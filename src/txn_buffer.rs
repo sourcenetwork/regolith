@@ -240,6 +240,12 @@ where
     /// database holds, which is why materializing it is affordable where
     /// materializing the database side would not be.
     pub(crate) fn snapshot(&self) -> Vec<(K, V)> {
+        self.snapshot_matching(|_| true)
+    }
+
+    /// Filter keys before copying or deduplicating. Narrow scans must not clone
+    /// unrelated buffered values, especially during a large history replay.
+    pub(crate) fn snapshot_matching(&self, include: impl Fn(&K) -> bool) -> Vec<(K, V)> {
         let mut out = Vec::new();
         let mut seen = std::collections::HashSet::new();
         let mut cursor = self.head.load(Ordering::Acquire);
@@ -248,7 +254,7 @@ where
             let node = unsafe { &*cursor };
             // Newest first, so the first sighting of a key is its current
             // value and later ones are writes it replaced.
-            if seen.insert(node.key.clone()) {
+            if include(&node.key) && seen.insert(node.key.clone()) {
                 out.push((node.key.clone(), node.value.clone()));
             }
             cursor = node.next;
@@ -293,3 +299,6 @@ impl<K: 'static, V: 'static> Drop for TxnBuffer<K, V> {
         }
     }
 }
+
+#[cfg(test)]
+mod scan_tests;

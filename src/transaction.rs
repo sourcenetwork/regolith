@@ -635,14 +635,9 @@ impl<'db> Transaction<'db> {
         let hi = end.map(|e| prefix_key(DEFAULT_CF_ID, e));
         let reverse = direction == ScanDirection::Reverse;
 
-        let mut buffered: Vec<(Vec<u8>, Option<Vec<u8>>)> = self
-            .writes
-            .snapshot()
-            .into_iter()
-            .filter(|(key, _)| {
-                lo.as_ref().is_none_or(|lo| key >= lo) && hi.as_ref().is_none_or(|hi| key < hi)
-            })
-            .collect();
+        let mut buffered: Vec<(Vec<u8>, Option<Vec<u8>>)> = self.writes.snapshot_matching(|key| {
+            lo.as_ref().is_none_or(|lo| key >= lo) && hi.as_ref().is_none_or(|hi| key < hi)
+        });
         if reverse {
             buffered.sort_unstable_by(|a, b| b.0.cmp(&a.0));
         } else {
