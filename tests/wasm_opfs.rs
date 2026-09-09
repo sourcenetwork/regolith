@@ -23,7 +23,7 @@ use std::path::Path;
 
 use regolith::env::opfs::{OpfsEnv, OpfsMode, OpfsOptions};
 use regolith::env::{Env, WriteMode};
-use regolith::{Db, Options, WriteBatch};
+use regolith::{CompactionOutcome, Db, Options, WriteBatch};
 use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
 
 wasm_bindgen_test_configure!(run_in_dedicated_worker);
@@ -119,7 +119,7 @@ async fn the_full_lifecycle_survives_a_remount() {
 
         db.flush().expect("flush");
         db.compact_range(None, None).expect("compact");
-        while db.compact_step().expect("compact step") {}
+        while db.compact_step().expect("compact step") == CompactionOutcome::DidWork {}
         db.close().expect("close");
     }
 
@@ -513,7 +513,7 @@ async fn the_wasm_profile_survives_a_full_lifecycle_in_a_browser() {
         }
         db.flush().expect("flush");
         db.compact_range(None, None).expect("compact");
-        while db.compact_step().expect("compact step") {}
+        while db.compact_step().expect("compact step") == CompactionOutcome::DidWork {}
 
         for i in (0..2000u32).step_by(97) {
             assert_eq!(

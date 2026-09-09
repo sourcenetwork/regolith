@@ -8,7 +8,9 @@
 // suite lives in tests/wasm_opfs*.rs.
 #![cfg(not(target_arch = "wasm32"))]
 
-use regolith::{CompactionStyle, Db, Env, Error, FifoCompactionOptions, Options};
+use regolith::{
+    CompactionOutcome, CompactionStyle, Db, Env, Error, FifoCompactionOptions, Options,
+};
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -287,7 +289,7 @@ fn probe_recovery(style: CompactionStyle, label: &str) {
         // compact_step terminates rather than looping forever, and it
         // reports no work, because there is none to do under this style.
         let mut steps = 0usize;
-        while db.compact_step().unwrap() {
+        while db.compact_step().unwrap() == CompactionOutcome::DidWork {
             steps += 1;
             assert!(steps <= 200, "{label}: compact_step did not converge");
         }
@@ -410,7 +412,7 @@ fn universal_compact_step_converges() {
             let _ = db.put(k.as_bytes(), &val(i));
         }
         let mut steps = 0usize;
-        while db.compact_step().unwrap() {
+        while db.compact_step().unwrap() == CompactionOutcome::DidWork {
             steps += 1;
             assert!(
                 steps <= 200,

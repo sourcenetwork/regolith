@@ -79,6 +79,7 @@ mod txn_buffer;
 pub use backup::{BackupEngine, BackupId, BackupInfo};
 pub use checkpoint::Checkpoint;
 pub use column_family::{ColumnFamilyHandle, DEFAULT_CF_NAME};
+pub use engine::compaction::CompactionOutcome;
 #[cfg(target_os = "wasi")]
 pub use env::WasiEnv;
 pub use env::{Capabilities, Env, MemEnv, StdEnv};
@@ -1211,23 +1212,42 @@ impl Db {
     /// itself, so this is an optimization of write latency rather than
     /// a requirement for correctness.
     ///
-    /// `Ok(false)` means this call did no work, for either of two
-    /// reasons: nothing was over its compaction trigger, or another
-    /// thread currently holds the files that would be compacted. A
-    /// loop of the form `while db.compact_step()? {}` therefore
-    /// terminates, and terminates having compacted everything this
-    /// thread could reach. Every compaction style regolith offers reduces
-    /// the file count it merges, so the loop cannot be fed forever by
+    /// The returned [`CompactionOutcome`] separates the two reasons a
+    /// pass can do nothing, because a caller has to act on them
+    /// differently. [`CompactionOutcome::Idle`] means nothing was over
+    /// its compaction trigger and the tree is settled.
+    /// [`CompactionOutcome::Contended`] means work is pending but
+    /// another thread holds the input files, so the right response is to
+    /// wait for that thread rather than conclude the engine is done.
+    ///
+    /// A drain therefore looks like this, and stops only on `Idle`:
+    ///
+    /// ```no_run
+    /// # use regolith::{CompactionOutcome, Db, Options};
+    /// # fn main() -> regolith::Result<()> {
+    /// # let db = Db::open("/tmp/db", Options::default())?;
+    /// loop {
+    ///     match db.compact_step()? {
+    ///         CompactionOutcome::DidWork => continue,
+    ///         CompactionOutcome::Contended => std::thread::yield_now(),
+    ///         CompactionOutcome::Idle => break,
+    ///     }
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// Every compaction style regolith offers reduces the file count it
+    /// merges, so a loop driven by `DidWork` cannot be fed forever by
     /// its own output.
     ///
     /// Safe to call with background workers running: the job is picked
     /// under the same engine-wide compaction lock and the same
     /// in-progress file set the workers use, so the two can never pick
     /// overlapping inputs.
-    pub fn compact_step(&self) -> Result<bool> {
+    pub fn compact_step(&self) -> Result<CompactionOutcome> {
         self.ensure_writable()?;
-        let outcome = self.engine.run_one_compaction_pass().map_err(Error::from)?;
-        Ok(outcome == engine::compaction::CompactionOutcome::DidWork)
+        self.engine.run_one_compaction_pass().map_err(Error::from)
     }
 
     /// Return the string value of a named property, or `None` if

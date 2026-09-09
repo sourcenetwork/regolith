@@ -20,7 +20,7 @@
 //! the rest of `tests/` is native-only.
 
 use regolith::env::opfs::{OpfsEnv, OpfsOptions};
-use regolith::{Db, Options};
+use regolith::{CompactionOutcome, Db, Options};
 use wasm_bindgen::JsCast as _;
 use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
 
@@ -55,7 +55,7 @@ async fn the_whole_lifecycle_fits_the_embedded_budget() {
             .expect("put");
     }
     db.flush().expect("flush");
-    while db.compact_step().expect("compact step") {}
+    while db.compact_step().expect("compact step") == CompactionOutcome::DidWork {}
     db.close().expect("close");
 
     let peak = linear_memory_kib();

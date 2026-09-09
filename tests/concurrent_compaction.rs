@@ -15,7 +15,7 @@
 // threads and the filesystem, neither of which exists there.
 #![cfg(not(target_arch = "wasm32"))]
 
-use regolith::{Db, Options, WriteBatch};
+use regolith::{CompactionOutcome, Db, Options, WriteBatch};
 
 /// Small enough that a few megabytes reach L1 through many separate
 /// compaction jobs, which is what gives the workers something to race over.
@@ -84,7 +84,7 @@ fn many_workers_keep_every_level_a_single_sorted_run() {
     const KEYS: u64 = 300_000;
     write_dense_keys(&db, KEYS);
     db.flush().unwrap();
-    while db.compact_step().unwrap() {}
+    while db.compact_step().unwrap() == CompactionOutcome::DidWork {}
 
     assert_single_sorted_run(&db, KEYS);
 }
@@ -98,7 +98,7 @@ fn a_reopened_database_reads_back_what_the_workers_wrote() {
         let db = Db::open(dir.path(), contended_options(16)).unwrap();
         write_dense_keys(&db, KEYS);
         db.flush().unwrap();
-        while db.compact_step().unwrap() {}
+        while db.compact_step().unwrap() == CompactionOutcome::DidWork {}
         db.close().unwrap();
     }
 

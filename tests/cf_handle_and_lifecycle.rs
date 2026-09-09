@@ -13,7 +13,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use regolith::{Db, Options, WriteBatch};
+use regolith::{CompactionOutcome, Db, Options, WriteBatch};
 
 fn small() -> Options {
     Options {
@@ -108,7 +108,7 @@ fn drop_all_is_not_undone_by_a_compaction_that_was_already_running() {
                 n, 0,
                 "round {round}: drop_all reported success, so nothing may come back"
             );
-            if !db.compact_step().unwrap() {
+            if db.compact_step().unwrap() != CompactionOutcome::DidWork {
                 break;
             }
         }

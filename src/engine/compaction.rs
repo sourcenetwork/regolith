@@ -474,7 +474,7 @@ fn compaction_loop(
     }
 }
 
-/// What one call to [`pick_and_run_compaction`] achieved.
+/// What one call to [`crate::Db::compact_step`] achieved.
 ///
 /// The distinction between [`CompactionOutcome::Idle`] and
 /// [`CompactionOutcome::Contended`] is load-bearing, not cosmetic. A
@@ -482,8 +482,15 @@ fn compaction_loop(
 /// itself; if it treated "another thread already holds these inputs"
 /// as "there is nothing to compact", it would fail the write with
 /// [`crate::Error::Busy`] the moment a second thread was mid-pass.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CompactionOutcome {
+///
+/// The same trap catches a caller draining compaction from outside the
+/// engine. A loop that stops on anything other than
+/// [`CompactionOutcome::DidWork`] exits while a background worker still
+/// holds the level, and concludes the tree is settled when it is not.
+/// Wait out a [`CompactionOutcome::Contended`] and stop only on
+/// [`CompactionOutcome::Idle`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CompactionOutcome {
     /// A compaction job ran to completion.
     DidWork,
     /// No level was over its trigger. Nothing to do.
