@@ -95,7 +95,15 @@ jobs:
         with:
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
-      - uses: taiki-e/install-action@wasm-bindgen
+      - name: Read the locked wasm-bindgen version
+        id: bindgen
+        run: |
+          bindgen_version=$(awk '/^name = "wasm-bindgen"$/ { found = 1; next } found && /^version = / { gsub(/"/, "", $3); print $3; exit }' Cargo.lock)
+          test -n "$bindgen_version"
+          echo "version=$bindgen_version" >> "$GITHUB_OUTPUT"
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-bindgen-cli@${{ steps.bindgen.outputs.version }}
       - uses: jetli/wasm-pack-action@v0.4.0
       - name: OPFS round trip in headless Firefox
         run: just wasm-browser
