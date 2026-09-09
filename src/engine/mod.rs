@@ -3766,14 +3766,31 @@ fn apply_replayed_wal_entry(memtable: &MemTable, entry: WalEntry) -> u64 {
 }
 
 fn rewrite_recovered_memtable_to_wal(memtable: &MemTable, wal: &mut Wal) -> std::io::Result<()> {
+    const GROUP_BYTES: usize = 64 * 1024;
+    let mut group = Vec::with_capacity(GROUP_BYTES);
     let mut wrote_record = false;
 
     memtable.try_for_each_entry(|internal_key, value| {
         let (user_key, seq, value_type) = internal_key::decode_internal_key(internal_key);
         match value_type {
-            internal_key::VALUE_TYPE_VALUE => wal.append_put(user_key, value, seq)?,
-            internal_key::VALUE_TYPE_DELETION => wal.append_delete(user_key, seq)?,
-            internal_key::VALUE_TYPE_MERGE => wal.append_merge(user_key, value, seq)?,
+            internal_key::VALUE_TYPE_VALUE => {
+                wal::encode_put_record(&mut group, user_key, value, seq)
+            }
+            internal_key::VALUE_TYPE_DELETION => wal::encode_op_record(
+                &mut group,
+                &WriteBatchOp::Delete {
+                    key: user_key.to_vec(),
+                },
+                seq,
+            ),
+            internal_key::VALUE_TYPE_MERGE => wal::encode_op_record(
+                &mut group,
+                &WriteBatchOp::Merge {
+                    key: user_key.to_vec(),
+                    operand: value.to_vec(),
+                },
+                seq,
+            ),
             other => {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
@@ -3781,18 +3798,40 @@ fn rewrite_recovered_memtable_to_wal(memtable: &MemTable, wal: &mut Wal) -> std:
                 ));
             }
         }
+        if group.len() >= GROUP_BYTES {
+            wal.append_group(&group)?;
+            group.clear();
+        }
         wrote_record = true;
         Ok(())
     })?;
 
     for tombstone in memtable.clone_range_tombstones() {
-        wal.append_delete_range(&tombstone.start, &tombstone.end, tombstone.seq)?;
+        wal::encode_op_record(
+            &mut group,
+            &WriteBatchOp::DeleteRange {
+                start: tombstone.start,
+                end: tombstone.end,
+            },
+            tombstone.seq,
+        );
+        if group.len() >= GROUP_BYTES {
+            wal.append_group(&group)?;
+            group.clear();
+        }
         wrote_record = true;
     }
 
+    // Replayed logs remain intact until the replacement is completely durable.
     if wrote_record {
+        if !group.is_empty() {
+            wal.append_group(&group)?;
+        }
         wal.sync_data()?;
     }
 
     Ok(())
 }
+
+#[cfg(test)]
+mod recovery_tests;

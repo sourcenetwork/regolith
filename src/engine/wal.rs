@@ -245,6 +245,7 @@ impl Wal {
     }
 
     /// Append a put record.
+    #[cfg(test)]
     pub(crate) fn append_put(&mut self, key: &[u8], value: &[u8], seq: u64) -> io::Result<()> {
         let mut record = Vec::with_capacity(record_len(put_payload_len(key, value)));
         encode_put_record(&mut record, key, value, seq);
@@ -252,6 +253,7 @@ impl Wal {
     }
 
     /// Append a delete record.
+    #[cfg(test)]
     pub(crate) fn append_delete(&mut self, key: &[u8], seq: u64) -> io::Result<()> {
         let mut record = Vec::with_capacity(record_len(delete_payload_len(key)));
         encode_record(&mut record, RECORD_DELETE, |out| {
@@ -262,6 +264,7 @@ impl Wal {
 
     /// Append a merge record - an operand layered on top of any
     /// existing value/merge chain for `key`.
+    #[cfg(test)]
     pub(crate) fn append_merge(&mut self, key: &[u8], operand: &[u8], seq: u64) -> io::Result<()> {
         let mut record = Vec::with_capacity(record_len(merge_payload_len(key, operand)));
         encode_record(&mut record, RECORD_MERGE, |out| {
@@ -271,6 +274,7 @@ impl Wal {
     }
 
     /// Append a range-delete record covering `[start, end)`.
+    #[cfg(test)]
     pub(crate) fn append_delete_range(
         &mut self,
         start: &[u8],
