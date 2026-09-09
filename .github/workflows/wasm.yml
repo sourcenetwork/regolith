@@ -103,7 +103,7 @@ jobs:
           echo "version=$bindgen_version" >> "$GITHUB_OUTPUT"
       - uses: taiki-e/install-action@v2
         with:
-          tool: wasm-bindgen-cli@${{ steps.bindgen.outputs.version }}
+          tool: wasm-bindgen@${{ steps.bindgen.outputs.version }}
       - uses: jetli/wasm-pack-action@v0.4.0
       - name: OPFS round trip in headless Firefox
         run: just wasm-browser
