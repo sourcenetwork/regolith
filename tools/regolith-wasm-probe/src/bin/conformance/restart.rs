@@ -1,7 +1,7 @@
 //! The phases that each need their own process: reopen, the kill, the
 //! recovery, the forced compaction, and the last reopen after it.
 
-use regolith::{Db, Options, WriteOptions};
+use regolith::{CompactionOutcome, Db, Options, WriteOptions};
 
 use crate::data;
 use crate::report::Report;
@@ -103,8 +103,9 @@ pub fn compact(dir: &std::path::Path, opts: Options, report: &mut Report) -> Res
             .compact_step()
             .map_err(|e| format!("compact_step failed: {e}"))?
         {
-            true => steps += 1,
-            false => break,
+            CompactionOutcome::DidWork => steps += 1,
+            CompactionOutcome::Contended => continue,
+            CompactionOutcome::Idle => break,
         }
     }
     report.check_u64("compact.extra_steps", steps);

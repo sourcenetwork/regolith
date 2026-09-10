@@ -12,7 +12,9 @@
 // threads and the filesystem, neither of which exists there.
 #![cfg(not(target_arch = "wasm32"))]
 
-use regolith::{CompactionStyle, Db, Options, UniversalCompactionOptions, WriteBatch};
+use regolith::{
+    CompactionOutcome, CompactionStyle, Db, Options, UniversalCompactionOptions, WriteBatch,
+};
 
 /// Universal compaction with tiny files, so a handful of writes produces
 /// several L0 runs and the merge has something to fold.
@@ -67,7 +69,7 @@ fn a_write_that_lands_during_a_universal_merge_is_not_overtaken() {
 
         // Give the merge time to land its output.
         for _ in 0..50 {
-            if db.compact_step().unwrap() {
+            if db.compact_step().unwrap() == CompactionOutcome::DidWork {
                 continue;
             }
             break;
@@ -109,7 +111,7 @@ fn a_universal_merge_keeps_every_key_it_folded() {
     }
     db.write(batch).unwrap();
     db.flush().unwrap();
-    while db.compact_step().unwrap() {}
+    while db.compact_step().unwrap() == CompactionOutcome::DidWork {}
 
     let mut scan = db.scan_stream(None, None).unwrap();
     let seen = scan.by_ref().count();

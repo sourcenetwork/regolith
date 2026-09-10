@@ -17,7 +17,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use regolith::{
-    CompactionJobInfo, Db, Error, EventListener, FlushJobInfo, Options, WriteBatch, WriteOptions,
+    CompactionJobInfo, CompactionOutcome, Db, Error, EventListener, FlushJobInfo, Options,
+    WriteBatch, WriteOptions,
 };
 
 /// A small database whose memtable fills after a few writes, so tests
@@ -271,13 +272,14 @@ fn explicit_flush_writes_an_l0_file_and_is_idempotent() {
 }
 
 #[test]
-fn compact_step_reports_whether_it_did_work() {
+fn compact_step_reports_idle_did_work_and_contended_apart() {
     let dir = tempfile::tempdir().unwrap();
     let db = Db::open(dir.path(), foreground_options()).unwrap();
 
-    assert!(
-        !db.compact_step().unwrap(),
-        "an empty database has nothing to compact"
+    assert_eq!(
+        db.compact_step().unwrap(),
+        CompactionOutcome::Idle,
+        "an empty database has nothing to compact, and must say Idle rather than Contended"
     );
 
     // `l0_compaction_trigger` is 2, so two flushed memtables give the
@@ -287,16 +289,28 @@ fn compact_step_reports_whether_it_did_work() {
     }
     db.flush().unwrap();
 
-    assert!(
+    assert_eq!(
         db.compact_step().unwrap(),
+        CompactionOutcome::DidWork,
         "L0 is over the compaction trigger but compact_step found no work"
     );
 
     let mut steps = 0;
-    while db.compact_step().unwrap() {
+    while db.compact_step().unwrap() == CompactionOutcome::DidWork {
         steps += 1;
         assert!(steps < 1_000, "compact_step never drained");
     }
+
+    // The reason this call returns an outcome rather than a bool. With no
+    // background worker running there is nothing to contend with, so a
+    // settled tree must report Idle exactly. A `bool` collapsed Idle and
+    // Contended into one `false`, and a caller draining compaction could
+    // not tell "the tree is settled" from "someone else holds the level".
+    assert_eq!(
+        db.compact_step().unwrap(),
+        CompactionOutcome::Idle,
+        "a drained tree with no worker running must report Idle, not Contended"
+    );
 
     for i in (0..600usize).step_by(37) {
         assert_eq!(
@@ -382,7 +396,7 @@ fn full_lifecycle_with_zero_workers() {
 
     db.flush().unwrap();
     db.compact_range(None, None).unwrap();
-    while db.compact_step().unwrap() {}
+    while db.compact_step().unwrap() == CompactionOutcome::DidWork {}
 
     db.close().unwrap();
     // The directory lock lives on the handle, not on the close, so the
