@@ -152,11 +152,25 @@ impl RegolithEngine {
         durability: DurabilityMode,
         disable_wal: bool,
     ) -> io::Result<u64> {
+        self.validate_ops_sizes(&ops)?;
+        self.submit_batch(ops, durability, disable_wal)
+    }
+
+    /// [`Self::apply_batch`] for a caller that has already checked every
+    /// key and value against the configured limits. `Db::write` does so at
+    /// the API boundary, before the stall wait and the statistics, so
+    /// repeating the pass here would compare the same lengths against the
+    /// same numbers a second time.
+    pub(crate) fn submit_batch(
+        &self,
+        ops: Vec<WriteBatchOp>,
+        durability: DurabilityMode,
+        disable_wal: bool,
+    ) -> io::Result<u64> {
         self.ensure_writable()?;
         if ops.is_empty() {
             return Ok(self.visible_seq.visible());
         }
-        self.validate_ops_sizes(&ops)?;
         self.submit(WriteRequest::Batch {
             ops,
             durability,

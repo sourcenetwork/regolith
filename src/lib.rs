@@ -862,7 +862,7 @@ impl Db {
         }
         let (dm, disable_wal) = self.resolve_write_opts(opts);
         self.engine
-            .apply_batch(batch.ops, dm, disable_wal)
+            .submit_batch(batch.ops, dm, disable_wal)
             .map_err(Error::from)
     }
 
@@ -1006,24 +1006,37 @@ impl Db {
         }
     }
 
-    fn validate_prefixed_cf(&self, prefixed_key: &[u8]) -> Result<()> {
+    /// Check one prefixed key's column family, remembering the last id
+    /// found live so a run of ops in one column family takes the
+    /// registry lock once.
+    fn validate_prefixed_cf(&self, live: &mut Option<u32>, prefixed_key: &[u8]) -> Result<()> {
         let cf_id = prefixed_cf_id(prefixed_key).map_err(Error::from)?;
-        if self.cfs.contains_id(cf_id) {
-            Ok(())
-        } else {
-            Err(invalid_cf_id_error(cf_id))
+        if *live == Some(cf_id) {
+            return Ok(());
         }
+        if !self.cfs.contains_id(cf_id) {
+            return Err(invalid_cf_id_error(cf_id));
+        }
+        *live = Some(cf_id);
+        Ok(())
     }
 
     fn validate_batch_cf_liveness(&self, batch: &WriteBatch) -> Result<()> {
+        // A batch is usually one column family, or a few long runs of one,
+        // and every distinct run still reaches the registry once. A drop
+        // that lands between two runs of the same id in one call is the
+        // same race the per-op form had: the lock was never held across the
+        // batch, so neither form promises more than "rejected or applied
+        // as a whole" for a drop that overlaps the write.
+        let mut live = None;
         for op in &batch.ops {
             match op {
                 WriteBatchOp::Put { key, .. }
                 | WriteBatchOp::Delete { key }
-                | WriteBatchOp::Merge { key, .. } => self.validate_prefixed_cf(key)?,
+                | WriteBatchOp::Merge { key, .. } => self.validate_prefixed_cf(&mut live, key)?,
                 WriteBatchOp::DeleteRange { start, end } => {
-                    self.validate_prefixed_cf(start)?;
-                    self.validate_prefixed_cf(end)?;
+                    self.validate_prefixed_cf(&mut live, start)?;
+                    self.validate_prefixed_cf(&mut live, end)?;
                 }
             }
         }
@@ -6246,6 +6259,136 @@ mod tests {
 
         let live = db.create_column_family("tmp").unwrap();
         assert_eq!(db.get_cf(&live, b"k").unwrap(), None);
+    }
+
+    #[test]
+    fn test_cf_write_batch_rejects_dropped_cf_in_first_op() {
+        let (db, _dir) = open_tmp();
+        let keep = db.create_column_family("keep").unwrap();
+        let gone = db.create_column_family("gone").unwrap();
+        db.drop_column_family(gone.clone()).unwrap();
+
+        let mut batch = WriteBatch::new();
+        batch.put_cf(&gone, b"g", b"ghost");
+        batch.put(b"d", b"dv");
+        batch.put_cf(&keep, b"k1", b"v1");
+        batch.put_cf(&keep, b"k2", b"v2");
+        let err = db.write(batch).unwrap_err();
+        match err {
+            Error::InvalidColumnFamily(message) => assert!(message.contains("column family id")),
+            other => panic!("expected invalid column family error, got {other:?}"),
+        }
+
+        assert_eq!(db.get(b"d").unwrap(), None);
+        assert_eq!(db.get_cf(&keep, b"k1").unwrap(), None);
+    }
+
+    #[test]
+    fn test_cf_write_batch_rejects_dropped_cf_in_last_op() {
+        let (db, _dir) = open_tmp();
+        let keep = db.create_column_family("keep").unwrap();
+        let gone = db.create_column_family("gone").unwrap();
+        db.drop_column_family(gone.clone()).unwrap();
+
+        let mut batch = WriteBatch::new();
+        batch.put(b"d1", b"v1");
+        batch.put(b"d2", b"v2");
+        batch.put_cf(&keep, b"k", b"kv");
+        batch.delete_cf(&gone, b"g");
+        let err = db.write(batch).unwrap_err();
+        match err {
+            Error::InvalidColumnFamily(message) => assert!(message.contains("column family id")),
+            other => panic!("expected invalid column family error, got {other:?}"),
+        }
+
+        assert_eq!(db.get(b"d1").unwrap(), None);
+        assert_eq!(db.get_cf(&keep, b"k").unwrap(), None);
+    }
+
+    #[test]
+    fn test_cf_write_batch_rejects_dropped_cf_between_live_runs() {
+        let (db, _dir) = open_tmp();
+        let keep = db.create_column_family("keep").unwrap();
+        let gone = db.create_column_family("gone").unwrap();
+        db.drop_column_family(gone.clone()).unwrap();
+
+        let mut batch_a = WriteBatch::new();
+        batch_a.put_cf(&keep, b"k1", b"v1");
+        batch_a.put_cf(&keep, b"k2", b"v2");
+        batch_a.put_cf(&gone, b"g", b"ghost");
+        batch_a.put_cf(&keep, b"k3", b"v3");
+        batch_a.put(b"d", b"dv");
+        let err = db.write(batch_a).unwrap_err();
+        match err {
+            Error::InvalidColumnFamily(message) => assert!(message.contains("column family id")),
+            other => panic!("expected invalid column family error, got {other:?}"),
+        }
+        assert_eq!(db.get_cf(&keep, b"k1").unwrap(), None);
+        assert_eq!(db.get_cf(&keep, b"k2").unwrap(), None);
+        assert_eq!(db.get_cf(&keep, b"k3").unwrap(), None);
+        assert_eq!(db.get(b"d").unwrap(), None);
+
+        let mut batch_b = WriteBatch::new();
+        batch_b.put_cf(&keep, b"k1", b"v1");
+        batch_b.insert_raw_range_delete(prefix_key(keep.id(), b"a"), prefix_key(gone.id(), b"z"));
+        let err = db.write(batch_b).unwrap_err();
+        match err {
+            Error::InvalidColumnFamily(message) => assert!(message.contains("column family id")),
+            other => panic!("expected invalid column family error, got {other:?}"),
+        }
+        assert_eq!(db.get_cf(&keep, b"k1").unwrap(), None);
+
+        let mut batch_c = WriteBatch::new();
+        batch_c.put_cf(&keep, b"k1", b"v1");
+        batch_c.insert_raw_range_delete(prefix_key(gone.id(), b"a"), prefix_key(keep.id(), b"z"));
+        let err = db.write(batch_c).unwrap_err();
+        match err {
+            Error::InvalidColumnFamily(message) => assert!(message.contains("column family id")),
+            other => panic!("expected invalid column family error, got {other:?}"),
+        }
+        assert_eq!(db.get_cf(&keep, b"k1").unwrap(), None);
+    }
+
+    #[test]
+    fn test_cf_write_batch_with_alternating_live_cfs_lands() {
+        let (db, _dir) = open_tmp();
+        let a = db.create_column_family("a").unwrap();
+        let b = db.create_column_family("b").unwrap();
+
+        let mut batch = WriteBatch::new();
+        batch.put_cf(&a, b"1", b"a1");
+        batch.put_cf(&b, b"1", b"b1");
+        batch.put_cf(&a, b"2", b"a2");
+        batch.put(b"d", b"dv");
+        batch.put_cf(&b, b"2", b"b2");
+        batch.delete_range_cf(&a, b"x", b"y");
+        db.write(batch).unwrap();
+
+        assert_eq!(db.get_cf(&a, b"1").unwrap(), Some(b"a1".to_vec()));
+        assert_eq!(db.get_cf(&b, b"1").unwrap(), Some(b"b1".to_vec()));
+        assert_eq!(db.get_cf(&a, b"2").unwrap(), Some(b"a2".to_vec()));
+        assert_eq!(db.get(b"d").unwrap(), Some(b"dv".to_vec()));
+        assert_eq!(db.get_cf(&b, b"2").unwrap(), Some(b"b2".to_vec()));
+    }
+
+    #[test]
+    fn test_cf_write_batch_rejects_reserved_meta_cf_id() {
+        let (db, _dir) = open_tmp();
+        let before = db.engine.get_latest(&meta::next_id_key()).unwrap();
+
+        let mut batch = WriteBatch::new();
+        batch.insert_raw_put(prefix_key(META_CF_ID, b"next_id"), vec![9, 9, 9, 9]);
+        let err = db.write(batch).unwrap_err();
+        match err {
+            Error::InvalidColumnFamily(message) => assert!(message.contains("column family id")),
+            other => panic!("expected invalid column family error, got {other:?}"),
+        }
+
+        assert_eq!(db.engine.get_latest(&meta::next_id_key()).unwrap(), before);
+        assert_eq!(db.list_column_families(), vec![DEFAULT_CF_NAME.to_string()]);
+        let after = db.create_column_family("after").unwrap();
+        assert!(db.list_column_families().contains(&"after".to_string()));
+        assert_eq!(db.get_cf(&after, b"k").unwrap(), None);
     }
 
     #[test]

@@ -192,6 +192,8 @@ pub(crate) mod meta {
 /// In-memory cache of the on-disk CF registry. Guarded by a
 /// single mutex - CF creation and drop are rare relative to point
 /// writes, and the common path (`column_family(name)`) only reads.
+/// The default column family is answered without the lock; see
+/// `contains_id`.
 pub(crate) struct CfRegistry {
     inner: Mutex<CfRegistryInner>,
 }
@@ -237,8 +239,16 @@ impl CfRegistry {
         })
     }
 
+    /// Whether `id` names a live column family.
+    ///
+    /// The default column family is live for as long as the database is
+    /// open, without a lookup: `Db::open` registers it on every load
+    /// (`Db::load_cf_registry`) and `Db::drop_column_family` refuses to
+    /// drop it, so `remove` can never take it out. Answering it from the
+    /// constant keeps the common batch, which is entirely in the default
+    /// column family, off the mutex.
     pub(crate) fn contains_id(&self, id: u32) -> bool {
-        self.inner.lock().by_id.contains_key(&id)
+        id == DEFAULT_CF_ID || self.inner.lock().by_id.contains_key(&id)
     }
 
     pub(crate) fn is_live_handle(&self, cf: &ColumnFamilyHandle) -> bool {
@@ -362,5 +372,19 @@ mod tests {
         assert!(a.id < b.id);
         assert_eq!(r.get("alpha").unwrap(), a);
         assert_eq!(r.get("beta").unwrap(), b);
+    }
+
+    #[test]
+    fn registry_default_cf_is_live_without_a_lookup() {
+        let r = CfRegistry::new();
+        assert!(r.contains_id(DEFAULT_CF_ID));
+        assert!(!r.contains_id(META_CF_ID));
+        assert!(!r.contains_id(DEFAULT_CF_ID + 1));
+
+        let (h, _) = r.allocate("x").expect("id space");
+        assert!(r.contains_id(h.id));
+        r.remove("x");
+        assert!(!r.contains_id(h.id));
+        assert!(r.contains_id(DEFAULT_CF_ID));
     }
 }

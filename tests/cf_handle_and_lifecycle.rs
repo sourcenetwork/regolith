@@ -1,19 +1,23 @@
-//! Three things the rest of the API already promises, held on the paths that
+//! Four things the rest of the API already promises, held on the paths that
 //! were not keeping them.
 //!
 //! 1. A handle that is not live is an error, not an empty column family.
 //! 2. `drop_all` drops everything, including what a compaction was midway
 //!    through writing.
 //! 3. `close` returns, even when an ingest holds the compaction gate.
+//! 4. A drop that returns is a drop every later batch sees, whatever else
+//!    is writing.
 
 // Native-only. wasm-pack builds every test target for wasm32, and these use
 // threads and the filesystem, neither of which exists there.
 #![cfg(not(target_arch = "wasm32"))]
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use regolith::{CompactionOutcome, Db, Options, WriteBatch};
+use regolith::{CompactionOutcome, Db, Error, Options, WriteBatch};
 
 fn small() -> Options {
     Options {
@@ -175,4 +179,98 @@ fn close_returns_while_an_ingest_holds_the_compaction_gate() {
              something that was waiting on it"
         );
     }
+}
+
+#[test]
+fn a_drop_that_returned_is_seen_by_every_batch_that_starts_after_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Arc::new(Db::open(dir.path(), small()).unwrap());
+    let hot = db.create_column_family("hot").unwrap();
+
+    let dropped = Arc::new(AtomicBool::new(false));
+    let (tx, rx) = mpsc::channel::<()>();
+
+    let writer = {
+        let db = Arc::clone(&db);
+        let dropped = Arc::clone(&dropped);
+        let hot = hot.clone();
+        std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            let mut results = Vec::new();
+            let mut ok_count = 0u64;
+            let mut after_true_count = 0u64;
+            let mut sent = false;
+            let mut i: u64 = 0;
+            loop {
+                let after = dropped.load(Ordering::Acquire);
+                let mut batch = WriteBatch::new();
+                batch.put(format!("d{i}").as_bytes(), b"v");
+                batch.put_cf(&hot, format!("h{i}").as_bytes(), b"v");
+                batch.put(format!("e{i}").as_bytes(), b"v");
+                let r = db.write(batch);
+                if r.is_ok() {
+                    ok_count += 1;
+                    if ok_count == 64 && !sent {
+                        let _ = tx.send(());
+                        sent = true;
+                    }
+                }
+                if after {
+                    after_true_count += 1;
+                }
+                results.push((i, after, r));
+                i += 1;
+                if after_true_count >= 64 || Instant::now() > deadline {
+                    break;
+                }
+            }
+            results
+        })
+    };
+
+    rx.recv_timeout(Duration::from_secs(30))
+        .expect("writer never reached 64 ok batches");
+    db.drop_column_family(hot.clone()).unwrap();
+    dropped.store(true, Ordering::Release);
+
+    let results = writer.join().unwrap();
+
+    // G1: a drop that returned before a batch's liveness check must be seen
+    // by that batch, no matter what else is contending for the registry.
+    let after_true: Vec<_> = results.iter().filter(|(_, after, _)| *after).collect();
+    assert!(
+        after_true.len() >= 64,
+        "writer must have observed the drop for at least 64 batches, got {}",
+        after_true.len()
+    );
+    for (i, _, r) in &after_true {
+        assert!(
+            matches!(r, Err(Error::InvalidColumnFamily(_))),
+            "batch {i} observed the drop before writing but was not rejected: {r:?}"
+        );
+    }
+
+    // G2: every batch is applied as a whole or not at all, drop race or not.
+    for (i, _after, r) in &results {
+        match r {
+            Ok(()) => {
+                assert_eq!(
+                    db.get(format!("d{i}").as_bytes()).unwrap(),
+                    Some(b"v".to_vec()),
+                    "batch {i} reported success, so its keys must be readable"
+                );
+                assert_eq!(
+                    db.get(format!("e{i}").as_bytes()).unwrap(),
+                    Some(b"v".to_vec())
+                );
+            }
+            Err(Error::InvalidColumnFamily(_)) => {
+                assert_eq!(db.get(format!("d{i}").as_bytes()).unwrap(), None);
+                assert_eq!(db.get(format!("e{i}").as_bytes()).unwrap(), None);
+            }
+            Err(other) => panic!("batch {i} failed with an unexpected error: {other:?}"),
+        }
+    }
+
+    assert!(db.column_family("hot").is_none());
 }

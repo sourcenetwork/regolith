@@ -21,7 +21,7 @@
 use std::collections::BTreeMap;
 
 use proptest::prelude::*;
-use regolith::WriteBatch;
+use regolith::{Error, WriteBatch};
 use tempfile::TempDir;
 
 mod common;
@@ -351,5 +351,107 @@ proptest! {
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
         prop_assert_eq!(got, want);
+    }
+
+    /// Any interleaving of ops across two live column families, the
+    /// default one, and a dropped one is rejected as a whole iff it
+    /// touches the dropped one; otherwise every key lands with exactly
+    /// last-write-wins semantics per (column family, key). Exercises the
+    /// full range of op orders `validate_batch_cf_liveness`'s run cache
+    /// must handle: the first/last/middle and repeated-run shapes hand
+    /// written in `src/lib.rs` are single points in the space this walks.
+    #[test]
+    fn batch_column_family_liveness_is_exact_for_any_op_order(
+        ops in prop::collection::vec(
+            (0u8..4, key_strategy(), any::<bool>()),
+            1..=48,
+        ),
+    ) {
+        let dir = TempDir::new().unwrap();
+        let db = open(&dir);
+
+        // Slot 0 is the default column family, 1 and 2 are live column
+        // families, 3 is a column family whose handle stays around after
+        // it is dropped, so it can still prefix keys into raw ops.
+        let a = db.create_column_family("a").unwrap();
+        let b = db.create_column_family("b").unwrap();
+        let gone = db.create_column_family("gone").unwrap();
+        db.put_cf(&a, b"sentinel", b"a-sentinel").unwrap();
+        db.put_cf(&b, b"sentinel", b"b-sentinel").unwrap();
+        db.drop_column_family(gone.clone()).unwrap();
+
+        let has_dropped = ops.iter().any(|(slot, _, _)| *slot == 3);
+
+        let mut batch = WriteBatch::new();
+        // Last-write-wins per (slot, key), independent of which column
+        // family the key's slot maps to.
+        let mut expected: BTreeMap<(u8, Vec<u8>), Option<Vec<u8>>> = BTreeMap::new();
+        for (slot, key, is_put) in &ops {
+            let value = key.clone();
+            match slot {
+                0 if *is_put => {
+                    batch.put(key, &value);
+                    expected.insert((0, key.clone()), Some(value));
+                }
+                0 => {
+                    batch.delete(key);
+                    expected.insert((0, key.clone()), None);
+                }
+                1 if *is_put => {
+                    batch.put_cf(&a, key, &value);
+                    expected.insert((1, key.clone()), Some(value));
+                }
+                1 => {
+                    batch.delete_cf(&a, key);
+                    expected.insert((1, key.clone()), None);
+                }
+                2 if *is_put => {
+                    batch.put_cf(&b, key, &value);
+                    expected.insert((2, key.clone()), Some(value));
+                }
+                2 => {
+                    batch.delete_cf(&b, key);
+                    expected.insert((2, key.clone()), None);
+                }
+                _ if *is_put => batch.put_cf(&gone, key, &value),
+                _ => batch.delete_cf(&gone, key),
+            }
+        }
+
+        let result = db.write(batch);
+
+        if has_dropped {
+            prop_assert!(matches!(result, Err(Error::InvalidColumnFamily(_))));
+            for (slot, key) in expected.keys() {
+                let got = match slot {
+                    0 => db.get(key).unwrap(),
+                    1 => db.get_cf(&a, key).unwrap(),
+                    2 => db.get_cf(&b, key).unwrap(),
+                    _ => unreachable!(),
+                };
+                prop_assert_eq!(
+                    got, None,
+                    "key {:?} in slot {} must be absent after a rejected batch",
+                    key, slot
+                );
+            }
+            prop_assert_eq!(db.get_cf(&a, b"sentinel").unwrap(), Some(b"a-sentinel".to_vec()));
+            prop_assert_eq!(db.get_cf(&b, b"sentinel").unwrap(), Some(b"b-sentinel".to_vec()));
+        } else {
+            prop_assert!(result.is_ok());
+            for ((slot, key), want) in &expected {
+                let got = match slot {
+                    0 => db.get(key).unwrap(),
+                    1 => db.get_cf(&a, key).unwrap(),
+                    2 => db.get_cf(&b, key).unwrap(),
+                    _ => unreachable!(),
+                };
+                prop_assert_eq!(
+                    &got, want,
+                    "key {:?} in slot {} did not match last-write-wins",
+                    key, slot
+                );
+            }
+        }
     }
 }
