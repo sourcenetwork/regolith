@@ -63,6 +63,32 @@
 //!   chunk that really entered a ring, and decremented only by the size
 //!   of one that really left, so it can neither underflow nor
 //!   over-report the bound.
+//! - **A8 (single allocator).** At most one thread is inside
+//!   [`Arena::alloc`] at a time, and no other code reads `state` while
+//!   the arena is live. The only production caller is
+//!   `ArenaSkipList::insert`, which already holds the skip list's
+//!   single-writer guard (S2), and the engine runs that on the commit
+//!   leader only. `alloc` carries its own debug guard so the contract is
+//!   checked at the arena, not inferred from its caller; under loom the
+//!   cell is instrumented and any unordered access fails the model.
+//!   Readers never depend on `state`: a reader learns a node's address
+//!   only through a tower link loaded with `Acquire` (S1), and the chunk
+//!   acquisition, the cursor bump and every node byte write are
+//!   sequenced before the writer's `Release` store of that link, so they
+//!   happen-before the reader's use with no further fence. `Arena::drop`
+//!   runs with `&mut self` after the last `Arc<Arena>` is gone; `Arc`'s
+//!   Release decrement and Acquire fence order the writer's last cursor
+//!   write before the drain, the same argument that already justifies
+//!   `get_mut` there.
+//!
+//!   Ordering summary: `state` is plain, non-atomic memory, touched only
+//!   by the A8 thread and never read by a reader. `used` and `reserved`
+//!   stay `Relaxed` atomics; other threads read them for statistics, but
+//!   neither guards a memory access. Reader visibility of a freshly
+//!   grown chunk's bytes is unchanged: S1's `Acquire`/`Release` pair on
+//!   the tower link. Pool hand-off is unchanged: `ChunkPool::take`/`give`
+//!   go through the MPMC ring, and a chunk arriving from a dead arena was
+//!   released by that arena's `drop`.
 
 #![allow(unsafe_code)]
 
@@ -71,7 +97,7 @@ use std::ptr::NonNull;
 
 use kovan_queue::array_queue::ArrayQueue;
 
-use crate::sync::{Arc, AtomicUsize, Mutex, Ordering};
+use crate::sync::{Arc, AtomicUsize, Ordering, UnsafeCell};
 
 /// Alignment every chunk is allocated at. Covers every alignment the
 /// skip-list asks for, so a fresh chunk never needs leading padding.
@@ -352,8 +378,8 @@ impl ChunkPool {
 
 /// Chunks owned by one arena, plus the bump cursor into the newest one.
 ///
-/// Only the writer touches this; readers follow node pointers, which are
-/// absolute addresses and never go through the chunk list.
+/// Only the writer touches this (A8); readers follow node pointers, which
+/// are absolute addresses and never go through the chunk list.
 struct ArenaState {
     chunks: Vec<ChunkHandle>,
     /// Bytes handed out of `chunks.last()`.
@@ -362,19 +388,25 @@ struct ArenaState {
 
 /// Bump allocator over a list of pooled chunks.
 pub(crate) struct Arena {
-    state: Mutex<ArenaState>,
+    /// Writer-private (A8): only the allocating thread reaches it,
+    /// through [`Arena::alloc`]; readers hold absolute node pointers and
+    /// never look here.
+    state: UnsafeCell<ArenaState>,
     reserved: AtomicUsize,
     used: AtomicUsize,
     pool: Arc<ChunkPool>,
     budget: usize,
     base: usize,
     max_chunk_size: usize,
+    #[cfg(debug_assertions)]
+    allocating: crate::sync::AtomicBool,
 }
 
-// SAFETY (A5): the chunk list is behind a `Mutex` and every pointer
-// `alloc` returns addresses memory this arena owns until it is dropped,
-// which cannot happen while any `Arc<Arena>` (including one held by a
-// live `DbSlice`) survives. The atomics carry the byte counters.
+// SAFETY (A8): at most one thread is ever inside `alloc`, which is the
+// only code that touches `state`, and every pointer `alloc` returns
+// addresses memory this arena owns until it is dropped, which cannot
+// happen while any `Arc<Arena>` (including one held by a live
+// `DbSlice`) survives. The atomics carry the byte counters.
 unsafe impl Send for Arena {}
 // SAFETY: see the `Send` impl above.
 unsafe impl Sync for Arena {}
@@ -391,7 +423,7 @@ impl Arena {
         };
         let base = base_class(profile, budget);
         Self {
-            state: Mutex::new(ArenaState {
+            state: UnsafeCell::new(ArenaState {
                 chunks: Vec::new(),
                 offset: 0,
             }),
@@ -401,6 +433,8 @@ impl Arena {
             budget,
             base,
             max_chunk_size: profile.max_chunk_size.max(base),
+            #[cfg(debug_assertions)]
+            allocating: crate::sync::AtomicBool::new(false),
         }
     }
 
@@ -416,22 +450,37 @@ impl Arena {
         if size == 0 {
             return None;
         }
-        let mut state = self.state.lock();
-        if let Some(ptr) = Self::bump(&mut state, size, align) {
+        #[cfg(debug_assertions)]
+        let _writer = crate::sync::SingleWriterGuard::enter(
+            &self.allocating,
+            "Arena::alloc is single-writer (A8); the memtable's one writer is its only allocator",
+        );
+
+        // SAFETY (A8): this thread is the only one touching `state` for
+        // the duration of the closure, and the pointer addresses the
+        // cell's own contents.
+        let (bumped, chunk_index) = self.state.with_mut(|state| {
+            let state = unsafe { &mut *state };
+            (Self::bump(state, size, align), state.chunks.len())
+        });
+        if let Some(ptr) = bumped {
             self.used.fetch_add(size, Ordering::Relaxed);
             return Some(ptr);
         }
 
-        let chunk_size = self.next_chunk_size(state.chunks.len(), size);
+        let chunk_size = self.next_chunk_size(chunk_index, size);
         let chunk = match self.pool.take(chunk_size) {
             Some(chunk) => chunk,
             None => ChunkHandle::alloc(chunk_size)?,
         };
         self.reserved.fetch_add(chunk.size, Ordering::Relaxed);
-        state.chunks.push(chunk);
-        state.offset = 0;
-
-        let ptr = Self::bump(&mut state, size, align)?;
+        // SAFETY (A8): as above.
+        let ptr = self.state.with_mut(|state| {
+            let state = unsafe { &mut *state };
+            state.chunks.push(chunk);
+            state.offset = 0;
+            Self::bump(state, size, align)
+        })?;
         self.used.fetch_add(size, Ordering::Relaxed);
         Some(ptr)
     }
@@ -501,13 +550,17 @@ impl Arena {
     /// How many chunks this arena holds.
     #[cfg(test)]
     pub(crate) fn chunk_count(&self) -> usize {
-        self.state.lock().chunks.len()
+        // SAFETY (A8): tests calling this are single-threaded with
+        // respect to the arena.
+        self.state.with(|s| unsafe { &*s }.chunks.len())
     }
 
     /// The sizes of this arena's chunks, oldest first.
     #[cfg(test)]
     pub(crate) fn chunk_sizes(&self) -> Vec<usize> {
-        self.state.lock().chunks.iter().map(|c| c.size).collect()
+        // SAFETY (A8): as above.
+        self.state
+            .with(|s| unsafe { &*s }.chunks.iter().map(|c| c.size).collect())
     }
 }
 
@@ -516,10 +569,13 @@ impl Drop for Arena {
     /// `Arc<Arena>` dies, which includes every outstanding
     /// [`crate::DbSlice`] taken from this memtable (A5).
     fn drop(&mut self) {
-        let state = self.state.get_mut();
-        for chunk in state.chunks.drain(..) {
-            self.pool.give(chunk);
-        }
+        // SAFETY (A8): `&mut self` proves exclusivity here, and
+        // `self.pool` and `self.state` are disjoint field borrows.
+        self.state.with_mut(|state| {
+            for chunk in unsafe { &mut *state }.chunks.drain(..) {
+                self.pool.give(chunk);
+            }
+        });
     }
 }
 
@@ -582,7 +638,11 @@ mod tests {
             }
             seen.push((start, size));
         }
-        assert!(arena.used_bytes() >= seen.iter().map(|(_, l)| l).sum::<usize>());
+        assert_eq!(
+            arena.used_bytes(),
+            seen.iter().map(|(_, l)| l).sum::<usize>(),
+            "alloc must charge exactly the requested size, once per success"
+        );
     }
 
     #[test]
@@ -601,6 +661,40 @@ mod tests {
             "4 KiB doubling up to the 64 KiB cap, stepped down at the budget"
         );
         assert_eq!(sizes.iter().sum::<usize>(), budget);
+    }
+
+    #[test]
+    fn growing_a_chunk_keeps_the_previous_chunks_and_their_bytes() {
+        // A 4 KiB-class arena filled with 900-byte allocations grows
+        // twice (4 KiB, then two 8 KiB chunks would overshoot the small
+        // budget's ladder, so use EMBEDDED's ladder and a size that
+        // forces exactly two growths). Every earlier allocation's bytes
+        // must still read back correctly after the arena's chunk list
+        // has reallocated underneath them: a `with_mut` that resets
+        // `offset` before pushing the new chunk, or that pushes without
+        // resetting it, would corrupt or overlap an earlier span.
+        let profile = ArenaProfile::EMBEDDED;
+        let budget = 16 * 1024;
+        let arena = Arena::new(pool(profile, budget, 2), budget, profile);
+        let mut spans: Vec<(NonNull<u8>, u8)> = Vec::new();
+        let mut pattern = 0u8;
+        while arena.chunk_count() < 3 {
+            let ptr = arena.alloc(900, 8).expect("allocator");
+            // SAFETY: `alloc` returned 900 fresh, non-overlapping bytes.
+            unsafe { std::ptr::write_bytes(ptr.as_ptr(), pattern, 900) };
+            spans.push((ptr, pattern));
+            pattern = pattern.wrapping_add(1);
+        }
+        for (ptr, pattern) in &spans {
+            // SAFETY: the span is still inside a chunk the arena has not
+            // dropped, since `arena` is still alive.
+            let bytes = unsafe { std::slice::from_raw_parts(ptr.as_ptr(), 900) };
+            assert!(
+                bytes.iter().all(|b| b == pattern),
+                "a byte pattern written before a later chunk grew was overwritten"
+            );
+        }
+        assert_eq!(arena.chunk_sizes().len(), 3);
     }
 
     #[test]
@@ -800,7 +894,7 @@ mod tests {
                 }
                 spans.push((start, size));
             }
-            prop_assert!(arena.used_bytes() >= spans.iter().map(|(_, l)| l).sum::<usize>());
+            prop_assert_eq!(arena.used_bytes(), spans.iter().map(|(_, l)| l).sum::<usize>());
             prop_assert!(arena.reserved_bytes() >= arena.used_bytes());
         }
 

@@ -250,15 +250,24 @@ stress secs="600":
 #
 # | recipe        | models | profile | measured |
 # |---------------|--------|---------|----------|
-# | `loom`        | 14     | release | 19.7s    |
-# | `loom-debug`  | 15     | debug   | 133s     |
-# | `loom-all`    | both   | both    | ~153s    |
+# | `loom`        | 16     | release | 21.6s    |
+# | `loom-debug`  | 17     | debug   | 16.0s    |
+# | `loom-all`    | both   | both    | ~38s     |
+#
+# Re-measured on a host at load average 105-140 on 36 threads (a shared,
+# heavily loaded machine), so these are not comparable to a quiet-host
+# baseline; they are the wall time `cargo test`'s own summary line
+# reported for the test binary, excluding compilation.
 #
 # The debug run carries one extra calibration: the skip list's
 # single-writer guard (S2) is a `debug_assert`, so the model proving it
-# fires is compiled out of a release build. Six of the models are
-# `should_panic` calibrations that deliberately get the ordering wrong;
-# they are what make the passes mean anything.
+# fires is compiled out of a release build. The arena's single-writer
+# guard (A8) is debug-only the same way, but its own calibration runs in
+# both profiles with a different expected panic message per profile (a
+# debug build trips the guard, a release build trips loom's tracked
+# cell), so it does not add to the debug-only gap the way S2's does.
+# Seven of the models are `should_panic` calibrations that deliberately
+# get the ordering wrong; they are what make the passes mean anything.
 
 loom:
     RUSTFLAGS="--cfg loom" cargo test --release --test loom_memtable

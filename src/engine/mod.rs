@@ -39,6 +39,7 @@ use manifest::{VersionEdit, VersionSet};
 use memtable::{MemTable, MemTableConfig};
 use read_horizon::ReadHorizon;
 use read_view::{ReadView, ReadViewCell, VersionStore};
+use skiplist::InsertHint;
 use snapshot_registry::SnapshotRegistry;
 
 use crate::env::{Capabilities, Env, FileLock};
@@ -138,12 +139,20 @@ fn memtable_needs_flush(memtable: &MemTable) -> bool {
     !memtable.is_empty() || !memtable.clone_range_tombstones().is_empty()
 }
 
-fn apply_batch_op_to_memtable(memtable: &MemTable, op: &WriteBatchOp, seq: u64) {
+/// Apply one batch op to `memtable`, threading `hint` through the point
+/// ops. `DeleteRange` touches only the tombstone set, not the skip list,
+/// so the hint stays valid across it.
+fn apply_batch_op_to_memtable<'a>(
+    memtable: &'a MemTable,
+    hint: &mut InsertHint<'a>,
+    op: &WriteBatchOp,
+    seq: u64,
+) {
     match op {
-        WriteBatchOp::Put { key, value } => memtable.put(key, value, seq),
-        WriteBatchOp::Delete { key } => memtable.delete(key, seq),
+        WriteBatchOp::Put { key, value } => memtable.put_hinted(hint, key, value, seq),
+        WriteBatchOp::Delete { key } => memtable.delete_hinted(hint, key, seq),
         WriteBatchOp::DeleteRange { start, end } => memtable.delete_range(start, end, seq),
-        WriteBatchOp::Merge { key, operand } => memtable.merge(key, operand, seq),
+        WriteBatchOp::Merge { key, operand } => memtable.merge_hinted(hint, key, operand, seq),
     }
 }
 
