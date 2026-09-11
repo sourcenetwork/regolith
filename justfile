@@ -308,7 +308,7 @@ elle model="list-append" level="snapshot-isolation" isolation="repeatable-read":
         --model {{model}} --isolation {{isolation}} \
         --threads 8 --txns 50 --keys 4 \
         --out /tmp/regolith-history.json --dir /tmp/regolith-elle-db
-    java -jar harness/elle/elle-cli.jar --model {{model}} \
+    java -jar harness/elle/elle-cli.jar --model {{model}} --cycle-search-timeout 60000 \
         --consistency-models {{level}} /tmp/regolith-history.json
 
 # The same, with the fault injection the harness supports.
@@ -317,31 +317,39 @@ elle-fault model="list-append" level="snapshot-isolation":
         --model {{model}} --isolation repeatable-read --faults \
         --threads 8 --txns 50 --keys 4 \
         --out /tmp/regolith-history-fault.json --dir /tmp/regolith-elle-fault-db
-    java -jar harness/elle/elle-cli.jar --model {{model}} \
+    java -jar harness/elle/elle-cli.jar --model {{model}} --cycle-search-timeout 60000 \
         --consistency-models {{level}} /tmp/regolith-history-fault.json
 
 # Every level regolith claims, checked in one go.
 #
-# Each line prints `true` or `false`; a `false` on a level regolith claims is
-# a real failure and the recipe exits non-zero.
+# Each line prints elle-cli's verdict and whether elle-gen's built-in check
+# passed; anything other than `true` with a passing built-in check fails the
+# recipe. `:unknown` means elle-cli gave up a cycle search, so the per-SCC
+# timeout below is raised to keep a slow runner from reporting a valid
+# history as `:unknown`.
 elle-matrix:
     #!/usr/bin/env bash
     set -uo pipefail
     cd harness/elle
-    cargo build --release --bin elle-gen
     fail=0
+    cargo build --release --bin elle-gen
+    cargo test --release || fail=1
     check() {
         local name="$1" model="$2" level="$3"; shift 3
-        ./target/release/elle-gen --model "$model" "$@" \
-            --out "/tmp/elle-$name.json" --dir "/tmp/elle-db-$name" >/dev/null
-        # elle-cli prints "<path>\t<true|false>"; take the last field and
-        # strip surrounding whitespace, so a stray tab cannot read as a
-        # failure on a history that actually passed.
+        local built_in=pass
+        if ! ./target/release/elle-gen --model "$model" "$@" \
+            --out "/tmp/elle-$name.json" --dir "/tmp/elle-db-$name" >/dev/null; then
+            built_in=fail
+            fail=1
+        fi
+        # elle-cli prints "<path>\t<true|false|:unknown>"; take the last
+        # field and strip surrounding whitespace, so a stray tab cannot read
+        # as a failure on a history that actually passed.
         local v
-        v=$(java -jar elle-cli.jar --model "$model" \
+        v=$(java -jar elle-cli.jar --model "$model" --cycle-search-timeout 60000 \
             --consistency-models "$level" "/tmp/elle-$name.json" \
             | tail -1 | awk '{print $NF}')
-        printf '  %-42s %s\n' "$name [$level]" "$v"
+        printf '  %-42s %s (built-in check: %s)\n' "$name [$level]" "$v" "$built_in"
         if [ "$v" != "true" ]; then fail=1; fi
     }
     # Optimistic transactions are snapshot isolation. That is the level
