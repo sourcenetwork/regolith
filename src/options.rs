@@ -689,8 +689,13 @@ pub struct Options {
     /// Set it to the number of keys the workload's transactions actually
     /// touch. Too low and a transaction pays for an index it did not need;
     /// too high and a large transaction walks further than it should. A
-    /// value of `0` never indexes, which suits a workload of uniformly
-    /// tiny transactions and is a poor choice for any other.
+    /// value of `0` disables the count-based index, so an ordinary lookup
+    /// always walks the list; that suits a workload of uniformly tiny
+    /// transactions and is a poor choice for any other. It is not
+    /// absolute: a pessimistic transaction that promotes a key through
+    /// `get_for_update` and then scans still builds the index on first
+    /// need, because a transactional scan cannot afford to walk it once
+    /// per yielded key.
     ///
     /// Default: 32.
     pub transaction_keys_inline: usize,

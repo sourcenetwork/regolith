@@ -61,30 +61,36 @@
 //! discard what the transaction has already read, so a read anchor
 //! survives the rollback and still guards the commit.
 //!
-//! Serializable isolation is out of scope for v1: reads that are
-//! never written are not validated, so a read-only key can change
-//! underneath a transaction without aborting it.
+//! Below [`IsolationLevel::Serializable`] a plain read ([`Transaction::get`],
+//! [`Transaction::get_slice`] or a transactional scan) of a key the
+//! transaction never writes is not validated; at
+//! [`IsolationLevel::SnapshotIsolation`] a [`Transaction::get_for_update`]
+//! key is validated even when it is not written. At `Serializable` every key
+//! read by any of them is validated. At every level, a key a transactional
+//! scan walked that the transaction then writes is validated as a read from
+//! the begin snapshot, so a scan-then-write is never taken for a blind write.
 //!
 //! # Out of scope (follow-ups)
 //!
-//! - Range-scan conflict tracking (only point writes / `get_for_update`
-//!   participate in conflict detection).
+//! - Phantom detection. A transactional scan records the stretches of keys
+//!   it walked, but only to anchor keys the commit validates anyway: a key
+//!   another transaction inserts into a scanned range after the snapshot (a
+//!   phantom) is detected only when this transaction also writes it or
+//!   validates it as a point read at its level.
 //! - Transactional range deletes. [`Transaction::delete_range`] rejects
 //!   non-empty ranges until range conflict tracking or range locks land.
 //! - Wait-for graph deadlock detection (the pessimistic flavor ships
 //!   with timeout-based detection only).
 //! - Column-family-aware transactions (depends on CFs landing).
-//! - Streaming iteration over a transaction's buffered-plus-snapshot
-//!   view (`Transaction::iter` is not implemented; callers can
-//!   commit then iterate, or use point lookups).
 
 use crate::portability::{AtomicBool, AtomicU64, Ordering};
 use kovan_queue::seg_queue::SegQueue;
 
 use crate::txn_buffer::TxnBuffer;
 use std::collections::{BTreeMap, HashMap};
+use std::ops::ControlFlow;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use crate::sync::{Condvar, Mutex};
@@ -92,6 +98,9 @@ use crate::sync::{Condvar, Mutex};
 use crate::column_family::{DEFAULT_CF_ID, prefix_key};
 use crate::engine::{CommitOutcome, ConflictKey, RegolithEngine, ValidationSet};
 use crate::{Db, DbSlice, Error, Options, Result};
+
+mod scan_range;
+use scan_range::{OpenRun, ScanRun};
 
 /// Default lock-acquisition timeout for [`TransactionDb`] when the
 /// caller doesn't specify one on [`TransactionDb::with_lock_timeout`].
@@ -389,13 +398,25 @@ pub enum ScanDirection {
 ///
 /// # The one thing to know before relying on it
 ///
-/// Serializability here covers point reads, which is all a transaction
-/// can do: there is no transactional range scan, and
-/// [`Transaction::delete_range`] is rejected. A read set is therefore a
-/// set of keys rather than a predicate, and a phantom - a key that did
-/// not exist to be read - is not reachable through this API. Adding a
-/// transactional scan would change that, and such a scan has to record
-/// the range it walked, not the keys it happened to return.
+/// Serializability here is validation of a set of keys, not of a
+/// predicate. Point reads and every key a transactional scan yields are
+/// in that set. The stretches a scan walked are recorded too, but only to
+/// anchor keys the transaction validates anyway: a phantom - a key that
+/// did not exist to be yielded, inserted into the range by a concurrent
+/// transaction - aborts the transaction only if it also writes that key or
+/// point-reads it. A transaction whose correctness depends on the absence
+/// of keys in a range must not rely on this level for it.
+/// [`Transaction::delete_range`] stays rejected.
+///
+/// # What a scan costs at Serializable
+///
+/// A transactional scan at [`IsolationLevel::Serializable`] adds one
+/// read-set entry per key it yields, held until the transaction resolves,
+/// and the commit checks each of them while holding the write pipeline
+/// that every writer of the database, [`crate::Db::put`] included, waits
+/// on: the commit cost is one check per scanned key, and a large scan
+/// stalls every writer for that long. Below this level a scan records one
+/// entry per stretch of keys it walked, not one per key.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum IsolationLevel {
     /// Validate nothing beyond what the transaction wrote.
@@ -404,7 +425,8 @@ pub enum IsolationLevel {
     /// [`Transaction::get_for_update`]. regolith's default.
     #[default]
     SnapshotIsolation,
-    /// Validate the entire read set.
+    /// Validate the entire read set, including every key a transactional
+    /// scan yields.
     Serializable,
 }
 
@@ -443,11 +465,26 @@ pub struct Transaction<'db> {
     range_deletes: SegQueue<(Vec<u8>, Vec<u8>)>,
     /// Merge operands buffered for commit.
     merges: SegQueue<(Vec<u8>, Vec<u8>)>,
-    /// What this transaction has observed about each key it read.
-    /// Sorted at commit so a multi-key conflict always reports the
-    /// same key. Never rewound: a savepoint rollback undoes buffered
-    /// writes, not reads that already happened.
+    /// What this transaction has observed about each key it read,
+    /// through a point read, or through a scan at Serializable. Sorted
+    /// at commit so a multi-key conflict always reports the same key.
+    /// Never rewound: a savepoint rollback undoes buffered writes, not
+    /// reads that already happened.
     tracked: TxnBuffer<Vec<u8>, Arc<KeyState>>,
+    /// The stretches of snapshot keys this transaction's scans yielded, one
+    /// record per stretch rather than one per key. Allocated by the first
+    /// scan that yields a snapshot key. Never rewound, like `tracked`.
+    ///
+    /// Boxed so the queue (and its 32-slot first segment once it exists)
+    /// stays off the `Transaction` struct itself: every commit moves this
+    /// value, and a transaction that never scans must not pay for it.
+    scan_runs: OnceLock<Box<SegQueue<Arc<ScanRun>>>>,
+    /// Highest sequence [`Transaction::get_for_update`] has ever promoted a
+    /// key to; `snapshot_seq` while nothing has been promoted past it.
+    /// Lets `scan_read_seq` skip the `tracked` lookup outright for a
+    /// pessimistic scan that could not possibly find a promoted key,
+    /// instead of walking `tracked` once per yielded key.
+    promoted_seq: AtomicU64,
     /// Savepoint stack. Each entry captures the full write buffer
     /// and a count of locks held at that point.
     savepoints: Vec<Savepoint>,
@@ -533,6 +570,8 @@ impl<'db> Transaction<'db> {
             range_deletes: SegQueue::new(),
             merges: SegQueue::new(),
             tracked: TxnBuffer::new(keys_inline),
+            scan_runs: OnceLock::new(),
+            promoted_seq: AtomicU64::new(snapshot_seq),
             savepoints: Vec::new(),
             held_locks: TxnBuffer::new(keys_inline),
             lock_manager,
@@ -554,8 +593,9 @@ impl<'db> Transaction<'db> {
     /// Takes no lock. The read is remembered, so writing the same
     /// key later turns it into a read-modify-write that is validated
     /// at commit and aborts with [`TransactionError::Conflict`]
-    /// rather than losing the update. A key that is read and never
-    /// written is not validated: use
+    /// rather than losing the update. Below
+    /// [`IsolationLevel::Serializable`], a key that is read and
+    /// never written is not validated: use
     /// [`Transaction::get_for_update`] when a read must participate
     /// in conflict detection on its own.
     pub fn get(&self, key: &[u8]) -> TxResult<Option<Vec<u8>>> {
@@ -588,11 +628,37 @@ impl<'db> Transaction<'db> {
     /// Scan a key range without materializing it, merging this
     /// transaction's buffered writes over the snapshot underneath.
     ///
-    /// The database side is streamed, so memory does not grow with the
-    /// size of the range and a caller that stops early pays only for what
-    /// it read. The transaction's own writes are sorted up front, which
-    /// is bounded by what this transaction has written rather than by
-    /// what the database holds.
+    /// The database side is streamed, and a caller that stops early pays
+    /// only for what it read. The transaction's own writes are sorted up
+    /// front, which is bounded by what this transaction has written rather
+    /// than by what the database holds.
+    ///
+    /// What the scan leaves in the transaction depends on the level. Below
+    /// [`IsolationLevel::Serializable`] it records each unbroken stretch of
+    /// snapshot keys it yields once, as its first and last key, so what it
+    /// holds until the transaction resolves grows with the number of scans
+    /// (and the transaction's own writes inside the range), not with the size
+    /// of the range. At `Serializable` it also records every yielded key as a
+    /// read, exactly as [`Transaction::get`] does: that grows by one entry per
+    /// distinct key yielded, and the commit checks each one while holding the
+    /// write pipeline, so every writer waits one check per scanned key.
+    ///
+    /// At every level, a key inside a stretch the scan walked that the
+    /// transaction then writes is validated as a read from the begin
+    /// snapshot, as a `get` followed by the write would be, so it is never
+    /// elided as a blind write. At `Serializable` a concurrent commit to any
+    /// yielded key also aborts the transaction. Keys yielded from the
+    /// transaction's own buffered writes are not recorded and end a stretch,
+    /// as `get` does not record them either. A key a pessimistic transaction
+    /// already locked through [`Transaction::get_for_update`] is served where
+    /// `get` serves it, at the lock horizon. A key a concurrent transaction
+    /// inserts into the range is not detected unless this transaction
+    /// validates it anyway; see [`IsolationLevel`].
+    ///
+    /// A stretch is recorded when its first key is yielded and closed when
+    /// the stream is exhausted or dropped. A stream that is never dropped
+    /// (leaked) counts as having walked to the end of the keyspace in its
+    /// direction.
     pub fn scan_stream(&self, start: Option<&[u8]>, end: Option<&[u8]>) -> TxnScanStream<'_> {
         self.scan_stream_in(start, end, ScanDirection::Forward)
     }
@@ -613,6 +679,10 @@ impl<'db> Transaction<'db> {
         end: Option<&[u8]>,
         direction: ScanDirection,
     ) -> TxnScanStream<'_> {
+        // `scan_read_seq` indexes `tracked` itself, lazily, the first time
+        // it finds a promotion; a `&self` stream and `&self` `get_for_update`
+        // mean a promotion can land after this call returns, so indexing
+        // only here would miss it. See `scan_read_seq`.
         let lo = start.map(|s| prefix_key(DEFAULT_CF_ID, s));
         let hi = end.map(|e| prefix_key(DEFAULT_CF_ID, e));
         let reverse = direction == ScanDirection::Reverse;
@@ -650,12 +720,16 @@ impl<'db> Transaction<'db> {
         }
 
         TxnScanStream {
+            txn: self,
             cursor,
             cursor_done: false,
             buffered: buffered.into_iter().peekable(),
             start: lo.map(|lo| lo[4..].to_vec()),
             end: hi.map(|hi| hi[4..].to_vec()),
             reverse,
+            run: None,
+            probe: Vec::new(),
+            error: None,
         }
     }
 
@@ -674,6 +748,9 @@ impl<'db> Transaction<'db> {
         let already_held = self.lock_key(&prefixed)?;
         let horizon = self.read_horizon(&prefixed, already_held);
         let read_seq = self.observe(&prefixed, horizon, true);
+        // Tells `scan_read_seq` a promoted key might exist, so it is worth
+        // looking `tracked` up for a pessimistic scan.
+        self.promoted_seq.fetch_max(read_seq, Ordering::AcqRel);
         if let Some(buffered) = self.writes.get(&prefixed) {
             return Ok(buffered);
         }
@@ -855,7 +932,20 @@ impl<'db> Transaction<'db> {
         let range_deletes = drain(&self.range_deletes);
         let merges = drain(&self.merges);
         let tracked = self.tracked.drain();
-        let checks = self.validation_set(tracked, &writes, &merges);
+        let mut checks = self.validation_set(tracked, &writes, &merges);
+        // Behind the `take`, not threaded through `validation_set`, so a
+        // transaction that never scans (the common case) pays no `Vec`
+        // round trip for an empty run list on its commit path.
+        if let Some(runs) = self.scan_runs.take() {
+            let runs = drain(&runs);
+            scan_range::cover(
+                &mut checks.reads,
+                &runs,
+                &writes,
+                &merges,
+                self.snapshot_seq,
+            );
+        }
 
         // The write-stall admission (same order as a plain write with
         // `WriteOptions::default()`: closed/read-only, then size
@@ -902,6 +992,10 @@ impl<'db> Transaction<'db> {
     /// read. Pessimistic: written keys are not validated (`writes_at` is
     /// `None`), the key lock already orders them and there is no read for a
     /// concurrent writer to invalidate.
+    ///
+    /// This set does not yet account for what a transactional scan walked;
+    /// `commit_inner` folds that in afterward with `scan_range::cover`,
+    /// skipped entirely when the transaction ran no scan.
     fn validation_set(
         &self,
         mut tracked: Vec<(Vec<u8>, Arc<KeyState>)>,
@@ -1020,6 +1114,61 @@ impl<'db> Transaction<'db> {
             .max(horizon)
     }
 
+    /// The sequence a scan serves `key` (CF-prefixed) at, recording nothing:
+    /// the begin snapshot, or the sequence a pessimistic transaction already
+    /// reads the key at because `get_for_update` promoted it, which is what
+    /// [`Transaction::get`] would serve.
+    ///
+    /// `tracked` is walked, not indexed, below
+    /// [`crate::Options::transaction_keys_inline`] entries, so a `tracked.get`
+    /// here would cost O(tracked keys) per yielded key. `promoted_seq` makes
+    /// the common case (no `get_for_update` promoted anything past the begin
+    /// snapshot) one Acquire load instead: no cell can have `read_seq` above
+    /// `snapshot_seq` then, so a lookup could only ever confirm what the
+    /// caller already knows.
+    ///
+    /// When a promotion might exist, this indexes `tracked` right here,
+    /// before the lookup, rather than only once when the stream was built:
+    /// `scan_stream_in` and `get_for_update` both take `&self`, so a
+    /// promotion can land after the stream already exists, and indexing at
+    /// construction alone would leave every later key walking the list.
+    /// Doing it per key instead of once still costs O(1) per call past the
+    /// first: `ensure_indexed` is a single `OnceLock::get` once the index is
+    /// built, and it is built at most once (the `OnceLock` inside it makes a
+    /// second, concurrent build a no-op). Sound with concurrent promotions:
+    /// `get_for_update` inserts into `tracked` before it raises
+    /// `promoted_seq` (`Release`-ordered by the `fetch_max` below, paired
+    /// with this `Acquire` load), so once this load observes a promotion,
+    /// that promotion's entry is already linked into `tracked`'s list and
+    /// visible to the index build this call triggers.
+    fn scan_read_seq(&self, key: &[u8]) -> u64 {
+        match self.mode {
+            // An optimistic transaction reads every key at its begin
+            // snapshot: `read_horizon` never returns anything else.
+            TxMode::Optimistic => self.snapshot_seq,
+            TxMode::Pessimistic { .. } => {
+                if self.promoted_seq.load(Ordering::Acquire) <= self.snapshot_seq {
+                    return self.snapshot_seq;
+                }
+                self.tracked.ensure_indexed();
+                self.tracked.get(key).map_or(self.snapshot_seq, |state| {
+                    state
+                        .read_seq
+                        .load(Ordering::Acquire)
+                        .max(self.snapshot_seq)
+                })
+            }
+        }
+    }
+
+    /// Register a stretch a scan began, so commit sees it even if the stream
+    /// is never closed.
+    fn record_scan_run(&self, run: Arc<ScanRun>) {
+        self.scan_runs
+            .get_or_init(|| Box::new(SegQueue::new()))
+            .push(run);
+    }
+
     /// Acquire `key`'s exclusive lock. Returns `true` when this
     /// transaction already held it.
     fn acquire_lock(&self, key: &[u8], tx_id: u64) -> TxResult<bool> {
@@ -1063,8 +1212,15 @@ type BufferedWrites = std::iter::Peekable<std::vec::IntoIter<(Vec<u8>, Option<Ve
 /// buffered side is bounded by what this transaction wrote.
 ///
 /// A buffered delete hides the snapshot's entry for that key, and a
-/// buffered put replaces it.
+/// buffered put replaces it. Each unbroken stretch of snapshot entries it
+/// yields is recorded in the transaction once, as the first and the last
+/// key of the stretch (per key as well at Serializable); entries that come
+/// from the transaction's own writes are not recorded and end the stretch.
 pub struct TxnScanStream<'txn> {
+    /// The transaction this scan reads for: its stretches are registered
+    /// there, and a key it already promoted through `get_for_update` is
+    /// served at that key's read sequence.
+    txn: &'txn Transaction<'txn>,
     cursor: crate::CfIter<'txn>,
     cursor_done: bool,
     buffered: BufferedWrites,
@@ -1073,6 +1229,12 @@ pub struct TxnScanStream<'txn> {
     /// Exclusive upper bound, user-visible form. Where a forward walk stops.
     end: Option<Vec<u8>>,
     reverse: bool,
+    /// The stretch of snapshot keys being yielded. Dropping it closes it.
+    run: Option<OpenRun>,
+    /// The key being handed out, CF-prefixed, reused across yields.
+    probe: Vec<u8>,
+    /// A read of a key served past the begin snapshot that failed.
+    error: Option<std::io::Error>,
 }
 
 impl TxnScanStream<'_> {
@@ -1080,7 +1242,9 @@ impl TxnScanStream<'_> {
     ///
     /// `Ok(())` means the range ended. An error means it did not: the
     /// entries handed out are the transaction's buffered writes merged with
-    /// a *prefix* of what the database holds, and the rest was never read.
+    /// a *prefix* of what the database holds, and the rest was never read,
+    /// or a read of a key this transaction already locked through
+    /// [`Transaction::get_for_update`] failed.
     ///
     /// A merged stream cannot report this any other way. `Iterator` has
     /// nowhere to put a failure, and a cursor that dies mid-range goes
@@ -1089,6 +1253,9 @@ impl TxnScanStream<'_> {
     /// this after iterating whenever a missing row would be worse than an
     /// error. It is the same contract as [`crate::ScanStream::status`].
     pub fn status(&self) -> Result<()> {
+        if let Some(e) = &self.error {
+            return Err(std::io::Error::new(e.kind(), e.to_string()).into());
+        }
         self.cursor.status()
     }
 
@@ -1147,6 +1314,63 @@ impl TxnScanStream<'_> {
             first.cmp(second)
         }
     }
+
+    /// Hand out the entry under the cursor and record the read.
+    ///
+    /// `Break(Some(entry))` hands `entry` out, `Break(None)` ends the stream,
+    /// `Continue` moves on to the next entry.
+    ///
+    /// A key a pessimistic transaction already promoted past the begin
+    /// snapshot through `get_for_update` is served where `get` serves it, at
+    /// its `read_seq`, and is skipped when nothing is visible there. Its cell
+    /// already records that read, so it ends the current stretch instead of
+    /// joining it: the stretch must hold only keys observed at the begin
+    /// snapshot. Every other key is served from the cursor at the begin
+    /// snapshot and extends the stretch (starting one, and registering it,
+    /// on the first such key). At Serializable the key is also recorded per
+    /// key through `observe`.
+    fn yield_cursor(&mut self, key: Vec<u8>) -> ControlFlow<Option<(Vec<u8>, DbSlice)>> {
+        let txn = self.txn;
+        self.probe.clear();
+        self.probe.extend_from_slice(&DEFAULT_CF_ID.to_be_bytes());
+        self.probe.extend_from_slice(&key);
+        let read_seq = txn.scan_read_seq(&self.probe);
+        if read_seq > txn.snapshot_seq {
+            self.step_cursor();
+            self.run = None;
+            return match txn.engine.get_slice_at(&self.probe, read_seq) {
+                Ok(Some(value)) => ControlFlow::Break(Some((key, value))),
+                Ok(None) => ControlFlow::Continue(()),
+                Err(e) => {
+                    tracing::error!(
+                        error = %e,
+                        "transaction scan ended early: a read failed mid-range, \
+                         so the rows returned are a prefix and not the range"
+                    );
+                    self.error = Some(e);
+                    self.cursor_done = true;
+                    ControlFlow::Continue(())
+                }
+            };
+        }
+        let Some(value) = self.cursor.value_slice() else {
+            self.run = None;
+            return ControlFlow::Break(None);
+        };
+        self.step_cursor();
+        match &mut self.run {
+            Some(open) => open.extend(&self.probe),
+            None => {
+                let (run, open) = OpenRun::start(&self.probe, self.reverse);
+                txn.record_scan_run(run);
+                self.run = Some(open);
+            }
+        }
+        if txn.isolation == IsolationLevel::Serializable {
+            txn.observe(&self.probe, txn.snapshot_seq, false);
+        }
+        ControlFlow::Break(Some((key, value)))
+    }
 }
 
 impl Iterator for TxnScanStream<'_> {
@@ -1160,9 +1384,13 @@ impl Iterator for TxnScanStream<'_> {
             let buffered_key = self.buffered.peek().map(|(key, _)| key[4..].to_vec());
 
             match (cursor_key, buffered_key) {
-                (None, None) => return None,
+                (None, None) => {
+                    self.run = None;
+                    return None;
+                }
                 // Only the transaction has this key.
                 (None, Some(_)) => {
+                    self.run = None;
                     let (key, value) = self.buffered.next()?;
                     if let Some(value) = value {
                         return Some((key[4..].to_vec(), DbSlice::from(value)));
@@ -1170,17 +1398,18 @@ impl Iterator for TxnScanStream<'_> {
                 }
                 // Only the database has it.
                 (Some(key), None) => {
-                    let value = self.cursor.value_slice()?;
-                    self.step_cursor();
-                    return Some((key, value));
+                    if let ControlFlow::Break(item) = self.yield_cursor(key) {
+                        return item;
+                    }
                 }
                 (Some(ckey), Some(bkey)) => match self.precedes(&ckey, &bkey) {
                     std::cmp::Ordering::Less => {
-                        let value = self.cursor.value_slice()?;
-                        self.step_cursor();
-                        return Some((ckey, value));
+                        if let ControlFlow::Break(item) = self.yield_cursor(ckey) {
+                            return item;
+                        }
                     }
                     std::cmp::Ordering::Greater => {
+                        self.run = None;
                         let (key, value) = self.buffered.next()?;
                         if let Some(value) = value {
                             return Some((key[4..].to_vec(), DbSlice::from(value)));
@@ -1190,6 +1419,7 @@ impl Iterator for TxnScanStream<'_> {
                     // so its write wins and the snapshot entry is skipped
                     // whether that write was a put or a delete.
                     std::cmp::Ordering::Equal => {
+                        self.run = None;
                         self.step_cursor();
                         let (key, value) = self.buffered.next()?;
                         if let Some(value) = value {
@@ -2110,6 +2340,110 @@ mod tests {
             stats.get_ticker(Ticker::WriteStallMicros),
             before,
             "a commit refused for a WAL failure must not pay the stall wait"
+        );
+    }
+
+    // A scan's read set grows by yielded key, not by call: a key it
+    // already tracked folds into the same cell, a buffered key it
+    // yields is never tracked, and a bound key the walk stops on is
+    // never handed out so it never reaches `tracked` either.
+    #[test]
+    fn a_scan_records_exactly_the_snapshot_keys_it_yields() {
+        let (db, _dir) = opt_db();
+        db.db().put(b"a", b"0").unwrap();
+        db.db().put(b"b", b"0").unwrap();
+        db.db().put(b"c", b"0").unwrap();
+        let tx = db.begin_transaction_with(IsolationLevel::Serializable);
+
+        assert_eq!(tx.scan_stream(Some(b"x"), Some(b"y")).count(), 0);
+        assert_eq!(tx.tracked.len(), 0, "an empty scan tracks nothing");
+
+        assert_eq!(tx.scan_stream(Some(b"a"), Some(b"b")).count(), 1);
+        assert_eq!(tx.tracked.len(), 1, "the bound key b is not recorded");
+
+        tx.put(b"c", b"pending").unwrap();
+        assert_eq!(tx.scan_stream(None, None).count(), 3);
+        assert_eq!(
+            tx.tracked.len(),
+            2,
+            "a folds into its existing cell, b is newly tracked, c came from \
+             the write buffer and is not tracked"
+        );
+
+        let fresh = db.begin_transaction_with(IsolationLevel::Serializable);
+        assert_eq!(fresh.scan_stream(None, None).take(0).count(), 0);
+        assert_eq!(
+            fresh.tracked.len(),
+            0,
+            "a stream that yields nothing records nothing"
+        );
+        assert!(fresh.scan_runs.get().is_none());
+    }
+
+    /// Regression: `scan_stream_in` used to index `tracked` only at the
+    /// moment the stream was built, so a `get_for_update` promotion that
+    /// landed after a stream was already open left every later yielded key
+    /// walking the unindexed list instead of hitting the hash index.
+    /// `scan_read_seq` now builds the index itself, lazily, the first time
+    /// it finds a promotion, so the order `get_for_update` and
+    /// `scan_stream` run in cannot matter.
+    #[test]
+    fn a_promotion_mid_scan_indexes_tracked_lazily_not_only_at_construction() {
+        let dir = TempDir::new().unwrap();
+        // `0` never indexes from ordinary inserts (`TxnBuffer::new`), so the
+        // only thing that can index `tracked` in this test is the lazy
+        // build `scan_read_seq` triggers, isolated from the unrelated
+        // "past N keys" auto-index a bigger default would also trigger.
+        let opts = Options {
+            transaction_keys_inline: 0,
+            ..Options::default()
+        };
+        let db = TransactionDb::open(dir.path(), opts).unwrap();
+        for i in 0..64u32 {
+            db.db().put(format!("k{i:04}").as_bytes(), b"0").unwrap();
+        }
+        let tx = db.begin_transaction();
+
+        let mut stream = tx.scan_stream(None, None);
+        assert_eq!(stream.next().unwrap().0, b"k0000".to_vec());
+        assert!(
+            !tx.tracked.is_indexed(),
+            "nothing is promoted yet: scan_stream_in must not index speculatively"
+        );
+
+        // Lands after the begin snapshot; the promotion below must read
+        // this, not the snapshot value, proving it is served at the lock
+        // horizon like `get` and not accidentally read from the cursor.
+        db.db().put(b"k0010", b"promoted").unwrap();
+        assert_eq!(
+            tx.get_for_update(b"k0010").unwrap(),
+            Some(b"promoted".to_vec()),
+            "get_for_update while the stream is open reads past the begin snapshot"
+        );
+        assert!(
+            !tx.tracked.is_indexed(),
+            "a promotion by itself must not index; the next scan lookup does"
+        );
+
+        // Draining the rest is exactly where the bug bit: every one of
+        // these calls used to fall back to `TxnBuffer::walk`, O(1) here but
+        // O(tracked keys) had more been promoted, because construction-time
+        // indexing had already run and missed this promotion.
+        let rest: Vec<(Vec<u8>, Vec<u8>)> = stream.map(|(k, v)| (k, v.to_vec())).collect();
+        assert!(
+            tx.tracked.is_indexed(),
+            "scan_read_seq must index tracked lazily on first need, mid-stream, \
+             not only when scan_stream_in constructed the stream"
+        );
+        assert_eq!(rest.len(), 63, "every remaining key is still yielded");
+        let promoted = rest
+            .iter()
+            .find(|(k, _)| k == b"k0010")
+            .expect("the promoted key is still yielded");
+        assert_eq!(
+            promoted.1,
+            b"promoted".to_vec(),
+            "yielded at the promoted read sequence, not the stale begin snapshot"
         );
     }
 }

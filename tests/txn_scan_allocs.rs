@@ -79,22 +79,30 @@ fn a_transaction_scan_stops_early_without_reading_the_range() {
             .put(format!("key/{i:06}").as_bytes(), &value)
             .expect("put");
     }
-    let txn = db.begin_transaction_owned(IsolationLevel::Serializable);
+    for level in [
+        IsolationLevel::SnapshotIsolation,
+        IsolationLevel::Serializable,
+    ] {
+        let txn = db.begin_transaction_owned(level);
 
-    BYTES.store(0, Ordering::Relaxed);
-    COUNT.store(0, Ordering::Relaxed);
-    ARMED.store(true, Ordering::Relaxed);
-    let taken = txn.scan_stream(None, None).take(5).count();
-    ARMED.store(false, Ordering::Relaxed);
-    let streamed = BYTES.load(Ordering::Relaxed);
+        BYTES.store(0, Ordering::Relaxed);
+        COUNT.store(0, Ordering::Relaxed);
+        ARMED.store(true, Ordering::Relaxed);
+        let taken = txn.scan_stream(None, None).take(5).count();
+        ARMED.store(false, Ordering::Relaxed);
+        let streamed = BYTES.load(Ordering::Relaxed);
 
-    assert_eq!(taken, 5);
-    let payload = ENTRIES * VALUE_LEN;
-    eprintln!("txn take(5) streamed {streamed} bytes over {ENTRIES} x {VALUE_LEN}B");
-    assert!(
-        streamed * 10 < payload,
-        "a transaction scan that stopped after 5 entries allocated {streamed} bytes \
-         against a {payload} byte range, so it is reading the range instead of \
-         streaming it"
-    );
+        assert_eq!(taken, 5);
+        let payload = ENTRIES * VALUE_LEN;
+        eprintln!(
+            "{level:?}: txn take(5) streamed {streamed} bytes in {} allocations over {ENTRIES} x {VALUE_LEN}B",
+            COUNT.load(Ordering::Relaxed)
+        );
+        assert!(
+            streamed * 10 < payload,
+            "{level:?}: a transaction scan that stopped after 5 entries allocated {streamed} bytes \
+             against a {payload} byte range, so it is reading the range instead of \
+             streaming it"
+        );
+    }
 }

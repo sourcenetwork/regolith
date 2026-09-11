@@ -148,6 +148,18 @@ txn.commit()?;
 | `SnapshotIsolation` (default) | prevented | prevented | possible |
 | `Serializable` | prevented | prevented | prevented |
 
+At `Serializable`, every key a transaction reads through `get` or a transactional scan is
+validated. Below it, a written key is validated only in the optimistic flavour; the
+pessimistic flavour never validates a written key at commit, since the key lock already
+orders it. A `get_for_update` key is validated in both flavours from `SnapshotIsolation`
+up. At every level a key a transactional scan walked that the transaction then writes is
+validated as a read, so a scan-then-write never loses an update. A range is not validated
+on its own: a key inserted into a scanned range by a concurrent transaction (a phantom) is
+detected only when the transaction also writes it or validates it as a point read. A scan
+at `Serializable` holds one read-set entry per key it yields until the transaction
+resolves, and its commit checks each one while every writer waits; below it, a scan holds
+one entry per stretch of keys it walked.
+
 `TransactionDb` is the pessimistic flavour: it takes key locks, so contention waits
 instead of retrying. `OptimisticTransactionDb` validates at commit and retries.
 
