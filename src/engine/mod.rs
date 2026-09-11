@@ -801,7 +801,7 @@ impl RegolithEngine {
         )
     }
 
-    fn ensure_writable(&self) -> std::io::Result<()> {
+    pub(crate) fn ensure_writable(&self) -> std::io::Result<()> {
         self.ensure_open()?;
         if self.wal_failed.load(Ordering::Acquire) {
             return Err(self.wal_failure_error());
@@ -878,6 +878,34 @@ impl RegolithEngine {
                     self.validate_value_size(operand)?;
                 }
             }
+        }
+        Ok(())
+    }
+
+    /// Validate the sizes of a transaction's buffered writes ahead of the
+    /// write-stall admission wait: the same check `validate_ops_sizes` runs
+    /// on a `grouped_batch_ops` output, but on the pre-grouped buffers so a
+    /// commit that can never pass size validation is rejected before it
+    /// pays for admission rather than after.
+    pub(crate) fn validate_commit_sizes(
+        &self,
+        point_ops: &BTreeMap<Vec<u8>, Option<Vec<u8>>>,
+        range_deletes: &[(Vec<u8>, Vec<u8>)],
+        merges: &[(Vec<u8>, Vec<u8>)],
+    ) -> std::io::Result<()> {
+        for (key, value) in point_ops {
+            self.validate_prefixed_key_size(key)?;
+            if let Some(value) = value {
+                self.validate_value_size(value)?;
+            }
+        }
+        for (start, end) in range_deletes {
+            self.validate_prefixed_key_size(start)?;
+            self.validate_prefixed_key_size(end)?;
+        }
+        for (key, operand) in merges {
+            self.validate_prefixed_key_size(key)?;
+            self.validate_value_size(operand)?;
         }
         Ok(())
     }

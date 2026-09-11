@@ -821,6 +821,20 @@ impl<'db> Transaction<'db> {
     /// for a write that bypassed it or that landed before the lock
     /// was taken. A pessimistic blind write is not validated: the
     /// key lock orders it, and there is no read to lose.
+    ///
+    /// A commit that carries writes passes the same admission as a plain
+    /// write with [`crate::WriteOptions::default`], in the same order: key
+    /// and value sizes are validated first, so an oversized commit is
+    /// rejected before it waits, then it blocks while a stop trigger is
+    /// active and pays the slowdown delay while a slowdown trigger is
+    /// active, before the conflict check and before any commit lock is
+    /// taken. A wait that admits the commit is charged to
+    /// [`crate::Ticker::WriteStallMicros`]. A stall the engine cannot
+    /// relieve surfaces as [`TransactionError::Io`] carrying the same
+    /// reason a plain write reports through [`crate::Error::Busy`]. A
+    /// commit with no buffered writes never waits: it validates its read
+    /// set and returns. A pessimistic transaction keeps its key locks for
+    /// the duration of the wait.
     pub fn commit(mut self) -> TxResult<()> {
         let result = self.commit_inner();
         self.resolved = true;
@@ -863,6 +877,28 @@ impl<'db> Transaction<'db> {
             .filter(|(key, _)| seen.insert(key.clone()))
             .collect();
         let conflict_keys = self.validation_set(tracked, &writes, &merges);
+
+        // Same admission as a plain write with `WriteOptions::default()`,
+        // in the same order: the closed and read-only checks first, so a
+        // handle that can never write is refused instead of parked, then
+        // size validation, so a commit that can never fit is refused
+        // instead of parked, then the stall wait, and only then the
+        // pipeline mutex inside `commit_optimistic`. Never inside that
+        // mutex: a `CompactInline` wait runs a compaction pass on this
+        // thread, and that pass must not be entered while any commit-path
+        // lock is held. A commit that writes nothing skips all of this: it
+        // takes no capacity, and its validation must still run under a
+        // stall.
+        let carries_writes = !writes.is_empty() || !range_deletes.is_empty() || !merges.is_empty();
+        if carries_writes {
+            self.engine
+                .ensure_writable()
+                .map_err(TransactionError::Io)?;
+            self.engine
+                .validate_commit_sizes(&writes, &range_deletes, &merges)
+                .map_err(TransactionError::Io)?;
+            self.engine.wait_for_write_capacity(false)?;
+        }
 
         let outcome = self
             .engine
@@ -1406,6 +1442,7 @@ impl LockManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{Statistics, Ticker};
     use tempfile::TempDir;
 
     fn opt_db() -> (OptimisticTransactionDb, TempDir) {
@@ -1990,5 +2027,145 @@ mod tests {
         assert_eq!(tx.get(b"a").unwrap(), Some(b"staged".to_vec()));
         assert_eq!(tx.get(b"b").unwrap(), Some(b"2".to_vec()));
         assert_eq!(tx.get(b"missing").unwrap(), None);
+    }
+
+    // -- Write-stall admission --------------------------------------------
+
+    fn slowdown_opts(stats: &Arc<Statistics>) -> Options {
+        Options {
+            // Tiny memtable so every handful of puts rolls an L0 file.
+            write_buffer_size: 4 * 1024,
+            // Disable automatic compaction so L0 can't drain on us.
+            l0_compaction_trigger: 1000,
+            // Slow down once L0 has 2 files, never stop (high trigger).
+            level0_slowdown_writes_trigger: 2,
+            level0_stop_writes_trigger: 10_000,
+            // Disable the memtable-count trigger so this isolates the L0
+            // slowdown path.
+            max_write_buffer_number: 0,
+            statistics: Some(Arc::clone(stats)),
+            ..Options::default()
+        }
+    }
+
+    /// Drive `plain` past the slowdown trigger with the same recipe as
+    /// `test_write_stall_slowdown_accumulates_micros`, then check that a
+    /// commit through `begin` is charged the wait only when it carries a
+    /// write.
+    fn probe_slowdown_ticker<'a>(
+        plain: &Db,
+        stats: &Statistics,
+        begin: impl Fn() -> Transaction<'a>,
+    ) {
+        let payload = vec![0xCDu8; 600];
+        for i in 0..128 {
+            let k = format!("k{i:04}");
+            plain.put(k.as_bytes(), &payload).unwrap();
+        }
+        let stall = stats.get_ticker(Ticker::WriteStallMicros);
+        assert!(
+            stall > 0,
+            "expected WriteStallMicros > 0 after crossing the slowdown trigger, got {stall}"
+        );
+
+        let before = stats.get_ticker(Ticker::WriteStallMicros);
+        let tx = begin();
+        tx.get(b"k0000").unwrap();
+        tx.commit().unwrap();
+        assert_eq!(
+            stats.get_ticker(Ticker::WriteStallMicros),
+            before,
+            "a read-only commit must not be charged for the write-stall wait"
+        );
+
+        let tx = begin();
+        tx.put(b"txn", b"v").unwrap();
+        tx.commit().unwrap();
+        assert!(
+            stats.get_ticker(Ticker::WriteStallMicros) > before,
+            "a writing commit under a slowdown must be charged for the wait"
+        );
+        assert_eq!(plain.get(b"txn").unwrap(), Some(b"v".to_vec()));
+    }
+
+    #[test]
+    fn optimistic_commit_is_charged_the_slowdown_like_a_plain_write() {
+        let stats = Arc::new(Statistics::new());
+        let dir = TempDir::new().unwrap();
+        let db = OptimisticTransactionDb::open(dir.path(), slowdown_opts(&stats)).unwrap();
+        probe_slowdown_ticker(db.db(), &stats, || db.begin_transaction());
+    }
+
+    #[test]
+    fn pessimistic_commit_is_charged_the_slowdown_like_a_plain_write() {
+        let stats = Arc::new(Statistics::new());
+        let dir = TempDir::new().unwrap();
+        let db = TransactionDb::open(dir.path(), slowdown_opts(&stats)).unwrap();
+        probe_slowdown_ticker(db.db(), &stats, || db.begin_transaction());
+    }
+
+    #[test]
+    fn commit_on_a_closed_handle_reports_closed_before_it_waits() {
+        let dir = TempDir::new().unwrap();
+        let db = OptimisticTransactionDb::open(dir.path(), Options::default()).unwrap();
+        let tx = db.begin_transaction();
+        tx.put(b"k", b"v").unwrap();
+        db.db().close().unwrap();
+        match tx.commit() {
+            Err(TransactionError::Io(e)) => {
+                assert_eq!(e.kind(), std::io::ErrorKind::NotConnected);
+                assert_eq!(e.to_string(), "database is closed");
+            }
+            other => panic!("expected a closed-handle Io error, got {other:?}"),
+        }
+    }
+
+    /// The closed-handle test above cannot tell whether `commit_inner`'s
+    /// `ensure_writable` call runs before the stall wait, because a closed
+    /// handle produces the identical error either way (`wait_for_write_capacity`
+    /// also refuses a closed engine). A latched write-ahead-log failure
+    /// under `StallPolicy::WaitForWorker` is the one case that can: without
+    /// the pre-wait check, the commit would sleep out the slowdown delay
+    /// first and only then report the WAL error, charging the wait to
+    /// `WriteStallMicros` on the way. Regression for deleting that call.
+    #[test]
+    fn commit_on_a_wal_failed_handle_is_refused_before_the_stall_wait() {
+        let stats = Arc::new(Statistics::new());
+        let dir = TempDir::new().unwrap();
+        let db = OptimisticTransactionDb::open(dir.path(), slowdown_opts(&stats)).unwrap();
+
+        let payload = vec![0xCDu8; 600];
+        for i in 0..128 {
+            let k = format!("k{i:04}");
+            db.db().put(k.as_bytes(), &payload).unwrap();
+        }
+        let stall = stats.get_ticker(Ticker::WriteStallMicros);
+        assert!(
+            stall > 0,
+            "expected WriteStallMicros > 0 after crossing the slowdown trigger, got {stall}"
+        );
+
+        db.db()
+            .engine
+            .latch_wal_failure(&std::io::Error::other("injected"));
+        let before = stats.get_ticker(Ticker::WriteStallMicros);
+
+        let tx = db.begin_transaction();
+        tx.put(b"txn", b"v").unwrap();
+        match tx.commit() {
+            Err(TransactionError::Io(e)) => {
+                assert!(
+                    e.to_string()
+                        .contains("write-ahead log left in an unknown state"),
+                    "expected the WAL failure reason, got: {e}"
+                );
+            }
+            other => panic!("expected a WAL-failure Io error, got {other:?}"),
+        }
+        assert_eq!(
+            stats.get_ticker(Ticker::WriteStallMicros),
+            before,
+            "a commit refused for a WAL failure must not pay the stall wait"
+        );
     }
 }
