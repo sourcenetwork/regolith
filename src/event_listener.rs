@@ -10,10 +10,11 @@
 //! # Dispatch
 //!
 //! Events are dispatched **synchronously** on the thread that
-//! triggered them - flush events on the write thread, compaction
-//! events on the compaction thread, ingest events on the ingest
-//! caller's thread. Listeners **MUST NOT block** or re-enter the
-//! database. The contract is "do a cheap thing or spawn a task."
+//! triggered them - flush events on the thread that ran the flush (a
+//! writer, or an ingest writing out the memtables that filled while it
+//! ran), compaction events on the compaction thread, ingest events on
+//! the ingest caller's thread. Listeners **MUST NOT block** or re-enter
+//! the database. The contract is "do a cheap thing or spawn a task."
 //! Blocking inside a listener stalls the engine and will starve
 //! background compaction / flush pipelines.
 //!

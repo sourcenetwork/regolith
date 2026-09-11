@@ -1,9 +1,9 @@
 //! Adversarial probe on external-file ingest under concurrent writes.
 //!
-//! Ingest allocates its sequence number and publishes the read horizon
-//! outside the commit pipeline's lock, so this drives it against a
-//! stream of ordinary writers and a reader that demands the ingested
-//! file be visible the moment `ingest_external_files` returns.
+//! Ingest allocates its sequence number under the commit pipeline's
+//! lock and publishes the read horizon outside it, so this drives it
+//! against a stream of ordinary writers and a reader that demands the
+//! ingested file be visible the moment `ingest_external_files` returns.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
