@@ -38,7 +38,7 @@ use std::time::Duration;
 use kovan_queue::array_queue::ArrayQueue;
 
 use super::memtable::MemTable;
-use super::wal::Wal;
+use super::wal::{MAX_RECORD_LEN, Wal, check_write_len};
 use super::{CommitOutcome, DurabilityMode, ReadView, RegolithEngine, grouped_batch_ops};
 use crate::WriteBatchOp;
 use crate::perf_context::{PerfTimer, PerfTimerField};
@@ -57,7 +57,9 @@ pub(crate) use stall::StallSignal;
 /// Bounded in bytes rather than in tickets because bytes are what the
 /// staging buffer, the write syscall and the fsync latency actually scale
 /// with. The cap is tested before a ticket is popped, so a request larger
-/// than the whole cap is still admitted rather than starved.
+/// than the whole cap is still admitted rather than starved; what bounds a
+/// group absolutely is the record limit (see
+/// [`RegolithEngine::admit_from_ring`]).
 const MAX_GROUP_BYTES: usize = 1024 * 1024;
 
 /// Ceiling on how much stage capacity `trim_stage` ever keeps.
@@ -111,6 +113,12 @@ pub(crate) struct Pipeline {
     /// `trim_stage` keeps, so a group cannot shrink a stage the group
     /// before it just grew.
     prev_staged: usize,
+    /// A ticket admission popped but could not add without taking the
+    /// group past the record limit. It heads the next group. `None`
+    /// whenever the pipeline mutex is released by a normal return: every
+    /// path that admits ends in `drain_locked`, which does not return
+    /// while it holds one.
+    held: Option<GroupTicket>,
 }
 
 impl Pipeline {
@@ -119,6 +127,7 @@ impl Pipeline {
             stage: Vec::new(),
             group: Vec::new(),
             prev_staged: 0,
+            held: None,
         }
     }
 }
@@ -202,15 +211,16 @@ impl RegolithEngine {
         durability: DurabilityMode,
         disable_wal: bool,
     ) -> io::Result<u64> {
-        self.validate_ops_sizes(&ops)?;
+        self.validate_ops_sizes(&ops, disable_wal)?;
         self.submit_batch(ops, durability, disable_wal)
     }
 
     /// [`Self::apply_batch`] for a caller that has already checked every
-    /// key and value against the configured limits. `Db::write` does so at
-    /// the API boundary, before the stall wait and the statistics, so
-    /// repeating the pass here would compare the same lengths against the
-    /// same numbers a second time.
+    /// key and value against the configured limits and the write's log
+    /// record against the record limit. `Db::write` does so at the API
+    /// boundary, before the stall wait and the statistics, so repeating
+    /// the pass here would compare the same lengths against the same
+    /// numbers a second time.
     pub(crate) fn submit_batch(
         &self,
         ops: Vec<WriteBatchOp>,
@@ -255,12 +265,14 @@ impl RegolithEngine {
         self.ensure_writable()?;
         self.validate_prefixed_key_size(&key)?;
         self.validate_value_size(&value)?;
-        self.submit(WriteRequest::Put {
+        let request = WriteRequest::Put {
             key,
             value,
             durability,
             disable_wal,
-        })
+        };
+        request.check_record_len(MAX_RECORD_LEN as usize)?;
+        self.submit(request)
     }
 
     /// Attempt to commit an optimistic transaction's buffered writes.
@@ -286,7 +298,7 @@ impl RegolithEngine {
     ) -> io::Result<CommitOutcome> {
         self.ensure_writable()?;
         let ops = grouped_batch_ops(point_ops, range_deletes, merges);
-        self.validate_ops_sizes(&ops)?;
+        self.validate_ops_sizes(&ops, false)?;
 
         // The write-stall admission a plain write pays with
         // `WriteOptions::default()`, in the same order: closed/WAL-failed/
@@ -462,7 +474,7 @@ impl RegolithEngine {
             request,
         });
         let view = self.view.load();
-        self.admit_from_ring(pipe, &view);
+        self.admit_from_ring(pipe, &view, MAX_RECORD_LEN as usize);
 
         let result = self.run_and_complete(pipe, view);
         self.drain_locked(pipe);
@@ -479,7 +491,8 @@ impl RegolithEngine {
         true
     }
 
-    /// Run group after group until the ring is empty.
+    /// Run group after group until the ring is empty and no ticket is
+    /// held.
     ///
     /// Re-checking the ring after each group is half of what closes the
     /// drain-then-push race; the other half is the follower's own
@@ -488,14 +501,15 @@ impl RegolithEngine {
     fn drain_locked(&self, pipe: &mut Pipeline) {
         loop {
             release_stranded(&mut pipe.group);
-            // The common exit: nothing queued behind the group just run.
-            // Checked before the view load so the empty pass costs no lock
-            // and no Arc.
-            if self.commit_ring.is_empty() {
+            // The common exit: nothing queued behind the group just run,
+            // and no ticket was held back for the next one. Checked
+            // before the view load so the empty pass costs no lock and no
+            // Arc.
+            if pipe.held.is_none() && self.commit_ring.is_empty() {
                 return;
             }
             let view = self.view.load();
-            self.admit_from_ring(pipe, &view);
+            self.admit_from_ring(pipe, &view, MAX_RECORD_LEN as usize);
             if pipe.group.is_empty() {
                 return;
             }
@@ -511,7 +525,13 @@ impl RegolithEngine {
     /// larger than either cap commits alone instead of starving. That one
     /// ticket is the whole of the documented overshoot: the active
     /// memtable holds at most `write_buffer_size` plus one request.
-    fn admit_from_ring(&self, pipe: &mut Pipeline, view: &ReadView) {
+    ///
+    /// A ticket that would take a non-empty group past `record_limit`
+    /// framed bytes is held back and leads the next group, so no group
+    /// stages more than `record_limit` unless it is a single request over
+    /// it, which `run_and_complete` refuses. A held ticket is taken
+    /// before the ring, which keeps ring order.
+    fn admit_from_ring(&self, pipe: &mut Pipeline, view: &ReadView, record_limit: usize) {
         let room = self.memtable_room(view);
         // `lead_with` seeds the group with the leader's own request
         // before calling in, so the running totals start from what is
@@ -522,16 +542,31 @@ impl RegolithEngine {
             if !pipe.group.is_empty() && (staged >= MAX_GROUP_BYTES || projected >= room) {
                 return;
             }
-            let Some(slot) = self.commit_ring.pop() else {
-                return;
+            let ticket = match pipe.held.take() {
+                Some(ticket) => ticket,
+                None => {
+                    let Some(slot) = self.commit_ring.pop() else {
+                        return;
+                    };
+                    let request = slot.take_request();
+                    GroupTicket {
+                        slot: Some(slot),
+                        request,
+                    }
+                }
             };
-            let request = slot.take_request();
-            staged += request.staged_len();
-            projected += request.memtable_cost();
-            pipe.group.push(GroupTicket {
-                slot: Some(slot),
-                request,
-            });
+            let len = ticket.request.staged_len();
+            // One append may not stage more than one record's limit. A
+            // popped ticket cannot go back to the head of the ring, so it
+            // waits here and leads the next group, where it is admitted
+            // first.
+            if !pipe.group.is_empty() && staged.saturating_add(len) > record_limit {
+                pipe.held = Some(ticket);
+                return;
+            }
+            staged += len;
+            projected += ticket.request.memtable_cost();
+            pipe.group.push(ticket);
         }
     }
 
@@ -559,12 +594,26 @@ impl RegolithEngine {
             stage,
             group,
             prev_staged,
+            ..
         } = pipe;
         // Summed again here rather than carried over from admission:
         // `commit_optimistic` seeds a group without going through
         // `admit_from_ring`, and the sum is one add per ticket.
         let staged: usize = group.iter().map(|t| t.request.staged_len()).sum();
-        let result = self.run_group(stage, group, view, staged);
+        // The last line of defence, for a request that reached the
+        // pipeline without its producer's check: admission never
+        // combines requests past the limit, so a group over it is a
+        // single request, and it is refused whole before `run_group`
+        // rotates, takes a sequence number or touches the log. The stage
+        // is emptied as `run_group`'s own early returns empty it, so the
+        // trim below reads no stale length.
+        let result = match check_write_len(staged) {
+            Ok(()) => self.run_group(stage, group, view, staged),
+            Err(err) => {
+                stage.clear();
+                Err(err)
+            }
+        };
         // Each ticket learns the sequence *its own* operations were
         // assigned, not the group's maximum. An upper layer ordering its
         // versions against regolith's needs the sequence of the write it
@@ -745,6 +794,9 @@ impl RegolithEngine {
         }
     }
 }
+
+#[cfg(test)]
+mod limit_tests;
 
 #[cfg(test)]
 mod tests {

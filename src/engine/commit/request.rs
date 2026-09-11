@@ -1,8 +1,12 @@
 //! What a writer hands to the commit leader, and how the leader turns it
 //! into WAL bytes and memtable entries.
 
+use std::io;
+
 use super::super::skiplist::InsertHint;
-use super::super::wal::{encode_ops_record, encode_put_record, ops_record_len, put_record_len};
+use super::super::wal::{
+    check_record_len, encode_ops_record, encode_put_record, ops_record_len, put_record_len,
+};
 use super::super::{DurabilityMode, MemTable, apply_batch_op_to_memtable, batch_op_wal_bytes};
 use crate::WriteBatchOp;
 
@@ -65,7 +69,9 @@ impl WriteRequest {
         }
     }
 
-    /// Framed WAL bytes this request will stage. Used only to cap a group.
+    /// Framed WAL bytes this request stages: exactly one record, or none
+    /// when it skips the log. Every producer refuses a request whose
+    /// record is over the limit, and admission sums it to cap a group.
     pub(super) fn staged_len(&self) -> usize {
         if self.skips_wal() {
             return 0;
@@ -75,6 +81,12 @@ impl WriteRequest {
             WriteRequest::Put { key, value, .. } => put_record_len(key, value),
             WriteRequest::Batch { ops, .. } => ops_record_len(ops),
         }
+    }
+
+    /// Refuse this request when its record is longer than `limit` bytes.
+    /// A request that skips the log has no record and always passes.
+    pub(super) fn check_record_len(&self, limit: usize) -> io::Result<()> {
+        check_record_len(self.staged_len(), limit)
     }
 
     /// Most memtable bytes this request can add when it is applied.
@@ -188,6 +200,7 @@ impl std::fmt::Debug for WriteRequest {
 
 #[cfg(test)]
 mod tests {
+    use super::super::super::wal::RecordLen;
     use super::*;
     use proptest::prelude::*;
 
@@ -347,21 +360,64 @@ mod tests {
         ]
     }
 
+    /// A random request: a lone put or a batch of 0..24 ops.
+    fn request_strategy() -> impl Strategy<Value = WriteRequest> {
+        prop_oneof![
+            (
+                proptest::collection::vec(any::<u8>(), 0..64),
+                proptest::collection::vec(any::<u8>(), 0..64)
+            )
+                .prop_map(|(key, value)| put(&key, &value)),
+            proptest::collection::vec(batch_op_strategy(), 0..24).prop_map(batch),
+        ]
+    }
+
     proptest! {
         #[test]
-        fn any_batch_encodes_exactly_its_staged_len(
-            ops in proptest::collection::vec(batch_op_strategy(), 0..24),
-        ) {
+        fn any_request_encodes_exactly_its_staged_len(request in request_strategy()) {
             // Covers `ops_record_len`'s three arms: empty (stages
             // nothing), one op (single-record framing), several ops
-            // (batch framing).
-            let request = batch(ops);
+            // (batch framing), plus the put shape.
             let staged_len = request.staged_len();
             let mut out = Vec::new();
             out.reserve_exact(staged_len);
             request.encode_wal(&mut out, 1);
             prop_assert_eq!(out.len(), staged_len);
             prop_assert_eq!(out.capacity(), staged_len);
+            if let WriteRequest::Batch { ops, .. } = &request {
+                let mut len = RecordLen::default();
+                ops.iter().for_each(|op| len.op(op));
+                prop_assert_eq!(len.framed(), staged_len);
+            }
         }
+    }
+
+    #[test]
+    fn a_request_is_refused_past_the_limit_unless_it_skips_the_wal() {
+        let request = put(b"key", b"value");
+        let limit = request.staged_len();
+        assert!(request.check_record_len(limit).is_ok());
+        let err = request.check_record_len(limit - 1).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+
+        let request = batch(vec![
+            WriteBatchOp::Put {
+                key: b"a".to_vec(),
+                value: b"1".to_vec(),
+            },
+            WriteBatchOp::Delete { key: b"b".to_vec() },
+        ]);
+        let limit = request.staged_len();
+        assert!(request.check_record_len(limit).is_ok());
+        let err = request.check_record_len(limit - 1).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+
+        let disabled = WriteRequest::Put {
+            key: b"key".to_vec(),
+            value: b"value".to_vec(),
+            durability: DurabilityMode::Eventual,
+            disable_wal: true,
+        };
+        assert!(disabled.check_record_len(0).is_ok());
     }
 }

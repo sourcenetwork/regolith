@@ -772,6 +772,10 @@ impl Db {
 
     /// Apply a batch of writes atomically using the database-global
     /// durability mode.
+    ///
+    /// Refused with [`Error::InvalidArgument`], with nothing applied and
+    /// no sequence number used, when the batch's write-ahead log record
+    /// would exceed 1 GiB (see [`WriteBatch`]).
     pub fn write(&self, batch: WriteBatch) -> Result<()> {
         self.write_opt(&WriteOptions::default(), batch)
     }
@@ -823,8 +827,9 @@ impl Db {
             // snapshot taken now would read at.
             return Ok(self.engine.snapshot_seq());
         }
+        let (dm, disable_wal) = self.resolve_write_opts(opts);
         self.validate_batch_cf_liveness(&batch)?;
-        self.validate_batch_sizes(&batch)?;
+        self.validate_batch_sizes(&batch, disable_wal)?;
         self.wait_for_write_capacity(opts)?;
         perf_context::record_write_call();
         let stats = self.stats();
@@ -860,7 +865,6 @@ impl Db {
             s.add(Ticker::MergesWritten, merges);
             s.record(Histogram::BytesPerWrite, bytes);
         }
-        let (dm, disable_wal) = self.resolve_write_opts(opts);
         self.engine
             .submit_batch(batch.ops, dm, disable_wal)
             .map_err(Error::from)
@@ -964,23 +968,35 @@ impl Db {
         )))
     }
 
-    fn validate_batch_sizes(&self, batch: &WriteBatch) -> Result<()> {
+    /// `disable_wal` skips the record-length check, since the write
+    /// produces no WAL record; key and value limits still apply.
+    fn validate_batch_sizes(&self, batch: &WriteBatch, disable_wal: bool) -> Result<()> {
+        let mut record = engine::wal::RecordLen::default();
         for op in &batch.ops {
             match op {
                 WriteBatchOp::Put { key, value } => {
                     self.validate_prefixed_key_size(key)?;
                     self.validate_value_size(value)?;
+                    record.put(key, value);
                 }
-                WriteBatchOp::Delete { key } => self.validate_prefixed_key_size(key)?,
+                WriteBatchOp::Delete { key } => {
+                    self.validate_prefixed_key_size(key)?;
+                    record.delete(key);
+                }
                 WriteBatchOp::DeleteRange { start, end } => {
                     self.validate_prefixed_key_size(start)?;
                     self.validate_prefixed_key_size(end)?;
+                    record.delete_range(start, end);
                 }
                 WriteBatchOp::Merge { key, operand } => {
                     self.validate_prefixed_key_size(key)?;
                     self.validate_value_size(operand)?;
+                    record.merge(key, operand);
                 }
             }
+        }
+        if !disable_wal {
+            engine::wal::check_write_len(record.framed())?;
         }
         Ok(())
     }
@@ -2746,6 +2762,13 @@ impl WriteBatchOp {
 }
 
 /// A batch of write operations to apply atomically.
+///
+/// A batch is one record in the write-ahead log, and a record may be at
+/// most 1 GiB: roughly the batch's keys and values plus a few tens of
+/// bytes per operation. [`Db::write`] refuses a larger batch with
+/// [`Error::InvalidArgument`] before applying any of it; split it into
+/// smaller batches. A batch written with `WriteOptions::disable_wal`
+/// logs nothing and is not subject to this limit.
 #[derive(Debug, Default)]
 pub struct WriteBatch {
     ops: Vec<WriteBatchOp>,
@@ -2920,6 +2943,9 @@ impl WriteBatch {
         self.ops.is_empty()
     }
 }
+
+#[cfg(test)]
+mod write_limit_tests;
 
 #[cfg(test)]
 mod tests {

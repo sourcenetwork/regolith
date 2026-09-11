@@ -48,7 +48,7 @@ use sstable::{
     LiveSst, LookupResult, Materialize, PointValue, SsTableMeta, SsTableReader, SsTableWriter,
     sst_filename,
 };
-use wal::{Wal, WalEntry, wal_filename};
+use wal::{RecordLen, Wal, WalEntry, check_write_len, wal_filename};
 use wal_replay::{WalPosition, WalReplayIter};
 
 /// Controls when data is flushed to disk after a commit.
@@ -887,23 +887,35 @@ impl RegolithEngine {
         ))
     }
 
-    fn validate_ops_sizes(&self, ops: &[WriteBatchOp]) -> std::io::Result<()> {
+    /// `disable_wal` skips the record-length check, since the write
+    /// produces no WAL record; key and value limits still apply.
+    fn validate_ops_sizes(&self, ops: &[WriteBatchOp], disable_wal: bool) -> std::io::Result<()> {
+        let mut record = RecordLen::default();
         for op in ops {
             match op {
                 WriteBatchOp::Put { key, value } => {
                     self.validate_prefixed_key_size(key)?;
                     self.validate_value_size(value)?;
+                    record.put(key, value);
                 }
-                WriteBatchOp::Delete { key } => self.validate_prefixed_key_size(key)?,
+                WriteBatchOp::Delete { key } => {
+                    self.validate_prefixed_key_size(key)?;
+                    record.delete(key);
+                }
                 WriteBatchOp::DeleteRange { start, end } => {
                     self.validate_prefixed_key_size(start)?;
                     self.validate_prefixed_key_size(end)?;
+                    record.delete_range(start, end);
                 }
                 WriteBatchOp::Merge { key, operand } => {
                     self.validate_prefixed_key_size(key)?;
                     self.validate_value_size(operand)?;
+                    record.merge(key, operand);
                 }
             }
+        }
+        if !disable_wal {
+            check_write_len(record.framed())?;
         }
         Ok(())
     }
