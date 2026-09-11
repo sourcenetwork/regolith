@@ -882,34 +882,6 @@ impl RegolithEngine {
         Ok(())
     }
 
-    /// Validate the sizes of a transaction's buffered writes ahead of the
-    /// write-stall admission wait: the same check `validate_ops_sizes` runs
-    /// on a `grouped_batch_ops` output, but on the pre-grouped buffers so a
-    /// commit that can never pass size validation is rejected before it
-    /// pays for admission rather than after.
-    pub(crate) fn validate_commit_sizes(
-        &self,
-        point_ops: &BTreeMap<Vec<u8>, Option<Vec<u8>>>,
-        range_deletes: &[(Vec<u8>, Vec<u8>)],
-        merges: &[(Vec<u8>, Vec<u8>)],
-    ) -> std::io::Result<()> {
-        for (key, value) in point_ops {
-            self.validate_prefixed_key_size(key)?;
-            if let Some(value) = value {
-                self.validate_value_size(value)?;
-            }
-        }
-        for (start, end) in range_deletes {
-            self.validate_prefixed_key_size(start)?;
-            self.validate_prefixed_key_size(end)?;
-        }
-        for (key, operand) in merges {
-            self.validate_prefixed_key_size(key)?;
-            self.validate_value_size(operand)?;
-        }
-        Ok(())
-    }
-
     /// Borrow the engine's `Statistics` sink if one is configured.
     /// Returning `Option<&Statistics>` lets instrumented call
     /// sites branch on a single `is_some()` check rather than
@@ -1991,16 +1963,27 @@ impl RegolithEngine {
         Ok(())
     }
 
+    // Not closed and no cached stall is the overwhelming common case, so
+    // this fast check stays inlined at every call site rather than a call
+    // instruction: two byte loads and two branches over state the engine
+    // already keeps resident (`close_state`, `cached_stall_level`), which
+    // also skips the `stall_state()` call that loads the read view and
+    // walks L0. Anything past that is parking or an inline compaction
+    // pass, so it is cold and kept out of line instead of bloating every
+    // caller that never stalls.
+    #[inline]
     pub(crate) fn wait_for_write_capacity(&self, no_slowdown: bool) -> Result<u64, crate::Error> {
+        if !self.is_closed() && self.cached_stall_level.load(Ordering::Acquire) == 0 {
+            return Ok(0);
+        }
+        self.wait_for_write_capacity_slow(no_slowdown)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn wait_for_write_capacity_slow(&self, no_slowdown: bool) -> Result<u64, crate::Error> {
         if self.is_closed() {
             return Err(crate::Error::Closed);
-        }
-        // Fast path: if the cached stall level is 0, skip the
-        // stall_state() call that loads the read view and walks L0.
-        // This saves a lock round-trip and a level scan per write in
-        // the common no-stall scenario.
-        if self.cached_stall_level.load(Ordering::Acquire) == 0 {
-            return Ok(0);
         }
 
         let start = self.env.now_micros();

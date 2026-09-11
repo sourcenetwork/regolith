@@ -55,6 +55,30 @@ impl Error {
             message.into(),
         ))
     }
+
+    /// Render this engine error as the `io::Error` a caller on an
+    /// `io::Result` boundary sees, preserving the kind and message a
+    /// direct `io::Error` path (a closed handle, a read-only handle)
+    /// already uses for the same condition. The one function both
+    /// [`crate::transaction::TransactionError`]'s `From<Error>` impl and
+    /// the engine's own `io::Result` commit path call, so the two never
+    /// drift apart on what a given `Error` variant reads as.
+    pub(crate) fn into_io_error(self) -> std::io::Error {
+        match self {
+            Self::Io(io) | Self::Corruption(io) => io,
+            Self::InvalidArgument(message) | Self::InvalidColumnFamily(message) => {
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, message)
+            }
+            Self::ReadOnly => std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "database was opened read-only",
+            ),
+            Self::Closed => {
+                std::io::Error::new(std::io::ErrorKind::NotConnected, "database is closed")
+            }
+            other => std::io::Error::other(other.to_string()),
+        }
+    }
 }
 
 impl From<std::io::Error> for Error {

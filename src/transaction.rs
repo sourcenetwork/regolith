@@ -143,25 +143,7 @@ pub type TxResult<T> = std::result::Result<T, TransactionError>;
 
 impl From<Error> for TransactionError {
     fn from(e: Error) -> Self {
-        match e {
-            Error::Io(io) => TransactionError::Io(io),
-            Error::Corruption(io) => TransactionError::Io(io),
-            Error::InvalidArgument(message) | Error::InvalidColumnFamily(message) => {
-                TransactionError::Io(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    message,
-                ))
-            }
-            Error::ReadOnly => TransactionError::Io(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                "database was opened read-only",
-            )),
-            Error::Closed => TransactionError::Io(std::io::Error::new(
-                std::io::ErrorKind::NotConnected,
-                "database is closed",
-            )),
-            other => TransactionError::Io(std::io::Error::other(other.to_string())),
-        }
+        TransactionError::Io(e.into_io_error())
     }
 }
 
@@ -878,28 +860,12 @@ impl<'db> Transaction<'db> {
             .collect();
         let conflict_keys = self.validation_set(tracked, &writes, &merges);
 
-        // Same admission as a plain write with `WriteOptions::default()`,
-        // in the same order: the closed and read-only checks first, so a
-        // handle that can never write is refused instead of parked, then
-        // size validation, so a commit that can never fit is refused
-        // instead of parked, then the stall wait, and only then the
-        // pipeline mutex inside `commit_optimistic`. Never inside that
-        // mutex: a `CompactInline` wait runs a compaction pass on this
-        // thread, and that pass must not be entered while any commit-path
-        // lock is held. A commit that writes nothing skips all of this: it
-        // takes no capacity, and its validation must still run under a
-        // stall.
-        let carries_writes = !writes.is_empty() || !range_deletes.is_empty() || !merges.is_empty();
-        if carries_writes {
-            self.engine
-                .ensure_writable()
-                .map_err(TransactionError::Io)?;
-            self.engine
-                .validate_commit_sizes(&writes, &range_deletes, &merges)
-                .map_err(TransactionError::Io)?;
-            self.engine.wait_for_write_capacity(false)?;
-        }
-
+        // The write-stall admission (same order as a plain write with
+        // `WriteOptions::default()`: closed/read-only, then size
+        // validation, then the stall wait) runs inside
+        // `commit_optimistic`, after its own `ensure_writable` and
+        // `validate_ops_sizes` and before the pipeline mutex, gated on
+        // the commit carrying an op. See the comment there for why.
         let outcome = self
             .engine
             .commit_with_conflict_check(
@@ -2120,7 +2086,7 @@ mod tests {
         }
     }
 
-    /// The closed-handle test above cannot tell whether `commit_inner`'s
+    /// The closed-handle test above cannot tell whether `commit_optimistic`'s
     /// `ensure_writable` call runs before the stall wait, because a closed
     /// handle produces the identical error either way (`wait_for_write_capacity`
     /// also refuses a closed engine). A latched write-ahead-log failure
