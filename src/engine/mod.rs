@@ -92,20 +92,37 @@ fn grouped_batch_ops(
     ops
 }
 
-/// A key a commit must validate, and what the transaction did with it.
-///
-/// The distinction between a key the transaction read and one it only wrote
-/// is what makes idempotent-write elision safe: a stale read can have changed
-/// what the transaction decided, so it must still abort, while a blind write
-/// of the value already stored changes nothing at all.
+/// A key a commit validates because the transaction read it: the key and
+/// the earliest sequence the transaction observed it at. Never elided as an
+/// idempotent write, since a value derived from a stale read is a lost
+/// update even when the bytes match.
 #[derive(Clone, Debug)]
 pub(crate) struct ConflictKey {
     /// The prefixed key.
     pub key: Vec<u8>,
     /// The sequence the transaction observed it at.
     pub observed_seq: u64,
-    /// The transaction read this key, rather than only writing it.
-    pub read: bool,
+}
+
+/// What a commit validates on top of the operations it carries.
+///
+/// The written keys are not listed here: the commit already owns them in
+/// its operation list and validates them from there, so listing them again
+/// would clone every key a second time. What needs its own entry is a key
+/// the transaction read, since a read carries its own anchor (the read's
+/// sequence) and its own rule (never elided).
+#[derive(Debug)]
+pub(crate) struct ValidationSet {
+    /// Keys the transaction read that the isolation level validates.
+    /// Sorted by key with no duplicates; the commit relies on both to
+    /// find a written key here by binary search and to name the same key
+    /// on every run of a multi-key conflict.
+    pub reads: Vec<ConflictKey>,
+    /// The sequence every written or merged key not in `reads` is validated
+    /// against, or `None` when written keys are not validated at all
+    /// (pessimistic mode: the key lock orders them and there is no read to
+    /// lose).
+    pub writes_at: Option<u64>,
 }
 
 fn batch_op_wal_bytes(op: &WriteBatchOp) -> u64 {
@@ -2098,13 +2115,13 @@ impl RegolithEngine {
 
     pub(crate) fn commit_with_conflict_check(
         &self,
-        conflict_keys: &[ConflictKey],
+        checks: &ValidationSet,
         point_ops: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
         range_deletes: Vec<(Vec<u8>, Vec<u8>)>,
         merges: Vec<(Vec<u8>, Vec<u8>)>,
         durability: DurabilityMode,
     ) -> std::io::Result<CommitOutcome> {
-        self.commit_optimistic(conflict_keys, point_ops, range_deletes, merges, durability)
+        self.commit_optimistic(checks, point_ops, range_deletes, merges, durability)
     }
 
     /// Whether this commit's write for `key` would store exactly what `key`
@@ -2204,7 +2221,7 @@ impl RegolithEngine {
         {
             let active = &view.active;
             max_rt_seq = max_rt_seq.max(active.covering_range_tombstone_seq(key, snap));
-            if let Some((seq, _)) = active.get(&lk) {
+            if let Some(seq) = active.latest_seq(&lk) {
                 return Ok(newest(seq, max_rt_seq));
             }
         }
@@ -2212,7 +2229,7 @@ impl RegolithEngine {
             let frozen = &view.frozen;
             for mt in frozen.iter().rev() {
                 max_rt_seq = max_rt_seq.max(mt.covering_range_tombstone_seq(key, snap));
-                if let Some((seq, _)) = mt.get(&lk) {
+                if let Some(seq) = mt.latest_seq(&lk) {
                     return Ok(newest(seq, max_rt_seq));
                 }
             }
@@ -2268,11 +2285,17 @@ impl RegolithEngine {
     /// applied - keeping write errors determinate: a returned error means
     /// the write did not land, never that it landed but a later step
     /// failed. Caller must hold the pipeline mutex.
-    fn rotate_if_full(&self) -> std::io::Result<()> {
-        if self.view.load().active.approximate_size() >= self.options.write_buffer_size {
-            self.rotate_memtable()?;
+    ///
+    /// Takes the view the leader already loaded and hands back the view the
+    /// group applies into: the same one when nothing rotated, a fresh load
+    /// otherwise. The active memtable changes only under the pipeline mutex,
+    /// so between the two nothing else can have replaced it.
+    fn rotate_if_full(&self, view: Arc<ReadView>) -> std::io::Result<Arc<ReadView>> {
+        if view.active.approximate_size() < self.options.write_buffer_size {
+            return Ok(view);
         }
-        Ok(())
+        self.rotate_memtable()?;
+        Ok(self.view.load())
     }
 
     fn rotate_memtable(&self) -> std::io::Result<()> {

@@ -97,22 +97,26 @@ fn commit_alloc_bytes() -> (usize, usize) {
     (BYTES.load(Ordering::Relaxed), COUNT.load(Ordering::Relaxed))
 }
 
-/// The commit must not allocate a per-entry copy of the write buffer.
+/// The commit must not allocate a per-entry copy of the write buffer, nor
+/// a per-key copy of the validation set built on top of it.
 ///
-/// Cloning the buffer out of the map costs two allocations per entry, one
-/// for the key and one for the value, on top of whatever the WAL record
-/// itself needs. Moving it costs none. Measured on this workload, 512
-/// entries of 1 KiB:
+/// Cloning the write buffer out of the map costs two allocations per
+/// entry, one for the key and one for the value, on top of whatever the
+/// WAL record itself needs. Cloning every written key a second time into
+/// the validation set costs one more. Owning both instead of copying
+/// them costs neither. Measured on this workload, 512 entries of 1 KiB:
 ///
 /// ```text
-/// clone (iter):      2_217_472 bytes, 1_699 allocations
-/// move  (into_iter): 1_689_232 bytes,   679 allocations
+/// base, clones the validation set:   1_693_088 bytes, 703 allocations
+/// this branch, owns the ops it validates: 1_626_080 bytes, 106 allocations
 /// ```
 ///
-/// The 528_240 byte difference is one full duplicate of the buffer and
-/// the 1_020 allocation difference is the two-per-entry clone. The bound
-/// is on the allocation count rather than bytes, because the count is
-/// what separates the two forms cleanly: the WAL encoding dominates the
+/// The per-key clone in the validation set is gone; what remains is the
+/// write map's nodes (about one per six keys), the WAL staging buffer's
+/// growth and a fixed handful of per-commit vectors, so a commit must
+/// allocate less than once per two buffered entries. The bound is on the
+/// allocation count rather than bytes, because the count is what
+/// separates a copy from a move cleanly: the WAL encoding dominates the
 /// byte figure and moves with unrelated tuning, while a per-entry copy
 /// shows up as a fixed multiple of `ENTRIES` no matter how the record is
 /// laid out.
@@ -127,9 +131,9 @@ fn commit_does_not_copy_the_write_buffer() {
     );
 
     assert!(
-        count < ENTRIES * 2,
-        "commit made {count} allocations for {ENTRIES} buffered writes, which is at \
-         least two per entry: the buffer is being cloned out of the map rather than \
-         moved"
+        count < ENTRIES / 2,
+        "commit made {count} allocations for {ENTRIES} buffered writes: a per-entry \
+         copy of the write set at commit shows up as a multiple of ENTRIES, and this \
+         bound is what catches it"
     );
 }

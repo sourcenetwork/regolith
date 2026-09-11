@@ -73,14 +73,37 @@ impl Default for MemTableConfig {
 ///
 /// Range tombstones are stored in a separate `Mutex<RangeTombstoneSet>`
 /// rather than interleaved with point entries. Range deletes are orders
-/// of magnitude rarer than point writes so the lock is cheap, and keeping
-/// them separate lets point-entry lookups stay lock-free.
+/// of magnitude rarer than point writes, and keeping them separate lets
+/// a point lookup skip the lock entirely while the memtable holds no
+/// range tombstone (see `range_tombstone_bytes`); once it holds one,
+/// every lookup takes the lock.
 pub(crate) struct MemTable {
     list: ArenaSkipList,
     range_tombstones: Mutex<RangeTombstoneSet>,
     /// Heap bytes the range tombstones hold. They are the one part of a
     /// memtable that does not live in the arena, so they are counted
     /// separately and added into [`MemTable::approximate_size`].
+    ///
+    /// Also the lock-free gate in [`MemTable::covering_range_tombstone_seq`]:
+    /// it only ever rises, and zero means no range tombstone was ever
+    /// recorded, so a lookup that reads zero skips the mutex.
+    ///
+    /// Why a reader can never miss a tombstone visible at its snapshot:
+    /// `delete_range` raises this counter (Release) while it still holds the
+    /// tombstone mutex, on the commit leader, before the leader publishes the
+    /// tombstone's sequence `T` through the read horizon (`ReadHorizon::publish`,
+    /// a Release read-modify-write). A reader outside the pipeline mutex takes
+    /// its snapshot `S` from `ReadHorizon::visible` (Acquire). Every publish is
+    /// a read-modify-write on that one atomic, so they form one release
+    /// sequence and a reader that observed any `S >= T` synchronizes with the
+    /// publish of the group that wrote `T`; the increment therefore
+    /// happens-before that reader's load and it cannot read zero. A reader
+    /// with `S < T` may read either value: it is not allowed to see the
+    /// tombstone anyway, and `max_covering_seq` filters it out by sequence, so
+    /// both paths return the same answer. A reader under the pipeline mutex
+    /// (commit validation probes at `u64::MAX`) is ordered by the mutex itself.
+    /// A sealed memtable takes no further range deletes, so the argument
+    /// covers frozen memtables as well.
     range_tombstone_bytes: AtomicUsize,
     /// The write-ahead log that backs this memtable's contents, recorded
     /// when the memtable is sealed and the log rotated away from it.
@@ -192,11 +215,12 @@ impl MemTable {
     /// is considered deleted as of `seq`.
     pub(crate) fn delete_range(&self, start: &[u8], end: &[u8], seq: u64) {
         let heap = start.len() + end.len() + size_of::<RangeTombstone>();
-        self.range_tombstones
-            .lock()
-            .push(RangeTombstone::new(start.to_vec(), end.to_vec(), seq));
+        let mut tombstones = self.range_tombstones.lock();
+        tombstones.push(RangeTombstone::new(start.to_vec(), end.to_vec(), seq));
+        // Under the guard, so nobody can find the tombstone through the lock
+        // while the gate still reads zero.
         self.range_tombstone_bytes
-            .fetch_add(heap, Ordering::Relaxed);
+            .fetch_add(heap, Ordering::Release);
     }
 
     /// Return a snapshot of every range tombstone currently held.
@@ -210,9 +234,34 @@ impl MemTable {
     /// visible at `snapshot_seq`. Returns `0` if no such tombstone
     /// exists - `0` is a safe sentinel because real seqs start at 1.
     pub(crate) fn covering_range_tombstone_seq(&self, user_key: &[u8], snapshot_seq: u64) -> u64 {
+        // The gate: see `range_tombstone_bytes` for why a reader whose
+        // snapshot can see a tombstone always reads nonzero here.
+        if self.range_tombstone_bytes.load(Ordering::Acquire) == 0 {
+            return 0;
+        }
         self.range_tombstones
             .lock()
             .max_covering_seq(user_key, snapshot_seq)
+    }
+
+    /// The newest entry for `lk`'s user key at or below its snapshot, with the
+    /// sequence and value type already decoded. Merge operands and point
+    /// tombstones count as entries; the caller decides what to make of the
+    /// type.
+    fn newest_visible(&self, lk: &LookupKey) -> Option<(NodeRef<'_>, u64, u8)> {
+        let snapshot_seq = lk.snapshot_seq();
+        let mut node = self.list.seek_ge(lk.internal());
+        while let Some(current) = node {
+            let (user_key, seq, value_type) = decode_internal_key(current.key());
+            if user_key != lk.prefixed_user_key() {
+                return None;
+            }
+            if seq <= snapshot_seq {
+                return Some((current, seq, value_type));
+            }
+            node = current.next();
+        }
+        None
     }
 
     /// Look up the newest point entry for `key` visible at
@@ -227,23 +276,18 @@ impl MemTable {
     /// is responsible for merging range-tombstone coverage across
     /// sources and comparing seqs.
     pub(crate) fn get(&self, lk: &LookupKey) -> Option<(u64, Option<DbSlice>)> {
-        let snapshot_seq = lk.snapshot_seq();
-        let mut node = self.list.seek_ge(lk.internal());
-        while let Some(current) = node {
-            let (user_key, seq, value_type) = decode_internal_key(current.key());
-            if user_key != lk.prefixed_user_key() {
-                return None;
-            }
-            if seq <= snapshot_seq {
-                return if value_type == VALUE_TYPE_DELETION {
-                    Some((seq, None))
-                } else {
-                    Some((seq, Some(self.value_slice(&current))))
-                };
-            }
-            node = current.next();
-        }
-        None
+        let (node, seq, value_type) = self.newest_visible(lk)?;
+        let value = (value_type != VALUE_TYPE_DELETION).then(|| self.value_slice(&node));
+        Some((seq, value))
+    }
+
+    /// [`MemTable::get`] without the value: the sequence of the newest entry
+    /// of any kind (value, tombstone or merge operand) for `lk`'s key at or
+    /// below its snapshot. No arena `Arc` is cloned and no byte is copied,
+    /// which is what commit validation wants: it only asks whether the key
+    /// was written again, never what it holds.
+    pub(crate) fn latest_seq(&self, lk: &LookupKey) -> Option<u64> {
+        self.newest_visible(lk).map(|(_, seq, _)| seq)
     }
 
     /// A zero-copy view of one node's value, keeping the arena alive for
@@ -940,3 +984,6 @@ mod tests {
         assert!(mt.last_slice_before(Bound::Excluded(b"k")).is_none());
     }
 }
+
+#[cfg(test)]
+mod probe_tests;

@@ -90,7 +90,7 @@ use std::time::Duration;
 use crate::sync::{Condvar, Mutex};
 
 use crate::column_family::{DEFAULT_CF_ID, prefix_key};
-use crate::engine::{CommitOutcome, ConflictKey, RegolithEngine};
+use crate::engine::{CommitOutcome, ConflictKey, RegolithEngine, ValidationSet};
 use crate::{Db, DbSlice, Error, Options, Result};
 
 /// Default lock-acquisition timeout for [`TransactionDb`] when the
@@ -851,14 +851,8 @@ impl<'db> Transaction<'db> {
         }
         let range_deletes = drain(&self.range_deletes);
         let merges = drain(&self.merges);
-        let mut seen = std::collections::HashSet::new();
-        let tracked: Vec<(Vec<u8>, Arc<KeyState>)> = self
-            .tracked
-            .drain()
-            .into_iter()
-            .filter(|(key, _)| seen.insert(key.clone()))
-            .collect();
-        let conflict_keys = self.validation_set(tracked, &writes, &merges);
+        let tracked = self.tracked.drain();
+        let checks = self.validation_set(tracked, &writes, &merges);
 
         // The write-stall admission (same order as a plain write with
         // `WriteOptions::default()`: closed/read-only, then size
@@ -868,13 +862,7 @@ impl<'db> Transaction<'db> {
         // the commit carrying an op. See the comment there for why.
         let outcome = self
             .engine
-            .commit_with_conflict_check(
-                &conflict_keys,
-                writes,
-                range_deletes,
-                merges,
-                self.durability,
-            )
+            .commit_with_conflict_check(&checks, writes, range_deletes, merges, self.durability)
             .map_err(TransactionError::Io)?;
         match outcome {
             CommitOutcome::Ok => Ok(()),
@@ -890,20 +878,10 @@ impl<'db> Transaction<'db> {
         }
     }
 
-    /// The keys this commit must validate, each mapped to the
-    /// earliest sequence the transaction observed it at.
-    ///
-    /// Optimistic: every key written or merged, plus every key read
-    /// through `get_for_update`, all anchored at the begin snapshot.
-    ///
-    /// Pessimistic: every key that was read and then written (the
-    /// read-modify-write set), plus every key read through
-    /// `get_for_update`. A key written without ever being read is
-    /// left out: its lock already orders it against the other
-    /// transactions, and there is no read for a concurrent writer to
-    /// invalidate.
-    /// The keys whose versions must be unchanged for this transaction to
-    /// commit, each with the sequence it was first observed at.
+    /// What this commit validates beyond the keys it writes: every tracked
+    /// read the isolation level cares about, at the earliest sequence the
+    /// transaction observed it, plus the anchor the written keys are checked
+    /// against.
     ///
     /// The size of this set *is* the isolation level:
     ///
@@ -915,71 +893,62 @@ impl<'db> Transaction<'db> {
     ///   reachable.
     /// * [`IsolationLevel::Serializable`] adds every remaining read, so
     ///   no anti-dependency edge can form unseen.
+    ///
+    /// Optimistic: the written and merged keys are validated against the
+    /// begin snapshot; a key that was also read is validated once, as the
+    /// read. Pessimistic: written keys are not validated (`writes_at` is
+    /// `None`), the key lock already orders them and there is no read for a
+    /// concurrent writer to invalidate.
     fn validation_set(
         &self,
-        tracked: Vec<(Vec<u8>, Arc<KeyState>)>,
+        mut tracked: Vec<(Vec<u8>, Arc<KeyState>)>,
         writes: &BTreeMap<Vec<u8>, Option<Vec<u8>>>,
         merges: &[(Vec<u8>, Vec<u8>)],
-    ) -> Vec<ConflictKey> {
+    ) -> ValidationSet {
         let optimistic = matches!(self.mode, TxMode::Optimistic);
         let serializable = self.isolation == IsolationLevel::Serializable;
         let read_committed = self.isolation == IsolationLevel::ReadCommitted;
-        // A `BTreeMap` rather than the tracked map's own order: the set
-        // has to come out sorted so a multi-key conflict names the same
-        // key on every run.
-        // The flag records whether the transaction read the key, which the
-        // commit check needs to decide whether an idempotent write may be
-        // elided: a stale read must still abort.
-        let mut checks: BTreeMap<Vec<u8>, (u64, bool)> = BTreeMap::new();
-        for (key, state) in tracked {
-            let written =
-                writes.contains_key(&key) || merges.iter().any(|(merged, _)| *merged == key);
-            let validate = if serializable {
-                // Every read, whether or not the transaction wrote it.
-                true
-            } else if read_committed {
-                written
-            } else {
-                state.for_update.load(Ordering::Acquire) || written
-            };
-            if validate {
-                // Any read at all, whatever the level. This flag exists to
-                // stop an idempotent-write elision at commit, and the
-                // equivalence that elision rests on holds only for a write
-                // nobody derived from a read.
-                //
-                // A read-modify-write is the counterexample: two transactions
-                // read a counter at 5 and both write 6. The writes are
-                // byte-identical, so eliding the second lets both commit and
-                // the counter advances once, losing an increment. No serial
-                // order produces that: run second, the transaction reads 6 and
-                // writes 7. `first_read_seq` anchors the check at the read for
-                // exactly this reason, and honouring the anchor is what makes
-                // the abort correct.
-                checks.insert(key, (state.first_read_seq, true));
-            }
-        }
-        if optimistic {
-            // `or_insert`, so a key already recorded above keeps its read flag.
-            for key in writes.keys() {
-                checks
-                    .entry(key.clone())
-                    .or_insert((self.snapshot_seq, false));
-            }
-            for (key, _) in merges {
-                checks
-                    .entry(key.clone())
-                    .or_insert((self.snapshot_seq, false));
-            }
-        }
-        checks
+        // The drain yields the newest node first and a stable sort keeps that
+        // within a key, so dedup keeps the cell every reader of the key used
+        // (`get_or_insert` settles a race by re-reading, newest first).
+        tracked.sort_by(|a, b| a.0.cmp(&b.0));
+        tracked.dedup_by(|later, first| later.0 == first.0);
+        let reads = tracked
             .into_iter()
-            .map(|(key, (observed_seq, read))| ConflictKey {
-                key,
-                observed_seq,
-                read,
+            .filter(|(key, state)| {
+                let written =
+                    writes.contains_key(key) || merges.iter().any(|(merged, _)| merged == key);
+                if serializable {
+                    // Every read, whether or not the transaction wrote it.
+                    true
+                } else if read_committed {
+                    written
+                } else {
+                    state.for_update.load(Ordering::Acquire) || written
+                }
             })
-            .collect()
+            // Any read at all, whatever the level. This flag exists to
+            // stop an idempotent-write elision at commit, and the
+            // equivalence that elision rests on holds only for a write
+            // nobody derived from a read.
+            //
+            // A read-modify-write is the counterexample: two transactions
+            // read a counter at 5 and both write 6. The writes are
+            // byte-identical, so eliding the second lets both commit and
+            // the counter advances once, losing an increment. No serial
+            // order produces that: run second, the transaction reads 6 and
+            // writes 7. `first_read_seq` anchors the check at the read for
+            // exactly this reason, and honouring the anchor is what makes
+            // the abort correct.
+            .map(|(key, state)| ConflictKey {
+                key,
+                observed_seq: state.first_read_seq,
+            })
+            .collect();
+        ValidationSet {
+            reads,
+            writes_at: optimistic.then_some(self.snapshot_seq),
+        }
     }
 
     /// Take `key`'s exclusive lock in pessimistic mode. Returns
@@ -1404,6 +1373,9 @@ impl LockManager {
         }
     }
 }
+
+#[cfg(test)]
+mod validation_set_tests;
 
 #[cfg(test)]
 mod tests {
