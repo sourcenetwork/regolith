@@ -262,6 +262,16 @@ fn validate_level_index(level: usize) -> io::Result<()> {
     ))
 }
 
+/// The sequence a `SetLastSeq` leaves behind. A stamp never lowers the
+/// value: a flush stamps the sequence its memtable was sealed at and an
+/// ingest stamps the one it allocated, and the two are applied in the
+/// order their tables finish, not the order the sequences were handed
+/// out. The log still records the stamp as issued, so `replay_manifest`
+/// applies the same rule to a log written before this rule existed.
+fn raised_last_seq(current: u64, stamp: u64) -> u64 {
+    current.max(stamp)
+}
+
 /// Identifier at the head of a MANIFEST: `REGOMAN` plus a format byte.
 const MANIFEST_MAGIC: [u8; 7] = *b"REGOMAN";
 
@@ -481,7 +491,7 @@ impl VersionSet {
                     version.levels[*level].retain(|f| f.meta.file_id != *file_id);
                 }
                 VersionEdit::SetLastSeq(seq) => {
-                    version.last_seq = *seq;
+                    version.last_seq = raised_last_seq(version.last_seq, *seq);
                 }
                 VersionEdit::SetNextFileId(id) => {
                     version.next_file_id = *id;
@@ -830,7 +840,7 @@ impl VersionSet {
                         surviving[level].retain(|m| m.file_id != file_id);
                     }
                     ManifestRecord::SetLastSeq(seq) => {
-                        last_seq = seq;
+                        last_seq = raised_last_seq(last_seq, seq);
                     }
                     ManifestRecord::SetNextFileId(id) => {
                         next_file_id = id;
@@ -878,6 +888,7 @@ impl VersionSet {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
     use tempfile::TempDir;
 
     /// Build a real on-disk SSTable and open a reader for it. Used by
@@ -1319,6 +1330,119 @@ mod tests {
 
         let vs = VersionSet::open(dir.path(), &sst_dir).unwrap();
         assert_eq!(vs.current().last_seq, 99);
+    }
+
+    /// A `SetLastSeq` below the running value must not lower it, whether
+    /// the lower stamp arrives on its own or batched with an even lower
+    /// one, and the raised value must survive a reopen. Fails if `apply`
+    /// reverts to a store: the first assertion below would then read 7.
+    #[test]
+    fn a_lower_set_last_seq_leaves_the_higher_value() {
+        let dir = TempDir::new().unwrap();
+        let sst_dir = dir.path().join("sst");
+        std::fs::create_dir_all(&sst_dir).unwrap();
+
+        {
+            let mut vs = VersionSet::open(dir.path(), &sst_dir).unwrap();
+            vs.apply(&[VersionEdit::SetLastSeq(11)]).unwrap();
+            vs.apply(&[VersionEdit::SetLastSeq(7)]).unwrap();
+            assert_eq!(vs.current().last_seq, 11);
+
+            vs.apply(&[VersionEdit::SetLastSeq(9), VersionEdit::SetLastSeq(4)])
+                .unwrap();
+            assert_eq!(vs.current().last_seq, 11);
+
+            vs.apply(&[VersionEdit::SetLastSeq(12)]).unwrap();
+            assert_eq!(vs.current().last_seq, 12);
+        }
+
+        // The log holds 11, 7, 9, 4, 12 verbatim; replay must reach 12,
+        // the running maximum, not 12's raw value from a differently
+        // ordered replay.
+        let vs = VersionSet::open(dir.path(), &sst_dir).unwrap();
+        assert_eq!(vs.current().last_seq, 12);
+    }
+
+    /// `replay_manifest` must apply the same maximum rule `apply` does,
+    /// and `Reset` must still be the one path that lowers `last_seq`.
+    /// Fails if replay reverts to a store (reads 7 after the first
+    /// reopen, since the log ends on the lower record); fails if `Reset`
+    /// stops zeroing (reads 11 instead of 3 after the second).
+    #[test]
+    fn replay_takes_the_highest_stamp_since_the_last_reset() {
+        let dir = TempDir::new().unwrap();
+        let sst_dir = dir.path().join("sst");
+        std::fs::create_dir_all(&sst_dir).unwrap();
+
+        {
+            let mut vs = VersionSet::open(dir.path(), &sst_dir).unwrap();
+            vs.apply(&[VersionEdit::SetLastSeq(11)]).unwrap();
+            vs.apply(&[VersionEdit::SetLastSeq(7)]).unwrap();
+        }
+
+        {
+            let mut vs = VersionSet::open(dir.path(), &sst_dir).unwrap();
+            assert_eq!(vs.current().last_seq, 11);
+
+            vs.apply(&[VersionEdit::Reset {
+                next_file_id: 5,
+                min_wal_id: 4,
+            }])
+            .unwrap();
+            vs.apply(&[VersionEdit::SetLastSeq(3)]).unwrap();
+            assert_eq!(vs.current().last_seq, 3);
+        }
+
+        let vs = VersionSet::open(dir.path(), &sst_dir).unwrap();
+        assert_eq!(vs.current().last_seq, 3);
+        assert_eq!(vs.current().next_file_id, 5);
+        assert_eq!(vs.current().min_wal_id, 4);
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: 32, .. ProptestConfig::default() })]
+
+        /// Random flush and ingest stamps, applied in order, must never
+        /// lower `current().last_seq`, live or after a reopen. Each
+        /// `SetLastSeq` apply syncs the manifest, so the case count
+        /// bounds the fsyncs this test pays at 32 x 24. The one mutation
+        /// that fails it is `raised_last_seq` returning `stamp` (a
+        /// store): with up to 24 random `u64` stamps per case, a
+        /// descending pair occurs in essentially every case.
+        #[test]
+        fn last_seq_never_decreases_across_random_stamps(
+            stamps in proptest::collection::vec((any::<u64>(), any::<bool>()), 1..=24),
+        ) {
+            let dir = TempDir::new().unwrap();
+            let sst_dir = dir.path().join("sst");
+            std::fs::create_dir_all(&sst_dir).unwrap();
+
+            let mut vs = VersionSet::open(dir.path(), &sst_dir).unwrap();
+            let mut running_max = 0u64;
+            let mut previous = 0u64;
+
+            for (i, (v, is_flush)) in stamps.iter().enumerate() {
+                running_max = running_max.max(*v);
+                if *is_flush {
+                    vs.apply(&[
+                        VersionEdit::SetNextFileId(i as u64 + 2),
+                        VersionEdit::SetLastSeq(*v),
+                    ])
+                    .unwrap();
+                } else {
+                    vs.apply(&[VersionEdit::SetLastSeq(*v)]).unwrap();
+                }
+
+                let current = vs.current().last_seq;
+                prop_assert_eq!(current, running_max);
+                prop_assert!(current >= previous);
+                previous = current;
+            }
+
+            drop(vs);
+            let vs = VersionSet::open(dir.path(), &sst_dir).unwrap();
+            prop_assert_eq!(vs.current().last_seq, running_max);
+        }
     }
 
     /// The manifest is an append-only log, so without a rewrite trigger a

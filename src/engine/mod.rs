@@ -28,7 +28,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::sync::{Gate, Mutex, OwnedGateWriteGuard};
+use crate::sync::{Gate, Mutex, MutexGuard, OwnedGateWriteGuard};
 use kovan_queue::array_queue::ArrayQueue;
 
 use block_cache::BlockCache;
@@ -424,10 +424,10 @@ pub(crate) struct RegolithEngine {
     /// (`compact_range`, `ingest_external_files`, `checkpoint_capture`,
     /// `drop_all`, `close`) take it blockingly; no follower ever does.
     pipeline: Mutex<Pipeline>,
-    /// Serializes [`Self::flush_frozen_memtable`] against itself.
+    /// Serializes [`Self::flush_oldest_frozen`] against itself.
     ///
-    /// Not the same exclusion as `pipeline`. Three of the four paths
-    /// into a flush hold the pipeline mutex, but `drain_memtables`
+    /// Not the same exclusion as `pipeline`. A rotation holds the
+    /// pipeline mutex while it flushes, but `drain_memtables`
     /// releases it before it flushes (a flush writes a whole SSTable
     /// and must not block writers for that long), so a checkpoint's
     /// drain and a writer's rotation could both be inside the flush at
@@ -436,7 +436,22 @@ pub(crate) struct RegolithEngine {
     /// memtable whose contents are in no published version: an
     /// acknowledged write disappears, and a reader that had already seen
     /// it reads an older version instead.
+    ///
+    /// An ingest holds it from its sequence allocation through its install
+    /// and through the flush of every memtable sealed meanwhile, for the
+    /// same reason: an ingested file is an L0 install whose place in the
+    /// order is its sequence. A rotation in that window does not wait for
+    /// it; see `ingest_holds_flushes`.
     flushing: Mutex<()>,
+    /// Set while an ingest holds `flushing`: a rotation then seals its
+    /// memtable and leaves the flush to that ingest instead of waiting for
+    /// the exclusion with the pipeline held, which would stop every writer
+    /// for as long as the ingest takes to write its table.
+    ///
+    /// Written only by `ingest_one` and read only by `rotate_memtable`,
+    /// both under the pipeline mutex, so a rotation sees the value of the
+    /// last write that completed before it took the mutex.
+    ingest_holds_flushes: AtomicBool,
     /// Latched write-path failure. Set only when a failed commit group
     /// could not be rolled back out of the WAL, which leaves the log with
     /// a tail no later write may extend. Once set, every write fails loud
@@ -625,6 +640,7 @@ impl RegolithEngine {
             commit_ring: Self::new_commit_ring(),
             pipeline: Mutex::new(Pipeline::new()),
             flushing: Mutex::new(()),
+            ingest_holds_flushes: AtomicBool::new(false),
             wal_failure: Mutex::new(None),
             wal_failed: AtomicBool::new(false),
             stall_signal,
@@ -765,6 +781,7 @@ impl RegolithEngine {
             commit_ring: Self::new_commit_ring(),
             pipeline: Mutex::new(Pipeline::new()),
             flushing: Mutex::new(()),
+            ingest_holds_flushes: AtomicBool::new(false),
             wal_failure: Mutex::new(None),
             wal_failed: AtomicBool::new(false),
             stall_signal,
@@ -2358,7 +2375,12 @@ impl RegolithEngine {
         // memtable is what lets that flush unlink the right one.
         sealed.seal_wal(old_wal.path().to_path_buf());
         drop(old_wal);
-        self.flush_until_retired(&sealed)?;
+        // An ingest holding `flushing` writes this memtable out right after
+        // its own file is installed. Waiting for the exclusion here would
+        // hold the pipeline, and so every writer, for the whole ingest.
+        if !self.ingest_holds_flushes.load(Ordering::Acquire) {
+            self.flush_until_retired(&sealed, None)?;
+        }
         self.refresh_stall_level();
 
         Ok(())
@@ -2375,7 +2397,16 @@ impl RegolithEngine {
     /// most recently added as the newest, so flushing out of order would
     /// publish an older file over a newer one and make a read travel
     /// backwards.
-    fn flush_until_retired(&self, target: &Arc<MemTable>) -> std::io::Result<()> {
+    ///
+    /// `held` is the caller's own `flushing` guard when it already holds
+    /// the exclusion, as an ingest does when it flushes the memtables
+    /// sealed while it ran. Otherwise each pass takes the exclusion and
+    /// releases it before the next.
+    fn flush_until_retired(
+        &self,
+        target: &Arc<MemTable>,
+        held: Option<&MutexGuard<'_, ()>>,
+    ) -> std::io::Result<()> {
         while self
             .view
             .load()
@@ -2383,7 +2414,11 @@ impl RegolithEngine {
             .iter()
             .any(|mt| Arc::ptr_eq(mt, target))
         {
-            if !self.flush_oldest_frozen()? {
+            let flushed = match held {
+                Some(flushing) => self.flush_oldest_frozen(flushing)?,
+                None => self.flush_oldest_frozen(&self.flushing.lock())?,
+            };
+            if !flushed {
                 break;
             }
         }
@@ -2393,16 +2428,15 @@ impl RegolithEngine {
     /// Write the oldest frozen memtable out to an L0 SSTable and retire
     /// it. Returns `false` when there was nothing frozen to flush.
     ///
-    /// Serialized against itself. The exclusion is not protecting shared
-    /// state, which the read view already publishes atomically: it is
-    /// what keeps L0 installs in the order the memtables were sealed,
-    /// because the format gives an L0 file no sequence of its own and
-    /// recency is install order. Two flushes racing would install a
-    /// newer file under an older one, and a read that had seen the newer
-    /// version would then see the older one.
-    fn flush_oldest_frozen(&self) -> std::io::Result<bool> {
-        let _flushing = self.flushing.lock();
-
+    /// The caller holds `flushing` and passes its guard, which is the
+    /// only way to call this. Serialized against itself. The exclusion
+    /// is not protecting shared state, which the read view already
+    /// publishes atomically: it is what keeps L0 installs in the order
+    /// the memtables were sealed, because the format gives an L0 file no
+    /// sequence of its own and recency is install order. Two flushes
+    /// racing would install a newer file under an older one, and a read
+    /// that had seen the newer version would then see the older one.
+    fn flush_oldest_frozen(&self, _flushing: &MutexGuard<'_, ()>) -> std::io::Result<bool> {
         // Through the env: a target with no monotonic clock reports
         // nothing measured rather than a fabricated duration.
         let flush_start = self.env.now_micros();
@@ -2583,10 +2617,10 @@ impl RegolithEngine {
     /// Synchronously compact SSTables overlapping the user-key range
     /// `[start, end)` down to the bottommost non-empty level.
     ///
-    /// - Flushes the active memtable first so any matching in-memory
-    ///   data reaches L0 before compaction picks inputs.
     /// - Acquires the engine-wide compaction lock so the background
     ///   scheduler can't pick an overlapping input set concurrently.
+    /// - Flushes the active memtable first so any matching in-memory
+    ///   data reaches L0 before compaction picks inputs.
     /// - Walks levels 0..MAX_LEVELS-1, picking range-overlapping files
     ///   and merging them into the next level.
     pub(crate) fn compact_range(
@@ -2595,7 +2629,16 @@ impl RegolithEngine {
         end: Option<&[u8]>,
     ) -> std::io::Result<()> {
         self.ensure_writable()?;
-        // 1. Flush the active memtable so any in-memory data that
+        // 1. Exclude all background workers for the duration of the
+        //    range walk. Write lock blocks until every in-flight
+        //    background pass releases its read lock. Taken before the
+        //    flush below: an ingest holds this lock for its whole call, so
+        //    no ingest can be holding flushes when this call rotates, and
+        //    the flush and any failure of it are this call's own.
+        let _compact_guard = self.compaction_lock.write();
+        self.ensure_writable()?;
+
+        // 2. Flush the active memtable so any in-memory data that
         //    overlaps the range is materialized in L0. We only touch
         //    the write lock if there's actually data to flush. "Data"
         //    here includes range tombstones, not just point entries.
@@ -2606,12 +2649,6 @@ impl RegolithEngine {
                 self.rotate_memtable()?;
             }
         }
-
-        // 2. Exclude all background workers for the duration of the
-        //    range walk. Write lock blocks until every in-flight
-        //    background pass releases its read lock.
-        let _compact_guard = self.compaction_lock.write();
-        self.ensure_writable()?;
 
         // 3. Compute the snapshot-pinning GC horizon so compaction can
         //    drop versions that no live snapshot needs.
@@ -2674,6 +2711,16 @@ impl RegolithEngine {
     /// set the call is rejected while any snapshot is pinned (ingest
     /// would otherwise inject a new seq that older snapshots cannot
     /// consistently observe).
+    ///
+    /// The call waits for any flush already in progress. A memtable that
+    /// fills while a file is being ingested is sealed without waiting, and
+    /// the call writes it to disk right after that file is installed, so
+    /// the ingested entries order after every write acknowledged before
+    /// the call and before every write acknowledged after it. Until then
+    /// those memtables count toward `Options::max_write_buffer_number`,
+    /// which slows and then stops writes. If writing them fails, the call
+    /// returns that error with the file already ingested, and they stay
+    /// readable until a later `Db::flush` writes them.
     pub(crate) fn ingest_external_files<F>(
         &self,
         files: &[PathBuf],
@@ -2849,25 +2896,112 @@ impl RegolithEngine {
         source: &IngestSource,
         ingest_opts: &crate::sst_file_writer::IngestOptions,
     ) -> std::io::Result<()> {
-        use crate::engine::internal_key::{decode_internal_key, encode_internal_key};
-
-        // Flush the active memtable if it overlaps the ingest range.
-        // The cheapest correct thing is to flush unconditionally when
-        // the memtable is non-empty and we might be landing at L0 -
-        // which is the only level where a concurrent memtable could
-        // shadow the ingested keys.
-        let needs_flush = {
-            let view = self.view.load();
-            !view.active.is_empty() || !view.active.clone_range_tombstones().is_empty()
-        };
-        if needs_flush {
+        // Drained, not merely rotated: an ingest is ordered like a flush. Every
+        // memtable sealed below the sequence allocated here is in an SSTable
+        // before the ingested file lands, and `flushing` is held from the
+        // allocation to the install so no memtable sealed above it can land
+        // before the ingested file; a rotation in that window seals without
+        // flushing, and this call flushes it after the install. L0 recency is
+        // install order, so either inversion would let a read return the wrong
+        // version of a key the ingest carries. The sequence is allocated under
+        // the pipeline mutex, where seals and commit groups allocate theirs, so
+        // it is strictly ordered against both.
+        let (flush_guard, ingest_seq) = {
             let _write_guard = self.pipeline.lock();
             let view = self.view.load();
             if !view.active.is_empty() || !view.active.clone_range_tombstones().is_empty() {
                 drop(view);
                 self.rotate_memtable()?;
+            } else if let Some(newest_frozen) = view.frozen.last().cloned() {
+                drop(view);
+                self.flush_until_retired(&newest_frozen, None)?;
             }
+            let flush_guard = self.flushing.lock();
+            let ingest_seq = self.latest_seq.fetch_add(1, Ordering::AcqRel) + 1;
+            self.ingest_holds_flushes.store(true, Ordering::Release);
+            (flush_guard, ingest_seq)
+        };
+
+        let installed = self.install_ingested(source, ingest_opts, ingest_seq);
+        let held = self.flush_memtables_sealed_during_ingest(&flush_guard);
+        // Released before listeners run: a listener is user code.
+        drop(flush_guard);
+
+        let table = match installed {
+            Ok(table) => table,
+            Err(e) => {
+                return Err(match held {
+                    Ok(()) => e,
+                    Err(flush_err) => std::io::Error::new(
+                        e.kind(),
+                        format!(
+                            "{e}; flushing memtables to disk afterwards also failed, \
+                             call flush to retry: {flush_err}"
+                        ),
+                    ),
+                });
+            }
+        };
+
+        if !self.options.listeners.is_empty() {
+            // Fire the table-created event first (file-level
+            // observation) and then the ingest-specific event
+            // (caller-level observation carrying the original
+            // external path).
+            let create_info = event_listener::TableFileCreationInfo {
+                file_id: table.file_id,
+                file_path: table.path.clone(),
+                level: table.level,
+                reason: event_listener::TableFileCreationReason::Recovery,
+                file_size: table.file_size,
+                num_entries: table.num_entries,
+            };
+            event_listener::dispatch(&self.options.listeners, |l| {
+                l.on_table_file_created(&create_info)
+            });
+            let ingest_info = event_listener::ExternalFileIngestionInfo {
+                external_file_path: source.path.clone(),
+                internal_file_id: table.file_id,
+                level: table.level,
+                num_entries: table.num_entries,
+                file_size: table.file_size,
+            };
+            event_listener::dispatch(&self.options.listeners, |l| {
+                l.on_external_file_ingested(&ingest_info)
+            });
         }
+
+        tracing::info!(
+            file_id = table.file_id,
+            target_level = table.level,
+            ingest_seq,
+            entries = table.num_entries,
+            size = table.file_size,
+            source = %source.path.display(),
+            "Ingested external SSTable"
+        );
+
+        held.map_err(|e| {
+            std::io::Error::new(
+                e.kind(),
+                format!(
+                    "ingest: {} was ingested, but flushing memtables to disk afterwards \
+                     failed; they stay readable, call flush to retry: {e}",
+                    source.path.display()
+                ),
+            )
+        })
+    }
+
+    /// Rewrite `source` at `ingest_seq` into the SSTable directory and
+    /// install it. The caller holds `flushing`.
+    fn install_ingested(
+        &self,
+        source: &IngestSource,
+        ingest_opts: &crate::sst_file_writer::IngestOptions,
+        ingest_seq: u64,
+    ) -> std::io::Result<IngestedTable> {
+        use crate::engine::internal_key::{decode_internal_key, encode_internal_key};
 
         // Compute the target level from the current version.
         let version = self.published_version();
@@ -2878,8 +3012,7 @@ impl RegolithEngine {
             ingest_opts.ingest_behind,
         )?;
 
-        // Allocate a new file_id and a new global seq. All entries in
-        // the emitted file share the allocated seq.
+        // Allocate a new file_id.
         let file_id = {
             let mut guard = self.versions.lock();
             let current = guard.current();
@@ -2887,7 +3020,6 @@ impl RegolithEngine {
             guard.apply(&[VersionEdit::SetNextFileId(id + 1)])?;
             id
         };
-        let ingest_seq = self.latest_seq.fetch_add(1, Ordering::AcqRel) + 1;
 
         let dest_path = self.sst_dir.join(sst_filename(file_id));
         let mut writer = SsTableWriter::new_in(
@@ -2963,44 +3095,46 @@ impl RegolithEngine {
         // published a higher horizon.
         self.visible_seq.publish(ingest_seq);
 
-        if !self.options.listeners.is_empty() {
-            // Fire the table-created event first (file-level
-            // observation) and then the ingest-specific event
-            // (caller-level observation carrying the original
-            // external path).
-            let create_info = event_listener::TableFileCreationInfo {
-                file_id,
-                file_path: dest_path.clone(),
-                level: target_level,
-                reason: event_listener::TableFileCreationReason::Recovery,
-                file_size,
-                num_entries: summary.num_entries,
-            };
-            event_listener::dispatch(&self.options.listeners, |l| {
-                l.on_table_file_created(&create_info)
-            });
-            let ingest_info = event_listener::ExternalFileIngestionInfo {
-                external_file_path: source.path.clone(),
-                internal_file_id: file_id,
-                level: target_level,
-                num_entries: summary.num_entries,
-                file_size,
-            };
-            event_listener::dispatch(&self.options.listeners, |l| {
-                l.on_external_file_ingested(&ingest_info)
-            });
-        }
-
-        tracing::info!(
+        Ok(IngestedTable {
             file_id,
-            target_level,
-            ingest_seq,
-            entries = summary.num_entries,
-            size = file_size,
-            source = %source.path.display(),
-            "Ingested external SSTable"
-        );
-        Ok(())
+            path: dest_path,
+            level: target_level,
+            file_size,
+            num_entries: summary.num_entries,
+        })
+    }
+
+    /// Give rotations their flushes back, then flush every memtable sealed
+    /// while the calling ingest held `flushing`, oldest first.
+    ///
+    /// Called by `ingest_one` on every path after it set
+    /// `ingest_holds_flushes`, still holding `flushing` and after its
+    /// install has succeeded or failed. Those memtables were sealed above
+    /// the ingest's sequence, so they have to land after its file, and
+    /// nothing else can flush them while the exclusion is held. The flag is
+    /// cleared and the frozen list read in one pipeline critical section:
+    /// a rotation that ran before it left its memtable in that list, and
+    /// one that runs after it flushes its own. The set is fixed there and
+    /// never extended, for the reason `drain_memtables` gives. A memtable
+    /// whose flush fails stays frozen, readable, and backed by its WAL.
+    fn flush_memtables_sealed_during_ingest(
+        &self,
+        flushing: &MutexGuard<'_, ()>,
+    ) -> std::io::Result<()> {
+        let newest = {
+            let _write_guard = self.pipeline.lock();
+            self.ingest_holds_flushes.store(false, Ordering::Release);
+            self.view.load().frozen.last().cloned()
+        };
+        let flushed = match newest {
+            Some(newest) => self.flush_until_retired(&newest, Some(flushing)),
+            None => Ok(()),
+        };
+        // Writers parked on a memtable stall re-check now rather than at
+        // their next timed wake-up.
+        self.refresh_stall_level();
+        self.stall_signal.notify_all();
+        flushed
     }
 
     /// Atomically capture a consistent snapshot of the on-disk state
@@ -3506,7 +3640,7 @@ impl RegolithEngine {
         // writes them in, so a target that an earlier pass already
         // flushed costs one list scan and no work.
         for target in &targets {
-            self.flush_until_retired(target)?;
+            self.flush_until_retired(target, None)?;
         }
         Ok(())
     }
@@ -3552,6 +3686,16 @@ impl Drop for IngestCacheGuard<'_> {
             self.cache.evict_file(ingest_probe_file_id(source_idx));
         }
     }
+}
+
+/// The table one ingest source was installed as, kept for the listeners
+/// and the log that run once `flushing` is released.
+struct IngestedTable {
+    file_id: u64,
+    path: PathBuf,
+    level: usize,
+    file_size: u64,
+    num_entries: u64,
 }
 
 /// A validated ingest source: an open reader plus its user-key range.
