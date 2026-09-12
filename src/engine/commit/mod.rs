@@ -219,6 +219,36 @@ impl RegolithEngine {
         let ops = grouped_batch_ops(point_ops, range_deletes, merges);
         self.validate_ops_sizes(&ops)?;
 
+        // The write-stall admission a plain write pays with
+        // `WriteOptions::default()`, in the same order: closed/WAL-failed/
+        // read-only above, then size validation above, then the wait, and
+        // only then the pipeline mutex below. Never inside that mutex: a
+        // `CompactInline` wait runs a compaction pass on this thread, and
+        // that pass must not be entered while any commit-path lock is
+        // held. A commit that writes nothing (`ops` empty, e.g. a
+        // `get_for_update` with no write) takes no capacity and skips the
+        // wait, though its conflict check below still runs under the
+        // mutex like any other commit.
+        if !ops.is_empty() {
+            self.wait_for_write_capacity(false)
+                .map_err(crate::Error::into_io_error)?;
+        }
+
+        self.commit_locked(conflict_keys, ops, durability)
+    }
+
+    /// The conflict check and the apply, under one uninterrupted hold of
+    /// the pipeline mutex. Split out of [`Self::commit_optimistic`] so the
+    /// admission wait above does not share a function body with this loop
+    /// once `Transaction::commit_inner` inlines both: sharing one grew
+    /// large enough to cost the loop its rotation, adding a per-key
+    /// instruction count no admission check should touch.
+    fn commit_locked(
+        &self,
+        conflict_keys: &[crate::engine::ConflictKey],
+        ops: Vec<WriteBatchOp>,
+        durability: DurabilityMode,
+    ) -> io::Result<CommitOutcome> {
         let mut pipe = self.pipeline.lock();
 
         let view = self.view.load();

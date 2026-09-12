@@ -85,8 +85,9 @@ pub enum Ticker {
     IterSeekCount = 19,
     /// Number of `Iter::next` calls that produced a key.
     IterNextCount = 20,
-    /// Microseconds the engine spent stalling a writer. Not
-    /// populated yet - reserved for the write-stall plumbing.
+    /// Microseconds writers spent in write-stall waits that admitted the
+    /// write: plain writes and transactional commits that carry writes
+    /// alike. A wait that ends in a busy or closed error is not counted.
     WriteStallMicros = 21,
     /// Number of snapshots registered via `Db::snapshot`.
     SnapshotsRegistered = 22,

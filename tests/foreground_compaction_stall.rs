@@ -9,7 +9,8 @@
 #![cfg(not(target_arch = "wasm32"))]
 
 use regolith::{
-    CompactionOutcome, CompactionStyle, Db, Env, Error, FifoCompactionOptions, Options,
+    CompactionOutcome, CompactionStyle, Db, Env, Error, FifoCompactionOptions, IsolationLevel,
+    MergeOperator, OptimisticTransactionDb, Options, Transaction, TransactionDb, TransactionError,
 };
 use std::sync::mpsc;
 use std::time::Duration;
@@ -573,4 +574,208 @@ fn a_second_handle_is_refused_even_without_a_cross_process_lock() {
     let reopened = Db::open("/lockless", opts()).unwrap();
     reopened.put(b"k", b"v").unwrap();
     reopened.close().unwrap();
+}
+
+/// With the plain writer already parked at the FIFO stop trigger, a commit
+/// that writes must observe the same stall the plain write did, and a commit
+/// that writes nothing must not wait at all.
+fn probe_transactional_stall<'a>(
+    plain: &Db,
+    label: &str,
+    begin: impl Fn(IsolationLevel) -> Transaction<'a>,
+) {
+    let reason = first_stall_reason(plain, label);
+    assert!(
+        reason.contains("FIFO compaction never merges them"),
+        "{label}: expected the FIFO stop reason, got: {reason}"
+    );
+
+    for iso in [
+        IsolationLevel::SnapshotIsolation,
+        IsolationLevel::Serializable,
+    ] {
+        let tx = begin(iso);
+        tx.get(b"k00000000").unwrap();
+        let read_only = tx.commit();
+        assert!(
+            read_only.is_ok(),
+            "{label}/{iso:?}: a read-only commit must not wait on a stall it never touches, \
+             got {read_only:?}"
+        );
+
+        let key = format!("{label}/txn/{iso:?}").into_bytes();
+        let tx = begin(iso);
+        tx.put(&key, &val(1)).unwrap();
+        match tx.commit() {
+            Err(TransactionError::Io(e)) => {
+                assert!(
+                    e.to_string().ends_with(&reason),
+                    "{label}/{iso:?}: expected the plain write's stall reason ({reason}), got: {e}"
+                );
+                assert!(
+                    plain.get(&key).unwrap().is_none(),
+                    "{label}/{iso:?}: a commit refused for a stall must not have written its key"
+                );
+            }
+            other => panic!("{label}/{iso:?}: expected the plain write's stall, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn optimistic_commit_observes_the_stop_trigger_like_a_plain_write() {
+    with_deadline("optimistic_txn_stall", 180, || {
+        let dir = tempfile::tempdir().unwrap();
+        let db = OptimisticTransactionDb::open(dir.path(), fifo_opts(0)).unwrap();
+        probe_transactional_stall(db.db(), "optimistic", |iso| db.begin_transaction_with(iso));
+        db.db().close().unwrap();
+    });
+}
+
+#[test]
+fn pessimistic_commit_observes_the_stop_trigger_like_a_plain_write() {
+    with_deadline("pessimistic_txn_stall", 180, || {
+        let dir = tempfile::tempdir().unwrap();
+        let db = TransactionDb::open(dir.path(), fifo_opts(0)).unwrap();
+        probe_transactional_stall(db.db(), "pessimistic", |iso| db.begin_transaction_with(iso));
+        db.db().close().unwrap();
+    });
+}
+
+/// An oversized transactional commit must be rejected the same way a plain
+/// put is, a permanent size error, even with the plain writer already
+/// parked at the FIFO stop trigger. Regression for admission ordering: when
+/// sizes were checked after the write-stall wait, a commit that could never
+/// pass validation got stalled first, and its size error came back looking
+/// like a transient "engine busy" instead.
+fn probe_oversized_commit_under_a_stop<'a>(
+    plain: &Db,
+    label: &str,
+    begin: impl FnOnce() -> Transaction<'a>,
+) {
+    // Park the plain writer at the stop before touching the size limit, so
+    // a broken admission order would see the stall ahead of the size check.
+    let _ = first_stall_reason(plain, label);
+
+    let oversized = vec![0u8; Options::default().max_value_size + 1];
+    let message = match plain.put(b"oversized", &oversized) {
+        Err(Error::InvalidArgument(message)) => message,
+        other => panic!("{label}: expected an oversized-value InvalidArgument, got {other:?}"),
+    };
+
+    let tx = begin();
+    tx.put(b"oversized", &oversized).unwrap();
+    match tx.commit() {
+        Err(TransactionError::Io(e)) => {
+            assert_eq!(
+                e.kind(),
+                std::io::ErrorKind::InvalidInput,
+                "{label}: expected the size error's kind, got {e:?}"
+            );
+            assert_eq!(
+                e.to_string(),
+                message,
+                "{label}: expected the plain write's size message"
+            );
+        }
+        other => panic!("{label}: expected a size Io error, got {other:?}"),
+    }
+}
+
+#[test]
+fn optimistic_commit_of_an_oversized_value_reports_the_size_error_not_a_stall() {
+    with_deadline("optimistic_oversized_commit", 180, || {
+        let dir = tempfile::tempdir().unwrap();
+        let db = OptimisticTransactionDb::open(dir.path(), fifo_opts(0)).unwrap();
+        probe_oversized_commit_under_a_stop(db.db(), "optimistic", || db.begin_transaction());
+        db.db().close().unwrap();
+    });
+}
+
+#[test]
+fn pessimistic_commit_of_an_oversized_value_reports_the_size_error_not_a_stall() {
+    with_deadline("pessimistic_oversized_commit", 180, || {
+        let dir = tempfile::tempdir().unwrap();
+        let db = TransactionDb::open(dir.path(), fifo_opts(0)).unwrap();
+        probe_oversized_commit_under_a_stop(db.db(), "pessimistic", || db.begin_transaction());
+        db.db().close().unwrap();
+    });
+}
+
+#[derive(Debug)]
+struct ConcatMerge;
+
+impl MergeOperator for ConcatMerge {
+    fn name(&self) -> &'static str {
+        "concat"
+    }
+
+    fn full_merge(
+        &self,
+        _key: &[u8],
+        existing: Option<&[u8]>,
+        operands: &[&[u8]],
+    ) -> Option<Vec<u8>> {
+        let mut out = existing.map(|e| e.to_vec()).unwrap_or_default();
+        for op in operands {
+            out.extend_from_slice(op);
+        }
+        Some(out)
+    }
+}
+
+fn fifo_merge_opts(workers: usize) -> Options {
+    Options {
+        merge_operator: Some(std::sync::Arc::new(ConcatMerge)),
+        ..fifo_opts(workers)
+    }
+}
+
+/// A commit whose only buffered op is a merge must be admitted the same way
+/// a put-carrying commit is. Regression for a `carries_writes` guard that
+/// checked `writes` and `range_deletes` but dropped the `merges` arm, which
+/// would let a merge-only commit skip admission and land straight through
+/// an L0 stop.
+fn probe_merge_only_commit_under_a_stop<'a>(
+    plain: &Db,
+    label: &str,
+    begin: impl FnOnce() -> Transaction<'a>,
+) {
+    let reason = first_stall_reason(plain, label);
+
+    let tx = begin();
+    tx.merge(b"counter", b"x").unwrap();
+    match tx.commit() {
+        Err(TransactionError::Io(e)) => {
+            assert!(
+                e.to_string().ends_with(&reason),
+                "{label}: expected the plain write's stall reason ({reason}), got: {e}"
+            );
+        }
+        other => panic!("{label}: expected the plain write's stall, got {other:?}"),
+    }
+    assert!(
+        plain.get(b"counter").unwrap().is_none(),
+        "{label}: a merge-only commit refused for a stall must not have written its key"
+    );
+}
+
+#[test]
+fn optimistic_merge_only_commit_observes_the_stop_trigger_like_a_plain_write() {
+    with_deadline("optimistic_merge_stall", 180, || {
+        let dir = tempfile::tempdir().unwrap();
+        let db = OptimisticTransactionDb::open(dir.path(), fifo_merge_opts(0)).unwrap();
+        probe_merge_only_commit_under_a_stop(db.db(), "optimistic", || db.begin_transaction());
+        db.db().close().unwrap();
+    });
+}
+
+#[test]
+fn pessimistic_merge_only_commit_observes_the_stop_trigger_like_a_plain_write() {
+    with_deadline("pessimistic_merge_stall", 180, || {
+        let dir = tempfile::tempdir().unwrap();
+        let db = TransactionDb::open(dir.path(), fifo_merge_opts(0)).unwrap();
+        probe_merge_only_commit_under_a_stop(db.db(), "pessimistic", || db.begin_transaction());
+        db.db().close().unwrap();
+    });
 }

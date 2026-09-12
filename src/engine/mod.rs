@@ -801,7 +801,7 @@ impl RegolithEngine {
         )
     }
 
-    fn ensure_writable(&self) -> std::io::Result<()> {
+    pub(crate) fn ensure_writable(&self) -> std::io::Result<()> {
         self.ensure_open()?;
         if self.wal_failed.load(Ordering::Acquire) {
             return Err(self.wal_failure_error());
@@ -1963,16 +1963,27 @@ impl RegolithEngine {
         Ok(())
     }
 
+    // Not closed and no cached stall is the overwhelming common case, so
+    // this fast check stays inlined at every call site rather than a call
+    // instruction: two byte loads and two branches over state the engine
+    // already keeps resident (`close_state`, `cached_stall_level`), which
+    // also skips the `stall_state()` call that loads the read view and
+    // walks L0. Anything past that is parking or an inline compaction
+    // pass, so it is cold and kept out of line instead of bloating every
+    // caller that never stalls.
+    #[inline]
     pub(crate) fn wait_for_write_capacity(&self, no_slowdown: bool) -> Result<u64, crate::Error> {
+        if !self.is_closed() && self.cached_stall_level.load(Ordering::Acquire) == 0 {
+            return Ok(0);
+        }
+        self.wait_for_write_capacity_slow(no_slowdown)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn wait_for_write_capacity_slow(&self, no_slowdown: bool) -> Result<u64, crate::Error> {
         if self.is_closed() {
             return Err(crate::Error::Closed);
-        }
-        // Fast path: if the cached stall level is 0, skip the
-        // stall_state() call that loads the read view and walks L0.
-        // This saves a lock round-trip and a level scan per write in
-        // the common no-stall scenario.
-        if self.cached_stall_level.load(Ordering::Acquire) == 0 {
-            return Ok(0);
         }
 
         let start = self.env.now_micros();
