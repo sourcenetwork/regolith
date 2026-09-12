@@ -64,6 +64,98 @@ pub fn insert_publishes_a_whole_node_to_a_concurrent_reader() {
     );
 }
 
+/// Invariants S1 and S3 for the hinted insert path: a writer that takes
+/// one hint and inserts two keys through it publishes each as a whole
+/// node, and the ordering the hint exists to skip a descent for is the
+/// same ordering that makes the second node's visibility imply the
+/// first's.
+///
+/// `a` and `e` bracket the run; the writer inserts `b` then `d` through
+/// one hint (`d` sorts after `b` and before `e`, so the second insert
+/// takes the level-0 bracket path with no descent from the head). The
+/// reader asserts `a` and `e` are always found with their own values
+/// (S3), that `b` or `d`, if seen at all, carry their own sequence and
+/// value (S1), and that whenever `d` is visible a fresh lookup of `b`
+/// finds it too: `b`'s `Release` stores precede `d`'s in the writer's
+/// program order, so the `Acquire` load that just revealed `d` orders
+/// `b`'s publication before the next load this reader issues.
+pub fn a_hinted_run_publishes_whole_nodes_to_a_concurrent_reader() {
+    explore(
+        "a_hinted_run_publishes_whole_nodes_to_a_concurrent_reader",
+        16,
+        4,
+        |witness| {
+            let mt = Arc::new(memtable());
+            mt.put(probe(b"a").prefixed_user_key(), b"va", 1);
+            mt.put(probe(b"e").prefixed_user_key(), b"ve", 1);
+
+            let writer = {
+                let mt = Arc::clone(&mt);
+                loom::thread::spawn(move || {
+                    let mut hint = mt.insert_hint();
+                    mt.put_hinted(&mut hint, probe(b"b").prefixed_user_key(), b"vb", 2);
+                    mt.put_hinted(&mut hint, probe(b"d").prefixed_user_key(), b"vd", 3);
+                })
+            };
+            let reader = {
+                let mt = Arc::clone(&mt);
+                let witness = witness.clone();
+                loom::thread::spawn(move || {
+                    let (seq, value) = mt.get(&probe(b"a")).expect("S3: `a` cannot be lost");
+                    assert_eq!(seq, 1);
+                    assert_eq!(value.expect("`a` is a live value").as_slice(), b"va");
+                    let (seq, value) = mt.get(&probe(b"e")).expect("S3: `e` cannot be lost");
+                    assert_eq!(seq, 1);
+                    assert_eq!(value.expect("`e` is a live value").as_slice(), b"ve");
+
+                    if let Some((seq, value)) = mt.get(&probe(b"b")) {
+                        assert_eq!(seq, 2, "S1: a visible node carries its own sequence");
+                        assert_eq!(
+                            value.expect("`b` is a live value").as_slice(),
+                            b"vb",
+                            "S1: a visible node carries its own value"
+                        );
+                    }
+
+                    if let Some((seq, value)) = mt.get(&probe(b"d")) {
+                        witness.record();
+                        assert_eq!(seq, 3, "S1: a visible node carries its own sequence");
+                        assert_eq!(
+                            value.expect("`d` is a live value").as_slice(),
+                            b"vd",
+                            "S1: a visible node carries its own value"
+                        );
+                        // The hinted publication order: `b` was released
+                        // before `d` (same writer thread), so the
+                        // `Acquire` that just revealed `d` also orders
+                        // `b`'s publication before this next load.
+                        let (b_seq, b_value) = mt
+                            .get(&probe(b"b"))
+                            .expect("`d` visible must imply `b` is too");
+                        assert_eq!(b_seq, 2, "S1: a visible node carries its own sequence");
+                        assert_eq!(b_value.expect("`b` is a live value").as_slice(), b"vb");
+                    }
+                })
+            };
+
+            writer.join().expect("writer");
+            reader.join().expect("reader");
+
+            for (key, want) in [
+                (&b"a"[..], &b"va"[..]),
+                (b"b", b"vb"),
+                (b"d", b"vd"),
+                (b"e", b"ve"),
+            ] {
+                let (_, value) = mt
+                    .get(&probe(key))
+                    .expect("every key is present after the join");
+                assert_eq!(value.expect("live value").as_slice(), want);
+            }
+        },
+    );
+}
+
 /// The regression that a two-load seek reintroduces: a key already in
 /// the memtable stays findable while a writer inserts immediately before
 /// it.
@@ -246,6 +338,12 @@ pub fn two_serialized_writers_and_a_reader_share_one_key() {
 ///
 /// Only a debug build has the guard, so only a debug build has this
 /// model. `tests/loom_memtable.rs` gates the test the same way.
+///
+/// The second writer goes through a hint (`insert_hint` + `put_hinted`)
+/// rather than plain `put`, so the calibration proves the hinted entry
+/// point is guarded by the same S2 check as the plain one: the guard is
+/// the first thing `insert_inner` does regardless of which caller reached
+/// it.
 #[cfg(debug_assertions)]
 pub fn an_unserialized_insert_trips_the_single_writer_guard() {
     explore(
@@ -256,17 +354,21 @@ pub fn an_unserialized_insert_trips_the_single_writer_guard() {
             let mt = Arc::new(memtable());
             witness.record();
 
-            let writers: Vec<_> = [(1u64, &b"v1"[..]), (2, b"v2")]
-                .into_iter()
-                .map(|(seq, value)| {
-                    let mt = Arc::clone(&mt);
-                    loom::thread::spawn(move || {
-                        mt.put(probe(b"k").prefixed_user_key(), value, seq);
-                    })
+            let first = {
+                let mt = Arc::clone(&mt);
+                loom::thread::spawn(move || {
+                    mt.put(probe(b"k").prefixed_user_key(), b"v1", 1);
                 })
-                .collect();
+            };
+            let second = {
+                let mt = Arc::clone(&mt);
+                loom::thread::spawn(move || {
+                    let mut hint = mt.insert_hint();
+                    mt.put_hinted(&mut hint, probe(b"k").prefixed_user_key(), b"v2", 2);
+                })
+            };
 
-            for writer in writers {
+            for writer in [first, second] {
                 if let Err(payload) = writer.join() {
                     std::panic::resume_unwind(payload);
                 }

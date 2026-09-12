@@ -22,7 +22,13 @@
 //! - that the flush handoff leaves every key reachable at every instant;
 //! - that a reader pinning one version walks a whole snapshot across a
 //!   concurrent compaction, and that a flush and a compaction
-//!   publishing at once cannot lose one another's edits.
+//!   publishing at once cannot lose one another's edits;
+//! - that the arena's chunk list, a `crate::sync::UnsafeCell` rather than
+//!   a lock (invariant A8 in `engine::arena`), sees no access that is
+//!   not ordered before or after every other access to it: every model
+//!   that allocates now runs its allocations through the tracked cell,
+//!   so a broken A8 contract fails the model the same way a broken S1
+//!   would.
 //!
 //! The version models in [`version`] are protocol models and say so:
 //! the production `VersionSet` writes a manifest record and opens an
@@ -58,8 +64,14 @@
 //! retires the frozen memtable before it installs the table, a relaxed
 //! read horizon, a compaction that publishes its removals and its
 //! addition as two versions, two version swaps with nothing serializing
-//! them - and the pair is only meaningful if the wrong one fails. They
-//! are run as `#[should_panic]` tests in `tests/loom_memtable.rs`.
+//! them, two arena allocations with nothing serializing them - and the
+//! pair is only meaningful if the wrong one fails. They are run as
+//! `#[should_panic]` tests in `tests/loom_memtable.rs`. [`arena`]'s
+//! calibration is two expectations gated on one test by
+//! `debug_assertions`, because the arena's single-writer guard is itself
+//! debug-only: a debug build proves the guard trips, a release build
+//! proves the tracked cell catches the same race once the guard is
+//! compiled out.
 //!
 //! A calibration stops at the first schedule that trips its assertion,
 //! so [`explore`]'s floors never execute for one: the panic unwinds past
@@ -67,6 +79,7 @@
 //! calibration reports is how many schedules loom searched before it
 //! found the bug, not how large its search space is.
 
+pub mod arena;
 pub mod handoff;
 pub mod skiplist;
 pub mod slice;

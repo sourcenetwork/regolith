@@ -22,10 +22,16 @@
 //! single-writer guard (invariant S2) is a `debug_assert`, so the model
 //! that proves it fires on an unserialized insert is compiled out of a
 //! release build. Both profiles run in CI for that reason.
+//!
+//! The arena's single-writer guard (invariant A8) is debug-only the same
+//! way, but its calibration runs in both profiles: a debug build proves
+//! the guard trips, a release build proves loom's tracked cell catches
+//! the same unserialized race once the guard is compiled out, so the
+//! expected panic message differs by profile on that one test.
 
 #![cfg(loom)]
 
-use regolith::loom_exports::{handoff, skiplist, slice, version};
+use regolith::loom_exports::{arena, handoff, skiplist, slice, version};
 
 #[test]
 fn insert_publishes_a_whole_node_to_a_concurrent_reader() {
@@ -48,6 +54,11 @@ fn two_serialized_writers_and_a_reader_share_one_key() {
     skiplist::two_serialized_writers_and_a_reader_share_one_key();
 }
 
+#[test]
+fn a_hinted_run_publishes_whole_nodes_to_a_concurrent_reader() {
+    skiplist::a_hinted_run_publishes_whole_nodes_to_a_concurrent_reader();
+}
+
 /// The S2 guard is a `debug_assert`, so this calibration only exists in
 /// a debug build. Run it with `RUSTFLAGS="--cfg loom" cargo test --test
 /// loom_memtable`, without `--release`.
@@ -56,6 +67,22 @@ fn two_serialized_writers_and_a_reader_share_one_key() {
 #[should_panic(expected = "insert is single-writer (S2)")]
 fn an_unserialized_insert_trips_the_single_writer_guard() {
     skiplist::an_unserialized_insert_trips_the_single_writer_guard();
+}
+
+/// Invariant A8: two unserialized `Arena::alloc` calls must never both
+/// touch the chunk list. A debug build's guard trips before either
+/// thread reaches the state; a release build has no guard, so it is
+/// loom's tracked cell that reports the concurrent write, which is the
+/// calibration that proves the cell replacing the removed `Mutex` is
+/// actually seen by the model.
+#[cfg_attr(debug_assertions, should_panic(expected = "single-writer (A8)"))]
+#[cfg_attr(
+    not(debug_assertions),
+    should_panic(expected = "Concurrent write accesses")
+)]
+#[test]
+fn two_unserialized_allocations_race_the_arena() {
+    arena::two_unserialized_allocations_race_the_arena();
 }
 
 #[test]

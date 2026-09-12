@@ -150,9 +150,12 @@ Every run ends with a built-in witness detector, so the harness produces
 evidence on a machine with no JVM and so a failure points at a concrete
 pair of operations rather than a cycle diagram. It reports lost appends
 for `list-append` and stale reads for `rw-register`, both stated against
-real time and therefore sound under strict serializability. Run it alone
-on an existing history with `--verify history.json`. elle-cli remains
-the authority; the built-in check is a witness, not a substitute.
+real time and therefore sound under strict serializability. A stale read
+is reported only when the newer write's transaction was invoked after
+the observed version committed, because two overlapping transactions can
+record their completions in the opposite order of their commits. Run it
+alone on an existing history with `--verify history.json`. elle-cli
+remains the authority; the built-in check is a witness, not a substitute.
 
 `elle-gen` exits non-zero when it finds witnesses.
 

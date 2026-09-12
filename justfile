@@ -250,15 +250,24 @@ stress secs="600":
 #
 # | recipe        | models | profile | measured |
 # |---------------|--------|---------|----------|
-# | `loom`        | 14     | release | 19.7s    |
-# | `loom-debug`  | 15     | debug   | 133s     |
-# | `loom-all`    | both   | both    | ~153s    |
+# | `loom`        | 16     | release | 21.6s    |
+# | `loom-debug`  | 17     | debug   | 16.0s    |
+# | `loom-all`    | both   | both    | ~38s     |
+#
+# Re-measured on a host at load average 105-140 on 36 threads (a shared,
+# heavily loaded machine), so these are not comparable to a quiet-host
+# baseline; they are the wall time `cargo test`'s own summary line
+# reported for the test binary, excluding compilation.
 #
 # The debug run carries one extra calibration: the skip list's
 # single-writer guard (S2) is a `debug_assert`, so the model proving it
-# fires is compiled out of a release build. Six of the models are
-# `should_panic` calibrations that deliberately get the ordering wrong;
-# they are what make the passes mean anything.
+# fires is compiled out of a release build. The arena's single-writer
+# guard (A8) is debug-only the same way, but its own calibration runs in
+# both profiles with a different expected panic message per profile (a
+# debug build trips the guard, a release build trips loom's tracked
+# cell), so it does not add to the debug-only gap the way S2's does.
+# Seven of the models are `should_panic` calibrations that deliberately
+# get the ordering wrong; they are what make the passes mean anything.
 
 loom:
     RUSTFLAGS="--cfg loom" cargo test --release --test loom_memtable
@@ -299,7 +308,7 @@ elle model="list-append" level="snapshot-isolation" isolation="repeatable-read":
         --model {{model}} --isolation {{isolation}} \
         --threads 8 --txns 50 --keys 4 \
         --out /tmp/regolith-history.json --dir /tmp/regolith-elle-db
-    java -jar harness/elle/elle-cli.jar --model {{model}} \
+    java -jar harness/elle/elle-cli.jar --model {{model}} --cycle-search-timeout 60000 \
         --consistency-models {{level}} /tmp/regolith-history.json
 
 # The same, with the fault injection the harness supports.
@@ -308,31 +317,39 @@ elle-fault model="list-append" level="snapshot-isolation":
         --model {{model}} --isolation repeatable-read --faults \
         --threads 8 --txns 50 --keys 4 \
         --out /tmp/regolith-history-fault.json --dir /tmp/regolith-elle-fault-db
-    java -jar harness/elle/elle-cli.jar --model {{model}} \
+    java -jar harness/elle/elle-cli.jar --model {{model}} --cycle-search-timeout 60000 \
         --consistency-models {{level}} /tmp/regolith-history-fault.json
 
 # Every level regolith claims, checked in one go.
 #
-# Each line prints `true` or `false`; a `false` on a level regolith claims is
-# a real failure and the recipe exits non-zero.
+# Each line prints elle-cli's verdict and whether elle-gen's built-in check
+# passed; anything other than `true` with a passing built-in check fails the
+# recipe. `:unknown` means elle-cli gave up a cycle search, so the per-SCC
+# timeout below is raised to keep a slow runner from reporting a valid
+# history as `:unknown`.
 elle-matrix:
     #!/usr/bin/env bash
     set -uo pipefail
     cd harness/elle
-    cargo build --release --bin elle-gen
     fail=0
+    cargo build --release --bin elle-gen
+    cargo test --release || fail=1
     check() {
         local name="$1" model="$2" level="$3"; shift 3
-        ./target/release/elle-gen --model "$model" "$@" \
-            --out "/tmp/elle-$name.json" --dir "/tmp/elle-db-$name" >/dev/null
-        # elle-cli prints "<path>\t<true|false>"; take the last field and
-        # strip surrounding whitespace, so a stray tab cannot read as a
-        # failure on a history that actually passed.
+        local built_in=pass
+        if ! ./target/release/elle-gen --model "$model" "$@" \
+            --out "/tmp/elle-$name.json" --dir "/tmp/elle-db-$name" >/dev/null; then
+            built_in=fail
+            fail=1
+        fi
+        # elle-cli prints "<path>\t<true|false|:unknown>"; take the last
+        # field and strip surrounding whitespace, so a stray tab cannot read
+        # as a failure on a history that actually passed.
         local v
-        v=$(java -jar elle-cli.jar --model "$model" \
+        v=$(java -jar elle-cli.jar --model "$model" --cycle-search-timeout 60000 \
             --consistency-models "$level" "/tmp/elle-$name.json" \
             | tail -1 | awk '{print $NF}')
-        printf '  %-42s %s\n' "$name [$level]" "$v"
+        printf '  %-42s %s (built-in check: %s)\n' "$name [$level]" "$v" "$built_in"
         if [ "$v" != "true" ]; then fail=1; fi
     }
     # Optimistic transactions are snapshot isolation. That is the level

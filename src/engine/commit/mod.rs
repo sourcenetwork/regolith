@@ -37,6 +37,7 @@ use std::time::Duration;
 
 use kovan_queue::array_queue::ArrayQueue;
 
+use super::memtable::MemTable;
 use super::wal::Wal;
 use super::{CommitOutcome, DurabilityMode, ReadView, RegolithEngine, grouped_batch_ops};
 use crate::WriteBatchOp;
@@ -700,10 +701,17 @@ impl RegolithEngine {
 
         {
             let _perf_mt = PerfTimer::new(PerfTimerField::WriteMemtable);
-            let memtable = &view.active;
+            let memtable: &MemTable = &view.active;
+            // One hint per group: a commit's point ops arrive in key
+            // order (`grouped_batch_ops`), so each insert after the
+            // first starts where the previous one landed. The hint
+            // borrows the memtable this group was applied to and dies
+            // with the block, so a rotation between groups can never
+            // leave it pointing into a retired arena.
+            let mut hint = memtable.insert_hint();
             let mut seq = base_seq;
             for ticket in group {
-                ticket.request.apply(memtable, &mut seq);
+                ticket.request.apply(memtable, &mut hint, &mut seq);
             }
         }
 

@@ -18,7 +18,7 @@ use super::internal_key::{
 };
 use super::lookup_key::LookupKey;
 use super::range_tombstone::{RangeTombstone, RangeTombstoneSet};
-use super::skiplist::{ArenaSkipList, NodeRef};
+use super::skiplist::{ArenaSkipList, InsertHint, NodeRef};
 use crate::DbSlice;
 use crate::sync::{Arc, AtomicUsize, Mutex, Ordering};
 
@@ -209,6 +209,43 @@ impl MemTable {
     /// read time via the configured [`crate::MergeOperator`].
     pub(crate) fn merge(&self, key: &[u8], operand: &[u8], seq: u64) {
         self.list.insert(key, seq, VALUE_TYPE_MERGE, operand);
+    }
+
+    /// A hint for a run of writes in key order; see
+    /// [`ArenaSkipList::insert_hint`].
+    pub(crate) fn insert_hint(&self) -> InsertHint<'_> {
+        self.list.insert_hint()
+    }
+
+    /// [`MemTable::put`] starting from `hint`, which the call updates to
+    /// point at the new entry.
+    pub(crate) fn put_hinted<'a>(
+        &'a self,
+        hint: &mut InsertHint<'a>,
+        key: &[u8],
+        value: &[u8],
+        seq: u64,
+    ) {
+        self.list
+            .insert_with_hint(hint, key, seq, VALUE_TYPE_VALUE, value);
+    }
+
+    /// [`MemTable::delete`] starting from `hint`.
+    pub(crate) fn delete_hinted<'a>(&'a self, hint: &mut InsertHint<'a>, key: &[u8], seq: u64) {
+        self.list
+            .insert_with_hint(hint, key, seq, VALUE_TYPE_DELETION, &[]);
+    }
+
+    /// [`MemTable::merge`] starting from `hint`.
+    pub(crate) fn merge_hinted<'a>(
+        &'a self,
+        hint: &mut InsertHint<'a>,
+        key: &[u8],
+        operand: &[u8],
+        seq: u64,
+    ) {
+        self.list
+            .insert_with_hint(hint, key, seq, VALUE_TYPE_MERGE, operand);
     }
 
     /// Record a range tombstone - every user key in `[start, end)`

@@ -29,6 +29,13 @@
 //! took it. `checkpoint_capture` needs exactly that, returning a
 //! snapshot that pins every referenced SSTable against a concurrent
 //! unlink for as long as the caller holds it.
+//!
+//! [`UnsafeCell`] and [`SingleWriterGuard`] live here for the same reason
+//! as everything else: a `std::cell::UnsafeCell` is invisible to loom, so
+//! state that is mutated without a lock (the arena's chunk list, A8 in
+//! `engine::arena`) goes through the wrapper here instead, and the debug
+//! guard that catches a broken single-writer contract is shared by the
+//! arena and the skip list rather than duplicated between them.
 
 #[cfg(loom)]
 pub(crate) use loom::sync::Arc;
@@ -109,6 +116,70 @@ impl<T> Mutex<T> {
 impl<T: std::fmt::Debug> std::fmt::Debug for Mutex<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.0.fmt(f)
+    }
+}
+
+/// Interior mutability for state that exactly one thread touches at a
+/// time (the arena's chunk list, invariant A8 in `engine::arena`).
+///
+/// Under loom the cell is instrumented and an access that is not ordered
+/// before or after every other access fails the model; in a normal build
+/// it is `std::cell::UnsafeCell` behind the same `with`/`with_mut` shape,
+/// so the code the model checks is the code that ships.
+#[cfg(not(loom))]
+pub(crate) struct UnsafeCell<T>(std::cell::UnsafeCell<T>);
+
+#[cfg(not(loom))]
+impl<T> UnsafeCell<T> {
+    /// A new cell holding `value`.
+    pub(crate) const fn new(value: T) -> Self {
+        Self(std::cell::UnsafeCell::new(value))
+    }
+
+    /// Run `f` on a shared pointer to the contents.
+    ///
+    /// Only test-only readers (`Arena::chunk_count`, `chunk_sizes`) use
+    /// this today; production code only ever needs exclusive access, so
+    /// a non-test, non-loom build sees it as dead code.
+    #[allow(dead_code)]
+    pub(crate) fn with<R>(&self, f: impl FnOnce(*const T) -> R) -> R {
+        f(self.0.get())
+    }
+
+    /// Run `f` on an exclusive pointer to the contents.
+    pub(crate) fn with_mut<R>(&self, f: impl FnOnce(*mut T) -> R) -> R {
+        f(self.0.get())
+    }
+}
+
+#[cfg(loom)]
+pub(crate) use loom::cell::UnsafeCell;
+
+/// Debug-only detector for a "exactly one thread at a time" contract.
+///
+/// `enter` flips the flag and asserts it was clear; dropping the guard
+/// clears it. Acquire on entry and Release on exit order the guarded
+/// section against the previous holder's, so a violation is always seen
+/// as one rather than as a torn flag. Compiled out of release builds:
+/// the contract is the caller's to keep, this only catches a breach.
+#[cfg(debug_assertions)]
+pub(crate) struct SingleWriterGuard<'a>(&'a AtomicBool);
+
+#[cfg(debug_assertions)]
+impl<'a> SingleWriterGuard<'a> {
+    /// Enter the guarded section; `contract` names the invariant in the
+    /// assertion message when it is broken.
+    pub(crate) fn enter(flag: &'a AtomicBool, contract: &'static str) -> Self {
+        let busy = flag.swap(true, Ordering::Acquire);
+        debug_assert!(!busy, "{contract}");
+        Self(flag)
+    }
+}
+
+#[cfg(debug_assertions)]
+impl Drop for SingleWriterGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
     }
 }
 
@@ -294,6 +365,25 @@ impl Drop for OwnedGateWriteGuard {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize as StdAtomicUsize, Ordering as StdOrdering};
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "nested")]
+    fn a_nested_entry_trips_the_single_writer_guard() {
+        let flag = AtomicBool::new(false);
+        let _outer = SingleWriterGuard::enter(&flag, "nested entry is not allowed");
+        let _inner = SingleWriterGuard::enter(&flag, "nested entry is not allowed");
+    }
+
+    #[test]
+    #[allow(unsafe_code)]
+    fn the_unsafe_cell_shim_round_trips() {
+        let cell = UnsafeCell::new(vec![1u32, 2, 3]);
+        // SAFETY: single-threaded test, no other access overlaps these.
+        cell.with_mut(|ptr| unsafe { (*ptr).push(4) });
+        let read = cell.with(|ptr| unsafe { (*ptr).clone() });
+        assert_eq!(read, vec![1, 2, 3, 4]);
+    }
 
     #[test]
     fn a_lock_whose_holder_panicked_still_hands_back_its_contents() {

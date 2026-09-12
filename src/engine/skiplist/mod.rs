@@ -24,6 +24,11 @@
 //!
 //! Exactly one thread inserts at a time (the engine serializes writers on
 //! its write lock); any number of threads read concurrently and lock-free.
+//! [`ArenaSkipList::insert_with_hint`] is the same single writer with a
+//! private splice: it takes an [`InsertHint`] bound to one list and, for
+//! a key that sorts after the hint's position, starts its descent there
+//! instead of at the head. See [`InsertHint`] for the invariants (H1 to
+//! H3) that make a hint safe to reuse across a whole run of inserts.
 //!
 //! The safety of the whole module rests on these invariants, named at
 //! every `unsafe` site that relies on them. They are what the loom and
@@ -58,7 +63,7 @@
 //!   by the list, so its address is stable for the list's life and an
 //!   untouched memtable reserves no arena chunk at all.
 //!
-//! The arena's own invariants (A1 to A7), which these build on, are
+//! The arena's own invariants (A1 to A8), which these build on, are
 //! documented in [`super::arena`].
 
 #![allow(unsafe_code)]
@@ -69,6 +74,9 @@ use std::ptr::NonNull;
 use super::arena::Arena;
 use super::internal_key::{INTERNAL_KEY_SUFFIX_LEN, compare_internal_keys, compare_internal_split};
 use crate::sync::{Arc, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
+
+#[cfg(test)]
+mod tests;
 
 /// Maximum tower height. With [`BRANCHING`] 4, height 12 indexes about
 /// 16.7M entries, which covers a 64 MiB memtable of 64-byte entries with
@@ -165,6 +173,51 @@ unsafe fn node_key<'a>(node: *const u8) -> &'a [u8] {
     }
 }
 
+/// Whether `prev`'s link at `level` still is `next`: the H3 re-check a
+/// hinted insert runs before it trusts a level it did not just walk.
+///
+/// # Safety
+///
+/// `prev` is the head or a node of height greater than `level` (S1, S7).
+unsafe fn adjacent(prev: NonNull<u8>, level: usize, next: *mut u8) -> bool {
+    // SAFETY: the caller upholds the precondition above.
+    unsafe { next_at(prev.as_ptr(), level) }.map_or(std::ptr::null_mut(), |n| n.as_ptr()) == next
+}
+
+/// Walk level `level` forward from `from` to the last node whose key is
+/// below the target, returning it and its successor (null at the end).
+///
+/// # Safety
+///
+/// `from` is the head or a node of height greater than `level` whose key
+/// is below the target (S1, S3, S7).
+unsafe fn walk_level(
+    from: NonNull<u8>,
+    level: usize,
+    user_key: &[u8],
+    trailer: &[u8; INTERNAL_KEY_SUFFIX_LEN],
+) -> (NonNull<u8>, *mut u8) {
+    let mut cursor = from;
+    loop {
+        // SAFETY: `cursor` starts at `from` and only ever advances to a
+        // node whose key the caller's precondition already bounds below
+        // the target, so the precondition holds at every step (S1, S3,
+        // S7).
+        match unsafe { next_at(cursor.as_ptr(), level) } {
+            Some(next) => {
+                // SAFETY (S1, S3): `next` is a live node.
+                let next_key = unsafe { node_key(next.as_ptr()) };
+                if compare_internal_split(next_key, user_key, trailer).is_lt() {
+                    cursor = next;
+                } else {
+                    return (cursor, next.as_ptr());
+                }
+            }
+            None => return (cursor, std::ptr::null_mut()),
+        }
+    }
+}
+
 /// A borrowed view of one node.
 ///
 /// The lifetime ties it to the skip list, which owns the `Arc<Arena>`
@@ -240,6 +293,55 @@ impl<'a> NodeRef<'a> {
         // SAFETY (S1, S7): every node has at least one tower slot.
         unsafe { next_at(self.ptr.as_ptr(), 0) }.map(NodeRef::new)
     }
+}
+
+/// Where the previous insert through it landed: the predecessor and the
+/// successor at every level, so an insert of a key that sorts after that
+/// position starts its descent there instead of at the head.
+///
+/// A hint can only save work, never misplace a node: every level taken
+/// from it is re-validated against the live links before it is used (see
+/// [`ArenaSkipList::insert_with_hint`]). The lifetime ties it to the list
+/// that produced it, so no node it points at can be freed while it
+/// exists (S3, A5), and `head` ties it to that list's identity, so a
+/// hint handed to a different list of the same lifetime restarts from
+/// that list's head.
+///
+/// Invariants, maintained by every insert through the hint and relied on
+/// by the next one (H1 to H3):
+///
+/// - **H1 (shape).** Once bound, `prev[l]` is the head or a node of
+///   height greater than `l`, and `next[l]` is null or a node.
+/// - **H2 (monotone).** Going up the levels, `prev` keys never increase
+///   and `next` keys never decrease: `prev[l+1].key <= prev[l].key` (the
+///   head counts as minus infinity) and `next[l+1].key >= next[l].key`
+///   (null counts as plus infinity). This is what lets one bracket check
+///   at level `L` vouch for every level above it.
+/// - **H3 (adjacency is advisory).** `next[l]` was `prev[l]`'s successor
+///   at level `l` when the hint was last written. A plain `insert` in
+///   between may have linked a node there; the hint is never trusted on
+///   this, every level it is used at is re-read first.
+///
+/// Why H2 survives a write-back: after the descent and the repair loop
+/// in `insert_inner`, every level below the new node's height holds the
+/// exact splice for the new key `T` (`prev[l]` is the last node at level
+/// `l` with key below `T`, `next[l]` the first at or above it), and
+/// exact splices are monotone across levels because a node present at
+/// level `l+1` is present at level `l`. Levels at or above
+/// `max(recompute, height)` keep their old values (or a freshly walked
+/// one, which is exactly as monotone), which were already monotone and
+/// bracket `T` by the old H2 and the level-`recompute` bracket check;
+/// the repair loop only moves a `prev` forward and a `next` backward, so
+/// the boundary between the exact levels and the kept levels still
+/// orders. Replacing `prev[l]` by the new node for `l` below its height
+/// writes a single key `T` into levels whose neighbours above have keys
+/// below `T` and whose `next` are at or above `T`.
+pub(crate) struct InsertHint<'a> {
+    /// Head sentinel of the list this hint belongs to; null until bound.
+    head: *const u8,
+    prev: [NonNull<u8>; MAX_HEIGHT],
+    next: [*mut u8; MAX_HEIGHT],
+    _marker: PhantomData<&'a ArenaSkipList>,
 }
 
 /// Insert-only concurrent skip list over a bump arena.
@@ -322,6 +424,31 @@ impl ArenaSkipList {
         height
     }
 
+    /// A fresh, unbound hint for a run of inserts into this list.
+    pub(crate) fn insert_hint(&self) -> InsertHint<'_> {
+        InsertHint {
+            head: std::ptr::null(),
+            prev: [NonNull::dangling(); MAX_HEIGHT],
+            next: [std::ptr::null_mut(); MAX_HEIGHT],
+            _marker: PhantomData,
+        }
+    }
+
+    /// Insert as [`ArenaSkipList::insert`], starting the descent where
+    /// `hint` says the previous insert landed when the new key sorts
+    /// after the hinted position, and from the head otherwise. Leaves
+    /// `hint` pointing at the new position.
+    pub(crate) fn insert_with_hint<'a>(
+        &'a self,
+        hint: &mut InsertHint<'a>,
+        user_key: &[u8],
+        seq: u64,
+        value_type: u8,
+        value: &[u8],
+    ) -> bool {
+        self.insert_inner(user_key, seq, value_type, value, Some(hint))
+    }
+
     /// Insert `user_key || !seq || value_type -> value`.
     ///
     /// The internal key is assembled directly inside the node, so no
@@ -331,8 +458,74 @@ impl ArenaSkipList {
     /// represented (a key or value of 4 GiB or more), which
     /// [`crate::Options::validate`] makes unreachable.
     pub(crate) fn insert(&self, user_key: &[u8], seq: u64, value_type: u8, value: &[u8]) -> bool {
+        self.insert_inner(user_key, seq, value_type, value, None)
+    }
+
+    /// Number of levels [`ArenaSkipList::insert_inner`] must recompute by
+    /// walking forward from the hint's position, or [`MAX_HEIGHT`] (a
+    /// full descent from the head) when the hint cannot help.
+    ///
+    /// Level 0 decides the direction. A key at or before the hinted
+    /// predecessor restarts from the head: the hint was built for a
+    /// later position and nothing above level 0 can bracket an earlier
+    /// key more cheaply than the head does. A key after the hinted
+    /// successor climbs, skipping the levels that share the successor it
+    /// already compared against (H2 makes the compare result the same
+    /// for all of them), until a level whose successor is at or past the
+    /// key. By H2 the predecessor side needs no compare above level 0.
+    fn hint_start_level(
+        &self,
+        hint: &InsertHint<'_>,
+        user_key: &[u8],
+        trailer: &[u8; INTERNAL_KEY_SUFFIX_LEN],
+    ) -> usize {
+        let head = self.head;
+        if hint.prev[0] != head
+            // SAFETY (H1): a bound hint's level-0 predecessor is the
+            // head or a node, checked not to be the head above.
+            && !compare_internal_split(unsafe { node_key(hint.prev[0].as_ptr()) }, user_key, trailer)
+                .is_lt()
+        {
+            return MAX_HEIGHT;
+        }
+        let mut level = 0;
+        while level < MAX_HEIGHT {
+            let (prev, next) = (hint.prev[level], hint.next[level]);
+            // SAFETY (H1, S3): a bound hint's `prev` is the head or a
+            // node of height > level, valid for the list's life.
+            if !unsafe { adjacent(prev, level, next) } {
+                level += 1;
+                continue;
+            }
+            if !next.is_null()
+                // SAFETY (H1, S3): `next` is a live node when non-null.
+                && compare_internal_split(unsafe { node_key(next) }, user_key, trailer).is_lt()
+            {
+                while level < MAX_HEIGHT && hint.next[level] == next {
+                    level += 1;
+                }
+                continue;
+            }
+            return level;
+        }
+        MAX_HEIGHT
+    }
+
+    /// Shared body of [`ArenaSkipList::insert`] and
+    /// [`ArenaSkipList::insert_with_hint`].
+    fn insert_inner<'a>(
+        &'a self,
+        user_key: &[u8],
+        seq: u64,
+        value_type: u8,
+        value: &[u8],
+        hint: Option<&mut InsertHint<'a>>,
+    ) -> bool {
         #[cfg(debug_assertions)]
-        let _writer = SingleWriterGuard::enter(&self.inserting);
+        let _writer = crate::sync::SingleWriterGuard::enter(
+            &self.inserting,
+            "ArenaSkipList::insert is single-writer (S2); the engine must serialize writers",
+        );
 
         let key_len = user_key.len() + INTERNAL_KEY_SUFFIX_LEN;
         if u32::try_from(key_len).is_err() || u32::try_from(value.len()).is_err() {
@@ -347,25 +540,63 @@ impl ArenaSkipList {
         let trailer = internal_trailer(seq, value_type);
         let height = self.random_height();
 
-        // Descend recording, at every level, the last node whose key is
-        // strictly less than the new one. Comparison always goes through
-        // the internal-key comparator: raw byte order is wrong when one
-        // user key is a prefix of another.
+        // Comparison always goes through the internal-key comparator: raw
+        // byte order is wrong when one user key is a prefix of another.
         let mut prev = [self.head; MAX_HEIGHT];
+        let mut next: [*mut u8; MAX_HEIGHT] = [std::ptr::null_mut(); MAX_HEIGHT];
+
+        let recompute = match hint.as_deref() {
+            Some(h) if h.head == self.head.as_ptr() => self.hint_start_level(h, user_key, &trailer),
+            _ => MAX_HEIGHT,
+        };
+
         let mut cursor = self.head;
-        for level in (0..MAX_HEIGHT).rev() {
-            // SAFETY (S1, S3, S7): `cursor` is the head or a node reached
-            // at this level, so its height exceeds `level`, and every
-            // node it reaches stays valid for the arena's life.
-            while let Some(next) = unsafe { next_at(cursor.as_ptr(), level) } {
-                let next_key = unsafe { node_key(next.as_ptr()) };
-                if compare_internal_split(next_key, user_key, &trailer).is_lt() {
-                    cursor = next;
-                } else {
-                    break;
-                }
+        if recompute < MAX_HEIGHT {
+            // The `Some` arm above only returns a level below `MAX_HEIGHT`
+            // when the hint is bound to this list, so this always finds
+            // one; the `if let` (rather than an `expect`) means that if
+            // the two conditions ever drifted apart, this thread falls
+            // back to the always-correct head descent below instead of
+            // panicking on a write path.
+            if let Some(h) = hint.as_deref() {
+                prev[recompute..MAX_HEIGHT].copy_from_slice(&h.prev[recompute..MAX_HEIGHT]);
+                next[recompute..MAX_HEIGHT].copy_from_slice(&h.next[recompute..MAX_HEIGHT]);
             }
-            prev[level] = cursor;
+            cursor = prev[recompute];
+        }
+
+        // Descend the levels the hint did not already bracket, recording
+        // at every level the last node whose key is strictly less than
+        // the new one and its successor.
+        for level in (0..recompute).rev() {
+            // SAFETY (H1, H2, S1, S3, S7): `cursor` is the head, or (when
+            // `recompute < MAX_HEIGHT`) `prev[recompute]`, a node of
+            // height greater than `recompute` (H1) whose key is below
+            // the target by the level-0 check in `hint_start_level` plus
+            // H2. Every node it reaches stays valid for the arena's life.
+            let (p, n) = unsafe { walk_level(cursor, level, user_key, &trailer) };
+            prev[level] = p;
+            next[level] = n;
+            cursor = p;
+        }
+
+        // Re-check every level the hint supplied but the descent above
+        // did not touch: H3 only promises the link was current when the
+        // hint was written, and a plain `insert` may have linked a node
+        // there since. A level that is still adjacent is correct as
+        // stored (H2: `prev[level].key <= prev[recompute].key < key <=
+        // next[recompute].key <= next[level].key`); one that is not gets
+        // walked forward, which finds the right pair because
+        // `prev[level].key < key` still holds (keys are immutable and
+        // nodes are never unlinked, S3).
+        for level in recompute..height {
+            // SAFETY (H1, S1, S3, S7): as in the loop above.
+            if !unsafe { adjacent(prev[level], level, next[level]) } {
+                // SAFETY: same as the descent above.
+                let (p, n) = unsafe { walk_level(prev[level], level, user_key, &trailer) };
+                prev[level] = p;
+                next[level] = n;
+            }
         }
 
         let size = node_size(key_len, value.len(), height);
@@ -394,10 +625,12 @@ impl ArenaSkipList {
             );
             std::ptr::copy_nonoverlapping(value.as_ptr(), key_at.add(key_len), value.len());
             // Still unreachable: seed the forward pointers with plain
-            // stores through the freshly constructed atomics.
-            for (level, slot) in prev.iter().enumerate().take(height) {
-                let successor =
-                    next_at(slot.as_ptr(), level).map_or(std::ptr::null_mut(), |n| n.as_ptr());
+            // stores. For every level the node occupies, `next[level]`
+            // was either just computed by the descent or just
+            // re-checked by the repair loop above, and this thread is
+            // the only writer (S2), so it equals what `next_at` would
+            // read now; no re-read is needed.
+            for (level, &successor) in next.iter().enumerate().take(height) {
                 link(raw, level).store(successor, Ordering::Relaxed);
             }
             // S1: the only synchronising stores in the module. Level 0
@@ -409,6 +642,15 @@ impl ArenaSkipList {
         }
 
         self.count.fetch_add(1, Ordering::Release);
+
+        if let Some(h) = hint {
+            h.head = self.head.as_ptr();
+            for level in 0..MAX_HEIGHT {
+                h.prev[level] = if level < height { node } else { prev[level] };
+                h.next[level] = next[level];
+            }
+        }
+
         true
     }
 
@@ -547,394 +789,92 @@ unsafe fn init_node_header(node: *mut u8, key_len: usize, value_len: usize, heig
     }
 }
 
-/// Debug-only enforcement of S2: exactly one thread inside `insert`.
-#[cfg(debug_assertions)]
-struct SingleWriterGuard<'a>(&'a crate::sync::AtomicBool);
-
-#[cfg(debug_assertions)]
-impl<'a> SingleWriterGuard<'a> {
-    fn enter(flag: &'a crate::sync::AtomicBool) -> Self {
-        let busy = flag.swap(true, Ordering::Acquire);
-        debug_assert!(
-            !busy,
-            "ArenaSkipList::insert is single-writer (S2); the engine must serialize writers"
-        );
-        Self(flag)
-    }
-}
-
-#[cfg(debug_assertions)]
-impl Drop for SingleWriterGuard<'_> {
-    fn drop(&mut self) {
-        self.0.store(false, Ordering::Release);
+impl<'a> NodeRef<'a> {
+    /// This node's tower height. Test-only: production code never needs
+    /// a node's height, only its key and value.
+    #[cfg(test)]
+    pub(crate) fn height(&self) -> usize {
+        // SAFETY (S1): the node was fully written before it became
+        // reachable.
+        unsafe { header(self.ptr.as_ptr()).2 }
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::engine::arena::{ArenaProfile, ChunkPool};
-    use crate::engine::internal_key::{VALUE_TYPE_DELETION, VALUE_TYPE_VALUE, encode_internal_key};
-    use proptest::prelude::*;
-
-    fn list(budget: usize) -> ArenaSkipList {
-        let profile = ArenaProfile::EMBEDDED;
-        let pool = Arc::new(ChunkPool::new(profile, budget, 2));
-        let arena = Arc::new(Arena::new(pool, budget, profile));
-        ArenaSkipList::new(arena).expect("head allocation")
-    }
-
-    fn collect(list: &ArenaSkipList) -> Vec<(Vec<u8>, Vec<u8>)> {
-        let mut out = Vec::new();
-        let mut node = list.first();
-        while let Some(current) = node {
-            out.push((current.key().to_vec(), current.value().to_vec()));
-            node = current.next();
-        }
-        out
-    }
-
-    #[test]
-    fn empty_list_has_no_entries() {
-        let list = list(64 * 1024);
-        assert!(list.is_empty());
-        assert_eq!(list.len(), 0);
-        assert!(list.first().is_none());
-        assert!(list.last().is_none());
-        assert!(list.seek_ge(b"anything").is_none());
-        assert!(list.seek_le(b"anything").is_none());
-        assert_eq!(
-            list.arena().reserved_bytes(),
-            0,
-            "head is not an arena chunk"
-        );
-    }
-
-    #[test]
-    fn insert_then_read_back() {
-        let list = list(64 * 1024);
-        assert!(list.insert(b"k", 1, VALUE_TYPE_VALUE, b"v1"));
-        assert!(list.insert(b"k", 2, VALUE_TYPE_VALUE, b"v2"));
-        assert!(list.insert(b"a", 3, VALUE_TYPE_DELETION, b""));
-        assert_eq!(list.len(), 3);
-
-        let entries = collect(&list);
-        assert_eq!(entries.len(), 3);
-        // "a" sorts first; for "k", the newer seq comes first.
-        assert_eq!(
-            entries[0].0,
-            encode_internal_key(b"a", 3, VALUE_TYPE_DELETION)
-        );
-        assert_eq!(entries[0].1, b"");
-        assert_eq!(entries[1].0, encode_internal_key(b"k", 2, VALUE_TYPE_VALUE));
-        assert_eq!(entries[1].1, b"v2");
-        assert_eq!(entries[2].1, b"v1");
-    }
-
-    #[test]
-    fn seeks_bracket_the_list() {
-        let list = list(64 * 1024);
-        for key in [b"b".as_slice(), b"m", b"y"] {
-            assert!(list.insert(key, 1, VALUE_TYPE_VALUE, key));
-        }
-        let probe = |k: &[u8]| encode_internal_key(k, u64::MAX, VALUE_TYPE_DELETION);
-
-        assert_eq!(list.seek_ge(&probe(b"a")).expect("first").value(), b"b");
-        assert_eq!(list.seek_ge(&probe(b"m")).expect("exact").value(), b"m");
-        assert_eq!(list.seek_ge(&probe(b"n")).expect("next").value(), b"y");
-        assert!(list.seek_ge(&probe(b"z")).is_none());
-
-        assert!(list.seek_lt(&probe(b"b")).is_none());
-        assert_eq!(list.seek_lt(&probe(b"n")).expect("prev").value(), b"m");
-        assert_eq!(list.last().expect("last").value(), b"y");
-        assert_eq!(list.first().expect("first").value(), b"b");
-    }
-
-    #[test]
-    fn duplicate_internal_key_finds_the_first() {
-        // WAL replay can re-present the same (key, seq) if a rewrite was
-        // interrupted. Both nodes are stored; a reader finds the first.
-        let list = list(64 * 1024);
-        assert!(list.insert(b"k", 7, VALUE_TYPE_VALUE, b"first"));
-        assert!(list.insert(b"k", 7, VALUE_TYPE_VALUE, b"second"));
-        assert_eq!(list.len(), 2);
-        let probe = encode_internal_key(b"k", 7, VALUE_TYPE_DELETION);
-        let found = list.seek_ge(&probe).expect("present");
-        assert!(found.value() == b"first" || found.value() == b"second");
-        assert_eq!(collect(&list).len(), 2);
-    }
-
-    #[test]
-    fn prefix_keys_sort_by_the_internal_comparator() {
-        // Raw byte order would interleave these wrongly: "ab"'s !seq
-        // trailer collides with "abc"'s literal 'c'.
-        let list = list(64 * 1024);
-        assert!(list.insert(b"abc", 1, VALUE_TYPE_VALUE, b"abc"));
-        assert!(list.insert(b"ab", u64::MAX, VALUE_TYPE_VALUE, b"ab-high"));
-        assert!(list.insert(b"ab", 0, VALUE_TYPE_VALUE, b"ab-low"));
-        let values: Vec<Vec<u8>> = collect(&list).into_iter().map(|(_, v)| v).collect();
-        assert_eq!(
-            values,
-            vec![b"ab-high".to_vec(), b"ab-low".to_vec(), b"abc".to_vec()]
-        );
-    }
-
-    #[test]
-    fn empty_value_round_trips() {
-        let list = list(64 * 1024);
-        assert!(list.insert(b"k", 1, VALUE_TYPE_DELETION, b""));
-        let node = list.first().expect("present");
-        assert_eq!(node.value(), b"");
-        assert_eq!(node.value_span().1, 0);
-        assert!(node.value_span().0.is_none());
-    }
-
-    #[test]
-    fn a_value_larger_than_a_chunk_still_lands() {
-        let list = list(64 * 1024);
-        let big = vec![7u8; 300 * 1024];
-        assert!(list.insert(b"big", 1, VALUE_TYPE_VALUE, &big));
-        assert_eq!(list.first().expect("present").value(), big.as_slice());
-    }
-
-    #[test]
-    #[cfg_attr(
-        miri,
-        ignore = "20k inserts against 8 spinning readers; \
-                  `a_reader_walks_the_list_while_a_writer_publishes` is the miri-sized form"
-    )]
-    fn readers_see_whole_entries_while_a_writer_inserts() {
-        // S1: a reader must never observe a node with a torn key or a
-        // value that does not match it.
-        let budget = 4 * 1024 * 1024;
-        let profile = ArenaProfile::SERVER;
-        let pool = Arc::new(ChunkPool::new(profile, budget, 2));
-        let arena = Arc::new(Arena::new(pool, budget, profile));
-        let list = Arc::new(ArenaSkipList::new(arena).expect("head"));
-
-        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let readers: Vec<_> = (0..8)
-            .map(|_| {
-                let list = Arc::clone(&list);
-                let stop = Arc::clone(&stop);
-                std::thread::spawn(move || {
-                    while !stop.load(Ordering::Relaxed) {
-                        let mut node = list.first();
-                        while let Some(current) = node {
-                            let key = current.key();
-                            assert!(key.len() >= INTERNAL_KEY_SUFFIX_LEN);
-                            let user = &key[..key.len() - INTERNAL_KEY_SUFFIX_LEN];
-                            assert_eq!(
-                                current.value(),
-                                user,
-                                "value must match the key it was written with"
-                            );
-                            node = current.next();
-                        }
-                    }
-                })
-            })
-            .collect();
-
-        for i in 0..20_000u32 {
-            let key = format!("key{i:08}");
-            assert!(list.insert(
-                key.as_bytes(),
-                u64::from(i) + 1,
-                VALUE_TYPE_VALUE,
-                key.as_bytes()
-            ));
-        }
-        stop.store(true, Ordering::Relaxed);
-        for reader in readers {
-            reader.join().expect("reader thread");
-        }
-        assert_eq!(list.len(), 20_000);
-    }
-
-    #[test]
-    #[cfg_attr(
-        miri,
-        ignore = "40k inserts against 4 spinning readers; \
-                  `a_reader_walks_the_list_while_a_writer_publishes` is the miri-sized form"
-    )]
-    fn a_seeded_key_stays_findable_while_a_writer_inserts_around_it() {
-        // The two-step seek this replaced (descend, then re-read the
-        // predecessor's level-0 link) could hand back a node inserted
-        // after the descent finished, which a reader reads as "absent".
-        let budget = 8 * 1024 * 1024;
-        let profile = ArenaProfile::SERVER;
-        let pool = Arc::new(ChunkPool::new(profile, budget, 2));
-        let arena = Arc::new(Arena::new(pool, budget, profile));
-        let list = Arc::new(ArenaSkipList::new(arena).expect("head"));
-        assert!(list.insert(b"pinned", 1, VALUE_TYPE_VALUE, b"stable"));
-
-        let probe = encode_internal_key(b"pinned", u64::MAX, VALUE_TYPE_DELETION);
-        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let misses = Arc::new(AtomicUsize::new(0));
-        let readers: Vec<_> = (0..4)
-            .map(|_| {
-                let list = Arc::clone(&list);
-                let stop = Arc::clone(&stop);
-                let misses = Arc::clone(&misses);
-                let probe = probe.clone();
-                std::thread::spawn(move || {
-                    while !stop.load(Ordering::Relaxed) {
-                        let found = list
-                            .seek_ge(&probe)
-                            .filter(|entry| entry.value() == b"stable");
-                        if found.is_none() {
-                            misses.fetch_add(1, Ordering::Relaxed);
-                        }
-                    }
-                })
-            })
-            .collect();
-
-        for i in 0..40_000u64 {
-            // Keys on both sides of "pinned", so inserts land right next
-            // to the seek target at every level.
-            let key = if i % 2 == 0 {
-                format!("pinne{i:08}")
-            } else {
-                format!("pinnee{i:08}")
-            };
-            assert!(list.insert(key.as_bytes(), i + 2, VALUE_TYPE_VALUE, b"noise"));
-        }
-        stop.store(true, Ordering::Relaxed);
-        for reader in readers {
-            reader.join().expect("reader thread");
-        }
-        assert_eq!(
-            misses.load(Ordering::Relaxed),
-            0,
-            "a present key must never read as absent"
-        );
-    }
-
-    /// The publication protocol at a size an interpreter can finish.
+impl ArenaSkipList {
+    /// Check that every level above 0 is a subsequence of level 0: for
+    /// every level `l >= 1`, the chain reachable from the head at level
+    /// `l` must equal the level-0 chain filtered to nodes whose height
+    /// is greater than `l`.
     ///
-    /// The two stress tests above are the ones that catch a rare race by
-    /// volume; this one exists so miri's aliasing model and data-race
-    /// detector actually reach the same code. One writer publishes eight
-    /// nodes while one reader walks the list, reads every key and value,
-    /// and re-seeks a key that was already there: S1, S3, S5, S6 and S7
-    /// all sit on that path.
-    #[test]
-    fn a_reader_walks_the_list_while_a_writer_publishes() {
-        let skiplist = Arc::new(list(64 * 1024));
-        assert!(skiplist.insert(b"seed", 1, VALUE_TYPE_VALUE, b"seed"));
-        let probe = encode_internal_key(b"seed", u64::MAX, VALUE_TYPE_DELETION);
-
-        let reader = {
-            let skiplist = Arc::clone(&skiplist);
-            let probe = probe.clone();
-            std::thread::spawn(move || {
-                for _ in 0..8 {
-                    let mut cursor = skiplist.first();
-                    while let Some(current) = cursor {
-                        let key = current.key();
-                        assert!(key.len() >= INTERNAL_KEY_SUFFIX_LEN);
-                        let user = &key[..key.len() - INTERNAL_KEY_SUFFIX_LEN];
-                        assert_eq!(current.value(), user);
-                        cursor = current.next();
-                    }
-                    assert!(
-                        skiplist.seek_ge(&probe).is_some(),
-                        "S3: a published key cannot be lost"
-                    );
-                }
-            })
+    /// Seeks stay correct even when one node is bypassed at a single
+    /// level (they fall back to a lower level), so this is the cheapest
+    /// observation that still catches a tower that skips a node it
+    /// should not, or fails to skip one it should.
+    pub(crate) fn assert_towers_consistent(&self) {
+        let level0: Vec<NonNull<u8>> = {
+            let mut nodes = Vec::new();
+            let mut cursor = self.head;
+            // SAFETY (S1, S3, S7): standard level-0 walk.
+            while let Some(next) = unsafe { next_at(cursor.as_ptr(), 0) } {
+                nodes.push(next);
+                cursor = next;
+            }
+            nodes
         };
-
-        for i in 0..8u64 {
-            let key = format!("k{i}");
-            assert!(skiplist.insert(key.as_bytes(), i + 2, VALUE_TYPE_VALUE, key.as_bytes()));
+        for level in 1..MAX_HEIGHT {
+            let want: Vec<NonNull<u8>> = level0
+                .iter()
+                .copied()
+                // SAFETY (S1): every node in `level0` is initialised.
+                .filter(|&n| unsafe { header(n.as_ptr()).2 } > level)
+                .collect();
+            let mut got = Vec::new();
+            let mut cursor = self.head;
+            // SAFETY (S1, S3, S7): standard tower walk at `level`.
+            while let Some(next) = unsafe { next_at(cursor.as_ptr(), level) } {
+                got.push(next);
+                cursor = next;
+            }
+            assert_eq!(
+                got, want,
+                "level {level} diverges from the level-0 chain filtered to height > {level}"
+            );
         }
-        reader.join().expect("reader thread");
-        assert_eq!(skiplist.len(), 9);
     }
+}
 
-    proptest! {
-        #[test]
-        fn insert_then_seek_round_trips(
-            entries in proptest::collection::vec(
-                (proptest::collection::vec(any::<u8>(), 0..24), 1u64..1000, any::<Vec<u8>>()),
-                1..80,
-            ),
-        ) {
-            let list = list(1024 * 1024);
-            let mut model: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-            for (key, seq, value) in &entries {
-                prop_assert!(list.insert(key, *seq, VALUE_TYPE_VALUE, value));
-                model.push((encode_internal_key(key, *seq, VALUE_TYPE_VALUE), value.clone()));
-            }
-            model.sort_by(|a, b| compare_internal_keys(&a.0, &b.0));
+/// `(key, height)` for every node in the list, in level-0 order.
+/// Test-only: compares the shape a hinted run produced against a plain
+/// one.
+#[cfg(test)]
+pub(crate) fn tower_shape(list: &ArenaSkipList) -> Vec<(Vec<u8>, usize)> {
+    let mut out = Vec::new();
+    let mut node = list.first();
+    while let Some(current) = node {
+        out.push((current.key().to_vec(), current.height()));
+        node = current.next();
+    }
+    out
+}
 
-            let got = collect(&list);
-            prop_assert_eq!(got.len(), model.len());
-            // Key order is total; two entries sharing an internal key
-            // (same user key and seq) may sit in either order, which is
-            // the documented duplicate behaviour, so compare the keys in
-            // order and the pairs as a multiset.
-            for (got, want) in got.iter().zip(model.iter()) {
-                prop_assert_eq!(&got.0, &want.0);
-            }
-            let mut got_pairs = got.clone();
-            let mut want_pairs = model.clone();
-            got_pairs.sort();
-            want_pairs.sort();
-            prop_assert_eq!(got_pairs, want_pairs);
+/// An internal key ordered by [`compare_internal_keys`], for a
+/// `BTreeMap` oracle in the proptest below. Test-only: production code
+/// never needs internal keys to implement `Ord`, only the comparator.
+#[cfg(test)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct OrdKey(pub(crate) Vec<u8>);
 
-            // Every stored key is findable by an exact seek.
-            for (key, _) in &model {
-                let found = list.seek_ge(key).expect("stored key is findable");
-                prop_assert!(compare_internal_keys(found.key(), key).is_eq());
-            }
-        }
+#[cfg(test)]
+impl PartialOrd for OrdKey {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
 
-        #[test]
-        fn seeks_agree_with_a_linear_scan(
-            keys in proptest::collection::vec(proptest::collection::vec(any::<u8>(), 0..12), 1..40),
-            probe in proptest::collection::vec(any::<u8>(), 0..12),
-        ) {
-            let list = list(1024 * 1024);
-            for (i, key) in keys.iter().enumerate() {
-                prop_assert!(list.insert(key, i as u64 + 1, VALUE_TYPE_VALUE, key));
-            }
-            let sorted = collect(&list);
-            let target = encode_internal_key(&probe, u64::MAX, VALUE_TYPE_DELETION);
-
-            let want_ge = sorted.iter().find(|(k, _)| compare_internal_keys(k, &target).is_ge());
-            let got_ge = list.seek_ge(&target).map(|n| n.key().to_vec());
-            prop_assert_eq!(got_ge.as_deref(), want_ge.map(|(k, _)| k.as_slice()));
-
-            let want_lt = sorted.iter().rev().find(|(k, _)| compare_internal_keys(k, &target).is_lt());
-            let got_lt = list.seek_lt(&target).map(|n| n.key().to_vec());
-            prop_assert_eq!(got_lt.as_deref(), want_lt.map(|(k, _)| k.as_slice()));
-
-            let want_le = sorted.iter().rev().find(|(k, _)| compare_internal_keys(k, &target).is_le());
-            let got_le = list.seek_le(&target).map(|n| n.key().to_vec());
-            prop_assert_eq!(got_le.as_deref(), want_le.map(|(k, _)| k.as_slice()));
-
-            let want_gt = sorted.iter().find(|(k, _)| compare_internal_keys(k, &target).is_gt());
-            let got_gt = list.seek_gt(&target).map(|n| n.key().to_vec());
-            prop_assert_eq!(got_gt.as_deref(), want_gt.map(|(k, _)| k.as_slice()));
-        }
-
-        #[test]
-        fn node_accounting_matches_the_layout(
-            key in proptest::collection::vec(any::<u8>(), 0..2048),
-            value in proptest::collection::vec(any::<u8>(), 0..4096),
-        ) {
-            let list = list(1024 * 1024);
-            prop_assert!(list.insert(&key, 5, VALUE_TYPE_VALUE, &value));
-            let node = list.first().expect("present");
-            prop_assert_eq!(node.key().len(), key.len() + INTERNAL_KEY_SUFFIX_LEN);
-            prop_assert_eq!(node.value(), value.as_slice());
-            // The arena charged the full node, not just key + value.
-            let used = list.arena().used_bytes();
-            prop_assert!(used >= key.len() + value.len() + INTERNAL_KEY_SUFFIX_LEN + NODE_HEADER);
-        }
+#[cfg(test)]
+impl Ord for OrdKey {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        compare_internal_keys(&self.0, &other.0)
     }
 }

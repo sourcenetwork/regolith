@@ -1,6 +1,7 @@
 //! What a writer hands to the commit leader, and how the leader turns it
 //! into WAL bytes and memtable entries.
 
+use super::super::skiplist::InsertHint;
 use super::super::wal::{encode_ops_record, encode_put_record, ops_record_len, put_record_len};
 use super::super::{DurabilityMode, MemTable, apply_batch_op_to_memtable, batch_op_wal_bytes};
 use crate::WriteBatchOp;
@@ -116,16 +117,24 @@ impl WriteRequest {
         }
     }
 
-    pub(super) fn apply(&self, memtable: &MemTable, seq: &mut u64) {
+    /// Apply this request's ops to `memtable`, threading `hint` through
+    /// every point op so a key-sorted request needs no head descent
+    /// after its first entry.
+    pub(super) fn apply<'a>(
+        &self,
+        memtable: &'a MemTable,
+        hint: &mut InsertHint<'a>,
+        seq: &mut u64,
+    ) {
         match self {
             WriteRequest::Idle => {}
             WriteRequest::Put { key, value, .. } => {
-                memtable.put(key, value, *seq);
+                memtable.put_hinted(hint, key, value, *seq);
                 *seq += 1;
             }
             WriteRequest::Batch { ops, .. } => {
                 for op in ops {
-                    apply_batch_op_to_memtable(memtable, op, *seq);
+                    apply_batch_op_to_memtable(memtable, hint, op, *seq);
                     *seq += 1;
                 }
             }
