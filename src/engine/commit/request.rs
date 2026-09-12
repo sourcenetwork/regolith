@@ -180,11 +180,20 @@ impl std::fmt::Debug for WriteRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     fn put(key: &[u8], value: &[u8]) -> WriteRequest {
         WriteRequest::Put {
             key: key.to_vec(),
             value: value.to_vec(),
+            durability: DurabilityMode::Eventual,
+            disable_wal: false,
+        }
+    }
+
+    fn batch(ops: Vec<WriteBatchOp>) -> WriteRequest {
+        WriteRequest::Batch {
+            ops,
             durability: DurabilityMode::Eventual,
             disable_wal: false,
         }
@@ -247,5 +256,103 @@ mod tests {
         };
         assert_eq!(request.staged_len(), 0);
         assert!(request.skips_wal());
+    }
+
+    #[test]
+    fn a_group_encodes_into_its_reservation_without_reallocating() {
+        // One of each shape `run_group` can stage: a lone put, a
+        // single-op batch (its own record), a multi-op batch (one batch
+        // record covering all four op kinds), an idle slot and a
+        // WAL-disabled put, the two members that stage nothing.
+        let group: Vec<WriteRequest> = vec![
+            put(b"solo", b"value"),
+            batch(vec![WriteBatchOp::Put {
+                key: b"one".to_vec(),
+                value: b"op".to_vec(),
+            }]),
+            batch(vec![
+                WriteBatchOp::Put {
+                    key: b"a".to_vec(),
+                    value: b"1".to_vec(),
+                },
+                WriteBatchOp::Delete { key: b"b".to_vec() },
+                WriteBatchOp::Merge {
+                    key: b"c".to_vec(),
+                    operand: b"2".to_vec(),
+                },
+                WriteBatchOp::DeleteRange {
+                    start: b"d".to_vec(),
+                    end: b"e".to_vec(),
+                },
+            ]),
+            WriteRequest::Idle,
+            WriteRequest::Put {
+                key: b"skipped".to_vec(),
+                value: b"never staged".to_vec(),
+                durability: DurabilityMode::Eventual,
+                disable_wal: true,
+            },
+        ];
+
+        let staged: usize = group.iter().map(WriteRequest::staged_len).sum();
+        let mut stage = Vec::new();
+        stage.reserve_exact(staged);
+        let cap_before = stage.capacity();
+        let ptr_before = stage.as_ptr();
+
+        // The loop `run_group` runs: skip what stages nothing, advance
+        // the sequence by every request's op count regardless.
+        let mut seq = 1u64;
+        for request in &group {
+            if !request.skips_wal() {
+                request.encode_wal(&mut stage, seq);
+            }
+            seq += request.op_count();
+        }
+
+        assert_eq!(
+            stage.len(),
+            staged,
+            "the loop must write exactly the reserved length"
+        );
+        assert_eq!(
+            stage.capacity(),
+            cap_before,
+            "encoding into an exact reservation must not reallocate"
+        );
+        assert_eq!(
+            stage.as_ptr(),
+            ptr_before,
+            "a stage that did not reallocate keeps its pointer"
+        );
+    }
+
+    /// One `WriteBatchOp`, covering every variant with short byte payloads.
+    fn batch_op_strategy() -> impl Strategy<Value = WriteBatchOp> {
+        let bytes = || proptest::collection::vec(any::<u8>(), 0..64);
+        prop_oneof![
+            (bytes(), bytes()).prop_map(|(key, value)| WriteBatchOp::Put { key, value }),
+            bytes().prop_map(|key| WriteBatchOp::Delete { key }),
+            (bytes(), bytes()).prop_map(|(start, end)| WriteBatchOp::DeleteRange { start, end }),
+            (bytes(), bytes()).prop_map(|(key, operand)| WriteBatchOp::Merge { key, operand }),
+        ]
+    }
+
+    proptest! {
+        #[test]
+        fn any_batch_encodes_exactly_its_staged_len(
+            ops in proptest::collection::vec(batch_op_strategy(), 0..24),
+        ) {
+            // Covers `ops_record_len`'s three arms: empty (stages
+            // nothing), one op (single-record framing), several ops
+            // (batch framing).
+            let request = batch(ops);
+            let staged_len = request.staged_len();
+            let mut out = Vec::new();
+            out.reserve_exact(staged_len);
+            request.encode_wal(&mut out, 1);
+            prop_assert_eq!(out.len(), staged_len);
+            prop_assert_eq!(out.capacity(), staged_len);
+        }
     }
 }

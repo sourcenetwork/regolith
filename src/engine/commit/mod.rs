@@ -59,6 +59,16 @@ pub(crate) use stall::StallSignal;
 /// than the whole cap is still admitted rather than starved.
 const MAX_GROUP_BYTES: usize = 1024 * 1024;
 
+/// Ceiling on how much stage capacity `trim_stage` ever keeps.
+///
+/// Without a ceiling a single one-off giant group parks its whole peak
+/// allocation for as long as the engine stays open and idle, or even after
+/// `close()`, because nothing else ever touches the stage. 16x the group
+/// cap still leaves a steady `BatchWrite`/4KiB stream (about 4.1 MB)
+/// allocation-free; only a group larger than this is trimmed back down to
+/// it in the same call that ran it.
+const MAX_KEPT_STAGE_BYTES: usize = 16 * MAX_GROUP_BYTES;
+
 /// Upper bound on how long a parked follower sleeps before re-checking.
 ///
 /// Correctness does not rest on this: the leader unparks every follower it
@@ -87,11 +97,19 @@ struct GroupTicket {
 }
 
 /// Leader-owned scratch, guarded by the pipeline mutex so only the leader
-/// can reach it. Both buffers are cleared, never reallocated, so a group
-/// in steady state stages its bytes without touching the allocator.
+/// can reach it. The stage is reserved to each group's exact framed length
+/// before it is encoded and kept between groups up to a byte ceiling, so a
+/// stream of equal-sized groups at or under that ceiling stages its bytes
+/// without touching the allocator once warmed up; `trim_stage` says when a
+/// varying stream reallocates, when capacity is given back, and bounds how
+/// much a one-off giant group can leave parked.
 pub(crate) struct Pipeline {
     stage: Vec<u8>,
     group: Vec<GroupTicket>,
+    /// Framed bytes the previous group staged: the one group of hysteresis
+    /// `trim_stage` keeps, so a group cannot shrink a stage the group
+    /// before it just grew.
+    prev_staged: usize,
 }
 
 impl Pipeline {
@@ -99,6 +117,7 @@ impl Pipeline {
         Self {
             stage: Vec::new(),
             group: Vec::new(),
+            prev_staged: 0,
         }
     }
 }
@@ -108,6 +127,36 @@ impl Pipeline {
 /// caller can observe, so reconstructing them is lossless here.
 fn clone_io_error(err: &io::Error) -> io::Error {
     io::Error::new(err.kind(), err.to_string())
+}
+
+/// Give staging memory back when neither of the last two groups needed it,
+/// and never keep more than `MAX_KEPT_STAGE_BYTES` regardless.
+///
+/// Policy: within that ceiling, the stage keeps enough capacity for the
+/// larger of the group that just ran and the one before it, and never less
+/// than `MAX_GROUP_BYTES`. A group at or under the ceiling touches the
+/// allocator only when it needs to grow past the kept capacity, or when
+/// the group two back was the largest of the three and is now shed, so a
+/// stream of equal-sized groups at or under the ceiling is allocation-free
+/// once warmed up, and a stage the previous group grew is not shrunk by a
+/// small group that happens to follow it (the common interleave of a bulk
+/// batch and a single put) until two smaller groups have run. A group
+/// larger than the ceiling is trimmed straight back down to it in the same
+/// call that ran it, so a one-off giant group can never park more than
+/// `MAX_KEPT_STAGE_BYTES` for the rest of the engine's life, whether writes
+/// go idle or the engine closes; the cost is that a steady stream of groups
+/// above the ceiling reallocates on every group instead of holding its
+/// peak. Bound, in bytes: on return, `stage.capacity() <=
+/// max(MAX_GROUP_BYTES, min(max(prev_staged, staged), MAX_KEPT_STAGE_BYTES))`,
+/// which is itself at most `MAX_KEPT_STAGE_BYTES`.
+///
+/// `shrink_to` cannot go below `len`, so the bytes have to go first.
+fn trim_stage(stage: &mut Vec<u8>, prev_staged: usize, staged: usize) {
+    let keep = MAX_GROUP_BYTES.max(prev_staged.max(staged).min(MAX_KEPT_STAGE_BYTES));
+    if stage.capacity() > keep {
+        stage.clear();
+        stage.shrink_to(keep);
+    }
 }
 
 /// Empty a staged group, telling anyone still in it that their write did
@@ -445,8 +494,16 @@ impl RegolithEngine {
     /// Completion happens after [`Self::run_group`] has published the read
     /// horizon (the lost-update fix) and hands the same outcome to every member (G2).
     fn run_and_complete(&self, pipe: &mut Pipeline) -> io::Result<u64> {
-        let Pipeline { stage, group } = pipe;
-        let result = self.run_group(stage, group);
+        let Pipeline {
+            stage,
+            group,
+            prev_staged,
+        } = pipe;
+        // Summed again here rather than carried over from admission:
+        // `commit_optimistic` seeds a group without going through
+        // `admit_from_ring`, and the sum is one add per ticket.
+        let staged: usize = group.iter().map(|t| t.request.staged_len()).sum();
+        let result = self.run_group(stage, group, staged);
         // Each ticket learns the sequence *its own* operations were
         // assigned, not the group's maximum. An upper layer ordering its
         // versions against regolith's needs the sequence of the write it
@@ -463,19 +520,30 @@ impl RegolithEngine {
             }
             seq = last.saturating_add(1);
         }
-        // The staging buffer is reused, never reallocated, but a request
-        // larger than a whole group's cap would otherwise park its peak
-        // allocation for the engine's lifetime. `shrink_to` cannot go
-        // below `len`, so the bytes have to go first.
-        if stage.capacity() > MAX_GROUP_BYTES {
-            stage.clear();
-            stage.shrink_to(MAX_GROUP_BYTES);
-        }
+        // Trimmed by what is actually resident (`stage.len()`), not by
+        // `staged`: a group that failed before encoding stages nothing,
+        // and crediting it with `staged` bytes would let a refused
+        // reservation pin an older group's capacity alive under a size
+        // that was never reserved.
+        let used = stage.len();
+        trim_stage(stage, *prev_staged, used);
+        *prev_staged = used;
         result
     }
 
     /// Write, sync and apply one group.
-    fn run_group(&self, stage: &mut Vec<u8>, group: &[GroupTicket]) -> io::Result<u64> {
+    fn run_group(
+        &self,
+        stage: &mut Vec<u8>,
+        group: &[GroupTicket],
+        staged: usize,
+    ) -> io::Result<u64> {
+        // Cleared first, ahead of every early return (`ensure_writable`,
+        // `rotate_if_full`, a refused reservation), so a group that never
+        // reaches the encode loop leaves the stage empty instead of a
+        // previous group's leftover length behind for `run_and_complete`'s
+        // `stage.len()` to mistake for this one.
+        stage.clear();
         self.ensure_writable()?;
         // Ahead of the WAL append on purpose: a rotation swaps the WAL as
         // well as the memtable, so rotating after this group's records
@@ -489,12 +557,29 @@ impl RegolithEngine {
             return Ok(self.visible_seq.visible());
         }
 
+        // One allocation for the whole group, before any sequence number
+        // is taken, so a refused reservation costs nothing but this group.
+        // The framed length is exact (`staged_len`), so `reserve_exact`
+        // leaves no slack to trim later.
+        // Handed to every member of this group (G2), including one whose
+        // own request was small: a group can carry another writer's
+        // oversized batch, so the message names no internal mechanism and
+        // gives advice that fits every caller, not just whoever staged the
+        // bytes.
+        stage.try_reserve_exact(staged).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::OutOfMemory,
+                format!(
+                    "not enough memory to commit this write ({staged} bytes pending); retry, splitting any very large write batch"
+                ),
+            )
+        })?;
+
         // The whole group's sequence range is allocated here, in group
         // order, so sequence order, WAL byte order and memtable apply
         // order stay identical - the property every reader depends on.
         let base_seq = self.latest_seq.fetch_add(total_ops, Ordering::AcqRel) + 1;
 
-        stage.clear();
         let mut any_immediate = false;
         let mut reported_bytes = 0u64;
         let mut seq = base_seq;
@@ -598,6 +683,7 @@ mod tests {
     use super::super::{EngineOptions, wal::fault};
     use super::*;
     use crate::sync::Mutex;
+    use proptest::prelude::*;
     use tempfile::TempDir;
 
     fn open_engine(dir: &TempDir) -> Arc<RegolithEngine> {
@@ -920,11 +1006,91 @@ mod tests {
     }
 
     #[test]
-    fn an_outsized_request_does_not_park_its_staging_buffer() {
+    fn a_group_is_staged_in_one_exact_reservation_the_next_group_reuses() {
+        let dir = TempDir::new().unwrap();
+        let engine = open_engine(&dir);
+
+        let batch = || WriteRequest::Batch {
+            ops: (0..1000)
+                .map(|i| WriteBatchOp::Put {
+                    key: key(format!("k{i:04}").as_bytes()),
+                    value: vec![b'v'; 4096],
+                })
+                .collect(),
+            durability: DurabilityMode::Eventual,
+            disable_wal: false,
+        };
+        let staged = batch().staged_len();
+        assert!(
+            staged > MAX_GROUP_BYTES,
+            "the test batch must exceed the group cap to exercise the reservation, got {staged}"
+        );
+
+        // `run_group` alone, ahead of `run_and_complete`'s `trim_stage`:
+        // `trim_stage` shrinks an overshot stage back down to exactly
+        // `staged` regardless of how it got there, which would make a
+        // doubling chain that happens to end above `staged` indistinguishable
+        // from a single exact reservation once the group has fully
+        // completed. Checking right after `run_group` returns, before that
+        // trim runs, is what actually pins the one-allocation claim.
+        {
+            let mut guard = engine.pipeline.lock();
+            let pipe: &mut Pipeline = &mut guard;
+            pipe.group.push(GroupTicket {
+                slot: None,
+                request: batch(),
+            });
+            engine
+                .run_group(&mut pipe.stage, &pipe.group, staged)
+                .expect("a batch larger than the group cap still commits");
+            assert_eq!(
+                pipe.stage.capacity(),
+                staged,
+                "run_group must reserve exactly the group's framed length in one allocation, not grow it by doubling"
+            );
+            pipe.group.clear();
+        }
+
+        engine
+            .submit(batch())
+            .expect("a batch larger than the group cap still commits");
+        let (cap, ptr) = {
+            let pipe = engine.pipeline.lock();
+            (pipe.stage.capacity(), pipe.stage.as_ptr())
+        };
+        assert_eq!(
+            cap, staged,
+            "the stage must reserve exactly the group's framed length, not a doubling chain"
+        );
+
+        engine.submit(batch()).expect("the next group commits");
+        let pipe = engine.pipeline.lock();
+        assert_eq!(
+            pipe.stage.capacity(),
+            staged,
+            "a stage already exactly sized must not change capacity"
+        );
+        assert_eq!(
+            pipe.stage.as_ptr(),
+            ptr,
+            "a stage already large enough for the next group must not reallocate"
+        );
+    }
+
+    #[test]
+    fn an_outsized_request_gives_its_stage_back_once_two_smaller_groups_ran() {
         let dir = TempDir::new().unwrap();
         let engine = open_engine(&dir);
 
         let huge = vec![b'x'; MAX_GROUP_BYTES + 64 * 1024];
+        let huge_staged = WriteRequest::Put {
+            key: key(b"huge"),
+            value: huge.clone(),
+            durability: DurabilityMode::Eventual,
+            disable_wal: false,
+        }
+        .staged_len();
+
         engine
             .submit(WriteRequest::Put {
                 key: key(b"huge"),
@@ -933,12 +1099,213 @@ mod tests {
                 disable_wal: false,
             })
             .expect("a request larger than the group cap still commits");
+        assert_eq!(
+            engine.pipeline.lock().stage.capacity(),
+            huge_staged,
+            "the group that just staged the huge request keeps exactly what it staged"
+        );
 
+        engine
+            .submit(durable_put(b"a", b"v"))
+            .expect("a small put commits");
+        assert_eq!(
+            engine.pipeline.lock().stage.capacity(),
+            huge_staged,
+            "one group of hysteresis must not release the stage yet"
+        );
+
+        engine
+            .submit(durable_put(b"b", b"v"))
+            .expect("a second small put commits");
         assert!(
             engine.pipeline.lock().stage.capacity() <= MAX_GROUP_BYTES,
-            "the staging buffer kept an outsized request's peak allocation"
+            "the stage must be released once two smaller groups have run"
         );
+
         assert_eq!(engine.get(&key(b"huge"), u64::MAX).unwrap(), Some(huge));
+    }
+
+    #[test]
+    fn a_giant_group_parks_no_more_than_the_retention_cap() {
+        // Only `run_and_complete` trims the stage, so a giant group has to
+        // be cut to the ceiling in the same call or it stays parked while
+        // writes are idle or after close.
+        let dir = TempDir::new().unwrap();
+        let engine = open_engine(&dir);
+
+        let huge = vec![b'x'; 32 * MAX_GROUP_BYTES];
+        engine
+            .submit(WriteRequest::Put {
+                key: key(b"huge"),
+                value: huge,
+                durability: DurabilityMode::Eventual,
+                disable_wal: false,
+            })
+            .expect("a request far larger than the group cap still commits");
+
+        let cap = engine.pipeline.lock().stage.capacity();
+        assert!(
+            cap <= MAX_KEPT_STAGE_BYTES,
+            "a one-off giant group must not park more than the retention cap, got {cap}"
+        );
+    }
+
+    #[test]
+    fn varying_group_sizes_reallocate_only_across_the_kept_capacity_boundary() {
+        // A group of varying size grows the stage only past the kept
+        // capacity, and shrinks it only once the group two back was the
+        // largest of the three, not on every group above the cap.
+        let dir = TempDir::new().unwrap();
+        let engine = open_engine(&dir);
+
+        let put_of = |mib: usize| WriteRequest::Put {
+            key: key(b"v"),
+            value: vec![b'x'; mib * 1024 * 1024],
+            durability: DurabilityMode::Eventual,
+            disable_wal: false,
+        };
+        let staged_of = |mib: usize| put_of(mib).staged_len();
+
+        let mut capacities = Vec::new();
+        for mib in [3, 2, 2, 3] {
+            engine
+                .submit(put_of(mib))
+                .expect("each oversized put commits on its own");
+            capacities.push(engine.pipeline.lock().stage.capacity());
+        }
+
+        assert_eq!(
+            capacities,
+            vec![staged_of(3), staged_of(3), staged_of(2), staged_of(3)],
+            "the stage grows only past its kept capacity and shrinks only once the group two back is shed"
+        );
+    }
+
+    #[test]
+    fn a_group_that_staged_nothing_does_not_count_as_staged() {
+        // A group that returns before encoding (here, a latched wal
+        // failure caught by `ensure_writable`) must not be credited with
+        // the bytes it was *asked* to stage: crediting it would let a
+        // refused or failed group pin an older, larger group's buffer
+        // alive under a size that was never reserved.
+        let dir = TempDir::new().unwrap();
+        let engine = open_engine(&dir);
+
+        let big = vec![b'x'; 2 * MAX_GROUP_BYTES];
+        let big_staged = WriteRequest::Put {
+            key: key(b"big"),
+            value: big.clone(),
+            durability: DurabilityMode::Eventual,
+            disable_wal: false,
+        }
+        .staged_len();
+
+        engine
+            .submit(WriteRequest::Put {
+                key: key(b"big"),
+                value: big,
+                durability: DurabilityMode::Eventual,
+                disable_wal: false,
+            })
+            .expect("a request larger than the group cap still commits");
+        assert_eq!(engine.pipeline.lock().stage.capacity(), big_staged);
+
+        engine
+            .submit(durable_put(b"small", b"v"))
+            .expect("a small put commits");
+        assert_eq!(
+            engine.pipeline.lock().stage.capacity(),
+            big_staged,
+            "one group of hysteresis must not release the stage yet"
+        );
+
+        engine.latch_wal_failure(&io::Error::other("induced for the test"));
+
+        let doomed = WriteRequest::Put {
+            key: key(b"never"),
+            value: vec![b'y'; 3 * MAX_GROUP_BYTES],
+            durability: DurabilityMode::Eventual,
+            disable_wal: false,
+        };
+        let mut pipe = engine.pipeline.lock();
+        pipe.group.clear();
+        pipe.group.push(GroupTicket {
+            slot: None,
+            request: doomed,
+        });
+        let result = engine.run_and_complete(&mut pipe);
+        assert!(
+            result.is_err(),
+            "a latched wal failure must fail the group before it stages anything"
+        );
+        assert!(
+            pipe.stage.capacity() <= MAX_GROUP_BYTES,
+            "a group that staged nothing must not be credited with a size it \
+             never reserved, so the previous group's buffer stays parked"
+        );
+    }
+
+    #[test]
+    fn a_refused_reservation_consumes_no_sequence_and_applies_nothing() {
+        // The refused-reservation branch (`try_reserve_exact` failing) has
+        // no other coverage. Pin that it behaves like any other failed
+        // group: no sequence number spent, nothing applied.
+        let dir = TempDir::new().unwrap();
+        let engine = open_engine(&dir);
+
+        let before = engine.latest_seq.load(Ordering::Acquire);
+        let mut guard = engine.pipeline.lock();
+        let pipe: &mut Pipeline = &mut guard;
+        pipe.group.clear();
+        pipe.group.push(GroupTicket {
+            slot: None,
+            request: durable_put(b"never", b"v"),
+        });
+        let err = engine
+            .run_group(&mut pipe.stage, &pipe.group, usize::MAX)
+            .expect_err("an unsatisfiable reservation must fail rather than allocate");
+        assert_eq!(err.kind(), io::ErrorKind::OutOfMemory);
+        pipe.group.clear();
+        drop(guard);
+
+        assert_eq!(
+            engine.latest_seq.load(Ordering::Acquire),
+            before,
+            "a refused reservation must not consume a sequence number"
+        );
+        assert_eq!(
+            engine.get(&key(b"never"), u64::MAX).unwrap(),
+            None,
+            "a refused reservation must not apply its group to the memtable"
+        );
+    }
+
+    #[test]
+    fn the_reservation_error_names_no_internal_mechanism() {
+        // The same refused reservation is handed to every member of a
+        // possibly shared group, including a writer whose own request was
+        // small, so the message must not name the internal staging
+        // mechanism or give advice tied to the group's size.
+        let dir = TempDir::new().unwrap();
+        let engine = open_engine(&dir);
+
+        let mut guard = engine.pipeline.lock();
+        let pipe: &mut Pipeline = &mut guard;
+        pipe.group.clear();
+        pipe.group.push(GroupTicket {
+            slot: None,
+            request: durable_put(b"never", b"v"),
+        });
+        let err = engine
+            .run_group(&mut pipe.stage, &pipe.group, usize::MAX)
+            .expect_err("an unsatisfiable reservation must fail rather than allocate");
+        pipe.group.clear();
+
+        assert_eq!(err.kind(), io::ErrorKind::OutOfMemory);
+        assert!(
+            !err.to_string().contains("group"),
+            "the message must not name the internal staging mechanism: {err}"
+        );
     }
 
     #[test]
@@ -1245,6 +1612,45 @@ mod tests {
                 engine.get(&key(name.as_bytes()), u64::MAX).unwrap(),
                 Some(b"v".to_vec())
             );
+        }
+    }
+
+    proptest! {
+        // Cases dropped from the default 256: the low-weight arm below
+        // draws lengths above `MAX_KEPT_STAGE_BYTES` so the property
+        // actually exercises the ceiling, and resizing (memset) a stage
+        // that large on every case would be needlessly slow.
+        #![proptest_config(ProptestConfig::with_cases(32))]
+        #[test]
+        fn the_stage_never_keeps_more_than_the_capped_larger_of_the_last_two_groups(
+            lengths in proptest::collection::vec(
+                prop_oneof![
+                    9 => 0usize..=2 * MAX_GROUP_BYTES + 4096,
+                    1 => MAX_KEPT_STAGE_BYTES..=MAX_KEPT_STAGE_BYTES + 2 * MAX_GROUP_BYTES,
+                ],
+                1..8,
+            ),
+        ) {
+            let mut stage: Vec<u8> = Vec::new();
+            let mut prev = 0usize;
+            for staged in lengths {
+                // Stands in for the encode loop: a real stage always has
+                // `len == staged` when `trim_stage` sees it, so a forgotten
+                // `clear` inside `trim_stage` would be caught by
+                // `shrink_to`'s cannot-go-below-`len` rule.
+                stage.clear();
+                stage.reserve_exact(staged);
+                stage.resize(staged, 0);
+                let before = stage.capacity();
+                trim_stage(&mut stage, prev, staged);
+                let keep = MAX_GROUP_BYTES.max(prev.max(staged).min(MAX_KEPT_STAGE_BYTES));
+                prop_assert!(stage.capacity() <= keep);
+                prop_assert!(stage.capacity() <= MAX_KEPT_STAGE_BYTES);
+                if before <= keep {
+                    prop_assert_eq!(stage.capacity(), before);
+                }
+                prev = staged;
+            }
         }
     }
 }
