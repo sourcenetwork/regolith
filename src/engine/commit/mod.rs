@@ -38,7 +38,7 @@ use std::time::Duration;
 use kovan_queue::array_queue::ArrayQueue;
 
 use super::wal::Wal;
-use super::{CommitOutcome, DurabilityMode, RegolithEngine, grouped_batch_ops};
+use super::{CommitOutcome, DurabilityMode, ReadView, RegolithEngine, grouped_batch_ops};
 use crate::WriteBatchOp;
 use crate::perf_context::{PerfTimer, PerfTimerField};
 use crate::statistics::{Histogram, Ticker};
@@ -270,9 +270,14 @@ impl RegolithEngine {
     /// transaction with a concurrent plain write would let the write land
     /// in the same group the conflict check already looked past, which is
     /// precisely the write-write conflict the check exists to catch.
+    ///
+    /// The checks and the apply also share one view: the active memtable is
+    /// replaced only under the pipeline mutex, so the memtable the checks read
+    /// is the memtable the group lands in unless this leader rotates it, and
+    /// `rotate_if_full` hands the apply the fresh view in that case.
     pub(crate) fn commit_optimistic(
         &self,
-        conflict_keys: &[crate::engine::ConflictKey],
+        checks: &crate::engine::ValidationSet,
         point_ops: std::collections::BTreeMap<Vec<u8>, Option<Vec<u8>>>,
         range_deletes: Vec<(Vec<u8>, Vec<u8>)>,
         merges: Vec<(Vec<u8>, Vec<u8>)>,
@@ -297,7 +302,7 @@ impl RegolithEngine {
                 .map_err(crate::Error::into_io_error)?;
         }
 
-        self.commit_locked(conflict_keys, ops, durability)
+        self.commit_locked(checks, ops, durability)
     }
 
     /// The conflict check and the apply, under one uninterrupted hold of
@@ -308,29 +313,76 @@ impl RegolithEngine {
     /// instruction count no admission check should touch.
     fn commit_locked(
         &self,
-        conflict_keys: &[crate::engine::ConflictKey],
+        checks: &crate::engine::ValidationSet,
         ops: Vec<WriteBatchOp>,
         durability: DurabilityMode,
     ) -> io::Result<CommitOutcome> {
         let mut pipe = self.pipeline.lock();
 
         let view = self.view.load();
-        for check in conflict_keys {
+        // Reads first, then the written keys in operation order: point
+        // operations arrive sorted from the write map, merges after them in
+        // the order they were buffered, so a multi-key conflict names the
+        // same key on every run.
+        for check in &checks.reads {
             if let Some(latest_seq) = self.latest_version_seq_in_view(&check.key, &view)?
                 && latest_seq > check.observed_seq
             {
-                // A blind write of the value the key already holds is not a
-                // conflict: the schedule has a serial equivalent reaching the
-                // same state. A key the transaction *read* still aborts, since
-                // the stale read may have changed what it decided.
-                if !check.read && self.write_matches_committed(&check.key, &ops, &view)? {
-                    continue;
-                }
+                // A key the transaction *read* always aborts, since the stale
+                // read may have changed what it decided.
                 return Ok(CommitOutcome::Conflict {
                     key: check.key.clone(),
                     observed_seq: check.observed_seq,
                     latest_seq,
                 });
+            }
+        }
+        // A key merged N times in one transaction is probed once, not N
+        // times: each probe past the first would just walk the same
+        // pipeline-mutex-held view again for an answer already known. A key
+        // with both a point op and a merge op is still probed twice, since
+        // the point op and the first merge op are seen as distinct writes
+        // here; `write_matches_committed` refuses any key carrying a merge
+        // op, so both probes land on the same outcome.
+        if let Some(observed_seq) = checks.writes_at {
+            let mut merged_keys: std::collections::HashSet<&[u8]> =
+                std::collections::HashSet::new();
+            for op in &ops {
+                let key = match op {
+                    WriteBatchOp::Put { key, .. } | WriteBatchOp::Delete { key } => key,
+                    WriteBatchOp::Merge { key, .. } => {
+                        if !merged_keys.insert(key.as_slice()) {
+                            continue;
+                        }
+                        key
+                    }
+                    // Range deletes are not validated (transaction.rs:459-460).
+                    WriteBatchOp::DeleteRange { .. } => continue,
+                };
+                // A written key the transaction also read was validated above,
+                // at the read's anchor and without the elision below.
+                if checks
+                    .reads
+                    .binary_search_by(|read| read.key.as_slice().cmp(key))
+                    .is_ok()
+                {
+                    continue;
+                }
+                if let Some(latest_seq) = self.latest_version_seq_in_view(key, &view)?
+                    && latest_seq > observed_seq
+                {
+                    // A blind write of the value the key already holds is not a
+                    // conflict: the schedule has a serial equivalent reaching the
+                    // same state.
+                    if self.write_matches_committed(key, &ops, &view)? {
+                        continue;
+                    }
+                    return Ok(CommitOutcome::Conflict {
+                        key: key.clone(),
+                        observed_seq,
+                        latest_seq,
+                    });
+                }
             }
         }
 
@@ -352,7 +404,7 @@ impl RegolithEngine {
             slot: None,
             request,
         });
-        let result = self.run_and_complete(&mut pipe);
+        let result = self.run_and_complete(&mut pipe, view);
         self.drain_locked(&mut pipe);
         result.map(|_| CommitOutcome::Ok)
     }
@@ -408,9 +460,10 @@ impl RegolithEngine {
             slot: None,
             request,
         });
-        self.admit_from_ring(pipe);
+        let view = self.view.load();
+        self.admit_from_ring(pipe, &view);
 
-        let result = self.run_and_complete(pipe);
+        let result = self.run_and_complete(pipe, view);
         self.drain_locked(pipe);
         result
     }
@@ -434,11 +487,18 @@ impl RegolithEngine {
     fn drain_locked(&self, pipe: &mut Pipeline) {
         loop {
             release_stranded(&mut pipe.group);
-            self.admit_from_ring(pipe);
+            // The common exit: nothing queued behind the group just run.
+            // Checked before the view load so the empty pass costs no lock
+            // and no Arc.
+            if self.commit_ring.is_empty() {
+                return;
+            }
+            let view = self.view.load();
+            self.admit_from_ring(pipe, &view);
             if pipe.group.is_empty() {
                 return;
             }
-            let _ = self.run_and_complete(pipe);
+            let _ = self.run_and_complete(pipe, view);
         }
     }
 
@@ -450,8 +510,8 @@ impl RegolithEngine {
     /// larger than either cap commits alone instead of starving. That one
     /// ticket is the whole of the documented overshoot: the active
     /// memtable holds at most `write_buffer_size` plus one request.
-    fn admit_from_ring(&self, pipe: &mut Pipeline) {
-        let room = self.memtable_room();
+    fn admit_from_ring(&self, pipe: &mut Pipeline, view: &ReadView) {
+        let room = self.memtable_room(view);
         // `lead_with` seeds the group with the leader's own request
         // before calling in, so the running totals start from what is
         // already staged rather than from zero.
@@ -479,9 +539,9 @@ impl RegolithEngine {
     /// `run_group` rotates before it applies anything, so a memtable
     /// already at or past its budget is about to be replaced by an empty
     /// one and the group may fill a whole `write_buffer_size`.
-    fn memtable_room(&self) -> usize {
+    fn memtable_room(&self, view: &ReadView) -> usize {
         let budget = self.options.write_buffer_size;
-        let used = self.view.load().active.approximate_size();
+        let used = view.active.approximate_size();
         if used >= budget {
             budget
         } else {
@@ -493,7 +553,7 @@ impl RegolithEngine {
     ///
     /// Completion happens after [`Self::run_group`] has published the read
     /// horizon (the lost-update fix) and hands the same outcome to every member (G2).
-    fn run_and_complete(&self, pipe: &mut Pipeline) -> io::Result<u64> {
+    fn run_and_complete(&self, pipe: &mut Pipeline, view: Arc<ReadView>) -> io::Result<u64> {
         let Pipeline {
             stage,
             group,
@@ -503,7 +563,7 @@ impl RegolithEngine {
         // `commit_optimistic` seeds a group without going through
         // `admit_from_ring`, and the sum is one add per ticket.
         let staged: usize = group.iter().map(|t| t.request.staged_len()).sum();
-        let result = self.run_group(stage, group, staged);
+        let result = self.run_group(stage, group, view, staged);
         // Each ticket learns the sequence *its own* operations were
         // assigned, not the group's maximum. An upper layer ordering its
         // versions against regolith's needs the sequence of the write it
@@ -536,6 +596,7 @@ impl RegolithEngine {
         &self,
         stage: &mut Vec<u8>,
         group: &[GroupTicket],
+        view: Arc<ReadView>,
         staged: usize,
     ) -> io::Result<u64> {
         // Cleared first, ahead of every early return (`ensure_writable`,
@@ -550,7 +611,7 @@ impl RegolithEngine {
         // were appended would strand them in the WAL that belongs to the
         // memtable now being flushed. `admit_from_ring` sized the group
         // against the room this leaves.
-        self.rotate_if_full()?;
+        let view = self.rotate_if_full(view)?;
 
         let total_ops: u64 = group.iter().map(|t| t.request.op_count()).sum();
         if total_ops == 0 {
@@ -639,7 +700,6 @@ impl RegolithEngine {
 
         {
             let _perf_mt = PerfTimer::new(PerfTimerField::WriteMemtable);
-            let view = self.view.load();
             let memtable = &view.active;
             let mut seq = base_seq;
             for ticket in group {
@@ -778,7 +838,7 @@ mod tests {
                     request,
                 });
             }
-            let result = engine.run_and_complete(&mut pipe);
+            let result = engine.run_and_complete(&mut pipe, engine.view.load());
             assert!(
                 result.is_err(),
                 "an injected sync failure must fail the group"
@@ -954,7 +1014,9 @@ mod tests {
                 request,
             });
         }
-        engine.run_and_complete(&mut pipe).expect("group commits");
+        engine
+            .run_and_complete(&mut pipe, engine.view.load())
+            .expect("group commits");
         drop(pipe);
 
         let horizon = engine.snapshot_seq();
@@ -1041,7 +1103,7 @@ mod tests {
                 request: batch(),
             });
             engine
-                .run_group(&mut pipe.stage, &pipe.group, staged)
+                .run_group(&mut pipe.stage, &pipe.group, engine.view.load(), staged)
                 .expect("a batch larger than the group cap still commits");
             assert_eq!(
                 pipe.stage.capacity(),
@@ -1233,7 +1295,7 @@ mod tests {
             slot: None,
             request: doomed,
         });
-        let result = engine.run_and_complete(&mut pipe);
+        let result = engine.run_and_complete(&mut pipe, engine.view.load());
         assert!(
             result.is_err(),
             "a latched wal failure must fail the group before it stages anything"
@@ -1262,7 +1324,7 @@ mod tests {
             request: durable_put(b"never", b"v"),
         });
         let err = engine
-            .run_group(&mut pipe.stage, &pipe.group, usize::MAX)
+            .run_group(&mut pipe.stage, &pipe.group, engine.view.load(), usize::MAX)
             .expect_err("an unsatisfiable reservation must fail rather than allocate");
         assert_eq!(err.kind(), io::ErrorKind::OutOfMemory);
         pipe.group.clear();
@@ -1297,7 +1359,7 @@ mod tests {
             request: durable_put(b"never", b"v"),
         });
         let err = engine
-            .run_group(&mut pipe.stage, &pipe.group, usize::MAX)
+            .run_group(&mut pipe.stage, &pipe.group, engine.view.load(), usize::MAX)
             .expect_err("an unsatisfiable reservation must fail rather than allocate");
         pipe.group.clear();
 

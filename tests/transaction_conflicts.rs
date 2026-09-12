@@ -16,7 +16,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use regolith::{
-    Db, MergeOperator, OptimisticTransactionDb, Options, TransactionDb, TransactionError, TxResult,
+    Db, IsolationLevel, MergeOperator, OptimisticTransactionDb, Options, TransactionDb,
+    TransactionError, TxResult,
 };
 use tempfile::TempDir;
 
@@ -480,4 +481,40 @@ fn a_non_transactional_writer_racing_transactions_never_hides_a_lost_update() {
     stop.store(true, Ordering::Relaxed);
     noise.join().unwrap();
     assert_eq!(decode(db.db().get(b"k").unwrap()), ROUNDS);
+}
+
+// ---- range-tombstone coverage of a blind write ----
+
+/// A range delete is a write too: a blind write into a range deleted
+/// after the transaction began has no serial equivalent, and one deleted
+/// before begin is simply the state the transaction started from.
+#[test]
+fn a_blind_write_conflicts_with_a_range_delete_that_landed_after_begin() {
+    for level in [
+        IsolationLevel::ReadCommitted,
+        IsolationLevel::SnapshotIsolation,
+        IsolationLevel::Serializable,
+    ] {
+        let dir = TempDir::new().unwrap();
+        let db = OptimisticTransactionDb::open(dir.path(), Options::default()).unwrap();
+        let tx = db.begin_transaction_with(level);
+        db.db().delete_range(b"a", b"z").unwrap();
+        tx.put(b"k", b"v").unwrap();
+        assert!(
+            matches!(
+                tx.commit(),
+                Err(TransactionError::Conflict { ref key, .. }) if key == b"k"
+            ),
+            "{level:?}: a range delete landing after begin must conflict with a blind write"
+        );
+
+        let dir = TempDir::new().unwrap();
+        let db = OptimisticTransactionDb::open(dir.path(), Options::default()).unwrap();
+        db.db().delete_range(b"a", b"z").unwrap();
+        let tx = db.begin_transaction_with(level);
+        tx.put(b"k", b"v").unwrap();
+        tx.commit()
+            .unwrap_or_else(|error| panic!("{level:?}: {error:?}"));
+        assert_eq!(db.db().get(b"k").unwrap(), Some(b"v".to_vec()));
+    }
 }

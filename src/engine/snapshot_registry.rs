@@ -19,7 +19,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use crate::sync::{Condvar, Mutex};
+use crate::sync::{AtomicUsize, Condvar, Mutex, Ordering};
 
 use crate::env::Env;
 
@@ -33,10 +33,29 @@ pub(crate) struct SnapshotRegistry {
     /// `regolith.oldest-snapshot-time` is stable across refcount
     /// changes.
     active: Mutex<BTreeMap<u64, SlotState>>,
-    /// Signalled whenever the last pin is released, so a caller
-    /// shutting the database down can wait for readers to finish
-    /// instead of polling a counter.
+    /// Signalled when the last pin is released and somebody is waiting for
+    /// that, so a caller shutting the database down can wait for readers
+    /// to finish instead of polling a counter.
     drained: Condvar,
+    /// Threads inside [`Self::wait_until_drained`]. A release that empties
+    /// the map wakes the condvar only when this is nonzero: std's futex
+    /// condvar issues the wake syscall unconditionally, and in single-writer
+    /// use the map empties on every commit.
+    ///
+    /// No wake is lost. A waiter raises the count before it takes the
+    /// registry mutex and checks the map; a releaser reads the count after
+    /// it has dropped the mutex. If the waiter found a pin and parked, the
+    /// release that removes the last pin enters the mutex after the
+    /// waiter's critical section left it, so the increment happens-before
+    /// the releaser's load and the wake is issued. If the release emptied
+    /// the map before the waiter's check, the waiter sees the empty map and
+    /// returns without parking. The only wake skipped is one nobody would
+    /// have received.
+    waiters: AtomicUsize,
+    /// Wakes actually issued. Test-only: it is how a test proves the
+    /// no-waiter path issued none and the waiter path issued one.
+    #[cfg(test)]
+    wakes: AtomicUsize,
     env: Arc<dyn Env>,
 }
 
@@ -55,6 +74,9 @@ impl SnapshotRegistry {
         Self {
             active: Mutex::new(BTreeMap::new()),
             drained: Condvar::new(),
+            waiters: AtomicUsize::new(0),
+            #[cfg(test)]
+            wakes: AtomicUsize::new(0),
             env,
         }
     }
@@ -117,7 +139,9 @@ impl SnapshotRegistry {
         }
         let empty = active.is_empty();
         drop(active);
-        if empty {
+        if empty && self.waiters.load(Ordering::Acquire) > 0 {
+            #[cfg(test)]
+            self.wakes.fetch_add(1, Ordering::Relaxed);
             self.drained.notify_all();
         }
     }
@@ -134,6 +158,7 @@ impl SnapshotRegistry {
     /// long scan; too long adds its own latency to every clean
     /// shutdown. Waiting on the release itself has neither cost.
     pub(crate) fn wait_until_drained(&self, timeout: std::time::Duration) -> u64 {
+        self.waiters.fetch_add(1, Ordering::AcqRel);
         let deadline = std::time::Instant::now() + timeout;
         let mut active = self.active.lock();
         while !active.is_empty() {
@@ -146,6 +171,7 @@ impl SnapshotRegistry {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             active = next;
         }
+        self.waiters.fetch_sub(1, Ordering::AcqRel);
         active.values().map(|slot| slot.refcount as u64).sum()
     }
 
@@ -192,6 +218,18 @@ impl SnapshotRegistry {
     #[cfg(test)]
     pub(crate) fn pin_count(&self) -> usize {
         self.active.lock().len()
+    }
+
+    /// Test-only: threads currently inside `wait_until_drained`.
+    #[cfg(test)]
+    pub(crate) fn waiting(&self) -> usize {
+        self.waiters.load(Ordering::Acquire)
+    }
+
+    /// Test-only: condvar wakes issued so far.
+    #[cfg(test)]
+    pub(crate) fn wakes_issued(&self) -> usize {
+        self.wakes.load(Ordering::Relaxed)
     }
 }
 
@@ -282,5 +320,73 @@ mod tests {
         assert_eq!(r.pin_count(), 0);
         assert_eq!(r.live_count(), 0);
         assert_eq!(r.oldest_live_seq(), u64::MAX);
+    }
+
+    #[test]
+    fn release_wakes_a_registered_waiter() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let r = Arc::new(SnapshotRegistry::new());
+        r.register(7);
+
+        thread::scope(|scope| {
+            let waiter = {
+                let r = Arc::clone(&r);
+                scope.spawn(move || {
+                    let started = std::time::Instant::now();
+                    let remaining = r.wait_until_drained(std::time::Duration::from_secs(60));
+                    (remaining, started.elapsed())
+                })
+            };
+
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while r.waiting() == 0 {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "waiter never registered itself"
+                );
+                thread::yield_now();
+            }
+            r.release(7);
+
+            let (remaining, elapsed) = waiter.join().expect("waiter thread");
+            assert_eq!(remaining, 0, "the release must drain the last pin");
+            assert_eq!(r.wakes_issued(), 1);
+            assert!(
+                elapsed < std::time::Duration::from_secs(20),
+                "a missed wake would only return at the 60s timeout, took {elapsed:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn release_with_nobody_waiting_issues_no_wake() {
+        let r = SnapshotRegistry::new();
+        r.register(1);
+        r.release(1);
+        assert_eq!(r.wakes_issued(), 0);
+
+        r.register(2);
+        r.register(3);
+        r.release(2);
+        r.release(3);
+        assert_eq!(r.wakes_issued(), 0);
+    }
+
+    #[test]
+    fn a_waiter_leaves_no_count_behind() {
+        let r = SnapshotRegistry::new();
+        r.register(3);
+        assert_eq!(
+            r.wait_until_drained(std::time::Duration::from_millis(10)),
+            1,
+            "the pin is still live, so the wait must time out rather than drain"
+        );
+        assert_eq!(r.waiting(), 0);
+
+        r.release(3);
+        assert_eq!(r.wait_until_drained(std::time::Duration::from_secs(1)), 0);
+        assert_eq!(r.waiting(), 0);
     }
 }
