@@ -668,9 +668,14 @@ pub struct Options {
     /// Default: `false`.
     pub read_only: bool,
     /// Maximum user-key length accepted by write APIs. Default: 8 MiB.
+    /// A logged write is still refused if its framed record exceeds the
+    /// write-ahead log's 1 GiB limit, whatever this allows; a write with
+    /// `disable_wal` is exempt from that limit.
     pub max_key_size: usize,
     /// Maximum value and merge-operand length accepted by write APIs.
-    /// Default: 64 MiB.
+    /// Default: 64 MiB. A logged write is still refused if its framed
+    /// record exceeds the write-ahead log's 1 GiB limit, whatever this
+    /// allows; a write with `disable_wal` is exempt from that limit.
     pub max_value_size: usize,
     /// Keys one transaction buffers before it builds a hash index over
     /// them.

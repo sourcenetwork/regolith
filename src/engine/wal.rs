@@ -111,9 +111,12 @@ pub(crate) const WAL_STAMP_LEN: usize = 12;
 /// On-disk WAL format this build writes.
 const WAL_FORMAT_V1: u16 = 1;
 
-/// Largest record payload the writer will emit, and the largest a reader
-/// will believe. Well under `REGO` read as a little-endian length
-/// (0x4F47_4552), so the stamp can never be parsed as a record header.
+/// Largest framed record the writer will emit, and so the largest payload
+/// a reader will believe. A write whose record would be larger is refused
+/// before it is admitted (see [`check_record_len`]), and a commit group
+/// never stages more than this in one append. Well under `REGO` read as a
+/// little-endian length (0x4F47_4552), so the stamp can never be parsed as
+/// a record header.
 pub(crate) const MAX_RECORD_LEN: u32 = 1 << 30;
 
 const WAL_HEADER_LEN: usize = 5;
@@ -206,14 +209,16 @@ impl Wal {
     /// own. On failure the tracked offset is left at the pre-call value
     /// so [`Wal::rollback_to`] can discard whatever prefix reached the
     /// file.
+    ///
+    /// `bytes` may hold several records; the commit path never stages more
+    /// than [`MAX_RECORD_LEN`] in one call.
     pub(crate) fn append_group(&mut self, bytes: &[u8]) -> io::Result<()> {
         if bytes.is_empty() {
             return Ok(());
         }
         debug_assert!(
             bytes.len() as u64 <= MAX_RECORD_LEN as u64,
-            "a group larger than MAX_RECORD_LEN would frame a length that \
-             could be mistaken for the REGO stamp"
+            "a commit group over MAX_RECORD_LEN must be refused before it is staged"
         );
         self.file.write_all(bytes)?;
         self.offset += bytes.len() as u64;
@@ -490,8 +495,13 @@ const RECORD_HEADER_LEN: usize = 5;
 const RECORD_CHECKSUM_LEN: usize = 4;
 
 /// Total on-disk size of a record with a payload of `payload_len` bytes.
+///
+/// Saturating: on a 32-bit target a length near `usize::MAX` would
+/// otherwise wrap past the limit check instead of failing it.
 fn record_len(payload_len: usize) -> usize {
-    RECORD_HEADER_LEN + payload_len + RECORD_CHECKSUM_LEN
+    RECORD_HEADER_LEN
+        .saturating_add(payload_len)
+        .saturating_add(RECORD_CHECKSUM_LEN)
 }
 
 /// Frame one record into `out`.
@@ -562,11 +572,88 @@ pub(crate) fn encode_ops_batch_record(out: &mut Vec<u8>, ops: &[WriteBatchOp], b
 /// one sequence base: one framed record per op when there is exactly one,
 /// a single framed batch record otherwise.
 pub(crate) fn ops_record_len(ops: &[WriteBatchOp]) -> usize {
-    match ops {
-        [] => 0,
-        [op] => record_len(batch_op_payload_len(op)),
-        _ => record_len(batch_ops_payload_len(ops)),
+    let mut len = RecordLen::default();
+    ops.iter().for_each(|op| len.op(op));
+    len.framed()
+}
+
+/// Framed length of the record one write becomes, accumulated one
+/// operation at a time.
+///
+/// The single implementation of `encode_ops_record`'s sizing rule:
+/// nothing for no operation, a per-operation record for one, a batch
+/// record for several. Validation folds it into the pass it already
+/// makes over a write, so the length costs no extra walk.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct RecordLen {
+    ops: usize,
+    /// Payload of the first operation, the whole record when it is the
+    /// only one.
+    first: usize,
+    /// Sum of the batch entries (`batch_payload_len`) so far.
+    entries: usize,
+}
+
+impl RecordLen {
+    pub(crate) fn put(&mut self, key: &[u8], value: &[u8]) {
+        self.push(put_payload_len(key, value))
     }
+    pub(crate) fn delete(&mut self, key: &[u8]) {
+        self.push(delete_payload_len(key))
+    }
+    pub(crate) fn delete_range(&mut self, start: &[u8], end: &[u8]) {
+        self.push(delete_range_payload_len(start, end))
+    }
+    pub(crate) fn merge(&mut self, key: &[u8], operand: &[u8]) {
+        self.push(merge_payload_len(key, operand))
+    }
+    pub(crate) fn op(&mut self, op: &WriteBatchOp) {
+        self.push(batch_op_payload_len(op))
+    }
+
+    fn push(&mut self, payload: usize) {
+        if self.ops == 0 {
+            self.first = payload;
+        }
+        self.ops += 1;
+        // Saturating: on a 32-bit target a sum of lengths can wrap, and a
+        // wrapped length would pass the limit check.
+        self.entries = self.entries.saturating_add(batch_payload_len(payload));
+    }
+
+    /// Framed bytes `encode_ops_record` emits for the operations seen so
+    /// far.
+    pub(crate) fn framed(&self) -> usize {
+        match self.ops {
+            0 => 0,
+            1 => record_len(self.first),
+            _ => record_len(4usize.saturating_add(self.entries)),
+        }
+    }
+}
+
+/// Refuse a write whose framed log record is longer than `limit` bytes.
+///
+/// Production passes [`MAX_RECORD_LEN`] through [`check_write_len`]; the
+/// limit is a parameter only so the boundary can be tested without a
+/// gigabyte of data.
+pub(crate) fn check_record_len(framed_len: usize, limit: usize) -> io::Result<()> {
+    if framed_len <= limit {
+        return Ok(());
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!(
+            "write is too large: it would log {framed_len} bytes and one write can \
+             log at most {limit}; split it into smaller writes"
+        ),
+    ))
+}
+
+/// [`check_record_len`] at the format's limit, the bound every write path
+/// enforces.
+pub(crate) fn check_write_len(framed_len: usize) -> io::Result<()> {
+    check_record_len(framed_len, MAX_RECORD_LEN as usize)
 }
 
 /// Encode `ops` into `out` the way the engine writes them: a lone
@@ -637,13 +724,6 @@ fn batch_op_payload_len(op: &WriteBatchOp) -> usize {
 
 fn batch_payload_len(entry_payload_len: usize) -> usize {
     1 + 4 + entry_payload_len
-}
-
-fn batch_ops_payload_len(ops: &[WriteBatchOp]) -> usize {
-    4 + ops
-        .iter()
-        .map(|op| batch_payload_len(batch_op_payload_len(op)))
-        .sum::<usize>()
 }
 
 fn encode_batch_header(out: &mut Vec<u8>, record_type: u8, payload_len: usize) {
@@ -1923,6 +2003,71 @@ mod tests {
         let mut out = Vec::new();
         encode_ops_record(&mut out, &single, 9);
         assert_eq!(out.len(), ops_record_len(&single));
+    }
+
+    // -- the record limit ------------------------------------------
+
+    #[test]
+    fn a_record_is_refused_one_byte_past_the_limit_and_accepted_at_it() {
+        fn check(accounted: usize, limit: usize) {
+            assert!(check_record_len(accounted, limit).is_ok());
+            let err = check_record_len(accounted, limit - 1).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+            assert_eq!(
+                err.to_string(),
+                format!(
+                    "write is too large: it would log {limit} bytes and one write can \
+                     log at most {}; split it into smaller writes",
+                    limit - 1
+                )
+            );
+        }
+
+        // A put via `put_record_len`.
+        let mut out = Vec::new();
+        encode_put_record(&mut out, b"key", b"value", 1);
+        check(put_record_len(b"key", b"value"), out.len());
+
+        // A single `Merge` op via `ops_record_len`.
+        let single = vec![WriteBatchOp::Merge {
+            key: b"k".to_vec(),
+            operand: b"v".to_vec(),
+        }];
+        let mut out = Vec::new();
+        encode_ops_record(&mut out, &single, 1);
+        check(ops_record_len(&single), out.len());
+
+        // A four-op batch with one of each kind.
+        let batch = vec![
+            WriteBatchOp::Put {
+                key: b"a".to_vec(),
+                value: b"1".to_vec(),
+            },
+            WriteBatchOp::Delete { key: b"b".to_vec() },
+            WriteBatchOp::DeleteRange {
+                start: b"c".to_vec(),
+                end: b"d".to_vec(),
+            },
+            WriteBatchOp::Merge {
+                key: b"e".to_vec(),
+                operand: b"2".to_vec(),
+            },
+        ];
+        let mut out = Vec::new();
+        encode_ops_record(&mut out, &batch, 1);
+        check(ops_record_len(&batch), out.len());
+
+        assert!(check_write_len(MAX_RECORD_LEN as usize).is_ok());
+        assert!(check_write_len(MAX_RECORD_LEN as usize + 1).is_err());
+    }
+
+    #[test]
+    fn record_len_saturates_instead_of_wrapping() {
+        let mut len = RecordLen::default();
+        len.push(usize::MAX / 2);
+        len.push(usize::MAX / 2);
+        assert_eq!(len.framed(), usize::MAX);
+        assert!(check_record_len(len.framed(), MAX_RECORD_LEN as usize).is_err());
     }
 
     // ── corruption / torn tail ──────────────────────────────────

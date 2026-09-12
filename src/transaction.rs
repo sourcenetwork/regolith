@@ -806,17 +806,20 @@ impl<'db> Transaction<'db> {
     ///
     /// A commit that carries writes passes the same admission as a plain
     /// write with [`crate::WriteOptions::default`], in the same order: key
-    /// and value sizes are validated first, so an oversized commit is
-    /// rejected before it waits, then it blocks while a stop trigger is
+    /// and value sizes are validated first, along with the size of the
+    /// record the commit will log (at most 1 GiB), so an oversized commit
+    /// is rejected before it waits, then it blocks while a stop trigger is
     /// active and pays the slowdown delay while a slowdown trigger is
     /// active, before the conflict check and before any commit lock is
     /// taken. A wait that admits the commit is charged to
     /// [`crate::Ticker::WriteStallMicros`]. A stall the engine cannot
     /// relieve surfaces as [`TransactionError::Io`] carrying the same
     /// reason a plain write reports through [`crate::Error::Busy`]. A
-    /// commit with no buffered writes never waits: it validates its read
-    /// set and returns. A pessimistic transaction keeps its key locks for
-    /// the duration of the wait.
+    /// commit too large to log fails with [`TransactionError::Io`] of kind
+    /// [`std::io::ErrorKind::InvalidInput`] and applies nothing; split it
+    /// into smaller transactions. A commit with no buffered writes never
+    /// waits: it validates its read set and returns. A pessimistic
+    /// transaction keeps its key locks for the duration of the wait.
     pub fn commit(mut self) -> TxResult<()> {
         let result = self.commit_inner();
         self.resolved = true;
@@ -1376,6 +1379,9 @@ impl LockManager {
 
 #[cfg(test)]
 mod validation_set_tests;
+
+#[cfg(test)]
+mod record_limit_tests;
 
 #[cfg(test)]
 mod tests {
