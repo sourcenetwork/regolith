@@ -195,6 +195,27 @@ where
         None
     }
 
+    /// Build the index now if it does not exist yet, regardless of
+    /// [`Self::spill_at`].
+    ///
+    /// For a caller that knows a burst of lookups is about to walk this
+    /// buffer repeatedly and would rather pay one index build than one
+    /// list walk per lookup, even below the entry count that would
+    /// otherwise trigger it. Cheap to call again: past the first time, it
+    /// is a single `OnceLock::get` check.
+    pub(crate) fn ensure_indexed(&self) {
+        if self.spill.get().is_none() {
+            self.start_spilling();
+        }
+    }
+
+    /// Whether the index is built, so a test can tell a lookup that used
+    /// it apart from one that walked the list.
+    #[cfg(test)]
+    pub(crate) fn is_indexed(&self) -> bool {
+        self.spill.get().is_some()
+    }
+
     /// Publish the spill map, then fold in everything already listed.
     ///
     /// Order matters: publishing first means every insert that follows

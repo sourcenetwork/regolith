@@ -103,6 +103,14 @@ impl AnyDb {
             AnyDb::Pessimistic(db) => db.db().put(key, value),
         }
     }
+
+    /// A delete around the transaction API.
+    fn delete_external(&self, key: &[u8]) -> Result<()> {
+        match self {
+            AnyDb::Optimistic(db) => db.db().delete(key),
+            AnyDb::Pessimistic(db) => db.db().delete(key),
+        }
+    }
 }
 
 fn isolation_level(level: u8) -> IsolationLevel {
@@ -219,4 +227,169 @@ fn duplicate_tracked_cells_are_deduped_keeping_the_newest() {
     );
 
     drop(tx);
+}
+
+fn open_any(flavor: u8, dir: &TempDir) -> AnyDb {
+    if flavor == 0 {
+        AnyDb::Optimistic(
+            OptimisticTransactionDb::open(dir.path(), Options::default()).expect("open"),
+        )
+    } else {
+        AnyDb::Pessimistic(
+            TransactionDb::open(dir.path(), Options::default())
+                .expect("open")
+                .with_lock_timeout(Duration::from_secs(10)),
+        )
+    }
+}
+
+/// The keys the stretches of one scan of `[start, end)` cover, worked out
+/// independently of `TxnScanStream`: the snapshot holds exactly the keys in
+/// `seeded`, an entry of the write buffer ends a stretch (and is yielded when
+/// it is a put), a snapshot key already promoted past the begin snapshot ends
+/// a stretch (and is yielded when the engine has it at its read sequence),
+/// every other snapshot key extends the stretch, and the walk stops once
+/// `take` entries were yielded. Called before the scan runs.
+fn expected_cover(
+    tx: &Transaction<'_>,
+    seeded: u8,
+    start: u8,
+    end: u8,
+    reverse: bool,
+    take: usize,
+) -> std::collections::BTreeSet<Vec<u8>> {
+    let mut covered = std::collections::BTreeSet::new();
+    let mut close = |stretch: &mut Option<(u8, u8)>| {
+        if let Some((a, b)) = stretch.take() {
+            for key in a.min(b)..=a.max(b) {
+                covered.insert(prefix_key(DEFAULT_CF_ID, &[key]));
+            }
+        }
+    };
+    let keys: Vec<u8> = if reverse {
+        (start..end).rev().collect()
+    } else {
+        (start..end).collect()
+    };
+    let mut stretch: Option<(u8, u8)> = None;
+    let mut yielded = 0;
+    for key in keys {
+        if yielded == take {
+            break;
+        }
+        let prefixed = prefix_key(DEFAULT_CF_ID, &[key]);
+        if let Some(buffered) = tx.writes.get(&prefixed) {
+            close(&mut stretch);
+            yielded += usize::from(buffered.is_some());
+            continue;
+        }
+        if key >= 6 || seeded & (1 << key) == 0 {
+            continue;
+        }
+        let promoted = matches!(tx.mode, TxMode::Pessimistic { .. })
+            .then(|| tx.tracked.get(&prefixed))
+            .flatten()
+            .map(|state| state.read_seq.load(Ordering::Acquire))
+            .filter(|read_seq| *read_seq > tx.snapshot_seq);
+        if let Some(read_seq) = promoted {
+            close(&mut stretch);
+            let visible = tx.engine.get_at(&prefixed, read_seq).expect("engine read");
+            yielded += usize::from(visible.is_some());
+            continue;
+        }
+        stretch = Some(stretch.map_or((key, key), |(first, _)| (first, key)));
+        yielded += 1;
+    }
+    close(&mut stretch);
+    covered
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig { cases: 256, ..ProptestConfig::default() })]
+
+    /// A transaction that scans validates exactly what a twin that reads
+    /// the same snapshot keys through `get` validates, except that every
+    /// written or validated key inside a stretch the scans walked is a read
+    /// from the begin snapshot. The stretches are worked out by
+    /// [`expected_cover`], not by the code under test.
+    #[test]
+    fn a_scan_validates_like_gets_of_what_it_walked(
+        flavor in 0..2u8,
+        level in 0..3u8,
+        seeded in any::<u8>(),
+        ops in proptest::collection::vec((0u8..10, 0u8..6), 0..28),
+    ) {
+        let (scan_dir, twin_dir) = (TempDir::new().expect("tempdir"), TempDir::new().expect("tempdir"));
+        let (scan_db, twin_db) = (open_any(flavor, &scan_dir), open_any(flavor, &twin_dir));
+        // Committed before the transactions begin, so the snapshot holds
+        // exactly these keys; a write after begin is invisible to a scan.
+        for key in (0u8..6).filter(|key| seeded & (1 << key) != 0) {
+            prop_assert!(scan_db.put_external(&[key], b"s").is_ok());
+            prop_assert!(twin_db.put_external(&[key], b"s").is_ok());
+        }
+        let mut scan_tx = scan_db.begin(isolation_level(level));
+        let mut twin_tx = twin_db.begin(isolation_level(level));
+        let mut covered = std::collections::BTreeSet::new();
+        for (kind, key) in &ops {
+            let key = [*key];
+            for (db, tx) in [(&scan_db, &scan_tx), (&twin_db, &twin_tx)] {
+                match kind {
+                    0 => prop_assert!(tx.get(&key).is_ok()),
+                    1 => prop_assert!(tx.get_for_update(&key).is_ok()),
+                    2 => prop_assert!(tx.put(&key, b"v").is_ok()),
+                    3 => prop_assert!(tx.delete(&key).is_ok()),
+                    4 => prop_assert!(tx.merge(&key, b"op").is_ok()),
+                    5 => prop_assert!(db.put_external(&key, b"v").is_ok()),
+                    6 => prop_assert!(db.delete_external(&key).is_ok()),
+                    _ => {}
+                }
+            }
+            if *kind >= 7 {
+                let end = [key[0] + 4];
+                let reverse = *kind == 8;
+                let take = if *kind == 9 { 1 } else { usize::MAX };
+                covered.extend(expected_cover(&scan_tx, seeded, key[0], end[0], reverse, take));
+                let direction = if reverse { ScanDirection::Reverse } else { ScanDirection::Forward };
+                let mut stream = scan_tx.scan_stream_in(Some(&key), Some(&end), direction);
+                let entries: Vec<Vec<u8>> = stream.by_ref().take(take).map(|(k, _)| k).collect();
+                prop_assert!(stream.status().is_ok());
+                drop(stream);
+                for entry in entries {
+                    if scan_tx.writes.get(&prefix_key(DEFAULT_CF_ID, &entry)).is_none() {
+                        prop_assert!(twin_tx.get(&entry).is_ok());
+                    }
+                }
+            }
+        }
+
+        let settle = |tx: &mut Transaction<'_>| {
+            let mut writes: BTreeMap<Vec<u8>, Option<Vec<u8>>> = BTreeMap::new();
+            for (key, value) in tx.writes.drain() {
+                writes.entry(key).or_insert(value);
+            }
+            let merges = drain(&tx.merges);
+            let tracked = tx.tracked.drain();
+            let mut checks = tx.validation_set(tracked, &writes, &merges);
+            if let Some(runs) = tx.scan_runs.take() {
+                let runs = drain(&runs);
+                scan_range::cover(&mut checks.reads, &runs, &writes, &merges, tx.snapshot_seq);
+            }
+            let written: std::collections::BTreeSet<Vec<u8>> =
+                writes.keys().chain(merges.iter().map(|(key, _)| key)).cloned().collect();
+            (expand(&checks, &writes, &merges), written)
+        };
+        let (scan_set, written) = settle(&mut scan_tx);
+        let (twin_set, _) = settle(&mut twin_tx);
+        let begin_seq = scan_tx.snapshot_seq;
+        let mut want = twin_set.clone();
+        for key in &covered {
+            let read = twin_set.get(key).is_some_and(|(_, read)| *read);
+            if written.contains(key) || read {
+                want.insert(key.clone(), (begin_seq, true));
+            }
+        }
+        prop_assert_eq!(scan_set, want);
+        drop(scan_tx);
+        drop(twin_tx);
+    }
 }
