@@ -337,7 +337,7 @@ tla:
 # The two are separate axes and elle-cli spells both `--model`-ish, which
 # is easy to get wrong: passing an isolation level as --model throws
 # "No matching clause". Hence the explicit --consistency-models here.
-elle model="list-append" level="snapshot-isolation" isolation="repeatable-read":
+elle model="list-append" level="snapshot-isolation" isolation="snapshot-isolation":
     cargo run --release --manifest-path harness/elle/Cargo.toml --bin elle-gen -- \
         --model {{model}} --isolation {{isolation}} \
         --threads 8 --txns 50 --keys 4 \
@@ -348,7 +348,7 @@ elle model="list-append" level="snapshot-isolation" isolation="repeatable-read":
 # The same, with the fault injection the harness supports.
 elle-fault model="list-append" level="snapshot-isolation":
     cargo run --release --manifest-path harness/elle/Cargo.toml --bin elle-gen -- \
-        --model {{model}} --isolation repeatable-read --faults \
+        --model {{model}} --isolation snapshot-isolation --faults \
         --threads 8 --txns 50 --keys 4 \
         --out /tmp/regolith-history-fault.json --dir /tmp/regolith-elle-fault-db
     java -jar harness/elle/elle-cli.jar --model {{model}} --cycle-search-timeout 60000 \
@@ -386,10 +386,10 @@ elle-matrix:
         printf '  %-42s %s (built-in check: %s)\n' "$name [$level]" "$v" "$built_in"
         if [ "$v" != "true" ]; then fail=1; fi
     }
-    # Optimistic transactions are snapshot isolation. That is the level
-    # regolith claims, so a false here is a defect.
-    check optimistic-si       list-append snapshot-isolation --isolation repeatable-read --threads 8 --txns 50 --keys 4 --seed 4
-    check optimistic-rw       rw-register snapshot-isolation --isolation repeatable-read --threads 8 --txns 50 --keys 4 --seed 5
+    # Optimistic transactions at snapshot isolation, checked at snapshot
+    # isolation: a false here is a defect.
+    check optimistic-si       list-append snapshot-isolation --isolation snapshot-isolation --threads 8 --txns 50 --keys 4 --seed 4
+    check optimistic-rw       rw-register snapshot-isolation --isolation snapshot-isolation --threads 8 --txns 50 --keys 4 --seed 5
     # Pessimistic transactions are checked at the level they request.
     check pessimistic-rc      list-append read-committed     --isolation read-committed --threads 8 --txns 50 --keys 4 --seed 2
     check pessimistic-hotkey  list-append read-committed     --isolation read-committed --threads 8 --txns 50 --keys 1 --seed 1
@@ -397,6 +397,12 @@ elle-matrix:
     # Elle offers must hold.
     check serializable        list-append strict-serializable --isolation serializable --threads 8 --txns 60 --keys 4 --seed 11
     check serializable-rw     rw-register strict-serializable --isolation serializable --threads 8 --txns 60 --keys 4 --seed 12
+    # RepeatableRead validates every point read: Adya's PL-2.99, which is
+    # what Elle's repeatable-read model checks. These workloads read through
+    # `get` only, so the same histories also hold the strongest model.
+    check repeatable-read     list-append repeatable-read    --isolation repeatable-read --threads 8 --txns 60 --keys 4 --seed 13
+    check repeatable-read-rw  rw-register repeatable-read    --isolation repeatable-read --threads 8 --txns 60 --keys 4 --seed 14
+    check repeatable-read-ss  list-append strict-serializable --isolation repeatable-read --threads 8 --txns 60 --keys 4 --seed 15
     exit $fail
 
 # ---------- portability ----------

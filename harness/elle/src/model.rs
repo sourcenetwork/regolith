@@ -157,12 +157,14 @@ impl TxDb {
     pub fn open(path: &Path, isolation: Isolation, opts: Options) -> regolith::Result<Self> {
         match isolation {
             Isolation::ReadCommitted => Ok(TxDb::Pessimistic(TransactionDb::open(path, opts)?)),
-            // Both run the optimistic engine; they differ in how much of
-            // the read set the commit validates, which is what separates
-            // snapshot isolation from serializability.
-            Isolation::RepeatableRead => Ok(TxDb::Optimistic(
+            // The optimistic flavour at the regolith level of the same name.
+            Isolation::Snapshot => Ok(TxDb::Optimistic(
                 OptimisticTransactionDb::open(path, opts)?
                     .with_isolation(IsolationLevel::SnapshotIsolation),
+            )),
+            Isolation::RepeatableRead => Ok(TxDb::Optimistic(
+                OptimisticTransactionDb::open(path, opts)?
+                    .with_isolation(IsolationLevel::RepeatableRead),
             )),
             Isolation::Serializable => Ok(TxDb::Optimistic(
                 OptimisticTransactionDb::open(path, opts)?
