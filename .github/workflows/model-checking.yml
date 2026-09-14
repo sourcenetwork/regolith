@@ -46,6 +46,23 @@ jobs:
       - name: Loom models, release and debug
         run: just loom-all
 
+  # TLA+ model of what commit validation covers at each isolation level,
+  # checked against the DefraDB workload `RepeatableRead` exists for. The green
+  # and the red configurations both run: a red one going green would mean
+  # the model stopped telling the levels apart.
+  tla:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - uses: extractions/setup-just@v2
+      - name: RepeatableRead model, every isolation level
+        run: just tla
+
   # The read-view chaos workload at full size. `cargo test` runs a smaller
   # default so the ordinary gate stays fast; this job is what covers
   # the full one.

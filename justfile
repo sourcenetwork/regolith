@@ -295,6 +295,40 @@ chaos instances="4" rounds="2" versions="120" min_rounds="20":
     REGOLITH_CHAOS_VERSIONS={{versions}} REGOLITH_CHAOS_MIN_ROUNDS={{min_rounds}} \
         cargo test --release --test read_view_chaos_workload -- --nocapture
 
+# TLA+ model of what commit validation covers at each isolation level,
+# checked against the DefraDB workload `RepeatableRead` exists for: appends to a
+# Merkle DAG whose head set is derived from keys, the sweep that reclaims
+# it, and a write derived from a definition read. `proofs/tla/RepeatableRead.tla`
+# carries the model; each configuration below runs with the verdict it must
+# produce. A GREEN model that reports an error, or a RED one that does not,
+# fails the recipe: the RED rows are what make the GREEN one mean anything.
+# TLC is fetched on first use, pinned by checksum in `proofs/tla/tools/tlc`.
+tla:
+    #!/usr/bin/env bash
+    set -uo pipefail
+    cd proofs/tla
+    fail=0
+    check() {
+        local cfg="$1" expect="$2" out verdict
+        out=$(./tools/tlc -metadir "states/$cfg" -config "$cfg.cfg" RepeatableRead.tla 2>&1)
+        if grep -q "No error has been found" <<<"$out"; then
+            verdict=GREEN
+        elif grep -qE "^Error: (Invariant|Temporal properties|Deadlock)" <<<"$out"; then
+            verdict=RED
+        else
+            verdict=BROKEN
+            echo "$out" | tail -20
+        fi
+        printf '  %-40s %-6s (expected %s)\n' "$cfg" "$verdict" "$expect"
+        if [ "$verdict" != "$expect" ]; then fail=1; fi
+    }
+    check MC_RepeatableRead_Green                  GREEN
+    check MC_RepeatableRead_Red_Serializable       RED
+    check MC_RepeatableRead_Red_SnapshotIsolation  RED
+    check MC_RepeatableRead_Red_ReadCommitted      RED
+    rm -rf states ./*_TTrace_*.tla ./*_TTrace_*.bin
+    exit $fail
+
 # ---------- consistency ----------
 
 # Elle consistency checking. `model` is the workload (list-append or
