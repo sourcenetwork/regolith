@@ -82,7 +82,11 @@ fn map_isolation(level: IsolationLevel) -> MvccIsolation {
     match level {
         IsolationLevel::ReadCommitted => MvccIsolation::ReadCommitted,
         IsolationLevel::SnapshotIsolation => MvccIsolation::RepeatableRead,
-        IsolationLevel::Serializable => MvccIsolation::Serializable,
+        // kovan-mvcc's RepeatableRead is its snapshot level, and it records
+        // no per-stretch scan, so ours takes the stricter neighbour.
+        IsolationLevel::RepeatableRead | IsolationLevel::Serializable => {
+            MvccIsolation::Serializable
+        }
     }
 }
 

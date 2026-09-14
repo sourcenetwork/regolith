@@ -77,6 +77,7 @@ fn a_scan_below_serializable_holds_no_memory_per_key() {
     for level in [
         IsolationLevel::ReadCommitted,
         IsolationLevel::SnapshotIsolation,
+        IsolationLevel::RepeatableRead,
     ] {
         let txn = db.begin_transaction_with(level);
         LIVE.store(0, Ordering::Relaxed);

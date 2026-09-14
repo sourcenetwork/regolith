@@ -53,10 +53,11 @@ fn is_conflict(r: &regolith::TxResult<()>) -> bool {
     matches!(r, Err(TransactionError::Conflict { .. }))
 }
 
-fn levels() -> [IsolationLevel; 3] {
+fn levels() -> [IsolationLevel; 4] {
     [
         IsolationLevel::ReadCommitted,
         IsolationLevel::SnapshotIsolation,
+        IsolationLevel::RepeatableRead,
         IsolationLevel::Serializable,
     ]
 }
@@ -717,4 +718,154 @@ fn a_stream_left_in_scope_does_not_hold_the_transaction() {
     let mut stream = tx.scan_stream(None, None);
     assert!(stream.next().is_some());
     tx.commit().unwrap();
+}
+
+/// W1: at RepeatableRead a scanned key is not validated. The shape that motivates
+/// the level: a scan yields a superseded entry and the marker against it, a
+/// concurrent reclamation deletes both, and the scanning transaction, which
+/// writes only keys of its own, commits. The same schedule at Serializable
+/// aborts, pinned here so the difference between the two levels is exactly
+/// the one this test names. Both flavours.
+///
+/// Fails under: `validates_scanned_keys` returning true for RepeatableRead (the
+/// RepeatableRead half aborts) or false for Serializable (the Serializable half
+/// commits).
+#[test]
+fn repeatable_read_commits_when_a_scanned_key_is_reclaimed_underneath() {
+    let keys: [&[u8]; 3] = [b"head/current", b"head/old", b"marker/old/current"];
+    for (level, reclaimed_commits) in [
+        (IsolationLevel::RepeatableRead, true),
+        (IsolationLevel::Serializable, false),
+    ] {
+        let dir = TempDir::new().unwrap();
+        let db = opt_db(&dir);
+        seed(db.db(), &keys);
+
+        let append = db.begin_transaction_with(level);
+        let heads = scanned_keys(append.scan_stream(Some(b"head/"), Some(b"head0")));
+        let markers = scanned_keys(append.scan_stream(Some(b"marker/"), Some(b"marker0")));
+        assert_eq!(heads, [b"head/current".to_vec(), b"head/old".to_vec()]);
+        assert_eq!(markers, [b"marker/old/current".to_vec()]);
+
+        let prune = db.begin_transaction_with(level);
+        prune.delete(b"head/old").unwrap();
+        prune.delete(b"marker/old/current").unwrap();
+        prune.commit().unwrap();
+
+        append.put(b"head/new", b"0").unwrap();
+        append.put(b"marker/current/new", b"0").unwrap();
+        let result = append.commit();
+        assert_eq!(
+            result.is_ok(),
+            reclaimed_commits,
+            "{level:?}: optimistic append under a reclamation: {result:?}"
+        );
+    }
+
+    for (level, reclaimed_commits) in [
+        (IsolationLevel::RepeatableRead, true),
+        (IsolationLevel::Serializable, false),
+    ] {
+        let dir = TempDir::new().unwrap();
+        let db = pes_db(&dir);
+        seed(db.db(), &keys);
+
+        let append = db.begin_transaction_with(level);
+        let heads = scanned_keys(append.scan_stream(Some(b"head/"), Some(b"head0")));
+        assert_eq!(heads, [b"head/current".to_vec(), b"head/old".to_vec()]);
+
+        let prune = db.begin_transaction_with(level);
+        prune.delete(b"head/old").unwrap();
+        prune.delete(b"marker/old/current").unwrap();
+        prune.commit().unwrap();
+
+        append.put(b"head/new", b"0").unwrap();
+        let result = append.commit();
+        assert_eq!(
+            result.is_ok(),
+            reclaimed_commits,
+            "{level:?}: pessimistic append under a reclamation: {result:?}"
+        );
+    }
+}
+
+/// W2: RepeatableRead keeps the point-read half of Serializable. A key read
+/// through `get` and overwritten by a concurrent commit aborts the
+/// transaction, exactly as it does one level up.
+///
+/// Fails under: `validates_every_read` returning false for RepeatableRead.
+#[test]
+fn repeatable_read_aborts_when_a_point_read_key_is_overwritten() {
+    let dir = TempDir::new().unwrap();
+    let db = opt_db(&dir);
+    seed(db.db(), &[b"k"]);
+
+    let a = db.begin_transaction_with(IsolationLevel::RepeatableRead);
+    assert_eq!(a.get(b"k").unwrap(), Some(b"0".to_vec()));
+    db.db().put(b"k", b"1").unwrap();
+    a.put(b"other", b"1").unwrap();
+
+    match a.commit() {
+        Err(TransactionError::Conflict { key, .. }) => assert_eq!(key, b"k".to_vec()),
+        other => panic!("expected a conflict on k, got {other:?}"),
+    }
+}
+
+/// W3: what RepeatableRead gives up, stated so it cannot be mistaken for
+/// Serializable. Two transactions that each scan the key the other writes
+/// both commit: the write skew a per-key scan record refuses one level up.
+///
+/// Fails under: `validates_scanned_keys` returning true for RepeatableRead.
+#[test]
+fn repeatable_read_admits_write_skew_through_scans() {
+    for (level, both_commit) in [
+        (IsolationLevel::RepeatableRead, true),
+        (IsolationLevel::Serializable, false),
+    ] {
+        let dir = TempDir::new().unwrap();
+        let db = opt_db(&dir);
+        seed(db.db(), &[b"x", b"y"]);
+
+        let a = db.begin_transaction_with(level);
+        let b = db.begin_transaction_with(level);
+        assert_eq!(
+            scanned_keys(a.scan_stream(Some(b"y"), Some(b"y0"))),
+            [b"y".to_vec()]
+        );
+        assert_eq!(
+            scanned_keys(b.scan_stream(Some(b"x"), Some(b"x0"))),
+            [b"x".to_vec()]
+        );
+        a.put(b"x", b"a").unwrap();
+        b.put(b"y", b"b").unwrap();
+        a.commit().unwrap();
+        assert_eq!(
+            b.commit().is_ok(),
+            both_commit,
+            "{level:?}: the second of two scan-then-write-the-other transactions"
+        );
+    }
+}
+
+/// W4: a scan at RepeatableRead records exactly what a scan at SnapshotIsolation
+/// records. The anchor survives: a key inside the walked stretch that the
+/// transaction then writes is validated from the begin snapshot and a key
+/// outside it is not, so a bound the walk stopped on is free to change.
+///
+/// Fails under: RepeatableRead taking the Serializable branch in `yield_cursor`
+/// (the bound key `k` is then recorded and the commit aborts).
+#[test]
+fn repeatable_read_ignores_keys_outside_the_scanned_range() {
+    let dir = TempDir::new().unwrap();
+    let db = opt_db(&dir);
+    seed(db.db(), &[b"a", b"k", b"z"]);
+
+    let a = db.begin_transaction_with(IsolationLevel::RepeatableRead);
+    let seen = scanned_keys(a.scan_stream(Some(b"a"), Some(b"k")));
+    assert_eq!(seen, [b"a".to_vec()]);
+
+    db.db().put(b"k", b"1").unwrap();
+    a.put(b"other", b"1").unwrap();
+    a.commit()
+        .expect("k was never yielded, so nothing about it is validated");
 }

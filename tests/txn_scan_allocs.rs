@@ -81,6 +81,7 @@ fn a_transaction_scan_stops_early_without_reading_the_range() {
     }
     for level in [
         IsolationLevel::SnapshotIsolation,
+        IsolationLevel::RepeatableRead,
         IsolationLevel::Serializable,
     ] {
         let txn = db.begin_transaction_owned(level);

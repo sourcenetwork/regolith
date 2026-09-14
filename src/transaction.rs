@@ -61,14 +61,16 @@
 //! discard what the transaction has already read, so a read anchor
 //! survives the rollback and still guards the commit.
 //!
-//! Below [`IsolationLevel::Serializable`] a plain read ([`Transaction::get`],
+//! Below [`IsolationLevel::RepeatableRead`] a plain read ([`Transaction::get`],
 //! [`Transaction::get_slice`] or a transactional scan) of a key the
 //! transaction never writes is not validated; at
 //! [`IsolationLevel::SnapshotIsolation`] a [`Transaction::get_for_update`]
-//! key is validated even when it is not written. At `Serializable` every key
-//! read by any of them is validated. At every level, a key a transactional
-//! scan walked that the transaction then writes is validated as a read from
-//! the begin snapshot, so a scan-then-write is never taken for a blind write.
+//! key is validated even when it is not written. At `RepeatableRead` every key a
+//! point read returned is validated and a scanned key still is not; at
+//! `Serializable` every key read by any of them is. At every level, a key a
+//! transactional scan walked that the transaction then writes is validated
+//! as a read from the begin snapshot, so a scan-then-write is never taken
+//! for a blind write.
 //!
 //! # Out of scope (follow-ups)
 //!
@@ -375,11 +377,28 @@ pub enum ScanDirection {
 /// |---|---|---|---|---|
 /// | [`IsolationLevel::ReadCommitted`] | no | possible | possible | possible |
 /// | [`IsolationLevel::SnapshotIsolation`] | no | no | no | **possible** |
+/// | [`IsolationLevel::RepeatableRead`] | no | no | no | **through a scan** |
 /// | [`IsolationLevel::Serializable`] | no | no | no | no |
 ///
 /// Every level reads from a snapshot captured when the transaction
 /// began, so none of them can observe a dirty read. What changes is the
 /// size of the read set validated at commit.
+///
+/// # Where RepeatableRead sits
+///
+/// [`IsolationLevel::RepeatableRead`] validates every key a point read
+/// returned, as `Serializable` does, and records a scan as
+/// `SnapshotIsolation` does: one entry per stretch it walked, none per key
+/// it yielded. A point read therefore refuses write skew and a scan does
+/// not: two transactions that each scan what the other writes both commit.
+/// In Adya's terms it is PL-2.99, the formal repeatable read, on top of
+/// PL-SI: G1, G-SI and G2-item are forbidden, and an anti-dependency
+/// through a predicate read (a key a scan yielded, or a phantom) is
+/// allowed. It is the level for a scan whose result is allowed to change
+/// underneath the transaction by construction, a set of markers that
+/// concurrent writers only ever add to or reclaim, where an entry per key
+/// would cost commit time and abort transactions no serial order needed
+/// to abort.
 ///
 /// # Why write skew survives snapshot isolation
 ///
@@ -425,9 +444,24 @@ pub enum IsolationLevel {
     /// [`Transaction::get_for_update`]. regolith's default.
     #[default]
     SnapshotIsolation,
+    /// Validate every key a point read returned; record a scan per
+    /// stretch, not per key. Adya's PL-2.99 over snapshot isolation.
+    RepeatableRead,
     /// Validate the entire read set, including every key a transactional
     /// scan yields.
     Serializable,
+}
+
+impl IsolationLevel {
+    /// Whether every point read is validated at commit, written or not.
+    pub(crate) fn validates_every_read(self) -> bool {
+        matches!(self, Self::RepeatableRead | Self::Serializable)
+    }
+
+    /// Whether a transactional scan records each key it yields as a read.
+    pub(crate) fn validates_scanned_keys(self) -> bool {
+        self == Self::Serializable
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -594,7 +628,7 @@ impl<'db> Transaction<'db> {
     /// key later turns it into a read-modify-write that is validated
     /// at commit and aborts with [`TransactionError::Conflict`]
     /// rather than losing the update. Below
-    /// [`IsolationLevel::Serializable`], a key that is read and
+    /// [`IsolationLevel::RepeatableRead`], a key that is read and
     /// never written is not validated: use
     /// [`Transaction::get_for_update`] when a read must participate
     /// in conflict detection on its own.
@@ -984,6 +1018,8 @@ impl<'db> Transaction<'db> {
     ///   `get_for_update`, which is what stops a lost update. A plain
     ///   read is still unvalidated, which is what leaves write skew
     ///   reachable.
+    /// * [`IsolationLevel::RepeatableRead`] adds every point read, so an
+    ///   anti-dependency edge can only form through a scan.
     /// * [`IsolationLevel::Serializable`] adds every remaining read, so
     ///   no anti-dependency edge can form unseen.
     ///
@@ -1003,7 +1039,7 @@ impl<'db> Transaction<'db> {
         merges: &[(Vec<u8>, Vec<u8>)],
     ) -> ValidationSet {
         let optimistic = matches!(self.mode, TxMode::Optimistic);
-        let serializable = self.isolation == IsolationLevel::Serializable;
+        let every_read = self.isolation.validates_every_read();
         let read_committed = self.isolation == IsolationLevel::ReadCommitted;
         // The drain yields the newest node first and a stable sort keeps that
         // within a key, so dedup keeps the cell every reader of the key used
@@ -1015,7 +1051,7 @@ impl<'db> Transaction<'db> {
             .filter(|(key, state)| {
                 let written =
                     writes.contains_key(key) || merges.iter().any(|(merged, _)| merged == key);
-                if serializable {
+                if every_read {
                     // Every read, whether or not the transaction wrote it.
                     true
                 } else if read_committed {
@@ -1366,7 +1402,7 @@ impl TxnScanStream<'_> {
                 self.run = Some(open);
             }
         }
-        if txn.isolation == IsolationLevel::Serializable {
+        if txn.isolation.validates_scanned_keys() {
             txn.observe(&self.probe, txn.snapshot_seq, false);
         }
         ControlFlow::Break(Some((key, value)))

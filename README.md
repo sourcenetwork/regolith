@@ -146,10 +146,16 @@ txn.commit()?;
 |---|---|---|---|
 | `ReadCommitted` | prevented | possible | possible |
 | `SnapshotIsolation` (default) | prevented | prevented | possible |
+| `RepeatableRead` | prevented | prevented | through a scan |
 | `Serializable` | prevented | prevented | prevented |
 
 At `Serializable`, every key a transaction reads through `get` or a transactional scan is
-validated. Below it, a written key is validated only in the optimistic flavour; the
+validated. At `RepeatableRead`, every key a `get` returned is validated and a scanned key is
+not: Adya's PL-2.99 over snapshot isolation, with G1, G-SI and G2-item forbidden and an
+anti-dependency through a scan allowed. It is the level for a scan over a set that
+concurrent writers are allowed to change underneath the transaction, and it pays no commit
+work per scanned key. Below `RepeatableRead`, a plain `get` is not validated either. A
+written key is validated only in the optimistic flavour; the
 pessimistic flavour never validates a written key at commit, since the key lock already
 orders it. A `get_for_update` key is validated in both flavours from `SnapshotIsolation`
 up. At every level a key a transactional scan walked that the transaction then writes is
