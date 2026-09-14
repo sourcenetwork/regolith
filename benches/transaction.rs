@@ -81,11 +81,13 @@ impl Flavor {
 /// the anomalies it refuses. Sweeping it is what makes that trade
 /// visible as a number rather than an assertion: `ReadCommitted`
 /// validates only what was written, `SnapshotIsolation` adds the keys
-/// read for update, and `Serializable` adds the whole read set and so
-/// pays for the anti-dependency check that refuses write skew.
-const LEVELS: [(IsolationLevel, &str); 3] = [
+/// read for update, `RepeatableRead` adds every point read, and `Serializable`
+/// adds the whole read set and so pays for the anti-dependency check that
+/// refuses write skew.
+const LEVELS: [(IsolationLevel, &str); 4] = [
     (IsolationLevel::ReadCommitted, "read-committed"),
     (IsolationLevel::SnapshotIsolation, "snapshot"),
+    (IsolationLevel::RepeatableRead, "repeatable-read"),
     (IsolationLevel::Serializable, "serializable"),
 ];
 
