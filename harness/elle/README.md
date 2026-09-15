@@ -98,25 +98,24 @@ directly rather than only through a dependency cycle.
 
 ## Isolation levels
 
-`--isolation read-committed|repeatable-read|serializable` selects the
-level to exercise. regolith today exposes snapshot isolation only, through
-two transaction flavors, so not every level is reachable:
+`--isolation read-committed|snapshot-isolation|repeatable-read|serializable`
+selects the level to exercise. Each is an engine level of its own, checked
+against the Elle model it claims:
 
-| Requested | Runs against | Reachable today? |
+| Requested | Runs against | Checked against |
 | --- | --- | --- |
-| `read-committed` | `TransactionDb` (pessimistic locks) | Yes, as a sound over-approximation. Snapshot isolation is strictly stronger than read-committed, so every anomaly the checker reports at `--consistency-models read-committed` is a genuine violation. |
-| `repeatable-read` | `OptimisticTransactionDb` | No. Snapshot isolation is incomparable with repeatable-read: it permits write skew (`G2-item`), which repeatable-read forbids. A `G2-item` verdict here is legal behavior, not a regolith bug. |
-| `serializable` | `OptimisticTransactionDb` | No. Snapshot isolation is strictly weaker than serializable, for the same reason. |
+| `read-committed` | `TransactionDb` (pessimistic locks) | `read-committed`. The pessimistic flavour reads from a snapshot, which is strictly stronger, so every anomaly reported here is a genuine violation. |
+| `snapshot-isolation` | `OptimisticTransactionDb` at `SnapshotIsolation` | `snapshot-isolation`. Write skew (`G2-item`) is legal here. |
+| `repeatable-read` | `OptimisticTransactionDb` at `RepeatableRead` | `repeatable-read`, Adya's PL-2.99: every point read is validated, so a `G2-item` verdict is a defect. A scan is recorded per stretch, so a predicate anomaly would be legal; the workloads here have no predicate reads. |
+| `serializable` | `OptimisticTransactionDb` at `Serializable` | `strict-serializable`. |
 
-The two unreachable levels still run, so the flag is exercisable and
-will keep working once the engine grows the levels, but the generator
-prints an unmissable warning naming the gap. To get a verdict that means
-something about regolith today, check the optimistic history against the
-level regolith actually claims:
+A history can be checked against any model elle-cli offers, whatever level
+generated it; a weaker model than the one claimed is a sound check, a
+stronger one reports anomalies the level permits:
 
 ```sh
 java -jar elle-cli.jar --model list-append \
-  --consistency-models snapshot-isolation history.json
+  --consistency-models repeatable-read history.json
 ```
 
 ## Fault injection
@@ -166,10 +165,13 @@ claims is green:
 
 | Workload | Engine | Checked against | Verdict |
 | --- | --- | --- | --- |
-| `list-append`, `--isolation repeatable-read` | `OptimisticTransactionDb` | `snapshot-isolation` | `true` |
-| `rw-register`, `--isolation repeatable-read` | `OptimisticTransactionDb` | `snapshot-isolation` | `true` |
+| `list-append`, `--isolation snapshot-isolation` | `OptimisticTransactionDb` | `snapshot-isolation` | `true` |
+| `rw-register`, `--isolation snapshot-isolation` | `OptimisticTransactionDb` | `snapshot-isolation` | `true` |
 | `list-append`, `--isolation read-committed` | `TransactionDb` | `read-committed` | `true` |
 | `list-append`, `--keys 1` (one hot key) | `TransactionDb` | `read-committed` | `true` |
+
+The `repeatable-read` and `serializable` rows of `just elle-matrix` are not
+recorded here; CI runs them on every push.
 
 The last two rows were `false` when PR 1 landed: `get_for_update` took
 the key lock and then read at the sequence the transaction began with,
@@ -203,7 +205,7 @@ dependency graph has no cycles, so it checks out while proving nothing.
 
 ```text
 --model <list-append|rw-register>   Workload model (default: list-append)
---isolation <read-committed|repeatable-read|serializable>
+--isolation <read-committed|snapshot-isolation|repeatable-read|serializable>
 --faults <kill,torn-write,truncate-wal|all>
 --dir <path>                        Database directory (default: db)
 --out <path>                        History output (default: history.json)

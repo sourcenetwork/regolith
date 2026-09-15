@@ -146,10 +146,16 @@ txn.commit()?;
 |---|---|---|---|
 | `ReadCommitted` | prevented | possible | possible |
 | `SnapshotIsolation` (default) | prevented | prevented | possible |
+| `RepeatableRead` | prevented | prevented | through a scan |
 | `Serializable` | prevented | prevented | prevented |
 
 At `Serializable`, every key a transaction reads through `get` or a transactional scan is
-validated. Below it, a written key is validated only in the optimistic flavour; the
+validated. At `RepeatableRead`, every key a `get` returned is validated and a scanned key is
+not: Adya's PL-2.99 over snapshot isolation, with G1, G-SI and G2-item forbidden and an
+anti-dependency through a scan allowed. It is the level for a scan over a set that
+concurrent writers are allowed to change underneath the transaction, and it pays no commit
+work per scanned key. Below `RepeatableRead`, a plain `get` is not validated either. A
+written key is validated only in the optimistic flavour; the
 pessimistic flavour never validates a written key at commit, since the key lock already
 orders it. A `get_for_update` key is validated in both flavours from `SnapshotIsolation`
 up. At every level a key a transactional scan walked that the transaction then writes is
@@ -281,6 +287,7 @@ The suite is the argument for trusting any of the above.
 just gate       # format, lint, docs, tests, dependency audit
 just test       # the whole suite under cargo-nextest
 just loom-all   # exhaustive model checking of the publication protocols
+just tla        # TLA+ model of commit validation per isolation level
 just elle       # Elle consistency checking of transaction histories
 just chaos      # the full-size read-view chaos workload
 just wasm       # the wasm32-wasip1 lifecycle under wasmtime

@@ -10,7 +10,7 @@ resolver = "2"
 
 [package]
 name = "regolith"
-version = "0.1.6"
+version = "0.1.7"
 edition = "2024"
 authors = [
     "Ivan Vercenco <ivan@source.network>",
@@ -162,6 +162,10 @@ harness = false
 
 [[bench]]
 name = "transaction"
+harness = false
+
+[[bench]]
+name = "scan_commit"
 harness = false
 
 [[bench]]

@@ -51,6 +51,11 @@ impl ValueSource {
     }
 }
 
+/// Every variant is a point operation. The `repeatable-read` rows of
+/// `just elle-matrix` rest on that: the level validates point reads and
+/// not scans, so a range read added here would need rows of its own,
+/// and Elle's list-append and rw-register models have no range operation
+/// to record one with.
 #[derive(Clone, Debug)]
 pub enum PlannedMop {
     Append { key: i64, val: i64 },
@@ -157,12 +162,14 @@ impl TxDb {
     pub fn open(path: &Path, isolation: Isolation, opts: Options) -> regolith::Result<Self> {
         match isolation {
             Isolation::ReadCommitted => Ok(TxDb::Pessimistic(TransactionDb::open(path, opts)?)),
-            // Both run the optimistic engine; they differ in how much of
-            // the read set the commit validates, which is what separates
-            // snapshot isolation from serializability.
-            Isolation::RepeatableRead => Ok(TxDb::Optimistic(
+            // The optimistic flavour at the regolith level of the same name.
+            Isolation::Snapshot => Ok(TxDb::Optimistic(
                 OptimisticTransactionDb::open(path, opts)?
                     .with_isolation(IsolationLevel::SnapshotIsolation),
+            )),
+            Isolation::RepeatableRead => Ok(TxDb::Optimistic(
+                OptimisticTransactionDb::open(path, opts)?
+                    .with_isolation(IsolationLevel::RepeatableRead),
             )),
             Isolation::Serializable => Ok(TxDb::Optimistic(
                 OptimisticTransactionDb::open(path, opts)?

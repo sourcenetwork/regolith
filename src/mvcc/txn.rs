@@ -7,7 +7,11 @@
 //! adapter below is complete and tested; flipping those two entry
 //! points over is the remaining step, and the `allow` under this
 //! comment goes with it, so a genuinely unused item is still caught
-//! once the module is reachable.
+//! once the module is reachable. One difference to close before the
+//! flip: [`IsolationLevel::RepeatableRead`] maps to kovan-mvcc's
+//! Serializable here, so a scanned key is validated per key on this
+//! path, where the native transaction records the stretch and lets a
+//! concurrent reclamation of a scanned key commit.
 //!
 //! Everything about isolation, conflict detection, timestamps and the
 //! two-phase commit belongs to kovan-mvcc. Nothing here reimplements
@@ -82,7 +86,11 @@ fn map_isolation(level: IsolationLevel) -> MvccIsolation {
     match level {
         IsolationLevel::ReadCommitted => MvccIsolation::ReadCommitted,
         IsolationLevel::SnapshotIsolation => MvccIsolation::RepeatableRead,
-        IsolationLevel::Serializable => MvccIsolation::Serializable,
+        // kovan-mvcc's RepeatableRead is its snapshot level, and it records
+        // no per-stretch scan, so ours takes the stricter neighbour.
+        IsolationLevel::RepeatableRead | IsolationLevel::Serializable => {
+            MvccIsolation::Serializable
+        }
     }
 }
 

@@ -41,10 +41,11 @@ fn db(dir: &std::path::Path) -> OptimisticTransactionDb {
     OptimisticTransactionDb::open(dir, Options::default()).unwrap()
 }
 
-fn levels() -> [IsolationLevel; 3] {
+fn levels() -> [IsolationLevel; 4] {
     [
         IsolationLevel::ReadCommitted,
         IsolationLevel::SnapshotIsolation,
+        IsolationLevel::RepeatableRead,
         IsolationLevel::Serializable,
     ]
 }

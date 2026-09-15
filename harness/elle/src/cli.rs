@@ -17,21 +17,15 @@ impl Model {
     }
 }
 
-/// Requested isolation level.
+/// Requested isolation level, each an engine level of its own.
 ///
-/// regolith exposes snapshot isolation only, through two transaction
-/// flavors, so not every level is soundly reachable today. Snapshot
-/// isolation is strictly stronger than read-committed, so checking a
-/// snapshot-isolated history against read-committed is a sound
-/// over-approximation: every anomaly reported is a genuine violation.
-/// It is incomparable with repeatable-read (snapshot isolation permits
-/// write skew, which repeatable-read forbids) and strictly weaker than
-/// serializable, so for those two the harness runs the closest engine
-/// mode and warns that the verdict cannot be read as a regolith bug.
-/// README.md carries the full reachability table.
+/// `read-committed` runs the pessimistic flavour; the other three run the
+/// optimistic flavour at the regolith level of the same name. Each is
+/// checked against the Elle model it claims; README.md carries the table.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Isolation {
     ReadCommitted,
+    Snapshot,
     RepeatableRead,
     Serializable,
 }
@@ -40,6 +34,7 @@ impl Isolation {
     pub fn as_str(self) -> &'static str {
         match self {
             Isolation::ReadCommitted => "read-committed",
+            Isolation::Snapshot => "snapshot-isolation",
             Isolation::RepeatableRead => "repeatable-read",
             Isolation::Serializable => "serializable",
         }
@@ -111,7 +106,7 @@ Usage: elle-gen [options]
 
 Options:
   --model <list-append|rw-register>   Workload model (default: list-append)
-  --isolation <read-committed|repeatable-read|serializable>
+  --isolation <read-committed|snapshot-isolation|repeatable-read|serializable>
                                       Requested isolation (default: read-committed)
   --faults <kill,torn-write,truncate-wal|all>
                                       Fault injection (default: none)
@@ -144,6 +139,7 @@ pub fn parse<I: Iterator<Item = String>>(mut args: I) -> Result<Config, String> 
             "--isolation" => {
                 cfg.isolation = match value()?.as_str() {
                     "read-committed" => Isolation::ReadCommitted,
+                    "snapshot-isolation" => Isolation::Snapshot,
                     "repeatable-read" => Isolation::RepeatableRead,
                     "serializable" => Isolation::Serializable,
                     other => return Err(format!("unknown isolation level {}", other)),

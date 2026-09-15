@@ -4,8 +4,8 @@
 //! Regolith: ACID, performance oriented, embedded key-value database engine for edge systems.
 //!
 //! Regolith provides a fast, embedded key-value store with:
-//! - **Read committed, snapshot isolation, or serializable** per
-//!   transaction, via MVCC sequence numbers
+//! - **Read committed, snapshot isolation, repeatable read, or serializable**
+//!   per transaction, via MVCC sequence numbers
 //! - **Lock-free transactions** whose reads and writes take `&self`, so
 //!   one transaction can be shared across threads without a lock
 //! - **Crash recovery** via write-ahead logging (WAL)

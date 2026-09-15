@@ -93,6 +93,18 @@ fn serializable_excludes_write_skew() {
     );
 }
 
+/// RepeatableRead keeps the point-read half of Serializable. The schedule reads
+/// through `get`, so it must be refused there exactly as it is above.
+#[test]
+fn repeatable_read_excludes_the_write_skew_of_point_reads() {
+    let skews = write_skew_pairs(IsolationLevel::RepeatableRead, 40);
+    assert_eq!(
+        skews, 0,
+        "{skews} write-skew pair(s) committed under RepeatableRead; a point read is validated \
+         there and should have aborted the second of each pair"
+    );
+}
+
 /// The calibration: the same schedule under snapshot isolation must be
 /// able to produce the anomaly.
 ///
