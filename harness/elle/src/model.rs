@@ -51,6 +51,11 @@ impl ValueSource {
     }
 }
 
+/// Every variant is a point operation. The `repeatable-read` rows of
+/// `just elle-matrix` rest on that: the level validates point reads and
+/// not scans, so a range read added here would need rows of its own,
+/// and Elle's list-append and rw-register models have no range operation
+/// to record one with.
 #[derive(Clone, Debug)]
 pub enum PlannedMop {
     Append { key: i64, val: i64 },

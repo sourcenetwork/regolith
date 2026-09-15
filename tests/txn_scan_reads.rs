@@ -791,7 +791,9 @@ fn repeatable_read_commits_when_a_scanned_key_is_reclaimed_underneath() {
 
 /// W2: RepeatableRead keeps the point-read half of Serializable. A key read
 /// through `get` and overwritten by a concurrent commit aborts the
-/// transaction, exactly as it does one level up.
+/// transaction, exactly as it does one level up. Both flavours: a
+/// pessimistic `get` takes no lock, so the writer commits through the lock
+/// manager and only the commit-time check can refuse the reader.
 ///
 /// Fails under: `validates_every_read` returning false for RepeatableRead.
 #[test]
@@ -808,6 +810,22 @@ fn repeatable_read_aborts_when_a_point_read_key_is_overwritten() {
     match a.commit() {
         Err(TransactionError::Conflict { key, .. }) => assert_eq!(key, b"k".to_vec()),
         other => panic!("expected a conflict on k, got {other:?}"),
+    }
+
+    let dir = TempDir::new().unwrap();
+    let db = pes_db(&dir);
+    seed(db.db(), &[b"k"]);
+
+    let a = db.begin_transaction_with(IsolationLevel::RepeatableRead);
+    assert_eq!(a.get(b"k").unwrap(), Some(b"0".to_vec()));
+    let writer = db.begin_transaction_with(IsolationLevel::RepeatableRead);
+    writer.put(b"k", b"1").unwrap();
+    writer.commit().unwrap();
+    a.put(b"other", b"1").unwrap();
+
+    match a.commit() {
+        Err(TransactionError::Conflict { key, .. }) => assert_eq!(key, b"k".to_vec()),
+        other => panic!("pessimistic: expected a conflict on k, got {other:?}"),
     }
 }
 
