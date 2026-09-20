@@ -78,6 +78,9 @@ use crate::DbSlice;
 use crate::env::{BufferedWriter, Env, ReadFile, WriteMode};
 use crate::options::{CompressionType, PrefixExtractor};
 
+#[cfg(test)]
+mod size_limit_tests;
+
 /// SSTable magic number: "REGOSST\x05" - flat index, 72-byte footer,
 /// metadata regions checksummed. Written by regolith today.
 const MAGIC_V5: u64 = 0x5245474F_53535405;
@@ -438,7 +441,7 @@ pub(crate) enum Materialize {
     /// Hand back the value as a [`DbSlice`] over its owner.
     Value,
     /// Hand back the value's length and nothing else.
-    LengthOnly,
+    LengthOnly(Option<usize>),
 }
 
 /// What a point lookup across every source produced.
@@ -460,7 +463,7 @@ impl PointValue {
     pub(crate) fn of(value: DbSlice, materialize: Materialize) -> Self {
         match materialize {
             Materialize::Value => Self::Value(value),
-            Materialize::LengthOnly => Self::Length(value.len()),
+            Materialize::LengthOnly(_) => Self::Length(value.len()),
         }
     }
 
@@ -611,6 +614,34 @@ fn write_meta_region(
     let size = (payload.len() + trailer.len()) as u64;
     *offset += size;
     Ok(size)
+}
+
+fn check_data_block_limit(frame: u64, decoded: u64, limit: Option<usize>) -> io::Result<()> {
+    if let Some(max_data_block_bytes) = limit
+        && frame
+            .checked_add(decoded)
+            .is_none_or(|n| n > max_data_block_bytes as u64)
+    {
+        return Err(crate::Error::DataBlockLimitExceeded {
+            max_data_block_bytes,
+        }
+        .into_io_error());
+    }
+    Ok(())
+}
+
+fn check_data_block_header(frame: u64, header: &[u8], limit: Option<usize>) -> io::Result<()> {
+    let decoded = match header[0] {
+        COMPRESSION_NONE => frame - 5,
+        COMPRESSION_LZ4 | COMPRESSION_SNAPPY => {
+            if frame < 9 || header.len() < 5 {
+                return Err(invalid_data("compressed block header too short"));
+            }
+            u32::from_le_bytes(header[1..5].try_into().unwrap()) as u64
+        }
+        _ => return Err(invalid_data("unknown compression type")),
+    };
+    check_data_block_limit(frame, decoded, limit)
 }
 
 fn read_file_region(
@@ -1624,7 +1655,7 @@ impl SsTableReader {
         key_buf: &mut Vec<u8>,
         cache: &BlockCache,
     ) -> io::Result<LookupResult<DbSlice>> {
-        Ok(match self.probe(lk, key_buf, cache)? {
+        Ok(match self.probe(lk, key_buf, cache, None)? {
             None => LookupResult::NotInTable,
             Some((_, BlockHit::Tombstone { seq })) => LookupResult::FoundTombstone { seq },
             Some((
@@ -1653,8 +1684,9 @@ impl SsTableReader {
         lk: &LookupKey,
         key_buf: &mut Vec<u8>,
         cache: &BlockCache,
+        limit: Option<usize>,
     ) -> io::Result<LookupResult<usize>> {
-        Ok(match self.probe(lk, key_buf, cache)? {
+        Ok(match self.probe(lk, key_buf, cache, limit)? {
             None => LookupResult::NotInTable,
             Some((_, BlockHit::Tombstone { seq })) => LookupResult::FoundTombstone { seq },
             Some((_, BlockHit::Value { seq, value_len, .. })) => LookupResult::Found {
@@ -1678,6 +1710,7 @@ impl SsTableReader {
         lk: &LookupKey,
         key_buf: &mut Vec<u8>,
         cache: &BlockCache,
+        limit: Option<usize>,
     ) -> io::Result<Option<(Arc<Block>, BlockHit)>> {
         let user_key = lk.prefixed_user_key();
         if !self.filter(cache)?.may_contain(user_key) {
@@ -1690,7 +1723,7 @@ impl SsTableReader {
             return Ok(None);
         };
 
-        let block = self.read_block(handle, cache)?;
+        let block = self.read_block_with_limit(handle, cache, limit)?;
         // The scan borrows the block, so it reports where the winning
         // value sits rather than copying it out.
         // A `Break(None)` means the scan walked past the requested user
@@ -1857,12 +1890,36 @@ impl SsTableReader {
         handle: BlockHandle,
         cache: &BlockCache,
     ) -> io::Result<Arc<Block>> {
+        self.read_block_with_limit(handle, cache, None)
+    }
+
+    fn read_block_with_limit(
+        &self,
+        handle: BlockHandle,
+        cache: &BlockCache,
+        limit: Option<usize>,
+    ) -> io::Result<Arc<Block>> {
         if let Some(block) = cache.get(self.file_id, handle.offset) {
+            check_data_block_limit(handle.size, block.decoded_buffer_capacity() as u64, limit)?;
             return Ok(block);
         }
 
         if handle.size < 5 {
             return Err(invalid_data("block frame too short"));
+        }
+        if limit.is_some() {
+            validate_file_region(handle.offset, handle.size, self.data_end, "data block")?;
+            // Only the codec and decoded-length prefix are needed before allocating the frame.
+            let mut header = [0u8; 5];
+            self.file.read_exact_at(handle.offset, &mut header[..1])?;
+            if matches!(header[0], COMPRESSION_LZ4 | COMPRESSION_SNAPPY) {
+                if handle.size < 9 {
+                    return Err(invalid_data("compressed block header too short"));
+                }
+                self.file
+                    .read_exact_at(handle.offset + 1, &mut header[1..])?;
+            }
+            check_data_block_header(handle.size, &header, limit)?;
         }
         let block_data = read_file_region(
             &*self.file,
@@ -1871,7 +1928,7 @@ impl SsTableReader {
             self.data_end,
             "data block",
         )?;
-        self.decode_block_frame(handle, &block_data, cache)
+        self.decode_block_frame_with_limit(handle, &block_data, cache, limit)
     }
 
     /// Read a contiguous span of the data area, clamped to what the file
@@ -1898,6 +1955,16 @@ impl SsTableReader {
         block_data: &[u8],
         cache: &BlockCache,
     ) -> io::Result<Arc<Block>> {
+        self.decode_block_frame_with_limit(handle, block_data, cache, None)
+    }
+
+    fn decode_block_frame_with_limit(
+        &self,
+        handle: BlockHandle,
+        block_data: &[u8],
+        cache: &BlockCache,
+        limit: Option<usize>,
+    ) -> io::Result<Arc<Block>> {
         if block_data.len() < 5 {
             return Err(invalid_data("block frame too short"));
         }
@@ -1917,6 +1984,10 @@ impl SsTableReader {
             ));
         }
 
+        // Recheck the actual frame: the file may have changed since the header preflight.
+        if limit.is_some() {
+            check_data_block_header(block_data.len() as u64, block_data, limit)?;
+        }
         let raw_data = match compression_type {
             COMPRESSION_NONE => compressed_data.to_vec(),
             COMPRESSION_LZ4 => lz4_flex::decompress_size_prepended(compressed_data)
@@ -2046,7 +2117,7 @@ mod tests {
     ) -> io::Result<LookupResult<usize>> {
         let lk = LookupKey::from_prefixed(key, snapshot_seq);
         let mut key_buf = Vec::new();
-        reader.get_size(&lk, &mut key_buf, cache)
+        reader.get_size(&lk, &mut key_buf, cache, None)
     }
     use crate::engine::internal_key::{VALUE_TYPE_VALUE, encode_internal_key};
     use tempfile::TempDir;

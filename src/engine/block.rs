@@ -33,6 +33,11 @@ pub(crate) struct Block {
 }
 
 impl Block {
+    pub(crate) fn decoded_buffer_capacity(&self) -> usize {
+        // LZ4 can decode fewer bytes than its declared buffer length.
+        self.data.capacity()
+    }
+
     /// Decode a block whose entry keys are opaque bytes.
     ///
     /// Only unit tests build blocks this way. Every production path

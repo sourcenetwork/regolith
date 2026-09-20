@@ -521,9 +521,9 @@ impl Db {
     ///
     /// Reads the same sources [`Db::get`] does and pays the same block
     /// reads: a bloom filter is probabilistic, so ruling a key *in*
-    /// still requires consulting the data block. What it skips is the
-    /// copy, so no value bytes are ever materialized and nothing is
-    /// pinned after it returns. On a bloom-negative lookup `has` and
+    /// still requires reading/decompressing the full data block. It skips
+    /// copying out the winning value and pins no value after returning.
+    /// On a bloom-negative lookup `has` and
     /// `get` cost the same and neither touches a block.
     ///
     /// When a [`MergeOperator`] is configured this method does
@@ -546,13 +546,43 @@ impl Db {
     /// copy. See [`Db::has`] for what that does and does not save, and
     /// for the [`MergeOperator`] caveat.
     pub fn get_size(&self, key: &[u8]) -> Result<Option<usize>> {
-        self.lookup_size_latest(DEFAULT_CF_ID, key)
+        self.lookup_size_latest(DEFAULT_CF_ID, key, None)
     }
 
     /// [`Db::get_size`] scoped to a column family.
     pub fn get_size_cf(&self, cf: &ColumnFamilyHandle, key: &[u8]) -> Result<Option<usize>> {
         self.validate_cf_handle(cf)?;
-        self.lookup_size_latest(cf.id(), key)
+        self.lookup_size_latest(cf.id(), key, None)
+    }
+
+    /// Like [`Db::get_size`], with an opt-in allocation guard per SST data block.
+    /// The on-disk frame size plus decoded backing-buffer capacity must not exceed
+    /// `max_data_block_bytes`, even on cache hits. Oversized blocks return
+    /// [`Error::DataBlockLimitExceeded`], not an exact value size or absence.
+    ///
+    /// This is NOT a total-memory or time bound: metadata (including indexes,
+    /// filters and range tombstones), keys, restart arrays, validation overhead,
+    /// allocator overhead and other concurrent/retained allocations are excluded.
+    /// Memtable values do not incur a data-block charge. A configured merge
+    /// operator is rejected with [`Error::InvalidArgument`] without invoking it.
+    /// A limit error can precede detection of corruption in an oversized frame.
+    pub fn get_size_with_limit(
+        &self,
+        key: &[u8],
+        max_data_block_bytes: usize,
+    ) -> Result<Option<usize>> {
+        self.lookup_size_latest(DEFAULT_CF_ID, key, Some(max_data_block_bytes))
+    }
+
+    /// [`Db::get_size_with_limit`] scoped to a column family, with the same exclusions.
+    pub fn get_size_cf_with_limit(
+        &self,
+        cf: &ColumnFamilyHandle,
+        key: &[u8],
+        max_data_block_bytes: usize,
+    ) -> Result<Option<usize>> {
+        self.validate_cf_handle(cf)?;
+        self.lookup_size_latest(cf.id(), key, Some(max_data_block_bytes))
     }
 
     /// [`Db::lookup_slice`] for a read of the newest visible value.
@@ -581,7 +611,12 @@ impl Db {
     }
 
     /// The length-only twin of [`Db::lookup_slice_latest`].
-    fn lookup_size_latest(&self, cf_id: u32, key: &[u8]) -> Result<Option<usize>> {
+    fn lookup_size_latest(
+        &self,
+        cf_id: u32,
+        key: &[u8],
+        limit: Option<usize>,
+    ) -> Result<Option<usize>> {
         let stats = self.stats();
         let _scope = statistics::TimeScope::new(stats, Histogram::DbGet);
         if let Some(s) = stats {
@@ -589,7 +624,7 @@ impl Db {
         }
         perf_context::record_get_call();
         self.engine
-            .get_size_latest(cf_id, key)
+            .get_size_latest(cf_id, key, limit)
             .map_err(|err| map_point_read_error_for(err, key))
     }
 
@@ -2460,18 +2495,45 @@ impl Snapshot {
     /// Length in bytes of the live value for `key` at this snapshot,
     /// or `None` when there is none. See [`Db::get_size`].
     pub fn get_size(&self, key: &[u8]) -> Result<Option<usize>> {
-        self.lookup_size(&LookupKey::new(DEFAULT_CF_ID, key, self.seq))
+        self.lookup_size(&LookupKey::new(DEFAULT_CF_ID, key, self.seq), None)
     }
 
     /// [`Snapshot::get_size`] scoped to a column family.
     pub fn get_size_cf(&self, cf: &ColumnFamilyHandle, key: &[u8]) -> Result<Option<usize>> {
         self.validate_cf_handle(cf)?;
-        self.lookup_size(&LookupKey::new(cf.id(), key, self.seq))
+        self.lookup_size(&LookupKey::new(cf.id(), key, self.seq), None)
     }
 
-    fn lookup_size(&self, lk: &LookupKey) -> Result<Option<usize>> {
+    /// Snapshot-scoped [`Db::get_size_with_limit`], with the same per-block guard
+    /// and exclusions; not a total-memory or time bound.
+    pub fn get_size_with_limit(
+        &self,
+        key: &[u8],
+        max_data_block_bytes: usize,
+    ) -> Result<Option<usize>> {
+        self.lookup_size(
+            &LookupKey::new(DEFAULT_CF_ID, key, self.seq),
+            Some(max_data_block_bytes),
+        )
+    }
+
+    /// [`Snapshot::get_size_with_limit`] scoped to a column family.
+    pub fn get_size_cf_with_limit(
+        &self,
+        cf: &ColumnFamilyHandle,
+        key: &[u8],
+        max_data_block_bytes: usize,
+    ) -> Result<Option<usize>> {
+        self.validate_cf_handle(cf)?;
+        self.lookup_size(
+            &LookupKey::new(cf.id(), key, self.seq),
+            Some(max_data_block_bytes),
+        )
+    }
+
+    fn lookup_size(&self, lk: &LookupKey, limit: Option<usize>) -> Result<Option<usize>> {
         self.engine
-            .get_size(lk)
+            .get_size(lk, limit)
             .map_err(|err| map_point_read_error(err, lk.prefixed_user_key()))
     }
 

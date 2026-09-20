@@ -1166,9 +1166,14 @@ impl RegolithEngine {
     }
 
     /// Length of the newest visible value for `key`, or `None`.
-    pub(crate) fn get_size_latest(&self, cf_id: u32, key: &[u8]) -> std::io::Result<Option<usize>> {
+    pub(crate) fn get_size_latest(
+        &self,
+        cf_id: u32,
+        key: &[u8],
+        limit: Option<usize>,
+    ) -> std::io::Result<Option<usize>> {
         Ok(self
-            .lookup_latest_cf(cf_id, key, Materialize::LengthOnly)?
+            .lookup_latest_cf(cf_id, key, Materialize::LengthOnly(limit))?
             .map(|v| v.len()))
     }
 
@@ -1187,8 +1192,14 @@ impl RegolithEngine {
     /// Reads the same sources [`RegolithEngine::get_slice`] does and pays
     /// the same block reads, but never takes a reference on the block
     /// or buffer the value lives in.
-    pub(crate) fn get_size(&self, lk: &LookupKey) -> std::io::Result<Option<usize>> {
-        Ok(self.lookup(lk, Materialize::LengthOnly)?.map(|v| v.len()))
+    pub(crate) fn get_size(
+        &self,
+        lk: &LookupKey,
+        limit: Option<usize>,
+    ) -> std::io::Result<Option<usize>> {
+        Ok(self
+            .lookup(lk, Materialize::LengthOnly(limit))?
+            .map(|v| v.len()))
     }
 
     /// Look one SSTable up, projecting the hit into whichever form the
@@ -1205,8 +1216,8 @@ impl RegolithEngine {
             Materialize::Value => Ok(reader
                 .get(lk, buf, &self.cache)?
                 .map_value(PointValue::Value)),
-            Materialize::LengthOnly => Ok(reader
-                .get_size(lk, buf, &self.cache)?
+            Materialize::LengthOnly(limit) => Ok(reader
+                .get_size(lk, buf, &self.cache, limit)?
                 .map_value(PointValue::Length)),
         })
     }
@@ -1223,6 +1234,7 @@ impl RegolithEngine {
     ) -> std::io::Result<Option<PointValue>> {
         self.ensure_open()?;
         if self.options.merge_operator.is_some() {
+            Self::reject_guarded_merge(materialize)?;
             // A merge operator decides inside `full_merge` whether a
             // value exists at all, so a length-only request has to
             // collapse the chain exactly like a full read does.
@@ -1263,6 +1275,7 @@ impl RegolithEngine {
         let lk = LookupKey::new(cf_id, key, self.visible_seq.visible());
         let snapshot_seq = lk.snapshot_seq();
         if self.options.merge_operator.is_some() {
+            Self::reject_guarded_merge(materialize)?;
             return Ok(self.get_with_merge(&lk)?.map(PointValue::Value));
         }
         self.lookup_in_view(
@@ -1272,6 +1285,16 @@ impl RegolithEngine {
             materialize,
             &view,
         )
+    }
+
+    fn reject_guarded_merge(materialize: Materialize) -> std::io::Result<()> {
+        if matches!(materialize, Materialize::LengthOnly(Some(_))) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "guarded size reads do not support a configured merge operator",
+            ));
+        }
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
