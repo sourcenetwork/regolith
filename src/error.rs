@@ -6,6 +6,12 @@ pub enum Error {
     /// other API argument.
     #[error("invalid argument: {0}")]
     InvalidArgument(String),
+    /// A size read exceeded its per-SST-data-block frame plus decoded-buffer limit.
+    #[error("SST data block exceeds allocation limit of {max_data_block_bytes} bytes")]
+    DataBlockLimitExceeded {
+        /// The caller's limit, not the size of the block or value.
+        max_data_block_bytes: usize,
+    },
     /// On-disk database, WAL, SSTable, manifest, or backup data was
     /// malformed or truncated.
     #[error("corruption: {0}")]
@@ -76,6 +82,7 @@ impl Error {
             Self::Closed => {
                 std::io::Error::new(std::io::ErrorKind::NotConnected, "database is closed")
             }
+            limit @ Self::DataBlockLimitExceeded { .. } => std::io::Error::other(limit),
             other => std::io::Error::other(other.to_string()),
         }
     }
@@ -83,6 +90,14 @@ impl Error {
 
 impl From<std::io::Error> for Error {
     fn from(err: std::io::Error) -> Self {
+        if let Some(Self::DataBlockLimitExceeded {
+            max_data_block_bytes,
+        }) = err.get_ref().and_then(|e| e.downcast_ref::<Self>())
+        {
+            return Self::DataBlockLimitExceeded {
+                max_data_block_bytes: *max_data_block_bytes,
+            };
+        }
         match err.kind() {
             std::io::ErrorKind::InvalidInput => Self::InvalidArgument(err.to_string()),
             std::io::ErrorKind::InvalidData | std::io::ErrorKind::UnexpectedEof => {
