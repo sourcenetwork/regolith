@@ -1146,6 +1146,10 @@ pub(crate) struct RegolithIterator {
     /// is `>= upper_bound`, confining the scan to the originally seeked
     /// prefix. Cleared by any other seek.
     upper_bound: Option<Vec<u8>>,
+    /// Internal entries the forward walk has examined, for tests that bound
+    /// how far a seek looks.
+    #[cfg(test)]
+    visited: usize,
     /// Prefix extractor captured at construction. Used by
     /// [`RegolithIterator::seek_prefix`] to derive the bloom probe for
     /// the caller's query prefix. If the extractor cannot produce a
@@ -1284,6 +1288,8 @@ impl RegolithIterator {
             error: None,
             terminal_error: false,
             upper_bound: None,
+            #[cfg(test)]
+            visited: 0,
             prefix_extractor,
             merge_operator,
             pending_consume: false,
@@ -1347,6 +1353,18 @@ impl RegolithIterator {
     }
 
     pub(crate) fn seek(&mut self, target: &[u8]) {
+        self.seek_below(target, None);
+    }
+
+    /// [`seek`](Self::seek), then stop forward iteration before the first
+    /// user key `>= upper_bound`. The bound also stops the walk over entries
+    /// the snapshot cannot see, so a range scan does not pay for tombstones
+    /// and newer versions stored past its end.
+    pub(crate) fn seek_bounded(&mut self, target: &[u8], upper_bound: &[u8]) {
+        self.seek_below(target, Some(upper_bound.to_vec()));
+    }
+
+    fn seek_below(&mut self, target: &[u8], upper_bound: Option<Vec<u8>>) {
         self.positioned = true;
         if self.terminal_error {
             return;
@@ -1357,7 +1375,7 @@ impl RegolithIterator {
         self.merge_result = None;
         self.reverse_curr = None;
         self.pending_consume = false;
-        self.upper_bound = None;
+        self.upper_bound = upper_bound;
         self.direction = Direction::Forward;
         // Smallest internal key for `target` at any seq: `target || !u64::MAX || 0`.
         // This positions the merging iterator at the newest version of the
@@ -1638,6 +1656,10 @@ impl RegolithIterator {
             let Some(ik) = self.inner.key() else {
                 return;
             };
+            #[cfg(test)]
+            {
+                self.visited += 1;
+            }
             let (uk, seq, vt) = decode_internal_key(ik);
 
             let went_backwards = self
@@ -1979,5 +2001,63 @@ impl RegolithIterator {
         self.valid_entry = false;
         self.merge_result = None;
         self.direction = Direction::Reverse;
+    }
+}
+
+#[cfg(test)]
+mod bounded_seek_tests {
+    use crate::column_family::{DEFAULT_CF_ID, prefix_key};
+    use crate::{Db, Options};
+
+    const TOMBSTONES: usize = 1_000;
+
+    fn key(user: &[u8]) -> Vec<u8> {
+        prefix_key(DEFAULT_CF_ID, user)
+    }
+
+    /// `a/1` live, `TOMBSTONES` deleted keys under `b/`, `c` live.
+    fn db_with_tombstones_past_a() -> (Db, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(dir.path(), Options::default()).unwrap();
+        db.put(b"a/1", b"live").unwrap();
+        for i in 0..TOMBSTONES {
+            let k = format!("b/{i:04}");
+            db.put(k.as_bytes(), b"gone").unwrap();
+            db.delete(k.as_bytes()).unwrap();
+        }
+        db.put(b"c", b"live").unwrap();
+        (db, dir)
+    }
+
+    #[test]
+    fn an_unbounded_seek_walks_the_tombstones_after_its_range() {
+        let (db, _dir) = db_with_tombstones_past_a();
+        let mut iter = db.engine.new_iter_at(db.engine.snapshot_seq());
+        iter.seek(&key(b"a/"));
+        assert_eq!(iter.key(), Some(key(b"a/1").as_slice()));
+        iter.next();
+        assert_eq!(iter.key(), Some(key(b"c").as_slice()));
+        assert!(iter.visited > TOMBSTONES, "visited {}", iter.visited);
+    }
+
+    #[test]
+    fn a_bounded_seek_stops_at_its_bound() {
+        let (db, _dir) = db_with_tombstones_past_a();
+        let mut iter = db.engine.new_iter_at(db.engine.snapshot_seq());
+        iter.seek_bounded(&key(b"a/"), &key(b"b/"));
+        assert_eq!(iter.key(), Some(key(b"a/1").as_slice()));
+        iter.next();
+        assert!(!iter.valid());
+        assert!(iter.visited <= 3, "visited {}", iter.visited);
+    }
+
+    #[test]
+    fn a_bounded_seek_past_its_bound_is_empty() {
+        let (db, _dir) = db_with_tombstones_past_a();
+        let mut iter = db.engine.new_iter_at(db.engine.snapshot_seq());
+        iter.seek_bounded(&key(b"b/"), &key(b"a/2"));
+        assert!(!iter.valid());
+        assert!(iter.status().is_ok());
+        assert!(iter.visited <= 1, "visited {}", iter.visited);
     }
 }
