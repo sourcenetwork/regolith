@@ -96,6 +96,19 @@ impl<'a> Iter<'a> {
         self.inner.seek(target);
     }
 
+    /// Position the iterator at the first user key `>= target`, and end
+    /// forward iteration before the first user key `>= upper_bound`.
+    ///
+    /// Prefer this to [`seek`](Self::seek) plus a bound check in the caller
+    /// whenever the range has an end: the iterator skips deleted and
+    /// not-yet-visible entries internally, and only a bound it knows about
+    /// stops that skipping at the end of the range.
+    pub fn seek_bounded(&mut self, target: &[u8], upper_bound: &[u8]) {
+        self.tick_seek();
+        let _t = TimeScope::new(self.stats.as_deref(), Histogram::DbIterSeek);
+        self.inner.seek_bounded(target, upper_bound);
+    }
+
     /// Position the iterator at the largest user key `<= target`. Sets
     /// the scan direction to reverse, so subsequent [`prev`](Self::prev)
     /// calls walk backward. Calling [`next`](Self::next) after

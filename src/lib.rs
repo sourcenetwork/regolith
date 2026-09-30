@@ -2002,6 +2002,21 @@ impl<'a> CfIter<'a> {
         self.inner.seek(&prefix_key(self.cf_id, target));
     }
 
+    /// Position the cursor at the first key `>= target` in the CF, and end
+    /// forward iteration before `upper_bound`, or at the end of the CF when
+    /// there is none. See [`Iter::seek_bounded`].
+    pub fn seek_bounded(&mut self, target: &[u8], upper_bound: Option<&[u8]>) {
+        if !self.valid_cf {
+            return;
+        }
+        let upper_bound = match upper_bound {
+            Some(bound) => prefix_key(self.cf_id, bound),
+            None => self.upper_bound.clone(),
+        };
+        self.inner
+            .seek_bounded(&prefix_key(self.cf_id, target), &upper_bound);
+    }
+
     /// Position the cursor at the last key `<= target` in the CF.
     pub fn seek_for_prev(&mut self, target: &[u8]) {
         if !self.valid_cf {
@@ -2135,6 +2150,12 @@ impl OwnedSnapshotIter {
     /// Position the cursor at the first key `>= target`.
     pub fn seek(&mut self, target: &[u8]) {
         self.inner.seek(target);
+    }
+
+    /// Position the cursor at the first key `>= target`, and end forward
+    /// iteration before `upper_bound`. See [`Iter::seek_bounded`].
+    pub fn seek_bounded(&mut self, target: &[u8], upper_bound: &[u8]) {
+        self.inner.seek_bounded(target, Some(upper_bound));
     }
 
     /// Position the cursor at the last key `<= target`.
@@ -2614,12 +2635,13 @@ impl Snapshot {
     /// [`Snapshot::scan_stream`], consuming the snapshot instead of
     /// pinning a second handle on it.
     pub fn into_scan_stream(self, start: Option<&[u8]>, end: Option<&[u8]>) -> ScanStream {
-        let end = end.map(<[u8]>::to_vec);
         let mut cursor = self.into_owned_iter();
-        match start {
-            Some(start) => cursor.seek(start),
-            None => cursor.seek_to_first(),
+        match (start, end) {
+            (start, Some(end)) => cursor.seek_bounded(start.unwrap_or_default(), end),
+            (Some(start), None) => cursor.seek(start),
+            (None, None) => cursor.seek_to_first(),
         }
+        let end = end.map(<[u8]>::to_vec);
         ScanStream {
             entries: Entries::new(cursor, false),
             end,
@@ -2733,9 +2755,10 @@ fn collect_range(
     start: Option<&[u8]>,
     end: Option<&[u8]>,
 ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-    match start {
-        Some(s) => iter.seek(s),
-        None => iter.seek_to_first(),
+    match (start, end) {
+        (start, Some(end)) => iter.seek_bounded(start.unwrap_or_default(), end),
+        (Some(start), None) => iter.seek(start),
+        (None, None) => iter.seek_to_first(),
     }
     iter.status().map_err(Error::from)?;
 
@@ -2768,7 +2791,7 @@ fn collect_page(
         ));
     }
 
-    iter.seek(start);
+    iter.seek_bounded(start, end);
     iter.status().map_err(Error::from)?;
 
     let mut entries = Vec::new();

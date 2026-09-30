@@ -755,10 +755,11 @@ impl<'db> Transaction<'db> {
                 None => cursor.seek_to_last(),
             }
         } else {
-            match &lo {
-                Some(lo) => cursor.seek(&lo[4..]),
-                None => cursor.seek_to_first(),
-            }
+            // The bound must reach the cursor, not only `peek_cursor`: the
+            // cursor skips entries this snapshot cannot see before it
+            // reports a key, and without it that skip runs past `end`.
+            let target = lo.as_deref().map_or(&[][..], |lo| &lo[4..]);
+            cursor.seek_bounded(target, hi.as_deref().map(|hi| &hi[4..]));
         }
 
         TxnScanStream {
