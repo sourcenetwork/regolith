@@ -1,6 +1,25 @@
 {
  "runs": [
   {
+   "file": "7bf1d4b57f60ba839b6b90120103f2c370f05b9f.json",
+   "commit": "7bf1d4b57f60ba839b6b90120103f2c370f05b9f",
+   "label": "main",
+   "timestamp": "2026-09-30T18:06:20Z",
+   "toolchain": "rustc 1.98.1 (48a229cea 2026-09-01)",
+   "loadguard_passed": false,
+   "trust": {
+    "throughput": null,
+    "rss": "clean",
+    "binary_size": "clean",
+    "correctness": "clean",
+    "isolation": "clean",
+    "allocs": "clean",
+    "scan_stream": "clean",
+    "viability": "absent"
+   },
+   "peak_ops": null
+  },
+  {
    "file": "457dec18a506e2956df9b51a067a47f602850dd6.json",
    "commit": "457dec18a506e2956df9b51a067a47f602850dd6",
    "label": "main",
