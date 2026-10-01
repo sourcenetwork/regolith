@@ -68,9 +68,8 @@ pub(crate) enum VersionEdit {
     Reset { next_file_id: u64, min_wal_id: u64 },
 }
 
-/// Serialized form of a version edit. The manifest on disk is a sequence
-/// of these records; runtime edits are converted to records just before
-/// being written out.
+/// Serialized form of a version edit. All edits in one apply share a
+/// checksummed frame, so recovery cannot install half a file replacement.
 enum ManifestRecord {
     AddFile { level: usize, meta: SsTableMeta },
     RemoveFile { level: usize, file_id: u64 },
@@ -307,6 +306,8 @@ pub(crate) struct VersionSet {
     /// Bytes the manifest holds on disk, tracked rather than stat'ed so
     /// the rewrite check costs nothing on the common path.
     manifest_bytes: u64,
+    /// Absent on read-only opens or after uncertain manifest I/O. Edits
+    /// and rewrites are refused until recovery reopens the log.
     manifest_writer: Option<BufferedWriter>,
     env: Arc<dyn Env>,
 }
@@ -466,6 +467,13 @@ impl VersionSet {
         &self.manifest_path
     }
 
+    fn writer_unavailable(&self) -> io::Error {
+        io::Error::other(format!(
+            "{} is not writable; reopen the database before updating the MANIFEST",
+            self.manifest_path.display(),
+        ))
+    }
+
     /// Apply a batch of edits atomically: update the in-memory version
     /// and persist the serialized records to the manifest log.
     pub(crate) fn apply(&mut self, edits: &[VersionEdit]) -> io::Result<()> {
@@ -509,16 +517,22 @@ impl VersionSet {
         }
 
         let records: Vec<ManifestRecord> = edits.iter().map(VersionEdit::to_record).collect();
-        let encoded = Self::encode_records(&records);
+        let encoded = Self::encode_records(&records)?;
         let requires_sync = edits.iter().any(VersionEdit::requires_manifest_sync);
-        if let Some(writer) = &mut self.manifest_writer {
-            writer.write_all(&encoded)?;
-            if requires_sync {
-                writer.sync_all()?;
-            } else {
-                writer.flush()?;
-            }
+        // An append or sync error leaves an uncertain tail. Only reopen
+        // may decide which complete frames survived; neither a later
+        // append nor a rewrite from the old version may bypass that tail.
+        let mut writer = self
+            .manifest_writer
+            .take()
+            .ok_or_else(|| self.writer_unavailable())?;
+        writer.write_all(&encoded)?;
+        if requires_sync {
+            writer.sync_all()?;
+        } else {
+            writer.flush()?;
         }
+        self.manifest_writer = Some(writer);
 
         let live_files: u64 = version.levels.iter().map(|l| l.len() as u64).sum();
         *self.current.write() = Arc::new(version);
@@ -548,6 +562,9 @@ impl VersionSet {
     /// a single compact sequence of records. Readers in the live
     /// `Version` are preserved - we never close their file descriptors.
     pub(crate) fn compact_manifest(&mut self) -> io::Result<()> {
+        if self.manifest_writer.is_none() {
+            return Err(self.writer_unavailable());
+        }
         let version = self.current();
 
         let mut records = Vec::new();
@@ -563,7 +580,7 @@ impl VersionSet {
             }
         }
 
-        let encoded = Self::encode_records(&records);
+        let encoded = Self::encode_records(&records)?;
 
         let tmp_path = self.manifest_path.with_extension("tmp");
         {
@@ -641,20 +658,27 @@ impl VersionSet {
         Ok(MANIFEST_STAMP_LEN)
     }
 
-    fn encode_records(records: &[ManifestRecord]) -> Vec<u8> {
-        let mut buf = Vec::new();
-        for record in records {
-            let mut record_buf = Vec::new();
-            record.encode(&mut record_buf);
-
-            let len = record_buf.len() as u32;
-            let checksum = checksum::manifest_record(len, &record_buf);
-
-            buf.extend_from_slice(&len.to_le_bytes());
-            buf.extend_from_slice(&record_buf);
-            buf.extend_from_slice(&checksum.to_le_bytes());
+    fn encode_records(records: &[ManifestRecord]) -> io::Result<Vec<u8>> {
+        if records.is_empty() {
+            return Ok(Vec::new());
         }
-        buf
+        // V1 readers already decode every edit inside a frame. Keep that
+        // format, but checksum the whole apply so a torn compaction drops
+        // both its removals and additions instead of just the additions.
+        let mut buf = vec![0; 4];
+        for record in records {
+            record.encode(&mut buf);
+        }
+        let len = u32::try_from(buf.len() - 4).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "MANIFEST edit batch exceeds u32 length",
+            )
+        })?;
+        buf[..4].copy_from_slice(&len.to_le_bytes());
+        let checksum = checksum::manifest_record(len, &buf[4..]);
+        buf.extend_from_slice(&checksum.to_le_bytes());
+        Ok(buf)
     }
 
     /// Refuse to open when a manifest that did not replay cleanly ends up
@@ -805,7 +829,7 @@ impl VersionSet {
         let mut valid_len = stamp;
 
         while offset < data.len() {
-            if offset + 4 > data.len() {
+            if data.len() - offset < 4 {
                 tracing::warn!("Truncated manifest record header, stopping replay");
                 break;
             }
@@ -813,7 +837,10 @@ impl VersionSet {
             let len = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
             offset += 4;
 
-            if offset + len + 4 > data.len() {
+            if len
+                .checked_add(4)
+                .is_none_or(|framed_len| framed_len > data.len() - offset)
+            {
                 tracing::warn!("Truncated manifest record, stopping replay");
                 break;
             }
@@ -884,6 +911,9 @@ impl VersionSet {
         Ok(ManifestReplay { version, valid_len })
     }
 }
+
+#[cfg(test)]
+mod atomic_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1185,11 +1215,9 @@ mod tests {
             level: MAX_LEVELS,
             meta: test_meta(1),
         }];
-        std::fs::write(
-            dir.path().join("MANIFEST"),
-            VersionSet::encode_records(&records),
-        )
-        .unwrap();
+        let mut bytes = VersionSet::encode_stamp().to_vec();
+        bytes.extend(VersionSet::encode_records(&records).unwrap());
+        std::fs::write(dir.path().join("MANIFEST"), bytes).unwrap();
 
         let kind = match VersionSet::open(dir.path(), &sst_dir) {
             Err(e) => e.kind(),

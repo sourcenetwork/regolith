@@ -17,7 +17,7 @@ use std::fs::{self, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
 
-use regolith::{Db, Error};
+use regolith::{Db, Error, Options};
 use tempfile::TempDir;
 
 mod common;
@@ -191,32 +191,86 @@ fn manifest_deleted_prevents_reopen_of_nonempty_db() {
     assert!(count_sst_files(dir.path()) >= 1);
 }
 
-#[test]
-fn corrupted_manifest_record_stops_replay_but_opens() {
-    // corruption_test.cc::CorruptedDescriptor - a mid-file bad
-    // checksum in the manifest halts replay at the corruption but
-    // leaves the pre-corruption state intact.
-    let dir = TempDir::new().unwrap();
-    {
-        let db = open(&dir);
-        db.put(b"k1", b"v1").unwrap();
-        force_compaction(&db);
-        db.put(b"k2", b"v2").unwrap();
-        force_compaction(&db);
+fn manifest_options() -> Options {
+    Options {
+        max_background_compactions: 0,
+        l0_compaction_trigger: 100,
+        ..Options::default()
     }
-    // Flip a byte deep in the manifest - lands inside the second
-    // record's payload or checksum, which the replay loop treats
-    // as "stop here".
-    let manifest = dir.path().join("MANIFEST");
-    let size = fs::metadata(&manifest).unwrap().len() as usize;
-    flip_byte(&manifest, size - 6);
+}
 
-    // Open must succeed; the state visible is a prefix of what was
-    // committed before the corruption, so at least `k1` should be
-    // readable. The exact cutoff depends on where the flip landed.
-    let db = open(&dir);
-    let _ = db.get(b"k1");
-    let _ = db.get(b"k2");
+#[test]
+fn corrupted_manifest_batch_preserves_the_earlier_flush() {
+    let dir = TempDir::new().unwrap();
+    let manifest = dir.path().join("MANIFEST");
+    let second_end = {
+        let db = Db::open(dir.path(), manifest_options()).unwrap();
+        db.put(b"k1", b"v1").unwrap();
+        db.flush().unwrap();
+        let first_end = fs::metadata(&manifest).unwrap().len();
+        db.put(b"k2", b"v2").unwrap();
+        db.flush().unwrap();
+        let second_end = fs::metadata(&manifest).unwrap().len();
+        assert!(second_end > first_end);
+        assert_eq!(count_sst_files(dir.path()), 2);
+        // Both sealed WALs are gone; only the empty active WAL remains.
+        assert_eq!(count_wal_files(dir.path()), 1);
+        db.close().unwrap();
+        second_end as usize
+    };
+
+    // Damage the second flush's checksum while the first flush's
+    // SSTable is still present and referenced by the valid prefix.
+    flip_byte(&manifest, second_end - 1);
+    let db = Db::open(dir.path(), manifest_options()).unwrap();
+    assert_eq!(db.get(b"k1").unwrap(), Some(b"v1".to_vec()));
+    assert_eq!(db.get(b"k2").unwrap(), None);
+    assert_eq!(
+        db.scan(None, None).unwrap(),
+        vec![(b"k1".to_vec(), b"v1".to_vec())]
+    );
+}
+
+#[test]
+fn corrupted_completed_compaction_refuses_missing_inputs_without_rewriting() {
+    let dir = TempDir::new().unwrap();
+    let manifest = dir.path().join("MANIFEST");
+    let (inputs, compaction_end) = {
+        let db = Db::open(dir.path(), manifest_options()).unwrap();
+        db.put(b"k1", b"v1").unwrap();
+        db.flush().unwrap();
+        db.put(b"k2", b"v2").unwrap();
+        db.flush().unwrap();
+        let inputs: Vec<_> = fs::read_dir(dir.path().join("sst"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        assert_eq!(inputs.len(), 2);
+        db.compact_range(None, None).unwrap();
+        let end = fs::metadata(&manifest).unwrap().len() as usize;
+        db.close().unwrap();
+        (inputs, end)
+    };
+    assert!(inputs.iter().all(|path| !path.exists()));
+    assert_eq!(count_sst_files(dir.path()), 1);
+    let output = first_sst(dir.path());
+    let output_bytes = fs::read(&output).unwrap();
+
+    // Unlike an interrupted append, corruption after a committed
+    // compaction cannot roll back to inputs that were already deleted.
+    flip_byte(&manifest, compaction_end - 1);
+    let damaged = fs::read(&manifest).unwrap();
+    match Db::open(dir.path(), manifest_options()) {
+        Err(Error::Io(error)) => {
+            assert_eq!(error.kind(), io::ErrorKind::NotFound);
+            assert!(error.to_string().contains(".sst"));
+        }
+        Err(error) => panic!("expected a missing compaction input, got {error:?}"),
+        Ok(_) => panic!("damaged compaction must not hide its missing inputs"),
+    }
+    assert_eq!(fs::read(&manifest).unwrap(), damaged);
+    assert_eq!(fs::read(&output).unwrap(), output_bytes);
+    assert_eq!(count_sst_files(dir.path()), 1);
 }
 
 // ── SSTable corruption ──────────────────────────────────────────
