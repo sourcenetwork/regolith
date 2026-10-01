@@ -50,13 +50,29 @@
 
 #![allow(clippy::missing_safety_doc)]
 
-use std::ffi::{c_char, c_int, c_long, c_void};
+use std::ffi::{c_char, c_int, c_long, c_uint, c_void, VaList};
 use std::sync::atomic::{AtomicI32, AtomicU64, AtomicU8, Ordering};
 
 const RTLD_NEXT: *mut c_void = -1isize as *mut c_void;
 
 const O_APPEND: c_int = 0o2000;
 const O_CREAT: c_int = 0o100;
+const O_DIRECTORY: c_int = if cfg!(any(
+    target_arch = "arm",
+    target_arch = "aarch64",
+    target_arch = "m68k",
+    target_arch = "powerpc",
+    target_arch = "powerpc64",
+)) {
+    0o40000
+} else {
+    0o200000
+};
+const O_TMPFILE: c_int = if cfg!(any(target_arch = "sparc", target_arch = "sparc64")) {
+    0o200000000 | O_DIRECTORY
+} else {
+    0o20000000 | O_DIRECTORY
+};
 const SEEK_SET: c_int = 0;
 const SEEK_CUR: c_int = 1;
 const SEEK_END: c_int = 2;
@@ -84,8 +100,8 @@ type WriteFn = unsafe extern "C" fn(c_int, *const c_void, usize) -> isize;
 type PwriteFn = unsafe extern "C" fn(c_int, *const c_void, usize, i64) -> isize;
 type WritevFn = unsafe extern "C" fn(c_int, *const c_void, c_int) -> isize;
 type SyncFn = unsafe extern "C" fn(c_int) -> c_int;
-type OpenFn = unsafe extern "C" fn(*const c_char, c_int, c_int) -> c_int;
-type OpenatFn = unsafe extern "C" fn(c_int, *const c_char, c_int, c_int) -> c_int;
+type OpenFn = unsafe extern "C" fn(*const c_char, c_int, ...) -> c_int;
+type OpenatFn = unsafe extern "C" fn(c_int, *const c_char, c_int, ...) -> c_int;
 type LseekFn = unsafe extern "C" fn(c_int, i64, c_int) -> i64;
 type CloseFn = unsafe extern "C" fn(c_int) -> c_int;
 type TruncFn = unsafe extern "C" fn(c_int, i64) -> c_int;
@@ -203,7 +219,11 @@ unsafe fn journal_fd() -> c_int {
             let mut c = path.into_bytes();
             c.push(0);
             let open = real!(o, OpenFn, "open64");
-            open(c.as_ptr() as *const c_char, 1 | O_CREAT | O_APPEND, 0o644)
+            open(
+                c.as_ptr() as *const c_char,
+                1 | O_CREAT | O_APPEND,
+                0o644u32,
+            )
         }
     };
     match JOURNAL_FD.compare_exchange(-2, fd, Ordering::AcqRel, Ordering::Acquire) {
@@ -239,7 +259,11 @@ impl Rec {
         let mut tmp = [0u8; 24];
         let mut i = tmp.len();
         let neg = v < 0;
-        let mut u = if neg { (v as i128).unsigned_abs() as u128 } else { v as u128 };
+        let mut u = if neg {
+            (v as i128).unsigned_abs() as u128
+        } else {
+            v as u128
+        };
         if u == 0 {
             i -= 1;
             tmp[i] = b'0';
@@ -502,17 +526,17 @@ pub unsafe extern "C" fn ftruncate(fd: c_int, len: i64) -> c_int {
     ftruncate64(fd, len)
 }
 
-// C declares the open family variadic (`int open(const char *, int, ...)`),
-// and rustc 1.99 rejects a fixed-arity definition of a symbol std calls
-// (`invalid_runtime_symbol_definitions`). C-variadic definitions are not
-// stable on every toolchain this suite supports. The shim only loads via
-// LD_PRELOAD on x86_64 and aarch64 Linux, where a variadic `int` arrives in
-// the same register as a fixed third argument, so reading `mode` as one is
-// exact there. `unknown_lints` keeps older toolchains quiet.
-#[allow(unknown_lints, invalid_runtime_symbol_definitions)]
-#[no_mangle]
-pub unsafe extern "C" fn open64(path: *const c_char, flags: c_int, mode: c_int) -> c_int {
-    let real = real!(o, OpenFn, "open64");
+unsafe fn open_mode(flags: c_int, mut args: VaList<'_>) -> c_uint {
+    // Ordinary opens have no mode argument. O_TMPFILE includes O_DIRECTORY,
+    // which by itself must not make us read an absent variadic argument.
+    if flags & O_CREAT != 0 || flags & O_TMPFILE == O_TMPFILE {
+        args.next_arg::<c_uint>()
+    } else {
+        0
+    }
+}
+
+unsafe fn open_with_mode(path: *const c_char, flags: c_int, mode: c_uint) -> c_int {    let real = real!(o, OpenFn, "open64");
     let g = Guard::enter();
     if !g.active() {
         return real(path, flags, mode);
@@ -524,18 +548,17 @@ pub unsafe extern "C" fn open64(path: *const c_char, flags: c_int, mode: c_int) 
 
 #[allow(unknown_lints, invalid_runtime_symbol_definitions)]
 #[no_mangle]
-pub unsafe extern "C" fn open(path: *const c_char, flags: c_int, mode: c_int) -> c_int {
-    open64(path, flags, mode)
+pub unsafe extern "C" fn open64(path: *const c_char, flags: c_int, args: ...) -> c_int {
+    open_with_mode(path, flags, open_mode(flags, args))
 }
 
 #[allow(unknown_lints, invalid_runtime_symbol_definitions)]
 #[no_mangle]
-pub unsafe extern "C" fn openat64(
-    dirfd: c_int,
-    path: *const c_char,
-    flags: c_int,
-    mode: c_int,
-) -> c_int {
+pub unsafe extern "C" fn open(path: *const c_char, flags: c_int, args: ...) -> c_int {
+    open_with_mode(path, flags, open_mode(flags, args))
+}
+
+unsafe fn openat_with_mode(dirfd: c_int, path: *const c_char, flags: c_int, mode: c_uint) -> c_int {
     let real = real!(a, OpenatFn, "openat64");
     let g = Guard::enter();
     if !g.active() {
@@ -548,8 +571,23 @@ pub unsafe extern "C" fn openat64(
 
 #[allow(unknown_lints, invalid_runtime_symbol_definitions)]
 #[no_mangle]
-pub unsafe extern "C" fn openat(dirfd: c_int, path: *const c_char, flags: c_int, mode: c_int) -> c_int {
-    openat64(dirfd, path, flags, mode)
+pub unsafe extern "C" fn openat64(
+    dirfd: c_int,
+    path: *const c_char,
+    flags: c_int,
+    args: ...
+) -> c_int {
+    openat_with_mode(dirfd, path, flags, open_mode(flags, args))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn openat(
+    dirfd: c_int,
+    path: *const c_char,
+    flags: c_int,
+    args: ...
+) -> c_int {
+    openat_with_mode(dirfd, path, flags, open_mode(flags, args))
 }
 
 #[no_mangle]
