@@ -17,6 +17,7 @@ pub(crate) mod memtable;
 pub(crate) mod range_tombstone;
 pub(crate) mod read_horizon;
 pub(crate) mod read_view;
+mod recovery;
 pub(crate) mod skiplist;
 pub(crate) mod snapshot_registry;
 pub(crate) mod sstable;
@@ -39,6 +40,7 @@ use manifest::{VersionEdit, VersionSet};
 use memtable::{MemTable, MemTableConfig};
 use read_horizon::ReadHorizon;
 use read_view::{ReadView, ReadViewCell, VersionStore};
+use recovery::rewrite_recovered_memtable_to_wal;
 use skiplist::InsertHint;
 use snapshot_registry::SnapshotRegistry;
 
@@ -3987,34 +3989,5 @@ fn apply_replayed_wal_entry(memtable: &MemTable, entry: WalEntry) -> u64 {
     }
 }
 
-fn rewrite_recovered_memtable_to_wal(memtable: &MemTable, wal: &mut Wal) -> std::io::Result<()> {
-    let mut wrote_record = false;
-
-    memtable.try_for_each_entry(|internal_key, value| {
-        let (user_key, seq, value_type) = internal_key::decode_internal_key(internal_key);
-        match value_type {
-            internal_key::VALUE_TYPE_VALUE => wal.append_put(user_key, value, seq)?,
-            internal_key::VALUE_TYPE_DELETION => wal.append_delete(user_key, seq)?,
-            internal_key::VALUE_TYPE_MERGE => wal.append_merge(user_key, value, seq)?,
-            other => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("unknown value type {other} in recovered memtable"),
-                ));
-            }
-        }
-        wrote_record = true;
-        Ok(())
-    })?;
-
-    for tombstone in memtable.clone_range_tombstones() {
-        wal.append_delete_range(&tombstone.start, &tombstone.end, tombstone.seq)?;
-        wrote_record = true;
-    }
-
-    if wrote_record {
-        wal.sync_data()?;
-    }
-
-    Ok(())
-}
+#[cfg(test)]
+mod recovery_tests;
