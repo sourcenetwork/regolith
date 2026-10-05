@@ -250,6 +250,7 @@ impl Wal {
     }
 
     /// Append a put record.
+    #[cfg(test)]
     pub(crate) fn append_put(&mut self, key: &[u8], value: &[u8], seq: u64) -> io::Result<()> {
         let mut record = Vec::with_capacity(record_len(put_payload_len(key, value)));
         encode_put_record(&mut record, key, value, seq);
@@ -257,6 +258,7 @@ impl Wal {
     }
 
     /// Append a delete record.
+    #[cfg(test)]
     pub(crate) fn append_delete(&mut self, key: &[u8], seq: u64) -> io::Result<()> {
         let mut record = Vec::with_capacity(record_len(delete_payload_len(key)));
         encode_record(&mut record, RECORD_DELETE, |out| {
@@ -267,6 +269,7 @@ impl Wal {
 
     /// Append a merge record - an operand layered on top of any
     /// existing value/merge chain for `key`.
+    #[cfg(test)]
     pub(crate) fn append_merge(&mut self, key: &[u8], operand: &[u8], seq: u64) -> io::Result<()> {
         let mut record = Vec::with_capacity(record_len(merge_payload_len(key, operand)));
         encode_record(&mut record, RECORD_MERGE, |out| {
@@ -276,6 +279,7 @@ impl Wal {
     }
 
     /// Append a range-delete record covering `[start, end)`.
+    #[cfg(test)]
     pub(crate) fn append_delete_range(
         &mut self,
         start: &[u8],
@@ -535,6 +539,34 @@ pub(crate) fn put_record_len(key: &[u8], value: &[u8]) -> usize {
 /// Encode a single put as one framed record.
 pub(crate) fn encode_put_record(out: &mut Vec<u8>, key: &[u8], value: &[u8], seq: u64) {
     encode_record(out, RECORD_PUT, |o| encode_put_payload(o, key, value, seq));
+}
+
+pub(crate) fn delete_record_len(key: &[u8]) -> usize {
+    record_len(delete_payload_len(key))
+}
+
+pub(crate) fn encode_delete_record(out: &mut Vec<u8>, key: &[u8], seq: u64) {
+    encode_record(out, RECORD_DELETE, |o| encode_delete_payload(o, key, seq));
+}
+
+pub(crate) fn merge_record_len(key: &[u8], operand: &[u8]) -> usize {
+    record_len(merge_payload_len(key, operand))
+}
+
+pub(crate) fn encode_merge_record(out: &mut Vec<u8>, key: &[u8], operand: &[u8], seq: u64) {
+    encode_record(out, RECORD_MERGE, |o| {
+        encode_merge_payload(o, key, operand, seq)
+    });
+}
+
+pub(crate) fn delete_range_record_len(start: &[u8], end: &[u8]) -> usize {
+    record_len(delete_range_payload_len(start, end))
+}
+
+pub(crate) fn encode_delete_range_record(out: &mut Vec<u8>, start: &[u8], end: &[u8], seq: u64) {
+    encode_record(out, RECORD_DELETE_RANGE, |o| {
+        encode_delete_range_payload(o, start, end, seq)
+    });
 }
 
 /// Encode one write-batch operation as one framed record at `seq`.
