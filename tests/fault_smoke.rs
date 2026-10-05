@@ -23,6 +23,9 @@
 
 mod common;
 
+#[path = "fault_smoke/open_variadic.rs"]
+mod open_variadic;
+
 use std::path::Path;
 use std::time::Duration;
 

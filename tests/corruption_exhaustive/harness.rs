@@ -591,7 +591,7 @@ pub fn watch(label: &'static str, body: impl FnOnce(&AtomicU64) + Send + 'static
 // ─── on-disk shapes ─────────────────────────────────────────────────────
 
 /// One framed record. The WAL writes `[len: u32 LE][type: u8][payload]
-/// [crc: u32 LE]` and the MANIFEST writes `[len: u32 LE][record]
+/// [crc: u32 LE]` and the MANIFEST writes `[len: u32 LE][edits]
 /// [crc: u32 LE]`; see `src/engine/wal.rs` and `src/engine/manifest.rs`.
 /// Knowing the frames is what lets these tests say *where* a cut landed
 /// instead of only that it did.
@@ -599,7 +599,7 @@ pub fn watch(label: &'static str, body: impl FnOnce(&AtomicU64) + Send + 'static
 pub struct Frame {
     pub start: u64,
     pub end: u64,
-    /// Record type for a WAL frame, record tag for a MANIFEST frame.
+    /// Record type for a WAL frame, first edit's tag for a MANIFEST frame.
     pub kind: u8,
 }
 
@@ -624,7 +624,7 @@ fn frames(bytes: &[u8], header: usize) -> Vec<Frame> {
         out.push(Frame {
             start: pos as u64,
             end: end as u64,
-            // Byte 4 is the WAL's record type and the MANIFEST record's tag.
+            // Byte 4 is the WAL's record type or the first MANIFEST edit's tag.
             kind: bytes[pos + 4],
         });
         pos = end;

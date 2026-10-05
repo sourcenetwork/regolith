@@ -567,10 +567,9 @@ fn read_var_bytes(data: &[u8], p: &mut usize) -> io::Result<Vec<u8>> {
 ///
 /// The stamp comes from [`VersionSet::encode_stamp`] so a restored
 /// manifest cannot drift from the one the engine writes. The records
-/// mirror the layout produced by `VersionSet::encode_records` /
-/// `ManifestRecord::encode` in [`crate::engine::manifest`]: each is
-/// `[len u32][body][cksum u32]` with the same accidental-corruption
-/// checksum the engine manifest uses.
+/// use the legacy single-edit frames understood by the engine:
+/// `[len u32][body][cksum u32]`, with the same checksum as the batched
+/// frames written by [`crate::engine::manifest`].
 fn encode_engine_manifest(m: &BackupManifest) -> Vec<u8> {
     const TAG_ADD_FILE: u8 = 1;
     const TAG_LAST_SEQ: u8 = 3;
