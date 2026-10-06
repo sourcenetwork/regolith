@@ -174,7 +174,7 @@ proptest! {
         let tracked = tx.tracked.drain();
 
         let want = oracle(&tx, tracked.clone(), &writes, &merges);
-        let checks = tx.validation_set(tracked, &writes, &merges);
+        let checks = tx.validation_set(tracked, &writes, &merges, &[]);
         prop_assert!(
             checks.reads.windows(2).all(|pair| pair[0].key < pair[1].key),
             "reads must be strictly ascending by key with no duplicates"
@@ -213,7 +213,7 @@ fn duplicate_tracked_cells_are_deduped_keeping_the_newest() {
         (b"k".to_vec(), Arc::new(KeyState::new(seq, true))),
         (b"k".to_vec(), Arc::new(KeyState::new(seq, false))),
     ];
-    let checks = tx.validation_set(tracked, &BTreeMap::new(), &[]);
+    let checks = tx.validation_set(tracked, &BTreeMap::new(), &[], &[]);
     assert_eq!(checks.reads.len(), 1, "a duplicate key validates once");
     assert_eq!(checks.reads[0].key.as_slice(), b"k");
 
@@ -223,7 +223,7 @@ fn duplicate_tracked_cells_are_deduped_keeping_the_newest() {
         (b"k".to_vec(), Arc::new(KeyState::new(seq, true))),
         (b"k".to_vec(), Arc::new(KeyState::new(seq, true))),
     ];
-    let checks = tx.validation_set(tracked, &BTreeMap::new(), &[]);
+    let checks = tx.validation_set(tracked, &BTreeMap::new(), &[], &[]);
     assert_eq!(
         checks.reads.len(),
         1,
@@ -379,7 +379,7 @@ proptest! {
             }
             let merges = drain(&tx.merges);
             let tracked = tx.tracked.drain();
-            let mut checks = tx.validation_set(tracked, &writes, &merges);
+            let mut checks = tx.validation_set(tracked, &writes, &merges, &[]);
             if let Some(runs) = tx.scan_runs.take() {
                 let runs = drain(&runs);
                 scan_range::cover(&mut checks.reads, &runs, &writes, &merges, tx.snapshot_seq);

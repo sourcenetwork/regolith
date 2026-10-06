@@ -99,6 +99,7 @@ use crate::sync::{Condvar, Mutex};
 
 use crate::column_family::{DEFAULT_CF_ID, prefix_key};
 use crate::engine::{CommitOutcome, ConflictKey, RegolithEngine, ValidationSet};
+use crate::stamp::{self, Stamp, StampedPut};
 use crate::{Db, DbSlice, Error, Options, Result};
 
 mod scan_range;
@@ -507,6 +508,10 @@ pub struct Transaction<'db> {
     range_deletes: SegQueue<(Vec<u8>, Vec<u8>)>,
     /// Merge operands buffered for commit.
     merges: SegQueue<(Vec<u8>, Vec<u8>)>,
+    /// Stamped puts buffered for commit. Kept apart from `writes`: their
+    /// final keys are unknown until commit, so two of them can share a
+    /// placeholder key without replacing each other.
+    stamped: SegQueue<StampedPut>,
     /// What this transaction has observed about each key it read,
     /// through a point read, or through a scan at Serializable. Sorted
     /// at commit so a multi-key conflict always reports the same key.
@@ -551,6 +556,7 @@ struct Savepoint {
     writes: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
     range_deletes: Vec<(Vec<u8>, Vec<u8>)>,
     merges: Vec<(Vec<u8>, Vec<u8>)>,
+    stamped: Vec<StampedPut>,
     held_lock_count: usize,
 }
 
@@ -611,6 +617,7 @@ impl<'db> Transaction<'db> {
             writes: TxnBuffer::new(keys_inline),
             range_deletes: SegQueue::new(),
             merges: SegQueue::new(),
+            stamped: SegQueue::new(),
             tracked: TxnBuffer::new(keys_inline),
             scan_runs: OnceLock::new(),
             promoted_seq: AtomicU64::new(snapshot_seq),
@@ -811,6 +818,61 @@ impl<'db> Transaction<'db> {
         Ok(())
     }
 
+    /// Buffer a put whose key or value carries this transaction's commit
+    /// sequence. At commit, the [`stamp::STAMP_LEN`] bytes at the `at` offset
+    /// are overwritten with the sequence the engine assigns this write, as a
+    /// big-endian `u64`. Stamps are unique and strictly increasing across
+    /// the database, but not dense, so stamped keys under one prefix sort in
+    /// commit order with gaps between them. One transaction's stamped puts
+    /// take consecutive sequences in the order they were buffered.
+    ///
+    /// A [`Stamp::Key`] write lands on a key no other write can produce, so it
+    /// never conflicts and takes no lock. A [`Stamp::Value`] write is an
+    /// ordinary write to `key` for conflict detection and locking. A stamped
+    /// put applies after this transaction's plain writes, so it wins over
+    /// one to the same final key.
+    ///
+    /// The final key is unknown until commit, so this transaction's own
+    /// reads and scans never see a stamped put.
+    pub fn put_stamped(&self, key: &[u8], value: &[u8], at: Stamp) -> TxResult<()> {
+        let (offset, len, part) = match at {
+            Stamp::Key(offset) => (offset, key.len(), "key"),
+            Stamp::Value(offset) => (offset, value.len(), "value"),
+        };
+        if !stamp::fits(offset, len) {
+            return Err(TransactionError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "a stamp at offset {offset} needs {} bytes, but the {part} is {len} bytes",
+                    stamp::STAMP_LEN
+                ),
+            )));
+        }
+        let prefixed = prefix_key(DEFAULT_CF_ID, key);
+        let at = match at {
+            Stamp::Key(offset) => Stamp::Key(offset + prefixed.len() - key.len()),
+            Stamp::Value(_) => {
+                self.lock_key(&prefixed)?;
+                at
+            }
+        };
+        self.stamped.push(StampedPut {
+            key: prefixed,
+            value: value.to_vec(),
+            at,
+        });
+        Ok(())
+    }
+
+    /// The sequence this transaction's snapshot was taken at: the engine's
+    /// published horizon at begin. Every write at or below it is visible to an
+    /// optimistic transaction's reads, and no later commit is assigned a
+    /// sequence at or below it, so a scan of stamped keys bounded by it never
+    /// gains an entry later.
+    pub fn snapshot_sequence(&self) -> u64 {
+        self.snapshot_seq
+    }
+
     /// Buffer a delete. For pessimistic transactions, acquires an
     /// exclusive lock on the key if not already held.
     pub fn delete(&self, key: &[u8]) -> TxResult<()> {
@@ -866,6 +928,7 @@ impl<'db> Transaction<'db> {
             writes: self.writes.snapshot().into_iter().collect(),
             range_deletes: drain(&self.range_deletes),
             merges: drain(&self.merges),
+            stamped: drain(&self.stamped),
             held_lock_count: self.held_locks.len(),
         });
         // `drain` emptied them, so put back what the savepoint captured.
@@ -875,6 +938,9 @@ impl<'db> Transaction<'db> {
             }
             for entry in &sp.merges {
                 self.merges.push(entry.clone());
+            }
+            for entry in &sp.stamped {
+                self.stamped.push(entry.clone());
             }
         }
     }
@@ -901,6 +967,10 @@ impl<'db> Transaction<'db> {
         self.merges = SegQueue::new();
         for entry in sp.merges {
             self.merges.push(entry);
+        }
+        self.stamped = SegQueue::new();
+        for entry in sp.stamped {
+            self.stamped.push(entry);
         }
         // Locks acquired after the savepoint remain held.
         let _ = sp.held_lock_count;
@@ -974,8 +1044,9 @@ impl<'db> Transaction<'db> {
         }
         let range_deletes = drain(&self.range_deletes);
         let merges = drain(&self.merges);
+        let stamped = drain(&self.stamped);
         let tracked = self.tracked.drain();
-        let mut checks = self.validation_set(tracked, &writes, &merges);
+        let mut checks = self.validation_set(tracked, &writes, &merges, &stamped);
         // Behind the `take`, not threaded through `validation_set`, so a
         // transaction that never scans (the common case) pays no `Vec`
         // round trip for an empty run list on its commit path.
@@ -998,7 +1069,14 @@ impl<'db> Transaction<'db> {
         // the commit carrying an op. See the comment there for why.
         let outcome = self
             .engine
-            .commit_with_conflict_check(&checks, writes, range_deletes, merges, self.durability)
+            .commit_with_conflict_check(
+                &checks,
+                writes,
+                range_deletes,
+                merges,
+                stamped,
+                self.durability,
+            )
             .map_err(TransactionError::Io)?;
         match outcome {
             CommitOutcome::Ok => Ok(()),
@@ -1046,6 +1124,7 @@ impl<'db> Transaction<'db> {
         mut tracked: Vec<(Vec<u8>, Arc<KeyState>)>,
         writes: &BTreeMap<Vec<u8>, Option<Vec<u8>>>,
         merges: &[(Vec<u8>, Vec<u8>)],
+        stamped: &[StampedPut],
     ) -> ValidationSet {
         let optimistic = matches!(self.mode, TxMode::Optimistic);
         let every_read = self.isolation.validates_every_read();
@@ -1058,8 +1137,11 @@ impl<'db> Transaction<'db> {
         let reads = tracked
             .into_iter()
             .filter(|(key, state)| {
-                let written =
-                    writes.contains_key(key) || merges.iter().any(|(merged, _)| merged == key);
+                let written = writes.contains_key(key)
+                    || merges.iter().any(|(merged, _)| merged == key)
+                    || stamped
+                        .iter()
+                        .any(|put| matches!(put.at, Stamp::Value(_)) && put.key == *key);
                 if every_read {
                     // Every read, whether or not the transaction wrote it.
                     true

@@ -42,6 +42,7 @@ use super::wal::{MAX_RECORD_LEN, Wal, check_write_len};
 use super::{CommitOutcome, DurabilityMode, ReadView, RegolithEngine, grouped_batch_ops};
 use crate::WriteBatchOp;
 use crate::perf_context::{PerfTimer, PerfTimerField};
+use crate::stamp::{self, Stamp};
 use crate::statistics::{Histogram, Ticker};
 
 mod request;
@@ -294,10 +295,22 @@ impl RegolithEngine {
         point_ops: std::collections::BTreeMap<Vec<u8>, Option<Vec<u8>>>,
         range_deletes: Vec<(Vec<u8>, Vec<u8>)>,
         merges: Vec<(Vec<u8>, Vec<u8>)>,
+        stamped: Vec<crate::stamp::StampedPut>,
         durability: DurabilityMode,
     ) -> io::Result<CommitOutcome> {
         self.ensure_writable()?;
-        let ops = grouped_batch_ops(point_ops, range_deletes, merges);
+        let mut ops = grouped_batch_ops(point_ops, range_deletes, merges);
+        // Stamped puts go last, so their op indices, and so their sequences,
+        // follow the order they were buffered in.
+        let stamped_from = ops.len();
+        let mut stamps = Vec::with_capacity(stamped.len());
+        for put in stamped {
+            stamps.push(put.at);
+            ops.push(WriteBatchOp::Put {
+                key: put.key,
+                value: put.value,
+            });
+        }
         self.validate_ops_sizes(&ops, false)?;
 
         // The write-stall admission a plain write pays with
@@ -315,7 +328,7 @@ impl RegolithEngine {
                 .map_err(crate::Error::into_io_error)?;
         }
 
-        self.commit_locked(checks, ops, durability)
+        self.commit_locked(checks, ops, stamped_from, &stamps, durability)
     }
 
     /// The conflict check and the apply, under one uninterrupted hold of
@@ -327,7 +340,9 @@ impl RegolithEngine {
     fn commit_locked(
         &self,
         checks: &crate::engine::ValidationSet,
-        ops: Vec<WriteBatchOp>,
+        mut ops: Vec<WriteBatchOp>,
+        stamped_from: usize,
+        stamps: &[Stamp],
         durability: DurabilityMode,
     ) -> io::Result<CommitOutcome> {
         let mut pipe = self.pipeline.lock();
@@ -360,7 +375,12 @@ impl RegolithEngine {
         if let Some(observed_seq) = checks.writes_at {
             let mut merged_keys: std::collections::HashSet<&[u8]> =
                 std::collections::HashSet::new();
-            for op in &ops {
+            for (index, op) in ops.iter().enumerate() {
+                // A key stamp makes the final key unique, so nothing can have
+                // written it and nothing will.
+                if index >= stamped_from && matches!(stamps[index - stamped_from], Stamp::Key(_)) {
+                    continue;
+                }
                 let key = match op {
                     WriteBatchOp::Put { key, .. } | WriteBatchOp::Delete { key } => key,
                     WriteBatchOp::Merge { key, .. } => {
@@ -407,6 +427,21 @@ impl RegolithEngine {
             return Ok(CommitOutcome::Ok);
         }
 
+        // Every sequence is allocated under the pipeline mutex held here, and
+        // this commit runs as a group of one, so its ops take the sequences
+        // right after `latest_seq`, in op order.
+        let base_seq = self.latest_seq.load(Ordering::Acquire) + 1;
+        for (offset, at) in stamps.iter().enumerate() {
+            let index = stamped_from + offset;
+            let seq = base_seq + index as u64;
+            if let WriteBatchOp::Put { key, value } = &mut ops[index] {
+                match *at {
+                    Stamp::Key(at) => stamp::write(key, at, seq),
+                    Stamp::Value(at) => stamp::write(value, at, seq),
+                }
+            }
+        }
+
         let request = WriteRequest::Batch {
             ops,
             durability,
@@ -418,6 +453,10 @@ impl RegolithEngine {
             request,
         });
         let result = self.run_and_complete(&mut pipe, view);
+        debug_assert!(
+            !matches!(result, Ok(seq) if seq != base_seq),
+            "a commit's stamps must match the sequences its group was assigned"
+        );
         self.drain_locked(&mut pipe);
         result.map(|_| CommitOutcome::Ok)
     }
