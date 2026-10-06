@@ -1390,12 +1390,7 @@ impl Db {
             "regolith.block-cache-usage" => Some(self.engine.block_cache_usage() as u64),
             "regolith.block-cache-capacity" => Some(self.engine.block_cache_capacity() as u64),
             "regolith.pinned-metadata-bytes" => Some(self.engine.pinned_metadata_bytes() as u64),
-            // Background errors are surfaced through the
-            // `EventListener::on_background_error` callback today,
-            // with no dedicated counter yet. Report `0` so any
-            // monitoring layer consuming this property gets a
-            // stable numeric value instead of `None`.
-            "regolith.background-errors" => Some(0),
+            "regolith.background-errors" => Some(self.engine.background_error_count()),
             _ => None,
         }
     }
