@@ -279,6 +279,7 @@ fn an_oversized_write_is_refused_before_it_reaches_the_pipeline() {
                     point_ops,
                     range_deletes,
                     merges,
+                    Vec::new(),
                     DurabilityMode::Eventual,
                 )
                 .map(|_outcome| 0)

@@ -328,7 +328,7 @@ mod tests {
             "one run per stretch, split at the buffered b"
         );
         let tracked = tx.tracked.drain();
-        let mut checks = tx.validation_set(tracked, &BTreeMap::new(), &[]);
+        let mut checks = tx.validation_set(tracked, &BTreeMap::new(), &[], &[]);
         cover(
             &mut checks.reads,
             &runs,

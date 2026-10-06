@@ -2180,9 +2180,17 @@ impl RegolithEngine {
         point_ops: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
         range_deletes: Vec<(Vec<u8>, Vec<u8>)>,
         merges: Vec<(Vec<u8>, Vec<u8>)>,
+        stamped: Vec<crate::stamp::StampedPut>,
         durability: DurabilityMode,
     ) -> std::io::Result<CommitOutcome> {
-        self.commit_optimistic(checks, point_ops, range_deletes, merges, durability)
+        self.commit_optimistic(
+            checks,
+            point_ops,
+            range_deletes,
+            merges,
+            stamped,
+            durability,
+        )
     }
 
     /// Whether this commit's write for `key` would store exactly what `key`
