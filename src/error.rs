@@ -41,6 +41,22 @@ pub enum Error {
     /// diagnostics.
     #[error("merge operator failed for key {0:?}")]
     MergeFailed(Vec<u8>),
+    /// A write was stalled behind background work (a flush or a
+    /// compaction) whose most recent attempt failed, so waiting would not
+    /// end. `source` carries the failure, OS error code included, so a
+    /// caller can tell a full disk (ENOSPC) or an exhausted descriptor
+    /// table (EMFILE) from anything else. The engine keeps retrying; a
+    /// later write succeeds once the job does.
+    #[error("background {job} is failing ({hazard}), so writes cannot proceed: {source}")]
+    BackgroundFailed {
+        /// The job the write was waiting on: `"flush"` or `"compaction"`.
+        job: &'static str,
+        /// The class of the failure, such as `"disk full"`.
+        hazard: &'static str,
+        /// The failure itself.
+        #[source]
+        source: std::io::Error,
+    },
     /// An underlying I/O error from the filesystem or operating system.
     #[error("I/O error: {0}")]
     Io(#[source] std::io::Error),
@@ -72,6 +88,7 @@ impl Error {
     pub(crate) fn into_io_error(self) -> std::io::Error {
         match self {
             Self::Io(io) | Self::Corruption(io) => io,
+            Self::BackgroundFailed { source, .. } => source,
             Self::InvalidArgument(message) | Self::InvalidColumnFamily(message) => {
                 std::io::Error::new(std::io::ErrorKind::InvalidInput, message)
             }

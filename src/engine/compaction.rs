@@ -15,7 +15,7 @@ use kovan_channel::unbounded::Sender;
 
 // Through the portability shim so a target without 64-bit atomics still
 // builds; see `src/portability.rs`.
-use crate::portability::{AtomicBool, AtomicU64, Ordering};
+use crate::portability::{AtomicBool, Ordering};
 
 use super::block_cache::BlockCache;
 use super::internal_key::{compare_internal_keys, decode_internal_key, user_key_of};
@@ -29,6 +29,9 @@ use super::sstable::{
     LiveSst, MetadataPolicy, SsTableInternalIter, SsTableMeta, SsTableReader, SsTableWriter,
     remove_sst_in, sst_filename,
 };
+use crate::engine::background_health::BackgroundHealth;
+#[cfg(not(target_arch = "wasm32"))]
+use crate::engine::background_health::Job;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::engine::compaction_backoff::FailureBackoff;
 use crate::engine::pending_outputs::PendingOutputs;
@@ -120,7 +123,7 @@ impl CompactionScheduler {
         opts: CompactionOptions,
         stall_signal: Arc<crate::engine::StallSignal>,
         in_progress: Arc<crate::sync::Mutex<HashSet<u64>>>,
-        background_errors: Arc<AtomicU64>,
+        health: Arc<BackgroundHealth>,
     ) -> std::io::Result<Self> {
         let shutdown = Arc::new(AtomicBool::new(false));
         let (trigger, receiver) = kovan_channel::unbounded::<()>();
@@ -165,7 +168,7 @@ impl CompactionScheduler {
                 let opts_clone = opts.clone();
                 let stall_clone = Arc::clone(&stall_signal);
                 let in_progress_clone = Arc::clone(&in_progress);
-                let errors_clone = Arc::clone(&background_errors);
+                let health_clone = Arc::clone(&health);
 
                 let spawned = spawn_worker(&*opts.env, i, move || {
                     compaction_loop(
@@ -180,7 +183,7 @@ impl CompactionScheduler {
                         opts_clone,
                         stall_clone,
                         in_progress_clone,
-                        errors_clone,
+                        health_clone,
                     );
                 });
 
@@ -411,7 +414,7 @@ fn compaction_loop(
     opts: CompactionOptions,
     stall_signal: Arc<crate::engine::StallSignal>,
     in_progress: Arc<crate::sync::Mutex<HashSet<u64>>>,
-    background_errors: Arc<AtomicU64>,
+    health: Arc<BackgroundHealth>,
 ) {
     let mut backoff = FailureBackoff::default();
     loop {
@@ -453,13 +456,15 @@ fn compaction_loop(
                 ) {
                     Ok(outcome) => {
                         backoff.record_success();
+                        health.record_success(Job::Compaction);
                         outcome == CompactionOutcome::DidWork
                     }
                     Err(e) => {
-                        background_errors.fetch_add(1, Ordering::Relaxed);
+                        let hazard = health.record_failure(Job::Compaction, &e);
                         let retry_in = backoff.record_failure(Instant::now());
                         tracing::error!(
                             error = %e,
+                            hazard = hazard.label(),
                             consecutive_failures = backoff.consecutive_failures(),
                             retry_in_secs = retry_in.as_secs(),
                             "Compaction failed"
@@ -2324,7 +2329,7 @@ mod tests {
                 opts,
                 Arc::new(crate::engine::StallSignal::new()),
                 Arc::new(crate::sync::Mutex::new(HashSet::new())),
-                Arc::new(AtomicU64::new(0)),
+                Arc::new(BackgroundHealth::default()),
             )
         };
 
@@ -2425,7 +2430,7 @@ mod tests {
                 opts,
                 Arc::new(crate::engine::StallSignal::new()),
                 Arc::new(crate::sync::Mutex::new(HashSet::new())),
-                Arc::new(AtomicU64::new(0)),
+                Arc::new(BackgroundHealth::default()),
             )
         };
         let elapsed = start.elapsed();

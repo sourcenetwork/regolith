@@ -1,10 +1,12 @@
-//! How the engine behaves when compaction keeps failing.
+//! How the engine behaves when background work keeps failing.
 //!
 //! A failed compaction must not leave its outputs on disk: nothing
 //! references them, so a compaction that kept failing (out of file
 //! descriptors, say) used to leak a full set on every retry until the disk
 //! filled. A background worker must also back off between failed passes
-//! and report them through `regolith.background-errors`.
+//! and report them through `regolith.background-errors`. A writer
+//! stopped behind failing work must get that failure back rather than
+//! wait forever, and writes must resume once the fault clears.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -64,6 +66,16 @@ impl SstBudgetEnv {
     }
 }
 
+#[cfg(unix)]
+fn emfile() -> io::Error {
+    io::Error::from_raw_os_error(24)
+}
+
+#[cfg(not(unix))]
+fn emfile() -> io::Error {
+    io::Error::other("Too many open files")
+}
+
 fn is_sst(path: &Path) -> bool {
     path.extension().is_some_and(|ext| ext == "sst")
 }
@@ -84,7 +96,7 @@ impl Env for SstBudgetEnv {
     fn open_write(&self, path: &Path, mode: WriteMode) -> io::Result<Box<dyn WriteFile>> {
         if is_sst(path) && !self.take_sst() {
             self.refused.fetch_add(1, Ordering::SeqCst);
-            return Err(io::Error::other("Too many open files (os error 24)"));
+            return Err(emfile());
         }
         self.inner.open_write(path, mode)
     }
@@ -255,4 +267,124 @@ fn a_flush_that_fails_after_writing_its_table_leaves_no_file_behind() {
     for i in 0..2_000u32 {
         assert!(db.get(&key(i)).unwrap().is_some(), "key {i} lost");
     }
+}
+
+/// Run `op` on another thread and fail the test if it has not returned
+/// within `limit`: the regression these tests guard against is a hang.
+fn within<T: Send + 'static>(limit: Duration, op: impl FnOnce() -> T + Send + 'static) -> T {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(op());
+    });
+    rx.recv_timeout(limit)
+        .expect("the write hung instead of returning")
+}
+
+fn wait_until(limit: Duration, mut ready: impl FnMut() -> bool) {
+    let deadline = std::time::Instant::now() + limit;
+    while !ready() {
+        assert!(std::time::Instant::now() < deadline, "condition never held");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[test]
+fn a_writer_stopped_behind_failing_compaction_gets_the_failure_instead_of_waiting() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = Arc::new(SstBudgetEnv::new());
+    let opts = |l0_compaction_trigger| Options {
+        env: Arc::clone(&env) as Arc<dyn Env>,
+        l0_compaction_trigger,
+        level0_slowdown_writes_trigger: 0,
+        level0_stop_writes_trigger: 4,
+        ..Options::default()
+    };
+
+    let db = Db::open(dir.path(), opts(1_000)).unwrap();
+    for batch in 0..4u32 {
+        for i in 0..200u32 {
+            db.put(&key(batch * 200 + i), b"value").unwrap();
+        }
+        db.flush().unwrap();
+    }
+    db.close().unwrap();
+    drop(db);
+
+    env.allow_ssts(0);
+    let db = Arc::new(Db::open(dir.path(), opts(2)).unwrap());
+    wait_until(Duration::from_secs(10), || {
+        db.get_int_property("regolith.background-errors").unwrap() > 0
+    });
+
+    let writer = Arc::clone(&db);
+    let result = within(Duration::from_secs(10), move || {
+        writer.put(b"stalled", b"v")
+    });
+    match result {
+        Err(regolith::Error::BackgroundFailed { job, source, .. }) => {
+            assert_eq!(job, "compaction");
+            #[cfg(unix)]
+            assert_eq!(source.raw_os_error(), Some(24), "the cause must survive");
+            #[cfg(not(unix))]
+            let _ = source;
+        }
+        other => panic!("expected BackgroundFailed, got {other:?}"),
+    }
+
+    env.allow_ssts(UNLIMITED);
+    let writer = Arc::clone(&db);
+    within(Duration::from_secs(90), move || {
+        wait_until(Duration::from_secs(85), || {
+            writer.put(b"recovered", b"v").is_ok()
+        })
+    });
+    assert!(db.get(b"recovered").unwrap().is_some());
+    for i in 0..800u32 {
+        assert!(db.get(&key(i)).unwrap().is_some(), "key {i} lost");
+    }
+}
+
+#[test]
+fn a_writer_stopped_behind_failing_flushes_retries_them_and_recovers() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = Arc::new(SstBudgetEnv::new());
+    let db = Arc::new(
+        Db::open(
+            dir.path(),
+            Options {
+                env: Arc::clone(&env) as Arc<dyn Env>,
+                write_buffer_size: 64 * 1024,
+                max_write_buffer_number: 1,
+                ..Options::default()
+            },
+        )
+        .unwrap(),
+    );
+
+    env.allow_ssts(0);
+    let writer = Arc::clone(&db);
+    let failure = within(Duration::from_secs(20), move || {
+        for i in 0..100_000u32 {
+            if let Err(e) = writer.put(&key(i), &[1u8; 256])
+                && matches!(e, regolith::Error::BackgroundFailed { job: "flush", .. })
+            {
+                return Some(e);
+            }
+        }
+        None
+    });
+    assert!(
+        failure.is_some(),
+        "writes behind failing flushes must hit BackgroundFailed"
+    );
+
+    env.allow_ssts(UNLIMITED);
+    let writer = Arc::clone(&db);
+    within(Duration::from_secs(20), move || {
+        wait_until(Duration::from_secs(15), || {
+            writer.put(b"recovered", b"v").is_ok()
+        })
+    });
+    db.flush().unwrap();
+    assert!(db.get(b"recovered").unwrap().is_some());
 }
