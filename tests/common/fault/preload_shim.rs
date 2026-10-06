@@ -502,6 +502,14 @@ pub unsafe extern "C" fn ftruncate(fd: c_int, len: i64) -> c_int {
     ftruncate64(fd, len)
 }
 
+// C declares the open family variadic (`int open(const char *, int, ...)`),
+// and rustc 1.99 rejects a fixed-arity definition of a symbol std calls
+// (`invalid_runtime_symbol_definitions`). C-variadic definitions are not
+// stable on every toolchain this suite supports. The shim only loads via
+// LD_PRELOAD on x86_64 and aarch64 Linux, where a variadic `int` arrives in
+// the same register as a fixed third argument, so reading `mode` as one is
+// exact there. `unknown_lints` keeps older toolchains quiet.
+#[allow(unknown_lints, invalid_runtime_symbol_definitions)]
 #[no_mangle]
 pub unsafe extern "C" fn open64(path: *const c_char, flags: c_int, mode: c_int) -> c_int {
     let real = real!(o, OpenFn, "open64");
@@ -514,11 +522,13 @@ pub unsafe extern "C" fn open64(path: *const c_char, flags: c_int, mode: c_int) 
     fd
 }
 
+#[allow(unknown_lints, invalid_runtime_symbol_definitions)]
 #[no_mangle]
 pub unsafe extern "C" fn open(path: *const c_char, flags: c_int, mode: c_int) -> c_int {
     open64(path, flags, mode)
 }
 
+#[allow(unknown_lints, invalid_runtime_symbol_definitions)]
 #[no_mangle]
 pub unsafe extern "C" fn openat64(
     dirfd: c_int,
@@ -536,6 +546,7 @@ pub unsafe extern "C" fn openat64(
     fd
 }
 
+#[allow(unknown_lints, invalid_runtime_symbol_definitions)]
 #[no_mangle]
 pub unsafe extern "C" fn openat(dirfd: c_int, path: *const c_char, flags: c_int, mode: c_int) -> c_int {
     openat64(dirfd, path, flags, mode)
