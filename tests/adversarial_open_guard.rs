@@ -130,22 +130,20 @@ fn a_zero_length_orphan_table_opens_and_keeps_every_acknowledged_write() {
 
 /// Recovery deletes nothing, so repeating it converges.
 ///
-/// The guard dismisses a zero-length orphan instead of removing it. That
-/// is what makes a crash part way through recovery re-entrant: every
-/// open sees the directory the previous one saw and reaches the same
-/// verdict, and there is no cleanup step for a second crash to land in
-/// the middle of. Removing it instead would race a second process that
-/// holds the same directory open and is flushing into that very id.
+/// The guard dismisses a zero-length orphan rather than refusing the open,
+/// and recovery from the wiped manifest leaves it exactly as it found it:
+/// a manifest that did not replay cleanly cannot say what is unreferenced.
 ///
-/// This is the "opened" half of the contract. The refusal tests already
-/// pin the other half with `orphan.exists()`; nothing pinned this one,
-/// so a later tidy-up that deleted dismissed orphans would have passed
-/// every test in this file.
+/// Once recovery has rebuilt the manifest, a later writable open's orphan
+/// sweep removes the file where the directory lock excludes other
+/// processes, since no other writer can be flushing into that id. Where
+/// the lock does not, the file is never touched.
 #[test]
-fn an_open_that_dismissed_a_zero_length_orphan_leaves_it_on_disk() {
+fn an_open_that_dismissed_a_zero_length_orphan_reaches_the_same_verdict_every_time() {
     let dir = wal_only_copy(61);
     let orphan = dir.path().join("sst").join("000003.sst");
     fs::write(&orphan, b"").expect("write orphan");
+    let swept = regolith::env::Env::capabilities(&regolith::env::StdEnv::new()).file_lock;
 
     for attempt in 0..3 {
         let db = Db::open(dir.path(), opts()).unwrap_or_else(|e| {
@@ -155,15 +153,21 @@ fn an_open_that_dismissed_a_zero_length_orphan_leaves_it_on_disk() {
         db.close().expect("close");
         drop(db);
 
-        let len = fs::metadata(&orphan)
-            .unwrap_or_else(|e| panic!("attempt {attempt}: recovery deleted the orphan: {e}"))
-            .len();
-        assert_eq!(
-            len, 0,
-            "attempt {attempt}: recovery must leave the dismissed orphan exactly as it found it",
-        );
+        if swept && attempt > 0 {
+            assert!(
+                !orphan.exists(),
+                "attempt {attempt}: a locked writable open must sweep the orphan",
+            );
+        } else {
+            let len = fs::metadata(&orphan)
+                .unwrap_or_else(|e| panic!("attempt {attempt}: recovery deleted the orphan: {e}"))
+                .len();
+            assert_eq!(
+                len, 0,
+                "attempt {attempt}: without a process lock, recovery must leave the orphan as it found it",
+            );
+        }
     }
-    println!("zero-length orphan: survived 3 open/close cycles at 0 bytes");
 }
 
 /// A table truncated to any non-zero prefix cannot be proved empty, so

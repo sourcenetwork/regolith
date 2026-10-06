@@ -578,9 +578,12 @@ fn a_process_kill_during_a_flush_installs_no_truncated_sstable() {
 
 /// Proves a crash while a compaction is writing its output keeps the
 /// compaction inputs live and discards the output: every acknowledged
-/// write is still readable, at least one SSTable the crash interrupted is
-/// on disk without being referenced by the recovered version, and no file
-/// the version does reference is missing.
+/// write is still readable, at least one SSTable the crash left on disk is
+/// not referenced by the recovered version, and no file the version does
+/// reference is missing.
+///
+/// The crash's files are listed before the reopen, because a writable
+/// open removes the SSTables its manifest does not name.
 ///
 /// The run is confirmed from the recorded thread ids to have had a
 /// background SSTable write in flight at the crash, and confirmed from the
@@ -615,14 +618,15 @@ fn a_process_kill_during_a_compaction_keeps_the_inputs_and_discards_the_output()
         out.journal,
     );
 
+    let on_disk: BTreeSet<u64> = fault::find_ssts(&db).iter().map(|p| sst_id_of(p)).collect();
     let recovered = reopen(&db, opts.clone());
     let live = live_file_ids(&recovered);
-    let on_disk: BTreeSet<u64> = fault::find_ssts(&db).iter().map(|p| sst_id_of(p)).collect();
     let discarded: Vec<u64> = on_disk.difference(&live).copied().collect();
     assert!(
         !discarded.is_empty(),
-        "every SSTable on disk was installed into the recovered version, so the output the \
-         crash interrupted was published rather than discarded (on disk {on_disk:?})",
+        "every SSTable the crash left on disk was installed into the recovered version, so \
+         the output the crash interrupted was published rather than discarded (on disk \
+         {on_disk:?})",
     );
     assert_no_dangling_files(&recovered, &db, "compaction");
     let report = fault::assert_valid_prefix(&recovered, &out.history);
