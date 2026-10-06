@@ -53,7 +53,26 @@ struct Shared {
 struct Clock {
     slots: Vec<Weak<Slot>>,
     hand: usize,
+    /// Prune retired slots once `slots` reaches this length. Without it a
+    /// store that never exceeds the limit (so never sweeps) keeps a weak
+    /// entry for every table it ever opened, and `remove_file` scans them
+    /// all. Doubling keeps pruning amortized O(1) per open.
+    prune_at: usize,
 }
+
+impl Clock {
+    fn push(&mut self, slot: &Arc<Slot>) {
+        self.slots.push(Arc::downgrade(slot));
+        if self.slots.len() >= self.prune_at {
+            self.slots.retain(|w| w.strong_count() > 0);
+            self.hand = 0;
+            self.prune_at = (2 * self.slots.len()).max(MIN_PRUNE_AT);
+        }
+    }
+}
+
+/// Slots below which pruning is not worth a pass.
+const MIN_PRUNE_AT: usize = 64;
 
 struct Slot {
     path: PathBuf,
@@ -185,7 +204,7 @@ impl Env for OpenFileLimit {
             shared: Arc::clone(&self.shared),
         });
         self.shared.open.fetch_add(1, Ordering::Relaxed);
-        self.shared.clock.lock().slots.push(Arc::downgrade(&slot));
+        self.shared.clock.lock().push(&slot);
         self.shared.make_room(&slot);
         Ok(Box::new(LimitedFile(slot)))
     }
@@ -297,6 +316,23 @@ mod tests {
             }
         }
         drop(files);
+        assert_eq!(env.open_count(), 0);
+    }
+
+    #[test]
+    fn retired_slots_are_pruned_without_descriptor_pressure() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = write_tables(dir.path(), 1);
+        // A limit that is never reached, so the eviction sweep never runs.
+        let env = OpenFileLimit::new(std_env(), 1_000_000);
+        for _ in 0..10_000 {
+            drop(env.open_read(&paths[0]).unwrap());
+        }
+        let tracked = env.shared.clock.lock().slots.len();
+        assert!(
+            tracked <= 2 * MIN_PRUNE_AT,
+            "{tracked} slots tracked for one live file"
+        );
         assert_eq!(env.open_count(), 0);
     }
 
