@@ -39,13 +39,21 @@ impl SstBudgetEnv {
     }
 
     fn take_sst(&self) -> bool {
-        self.remaining
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| match n {
-                UNLIMITED => Some(UNLIMITED),
-                0 => None,
-                n => Some(n - 1),
-            })
-            .is_ok()
+        let mut n = self.remaining.load(Ordering::SeqCst);
+        loop {
+            let next = match n {
+                UNLIMITED => return true,
+                0 => return false,
+                n => n - 1,
+            };
+            match self
+                .remaining
+                .compare_exchange(n, next, Ordering::SeqCst, Ordering::SeqCst)
+            {
+                Ok(_) => return true,
+                Err(current) => n = current,
+            }
+        }
     }
 }
 
