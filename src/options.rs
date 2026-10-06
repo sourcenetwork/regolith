@@ -712,6 +712,20 @@ pub struct Options {
     /// [`crate::env::Env::capabilities`] and handed back to callers
     /// through [`crate::Db::capabilities`].
     pub env: Arc<dyn crate::env::Env>,
+
+    /// Most SSTables that keep a file descriptor open at once. `0`, the
+    /// default, keeps every live table's file open, one descriptor per
+    /// table.
+    ///
+    /// A store needs a descriptor per live table, plus those a compaction
+    /// is reading and writing, so a large store or a process with a low
+    /// `RLIMIT_NOFILE` (256 under macOS launchd) runs out and compaction
+    /// fails with EMFILE. With a limit, the least recently read tables
+    /// have their descriptor closed and reopened on the next read; a
+    /// read that misses the block cache on such a table pays an `open`.
+    /// The limit is soft: tables a compaction has just deleted stay open
+    /// until no snapshot or iterator can read them.
+    pub max_open_files: usize,
 }
 
 impl Default for Options {
@@ -757,6 +771,7 @@ impl Default for Options {
             max_value_size: DEFAULT_MAX_VALUE_SIZE,
             transaction_keys_inline: DEFAULT_TRANSACTION_KEYS_INLINE,
             env: crate::env::std_env(),
+            max_open_files: 0,
         }
     }
 }
@@ -1357,7 +1372,14 @@ impl Options {
             read_only: self.read_only,
             max_key_size: self.max_key_size,
             max_value_size: self.max_value_size,
-            env: Arc::clone(&self.env),
+            env: if self.max_open_files > 0 {
+                Arc::new(crate::env::OpenFileLimit::new(
+                    Arc::clone(&self.env),
+                    self.max_open_files,
+                ))
+            } else {
+                Arc::clone(&self.env)
+            },
         }
     }
 }

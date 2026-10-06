@@ -37,6 +37,7 @@
 mod buffered;
 mod db_lock;
 mod mem_env;
+mod open_file_limit;
 mod types;
 // The browser's Origin Private File System. Only compiled for
 // `wasm32-unknown-unknown`, the one target with no `std::fs` at all;
@@ -59,6 +60,7 @@ pub use types::{Capabilities, DirEntry, DiskSpace, FileMeta, WriteMode};
 pub use wasi::WasiEnv;
 
 pub(crate) use buffered::BufferedWriter;
+pub(crate) use open_file_limit::OpenFileLimit;
 
 use std::io;
 use std::path::Path;
