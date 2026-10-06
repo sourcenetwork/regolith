@@ -1,4 +1,5 @@
 pub(crate) mod arena;
+pub(crate) mod background_health;
 pub(crate) mod block;
 pub(crate) mod block_cache;
 pub(crate) mod bloom;
@@ -35,12 +36,15 @@ use std::sync::Arc;
 use crate::sync::{Gate, Mutex, MutexGuard, OwnedGateWriteGuard};
 use kovan_queue::array_queue::ArrayQueue;
 
+use background_health::{BackgroundHealth, Hazard, Job};
 use block_cache::BlockCache;
 use commit::{Pipeline, StallSignal, WriteSlot};
 use compaction::{CompactionOptions, CompactionOutcome, CompactionScheduler};
 use lookup_key::{LookupKey, with_key_scratch};
 use manifest::{VersionEdit, VersionSet};
 use memtable::{MemTable, MemTableConfig};
+
+const STOP_TOO_MANY_MEMTABLES: &str = "stop: too many memtables";
 use pending_outputs::PendingOutputs;
 use read_horizon::ReadHorizon;
 use read_view::{ReadView, ReadViewCell, VersionStore};
@@ -485,8 +489,8 @@ pub(crate) struct RegolithEngine {
     /// for the whole engine is what stops a foreground pass and a
     /// worker from picking overlapping inputs.
     compaction_in_progress: Arc<Mutex<HashSet<u64>>>,
-    /// Failed background compaction passes since open.
-    background_errors: Arc<AtomicU64>,
+    /// Whether background flushes and compactions are currently failing.
+    background_health: Arc<BackgroundHealth>,
     /// The host platform. Cloned out of [`EngineOptions`] so the read
     /// and write paths reach it without going through `options`.
     env: Arc<dyn Env>,
@@ -610,7 +614,7 @@ impl RegolithEngine {
         let snapshot_registry = Arc::new(SnapshotRegistry::with_env(Arc::clone(&env)));
         let stall_signal = Arc::new(StallSignal::new());
         let compaction_in_progress = Arc::new(Mutex::new(HashSet::new()));
-        let background_errors = Arc::new(AtomicU64::new(0));
+        let background_health = Arc::new(BackgroundHealth::default());
         // `max_background_compactions == 0` starts no worker, which is
         // how a single-threaded target opens at all. A platform that
         // cannot spawn a worker it was asked for fails the open here
@@ -625,7 +629,7 @@ impl RegolithEngine {
             compaction_opts,
             Arc::clone(&stall_signal),
             Arc::clone(&compaction_in_progress),
-            Arc::clone(&background_errors),
+            Arc::clone(&background_health),
         )?;
 
         let engine = Arc::new(Self {
@@ -655,7 +659,7 @@ impl RegolithEngine {
             stall_signal,
             cached_stall_level: AtomicU8::new(0),
             compaction_in_progress,
-            background_errors,
+            background_health,
             env,
             _db_lock: db_lock,
         });
@@ -797,7 +801,7 @@ impl RegolithEngine {
             stall_signal,
             cached_stall_level: AtomicU8::new(0),
             compaction_in_progress: Arc::new(Mutex::new(HashSet::new())),
-            background_errors: Arc::new(AtomicU64::new(0)),
+            background_health: Arc::new(BackgroundHealth::default()),
             env,
             _db_lock: db_lock,
         }))
@@ -1919,7 +1923,7 @@ impl RegolithEngine {
         if opts.max_write_buffer_number > 0
             && memtables >= opts.max_write_buffer_number.saturating_mul(2)
         {
-            return Some(("stop: too many memtables", true));
+            return Some((STOP_TOO_MANY_MEMTABLES, true));
         }
         if opts.hard_pending_compaction_bytes_limit > 0
             && pending_bytes >= opts.hard_pending_compaction_bytes_limit
@@ -1976,6 +1980,45 @@ impl RegolithEngine {
     /// Shared by both stall policies: `WaitForWorker` waits on the
     /// background worker, and `CompactInline` waits on whichever other
     /// foreground thread currently holds the input files it needs.
+    /// One wait step for a writer stopped behind background work, or the
+    /// error that says waiting would not end.
+    ///
+    /// Too many memtables means flushes are failing: memtables are written
+    /// out by the writer that seals them, and no worker retries one that
+    /// failed, so a stopped writer that only waited would wait forever,
+    /// even after the fault cleared. It retries the oldest flush itself,
+    /// unless another thread holds the flush exclusion, and returns that
+    /// flush's error if it fails. Any other stop is relieved by
+    /// compaction; while the last compaction pass failed, the writer
+    /// returns that failure instead of waiting on a retry that is
+    /// likely to fail the same way.
+    fn wait_out_stop(&self, reason: &'static str) -> Result<(), crate::Error> {
+        if reason == STOP_TOO_MANY_MEMTABLES {
+            if !self.ingest_holds_flushes.load(Ordering::Acquire)
+                && let Some(flushing) = self.flushing.try_lock()
+            {
+                let flushed = self.flush_oldest_frozen(&flushing);
+                drop(flushing);
+                return match flushed {
+                    Ok(_) => {
+                        self.refresh_stall_level();
+                        self.stall_signal.notify_all();
+                        Ok(())
+                    }
+                    Err(source) => Err(crate::Error::BackgroundFailed {
+                        job: Job::Flush.name(),
+                        hazard: Hazard::of(&source).label(),
+                        source,
+                    }),
+                };
+            }
+        } else if let Some(failure) = self.background_health.failing(Job::Compaction) {
+            return Err(failure.to_error());
+        }
+        self.wait_for_stall_signal();
+        Ok(())
+    }
+
     fn wait_for_stall_signal(&self) {
         self.stall_signal.wait(Self::STALL_WAIT);
     }
@@ -2097,7 +2140,7 @@ impl RegolithEngine {
                     }
                     any_stall = true;
                     match self.stall_policy {
-                        StallPolicy::WaitForWorker => self.wait_for_stall_signal(),
+                        StallPolicy::WaitForWorker => self.wait_out_stop(reason)?,
                         StallPolicy::CompactInline => {
                             match self.run_one_compaction_pass()? {
                                 // Files came out of L0; the next
@@ -2412,10 +2455,17 @@ impl RegolithEngine {
         // An ingest holding `flushing` writes this memtable out right after
         // its own file is installed. Waiting for the exclusion here would
         // hold the pipeline, and so every writer, for the whole ingest.
-        if !self.ingest_holds_flushes.load(Ordering::Acquire) {
-            self.flush_until_retired(&sealed, None)?;
-        }
+        let flushed = if self.ingest_holds_flushes.load(Ordering::Acquire) {
+            Ok(())
+        } else {
+            self.flush_until_retired(&sealed, None)
+        };
+        // Even when the flush failed: the memtable it left frozen counts
+        // toward the stall thresholds, and skipping the refresh would let
+        // writers keep sealing memtables, without back-pressure, for as
+        // long as flushes keep failing.
         self.refresh_stall_level();
+        flushed?;
 
         Ok(())
     }
@@ -2470,7 +2520,30 @@ impl RegolithEngine {
     /// sequence of its own and recency is install order. Two flushes
     /// racing would install a newer file under an older one, and a read
     /// that had seen the newer version would then see the older one.
-    fn flush_oldest_frozen(&self, _flushing: &MutexGuard<'_, ()>) -> std::io::Result<bool> {
+    fn flush_oldest_frozen(&self, flushing: &MutexGuard<'_, ()>) -> std::io::Result<bool> {
+        match self.flush_oldest_frozen_inner(flushing) {
+            Ok(flushed) => {
+                self.background_health.record_success(Job::Flush);
+                Ok(flushed)
+            }
+            Err(e) => {
+                let hazard = self.background_health.record_failure(Job::Flush, &e);
+                tracing::error!(error = %e, hazard = hazard.label(), "Flush failed");
+                if !self.options.listeners.is_empty() {
+                    let err = crate::Error::from(std::io::Error::new(e.kind(), e.to_string()));
+                    crate::event_listener::dispatch(&self.options.listeners, |l| {
+                        l.on_background_error(
+                            crate::event_listener::BackgroundErrorReason::Flush,
+                            &err,
+                        )
+                    });
+                }
+                Err(e)
+            }
+        }
+    }
+
+    fn flush_oldest_frozen_inner(&self, _flushing: &MutexGuard<'_, ()>) -> std::io::Result<bool> {
         // Through the env: a target with no monotonic clock reports
         // nothing measured rather than a fabricated duration.
         let flush_start = self.env.now_micros();
@@ -3380,7 +3453,7 @@ impl RegolithEngine {
     }
 
     pub(crate) fn background_error_count(&self) -> u64 {
-        self.background_errors.load(Ordering::Relaxed)
+        self.background_health.error_count()
     }
 
     /// Bytes the currently-live SSTable readers hold *outside* the
