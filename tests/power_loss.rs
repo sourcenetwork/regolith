@@ -844,9 +844,12 @@ fn a_write_batch_is_all_or_nothing_at_every_cut_point() {
     .timeout(CHILD_TIMEOUT)
     .run();
     probe.assert_killed();
+    // The `LOCK` stamp is no longer synced. It was the first sync, so
+    // every later one moved down a place and the count fell from four to
+    // three: `syncs / 2` still names the same sync (4 / 2 then, 3 / 2 now).
     let syncs = probe.journal.sync_seqs().len();
     assert!(
-        syncs >= 4,
+        syncs >= 3,
         "Immediate durability should have fsynced several times before the crash, saw {syncs}",
     );
 
