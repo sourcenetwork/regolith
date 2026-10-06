@@ -250,10 +250,14 @@ mod real {
                 "LOCK exists but was not written by regolith: refusing to open a database here",
             ));
         }
+        // Not synced. A crash that loses the stamp leaves an empty `LOCK`,
+        // which the next open adopts exactly as it adopts one from before
+        // the stamp existed, so durability buys nothing here. It would
+        // cost a full device-cache flush on every open of a new database
+        // on macOS, where `sync_data` is `F_FULLFSYNC`.
         if existing.is_empty() {
             (&*file).seek(SeekFrom::Start(0))?;
             (&*file).write_all(LOCK_STAMP)?;
-            file.sync_data()?;
         }
         Ok(())
     }
