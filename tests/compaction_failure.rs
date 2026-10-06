@@ -1,7 +1,10 @@
-//! A compaction that fails after writing some outputs must not leave them
-//! on disk. Nothing references such files, so before this was enforced a
-//! compaction that kept failing (out of file descriptors, say) leaked a
-//! full set of outputs on every retry until the disk filled.
+//! How the engine behaves when compaction keeps failing.
+//!
+//! A failed compaction must not leave its outputs on disk: nothing
+//! references them, so a compaction that kept failing (out of file
+//! descriptors, say) used to leak a full set on every retry until the disk
+//! filled. A background worker must also back off between failed passes
+//! and report them through `regolith.background-errors`.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -22,6 +25,7 @@ use regolith::{Db, Options};
 struct SstBudgetEnv {
     inner: StdEnv,
     remaining: AtomicUsize,
+    refused: AtomicUsize,
 }
 
 const UNLIMITED: usize = usize::MAX;
@@ -31,6 +35,7 @@ impl SstBudgetEnv {
         Self {
             inner: StdEnv::new(),
             remaining: AtomicUsize::new(UNLIMITED),
+            refused: AtomicUsize::new(0),
         }
     }
 
@@ -73,6 +78,7 @@ impl Env for SstBudgetEnv {
     }
     fn open_write(&self, path: &Path, mode: WriteMode) -> io::Result<Box<dyn WriteFile>> {
         if is_sst(path) && !self.take_sst() {
+            self.refused.fetch_add(1, Ordering::SeqCst);
             return Err(io::Error::other("Too many open files (os error 24)"));
         }
         self.inner.open_write(path, mode)
@@ -165,6 +171,44 @@ fn a_compaction_that_fails_midway_leaves_no_outputs_behind() {
     env.allow_ssts(UNLIMITED);
     db.compact_range(None, None).unwrap();
     for i in 0..8_000u32 {
+        assert!(db.get(&key(i)).unwrap().is_some(), "key {i} lost");
+    }
+}
+
+#[test]
+fn a_failing_background_worker_backs_off_and_counts_its_failures() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = Arc::new(SstBudgetEnv::new());
+    let opts = |l0_compaction_trigger| Options {
+        env: Arc::clone(&env) as Arc<dyn Env>,
+        l0_compaction_trigger,
+        ..Options::default()
+    };
+
+    let db = Db::open(dir.path(), opts(1_000)).unwrap();
+    for batch in 0..6u32 {
+        for i in 0..500u32 {
+            db.put(&key(batch * 500 + i), &[batch as u8; 64]).unwrap();
+        }
+        db.flush().unwrap();
+    }
+    db.close().unwrap();
+    drop(db);
+
+    env.allow_ssts(0);
+    let db = Db::open(dir.path(), opts(2)).unwrap();
+    std::thread::sleep(Duration::from_secs(7));
+
+    let failures = db.get_int_property("regolith.background-errors").unwrap();
+    let attempts = env.refused.load(Ordering::SeqCst);
+    assert!(failures >= 2, "expected repeated failures, saw {failures}");
+    assert_eq!(failures as usize, attempts, "every failed pass is counted");
+    // Unpaced, the worker retries on every one-second poll: about 7
+    // attempts here. Backing off 1 s, 2 s, 4 s allows at most 4.
+    assert!(attempts <= 4, "worker retried {attempts} times in 7 s");
+
+    env.allow_ssts(UNLIMITED);
+    for i in 0..3_000u32 {
         assert!(db.get(&key(i)).unwrap().is_some(), "key {i} lost");
     }
 }

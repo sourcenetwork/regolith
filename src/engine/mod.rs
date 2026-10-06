@@ -5,6 +5,8 @@ pub(crate) mod bloom;
 pub(crate) mod checksum;
 pub(crate) mod commit;
 pub(crate) mod compaction;
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) mod compaction_backoff;
 pub(crate) mod filter_block;
 pub(crate) mod index_block;
 pub(crate) mod internal_key;
@@ -481,6 +483,8 @@ pub(crate) struct RegolithEngine {
     /// for the whole engine is what stops a foreground pass and a
     /// worker from picking overlapping inputs.
     compaction_in_progress: Arc<Mutex<HashSet<u64>>>,
+    /// Failed background compaction passes since open.
+    background_errors: Arc<AtomicU64>,
     /// The host platform. Cloned out of [`EngineOptions`] so the read
     /// and write paths reach it without going through `options`.
     env: Arc<dyn Env>,
@@ -604,6 +608,7 @@ impl RegolithEngine {
         let snapshot_registry = Arc::new(SnapshotRegistry::with_env(Arc::clone(&env)));
         let stall_signal = Arc::new(StallSignal::new());
         let compaction_in_progress = Arc::new(Mutex::new(HashSet::new()));
+        let background_errors = Arc::new(AtomicU64::new(0));
         // `max_background_compactions == 0` starts no worker, which is
         // how a single-threaded target opens at all. A platform that
         // cannot spawn a worker it was asked for fails the open here
@@ -618,6 +623,7 @@ impl RegolithEngine {
             compaction_opts,
             Arc::clone(&stall_signal),
             Arc::clone(&compaction_in_progress),
+            Arc::clone(&background_errors),
         )?;
 
         let engine = Arc::new(Self {
@@ -647,6 +653,7 @@ impl RegolithEngine {
             stall_signal,
             cached_stall_level: AtomicU8::new(0),
             compaction_in_progress,
+            background_errors,
             env,
             _db_lock: db_lock,
         });
@@ -788,6 +795,7 @@ impl RegolithEngine {
             stall_signal,
             cached_stall_level: AtomicU8::new(0),
             compaction_in_progress: Arc::new(Mutex::new(HashSet::new())),
+            background_errors: Arc::new(AtomicU64::new(0)),
             env,
             _db_lock: db_lock,
         }))
@@ -3361,6 +3369,10 @@ impl RegolithEngine {
     /// property.
     pub(crate) fn block_cache_capacity(&self) -> usize {
         self.cache.capacity()
+    }
+
+    pub(crate) fn background_error_count(&self) -> u64 {
+        self.background_errors.load(Ordering::Relaxed)
     }
 
     /// Bytes the currently-live SSTable readers hold *outside* the
