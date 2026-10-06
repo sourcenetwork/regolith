@@ -12,6 +12,12 @@
 //! may belong to an allocation whose manifest record never became durable;
 //! it is left in place and will be overwritten if its id is handed out
 //! again.
+//!
+//! The caller holds the exclusive directory lock and only sweeps where
+//! that lock excludes other processes ([`crate::env::Capabilities::file_lock`]),
+//! so no other writer can be creating one of these files. Removing them
+//! is idempotent: a crash part way through leaves a directory the next
+//! open sweeps the same way.
 
 use std::collections::HashSet;
 use std::io;

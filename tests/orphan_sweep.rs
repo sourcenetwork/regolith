@@ -3,6 +3,9 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
+use std::sync::Arc;
+
+use regolith::env::{Env, MemEnv, WriteMode};
 use regolith::{Db, Options};
 
 fn table_ids(dir: &Path) -> BTreeSet<u64> {
@@ -124,4 +127,37 @@ fn a_torn_manifest_suppresses_the_sweep() {
         "a replay that lost records must not judge what is unreferenced"
     );
     assert_all_keys(&db);
+}
+
+#[test]
+fn an_environment_without_a_process_lock_sweeps_nothing() {
+    let env: Arc<dyn Env> = Arc::new(MemEnv::new());
+    assert!(!env.capabilities().file_lock);
+    let opts = || Options {
+        env: Arc::clone(&env),
+        max_background_compactions: 0,
+        ..Options::default()
+    };
+    let dir = Path::new("/db");
+
+    let db = Db::open(dir, opts()).unwrap();
+    for i in 0..500u32 {
+        db.put(&key(i), b"value").unwrap();
+    }
+    db.flush().unwrap();
+    db.put(&key(500), b"value").unwrap();
+    db.flush().unwrap();
+    db.close().unwrap();
+    drop(db);
+
+    let orphan = dir.join("sst").join("000001.sst");
+    assert!(!env.exists(&orphan), "pick an id the store never used");
+    let mut file = env.open_write(&orphan, WriteMode::Truncate).unwrap();
+    file.write_all(b"not referenced").unwrap();
+    file.sync_all().unwrap();
+    drop(file);
+
+    let db = Db::open(dir, opts()).unwrap();
+    assert!(env.exists(&orphan), "swept without a process lock");
+    assert!(db.get(&key(0)).unwrap().is_some());
 }

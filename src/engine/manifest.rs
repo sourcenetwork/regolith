@@ -372,8 +372,12 @@ impl VersionSet {
             let replay = Self::replay_manifest(env, &data, sst_dir, policy)?;
             Self::reject_discarded_tables(&**env, &replay, data.len(), sst_dir, &manifest_path)?;
             // A torn tail means the log lost records; keep every table
-            // until a clean replay says which ones are unreferenced.
-            if replay.valid_len == data.len() {
+            // until a clean replay says which ones are unreferenced. And
+            // only when the directory lock excludes other processes: where
+            // it does not, another one could be flushing into one of these
+            // ids right now.
+            let replayed_cleanly = !data.is_empty() && replay.valid_len == data.len();
+            if replayed_cleanly && env.capabilities().file_lock {
                 super::orphan_sweep::sweep_unreferenced_tables(&**env, sst_dir, &replay.version)?;
             }
 
