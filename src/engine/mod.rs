@@ -16,6 +16,7 @@ pub(crate) mod lookup_key;
 pub mod loom_model;
 pub(crate) mod manifest;
 pub(crate) mod memtable;
+pub(crate) mod orphan_sweep;
 pub(crate) mod pending_outputs;
 pub(crate) mod range_tombstone;
 pub(crate) mod read_horizon;

@@ -371,6 +371,11 @@ impl VersionSet {
             let data = env.read(&manifest_path)?;
             let replay = Self::replay_manifest(env, &data, sst_dir, policy)?;
             Self::reject_discarded_tables(&**env, &replay, data.len(), sst_dir, &manifest_path)?;
+            // A torn tail means the log lost records; keep every table
+            // until a clean replay says which ones are unreferenced.
+            if replay.valid_len == data.len() {
+                super::orphan_sweep::sweep_unreferenced_tables(&**env, sst_dir, &replay.version)?;
+            }
 
             // Trim through its own handle, and close it before the
             // append handle is opened. A torn or corrupt tail is the
