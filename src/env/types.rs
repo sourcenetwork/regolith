@@ -61,6 +61,40 @@ pub struct FileMeta {
     pub is_dir: bool,
 }
 
+/// Free and total space on the filesystem holding a path, as reported
+/// by [`Env::disk_space`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct DiskSpace {
+    /// Bytes an unprivileged writer can still allocate.
+    pub available_bytes: u64,
+    /// Size of the filesystem in bytes.
+    pub total_bytes: u64,
+    /// Inodes an unprivileged writer can still allocate. Every SSTable,
+    /// WAL segment and temporary file takes one.
+    pub available_inodes: u64,
+    /// Inodes the filesystem has in total. `0` where it does not report
+    /// a fixed count.
+    pub total_inodes: u64,
+}
+
+impl DiskSpace {
+    /// Build a report, for an [`Env`] implementation outside this crate.
+    pub fn new(
+        available_bytes: u64,
+        total_bytes: u64,
+        available_inodes: u64,
+        total_inodes: u64,
+    ) -> Self {
+        Self {
+            available_bytes,
+            total_bytes,
+            available_inodes,
+            total_inodes,
+        }
+    }
+}
+
 /// What a given [`Env`] can actually do.
 ///
 /// regolith reads this at open and adapts: an environment without

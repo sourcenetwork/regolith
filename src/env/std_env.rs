@@ -12,6 +12,8 @@ use std::time::Duration;
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 use std::time::{SystemTime, UNIX_EPOCH};
 
+#[cfg(unix)]
+use super::DiskSpace;
 use super::db_lock;
 use super::{
     Capabilities, DirEntry, Env, FileLock, FileMeta, JoinHandle, ReadFile, WriteFile, WriteMode,
@@ -165,6 +167,18 @@ impl Env for StdEnv {
             .name(name.to_string())
             .spawn(body)?;
         Ok(Box::new(StdJoinHandle(handle)))
+    }
+
+    #[cfg(unix)]
+    fn disk_space(&self, path: &Path) -> io::Result<Option<DiskSpace>> {
+        let s = rustix::fs::statvfs(path)?;
+        let block = s.f_frsize;
+        Ok(Some(DiskSpace::new(
+            s.f_bavail.saturating_mul(block),
+            s.f_blocks.saturating_mul(block),
+            s.f_favail,
+            s.f_files,
+        )))
     }
 
     fn sleep(&self, dur: Duration) {

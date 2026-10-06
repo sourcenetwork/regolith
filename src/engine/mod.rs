@@ -8,6 +8,7 @@ pub(crate) mod commit;
 pub(crate) mod compaction;
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) mod compaction_backoff;
+pub(crate) mod disk_check;
 pub(crate) mod filter_block;
 pub(crate) mod index_block;
 pub(crate) mod internal_key;
@@ -520,6 +521,7 @@ impl RegolithEngine {
         options.read_only = false;
         let env = Arc::clone(&options.env);
         let db_lock = env.lock_file(db_dir, true)?;
+        disk_check::spawn(&env, db_dir.to_path_buf());
         let sst_dir = db_dir.join("sst");
         let wal_dir = db_dir.join("wal");
 
@@ -3454,6 +3456,12 @@ impl RegolithEngine {
 
     pub(crate) fn background_error_count(&self) -> u64 {
         self.background_health.error_count()
+    }
+
+    /// Free and total space on the filesystem holding the database, read
+    /// now. `None` where the environment cannot say.
+    pub(crate) fn disk_space(&self) -> Option<crate::env::DiskSpace> {
+        self.env.disk_space(&self.sst_dir).ok().flatten()
     }
 
     /// Bytes the currently-live SSTable readers hold *outside* the
