@@ -29,6 +29,7 @@ use super::sstable::{
     LiveSst, MetadataPolicy, SsTableInternalIter, SsTableMeta, SsTableReader, SsTableWriter,
     remove_sst_in, sst_filename,
 };
+use crate::engine::pending_outputs::PendingOutputs;
 use crate::env::{Env, JoinHandle};
 
 /// Default compaction trigger: flush L0 → L1 when L0 has this many SSTables.
@@ -1190,7 +1191,11 @@ fn perform_compaction_to(
         });
     }
 
-    let (new_file_edits, output_file_infos) = stream_compaction_outputs(
+    let CompactionOutputs {
+        edits: new_file_edits,
+        infos: output_file_infos,
+        pending,
+    } = stream_compaction_outputs(
         versions,
         sst_dir,
         cache,
@@ -1276,8 +1281,10 @@ fn perform_compaction_to(
                     file: Arc::clone(f),
                 });
             }
+            pending.offered_to_manifest();
             versions.apply(&rebuilt)?;
         } else {
+            pending.offered_to_manifest();
             versions.apply(&edits)?;
         }
     }
@@ -1689,7 +1696,7 @@ fn stream_compaction_outputs(
     overlap_files: &[Arc<LiveSst>],
     pin_seq: u64,
     merged_range_tombstones: &RangeTombstoneSet,
-) -> std::io::Result<(Vec<VersionEdit>, Vec<OutputFileInfo>)> {
+) -> std::io::Result<CompactionOutputs> {
     let all_files: Vec<Arc<LiveSst>> = input_files
         .iter()
         .chain(overlap_files.iter())
@@ -1786,6 +1793,15 @@ fn transform_compaction_group(
     group
 }
 
+/// What a successful output stream hands back: the edits that install
+/// the new files, their stats, and the claim on their paths that unlinks
+/// them unless the caller offers them to the manifest.
+struct CompactionOutputs {
+    edits: Vec<VersionEdit>,
+    infos: Vec<OutputFileInfo>,
+    pending: PendingOutputs,
+}
+
 struct StreamingOutputBuilder {
     file_id: u64,
     path: PathBuf,
@@ -1805,6 +1821,7 @@ struct StreamingCompactionWriter<'a> {
     current: Option<StreamingOutputBuilder>,
     edits: Vec<VersionEdit>,
     infos: Vec<OutputFileInfo>,
+    pending: PendingOutputs,
 }
 
 impl<'a> StreamingCompactionWriter<'a> {
@@ -1825,6 +1842,7 @@ impl<'a> StreamingCompactionWriter<'a> {
             current: None,
             edits: Vec::new(),
             infos: Vec::new(),
+            pending: PendingOutputs::new(Arc::clone(&opts.env)),
         }
     }
 
@@ -1857,10 +1875,14 @@ impl<'a> StreamingCompactionWriter<'a> {
         Ok(())
     }
 
-    fn finish(mut self) -> std::io::Result<(Vec<VersionEdit>, Vec<OutputFileInfo>)> {
+    fn finish(mut self) -> std::io::Result<CompactionOutputs> {
         self.finish_current()?;
         self.write_uncovered_range_tombstones()?;
-        Ok((self.edits, self.infos))
+        Ok(CompactionOutputs {
+            pending: self.pending.take(),
+            edits: std::mem::take(&mut self.edits),
+            infos: std::mem::take(&mut self.infos),
+        })
     }
 
     fn ensure_current(&mut self) -> std::io::Result<()> {
@@ -1877,6 +1899,7 @@ impl<'a> StreamingCompactionWriter<'a> {
         };
 
         let path = self.sst_dir.join(sst_filename(file_id));
+        self.pending.track(path.clone());
         let writer = SsTableWriter::new_in(
             &self.opts.env,
             &path,
@@ -2018,6 +2041,7 @@ impl<'a> StreamingCompactionWriter<'a> {
         };
 
         let path = self.sst_dir.join(sst_filename(file_id));
+        self.pending.track(path.clone());
         let mut writer = SsTableWriter::new_in(
             &self.opts.env,
             &path,
