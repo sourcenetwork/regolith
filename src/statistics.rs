@@ -27,8 +27,6 @@
 
 use crate::portability::{AtomicU64, Ordering};
 
-use crate::sync::Mutex;
-
 /// Enumerated counters incremented by the engine. Every variant
 /// is backed by one `AtomicU64` slot in [`Statistics`]; looking
 /// up a ticker is `O(1)` and thread-safe.
@@ -259,53 +257,84 @@ impl HistogramSnapshot {
     }
 }
 
-#[derive(Debug, Default)]
+/// One histogram's running count, sum, min and max.
+///
+/// Lock-free: `record` runs on hot read and write paths, and a mutex here
+/// serialised every instrumented `get` across threads. Each field is
+/// updated independently, so a snapshot taken while a sample is being
+/// recorded may include part of that one sample (its count but not yet
+/// its sum, say). That is the precision these observability counters
+/// need; `reset` racing a recorder is equally approximate.
+#[derive(Debug)]
 struct HistogramData {
-    count: u64,
-    sum: u64,
-    min: u64,
-    max: u64,
+    count: AtomicU64,
+    sum: AtomicU64,
+    /// `u64::MAX` until the first sample, so `fetch_min` needs no branch.
+    min: AtomicU64,
+    max: AtomicU64,
+}
+
+impl Default for HistogramData {
+    fn default() -> Self {
+        Self {
+            count: AtomicU64::new(0),
+            sum: AtomicU64::new(0),
+            min: AtomicU64::new(u64::MAX),
+            max: AtomicU64::new(0),
+        }
+    }
 }
 
 impl HistogramData {
-    fn record(&mut self, value: u64) {
-        if self.count == 0 {
-            self.min = value;
-            self.max = value;
-        } else {
-            if value < self.min {
-                self.min = value;
-            }
-            if value > self.max {
-                self.max = value;
-            }
+    fn record(&self, value: u64) {
+        self.count.fetch_add(1, Ordering::Relaxed);
+        let mut sum = self.sum.load(Ordering::Relaxed);
+        while let Err(current) = self.sum.compare_exchange_weak(
+            sum,
+            sum.saturating_add(value),
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            sum = current;
         }
-        self.count += 1;
-        self.sum = self.sum.saturating_add(value);
+        self.min.fetch_min(value, Ordering::Relaxed);
+        self.max.fetch_max(value, Ordering::Relaxed);
     }
 
     fn snapshot(&self) -> HistogramSnapshot {
+        let count = self.count.load(Ordering::Relaxed);
+        if count == 0 {
+            return HistogramSnapshot {
+                count: 0,
+                sum: 0,
+                min: 0,
+                max: 0,
+            };
+        }
+        let min = self.min.load(Ordering::Relaxed);
         HistogramSnapshot {
-            count: self.count,
-            sum: self.sum,
-            min: self.min,
-            max: self.max,
+            count,
+            sum: self.sum.load(Ordering::Relaxed),
+            min: if min == u64::MAX { 0 } else { min },
+            max: self.max.load(Ordering::Relaxed),
         }
     }
 
-    fn clear(&mut self) {
-        *self = HistogramData::default();
+    fn clear(&self) {
+        self.count.store(0, Ordering::Relaxed);
+        self.sum.store(0, Ordering::Relaxed);
+        self.min.store(u64::MAX, Ordering::Relaxed);
+        self.max.store(0, Ordering::Relaxed);
     }
 }
 
 /// Engine-wide counters and histograms. Constructed by the
 /// caller and passed to [`crate::Options::statistics`]. The
 /// engine clones the `Arc` into the paths it wants to
-/// instrument and updates it via lock-free atomic adds
-/// (tickers) or short mutex sections (histograms).
+/// instrument and updates it with lock-free atomics.
 pub struct Statistics {
     tickers: [AtomicU64; NUM_TICKERS],
-    histograms: [Mutex<HistogramData>; NUM_HISTOGRAMS],
+    histograms: [HistogramData; NUM_HISTOGRAMS],
 }
 
 impl std::fmt::Debug for Statistics {
@@ -328,7 +357,7 @@ impl Statistics {
         // `[x; N]` syntax. `std::array::from_fn` is the
         // cleanest alternative.
         let tickers = std::array::from_fn(|_| AtomicU64::new(0));
-        let histograms = std::array::from_fn(|_| Mutex::new(HistogramData::default()));
+        let histograms = std::array::from_fn(|_| HistogramData::default());
         Self {
             tickers,
             histograms,
@@ -345,7 +374,7 @@ impl Statistics {
 
     /// Return an immutable snapshot of a histogram's state.
     pub fn get_histogram_snapshot(&self, hist: Histogram) -> HistogramSnapshot {
-        self.histograms[hist as usize].lock().snapshot()
+        self.histograms[hist as usize].snapshot()
     }
 
     /// Zero every ticker and clear every histogram.
@@ -354,7 +383,7 @@ impl Statistics {
             t.store(0, Ordering::Relaxed);
         }
         for h in &self.histograms {
-            h.lock().clear();
+            h.clear();
         }
     }
 
@@ -372,7 +401,7 @@ impl Statistics {
         }
         out.push_str("-- histograms --\n");
         for hist in ALL_HISTOGRAMS {
-            let snap = self.histograms[*hist as usize].lock().snapshot();
+            let snap = self.histograms[*hist as usize].snapshot();
             out.push_str(&format!(
                 "{:40} count={} sum={} min={} max={} avg={}\n",
                 hist.name(),
@@ -394,7 +423,7 @@ impl Statistics {
 
     /// Record a single sample into `hist`.
     pub(crate) fn record(&self, hist: Histogram, value: u64) {
-        self.histograms[hist as usize].lock().record(value);
+        self.histograms[hist as usize].record(value);
     }
 }
 
@@ -435,6 +464,44 @@ impl Drop for TimeScope<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn concurrent_records_are_all_counted() {
+        let stats = std::sync::Arc::new(Statistics::new());
+        let threads: Vec<_> = (0..8u64)
+            .map(|t| {
+                let stats = std::sync::Arc::clone(&stats);
+                std::thread::spawn(move || {
+                    for i in 0..10_000u64 {
+                        stats.record(Histogram::DbGet, t * 10_000 + i + 1);
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        let snap = stats.get_histogram_snapshot(Histogram::DbGet);
+        assert_eq!(snap.count, 80_000);
+        assert_eq!(snap.sum, (1..=80_000u64).sum::<u64>());
+        assert_eq!(snap.min, 1);
+        assert_eq!(snap.max, 80_000);
+    }
+
+    #[test]
+    fn an_empty_histogram_snapshots_as_zero_and_reset_empties_it() {
+        let stats = Statistics::new();
+        let empty = stats.get_histogram_snapshot(Histogram::DbGet);
+        assert_eq!((empty.count, empty.sum, empty.min, empty.max), (0, 0, 0, 0));
+        stats.record(Histogram::DbGet, 7);
+        stats.reset();
+        let reset = stats.get_histogram_snapshot(Histogram::DbGet);
+        assert_eq!((reset.count, reset.sum, reset.min, reset.max), (0, 0, 0, 0));
+        stats.record(Histogram::DbGet, 9);
+        let one = stats.get_histogram_snapshot(Histogram::DbGet);
+        assert_eq!((one.count, one.sum, one.min, one.max), (1, 9, 9, 9));
+    }
 
     #[test]
     fn ticker_add_and_read() {
