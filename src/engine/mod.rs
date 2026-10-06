@@ -41,6 +41,7 @@ use compaction::{CompactionOptions, CompactionOutcome, CompactionScheduler};
 use lookup_key::{LookupKey, with_key_scratch};
 use manifest::{VersionEdit, VersionSet};
 use memtable::{MemTable, MemTableConfig};
+use pending_outputs::PendingOutputs;
 use read_horizon::ReadHorizon;
 use read_view::{ReadView, ReadViewCell, VersionStore};
 use skiplist::InsertHint;
@@ -2495,6 +2496,11 @@ impl RegolithEngine {
         };
 
         let sst_path = self.sst_dir.join(sst_filename(file_id));
+        // Until the edit below is offered to the manifest, nothing else
+        // knows this file exists: every early return must unlink it, or a
+        // flush that keeps failing leaks a memtable-sized file per retry.
+        let mut pending = PendingOutputs::new(Arc::clone(&self.env));
+        pending.track(sst_path.clone());
 
         // Memtable flushes always land at L0 - pick L0's codec.
         let mut writer = SsTableWriter::new_in(
@@ -2570,6 +2576,7 @@ impl RegolithEngine {
             VersionEdit::AddFile { level: 0, file },
             VersionEdit::SetLastSeq(seq),
         ];
+        pending.offered_to_manifest();
         self.versions.lock().apply(&edits)?;
 
         // Retired only now: until the `AddFile` above is published, the

@@ -9,7 +9,7 @@
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use regolith::env::{
@@ -26,6 +26,7 @@ struct SstBudgetEnv {
     inner: StdEnv,
     remaining: AtomicUsize,
     refused: AtomicUsize,
+    deny_sst_reads: AtomicBool,
 }
 
 const UNLIMITED: usize = usize::MAX;
@@ -36,6 +37,7 @@ impl SstBudgetEnv {
             inner: StdEnv::new(),
             remaining: AtomicUsize::new(UNLIMITED),
             refused: AtomicUsize::new(0),
+            deny_sst_reads: AtomicBool::new(false),
         }
     }
 
@@ -74,6 +76,9 @@ impl Env for SstBudgetEnv {
         self.inner.read_dir(path)
     }
     fn open_read(&self, path: &Path) -> io::Result<Box<dyn ReadFile>> {
+        if is_sst(path) && self.deny_sst_reads.load(Ordering::SeqCst) {
+            return Err(io::Error::other("Too many open files (os error 24)"));
+        }
         self.inner.open_read(path)
     }
     fn open_write(&self, path: &Path, mode: WriteMode) -> io::Result<Box<dyn WriteFile>> {
@@ -209,6 +214,45 @@ fn a_failing_background_worker_backs_off_and_counts_its_failures() {
 
     env.allow_ssts(UNLIMITED);
     for i in 0..3_000u32 {
+        assert!(db.get(&key(i)).unwrap().is_some(), "key {i} lost");
+    }
+}
+
+/// A flush writes its table, then opens a reader on it. When that open
+/// fails (the descriptor table is full) the flush errors with the file
+/// already on disk, and the next attempt allocates a fresh id.
+#[test]
+fn a_flush_that_fails_after_writing_its_table_leaves_no_file_behind() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = Arc::new(SstBudgetEnv::new());
+    let opts = Options {
+        env: Arc::clone(&env) as Arc<dyn Env>,
+        max_background_compactions: 0,
+        ..Options::default()
+    };
+    let db = Db::open(dir.path(), opts).unwrap();
+    for i in 0..1_000u32 {
+        db.put(&key(i), &[7u8; 64]).unwrap();
+    }
+    db.flush().unwrap();
+    for i in 1_000..2_000u32 {
+        db.put(&key(i), &[8u8; 64]).unwrap();
+    }
+    let live_before = sst_files(dir.path());
+
+    env.deny_sst_reads.store(true, Ordering::SeqCst);
+    for _ in 0..3 {
+        assert!(db.flush().is_err());
+        assert_eq!(
+            sst_files(dir.path()),
+            live_before,
+            "a failed flush must leave exactly the live tables on disk"
+        );
+    }
+
+    env.deny_sst_reads.store(false, Ordering::SeqCst);
+    db.flush().unwrap();
+    for i in 0..2_000u32 {
         assert!(db.get(&key(i)).unwrap().is_some(), "key {i} lost");
     }
 }
