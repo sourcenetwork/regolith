@@ -54,7 +54,7 @@ mod wasi;
 
 pub use mem_env::MemEnv;
 pub use std_env::StdEnv;
-pub use types::{Capabilities, DirEntry, FileMeta, WriteMode};
+pub use types::{Capabilities, DirEntry, DiskSpace, FileMeta, WriteMode};
 #[cfg(target_os = "wasi")]
 pub use wasi::WasiEnv;
 
@@ -160,6 +160,17 @@ pub trait Env: Send + Sync + std::fmt::Debug {
     /// correctness, so skipping it costs throughput smoothing and
     /// nothing else.
     fn sleep(&self, dur: Duration);
+
+    /// Free and total space on the filesystem holding `path`.
+    ///
+    /// `Ok(None)` where the environment has no filesystem to ask about,
+    /// which is the default. regolith uses it to warn at open when the
+    /// disk is close to full and to report `regolith.disk-available-*`
+    /// properties; it never gates an operation on the answer.
+    fn disk_space(&self, path: &Path) -> io::Result<Option<DiskSpace>> {
+        let _ = path;
+        Ok(None)
+    }
 
     /// Whether anything exists at `path`.
     fn exists(&self, path: &Path) -> bool {
