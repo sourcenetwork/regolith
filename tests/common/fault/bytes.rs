@@ -4,6 +4,10 @@
 //! crash: they express deliberate corruption, the "an adversary or a bad
 //! sector changed these bytes" family. Power loss lives in
 //! [`super::power`].
+//!
+//! None of them syncs: the database reopens in this process and reads the
+//! edit back through the page cache, so a sync makes no test stronger, and
+//! on macOS it is a full device-cache flush per mutation.
 
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -48,7 +52,6 @@ pub fn flip_bit(path: &Path, byte_offset: u64, bit: u8) {
     f.seek(SeekFrom::Start(byte_offset))
         .expect("flip_bit: seek");
     f.write_all(&b).expect("flip_bit: write");
-    f.sync_all().expect("flip_bit: sync");
 }
 
 /// Overwrite `bytes.len()` bytes at `offset`, extending the file if the
@@ -62,7 +65,6 @@ pub fn overwrite_range(path: &Path, offset: u64, bytes: &[u8]) {
     f.seek(SeekFrom::Start(offset))
         .expect("overwrite_range: seek");
     f.write_all(bytes).expect("overwrite_range: write");
-    f.sync_all().expect("overwrite_range: sync");
 }
 
 /// Deterministic filler bytes for an overwrite: a seeded xorshift stream,
