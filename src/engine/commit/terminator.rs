@@ -1,5 +1,5 @@
-//! The newest write that replaced a key since a sequence, for the commit
-//! check of a blind merge under `IsolationLevel::DefraLevel`.
+//! What landed on a key since a sequence, for the commit check of a blind
+//! merge under `IsolationLevel::DefraLevel`.
 //!
 //! Operands commute, so a newer operand never invalidates a blind merge, but
 //! a newer put, delete or covering range delete does. The walk runs under
@@ -12,57 +12,76 @@ use std::ops::ControlFlow;
 use super::super::source_walk::Source;
 use super::super::{LookupKey, ReadView, RegolithEngine, with_key_scratch};
 
+/// What landed on a key above a floor, as a blind merge's commit check sees it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Landed {
+    /// Nothing newer than the floor.
+    Nothing,
+    /// Only merge operands, which a blind merge commutes with.
+    Operands,
+    /// A put, a delete or a covering range delete.
+    Replaced,
+}
+
 impl RegolithEngine {
-    /// The sequence of the newest write above `floor` that replaced `key`
-    /// outright in `view`: a put, a delete, or a covering range delete.
-    /// `None` when every write to `key` above `floor` is a merge operand.
+    /// What landed on `key` above `floor` in `view`: nothing, only merge
+    /// operands, or a replacement (a put, a delete, or a covering range
+    /// delete).
     ///
     /// Sources are visited newest first and range-tombstone coverage is
     /// accumulated on the way down, as in `latest_version_in_view`.
-    pub(super) fn newest_terminator_seq_above(
+    pub(super) fn landed_above(
         &self,
         key: &[u8],
         floor: u64,
         view: &ReadView,
-    ) -> std::io::Result<Option<u64>> {
+    ) -> std::io::Result<Landed> {
         let snap = u64::MAX;
         let lk = LookupKey::from_prefixed(key, snap);
-        // Where a source's skip stopped settles the answer. Above the floor
-        // and every covering tombstone seen so far, the stop is a value or
-        // deletion: the newest replacement. Otherwise the entry is hidden by
-        // a covering tombstone, which then is the newest replacement if it is
+        // Where a source's skip stopped settles whether a replacement
+        // landed. Above the floor and every covering tombstone seen so far,
+        // the stop is a value or deletion: a replacement. Otherwise the entry
+        // is hidden by a covering tombstone, which is a replacement if it is
         // above the floor, or the entry is at or below the floor, as is
         // everything older.
-        let settle = |stop: u64, max_rt_seq: u64| {
-            if stop > floor.max(max_rt_seq) {
-                Some(stop)
-            } else {
-                (max_rt_seq > floor).then_some(max_rt_seq)
-            }
-        };
+        let settle =
+            |stop: u64, max_rt_seq: u64| stop > floor.max(max_rt_seq) || max_rt_seq > floor;
 
+        // With no replacement, no covering tombstone is above the floor, so
+        // every skip ran with the floor itself and `passed` is exactly
+        // whether an operand above it exists.
+        let mut passed = false;
         let walked = view.walk_newest_first(key, snap, |source, max_rt_seq| {
             let skip_floor = floor.max(max_rt_seq);
-            let stop = match source {
+            let skip = match source {
                 Source::Memtable(mt) => mt.skip_merges_above(&lk, skip_floor),
                 Source::Table(reader) => with_key_scratch(|buf| {
                     reader.skip_merges_above(&lk, skip_floor, buf, &self.cache)
                 })?,
             };
-            Ok(match stop {
+            passed |= skip.passed;
+            Ok(match skip.stop {
                 Some(stop) => ControlFlow::Break(settle(stop, max_rt_seq)),
                 None => ControlFlow::Continue(()),
             })
         })?;
-        Ok(match walked {
-            ControlFlow::Break(settled) => settled,
-            ControlFlow::Continue(max_rt_seq) => (max_rt_seq > floor).then_some(max_rt_seq),
+        let replaced = match walked {
+            ControlFlow::Break(replaced) => replaced,
+            ControlFlow::Continue(max_rt_seq) => max_rt_seq > floor,
+        };
+        Ok(if replaced {
+            Landed::Replaced
+        } else if passed {
+            Landed::Operands
+        } else {
+            Landed::Nothing
         })
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::Landed;
     use crate::column_family::{DEFAULT_CF_ID, prefix_key};
     use crate::{Db, Options};
     use proptest::prelude::*;
@@ -93,6 +112,11 @@ mod tests {
                 Self::Merge(_) | Self::Flush | Self::Compact => false,
             }
         }
+
+        /// Whether this write adds a merge operand to `key`.
+        fn merges_into(&self, key: usize) -> bool {
+            matches!(*self, Self::Merge(k) if k == key)
+        }
     }
 
     /// A workload step; a range delete always spans at least one key.
@@ -113,7 +137,7 @@ mod tests {
         // Each case opens a database, so far fewer than the default 256.
         #![proptest_config(ProptestConfig::with_cases(96))]
         #[test]
-        fn newest_terminator_seq_above_matches_the_write_log_across_flushes_and_compactions(
+        fn landed_above_matches_the_write_log_across_flushes_and_compactions(
             ops in proptest::collection::vec(op(), 0..40),
         ) {
             let dir = TempDir::new().unwrap();
@@ -146,14 +170,19 @@ mod tests {
             for (key, name) in KEYS.iter().take(WRITABLE).enumerate() {
                 let prefixed = prefix_key(DEFAULT_CF_ID, name);
                 for floor in 0..=db.latest_sequence() + 1 {
-                    let expected = log
-                        .iter()
-                        .filter(|(seq, op)| *seq > floor && op.replaces(key))
-                        .map(|(seq, _)| *seq)
-                        .max();
+                    let landed = |matches: &dyn Fn(&Op) -> bool| {
+                        log.iter().any(|(seq, op)| *seq > floor && matches(op))
+                    };
+                    let expected = if landed(&|op| op.replaces(key)) {
+                        Landed::Replaced
+                    } else if landed(&|op| op.merges_into(key)) {
+                        Landed::Operands
+                    } else {
+                        Landed::Nothing
+                    };
                     let actual = db
                         .engine()
-                        .newest_terminator_seq_above(&prefixed, floor, &view)
+                        .landed_above(&prefixed, floor, &view)
                         .unwrap();
                     prop_assert_eq!(actual, expected, "key {:?} floor {}", name, floor);
                 }

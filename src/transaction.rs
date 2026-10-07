@@ -1188,7 +1188,14 @@ impl<'db> Transaction<'db> {
         if let Some(runs) = self.scan_runs.take() {
             let mut runs = drain(&runs);
             if let Some(classifier) = classifier {
+                let before = runs.len();
                 runs.retain(|run| !policy::run_is_commutative(classifier, run));
+                if let Some(s) = self.engine.statistics() {
+                    s.add(
+                        crate::Ticker::PolicyScanRunsDropped,
+                        (before - runs.len()) as u64,
+                    );
+                }
             }
             scan_range::cover(
                 &mut checks.reads,
@@ -1215,16 +1222,26 @@ impl<'db> Transaction<'db> {
             .commit_with_conflict_check(&checks, writes, range_deletes, merges, self.durability)
             .map_err(TransactionError::Io)?;
         match outcome {
-            CommitOutcome::Ok => Ok(()),
+            CommitOutcome::Ok => {
+                if let Some(s) = self.engine.statistics() {
+                    s.add(crate::Ticker::CommitCount, 1);
+                }
+                Ok(())
+            }
             CommitOutcome::Conflict {
                 key,
                 observed_seq,
                 latest_seq,
-            } => Err(TransactionError::Conflict {
-                key: strip_cf_prefix(key),
-                observed_seq,
-                latest_seq,
-            }),
+            } => {
+                if let Some(s) = self.engine.statistics() {
+                    s.add(crate::Ticker::CommitConflicts, 1);
+                }
+                Err(TransactionError::Conflict {
+                    key: strip_cf_prefix(key),
+                    observed_seq,
+                    latest_seq,
+                })
+            }
         }
     }
 

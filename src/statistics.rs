@@ -15,7 +15,9 @@
 //! under a shared surface prefix. The surfaces are `write`
 //! (memtable/batch writes), `read` (point lookups), `iter`
 //! (iterator seek/next), `block_cache`, `bloom`, `block`,
-//! `compaction`, `flush`, `wal`, and `snapshot`.
+//! `compaction`, `flush`, `wal`, `snapshot`, `commit` (transaction
+//! commit outcomes), and `policy` ([`IsolationLevel::DefraLevel`]
+//! relaxations).
 //!
 //! # Cost when disabled
 //!
@@ -106,9 +108,34 @@ pub enum Ticker {
     /// record behind and the bytes from it to end-of-file were dropped;
     /// the discard is also logged with the file and the offset.
     WalTailDiscarded = 24,
+    /// Optimistic or pessimistic transaction commits that returned
+    /// `Ok`.
+    CommitCount = 25,
+    /// Transaction commits that returned
+    /// [`crate::TransactionError::Conflict`].
+    CommitConflicts = 26,
+    /// The subset of [`Ticker::CommitConflicts`] where the
+    /// conflicting key was a key the transaction read.
+    CommitConflictsOnRead = 27,
+    /// The subset of [`Ticker::CommitConflicts`] where the
+    /// conflicting key was a key the transaction wrote or merged
+    /// into.
+    CommitConflictsOnWrite = 28,
+    /// Written keys whose newer committed version was accepted
+    /// because the write stored exactly what the key already holds
+    /// (`write_matches_committed` held).
+    CommitWritesElided = 29,
+    /// Blind merge-only keys accepted at
+    /// [`crate::IsolationLevel::DefraLevel`] despite a newer merge
+    /// operand, because operands commute.
+    PolicyBlindMergesCommuted = 30,
+    /// Scan stretches dropped because they stayed inside a
+    /// [`crate::KeyClass::CommutativePrefix`], so the caller's
+    /// policy declared them safe to leave unvalidated.
+    PolicyScanRunsDropped = 31,
 }
 
-const NUM_TICKERS: usize = 25;
+const NUM_TICKERS: usize = 32;
 
 /// Every defined ticker, in discriminant order. Used by
 /// [`Statistics::dump`] to iterate all slots. Keep this in sync
@@ -140,6 +167,13 @@ const ALL_TICKERS: &[Ticker] = &[
     Ticker::SnapshotsRegistered,
     Ticker::SnapshotsReleased,
     Ticker::WalTailDiscarded,
+    Ticker::CommitCount,
+    Ticker::CommitConflicts,
+    Ticker::CommitConflictsOnRead,
+    Ticker::CommitConflictsOnWrite,
+    Ticker::CommitWritesElided,
+    Ticker::PolicyBlindMergesCommuted,
+    Ticker::PolicyScanRunsDropped,
 ];
 
 impl Ticker {
@@ -171,6 +205,13 @@ impl Ticker {
             Ticker::SnapshotsRegistered => "regolith.snapshot.registered",
             Ticker::SnapshotsReleased => "regolith.snapshot.released",
             Ticker::WalTailDiscarded => "regolith.wal.tail_discarded",
+            Ticker::CommitCount => "regolith.commit.count",
+            Ticker::CommitConflicts => "regolith.commit.conflicts",
+            Ticker::CommitConflictsOnRead => "regolith.commit.conflicts_on_read",
+            Ticker::CommitConflictsOnWrite => "regolith.commit.conflicts_on_write",
+            Ticker::CommitWritesElided => "regolith.commit.writes_elided",
+            Ticker::PolicyBlindMergesCommuted => "regolith.policy.blind_merges_commuted",
+            Ticker::PolicyScanRunsDropped => "regolith.policy.scan_runs_dropped",
         }
     }
 }
@@ -558,7 +599,7 @@ mod tests {
 
     #[test]
     fn every_metric_name_is_unique_and_surface_prefixed() {
-        const SURFACES: [&str; 10] = [
+        const SURFACES: [&str; 12] = [
             "write",
             "read",
             "iter",
@@ -569,6 +610,8 @@ mod tests {
             "flush",
             "wal",
             "snapshot",
+            "commit",
+            "policy",
         ];
         let mut names: Vec<&str> = ALL_TICKERS
             .iter()

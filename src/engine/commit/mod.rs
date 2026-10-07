@@ -55,6 +55,7 @@ use replaced::Replaced;
 pub(crate) use request::WriteRequest;
 pub(crate) use slot::WriteSlot;
 pub(crate) use stall::StallSignal;
+use terminator::Landed;
 
 /// Largest number of WAL bytes one group stages before it stops admitting.
 ///
@@ -350,7 +351,12 @@ impl RegolithEngine {
                 && (!check.presence_only || newest_type == VALUE_TYPE_DELETION)
             {
                 // A key the transaction *read* always aborts, since the stale
-                // read may have changed what it decided.
+                // read may have changed what it decided. The commit-level
+                // `CommitConflicts` ticker is recorded once per commit where
+                // the outcome is mapped; this is the per-key subset.
+                if let Some(s) = self.statistics() {
+                    s.add(Ticker::CommitConflictsOnRead, 1);
+                }
                 return Ok(CommitOutcome::Conflict {
                     key: check.key.clone(),
                     observed_seq: check.observed_seq,
@@ -414,16 +420,27 @@ impl RegolithEngine {
                 }
                 // Operands commute, so a key the batch only merges into
                 // conflicts only with a replacement newer than the snapshot,
-                // and one walk settles that. The probe below then runs for
-                // such a key only once it is about to conflict anyway.
+                // and one walk settles that and tells whether operands landed
+                // too. The probe below then runs for such a key only once it
+                // is about to conflict anyway.
                 if merged
                     && let Some(replaced) = &replaced
                     && !replaced.contains(key)
-                    && self
-                        .newest_terminator_seq_above(key, observed_seq, &view)?
-                        .is_none()
                 {
-                    continue;
+                    match self.landed_above(key, observed_seq, &view)? {
+                        // The probe below conflicts.
+                        Landed::Replaced => {}
+                        Landed::Operands => {
+                            // Operands commute, so a newer merge operand never
+                            // invalidates a blind merge: the key is accepted
+                            // despite the newer write.
+                            if let Some(s) = self.statistics() {
+                                s.add(Ticker::PolicyBlindMergesCommuted, 1);
+                            }
+                            continue;
+                        }
+                        Landed::Nothing => continue,
+                    }
                 }
                 if let Some((latest_seq, newest_type)) = self.latest_version_in_view(key, &view)?
                     && latest_seq > observed_seq
@@ -432,7 +449,13 @@ impl RegolithEngine {
                     // conflict: the schedule has a serial equivalent reaching the
                     // same state.
                     if self.write_matches_committed(key, &ops, &view, newest_type)? {
+                        if let Some(s) = self.statistics() {
+                            s.add(Ticker::CommitWritesElided, 1);
+                        }
                         continue;
+                    }
+                    if let Some(s) = self.statistics() {
+                        s.add(Ticker::CommitConflictsOnWrite, 1);
                     }
                     return Ok(CommitOutcome::Conflict {
                         key: key.clone(),
