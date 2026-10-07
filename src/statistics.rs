@@ -8,6 +8,15 @@
 //! or [`Statistics::to_string`]) to export the values to their
 //! monitoring stack of choice.
 //!
+//! # Metric names
+//!
+//! Every ticker and histogram exports a stable string name of the
+//! form `regolith.<surface>.<metric>`, grouping related metrics
+//! under a shared surface prefix. The surfaces are `write`
+//! (memtable/batch writes), `read` (point lookups), `iter`
+//! (iterator seek/next), `block_cache`, `bloom`, `block`,
+//! `compaction`, `flush`, `wal`, and `snapshot`.
+//!
 //! # Cost when disabled
 //!
 //! `Options::statistics = None` short-circuits every instrumentation
@@ -137,31 +146,31 @@ impl Ticker {
     /// Stable string name for exporting to monitoring systems.
     pub fn name(&self) -> &'static str {
         match self {
-            Ticker::BytesWritten => "regolith.bytes_written",
-            Ticker::BytesRead => "regolith.bytes_read",
-            Ticker::KeysWritten => "regolith.keys_written",
-            Ticker::KeysRead => "regolith.keys_read",
-            Ticker::KeysDeleted => "regolith.keys_deleted",
-            Ticker::RangeDeletesWritten => "regolith.range_deletes_written",
-            Ticker::MergesWritten => "regolith.merges_written",
-            Ticker::BlockCacheHit => "regolith.block_cache_hit",
-            Ticker::BlockCacheMiss => "regolith.block_cache_miss",
-            Ticker::BlockCacheAdd => "regolith.block_cache_add",
-            Ticker::BloomFilterUseful => "regolith.bloom_filter_useful",
-            Ticker::BloomFilterFullPositive => "regolith.bloom_filter_full_positive",
-            Ticker::CompactionBytesRead => "regolith.compaction_bytes_read",
-            Ticker::CompactionBytesWritten => "regolith.compaction_bytes_written",
-            Ticker::CompactionCount => "regolith.compaction_count",
-            Ticker::FlushBytesWritten => "regolith.flush_bytes_written",
-            Ticker::FlushCount => "regolith.flush_count",
-            Ticker::WalBytesWritten => "regolith.wal_bytes_written",
-            Ticker::WalSyncCount => "regolith.wal_sync_count",
-            Ticker::IterSeekCount => "regolith.iter_seek_count",
-            Ticker::IterNextCount => "regolith.iter_next_count",
-            Ticker::WriteStallMicros => "regolith.write_stall_micros",
-            Ticker::SnapshotsRegistered => "regolith.snapshots_registered",
-            Ticker::SnapshotsReleased => "regolith.snapshots_released",
-            Ticker::WalTailDiscarded => "regolith.wal_tail_discarded",
+            Ticker::BytesWritten => "regolith.write.bytes",
+            Ticker::BytesRead => "regolith.read.bytes",
+            Ticker::KeysWritten => "regolith.write.keys",
+            Ticker::KeysRead => "regolith.read.keys",
+            Ticker::KeysDeleted => "regolith.write.deletes",
+            Ticker::RangeDeletesWritten => "regolith.write.range_deletes",
+            Ticker::MergesWritten => "regolith.write.merges",
+            Ticker::BlockCacheHit => "regolith.block_cache.hit",
+            Ticker::BlockCacheMiss => "regolith.block_cache.miss",
+            Ticker::BlockCacheAdd => "regolith.block_cache.add",
+            Ticker::BloomFilterUseful => "regolith.bloom.useful",
+            Ticker::BloomFilterFullPositive => "regolith.bloom.full_positive",
+            Ticker::CompactionBytesRead => "regolith.compaction.bytes_read",
+            Ticker::CompactionBytesWritten => "regolith.compaction.bytes_written",
+            Ticker::CompactionCount => "regolith.compaction.count",
+            Ticker::FlushBytesWritten => "regolith.flush.bytes_written",
+            Ticker::FlushCount => "regolith.flush.count",
+            Ticker::WalBytesWritten => "regolith.wal.bytes_written",
+            Ticker::WalSyncCount => "regolith.wal.sync_count",
+            Ticker::IterSeekCount => "regolith.iter.seek_count",
+            Ticker::IterNextCount => "regolith.iter.next_count",
+            Ticker::WriteStallMicros => "regolith.write.stall_micros",
+            Ticker::SnapshotsRegistered => "regolith.snapshot.registered",
+            Ticker::SnapshotsReleased => "regolith.snapshot.released",
+            Ticker::WalTailDiscarded => "regolith.wal.tail_discarded",
         }
     }
 }
@@ -221,16 +230,16 @@ impl Histogram {
     /// Stable string name for exporting to monitoring systems.
     pub fn name(&self) -> &'static str {
         match self {
-            Histogram::DbGet => "regolith.db_get",
-            Histogram::DbWrite => "regolith.db_write",
-            Histogram::DbIterSeek => "regolith.db_iter_seek",
-            Histogram::DbIterNext => "regolith.db_iter_next",
-            Histogram::CompactionTime => "regolith.compaction_time",
-            Histogram::FlushTime => "regolith.flush_time",
-            Histogram::BlockReadTime => "regolith.block_read_time",
-            Histogram::BytesPerRead => "regolith.bytes_per_read",
-            Histogram::BytesPerWrite => "regolith.bytes_per_write",
-            Histogram::WalWriteTime => "regolith.wal_write_time",
+            Histogram::DbGet => "regolith.read.get_micros",
+            Histogram::DbWrite => "regolith.write.batch_micros",
+            Histogram::DbIterSeek => "regolith.iter.seek_micros",
+            Histogram::DbIterNext => "regolith.iter.next_micros",
+            Histogram::CompactionTime => "regolith.compaction.micros",
+            Histogram::FlushTime => "regolith.flush.micros",
+            Histogram::BlockReadTime => "regolith.block.read_micros",
+            Histogram::BytesPerRead => "regolith.read.bytes_per_get",
+            Histogram::BytesPerWrite => "regolith.write.bytes_per_batch",
+            Histogram::WalWriteTime => "regolith.wal.write_micros",
         }
     }
 }
@@ -541,10 +550,45 @@ mod tests {
     fn dump_contains_every_ticker_and_histogram_name() {
         let s = Statistics::new();
         let out = s.dump();
-        assert!(out.contains("regolith.bytes_written"));
-        assert!(out.contains("regolith.block_cache_hit"));
-        assert!(out.contains("regolith.db_get"));
-        assert!(out.contains("regolith.flush_time"));
+        assert!(out.contains("regolith.write.bytes"));
+        assert!(out.contains("regolith.block_cache.hit"));
+        assert!(out.contains("regolith.read.get_micros"));
+        assert!(out.contains("regolith.flush.micros"));
+    }
+
+    #[test]
+    fn every_metric_name_is_unique_and_surface_prefixed() {
+        const SURFACES: [&str; 10] = [
+            "write",
+            "read",
+            "iter",
+            "block_cache",
+            "bloom",
+            "block",
+            "compaction",
+            "flush",
+            "wal",
+            "snapshot",
+        ];
+        let mut names: Vec<&str> = ALL_TICKERS
+            .iter()
+            .map(|t| t.name())
+            .chain(ALL_HISTOGRAMS.iter().map(|h| h.name()))
+            .collect();
+        let total = names.len();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), total, "metric names must be unique");
+        for name in names {
+            let rest = name
+                .strip_prefix("regolith.")
+                .unwrap_or_else(|| panic!("{name} must start with `regolith.`"));
+            let surface = rest.split('.').next().unwrap();
+            assert!(
+                SURFACES.contains(&surface),
+                "{name} uses unknown surface `{surface}`"
+            );
+        }
     }
 
     #[test]
