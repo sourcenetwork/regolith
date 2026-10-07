@@ -13,9 +13,9 @@ dependencies = [
 
 [[package]]
 name = "bitflags"
-version = "2.13.1"
+version = "2.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b588b76d00fde79687d7646a9b5bdf3cc0f655e0bbd080335a95d7e96f3587da"
+checksum = "3ded4057c258ba199e2d26386d3af3780957ecaee6c4ef4041c6b4b8b97c0b06"
 
 [[package]]
 name = "bumpalo"
@@ -145,9 +145,9 @@ dependencies = [
 
 [[package]]
 name = "kovan"
-version = "0.1.20"
+version = "0.1.22"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "069314825b47e60f2882bf6fc90ab66e3eb37ee5e4407de6357a124842fc3b26"
+checksum = "7919a54a249fd585dba9436a09301f747d4f6ca16689c0cbb619301df1cbdf8f"
 dependencies = [
  "once_cell",
  "portable-atomic",
@@ -155,9 +155,9 @@ dependencies = [
 
 [[package]]
 name = "kovan-channel"
-version = "0.1.20"
+version = "0.1.22"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0d105d382f56b3e8ece40ef1de7246205a419513333ac71e42832766240d8a47"
+checksum = "013b9b50403275599d3a1b505c83bc791458d12041d66dd3749eedf2acb1a41a"
 dependencies = [
  "crossbeam-utils",
  "kovan",
@@ -166,9 +166,9 @@ dependencies = [
 
 [[package]]
 name = "kovan-map"
-version = "0.1.20"
+version = "0.1.22"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "aaba93d80fa57cdb3525198c0b61abeeb689ec0ac346b6d8da6a7c108bf608d4"
+checksum = "ee9fda66cc131f283a3237413de11ed4488ca1cc3599d9ca5de934e67dc6a031"
 dependencies = [
  "foldhash",
  "kovan",
@@ -176,9 +176,9 @@ dependencies = [
 
 [[package]]
 name = "kovan-mvcc"
-version = "0.1.20"
+version = "0.1.22"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "43bda37cfe1a4e6a1cf6737aaab3f601b0a245098beaa2c278630beadb8eec5b"
+checksum = "1bff8c25bed5ebe9a20fde7a01d7fb04387ad69d70834ba990a3919b17db3b95"
 dependencies = [
  "kovan",
  "kovan-map",
@@ -188,9 +188,9 @@ dependencies = [
 
 [[package]]
 name = "kovan-queue"
-version = "0.1.20"
+version = "0.1.22"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f1f72e2bdab247e2f7d53e41bcd2abd6a53daac69727511d1223abf41f0c9b7f"
+checksum = "89c76a4c5d5ddb5c8976681c916200e4f9c5e71b70f061cf04232dabaff9c868"
 dependencies = [
  "crossbeam-utils",
  "kovan",
@@ -368,7 +368,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "regolith"
-version = "0.1.7"
+version = "0.1.9"
 dependencies = [
  "js-sys",
  "kovan",
@@ -485,9 +485,9 @@ checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 
 [[package]]
 name = "smallvec"
-version = "1.15.2"
+version = "1.16.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8ed6a63f02c8539c91a8685a86f4099661ba3da017932f6ebbea6de3f0fa7c90"
+checksum = "f9395f0f0eee849a9b707b2f06bb92a6a422090e2123bb2ef8e87a0e61892a8e"
 
 [[package]]
 name = "snap"

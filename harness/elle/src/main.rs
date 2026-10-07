@@ -31,7 +31,6 @@ fn dispatch(cfg: &Config) -> Result<(), String> {
         return report_verification(&verify::verify(path, cfg.model)?);
     }
 
-
     if cfg.worker.is_some() {
         return runner::run_worker(cfg);
     }

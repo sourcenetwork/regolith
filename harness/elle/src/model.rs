@@ -5,8 +5,9 @@
 //! match the ones in the completion record even when an optimistic
 //! transaction has to be replayed.
 
-use regolith::{IsolationLevel, 
-    Db, OptimisticTransactionDb, Options, Transaction, TransactionDb, TransactionError, TxResult,
+use regolith::{
+    Db, IsolationLevel, OptimisticTransactionDb, Options, Transaction, TransactionDb,
+    TransactionError, TxResult,
 };
 use std::path::Path;
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -161,7 +162,9 @@ pub enum TxDb {
 impl TxDb {
     pub fn open(path: &Path, isolation: Isolation, opts: Options) -> regolith::Result<Self> {
         match isolation {
-            Isolation::ReadCommitted => Ok(TxDb::Pessimistic(TransactionDb::open(path, opts)?)),
+            Isolation::ReadCommitted => Ok(TxDb::Pessimistic(
+                TransactionDb::open(path, opts)?.with_isolation(IsolationLevel::ReadCommitted),
+            )),
             // The optimistic flavour at the regolith level of the same name.
             Isolation::Snapshot => Ok(TxDb::Optimistic(
                 OptimisticTransactionDb::open(path, opts)?
@@ -174,6 +177,12 @@ impl TxDb {
             Isolation::Serializable => Ok(TxDb::Optimistic(
                 OptimisticTransactionDb::open(path, opts)?
                     .with_isolation(IsolationLevel::Serializable),
+            )),
+            // No key classifier: these workloads are point operations, so
+            // DefraLevel validates exactly as RepeatableRead here.
+            Isolation::DefraLevel => Ok(TxDb::Optimistic(
+                OptimisticTransactionDb::open(path, opts)?
+                    .with_isolation(IsolationLevel::DefraLevel),
             )),
         }
     }

@@ -8,11 +8,11 @@ use std::time::{Duration, Instant};
 use regolith::{DurabilityMode, Options};
 
 use crate::cli::{Config, Fault, WorkerRole};
-use crate::faults::{tear_wal_write, truncate_wal_tail, WalMark};
+use crate::faults::{WalMark, tear_wal_write, truncate_wal_tail};
 use crate::history::{
-    close_dangling_invokes, read_worker_records, stream_record, write_history, Op, OpKind, Recorder,
+    Op, OpKind, Recorder, close_dangling_invokes, read_worker_records, stream_record, write_history,
 };
-use crate::model::{run_txn, Outcome, Rng, TxDb, TxnPlan, ValueSource};
+use crate::model::{Outcome, Rng, TxDb, TxnPlan, ValueSource, run_txn};
 
 /// Process id space reserved per child so a killed process is never
 /// reused, which Jepsen requires after an indeterminate operation.

@@ -412,7 +412,8 @@ elle-matrix:
     # isolation: a false here is a defect.
     check optimistic-si       list-append snapshot-isolation --isolation snapshot-isolation --threads 8 --txns 50 --keys 4 --seed 4
     check optimistic-rw       rw-register snapshot-isolation --isolation snapshot-isolation --threads 8 --txns 50 --keys 4 --seed 5
-    # Pessimistic transactions are checked at the level they request.
+    # Pessimistic transactions are checked at the level they request: these
+    # rows run regolith's ReadCommitted level.
     check pessimistic-rc      list-append read-committed     --isolation read-committed --threads 8 --txns 50 --keys 4 --seed 2
     check pessimistic-hotkey  list-append read-committed     --isolation read-committed --threads 8 --txns 50 --keys 1 --seed 1
     # Serializable validates the whole read set, so the strongest model
@@ -425,6 +426,11 @@ elle-matrix:
     check repeatable-read     list-append repeatable-read    --isolation repeatable-read --threads 8 --txns 60 --keys 4 --seed 13
     check repeatable-read-rw  rw-register repeatable-read    --isolation repeatable-read --threads 8 --txns 60 --keys 4 --seed 14
     check repeatable-read-ss  list-append strict-serializable --isolation repeatable-read --threads 8 --txns 60 --keys 4 --seed 15
+    # DefraLevel without a classifier validates point reads as RepeatableRead;
+    # the TLA+ model (proofs/tla, MC_DefraLevel_*) proves its relaxations.
+    check defra-level         list-append repeatable-read     --isolation defra-level --threads 8 --txns 60 --keys 4 --seed 16
+    check defra-level-rw      rw-register repeatable-read     --isolation defra-level --threads 8 --txns 60 --keys 4 --seed 17
+    check defra-level-si      list-append snapshot-isolation  --isolation defra-level --threads 8 --txns 60 --keys 4 --seed 18
     exit $fail
 
 # ---------- portability ----------

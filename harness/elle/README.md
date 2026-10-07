@@ -98,16 +98,17 @@ directly rather than only through a dependency cycle.
 
 ## Isolation levels
 
-`--isolation read-committed|snapshot-isolation|repeatable-read|serializable`
+`--isolation read-committed|snapshot-isolation|repeatable-read|serializable|defra-level`
 selects the level to exercise. Each is an engine level of its own, checked
 against the Elle model it claims:
 
 | Requested | Runs against | Checked against |
 | --- | --- | --- |
-| `read-committed` | `TransactionDb` (pessimistic locks) | `read-committed`. The pessimistic flavour reads from a snapshot, which is strictly stronger, so every anomaly reported here is a genuine violation. |
+| `read-committed` | `TransactionDb` (pessimistic locks) at `ReadCommitted` | `read-committed`. The pessimistic flavour reads from a snapshot, which is strictly stronger, so every anomaly reported here is a genuine violation. |
 | `snapshot-isolation` | `OptimisticTransactionDb` at `SnapshotIsolation` | `snapshot-isolation`. Write skew (`G2-item`) is legal here. |
 | `repeatable-read` | `OptimisticTransactionDb` at `RepeatableRead` | `repeatable-read`, Adya's PL-2.99: every point read is validated, so a `G2-item` verdict is a defect. A scan is recorded per stretch, so a predicate anomaly would be legal; the workloads here have no predicate reads. |
 | `serializable` | `OptimisticTransactionDb` at `Serializable` | `strict-serializable`. |
+| `defra-level` | `OptimisticTransactionDb` at `DefraLevel` | `repeatable-read`. No key classifier is installed, so the level validates point reads exactly as `RepeatableRead` does; the TLA+ model (`proofs/tla`, `MC_DefraLevel_*`) proves its relaxations. |
 
 A history can be checked against any model elle-cli offers, whatever level
 generated it; a weaker model than the one claimed is a sound check, a
@@ -205,7 +206,7 @@ dependency graph has no cycles, so it checks out while proving nothing.
 
 ```text
 --model <list-append|rw-register>   Workload model (default: list-append)
---isolation <read-committed|snapshot-isolation|repeatable-read|serializable>
+--isolation <read-committed|snapshot-isolation|repeatable-read|serializable|defra-level>
 --faults <kill,torn-write,truncate-wal|all>
 --dir <path>                        Database directory (default: db)
 --out <path>                        History output (default: history.json)
