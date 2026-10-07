@@ -27,7 +27,7 @@ fn oracle(
     let optimistic = matches!(tx.mode, TxMode::Optimistic);
     let serializable = matches!(
         tx.isolation,
-        IsolationLevel::RepeatableRead | IsolationLevel::Serializable
+        IsolationLevel::RepeatableRead | IsolationLevel::Serializable | IsolationLevel::DefraLevel
     );
     let read_committed = tx.isolation == IsolationLevel::ReadCommitted;
     let mut checks: BTreeMap<Vec<u8>, (u64, bool)> = BTreeMap::new();
@@ -117,11 +117,12 @@ impl AnyDb {
 }
 
 fn isolation_level(level: u8) -> IsolationLevel {
-    match level % 4 {
+    match level % 5 {
         0 => IsolationLevel::ReadCommitted,
         1 => IsolationLevel::SnapshotIsolation,
         2 => IsolationLevel::RepeatableRead,
-        _ => IsolationLevel::Serializable,
+        3 => IsolationLevel::Serializable,
+        _ => IsolationLevel::DefraLevel,
     }
 }
 
@@ -134,7 +135,7 @@ proptest! {
     #[test]
     fn new_validation_set_equals_the_old_one(
         flavor in 0..2u8,
-        level in 0..4u8,
+        level in 0..5u8,
         ops in proptest::collection::vec((0u8..6, 0u8..6), 0..24),
     ) {
         let dir = TempDir::new().expect("tempdir");
@@ -178,6 +179,11 @@ proptest! {
         prop_assert!(
             checks.reads.windows(2).all(|pair| pair[0].key < pair[1].key),
             "reads must be strictly ascending by key with no duplicates"
+        );
+        prop_assert_eq!(
+            checks.blind_merges_commute,
+            tx.isolation == IsolationLevel::DefraLevel,
+            "only DefraLevel lets blind merges commute"
         );
         let got = expand(&checks, &writes, &merges);
         prop_assert_eq!(got, want);
@@ -324,7 +330,7 @@ proptest! {
     #[test]
     fn a_scan_validates_like_gets_of_what_it_walked(
         flavor in 0..2u8,
-        level in 0..4u8,
+        level in 0..5u8,
         seeded in any::<u8>(),
         ops in proptest::collection::vec((0u8..10, 0u8..6), 0..28),
     ) {
@@ -365,7 +371,12 @@ proptest! {
                 drop(stream);
                 for entry in entries {
                     let buffered = scan_tx.writes.get(&prefix_key(DEFAULT_CF_ID, &entry)).is_some();
-                    if !buffered && scan_tx.isolation != IsolationLevel::RepeatableRead {
+                    if !buffered
+                        && !matches!(
+                            scan_tx.isolation,
+                            IsolationLevel::RepeatableRead | IsolationLevel::DefraLevel
+                        )
+                    {
                         prop_assert!(twin_tx.get(&entry).is_ok());
                     }
                 }

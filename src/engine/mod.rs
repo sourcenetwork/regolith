@@ -134,6 +134,11 @@ pub(crate) struct ValidationSet {
     /// (pessimistic mode: the key lock orders them and there is no read to
     /// lose).
     pub writes_at: Option<u64>,
+    /// Whether a key this commit only merges into, and did not read, is
+    /// validated against the newest write that replaced it rather than the
+    /// newest write of any kind. Operands commute, so a newer operand never
+    /// invalidates a blind merge; a newer put or delete still does.
+    pub blind_merges_commute: bool,
 }
 
 fn batch_op_wal_bytes(op: &WriteBatchOp) -> u64 {
@@ -165,6 +170,10 @@ fn apply_batch_op_to_memtable<'a>(
         WriteBatchOp::Merge { key, operand } => memtable.merge_hinted(hint, key, operand, seq),
     }
 }
+
+/// A key's visible entries, newest first, as `(seq, value_type, value)`,
+/// through its first terminator.
+type MergeChain = Vec<(u64, u8, DbSlice)>;
 
 struct MultiGetEntry {
     key: Vec<u8>,
@@ -1435,33 +1444,24 @@ impl RegolithEngine {
         Ok(None)
     }
 
-    /// Merge-aware point lookup. Walks every source newest→oldest
-    /// collecting merge operands and any base value / deletion into
-    /// a single chain, honors range-tombstone coverage, and calls
-    /// [`crate::MergeOperator::full_merge`] at the end to materialize
-    /// the final value.
-    ///
-    /// Callers are responsible for having checked that
-    /// `self.options.merge_operator.is_some()`; this helper asserts
-    /// internally.
-    fn get_with_merge(&self, lk: &LookupKey) -> std::io::Result<Option<DbSlice>> {
-        use internal_key::{VALUE_TYPE_DELETION, VALUE_TYPE_MERGE, VALUE_TYPE_VALUE};
+    /// Every visible entry for `lk`'s key in `view`, newest first, through
+    /// the first terminator: a value, a deletion, or a covering range
+    /// tombstone standing in as one. Also returns the newest covering range
+    /// tombstone's sequence, which can sit below every collected operand.
+    fn merge_chain_in_view(
+        &self,
+        lk: &LookupKey,
+        view: &ReadView,
+    ) -> std::io::Result<(MergeChain, u64)> {
+        use internal_key::{VALUE_TYPE_DELETION, VALUE_TYPE_MERGE};
 
         let key = lk.prefixed_user_key();
         let snapshot_seq = lk.snapshot_seq();
-
-        let merge_op = self
-            .options
-            .merge_operator
-            .as_ref()
-            .expect("get_with_merge called without a merge operator");
-
-        let view = self.view.load();
         // `chain` records visible entries for `key` in newest-seq-
         // first order, stopping at (and including) the first
         // terminator (`VALUE` or `DELETION`). Range tombstones that
         // cover the key are treated as virtual deletion terminators.
-        let mut chain: Vec<(u64, u8, DbSlice)> = Vec::new();
+        let mut chain: MergeChain = Vec::new();
         let mut max_rt_seq: u64 = 0;
         let mut terminated;
 
@@ -1579,6 +1579,30 @@ impl RegolithEngine {
             }
         }
 
+        Ok((chain, max_rt_seq))
+    }
+
+    /// Merge-aware point lookup. Walks every source newest→oldest
+    /// collecting merge operands and any base value / deletion into
+    /// a single chain, honors range-tombstone coverage, and calls
+    /// [`crate::MergeOperator::full_merge`] at the end to materialize
+    /// the final value.
+    ///
+    /// Callers are responsible for having checked that
+    /// `self.options.merge_operator.is_some()`; this helper asserts
+    /// internally.
+    fn get_with_merge(&self, lk: &LookupKey) -> std::io::Result<Option<DbSlice>> {
+        use internal_key::{VALUE_TYPE_DELETION, VALUE_TYPE_MERGE, VALUE_TYPE_VALUE};
+
+        let merge_op = self
+            .options
+            .merge_operator
+            .as_ref()
+            .expect("get_with_merge called without a merge operator");
+
+        let view = self.view.load();
+        let key = lk.prefixed_user_key();
+        let (mut chain, _) = self.merge_chain_in_view(lk, &view)?;
         // Materialize the chain. `chain` is newest-first; the last
         // entry (if any) is either a real VALUE / DELETION terminator
         // or (if !terminated) the oldest visible merge operand.
@@ -2314,6 +2338,25 @@ impl RegolithEngine {
             // A delete of a key that is already absent stores the same thing.
             (None, None) => true,
             _ => false,
+        })
+    }
+
+    /// The sequence of the newest write that replaced `key` outright in
+    /// `view`: a put, a delete, or a covering range delete. Newer merge
+    /// operands are walked past, since they build on whatever lies beneath
+    /// them instead of replacing it.
+    fn newest_terminator_seq_in_view(
+        &self,
+        key: &[u8],
+        view: &ReadView,
+    ) -> std::io::Result<Option<u64>> {
+        let lk = LookupKey::from_prefixed(key, u64::MAX);
+        let (chain, max_rt_seq) = self.merge_chain_in_view(&lk, view)?;
+        Ok(match chain.last() {
+            Some(&(seq, value_type, _)) if value_type != internal_key::VALUE_TYPE_MERGE => {
+                Some(seq)
+            }
+            _ => (max_rt_seq > 0).then_some(max_rt_seq),
         })
     }
 

@@ -49,6 +49,13 @@ pub(super) struct OpenRun {
     last: Vec<u8>,
 }
 
+impl ScanRun {
+    /// The stretch's first key and, once it closed, its last, CF-prefixed.
+    pub(super) fn bounds(&self) -> (&[u8], Option<&[u8]>) {
+        (&self.first, self.last.get().map(Vec::as_slice))
+    }
+}
+
 impl OpenRun {
     /// Begin a stretch at `key` (CF-prefixed). Returns the record for the
     /// transaction to register and the handle that extends and closes it.

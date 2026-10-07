@@ -105,9 +105,18 @@ pub use statistics::{Histogram, HistogramSnapshot, Statistics, Ticker};
 pub use stream_writer::{StreamOptions, StreamingWriter};
 pub use tailing::TailingIter;
 pub use transaction::{
-    IsolationLevel, OptimisticTransactionDb, OwnedTransaction, ScanDirection, Transaction,
-    TransactionDb, TransactionError, TxResult, TxnScanStream,
+    IsolationLevel, KeyClass, KeyClassifier, OptimisticTransactionDb, OwnedTransaction,
+    ScanDirection, Transaction, TransactionDb, TransactionError, TxResult, TxnScanStream,
 };
+
+/// The transactional API and the traits a caller implements, in one import:
+/// `use regolith::prelude::*;`.
+pub mod prelude {
+    pub use crate::{
+        Db, IsolationLevel, KeyClass, KeyClassifier, MergeOperator, OptimisticTransactionDb,
+        Options, OwnedTransaction, Transaction, TransactionError, TxResult,
+    };
+}
 pub use ttl::{DbWithTtl, TtlCompactionFilter, strip_timestamp};
 
 #[cfg(loom)]

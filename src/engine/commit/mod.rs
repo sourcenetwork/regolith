@@ -358,6 +358,9 @@ impl RegolithEngine {
         // here; `write_matches_committed` refuses any key carrying a merge
         // op, so both probes land on the same outcome.
         if let Some(observed_seq) = checks.writes_at {
+            // Built once per batch, not per key: the loop below runs under
+            // the pipeline mutex.
+            let replaced = checks.blind_merges_commute.then(|| Replaced::of(&ops));
             let mut merged_keys: std::collections::HashSet<&[u8]> =
                 std::collections::HashSet::new();
             for op in &ops {
@@ -384,6 +387,14 @@ impl RegolithEngine {
                 if let Some((latest_seq, newest_type)) = self.latest_version_in_view(key, &view)?
                     && latest_seq > observed_seq
                 {
+                    if let Some(replaced) = &replaced
+                        && !replaced.contains(key)
+                        && self
+                            .newest_terminator_seq_in_view(key, &view)?
+                            .is_none_or(|seq| seq <= observed_seq)
+                    {
+                        continue;
+                    }
                     // A blind write of the value the key already holds is not a
                     // conflict: the schedule has a serial equivalent reaching the
                     // same state.
@@ -792,6 +803,40 @@ impl RegolithEngine {
                 )
             });
         }
+    }
+}
+
+/// The keys a batch replaces outright: put, deleted, or covered by a range
+/// delete. A merged key outside it is one the batch only merges into.
+struct Replaced<'a> {
+    points: std::collections::HashSet<&'a [u8]>,
+    ranges: Vec<(&'a [u8], &'a [u8])>,
+}
+
+impl<'a> Replaced<'a> {
+    fn of(ops: &'a [WriteBatchOp]) -> Self {
+        let mut replaced = Self {
+            points: std::collections::HashSet::new(),
+            ranges: Vec::new(),
+        };
+        for op in ops {
+            match op {
+                WriteBatchOp::Put { key, .. } | WriteBatchOp::Delete { key } => {
+                    replaced.points.insert(key);
+                }
+                WriteBatchOp::DeleteRange { start, end } => replaced.ranges.push((start, end)),
+                WriteBatchOp::Merge { .. } => {}
+            }
+        }
+        replaced
+    }
+
+    fn contains(&self, key: &[u8]) -> bool {
+        self.points.contains(key)
+            || self
+                .ranges
+                .iter()
+                .any(|&(start, end)| start <= key && key < end)
     }
 }
 
