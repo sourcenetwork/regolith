@@ -2354,11 +2354,10 @@ impl RegolithEngine {
         let version = &view.version;
         for file in version.levels[0].iter().rev() {
             max_rt_seq = max_rt_seq.max(file.reader.covering_range_tombstone_seq(key, snap));
-            match with_key_scratch(|buf| file.reader.get(&lk, buf, &self.cache))? {
-                LookupResult::Found { seq, .. } | LookupResult::FoundTombstone { seq } => {
-                    return Ok(newest(seq, max_rt_seq));
-                }
-                LookupResult::NotInTable => {}
+            if let Some((seq, _)) =
+                with_key_scratch(|buf| file.reader.latest_version(&lk, buf, &self.cache))?
+            {
+                return Ok(newest(seq, max_rt_seq));
             }
         }
         for level in 1..version.levels.len() {
@@ -2382,11 +2381,10 @@ impl RegolithEngine {
                 {
                     continue;
                 }
-                match with_key_scratch(|buf| file.reader.get(&lk, buf, &self.cache))? {
-                    LookupResult::Found { seq, .. } | LookupResult::FoundTombstone { seq } => {
-                        return Ok(newest(seq, max_rt_seq));
-                    }
-                    LookupResult::NotInTable => {}
+                if let Some((seq, _)) =
+                    with_key_scratch(|buf| file.reader.latest_version(&lk, buf, &self.cache))?
+                {
+                    return Ok(newest(seq, max_rt_seq));
                 }
             }
         }

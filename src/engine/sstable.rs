@@ -1696,6 +1696,26 @@ impl SsTableReader {
         })
     }
 
+    /// The block a point lookup for `lk` has to scan, or `None` when the
+    /// bloom filter or the index rules this table out. A bloom rejection
+    /// is recorded here; a positive is recorded by the caller once its
+    /// scan finds the key, since only the scan knows.
+    fn candidate_block(
+        &self,
+        lk: &LookupKey,
+        cache: &BlockCache,
+        limit: Option<usize>,
+    ) -> io::Result<Option<Arc<Block>>> {
+        if !self.filter(cache)?.may_contain(lk.prefixed_user_key()) {
+            cache.record_bloom_useful();
+            return Ok(None);
+        }
+        let Some(handle) = self.find_block_handle(lk.internal(), cache)? else {
+            return Ok(None);
+        };
+        self.read_block_with_limit(handle, cache, limit).map(Some)
+    }
+
     /// The shared half of a point lookup: bloom, index search, block
     /// read and block scan, stopping at the winning entry's position
     /// inside its block. `None` means this table has no visible entry
@@ -1712,18 +1732,11 @@ impl SsTableReader {
         cache: &BlockCache,
         limit: Option<usize>,
     ) -> io::Result<Option<(Arc<Block>, BlockHit)>> {
-        let user_key = lk.prefixed_user_key();
-        if !self.filter(cache)?.may_contain(user_key) {
-            cache.record_bloom_useful();
-            return Ok(None);
-        }
-
-        let search_key = lk.internal();
-        let Some(handle) = self.find_block_handle(search_key, cache)? else {
+        let Some(block) = self.candidate_block(lk, cache, limit)? else {
             return Ok(None);
         };
-
-        let block = self.read_block_with_limit(handle, cache, limit)?;
+        let user_key = lk.prefixed_user_key();
+        let search_key = lk.internal();
         // The scan borrows the block, so it reports where the winning
         // value sits rather than copying it out.
         // A `Break(None)` means the scan walked past the requested user
@@ -1751,6 +1764,34 @@ impl SsTableReader {
                 Ok(Some((block, hit)))
             }
         }
+    }
+
+    /// The newest entry this table holds for the key at or below the
+    /// lookup's snapshot, of any kind: `(seq, value_type)`.
+    ///
+    /// Unlike [`SsTableReader::get`], a merge operand counts. The
+    /// conflict check asks when a key last changed, and a newer operand
+    /// changes it even though a read has to walk past it to a base.
+    pub(crate) fn latest_version(
+        &self,
+        lk: &LookupKey,
+        key_buf: &mut Vec<u8>,
+        cache: &BlockCache,
+    ) -> io::Result<Option<(u64, u8)>> {
+        let Some(block) = self.candidate_block(lk, cache, None)? else {
+            return Ok(None);
+        };
+        let user_key = lk.prefixed_user_key();
+        let newest = block
+            .scan_from(lk.internal(), key_buf, |ik, _, _| {
+                let (uk, seq, vt) = decode_internal_key(ik);
+                ControlFlow::Break((uk == user_key).then_some((seq, vt)))
+            })
+            .flatten();
+        if newest.is_some() {
+            cache.record_bloom_full_positive();
+        }
+        Ok(newest)
     }
 
     /// Walk every visible entry for `user_key` at `snapshot_seq` in
