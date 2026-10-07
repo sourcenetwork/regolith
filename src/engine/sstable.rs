@@ -1758,6 +1758,11 @@ impl SsTableReader {
     /// tuples onto `out` and stopping at (and including) the first
     /// terminator (`VALUE_TYPE_VALUE` or `VALUE_TYPE_DELETION`).
     /// Returns `true` if a terminator was reached.
+    ///
+    /// The chain continues into the following data blocks for as long as
+    /// the key does: a key with more operands than one block holds, which a
+    /// pinned snapshot makes routine by keeping compaction from folding
+    /// them, would otherwise lose the rest of its chain and its base.
     pub(crate) fn collect_merge_chain(
         &self,
         lk: &LookupKey,
@@ -1771,17 +1776,15 @@ impl SsTableReader {
         }
 
         let search_key = lk.internal();
-        let handle = match self.find_block_handle(search_key, cache)? {
-            Some(h) => h,
-            None => return Ok(false),
-        };
-
-        let block = self.read_block(handle, cache)?;
-        // Positions first, owning slices second: the scan closure holds
-        // a borrow of the block for its whole run.
-        let mut spans: Vec<(u64, u8, usize, usize)> = Vec::new();
-        let terminated = block
-            .scan_from(search_key, key_buf, |ik, value_offset, value_len| {
+        let mut cursor = self.seek_block_cursor(search_key, cache)?;
+        while let Some(at) = cursor {
+            let block = self.load_block_at_cursor(&at, cache)?;
+            // Positions first, owning slices second: the scan closure holds
+            // a borrow of the block for its whole run. Every entry of a
+            // later block sorts after `search_key`, so seeking to it there
+            // starts at the block's first entry.
+            let mut spans: Vec<(u64, u8, usize, usize)> = Vec::new();
+            let ended = block.scan_from(search_key, key_buf, |ik, value_offset, value_len| {
                 let (uk, seq, vt) = decode_internal_key(ik);
                 if uk != user_key {
                     return ControlFlow::Break(false);
@@ -1792,15 +1795,20 @@ impl SsTableReader {
                 } else {
                     ControlFlow::Continue(())
                 }
-            })
-            .unwrap_or(false);
+            });
 
-        for (seq, vt, value_offset, value_len) in spans {
-            let value = DbSlice::from_block(Arc::clone(&block), value_offset, value_len)
-                .ok_or_else(|| invalid_data("block value extends past block"))?;
-            out.push((seq, vt, value));
+            for (seq, vt, value_offset, value_len) in spans {
+                let value = DbSlice::from_block(Arc::clone(&block), value_offset, value_len)
+                    .ok_or_else(|| invalid_data("block value extends past block"))?;
+                out.push((seq, vt, value));
+            }
+            match ended {
+                Some(terminated) => return Ok(terminated),
+                // The block ran out while still on this key.
+                None => cursor = self.next_block_cursor(&at, cache)?,
+            }
         }
-        Ok(terminated)
+        Ok(false)
     }
 
     /// Collect every entry in internal-key order with no dedup or
