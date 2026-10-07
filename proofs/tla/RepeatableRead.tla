@@ -70,6 +70,30 @@
 \* allowed. Every read a DefraDB DAG or CRDT merge path derives a decision
 \* from is a point read, and the one read that is allowed to change
 \* underneath a transaction is the head scan.
+\*
+\* DEFRALEVEL. RepeatableRead, relaxed in two places (src/transaction/policy.rs,
+\* src/engine/commit/mod.rs):
+\*   policy::run_is_commutative   a scan stretch wholly inside a range the
+\*                                caller declares commutative is dropped
+\*                                before scan_range::cover.
+\*   Replaced / newest_terminator a key the commit only merges into, and did
+\*                                not read, aborts only on a newer write that
+\*                                replaced it, never on a newer merge operand.
+\* Two more workloads exercise them. Mergers apply the same remote block, so
+\* they write identical head and marker keys inside the stretches their head
+\* scans walked. Incrementers blind-merge one counter that a Resetter
+\* replaces.
+\*   INV_DuplicateMergesCommit         no merger is refused over writes
+\*                                     identical to its own.
+\*                                     RepeatableRead RED. DefraLevel GREEN,
+\*                                     and RED again without the policy.
+\*   INV_IncrementsCommitUnlessReplaced an increment aborts only when a reset
+\*                                     committed after it began.
+\*                                     RepeatableRead RED. DefraLevel GREEN.
+\*   INV_NoIncrementAcrossReset        no increment commits over a reset that
+\*                                     committed after it began. Every level.
+\* INV_HeadsExact is the check that dropping the head stretches is safe for
+\* the head set: the derived heads stay the DAG's tips.
 
 EXTENDS Naturals, FiniteSets, TLC
 
@@ -79,33 +103,52 @@ CONSTANTS
   Pruner,    \* transaction ids, naturals outside Appenders
   Writer,
   Patcher,
-  Level      \* "ReadCommitted" | "SnapshotIsolation" | "RepeatableRead" | "Serializable"
+  Mergers,      \* transactions applying the remote block, possibly none
+  Remote,       \* the remote block, a natural
+  RemoteParents,\* the parents the remote block names, fixed by its content
+  Incrementers, \* transactions blind-merging the counter, possibly none
+  Resetters,    \* transactions replacing the counter, possibly none
+  CommutativeRanges, \* ranges the KeyClassifier declares commutative
+  Level      \* "ReadCommitted" | "SnapshotIsolation" | "RepeatableRead" | "Serializable" | "DefraLevel"
 
 ASSUME Appenders # {} /\ Appenders \subseteq Nat
 ASSUME Seed \in Nat /\ Seed \notin Appenders
 ASSUME {Pruner, Writer, Patcher} \subseteq Nat
 ASSUME Cardinality({Pruner, Writer, Patcher}) = 3
 ASSUME {Pruner, Writer, Patcher} \cap Appenders = {}
-ASSUME Level \in {"ReadCommitted", "SnapshotIsolation", "RepeatableRead", "Serializable"}
+ASSUME Level \in {"ReadCommitted", "SnapshotIsolation", "RepeatableRead", "Serializable",
+                  "DefraLevel"}
+ASSUME Remote \in Nat /\ Remote \notin Appenders \cup {Seed}
+ASSUME RemoteParents \subseteq Appenders \cup {Seed}
+ASSUME Mergers \cup Incrementers \cup Resetters \subseteq Nat
+ASSUME (Mergers \cup Incrementers \cup Resetters) \cap (Appenders \cup {Pruner, Writer, Patcher}) = {}
+ASSUME Mergers \cap Incrementers = {} /\ Mergers \cap Resetters = {} /\ Incrementers \cap Resetters = {}
 
-Blocks == Appenders \cup {Seed}
-Txns   == Appenders \cup {Pruner, Writer, Patcher}
+Blocks == Appenders \cup {Seed} \cup (IF Mergers = {} THEN {} ELSE {Remote})
+Txns   == Appenders \cup {Pruner, Writer, Patcher} \cup Mergers \cup Incrementers \cup Resetters
 
 \* Keys are <<range, p, c>>. Ranges sort head < marker < def < doc, and inside
 \* a range a key sorts by the blocks it names: the order a scan walks.
-HeadRange   == 1
-MarkerRange == 2
-DefRange    == 3
-DocRange    == 4
+HeadRange    == 1
+MarkerRange  == 2
+DefRange     == 3
+DocRange     == 4
+CounterRange == 5
+BlockRange   == 6
+ASSUME CommutativeRanges \subseteq {HeadRange, MarkerRange}
 
 HeadKey(b)      == <<HeadRange, b, b>>
 MarkerKey(p, c) == <<MarkerRange, p, c>>
 DefKey          == <<DefRange, 0, 0>>
 DocKey          == <<DocRange, 0, 0>>
+CounterKey      == <<CounterRange, 0, 0>>
+\* A block's content-addressed key: written once, identically by anyone.
+BlockKey(b)     == <<BlockRange, b, b>>
 
 Keys == {HeadKey(b) : b \in Blocks}
         \cup {MarkerKey(p, c) : p \in Blocks, c \in Blocks}
-        \cup {DefKey, DocKey}
+        \cup {DefKey, DocKey, CounterKey}
+        \cup {BlockKey(b) : b \in Blocks}
 
 KeyLeq(a, b) ==
   \/ a[1] < b[1]
@@ -127,13 +170,19 @@ VARIABLES
   tracked,   \* [Txns -> SUBSET Keys] keys recorded as reads
   runs,      \* [Txns -> SUBSET (Keys \X Keys)] stretches scans walked
   written,   \* [Txns -> SUBSET Keys] keys the commit puts or deletes
+  merged,    \* [Txns -> SUBSET Keys] keys the commit merges an operand into
+  replaced,  \* [Keys -> Nat] sequence of the last commit that put or deleted each key
+  lostIncrement, \* TRUE once an increment aborted with no reset after it began
+  acrossReset,   \* TRUE once an increment committed over a later reset
+  dupRefused,    \* TRUE once a merger was refused over writes identical to its own
   intended,  \* [Txns -> [Keys -> Nat]] what each written key will hold
   parents,   \* [Blocks -> SUBSET Blocks] parents each committed block recorded
   defAtRead, \* the definition the writer read
   stale      \* TRUE once a document committed over a replaced definition
 
 vars == <<clock, store, latest, phase, snap, tracked, runs, written, intended,
-          parents, defAtRead, stale>>
+          parents, defAtRead, stale, merged, replaced, lostIncrement, acrossReset,
+          dupRefused>>
 
 Stored == {k \in Keys : store[k] # Absent}
 
@@ -162,27 +211,56 @@ ScanReads(Y) == IF Level = "Serializable" THEN Y ELSE {}
 ----------------------------------------------------------------------------
 Init ==
   /\ clock     = 0
-  /\ store     = [k \in Keys |-> IF k \in {HeadKey(Seed), DefKey} THEN 1 ELSE Absent]
+  /\ store     = [k \in Keys |-> IF k \in {HeadKey(Seed), DefKey, BlockKey(Seed)} THEN 1 ELSE Absent]
   /\ latest    = [k \in Keys |-> 0]
   /\ phase     = [t \in Txns |-> "idle"]
   /\ snap      = [t \in Txns |-> 0]
   /\ tracked   = [t \in Txns |-> {}]
   /\ runs      = [t \in Txns |-> {}]
   /\ written   = [t \in Txns |-> {}]
+  /\ merged    = [t \in Txns |-> {}]
+  /\ replaced  = [k \in Keys |-> 0]
+  /\ lostIncrement = FALSE
+  /\ acrossReset   = FALSE
+  /\ dupRefused    = FALSE
   /\ intended  = [t \in Txns |-> [k \in Keys |-> Absent]]
   /\ parents   = [b \in Blocks |-> {}]
   /\ defAtRead = 0
   /\ stale     = FALSE
 
+\* The remote block's parents are fixed by its content, not by the local
+\* heads; the scan is the head-set read the merge path makes. A block already
+\* stored is not merged again.
+BeginMerger(m) ==
+  LET heads   == Yield(Stored, HeadRange)
+      markers == Yield(Stored, MarkerRange)
+      keys    == IF BlockKey(Remote) \in Stored THEN {}
+                 ELSE {HeadKey(Remote), BlockKey(Remote)}
+                      \cup {MarkerKey(p, Remote) : p \in RemoteParents}
+  IN /\ tracked'  = [tracked EXCEPT ![m] = ScanReads(heads) \cup ScanReads(markers)]
+     /\ runs'     = [runs EXCEPT ![m] = Stretch(heads) \cup Stretch(markers)]
+     /\ written'  = [written EXCEPT ![m] = keys]
+     /\ intended' = [intended EXCEPT ![m] = [k \in Keys |-> IF k \in keys THEN 1 ELSE Absent]]
+     /\ UNCHANGED <<merged, defAtRead>>
+
+BeginIncrementer(i) ==
+  /\ merged' = [merged EXCEPT ![i] = {CounterKey}]
+  /\ UNCHANGED <<tracked, runs, written, intended, defAtRead>>
+
+BeginResetter(r) ==
+  /\ written'  = [written EXCEPT ![r] = {CounterKey}]
+  /\ intended' = [intended EXCEPT ![r] = [k \in Keys |-> Absent]]
+  /\ UNCHANGED <<tracked, runs, merged, defAtRead>>
+
 BeginAppender(a) ==
   LET heads   == Yield(Stored, HeadRange)
       markers == Yield(Stored, MarkerRange)
-      keys    == {HeadKey(a)} \cup {MarkerKey(h, a) : h \in Heads(Stored)}
+      keys    == {HeadKey(a), BlockKey(a)} \cup {MarkerKey(h, a) : h \in Heads(Stored)}
   IN /\ tracked'  = [tracked EXCEPT ![a] = ScanReads(heads) \cup ScanReads(markers)]
      /\ runs'     = [runs EXCEPT ![a] = Stretch(heads) \cup Stretch(markers)]
      /\ written'  = [written EXCEPT ![a] = keys]
      /\ intended' = [intended EXCEPT ![a] = [k \in Keys |-> IF k \in keys THEN 1 ELSE Absent]]
-     /\ UNCHANGED defAtRead
+     /\ UNCHANGED <<merged, defAtRead>>
 
 \* Enabled once something is reclaimable, as the real sweep is a no-op
 \* otherwise. One head per pass, chosen freely, with the markers against it
@@ -197,7 +275,7 @@ BeginPruner ==
      /\ intended' = [intended EXCEPT ![Pruner] = [k \in Keys |-> Absent]]
      /\ tracked'  = [tracked EXCEPT ![Pruner] = ScanReads(heads) \cup ScanReads(markers)]
      /\ runs'     = [runs EXCEPT ![Pruner] = Stretch(heads) \cup Stretch(markers)]
-     /\ UNCHANGED defAtRead
+     /\ UNCHANGED <<merged, defAtRead>>
 
 \* Transaction::observe on the definition, then a document carrying it.
 BeginWriter ==
@@ -206,13 +284,13 @@ BeginWriter ==
   /\ intended'  = [intended EXCEPT ![Writer] =
                     [k \in Keys |-> IF k = DocKey THEN store[DefKey] ELSE Absent]]
   /\ defAtRead' = store[DefKey]
-  /\ UNCHANGED runs
+  /\ UNCHANGED <<runs, merged>>
 
 BeginPatcher ==
   /\ written'  = [written EXCEPT ![Patcher] = {DefKey}]
   /\ intended' = [intended EXCEPT ![Patcher] =
                    [k \in Keys |-> IF k = DefKey THEN store[DefKey] + 1 ELSE Absent]]
-  /\ UNCHANGED <<tracked, runs, defAtRead>>
+  /\ UNCHANGED <<tracked, runs, merged, defAtRead>>
 
 Begin(t) ==
   /\ phase[t] = "idle"
@@ -222,13 +300,17 @@ Begin(t) ==
        [] t = Pruner       -> BeginPruner
        [] t = Writer       -> BeginWriter
        [] t = Patcher      -> BeginPatcher
-  /\ UNCHANGED <<clock, store, latest, parents, stale>>
+       [] t \in Mergers      -> BeginMerger(t)
+       [] t \in Incrementers -> BeginIncrementer(t)
+       [] t \in Resetters    -> BeginResetter(t)
+  /\ UNCHANGED <<clock, store, latest, parents, stale, replaced, lostIncrement, acrossReset,
+                 dupRefused>>
 
 ----------------------------------------------------------------------------
 \* The commit, transcribed.
 
 \* IsolationLevel::validates_every_read.
-EveryRead == Level \in {"RepeatableRead", "Serializable"}
+EveryRead == Level \in {"RepeatableRead", "Serializable", "DefraLevel"}
 
 \* No get_for_update in this workload.
 ForUpdate(t) == {}
@@ -243,9 +325,14 @@ ValidatedReads(t) ==
 \* scan_range::cover: every written key inside a stretch a scan walked joins
 \* the reads. Each read is already anchored at the begin snapshot, so the
 \* re-anchoring `cover` also performs is the identity here.
-Walked(t, k) == \E s \in runs[t] : KeyLeq(s[1], k) /\ KeyLeq(k, s[2])
+\* policy::run_is_commutative: at DefraLevel a stretch inside one declared
+\* range is dropped before cover sees it.
+Commutative(s) == Level = "DefraLevel" /\ s[1][1] = s[2][1] /\ s[1][1] \in CommutativeRanges
+CoveredRuns(t) == {s \in runs[t] : ~Commutative(s)}
 
-Reads(t) == ValidatedReads(t) \cup {k \in written[t] : Walked(t, k)}
+Walked(t, k) == \E s \in CoveredRuns(t) : KeyLeq(s[1], k) /\ KeyLeq(k, s[2])
+
+Reads(t) == ValidatedReads(t) \cup {k \in (written[t] \cup merged[t]) : Walked(t, k)}
 
 \* Engine::commit_locked, the read loop: a read aborts on any newer write.
 ReadConflict(t) == \E k \in Reads(t) : latest[k] > snap[t]
@@ -256,22 +343,44 @@ ReadConflict(t) == \E k \in Reads(t) : latest[k] > snap[t]
 WriteConflict(t) ==
   \E k \in written[t] \ Reads(t) : latest[k] > snap[t] /\ intended[t][k] # store[k]
 
-Conflicts(t) == ReadConflict(t) \/ WriteConflict(t)
+\* The same loop for a key the commit only merges into: a merge is never
+\* elided. At DefraLevel (IsolationLevel::blind_merges_commute) it aborts only
+\* on a newer write that replaced the key, walking past newer operands.
+MergeConflict(t) ==
+  \E k \in merged[t] \ (Reads(t) \cup written[t]) :
+     IF Level = "DefraLevel" THEN replaced[k] > snap[t] ELSE latest[k] > snap[t]
+
+Conflicts(t) == ReadConflict(t) \/ WriteConflict(t) \/ MergeConflict(t)
 
 Commit(t) ==
   /\ phase[t] = "open"
   /\ IF Conflicts(t)
        THEN /\ phase' = [phase EXCEPT ![t] = "aborted"]
-            /\ UNCHANGED <<clock, store, latest, parents, stale>>
+            /\ lostIncrement' = (lostIncrement \/
+                                 (t \in Incrementers /\ replaced[CounterKey] <= snap[t]))
+            /\ dupRefused' = (dupRefused \/
+                              (t \in Mergers /\ \A k \in written[t] :
+                                  latest[k] > snap[t] => store[k] = intended[t][k]))
+            /\ UNCHANGED <<clock, store, latest, parents, stale, replaced, acrossReset>>
        ELSE /\ phase'   = [phase EXCEPT ![t] = "committed"]
             /\ clock'   = clock + 1
-            /\ store'   = [k \in Keys |-> IF k \in written[t] THEN intended[t][k] ELSE store[k]]
-            /\ latest'  = [k \in Keys |-> IF k \in written[t] THEN clock + 1 ELSE latest[k]]
+            /\ store'   = [k \in Keys |->
+                             IF k \in written[t] THEN intended[t][k]
+                             ELSE IF k \in merged[t] THEN store[k] + 1
+                             ELSE store[k]]
+            /\ latest'  = [k \in Keys |->
+                             IF k \in written[t] \cup merged[t] THEN clock + 1 ELSE latest[k]]
+            /\ replaced' = [k \in Keys |-> IF k \in written[t] THEN clock + 1 ELSE replaced[k]]
             /\ parents' = IF t \in Appenders
                             THEN [parents EXCEPT ![t] = {h \in Blocks : MarkerKey(h, t) \in written[t]}]
+                            ELSE IF t \in Mergers /\ written[t] # {}
+                            THEN [parents EXCEPT ![Remote] = RemoteParents]
                             ELSE parents
             /\ stale'   = (stale \/ (t = Writer /\ store[DefKey] # defAtRead))
-  /\ UNCHANGED <<snap, tracked, runs, written, intended, defAtRead>>
+            /\ acrossReset' = (acrossReset \/
+                               (t \in Incrementers /\ replaced[CounterKey] > snap[t]))
+            /\ UNCHANGED <<lostIncrement, dupRefused>>
+  /\ UNCHANGED <<snap, tracked, runs, written, intended, defAtRead, merged>>
 
 Next == \E t \in Txns : Begin(t) \/ Commit(t)
 
@@ -283,7 +392,7 @@ TypeOK ==
   /\ store \in [Keys -> Nat]
   /\ latest \in [Keys -> Nat]
   /\ phase \in [Txns -> {"idle", "open", "committed", "aborted"}]
-  /\ \A t \in Txns : tracked[t] \subseteq Keys /\ written[t] \subseteq Keys
+  /\ \A t \in Txns : tracked[t] \subseteq Keys /\ written[t] \subseteq Keys /\ merged[t] \subseteq Keys
   /\ \A t \in Txns : \A s \in runs[t] : s \in Keys \X Keys /\ KeyLeq(s[1], s[2])
   /\ stale \in BOOLEAN
 
@@ -299,8 +408,26 @@ INV_NoStaleDefinition == ~stale
 \* The derived head set is the DAG's tips: the committed blocks no committed
 \* block names as a parent. Holds at every level.
 CommittedBlocks == {Seed} \cup {a \in Appenders : phase[a] = "committed"}
+                   \cup (IF \E m \in Mergers : phase[m] = "committed" /\ written[m] # {}
+                         THEN {Remote} ELSE {})
 DagHeads == {b \in CommittedBlocks : ~\E c \in CommittedBlocks : b \in parents[c]}
 INV_HeadsExact == Heads(Stored) = DagHeads
+
+\* A merger is never refused when every newer write to its keys stored
+\* exactly what it writes: applying a block another transaction already
+\* applied lands. One whose keys a sweep reclaimed meanwhile is refused, and
+\* must be, or it would write the reclaimed marker back.
+INV_DuplicateMergesCommit == ~dupRefused
+
+\* A blind increment is refused only by a reset that committed after it began.
+INV_IncrementsCommitUnlessReplaced == ~lostIncrement
+
+\* No increment commits over a reset that committed after it began.
+INV_NoIncrementAcrossReset == ~acrossReset
+
+\* A state constraint for the counter configs: the head-set transactions stay
+\* idle, so the check spends its states on the counter alone.
+CounterWorkloadOnly == \A t \in Appenders \cup {Pruner, Writer, Patcher} : phase[t] = "idle"
 
 \* Under the level that refuses no append, every append lands.
 EventuallyAllAppendsCommit == <>[](\A a \in Appenders : phase[a] = "committed")

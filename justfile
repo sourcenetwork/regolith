@@ -319,13 +319,18 @@ tla:
             verdict=BROKEN
             echo "$out" | tail -20
         fi
-        printf '  %-40s %-6s (expected %s)\n' "$cfg" "$verdict" "$expect"
+        printf '  %-48s %-6s (expected %s)\n' "$cfg" "$verdict" "$expect"
         if [ "$verdict" != "$expect" ]; then fail=1; fi
     }
     check MC_RepeatableRead_Green                  GREEN
     check MC_RepeatableRead_Red_Serializable       RED
     check MC_RepeatableRead_Red_SnapshotIsolation  RED
     check MC_RepeatableRead_Red_ReadCommitted      RED
+    check MC_DefraLevel_Green_Heads                GREEN
+    check MC_DefraLevel_Green_Counters             GREEN
+    check MC_DefraLevel_Red_RepeatableRead_Merges  RED
+    check MC_DefraLevel_Red_NoPolicy               RED
+    check MC_DefraLevel_Red_RepeatableRead_Counters RED
     rm -rf states ./*_TTrace_*.tla ./*_TTrace_*.bin
     exit $fail
 
