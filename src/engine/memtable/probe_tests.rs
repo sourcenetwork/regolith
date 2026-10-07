@@ -1,5 +1,5 @@
 //! Tests for the range-tombstone lock-free gate and the sequence-only
-//! probe `MemTable::latest_seq` shares with `MemTable::get`.
+//! version probe `MemTable::latest_version` shares with `MemTable::get`.
 
 use super::*;
 use proptest::prelude::*;
@@ -81,7 +81,7 @@ fn a_lookup_takes_the_lock_once_a_tombstone_exists() {
 }
 
 #[test]
-fn latest_seq_agrees_with_get() {
+fn latest_version_agrees_with_get() {
     let mt = memtable();
     mt.put(b"k", b"v1", 1);
     mt.put(b"k", b"v2", 2);
@@ -89,9 +89,24 @@ fn latest_seq_agrees_with_get() {
     mt.merge(b"k", b"op", 4);
     for snapshot_seq in 0..=5u64 {
         let lk = probe(b"k", snapshot_seq);
-        assert_eq!(mt.latest_seq(&lk), mt.get(&lk).map(|(seq, _)| seq));
+        assert_eq!(
+            mt.latest_version(&lk).map(|(seq, _)| seq),
+            mt.get(&lk).map(|(seq, _)| seq)
+        );
     }
-    assert_eq!(mt.latest_seq(&probe(b"k", 0)), None);
+    assert_eq!(mt.latest_version(&probe(b"k", 0)), None);
+    assert_eq!(
+        mt.latest_version(&probe(b"k", 2)),
+        Some((2, VALUE_TYPE_VALUE))
+    );
+    assert_eq!(
+        mt.latest_version(&probe(b"k", 3)),
+        Some((3, VALUE_TYPE_DELETION))
+    );
+    assert_eq!(
+        mt.latest_version(&probe(b"k", 4)),
+        Some((4, VALUE_TYPE_MERGE))
+    );
 }
 
 fn key_strategy() -> impl Strategy<Value = Vec<u8>> {
@@ -147,7 +162,7 @@ proptest! {
                 .unwrap_or(0);
 
             let lk = probe(key, *snapshot_seq);
-            prop_assert_eq!(mt.latest_seq(&lk), expected_latest);
+            prop_assert_eq!(mt.latest_version(&lk).map(|(seq, _)| seq), expected_latest);
             prop_assert_eq!(mt.get(&lk).map(|(seq, _)| seq), expected_latest);
             prop_assert_eq!(mt.covering_range_tombstone_seq(key, *snapshot_seq), expected_covering);
         }

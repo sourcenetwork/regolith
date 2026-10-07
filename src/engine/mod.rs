@@ -2261,10 +2261,12 @@ impl RegolithEngine {
         key: &[u8],
         ops: &[WriteBatchOp],
         view: &ReadView,
+        newest_type: u8,
     ) -> std::io::Result<bool> {
-        // A merge operator resolves values by replaying operands, so what a
-        // point read returns is not what this key would hold afterwards.
-        if self.options.merge_operator.is_some() {
+        // Unresolved merge operands on top mean a point read replays them, so
+        // what it returns is not what this key stores. Beneath a newest value
+        // or deletion, any operands are already folded and the read is exact.
+        if newest_type == internal_key::VALUE_TYPE_MERGE {
             return Ok(false);
         }
 
@@ -2315,8 +2317,10 @@ impl RegolithEngine {
         })
     }
 
-    /// Return the sequence number of the newest write that touched
-    /// `key` across every source, or `None` if nothing ever wrote it.
+    /// Return the sequence number and value type of the newest write that
+    /// touched `key` across every source, or `None` if nothing ever wrote
+    /// it. A covering range tombstone that outranks every point entry
+    /// reports as a deletion.
     /// Used by transaction commit to detect conflicts, so it counts
     /// every kind of write: point entries, point tombstones, merge
     /// operands, and range tombstones that cover the key. The caller
@@ -2326,38 +2330,44 @@ impl RegolithEngine {
     /// is accumulated on the way down, mirroring the read path: a
     /// tombstone in a newer source outranks a point entry found in an
     /// older one.
-    fn latest_version_seq_in_view(
+    fn latest_version_in_view(
         &self,
         key: &[u8],
         view: &ReadView,
-    ) -> std::io::Result<Option<u64>> {
+    ) -> std::io::Result<Option<(u64, u8)>> {
         let snap = u64::MAX;
         let lk = LookupKey::from_prefixed(key, snap);
         let mut max_rt_seq: u64 = 0;
-        let newest = |point_seq: u64, max_rt_seq: u64| Some(point_seq.max(max_rt_seq));
+        let newest = |(point_seq, value_type): (u64, u8), max_rt_seq: u64| {
+            Some(if max_rt_seq > point_seq {
+                (max_rt_seq, internal_key::VALUE_TYPE_DELETION)
+            } else {
+                (point_seq, value_type)
+            })
+        };
         {
             let active = &view.active;
             max_rt_seq = max_rt_seq.max(active.covering_range_tombstone_seq(key, snap));
-            if let Some(seq) = active.latest_seq(&lk) {
-                return Ok(newest(seq, max_rt_seq));
+            if let Some(version) = active.latest_version(&lk) {
+                return Ok(newest(version, max_rt_seq));
             }
         }
         {
             let frozen = &view.frozen;
             for mt in frozen.iter().rev() {
                 max_rt_seq = max_rt_seq.max(mt.covering_range_tombstone_seq(key, snap));
-                if let Some(seq) = mt.latest_seq(&lk) {
-                    return Ok(newest(seq, max_rt_seq));
+                if let Some(version) = mt.latest_version(&lk) {
+                    return Ok(newest(version, max_rt_seq));
                 }
             }
         }
         let version = &view.version;
         for file in version.levels[0].iter().rev() {
             max_rt_seq = max_rt_seq.max(file.reader.covering_range_tombstone_seq(key, snap));
-            if let Some((seq, _)) =
+            if let Some(version) =
                 with_key_scratch(|buf| file.reader.latest_version(&lk, buf, &self.cache))?
             {
-                return Ok(newest(seq, max_rt_seq));
+                return Ok(newest(version, max_rt_seq));
             }
         }
         for level in 1..version.levels.len() {
@@ -2381,15 +2391,15 @@ impl RegolithEngine {
                 {
                     continue;
                 }
-                if let Some((seq, _)) =
+                if let Some(version) =
                     with_key_scratch(|buf| file.reader.latest_version(&lk, buf, &self.cache))?
                 {
-                    return Ok(newest(seq, max_rt_seq));
+                    return Ok(newest(version, max_rt_seq));
                 }
             }
         }
         if max_rt_seq > 0 {
-            return Ok(Some(max_rt_seq));
+            return Ok(Some((max_rt_seq, internal_key::VALUE_TYPE_DELETION)));
         }
         Ok(None)
     }

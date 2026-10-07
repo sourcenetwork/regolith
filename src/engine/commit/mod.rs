@@ -338,7 +338,7 @@ impl RegolithEngine {
         // the order they were buffered, so a multi-key conflict names the
         // same key on every run.
         for check in &checks.reads {
-            if let Some(latest_seq) = self.latest_version_seq_in_view(&check.key, &view)?
+            if let Some((latest_seq, _)) = self.latest_version_in_view(&check.key, &view)?
                 && latest_seq > check.observed_seq
             {
                 // A key the transaction *read* always aborts, since the stale
@@ -381,13 +381,13 @@ impl RegolithEngine {
                 {
                     continue;
                 }
-                if let Some(latest_seq) = self.latest_version_seq_in_view(key, &view)?
+                if let Some((latest_seq, newest_type)) = self.latest_version_in_view(key, &view)?
                     && latest_seq > observed_seq
                 {
                     // A blind write of the value the key already holds is not a
                     // conflict: the schedule has a serial equivalent reaching the
                     // same state.
-                    if self.write_matches_committed(key, &ops, &view)? {
+                    if self.write_matches_committed(key, &ops, &view, newest_type)? {
                         continue;
                     }
                     return Ok(CommitOutcome::Conflict {

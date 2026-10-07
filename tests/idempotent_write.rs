@@ -260,3 +260,78 @@ fn sequential_identical_writes_commit() {
         Some(b"value".as_slice())
     );
 }
+
+fn counter_db(dir: &std::path::Path) -> OptimisticTransactionDb {
+    let options = Options {
+        merge_operator: Some(std::sync::Arc::new(CounterMerge)),
+        ..Options::default()
+    };
+    OptimisticTransactionDb::open(dir, options).unwrap()
+}
+
+/// A merge operator on the database no longer turns the elision off for
+/// every key: a key that never saw an operand compares exactly as before.
+#[test]
+fn identical_writes_commit_with_a_merge_operator_configured() {
+    for level in levels() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = counter_db(dir.path());
+
+        let first = db.begin_transaction_with(level);
+        let second = db.begin_transaction_with(level);
+        first.put(b"block", b"identical").unwrap();
+        second.put(b"block", b"identical").unwrap();
+
+        first.commit().unwrap();
+        second
+            .commit()
+            .unwrap_or_else(|error| panic!("{level:?}: {error:?}"));
+    }
+}
+
+/// Operands beneath a newer value are already folded into it, so the
+/// committed value a point read returns is what the key stores.
+#[test]
+fn an_identical_write_over_folded_operands_commits() {
+    for flush in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let db = counter_db(dir.path());
+        db.db().put(b"key", &0i64.to_be_bytes()).unwrap();
+        db.db().merge(b"key", &1i64.to_be_bytes()).unwrap();
+
+        let first = db.begin_transaction_with(IsolationLevel::SnapshotIsolation);
+        let second = db.begin_transaction_with(IsolationLevel::SnapshotIsolation);
+        first.put(b"key", &5i64.to_be_bytes()).unwrap();
+        second.put(b"key", &5i64.to_be_bytes()).unwrap();
+        first.commit().unwrap();
+        if flush {
+            db.db().flush().unwrap();
+        }
+        second
+            .commit()
+            .unwrap_or_else(|error| panic!("flush={flush}: {error:?}"));
+    }
+}
+
+/// A newer operand that has not been folded still refuses the elision,
+/// even when the write matches what a point read would resolve to: the
+/// key stores operands, not that value.
+#[test]
+fn an_identical_write_under_an_unresolved_operand_still_conflicts() {
+    for flush in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let db = counter_db(dir.path());
+        db.db().put(b"key", &0i64.to_be_bytes()).unwrap();
+
+        let tx = db.begin_transaction_with(IsolationLevel::SnapshotIsolation);
+        tx.put(b"key", &1i64.to_be_bytes()).unwrap();
+        db.db().merge(b"key", &1i64.to_be_bytes()).unwrap();
+        if flush {
+            db.db().flush().unwrap();
+        }
+        assert!(
+            tx.commit().is_err(),
+            "flush={flush}: a write under an unresolved operand must conflict"
+        );
+    }
+}
