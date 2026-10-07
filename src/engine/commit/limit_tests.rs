@@ -272,6 +272,7 @@ fn an_oversized_write_is_refused_before_it_reaches_the_pipeline() {
             let checks = ValidationSet {
                 reads: Vec::new(),
                 writes_at: None,
+                blind_merges_commute: false,
             };
             engine
                 .commit_optimistic(

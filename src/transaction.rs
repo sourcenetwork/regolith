@@ -101,7 +101,9 @@ use crate::column_family::{DEFAULT_CF_ID, prefix_key};
 use crate::engine::{CommitOutcome, ConflictKey, RegolithEngine, ValidationSet};
 use crate::{Db, DbSlice, Error, Options, Result};
 
+mod policy;
 mod scan_range;
+pub use policy::{KeyClass, KeyClassifier};
 use scan_range::{OpenRun, ScanRun};
 
 /// Default lock-acquisition timeout for [`TransactionDb`] when the
@@ -167,6 +169,7 @@ impl From<Error> for TransactionError {
 /// [`TransactionError::Conflict`].
 pub struct OptimisticTransactionDb {
     isolation: IsolationLevel,
+    policy: Option<Arc<dyn KeyClassifier>>,
     inner: Db,
 }
 
@@ -183,7 +186,15 @@ impl OptimisticTransactionDb {
         Ok(Self {
             inner: Db::open(path, opts)?,
             isolation: IsolationLevel::default(),
+            policy: None,
         })
+    }
+
+    /// Install the [`KeyClassifier`] that [`IsolationLevel::DefraLevel`]
+    /// consults. Transactions at any other level ignore it.
+    pub fn with_policy(mut self, classifier: Arc<dyn KeyClassifier>) -> Self {
+        self.policy = Some(classifier);
+        self
     }
 
     /// Borrow the underlying [`Db`] for APIs that
@@ -237,6 +248,7 @@ impl OptimisticTransactionDb {
             DEFAULT_LOCK_TIMEOUT,
             isolation,
             self.inner.transaction_keys_inline(),
+            self.policy.clone(),
         )
     }
 
@@ -337,6 +349,7 @@ impl TransactionDb {
             self.lock_timeout,
             isolation,
             self.inner.transaction_keys_inline(),
+            None,
         )
     }
 
@@ -458,12 +471,24 @@ pub enum IsolationLevel {
     /// Validate the entire read set, including every key a transactional
     /// scan yields.
     Serializable,
+    /// [`IsolationLevel::RepeatableRead`], relaxed in two places. A key the
+    /// transaction merges into without
+    /// reading it conflicts only with a newer put, delete or range delete,
+    /// never with a newer merge operand, since operands commute. With a
+    /// [`KeyClassifier`] installed through
+    /// [`OptimisticTransactionDb::with_policy`], a scan that stays inside a
+    /// [`KeyClass::CommutativePrefix`] records no stretch: the caller
+    /// declares that scan safe to leave unvalidated.
+    DefraLevel,
 }
 
 impl IsolationLevel {
     /// Whether every point read is validated at commit, written or not.
     pub(crate) fn validates_every_read(self) -> bool {
-        matches!(self, Self::RepeatableRead | Self::Serializable)
+        matches!(
+            self,
+            Self::RepeatableRead | Self::Serializable | Self::DefraLevel
+        )
     }
 
     /// Whether a transactional scan records each key it yields as a read.
@@ -494,6 +519,8 @@ pub struct Transaction<'db> {
     engine: Arc<RegolithEngine>,
     /// What the commit-time validation covers. See [`IsolationLevel`].
     isolation: IsolationLevel,
+    /// The key classes [`IsolationLevel::DefraLevel`] applies.
+    policy: Option<Arc<dyn KeyClassifier>>,
     snapshot_seq: u64,
     durability: crate::engine::DurabilityMode,
     mode: TxMode,
@@ -601,6 +628,7 @@ impl<'db> Transaction<'db> {
         lock_timeout: Duration,
         isolation: IsolationLevel,
         keys_inline: usize,
+        policy: Option<Arc<dyn KeyClassifier>>,
     ) -> Self {
         Self {
             engine,
@@ -608,6 +636,7 @@ impl<'db> Transaction<'db> {
             durability,
             mode,
             isolation,
+            policy,
             writes: TxnBuffer::new(keys_inline),
             range_deletes: SegQueue::new(),
             merges: SegQueue::new(),
@@ -980,7 +1009,12 @@ impl<'db> Transaction<'db> {
         // transaction that never scans (the common case) pays no `Vec`
         // round trip for an empty run list on its commit path.
         if let Some(runs) = self.scan_runs.take() {
-            let runs = drain(&runs);
+            let mut runs = drain(&runs);
+            if self.isolation == IsolationLevel::DefraLevel
+                && let Some(classifier) = &self.policy
+            {
+                runs.retain(|run| !policy::run_is_commutative(classifier.as_ref(), run));
+            }
             scan_range::cover(
                 &mut checks.reads,
                 &runs,
@@ -1090,6 +1124,7 @@ impl<'db> Transaction<'db> {
         ValidationSet {
             reads,
             writes_at: optimistic.then_some(self.snapshot_seq),
+            blind_merges_commute: self.isolation.blind_merges_commute(),
         }
     }
 
