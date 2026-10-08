@@ -743,7 +743,7 @@ impl<'db> Transaction<'db> {
     pub fn get(&self, key: &[u8]) -> TxResult<Option<Vec<u8>>> {
         let prefixed = prefix_key(DEFAULT_CF_ID, key);
         let committed = || self.read_committed(&prefixed);
-        match self.read_own(&prefixed, &committed)? {
+        match self.read_own(&prefixed, committed)? {
             Some(own) => Ok(own),
             None => Ok(committed()
                 .map_err(TransactionError::Io)?
@@ -759,7 +759,7 @@ impl<'db> Transaction<'db> {
     pub fn get_slice(&self, key: &[u8]) -> TxResult<Option<DbSlice>> {
         let prefixed = prefix_key(DEFAULT_CF_ID, key);
         let committed = || self.read_committed(&prefixed);
-        match self.read_own(&prefixed, &committed)? {
+        match self.read_own(&prefixed, committed)? {
             Some(own) => Ok(own.map(DbSlice::from)),
             None => committed().map_err(TransactionError::Io),
         }
@@ -943,7 +943,7 @@ impl<'db> Transaction<'db> {
         // looking `tracked` up for a pessimistic scan.
         self.promoted_seq.fetch_max(read_seq, Ordering::AcqRel);
         let committed = || self.engine.get_slice_at(&prefixed, read_seq);
-        match self.read_own(&prefixed, &committed)? {
+        match self.read_own(&prefixed, committed)? {
             Some(own) => Ok(own),
             None => Ok(committed()
                 .map_err(TransactionError::Io)?

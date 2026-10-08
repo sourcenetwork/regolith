@@ -1154,17 +1154,12 @@ impl RegolithEngine {
             }))
     }
 
-    /// Point lookup at a caller-pinned snapshot sequence. The
+    /// Point lookup at a caller-pinned snapshot sequence, without copying
+    /// the value out of the block or heap buffer it already lives in. The
     /// snapshot's registration in [`SnapshotRegistry`] is what keeps
-    /// compaction from dropping the versions it needs, so the load
-    /// order does not matter here; the view is still loaded once so
-    /// every source the read walks agrees with every other.
-    pub(crate) fn get_at(&self, key: &[u8], snapshot_seq: u64) -> std::io::Result<Option<Vec<u8>>> {
-        self.get(key, snapshot_seq)
-    }
-
-    /// [`RegolithEngine::get_at`] without copying the value out of the
-    /// block or heap buffer it already lives in.
+    /// compaction from dropping the versions it needs, so the load order
+    /// does not matter here; the view is still loaded once so every
+    /// source the read walks agrees with every other.
     pub(crate) fn get_slice_at(
         &self,
         prefixed_key: &[u8],
@@ -1189,6 +1184,7 @@ impl RegolithEngine {
     /// collects any merge operands that sit on top of the terminator
     /// and calls the operator to collapse the chain into a final
     /// value at visibility time.
+    #[cfg(test)]
     pub(crate) fn get(
         &self,
         prefixed_key: &[u8],
@@ -1198,13 +1194,12 @@ impl RegolithEngine {
         Ok(self.get_slice(&lk)?.map(DbSlice::into_vec))
     }
 
-    /// [`RegolithEngine::get`] without copying the value. The returned
+    /// Newest visible value for `key`, without copying it. The returned
     /// [`DbSlice`] borrows the block or heap buffer the value already
     /// lives in and keeps that owner alive.
-    /// The sequence a "read the latest" caller must use, sampled with
-    /// the view it will read through already loaded.
     ///
-    /// The order is load-bearing and it is the whole reason this is not
+    /// The read samples its sequence with the view it reads through
+    /// already loaded. The order is load-bearing and it is the whole reason this is not
     /// `visible_seq.visible()` at the call site. Sampling the horizon
     /// first and loading the view afterwards leaves a window in
     /// between: `snapshot_seq()` registers nothing in the
@@ -1218,8 +1213,7 @@ impl RegolithEngine {
     ///
     /// A caller reading at a *pinned* snapshot does not need this: the
     /// registration is what holds the versions, so the order does not
-    /// matter there. See [`RegolithEngine::get_at`].
-    /// Newest visible value for `key`, without copying it.
+    /// matter there. See [`RegolithEngine::get_slice_at`].
     pub(crate) fn get_slice_latest(
         &self,
         cf_id: u32,
@@ -1540,7 +1534,7 @@ impl RegolithEngine {
     }
 
     /// Batched point lookup at a caller-pinned snapshot sequence. See
-    /// [`Self::get_at`] for why the load order is free here.
+    /// [`Self::get_slice_at`] for why the load order is free here.
     pub(crate) fn multi_get_at(
         &self,
         keys: &[&[u8]],

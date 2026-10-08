@@ -310,7 +310,10 @@ fn expected_cover(
             .filter(|read_seq| *read_seq > tx.snapshot_seq);
         if let Some(read_seq) = promoted {
             close(&mut stretch);
-            let visible = tx.engine.get_at(&prefixed, read_seq).expect("engine read");
+            let visible = tx
+                .engine
+                .get_slice_at(&prefixed, read_seq)
+                .expect("engine read");
             yielded += usize::from(visible.is_some());
             continue;
         }
