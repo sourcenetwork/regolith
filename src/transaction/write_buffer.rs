@@ -349,6 +349,35 @@ mod tests {
     }
 
     #[test]
+    fn fold_by_key_keeps_each_keys_writes_in_order_among_many_interleaved_keys() {
+        // Newest first, as the buffer yields them, with three keys written in
+        // turn on every round: far more entries than a sort handles in one
+        // pass of insertion sort, so a key's order is only kept if the sort
+        // keeps it.
+        let mut chains = Vec::new();
+        for round in (0..40u8).rev() {
+            for key in [b"k2", b"k0", b"k1"] {
+                chains.push((key.to_vec(), merge(&[round])));
+            }
+        }
+        let oldest_first: Vec<Vec<u8>> = (0..40u8).map(|round| vec![round]).collect();
+
+        for reverse in [false, true] {
+            let folded = fold_by_key(chains.clone(), reverse, Some(&Append));
+            let keys: Vec<&[u8]> = folded.iter().map(|(key, _)| key.as_slice()).collect();
+            let want: [&[u8]; 3] = if reverse {
+                [b"k2", b"k1", b"k0"]
+            } else {
+                [b"k0", b"k1", b"k2"]
+            };
+            assert_eq!(keys, want, "reverse={reverse}");
+            for (key, writes) in &folded {
+                assert_eq!(writes.operands, oldest_first, "reverse={reverse} {key:?}");
+            }
+        }
+    }
+
+    #[test]
     fn settle_commits_the_newest_replacement_and_the_operands_after_it() {
         let drained = vec![
             (b"k".to_vec(), merge(b"3")),

@@ -513,6 +513,104 @@ fn a_scan_that_reaches_a_merged_key_validates_it_as_a_read_at_every_level() {
     }
 }
 
+/// `(key, value)` pairs of a transaction scan as text.
+fn scanned_text(
+    tx: &Transaction<'_>,
+    start: Option<&[u8]>,
+    end: Option<&[u8]>,
+    reverse: bool,
+) -> Vec<(String, String)> {
+    let direction = if reverse {
+        regolith::ScanDirection::Reverse
+    } else {
+        regolith::ScanDirection::Forward
+    };
+    let mut stream = tx.scan_stream_in(start, end, direction);
+    let got = stream
+        .by_ref()
+        .map(|(key, value)| {
+            (
+                String::from_utf8(key).unwrap(),
+                String::from_utf8(value.to_vec()).unwrap(),
+            )
+        })
+        .collect();
+    stream.status().unwrap();
+    got
+}
+
+#[test]
+fn a_scan_applies_each_keys_operands_in_the_order_they_were_made() {
+    each_flavour(appending, |flavour| {
+        flavour.db().put(b"c", b"C").unwrap();
+        let tx = flavour.begin();
+        // Every key has a put or a committed value and two or three operands,
+        // and the writes of the four keys are interleaved.
+        tx.put(b"a", b"A").unwrap();
+        tx.put(b"b", b"B").unwrap();
+        tx.merge(b"a", b"1").unwrap();
+        tx.merge(b"c", b"6").unwrap();
+        tx.merge(b"b", b"4").unwrap();
+        tx.merge(b"a", b"2").unwrap();
+        tx.put(b"d", b"D").unwrap();
+        tx.merge(b"c", b"7").unwrap();
+        tx.merge(b"a", b"3").unwrap();
+        tx.merge(b"b", b"5").unwrap();
+        tx.merge(b"d", b"8").unwrap();
+        tx.merge(b"c", b"9").unwrap();
+
+        let rows = |pairs: &[(&str, &str)]| -> Vec<(String, String)> {
+            pairs
+                .iter()
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .collect()
+        };
+        let all = [("a", "A123"), ("b", "B45"), ("c", "C679"), ("d", "D8")];
+        let backwards: Vec<_> = all.iter().rev().copied().collect();
+
+        assert_eq!(scanned_text(&tx, None, None, false), rows(&all));
+        assert_eq!(scanned_text(&tx, None, None, true), rows(&backwards));
+        assert_eq!(
+            scanned_text(&tx, Some(b"b"), Some(b"d"), false),
+            rows(&all[1..3])
+        );
+        assert_eq!(
+            scanned_text(&tx, Some(b"b"), Some(b"d"), true),
+            rows(&backwards[1..3])
+        );
+        assert_eq!(
+            scanned_text(&tx, Some(b"c"), Some(b"d"), false),
+            rows(&all[2..3]),
+            "a range of one key"
+        );
+        tx.commit().unwrap();
+        assert_eq!(
+            flavour.db().get(b"c").unwrap().as_deref(),
+            Some(&b"C679"[..])
+        );
+    });
+}
+
+#[test]
+fn a_savepoint_rollback_restores_the_order_the_writes_were_made_in() {
+    each_flavour(appending, |flavour| {
+        let mut tx = flavour.begin();
+        tx.put(b"k", b"P").unwrap();
+        tx.merge(b"k", b"a").unwrap();
+        tx.merge(b"k", b"b").unwrap();
+        tx.set_savepoint();
+        tx.merge(b"k", b"c").unwrap();
+        assert_eq!(reads(&tx, b"k").as_deref(), Some(&b"Pabc"[..]));
+        tx.rollback_to_savepoint().unwrap();
+        assert_eq!(reads(&tx, b"k").as_deref(), Some(&b"Pab"[..]));
+        tx.commit().unwrap();
+        assert_eq!(
+            flavour.db().get(b"k").unwrap().as_deref(),
+            Some(&b"Pab"[..])
+        );
+    });
+}
+
 #[test]
 fn a_savepoint_rollback_restores_the_merges_buffered_before_it() {
     each_flavour(counting, |flavour| {
