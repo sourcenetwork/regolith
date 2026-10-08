@@ -296,12 +296,17 @@ chaos instances="4" rounds="2" versions="120" min_rounds="20":
         cargo test --release --test read_view_chaos_workload -- --nocapture
 
 # TLA+ model of what commit validation covers at each isolation level,
-# checked against the DefraDB workload `RepeatableRead` exists for: appends to a
+# checked against the Merkle-DAG CRDT workload `RepeatableRead` exists for: appends to a
 # Merkle DAG whose head set is derived from keys, the sweep that reclaims
-# it, and a write derived from a definition read. `proofs/tla/RepeatableRead.tla`
-# carries the model; each configuration below runs with the verdict it must
-# produce. A GREEN model that reports an error, or a RED one that does not,
-# fails the recipe: the RED rows are what make the GREEN one mean anything.
+# it, and a write derived from a definition read; and against DefraLevel's
+# relaxations: merges into a counter, scans that stay inside or leave a
+# commutative prefix, and content-addressed keys.
+# `proofs/tla/RepeatableRead.tla` carries the model; each configuration below
+# runs with the verdict it must produce, and a RED row names the invariant it
+# must break. A GREEN model that reports an error, or a
+# RED one that does not break exactly its invariant, fails the recipe: the RED
+# rows are what make the GREEN ones mean anything, and a RED row that fails
+# for some other reason shows nothing.
 # TLC is fetched on first use, pinned by checksum in `proofs/tla/tools/tlc`.
 tla:
     #!/usr/bin/env bash
@@ -309,23 +314,40 @@ tla:
     cd proofs/tla
     fail=0
     check() {
-        local cfg="$1" expect="$2" out verdict
+        local cfg="$1" expect="$2" inv="${3:-}" out broke verdict
         out=$(./tools/tlc -metadir "states/$cfg" -config "$cfg.cfg" RepeatableRead.tla 2>&1)
+        broke=$(sed -n 's/^Error: Invariant \(.*\) is violated\.$/\1/p' <<<"$out" | head -1)
         if grep -q "No error has been found" <<<"$out"; then
             verdict=GREEN
-        elif grep -qE "^Error: (Invariant|Temporal properties|Deadlock)" <<<"$out"; then
+        elif [ -n "$broke" ] && [ "$broke" = "$inv" ]; then
             verdict=RED
+        elif [ -n "$broke" ]; then
+            verdict="RED on $broke"
         else
             verdict=BROKEN
             echo "$out" | tail -20
         fi
-        printf '  %-40s %-6s (expected %s)\n' "$cfg" "$verdict" "$expect"
+        printf '  %-48s %-6s (expected %s)\n' "$cfg" "$verdict" "$expect${inv:+ on $inv}"
         if [ "$verdict" != "$expect" ]; then fail=1; fi
     }
-    check MC_RepeatableRead_Green                  GREEN
-    check MC_RepeatableRead_Red_Serializable       RED
-    check MC_RepeatableRead_Red_SnapshotIsolation  RED
-    check MC_RepeatableRead_Red_ReadCommitted      RED
+    check MC_RepeatableRead_Green                      GREEN
+    check MC_RepeatableRead_Red_Serializable           RED INV_AppendsCommit
+    check MC_RepeatableRead_Red_SnapshotIsolation      RED INV_NoStaleDefinition
+    check MC_RepeatableRead_Red_ReadCommitted          RED INV_NoStaleDefinition
+    check MC_DefraLevel_Green_Heads                    GREEN
+    check MC_DefraLevel_Green_Counters                 GREEN
+    check MC_DefraLevel_Green_Migrations               GREEN
+    check MC_DefraLevel_Red_RepeatableRead_Merges      RED INV_DuplicateMergesCommit
+    check MC_DefraLevel_Red_NoPolicy                   RED INV_DuplicateMergesCommit
+    check MC_DefraLevel_Red_BlocksOrdinary             RED INV_DuplicateMergesCommit
+    check MC_DefraLevel_Red_RepeatableRead_Counters    RED INV_IncrementsCommitUnlessReplaced
+    check MC_DefraLevel_Red_ReadMergeBlind             RED INV_ReceiptsExact
+    check MC_DefraLevel_Red_PutMergeBlind              RED INV_CounterExact
+    check MC_DefraLevel_Red_PutMergeElides             RED INV_CounterExact
+    check MC_DefraLevel_Red_MergeIgnoresReplacement    RED INV_CounterExact
+    check MC_DefraLevel_Red_RangeDeleteNotReplacement  RED INV_CounterExact
+    check MC_DefraLevel_Red_PolicyIgnoresRange         RED INV_NoStaleDefinition
+    check MC_DefraLevel_Red_DefinitionContentAddressed RED INV_NoStaleDefinition
     rm -rf states ./*_TTrace_*.tla ./*_TTrace_*.bin
     exit $fail
 

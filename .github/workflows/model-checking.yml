@@ -47,7 +47,7 @@ jobs:
         run: just loom-all
 
   # TLA+ model of what commit validation covers at each isolation level,
-  # checked against the DefraDB workload `RepeatableRead` exists for. The green
+  # checked against the Merkle-DAG CRDT workload `RepeatableRead` exists for. The green
   # and the red configurations both run: a red one going green would mean
   # the model stopped telling the levels apart.
   tla:
