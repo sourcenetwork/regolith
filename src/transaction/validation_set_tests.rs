@@ -254,10 +254,16 @@ fn open_any(flavor: u8, dir: &TempDir) -> AnyDb {
 /// the case throughout this file, a scan neither yields them nor skips the
 /// snapshot entry beneath them.
 fn replacement(tx: &Transaction<'_>, prefixed: &[u8]) -> Option<Write> {
-    tx.writes
-        .chain(prefixed, Write::is_terminator)
-        .pop()
-        .filter(Write::is_terminator)
+    let mut found = None;
+    tx.writes.walk_chain(prefixed, |write| {
+        found = write.is_terminator().then(|| write.clone());
+        if found.is_some() {
+            ControlFlow::Break(())
+        } else {
+            ControlFlow::Continue(())
+        }
+    });
+    found
 }
 
 /// The keys the stretches of one scan of `[start, end)` cover, worked out

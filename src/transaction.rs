@@ -116,7 +116,7 @@ mod scan_range;
 mod write_buffer;
 pub use policy::{KeyClass, KeyClassifier};
 use scan_range::{OpenRun, ScanRun};
-use write_buffer::{KeyWrites, Write, fold_by_key, settle};
+use write_buffer::{KeyWrites, Write, fold_by_key, read_buffered, settle};
 
 /// Default lock-acquisition timeout for [`TransactionDb`] when the
 /// caller doesn't specify one on [`TransactionDb::with_lock_timeout`].
@@ -805,18 +805,13 @@ impl<'db> Transaction<'db> {
         prefixed: &[u8],
         committed: impl FnOnce() -> std::io::Result<Option<DbSlice>>,
     ) -> TxResult<Option<Option<Vec<u8>>>> {
-        let own = match self.writes.get(prefixed) {
-            None => return Ok(None),
-            Some(Write::Put(value)) => return Ok(Some(Some(value))),
-            Some(Write::Delete) => return Ok(Some(None)),
-            // Operands lie on top of whatever the key held when they were
-            // made, so the writes beneath them say what they apply to.
-            Some(Write::Merge(_)) => {
-                KeyWrites::fold(self.writes.chain(prefixed, Write::is_terminator))
-            }
-        };
-        own.apply(self.engine.merge_operator(), prefixed, committed)
-            .map_err(TransactionError::Io)
+        read_buffered(
+            &self.writes,
+            self.engine.merge_operator(),
+            prefixed,
+            committed,
+        )
+        .map_err(TransactionError::Io)
     }
 
     /// Scan a key range without materializing it, merging this
@@ -2781,7 +2776,7 @@ mod tests {
         );
 
         // Draining the rest is exactly where the bug bit: every one of
-        // these calls used to fall back to `TxnBuffer::walk`, O(1) here but
+        // these calls used to fall back to walking the list, O(1) here but
         // O(tracked keys) had more been promoted, because construction-time
         // indexing had already run and missed this promotion.
         let rest: Vec<(Vec<u8>, Vec<u8>)> = stream.map(|(k, v)| (k, v.to_vec())).collect();
