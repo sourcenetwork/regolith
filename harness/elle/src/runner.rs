@@ -8,11 +8,11 @@ use std::time::{Duration, Instant};
 use regolith::{DurabilityMode, Options};
 
 use crate::cli::{Config, Fault, WorkerRole};
-use crate::faults::{tear_wal_write, truncate_wal_tail, WalMark};
+use crate::faults::{WalMark, tear_wal_write, truncate_wal_tail};
 use crate::history::{
-    close_dangling_invokes, read_worker_records, stream_record, write_history, Op, OpKind, Recorder,
+    Op, OpKind, Recorder, close_dangling_invokes, read_worker_records, stream_record, write_history,
 };
-use crate::model::{run_txn, Outcome, Rng, TxDb, TxnPlan, ValueSource};
+use crate::model::{Outcome, Rng, TxDb, TxnPlan, ValueSource, run_txn};
 
 /// Process id space reserved per child so a killed process is never
 /// reused, which Jepsen requires after an indeterminate operation.
@@ -89,7 +89,8 @@ fn concurrent_phase(db: &TxDb, cfg: &Config, recorder: &Recorder, values: &Value
             scope.spawn(move || {
                 let mut rng = Rng::new(cfg.seed ^ process.wrapping_mul(0x9E37_79B9_7F4A_7C15));
                 for _ in 0..cfg.txns {
-                    let plan = TxnPlan::generate(cfg.model, cfg.keys, &mut rng, values);
+                    let plan =
+                        TxnPlan::generate(cfg.model, cfg.isolation, cfg.keys, &mut rng, values);
                     let mut emit = |op: Op| recorder.push(op);
                     record_txn(db, cfg, &plan, recorder, process, false, &mut emit);
                 }
@@ -300,7 +301,7 @@ pub fn run_worker(cfg: &Config) -> Result<(), String> {
         WorkerRole::Doomed => cfg.txns,
     };
     for _ in 0..budget {
-        let plan = TxnPlan::generate(cfg.model, cfg.keys, &mut rng, &values);
+        let plan = TxnPlan::generate(cfg.model, cfg.isolation, cfg.keys, &mut rng, &values);
         let mut emit = |op: Op| {
             let _ = stream_record(&mut sink, &op);
         };

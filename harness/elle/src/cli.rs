@@ -19,15 +19,21 @@ impl Model {
 
 /// Requested isolation level, each an engine level of its own.
 ///
-/// `read-committed` runs the pessimistic flavour; the other three run the
-/// optimistic flavour at the regolith level of the same name. Each is
-/// checked against the Elle model it claims; README.md carries the table.
+/// `read-committed` runs the pessimistic flavour, opened at regolith's
+/// `ReadCommitted` level so the level the harness claims is the one the
+/// engine runs; the other four run the optimistic flavour at the regolith
+/// level of the same name. `defra-level` has no key classifier here: the
+/// workloads are point operations, so it validates point reads exactly as
+/// `repeatable-read` does, and it differs only in appending to a list by
+/// blind merge. Each is checked against the Elle model it claims; README.md
+/// carries the table.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Isolation {
     ReadCommitted,
     Snapshot,
     RepeatableRead,
     Serializable,
+    DefraLevel,
 }
 
 impl Isolation {
@@ -37,6 +43,7 @@ impl Isolation {
             Isolation::Snapshot => "snapshot-isolation",
             Isolation::RepeatableRead => "repeatable-read",
             Isolation::Serializable => "serializable",
+            Isolation::DefraLevel => "defra-level",
         }
     }
 }
@@ -106,7 +113,7 @@ Usage: elle-gen [options]
 
 Options:
   --model <list-append|rw-register>   Workload model (default: list-append)
-  --isolation <read-committed|snapshot-isolation|repeatable-read|serializable>
+  --isolation <read-committed|snapshot-isolation|repeatable-read|serializable|defra-level>
                                       Requested isolation (default: read-committed)
   --faults <kill,torn-write,truncate-wal|all>
                                       Fault injection (default: none)
@@ -142,6 +149,7 @@ pub fn parse<I: Iterator<Item = String>>(mut args: I) -> Result<Config, String> 
                     "snapshot-isolation" => Isolation::Snapshot,
                     "repeatable-read" => Isolation::RepeatableRead,
                     "serializable" => Isolation::Serializable,
+                    "defra-level" => Isolation::DefraLevel,
                     other => return Err(format!("unknown isolation level {}", other)),
                 }
             }

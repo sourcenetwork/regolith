@@ -5,6 +5,7 @@
 mod cli;
 mod faults;
 mod history;
+mod list;
 mod model;
 mod runner;
 mod verify;
@@ -30,7 +31,6 @@ fn dispatch(cfg: &Config) -> Result<(), String> {
     if let Some(path) = &cfg.verify_only {
         return report_verification(&verify::verify(path, cfg.model)?);
     }
-
 
     if cfg.worker.is_some() {
         return runner::run_worker(cfg);

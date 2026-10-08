@@ -74,8 +74,9 @@ pub fn verify(path: &Path, model: Model) -> Result<Report, String> {
 }
 
 /// A committed append that a later transaction failed to observe, plus
-/// the append that displaced it. The displacing append proves the read
-/// side of a read-modify-write ran against a stale snapshot.
+/// the append that displaced it. The displacing append proves the state
+/// it was applied to predates the lost one, whether it was a
+/// read-modify-write or a merge operand.
 fn lost_appends(committed: &[Completed]) -> Vec<String> {
     let mut appended: Vec<(i64, i64, u64, u64)> = Vec::new();
     for entry in committed {
@@ -107,8 +108,8 @@ fn lost_appends(committed: &[Completed]) -> Vec<String> {
                 let blame = match displaced_by {
                     Some((_, v, at, idx)) => format!(
                         "; append {} on the same key committed later at t={} (index {}) \
-                         and is present, so its read-modify-write started from a state \
-                         that predates value {}",
+                         and is present, so it was applied to a state that predates \
+                         value {}",
                         v, at, idx, value
                     ),
                     None => String::new(),
