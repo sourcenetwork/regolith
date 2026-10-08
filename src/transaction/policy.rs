@@ -143,6 +143,9 @@ pub(super) fn classifier_for(
 /// binary search, which neither hashes nor allocates, and skips the key's
 /// lookup outright, where a lookup is what validating it would cost. A commit
 /// whose classifier names no such key leaves the list empty and pays nothing.
+///
+/// A key is classified at most once, however many operands the commit merges
+/// into it or whether it is also read, and only the exempt keys are copied.
 pub(super) fn exempt_content_addressed(
     classifier: &dyn KeyClassifier,
     checks: &mut ValidationSet,
@@ -150,17 +153,31 @@ pub(super) fn exempt_content_addressed(
     merges: &[(Vec<u8>, Vec<u8>)],
 ) {
     let content_addressed = |key: &[u8]| class_of(classifier, key) == KeyClass::ContentAddressed;
-    checks.exempt = writes
+    let is_put = |key: &[u8]| matches!(writes.get(key), Some(Some(_)));
+    // The keys merged into, each once however many operands they got.
+    let mut merged: Vec<&[u8]> = merges.iter().map(|(key, _)| key.as_slice()).collect();
+    merged.sort_unstable();
+    merged.dedup();
+    // The exempt keys as references, so only those are copied below: the
+    // content-addressed ones put, already in the map's order, then the ones
+    // merged that are not also put, which were classified with the puts.
+    let mut exempt: Vec<&[u8]> = writes
         .iter()
         .filter(|(_, value)| value.is_some())
-        .map(|(key, _)| key)
-        .chain(merges.iter().map(|(key, _)| key))
-        .filter(|key| content_addressed(key.as_slice()))
-        .cloned()
+        .map(|(key, _)| key.as_slice())
+        .filter(|key| content_addressed(key))
         .collect();
-    checks.exempt.sort_unstable();
-    checks.exempt.dedup();
-    let exempt = &checks.exempt;
+    let puts = exempt.len();
+    exempt.extend(
+        merged
+            .iter()
+            .copied()
+            .filter(|key| !is_put(key) && content_addressed(key)),
+    );
+    if exempt.len() > puts {
+        exempt.sort_unstable();
+    }
+    let exempt: Vec<Vec<u8>> = exempt.into_iter().map(<[u8]>::to_vec).collect();
     checks.reads.retain_mut(|read| {
         if exempt
             .binary_search_by(|key| key.as_slice().cmp(&read.key))
@@ -168,9 +185,15 @@ pub(super) fn exempt_content_addressed(
         {
             return false;
         }
-        read.presence_only = read.found && content_addressed(&read.key);
+        // A key the commit puts or merges was classified above, and is not
+        // exempt.
+        read.presence_only = read.found
+            && !is_put(&read.key)
+            && merged.binary_search(&read.key.as_slice()).is_err()
+            && content_addressed(&read.key);
         true
     });
+    checks.exempt = exempt;
 }
 
 impl IsolationLevel {
@@ -289,6 +312,64 @@ mod tests {
 
         assert_eq!(kept(&checks), [(key(b"a"), false), (key(b"p"), false)]);
         assert!(checks.exempt.is_empty());
+    }
+
+    /// Remembers how often it was asked about each key.
+    struct Counting(std::sync::Mutex<BTreeMap<Vec<u8>, usize>>);
+
+    impl KeyClassifier for Counting {
+        fn classify(&self, key: &[u8]) -> KeyClass {
+            *self.0.lock().unwrap().entry(key.to_vec()).or_default() += 1;
+            ByFirstByte.classify(key)
+        }
+    }
+
+    #[test]
+    fn each_distinct_key_is_classified_once_however_often_it_is_named() {
+        let mut checks = checks_of(vec![
+            read(b"a", true),
+            read(b"c1", true),
+            read(b"c9", true),
+            read(b"p", true),
+        ]);
+        let writes: BTreeMap<Vec<u8>, Option<Vec<u8>>> = [
+            (key(b"c1"), None),
+            (key(b"c3"), Some(b"v".to_vec())),
+            (key(b"p"), Some(b"v".to_vec())),
+        ]
+        .into_iter()
+        .collect();
+        let merges = [
+            (key(b"c9"), b"1".to_vec()),
+            (key(b"p"), b"2".to_vec()),
+            (key(b"c9"), b"3".to_vec()),
+            (key(b"c3"), b"4".to_vec()),
+            (key(b"c9"), b"5".to_vec()),
+            (key(b"p"), b"6".to_vec()),
+        ];
+        let classifier = Counting(Default::default());
+
+        exempt_content_addressed(&classifier, &mut checks, &writes, &merges);
+
+        let calls = classifier.0.lock().unwrap();
+        let asked: Vec<Vec<u8>> = calls.keys().cloned().collect();
+        assert_eq!(
+            asked,
+            [
+                b"a".to_vec(),
+                b"c1".to_vec(),
+                b"c3".to_vec(),
+                b"c9".to_vec(),
+                b"p".to_vec()
+            ],
+            "the classifier sees keys without the column-family prefix"
+        );
+        assert!(calls.values().all(|&times| times == 1), "{calls:?}");
+        assert_eq!(checks.exempt, [key(b"c3"), key(b"c9")]);
+        assert_eq!(
+            kept(&checks),
+            [(key(b"a"), false), (key(b"c1"), true), (key(b"p"), false)]
+        );
     }
 
     #[test]
