@@ -338,6 +338,11 @@ impl RegolithEngine {
         let mut pipe = self.pipeline.lock();
 
         let view = self.view.load();
+        // Counted while validating, recorded once off the pipeline mutex and
+        // only after the commit succeeded: an abort or an I/O failure adds
+        // nothing.
+        let mut merges_commuted = 0u64;
+        let mut writes_elided = 0u64;
         // Reads first, then the written keys in operation order: point
         // operations arrive sorted from the write map, merges after them
         // sorted by key, so a multi-key conflict names the same key on
@@ -434,9 +439,7 @@ impl RegolithEngine {
                             // Operands commute, so a newer merge operand never
                             // invalidates a blind merge: the key is accepted
                             // despite the newer write.
-                            if let Some(s) = self.statistics() {
-                                s.add(Ticker::PolicyBlindMergesCommuted, 1);
-                            }
+                            merges_commuted += 1;
                             continue;
                         }
                         Landed::Nothing => continue,
@@ -449,9 +452,7 @@ impl RegolithEngine {
                     // conflict: the schedule has a serial equivalent reaching the
                     // same state.
                     if self.write_matches_committed(key, &ops, &view, newest_type)? {
-                        if let Some(s) = self.statistics() {
-                            s.add(Ticker::CommitWritesElided, 1);
-                        }
+                        writes_elided += 1;
                         continue;
                     }
                     if let Some(s) = self.statistics() {
@@ -486,6 +487,18 @@ impl RegolithEngine {
         });
         let result = self.run_and_complete(&mut pipe, view);
         self.drain_locked(&mut pipe);
+        drop(pipe);
+
+        if result.is_ok()
+            && let Some(s) = self.statistics()
+        {
+            if merges_commuted > 0 {
+                s.add(Ticker::PolicyBlindMergesCommuted, merges_commuted);
+            }
+            if writes_elided > 0 {
+                s.add(Ticker::CommitWritesElided, writes_elided);
+            }
+        }
         result.map(|_| CommitOutcome::Ok)
     }
 

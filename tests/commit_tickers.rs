@@ -6,7 +6,8 @@
 //! them: one per commit for `regolith.commit.count` and
 //! `regolith.commit.conflicts`, one per key for the per-key subsets, and
 //! one per dropped stretch or commuted blind merge for the policy
-//! tickers.
+//! tickers. The elision and policy tickers count only a commit that
+//! succeeds: one that aborts leaves them where they were.
 
 // Native-only. wasm-pack builds every test target for wasm32, and these use
 // threads and the filesystem. The browser suite lives in tests/wasm_opfs*.rs.
@@ -293,6 +294,73 @@ fn an_uncontended_commit_moves_only_the_commit_count() {
     ] {
         assert_eq!(count(&stats, ticker), 0, "{ticker:?}");
     }
+}
+
+/// `a` is overtaken by an identical write and would be elided, but `b`,
+/// validated after it, is overtaken by a different one and aborts the
+/// commit: nothing was elided.
+#[test]
+fn an_aborted_commit_counts_no_elided_writes() {
+    let dir = tempfile::tempdir().unwrap();
+    let stats = Arc::new(Statistics::new());
+    let db = open(dir.path(), stats.clone());
+
+    let tx = db.begin_transaction_with(IsolationLevel::SnapshotIsolation);
+    tx.put(b"a", b"same").unwrap();
+    tx.put(b"b", b"mine").unwrap();
+    db.db().put(b"a", b"same").unwrap();
+    db.db().put(b"b", b"theirs").unwrap();
+    stats.reset();
+    assert!(conflicted(tx.commit()));
+    assert_eq!(count(&stats, Ticker::CommitConflicts), 1);
+    assert_eq!(count(&stats, Ticker::CommitConflictsOnWrite), 1);
+    assert_eq!(count(&stats, Ticker::CommitWritesElided), 0);
+    assert_eq!(count(&stats, Ticker::CommitCount), 0);
+}
+
+/// A newer operand on `a` commutes, but a newer put on `b`, merged after it,
+/// does not and aborts the commit: no blind merge was accepted.
+#[test]
+fn an_aborted_commit_counts_no_commuted_blind_merges() {
+    let dir = tempfile::tempdir().unwrap();
+    let stats = Arc::new(Statistics::new());
+    let db = open(dir.path(), stats.clone());
+    db.db().put(b"a", &0i64.to_be_bytes()).unwrap();
+    db.db().put(b"b", &0i64.to_be_bytes()).unwrap();
+
+    let tx = db.begin_transaction_with(IsolationLevel::DefraLevel);
+    tx.merge(b"a", &1i64.to_be_bytes()).unwrap();
+    tx.merge(b"b", &1i64.to_be_bytes()).unwrap();
+    db.db().merge(b"a", &1i64.to_be_bytes()).unwrap();
+    db.db().put(b"b", &5i64.to_be_bytes()).unwrap();
+    stats.reset();
+    assert!(conflicted(tx.commit()));
+    assert_eq!(count(&stats, Ticker::CommitConflicts), 1);
+    assert_eq!(count(&stats, Ticker::CommitConflictsOnWrite), 1);
+    assert_eq!(count(&stats, Ticker::PolicyBlindMergesCommuted), 0);
+    assert_eq!(count(&stats, Ticker::CommitCount), 0);
+}
+
+/// The scan stays inside the commutative prefix and is dropped from
+/// validation, but the write to `k` is overtaken and aborts the commit: no
+/// stretch was dropped.
+#[test]
+fn an_aborted_commit_counts_no_dropped_scan_stretches() {
+    let dir = tempfile::tempdir().unwrap();
+    let stats = Arc::new(Statistics::new());
+    let db = open(dir.path(), stats.clone());
+    db.db().put(b"h/a", b"cid").unwrap();
+
+    let tx = db.begin_transaction_with(IsolationLevel::DefraLevel);
+    let walked: Vec<_> = tx.scan_stream(Some(b"h/"), Some(b"h0")).collect();
+    assert!(!walked.is_empty());
+    tx.put(b"k", b"mine").unwrap();
+    db.db().put(b"k", b"theirs").unwrap();
+    stats.reset();
+    assert!(conflicted(tx.commit()));
+    assert_eq!(count(&stats, Ticker::CommitConflicts), 1);
+    assert_eq!(count(&stats, Ticker::PolicyScanRunsDropped), 0);
+    assert_eq!(count(&stats, Ticker::CommitCount), 0);
 }
 
 fn pessimistic(dir: &std::path::Path, stats: Arc<Statistics>) -> regolith::TransactionDb {

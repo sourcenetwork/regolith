@@ -14,9 +14,9 @@
 //! form `regolith.<surface>.<metric>`, grouping related metrics
 //! under a shared surface prefix. The surfaces are `write`
 //! (memtable/batch writes), `read` (point lookups), `iter`
-//! (iterator seek/next), `block_cache`, `bloom`, `block`,
-//! `compaction`, `flush`, `wal`, `snapshot`, `commit` (transaction
-//! commit outcomes), and `policy` ([`IsolationLevel::DefraLevel`]
+//! (iterator seek/next), `block_cache`, `bloom`, `compaction`,
+//! `flush`, `wal`, `snapshot`, `commit` (transaction commit
+//! outcomes), and `policy` ([`IsolationLevel::DefraLevel`]
 //! relaxations).
 //!
 //! # Cost when disabled
@@ -122,16 +122,18 @@ pub enum Ticker {
     /// into.
     CommitConflictsOnWrite = 28,
     /// Written keys whose newer committed version was accepted
-    /// because the write stored exactly what the key already holds
-    /// (`write_matches_committed` held).
+    /// because the write stored exactly what the key already holds.
+    /// Counted only for commits that returned `Ok`.
     CommitWritesElided = 29,
     /// Blind merge-only keys accepted at
     /// [`crate::IsolationLevel::DefraLevel`] despite a newer merge
-    /// operand, because operands commute.
+    /// operand, because operands commute. Counted only for commits
+    /// that returned `Ok`.
     PolicyBlindMergesCommuted = 30,
     /// Scan stretches dropped because they stayed inside a
     /// [`crate::KeyClass::CommutativePrefix`], so the caller's
-    /// policy declared them safe to leave unvalidated.
+    /// policy declared them safe to leave unvalidated. Counted only
+    /// for commits that returned `Ok`.
     PolicyScanRunsDropped = 31,
 }
 
@@ -236,21 +238,17 @@ pub enum Histogram {
     CompactionTime = 4,
     /// Wall-clock microseconds per flush.
     FlushTime = 5,
-    /// Wall-clock microseconds spent reading a single data
-    /// block off disk (decompression included, cache lookup
-    /// excluded).
-    BlockReadTime = 6,
     /// Bytes returned per `Db::get` that found a live value.
-    BytesPerRead = 7,
+    BytesPerRead = 6,
     /// Total bytes applied per `Db::write` (keys + values across
     /// every op in the batch).
-    BytesPerWrite = 8,
+    BytesPerWrite = 7,
     /// Wall-clock microseconds to append a batch to the WAL
     /// (including fsync when durability is Immediate).
-    WalWriteTime = 9,
+    WalWriteTime = 8,
 }
 
-const NUM_HISTOGRAMS: usize = 10;
+const NUM_HISTOGRAMS: usize = 9;
 
 /// Every defined histogram, in discriminant order. Same pattern
 /// as [`ALL_TICKERS`].
@@ -261,7 +259,6 @@ const ALL_HISTOGRAMS: &[Histogram] = &[
     Histogram::DbIterNext,
     Histogram::CompactionTime,
     Histogram::FlushTime,
-    Histogram::BlockReadTime,
     Histogram::BytesPerRead,
     Histogram::BytesPerWrite,
     Histogram::WalWriteTime,
@@ -277,7 +274,6 @@ impl Histogram {
             Histogram::DbIterNext => "regolith.iter.next_micros",
             Histogram::CompactionTime => "regolith.compaction.micros",
             Histogram::FlushTime => "regolith.flush.micros",
-            Histogram::BlockReadTime => "regolith.block.read_micros",
             Histogram::BytesPerRead => "regolith.read.bytes_per_get",
             Histogram::BytesPerWrite => "regolith.write.bytes_per_batch",
             Histogram::WalWriteTime => "regolith.wal.write_micros",
@@ -599,13 +595,12 @@ mod tests {
 
     #[test]
     fn every_metric_name_is_unique_and_surface_prefixed() {
-        const SURFACES: [&str; 12] = [
+        const SURFACES: [&str; 11] = [
             "write",
             "read",
             "iter",
             "block_cache",
             "bloom",
-            "block",
             "compaction",
             "flush",
             "wal",

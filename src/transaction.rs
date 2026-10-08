@@ -1182,6 +1182,9 @@ impl<'db> Transaction<'db> {
         // consult: the policy is installed on the optimistic database alone,
         // and every other level ignores it.
         let classifier = policy::classifier_for(&self.policy, self.isolation);
+        // Counted here, recorded only once the commit succeeded: a commit
+        // that aborts or fails dropped nothing.
+        let mut scan_runs_dropped = 0u64;
         // Behind the `take`, not threaded through `validation_set`, so a
         // transaction that never scans (the common case) pays no `Vec`
         // round trip for an empty run list on its commit path.
@@ -1190,12 +1193,7 @@ impl<'db> Transaction<'db> {
             if let Some(classifier) = classifier {
                 let before = runs.len();
                 runs.retain(|run| !policy::run_is_commutative(classifier, run));
-                if let Some(s) = self.engine.statistics() {
-                    s.add(
-                        crate::Ticker::PolicyScanRunsDropped,
-                        (before - runs.len()) as u64,
-                    );
-                }
+                scan_runs_dropped = (before - runs.len()) as u64;
             }
             scan_range::cover(
                 &mut checks.reads,
@@ -1225,6 +1223,9 @@ impl<'db> Transaction<'db> {
             CommitOutcome::Ok => {
                 if let Some(s) = self.engine.statistics() {
                     s.add(crate::Ticker::CommitCount, 1);
+                    if scan_runs_dropped > 0 {
+                        s.add(crate::Ticker::PolicyScanRunsDropped, scan_runs_dropped);
+                    }
                 }
                 Ok(())
             }
