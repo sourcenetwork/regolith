@@ -14,6 +14,7 @@ pub(crate) trait VisitNode<'mem, R>:
 }
 
 impl<'mem, R, F> VisitNode<'mem, R> for F where F: FnMut(NodeRef<'mem>, u64, u8) -> ControlFlow<R> {}
+use super::super::source_walk::Skip;
 
 impl MemTable {
     /// Visits `lk`'s entries newest first among those at or below the lookup's
@@ -65,21 +66,25 @@ impl MemTable {
     }
 
     /// Skips `lk`'s merge operands above `floor`, newest first among the
-    /// entries at or below the lookup's snapshot, and returns the sequence
-    /// of the entry the skip stops at: a value or deletion above `floor`,
-    /// or any entry at or below it. `None` when every such entry here is an
-    /// operand above `floor`, or there is none.
+    /// entries at or below the lookup's snapshot, and reports where the skip
+    /// ended: whether it passed any operand, and the sequence of the entry it
+    /// stopped at, a value or deletion above `floor` or any entry at or below
+    /// it. The stop is `None` when every such entry here is an operand above
+    /// `floor`, or there is none.
     ///
     /// Reads sequences and value types in place: no value is sliced and no
     /// arena `Arc` is cloned.
-    pub(crate) fn skip_merges_above(&self, lk: &LookupKey, floor: u64) -> Option<u64> {
-        self.scan_key(lk, |_, seq, value_type| {
+    pub(crate) fn skip_merges_above(&self, lk: &LookupKey, floor: u64) -> Skip {
+        let mut passed = false;
+        let stop = self.scan_key(lk, |_, seq, value_type| {
             if seq <= floor || value_type != VALUE_TYPE_MERGE {
                 ControlFlow::Break(seq)
             } else {
+                passed = true;
                 ControlFlow::Continue(())
             }
-        })
+        });
+        Skip { passed, stop }
     }
 }
 
@@ -117,8 +122,13 @@ mod tests {
     }
 
     /// `skip_merges_above` for `key` read at `snapshot_seq`.
-    fn skip(mt: &MemTable, key: &[u8], snapshot_seq: u64, floor: u64) -> Option<u64> {
+    fn skip(mt: &MemTable, key: &[u8], snapshot_seq: u64, floor: u64) -> Skip {
         mt.skip_merges_above(&probe(key, snapshot_seq), floor)
+    }
+
+    /// A skip that passed an operand or not, and stopped at `stop`.
+    fn ended(passed: bool, stop: Option<u64>) -> Skip {
+        Skip { passed, stop }
     }
 
     #[test]
@@ -217,7 +227,7 @@ mod tests {
         write(&mt, b"k", 1, Kind::Put);
         write(&mt, b"k", 2, Kind::Merge);
         write(&mt, b"k", 3, Kind::Merge);
-        assert_eq!(skip(&mt, b"k", u64::MAX, 0), Some(1));
+        assert_eq!(skip(&mt, b"k", u64::MAX, 0), ended(true, Some(1)));
     }
 
     #[test]
@@ -227,9 +237,9 @@ mod tests {
         for seq in 2..=10 {
             write(&mt, b"k", seq, Kind::Merge);
         }
-        assert_eq!(skip(&mt, b"k", u64::MAX, 5), Some(5));
-        assert_eq!(skip(&mt, b"k", u64::MAX, 10), Some(10));
-        assert_eq!(skip(&mt, b"k", u64::MAX, 40), Some(10));
+        assert_eq!(skip(&mt, b"k", u64::MAX, 5), ended(true, Some(5)));
+        assert_eq!(skip(&mt, b"k", u64::MAX, 10), ended(false, Some(10)));
+        assert_eq!(skip(&mt, b"k", u64::MAX, 40), ended(false, Some(10)));
     }
 
     #[test]
@@ -239,7 +249,7 @@ mod tests {
         write(&mt, b"k", 2, Kind::Merge);
         write(&mt, b"k", 3, Kind::Delete);
         write(&mt, b"k", 4, Kind::Merge);
-        assert_eq!(skip(&mt, b"k", u64::MAX, 1), Some(3));
+        assert_eq!(skip(&mt, b"k", u64::MAX, 1), ended(true, Some(3)));
     }
 
     #[test]
@@ -247,15 +257,15 @@ mod tests {
         let mt = memtable();
         write(&mt, b"k", 3, Kind::Merge);
         write(&mt, b"k", 4, Kind::Merge);
-        assert_eq!(skip(&mt, b"k", u64::MAX, 2), None);
+        assert_eq!(skip(&mt, b"k", u64::MAX, 2), ended(true, None));
     }
 
     #[test]
     fn a_missing_key_finds_nothing() {
         let mt = memtable();
-        assert_eq!(skip(&mt, b"k", u64::MAX, 0), None);
+        assert_eq!(skip(&mt, b"k", u64::MAX, 0), ended(false, None));
         write(&mt, b"j", 1, Kind::Put);
-        assert_eq!(skip(&mt, b"k", u64::MAX, 0), None);
+        assert_eq!(skip(&mt, b"k", u64::MAX, 0), ended(false, None));
     }
 
     #[test]
@@ -266,8 +276,8 @@ mod tests {
         write(&mt, b"k", 4, Kind::Merge);
         write(&mt, b"ka", 5, Kind::Put);
         write(&mt, b"l", 6, Kind::Delete);
-        assert_eq!(skip(&mt, b"k", u64::MAX, 2), None);
-        assert_eq!(skip(&mt, b"k", u64::MAX, 0), None);
+        assert_eq!(skip(&mt, b"k", u64::MAX, 2), ended(true, None));
+        assert_eq!(skip(&mt, b"k", u64::MAX, 0), ended(true, None));
     }
 
     #[test]
@@ -276,8 +286,21 @@ mod tests {
         write(&mt, b"k", 1, Kind::Put);
         write(&mt, b"k", 2, Kind::Merge);
         write(&mt, b"k", 9, Kind::Put);
-        assert_eq!(skip(&mt, b"k", 5, 0), Some(1));
-        assert_eq!(skip(&mt, b"k", u64::MAX, 0), Some(9));
+        assert_eq!(skip(&mt, b"k", 5, 0), ended(true, Some(1)));
+        assert_eq!(skip(&mt, b"k", u64::MAX, 0), ended(false, Some(9)));
+    }
+
+    #[test]
+    fn a_skip_reports_whether_it_passed_an_operand() {
+        let mt = memtable();
+        write(&mt, b"k", 1, Kind::Put);
+        write(&mt, b"k", 2, Kind::Merge);
+        // The operand at 2 is above the floor at 1 and is passed over.
+        assert_eq!(skip(&mt, b"k", u64::MAX, 1), ended(true, Some(1)));
+        // At the floor it is the stop itself, so nothing was passed.
+        assert_eq!(skip(&mt, b"k", u64::MAX, 2), ended(false, Some(2)));
+        // Below the operand's snapshot only the put is visible.
+        assert_eq!(skip(&mt, b"k", 1, 0), ended(false, Some(1)));
     }
 
     const KEYS: [&[u8]; 3] = [b"a", b"ab", b"b"];
@@ -309,14 +332,20 @@ mod tests {
             for (key, name) in KEYS.iter().enumerate() {
                 // Sequences rise with the index, so the reversed log is
                 // the key's entries newest first.
-                let expected = writes
+                let mut expected = ended(false, None);
+                let visible = writes
                     .iter()
                     .enumerate()
                     .rev()
                     .map(|(index, &(k, kind))| (k, index as u64 + 1, kind))
-                    .filter(|&(k, seq, _)| k == key && seq <= snapshot_seq)
-                    .find(|&(_, seq, kind)| seq <= floor || kind != Kind::Merge)
-                    .map(|(_, seq, _)| seq);
+                    .filter(|&(k, seq, _)| k == key && seq <= snapshot_seq);
+                for (_, seq, kind) in visible {
+                    if seq <= floor || kind != Kind::Merge {
+                        expected.stop = Some(seq);
+                        break;
+                    }
+                    expected.passed = true;
+                }
                 prop_assert_eq!(skip(&mt, name, snapshot_seq, floor), expected);
             }
         }

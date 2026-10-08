@@ -35,6 +35,16 @@ pub(crate) type WalkResult<B> = io::Result<ControlFlow<B, u64>>;
 pub(crate) trait VisitSource<'view, B>: FnMut(Source<'view>, u64) -> VisitResult<B> {}
 
 impl<'view, B, F> VisitSource<'view, B> for F where F: FnMut(Source<'view>, u64) -> VisitResult<B> {}
+/// Where one source's skip over a key's merge operands above a floor ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Skip {
+    /// Whether an operand above the floor was passed over.
+    pub(crate) passed: bool,
+    /// The entry the skip stopped at: a value or deletion above the floor,
+    /// or any entry at or below it. `None` when the key's entries here ran
+    /// out first.
+    pub(crate) stop: Option<u64>,
+}
 
 impl ReadView {
     /// Visits the sources of this view that may hold `key`, newest first: the

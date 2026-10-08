@@ -14,8 +14,10 @@
 //! form `regolith.<surface>.<metric>`, grouping related metrics
 //! under a shared surface prefix. The surfaces are `write`
 //! (memtable/batch writes), `read` (point lookups), `iter`
-//! (iterator seek/next), `block_cache`, `bloom`, `block`,
-//! `compaction`, `flush`, `wal`, and `snapshot`.
+//! (iterator seek/next), `block_cache`, `bloom`, `compaction`,
+//! `flush`, `wal`, `snapshot`, `commit` (transaction commit
+//! outcomes), and `policy` ([`IsolationLevel::DefraLevel`]
+//! relaxations).
 //!
 //! # Cost when disabled
 //!
@@ -106,9 +108,36 @@ pub enum Ticker {
     /// record behind and the bytes from it to end-of-file were dropped;
     /// the discard is also logged with the file and the offset.
     WalTailDiscarded = 24,
+    /// Optimistic or pessimistic transaction commits that returned
+    /// `Ok`.
+    CommitCount = 25,
+    /// Transaction commits that returned
+    /// [`crate::TransactionError::Conflict`].
+    CommitConflicts = 26,
+    /// The subset of [`Ticker::CommitConflicts`] where the
+    /// conflicting key was a key the transaction read.
+    CommitConflictsOnRead = 27,
+    /// The subset of [`Ticker::CommitConflicts`] where the
+    /// conflicting key was a key the transaction wrote or merged
+    /// into.
+    CommitConflictsOnWrite = 28,
+    /// Written keys whose newer committed version was accepted
+    /// because the write stored exactly what the key already holds.
+    /// Counted only for commits that returned `Ok`.
+    CommitWritesElided = 29,
+    /// Blind merge-only keys accepted at
+    /// [`crate::IsolationLevel::DefraLevel`] despite a newer merge
+    /// operand, because operands commute. Counted only for commits
+    /// that returned `Ok`.
+    PolicyBlindMergesCommuted = 30,
+    /// Scan stretches dropped because they stayed inside a
+    /// [`crate::KeyClass::CommutativePrefix`], so the caller's
+    /// policy declared them safe to leave unvalidated. Counted only
+    /// for commits that returned `Ok`.
+    PolicyScanRunsDropped = 31,
 }
 
-const NUM_TICKERS: usize = 25;
+const NUM_TICKERS: usize = 32;
 
 /// Every defined ticker, in discriminant order. Used by
 /// [`Statistics::dump`] to iterate all slots. Keep this in sync
@@ -140,6 +169,13 @@ const ALL_TICKERS: &[Ticker] = &[
     Ticker::SnapshotsRegistered,
     Ticker::SnapshotsReleased,
     Ticker::WalTailDiscarded,
+    Ticker::CommitCount,
+    Ticker::CommitConflicts,
+    Ticker::CommitConflictsOnRead,
+    Ticker::CommitConflictsOnWrite,
+    Ticker::CommitWritesElided,
+    Ticker::PolicyBlindMergesCommuted,
+    Ticker::PolicyScanRunsDropped,
 ];
 
 impl Ticker {
@@ -171,6 +207,13 @@ impl Ticker {
             Ticker::SnapshotsRegistered => "regolith.snapshot.registered",
             Ticker::SnapshotsReleased => "regolith.snapshot.released",
             Ticker::WalTailDiscarded => "regolith.wal.tail_discarded",
+            Ticker::CommitCount => "regolith.commit.count",
+            Ticker::CommitConflicts => "regolith.commit.conflicts",
+            Ticker::CommitConflictsOnRead => "regolith.commit.conflicts_on_read",
+            Ticker::CommitConflictsOnWrite => "regolith.commit.conflicts_on_write",
+            Ticker::CommitWritesElided => "regolith.commit.writes_elided",
+            Ticker::PolicyBlindMergesCommuted => "regolith.policy.blind_merges_commuted",
+            Ticker::PolicyScanRunsDropped => "regolith.policy.scan_runs_dropped",
         }
     }
 }
@@ -195,21 +238,17 @@ pub enum Histogram {
     CompactionTime = 4,
     /// Wall-clock microseconds per flush.
     FlushTime = 5,
-    /// Wall-clock microseconds spent reading a single data
-    /// block off disk (decompression included, cache lookup
-    /// excluded).
-    BlockReadTime = 6,
     /// Bytes returned per `Db::get` that found a live value.
-    BytesPerRead = 7,
+    BytesPerRead = 6,
     /// Total bytes applied per `Db::write` (keys + values across
     /// every op in the batch).
-    BytesPerWrite = 8,
+    BytesPerWrite = 7,
     /// Wall-clock microseconds to append a batch to the WAL
     /// (including fsync when durability is Immediate).
-    WalWriteTime = 9,
+    WalWriteTime = 8,
 }
 
-const NUM_HISTOGRAMS: usize = 10;
+const NUM_HISTOGRAMS: usize = 9;
 
 /// Every defined histogram, in discriminant order. Same pattern
 /// as [`ALL_TICKERS`].
@@ -220,7 +259,6 @@ const ALL_HISTOGRAMS: &[Histogram] = &[
     Histogram::DbIterNext,
     Histogram::CompactionTime,
     Histogram::FlushTime,
-    Histogram::BlockReadTime,
     Histogram::BytesPerRead,
     Histogram::BytesPerWrite,
     Histogram::WalWriteTime,
@@ -236,7 +274,6 @@ impl Histogram {
             Histogram::DbIterNext => "regolith.iter.next_micros",
             Histogram::CompactionTime => "regolith.compaction.micros",
             Histogram::FlushTime => "regolith.flush.micros",
-            Histogram::BlockReadTime => "regolith.block.read_micros",
             Histogram::BytesPerRead => "regolith.read.bytes_per_get",
             Histogram::BytesPerWrite => "regolith.write.bytes_per_batch",
             Histogram::WalWriteTime => "regolith.wal.write_micros",
@@ -558,17 +595,18 @@ mod tests {
 
     #[test]
     fn every_metric_name_is_unique_and_surface_prefixed() {
-        const SURFACES: [&str; 10] = [
+        const SURFACES: [&str; 11] = [
             "write",
             "read",
             "iter",
             "block_cache",
             "bloom",
-            "block",
             "compaction",
             "flush",
             "wal",
             "snapshot",
+            "commit",
+            "policy",
         ];
         let mut names: Vec<&str> = ALL_TICKERS
             .iter()

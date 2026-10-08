@@ -7,6 +7,7 @@ use std::ops::ControlFlow;
 use std::sync::Arc;
 
 use super::super::MergeChain;
+use super::super::source_walk::Skip;
 use super::{
     Block, BlockCache, DbSlice, LookupKey, SsTableReader, VALUE_TYPE_MERGE, decode_internal_key,
     invalid_data,
@@ -69,14 +70,17 @@ impl SsTableReader {
         floor: u64,
         key_buf: &mut Vec<u8>,
         cache: &BlockCache,
-    ) -> io::Result<Option<u64>> {
-        self.scan_key(lk, key_buf, cache, |_, seq, vt, _, _| {
+    ) -> io::Result<Skip> {
+        let mut passed = false;
+        let stop = self.scan_key(lk, key_buf, cache, |_, seq, vt, _, _| {
             if seq <= floor || vt != VALUE_TYPE_MERGE {
                 ControlFlow::Break(seq)
             } else {
+                passed = true;
                 ControlFlow::Continue(())
             }
-        })
+        })?;
+        Ok(Skip { passed, stop })
     }
 
     /// Visits `lk`'s entries newest first from the lookup's snapshot, carrying
@@ -219,11 +223,16 @@ mod tests {
         key: &[u8],
         snapshot_seq: u64,
         floor: u64,
-    ) -> Option<u64> {
+    ) -> Skip {
         let lk = LookupKey::from_prefixed(key, snapshot_seq);
         reader
             .skip_merges_above(&lk, floor, &mut Vec::new(), cache)
             .unwrap()
+    }
+
+    /// A skip that passed an operand or not, and stopped at `stop`.
+    fn ended(passed: bool, stop: Option<u64>) -> Skip {
+        Skip { passed, stop }
     }
 
     /// `collect_merge_chain` for `key` read at `snapshot_seq`.
@@ -256,13 +265,18 @@ mod tests {
         found
     }
 
-    /// The sequence `skip_merges_above` should stop at, by walking
-    /// `visible` entry by entry.
-    fn model_skip(entries: &[Entry], key: &[u8], snapshot_seq: u64, floor: u64) -> Option<u64> {
-        visible(entries, key, snapshot_seq)
-            .into_iter()
-            .find(|&(_, seq, kind)| seq <= floor || kind != Kind::Merge)
-            .map(|(_, seq, _)| seq)
+    /// What `skip_merges_above` should report, by walking `visible` entry by
+    /// entry.
+    fn model_skip(entries: &[Entry], key: &[u8], snapshot_seq: u64, floor: u64) -> Skip {
+        let mut skip = ended(false, None);
+        for (_, seq, kind) in visible(entries, key, snapshot_seq) {
+            if seq <= floor || kind != Kind::Merge {
+                skip.stop = Some(seq);
+                break;
+            }
+            skip.passed = true;
+        }
+        skip
     }
 
     /// The chain `collect_merge_chain` should report: `visible`, through the
@@ -324,29 +338,56 @@ mod tests {
     #[test]
     fn the_skip_crosses_blocks_down_to_the_base() {
         for_both_indexes(&chain(), |reader, cache| {
-            assert_eq!(skip(reader, cache, b"k", u64::MAX, 0), Some(3));
-            assert_eq!(skip(reader, cache, b"k", u64::MAX, 2), Some(3));
+            assert_eq!(skip(reader, cache, b"k", u64::MAX, 0), ended(true, Some(3)));
+            assert_eq!(skip(reader, cache, b"k", u64::MAX, 2), ended(true, Some(3)));
         });
     }
 
     #[test]
     fn the_skip_stops_at_the_floor_in_the_middle_of_the_chain() {
         for_both_indexes(&chain(), |reader, cache| {
-            assert_eq!(skip(reader, cache, b"k", u64::MAX, 150), Some(150));
-            assert_eq!(skip(reader, cache, b"k", u64::MAX, 3), Some(3));
-            assert_eq!(skip(reader, cache, b"k", u64::MAX, 303), Some(303));
-            assert_eq!(skip(reader, cache, b"k", u64::MAX, 400), Some(303));
+            assert_eq!(
+                skip(reader, cache, b"k", u64::MAX, 150),
+                ended(true, Some(150))
+            );
+            assert_eq!(skip(reader, cache, b"k", u64::MAX, 3), ended(true, Some(3)));
+            assert_eq!(
+                skip(reader, cache, b"k", u64::MAX, 303),
+                ended(false, Some(303))
+            );
+            assert_eq!(
+                skip(reader, cache, b"k", u64::MAX, 400),
+                ended(false, Some(303))
+            );
+        });
+    }
+
+    #[test]
+    fn a_skip_reports_whether_it_passed_an_operand() {
+        for_both_indexes(&chain(), |reader, cache| {
+            // The newest operand is the stop itself: nothing was passed.
+            assert_eq!(
+                skip(reader, cache, b"k", u64::MAX, 303),
+                ended(false, Some(303))
+            );
+            // One operand above the floor is passed over.
+            assert_eq!(
+                skip(reader, cache, b"k", u64::MAX, 302),
+                ended(true, Some(302))
+            );
+            // The only visible entry is a base: there is nothing to pass.
+            assert_eq!(skip(reader, cache, b"j", 1, 0), ended(false, Some(1)));
         });
     }
 
     #[test]
     fn the_skip_starts_below_the_lookup_snapshot() {
         for_both_indexes(&chain(), |reader, cache| {
-            assert_eq!(skip(reader, cache, b"k", 100, 0), Some(3));
-            assert_eq!(skip(reader, cache, b"k", 100, 50), Some(50));
-            assert_eq!(skip(reader, cache, b"k", 100, 120), Some(100));
-            assert_eq!(skip(reader, cache, b"k", 3, 0), Some(3));
-            assert_eq!(skip(reader, cache, b"k", 2, 0), None);
+            assert_eq!(skip(reader, cache, b"k", 100, 0), ended(true, Some(3)));
+            assert_eq!(skip(reader, cache, b"k", 100, 50), ended(true, Some(50)));
+            assert_eq!(skip(reader, cache, b"k", 100, 120), ended(false, Some(100)));
+            assert_eq!(skip(reader, cache, b"k", 3, 0), ended(false, Some(3)));
+            assert_eq!(skip(reader, cache, b"k", 2, 0), ended(false, None));
         });
     }
 
@@ -358,11 +399,26 @@ mod tests {
         entries.extend(operands(b"k", 102..=303));
         entries.push((b"l", 304, Kind::Put));
         for_both_indexes(&entries, |reader, cache| {
-            assert_eq!(skip(reader, cache, b"k", u64::MAX, 0), Some(101));
-            assert_eq!(skip(reader, cache, b"k", u64::MAX, 50), Some(101));
-            assert_eq!(skip(reader, cache, b"k", u64::MAX, 100), Some(101));
-            assert_eq!(skip(reader, cache, b"k", u64::MAX, 101), Some(101));
-            assert_eq!(skip(reader, cache, b"k", u64::MAX, 150), Some(150));
+            assert_eq!(
+                skip(reader, cache, b"k", u64::MAX, 0),
+                ended(true, Some(101))
+            );
+            assert_eq!(
+                skip(reader, cache, b"k", u64::MAX, 50),
+                ended(true, Some(101))
+            );
+            assert_eq!(
+                skip(reader, cache, b"k", u64::MAX, 100),
+                ended(true, Some(101))
+            );
+            assert_eq!(
+                skip(reader, cache, b"k", u64::MAX, 101),
+                ended(true, Some(101))
+            );
+            assert_eq!(
+                skip(reader, cache, b"k", u64::MAX, 150),
+                ended(true, Some(150))
+            );
         });
     }
 
@@ -370,9 +426,12 @@ mod tests {
     fn operands_above_the_floor_find_nothing_before_or_at_the_end_of_the_table() {
         for entries in operands_only() {
             for_both_indexes(&entries, |reader, cache| {
-                assert_eq!(skip(reader, cache, b"k", u64::MAX, 100), None);
-                assert_eq!(skip(reader, cache, b"k", u64::MAX, 199), None);
-                assert_eq!(skip(reader, cache, b"k", u64::MAX, 200), Some(200));
+                assert_eq!(skip(reader, cache, b"k", u64::MAX, 100), ended(true, None));
+                assert_eq!(skip(reader, cache, b"k", u64::MAX, 199), ended(true, None));
+                assert_eq!(
+                    skip(reader, cache, b"k", u64::MAX, 200),
+                    ended(true, Some(200))
+                );
             });
         }
     }
@@ -381,7 +440,11 @@ mod tests {
     fn a_key_the_table_lacks_finds_nothing() {
         for_both_indexes(&chain(), |reader, cache| {
             for key in [b"a".as_slice(), b"i", b"ka", b"m", b"zz"] {
-                assert_eq!(skip(reader, cache, key, u64::MAX, 0), None, "{key:?}");
+                assert_eq!(
+                    skip(reader, cache, key, u64::MAX, 0),
+                    ended(false, None),
+                    "{key:?}"
+                );
             }
         });
     }
