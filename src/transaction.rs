@@ -43,7 +43,10 @@
 //! the *earliest* sequence this transaction observed it at:
 //!
 //! - Optimistic: every key the transaction wrote or read through
-//!   `get_for_update`, against the begin snapshot.
+//!   `get_for_update`, against the begin snapshot. At
+//!   [`IsolationLevel::DefraLevel`], a key the transaction only merges into
+//!   conflicts with a newer put, delete or range delete of the key, and not
+//!   with a newer merge operand.
 //! - Pessimistic: every key the transaction read and then wrote
 //!   (the read-modify-write set) plus every key it read through
 //!   `get_for_update`. A key written blind, without ever being
@@ -70,7 +73,9 @@
 //! `Serializable` every key read by any of them is. At every level, a key a
 //! transactional scan walked that the transaction then writes is validated
 //! as a read from the begin snapshot, so a scan-then-write is never taken
-//! for a blind write.
+//! for a blind write. The one exception is a stretch that stays inside one
+//! [`KeyClass::CommutativePrefix`] at [`IsolationLevel::DefraLevel`] with a
+//! [`KeyClassifier`] installed: a write there is validated as a blind write.
 //!
 //! # Out of scope (follow-ups)
 //!
@@ -192,6 +197,20 @@ impl OptimisticTransactionDb {
 
     /// Install the [`KeyClassifier`] that [`IsolationLevel::DefraLevel`]
     /// consults. Transactions at any other level ignore it.
+    ///
+    /// Without a classifier every scan is recorded as at
+    /// [`IsolationLevel::RepeatableRead`]. With one, the commit disregards a
+    /// scan stretch that stays inside one [`KeyClass::CommutativePrefix`], so
+    /// a write or merge the transaction makes inside that stretch is
+    /// validated as a blind write instead of as a read.
+    ///
+    /// This is safe only when nothing the transaction writes outside the
+    /// prefix depends on which keys of the prefix the scan returned, and its
+    /// writes inside the prefix are unique keys or identical rewrites.
+    /// regolith cannot check that, so it rests on the caller's word.
+    ///
+    /// The classifier does not change how blind merges are validated: they
+    /// commute at this level for every key.
     pub fn with_policy(mut self, classifier: Arc<dyn KeyClassifier>) -> Self {
         self.policy = Some(classifier);
         self
@@ -392,6 +411,14 @@ pub enum ScanDirection {
 /// | [`IsolationLevel::SnapshotIsolation`] | no | no | no | **possible** |
 /// | [`IsolationLevel::RepeatableRead`] | no | no | no | **through a scan** |
 /// | [`IsolationLevel::Serializable`] | no | no | no | no |
+/// | [`IsolationLevel::DefraLevel`] | no | no | no | **through a scan** |
+///
+/// The [`IsolationLevel::DefraLevel`] row is `RepeatableRead`'s, with two
+/// relaxations described on that variant. A key that is only merged into is
+/// not snapshot isolated there: concurrent transactions can all commit a
+/// merge to it, and every operand applies. When every transaction uses only
+/// point reads, puts, deletes and merges, the committed transactions are
+/// serializable in commit order. The keys a scan returns are not validated.
 ///
 /// Every level reads from a snapshot captured when the transaction
 /// began, so none of them can observe a dirty read. What changes is the
@@ -471,14 +498,29 @@ pub enum IsolationLevel {
     /// Validate the entire read set, including every key a transactional
     /// scan yields.
     Serializable,
-    /// [`IsolationLevel::RepeatableRead`], relaxed in two places. A key the
-    /// transaction merges into without
-    /// reading it conflicts only with a newer put, delete or range delete,
-    /// never with a newer merge operand, since operands commute. With a
-    /// [`KeyClassifier`] installed through
-    /// [`OptimisticTransactionDb::with_policy`], a scan that stays inside a
-    /// [`KeyClass::CommutativePrefix`] records no stretch: the caller
-    /// declares that scan safe to leave unvalidated.
+    /// [`IsolationLevel::RepeatableRead`] with two relaxations, for
+    /// optimistic transactions only. A pessimistic transaction at this
+    /// level validates exactly as at `RepeatableRead`.
+    ///
+    /// - Blind merges commute. A key the transaction only merges into (it
+    ///   did not read the key, did not walk it in a scan, and did not put or
+    ///   delete it) conflicts only with a newer put, delete or range delete
+    ///   of that key, never with a newer merge operand. Concurrent blind
+    ///   merges to one key all commit, and their operands apply in commit
+    ///   order.
+    /// - Commutative prefixes. With a [`KeyClassifier`] installed through
+    ///   [`OptimisticTransactionDb::with_policy`], the commit disregards a
+    ///   scan stretch that stays inside one [`KeyClass::CommutativePrefix`],
+    ///   so a write or merge the transaction makes inside that stretch is
+    ///   validated as a blind write instead of as a read.
+    ///   [`KeyClass::CommutativePrefix`] states when that is safe.
+    ///
+    /// A key that is only merged into does not get snapshot isolation:
+    /// first committer wins does not apply to merge operands. When every
+    /// transaction uses only point reads, puts, deletes and merges, the
+    /// committed transactions are serializable in commit order, because
+    /// every point read is validated. The keys a scan returns are not
+    /// validated, as at `RepeatableRead`, so phantoms are possible.
     DefraLevel,
 }
 
@@ -717,8 +759,12 @@ impl<'db> Transaction<'db> {
     /// At every level, a key inside a stretch the scan walked that the
     /// transaction then writes is validated as a read from the begin
     /// snapshot, as a `get` followed by the write would be, so it is never
-    /// elided as a blind write. At `Serializable` a concurrent commit to any
-    /// yielded key also aborts the transaction. Keys yielded from the
+    /// elided as a blind write. The one exception is a stretch that stays
+    /// inside one [`KeyClass::CommutativePrefix`] at
+    /// [`IsolationLevel::DefraLevel`] with a [`KeyClassifier`] installed: the
+    /// commit disregards that stretch, and a write or merge inside it is
+    /// validated as a blind write. At `Serializable` a concurrent commit to
+    /// any yielded key also aborts the transaction. Keys yielded from the
     /// transaction's own buffered writes are not recorded and end a stretch,
     /// as `get` does not record them either. A key a pessimistic transaction
     /// already locked through [`Transaction::get_for_update`] is served where
@@ -873,9 +919,16 @@ impl<'db> Transaction<'db> {
         Err(TransactionError::UnsupportedRangeDelete)
     }
 
-    /// Buffer a merge operand. Merges are conflict-checked at the
-    /// key level: two transactions cannot concurrently merge the
-    /// same key under optimistic concurrency control.
+    /// Buffer a merge operand. Merges are conflict-checked at the key
+    /// level, so two optimistic transactions that run concurrently cannot
+    /// both commit a merge to the same key.
+    ///
+    /// [`IsolationLevel::DefraLevel`] is the exception, for a key the
+    /// transaction only merges into: it did not read the key, did not walk
+    /// it in a scan, and did not put or delete it. That merge conflicts only
+    /// with a newer put, delete or range delete of the key, never with a
+    /// newer merge operand. Concurrent blind merges to one key all commit,
+    /// and their operands apply in commit order.
     pub fn merge(&self, key: &[u8], operand: &[u8]) -> TxResult<()> {
         let prefixed = prefix_key(DEFAULT_CF_ID, key);
         self.lock_key(&prefixed)?;
@@ -944,7 +997,10 @@ impl<'db> Transaction<'db> {
     ///
     /// An optimistic transaction validates every key it wrote or
     /// read through [`Transaction::get_for_update`] against its
-    /// begin snapshot, so the check catches any concurrent writer. A
+    /// begin snapshot, so the check catches any concurrent writer. At
+    /// [`IsolationLevel::DefraLevel`] a key it only merges into is the
+    /// exception: a newer put, delete or range delete of the key is a
+    /// conflict, and a newer merge operand is not. A
     /// pessimistic transaction validates every key it read and then
     /// wrote, plus every key it read through `get_for_update`,
     /// against the sequence that read observed. The check passes
@@ -1068,7 +1124,10 @@ impl<'db> Transaction<'db> {
     ///
     /// Optimistic: the written and merged keys are validated against the
     /// begin snapshot; a key that was also read is validated once, as the
-    /// read. Pessimistic: written keys are not validated (`writes_at` is
+    /// read. At `DefraLevel`, `blind_merges_commute` relaxes that for a
+    /// merged key the transaction did not read: only a newer put, delete or
+    /// range delete conflicts, and a newer merge operand does not.
+    /// Pessimistic: written keys are not validated (`writes_at` is
     /// `None`), the key lock already orders them and there is no read for a
     /// concurrent writer to invalidate.
     ///

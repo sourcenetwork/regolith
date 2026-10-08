@@ -1,10 +1,11 @@
 //! Caller-declared key classes that [`IsolationLevel::DefraLevel`] applies.
 //!
 //! regolith knows nothing about what a caller's keys mean. A caller whose
-//! keyspace makes some conflicts harmless says so through a
-//! [`KeyClassifier`], and the level relaxes validation for exactly those
-//! keys, on the caller's word. Every other key is validated as at
-//! [`IsolationLevel::RepeatableRead`].
+//! keyspace makes some scan conflicts harmless says so through a
+//! [`KeyClassifier`], and the level relaxes the validation of a scan inside
+//! those keys, on the caller's word. A scan anywhere else is recorded as at
+//! [`IsolationLevel::RepeatableRead`]. The classifier does not govern blind
+//! merges, which commute at this level for every key.
 
 use crate::transaction::IsolationLevel;
 
@@ -13,26 +14,32 @@ use super::scan_range::ScanRun;
 /// What a caller declares about one key.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KeyClass {
-    /// No declaration: validated as at [`IsolationLevel::RepeatableRead`].
+    /// No declaration: a scan over the key is recorded as at
+    /// [`IsolationLevel::RepeatableRead`].
     Ordinary,
     /// The key lies in a prefix the caller declares commutative. `len` is
     /// the prefix length: every key that starts with this key's first
     /// `len` bytes is in the same class.
     ///
-    /// A transactional scan that stays inside one such prefix records no
-    /// stretch, so a key it walked is not re-anchored at the begin snapshot
-    /// when the transaction also writes it, and an identical write there
-    /// still elides. The scan becomes an unvalidated read, as a plain read
-    /// is at [`IsolationLevel::SnapshotIsolation`]: a concurrent commit
-    /// that adds or removes a key in the prefix never aborts the scanner.
+    /// This class has an effect only for an optimistic transaction at
+    /// [`IsolationLevel::DefraLevel`]. There, the commit disregards a scan
+    /// stretch that stays inside one such prefix. The keys that scan
+    /// returned are not validated as reads, as for any scan at
+    /// [`IsolationLevel::RepeatableRead`]. A write or merge the transaction
+    /// makes inside that stretch is validated as a blind write instead of
+    /// as a read: an identical rewrite of a key's current value commits,
+    /// and a merge there is blind. A write still conflicts with a newer
+    /// commit to its key, a removal included, unless the key already holds
+    /// exactly what the write would store. A stretch that leaves the prefix
+    /// is recorded as at `RepeatableRead`.
     ///
-    /// That is safe only when nothing the transaction decides depends on
-    /// which keys of the prefix it saw. Keys there should be added under
-    /// fresh names, with any two writers of one key writing the same
-    /// bytes, and a transaction that branches on a prefix scan - writing
-    /// something elsewhere only when a key is absent - must not rely on
-    /// this class for that prefix: two such transactions can both commit
-    /// where a serial order would let only one act.
+    /// Declare a prefix commutative only when nothing the transaction
+    /// writes outside it depends on which keys of the prefix the scan
+    /// returned, and its writes inside it are unique keys or identical
+    /// rewrites. A transaction that writes something elsewhere only when a
+    /// prefix scan finds a key absent breaks the first condition: two such
+    /// transactions can both commit where a serial order would let only one
+    /// act.
     CommutativePrefix {
         /// Length of the shared prefix, in bytes of the caller's key.
         len: usize,

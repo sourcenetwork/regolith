@@ -148,6 +148,7 @@ txn.commit()?;
 | `SnapshotIsolation` (default) | prevented | prevented | possible |
 | `RepeatableRead` | prevented | prevented | through a scan |
 | `Serializable` | prevented | prevented | prevented |
+| `DefraLevel` | prevented | prevented | through a scan |
 
 At `Serializable`, every key a transaction reads through `get` or a transactional scan is
 validated. At `RepeatableRead`, every key a `get` returned is validated and a scanned key is
@@ -159,12 +160,31 @@ written key is validated only in the optimistic flavour; the
 pessimistic flavour never validates a written key at commit, since the key lock already
 orders it. A `get_for_update` key is validated in both flavours from `SnapshotIsolation`
 up. At every level a key a transactional scan walked that the transaction then writes is
-validated as a read, so a scan-then-write never loses an update. A range is not validated
+validated as a read (inside a commutative prefix at `DefraLevel` it is validated as a blind
+write instead, below), so a scan-then-write never loses an update. A range is not validated
 on its own: a key inserted into a scanned range by a concurrent transaction (a phantom) is
 detected only when the transaction also writes it or validates it as a point read. A scan
 at `Serializable` holds one read-set entry per key it yields until the transaction
 resolves, and its commit checks each one while every writer waits; below it, a scan holds
 one entry per stretch of keys it walked.
+
+`DefraLevel` is `RepeatableRead` with two relaxations, which apply to optimistic
+transactions only. A pessimistic transaction at this level validates as `RepeatableRead`.
+
+- A key the transaction only merges into (it did not read the key, did not walk it in a
+  scan, and did not put or delete it) conflicts only with a newer put, delete or range
+  delete of that key, never with a newer merge operand. Concurrent blind merges to one key
+  all commit, and their operands apply in commit order.
+- With a `KeyClassifier` installed through `OptimisticTransactionDb::with_policy`, the
+  commit disregards a scan stretch that stays inside one `KeyClass::CommutativePrefix`, so
+  a write or merge made there is validated as a blind write instead of as a read. Declare a
+  prefix commutative only when nothing the transaction writes outside it depends on which
+  keys of the prefix the scan returned, and its writes inside it are unique keys or
+  identical rewrites.
+
+A key that is only merged into does not get snapshot isolation. When every transaction uses
+only point reads, puts, deletes and merges, the committed transactions are serializable in
+commit order. The keys a scan returns are not validated, as at `RepeatableRead`.
 
 `TransactionDb` is the pessimistic flavour: it takes key locks, so contention waits
 instead of retrying. `OptimisticTransactionDb` validates at commit and retries.
