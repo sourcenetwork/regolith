@@ -9,6 +9,7 @@
 //! not govern blind merges, which commute at this level for every key.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use crate::engine::ValidationSet;
 use crate::transaction::IsolationLevel;
@@ -110,32 +111,66 @@ fn class_of(classifier: &dyn KeyClassifier, key: &[u8]) -> KeyClass {
         .map_or(KeyClass::Ordinary, |key| classifier.classify(key))
 }
 
-/// Take the content-addressed keys out of `checks`, which holds the commit's
-/// reads once the transaction's scans are folded in: drop their reads, and
-/// list the ones the commit writes or merges in `checks.exempt`, so the engine
-/// validates none of them.
+/// The classifier a transaction at `isolation` consults: only
+/// [`IsolationLevel::DefraLevel`] does, and only when the database installed
+/// one. Every place that asks takes the answer from here.
+pub(super) fn classifier_for(
+    policy: &Option<Arc<dyn KeyClassifier>>,
+    isolation: IsolationLevel,
+) -> Option<&dyn KeyClassifier> {
+    policy
+        .as_deref()
+        .filter(|_| isolation == IsolationLevel::DefraLevel)
+}
+
+/// Apply the content-addressed rule to `checks`, which holds the commit's
+/// reads once the transaction's scans are folded in.
 ///
-/// The listing is a sorted copy of those keys, built here before the commit
-/// takes the write pipeline. The engine finds a written key in it by binary
-/// search, which neither hashes nor allocates, and skips the key's lookup
-/// outright, where a lookup is what validating it would cost. A commit whose
-/// classifier names no written key leaves the list empty and pays nothing.
+/// A key the commit puts or merges is listed in `checks.exempt`, so the
+/// engine validates neither the write nor any read of it. The newest write of
+/// a key decides: `settle` keeps an operand only when it is newer than the
+/// key's newest put or delete, so a key with an operand is merged, and one
+/// without is put or deleted by its point write. A deleted key is not listed:
+/// its delete is validated as for any key, and a read of it that found a value
+/// is validated for presence only, so a concurrent delete or put of the key
+/// still decides the commit.
+///
+/// Every other read of a content-addressed key that found a value is marked
+/// presence-only, and one that found nothing stays a read like any other.
+///
+/// The listing is a sorted copy of the exempt keys, built here before the
+/// commit takes the write pipeline. The engine finds a written key in it by
+/// binary search, which neither hashes nor allocates, and skips the key's
+/// lookup outright, where a lookup is what validating it would cost. A commit
+/// whose classifier names no such key leaves the list empty and pays nothing.
 pub(super) fn exempt_content_addressed(
     classifier: &dyn KeyClassifier,
     checks: &mut ValidationSet,
     writes: &BTreeMap<Vec<u8>, Option<Vec<u8>>>,
     merges: &[(Vec<u8>, Vec<u8>)],
 ) {
-    let exempt = |key: &[u8]| class_of(classifier, key) == KeyClass::ContentAddressed;
-    checks.reads.retain(|read| !exempt(read.key.as_slice()));
+    let content_addressed = |key: &[u8]| class_of(classifier, key) == KeyClass::ContentAddressed;
     checks.exempt = writes
-        .keys()
+        .iter()
+        .filter(|(_, value)| value.is_some())
+        .map(|(key, _)| key)
         .chain(merges.iter().map(|(key, _)| key))
-        .filter(|key| exempt(key.as_slice()))
+        .filter(|key| content_addressed(key.as_slice()))
         .cloned()
         .collect();
     checks.exempt.sort_unstable();
     checks.exempt.dedup();
+    let exempt = &checks.exempt;
+    checks.reads.retain_mut(|read| {
+        if exempt
+            .binary_search_by(|key| key.as_slice().cmp(&read.key))
+            .is_ok()
+        {
+            return false;
+        }
+        read.presence_only = read.found && content_addressed(&read.key);
+        true
+    });
 }
 
 impl IsolationLevel {
@@ -171,25 +206,48 @@ mod tests {
         prefix_key(DEFAULT_CF_ID, name)
     }
 
-    fn read(name: &[u8]) -> ConflictKey {
+    fn read(name: &[u8], found: bool) -> ConflictKey {
         ConflictKey {
             key: key(name),
             observed_seq: 3,
+            found,
+            presence_only: false,
         }
     }
 
-    #[test]
-    fn exempting_drops_the_reads_of_content_addressed_keys_and_lists_the_ones_written() {
-        let mut checks = ValidationSet {
-            reads: vec![read(b"a"), read(b"c1"), read(b"c3"), read(b"p")],
+    fn checks_of(reads: Vec<ConflictKey>) -> ValidationSet {
+        ValidationSet {
+            reads,
             writes_at: Some(3),
             blind_merges_commute: true,
             exempt: Vec::new(),
-        };
+        }
+    }
+
+    /// Each read left in `checks`, with whether it is presence-only.
+    fn kept(checks: &ValidationSet) -> Vec<(Vec<u8>, bool)> {
+        checks
+            .reads
+            .iter()
+            .map(|read| (read.key.clone(), read.presence_only))
+            .collect()
+    }
+
+    #[test]
+    fn exempting_lists_the_content_addressed_keys_put_or_merged_and_drops_their_reads() {
+        let mut checks = checks_of(vec![
+            read(b"a", true),
+            read(b"c1", true),
+            read(b"c3", true),
+            read(b"c4", false),
+            read(b"c5", true),
+            read(b"p", true),
+        ]);
         let writes: BTreeMap<Vec<u8>, Option<Vec<u8>>> = [
             (key(b"b"), Some(b"v".to_vec())),
             (key(b"c2"), None),
             (key(b"c3"), Some(b"v".to_vec())),
+            (key(b"c5"), None),
         ]
         .into_iter()
         .collect();
@@ -202,29 +260,50 @@ mod tests {
 
         exempt_content_addressed(&ByFirstByte, &mut checks, &writes, &merges);
 
-        let read_keys: Vec<Vec<u8>> = checks.reads.iter().map(|read| read.key.clone()).collect();
-        assert_eq!(read_keys, [key(b"a"), key(b"p")]);
         assert_eq!(
             checks.exempt,
             [key(b"c2"), key(b"c3"), key(b"c9")],
-            "only the content-addressed keys, sorted, each once"
+            "the content-addressed keys put or merged, sorted, each once; c5 is only deleted"
+        );
+        assert_eq!(
+            kept(&checks),
+            [
+                (key(b"a"), false),
+                (key(b"c1"), true),
+                (key(b"c4"), false),
+                (key(b"c5"), true),
+                (key(b"p"), false),
+            ],
+            "c3 is put, so its read is gone; a content-addressed read that found a value is \
+             presence-only, one that found nothing is an ordinary read, and c5 is deleted but \
+             not exempt"
         );
     }
 
     #[test]
     fn a_commit_that_names_no_content_addressed_key_exempts_nothing() {
-        let mut checks = ValidationSet {
-            reads: vec![read(b"a"), read(b"p")],
-            writes_at: Some(3),
-            blind_merges_commute: true,
-            exempt: Vec::new(),
-        };
+        let mut checks = checks_of(vec![read(b"a", true), read(b"p", true)]);
         let writes = BTreeMap::from([(key(b"b"), Some(b"v".to_vec()))]);
 
         exempt_content_addressed(&ByFirstByte, &mut checks, &writes, &[]);
 
-        assert_eq!(checks.reads.len(), 2);
+        assert_eq!(kept(&checks), [(key(b"a"), false), (key(b"p"), false)]);
         assert!(checks.exempt.is_empty());
+    }
+
+    #[test]
+    fn only_a_defra_transaction_with_a_policy_has_a_classifier() {
+        let policy: Option<Arc<dyn KeyClassifier>> = Some(Arc::new(ByFirstByte));
+        for level in [
+            IsolationLevel::ReadCommitted,
+            IsolationLevel::SnapshotIsolation,
+            IsolationLevel::RepeatableRead,
+            IsolationLevel::Serializable,
+        ] {
+            assert!(classifier_for(&policy, level).is_none(), "{level:?}");
+        }
+        assert!(classifier_for(&policy, IsolationLevel::DefraLevel).is_some());
+        assert!(classifier_for(&None, IsolationLevel::DefraLevel).is_none());
     }
 
     #[test]

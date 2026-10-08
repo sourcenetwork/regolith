@@ -670,6 +670,11 @@ struct KeyState {
     /// The key was read through [`Transaction::get_for_update`], so
     /// it is validated at commit whether or not it is written.
     for_update: AtomicBool,
+    /// A read of the key found a value in the database. Recorded only while
+    /// the transaction consults a [`KeyClassifier`], which uses it to tell a
+    /// read that must see the key stay present from one that found nothing.
+    /// Latches on, like `for_update`.
+    found: AtomicBool,
 }
 
 impl KeyState {
@@ -678,6 +683,7 @@ impl KeyState {
             first_read_seq: horizon,
             read_seq: AtomicU64::new(horizon),
             for_update: AtomicBool::new(for_update),
+            found: AtomicBool::new(false),
         }
     }
 }
@@ -768,8 +774,23 @@ impl<'db> Transaction<'db> {
     /// What the database holds for `prefixed` as this transaction reads it,
     /// at the sequence it observes the key at. The read is recorded.
     fn read_committed(&self, prefixed: &[u8]) -> std::io::Result<Option<DbSlice>> {
-        let read_seq = self.observe(prefixed, self.snapshot_seq, false);
-        self.engine.get_slice_at(prefixed, read_seq)
+        let (state, read_seq) = self.observe(prefixed, self.snapshot_seq, false);
+        self.read_noting(&state, prefixed, read_seq)
+    }
+
+    /// What the database holds for `prefixed` at `read_seq`, noted on `state`
+    /// when it holds a value and a classifier is there to make use of that.
+    fn read_noting(
+        &self,
+        state: &KeyState,
+        prefixed: &[u8],
+        read_seq: u64,
+    ) -> std::io::Result<Option<DbSlice>> {
+        let found = self.engine.get_slice_at(prefixed, read_seq)?;
+        if found.is_some() && policy::classifier_for(&self.policy, self.isolation).is_some() {
+            state.found.store(true, Ordering::Release);
+        }
+        Ok(found)
     }
 
     /// What a read of `prefixed` finds in this transaction's own writes, or
@@ -938,11 +959,11 @@ impl<'db> Transaction<'db> {
         let prefixed = prefix_key(DEFAULT_CF_ID, key);
         let already_held = self.lock_key(&prefixed)?;
         let horizon = self.read_horizon(&prefixed, already_held);
-        let read_seq = self.observe(&prefixed, horizon, true);
+        let (state, read_seq) = self.observe(&prefixed, horizon, true);
         // Tells `scan_read_seq` a promoted key might exist, so it is worth
         // looking `tracked` up for a pessimistic scan.
         self.promoted_seq.fetch_max(read_seq, Ordering::AcqRel);
-        let committed = || self.engine.get_slice_at(&prefixed, read_seq);
+        let committed = || self.read_noting(&state, &prefixed, read_seq);
         match self.read_own(&prefixed, committed)? {
             Some(own) => Ok(own),
             None => Ok(committed()
@@ -1127,10 +1148,7 @@ impl<'db> Transaction<'db> {
         // Only an optimistic transaction at `DefraLevel` has a classifier to
         // consult: the policy is installed on the optimistic database alone,
         // and every other level ignores it.
-        let classifier = self
-            .policy
-            .as_deref()
-            .filter(|_| self.isolation == IsolationLevel::DefraLevel);
+        let classifier = policy::classifier_for(&self.policy, self.isolation);
         // Behind the `take`, not threaded through `validation_set`, so a
         // transaction that never scans (the common case) pays no `Vec`
         // round trip for an empty run list on its commit path.
@@ -1147,8 +1165,8 @@ impl<'db> Transaction<'db> {
                 self.snapshot_seq,
             );
         }
-        // After the scans are folded in, so the reads they added for written
-        // keys are dropped with the rest.
+        // After the scans are folded in, so the reads they added for put or
+        // merged keys are dropped with the rest.
         if let Some(classifier) = classifier {
             policy::exempt_content_addressed(classifier, &mut checks, &writes, &merges);
         }
@@ -1206,9 +1224,11 @@ impl<'db> Transaction<'db> {
     ///
     /// This set does not yet account for what a transactional scan walked;
     /// `commit_inner` folds that in afterward with `scan_range::cover`,
-    /// skipped entirely when the transaction ran no scan. It then takes out
-    /// the keys a classifier exempts, with `policy::exempt_content_addressed`,
+    /// skipped entirely when the transaction ran no scan. It then applies the
+    /// content-addressed rule, with `policy::exempt_content_addressed`,
     /// skipped entirely when the transaction has no classifier to consult.
+    /// That is why each read carries whether it found a value: the rule
+    /// needs it and only the read could say.
     fn validation_set(
         &self,
         mut tracked: Vec<(Vec<u8>, Arc<KeyState>)>,
@@ -1253,6 +1273,8 @@ impl<'db> Transaction<'db> {
             .map(|(key, state)| ConflictKey {
                 key,
                 observed_seq: state.first_read_seq,
+                found: state.found.load(Ordering::Acquire),
+                presence_only: false,
             })
             .collect();
         ValidationSet {
@@ -1295,14 +1317,14 @@ impl<'db> Transaction<'db> {
     }
 
     /// Record that this transaction observed `key` at `horizon` and
-    /// return the sequence the read should be served at.
+    /// return the key's cell with the sequence the read should be served at.
     ///
     /// `first_read_seq` keeps the earliest observation, because that
     /// is the read a later write would overwrite. `read_seq` only
     /// moves forward, so promoting a key from a plain `get` to
     /// `get_for_update` never makes a later read of the same key
     /// return an older value than an earlier one.
-    fn observe(&self, key: &[u8], horizon: u64, for_update: bool) -> u64 {
+    fn observe(&self, key: &[u8], horizon: u64, for_update: bool) -> (Arc<KeyState>, u64) {
         let state = self
             .tracked
             .get_or_insert(key.to_vec(), Arc::new(KeyState::new(horizon, for_update)));
@@ -1323,10 +1345,11 @@ impl<'db> Transaction<'db> {
         if for_update {
             state.for_update.store(true, Ordering::Release);
         }
-        state
+        let read_seq = state
             .read_seq
             .fetch_max(horizon, Ordering::AcqRel)
-            .max(horizon)
+            .max(horizon);
+        (state, read_seq)
     }
 
     /// The sequence a scan serves `key` (CF-prefixed) at, recording nothing:

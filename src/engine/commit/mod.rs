@@ -37,6 +37,7 @@ use std::time::Duration;
 
 use kovan_queue::array_queue::ArrayQueue;
 
+use super::internal_key::VALUE_TYPE_DELETION;
 use super::memtable::MemTable;
 use super::wal::{MAX_RECORD_LEN, Wal, check_write_len};
 use super::{CommitOutcome, DurabilityMode, ReadView, RegolithEngine, grouped_batch_ops};
@@ -341,8 +342,12 @@ impl RegolithEngine {
         // sorted by key, so a multi-key conflict names the same key on
         // every run.
         for check in &checks.reads {
-            if let Some((latest_seq, _)) = self.latest_version_in_view(&check.key, &view)?
+            if let Some((latest_seq, newest_type)) = self.latest_version_in_view(&check.key, &view)?
                 && latest_seq > check.observed_seq
+                // A presence-only read found a value of a key whose bytes
+                // never differ, so only the key being gone (a deletion, or a
+                // range delete over it) can have changed what it decided.
+                && (!check.presence_only || newest_type == VALUE_TYPE_DELETION)
             {
                 // A key the transaction *read* always aborts, since the stale
                 // read may have changed what it decided.
@@ -397,11 +402,13 @@ impl RegolithEngine {
                     continue;
                 }
                 // A written key the transaction also read was validated above,
-                // at the read's anchor and without the elision below.
+                // at the read's anchor and without the elision below. A
+                // presence-only read does not stand for the write, so that
+                // key goes on to the check below.
                 if checks
                     .reads
                     .binary_search_by(|read| read.key.as_slice().cmp(key))
-                    .is_ok()
+                    .is_ok_and(|at| !checks.reads[at].presence_only)
                 {
                     continue;
                 }
