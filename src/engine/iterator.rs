@@ -59,6 +59,7 @@ use std::io;
 use std::ops::Bound;
 use std::sync::Arc;
 
+use super::KeyVersion;
 use super::block::encoded_entry_size;
 use super::block::{Block, decode_entry_at};
 use super::block_cache::BlockCache;
@@ -1873,7 +1874,7 @@ impl RegolithIterator {
             let group = uk.to_vec();
 
             let rt_seq = self.covering_rt_seq(&group);
-            let mut collected: Vec<(u64, u8, DbSlice)> = Vec::new();
+            let mut collected: Vec<KeyVersion> = Vec::new();
 
             while let Some(ik2) = self.inner.key() {
                 let (uk2, seq, vt) = decode_internal_key(ik2);

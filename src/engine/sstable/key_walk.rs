@@ -6,10 +6,23 @@ use std::io;
 use std::ops::ControlFlow;
 use std::sync::Arc;
 
+use super::super::MergeChain;
 use super::{
     Block, BlockCache, DbSlice, LookupKey, SsTableReader, VALUE_TYPE_MERGE, decode_internal_key,
     invalid_data,
 };
+
+/// Visits one entry of a key in a data block: the block, the entry's
+/// sequence and value type, and its value's offset and length in the block.
+pub(crate) trait VisitBlockEntry<R>:
+    FnMut(&Arc<Block>, u64, u8, usize, usize) -> ControlFlow<R>
+{
+}
+
+impl<R, F> VisitBlockEntry<R> for F where
+    F: FnMut(&Arc<Block>, u64, u8, usize, usize) -> ControlFlow<R>
+{
+}
 
 impl SsTableReader {
     /// Walk every visible entry for `user_key` at `snapshot_seq` in
@@ -27,7 +40,7 @@ impl SsTableReader {
         lk: &LookupKey,
         key_buf: &mut Vec<u8>,
         cache: &BlockCache,
-        out: &mut Vec<(u64, u8, DbSlice)>,
+        out: &mut MergeChain,
     ) -> io::Result<bool> {
         let terminated = self.scan_key(lk, key_buf, cache, |block, seq, vt, offset, len| {
             let Some(value) = DbSlice::from_block(Arc::clone(block), offset, len) else {
@@ -76,7 +89,7 @@ impl SsTableReader {
         lk: &LookupKey,
         key_buf: &mut Vec<u8>,
         cache: &BlockCache,
-        mut visit: impl FnMut(&Arc<Block>, u64, u8, usize, usize) -> ControlFlow<R>,
+        mut visit: impl VisitBlockEntry<R>,
     ) -> io::Result<Option<R>> {
         let user_key = lk.prefixed_user_key();
         if !self.filter(cache)?.may_contain(user_key) {

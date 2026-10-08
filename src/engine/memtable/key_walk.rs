@@ -4,17 +4,26 @@
 
 use std::ops::ControlFlow;
 
-use super::{DbSlice, LookupKey, MemTable, NodeRef, VALUE_TYPE_MERGE, decode_internal_key};
+use super::super::MergeChain;
+use super::{LookupKey, MemTable, NodeRef, VALUE_TYPE_MERGE, decode_internal_key};
+
+/// Visits one entry of a key in a memtable: its node, sequence and value type.
+pub(crate) trait VisitNode<'mem, R>:
+    FnMut(NodeRef<'mem>, u64, u8) -> ControlFlow<R>
+{
+}
+
+impl<'mem, R, F> VisitNode<'mem, R> for F where F: FnMut(NodeRef<'mem>, u64, u8) -> ControlFlow<R> {}
 
 impl MemTable {
     /// Visits `lk`'s entries newest first among those at or below the lookup's
     /// snapshot, until `visit` breaks. `None` when the key's entries end first.
     /// Nodes are read in place.
     #[inline]
-    pub(super) fn scan_key<'s, R>(
-        &'s self,
+    pub(super) fn scan_key<'mem, R>(
+        &'mem self,
         lk: &LookupKey,
-        mut visit: impl FnMut(NodeRef<'s>, u64, u8) -> ControlFlow<R>,
+        mut visit: impl VisitNode<'mem, R>,
     ) -> Option<R> {
         // A key's versions sort newest first and the lookup key carries the
         // lowest value type, so the seek lands on the newest version at or
@@ -43,11 +52,7 @@ impl MemTable {
     ///
     /// Used by the merge-operator read path to collect a chain of
     /// merge operands layered on top of the underlying base value.
-    pub(crate) fn collect_merge_chain(
-        &self,
-        lk: &LookupKey,
-        out: &mut Vec<(u64, u8, DbSlice)>,
-    ) -> bool {
+    pub(crate) fn collect_merge_chain(&self, lk: &LookupKey, out: &mut MergeChain) -> bool {
         self.scan_key(lk, |node, seq, value_type| {
             out.push((seq, value_type, self.value_slice(&node)));
             if value_type != VALUE_TYPE_MERGE {
