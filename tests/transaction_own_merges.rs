@@ -75,6 +75,19 @@ fn appending() -> Options {
     }
 }
 
+/// `counting`, with a write buffer that never builds an index, so a lookup
+/// always walks the list.
+fn counting_unindexed() -> Options {
+    Options {
+        transaction_keys_inline: 0,
+        ..counting()
+    }
+}
+
+/// `counting` with both buffer shapes: indexed past the default size, and
+/// never.
+const BUFFER_SHAPES: [fn() -> Options; 2] = [counting, counting_unindexed];
+
 fn delta(n: i64) -> [u8; 8] {
     n.to_be_bytes()
 }
@@ -369,6 +382,108 @@ fn a_scan_lays_the_merges_over_the_snapshot_in_both_directions() {
         assert_eq!(first[0].0, b"a".to_vec());
         assert_eq!(counter(Some(first[0].1.to_vec())), Some(11));
     });
+}
+
+#[test]
+fn a_merged_key_reads_through_ten_thousand_unrelated_entries() {
+    const UNRELATED: usize = 10_000;
+    let unrelated = |i: usize| format!("u{i:05}").into_bytes();
+    for options in BUFFER_SHAPES {
+        each_flavour(options, |flavour| {
+            flavour.db().put(b"above", &delta(10)).unwrap();
+            flavour.db().put(b"below", &delta(20)).unwrap();
+            let tx = flavour.begin();
+            // `below` is merged before the unrelated entries and `above` after
+            // them, so one chain lies beneath all of them and one over them.
+            tx.merge(b"below", &delta(1)).unwrap();
+            tx.merge(b"below", &delta(2)).unwrap();
+            for i in 0..UNRELATED {
+                tx.put(&unrelated(i), b"x").unwrap();
+            }
+            tx.merge(b"above", &delta(3)).unwrap();
+            tx.merge(b"above", &delta(4)).unwrap();
+            assert_eq!(counter(reads(&tx, b"below")), Some(23));
+            assert_eq!(counter(reads(&tx, b"above")), Some(17));
+            assert_eq!(reads(&tx, &unrelated(7)).as_deref(), Some(&b"x"[..]));
+
+            // Another operand in each chain, and more entries in between.
+            tx.merge(b"below", &delta(5)).unwrap();
+            for i in UNRELATED..UNRELATED + 100 {
+                tx.put(&unrelated(i), b"x").unwrap();
+            }
+            tx.merge(b"above", &delta(6)).unwrap();
+            assert_eq!(counter(reads(&tx, b"below")), Some(28));
+            assert_eq!(counter(reads(&tx, b"above")), Some(23));
+
+            tx.commit().unwrap();
+            assert_eq!(counter(flavour.db().get(b"below").unwrap()), Some(28));
+            assert_eq!(counter(flavour.db().get(b"above").unwrap()), Some(23));
+        });
+    }
+}
+
+#[test]
+fn threads_merging_into_one_key_of_a_shared_transaction_all_count() {
+    const THREADS: i64 = 4;
+    const MERGES: i64 = 250;
+    for options in BUFFER_SHAPES {
+        each_flavour(options, |flavour| {
+            flavour.db().put(b"k", &delta(10)).unwrap();
+            let tx = flavour.begin();
+            // Past the default inline size before the threads start, so a
+            // buffer that indexes itself has its index by then.
+            for i in 0..64 {
+                tx.put(format!("u{i:02}").as_bytes(), b"x").unwrap();
+            }
+            std::thread::scope(|scope| {
+                for _ in 0..THREADS {
+                    scope.spawn(|| {
+                        for _ in 0..MERGES {
+                            tx.merge(b"k", &delta(1)).unwrap();
+                        }
+                    });
+                }
+            });
+            let total = 10 + THREADS * MERGES;
+            assert_eq!(
+                counter(reads(&tx, b"k")),
+                Some(total),
+                "a read sees every operand any thread made"
+            );
+            tx.commit().unwrap();
+            assert_eq!(counter(flavour.db().get(b"k").unwrap()), Some(total));
+        });
+    }
+}
+
+#[test]
+fn threads_putting_one_key_of_a_shared_transaction_read_what_they_commit() {
+    const THREADS: usize = 4;
+    const PUTS: usize = 200;
+    for options in BUFFER_SHAPES {
+        each_flavour(options, |flavour| {
+            let tx = flavour.begin();
+            for i in 0..64 {
+                tx.put(format!("u{i:02}").as_bytes(), b"x").unwrap();
+            }
+            let shared = &tx;
+            std::thread::scope(|scope| {
+                for thread in 0..THREADS {
+                    scope.spawn(move || {
+                        for put in 0..PUTS {
+                            shared
+                                .put(b"k", format!("{thread}/{put}").as_bytes())
+                                .unwrap();
+                        }
+                    });
+                }
+            });
+            // Whichever put landed last, a read and the commit agree on it.
+            let read = reads(&tx, b"k").expect("the key was put");
+            tx.commit().unwrap();
+            assert_eq!(flavour.db().get(b"k").unwrap(), Some(read));
+        });
+    }
 }
 
 #[test]

@@ -11,10 +11,12 @@
 
 use std::collections::BTreeMap;
 use std::io;
+use std::ops::ControlFlow;
 
 use crate::DbSlice;
 use crate::engine::apply_merge;
 use crate::options::MergeOperator;
+use crate::txn_buffer::TxnBuffer;
 
 /// One buffered write of a key.
 #[derive(Clone, Debug)]
@@ -95,19 +97,65 @@ impl KeyWrites {
             return Ok(self.base);
         };
         let operands: Vec<&[u8]> = self.operands.iter().map(Vec::as_slice).collect();
-        let merged = match &self.base {
-            Some(base) => apply_merge(op, key, base.as_deref(), &operands)?,
-            None => {
-                let committed = committed()?;
-                apply_merge(
-                    op,
-                    key,
-                    committed.as_ref().map(DbSlice::as_slice),
-                    &operands,
-                )?
-            }
-        };
-        Ok(Some(Some(merged)))
+        let base = self.base.as_ref().map(Option::as_deref);
+        merged(op, key, base, &operands, committed).map(|value| Some(Some(value)))
+    }
+}
+
+/// What `operands`, oldest first, make of the key they lie on: `base` when the
+/// transaction replaced the key (`None` inside: it deleted it), else what
+/// `committed` reads from the database.
+fn merged(
+    op: &dyn MergeOperator,
+    key: &[u8],
+    base: Option<Option<&[u8]>>,
+    operands: &[&[u8]],
+    committed: impl FnOnce() -> io::Result<Option<DbSlice>>,
+) -> io::Result<Vec<u8>> {
+    match base {
+        Some(base) => apply_merge(op, key, base, operands),
+        None => {
+            let committed = committed()?;
+            apply_merge(op, key, committed.as_ref().map(DbSlice::as_slice), operands)
+        }
+    }
+}
+
+/// What a read of `key` finds in `writes`, the transaction's own buffer, or
+/// `None` when they do not decide it and the caller reads the database.
+/// `Some(None)` is a key the transaction deleted.
+///
+/// The same answer `KeyWrites::apply` gives for the same writes, taken
+/// without copying them: the key's chain is walked in place from its newest
+/// write back to the one that replaced it, and only the value handed back is
+/// copied.
+pub(super) fn read_buffered(
+    writes: &TxnBuffer<Vec<u8>, Write>,
+    merge: Option<&dyn MergeOperator>,
+    key: &[u8],
+    committed: impl FnOnce() -> io::Result<Option<DbSlice>>,
+) -> io::Result<Option<Option<Vec<u8>>>> {
+    let mut operands: Vec<&[u8]> = Vec::new();
+    let mut base: Option<Option<&[u8]>> = None;
+    writes.walk_chain(key, |write| match write {
+        Write::Merge(operand) => {
+            operands.push(operand);
+            ControlFlow::Continue(())
+        }
+        Write::Put(value) => {
+            base = Some(Some(value.as_slice()));
+            ControlFlow::Break(())
+        }
+        Write::Delete => {
+            base = Some(None);
+            ControlFlow::Break(())
+        }
+    });
+    // Newest first as walked; the operator folds them oldest first.
+    operands.reverse();
+    match merge.filter(|_| !operands.is_empty()) {
+        Some(op) => merged(op, key, base, &operands, committed).map(|value| Some(Some(value))),
+        None => Ok(base.map(|base| base.map(<[u8]>::to_vec))),
     }
 }
 
