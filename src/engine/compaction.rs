@@ -447,17 +447,12 @@ fn compaction_loop(
         loop {
             let did_work = {
                 let _guard = compaction_lock.read();
-                // Read the live snapshots on every pass: one may have
-                // dropped since the previous pass, letting more fold. The
-                // pass keeps this list throughout; see
-                // `SnapshotRegistry::live_seqs` for what that covers.
-                let live = snapshot_registry.live_seqs();
                 match pick_and_run_compaction(
                     &versions,
                     &sst_dir,
                     &cache,
                     &opts,
-                    &live,
+                    &snapshot_registry,
                     &in_progress,
                 ) {
                     Ok(outcome) => {
@@ -591,12 +586,12 @@ pub(crate) fn pick_and_run_compaction(
     sst_dir: &Path,
     cache: &BlockCache,
     opts: &CompactionOptions,
-    live: &[u64],
+    snapshots: &SnapshotRegistry,
     in_progress: &crate::sync::Mutex<HashSet<u64>>,
 ) -> std::io::Result<CompactionOutcome> {
     match opts.compaction_style {
         crate::options::CompactionStyle::Level => {
-            pick_and_run_level_compaction(versions, sst_dir, cache, opts, live, in_progress)
+            pick_and_run_level_compaction(versions, sst_dir, cache, opts, snapshots, in_progress)
         }
         crate::options::CompactionStyle::Fifo => {
             // One L0 pool, so there is nothing safe to pick in parallel.
@@ -613,7 +608,7 @@ pub(crate) fn pick_and_run_compaction(
             let Some(claim) = claim_whole_pool(versions, in_progress) else {
                 return Ok(CompactionOutcome::Contended);
             };
-            let result = pick_and_run_universal(versions, sst_dir, cache, opts, live);
+            let result = pick_and_run_universal(versions, sst_dir, cache, opts, snapshots);
             release_claim(in_progress, &claim);
             Ok(outcome(result?))
         }
@@ -643,7 +638,7 @@ fn pick_and_run_universal(
     sst_dir: &Path,
     cache: &BlockCache,
     opts: &CompactionOptions,
-    live: &[u64],
+    snapshots: &SnapshotRegistry,
 ) -> std::io::Result<bool> {
     let universal = opts.universal_compaction_options;
 
@@ -700,7 +695,8 @@ fn pick_and_run_universal(
         let _ = i;
     }
     if group.len() >= min_width {
-        return perform_universal_merge(versions, sst_dir, cache, opts, group, live).map(|_| true);
+        return perform_universal_merge(versions, sst_dir, cache, opts, group, snapshots)
+            .map(|_| true);
     }
 
     // Rule 2 - size amplification. Compute the ratio of "all
@@ -720,7 +716,8 @@ fn pick_and_run_universal(
         .sum();
     let amp_percent = younger_total * 100 / oldest_size;
     if amp_percent >= universal.max_size_amplification_percent as u128 {
-        return perform_universal_merge(versions, sst_dir, cache, opts, by_age, live).map(|_| true);
+        return perform_universal_merge(versions, sst_dir, cache, opts, by_age, snapshots)
+            .map(|_| true);
     }
 
     Ok(false)
@@ -746,7 +743,7 @@ fn perform_universal_merge(
     cache: &BlockCache,
     opts: &CompactionOptions,
     inputs: Vec<Arc<LiveSst>>,
-    live: &[u64],
+    snapshots: &SnapshotRegistry,
 ) -> std::io::Result<()> {
     let mut run_opts = opts.clone();
     run_opts.target_file_size = u64::MAX;
@@ -763,7 +760,7 @@ fn perform_universal_merge(
         0,
         inputs,
         Vec::new(),
-        live,
+        snapshots,
     )
 }
 
@@ -788,7 +785,7 @@ pub(crate) fn run_universal_full_compaction(
     sst_dir: &Path,
     cache: &BlockCache,
     opts: &CompactionOptions,
-    live: &[u64],
+    snapshots: &SnapshotRegistry,
 ) -> std::io::Result<()> {
     let l0_files: Vec<Arc<LiveSst>> = {
         let version = versions.lock().current();
@@ -797,7 +794,7 @@ pub(crate) fn run_universal_full_compaction(
     if l0_files.len() < 2 {
         return Ok(());
     }
-    perform_universal_merge(versions, sst_dir, cache, opts, l0_files, live)
+    perform_universal_merge(versions, sst_dir, cache, opts, l0_files, snapshots)
 }
 
 fn pick_and_run_level_compaction(
@@ -805,21 +802,29 @@ fn pick_and_run_level_compaction(
     sst_dir: &Path,
     cache: &BlockCache,
     opts: &CompactionOptions,
-    live: &[u64],
+    snapshots: &SnapshotRegistry,
     in_progress: &crate::sync::Mutex<HashSet<u64>>,
 ) -> std::io::Result<CompactionOutcome> {
     let version = versions.lock().current();
 
     // Check L0 first
     if version.l0_count() >= opts.l0_compaction_trigger {
-        return compact_l0(versions, sst_dir, cache, opts, live, in_progress);
+        return compact_l0(versions, sst_dir, cache, opts, snapshots, in_progress);
     }
 
     // Check other levels
     for level in 1..MAX_LEVELS - 1 {
         let target = level_target_size(level, opts);
         if version.level_size(level) > target {
-            return compact_level(versions, sst_dir, cache, opts, level, live, in_progress);
+            return compact_level(
+                versions,
+                sst_dir,
+                cache,
+                opts,
+                level,
+                snapshots,
+                in_progress,
+            );
         }
     }
 
@@ -926,10 +931,10 @@ fn compact_l0(
     sst_dir: &Path,
     cache: &BlockCache,
     opts: &CompactionOptions,
-    live: &[u64],
+    snapshots: &SnapshotRegistry,
     in_progress: &crate::sync::Mutex<HashSet<u64>>,
 ) -> std::io::Result<CompactionOutcome> {
-    compact_level(versions, sst_dir, cache, opts, 0, live, in_progress)
+    compact_level(versions, sst_dir, cache, opts, 0, snapshots, in_progress)
 }
 
 /// Compact a level into the next level using the standard size-based
@@ -941,7 +946,7 @@ fn compact_level(
     cache: &BlockCache,
     opts: &CompactionOptions,
     level: usize,
-    live: &[u64],
+    snapshots: &SnapshotRegistry,
     in_progress: &crate::sync::Mutex<HashSet<u64>>,
 ) -> std::io::Result<CompactionOutcome> {
     let target_level = level + 1;
@@ -1012,7 +1017,7 @@ fn compact_level(
         level,
         input_files,
         overlap_files,
-        live,
+        snapshots,
     );
 
     // Always deregister, even on error, so workers don't stall
@@ -1037,7 +1042,7 @@ pub(crate) fn run_compact_range(
     opts: &CompactionOptions,
     start: Option<&[u8]>,
     end: Option<&[u8]>,
-    live: &[u64],
+    snapshots: &SnapshotRegistry,
 ) -> std::io::Result<()> {
     for level in 0..MAX_LEVELS - 1 {
         loop {
@@ -1085,7 +1090,7 @@ pub(crate) fn run_compact_range(
                 level,
                 inputs,
                 overlap_files,
-                live,
+                snapshots,
             )?;
 
             // At L0 we handled every range-overlapping file in one
@@ -1106,9 +1111,10 @@ pub(crate) fn run_compact_range(
 /// files, Add new ones). File descriptors of old files stay alive via
 /// any `Arc<LiveSst>` still referenced by older versions / iterators.
 ///
-/// `live` is the sorted list of live snapshot sequences the key's versions
-/// are cut into stripes at (see the `stripes` module). With no snapshot
-/// live every key is one stripe, and only its newest state is retained.
+/// The live snapshots, read from `snapshots` once the inputs are fixed, cut
+/// the key's versions into stripes (see the `stripes` module). With no
+/// snapshot live every key is one stripe, and only its newest state is
+/// retained.
 #[allow(clippy::too_many_arguments)]
 fn perform_compaction(
     versions: &Arc<VersionStore>,
@@ -1118,7 +1124,7 @@ fn perform_compaction(
     level: usize,
     input_files: Vec<Arc<LiveSst>>,
     overlap_files: Vec<Arc<LiveSst>>,
-    live: &[u64],
+    snapshots: &SnapshotRegistry,
 ) -> std::io::Result<()> {
     // Leveled callers always push down one level.
     perform_compaction_to(
@@ -1130,7 +1136,7 @@ fn perform_compaction(
         level + 1,
         input_files,
         overlap_files,
-        live,
+        snapshots,
     )
 }
 
@@ -1150,7 +1156,7 @@ fn perform_compaction_to(
     target_level: usize,
     input_files: Vec<Arc<LiveSst>>,
     overlap_files: Vec<Arc<LiveSst>>,
-    live: &[u64],
+    snapshots: &SnapshotRegistry,
 ) -> std::io::Result<()> {
     let compaction_start = opts.env.now_micros();
 
@@ -1217,6 +1223,16 @@ fn perform_compaction_to(
         });
     }
 
+    // Read here, with the inputs fixed, never before they are picked. A
+    // snapshot registered before this read is in the list. One registered
+    // after it reads at a sequence at or above every version in the inputs,
+    // and the newest version of every key survives in its stripe, so it
+    // loses nothing. Read before the pick, a snapshot could register and a
+    // newer version be flushed into a table the pass then picks, with the
+    // list none the wiser: both would share a stripe and the older one, the
+    // version that snapshot reads, would be dropped.
+    let live = snapshots.live_seqs();
+
     let CompactionOutputs {
         edits: new_file_edits,
         infos: output_file_infos,
@@ -1229,7 +1245,7 @@ fn perform_compaction_to(
         target_level,
         &input_files,
         &overlap_files,
-        live,
+        &live,
         &merged_range_tombstones,
     )?;
     edits.extend(new_file_edits);

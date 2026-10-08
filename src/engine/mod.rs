@@ -460,7 +460,8 @@ pub(crate) struct RegolithEngine {
     /// can cut each key's versions into stripes no snapshot straddles,
     /// and drop or fold what no reader can see. A snapshot registers
     /// itself on creation and releases on drop; a compaction pass reads
-    /// the list through `live_snapshot_seqs()`.
+    /// the list with [`SnapshotRegistry::live_seqs`] once its inputs are
+    /// fixed.
     snapshot_registry: Arc<SnapshotRegistry>,
     options: EngineOptions,
     /// Bounded ring of writers waiting for a commit group. Writers push a
@@ -1057,13 +1058,6 @@ impl RegolithEngine {
     /// currently pinned.
     pub(crate) fn oldest_live_seq(&self) -> u64 {
         self.snapshot_registry.oldest_live_seq()
-    }
-
-    /// Every live snapshot seq, ascending and distinct: the cuts a
-    /// compaction pass makes between stripes. See
-    /// [`SnapshotRegistry::live_seqs`].
-    pub(crate) fn live_snapshot_seqs(&self) -> Vec<u64> {
-        self.snapshot_registry.live_seqs()
     }
 
     /// Wait for every snapshot pin to be released, returning how many
@@ -1951,15 +1945,12 @@ impl RegolithEngine {
         let outcome = {
             let _guard = self.compaction_lock.read();
             self.ensure_writable()?;
-            // Read the live snapshots per pass: one may have dropped since
-            // the last, letting more fold.
-            let live = self.live_snapshot_seqs();
             compaction::pick_and_run_compaction(
                 &self.versions,
                 &self.sst_dir,
                 &self.cache,
                 &self.options.to_compaction_options(),
-                &live,
+                &self.snapshot_registry,
                 &self.compaction_in_progress,
             )?
         };
@@ -2618,11 +2609,7 @@ impl RegolithEngine {
             }
         }
 
-        // 3. Read the live snapshots so compaction can cut each key's
-        //    versions into stripes at them.
-        let live = self.live_snapshot_seqs();
-
-        // 4. Run the level-by-level push-down.
+        // 3. Run the level-by-level push-down.
         let compaction_opts = self.options.to_compaction_options();
         // Under FIFO compaction there is no level push-down; a
         // synchronous compact_range just flushes the memtable and
@@ -2648,7 +2635,7 @@ impl RegolithEngine {
                 &self.sst_dir,
                 &self.cache,
                 &compaction_opts,
-                &live,
+                &self.snapshot_registry,
             )?;
             return Ok(());
         }
@@ -2660,7 +2647,7 @@ impl RegolithEngine {
             &compaction_opts,
             start,
             end,
-            &live,
+            &self.snapshot_registry,
         )
     }
 

@@ -186,4 +186,6 @@ mod hot_counter;
 #[cfg(test)]
 mod invariant;
 #[cfg(test)]
+mod late_snapshot;
+#[cfg(test)]
 mod tests;
