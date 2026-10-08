@@ -160,8 +160,8 @@ written key is validated only in the optimistic flavour; the
 pessimistic flavour never validates a written key at commit, since the key lock already
 orders it. A `get_for_update` key is validated in both flavours from `SnapshotIsolation`
 up. At every level a key a transactional scan walked that the transaction then writes is
-validated as a read (inside a commutative prefix at `DefraLevel` it is validated as a blind
-write instead, and a content-addressed key is not validated, below), so a scan-then-write
+validated as a read (at `DefraLevel`, a key in a commutative prefix is validated as a blind
+write instead, and a content-addressed key follows the rules below), so a scan-then-write
 never loses an update. A range is not validated
 on its own: a key inserted into a scanned range by a concurrent transaction (a phantom) is
 detected only when the transaction also writes it or validates it as a point read. A scan
@@ -171,26 +171,48 @@ one entry per stretch of keys it walked.
 
 `DefraLevel` is `RepeatableRead` with three relaxations, which apply to optimistic
 transactions only. A pessimistic transaction at this level validates as `RepeatableRead`.
+What the commit validates, by kind of key (the first is `RepeatableRead` itself, the other
+three are the relaxations):
 
+- An ordinary key: every point read of it is validated, whether it found a value or not,
+  and a put or delete of it conflicts with any commit to the key since the transaction
+  began, unless the key already holds what the write would leave.
 - A key the transaction only merges into (it did not read the key, did not walk it in a
-  scan, and did not put or delete it) conflicts only with a newer put, delete or range
-  delete of that key, never with a newer merge operand. Concurrent blind merges to one key
-  all commit, and their operands apply in commit order.
-- With a `KeyClassifier` installed through `OptimisticTransactionDb::with_policy`, the
-  commit disregards a scan stretch that stays inside one `KeyClass::CommutativePrefix`, so
-  a write or merge made there is validated as a blind write instead of as a read. Declare a
-  prefix commutative only when nothing the transaction writes outside it depends on which
-  keys of the prefix the scan returned, and its writes inside it are unique keys or
-  identical rewrites.
-- With the same classifier, no read or write of a key it declares
-  `KeyClass::ContentAddressed` is validated, so two transactions that touch the same such
-  key both commit. The caller's contract is that the key determines its bytes, as a
-  content hash does; regolith cannot check it, and a transaction that writes other bytes
-  under the key commits too, the last commit to land winning.
+  scan, and did not put or delete it) conflicts only with a newer put, delete or covering
+  range delete of that key, never with a newer merge operand. Concurrent blind merges to
+  one key all commit, and their operands apply in commit order. This needs no classifier.
+- A key in a `KeyClass::CommutativePrefix`, with a `KeyClassifier` installed through
+  `OptimisticTransactionDb::with_policy`: a scan stretch that stays inside one such prefix
+  is not recorded, and a put or merge made there, before or after the scan, is validated as
+  a blind write instead of as a read. Declare a prefix commutative only when nothing the
+  transaction writes outside it depends on which keys of the prefix the scan returned, and
+  its writes inside it are unique keys or identical rewrites.
+- A key declared `KeyClass::ContentAddressed`, with the same classifier: a put or merge of
+  it is never validated, nor is a read of a key the transaction puts or merges, so two
+  transactions that create the same key both commit. A delete of it is validated like a
+  delete of an ordinary key. A point read that found it is validated for presence only: it
+  conflicts at commit when the key is gone, and not when a newer put or merge left it
+  there. A read that found nothing is validated in full, so a newer put conflicts. The
+  caller's contract is that the key determines its bytes, as a content hash does; regolith
+  cannot check it, and a transaction that writes other bytes under the key commits too, the
+  last commit to land winning.
+
+A transaction reads its own puts, deletes and merges in the order it made them, and the
+commit applies them in that order: an operand applies to the put or delete before it, and a
+put or delete replaces every operand before it. This changes what a commit stores for a
+merge made before a put of the same key. Earlier versions applied every merge on top of the
+puts, whatever order they were made in; the commit now stores the put alone.
 
 A key that is only merged into does not get snapshot isolation. When every transaction uses
 only point reads, puts, deletes and merges, the committed transactions are serializable in
-commit order. The keys a scan returns are not validated, as at `RepeatableRead`.
+commit order, because every point read is validated; a content-addressed key is outside that
+statement. The keys a scan returns are not validated, as at `RepeatableRead`, so phantoms are
+possible: a key another transaction inserts into a scanned range is detected only when this
+transaction also reads or writes it.
+
+A compaction filter runs in every snapshot stripe, so a filter that changes or removes a
+value changes what a live snapshot, a transaction's included, reads from then on. No commit
+check sees it.
 
 `TransactionDb` is the pessimistic flavour: it takes key locks, so contention waits
 instead of retrying. `OptimisticTransactionDb` validates at commit and retries.
