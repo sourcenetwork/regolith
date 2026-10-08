@@ -34,6 +34,8 @@ pub(crate) mod source_walk;
 pub(crate) mod sstable;
 pub(crate) mod wal;
 pub(crate) mod wal_replay;
+#[cfg(test)]
+mod wal_rotation_tests;
 
 use crate::portability::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::collections::{BTreeMap, HashSet};
@@ -938,6 +940,31 @@ impl RegolithEngine {
             ),
             None => std::io::Error::other("write-ahead log left in an unknown state"),
         }
+    }
+
+    /// Install a new log, named `new_wal_id`, as the active one and hand back
+    /// the log it seals.
+    ///
+    /// Recovery takes the newest log by file name and tolerates a torn tail
+    /// only there, so a log has to be complete on disk before any newer file
+    /// exists, an empty one included, and `Eventual` durability never syncs a
+    /// log on its own. Hence the order, all under the `active_wal` lock so no
+    /// commit appends to the old log in between: sync it, create the new
+    /// file, swap. A failed sync latches the log as unknown, since its tail
+    /// can no longer be vouched for and a retried sync may report success for
+    /// pages the kernel already dropped.
+    fn swap_wal(&self, new_wal_id: u64) -> std::io::Result<Wal> {
+        let mut guard = self.active_wal.lock();
+        let current = guard.as_mut().ok_or_else(Self::read_only_error)?;
+        if let Err(err) = current.sync_data() {
+            drop(guard);
+            tracing::error!(error = %err, "syncing the write-ahead log before sealing it failed");
+            self.latch_wal_failure(&err);
+            self.notify_wal_error(&err);
+            return Err(err);
+        }
+        let new_wal = Wal::create_in(&self.env, &self.wal_dir.join(wal_filename(new_wal_id)))?;
+        guard.replace(new_wal).ok_or_else(Self::read_only_error)
     }
 
     fn validate_prefixed_key_size(&self, key: &[u8]) -> std::io::Result<()> {
@@ -2275,20 +2302,9 @@ impl RegolithEngine {
     /// a fresh WAL, and return it. Caller must hold the pipeline mutex.
     fn seal_active(&self) -> std::io::Result<Arc<MemTable>> {
         self.ensure_writable()?;
-        // One publication: the sealed memtable joins `frozen` in the
-        // same view that hands writers the fresh active one, so no
-        // reader can catch it in neither. The fresh memtable is built
-        // before the publication so the fallible allocation happens
-        // once, outside it.
+        // Everything fallible happens before the publication, so a rotation
+        // that fails leaves the view as it was.
         let fresh = Arc::new(MemTable::new(&self.memtable_config)?);
-        let sealed = self.view.update_memtables(|active, frozen| {
-            let sealed = Arc::clone(active);
-            let mut next_frozen = frozen.to_vec();
-            next_frozen.push(Arc::clone(&sealed));
-            (fresh, next_frozen, sealed)
-        });
-        sealed.seal_seq(self.latest_seq.load(Ordering::Acquire));
-
         let new_wal_id = {
             let mut versions = self.versions.lock();
             let version = versions.current();
@@ -2296,14 +2312,18 @@ impl RegolithEngine {
             versions.apply(&[VersionEdit::SetNextFileId(id + 1)])?;
             id
         };
+        let old_wal = self.swap_wal(new_wal_id)?;
 
-        let wal_path = self.wal_dir.join(wal_filename(new_wal_id));
-        let new_wal = Wal::create_in(&self.env, &wal_path)?;
-
-        let old_wal = {
-            let mut wal = self.active_wal.lock();
-            wal.replace(new_wal).ok_or_else(Self::read_only_error)?
-        };
+        // One publication: the sealed memtable joins `frozen` in the
+        // same view that hands writers the fresh active one, so no
+        // reader can catch it in neither.
+        let sealed = self.view.update_memtables(|active, frozen| {
+            let sealed = Arc::clone(active);
+            let mut next_frozen = frozen.to_vec();
+            next_frozen.push(Arc::clone(&sealed));
+            (fresh, next_frozen, sealed)
+        });
+        sealed.seal_seq(self.latest_seq.load(Ordering::Acquire));
 
         self.wal_id.store(new_wal_id, Ordering::Release);
         // The log that was active while `sealed` took writes is the one
@@ -3490,13 +3510,12 @@ impl RegolithEngine {
                     versions.apply(&[VersionEdit::SetNextFileId(id + 1)])?;
                     id
                 };
-                let wal_for_flush =
-                    Wal::create_in(&self.env, &self.wal_dir.join(wal_filename(new_wal_id)))?;
+                let fresh = Arc::new(MemTable::new(&self.memtable_config)?);
+                let old_wal = self.swap_wal(new_wal_id)?;
 
                 // One publication for the seal and the enqueue: two
                 // would leave a window where the sealed memtable is in
                 // neither the active slot nor the frozen list.
-                let fresh = Arc::new(MemTable::new(&self.memtable_config)?);
                 let sealed = self.view.update_memtables(|active, frozen| {
                     let sealed = Arc::clone(active);
                     let mut next_frozen = frozen.to_vec();
@@ -3505,11 +3524,6 @@ impl RegolithEngine {
                 });
                 sealed.seal_seq(self.latest_seq.load(Ordering::Acquire));
 
-                let old_wal = self
-                    .active_wal
-                    .lock()
-                    .replace(wal_for_flush)
-                    .ok_or_else(Self::read_only_error)?;
                 self.wal_id.store(new_wal_id, Ordering::Release);
                 sealed.seal_wal(old_wal.path().to_path_buf());
                 targets.push(sealed);
