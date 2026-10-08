@@ -393,7 +393,7 @@ mod tests {
     }
 
     #[test]
-    fn only_a_defra_transaction_with_a_policy_has_a_classifier() {
+    fn only_a_defra_level_transaction_with_a_policy_has_a_classifier() {
         let policy: Option<Arc<dyn KeyClassifier>> = Some(Arc::new(ByFirstByte));
         for level in [
             IsolationLevel::ReadCommitted,
