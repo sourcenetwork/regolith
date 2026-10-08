@@ -1162,7 +1162,7 @@ impl RegolithEngine {
         let view = self.view.load();
         let lk = LookupKey::from_prefixed(key, self.visible_seq.visible());
         if self.options.merge_operator.is_some() {
-            return Ok(self.get_with_merge(&lk)?.map(DbSlice::into_vec));
+            return Ok(self.get_with_merge(&lk, &view)?.map(DbSlice::into_vec));
         }
         Ok(self
             .lookup_in_view(
@@ -1320,14 +1320,14 @@ impl RegolithEngine {
         materialize: Materialize,
     ) -> std::io::Result<Option<PointValue>> {
         self.ensure_open()?;
+        let view = self.view.load();
         if self.options.merge_operator.is_some() {
             Self::reject_guarded_merge(materialize)?;
             // A merge operator decides inside `full_merge` whether a
             // value exists at all, so a length-only request has to
             // collapse the chain exactly like a full read does.
-            return Ok(self.get_with_merge(lk)?.map(PointValue::Value));
+            return Ok(self.get_with_merge(lk, &view)?.map(PointValue::Value));
         }
-        let view = self.view.load();
         self.lookup_in_view(
             lk.prefixed_user_key(),
             lk.snapshot_seq(),
@@ -1363,7 +1363,7 @@ impl RegolithEngine {
         let snapshot_seq = lk.snapshot_seq();
         if self.options.merge_operator.is_some() {
             Self::reject_guarded_merge(materialize)?;
-            return Ok(self.get_with_merge(&lk)?.map(PointValue::Value));
+            return Ok(self.get_with_merge(&lk, &view)?.map(PointValue::Value));
         }
         self.lookup_in_view(
             lk.prefixed_user_key(),
@@ -1489,10 +1489,14 @@ impl RegolithEngine {
     /// [`crate::MergeOperator::full_merge`] at the end to materialize
     /// the final value.
     ///
+    /// Resolved against the caller's `view`, never one loaded here: the
+    /// caller chose `lk`'s sequence against that view, and a later one
+    /// may have had the version that sequence admits compacted away.
+    ///
     /// Callers are responsible for having checked that
     /// `self.options.merge_operator.is_some()`; this helper asserts
     /// internally.
-    fn get_with_merge(&self, lk: &LookupKey) -> std::io::Result<Option<DbSlice>> {
+    fn get_with_merge(&self, lk: &LookupKey, view: &ReadView) -> std::io::Result<Option<DbSlice>> {
         use internal_key::{VALUE_TYPE_DELETION, VALUE_TYPE_MERGE, VALUE_TYPE_VALUE};
 
         let merge_op = self
@@ -1501,9 +1505,8 @@ impl RegolithEngine {
             .as_ref()
             .expect("get_with_merge called without a merge operator");
 
-        let view = self.view.load();
         let key = lk.prefixed_user_key();
-        let mut chain = self.merge_chain_in_view(lk, &view)?;
+        let mut chain = self.merge_chain_in_view(lk, view)?;
         // Materialize the chain. `chain` is newest-first; the last
         // entry (if any) is either a real VALUE / DELETION terminator
         // or (if !terminated) the oldest visible merge operand.
@@ -1586,7 +1589,7 @@ impl RegolithEngine {
             let mut lk = LookupKey::from_prefixed(&[], snapshot_seq);
             for key in keys {
                 lk.reset_prefixed(key, snapshot_seq);
-                out.push(self.get_with_merge(&lk)?.map(DbSlice::into_vec));
+                out.push(self.get_with_merge(&lk, view)?.map(DbSlice::into_vec));
             }
             return Ok(out);
         }
