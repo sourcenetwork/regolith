@@ -80,7 +80,9 @@
 //! [`KeyClass::CommutativePrefix`] at [`IsolationLevel::DefraLevel`] with a
 //! [`KeyClassifier`] installed: a write there is validated as a blind write.
 //! The other is a key that classifier declares [`KeyClass::ContentAddressed`]:
-//! at that level no read or write of it is validated at all.
+//! at that level a put or merge of it is not validated, a read of it that
+//! found a value is validated for its presence only, and a delete of it, or a
+//! read that found nothing, is validated as for any key.
 //!
 //! # Out of scope (follow-ups)
 //!
@@ -210,9 +212,11 @@ impl OptimisticTransactionDb {
     /// validated as there. With one, the commit disregards a scan stretch
     /// that stays inside one [`KeyClass::CommutativePrefix`], so a write or
     /// merge the transaction makes inside that stretch is validated as a
-    /// blind write instead of as a read. It validates no read or write of a
-    /// [`KeyClass::ContentAddressed`] key at all, so two transactions that
-    /// touch the same such key both commit.
+    /// blind write instead of as a read. It does not validate a put or merge
+    /// of a [`KeyClass::ContentAddressed`] key, nor a read of a key the
+    /// transaction puts or merges, and validates a read of one that found it
+    /// for presence only, so two transactions that create the same such key
+    /// both commit while a delete of it is still checked.
     ///
     /// This is safe only when nothing the transaction writes outside the
     /// prefix depends on which keys of the prefix the scan returned, its
@@ -431,7 +435,8 @@ pub enum ScanDirection {
 /// point reads, puts, deletes and merges, the committed transactions are
 /// serializable in commit order. The keys a scan returns are not validated.
 /// A key the installed classifier declares [`KeyClass::ContentAddressed`] is
-/// not validated at all, so transactions that touch it all commit.
+/// outside that statement: transactions that create it all commit, and a read
+/// that found it holds as long as the key is not deleted.
 ///
 /// Every level reads from a snapshot captured when the transaction
 /// began, so none of them can observe a dirty read. What changes is the
@@ -515,31 +520,58 @@ pub enum IsolationLevel {
     /// optimistic transactions only. A pessimistic transaction at this
     /// level validates exactly as at `RepeatableRead`.
     ///
+    /// What the commit validates, by kind of key (the first is
+    /// `RepeatableRead` itself, the other three are the relaxations):
+    ///
+    /// - An ordinary key. Every point read of it is validated, whether it
+    ///   found a value or not, and a put or delete of it conflicts with any
+    ///   commit to the key since the transaction began, unless the key
+    ///   already holds what the write would leave.
     /// - Blind merges commute. A key the transaction only merges into (it
     ///   did not read the key, did not walk it in a scan, and did not put or
-    ///   delete it) conflicts only with a newer put, delete or range delete
-    ///   of that key, never with a newer merge operand. Concurrent blind
-    ///   merges to one key all commit, and their operands apply in commit
-    ///   order.
+    ///   delete it) conflicts only with a newer put, delete or covering
+    ///   range delete of that key, never with a newer merge operand.
+    ///   Concurrent blind merges to one key all commit, and their operands
+    ///   apply in commit order. This needs no classifier.
     /// - Commutative prefixes. With a [`KeyClassifier`] installed through
-    ///   [`OptimisticTransactionDb::with_policy`], the commit disregards a
-    ///   scan stretch that stays inside one [`KeyClass::CommutativePrefix`],
-    ///   so a write or merge the transaction makes inside that stretch is
-    ///   validated as a blind write instead of as a read.
+    ///   [`OptimisticTransactionDb::with_policy`], a scan stretch that stays
+    ///   inside one [`KeyClass::CommutativePrefix`] is not recorded, and a
+    ///   put or merge the transaction makes inside it, before or after the
+    ///   scan, is validated as a blind write instead of as a read.
     ///   [`KeyClass::CommutativePrefix`] states when that is safe.
-    /// - Content-addressed keys. With the same classifier, no read or write
-    ///   of a key it declares [`KeyClass::ContentAddressed`] is validated, so
-    ///   two transactions that touch the same such key both commit.
-    ///   [`KeyClass::ContentAddressed`] states the caller's contract.
+    /// - Content-addressed keys. With the same classifier, a put or merge of
+    ///   a key it declares [`KeyClass::ContentAddressed`] is never
+    ///   validated, nor is a read of a key the transaction puts or merges,
+    ///   so two transactions that create the same key both commit. A delete
+    ///   of it is validated like a delete of an ordinary key. A point read
+    ///   that found it is validated for presence only: it conflicts at
+    ///   commit when the key is gone, and not when a newer put or merge left
+    ///   it there. A read that found nothing is validated in full, so a
+    ///   newer put conflicts. [`KeyClass::ContentAddressed`] states the
+    ///   caller's contract.
+    ///
+    /// A transaction reads its own puts, deletes and merges in the order it
+    /// made them, and the commit applies them in that order: an operand
+    /// applies to the put or delete before it, and a put or delete replaces
+    /// every operand before it. That changes what a commit stores for a merge
+    /// made before a put of the same key. Earlier versions applied every
+    /// merge on top of the puts, whatever order they were made in; the
+    /// commit now stores the put alone.
     ///
     /// A key that is only merged into does not get snapshot isolation:
     /// first committer wins does not apply to merge operands. When every
     /// transaction uses only point reads, puts, deletes and merges, the
     /// committed transactions are serializable in commit order, because
-    /// every point read is validated. The keys a scan returns are not
-    /// validated, as at `RepeatableRead`, so phantoms are possible. A
-    /// content-addressed key is outside that statement: nothing about it is
-    /// validated.
+    /// every point read is validated; a content-addressed key is outside
+    /// that statement. The keys a scan returns are not validated, as at
+    /// `RepeatableRead`, so phantoms are possible: a key another transaction
+    /// inserts into a scanned range is detected only when this transaction
+    /// also reads or writes it.
+    ///
+    /// A [`crate::CompactionFilter`] runs in every snapshot stripe, so a
+    /// filter that changes or removes a value changes what a live snapshot,
+    /// a transaction's included, reads from then on. No commit check sees
+    /// it.
     DefraLevel,
 }
 
@@ -760,8 +792,9 @@ impl<'db> Transaction<'db> {
     /// [`Transaction::get`] without copying the value.
     ///
     /// The returned [`DbSlice`] borrows the bytes the database already
-    /// holds, or the buffered write this transaction made. Nothing is
-    /// materialized on the way out.
+    /// holds. A value the transaction wrote itself, or that its merge
+    /// operands build, is copied out of the write buffer first, since the
+    /// buffer cannot lend it.
     pub fn get_slice(&self, key: &[u8]) -> TxResult<Option<DbSlice>> {
         let prefixed = prefix_key(DEFAULT_CF_ID, key);
         let committed = || self.read_committed(&prefixed);
@@ -825,10 +858,11 @@ impl<'db> Transaction<'db> {
     /// A key the transaction merged into is yielded as [`Transaction::get`]
     /// reads it, the operands applied by the configured
     /// [`crate::MergeOperator`], and a key the snapshot does not hold appears
-    /// with them applied to nothing. The value the operands apply to is read,
-    /// and recorded as a read, when the scan reaches the key. A merge the
-    /// operator declines ends the stream, and [`TxnScanStream::status`] says
-    /// why.
+    /// with them applied to nothing. The value the operands apply to is read
+    /// when the scan reaches the key, as the snapshot key it is: it joins the
+    /// stretch and is recorded as a read only where a scan records every key.
+    /// A merge the operator declines ends the stream, and
+    /// [`TxnScanStream::status`] says why.
     ///
     /// What the scan leaves in the transaction depends on the level. Below
     /// [`IsolationLevel::Serializable`] it records each unbroken stretch of
@@ -850,7 +884,11 @@ impl<'db> Transaction<'db> {
     /// validated as a blind write. At `Serializable` a concurrent commit to
     /// any yielded key also aborts the transaction. Keys yielded from the
     /// transaction's own buffered writes are not recorded and end a stretch,
-    /// as `get` does not record them either. A key a pessimistic transaction
+    /// as `get` does not record them either. The exception is a key the
+    /// transaction merged into and did not put or delete: its base is a
+    /// snapshot key, so it joins the stretch and records no read below
+    /// Serializable, where `get` of such a key records one. A key a
+    /// pessimistic transaction
     /// already locked through [`Transaction::get_for_update`] is served where
     /// `get` serves it, at the lock horizon. A key a concurrent transaction
     /// inserts into the range is not detected unless this transaction
@@ -1451,7 +1489,8 @@ type BufferedWrites = std::iter::Peekable<std::vec::IntoIter<(Vec<u8>, KeyWrites
 /// entries it yields is recorded in the transaction once, as the first and
 /// the last key of the stretch (per key as well at Serializable); entries
 /// that come from the transaction's own writes are not recorded and end the
-/// stretch.
+/// stretch, except a merged key whose operands lie on a snapshot entry, which
+/// joins it.
 pub struct TxnScanStream<'txn> {
     /// The transaction this scan reads for: its stretches are registered
     /// there, and a key it already promoted through `get_for_update` is
@@ -1480,8 +1519,9 @@ impl TxnScanStream<'_> {
     /// entries handed out are the transaction's buffered writes merged with
     /// a *prefix* of what the database holds, and the rest was never read,
     /// or a read of a key this transaction already locked through
-    /// [`Transaction::get_for_update`] failed, or the merge operator declined
-    /// a key the transaction merged into.
+    /// [`Transaction::get_for_update`] failed, or reading the value a merge
+    /// builds on failed, or the merge operator declined a key the transaction
+    /// merged into.
     ///
     /// A merged stream cannot report this any other way. `Iterator` has
     /// nowhere to put a failure, and a cursor that dies mid-range goes
@@ -1657,7 +1697,7 @@ impl TxnScanStream<'_> {
             Err(e) => {
                 tracing::error!(
                     error = %e,
-                    "transaction scan ended early: a merge failed mid-range, \
+                    "transaction scan ended early: reading a merged key failed mid-range, \
                      so the rows returned are a prefix and not the range"
                 );
                 self.error = Some(e);

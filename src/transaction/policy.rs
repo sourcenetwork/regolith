@@ -4,9 +4,10 @@
 //! keyspace makes some conflicts harmless says so through a
 //! [`KeyClassifier`], and the level relaxes validation for those keys on the
 //! caller's word: a scan inside a commutative prefix is not validated as a
-//! read, and a content-addressed key is not validated at all. Anything else
-//! is validated as at [`IsolationLevel::RepeatableRead`]. The classifier does
-//! not govern blind merges, which commute at this level for every key.
+//! read, a put or merge of a content-addressed key is not validated, and a
+//! read of one that found it is validated for its presence only. Anything
+//! else is validated as at [`IsolationLevel::RepeatableRead`]. The classifier
+//! does not govern blind merges, which commute at this level for every key.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -35,12 +36,12 @@ pub enum KeyClass {
     /// stretch that stays inside one such prefix. The keys that scan
     /// returned are not validated as reads, as for any scan at
     /// [`IsolationLevel::RepeatableRead`]. A write or merge the transaction
-    /// makes inside that stretch is validated as a blind write instead of
-    /// as a read: an identical rewrite of a key's current value commits,
-    /// and a merge there is blind. A write still conflicts with a newer
-    /// commit to its key, a removal included, unless the key already holds
-    /// exactly what the write would store. A stretch that leaves the prefix
-    /// is recorded as at `RepeatableRead`.
+    /// makes inside that stretch, before or after the scan, is validated as
+    /// a blind write instead of as a read: an identical rewrite of a key's
+    /// current value commits, and a merge there is blind. A write still
+    /// conflicts with a newer commit to its key, a removal included, unless
+    /// the key already holds exactly what the write would store. A stretch
+    /// that leaves the prefix is recorded as at `RepeatableRead`.
     ///
     /// Declare a prefix commutative only when nothing the transaction
     /// writes outside it depends on which keys of the prefix the scan
@@ -58,11 +59,28 @@ pub enum KeyClass {
     ///
     /// This class has an effect only for an optimistic transaction at
     /// [`IsolationLevel::DefraLevel`] with a [`KeyClassifier`] installed.
-    /// There, no read or write of such a key is ever validated. A `get`, a
-    /// `get_for_update` or a scan that returns it records no read of it, and
-    /// a put, delete or merge of it is never checked against newer writes, so
-    /// two transactions that touch the same such key both commit. Other
-    /// levels, and transactions without a classifier, are unchanged.
+    /// There:
+    ///
+    /// - A put or merge of the key is never checked against newer writes, and
+    ///   neither is a read of a key the transaction puts or merges, so two
+    ///   transactions that create the same key both commit. The newest write
+    ///   of a key decides: a key the transaction deletes and then puts or
+    ///   merges counts as put or merged.
+    /// - A delete of the key is validated like a delete of any other key: it
+    ///   conflicts with a commit to the key since the transaction began,
+    ///   unless the key already holds what the delete would leave.
+    /// - A `get`, a `get_slice` or a `get_for_update` that found the key is
+    ///   validated for its presence only. It conflicts at commit when the key
+    ///   is gone, because a delete or a range delete over it is the newest
+    ///   write, and not when a newer put or merge left it there. One that
+    ///   found nothing is validated like a read of any other key, so a newer
+    ///   put conflicts.
+    /// - A scan that returns the key records no read of it, as for any scan at
+    ///   [`IsolationLevel::RepeatableRead`]. A key the transaction puts or
+    ///   merges inside a scanned stretch is not validated as a read either,
+    ///   while one it deletes there is, as for any key.
+    ///
+    /// Other levels, and transactions without a classifier, are unchanged.
     ///
     /// The caller's contract is that the bytes under the key never differ.
     /// regolith cannot check it: a transaction that writes other bytes under
@@ -74,9 +92,11 @@ pub enum KeyClass {
 /// Classifies keys for [`IsolationLevel::DefraLevel`].
 ///
 /// `classify` sees the key as the caller wrote it, without regolith's
-/// column-family prefix, and must be pure, deterministic and cheap: commit
-/// calls it while holding the transaction, once per scan stretch and once for
-/// each key the transaction reads, writes or merges.
+/// column-family prefix. It must be pure, deterministic and allocation-free:
+/// commit calls it while it holds the transaction and before it takes the
+/// write pipeline, at most once for the start of each scan stretch and at
+/// most once for each distinct key the transaction reads, puts, deletes or
+/// merges.
 pub trait KeyClassifier: Send + Sync {
     /// The class `key` belongs to.
     fn classify(&self, key: &[u8]) -> KeyClass;
