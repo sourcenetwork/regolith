@@ -318,13 +318,14 @@ impl MemTable {
         Some((seq, value))
     }
 
-    /// [`MemTable::get`] without the value: the sequence of the newest entry
-    /// of any kind (value, tombstone or merge operand) for `lk`'s key at or
-    /// below its snapshot. No arena `Arc` is cloned and no byte is copied,
-    /// which is what commit validation wants: it only asks whether the key
-    /// was written again, never what it holds.
-    pub(crate) fn latest_seq(&self, lk: &LookupKey) -> Option<u64> {
-        self.newest_visible(lk).map(|(_, seq, _)| seq)
+    /// [`MemTable::get`] without the value: the sequence and value type of
+    /// the newest entry of any kind (value, tombstone or merge operand) for
+    /// `lk`'s key at or below its snapshot. No arena `Arc` is cloned and no
+    /// byte is copied, which is what commit validation wants: it asks
+    /// whether and how the key was written again, never what it holds.
+    pub(crate) fn latest_version(&self, lk: &LookupKey) -> Option<(u64, u8)> {
+        self.newest_visible(lk)
+            .map(|(_, seq, value_type)| (seq, value_type))
     }
 
     /// A zero-copy view of one node's value, keeping the arena alive for
