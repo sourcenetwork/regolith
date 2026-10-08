@@ -307,16 +307,27 @@ chaos instances="4" rounds="2" versions="120" min_rounds="20":
 # RED one that does not break exactly its invariant, fails the recipe: the RED
 # rows are what make the GREEN ones mean anything, and a RED row that fails
 # for some other reason shows nothing.
+# The storage-engine models follow, each backed by a Lean proof in
+# `proofs/lean` that holds for every size where TLC checks a few:
+# `LsmOrder.tla` (E1, compact_range picks a closed L0 input set),
+# `BatchRead.tla` (E6, one view per batch read), `IngestPublication.tla`
+# (E8, the visible sequence never passes a pending slot) and
+# `WalRotation.tla` (E2, a rotation syncs the sealed log first).
+# Each row prints the distinct states TLC explored and its wall time.
 # TLC is fetched on first use, pinned by checksum in `proofs/tla/tools/tlc`.
 tla:
     #!/usr/bin/env bash
     set -uo pipefail
     cd proofs/tla
     fail=0
+    # The module the next rows check; each block below sets it.
+    spec=RepeatableRead
     check() {
-        local cfg="$1" expect="$2" inv="${3:-}" out broke verdict
-        out=$(./tools/tlc -metadir "states/$cfg" -config "$cfg.cfg" RepeatableRead.tla 2>&1)
+        local cfg="$1" expect="$2" inv="${3:-}" out broke verdict states took
+        out=$(./tools/tlc -metadir "states/$cfg" -config "$cfg.cfg" "$spec.tla" 2>&1)
         broke=$(sed -n 's/^Error: Invariant \(.*\) is violated\.$/\1/p' <<<"$out" | head -1)
+        states=$(sed -n 's/^.* states generated, \([0-9,]*\) distinct states found.*$/\1/p' <<<"$out" | tail -1)
+        took=$(sed -n 's/^Finished in \(.*\) at (.*$/\1/p' <<<"$out" | tail -1)
         if grep -q "No error has been found" <<<"$out"; then
             verdict=GREEN
         elif [ -n "$broke" ] && [ "$broke" = "$inv" ]; then
@@ -327,7 +338,8 @@ tla:
             verdict=BROKEN
             echo "$out" | tail -20
         fi
-        printf '  %-48s %-6s (expected %s)\n' "$cfg" "$verdict" "$expect${inv:+ on $inv}"
+        printf '  %-48s %-6s %9s states %8s  (expected %s)\n' \
+            "$cfg" "$verdict" "${states:-?}" "${took:-?}" "$expect${inv:+ on $inv}"
         if [ "$verdict" != "$expect" ]; then fail=1; fi
     }
     check MC_RepeatableRead_Green                      GREEN
@@ -348,8 +360,50 @@ tla:
     check MC_DefraLevel_Red_RangeDeleteNotReplacement  RED INV_CounterExact
     check MC_DefraLevel_Red_PolicyIgnoresRange         RED INV_NoStaleDefinition
     check MC_DefraLevel_Red_DefinitionContentAddressed RED INV_NoStaleDefinition
+    # E1. Lean: Regolith/LsmOrder.lean, compact_range_reads_newest.
+    spec=LsmOrder
+    check MC_LsmOrder_Green                            GREEN
+    check MC_LsmOrder_Red_Intersect                    RED ReadNewest
+    # E6. Lean: Regolith/BatchView.lean, batch_one_view_newest.
+    spec=BatchRead
+    check MC_BatchRead_Green                           GREEN
+    check MC_BatchRead_Red_ViewPerKey                  RED BatchConsistent
+    check MC_BatchRead_Red_ViewPerKey_Exact            RED BatchExact
+    # E8. Lean: Regolith/Publication.lean, repeatable_snapshot.
+    spec=IngestPublication
+    check MC_IngestPublication_Green                   GREEN
+    check MC_IngestPublication_Red_CommitPassesSlot    RED RepeatableSnapshot
+    check MC_IngestPublication_Red_IngestPublishesEarly RED RepeatableSnapshot
+    # E2. Lean: Regolith/WalRecovery.lean, reachable_recovers_prefix.
+    spec=WalRotation
+    check MC_WalRotation_Green                         GREEN
+    check MC_WalRotation_Red_NoSync                    RED RecoversPrefix
+    check MC_WalRotation_Red_NoSync_Gap                RED NoGap
     rm -rf states ./*_TTrace_*.tla ./*_TTrace_*.bin
     exit $fail
+
+# `proofs/lean` is a Lake project named Regolith, plain Lean 4 core with no
+# dependencies, so it builds offline. Each module proves for every size what
+# a TLA+ model above checks for a few, and names that model in its header.
+# The build treats every warning as an error, so a proof left open fails it;
+# the grep refuses the placeholder words outright; and `Audit.lean` fails
+# unless every Regolith declaration rests on Lean's three standard
+# assumptions alone. elan provides the toolchain `lean-toolchain` pins.
+# Build and audit the Lean proofs in proofs/lean.
+lean:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    export PATH="$HOME/.elan/bin:$PATH"
+    cd proofs/lean
+    lake build
+    if grep -rnwE --include='*.lean' --exclude-dir=.lake 'sorry|admit|axiom' .; then
+        echo "error: proofs/lean holds sorry, admit or axiom; every proof must be complete" >&2
+        exit 1
+    fi
+    lake env lean Audit.lean
+
+# Every formal check: the TLA+ models and the Lean proofs.
+proofs: tla lean
 
 # ---------- consistency ----------
 
