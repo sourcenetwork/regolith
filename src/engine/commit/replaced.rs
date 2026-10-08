@@ -10,16 +10,16 @@ use crate::WriteBatchOp;
 /// Borrows the batch in the layout `grouped_batch_ops` builds, so a lookup
 /// is a binary search over the sorted point operations plus a scan of the
 /// range deletes, and building it allocates nothing.
-pub(super) struct Replaced<'a> {
-    points: &'a [WriteBatchOp],
-    ranges: &'a [WriteBatchOp],
+pub(super) struct Replaced<'batch> {
+    points: &'batch [WriteBatchOp],
+    ranges: &'batch [WriteBatchOp],
 }
 
-impl<'a> Replaced<'a> {
+impl<'batch> Replaced<'batch> {
     /// Split `ops` into its point operations and its range deletes. `ops`
     /// must be laid out as `grouped_batch_ops` lays it out; debug builds
     /// check that.
-    pub(super) fn of(ops: &'a [WriteBatchOp]) -> Self {
+    pub(super) fn of(ops: &'batch [WriteBatchOp]) -> Self {
         let (points, rest) = ops.split_at(ops.partition_point(is_point));
         let ranges =
             &rest[..rest.partition_point(|op| matches!(op, WriteBatchOp::DeleteRange { .. }))];

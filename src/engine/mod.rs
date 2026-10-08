@@ -182,9 +182,11 @@ fn apply_batch_op_to_memtable<'a>(
     }
 }
 
-/// A key's visible entries, newest first, as `(seq, value_type, value)`,
-/// through its first terminator.
-type MergeChain = Vec<(u64, u8, DbSlice)>;
+/// One version of a key: its sequence, value type and value.
+pub(crate) type KeyVersion = (u64, u8, DbSlice);
+
+/// A key's visible versions, newest first, through its first terminator.
+pub(crate) type MergeChain = Vec<KeyVersion>;
 
 struct MultiGetEntry {
     key: Vec<u8>,

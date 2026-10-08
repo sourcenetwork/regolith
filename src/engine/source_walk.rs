@@ -13,12 +13,25 @@ use super::read_view::ReadView;
 use super::sstable::SsTableReader;
 
 /// One source a key's entries can come from.
-pub(crate) enum Source<'a> {
+pub(crate) enum Source<'view> {
     /// The active memtable or a frozen one.
-    Memtable(&'a MemTable),
+    Memtable(&'view MemTable),
     /// One SSTable that may hold the key.
-    Table(&'a SsTableReader),
+    Table(&'view SsTableReader),
 }
+
+/// What visiting one source returns: break to stop the walk there.
+pub(crate) type VisitResult<B> = io::Result<ControlFlow<B>>;
+
+/// How a walk ended: broken with a visit's value, or carried past every
+/// source with the newest covering range-tombstone sequence.
+pub(crate) type WalkResult<B> = io::Result<ControlFlow<B, u64>>;
+
+/// Visits one source of a view with the newest sequence of a range
+/// tombstone covering the key seen so far.
+pub(crate) trait VisitSource<'view, B>: FnMut(Source<'view>, u64) -> VisitResult<B> {}
+
+impl<'view, B, F> VisitSource<'view, B> for F where F: FnMut(Source<'view>, u64) -> VisitResult<B> {}
 
 impl ReadView {
     /// Visits the sources of this view that may hold `key`, newest first: the
@@ -32,12 +45,12 @@ impl ReadView {
     /// source was visited, the walk continues with the final tombstone
     /// sequence.
     #[inline]
-    pub(crate) fn walk_newest_first<B>(
-        &self,
+    pub(crate) fn walk_newest_first<'view, B>(
+        &'view self,
         key: &[u8],
         snapshot_seq: u64,
-        mut visit: impl FnMut(Source<'_>, u64) -> io::Result<ControlFlow<B>>,
-    ) -> io::Result<ControlFlow<B, u64>> {
+        mut visit: impl VisitSource<'view, B>,
+    ) -> WalkResult<B> {
         let mut max_rt_seq: u64 = 0;
 
         for mt in std::iter::once(&self.active).chain(self.frozen.iter().rev()) {
