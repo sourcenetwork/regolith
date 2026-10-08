@@ -119,23 +119,19 @@ impl Read {
 /// A way to take `b/block` away from under a reader.
 #[derive(Clone, Copy, Debug)]
 enum Removal {
-    PlainDelete,
-    PlainRangeDelete,
-    TransactionDelete,
+    Delete,
+    DeleteRange,
+    InTransaction,
 }
 
 impl Removal {
-    const ALL: [Self; 3] = [
-        Self::PlainDelete,
-        Self::PlainRangeDelete,
-        Self::TransactionDelete,
-    ];
+    const ALL: [Self; 3] = [Self::Delete, Self::DeleteRange, Self::InTransaction];
 
     fn apply(self, db: &OptimisticTransactionDb) {
         match self {
-            Self::PlainDelete => db.db().delete(b"b/block").unwrap(),
-            Self::PlainRangeDelete => db.db().delete_range(b"b/", b"b0").unwrap(),
-            Self::TransactionDelete => {
+            Self::Delete => db.db().delete(b"b/block").unwrap(),
+            Self::DeleteRange => db.db().delete_range(b"b/", b"b0").unwrap(),
+            Self::InTransaction => {
                 let collector = db.begin_transaction_with(IsolationLevel::DefraLevel);
                 collector.delete(b"b/block").unwrap();
                 collector.commit().unwrap();
