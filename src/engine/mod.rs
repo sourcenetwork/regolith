@@ -25,12 +25,14 @@ pub(crate) mod read_horizon;
 pub(crate) mod read_view;
 pub(crate) mod skiplist;
 pub(crate) mod snapshot_registry;
+pub(crate) mod source_walk;
 pub(crate) mod sstable;
 pub(crate) mod wal;
 pub(crate) mod wal_replay;
 
 use crate::portability::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::collections::{BTreeMap, HashSet};
+use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -51,6 +53,7 @@ use read_horizon::ReadHorizon;
 use read_view::{ReadView, ReadViewCell, VersionStore};
 use skiplist::InsertHint;
 use snapshot_registry::SnapshotRegistry;
+use source_walk::Source;
 
 use crate::env::{Capabilities, Env, FileLock};
 use crate::{DbSlice, WriteBatchOp, event_listener};
@@ -1340,248 +1343,93 @@ impl RegolithEngine {
         materialize: Materialize,
         view: &ReadView,
     ) -> std::io::Result<Option<PointValue>> {
-        let mut max_rt_seq: u64 = 0;
+        use crate::perf_context::{PerfTimer, PerfTimerField};
 
         // Memtable phase - timed via `PerfContext` at
         // `PerfLevel::EnableTime` so per-op breakdowns can
-        // attribute time to "memtable vs SSTable".
-        {
-            let _t = crate::perf_context::PerfTimer::new(
-                crate::perf_context::PerfTimerField::GetFromMemtable,
-            );
-            {
-                let active = &view.active;
-                let rt = active.covering_range_tombstone_seq(key, snapshot_seq);
-                if rt > max_rt_seq {
-                    max_rt_seq = rt;
-                }
-                if let Some((pseq, popt)) = active.get(lk) {
-                    return Ok(if pseq > max_rt_seq {
-                        popt.map(|v| PointValue::of(v, materialize))
+        // attribute time to "memtable vs SSTable". The first table the
+        // walk reaches starts the SSTable phase: everything from there is
+        // the "get_from_output_files" time.
+        let mut timer = PerfTimer::new(PerfTimerField::GetFromMemtable);
+        let mut in_tables = false;
+        let walked = view.walk_newest_first(key, snapshot_seq, |source, max_rt_seq| {
+            Ok(match source {
+                Source::Memtable(mt) => match mt.get(lk) {
+                    Some((seq, value)) => ControlFlow::Break(if seq > max_rt_seq {
+                        value.map(|v| PointValue::of(v, materialize))
                     } else {
                         None
-                    });
-                }
-            }
-            {
-                let frozen = &view.frozen;
-                for mt in frozen.iter().rev() {
-                    let rt = mt.covering_range_tombstone_seq(key, snapshot_seq);
-                    if rt > max_rt_seq {
-                        max_rt_seq = rt;
+                    }),
+                    None => ControlFlow::Continue(()),
+                },
+                // Readers are already open in the pinned `Version`, so no
+                // filesystem access happens here - concurrent compaction
+                // unlinking paths cannot break us.
+                Source::Table(reader) => {
+                    if !in_tables {
+                        in_tables = true;
+                        drop(std::mem::replace(
+                            &mut timer,
+                            PerfTimer::new(PerfTimerField::GetFromOutputFiles),
+                        ));
                     }
-                    if let Some((pseq, popt)) = mt.get(lk) {
-                        return Ok(if pseq > max_rt_seq {
-                            popt.map(|v| PointValue::of(v, materialize))
-                        } else {
-                            None
-                        });
-                    }
-                }
-            }
-        }
-
-        // SSTable phase - likewise timed. Everything below this
-        // line is the "get_from_output_files" time.
-        let _t_ssts = crate::perf_context::PerfTimer::new(
-            crate::perf_context::PerfTimerField::GetFromOutputFiles,
-        );
-        let version = &view.version;
-
-        // L0: check all files (may overlap), newest first. Readers are
-        // already open in the pinned `Version`, so no filesystem access
-        // happens here - concurrent compaction unlinking paths cannot
-        // break us.
-        for file in version.levels[0].iter().rev() {
-            let rt = file.reader.covering_range_tombstone_seq(key, snapshot_seq);
-            if rt > max_rt_seq {
-                max_rt_seq = rt;
-            }
-            match self.probe_file(&file.reader, lk, materialize)? {
-                LookupResult::Found { seq, value } => {
-                    return Ok((seq > max_rt_seq).then_some(value));
-                }
-                LookupResult::FoundTombstone { .. } => return Ok(None),
-                LookupResult::NotInTable => {}
-            }
-        }
-
-        // L1+: point files are non-overlapping, but RT-only files can
-        // share a boundary with neighboring point files. Scan metadata
-        // ranges at the level so those empty files cannot hide the
-        // actual point-containing SSTable.
-        for level in 1..version.levels.len() {
-            let files = &version.levels[level];
-            if files.is_empty() {
-                continue;
-            }
-
-            // Range tombstones can be stored in any file at this level whose
-            // user-key range covers `key`, even if the point entry for `key`
-            // lives in a different file (e.g. an RT-only SSTable). Scan each
-            // overlapping file for RT coverage before the point lookup.
-            for file in files {
-                if file.meta.smallest_key.as_slice() <= key
-                    && key <= file.meta.largest_key.as_slice()
-                {
-                    let rt = file.reader.covering_range_tombstone_seq(key, snapshot_seq);
-                    if rt > max_rt_seq {
-                        max_rt_seq = rt;
+                    match self.probe_file(reader, lk, materialize)? {
+                        LookupResult::Found { seq, value } => {
+                            ControlFlow::Break((seq > max_rt_seq).then_some(value))
+                        }
+                        LookupResult::FoundTombstone { .. } => ControlFlow::Break(None),
+                        LookupResult::NotInTable => ControlFlow::Continue(()),
                     }
                 }
-            }
-
-            for file in files {
-                if file.meta.num_entries == 0 {
-                    continue;
-                }
-                if file.meta.smallest_key.as_slice() > key || key > file.meta.largest_key.as_slice()
-                {
-                    continue;
-                }
-                match self.probe_file(&file.reader, lk, materialize)? {
-                    LookupResult::Found { seq, value } => {
-                        return Ok((seq > max_rt_seq).then_some(value));
-                    }
-                    LookupResult::FoundTombstone { .. } => return Ok(None),
-                    LookupResult::NotInTable => {}
-                }
-            }
-        }
-
-        Ok(None)
+            })
+        })?;
+        Ok(match walked {
+            ControlFlow::Break(found) => found,
+            ControlFlow::Continue(_) => None,
+        })
     }
 
     /// Every visible entry for `lk`'s key in `view`, newest first, through
     /// the first terminator: a value, a deletion, or a covering range
     /// tombstone standing in as one.
     fn merge_chain_in_view(&self, lk: &LookupKey, view: &ReadView) -> std::io::Result<MergeChain> {
-        use internal_key::{VALUE_TYPE_DELETION, VALUE_TYPE_MERGE};
+        use internal_key::VALUE_TYPE_DELETION;
 
-        let key = lk.prefixed_user_key();
-        let snapshot_seq = lk.snapshot_seq();
         // `chain` records visible entries for `key` in newest-seq-
         // first order, stopping at (and including) the first
         // terminator (`VALUE` or `DELETION`). Range tombstones that
         // cover the key are treated as virtual deletion terminators.
         let mut chain: MergeChain = Vec::new();
-        let mut max_rt_seq: u64 = 0;
-        let mut terminated;
-
-        // `consume_partial` appends entries from one source into the
-        // running chain, short-circuiting if a terminator (real or
-        // RT-synthesized) is reached.
-        let consume_partial = |partial: Vec<(u64, u8, DbSlice)>,
-                               max_rt_seq: u64,
-                               chain: &mut Vec<(u64, u8, DbSlice)>|
-         -> bool {
-            for (seq, vt, value) in partial {
-                if seq <= max_rt_seq {
-                    // Range tombstone hides this and every older
-                    // entry for the same key.
+        // The chain is the result; where the walk ended adds nothing to it.
+        let _ = view.walk_newest_first(
+            lk.prefixed_user_key(),
+            lk.snapshot_seq(),
+            |source, max_rt_seq| {
+                let start = chain.len();
+                let terminated = match source {
+                    Source::Memtable(mt) => mt.collect_merge_chain(lk, &mut chain),
+                    Source::Table(reader) => with_key_scratch(|buf| {
+                        reader.collect_merge_chain(lk, buf, &self.cache, &mut chain)
+                    })?,
+                };
+                // Entries are newest first, so a range tombstone hides the
+                // first entry at or below it and every older one: it stands
+                // in as the terminator.
+                if let Some(hidden) = chain[start..]
+                    .iter()
+                    .position(|entry| entry.0 <= max_rt_seq)
+                {
+                    chain.truncate(start + hidden);
                     chain.push((max_rt_seq, VALUE_TYPE_DELETION, DbSlice::empty()));
-                    return true;
+                    return Ok(ControlFlow::Break(()));
                 }
-                chain.push((seq, vt, value));
-                if vt != VALUE_TYPE_MERGE {
-                    return true;
-                }
-            }
-            false
-        };
-
-        // Walk sources newest → oldest.
-        {
-            let active = &view.active;
-            let rt = active.covering_range_tombstone_seq(key, snapshot_seq);
-            if rt > max_rt_seq {
-                max_rt_seq = rt;
-            }
-            let mut partial = Vec::new();
-            let _ = active.collect_merge_chain(lk, &mut partial);
-            terminated = consume_partial(partial, max_rt_seq, &mut chain);
-        }
-
-        if !terminated {
-            let frozen = &view.frozen;
-            for mt in frozen.iter().rev() {
-                let rt = mt.covering_range_tombstone_seq(key, snapshot_seq);
-                if rt > max_rt_seq {
-                    max_rt_seq = rt;
-                }
-                let mut partial = Vec::new();
-                let _ = mt.collect_merge_chain(lk, &mut partial);
-                terminated = consume_partial(partial, max_rt_seq, &mut chain);
-                if terminated {
-                    break;
-                }
-            }
-        }
-
-        if !terminated {
-            let version = &view.version;
-
-            // L0: newest-first.
-            for file in version.levels[0].iter().rev() {
-                let rt = file.reader.covering_range_tombstone_seq(key, snapshot_seq);
-                if rt > max_rt_seq {
-                    max_rt_seq = rt;
-                }
-                let mut partial = Vec::new();
-                with_key_scratch(|buf| {
-                    file.reader
-                        .collect_merge_chain(lk, buf, &self.cache, &mut partial)
-                })?;
-                terminated = consume_partial(partial, max_rt_seq, &mut chain);
-                if terminated {
-                    break;
-                }
-            }
-
-            // L1+: point files are non-overlapping, while RT coverage
-            // may sit in sibling RT-only files.
-            if !terminated {
-                for level in 1..version.levels.len() {
-                    let files = &version.levels[level];
-                    if files.is_empty() {
-                        continue;
-                    }
-                    for file in files {
-                        if file.meta.smallest_key.as_slice() <= key
-                            && key <= file.meta.largest_key.as_slice()
-                        {
-                            let rt = file.reader.covering_range_tombstone_seq(key, snapshot_seq);
-                            if rt > max_rt_seq {
-                                max_rt_seq = rt;
-                            }
-                        }
-                    }
-                    for file in files {
-                        if file.meta.num_entries == 0 {
-                            continue;
-                        }
-                        if file.meta.smallest_key.as_slice() > key
-                            || key > file.meta.largest_key.as_slice()
-                        {
-                            continue;
-                        }
-                        let mut partial = Vec::new();
-                        with_key_scratch(|buf| {
-                            file.reader
-                                .collect_merge_chain(lk, buf, &self.cache, &mut partial)
-                        })?;
-                        terminated = consume_partial(partial, max_rt_seq, &mut chain);
-                        if terminated {
-                            break;
-                        }
-                    }
-                    if terminated {
-                        break;
-                    }
-                }
-            }
-        }
-
+                Ok(if terminated {
+                    ControlFlow::Break(())
+                } else {
+                    ControlFlow::Continue(())
+                })
+            },
+        )?;
         Ok(chain)
     }
 
@@ -2362,73 +2210,33 @@ impl RegolithEngine {
         key: &[u8],
         view: &ReadView,
     ) -> std::io::Result<Option<(u64, u8)>> {
+        use internal_key::VALUE_TYPE_DELETION;
+
         let snap = u64::MAX;
         let lk = LookupKey::from_prefixed(key, snap);
-        let mut max_rt_seq: u64 = 0;
-        let newest = |(point_seq, value_type): (u64, u8), max_rt_seq: u64| {
-            Some(if max_rt_seq > point_seq {
-                (max_rt_seq, internal_key::VALUE_TYPE_DELETION)
-            } else {
-                (point_seq, value_type)
+        let walked = view.walk_newest_first(key, snap, |source, max_rt_seq| {
+            let version = match source {
+                Source::Memtable(mt) => mt.latest_version(&lk),
+                Source::Table(reader) => {
+                    with_key_scratch(|buf| reader.latest_version(&lk, buf, &self.cache))?
+                }
+            };
+            // A covering range tombstone that outranks the point entry
+            // stands in for it, as a deletion.
+            Ok(match version {
+                Some((point_seq, _)) if max_rt_seq > point_seq => {
+                    ControlFlow::Break((max_rt_seq, VALUE_TYPE_DELETION))
+                }
+                Some(version) => ControlFlow::Break(version),
+                None => ControlFlow::Continue(()),
             })
-        };
-        {
-            let active = &view.active;
-            max_rt_seq = max_rt_seq.max(active.covering_range_tombstone_seq(key, snap));
-            if let Some(version) = active.latest_version(&lk) {
-                return Ok(newest(version, max_rt_seq));
+        })?;
+        Ok(match walked {
+            ControlFlow::Break(version) => Some(version),
+            ControlFlow::Continue(max_rt_seq) => {
+                (max_rt_seq > 0).then_some((max_rt_seq, VALUE_TYPE_DELETION))
             }
-        }
-        {
-            let frozen = &view.frozen;
-            for mt in frozen.iter().rev() {
-                max_rt_seq = max_rt_seq.max(mt.covering_range_tombstone_seq(key, snap));
-                if let Some(version) = mt.latest_version(&lk) {
-                    return Ok(newest(version, max_rt_seq));
-                }
-            }
-        }
-        let version = &view.version;
-        for file in version.levels[0].iter().rev() {
-            max_rt_seq = max_rt_seq.max(file.reader.covering_range_tombstone_seq(key, snap));
-            if let Some(version) =
-                with_key_scratch(|buf| file.reader.latest_version(&lk, buf, &self.cache))?
-            {
-                return Ok(newest(version, max_rt_seq));
-            }
-        }
-        for level in 1..version.levels.len() {
-            let files = &version.levels[level];
-            if files.is_empty() {
-                continue;
-            }
-            for file in files {
-                if file.meta.smallest_key.as_slice() <= key
-                    && key <= file.meta.largest_key.as_slice()
-                {
-                    max_rt_seq =
-                        max_rt_seq.max(file.reader.covering_range_tombstone_seq(key, snap));
-                }
-            }
-            for file in files {
-                if file.meta.num_entries == 0 {
-                    continue;
-                }
-                if file.meta.smallest_key.as_slice() > key || key > file.meta.largest_key.as_slice()
-                {
-                    continue;
-                }
-                if let Some(version) =
-                    with_key_scratch(|buf| file.reader.latest_version(&lk, buf, &self.cache))?
-                {
-                    return Ok(newest(version, max_rt_seq));
-                }
-            }
-        }
-        if max_rt_seq > 0 {
-            return Ok(Some((max_rt_seq, internal_key::VALUE_TYPE_DELETION)));
-        }
-        Ok(None)
+        })
     }
 
     /// Rotate the active memtable when it has reached the write-buffer
