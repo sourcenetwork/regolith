@@ -1558,15 +1558,11 @@ impl Db {
     /// so it can rewrite entry sequence numbers. Callers may delete
     /// the source files or re-ingest them at any time.
     ///
-    /// The call waits for any flush already in progress. A memtable that
-    /// fills while a file is being ingested is sealed without waiting, and
-    /// the call writes it to disk right after that file is installed, so
-    /// the ingested entries order after every write acknowledged before
-    /// the call and before every write acknowledged after it. Until then
-    /// those memtables count toward [`Options::max_write_buffer_number`],
-    /// which slows and then stops writes. If writing them fails, the call
-    /// returns that error with the file already ingested, and they stay
-    /// readable until a later [`Db::flush`] writes them.
+    /// The call waits for any flush already in progress, and writes wait
+    /// while each file is rewritten and installed, so the ingested entries
+    /// order after every write acknowledged before the call and before
+    /// every write acknowledged after it, and no snapshot sees them appear
+    /// under it.
     pub fn ingest_external_files(
         &self,
         files: &[std::path::PathBuf],

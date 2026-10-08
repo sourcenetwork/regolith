@@ -27,7 +27,9 @@
 //! if a later group published its maximum before an earlier one applied, a
 //! snapshot at that watermark would read a hole. Overlapping groups need a
 //! per-commit completion tracker, which this module deliberately does not
-//! have.
+//! have. An ingest takes its sequence under the same mutex and holds it
+//! until its table is installed and the sequence published, so no group
+//! publishes past an ingest either.
 
 use std::io;
 use std::sync::Arc;

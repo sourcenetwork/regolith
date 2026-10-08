@@ -13,6 +13,8 @@ pub(crate) mod filter_block;
 pub(crate) mod index_block;
 #[cfg(test)]
 mod ingest_range_tests;
+#[cfg(test)]
+mod ingest_window_tests;
 pub(crate) mod internal_key;
 pub(crate) mod iterator;
 pub(crate) mod lookup_key;
@@ -500,21 +502,11 @@ pub(crate) struct RegolithEngine {
     /// acknowledged write disappears, and a reader that had already seen
     /// it reads an older version instead.
     ///
-    /// An ingest holds it from its sequence allocation through its install
-    /// and through the flush of every memtable sealed meanwhile, for the
-    /// same reason: an ingested file is an L0 install whose place in the
-    /// order is its sequence. A rotation in that window does not wait for
-    /// it; see `ingest_holds_flushes`.
+    /// An ingest does not take it. It drains every frozen memtable under
+    /// the pipeline mutex and keeps that mutex until its file is installed,
+    /// so no memtable can be sealed, let alone flushed, before the file
+    /// takes its place in L0 install order.
     flushing: Mutex<()>,
-    /// Set while an ingest holds `flushing`: a rotation then seals its
-    /// memtable and leaves the flush to that ingest instead of waiting for
-    /// the exclusion with the pipeline held, which would stop every writer
-    /// for as long as the ingest takes to write its table.
-    ///
-    /// Written only by `ingest_one` and read only by `rotate_memtable`,
-    /// both under the pipeline mutex, so a rotation sees the value of the
-    /// last write that completed before it took the mutex.
-    ingest_holds_flushes: AtomicBool,
     /// Latched write-path failure. Set only when a failed commit group
     /// could not be rolled back out of the WAL, which leaves the log with
     /// a tail no later write may extend. Once set, every write fails loud
@@ -708,7 +700,6 @@ impl RegolithEngine {
             commit_ring: Self::new_commit_ring(),
             pipeline: Mutex::new(Pipeline::new()),
             flushing: Mutex::new(()),
-            ingest_holds_flushes: AtomicBool::new(false),
             wal_failure: Mutex::new(None),
             wal_failed: AtomicBool::new(false),
             stall_signal,
@@ -850,7 +841,6 @@ impl RegolithEngine {
             commit_ring: Self::new_commit_ring(),
             pipeline: Mutex::new(Pipeline::new()),
             flushing: Mutex::new(()),
-            ingest_holds_flushes: AtomicBool::new(false),
             wal_failure: Mutex::new(None),
             wal_failed: AtomicBool::new(false),
             stall_signal,
@@ -1888,9 +1878,7 @@ impl RegolithEngine {
     /// likely to fail the same way.
     fn wait_out_stop(&self, reason: &'static str) -> Result<(), crate::Error> {
         if reason == STOP_TOO_MANY_MEMTABLES {
-            if !self.ingest_holds_flushes.load(Ordering::Acquire)
-                && let Some(flushing) = self.flushing.try_lock()
-            {
+            if let Some(flushing) = self.flushing.try_lock() {
                 let flushed = self.flush_oldest_frozen(&flushing);
                 drop(flushing);
                 return match flushed {
@@ -2273,6 +2261,19 @@ impl RegolithEngine {
     }
 
     fn rotate_memtable(&self) -> std::io::Result<()> {
+        let sealed = self.seal_active()?;
+        let flushed = self.flush_until_retired(&sealed);
+        // Even when the flush failed: the memtable it left frozen counts
+        // toward the stall thresholds, and skipping the refresh would let
+        // writers keep sealing memtables, without back-pressure, for as
+        // long as flushes keep failing.
+        self.refresh_stall_level();
+        flushed
+    }
+
+    /// Move the active memtable to the frozen list behind a fresh one and
+    /// a fresh WAL, and return it. Caller must hold the pipeline mutex.
+    fn seal_active(&self) -> std::io::Result<Arc<MemTable>> {
         self.ensure_writable()?;
         // One publication: the sealed memtable joins `frozen` in the
         // same view that hands writers the fresh active one, so no
@@ -2310,23 +2311,7 @@ impl RegolithEngine {
         // until a flush publishes an SSTable. Stamping it on the
         // memtable is what lets that flush unlink the right one.
         sealed.seal_wal(old_wal.path().to_path_buf());
-        drop(old_wal);
-        // An ingest holding `flushing` writes this memtable out right after
-        // its own file is installed. Waiting for the exclusion here would
-        // hold the pipeline, and so every writer, for the whole ingest.
-        let flushed = if self.ingest_holds_flushes.load(Ordering::Acquire) {
-            Ok(())
-        } else {
-            self.flush_until_retired(&sealed, None)
-        };
-        // Even when the flush failed: the memtable it left frozen counts
-        // toward the stall thresholds, and skipping the refresh would let
-        // writers keep sealing memtables, without back-pressure, for as
-        // long as flushes keep failing.
-        self.refresh_stall_level();
-        flushed?;
-
-        Ok(())
+        Ok(sealed)
     }
 
     /// Flush frozen memtables, oldest first, until `target` is no
@@ -2341,15 +2326,9 @@ impl RegolithEngine {
     /// publish an older file over a newer one and make a read travel
     /// backwards.
     ///
-    /// `held` is the caller's own `flushing` guard when it already holds
-    /// the exclusion, as an ingest does when it flushes the memtables
-    /// sealed while it ran. Otherwise each pass takes the exclusion and
-    /// releases it before the next.
-    fn flush_until_retired(
-        &self,
-        target: &Arc<MemTable>,
-        held: Option<&MutexGuard<'_, ()>>,
-    ) -> std::io::Result<()> {
+    /// Each pass takes the `flushing` exclusion and releases it before the
+    /// next.
+    fn flush_until_retired(&self, target: &Arc<MemTable>) -> std::io::Result<()> {
         while self
             .view
             .load()
@@ -2357,11 +2336,7 @@ impl RegolithEngine {
             .iter()
             .any(|mt| Arc::ptr_eq(mt, target))
         {
-            let flushed = match held {
-                Some(flushing) => self.flush_oldest_frozen(flushing)?,
-                None => self.flush_oldest_frozen(&self.flushing.lock())?,
-            };
-            if !flushed {
+            if !self.flush_oldest_frozen(&self.flushing.lock())? {
                 break;
             }
         }
@@ -2604,9 +2579,8 @@ impl RegolithEngine {
         // 1. Exclude all background workers for the duration of the
         //    range walk. Write lock blocks until every in-flight
         //    background pass releases its read lock. Taken before the
-        //    flush below: an ingest holds this lock for its whole call, so
-        //    no ingest can be holding flushes when this call rotates, and
-        //    the flush and any failure of it are this call's own.
+        //    flush below, in the `compaction_lock -> pipeline` order an
+        //    ingest and `drop_all` take too.
         let _compact_guard = self.compaction_lock.write();
         self.ensure_writable()?;
 
@@ -2680,15 +2654,11 @@ impl RegolithEngine {
     /// would otherwise inject a new seq that older snapshots cannot
     /// consistently observe).
     ///
-    /// The call waits for any flush already in progress. A memtable that
-    /// fills while a file is being ingested is sealed without waiting, and
-    /// the call writes it to disk right after that file is installed, so
-    /// the ingested entries order after every write acknowledged before
-    /// the call and before every write acknowledged after it. Until then
-    /// those memtables count toward `Options::max_write_buffer_number`,
-    /// which slows and then stops writes. If writing them fails, the call
-    /// returns that error with the file already ingested, and they stay
-    /// readable until a later `Db::flush` writes them.
+    /// The call waits for any flush already in progress, and writes wait
+    /// while each file is rewritten and installed, so the ingested entries
+    /// order after every write acknowledged before the call and before
+    /// every write acknowledged after it, and no snapshot sees them appear
+    /// under it.
     pub(crate) fn ingest_external_files<F>(
         &self,
         files: &[PathBuf],
@@ -2854,53 +2824,43 @@ impl RegolithEngine {
         source: &IngestSource,
         ingest_opts: &crate::sst_file_writer::IngestOptions,
     ) -> std::io::Result<()> {
-        // Drained, not merely rotated: an ingest is ordered like a flush. Every
-        // memtable sealed below the sequence allocated here is in an SSTable
-        // before the ingested file lands, and `flushing` is held from the
-        // allocation to the install so no memtable sealed above it can land
-        // before the ingested file; a rotation in that window seals without
-        // flushing, and this call flushes it after the install. L0 recency is
-        // install order, so either inversion would let a read return the wrong
-        // version of a key the ingest carries. The sequence is allocated under
-        // the pipeline mutex, where seals and commit groups allocate theirs, so
-        // it is strictly ordered against both.
-        let (flush_guard, ingest_seq) = {
+        // The pipeline mutex is held from the sequence allocation through the
+        // install, as a commit group holds it from its allocation through its
+        // publish. Groups do not pipeline, so no group can publish a horizon
+        // past this sequence before the table is in place. Released earlier,
+        // a group committing in between would: a snapshot taken then reads the
+        // old value of a key the ingest carries and later the ingested one,
+        // and a transaction that read the old value does not see the ingest
+        // as newer at commit. The rewrite stamps every entry with this
+        // sequence, so it has to run inside the hold, and writers wait for it.
+        let (table, ingest_seq) = {
             let _write_guard = self.pipeline.lock();
+            // Drained, not merely rotated: an ingest is ordered like a flush.
+            // L0 recency is install order, so a memtable sealed below this
+            // sequence that landed after the ingested file would shadow the
+            // version the ingest carries.
             let view = self.view.load();
             if !view.active.is_empty() || !view.active.clone_range_tombstones().is_empty() {
                 drop(view);
                 self.rotate_memtable()?;
             } else if let Some(newest_frozen) = view.frozen.last().cloned() {
                 drop(view);
-                self.flush_until_retired(&newest_frozen, None)?;
+                self.flush_until_retired(&newest_frozen)?;
             }
-            let flush_guard = self.flushing.lock();
             let ingest_seq = self.latest_seq.fetch_add(1, Ordering::AcqRel) + 1;
-            self.ingest_holds_flushes.store(true, Ordering::Release);
-            (flush_guard, ingest_seq)
-        };
 
-        let installed = self.install_ingested(source, ingest_opts, ingest_seq);
-        let held = self.flush_memtables_sealed_during_ingest(&flush_guard);
-        // Released before listeners run: a listener is user code.
-        drop(flush_guard);
-
-        let table = match installed {
-            Ok(table) => table,
-            Err(e) => {
-                return Err(match held {
-                    Ok(()) => e,
-                    Err(flush_err) => std::io::Error::new(
-                        e.kind(),
-                        format!(
-                            "{e}; flushing memtables to disk afterwards also failed, \
-                             call flush to retry: {flush_err}"
-                        ),
-                    ),
-                });
+            #[cfg(test)]
+            if let Some(hook) = AFTER_INGEST_SEQ.with(|slot| slot.borrow_mut().take()) {
+                hook();
             }
+
+            (
+                self.install_ingested(source, ingest_opts, ingest_seq)?,
+                ingest_seq,
+            )
         };
 
+        // Run with the pipeline released: a listener is user code.
         if !self.options.listeners.is_empty() {
             // Fire the table-created event first (file-level
             // observation) and then the ingest-specific event
@@ -2938,21 +2898,11 @@ impl RegolithEngine {
             source = %source.path.display(),
             "Ingested external SSTable"
         );
-
-        held.map_err(|e| {
-            std::io::Error::new(
-                e.kind(),
-                format!(
-                    "ingest: {} was ingested, but flushing memtables to disk afterwards \
-                     failed; they stay readable, call flush to retry: {e}",
-                    source.path.display()
-                ),
-            )
-        })
+        Ok(())
     }
 
     /// Rewrite `source` at `ingest_seq` into the SSTable directory and
-    /// install it. The caller holds `flushing`.
+    /// install it. The caller holds the pipeline mutex.
     fn install_ingested(
         &self,
         source: &IngestSource,
@@ -3047,10 +2997,6 @@ impl RegolithEngine {
         ];
         self.versions.lock().apply(&edits)?;
 
-        // The ingested file is now installed in the version, so publish its
-        // sequence. `fetch_max` guards against a concurrent write (ingest
-        // holds the compaction lock, not the write lock) having already
-        // published a higher horizon.
         self.visible_seq.publish(ingest_seq);
 
         Ok(IngestedTable {
@@ -3060,39 +3006,6 @@ impl RegolithEngine {
             file_size,
             num_entries: summary.num_entries,
         })
-    }
-
-    /// Give rotations their flushes back, then flush every memtable sealed
-    /// while the calling ingest held `flushing`, oldest first.
-    ///
-    /// Called by `ingest_one` on every path after it set
-    /// `ingest_holds_flushes`, still holding `flushing` and after its
-    /// install has succeeded or failed. Those memtables were sealed above
-    /// the ingest's sequence, so they have to land after its file, and
-    /// nothing else can flush them while the exclusion is held. The flag is
-    /// cleared and the frozen list read in one pipeline critical section:
-    /// a rotation that ran before it left its memtable in that list, and
-    /// one that runs after it flushes its own. The set is fixed there and
-    /// never extended, for the reason `drain_memtables` gives. A memtable
-    /// whose flush fails stays frozen, readable, and backed by its WAL.
-    fn flush_memtables_sealed_during_ingest(
-        &self,
-        flushing: &MutexGuard<'_, ()>,
-    ) -> std::io::Result<()> {
-        let newest = {
-            let _write_guard = self.pipeline.lock();
-            self.ingest_holds_flushes.store(false, Ordering::Release);
-            self.view.load().frozen.last().cloned()
-        };
-        let flushed = match newest {
-            Some(newest) => self.flush_until_retired(&newest, Some(flushing)),
-            None => Ok(()),
-        };
-        // Writers parked on a memtable stall re-check now rather than at
-        // their next timed wake-up.
-        self.refresh_stall_level();
-        self.stall_signal.notify_all();
-        flushed
     }
 
     /// Atomically capture a consistent snapshot of the on-disk state
@@ -3608,7 +3521,7 @@ impl RegolithEngine {
         // writes them in, so a target that an earlier pass already
         // flushed costs one list scan and no work.
         for target in &targets {
-            self.flush_until_retired(target, None)?;
+            self.flush_until_retired(target)?;
         }
         Ok(())
     }
@@ -3657,7 +3570,7 @@ impl Drop for IngestCacheGuard<'_> {
 }
 
 /// The table one ingest source was installed as, kept for the listeners
-/// and the log that run once `flushing` is released.
+/// and the log that run once the pipeline mutex is released.
 struct IngestedTable {
     file_id: u64,
     path: PathBuf,
@@ -3672,6 +3585,22 @@ struct IngestSource {
     reader: SsTableReader,
     smallest: Vec<u8>,
     largest: Vec<u8>,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test seam: runs once, on this thread, right after the next ingest
+    /// has taken its sequence and before it installs its table.
+    /// Thread-local so a parallel test never fires another test's hook.
+    static AFTER_INGEST_SEQ: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Test-only: run `hook` once, on this thread, right after the next ingest
+/// has taken its sequence and before it installs its table.
+#[cfg(test)]
+pub(crate) fn after_next_ingest_seq(hook: impl FnOnce() + 'static) {
+    AFTER_INGEST_SEQ.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
 }
 
 /// Choose the target level for an ingest file covering the user-key

@@ -115,7 +115,6 @@ mod tests {
     use crate::engine::memtable::MemTableConfig;
     use crate::engine::sstable::{LiveSst, Materialize, PointValue, SsTableMeta, SsTableWriter};
     use crate::options::CompressionType;
-    use crate::portability::Ordering;
     use crate::{Db, Options};
     use std::sync::Arc;
     use tempfile::TempDir;
@@ -134,14 +133,11 @@ mod tests {
         prefix_key(DEFAULT_CF_ID, name)
     }
 
-    /// Seal the active memtable and leave it frozen. Only an ingest in
-    /// flight keeps a rotation from flushing the memtable it seals.
+    /// Seal the active memtable and leave it frozen.
     fn freeze_active(db: &Db) {
         let engine = db.engine();
         let _pipeline = engine.pipeline.lock();
-        engine.ingest_holds_flushes.store(true, Ordering::Release);
-        engine.rotate_memtable().unwrap();
-        engine.ingest_holds_flushes.store(false, Ordering::Release);
+        engine.seal_active().unwrap();
     }
 
     /// Where `view` keeps `source`: "active", "frozen N" or "L<level> N",
