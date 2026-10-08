@@ -5,6 +5,7 @@
 //! with a direct `rustc` call into a `cdylib`. Keeping it out of the
 //! workspace keeps `cargo check --workspace`, clippy and the MSRV job on
 //! pure library code, and means no new Cargo member and no C toolchain.
+//! The standalone shim needs Rust 1.99 for C-variadic function definitions.
 //!
 //! The build is content-addressed and atomic: the object is named after a
 //! hash of the source and installed with a rename, so several test
