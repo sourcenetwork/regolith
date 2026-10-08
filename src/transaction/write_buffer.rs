@@ -167,13 +167,22 @@ pub(super) fn fold_by_key(
     reverse: bool,
     merge: Option<&dyn MergeOperator>,
 ) -> Vec<(Vec<u8>, KeyWrites)> {
-    // Stable: a key's writes keep the newest-first order `fold` needs.
-    if reverse {
-        chains.sort_by(|a, b| b.0.cmp(&a.0));
-    } else {
-        chains.sort_by(|a, b| a.0.cmp(&b.0));
-    }
-    let mut chains = chains.into_iter().peekable();
+    // Sorts positions, not entries, with the position breaking ties between
+    // writes of one key: an unstable sort that still leaves a key's writes
+    // newest first, as `fold` needs, and needs no scratch for the entries.
+    let mut order: Vec<usize> = (0..chains.len()).collect();
+    order.sort_unstable_by(|&a, &b| {
+        let keys = if reverse {
+            chains[b].0.cmp(&chains[a].0)
+        } else {
+            chains[a].0.cmp(&chains[b].0)
+        };
+        keys.then(a.cmp(&b))
+    });
+    let mut chains = order
+        .into_iter()
+        .map(|at| std::mem::replace(&mut chains[at], (Vec::new(), Write::Delete)))
+        .peekable();
     let mut folded = Vec::new();
     while let Some((key, first)) = chains.next() {
         let rest = std::iter::from_fn(|| chains.next_if(|(next, _)| *next == key));
