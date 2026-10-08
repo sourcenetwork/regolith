@@ -10,11 +10,13 @@
 //! registry keeps a refcount per seq and removes the entry when the
 //! refcount reaches zero.
 //!
-//! [`SnapshotRegistry::oldest_live_seq`] returns the smallest currently
-//! registered seq - or `u64::MAX` when no snapshot is live. Compaction
-//! uses this as the **pin seq**: any version with a smaller seq than
-//! the largest visible version at `pin_seq` is invisible to every
-//! live snapshot and to current reads, and can be discarded.
+//! [`SnapshotRegistry::live_seqs`] lists every registered seq, ascending.
+//! Compaction cuts a key's versions into stripes at those seqs: inside a
+//! stripe only the newest state is visible to any reader, so what lies
+//! beneath it can be discarded and its operands folded, while nothing
+//! crosses a stripe boundary (see `engine::compaction::stripes`).
+//! [`SnapshotRegistry::oldest_live_seq`] returns the smallest, or
+//! `u64::MAX` when no snapshot is live.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -176,9 +178,7 @@ impl SnapshotRegistry {
     }
 
     /// Return the smallest currently registered seq, or `u64::MAX`
-    /// if no snapshot is live. Compaction uses this as its GC
-    /// horizon: entries older than the largest version visible to
-    /// this seq are safe to drop.
+    /// if no snapshot is live.
     pub(crate) fn oldest_live_seq(&self) -> u64 {
         self.active
             .lock()
@@ -186,6 +186,24 @@ impl SnapshotRegistry {
             .next()
             .copied()
             .unwrap_or(u64::MAX)
+    }
+
+    /// Every seq a snapshot is pinned at, ascending and distinct; empty
+    /// when no snapshot is live. Compaction cuts a key's versions into
+    /// stripes at these seqs.
+    ///
+    /// A pass reads this once and keeps the list for the whole pass. A
+    /// snapshot registered afterwards reads at the visible sequence, at or
+    /// above every entry of a table flushed before it registered, so it
+    /// cannot split a stripe of those entries; one released afterwards only
+    /// makes the pass fold less than it could. The one gap is a table
+    /// flushed between this read and the pass picking its inputs, the
+    /// window `tests/adversarial_readview.rs` attacks.
+    pub(crate) fn live_seqs(&self) -> Vec<u64> {
+        // vertexia: read before the pass picks its inputs, so a snapshot
+        // registered in between can sit inside a table flushed in between;
+        // read after the pick (in `perform_compaction_to`) to close that.
+        self.active.lock().keys().copied().collect()
     }
 
     /// Number of distinct live snapshots. Counts pins, not
@@ -267,6 +285,26 @@ mod tests {
         r.release(20);
         assert_eq!(r.oldest_live_seq(), u64::MAX);
         assert_eq!(r.pin_count(), 0);
+    }
+
+    #[test]
+    fn live_seqs_lists_each_pinned_seq_once_in_ascending_order() {
+        let r = SnapshotRegistry::new();
+        assert!(r.live_seqs().is_empty());
+
+        r.register(20);
+        r.register(5);
+        r.register(20);
+        r.register(10);
+        assert_eq!(r.live_seqs(), vec![5, 10, 20]);
+
+        r.release(20);
+        assert_eq!(r.live_seqs(), vec![5, 10, 20], "a pin at 20 remains");
+        r.release(20);
+        r.release(5);
+        assert_eq!(r.live_seqs(), vec![10]);
+        r.release(10);
+        assert!(r.live_seqs().is_empty());
     }
 
     #[test]

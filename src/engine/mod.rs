@@ -434,10 +434,10 @@ pub(crate) struct RegolithEngine {
     /// their pass.
     compaction_lock: Arc<Gate>,
     /// Tracks the sequence numbers of every live snapshot so compaction
-    /// can drop versions that no snapshot and no current reader can
-    /// see. A snapshot registers itself on creation and releases on
-    /// drop; compaction queries `oldest_live_seq()` to compute its GC
-    /// horizon.
+    /// can cut each key's versions into stripes no snapshot straddles,
+    /// and drop or fold what no reader can see. A snapshot registers
+    /// itself on creation and releases on drop; a compaction pass reads
+    /// the list through `live_snapshot_seqs()`.
     snapshot_registry: Arc<SnapshotRegistry>,
     options: EngineOptions,
     /// Bounded ring of writers waiting for a commit group. Writers push a
@@ -1000,8 +1000,8 @@ impl RegolithEngine {
 
     /// Pin a snapshot at the current read horizon, sampling the
     /// horizon and registering the pin as one step so a concurrent
-    /// compaction cannot compute its GC bound from a registry that
-    /// does not yet contain this pin. Returns the pinned sequence.
+    /// compaction cannot cut its stripes from a registry that does
+    /// not yet contain this pin. Returns the pinned sequence.
     pub(crate) fn register_snapshot_at_horizon(&self) -> u64 {
         if self.is_closed() {
             return self.visible_seq.visible();
@@ -1024,10 +1024,17 @@ impl RegolithEngine {
         }
     }
 
-    /// Current GC horizon for compaction - the smallest live snapshot
-    /// seq, or `u64::MAX` if no snapshot is currently pinned.
+    /// The smallest live snapshot seq, or `u64::MAX` if no snapshot is
+    /// currently pinned.
     pub(crate) fn oldest_live_seq(&self) -> u64 {
         self.snapshot_registry.oldest_live_seq()
+    }
+
+    /// Every live snapshot seq, ascending and distinct: the cuts a
+    /// compaction pass makes between stripes. See
+    /// [`SnapshotRegistry::live_seqs`].
+    pub(crate) fn live_snapshot_seqs(&self) -> Vec<u64> {
+        self.snapshot_registry.live_seqs()
     }
 
     /// Wait for every snapshot pin to be released, returning how many
@@ -1083,8 +1090,8 @@ impl RegolithEngine {
     /// The order of the first two statements is load-bearing: the view
     /// is loaded FIRST and the horizon sampled SECOND. Sampling the
     /// horizon first lets a compaction garbage-collect the newest
-    /// version at or below it - compaction's GC bound is
-    /// `oldest_live_seq()`, and a read without a `Snapshot` registers
+    /// version at or below it - compaction cuts its stripes at the
+    /// registered snapshots, and a read without a `Snapshot` registers
     /// nothing there - after which the key reads back as absent. A
     /// version that compaction dropped was shadowed by a newer one
     /// that had already been flushed into the version being published,
@@ -1926,15 +1933,15 @@ impl RegolithEngine {
         let outcome = {
             let _guard = self.compaction_lock.read();
             self.ensure_writable()?;
-            // Recompute the GC horizon per pass: a snapshot may have
-            // dropped since the last one, unpinning more versions.
-            let pin_seq = self.oldest_live_seq();
+            // Read the live snapshots per pass: one may have dropped since
+            // the last, letting more fold.
+            let live = self.live_snapshot_seqs();
             compaction::pick_and_run_compaction(
                 &self.versions,
                 &self.sst_dir,
                 &self.cache,
                 &self.options.to_compaction_options(),
-                pin_seq,
+                &live,
                 &self.compaction_in_progress,
             )?
         };
@@ -2593,9 +2600,9 @@ impl RegolithEngine {
             }
         }
 
-        // 3. Compute the snapshot-pinning GC horizon so compaction can
-        //    drop versions that no live snapshot needs.
-        let pin_seq = self.oldest_live_seq();
+        // 3. Read the live snapshots so compaction can cut each key's
+        //    versions into stripes at them.
+        let live = self.live_snapshot_seqs();
 
         // 4. Run the level-by-level push-down.
         let compaction_opts = self.options.to_compaction_options();
@@ -2623,7 +2630,7 @@ impl RegolithEngine {
                 &self.sst_dir,
                 &self.cache,
                 &compaction_opts,
-                pin_seq,
+                &live,
             )?;
             return Ok(());
         }
@@ -2635,7 +2642,7 @@ impl RegolithEngine {
             &compaction_opts,
             start,
             end,
-            pin_seq,
+            &live,
         )
     }
 
