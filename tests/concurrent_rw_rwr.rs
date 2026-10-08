@@ -3,11 +3,20 @@
 //! to clear before anything builds on the levels.
 //!
 //! Every scenario forces the interleaving it is about rather than hoping a
-//! scheduler produces it. A barrier lines the threads up inside their
+//! scheduler produces it. A rendezvous lines the threads up inside their
 //! transactions, or a helper thread commits between two reads and
 //! acknowledges before the second one, so each invariant is checked
 //! against a history that actually contains the hazard. Where a scenario
 //! also runs freely, it requires evidence that the free run overlapped.
+//! Every wait has a deadline, and a helper ends when the last thread that can
+//! ask it for anything is gone.
+//!
+//! Scenarios 1 to 4 and 7 run on both transaction flavours; 5 and 6 need the
+//! optimistic one. Every scenario runs on two storage shapes: the default,
+//! where only the active memtable is ever probed, and a small write buffer
+//! with flushes in the worker loops, where the conflict probes walk SSTables
+//! too. A scenario claims a probe reached a table only after counting block
+//! cache lookups on the committing thread.
 //!
 //! 1. Lost update. Eight transactions read one counter at the same value,
 //!    then all commit `value + 1`. Exactly one may commit at every level and
@@ -20,36 +29,71 @@
 //!    it, and every audit and the final state hold the total.
 //! 3. Repeatable point read. Each of eight readers reads a shared key, a
 //!    writer commits a new value and acknowledges, and the reader reads the
-//!    key again: the same value, at every level. It then writes its own key
-//!    and reads it back. The commit aborts exactly at the levels that
-//!    validate a plain point read.
+//!    key again: the same value, at every level. It reads with `get` and with
+//!    `get_for_update`, then writes its own key and reads it back. The commit
+//!    aborts exactly at the levels that validate that kind of read.
 //! 4. Repeatable scan. Each of eight readers scans a prefix, an inserter
 //!    commits a new key into it and acknowledges, and the reader scans
-//!    again: the same keys, every seeded key among them. A transaction
-//!    begun afterwards sees the insertion.
+//!    again: the same keys, every seeded key among them, one of them read
+//!    first with `get` or `get_for_update`. A transaction begun afterwards
+//!    sees the insertion.
+//! 5. Blind merges (`DefraLevel`, optimistic). Eight transactions merge into
+//!    one hot counter without reading it, and every one has a write forced
+//!    onto the counter between its begin and its commit: another operand, a
+//!    put, a delete or a range delete. Operands never abort a blind merge at
+//!    `DefraLevel`, and a replacement always does; the counter is checked
+//!    against a model after every round, with and without a flush or a
+//!    compaction in between.
+//! 6. Commutative prefix (`DefraLevel`, optimistic). Eight transactions scan
+//!    a head prefix and write a key of their own and one fresh key they all
+//!    write alike: with a classifier all commit at `DefraLevel`, at any other
+//!    level one does, and so does a scan that leaves the prefix.
+//! 7. Scan reader commits. A reader scans, a write to a row it was returned
+//!    commits, and then the reader commits: only `Serializable` validates a
+//!    scan, but a row the reader scanned and then writes is validated at
+//!    every level.
 
 // Native-only. wasm-pack builds every test target for wasm32, and these use
 // threads and the filesystem. The browser suite lives in tests/wasm_opfs*.rs.
 #![cfg(not(target_arch = "wasm32"))]
 
 use std::collections::BTreeSet;
+use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
-use std::sync::{Barrier, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use regolith::{
-    Db, IsolationLevel, OptimisticTransactionDb, Options, Transaction, TransactionDb,
-    TransactionError, TxResult,
+    Db, IsolationLevel, OptimisticTransactionDb, Transaction, TransactionDb, TransactionError,
+    TxResult,
 };
 use tempfile::TempDir;
+
+/// The scenarios that need a database of their own shape live in their own
+/// files. The `#[path]` attributes are what keep `tests/concurrent_rw_rwr/`
+/// from being picked up as further test targets.
+#[path = "concurrent_rw_rwr/blind_merge.rs"]
+mod blind_merge;
+#[path = "concurrent_rw_rwr/commutative_prefix.rs"]
+mod commutative_prefix;
+#[path = "concurrent_rw_rwr/scan_commit.rs"]
+mod scan_commit;
+#[path = "concurrent_rw_rwr/support.rs"]
+mod support;
+
+use support::{Rendezvous, STORAGES, Storage, table_lookups};
 
 /// Threads per scenario.
 const THREADS: usize = 8;
 
-/// Retry budget per transaction: bounded so a livelock fails loudly.
+/// Retry budget per transaction in attempts: bounded so a livelock fails
+/// loudly.
 const MAX_ATTEMPTS: usize = 2_000;
+
+/// Retry budget per transaction in time, for a machine that makes each
+/// attempt slow.
+const RETRY_DEADLINE: Duration = Duration::from_secs(30);
 
 /// How long a forced handoff may take before the test fails instead of
 /// hanging.
@@ -62,6 +106,19 @@ const LEVELS: [IsolationLevel; 5] = [
     IsolationLevel::Serializable,
     IsolationLevel::DefraLevel,
 ];
+
+/// Run `case` on every storage shape at every isolation level, naming the
+/// pair when one fails so that a break only `Tables` shows is attributable.
+fn each_case(case: impl Fn(Storage, IsolationLevel)) {
+    for storage in STORAGES {
+        for level in LEVELS {
+            if let Err(panic) = catch_unwind(AssertUnwindSafe(|| case(storage, level))) {
+                eprintln!("failed on {storage:?} storage at {level:?}");
+                resume_unwind(panic);
+            }
+        }
+    }
+}
 
 /// Whether a plain point read is validated at commit.
 fn validates_point_reads(level: IsolationLevel) -> bool {
@@ -88,15 +145,37 @@ fn retryable(result: &TxResult<()>) -> bool {
     )
 }
 
+/// Wait after the `refused`-th refusal: yield at first, then sleep for an
+/// interval that doubles up to a cap, so contenders spread out without any
+/// wait being a fixed interval.
+fn back_off(refused: usize) {
+    const YIELDS: usize = 4;
+    if refused < YIELDS {
+        thread::yield_now();
+    } else {
+        thread::sleep(Duration::from_micros(50 << (refused - YIELDS).min(5)));
+    }
+}
+
 /// Run `attempt` until it commits, retrying only conflicts and lock
 /// timeouts. Returns how many attempts were refused.
+///
+/// Bounded twice, by attempts and by `RETRY_DEADLINE`, with a growing
+/// back-off between attempts, so a livelock fails loudly and a slow machine
+/// is not hammered while it waits.
 fn commit_with_retry(what: &str, mut attempt: impl FnMut() -> TxResult<()>) -> u64 {
+    let deadline = Instant::now() + RETRY_DEADLINE;
     for refused in 0..MAX_ATTEMPTS {
         match attempt() {
             Ok(()) => return refused as u64,
-            result if retryable(&result) => thread::yield_now(),
+            result if retryable(&result) => back_off(refused),
             Err(e) => panic!("{what}: unexpected transaction error: {e}"),
         }
+        assert!(
+            Instant::now() < deadline,
+            "{what}: did not commit within {RETRY_DEADLINE:?} ({} attempts refused)",
+            refused + 1
+        );
     }
     panic!("{what}: did not commit within {MAX_ATTEMPTS} attempts");
 }
@@ -135,12 +214,12 @@ impl Flavour for TransactionDb {
     }
 }
 
-fn optimistic(dir: &TempDir) -> OptimisticTransactionDb {
-    OptimisticTransactionDb::open(dir.path(), Options::default()).unwrap()
+fn optimistic(dir: &TempDir, storage: Storage) -> OptimisticTransactionDb {
+    OptimisticTransactionDb::open(dir.path(), storage.options()).unwrap()
 }
 
-fn pessimistic(dir: &TempDir) -> TransactionDb {
-    TransactionDb::open(dir.path(), Options::default())
+fn pessimistic(dir: &TempDir, storage: Storage) -> TransactionDb {
+    TransactionDb::open(dir.path(), storage.options())
         .unwrap()
         .with_lock_timeout(Duration::from_millis(200))
 }
@@ -149,34 +228,61 @@ fn pessimistic(dir: &TempDir) -> TransactionDb {
 
 /// All readers read the counter at 0 before any of them writes, so every
 /// commit after the first carries a stale read of a key it writes.
-fn lost_update(db: &impl Flavour, level: IsolationLevel) {
+///
+/// On `Tables` the transaction of thread 0 commits alone and the memtable is
+/// flushed behind it before the other seven try, and none of them retries
+/// until all seven first attempts are in, so each refused commit has to find
+/// the winner's version in an SSTable, not in the active memtable.
+fn lost_update(db: &impl Flavour, level: IsolationLevel, storage: Storage) {
     db.raw().put(b"counter", &encode(0)).unwrap();
-    let all_read = Barrier::new(THREADS);
+    storage.flush(db.raw());
+    let all_read = Rendezvous::new(THREADS);
+    let phase = Rendezvous::new(THREADS);
     let first_round_commits = AtomicU64::new(0);
 
     thread::scope(|scope| {
-        for _ in 0..THREADS {
-            scope.spawn(|| {
+        for t in 0..THREADS {
+            let (all_read, phase, first_round_commits) = (&all_read, &phase, &first_round_commits);
+            scope.spawn(move || {
                 let tx = db.begin(level);
-                // Arrive at the barrier whatever the read did, so one failed
-                // reader cannot strand the other seven; judge it after.
+                // Arrive at the rendezvous whatever the read did, so one
+                // failed reader cannot strand the other seven; judge it after.
                 let read = tx.get(b"counter");
                 all_read.wait();
                 let seen = decode(read.unwrap());
                 assert_eq!(seen, 0, "{level:?}: every reader starts from 0");
+                if storage.is_tables() && t != 0 {
+                    phase.wait(); // the winner has committed and flushed
+                }
                 // A pessimistic put can time out on the winner's lock: that
                 // is a lost race like a refused commit.
-                let result = match tx.put(b"counter", &encode(seen + 1)) {
-                    Ok(()) => tx.commit(),
-                    Err(e) => {
-                        drop(tx);
-                        Err(e)
+                let (result, lookups) =
+                    table_lookups(|| match tx.put(b"counter", &encode(seen + 1)) {
+                        Ok(()) => tx.commit(),
+                        Err(e) => {
+                            drop(tx);
+                            Err(e)
+                        }
+                    });
+                if storage.is_tables() {
+                    if t == 0 {
+                        storage.flush(db.raw());
+                        phase.wait();
                     }
-                };
+                    phase.wait(); // every first attempt is in
+                }
                 if result.is_ok() {
                     first_round_commits.fetch_add(1, Ordering::Relaxed);
                 } else {
                     assert!(retryable(&result), "{level:?}: {result:?}");
+                    if storage.is_tables()
+                        && matches!(result, Err(TransactionError::Conflict { .. }))
+                    {
+                        assert!(
+                            lookups > 0,
+                            "{level:?}: a commit refused behind a flush never probed a table"
+                        );
+                    }
                     // The stale write lost; increment again from a fresh read.
                     commit_with_retry("counter retry", || {
                         let tx = db.begin(level);
@@ -203,18 +309,18 @@ fn lost_update(db: &impl Flavour, level: IsolationLevel) {
 
 #[test]
 fn a_stale_read_modify_write_never_commits_optimistic() {
-    for level in LEVELS {
+    each_case(|storage, level| {
         let dir = tempfile::tempdir().unwrap();
-        lost_update(&optimistic(&dir), level);
-    }
+        lost_update(&optimistic(&dir, storage), level, storage);
+    });
 }
 
 #[test]
 fn a_stale_read_modify_write_never_commits_pessimistic() {
-    for level in LEVELS {
+    each_case(|storage, level| {
         let dir = tempfile::tempdir().unwrap();
-        lost_update(&pessimistic(&dir), level);
-    }
+        lost_update(&pessimistic(&dir, storage), level, storage);
+    });
 }
 
 // ---- 2. snapshot sum ------------------------------------------------------
@@ -245,16 +351,29 @@ fn audit(tx: &Transaction<'_>) -> u64 {
         .sum()
 }
 
-fn snapshot_sum(db: &impl Flavour, level: IsolationLevel) {
+fn snapshot_sum(db: &impl Flavour, level: IsolationLevel, storage: Storage) {
     for i in 0..ACCOUNTS {
         db.raw().put(&account(i), &encode(BALANCE)).unwrap();
     }
+    storage.flush(db.raw());
 
     // Forced: a transfer out of an account the audit already read, into
-    // one it has not, commits in the middle of the audit.
+    // one it has not, commits in the middle of the audit. On `Tables` a
+    // flush and a compaction follow it while the audit's snapshot is pinned:
+    // the versions the audit has yet to read must survive both.
     let auditor = db.begin(level);
     let first = decode(auditor.get(&account(0)).unwrap());
-    commit_with_retry("forced transfer", || transfer(db, level, 0, ACCOUNTS - 1));
+    let (_, lookups) = table_lookups(|| {
+        commit_with_retry("forced transfer", || transfer(db, level, 0, ACCOUNTS - 1))
+    });
+    if storage.is_tables() {
+        assert!(
+            lookups > 0,
+            "{level:?}: the forced transfer never reached a table"
+        );
+        db.raw().flush().unwrap();
+        db.raw().compact_range(None, None).unwrap();
+    }
     let rest: u64 = (1..ACCOUNTS)
         .map(|i| decode(auditor.get(&account(i)).unwrap()))
         .sum();
@@ -266,39 +385,48 @@ fn snapshot_sum(db: &impl Flavour, level: IsolationLevel) {
     drop(auditor);
 
     // Free: writers keep transferring until an audit has seen a commit land
-    // inside it. An audit overlapped when the engine's sequence advanced
-    // between just after its transaction began and its last read: a write
-    // committed strictly inside it. A transfer that moves nothing writes
-    // nothing, so it cannot fake one.
+    // inside it and, on `Tables`, until a transfer has gone to a table. An
+    // audit overlapped when the engine's sequence advanced between just after
+    // its transaction began and its last read: a write committed strictly
+    // inside it. A transfer that moves nothing writes nothing, so it cannot
+    // fake one.
     let overlapped = AtomicBool::new(false);
+    let reached_tables = AtomicBool::new(!storage.is_tables());
+    let enough = || overlapped.load(Ordering::Acquire) && reached_tables.load(Ordering::Acquire);
     let stop = AtomicBool::new(false);
     thread::scope(|scope| {
         let _stop = StopOnDrop(&stop);
         for t in 0..THREADS as u64 {
-            let (overlapped, stop) = (&overlapped, &stop);
+            let (enough, reached_tables, stop) = (&enough, &reached_tables, &stop);
             scope.spawn(move || {
                 // A writer that panics stops the auditor too.
                 let _stop = StopOnDrop(stop);
                 let mut n = 0u64;
-                while !stop.load(Ordering::Acquire)
-                    && (!overlapped.load(Ordering::Acquire) || n < 50)
-                {
+                while !stop.load(Ordering::Acquire) && (!enough() || n < 50) {
                     let (from, to) = ((t + n) % ACCOUNTS, (t + n + 3) % ACCOUNTS);
-                    commit_with_retry("transfer", || transfer(db, level, from, to));
+                    let (_, lookups) = table_lookups(|| {
+                        commit_with_retry("transfer", || transfer(db, level, from, to))
+                    });
+                    if lookups > 0 {
+                        reached_tables.store(true, Ordering::Release);
+                    }
                     n += 1;
+                    storage.churn(db.raw(), n);
                 }
             });
         }
-        let deadline = std::time::Instant::now() + HANDOFF;
+        let deadline = Instant::now() + HANDOFF;
         let mut audits = 0u64;
-        while !overlapped.load(Ordering::Acquire) || audits < 20 {
+        while !enough() || audits < 20 {
             assert!(
-                !stop.load(Ordering::Acquire) || overlapped.load(Ordering::Acquire),
-                "{level:?}: the writers stopped before any audit overlapped a commit"
+                !stop.load(Ordering::Acquire) || enough(),
+                "{level:?}: the writers stopped before the evidence was in"
             );
             assert!(
-                std::time::Instant::now() < deadline,
-                "{level:?}: no audit overlapped a commit within {HANDOFF:?}"
+                Instant::now() < deadline,
+                "{level:?}: within {HANDOFF:?} an audit overlapped a commit: {}, a transfer reached a table: {}",
+                overlapped.load(Ordering::Acquire),
+                reached_tables.load(Ordering::Acquire)
             );
             let tx = db.begin(level);
             let began = db.raw().snapshot().sequence();
@@ -316,44 +444,29 @@ fn snapshot_sum(db: &impl Flavour, level: IsolationLevel) {
 
 #[test]
 fn an_audit_reads_one_snapshot_while_transfers_commit_optimistic() {
-    for level in LEVELS {
+    each_case(|storage, level| {
         let dir = tempfile::tempdir().unwrap();
-        snapshot_sum(&optimistic(&dir), level);
-    }
+        snapshot_sum(&optimistic(&dir, storage), level, storage);
+    });
 }
 
 #[test]
 fn an_audit_reads_one_snapshot_while_transfers_commit_pessimistic() {
-    for level in LEVELS {
+    each_case(|storage, level| {
         let dir = tempfile::tempdir().unwrap();
-        snapshot_sum(&pessimistic(&dir), level);
-    }
+        snapshot_sum(&pessimistic(&dir, storage), level, storage);
+    });
 }
 
 // ---- 3 and 4. repeatable reads --------------------------------------------
 
-/// A helper thread that commits on request and acknowledges once the commit
-/// is visible: the forced write between a reader's two reads.
-fn serve_commits(
-    requests: mpsc::Receiver<usize>,
-    acks: &[mpsc::Sender<()>],
-    stop: &AtomicBool,
-    mut commit: impl FnMut(usize),
-) {
-    while !stop.load(Ordering::Acquire) {
-        match requests.recv_timeout(Duration::from_millis(50)) {
-            Ok(reader) => {
-                commit(reader);
-                acks[reader].send(()).unwrap();
-            }
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
-            Err(mpsc::RecvTimeoutError::Disconnected) => return,
-        }
-    }
-}
-
 /// Run `reader` on eight threads against one helper thread that commits
 /// `write` between a reader's two reads when asked.
+///
+/// The helper owns every acknowledgement sender and ends when the last
+/// request sender is dropped. A reader that finishes or panics, or a helper
+/// that panics, therefore releases whoever waits on it at once, with no flag
+/// for anyone to poll.
 fn with_forced_writes<D: Flavour>(
     db: &D,
     write: impl Fn(&D, usize) + Sync,
@@ -361,35 +474,38 @@ fn with_forced_writes<D: Flavour>(
 ) {
     let (request, requests) = mpsc::channel::<usize>();
     let (acks, ack_rx): (Vec<_>, Vec<_>) = (0..THREADS).map(|_| mpsc::channel::<()>()).unzip();
-    let ack_rx: Vec<Mutex<mpsc::Receiver<()>>> = ack_rx.into_iter().map(Mutex::new).collect();
-    let stop = AtomicBool::new(false);
     thread::scope(|scope| {
-        let _stop = StopOnDrop(&stop);
-        let (acks, stop, write) = (&acks, &stop, &write);
-        scope.spawn(move || serve_commits(requests, acks, stop, |r| write(db, r)));
-        let readers: Vec<_> = (0..THREADS)
-            .map(|r| {
-                let (request, ack_rx, reader) = (request.clone(), &ack_rx, &reader);
+        let (write, reader) = (&write, &reader);
+        scope.spawn(move || {
+            for asker in requests {
+                write(db, asker);
+                // A send fails only once its reader has gone, and that
+                // reader has already failed on its own account.
+                let _ = acks[asker].send(());
+            }
+        });
+        let readers: Vec<_> = ack_rx
+            .into_iter()
+            .enumerate()
+            .map(|(r, ack)| {
+                let request = request.clone();
                 scope.spawn(move || {
                     let force = || {
-                        request.send(r).unwrap();
-                        ack_rx[r]
-                            .lock()
-                            .unwrap()
-                            .recv_timeout(HANDOFF)
-                            .expect("the forced commit was acknowledged");
+                        request.send(r).expect("the commit helper is running");
+                        ack.recv_timeout(HANDOFF).unwrap_or_else(|e| {
+                            panic!("the forced commit was not acknowledged: {e:?}")
+                        });
                     };
                     reader(r, &force);
                 })
             })
             .collect();
-        // Join the readers first and only then let the guard stop the
-        // helper, so a reader's panic propagates instead of hanging.
+        // Only the readers' clones may keep the helper alive.
+        drop(request);
         let outcomes: Vec<_> = readers.into_iter().map(|h| h.join()).collect();
-        drop(_stop);
         for outcome in outcomes {
             if let Err(panic) = outcome {
-                std::panic::resume_unwind(panic);
+                resume_unwind(panic);
             }
         }
     });
@@ -403,51 +519,117 @@ fn own(r: usize) -> Vec<u8> {
     format!("own/{r}").into_bytes()
 }
 
-#[test]
-fn a_point_read_repeats_while_its_key_changes() {
-    for level in LEVELS {
-        let dir = tempfile::tempdir().unwrap();
-        let db = optimistic(&dir);
-        for r in 0..THREADS {
-            db.db().put(&shared(r), &encode(1)).unwrap();
+/// How a reader reads the key a scenario changes under it.
+#[derive(Clone, Copy, Debug)]
+enum Read {
+    /// `get`: validated at commit from `RepeatableRead` up.
+    Plain,
+    /// `get_for_update`: validated at commit at every level but
+    /// `ReadCommitted`, and, for a pessimistic reader, a lock it holds.
+    ForUpdate,
+}
+
+const READS: [Read; 2] = [Read::Plain, Read::ForUpdate];
+
+impl Read {
+    fn of(self, tx: &Transaction<'_>, key: &[u8]) -> Option<Vec<u8>> {
+        match self {
+            Self::Plain => tx.get(key),
+            Self::ForUpdate => tx.get_for_update(key),
         }
-        with_forced_writes(
-            &db,
-            |db, r| {
-                let value = decode(db.db().get(&shared(r)).unwrap());
-                db.db().put(&shared(r), &encode(value + 1)).unwrap();
-            },
-            |r, force| {
-                let tx = db.begin_transaction_with(level);
-                let first = decode(tx.get(&shared(r)).unwrap());
-                force();
-                assert_eq!(
-                    decode(db.db().get(&shared(r)).unwrap()),
-                    first + 1,
-                    "the forced commit is visible outside the transaction"
-                );
-                let second = decode(tx.get(&shared(r)).unwrap());
-                assert_eq!(first, second, "{level:?}: reader {r} read one snapshot");
-                tx.put(&own(r), &encode(first)).unwrap();
-                assert_eq!(decode(tx.get(&own(r)).unwrap()), first, "read your writes");
-                let result = tx.commit();
-                if validates_point_reads(level) {
-                    assert!(
-                        matches!(result, Err(TransactionError::Conflict { .. })),
-                        "{level:?}: a validated read overtaken by a commit aborts: {result:?}"
-                    );
-                } else {
-                    assert!(
-                        result.is_ok(),
-                        "{level:?}: an unvalidated read commits: {result:?}"
-                    );
-                }
-            },
-        );
+        .unwrap()
+    }
+
+    /// Whether the commit validates a key read this way and never written.
+    fn validated_at(self, level: IsolationLevel) -> bool {
+        match self {
+            Self::Plain => validates_point_reads(level),
+            Self::ForUpdate => level != IsolationLevel::ReadCommitted,
+        }
     }
 }
 
+fn point_read_repeats<D: Flavour>(db: &D, level: IsolationLevel, storage: Storage, read: Read) {
+    for r in 0..THREADS {
+        db.raw().put(&shared(r), &encode(1)).unwrap();
+    }
+    storage.flush(db.raw());
+    with_forced_writes(
+        db,
+        |db, r| {
+            let value = decode(db.raw().get(&shared(r)).unwrap());
+            db.raw().put(&shared(r), &encode(value + 1)).unwrap();
+            // The commit that follows must find this version in a table.
+            storage.flush(db.raw());
+        },
+        |r, force| {
+            let tx = db.begin(level);
+            let first = decode(read.of(&tx, &shared(r)));
+            force();
+            assert_eq!(
+                decode(db.raw().get(&shared(r)).unwrap()),
+                first + 1,
+                "the forced commit is visible outside the transaction"
+            );
+            let second = decode(read.of(&tx, &shared(r)));
+            assert_eq!(
+                first, second,
+                "{level:?} {read:?}: reader {r} read one snapshot"
+            );
+            tx.put(&own(r), &encode(first)).unwrap();
+            assert_eq!(decode(tx.get(&own(r)).unwrap()), first, "read your writes");
+            let (result, lookups) = table_lookups(|| tx.commit());
+            if read.validated_at(level) {
+                assert!(
+                    matches!(result, Err(TransactionError::Conflict { .. })),
+                    "{level:?} {read:?}: a validated read overtaken by a commit aborts: {result:?}"
+                );
+                assert!(
+                    !storage.is_tables() || lookups > 0,
+                    "{level:?} {read:?}: the refused commit never probed the table"
+                );
+            } else {
+                assert!(
+                    result.is_ok(),
+                    "{level:?} {read:?}: an unvalidated read commits: {result:?}"
+                );
+            }
+        },
+    );
+}
+
+#[test]
+fn a_point_read_repeats_while_its_key_changes_optimistic() {
+    each_case(|storage, level| {
+        for read in READS {
+            let dir = tempfile::tempdir().unwrap();
+            point_read_repeats(&optimistic(&dir, storage), level, storage, read);
+        }
+    });
+}
+
+#[test]
+fn a_point_read_repeats_while_its_key_changes_pessimistic() {
+    each_case(|storage, level| {
+        for read in READS {
+            let dir = tempfile::tempdir().unwrap();
+            point_read_repeats(&pessimistic(&dir, storage), level, storage, read);
+        }
+    });
+}
+
 const SEEDED: usize = 4;
+
+/// The row reader `r` reads before its first scan.
+fn mine(r: usize) -> Vec<u8> {
+    format!("row/mine-{r}").into_bytes()
+}
+
+/// The row reader `r` reads after the forced insertion and before its second
+/// scan.
+fn late(r: usize) -> Vec<u8> {
+    format!("row/late-{r}").into_bytes()
+}
 
 fn scanned(tx: &Transaction<'_>) -> BTreeSet<Vec<u8>> {
     tx.scan_stream(Some(b"row/"), Some(b"row0"))
@@ -455,41 +637,83 @@ fn scanned(tx: &Transaction<'_>) -> BTreeSet<Vec<u8>> {
         .collect()
 }
 
-#[test]
-fn a_scan_repeats_while_its_range_grows() {
-    for level in LEVELS {
-        let dir = tempfile::tempdir().unwrap();
-        let db = optimistic(&dir);
-        let seeded: BTreeSet<Vec<u8>> = (0..SEEDED)
-            .map(|i| format!("row/seed-{i}").into_bytes())
-            .collect();
-        for key in &seeded {
-            db.db().put(key, b"x").unwrap();
-        }
-        with_forced_writes(
-            &db,
-            |db, r| {
-                db.db()
-                    .put(format!("row/new-{r}").as_bytes(), b"x")
-                    .unwrap()
-            },
-            |r, force| {
-                let tx = db.begin_transaction_with(level);
-                let first = scanned(&tx);
-                assert!(
-                    first.is_superset(&seeded),
-                    "{level:?}: reader {r} sees every seeded row"
-                );
-                force();
-                let second = scanned(&tx);
-                assert_eq!(first, second, "{level:?}: reader {r} scanned one snapshot");
-                let inserted = format!("row/new-{r}").into_bytes();
-                assert!(!second.contains(&inserted));
-                assert!(
-                    scanned(&db.begin_transaction_with(level)).contains(&inserted),
-                    "{level:?}: a later transaction sees the insertion"
-                );
-            },
-        );
+fn scan_repeats<D: Flavour>(db: &D, level: IsolationLevel, storage: Storage, read: Read) {
+    let seeded: BTreeSet<Vec<u8>> = (0..SEEDED)
+        .map(|i| format!("row/seed-{i}").into_bytes())
+        .chain((0..THREADS).map(mine))
+        .chain((0..THREADS).map(late))
+        .collect();
+    for key in &seeded {
+        db.raw().put(key, b"x").unwrap();
     }
+    storage.flush(db.raw());
+    with_forced_writes(
+        db,
+        |db, r| {
+            db.raw()
+                .put(format!("row/new-{r}").as_bytes(), b"x")
+                .unwrap();
+            storage.flush(db.raw());
+        },
+        |r, force| {
+            let tx = db.begin(level);
+            // A row read before the scan: a pessimistic `get_for_update`
+            // locks it, and the scan has to serve it where `get` does, in the
+            // middle of a stretch.
+            assert_eq!(
+                read.of(&tx, &mine(r)).as_deref(),
+                Some(&b"x"[..]),
+                "{level:?} {read:?}: reader {r} reads its first row"
+            );
+            let first = scanned(&tx);
+            assert!(
+                first.is_superset(&seeded),
+                "{level:?} {read:?}: reader {r} sees every seeded row"
+            );
+            force();
+            // A lock taken after the forced commit is sampled past the begin
+            // snapshot, so the second scan serves this row at a sequence of its
+            // own: the row is the same, and the insertion stays out of sight.
+            assert_eq!(
+                read.of(&tx, &late(r)).as_deref(),
+                Some(&b"x"[..]),
+                "{level:?} {read:?}: reader {r} reads its second row"
+            );
+            let (second, lookups) = table_lookups(|| scanned(&tx));
+            assert!(
+                !storage.is_tables() || lookups > 0,
+                "{level:?} {read:?}: reader {r}'s second scan never reached a table"
+            );
+            assert_eq!(
+                first, second,
+                "{level:?} {read:?}: reader {r} scanned one snapshot"
+            );
+            let inserted = format!("row/new-{r}").into_bytes();
+            assert!(!second.contains(&inserted));
+            assert!(
+                scanned(&db.begin(level)).contains(&inserted),
+                "{level:?} {read:?}: a later transaction sees the insertion"
+            );
+        },
+    );
+}
+
+#[test]
+fn a_scan_repeats_while_its_range_grows_optimistic() {
+    each_case(|storage, level| {
+        for read in READS {
+            let dir = tempfile::tempdir().unwrap();
+            scan_repeats(&optimistic(&dir, storage), level, storage, read);
+        }
+    });
+}
+
+#[test]
+fn a_scan_repeats_while_its_range_grows_pessimistic() {
+    each_case(|storage, level| {
+        for read in READS {
+            let dir = tempfile::tempdir().unwrap();
+            scan_repeats(&pessimistic(&dir, storage), level, storage, read);
+        }
+    });
 }
