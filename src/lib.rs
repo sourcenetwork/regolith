@@ -7486,11 +7486,11 @@ mod tests {
         db.put(b"k", b"v").unwrap();
         let dump = stats.dump();
         for ticker_name in [
-            "regolith.bytes_written",
-            "regolith.keys_written",
-            "regolith.bloom_filter_useful",
-            "regolith.compaction_count",
-            "regolith.flush_count",
+            "regolith.write.bytes",
+            "regolith.write.keys",
+            "regolith.bloom.useful",
+            "regolith.compaction.count",
+            "regolith.flush.count",
         ] {
             assert!(dump.contains(ticker_name), "dump missing {ticker_name}");
         }
@@ -7639,7 +7639,7 @@ mod tests {
         let text = db.get_property("regolith.stats").unwrap();
         assert!(text.contains("== regolith engine stats =="));
         assert!(text.contains("Level  Files     Size(B)"));
-        assert!(text.contains("regolith.keys_written"));
+        assert!(text.contains("regolith.write.keys"));
     }
 
     #[test]
