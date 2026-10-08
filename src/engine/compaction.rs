@@ -19,7 +19,7 @@ use crate::portability::{AtomicBool, Ordering};
 
 use super::block_cache::BlockCache;
 use super::internal_key::{compare_internal_keys, decode_internal_key, user_key_of};
-use super::manifest::{MAX_LEVELS, VersionEdit};
+use super::manifest::{MAX_LEVELS, VersionEdit, overlapping};
 use super::range_tombstone::{
     RangeTombstone, RangeTombstoneSet, exclusive_successor, sort_dedup_tombstones,
 };
@@ -2247,13 +2247,7 @@ fn key_range(files: &[Arc<LiveSst>]) -> (Vec<u8>, Vec<u8>) {
 }
 
 fn find_overlapping(files: &[Arc<LiveSst>], min_key: &[u8], max_key: &[u8]) -> Vec<Arc<LiveSst>> {
-    files
-        .iter()
-        .filter(|f| {
-            f.meta.smallest_key.as_slice() <= max_key && f.meta.largest_key.as_slice() >= min_key
-        })
-        .map(Arc::clone)
-        .collect()
+    overlapping(files, min_key, max_key).to_vec()
 }
 
 fn delete_old_files(

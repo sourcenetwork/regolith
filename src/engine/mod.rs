@@ -11,6 +11,8 @@ pub(crate) mod compaction_backoff;
 pub(crate) mod disk_check;
 pub(crate) mod filter_block;
 pub(crate) mod index_block;
+#[cfg(test)]
+mod ingest_range_tests;
 pub(crate) mod internal_key;
 pub(crate) mod iterator;
 pub(crate) mod lookup_key;
@@ -49,6 +51,7 @@ use memtable::{MemTable, MemTableConfig};
 
 const STOP_TOO_MANY_MEMTABLES: &str = "stop: too many memtables";
 use pending_outputs::PendingOutputs;
+use range_tombstone::table_key_range;
 use read_horizon::ReadHorizon;
 use read_view::{ReadView, ReadViewCell, VersionStore};
 use skiplist::InsertHint;
@@ -213,15 +216,6 @@ fn grouped_multi_get_entries(keys: &[&[u8]]) -> Vec<MultiGetEntry> {
 
 fn file_covers_key(file: &LiveSst, key: &[u8]) -> bool {
     file.meta.smallest_key.as_slice() <= key && key <= file.meta.largest_key.as_slice()
-}
-
-fn key_range_for_file(entries: &[MultiGetEntry], file: &LiveSst) -> std::ops::Range<usize> {
-    let start =
-        entries.partition_point(|entry| entry.key.as_slice() < file.meta.smallest_key.as_slice());
-    let end = start
-        + entries[start..]
-            .partition_point(|entry| entry.key.as_slice() <= file.meta.largest_key.as_slice());
-    start..end
 }
 
 fn resolve_multi_get_value(pseq: u64, popt: Option<DbSlice>, rt_seq: u64) -> Option<Vec<u8>> {
@@ -1639,23 +1633,23 @@ impl RegolithEngine {
             }
         }
 
-        // 4. L1..Ln: point files are non-overlapping, while RT-only
-        //    files can cover gaps or boundaries. Entries are sorted
-        //    and deduplicated, so each file only examines the key
-        //    subrange overlapped by its metadata instead of every
-        //    unresolved input key.
-        for level in 1..version.levels.len() {
-            let files = &version.levels[level];
+        // 4. L1..Ln: a level is one sorted run, so each key finds the few
+        //    tables covering it by binary search rather than being matched
+        //    against every table, and a table whose range covers the key
+        //    but holds no point entry for it, as a tombstone-only table
+        //    does, costs no more than any other. As a single-key read
+        //    does, a key sees the tombstones of all its covering tables in
+        //    a level before any of them is probed.
+        for files in version.levels.iter().skip(1) {
             if files.is_empty() {
                 continue;
             }
-
-            for file in files {
-                for idx in key_range_for_file(&entries, file) {
-                    let entry = &mut entries[idx];
-                    if entry.resolved {
-                        continue;
-                    }
+            for entry in &mut entries {
+                if entry.resolved {
+                    continue;
+                }
+                let run = manifest::covering(files, &entry.key);
+                for file in run {
                     let rt = file
                         .reader
                         .covering_range_tombstone_seq(&entry.key, snapshot_seq);
@@ -1663,37 +1657,26 @@ impl RegolithEngine {
                         entry.max_rt = rt;
                     }
                 }
-            }
-
-            for file in files {
-                if file.meta.num_entries == 0 {
-                    continue;
-                }
-                for idx in key_range_for_file(&entries, file) {
-                    let entry = &mut entries[idx];
-                    if entry.resolved {
-                        continue;
-                    }
+                for file in run.iter().filter(|file| file.meta.num_entries > 0) {
                     lk.reset_prefixed(&entry.key, snapshot_seq);
                     match with_key_scratch(|buf| file.reader.get(&lk, buf, &self.cache))? {
                         LookupResult::Found { seq, value } => {
                             let value = resolve_multi_get_value(seq, Some(value), entry.max_rt);
                             set_multi_get_result(entry, &mut results, value);
                             unresolved -= 1;
+                            break;
                         }
                         LookupResult::FoundTombstone { .. } => {
                             set_multi_get_result(entry, &mut results, None);
                             unresolved -= 1;
+                            break;
                         }
                         LookupResult::NotInTable => {}
                     }
-                    if unresolved == 0 {
-                        return Ok(results);
-                    }
                 }
-            }
-            if unresolved == 0 {
-                return Ok(results);
+                if unresolved == 0 {
+                    return Ok(results);
+                }
             }
         }
 
@@ -2810,21 +2793,11 @@ impl RegolithEngine {
                     )
                 })?;
             }
-            let (smallest, largest) = if let Some(first) = first_user_key {
-                (first, last_user_key)
-            } else if !rts.is_empty() {
-                let mut lo = rts[0].start.clone();
-                let mut hi = rts[0].end.clone();
-                for rt in rts.iter().skip(1) {
-                    if rt.start < lo {
-                        lo = rt.start.clone();
-                    }
-                    if rt.end > hi {
-                        hi = rt.end.clone();
-                    }
-                }
-                (lo, hi)
-            } else {
+            // The range the installed table will be recorded with, tombstones
+            // included, because that is what must not overlap the level the
+            // table is placed in.
+            let points = first_user_key.map(|first| (first, last_user_key));
+            let Some((smallest, largest)) = table_key_range(points, rts) else {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
                     format!("ingest: source file {} is empty", path.display()),
