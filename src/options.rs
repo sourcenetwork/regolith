@@ -71,15 +71,16 @@ pub enum CompactionDecision {
 ///
 /// # Snapshot isolation
 ///
-/// Compaction filters currently run only when no live [`crate::Snapshot`]
-/// is pinned. This guarantees that every `Snapshot` taken before
-/// compaction still observes the pre-filter value until the snapshot
-/// is dropped. When a snapshot is alive, compaction still runs but
-/// skips the filter entirely. Finer-grained per-snapshot filtering is
-/// a planned follow-up.
+/// Filters run whether or not a [`crate::Snapshot`] is live, so a filter
+/// that removes or changes a value an open snapshot can see changes what
+/// that snapshot reads from then on. A filter that only hides values
+/// readers already treat as absent is unaffected:
+/// [`crate::TtlCompactionFilter`] removes only expired values, and an
+/// expired value already reads as absent.
 pub trait CompactionFilter: Send + Sync + 'static {
     /// Inspect a point entry. Called once per surviving
-    /// `(user_key, value)` pair during compaction.
+    /// `(user_key, value)` pair during compaction; versions no reader
+    /// can see are dropped first and never reach the filter.
     fn filter(&self, level: usize, key: &[u8], value: &[u8]) -> CompactionDecision;
 
     /// Inspect a range tombstone. Default implementation keeps every
@@ -127,9 +128,16 @@ pub trait MergeOperator: Send + Sync + 'static {
 
     /// Optionally fold two adjacent operands `left` (older) and
     /// `right` (newer) into a single equivalent operand without a
-    /// base value. Compaction calls this to shrink merge chains in
-    /// the middle of an LSM level. The default implementation
-    /// returns `None`, which disables compaction-time collapse.
+    /// base value. Compaction calls this to shrink a key's run of
+    /// operands when it has no value to fold them onto, which includes
+    /// every run a live snapshot separates from its base. It folds a
+    /// run pairwise from oldest to newest, so the fold must be
+    /// associative: any run, in any grouping, has to give the value
+    /// [`MergeOperator::full_merge`] gives over the unfolded operands.
+    /// An operator whose fold is not exactly associative (floating-point
+    /// addition, for one) should not implement this; `full_merge` onto a
+    /// base value still folds. The default implementation returns
+    /// `None`, which leaves such runs as written.
     fn partial_merge(&self, key: &[u8], left: &[u8], right: &[u8]) -> Option<Vec<u8>> {
         let _ = (key, left, right);
         None

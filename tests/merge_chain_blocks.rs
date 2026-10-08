@@ -5,9 +5,10 @@
 //! data block it landed in, and the read moved on to the next older file:
 //! every operand in the rest of the file, and the base beneath them, was
 //! skipped, and a later compaction could write the short sum back as the
-//! key's value. A pinned snapshot makes such chains routine, since it keeps
-//! compaction from folding operands, so every transaction's snapshot could
-//! trigger it.
+//! key's value. A snapshot taken after the key's base makes such chains
+//! routine: compaction never folds operands onto a base in an older snapshot
+//! stripe, and this operator cannot fold operands alone, so every
+//! transaction's snapshot could trigger it.
 
 // Native-only. wasm-pack builds every test target for wasm32, and these use
 // the filesystem. The browser suite lives in tests/wasm_opfs*.rs.
@@ -71,8 +72,11 @@ fn sst_bytes(db: &Db) -> u64 {
         .unwrap()
 }
 
-fn merge_operands(db: &Db) {
+fn base(db: &Db) {
     db.put(b"counter", &100i64.to_be_bytes()).unwrap();
+}
+
+fn merge_operands(db: &Db) {
     for _ in 0..OPERANDS {
         db.merge(b"counter", &1i64.to_be_bytes()).unwrap();
     }
@@ -86,6 +90,7 @@ fn a_flushed_chain_spanning_blocks_reads_whole() {
     for opts in [options(), partitioned()] {
         let dir = tempfile::tempdir().unwrap();
         let db = Db::open(dir.path(), opts).unwrap();
+        base(&db);
         merge_operands(&db);
         db.flush().unwrap();
         assert_eq!(counter(&db), 100 + OPERANDS);
@@ -97,11 +102,23 @@ fn a_chain_a_snapshot_kept_unfolded_reads_whole_and_compacts_whole() {
     for opts in [options(), partitioned()] {
         let dir = tempfile::tempdir().unwrap();
         let db = Db::open(dir.path(), opts).unwrap();
+        base(&db);
+        // The snapshot sits between the base and the operands, so the
+        // operands are a stripe of their own that compaction cannot fold
+        // onto the base or, lacking a `partial_merge`, into one another.
         let snapshot = db.snapshot();
         merge_operands(&db);
         db.flush().unwrap();
+        let flushed = sst_bytes(&db);
         db.compact_range(None, None).unwrap();
+        assert!(
+            sst_bytes(&db) > flushed / 2,
+            "the chain stayed unfolded: {} bytes from {flushed}",
+            sst_bytes(&db)
+        );
         assert_eq!(counter(&db), 100 + OPERANDS, "while the snapshot is held");
+        let held = snapshot.get(b"counter").unwrap().unwrap();
+        assert_eq!(i64::from_be_bytes(held[..].try_into().unwrap()), 100);
 
         // Folding the chain once the snapshot is gone must fold all of it.
         // A compaction only rewrites the chain when a newer file overlaps
