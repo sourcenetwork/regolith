@@ -372,6 +372,33 @@ fn a_scan_lays_the_merges_over_the_snapshot_in_both_directions() {
 }
 
 #[test]
+fn a_scan_that_reaches_a_merged_key_validates_it_as_a_read_at_every_level() {
+    for level in [
+        IsolationLevel::ReadCommitted,
+        IsolationLevel::SnapshotIsolation,
+        IsolationLevel::RepeatableRead,
+        IsolationLevel::Serializable,
+        IsolationLevel::DefraLevel,
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let db = OptimisticTransactionDb::open(dir.path(), counting()).unwrap();
+        db.db().put(b"k", &delta(10)).unwrap();
+        let tx = db.begin_transaction_with(level);
+        tx.merge(b"k", &delta(1)).unwrap();
+        assert_eq!(
+            scanned(&tx, None, None, false),
+            [(b"k".to_vec(), 11)],
+            "{level:?}"
+        );
+        db.db().merge(b"k", &delta(1)).unwrap();
+        assert!(
+            matches!(tx.commit(), Err(TransactionError::Conflict { .. })),
+            "{level:?}: the scan walked the key the merge builds on"
+        );
+    }
+}
+
+#[test]
 fn a_savepoint_rollback_restores_the_merges_buffered_before_it() {
     each_flavour(counting, |flavour| {
         flavour.db().put(b"k", &delta(10)).unwrap();

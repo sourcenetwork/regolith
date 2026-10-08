@@ -299,6 +299,104 @@ fn without_a_policy_scans_are_recorded_as_at_repeatable_read() {
     assert!(conflicted(second.commit()));
 }
 
+/// The value of the counter under `key`.
+fn counter_at(db: &OptimisticTransactionDb, key: &[u8]) -> i64 {
+    i64::from_be_bytes(db.db().get(key).unwrap().unwrap()[..].try_into().unwrap())
+}
+
+#[test]
+fn a_merge_made_before_a_scan_of_a_commutative_prefix_stays_blind() {
+    for flush in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let db = open(dir.path());
+        db.db().put(b"h/a", b"cid").unwrap();
+        db.db().put(b"h/m", &0i64.to_be_bytes()).unwrap();
+        db.db().put(b"h/z", b"cid").unwrap();
+        if flush {
+            db.db().flush().unwrap();
+        }
+
+        let first = db.begin_transaction_with(IsolationLevel::DefraLevel);
+        let second = db.begin_transaction_with(IsolationLevel::DefraLevel);
+        for tx in [&first, &second] {
+            tx.merge(b"h/m", &1i64.to_be_bytes()).unwrap();
+            let walked: Vec<_> = tx.scan_stream(Some(b"h/"), Some(b"h0")).collect();
+            assert_eq!(walked.len(), 3, "flush={flush}");
+            assert_eq!(
+                walked[1].1.to_vec(),
+                1i64.to_be_bytes(),
+                "flush={flush}: the scan yields the key with the transaction's operand applied"
+            );
+        }
+        first.commit().unwrap();
+        let second = second.commit();
+        assert!(second.is_ok(), "flush={flush}: {second:?}");
+        assert_eq!(counter_at(&db, b"h/m"), 2, "flush={flush}");
+    }
+}
+
+/// A plain write to a key that lands after a transaction's snapshot.
+#[derive(Clone, Copy, Debug)]
+enum Newer {
+    Put,
+    Merge,
+    Delete,
+}
+
+impl Newer {
+    const ALL: [Self; 3] = [Self::Put, Self::Merge, Self::Delete];
+
+    fn apply(self, db: &OptimisticTransactionDb, key: &[u8]) {
+        match self {
+            Self::Put => db.db().put(key, &5i64.to_be_bytes()).unwrap(),
+            Self::Merge => db.db().merge(key, &1i64.to_be_bytes()).unwrap(),
+            Self::Delete => db.db().delete(key).unwrap(),
+        }
+    }
+}
+
+#[test]
+fn a_merged_key_inside_a_scanned_stretch_is_a_read_unless_the_stretch_is_commutative() {
+    for flush in [false, true] {
+        for newer in Newer::ALL {
+            // In a commutative prefix the merge stays blind, so only a newer
+            // replacement conflicts with it. Anywhere else the scan walked the
+            // key before the merge, so any newer write does.
+            for (prefix, key, conflicts) in [
+                (&b"h/"[..], &b"h/m"[..], !matches!(newer, Newer::Merge)),
+                (&b"o/"[..], &b"o/m"[..], true),
+            ] {
+                let dir = tempfile::tempdir().unwrap();
+                let db = open(dir.path());
+                db.db().put(&[prefix, &b"a"[..]].concat(), b"x").unwrap();
+                db.db().put(key, &0i64.to_be_bytes()).unwrap();
+                db.db().put(&[prefix, &b"z"[..]].concat(), b"x").unwrap();
+
+                let tx = db.begin_transaction_with(IsolationLevel::DefraLevel);
+                tx.merge(key, &1i64.to_be_bytes()).unwrap();
+                let end = [&prefix[..1], &b"0"[..]].concat();
+                assert_eq!(tx.scan_stream(Some(prefix), Some(&end)).count(), 3);
+                newer.apply(&db, key);
+                if flush {
+                    db.db().flush().unwrap();
+                }
+                let committed = tx.commit();
+                let name = format!("{newer:?} flush={flush} {}", String::from_utf8_lossy(key));
+                if conflicts {
+                    match committed {
+                        Err(TransactionError::Conflict { key: named, .. }) => {
+                            assert_eq!(named, key, "{name}");
+                        }
+                        other => panic!("{name}: expected a conflict, got {other:?}"),
+                    }
+                } else {
+                    assert!(committed.is_ok(), "{name}: {committed:?}");
+                }
+            }
+        }
+    }
+}
+
 /// Commit a blind merge onto a key with `operands` flushed merges beneath
 /// it, after one more merge landed since the transaction's snapshot. Returns
 /// the block cache lookups the commit made and the bytes of SSTable the
