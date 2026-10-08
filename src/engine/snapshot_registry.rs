@@ -192,18 +192,17 @@ impl SnapshotRegistry {
     /// when no snapshot is live. Compaction cuts a key's versions into
     /// stripes at these seqs.
     ///
-    /// A pass reads this once and keeps the list for the whole pass. A
-    /// snapshot registered afterwards reads at the visible sequence, at or
-    /// above every entry of a table flushed before it registered, so it
-    /// cannot split a stripe of those entries; one released afterwards only
-    /// makes the pass fold less than it could. The one gap is a table
-    /// flushed between this read and the pass picking its inputs, the
-    /// window `tests/adversarial_readview.rs` attacks.
+    /// A pass reads this once its input tables are fixed, never before,
+    /// and keeps the list for the whole merge; `perform_compaction_to`
+    /// says why that loses no snapshot's version. A snapshot released
+    /// after the read only makes the pass fold less than it could.
     pub(crate) fn live_seqs(&self) -> Vec<u64> {
-        // vertexia: read before the pass picks its inputs, so a snapshot
-        // registered in between can sit inside a table flushed in between;
-        // read after the pick (in `perform_compaction_to`) to close that.
-        self.active.lock().keys().copied().collect()
+        let live: Vec<u64> = self.active.lock().keys().copied().collect();
+        #[cfg(test)]
+        if let Some(hook) = AFTER_LIVE_READ.with(|slot| slot.borrow_mut().take()) {
+            hook();
+        }
+        live
     }
 
     /// Number of distinct live snapshots. Counts pins, not
@@ -249,6 +248,26 @@ impl SnapshotRegistry {
     pub(crate) fn wakes_issued(&self) -> usize {
         self.wakes.load(Ordering::Relaxed)
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test seam: runs once, on this thread, right after the next
+    /// [`SnapshotRegistry::live_seqs`] has taken its list. Thread-local so a
+    /// parallel test never fires another test's hook.
+    static AFTER_LIVE_READ: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Test-only: run `hook` once, on this thread, right after the next
+/// [`SnapshotRegistry::live_seqs`] has taken its list.
+///
+/// A pin the hook registers is missing from that list. That is how a test
+/// puts a snapshot, and the flush of a newer version beside it, after a
+/// compaction pass has read the live snapshots.
+#[cfg(test)]
+pub(crate) fn after_next_live_read(hook: impl FnOnce() + 'static) {
+    AFTER_LIVE_READ.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
 }
 
 #[cfg(test)]
@@ -305,6 +324,25 @@ mod tests {
         assert_eq!(r.live_seqs(), vec![10]);
         r.release(10);
         assert!(r.live_seqs().is_empty());
+    }
+
+    #[test]
+    fn the_live_read_hook_runs_once_after_the_list_is_taken() {
+        let r = Arc::new(SnapshotRegistry::new());
+        r.register(5);
+        let hooked = Arc::clone(&r);
+        after_next_live_read(move || hooked.register(9));
+
+        assert_eq!(
+            r.live_seqs(),
+            vec![5],
+            "the pin the hook registers is not in the list it follows"
+        );
+        assert_eq!(
+            r.live_seqs(),
+            vec![5, 9],
+            "the hook is spent after one read"
+        );
     }
 
     #[test]
