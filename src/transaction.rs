@@ -1600,33 +1600,59 @@ impl TxnScanStream<'_> {
             return ControlFlow::Break(None);
         };
         self.step_cursor();
-        match &mut self.run {
-            Some(open) => open.extend(&self.probe),
+        Self::join_stretch(txn, &mut self.run, self.reverse, &self.probe);
+        ControlFlow::Break(Some((key, value)))
+    }
+
+    /// Take `key` (CF-prefixed), a snapshot key the walk read at the begin
+    /// snapshot, into the stretch in `run`, starting and registering one if
+    /// none is open. At Serializable the key is also recorded per key through
+    /// `observe`.
+    fn join_stretch(txn: &Transaction<'_>, run: &mut Option<OpenRun>, reverse: bool, key: &[u8]) {
+        match run {
+            Some(open) => open.extend(key),
             None => {
-                let (run, open) = OpenRun::start(&self.probe, self.reverse);
-                txn.record_scan_run(run);
-                self.run = Some(open);
+                let (record, open) = OpenRun::start(key, reverse);
+                txn.record_scan_run(record);
+                *run = Some(open);
             }
         }
         if txn.isolation.validates_scanned_keys() {
-            txn.observe(&self.probe, txn.snapshot_seq, false);
+            txn.observe(key, txn.snapshot_seq, false);
         }
-        ControlFlow::Break(Some((key, value)))
     }
 
     /// Hand out the transaction's own entry at the head of `buffered`.
     ///
     /// The same protocol as `yield_cursor`. A key the transaction merged into
-    /// is read the way [`Transaction::get`] reads it: the value its operands
-    /// apply to is read, and recorded as a read, here. A merge the operator
-    /// declines ends the stream, with the reason left for `status`.
+    /// and did not replace has its operands lie on a snapshot key, which the
+    /// walk reads as it reads any other: at the key's read sequence, joining
+    /// the stretch when that is the begin snapshot and ending it when a
+    /// promotion moved it past that, and recording a read of it only at
+    /// Serializable. Every other entry comes from the write buffer and ends
+    /// the stretch. A merge the operator declines ends the stream, with the
+    /// reason left for `status`.
     fn yield_buffered(&mut self) -> ControlFlow<Option<(Vec<u8>, DbSlice)>> {
         let Some((prefixed, writes)) = self.buffered.next() else {
             return ControlFlow::Break(None);
         };
         let txn = self.txn;
+        // Only an entry that reads its base uses the sequence: `apply` takes
+        // the closure below for nothing else.
+        let read_seq = if writes.reads_base() {
+            let read_seq = txn.scan_read_seq(&prefixed);
+            if read_seq > txn.snapshot_seq {
+                self.run = None;
+            } else {
+                Self::join_stretch(txn, &mut self.run, self.reverse, &prefixed);
+            }
+            read_seq
+        } else {
+            self.run = None;
+            txn.snapshot_seq
+        };
         let found = writes.apply(txn.engine.merge_operator(), &prefixed, || {
-            txn.read_committed(&prefixed)
+            txn.engine.get_slice_at(&prefixed, read_seq)
         });
         match found {
             Ok(Some(Some(value))) => {
@@ -1665,7 +1691,6 @@ impl Iterator for TxnScanStream<'_> {
                 }
                 // Only the transaction has this key.
                 (None, Some(_)) => {
-                    self.run = None;
                     if let ControlFlow::Break(item) = self.yield_buffered() {
                         return item;
                     }
@@ -1683,7 +1708,6 @@ impl Iterator for TxnScanStream<'_> {
                         }
                     }
                     std::cmp::Ordering::Greater => {
-                        self.run = None;
                         if let ControlFlow::Break(item) = self.yield_buffered() {
                             return item;
                         }
@@ -1694,7 +1718,6 @@ impl Iterator for TxnScanStream<'_> {
                     // with no put or delete beneath them read the entry
                     // themselves, as `get` would.
                     std::cmp::Ordering::Equal => {
-                        self.run = None;
                         self.step_cursor();
                         if let ControlFlow::Break(item) = self.yield_buffered() {
                             return item;
@@ -2652,6 +2675,64 @@ mod tests {
             "a stream that yields nothing records nothing"
         );
         assert!(fresh.scan_runs.get().is_none());
+    }
+
+    /// Appends every operand to the base.
+    struct Append;
+
+    impl crate::MergeOperator for Append {
+        fn name(&self) -> &'static str {
+            "append"
+        }
+
+        fn full_merge(
+            &self,
+            _key: &[u8],
+            base: Option<&[u8]>,
+            operands: &[&[u8]],
+        ) -> Option<Vec<u8>> {
+            let mut out = base.unwrap_or_default().to_vec();
+            out.extend(operands.concat());
+            Some(out)
+        }
+    }
+
+    // The base of a key the transaction merged into is a snapshot key like
+    // any the scan yields: it joins the stretch and is recorded as a read only
+    // where a scan records every key. `get` records it at every level.
+    #[test]
+    fn a_scan_reaching_a_merged_key_records_a_read_of_it_only_at_serializable() {
+        for (level, recorded) in [
+            (IsolationLevel::SnapshotIsolation, 0),
+            (IsolationLevel::RepeatableRead, 0),
+            (IsolationLevel::DefraLevel, 0),
+            (IsolationLevel::Serializable, 1),
+        ] {
+            let dir = TempDir::new().unwrap();
+            let opts = Options {
+                merge_operator: Some(Arc::new(Append)),
+                ..Options::default()
+            };
+            let db = OptimisticTransactionDb::open(dir.path(), opts).unwrap();
+            db.db().put(b"k", b"base").unwrap();
+            let tx = db.begin_transaction_with(level);
+            tx.merge(b"k", b"+op").unwrap();
+
+            let walked: Vec<(Vec<u8>, Vec<u8>)> = tx
+                .scan_stream(None, None)
+                .map(|(key, value)| (key, value.to_vec()))
+                .collect();
+            assert_eq!(walked, [(b"k".to_vec(), b"base+op".to_vec())]);
+            assert_eq!(tx.tracked.len(), recorded, "{level:?}");
+            assert_eq!(
+                tx.scan_runs.get().map(|runs| runs.len()),
+                Some(1),
+                "{level:?}: the merged key's base is a snapshot key and starts a stretch"
+            );
+
+            assert_eq!(tx.get(b"k").unwrap(), Some(b"base+op".to_vec()));
+            assert_eq!(tx.tracked.len(), 1, "{level:?}: a get records the read");
+        }
     }
 
     /// Regression: `scan_stream_in` used to index `tracked` only at the

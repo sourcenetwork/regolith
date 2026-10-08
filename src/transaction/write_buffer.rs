@@ -72,6 +72,12 @@ impl KeyWrites {
         self.base.is_none() && merge.is_none()
     }
 
+    /// Whether applying these writes reads the database: operands that lie on
+    /// nothing the transaction replaced, so on what the key holds there.
+    pub(super) fn reads_base(&self) -> bool {
+        self.base.is_none() && !self.operands.is_empty()
+    }
+
     /// What a read of `key` finds, or `None` when the transaction's writes do
     /// not decide it and the caller reads the database. `Some(None)` is a key
     /// the transaction deleted.
@@ -228,6 +234,15 @@ mod tests {
         );
         let over_nothing = KeyWrites::fold([merge(b"a")]);
         assert_eq!(applied(over_nothing, None), Some(Some(b"a".to_vec())));
+    }
+
+    #[test]
+    fn only_operands_over_nothing_replaced_read_the_database() {
+        assert!(KeyWrites::fold([merge(b"b"), merge(b"a")]).reads_base());
+        assert!(!KeyWrites::fold([merge(b"b"), put(b"P")]).reads_base());
+        assert!(!KeyWrites::fold([merge(b"b"), Write::Delete]).reads_base());
+        assert!(!KeyWrites::fold([put(b"P")]).reads_base());
+        assert!(!KeyWrites::fold([Write::Delete]).reads_base());
     }
 
     #[test]
