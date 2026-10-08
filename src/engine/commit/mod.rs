@@ -47,6 +47,7 @@ use crate::statistics::{Histogram, Ticker};
 mod request;
 mod slot;
 mod stall;
+mod terminator;
 
 pub(crate) use request::WriteRequest;
 pub(crate) use slot::WriteSlot;
@@ -364,13 +365,13 @@ impl RegolithEngine {
             let mut merged_keys: std::collections::HashSet<&[u8]> =
                 std::collections::HashSet::new();
             for op in &ops {
-                let key = match op {
-                    WriteBatchOp::Put { key, .. } | WriteBatchOp::Delete { key } => key,
+                let (key, merged) = match op {
+                    WriteBatchOp::Put { key, .. } | WriteBatchOp::Delete { key } => (key, false),
                     WriteBatchOp::Merge { key, .. } => {
                         if !merged_keys.insert(key.as_slice()) {
                             continue;
                         }
-                        key
+                        (key, true)
                     }
                     // Range deletes are not validated (transaction.rs:459-460).
                     WriteBatchOp::DeleteRange { .. } => continue,
@@ -384,17 +385,22 @@ impl RegolithEngine {
                 {
                     continue;
                 }
+                // Operands commute, so a key the batch only merges into
+                // conflicts only with a replacement newer than the snapshot,
+                // and one walk settles that. The probe below then runs for
+                // such a key only once it is about to conflict anyway.
+                if merged
+                    && let Some(replaced) = &replaced
+                    && !replaced.contains(key)
+                    && self
+                        .newest_terminator_seq_above(key, observed_seq, &view)?
+                        .is_none()
+                {
+                    continue;
+                }
                 if let Some((latest_seq, newest_type)) = self.latest_version_in_view(key, &view)?
                     && latest_seq > observed_seq
                 {
-                    if let Some(replaced) = &replaced
-                        && !replaced.contains(key)
-                        && self
-                            .newest_terminator_seq_in_view(key, &view)?
-                            .is_none_or(|seq| seq <= observed_seq)
-                    {
-                        continue;
-                    }
                     // A blind write of the value the key already holds is not a
                     // conflict: the schedule has a serial equivalent reaching the
                     // same state.

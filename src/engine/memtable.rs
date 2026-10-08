@@ -22,6 +22,8 @@ use super::skiplist::{ArenaSkipList, InsertHint, NodeRef};
 use crate::DbSlice;
 use crate::sync::{Arc, AtomicUsize, Mutex, Ordering};
 
+mod terminator;
+
 /// Everything a memtable needs to build its arena: the engine-wide chunk
 /// pool, the per-memtable byte budget, and the chunk sizing policy.
 ///

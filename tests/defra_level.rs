@@ -11,6 +11,7 @@
 use std::sync::Arc;
 
 use regolith::prelude::*;
+use regolith::{PerfContext, PerfLevel};
 
 /// Sums big-endian i64 deltas.
 struct CounterMerge;
@@ -49,15 +50,46 @@ impl KeyClassifier for HeadPrefix {
     }
 }
 
-fn open(dir: &std::path::Path) -> OptimisticTransactionDb {
-    let options = Options {
-        merge_operator: Some(Arc::new(CounterMerge)),
-        ..Options::default()
-    };
+/// Open under `options`, with the same key policy as `open`.
+fn open_with(dir: &std::path::Path, options: Options) -> OptimisticTransactionDb {
     OptimisticTransactionDb::open(dir, options)
         .unwrap()
         .with_policy(Arc::new(HeadPrefix))
 }
+
+fn open(dir: &std::path::Path) -> OptimisticTransactionDb {
+    open_with(
+        dir,
+        Options {
+            merge_operator: Some(Arc::new(CounterMerge)),
+            ..Options::default()
+        },
+    )
+}
+
+/// Small blocks, so a key's merge chain spans many of them, and no
+/// background compaction to fold the chain away.
+fn block_spanning() -> Options {
+    Options {
+        merge_operator: Some(Arc::new(CounterMerge)),
+        block_size: 512,
+        max_background_compactions: 0,
+        ..Options::default()
+    }
+}
+
+/// `block_spanning` with a partitioned index of small leaves.
+fn block_spanning_partitioned() -> Options {
+    Options {
+        partitioned_index: true,
+        metadata_block_size: 512,
+        ..block_spanning()
+    }
+}
+
+/// Both index shapes, as constructors so a test can open several databases
+/// per shape.
+const INDEX_SHAPES: [fn() -> Options; 2] = [block_spanning, block_spanning_partitioned];
 
 fn counter(db: &OptimisticTransactionDb) -> i64 {
     i64::from_be_bytes(
@@ -265,4 +297,84 @@ fn without_a_policy_scans_are_recorded_as_at_repeatable_read() {
     supersede(&second, b"h/", b"h0");
     first.commit().unwrap();
     assert!(conflicted(second.commit()));
+}
+
+/// Commit a blind merge onto a key with `operands` flushed merges beneath
+/// it, after one more merge landed since the transaction's snapshot. Returns
+/// the block cache lookups the commit made and the bytes of SSTable the
+/// chain occupies.
+fn blind_merge_commit(options: Options, operands: i64) -> (u64, u64) {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open_with(dir.path(), options);
+    db.db().put(b"counter", &0i64.to_be_bytes()).unwrap();
+    for _ in 0..operands {
+        db.db().merge(b"counter", &1i64.to_be_bytes()).unwrap();
+    }
+    db.db().flush().unwrap();
+
+    let tx = db.begin_transaction_with(IsolationLevel::DefraLevel);
+    tx.merge(b"counter", &1i64.to_be_bytes()).unwrap();
+    db.db().merge(b"counter", &1i64.to_be_bytes()).unwrap();
+
+    PerfContext::set_level(PerfLevel::EnableCount);
+    PerfContext::reset();
+    let committed = tx.commit();
+    let lookups = PerfContext::capture().block_cache_lookup_count;
+    PerfContext::set_level(PerfLevel::Disable);
+    committed.expect("a blind merge commits beside newer operands");
+
+    // Read after the capture: a read walks the whole chain.
+    assert_eq!(counter(&db), operands + 2);
+    let sst_bytes = db
+        .db()
+        .get_int_property("regolith.total-sst-files-size")
+        .unwrap();
+    (lookups, sst_bytes)
+}
+
+#[test]
+fn a_blind_merge_commit_reads_only_what_landed_since_its_snapshot() {
+    for options in INDEX_SHAPES {
+        let (short_lookups, short_bytes) = blind_merge_commit(options(), 200);
+        let (long_lookups, long_bytes) = blind_merge_commit(options(), 2000);
+
+        // Ten times the chain over many more blocks, so a walk down the
+        // chain could not read the same number of them.
+        assert!(
+            long_bytes > 4 * short_bytes,
+            "{long_bytes} bytes of table for 2000 operands against {short_bytes} for 200"
+        );
+        assert!(short_lookups > 0, "the commit never consulted the table");
+        assert_eq!(
+            long_lookups, short_lookups,
+            "the commit reads the block of the newest flushed operand, however long the chain"
+        );
+    }
+}
+
+#[test]
+fn a_replacement_beneath_operands_spanning_blocks_still_conflicts() {
+    for replacement in [
+        Replacement::Put,
+        Replacement::Delete,
+        Replacement::RangeDelete,
+    ] {
+        for (shape, options) in INDEX_SHAPES.into_iter().enumerate() {
+            let dir = tempfile::tempdir().unwrap();
+            let db = open_with(dir.path(), options());
+            db.db().put(b"counter", &0i64.to_be_bytes()).unwrap();
+
+            let tx = db.begin_transaction_with(IsolationLevel::DefraLevel);
+            tx.merge(b"counter", &1i64.to_be_bytes()).unwrap();
+            replacement.apply(&db);
+            for _ in 0..2000 {
+                db.db().merge(b"counter", &1i64.to_be_bytes()).unwrap();
+            }
+            db.db().flush().unwrap();
+            assert!(
+                conflicted(tx.commit()),
+                "{replacement:?} index shape {shape}"
+            );
+        }
+    }
 }
