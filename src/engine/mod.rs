@@ -1446,13 +1446,8 @@ impl RegolithEngine {
 
     /// Every visible entry for `lk`'s key in `view`, newest first, through
     /// the first terminator: a value, a deletion, or a covering range
-    /// tombstone standing in as one. Also returns the newest covering range
-    /// tombstone's sequence, which can sit below every collected operand.
-    fn merge_chain_in_view(
-        &self,
-        lk: &LookupKey,
-        view: &ReadView,
-    ) -> std::io::Result<(MergeChain, u64)> {
+    /// tombstone standing in as one.
+    fn merge_chain_in_view(&self, lk: &LookupKey, view: &ReadView) -> std::io::Result<MergeChain> {
         use internal_key::{VALUE_TYPE_DELETION, VALUE_TYPE_MERGE};
 
         let key = lk.prefixed_user_key();
@@ -1579,7 +1574,7 @@ impl RegolithEngine {
             }
         }
 
-        Ok((chain, max_rt_seq))
+        Ok(chain)
     }
 
     /// Merge-aware point lookup. Walks every source newest→oldest
@@ -1602,7 +1597,7 @@ impl RegolithEngine {
 
         let view = self.view.load();
         let key = lk.prefixed_user_key();
-        let (mut chain, _) = self.merge_chain_in_view(lk, &view)?;
+        let mut chain = self.merge_chain_in_view(lk, &view)?;
         // Materialize the chain. `chain` is newest-first; the last
         // entry (if any) is either a real VALUE / DELETION terminator
         // or (if !terminated) the oldest visible merge operand.
@@ -2338,25 +2333,6 @@ impl RegolithEngine {
             // A delete of a key that is already absent stores the same thing.
             (None, None) => true,
             _ => false,
-        })
-    }
-
-    /// The sequence of the newest write that replaced `key` outright in
-    /// `view`: a put, a delete, or a covering range delete. Newer merge
-    /// operands are walked past, since they build on whatever lies beneath
-    /// them instead of replacing it.
-    fn newest_terminator_seq_in_view(
-        &self,
-        key: &[u8],
-        view: &ReadView,
-    ) -> std::io::Result<Option<u64>> {
-        let lk = LookupKey::from_prefixed(key, u64::MAX);
-        let (chain, max_rt_seq) = self.merge_chain_in_view(&lk, view)?;
-        Ok(match chain.last() {
-            Some(&(seq, value_type, _)) if value_type != internal_key::VALUE_TYPE_MERGE => {
-                Some(seq)
-            }
-            _ => (max_rt_seq > 0).then_some(max_rt_seq),
         })
     }
 
