@@ -5,6 +5,7 @@
 mod cli;
 mod faults;
 mod history;
+mod list;
 mod model;
 mod runner;
 mod verify;

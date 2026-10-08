@@ -89,7 +89,8 @@ fn concurrent_phase(db: &TxDb, cfg: &Config, recorder: &Recorder, values: &Value
             scope.spawn(move || {
                 let mut rng = Rng::new(cfg.seed ^ process.wrapping_mul(0x9E37_79B9_7F4A_7C15));
                 for _ in 0..cfg.txns {
-                    let plan = TxnPlan::generate(cfg.model, cfg.keys, &mut rng, values);
+                    let plan =
+                        TxnPlan::generate(cfg.model, cfg.isolation, cfg.keys, &mut rng, values);
                     let mut emit = |op: Op| recorder.push(op);
                     record_txn(db, cfg, &plan, recorder, process, false, &mut emit);
                 }
@@ -300,7 +301,7 @@ pub fn run_worker(cfg: &Config) -> Result<(), String> {
         WorkerRole::Doomed => cfg.txns,
     };
     for _ in 0..budget {
-        let plan = TxnPlan::generate(cfg.model, cfg.keys, &mut rng, &values);
+        let plan = TxnPlan::generate(cfg.model, cfg.isolation, cfg.keys, &mut rng, &values);
         let mut emit = |op: Op| {
             let _ = stream_record(&mut sink, &op);
         };

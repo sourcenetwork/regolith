@@ -9,11 +9,14 @@ use regolith::{
     Db, IsolationLevel, OptimisticTransactionDb, Options, Transaction, TransactionDb,
     TransactionError, TxResult,
 };
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
 
 use crate::cli::{Isolation, Model};
 use crate::history::{Mop, MopVal};
+use crate::list::{self, ListAppend};
 
 /// Deterministic splitmix64. A dependency-free RNG is enough here: the
 /// workload only needs reproducible key and shape choices.
@@ -57,10 +60,15 @@ impl ValueSource {
 /// not scans, so a range read added here would need rows of its own,
 /// and Elle's list-append and rw-register models have no range operation
 /// to record one with.
+///
+/// `ReadForUpdate` is a read through `get_for_update` that the transaction
+/// does not write back, recorded as a plain read. It is the one read
+/// `ReadCommitted` leaves unvalidated and `SnapshotIsolation` validates.
 #[derive(Clone, Debug)]
 pub enum PlannedMop {
     Append { key: i64, val: i64 },
     Read { key: i64 },
+    ReadForUpdate { key: i64 },
     Write { key: i64, val: i64 },
 }
 
@@ -72,7 +80,17 @@ pub struct TxnPlan {
 }
 
 impl TxnPlan {
-    pub fn generate(model: Model, keys: i64, rng: &mut Rng, values: &ValueSource) -> Self {
+    /// Only `read-committed` plans carry [`PlannedMop::ReadForUpdate`]: it is
+    /// there so that level and `snapshot-isolation` run different commit
+    /// validation, and every other level's plans stay as they were.
+    pub fn generate(
+        model: Model,
+        isolation: Isolation,
+        keys: i64,
+        rng: &mut Rng,
+        values: &ValueSource,
+    ) -> Self {
+        let locking_reads = isolation == Isolation::ReadCommitted;
         let count = 1 + rng.below(3) as usize;
         let mut mops = Vec::with_capacity(count);
         for _ in 0..count {
@@ -87,6 +105,9 @@ impl TxnPlan {
                     key,
                     val: values.next(),
                 },
+                (_, false) if locking_reads && rng.below(2) == 0 => {
+                    PlannedMop::ReadForUpdate { key }
+                }
                 (_, false) => PlannedMop::Read { key },
             });
         }
@@ -108,7 +129,9 @@ impl TxnPlan {
             .map(|mop| match mop {
                 PlannedMop::Append { key, val } => Mop("append".into(), *key, MopVal::Int(*val)),
                 PlannedMop::Write { key, val } => Mop("w".into(), *key, MopVal::Int(*val)),
-                PlannedMop::Read { key } => Mop("r".into(), *key, MopVal::Null),
+                PlannedMop::Read { key } | PlannedMop::ReadForUpdate { key } => {
+                    Mop("r".into(), *key, MopVal::Null)
+                }
             })
             .collect()
     }
@@ -118,15 +141,33 @@ impl TxnPlan {
     ///
     /// Appends are read-modify-write against `get_for_update`, which is
     /// the API a caller reaches for precisely to make an increment safe.
-    pub fn execute(&self, model: Model, tx: &mut Transaction<'_>) -> TxResult<Vec<Mop>> {
+    /// With `blind_appends`, an append to a key the transaction has not read
+    /// goes in as a merge operand instead, the one write DefraLevel lets
+    /// commute with another transaction's. A key that has taken an operand
+    /// keeps taking them, because a put and an operand in one commit apply
+    /// in the engine's order and not the plan's.
+    pub fn execute(
+        &self,
+        model: Model,
+        blind_appends: bool,
+        tx: &mut Transaction<'_>,
+    ) -> TxResult<Vec<Mop>> {
         let mut observed = Vec::with_capacity(self.mops.len());
+        let mut read = HashSet::new();
+        let mut merged: HashMap<i64, Vec<i64>> = HashMap::new();
         for mop in &self.mops {
             match mop {
                 PlannedMop::Append { key, val } => {
-                    let current = tx.get_for_update(&key_bytes(*key))?;
-                    let mut list = decode_list(current.as_deref()).unwrap_or_default();
-                    list.push(*val);
-                    tx.put(&key_bytes(*key), &encode_list(&list))?;
+                    if blind_appends && (merged.contains_key(key) || !read.contains(key)) {
+                        tx.merge(&key_bytes(*key), &list::encode(&[*val]))?;
+                        merged.entry(*key).or_default().push(*val);
+                    } else {
+                        read.insert(*key);
+                        let current = tx.get_for_update(&key_bytes(*key))?;
+                        let mut list = list::decode(current.as_deref()).unwrap_or_default();
+                        list.push(*val);
+                        tx.put(&key_bytes(*key), &list::encode(&list))?;
+                    }
                     observed.push(Mop("append".into(), *key, MopVal::Int(*val)));
                 }
                 PlannedMop::Write { key, val } => {
@@ -134,18 +175,16 @@ impl TxnPlan {
                     observed.push(Mop("w".into(), *key, MopVal::Int(*val)));
                 }
                 PlannedMop::Read { key } => {
+                    read.insert(*key);
                     let current = tx.get(&key_bytes(*key))?;
-                    let value = match model {
-                        Model::ListAppend => match decode_list(current.as_deref()) {
-                            Some(list) => MopVal::List(list),
-                            None => MopVal::Null,
-                        },
-                        Model::RwRegister => match decode_int(current.as_deref()) {
-                            Some(v) => MopVal::Int(v),
-                            None => MopVal::Null,
-                        },
-                    };
-                    observed.push(Mop("r".into(), *key, value));
+                    let own = merged.get(key).map_or(&[][..], Vec::as_slice);
+                    observed.push(read_mop(model, *key, current.as_deref(), own));
+                }
+                PlannedMop::ReadForUpdate { key } => {
+                    read.insert(*key);
+                    let current = tx.get_for_update(&key_bytes(*key))?;
+                    let own = merged.get(key).map_or(&[][..], Vec::as_slice);
+                    observed.push(read_mop(model, *key, current.as_deref(), own));
                 }
             }
         }
@@ -153,10 +192,31 @@ impl TxnPlan {
     }
 }
 
+/// The completion record of a read that returned `current`. A read does not
+/// return the operands the same transaction has buffered, so `own` (the
+/// elements it merged into the key) is added the way the commit will apply
+/// them.
+fn read_mop(model: Model, key: i64, current: Option<&[u8]>, own: &[i64]) -> Mop {
+    let value = match model {
+        Model::ListAppend => {
+            let mut list = list::decode(current);
+            if !own.is_empty() {
+                list.get_or_insert_default().extend_from_slice(own);
+            }
+            list.map_or(MopVal::Null, MopVal::List)
+        }
+        Model::RwRegister => decode_int(current).map_or(MopVal::Null, MopVal::Int),
+    };
+    Mop("r".into(), key, value)
+}
+
 /// The transaction flavor the requested isolation level maps onto.
 pub enum TxDb {
     Pessimistic(TransactionDb),
     Optimistic(OptimisticTransactionDb),
+    /// The optimistic flavour at `DefraLevel`, opened with the list-append
+    /// merge operator so an append can be a merge operand.
+    Defra(OptimisticTransactionDb),
 }
 
 impl TxDb {
@@ -179,10 +239,18 @@ impl TxDb {
                     .with_isolation(IsolationLevel::Serializable),
             )),
             // No key classifier: these workloads are point operations, so
-            // DefraLevel validates exactly as RepeatableRead here.
-            Isolation::DefraLevel => Ok(TxDb::Optimistic(
-                OptimisticTransactionDb::open(path, opts)?
-                    .with_isolation(IsolationLevel::DefraLevel),
+            // DefraLevel validates point reads exactly as RepeatableRead
+            // does. What it adds here is the blind merge, which needs the
+            // operator.
+            Isolation::DefraLevel => Ok(TxDb::Defra(
+                OptimisticTransactionDb::open(
+                    path,
+                    Options {
+                        merge_operator: Some(Arc::new(ListAppend)),
+                        ..opts
+                    },
+                )?
+                .with_isolation(IsolationLevel::DefraLevel),
             )),
         }
     }
@@ -190,14 +258,14 @@ impl TxDb {
     pub fn begin(&self) -> Transaction<'_> {
         match self {
             TxDb::Pessimistic(db) => db.begin_transaction(),
-            TxDb::Optimistic(db) => db.begin_transaction(),
+            TxDb::Optimistic(db) | TxDb::Defra(db) => db.begin_transaction(),
         }
     }
 
     pub fn db(&self) -> &Db {
         match self {
             TxDb::Pessimistic(db) => db.db(),
-            TxDb::Optimistic(db) => db.db(),
+            TxDb::Optimistic(db) | TxDb::Defra(db) => db.db(),
         }
     }
 
@@ -207,8 +275,14 @@ impl TxDb {
     pub fn retries(&self) -> u32 {
         match self {
             TxDb::Pessimistic(_) => 1,
-            TxDb::Optimistic(_) => 16,
+            TxDb::Optimistic(_) | TxDb::Defra(_) => 16,
         }
+    }
+
+    /// Whether an append the transaction has not read may be a merge
+    /// operand: only at the level that lets blind merges commute.
+    pub fn blind_appends(&self) -> bool {
+        matches!(self, TxDb::Defra(_))
     }
 }
 
@@ -227,7 +301,7 @@ pub fn run_txn(db: &TxDb, model: Model, plan: &TxnPlan) -> Outcome {
     let mut last_retryable = false;
     for _ in 0..db.retries() {
         let mut tx = db.begin();
-        match plan.execute(model, &mut tx) {
+        match plan.execute(model, db.blind_appends(), &mut tx) {
             Ok(observed) => match tx.commit() {
                 Ok(()) => return Outcome::Committed(observed),
                 Err(TransactionError::Conflict { .. }) | Err(TransactionError::Busy(_)) => {
@@ -256,27 +330,9 @@ pub fn key_bytes(key: i64) -> Vec<u8> {
     format!("k{:08}", key).into_bytes()
 }
 
-fn encode_list(list: &[i64]) -> Vec<u8> {
-    let mut out = String::new();
-    for (i, v) in list.iter().enumerate() {
-        if i > 0 {
-            out.push(',');
-        }
-        out.push_str(&v.to_string());
-    }
-    out.into_bytes()
-}
-
-fn decode_list(raw: Option<&[u8]>) -> Option<Vec<i64>> {
-    let text = std::str::from_utf8(raw?).ok()?;
-    if text.is_empty() {
-        return Some(Vec::new());
-    }
-    text.split(',')
-        .map(|part| part.parse::<i64>().ok())
-        .collect()
-}
-
 fn decode_int(raw: Option<&[u8]>) -> Option<i64> {
     std::str::from_utf8(raw?).ok()?.parse::<i64>().ok()
 }
+
+#[cfg(test)]
+mod tests;

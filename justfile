@@ -353,6 +353,14 @@ tla:
 
 # ---------- consistency ----------
 
+# Where the Elle recipes write histories and scratch databases, and which
+# elle-cli jar they run. Both are absolute paths. The output goes under the
+# harness's gitignored target/ rather than /tmp, which can be full or absent;
+# set ELLE_OUT to move it. The jar defaults to where CI downloads it; set
+# ELLE_CLI to run one kept elsewhere.
+elle_out := env_var_or_default("ELLE_OUT", justfile_directory() / "harness/elle/target/elle-out")
+elle_cli := env_var_or_default("ELLE_CLI", justfile_directory() / "harness/elle/elle-cli.jar")
+
 # Elle consistency checking. `model` is the workload (list-append or
 # rw-register); `level` is the consistency model to check it against.
 #
@@ -360,21 +368,23 @@ tla:
 # is easy to get wrong: passing an isolation level as --model throws
 # "No matching clause". Hence the explicit --consistency-models here.
 elle model="list-append" level="snapshot-isolation" isolation="snapshot-isolation":
+    mkdir -p "{{elle_out}}"
     cargo run --release --manifest-path harness/elle/Cargo.toml --bin elle-gen -- \
         --model {{model}} --isolation {{isolation}} \
         --threads 8 --txns 50 --keys 4 \
-        --out /tmp/regolith-history.json --dir /tmp/regolith-elle-db
-    java -jar harness/elle/elle-cli.jar --model {{model}} --cycle-search-timeout 60000 \
-        --consistency-models {{level}} /tmp/regolith-history.json
+        --out "{{elle_out}}/regolith-history.json" --dir "{{elle_out}}/regolith-elle-db"
+    java -jar "{{elle_cli}}" --model {{model}} --cycle-search-timeout 60000 \
+        --consistency-models {{level}} "{{elle_out}}/regolith-history.json"
 
 # The same, with the fault injection the harness supports.
 elle-fault model="list-append" level="snapshot-isolation":
+    mkdir -p "{{elle_out}}"
     cargo run --release --manifest-path harness/elle/Cargo.toml --bin elle-gen -- \
-        --model {{model}} --isolation snapshot-isolation --faults \
+        --model {{model}} --isolation snapshot-isolation --faults all \
         --threads 8 --txns 50 --keys 4 \
-        --out /tmp/regolith-history-fault.json --dir /tmp/regolith-elle-fault-db
-    java -jar harness/elle/elle-cli.jar --model {{model}} --cycle-search-timeout 60000 \
-        --consistency-models {{level}} /tmp/regolith-history-fault.json
+        --out "{{elle_out}}/regolith-history-fault.json" --dir "{{elle_out}}/regolith-elle-fault-db"
+    java -jar "{{elle_cli}}" --model {{model}} --cycle-search-timeout 60000 \
+        --consistency-models {{level}} "{{elle_out}}/regolith-history-fault.json"
 
 # Every level regolith claims, checked in one go.
 #
@@ -386,6 +396,8 @@ elle-fault model="list-append" level="snapshot-isolation":
 elle-matrix:
     #!/usr/bin/env bash
     set -uo pipefail
+    out="{{elle_out}}"
+    mkdir -p "$out"
     cd harness/elle
     fail=0
     cargo build --release --bin elle-gen
@@ -394,7 +406,7 @@ elle-matrix:
         local name="$1" model="$2" level="$3"; shift 3
         local built_in=pass
         if ! ./target/release/elle-gen --model "$model" "$@" \
-            --out "/tmp/elle-$name.json" --dir "/tmp/elle-db-$name" >/dev/null; then
+            --out "$out/elle-$name.json" --dir "$out/elle-db-$name" >/dev/null; then
             built_in=fail
             fail=1
         fi
@@ -402,8 +414,8 @@ elle-matrix:
         # field and strip surrounding whitespace, so a stray tab cannot read
         # as a failure on a history that actually passed.
         local v
-        v=$(java -jar elle-cli.jar --model "$model" --cycle-search-timeout 60000 \
-            --consistency-models "$level" "/tmp/elle-$name.json" \
+        v=$(java -jar "{{elle_cli}}" --model "$model" --cycle-search-timeout 60000 \
+            --consistency-models "$level" "$out/elle-$name.json" \
             | tail -1 | awk '{print $NF}')
         printf '  %-42s %s (built-in check: %s)\n' "$name [$level]" "$v" "$built_in"
         if [ "$v" != "true" ]; then fail=1; fi
@@ -413,7 +425,9 @@ elle-matrix:
     check optimistic-si       list-append snapshot-isolation --isolation snapshot-isolation --threads 8 --txns 50 --keys 4 --seed 4
     check optimistic-rw       rw-register snapshot-isolation --isolation snapshot-isolation --threads 8 --txns 50 --keys 4 --seed 5
     # Pessimistic transactions are checked at the level they request: these
-    # rows run regolith's ReadCommitted level.
+    # rows run regolith's ReadCommitted level. Their plans include a read-only
+    # get_for_update, the one read that level leaves unvalidated and
+    # SnapshotIsolation validates.
     check pessimistic-rc      list-append read-committed     --isolation read-committed --threads 8 --txns 50 --keys 4 --seed 2
     check pessimistic-hotkey  list-append read-committed     --isolation read-committed --threads 8 --txns 50 --keys 1 --seed 1
     # Serializable validates the whole read set, so the strongest model
@@ -426,11 +440,15 @@ elle-matrix:
     check repeatable-read     list-append repeatable-read    --isolation repeatable-read --threads 8 --txns 60 --keys 4 --seed 13
     check repeatable-read-rw  rw-register repeatable-read    --isolation repeatable-read --threads 8 --txns 60 --keys 4 --seed 14
     check repeatable-read-ss  list-append strict-serializable --isolation repeatable-read --threads 8 --txns 60 --keys 4 --seed 15
-    # DefraLevel without a classifier validates point reads as RepeatableRead;
-    # the TLA+ model (proofs/tla, MC_DefraLevel_*) proves its relaxations.
-    check defra-level         list-append repeatable-read     --isolation defra-level --threads 8 --txns 60 --keys 4 --seed 16
-    check defra-level-rw      rw-register repeatable-read     --isolation defra-level --threads 8 --txns 60 --keys 4 --seed 17
-    check defra-level-si      list-append snapshot-isolation  --isolation defra-level --threads 8 --txns 60 --keys 4 --seed 18
+    # DefraLevel without a classifier validates point reads as RepeatableRead
+    # and lets blind merges to one key all commit; the TLA+ model (proofs/tla,
+    # MC_DefraLevel_*) proves those relaxations. list-append appends the
+    # transaction has not read are merge operands, applied in commit order, so
+    # a point workload is serializable in commit order and the strongest model
+    # must hold. There is no snapshot-isolation row: two blind merges to one
+    # key both commit, which first-committer-wins forbids.
+    check defra-level         list-append strict-serializable --isolation defra-level --threads 8 --txns 60 --keys 4 --seed 16
+    check defra-level-rw      rw-register strict-serializable --isolation defra-level --threads 8 --txns 60 --keys 4 --seed 17
     exit $fail
 
 # ---------- portability ----------

@@ -39,7 +39,11 @@ unzip -j elle-cli-bin.zip 'target/*.jar'
 mv elle-cli-0.1.9-standalone.jar elle-cli.jar
 ```
 
-The jar and every generated history are gitignored.
+The jar and every generated history are gitignored. The justfile recipes
+read the jar from `ELLE_CLI` (default `harness/elle/elle-cli.jar`, where CI
+downloads it) and write histories and scratch databases to `ELLE_OUT`
+(default `harness/elle/target/elle-out`), so the histories and databases
+never go to `/tmp`.
 
 ## Checking a history
 
@@ -89,6 +93,16 @@ API a caller reaches for precisely to make an increment safe. Append
 values are globally unique, as Elle requires to reconstruct version
 order.
 
+At `defra-level` the database is opened with a merge operator that appends
+to a list, and an append to a key the transaction has not read is a blind
+merge operand instead; operands are applied in commit order. `get` does not
+return the operands its own transaction has buffered, so a later read of
+that key in the same transaction adds them itself. An append to a key the
+transaction has read, and has not merged into, stays a read-modify-write.
+
+At `read-committed` the plans also hold reads through `get_for_update` that
+the transaction never writes back, recorded as plain reads.
+
 `--model rw-register` performs blind writes of globally unique values
 and reads, `[["w",k,v],["r",k,v]]`.
 
@@ -104,11 +118,14 @@ against the Elle model it claims:
 
 | Requested | Runs against | Checked against |
 | --- | --- | --- |
-| `read-committed` | `TransactionDb` (pessimistic locks) at `ReadCommitted` | `read-committed`. The pessimistic flavour reads from a snapshot, which is strictly stronger, so every anomaly reported here is a genuine violation. |
+| `read-committed` | `TransactionDb` (pessimistic locks) at `ReadCommitted` | `read-committed`. A read-only `get_for_update` is the one read this level leaves unvalidated and `snapshot-isolation` validates, so the plans hold it. It reads when its lock is taken, later than the begin snapshot plain reads use, so a transaction can see two states of a key, which `read-committed` allows and `snapshot-isolation` does not. |
 | `snapshot-isolation` | `OptimisticTransactionDb` at `SnapshotIsolation` | `snapshot-isolation`. Write skew (`G2-item`) is legal here. |
 | `repeatable-read` | `OptimisticTransactionDb` at `RepeatableRead` | `repeatable-read`, Adya's PL-2.99: every point read is validated, so a `G2-item` verdict is a defect. A scan is recorded per stretch, so a predicate anomaly would be legal; the workloads here have no predicate reads. |
 | `serializable` | `OptimisticTransactionDb` at `Serializable` | `strict-serializable`. |
-| `defra-level` | `OptimisticTransactionDb` at `DefraLevel` | `repeatable-read`. No key classifier is installed, so the level validates point reads exactly as `RepeatableRead` does; the TLA+ model (`proofs/tla`, `MC_DefraLevel_*`) proves its relaxations. |
+| `defra-level` | `OptimisticTransactionDb` at `DefraLevel`, with a list-append merge operator | `strict-serializable`. No key classifier is installed, so point reads are validated exactly as `RepeatableRead` does and the one relaxation left is that blind merges to a key commute. They are applied in commit order, so a point workload is serializable in commit order; the TLA+ model (`proofs/tla`, `MC_DefraLevel_*`) proves the relaxations. |
+
+There is no `snapshot-isolation` row for `defra-level`, because two blind
+merges to one key both commit, which snapshot isolation forbids.
 
 A history can be checked against any model elle-cli offers, whatever level
 generated it; a weaker model than the one claimed is a sound check, a
@@ -171,8 +188,8 @@ claims is green:
 | `list-append`, `--isolation read-committed` | `TransactionDb` | `read-committed` | `true` |
 | `list-append`, `--keys 1` (one hot key) | `TransactionDb` | `read-committed` | `true` |
 
-The `repeatable-read` and `serializable` rows of `just elle-matrix` are not
-recorded here; CI runs them on every push.
+The `repeatable-read`, `serializable` and `defra-level` rows of
+`just elle-matrix` are not recorded here; CI runs them on every push.
 
 The last two rows were `false` when PR 1 landed: `get_for_update` took
 the key lock and then read at the sequence the transaction began with,
@@ -193,7 +210,7 @@ and a green matrix would mean nothing:
 
 ```sh
 java -jar elle-cli.jar --model list-append \
-  --consistency-models strict-serializable /tmp/elle-optimistic-si.json
+  --consistency-models strict-serializable target/elle-out/elle-optimistic-si.json
 # => false, with G2-item / G-nonadjacent-item witnesses
 ```
 

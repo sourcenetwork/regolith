@@ -23,9 +23,10 @@ impl Model {
 /// `ReadCommitted` level so the level the harness claims is the one the
 /// engine runs; the other four run the optimistic flavour at the regolith
 /// level of the same name. `defra-level` has no key classifier here: the
-/// workloads are point operations, so it validates exactly as
-/// `repeatable-read` does. Each is checked against the Elle model it
-/// claims; README.md carries the table.
+/// workloads are point operations, so it validates point reads exactly as
+/// `repeatable-read` does, and it differs only in appending to a list by
+/// blind merge. Each is checked against the Elle model it claims; README.md
+/// carries the table.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Isolation {
     ReadCommitted,
