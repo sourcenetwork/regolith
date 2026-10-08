@@ -9,7 +9,7 @@ use regolith::{
     Db, IsolationLevel, OptimisticTransactionDb, Options, Transaction, TransactionDb,
     TransactionError, TxResult,
 };
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -144,8 +144,7 @@ impl TxnPlan {
     /// With `blind_appends`, an append to a key the transaction has not read
     /// goes in as a merge operand instead, the one write DefraLevel lets
     /// commute with another transaction's. A key that has taken an operand
-    /// keeps taking them, because a put and an operand in one commit apply
-    /// in the engine's order and not the plan's.
+    /// keeps taking them.
     pub fn execute(
         &self,
         model: Model,
@@ -154,13 +153,13 @@ impl TxnPlan {
     ) -> TxResult<Vec<Mop>> {
         let mut observed = Vec::with_capacity(self.mops.len());
         let mut read = HashSet::new();
-        let mut merged: HashMap<i64, Vec<i64>> = HashMap::new();
+        let mut merged = HashSet::new();
         for mop in &self.mops {
             match mop {
                 PlannedMop::Append { key, val } => {
-                    if blind_appends && (merged.contains_key(key) || !read.contains(key)) {
+                    if blind_appends && (merged.contains(key) || !read.contains(key)) {
                         tx.merge(&key_bytes(*key), &list::encode(&[*val]))?;
-                        merged.entry(*key).or_default().push(*val);
+                        merged.insert(*key);
                     } else {
                         read.insert(*key);
                         let current = tx.get_for_update(&key_bytes(*key))?;
@@ -177,14 +176,12 @@ impl TxnPlan {
                 PlannedMop::Read { key } => {
                     read.insert(*key);
                     let current = tx.get(&key_bytes(*key))?;
-                    let own = merged.get(key).map_or(&[][..], Vec::as_slice);
-                    observed.push(read_mop(model, *key, current.as_deref(), own));
+                    observed.push(read_mop(model, *key, current.as_deref()));
                 }
                 PlannedMop::ReadForUpdate { key } => {
                     read.insert(*key);
                     let current = tx.get_for_update(&key_bytes(*key))?;
-                    let own = merged.get(key).map_or(&[][..], Vec::as_slice);
-                    observed.push(read_mop(model, *key, current.as_deref(), own));
+                    observed.push(read_mop(model, *key, current.as_deref()));
                 }
             }
         }
@@ -192,19 +189,11 @@ impl TxnPlan {
     }
 }
 
-/// The completion record of a read that returned `current`. A read does not
-/// return the operands the same transaction has buffered, so `own` (the
-/// elements it merged into the key) is added the way the commit will apply
-/// them.
-fn read_mop(model: Model, key: i64, current: Option<&[u8]>, own: &[i64]) -> Mop {
+/// The completion record of a read that returned `current`, which already
+/// holds the elements the same transaction merged into the key.
+fn read_mop(model: Model, key: i64, current: Option<&[u8]>) -> Mop {
     let value = match model {
-        Model::ListAppend => {
-            let mut list = list::decode(current);
-            if !own.is_empty() {
-                list.get_or_insert_default().extend_from_slice(own);
-            }
-            list.map_or(MopVal::Null, MopVal::List)
-        }
+        Model::ListAppend => list::decode(current).map_or(MopVal::Null, MopVal::List),
         Model::RwRegister => decode_int(current).map_or(MopVal::Null, MopVal::Int),
     };
     Mop("r".into(), key, value)
