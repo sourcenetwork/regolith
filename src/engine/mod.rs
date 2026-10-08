@@ -82,11 +82,19 @@ pub(crate) enum CommitOutcome {
     },
 }
 
+/// Lay a commit's writes out as one batch: point operations in ascending key
+/// order, then range deletes, then merges in ascending key order, each key's
+/// operands in the order they were buffered. The commit's conflict check
+/// relies on both sorted runs, so this layout is a guarantee and not an
+/// accident.
 fn grouped_batch_ops(
     point_ops: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
     range_deletes: Vec<(Vec<u8>, Vec<u8>)>,
-    merges: Vec<(Vec<u8>, Vec<u8>)>,
+    mut merges: Vec<(Vec<u8>, Vec<u8>)>,
 ) -> Vec<WriteBatchOp> {
+    // Stable on purpose: a key's operands must keep the order they were
+    // buffered in, which is the order a read folds them.
+    merges.sort_by(|a, b| a.0.cmp(&b.0));
     let mut ops = Vec::with_capacity(point_ops.len() + range_deletes.len() + merges.len());
     for (key, value) in point_ops {
         match value {
