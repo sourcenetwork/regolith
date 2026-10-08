@@ -87,10 +87,11 @@ fn map_isolation(level: IsolationLevel) -> MvccIsolation {
         IsolationLevel::ReadCommitted => MvccIsolation::ReadCommitted,
         IsolationLevel::SnapshotIsolation => MvccIsolation::RepeatableRead,
         // kovan-mvcc's RepeatableRead is its snapshot level, and it records
-        // no per-stretch scan, so ours takes the stricter neighbour.
-        IsolationLevel::RepeatableRead | IsolationLevel::Serializable => {
-            MvccIsolation::Serializable
-        }
+        // no per-stretch scan, so ours takes the stricter neighbour. It has
+        // no key policy either, so DefraLevel validates as RepeatableRead.
+        IsolationLevel::RepeatableRead
+        | IsolationLevel::Serializable
+        | IsolationLevel::DefraLevel => MvccIsolation::Serializable,
     }
 }
 

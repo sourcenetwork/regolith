@@ -10,11 +10,13 @@
 //! registry keeps a refcount per seq and removes the entry when the
 //! refcount reaches zero.
 //!
-//! [`SnapshotRegistry::oldest_live_seq`] returns the smallest currently
-//! registered seq - or `u64::MAX` when no snapshot is live. Compaction
-//! uses this as the **pin seq**: any version with a smaller seq than
-//! the largest visible version at `pin_seq` is invisible to every
-//! live snapshot and to current reads, and can be discarded.
+//! [`SnapshotRegistry::live_seqs`] lists every registered seq, ascending.
+//! Compaction cuts a key's versions into stripes at those seqs: inside a
+//! stripe only the newest state is visible to any reader, so what lies
+//! beneath it can be discarded and its operands folded, while nothing
+//! crosses a stripe boundary (see `engine::compaction::stripes`).
+//! [`SnapshotRegistry::oldest_live_seq`] returns the smallest, or
+//! `u64::MAX` when no snapshot is live.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -176,9 +178,7 @@ impl SnapshotRegistry {
     }
 
     /// Return the smallest currently registered seq, or `u64::MAX`
-    /// if no snapshot is live. Compaction uses this as its GC
-    /// horizon: entries older than the largest version visible to
-    /// this seq are safe to drop.
+    /// if no snapshot is live.
     pub(crate) fn oldest_live_seq(&self) -> u64 {
         self.active
             .lock()
@@ -186,6 +186,23 @@ impl SnapshotRegistry {
             .next()
             .copied()
             .unwrap_or(u64::MAX)
+    }
+
+    /// Every seq a snapshot is pinned at, ascending and distinct; empty
+    /// when no snapshot is live. Compaction cuts a key's versions into
+    /// stripes at these seqs.
+    ///
+    /// A pass reads this once its input tables are fixed, never before,
+    /// and keeps the list for the whole merge; `perform_compaction_to`
+    /// says why that loses no snapshot's version. A snapshot released
+    /// after the read only makes the pass fold less than it could.
+    pub(crate) fn live_seqs(&self) -> Vec<u64> {
+        let live: Vec<u64> = self.active.lock().keys().copied().collect();
+        #[cfg(test)]
+        if let Some(hook) = AFTER_LIVE_READ.with(|slot| slot.borrow_mut().take()) {
+            hook();
+        }
+        live
     }
 
     /// Number of distinct live snapshots. Counts pins, not
@@ -234,6 +251,26 @@ impl SnapshotRegistry {
 }
 
 #[cfg(test)]
+thread_local! {
+    /// Test seam: runs once, on this thread, right after the next
+    /// [`SnapshotRegistry::live_seqs`] has taken its list. Thread-local so a
+    /// parallel test never fires another test's hook.
+    static AFTER_LIVE_READ: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Test-only: run `hook` once, on this thread, right after the next
+/// [`SnapshotRegistry::live_seqs`] has taken its list.
+///
+/// A pin the hook registers is missing from that list. That is how a test
+/// puts a snapshot, and the flush of a newer version beside it, after a
+/// compaction pass has read the live snapshots.
+#[cfg(test)]
+pub(crate) fn after_next_live_read(hook: impl FnOnce() + 'static) {
+    AFTER_LIVE_READ.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -267,6 +304,45 @@ mod tests {
         r.release(20);
         assert_eq!(r.oldest_live_seq(), u64::MAX);
         assert_eq!(r.pin_count(), 0);
+    }
+
+    #[test]
+    fn live_seqs_lists_each_pinned_seq_once_in_ascending_order() {
+        let r = SnapshotRegistry::new();
+        assert!(r.live_seqs().is_empty());
+
+        r.register(20);
+        r.register(5);
+        r.register(20);
+        r.register(10);
+        assert_eq!(r.live_seqs(), vec![5, 10, 20]);
+
+        r.release(20);
+        assert_eq!(r.live_seqs(), vec![5, 10, 20], "a pin at 20 remains");
+        r.release(20);
+        r.release(5);
+        assert_eq!(r.live_seqs(), vec![10]);
+        r.release(10);
+        assert!(r.live_seqs().is_empty());
+    }
+
+    #[test]
+    fn the_live_read_hook_runs_once_after_the_list_is_taken() {
+        let r = Arc::new(SnapshotRegistry::new());
+        r.register(5);
+        let hooked = Arc::clone(&r);
+        after_next_live_read(move || hooked.register(9));
+
+        assert_eq!(
+            r.live_seqs(),
+            vec![5],
+            "the pin the hook registers is not in the list it follows"
+        );
+        assert_eq!(
+            r.live_seqs(),
+            vec![5, 9],
+            "the hook is spent after one read"
+        );
     }
 
     #[test]

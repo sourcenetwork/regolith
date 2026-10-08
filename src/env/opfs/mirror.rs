@@ -1,8 +1,7 @@
 //! Mirror mode: the database resident in linear memory, written back to
 //! OPFS whole-file.
 //!
-//! This is the strategy defradb's OPFS backend uses, and it exists here
-//! for the same reason: `createSyncAccessHandle` is worker-only, so a
+//! It exists because `createSyncAccessHandle` is worker-only, so a
 //! database opened on the main thread has no synchronous path to storage
 //! at all. `FileSystemWritableFileStream` is asynchronous but available
 //! everywhere, so the engine runs against RAM and

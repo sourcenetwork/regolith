@@ -19,7 +19,7 @@ use crate::portability::{AtomicBool, Ordering};
 
 use super::block_cache::BlockCache;
 use super::internal_key::{compare_internal_keys, decode_internal_key, user_key_of};
-use super::manifest::{MAX_LEVELS, VersionEdit};
+use super::manifest::{MAX_LEVELS, VersionEdit, overlapping};
 use super::range_tombstone::{
     RangeTombstone, RangeTombstoneSet, exclusive_successor, sort_dedup_tombstones,
 };
@@ -36,6 +36,10 @@ use crate::engine::background_health::Job;
 use crate::engine::compaction_backoff::FailureBackoff;
 use crate::engine::pending_outputs::PendingOutputs;
 use crate::env::{Env, JoinHandle};
+
+mod stripes;
+
+use stripes::Stripes;
 
 /// Default compaction trigger: flush L0 → L1 when L0 has this many SSTables.
 pub(crate) const L0_COMPACTION_TRIGGER: usize = 4;
@@ -89,8 +93,9 @@ impl CompactionScheduler {
     /// set inside `compaction_loop` ensures they don't pick overlapping
     /// input sets.
     ///
-    /// `snapshot_registry` lets each compaction pass query the current
-    /// pin seq so it can drop versions that no live snapshot needs.
+    /// `snapshot_registry` lets each compaction pass read the live
+    /// snapshots, so it can cut each key's versions into stripes and
+    /// drop or fold what no reader of a stripe can see.
     ///
     /// `in_progress` is the engine-wide set of file ids currently being
     /// compacted. The engine owns it and shares it with the foreground
@@ -442,16 +447,12 @@ fn compaction_loop(
         loop {
             let did_work = {
                 let _guard = compaction_lock.read();
-                // Recompute the GC horizon on every pass: a snapshot
-                // may have dropped since the previous pass, unpinning
-                // more versions.
-                let pin_seq = snapshot_registry.oldest_live_seq();
                 match pick_and_run_compaction(
                     &versions,
                     &sst_dir,
                     &cache,
                     &opts,
-                    pin_seq,
+                    &snapshot_registry,
                     &in_progress,
                 ) {
                     Ok(outcome) => {
@@ -585,12 +586,12 @@ pub(crate) fn pick_and_run_compaction(
     sst_dir: &Path,
     cache: &BlockCache,
     opts: &CompactionOptions,
-    pin_seq: u64,
+    snapshots: &SnapshotRegistry,
     in_progress: &crate::sync::Mutex<HashSet<u64>>,
 ) -> std::io::Result<CompactionOutcome> {
     match opts.compaction_style {
         crate::options::CompactionStyle::Level => {
-            pick_and_run_level_compaction(versions, sst_dir, cache, opts, pin_seq, in_progress)
+            pick_and_run_level_compaction(versions, sst_dir, cache, opts, snapshots, in_progress)
         }
         crate::options::CompactionStyle::Fifo => {
             // One L0 pool, so there is nothing safe to pick in parallel.
@@ -607,7 +608,7 @@ pub(crate) fn pick_and_run_compaction(
             let Some(claim) = claim_whole_pool(versions, in_progress) else {
                 return Ok(CompactionOutcome::Contended);
             };
-            let result = pick_and_run_universal(versions, sst_dir, cache, opts, pin_seq);
+            let result = pick_and_run_universal(versions, sst_dir, cache, opts, snapshots);
             release_claim(in_progress, &claim);
             Ok(outcome(result?))
         }
@@ -637,7 +638,7 @@ fn pick_and_run_universal(
     sst_dir: &Path,
     cache: &BlockCache,
     opts: &CompactionOptions,
-    pin_seq: u64,
+    snapshots: &SnapshotRegistry,
 ) -> std::io::Result<bool> {
     let universal = opts.universal_compaction_options;
 
@@ -694,7 +695,7 @@ fn pick_and_run_universal(
         let _ = i;
     }
     if group.len() >= min_width {
-        return perform_universal_merge(versions, sst_dir, cache, opts, group, pin_seq)
+        return perform_universal_merge(versions, sst_dir, cache, opts, group, snapshots)
             .map(|_| true);
     }
 
@@ -715,7 +716,7 @@ fn pick_and_run_universal(
         .sum();
     let amp_percent = younger_total * 100 / oldest_size;
     if amp_percent >= universal.max_size_amplification_percent as u128 {
-        return perform_universal_merge(versions, sst_dir, cache, opts, by_age, pin_seq)
+        return perform_universal_merge(versions, sst_dir, cache, opts, by_age, snapshots)
             .map(|_| true);
     }
 
@@ -742,7 +743,7 @@ fn perform_universal_merge(
     cache: &BlockCache,
     opts: &CompactionOptions,
     inputs: Vec<Arc<LiveSst>>,
-    pin_seq: u64,
+    snapshots: &SnapshotRegistry,
 ) -> std::io::Result<()> {
     let mut run_opts = opts.clone();
     run_opts.target_file_size = u64::MAX;
@@ -759,7 +760,7 @@ fn perform_universal_merge(
         0,
         inputs,
         Vec::new(),
-        pin_seq,
+        snapshots,
     )
 }
 
@@ -784,7 +785,7 @@ pub(crate) fn run_universal_full_compaction(
     sst_dir: &Path,
     cache: &BlockCache,
     opts: &CompactionOptions,
-    pin_seq: u64,
+    snapshots: &SnapshotRegistry,
 ) -> std::io::Result<()> {
     let l0_files: Vec<Arc<LiveSst>> = {
         let version = versions.lock().current();
@@ -793,7 +794,7 @@ pub(crate) fn run_universal_full_compaction(
     if l0_files.len() < 2 {
         return Ok(());
     }
-    perform_universal_merge(versions, sst_dir, cache, opts, l0_files, pin_seq)
+    perform_universal_merge(versions, sst_dir, cache, opts, l0_files, snapshots)
 }
 
 fn pick_and_run_level_compaction(
@@ -801,21 +802,29 @@ fn pick_and_run_level_compaction(
     sst_dir: &Path,
     cache: &BlockCache,
     opts: &CompactionOptions,
-    pin_seq: u64,
+    snapshots: &SnapshotRegistry,
     in_progress: &crate::sync::Mutex<HashSet<u64>>,
 ) -> std::io::Result<CompactionOutcome> {
     let version = versions.lock().current();
 
     // Check L0 first
     if version.l0_count() >= opts.l0_compaction_trigger {
-        return compact_l0(versions, sst_dir, cache, opts, pin_seq, in_progress);
+        return compact_l0(versions, sst_dir, cache, opts, snapshots, in_progress);
     }
 
     // Check other levels
     for level in 1..MAX_LEVELS - 1 {
         let target = level_target_size(level, opts);
         if version.level_size(level) > target {
-            return compact_level(versions, sst_dir, cache, opts, level, pin_seq, in_progress);
+            return compact_level(
+                versions,
+                sst_dir,
+                cache,
+                opts,
+                level,
+                snapshots,
+                in_progress,
+            );
         }
     }
 
@@ -922,10 +931,10 @@ fn compact_l0(
     sst_dir: &Path,
     cache: &BlockCache,
     opts: &CompactionOptions,
-    pin_seq: u64,
+    snapshots: &SnapshotRegistry,
     in_progress: &crate::sync::Mutex<HashSet<u64>>,
 ) -> std::io::Result<CompactionOutcome> {
-    compact_level(versions, sst_dir, cache, opts, 0, pin_seq, in_progress)
+    compact_level(versions, sst_dir, cache, opts, 0, snapshots, in_progress)
 }
 
 /// Compact a level into the next level using the standard size-based
@@ -937,7 +946,7 @@ fn compact_level(
     cache: &BlockCache,
     opts: &CompactionOptions,
     level: usize,
-    pin_seq: u64,
+    snapshots: &SnapshotRegistry,
     in_progress: &crate::sync::Mutex<HashSet<u64>>,
 ) -> std::io::Result<CompactionOutcome> {
     let target_level = level + 1;
@@ -1008,7 +1017,7 @@ fn compact_level(
         level,
         input_files,
         overlap_files,
-        pin_seq,
+        snapshots,
     );
 
     // Always deregister, even on error, so workers don't stall
@@ -1033,7 +1042,7 @@ pub(crate) fn run_compact_range(
     opts: &CompactionOptions,
     start: Option<&[u8]>,
     end: Option<&[u8]>,
-    pin_seq: u64,
+    snapshots: &SnapshotRegistry,
 ) -> std::io::Result<()> {
     for level in 0..MAX_LEVELS - 1 {
         loop {
@@ -1081,7 +1090,7 @@ pub(crate) fn run_compact_range(
                 level,
                 inputs,
                 overlap_files,
-                pin_seq,
+                snapshots,
             )?;
 
             // At L0 we handled every range-overlapping file in one
@@ -1102,10 +1111,10 @@ pub(crate) fn run_compact_range(
 /// files, Add new ones). File descriptors of old files stay alive via
 /// any `Arc<LiveSst>` still referenced by older versions / iterators.
 ///
-/// `pin_seq` is the snapshot-pinning GC horizon: every version with a
-/// seq older than the version visible to `pin_seq` can be dropped.
-/// When no snapshot is live, callers pass `u64::MAX` and only the
-/// newest version of each user key is retained.
+/// The live snapshots, read from `snapshots` once the inputs are fixed, cut
+/// the key's versions into stripes (see the `stripes` module). With no
+/// snapshot live every key is one stripe, and only its newest state is
+/// retained.
 #[allow(clippy::too_many_arguments)]
 fn perform_compaction(
     versions: &Arc<VersionStore>,
@@ -1115,7 +1124,7 @@ fn perform_compaction(
     level: usize,
     input_files: Vec<Arc<LiveSst>>,
     overlap_files: Vec<Arc<LiveSst>>,
-    pin_seq: u64,
+    snapshots: &SnapshotRegistry,
 ) -> std::io::Result<()> {
     // Leveled callers always push down one level.
     perform_compaction_to(
@@ -1127,7 +1136,7 @@ fn perform_compaction(
         level + 1,
         input_files,
         overlap_files,
-        pin_seq,
+        snapshots,
     )
 }
 
@@ -1147,7 +1156,7 @@ fn perform_compaction_to(
     target_level: usize,
     input_files: Vec<Arc<LiveSst>>,
     overlap_files: Vec<Arc<LiveSst>>,
-    pin_seq: u64,
+    snapshots: &SnapshotRegistry,
 ) -> std::io::Result<()> {
     let compaction_start = opts.env.now_micros();
 
@@ -1184,10 +1193,8 @@ fn perform_compaction_to(
     // User compaction filter for range tombstones. Run this **before**
     // the point-entry RT shadow pass so a filter that drops a range
     // tombstone doesn't leave orphaned point entries already wiped
-    // out by that same RT. Only runs when no snapshot is pinned.
-    if pin_seq == u64::MAX
-        && let Some(filter) = opts.compaction_filter.as_ref()
-    {
+    // out by that same RT.
+    if let Some(filter) = opts.compaction_filter.as_ref() {
         merged_range_tombstones.retain(|rt| {
             !matches!(
                 filter.filter_range_delete(target_level, &rt.start, &rt.end),
@@ -1216,6 +1223,16 @@ fn perform_compaction_to(
         });
     }
 
+    // Read here, with the inputs fixed, never before they are picked. A
+    // snapshot registered before this read is in the list. One registered
+    // after it reads at a sequence at or above every version in the inputs,
+    // and the newest version of every key survives in its stripe, so it
+    // loses nothing. Read before the pick, a snapshot could register and a
+    // newer version be flushed into a table the pass then picks, with the
+    // list none the wiser: both would share a stripe and the older one, the
+    // version that snapshot reads, would be dropped.
+    let live = snapshots.live_seqs();
+
     let CompactionOutputs {
         edits: new_file_edits,
         infos: output_file_infos,
@@ -1228,7 +1245,7 @@ fn perform_compaction_to(
         target_level,
         &input_files,
         &overlap_files,
-        pin_seq,
+        &live,
         &merged_range_tombstones,
     )?;
     edits.extend(new_file_edits);
@@ -1385,271 +1402,6 @@ fn perform_compaction_to(
     Ok(())
 }
 
-/// Drop every version that no live snapshot and no current reader
-/// can observe.
-///
-/// Input `entries` is in internal-key order, so within a user-key
-/// group entries appear **newest-seq first** (because the internal
-/// key encodes `!seq`). The rule is:
-///
-/// 1. Keep every entry with `seq > pin_seq`. These are visible to
-///    newer snapshots or to current reads.
-/// 2. For the stretch of entries with `seq <= pin_seq`, keep only
-///    the *first* one we see - that's the largest seq not exceeding
-///    `pin_seq`, i.e. the version the oldest live snapshot actually
-///    reads. Drop everything strictly older than that.
-///
-/// When `pin_seq == u64::MAX` (no live snapshot), rule (1) vacuously
-/// keeps nothing and rule (2) keeps only the newest version of each
-/// user key - the aggressive GC case. When `pin_seq` is somewhere in
-/// the middle, older versions still visible to some snapshot are
-/// conservatively preserved.
-///
-/// Tombstones participate in the same rule: the newest tombstone in
-/// a user-key group survives as long as `seq > pin_seq`, or as the
-/// single pin entry if all versions fall at or below `pin_seq`.
-/// Dropping tombstones at the bottommost level when no deeper data
-/// references them is a future optimization (tracked as a follow-up).
-fn gc_old_versions(entries: Vec<(Vec<u8>, Vec<u8>)>, pin_seq: u64) -> Vec<(Vec<u8>, Vec<u8>)> {
-    use super::internal_key::VALUE_TYPE_MERGE;
-
-    let mut out = Vec::with_capacity(entries.len());
-    let mut current_user_key: Option<Vec<u8>> = None;
-    // Once set to `true`, every subsequent entry for the current
-    // user key that sits at or below `pin_seq` is shadowed by an
-    // already-emitted terminator and can be dropped. Merge
-    // operands do *not* set this flag - they form an open chain
-    // that must be preserved until a non-merge terminator arrives.
-    let mut chain_terminated = false;
-
-    for (ik, value) in entries {
-        let (uk, seq, vt) = decode_internal_key(&ik);
-
-        if current_user_key.as_deref() != Some(uk) {
-            current_user_key = Some(uk.to_vec());
-            chain_terminated = false;
-        }
-
-        if seq > pin_seq {
-            out.push((ik, value));
-            continue;
-        }
-
-        // `seq <= pin_seq` and we've already reached a terminator
-        // for this user key - the entry is strictly older and
-        // shadowed. Drop it.
-        if chain_terminated {
-            continue;
-        }
-
-        out.push((ik, value));
-        if vt != VALUE_TYPE_MERGE {
-            chain_terminated = true;
-        }
-    }
-
-    out
-}
-
-/// Run the user [`crate::options::CompactionFilter`] over every
-/// `Value` entry in `entries` and apply its decision:
-///
-/// - [`CompactionDecision::Keep`] - pass the entry through unchanged.
-/// - [`CompactionDecision::Change`] - pass through with the filter's
-///   new value (key and seq preserved).
-/// - [`CompactionDecision::Remove`] - replace the entry with a
-///   deletion tombstone at the same seq. The tombstone prevents an
-///   older version of the same user key (living deeper in the LSM)
-///   from resurfacing after the filtered value disappears.
-///
-/// Deletion internal keys are passed through without consulting the
-/// filter - the filter's contract is about the user's own values,
-/// not about tombstones regolith writes itself.
-fn apply_compaction_filter(
-    entries: Vec<(Vec<u8>, Vec<u8>)>,
-    filter: &dyn crate::options::CompactionFilter,
-    level: usize,
-) -> Vec<(Vec<u8>, Vec<u8>)> {
-    use super::internal_key::{VALUE_TYPE_DELETION, VALUE_TYPE_VALUE, encode_internal_key};
-
-    let mut out = Vec::with_capacity(entries.len());
-    for (ik, value) in entries {
-        let (uk, seq, vt) = decode_internal_key(&ik);
-        if vt != VALUE_TYPE_VALUE {
-            out.push((ik, value));
-            continue;
-        }
-        match filter.filter(level, uk, &value) {
-            crate::options::CompactionDecision::Keep => out.push((ik, value)),
-            crate::options::CompactionDecision::Change(new_value) => out.push((ik, new_value)),
-            crate::options::CompactionDecision::Remove => {
-                // Replace with a same-seq deletion so lower levels
-                // can't resurrect the filtered value.
-                let tombstone_key = encode_internal_key(uk, seq, VALUE_TYPE_DELETION);
-                out.push((tombstone_key, Vec::new()));
-            }
-        }
-    }
-    out
-}
-
-/// Walk the entries in user-key groups and collapse merge chains
-/// where possible, using the configured [`MergeOperator`]. Entries
-/// arrive in internal-key order, so within each group the newest
-/// seq appears first.
-///
-/// Two transformations happen:
-///
-/// 1. **Full collapse:** if a group contains a `Value` or
-///    `Deletion` terminator AND one or more `Merge` operands
-///    layered on top of it, call `full_merge(base, operands)` and
-///    replace the whole group with a single `Value` entry at the
-///    newest merge's seq (or with the original terminator if
-///    `full_merge` fails - we conservatively keep the raw chain).
-///
-/// 2. **Partial fold:** if a group is pure merges (no terminator in
-///    the compaction's input set) and the operator's
-///    `partial_merge` is available, fold the operand chain pairwise
-///    into a single operand. The result replaces the chain at the
-///    newest merge's seq.
-///
-/// Anything the operator rejects (`None` return) is left intact so
-/// a compaction-time merge failure never loses data - the raw
-/// operands survive to be retried on the next compaction or
-/// materialized by a reader.
-fn collapse_merge_chains(
-    entries: Vec<(Vec<u8>, Vec<u8>)>,
-    op: &dyn crate::options::MergeOperator,
-) -> Vec<(Vec<u8>, Vec<u8>)> {
-    use super::internal_key::{
-        VALUE_TYPE_DELETION, VALUE_TYPE_MERGE, VALUE_TYPE_VALUE, encode_internal_key,
-    };
-
-    let mut out: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(entries.len());
-    let mut i = 0;
-    while i < entries.len() {
-        // Find the group of entries sharing this user key.
-        let (uk_head, _, _) = decode_internal_key(&entries[i].0);
-        let uk = uk_head.to_vec();
-        let start = i;
-        let mut end = i + 1;
-        while end < entries.len() {
-            let (uk_next, _, _) = decode_internal_key(&entries[end].0);
-            if uk_next != uk.as_slice() {
-                break;
-            }
-            end += 1;
-        }
-
-        // Classify the group.
-        //
-        // Walk newest → oldest: collect merge operands until we hit
-        // a terminator (Value / Deletion) or run off the end.
-        let group = &entries[start..end];
-        let mut operands_newest_first: Vec<(u64, Vec<u8>)> = Vec::new();
-        let mut terminator: Option<(u64, u8, Vec<u8>)> = None;
-        let mut chain_end_offset = 0usize;
-        for (offset, entry) in group.iter().enumerate() {
-            let (_, seq, vt) = decode_internal_key(&entry.0);
-            match vt {
-                VALUE_TYPE_MERGE => {
-                    operands_newest_first.push((seq, entry.1.clone()));
-                    chain_end_offset = offset + 1;
-                }
-                VALUE_TYPE_VALUE | VALUE_TYPE_DELETION => {
-                    terminator = Some((seq, vt, entry.1.clone()));
-                    chain_end_offset = offset + 1;
-                    break;
-                }
-                _ => {
-                    chain_end_offset = group.len();
-                    break;
-                }
-            }
-        }
-
-        let everything_scanned = chain_end_offset == group.len();
-        let has_operands = !operands_newest_first.is_empty();
-
-        match (has_operands, &terminator) {
-            (false, _) => {
-                // No merges in this group - nothing to collapse.
-                out.extend(group.iter().cloned());
-            }
-            (true, Some((_term_seq, term_vt, term_value))) => {
-                // Full collapse. Build operands in oldest-first
-                // order, pick base from terminator type, call
-                // full_merge. Newest merge's seq becomes the single
-                // output's seq so it shadows everything that was
-                // already shadowed by the original terminator.
-                let newest_seq = operands_newest_first[0].0;
-                let base: Option<&[u8]> = if *term_vt == VALUE_TYPE_VALUE {
-                    Some(term_value.as_slice())
-                } else {
-                    None
-                };
-                let operand_refs: Vec<&[u8]> = operands_newest_first
-                    .iter()
-                    .rev()
-                    .map(|(_, v)| v.as_slice())
-                    .collect();
-                match op.full_merge(&uk, base, &operand_refs) {
-                    Some(collapsed) => {
-                        let new_key = encode_internal_key(&uk, newest_seq, VALUE_TYPE_VALUE);
-                        out.push((new_key, collapsed));
-                        // Older entries past the terminator are
-                        // already shadowed by it; emit them as-is
-                        // in case a later pass wants them.
-                        out.extend(group[chain_end_offset..].iter().cloned());
-                    }
-                    None => {
-                        // Conservative: keep the raw chain.
-                        out.extend(group.iter().cloned());
-                    }
-                }
-            }
-            (true, None) => {
-                // No terminator in this group. Try pairwise partial
-                // merge to shrink the chain.
-                if everything_scanned && operands_newest_first.len() > 1 {
-                    // Fold oldest→newest, carrying an accumulator.
-                    // The length check above guarantees a first item.
-                    let mut iter = operands_newest_first.iter().rev();
-                    let first = iter.next().unwrap();
-                    let mut acc: Vec<u8> = first.1.clone();
-                    let mut newest_seq = first.0;
-                    let mut succeeded_any = false;
-                    for (seq, val) in iter {
-                        match op.partial_merge(&uk, &acc, val) {
-                            Some(folded) => {
-                                acc = folded;
-                                newest_seq = *seq;
-                                succeeded_any = true;
-                            }
-                            None => {
-                                succeeded_any = false;
-                                break;
-                            }
-                        }
-                    }
-                    if succeeded_any {
-                        let new_key = encode_internal_key(&uk, newest_seq, VALUE_TYPE_MERGE);
-                        out.push((new_key, acc));
-                    } else {
-                        out.extend(group.iter().cloned());
-                    }
-                } else {
-                    out.extend(group.iter().cloned());
-                }
-            }
-        }
-
-        i = end;
-    }
-
-    out
-}
-
 /// Whether a file's user-key range intersects `[start, end)`. `None`
 /// bounds are treated as unbounded.
 fn file_overlaps_range(file: &Arc<LiveSst>, start: Option<&[u8]>, end: Option<&[u8]>) -> bool {
@@ -1719,7 +1471,7 @@ fn stream_compaction_outputs(
     target_level: usize,
     input_files: &[Arc<LiveSst>],
     overlap_files: &[Arc<LiveSst>],
-    pin_seq: u64,
+    live: &[u64],
     merged_range_tombstones: &RangeTombstoneSet,
 ) -> std::io::Result<CompactionOutputs> {
     let all_files: Vec<Arc<LiveSst>> = input_files
@@ -1750,6 +1502,12 @@ fn stream_compaction_outputs(
         target_level,
         merged_range_tombstones,
     );
+    let stripes = Stripes::new(
+        live,
+        opts.compaction_filter.as_deref(),
+        opts.merge_operator.as_deref(),
+        target_level,
+    );
     let mut last_internal_key: Option<Vec<u8>> = None;
     let mut current_user_key: Option<Vec<u8>> = None;
     let mut group: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
@@ -1773,49 +1531,23 @@ fn stream_compaction_outputs(
             .as_deref()
             .is_some_and(|current| current != user_key)
         {
-            let transformed =
-                transform_compaction_group(std::mem::take(&mut group), pin_seq, opts, target_level);
-            writer.add_group(&transformed)?;
+            writer.add_group(&stripes.reduce_group(std::mem::take(&mut group)))?;
         }
         if current_user_key.as_deref() != Some(user_key) {
             current_user_key = Some(user_key.to_vec());
         }
 
         let (_, seq, _) = decode_internal_key(&entry.key);
-        let rt_seq = merged_range_tombstones.max_covering_seq(user_key, pin_seq);
-        if rt_seq <= seq {
+        if !stripes.shadowed(merged_range_tombstones, user_key, seq) {
             group.push((entry.key, entry.value));
         }
     }
 
     if current_user_key.is_some() {
-        let transformed = transform_compaction_group(group, pin_seq, opts, target_level);
-        writer.add_group(&transformed)?;
+        writer.add_group(&stripes.reduce_group(group))?;
     }
 
     writer.finish()
-}
-
-fn transform_compaction_group(
-    mut group: Vec<(Vec<u8>, Vec<u8>)>,
-    pin_seq: u64,
-    opts: &CompactionOptions,
-    target_level: usize,
-) -> Vec<(Vec<u8>, Vec<u8>)> {
-    if group.is_empty() {
-        return group;
-    }
-
-    group = gc_old_versions(group, pin_seq);
-    if pin_seq == u64::MAX {
-        if let Some(filter) = opts.compaction_filter.as_ref() {
-            group = apply_compaction_filter(group, filter.as_ref(), target_level);
-        }
-        if let Some(op) = opts.merge_operator.as_ref() {
-            group = collapse_merge_chains(group, op.as_ref());
-        }
-    }
-    group
 }
 
 /// What a successful output stream hands back: the edits that install
@@ -2247,13 +1979,7 @@ fn key_range(files: &[Arc<LiveSst>]) -> (Vec<u8>, Vec<u8>) {
 }
 
 fn find_overlapping(files: &[Arc<LiveSst>], min_key: &[u8], max_key: &[u8]) -> Vec<Arc<LiveSst>> {
-    files
-        .iter()
-        .filter(|f| {
-            f.meta.smallest_key.as_slice() <= max_key && f.meta.largest_key.as_slice() >= min_key
-        })
-        .map(Arc::clone)
-        .collect()
+    overlapping(files, min_key, max_key).to_vec()
 }
 
 fn delete_old_files(

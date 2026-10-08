@@ -444,17 +444,16 @@ fn snapshot_scan_never_travels_backwards() {
 }
 
 /// A snapshot's view must not change under it, and the window this
-/// attacks is the one the read-view work left open on purpose:
-/// compaction reads its GC bound (`oldest_live_seq`) *before* it fixes
-/// its input set, so a snapshot registered in between is not accounted
-/// for by the pass that is about to drop versions.
+/// attacks is the one between a compaction pass fixing its input set and
+/// reading the live snapshots (`SnapshotRegistry::live_seqs`). The read
+/// comes second, so a snapshot registered at any point is either in the
+/// list or reads at a sequence no input version exceeds.
 ///
 /// Shape: many short-lived snapshots, each taken while writers overwrite
 /// and a user thread runs `compact_range`. Each snapshot reads its whole
 /// key set, then reads it again after more writes and compactions have
 /// landed, and requires the two reads to be byte-identical. Snapshot
-/// churn is the point: a long-lived snapshot holds the GC horizon back
-/// and closes the very window this is looking for.
+/// churn is the point: it keeps registering snapshots inside that window.
 #[test]
 fn a_snapshot_taken_during_compaction_keeps_its_view() {
     let rounds = env_usize("REGOLITH_ADV_ROUNDS", 1);

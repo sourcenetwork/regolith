@@ -37,6 +37,7 @@ use std::time::Duration;
 
 use kovan_queue::array_queue::ArrayQueue;
 
+use super::internal_key::VALUE_TYPE_DELETION;
 use super::memtable::MemTable;
 use super::wal::{MAX_RECORD_LEN, Wal, check_write_len};
 use super::{CommitOutcome, DurabilityMode, ReadView, RegolithEngine, grouped_batch_ops};
@@ -44,10 +45,13 @@ use crate::WriteBatchOp;
 use crate::perf_context::{PerfTimer, PerfTimerField};
 use crate::statistics::{Histogram, Ticker};
 
+mod replaced;
 mod request;
 mod slot;
 mod stall;
+mod terminator;
 
+use replaced::Replaced;
 pub(crate) use request::WriteRequest;
 pub(crate) use slot::WriteSlot;
 pub(crate) use stall::StallSignal;
@@ -334,12 +338,16 @@ impl RegolithEngine {
 
         let view = self.view.load();
         // Reads first, then the written keys in operation order: point
-        // operations arrive sorted from the write map, merges after them in
-        // the order they were buffered, so a multi-key conflict names the
-        // same key on every run.
+        // operations arrive sorted from the write map, merges after them
+        // sorted by key, so a multi-key conflict names the same key on
+        // every run.
         for check in &checks.reads {
-            if let Some((latest_seq, _)) = self.latest_version_in_view(&check.key, &view)?
+            if let Some((latest_seq, newest_type)) = self.latest_version_in_view(&check.key, &view)?
                 && latest_seq > check.observed_seq
+                // A presence-only read found a value of a key whose bytes
+                // never differ, so only the key being gone (a deletion, or a
+                // range delete over it) can have changed what it decided.
+                && (!check.presence_only || newest_type == VALUE_TYPE_DELETION)
             {
                 // A key the transaction *read* always aborts, since the stale
                 // read may have changed what it decided.
@@ -350,34 +358,70 @@ impl RegolithEngine {
                 });
             }
         }
-        // A key merged N times in one transaction is probed once, not N
-        // times: each probe past the first would just walk the same
-        // pipeline-mutex-held view again for an answer already known. A key
-        // with both a point op and a merge op is still probed twice, since
-        // the point op and the first merge op are seen as distinct writes
-        // here; `write_matches_committed` refuses any key carrying a merge
-        // op, so both probes land on the same outcome.
+        // The merges arrive sorted by key, so a key merged N times in one
+        // transaction is probed once, not N times: a repeat of the previous
+        // merged key is skipped, since another probe would just walk the
+        // same pipeline-mutex-held view again for an answer already known.
+        // Only an optimization: a repeat probe lands on the same outcome, so
+        // no correctness rests on the order. A key with both a point op and
+        // a merge op is still probed twice, since the point op and the first
+        // merge op are seen as distinct writes here; `write_matches_committed`
+        // refuses any key carrying a merge op, so both probes land on the
+        // same outcome.
         if let Some(observed_seq) = checks.writes_at {
-            let mut merged_keys: std::collections::HashSet<&[u8]> =
-                std::collections::HashSet::new();
+            // Borrows the batch and allocates nothing: the loop below runs
+            // under the pipeline mutex.
+            let replaced = checks.blind_merges_commute.then(|| Replaced::of(&ops));
+            let mut last_merged: Option<&[u8]> = None;
             for op in &ops {
-                let key = match op {
-                    WriteBatchOp::Put { key, .. } | WriteBatchOp::Delete { key } => key,
+                let (key, merged) = match op {
+                    WriteBatchOp::Put { key, .. } | WriteBatchOp::Delete { key } => (key, false),
                     WriteBatchOp::Merge { key, .. } => {
-                        if !merged_keys.insert(key.as_slice()) {
+                        if last_merged == Some(key.as_slice()) {
                             continue;
                         }
-                        key
+                        last_merged = Some(key.as_slice());
+                        (key, true)
                     }
                     // Range deletes are not validated (transaction.rs:459-460).
                     WriteBatchOp::DeleteRange { .. } => continue,
                 };
+                // The caller exempted this key from validation, so a newer
+                // write of it is no conflict and its lookup is not worth
+                // making. A search of a sorted list, no hash and no
+                // allocation, and an empty list unless a key classifier
+                // named keys.
+                // vertexia: O(log exempt keys) per written key; a merge-join
+                // over the sorted point and merge runs is O(1) if a very
+                // large exempt list ever shows in a profile.
+                if checks
+                    .exempt
+                    .binary_search_by(|exempt| exempt.as_slice().cmp(key))
+                    .is_ok()
+                {
+                    continue;
+                }
                 // A written key the transaction also read was validated above,
-                // at the read's anchor and without the elision below.
+                // at the read's anchor and without the elision below. A
+                // presence-only read does not stand for the write, so that
+                // key goes on to the check below.
                 if checks
                     .reads
                     .binary_search_by(|read| read.key.as_slice().cmp(key))
-                    .is_ok()
+                    .is_ok_and(|at| !checks.reads[at].presence_only)
+                {
+                    continue;
+                }
+                // Operands commute, so a key the batch only merges into
+                // conflicts only with a replacement newer than the snapshot,
+                // and one walk settles that. The probe below then runs for
+                // such a key only once it is about to conflict anyway.
+                if merged
+                    && let Some(replaced) = &replaced
+                    && !replaced.contains(key)
+                    && self
+                        .newest_terminator_seq_above(key, observed_seq, &view)?
+                        .is_none()
                 {
                     continue;
                 }
@@ -794,6 +838,9 @@ impl RegolithEngine {
         }
     }
 }
+
+#[cfg(test)]
+mod exempt_tests;
 
 #[cfg(test)]
 mod limit_tests;

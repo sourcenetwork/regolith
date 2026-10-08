@@ -161,6 +161,35 @@ pub(crate) fn exclusive_successor(key: &[u8]) -> Vec<u8> {
     end
 }
 
+/// The user-key range a table covers: its point keys `points`, widened to take
+/// in the start and end of every tombstone in `tombstones`, which cover keys
+/// the points do not. `None` for a table holding neither.
+///
+/// The one place this is decided, so the range a table is placed by and the
+/// range it is recorded with cannot differ.
+pub(crate) fn table_key_range<'tombstone>(
+    points: Option<(Vec<u8>, Vec<u8>)>,
+    tombstones: impl IntoIterator<Item = &'tombstone RangeTombstone>,
+) -> Option<(Vec<u8>, Vec<u8>)> {
+    tombstones
+        .into_iter()
+        .fold(points, |range, rt| match range {
+            None => Some((rt.start.clone(), rt.end.clone())),
+            Some((smallest, largest)) => Some((
+                if rt.start < smallest {
+                    rt.start.clone()
+                } else {
+                    smallest
+                },
+                if rt.end > largest {
+                    rt.end.clone()
+                } else {
+                    largest
+                },
+            )),
+        })
+}
+
 pub(crate) fn sort_dedup_tombstones(tombstones: &mut Vec<RangeTombstone>) {
     tombstones.sort_by(|a, b| {
         a.start
@@ -266,6 +295,38 @@ mod tests {
         assert_eq!(clipped[1].start, b"c");
         assert_eq!(clipped[1].end, b"e");
         assert_eq!(clipped[1].seq, 7);
+    }
+
+    fn range_of(
+        points: Option<(&[u8], &[u8])>,
+        tombstones: &[(&[u8], &[u8])],
+    ) -> Option<(Vec<u8>, Vec<u8>)> {
+        let tombstones: Vec<RangeTombstone> = tombstones
+            .iter()
+            .map(|&(start, end)| RangeTombstone::new(start.to_vec(), end.to_vec(), 1))
+            .collect();
+        let points = points.map(|(first, last)| (first.to_vec(), last.to_vec()));
+        table_key_range(points, &tombstones)
+    }
+
+    #[test]
+    fn a_table_range_is_its_points_widened_by_every_tombstone() {
+        let range = |points, tombstones: &[(&[u8], &[u8])]| range_of(points, tombstones);
+        let pair = |a: &[u8], b: &[u8]| Some((a.to_vec(), b.to_vec()));
+
+        assert_eq!(range(None, &[]), None);
+        assert_eq!(range(Some((b"m", b"p")), &[]), pair(b"m", b"p"));
+        // Tombstones alone: their hull.
+        assert_eq!(range(None, &[(b"c", b"f"), (b"b", b"d")]), pair(b"b", b"f"));
+        // A tombstone inside the points changes nothing.
+        assert_eq!(range(Some((b"a", b"z")), &[(b"c", b"f")]), pair(b"a", b"z"));
+        // One reaching past either end, or both, widens that end.
+        assert_eq!(range(Some((b"m", b"p")), &[(b"a", b"n")]), pair(b"a", b"p"));
+        assert_eq!(range(Some((b"m", b"p")), &[(b"n", b"z")]), pair(b"m", b"z"));
+        assert_eq!(
+            range(Some((b"m", b"p")), &[(b"a", b"b"), (b"y", b"z")]),
+            pair(b"a", b"z")
+        );
     }
 
     #[test]

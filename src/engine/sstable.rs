@@ -73,11 +73,12 @@ use super::internal_key::{
     VALUE_TYPE_DELETION, VALUE_TYPE_MERGE, decode_internal_key, user_key_of,
 };
 use super::lookup_key::LookupKey;
-use super::range_tombstone::{RangeTombstone, RangeTombstoneSet};
+use super::range_tombstone::{RangeTombstone, RangeTombstoneSet, table_key_range};
 use crate::DbSlice;
 use crate::env::{BufferedWriter, Env, ReadFile, WriteMode};
 use crate::options::{CompressionType, PrefixExtractor};
 
+mod key_walk;
 #[cfg(test)]
 mod size_limit_tests;
 
@@ -966,25 +967,12 @@ impl SsTableWriter {
         self.writer.sync_all()?;
         crate::env::sync_parent_dir(&*self.env, &self.path)?;
 
-        let mut smallest_user_key = self.smallest_user_key.take();
-        let mut largest_user_key = self.largest_user_key.take();
-        for rt in range_tombstone_set.iter() {
-            if smallest_user_key
-                .as_ref()
-                .is_none_or(|smallest| rt.start.as_slice() < smallest.as_slice())
-            {
-                smallest_user_key = Some(rt.start.clone());
-            }
-            if largest_user_key
-                .as_ref()
-                .is_none_or(|largest| rt.end.as_slice() > largest.as_slice())
-            {
-                largest_user_key = Some(rt.end.clone());
-            }
-        }
-
-        let smallest_user_key = smallest_user_key.expect("checked non-empty above");
-        let largest_user_key = largest_user_key.expect("checked non-empty above");
+        let points = self
+            .smallest_user_key
+            .take()
+            .zip(self.largest_user_key.take());
+        let (smallest_user_key, largest_user_key) =
+            table_key_range(points, range_tombstone_set.iter()).expect("checked non-empty above");
 
         Ok(Some(SsTableWriteSummary {
             smallest_user_key,
@@ -1792,64 +1780,6 @@ impl SsTableReader {
             cache.record_bloom_full_positive();
         }
         Ok(newest)
-    }
-
-    /// Walk every visible entry for `user_key` at `snapshot_seq` in
-    /// newest-seq-first order, appending `(seq, value_type, value)`
-    /// tuples onto `out` and stopping at (and including) the first
-    /// terminator (`VALUE_TYPE_VALUE` or `VALUE_TYPE_DELETION`).
-    /// Returns `true` if a terminator was reached.
-    ///
-    /// The chain continues into the following data blocks for as long as
-    /// the key does: a key with more operands than one block holds, which a
-    /// pinned snapshot makes routine by keeping compaction from folding
-    /// them, would otherwise lose the rest of its chain and its base.
-    pub(crate) fn collect_merge_chain(
-        &self,
-        lk: &LookupKey,
-        key_buf: &mut Vec<u8>,
-        cache: &BlockCache,
-        out: &mut Vec<(u64, u8, DbSlice)>,
-    ) -> io::Result<bool> {
-        let user_key = lk.prefixed_user_key();
-        if !self.filter(cache)?.may_contain(user_key) {
-            return Ok(false);
-        }
-
-        let search_key = lk.internal();
-        let mut cursor = self.seek_block_cursor(search_key, cache)?;
-        while let Some(at) = cursor {
-            let block = self.load_block_at_cursor(&at, cache)?;
-            // Positions first, owning slices second: the scan closure holds
-            // a borrow of the block for its whole run. Every entry of a
-            // later block sorts after `search_key`, so seeking to it there
-            // starts at the block's first entry.
-            let mut spans: Vec<(u64, u8, usize, usize)> = Vec::new();
-            let ended = block.scan_from(search_key, key_buf, |ik, value_offset, value_len| {
-                let (uk, seq, vt) = decode_internal_key(ik);
-                if uk != user_key {
-                    return ControlFlow::Break(false);
-                }
-                spans.push((seq, vt, value_offset, value_len));
-                if vt != VALUE_TYPE_MERGE {
-                    ControlFlow::Break(true)
-                } else {
-                    ControlFlow::Continue(())
-                }
-            });
-
-            for (seq, vt, value_offset, value_len) in spans {
-                let value = DbSlice::from_block(Arc::clone(&block), value_offset, value_len)
-                    .ok_or_else(|| invalid_data("block value extends past block"))?;
-                out.push((seq, vt, value));
-            }
-            match ended {
-                Some(terminated) => return Ok(terminated),
-                // The block ran out while still on this key.
-                None => cursor = self.next_block_cursor(&at, cache)?,
-            }
-        }
-        Ok(false)
     }
 
     /// Collect every entry in internal-key order with no dedup or

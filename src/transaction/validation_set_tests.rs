@@ -27,7 +27,7 @@ fn oracle(
     let optimistic = matches!(tx.mode, TxMode::Optimistic);
     let serializable = matches!(
         tx.isolation,
-        IsolationLevel::RepeatableRead | IsolationLevel::Serializable
+        IsolationLevel::RepeatableRead | IsolationLevel::Serializable | IsolationLevel::DefraLevel
     );
     let read_committed = tx.isolation == IsolationLevel::ReadCommitted;
     let mut checks: BTreeMap<Vec<u8>, (u64, bool)> = BTreeMap::new();
@@ -117,11 +117,12 @@ impl AnyDb {
 }
 
 fn isolation_level(level: u8) -> IsolationLevel {
-    match level % 4 {
+    match level % 5 {
         0 => IsolationLevel::ReadCommitted,
         1 => IsolationLevel::SnapshotIsolation,
         2 => IsolationLevel::RepeatableRead,
-        _ => IsolationLevel::Serializable,
+        3 => IsolationLevel::Serializable,
+        _ => IsolationLevel::DefraLevel,
     }
 }
 
@@ -134,7 +135,7 @@ proptest! {
     #[test]
     fn new_validation_set_equals_the_old_one(
         flavor in 0..2u8,
-        level in 0..4u8,
+        level in 0..5u8,
         ops in proptest::collection::vec((0u8..6, 0u8..6), 0..24),
     ) {
         let dir = TempDir::new().expect("tempdir");
@@ -166,11 +167,7 @@ proptest! {
         // Drained exactly as `commit_inner` drains them. This never
         // reaches the engine: no merge operator is configured, and
         // nothing here commits.
-        let mut writes: BTreeMap<Vec<u8>, Option<Vec<u8>>> = BTreeMap::new();
-        for (key, value) in tx.writes.drain() {
-            writes.entry(key).or_insert(value);
-        }
-        let merges = drain(&tx.merges);
+        let (writes, merges) = settle(tx.writes.drain());
         let tracked = tx.tracked.drain();
 
         let want = oracle(&tx, tracked.clone(), &writes, &merges);
@@ -178,6 +175,11 @@ proptest! {
         prop_assert!(
             checks.reads.windows(2).all(|pair| pair[0].key < pair[1].key),
             "reads must be strictly ascending by key with no duplicates"
+        );
+        prop_assert_eq!(
+            checks.blind_merges_commute,
+            tx.isolation == IsolationLevel::DefraLevel,
+            "only DefraLevel lets blind merges commute"
         );
         let got = expand(&checks, &writes, &merges);
         prop_assert_eq!(got, want);
@@ -247,6 +249,23 @@ fn open_any(flavor: u8, dir: &TempDir) -> AnyDb {
     }
 }
 
+/// The put or delete the transaction buffered for `prefixed`, if any. Merge
+/// operands alone are not one: with no merge operator configured, which is
+/// the case throughout this file, a scan neither yields them nor skips the
+/// snapshot entry beneath them.
+fn replacement(tx: &Transaction<'_>, prefixed: &[u8]) -> Option<Write> {
+    let mut found = None;
+    tx.writes.walk_chain(prefixed, |write| {
+        found = write.is_terminator().then(|| write.clone());
+        if found.is_some() {
+            ControlFlow::Break(())
+        } else {
+            ControlFlow::Continue(())
+        }
+    });
+    found
+}
+
 /// The keys the stretches of one scan of `[start, end)` cover, worked out
 /// independently of `TxnScanStream`: the snapshot holds exactly the keys in
 /// `seeded`, an entry of the write buffer ends a stretch (and is yielded when
@@ -282,9 +301,9 @@ fn expected_cover(
             break;
         }
         let prefixed = prefix_key(DEFAULT_CF_ID, &[key]);
-        if let Some(buffered) = tx.writes.get(&prefixed) {
+        if let Some(replaced) = replacement(tx, &prefixed) {
             close(&mut stretch);
-            yielded += usize::from(buffered.is_some());
+            yielded += usize::from(matches!(replaced, Write::Put(_)));
             continue;
         }
         if key >= 6 || seeded & (1 << key) == 0 {
@@ -297,7 +316,10 @@ fn expected_cover(
             .filter(|read_seq| *read_seq > tx.snapshot_seq);
         if let Some(read_seq) = promoted {
             close(&mut stretch);
-            let visible = tx.engine.get_at(&prefixed, read_seq).expect("engine read");
+            let visible = tx
+                .engine
+                .get_slice_at(&prefixed, read_seq)
+                .expect("engine read");
             yielded += usize::from(visible.is_some());
             continue;
         }
@@ -324,7 +346,7 @@ proptest! {
     #[test]
     fn a_scan_validates_like_gets_of_what_it_walked(
         flavor in 0..2u8,
-        level in 0..4u8,
+        level in 0..5u8,
         seeded in any::<u8>(),
         ops in proptest::collection::vec((0u8..10, 0u8..6), 0..28),
     ) {
@@ -364,8 +386,13 @@ proptest! {
                 prop_assert!(stream.status().is_ok());
                 drop(stream);
                 for entry in entries {
-                    let buffered = scan_tx.writes.get(&prefix_key(DEFAULT_CF_ID, &entry)).is_some();
-                    if !buffered && scan_tx.isolation != IsolationLevel::RepeatableRead {
+                    let buffered = replacement(&scan_tx, &prefix_key(DEFAULT_CF_ID, &entry)).is_some();
+                    if !buffered
+                        && !matches!(
+                            scan_tx.isolation,
+                            IsolationLevel::RepeatableRead | IsolationLevel::DefraLevel
+                        )
+                    {
                         prop_assert!(twin_tx.get(&entry).is_ok());
                     }
                 }
@@ -373,11 +400,7 @@ proptest! {
         }
 
         let settle = |tx: &mut Transaction<'_>| {
-            let mut writes: BTreeMap<Vec<u8>, Option<Vec<u8>>> = BTreeMap::new();
-            for (key, value) in tx.writes.drain() {
-                writes.entry(key).or_insert(value);
-            }
-            let merges = drain(&tx.merges);
+            let (writes, merges) = write_buffer::settle(tx.writes.drain());
             let tracked = tx.tracked.drain();
             let mut checks = tx.validation_set(tracked, &writes, &merges);
             if let Some(runs) = tx.scan_runs.take() {

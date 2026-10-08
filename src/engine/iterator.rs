@@ -59,6 +59,7 @@ use std::io;
 use std::ops::Bound;
 use std::sync::Arc;
 
+use super::KeyVersion;
 use super::block::encoded_entry_size;
 use super::block::{Block, decode_entry_at};
 use super::block_cache::BlockCache;
@@ -1244,13 +1245,14 @@ impl RegolithIterator {
         // the files it is handed are sorted and non-overlapping.
         //
         // Compaction also emits range-tombstone-only files, whose key
-        // range is the tombstone's and therefore *does* overlap the data
-        // files beside it. They carry zero point entries, and their
-        // tombstones are collected below for every file in the level
-        // regardless, so they are dropped from the concat list: leaving
-        // one in place lets `seek_for_prev` bisect onto an empty file and
-        // report "no key <= target" while a live key sits in the data
-        // file that sorts after it.
+        // range is the tombstone's and so can end on the first key of the
+        // data file after it: the two overlap at that boundary key. They
+        // carry zero point entries, and their tombstones are collected
+        // below for every file in the level regardless, so they are
+        // dropped from the concat list: leaving one in place lets
+        // `seek_for_prev` bisect onto an empty file and report "no key <=
+        // target" while a live key sits in the data file that sorts after
+        // it.
         for level in 1..version.levels.len() {
             if version.levels[level].is_empty() {
                 continue;
@@ -1873,7 +1875,7 @@ impl RegolithIterator {
             let group = uk.to_vec();
 
             let rt_seq = self.covering_rt_seq(&group);
-            let mut collected: Vec<(u64, u8, DbSlice)> = Vec::new();
+            let mut collected: Vec<KeyVersion> = Vec::new();
 
             while let Some(ik2) = self.inner.key() {
                 let (uk2, seq, vt) = decode_internal_key(ik2);

@@ -1,6 +1,6 @@
-//! `RepeatableRead` against the client protocol DefraDB runs over a branchable
-//! collection's head set: a Merkle DAG whose tips are derived from keys
-//! and reclaimed by a separate sweep.
+//! `RepeatableRead` against the client protocol a Merkle-DAG CRDT store runs
+//! over a collection's head set: a DAG whose tips are derived from keys and
+//! reclaimed by a separate sweep.
 //!
 //! A head key `h/{block}` names a DAG tip candidate; a marker key
 //! `m/{parent}/{child}` records that `child` supersedes `parent`. Live
@@ -127,7 +127,7 @@ fn try_append(
 /// key that is both currently live (present in the `h/` scan) and named
 /// as a parent by some marker. A marker whose parent's head key was
 /// already deleted in an earlier pass is left alone: it is an orphan by
-/// construction, and DefraDB keeps those on purpose.
+/// construction, and the protocol keeps those on purpose.
 fn try_prune(db: &OptimisticTransactionDb, level: IsolationLevel, conflicts: &AtomicU64) {
     for _ in 0..MAX_BUSY_ATTEMPTS {
         let txn = db.begin_transaction_with(level);
@@ -167,8 +167,8 @@ fn try_prune(db: &OptimisticTransactionDb, level: IsolationLevel, conflicts: &At
     panic!("prune exhausted {MAX_BUSY_ATTEMPTS} busy retries");
 }
 
-/// Reproduces the client protocol DefraDB runs over a branchable
-/// collection's head set: appenders extend a Merkle DAG by scanning for
+/// Reproduces the client protocol a Merkle-DAG CRDT store runs over a
+/// collection's head set: appenders extend the DAG by scanning for
 /// live heads and marking each one as a parent, while a separate sweep
 /// reclaims heads a marker has since superseded. Both run concurrently at
 /// `RepeatableRead`, the level for a scan of a set concurrent writers only add

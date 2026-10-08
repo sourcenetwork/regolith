@@ -8,6 +8,7 @@
 //! node (header, tower, internal key, value, rounded to alignment)
 //! rather than only the key and value payload the old counter measured.
 
+use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -21,6 +22,8 @@ use super::range_tombstone::{RangeTombstone, RangeTombstoneSet};
 use super::skiplist::{ArenaSkipList, InsertHint, NodeRef};
 use crate::DbSlice;
 use crate::sync::{Arc, AtomicUsize, Mutex, Ordering};
+
+mod key_walk;
 
 /// Everything a memtable needs to build its arena: the engine-wide chunk
 /// pool, the per-memtable byte budget, and the chunk sizing policy.
@@ -286,19 +289,9 @@ impl MemTable {
     /// tombstones count as entries; the caller decides what to make of the
     /// type.
     fn newest_visible(&self, lk: &LookupKey) -> Option<(NodeRef<'_>, u64, u8)> {
-        let snapshot_seq = lk.snapshot_seq();
-        let mut node = self.list.seek_ge(lk.internal());
-        while let Some(current) = node {
-            let (user_key, seq, value_type) = decode_internal_key(current.key());
-            if user_key != lk.prefixed_user_key() {
-                return None;
-            }
-            if seq <= snapshot_seq {
-                return Some((current, seq, value_type));
-            }
-            node = current.next();
-        }
-        None
+        self.scan_key(lk, |node, seq, value_type| {
+            ControlFlow::Break((node, seq, value_type))
+        })
     }
 
     /// Look up the newest point entry for `key` visible at
@@ -344,39 +337,6 @@ impl MemTable {
             (Some(ptr), len) => DbSlice::from_arena(Arc::clone(self.list.arena()), ptr, len),
             _ => DbSlice::empty(),
         }
-    }
-
-    /// Walk every visible entry for `key` at `snapshot_seq` in
-    /// newest-seq-first order, appending `(seq, value_type, bytes)`
-    /// tuples onto `out` and stopping at (and including) the first
-    /// terminator (`VALUE_TYPE_VALUE` or `VALUE_TYPE_DELETION`).
-    /// Returns `true` when a terminator was reached - callers walking
-    /// multiple sources use this to decide whether to continue the
-    /// walk into the next source.
-    ///
-    /// Used by the merge-operator read path to collect a chain of
-    /// merge operands layered on top of the underlying base value.
-    pub(crate) fn collect_merge_chain(
-        &self,
-        lk: &LookupKey,
-        out: &mut Vec<(u64, u8, DbSlice)>,
-    ) -> bool {
-        let snapshot_seq = lk.snapshot_seq();
-        let mut node = self.list.seek_ge(lk.internal());
-        while let Some(current) = node {
-            let (user_key, seq, value_type) = decode_internal_key(current.key());
-            if user_key != lk.prefixed_user_key() {
-                return false;
-            }
-            if seq <= snapshot_seq {
-                out.push((seq, value_type, self.value_slice(&current)));
-                if value_type != VALUE_TYPE_MERGE {
-                    return true;
-                }
-            }
-            node = current.next();
-        }
-        false
     }
 
     /// Visit every raw entry in internal-key order, preserving every
@@ -753,59 +713,6 @@ mod tests {
         let (seq, val) = get_owned(&mt, b"k", 1).expect("should find operand");
         assert_eq!(seq, 1);
         assert_eq!(val, Some(b"op1".to_vec()));
-    }
-
-    #[test]
-    fn collect_merge_chain_walks_until_terminator() {
-        let mt = memtable();
-        mt.put(b"k", b"base", 1);
-        mt.merge(b"k", b"a", 2);
-        mt.merge(b"k", b"b", 3);
-
-        let mut chain = Vec::new();
-        let reached_term = mt.collect_merge_chain(&probe(b"k", 3), &mut chain);
-        assert!(reached_term);
-        // Newest seq first: b, a, base (terminator).
-        assert_eq!(chain.len(), 3);
-        assert_eq!(chain[0].0, 3);
-        assert_eq!(chain[2].0, 1);
-        assert_eq!(chain[2].1, VALUE_TYPE_VALUE);
-    }
-
-    #[test]
-    fn collect_merge_chain_stops_at_tombstone() {
-        let mt = memtable();
-        mt.delete(b"k", 1);
-        mt.merge(b"k", b"a", 2);
-
-        let mut chain = Vec::new();
-        let reached_term = mt.collect_merge_chain(&probe(b"k", 2), &mut chain);
-        assert!(reached_term);
-        assert_eq!(chain.len(), 2);
-        assert_eq!(chain[1].1, VALUE_TYPE_DELETION);
-    }
-
-    #[test]
-    fn collect_merge_chain_returns_false_when_only_merges_visible() {
-        let mt = memtable();
-        mt.merge(b"k", b"a", 1);
-        mt.merge(b"k", b"b", 2);
-        let mut chain = Vec::new();
-        let terminated = mt.collect_merge_chain(&probe(b"k", 2), &mut chain);
-        assert!(!terminated, "pure-merge chain must return false");
-        assert_eq!(chain.len(), 2);
-    }
-
-    #[test]
-    fn collect_merge_chain_skips_entries_above_the_snapshot() {
-        let mt = memtable();
-        mt.put(b"k", b"base", 1);
-        mt.merge(b"k", b"a", 2);
-        mt.merge(b"k", b"future", 9);
-        let mut chain = Vec::new();
-        assert!(mt.collect_merge_chain(&probe(b"k", 2), &mut chain));
-        assert_eq!(chain.len(), 2);
-        assert_eq!(chain[0].0, 2);
     }
 
     #[test]

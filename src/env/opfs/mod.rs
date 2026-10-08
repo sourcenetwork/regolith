@@ -19,8 +19,7 @@
 //!   `sync_all` is real durability.
 //! - [`OpfsMode::Mirror`] holds the whole database in linear memory and
 //!   writes it back through `FileSystemWritableFileStream`, which is what
-//!   the main thread offers. This is the strategy defradb's OPFS backend
-//!   uses. The database must fit in memory, and nothing is durable until
+//!   the main thread offers. The database must fit in memory, and nothing is durable until
 //!   [`OpfsEnv::persist`] resolves.
 //!
 //! [`OpfsOptions::force_mode`] pins the choice. Forcing [`OpfsMode::Sah`]

@@ -105,9 +105,18 @@ pub use statistics::{Histogram, HistogramSnapshot, Statistics, Ticker};
 pub use stream_writer::{StreamOptions, StreamingWriter};
 pub use tailing::TailingIter;
 pub use transaction::{
-    IsolationLevel, OptimisticTransactionDb, OwnedTransaction, ScanDirection, Transaction,
-    TransactionDb, TransactionError, TxResult, TxnScanStream,
+    IsolationLevel, KeyClass, KeyClassifier, OptimisticTransactionDb, OwnedTransaction,
+    ScanDirection, Transaction, TransactionDb, TransactionError, TxResult, TxnScanStream,
 };
+
+/// The transactional API and the traits a caller implements, in one import:
+/// `use regolith::prelude::*;`.
+pub mod prelude {
+    pub use crate::{
+        Db, IsolationLevel, KeyClass, KeyClassifier, MergeOperator, OptimisticTransactionDb,
+        Options, OwnedTransaction, Transaction, TransactionError, TxResult,
+    };
+}
 pub use ttl::{DbWithTtl, TtlCompactionFilter, strip_timestamp};
 
 #[cfg(loom)]
@@ -1096,11 +1105,13 @@ impl Db {
 
     /// Create a point-in-time snapshot for consistent reads.
     ///
-    /// Snapshots also pin the compaction GC horizon: as long as at
-    /// least one `Snapshot` at seq `S` is alive, the compaction
-    /// thread will not drop any version needed to read at seq `S`.
-    /// Dropping the returned `Snapshot` releases the pin and may
-    /// allow subsequent compactions to reclaim space.
+    /// Snapshots also pin what they read: as long as a `Snapshot` at
+    /// seq `S` is alive, compaction keeps every version a read at `S`
+    /// needs. It still drops what no reader can see, folds
+    /// merge operands between one snapshot and the next, and runs the
+    /// [`CompactionFilter`] (see its note on snapshots). Dropping the
+    /// returned `Snapshot` releases the pin and may allow subsequent
+    /// compactions to reclaim more space.
     pub fn snapshot(&self) -> Snapshot {
         let seq = self.engine.register_snapshot_at_horizon();
         Snapshot {
@@ -3963,11 +3974,10 @@ mod tests {
     }
 
     #[test]
-    fn test_gc_with_multiple_live_snapshots_uses_oldest() {
-        // When two snapshots are live, the older one's seq is the
-        // GC horizon. Every version newer than (or at) the older
-        // snapshot's seq must be preserved so the newer snapshot
-        // can still read its own view too.
+    fn test_gc_with_multiple_live_snapshots_keeps_every_snapshots_view() {
+        // With two snapshots live, compaction keeps the version each
+        // one reads, so the older snapshot's view and the newer
+        // snapshot's both survive.
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), tiny_flush_opts()).unwrap();
 
@@ -5445,7 +5455,7 @@ mod tests {
     }
 
     #[test]
-    fn test_compaction_filter_skipped_while_snapshot_alive() {
+    fn test_compaction_filter_runs_in_every_snapshot_stripe() {
         let dir = TempDir::new().unwrap();
         let opts = Options {
             write_buffer_size: 4 * 1024,
@@ -5456,24 +5466,20 @@ mod tests {
         for i in 0..20 {
             db.put(format!("k{i:02}").as_bytes(), b"hello").unwrap();
         }
-        // Hold a snapshot so the compaction filter is skipped entirely.
         let snap = db.snapshot();
+        for i in 0..20 {
+            db.put(format!("k{i:02}").as_bytes(), b"world").unwrap();
+        }
         force_flush(&db, "snap_filter");
         db.compact_range(None, None).unwrap();
 
-        // The snapshot still observes the pre-filter value because
-        // the filter was suppressed while it was alive. The live db
-        // reads also see the unmodified value since compaction left
-        // it intact.
+        // Compaction keeps one version per side of the snapshot, and
+        // the filter runs on both: the snapshot reads its own version,
+        // filtered, and the live db reads the newer one, filtered.
         for i in 0..20 {
-            assert_eq!(
-                snap.get(format!("k{i:02}").as_bytes()).unwrap(),
-                Some(b"hello".to_vec())
-            );
-            assert_eq!(
-                db.get(format!("k{i:02}").as_bytes()).unwrap(),
-                Some(b"hello".to_vec())
-            );
+            let key = format!("k{i:02}");
+            assert_eq!(snap.get(key.as_bytes()).unwrap(), Some(b"HELLO".to_vec()));
+            assert_eq!(db.get(key.as_bytes()).unwrap(), Some(b"WORLD".to_vec()));
         }
     }
 

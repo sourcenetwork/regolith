@@ -35,15 +35,21 @@
 //! read-modify-write through `get_for_update` sees the value the
 //! previous lock holder committed instead of a stale one. Reads
 //! that hit the transaction's own buffered writes always see the
-//! written value. A read anchor only ever moves forward, so two
-//! reads of the same key inside one transaction never travel
+//! written value, and a key the transaction merged into reads as the
+//! merge operator folds its operands, in the order it made them, onto
+//! the value it last put or deleted the key to, or else onto the
+//! value it reads for the key. A read anchor only ever moves forward,
+//! so two reads of the same key inside one transaction never travel
 //! backwards in time.
 //!
 //! At commit each flavor validates a set of keys, every key against
 //! the *earliest* sequence this transaction observed it at:
 //!
 //! - Optimistic: every key the transaction wrote or read through
-//!   `get_for_update`, against the begin snapshot.
+//!   `get_for_update`, against the begin snapshot. At
+//!   [`IsolationLevel::DefraLevel`], a key the transaction only merges into
+//!   conflicts with a newer put, delete or range delete of the key, and not
+//!   with a newer merge operand.
 //! - Pessimistic: every key the transaction read and then wrote
 //!   (the read-modify-write set) plus every key it read through
 //!   `get_for_update`. A key written blind, without ever being
@@ -70,7 +76,13 @@
 //! `Serializable` every key read by any of them is. At every level, a key a
 //! transactional scan walked that the transaction then writes is validated
 //! as a read from the begin snapshot, so a scan-then-write is never taken
-//! for a blind write.
+//! for a blind write. One exception is a stretch that stays inside one
+//! [`KeyClass::CommutativePrefix`] at [`IsolationLevel::DefraLevel`] with a
+//! [`KeyClassifier`] installed: a write there is validated as a blind write.
+//! The other is a key that classifier declares [`KeyClass::ContentAddressed`]:
+//! at that level a put or merge of it is not validated, a read of it that
+//! found a value is validated for its presence only, and a delete of it, or a
+//! read that found nothing, is validated as for any key.
 //!
 //! # Out of scope (follow-ups)
 //!
@@ -101,8 +113,12 @@ use crate::column_family::{DEFAULT_CF_ID, prefix_key};
 use crate::engine::{CommitOutcome, ConflictKey, RegolithEngine, ValidationSet};
 use crate::{Db, DbSlice, Error, Options, Result};
 
+mod policy;
 mod scan_range;
+mod write_buffer;
+pub use policy::{KeyClass, KeyClassifier};
 use scan_range::{OpenRun, ScanRun};
+use write_buffer::{KeyWrites, Write, fold_by_key, read_buffered, settle};
 
 /// Default lock-acquisition timeout for [`TransactionDb`] when the
 /// caller doesn't specify one on [`TransactionDb::with_lock_timeout`].
@@ -167,6 +183,7 @@ impl From<Error> for TransactionError {
 /// [`TransactionError::Conflict`].
 pub struct OptimisticTransactionDb {
     isolation: IsolationLevel,
+    policy: Option<Arc<dyn KeyClassifier>>,
     inner: Db,
 }
 
@@ -183,7 +200,35 @@ impl OptimisticTransactionDb {
         Ok(Self {
             inner: Db::open(path, opts)?,
             isolation: IsolationLevel::default(),
+            policy: None,
         })
+    }
+
+    /// Install the [`KeyClassifier`] that [`IsolationLevel::DefraLevel`]
+    /// consults. Transactions at any other level ignore it.
+    ///
+    /// Without a classifier every scan is recorded as at
+    /// [`IsolationLevel::RepeatableRead`], and every read and write is
+    /// validated as there. With one, the commit disregards a scan stretch
+    /// that stays inside one [`KeyClass::CommutativePrefix`], so a write or
+    /// merge the transaction makes inside that stretch is validated as a
+    /// blind write instead of as a read. It does not validate a put or merge
+    /// of a [`KeyClass::ContentAddressed`] key, nor a read of a key the
+    /// transaction puts or merges, and validates a read of one that found it
+    /// for presence only, so two transactions that create the same such key
+    /// both commit while a delete of it is still checked.
+    ///
+    /// This is safe only when nothing the transaction writes outside the
+    /// prefix depends on which keys of the prefix the scan returned, its
+    /// writes inside the prefix are unique keys or identical rewrites, and a
+    /// content-addressed key never holds different bytes. regolith cannot
+    /// check that, so it rests on the caller's word.
+    ///
+    /// The classifier does not change how blind merges are validated: they
+    /// commute at this level for every key.
+    pub fn with_policy(mut self, classifier: Arc<dyn KeyClassifier>) -> Self {
+        self.policy = Some(classifier);
+        self
     }
 
     /// Borrow the underlying [`Db`] for APIs that
@@ -237,6 +282,7 @@ impl OptimisticTransactionDb {
             DEFAULT_LOCK_TIMEOUT,
             isolation,
             self.inner.transaction_keys_inline(),
+            self.policy.clone(),
         )
     }
 
@@ -337,6 +383,7 @@ impl TransactionDb {
             self.lock_timeout,
             isolation,
             self.inner.transaction_keys_inline(),
+            None,
         )
     }
 
@@ -379,6 +426,17 @@ pub enum ScanDirection {
 /// | [`IsolationLevel::SnapshotIsolation`] | no | no | no | **possible** |
 /// | [`IsolationLevel::RepeatableRead`] | no | no | no | **through a scan** |
 /// | [`IsolationLevel::Serializable`] | no | no | no | no |
+/// | [`IsolationLevel::DefraLevel`] | no | no | no | **through a scan** |
+///
+/// The [`IsolationLevel::DefraLevel`] row is `RepeatableRead`'s, with the
+/// relaxations described on that variant. A key that is only merged into is
+/// not snapshot isolated there: concurrent transactions can all commit a
+/// merge to it, and every operand applies. When every transaction uses only
+/// point reads, puts, deletes and merges, the committed transactions are
+/// serializable in commit order. The keys a scan returns are not validated.
+/// A key the installed classifier declares [`KeyClass::ContentAddressed`] is
+/// outside that statement: transactions that create it all commit, and a read
+/// that found it holds as long as the key is not deleted.
 ///
 /// Every level reads from a snapshot captured when the transaction
 /// began, so none of them can observe a dirty read. What changes is the
@@ -458,12 +516,72 @@ pub enum IsolationLevel {
     /// Validate the entire read set, including every key a transactional
     /// scan yields.
     Serializable,
+    /// [`IsolationLevel::RepeatableRead`] with three relaxations, for
+    /// optimistic transactions only. A pessimistic transaction at this
+    /// level validates exactly as at `RepeatableRead`.
+    ///
+    /// What the commit validates, by kind of key (the first is
+    /// `RepeatableRead` itself, the other three are the relaxations):
+    ///
+    /// - An ordinary key. Every point read of it is validated, whether it
+    ///   found a value or not, and a put or delete of it conflicts with any
+    ///   commit to the key since the transaction began, unless the key
+    ///   already holds what the write would leave.
+    /// - Blind merges commute. A key the transaction only merges into (it
+    ///   did not read the key, did not walk it in a scan, and did not put or
+    ///   delete it) conflicts only with a newer put, delete or covering
+    ///   range delete of that key, never with a newer merge operand.
+    ///   Concurrent blind merges to one key all commit, and their operands
+    ///   apply in commit order. This needs no classifier.
+    /// - Commutative prefixes. With a [`KeyClassifier`] installed through
+    ///   [`OptimisticTransactionDb::with_policy`], a scan stretch that stays
+    ///   inside one [`KeyClass::CommutativePrefix`] is not recorded, and a
+    ///   put or merge the transaction makes inside it, before or after the
+    ///   scan, is validated as a blind write instead of as a read.
+    ///   [`KeyClass::CommutativePrefix`] states when that is safe.
+    /// - Content-addressed keys. With the same classifier, a put or merge of
+    ///   a key it declares [`KeyClass::ContentAddressed`] is never
+    ///   validated, nor is a read of a key the transaction puts or merges,
+    ///   so two transactions that create the same key both commit. A delete
+    ///   of it is validated like a delete of an ordinary key. A point read
+    ///   that found it is validated for presence only: it conflicts at
+    ///   commit when the key is gone, and not when a newer put or merge left
+    ///   it there. A read that found nothing is validated in full, so a
+    ///   newer put conflicts. [`KeyClass::ContentAddressed`] states the
+    ///   caller's contract.
+    ///
+    /// A transaction reads its own puts, deletes and merges in the order it
+    /// made them, and the commit applies them in that order: an operand
+    /// applies to the put or delete before it, and a put or delete replaces
+    /// every operand before it. That changes what a commit stores for a merge
+    /// made before a put of the same key. Earlier versions applied every
+    /// merge on top of the puts, whatever order they were made in; the
+    /// commit now stores the put alone.
+    ///
+    /// A key that is only merged into does not get snapshot isolation:
+    /// first committer wins does not apply to merge operands. When every
+    /// transaction uses only point reads, puts, deletes and merges, the
+    /// committed transactions are serializable in commit order, because
+    /// every point read is validated; a content-addressed key is outside
+    /// that statement. The keys a scan returns are not validated, as at
+    /// `RepeatableRead`, so phantoms are possible: a key another transaction
+    /// inserts into a scanned range is detected only when this transaction
+    /// also reads or writes it.
+    ///
+    /// A [`crate::CompactionFilter`] runs in every snapshot stripe, so a
+    /// filter that changes or removes a value changes what a live snapshot,
+    /// a transaction's included, reads from then on. No commit check sees
+    /// it.
+    DefraLevel,
 }
 
 impl IsolationLevel {
     /// Whether every point read is validated at commit, written or not.
     pub(crate) fn validates_every_read(self) -> bool {
-        matches!(self, Self::RepeatableRead | Self::Serializable)
+        matches!(
+            self,
+            Self::RepeatableRead | Self::Serializable | Self::DefraLevel
+        )
     }
 
     /// Whether a transactional scan records each key it yields as a read.
@@ -485,7 +603,10 @@ enum TxMode {
 ///
 /// Reads within the transaction see a consistent snapshot captured
 /// at begin time, except for keys that the transaction itself has
-/// written; those always read back the buffered write.
+/// written; those always read back the buffered write. A key it merged
+/// into reads as the database's merge operator folds the transaction's
+/// operands onto the value it replaced, or onto the value it reads for the
+/// key when it replaced nothing.
 ///
 /// Dropping a `Transaction` without committing is equivalent to
 /// calling [`Transaction::rollback`]: buffered writes are
@@ -494,19 +615,21 @@ pub struct Transaction<'db> {
     engine: Arc<RegolithEngine>,
     /// What the commit-time validation covers. See [`IsolationLevel`].
     isolation: IsolationLevel,
+    /// The key classes [`IsolationLevel::DefraLevel`] applies.
+    policy: Option<Arc<dyn KeyClassifier>>,
     snapshot_seq: u64,
     durability: crate::engine::DurabilityMode,
     mode: TxMode,
-    /// Buffer of point writes. `Some(v)` is a put, `None` is a
-    /// delete. Concurrent so that buffering a write takes `&self`;
-    /// drained into a `BTreeMap` at commit, which is where the order
-    /// the engine applies them in is restored.
-    writes: TxnBuffer<Vec<u8>, Option<Vec<u8>>>,
+    /// Buffer of the transaction's writes: puts, deletes and merge
+    /// operands in the order they were made, which is what lets a read and
+    /// a commit agree on what a put after a merge, or a merge after a put,
+    /// leaves. Concurrent so that buffering a write takes `&self`; drained
+    /// at commit, which is where the order the engine applies them in is
+    /// restored.
+    writes: TxnBuffer<Vec<u8>, Write>,
     /// Range deletes buffered for commit. Not tracked in the
     /// optimistic conflict set (initial impl limitation).
     range_deletes: SegQueue<(Vec<u8>, Vec<u8>)>,
-    /// Merge operands buffered for commit.
-    merges: SegQueue<(Vec<u8>, Vec<u8>)>,
     /// What this transaction has observed about each key it read,
     /// through a point read, or through a scan at Serializable. Sorted
     /// at commit so a multi-key conflict always reports the same key.
@@ -548,9 +671,10 @@ pub struct Transaction<'db> {
 
 #[derive(Clone)]
 struct Savepoint {
-    writes: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
+    /// Every key's writes since it was last put or deleted, newest first:
+    /// all the buffer needs to be rebuilt as it was.
+    writes: Vec<(Vec<u8>, Write)>,
     range_deletes: Vec<(Vec<u8>, Vec<u8>)>,
-    merges: Vec<(Vec<u8>, Vec<u8>)>,
     held_lock_count: usize,
 }
 
@@ -578,6 +702,11 @@ struct KeyState {
     /// The key was read through [`Transaction::get_for_update`], so
     /// it is validated at commit whether or not it is written.
     for_update: AtomicBool,
+    /// A read of the key found a value in the database. Recorded only while
+    /// the transaction consults a [`KeyClassifier`], which uses it to tell a
+    /// read that must see the key stay present from one that found nothing.
+    /// Latches on, like `for_update`.
+    found: AtomicBool,
 }
 
 impl KeyState {
@@ -586,6 +715,7 @@ impl KeyState {
             first_read_seq: horizon,
             read_seq: AtomicU64::new(horizon),
             for_update: AtomicBool::new(for_update),
+            found: AtomicBool::new(false),
         }
     }
 }
@@ -601,6 +731,7 @@ impl<'db> Transaction<'db> {
         lock_timeout: Duration,
         isolation: IsolationLevel,
         keys_inline: usize,
+        policy: Option<Arc<dyn KeyClassifier>>,
     ) -> Self {
         Self {
             engine,
@@ -608,9 +739,9 @@ impl<'db> Transaction<'db> {
             durability,
             mode,
             isolation,
+            policy,
             writes: TxnBuffer::new(keys_inline),
             range_deletes: SegQueue::new(),
-            merges: SegQueue::new(),
             tracked: TxnBuffer::new(keys_inline),
             scan_runs: OnceLock::new(),
             promoted_seq: AtomicU64::new(snapshot_seq),
@@ -632,6 +763,13 @@ impl<'db> Transaction<'db> {
     /// key a pessimistic transaction already holds a lock on, the
     /// horizon sampled when that lock was acquired.
     ///
+    /// A key the transaction merged into reads as the configured
+    /// [`crate::MergeOperator`] folds the transaction's operands, in the order
+    /// it made them, onto the value of its newest put or delete of the key,
+    /// or, when it made neither, onto the value read as above. A merge that
+    /// the operator declines is an error, as it is for a read of the database.
+    /// With no merge operator configured, the operands are not applied.
+    ///
     /// Takes no lock. The read is remembered, so writing the same
     /// key later turns it into a read-modify-write that is validated
     /// at commit and aborts with [`TransactionError::Conflict`]
@@ -642,29 +780,71 @@ impl<'db> Transaction<'db> {
     /// in conflict detection on its own.
     pub fn get(&self, key: &[u8]) -> TxResult<Option<Vec<u8>>> {
         let prefixed = prefix_key(DEFAULT_CF_ID, key);
-        if let Some(buffered) = self.writes.get(&prefixed) {
-            return Ok(buffered);
+        let committed = || self.read_committed(&prefixed);
+        match self.read_own(&prefixed, committed)? {
+            Some(own) => Ok(own),
+            None => Ok(committed()
+                .map_err(TransactionError::Io)?
+                .map(DbSlice::into_vec)),
         }
-        let read_seq = self.observe(&prefixed, self.snapshot_seq, false);
-        self.engine
-            .get_at(&prefixed, read_seq)
-            .map_err(TransactionError::Io)
     }
 
     /// [`Transaction::get`] without copying the value.
     ///
     /// The returned [`DbSlice`] borrows the bytes the database already
-    /// holds, or the buffered write this transaction made. Nothing is
-    /// materialized on the way out.
+    /// holds. A value the transaction wrote itself, or that its merge
+    /// operands build, is copied out of the write buffer first, since the
+    /// buffer cannot lend it.
     pub fn get_slice(&self, key: &[u8]) -> TxResult<Option<DbSlice>> {
         let prefixed = prefix_key(DEFAULT_CF_ID, key);
-        if let Some(buffered) = self.writes.get(&prefixed) {
-            return Ok(buffered.map(DbSlice::from));
+        let committed = || self.read_committed(&prefixed);
+        match self.read_own(&prefixed, committed)? {
+            Some(own) => Ok(own.map(DbSlice::from)),
+            None => committed().map_err(TransactionError::Io),
         }
-        let read_seq = self.observe(&prefixed, self.snapshot_seq, false);
-        self.engine
-            .get_slice_at(&prefixed, read_seq)
-            .map_err(TransactionError::Io)
+    }
+
+    /// What the database holds for `prefixed` as this transaction reads it,
+    /// at the sequence it observes the key at. The read is recorded.
+    fn read_committed(&self, prefixed: &[u8]) -> std::io::Result<Option<DbSlice>> {
+        let (state, read_seq) = self.observe(prefixed, self.snapshot_seq, false);
+        self.read_noting(&state, prefixed, read_seq)
+    }
+
+    /// What the database holds for `prefixed` at `read_seq`, noted on `state`
+    /// when it holds a value and a classifier is there to make use of that.
+    fn read_noting(
+        &self,
+        state: &KeyState,
+        prefixed: &[u8],
+        read_seq: u64,
+    ) -> std::io::Result<Option<DbSlice>> {
+        let found = self.engine.get_slice_at(prefixed, read_seq)?;
+        if found.is_some() && policy::classifier_for(&self.policy, self.isolation).is_some() {
+            state.found.store(true, Ordering::Release);
+        }
+        Ok(found)
+    }
+
+    /// What a read of `prefixed` finds in this transaction's own writes, or
+    /// `None` when they do not decide it and the caller reads the database.
+    /// `Some(None)` is a key the transaction deleted.
+    ///
+    /// `committed` reads what the database holds for the key. It runs only
+    /// for a key the transaction merged into and did not put or delete
+    /// since, since a put or a delete leaves nothing of it to show.
+    fn read_own(
+        &self,
+        prefixed: &[u8],
+        committed: impl FnOnce() -> std::io::Result<Option<DbSlice>>,
+    ) -> TxResult<Option<Option<Vec<u8>>>> {
+        read_buffered(
+            &self.writes,
+            self.engine.merge_operator(),
+            prefixed,
+            committed,
+        )
+        .map_err(TransactionError::Io)
     }
 
     /// Scan a key range without materializing it, merging this
@@ -674,6 +854,15 @@ impl<'db> Transaction<'db> {
     /// only for what it read. The transaction's own writes are sorted up
     /// front, which is bounded by what this transaction has written rather
     /// than by what the database holds.
+    ///
+    /// A key the transaction merged into is yielded as [`Transaction::get`]
+    /// reads it, the operands applied by the configured
+    /// [`crate::MergeOperator`], and a key the snapshot does not hold appears
+    /// with them applied to nothing. The value the operands apply to is read
+    /// when the scan reaches the key, as the snapshot key it is: it joins the
+    /// stretch and is recorded as a read only where a scan records every key.
+    /// A merge the operator declines ends the stream, and
+    /// [`TxnScanStream::status`] says why.
     ///
     /// What the scan leaves in the transaction depends on the level. Below
     /// [`IsolationLevel::Serializable`] it records each unbroken stretch of
@@ -688,10 +877,18 @@ impl<'db> Transaction<'db> {
     /// At every level, a key inside a stretch the scan walked that the
     /// transaction then writes is validated as a read from the begin
     /// snapshot, as a `get` followed by the write would be, so it is never
-    /// elided as a blind write. At `Serializable` a concurrent commit to any
-    /// yielded key also aborts the transaction. Keys yielded from the
+    /// elided as a blind write. The one exception is a stretch that stays
+    /// inside one [`KeyClass::CommutativePrefix`] at
+    /// [`IsolationLevel::DefraLevel`] with a [`KeyClassifier`] installed: the
+    /// commit disregards that stretch, and a write or merge inside it is
+    /// validated as a blind write. At `Serializable` a concurrent commit to
+    /// any yielded key also aborts the transaction. Keys yielded from the
     /// transaction's own buffered writes are not recorded and end a stretch,
-    /// as `get` does not record them either. A key a pessimistic transaction
+    /// as `get` does not record them either. The exception is a key the
+    /// transaction merged into and did not put or delete: its base is a
+    /// snapshot key, so it joins the stretch and records no read below
+    /// Serializable, where `get` of such a key records one. A key a
+    /// pessimistic transaction
     /// already locked through [`Transaction::get_for_update`] is served where
     /// `get` serves it, at the lock horizon. A key a concurrent transaction
     /// inserts into the range is not detected unless this transaction
@@ -729,14 +926,16 @@ impl<'db> Transaction<'db> {
         let hi = end.map(|e| prefix_key(DEFAULT_CF_ID, e));
         let reverse = direction == ScanDirection::Reverse;
 
-        let mut buffered: Vec<(Vec<u8>, Option<Vec<u8>>)> = self.writes.snapshot_matching(|key| {
-            lo.as_ref().is_none_or(|lo| key >= lo) && hi.as_ref().is_none_or(|hi| key < hi)
-        });
-        if reverse {
-            buffered.sort_unstable_by(|a, b| b.0.cmp(&a.0));
-        } else {
-            buffered.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-        }
+        let buffered = fold_by_key(
+            self.writes.chains_matching(
+                |key| {
+                    lo.as_ref().is_none_or(|lo| key >= lo) && hi.as_ref().is_none_or(|hi| key < hi)
+                },
+                Write::is_terminator,
+            ),
+            reverse,
+            self.engine.merge_operator(),
+        );
 
         let mut cursor = crate::CfIter::new(
             crate::Iter::from_internal(self.engine.new_iter_at(self.snapshot_seq)),
@@ -786,20 +985,24 @@ impl<'db> Transaction<'db> {
     /// transaction that committed before the lock was released to
     /// it. An optimistic transaction reads at its begin snapshot
     /// and detects the conflict at commit instead.
+    ///
+    /// The transaction's own writes lie over the value read, as for
+    /// [`Transaction::get`], merge operands included.
     pub fn get_for_update(&self, key: &[u8]) -> TxResult<Option<Vec<u8>>> {
         let prefixed = prefix_key(DEFAULT_CF_ID, key);
         let already_held = self.lock_key(&prefixed)?;
         let horizon = self.read_horizon(&prefixed, already_held);
-        let read_seq = self.observe(&prefixed, horizon, true);
+        let (state, read_seq) = self.observe(&prefixed, horizon, true);
         // Tells `scan_read_seq` a promoted key might exist, so it is worth
         // looking `tracked` up for a pessimistic scan.
         self.promoted_seq.fetch_max(read_seq, Ordering::AcqRel);
-        if let Some(buffered) = self.writes.get(&prefixed) {
-            return Ok(buffered);
+        let committed = || self.read_noting(&state, &prefixed, read_seq);
+        match self.read_own(&prefixed, committed)? {
+            Some(own) => Ok(own),
+            None => Ok(committed()
+                .map_err(TransactionError::Io)?
+                .map(DbSlice::into_vec)),
         }
-        self.engine
-            .get_at(&prefixed, read_seq)
-            .map_err(TransactionError::Io)
     }
 
     /// Buffer a put. For pessimistic transactions, acquires an
@@ -807,7 +1010,7 @@ impl<'db> Transaction<'db> {
     pub fn put(&self, key: &[u8], value: &[u8]) -> TxResult<()> {
         let prefixed = prefix_key(DEFAULT_CF_ID, key);
         self.lock_key(&prefixed)?;
-        self.writes.insert(prefixed, Some(value.to_vec()));
+        self.writes.insert(prefixed, Write::Put(value.to_vec()));
         Ok(())
     }
 
@@ -816,7 +1019,7 @@ impl<'db> Transaction<'db> {
     pub fn delete(&self, key: &[u8]) -> TxResult<()> {
         let prefixed = prefix_key(DEFAULT_CF_ID, key);
         self.lock_key(&prefixed)?;
-        self.writes.insert(prefixed, None);
+        self.writes.insert(prefixed, Write::Delete);
         Ok(())
     }
 
@@ -844,13 +1047,26 @@ impl<'db> Transaction<'db> {
         Err(TransactionError::UnsupportedRangeDelete)
     }
 
-    /// Buffer a merge operand. Merges are conflict-checked at the
-    /// key level: two transactions cannot concurrently merge the
-    /// same key under optimistic concurrency control.
+    /// Buffer a merge operand. Merges are conflict-checked at the key
+    /// level, so two optimistic transactions that run concurrently cannot
+    /// both commit a merge to the same key.
+    ///
+    /// [`IsolationLevel::DefraLevel`] is the exception, for a key the
+    /// transaction only merges into: it did not read the key, did not walk
+    /// it in a scan, and did not put or delete it. That merge conflicts only
+    /// with a newer put, delete or range delete of the key, never with a
+    /// newer merge operand. Concurrent blind merges to one key all commit,
+    /// and their operands apply in commit order.
+    ///
+    /// A read of the key through this transaction sees the operand applied
+    /// (see [`Transaction::get`]), and a commit stores what that read found:
+    /// the operand applies to the transaction's own put or delete of the key
+    /// when it made one earlier, and a put or a delete made after the operand
+    /// replaces the key outright, so the operand has no effect.
     pub fn merge(&self, key: &[u8], operand: &[u8]) -> TxResult<()> {
         let prefixed = prefix_key(DEFAULT_CF_ID, key);
         self.lock_key(&prefixed)?;
-        self.merges.push((prefixed, operand.to_vec()));
+        self.writes.insert(prefixed, Write::Merge(operand.to_vec()));
         Ok(())
     }
 
@@ -863,18 +1079,14 @@ impl<'db> Transaction<'db> {
         // state, so taking one is an exclusive operation even though
         // buffering is not.
         self.savepoints.push(Savepoint {
-            writes: self.writes.snapshot().into_iter().collect(),
+            writes: self.writes.chains_matching(|_| true, Write::is_terminator),
             range_deletes: drain(&self.range_deletes),
-            merges: drain(&self.merges),
             held_lock_count: self.held_locks.len(),
         });
-        // `drain` emptied them, so put back what the savepoint captured.
+        // `drain` emptied it, so put back what the savepoint captured.
         if let Some(sp) = self.savepoints.last() {
             for entry in &sp.range_deletes {
                 self.range_deletes.push(entry.clone());
-            }
-            for entry in &sp.merges {
-                self.merges.push(entry.clone());
             }
         }
     }
@@ -891,16 +1103,13 @@ impl<'db> Transaction<'db> {
     pub fn rollback_to_savepoint(&mut self) -> TxResult<()> {
         let sp = self.savepoints.pop().ok_or(TransactionError::NoSavepoint)?;
         self.writes = TxnBuffer::new(self.keys_inline);
-        for (key, value) in sp.writes {
-            self.writes.insert(key, value);
+        // Oldest first, so the buffer's newest-first order comes out as it was.
+        for (key, write) in sp.writes.into_iter().rev() {
+            self.writes.insert(key, write);
         }
         self.range_deletes = SegQueue::new();
         for entry in sp.range_deletes {
             self.range_deletes.push(entry);
-        }
-        self.merges = SegQueue::new();
-        for entry in sp.merges {
-            self.merges.push(entry);
         }
         // Locks acquired after the savepoint remain held.
         let _ = sp.held_lock_count;
@@ -915,7 +1124,10 @@ impl<'db> Transaction<'db> {
     ///
     /// An optimistic transaction validates every key it wrote or
     /// read through [`Transaction::get_for_update`] against its
-    /// begin snapshot, so the check catches any concurrent writer. A
+    /// begin snapshot, so the check catches any concurrent writer. At
+    /// [`IsolationLevel::DefraLevel`] a key it only merges into is the
+    /// exception: a newer put, delete or range delete of the key is a
+    /// conflict, and a newer merge operand is not. A
     /// pessimistic transaction validates every key it read and then
     /// wrote, plus every key it read through `get_for_update`,
     /// against the sequence that read observed. The check passes
@@ -961,26 +1173,23 @@ impl<'db> Transaction<'db> {
         // rather than copied: the transaction is being consumed, so
         // nothing needs the buffers' own copies afterwards, and draining
         // hands over the stored keys and values instead of cloning each
-        // one.
-        //
-        // A buffer yields the newest write of a key first, with the ones
-        // it replaced behind it, so the first value seen for a key is the
-        // one that commits. Collecting into a `BTreeMap` with `or_insert`
-        // keeps that value and restores the key order the engine applies
-        // them in.
-        let mut writes: BTreeMap<Vec<u8>, Option<Vec<u8>>> = BTreeMap::new();
-        for (key, value) in self.writes.drain() {
-            writes.entry(key).or_insert(value);
-        }
+        // one. `settle` says what the drained writes commit as.
+        let (writes, merges) = settle(self.writes.drain());
         let range_deletes = drain(&self.range_deletes);
-        let merges = drain(&self.merges);
         let tracked = self.tracked.drain();
         let mut checks = self.validation_set(tracked, &writes, &merges);
+        // Only an optimistic transaction at `DefraLevel` has a classifier to
+        // consult: the policy is installed on the optimistic database alone,
+        // and every other level ignores it.
+        let classifier = policy::classifier_for(&self.policy, self.isolation);
         // Behind the `take`, not threaded through `validation_set`, so a
         // transaction that never scans (the common case) pays no `Vec`
         // round trip for an empty run list on its commit path.
         if let Some(runs) = self.scan_runs.take() {
-            let runs = drain(&runs);
+            let mut runs = drain(&runs);
+            if let Some(classifier) = classifier {
+                runs.retain(|run| !policy::run_is_commutative(classifier, run));
+            }
             scan_range::cover(
                 &mut checks.reads,
                 &runs,
@@ -988,6 +1197,11 @@ impl<'db> Transaction<'db> {
                 &merges,
                 self.snapshot_seq,
             );
+        }
+        // After the scans are folded in, so the reads they added for put or
+        // merged keys are dropped with the rest.
+        if let Some(classifier) = classifier {
+            policy::exempt_content_addressed(classifier, &mut checks, &writes, &merges);
         }
 
         // The write-stall admission (same order as a plain write with
@@ -1034,13 +1248,20 @@ impl<'db> Transaction<'db> {
     ///
     /// Optimistic: the written and merged keys are validated against the
     /// begin snapshot; a key that was also read is validated once, as the
-    /// read. Pessimistic: written keys are not validated (`writes_at` is
+    /// read. At `DefraLevel`, `blind_merges_commute` relaxes that for a
+    /// merged key the transaction did not read: only a newer put, delete or
+    /// range delete conflicts, and a newer merge operand does not.
+    /// Pessimistic: written keys are not validated (`writes_at` is
     /// `None`), the key lock already orders them and there is no read for a
     /// concurrent writer to invalidate.
     ///
     /// This set does not yet account for what a transactional scan walked;
     /// `commit_inner` folds that in afterward with `scan_range::cover`,
-    /// skipped entirely when the transaction ran no scan.
+    /// skipped entirely when the transaction ran no scan. It then applies the
+    /// content-addressed rule, with `policy::exempt_content_addressed`,
+    /// skipped entirely when the transaction has no classifier to consult.
+    /// That is why each read carries whether it found a value: the rule
+    /// needs it and only the read could say.
     fn validation_set(
         &self,
         mut tracked: Vec<(Vec<u8>, Arc<KeyState>)>,
@@ -1085,11 +1306,15 @@ impl<'db> Transaction<'db> {
             .map(|(key, state)| ConflictKey {
                 key,
                 observed_seq: state.first_read_seq,
+                found: state.found.load(Ordering::Acquire),
+                presence_only: false,
             })
             .collect();
         ValidationSet {
             reads,
             writes_at: optimistic.then_some(self.snapshot_seq),
+            blind_merges_commute: self.isolation.blind_merges_commute(),
+            exempt: Vec::new(),
         }
     }
 
@@ -1125,14 +1350,14 @@ impl<'db> Transaction<'db> {
     }
 
     /// Record that this transaction observed `key` at `horizon` and
-    /// return the sequence the read should be served at.
+    /// return the key's cell with the sequence the read should be served at.
     ///
     /// `first_read_seq` keeps the earliest observation, because that
     /// is the read a later write would overwrite. `read_seq` only
     /// moves forward, so promoting a key from a plain `get` to
     /// `get_for_update` never makes a later read of the same key
     /// return an older value than an earlier one.
-    fn observe(&self, key: &[u8], horizon: u64, for_update: bool) -> u64 {
+    fn observe(&self, key: &[u8], horizon: u64, for_update: bool) -> (Arc<KeyState>, u64) {
         let state = self
             .tracked
             .get_or_insert(key.to_vec(), Arc::new(KeyState::new(horizon, for_update)));
@@ -1153,10 +1378,11 @@ impl<'db> Transaction<'db> {
         if for_update {
             state.for_update.store(true, Ordering::Release);
         }
-        state
+        let read_seq = state
             .read_seq
             .fetch_max(horizon, Ordering::AcqRel)
-            .max(horizon)
+            .max(horizon);
+        (state, read_seq)
     }
 
     /// The sequence a scan serves `key` (CF-prefixed) at, recording nothing:
@@ -1245,9 +1471,9 @@ impl<'db> Transaction<'db> {
     }
 }
 
-/// The transaction's own writes for a range, sorted and ready to merge.
-/// `Some` is a put, `None` a delete.
-type BufferedWrites = std::iter::Peekable<std::vec::IntoIter<(Vec<u8>, Option<Vec<u8>>)>>;
+/// The transaction's own writes for a range, folded per key, sorted and
+/// ready to merge.
+type BufferedWrites = std::iter::Peekable<std::vec::IntoIter<(Vec<u8>, KeyWrites)>>;
 
 /// A transaction's view of a key range, streamed.
 ///
@@ -1257,10 +1483,14 @@ type BufferedWrites = std::iter::Peekable<std::vec::IntoIter<(Vec<u8>, Option<Ve
 /// buffered side is bounded by what this transaction wrote.
 ///
 /// A buffered delete hides the snapshot's entry for that key, and a
-/// buffered put replaces it. Each unbroken stretch of snapshot entries it
-/// yields is recorded in the transaction once, as the first and the last
-/// key of the stretch (per key as well at Serializable); entries that come
-/// from the transaction's own writes are not recorded and end the stretch.
+/// buffered put replaces it. Buffered merge operands are applied to the put,
+/// or else to the value the transaction reads for the key, as
+/// [`Transaction::get`] applies them. Each unbroken stretch of snapshot
+/// entries it yields is recorded in the transaction once, as the first and
+/// the last key of the stretch (per key as well at Serializable); entries
+/// that come from the transaction's own writes are not recorded and end the
+/// stretch, except a merged key whose operands lie on a snapshot entry, which
+/// joins it.
 pub struct TxnScanStream<'txn> {
     /// The transaction this scan reads for: its stretches are registered
     /// there, and a key it already promoted through `get_for_update` is
@@ -1289,7 +1519,9 @@ impl TxnScanStream<'_> {
     /// entries handed out are the transaction's buffered writes merged with
     /// a *prefix* of what the database holds, and the rest was never read,
     /// or a read of a key this transaction already locked through
-    /// [`Transaction::get_for_update`] failed.
+    /// [`Transaction::get_for_update`] failed, or reading the value a merge
+    /// builds on failed, or the merge operator declined a key the transaction
+    /// merged into.
     ///
     /// A merged stream cannot report this any other way. `Iterator` has
     /// nowhere to put a failure, and a cursor that dies mid-range goes
@@ -1403,18 +1635,77 @@ impl TxnScanStream<'_> {
             return ControlFlow::Break(None);
         };
         self.step_cursor();
-        match &mut self.run {
-            Some(open) => open.extend(&self.probe),
+        Self::join_stretch(txn, &mut self.run, self.reverse, &self.probe);
+        ControlFlow::Break(Some((key, value)))
+    }
+
+    /// Take `key` (CF-prefixed), a snapshot key the walk read at the begin
+    /// snapshot, into the stretch in `run`, starting and registering one if
+    /// none is open. At Serializable the key is also recorded per key through
+    /// `observe`.
+    fn join_stretch(txn: &Transaction<'_>, run: &mut Option<OpenRun>, reverse: bool, key: &[u8]) {
+        match run {
+            Some(open) => open.extend(key),
             None => {
-                let (run, open) = OpenRun::start(&self.probe, self.reverse);
-                txn.record_scan_run(run);
-                self.run = Some(open);
+                let (record, open) = OpenRun::start(key, reverse);
+                txn.record_scan_run(record);
+                *run = Some(open);
             }
         }
         if txn.isolation.validates_scanned_keys() {
-            txn.observe(&self.probe, txn.snapshot_seq, false);
+            txn.observe(key, txn.snapshot_seq, false);
         }
-        ControlFlow::Break(Some((key, value)))
+    }
+
+    /// Hand out the transaction's own entry at the head of `buffered`.
+    ///
+    /// The same protocol as `yield_cursor`. A key the transaction merged into
+    /// and did not replace has its operands lie on a snapshot key, which the
+    /// walk reads as it reads any other: at the key's read sequence, joining
+    /// the stretch when that is the begin snapshot and ending it when a
+    /// promotion moved it past that, and recording a read of it only at
+    /// Serializable. Every other entry comes from the write buffer and ends
+    /// the stretch. A merge the operator declines ends the stream, with the
+    /// reason left for `status`.
+    fn yield_buffered(&mut self) -> ControlFlow<Option<(Vec<u8>, DbSlice)>> {
+        let Some((prefixed, writes)) = self.buffered.next() else {
+            return ControlFlow::Break(None);
+        };
+        let txn = self.txn;
+        // Only an entry that reads its base uses the sequence: `apply` takes
+        // the closure below for nothing else.
+        let read_seq = if writes.reads_base() {
+            let read_seq = txn.scan_read_seq(&prefixed);
+            if read_seq > txn.snapshot_seq {
+                self.run = None;
+            } else {
+                Self::join_stretch(txn, &mut self.run, self.reverse, &prefixed);
+            }
+            read_seq
+        } else {
+            self.run = None;
+            txn.snapshot_seq
+        };
+        let found = writes.apply(txn.engine.merge_operator(), &prefixed, || {
+            txn.engine.get_slice_at(&prefixed, read_seq)
+        });
+        match found {
+            Ok(Some(Some(value))) => {
+                ControlFlow::Break(Some((prefixed[4..].to_vec(), DbSlice::from(value))))
+            }
+            Ok(_) => ControlFlow::Continue(()),
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    "transaction scan ended early: reading a merged key failed mid-range, \
+                     so the rows returned are a prefix and not the range"
+                );
+                self.error = Some(e);
+                self.cursor_done = true;
+                self.buffered = Vec::new().into_iter().peekable();
+                ControlFlow::Break(None)
+            }
+        }
     }
 }
 
@@ -1435,10 +1726,8 @@ impl Iterator for TxnScanStream<'_> {
                 }
                 // Only the transaction has this key.
                 (None, Some(_)) => {
-                    self.run = None;
-                    let (key, value) = self.buffered.next()?;
-                    if let Some(value) = value {
-                        return Some((key[4..].to_vec(), DbSlice::from(value)));
+                    if let ControlFlow::Break(item) = self.yield_buffered() {
+                        return item;
                     }
                 }
                 // Only the database has it.
@@ -1454,21 +1743,19 @@ impl Iterator for TxnScanStream<'_> {
                         }
                     }
                     std::cmp::Ordering::Greater => {
-                        self.run = None;
-                        let (key, value) = self.buffered.next()?;
-                        if let Some(value) = value {
-                            return Some((key[4..].to_vec(), DbSlice::from(value)));
+                        if let ControlFlow::Break(item) = self.yield_buffered() {
+                            return item;
                         }
                     }
                     // The transaction wrote a key the snapshot also has,
                     // so its write wins and the snapshot entry is skipped
-                    // whether that write was a put or a delete.
+                    // whether that write was a put or a delete. Operands
+                    // with no put or delete beneath them read the entry
+                    // themselves, as `get` would.
                     std::cmp::Ordering::Equal => {
-                        self.run = None;
                         self.step_cursor();
-                        let (key, value) = self.buffered.next()?;
-                        if let Some(value) = value {
-                            return Some((key[4..].to_vec(), DbSlice::from(value)));
+                        if let ControlFlow::Break(item) = self.yield_buffered() {
+                            return item;
                         }
                     }
                 },
@@ -2425,6 +2712,64 @@ mod tests {
         assert!(fresh.scan_runs.get().is_none());
     }
 
+    /// Appends every operand to the base.
+    struct Append;
+
+    impl crate::MergeOperator for Append {
+        fn name(&self) -> &'static str {
+            "append"
+        }
+
+        fn full_merge(
+            &self,
+            _key: &[u8],
+            base: Option<&[u8]>,
+            operands: &[&[u8]],
+        ) -> Option<Vec<u8>> {
+            let mut out = base.unwrap_or_default().to_vec();
+            out.extend(operands.concat());
+            Some(out)
+        }
+    }
+
+    // The base of a key the transaction merged into is a snapshot key like
+    // any the scan yields: it joins the stretch and is recorded as a read only
+    // where a scan records every key. `get` records it at every level.
+    #[test]
+    fn a_scan_reaching_a_merged_key_records_a_read_of_it_only_at_serializable() {
+        for (level, recorded) in [
+            (IsolationLevel::SnapshotIsolation, 0),
+            (IsolationLevel::RepeatableRead, 0),
+            (IsolationLevel::DefraLevel, 0),
+            (IsolationLevel::Serializable, 1),
+        ] {
+            let dir = TempDir::new().unwrap();
+            let opts = Options {
+                merge_operator: Some(Arc::new(Append)),
+                ..Options::default()
+            };
+            let db = OptimisticTransactionDb::open(dir.path(), opts).unwrap();
+            db.db().put(b"k", b"base").unwrap();
+            let tx = db.begin_transaction_with(level);
+            tx.merge(b"k", b"+op").unwrap();
+
+            let walked: Vec<(Vec<u8>, Vec<u8>)> = tx
+                .scan_stream(None, None)
+                .map(|(key, value)| (key, value.to_vec()))
+                .collect();
+            assert_eq!(walked, [(b"k".to_vec(), b"base+op".to_vec())]);
+            assert_eq!(tx.tracked.len(), recorded, "{level:?}");
+            assert_eq!(
+                tx.scan_runs.get().map(|runs| runs.len()),
+                Some(1),
+                "{level:?}: the merged key's base is a snapshot key and starts a stretch"
+            );
+
+            assert_eq!(tx.get(b"k").unwrap(), Some(b"base+op".to_vec()));
+            assert_eq!(tx.tracked.len(), 1, "{level:?}: a get records the read");
+        }
+    }
+
     /// Regression: `scan_stream_in` used to index `tracked` only at the
     /// moment the stream was built, so a `get_for_update` promotion that
     /// landed after a stream was already open left every later yielded key
@@ -2471,7 +2816,7 @@ mod tests {
         );
 
         // Draining the rest is exactly where the bug bit: every one of
-        // these calls used to fall back to `TxnBuffer::walk`, O(1) here but
+        // these calls used to fall back to walking the list, O(1) here but
         // O(tracked keys) had more been promoted, because construction-time
         // indexing had already run and missed this promotion.
         let rest: Vec<(Vec<u8>, Vec<u8>)> = stream.map(|(k, v)| (k, v.to_vec())).collect();

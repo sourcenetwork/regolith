@@ -49,6 +49,13 @@ pub(super) struct OpenRun {
     last: Vec<u8>,
 }
 
+impl ScanRun {
+    /// The stretch's first key and, once it closed, its last, CF-prefixed.
+    pub(super) fn bounds(&self) -> (&[u8], Option<&[u8]>) {
+        (&self.first, self.last.get().map(Vec::as_slice))
+    }
+}
+
 impl OpenRun {
     /// Begin a stretch at `key` (CF-prefixed). Returns the record for the
     /// transaction to register and the handle that extends and closes it.
@@ -180,6 +187,8 @@ pub(super) fn cover(
         .map(|key| ConflictKey {
             key: key.clone(),
             observed_seq: begin_seq,
+            found: false,
+            presence_only: false,
         })
         .collect();
     if added.is_empty() {
@@ -258,10 +267,14 @@ mod tests {
             ConflictKey {
                 key: b"a".to_vec(),
                 observed_seq: 9,
+                found: false,
+                presence_only: false,
             },
             ConflictKey {
                 key: b"c".to_vec(),
                 observed_seq: 9,
+                found: false,
+                presence_only: false,
             },
         ];
         let writes: BTreeMap<Vec<u8>, Option<Vec<u8>>> = [
