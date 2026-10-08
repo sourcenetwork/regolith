@@ -167,11 +167,7 @@ proptest! {
         // Drained exactly as `commit_inner` drains them. This never
         // reaches the engine: no merge operator is configured, and
         // nothing here commits.
-        let mut writes: BTreeMap<Vec<u8>, Option<Vec<u8>>> = BTreeMap::new();
-        for (key, value) in tx.writes.drain() {
-            writes.entry(key).or_insert(value);
-        }
-        let merges = drain(&tx.merges);
+        let (writes, merges) = settle(tx.writes.drain());
         let tracked = tx.tracked.drain();
 
         let want = oracle(&tx, tracked.clone(), &writes, &merges);
@@ -253,6 +249,17 @@ fn open_any(flavor: u8, dir: &TempDir) -> AnyDb {
     }
 }
 
+/// The put or delete the transaction buffered for `prefixed`, if any. Merge
+/// operands alone are not one: with no merge operator configured, which is
+/// the case throughout this file, a scan neither yields them nor skips the
+/// snapshot entry beneath them.
+fn replacement(tx: &Transaction<'_>, prefixed: &[u8]) -> Option<Write> {
+    tx.writes
+        .chain(prefixed, Write::is_terminator)
+        .pop()
+        .filter(Write::is_terminator)
+}
+
 /// The keys the stretches of one scan of `[start, end)` cover, worked out
 /// independently of `TxnScanStream`: the snapshot holds exactly the keys in
 /// `seeded`, an entry of the write buffer ends a stretch (and is yielded when
@@ -288,9 +295,9 @@ fn expected_cover(
             break;
         }
         let prefixed = prefix_key(DEFAULT_CF_ID, &[key]);
-        if let Some(buffered) = tx.writes.get(&prefixed) {
+        if let Some(replaced) = replacement(tx, &prefixed) {
             close(&mut stretch);
-            yielded += usize::from(buffered.is_some());
+            yielded += usize::from(matches!(replaced, Write::Put(_)));
             continue;
         }
         if key >= 6 || seeded & (1 << key) == 0 {
@@ -370,7 +377,7 @@ proptest! {
                 prop_assert!(stream.status().is_ok());
                 drop(stream);
                 for entry in entries {
-                    let buffered = scan_tx.writes.get(&prefix_key(DEFAULT_CF_ID, &entry)).is_some();
+                    let buffered = replacement(&scan_tx, &prefix_key(DEFAULT_CF_ID, &entry)).is_some();
                     if !buffered
                         && !matches!(
                             scan_tx.isolation,
@@ -384,11 +391,7 @@ proptest! {
         }
 
         let settle = |tx: &mut Transaction<'_>| {
-            let mut writes: BTreeMap<Vec<u8>, Option<Vec<u8>>> = BTreeMap::new();
-            for (key, value) in tx.writes.drain() {
-                writes.entry(key).or_insert(value);
-            }
-            let merges = drain(&tx.merges);
+            let (writes, merges) = write_buffer::settle(tx.writes.drain());
             let tracked = tx.tracked.drain();
             let mut checks = tx.validation_set(tracked, &writes, &merges);
             if let Some(runs) = tx.scan_runs.take() {

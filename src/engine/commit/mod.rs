@@ -381,6 +381,21 @@ impl RegolithEngine {
                     // Range deletes are not validated (transaction.rs:459-460).
                     WriteBatchOp::DeleteRange { .. } => continue,
                 };
+                // The caller exempted this key from validation, so a newer
+                // write of it is no conflict and its lookup is not worth
+                // making. A search of a sorted list, no hash and no
+                // allocation, and an empty list unless a key classifier
+                // named keys.
+                // vertexia: O(log exempt keys) per written key; a merge-join
+                // over the sorted point and merge runs is O(1) if a very
+                // large exempt list ever shows in a profile.
+                if checks
+                    .exempt
+                    .binary_search_by(|exempt| exempt.as_slice().cmp(key))
+                    .is_ok()
+                {
+                    continue;
+                }
                 // A written key the transaction also read was validated above,
                 // at the read's anchor and without the elision below.
                 if checks
@@ -816,6 +831,9 @@ impl RegolithEngine {
         }
     }
 }
+
+#[cfg(test)]
+mod exempt_tests;
 
 #[cfg(test)]
 mod limit_tests;

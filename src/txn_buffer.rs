@@ -254,31 +254,63 @@ where
             .expect("the entry just inserted is on the list")
     }
 
-    /// Every buffered entry, newest write of each key only, without
-    /// consuming the buffer.
+    /// The listed nodes, newest first.
+    fn nodes(&self) -> impl Iterator<Item = &Node<K, V>> {
+        // SAFETY: as in `walk`, for the head and for each `next` after it.
+        std::iter::successors(
+            unsafe { self.head.load(Ordering::Acquire).as_ref() },
+            |node| unsafe { node.next.as_ref() },
+        )
+    }
+
+    /// The values buffered for `key`, newest first, through the first one
+    /// `done` accepts.
+    ///
+    /// Walks the list from its head, indexed or not.
+    // vertexia: O(buffered entries) per call; start from the index's node for
+    // the key if a read of a heavily merged key shows up in a profile.
+    pub(crate) fn chain<Q>(&self, key: &Q, done: impl Fn(&V) -> bool) -> Vec<V>
+    where
+        K: core::borrow::Borrow<Q>,
+        Q: Eq + ?Sized,
+    {
+        let mut out = Vec::new();
+        for node in self.nodes().filter(|node| node.key.borrow() == key) {
+            out.push(node.value.clone());
+            if done(&node.value) {
+                break;
+            }
+        }
+        out
+    }
+
+    /// The entries of the keys `include` accepts, newest first, each key's
+    /// through the first value `done` accepts, without consuming the buffer.
+    ///
+    /// Where `done` accepts every value this is the newest write of each
+    /// key. Where it accepts only a write that replaces the key outright, it
+    /// is the key's writes since it was last replaced: all a reader of an
+    /// append-only log or a savepoint has to keep.
     ///
     /// Bounded by what this transaction has written, never by what the
     /// database holds, which is why materializing it is affordable where
-    /// materializing the database side would not be.
-    pub(crate) fn snapshot(&self) -> Vec<(K, V)> {
-        self.snapshot_matching(|_| true)
-    }
-
-    /// Filter keys before copying or deduplicating. Narrow scans must not clone
-    /// unrelated buffered values, especially during a large history replay.
-    pub(crate) fn snapshot_matching(&self, include: impl Fn(&K) -> bool) -> Vec<(K, V)> {
+    /// materializing the database side would not be. `include` runs before
+    /// anything is copied, so a narrow scan does not clone unrelated
+    /// buffered values, especially during a large history replay.
+    pub(crate) fn chains_matching(
+        &self,
+        include: impl Fn(&K) -> bool,
+        done: impl Fn(&V) -> bool,
+    ) -> Vec<(K, V)> {
         let mut out = Vec::new();
-        let mut seen = std::collections::HashSet::new();
-        let mut cursor = self.head.load(Ordering::Acquire);
-        while !cursor.is_null() {
-            // SAFETY: as in `walk`.
-            let node = unsafe { &*cursor };
-            // Newest first, so the first sighting of a key is its current
-            // value and later ones are writes it replaced.
-            if include(&node.key) && seen.insert(node.key.clone()) {
+        let mut finished = std::collections::HashSet::new();
+        for node in self.nodes() {
+            if include(&node.key) && !finished.contains(&node.key) {
+                if done(&node.value) {
+                    finished.insert(node.key.clone());
+                }
                 out.push((node.key.clone(), node.value.clone()));
             }
-            cursor = node.next;
         }
         out
     }
