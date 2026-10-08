@@ -144,6 +144,15 @@ pub(crate) struct ConflictKey {
     pub key: Vec<u8>,
     /// The sequence the transaction observed it at.
     pub observed_seq: u64,
+    /// A read of the key returned a value. Recorded only for a transaction
+    /// with a key classifier, which narrows it to `presence_only`; the
+    /// commit does not look at it.
+    pub found: bool,
+    /// The read returned a value of a key whose bytes never differ, so it
+    /// is lost only when the key is gone: a newer version conflicts only if
+    /// the newest is a deletion, a covering range delete included. It does
+    /// not stand for a write of the same key, which takes its own check.
+    pub presence_only: bool,
 }
 
 /// What a commit validates on top of the operations it carries.
@@ -158,7 +167,8 @@ pub(crate) struct ValidationSet {
     /// Keys the transaction read that the isolation level validates.
     /// Sorted by key with no duplicates; the commit relies on both to
     /// find a written key here by binary search and to name the same key
-    /// on every run of a multi-key conflict.
+    /// on every run of a multi-key conflict. A read is validated in full
+    /// (any newer version conflicts) unless it is `presence_only`.
     pub reads: Vec<ConflictKey>,
     /// The sequence every written or merged key not in `reads` is validated
     /// against, or `None` when written keys are not validated at all
@@ -170,11 +180,12 @@ pub(crate) struct ValidationSet {
     /// newest write of any kind. Operands commute, so a newer operand never
     /// invalidates a blind merge; a newer put or delete still does.
     pub blind_merges_commute: bool,
-    /// Written or merged keys the caller exempts from validation: the commit
-    /// skips them without looking them up. Sorted by key with no duplicates,
-    /// for the binary search that finds a written key here, and empty unless
-    /// the transaction layer's key classifier named some, so a commit
-    /// without one pays nothing. Their reads are not in `reads`.
+    /// Keys the commit puts or merges that the caller exempts from
+    /// validation: the commit skips them without looking them up. Sorted by
+    /// key with no duplicates, for the binary search that finds a written
+    /// key here, and empty unless the transaction layer's key classifier
+    /// named some, so a commit without one pays nothing. Their reads are not
+    /// in `reads`, and a key the commit deletes is never listed.
     pub exempt: Vec<Vec<u8>>,
 }
 

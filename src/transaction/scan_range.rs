@@ -187,6 +187,8 @@ pub(super) fn cover(
         .map(|key| ConflictKey {
             key: key.clone(),
             observed_seq: begin_seq,
+            found: false,
+            presence_only: false,
         })
         .collect();
     if added.is_empty() {
@@ -265,10 +267,14 @@ mod tests {
             ConflictKey {
                 key: b"a".to_vec(),
                 observed_seq: 9,
+                found: false,
+                presence_only: false,
             },
             ConflictKey {
                 key: b"c".to_vec(),
                 observed_seq: 9,
+                found: false,
+                presence_only: false,
             },
         ];
         let writes: BTreeMap<Vec<u8>, Option<Vec<u8>>> = [
