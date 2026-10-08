@@ -1,10 +1,10 @@
 //! The nine OPFS calls regolith needs, reached through `js_sys::Reflect`.
 //!
-//! Bindings are hand-rolled rather than taken from `web-sys` for the same
-//! reason defradb's OPFS backend does it: `FileSystemSyncAccessHandle` is
-//! still an unstable web-sys API, so using it would force
-//! `RUSTFLAGS=--cfg=web_sys_unstable_apis` on every downstream build. The
-//! surface is small enough that `Reflect` costs less than that constraint.
+//! Bindings are hand-rolled rather than taken from `web-sys` because
+//! `FileSystemSyncAccessHandle` is still an unstable web-sys API, so using
+//! it would force `RUSTFLAGS=--cfg=web_sys_unstable_apis` on every
+//! downstream build. The surface is small enough that `Reflect` costs less
+//! than that constraint.
 //!
 //! Every function returns `Result<_, JsValue>`: a thrown JS exception
 //! becomes an `Err`, never a trap, so no OPFS failure can abort the module.
