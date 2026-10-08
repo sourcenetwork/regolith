@@ -46,7 +46,7 @@ fn refuses_an_oversized_commit(db: &Db, tx: Transaction<'_>) {
         let WriteBatchOp::Put { key, value } = op else {
             unreachable!("puts_framing_to only builds Put ops")
         };
-        tx.writes.insert(key, Some(value));
+        tx.writes.insert(key, Write::Put(value));
     }
 
     let err = tx

@@ -161,14 +161,15 @@ pessimistic flavour never validates a written key at commit, since the key lock 
 orders it. A `get_for_update` key is validated in both flavours from `SnapshotIsolation`
 up. At every level a key a transactional scan walked that the transaction then writes is
 validated as a read (inside a commutative prefix at `DefraLevel` it is validated as a blind
-write instead, below), so a scan-then-write never loses an update. A range is not validated
+write instead, and a content-addressed key is not validated, below), so a scan-then-write
+never loses an update. A range is not validated
 on its own: a key inserted into a scanned range by a concurrent transaction (a phantom) is
 detected only when the transaction also writes it or validates it as a point read. A scan
 at `Serializable` holds one read-set entry per key it yields until the transaction
 resolves, and its commit checks each one while every writer waits; below it, a scan holds
 one entry per stretch of keys it walked.
 
-`DefraLevel` is `RepeatableRead` with two relaxations, which apply to optimistic
+`DefraLevel` is `RepeatableRead` with three relaxations, which apply to optimistic
 transactions only. A pessimistic transaction at this level validates as `RepeatableRead`.
 
 - A key the transaction only merges into (it did not read the key, did not walk it in a
@@ -181,6 +182,11 @@ transactions only. A pessimistic transaction at this level validates as `Repeata
   prefix commutative only when nothing the transaction writes outside it depends on which
   keys of the prefix the scan returned, and its writes inside it are unique keys or
   identical rewrites.
+- With the same classifier, no read or write of a key it declares
+  `KeyClass::ContentAddressed` is validated, so two transactions that touch the same such
+  key both commit. The caller's contract is that the key determines its bytes, as a
+  content hash does; regolith cannot check it, and a transaction that writes other bytes
+  under the key commits too, the last commit to land winning.
 
 A key that is only merged into does not get snapshot isolation. When every transaction uses
 only point reads, puts, deletes and merges, the committed transactions are serializable in

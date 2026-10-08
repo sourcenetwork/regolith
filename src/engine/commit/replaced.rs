@@ -242,6 +242,7 @@ mod tests {
             reads: Vec::new(),
             writes_at: Some(observed),
             blind_merges_commute: true,
+            exempt: Vec::new(),
         };
         engine
             .commit_optimistic(

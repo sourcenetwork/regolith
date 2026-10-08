@@ -117,6 +117,23 @@ fn grouped_batch_ops(
     ops
 }
 
+/// Fold `operands`, oldest first, onto `base` with `op`. A read of the
+/// database and a transaction's read of its own merges both go through here,
+/// so both fail the same way when the operator declines.
+pub(crate) fn apply_merge(
+    op: &dyn crate::options::MergeOperator,
+    key: &[u8],
+    base: Option<&[u8]>,
+    operands: &[&[u8]],
+) -> std::io::Result<Vec<u8>> {
+    op.full_merge(key, base, operands).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("merge operator {} failed for key", op.name()),
+        )
+    })
+}
+
 /// A key a commit validates because the transaction read it: the key and
 /// the earliest sequence the transaction observed it at. Never elided as an
 /// idempotent write, since a value derived from a stale read is a lost
@@ -153,6 +170,12 @@ pub(crate) struct ValidationSet {
     /// newest write of any kind. Operands commute, so a newer operand never
     /// invalidates a blind merge; a newer put or delete still does.
     pub blind_merges_commute: bool,
+    /// Written or merged keys the caller exempts from validation: the commit
+    /// skips them without looking them up. Sorted by key with no duplicates,
+    /// for the binary search that finds a written key here, and empty unless
+    /// the transaction layer's key classifier named some, so a commit
+    /// without one pays nothing. Their reads are not in `reads`.
+    pub exempt: Vec<Vec<u8>>,
 }
 
 fn batch_op_wal_bytes(op: &WriteBatchOp) -> u64 {
@@ -854,6 +877,12 @@ impl RegolithEngine {
         self.options.read_only
     }
 
+    /// The operator that folds merge operands into a value, if one is
+    /// configured.
+    pub(crate) fn merge_operator(&self) -> Option<&dyn crate::options::MergeOperator> {
+        self.options.merge_operator.as_deref()
+    }
+
     pub(crate) fn is_closed(&self) -> bool {
         self.close_state.load(Ordering::Acquire) != CLOSE_STATE_OPEN
     }
@@ -1490,13 +1519,8 @@ impl RegolithEngine {
             });
         }
 
-        match merge_op.full_merge(key, base_slice, &operands_owned) {
-            Some(v) => Ok(Some(DbSlice::from_vec(v))),
-            None => Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("merge operator {} failed for key", merge_op.name()),
-            )),
-        }
+        apply_merge(merge_op.as_ref(), key, base_slice, &operands_owned)
+            .map(|merged| Some(DbSlice::from_vec(merged)))
     }
 
     /// Batched point lookup at a given snapshot. Returns one `Option<Vec<u8>>`
