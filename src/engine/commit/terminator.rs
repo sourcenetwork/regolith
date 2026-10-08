@@ -7,6 +7,9 @@
 //! transaction's snapshot: what it reads is bounded by the writes that landed
 //! since, not by the key's history, and it copies nothing.
 
+use std::ops::ControlFlow;
+
+use super::super::source_walk::Source;
 use super::super::{LookupKey, ReadView, RegolithEngine, with_key_scratch};
 
 impl RegolithEngine {
@@ -22,12 +25,8 @@ impl RegolithEngine {
         floor: u64,
         view: &ReadView,
     ) -> std::io::Result<Option<u64>> {
-        // vertexia: the fourth copy of the newest-first source walk, after
-        // `lookup_in_view`, `merge_chain_in_view` and `latest_version_in_view`;
-        // one shared per-source visitor would fold all four.
         let snap = u64::MAX;
         let lk = LookupKey::from_prefixed(key, snap);
-        let mut max_rt_seq: u64 = 0;
         // Where a source's skip stopped settles the answer. Above the floor
         // and every covering tombstone seen so far, the stop is a value or
         // deletion: the newest replacement. Otherwise the entry is hidden by
@@ -42,51 +41,23 @@ impl RegolithEngine {
             }
         };
 
-        for mt in std::iter::once(&view.active).chain(view.frozen.iter().rev()) {
-            max_rt_seq = max_rt_seq.max(mt.covering_range_tombstone_seq(key, snap));
-            if let Some(stop) = mt.skip_merges_above(&lk, floor.max(max_rt_seq)) {
-                return Ok(settle(stop, max_rt_seq));
-            }
-        }
-        let version = &view.version;
-        for file in version.levels[0].iter().rev() {
-            max_rt_seq = max_rt_seq.max(file.reader.covering_range_tombstone_seq(key, snap));
-            if let Some(stop) = with_key_scratch(|buf| {
-                file.reader
-                    .skip_merges_above(&lk, floor.max(max_rt_seq), buf, &self.cache)
-            })? {
-                return Ok(settle(stop, max_rt_seq));
-            }
-        }
-        for files in version.levels.iter().skip(1) {
-            if files.is_empty() {
-                continue;
-            }
-            for file in files {
-                if file.meta.smallest_key.as_slice() <= key
-                    && key <= file.meta.largest_key.as_slice()
-                {
-                    max_rt_seq =
-                        max_rt_seq.max(file.reader.covering_range_tombstone_seq(key, snap));
-                }
-            }
-            for file in files {
-                if file.meta.num_entries == 0 {
-                    continue;
-                }
-                if file.meta.smallest_key.as_slice() > key || key > file.meta.largest_key.as_slice()
-                {
-                    continue;
-                }
-                if let Some(stop) = with_key_scratch(|buf| {
-                    file.reader
-                        .skip_merges_above(&lk, floor.max(max_rt_seq), buf, &self.cache)
-                })? {
-                    return Ok(settle(stop, max_rt_seq));
-                }
-            }
-        }
-        Ok((max_rt_seq > floor).then_some(max_rt_seq))
+        let walked = view.walk_newest_first(key, snap, |source, max_rt_seq| {
+            let skip_floor = floor.max(max_rt_seq);
+            let stop = match source {
+                Source::Memtable(mt) => mt.skip_merges_above(&lk, skip_floor),
+                Source::Table(reader) => with_key_scratch(|buf| {
+                    reader.skip_merges_above(&lk, skip_floor, buf, &self.cache)
+                })?,
+            };
+            Ok(match stop {
+                Some(stop) => ControlFlow::Break(settle(stop, max_rt_seq)),
+                None => ControlFlow::Continue(()),
+            })
+        })?;
+        Ok(match walked {
+            ControlFlow::Break(settled) => settled,
+            ControlFlow::Continue(max_rt_seq) => (max_rt_seq > floor).then_some(max_rt_seq),
+        })
     }
 }
 
