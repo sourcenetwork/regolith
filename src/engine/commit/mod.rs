@@ -44,11 +44,13 @@ use crate::WriteBatchOp;
 use crate::perf_context::{PerfTimer, PerfTimerField};
 use crate::statistics::{Histogram, Ticker};
 
+mod replaced;
 mod request;
 mod slot;
 mod stall;
 mod terminator;
 
+use replaced::Replaced;
 pub(crate) use request::WriteRequest;
 pub(crate) use slot::WriteSlot;
 pub(crate) use stall::StallSignal;
@@ -335,9 +337,9 @@ impl RegolithEngine {
 
         let view = self.view.load();
         // Reads first, then the written keys in operation order: point
-        // operations arrive sorted from the write map, merges after them in
-        // the order they were buffered, so a multi-key conflict names the
-        // same key on every run.
+        // operations arrive sorted from the write map, merges after them
+        // sorted by key, so a multi-key conflict names the same key on
+        // every run.
         for check in &checks.reads {
             if let Some((latest_seq, _)) = self.latest_version_in_view(&check.key, &view)?
                 && latest_seq > check.observed_seq
@@ -351,26 +353,29 @@ impl RegolithEngine {
                 });
             }
         }
-        // A key merged N times in one transaction is probed once, not N
-        // times: each probe past the first would just walk the same
-        // pipeline-mutex-held view again for an answer already known. A key
-        // with both a point op and a merge op is still probed twice, since
-        // the point op and the first merge op are seen as distinct writes
-        // here; `write_matches_committed` refuses any key carrying a merge
-        // op, so both probes land on the same outcome.
+        // The merges arrive sorted by key, so a key merged N times in one
+        // transaction is probed once, not N times: a repeat of the previous
+        // merged key is skipped, since another probe would just walk the
+        // same pipeline-mutex-held view again for an answer already known.
+        // Only an optimization: a repeat probe lands on the same outcome, so
+        // no correctness rests on the order. A key with both a point op and
+        // a merge op is still probed twice, since the point op and the first
+        // merge op are seen as distinct writes here; `write_matches_committed`
+        // refuses any key carrying a merge op, so both probes land on the
+        // same outcome.
         if let Some(observed_seq) = checks.writes_at {
-            // Built once per batch, not per key: the loop below runs under
-            // the pipeline mutex.
+            // Borrows the batch and allocates nothing: the loop below runs
+            // under the pipeline mutex.
             let replaced = checks.blind_merges_commute.then(|| Replaced::of(&ops));
-            let mut merged_keys: std::collections::HashSet<&[u8]> =
-                std::collections::HashSet::new();
+            let mut last_merged: Option<&[u8]> = None;
             for op in &ops {
                 let (key, merged) = match op {
                     WriteBatchOp::Put { key, .. } | WriteBatchOp::Delete { key } => (key, false),
                     WriteBatchOp::Merge { key, .. } => {
-                        if !merged_keys.insert(key.as_slice()) {
+                        if last_merged == Some(key.as_slice()) {
                             continue;
                         }
+                        last_merged = Some(key.as_slice());
                         (key, true)
                     }
                     // Range deletes are not validated (transaction.rs:459-460).
@@ -809,40 +814,6 @@ impl RegolithEngine {
                 )
             });
         }
-    }
-}
-
-/// The keys a batch replaces outright: put, deleted, or covered by a range
-/// delete. A merged key outside it is one the batch only merges into.
-struct Replaced<'a> {
-    points: std::collections::HashSet<&'a [u8]>,
-    ranges: Vec<(&'a [u8], &'a [u8])>,
-}
-
-impl<'a> Replaced<'a> {
-    fn of(ops: &'a [WriteBatchOp]) -> Self {
-        let mut replaced = Self {
-            points: std::collections::HashSet::new(),
-            ranges: Vec::new(),
-        };
-        for op in ops {
-            match op {
-                WriteBatchOp::Put { key, .. } | WriteBatchOp::Delete { key } => {
-                    replaced.points.insert(key);
-                }
-                WriteBatchOp::DeleteRange { start, end } => replaced.ranges.push((start, end)),
-                WriteBatchOp::Merge { .. } => {}
-            }
-        }
-        replaced
-    }
-
-    fn contains(&self, key: &[u8]) -> bool {
-        self.points.contains(key)
-            || self
-                .ranges
-                .iter()
-                .any(|&(start, end)| start <= key && key < end)
     }
 }
 
