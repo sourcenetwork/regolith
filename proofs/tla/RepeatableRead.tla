@@ -1,6 +1,6 @@
 ---- MODULE RepeatableRead ----
 \* What an optimistic commit validates at each isolation level, transcribed
-\* from the code, and checked against the workload DefraDB runs on it: appends
+\* from the code, and checked against the workload a Merkle-DAG CRDT store runs on it: appends
 \* to a Merkle DAG whose head set is derived from keys, the sweep that reclaims
 \* superseded heads, and a document write derived from a definition read.
 \*
@@ -78,7 +78,7 @@
 \*
 \* RepeatableRead is the one level green on all three: Adya's PL-2.99 over
 \* snapshot isolation, G2-item forbidden and predicate anti-dependencies
-\* allowed. Every read a DefraDB DAG or CRDT merge path derives a decision
+\* allowed. Every read a Merkle-DAG CRDT merge path derives a decision
 \* from is a point read, and the one read that is allowed to change
 \* underneath a transaction is the head scan.
 \*

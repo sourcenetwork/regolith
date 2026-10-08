@@ -296,7 +296,7 @@ chaos instances="4" rounds="2" versions="120" min_rounds="20":
         cargo test --release --test read_view_chaos_workload -- --nocapture
 
 # TLA+ model of what commit validation covers at each isolation level,
-# checked against the DefraDB workload `RepeatableRead` exists for: appends to a
+# checked against the Merkle-DAG CRDT workload `RepeatableRead` exists for: appends to a
 # Merkle DAG whose head set is derived from keys, the sweep that reclaims
 # it, and a write derived from a definition read; and against DefraLevel's
 # relaxations: merges into a counter, scans that stay inside or leave a
