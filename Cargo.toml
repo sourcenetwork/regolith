@@ -72,8 +72,7 @@ loom = "0.7"
 
 # Browser wasm only. `wasm32-wasip1` has a working `std::fs` under a host
 # preopen and needs none of this; `wasm32-unknown-unknown` has no
-# filesystem at all and reaches storage through OPFS. The versions match
-# the ones defradb's OPFS backend already ships against.
+# filesystem at all and reaches storage through OPFS.
 [target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
 js-sys = "0.3"
 wasm-bindgen = "0.2"
