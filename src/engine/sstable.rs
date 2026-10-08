@@ -73,7 +73,7 @@ use super::internal_key::{
     VALUE_TYPE_DELETION, VALUE_TYPE_MERGE, decode_internal_key, user_key_of,
 };
 use super::lookup_key::LookupKey;
-use super::range_tombstone::{RangeTombstone, RangeTombstoneSet};
+use super::range_tombstone::{RangeTombstone, RangeTombstoneSet, table_key_range};
 use crate::DbSlice;
 use crate::env::{BufferedWriter, Env, ReadFile, WriteMode};
 use crate::options::{CompressionType, PrefixExtractor};
@@ -967,25 +967,12 @@ impl SsTableWriter {
         self.writer.sync_all()?;
         crate::env::sync_parent_dir(&*self.env, &self.path)?;
 
-        let mut smallest_user_key = self.smallest_user_key.take();
-        let mut largest_user_key = self.largest_user_key.take();
-        for rt in range_tombstone_set.iter() {
-            if smallest_user_key
-                .as_ref()
-                .is_none_or(|smallest| rt.start.as_slice() < smallest.as_slice())
-            {
-                smallest_user_key = Some(rt.start.clone());
-            }
-            if largest_user_key
-                .as_ref()
-                .is_none_or(|largest| rt.end.as_slice() > largest.as_slice())
-            {
-                largest_user_key = Some(rt.end.clone());
-            }
-        }
-
-        let smallest_user_key = smallest_user_key.expect("checked non-empty above");
-        let largest_user_key = largest_user_key.expect("checked non-empty above");
+        let points = self
+            .smallest_user_key
+            .take()
+            .zip(self.largest_user_key.take());
+        let (smallest_user_key, largest_user_key) =
+            table_key_range(points, range_tombstone_set.iter()).expect("checked non-empty above");
 
         Ok(Some(SsTableWriteSummary {
             smallest_user_key,

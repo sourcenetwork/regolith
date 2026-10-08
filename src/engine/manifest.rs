@@ -26,6 +26,14 @@ pub(crate) const MAX_LEVELS: usize = 7;
 /// descriptor. Concurrent compaction can safely `unlink` a file as soon
 /// as it's removed from the *current* version because the Arcs in older
 /// versions keep the FD alive until those versions are dropped.
+///
+/// Order within a level matters. L0 is in age order, oldest first, because
+/// its tables overlap and recency is position. Every deeper level is one
+/// sorted run: its tables ascend by smallest key (a table added later sorts
+/// after any with the same smallest key) and never overlap except at a shared
+/// boundary key, `files[i].largest_key <= files[i + 1].smallest_key`. That is
+/// what lets a read find the tables covering a key by binary search, see
+/// [`overlapping`].
 #[derive(Clone)]
 pub(crate) struct Version {
     pub(crate) levels: Vec<Vec<Arc<LiveSst>>>,
@@ -53,6 +61,64 @@ impl Version {
     pub(crate) fn level_size(&self, level: usize) -> u64 {
         self.levels[level].iter().map(|f| f.meta.file_size).sum()
     }
+
+    /// Place `file` in `level`: at the end of L0, whose order is age, and
+    /// deeper at its sorted position, after any table with the same smallest
+    /// key.
+    fn add_file(&mut self, level: usize, file: Arc<LiveSst>) {
+        let files = &mut self.levels[level];
+        if level == 0 {
+            files.push(file);
+        } else {
+            let at = files.partition_point(|f| f.meta.smallest_key <= file.meta.smallest_key);
+            files.insert(at, file);
+        }
+    }
+
+    /// The first level below L0, and the two neighbouring tables in it, that
+    /// overlap beyond a shared boundary key, which [`overlapping`] cannot
+    /// search. `None` when every level below L0 is a sorted run.
+    pub(crate) fn find_overlap(&self) -> Option<(usize, &SsTableMeta, &SsTableMeta)> {
+        self.levels
+            .iter()
+            .enumerate()
+            .skip(1)
+            .find_map(|(level, files)| {
+                files
+                    .windows(2)
+                    .find(|pair| pair[0].meta.largest_key > pair[1].meta.smallest_key)
+                    .map(|pair| (level, &pair[0].meta, &pair[1].meta))
+            })
+    }
+
+    /// Whether every level below L0 is a sorted run of tables that overlap
+    /// only at a shared boundary key.
+    pub(crate) fn levels_are_sorted_runs(&self) -> bool {
+        self.find_overlap().is_none()
+    }
+}
+
+/// The tables of `files`, one level below L0 in order, whose key range
+/// intersects `[first, last]`, with `first <= last`. They are a contiguous run
+/// of the level, found by binary search: the first table ending at or after
+/// `first`, through the last one starting at or before `last`.
+pub(crate) fn overlapping<'level>(
+    files: &'level [Arc<LiveSst>],
+    first: &[u8],
+    last: &[u8],
+) -> &'level [Arc<LiveSst>] {
+    let from = files.partition_point(|f| f.meta.largest_key.as_slice() < first);
+    let len = files[from..].partition_point(|f| f.meta.smallest_key.as_slice() <= last);
+    &files[from..from + len]
+}
+
+/// The tables of `files`, one level below L0 in order, whose key range covers
+/// `key`. More than one only where a table ends on the key another begins at.
+pub(crate) fn covering<'level>(
+    files: &'level [Arc<LiveSst>],
+    key: &[u8],
+) -> &'level [Arc<LiveSst>] {
+    overlapping(files, key, key)
 }
 
 /// A runtime mutation to the version. Carries `Arc<LiveSst>` for
@@ -494,7 +560,7 @@ impl VersionSet {
         for edit in edits {
             match edit {
                 VersionEdit::AddFile { level, file } => {
-                    version.levels[*level].push(Arc::clone(file));
+                    version.add_file(*level, Arc::clone(file));
                 }
                 VersionEdit::RemoveFile { level, file_id } => {
                     version.levels[*level].retain(|f| f.meta.file_id != *file_id);
@@ -516,6 +582,14 @@ impl VersionSet {
                 }
             }
         }
+
+        // Checked once the whole batch is in: a compaction removes its inputs
+        // and adds its outputs in one batch, so the level is only expected to
+        // be sound at the end of it.
+        debug_assert!(
+            version.levels_are_sorted_runs(),
+            "a level below L0 holds tables that overlap beyond a shared boundary key"
+        );
 
         let records: Vec<ManifestRecord> = edits.iter().map(VersionEdit::to_record).collect();
         let encoded = Self::encode_records(&records);
@@ -873,6 +947,13 @@ impl VersionSet {
             valid_len = offset;
         }
 
+        // Below L0 a level is one sorted run. The log lists a level's tables in
+        // the order they arrived, which is how `Version::add_file` placed
+        // them, so a stable sort puts each back where it was.
+        for files in surviving.iter_mut().skip(1) {
+            files.sort_by(|a, b| a.smallest_key.cmp(&b.smallest_key));
+        }
+
         // Second pass: open readers for the survivors.
         let mut version = Version::new();
         version.last_seq = last_seq;
@@ -889,10 +970,24 @@ impl VersionSet {
                 version.levels[level].push(LiveSst::new(meta, reader));
             }
         }
+        // The log is untrusted input, and a level that is not one sorted run
+        // cannot be searched, so a manifest that says so is refused.
+        if let Some((level, left, right)) = version.find_overlap() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "manifest lists tables {} and {} at level {level} with overlapping key ranges",
+                    left.file_id, right.file_id
+                ),
+            ));
+        }
 
         Ok(ManifestReplay { version, valid_len })
     }
 }
+
+#[cfg(test)]
+mod level_order_tests;
 
 #[cfg(test)]
 mod tests {
@@ -902,7 +997,12 @@ mod tests {
 
     /// Build a real on-disk SSTable and open a reader for it. Used by
     /// tests that need a non-trivial `LiveSst` instance.
-    fn make_live_sst(dir: &Path, file_id: u64, smallest: &[u8], largest: &[u8]) -> Arc<LiveSst> {
+    pub(super) fn make_live_sst(
+        dir: &Path,
+        file_id: u64,
+        smallest: &[u8],
+        largest: &[u8],
+    ) -> Arc<LiveSst> {
         use super::super::internal_key::{VALUE_TYPE_VALUE, encode_internal_key};
         use super::super::sstable::SsTableWriter;
         use crate::options::CompressionType;

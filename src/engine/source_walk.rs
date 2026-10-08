@@ -1,13 +1,16 @@
 //! The newest-first walk over a view's sources for one key. Every single-key
 //! probe (the point read, the merge-chain read, the commit check's
 //! latest-version and terminator probes) shares it, so they cannot disagree
-//! about which source shadows which. `multi_get_in_view` keeps its own
-//! source-major walk because it visits each source once for many keys.
+//! about which source shadows which. `multi_get_in_view` keeps its own walk
+//! because it serves many keys at once: source by source through the
+//! memtables and L0, so each is visited once for the batch, and key by key
+//! below that, where [`covering`](super::manifest::covering) finds a key's
+//! tables directly.
 
 use std::io;
 use std::ops::ControlFlow;
 
-use super::file_covers_key;
+use super::manifest::covering;
 use super::memtable::MemTable;
 use super::read_view::ReadView;
 use super::sstable::SsTableReader;
@@ -36,7 +39,8 @@ impl<'view, B, F> VisitSource<'view, B> for F where F: FnMut(Source<'view>, u64)
 impl ReadView {
     /// Visits the sources of this view that may hold `key`, newest first: the
     /// active memtable, the frozen ones, every L0 table, then each deeper
-    /// level's tables whose key range covers `key`. `visit` sees each with the
+    /// level's tables whose key range covers `key`, found by binary search
+    /// because such a level is one sorted run. `visit` sees each with the
     /// newest sequence of a range tombstone covering `key` at `snapshot_seq`
     /// seen so far: a memtable's or an L0 table's own count before it is
     /// visited, a deeper level's are gathered across all its covering tables
@@ -72,17 +76,15 @@ impl ReadView {
         }
 
         for files in levels.iter().skip(1) {
-            if files.is_empty() {
+            let run = covering(files, key);
+            if run.is_empty() {
                 continue;
             }
-            for file in files.iter().filter(|file| file_covers_key(file, key)) {
+            for file in run {
                 max_rt_seq =
                     max_rt_seq.max(file.reader.covering_range_tombstone_seq(key, snapshot_seq));
             }
-            let holders = files
-                .iter()
-                .filter(|file| file.meta.num_entries > 0 && file_covers_key(file, key));
-            for file in holders {
+            for file in run.iter().filter(|file| file.meta.num_entries > 0) {
                 if let ControlFlow::Break(done) = visit(Source::Table(&file.reader), max_rt_seq)? {
                     return Ok(ControlFlow::Break(done));
                 }
@@ -98,9 +100,10 @@ mod tests {
     use super::*;
     use crate::column_family::{DEFAULT_CF_ID, prefix_key};
     use crate::engine::internal_key::{VALUE_TYPE_VALUE, encode_internal_key};
+    use crate::engine::lookup_key::LookupKey;
     use crate::engine::manifest::Version;
     use crate::engine::memtable::MemTableConfig;
-    use crate::engine::sstable::{LiveSst, SsTableMeta, SsTableWriter};
+    use crate::engine::sstable::{LiveSst, Materialize, PointValue, SsTableMeta, SsTableWriter};
     use crate::options::CompressionType;
     use crate::portability::Ordering;
     use crate::{Db, Options};
@@ -309,36 +312,150 @@ mod tests {
         LiveSst::new(meta, Arc::new(SsTableReader::open(&path, file_id).unwrap()))
     }
 
-    #[test]
-    fn a_deeper_levels_tombstones_are_gathered_before_any_of_its_tables_is_visited() {
-        let dir = TempDir::new().unwrap();
-        // L1 lists the table holding `k` first and, after it, one holding only
-        // a newer tombstone over it.
-        let holder = live_table(&dir, 1, &[(b"a", 5), (b"k", 5), (b"m", 5)], &[]);
-        let tombstone_only = live_table(&dir, 2, &[], &[(b"c", b"p", 10)]);
-        let mut version = Version::new();
-        version.levels[1] = vec![holder, tombstone_only];
-        let view = ReadView {
+    /// A view of an empty memtable over `version`.
+    fn view_over(version: Version) -> ReadView {
+        ReadView {
             active: Arc::new(MemTable::new(&MemTableConfig::default()).unwrap()),
             frozen: Vec::new(),
             version: Arc::new(version),
-        };
+        }
+    }
+
+    #[test]
+    fn a_deeper_levels_tombstones_are_gathered_before_any_of_its_tables_is_visited() {
+        let dir = TempDir::new().unwrap();
+        // L1 lists the table holding `m` first and, after it, one holding only
+        // a newer tombstone over `m` and beyond, which starts where it ends.
+        let holder = live_table(&dir, 1, &[(b"a", 5), (b"k", 5), (b"m", 5)], &[]);
+        let tombstone_only = live_table(&dir, 2, &[], &[(b"m", b"p", 10)]);
+        let mut version = Version::new();
+        version.levels[1] = vec![holder, tombstone_only];
+        assert!(version.levels_are_sorted_runs());
+        let view = view_over(version);
         let at = |place: &str, rt| (place.to_string(), rt);
 
         // The table without entries is not visited, but its tombstone is
         // seen by the one that holds the key.
-        let (visited, ended) = walk_all(&view, b"k", u64::MAX);
+        let (visited, ended) = walk_all(&view, b"m", u64::MAX);
         assert_eq!(visited, [at("active", 0), at("L1 0", 10)]);
         assert_eq!(ended, 10);
 
-        // Outside the tombstone's range, the holder sees none.
-        let (visited, ended) = walk_all(&view, b"a", u64::MAX);
+        // Before the tombstone's range, the holder sees none.
+        let (visited, ended) = walk_all(&view, b"k", u64::MAX);
         assert_eq!(visited, [at("active", 0), at("L1 0", 0)]);
         assert_eq!(ended, 0);
 
-        // Outside every table's key range, only the memtable is visited.
-        let (visited, ended) = walk_all(&view, b"q", u64::MAX);
+        // Where only the tombstone's table covers the key, nothing is visited
+        // but the walk still ends with the tombstone.
+        let (visited, ended) = walk_all(&view, b"n", u64::MAX);
         assert_eq!(visited, [at("active", 0)]);
-        assert_eq!(ended, 0);
+        assert_eq!(ended, 10);
+
+        // Outside every table's key range, only the memtable is visited.
+        for key in [b"0".as_slice(), b"q"] {
+            let (visited, ended) = walk_all(&view, key, u64::MAX);
+            assert_eq!(visited, [at("active", 0)], "{key:?}");
+            assert_eq!(ended, 0, "{key:?}");
+        }
+    }
+
+    #[test]
+    fn a_deep_level_of_many_tables_visits_only_the_one_covering_the_key() {
+        let dir = TempDir::new().unwrap();
+        // Table i holds t(2i) and t(2i + 1), so the level is 30 tables with a
+        // gap between each pair.
+        let key = |n: u64| format!("t{n:03}").into_bytes();
+        let tables: Vec<_> = (0..30)
+            .map(|i| {
+                let points = [(key(2 * i), 5), (key(2 * i + 1), 5)];
+                let points: Vec<(&[u8], u64)> =
+                    points.iter().map(|(k, seq)| (k.as_slice(), *seq)).collect();
+                live_table(&dir, i + 1, &points, &[])
+            })
+            .collect();
+        let mut version = Version::new();
+        version.levels[2] = tables;
+        let view = view_over(version);
+
+        for n in 0..60 {
+            let (visited, _) = walk_all(&view, &key(n), u64::MAX);
+            let names: Vec<&str> = visited.iter().map(|(name, _)| name.as_str()).collect();
+            assert_eq!(names, ["active", &format!("L2 {}", n / 2)], "t{n:03}");
+        }
+        // A key between a table's own two keys is still covered by it.
+        let (visited, _) = walk_all(&view, b"t000\0", u64::MAX);
+        assert_eq!(visited.len(), 2);
+
+        // Between two tables, before the first, and after the last.
+        for missing in [b"t0075".as_slice(), b"s", b"u"] {
+            let (visited, ended) = walk_all(&view, missing, u64::MAX);
+            assert_eq!(visited.len(), 1, "{missing:?}");
+            assert_eq!(ended, 0, "{missing:?}");
+        }
+    }
+
+    #[test]
+    fn a_batch_read_and_a_single_key_read_agree_on_how_deeper_level_tombstones_hide_entries() {
+        let tables = TempDir::new().unwrap();
+        // L1 holds, in key order: a, c and e; a tombstone-only table over
+        // [e, h) at sequence 10 that starts where the first ends; i and k;
+        // and a tombstone-only table over [k, m) at sequence 3, older than
+        // the entry for k it starts beside. L2 holds older entries.
+        let mut version = Version::new();
+        version.levels[1] = vec![
+            live_table(&tables, 1, &[(b"a", 5), (b"c", 5), (b"e", 5)], &[]),
+            live_table(&tables, 2, &[], &[(b"e", b"h", 10)]),
+            live_table(&tables, 3, &[(b"i", 5), (b"k", 5)], &[]),
+            live_table(&tables, 4, &[], &[(b"k", b"m", 3)]),
+        ];
+        version.levels[2] = vec![live_table(
+            &tables,
+            5,
+            &[(b"a", 2), (b"e", 2), (b"g", 2), (b"k", 2)],
+            &[],
+        )];
+        assert!(version.levels_are_sorted_runs());
+        let view = view_over(version);
+
+        let dir = TempDir::new().unwrap();
+        let db = open(&dir);
+        let engine = db.engine();
+
+        let keys: [&[u8]; 16] = [
+            b"0", b"a", b"b", b"c", b"d", b"e", b"f", b"g", b"h", b"hh", b"i", b"j", b"k", b"l",
+            b"m", b"z",
+        ];
+        let prefixed: Vec<Vec<u8>> = keys.iter().map(|key| key_of(key)).collect();
+        let refs: Vec<&[u8]> = prefixed.iter().map(Vec::as_slice).collect();
+        let batch = engine.multi_get_in_view(&refs, u64::MAX, &view).unwrap();
+
+        for (key, got) in keys.iter().zip(&batch) {
+            let lk = LookupKey::new(DEFAULT_CF_ID, key, u64::MAX);
+            let single = engine
+                .lookup_in_view(
+                    lk.prefixed_user_key(),
+                    u64::MAX,
+                    &lk,
+                    Materialize::Value,
+                    &view,
+                )
+                .unwrap()
+                .map(|found| match found {
+                    PointValue::Value(value) => value.to_vec(),
+                    PointValue::Length(_) => unreachable!("a value was asked for"),
+                });
+            assert_eq!(got, &single, "{key:?}: batch against single-key read");
+        }
+
+        // What each read is meant to say: `e` and `g` are hidden by the newer
+        // tombstone, `g` from a deeper level than the one that holds it; `k`
+        // outlives the older tombstone beside it.
+        let visible: Vec<&[u8]> = keys
+            .iter()
+            .zip(&batch)
+            .filter(|(_, got)| got.is_some())
+            .map(|(key, _)| *key)
+            .collect();
+        assert_eq!(visible, [b"a".as_slice(), b"c", b"i", b"k"]);
     }
 }
