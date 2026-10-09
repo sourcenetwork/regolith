@@ -488,6 +488,18 @@ tla:
     check MC_WalRecovery_Red_CloseWithoutSync          RED RecoveryOpens
     check MC_WalRecovery_Red_NoTruncate                RED RecoveryOpens
     check MC_WalRecovery_Red_StampNotSealed            RED AckedSurvive
+    # E29, E30: the manifest's torn end and the logs a flush retires. Lean:
+    # Regolith/ManifestRecovery.lean, crash_never_proves, replay_keeps_synced,
+    # replay_never_above_newer_table.
+    spec=ManifestRecovery
+    check MC_ManifestRecovery_Green                    GREEN
+    check MC_ManifestRecovery_Green_Refuses            RED NeverRefusesRot
+    check MC_ManifestRecovery_Red_OldGuard             RED RecoveryOpens
+    check MC_ManifestRecovery_Red_NoSyncBeforeNext     RED RecoveryOpens
+    check MC_ManifestRecovery_Red_UnlinkBeforeSync     RED AckedSurvive
+    check MC_ManifestRecovery_Red_RetireBeforeTable    RED AckedSurvive
+    check MC_ManifestRecovery_Red_NoMinWalId           RED ReadsNewest
+    check MC_ManifestRecovery_Red_IgnoreProof          RED RotSafe
     # 4.8, E5: compaction per snapshot stripe. Lean: Regolith/Stripes.lean,
     # reduce_reads.
     spec=StripeCompaction
