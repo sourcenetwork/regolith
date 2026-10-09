@@ -508,6 +508,7 @@ tla:
     check MC_WalRecovery_Red_CloseWithoutSync          RED RecoveryOpens
     check MC_WalRecovery_Red_NoTruncate                RED RecoveryOpens
     check MC_WalRecovery_Red_StampNotSealed            RED AckedSurvive
+    check MC_WalRecovery_Red_StampUnsynced             RED RecoveryOpens
     # E29, E30: the manifest's torn end and the logs a flush retires. Lean:
     # Regolith/ManifestRecovery.lean, crash_never_proves, replay_keeps_synced,
     # replay_never_above_newer_table.
@@ -520,7 +521,6 @@ tla:
     check MC_ManifestRecovery_Red_RetireBeforeTable    RED AckedSurvive
     check MC_ManifestRecovery_Red_NoMinWalId           RED ReadsNewest
     check MC_ManifestRecovery_Red_IgnoreProof          RED RotSafe
-    check MC_WalRecovery_Red_StampUnsynced             RED RecoveryOpens
     # 4.12, D45: a sealed manifest batch keeps its checksum, checked before
     # any key. Lean: Regolith/ManifestSeal.lean, replay_opens_with_right_keys,
     # open_ends_only_at_a_torn_batch.
