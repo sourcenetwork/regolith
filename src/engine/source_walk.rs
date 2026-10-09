@@ -30,8 +30,8 @@ pub(crate) type VisitResult<B> = io::Result<ControlFlow<B>>;
 /// source with the newest covering range-tombstone sequence.
 pub(crate) type WalkResult<B> = io::Result<ControlFlow<B, u64>>;
 
-/// Visits one source of a view with the newest sequence of a range
-/// tombstone covering the key seen so far.
+/// Visits one source with the newest covering range-tombstone sequence
+/// gathered for it, including all visible L0 tombstones.
 pub(crate) trait VisitSource<'view, B>: FnMut(Source<'view>, u64) -> VisitResult<B> {}
 
 impl<'view, B, F> VisitSource<'view, B> for F where F: FnMut(Source<'view>, u64) -> VisitResult<B> {}
@@ -51,13 +51,13 @@ impl ReadView {
     /// active memtable, the frozen ones, every L0 table, then each deeper
     /// level's tables whose key range covers `key`, found by binary search
     /// because such a level is one sorted run. `visit` sees each with the
-    /// newest sequence of a range tombstone covering `key` at `snapshot_seq`
-    /// seen so far: a memtable's or an L0 table's own count before it is
-    /// visited, a deeper level's are gathered across all its covering tables
-    /// before any of them is, since a tombstone can sit in a table other than
-    /// the one holding the key. `visit` breaks to stop the walk; once every
-    /// source was visited, the walk continues with the final tombstone
-    /// sequence.
+    /// newest covering range-tombstone sequence at `snapshot_seq`. Gather
+    /// all L0 tombstones before visiting any source: a demoted legacy
+    /// tombstone can be newer than a shallow point or a replayed memtable
+    /// point. Add each memtable's own tombstones before visiting it, and
+    /// each deeper level's across all its covering tables before visiting
+    /// any of them. `visit` breaks to stop the walk; once every source was
+    /// visited, the walk continues with the final tombstone sequence.
     #[inline]
     pub(crate) fn walk_newest_first<'view, B>(
         &'view self,
@@ -65,7 +65,7 @@ impl ReadView {
         snapshot_seq: u64,
         mut visit: impl VisitSource<'view, B>,
     ) -> WalkResult<B> {
-        let mut max_rt_seq: u64 = 0;
+        let mut max_rt_seq = self.version.l0_range_tombstone_seq(key, snapshot_seq);
 
         for mt in std::iter::once(&self.active).chain(self.frozen.iter().rev()) {
             max_rt_seq = max_rt_seq.max(mt.covering_range_tombstone_seq(key, snapshot_seq));
@@ -78,8 +78,6 @@ impl ReadView {
         // Every L0 table, whatever its key range: they may overlap, and a
         // filter here would change which bloom checks a point read runs.
         for file in levels[0].iter().rev() {
-            max_rt_seq =
-                max_rt_seq.max(file.reader.covering_range_tombstone_seq(key, snapshot_seq));
             if let ControlFlow::Break(done) = visit(Source::Table(&file.reader), max_rt_seq)? {
                 return Ok(ControlFlow::Break(done));
             }
@@ -271,13 +269,17 @@ mod tests {
         let view = db.engine().view.load();
 
         let (visited, ended) = walk_all(&view, b"k", u64::MAX);
-        let expected = [("active", 0), ("L0 1", tombstone), ("L0 0", tombstone)];
+        let expected = [
+            ("active", tombstone),
+            ("L0 1", tombstone),
+            ("L0 0", tombstone),
+        ];
         assert_eq!(visited, expected.map(|(place, rt)| (place.to_string(), rt)));
         assert_eq!(ended, tombstone);
     }
 
     #[test]
-    fn a_tombstone_in_an_older_source_does_not_reach_the_visit_of_a_newer_one() {
+    fn l0_tombstones_are_gathered_before_any_source_is_visited() {
         let dir = TempDir::new().unwrap();
         let db = open(&dir);
         db.delete_range(b"a", b"z").unwrap();
@@ -288,7 +290,11 @@ mod tests {
         let view = db.engine().view.load();
 
         let (visited, ended) = walk_all(&view, b"k", u64::MAX);
-        let expected = [("active", 0), ("L0 1", 0), ("L0 0", tombstone)];
+        let expected = [
+            ("active", tombstone),
+            ("L0 1", tombstone),
+            ("L0 0", tombstone),
+        ];
         assert_eq!(visited, expected.map(|(place, rt)| (place.to_string(), rt)));
         assert_eq!(ended, tombstone);
     }

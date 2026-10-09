@@ -39,6 +39,7 @@ pub(crate) const MAX_LEVELS: usize = 7;
 #[derive(Clone)]
 pub(crate) struct Version {
     pub(crate) levels: Vec<Vec<Arc<LiveSst>>>,
+    l0_has_range_tombstones: bool,
     pub(crate) next_file_id: u64,
     pub(crate) last_seq: u64,
     pub(crate) min_wal_id: u64,
@@ -48,6 +49,7 @@ impl Version {
     pub(crate) fn new() -> Self {
         Self {
             levels: (0..MAX_LEVELS).map(|_| Vec::new()).collect(),
+            l0_has_range_tombstones: false,
             next_file_id: 1,
             last_seq: 0,
             min_wal_id: 0,
@@ -62,6 +64,27 @@ impl Version {
     /// Total size of SSTables at a given level.
     pub(crate) fn level_size(&self, level: usize) -> u64 {
         self.levels[level].iter().map(|f| f.meta.file_size).sum()
+    }
+
+    pub(crate) fn refresh_l0_range_tombstones(&mut self) {
+        self.l0_has_range_tombstones = self.levels[0]
+            .iter()
+            .any(|file| !file.reader.range_tombstones().is_empty());
+    }
+
+    /// A legacy ingest's tombstone can be newer than a shallow point
+    /// demoted ahead of it, or an older point replayed into a memtable.
+    /// Gather deletes before a point lookup can stop at either source.
+    /// The cached flag keeps tombstone-free L0 runs out of the scan.
+    pub(crate) fn l0_range_tombstone_seq(&self, key: &[u8], snapshot_seq: u64) -> u64 {
+        if !self.l0_has_range_tombstones {
+            return 0;
+        }
+        self.levels[0]
+            .iter()
+            .map(|file| file.reader.covering_range_tombstone_seq(key, snapshot_seq))
+            .max()
+            .unwrap_or(0)
     }
 
     /// Place `file` in `level`: at the end of L0, whose order is age, and
@@ -613,6 +636,7 @@ impl VersionSet {
         // Checked once the whole batch is in: a compaction removes its inputs
         // and adds its outputs in one batch, so the level is only expected to
         // be sound at the end of it.
+        version.refresh_l0_range_tombstones();
         debug_assert!(
             version.levels_are_sorted_runs(),
             "a level below L0 holds tables that overlap beyond a shared boundary key"
@@ -1018,6 +1042,7 @@ impl VersionSet {
                 version.levels[level].push(LiveSst::new(meta, reader));
             }
         }
+        version.refresh_l0_range_tombstones();
         // The log is untrusted input, and a level that is not one sorted run
         // cannot be searched, so a manifest that says so is refused.
         if let Some((level, left, right)) = version.find_overlap() {

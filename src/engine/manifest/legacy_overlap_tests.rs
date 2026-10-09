@@ -59,6 +59,10 @@ fn manifest(dir: &Path, records: &[ManifestRecord]) -> Vec<u8> {
 }
 
 pub(super) fn fixture() -> (TempDir, Vec<u8>) {
+    fixture_with_ingest_seq(20)
+}
+
+fn fixture_with_ingest_seq(ingest_seq: u64) -> (TempDir, Vec<u8>) {
     let dir = TempDir::new().unwrap();
     let sst_dir = dir.path().join("sst");
     std::fs::create_dir_all(&sst_dir).unwrap();
@@ -67,7 +71,13 @@ pub(super) fn fixture() -> (TempDir, Vec<u8>) {
     let old = table(&sst_dir, 8, 10, &[(b"k", b"old"), (b"x", b"x")], None);
     // Its point is disjoint from the old table, but the range tombstone
     // widens its recorded range to b..z: the legacy ingest placement bug.
-    let ingest = table(&sst_dir, 3, 20, &[(b"z", b"ingested")], Some((b"b", b"t")));
+    let ingest = table(
+        &sst_dir,
+        3,
+        ingest_seq,
+        &[(b"z", b"ingested")],
+        Some((b"b", b"t")),
+    );
     let upper = table(&sst_dir, 10, 30, &[(b"k", b"new")], None);
     let l0 = table(&sst_dir, 90, 50, &[(b"e", b"l0")], None);
     let deep = table(&sst_dir, 77, 5, &[(b"r", b"deleted")], None);
@@ -165,6 +175,54 @@ fn options() -> Options {
         max_background_compactions: 0,
         ..Options::default()
     }
+}
+
+#[test]
+fn a_newer_demoted_range_tombstone_hides_an_older_shallow_point() {
+    let (dir, _) = fixture_with_ingest_seq(40);
+    // A legacy ingest could advance the manifest sequence while an older
+    // point was still unflushed. The tombstone must also mask its WAL replay.
+    let mut wal = crate::engine::wal::Wal::create(
+        &dir.path()
+            .join("wal")
+            .join(crate::engine::wal::wal_filename(5)),
+    )
+    .unwrap();
+    wal.append_put(&prefix_key(DEFAULT_CF_ID, b"k"), b"unflushed", 35)
+        .unwrap();
+    wal.sync_data().unwrap();
+    drop(wal);
+
+    let db = Db::open_read_only(dir.path(), options()).unwrap();
+    assert_eq!(db.get(b"k").unwrap(), None);
+    assert_eq!(db.multi_get(&[b"k"]).unwrap(), [None]);
+    assert_eq!(
+        db.engine()
+            .get_slice_at(&prefix_key(DEFAULT_CF_ID, b"k"), 30)
+            .unwrap()
+            .as_deref(),
+        Some(b"new".as_slice())
+    );
+    drop(db);
+
+    let db = Db::open(dir.path(), options()).unwrap();
+    assert_eq!(db.get(b"k").unwrap(), None);
+    assert_eq!(db.multi_get(&[b"k"]).unwrap(), [None]);
+    assert!(!db.scan(None, None).unwrap().iter().any(|(k, _)| k == b"k"));
+    assert_eq!(db.get(b"e").unwrap().as_deref(), Some(b"l0".as_slice()));
+    let snapshot = db.snapshot();
+    db.put(b"k", b"latest").unwrap();
+    assert_eq!(db.get(b"k").unwrap().as_deref(), Some(b"latest".as_slice()));
+    assert_eq!(snapshot.get(b"k").unwrap(), None);
+    db.flush().unwrap();
+    db.compact_range(None, None).unwrap();
+    assert_eq!(snapshot.get(b"k").unwrap(), None);
+    assert_eq!(db.get(b"k").unwrap().as_deref(), Some(b"latest".as_slice()));
+    drop(snapshot);
+    db.close().unwrap();
+    drop(db);
+    let db = Db::open(dir.path(), options()).unwrap();
+    assert_eq!(db.get(b"k").unwrap().as_deref(), Some(b"latest".as_slice()));
 }
 
 #[test]
