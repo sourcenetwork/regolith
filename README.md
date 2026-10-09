@@ -223,6 +223,26 @@ key, what the transaction did with it (`Access`) and the newer write that won
 never its bytes, since a key can hold user data. An `EventListener::on_conflict` hears each
 conflict once, after the commit released its locks, so a caller can count the reasons.
 
+`transact` runs a closure in a transaction and commits it. After a conflict it runs the
+closure again at once, in a fresh transaction, handing it the conflict it lost to, up to the
+policy's `max_attempts`. The closure can settle the race from that reason instead of
+redoing its work blindly. An error from the closure ends the attempt and is not retried.
+
+```rust
+use regolith::{RetryPolicy, TransactionError, WriteKind};
+
+let (_, receipt) = db.transact(&RetryPolicy::default(), |txn, lost| {
+    // `lost` is the conflict the previous attempt lost to, `None` on the first run.
+    if lost.is_some_and(|conflict| conflict.theirs() == WriteKind::Delete) {
+        return Ok(()); // the document was deleted by the writer that won
+    }
+    txn.get_for_update(b"doc")?;
+    txn.delete(b"doc")?;
+    Ok::<_, TransactionError>(())
+})?;
+println!("visible at sequence {}", receipt.seq());
+```
+
 `commit` returns a `CommitReceipt` whose `seq()` is the sequence its writes became visible
 at, or the snapshot's sequence for a commit that wrote nothing. A sequence orders commits
 within one database; do not keep it across `drop_all` or in a restored database.

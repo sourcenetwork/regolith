@@ -115,11 +115,13 @@ use crate::{Access, Conflict, Db, DbSlice, Error, Options, Result};
 
 mod policy;
 mod receipt;
+mod retry;
 mod scan_range;
 mod txn_options;
 mod write_buffer;
 pub use policy::{KeyClass, KeyClassifier};
 pub use receipt::CommitReceipt;
+pub use retry::{RetryPolicy, TransactError};
 use scan_range::{OpenRun, ScanRun};
 pub use txn_options::TxnOptions;
 use write_buffer::{KeyWrites, Write, fold_by_key, read_buffered, settle};
@@ -148,7 +150,7 @@ pub enum TransactionError {
     /// overwrite. The [`Conflict`] says what this transaction did with the
     /// key and what the newer write was; its message names the reason and
     /// the sequences but never the key's bytes. The caller should roll back
-    /// and retry.
+    /// and retry, or let [`OptimisticTransactionDb::transact`] do it.
     #[error("{0}")]
     Conflict(Conflict),
     /// A pessimistic transaction could not acquire a key lock in

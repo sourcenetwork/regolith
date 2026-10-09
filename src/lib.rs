@@ -106,8 +106,9 @@ pub use statistics::{Histogram, HistogramSnapshot, Statistics, Ticker};
 pub use stream_writer::{StreamOptions, StreamingWriter};
 pub use tailing::TailingIter;
 pub use transaction::{
-    CommitReceipt, IsolationLevel, KeyClass, KeyClassifier, OptimisticTransactionDb, ScanDirection,
-    Transaction, TransactionDb, TransactionError, TxResult, TxnOptions, TxnScanStream,
+    CommitReceipt, IsolationLevel, KeyClass, KeyClassifier, OptimisticTransactionDb, RetryPolicy,
+    ScanDirection, TransactError, Transaction, TransactionDb, TransactionError, TxResult,
+    TxnOptions, TxnScanStream,
 };
 
 /// The transactional API and the traits a caller implements, in one import:
@@ -115,7 +116,8 @@ pub use transaction::{
 pub mod prelude {
     pub use crate::{
         CommitReceipt, Conflict, Db, IsolationLevel, KeyClass, KeyClassifier, MergeOperator,
-        OptimisticTransactionDb, Options, Transaction, TransactionError, TxResult, TxnOptions,
+        OptimisticTransactionDb, Options, RetryPolicy, TransactError, Transaction,
+        TransactionError, TxResult, TxnOptions,
     };
 }
 pub use ttl::{DbWithTtl, TtlCompactionFilter, strip_timestamp};

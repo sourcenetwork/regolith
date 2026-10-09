@@ -223,7 +223,8 @@ pub trait EventListener: Send + Sync + 'static {
     /// thread that committed, after the commit released its locks. The
     /// [`Conflict`] says what the transaction did with the key and what the
     /// newer write was, so a caller can count the reasons in its own
-    /// telemetry.
+    /// telemetry. A [`crate::OptimisticTransactionDb::transact`] retry that
+    /// conflicts again calls it again.
     fn on_conflict(&self, conflict: &Conflict) {
         let _ = conflict;
     }

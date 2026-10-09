@@ -12,8 +12,8 @@
 
 use regolith::{
     CfIter, CommitReceipt, Conflict, Db, DbSlice, DbWithTtl, Entries, Error, Iter,
-    OptimisticTransactionDb, OwnedSnapshotIter, ScanStream, Snapshot, TailingIter, Transaction,
-    TransactionDb, TransactionError, TxnScanStream,
+    OptimisticTransactionDb, OwnedSnapshotIter, RetryPolicy, ScanStream, Snapshot, TailingIter,
+    TransactError, Transaction, TransactionDb, TransactionError, TxnScanStream,
 };
 
 const fn assert_send<T: Send>() {}
@@ -33,6 +33,8 @@ fn handles_are_send_and_sync() {
     assert_send_sync::<TransactionError>();
     assert_send_sync::<Conflict>();
     assert_send_sync::<CommitReceipt>();
+    assert_send_sync::<RetryPolicy>();
+    assert_send_sync::<TransactError<Error>>();
 }
 
 #[test]
