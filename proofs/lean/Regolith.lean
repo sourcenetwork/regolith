@@ -38,3 +38,13 @@ import Regolith.GroupCommit
 -- reader at the published horizon sees exactly the published commits.
 -- Backs `proofs/tla/CommitPipeline.tla`.
 import Regolith.Pipeline
+-- Plan 3.3: an exact partial_merge folds to full_merge in any grouping, and
+-- the touches law. Backs `proofs/tla/RepeatableRead.tla`.
+import Regolith.MergeOperator
+-- Plan 3.1 to 3.15: every key class's commit rule accepts only histories
+-- equal to the serial one in commit order, up to the class's relaxation.
+-- Backs `proofs/tla/RepeatableRead.tla`.
+import Regolith.Validation
+-- Each key class's relaxation stated exactly, and the RED counterexamples.
+-- Backs `proofs/tla/RepeatableRead.tla`.
+import Regolith.Relaxations
