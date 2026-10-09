@@ -463,6 +463,27 @@ tla:
     check MC_SnapshotRegistry_Green                    GREEN
     check MC_SnapshotRegistry_Red_NoConfirm            RED MinBelowLive
     check MC_SnapshotRegistry_Red_ScanThenSample       RED MinBelowLive
+    # E10, group commit. Lean: Regolith/GroupCommit.lean, group_eq_serial.
+    spec=GroupCommit
+    check MC_GroupCommit_Green                         GREEN
+    check MC_GroupCommit_Red_ViewOnly                  RED SerialEquivalent
+    check MC_GroupCommit_Red_PublishBeforeSync         RED DurableBeforeVisible
+    # 4.7, the lock-free commit pipeline. Lean: Regolith/Pipeline.lean,
+    # seqs_dense and reader_sees_published.
+    spec=CommitPipeline
+    check MC_CommitPipeline_Green                      GREEN
+    check MC_CommitPipeline_Red_OutOfOrder             RED ReadersSeePrefix
+    check MC_CommitPipeline_Red_AbortHole              RED NoHole
+    check MC_CommitPipeline_Red_NoHelping              RED NoLiveThreadBlocked
+    check MC_CommitPipeline_Red_SyncPastGap            RED DurableImpliesWritten
+    check MC_CommitPipeline_Red_ValidatePublished      RED NoLostUpdate
+    # R13, non-blocking calls: tickets, poll_io, io_pending, CacheOnly reads.
+    # TLC only; wakeups are interleavings with no law over sizes to prove.
+    spec=NonBlocking
+    check MC_NonBlocking_Green_Pool                    GREEN
+    check MC_NonBlocking_Green_Single                  GREEN
+    check MC_NonBlocking_Red_LostWakeup                RED NoLostWakeup
+    check MC_NonBlocking_Red_SilentSelfIo              RED IoPendingFires
     rm -rf states ./*_TTrace_*.tla ./*_TTrace_*.bin
     exit $fail
 
