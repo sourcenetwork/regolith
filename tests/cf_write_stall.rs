@@ -19,17 +19,15 @@ fn every_column_family_write_is_stopped_with_the_default_column_family() {
     let dir = tempfile::tempdir().expect("tempdir");
     let db = Db::open(
         dir.path(),
-        Options {
-            write_buffer_size: 16 * 1024,
-            level0_slowdown_writes_trigger: 3,
-            level0_stop_writes_trigger: 4,
-            max_background_compactions: 0,
-            compaction_style: CompactionStyle::Fifo,
-            fifo_compaction_options: FifoCompactionOptions {
+        Options::default()
+            .write_buffer_size(16 * 1024)
+            .level0_slowdown_writes_trigger(3)
+            .level0_stop_writes_trigger(4)
+            .max_background_compactions(0)
+            .compaction_style(CompactionStyle::Fifo)
+            .fifo_compaction_options(FifoCompactionOptions {
                 max_table_files_size: 1024 * 1024 * 1024,
-            },
-            ..Options::default()
-        },
+            }),
     )
     .expect("open");
     let cf = db.create_column_family("cf").expect("create cf");

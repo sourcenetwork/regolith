@@ -39,7 +39,7 @@ fn begin(db: &OptimisticTransactionDb) -> Transaction {
     db.begin(&TxnOptions::new().isolation(IsolationLevel::DefraLevel))
 }
 
-fn panicked(callback: &str, result: &TxResult<()>) -> bool {
+fn panicked<T>(callback: &str, result: &TxResult<T>) -> bool {
     matches!(
         result,
         Err(TransactionError::Engine(Error::CallbackPanicked { callback: named })) if *named == callback

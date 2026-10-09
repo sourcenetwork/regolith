@@ -10,8 +10,8 @@
 
 use std::io;
 
-use super::super::internal_key::VALUE_TYPE_VALUE;
 use super::super::{LookupKey, Materialize, PointValue, ReadView, RegolithEngine};
+use crate::WriteKind;
 
 impl RegolithEngine {
     /// Whether putting `value` under the content-addressed `key` contradicts
@@ -26,7 +26,7 @@ impl RegolithEngine {
         floor: u64,
         view: &ReadView,
     ) -> io::Result<bool> {
-        let Some((latest_seq, VALUE_TYPE_VALUE)) = self.latest_version_in_view(key, view)? else {
+        let Some((latest_seq, WriteKind::Put)) = self.latest_version_in_view(key, view)? else {
             return Ok(false);
         };
         if latest_seq <= floor {
@@ -131,14 +131,14 @@ mod tests {
     fn a_put_beside_a_commit_of_the_same_bytes_commits() {
         for flush in [false, true] {
             let outcome = put_after(Some(Newest::Put(b"same")), b"same", flush).unwrap();
-            assert!(matches!(outcome, CommitOutcome::Ok), "flush={flush}");
+            assert!(matches!(outcome, CommitOutcome::Ok { .. }), "flush={flush}");
         }
     }
 
     #[test]
     fn a_put_after_nothing_landed_is_not_looked_up() {
         let outcome = put_after(None, b"mine", false).unwrap();
-        assert!(matches!(outcome, CommitOutcome::Ok), "{outcome:?}");
+        assert!(matches!(outcome, CommitOutcome::Ok { .. }), "{outcome:?}");
     }
 
     #[test]
@@ -146,7 +146,7 @@ mod tests {
         for flush in [false, true] {
             for landed in [Newest::Delete, Newest::DeleteRange, Newest::Merge] {
                 let outcome = put_after(Some(landed), b"mine", flush).unwrap();
-                assert!(matches!(outcome, CommitOutcome::Ok), "flush={flush}");
+                assert!(matches!(outcome, CommitOutcome::Ok { .. }), "flush={flush}");
             }
         }
     }

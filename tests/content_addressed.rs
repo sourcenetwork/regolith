@@ -219,7 +219,7 @@ fn other_levels_with_the_same_classifier_conflict_as_before() {
 
 /// Whether a commit failed because a content-addressed key would have held
 /// different bytes.
-fn mismatched(result: TxResult<()>) -> bool {
+fn mismatched<T>(result: TxResult<T>) -> bool {
     matches!(
         result,
         Err(TransactionError::Engine(Error::ContentMismatch))
