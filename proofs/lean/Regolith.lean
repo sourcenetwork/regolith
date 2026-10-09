@@ -62,3 +62,9 @@ import Regolith.SyncFifo
 -- outcome, in the stated order, and attempts are isolated. Backs
 -- `proofs/tla/TxnCallbacks.tla`.
 import Regolith.Callbacks
+-- 4.10, D53: per-thread I/O queues. A unit is claimed by one CAS and runs
+-- once, every registered queue is told exactly once and no other is, a
+-- request sits on its own queue, an idle owner is woken and a busy one
+-- never, and one thread finishes everything. Backs
+-- `proofs/tla/NonBlocking.tla`.
+import Regolith.IoQueue
