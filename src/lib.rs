@@ -8477,6 +8477,25 @@ mod tests {
         assert_eq!(limiter.get_total_bytes_through(Priority::High), 0);
     }
 
+    /// Wait, with a deadline and a bounded backoff, until the background
+    /// has written L0 up to `files` tables.
+    fn wait_for_l0_files(db: &Db, files: u64) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let mut pause = std::time::Duration::from_millis(1);
+        while db
+            .get_int_property("regolith.num-files-at-level0")
+            .unwrap_or(0)
+            < files
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the background never wrote L0 up to {files} tables"
+            );
+            std::thread::sleep(pause);
+            pause = (pause * 2).min(std::time::Duration::from_millis(50));
+        }
+    }
+
     #[test]
     fn test_write_stall_slowdown_accumulates_micros() {
         use std::sync::Arc;
@@ -8502,7 +8521,14 @@ mod tests {
         // memtable rolls, and after the 2nd flush L0 hits the
         // slowdown trigger.
         let payload = vec![0xCDu8; 600];
-        for i in 0..128 {
+        for i in 0..64 {
+            let k = format!("k{i:04}");
+            db.put(k.as_bytes(), &payload).unwrap();
+        }
+        // The worker writes the sealed memtables out off the commit path;
+        // the writes after that pay the slowdown.
+        wait_for_l0_files(&db, 2);
+        for i in 64..128 {
             let k = format!("k{i:04}");
             db.put(k.as_bytes(), &payload).unwrap();
         }
@@ -8525,12 +8551,14 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), opts).unwrap();
 
-        // Build up L0 past the slowdown trigger.
+        // Build up L0 past the slowdown trigger. The worker writes the
+        // sealed memtables out off the commit path.
         let payload = vec![0xEFu8; 600];
         for i in 0..64 {
             let k = format!("k{i:04}");
             db.put(k.as_bytes(), &payload).unwrap();
         }
+        wait_for_l0_files(&db, 2);
 
         // A write with `no_slowdown` must now return Busy rather
         // than sleep or block.

@@ -532,10 +532,11 @@ pub(crate) struct RegolithEngine {
     /// takes the WAL fsync off every writer's critical path.
     commit_ring: ArrayQueue<Arc<WriteSlot>>,
     /// Exclusion for the whole write pipeline, and the leader-owned
-    /// staging buffers. Acquiring it *is* becoming the commit leader.
-    /// Administrative operations that rotate the memtable or the WAL
+    /// staging buffers. Acquiring it *is* becoming the commit leader, for one
+    /// group. Administrative operations that rotate the memtable or the WAL
     /// (`compact_range`, `ingest_external_files`, `checkpoint_capture`,
-    /// `drop_all`, `close`) take it blockingly; no follower ever does.
+    /// `drop_all`, `close`) take it blockingly; no follower ever does. A
+    /// rotation seals under it and leaves the flush to the background (E9).
     pipeline: Mutex<Pipeline>,
     /// What writes frozen memtables out, shared with the compaction
     /// workers, which flush on their own (E9) and hold no handle on the
@@ -2782,6 +2783,11 @@ impl RegolithEngine {
         // write_lock` order documented on `run_one_compaction_pass`.
         let _compact_guard = self.compaction_lock.write();
         let _write_guard = self.pipeline.lock();
+        // A flush the background is running took its memtable before the
+        // drop and installs its table after it: held here, it finishes first
+        // and the `Reset` below removes its table, instead of laying it over
+        // the emptied version.
+        let _flushing = self.flusher.flushing.lock();
         self.ensure_writable()?;
 
         // Published before the version `Reset` below, so no reader can
