@@ -182,9 +182,13 @@ impl Error {
     }
 
     /// A copy of `err`, for a failure handed to several callers:
-    /// `io::Error` is not `Clone`. Kind and message are rebuilt, and a typed
-    /// variant the error carries stays that variant.
+    /// `io::Error` is not `Clone`. An OS error keeps its code, a typed
+    /// variant the error carries stays that variant, and anything else keeps
+    /// its kind and message.
     pub(crate) fn clone_io(err: &std::io::Error) -> std::io::Error {
+        if let Some(code) = err.raw_os_error() {
+            return std::io::Error::from_raw_os_error(code);
+        }
         match carried(err) {
             Some(typed) => typed.into_io_error(),
             None => std::io::Error::new(err.kind(), err.to_string()),

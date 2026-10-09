@@ -70,6 +70,16 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
+/// Whether the target has more than one thread at all. A wasm module built
+/// without the `atomics` target feature has exactly one, and
+/// `std::thread::spawn` there reports [`std::io::ErrorKind::Unsupported`]:
+/// nothing another thread would do can happen while the one thread waits.
+/// [`Capabilities::threads`] says whether an [`Env`] spawns threads, which
+/// is a different question: an in-memory env spawns none on a host that has
+/// many.
+pub(crate) const PLATFORM_THREADS: bool =
+    !cfg!(all(target_family = "wasm", not(target_feature = "atomics")));
+
 /// Filesystem, clock, and scheduling for one database.
 ///
 /// An implementation is shared across threads (a compaction worker

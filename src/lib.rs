@@ -1648,6 +1648,13 @@ impl Db {
     /// does not require this wait, and a database closed with snapshots
     /// live is consistent, just not tidy.
     ///
+    /// The timeout is measured on the clock of [`Options::env`]. Where the
+    /// env has no clock the wait is one wait of `timeout`, ended early by
+    /// the last release. On a target with a single thread (wasm without
+    /// the `atomics` feature) nothing can release a pin while this call
+    /// waits, so it returns the count at once without waiting: release the
+    /// snapshots first, then call it.
+    ///
     /// ```
     /// # use std::time::Duration;
     /// # use regolith::{Db, Options};
@@ -8477,6 +8484,25 @@ mod tests {
         assert_eq!(limiter.get_total_bytes_through(Priority::High), 0);
     }
 
+    /// Wait, with a deadline and a bounded backoff, until the background
+    /// has written L0 up to `files` tables.
+    fn wait_for_l0_files(db: &Db, files: u64) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let mut pause = std::time::Duration::from_millis(1);
+        while db
+            .get_int_property("regolith.num-files-at-level0")
+            .unwrap_or(0)
+            < files
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the background never wrote L0 up to {files} tables"
+            );
+            std::thread::sleep(pause);
+            pause = (pause * 2).min(std::time::Duration::from_millis(50));
+        }
+    }
+
     #[test]
     fn test_write_stall_slowdown_accumulates_micros() {
         use std::sync::Arc;
@@ -8502,7 +8528,14 @@ mod tests {
         // memtable rolls, and after the 2nd flush L0 hits the
         // slowdown trigger.
         let payload = vec![0xCDu8; 600];
-        for i in 0..128 {
+        for i in 0..64 {
+            let k = format!("k{i:04}");
+            db.put(k.as_bytes(), &payload).unwrap();
+        }
+        // The worker writes the sealed memtables out off the commit path;
+        // the writes after that pay the slowdown.
+        wait_for_l0_files(&db, 2);
+        for i in 64..128 {
             let k = format!("k{i:04}");
             db.put(k.as_bytes(), &payload).unwrap();
         }
@@ -8525,12 +8558,14 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), opts).unwrap();
 
-        // Build up L0 past the slowdown trigger.
+        // Build up L0 past the slowdown trigger. The worker writes the
+        // sealed memtables out off the commit path.
         let payload = vec![0xEFu8; 600];
         for i in 0..64 {
             let k = format!("k{i:04}");
             db.put(k.as_bytes(), &payload).unwrap();
         }
+        wait_for_l0_files(&db, 2);
 
         // A write with `no_slowdown` must now return Busy rather
         // than sleep or block.
@@ -8561,25 +8596,29 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let db = Arc::new(Db::open(dir.path(), opts).unwrap());
 
-        // Fill L0 to the stop trigger. Writes go through until the
-        // snapshot after the flush shows L0 >= 2; from then on the
-        // next write would block, so we time it carefully with a
-        // spawned thread.
+        // Fill L0 to the stop trigger. Writes go through until two
+        // memtables are sealed; the worker writes them out to L0, and
+        // from then on the next write would block, so we time it
+        // carefully with a spawned thread.
         let payload = vec![0x12u8; 600];
+        let l0 = || {
+            db.get_int_property("regolith.num-files-at-level0")
+                .unwrap_or(0)
+        };
         for i in 0..32 {
             let k = format!("fill{i:04}");
             db.put(k.as_bytes(), &payload).unwrap();
-            if db
-                .get_int_property("regolith.num-files-at-level0")
-                .unwrap_or(0)
-                >= 2
-            {
+            if l0() + db.engine.frozen_memtables() as u64 >= 2 {
                 break;
             }
         }
-        let l0 = db
-            .get_int_property("regolith.num-files-at-level0")
-            .unwrap_or(0);
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let mut pause = Duration::from_millis(1);
+        while l0() < 2 && Instant::now() < deadline {
+            thread::sleep(pause);
+            pause = (pause * 2).min(Duration::from_millis(50));
+        }
+        let l0 = l0();
         assert!(l0 >= 2, "precondition: need L0 >= 2, got {l0}");
 
         let db_writer = db.clone();

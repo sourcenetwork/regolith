@@ -247,7 +247,7 @@ mod tests {
         };
         engine
             .commit_optimistic(
-                &checks,
+                checks,
                 BTreeMap::new(),
                 ranges,
                 vec![(key_of(b"k"), b"op".to_vec())],

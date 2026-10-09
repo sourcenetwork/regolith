@@ -183,6 +183,53 @@ pub(crate) fn is_timed() -> bool {
     PERF_LEVEL.with(|cell| *cell.borrow()) == PerfLevel::EnableTime
 }
 
+/// Run `f` on this thread for another thread whose level is `level`, and
+/// return what `f` counted apart from this thread's own counters, which are
+/// left as they were.
+///
+/// The leader of a commit group validates each transaction in it on behalf of
+/// the thread that committed it; that thread [`absorb`]s the counts, so the
+/// work lands where the module docs say it does, on the originating thread.
+pub(crate) fn on_behalf<T>(level: PerfLevel, f: impl FnOnce() -> T) -> (T, PerfContextSnapshot) {
+    /// Puts this thread's own level and counters back, on unwind too.
+    struct Restore {
+        level: PerfLevel,
+        state: PerfContextSnapshot,
+    }
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            PERF_STATE.with(|cell| *cell.borrow_mut() = self.state);
+            PerfContext::set_level(self.level);
+        }
+    }
+    let restore = Restore {
+        level: PerfContext::set_level(level),
+        state: PERF_STATE.with(|cell| std::mem::take(&mut *cell.borrow_mut())),
+    };
+    let out = f();
+    let counted = PerfContext::capture();
+    drop(restore);
+    (out, counted)
+}
+
+/// Add what another thread counted on this thread's behalf (see
+/// [`on_behalf`]) to this thread's counters.
+pub(crate) fn absorb(counted: &PerfContextSnapshot) {
+    PERF_STATE.with(|cell| {
+        let mut s = cell.borrow_mut();
+        s.get_count += counted.get_count;
+        s.get_from_memtable_time_nanos += counted.get_from_memtable_time_nanos;
+        s.get_from_output_files_time_nanos += counted.get_from_output_files_time_nanos;
+        s.write_count += counted.write_count;
+        s.write_wal_time_nanos += counted.write_wal_time_nanos;
+        s.write_memtable_time_nanos += counted.write_memtable_time_nanos;
+        s.block_cache_lookup_count += counted.block_cache_lookup_count;
+        s.block_cache_hit_count += counted.block_cache_hit_count;
+        s.bloom_check_count += counted.bloom_check_count;
+        s.bloom_useful_count += counted.bloom_useful_count;
+    });
+}
+
 /// Bump the "Db::get" call counter. No-op when perf is off.
 #[inline]
 pub(crate) fn record_get_call() {
@@ -351,6 +398,39 @@ mod tests {
             "expected at least 1 ms of WAL time, got {}",
             snap.write_wal_time_nanos
         );
+        PerfContext::set_level(PerfLevel::Disable);
+    }
+
+    /// Work done for another thread is counted at that thread's level, apart
+    /// from this thread's own counters, which come back untouched, and the
+    /// other thread adds it to its own.
+    #[test]
+    fn work_done_on_behalf_of_another_thread_lands_on_that_thread() {
+        PerfContext::set_level(PerfLevel::Disable);
+        PerfContext::reset();
+        let (out, counted) = on_behalf(PerfLevel::EnableCount, || {
+            record_block_cache_lookup(true);
+            record_bloom_check(false);
+            7
+        });
+        assert_eq!(out, 7);
+        assert_eq!(counted.block_cache_lookup_count, 1);
+        assert_eq!(counted.block_cache_hit_count, 1);
+        assert_eq!(counted.bloom_check_count, 1);
+        assert_eq!(PerfContext::level(), PerfLevel::Disable);
+        assert_eq!(PerfContext::capture(), PerfContextSnapshot::default());
+
+        PerfContext::set_level(PerfLevel::EnableCount);
+        PerfContext::reset();
+        record_get_call();
+        let (_, nothing) = on_behalf(PerfLevel::Disable, record_get_call);
+        assert_eq!(nothing, PerfContextSnapshot::default());
+        assert_eq!(PerfContext::capture().get_count, 1, "own counters kept");
+        absorb(&counted);
+        let snap = PerfContext::capture();
+        assert_eq!(snap.get_count, 1);
+        assert_eq!(snap.block_cache_lookup_count, 1);
+        assert_eq!(snap.bloom_check_count, 1);
         PerfContext::set_level(PerfLevel::Disable);
     }
 
