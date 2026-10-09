@@ -368,3 +368,152 @@ fn a_hook_that_ran_inside_a_failed_callback_runs_again() {
         Some(&b"wrote"[..])
     );
 }
+
+/// The transaction is poisoned once a callback panics, whether or not the
+/// callback that met the panic passed it on.
+fn assert_poisoned(mut txn: Transaction, log: &Log, fixture: &Fixture) {
+    for _ in 0..2 {
+        assert!(
+            matches!(
+                txn.prepare(),
+                Err(TransactionError::Engine(Error::CallbackPanicked {
+                    latched: false,
+                    ..
+                }))
+            ),
+            "a later prepare must fail"
+        );
+    }
+    let result = txn.commit();
+    assert!(
+        matches!(
+            result,
+            Err(TransactionError::Engine(Error::CallbackPanicked {
+                latched: false,
+                ..
+            }))
+        ),
+        "{result:?}"
+    );
+    assert_eq!(
+        entries(log),
+        ["abort:panicked"],
+        "on_abort, once, and no on_commit"
+    );
+    assert_eq!(fixture.db().get(b"k").unwrap(), None, "nothing committed");
+}
+
+fn register_outcomes(txn: &mut Transaction, log: &Log) {
+    let l = Arc::clone(log);
+    txn.on_abort(move |why| {
+        note(
+            &l,
+            if matches!(why, AbortReason::CallbackPanicked) {
+                "abort:panicked"
+            } else {
+                "abort:other"
+            },
+        )
+    });
+    let l = Arc::clone(log);
+    txn.on_commit(move |_| note(&l, "commit"));
+    txn.put(b"k", b"v").unwrap();
+}
+
+#[test]
+fn a_panic_a_callback_ignored_still_poisons_the_transaction() {
+    for fixture in Fixture::both() {
+        let log = Log::default();
+        let mut txn = fixture.begin();
+        register_outcomes(&mut txn, &log);
+        txn.before_commit(move |txn| {
+            txn.before_commit(|_| panic!("injected"));
+            // The nested prepare reports the panic and this callback drops it.
+            let _ = txn.prepare();
+            Ok(())
+        });
+        let first = txn.prepare();
+        assert!(
+            matches!(
+                first,
+                Err(TransactionError::Engine(Error::CallbackPanicked {
+                    latched: false,
+                    ..
+                }))
+            ),
+            "{first:?}"
+        );
+        assert_poisoned(txn, &log, &fixture);
+    }
+}
+
+#[test]
+fn a_panic_ignored_two_levels_up_poisons_the_commit_too() {
+    for fixture in Fixture::both() {
+        let log = Log::default();
+        let mut txn = fixture.begin();
+        register_outcomes(&mut txn, &log);
+        txn.before_commit(move |txn| {
+            txn.before_commit(move |txn| {
+                txn.before_commit(|_| panic!("injected"));
+                let _ = txn.prepare();
+                Ok(())
+            });
+            let _ = txn.prepare();
+            Ok(())
+        });
+        // No `prepare` of its own: the commit is the first to meet it.
+        let result = txn.commit();
+        assert!(
+            matches!(
+                result,
+                Err(TransactionError::Engine(Error::CallbackPanicked {
+                    latched: false,
+                    ..
+                }))
+            ),
+            "{result:?}"
+        );
+        assert_eq!(entries(&log), ["abort:panicked"]);
+        assert_eq!(fixture.db().get(b"k").unwrap(), None);
+    }
+}
+
+struct PanicsBeforeCommit;
+
+impl TransactionHooks for PanicsBeforeCommit {
+    fn before_commit(&self, _: &mut Transaction) -> TxResult<()> {
+        panic!("injected hook panic");
+    }
+}
+
+#[test]
+fn a_hook_panic_a_callback_ignored_poisons_the_transaction() {
+    let dir = TempDir::new().unwrap();
+    let db = OptimisticTransactionDb::open(
+        dir.path(),
+        Options::default().transaction_hooks(Arc::new(PanicsBeforeCommit)),
+    )
+    .unwrap();
+    let log = Log::default();
+    let mut txn = db.begin(&TxnOptions::new());
+    register_outcomes(&mut txn, &log);
+    txn.before_commit(move |txn| {
+        // The hook has not run, so the nested prepare runs it, and it panics.
+        let _ = txn.prepare();
+        Ok(())
+    });
+    let result = txn.commit();
+    assert!(
+        matches!(
+            result,
+            Err(TransactionError::Engine(Error::CallbackPanicked {
+                latched: false,
+                ..
+            }))
+        ),
+        "{result:?}"
+    );
+    assert_eq!(entries(&log), ["abort:panicked"]);
+    assert_eq!(db.db().get(b"k").unwrap(), None);
+}

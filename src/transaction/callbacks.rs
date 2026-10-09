@@ -27,6 +27,11 @@
 //!   place, and runs again at the next `prepare`. After the
 //!   outcome a panic is caught and reported to
 //!   [`crate::EventListener::on_callback_panic`], and the outcome stands.
+//! - A panic before the outcome poisons the transaction, wherever it happened
+//!   and whether or not a callback that met it passed it on: every later
+//!   `prepare` and the commit fail with [`Error::CallbackPanicked`] (not
+//!   latched), and the `on_abort` callbacks see
+//!   [`AbortReason::CallbackPanicked`].
 //! - No lock. The `on_abort` callbacks are handed from the owner to whichever
 //!   thread ends the transaction through a lock-free list, and a callback
 //!   that is still running keeps its own `on_abort` registrations apart until
@@ -165,10 +170,17 @@ pub(super) type OnAbort = Box<dyn FnOnce(&AbortReason<'_>) + Send>;
 /// this transaction's and the transaction is lost, not the database.
 fn caught<T>(callback: &'static str, f: impl FnOnce() -> T) -> Result<T, Error> {
     let _mode = InCommit::enter();
-    contain(callback, f).map_err(|_| Error::CallbackPanicked {
+    contain(callback, f).map_err(|_| panicked(callback))
+}
+
+/// What a panic in a transaction callback is reported as, by the call that met
+/// it and by every `prepare` and the commit after it: not latched, since these
+/// callbacks run before the commit enters the ordered step.
+fn panicked(callback: &'static str) -> Error {
+    Error::CallbackPanicked {
         callback,
         latched: false,
-    })
+    }
 }
 
 /// Run a callback after the outcome is decided: a panic cannot change the
@@ -336,7 +348,10 @@ impl Transaction {
     /// queued, ahead of the ones behind it, so a second call runs it again and
     /// then them. An error from the hook leaves the hook to run again. A
     /// callback that panics returns [`Error::CallbackPanicked`], and so does
-    /// every later call: the transaction can only be rolled back.
+    /// every later call and the commit: the transaction can only be rolled
+    /// back, and its `on_abort` callbacks see [`AbortReason::CallbackPanicked`].
+    /// That holds when the panic happened inside another callback's `prepare`
+    /// and that callback ignored the error: its own run then fails too.
     ///
     /// A callback that calls `prepare` on the transaction it was handed runs
     /// the callbacks queued behind it, and the hook if it has not run, inside
@@ -345,11 +360,7 @@ impl Transaction {
     /// when the transaction ends.
     pub fn prepare(&mut self) -> TxResult<()> {
         if let Prepare::Panicked(callback) = self.prepare_state {
-            return Err(Error::CallbackPanicked {
-                callback,
-                latched: false,
-            }
-            .into());
+            return Err(panicked(callback).into());
         }
         self.run_before_commit()?;
         if matches!(self.prepare_state, Prepare::Pending)
@@ -404,10 +415,15 @@ impl Transaction {
         let outcome = caught(callback, || run(self));
         self.callbacks.running -= 1;
         let error = match outcome {
-            Ok(Ok(())) => {
-                self.publish_on_abort();
-                return Ok(());
-            }
+            Ok(Ok(())) => match self.prepare_state {
+                // A callback run inside this one panicked and this one passed
+                // over the error: the transaction is poisoned all the same.
+                Prepare::Panicked(callback) => panicked(callback).into(),
+                _ => {
+                    self.publish_on_abort();
+                    return Ok(());
+                }
+            },
             Ok(Err(error)) => error,
             Err(panicked) => {
                 self.prepare_state = Prepare::Panicked(callback);
