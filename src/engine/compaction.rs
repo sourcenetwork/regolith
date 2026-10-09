@@ -1778,6 +1778,7 @@ impl<'a> StreamingCompactionWriter<'a> {
                 largest_key,
                 file_size,
                 num_entries,
+                global_seq: None,
             },
             reader,
         );
@@ -1877,6 +1878,7 @@ impl<'a> StreamingCompactionWriter<'a> {
                 largest_key: summary.largest_user_key,
                 file_size,
                 num_entries: summary.num_entries,
+                global_seq: None,
             },
             reader,
         );

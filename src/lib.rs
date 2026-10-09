@@ -1568,22 +1568,25 @@ impl Db {
     }
 
     /// Bulk-ingest one or more externally-built SSTable files. Each
-    /// file must have been produced by [`SstFileWriter`]; on success
-    /// every ingested file is placed at the appropriate level and its
-    /// keys become visible to new reads and iterators. See
-    /// [`IngestOptions`] for the snapshot-consistency and placement
-    /// rules.
+    /// file must have been produced by [`SstFileWriter`], or hold at most
+    /// one entry per key as it does; a file holding a key twice is
+    /// refused. On success every ingested file is placed at the
+    /// appropriate level and its keys become visible to new reads and
+    /// iterators. See [`IngestOptions`] for the snapshot-consistency,
+    /// placement and move rules.
     ///
-    /// The source files are left untouched on disk - the engine
-    /// re-emits each file into the database's own SSTable directory
-    /// so it can rewrite entry sequence numbers. Callers may delete
-    /// the source files or re-ingest them at any time.
-    ///
-    /// The call waits for any flush already in progress, and writes wait
-    /// while each file is rewritten and installed, so the ingested entries
-    /// order after every write acknowledged before the call and before
-    /// every write acknowledged after it, and no snapshot sees them appear
-    /// under it.
+    /// Each file takes a fresh sequence number, and every entry in it
+    /// reads at that sequence. The file is not rewritten: it is copied
+    /// into the database's own SSTable directory, or linked when
+    /// [`IngestOptions::move_files`] is set, with no lock held, so writers
+    /// never wait for the copy. They wait only for the flush of a memtable
+    /// holding a key of the file's range, when there is one, and for the
+    /// manifest edit that installs the file. So the ingested entries order
+    /// after every write acknowledged before the call and before every
+    /// write acknowledged after it, no snapshot sees them appear under it,
+    /// and a write running alongside the call orders on one side of it.
+    /// Files are installed one at a time, each at its own sequence; an
+    /// error leaves the files before it installed.
     pub fn ingest_external_files(
         &self,
         files: &[std::path::PathBuf],

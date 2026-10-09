@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 
 use tempfile::TempDir;
 
-use crate::engine::after_next_ingest_seq;
+use crate::engine::ingest::after_next_ingest_seq;
 use crate::portability::Ordering;
 use crate::{
     Db, IngestOptions, IsolationLevel, OptimisticTransactionDb, Options, SstFileWriter,

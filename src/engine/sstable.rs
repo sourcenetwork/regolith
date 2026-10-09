@@ -78,6 +78,7 @@ use crate::DbSlice;
 use crate::env::{BufferedWriter, Env, ReadFile, WriteMode};
 use crate::options::{CompressionType, PrefixExtractor};
 
+mod global_seq;
 mod key_walk;
 #[cfg(test)]
 mod size_limit_tests;
@@ -309,6 +310,11 @@ pub(crate) struct SsTableMeta {
     pub(crate) largest_key: Vec<u8>,
     pub(crate) file_size: u64,
     pub(crate) num_entries: u64,
+    /// The sequence every entry of an ingested table reads at, whatever
+    /// sequence the file stores (D48). `None` for a table regolith wrote,
+    /// whose entries carry their own. A compaction rewrites an ingested
+    /// table's entries at this sequence, so its outputs have `None`.
+    pub(crate) global_seq: Option<u64>,
 }
 
 /// A live SSTable: metadata plus an already-opened reader. Held by
@@ -326,7 +332,14 @@ pub(crate) struct LiveSst {
 }
 
 impl LiveSst {
+    /// Pair a table's metadata with its reader. The reader must read at the
+    /// sequence the metadata records, which is why both come from the one
+    /// [`SsTableMeta::global_seq`].
     pub(crate) fn new(meta: SsTableMeta, reader: Arc<SsTableReader>) -> Arc<Self> {
+        debug_assert_eq!(
+            meta.global_seq, reader.global_seq,
+            "a table's reader reads at the sequence its metadata records"
+        );
         Arc::new(Self { meta, reader })
     }
 }
@@ -1074,6 +1087,9 @@ pub(crate) struct SsTableReader {
     /// entries; each entry's `handle` points to a leaf sub-block read
     /// via [`SsTableReader::read_index_leaf`].
     partitioned: bool,
+    /// The sequence every entry reads at, for an ingested table. See the
+    /// `global_seq` module for the seams that apply it.
+    global_seq: Option<u64>,
     /// Number of index leaves actually read from disk, i.e. block-cache
     /// misses. Cached leaf hits do not count.
     #[cfg(test)]
@@ -1236,9 +1252,56 @@ impl SsTableReader {
             filter_fallback: OnceLock::new(),
             range_tombstones: RangeTombstoneSet::from_vec(range_tombstones),
             partitioned,
+            global_seq: None,
             #[cfg(test)]
             index_leaf_reads: AtomicUsize::new(0),
         })
+    }
+
+    /// This reader, reading every entry and range tombstone of the file at
+    /// `seq` from now on (an ingested table), or at the sequences the file
+    /// stores (`None`).
+    ///
+    /// Bind before the first data block is read under this reader's file
+    /// id: a block is rebuilt at the sequence as it enters the block cache,
+    /// so one cached before the bind would be served at the stored
+    /// sequences. The file must hold at most one entry per user key.
+    pub(crate) fn with_global_seq(mut self, seq: Option<u64>) -> Self {
+        if let Some(seq) = seq {
+            self.range_tombstones = RangeTombstoneSet::from_vec(global_seq::tombstones_at(
+                self.range_tombstones.as_slice(),
+                seq,
+            ));
+        }
+        self.global_seq = seq;
+        self
+    }
+
+    /// This reader under another file id, the one the block cache keys its
+    /// blocks by from now on. An ingest validates a file under a probe id
+    /// and installs it under the id it allocated, without reading the
+    /// index and filter a second time.
+    pub(crate) fn rebind(mut self, file_id: u64) -> Self {
+        self.file_id = file_id;
+        self
+    }
+
+    /// Whether every entry of this table is newer than `snapshot_seq`, so
+    /// a lookup at that snapshot finds nothing here without reading it.
+    fn hidden_at(&self, snapshot_seq: u64) -> bool {
+        self.global_seq.is_some_and(|seq| seq > snapshot_seq)
+    }
+
+    /// Where an index seek for `target` lands among `index`'s entries,
+    /// steered for an ingested table (see `global_seq::steer`).
+    fn index_seek(&self, index: &IndexBlock, target: &[u8]) -> usize {
+        match self
+            .global_seq
+            .and_then(|seq| global_seq::steer(target, seq))
+        {
+            Some((user_key, trailer)) => index.seek_split(user_key, &trailer),
+            None => index.seek(target),
+        }
     }
 
     /// Bytes this reader holds outside the block cache's budget: its
@@ -1447,7 +1510,7 @@ impl SsTableReader {
         cache: &BlockCache,
     ) -> io::Result<Option<SsTableBlockCursor>> {
         let index = self.index(cache)?;
-        let mut leaf_idx = index.seek(target);
+        let mut leaf_idx = self.index_seek(&index, target);
         if leaf_idx >= index.len() {
             return Ok(None);
         }
@@ -1460,7 +1523,7 @@ impl SsTableReader {
                 break;
             };
             let leaf = self.read_index_leaf(handle, cache)?;
-            let entry_idx = leaf.seek(target);
+            let entry_idx = self.index_seek(&leaf, target);
             if let Some(cursor) = self.cursor_from_leaf(leaf_idx, entry_idx, leaf) {
                 return Ok(Some(cursor));
             }
@@ -1694,6 +1757,9 @@ impl SsTableReader {
         cache: &BlockCache,
         limit: Option<usize>,
     ) -> io::Result<Option<Arc<Block>>> {
+        if self.hidden_at(lk.snapshot_seq()) {
+            return Ok(None);
+        }
         if !self.filter(cache)?.may_contain(lk.prefixed_user_key()) {
             cache.record_bloom_useful();
             return Ok(None);
@@ -2001,7 +2067,11 @@ impl SsTableReader {
             }
         };
 
-        let block = Arc::new(Block::decode_data_block(raw_data)?);
+        let block = Block::decode_data_block(raw_data)?;
+        let block = Arc::new(match self.global_seq {
+            Some(seq) => global_seq::rebuild(&block, seq),
+            None => block,
+        });
         cache.insert(self.file_id, handle.offset, Arc::clone(&block));
         Ok(block)
     }
@@ -2601,6 +2671,7 @@ mod tests {
             filter_fallback: OnceLock::new(),
             range_tombstones: RangeTombstoneSet::default(),
             partitioned: false,
+            global_seq: None,
             index_leaf_reads: AtomicUsize::new(0),
         };
         let cache = BlockCache::new(1024);

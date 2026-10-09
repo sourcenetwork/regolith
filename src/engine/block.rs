@@ -96,6 +96,22 @@ impl Block {
         })
     }
 
+    /// The block a builder holds, decoded without the validation
+    /// [`Block::decode_data_block`] runs: the builder wrote every entry and
+    /// restart itself, so they are well formed by construction.
+    ///
+    /// Shrunk to its length, because the block cache charges a block by
+    /// its capacity and a data-block size limit is checked against it.
+    pub(crate) fn from_builder(builder: BlockBuilder) -> Self {
+        let (mut data, restarts, entries_end) = builder.finish_parts();
+        data.shrink_to_fit();
+        Self {
+            data,
+            restarts,
+            entries_end,
+        }
+    }
+
     /// Approximate heap bytes held by this block. Used by the
     /// block cache to charge accurate sizes against its capacity
     /// budget. Includes the backing `Vec` allocations plus the
@@ -316,17 +332,26 @@ impl BlockBuilder {
         self.buffer.extend_from_slice(&key[shared..]);
         self.buffer.extend_from_slice(value);
 
-        self.last_key = key.to_vec();
+        // Reuses the buffer's capacity: one allocation per block rather than
+        // one per entry.
+        self.last_key.clear();
+        self.last_key.extend_from_slice(key);
         self.entry_count += 1;
     }
 
-    pub(crate) fn finish(mut self) -> Vec<u8> {
+    pub(crate) fn finish(self) -> Vec<u8> {
+        self.finish_parts().0
+    }
+
+    /// The encoded block, its restart offsets and where its entries end.
+    fn finish_parts(mut self) -> (Vec<u8>, Vec<u32>, usize) {
+        let entries_end = self.buffer.len();
         for restart in &self.restarts {
             self.buffer.extend_from_slice(&restart.to_le_bytes());
         }
         self.buffer
             .extend_from_slice(&(self.restarts.len() as u32).to_le_bytes());
-        self.buffer
+        (self.buffer, self.restarts, entries_end)
     }
 
     pub(crate) fn estimated_size(&self) -> usize {

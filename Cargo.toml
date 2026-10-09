@@ -217,3 +217,7 @@ harness = false
 [[bench]]
 name = "sync"
 harness = false
+
+[[bench]]
+name = "ingest"
+harness = false
