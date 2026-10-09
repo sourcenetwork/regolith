@@ -151,6 +151,7 @@ pub mod loom_exports {
     pub use crate::engine::loom_model::{
         arena, families, handoff, io_queue, skiplist, slice, version,
     };
+    pub use crate::env::open_file_limit::loom_model as open_files;
 }
 
 #[cfg(feature = "fuzzing")]

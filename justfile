@@ -289,7 +289,14 @@ loom-sync:
 loom-io:
     RUSTFLAGS="--cfg loom" cargo test --release --test loom_io_queue
 
-loom-all: loom loom-debug loom-sync loom-io
+# Loom models for the open-file slot table (acquire, evict, release, drain)
+# and the column-family registry (create, drop and use racing in the
+# ordered step), with three calibrations that must fail. Release, like
+# `loom-io`.
+loom-tables:
+    RUSTFLAGS="--cfg loom" cargo test --release --test loom_tables
+
+loom-all: loom loom-debug loom-sync loom-io loom-tables
 
 # The read-view chaos workload at full size: 6 instances x 2 rounds x 400
 # versions. Measured at over 20 minutes wall and 4h of CPU unoptimized,
