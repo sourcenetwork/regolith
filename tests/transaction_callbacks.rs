@@ -714,7 +714,7 @@ fn a_failing_callbacks_appends_are_taken_back_with_its_writes() {
 fn panicked_in(callback: &str, result: &TxResult<CommitReceipt>) -> bool {
     matches!(
         result,
-        Err(TransactionError::Engine(Error::CallbackPanicked { callback: named })) if *named == callback
+        Err(TransactionError::Engine(Error::CallbackPanicked { callback: named, latched: false })) if *named == callback
     )
 }
 
@@ -791,6 +791,11 @@ fn after_prepare_panics_the_transaction_can_only_fail() {
             "{level:?}: {result:?}"
         );
         assert_eq!(fixture.db().get(b"k").unwrap(), None);
+        let message = result.unwrap_err().to_string();
+        assert!(
+            !message.contains("read-only"),
+            "a panic in before_commit does not latch the database: {message}"
+        );
     });
 }
 

@@ -191,7 +191,7 @@ impl RegolithEngine {
         match callback::contain("MergeOperator", f) {
             Ok(result) => result,
             Err(err) => {
-                if let crate::Error::CallbackPanicked { callback } = &err {
+                if let crate::Error::CallbackPanicked { callback, .. } = &err {
                     self.latch_callback_panic(callback);
                 }
                 Err(err.into_io_error())

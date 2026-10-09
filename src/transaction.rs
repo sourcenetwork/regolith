@@ -1421,7 +1421,7 @@ impl Transaction {
     /// does.
     fn contain_classifier<T>(&self, f: impl FnOnce() -> T) -> TxResult<T> {
         callback::contain("KeyClassifier", f).map_err(|err| {
-            if let Error::CallbackPanicked { callback } = err {
+            if let Error::CallbackPanicked { callback, .. } = err {
                 self.engine.latch_callback_panic(callback);
             }
             TransactionError::Engine(err)

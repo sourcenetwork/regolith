@@ -54,18 +54,28 @@ pub enum Error {
     ContentMismatch,
     /// Code the caller supplied panicked while a commit ran it: an
     /// implementation of the trait named by `callback`, such as
-    /// [`crate::KeyClassifier`]. The panic was caught and the commit applied
-    /// nothing. The commit's shared state can no longer be vouched for, so the
-    /// database is read-only until it is reopened, and every later write
-    /// fails with this error too. A panic outside a commit unwinds into the
-    /// call that ran it and nothing else.
+    /// [`crate::KeyClassifier`], or a `before_commit` callback. The panic was
+    /// caught and the commit applied nothing.
+    ///
+    /// When `latched` is true the panic was in the commit's ordered step,
+    /// whose shared state can no longer be vouched for: the database is
+    /// read-only until it is reopened, and every later write fails with this
+    /// error too. When it is false (a [`crate::Transaction::before_commit`]
+    /// callback or a [`crate::TransactionHooks::before_commit`]) the panic
+    /// failed that transaction only, the database stays writable, and the
+    /// transaction can only be rolled back. A panic outside a commit unwinds
+    /// into the call that ran it and nothing else.
     #[error(
-        "the {callback} you provided panicked while committing, so the database is read-only \
-         until it is reopened"
+        "the {callback} you provided panicked while committing{}",
+        if *.latched { "; the database is read-only until it is reopened" } else { "" }
     )]
     CallbackPanicked {
-        /// The trait the panicking code implements, such as `KeyClassifier`.
+        /// The trait the panicking code implements, such as `KeyClassifier`,
+        /// or `before_commit`.
         callback: &'static str,
+        /// Whether the panic left the database read-only until it is
+        /// reopened.
+        latched: bool,
     },
     /// A write was stalled behind background work (a flush or a
     /// compaction) whose most recent attempt failed, so waiting would not
@@ -153,7 +163,10 @@ fn carried(err: &std::io::Error) -> Option<Error> {
         Error::ReadOnly => Some(Error::ReadOnly),
         Error::Busy(reason) => Some(Error::Busy(reason)),
         Error::ContentMismatch => Some(Error::ContentMismatch),
-        Error::CallbackPanicked { callback } => Some(Error::CallbackPanicked { callback }),
+        Error::CallbackPanicked { callback, latched } => Some(Error::CallbackPanicked {
+            callback,
+            latched: *latched,
+        }),
         _ => None,
     }
 }
@@ -163,7 +176,7 @@ impl Error {
     /// if it carries one.
     pub(crate) fn callback_panic_of(err: &std::io::Error) -> Option<&'static str> {
         match carried(err)? {
-            Error::CallbackPanicked { callback } => Some(callback),
+            Error::CallbackPanicked { callback, .. } => Some(callback),
             _ => None,
         }
     }
@@ -233,6 +246,11 @@ mod tests {
             Error::ContentMismatch,
             Error::CallbackPanicked {
                 callback: "KeyClassifier",
+                latched: true,
+            },
+            Error::CallbackPanicked {
+                callback: "before_commit",
+                latched: false,
             },
             Error::DataBlockLimitExceeded {
                 max_data_block_bytes: 4096,
@@ -256,6 +274,11 @@ mod tests {
             Error::ContentMismatch,
             Error::CallbackPanicked {
                 callback: "EventListener",
+                latched: true,
+            },
+            Error::CallbackPanicked {
+                callback: "before_commit",
+                latched: false,
             },
         ] {
             let text = typed.to_string();
@@ -269,6 +292,7 @@ mod tests {
     fn a_callback_panic_is_named_through_an_io_error() {
         let err = Error::CallbackPanicked {
             callback: "RateLimiter",
+            latched: true,
         }
         .into_io_error();
         assert_eq!(Error::callback_panic_of(&err), Some("RateLimiter"));
@@ -278,6 +302,47 @@ mod tests {
         );
         let plain = std::io::Error::other("not typed");
         assert_eq!(Error::callback_panic_of(&plain), None);
+    }
+
+    #[test]
+    fn only_a_panic_that_latched_the_database_says_it_is_read_only() {
+        let latched = Error::CallbackPanicked {
+            callback: "KeyClassifier",
+            latched: true,
+        };
+        assert_eq!(
+            latched.to_string(),
+            "the KeyClassifier you provided panicked while committing; the database is \
+             read-only until it is reopened"
+        );
+        let loose = Error::CallbackPanicked {
+            callback: "before_commit",
+            latched: false,
+        };
+        assert_eq!(
+            loose.to_string(),
+            "the before_commit you provided panicked while committing"
+        );
+    }
+
+    #[test]
+    fn a_panic_keeps_whether_it_latched_through_an_io_error() {
+        for latched in [true, false] {
+            let io = Error::CallbackPanicked {
+                callback: "before_commit",
+                latched,
+            }
+            .into_io_error();
+            let copy = Error::clone_io(&io);
+            assert!(matches!(
+                Error::from(copy),
+                Error::CallbackPanicked { latched: l, .. } if l == latched
+            ));
+            assert!(matches!(
+                Error::from(io),
+                Error::CallbackPanicked { latched: l, .. } if l == latched
+            ));
+        }
     }
 
     #[test]

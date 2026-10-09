@@ -121,7 +121,7 @@ impl CommitInfo {
 /// must not block, panic or re-enter the database; a panic is caught and
 /// reported to [`crate::EventListener::on_callback_panic`], and the outcome
 /// stands. A panic in `before_commit` fails the commit with
-/// [`Error::CallbackPanicked`].
+/// [`Error::CallbackPanicked`], not latched: the database stays writable.
 ///
 /// A database with hooks tracks every transaction it begins, so that
 /// [`crate::Db::close`] can run `on_abort` for the ones still open: that costs
@@ -160,10 +160,15 @@ pub(super) type OnAbort = Box<dyn FnOnce(&AbortReason<'_>) + Send>;
 ///
 /// The commit's containment (`engine::callback`), switched on for this call:
 /// the same catch and the same error as a caller's trait that panics inside
-/// the ordered step.
+/// the ordered step, except that it is not latched. These callbacks run
+/// before the commit enters the ordered step, so what they leave half done is
+/// this transaction's and the transaction is lost, not the database.
 fn caught<T>(callback: &'static str, f: impl FnOnce() -> T) -> Result<T, Error> {
     let _mode = InCommit::enter();
-    contain(callback, f)
+    contain(callback, f).map_err(|_| Error::CallbackPanicked {
+        callback,
+        latched: false,
+    })
 }
 
 /// Run a callback after the outcome is decided: a panic cannot change the
@@ -337,7 +342,11 @@ impl Transaction {
     /// when the transaction ends.
     pub fn prepare(&mut self) -> TxResult<()> {
         if let Prepare::Panicked(callback) = self.prepare_state {
-            return Err(Error::CallbackPanicked { callback }.into());
+            return Err(Error::CallbackPanicked {
+                callback,
+                latched: false,
+            }
+            .into());
         }
         self.run_before_commit()?;
         if matches!(self.prepare_state, Prepare::Pending)

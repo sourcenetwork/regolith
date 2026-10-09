@@ -42,7 +42,7 @@ fn begin(db: &OptimisticTransactionDb) -> Transaction {
 fn panicked<T>(callback: &str, result: &TxResult<T>) -> bool {
     matches!(
         result,
-        Err(TransactionError::Engine(Error::CallbackPanicked { callback: named })) if *named == callback
+        Err(TransactionError::Engine(Error::CallbackPanicked { callback: named, latched: true })) if *named == callback
     )
 }
 
@@ -64,10 +64,18 @@ fn a_panicking_classifier_fails_the_commit_and_latches_the_database() {
         matches!(
             after,
             Err(Error::CallbackPanicked {
-                callback: "KeyClassifier"
+                callback: "KeyClassifier",
+                latched: true
             })
         ),
         "{after:?}"
+    );
+    assert!(
+        after
+            .unwrap_err()
+            .to_string()
+            .contains("read-only until it is reopened"),
+        "a latched panic says the database is read-only"
     );
     let other = begin(&db);
     other.put(b"elsewhere", b"v").unwrap();
@@ -158,13 +166,13 @@ fn assert_the_rotating_write_latches(dir: &Path, options: Options, callback: &st
     let db = Db::open(dir, options).unwrap();
     let (failed_at, err) = write_until_it_fails(&db);
     assert!(
-        matches!(&err, Error::CallbackPanicked { callback: named } if *named == callback),
+        matches!(&err, Error::CallbackPanicked { callback: named, latched: true } if *named == callback),
         "{err:?}"
     );
     assert!(failed_at > 0);
     let later = db.put(b"later", b"v");
     assert!(
-        matches!(&later, Err(Error::CallbackPanicked { callback: named }) if *named == callback),
+        matches!(&later, Err(Error::CallbackPanicked { callback: named, latched: true }) if *named == callback),
         "{later:?}"
     );
     assert_eq!(db.get(&key(failed_at)).unwrap(), None);

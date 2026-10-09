@@ -51,7 +51,12 @@ pub(crate) fn contain<T>(callback: &'static str, f: impl FnOnce() -> T) -> Resul
     }
     catch_unwind(AssertUnwindSafe(f)).map_err(|_| {
         tracing::error!(callback, "a callback panicked while committing");
-        Error::CallbackPanicked { callback }
+        // Every caller propagates it to the ordered step's boundary, which
+        // latches the database.
+        Error::CallbackPanicked {
+            callback,
+            latched: true,
+        }
     })
 }
 
@@ -66,7 +71,8 @@ mod tests {
         assert!(matches!(
             caught,
             Err(Error::CallbackPanicked {
-                callback: "KeyClassifier"
+                callback: "KeyClassifier",
+                latched: true
             })
         ));
         assert_eq!(contain("KeyClassifier", || 7).unwrap(), 7);

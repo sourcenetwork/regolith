@@ -529,8 +529,9 @@ fn a_panic_in_touches_fails_the_commit_and_latches_the_database() {
     db.db().merge(KEY, &add(1, 1)).unwrap();
     tx.put(b"elsewhere", b"x").unwrap();
     match tx.commit() {
-        Err(TransactionError::Engine(Error::CallbackPanicked { callback })) => {
+        Err(TransactionError::Engine(Error::CallbackPanicked { callback, latched })) => {
             assert_eq!(callback, "MergeOperator");
+            assert!(latched, "a merge operator panic latches the database");
         }
         other => panic!("expected the panic to fail the commit, got {other:?}"),
     }

@@ -937,7 +937,8 @@ fn a_layout_that_panics_in_a_commit_latches_the_database_read_only() {
             matches!(
                 err,
                 TransactionError::Engine(Error::CallbackPanicked {
-                    callback: "LogLayout"
+                    callback: "LogLayout",
+                    latched: true
                 })
             ),
             "{err:?}"

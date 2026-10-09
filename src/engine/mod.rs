@@ -1012,9 +1012,11 @@ impl RegolithEngine {
                 *kind,
                 format!("write-ahead log left in an unknown state: {message}"),
             ),
-            Some(WriteLatch::CallbackPanicked(callback)) => {
-                crate::Error::CallbackPanicked { callback }.into_io_error()
+            Some(WriteLatch::CallbackPanicked(callback)) => crate::Error::CallbackPanicked {
+                callback,
+                latched: true,
             }
+            .into_io_error(),
             None => std::io::Error::other("write-ahead log left in an unknown state"),
         }
     }
