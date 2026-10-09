@@ -14,9 +14,11 @@
 //! - **Bloom filters** for fast negative lookups
 //! - **Level-based compaction** on background worker threads, or inline on a
 //!   target that has none
-//! - **An arena-backed skip list memtable** that readers walk without a lock
-//!   until a range delete lands in it. A block-cache hit is lock-free; a miss
-//!   inserts under its shard's lock
+//! - **Reads that take no lock**: the published view of memtables and tables
+//!   is loaded wait-free, the arena-backed skip list memtable and its range
+//!   tombstones are walked without a lock, and the CLOCK block cache admits,
+//!   evicts and serves blocks by compare-and-swap, never evicting a block a
+//!   reader holds
 //! - **Zero-copy reads** via [`DbSlice`], which borrows the bytes the
 //!   database already holds
 //!
@@ -148,7 +150,9 @@ pub mod loom_exports {
     //! check, and this module is the seam that lets the test target call
     //! them. It does not exist in an ordinary build.
 
-    pub use crate::engine::loom_model::{arena, handoff, io_queue, skiplist, slice, version};
+    pub use crate::engine::loom_model::{
+        arena, handoff, io_queue, skiplist, slice, tombstones, version,
+    };
 }
 
 #[cfg(feature = "fuzzing")]

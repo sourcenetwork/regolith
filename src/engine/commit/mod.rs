@@ -42,7 +42,9 @@ use kovan_queue::array_queue::ArrayQueue;
 use super::callback::InCommit;
 use super::memtable::MemTable;
 use super::wal::{MAX_RECORD_LEN, Wal, check_write_len};
-use super::{CommitOutcome, DurabilityMode, ReadView, RegolithEngine, grouped_batch_ops};
+use super::{
+    CommitOutcome, DurabilityMode, ReadView, RegolithEngine, ViewGuard, grouped_batch_ops,
+};
 use crate::perf_context::{PerfTimer, PerfTimerField};
 use crate::statistics::{Histogram, Ticker};
 use crate::{Access, Conflict, WriteBatchOp};
@@ -773,7 +775,7 @@ impl RegolithEngine {
     ///
     /// Completion happens after [`Self::run_group`] has published the read
     /// horizon (the lost-update fix) and hands the same outcome to every member (G2).
-    fn run_and_complete(&self, pipe: &mut Pipeline, view: Arc<ReadView>) -> io::Result<u64> {
+    fn run_and_complete(&self, pipe: &mut Pipeline, view: ViewGuard<'_>) -> io::Result<u64> {
         let _commit = InCommit::enter();
         let Pipeline {
             stage,
@@ -838,7 +840,7 @@ impl RegolithEngine {
         &self,
         stage: &mut Vec<u8>,
         group: &[GroupTicket],
-        view: Arc<ReadView>,
+        view: ViewGuard<'_>,
         staged: usize,
     ) -> io::Result<u64> {
         // Cleared first, ahead of every early return (`ensure_writable`,
