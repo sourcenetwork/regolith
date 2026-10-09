@@ -543,7 +543,8 @@ pub struct Options {
     /// Stop foreground writes entirely when the number of L0
     /// SSTables reaches this threshold. Writers block on a
     /// condvar that compaction notifies once it reduces the
-    /// count below the slowdown trigger. Plain writes and
+    /// count below the slowdown trigger. Plain writes, column-family
+    /// writes (including creating and dropping a column family) and
     /// transactional commits that carry writes are stopped alike.
     /// `0` disables this trigger. Default: 36.
     ///

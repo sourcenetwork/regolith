@@ -387,8 +387,7 @@ enum Step {
     Pick,
     /// Everything pushed to the bottom.
     Settle,
-    /// A manual compaction of a key range, run only while L0 is empty (see
-    /// the test).
+    /// A manual compaction of a key range.
     Bounded(u16, u16),
 }
 
@@ -406,11 +405,6 @@ fn step() -> impl Strategy<Value = Step> {
 
 fn key(n: u16) -> Vec<u8> {
     format!("k{n:04}").into_bytes()
-}
-
-fn files_at_level(db: &Db, level: usize) -> u64 {
-    db.get_int_property(&format!("regolith.num-files-at-level{level}"))
-        .unwrap()
 }
 
 proptest! {
@@ -454,15 +448,7 @@ proptest! {
                 }
                 Step::Settle => db.compact_range(None, None).unwrap(),
                 Step::Bounded(lo, hi) => {
-                    // A bounded compaction takes the L0 tables that intersect
-                    // its range and no others, so with two or more in L0 it
-                    // can move a newer table down and leave an older one
-                    // above it, shadowing it. That is a defect of its own and
-                    // not what this test is about, so it runs only when the
-                    // flush it starts with makes L0 a single table.
-                    if files_at_level(&db, 0) == 0 {
-                        db.compact_range(Some(&key(lo)), Some(&key(hi))).unwrap();
-                    }
+                    db.compact_range(Some(&key(lo)), Some(&key(hi))).unwrap();
                 }
             }
             prop_assert!(

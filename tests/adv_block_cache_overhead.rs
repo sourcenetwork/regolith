@@ -65,6 +65,24 @@ unsafe impl GlobalAlloc for Counting {
 #[global_allocator]
 static ALLOC: Counting = Counting;
 
+/// Live heap once kovan has freed every node this thread retired.
+///
+/// Reclamation is deferred, and how much of it has happened by the time a
+/// measurement is taken depends on how long the thread has been scheduled,
+/// so an undrained reading moves with machine load. A flush frees what an
+/// earlier epoch retired, so flush until the figure stops falling.
+fn drained_live() -> isize {
+    let mut live = LIVE.load(Ordering::Relaxed);
+    loop {
+        kovan::flush();
+        let now = LIVE.load(Ordering::Relaxed);
+        if now >= live {
+            return now;
+        }
+        live = now;
+    }
+}
+
 const KEYS: u32 = 60_000;
 const DIR_ENV: &str = "REGOLITH_ADV_OVERHEAD_DIR";
 const CACHE_ENV: &str = "REGOLITH_ADV_OVERHEAD_CACHE";
@@ -94,6 +112,10 @@ fn adv_overhead_child() {
             block_cache_size: cache_bytes,
             block_cache_num_shard_bits: 0,
             block_size,
+            // A worker thread can hold a retired node back for as long as it
+            // goes unscheduled, which no flush on this thread can reach, so
+            // the measurement would move with machine load.
+            max_background_compactions: 0,
             statistics: Some(Arc::clone(&stats)),
             ..Options::default()
         },
@@ -104,13 +126,13 @@ fn adv_overhead_child() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(2);
-    let heap_open = LIVE.load(Ordering::Relaxed);
+    let heap_open = drained_live();
     for _ in 0..rounds {
         for i in 0..KEYS {
             assert!(db.get(&key(i)).unwrap().is_some());
         }
     }
-    let heap_warm = LIVE.load(Ordering::Relaxed);
+    let heap_warm = drained_live();
     let usage = db.get_int_property("regolith.block-cache-usage").unwrap();
     let capacity = db
         .get_int_property("regolith.block-cache-capacity")
@@ -263,17 +285,18 @@ charged_per_entry={:.1} over_capacity={} ratio={:.4}",
     );
     // The margin a saturated cache carries over its byte budget: the
     // bookkeeping `ENTRY_OVERHEAD` charges but `usage()` reports outside
-    // the block bytes, plus whatever the map's deferred reclamation has
-    // retired and not yet freed.
+    // the block bytes. The child drains the map's deferred reclamation
+    // before it measures, so a retired node not yet freed does not count
+    // here; the flatness check below is what guards that.
     //
-    // Both are per ENTRY, not per byte, so the margin is set by how many
+    // The margin is per ENTRY, not per byte, so it is set by how many
     // entries a budget holds and therefore by the block size. These two
     // arms bracket it from the wrong end deliberately: 1 KiB blocks are
     // a quarter of the default `block_size` and 256-byte blocks a
     // sixteenth, so a default-configured cache sits well inside the
-    // tighter of the two. Measured 1.25x at 1 KiB and 1.54x at 256
+    // tighter of the two. Measured 1.03x at 1 KiB and 1.07x at 256
     // bytes, against 3.8x and rising if the reclamation is left
-    // undrained, which is what the flatness check below guards.
+    // undrained.
     for (label, real, capacity, ceiling) in [
         ("1 KiB blocks", tight_real, tight.capacity, 18),
         ("256 B blocks", tiny_real, tiny.capacity, 24),
@@ -309,16 +332,15 @@ charged_per_entry={:.1} over_capacity={} ratio={:.4}",
     let extra = churned_real.saturating_sub(tiny_real);
     let per_add = extra as f64 / (churned.adds - tiny.adds).max(1) as f64;
     println!("ADVOVERHEAD retained_per_insert={per_add:.1} bytes");
-    // The rate, not exact flatness. How much the drain keeps up with
-    // depends on how much CPU the process gets: measured 0.2 bytes per
-    // insert on an idle machine and 14.1 with the rest of the suite
-    // running alongside. Undrained it is 144, so a ceiling of 40 keeps
-    // roughly three times the loaded figure in hand and still fails by a
-    // wide margin if the drain stops working.
+    // The rate, not exact flatness. The child drains kovan before each
+    // measurement and runs no compaction worker, so the figure does not
+    // move with machine load: 0.0 bytes per insert idle and with
+    // twice as many busy loops as cores. Undrained it is 144, so a ceiling
+    // of 40 still fails by a wide margin if the drain stops working.
     assert!(
         per_add <= 40.0,
         "the cache retains {per_add:.1} bytes per insert, so resident memory grows with churn \
          rather than with the working set. Undrained this measures 144 bytes per insert, and a \
-         working drain measures under 15 even on a loaded machine"
+         working drain measures under 1"
     );
 }

@@ -1,18 +1,16 @@
 //! Deterministic proof that an ingest orders itself like a flush, and
-//! that ordering it so never makes a write wait for it.
+//! that a write issued while it writes its table lands above it.
 //!
-//! `Db::ingest_external_files` allocates its sequence number and holds
-//! the flush exclusion (`flushing`) from that allocation through its
-//! manifest apply, so a flush of a memtable sealed before the ingest's
-//! critical section always installs before the ingested file, and one
-//! sealed after it always installs after: a memtable that fills while
-//! the ingest writes its table is sealed without a flush, and the ingest
-//! flushes it once its file is installed. Each test forces one
+//! `Db::ingest_external_files` drains every memtable sealed before it
+//! allocates its sequence number, and holds the commit pipeline from that
+//! allocation through its manifest apply, so a flush of a memtable sealed
+//! before the ingest always installs before the ingested file, and a
+//! write issued while the ingest writes its table commits, rotates and
+//! flushes only after the file is installed. Each test forces one
 //! interleaving, named in its doc, with a seam that pauses or fails a
 //! real background write mid-flight, then checks the read that
-//! interleaving gets wrong, the writes that must not wait, and the
-//! reopened sequence counter that the manifest's raised-maximum rule
-//! protects on its own.
+//! interleaving gets wrong and the reopened sequence counter that the
+//! manifest's raised-maximum rule protects on its own.
 #![cfg(not(target_arch = "wasm32"))]
 
 use std::io;
@@ -26,10 +24,7 @@ use regolith::env::{
     Capabilities, DirEntry, Env, FileLock, FileMeta, JoinHandle, ReadFile, StdEnv, WriteFile,
     WriteMode,
 };
-use regolith::{
-    Db, Error, IngestOptions, Options, Priority, RateLimiter, SstFileWriter, WriteBatch,
-    WriteOptions,
-};
+use regolith::{Db, IngestOptions, Options, Priority, RateLimiter, SstFileWriter, WriteBatch};
 use tempfile::TempDir;
 
 /// How long a test lets the fixed engine prove the losing side of the
@@ -38,12 +33,6 @@ use tempfile::TempDir;
 /// on, so nothing can finish first regardless of this value; the
 /// deadline only bounds how long a broken engine gets to hide the bug.
 const RELEASE_DEADLINE: Duration = Duration::from_secs(3);
-
-/// How long a write that must not wait for a paused ingest gets to
-/// return. Generous, because a correct engine makes it wait on nothing:
-/// only this test's thread can release the ingest, so the bound is what
-/// turns a write stuck behind it into a failure instead of a hang.
-const WRITE_DEADLINE: Duration = Duration::from_secs(10);
 
 /// Polls `done` with a bounded backoff (1 ms doubling to a 50 ms cap,
 /// never a fixed sleep in a loop) until it returns true or `deadline`
@@ -370,10 +359,12 @@ fn an_ingest_waits_for_a_flush_of_a_memtable_sealed_before_it() {
 }
 
 /// Interleaving (b): an ingest allocates its sequence and is slow
-/// writing its table while a writer commits above it and a flush of
-/// that write races to install first.
+/// writing its table while a writer commits a newer version of the key
+/// it carries and a flush of that write races the install. The write
+/// cannot commit before the table is installed, so it, and the flush
+/// of it, land above the ingested file.
 #[test]
-fn a_flush_sealed_after_an_ingest_lands_above_the_ingested_file() {
+fn a_write_issued_during_an_ingest_lands_above_the_ingested_file() {
     let dir = TempDir::new().unwrap();
     let staging = TempDir::new().unwrap();
     let env = NthSstOpen::new(dir.path(), 2, 0);
@@ -394,34 +385,23 @@ fn a_flush_sealed_after_an_ingest_lands_above_the_ingested_file() {
     };
     env.wait_paused(Duration::from_secs(60));
 
-    // A commit that does not fill the memtable goes through while the
-    // ingest is paused: the ingest holds `flushing`, not the pipeline.
     let put = {
         let db = Arc::clone(&db);
         std::thread::spawn(move || db.put(b"k", b"v2"))
     };
-    if !wait_finished(&put, WRITE_DEADLINE) {
-        // Unpaused first, so the threads this test started can finish
-        // and the failure is reported instead of a hang.
-        env.release();
-        let _ = b.join();
-        let _ = put.join();
-        panic!("a commit did not complete while the ingest was paused");
-    }
-    put.join().unwrap().unwrap();
-
     let a = {
         let db = Arc::clone(&db);
         std::thread::spawn(move || db.flush())
     };
 
-    release_when_finished_or_after(&a, RELEASE_DEADLINE, || env.release());
-    a.join().unwrap().unwrap();
+    env.release();
     b.join().unwrap().unwrap();
+    put.join().unwrap().unwrap();
+    a.join().unwrap().unwrap();
 
-    // The write acknowledged after the ingest is the newest. Before
-    // the fix, A installs first and the ingested file (overlapping, so
-    // at L0) is installed above it, and this reads "new".
+    // The write issued during the ingest is the newest. Had it committed
+    // and been flushed before the ingested file (overlapping, so at L0)
+    // was installed above it, this would read "new".
     assert_eq!(db.get(b"k").unwrap(), Some(b"v2".to_vec()));
 
     let before = db.latest_sequence();
@@ -512,13 +492,11 @@ fn an_ingest_drains_a_memtable_left_frozen_by_a_failed_flush() {
 }
 
 /// A write that fills the memtable while an ingest writes its table
-/// seals the memtable and returns: the ingest flushes that memtable
-/// once it has installed its own file, so it lands above the file.
-/// Before, the write waited for the flush exclusion while holding the
-/// commit pipeline, and every other write waited behind it until the
-/// ingest installed.
+/// commits once the table is installed, and its rotation flushes the
+/// memtable it seals as any rotation does, so the write lands above the
+/// file and nothing is left frozen.
 #[test]
-fn a_write_that_fills_the_memtable_does_not_wait_for_an_ingest() {
+fn a_write_that_fills_the_memtable_during_an_ingest_lands_above_the_ingested_file() {
     let dir = TempDir::new().unwrap();
     let staging = TempDir::new().unwrap();
     // The first SST open is the flush of `old` below; the second is the
@@ -555,40 +533,16 @@ fn a_write_that_fills_the_memtable_does_not_wait_for_an_ingest() {
             write_past_one_rotation(&db, "f")
         })
     };
-    let writer_done = wait_finished(&writer, WRITE_DEADLINE);
-    let frozen_while_paused = frozen_bytes(&db);
     env.release();
-    let ingested = ingest.join().unwrap();
-    let written = writer.join().unwrap();
+    ingest.join().unwrap().unwrap();
+    writer.join().unwrap().unwrap();
 
-    assert!(
-        writer_done,
-        "a write that filled the memtable did not return while an ingest was writing its table"
-    );
-    written.unwrap();
-    ingested.unwrap();
-    assert!(
-        frozen_while_paused > 0,
-        "the writes never rotated the memtable, so nothing here was exercised"
-    );
-
-    // The ingest flushed that memtable after installing its file:
-    // nothing is left frozen, and `v2`, written after the ingest began,
-    // is the newest version of `k`.
     assert_eq!(
         frozen_bytes(&db),
         0,
-        "the ingest returned with a memtable sealed during it still unflushed"
+        "a rotation during an ingest left its memtable unflushed"
     );
     assert_eq!(db.get(b"k").unwrap(), Some(b"v2".to_vec()));
-
-    // With the ingest done, a rotation flushes its own memtable again.
-    write_past_one_rotation(&db, "g").unwrap();
-    assert_eq!(
-        frozen_bytes(&db),
-        0,
-        "a rotation after the ingest left its memtable unflushed"
-    );
 
     let before = db.latest_sequence();
     drop(db);
@@ -611,98 +565,11 @@ fn a_write_that_fills_the_memtable_does_not_wait_for_an_ingest() {
     assert_eq!(db.get(b"k").unwrap(), Some(b"v2".to_vec()));
 }
 
-/// Memtables sealed while an ingest writes its table wait for that
-/// ingest to flush them, and they count toward
-/// `max_write_buffer_number` like any memtable waiting on a flush:
-/// writes slow and then stop at the limit rather than grow memory for
-/// as long as the ingest runs. With `no_slowdown`, the first write the
-/// limit would slow fails with `Error::Busy` instead.
+/// An ingest that fails after it allocated its sequence lets the writes
+/// issued while it ran commit: they land, a rotation among them flushes
+/// its memtable as usual, and nothing is stranded in memory.
 #[test]
-fn memtables_sealed_during_an_ingest_count_toward_the_write_limit() {
-    let dir = TempDir::new().unwrap();
-    let staging = TempDir::new().unwrap();
-    // Nothing is flushed before the ingest, so its table is the first
-    // SST open.
-    let env = NthSstOpen::new(dir.path(), 1, 0);
-    let opts = Options {
-        env: env.clone(),
-        write_buffer_size: 4 * 1024,
-        max_write_buffer_number: 2,
-        ..Options::default()
-    };
-    let db = Arc::new(Db::open(dir.path(), opts.clone()).unwrap());
-
-    let ingest_path = build_ingest_file(staging.path(), &opts, b"k", b"new");
-    let ingest = {
-        let db = Arc::clone(&db);
-        std::thread::spawn(move || {
-            db.ingest_external_files(&[ingest_path], IngestOptions::default())
-        })
-    };
-    env.wait_paused(Duration::from_secs(60));
-
-    let writer = {
-        let db = Arc::clone(&db);
-        std::thread::spawn(move || {
-            let no_slowdown = WriteOptions {
-                no_slowdown: true,
-                ..WriteOptions::default()
-            };
-            for i in 0..64 {
-                match db.put_opt(&no_slowdown, format!("f{i:02}").as_bytes(), &[0u8; 1024]) {
-                    Ok(()) => {}
-                    Err(Error::Busy(reason)) => return Ok(Some(reason)),
-                    Err(e) => return Err(e),
-                }
-            }
-            Ok(None)
-        })
-    };
-    let writer_done = wait_finished(&writer, WRITE_DEADLINE);
-    let frozen_while_paused = frozen_bytes(&db);
-    env.release();
-    let ingested = ingest.join().unwrap();
-    let refused = writer.join().unwrap();
-
-    assert!(
-        writer_done,
-        "a write with no_slowdown did not return while an ingest was writing its table"
-    );
-    ingested.unwrap();
-    let Some(reason) = refused.unwrap() else {
-        panic!(
-            "64 writes into 4 KiB memtables were all accepted while an ingest held their \
-             flushes: nothing bounded the memtables it held"
-        );
-    };
-    assert!(
-        reason.contains("memtables"),
-        "the write was refused for {reason:?}, not for the memtable limit"
-    );
-    assert!(
-        frozen_while_paused > 0,
-        "no memtable was held for the ingest, so nothing here was exercised"
-    );
-
-    // The ingest flushed what it held, and the limit is gone with it.
-    assert_eq!(
-        frozen_bytes(&db),
-        0,
-        "the ingest returned with memtables sealed during it still unflushed"
-    );
-    let no_slowdown = WriteOptions {
-        no_slowdown: true,
-        ..WriteOptions::default()
-    };
-    db.put_opt(&no_slowdown, b"after", b"v").unwrap();
-}
-
-/// An ingest that fails after it allocated its sequence still flushes
-/// the memtables sealed while it ran, and a rotation after it flushes
-/// its own memtable again: the failure neither strands those writes in
-/// memory nor leaves later rotations waiting for an ingest that is gone.
-#[test]
-fn an_ingest_that_fails_still_flushes_the_memtables_sealed_while_it_ran() {
+fn writes_issued_during_an_ingest_that_fails_commit_once_it_gives_up() {
     let dir = TempDir::new().unwrap();
     let staging = TempDir::new().unwrap();
     // The ingest's table is the first SST open: it pauses, then fails.
@@ -730,40 +597,21 @@ fn an_ingest_that_fails_still_flushes_the_memtables_sealed_while_it_ran() {
             write_past_one_rotation(&db, "f")
         })
     };
-    let writer_done = wait_finished(&writer, WRITE_DEADLINE);
-    let frozen_while_paused = frozen_bytes(&db);
     env.release();
     let ingested = ingest.join().unwrap();
-    let written = writer.join().unwrap();
+    writer.join().unwrap().unwrap();
 
-    assert!(
-        writer_done,
-        "a write that filled the memtable did not return while an ingest was writing its table"
-    );
-    written.unwrap();
-    assert!(
-        frozen_while_paused > 0,
-        "the writes never rotated the memtable, so nothing here was exercised"
-    );
     let err = ingested.unwrap_err();
     assert!(
         err.to_string().contains("injected table open failure"),
         "unexpected ingest error: {err}"
     );
-
     assert_eq!(
         frozen_bytes(&db),
         0,
-        "a failed ingest left a memtable sealed during it unflushed"
+        "a rotation during a failed ingest left its memtable unflushed"
     );
     assert_eq!(db.get(b"k").unwrap(), Some(b"v2".to_vec()));
-
-    write_past_one_rotation(&db, "g").unwrap();
-    assert_eq!(
-        frozen_bytes(&db),
-        0,
-        "a rotation after a failed ingest left its memtable unflushed"
-    );
 
     drop(db);
     let db = Db::open(
@@ -776,157 +624,4 @@ fn an_ingest_that_fails_still_flushes_the_memtables_sealed_while_it_ran() {
     .unwrap();
     assert_eq!(db.get(b"k").unwrap(), Some(b"v2".to_vec()));
     assert_eq!(db.get(b"f0").unwrap(), Some(vec![0u8; 1024]));
-}
-
-/// If the ingest installs its file but flushing the memtables sealed
-/// while it ran fails, the call reports that failure, the file stays
-/// ingested, and those memtables stay frozen and readable until a later
-/// flush writes them. Nothing is lost.
-#[test]
-fn a_failed_flush_after_an_ingest_installs_keeps_those_memtables_readable() {
-    let dir = TempDir::new().unwrap();
-    let staging = TempDir::new().unwrap();
-    // The ingest's table is the first SST open and pauses; the second
-    // is its flush of the memtable sealed meanwhile, and fails.
-    let env = NthSstOpen::new(dir.path(), 1, 2);
-    let opts = Options {
-        env: env.clone(),
-        write_buffer_size: 4 * 1024,
-        ..Options::default()
-    };
-    let db = Arc::new(Db::open(dir.path(), opts.clone()).unwrap());
-
-    let ingest_path = build_ingest_file(staging.path(), &opts, b"k", b"new");
-    let ingest = {
-        let db = Arc::clone(&db);
-        std::thread::spawn(move || {
-            db.ingest_external_files(&[ingest_path], IngestOptions::default())
-        })
-    };
-    env.wait_paused(Duration::from_secs(60));
-
-    let writer = {
-        let db = Arc::clone(&db);
-        std::thread::spawn(move || write_past_one_rotation(&db, "f"))
-    };
-    let writer_done = wait_finished(&writer, WRITE_DEADLINE);
-    let frozen_while_paused = frozen_bytes(&db);
-    env.release();
-    let ingested = ingest.join().unwrap();
-    let written = writer.join().unwrap();
-
-    assert!(
-        writer_done,
-        "a write that filled the memtable did not return while an ingest was writing its table"
-    );
-    written.unwrap();
-    assert!(
-        frozen_while_paused > 0,
-        "the writes never rotated the memtable, so nothing here was exercised"
-    );
-    let err = ingested.unwrap_err();
-    assert!(
-        err.to_string().contains("injected table open failure"),
-        "unexpected ingest error: {err}"
-    );
-
-    assert_eq!(
-        db.get(b"k").unwrap(),
-        Some(b"new".to_vec()),
-        "the ingested file must stay installed"
-    );
-    assert!(
-        frozen_bytes(&db) > 0,
-        "the memtable whose flush failed must stay frozen"
-    );
-    assert_eq!(db.get(b"f0").unwrap(), Some(vec![0u8; 1024]));
-
-    db.flush().unwrap();
-    assert_eq!(frozen_bytes(&db), 0);
-
-    let before = db.latest_sequence();
-    drop(db);
-    let db = Db::open(
-        dir.path(),
-        Options {
-            env: NthSstOpen::new(dir.path(), 0, 0),
-            ..opts
-        },
-    )
-    .unwrap();
-    let mut batch = WriteBatch::new();
-    batch.put(b"z", b"v");
-    let seq = db.write_sequenced(batch).unwrap();
-    assert!(
-        seq > before,
-        "reopened sequence {seq} did not exceed {before}"
-    );
-    assert_eq!(db.get(b"k").unwrap(), Some(b"new".to_vec()));
-    assert_eq!(db.get(b"f0").unwrap(), Some(vec![0u8; 1024]));
-}
-
-/// `compact_range` during an ingest waits for it, then flushes its own
-/// memtable and reports that flush's failure. It takes the compaction
-/// gate, which an ingest holds for its whole call, before it seals
-/// anything, so it never leaves its memtable to an ingest's flush whose
-/// failure it would not see.
-#[test]
-fn compact_range_during_an_ingest_reports_a_failed_flush_of_its_memtable() {
-    let dir = TempDir::new().unwrap();
-    let staging = TempDir::new().unwrap();
-    // The ingest's table is the first SST open and pauses; the second
-    // fails.
-    let env = NthSstOpen::new(dir.path(), 1, 2);
-    let opts = Options {
-        env: env.clone(),
-        ..Options::default()
-    };
-    let db = Arc::new(Db::open(dir.path(), opts.clone()).unwrap());
-
-    let ingest_path = build_ingest_file(staging.path(), &opts, b"k", b"new");
-    let ingest = {
-        let db = Arc::clone(&db);
-        std::thread::spawn(move || {
-            db.ingest_external_files(&[ingest_path], IngestOptions::default())
-        })
-    };
-    env.wait_paused(Duration::from_secs(60));
-
-    // A write during the ingest, so `compact_range` has a memtable to
-    // flush.
-    let put = {
-        let db = Arc::clone(&db);
-        std::thread::spawn(move || db.put(b"k", b"v2"))
-    };
-    if !wait_finished(&put, WRITE_DEADLINE) {
-        env.release();
-        let _ = ingest.join();
-        let _ = put.join();
-        panic!("a commit did not complete while the ingest was paused");
-    }
-    put.join().unwrap().unwrap();
-
-    let compact = {
-        let db = Arc::clone(&db);
-        std::thread::spawn(move || db.compact_range(None, None))
-    };
-    // A `compact_range` that sealed before taking the gate would show
-    // its memtable in the frozen list here: give it the time to.
-    wait_until(RELEASE_DEADLINE, || frozen_bytes(&db) > 0);
-    env.release();
-    let ingested = ingest.join().unwrap();
-    let compacted = compact.join().unwrap();
-
-    ingested.unwrap();
-    let err = compacted.unwrap_err();
-    assert!(
-        err.to_string().contains("injected table open failure"),
-        "unexpected compact_range error: {err}"
-    );
-
-    // The memtable whose flush failed is still frozen, and still read.
-    assert_eq!(db.get(b"k").unwrap(), Some(b"v2".to_vec()));
-    db.flush().unwrap();
-    assert_eq!(frozen_bytes(&db), 0);
-    assert_eq!(db.get(b"k").unwrap(), Some(b"v2".to_vec()));
 }

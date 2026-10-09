@@ -47,9 +47,11 @@ jobs:
         run: just loom-all
 
   # TLA+ model of what commit validation covers at each isolation level,
-  # checked against the Merkle-DAG CRDT workload `RepeatableRead` exists for. The green
+  # checked against the Merkle-DAG CRDT workload `RepeatableRead` exists for,
+  # and the storage-engine models: the L0 input set of compact_range, one
+  # view per batch read, ingest publication and WAL rotation. The green
   # and the red configurations both run: a red one going green would mean
-  # the model stopped telling the levels apart.
+  # the model stopped telling the fix from the defect.
   tla:
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -60,8 +62,44 @@ jobs:
           distribution: temurin
           java-version: '21'
       - uses: extractions/setup-just@v2
-      - name: RepeatableRead model, every isolation level
+      - name: TLA+ models, every green and red configuration
         run: just tla
+
+  # The Lean proofs beside the TLA+ models: each module proves for every
+  # size what a model checks for a few. Plain Lean 4 core, no dependencies.
+  # The toolchain pinned in proofs/lean/lean-toolchain and the build output
+  # are cached together, so a run that changes no proof rebuilds nothing.
+  lean:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: extractions/setup-just@v2
+      - name: Cache the Lean toolchain and build output
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.elan
+            proofs/lean/.lake
+          key: lean-${{ runner.os }}-${{ hashFiles('proofs/lean/lean-toolchain') }}-${{ hashFiles('proofs/lean/**/*.lean', 'proofs/lean/lakefile.toml', 'proofs/lean/lake-manifest.json') }}
+          restore-keys: |
+            lean-${{ runner.os }}-${{ hashFiles('proofs/lean/lean-toolchain') }}-
+      # The installer script is pinned by tag and checksum, as the TLC jar
+      # is; the proofs are checked by the toolchain lean-toolchain pins.
+      - name: Install elan and the pinned Lean toolchain
+        run: |
+          if [ ! -x "$HOME/.elan/bin/elan" ]; then
+            curl -sSfL -o elan-init.sh \
+              https://raw.githubusercontent.com/leanprover/elan/v4.2.3/elan-init.sh
+            echo "a620ff1641616222c8d37c54845492004bb84d6877cdbc944dd65c1aa685bf53  elan-init.sh" \
+              | sha256sum -c -
+            sh elan-init.sh -y --default-toolchain none --no-modify-path
+            rm elan-init.sh
+          fi
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+          "$HOME/.elan/bin/elan" toolchain install "$(cat proofs/lean/lean-toolchain)"
+      - name: Lean proofs, built and audited
+        run: just lean
 
   # The read-view chaos workload at full size. `cargo test` runs a smaller
   # default so the ordinary gate stays fast; this job is what covers

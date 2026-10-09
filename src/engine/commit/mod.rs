@@ -27,7 +27,9 @@
 //! if a later group published its maximum before an earlier one applied, a
 //! snapshot at that watermark would read a hole. Overlapping groups need a
 //! per-commit completion tracker, which this module deliberately does not
-//! have.
+//! have. An ingest takes its sequence under the same mutex and holds it
+//! until its table is installed and the sequence published, so no group
+//! publishes past an ingest either.
 
 use std::io;
 use std::sync::Arc;
@@ -863,6 +865,11 @@ impl RegolithEngine {
         if let Err(rollback_err) = wal.rollback_to(start_offset) {
             self.latch_wal_failure(&rollback_err);
         }
+        self.notify_wal_error(cause);
+    }
+
+    /// Tell the registered listeners a write-ahead-log operation failed.
+    pub(super) fn notify_wal_error(&self, cause: &io::Error) {
         if !self.options.listeners.is_empty() {
             let err = crate::Error::from(clone_io_error(cause));
             crate::event_listener::dispatch(&self.options.listeners, |l| {
