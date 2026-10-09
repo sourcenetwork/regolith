@@ -618,6 +618,27 @@ tla:
     check MC_TxnCallbacks_Red_CallbacksSurvive         RED AttemptIsolation
     check MC_TxnCallbacks_Red_HelperNoClaim            RED AtMostOnce
     check MC_TxnCallbacks_Red_CloseNoClaim             RED AtMostOnce
+    # 4.6, Phase 7b: the wait-free read view (D54). Lean:
+    # Regolith/ReadView.lean, reachable_safe and cas_chain.
+    spec=ReadView
+    check MC_ReadView_Green                            GREEN
+    check MC_ReadView_Red_FreeEarly                    RED NoFreedRead
+    check MC_ReadView_Red_StaleLoad                    RED FreshLoad
+    check MC_ReadView_Red_PlainStore                   RED ChainOfPublications
+    # 4.6, Phase 7b: the lock-free CLOCK block cache. Lean:
+    # Regolith/ClockCache.lean, evict_only_unpinned, reachable_safe,
+    # two_level_bounded and used_exact.
+    spec=ClockCache
+    check MC_ClockCache_Green                          GREEN
+    check MC_ClockCache_Red_IgnorePins                 RED NoFreedPin
+    check MC_ClockCache_Red_Unbounded                  RED ByteBound
+    check MC_ClockCache_Red_LandingUnheld              RED LandedReadable
+    # 4.6, Phase 7b: a memtable's append-only range-tombstone log. Lean:
+    # Regolith/TombstoneLog.lean, prefix_whole and published_seen.
+    spec=TombstoneLog
+    check MC_TombstoneLog_Green                        GREEN
+    check MC_TombstoneLog_Red_LenFirst                 RED PrefixWhole
+    check MC_TombstoneLog_Red_HorizonFirst             RED PublishedSeen
     rm -rf states ./*_TTrace_*.tla ./*_TTrace_*.bin
     exit $fail
 
