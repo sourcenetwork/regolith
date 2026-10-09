@@ -13,6 +13,11 @@
 //!
 //! # Merge operators
 //!
+//! [`check_touches`] checks the other law an operator carries: that
+//! [`MergeOperator::touches`] survives the early folding below.
+//!
+//! [`check_merge_operator`] and [`check_touches`] are the two checks.
+//!
 //! [`check_merge_operator`] checks the law that lets compaction fold operands
 //! early. For any run of operands, cut into contiguous groups, each group
 //! reduced to one operand by exact [`MergeOperator::partial_merge`] steps in
@@ -54,6 +59,15 @@
 //! assert!(checked.folds > 0, "the operator's partial_merge was never exercised");
 //! # Ok::<(), String>(())
 //! ```
+//!
+//! # Projected reads
+//!
+//! [`check_touches`] checks the law that lets a commit trust
+//! [`MergeOperator::touches`] after compaction has folded operands: an
+//! operand folded from two touches a part exactly when one of the two does.
+//! Without it a transaction that read some parts with
+//! [`Transaction::get_parts`](crate::Transaction::get_parts) could commit
+//! over a part a folded operand changed.
 
 use std::cell::Cell;
 
@@ -64,6 +78,9 @@ use proptest::prelude::{Strategy, TestCaseError, any};
 use proptest::test_runner::{Config, TestError, TestRunner};
 
 use crate::MergeOperator;
+
+/// The most part sets in one generated case.
+const MAX_PART_SETS: usize = 6;
 
 /// The most operands in one generated run.
 const MAX_OPERANDS: usize = 12;
@@ -133,6 +150,82 @@ pub fn check_merge_operator<O: MergeOperator + ?Sized>(
             TestError::Abort(reason) => format!("the check gave up: {reason}"),
         })?;
     Ok(MergeCheck {
+        cases: cases.get(),
+        folds: folds.get(),
+    })
+}
+
+/// What a passing [`check_touches`] covered.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct TouchesCheck {
+    /// The generated cases that passed.
+    pub cases: u32,
+    /// The cases whose pair of operands `partial_merge` folded into one,
+    /// which are the ones that tested the law. Zero means the operator folds
+    /// nothing early, so nothing was checked.
+    pub folds: u64,
+}
+
+/// Check `operator`'s [`MergeOperator::touches`] against its
+/// [`MergeOperator::partial_merge`]: for adjacent operands `left` and `right`
+/// that fold to one, `touches` of the folded operand over any set of parts is
+/// `touches(left) || touches(right)`.
+///
+/// `parts` generates the part sets a reader names (they are sorted and
+/// deduplicated before use), and `operands` the operands the operator
+/// accepts. Failures name the shrunk case. The `PROPTEST_CASES` environment
+/// variable sets the number of cases.
+pub fn check_touches<O: MergeOperator + ?Sized>(
+    operator: &O,
+    keys: impl Strategy<Value = Vec<u8>>,
+    operands: impl Strategy<Value = Vec<u8>> + Clone,
+    parts: impl Strategy<Value = Vec<u32>>,
+) -> Result<TouchesCheck, String> {
+    let sets = parts.prop_map(|mut set| {
+        set.sort_unstable();
+        set.dedup();
+        set
+    });
+    let input = (
+        keys,
+        operands.clone(),
+        operands,
+        vec(sets, 1..=MAX_PART_SETS),
+    );
+    // No regression file: a library harness must not write into its caller's tree.
+    let mut runner = TestRunner::new(Config {
+        failure_persistence: None,
+        ..Config::default()
+    });
+    let (cases, folds) = (Cell::new(0u32), Cell::new(0u64));
+    runner
+        .run(&input, |(key, left, right, sets)| {
+            cases.set(cases.get() + 1);
+            let Some(folded) = operator.partial_merge(&key, &left, &right) else {
+                return Ok(());
+            };
+            for set in &sets {
+                let expected =
+                    operator.touches(&key, &left, set) || operator.touches(&key, &right, set);
+                let got = operator.touches(&key, &folded, set);
+                if got != expected {
+                    return Err(TestCaseError::fail(format!(
+                        "touches of the folded operand over parts {set:?} is {got}, but the \
+                         operands it folds touch {expected}"
+                    )));
+                }
+            }
+            folds.set(folds.get() + 1);
+            Ok(())
+        })
+        .map_err(|err| match err {
+            TestError::Fail(reason, input) => {
+                format!("{reason}\nkey, left, right, part sets: {input:?}")
+            }
+            TestError::Abort(reason) => format!("the check gave up: {reason}"),
+        })?;
+    Ok(TouchesCheck {
         cases: cases.get(),
         folds: folds.get(),
     })
@@ -227,7 +320,7 @@ mod tests {
         Some(u64::from_be_bytes(bytes.try_into().ok()?))
     }
 
-    fn counters() -> impl Strategy<Value = Vec<u8>> {
+    fn counters() -> impl Strategy<Value = Vec<u8>> + Clone {
         any::<u64>().prop_map(|n| n.to_be_bytes().to_vec())
     }
 
@@ -345,5 +438,107 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("gave up"), "{err}");
+    }
+
+    /// Operands are `(part, delta)` pairs and a value holds three parts. An
+    /// operand touches its own part.
+    struct Parted {
+        /// A zero delta touches nothing, which a fold of two nonzero deltas
+        /// that wrap to zero then breaks.
+        zero_delta_touches_nothing: bool,
+        override_touches: bool,
+    }
+
+    fn operand(part: u8, delta: u8) -> Vec<u8> {
+        vec![part, delta]
+    }
+
+    fn operands() -> impl Strategy<Value = Vec<u8>> + Clone {
+        (0u8..3, proptest::sample::select(vec![0u8, 128]))
+            .prop_map(|(part, delta)| operand(part, delta))
+    }
+
+    impl MergeOperator for Parted {
+        fn name(&self) -> &'static str {
+            "parted"
+        }
+
+        fn full_merge(&self, _: &[u8], base: Option<&[u8]>, operands: &[&[u8]]) -> Option<Vec<u8>> {
+            let mut value = base.map_or(vec![0; 3], <[u8]>::to_vec);
+            for operand in operands {
+                let part = usize::from(operand[0]);
+                value[part] = value[part].wrapping_add(operand[1]);
+            }
+            Some(value)
+        }
+
+        // Folds two operands on one part into one; operands on two parts do not fold.
+        fn partial_merge(&self, _: &[u8], left: &[u8], right: &[u8]) -> Option<Vec<u8>> {
+            (left[0] == right[0]).then(|| operand(left[0], left[1].wrapping_add(right[1])))
+        }
+
+        fn touches(&self, _: &[u8], operand: &[u8], parts: &[u32]) -> bool {
+            if !self.override_touches {
+                return true;
+            }
+            parts.contains(&u32::from(operand[0]))
+                && (operand[1] != 0 || !self.zero_delta_touches_nothing)
+        }
+    }
+
+    fn part_sets() -> impl Strategy<Value = Vec<u32>> {
+        vec(0u32..3, 0..=3)
+    }
+
+    fn check_parted(op: &Parted) -> Result<TouchesCheck, String> {
+        check_touches(op, any::<Vec<u8>>(), operands(), part_sets())
+    }
+
+    #[test]
+    fn the_default_touches_passes_and_counts_its_folds() {
+        let checked = check_parted(&Parted {
+            zero_delta_touches_nothing: false,
+            override_touches: false,
+        })
+        .unwrap();
+        assert_eq!(checked.cases, Config::default().cases);
+        assert!(checked.folds > 0);
+    }
+
+    #[test]
+    fn a_touches_that_survives_folding_passes() {
+        let checked = check_parted(&Parted {
+            zero_delta_touches_nothing: false,
+            override_touches: true,
+        })
+        .unwrap();
+        assert!(checked.folds > 0);
+    }
+
+    #[test]
+    fn a_touches_that_a_fold_can_change_fails_with_the_case() {
+        // Two nonzero deltas can fold to zero, which touches nothing, so the
+        // fold stops touching a part both operands touched.
+        let err = check_parted(&Parted {
+            zero_delta_touches_nothing: true,
+            override_touches: true,
+        })
+        .unwrap_err();
+        assert!(err.contains("folded operand over parts"), "{err}");
+        assert!(err.contains("part sets"), "{err}");
+    }
+
+    #[test]
+    fn an_operator_that_folds_nothing_passes_with_no_folds() {
+        let checked = check_touches(
+            &Sum {
+                partial: |_, _| None,
+            },
+            any::<Vec<u8>>(),
+            counters(),
+            part_sets(),
+        )
+        .unwrap();
+        assert_eq!(checked.folds, 0);
     }
 }

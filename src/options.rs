@@ -147,6 +147,33 @@ pub trait MergeOperator: Send + Sync + 'static {
         None
     }
 
+    /// Whether `operand` changes any of the value parts named by `parts`,
+    /// sorted ids the caller's own scheme defines. A transaction that read
+    /// a key with [`crate::Transaction::get_parts`] is refused at commit
+    /// only by an operand this says touches the parts it named, so an
+    /// operand on another part does not abort it.
+    ///
+    /// `key` is the key exactly as [`MergeOperator::full_merge`] receives
+    /// it. Return `true` when unsure: the default, `true`, makes every
+    /// operand change every part, which is the behaviour of a read that
+    /// names no parts at all.
+    ///
+    /// Contract: a part this says an operand leaves alone is left alone by
+    /// the value [`MergeOperator::full_merge`] produces, and the answer
+    /// survives folding: `touches(partial_merge(a, b), P)` equals
+    /// `touches(a, P) || touches(b, P)`. Breaking it lets a transaction
+    /// commit on a part that changed. `regolith::testing::check_touches`, behind
+    /// the `testing` feature, checks the second half.
+    ///
+    /// Pure and fast: a commit calls it for every operand committed to the
+    /// key since the transaction began, while it holds the write pipeline.
+    /// A panic here fails that commit with [`crate::Error::CallbackPanicked`]
+    /// and latches the database read-only until it is reopened.
+    fn touches(&self, key: &[u8], operand: &[u8], parts: &[u32]) -> bool {
+        let _ = (key, operand, parts);
+        true
+    }
+
     /// A stable, human-readable identifier for this operator. Used
     /// by tracing and diagnostics.
     fn name(&self) -> &'static str;
