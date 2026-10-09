@@ -534,6 +534,113 @@ fn external_tables_ingest_into_an_encrypted_database_sealed_or_not() {
     assert!(files_holding(dir.path(), MARKER).is_empty());
 }
 
+/// Write an external table of `keys` under `opts`, each holding `value(i)`
+/// tagged with `tag`.
+fn external(path: &Path, opts: &Options, keys: std::ops::Range<usize>, tag: &[u8]) {
+    let mut writer = SstFileWriter::create(path, opts).unwrap();
+    for i in keys {
+        let mut v = value(i);
+        v.extend_from_slice(tag);
+        writer.put(&key(i), &v).unwrap();
+    }
+    writer.finish().unwrap();
+}
+
+/// A sealed external table is installed as it is, its blocks read at the
+/// sequence its sealed manifest record carries (tag 7), before and after a
+/// reopen, and a snapshot taken before the ingest never sees it.
+#[test]
+fn an_ingested_sealed_table_is_installed_as_is_and_reads_at_its_sequence() {
+    let dir = TempDir::new().unwrap();
+    let keys = Keys::new(&[1]);
+    let db = Db::open(dir.path(), options(&keys)).unwrap();
+    fill(&db, 0, 20);
+    let before = db.snapshot();
+
+    let staging = TempDir::new().unwrap();
+    let source = staging.path().join("ingest.sst");
+    external(&source, &options(&keys), 10..30, b"/ingested");
+    let source_bytes = std::fs::read(&source).unwrap();
+    let ingest = IngestOptions {
+        snapshot_consistency: false,
+        ..IngestOptions::default()
+    };
+    db.ingest_external_files(std::slice::from_ref(&source), ingest)
+        .unwrap();
+
+    let ingested = |i: usize| {
+        let mut v = value(i);
+        v.extend_from_slice(b"/ingested");
+        Some(v)
+    };
+    for i in 10..30 {
+        assert_eq!(db.get(&key(i)).unwrap(), ingested(i), "key {i}");
+    }
+    for i in 10..20 {
+        assert_eq!(
+            before.get(&key(i)).unwrap(),
+            Some(value(i)),
+            "snapshot, key {i}"
+        );
+    }
+    assert_eq!(before.get(&key(25)).unwrap(), None);
+    drop(before);
+
+    let installed = files_under(&dir.path().join("sst"))
+        .into_iter()
+        .filter(|p| std::fs::read(p).unwrap() == source_bytes)
+        .count();
+    assert_eq!(installed, 1, "the sealed source was not installed as it is");
+    db.close().unwrap();
+    drop(db);
+    assert!(files_holding(dir.path(), b"user-key-").is_empty());
+
+    let db = Db::open(dir.path(), options(&keys)).unwrap();
+    check(&db, 0, 10);
+    for i in 10..30 {
+        assert_eq!(db.get(&key(i)).unwrap(), ingested(i), "reopened, key {i}");
+    }
+}
+
+/// A backup of an encrypted database holding an ingested table (manifest
+/// version 3 carries its sequence) restores into a database that opens
+/// only under the keys, reads the table at its sequence, and holds no
+/// plaintext value.
+#[test]
+fn a_backup_holding_an_ingested_table_restores_under_the_keys() {
+    let dir = TempDir::new().unwrap();
+    let keys = Keys::new(&[1]);
+    let db = Db::open(dir.path(), options(&keys)).unwrap();
+    fill(&db, 0, 300);
+    db.flush().unwrap();
+    let staging = TempDir::new().unwrap();
+    let source = staging.path().join("ingest.sst");
+    external(&source, &Options::default(), 100..140, b"/ingested");
+    db.ingest_external_files(&[source], IngestOptions::default())
+        .unwrap();
+
+    let backups = TempDir::new().unwrap();
+    let mut engine = BackupEngine::open(backups.path()).unwrap();
+    let id = engine.create_backup(&db).unwrap();
+    drop(db);
+    let restored = TempDir::new().unwrap();
+    engine.restore(id, restored.path()).unwrap();
+    assert!(matches!(
+        Db::open(restored.path(), Options::default()),
+        Err(Error::KeyProviderRequired)
+    ));
+    let db = Db::open(restored.path(), options(&keys)).unwrap();
+    check(&db, 0, 100);
+    for i in 100..140 {
+        let mut v = value(i);
+        v.extend_from_slice(b"/ingested");
+        assert_eq!(db.get(&key(i)).unwrap(), Some(v), "key {i}");
+    }
+    check(&db, 140, 300);
+    db.close().unwrap();
+    assert!(files_holding(restored.path(), MARKER).is_empty());
+}
+
 #[test]
 fn checkpoints_and_backups_of_an_encrypted_database_open_under_its_keys() {
     let dir = TempDir::new().unwrap();
