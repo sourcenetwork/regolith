@@ -31,3 +31,10 @@ import Regolith.SnapshotRegistry
 -- WalRecovery.lean also holds format 2 replay (4.2), backing
 -- `proofs/tla/WalRecovery.tla`; LsmOrder.lean also holds flush order,
 -- ingest placement, overlap demotion (E14) and binary search.
+-- E10: a group commit decides every member as committing them one at a
+-- time would. Backs `proofs/tla/GroupCommit.tla`.
+import Regolith.GroupCommit
+-- 4.7: deciding in ring order gives dense sequences in ring order, and a
+-- reader at the published horizon sees exactly the published commits.
+-- Backs `proofs/tla/CommitPipeline.tla`.
+import Regolith.Pipeline
