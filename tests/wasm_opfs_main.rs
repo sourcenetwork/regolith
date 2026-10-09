@@ -156,3 +156,55 @@ async fn mirror_mode_refuses_immediate_durability() {
         "the refusal must name the capability, got: {text}"
     );
 }
+
+/// One persist batch carrying new tables, the manifest that names them and
+/// the deletion of the tables a compaction replaced: mirror mode writes the
+/// tables first, the MANIFEST last and deletes after both (E20), and the
+/// database reopens from what it wrote.
+#[wasm_bindgen_test]
+async fn a_batch_of_new_tables_a_manifest_and_deletions_reopens() {
+    let name = "regolith-test-main-persist-order";
+    {
+        let env = OpfsEnv::mount(name, OpfsOptions::default())
+            .await
+            .expect("mount");
+        let options = Options::embedded().env(env.as_env());
+        let db = Db::open(env.db_path(), options).expect("open");
+        for round in 0..4u32 {
+            for i in 0..32u32 {
+                db.put(
+                    format!("k{i:04}").as_bytes(),
+                    format!("v{round}").as_bytes(),
+                )
+                .expect("put");
+            }
+            db.flush().expect("flush");
+        }
+        env.persist().await.expect("persist the flushed tables");
+        db.compact_range(None, None).expect("compact");
+        db.put(b"after", b"compaction").expect("put");
+        db.flush().expect("flush");
+        db.close().expect("close");
+        env.persist().await.expect("persist the compaction");
+        assert_eq!(env.pending_bytes(), 0);
+    }
+
+    let env = OpfsEnv::mount(name, OpfsOptions::default())
+        .await
+        .expect("remount");
+    let options = Options::embedded().env(env.as_env());
+    let db = Db::open(env.db_path(), options).expect("reopen");
+    for i in 0..32u32 {
+        assert_eq!(
+            db.get(format!("k{i:04}").as_bytes())
+                .expect("get")
+                .as_deref(),
+            Some(&b"v3"[..])
+        );
+    }
+    assert_eq!(
+        db.get(b"after").expect("get").as_deref(),
+        Some(&b"compaction"[..])
+    );
+    db.close().expect("close");
+}
