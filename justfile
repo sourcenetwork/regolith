@@ -364,6 +364,16 @@ tla:
     spec=LsmOrder
     check MC_LsmOrder_Green                            GREEN
     check MC_LsmOrder_Red_Intersect                    RED ReadNewest
+    # Flush order, ingest placement, overlap demotion (E14, D13), binary
+    # search. Lean: Regolith/LsmOrder.lean, install_oldest_same_order,
+    # ingest_ordered, demote_reads_newest, level_read_bsearch.
+    check MC_LsmOrder_Green_Flush                      GREEN
+    check MC_LsmOrder_Red_FlushAnyOrder                RED ReadNewest
+    check MC_LsmOrder_Green_Ingest                     GREEN
+    check MC_LsmOrder_Red_IngestIgnoresUpper           RED ReadNewest
+    check MC_LsmOrder_Green_Demote                     GREEN
+    check MC_LsmOrder_Red_DemoteLevelOnly              RED ReadNewest
+    check MC_LsmOrder_Red_NoDemotion                   RED ReadNewest
     # E6. Lean: Regolith/BatchView.lean, batch_one_view_newest.
     spec=BatchRead
     check MC_BatchRead_Green                           GREEN
@@ -425,6 +435,34 @@ tla:
     check MC_Allocate_Red_LogAfterUse_Reuse                    RED INV_UsesUnique
     check MC_Allocate_Teeth_InTxn                              GREEN
     check MC_Allocate_Teeth_LogAfterUse                        GREEN
+    # 4.2, E3: WAL format 2 replay. Lean: Regolith/WalRecovery.lean,
+    # recovers_prefix2.
+    spec=WalRecovery
+    check MC_WalRecovery_Green_Immediate               GREEN
+    check MC_WalRecovery_Green_Eventual                GREEN
+    check MC_WalRecovery_Green_Residual                GREEN
+    check MC_WalRecovery_Green_Aead                    GREEN
+    check MC_WalRecovery_Red_DropBelowP                RED NoProvenLoss
+    check MC_WalRecovery_Red_RefuseAboveP              RED RecoveryOpens
+    check MC_WalRecovery_Red_Format1                   RED RecoveryOpens
+    check MC_WalRecovery_Red_CloseWithoutSync          RED RecoveryOpens
+    check MC_WalRecovery_Red_NoTruncate                RED RecoveryOpens
+    check MC_WalRecovery_Red_StampNotSealed            RED AckedSurvive
+    # 4.8, E5: compaction per snapshot stripe. Lean: Regolith/Stripes.lean,
+    # reduce_reads.
+    spec=StripeCompaction
+    check MC_StripeCompaction_Green                    GREEN
+    check MC_StripeCompaction_Green_Filter             GREEN
+    check MC_StripeCompaction_Green_Inexact            GREEN
+    check MC_StripeCompaction_Red_CaptureEarly         RED SnapshotReadsKept
+    check MC_StripeCompaction_Red_InexactFold          RED HeadKept
+    check MC_StripeCompaction_Red_IgnoreStripes        RED SnapshotReadsKept
+    # 4.6: the lock-free snapshot registry. Lean:
+    # Regolith/SnapshotRegistry.lean, scan_respects_live.
+    spec=SnapshotRegistry
+    check MC_SnapshotRegistry_Green                    GREEN
+    check MC_SnapshotRegistry_Red_NoConfirm            RED MinBelowLive
+    check MC_SnapshotRegistry_Red_ScanThenSample       RED MinBelowLive
     rm -rf states ./*_TTrace_*.tla ./*_TTrace_*.bin
     exit $fail
 
