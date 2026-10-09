@@ -70,7 +70,10 @@ use pending_outputs::PendingOutputs;
 use read_horizon::ReadHorizon;
 pub(crate) use read_rule::ReadRule;
 use read_view::{ReadView, ReadViewCell, VersionStore};
-use recovery::{replay_logs, report_discarded_tail, rewrite_recovered_memtable_to_wal};
+use recovery::{
+    replay_logs, report_discarded_tail, report_dropped_manifest_tail,
+    rewrite_recovered_memtable_to_wal,
+};
 use skiplist::InsertHint;
 use snapshot_registry::SnapshotRegistry;
 use source_walk::Source;
@@ -630,6 +633,9 @@ impl RegolithEngine {
 
         let version_set =
             VersionSet::open_with_policy(&env, db_dir, &sst_dir, options.metadata_policy())?;
+        if let Some(tail) = version_set.dropped_tail() {
+            report_dropped_manifest_tail(&options, version_set.manifest_path(), tail);
+        }
         let version = version_set.current();
         let latest_seq = version.last_seq;
 
@@ -795,6 +801,9 @@ impl RegolithEngine {
         );
         let version_set =
             VersionSet::open_read_only(&env, db_dir, &sst_dir, options.metadata_policy())?;
+        if let Some(tail) = version_set.dropped_tail() {
+            report_dropped_manifest_tail(&options, version_set.manifest_path(), tail);
+        }
         let version = version_set.current();
         let latest_seq = version.last_seq;
 
