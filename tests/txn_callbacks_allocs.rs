@@ -11,23 +11,25 @@
 #![cfg(not(target_arch = "wasm32"))]
 
 use std::alloc::{GlobalAlloc, Layout, System};
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::cell::Cell;
 
 use regolith::{OptimisticTransactionDb, Options, TxnOptions};
 use tempfile::TempDir;
 
-static ARMED: AtomicBool = AtomicBool::new(false);
-static COUNT: AtomicUsize = AtomicUsize::new(0);
-
-/// The counters are process-wide, so a test holds this for its whole run.
-static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
+// Per thread, so only the measuring thread's allocations count: the database
+// opens background threads whose allocations must not leak into a figure.
+// Const-initialised and without a destructor, so touching them allocates
+// nothing.
+thread_local! {
+    static ARMED: Cell<bool> = const { Cell::new(false) };
+    static COUNT: Cell<usize> = const { Cell::new(0) };
+}
 
 struct Counting;
 
 fn count() {
-    if ARMED.load(Ordering::Relaxed) {
-        COUNT.fetch_add(1, Ordering::Relaxed);
+    if ARMED.get() {
+        COUNT.set(COUNT.get() + 1);
     }
 }
 
@@ -57,11 +59,11 @@ static ALLOC: Counting = Counting;
 
 /// Run `f` and return how many allocations it made.
 fn allocations(f: impl FnOnce()) -> usize {
-    COUNT.store(0, Ordering::Relaxed);
-    ARMED.store(true, Ordering::Relaxed);
+    COUNT.set(0);
+    ARMED.set(true);
     f();
-    ARMED.store(false, Ordering::Relaxed);
-    COUNT.load(Ordering::Relaxed)
+    ARMED.set(false);
+    COUNT.get()
 }
 
 fn open() -> (OptimisticTransactionDb, TempDir) {
@@ -74,7 +76,6 @@ fn open() -> (OptimisticTransactionDb, TempDir) {
 
 #[test]
 fn prepare_allocates_nothing_without_callbacks() {
-    let _serial = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let (db, _dir) = open();
     let mut txn = db.begin(&TxnOptions::new());
     assert_eq!(allocations(|| txn.prepare().unwrap()), 0);
@@ -82,7 +83,6 @@ fn prepare_allocates_nothing_without_callbacks() {
 
 #[test]
 fn the_first_four_callbacks_of_a_kind_share_one_allocation() {
-    let _serial = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let (db, _dir) = open();
 
     let mut txn = db.begin(&TxnOptions::new());

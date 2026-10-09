@@ -11,22 +11,27 @@
 #![cfg(not(target_arch = "wasm32"))]
 
 use std::alloc::{GlobalAlloc, Layout, System};
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::cell::Cell;
 
 use regolith::{OptimisticTransactionDb, Options, TxnOptions};
 use tempfile::TempDir;
 
-static ARMED: AtomicBool = AtomicBool::new(false);
-static BYTES: AtomicUsize = AtomicUsize::new(0);
-static COUNT: AtomicUsize = AtomicUsize::new(0);
+// Per thread, so only the measuring thread's allocations count: the database
+// opens background threads whose allocations must not leak into a figure.
+// Const-initialised and without a destructor, so touching them allocates
+// nothing.
+thread_local! {
+    static ARMED: Cell<bool> = const { Cell::new(false) };
+    static BYTES: Cell<usize> = const { Cell::new(0) };
+    static COUNT: Cell<usize> = const { Cell::new(0) };
+}
 
 struct Counting;
 
 fn count(bytes: usize) {
-    if ARMED.load(Ordering::Relaxed) {
-        BYTES.fetch_add(bytes, Ordering::Relaxed);
-        COUNT.fetch_add(1, Ordering::Relaxed);
+    if ARMED.get() {
+        BYTES.set(BYTES.get() + bytes);
+        COUNT.set(COUNT.get() + 1);
     }
 }
 
@@ -54,25 +59,21 @@ unsafe impl GlobalAlloc for Counting {
 #[global_allocator]
 static ALLOC: Counting = Counting;
 
-/// The counters are process-wide, so a test holds this for its whole run.
-static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
-
 const BUFFERED: usize = 2_000;
 const SAVEPOINTS: usize = 10_000;
 
 /// Run `f` and return the bytes and the allocations it made.
 fn measure(f: impl FnOnce()) -> (usize, usize) {
-    BYTES.store(0, Ordering::Relaxed);
-    COUNT.store(0, Ordering::Relaxed);
-    ARMED.store(true, Ordering::Relaxed);
+    BYTES.set(0);
+    COUNT.set(0);
+    ARMED.set(true);
     f();
-    ARMED.store(false, Ordering::Relaxed);
-    (BYTES.load(Ordering::Relaxed), COUNT.load(Ordering::Relaxed))
+    ARMED.set(false);
+    (BYTES.get(), COUNT.get())
 }
 
 #[test]
 fn ten_thousand_savepoints_over_a_large_buffer_copy_nothing() {
-    let _serial = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let dir = TempDir::new().unwrap();
     let db = OptimisticTransactionDb::open(dir.path(), Options::default()).unwrap();
     let mut txn = db.begin(&TxnOptions::new());
@@ -107,7 +108,6 @@ fn ten_thousand_savepoints_over_a_large_buffer_copy_nothing() {
 
 #[test]
 fn a_set_write_rollback_cycle_costs_the_write_and_not_the_buffer() {
-    let _serial = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let dir = TempDir::new().unwrap();
     let db = OptimisticTransactionDb::open(dir.path(), Options::default()).unwrap();
     let mut txn = db.begin(&TxnOptions::new());
