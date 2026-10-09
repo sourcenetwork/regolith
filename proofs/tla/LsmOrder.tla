@@ -46,8 +46,10 @@
 \*   run_compact_range                src/engine/compaction.rs
 \*     At L0 the inputs are the files that intersect [start, end]. They and
 \*     the L1 tables their key range overlaps are merged into L1.
-\*   ingest                           src/engine/mod.rs
-\*     An external file takes a fresh sequence and is placed at a level.
+\*   RegolithEngine::install          src/engine/ingest.rs
+\*     An external file takes a fresh sequence and is placed at a level
+\*     (`placement`), after the memtables holding a key of its range are
+\*     flushed (`flush_memtables_holding`).
 \*   manifest replay                  src/engine/manifest.rs
 \*     Today refuses a deeper level whose tables overlap (E14).
 \*

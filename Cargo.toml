@@ -231,5 +231,13 @@ name = "sync"
 harness = false
 
 [[bench]]
+name = "ingest"
+harness = false
+
+[[bench]]
+name = "cf_drop"
+harness = false
+
+[[bench]]
 name = "encryption"
 harness = false

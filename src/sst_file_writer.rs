@@ -4,9 +4,10 @@
 //! without going through a [`crate::Db`], and
 //! [`crate::Db::ingest_external_files`] bulk-loads those files into a
 //! running database. All entries in a single ingest file are assigned
-//! one freshly-allocated sequence number at ingest time; the
-//! placeholder seq (`0`) embedded by this writer is rewritten as the
-//! engine re-emits the file into `sst_dir`.
+//! one freshly-allocated sequence number at ingest time. The file is
+//! installed as it is, copied or linked: the database records that
+//! sequence beside the file and reads every entry at it, so the
+//! placeholder seq (`0`) this writer embeds is never read.
 
 use std::path::{Path, PathBuf};
 
@@ -22,7 +23,7 @@ use crate::options::Options;
 /// duplicates and out-of-order keys are rejected with an error. Every
 /// entry is written with a placeholder sequence number of `0`; the
 /// real sequence number is assigned by the engine when the file is
-/// ingested.
+/// ingested, and every entry reads at it.
 pub struct SstFileWriter {
     inner: SsTableWriter,
     path: PathBuf,
@@ -47,13 +48,27 @@ pub struct SstFileMeta {
 
 /// Options controlling how [`crate::Db::ingest_external_files`] moves
 /// files into the database.
+///
+/// Unless `ingest_behind` is set, a file goes to the deepest level such
+/// that no L0 table holds a key of the file's range and no table of that
+/// level or any level above it overlaps the range; with no such level it
+/// goes in front of every L0 table. The range includes the file's range
+/// tombstones.
 #[derive(Debug, Clone, Copy)]
 pub struct IngestOptions {
-    /// Advisory: whether to treat the source file as movable. In the
-    /// current implementation the engine always re-emits the ingest
-    /// file (to rewrite sequence numbers), so the source path is left
-    /// untouched regardless of this flag - the caller is free to
-    /// delete or re-ingest it.
+    /// Move each file into the database instead of copying it.
+    ///
+    /// With `true`, the file is hard-linked into the database's table
+    /// directory where the environment has hard links (it is copied
+    /// where it has none, or where the link fails, across filesystems
+    /// say), and its source path is removed once it is installed. The
+    /// caller hands the file over: it must not write to it afterwards.
+    /// A source whose removal fails is left in place and logged, since
+    /// the ingest itself succeeded; so is one a crash catches between
+    /// the install and the removal.
+    ///
+    /// With `false`, the default, the file is copied and the source is
+    /// left untouched: the caller may rewrite, delete or re-ingest it.
     pub move_files: bool,
     /// Reject the ingest if any live snapshot is pinned. Ingest
     /// assigns a single new seq to every entry in the file; a snapshot
@@ -62,7 +77,8 @@ pub struct IngestOptions {
     pub snapshot_consistency: bool,
     /// Force every ingest file to land at the bottommost level. The
     /// ingest is rejected if any input file's user-key range overlaps
-    /// an existing SSTable at any level.
+    /// an existing SSTable at any level, or a memtable holds a key in
+    /// it.
     pub ingest_behind: bool,
 }
 
@@ -301,10 +317,12 @@ mod tests {
     }
 
     #[test]
-    fn test_ingest_overlap_lands_at_l0() {
+    fn test_ingest_overlap_lands_above_the_level_it_overlaps() {
         let (db, dir) = open_tmp();
         db.put(b"banana", b"old").unwrap();
         db.compact_range(None, None).unwrap();
+        let bottom = crate::engine::manifest::MAX_LEVELS - 1;
+        assert_eq!(db.level_file_count(bottom), 1);
 
         let sst_path = dir.path().join("external-overlap.sst");
         build_sst(
@@ -317,7 +335,10 @@ mod tests {
 
         assert_eq!(db.get(b"apple").unwrap(), Some(b"a".to_vec()));
         assert_eq!(db.get(b"banana").unwrap(), Some(b"new".to_vec()));
-        assert!(db.level_file_count(0) >= 1);
+        // The deepest level above every table the range overlaps.
+        assert_eq!(db.level_file_count(bottom - 1), 1);
+        assert_eq!(db.level_file_count(bottom), 1);
+        assert_eq!(db.level_file_count(0), 0);
     }
 
     #[test]

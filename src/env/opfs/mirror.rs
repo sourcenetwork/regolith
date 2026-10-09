@@ -25,6 +25,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
 
+use crate::env::persist_order::persist_rank;
 use crate::sync::internal::Mutex;
 use wasm_bindgen::JsValue;
 
@@ -177,10 +178,12 @@ impl MirrorFs {
     }
 
     /// Snapshot the work `persist` has to do, releasing the lock before
-    /// any `await`.
+    /// any `await`. The writes come tables first and the MANIFEST last
+    /// (`persist_order`), and `persist` deletes only after writing, so a
+    /// batch cut short never leaves a manifest naming a table it lost.
     fn take_persist_batch(&self) -> (Vec<PendingWrite>, Vec<PathBuf>) {
         let state = self.state.lock();
-        let writes = state
+        let mut writes: Vec<PendingWrite> = state
             .dirty
             .iter()
             .filter_map(|path| {
@@ -190,6 +193,7 @@ impl MirrorFs {
                     .map(|entry| (path.clone(), entry.version, entry.data.clone()))
             })
             .collect();
+        writes.sort_by_key(|(path, _, _)| persist_rank(path));
         let deletes = state.deleted.iter().cloned().collect();
         (writes, deletes)
     }
@@ -208,7 +212,8 @@ impl MirrorFs {
         }
     }
 
-    /// Write every dirty file back to OPFS and drop the deleted ones.
+    /// Write every dirty file back to OPFS, tables first and the MANIFEST
+    /// last, then drop the deleted ones.
     pub(super) async fn persist(&self) -> Result<(), JsValue> {
         let (writes, deletes) = self.take_persist_batch();
         if writes.is_empty() && deletes.is_empty() {

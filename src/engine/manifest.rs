@@ -156,6 +156,11 @@ const TAG_LAST_SEQ: u8 = 3;
 const TAG_NEXT_FILE_ID: u8 = 4;
 const TAG_MIN_WAL_ID: u8 = 5;
 const TAG_RESET: u8 = 6;
+/// An `AddFile` for an ingested table: the same fields, then the sequence
+/// every entry of the table reads at (D48). A manifest written before this
+/// record existed never carries it, so it reads unchanged; a build that
+/// predates the record refuses one that does, naming the unknown tag.
+const TAG_ADD_INGESTED_FILE: u8 = 7;
 
 impl VersionEdit {
     fn to_record(&self) -> ManifestRecord {
@@ -192,7 +197,10 @@ impl ManifestRecord {
     fn encode(&self, buf: &mut Vec<u8>) {
         match self {
             ManifestRecord::AddFile { level, meta } => {
-                buf.push(TAG_ADD_FILE);
+                buf.push(match meta.global_seq {
+                    Some(_) => TAG_ADD_INGESTED_FILE,
+                    None => TAG_ADD_FILE,
+                });
                 buf.extend_from_slice(&(*level as u32).to_le_bytes());
                 buf.extend_from_slice(&meta.file_id.to_le_bytes());
                 buf.extend_from_slice(&(meta.smallest_key.len() as u32).to_le_bytes());
@@ -201,6 +209,9 @@ impl ManifestRecord {
                 buf.extend_from_slice(&meta.largest_key);
                 buf.extend_from_slice(&meta.file_size.to_le_bytes());
                 buf.extend_from_slice(&meta.num_entries.to_le_bytes());
+                if let Some(seq) = meta.global_seq {
+                    buf.extend_from_slice(&seq.to_le_bytes());
+                }
             }
             ManifestRecord::RemoveFile { level, file_id } => {
                 buf.push(TAG_REMOVE_FILE);
@@ -239,7 +250,7 @@ impl ManifestRecord {
         *pos += 1;
 
         match tag {
-            TAG_ADD_FILE => {
+            TAG_ADD_FILE | TAG_ADD_INGESTED_FILE => {
                 let level = read_u32(data, pos)? as usize;
                 validate_level_index(level)?;
                 let file_id = read_u64(data, pos)?;
@@ -247,6 +258,20 @@ impl ManifestRecord {
                 let largest_key = read_bytes(data, pos)?;
                 let file_size = read_u64(data, pos)?;
                 let num_entries = read_u64(data, pos)?;
+                let global_seq = if tag == TAG_ADD_INGESTED_FILE {
+                    // Sequences start at 1, so 0 can only be damage.
+                    match read_u64(data, pos)? {
+                        0 => {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                format!("manifest records ingested table {file_id} at sequence 0"),
+                            ));
+                        }
+                        seq => Some(seq),
+                    }
+                } else {
+                    None
+                };
 
                 Ok(Some(ManifestRecord::AddFile {
                     level,
@@ -256,6 +281,7 @@ impl ManifestRecord {
                         largest_key,
                         file_size,
                         num_entries,
+                        global_seq,
                     },
                 }))
             }
@@ -340,6 +366,46 @@ fn validate_level_index(level: usize) -> io::Result<()> {
 /// applies the same rule to a log written before this rule existed.
 fn raised_last_seq(current: u64, stamp: u64) -> u64 {
     current.max(stamp)
+}
+
+/// A whole MANIFEST describing one version: the stamp, then one frame
+/// holding the file-id counter, the last sequence, the oldest live WAL and
+/// an `AddFile` per table, level by level in the order given.
+///
+/// The one encoder of a canonical manifest: the rewrite that bounds the log
+/// and a backup restore both write it, so the two cannot drift apart.
+pub(crate) fn encode_manifest_image(
+    next_file_id: u64,
+    last_seq: u64,
+    min_wal_id: u64,
+    files: impl IntoIterator<Item = (usize, SsTableMeta)>,
+) -> io::Result<Vec<u8>> {
+    Ok(encode_image(next_file_id, last_seq, min_wal_id, files, None)?.0)
+}
+
+/// [`encode_manifest_image`], sealed under `sealing` when given: its salt in
+/// the stamp and the batch under the keyring's current key, which is handed
+/// back.
+fn encode_image(
+    next_file_id: u64,
+    last_seq: u64,
+    min_wal_id: u64,
+    files: impl IntoIterator<Item = (usize, SsTableMeta)>,
+    sealing: Option<&ManifestSeal>,
+) -> io::Result<(Vec<u8>, Option<KeyId>)> {
+    let mut records = vec![
+        ManifestRecord::SetNextFileId(next_file_id),
+        ManifestRecord::SetLastSeq(last_seq),
+        ManifestRecord::SetMinWalId(min_wal_id),
+    ];
+    for (level, meta) in files {
+        validate_level_index(level)?;
+        records.push(ManifestRecord::AddFile { level, meta });
+    }
+    let mut image = VersionSet::stamp_bytes(sealing.map(|s| &s.salt));
+    let (batch, sealed_under) = VersionSet::encode_records(&records, image.len() as u64, sealing)?;
+    image.extend_from_slice(&batch);
+    Ok((image, sealed_under))
 }
 
 /// Identifier at the head of a MANIFEST: `REGOMAN` plus a format byte.
@@ -551,7 +617,8 @@ impl VersionSet {
         path: &Path,
         sealed: bool,
     ) -> io::Result<(BufferedWriter, Option<[u8; 16]>, u64)> {
-        let (stamp, salt) = Self::new_stamp(sealed)?;
+        let salt = sealed.then(sealed::fresh_salt).transpose()?;
+        let stamp = Self::stamp_bytes(salt.as_ref());
         let mut file = env.open_write(path, WriteMode::Truncate)?;
         file.write_all(&stamp)?;
         file.sync_all()?;
@@ -559,17 +626,13 @@ impl VersionSet {
         Ok((BufferedWriter::new(file), salt, stamp.len() as u64))
     }
 
-    /// The stamp of a new manifest: sealed with a fresh salt, or the
-    /// format 1 stamp.
-    fn new_stamp(sealed: bool) -> io::Result<(Vec<u8>, Option<[u8; 16]>)> {
-        if !sealed {
-            return Ok((Self::encode_stamp().to_vec(), None));
+    /// The stamp a manifest begins with: sealed under `salt` when there is
+    /// one, else the format 1 stamp.
+    fn stamp_bytes(salt: Option<&[u8; 16]>) -> Vec<u8> {
+        match salt {
+            Some(salt) => sealed::encode_stamp(&MANIFEST_MAGIC, salt).to_vec(),
+            None => Self::encode_stamp().to_vec(),
         }
-        let salt = sealed::fresh_salt()?;
-        Ok((
-            sealed::encode_stamp(&MANIFEST_MAGIC, &salt).to_vec(),
-            Some(salt),
-        ))
     }
 
     /// How batches are sealed for a manifest whose salt is `salt`. A sealed
@@ -775,31 +838,31 @@ impl VersionSet {
         if self.manifest_writer.is_none() {
             return Err(self.writer_unavailable());
         }
-        let (stamp, salt) = Self::new_stamp(self.keyring.is_some())?;
+        let salt = self
+            .keyring
+            .is_some()
+            .then(sealed::fresh_salt)
+            .transpose()?;
         let sealing = Self::sealing(self.keyring.as_ref(), salt)?;
         let version = self.current();
-
-        let mut records = Vec::new();
-        records.push(ManifestRecord::SetNextFileId(version.next_file_id));
-        records.push(ManifestRecord::SetLastSeq(version.last_seq));
-        records.push(ManifestRecord::SetMinWalId(version.min_wal_id));
-        for (level, files) in version.levels.iter().enumerate() {
-            for file in files {
-                records.push(ManifestRecord::AddFile {
-                    level,
-                    meta: file.meta.clone(),
-                });
-            }
-        }
-
-        let (encoded, sealed_under) =
-            Self::encode_records(&records, stamp.len() as u64, sealing.as_ref())?;
+        let (image, sealed_under) = encode_image(
+            version.next_file_id,
+            version.last_seq,
+            version.min_wal_id,
+            version
+                .levels
+                .iter()
+                .enumerate()
+                .flat_map(|(level, files)| {
+                    files.iter().map(move |file| (level, file.meta.clone()))
+                }),
+            sealing.as_ref(),
+        )?;
 
         let tmp_path = self.manifest_path.with_extension("tmp");
         {
             let mut file = self.env.open_write(&tmp_path, WriteMode::Truncate)?;
-            file.write_all(&stamp)?;
-            file.write_all(&encoded)?;
+            file.write_all(&image)?;
             file.sync_all()?;
         }
         // Close the log before replacing it. Windows refuses to replace
@@ -812,7 +875,7 @@ impl VersionSet {
         self.manifest_writer = None;
         self.env.rename(&tmp_path, &self.manifest_path)?;
         crate::env::sync_parent_dir(&*self.env, &self.manifest_path)?;
-        self.manifest_bytes = (stamp.len() + encoded.len()) as u64;
+        self.manifest_bytes = image.len() as u64;
         self.sealing = sealing;
         self.sealed_under = sealed_under.into_iter().collect();
 
@@ -1179,14 +1242,14 @@ impl VersionSet {
             for meta in files {
                 let path = sst_dir.join(sst_filename(meta.file_id));
                 let reader = Arc::new(
-                    SsTableReader::open_with(env, &path, meta.file_id, policy, keyring).map_err(
-                        |e| {
+                    SsTableReader::open_with(env, &path, meta.file_id, policy, keyring)
+                        .map_err(|e| {
                             if crate::Error::is_typed(&e) {
                                 return e;
                             }
                             std::io::Error::new(e.kind(), format!("open {}: {e}", path.display()))
-                        },
-                    )?,
+                        })?
+                        .with_global_seq(meta.global_seq),
                 );
                 version.levels[level].push(LiveSst::new(meta, reader));
             }
@@ -1260,6 +1323,7 @@ mod tests {
                 largest_key: summary.largest_user_key,
                 file_size,
                 num_entries: summary.num_entries,
+                global_seq: None,
             },
             reader,
         )
@@ -1283,6 +1347,7 @@ mod tests {
             largest_key: b"z".to_vec(),
             file_size: 128,
             num_entries: 2,
+            global_seq: None,
         }
     }
 
@@ -1410,6 +1475,18 @@ mod tests {
                     largest_key: b"zzz".to_vec(),
                     file_size: 4096,
                     num_entries: 128,
+                    global_seq: None,
+                },
+            },
+            ManifestRecord::AddFile {
+                level: 3,
+                meta: SsTableMeta {
+                    file_id: 100,
+                    smallest_key: b"b".to_vec(),
+                    largest_key: b"y".to_vec(),
+                    file_size: 512,
+                    num_entries: 3,
+                    global_seq: Some(77),
                 },
             },
             ManifestRecord::RemoveFile {
@@ -1439,6 +1516,52 @@ mod tests {
             assert_eq!(buf, rebuf);
             assert_eq!(pos, buf.len());
         }
+    }
+
+    #[test]
+    fn an_ingested_tables_record_carries_its_sequence_and_an_older_record_reads_without_one() {
+        let decoded = |bytes: &[u8]| {
+            let mut pos = 0;
+            match ManifestRecord::decode(bytes, &mut pos) {
+                Ok(Some(ManifestRecord::AddFile { meta, .. })) => meta.global_seq,
+                Ok(_) => panic!("decoded something other than an AddFile"),
+                Err(e) => panic!("decode failed: {e}"),
+            }
+        };
+        let mut ingested = Vec::new();
+        ManifestRecord::AddFile {
+            level: 5,
+            meta: SsTableMeta {
+                global_seq: Some(77),
+                ..test_meta(3)
+            },
+        }
+        .encode(&mut ingested);
+        assert_eq!(ingested[0], TAG_ADD_INGESTED_FILE);
+        assert_eq!(decoded(&ingested), Some(77));
+
+        // A table regolith wrote keeps the record every earlier manifest
+        // holds, byte for byte, and reads back without a sequence.
+        let mut written = Vec::new();
+        ManifestRecord::AddFile {
+            level: 5,
+            meta: test_meta(3),
+        }
+        .encode(&mut written);
+        assert_eq!(written[0], TAG_ADD_FILE);
+        assert_eq!(written.len() + 8, ingested.len());
+        assert_eq!(written[1..], ingested[1..written.len()]);
+        assert_eq!(decoded(&written), None);
+
+        // Sequences start at 1, so a recorded 0 is damage.
+        let len = ingested.len();
+        ingested[len - 8..].copy_from_slice(&0u64.to_le_bytes());
+        let mut pos = 0;
+        let err = match ManifestRecord::decode(&ingested, &mut pos) {
+            Err(e) => e,
+            Ok(_) => panic!("a record at sequence 0 was accepted"),
+        };
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 
     #[test]

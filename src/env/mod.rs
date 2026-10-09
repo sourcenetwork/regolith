@@ -44,6 +44,9 @@ mod types;
 // it is also the only target that has `js-sys` as a dependency.
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 pub mod opfs;
+// Pure, so it is unit-tested on the host as well as built for OPFS.
+#[cfg(any(test, all(target_arch = "wasm32", target_os = "unknown")))]
+mod persist_order;
 mod std_env;
 // WASI has `std::fs` but no threads. `WasiEnv` delegates every
 // filesystem call to `StdEnv` and says so where it matters: a spawn
