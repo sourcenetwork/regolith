@@ -229,3 +229,7 @@ harness = false
 [[bench]]
 name = "sync"
 harness = false
+
+[[bench]]
+name = "encryption"
+harness = false
