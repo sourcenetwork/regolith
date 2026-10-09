@@ -294,7 +294,11 @@ fn applying_tables_that_overlap_below_l0_trips_the_debug_check() {
 /// A MANIFEST holding exactly `records`, after its stamp.
 fn write_manifest(dir: &Path, records: &[ManifestRecord]) {
     let mut bytes = VersionSet::encode_stamp().to_vec();
-    bytes.extend_from_slice(&VersionSet::encode_records(records).unwrap());
+    bytes.extend_from_slice(
+        &VersionSet::encode_records(records, MANIFEST_STAMP_LEN as u64, None)
+            .unwrap()
+            .0,
+    );
     std::fs::write(dir.join("MANIFEST"), bytes).unwrap();
 }
 

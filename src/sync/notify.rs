@@ -9,12 +9,11 @@ use core::task::{Context, Poll};
 
 use super::internal::{AtomicUsize, Ordering, UnsafeCell};
 use super::list::List;
-use super::queue::{Arrivals, FIRST_BIT, Policy, Step, WaitQueue};
+use super::queue::{Arrivals, FIRST_BIT, Policy, QUEUED, Step, WaitQueue};
 use super::waiter::{Cancel, Wait, WakeList};
 
-const QUEUED: usize = 1 << FIRST_BIT;
 /// A `notify_one` found nobody waiting and left this for the next waiter.
-const PERMIT: usize = 1 << (FIRST_BIT + 1);
+const PERMIT: usize = 1 << FIRST_BIT;
 
 /// The payload a drainer leaves on a waiter it granted for `notify_one`,
 /// so a waiter dropped before it saw the grant passes it on. Waiters
@@ -139,8 +138,8 @@ impl Policy for Notify {
         &self.queue
     }
 
-    fn pass(&self, arrivals: Arrivals, woken: &mut WakeList<'_>) -> usize {
-        let pool = self.queue.pool();
+    fn pass(&self, arrivals: Arrivals, woken: &mut WakeList<'_>, _wake_front: bool) -> usize {
+        let pool = &self.queue;
         // SAFETY: only the drain role's holder runs a pass.
         self.waiting.with_mut(|waiting| unsafe {
             let waiting = &mut *waiting;
@@ -182,7 +181,7 @@ impl Policy for Notify {
 
 impl Drop for Notify {
     fn drop(&mut self) {
-        let pool = self.queue.pool();
+        let pool = &self.queue;
         // SAFETY: `&mut self` rules out a concurrent pass.
         self.waiting
             .with_mut(|waiting| unsafe { (*waiting).clear(pool) });
@@ -227,7 +226,7 @@ impl Future for Notified<'_> {
         } else if notify.generation() != this.generation || notify.take_permit() {
             true
         } else {
-            notify.enqueue(&mut this.wait, this.generation, cx.waker(), QUEUED);
+            notify.enqueue(&mut this.wait, this.generation, cx.waker());
             this.wait.poll(&notify.queue, None).is_ready()
         };
         this.done = ready;
@@ -243,7 +242,7 @@ impl Drop for Notified<'_> {
     fn drop(&mut self) {
         match self.wait.cancel(&self.notify.queue) {
             Cancel::Idle => {}
-            Cancel::Withdrawn => self.notify.withdrawn(),
+            Cancel::Withdrawn(_) => self.notify.withdrawn(false),
             Cancel::Granted(BY_ONE) => self.notify.notify_one(),
             Cancel::Granted(_) => {}
         }

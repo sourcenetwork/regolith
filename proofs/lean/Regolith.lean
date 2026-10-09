@@ -62,3 +62,29 @@ import Regolith.SyncFifo
 -- outcome, in the stated order, and attempts are isolated. Backs
 -- `proofs/tla/TxnCallbacks.tla`.
 import Regolith.Callbacks
+-- E29, E30: the open accepts every crash state of the manifest, keeps every
+-- synced batch, and replays no version above a newer table. Backs
+-- `proofs/tla/ManifestRecovery.tla`.
+import Regolith.ManifestRecovery
+-- D48: an ingest that survives a crash keeps every commit ordered before it.
+-- Backs `proofs/tla/IngestDurability.tla`.
+import Regolith.IngestDurability
+-- E27: retiring a tombstone no deeper run meets and no live snapshot is below
+-- changes no snapshot's read. Backs `proofs/tla/TombstoneRetirement.tla`.
+import Regolith.TombstoneRetirement
+-- 4.10, D53: per-thread I/O queues. A unit is claimed by one CAS and runs
+-- once, every registered queue is told exactly once and no other is, a
+-- request sits on its own queue, an idle owner is woken and a busy one
+-- never, and one thread finishes everything. Backs
+-- `proofs/tla/NonBlocking.tla`.
+import Regolith.IoQueue
+-- 4.12, D45: a sealed manifest batch keeps its checksum, checked before any
+-- key, so a torn batch and a wrong or missing key are never confused.
+-- Backs `proofs/tla/ManifestSeal.tla`. (The sealed log stamp is in
+-- WalRecovery.lean.)
+import Regolith.ManifestSeal
+-- 4.12, D57: a backup of an encrypted database seals its metadata; a
+-- restore checks every key before its first write, copies exactly what the
+-- tag covers and writes a sealed MANIFEST last. Backs
+-- `proofs/tla/BackupSeal.tla`.
+import Regolith.BackupSeal

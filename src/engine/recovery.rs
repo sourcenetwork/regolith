@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use super::internal_key;
 use super::memtable::MemTable;
+use super::seal::Keyring;
 use super::wal::{self, TailVerdict, Wal};
 use super::wal_replay::{WalPosition, WalReplayIter};
 use crate::env::Env;
@@ -21,12 +22,13 @@ const GROUP_BYTES: usize = 64 * 1024;
 /// Returns the largest sequence number recovered, at least
 /// `latest_seq`, and the tail the newest log dropped, if it dropped one,
 /// with that log's path. Only the newest log can drop a tail; damage in
-/// an earlier one is an error.
+/// an earlier one is an error. Sealed logs are read through `keyring`.
 pub(super) fn replay_logs(
     env: &Arc<dyn Env>,
     wal_files: &[PathBuf],
     memtable: &MemTable,
     mut latest_seq: u64,
+    keyring: Option<&Keyring>,
 ) -> io::Result<(u64, Option<(PathBuf, TailVerdict)>)> {
     let mut discarded = None;
     for (i, path) in wal_files.iter().enumerate() {
@@ -36,7 +38,7 @@ pub(super) fn replay_logs(
         } else {
             WalPosition::Earlier
         };
-        let mut replay = WalReplayIter::open(env, path, position)?;
+        let mut replay = WalReplayIter::open(env, path, position, keyring)?;
         while let Some(entry) = replay.next_entry()? {
             latest_seq = latest_seq.max(super::apply_replayed_wal_entry(memtable, entry));
         }
@@ -79,6 +81,26 @@ pub(super) fn report_discarded_tail(
         last_sequence,
     };
     crate::event_listener::dispatch(&options.listeners, |l| l.on_wal_tail_discarded(&info));
+}
+
+/// Tell the operator that the open dropped `tail` of the manifest at
+/// `path` as a crash's unsynced tail: a warn line, and the
+/// `ManifestTailDiscarded` and `ManifestTailDiscardedBytes` tickers.
+pub(super) fn report_dropped_manifest_tail(
+    options: &super::EngineOptions,
+    path: &Path,
+    tail: super::manifest::DroppedTail,
+) {
+    tracing::warn!(
+        path = %path.display(),
+        offset = tail.offset,
+        discarded_bytes = tail.bytes,
+        "discarded the end of the MANIFEST: no later batch proves it was made durable"
+    );
+    if let Some(stats) = options.statistics.as_ref() {
+        stats.add(Ticker::ManifestTailDiscarded, 1);
+        stats.add(Ticker::ManifestTailDiscardedBytes, tail.bytes);
+    }
 }
 
 pub(super) fn rewrite_recovered_memtable_to_wal(

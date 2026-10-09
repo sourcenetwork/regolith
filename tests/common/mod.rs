@@ -87,9 +87,21 @@ pub fn force_compaction(db: &Db) {
 /// power cut.
 pub mod fault;
 
+/// A key provider for encryption at rest, with keys by id and a movable
+/// current key.
+pub mod keys;
+
 /// A merge operator over values of three counters, with `touches`.
 pub mod parted;
 
 /// The format 2 write-ahead log layout, for tests that edit log bytes, and
 /// a listener that records the tails an open discards.
 pub mod wal_format;
+
+/// An `Env` that counts SSTable opens and reads, and can hold reads at the
+/// device: what the non-blocking read tests pin.
+pub mod device_env;
+
+/// An `Env` that refuses chosen log removals and, while armed, table
+/// creations: what the flush retirement tests pin.
+pub mod faulty_env;

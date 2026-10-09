@@ -248,7 +248,7 @@ mod tests {
             };
             let outcome = engine
                 .commit_optimistic(
-                    &checks,
+                    checks,
                     points,
                     Vec::new(),
                     merges,

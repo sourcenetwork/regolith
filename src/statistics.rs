@@ -141,9 +141,21 @@ pub enum Ticker {
     /// Bytes discarded from the end of the newest write-ahead log at open,
     /// summed over the discards [`Ticker::WalTailDiscarded`] counts.
     WalTailDiscardedBytes = 32,
+    /// Write-ahead logs that could not be removed once their writes were in
+    /// tables. Each is logged, never replayed, and removed again by the
+    /// next flush or open.
+    WalRemoveFailed = 33,
+    /// Opens that discarded the end of the MANIFEST: the bytes from its
+    /// first batch that does not read back whole, which no later batch
+    /// proves were made durable, as a crash leaves an unsynced tail. Each
+    /// is also logged with the file and the offset.
+    ManifestTailDiscarded = 34,
+    /// Bytes discarded from the end of the MANIFEST at open, summed over the
+    /// discards [`Ticker::ManifestTailDiscarded`] counts.
+    ManifestTailDiscardedBytes = 35,
 }
 
-const NUM_TICKERS: usize = 33;
+const NUM_TICKERS: usize = 36;
 
 impl Ticker {
     /// Every defined ticker, in discriminant order. Adding a variant
@@ -182,6 +194,9 @@ impl Ticker {
         Ticker::PolicyBlindMergesCommuted,
         Ticker::PolicyScanRunsDropped,
         Ticker::WalTailDiscardedBytes,
+        Ticker::WalRemoveFailed,
+        Ticker::ManifestTailDiscarded,
+        Ticker::ManifestTailDiscardedBytes,
     ];
 
     /// Stable string name for exporting to monitoring systems.
@@ -220,6 +235,9 @@ impl Ticker {
             Ticker::PolicyBlindMergesCommuted => "regolith.policy.blind_merges_commuted",
             Ticker::PolicyScanRunsDropped => "regolith.policy.scan_runs_dropped",
             Ticker::WalTailDiscardedBytes => "regolith.wal.tail_discarded_bytes",
+            Ticker::WalRemoveFailed => "regolith.wal.remove_failed",
+            Ticker::ManifestTailDiscarded => "regolith.manifest.tail_discarded",
+            Ticker::ManifestTailDiscardedBytes => "regolith.manifest.tail_discarded_bytes",
         }
     }
 }
@@ -610,7 +628,7 @@ mod tests {
 
     #[test]
     fn every_metric_name_is_unique_and_surface_prefixed() {
-        const SURFACES: [&str; 11] = [
+        const SURFACES: [&str; 12] = [
             "write",
             "read",
             "iter",
@@ -619,6 +637,7 @@ mod tests {
             "compaction",
             "flush",
             "wal",
+            "manifest",
             "snapshot",
             "commit",
             "policy",

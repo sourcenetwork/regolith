@@ -29,7 +29,7 @@ fn last_record(path: &Path) -> (u8, u64, u64) {
     let mut at = STAMP_LEN as u64;
     let mut last = None;
     while (at as usize) < bytes.len() {
-        let header = wal_frame::decode_header(&bytes[at as usize..], nonce, at).unwrap();
+        let header = wal_frame::decode_header(&bytes[at as usize..], nonce, at, false).unwrap();
         last = Some((header.kind, header.synced_through, at));
         at += header.record_len();
     }

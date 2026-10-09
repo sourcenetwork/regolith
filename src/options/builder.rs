@@ -219,6 +219,29 @@ impl Options {
         self
     }
 
+    /// Encrypt the database at rest under keys from `provider`. Unset by
+    /// default, in which case nothing is encrypted and nothing is paid.
+    ///
+    /// Every table block, write-ahead log record and manifest batch written
+    /// with a provider set is sealed with AES-256-GCM-SIV under
+    /// [`crate::KeyProvider::current`]; see [`crate::KeyProvider`] for the
+    /// key rules. A database written without encryption opens with a
+    /// provider and is sealed as its files are rewritten. An encrypted
+    /// database must always be opened with a provider that still provides
+    /// every key its files name: without one the open refuses with
+    /// [`crate::Error::KeyProviderRequired`], and a missing key refuses it
+    /// with [`crate::Error::UnknownKey`]. The provider's current key must be
+    /// one it provides, or the open refuses with
+    /// [`crate::Error::UnknownKey`].
+    ///
+    /// Also applies to [`crate::SstFileWriter`], which seals the tables it
+    /// builds under the same key.
+    #[must_use]
+    pub fn key_provider(mut self, provider: Arc<dyn crate::KeyProvider>) -> Self {
+        self.key_provider = Some(provider);
+        self
+    }
+
     /// Optional statistics sink. When set, every hot path in
     /// the engine updates the provided [`crate::Statistics`]
     /// object with tickers and histograms. The caller polls the
@@ -317,10 +340,19 @@ impl Options {
         self
     }
 
-    /// Soft cap on the number of in-memory memtables (active +
-    /// frozen). Reaching this count slows writes; reaching
-    /// `2 * max_write_buffer_number` stops them. `0` disables
-    /// this trigger. Default: 2.
+    /// Cap on the number of in-memory memtables (active + frozen).
+    ///
+    /// A write that fills the active memtable seals it, and the
+    /// background writes it out to a table: the compaction worker, or,
+    /// with none, the write that sealed it once it has committed. When
+    /// the flushes before it have not finished and one more sealed
+    /// memtable would pass this count, the write that fills the active
+    /// memtable writes the oldest out first, so a rotation never leaves
+    /// more than this many. `1` writes every sealed memtable out in the
+    /// write that sealed it. Memtables that cannot be written out (a
+    /// failing flush) still count: past this count writes slow down, and
+    /// at `2 * max_write_buffer_number` they stop. `0` disables the cap
+    /// and both triggers. Default: 2.
     #[must_use]
     pub fn max_write_buffer_number(mut self, max_write_buffer_number: usize) -> Self {
         self.max_write_buffer_number = max_write_buffer_number;

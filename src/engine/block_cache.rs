@@ -13,6 +13,7 @@ use xxhash_rust::xxh3::xxh3_64;
 use super::block::Block;
 use super::filter_block::FilterBlock;
 use super::index_block::IndexBlock;
+use super::io::IoRuntime;
 use crate::options::MAX_BLOCK_CACHE_SHARD_BITS;
 use crate::statistics::{Statistics, Ticker};
 
@@ -601,6 +602,10 @@ pub(crate) struct BlockCache {
     /// Optional statistics sink. When set, every `get` and
     /// `insert` call increments the corresponding tickers.
     stats: Option<Arc<Statistics>>,
+    /// The reads in flight for `CacheOnly` handles and the queues they
+    /// complete on: the cache's misses that are not read yet. Made by the
+    /// first `Db::io_queue`, so a database that never opens one pays nothing.
+    io: OnceLock<IoRuntime>,
 }
 
 impl BlockCache {
@@ -632,6 +637,7 @@ impl BlockCache {
                 total_used: AtomicUsize::new(0),
                 strict: strict_capacity_limit,
                 stats: None,
+                io: OnceLock::new(),
             };
         }
         let shard_bits = shard_bits.min(MAX_SHARD_BITS);
@@ -655,6 +661,28 @@ impl BlockCache {
             total_used: AtomicUsize::new(0),
             strict: strict_capacity_limit,
             stats: None,
+            io: OnceLock::new(),
+        }
+    }
+
+    /// The table of reads in flight for `CacheOnly` handles, made on first
+    /// use.
+    pub(crate) fn io(&self) -> &IoRuntime {
+        self.io.get_or_init(IoRuntime::new)
+    }
+
+    /// `close`: hand every queue waiting on a read its completion now. A
+    /// database that never opened a queue has nothing to do.
+    pub(crate) fn close_io(&self) {
+        if let Some(io) = self.io.get() {
+            io.close();
+        }
+    }
+
+    /// A close that failed: reads through queues make units again.
+    pub(crate) fn reopen_io(&self) {
+        if let Some(io) = self.io.get() {
+            io.reopen();
         }
     }
 

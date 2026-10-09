@@ -7,6 +7,17 @@
 //! to the active memtable, publishes the read horizon, and only then
 //! releases the followers.
 //!
+//! An optimistic transaction's commit is a member like any write (E10). The
+//! leader decides the group's transactions first, in group order, each
+//! against the view plus the writes of the members before it (`group.rs`,
+//! `GroupCommit.tla`), and only the members that validate take sequences
+//! and records. Each member learns its own outcome.
+//!
+//! A leader commits one group, of at most [`MAX_GROUP_MEMBERS`] members and
+//! [`MAX_GROUP_BYTES`] staged bytes, then hands the pipeline to the ticket
+//! at the head of the ring and wakes its writer (E21), so no writer serves an
+//! unbounded queue of others.
+//!
 //! Three invariants outrank throughput here, and every design choice below
 //! is subordinate to them.
 //!
@@ -42,15 +53,19 @@ use kovan_queue::array_queue::ArrayQueue;
 use super::callback::InCommit;
 use super::memtable::MemTable;
 use super::wal::{MAX_RECORD_LEN, Wal, check_write_len};
-use super::{CommitOutcome, DurabilityMode, ReadView, RegolithEngine, grouped_batch_ops};
-use crate::perf_context::{PerfTimer, PerfTimerField};
+use super::{
+    CommitOutcome, DurabilityMode, ReadView, RegolithEngine, ValidationSet, grouped_batch_ops,
+};
+use crate::perf_context::{PerfContextSnapshot, PerfTimer, PerfTimerField};
 use crate::statistics::{Histogram, Ticker};
-use crate::{Access, Conflict, WriteBatchOp};
+use crate::{Conflict, WriteBatchOp};
 
 mod allocate;
 mod append;
 mod content;
 mod counter;
+mod early;
+mod group;
 mod range_rule;
 mod read_rules;
 mod replaced;
@@ -58,17 +73,20 @@ mod request;
 mod slot;
 mod stall;
 mod terminator;
+mod txn;
 mod write_check;
 
-use append::AppendOrder;
 pub(crate) use append::PendingAppend;
+use early::EarlyVerdict;
 use replaced::Replaced;
 pub(crate) use request::WriteRequest;
+use request::batch_op_memtable_cost;
 pub(crate) use slot::WriteSlot;
 pub(crate) use stall::StallSignal;
 use terminator::Landed;
+pub(crate) use txn::Settled;
+use txn::{TxnRequest, Verdict};
 pub(crate) use write_check::EarlyWrite;
-use write_check::WriteCheck;
 
 /// Largest number of WAL bytes one group stages before it stops admitting.
 ///
@@ -79,6 +97,16 @@ use write_check::WriteCheck;
 /// group absolutely is the record limit (see
 /// [`RegolithEngine::admit_from_ring`]).
 const MAX_GROUP_BYTES: usize = 1024 * 1024;
+
+/// Most members one group admits, the leader's own request included (E21).
+///
+/// With [`MAX_GROUP_BYTES`] this bounds what one leadership turn costs: a
+/// leader commits one group and hands the pipeline on, so no writer serves
+/// an unbounded queue of others. Members are bounded as well as bytes
+/// because the decide stage validates each transaction in turn, so a group
+/// of many small transactions costs the leader more than its bytes say.
+/// 128 lets a group carry every writer of a 64-writer burst under one fsync.
+const MAX_GROUP_MEMBERS: usize = 128;
 
 /// Ceiling on how much stage capacity `trim_stage` ever keeps.
 ///
@@ -101,12 +129,14 @@ const MAX_KEPT_STAGE_BYTES: usize = 16 * MAX_GROUP_BYTES;
 const PARK_SLICE: Duration = Duration::from_micros(200);
 
 /// Ring capacity for pending commit tickets, sized from the machine's
-/// parallelism and clamped so a huge core count cannot balloon it.
+/// parallelism and clamped so a huge core count cannot balloon it. Never
+/// under two full groups, so a queue deeper than one group is what bounds a
+/// leader's turn (E21), not the ring.
 fn commit_ring_capacity() -> usize {
     thread::available_parallelism()
         .map(|n| n.get().saturating_mul(4))
         .unwrap_or(16)
-        .clamp(16, 1024)
+        .clamp(2 * MAX_GROUP_MEMBERS, 1024)
 }
 
 /// A group member: the work, plus the slot to complete when the group is
@@ -115,6 +145,45 @@ fn commit_ring_capacity() -> usize {
 struct GroupTicket {
     slot: Option<Arc<WriteSlot>>,
     request: WriteRequest,
+    /// The decide stage's verdict on a transaction member; `None` for a
+    /// plain write, which is not validated.
+    verdict: Option<io::Result<Verdict>>,
+    /// What deciding a transaction member counted, for its own thread's
+    /// perf context; `None` unless that thread counts.
+    perf: Option<Box<PerfContextSnapshot>>,
+}
+
+impl GroupTicket {
+    fn new(slot: Option<Arc<WriteSlot>>, request: WriteRequest) -> Self {
+        Self {
+            slot,
+            request,
+            verdict: None,
+            perf: None,
+        }
+    }
+
+    /// What this member learns from a group that landed, given the `ops`
+    /// sequences it took, the last of them `last`.
+    fn settle(self, ops: u64, last: u64) -> io::Result<Settled> {
+        match self.verdict {
+            None => Ok(Settled::Write(last)),
+            Some(Ok(Verdict::Accept {
+                merges_commuted,
+                writes_elided,
+            })) => Ok(Settled::Committed {
+                seq: (ops > 0).then_some(last),
+                merges_commuted,
+                writes_elided,
+                perf: self.perf,
+            }),
+            Some(Ok(Verdict::Conflict(conflict))) => Ok(Settled::Conflict {
+                conflict,
+                perf: self.perf,
+            }),
+            Some(Err(err)) => Err(err),
+        }
+    }
 }
 
 /// Leader-owned scratch, guarded by the pipeline mutex so only the leader
@@ -131,11 +200,10 @@ pub(crate) struct Pipeline {
     /// `trim_stage` keeps, so a group cannot shrink a stage the group
     /// before it just grew.
     prev_staged: usize,
-    /// A ticket admission popped but could not add without taking the
-    /// group past the record limit. It heads the next group. `None`
-    /// whenever the pipeline mutex is released by a normal return: every
-    /// path that admits ends in `drain_locked`, which does not return
-    /// while it holds one.
+    /// The ticket that heads the next group: one admission popped but could
+    /// not add without taking the group past the record limit, or the head
+    /// of the ring a leader took out to hand the pipeline to (E21). Whoever
+    /// leads next admits it first.
     held: Option<GroupTicket>,
 }
 
@@ -288,20 +356,16 @@ impl RegolithEngine {
 
     /// Attempt to commit an optimistic transaction's buffered writes.
     ///
-    /// The conflict check and the apply run under one uninterrupted hold
-    /// of the pipeline mutex, so no other write can land between them.
-    /// The transaction is committed as a group of exactly one: batching a
-    /// transaction with a concurrent plain write would let the write land
-    /// in the same group the conflict check already looked past, which is
-    /// precisely the write-write conflict the check exists to catch.
-    ///
-    /// The checks and the apply also share one view: the active memtable is
-    /// replaced only under the pipeline mutex, so the memtable the checks read
-    /// is the memtable the group lands in unless this leader rotates it, and
-    /// `rotate_if_full` hands the apply the fresh view in that case.
+    /// The commit joins the commit groups plain writes use (E10): one WAL
+    /// append and at most one fsync per group. The leader decides it in group
+    /// order against the view plus the writes of the members before it in
+    /// the group (`group.rs`), so it gets the verdict committing the members
+    /// one at a time would give it. A conflict, and every failure of its own
+    /// check, are its own; a group whose log write or sync fails fails every
+    /// member, as a plain write's group does.
     pub(crate) fn commit_optimistic(
         &self,
-        checks: &crate::engine::ValidationSet,
+        checks: ValidationSet,
         point_ops: std::collections::BTreeMap<Vec<u8>, Option<Vec<u8>>>,
         range_deletes: Vec<(Vec<u8>, Vec<u8>)>,
         merges: Vec<(Vec<u8>, Vec<u8>)>,
@@ -310,27 +374,80 @@ impl RegolithEngine {
     ) -> io::Result<CommitOutcome> {
         self.ensure_writable()?;
         let ops = grouped_batch_ops(point_ops, range_deletes, merges);
-        self.validate_ops_sizes(&ops, false)?;
+        let mut record_bound = self.validate_ops_sizes(&ops, false)?;
+        let mut cost_bound = ops
+            .iter()
+            .map(batch_op_memtable_cost)
+            .fold(0usize, usize::saturating_add);
         if !appends.is_empty() {
-            self.validate_append_sizes(&ops, &appends)?;
+            let (framed, append_cost) = self.validate_append_sizes(&ops, &appends)?;
+            record_bound = framed;
+            cost_bound = cost_bound.saturating_add(append_cost);
         }
 
         // The write-stall admission a plain write pays with
         // `WriteOptions::default()`, in the same order: closed/WAL-failed/
         // read-only above, then size validation above, then the wait, and
-        // only then the pipeline mutex below. Never inside that mutex: a
+        // only then the commit pipeline below. Never inside it: a
         // `CompactInline` wait runs a compaction pass on this thread, and
         // that pass must not be entered while any commit-path lock is
         // held. A commit that writes nothing (`ops` empty, e.g. a
         // `get_for_update` with no write) takes no capacity and skips the
-        // wait, though its conflict check below still runs under the
-        // mutex like any other commit. An append is a write.
+        // wait, though its conflict check still runs in a commit group like
+        // any other commit. An append is a write.
         if !ops.is_empty() || !appends.is_empty() {
             self.wait_for_write_capacity(false)
                 .map_err(crate::Error::into_io_error)?;
         }
 
-        self.commit_locked(checks, ops, appends, durability)
+        // Checked up to the horizon here, on this thread and outside the
+        // pipeline mutex; the leader checks only what landed above it.
+        let early = match self.check_early(&checks, &ops)? {
+            EarlyVerdict::Conflict(conflict) => return Ok(CommitOutcome::Conflict(conflict)),
+            EarlyVerdict::Marks(early) => early,
+        };
+        let settled = self.submit_settled(WriteRequest::Txn(TxnRequest {
+            checks,
+            ops,
+            appends,
+            durability,
+            record_bound,
+            cost_bound,
+            perf: crate::PerfContext::level(),
+            early,
+        }))?;
+        match settled {
+            Settled::Committed {
+                seq,
+                merges_commuted,
+                writes_elided,
+                perf,
+            } => {
+                if let Some(counted) = perf {
+                    crate::perf_context::absorb(&counted);
+                }
+                // Counted while validating, recorded here, off the commit
+                // pipeline and only once the commit landed.
+                if let Some(s) = self.statistics() {
+                    if merges_commuted > 0 {
+                        s.add(Ticker::PolicyBlindMergesCommuted, merges_commuted);
+                    }
+                    if writes_elided > 0 {
+                        s.add(Ticker::CommitWritesElided, writes_elided);
+                    }
+                }
+                Ok(CommitOutcome::Ok { seq })
+            }
+            Settled::Conflict { conflict, perf } => {
+                if let Some(counted) = perf {
+                    crate::perf_context::absorb(&counted);
+                }
+                Ok(CommitOutcome::Conflict(conflict))
+            }
+            Settled::Write(_) => Err(io::Error::other(
+                "a transaction's commit settled as a plain write",
+            )),
+        }
     }
 
     /// Commit a transaction that writes nothing: check the reads it asked to
@@ -375,240 +492,25 @@ impl RegolithEngine {
         Ok(CommitOutcome::Ok { seq: None })
     }
 
-    /// The conflict check and the apply, under one uninterrupted hold of
-    /// the pipeline mutex. Split out of [`Self::commit_optimistic`] so the
-    /// admission wait above does not share a function body with this loop
-    /// once `Transaction::commit_inner` inlines both: sharing one grew
-    /// large enough to cost the loop its rotation, adding a per-key
-    /// instruction count no admission check should touch.
-    fn commit_locked(
-        &self,
-        checks: &crate::engine::ValidationSet,
-        mut ops: Vec<WriteBatchOp>,
-        appends: Vec<PendingAppend>,
-        durability: DurabilityMode,
-    ) -> io::Result<CommitOutcome> {
-        let mut pipe = self.pipeline.lock();
-
-        let view = self.view.load();
-        // Counted while validating, recorded once off the pipeline mutex and
-        // only after the commit succeeded: an abort or an I/O failure adds
-        // nothing.
-        let mut merges_commuted = 0u64;
-        let mut writes_elided = 0u64;
-        // Reads first, then the written keys in operation order: point
-        // operations arrive sorted from the write map, merges after them
-        // sorted by key, so a multi-key conflict names the same key on
-        // every run.
-        for check in &checks.reads {
-            if let Some((latest_seq, newest)) = self.latest_version_in_view(&check.key, &view)?
-                && latest_seq > check.observed_seq
-                // Only a newer version can have changed what the read
-                // decided, and the read's rule says whether this one did: a
-                // presence-only read needs the key gone, a value read the
-                // bytes different, a projected read a part touched.
-                && let Some((seq, theirs)) =
-                    self.read_changed(check, (latest_seq, newest), u64::MAX, &view)?
-            {
-                // A key the transaction *read* aborts when the rule says the
-                // stale read may have changed what it decided. The
-                // commit-level `CommitConflicts` ticker is recorded once per
-                // commit where the outcome is mapped; this is the per-key
-                // subset.
-                if let Some(s) = self.statistics() {
-                    s.add(Ticker::CommitConflictsOnRead, 1);
-                }
-                return Ok(CommitOutcome::Conflict(Conflict::new(
-                    check.key.clone(),
-                    check.access,
-                    theirs,
-                    check.observed_seq,
-                    seq,
-                )));
-            }
-        }
-        // A validated scan decided on a whole range, so a write anywhere in it
-        // after the snapshot is a conflict, a key that left it or appeared in
-        // it alike.
-        for range in &checks.ranges {
-            if let Some((key, seq, theirs)) =
-                self.written_in_range(&range.lo, &range.hi, range.observed_seq, &view)?
-            {
-                if let Some(s) = self.statistics() {
-                    s.add(Ticker::CommitConflictsOnRead, 1);
-                }
-                return Ok(CommitOutcome::Conflict(Conflict::new(
-                    key,
-                    Access::ScannedRange,
-                    theirs,
-                    range.observed_seq,
-                    seq,
-                )));
-            }
-        }
-        // The merges arrive sorted by key, so a key merged N times in one
-        // transaction is probed once, not N times: a repeat of the previous
-        // merged key is skipped, since another probe would just walk the
-        // same pipeline-mutex-held view again for an answer already known.
-        // Only an optimization: a repeat probe lands on the same outcome, so
-        // no correctness rests on the order. A key with both a point op and
-        // a merge op is still probed twice, since the point op and the first
-        // merge op are seen as distinct writes here; `write_matches_committed`
-        // refuses any key carrying a merge op, so both probes land on the
-        // same outcome.
-        if let Some(observed_seq) = checks.writes_at {
-            // Borrows the batch and allocates nothing: the loop below runs
-            // under the pipeline mutex.
-            let replaced = checks.blind_merges_commute.then(|| Replaced::of(&ops));
-            // Whether anything committed since the snapshot, which only an
-            // exempt put has any use for: with no exempt key, or nothing
-            // newer, no put is looked up.
-            let landed_since =
-                !checks.exempt.is_empty() && self.latest_seq.load(Ordering::Acquire) > observed_seq;
-            let mut last_merged: Option<&[u8]> = None;
-            for op in &ops {
-                let (key, mine) = match op {
-                    WriteBatchOp::Put { key, .. } => (key, Access::Put),
-                    WriteBatchOp::Delete { key } => (key, Access::Delete),
-                    WriteBatchOp::Merge { key, .. } => {
-                        if last_merged == Some(key.as_slice()) {
-                            continue;
-                        }
-                        last_merged = Some(key.as_slice());
-                        (key, Access::Merge)
-                    }
-                    // Range deletes are not validated (transaction.rs:459-460).
-                    WriteBatchOp::DeleteRange { .. } => continue,
-                };
-                // The caller exempted this key from validation, so a newer
-                // write of it is no conflict and its lookup is not worth
-                // making. A search of a sorted list, no hash and no
-                // allocation, and an empty list unless a key classifier
-                // named keys.
-                // vertexia: O(log exempt keys) per written key; a merge-join
-                // over the sorted point and merge runs is O(1) if a very
-                // large exempt list ever shows in a profile.
-                if checks
-                    .exempt
-                    .binary_search_by(|exempt| exempt.as_slice().cmp(key))
-                    .is_ok()
-                {
-                    // The one lookup an exempt put can cost: the key names
-                    // its bytes, so a put beside different ones breaks the
-                    // contract and the commit is refused loudly.
-                    if landed_since
-                        && let WriteBatchOp::Put { value, .. } = op
-                        && self.content_mismatch(key, value, observed_seq, &view)?
-                    {
-                        tracing::error!(
-                            "a content-addressed key was put with bytes that differ from \
-                             the bytes it holds; the commit was refused"
-                        );
-                        return Err(crate::Error::ContentMismatch.into_io_error());
-                    }
-                    continue;
-                }
-                // A written key the transaction also read was validated above,
-                // at the read's anchor and without the elision below. A
-                // presence-only read does not stand for the write, so that
-                // key goes on to the check below.
-                if checks
-                    .reads
-                    .binary_search_by(|read| read.key.as_slice().cmp(key))
-                    .is_ok_and(|at| !checks.reads[at].presence_only())
-                {
-                    continue;
-                }
-                match self.check_write(
-                    key,
-                    mine,
-                    observed_seq,
-                    replaced.as_ref(),
-                    &view,
-                    |theirs| self.write_matches_committed(key, &ops, &view, theirs),
-                )? {
-                    WriteCheck::Clean => {}
-                    WriteCheck::Commuted => merges_commuted += 1,
-                    WriteCheck::Elided => writes_elided += 1,
-                    WriteCheck::Conflict { seq, theirs } => {
-                        if let Some(s) = self.statistics() {
-                            s.add(Ticker::CommitConflictsOnWrite, 1);
-                        }
-                        return Ok(CommitOutcome::Conflict(Conflict::new(
-                            key.clone(),
-                            mine,
-                            theirs,
-                            observed_seq,
-                            seq,
-                        )));
-                    }
-                }
-            }
-        }
-
-        // The commit validated, so its appends take their positions now, and
-        // only now: in the ordered step, after validation and before the
-        // record is staged. The group is this commit alone, so the order
-        // starts from the view and nothing outlives the group.
-        if !appends.is_empty() {
-            // The layout is the caller's code, so a panic in it is caught
-            // and latches the database read-only, as one anywhere in the
-            // ordered step does.
-            let _commit = InCommit::enter();
-            let mut order = AppendOrder::default();
-            if let Err(err) = order.number(self, &view, appends, &mut ops) {
-                if let Some(callback) = crate::Error::callback_panic_of(&err) {
-                    self.latch_callback_panic(callback);
-                }
-                return Err(err);
-            }
-            order.finish(&mut ops);
-        }
-
-        // A read-only transaction still has to be validated: a
-        // `get_for_update` with no write is exactly the read whose
-        // conflict a lost-update check exists to catch. Short-circuit
-        // only after the check, never before it.
-        if ops.is_empty() {
-            return Ok(CommitOutcome::Ok { seq: None });
-        }
-        let op_count = ops.len() as u64;
-
-        let request = WriteRequest::Batch {
-            ops,
-            durability,
-            disable_wal: false,
-        };
-        release_stranded(&mut pipe.group);
-        pipe.group.push(GroupTicket {
-            slot: None,
-            request,
-        });
-        let result = self.run_and_complete(&mut pipe, view);
-        self.drain_locked(&mut pipe);
-        drop(pipe);
-
-        if result.is_ok()
-            && let Some(s) = self.statistics()
-        {
-            if merges_commuted > 0 {
-                s.add(Ticker::PolicyBlindMergesCommuted, merges_commuted);
-            }
-            if writes_elided > 0 {
-                s.add(Ticker::CommitWritesElided, writes_elided);
-            }
-        }
-        // The group is this commit alone, so its base sequence is the first of
-        // the `op_count` this batch took, and the last is where its writes
-        // became visible.
-        result.map(|base_seq| CommitOutcome::Ok {
-            seq: Some(base_seq + op_count - 1),
-        })
+    /// Hand a plain write to the commit pipeline and block until its group
+    /// is durable and applied, or until that group fails. Returns the last
+    /// sequence its operations took.
+    fn submit(&self, request: WriteRequest) -> io::Result<u64> {
+        self.submit_settled(request).and_then(Settled::into_seq)
     }
 
     /// Hand `request` to the commit pipeline and block until its group is
-    /// durable and applied, or until that group fails.
-    fn submit(&self, request: WriteRequest) -> io::Result<u64> {
+    /// durable and applied, or until that group fails, and return what the
+    /// group decided for it. Then, on a database with no worker, run the
+    /// bounded step of background work the writes left owing, if any, now
+    /// that this commit holds nothing of the pipeline.
+    fn submit_settled(&self, request: WriteRequest) -> io::Result<Settled> {
+        let settled = self.commit_through_pipeline(request);
+        self.run_owed_step();
+        settled
+    }
+
+    fn commit_through_pipeline(&self, request: WriteRequest) -> io::Result<Settled> {
         // Uncontended path: nobody is committing, so lead a group carrying
         // this request plus anything already queued behind it. One fsync
         // covers all of it.
@@ -637,73 +539,99 @@ impl RegolithEngine {
         }
 
         while !slot.is_done() {
-            // Anyone may lead. Whoever wins the mutex drains for everyone,
-            // which may complete this very ticket.
-            if self.try_drain() {
-                continue;
+            // Anyone may lead one group, which may complete this very ticket.
+            // A leader hands the pipeline to the ticket at the head of the
+            // ring and wakes its writer, so this one parks after a turn
+            // instead of serving the queue behind it (E21); it wakes when its
+            // ticket completes, or when the pipeline is handed to it.
+            if self.try_drain() && slot.is_done() {
+                break;
             }
             thread::park_timeout(PARK_SLICE);
         }
 
-        slot.finish()
+        slot.finish_settled()
     }
 
-    /// Lead a group whose first member is the caller's own `request`, then
-    /// drain anything that arrived while it ran. Returns that request's
-    /// outcome.
-    pub(super) fn lead_with(&self, pipe: &mut Pipeline, request: WriteRequest) -> io::Result<u64> {
+    /// Lead one group whose first member is the caller's own `request`, then
+    /// hand the pipeline to the next writer waiting (E21). Returns that
+    /// request's outcome.
+    pub(super) fn lead_with(
+        &self,
+        pipe: &mut Pipeline,
+        request: WriteRequest,
+    ) -> io::Result<Settled> {
         release_stranded(&mut pipe.group);
-        pipe.group.push(GroupTicket {
-            slot: None,
-            request,
-        });
+        pipe.group.push(GroupTicket::new(None, request));
         let view = self.view.load();
         self.admit_from_ring(pipe, &view, MAX_RECORD_LEN as usize);
 
-        let result = self.run_and_complete(pipe, view);
-        self.drain_locked(pipe);
+        let result = self.run_and_complete(pipe, view).unwrap_or_else(|| {
+            Err(io::Error::other(
+                "a commit group finished without the leader's own write",
+            ))
+        });
+        self.hand_off(pipe);
         result
     }
 
-    /// Become the leader if nobody else is, and drain the ring dry.
-    /// Returns whether this call held the pipeline mutex.
+    /// Become the leader if nobody else is, commit one group from the ring,
+    /// and hand the pipeline on. Returns whether this call held the
+    /// pipeline mutex.
     fn try_drain(&self) -> bool {
         let Some(mut pipe) = self.pipeline.try_lock() else {
             return false;
         };
-        self.drain_locked(&mut pipe);
+        self.lead_one(&mut pipe);
         true
     }
 
-    /// Run group after group until the ring is empty and no ticket is
-    /// held.
-    ///
-    /// Re-checking the ring after each group is half of what closes the
-    /// drain-then-push race; the other half is the follower's own
-    /// `try_drain` retry, which covers a ticket pushed after this loop's
-    /// last `pop` but before the mutex is released.
-    fn drain_locked(&self, pipe: &mut Pipeline) {
-        loop {
-            release_stranded(&mut pipe.group);
-            // The common exit: nothing queued behind the group just run,
-            // and no ticket was held back for the next one. Checked
-            // before the view load so the empty pass costs no lock and no
-            // Arc.
-            if pipe.held.is_none() && self.commit_ring.is_empty() {
-                return;
-            }
-            let view = self.view.load();
-            self.admit_from_ring(pipe, &view, MAX_RECORD_LEN as usize);
-            if pipe.group.is_empty() {
-                return;
-            }
+    /// Commit one group of the tickets waiting, the held one first, then
+    /// hand the pipeline on. A drain leads no request of its own.
+    fn lead_one(&self, pipe: &mut Pipeline) {
+        release_stranded(&mut pipe.group);
+        // The common exit: nothing queued and nothing held. Checked before
+        // the view load so the empty pass costs no lock and no Arc.
+        if pipe.held.is_none() && self.commit_ring.is_empty() {
+            return;
+        }
+        let view = self.view.load();
+        self.admit_from_ring(pipe, &view, MAX_RECORD_LEN as usize);
+        if !pipe.group.is_empty() {
             let _ = self.run_and_complete(pipe, view);
+        }
+        self.hand_off(pipe);
+    }
+
+    /// End a leadership turn (E21): a leader commits one bounded group and
+    /// no more, so the ticket at the head of the ring leads the next one. It
+    /// is taken out of the ring to head that group, which keeps ring order,
+    /// and its writer is woken to lead it.
+    ///
+    /// If that writer is slow to run, any writer that takes the pipeline
+    /// first commits the held ticket in its own group, so nothing waits on
+    /// one thread. A writer that pushes its ticket after the ring was found
+    /// empty here and before the mutex is released is covered by its own
+    /// `try_drain` after the push, and by its bounded park.
+    fn hand_off(&self, pipe: &mut Pipeline) {
+        if pipe.held.is_none()
+            && !self.commit_ring.is_empty()
+            && let Some(slot) = self.commit_ring.pop()
+        {
+            let request = slot.take_request();
+            pipe.held = Some(GroupTicket::new(Some(slot), request));
+        }
+        if let Some(GroupTicket {
+            slot: Some(slot), ..
+        }) = &pipe.held
+        {
+            slot.wake();
         }
     }
 
     /// Pop tickets into the current group until the ring is empty, the
-    /// group's staged byte cap is reached, or the group would carry the
-    /// active memtable past `write_buffer_size`.
+    /// group's staged byte cap or member cap is reached, or the group would
+    /// carry the active memtable past `write_buffer_size`.
     ///
     /// The first ticket is always admitted, whatever it costs, so a write
     /// larger than either cap commits alone instead of starving. That one
@@ -716,6 +644,10 @@ impl RegolithEngine {
     /// it, which `run_and_complete` refuses. A held ticket is taken
     /// before the ring, which keeps ring order.
     fn admit_from_ring(&self, pipe: &mut Pipeline, view: &ReadView, record_limit: usize) {
+        // Nothing waits: the common uncontended commit sizes nothing.
+        if pipe.held.is_none() && self.commit_ring.is_empty() {
+            return;
+        }
         let room = self.memtable_room(view);
         // `lead_with` seeds the group with the leader's own request
         // before calling in, so the running totals start from what is
@@ -723,20 +655,26 @@ impl RegolithEngine {
         let mut staged: usize = pipe.group.iter().map(|t| t.request.staged_len()).sum();
         let mut projected: usize = pipe.group.iter().map(|t| t.request.memtable_cost()).sum();
         loop {
-            if !pipe.group.is_empty() && (staged >= MAX_GROUP_BYTES || projected >= room) {
+            if !pipe.group.is_empty()
+                && (staged >= MAX_GROUP_BYTES
+                    || projected >= room
+                    || pipe.group.len() >= MAX_GROUP_MEMBERS)
+            {
                 return;
             }
             let ticket = match pipe.held.take() {
                 Some(ticket) => ticket,
                 None => {
+                    // Two plain loads; a `pop` of an empty ring pays a full
+                    // fence to say so, on every commit nobody queued behind.
+                    if self.commit_ring.is_empty() {
+                        return;
+                    }
                     let Some(slot) = self.commit_ring.pop() else {
                         return;
                     };
                     let request = slot.take_request();
-                    GroupTicket {
-                        slot: Some(slot),
-                        request,
-                    }
+                    GroupTicket::new(Some(slot), request)
                 }
             };
             let len = ticket.request.staged_len();
@@ -769,11 +707,21 @@ impl RegolithEngine {
         }
     }
 
-    /// Commit the staged group, then release every follower in it.
+    /// Decide, commit and complete the staged group, then release every
+    /// follower in it. Returns the outcome of the leader's own request, the
+    /// one ticket with no slot, when the group carries one.
     ///
     /// Completion happens after [`Self::run_group`] has published the read
-    /// horizon (the lost-update fix) and hands the same outcome to every member (G2).
-    fn run_and_complete(&self, pipe: &mut Pipeline, view: Arc<ReadView>) -> io::Result<u64> {
+    /// horizon (the lost-update fix). Each member learns its own outcome: a
+    /// plain write its last sequence, a transaction its verdict. A group that
+    /// fails hands every member the same error (G2), a member the leader had
+    /// decided to abort included, as a run one at a time under the same
+    /// persistent fault would fail it too.
+    fn run_and_complete(
+        &self,
+        pipe: &mut Pipeline,
+        view: Arc<ReadView>,
+    ) -> Option<io::Result<Settled>> {
         let _commit = InCommit::enter();
         let Pipeline {
             stage,
@@ -781,24 +729,22 @@ impl RegolithEngine {
             prev_staged,
             ..
         } = pipe;
-        // Summed again here rather than carried over from admission:
-        // `commit_optimistic` seeds a group without going through
-        // `admit_from_ring`, and the sum is one add per ticket.
-        let staged: usize = group.iter().map(|t| t.request.staged_len()).sum();
-        // The last line of defence, for a request that reached the
-        // pipeline without its producer's check: admission never
-        // combines requests past the limit, so a group over it is a
-        // single request, and it is refused whole before `run_group`
-        // rotates, takes a sequence number or touches the log. The stage
-        // is emptied as `run_group`'s own early returns empty it, so the
-        // trim below reads no stale length.
-        let result = match check_write_len(staged) {
-            Ok(()) => self.run_group(stage, group, view, staged),
-            Err(err) => {
-                stage.clear();
-                Err(err)
-            }
-        };
+        // Emptied first, so a group that fails before it encodes leaves no
+        // previous group's length behind for the trim below.
+        stage.clear();
+        let result = self.decide(group, &view).and_then(|()| {
+            // Summed after the decide stage, which turned every transaction
+            // into what it actually stages, and not carried over from
+            // admission, which summed bounds.
+            let staged: usize = group.iter().map(|t| t.request.staged_len()).sum();
+            // The last line of defence, for a request that reached the
+            // pipeline without its producer's check: admission never
+            // combines requests past the limit, so a group over it is a
+            // single request, and it is refused whole before `run_group`
+            // rotates, takes a sequence number or touches the log.
+            check_write_len(staged)?;
+            self.run_group(stage, group, view, staged)
+        });
         // A caller's code panicked inside the group: the step it left half
         // done is not one any later write may build on.
         if let Err(err) = &result
@@ -810,27 +756,35 @@ impl RegolithEngine {
         // assigned, not the group's maximum. An upper layer ordering its
         // versions against regolith's needs the sequence of the write it
         // made, and a group can carry many writers' batches.
+        let mut own = None;
         let mut seq = result.as_ref().ok().copied().unwrap_or(0);
         for ticket in group.drain(..) {
             let ops = ticket.request.op_count();
             let last = seq.saturating_add(ops).saturating_sub(1);
-            if let Some(slot) = ticket.slot {
-                slot.complete(match &result {
-                    Ok(_) => Ok(last),
-                    Err(e) => Err(crate::Error::clone_io(e)),
-                });
+            let slot = ticket.slot.clone();
+            let outcome = match &result {
+                Ok(_) => ticket.settle(ops, last),
+                Err(e) => Err(crate::Error::clone_io(e)),
+            };
+            match slot {
+                Some(slot) => slot.complete(outcome),
+                None => own = Some(outcome),
             }
             seq = last.saturating_add(1);
         }
+        // The leader's own request keeps the original error, raw OS code
+        // included; the followers get copies (`io::Error` is not `Clone`).
+        if let (Err(err), Some(Err(_))) = (result, &own) {
+            own = Some(Err(err));
+        }
         // Trimmed by what is actually resident (`stage.len()`), not by
-        // `staged`: a group that failed before encoding stages nothing,
-        // and crediting it with `staged` bytes would let a refused
-        // reservation pin an older group's capacity alive under a size
-        // that was never reserved.
+        // the staged sum: a group that failed before encoding stages
+        // nothing, and crediting it with bytes it never reserved would let
+        // a refused reservation pin an older group's capacity alive.
         let used = stage.len();
         trim_stage(stage, *prev_staged, used);
         *prev_staged = used;
-        result
+        own
     }
 
     /// Write, sync and apply one group.
@@ -907,29 +861,12 @@ impl RegolithEngine {
             // are on, so a write with them off pays no clock read at
             // all.
             let wal_start = self.statistics().and_then(|_| self.env.now_micros());
-            let mut guard = self.active_wal.lock();
-            let wal = guard.as_mut().ok_or_else(Self::read_only_error)?;
-            let start_offset = wal.offset();
-
-            if let Err(err) = wal.append_group(stage) {
-                self.abandon_group(wal, start_offset, &err)?;
-                return Err(err);
-            }
-
-            let mut synced = 0u64;
-            if any_immediate {
-                if let Err(err) = wal.sync_data() {
-                    self.abandon_group(wal, start_offset, &err)?;
-                    return Err(err);
-                }
-                synced = 1;
-            }
-            drop(guard);
+            let synced = self.log_group(stage, any_immediate)?;
 
             if let Some(s) = self.statistics() {
                 s.add(Ticker::WalBytesWritten, reported_bytes);
-                if synced > 0 {
-                    s.add(Ticker::WalSyncCount, synced);
+                if synced {
+                    s.add(Ticker::WalSyncCount, 1);
                 }
                 // `None` means the platform has no clock. Skip the
                 // recording rather than publishing a zero that reads
@@ -961,6 +898,36 @@ impl RegolithEngine {
         // followers only after this returns.
         self.visible_seq.publish(base_seq + total_ops - 1);
         Ok(base_seq)
+    }
+
+    /// Append a group's records to the log in one write, and make them
+    /// durable with the group's one fsync when `sync` (a member asked for
+    /// Immediate durability). Returns whether it synced. A failure of either
+    /// discards the group's bytes, so no member reads as committed (G2).
+    fn log_group(&self, stage: &[u8], sync: bool) -> io::Result<bool> {
+        let mut guard = self.active_wal.lock();
+        let wal = guard.as_mut().ok_or_else(Self::read_only_error)?;
+        let start_offset = wal.offset();
+        if let Err(err) = wal.append_group(stage) {
+            self.abandon_group(wal, start_offset, &err)?;
+            return Err(err);
+        }
+        if sync {
+            self.sync_group(wal, start_offset)?;
+        }
+        Ok(sync)
+    }
+
+    /// The group's fsync: one `fdatasync` that makes every record the group
+    /// appended at `start_offset` and after durable, and the one place an
+    /// Immediate commit waits for the device. Nothing of the group is applied
+    /// or visible before it returns. A failure discards the group's bytes.
+    fn sync_group(&self, wal: &mut Wal, start_offset: u64) -> io::Result<()> {
+        if let Err(err) = wal.sync_data() {
+            self.abandon_group(wal, start_offset, &err)?;
+            return Err(err);
+        }
+        Ok(())
     }
 
     /// Discard a group whose WAL work failed.
@@ -1014,6 +981,15 @@ mod append_tests;
 
 #[cfg(test)]
 mod exempt_tests;
+
+#[cfg(test)]
+mod early_tests;
+
+#[cfg(test)]
+mod group_tests;
+
+#[cfg(test)]
+mod leader_tests;
 
 #[cfg(test)]
 mod limit_tests;
@@ -1077,6 +1053,16 @@ mod tests {
         assert_eq!(cloned.to_string(), err.to_string());
     }
 
+    /// Every member of a failed group learns the same OS error the leader
+    /// saw, its code included, not only its kind.
+    #[test]
+    fn cloned_os_errors_keep_their_code() {
+        let err = io::Error::from_raw_os_error(28);
+        let cloned = crate::Error::clone_io(&err);
+        assert_eq!(cloned.raw_os_error(), Some(28));
+        assert_eq!(cloned.kind(), err.kind());
+    }
+
     #[test]
     fn commit_ring_capacity_is_bounded() {
         let cap = commit_ring_capacity();
@@ -1113,16 +1099,11 @@ mod tests {
             pipe.group.clear();
             for slot in &followers {
                 let request = slot.take_request();
-                pipe.group.push(GroupTicket {
-                    slot: Some(Arc::clone(slot)),
-                    request,
-                });
+                pipe.group
+                    .push(GroupTicket::new(Some(Arc::clone(slot)), request));
             }
-            let result = engine.run_and_complete(&mut pipe, engine.view.load());
-            assert!(
-                result.is_err(),
-                "an injected sync failure must fail the group"
-            );
+            let own = engine.run_and_complete(&mut pipe, engine.view.load());
+            assert!(own.is_none(), "the group carries no leader request");
         }
 
         for (i, slot) in followers.iter().enumerate() {
@@ -1289,15 +1270,19 @@ mod tests {
         pipe.group.clear();
         for slot in &slots {
             let request = slot.take_request();
-            pipe.group.push(GroupTicket {
-                slot: Some(Arc::clone(slot)),
-                request,
-            });
+            pipe.group
+                .push(GroupTicket::new(Some(Arc::clone(slot)), request));
         }
-        engine
-            .run_and_complete(&mut pipe, engine.view.load())
-            .expect("group commits");
+        assert!(
+            engine
+                .run_and_complete(&mut pipe, engine.view.load())
+                .is_none(),
+            "the group carries no leader request"
+        );
         drop(pipe);
+        for slot in &slots {
+            slot.finish().expect("group commits");
+        }
 
         let horizon = engine.snapshot_seq();
         for i in 0..4 {
@@ -1326,10 +1311,8 @@ mod tests {
         {
             let mut pipe = engine.pipeline.lock();
             let request = stranded.take_request();
-            pipe.group.push(GroupTicket {
-                slot: Some(Arc::clone(&stranded)),
-                request,
-            });
+            pipe.group
+                .push(GroupTicket::new(Some(Arc::clone(&stranded)), request));
         }
 
         engine
@@ -1378,10 +1361,7 @@ mod tests {
         {
             let mut guard = engine.pipeline.lock();
             let pipe: &mut Pipeline = &mut guard;
-            pipe.group.push(GroupTicket {
-                slot: None,
-                request: batch(),
-            });
+            pipe.group.push(GroupTicket::new(None, batch()));
             engine
                 .run_group(&mut pipe.stage, &pipe.group, engine.view.load(), staged)
                 .expect("a batch larger than the group cap still commits");
@@ -1571,13 +1551,10 @@ mod tests {
         };
         let mut pipe = engine.pipeline.lock();
         pipe.group.clear();
-        pipe.group.push(GroupTicket {
-            slot: None,
-            request: doomed,
-        });
+        pipe.group.push(GroupTicket::new(None, doomed));
         let result = engine.run_and_complete(&mut pipe, engine.view.load());
         assert!(
-            result.is_err(),
+            result.is_some_and(|own| own.is_err()),
             "a latched wal failure must fail the group before it stages anything"
         );
         assert!(
@@ -1599,10 +1576,8 @@ mod tests {
         let mut guard = engine.pipeline.lock();
         let pipe: &mut Pipeline = &mut guard;
         pipe.group.clear();
-        pipe.group.push(GroupTicket {
-            slot: None,
-            request: durable_put(b"never", b"v"),
-        });
+        pipe.group
+            .push(GroupTicket::new(None, durable_put(b"never", b"v")));
         let err = engine
             .run_group(&mut pipe.stage, &pipe.group, engine.view.load(), usize::MAX)
             .expect_err("an unsatisfiable reservation must fail rather than allocate");
@@ -1634,10 +1609,8 @@ mod tests {
         let mut guard = engine.pipeline.lock();
         let pipe: &mut Pipeline = &mut guard;
         pipe.group.clear();
-        pipe.group.push(GroupTicket {
-            slot: None,
-            request: durable_put(b"never", b"v"),
-        });
+        pipe.group
+            .push(GroupTicket::new(None, durable_put(b"never", b"v")));
         let err = engine
             .run_group(&mut pipe.stage, &pipe.group, engine.view.load(), usize::MAX)
             .expect_err("an unsatisfiable reservation must fail rather than allocate");

@@ -82,11 +82,21 @@ impl WalGroupPayloadHasher {
 /// log's `nonce` and to the record's `offset` in it, so the same bytes
 /// anywhere else never verify.
 pub(crate) fn wal_group_header(nonce: u64, offset: u64, fields: &[u8; 17]) -> u32 {
+    xxh3_64_with_seed(
+        &wal_group_header_input(nonce, offset, fields),
+        WAL_GROUP_HEADER_SEED,
+    ) as u32
+}
+
+/// What [`wal_group_header`] hashes: the log's nonce, the record's offset
+/// and the header's first 17 bytes. A sealed record's tag binds the same
+/// bytes.
+pub(crate) fn wal_group_header_input(nonce: u64, offset: u64, fields: &[u8; 17]) -> [u8; 33] {
     let mut input = [0u8; 33];
     input[0..8].copy_from_slice(&nonce.to_le_bytes());
     input[8..16].copy_from_slice(&offset.to_le_bytes());
     input[16..].copy_from_slice(fields);
-    xxh3_64_with_seed(&input, WAL_GROUP_HEADER_SEED) as u32
+    input
 }
 
 pub(crate) fn manifest_record(len: u32, data: &[u8]) -> u32 {

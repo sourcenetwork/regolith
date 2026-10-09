@@ -16,10 +16,12 @@ use super::raw_semaphore::{PermitWait, RawSemaphore};
 /// A mutual-exclusion lock whose wait is a future.
 ///
 /// Uncontended, [`try_lock`](Self::try_lock) and a guard's drop are one
-/// compare-and-swap each and allocate nothing. Under contention
-/// [`lock`](Self::lock) queues and returns `Pending`; an unlock hands the
-/// lock to the oldest waiter before waking it, and `try_lock` fails while
-/// anyone waits.
+/// atomic read-modify-write each and allocate nothing. A caller takes the
+/// lock whenever it is free, even while others wait; under contention
+/// [`lock`](Self::lock) queues and returns `Pending`.
+/// An unlock wakes the oldest waiter to try again; a waiter that loses
+/// [`MAX_BYPASS`](super::MAX_BYPASS) times is handed the lock directly,
+/// and `try_lock` fails until it has had it.
 ///
 /// ```
 /// use regolith::sync::Mutex;
@@ -54,7 +56,7 @@ impl<T> Mutex<T> {
 }
 
 impl<T: ?Sized> Mutex<T> {
-    /// Locks the mutex if it is free and nobody is waiting.
+    /// Locks the mutex if it is free and no handoff is owed.
     pub fn try_lock(&self) -> Option<MutexGuard<'_, T>> {
         self.sem.try_acquire(1).then(|| MutexGuard::new(self))
     }
@@ -258,7 +260,7 @@ mod tests {
     const ITERATIONS: usize = if cfg!(miri) { 20 } else { 5_000 };
 
     #[test]
-    fn the_lock_is_handed_to_waiters_in_arrival_order() {
+    fn releases_wake_waiters_in_arrival_order() {
         let mutex = Mutex::new(Vec::new());
         let held = mutex.try_lock().expect("free");
         let mut waiters: Vec<_> = (0..3).map(|_| Polled::new(mutex.lock())).collect();
@@ -270,11 +272,11 @@ mod tests {
             assert_eq!(
                 waiter.wakes(),
                 1,
-                "waiter {i} is woken once it is handed the lock"
+                "waiter {i} is woken by the release before it"
             );
             let mut guard = waiter.ready();
             guard.push(i);
-            assert!(mutex.try_lock().is_none(), "nobody barges past the queue");
+            assert!(mutex.try_lock().is_none(), "the woken waiter holds it");
         }
         assert_eq!(*mutex.try_lock().expect("free"), vec![0, 1, 2]);
     }

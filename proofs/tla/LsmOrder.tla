@@ -52,6 +52,18 @@
 \*     flushed (`flush_memtables_holding`).
 \*   manifest replay                  src/engine/manifest.rs
 \*     Today refuses a deeper level whose tables overlap (E14).
+\*   rotate_if_full, seal_active      src/engine/mod.rs (Freeze here)
+\*     A writer whose commit group fills the active memtable seals it under
+\*     the pipeline mutex: it becomes the newest frozen memtable and a fresh
+\*     one takes the writes. The flush is not done there (E9). A rotation
+\*     that would leave more than max_write_buffer_number memtables first
+\*     writes the oldest frozen one out itself: that is the bound MaxImm.
+\*   Flusher::flush_oldest            src/engine/flush.rs (FlushInstall)
+\*     Whoever flushes (the compaction worker, the bounded step a write owes
+\*     with no worker, a rotation at the cap, an explicit flush) takes the
+\*     `flushing` exclusion, picks the OLDEST frozen memtable, writes its
+\*     table, installs it as the newest L0 file and retires the memtable,
+\*     all inside that one hold, so a flush is one step here.
 \*
 \* THE DEFECTS, one per mutant constant.
 \*   Picker = "Intersect" (E1). Picking only the L0 files that intersect the
@@ -59,7 +71,10 @@
 \*     stays in an older, unpicked L0 file, which every read consults first.
 \*   FlushOrder = "Any". With several frozen memtables, a newer one's file
 \*     is installed in L0 before an older one is flushed. The older frozen
-\*     memtable is read before L0, so its older version answers first.
+\*     memtable is read before L0, so its older version answers first. This
+\*     is what flushes off the commit path would do without the `flushing`
+\*     exclusion: two threads flushing at once, the newer memtable's flush
+\*     finishing first.
 \*   Ingest = "IgnoreUpper". The file is placed at the deepest level whose
 \*     own tables it does not overlap, without checking L0 and the levels
 \*     above, which may hold older versions of its keys and are read first.
@@ -72,7 +87,9 @@
 \*   Picker = "Closure": add every older L0 file whose key range overlaps
 \*     the picked set's, until nothing changes.
 \*   FlushOrder = "Oldest": a flush installs in memtable order; a file
-\*     written early waits for the older ones.
+\*     written early waits for the older ones. The code gets this from the
+\*     `flushing` exclusion and from always taking the oldest frozen
+\*     memtable, whichever thread flushes.
 \*   Ingest = "Placed": the deepest level L such that no L0 file holds a key
 \*     in the file's range and no table of levels 1..L overlaps it; L0 when
 \*     there is none. A memtable holding a key in the range is flushed
@@ -350,26 +367,28 @@ Flush ==
   /\ mem' = {}
   /\ UNCHANGED <<seq, imm, lv, opened>>
 
-\* Rotation freezes the memtable: it becomes the newest frozen memtable,
-\* still read before L0, and a new, empty memtable takes the writes.
+\* Rotation freezes the memtable (seal_active, under the pipeline mutex): it
+\* becomes the newest frozen memtable, still read before L0, and a new,
+\* empty memtable takes the writes. Nothing is flushed here (E9).
 Freeze ==
-  /\ MaxImm > 0
-  /\ mem # {}
-  /\ Len(imm) < MaxImm
-  /\ imm' = <<mem>> \o imm
-  /\ mem' = {}
-  /\ UNCHANGED <<seq, l0, lv, opened>>
+  /\ MaxImm > 0                  \* this configuration keeps frozen memtables
+  /\ mem # {}                    \* there is something to freeze
+  /\ Len(imm) < MaxImm           \* under the cap: at the cap the rotation flushes the oldest first
+  /\ imm' = <<mem>> \o imm        \* the memtable joins the front: the newest frozen one
+  /\ mem' = {}                   \* writes go to a fresh, empty memtable
+  /\ UNCHANGED <<seq, l0, lv, opened>>   \* no sequence, file or level changes
 
-\* A flush of frozen memtable i installs its file as the newest L0 file and
-\* drops the memtable. The fix installs only the oldest (the last); the
-\* defect installs whichever flush finished first.
+\* A flush of frozen memtable i (Flusher::flush_oldest, by whatever thread)
+\* installs its file as the newest L0 file and drops the memtable. The fix
+\* installs only the oldest (the last in `imm`); the defect installs
+\* whichever flush finished first.
 FlushInstall(i) ==
-  /\ i \in 1..Len(imm)
-  /\ FlushOrder = "Any" \/ i = Len(imm)
-  /\ Len(l0) < MaxL0
-  /\ l0'  = <<imm[i]>> \o l0
-  /\ imm' = Keep(imm, {i}, 1)
-  /\ UNCHANGED <<seq, mem, lv, opened>>
+  /\ i \in 1..Len(imm)                  \* a frozen memtable
+  /\ FlushOrder = "Any" \/ i = Len(imm)  \* the oldest one, unless the bug is planted
+  /\ Len(l0) < MaxL0                    \* keeps the model small
+  /\ l0'  = <<imm[i]>> \o l0             \* its file is the newest L0 file
+  /\ imm' = Keep(imm, {i}, 1)            \* and it is no longer frozen
+  /\ UNCHANGED <<seq, mem, lv, opened>>  \* nothing else changes
 
 \* compact_range(lo, hi) at L0: the picked files leave L0 and merge with
 \* the L1 tables their key range meets into one L1 table.

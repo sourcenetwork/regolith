@@ -1,5 +1,8 @@
 pub(crate) mod arena;
 pub(crate) mod background_health;
+mod background_step;
+#[cfg(test)]
+mod background_step_tests;
 pub(crate) mod block;
 pub(crate) mod block_cache;
 pub(crate) mod bloom;
@@ -11,6 +14,7 @@ pub(crate) mod compaction;
 pub(crate) mod compaction_backoff;
 pub(crate) mod disk_check;
 pub(crate) mod filter_block;
+mod flush;
 pub(crate) mod index_block;
 mod ingest;
 #[cfg(test)]
@@ -18,7 +22,9 @@ mod ingest_range_tests;
 #[cfg(test)]
 mod ingest_window_tests;
 pub(crate) mod internal_key;
+pub(crate) mod io;
 pub(crate) mod iterator;
+pub(crate) mod log_retirement;
 pub(crate) mod lookup_key;
 #[cfg(loom)]
 pub mod loom_model;
@@ -32,10 +38,12 @@ pub(crate) mod read_horizon;
 mod read_rule;
 pub(crate) mod read_view;
 mod recovery;
+pub(crate) mod seal;
 pub(crate) mod skiplist;
 pub(crate) mod snapshot_registry;
 pub(crate) mod source_walk;
 pub(crate) mod sstable;
+mod stall_state;
 pub(crate) mod wal;
 #[cfg(test)]
 mod wal_close_tests;
@@ -43,6 +51,7 @@ pub(crate) mod wal_frame;
 pub(crate) mod wal_replay;
 #[cfg(test)]
 mod wal_rotation_tests;
+pub(crate) mod wal_seal;
 pub(crate) mod wal_v1;
 
 use crate::portability::{AtomicBool, AtomicU8, AtomicU64, Ordering};
@@ -64,21 +73,21 @@ use manifest::{VersionEdit, VersionSet};
 use memtable::{MemTable, MemTableConfig};
 
 const STOP_TOO_MANY_MEMTABLES: &str = "stop: too many memtables";
-use pending_outputs::PendingOutputs;
+use log_retirement::RetiredLogs;
 use read_horizon::ReadHorizon;
 pub(crate) use read_rule::ReadRule;
 use read_view::{ReadView, ReadViewCell, VersionStore};
-use recovery::{replay_logs, report_discarded_tail, rewrite_recovered_memtable_to_wal};
+use recovery::{
+    replay_logs, report_discarded_tail, report_dropped_manifest_tail,
+    rewrite_recovered_memtable_to_wal,
+};
 use skiplist::InsertHint;
 use snapshot_registry::SnapshotRegistry;
 use source_walk::Source;
 
 use crate::env::{Capabilities, Env, FileLock};
 use crate::{Access, Conflict, DbSlice, WriteBatchOp, WriteKind, event_listener};
-use sstable::{
-    LiveSst, LookupResult, Materialize, PointValue, SsTableMeta, SsTableReader, SsTableWriter,
-    sst_filename,
-};
+use sstable::{LiveSst, LookupResult, Materialize, PointValue, SsTableReader, sst_filename};
 use wal::{RecordLen, Wal, WalEntry, check_write_len, wal_filename};
 
 /// Controls when data is flushed to disk after a commit.
@@ -339,6 +348,9 @@ pub(crate) struct EngineOptions {
     pub(crate) merge_operator: Option<Arc<dyn crate::options::MergeOperator>>,
     pub(crate) listeners: Vec<Arc<dyn crate::event_listener::EventListener>>,
     pub(crate) transaction_hooks: Option<Arc<dyn crate::TransactionHooks>>,
+    /// Set when the database is encrypted at rest: every file the engine
+    /// writes is sealed under its current key.
+    pub(crate) keyring: Option<Arc<seal::Keyring>>,
     pub(crate) statistics: Option<Arc<crate::statistics::Statistics>>,
     pub(crate) rate_limiter: Option<Arc<dyn crate::rate_limiter::RateLimiter>>,
     pub(crate) level0_slowdown_writes_trigger: usize,
@@ -413,6 +425,7 @@ impl EngineOptions {
             max_background_compactions: self.max_background_compactions,
             partitioned_index: self.partitioned_index,
             metadata_block_size: self.metadata_block_size,
+            keyring: self.keyring.clone(),
             env: Arc::clone(&self.env),
         }
     }
@@ -450,6 +463,7 @@ impl Default for EngineOptions {
             merge_operator: None,
             listeners: Vec::new(),
             transaction_hooks: None,
+            keyring: None,
             statistics: None,
             rate_limiter: None,
             level0_slowdown_writes_trigger: 20,
@@ -476,6 +490,11 @@ impl Default for EngineOptions {
 const CLOSE_STATE_OPEN: u8 = 0;
 const CLOSE_STATE_CLOSING: u8 = 1;
 const CLOSE_STATE_CLOSED: u8 = 2;
+
+/// Blocks of the configured block size one I/O queue may owe before a
+/// further miss waits for room. Enough for a seek through every level and a
+/// deep L0 at once, with each level's index leaf and filter.
+const IO_QUEUE_BLOCKS: usize = 256;
 
 /// The core LSM-tree engine.
 pub(crate) struct RegolithEngine {
@@ -531,31 +550,16 @@ pub(crate) struct RegolithEngine {
     /// takes the WAL fsync off every writer's critical path.
     commit_ring: ArrayQueue<Arc<WriteSlot>>,
     /// Exclusion for the whole write pipeline, and the leader-owned
-    /// staging buffers. Acquiring it *is* becoming the commit leader.
-    /// Administrative operations that rotate the memtable or the WAL
+    /// staging buffers. Acquiring it *is* becoming the commit leader, for one
+    /// group. Administrative operations that rotate the memtable or the WAL
     /// (`compact_range`, `ingest_external_files`, `checkpoint_capture`,
-    /// `drop_all`, `close`) take it blockingly; no follower ever does.
+    /// `drop_all`, `close`) take it blockingly; no follower ever does. A
+    /// rotation seals under it and leaves the flush to the background (E9).
     pipeline: Mutex<Pipeline>,
-    /// Serializes [`Self::flush_oldest_frozen`] against itself.
-    ///
-    /// Not the same exclusion as `pipeline`. A rotation holds the
-    /// pipeline mutex while it flushes, but `drain_memtables`
-    /// releases it before it flushes (a flush writes a whole SSTable
-    /// and must not block writers for that long), so a checkpoint's
-    /// drain and a writer's rotation could both be inside the flush at
-    /// once. They would then both take `frozen.first()` as their victim
-    /// and both retire index 0, and the second retirement would drop a
-    /// memtable whose contents are in no published version: an
-    /// acknowledged write disappears, and a reader that had already seen
-    /// it reads an older version instead.
-    ///
-    /// An ingest takes it only through `flush_until_retired`, for the
-    /// memtables holding a key of its file's range, and holds the pipeline
-    /// mutex until the file is installed. A memtable holding none of its
-    /// keys may be flushed after it and land in front of it in L0, which
-    /// changes no read: the two share no key (LsmOrder.tla, Lean
-    /// `ingest_ordered`).
-    flushing: Mutex<()>,
+    /// What writes frozen memtables out, shared with the compaction
+    /// workers, which flush on their own (E9) and hold no handle on the
+    /// engine. Its `flushing` exclusion serializes every flush.
+    flusher: Arc<flush::Flusher>,
     /// Latched write-path failure. Set only when a failed commit group
     /// could not be rolled back out of the WAL, which leaves the log with
     /// a tail no later write may extend, or when a caller's code panicked
@@ -578,9 +582,15 @@ pub(crate) struct RegolithEngine {
     /// with its lock acquisitions is only called when the cached
     /// level is nonzero, saving 2 lock round-trips per write in
     /// the common no-stall case.
-    cached_stall_level: AtomicU8,
+    cached_stall_level: Arc<AtomicU8>,
     /// How a stalled writer makes room. See [`StallPolicy`].
     stall_policy: StallPolicy,
+    /// A compaction worker runs: it flushes what writers seal. Without one,
+    /// a writer owes the flush itself (`background_step.rs`).
+    has_worker: bool,
+    /// A database with no worker owes a bounded step of background work,
+    /// which the next write to leave the commit pipeline runs.
+    background_owed: AtomicBool,
     /// File ids currently being compacted, shared with every background
     /// worker and with [`RegolithEngine::run_one_compaction_pass`]. One set
     /// for the whole engine is what stops a foreground pass and a
@@ -624,8 +634,22 @@ impl RegolithEngine {
         env.create_dir_all(&sst_dir)?;
         env.create_dir_all(&wal_dir)?;
 
-        let version_set =
-            VersionSet::open_with_policy(&env, db_dir, &sst_dir, options.metadata_policy())?;
+        // Every file this open writes is sealed under the current key, so a
+        // current key the provider cannot provide refuses here, before
+        // anything is written.
+        if let Some(keyring) = &options.keyring {
+            keyring.current()?;
+        }
+        let version_set = VersionSet::open_with_policy(
+            &env,
+            db_dir,
+            &sst_dir,
+            options.metadata_policy(),
+            options.keyring.clone(),
+        )?;
+        if let Some(tail) = version_set.dropped_tail() {
+            report_dropped_manifest_tail(&options, version_set.manifest_path(), tail);
+        }
         let version = version_set.current();
         let latest_seq = version.last_seq;
 
@@ -636,11 +660,18 @@ impl RegolithEngine {
             options.max_write_buffer_number,
         );
         let memtable = Arc::new(MemTable::new(&memtable_config)?);
+        wal_seal::remove_staged(&*env, &wal_dir)?;
         let mut wal_files = list_wal_files(&*env, &wal_dir)?;
         wal_files.sort();
         wal_files.retain(|path| should_replay_wal(path, version.min_wal_id));
 
-        let (latest_seq, discarded) = replay_logs(&env, &wal_files, &memtable, latest_seq)?;
+        let (latest_seq, discarded) = replay_logs(
+            &env,
+            &wal_files,
+            &memtable,
+            latest_seq,
+            options.keyring.as_deref(),
+        )?;
         if let Some((path, tail)) = discarded {
             // Before the next log exists, so the newest log is complete
             // when it becomes an earlier one (WalRecovery.tla, RED
@@ -653,19 +684,9 @@ impl RegolithEngine {
 
         let wal_id = next_wal_id(version.next_file_id, &wal_files);
         let wal_path = wal_dir.join(wal_filename(wal_id));
-        let mut wal = Wal::create_in(&env, &wal_path)?;
+        let mut wal = Wal::create_in(&env, &wal_path, options.keyring.as_deref())?;
 
         rewrite_recovered_memtable_to_wal(&memtable, &mut wal)?;
-
-        for replayed_wal_path in &wal_files {
-            if replayed_wal_path != &wal_path {
-                match Wal::remove_in(&*env, replayed_wal_path) {
-                    Ok(()) => {}
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(e) => return Err(e),
-                }
-            }
-        }
 
         let versions = Arc::new(VersionStore::new(version_set));
         let view = Arc::new(ReadViewCell::new(ReadView {
@@ -675,9 +696,17 @@ impl RegolithEngine {
         }));
         versions.attach_view(Arc::clone(&view));
 
-        versions
-            .lock()
-            .apply(&[VersionEdit::SetNextFileId(wal_id + 1)])?;
+        // The new log holds every write the replayed ones did, so they are
+        // retired with the logs flushes left behind. Recorded unsynced: if
+        // the record is lost, the replayed logs are replayed again beside
+        // the new one, which repeats their writes and nothing older.
+        versions.lock().apply(&[
+            VersionEdit::SetNextFileId(wal_id + 1),
+            VersionEdit::SetMinWalId(wal_id),
+        ])?;
+        let removed =
+            log_retirement::remove_below(&*env, &wal_dir, wal_id, options.statistics.as_deref());
+        let retired_logs = RetiredLogs::new(wal_dir.clone(), !removed);
 
         let cache = Arc::new(
             BlockCache::with_config(
@@ -710,6 +739,25 @@ impl RegolithEngine {
             Arc::clone(&compaction_in_progress),
             Arc::clone(&background_health),
         )?;
+        let has_worker = compaction.has_workers();
+        let cached_stall_level = Arc::new(AtomicU8::new(0));
+        // The workers flush what writers seal (E9), through a flusher that
+        // holds nothing of the engine, so a worker never keeps a database
+        // open that every caller dropped.
+        let flusher = Arc::new(flush::Flusher::new(
+            Arc::clone(&view),
+            Arc::clone(&versions),
+            sst_dir.clone(),
+            retired_logs,
+            options.clone(),
+            Arc::clone(&background_health),
+            Arc::clone(&stall_signal),
+            Arc::clone(&cached_stall_level),
+        ));
+        compaction.set_flush(Box::new({
+            let flusher = Arc::clone(&flusher);
+            move || flusher.flush_all_frozen()
+        }));
 
         let engine = Arc::new(Self {
             view,
@@ -729,14 +777,16 @@ impl RegolithEngine {
             compaction_lock,
             snapshot_registry,
             stall_policy: options.stall_policy(),
+            has_worker,
+            background_owed: AtomicBool::new(false),
             options,
             commit_ring: Self::new_commit_ring(),
             pipeline: Mutex::new(Pipeline::new()),
-            flushing: Mutex::new(()),
+            flusher,
             write_latch: Mutex::new(None),
             write_latched: AtomicBool::new(false),
             stall_signal,
-            cached_stall_level: AtomicU8::new(0),
+            cached_stall_level,
             compaction_in_progress,
             background_health,
             env,
@@ -790,8 +840,16 @@ impl RegolithEngine {
             options.write_buffer_size,
             options.max_write_buffer_number,
         );
-        let version_set =
-            VersionSet::open_read_only(&env, db_dir, &sst_dir, options.metadata_policy())?;
+        let version_set = VersionSet::open_read_only(
+            &env,
+            db_dir,
+            &sst_dir,
+            options.metadata_policy(),
+            options.keyring.clone(),
+        )?;
+        if let Some(tail) = version_set.dropped_tail() {
+            report_dropped_manifest_tail(&options, version_set.manifest_path(), tail);
+        }
         let version = version_set.current();
         let latest_seq = version.last_seq;
 
@@ -802,7 +860,13 @@ impl RegolithEngine {
 
         // A read-only open writes nothing, so the tail stays in the file;
         // the next read-write open drops it again and truncates it.
-        let (latest_seq, discarded) = replay_logs(&env, &wal_files, &memtable, latest_seq)?;
+        let (latest_seq, discarded) = replay_logs(
+            &env,
+            &wal_files,
+            &memtable,
+            latest_seq,
+            options.keyring.as_deref(),
+        )?;
         if let Some((path, tail)) = discarded {
             report_discarded_tail(&options, &path, tail, latest_seq);
         }
@@ -826,6 +890,20 @@ impl RegolithEngine {
         let snapshot_registry = Arc::new(SnapshotRegistry::with_env(Arc::clone(&env)));
         let stall_signal = Arc::new(StallSignal::new());
         let wal_id = next_wal_id(version.next_file_id, &wal_files);
+        let background_health = Arc::new(BackgroundHealth::default());
+        let cached_stall_level = Arc::new(AtomicU8::new(0));
+        // Never flushes: a read-only engine refuses every write before one
+        // could seal a memtable.
+        let flusher = Arc::new(flush::Flusher::new(
+            Arc::clone(&view),
+            Arc::clone(&versions),
+            sst_dir.clone(),
+            RetiredLogs::new(wal_dir.clone(), false),
+            options.clone(),
+            Arc::clone(&background_health),
+            Arc::clone(&stall_signal),
+            Arc::clone(&cached_stall_level),
+        ));
 
         Ok(Arc::new(Self {
             view,
@@ -850,16 +928,18 @@ impl RegolithEngine {
             // so this policy can only ever produce an error, never a
             // wait that nobody will end.
             stall_policy: StallPolicy::CompactInline,
+            has_worker: false,
+            background_owed: AtomicBool::new(false),
             options,
             commit_ring: Self::new_commit_ring(),
             pipeline: Mutex::new(Pipeline::new()),
-            flushing: Mutex::new(()),
+            flusher,
             write_latch: Mutex::new(None),
             write_latched: AtomicBool::new(false),
             stall_signal,
-            cached_stall_level: AtomicU8::new(0),
+            cached_stall_level,
             compaction_in_progress: Arc::new(Mutex::new(HashSet::new())),
-            background_health: Arc::new(BackgroundHealth::default()),
+            background_health,
             env,
             _db_lock: db_lock,
         }))
@@ -875,6 +955,12 @@ impl RegolithEngine {
     /// own and must do it on the same host.
     pub(crate) fn env(&self) -> &Arc<dyn Env> {
         &self.env
+    }
+
+    /// The keyring this database seals its files through, when it is
+    /// encrypted at rest. A backup seals its metadata through it too.
+    pub(crate) fn keyring(&self) -> Option<&Arc<seal::Keyring>> {
+        self.options.keyring.as_ref()
     }
 
     /// Microseconds elapsed since `start`, or `None` when this
@@ -1007,7 +1093,11 @@ impl RegolithEngine {
             self.notify_wal_error(&err)?;
             return Err(err);
         }
-        let new_wal = Wal::create_in(&self.env, &self.wal_dir.join(wal_filename(new_wal_id)))?;
+        let new_wal = Wal::create_in(
+            &self.env,
+            &self.wal_dir.join(wal_filename(new_wal_id)),
+            self.options.keyring.as_deref(),
+        )?;
         guard.replace(new_wal).ok_or_else(Self::read_only_error)
     }
 
@@ -1047,8 +1137,13 @@ impl RegolithEngine {
     }
 
     /// `disable_wal` skips the record-length check, since the write
-    /// produces no WAL record; key and value limits still apply.
-    fn validate_ops_sizes(&self, ops: &[WriteBatchOp], disable_wal: bool) -> std::io::Result<()> {
+    /// produces no WAL record; key and value limits still apply. Returns the
+    /// framed length of the batch's record.
+    fn validate_ops_sizes(
+        &self,
+        ops: &[WriteBatchOp],
+        disable_wal: bool,
+    ) -> std::io::Result<usize> {
         let mut record = RecordLen::default();
         for op in ops {
             match op {
@@ -1076,7 +1171,7 @@ impl RegolithEngine {
         if !disable_wal {
             check_write_len(record.framed())?;
         }
-        Ok(())
+        Ok(record.framed())
     }
 
     /// Borrow the engine's `Statistics` sink if one is configured.
@@ -1092,6 +1187,18 @@ impl RegolithEngine {
     /// boundary where a borrowed reference wouldn't reach.
     pub(crate) fn statistics_arc(&self) -> Option<Arc<crate::statistics::Statistics>> {
         self.options.statistics.clone()
+    }
+
+    /// A new I/O queue for one thread, on this database's block cache.
+    ///
+    /// What the queue may owe is bounded by bytes: [`IO_QUEUE_BLOCKS`]
+    /// blocks of the configured block size, so the bound follows the block
+    /// size the reads are made of.
+    pub(crate) fn io_queue(&self) -> crate::IoQueue {
+        crate::IoQueue::open(
+            Arc::clone(&self.cache),
+            self.options.block_size.saturating_mul(IO_QUEUE_BLOCKS),
+        )
     }
 
     /// Register a new live snapshot at `seq` so compaction keeps
@@ -1807,116 +1914,10 @@ impl RegolithEngine {
         Arc::clone(&self.view.load().version)
     }
 
-    /// Retire one frozen memtable in one publication. Called only once
-    /// its contents are durable in an SSTable the published version
-    /// already references, or once they proved to be empty.
-    ///
-    /// By identity, not by position. The memtable named here is the one
-    /// this flush read, and between reading it and getting here the
-    /// list can have changed: a rotation appends, and another flush
-    /// could have retired ahead of this one. Dropping "index 0" would
-    /// then drop somebody else's memtable, whose contents are in no
-    /// published version. Retiring a memtable that is already gone is a
-    /// no-op, which is what makes this safe to call on every exit path.
-    fn retire_frozen(&self, flushed: &Arc<MemTable>) {
-        self.view.retire_memtable(flushed);
-    }
-
-    /// Unlink the log that backed `flushed`, now that its records are in
-    /// an SSTable the published version references.
-    ///
-    /// Keyed off the memtable rather than off whatever log the caller
-    /// happened to seal. A flush and the seal that fed it are not
-    /// necessarily about the same memtable: the seal appends to the
-    /// frozen list while the flush takes the front of it, and the two
-    /// are separated by a whole SSTable write. Unlinking the caller's
-    /// log would delete the only durable copy of a memtable that has not
-    /// been flushed, and a crash would then lose every write in it.
-    fn remove_sealed_wal(&self, flushed: &MemTable) {
-        if let Some(path) = flushed.sealed_wal() {
-            let _ = Wal::remove_in(&*self.env, path);
-        }
-    }
-
-    /// Snapshot the current write-stall inputs: L0 file count,
-    /// in-memory memtable count (active + frozen), and total bytes
-    /// across all L0 files (regolith's approximation of pending
-    /// compaction bytes).
-    fn stall_snapshot(&self) -> (usize, usize, u64) {
-        let view = self.view.load();
-        let l0 = view.version.levels[0].len();
-        let pending_bytes: u64 = view.version.levels[0]
-            .iter()
-            .map(|f| f.meta.file_size)
-            .sum();
-        // The active memtable always counts as 1; frozen memtables
-        // are whatever is still waiting for the flush path.
-        let memtable_count = 1 + view.frozen.len();
-        (l0, memtable_count, pending_bytes)
-    }
-
     /// Classify the current state against the configured stall
-    /// thresholds. Returns:
-    ///
-    /// * `None` - writes may proceed freely.
-    /// * `Some(("...", true))` - hard stop: block writers until
-    ///   compaction relieves the condition.
-    /// * `Some(("...", false))` - slowdown: add a small delay per
-    ///   write so the foreground write rate tracks compaction.
+    /// thresholds; see [`stall_state::classify`].
     fn stall_state(&self) -> Option<(&'static str, bool)> {
-        let (l0, memtables, pending_bytes) = self.stall_snapshot();
-        let opts = &self.options;
-        // Stop conditions dominate over slowdown. An unconfigured
-        // threshold (`0`) disables that particular trigger.
-        if opts.level0_stop_writes_trigger > 0 && l0 >= opts.level0_stop_writes_trigger {
-            // The L0 *count* triggers are level-style back-pressure:
-            // only level compaction reduces the L0 file count in
-            // response to them. Under the other two styles the count
-            // can sit above the trigger with the picker correctly
-            // declining to merge, so name the real cause and the knob
-            // rather than pointing the caller at a compaction that
-            // provably cannot help.
-            return Some((
-                match opts.compaction_style {
-                    crate::options::CompactionStyle::Level => "stop: too many L0 files",
-                    crate::options::CompactionStyle::Fifo => {
-                        "stop: too many L0 files, and FIFO compaction never merges them - \
-                         set level0_stop_writes_trigger to 0 to disable this level-style \
-                         trigger, or lower fifo_compaction_options.max_table_files_size"
-                    }
-                    crate::options::CompactionStyle::Universal => {
-                        "stop: too many L0 files, and the universal picker's size-ratio and \
-                         size-amplification rules decline to merge them - set \
-                         level0_stop_writes_trigger to 0 to disable this level-style \
-                         trigger, or lower \
-                         universal_compaction_options.max_size_amplification_percent"
-                    }
-                },
-                true,
-            ));
-        }
-        if opts.max_write_buffer_number > 0
-            && memtables >= opts.max_write_buffer_number.saturating_mul(2)
-        {
-            return Some((STOP_TOO_MANY_MEMTABLES, true));
-        }
-        if opts.hard_pending_compaction_bytes_limit > 0
-            && pending_bytes >= opts.hard_pending_compaction_bytes_limit
-        {
-            return Some(("stop: pending compaction bytes over hard limit", true));
-        }
-        if opts.level0_slowdown_writes_trigger > 0 && l0 >= opts.level0_slowdown_writes_trigger {
-            return Some(("slowdown: L0 files over trigger", false));
-        }
-        if opts.max_write_buffer_number > 0 && memtables > opts.max_write_buffer_number {
-            return Some(("slowdown: memtables over trigger", false));
-        }
-        if opts.soft_pending_compaction_bytes_limit > 0
-            && pending_bytes >= opts.soft_pending_compaction_bytes_limit
-        {
-            return Some(("slowdown: pending compaction bytes over soft limit", false));
-        }
-        None
+        stall_state::classify(&self.view.load(), &self.options)
     }
 
     /// Fixed per-write slowdown delay. Keeping this small (1 ms)
@@ -1936,12 +1937,7 @@ impl RegolithEngine {
     /// memtable / pending-bytes state. Called after any event that
     /// changes those counters (memtable rotation, compaction pass).
     pub(crate) fn refresh_stall_level(&self) {
-        let level = match self.stall_state() {
-            None => 0,
-            Some((_, false)) => 1,
-            Some((_, true)) => 2,
-        };
-        self.cached_stall_level.store(level, Ordering::Release);
+        stall_state::refresh(&self.cached_stall_level, &self.view.load(), &self.options);
     }
 
     /// How long a stalled writer parks before re-checking its
@@ -1958,18 +1954,20 @@ impl RegolithEngine {
     /// One wait step for a writer stopped behind background work, or the
     /// error that says waiting would not end.
     ///
-    /// Too many memtables means flushes are failing: memtables are written
-    /// out by the writer that seals them, and no worker retries one that
-    /// failed, so a stopped writer that only waited would wait forever,
-    /// even after the fault cleared. It retries the oldest flush itself,
-    /// unless another thread holds the flush exclusion, and returns that
-    /// flush's error if it fails. Any other stop is relieved by
+    /// Too many memtables means flushes are behind or failing. The worker
+    /// flushes what writers seal, but one that keeps failing may not be
+    /// retried before the poll that next wakes it, so a stopped writer
+    /// retries the oldest flush itself, unless another thread holds the
+    /// flush exclusion, and returns that flush's error if it fails. Any other stop is relieved by
     /// compaction; while the last compaction pass failed, the writer
     /// returns that failure instead of waiting on a retry that is
     /// likely to fail the same way.
     fn wait_out_stop(&self, reason: &'static str) -> Result<(), crate::Error> {
         if reason == STOP_TOO_MANY_MEMTABLES {
-            if let Some(flushing) = self.flushing.try_lock() {
+            if let Some(flushing) = self.flusher.flushing.try_lock() {
+                // The flush is the background's, run on this writer's turn: a
+                // panic in a caller's code fails it without unwinding here.
+                let _background = callback::InBackground::enter();
                 let flushed = self.flush_oldest_frozen(&flushing);
                 drop(flushing);
                 return match flushed {
@@ -2033,9 +2031,28 @@ impl RegolithEngine {
     /// satisfies this because it runs before the write path takes
     /// `write_lock`, never inside it.
     pub(crate) fn run_one_compaction_pass(&self) -> std::io::Result<CompactionOutcome> {
+        self.run_one_compaction_pass_on(true)
+    }
+
+    /// [`Self::run_one_compaction_pass`], or, unless `wait`, `Contended`
+    /// at once when a `compact_range`, an ingest, a checkpoint or a
+    /// `drop_all` holds the compaction lock or waits for it. A write's owed
+    /// step never waits: the thread that owes it may be the one holding the
+    /// lock.
+    pub(crate) fn run_one_compaction_pass_on(
+        &self,
+        wait: bool,
+    ) -> std::io::Result<CompactionOutcome> {
         self.ensure_writable()?;
         let outcome = {
-            let _guard = self.compaction_lock.read();
+            let _guard = if wait {
+                self.compaction_lock.read()
+            } else {
+                match self.compaction_lock.try_read() {
+                    Some(guard) => guard,
+                    None => return Ok(CompactionOutcome::Contended),
+                }
+            };
             self.ensure_writable()?;
             compaction::pick_and_run_compaction(
                 &self.versions,
@@ -2112,7 +2129,9 @@ impl RegolithEngine {
                     match self.stall_policy {
                         StallPolicy::WaitForWorker => self.wait_out_stop(reason)?,
                         StallPolicy::CompactInline => {
-                            match self.run_one_compaction_pass()? {
+                            // A frozen memtable is flushed first: with no
+                            // worker, nothing else writes it out.
+                            match self.run_one_background_step(true)? {
                                 // Files came out of L0; the next
                                 // `stall_state()` sees it. Only real
                                 // work counts against the budget,
@@ -2177,7 +2196,7 @@ impl RegolithEngine {
                         // which is what makes the write rate track
                         // compaction on a single-threaded host.
                         StallPolicy::CompactInline => {
-                            self.run_one_compaction_pass()?;
+                            self.run_one_background_step(true)?;
                         }
                     }
                     // One slowdown delay per call - don't loop, or
@@ -2200,7 +2219,7 @@ impl RegolithEngine {
 
     pub(crate) fn commit_with_conflict_check(
         &self,
-        checks: &ValidationSet,
+        checks: ValidationSet,
         point_ops: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
         range_deletes: Vec<(Vec<u8>, Vec<u8>)>,
         merges: Vec<(Vec<u8>, Vec<u8>)>,
@@ -2394,10 +2413,36 @@ impl RegolithEngine {
         if view.active.approximate_size() < self.options.write_buffer_size {
             return Ok(view);
         }
-        self.rotate_memtable()?;
+        // A rotation leaves at most `max_write_buffer_number` memtables. One
+        // that may leave none but the fresh active one flushes what it seals
+        // here, as every rotation did before flushes left the commit path.
+        let room = self.options.max_write_buffer_number.checked_sub(1);
+        if room == Some(0) {
+            self.rotate_memtable()?;
+            return Ok(self.view.load());
+        }
+        // Normally the flushes behind it are done and nothing is written
+        // here. When they are not, the oldest frozen memtables are written
+        // out first: memory stays within the cap, and the commit path waits
+        // only when the background has fallen a whole memtable behind.
+        if let Some(room) = room {
+            while self.view.load().frozen.len() >= room {
+                if !self.flush_oldest_frozen(&self.flusher.flushing.lock())? {
+                    break;
+                }
+            }
+        }
+        // Sealed here and flushed off the commit path (E9): by the worker, or
+        // by the writer once it leaves the pipeline.
+        self.seal_active()?;
+        self.flush_sealed_later();
+        self.refresh_stall_level();
         Ok(self.view.load())
     }
 
+    /// Seal the active memtable and flush it, and every frozen one before
+    /// it, on this thread: what `compact_range` and an ingest need before
+    /// they read L0. A writer only seals (`rotate_if_full`).
     fn rotate_memtable(&self) -> std::io::Result<()> {
         let sealed = self.seal_active()?;
         let flushed = self.flush_until_retired(&sealed);
@@ -2425,6 +2470,18 @@ impl RegolithEngine {
         };
         let old_wal = self.swap_wal(new_wal_id)?;
 
+        // Stamped before it is published as frozen: from then on a flush on
+        // another thread may take it, and the flush reads both stamps. The
+        // pipeline mutex is held, so no write enters it after this and it
+        // stays the active memtable until the publication below.
+        let sealing = Arc::clone(&self.view.load().active);
+        sealing.seal_seq(self.latest_seq.load(Ordering::Acquire));
+        // The log that was active while it took writes is the one its
+        // records are in, and the only durable copy of them until a flush
+        // publishes an SSTable. Stamping it on the memtable is what lets
+        // that flush unlink the right one.
+        sealing.seal_wal(old_wal.path().to_path_buf());
+
         // One publication: the sealed memtable joins `frozen` in the
         // same view that hands writers the fresh active one, so no
         // reader can catch it in neither.
@@ -2434,14 +2491,8 @@ impl RegolithEngine {
             next_frozen.push(Arc::clone(&sealed));
             (fresh, next_frozen, sealed)
         });
-        sealed.seal_seq(self.latest_seq.load(Ordering::Acquire));
-
+        debug_assert!(Arc::ptr_eq(&sealed, &sealing));
         self.wal_id.store(new_wal_id, Ordering::Release);
-        // The log that was active while `sealed` took writes is the one
-        // `sealed`'s records are in, and the only durable copy of them
-        // until a flush publishes an SSTable. Stamping it on the
-        // memtable is what lets that flush unlink the right one.
-        sealed.seal_wal(old_wal.path().to_path_buf());
         Ok(sealed)
     }
 
@@ -2467,7 +2518,7 @@ impl RegolithEngine {
             .iter()
             .any(|mt| Arc::ptr_eq(mt, target))
         {
-            if !self.flush_oldest_frozen(&self.flushing.lock())? {
+            if !self.flush_oldest_frozen(&self.flusher.flushing.lock())? {
                 break;
             }
         }
@@ -2475,236 +2526,15 @@ impl RegolithEngine {
     }
 
     /// Write the oldest frozen memtable out to an L0 SSTable and retire
-    /// it. Returns `false` when there was nothing frozen to flush.
-    ///
-    /// The caller holds `flushing` and passes its guard, which is the
-    /// only way to call this. Serialized against itself. The exclusion
-    /// is not protecting shared state, which the read view already
-    /// publishes atomically: it is what keeps L0 installs in the order
-    /// the memtables were sealed, because the format gives an L0 file no
-    /// sequence of its own and recency is install order. Two flushes
-    /// racing would install a newer file under an older one, and a read
-    /// that had seen the newer version would then see the older one.
+    /// it, then wake the compaction worker, or, with none, owe the next
+    /// write a bounded step. Returns `false` when there was
+    /// nothing frozen to flush. See [`Flusher::flush_oldest`].
     fn flush_oldest_frozen(&self, flushing: &MutexGuard<'_, ()>) -> std::io::Result<bool> {
-        match self.flush_oldest_frozen_inner(flushing) {
-            Ok(flushed) => {
-                self.background_health.record_success(Job::Flush);
-                Ok(flushed)
-            }
-            Err(e) => {
-                let hazard = self.background_health.record_failure(Job::Flush, &e);
-                tracing::error!(error = %e, hazard = hazard.label(), "Flush failed");
-                if !self.options.listeners.is_empty() {
-                    let err = crate::Error::from(crate::Error::clone_io(&e));
-                    crate::event_listener::dispatch_contained(&self.options.listeners, |l| {
-                        l.on_background_error(
-                            crate::event_listener::BackgroundErrorReason::Flush,
-                            &err,
-                        )
-                    })
-                    .map_err(crate::Error::into_io_error)?;
-                }
-                Err(e)
-            }
+        let flushed = self.flusher.flush_oldest(flushing)?;
+        if flushed {
+            self.after_flush();
         }
-    }
-
-    fn flush_oldest_frozen_inner(&self, _flushing: &MutexGuard<'_, ()>) -> std::io::Result<bool> {
-        // Through the env: a target with no monotonic clock reports
-        // nothing measured rather than a fabricated duration.
-        let flush_start = self.env.now_micros();
-        let memtable = match self.view.load().frozen.first() {
-            Some(mt) => Arc::clone(mt),
-            None => return Ok(false),
-        };
-
-        let range_tombstones = memtable.clone_range_tombstones();
-
-        if memtable.is_empty() && range_tombstones.is_empty() {
-            self.retire_frozen(&memtable);
-            self.remove_sealed_wal(&memtable);
-            return Ok(true);
-        }
-
-        let file_id = {
-            let mut versions = self.versions.lock();
-            let version = versions.current();
-            let id = version.next_file_id;
-            versions.apply(&[VersionEdit::SetNextFileId(id + 1)])?;
-            id
-        };
-
-        let sst_path = self.sst_dir.join(sst_filename(file_id));
-        // Until the edit below is offered to the manifest, nothing else
-        // knows this file exists: every early return must unlink it, or a
-        // flush that keeps failing leaks a memtable-sized file per retry.
-        let mut pending = PendingOutputs::new(Arc::clone(&self.env));
-        pending.track(sst_path.clone());
-
-        // Memtable flushes always land at L0 - pick L0's codec.
-        let mut writer = SsTableWriter::new_in(
-            &self.env,
-            &sst_path,
-            self.options.block_size,
-            self.options.bloom_bits_per_key,
-            self.options.compression_for_level(0),
-            self.options.prefix_extractor.clone(),
-            self.options.partitioned_index,
-            self.options.metadata_block_size,
-        )?;
-
-        // Walk the memtable in internal-key order and copy every version
-        // and tombstone into the SSTable unchanged, preserving MVCC.
-        // The walk streams straight out of the arena: a flush holds one
-        // entry plus the block builder, never a second copy of the
-        // whole memtable.
-        let mut walk =
-            || memtable.try_for_each_entry(|internal_key, value| writer.add(internal_key, value));
-        // Only a prefix extractor runs caller code in the walk, so only then
-        // is there a panic to catch.
-        if self.options.prefix_extractor.is_some() {
-            callback::contain("PrefixExtractor", walk).map_err(crate::Error::into_io_error)??;
-        } else {
-            walk()?;
-        }
-
-        // Persist range tombstones alongside the point entries.
-        for rt in &range_tombstones {
-            writer.add_range_tombstone(&rt.start, &rt.end, rt.seq);
-        }
-
-        let summary = match writer.finish()? {
-            Some(s) => s,
-            None => {
-                self.retire_frozen(&memtable);
-                self.remove_sealed_wal(&memtable);
-                let _ = self.env.remove_file(&sst_path);
-                return Ok(true);
-            }
-        };
-
-        let file_size = self.env.metadata(&sst_path)?.len;
-        let num_entries = summary.num_entries;
-
-        // Throttle background I/O so bursts of flush writes don't
-        // starve foreground traffic. Rate-limiting is opt-in via
-        // `Options::rate_limiter`; a `None` limiter is a no-op.
-        if let Some(limiter) = &self.options.rate_limiter {
-            callback::contain("RateLimiter", || {
-                limiter.request(file_size, crate::rate_limiter::Priority::Low)
-            })
-            .map_err(crate::Error::into_io_error)?;
-        }
-
-        let reader = Arc::new(SsTableReader::open_with(
-            &self.env,
-            &sst_path,
-            file_id,
-            self.options.metadata_policy(),
-        )?);
-        let file = LiveSst::new(
-            SsTableMeta {
-                file_id,
-                smallest_key: summary.smallest_user_key,
-                largest_key: summary.largest_user_key,
-                file_size,
-                num_entries,
-                global_seq: None,
-            },
-            reader,
-        );
-
-        // The sequence this memtable was sealed at, not the engine's
-        // current one. `last_seq` is read back as "every write at or
-        // below this is in an SSTable", and a checkpoint copies tables
-        // and no WAL, so stamping the global counter here would make a
-        // checkpoint claim writes that are still only in a memtable it
-        // did not flush.
-        let seq = memtable
-            .sealed_seq()
-            .unwrap_or_else(|| self.latest_seq.load(Ordering::Acquire));
-        let edits = vec![
-            VersionEdit::AddFile { level: 0, file },
-            VersionEdit::SetLastSeq(seq),
-        ];
-        pending.offered_to_manifest();
-        self.versions.lock().apply(&edits)?;
-
-        // Retired only now: until the `AddFile` above is published, the
-        // flushed data lives in this memtable alone.
-        self.retire_frozen(&memtable);
-        self.remove_sealed_wal(&memtable);
-        self.compaction.lock().notify();
-
-        // Publish flush statistics before the listener dispatch
-        // so callers that react to `on_flush_completed` can
-        // already see the updated tickers.
-        if let Some(s) = self.statistics() {
-            s.add(crate::statistics::Ticker::FlushCount, 1);
-            s.add(crate::statistics::Ticker::FlushBytesWritten, file_size);
-            if let Some(micros) = self.elapsed_micros(flush_start) {
-                s.record(crate::statistics::Histogram::FlushTime, micros);
-            }
-        }
-
-        // Dispatch lifecycle events to any registered listeners.
-        // Two callbacks fire per flush: `on_table_file_created`
-        // for the new SSTable and `on_flush_completed` with
-        // memtable-level aggregates.
-        if !self.options.listeners.is_empty() {
-            let (smallest, largest) = {
-                // Version was just applied; pull the newly-added
-                // file's metadata back out so listeners see the
-                // exact bounds the engine committed.
-                let ver = self.versions.lock().current();
-                if let Some(added) = ver.levels[0].iter().find(|f| f.meta.file_id == file_id) {
-                    (
-                        added.meta.smallest_key.clone(),
-                        added.meta.largest_key.clone(),
-                    )
-                } else {
-                    (Vec::new(), Vec::new())
-                }
-            };
-            // Zero where the platform has no monotonic clock; the
-            // `FlushJobInfo::duration` doc says so.
-            let duration =
-                std::time::Duration::from_micros(self.elapsed_micros(flush_start).unwrap_or(0));
-            let create_info = event_listener::TableFileCreationInfo {
-                file_id,
-                file_path: sst_path.clone(),
-                level: 0,
-                reason: event_listener::TableFileCreationReason::Flush,
-                file_size,
-                num_entries,
-            };
-            let flush_info = event_listener::FlushJobInfo {
-                file_id,
-                file_path: sst_path.clone(),
-                file_size,
-                num_entries,
-                smallest_key: smallest,
-                largest_key: largest,
-                duration,
-            };
-            event_listener::dispatch_contained(&self.options.listeners, |l| {
-                l.on_table_file_created(&create_info)
-            })
-            .map_err(crate::Error::into_io_error)?;
-            event_listener::dispatch_contained(&self.options.listeners, |l| {
-                l.on_flush_completed(&flush_info)
-            })
-            .map_err(crate::Error::into_io_error)?;
-        }
-
-        tracing::info!(
-            file_id,
-            entries = num_entries,
-            size = file_size,
-            "Flushed memtable to L0 SSTable"
-        );
-
-        Ok(true)
+        Ok(flushed)
     }
 
     /// Synchronously compact SSTables overlapping the user-key range
@@ -2734,7 +2564,12 @@ impl RegolithEngine {
         //    overlaps the range is materialized in L0. We only touch
         //    the write lock if there's actually data to flush. "Data"
         //    here includes range tombstones, not just point entries.
-        let needs_flush = |mt: &MemTable| !mt.is_empty() || !mt.clone_range_tombstones().is_empty();
+        // A log sealed under a key other than the current one is rotated
+        // away even when its memtable is empty, so a full compaction leaves
+        // no file naming a rotated key.
+        let needs_flush = |mt: &MemTable| {
+            !mt.is_empty() || !mt.clone_range_tombstones().is_empty() || self.wal_key_is_stale()
+        };
         if needs_flush(&self.view.load().active) {
             let _write_guard = self.pipeline.lock();
             if needs_flush(&self.view.load().active) {
@@ -2748,40 +2583,70 @@ impl RegolithEngine {
         // synchronous compact_range just flushes the memtable and
         // runs the FIFO picker so any pending files over the cap
         // get dropped deterministically.
-        if matches!(
-            self.options.compaction_style,
-            crate::options::CompactionStyle::Fifo
-        ) {
-            let _ = compaction::run_fifo_pass(&self.versions, &self.sst_dir, &compaction_opts)?;
-            return Ok(());
+        match self.options.compaction_style {
+            crate::options::CompactionStyle::Fifo => {
+                let _ = compaction::run_fifo_pass(&self.versions, &self.sst_dir, &compaction_opts)?;
+            }
+            // Under Universal compaction a manual compact_range folds
+            // every L0 file into one run, matching the "force full
+            // compaction" semantics a caller expects.
+            crate::options::CompactionStyle::Universal => {
+                compaction::run_universal_full_compaction(
+                    &self.versions,
+                    &self.sst_dir,
+                    &self.cache,
+                    &compaction_opts,
+                    &self.snapshot_registry,
+                )?;
+            }
+            _ => compaction::run_compact_range(
+                &self.versions,
+                &self.sst_dir,
+                &self.cache,
+                &compaction_opts,
+                start,
+                end,
+                &self.snapshot_registry,
+            )?,
         }
 
-        // Under Universal compaction a manual compact_range folds
-        // every L0 file into one run, matching the "force full
-        // compaction" semantics a caller expects.
-        if matches!(
-            self.options.compaction_style,
-            crate::options::CompactionStyle::Universal
-        ) {
-            compaction::run_universal_full_compaction(
+        // On an encrypted database a manual compaction also re-seals, over
+        // the whole database whatever the range: every table not sealed under
+        // the current key (written before encryption was turned on, or under
+        // a key since rotated away, or left untouched by the passes above)
+        // is rewritten, and so is a manifest holding a batch under another
+        // key. With the log rotated above, no file names any other key after.
+        if self.options.keyring.is_some() {
+            compaction::reseal_tables(
                 &self.versions,
                 &self.sst_dir,
                 &self.cache,
                 &compaction_opts,
                 &self.snapshot_registry,
             )?;
-            return Ok(());
+            let mut versions = self.versions.lock();
+            if versions.has_stale_seals() {
+                versions.compact_manifest()?;
+            }
         }
+        Ok(())
+    }
 
-        compaction::run_compact_range(
-            &self.versions,
-            &self.sst_dir,
-            &self.cache,
-            &compaction_opts,
-            start,
-            end,
-            &self.snapshot_registry,
-        )
+    /// Whether, on an encrypted database, a log may name a key other than
+    /// the current one: the active log is sealed under another key or not
+    /// sealed at all, or a frozen memtable's log is still on disk (a
+    /// rotation flushes it, and its log with it).
+    fn wal_key_is_stale(&self) -> bool {
+        let Some(keyring) = &self.options.keyring else {
+            return false;
+        };
+        let current = keyring.current_id();
+        !self.view.load().frozen.is_empty()
+            || self
+                .active_wal
+                .lock()
+                .as_ref()
+                .is_some_and(|wal| wal.seal_key() != Some(current))
     }
 
     /// Atomically capture a consistent snapshot of the on-disk state
@@ -3048,6 +2913,11 @@ impl RegolithEngine {
         // write_lock` order documented on `run_one_compaction_pass`.
         let _compact_guard = self.compaction_lock.write();
         let _write_guard = self.pipeline.lock();
+        // A flush the background is running took its memtable before the
+        // drop and installs its table after it: held here, it finishes first
+        // and the `Reset` below removes its table, instead of laying it over
+        // the emptied version.
+        let _flushing = self.flusher.flushing.lock();
         self.ensure_writable()?;
 
         // Published before the version `Reset` below, so no reader can
@@ -3063,7 +2933,7 @@ impl RegolithEngine {
             let old_version = versions.current();
             let id = old_version.next_file_id;
             let wal_path = self.wal_dir.join(wal_filename(id));
-            let new_wal = Wal::create_in(&self.env, &wal_path)?;
+            let new_wal = Wal::create_in(&self.env, &wal_path, self.options.keyring.as_deref())?;
             versions.apply(&[VersionEdit::Reset {
                 next_file_id: id + 1,
                 min_wal_id: id,
@@ -3153,6 +3023,9 @@ impl RegolithEngine {
         self.close_state
             .store(CLOSE_STATE_CLOSING, Ordering::Release);
         self.stall_signal.notify_all();
+        // Every queue waiting on a read gets its completion now, and the read
+        // run again sees the database closing.
+        self.cache.close_io();
         // A transaction still open ends here, on this thread, before the final
         // sync; one already committing is left to finish through it.
         self.open_transactions.abort_all(self);
@@ -3164,6 +3037,9 @@ impl RegolithEngine {
                 Ok(())
             }
             Err(err) => {
+                // Reads through queues work again on the database the failed
+                // close left open.
+                self.cache.reopen_io();
                 self.close_state.store(CLOSE_STATE_OPEN, Ordering::Release);
                 self.stall_signal.notify_all();
                 Err(err)
@@ -3240,6 +3116,12 @@ impl RegolithEngine {
         self.versions.lock().compact_manifest()
     }
 
+    /// Test-only: how many sealed memtables wait for a flush.
+    #[cfg(test)]
+    pub(crate) fn frozen_memtables(&self) -> usize {
+        self.view.load().frozen.len()
+    }
+
     #[cfg(test)]
     pub(crate) fn memtables_hold_no_data(&self) -> bool {
         let view = self.view.load();
@@ -3283,6 +3165,12 @@ impl RegolithEngine {
                 let fresh = Arc::new(MemTable::new(&self.memtable_config)?);
                 let old_wal = self.swap_wal(new_wal_id)?;
 
+                // Stamped before it is published as frozen, as
+                // `seal_active` stamps it: a worker may flush it at once.
+                let sealing = Arc::clone(&self.view.load().active);
+                sealing.seal_seq(self.latest_seq.load(Ordering::Acquire));
+                sealing.seal_wal(old_wal.path().to_path_buf());
+
                 // One publication for the seal and the enqueue: two
                 // would leave a window where the sealed memtable is in
                 // neither the active slot nor the frozen list.
@@ -3292,10 +3180,8 @@ impl RegolithEngine {
                     next_frozen.push(Arc::clone(&sealed));
                     (fresh, next_frozen, sealed)
                 });
-                sealed.seal_seq(self.latest_seq.load(Ordering::Acquire));
-
+                debug_assert!(Arc::ptr_eq(&sealed, &sealing));
                 self.wal_id.store(new_wal_id, Ordering::Release);
-                sealed.seal_wal(old_wal.path().to_path_buf());
                 targets.push(sealed);
             }
             targets

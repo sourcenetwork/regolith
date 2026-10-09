@@ -255,6 +255,9 @@ fn explicit_flush_writes_an_l0_file_and_is_idempotent() {
 
 #[test]
 fn compact_step_reports_idle_did_work_and_contended_apart() {
+    // Two 32 KiB memtables' worth of 512-byte values: one sealed by the
+    // writes, one by the flush, and under the slowdown trigger of 4.
+    const KEYS: usize = 100;
     let dir = tempfile::tempdir().unwrap();
     let db = Db::open(dir.path(), foreground_options()).unwrap();
 
@@ -264,12 +267,26 @@ fn compact_step_reports_idle_did_work_and_contended_apart() {
         "an empty database has nothing to compact, and must say Idle rather than Contended"
     );
 
-    // `l0_compaction_trigger` is 2, so two flushed memtables give the
-    // picker something to merge.
-    for i in 0..600usize {
+    // With no worker the writes themselves compact once L0 reaches its
+    // trigger (E16), so the tables are written with a trigger they never
+    // reach, and the database is reopened at `l0_compaction_trigger` 2 to
+    // give the picker two of them to merge with no write in between.
+    drop(db);
+    let db = Db::open(
+        dir.path(),
+        foreground_options().l0_compaction_trigger(1_000),
+    )
+    .unwrap();
+    for i in 0..KEYS {
         db.put(format!("key{i:06}").as_bytes(), &value(i)).unwrap();
     }
     db.flush().unwrap();
+    assert!(
+        db.get_int_property("regolith.num-files-at-level0").unwrap() >= 2,
+        "the writes left fewer than two tables to merge"
+    );
+    drop(db);
+    let db = Db::open(dir.path(), foreground_options()).unwrap();
 
     assert_eq!(
         db.compact_step().unwrap(),
@@ -294,7 +311,7 @@ fn compact_step_reports_idle_did_work_and_contended_apart() {
         "a drained tree with no worker running must report Idle, not Contended"
     );
 
-    for i in (0..600usize).step_by(37) {
+    for i in (0..KEYS).step_by(37) {
         assert_eq!(
             db.get(format!("key{i:06}").as_bytes()).unwrap(),
             Some(value(i))

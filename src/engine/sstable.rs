@@ -24,12 +24,15 @@
 //! ```text
 //! MAGIC_V5 (version byte 0x05) flat index,        72-byte footer, metadata checksummed
 //! MAGIC_V6 (version byte 0x06) partitioned index, 72-byte footer, metadata checksummed
+//! MAGIC_V7 (version byte 0x07) flat index,        116-byte footer, every region sealed
+//! MAGIC_V8 (version byte 0x08) partitioned index, 116-byte footer, every region sealed
 //! ```
 //!
-//! Both carry the `REGOSST` identifier. These are the formats regolith
-//! has written since its first release, and the only ones it reads: a
-//! file whose trailing magic is anything else is refused with "invalid
-//! SSTable magic number", which is the correct loud failure.
+//! All carry the `REGOSST` identifier. V5 and V6 are the formats regolith
+//! has written since its first release; V7 and V8 are what it writes when
+//! the database is encrypted at rest (see the `sealed` submodule). A file
+//! whose trailing magic is anything else is refused with "invalid SSTable
+//! magic number", which is the correct loud failure.
 //!
 //! # What a checksum covers
 //!
@@ -59,7 +62,7 @@ use std::fs;
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, OnceLock, Weak};
 
 use std::ops::ControlFlow;
 
@@ -72,16 +75,24 @@ use super::index_block::IndexBlock;
 use super::internal_key::{
     VALUE_TYPE_DELETION, VALUE_TYPE_MERGE, decode_internal_key, user_key_of,
 };
+use super::io::Landed;
+use super::io::scope;
+use super::io::unit::{UnitKey, Work};
 use super::lookup_key::LookupKey;
 use super::range_tombstone::{RangeTombstone, RangeTombstoneSet, table_key_range};
+use super::seal::{Keyring, OVERHEAD};
 use crate::DbSlice;
 use crate::env::{BufferedWriter, Env, ReadFile, WriteMode};
 use crate::options::{CompressionType, PrefixExtractor};
 
 mod global_seq;
 mod key_walk;
+mod sealed;
 #[cfg(test)]
 mod size_limit_tests;
+
+pub(crate) use sealed::TableSeal;
+use sealed::{MAGIC_V7, MAGIC_V8, SEALED_FOOTER_SIZE};
 
 /// SSTable magic number: "REGOSST\x05" - flat index, 72-byte footer,
 /// metadata regions checksummed. Written by regolith today.
@@ -139,13 +150,17 @@ struct Footer {
     index_size: u64,
     num_entries: u64,
     magic: u64,
+    /// The whole footer of a sealed table, which `TableSeal::open_footer`
+    /// verifies before anything it says is trusted. `None` for an unsealed
+    /// table, whose footer checksum has already been checked.
+    sealed: Option<[u8; SEALED_FOOTER_SIZE]>,
 }
 
 impl Footer {
     /// Whether `magic` names the partitioned index layout, where the
     /// footer's index handle points at a top-level index of leaves.
     fn magic_is_partitioned(magic: u64) -> bool {
-        matches!(magic, MAGIC_V6)
+        matches!(magic, MAGIC_V6 | MAGIC_V8)
     }
 
     /// Footer byte length implied by `magic`, or an error naming the
@@ -153,6 +168,7 @@ impl Footer {
     fn size_for_magic(magic: u64) -> io::Result<usize> {
         match magic {
             MAGIC_V5 | MAGIC_V6 => Ok(FOOTER_SIZE),
+            MAGIC_V7 | MAGIC_V8 => Ok(SEALED_FOOTER_SIZE),
             other => Err(invalid_data(format!(
                 "invalid SSTable magic number: {other:#018x}"
             ))),
@@ -160,12 +176,26 @@ impl Footer {
     }
 
     fn size(&self) -> usize {
-        FOOTER_SIZE
+        if self.sealed.is_some() {
+            SEALED_FOOTER_SIZE
+        } else {
+            FOOTER_SIZE
+        }
     }
 
-    /// Encode into the layout `self.magic` selects.
-    fn encode(&self) -> Vec<u8> {
-        let mut buf = vec![0u8; self.size()];
+    /// Bytes each region carries beside its payload: a checksum trailer,
+    /// or the nonce and tag of a sealed frame.
+    fn region_overhead(&self) -> u64 {
+        if self.sealed.is_some() {
+            OVERHEAD as u64
+        } else {
+            META_CHECKSUM_LEN as u64
+        }
+    }
+
+    /// The seven fixed fields, in their on-disk order.
+    fn fields(&self) -> [u8; 56] {
+        let mut buf = [0u8; 56];
         buf[0..8].copy_from_slice(&self.range_tombstone_offset.to_le_bytes());
         buf[8..16].copy_from_slice(&self.range_tombstone_size.to_le_bytes());
         buf[16..24].copy_from_slice(&self.bloom_offset.to_le_bytes());
@@ -173,17 +203,30 @@ impl Footer {
         buf[32..40].copy_from_slice(&self.index_offset.to_le_bytes());
         buf[40..48].copy_from_slice(&self.index_size.to_le_bytes());
         buf[48..56].copy_from_slice(&self.num_entries.to_le_bytes());
+        buf
+    }
+
+    /// Encode into the layout `self.magic` selects: sealed under `seal`
+    /// when there is one.
+    fn encode(&self, seal: Option<&TableSeal>) -> io::Result<Vec<u8>> {
+        let fields = self.fields();
+        if let Some(seal) = seal {
+            return Ok(seal.encode_footer(&fields, self.magic)?.to_vec());
+        }
+        let mut buf = vec![0u8; FOOTER_SIZE];
+        buf[0..56].copy_from_slice(&fields);
         let sum = checksum::sst_footer(&buf[0..56], self.magic).to_le_bytes();
         buf[56..64].copy_from_slice(&sum);
         buf[64..72].copy_from_slice(&self.magic.to_le_bytes());
-        buf
+        Ok(buf)
     }
 
     /// Decode a footer whose length is exactly what its magic implies.
     ///
     /// The magic is validated first, so a table from a format version
     /// regolith does not implement is reported as a magic error rather than
-    /// as a checksum error.
+    /// as a checksum error. A sealed footer is parsed but not yet verified:
+    /// that takes its key.
     fn decode(buf: &[u8]) -> io::Result<Self> {
         if buf.len() < FOOTER_SIZE {
             return Err(invalid_data("SSTable footer is truncated"));
@@ -196,10 +239,17 @@ impl Footer {
                 buf.len()
             )));
         }
-        let stored = u64::from_le_bytes(buf[56..64].try_into().unwrap());
-        if stored != checksum::sst_footer(&buf[0..56], magic) {
-            return Err(invalid_data("SSTable footer checksum mismatch"));
-        }
+        let sealed = if matches!(magic, MAGIC_V7 | MAGIC_V8) {
+            let mut whole = [0u8; SEALED_FOOTER_SIZE];
+            whole.copy_from_slice(buf);
+            Some(whole)
+        } else {
+            let stored = u64::from_le_bytes(buf[56..64].try_into().unwrap());
+            if stored != checksum::sst_footer(&buf[0..56], magic) {
+                return Err(invalid_data("SSTable footer checksum mismatch"));
+            }
+            None
+        };
         Ok(Self {
             range_tombstone_offset: u64::from_le_bytes(buf[0..8].try_into().unwrap()),
             range_tombstone_size: u64::from_le_bytes(buf[8..16].try_into().unwrap()),
@@ -209,8 +259,38 @@ impl Footer {
             index_size: u64::from_le_bytes(buf[40..48].try_into().unwrap()),
             num_entries: u64::from_le_bytes(buf[48..56].try_into().unwrap()),
             magic,
+            sealed,
         })
     }
+
+    /// The seal of a sealed table once its footer verifies, or `None` for
+    /// an unsealed one.
+    fn open_seal(&self, keyring: Option<&Keyring>, path: &Path) -> io::Result<Option<TableSeal>> {
+        self.sealed
+            .as_ref()
+            .map(|footer| TableSeal::open_footer(keyring, footer, path))
+            .transpose()
+    }
+}
+
+/// The payload of a metadata region read whole at `offset`: its checksum
+/// trailer verified and cut off, or, in a table sealed under `seal`, its
+/// frame opened. Truncates or shifts in place, so it costs no copy beyond
+/// a sealed region's 12-byte shift.
+fn unframe_meta_region(
+    seal: Option<&TableSeal>,
+    mut region: Vec<u8>,
+    offset: u64,
+    kind: u8,
+    file_id: u64,
+    name: &'static str,
+) -> io::Result<Vec<u8>> {
+    if let Some(seal) = seal {
+        return seal.open_region(kind, offset, region, file_id, name);
+    }
+    let len = verify_meta_region(&region, kind, true, name)?.len();
+    region.truncate(len);
+    Ok(region)
 }
 
 /// Read the trailing footer of an SSTable. The magic is the file's last
@@ -340,6 +420,9 @@ impl LiveSst {
             meta.global_seq, reader.global_seq,
             "a table's reader reads at the sequence its metadata records"
         );
+        // Every table a read can reach is made here, so this is where its
+        // reader learns how to hand a queued read its own handle.
+        let _ = reader.me.set(Arc::downgrade(&reader));
         Arc::new(Self { meta, reader })
     }
 }
@@ -577,10 +660,10 @@ fn read_bytes(
 
 /// Check every region the footer points at against `data_end`, the first
 /// byte past the region area (the file size less the footer). Every
-/// region is checksummed, so each also has to be long enough to hold its
-/// trailer.
+/// region is checksummed or sealed, so each also has to be long enough to
+/// hold its trailer or its nonce and tag.
 fn validate_footer_regions(footer: &Footer, data_end: u64) -> io::Result<()> {
-    let trailer = META_CHECKSUM_LEN as u64;
+    let trailer = footer.region_overhead();
     if footer.bloom_size < 8 + trailer {
         return Err(invalid_data("bloom region too short"));
     }
@@ -613,19 +696,28 @@ fn validate_footer_regions(footer: &Footer, data_end: u64) -> io::Result<()> {
     Ok(())
 }
 
-/// Append one metadata region followed by its checksum trailer, and
-/// advance `offset` past both. The reader half is `verify_meta_region`;
-/// the two must agree on the trailer or no table opens.
+/// Append one metadata region followed by its checksum trailer, or as one
+/// frame sealed under `seal`, and advance `offset` past it. The reader half
+/// is `unframe_meta_region`; the two must agree on the framing or no table
+/// opens.
 fn write_meta_region(
     writer: &mut BufferedWriter,
     offset: &mut u64,
     payload: &[u8],
     kind: u8,
+    seal: Option<&TableSeal>,
 ) -> io::Result<u64> {
-    let trailer = checksum::sst_meta(kind, payload).to_le_bytes();
-    writer.write_all(payload)?;
-    writer.write_all(&trailer)?;
-    let size = (payload.len() + trailer.len()) as u64;
+    let size = if let Some(seal) = seal {
+        let mut frame = Vec::with_capacity(payload.len() + OVERHEAD);
+        seal.seal_region(kind, *offset, payload, &mut frame)?;
+        writer.write_all(&frame)?;
+        frame.len()
+    } else {
+        let trailer = checksum::sst_meta(kind, payload).to_le_bytes();
+        writer.write_all(payload)?;
+        writer.write_all(&trailer)?;
+        payload.len() + trailer.len()
+    } as u64;
     *offset += size;
     Ok(size)
 }
@@ -656,6 +748,35 @@ fn check_data_block_header(frame: u64, header: &[u8], limit: Option<usize>) -> i
         _ => return Err(invalid_data("unknown compression type")),
     };
     check_data_block_limit(frame, decoded, limit)
+}
+
+/// The raw block a data block's `payload` decodes to under its
+/// compression type. Shared by sealed and checksummed frames.
+fn decompress_block(compression_type: u8, payload: &[u8]) -> io::Result<Vec<u8>> {
+    match compression_type {
+        COMPRESSION_NONE => Ok(payload.to_vec()),
+        COMPRESSION_LZ4 => lz4_flex::decompress_size_prepended(payload)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string())),
+        COMPRESSION_SNAPPY => {
+            if payload.len() < 4 {
+                return Err(invalid_data("snappy block too short"));
+            }
+            let raw_len = u32::from_le_bytes(payload[0..4].try_into().unwrap()) as usize;
+            let mut decoder = snap::raw::Decoder::new();
+            let mut out = vec![0u8; raw_len];
+            let n = decoder
+                .decompress(&payload[4..], &mut out)
+                .map_err(|e| invalid_data(format!("snappy decode: {e}")))?;
+            if n != raw_len {
+                return Err(invalid_data("snappy decoded length mismatch"));
+            }
+            out.truncate(n);
+            Ok(out)
+        }
+        _ => Err(invalid_data(format!(
+            "unknown compression type: {compression_type}"
+        ))),
+    }
 }
 
 fn read_file_region(
@@ -719,10 +840,16 @@ pub(crate) struct SsTableWriter {
     compression: CompressionType,
     partitioned_index: bool,
     metadata_block_size: usize,
+    /// Set when the table is sealed: every region is written as a frame
+    /// under this key and salt.
+    seal: Option<TableSeal>,
+    /// A sealed block's frame, reused from one block to the next.
+    frame: Vec<u8>,
 }
 
 impl SsTableWriter {
-    /// Start writing an SSTable at `path` on `env`.
+    /// Start writing an SSTable at `path` on `env`, sealed under the
+    /// current key of `keyring` when one is given.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new_in(
         env: &Arc<dyn Env>,
@@ -733,7 +860,9 @@ impl SsTableWriter {
         prefix_extractor: Option<Arc<dyn PrefixExtractor>>,
         partitioned_index: bool,
         metadata_block_size: usize,
+        keyring: Option<&Keyring>,
     ) -> io::Result<Self> {
+        let seal = keyring.map(TableSeal::fresh).transpose()?;
         let file = env.open_write(path, WriteMode::Truncate)?;
         let prefix_bloom_builder = prefix_extractor
             .as_ref()
@@ -759,6 +888,8 @@ impl SsTableWriter {
             compression,
             partitioned_index,
             metadata_block_size,
+            seal,
+            frame: Vec::new(),
         })
     }
 
@@ -782,6 +913,7 @@ impl SsTableWriter {
             prefix_extractor,
             partitioned_index,
             metadata_block_size,
+            None,
         )
     }
 
@@ -875,6 +1007,7 @@ impl SsTableWriter {
                 &mut self.current_offset,
                 &range_tombstone_data,
                 checksum::META_KIND_RANGE_TOMBSTONE,
+                self.seal.as_ref(),
             )?
         };
 
@@ -903,6 +1036,7 @@ impl SsTableWriter {
             &mut self.current_offset,
             &bloom_region,
             checksum::META_KIND_BLOOM,
+            self.seal.as_ref(),
         )?;
 
         let (index_offset, index_size, magic) = if self.partitioned_index {
@@ -934,6 +1068,7 @@ impl SsTableWriter {
                     &mut self.current_offset,
                     &leaf_data,
                     checksum::META_KIND_INDEX_LEAF,
+                    self.seal.as_ref(),
                 )?;
 
                 top_level.push((
@@ -952,8 +1087,14 @@ impl SsTableWriter {
                 &mut self.current_offset,
                 &top_data,
                 checksum::META_KIND_INDEX,
+                self.seal.as_ref(),
             )?;
-            (top_offset, top_size, MAGIC_V6)
+            let magic = if self.seal.is_some() {
+                MAGIC_V8
+            } else {
+                MAGIC_V6
+            };
+            (top_offset, top_size, magic)
         } else {
             let index_data = encode_index_block(&self.index_entries);
             let idx_offset = self.current_offset;
@@ -962,8 +1103,14 @@ impl SsTableWriter {
                 &mut self.current_offset,
                 &index_data,
                 checksum::META_KIND_INDEX,
+                self.seal.as_ref(),
             )?;
-            (idx_offset, idx_size, MAGIC_V5)
+            let magic = if self.seal.is_some() {
+                MAGIC_V7
+            } else {
+                MAGIC_V5
+            };
+            (idx_offset, idx_size, magic)
         };
 
         let footer = Footer {
@@ -975,8 +1122,9 @@ impl SsTableWriter {
             index_size,
             num_entries: self.num_entries,
             magic,
+            sealed: None,
         };
-        self.writer.write_all(&footer.encode())?;
+        self.writer.write_all(&footer.encode(self.seal.as_ref())?)?;
         self.writer.sync_all()?;
         crate::env::sync_parent_dir(&*self.env, &self.path)?;
 
@@ -1019,11 +1167,18 @@ impl SsTableWriter {
             }
         };
 
-        let checksum = checksum::sst_block(codec_byte, &payload);
-        self.writer.write_all(&[codec_byte])?;
-        self.writer.write_all(&payload)?;
-        self.writer.write_all(&checksum.to_le_bytes())?;
-        let total = 1 + payload.len() + 4;
+        let total = if let Some(seal) = &self.seal {
+            self.frame.clear();
+            seal.seal_data_block(block_offset, codec_byte, &payload, &mut self.frame)?;
+            self.writer.write_all(&self.frame)?;
+            self.frame.len()
+        } else {
+            let checksum = checksum::sst_block(codec_byte, &payload);
+            self.writer.write_all(&[codec_byte])?;
+            self.writer.write_all(&payload)?;
+            self.writer.write_all(&checksum.to_le_bytes())?;
+            1 + payload.len() + 4
+        };
         self.current_offset += total as u64;
 
         let block_size = self.current_offset - block_offset;
@@ -1082,14 +1237,21 @@ pub(crate) struct SsTableReader {
     index_fallback: OnceLock<Arc<IndexBlock>>,
     filter_fallback: OnceLock<Arc<FilterBlock>>,
     range_tombstones: RangeTombstoneSet,
-    /// `true` when the file was written with `MAGIC_V6` (partitioned
-    /// index). `self.index` then holds only the compact top-level
-    /// entries; each entry's `handle` points to a leaf sub-block read
-    /// via [`SsTableReader::read_index_leaf`].
+    /// `true` when the file was written with `MAGIC_V6` or `MAGIC_V8`
+    /// (partitioned index). `self.index` then holds only the compact
+    /// top-level entries; each entry's `handle` points to a leaf sub-block
+    /// read via [`SsTableReader::read_index_leaf`].
     partitioned: bool,
+    /// Set when the table is sealed: every region read from it is opened
+    /// under this key and salt instead of checked against a checksum.
+    seal: Option<TableSeal>,
     /// The sequence every entry reads at, for an ingested table. See the
     /// `global_seq` module for the seams that apply it.
     global_seq: Option<u64>,
+    /// This reader's own handle, set when its table goes live
+    /// ([`LiveSst::new`]). A `CacheOnly` miss hands it to the unit that
+    /// reads the block later, on whichever thread claims it.
+    me: OnceLock<Weak<SsTableReader>>,
     /// Number of index leaves actually read from disk, i.e. block-cache
     /// misses. Cached leaf hits do not count.
     #[cfg(test)]
@@ -1145,6 +1307,7 @@ impl SsTableReader {
             path,
             file_id,
             MetadataPolicy::Pinned,
+            None,
         )
     }
 
@@ -1156,11 +1319,17 @@ impl SsTableReader {
     /// [`MetadataPolicy::Cached`] the decoded blocks are then dropped
     /// and re-fetched through the block cache on first use, which is
     /// what puts them inside the configured budget.
+    ///
+    /// A sealed table opens only through `keyring`, under the key its
+    /// footer names: with no keyring it refuses with
+    /// [`crate::Error::KeyProviderRequired`], and a key the keyring does
+    /// not provide refuses with [`crate::Error::UnknownKey`].
     pub(crate) fn open_with(
         env: &Arc<dyn Env>,
         path: &Path,
         file_id: u64,
         policy: MetadataPolicy,
+        keyring: Option<&Keyring>,
     ) -> io::Result<Self> {
         let file = env.open_read(path)?;
         let file_size = file.len()?;
@@ -1168,6 +1337,7 @@ impl SsTableReader {
         let footer = read_footer(&*file, file_size)?;
         let data_end = file_size - footer.size() as u64;
         validate_footer_regions(&footer, data_end)?;
+        let seal = footer.open_seal(keyring, path)?;
 
         let filter_handle = BlockHandle {
             offset: footer.bloom_offset,
@@ -1180,23 +1350,24 @@ impl SsTableReader {
             data_end,
             "bloom region",
         )?;
-        let filter_block = FilterBlock::decode(verify_meta_region(
-            &filter_region,
+        let filter_block = FilterBlock::decode(&unframe_meta_region(
+            seal.as_ref(),
+            filter_region,
+            filter_handle.offset,
             checksum::META_KIND_BLOOM,
-            true,
+            file_id,
             "bloom region",
         )?)?;
         let filter = match policy {
             MetadataPolicy::Pinned => MetaSlot::Pinned(Arc::new(filter_block)),
             MetadataPolicy::Cached => MetaSlot::Cached(filter_handle),
         };
-        drop(filter_region);
 
         let index_handle = BlockHandle {
             offset: footer.index_offset,
             size: footer.index_size,
         };
-        let mut index_region = read_file_region(
+        let index_region = read_file_region(
             &*file,
             index_handle.offset,
             index_handle.size,
@@ -1205,15 +1376,14 @@ impl SsTableReader {
         )?;
         // `IndexBlock::decode` takes the buffer by value, so the verified
         // payload is truncated in place rather than copied out.
-        let index_payload_len = verify_meta_region(
-            &index_region,
+        let index_block = IndexBlock::decode(unframe_meta_region(
+            seal.as_ref(),
+            index_region,
+            index_handle.offset,
             checksum::META_KIND_INDEX,
-            true,
+            file_id,
             "index block",
-        )?
-        .len();
-        index_region.truncate(index_payload_len);
-        let index_block = IndexBlock::decode(index_region)?;
+        )?)?;
 
         let range_tombstones = if footer.range_tombstone_size == 0 {
             Vec::new()
@@ -1225,10 +1395,12 @@ impl SsTableReader {
                 data_end,
                 "range tombstone block",
             )?;
-            decode_range_tombstone_block(verify_meta_region(
-                &rt_region,
+            decode_range_tombstone_block(&unframe_meta_region(
+                seal.as_ref(),
+                rt_region,
+                footer.range_tombstone_offset,
                 checksum::META_KIND_RANGE_TOMBSTONE,
-                true,
+                file_id,
                 "range tombstone block",
             )?)?
         };
@@ -1252,10 +1424,27 @@ impl SsTableReader {
             filter_fallback: OnceLock::new(),
             range_tombstones: RangeTombstoneSet::from_vec(range_tombstones),
             partitioned,
+            seal,
             global_seq: None,
+            me: OnceLock::new(),
             #[cfg(test)]
             index_leaf_reads: AtomicUsize::new(0),
         })
+    }
+
+    /// The key this table is sealed under, or `None` when it is not sealed.
+    pub(crate) fn seal_key(&self) -> Option<crate::KeyId> {
+        self.seal.as_ref().map(TableSeal::key_id)
+    }
+
+    /// Bytes a data block's frame carries beside its payload, so the
+    /// smallest frame a handle can name.
+    fn min_block_frame(&self) -> u64 {
+        if self.seal.is_some() {
+            OVERHEAD as u64 + 1
+        } else {
+            5
+        }
     }
 
     /// This reader, reading every entry and range tombstone of the file at
@@ -1346,12 +1535,23 @@ impl SsTableReader {
         if let Some(block) = cache.get_index(self.file_id, handle.offset) {
             return Ok(MetaRef::Owned(block));
         }
+        if let Some(landed) = self.queue_miss(cache, handle, None, |reader| {
+            Box::new(move |cache| reader.load_index(handle, cache).map(Landed::Index))
+        }) {
+            return Ok(MetaRef::Owned(landed?.into_index()?));
+        }
+        self.load_index(handle, cache).map(MetaRef::Owned)
+    }
+
+    /// Read a cached flat index from the device, into the block cache, or
+    /// pinned when the cache refuses it.
+    fn load_index(&self, handle: BlockHandle, cache: &BlockCache) -> io::Result<Arc<IndexBlock>> {
         let data = self.read_metadata_region(handle, checksum::META_KIND_INDEX, "index block")?;
         let block = Arc::new(IndexBlock::decode(data)?);
         if !cache.insert_index(self.file_id, handle.offset, Arc::clone(&block)) {
             let _ = self.index_fallback.set(Arc::clone(&block));
         }
-        Ok(MetaRef::Owned(block))
+        Ok(block)
     }
 
     /// The filter region, from wherever this reader keeps it.
@@ -1366,13 +1566,51 @@ impl SsTableReader {
         if let Some(block) = cache.get_filter(self.file_id, handle.offset) {
             return Ok(MetaRef::Owned(block));
         }
+        if let Some(landed) = self.queue_miss(cache, handle, None, |reader| {
+            Box::new(move |cache| reader.load_filter(handle, cache).map(Landed::Filter))
+        }) {
+            return Ok(MetaRef::Owned(landed?.into_filter()?));
+        }
+        self.load_filter(handle, cache).map(MetaRef::Owned)
+    }
+
+    /// Read a cached filter region from the device, into the block cache, or
+    /// pinned when the cache refuses it.
+    fn load_filter(&self, handle: BlockHandle, cache: &BlockCache) -> io::Result<Arc<FilterBlock>> {
         let region =
             self.read_metadata_region(handle, checksum::META_KIND_BLOOM, "bloom region")?;
         let block = Arc::new(FilterBlock::decode(&region)?);
         if !cache.insert_filter(self.file_id, handle.offset, Arc::clone(&block)) {
             let _ = self.filter_fallback.set(Arc::clone(&block));
         }
-        Ok(MetaRef::Owned(block))
+        Ok(block)
+    }
+
+    /// The device seam. The block cache just missed `handle`: in a
+    /// `CacheOnly` scope, hand the read to the scope's queue, and return
+    /// what landed for it or the `WouldBlock` that records it; `None` in a
+    /// `Blocking` scope, whose caller reads the device itself. `work` makes
+    /// the read the unit runs later, from this reader's own handle.
+    fn queue_miss(
+        &self,
+        cache: &BlockCache,
+        handle: BlockHandle,
+        guard: Option<usize>,
+        work: impl FnOnce(Arc<SsTableReader>) -> Work,
+    ) -> Option<io::Result<Landed>> {
+        let queue = scope::current()?;
+        let key = UnitKey {
+            file_id: self.file_id,
+            offset: handle.offset,
+            guard,
+        };
+        let bytes = usize::try_from(handle.size).unwrap_or(usize::MAX);
+        Some(cache.io().miss(queue, key, bytes, || {
+            let reader = self.me.get().and_then(Weak::upgrade).ok_or_else(|| {
+                io::Error::other("this table cannot be read through an I/O queue")
+            })?;
+            Ok(work(reader))
+        }))
     }
 
     /// Read one metadata region, bounded by the start of the footer and
@@ -1388,11 +1626,16 @@ impl SsTableReader {
         kind: u8,
         name: &'static str,
     ) -> io::Result<Vec<u8>> {
-        let mut region =
-            { read_file_region(&*self.file, handle.offset, handle.size, self.data_end, name)? };
-        let payload_len = verify_meta_region(&region, kind, true, name)?.len();
-        region.truncate(payload_len);
-        Ok(region)
+        let region =
+            read_file_region(&*self.file, handle.offset, handle.size, self.data_end, name)?;
+        unframe_meta_region(
+            self.seal.as_ref(),
+            region,
+            handle.offset,
+            kind,
+            self.file_id,
+            name,
+        )
     }
 
     /// Read a leaf index sub-block, through the block cache.
@@ -1409,6 +1652,11 @@ impl SsTableReader {
     ) -> io::Result<Arc<IndexBlock>> {
         if let Some(leaf) = cache.get_index(self.file_id, handle.offset) {
             return Ok(leaf);
+        }
+        if let Some(landed) = self.queue_miss(cache, handle, None, |reader| {
+            Box::new(move |cache| reader.read_index_leaf(handle, cache).map(Landed::Index))
+        }) {
+            return landed?.into_index();
         }
 
         #[cfg(test)]
@@ -1948,11 +2196,41 @@ impl SsTableReader {
             check_data_block_limit(handle.size, block.decoded_buffer_capacity() as u64, limit)?;
             return Ok(block);
         }
+        self.fetch_block(handle, cache, limit)
+    }
 
-        if handle.size < 5 {
+    /// Read the data block at `handle`, which the block cache just missed:
+    /// from the device, or, in a `CacheOnly` scope, through the scope's
+    /// queue. `limit` is the per-block allocation guard, applied to a block
+    /// that landed for the queue as to one the cache held.
+    pub(crate) fn fetch_block(
+        &self,
+        handle: BlockHandle,
+        cache: &BlockCache,
+        limit: Option<usize>,
+    ) -> io::Result<Arc<Block>> {
+        if let Some(landed) = self.queue_miss(cache, handle, limit, |reader| {
+            Box::new(move |cache| {
+                reader
+                    .read_block_with_limit(handle, cache, limit)
+                    .map(Landed::Data)
+            })
+        }) {
+            let block = landed?.into_data()?;
+            check_data_block_limit(handle.size, block.decoded_buffer_capacity() as u64, limit)?;
+            return Ok(block);
+        }
+
+        if handle.size < self.min_block_frame() {
             return Err(invalid_data("block frame too short"));
         }
-        if limit.is_some() {
+        if limit.is_some() && self.seal.is_some() {
+            // A sealed frame's codec and decoded length are encrypted, so
+            // only the frame is bounded before it is read; the decoded
+            // length is checked once it is opened, before decompressing.
+            validate_file_region(handle.offset, handle.size, self.data_end, "data block")?;
+            check_data_block_limit(handle.size, 0, limit)?;
+        } else if limit.is_some() {
             validate_file_region(handle.offset, handle.size, self.data_end, "data block")?;
             // Only the codec and decoded-length prefix are needed before allocating the frame.
             let mut header = [0u8; 5];
@@ -1984,7 +2262,20 @@ impl SsTableReader {
     /// volume that latency, not bandwidth, is what the scan waits on. The
     /// sequential reader above pulls a span covering many blocks at once
     /// and decodes them out of it.
-    pub(crate) fn read_span(&self, offset: u64, len: u64) -> io::Result<Vec<u8>> {
+    ///
+    /// `first` is the block the span starts with. A `CacheOnly` scope reads
+    /// no span: `first` alone goes through its queue, and the span comes
+    /// back empty, so the caller takes the block from where it landed.
+    pub(crate) fn read_span(
+        &self,
+        first: BlockHandle,
+        len: u64,
+        cache: &BlockCache,
+    ) -> io::Result<Vec<u8>> {
+        if scope::current().is_some() {
+            return self.fetch_block(first, cache, None).map(|_| Vec::new());
+        }
+        let offset = first.offset;
         let len = len.min(self.data_end.saturating_sub(offset));
         read_file_region(&*self.file, offset, len, self.data_end, "data span")
     }
@@ -2010,61 +2301,47 @@ impl SsTableReader {
         cache: &BlockCache,
         limit: Option<usize>,
     ) -> io::Result<Arc<Block>> {
-        if block_data.len() < 5 {
-            return Err(invalid_data("block frame too short"));
-        }
-
-        // Frame: [compression_type: u8][payload][checksum: u32].
-        // The checksum is an accidental-corruption guard, not a MAC.
-        let compression_type = block_data[0];
-        let checksum_offset = block_data.len() - 4;
-        let stored_checksum = u32::from_le_bytes(block_data[checksum_offset..].try_into().unwrap());
-        let compressed_data = &block_data[1..checksum_offset];
-
-        let computed_checksum = checksum::sst_block(compression_type, compressed_data);
-        if stored_checksum != computed_checksum {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "block checksum mismatch",
-            ));
-        }
-
-        // Recheck the actual frame: the file may have changed since the header preflight.
-        if limit.is_some() {
-            check_data_block_header(block_data.len() as u64, block_data, limit)?;
-        }
-        let raw_data = match compression_type {
-            COMPRESSION_NONE => compressed_data.to_vec(),
-            COMPRESSION_LZ4 => lz4_flex::decompress_size_prepended(compressed_data)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?,
-            COMPRESSION_SNAPPY => {
-                if compressed_data.len() < 4 {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "snappy block too short",
-                    ));
-                }
-                let raw_len =
-                    u32::from_le_bytes(compressed_data[0..4].try_into().unwrap()) as usize;
-                let mut decoder = snap::raw::Decoder::new();
-                let mut out = vec![0u8; raw_len];
-                let n = decoder
-                    .decompress(&compressed_data[4..], &mut out)
-                    .map_err(|e| {
-                        io::Error::new(io::ErrorKind::InvalidData, format!("snappy decode: {e}"))
-                    })?;
-                if n != raw_len {
-                    return Err(invalid_data("snappy decoded length mismatch"));
-                }
-                out.truncate(n);
-                out
+        let raw_data = if let Some(seal) = &self.seal {
+            // Frame: [nonce][sealed payload || compression_type: u8][tag].
+            // The tag authenticates the block, its kind, its table and its
+            // offset; an uncompressed block is decrypted into its own buffer.
+            let (compression_type, payload) =
+                seal.open_data_block(handle.offset, block_data, self.file_id)?;
+            if limit.is_some() {
+                let decoded = sealed::decoded_len(compression_type, &payload)?;
+                check_data_block_limit(block_data.len() as u64, decoded, limit)?;
             }
-            _ => {
+            if compression_type == COMPRESSION_NONE {
+                payload
+            } else {
+                decompress_block(compression_type, &payload)?
+            }
+        } else {
+            if block_data.len() < 5 {
+                return Err(invalid_data("block frame too short"));
+            }
+
+            // Frame: [compression_type: u8][payload][checksum: u32].
+            // The checksum is an accidental-corruption guard, not a MAC.
+            let compression_type = block_data[0];
+            let checksum_offset = block_data.len() - 4;
+            let stored_checksum =
+                u32::from_le_bytes(block_data[checksum_offset..].try_into().unwrap());
+            let compressed_data = &block_data[1..checksum_offset];
+
+            let computed_checksum = checksum::sst_block(compression_type, compressed_data);
+            if stored_checksum != computed_checksum {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    format!("unknown compression type: {}", compression_type),
+                    "block checksum mismatch",
                 ));
             }
+
+            // Recheck the actual frame: the file may have changed since the header preflight.
+            if limit.is_some() {
+                check_data_block_header(block_data.len() as u64, block_data, limit)?;
+            }
+            decompress_block(compression_type, compressed_data)?
         };
 
         let block = Block::decode_data_block(raw_data)?;
@@ -2084,8 +2361,14 @@ impl SsTableReader {
 /// costs one small read per file rather than an index and bloom load per
 /// file. An `Err` means the file is not a readable SSTable at all, which
 /// the caller must not read as "holds nothing": a file whose footer will
-/// not parse cannot be proved empty.
-pub(crate) fn table_carries_data(env: &dyn Env, path: &Path) -> io::Result<bool> {
+/// not parse cannot be proved empty. Neither can a sealed table whose
+/// footer does not verify through `keyring`, or that there is no keyring
+/// for.
+pub(crate) fn table_carries_data(
+    env: &dyn Env,
+    path: &Path,
+    keyring: Option<&Keyring>,
+) -> io::Result<bool> {
     let file = env.open_read(path)?;
     let file_size = file.len()?;
     if file_size < 8 {
@@ -2103,6 +2386,7 @@ pub(crate) fn table_carries_data(env: &dyn Env, path: &Path) -> io::Result<bool>
     file.read_exact_at(data_end, &mut footer_buf)?;
     let footer = Footer::decode(&footer_buf)?;
     validate_footer_regions(&footer, data_end)?;
+    let seal = footer.open_seal(keyring, path)?;
     if footer.num_entries > 0 || footer.range_tombstone_size > 0 {
         return Ok(true);
     }
@@ -2111,22 +2395,27 @@ pub(crate) fn table_carries_data(env: &dyn Env, path: &Path) -> io::Result<bool>
     // holding real data claim to hold none, and the open guard that
     // trusts it then discards the table as a crash artifact. When the
     // claim is "empty", the index block has to agree.
-    let mut index_region = read_file_region(
+    let index_region = read_file_region(
         &*file,
         footer.index_offset,
         footer.index_size,
         data_end,
         "index block",
     )?;
-    let payload_len = verify_meta_region(
-        &index_region,
+    let file_id = path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .and_then(|stem| stem.parse().ok())
+        .unwrap_or(0);
+    let index = unframe_meta_region(
+        seal.as_ref(),
+        index_region,
+        footer.index_offset,
         checksum::META_KIND_INDEX,
-        true,
+        file_id,
         "index block",
-    )?
-    .len();
-    index_region.truncate(payload_len);
-    Ok(!IndexBlock::decode(index_region)?.is_empty())
+    )?;
+    Ok(!IndexBlock::decode(index)?.is_empty())
 }
 
 /// Format an SSTable filename from a numeric ID.
@@ -2463,8 +2752,9 @@ mod tests {
             index_size: 23,
             num_entries: 29,
             magic: MAGIC_V5,
+            sealed: None,
         };
-        let clean = f.encode();
+        let clean = f.encode(None).unwrap();
         for byte in 0..clean.len() {
             for bit in 0..8u8 {
                 let mut damaged = clean.clone();
@@ -2536,7 +2826,7 @@ mod tests {
             );
             let reader = SsTableReader::open(&path, 1).unwrap();
             assert_eq!(reader.partitioned, partitioned);
-            assert!(table_carries_data(&*crate::env::std_env(), &path).unwrap());
+            assert!(table_carries_data(&*crate::env::std_env(), &path, None).unwrap());
         }
     }
 
@@ -2636,8 +2926,9 @@ mod tests {
             index_size: 4,
             num_entries: 0,
             magic: MAGIC_V5,
+            sealed: None,
         };
-        fs::write(&path, footer.encode()).unwrap();
+        fs::write(&path, footer.encode(None).unwrap()).unwrap();
 
         let err = expect_reader_open_err(&path);
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
@@ -2671,7 +2962,9 @@ mod tests {
             filter_fallback: OnceLock::new(),
             range_tombstones: RangeTombstoneSet::default(),
             partitioned: false,
+            seal: None,
             global_seq: None,
+            me: OnceLock::new(),
             index_leaf_reads: AtomicUsize::new(0),
         };
         let cache = BlockCache::new(1024);
@@ -3288,12 +3581,22 @@ mod tests {
 
             let pinned_cache = BlockCache::new(1024 * 1024);
             let cached_cache = BlockCache::new(1024 * 1024);
-            let pinned =
-                SsTableReader::open_with(&crate::env::std_env(), &path, 1, MetadataPolicy::Pinned)
-                    .unwrap();
-            let cached =
-                SsTableReader::open_with(&crate::env::std_env(), &path, 1, MetadataPolicy::Cached)
-                    .unwrap();
+            let pinned = SsTableReader::open_with(
+                &crate::env::std_env(),
+                &path,
+                1,
+                MetadataPolicy::Pinned,
+                None,
+            )
+            .unwrap();
+            let cached = SsTableReader::open_with(
+                &crate::env::std_env(),
+                &path,
+                1,
+                MetadataPolicy::Cached,
+                None,
+            )
+            .unwrap();
 
             for probe in ["k_0000", "k_0123", "k_0299", "k_9999"] {
                 let a = probe_get(&pinned, probe.as_bytes(), u64::MAX, &pinned_cache).unwrap();
@@ -3313,12 +3616,22 @@ mod tests {
         let path = dir.path().join("charge.sst");
         write_flat_fixture(&path);
 
-        let pinned =
-            SsTableReader::open_with(&crate::env::std_env(), &path, 1, MetadataPolicy::Pinned)
-                .unwrap();
-        let cached =
-            SsTableReader::open_with(&crate::env::std_env(), &path, 2, MetadataPolicy::Cached)
-                .unwrap();
+        let pinned = SsTableReader::open_with(
+            &crate::env::std_env(),
+            &path,
+            1,
+            MetadataPolicy::Pinned,
+            None,
+        )
+        .unwrap();
+        let cached = SsTableReader::open_with(
+            &crate::env::std_env(),
+            &path,
+            2,
+            MetadataPolicy::Cached,
+            None,
+        )
+        .unwrap();
         assert!(
             pinned.pinned_metadata_bytes() > cached.pinned_metadata_bytes(),
             "the cached reader must hold less outside the budget"
@@ -3350,7 +3663,8 @@ mod tests {
         fs::write(&path, &bytes).unwrap();
 
         for policy in [MetadataPolicy::Pinned, MetadataPolicy::Cached] {
-            let err = match SsTableReader::open_with(&crate::env::std_env(), &path, 1, policy) {
+            let err = match SsTableReader::open_with(&crate::env::std_env(), &path, 1, policy, None)
+            {
                 Err(e) => e,
                 Ok(_) => panic!("a corrupt index must fail the open under either policy"),
             };
@@ -3368,9 +3682,14 @@ mod tests {
         // region of a 500-entry file are both larger than that, so both
         // inserts are refused.
         let cache = BlockCache::with_config(512, 0, true);
-        let reader =
-            SsTableReader::open_with(&crate::env::std_env(), &path, 1, MetadataPolicy::Cached)
-                .unwrap();
+        let reader = SsTableReader::open_with(
+            &crate::env::std_env(),
+            &path,
+            1,
+            MetadataPolicy::Cached,
+            None,
+        )
+        .unwrap();
         assert_eq!(reader.pinned_metadata_bytes(), 0);
 
         for i in 0..64 {
