@@ -229,3 +229,7 @@ harness = false
 [[bench]]
 name = "io_queue"
 harness = false
+
+[[bench]]
+name = "per_core"
+harness = false
