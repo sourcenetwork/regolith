@@ -63,7 +63,9 @@ Library modules:
 ```text
 src/
 ├── lib.rs              # Public API: Db, Snapshot, WriteBatch, column families, re-exports
-├── backup.rs           # BackupEngine and restore flow
+├── allocate.rs         # Conflict-free allocation of u64 ranges: Db::allocate
+├── backup.rs           # BackupEngine: backups, metadata sealed through the KeyProvider (D57), restore
+├── backup/             # format.rs: the .backup metadata, plain (version 3) and sealed (version 4)
 ├── checkpoint.rs       # Hardlinked checkpoint creation
 ├── column_family.rs    # Column-family handles and descriptors
 ├── conflict.rs         # Conflict reasons: Conflict, Access, WriteKind
@@ -73,6 +75,7 @@ src/
 ├── io_queue.rs         # Non-blocking reads: ReadMode, QueueId, IoBudget, IoProgress
 ├── io_queue/           # queue.rs (IoQueue: poll, idle_waker), wait.rs (IoWait, WouldBlock)
 ├── iter.rs             # Public iterator wrappers
+├── log_layout.rs       # LogLayout: the key layout of a commit-ordered log
 ├── options.rs          # Options, tuning enums, MergeOperator, CompactionFilter
 ├── options/            # Options builder methods (builder.rs) and getters (getters.rs)
 ├── perf_context.rs     # Per-operation performance counters
@@ -82,7 +85,6 @@ src/
 ├── sst_file_writer.rs  # External SSTable writer API
 ├── statistics.rs       # Tickers, histograms, and properties
 ├── stream_writer.rs    # StreamingWriter: bounded-memory write stream
-├── sync.rs             # Std-backed Mutex, RwLock, Condvar and Gate, swapped for loom's under --cfg loom
 ├── tailing.rs          # Tailing iterator API
 ├── testing.rs          # `testing` feature: property checks a caller runs against its own trait implementations
 ├── transaction.rs      # Optimistic and pessimistic transactions, isolation levels
@@ -91,8 +93,9 @@ src/
 ├── ttl.rs              # TTL database wrapper
 ├── sync/               # Public regolith::sync: async locks, semaphore, notify, event, latch, barrier, once cell
 │   ├── queue.rs        # Wait queue and drain role every primitive builds on
+│   ├── contend.rs      # The acquire every lock-like primitive shares: barging with bounded bypass (D49)
 │   ├── waiter.rs       # Waiter nodes, their free list, the wake list
-│   └── internal.rs     # The engine's private std/loom atomics and locks
+│   └── internal.rs     # The engine's private std/loom atomics, Mutex, RwLock, Condvar and Gate
 ├── txn_buffer.rs       # Concurrent write and read-set buffer of one transaction
 ├── env/                # Env trait and backends: StdEnv, MemEnv, WASI, OPFS; db_lock.rs, open_file_limit.rs
 └── engine/
@@ -105,7 +108,12 @@ src/
     ├── compaction.rs   # Level/FIFO/universal compaction planning and worker loop
     ├── compaction/     # Per-snapshot-stripe folding of versions and merge chains
     ├── manifest.rs     # VersionSet, VersionEdit log, level tracking
-    ├── manifest/       # Sealed manifests (format 2), manifest tests
+    ├── manifest/       # Sealed manifests (sealed.rs), the judge of a torn tail (tail.rs, E29), tests
+    ├── log_retirement.rs # Retiring flushed logs: min_wal_id in the table's batch, failed removals
+    │                   # reported and retried (E30)
+    ├── ingest.rs       # External-table ingest without a rewrite: per-file sequence (D48, E8)
+    ├── open_transactions.rs # The open transactions close aborts
+    ├── read_rule.rs    # How a commit judges one read against later commits
     ├── memtable.rs     # Arena-backed skip list memtable plus its range tombstones
     ├── skiplist/       # Insert-only concurrent skip list over the arena
     ├── sstable.rs      # SSTable reader/writer, footer, index block
@@ -113,6 +121,7 @@ src/
     ├── wal.rs          # Write-ahead log writer (format 2), CLOSE, format 1 reading rules
     ├── wal_frame.rs    # WAL format 2: stamp, group record frame, the scan past damage
     ├── wal_replay.rs   # Streaming reader over one WAL file: the O < P rule
+    ├── wal_v1.rs       # Format 1 of the WAL, as 0.1.x wrote it, for replay
     ├── wal_seal.rs     # Sealed WAL: the stamp sealed and durable at creation, sealed records
     ├── seal.rs         # AES-256-GCM-SIV frames and the keyring over a KeyProvider
     ├── recovery.rs     # Replaying the WALs at open, the dropped-tail report, the rewrite
@@ -125,8 +134,10 @@ src/
     ├── filter_block.rs # SSTable filter region: user-key and prefix bloom filters
     ├── index_block.rs  # Decoded SSTable index blocks
     ├── internal_key.rs # MVCC internal key encoding
-    ├── io/             # CacheOnly misses: unit table and single-flight units (unit.rs), per-queue
-    │                   # inbox and landings (shared.rs), the mode scope (scope.rs), stack.rs, atomic_waker.rs
+    ├── io/             # CacheOnly misses: unit table, the close gate (mod.rs), single-flight units
+    │                   # (unit.rs), per-queue inbox and landings (shared.rs), the mode scope (scope.rs),
+    │                   # stack.rs, atomic_waker.rs
+    ├── loom_model/     # Loom models of the engine's lock-free protocols (--cfg loom)
     ├── lookup_key.rs   # Inline-first internal key used by every read path
     ├── iterator.rs     # Engine iterator merge logic
     ├── range_tombstone.rs # Range-delete tombstone encoding
