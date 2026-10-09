@@ -18,10 +18,50 @@
 //!   current version; a reader holding an older view keeps reading it
 //!   through that descriptor. This view composes with that existing pin
 //!   chain by adding one level to it, and does not duplicate it.
-//! * Lock order: [`VersionStore`] mutex -> [`ReadViewCell::publish`]
-//!   mutex -> `ReadViewCell::current` write lock. Nothing acquires the
-//!   `VersionStore` mutex while holding either of the latter two.
-//!   Readers acquire only `current`, shared.
+//! * **Readers take no lock and write no shared word.** A load is one
+//!   pin of the calling thread's own reclamation slot and one acquire
+//!   load of the published pointer ([`ReadViewCell::load`]); it is
+//!   wait-free. A reader that must keep sources past the call clones the
+//!   parts it needs (an iterator takes the memtables and the version),
+//!   so nothing outlives a [`ViewGuard`] by borrowing through it.
+//! * **A replaced view is freed only when no reader holds it.** A
+//!   publication swaps the pointer and retires the old view to kovan,
+//!   which drops it once every thread that could have loaded it has
+//!   released its guard. A reader therefore never reads a freed view.
+//! * **Every publication is a compare-and-swap from the exact view it
+//!   was built from**, so the published views form one total order in
+//!   which each is a function of its predecessor and no publication is
+//!   lost. Publishers never exclude each other: one that loses the swap
+//!   rebuilds on whatever won. That is what replaced the publish mutex.
+//! * **A load never returns a view older than one already published
+//!   before the load began.** The swap is a release, the load an
+//!   acquire of the same word, so a publication that happened before a
+//!   load is what that load (or something newer) reads.
+//! * Lock order: the [`VersionStore`] mutex is the only lock left here,
+//!   and no reader takes it.
+//!
+//! # What the deferred drop costs, and where it is paid
+//!
+//! The view a publication replaced is not dropped at the swap; kovan
+//! drops it once no reader can still reach it. A retired view owns
+//! memtables and an `Arc<Version>`, and a `Version` owns the open
+//! descriptor of every SSTable in it, so a late drop holds memory, file
+//! descriptors and the disk blocks of tables a compaction already
+//! unlinked. [`quiesce`] bounds that: every publication that retires
+//! a view hands this thread's retired batch to the reclaimer at once,
+//! and regolith's own background thread calls it before it idles. A
+//! thread that read once and then parked holds back only the views
+//! retired before its last load, never the ones retired after it
+//! (`tests/adv_atom_reclaim.rs` checks both, at the descriptor level).
+//!
+//! # Progress
+//!
+//! The load is wait-free. A publication is lock-free: it retries only
+//! when another publication won, so some publisher always finishes.
+//! On `armv7` and both `wasm32` targets kovan's reservation slot is a
+//! 128-bit word that `portable-atomic` emulates with a spinlock, so
+//! there a load takes that lock and neither bound holds; the publish
+//! word itself is one pointer and is never emulated.
 //!
 //! # Why the version half is published by the store, not by callers
 //!
@@ -32,10 +72,14 @@
 //! background compaction all refresh the view without any of them
 //! having to remember to.
 
+use std::cell::Cell;
+use std::mem::ManuallyDrop;
 use std::ops::{Deref, DerefMut};
 use std::sync::{Arc, OnceLock};
 
-use crate::sync::internal::{Mutex, MutexGuard, RwLock};
+use kovan::{Atom, AtomGuard};
+
+use crate::sync::internal::{Mutex, MutexGuard};
 
 use super::manifest::{Version, VersionSet};
 use super::memtable::MemTable;
@@ -53,49 +97,159 @@ pub(crate) struct ReadView {
 
 /// Holds the currently published [`ReadView`].
 pub(crate) struct ReadViewCell {
-    current: RwLock<Arc<ReadView>>,
-    /// Serializes publishers so two of them cannot each build a next
-    /// view from the same current one and lose the other's change.
-    /// Readers never take this.
-    publish: Mutex<()>,
+    current: Atom<ReadView>,
+}
+
+/// One loaded view, pinned for as long as the guard lives.
+///
+/// Derefs to the [`ReadView`]. It holds the calling thread's reclamation
+/// guard, so it is neither `Send` nor `Sync`: it is dropped on the thread
+/// that loaded it, and it must not be held across a wait for another
+/// thread. A view held through a long operation delays the drop of every
+/// view retired after it was loaded, until it is released.
+pub(crate) struct ViewGuard<'a> {
+    /// Dropped by hand in `Drop`, before the owed flush runs: a flush made
+    /// while this thread still holds a reclamation guard frees nothing.
+    view: ManuallyDrop<AtomGuard<'a, ReadView>>,
+}
+
+impl Deref for ViewGuard<'_> {
+    type Target = ReadView;
+
+    #[inline]
+    fn deref(&self) -> &ReadView {
+        &self.view
+    }
+}
+
+impl Drop for ViewGuard<'_> {
+    #[inline]
+    #[allow(unsafe_code)]
+    fn drop(&mut self) {
+        // SAFETY: `view` is dropped exactly once, here, and never touched
+        // again: this is the guard's own destructor.
+        unsafe { ManuallyDrop::drop(&mut self.view) };
+        let owed = HELD.with(|held| {
+            let (live, owed) = held.get();
+            let live = live.saturating_sub(1);
+            held.set((live, owed && live != 0));
+            owed && live == 0
+        });
+        if owed {
+            // The batch was submitted at the publication; with no guard
+            // left, this drains this thread's own reservation of it.
+            kovan::flush();
+        }
+    }
+}
+
+std::thread_local! {
+    /// The `ViewGuard`s live on this thread, and whether a publication
+    /// made while one was live still owes [`quiesce`] its flush.
+    ///
+    /// kovan cannot free anything a live guard on the flushing thread may
+    /// reach, so a flush made under a guard only submits: the retired view
+    /// waits on this thread's own reservation until its next pin. A thread
+    /// that published inside a read (a rotation in the middle of a commit
+    /// group) and then went idle would hold that view, and every table
+    /// descriptor in it, for as long as it idled. Counting the guards lets
+    /// the flush run the moment the last one is released instead.
+    static HELD: Cell<(u32, bool)> = const { Cell::new((0, false)) };
 }
 
 impl ReadViewCell {
     /// Publish an initial view. Called once per engine open.
     pub(crate) fn new(view: ReadView) -> Self {
+        // A node is stamped with the epoch this thread last saw at a pin,
+        // and a thread that never pinned has seen none: a view allocated
+        // there would be stamped older than every reservation in the
+        // process, so once retired any thread idling since its last read
+        // would hold it, with every table descriptor it names. Pinning
+        // first stamps it with the epoch it is actually born in.
+        let _fresh_epoch = kovan::pin();
         Self {
-            current: RwLock::new(Arc::new(view)),
-            publish: Mutex::new(()),
+            current: Atom::new(view),
         }
     }
 
-    /// Load the currently published view. This is the read path: one
-    /// shared lock acquisition and one `Arc` clone, with the guard
-    /// dropped before the caller does any work.
+    /// Load the currently published view. This is the read path: a pin
+    /// of this thread's own reclamation slot and one acquire load, with
+    /// no lock and no write to any word another thread reads.
+    ///
+    /// The result is never older than a view whose publication happened
+    /// before this call.
     #[inline]
-    pub(crate) fn load(&self) -> Arc<ReadView> {
-        Arc::clone(&self.current.read())
+    pub(crate) fn load(&self) -> ViewGuard<'_> {
+        HELD.with(|held| {
+            let (live, owed) = held.get();
+            held.set((live + 1, owed));
+        });
+        ViewGuard {
+            view: ManuallyDrop::new(self.current.load()),
+        }
+    }
+
+    /// Publish `build(current)` by compare-and-swap from the exact view
+    /// it was built from, rebuilding on whatever won when another
+    /// publication got in first. Returns the value the winning build
+    /// produced.
+    ///
+    /// `build` runs once per attempt and every attempt but the last is
+    /// thrown away, so it must be a pure function of the view it is
+    /// given: allocate the fresh memtable or create the next log before
+    /// the call, never inside it. A losing attempt drops the view it
+    /// built, which returns every reference count it took.
+    fn publish<R>(&self, build: impl Fn(&ReadView) -> (ReadView, R)) -> R {
+        // A view is stamped with the reclamation epoch this thread last
+        // pinned at, and a thread idling since its last read keeps back
+        // every retired batch holding anything stamped at or before the
+        // epoch of that read, whether or not it ever saw it. Submitting
+        // this thread's pending retirements first, padded so they are
+        // placed rather than kept, does two things: it advances the epoch,
+        // so the view this call publishes is stamped after every such read,
+        // and it keeps older nodes out of the batch the view this call
+        // replaces goes into, so that batch waits only on threads that
+        // read after its oldest view was born. With a view guard live on
+        // this thread the stamp stays that guard's epoch; that is only
+        // later, never unsafe.
+        if !holds_view() {
+            super::reclaim::submit();
+        }
+        loop {
+            let current = self.current.load();
+            let (next, out) = build(&current);
+            if self.current.compare_and_swap(&current, next).is_ok() {
+                return out;
+            }
+        }
     }
 
     /// Atomically replace the memtable half of the view. `mutate`
     /// receives the current `(active, frozen)` and returns the next
-    /// pair plus a value for the caller. Runs under the publish mutex,
-    /// so a rotation and a flush retirement serialize instead of
-    /// racing, and both halves change in one publication rather than
-    /// two observable steps.
+    /// pair plus a value for the caller, and both halves change in one
+    /// publication rather than two observable steps.
+    ///
+    /// A compare-and-swap publication: a rotation and a flush retirement
+    /// rebuild on whatever the other published instead of serializing
+    /// behind it, so `mutate` may run more than once and must be pure
+    /// (see [`Self::publish`]). The returned value is the one from the
+    /// attempt that was published.
     pub(crate) fn update_memtables<R>(
         &self,
-        mutate: impl FnOnce(&Arc<MemTable>, &[Arc<MemTable>]) -> (Arc<MemTable>, Vec<Arc<MemTable>>, R),
+        mutate: impl Fn(&Arc<MemTable>, &[Arc<MemTable>]) -> (Arc<MemTable>, Vec<Arc<MemTable>>, R),
     ) -> R {
-        let _publishing = self.publish.lock();
-        let current = self.load();
-        let (active, frozen, out) = mutate(&current.active, &current.frozen);
-        let next = Arc::new(ReadView {
-            active,
-            frozen,
-            version: Arc::clone(&current.version),
+        let out = self.publish(|current| {
+            let (active, frozen, out) = mutate(&current.active, &current.frozen);
+            let next = ReadView {
+                active,
+                frozen,
+                version: Arc::clone(&current.version),
+            };
+            (next, out)
         });
-        *self.current.write() = next;
+        // The view this replaced may hold the only reference to a
+        // flushed memtable, a whole write buffer's worth of memory.
+        quiesce();
         out
     }
 
@@ -129,15 +283,45 @@ impl ReadViewCell {
     /// Replace the version half of the view. Called by
     /// [`VersionGuard::drop`] and by nothing else.
     fn publish_version(&self, version: Arc<Version>) {
-        let _publishing = self.publish.lock();
-        let current = self.load();
-        let next = Arc::new(ReadView {
-            active: Arc::clone(&current.active),
-            frozen: current.frozen.clone(),
-            version,
+        self.publish(|current| {
+            let next = ReadView {
+                active: Arc::clone(&current.active),
+                frozen: current.frozen.clone(),
+                version: Arc::clone(&version),
+            };
+            (next, ())
         });
-        *self.current.write() = next;
+        // The view this replaced owns the previous `Arc<Version>`, and
+        // with it the open descriptor of every table the edit just
+        // dropped. Handing the retired view to the reclaimer here frees
+        // those at the point a refcounted view would have: inside the
+        // version-set critical section, which has just written a
+        // manifest record anyway.
+        quiesce();
     }
+}
+
+/// Hand the views this thread retired to the reclaimer, padded so kovan
+/// places them at once (see `engine::reclaim`).
+///
+/// Every publication that retires a view calls this. With a view guard
+/// still live on this thread the batch is also placed on this thread's
+/// own reservation, which a thread that publishes and then idles would
+/// never release; the release is therefore owed, and paid by a flush the
+/// moment the last guard is dropped. Wait-free either way.
+/// Whether a [`ViewGuard`] is live on this thread.
+fn holds_view() -> bool {
+    HELD.with(|held| held.get().0 != 0)
+}
+
+pub(crate) fn quiesce() {
+    super::reclaim::submit();
+    HELD.with(|held| {
+        let (live, _) = held.get();
+        if live != 0 {
+            held.set((live, true));
+        }
+    });
 }
 
 /// The [`VersionSet`] plus the read view its edits publish into.
@@ -218,6 +402,18 @@ impl Drop for VersionGuard<'_> {
         // the same order the edits did.
         view.publish_version(current);
     }
+}
+
+/// Release what this thread's reservation is holding back before the
+/// thread waits for work.
+///
+/// kovan keeps a thread's reservation published after its last guard
+/// drops, so a thread that loaded a view and went idle keeps alive every
+/// view retired before that load, and with it memtables and table
+/// descriptors. regolith's compaction thread calls this before each wait;
+/// a thread regolith does not own releases at its next read.
+pub(crate) fn idle() {
+    kovan::flush();
 }
 
 #[cfg(test)]
@@ -369,15 +565,12 @@ mod tests {
         let (_dir, _store, cell) = store_with_view();
         let before = cell.load();
         before.active.put(b"k", b"v", 1);
+        let fresh = Arc::new(MemTable::new(&test_memtable_config()).unwrap());
 
         cell.update_memtables(|active, frozen| {
             let mut next = frozen.to_vec();
             next.push(Arc::clone(active));
-            (
-                Arc::new(MemTable::new(&test_memtable_config()).unwrap()),
-                next,
-                (),
-            )
+            (Arc::clone(&fresh), next, ())
         });
 
         let after = cell.load();
@@ -424,8 +617,12 @@ mod tests {
         }
 
         assert!(
-            Arc::ptr_eq(&before, &cell.load()),
+            std::ptr::eq::<ReadView>(&*before, &*cell.load()),
             "a read-only critical section must not churn the published view",
         );
     }
 }
+
+#[cfg(test)]
+#[path = "read_view_tests.rs"]
+mod concurrency_tests;

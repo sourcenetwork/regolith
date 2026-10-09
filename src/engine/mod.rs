@@ -32,6 +32,7 @@ pub(crate) mod range_tombstone;
 pub(crate) mod read_horizon;
 mod read_rule;
 pub(crate) mod read_view;
+mod reclaim;
 mod recovery;
 pub(crate) mod skiplist;
 pub(crate) mod snapshot_registry;
@@ -68,7 +69,7 @@ const STOP_TOO_MANY_MEMTABLES: &str = "stop: too many memtables";
 use pending_outputs::PendingOutputs;
 use read_horizon::ReadHorizon;
 pub(crate) use read_rule::ReadRule;
-use read_view::{ReadView, ReadViewCell, VersionStore};
+use read_view::{ReadView, ReadViewCell, VersionStore, ViewGuard};
 use recovery::{replay_logs, report_discarded_tail, rewrite_recovered_memtable_to_wal};
 use skiplist::InsertHint;
 use snapshot_registry::SnapshotRegistry;
@@ -2408,10 +2409,14 @@ impl RegolithEngine {
     /// group applies into: the same one when nothing rotated, a fresh load
     /// otherwise. The active memtable changes only under the pipeline mutex,
     /// so between the two nothing else can have replaced it.
-    fn rotate_if_full(&self, view: Arc<ReadView>) -> std::io::Result<Arc<ReadView>> {
+    fn rotate_if_full<'v>(&'v self, view: ViewGuard<'v>) -> std::io::Result<ViewGuard<'v>> {
         if view.active.approximate_size() < self.options.write_buffer_size {
             return Ok(view);
         }
+        // Released before the rotation publishes, so the views it retires
+        // are handed to the reclaimer at once rather than when this group
+        // is done (see `read_view::quiesce`).
+        drop(view);
         self.rotate_memtable()?;
         Ok(self.view.load())
     }
@@ -2450,7 +2455,7 @@ impl RegolithEngine {
             let sealed = Arc::clone(active);
             let mut next_frozen = frozen.to_vec();
             next_frozen.push(Arc::clone(&sealed));
-            (fresh, next_frozen, sealed)
+            (Arc::clone(&fresh), next_frozen, sealed)
         });
         sealed.seal_seq(self.latest_seq.load(Ordering::Acquire));
 
@@ -3074,7 +3079,8 @@ impl RegolithEngine {
         // readers: a concurrent reader may still briefly observe
         // pre-drop SSTable data, exactly as before this view existed.
         let fresh = Arc::new(MemTable::new(&self.memtable_config)?);
-        self.view.update_memtables(|_, _| (fresh, Vec::new(), ()));
+        self.view
+            .update_memtables(|_, _| (Arc::clone(&fresh), Vec::new(), ()));
 
         let (old_version, wal_id, wal_path, new_wal) = {
             let mut versions = self.versions.lock();
@@ -3311,7 +3317,7 @@ impl RegolithEngine {
                     let sealed = Arc::clone(active);
                     let mut next_frozen = frozen.to_vec();
                     next_frozen.push(Arc::clone(&sealed));
-                    (fresh, next_frozen, sealed)
+                    (Arc::clone(&fresh), next_frozen, sealed)
                 });
                 sealed.seal_seq(self.latest_seq.load(Ordering::Acquire));
 
