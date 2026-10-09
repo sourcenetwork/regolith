@@ -54,10 +54,11 @@ pub(crate) struct Flusher {
     /// it, and the second retirement would drop a memtable whose contents are
     /// in no published version.
     ///
-    /// An ingest does not take it. It drains every frozen memtable under the
-    /// pipeline mutex and keeps that mutex until its file is installed, so
-    /// no memtable can be sealed, let alone flushed, before the file takes
-    /// its place in L0 install order.
+    /// An ingest takes it only through `flush_until_retired`, for the
+    /// memtables holding a key of its file's range, and holds the pipeline
+    /// mutex until the file is installed. A memtable holding none of its keys
+    /// may be flushed after it and land in front of it in L0, which changes no
+    /// read: the two share no key (LsmOrder.tla, Lean `ingest_ordered`).
     pub(crate) flushing: Mutex<()>,
 }
 
@@ -273,6 +274,7 @@ impl Flusher {
                 largest_key: summary.largest_user_key,
                 file_size,
                 num_entries,
+                global_seq: None,
             },
             reader,
         );

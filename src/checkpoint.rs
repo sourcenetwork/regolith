@@ -147,9 +147,15 @@ impl<'db> Checkpoint<'db> {
 }
 
 /// Copy exactly `len` bytes from `src` to `dst`, creating `dst`
-/// anew. Used to stage a point-in-time manifest snapshot without
-/// picking up `AddFile` records appended by concurrent flushes.
-fn copy_truncated(env: &dyn Env, src: &Path, dst: &Path, len: u64) -> std::io::Result<()> {
+/// anew, and sync it. Used to stage a point-in-time manifest snapshot
+/// without picking up `AddFile` records appended by concurrent flushes,
+/// and to copy an ingested table into the database.
+pub(crate) fn copy_truncated(
+    env: &dyn Env,
+    src: &Path,
+    dst: &Path,
+    len: u64,
+) -> std::io::Result<()> {
     let reader = env.open_read(src)?;
     let mut writer = env.open_write(dst, WriteMode::Truncate)?;
     // A fixed 16 KiB window, so copying a multi-gigabyte SSTable

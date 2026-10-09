@@ -121,6 +121,42 @@ impl SsTableReader {
         Ok(None)
     }
 
+    /// [`MemTable::holds_key_in`](crate::engine::memtable::MemTable::holds_key_in)
+    /// for one table: whether it holds an entry whose user key lies in
+    /// `[first, last]`, or a range tombstone reaching into it, at any
+    /// sequence. Reads the one or two data blocks the first such key could
+    /// be in.
+    pub(crate) fn holds_key_in(
+        &self,
+        first: &[u8],
+        last: &[u8],
+        key_buf: &mut Vec<u8>,
+        cache: &BlockCache,
+    ) -> io::Result<bool> {
+        if self
+            .range_tombstones
+            .iter()
+            .any(|rt| rt.start.as_slice() <= last && first < rt.end.as_slice())
+        {
+            return Ok(true);
+        }
+        let start = LookupKey::from_prefixed(first, u64::MAX);
+        let search_key = start.internal();
+        let mut cursor = self.seek_block_cursor(search_key, cache)?;
+        while let Some(at) = cursor {
+            let block = self.load_block_at_cursor(&at, cache)?;
+            let found = block.scan_from(search_key, key_buf, |ik, _, _| {
+                ControlFlow::Break(decode_internal_key(ik).0 <= last)
+            });
+            match found {
+                Some(holds) => return Ok(holds),
+                // Only a block emptied by the seek moves on to the next.
+                None => cursor = self.next_block_cursor(&at, cache)?,
+            }
+        }
+        Ok(false)
+    }
+
     /// [`MemTable::visit_above`](crate::engine::memtable::MemTable::visit_above)
     /// for one table: `lk`'s entries newest first among those at or below the
     /// lookup's snapshot and above `floor`, carrying on into the following
@@ -162,7 +198,7 @@ impl SsTableReader {
         mut visit: impl VisitBlockEntry<R>,
     ) -> io::Result<Option<R>> {
         let user_key = lk.prefixed_user_key();
-        if !self.filter(cache)?.may_contain(user_key) {
+        if self.hidden_at(lk.snapshot_seq()) || !self.filter(cache)?.may_contain(user_key) {
             return Ok(None);
         }
 

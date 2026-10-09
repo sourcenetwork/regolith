@@ -192,13 +192,7 @@ impl LevelIter {
     fn key(&self) -> Option<&[u8]> {
         match self {
             Self::Memtable(it) => it.curr.as_ref().map(|(k, _)| k.as_slice()),
-            Self::SsTable(it) => {
-                if it.valid {
-                    Some(&it.cached_key[..])
-                } else {
-                    None
-                }
-            }
+            Self::SsTable(it) => it.valid.then(|| it.current_key()),
             Self::LevelConcat(it) => it.key(),
         }
     }
@@ -282,6 +276,13 @@ struct SsTableLevelIter {
     /// Byte offset just past the current entry (start of the next).
     next_entry_pos: usize,
     cached_key: Vec<u8>,
+    /// The current key as a reader sees it, for a block of an ingested
+    /// table, whose entries read with the block's stamp; `cached_key` stays
+    /// the stored key the next entry is reconstructed from.
+    stamped_key: Vec<u8>,
+    /// Whether the loaded block is stamped. Held here so the merge's every
+    /// key comparison reads one flag rather than the block.
+    stamped: bool,
     cached_value_offset: usize,
     cached_value_len: usize,
     valid: bool,
@@ -349,6 +350,8 @@ impl SsTableLevelIter {
             entry_pos: 0,
             next_entry_pos: 0,
             cached_key: Vec::new(),
+            stamped_key: Vec::new(),
+            stamped: false,
             cached_value_offset: 0,
             cached_value_len: 0,
             valid: false,
@@ -437,6 +440,25 @@ impl SsTableLevelIter {
         self.sequential = false;
     }
 
+    /// The current key as a reader sees it.
+    fn current_key(&self) -> &[u8] {
+        if self.stamped {
+            &self.stamped_key
+        } else {
+            &self.cached_key
+        }
+    }
+
+    /// Bring `stamped_key` up to the entry `cached_key` holds, for a stamped
+    /// block.
+    fn restamp(&mut self) {
+        if self.stamped
+            && let Some(block) = &self.block
+        {
+            block.read_key(&self.cached_key, &mut self.stamped_key);
+        }
+    }
+
     /// The current value, borrowed from the decoded block holding it.
     fn value(&self) -> Option<&[u8]> {
         if !self.valid {
@@ -460,7 +482,9 @@ impl SsTableLevelIter {
 
     fn load_block(&mut self, cursor: SsTableBlockCursor) -> io::Result<()> {
         let handle = self.reader.cursor_handle(&cursor, &self.cache)?;
-        self.block = Some(self.block_for(handle)?);
+        let block = self.block_for(handle)?;
+        self.stamped = block.stamp().is_some();
+        self.block = Some(block);
         self.block_cursor = Some(cursor);
         self.entry_pos = 0;
         self.next_entry_pos = 0;
@@ -486,6 +510,7 @@ impl SsTableLevelIter {
             .as_ref()
             .and_then(|offsets| offsets.binary_search(&self.entry_pos).ok());
         self.valid = true;
+        self.restamp();
     }
 
     fn seek_to_first(&mut self) -> io::Result<()> {
@@ -509,7 +534,8 @@ impl SsTableLevelIter {
             }
         };
         self.load_block(cursor)?;
-        let data = self.block.as_ref().unwrap().entry_data();
+        let block = self.block.as_ref().unwrap();
+        let data = block.entry_data();
         self.entry_pos = 0;
         self.cached_key.clear();
         while self.entry_pos < data.len() {
@@ -518,8 +544,9 @@ impl SsTableLevelIter {
             self.next_entry_pos = self.entry_pos + consumed;
             self.cached_value_offset = val_off;
             self.cached_value_len = val_len;
-            if compare_internal_keys(&self.cached_key, target).is_ge() {
+            if block.compare_entry(&self.cached_key, target).is_ge() {
                 self.valid = true;
+                self.restamp();
                 return Ok(());
             }
             self.entry_pos = self.next_entry_pos;
@@ -553,12 +580,13 @@ impl SsTableLevelIter {
         self.load_block(cursor)?;
         self.build_entry_offsets();
         let offsets = self.entry_offsets.as_ref().unwrap();
-        let data = self.block.as_ref().unwrap().entry_data();
+        let block = self.block.as_ref().unwrap();
+        let data = block.entry_data();
         let mut best: Option<usize> = None;
         let mut temp_key = Vec::new();
         for (i, &off) in offsets.iter().enumerate() {
             let (_consumed, _vo, _vl) = decode_entry_at(data, off, &mut temp_key);
-            if compare_internal_keys(&temp_key, target).is_le() {
+            if block.compare_entry(&temp_key, target).is_le() {
                 best = Some(i);
             } else {
                 break;
@@ -751,6 +779,7 @@ impl SsTableLevelIter {
             }
             pos += consumed;
         }
+        self.restamp();
     }
 }
 
@@ -943,13 +972,9 @@ impl LevelConcatIter {
     }
 
     fn key(&self) -> Option<&[u8]> {
-        self.current.as_ref().and_then(|it| {
-            if it.valid {
-                Some(it.cached_key.as_slice())
-            } else {
-                None
-            }
-        })
+        self.current
+            .as_ref()
+            .and_then(|it| it.valid.then(|| it.current_key()))
     }
 
     fn value(&self) -> Option<&[u8]> {

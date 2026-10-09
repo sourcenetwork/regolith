@@ -1,16 +1,17 @@
-//! Deterministic proof that an ingest orders itself like a flush, and
-//! that a write issued while it writes its table lands above it.
+//! Deterministic proof that an ingest orders itself like a flush.
 //!
-//! `Db::ingest_external_files` drains every memtable sealed before it
-//! allocates its sequence number, and holds the commit pipeline from that
-//! allocation through its manifest apply, so a flush of a memtable sealed
-//! before the ingest always installs before the ingested file, and a
-//! write issued while the ingest writes its table commits, rotates and
-//! flushes only after the file is installed. Each test forces one
-//! interleaving, named in its doc, with a seam that pauses or fails a
-//! real background write mid-flight, then checks the read that
-//! interleaving gets wrong and the reopened sequence counter that the
-//! manifest's raised-maximum rule protects on its own.
+//! `Db::ingest_external_files` copies its file with no lock held, then,
+//! under the commit pipeline, flushes every memtable up to the newest one
+//! holding a key of the file's range, allocates its sequence number and
+//! installs the file before it releases the pipeline. So a flush of a
+//! memtable holding one of its keys always installs before the ingested
+//! file, a write issued while the ingest copies its file commits at once,
+//! below the ingest's sequence, and a write issued while the ingest holds
+//! the pipeline commits, rotates and flushes only after the file is
+//! installed. Each test forces one interleaving, named in its doc, with a
+//! seam that pauses or fails a real background write mid-flight, then
+//! checks the read that interleaving gets wrong and the reopened sequence
+//! counter that the manifest's raised-maximum rule protects on its own.
 #![cfg(not(target_arch = "wasm32"))]
 
 use std::io;
@@ -369,15 +370,17 @@ fn an_ingest_waits_for_a_flush_of_a_memtable_sealed_before_it() {
     assert_eq!(db.get(b"k").unwrap(), Some(b"new".to_vec()));
 }
 
-/// Interleaving (b): an ingest allocates its sequence and is slow
-/// writing its table while a writer commits a newer version of the key
-/// it carries and a flush of that write races the install. The write
-/// cannot commit before the table is installed, so it, and the flush
-/// of it, land above the ingested file.
+/// Interleaving (b): an ingest holds the pipeline and is slow flushing
+/// the memtable that holds a key it carries, while a writer commits a
+/// newer version of that key and a flush of that write races the install.
+/// The write cannot commit before the table is installed, so it, and the
+/// flush of it, land above the ingested file.
 #[test]
 fn a_write_issued_during_an_ingest_lands_above_the_ingested_file() {
     let dir = TempDir::new().unwrap();
     let staging = TempDir::new().unwrap();
+    // The first SST open is the ingest's copy of its file; the second is
+    // its flush of the memtable holding `k`, under the pipeline.
     let env = NthSstOpen::new(dir.path(), 2, 0);
     let opts = Options::default().env(env.clone());
     let db = Arc::new(Db::open(dir.path(), opts.clone()).unwrap());
@@ -440,12 +443,12 @@ fn a_write_issued_during_an_ingest_lands_above_the_ingested_file() {
 /// read.
 ///
 /// Deterministic: it runs on one thread. `Db::open` opens no SST, so
-/// the first SST open is M1's flush, which fails. The ingest's drain
-/// retries that flush (the second open) before it allocates: M1 lands
-/// at L0, the ingest overlaps it and lands above it, and the read
-/// returns "new". Without the drain the ingest lands at the deepest
-/// level while M1 stays frozen, and the read returns "old" from the
-/// frozen list.
+/// the first SST open is M1's flush, which fails. The ingest copies its
+/// file (the second open), then retries that flush (the third) before it
+/// allocates: M1 lands at L0, the ingest overlaps it and lands above it,
+/// and the read returns "new". Without the flush the ingest lands at the
+/// deepest level while M1 stays frozen, and the read returns "old" from
+/// the frozen list.
 #[test]
 fn an_ingest_drains_a_memtable_left_frozen_by_a_failed_flush() {
     let dir = TempDir::new().unwrap();
@@ -486,25 +489,24 @@ fn an_ingest_drains_a_memtable_left_frozen_by_a_failed_flush() {
     assert_eq!(db.get(b"k").unwrap(), Some(b"new".to_vec()));
 }
 
-/// A write that fills the memtable while an ingest writes its table
-/// commits once the table is installed, and the memtable its rotation seals
-/// is flushed by the background as any sealed memtable is, so the write
-/// lands above the file and nothing is left frozen.
+/// A write that fills the memtable while an ingest copies its file is not
+/// held back by the copy: it commits and rotates while the copy is paused.
+/// The ingest draws its sequence afterwards, so its version of the key is
+/// the newer one, and the memtable holding the write, sealed by the
+/// rotation and written out off the commit path, is flushed before the
+/// ingested file installs, so nothing is left frozen.
 #[test]
-fn a_write_that_fills_the_memtable_during_an_ingest_lands_above_the_ingested_file() {
+fn a_write_that_fills_the_memtable_during_an_ingest_copy_commits_below_it() {
     let dir = TempDir::new().unwrap();
     let staging = TempDir::new().unwrap();
     // The first SST open is the flush of `old` below; the second is the
-    // ingest's table.
+    // ingest's copy of its file.
     let env = NthSstOpen::new(dir.path(), 2, 0);
     let opts = Options::default()
         .env(env.clone())
         .write_buffer_size(4 * 1024);
     let db = Arc::new(Db::open(dir.path(), opts.clone()).unwrap());
 
-    // An L0 file holding `k`: the ingested file overlaps it, so it lands
-    // at L0 as well, where install order decides which version a read
-    // sees.
     db.put(b"k", b"old").unwrap();
     db.flush().unwrap();
 
@@ -526,16 +528,21 @@ fn a_write_that_fills_the_memtable_during_an_ingest_lands_above_the_ingested_fil
             write_past_one_rotation(&db, "f")
         })
     };
+    let committed_during_copy = wait_finished(&writer, Duration::from_secs(60));
     env.release();
     ingest.join().unwrap().unwrap();
     writer.join().unwrap().unwrap();
+    assert!(
+        committed_during_copy,
+        "a write waited for an ingest to copy its file"
+    );
 
     assert_eq!(
         frozen_bytes_once_flushed(&db),
         0,
         "a rotation during an ingest left its memtable unflushed"
     );
-    assert_eq!(db.get(b"k").unwrap(), Some(b"v2".to_vec()));
+    assert_eq!(db.get(b"k").unwrap(), Some(b"new".to_vec()));
 
     let before = db.latest_sequence();
     drop(db);
@@ -548,17 +555,18 @@ fn a_write_that_fills_the_memtable_during_an_ingest_lands_above_the_ingested_fil
         seq > before,
         "reopened sequence {seq} did not exceed {before}"
     );
-    assert_eq!(db.get(b"k").unwrap(), Some(b"v2".to_vec()));
+    assert_eq!(db.get(b"k").unwrap(), Some(b"new".to_vec()));
+    assert_eq!(db.get(b"f0").unwrap(), Some(vec![0u8; 1024]));
 }
 
-/// An ingest that fails after it allocated its sequence lets the writes
-/// issued while it ran commit: they land, the memtable a rotation among them
-/// seals is flushed as usual, and nothing is stranded in memory.
+/// An ingest that fails copying its file holds nothing the writes
+/// issued while it ran wait for: they land, the memtable a rotation among
+/// them seals is flushed as usual, and nothing is stranded in memory.
 #[test]
 fn writes_issued_during_an_ingest_that_fails_commit_once_it_gives_up() {
     let dir = TempDir::new().unwrap();
     let staging = TempDir::new().unwrap();
-    // The ingest's table is the first SST open: it pauses, then fails.
+    // The ingest's copy is the first SST open: it pauses, then fails.
     let env = NthSstOpen::new(dir.path(), 1, 1);
     let opts = Options::default()
         .env(env.clone())

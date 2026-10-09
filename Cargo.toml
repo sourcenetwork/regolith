@@ -221,3 +221,11 @@ harness = false
 [[bench]]
 name = "group_commit"
 harness = false
+
+[[bench]]
+name = "ingest"
+harness = false
+
+[[bench]]
+name = "cf_drop"
+harness = false
