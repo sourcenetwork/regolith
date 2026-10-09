@@ -108,6 +108,7 @@ mod tests {
             puts,
             Vec::new(),
             Vec::new(),
+            Vec::new(),
             DurabilityMode::Eventual,
         )
     }

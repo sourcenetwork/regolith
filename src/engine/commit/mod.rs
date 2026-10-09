@@ -47,13 +47,17 @@ use crate::perf_context::{PerfTimer, PerfTimerField};
 use crate::statistics::{Histogram, Ticker};
 use crate::{Access, Conflict, WriteBatchOp};
 
+mod append;
 mod content;
+mod counter;
 mod replaced;
 mod request;
 mod slot;
 mod stall;
 mod terminator;
 
+use append::AppendOrder;
+pub(crate) use append::PendingAppend;
 use replaced::Replaced;
 pub(crate) use request::WriteRequest;
 pub(crate) use slot::WriteSlot;
@@ -295,11 +299,15 @@ impl RegolithEngine {
         point_ops: std::collections::BTreeMap<Vec<u8>, Option<Vec<u8>>>,
         range_deletes: Vec<(Vec<u8>, Vec<u8>)>,
         merges: Vec<(Vec<u8>, Vec<u8>)>,
+        appends: Vec<PendingAppend>,
         durability: DurabilityMode,
     ) -> io::Result<CommitOutcome> {
         self.ensure_writable()?;
         let ops = grouped_batch_ops(point_ops, range_deletes, merges);
         self.validate_ops_sizes(&ops, false)?;
+        if !appends.is_empty() {
+            self.validate_append_sizes(&ops, &appends)?;
+        }
 
         // The write-stall admission a plain write pays with
         // `WriteOptions::default()`, in the same order: closed/WAL-failed/
@@ -310,13 +318,13 @@ impl RegolithEngine {
         // held. A commit that writes nothing (`ops` empty, e.g. a
         // `get_for_update` with no write) takes no capacity and skips the
         // wait, though its conflict check below still runs under the
-        // mutex like any other commit.
-        if !ops.is_empty() {
+        // mutex like any other commit. An append is a write.
+        if !ops.is_empty() || !appends.is_empty() {
             self.wait_for_write_capacity(false)
                 .map_err(crate::Error::into_io_error)?;
         }
 
-        self.commit_locked(checks, ops, durability)
+        self.commit_locked(checks, ops, appends, durability)
     }
 
     /// The conflict check and the apply, under one uninterrupted hold of
@@ -328,7 +336,8 @@ impl RegolithEngine {
     fn commit_locked(
         &self,
         checks: &crate::engine::ValidationSet,
-        ops: Vec<WriteBatchOp>,
+        mut ops: Vec<WriteBatchOp>,
+        appends: Vec<PendingAppend>,
         durability: DurabilityMode,
     ) -> io::Result<CommitOutcome> {
         let mut pipe = self.pipeline.lock();
@@ -491,6 +500,25 @@ impl RegolithEngine {
                     )));
                 }
             }
+        }
+
+        // The commit validated, so its appends take their positions now, and
+        // only now: in the ordered step, after validation and before the
+        // record is staged. The group is this commit alone, so the order
+        // starts from the view and nothing outlives the group.
+        if !appends.is_empty() {
+            // The layout is the caller's code, so a panic in it is caught
+            // and latches the database read-only, as one anywhere in the
+            // ordered step does.
+            let _commit = InCommit::enter();
+            let mut order = AppendOrder::default();
+            if let Err(err) = order.number(self, &view, appends, &mut ops) {
+                if let Some(callback) = crate::Error::callback_panic_of(&err) {
+                    self.latch_callback_panic(callback);
+                }
+                return Err(err);
+            }
+            order.finish(&mut ops);
         }
 
         // A read-only transaction still has to be validated: a
@@ -930,6 +958,9 @@ impl RegolithEngine {
         .map_err(crate::Error::into_io_error)
     }
 }
+
+#[cfg(test)]
+mod append_tests;
 
 #[cfg(test)]
 mod exempt_tests;

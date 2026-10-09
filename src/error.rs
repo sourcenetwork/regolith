@@ -83,6 +83,11 @@ pub enum Error {
         #[source]
         source: std::io::Error,
     },
+    /// A transaction put, deleted or merged a key that its installed
+    /// [`crate::KeyClassifier`] declares [`crate::KeyClass::Log`]. Only
+    /// [`crate::Transaction::append`] writes the keys of a commit-ordered log.
+    #[error("this key belongs to a commit-ordered log; write it with append")]
+    LogKeyWrite,
     /// An underlying I/O error from the filesystem or operating system.
     #[error("I/O error: {0}")]
     Io(#[source] std::io::Error),
@@ -280,6 +285,12 @@ mod tests {
         let io = Error::Closed.into_io_error();
         assert_eq!(io.kind(), std::io::ErrorKind::NotConnected);
         assert_eq!(io.to_string(), "database is closed");
+    }
+
+    #[test]
+    fn log_key_write_says_what_to_do() {
+        let msg = Error::LogKeyWrite.to_string();
+        assert!(msg.contains("append"), "{msg}");
     }
 
     #[test]

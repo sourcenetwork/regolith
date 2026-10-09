@@ -66,6 +66,7 @@ pub mod env;
 mod error;
 mod event_listener;
 mod iter;
+mod log_layout;
 mod options;
 mod perf_context;
 mod portability;
@@ -96,6 +97,7 @@ pub use event_listener::{
     FlushJobInfo, TableFileCreationInfo, TableFileCreationReason, TableFileDeletionInfo,
 };
 pub use iter::Iter;
+pub use log_layout::LogLayout;
 pub use options::{
     ArenaProfile, CompactionDecision, CompactionFilter, CompactionStyle, CompressionType,
     DEFAULT_MAX_BACKGROUND_COMPACTIONS, DEFAULT_MAX_KEY_SIZE, DEFAULT_MAX_VALUE_SIZE,
@@ -120,8 +122,8 @@ pub use transaction::{
 /// `use regolith::prelude::*;`.
 pub mod prelude {
     pub use crate::{
-        CommitReceipt, Conflict, Db, IsolationLevel, KeyClass, KeyClassifier, MergeOperator,
-        OptimisticTransactionDb, Options, RetryPolicy, TransactError, Transaction,
+        CommitReceipt, Conflict, Db, IsolationLevel, KeyClass, KeyClassifier, LogLayout,
+        MergeOperator, OptimisticTransactionDb, Options, RetryPolicy, TransactError, Transaction,
         TransactionError, TxResult, TxnOptions,
     };
 }

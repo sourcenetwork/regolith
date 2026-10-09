@@ -5,9 +5,11 @@
 //! [`KeyClassifier`], and the level relaxes validation for those keys on the
 //! caller's word: a scan inside a commutative prefix is not validated as a
 //! read, a put or merge of a content-addressed key is not validated, and a
-//! read of one that found it is validated for its presence only. Anything
-//! else is validated as at [`IsolationLevel::RepeatableRead`]. The classifier
-//! does not govern blind merges, which commute at this level for every key.
+//! read of one that found it is validated for its presence only, a read of a
+//! key of a commit-ordered log is never validated, and a write to one is
+//! refused. Anything else is validated as at
+//! [`IsolationLevel::RepeatableRead`]. The classifier does not govern blind
+//! merges, which commute at this level for every key.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -94,6 +96,34 @@ pub enum KeyClass {
     /// different before the transaction began, so the contract still rests on
     /// the caller.
     ContentAddressed,
+    /// The key belongs to a commit-ordered log: its head key, an entry key or
+    /// a once key, as the log's [`crate::LogLayout`] and the `once_key` of
+    /// [`Transaction::append`] name them. Only `append` writes them.
+    ///
+    /// This class has an effect only for an optimistic transaction at
+    /// [`IsolationLevel::DefraLevel`] with a [`KeyClassifier`] installed.
+    /// There:
+    ///
+    /// - A read of the key (`get`, `get_slice`, `get_for_update`) is never
+    ///   validated. A reader that reads a log in a snapshot sees a dense
+    ///   prefix of it, and entries appended later are not a conflict.
+    /// - A `put`, `delete` or `merge` of the key is refused with
+    ///   [`crate::Error::LogKeyWrite`] when it is called, and nothing is
+    ///   buffered.
+    /// - `append` checks that the layout's head and entry keys and the
+    ///   `once_key` are all declared `Log`, and refuses the call with
+    ///   [`crate::Error::InvalidArgument`] when one is not.
+    ///
+    /// Other levels, pessimistic transactions and transactions without a
+    /// classifier are unchanged: a pessimistic transaction consults no
+    /// classifier, so its writes to log keys are not refused, and a write
+    /// through [`crate::Db`] is not either. That is the caller's contract.
+    ///
+    /// Declare a key `Log` only when every writer of it is `append`, and when
+    /// nothing the transaction writes depends on entries the log did not yet
+    /// hold: a decision taken on a read of a log may be overtaken by entries
+    /// appended after the transaction's snapshot.
+    Log,
 }
 
 /// Classifies keys for [`IsolationLevel::DefraLevel`].
@@ -131,7 +161,7 @@ pub(super) fn run_is_commutative(classifier: &dyn KeyClassifier, run: &ScanRun) 
         KeyClass::CommutativePrefix { len } => {
             first.len() >= len && last.len() >= len && first[..len] == last[..len]
         }
-        KeyClass::Ordinary | KeyClass::ContentAddressed => false,
+        KeyClass::Ordinary | KeyClass::ContentAddressed | KeyClass::Log => false,
     }
 }
 
@@ -168,6 +198,11 @@ pub(super) fn classifier_for(
 ///
 /// Every other read of a content-addressed key that found a value is marked
 /// presence-only, and one that found nothing stays a read like any other.
+///
+/// A read of a key of a commit-ordered log is dropped, found or not: nothing a
+/// transaction decides on a log read is validated. The commit never writes a
+/// log key, since a put, delete or merge of one is refused when it is made,
+/// and an append is not validated.
 ///
 /// The listing is a sorted copy of the exempt keys, built here before the
 /// commit takes the write pipeline. The engine finds a written key in it by
@@ -217,13 +252,13 @@ pub(super) fn exempt_content_addressed(
             return false;
         }
         // A key the commit puts or merges was classified above, and is not
-        // exempt.
-        if read.found
-            && !is_put(&read.key)
-            && merged.binary_search(&read.key.as_slice()).is_err()
-            && content_addressed(&read.key)
-        {
-            read.access = Access::ReadPresence;
+        // exempt, nor can it be a log key, which a write refuses.
+        if !is_put(&read.key) && merged.binary_search(&read.key.as_slice()).is_err() {
+            match class_of(classifier, &read.key) {
+                KeyClass::Log => return false,
+                KeyClass::ContentAddressed if read.found => read.access = Access::ReadPresence,
+                _ => {}
+            }
         }
         true
     });
@@ -246,7 +281,7 @@ mod tests {
     use crate::engine::ConflictKey;
 
     /// Keys that start with `c` are content-addressed, those with `p` are in a
-    /// commutative prefix, the rest are ordinary.
+    /// commutative prefix, those with `l` are log keys, the rest are ordinary.
     struct ByFirstByte;
 
     impl KeyClassifier for ByFirstByte {
@@ -254,6 +289,7 @@ mod tests {
             match key.first() {
                 Some(b'c') => KeyClass::ContentAddressed,
                 Some(b'p') => KeyClass::CommutativePrefix { len: 1 },
+                Some(b'l') => KeyClass::Log,
                 _ => KeyClass::Ordinary,
             }
         }
@@ -334,6 +370,25 @@ mod tests {
             "c3 is put, so its read is gone; a content-addressed read that found a value is \
              presence-only, one that found nothing is an ordinary read, and c5 is deleted but \
              not exempt"
+        );
+    }
+
+    #[test]
+    fn a_read_of_a_log_key_is_dropped_found_or_not_and_other_reads_stay() {
+        let mut checks = checks_of(vec![
+            read(b"a", true),
+            read(b"l1", true),
+            read(b"l2", false),
+            read(b"p", true),
+        ]);
+        let writes = BTreeMap::from([(key(b"b"), Some(b"v".to_vec()))]);
+
+        exempt_content_addressed(&ByFirstByte, &mut checks, &writes, &[]);
+
+        assert_eq!(kept(&checks), [(key(b"a"), false), (key(b"p"), false)]);
+        assert!(
+            checks.exempt.is_empty(),
+            "a log key is never written, so never listed"
         );
     }
 

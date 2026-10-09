@@ -127,9 +127,12 @@ use std::time::Duration;
 use crate::sync::internal::{Condvar, Mutex};
 
 use crate::column_family::{DEFAULT_CF_ID, prefix_key};
-use crate::engine::{CommitOutcome, ConflictKey, RegolithEngine, ValidationSet, callback};
+use crate::engine::{
+    CommitOutcome, ConflictKey, PendingAppend, RegolithEngine, ValidationSet, callback,
+};
 use crate::{Access, Conflict, Db, DbSlice, Error, Options, Result};
 
+mod append;
 mod policy;
 mod receipt;
 mod retry;
@@ -619,6 +622,12 @@ pub struct Transaction {
     /// Range deletes buffered for commit. Not tracked in the
     /// optimistic conflict set (initial impl limitation).
     range_deletes: SegQueue<(Vec<u8>, Vec<u8>)>,
+    /// The `append` calls, in the order they were made. Not part of `writes`:
+    /// their positions do not exist until the commit orders them, so nothing
+    /// in the transaction can read them. Allocated by the first `append`, and
+    /// boxed for the reason `scan_runs` is: a transaction that never appends
+    /// pays nothing for it.
+    appends: OnceLock<Box<SegQueue<PendingAppend>>>,
     /// What this transaction has observed about each key it read,
     /// through a point read, or through a scan at Serializable. Sorted
     /// at commit so a multi-key conflict always reports the same key.
@@ -663,6 +672,7 @@ struct Savepoint {
     /// all the buffer needs to be rebuilt as it was.
     writes: Vec<(Vec<u8>, Write)>,
     range_deletes: Vec<(Vec<u8>, Vec<u8>)>,
+    appends: Vec<PendingAppend>,
     held_lock_count: usize,
 }
 
@@ -730,6 +740,7 @@ impl Transaction {
             policy,
             writes: TxnBuffer::new(keys_inline),
             range_deletes: SegQueue::new(),
+            appends: OnceLock::new(),
             tracked: TxnBuffer::new(keys_inline),
             scan_runs: OnceLock::new(),
             promoted_seq: AtomicU64::new(snapshot_seq),
@@ -1003,6 +1014,7 @@ impl Transaction {
     /// [`Transaction::get_for_update`] first, or write a value unique to
     /// the writer, to make a claim (see the module documentation).
     pub fn put(&self, key: &[u8], value: &[u8]) -> TxResult<()> {
+        self.refuse_log_key(key)?;
         let prefixed = prefix_key(DEFAULT_CF_ID, key);
         self.lock_key(&prefixed)?;
         self.writes.insert(prefixed, Write::Put(value.to_vec()));
@@ -1012,6 +1024,7 @@ impl Transaction {
     /// Buffer a delete. For pessimistic transactions, acquires an
     /// exclusive lock on the key if not already held.
     pub fn delete(&self, key: &[u8]) -> TxResult<()> {
+        self.refuse_log_key(key)?;
         let prefixed = prefix_key(DEFAULT_CF_ID, key);
         self.lock_key(&prefixed)?;
         self.writes.insert(prefixed, Write::Delete);
@@ -1064,6 +1077,7 @@ impl Transaction {
     /// replaces the key outright, so the operand has no effect.
     pub fn merge(&self, key: &[u8], operand: &[u8]) -> TxResult<()> {
         self.engine.require_merge_operator()?;
+        self.refuse_log_key(key)?;
         let prefixed = prefix_key(DEFAULT_CF_ID, key);
         self.lock_key(&prefixed)?;
         self.writes.insert(prefixed, Write::Merge(operand.to_vec()));
@@ -1081,6 +1095,7 @@ impl Transaction {
         self.savepoints.push(Savepoint {
             writes: self.writes.chains_matching(|_| true, Write::is_terminator),
             range_deletes: drain(&self.range_deletes),
+            appends: self.save_appends(),
             held_lock_count: self.held_locks.len(),
         });
         // `drain` emptied it, so put back what the savepoint captured.
@@ -1111,6 +1126,7 @@ impl Transaction {
         for entry in sp.range_deletes {
             self.range_deletes.push(entry);
         }
+        self.restore_appends(sp.appends);
         // Locks acquired after the savepoint remain held.
         let _ = sp.held_lock_count;
         Ok(())
@@ -1190,6 +1206,7 @@ impl Transaction {
         // one. `settle` says what the drained writes commit as.
         let (writes, merges) = settle(self.writes.drain());
         let range_deletes = drain(&self.range_deletes);
+        let appends = self.appends.take().map_or_else(Vec::new, |q| drain(&q));
         let tracked = self.tracked.drain();
         let mut checks = self.validation_set(tracked, &writes, &merges);
         // Only an optimistic transaction at `DefraLevel` has a classifier to
@@ -1240,6 +1257,7 @@ impl Transaction {
             writes,
             range_deletes,
             merges,
+            appends,
             self.durability,
         )?;
         match outcome {

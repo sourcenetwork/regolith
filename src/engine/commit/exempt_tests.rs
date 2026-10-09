@@ -62,6 +62,7 @@ fn commit_after_newer_writes(exempt: &[&[u8]], puts: &[&[u8]], merged: &[&[u8]])
             point_ops,
             Vec::new(),
             merges,
+            Vec::new(),
             DurabilityMode::Eventual,
         )
         .unwrap()
@@ -174,6 +175,7 @@ fn commit_read_of_a_present_key(
         .commit_optimistic(
             &checks,
             point_ops,
+            Vec::new(),
             Vec::new(),
             Vec::new(),
             DurabilityMode::Eventual,

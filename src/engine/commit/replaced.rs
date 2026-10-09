@@ -250,6 +250,7 @@ mod tests {
                 BTreeMap::new(),
                 ranges,
                 vec![(key_of(b"k"), b"op".to_vec())],
+                Vec::new(),
                 DurabilityMode::Eventual,
             )
             .unwrap()

@@ -49,6 +49,7 @@ use kovan_queue::array_queue::ArrayQueue;
 
 use background_health::{BackgroundHealth, Hazard, Job};
 use block_cache::BlockCache;
+pub(crate) use commit::PendingAppend;
 use commit::{Pipeline, StallSignal, WriteSlot};
 use compaction::{CompactionOptions, CompactionOutcome, CompactionScheduler};
 use lookup_key::{LookupKey, with_key_scratch};
@@ -1009,7 +1010,12 @@ impl RegolithEngine {
     }
 
     fn validate_prefixed_key_size(&self, key: &[u8]) -> std::io::Result<()> {
-        let user_key_len = key.len().saturating_sub(4);
+        self.validate_user_key_len(key.len().saturating_sub(4))
+    }
+
+    /// [`Self::validate_prefixed_key_size`] for a key known by its length,
+    /// without the column-family prefix.
+    fn validate_user_key_len(&self, user_key_len: usize) -> std::io::Result<()> {
         if user_key_len <= self.options.max_key_size {
             return Ok(());
         }
@@ -2184,9 +2190,17 @@ impl RegolithEngine {
         point_ops: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
         range_deletes: Vec<(Vec<u8>, Vec<u8>)>,
         merges: Vec<(Vec<u8>, Vec<u8>)>,
+        appends: Vec<PendingAppend>,
         durability: DurabilityMode,
     ) -> std::io::Result<CommitOutcome> {
-        self.commit_optimistic(checks, point_ops, range_deletes, merges, durability)
+        self.commit_optimistic(
+            checks,
+            point_ops,
+            range_deletes,
+            merges,
+            appends,
+            durability,
+        )
     }
 
     /// Whether this commit's write for `key` would store exactly what `key`
