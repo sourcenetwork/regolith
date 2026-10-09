@@ -44,6 +44,15 @@ below it.
    "reading memory first returns the newest version".
 4. `no_sync_before_next_refuses_a_crash` and `stale_without_min_wal`: the two
    RED cases as concrete counterexamples.
+5. `crash_never_proves_opened`: on a sealed manifest the judge opens each
+   batch before it reads whether the writer synced it, and then accepts every
+   crash state; `judging_ciphertext_refuses_a_crash` is the RED where it reads
+   the sealed bytes as plain records (`MC_ManifestRecovery_Red_JudgeCiphertext`).
+6. `oldest_first_keeps_every_log`: with several memtables waiting and flushes
+   on several threads, every flush takes the oldest, so every version of every
+   log comes back from a table or replayed; `newest_first_loses_a_log` is the
+   RED where a newer memtable is flushed first
+   (`MC_ManifestRecovery_Red_NewestFirst`).
 
 The code each definition mirrors is named on it. The engine side lives in
 `src/engine/manifest/tail.rs` (the judgment), `src/engine/manifest.rs`
@@ -244,6 +253,73 @@ theorem no_sync_before_next_refuses_a_crash :
   · -- Batch 1 is whole, needs a sync, and batch 2 follows it.
     exact ⟨1, ⟨true⟩, by decide, by decide, by simp [img, m], rfl⟩
 
+/-! ## Part 1b: the judge on a sealed manifest (encryption meets E29) -/
+
+/-- `tail::proof_past` with the judge's reading made explicit: `seen b` is
+what the judge reads off a whole batch `b` for "did the writer sync you
+before writing on?". On a plain manifest it reads the batch's own flag. On
+a sealed one the batch is noise until `sealed::open_batch` opens it. -/
+def ProofBy (seen : Batch → Bool) (len : Nat) (img : Image) (o : Nat) : Prop :=
+  ∃ j b, o < j ∧ j + 1 < len ∧ img j = some b ∧ seen b = true -- a whole batch past o, not the last, read as synced
+
+/-- **The judge that opens each batch first accepts every crash state, sealed
+or not.** `tail::needs_sync` opens a sealed batch before it decodes its
+records, so what it reads is the batch's true flag, `Batch.needsSync`, and
+the judgment is exactly the plain one: `crash_never_proves` applies. -/
+theorem crash_never_proves_opened {m : Manifest} {img : Image} {o : Nat}
+    -- The writer synced every batch that needed it before writing on,
+    (hw : SyncedBeforeNext m)
+    -- `img` is something a crash left,
+    (hc : CrashImage m img)
+    -- and replay stopped at `o`.
+    (hf : FirstTorn m.len img o) :
+    ¬ ProofBy Batch.needsSync m.len img o := -- claim: reading true flags, no proof follows the stop
+  -- `ProofBy Batch.needsSync` unfolds to `Proof`, which the plain theorem rules out.
+  crash_never_proves hw hc hf
+
+/-- **RED `JudgeCiphertext`.** A judge that reads sealed bytes as plain
+records cannot decode them and counts every whole batch as synced
+(`seen := fun _ => true`). Three reservations, none needing a sync, nothing
+synced yet; a crash tears the first and keeps the other two. The writer kept
+its rule, the image is a crash image, replay stops at 0, and yet the judge
+finds a "proof" and would refuse a database a crash left. -/
+theorem judging_ciphertext_refuses_a_crash :
+    -- Three batches; none needs a sync; nothing was synced yet.
+    let m : Manifest := ⟨3, fun _ => ⟨false⟩, 0⟩
+    -- The crash tears batch 0 and keeps batches 1 and 2.
+    let img : Image := fun j => if j = 0 then none else some (m.batch j)
+    -- The writer kept its rule, the image is a crash image, replay stops at
+    -- 0, and the judge that reads every batch as synced finds a proof.
+    SyncedBeforeNext m ∧ CrashImage m img ∧ FirstTorn m.len img 0 ∧
+      ProofBy (fun _ => true) m.len img 0 := by -- the four facts together
+  -- Unfold the two `let`s into the goal.
+  intro m img
+  -- Four claims, proved one by one.
+  refine ⟨?_, ?_, ?_, ?_⟩
+  · -- `synced = 0` lies inside the file, and no batch needs a sync, so the
+    -- rule has nothing to say about any of them.
+    refine ⟨by decide, fun j _ h => ?_⟩
+    -- `h` claims batch `j` needs a sync, but every batch here says `false`.
+    simp [m] at h
+  · -- Every position is intact or torn, and nothing is synced.
+    intro j _
+    -- Nothing is synced, so the first half holds vacuously.
+    refine ⟨fun h => absurd h (Nat.not_lt_zero _), ?_⟩
+    -- Position 0 is torn, every other one intact.
+    by_cases h0 : j = 0
+    · -- Torn: the image reads nothing there.
+      right
+      -- Unfold the image at 0.
+      simp [img, h0]
+    · -- Intact: the image reads the batch written there.
+      left
+      -- Unfold the image away from 0.
+      simp [img, h0]
+  · -- Replay stops at 0: inside the file, torn, nothing before it.
+    refine ⟨by decide, by simp [img], fun i hi => absurd hi (Nat.not_lt_zero _)⟩
+  · -- Batch 1 is whole and batch 2 follows it; the judge reads it as synced.
+    exact ⟨1, ⟨false⟩, by decide, by decide, by simp [img, m], rfl⟩
+
 /-! ## Part 2 (E30): no replayed version above a newer table -/
 
 /-- A version of a key: the key and the sequence number that wrote it. -/
@@ -362,5 +438,59 @@ theorem stale_without_min_wal :
     refine ⟨⟨0, 1⟩, ⟨0, 2⟩, ⟨0, Nat.le_refl 0, rfl, rfl⟩, Or.inr rfl, rfl, ?_⟩
     -- `2 < 1` is false.
     decide
+
+/-! ## Part 3: flushes from several threads (group commit meets E30) -/
+
+/-- What recovery brings back when the logs `flushed` are in tables and the
+last synced table batch recorded `min_wal_id = minWal`: every version of a
+flushed log, from its table, and every version of a log at or above
+`minWal`, replayed. Mirrors `MemOf` and `TableWritesOf` in the TLA+ model. -/
+def Recovered (logs : Logs) (flushed : Nat → Prop) (minWal : Nat) (v : Version) : Prop :=
+  (∃ j, flushed j ∧ logs j v) ∨ Replayed logs minWal v -- in a table, or replayed
+
+/-- **Oldest first keeps every log.** Every flush path runs
+`Flusher::flush_oldest` under the `flushing` exclusion and takes the front of
+the queue, so the flushed logs are always the oldest ones, `0 .. f - 1`, and
+the last table's batch records `min_wal_id = f`. Then every version of every
+log comes back, from a table or replayed: the flush half of `AckedSurvive`
+with two memtables waiting (`MC_ManifestRecovery_Green_Frozen2`). -/
+theorem oldest_first_keeps_every_log {logs : Logs} {f : Nat} :
+    ∀ j v, logs j v → Recovered logs (fun i => i < f) f v := by -- claim: any version of any log comes back
+  -- Take a version `v` that log `j` holds.
+  intro j v hv
+  -- Either log `j` is one of the flushed ones, or it is at or above `f`.
+  by_cases h : j < f
+  · -- Flushed: its table holds `v`.
+    exact Or.inl ⟨j, h, hv⟩
+  · -- Not flushed: it is at or above `min_wal_id = f`, so it is replayed.
+    exact Or.inr ⟨j, by omega, hv⟩
+
+/-- Two logs waiting for a flush: log 0 holds key 0 at sequence 1, log 1 holds
+key 1 at sequence 2. -/
+def twoLogs : Logs := fun i v => (i = 0 ∧ v = ⟨0, 1⟩) ∨ (i = 1 ∧ v = ⟨1, 2⟩) -- log 0 holds (0, 1), log 1 holds (1, 2)
+
+/-- **RED `NewestFirst`.** A flush takes log 1, the newer, first and records
+`min_wal_id = 2`; the power goes before log 0 is flushed. Log 0's version is
+in no table and is not replayed: an acknowledged write is lost
+(`MC_ManifestRecovery_Red_NewestFirst`). -/
+theorem newest_first_loses_a_log :
+    -- Log 0 holds `(0, 1)`, and it does not come back.
+    twoLogs 0 ⟨0, 1⟩ ∧ ¬ Recovered twoLogs (fun i => i = 1) 2 ⟨0, 1⟩ := by -- the two facts together
+  -- Two claims, proved one by one.
+  constructor
+  · -- Log 0 holds `(0, 1)`: the left case of `twoLogs`.
+    exact Or.inl ⟨rfl, rfl⟩
+  · -- Suppose it came back, from a table or replayed.
+    rintro (⟨j, hj, hv⟩ | ⟨j, hj, hv⟩)
+    · -- From a table: the only flushed log is log 1.
+      subst hj
+      -- Log 1 holds only `(1, 2)`, which is not `(0, 1)`.
+      rcases hv with ⟨h, _⟩ | ⟨_, h⟩
+      · -- `1 = 0` is false.
+        exact absurd h (by decide)
+      · -- `(0, 1) = (1, 2)` is false: the keys differ.
+        exact absurd (congrArg Version.key h) (by decide)
+    · -- Replayed: the log is numbered 2 or more, and no such log holds anything.
+      rcases hv with ⟨h, _⟩ | ⟨h, _⟩ <;> omega
 
 end Regolith.ManifestRecovery
