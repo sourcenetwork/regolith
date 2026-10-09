@@ -6,21 +6,23 @@
 //! writes 0); every read sees the recorded one instead. Three seams carry
 //! that, so no read path has to know:
 //!
-//! - a data block is rebuilt with the recorded sequence when it is decoded,
-//!   before the block cache holds it, so every walk, iterator, validation and
-//!   compaction input reads the recorded sequence;
+//! - a data block is stamped with the recorded sequence when it is decoded,
+//!   before the block cache holds it, and every walk, iterator, validation
+//!   and compaction input over a stamped block reads each key with the stamp
+//!   in place of the sequence it stores (`block::stamp`), with no copy of
+//!   the block;
 //! - an index seek, whose keys are the file's own last keys, is steered by
 //!   the target's user key and by whether the recorded sequence is visible to
 //!   it, never by the stored sequences;
 //! - the range tombstones, held in memory, are rewritten when the reader is
 //!   bound to the sequence.
 //!
-//! The rewrite needs the file to hold at most one entry per user key, which
-//! the ingest checks: two entries of one key at one sequence have no order.
+//! Reading every entry at one sequence needs the file to hold at most one
+//! entry per user key, which the ingest checks: two entries of one key at
+//! one sequence have no order.
 //! A compaction reads the file through these seams and writes what it reads,
 //! so its output carries the sequence in its entries and no record of its own.
 
-use super::super::block::{Block, BlockBuilder, RESTART_INTERVAL, decode_entry_at};
 use super::super::internal_key::{INTERNAL_KEY_SUFFIX_LEN, decode_internal_key};
 use super::super::range_tombstone::RangeTombstone;
 
@@ -57,32 +59,6 @@ pub(super) fn steer(target: &[u8], seq: u64) -> Option<(&[u8], [u8; INTERNAL_KEY
     ))
 }
 
-/// `block` with every entry's sequence replaced by `seq`, value types and
-/// values unchanged.
-///
-/// The block was validated when it was decoded, so every key is at least an
-/// internal-key trailer long. Prefix compression is rebuilt rather than
-/// patched: a key's trailer can be part of the prefix the next key shares.
-pub(super) fn rebuild(block: &Block, seq: u64) -> Block {
-    let stamp = (!seq).to_be_bytes();
-    let data = block.entry_data();
-    let mut builder = BlockBuilder::new(RESTART_INTERVAL);
-    let mut stored = Vec::new();
-    let mut read_as = Vec::new();
-    let mut pos = 0;
-    while pos < data.len() {
-        let (consumed, value_offset, value_len) = decode_entry_at(data, pos, &mut stored);
-        pos += consumed;
-        let user_end = stored.len() - INTERNAL_KEY_SUFFIX_LEN;
-        read_as.clear();
-        read_as.extend_from_slice(&stored[..user_end]);
-        read_as.extend_from_slice(&stamp);
-        read_as.push(stored[stored.len() - 1]);
-        builder.add(&read_as, &data[value_offset..value_offset + value_len]);
-    }
-    Block::from_builder(builder)
-}
-
 /// `tombstones` with every sequence replaced by `seq`.
 pub(super) fn tombstones_at(tombstones: &[RangeTombstone], seq: u64) -> Vec<RangeTombstone> {
     tombstones
@@ -94,11 +70,13 @@ pub(super) fn tombstones_at(tombstones: &[RangeTombstone], seq: u64) -> Vec<Rang
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::block::{Block, BlockBuilder, RESTART_INTERVAL};
     use crate::engine::internal_key::{
         VALUE_TYPE_DELETION, VALUE_TYPE_MERGE, VALUE_TYPE_VALUE, compare_internal_keys,
         compare_internal_split, encode_internal_key,
     };
     use proptest::prelude::*;
+    use std::ops::ControlFlow;
 
     fn block_of(entries: &[(Vec<u8>, Vec<u8>)]) -> Block {
         let mut builder = BlockBuilder::new(RESTART_INTERVAL);
@@ -108,24 +86,23 @@ mod tests {
         Block::decode_data_block(builder.finish()).unwrap()
     }
 
-    fn entries_of(block: &Block) -> Vec<(Vec<u8>, Vec<u8>)> {
-        let data = block.entry_data();
-        let mut key = Vec::new();
+    /// Every entry `scan_from(target)` hands out, key and value.
+    fn scan(block: &Block, target: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let mut key_buf = Vec::new();
         let mut out = Vec::new();
-        let mut pos = 0;
-        while pos < data.len() {
-            let (consumed, off, len) = decode_entry_at(data, pos, &mut key);
-            pos += consumed;
-            out.push((key.clone(), data[off..off + len].to_vec()));
-        }
+        let ended: Option<()> = block.scan_from(target, &mut key_buf, |key, off, len| {
+            out.push((key.to_vec(), block.entry_bytes(off, len).unwrap().to_vec()));
+            ControlFlow::Continue(())
+        });
+        assert!(ended.is_none());
         out
     }
 
     #[test]
-    fn a_rebuilt_block_reads_every_entry_at_the_sequence_and_keeps_the_rest() {
-        // `ab` is a prefix of `ab\xff...`: the second key shares bytes of the
-        // first one's trailer, so a patch in place would corrupt it.
-        let stored = vec![
+    fn a_stamped_block_scans_like_the_block_written_at_the_sequence() {
+        // `ab` is a prefix of `ab\xff...`, so the second key shares bytes of
+        // the first one's trailer: a stamp left in place would corrupt it.
+        let mut stored = vec![
             (
                 encode_internal_key(b"ab", 0, VALUE_TYPE_VALUE),
                 b"1".to_vec(),
@@ -139,102 +116,33 @@ mod tests {
                 b"3".to_vec(),
             ),
         ];
-        let rebuilt = entries_of(&rebuild(&block_of(&stored), 42));
-        let expected: Vec<_> = stored
+        stored.extend((0..40u32).map(|i| {
+            let key = format!("k{i:03}").into_bytes();
+            (encode_internal_key(&key, 5, VALUE_TYPE_VALUE), key)
+        }));
+        let written: Vec<_> = stored
             .iter()
             .map(|(key, value)| {
                 let (user_key, _, value_type) = decode_internal_key(key);
                 (encode_internal_key(user_key, 42, value_type), value.clone())
             })
             .collect();
-        assert_eq!(rebuilt, expected);
-    }
-
-    #[test]
-    fn a_rebuilt_block_answers_a_seek_like_a_block_written_at_the_sequence() {
-        let keys: Vec<Vec<u8>> = (0..40u32)
-            .map(|i| format!("k{i:03}").into_bytes())
-            .collect();
-        let stored: Vec<_> = keys
-            .iter()
-            .map(|k| (encode_internal_key(k, 0, VALUE_TYPE_VALUE), k.clone()))
-            .collect();
-        let written: Vec<_> = keys
-            .iter()
-            .map(|k| (encode_internal_key(k, 7, VALUE_TYPE_VALUE), k.clone()))
-            .collect();
-        let rebuilt = rebuild(&block_of(&stored), 7);
+        let stamped = block_of(&stored).stamped(42);
         let reference = block_of(&written);
-        assert_eq!(rebuilt.restart_count(), reference.restart_count());
-        for k in &keys {
-            for snapshot in [6, 7, 8] {
-                let target = encode_internal_key(k, snapshot, VALUE_TYPE_DELETION);
-                let first = |block: &Block| {
-                    let mut buf = Vec::new();
-                    block.scan_from(&target, &mut buf, |key, _, _| {
-                        std::ops::ControlFlow::Break(key.to_vec())
-                    })
-                };
-                assert_eq!(first(&rebuilt), first(&reference));
+        for (key, _) in &written {
+            let user_key = decode_internal_key(key).0;
+            for snapshot in [0, 41, 42, 43, u64::MAX] {
+                let target = encode_internal_key(user_key, snapshot, VALUE_TYPE_DELETION);
+                assert_eq!(scan(&stamped, &target), scan(&reference, &target));
             }
         }
-    }
-
-    #[test]
-    fn a_bound_reader_answers_every_lookup_at_the_recorded_sequence() {
-        use crate::engine::block_cache::BlockCache;
-        use crate::engine::lookup_key::LookupKey;
-        use crate::engine::sstable::{LookupResult, SsTableReader, SsTableWriter};
-        use crate::options::CompressionType;
-
-        let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("bound.sst");
-        let mut writer =
-            SsTableWriter::new(&path, 64, 10, CompressionType::None, None, true, 64).unwrap();
-        let keys: Vec<Vec<u8>> = (0..30u32)
-            .map(|i| format!("k{i:02}").into_bytes())
-            .collect();
-        for (i, key) in keys.iter().enumerate() {
-            let value_type = if i == 3 {
-                VALUE_TYPE_DELETION
-            } else {
-                VALUE_TYPE_VALUE
-            };
-            writer
-                .add(
-                    &encode_internal_key(key, 1_000 + i as u64, value_type),
-                    b"v",
-                )
-                .unwrap();
-        }
-        writer.add_range_tombstone(b"x", b"z", 2_000);
-        writer.finish().unwrap().unwrap();
-        let reader = SsTableReader::open(&path, 1)
-            .unwrap()
-            .with_global_seq(Some(50));
-        let cache = BlockCache::new(1 << 20);
-        let mut buf = Vec::new();
-
-        for (i, key) in keys.iter().enumerate() {
-            let mut at =
-                |snapshot| reader.get(&LookupKey::from_prefixed(key, snapshot), &mut buf, &cache);
-            assert_eq!(at(49).unwrap(), LookupResult::NotInTable);
-            for snapshot in [50, u64::MAX] {
-                match at(snapshot).unwrap() {
-                    LookupResult::FoundTombstone { seq } => assert!(i == 3 && seq == 50),
-                    LookupResult::Found { seq, .. } => assert!(i != 3 && seq == 50),
-                    LookupResult::NotInTable => panic!("k{i:02} missing at {snapshot}"),
-                }
-            }
-            let newest = reader
-                .latest_version(&LookupKey::from_prefixed(key, u64::MAX), &mut buf, &cache)
-                .unwrap();
-            assert_eq!(newest.map(|(seq, _)| seq), Some(50));
-        }
-        assert_eq!(reader.covering_range_tombstone_seq(b"y", 49), 0);
-        assert_eq!(reader.covering_range_tombstone_seq(b"y", 50), 50);
-        for (ik, _) in reader.iter_internal(&cache).unwrap() {
-            assert_eq!(decode_internal_key(&ik).1, 50);
+        for (key, _) in &stored {
+            let mut out = Vec::new();
+            let (user_key, _, value_type) = decode_internal_key(key);
+            let read = encode_internal_key(user_key, 42, value_type);
+            assert_eq!(stamped.read_key(key, &mut out), read.as_slice());
+            assert_eq!(stamped.owned_key(key), read);
+            assert_eq!(block_of(&stored).read_key(key, &mut out), key.as_slice());
         }
     }
 

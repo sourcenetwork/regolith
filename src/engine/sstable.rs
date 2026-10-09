@@ -1115,7 +1115,7 @@ impl<'a> SsTableInternalIter<'a> {
                         decode_entry_at(data, self.current_pos, &mut self.current_key);
                     self.current_pos += consumed;
                     let value = data[value_offset..value_offset + value_len].to_vec();
-                    return Ok(Some((self.current_key.clone(), value)));
+                    return Ok(Some((block.owned_key(&self.current_key), value)));
                 }
             }
 
@@ -1263,8 +1263,8 @@ impl SsTableReader {
     /// stores (`None`).
     ///
     /// Bind before the first data block is read under this reader's file
-    /// id: a block is rebuilt at the sequence as it enters the block cache,
-    /// so one cached before the bind would be served at the stored
+    /// id: a block is stamped with the sequence as it enters the block
+    /// cache, so one cached before the bind would be served at the stored
     /// sequences. The file must hold at most one entry per user key.
     pub(crate) fn with_global_seq(mut self, seq: Option<u64>) -> Self {
         if let Some(seq) = seq {
@@ -2069,7 +2069,7 @@ impl SsTableReader {
 
         let block = Block::decode_data_block(raw_data)?;
         let block = Arc::new(match self.global_seq {
-            Some(seq) => global_seq::rebuild(&block, seq),
+            Some(seq) => block.stamped(seq),
             None => block,
         });
         cache.insert(self.file_id, handle.offset, Arc::clone(&block));

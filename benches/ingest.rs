@@ -13,7 +13,10 @@
 //!   min and max over the files;
 //! - commit latency while an ingest is in flight (a commit whose span
 //!   overlaps an ingest call), p50, p99 and max, beside the same numbers
-//!   for the commits that overlapped no ingest.
+//!   for the commits that overlapped no ingest;
+//! - point reads of a freshly ingested table through a block cache too small
+//!   to hold it, so nearly every read decodes a block, p50 and p99: what a
+//!   read pays until a compaction rewrites the table.
 //!
 //! `--quick` (or `--test`) ingests fewer, smaller files.
 
@@ -167,17 +170,50 @@ fn main() {
         idle.iter().map(|c| c.took).collect(),
     );
 
+    let db = Arc::try_unwrap(db).unwrap_or_else(|_| panic!("the writer still holds the database"));
+    db.close().unwrap_or_else(|e| panic!("close: {e}"));
+    drop(tmp);
+
+    let reads_json = cold_reads(&paths[0], 0, entries);
     common::write_family(
         "ingest",
         &format!(
             "{{\"files\":{files},\"entries\":{entries},\"file_bytes\":{file_bytes},\
              \"ingest_ms\":{{\"median\":{median:.2},\"min\":{lo:.2},\"max\":{hi:.2}}},\
-             \"commit_latency\":[{during_json},{idle_json}]}}"
+             \"commit_latency\":[{during_json},{idle_json}],\"cold_reads\":{reads_json}}}"
         ),
     );
+    drop(staging);
+}
 
-    let db = Arc::try_unwrap(db).unwrap_or_else(|_| panic!("the writer still holds the database"));
+/// Point reads of `path`, file number `file`, freshly ingested into a
+/// database whose block cache holds a few blocks.
+fn cold_reads(path: &std::path::Path, file: usize, entries: usize) -> String {
+    let (tmp, db) = common::open(
+        "ingest-reads",
+        common::default_opts()
+            .block_cache_size(64 * 1024)
+            .block_cache_num_shard_bits(0),
+    );
+    db.ingest_external_files(
+        std::slice::from_ref(&path.to_path_buf()),
+        IngestOptions::default(),
+    )
+    .unwrap_or_else(|e| panic!("ingest {}: {e}", path.display()));
+    let mut rng = common::Rng::new(0x5EAD);
+    let reads = entries.min(50_000);
+    let mut ns = Vec::with_capacity(reads);
+    for _ in 0..reads {
+        let i = rng.next() as usize % entries;
+        let key = format!("ing/{file:04}/{i:010}");
+        let started = Instant::now();
+        let got = db
+            .get(key.as_bytes())
+            .unwrap_or_else(|e| panic!("get: {e}"));
+        ns.push(started.elapsed().as_nanos() as u64);
+        assert!(got.is_some(), "an ingested key is missing");
+    }
     db.close().unwrap_or_else(|e| panic!("close: {e}"));
     drop(tmp);
-    drop(staging);
+    summary("reads of an ingested table", ns)
 }
