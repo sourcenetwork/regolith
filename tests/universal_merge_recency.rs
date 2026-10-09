@@ -111,10 +111,12 @@ fn a_universal_merge_keeps_every_key_it_folded() {
     db.flush().unwrap();
     while db.compact_step().unwrap() == CompactionOutcome::DidWork {}
 
-    let mut scan = db.scan_stream(None, None).unwrap();
-    let seen = scan.by_ref().count();
-    scan.status().unwrap();
-    assert_eq!(seen as u64, N, "a merge must not drop or duplicate keys");
+    let seen = db
+        .scan_stream(None, None)
+        .unwrap()
+        .try_fold(0u64, |seen, entry| entry.map(|_| seen + 1))
+        .unwrap();
+    assert_eq!(seen, N, "a merge must not drop or duplicate keys");
 
     for i in (0..N).step_by(97) {
         assert_eq!(

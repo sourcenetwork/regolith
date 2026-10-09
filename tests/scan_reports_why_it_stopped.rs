@@ -1,18 +1,20 @@
 //! A scan that fails mid-range must not read as one that finished.
 //!
-//! `Iterator` has nowhere to put a failure, so a scan that dies on a corrupt
-//! block ends exactly like one that reached the end of its range. A caller
-//! that only iterates sees a short answer and no reason for it. `status()`
-//! is where the reason lives, and this holds it to that: after a scan over a
-//! damaged store, the rows are a prefix and `status()` says so.
+//! A scan that dies on a corrupt block, or on a key the merge operator
+//! declines, must not end like one that reached the end of its range, or a
+//! caller that only iterates sees a short answer and no reason for it. Every
+//! stream carries the failure as an item instead: the rows are a prefix, one
+//! `Err` follows, and then the stream is finished. Nothing has to be asked
+//! afterwards.
 
 // Native-only. wasm-pack builds every test target for wasm32, and these use
 // the filesystem, which does not exist there.
 #![cfg(not(target_arch = "wasm32"))]
 
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::sync::Arc;
 
-use regolith::{Db, Options, TxnOptions, WriteBatch};
+use regolith::{Db, DbSlice, Error, MergeOperator, Options, TxnOptions, WriteBatch};
 
 fn small_options() -> Options {
     Options::default()
@@ -94,29 +96,38 @@ fn walk(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
 }
 
 #[test]
-fn a_scan_cut_short_by_damage_says_so_instead_of_looking_complete() {
+fn a_scan_cut_short_by_damage_ends_with_an_err_instead_of_looking_complete() {
     let dir = tempfile::tempdir().unwrap();
     build(dir.path());
     damage_a_data_block(dir.path());
 
     let db = Db::open(dir.path(), small_options()).unwrap();
     let mut scan = db.scan_stream(None, None).unwrap();
-    let rows = scan.by_ref().count();
+    let mut rows = 0u64;
+    let mut errors = 0u64;
+    for item in scan.by_ref() {
+        match item {
+            Ok(_) => {
+                assert_eq!(errors, 0, "nothing follows the error");
+                rows += 1;
+            }
+            Err(_) => errors += 1,
+        }
+    }
+    assert!(
+        scan.next().is_none(),
+        "the stream is finished after the error"
+    );
 
     // Either outcome is acceptable on its own; what is not acceptable is a
-    // short scan that reports success. If the damage happened to land
-    // somewhere a scan never reads, the scan is complete and Ok.
-    match scan.status() {
-        Err(_) => assert!(
-            (rows as u64) < KEYS,
-            "status reported a failure, so the scan must not also have returned every row"
-        ),
-        Ok(()) => assert_eq!(
-            rows as u64, KEYS,
-            "status reported success, so every row must be there: a short scan \
-             reporting Ok is the exact failure this test exists to catch"
-        ),
-    }
+    // short scan with no error. If the damage happened to land somewhere a
+    // scan never reads, the scan is complete and has no `Err`.
+    assert!(errors <= 1, "the error is handed out once");
+    assert_eq!(
+        errors == 1,
+        rows < KEYS,
+        "a short scan must end with its reason, and a full one must not carry one"
+    );
 }
 
 /// The iterator form of a cursor carries the failure as an item, so no caller
@@ -188,10 +199,12 @@ fn an_undamaged_scan_reports_success_and_returns_everything() {
     build(dir.path());
 
     let db = Db::open(dir.path(), small_options()).unwrap();
-    let mut scan = db.scan_stream(None, None).unwrap();
-    let rows = scan.by_ref().count();
-    scan.status().expect("an intact store must scan clean");
-    assert_eq!(rows as u64, KEYS);
+    let rows = db
+        .scan_stream(None, None)
+        .unwrap()
+        .collect::<regolith::Result<Vec<_>>>()
+        .expect("an intact store must scan clean");
+    assert_eq!(rows.len() as u64, KEYS);
 }
 
 /// The same contract on the transaction side, stronger: the items carry the
@@ -227,4 +240,133 @@ fn a_transaction_scan_cut_short_says_so_too() {
         after.len()
     );
     assert_eq!(after.iter().filter(|item| item.is_err()).count(), 1);
+}
+
+/// Declines any operand `bad`, which a read of that key reports as an error.
+struct Declines;
+
+impl MergeOperator for Declines {
+    fn name(&self) -> &'static str {
+        "declines"
+    }
+
+    fn full_merge(&self, _: &[u8], base: Option<&[u8]>, operands: &[&[u8]]) -> Option<Vec<u8>> {
+        if operands.contains(&&b"bad"[..]) {
+            return None;
+        }
+        let mut out = base.map(<[u8]>::to_vec).unwrap_or_default();
+        operands
+            .iter()
+            .for_each(|operand| out.extend_from_slice(operand));
+        Some(out)
+    }
+}
+
+type Item = regolith::Result<(Vec<u8>, DbSlice)>;
+
+fn declining_options() -> Options {
+    Options::default().merge_operator(Some(Arc::new(Declines)))
+}
+
+/// `k0 k1 [k2: a merge the operator declines] k3 k4`, flushed to an SSTable
+/// when `flush` is set so the failure is met in a table and not a memtable.
+fn declining(dir: &std::path::Path, flush: bool) -> Db {
+    let db = Db::open(dir, declining_options()).unwrap();
+    for key in ["k0", "k1", "k3", "k4"] {
+        db.put(key.as_bytes(), b"v").unwrap();
+    }
+    db.merge(b"k2", b"bad").unwrap();
+    if flush {
+        db.flush().unwrap();
+    }
+    db
+}
+
+fn keys(items: &[Item]) -> Vec<String> {
+    items
+        .iter()
+        .flatten()
+        .map(|(key, _)| String::from_utf8(key.clone()).unwrap())
+        .collect()
+}
+
+/// The rows before the failure, then one `Err`, then nothing, however often
+/// the stream is asked.
+fn assert_prefix_then_err_then_none(mut scan: impl Iterator<Item = Item>) {
+    let items: Vec<Item> = scan.by_ref().collect();
+    assert_eq!(items.len(), 3, "two rows and the error, nothing after it");
+    assert_eq!(keys(&items), ["k0", "k1"]);
+    assert!(
+        matches!(items[2], Err(Error::Corruption(_))),
+        "the last item is the failure"
+    );
+    for _ in 0..3 {
+        assert!(scan.next().is_none(), "the stream stays finished");
+    }
+}
+
+#[test]
+fn a_db_scan_stream_yields_the_error_where_a_key_failed_then_ends() {
+    for flush in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let db = declining(dir.path(), flush);
+        assert_prefix_then_err_then_none(db.scan_stream(None, None).unwrap());
+    }
+}
+
+#[test]
+fn a_snapshot_scan_stream_yields_the_error_where_a_key_failed_then_ends() {
+    for flush in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let db = declining(dir.path(), flush);
+        let snapshot = db.snapshot();
+        assert_prefix_then_err_then_none(snapshot.scan_stream(None, None));
+        assert_prefix_then_err_then_none(snapshot.into_scan_stream(None, None));
+    }
+}
+
+#[test]
+fn an_error_on_the_first_key_is_the_first_item() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(dir.path(), declining_options()).unwrap();
+    db.merge(b"a", b"bad").unwrap();
+    db.put(b"b", b"v").unwrap();
+
+    let mut scan = db.scan_stream(None, None).unwrap();
+    assert!(matches!(scan.next(), Some(Err(Error::Corruption(_)))));
+    assert!(scan.next().is_none());
+}
+
+/// A key the stream is not asked to reach cannot fail it: a bound that ends
+/// the scan short of the declined key, and a start past it, both finish clean.
+#[test]
+fn a_range_that_does_not_reach_the_failure_ends_cleanly() {
+    for flush in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let db = declining(dir.path(), flush);
+
+        let before: Vec<Item> = db.scan_stream(None, Some(b"k2")).unwrap().collect();
+        assert_eq!(keys(&before), ["k0", "k1"]);
+        assert!(
+            before.iter().all(Result::is_ok),
+            "the range ended, it did not fail"
+        );
+
+        let after: Vec<Item> = db.scan_stream(Some(b"k3"), None).unwrap().collect();
+        assert_eq!(keys(&after), ["k3", "k4"]);
+        assert!(after.iter().all(Result::is_ok));
+    }
+}
+
+/// The idiom the item type is for: one `collect` into a `Result`, and a
+/// partial range cannot be taken for a whole one.
+#[test]
+fn collecting_into_a_result_surfaces_the_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = declining(dir.path(), false);
+    let collected = db
+        .scan_stream(None, None)
+        .unwrap()
+        .collect::<regolith::Result<Vec<_>>>();
+    assert!(matches!(collected, Err(Error::Corruption(_))));
 }

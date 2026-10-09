@@ -273,7 +273,7 @@ fn scan_stream_respects_the_range_bounds() {
     let keys: Vec<Vec<u8>> = db
         .scan_stream(Some(b"b"), Some(b"d"))
         .expect("scan_stream")
-        .map(|(key, _)| key)
+        .map(|entry| entry.expect("scan row").0)
         .collect();
 
     assert_eq!(keys, vec![b"b".to_vec(), b"c".to_vec()]);
@@ -286,7 +286,7 @@ fn scan_stream_with_open_bounds_covers_everything() {
     let keys: Vec<Vec<u8>> = db
         .scan_stream(None, None)
         .expect("scan_stream")
-        .map(|(key, _)| key)
+        .map(|entry| entry.expect("scan row").0)
         .collect();
 
     assert_eq!(keys, vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec()]);
@@ -307,7 +307,10 @@ fn scan_stream_agrees_with_the_materializing_scan() {
     let streamed: Vec<(Vec<u8>, Vec<u8>)> = db
         .scan_stream(Some(b"key/0100"), Some(b"key/0200"))
         .expect("scan_stream")
-        .map(|(key, value)| (key, value.to_vec()))
+        .map(|entry| {
+            let (key, value) = entry.expect("scan row");
+            (key, value.to_vec())
+        })
         .collect();
 
     assert_eq!(streamed, materialized);

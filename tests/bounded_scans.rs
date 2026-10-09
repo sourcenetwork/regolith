@@ -81,12 +81,13 @@ fn a_transaction_scan_merges_its_writes_on_both_sides_of_the_bound() {
 fn snapshot_and_db_scans_return_their_range_and_no_further() {
     let dir = TempDir::new().unwrap();
     let db = db_with_tombstones_after_a(&dir);
-    let mut stream = db
+    let rows = db
         .db()
         .snapshot()
-        .into_scan_stream(Some(b"a/"), Some(b"b/"));
-    assert_eq!(keys(&mut stream), a_keys());
-    stream.status().unwrap();
+        .into_scan_stream(Some(b"a/"), Some(b"b/"))
+        .collect::<regolith::Result<Vec<_>>>()
+        .unwrap();
+    assert_eq!(keys(rows), a_keys());
     assert_eq!(
         keys(db.db().scan(Some(b"a/"), Some(b"b/")).unwrap()),
         a_keys()

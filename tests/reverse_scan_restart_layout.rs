@@ -77,7 +77,7 @@ fn a_reverse_walk_is_the_forward_walk_backwards() {
     let forward: Vec<Vec<u8>> = db
         .scan_stream(None, None)
         .unwrap()
-        .map(|(k, _)| k)
+        .map(|entry| entry.unwrap().0)
         .collect();
     assert_eq!(forward.len() as u64, KEYS);
 

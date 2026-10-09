@@ -32,7 +32,7 @@ fn a_memory_database_scans_and_transacts() {
         .db()
         .scan_stream(Some(b"key:"), Some(b"key;"))
         .unwrap()
-        .map(|(key, _)| key)
+        .map(|entry| entry.unwrap().0)
         .collect();
     assert_eq!(scanned.len(), 64);
 }

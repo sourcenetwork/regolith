@@ -53,7 +53,8 @@ fn write_dense_keys(db: &Db, count: u64) {
 fn assert_single_sorted_run(db: &Db, expected: u64) {
     let mut seen: u64 = 0;
     let mut last: Option<Vec<u8>> = None;
-    for (key, _value) in db.scan_stream(None, None).unwrap() {
+    for entry in db.scan_stream(None, None).unwrap() {
+        let (key, _value) = entry.unwrap();
         if let Some(prev) = &last {
             assert!(
                 key.as_slice() > prev.as_slice(),

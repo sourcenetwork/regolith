@@ -1146,10 +1146,15 @@ impl Db {
     /// The scan is served from a snapshot pinned when it is created, so
     /// concurrent writes cannot shift the range underneath it.
     ///
+    /// Each item is a `Result`. A scan that fails part-way ends with one
+    /// `Err`, then `None`, so a failure is never read as the end of the
+    /// range.
+    ///
     /// ```no_run
     /// # use regolith::{Db, Options};
     /// # let db = Db::open("/tmp/scan_stream_doc", Options::default()).unwrap();
-    /// for (key, value) in db.scan_stream(Some(b"user:"), Some(b"user;"))? {
+    /// for entry in db.scan_stream(Some(b"user:"), Some(b"user;"))? {
+    ///     let (key, value) = entry?;
     ///     println!("{} is {} bytes", String::from_utf8_lossy(&key), value.len());
     /// }
     /// # Ok::<(), regolith::Error>(())
@@ -2252,11 +2257,19 @@ impl OwnedSnapshotIter {
 
 /// A lazy, bounded scan over a key range.
 ///
-/// Returned by [`Db::scan_stream`] and [`Snapshot::scan_stream`]. Holds
-/// one entry at a time rather than the range, so a caller that stops
-/// early pays only for what it read: the opposite of [`Db::scan`], which
-/// reads the whole range up front. The value is a [`DbSlice`], so no
-/// value bytes are copied.
+/// Returned by [`Db::scan_stream`], [`Snapshot::scan_stream`] and
+/// [`Snapshot::into_scan_stream`]. Holds one entry at a time rather than
+/// the range, so a caller that stops early pays only for what it read: the
+/// opposite of [`Db::scan`], which reads the whole range up front. The
+/// value is a [`DbSlice`], so no value bytes are copied.
+///
+/// Each item is a `Result`: a scan that fails in the middle of the range
+/// (a corrupt block, a failed read, a key the merge operator declines) ends
+/// with one `Err` item, so a failed scan is never read as a short one.
+/// After the `Err`, or after the end of the range, the stream returns
+/// `None`. The entries before the `Err` are a prefix of the range and the
+/// rest was never read; `collect::<Result<Vec<_>>>()` keeps the rows only
+/// when the whole range was read.
 ///
 /// The scan runs against a pinned snapshot, so writes that land while it
 /// is being drained are invisible to it and the range cannot shift
@@ -2269,41 +2282,19 @@ pub struct ScanStream {
     done: bool,
 }
 
-impl ScanStream {
-    /// Why the scan stopped.
-    ///
-    /// `Ok(())` means the range ended. An error means it did not: what the
-    /// stream yielded is a prefix of the range and the rest was never read.
-    ///
-    /// This matters because [`Iterator`] cannot carry a failure. A scan that
-    /// dies on a corrupt block ends exactly like one that reached the end of
-    /// its range, and a caller that only iterates cannot tell a short answer
-    /// from a complete one. Check this after iterating whenever a missing row
-    /// would be worse than an error.
-    ///
-    /// ```no_run
-    /// # use regolith::{Db, Options};
-    /// # let db = Db::open("/tmp/scan_status_doc", Options::default()).unwrap();
-    /// let mut scan = db.scan_stream(None, None)?;
-    /// let rows: Vec<_> = scan.by_ref().collect();
-    /// scan.status()?;  // the rows above are the whole range only if this is Ok
-    /// # Ok::<(), regolith::Error>(())
-    /// ```
-    pub fn status(&self) -> Result<()> {
-        self.entries.status()
-    }
-}
-
 impl Iterator for ScanStream {
-    type Item = (Vec<u8>, DbSlice);
+    type Item = Result<(Vec<u8>, DbSlice)>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.done {
             return None;
         }
-        // An error ends the scan here and is reported by `status`; the
-        // iterator form of this type has nowhere else to carry it.
-        let (key, value) = self.entries.next()?.ok()?;
+        // `Entries` hands a failure out once and is finished after it, so
+        // passing the item on is all it takes to keep that contract here.
+        let (key, value) = match self.entries.next()? {
+            Ok(entry) => entry,
+            Err(error) => return Some(Err(error)),
+        };
         if let Some(end) = &self.end
             && key.as_slice() >= end.as_slice()
         {
@@ -2312,7 +2303,7 @@ impl Iterator for ScanStream {
             self.done = true;
             return None;
         }
-        Some((key, value))
+        Some(Ok((key, value)))
     }
 }
 

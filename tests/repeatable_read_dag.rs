@@ -267,7 +267,7 @@ fn repeatable_read_appends_never_abort_under_reclamation() {
         .db()
         .scan_stream(Some(b"h/"), Some(b"h0"))
         .unwrap_or_else(|e| panic!("final head scan: {e}"))
-        .map(|(key, _)| parse_head(&key))
+        .map(|entry| parse_head(&entry.unwrap().0))
         .collect();
     remaining_heads.sort_unstable();
     assert_eq!(
@@ -279,7 +279,7 @@ fn repeatable_read_appends_never_abort_under_reclamation() {
         .db()
         .scan_stream(Some(b"m/"), Some(b"m0"))
         .unwrap_or_else(|e| panic!("final marker scan: {e}"))
-        .map(|(key, _)| parse_marker(&key).0)
+        .map(|entry| parse_marker(&entry.unwrap().0).0)
         .collect();
     for &tip in &remaining_heads {
         assert!(
