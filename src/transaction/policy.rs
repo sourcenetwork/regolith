@@ -98,7 +98,7 @@ pub enum KeyClass {
     ContentAddressed,
     /// The key belongs to a commit-ordered log: its head key, an entry key or
     /// a once key, as the log's [`crate::LogLayout`] and the `once_key` of
-    /// [`Transaction::append`] name them. Only `append` writes them.
+    /// [`crate::Transaction::append`] name them. Only `append` writes them.
     ///
     /// This class has an effect only for an optimistic transaction at
     /// [`IsolationLevel::DefraLevel`] with a [`KeyClassifier`] installed.
@@ -133,11 +133,16 @@ pub enum KeyClass {
 /// commit calls it while it holds the transaction and before it takes the
 /// write pipeline, at most once for the start of each scan stretch and at
 /// most once for each distinct key the transaction reads, puts or merges. A
-/// key it only deletes is not classified.
+/// key it only deletes is not classified there.
 ///
-/// A panic in `classify` fails the commit with
+/// Before commit, `put`, `delete` and `merge` call it once with the key they
+/// are given, to refuse a [`KeyClass::Log`] key, and `append` calls it for
+/// each key of the log it names.
+///
+/// A panic in `classify` during the commit fails the commit with
 /// [`Error::CallbackPanicked`](crate::Error::CallbackPanicked) and latches the
-/// database read-only until it is reopened.
+/// database read-only until it is reopened. A panic in one of the calls before
+/// the commit unwinds into that call and fails only it.
 pub trait KeyClassifier: Send + Sync {
     /// The class `key` belongs to.
     fn classify(&self, key: &[u8]) -> KeyClass;

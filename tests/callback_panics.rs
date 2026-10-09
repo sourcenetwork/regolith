@@ -52,8 +52,10 @@ fn a_panicking_classifier_fails_the_commit_and_latches_the_database() {
     let db = classified(dir.path());
     db.db().put(b"before", b"kept").unwrap();
 
+    // A write is classified when it is made, to refuse a log key, so the
+    // classifier meets `boom` at the commit through a read of it.
     let tx = begin(&db);
-    tx.put(b"boom", b"lost").unwrap();
+    assert_eq!(tx.get(b"boom").unwrap(), None);
     tx.put(b"beside", b"lost").unwrap();
     assert!(panicked("KeyClassifier", &tx.commit()));
 
@@ -82,6 +84,23 @@ fn a_panicking_classifier_fails_the_commit_and_latches_the_database() {
     assert_eq!(reopened.get(b"before").unwrap(), Some(b"kept".to_vec()));
     assert_eq!(reopened.get(b"boom").unwrap(), None);
     reopened.put(b"after", b"v").unwrap();
+}
+
+/// A write is classified when it is made, so a panic there is outside any
+/// commit: it unwinds into the call that ran the classifier and fails only
+/// that call.
+#[test]
+fn a_classifier_that_panics_in_a_write_unwinds_into_it_and_leaves_the_database_writable() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = classified(dir.path());
+    let tx = begin(&db);
+    assert!(catch_unwind(AssertUnwindSafe(|| tx.put(b"boom", b"v"))).is_err());
+    assert!(catch_unwind(AssertUnwindSafe(|| tx.delete(b"boom"))).is_err());
+    tx.put(b"fine", b"v").unwrap();
+    tx.commit().unwrap();
+    db.db().put(b"after", b"v").unwrap();
+    assert_eq!(db.db().get(b"fine").unwrap(), Some(b"v".to_vec()));
+    assert_eq!(db.db().get(b"boom").unwrap(), None);
 }
 
 #[test]

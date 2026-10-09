@@ -169,10 +169,10 @@ at `Serializable` holds one read-set entry per key it yields until the transacti
 resolves, and its commit checks each one while every writer waits; below it, a scan holds
 one entry per stretch of keys it walked.
 
-`DefraLevel` is `RepeatableRead` with three relaxations, which apply to optimistic
+`DefraLevel` is `RepeatableRead` with four relaxations, which apply to optimistic
 transactions only. A pessimistic transaction at this level validates as `RepeatableRead`.
 What the commit validates, by kind of key (the first is `RepeatableRead` itself, the other
-three are the relaxations):
+four are the relaxations):
 
 - An ordinary key: every point read of it is validated, whether it found a value or not,
   and a put or delete of it conflicts with any commit to the key since the transaction
@@ -196,6 +196,20 @@ three are the relaxations):
   caller's contract is that the key determines its bytes, as a content hash does; regolith
   cannot check it, and a transaction that writes other bytes under the key commits too, the
   last commit to land winning.
+- A key declared `KeyClass::Log`, with the same classifier: a read of it is never validated,
+  and a put, delete or merge of it is refused with `Error::LogKeyWrite`. Only
+  `Transaction::append` writes the keys of a commit-ordered log.
+
+`Transaction::append(&log, entry, once_key)` adds an entry to a commit-ordered log, whose
+keys a `LogLayout` names. At commit, in the ordered step after validation, the entry takes
+the log's next position, dense from 1, and the entry, its once key and the head key are
+written in the same atomic commit. Positions follow commit order, a transaction that
+aborts takes none, an append is never validated so it never conflicts (at every level, for
+both flavours), and an append whose once key already holds a position writes nothing.
+`Db::allocate(key, n)` reserves `n` values of a `u64` counter in the same ordered step. It
+is never a conflict, never waits on a write stall, and is logged before any commit that
+uses one of its values, so after a crash no value a surviving commit used is returned
+again. Values reserved by a transaction that aborts are skipped.
 
 A transaction reads its own puts, deletes and merges in the order it made them, and the
 commit applies them in that order: an operand applies to the put or delete before it, and a

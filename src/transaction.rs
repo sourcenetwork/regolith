@@ -518,12 +518,12 @@ pub enum IsolationLevel {
     /// Validate the entire read set, including every key a transactional
     /// scan yields.
     Serializable,
-    /// [`IsolationLevel::RepeatableRead`] with three relaxations, for
+    /// [`IsolationLevel::RepeatableRead`] with four relaxations, for
     /// optimistic transactions only. A pessimistic transaction at this
     /// level validates exactly as at `RepeatableRead`.
     ///
     /// What the commit validates, by kind of key (the first is
-    /// `RepeatableRead` itself, the other three are the relaxations):
+    /// `RepeatableRead` itself, the other four are the relaxations):
     ///
     /// - An ordinary key. Every point read of it is validated, whether it
     ///   found a value or not, and a put or delete of it conflicts with any
@@ -553,6 +553,10 @@ pub enum IsolationLevel {
     ///   it there. A read that found nothing is validated in full, so a
     ///   newer put conflicts. [`KeyClass::ContentAddressed`] states the
     ///   caller's contract.
+    /// - Log keys. With the same classifier, a read of a key it declares
+    ///   [`KeyClass::Log`] is never validated, and a put, delete or merge of
+    ///   one is refused with [`Error::LogKeyWrite`]. Only
+    ///   [`Transaction::append`] writes them.
     ///
     /// A transaction reads its own puts, deletes and merges in the order it
     /// made them, and the commit applies them in that order: an operand
@@ -1088,8 +1092,8 @@ impl Transaction {
     /// when it made one earlier, and a put or a delete made after the operand
     /// replaces the key outright, so the operand has no effect.
     pub fn merge(&self, key: &[u8], operand: &[u8]) -> TxResult<()> {
-        self.engine.require_merge_operator()?;
         self.refuse_log_key(key)?;
+        self.engine.require_merge_operator()?;
         let prefixed = prefix_key(DEFAULT_CF_ID, key);
         self.lock_key(&prefixed)?;
         self.writes.insert(prefixed, Write::Merge(operand.to_vec()));

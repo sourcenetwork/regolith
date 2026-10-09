@@ -329,10 +329,7 @@ fn a_transaction_does_not_see_its_own_appends() {
     );
     assert_eq!(tx.get(b"journal/00000000000000000002").unwrap(), None);
     assert_eq!(tx.get(b"once/k").unwrap(), None);
-    let scanned = tx
-        .scan_stream(Some(b"journal/"), Some(b"journal0"))
-        .map(|(key, _)| key)
-        .count();
+    let scanned = tx.scan_stream(Some(b"journal/"), Some(b"journal0")).count();
     assert_eq!(scanned, 1, "the scan finds the committed entry only");
     tx.commit().unwrap();
     assert_eq!(texts(&log_of(db.db(), "journal")), ["seed", "mine"]);
@@ -897,4 +894,61 @@ fn a_once_key_survives_a_reopen_and_still_appends_nothing() {
     let db = open_with(path, mem_options(&env, DurabilityMode::Eventual));
     assert_eq!(texts(&log_of(db.db(), "journal")), ["first"]);
     assert_eq!(once_of(db.db(), b"once/k"), Some(1));
+}
+
+// ── a panic in the layout ───────────────────────────────────────────────
+
+/// Builds its one probe key at the largest position and panics for any other.
+struct Panicky;
+
+impl LogLayout for Panicky {
+    fn head_key(&self) -> &[u8] {
+        b"journal-panicky"
+    }
+
+    fn entry_key(&self, position: u64, out: &mut Vec<u8>) {
+        assert_eq!(
+            position,
+            u64::MAX,
+            "the layout panics when a commit numbers"
+        );
+        out.extend_from_slice(b"journal/probe");
+    }
+
+    fn max_entry_key_len(&self) -> usize {
+        64
+    }
+}
+
+/// The layout is the caller's code, run in the ordered step: a panic there is
+/// caught, fails the commit with the trait named, and latches the database
+/// read-only until it is reopened. Nothing of the commit is applied.
+#[test]
+fn a_layout_that_panics_in_a_commit_latches_the_database_read_only() {
+    let dir = TempDir::new().unwrap();
+    {
+        let db = open(dir.path());
+        let log: Arc<dyn LogLayout> = Arc::new(Panicky);
+        let tx = db.begin(&TxnOptions::new());
+        tx.put(b"ok", b"v").unwrap();
+        tx.append(&log, b"x", None).unwrap();
+        let err = tx.commit().unwrap_err();
+        assert!(
+            matches!(
+                err,
+                TransactionError::Engine(Error::CallbackPanicked {
+                    callback: "LogLayout"
+                })
+            ),
+            "{err:?}"
+        );
+        assert_eq!(db.db().get(b"ok").unwrap(), None);
+        assert!(matches!(
+            db.db().put(b"later", b"v"),
+            Err(Error::CallbackPanicked { .. })
+        ));
+    }
+    let db = open(dir.path());
+    db.db().put(b"later", b"v").unwrap();
+    assert_eq!(db.db().get(b"ok").unwrap(), None);
 }
