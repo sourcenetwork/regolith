@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64};
 use proptest::prelude::*;
 
 use super::*;
+use crate::engine::range_tombstone::sort_dedup_tombstones;
 
 fn tomb(start: &[u8], end: &[u8], seq: u64) -> RangeTombstone {
     RangeTombstone::new(start.to_vec(), end.to_vec(), seq)

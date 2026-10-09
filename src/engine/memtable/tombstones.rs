@@ -36,7 +36,7 @@ use std::cmp::Ordering as CmpOrdering;
 use std::mem::{MaybeUninit, size_of};
 use std::ptr;
 
-use super::super::range_tombstone::{RangeTombstone, sort_dedup_tombstones};
+use super::super::range_tombstone::RangeTombstone;
 #[cfg(debug_assertions)]
 use crate::sync::internal::{AtomicBool, SingleWriterGuard};
 use crate::sync::internal::{AtomicPtr, AtomicUsize, Ordering, UnsafeCell};
@@ -316,12 +316,36 @@ impl TombstoneLog {
 
     /// Every published tombstone, sorted and deduplicated as the memtable
     /// has always listed them.
+    ///
+    /// The index is already in listing order, so only the tail past it is
+    /// sorted and merged in: `O(n + t log t)` for `t < REBUILD`, not a sort
+    /// of the whole log on every iterator built over the memtable.
     pub(crate) fn to_sorted_vec(&self) -> Vec<RangeTombstone> {
-        let mut all: Vec<RangeTombstone> = (0..self.len())
+        let mut indexed: Vec<RangeTombstone> = Vec::new();
+        let covered = self.scan_index(|index| {
+            indexed = index
+                .order
+                .iter()
+                .map(|&position| self.get(position as usize).clone())
+                .collect();
+        });
+        let mut tail: Vec<RangeTombstone> = (covered..self.len())
             .map(|position| self.get(position).clone())
             .collect();
-        sort_dedup_tombstones(&mut all);
-        all
+        tail.sort_by(listing_order);
+        let mut merged = Vec::with_capacity(indexed.len() + tail.len());
+        let (mut left, mut right) = (indexed.into_iter().peekable(), tail.into_iter().peekable());
+        loop {
+            let take_left = match (left.peek(), right.peek()) {
+                (Some(a), Some(b)) => listing_order(a, b) != CmpOrdering::Greater,
+                (Some(_), None) => true,
+                (None, Some(_)) => false,
+                (None, None) => break,
+            };
+            merged.extend(if take_left { left.next() } else { right.next() });
+        }
+        merged.dedup_by(|a, b| a.start == b.start && a.end == b.end && a.seq == b.seq);
+        merged
     }
 
     /// Run `walk` over the index when there is one; returns how many
