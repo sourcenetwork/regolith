@@ -8,7 +8,7 @@
 //!   `std::sync::Mutex`.
 //! - **Contended throughput**: N tasks take the same lock, bump a counter
 //!   and release it, for N = 2, 8 and 32; one element is one lock and
-//!   unlock. Three shapes:
+//!   unlock. Four shapes:
 //!   - `std_mutex`: one thread per task, blocking in `lock()`.
 //!   - `regolith_mutex_park`: one thread per task, driving its future
 //!     with an executor that parks the thread while the future is pending
@@ -17,15 +17,17 @@
 //!     wake flag (yielding after a short spin) instead of parking, as a
 //!     pinned-thread pool does when it keeps polling.
 //!   - `regolith_mutex_one_thread`: all N tasks on one thread, each
-//!     holding the lock across one suspension, so every lock is a queued
-//!     handoff and nothing leaves the thread. `std::sync::Mutex` has no
-//!     equivalent: held across a suspension on one thread it deadlocks.
+//!     holding the lock across one suspension, so every lock but the
+//!     first goes through the queue and nothing leaves the thread.
+//!     `std::sync::Mutex` has no equivalent: held across a suspension on
+//!     one thread it deadlocks.
 //!
-//! Strict FIFO handoff means a release hands the lock to a waiter that is
-//! not running yet, so under contention with parked waiters every
-//! acquisition costs a wake-up and a context switch; `std::sync::Mutex`
-//! lets the releasing thread take the lock straight back instead. The
-//! shapes above separate that cost from the primitive's own.
+//! The locks barge: a caller takes a free lock even while others wait,
+//! after a brief spin before it queues, and a release only wakes a waiter
+//! to compete again, so the releasing thread takes the lock straight back,
+//! as with `std::sync::Mutex`. A waiter passed over `MAX_BYPASS` times is
+//! handed the lock directly, which costs a context switch for that one
+//! acquisition.
 //!
 //! No async runtime is involved: the executors are the functions below.
 
