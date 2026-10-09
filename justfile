@@ -488,6 +488,7 @@ tla:
     check MC_WalRecovery_Red_CloseWithoutSync          RED RecoveryOpens
     check MC_WalRecovery_Red_NoTruncate                RED RecoveryOpens
     check MC_WalRecovery_Red_StampNotSealed            RED AckedSurvive
+    check MC_WalRecovery_Red_StampUnsynced             RED RecoveryOpens
     # 4.8, E5: compaction per snapshot stripe. Lean: Regolith/Stripes.lean,
     # reduce_reads.
     spec=StripeCompaction
