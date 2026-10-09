@@ -86,3 +86,6 @@ pub fn force_compaction(db: &Db) {
 /// [`fault`] for the full contract, including why a `kill -9` is not a
 /// power cut.
 pub mod fault;
+
+/// A merge operator over values of three counters, with `touches`.
+pub mod parted;
