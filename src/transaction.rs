@@ -1412,6 +1412,8 @@ impl Transaction {
         tracked.sort_by(|a, b| a.0.cmp(&b.0));
         tracked.dedup_by(|later, first| later.0 == first.0);
         let value_rule = self.projects();
+        // Part sets in use, so reads by one set share one allocation.
+        let mut pool: Vec<Arc<[u32]>> = Vec::new();
         let reads = tracked
             .into_iter()
             .filter(|(key, state)| {
@@ -1446,23 +1448,26 @@ impl Transaction {
                 } else {
                     ReadRule::Seq
                 };
-                let (rule, access) =
-                    match state.projection.as_deref().and_then(Projection::take_parts) {
-                        // A read by no parts decided on nothing in the value.
-                        Some(parts) if parts.is_empty() => return None,
-                        // A put or delete replaces every part, and what it
-                        // replaces was read by some: validated in whole.
-                        Some(_) if writes.contains_key(&key) => (full, Access::ReadParts),
-                        Some(parts) => (ReadRule::Parts(parts.into()), Access::ReadParts),
-                        None => (
-                            full,
-                            if for_update {
-                                Access::ReadForUpdate
-                            } else {
-                                Access::Read
-                            },
-                        ),
-                    };
+                // `None`: a key read in whole.
+                let parts = state.projection.as_deref().and_then(|projection| {
+                    projection.with_parts(|parts| parts.map(|parts| intern(&mut pool, parts)))
+                });
+                let (rule, access) = match parts {
+                    // A read by no parts decided on nothing in the value.
+                    Some(parts) if parts.is_empty() => return None,
+                    // A put or delete replaces every part, and what it
+                    // replaces was read by some: validated in whole.
+                    Some(_) if writes.contains_key(&key) => (full, Access::ReadParts),
+                    Some(parts) => (ReadRule::Parts(parts), Access::ReadParts),
+                    None => (
+                        full,
+                        if for_update {
+                            Access::ReadForUpdate
+                        } else {
+                            Access::Read
+                        },
+                    ),
+                };
                 Some(ConflictKey {
                     key,
                     observed_seq: state.first_read_seq,
@@ -1655,6 +1660,16 @@ impl Transaction {
         }
         self.engine.release_snapshot(self.snapshot_seq);
     }
+}
+
+/// The shared copy of `parts` in `pool`, adding it if it is new.
+fn intern(pool: &mut Vec<Arc<[u32]>>, parts: &[u32]) -> Arc<[u32]> {
+    if let Some(shared) = pool.iter().find(|shared| shared.as_ref() == parts) {
+        return Arc::clone(shared);
+    }
+    let shared: Arc<[u32]> = Arc::from(parts);
+    pool.push(Arc::clone(&shared));
+    shared
 }
 
 /// Empty a queue into a `Vec`, preserving push order.

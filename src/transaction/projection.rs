@@ -18,24 +18,66 @@ use super::{
     TxMode, TxResult, prefix_key, read_error,
 };
 
+/// The part ids that fit beside the cell without a second allocation; a read
+/// by more parts than this moves them to the heap.
+const INLINE: usize = 8;
+
+/// A sorted set of part ids.
+enum PartSet {
+    Inline { len: u8, ids: [u32; INLINE] },
+    Heap(Vec<u32>),
+}
+
+impl PartSet {
+    fn as_slice(&self) -> &[u32] {
+        match self {
+            Self::Inline { len, ids } => &ids[..usize::from(*len)],
+            Self::Heap(ids) => ids,
+        }
+    }
+
+    fn insert(&mut self, part: u32) {
+        let Err(at) = self.as_slice().binary_search(&part) else {
+            return;
+        };
+        match self {
+            Self::Inline { len, ids } if usize::from(*len) < INLINE => {
+                let n = usize::from(*len);
+                ids.copy_within(at..n, at + 1);
+                ids[at] = part;
+                *len += 1;
+            }
+            Self::Inline { .. } => {
+                let mut heap = self.as_slice().to_vec();
+                heap.insert(at, part);
+                *self = Self::Heap(heap);
+            }
+            Self::Heap(ids) => ids.insert(at, part),
+        }
+    }
+}
+
 /// The parts one key was read by.
 pub(super) struct Projection {
     /// A read of the whole value has happened, which no set of parts
     /// narrows again.
     full: AtomicBool,
-    /// The parts read, sorted and without repeats. Meaningless once `full`.
+    /// The parts read. Meaningless once `full`.
     //
     // vertexia: a mutex, taken only by `get_parts` and the commit, on a set a
     // handful of ids long; a lock-free append list if one projected key is
     // ever read from many threads at once.
-    parts: Mutex<Vec<u32>>,
+    parts: Mutex<PartSet>,
 }
 
 impl Projection {
     pub(super) fn new(parts: &[u32]) -> Self {
         let projection = Self {
             full: AtomicBool::new(false),
-            parts: Mutex::new(Vec::with_capacity(parts.len())),
+            parts: Mutex::new(PartSet::Inline {
+                len: 0,
+                ids: [0; INLINE],
+            }),
         };
         projection.widen(parts);
         projection
@@ -44,11 +86,7 @@ impl Projection {
     /// Add `parts` to the set.
     pub(super) fn widen(&self, parts: &[u32]) {
         let mut held = self.parts.lock();
-        for part in parts {
-            if let Err(at) = held.binary_search(part) {
-                held.insert(at, *part);
-            }
-        }
+        parts.iter().for_each(|part| held.insert(*part));
     }
 
     /// The key was read in whole.
@@ -56,13 +94,13 @@ impl Projection {
         self.full.store(true, Ordering::Release);
     }
 
-    /// The sorted parts, or `None` when the key was read in whole. Empties the
-    /// set: the commit asks once, as it drains the transaction's reads.
-    pub(super) fn take_parts(&self) -> Option<Vec<u32>> {
+    /// Run `f` on the sorted parts, or on `None` when the key was read in
+    /// whole.
+    pub(super) fn with_parts<R>(&self, f: impl FnOnce(Option<&[u32]>) -> R) -> R {
         if self.full.load(Ordering::Acquire) {
-            None
+            f(None)
         } else {
-            Some(std::mem::take(&mut *self.parts.lock()))
+            f(Some(self.parts.lock().as_slice()))
         }
     }
 }
@@ -140,5 +178,40 @@ impl Transaction {
             projection.widen(parts);
         }
         self.read_noting(&state, prefixed, self.snapshot_seq)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parts(projection: &Projection) -> Option<Vec<u32>> {
+        projection.with_parts(|parts| parts.map(<[u32]>::to_vec))
+    }
+
+    #[test]
+    fn the_set_is_sorted_without_repeats_and_spills_past_the_inline_ids() {
+        let projection = Projection::new(&[5, 1, 5]);
+        assert_eq!(parts(&projection), Some(vec![1, 5]));
+        projection.widen(&[3, 1]);
+        assert_eq!(parts(&projection), Some(vec![1, 3, 5]));
+        let many: Vec<u32> = (0..20).rev().collect();
+        projection.widen(&many);
+        assert_eq!(parts(&projection), Some((0..20).collect::<Vec<_>>()));
+        projection.widen(&[7, 99]);
+        assert_eq!(parts(&projection).unwrap().len(), 21);
+    }
+
+    #[test]
+    fn a_whole_read_ends_the_set() {
+        let projection = Projection::new(&[1]);
+        projection.widen_to_full();
+        projection.widen(&[2]);
+        assert_eq!(parts(&projection), None);
+    }
+
+    #[test]
+    fn no_parts_is_an_empty_set_not_a_whole_read() {
+        assert_eq!(parts(&Projection::new(&[])), Some(Vec::new()));
     }
 }

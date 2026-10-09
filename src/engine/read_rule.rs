@@ -5,6 +5,8 @@
 //! version is newer than the read. A key nothing touched since the read costs
 //! the one lookup of its newest version whatever the rule.
 
+use std::sync::Arc;
+
 /// The rule that decides whether a newer version of a key makes a read stale.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ReadRule {
@@ -20,5 +22,5 @@ pub(crate) enum ReadRule {
     /// an operand the merge operator says touches one of these parts (sorted,
     /// never empty). A read that found nothing is judged by `Value`, since
     /// existence is part of every decision on parts.
-    Parts(Box<[u32]>),
+    Parts(Arc<[u32]>),
 }

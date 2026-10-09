@@ -470,7 +470,7 @@ mod tests {
     fn a_key_merged_inside_a_parts_scan_is_validated_over_its_parts() {
         let runs = [run_by(b"a", Some(b"z"), false, Some(&[2, 5]))];
         let rules = added_rules(&runs, &[], &[b"m"]);
-        assert_eq!(rules[&b"m".to_vec()], ReadRule::Parts(Box::from([2, 5])));
+        assert_eq!(rules[&b"m".to_vec()], ReadRule::Parts(Arc::from([2, 5])));
     }
 
     #[test]
@@ -482,7 +482,7 @@ mod tests {
             ReadRule::Value,
             "a put replaces every part"
         );
-        assert_eq!(rules[&b"n".to_vec()], ReadRule::Parts(Box::from([2])));
+        assert_eq!(rules[&b"n".to_vec()], ReadRule::Parts(Arc::from([2])));
     }
 
     #[test]
@@ -493,8 +493,8 @@ mod tests {
             run(b"p", Some(b"z"), false),
         ];
         let rules = added_rules(&runs, &[], &[b"c", b"g", b"q"]);
-        assert_eq!(rules[&b"c".to_vec()], ReadRule::Parts(Box::from([3])));
-        assert_eq!(rules[&b"g".to_vec()], ReadRule::Parts(Box::from([1, 3])));
+        assert_eq!(rules[&b"c".to_vec()], ReadRule::Parts(Arc::from([3])));
+        assert_eq!(rules[&b"g".to_vec()], ReadRule::Parts(Arc::from([1, 3])));
         assert_eq!(
             rules[&b"q".to_vec()],
             ReadRule::Value,
@@ -525,7 +525,7 @@ mod tests {
     #[test]
     fn a_projected_read_of_a_merged_key_widens_to_what_a_scan_used() {
         let merges = vec![(b"m".to_vec(), b"op".to_vec())];
-        let projected = || vec![read(b"m", 4, ReadRule::Parts(Box::from([1])))];
+        let projected = || vec![read(b"m", 4, ReadRule::Parts(Arc::from([1])))];
 
         let mut reads = projected();
         let runs = [run(b"a", Some(b"z"), false)];
@@ -553,7 +553,7 @@ mod tests {
             4,
             &ReadRule::Value,
         );
-        assert_eq!(reads[0].rule, ReadRule::Parts(Box::from([1, 2])));
+        assert_eq!(reads[0].rule, ReadRule::Parts(Arc::from([1, 2])));
 
         let mut reads = projected();
         cover(
@@ -566,7 +566,7 @@ mod tests {
         );
         assert_eq!(
             reads[0].rule,
-            ReadRule::Parts(Box::from([1])),
+            ReadRule::Parts(Arc::from([1])),
             "a key the transaction does not merge into is not widened"
         );
     }
