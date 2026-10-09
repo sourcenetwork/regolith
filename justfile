@@ -282,7 +282,13 @@ loom-debug:
 loom-sync:
     RUSTFLAGS="--cfg loom" cargo test --release --test loom_sync
 
-loom-all: loom loom-debug loom-sync
+# Loom models for the snapshot registry's per-thread slots: the slot and
+# thread-number claims, a moved pin's release, announce-sample-confirm and
+# the drain wake, with four calibrations that must fail. Release only.
+loom-snapshots:
+    RUSTFLAGS="--cfg loom" cargo test --release --test loom_snapshots
+
+loom-all: loom loom-debug loom-sync loom-snapshots
 
 # The read-view chaos workload at full size: 6 instances x 2 rounds x 400
 # versions. Measured at over 20 minutes wall and 4h of CPU unoptimized,
@@ -505,12 +511,24 @@ tla:
     check MC_TombstoneRetirement_Green_Retires         RED NothingRetired
     check MC_TombstoneRetirement_Red_IgnoreSnapshots   RED SnapshotReadsKept
     check MC_TombstoneRetirement_Red_IgnoreDeeper      RED SnapshotReadsKept
-    # 4.6: the lock-free snapshot registry. Lean:
-    # Regolith/SnapshotRegistry.lean, scan_respects_live.
+    # 4.6, D54: the snapshot registry on per-thread slots with counted
+    # entries, moved handles, copies and shared slots. Lean:
+    # Regolith/SnapshotRegistry.lean, scan_respects_live,
+    # clone_respects_live, pins_exact.
     spec=SnapshotRegistry
     check MC_SnapshotRegistry_Green                    GREEN
     check MC_SnapshotRegistry_Red_NoConfirm            RED MinBelowLive
     check MC_SnapshotRegistry_Red_ScanThenSample       RED MinBelowLive
+    check MC_SnapshotRegistry_Red_ReleaseHere          RED LiveCovered
+    check MC_SnapshotRegistry_Red_CloneFresh           RED LiveCovered
+    check MC_SnapshotRegistry_Red_PlainClaim           RED MinBelowLive
+    check MC_SnapshotRegistry_Red_JoinNoRecheck        RED LiveEntryExact
+    # 4.6, D54: per-thread statistics shards. Lean: Regolith/ShardedStats.lean,
+    # total_after_adds, read_between, reads_monotone.
+    spec=ShardedStats
+    check MC_ShardedStats_Green                        GREEN
+    check MC_ShardedStats_Red_LostUpdate               RED QuiescentExact
+    check MC_ShardedStats_Red_PartialRead              RED ReadBetween
     # E10, group commit. Lean: Regolith/GroupCommit.lean, group_eq_serial.
     spec=GroupCommit
     check MC_GroupCommit_Green                         GREEN

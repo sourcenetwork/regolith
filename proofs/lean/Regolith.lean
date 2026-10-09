@@ -24,10 +24,15 @@ import Regolith.Allocate
 -- partial_merge, changes no read at a live snapshot or at the head. Backs
 -- `proofs/tla/StripeCompaction.tla`.
 import Regolith.Stripes
--- 4.6: lock-free registration (announce, sample, confirm) keeps the
--- compaction's minimum at or below every live snapshot. Backs
--- `proofs/tla/SnapshotRegistry.tla`.
+-- 4.6: per-thread slots with counted entries (announce, sample, confirm;
+-- copies join, releases go where the pin was recorded) keep the
+-- compaction's minimum at or below every live snapshot and every count
+-- exact. Backs `proofs/tla/SnapshotRegistry.tla`.
 import Regolith.SnapshotRegistry
+-- 4.6: per-thread statistics shards sum to every increment, and a read
+-- concurrent with adds is bounded and never goes backwards. Backs
+-- `proofs/tla/ShardedStats.tla`.
+import Regolith.ShardedStats
 -- WalRecovery.lean also holds format 2 replay (4.2), backing
 -- `proofs/tla/WalRecovery.tla`; LsmOrder.lean also holds flush order,
 -- ingest placement, overlap demotion (E14) and binary search.

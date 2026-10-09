@@ -69,6 +69,7 @@ mod event_listener;
 mod iter;
 mod log_layout;
 mod options;
+mod per_thread;
 mod perf_context;
 mod portability;
 mod rate_limiter;
@@ -145,7 +146,7 @@ pub mod loom_exports {
     //! check, and this module is the seam that lets the test target call
     //! them. It does not exist in an ordinary build.
 
-    pub use crate::engine::loom_model::{arena, handoff, skiplist, slice, version};
+    pub use crate::engine::loom_model::{arena, handoff, skiplist, slice, snapshots, version};
 }
 
 #[cfg(feature = "fuzzing")]
@@ -1129,11 +1130,12 @@ impl Db {
     /// returned `Snapshot` releases the pin and may allow subsequent
     /// compactions to reclaim more space.
     pub fn snapshot(&self) -> Snapshot {
-        let seq = self.engine.register_snapshot_at_horizon();
+        let (seq, pin) = self.engine.register_snapshot_at_horizon();
         Snapshot {
             engine: Arc::clone(&self.engine),
             cfs: Arc::clone(&self.cfs),
             seq,
+            pin,
         }
     }
 
@@ -2478,6 +2480,9 @@ pub struct Snapshot {
     engine: Arc<RegolithEngine>,
     cfs: Arc<CfRegistry>,
     seq: u64,
+    /// Where `seq` is pinned in the engine's snapshot registry. The drop
+    /// releases exactly there, whichever thread it runs on.
+    pin: engine::SnapshotPin,
 }
 
 impl Drop for Snapshot {
@@ -2487,7 +2492,7 @@ impl Drop for Snapshot {
         // version it was keeping alive for this snapshot's sake,
         // subject to other live snapshots that may still pin older
         // seqs.
-        self.engine.release_snapshot(self.seq);
+        self.engine.release_snapshot(self.pin.take());
     }
 }
 
@@ -2501,11 +2506,11 @@ impl std::fmt::Debug for Snapshot {
 
 impl Snapshot {
     fn clone_pin(&self) -> Self {
-        self.engine.register_snapshot(self.seq);
         Self {
             engine: Arc::clone(&self.engine),
             cfs: Arc::clone(&self.cfs),
             seq: self.seq,
+            pin: self.engine.clone_snapshot_pin(&self.pin),
         }
     }
 
