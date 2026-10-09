@@ -248,7 +248,7 @@ fn batch_op_wal_bytes(op: &WriteBatchOp) -> u64 {
 }
 
 fn memtable_needs_flush(memtable: &MemTable) -> bool {
-    !memtable.is_empty() || !memtable.clone_range_tombstones().is_empty()
+    !memtable.is_empty() || memtable.has_range_tombstones()
 }
 
 /// Apply one batch op to `memtable`, threading `hint` through the point
@@ -2757,7 +2757,7 @@ impl RegolithEngine {
         //    overlaps the range is materialized in L0. We only touch
         //    the write lock if there's actually data to flush. "Data"
         //    here includes range tombstones, not just point entries.
-        let needs_flush = |mt: &MemTable| !mt.is_empty() || !mt.clone_range_tombstones().is_empty();
+        let needs_flush = |mt: &MemTable| !mt.is_empty() || mt.has_range_tombstones();
         if needs_flush(&self.view.load().active) {
             let _write_guard = self.pipeline.lock();
             if needs_flush(&self.view.load().active) {
@@ -3120,7 +3120,7 @@ impl RegolithEngine {
     #[cfg(test)]
     pub(crate) fn active_memtable_is_empty(&self) -> bool {
         let view = self.view.load();
-        view.active.is_empty() && view.active.clone_range_tombstones().is_empty()
+        view.active.is_empty() && !view.active.has_range_tombstones()
     }
 
     /// Test-only: number of SSTable files at `level` in the current
@@ -3270,17 +3270,13 @@ impl RegolithEngine {
     #[cfg(test)]
     pub(crate) fn memtables_hold_no_data(&self) -> bool {
         let view = self.view.load();
-        view.frozen.is_empty()
-            && view.active.is_empty()
-            && view.active.clone_range_tombstones().is_empty()
+        view.frozen.is_empty() && view.active.is_empty() && !view.active.has_range_tombstones()
     }
 
     fn drain_memtables(&self, active: ActiveFlush) -> std::io::Result<()> {
         let active_pending = |view: &ReadView| match active {
             ActiveFlush::WhenFull => memtable_needs_flush(&view.active),
-            ActiveFlush::Always => {
-                !view.active.is_empty() || !view.active.clone_range_tombstones().is_empty()
-            }
+            ActiveFlush::Always => !view.active.is_empty() || view.active.has_range_tombstones(),
         };
 
         // The set to drain is fixed here and never extended. A drain that
