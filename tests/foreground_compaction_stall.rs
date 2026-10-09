@@ -11,6 +11,7 @@
 use regolith::{
     CompactionOutcome, CompactionStyle, Db, Env, Error, FifoCompactionOptions, IsolationLevel,
     MergeOperator, OptimisticTransactionDb, Options, Transaction, TransactionDb, TransactionError,
+    TxnOptions,
 };
 use std::sync::mpsc;
 use std::time::Duration;
@@ -579,10 +580,10 @@ fn a_second_handle_is_refused_even_without_a_cross_process_lock() {
 /// With the plain writer already parked at the FIFO stop trigger, a commit
 /// that writes must observe the same stall the plain write did, and a commit
 /// that writes nothing must not wait at all.
-fn probe_transactional_stall<'a>(
+fn probe_transactional_stall(
     plain: &Db,
     label: &str,
-    begin: impl Fn(IsolationLevel) -> Transaction<'a>,
+    begin: impl Fn(IsolationLevel) -> Transaction,
 ) {
     let reason = first_stall_reason(plain, label);
     assert!(
@@ -627,7 +628,9 @@ fn optimistic_commit_observes_the_stop_trigger_like_a_plain_write() {
     with_deadline("optimistic_txn_stall", 180, || {
         let dir = tempfile::tempdir().unwrap();
         let db = OptimisticTransactionDb::open(dir.path(), fifo_opts(0)).unwrap();
-        probe_transactional_stall(db.db(), "optimistic", |iso| db.begin_transaction_with(iso));
+        probe_transactional_stall(db.db(), "optimistic", |iso| {
+            db.begin(&TxnOptions::new().isolation(iso))
+        });
         db.db().close().unwrap();
     });
 }
@@ -637,7 +640,9 @@ fn pessimistic_commit_observes_the_stop_trigger_like_a_plain_write() {
     with_deadline("pessimistic_txn_stall", 180, || {
         let dir = tempfile::tempdir().unwrap();
         let db = TransactionDb::open(dir.path(), fifo_opts(0)).unwrap();
-        probe_transactional_stall(db.db(), "pessimistic", |iso| db.begin_transaction_with(iso));
+        probe_transactional_stall(db.db(), "pessimistic", |iso| {
+            db.begin(&TxnOptions::new().isolation(iso))
+        });
         db.db().close().unwrap();
     });
 }
@@ -648,10 +653,10 @@ fn pessimistic_commit_observes_the_stop_trigger_like_a_plain_write() {
 /// sizes were checked after the write-stall wait, a commit that could never
 /// pass validation got stalled first, and its size error came back looking
 /// like a transient "engine busy" instead.
-fn probe_oversized_commit_under_a_stop<'a>(
+fn probe_oversized_commit_under_a_stop(
     plain: &Db,
     label: &str,
-    begin: impl FnOnce() -> Transaction<'a>,
+    begin: impl FnOnce() -> Transaction,
 ) {
     // Park the plain writer at the stop before touching the size limit, so
     // a broken admission order would see the stall ahead of the size check.
@@ -687,7 +692,7 @@ fn optimistic_commit_of_an_oversized_value_reports_the_size_error_not_a_stall() 
     with_deadline("optimistic_oversized_commit", 180, || {
         let dir = tempfile::tempdir().unwrap();
         let db = OptimisticTransactionDb::open(dir.path(), fifo_opts(0)).unwrap();
-        probe_oversized_commit_under_a_stop(db.db(), "optimistic", || db.begin_transaction());
+        probe_oversized_commit_under_a_stop(db.db(), "optimistic", || db.begin(&TxnOptions::new()));
         db.db().close().unwrap();
     });
 }
@@ -697,7 +702,9 @@ fn pessimistic_commit_of_an_oversized_value_reports_the_size_error_not_a_stall()
     with_deadline("pessimistic_oversized_commit", 180, || {
         let dir = tempfile::tempdir().unwrap();
         let db = TransactionDb::open(dir.path(), fifo_opts(0)).unwrap();
-        probe_oversized_commit_under_a_stop(db.db(), "pessimistic", || db.begin_transaction());
+        probe_oversized_commit_under_a_stop(db.db(), "pessimistic", || {
+            db.begin(&TxnOptions::new())
+        });
         db.db().close().unwrap();
     });
 }
@@ -736,10 +743,10 @@ fn fifo_merge_opts(workers: usize) -> Options {
 /// checked `writes` and `range_deletes` but dropped the `merges` arm, which
 /// would let a merge-only commit skip admission and land straight through
 /// an L0 stop.
-fn probe_merge_only_commit_under_a_stop<'a>(
+fn probe_merge_only_commit_under_a_stop(
     plain: &Db,
     label: &str,
-    begin: impl FnOnce() -> Transaction<'a>,
+    begin: impl FnOnce() -> Transaction,
 ) {
     let reason = first_stall_reason(plain, label);
 
@@ -765,7 +772,9 @@ fn optimistic_merge_only_commit_observes_the_stop_trigger_like_a_plain_write() {
     with_deadline("optimistic_merge_stall", 180, || {
         let dir = tempfile::tempdir().unwrap();
         let db = OptimisticTransactionDb::open(dir.path(), fifo_merge_opts(0)).unwrap();
-        probe_merge_only_commit_under_a_stop(db.db(), "optimistic", || db.begin_transaction());
+        probe_merge_only_commit_under_a_stop(db.db(), "optimistic", || {
+            db.begin(&TxnOptions::new())
+        });
         db.db().close().unwrap();
     });
 }
@@ -775,7 +784,9 @@ fn pessimistic_merge_only_commit_observes_the_stop_trigger_like_a_plain_write() 
     with_deadline("pessimistic_merge_stall", 180, || {
         let dir = tempfile::tempdir().unwrap();
         let db = TransactionDb::open(dir.path(), fifo_merge_opts(0)).unwrap();
-        probe_merge_only_commit_under_a_stop(db.db(), "pessimistic", || db.begin_transaction());
+        probe_merge_only_commit_under_a_stop(db.db(), "pessimistic", || {
+            db.begin(&TxnOptions::new())
+        });
         db.db().close().unwrap();
     });
 }

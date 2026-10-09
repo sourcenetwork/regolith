@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::thread;
 
-use regolith::{Db, OptimisticTransactionDb, Options, WriteBatch};
+use regolith::{Db, OptimisticTransactionDb, Options, TxnOptions, WriteBatch};
 use tempfile::TempDir;
 
 fn active_bytes(db: &Db) -> u64 {
@@ -375,7 +375,7 @@ fn optimistic_transactions_do_not_lose_conflicts_under_group_commit() {
         let conflicts = Arc::clone(&conflicts);
         handles.push(thread::spawn(move || {
             for _ in 0..200 {
-                let txn = tdb.begin_transaction();
+                let txn = tdb.begin(&TxnOptions::new());
                 let current: u64 = txn
                     .get_for_update(b"counter")
                     .unwrap()

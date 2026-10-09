@@ -13,7 +13,7 @@ use tempfile::TempDir;
 /// oracle the proptest below checks the new code against; nothing here
 /// is meant to be idiomatic, only faithful to what shipped before.
 fn oracle(
-    tx: &Transaction<'_>,
+    tx: &Transaction,
     tracked: Vec<(Vec<u8>, Arc<KeyState>)>,
     writes: &BTreeMap<Vec<u8>, Option<Vec<u8>>>,
     merges: &[(Vec<u8>, Vec<u8>)],
@@ -90,10 +90,10 @@ enum AnyDb {
 }
 
 impl AnyDb {
-    fn begin(&self, isolation: IsolationLevel) -> Transaction<'_> {
+    fn begin(&self, isolation: IsolationLevel) -> Transaction {
         match self {
-            AnyDb::Optimistic(db) => db.begin_transaction_with(isolation),
-            AnyDb::Pessimistic(db) => db.begin_transaction_with(isolation),
+            AnyDb::Optimistic(db) => db.begin(&TxnOptions::new().isolation(isolation)),
+            AnyDb::Pessimistic(db) => db.begin(&TxnOptions::new().isolation(isolation)),
         }
     }
 
@@ -204,7 +204,7 @@ proptest! {
 fn duplicate_tracked_cells_are_deduped_keeping_the_newest() {
     let dir = TempDir::new().expect("tempdir");
     let db = OptimisticTransactionDb::open(dir.path(), Options::default()).expect("open");
-    let tx = db.begin_transaction_with(IsolationLevel::SnapshotIsolation);
+    let tx = db.begin(&TxnOptions::new().isolation(IsolationLevel::SnapshotIsolation));
     let seq = tx.snapshot_seq;
 
     // Case 1: catches a dedupe that keeps the wrong (older) cell. Newest
@@ -253,7 +253,7 @@ fn open_any(flavor: u8, dir: &TempDir) -> AnyDb {
 /// operands alone are not one: with no merge operator configured, which is
 /// the case throughout this file, a scan neither yields them nor skips the
 /// snapshot entry beneath them.
-fn replacement(tx: &Transaction<'_>, prefixed: &[u8]) -> Option<Write> {
+fn replacement(tx: &Transaction, prefixed: &[u8]) -> Option<Write> {
     let mut found = None;
     tx.writes.walk_chain(prefixed, |write| {
         found = write.is_terminator().then(|| write.clone());
@@ -274,7 +274,7 @@ fn replacement(tx: &Transaction<'_>, prefixed: &[u8]) -> Option<Write> {
 /// every other snapshot key extends the stretch, and the walk stops once
 /// `take` entries were yielded. Called before the scan runs.
 fn expected_cover(
-    tx: &Transaction<'_>,
+    tx: &Transaction,
     seeded: u8,
     start: u8,
     end: u8,
@@ -399,7 +399,7 @@ proptest! {
             }
         }
 
-        let settle = |tx: &mut Transaction<'_>| {
+        let settle = |tx: &mut Transaction| {
             let (writes, merges) = write_buffer::settle(tx.writes.drain());
             let tracked = tx.tracked.drain();
             let mut checks = tx.validation_set(tracked, &writes, &merges);

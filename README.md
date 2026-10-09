@@ -132,11 +132,11 @@ transaction's footprint is validated at commit, so a stricter level refuses more
 commits fewer.
 
 ```rust
-use regolith::{IsolationLevel, OptimisticTransactionDb, Options};
+use regolith::{IsolationLevel, OptimisticTransactionDb, Options, TxnOptions};
 
 let db = OptimisticTransactionDb::open("/tmp/txn_db", Options::default())?;
 
-let mut txn = db.begin_transaction_with(IsolationLevel::Serializable);
+let mut txn = db.begin(&TxnOptions::new().isolation(IsolationLevel::Serializable));
 let balance = txn.get(b"account")?.unwrap_or_default();
 txn.put(b"account", b"debited")?;
 txn.commit()?;
@@ -225,15 +225,13 @@ those are the points where the buffer stops changing.
 
 ```rust
 use std::sync::Arc;
-use regolith::{IsolationLevel, OptimisticTransactionDb, Options};
+use regolith::{IsolationLevel, OptimisticTransactionDb, Options, TxnOptions};
 
-let db = Arc::new(OptimisticTransactionDb::open("/tmp/shared_db", Options::default())?);
+let db = OptimisticTransactionDb::open("/tmp/shared_db", Options::default())?;
 
-// `begin_transaction` borrows the database, so the transaction cannot outlive it or be
-// stored in a `'static` container. `begin_transaction_owned` returns an
-// `OwnedTransaction`, which carries an `Arc` on the database instead and can be boxed,
-// shared, and moved freely.
-let txn = Arc::new(db.begin_transaction_owned(IsolationLevel::Serializable));
+// A `Transaction` has no lifetime and borrows nothing from the database, so it can be
+// boxed, shared, and moved freely, and it outlives the handle that began it.
+let txn = Arc::new(db.begin(&TxnOptions::new().isolation(IsolationLevel::Serializable)));
 
 std::thread::scope(|scope| {
     for thread in 0..4 {

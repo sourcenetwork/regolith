@@ -239,7 +239,7 @@ fn blind_merge_rounds(level: IsolationLevel, storage: Storage, rounds: &[Round])
         |r, force| {
             for (round, plan) in rounds.iter().enumerate() {
                 lockstep.wait(); // the previous round is settled
-                let tx = db.begin(level);
+                let tx = db.begin_at(level);
                 if matches!(plan.shape, Shape::ReadsFirst) {
                     tx.get(COUNTER).unwrap();
                 }
@@ -293,7 +293,7 @@ fn blind_merge_rounds(level: IsolationLevel, storage: Storage, rounds: &[Round])
                             format!("{case} round {round} reader {r}: conflict on {key:?}")
                         });
                         commit_with_retry("increment", || {
-                            let tx = db.begin(level);
+                            let tx = db.begin_at(level);
                             tx.merge(COUNTER, &1i64.to_le_bytes())?;
                             tx.commit()
                         })

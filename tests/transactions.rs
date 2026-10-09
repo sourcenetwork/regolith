@@ -14,7 +14,9 @@
 
 use std::time::Duration;
 
-use regolith::{OptimisticTransactionDb, Options, TransactionDb, TransactionError, TxResult};
+use regolith::{
+    OptimisticTransactionDb, Options, TransactionDb, TransactionError, TxResult, TxnOptions,
+};
 use tempfile::TempDir;
 
 const THREADS: u64 = 8;
@@ -54,14 +56,14 @@ where
 }
 
 fn pessimistic_increment(db: &TransactionDb, key: &[u8]) -> TxResult<()> {
-    let tx = db.begin_transaction();
+    let tx = db.begin(&TxnOptions::new());
     let current = decode(tx.get_for_update(key)?);
     tx.put(key, &(current + 1).to_le_bytes())?;
     tx.commit()
 }
 
 fn optimistic_increment(db: &OptimisticTransactionDb, key: &[u8]) -> TxResult<()> {
-    let tx = db.begin_transaction();
+    let tx = db.begin(&TxnOptions::new());
     let current = decode(tx.get_for_update(key)?);
     tx.put(key, &(current + 1).to_le_bytes())?;
     tx.commit()

@@ -12,7 +12,7 @@
 
 use std::io::{Read, Seek, SeekFrom, Write};
 
-use regolith::{Db, Options, WriteBatch};
+use regolith::{Db, Options, TxnOptions, WriteBatch};
 
 fn small_options() -> Options {
     Options {
@@ -146,7 +146,7 @@ fn a_transaction_scan_cut_short_says_so_too() {
         tdb.db().put(format!("k{i:02}").as_bytes(), b"v").unwrap();
     }
 
-    let txn = tdb.begin_transaction();
+    let txn = tdb.begin(&TxnOptions::new());
     txn.put(b"zzz", b"buffered").unwrap();
 
     let mut scan = txn.scan_stream(None, None);

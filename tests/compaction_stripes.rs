@@ -20,7 +20,7 @@ use proptest::prelude::*;
 use regolith::{
     CompactionDecision, CompactionFilter, CompactionOutcome, CompactionStyle, CompressionType, Db,
     DbWithTtl, Env, IsolationLevel, MemEnv, MergeOperator, OptimisticTransactionDb, Options,
-    Snapshot, TransactionError, TxResult,
+    Snapshot, TransactionError, TxResult, TxnOptions,
 };
 
 /// Sums big-endian `i64` deltas. `fold` is whether two deltas fold into one
@@ -634,7 +634,7 @@ fn a_blind_merge_commits_after_the_operands_beside_it_were_compacted() {
         let db = OptimisticTransactionDb::open(dir.path(), counter_options(fold)).unwrap();
         db.db().put(b"counter", &0i64.to_be_bytes()).unwrap();
 
-        let tx = db.begin_transaction_with(IsolationLevel::DefraLevel);
+        let tx = db.begin(&TxnOptions::new().isolation(IsolationLevel::DefraLevel));
         tx.merge(b"counter", &1i64.to_be_bytes()).unwrap();
         merge_ones(db.db());
         db.db().flush().unwrap();
@@ -691,7 +691,7 @@ fn a_replacement_above_the_snapshot_still_conflicts_after_the_operands_over_it_w
             let db = OptimisticTransactionDb::open(dir.path(), counter_options(fold)).unwrap();
             db.db().put(b"counter", &0i64.to_be_bytes()).unwrap();
 
-            let tx = db.begin_transaction_with(IsolationLevel::DefraLevel);
+            let tx = db.begin(&TxnOptions::new().isolation(IsolationLevel::DefraLevel));
             tx.merge(b"counter", &1i64.to_be_bytes()).unwrap();
             replacement.apply(db.db());
             merge_ones(db.db());

@@ -11,7 +11,7 @@
 use std::sync::Arc;
 
 use regolith::prelude::*;
-use regolith::{PerfContext, PerfLevel};
+use regolith::{PerfContext, PerfLevel, TxnOptions};
 
 /// Sums big-endian i64 deltas.
 struct CounterMerge;
@@ -109,7 +109,7 @@ fn point_reads_are_validated_as_at_repeatable_read() {
     let db = open(dir.path());
     db.db().put(b"k", b"old").unwrap();
 
-    let tx = db.begin_transaction_with(IsolationLevel::DefraLevel);
+    let tx = db.begin(&TxnOptions::new().isolation(IsolationLevel::DefraLevel));
     tx.get(b"k").unwrap();
     db.db().put(b"k", b"new").unwrap();
     tx.put(b"elsewhere", b"x").unwrap();
@@ -127,8 +127,8 @@ fn concurrent_blind_merges_commit_where_repeatable_read_aborts() {
             let db = open(dir.path());
             db.db().put(b"counter", &0i64.to_be_bytes()).unwrap();
 
-            let first = db.begin_transaction_with(level);
-            let second = db.begin_transaction_with(level);
+            let first = db.begin(&TxnOptions::new().isolation(level));
+            let second = db.begin(&TxnOptions::new().isolation(level));
             first.merge(b"counter", &1i64.to_be_bytes()).unwrap();
             second.merge(b"counter", &1i64.to_be_bytes()).unwrap();
             first.commit().unwrap();
@@ -158,7 +158,7 @@ fn eight_threads_of_blind_merges_never_conflict_and_lose_nothing() {
         for _ in 0..THREADS {
             scope.spawn(|| {
                 for i in 0..MERGES {
-                    let tx = db.begin_transaction_with(IsolationLevel::DefraLevel);
+                    let tx = db.begin(&TxnOptions::new().isolation(IsolationLevel::DefraLevel));
                     tx.merge(b"counter", &1i64.to_be_bytes()).unwrap();
                     tx.commit().expect("a blind merge never conflicts");
                     if i % 50 == 0 {
@@ -201,7 +201,7 @@ fn a_blind_merge_still_conflicts_with_a_newer_replacement() {
             let db = open(dir.path());
             db.db().put(b"counter", &0i64.to_be_bytes()).unwrap();
 
-            let tx = db.begin_transaction_with(IsolationLevel::DefraLevel);
+            let tx = db.begin(&TxnOptions::new().isolation(IsolationLevel::DefraLevel));
             tx.merge(b"counter", &1i64.to_be_bytes()).unwrap();
             replacement.apply(&db);
             // Operands on top of the replacement do not hide it.
@@ -220,7 +220,7 @@ fn a_merge_into_a_key_the_transaction_read_is_not_blind() {
     let db = open(dir.path());
     db.db().put(b"counter", &0i64.to_be_bytes()).unwrap();
 
-    let tx = db.begin_transaction_with(IsolationLevel::DefraLevel);
+    let tx = db.begin(&TxnOptions::new().isolation(IsolationLevel::DefraLevel));
     tx.get(b"counter").unwrap();
     tx.merge(b"counter", &1i64.to_be_bytes()).unwrap();
     db.db().merge(b"counter", &1i64.to_be_bytes()).unwrap();
@@ -233,7 +233,7 @@ fn a_merge_beside_a_put_of_the_same_key_is_not_blind() {
     let db = open(dir.path());
     db.db().put(b"counter", &0i64.to_be_bytes()).unwrap();
 
-    let tx = db.begin_transaction_with(IsolationLevel::DefraLevel);
+    let tx = db.begin(&TxnOptions::new().isolation(IsolationLevel::DefraLevel));
     tx.put(b"counter", &3i64.to_be_bytes()).unwrap();
     tx.merge(b"counter", &1i64.to_be_bytes()).unwrap();
     db.db().merge(b"counter", &1i64.to_be_bytes()).unwrap();
@@ -242,7 +242,7 @@ fn a_merge_beside_a_put_of_the_same_key_is_not_blind() {
 
 /// Scan the head prefix, then write the marker every writer writes. The
 /// marker sorts between the heads, so it lies inside the stretch walked.
-fn supersede(tx: &Transaction<'_>, start: &[u8], end: &[u8]) {
+fn supersede(tx: &Transaction, start: &[u8], end: &[u8]) {
     let walked: Vec<_> = tx.scan_stream(Some(start), Some(end)).collect();
     assert!(!walked.is_empty());
     tx.put(b"h/m", b"superseded").unwrap();
@@ -259,8 +259,8 @@ fn an_identical_write_inside_a_scanned_commutative_prefix_commits() {
         db.db().put(b"h/a", b"cid").unwrap();
         db.db().put(b"h/z", b"cid").unwrap();
 
-        let first = db.begin_transaction_with(level);
-        let second = db.begin_transaction_with(level);
+        let first = db.begin(&TxnOptions::new().isolation(level));
+        let second = db.begin(&TxnOptions::new().isolation(level));
         supersede(&first, b"h/", b"h0");
         supersede(&second, b"h/", b"h0");
         first.commit().unwrap();
@@ -276,8 +276,8 @@ fn a_scan_leaving_the_commutative_prefix_is_still_recorded() {
     db.db().put(b"h/a", b"cid").unwrap();
     db.db().put(b"i/other", b"x").unwrap();
 
-    let first = db.begin_transaction_with(IsolationLevel::DefraLevel);
-    let second = db.begin_transaction_with(IsolationLevel::DefraLevel);
+    let first = db.begin(&TxnOptions::new().isolation(IsolationLevel::DefraLevel));
+    let second = db.begin(&TxnOptions::new().isolation(IsolationLevel::DefraLevel));
     supersede(&first, b"h/", b"j");
     supersede(&second, b"h/", b"j");
     first.commit().unwrap();
@@ -291,8 +291,8 @@ fn without_a_policy_scans_are_recorded_as_at_repeatable_read() {
     db.db().put(b"h/a", b"cid").unwrap();
     db.db().put(b"h/z", b"cid").unwrap();
 
-    let first = db.begin_transaction_with(IsolationLevel::DefraLevel);
-    let second = db.begin_transaction_with(IsolationLevel::DefraLevel);
+    let first = db.begin(&TxnOptions::new().isolation(IsolationLevel::DefraLevel));
+    let second = db.begin(&TxnOptions::new().isolation(IsolationLevel::DefraLevel));
     supersede(&first, b"h/", b"h0");
     supersede(&second, b"h/", b"h0");
     first.commit().unwrap();
@@ -316,8 +316,8 @@ fn a_merge_made_before_a_scan_of_a_commutative_prefix_stays_blind() {
             db.db().flush().unwrap();
         }
 
-        let first = db.begin_transaction_with(IsolationLevel::DefraLevel);
-        let second = db.begin_transaction_with(IsolationLevel::DefraLevel);
+        let first = db.begin(&TxnOptions::new().isolation(IsolationLevel::DefraLevel));
+        let second = db.begin(&TxnOptions::new().isolation(IsolationLevel::DefraLevel));
         for tx in [&first, &second] {
             tx.merge(b"h/m", &1i64.to_be_bytes()).unwrap();
             let walked: Vec<_> = tx.scan_stream(Some(b"h/"), Some(b"h0")).collect();
@@ -372,7 +372,7 @@ fn a_merged_key_inside_a_scanned_stretch_is_a_read_unless_the_stretch_is_commuta
                 db.db().put(key, &0i64.to_be_bytes()).unwrap();
                 db.db().put(&[prefix, &b"z"[..]].concat(), b"x").unwrap();
 
-                let tx = db.begin_transaction_with(IsolationLevel::DefraLevel);
+                let tx = db.begin(&TxnOptions::new().isolation(IsolationLevel::DefraLevel));
                 tx.merge(key, &1i64.to_be_bytes()).unwrap();
                 let end = [&prefix[..1], &b"0"[..]].concat();
                 assert_eq!(tx.scan_stream(Some(prefix), Some(&end)).count(), 3);
@@ -410,7 +410,7 @@ fn blind_merge_commit(options: Options, operands: i64) -> (u64, u64) {
     }
     db.db().flush().unwrap();
 
-    let tx = db.begin_transaction_with(IsolationLevel::DefraLevel);
+    let tx = db.begin(&TxnOptions::new().isolation(IsolationLevel::DefraLevel));
     tx.merge(b"counter", &1i64.to_be_bytes()).unwrap();
     db.db().merge(b"counter", &1i64.to_be_bytes()).unwrap();
 
@@ -462,7 +462,7 @@ fn a_replacement_beneath_operands_spanning_blocks_still_conflicts() {
             let db = open_with(dir.path(), options());
             db.db().put(b"counter", &0i64.to_be_bytes()).unwrap();
 
-            let tx = db.begin_transaction_with(IsolationLevel::DefraLevel);
+            let tx = db.begin(&TxnOptions::new().isolation(IsolationLevel::DefraLevel));
             tx.merge(b"counter", &1i64.to_be_bytes()).unwrap();
             replacement.apply(&db);
             for _ in 0..2000 {

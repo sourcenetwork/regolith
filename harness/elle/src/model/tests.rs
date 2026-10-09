@@ -219,7 +219,7 @@ fn a_read_for_update_is_validated_at_snapshot_isolation_and_not_at_read_committe
         let db = TransactionDb::open(&scratch.0, Options::default())
             .unwrap()
             .with_isolation(level);
-        let mut tx = db.begin_transaction();
+        let mut tx = db.begin(&TxnOptions::new());
         plan(vec![read_for_update(0)])
             .execute(Model::ListAppend, false, &mut tx)
             .unwrap();

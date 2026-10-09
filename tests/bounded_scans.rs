@@ -5,7 +5,7 @@
 
 #![cfg(not(target_arch = "wasm32"))]
 
-use regolith::{OptimisticTransactionDb, Options};
+use regolith::{OptimisticTransactionDb, Options, TxnOptions};
 use tempfile::TempDir;
 
 /// Live `a/0..a/4`, then deleted `b/0000..b/0999`, then live `c/0`.
@@ -38,7 +38,7 @@ fn a_keys() -> Vec<String> {
 fn a_transaction_scan_returns_its_range_and_no_further() {
     let dir = TempDir::new().unwrap();
     let db = db_with_tombstones_after_a(&dir);
-    let txn = db.begin_transaction();
+    let txn = db.begin(&TxnOptions::new());
     let mut stream = txn.scan_stream(Some(b"a/"), Some(b"b/"));
     assert_eq!(keys(&mut stream), a_keys());
     stream.status().unwrap();
@@ -48,7 +48,7 @@ fn a_transaction_scan_returns_its_range_and_no_further() {
 fn a_transaction_scan_without_a_start_still_stops_at_its_end() {
     let dir = TempDir::new().unwrap();
     let db = db_with_tombstones_after_a(&dir);
-    let txn = db.begin_transaction();
+    let txn = db.begin(&TxnOptions::new());
     let mut stream = txn.scan_stream(None, Some(b"b/"));
     assert_eq!(keys(&mut stream), a_keys());
     stream.status().unwrap();
@@ -58,7 +58,7 @@ fn a_transaction_scan_without_a_start_still_stops_at_its_end() {
 fn a_transaction_scan_merges_its_writes_on_both_sides_of_the_bound() {
     let dir = TempDir::new().unwrap();
     let db = db_with_tombstones_after_a(&dir);
-    let txn = db.begin_transaction();
+    let txn = db.begin(&TxnOptions::new());
     txn.put(b"a/9", b"mine").unwrap();
     txn.delete(b"a/0").unwrap();
     txn.put(b"b/0500", b"past the end").unwrap();

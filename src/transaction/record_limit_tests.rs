@@ -39,7 +39,7 @@ fn puts_framing_to(framed: usize, count: usize) -> Vec<WriteBatchOp> {
 /// Buffer 17 zeroed values straight into `tx.writes`: `Transaction::put`
 /// would copy each one again into a fresh buffer of its own, and the
 /// values here are already the buffers the commit will frame.
-fn refuses_an_oversized_commit(db: &Db, tx: Transaction<'_>) {
+fn refuses_an_oversized_commit(db: &Db, tx: Transaction) {
     let seq0 = db.latest_sequence();
 
     for op in puts_framing_to(MAX_RECORD_LEN as usize + 1, 17) {
@@ -78,9 +78,9 @@ fn refuses_an_oversized_commit(db: &Db, tx: Transaction<'_>) {
 fn an_oversized_commit_is_refused_and_leaves_no_trace() {
     let dir = TempDir::new().expect("tempdir");
     let db = OptimisticTransactionDb::open(dir.path(), Options::default()).expect("open");
-    refuses_an_oversized_commit(db.db(), db.begin_transaction());
+    refuses_an_oversized_commit(db.db(), db.begin(&TxnOptions::new()));
 
     let dir = TempDir::new().expect("tempdir");
     let db = TransactionDb::open(dir.path(), Options::default()).expect("open");
-    refuses_an_oversized_commit(db.db(), db.begin_transaction());
+    refuses_an_oversized_commit(db.db(), db.begin(&TxnOptions::new()));
 }

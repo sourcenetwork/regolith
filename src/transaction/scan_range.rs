@@ -311,7 +311,7 @@ mod tests {
         for key in [b"a", b"b", b"c"] {
             db.db().put(key, b"0").unwrap();
         }
-        let mut tx = db.begin_transaction_with(IsolationLevel::SnapshotIsolation);
+        let mut tx = db.begin(&TxnOptions::new().isolation(IsolationLevel::SnapshotIsolation));
         assert_eq!(tx.scan_stream(None, None).count(), 3);
         assert_eq!(tx.tracked.len(), 0, "no key is tracked below Serializable");
         tx.put(b"b", b"pending").unwrap();

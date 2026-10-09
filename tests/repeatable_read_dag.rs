@@ -20,7 +20,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 use std::time::Instant;
 
-use regolith::{IsolationLevel, OptimisticTransactionDb, Options, Transaction, TransactionError};
+use regolith::{
+    IsolationLevel, OptimisticTransactionDb, Options, Transaction, TransactionError, TxnOptions,
+};
 use tempfile::TempDir;
 
 fn opt_db(dir: &TempDir) -> OptimisticTransactionDb {
@@ -65,7 +67,7 @@ fn parse_marker(key: &[u8]) -> (u64, u64) {
 /// Live heads of the snapshot `txn` reads from: head keys with no marker
 /// naming them as a parent, from two scans over the `h/` and `m/`
 /// prefixes.
-fn live_heads(txn: &Transaction<'_>) -> Vec<u64> {
+fn live_heads(txn: &Transaction) -> Vec<u64> {
     let heads: Vec<u64> = txn
         .scan_stream(Some(b"h/"), Some(b"h0"))
         .map(|(key, _)| parse_head(&key))
@@ -97,7 +99,7 @@ fn try_append(
     conflicts: &AtomicU64,
 ) {
     for _ in 0..MAX_BUSY_ATTEMPTS {
-        let txn = db.begin_transaction_with(level);
+        let txn = db.begin(&TxnOptions::new().isolation(level));
         let heads = live_heads(&txn);
         txn.put(&head_key(block), b"0")
             .unwrap_or_else(|e| panic!("put head {block}: {e}"));
@@ -130,7 +132,7 @@ fn try_append(
 /// construction, and the protocol keeps those on purpose.
 fn try_prune(db: &OptimisticTransactionDb, level: IsolationLevel, conflicts: &AtomicU64) {
     for _ in 0..MAX_BUSY_ATTEMPTS {
-        let txn = db.begin_transaction_with(level);
+        let txn = db.begin(&TxnOptions::new().isolation(level));
         let heads: Vec<u64> = txn
             .scan_stream(Some(b"h/"), Some(b"h0"))
             .map(|(key, _)| parse_head(&key))
@@ -310,7 +312,7 @@ fn serializable_aborts_an_append_when_reclamation_commits_underneath() {
         // still a head key in the store, but a marker now names it as a
         // parent.
         {
-            let txn = db.begin_transaction_with(level);
+            let txn = db.begin(&TxnOptions::new().isolation(level));
             let heads = live_heads(&txn);
             assert_eq!(heads, [0], "{level:?}: only the seeded head is live");
             txn.put(&head_key(1), b"0").unwrap();
@@ -324,7 +326,7 @@ fn serializable_aborts_an_append_when_reclamation_commits_underneath() {
         // The probe: this scan yields h/000000 (superseded, but still
         // present), then a concurrent prune reclaims it before this
         // transaction writes and commits.
-        let appender = db.begin_transaction_with(level);
+        let appender = db.begin(&TxnOptions::new().isolation(level));
         let heads = live_heads(&appender);
         assert_eq!(heads, [1], "{level:?}: block 1 is the only live head");
 
@@ -366,7 +368,7 @@ fn repeatable_read_read_modify_write_of_a_register_never_loses_an_update() {
     fn increment_once(db: &OptimisticTransactionDb, attempts: &AtomicU64) {
         for _ in 0..MAX_ATTEMPTS {
             attempts.fetch_add(1, Ordering::Relaxed);
-            let txn = db.begin_transaction_with(IsolationLevel::RepeatableRead);
+            let txn = db.begin(&TxnOptions::new().isolation(IsolationLevel::RepeatableRead));
             let current = match txn.get(b"counter") {
                 Ok(None) => 0,
                 Ok(Some(bytes)) => u64::from_le_bytes(

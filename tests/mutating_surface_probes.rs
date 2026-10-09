@@ -6,7 +6,7 @@
 //! lifecycle calls.
 
 use regolith::{
-    Db, DbWithTtl, DurabilityMode, Error, OptimisticTransactionDb, Options, WriteBatch,
+    Db, DbWithTtl, DurabilityMode, Error, OptimisticTransactionDb, Options, TxnOptions, WriteBatch,
     WriteOptions,
 };
 use tempfile::TempDir;
@@ -130,8 +130,8 @@ fn a_transaction_that_carries_no_work_still_fails_to_commit_when_closed() {
     let dir = TempDir::new().expect("tempdir");
     let tdb = OptimisticTransactionDb::open(dir.path(), opts()).expect("open");
     tdb.db().put(b"k", b"v").expect("put");
-    let empty = tdb.begin_transaction();
-    let loaded = tdb.begin_transaction();
+    let empty = tdb.begin(&TxnOptions::new());
+    let loaded = tdb.begin(&TxnOptions::new());
     loaded.put(b"a", b"b").expect("buffer");
     tdb.db().close().expect("close");
 

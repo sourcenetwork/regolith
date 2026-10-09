@@ -115,9 +115,11 @@ use crate::{Db, DbSlice, Error, Options, Result};
 
 mod policy;
 mod scan_range;
+mod txn_options;
 mod write_buffer;
 pub use policy::{KeyClass, KeyClassifier};
 use scan_range::{OpenRun, ScanRun};
+pub use txn_options::TxnOptions;
 use write_buffer::{KeyWrites, Write, fold_by_key, read_buffered, settle};
 
 /// Default lock-acquisition timeout for [`TransactionDb`] when the
@@ -176,7 +178,7 @@ impl From<Error> for TransactionError {
 
 /// Optimistic-concurrency-control wrapper over a [`Db`].
 ///
-/// `begin_transaction` returns a fresh [`Transaction`] whose
+/// `begin` returns a fresh [`Transaction`] whose
 /// `commit` performs write-write conflict detection against the
 /// seq captured at begin time. No locks are taken; other writers
 /// proceed in parallel. Conflicts surface as
@@ -241,36 +243,12 @@ impl OptimisticTransactionDb {
     /// Start a new optimistic transaction anchored at the engine's
     /// current sequence number. Reads see a consistent view as of
     /// that seq; writes buffer in memory until [`Transaction::commit`].
-    pub fn begin_transaction(&self) -> Transaction<'_> {
-        self.begin_transaction_with(self.isolation)
-    }
-
-    /// Begin a transaction at an explicit [`IsolationLevel`], whatever
-    /// the database default is.
     ///
-    /// Per transaction rather than per database because the level is a
-    /// property of what a unit of work needs: a read-mostly query and a
-    /// read-modify-write against the same database want different
-    /// answers, and paying serializable validation for the former is
-    /// waste.
-    pub fn begin_transaction_with(&self, isolation: IsolationLevel) -> Transaction<'_> {
-        self.begin_inner(isolation)
-    }
-
-    /// Begin a transaction that keeps this database alive for as long as
-    /// it lives, for callers that must store it in a `'static` container
-    /// such as a boxed trait object.
-    pub fn begin_transaction_owned(
-        self: &Arc<Self>,
-        isolation: IsolationLevel,
-    ) -> OwnedTransaction {
-        OwnedTransaction::new(self.begin_inner(isolation), Arc::clone(self) as Arc<_>)
-    }
-
-    /// The lifetime is free because a `Transaction` borrows nothing from
-    /// the database: every field it holds is owned. The two public entry
-    /// points differ only in what they tie that freedom to.
-    fn begin_inner<'any>(&self, isolation: IsolationLevel) -> Transaction<'any> {
+    /// The transaction runs at `opts`' [`IsolationLevel`], or at this
+    /// database's default when `opts` sets none. It borrows nothing from the
+    /// database, so it can be stored, moved to another thread, or held past
+    /// the database handle that began it.
+    pub fn begin(&self, opts: &TxnOptions) -> Transaction {
         let engine = self.inner.engine_arc();
         let snapshot_seq = engine.register_snapshot_at_horizon();
         Transaction::new(
@@ -280,7 +258,7 @@ impl OptimisticTransactionDb {
             TxMode::Optimistic,
             None,
             DEFAULT_LOCK_TIMEOUT,
-            isolation,
+            opts.resolve_isolation(self.isolation),
             self.inner.transaction_keys_inline(),
             self.policy.clone(),
         )
@@ -293,7 +271,7 @@ impl OptimisticTransactionDb {
         self
     }
 
-    /// The default level [`Self::begin_transaction`] uses.
+    /// The default level [`Self::begin`] uses when its [`TxnOptions`] set none.
     pub fn isolation(&self) -> IsolationLevel {
         self.isolation
     }
@@ -352,25 +330,12 @@ impl TransactionDb {
     /// Start a new pessimistic transaction. Reads see the engine
     /// state as of the current seq; writes acquire key locks that
     /// the caller retains until commit or rollback.
-    pub fn begin_transaction(&self) -> Transaction<'_> {
-        self.begin_transaction_with(self.isolation)
-    }
-
-    /// Begin a transaction at an explicit [`IsolationLevel`].
-    pub fn begin_transaction_with(&self, isolation: IsolationLevel) -> Transaction<'_> {
-        self.begin_inner(isolation)
-    }
-
-    /// Begin a transaction that keeps this database alive for as long as
-    /// it lives. See [`OptimisticTransactionDb::begin_transaction_owned`].
-    pub fn begin_transaction_owned(
-        self: &Arc<Self>,
-        isolation: IsolationLevel,
-    ) -> OwnedTransaction {
-        OwnedTransaction::new(self.begin_inner(isolation), Arc::clone(self) as Arc<_>)
-    }
-
-    fn begin_inner<'any>(&self, isolation: IsolationLevel) -> Transaction<'any> {
+    ///
+    /// The transaction runs at `opts`' [`IsolationLevel`], or at this
+    /// database's default when `opts` sets none. It borrows nothing from the
+    /// database, so it can be stored, moved to another thread, or held past
+    /// the database handle that began it.
+    pub fn begin(&self, opts: &TxnOptions) -> Transaction {
         let engine = self.inner.engine_arc();
         let snapshot_seq = engine.register_snapshot_at_horizon();
         let id = self.tx_id.fetch_add(1, Ordering::Relaxed);
@@ -381,7 +346,7 @@ impl TransactionDb {
             TxMode::Pessimistic { tx_id: id },
             Some(Arc::clone(&self.lock_manager)),
             self.lock_timeout,
-            isolation,
+            opts.resolve_isolation(self.isolation),
             self.inner.transaction_keys_inline(),
             None,
         )
@@ -394,7 +359,7 @@ impl TransactionDb {
         self
     }
 
-    /// The default level [`Self::begin_transaction`] uses.
+    /// The default level [`Self::begin`] uses when its [`TxnOptions`] set none.
     pub fn isolation(&self) -> IsolationLevel {
         self.isolation
     }
@@ -597,8 +562,8 @@ enum TxMode {
 }
 
 /// An in-flight transaction. Created by
-/// [`OptimisticTransactionDb::begin_transaction`] or
-/// [`TransactionDb::begin_transaction`] and resolved by
+/// [`OptimisticTransactionDb::begin`] or
+/// [`TransactionDb::begin`] and resolved by
 /// [`Transaction::commit`] or [`Transaction::rollback`].
 ///
 /// Reads within the transaction see a consistent snapshot captured
@@ -611,7 +576,7 @@ enum TxMode {
 /// Dropping a `Transaction` without committing is equivalent to
 /// calling [`Transaction::rollback`]: buffered writes are
 /// discarded and any held locks are released.
-pub struct Transaction<'db> {
+pub struct Transaction {
     engine: Arc<RegolithEngine>,
     /// What the commit-time validation covers. See [`IsolationLevel`].
     isolation: IsolationLevel,
@@ -666,7 +631,6 @@ pub struct Transaction<'db> {
     keys_inline: usize,
     resolved: bool,
     resources_released: bool,
-    _phantom: std::marker::PhantomData<&'db ()>,
 }
 
 #[derive(Clone)]
@@ -720,7 +684,7 @@ impl KeyState {
     }
 }
 
-impl<'db> Transaction<'db> {
+impl Transaction {
     #[allow(clippy::too_many_arguments)]
     fn new(
         engine: Arc<RegolithEngine>,
@@ -752,7 +716,6 @@ impl<'db> Transaction<'db> {
             keys_inline,
             resolved: false,
             resources_released: false,
-            _phantom: std::marker::PhantomData,
         }
     }
 
@@ -1513,7 +1476,7 @@ pub struct TxnScanStream<'txn> {
     /// The transaction this scan reads for: its stretches are registered
     /// there, and a key it already promoted through `get_for_update` is
     /// served at that key's read sequence.
-    txn: &'txn Transaction<'txn>,
+    txn: &'txn Transaction,
     cursor: crate::CfIter<'txn>,
     cursor_done: bool,
     buffered: BufferedWrites,
@@ -1661,7 +1624,7 @@ impl TxnScanStream<'_> {
     /// snapshot, into the stretch in `run`, starting and registering one if
     /// none is open. At Serializable the key is also recorded per key through
     /// `observe`.
-    fn join_stretch(txn: &Transaction<'_>, run: &mut Option<OpenRun>, reverse: bool, key: &[u8]) {
+    fn join_stretch(txn: &Transaction, run: &mut Option<OpenRun>, reverse: bool, key: &[u8]) {
         match run {
             Some(open) => open.extend(key),
             None => {
@@ -1811,64 +1774,7 @@ fn strip_cf_prefix(key: Vec<u8>) -> Vec<u8> {
     }
 }
 
-/// A [`Transaction`] bundled with an owning handle on the database that
-/// began it.
-///
-/// [`Transaction`] carries a `'db` lifetime, which makes it impossible to
-/// place in a `'static` container such as a boxed trait object. The
-/// lifetime is the only thing tying it to its database: every field it
-/// holds is already an `Arc`. `OwnedTransaction` makes that ownership
-/// explicit by keeping an `Arc` on the database alongside the
-/// transaction, so the database cannot be dropped out from under an
-/// in-flight transaction and the pair can be stored and moved freely.
-///
-/// Deref gives the full [`Transaction`] surface; [`Self::commit`] and
-/// [`Self::rollback`] are re-stated here because they consume the
-/// transaction and cannot go through `Deref`.
-pub struct OwnedTransaction {
-    /// Declared first so it drops first: the transaction releases its
-    /// snapshot pin and any held locks before the database handle goes.
-    txn: Transaction<'static>,
-    _db: Arc<dyn core::any::Any + Send + Sync>,
-}
-
-impl OwnedTransaction {
-    fn new(txn: Transaction<'static>, db: Arc<dyn core::any::Any + Send + Sync>) -> Self {
-        Self { txn, _db: db }
-    }
-
-    /// Validate and apply the transaction. See [`Transaction::commit`].
-    pub fn commit(self) -> TxResult<()> {
-        self.txn.commit()
-    }
-
-    /// Discard the transaction. See [`Transaction::rollback`].
-    pub fn rollback(self) {
-        self.txn.rollback();
-    }
-}
-
-impl core::ops::Deref for OwnedTransaction {
-    type Target = Transaction<'static>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.txn
-    }
-}
-
-impl core::ops::DerefMut for OwnedTransaction {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.txn
-    }
-}
-
-impl std::fmt::Debug for OwnedTransaction {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("OwnedTransaction").finish_non_exhaustive()
-    }
-}
-
-impl Drop for Transaction<'_> {
+impl Drop for Transaction {
     fn drop(&mut self) {
         if !self.resolved {
             self.resolved = true;
@@ -1986,7 +1892,7 @@ mod tests {
     #[test]
     fn optimistic_basic_put_commit_read() {
         let (db, _dir) = opt_db();
-        let tx = db.begin_transaction();
+        let tx = db.begin(&TxnOptions::new());
         tx.put(b"k", b"v").unwrap();
         tx.commit().unwrap();
         assert_eq!(db.db().get(b"k").unwrap(), Some(b"v".to_vec()));
@@ -1996,7 +1902,7 @@ mod tests {
     fn optimistic_read_your_own_writes() {
         let (db, _dir) = opt_db();
         db.db().put(b"k", b"initial").unwrap();
-        let tx = db.begin_transaction();
+        let tx = db.begin(&TxnOptions::new());
         assert_eq!(tx.get(b"k").unwrap(), Some(b"initial".to_vec()));
         tx.put(b"k", b"staged").unwrap();
         // Tx sees its own write.
@@ -2010,7 +1916,7 @@ mod tests {
     #[test]
     fn optimistic_rollback_discards_writes() {
         let (db, _dir) = opt_db();
-        let tx = db.begin_transaction();
+        let tx = db.begin(&TxnOptions::new());
         tx.put(b"k", b"never").unwrap();
         tx.rollback();
         assert_eq!(db.db().get(b"k").unwrap(), None);
@@ -2019,8 +1925,8 @@ mod tests {
     #[test]
     fn optimistic_rollback_releases_shared_snapshot_pin_once() {
         let (db, _dir) = opt_db();
-        let tx1 = db.begin_transaction();
-        let tx2 = db.begin_transaction();
+        let tx1 = db.begin(&TxnOptions::new());
+        let tx2 = db.begin(&TxnOptions::new());
         assert_eq!(db.db().get_int_property("regolith.num-snapshots"), Some(2));
 
         tx1.rollback();
@@ -2034,7 +1940,7 @@ mod tests {
     fn optimistic_conflict_detected() {
         let (db, _dir) = opt_db();
         db.db().put(b"k", b"v0").unwrap();
-        let tx1 = db.begin_transaction();
+        let tx1 = db.begin(&TxnOptions::new());
         assert_eq!(tx1.get(b"k").unwrap(), Some(b"v0".to_vec()));
         // Concurrent writer bumps the key.
         db.db().put(b"k", b"v1").unwrap();
@@ -2053,7 +1959,7 @@ mod tests {
     fn optimistic_get_for_update_tracks_conflicts() {
         let (db, _dir) = opt_db();
         db.db().put(b"k", b"v0").unwrap();
-        let tx = db.begin_transaction();
+        let tx = db.begin(&TxnOptions::new());
         assert_eq!(tx.get_for_update(b"k").unwrap(), Some(b"v0".to_vec()));
         // Concurrent writer invalidates the read.
         db.db().put(b"k", b"v1").unwrap();
@@ -2073,7 +1979,7 @@ mod tests {
         let (db, _dir) = opt_db();
         db.db().put(b"a", b"v0").unwrap();
         db.db().put(b"z", b"v0").unwrap();
-        let tx = db.begin_transaction();
+        let tx = db.begin(&TxnOptions::new());
         // Tracked in the reverse of their sort order.
         tx.get_for_update(b"z").unwrap();
         tx.get_for_update(b"a").unwrap();
@@ -2089,7 +1995,7 @@ mod tests {
     fn optimistic_no_conflict_passes() {
         let (db, _dir) = opt_db();
         db.db().put(b"k", b"v0").unwrap();
-        let tx = db.begin_transaction();
+        let tx = db.begin(&TxnOptions::new());
         tx.put(b"other", b"stuff").unwrap();
         tx.commit().unwrap();
         assert_eq!(db.db().get(b"other").unwrap(), Some(b"stuff".to_vec()));
@@ -2099,7 +2005,7 @@ mod tests {
     fn optimistic_snapshot_isolation_reads() {
         let (db, _dir) = opt_db();
         db.db().put(b"k", b"v0").unwrap();
-        let tx = db.begin_transaction();
+        let tx = db.begin(&TxnOptions::new());
         db.db().put(b"k", b"v1").unwrap();
         // Tx is anchored at the seq before the second put.
         assert_eq!(tx.get(b"k").unwrap(), Some(b"v0".to_vec()));
@@ -2108,7 +2014,7 @@ mod tests {
     #[test]
     fn optimistic_savepoint_rollback() {
         let (db, _dir) = opt_db();
-        let mut tx = db.begin_transaction();
+        let mut tx = db.begin(&TxnOptions::new());
         tx.put(b"a", b"1").unwrap();
         tx.set_savepoint();
         tx.put(b"b", b"2").unwrap();
@@ -2126,7 +2032,7 @@ mod tests {
     #[test]
     fn optimistic_rollback_to_savepoint_without_savepoint_errors() {
         let (db, _dir) = opt_db();
-        let mut tx = db.begin_transaction();
+        let mut tx = db.begin(&TxnOptions::new());
         assert!(matches!(
             tx.rollback_to_savepoint(),
             Err(TransactionError::NoSavepoint)
@@ -2137,7 +2043,7 @@ mod tests {
     fn optimistic_delete_commit() {
         let (db, _dir) = opt_db();
         db.db().put(b"k", b"v").unwrap();
-        let tx = db.begin_transaction();
+        let tx = db.begin(&TxnOptions::new());
         tx.delete(b"k").unwrap();
         tx.commit().unwrap();
         assert_eq!(db.db().get(b"k").unwrap(), None);
@@ -2146,7 +2052,7 @@ mod tests {
     #[test]
     fn optimistic_range_delete_is_rejected() {
         let (db, _dir) = opt_db();
-        let tx = db.begin_transaction();
+        let tx = db.begin(&TxnOptions::new());
 
         assert!(matches!(
             tx.delete_range(b"a", b"z"),
@@ -2160,7 +2066,7 @@ mod tests {
     #[test]
     fn pessimistic_basic_put_commit_read() {
         let (db, _dir) = pes_db();
-        let tx = db.begin_transaction();
+        let tx = db.begin(&TxnOptions::new());
         tx.put(b"k", b"v").unwrap();
         tx.commit().unwrap();
         assert_eq!(db.db().get(b"k").unwrap(), Some(b"v".to_vec()));
@@ -2169,7 +2075,7 @@ mod tests {
     #[test]
     fn pessimistic_range_delete_is_rejected() {
         let (db, _dir) = pes_db();
-        let tx = db.begin_transaction();
+        let tx = db.begin(&TxnOptions::new());
 
         assert!(matches!(
             tx.delete_range(b"a", b"z"),
@@ -2182,7 +2088,7 @@ mod tests {
     fn pessimistic_lock_blocks_second_writer() {
         let (db, _dir) = pes_db();
         let db = Arc::new(db);
-        let tx1 = db.begin_transaction();
+        let tx1 = db.begin(&TxnOptions::new());
         tx1.put(b"k", b"v1").unwrap();
         // Second tx with a short timeout must fail to lock `k`.
         let db2 = Arc::clone(&db);
@@ -2193,7 +2099,7 @@ mod tests {
             // rely on acquire_lock using the DB's
             // configured timeout; so we just do a normal put and
             // expect `Busy`.
-            let tx2 = db2.begin_transaction();
+            let tx2 = db2.begin(&TxnOptions::new());
             tx2.put(b"k", b"v2")
         });
         // Give tx2 some time to actually start waiting.
@@ -2212,11 +2118,11 @@ mod tests {
             .with_lock_timeout(Duration::from_millis(50));
         let db = Arc::new(db);
         // tx1 grabs the lock and holds it.
-        let tx1 = db.begin_transaction();
+        let tx1 = db.begin(&TxnOptions::new());
         tx1.put(b"k", b"v1").unwrap();
         let db2 = Arc::clone(&db);
         let join = std::thread::spawn(move || {
-            let tx2 = db2.begin_transaction();
+            let tx2 = db2.begin(&TxnOptions::new());
             tx2.put(b"k", b"v2")
         });
         // tx2 should time out within ~50ms.
@@ -2229,7 +2135,7 @@ mod tests {
     #[test]
     fn pessimistic_reentrant_lock() {
         let (db, _dir) = pes_db();
-        let tx = db.begin_transaction();
+        let tx = db.begin(&TxnOptions::new());
         tx.put(b"k", b"v1").unwrap();
         // Re-lock (via a second put) must not deadlock against
         // itself.
@@ -2243,11 +2149,11 @@ mod tests {
     fn pessimistic_rollback_releases_locks() {
         let (db, _dir) = pes_db();
         let db = Arc::new(db);
-        let tx1 = db.begin_transaction();
+        let tx1 = db.begin(&TxnOptions::new());
         tx1.put(b"k", b"v1").unwrap();
         tx1.rollback();
         // New tx must now be able to grab the lock without blocking.
-        let tx2 = db.begin_transaction();
+        let tx2 = db.begin(&TxnOptions::new());
         tx2.put(b"k", b"v2").unwrap();
         tx2.commit().unwrap();
         assert_eq!(db.db().get(b"k").unwrap(), Some(b"v2".to_vec()));
@@ -2256,8 +2162,8 @@ mod tests {
     #[test]
     fn pessimistic_rollback_releases_shared_snapshot_pin_once() {
         let (db, _dir) = pes_db();
-        let tx1 = db.begin_transaction();
-        let tx2 = db.begin_transaction();
+        let tx1 = db.begin(&TxnOptions::new());
+        let tx2 = db.begin(&TxnOptions::new());
         assert_eq!(db.db().get_int_property("regolith.num-snapshots"), Some(2));
 
         tx1.rollback();
@@ -2272,11 +2178,11 @@ mod tests {
         let (db, _dir) = pes_db();
         let db = Arc::new(db);
         {
-            let tx1 = db.begin_transaction();
+            let tx1 = db.begin(&TxnOptions::new());
             tx1.put(b"k", b"v1").unwrap();
             // tx1 dropped here without explicit rollback.
         }
-        let tx2 = db.begin_transaction();
+        let tx2 = db.begin(&TxnOptions::new());
         tx2.put(b"k", b"v2").unwrap();
         tx2.commit().unwrap();
         assert_eq!(db.db().get(b"k").unwrap(), Some(b"v2".to_vec()));
@@ -2286,7 +2192,7 @@ mod tests {
     fn pessimistic_read_your_own_writes() {
         let (db, _dir) = pes_db();
         db.db().put(b"k", b"initial").unwrap();
-        let tx = db.begin_transaction();
+        let tx = db.begin(&TxnOptions::new());
         tx.put(b"k", b"staged").unwrap();
         assert_eq!(tx.get(b"k").unwrap(), Some(b"staged".to_vec()));
         tx.commit().unwrap();
@@ -2301,12 +2207,12 @@ mod tests {
                 .with_lock_timeout(Duration::from_millis(50)),
         );
         db.db().put(b"k", b"v0").unwrap();
-        let tx1 = db.begin_transaction();
+        let tx1 = db.begin(&TxnOptions::new());
         assert_eq!(tx1.get_for_update(b"k").unwrap(), Some(b"v0".to_vec()));
         // Concurrent tx2 can't touch k.
         let db2 = Arc::clone(&db);
         let join = std::thread::spawn(move || {
-            let tx2 = db2.begin_transaction();
+            let tx2 = db2.begin(&TxnOptions::new());
             tx2.put(b"k", b"v1")
         });
         let result = join.join().unwrap();
@@ -2317,7 +2223,7 @@ mod tests {
     #[test]
     fn pessimistic_savepoint_keeps_locks_but_rolls_back_writes() {
         let (db, _dir) = pes_db();
-        let mut tx = db.begin_transaction();
+        let mut tx = db.begin(&TxnOptions::new());
         tx.put(b"a", b"1").unwrap();
         tx.set_savepoint();
         tx.put(b"b", b"2").unwrap();
@@ -2334,7 +2240,7 @@ mod tests {
     fn pessimistic_get_for_update_sees_writes_committed_after_begin() {
         let (db, _dir) = pes_db();
         db.db().put(b"k", b"v0").unwrap();
-        let tx = db.begin_transaction();
+        let tx = db.begin(&TxnOptions::new());
         // Lands after the transaction began, before it locks `k`.
         db.db().put(b"k", b"v1").unwrap();
         assert_eq!(tx.get_for_update(b"k").unwrap(), Some(b"v1".to_vec()));
@@ -2351,8 +2257,8 @@ mod tests {
         db.db().put(b"k", b"v0").unwrap();
         // Both transactions begin before either one commits, so both
         // are anchored at the seq where `k` is still `v0`.
-        let tx1 = db.begin_transaction();
-        let tx2 = db.begin_transaction();
+        let tx1 = db.begin(&TxnOptions::new());
+        let tx2 = db.begin(&TxnOptions::new());
         assert_eq!(tx1.get_for_update(b"k").unwrap(), Some(b"v0".to_vec()));
         tx1.put(b"k", b"v1").unwrap();
         tx1.commit().unwrap();
@@ -2366,7 +2272,7 @@ mod tests {
     #[test]
     fn pessimistic_commit_detects_write_from_outside_the_lock_manager() {
         let (db, _dir) = pes_db();
-        let tx = db.begin_transaction();
+        let tx = db.begin(&TxnOptions::new());
         tx.get_for_update(b"k").unwrap();
         // A raw `Db` write never touches the lock manager.
         db.db().put(b"k", b"racer").unwrap();
@@ -2381,10 +2287,10 @@ mod tests {
     #[test]
     fn pessimistic_sequential_transactions_do_not_conflict() {
         let (db, _dir) = pes_db();
-        let tx1 = db.begin_transaction();
+        let tx1 = db.begin(&TxnOptions::new());
         tx1.put(b"k", b"v1").unwrap();
         tx1.commit().unwrap();
-        let tx2 = db.begin_transaction();
+        let tx2 = db.begin(&TxnOptions::new());
         assert_eq!(tx2.get_for_update(b"k").unwrap(), Some(b"v1".to_vec()));
         tx2.put(b"k", b"v2").unwrap();
         tx2.commit().unwrap();
@@ -2395,7 +2301,7 @@ mod tests {
     fn pessimistic_blind_put_after_external_write_is_not_a_conflict() {
         let (db, _dir) = pes_db();
         db.db().put(b"k", b"v0").unwrap();
-        let tx = db.begin_transaction();
+        let tx = db.begin(&TxnOptions::new());
         db.db().put(b"k", b"v1").unwrap();
         // Nothing was read, so there is no read to lose: a blind write
         // is last-writer-wins against a non-transactional writer.
@@ -2410,7 +2316,7 @@ mod tests {
         // transaction has already buffered its blind write.
         let (db, _dir) = pes_db();
         db.db().put(b"k", b"v0").unwrap();
-        let tx = db.begin_transaction();
+        let tx = db.begin(&TxnOptions::new());
         tx.put(b"k", b"v2").unwrap();
         db.db().put(b"k", b"v1").unwrap();
         tx.commit().unwrap();
@@ -2420,7 +2326,7 @@ mod tests {
     #[test]
     fn pessimistic_savepoint_rollback_keeps_untouched_keys_unvalidated() {
         let (db, _dir) = pes_db();
-        let mut tx = db.begin_transaction();
+        let mut tx = db.begin(&TxnOptions::new());
         tx.set_savepoint();
         tx.put(b"b", b"rolled-back").unwrap();
         tx.rollback_to_savepoint().unwrap();
@@ -2440,7 +2346,7 @@ mod tests {
         // laundered a write that had bypassed the lock manager.
         let (db, _dir) = pes_db();
         db.db().put(b"k", b"v0").unwrap();
-        let mut tx = db.begin_transaction();
+        let mut tx = db.begin(&TxnOptions::new());
         assert_eq!(tx.get_for_update(b"k").unwrap(), Some(b"v0".to_vec()));
         tx.set_savepoint();
         tx.put(b"k", b"rolled-back").unwrap();
@@ -2456,7 +2362,7 @@ mod tests {
     fn pessimistic_reads_do_not_travel_backwards_after_a_savepoint_rollback() {
         let (db, _dir) = pes_db();
         db.db().put(b"k", b"v0").unwrap();
-        let mut tx = db.begin_transaction();
+        let mut tx = db.begin(&TxnOptions::new());
         db.db().put(b"k", b"v1").unwrap();
         let first = tx.get_for_update(b"k").unwrap();
         assert_eq!(first, Some(b"v1".to_vec()));
@@ -2475,7 +2381,7 @@ mod tests {
         // update.
         let (db, _dir) = pes_db();
         db.db().put(b"k", b"v0").unwrap();
-        let tx = db.begin_transaction();
+        let tx = db.begin(&TxnOptions::new());
         assert_eq!(tx.get(b"k").unwrap(), Some(b"v0".to_vec()));
         db.db().put(b"k", b"v1").unwrap();
         tx.put(b"k", b"derived-from-v0").unwrap();
@@ -2488,7 +2394,7 @@ mod tests {
     fn pessimistic_read_without_a_write_is_not_validated() {
         let (db, _dir) = pes_db();
         db.db().put(b"read-only", b"v0").unwrap();
-        let tx = db.begin_transaction();
+        let tx = db.begin(&TxnOptions::new());
         assert_eq!(tx.get(b"read-only").unwrap(), Some(b"v0".to_vec()));
         db.db().put(b"read-only", b"v1").unwrap();
         tx.put(b"other", b"1").unwrap();
@@ -2500,7 +2406,7 @@ mod tests {
     fn pessimistic_range_delete_over_a_tracked_key_is_a_conflict() {
         let (db, _dir) = pes_db();
         db.db().put(b"k", b"v0").unwrap();
-        let tx = db.begin_transaction();
+        let tx = db.begin(&TxnOptions::new());
         assert_eq!(tx.get_for_update(b"k").unwrap(), Some(b"v0".to_vec()));
         db.db().delete_range(b"a", b"z").unwrap();
         tx.put(b"k", b"resurrected").unwrap();
@@ -2515,7 +2421,7 @@ mod tests {
     fn optimistic_range_delete_over_a_tracked_key_is_a_conflict() {
         let (db, _dir) = opt_db();
         db.db().put(b"k", b"v0").unwrap();
-        let tx = db.begin_transaction();
+        let tx = db.begin(&TxnOptions::new());
         assert_eq!(tx.get_for_update(b"k").unwrap(), Some(b"v0".to_vec()));
         db.db().delete_range(b"a", b"z").unwrap();
         tx.put(b"k", b"resurrected").unwrap();
@@ -2531,7 +2437,7 @@ mod tests {
     #[test]
     fn commit_is_atomic_with_respect_to_other_writers() {
         let (db, _dir) = opt_db();
-        let tx = db.begin_transaction();
+        let tx = db.begin(&TxnOptions::new());
         tx.put(b"a", b"1").unwrap();
         tx.put(b"b", b"2").unwrap();
         tx.put(b"c", b"3").unwrap();
@@ -2546,7 +2452,7 @@ mod tests {
         let (db, _dir) = opt_db();
         db.db().put(b"a", b"1").unwrap();
         db.db().put(b"b", b"2").unwrap();
-        let tx = db.begin_transaction();
+        let tx = db.begin(&TxnOptions::new());
         tx.put(b"a", b"staged").unwrap();
         assert_eq!(tx.get(b"a").unwrap(), Some(b"staged".to_vec()));
         assert_eq!(tx.get(b"b").unwrap(), Some(b"2".to_vec()));
@@ -2576,11 +2482,7 @@ mod tests {
     /// `test_write_stall_slowdown_accumulates_micros`, then check that a
     /// commit through `begin` is charged the wait only when it carries a
     /// write.
-    fn probe_slowdown_ticker<'a>(
-        plain: &Db,
-        stats: &Statistics,
-        begin: impl Fn() -> Transaction<'a>,
-    ) {
+    fn probe_slowdown_ticker(plain: &Db, stats: &Statistics, begin: impl Fn() -> Transaction) {
         let payload = vec![0xCDu8; 600];
         for i in 0..128 {
             let k = format!("k{i:04}");
@@ -2617,7 +2519,7 @@ mod tests {
         let stats = Arc::new(Statistics::new());
         let dir = TempDir::new().unwrap();
         let db = OptimisticTransactionDb::open(dir.path(), slowdown_opts(&stats)).unwrap();
-        probe_slowdown_ticker(db.db(), &stats, || db.begin_transaction());
+        probe_slowdown_ticker(db.db(), &stats, || db.begin(&TxnOptions::new()));
     }
 
     #[test]
@@ -2625,14 +2527,14 @@ mod tests {
         let stats = Arc::new(Statistics::new());
         let dir = TempDir::new().unwrap();
         let db = TransactionDb::open(dir.path(), slowdown_opts(&stats)).unwrap();
-        probe_slowdown_ticker(db.db(), &stats, || db.begin_transaction());
+        probe_slowdown_ticker(db.db(), &stats, || db.begin(&TxnOptions::new()));
     }
 
     #[test]
     fn commit_on_a_closed_handle_reports_closed_before_it_waits() {
         let dir = TempDir::new().unwrap();
         let db = OptimisticTransactionDb::open(dir.path(), Options::default()).unwrap();
-        let tx = db.begin_transaction();
+        let tx = db.begin(&TxnOptions::new());
         tx.put(b"k", b"v").unwrap();
         db.db().close().unwrap();
         match tx.commit() {
@@ -2674,7 +2576,7 @@ mod tests {
             .latch_wal_failure(&std::io::Error::other("injected"));
         let before = stats.get_ticker(Ticker::WriteStallMicros);
 
-        let tx = db.begin_transaction();
+        let tx = db.begin(&TxnOptions::new());
         tx.put(b"txn", b"v").unwrap();
         match tx.commit() {
             Err(TransactionError::Io(e)) => {
@@ -2703,7 +2605,7 @@ mod tests {
         db.db().put(b"a", b"0").unwrap();
         db.db().put(b"b", b"0").unwrap();
         db.db().put(b"c", b"0").unwrap();
-        let tx = db.begin_transaction_with(IsolationLevel::Serializable);
+        let tx = db.begin(&TxnOptions::new().isolation(IsolationLevel::Serializable));
 
         assert_eq!(tx.scan_stream(Some(b"x"), Some(b"y")).count(), 0);
         assert_eq!(tx.tracked.len(), 0, "an empty scan tracks nothing");
@@ -2720,7 +2622,7 @@ mod tests {
              the write buffer and is not tracked"
         );
 
-        let fresh = db.begin_transaction_with(IsolationLevel::Serializable);
+        let fresh = db.begin(&TxnOptions::new().isolation(IsolationLevel::Serializable));
         assert_eq!(fresh.scan_stream(None, None).take(0).count(), 0);
         assert_eq!(
             fresh.tracked.len(),
@@ -2768,7 +2670,7 @@ mod tests {
             };
             let db = OptimisticTransactionDb::open(dir.path(), opts).unwrap();
             db.db().put(b"k", b"base").unwrap();
-            let tx = db.begin_transaction_with(level);
+            let tx = db.begin(&TxnOptions::new().isolation(level));
             tx.merge(b"k", b"+op").unwrap();
 
             let walked: Vec<(Vec<u8>, Vec<u8>)> = tx
@@ -2810,7 +2712,7 @@ mod tests {
         for i in 0..64u32 {
             db.db().put(format!("k{i:04}").as_bytes(), b"0").unwrap();
         }
-        let tx = db.begin_transaction();
+        let tx = db.begin(&TxnOptions::new());
 
         let mut stream = tx.scan_stream(None, None);
         assert_eq!(stream.next().unwrap().0, b"k0000".to_vec());

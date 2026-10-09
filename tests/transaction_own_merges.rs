@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 use regolith::{
     Db, IsolationLevel, MergeOperator, OptimisticTransactionDb, Options, Transaction,
-    TransactionDb, TransactionError,
+    TransactionDb, TransactionError, TxnOptions,
 };
 
 /// Sums big-endian i64 deltas onto the base.
@@ -107,10 +107,10 @@ impl Flavour {
         }
     }
 
-    fn begin(&self) -> Transaction<'_> {
+    fn begin(&self) -> Transaction {
         match self {
-            Self::Optimistic(db) => db.begin_transaction(),
-            Self::Pessimistic(db) => db.begin_transaction(),
+            Self::Optimistic(db) => db.begin(&TxnOptions::new()),
+            Self::Pessimistic(db) => db.begin(&TxnOptions::new()),
         }
     }
 
@@ -136,7 +136,7 @@ fn counter(bytes: Option<Vec<u8>>) -> Option<i64> {
 
 /// What the transaction reads for `key` through each of its point reads,
 /// which must agree.
-fn reads(tx: &Transaction<'_>, key: &[u8]) -> Option<Vec<u8>> {
+fn reads(tx: &Transaction, key: &[u8]) -> Option<Vec<u8>> {
     let got = tx.get(key).unwrap();
     assert_eq!(
         tx.get_slice(key).unwrap().map(|slice| slice.to_vec()),
@@ -315,7 +315,7 @@ fn without_a_merge_operator_reads_ignore_buffered_merges() {
 
 /// `(key, value)` pairs of a transaction scan as counters.
 fn scanned(
-    tx: &Transaction<'_>,
+    tx: &Transaction,
     start: Option<&[u8]>,
     end: Option<&[u8]>,
     reverse: bool,
@@ -498,7 +498,7 @@ fn a_scan_that_reaches_a_merged_key_validates_it_as_a_read_at_every_level() {
         let dir = tempfile::tempdir().unwrap();
         let db = OptimisticTransactionDb::open(dir.path(), counting()).unwrap();
         db.db().put(b"k", &delta(10)).unwrap();
-        let tx = db.begin_transaction_with(level);
+        let tx = db.begin(&TxnOptions::new().isolation(level));
         tx.merge(b"k", &delta(1)).unwrap();
         assert_eq!(
             scanned(&tx, None, None, false),
@@ -515,7 +515,7 @@ fn a_scan_that_reaches_a_merged_key_validates_it_as_a_read_at_every_level() {
 
 /// `(key, value)` pairs of a transaction scan as text.
 fn scanned_text(
-    tx: &Transaction<'_>,
+    tx: &Transaction,
     start: Option<&[u8]>,
     end: Option<&[u8]>,
     reverse: bool,
@@ -649,7 +649,7 @@ fn reading_a_merged_key_makes_the_merge_a_read_modify_write() {
     let db = OptimisticTransactionDb::open(dir.path(), counting()).unwrap();
     db.db().put(b"k", &delta(10)).unwrap();
 
-    let tx = db.begin_transaction_with(IsolationLevel::DefraLevel);
+    let tx = db.begin(&TxnOptions::new().isolation(IsolationLevel::DefraLevel));
     tx.merge(b"k", &delta(1)).unwrap();
     assert_eq!(counter(tx.get(b"k").unwrap()), Some(11));
     db.db().merge(b"k", &delta(1)).unwrap();
@@ -658,7 +658,7 @@ fn reading_a_merged_key_makes_the_merge_a_read_modify_write() {
         "the value the transaction read is stale"
     );
 
-    let blind = db.begin_transaction_with(IsolationLevel::DefraLevel);
+    let blind = db.begin(&TxnOptions::new().isolation(IsolationLevel::DefraLevel));
     blind.merge(b"k", &delta(1)).unwrap();
     db.db().merge(b"k", &delta(1)).unwrap();
     blind.commit().expect("a blind merge still commutes");

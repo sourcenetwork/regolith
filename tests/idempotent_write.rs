@@ -10,7 +10,7 @@
 //! The cases below draw the line: byte equality on a key the transaction did
 //! not read, and nothing else.
 
-use regolith::{IsolationLevel, MergeOperator, OptimisticTransactionDb, Options};
+use regolith::{IsolationLevel, MergeOperator, OptimisticTransactionDb, Options, TxnOptions};
 
 /// Sums big-endian i64 deltas, so two `+1` operands make `+2` and the
 /// operation is plainly not idempotent.
@@ -56,8 +56,8 @@ fn concurrent_writes_of_identical_bytes_both_commit() {
         let dir = tempfile::tempdir().unwrap();
         let db = db(dir.path());
 
-        let first = db.begin_transaction_with(level);
-        let second = db.begin_transaction_with(level);
+        let first = db.begin(&TxnOptions::new().isolation(level));
+        let second = db.begin(&TxnOptions::new().isolation(level));
         first.put(b"block", b"identical").unwrap();
         second.put(b"block", b"identical").unwrap();
 
@@ -80,8 +80,8 @@ fn concurrent_writes_of_different_bytes_still_conflict() {
         let dir = tempfile::tempdir().unwrap();
         let db = db(dir.path());
 
-        let first = db.begin_transaction_with(level);
-        let second = db.begin_transaction_with(level);
+        let first = db.begin(&TxnOptions::new().isolation(level));
+        let second = db.begin(&TxnOptions::new().isolation(level));
         first.put(b"key", b"one").unwrap();
         second.put(b"key", b"two").unwrap();
 
@@ -101,8 +101,8 @@ fn concurrent_identical_deletes_both_commit() {
         let db = db(dir.path());
         db.db().put(b"key", b"value").unwrap();
 
-        let first = db.begin_transaction_with(level);
-        let second = db.begin_transaction_with(level);
+        let first = db.begin(&TxnOptions::new().isolation(level));
+        let second = db.begin(&TxnOptions::new().isolation(level));
         first.delete(b"key").unwrap();
         second.delete(b"key").unwrap();
 
@@ -123,8 +123,8 @@ fn a_delete_against_a_concurrent_put_still_conflicts() {
     let db = db(dir.path());
     db.db().put(b"key", b"value").unwrap();
 
-    let first = db.begin_transaction_with(IsolationLevel::Serializable);
-    let second = db.begin_transaction_with(IsolationLevel::Serializable);
+    let first = db.begin(&TxnOptions::new().isolation(IsolationLevel::Serializable));
+    let second = db.begin(&TxnOptions::new().isolation(IsolationLevel::Serializable));
     first.put(b"key", b"changed").unwrap();
     second.delete(b"key").unwrap();
 
@@ -143,8 +143,8 @@ fn a_stale_read_still_conflicts_even_when_the_write_matches() {
     let dir = tempfile::tempdir().unwrap();
     let db = db(dir.path());
 
-    let first = db.begin_transaction_with(IsolationLevel::Serializable);
-    let second = db.begin_transaction_with(IsolationLevel::Serializable);
+    let first = db.begin(&TxnOptions::new().isolation(IsolationLevel::Serializable));
+    let second = db.begin(&TxnOptions::new().isolation(IsolationLevel::Serializable));
 
     // The second transaction observes the key as absent and acts on that.
     assert_eq!(second.get(b"key").unwrap(), None);
@@ -174,8 +174,8 @@ fn a_read_modify_write_still_conflicts_at_every_level() {
         let db = db(dir.path());
         db.db().put(b"counter", &5u64.to_le_bytes()).unwrap();
 
-        let first = db.begin_transaction_with(level);
-        let second = db.begin_transaction_with(level);
+        let first = db.begin(&TxnOptions::new().isolation(level));
+        let second = db.begin(&TxnOptions::new().isolation(level));
 
         // Both read 5 and both intend to store 6.
         for txn in [&first, &second] {
@@ -205,8 +205,8 @@ fn a_stale_get_for_update_still_conflicts_when_the_write_matches() {
         let dir = tempfile::tempdir().unwrap();
         let db = db(dir.path());
 
-        let first = db.begin_transaction_with(level);
-        let second = db.begin_transaction_with(level);
+        let first = db.begin(&TxnOptions::new().isolation(level));
+        let second = db.begin(&TxnOptions::new().isolation(level));
 
         assert_eq!(second.get_for_update(b"key").unwrap(), None);
         second.put(b"key", b"same").unwrap();
@@ -231,8 +231,8 @@ fn concurrent_merges_still_conflict() {
     };
     let db = OptimisticTransactionDb::open(dir.path(), options).unwrap();
 
-    let first = db.begin_transaction_with(IsolationLevel::Serializable);
-    let second = db.begin_transaction_with(IsolationLevel::Serializable);
+    let first = db.begin(&TxnOptions::new().isolation(IsolationLevel::Serializable));
+    let second = db.begin(&TxnOptions::new().isolation(IsolationLevel::Serializable));
     first.merge(b"key", &1i64.to_be_bytes()).unwrap();
     second.merge(b"key", &1i64.to_be_bytes()).unwrap();
 
@@ -247,11 +247,11 @@ fn sequential_identical_writes_commit() {
     let dir = tempfile::tempdir().unwrap();
     let db = db(dir.path());
 
-    let first = db.begin_transaction_with(IsolationLevel::Serializable);
+    let first = db.begin(&TxnOptions::new().isolation(IsolationLevel::Serializable));
     first.put(b"key", b"value").unwrap();
     first.commit().unwrap();
 
-    let second = db.begin_transaction_with(IsolationLevel::Serializable);
+    let second = db.begin(&TxnOptions::new().isolation(IsolationLevel::Serializable));
     second.put(b"key", b"value").unwrap();
     second.commit().unwrap();
 
@@ -277,8 +277,8 @@ fn identical_writes_commit_with_a_merge_operator_configured() {
         let dir = tempfile::tempdir().unwrap();
         let db = counter_db(dir.path());
 
-        let first = db.begin_transaction_with(level);
-        let second = db.begin_transaction_with(level);
+        let first = db.begin(&TxnOptions::new().isolation(level));
+        let second = db.begin(&TxnOptions::new().isolation(level));
         first.put(b"block", b"identical").unwrap();
         second.put(b"block", b"identical").unwrap();
 
@@ -299,8 +299,8 @@ fn an_identical_write_over_folded_operands_commits() {
         db.db().put(b"key", &0i64.to_be_bytes()).unwrap();
         db.db().merge(b"key", &1i64.to_be_bytes()).unwrap();
 
-        let first = db.begin_transaction_with(IsolationLevel::SnapshotIsolation);
-        let second = db.begin_transaction_with(IsolationLevel::SnapshotIsolation);
+        let first = db.begin(&TxnOptions::new().isolation(IsolationLevel::SnapshotIsolation));
+        let second = db.begin(&TxnOptions::new().isolation(IsolationLevel::SnapshotIsolation));
         first.put(b"key", &5i64.to_be_bytes()).unwrap();
         second.put(b"key", &5i64.to_be_bytes()).unwrap();
         first.commit().unwrap();
@@ -323,7 +323,7 @@ fn an_identical_write_under_an_unresolved_operand_still_conflicts() {
         let db = counter_db(dir.path());
         db.db().put(b"key", &0i64.to_be_bytes()).unwrap();
 
-        let tx = db.begin_transaction_with(IsolationLevel::SnapshotIsolation);
+        let tx = db.begin(&TxnOptions::new().isolation(IsolationLevel::SnapshotIsolation));
         tx.put(b"key", &1i64.to_be_bytes()).unwrap();
         db.db().merge(b"key", &1i64.to_be_bytes()).unwrap();
         if flush {

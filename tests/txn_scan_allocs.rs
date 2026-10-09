@@ -14,7 +14,7 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use regolith::{IsolationLevel, OptimisticTransactionDb, Options};
+use regolith::{IsolationLevel, OptimisticTransactionDb, Options, TxnOptions};
 use tempfile::TempDir;
 
 static ARMED: AtomicBool = AtomicBool::new(false);
@@ -84,7 +84,7 @@ fn a_transaction_scan_stops_early_without_reading_the_range() {
         IsolationLevel::RepeatableRead,
         IsolationLevel::Serializable,
     ] {
-        let txn = db.begin_transaction_owned(level);
+        let txn = db.begin(&TxnOptions::new().isolation(level));
 
         BYTES.store(0, Ordering::Relaxed);
         COUNT.store(0, Ordering::Relaxed);

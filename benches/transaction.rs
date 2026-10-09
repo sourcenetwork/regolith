@@ -17,6 +17,7 @@ use std::time::{Duration, Instant};
 
 use regolith::{
     IsolationLevel, OptimisticTransactionDb, Transaction, TransactionDb, TransactionError,
+    TxnOptions,
 };
 
 const COUNTER_KEY: &[u8] = b"txn/counter";
@@ -36,15 +37,15 @@ const MAX_ATTEMPTS: u32 = 10_000;
 /// written once against this local one and neither flavor gets its own
 /// subtly different copy of the loop.
 trait TxnDb: Sync {
-    fn begin(&self) -> Transaction<'_>;
+    fn begin(&self) -> Transaction;
     fn read(&self, key: &[u8]) -> Option<Vec<u8>>;
 }
 
 macro_rules! impl_txn_db {
     ($flavor:ty) => {
         impl TxnDb for $flavor {
-            fn begin(&self) -> Transaction<'_> {
-                self.begin_transaction()
+            fn begin(&self) -> Transaction {
+                self.begin(&TxnOptions::new())
             }
 
             fn read(&self, key: &[u8]) -> Option<Vec<u8>> {

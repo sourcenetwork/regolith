@@ -5,7 +5,9 @@
 //! for one fails the open. A caller assembling the options by hand meets that
 //! as an open error that says nothing about the environment.
 
-use regolith::{Db, DurabilityMode, IsolationLevel, MemEnv, OptimisticTransactionDb, Options};
+use regolith::{
+    Db, DurabilityMode, IsolationLevel, MemEnv, OptimisticTransactionDb, Options, TxnOptions,
+};
 use std::sync::Arc;
 
 #[test]
@@ -20,7 +22,7 @@ fn a_memory_database_reads_back_what_it_writes() {
 #[test]
 fn a_memory_database_scans_and_transacts() {
     let db = OptimisticTransactionDb::open("memory-txn", Options::memory()).unwrap();
-    let txn = db.begin_transaction_with(IsolationLevel::Serializable);
+    let txn = db.begin(&TxnOptions::new().isolation(IsolationLevel::Serializable));
     for index in 0..64u32 {
         txn.put(format!("key:{index:04}").as_bytes(), b"v").unwrap();
     }

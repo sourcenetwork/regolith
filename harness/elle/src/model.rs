@@ -5,7 +5,7 @@
 //! match the ones in the completion record even when an optimistic
 //! transaction has to be replayed.
 
-use regolith::{
+use regolith::{TxnOptions, 
     Db, IsolationLevel, OptimisticTransactionDb, Options, Transaction, TransactionDb,
     TransactionError, TxResult,
 };
@@ -149,7 +149,7 @@ impl TxnPlan {
         &self,
         model: Model,
         blind_appends: bool,
-        tx: &mut Transaction<'_>,
+        tx: &mut Transaction,
     ) -> TxResult<Vec<Mop>> {
         let mut observed = Vec::with_capacity(self.mops.len());
         let mut read = HashSet::new();
@@ -244,10 +244,10 @@ impl TxDb {
         }
     }
 
-    pub fn begin(&self) -> Transaction<'_> {
+    pub fn begin(&self) -> Transaction {
         match self {
-            TxDb::Pessimistic(db) => db.begin_transaction(),
-            TxDb::Optimistic(db) | TxDb::Defra(db) => db.begin_transaction(),
+            TxDb::Pessimistic(db) => db.begin(&TxnOptions::new()),
+            TxDb::Optimistic(db) | TxDb::Defra(db) => db.begin(&TxnOptions::new()),
         }
     }
 

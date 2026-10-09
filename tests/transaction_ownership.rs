@@ -1,12 +1,11 @@
-//! Integration tests for the owned-transaction API.
+//! Integration tests for the ownership of a `Transaction`.
 //!
-//! `Transaction<'db>` cannot be stored in a `'static` container, which is
-//! what a storage abstraction layer needs when it hands transactions out
-//! as boxed trait objects. `begin_transaction_owned` returns a
-//! transaction that carries an `Arc` on its database instead, so the
-//! tests here are about that boundary: the transaction still commits,
-//! still validates, and still works after every named handle on the
-//! database is gone.
+//! A `Transaction` carries no lifetime and borrows nothing from its
+//! database, so it can sit in a `'static` container such as a boxed trait
+//! object, which is what a storage abstraction layer needs when it hands
+//! transactions out. The tests here are about that boundary: the
+//! transaction still commits, still validates, and still works after
+//! every named handle on the database is gone.
 
 // Native-only. wasm-pack builds every test target for wasm32, and these
 // use the filesystem, which does not exist there. The browser suite lives
@@ -16,8 +15,8 @@
 use std::sync::Arc;
 
 use regolith::{
-    DbSlice, IsolationLevel, OptimisticTransactionDb, Options, OwnedTransaction, TransactionDb,
-    TransactionError,
+    DbSlice, IsolationLevel, OptimisticTransactionDb, Options, Transaction, TransactionDb,
+    TransactionError, TxnOptions,
 };
 use tempfile::TempDir;
 
@@ -28,11 +27,11 @@ fn optimistic(dir: &TempDir) -> Arc<OptimisticTransactionDb> {
 }
 
 #[test]
-fn owned_transaction_commits() {
+fn a_transaction_commits() {
     let dir = TempDir::new().expect("tempdir");
     let db = optimistic(&dir);
 
-    let txn = db.begin_transaction_owned(IsolationLevel::Serializable);
+    let txn = db.begin(&TxnOptions::new().isolation(IsolationLevel::Serializable));
     txn.put(b"key", b"value").expect("put");
     txn.commit().expect("commit");
 
@@ -43,11 +42,11 @@ fn owned_transaction_commits() {
 }
 
 #[test]
-fn owned_transaction_rollback_discards() {
+fn a_transaction_rollback_discards() {
     let dir = TempDir::new().expect("tempdir");
     let db = optimistic(&dir);
 
-    let txn = db.begin_transaction_owned(IsolationLevel::Serializable);
+    let txn = db.begin(&TxnOptions::new().isolation(IsolationLevel::Serializable));
     txn.put(b"key", b"value").expect("put");
     txn.rollback();
 
@@ -55,11 +54,11 @@ fn owned_transaction_rollback_discards() {
 }
 
 #[test]
-fn owned_transaction_reads_its_own_writes() {
+fn a_transaction_reads_its_own_writes() {
     let dir = TempDir::new().expect("tempdir");
     let db = optimistic(&dir);
 
-    let txn = db.begin_transaction_owned(IsolationLevel::Serializable);
+    let txn = db.begin(&TxnOptions::new().isolation(IsolationLevel::Serializable));
     txn.put(b"key", b"buffered").expect("put");
     assert_eq!(
         txn.get(b"key").expect("get").as_deref(),
@@ -70,14 +69,14 @@ fn owned_transaction_reads_its_own_writes() {
 
 /// The point of the type: a transaction that outlives every named handle
 /// on the database it came from. Dropping `db` here would invalidate a
-/// borrowing `Transaction<'db>`, so this is what the `Arc` inside buys.
+/// borrowing `Transaction`, so this is what the `Arc` inside buys.
 #[test]
-fn owned_transaction_outlives_every_named_db_handle() {
+fn a_transaction_outlives_every_named_db_handle() {
     let dir = TempDir::new().expect("tempdir");
 
     let txn = {
         let db = optimistic(&dir);
-        let txn = db.begin_transaction_owned(IsolationLevel::Serializable);
+        let txn = db.begin(&TxnOptions::new().isolation(IsolationLevel::Serializable));
         txn.put(b"key", b"value").expect("put");
         txn
     };
@@ -97,15 +96,14 @@ fn owned_transaction_outlives_every_named_db_handle() {
     );
 }
 
-/// A boxed trait object is the shape a storage layer actually stores, and
-/// it is exactly what the borrowing form cannot produce.
+/// A boxed trait object is the shape a storage layer actually stores.
 #[test]
-fn owned_transaction_fits_a_static_trait_object() {
+fn a_transaction_fits_a_static_trait_object() {
     trait Unit {
         fn run(self: Box<Self>) -> Result<(), TransactionError>;
     }
 
-    impl Unit for OwnedTransaction {
+    impl Unit for Transaction {
         fn run(self: Box<Self>) -> Result<(), TransactionError> {
             self.put(b"boxed", b"value")?;
             (*self).commit()
@@ -115,7 +113,8 @@ fn owned_transaction_fits_a_static_trait_object() {
     let dir = TempDir::new().expect("tempdir");
     let db = optimistic(&dir);
 
-    let unit: Box<dyn Unit> = Box::new(db.begin_transaction_owned(IsolationLevel::Serializable));
+    let unit: Box<dyn Unit> =
+        Box::new(db.begin(&TxnOptions::new().isolation(IsolationLevel::Serializable)));
     unit.run().expect("commit through trait object");
 
     assert_eq!(
@@ -124,16 +123,16 @@ fn owned_transaction_fits_a_static_trait_object() {
     );
 }
 
-/// Serializable validation must still fire through the owned wrapper: it
-/// is the same `Transaction`, so a read the other writer invalidated has
-/// to lose at commit.
+/// Serializable validation must still fire for a transaction held past its
+/// database handle's scope: a read the other writer invalidated has to lose
+/// at commit.
 #[test]
-fn owned_transaction_still_validates_serializable() {
+fn a_transaction_still_validates_serializable() {
     let dir = TempDir::new().expect("tempdir");
     let db = optimistic(&dir);
     db.db().put(b"key", b"first").expect("seed");
 
-    let txn = db.begin_transaction_owned(IsolationLevel::Serializable);
+    let txn = db.begin(&TxnOptions::new().isolation(IsolationLevel::Serializable));
     assert_eq!(
         txn.get(b"key").expect("get").as_deref(),
         Some(&b"first"[..])
@@ -150,11 +149,11 @@ fn owned_transaction_still_validates_serializable() {
 }
 
 #[test]
-fn owned_transaction_works_on_the_pessimistic_db() {
+fn a_transaction_works_on_the_pessimistic_db() {
     let dir = TempDir::new().expect("tempdir");
     let db = Arc::new(TransactionDb::open(dir.path(), Options::default()).expect("open txn db"));
 
-    let txn = db.begin_transaction_owned(IsolationLevel::Serializable);
+    let txn = db.begin(&TxnOptions::new().isolation(IsolationLevel::Serializable));
     txn.put(b"key", b"value").expect("put");
     txn.commit().expect("commit");
 
@@ -191,7 +190,7 @@ fn concurrent_writes_through_a_shared_transaction_all_land() {
 
     let dir = TempDir::new().expect("tempdir");
     let db = optimistic(&dir);
-    let txn = Arc::new(db.begin_transaction_owned(IsolationLevel::Serializable));
+    let txn = Arc::new(db.begin(&TxnOptions::new().isolation(IsolationLevel::Serializable)));
 
     std::thread::scope(|scope| {
         for thread in 0..THREADS {
@@ -239,7 +238,7 @@ fn concurrent_reads_through_a_shared_transaction_are_all_validated() {
             .expect("seed");
     }
 
-    let txn = Arc::new(db.begin_transaction_owned(IsolationLevel::Serializable));
+    let txn = Arc::new(db.begin(&TxnOptions::new().isolation(IsolationLevel::Serializable)));
     std::thread::scope(|scope| {
         for _ in 0..THREADS {
             let txn = Arc::clone(&txn);
@@ -273,7 +272,7 @@ fn a_transaction_keeps_every_key_across_the_buffer_spill_threshold() {
 
     let dir = TempDir::new().expect("tempdir");
     let db = optimistic(&dir);
-    let txn = db.begin_transaction_owned(IsolationLevel::Serializable);
+    let txn = db.begin(&TxnOptions::new().isolation(IsolationLevel::Serializable));
 
     for i in 0..KEYS {
         txn.put(format!("k/{i:04}").as_bytes(), format!("v{i}").as_bytes())
@@ -312,7 +311,7 @@ fn a_later_write_wins_across_the_buffer_spill_threshold() {
 
     let dir = TempDir::new().expect("tempdir");
     let db = optimistic(&dir);
-    let txn = db.begin_transaction_owned(IsolationLevel::Serializable);
+    let txn = db.begin(&TxnOptions::new().isolation(IsolationLevel::Serializable));
 
     for i in 0..KEYS {
         txn.put(format!("k/{i:04}").as_bytes(), b"first")
@@ -358,7 +357,7 @@ fn a_delete_after_the_spill_threshold_still_applies() {
             .expect("seed");
     }
 
-    let txn = db.begin_transaction_owned(IsolationLevel::Serializable);
+    let txn = db.begin(&TxnOptions::new().isolation(IsolationLevel::Serializable));
     for i in 0..KEYS {
         txn.delete(format!("k/{i:04}").as_bytes()).expect("delete");
     }
@@ -382,7 +381,7 @@ fn concurrent_writers_cross_the_spill_threshold_without_losing_a_key() {
 
     let dir = TempDir::new().expect("tempdir");
     let db = optimistic(&dir);
-    let txn = Arc::new(db.begin_transaction_owned(IsolationLevel::Serializable));
+    let txn = Arc::new(db.begin(&TxnOptions::new().isolation(IsolationLevel::Serializable)));
 
     std::thread::scope(|scope| {
         for thread in 0..THREADS {
@@ -426,7 +425,7 @@ fn the_buffer_threshold_is_configurable_and_correct_at_every_setting() {
             ..Options::default()
         };
         let db = Arc::new(OptimisticTransactionDb::open(dir.path(), opts).expect("open"));
-        let txn = db.begin_transaction_owned(IsolationLevel::Serializable);
+        let txn = db.begin(&TxnOptions::new().isolation(IsolationLevel::Serializable));
 
         for i in 0..KEYS {
             txn.put(format!("k/{i:04}").as_bytes(), b"first")

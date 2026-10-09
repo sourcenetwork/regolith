@@ -62,7 +62,7 @@ fn scan_then_commit<D: Flavour>(db: &D, level: IsolationLevel, storage: Storage,
             storage.flush(db.raw());
         },
         |r, force| {
-            let tx = db.begin(level);
+            let tx = db.begin_at(level);
             let walked: BTreeSet<Vec<u8>> = tx
                 .scan_stream(
                     Some(format!("scan/{r}/").as_bytes()),
