@@ -1,56 +1,21 @@
 ---- MODULE RepeatableRead ----
-\* What an optimistic commit validates at each isolation level, transcribed
-\* from the code, and checked against the workload a Merkle-DAG CRDT store runs on it: appends
-\* to a Merkle DAG whose head set is derived from keys, the sweep that reclaims
-\* superseded heads, and a document write derived from a definition read.
-\*
-\* THE ENGINE, as implemented. Each operator below names the function it is
-\* taken from, and the shape is kept so the two can be read side by side.
-\*
-\*   Transaction::observe            src/transaction.rs
-\*     A point read records its key with the begin snapshot as its anchor
-\*     (`read_horizon` is `snapshot_seq` for an optimistic transaction).
-\*   TxnScanStream::yield_cursor     src/transaction.rs
-\*     A scan records one stretch per unbroken run of snapshot keys it
-\*     yields, its first and last key, at every level. It records each
-\*     yielded key as a read only when `validates_scanned_keys` holds, which
-\*     is `Serializable` alone.
-\*   Transaction::validation_set     src/transaction.rs
-\*     Which recorded reads the level validates: every one when
-\*     `validates_every_read` (`RepeatableRead`, `Serializable`,
-\*     `DefraLevel`); the written ones at `ReadCommitted`; the written or
-\*     `get_for_update` ones otherwise.
-\*   scan_range::cover               src/transaction/scan_range.rs
-\*     Every written or merged key inside a stretch a scan walked is a read
-\*     at the begin snapshot, so a scan-then-write is never elided as blind.
-\*   Engine::commit_locked           src/engine/commit/mod.rs
-\*     A read aborts when a newer write to its key exists. A written key not
-\*     among the reads aborts on a newer write unless the write stores
-\*     exactly what the key already holds (`write_matches_committed`,
-\*     src/engine/mod.rs: byte equality, a delete equals only an absent key,
-\*     and never for a key the batch also merges into, since the merge on
-\*     top makes the key hold something else). A merged key is never
-\*     elided. The writes then apply under one sequence, a put before a
-\*     merge into the same key.
+\* What an optimistic commit validates at each isolation level, and at
+\* DefraLevel for each key class, checked against the workloads a Merkle-DAG
+\* CRDT store and its callers run on it. The commit rule, the key layout and
+\* the variables live in RepeatableReadCommit.tla, which says which rules are
+\* transcribed from the code and which the plan specifies before code.
 \*
 \* Reads are performed when a transaction begins. They are snapshot reads in
 \* the engine, answered from the state at begin whenever they are issued, so
-\* taking them at begin loses no interleaving. A commit takes one sequence
-\* here where the engine gives a batch one per operation; every operation of
-\* a commit after the snapshot sorts above it and every one before sorts at
-\* or below, which is all the check reads. `get_for_update` and the
-\* pessimistic flavour do not occur in the workload; the `get_for_update`
-\* term of `validation_set` is kept, with an empty set, so the transcription
-\* stays complete. A range delete occurs only as a plain write,
-\* `Db::delete_range`: `Transaction::delete_range` refuses one, so no commit
-\* batch carries it. `write_matches_committed` also refuses an elision when
-\* the key's newest entry is an unresolved merge operand. That is not
-\* modeled, because here it cannot change an outcome: a counter with an
-\* operand on top holds at least one, which a reset's delete never equals,
-\* and a rebase's put is already refused elision by the merge its own batch
-\* carries.
+\* taking them at begin loses no interleaving; the one read served later is
+\* a pessimistic get_for_update past the snapshot (Promote). A commit takes
+\* one sequence here where the engine gives a batch one per operation; every
+\* operation of a commit after the snapshot sorts above it and every one
+\* before sorts at or below, which is all the check reads. A range delete
+\* occurs only as a plain write, `Db::delete_range`:
+\* `Transaction::delete_range` refuses one, so no commit batch carries it.
 \*
-\* THE WORKLOAD, one transaction each.
+\* THE FIRST WORKLOADS (#237), one transaction each.
 \*   Appender  scans the head range and the marker range, derives the live
 \*             heads, writes its own head key and one marker per live head
 \*             naming itself. A branchable collection append.
@@ -82,27 +47,13 @@
 \* from is a point read, and the one read that is allowed to change
 \* underneath a transaction is the head scan.
 \*
-\* DEFRALEVEL. RepeatableRead, relaxed in three places for an optimistic
-\* transaction (src/transaction/policy.rs, src/engine/commit/mod.rs):
-\*   policy::run_is_commutative   a scan stretch whose first and last key lie
-\*                                in one prefix the caller declares
-\*                                commutative is dropped before
-\*                                scan_range::cover. A stretch that leaves the
-\*                                prefix is kept, as at RepeatableRead.
-\*   KeyClass::ContentAddressed   a key in a prefix the caller declares
-\*                                content-addressed is validated nowhere: a
-\*                                read of it records nothing, and a put,
-\*                                delete or merge of it is never checked
-\*                                against a newer write. Sound only where the
-\*                                key determines the bytes, as for a block.
-\*   Replaced / newest_terminator a key the commit only merges into (it
-\*                                neither read it nor puts or deletes it)
-\*                                aborts only on a newer put, delete or range
-\*                                delete, never on a newer merge operand.
-\*                                Operands apply in commit order.
-\* For a key merged into blind this is not snapshot isolation: two
-\* transactions merging into it concurrently both commit. What the model
-\* checks for such a key is the value it ends up holding.
+\* DEFRALEVEL. RepeatableRead, relaxed for an optimistic transaction:
+\* commutative prefixes (a stretch inside one records nothing), the
+\* content-addressed class (E17), blind merges (a key the commit only merges
+\* into aborts only on a newer put, delete or range delete), and the PLAN
+\* mechanisms below. For a key merged into blind this is not snapshot
+\* isolation: two transactions merging into it concurrently both commit.
+\* What the model checks for such a key is the value it ends up holding.
 \*
 \* More workloads exercise DefraLevel, each in configs of its own.
 \*   Mergers       apply the same remote block, so they write identical head
@@ -144,16 +95,89 @@
 \* Red_DefinitionContentAddressed declares the definition, whose bytes change
 \* under one key, and INV_NoStaleDefinition fails.
 \*
-\* MUTANTS. `Mutant` breaks one line of the transcription, and each has a RED
-\* config: that is what shows the line keeps a GREEN config green.
+\* THE LATER WORKLOADS (docs/plans/defralevel.md, section 3), one per
+\* mechanism, each with its own Extras record below and configs of its own.
+\* Each decider writes its decision into an output key only it writes, so it
+\* is a writing transaction and its reads are validated.
+\*   ContentAddressedWorkload [3.2, E17]
+\*     Collector  reads the shared block (present), scans the pins with a
+\*                plain scan and point-reads every hold; when nothing refers
+\*                to the block it deletes it. Garbage collection.
+\*     Linkers    read the block, put it again (or merge its own bytes into
+\*                it) and pin it: a reference that re-puts what it refers to.
+\*     Holder     reads the block and records whether it is present: 1, a
+\*                reference that relies on the block's presence, or 2.
+\*     INV_NoDanglingReference  a stored pin or reference names a stored block.
+\*     INV_LinksCommit          two creates of one block both commit.
+\*     INV_HoldsCurrent         a holder's record matches the block at commit.
+\*   PartsWorkload [3.3, 3.4]
+\*     PartReader    get_parts(part key, {1}); its decision is whether the key
+\*                   exists and what part 1 holds.
+\*     PartRewriter  get_parts(part key, {1}), then puts the whole value it read
+\*                   with part 1 bumped: a decision on every part.
+\*     PartWriters   one blind write each: an identical put, a put changing
+\*                   part 2, a delete, or an operand touching part 1 or part 2.
+\*     INV_PartsCurrent  no projected reader commits on changed inputs.
+\*     INV_PartsRelaxed  a reader that found the key is not refused when every
+\*                       newer write is an operand touching only part 2.
+\*   ValueWorkload [3.5]
+\*     ValueReader     reads the version key and decides on its value.
+\*     VersionWriters  rewrite it with the same bytes, or toggle it (1, 2),
+\*                     so a value can come back (ABA).
+\*     INV_ValueReadsCurrent        no reader commits over a different value.
+\*     INV_IdenticalRewritesCommit  no reader is refused while the value is the
+\*                                  one it read. A liveness property, kept as
+\*                                  an invariant on refusals.
+\*   WriteFreeWorkload [3.8]
+\*     ReadOnly    optimistic, reads both skew keys at its snapshot, writes
+\*                 nothing.
+\*     Promoter    pessimistic, reads skew key A at its snapshot, then skew key
+\*                 B with get_for_update at a later horizon, writes nothing.
+\*                 Its lock on B is not modelled: dropping it only adds
+\*                 interleavings, and the RED needs none of them.
+\*     SkewWriter  writes both keys, one more each.
+\*     INV_WriteFreeCommits     a write-free DefraLevel transaction never
+\*                              conflicts.
+\*     INV_WriteFreeConsistent  every committed write-free transaction read one
+\*                              point in time.
+\*   LogWorkload, LogDecisionWorkload [3.2, 3.6]
+\*     LogAppenders  append one entry each.
+\*     LogReader     reads the head, appends, and stores the head it read as
+\*                   its cursor. It does not see its own append.
+\*     LogDecider    misuse: decides on how many entries the log holds.
+\*     INV_LogNeverConflicts    no appender or log reader is refused.
+\*     INV_LogDense             the log holds entries 1..head and nothing more.
+\*     INV_NoPhantomAppend      every entry a reader saw is in the log at its
+\*                              commit, at the position it saw.
+\*     INV_LogDecisionsCurrent  no decision on a log read went stale.
+\*   TallyWorkload [3.2, E11]
+\*     TallyMergers  merge into a key of a commutative prefix, then scan the
+\*                   prefix: the merge stays blind inside the stretch.
+\*     INV_TallyMergesCommit, INV_TallyExact  none is refused, none is lost.
+\*   OwnWritesWorkload [3.9]
+\*     OwnWriters  two operations on one key (merge, put, delete, in some
+\*                 order), then a read of it.
+\*     INV_ReadYourOwnWrites  the value a commit leaves is the value its
+\*                            transaction read back.
+\*   ScanWorkload [3.15]
+\*     Checker  a validated scan of the grant range; it decides on the set
+\*              of grants.
+\*     Revoker  deletes the grant there; Granter puts a new one (a phantom).
+\*     INV_ScanDecisionsCurrent  no checker commits over a changed range.
+\*   Every GREEN, the first workloads' included:
+\*     INV_ReasonsExact  every abort's reason names a key, what the
+\*                       transaction did with it, and a write newer than
+\*                       the anchor whose kind is `theirs`, whose sequence
+\*                       is `latest_seq`, and which can decide that access
+\*                       [3.14].
+\*
+\* MUTANTS. `Mutant` breaks one line of the rule, and each has a RED config:
+\* that is what shows the line keeps a GREEN config green.
 \*   ReadMergeBlind             a merged key the transaction read is
 \*                              validated as a blind merge.
 \*                              INV_ReceiptsExact RED.
 \*   PutMergeBlind              a merged key the batch also puts is validated
 \*                              as a blind merge.  INV_CounterExact RED.
-\*                              The engine also checks the put on its own, so
-\*                              there this takes losing that check as well as
-\*                              `Replaced`.
 \*   PutMergeElides             an identical put is elided although its batch
 \*                              merges on top.     INV_CounterExact RED.
 \*   MergeIgnoresReplacement    a blind merge conflicts with nothing.
@@ -163,153 +187,127 @@
 \*   PolicyIgnoresRange         a stretch is dropped when either end lies in a
 \*                              commutative prefix, wherever it runs.
 \*                              INV_NoStaleDefinition RED.
+\*   CaDeleteExempt             a content-addressed delete is not validated
+\*                              (before E17): a collection races a pin.
+\*                              INV_NoDanglingReference RED.
+\*   PresenceReadFull           a content-addressed read that found the key is
+\*                              validated in full by sequence, its own put
+\*                              notwithstanding: two creates of one block.
+\*                              INV_LinksCommit RED.
+\*   PresenceUnchecked          a content-addressed read that found the key is
+\*                              not validated (before E17).
+\*                              INV_HoldsCurrent RED.
+\*   PartsIgnorePut             a put or delete does not change the parts.
+\*   PartsIgnoreTouch           an operand never changes them.
+\*   PartsNoAbsentFallback      a projected read that found nothing stays
+\*                              projected.
+\*   PartsNoPutFallback         a projected read of a key the transaction puts
+\*                              stays projected: a lost update.
+\*   PartsNamesOther            the reader names part 2 and decides on part 1
+\*                              (caller misuse).   All five INV_PartsCurrent RED.
+\*   SeqOnlyValidation          DefraLevel compares sequences, not values.
+\*                              INV_IdenticalRewritesCommit RED.
+\*   WriteFreePessimistic       the write-free exemption applies to a
+\*                              pessimistic transaction whose get_for_update
+\*                              read past its snapshot (rejected by the plan).
+\*                              INV_WriteFreeConsistent RED.
+\*   OwnAppendVisible           a log reader sees its own append at the next
+\*                              position.          INV_NoPhantomAppend RED.
+\*   MergeBeforeScanReadsBase   a scan over a key the transaction merged into
+\*                              records the base read (before E11).
+\*                              INV_TallyMergesCommit RED.
+\*   PutsBeforeMerges           a commit applies puts before merges whatever
+\*                              their order (the 0.1.x engine).
+\*   OwnMergesInvisible         a read ignores the transaction's own merges.
+\*                              Both INV_ReadYourOwnWrites RED.
+\*   ReasonNewestWrite          a reason names the key's newest write, not the
+\*                              one that decided.  INV_ReasonsExact RED.
+\*   PlainScanDecides           a checker decides on a plain scan.
+\*                              INV_ScanDecisionsCurrent RED.
+\* Two REDs are misuse, not mutants: Red_DecideOnLogRead (a decision on a
+\* Log read, INV_LogDecisionsCurrent) and Red_Parts_RepeatableRead (get_parts
+\* at RepeatableRead is a get, INV_PartsRelaxed).
+\*
+\* LEAN, for every size (proofs/lean/Regolith):
+\*   Validation.lean     ordinary_serial, value_serial, contentAddressed_serial,
+\*                       parts_serial, scan_serial, exempt_serial (Log reads,
+\*                       commutative stretches, empty parts), blindMerge_serial,
+\*                       and all_classes_serial: a history whose every commit
+\*                       passed its class's rule equals the same transactions
+\*                       run one at a time in commit order. Each rests on its
+\*                       rule's soundness lemma: full_current, value_current,
+\*                       presence_current, parts_current, scan_current; the
+\*                       content-addressed one on ca_put_idempotent and
+\*                       ca_commit_point.
+\*   Relaxations.lean    blindMerge_commutes, identical_rewrite,
+\*                       commutative_union, appends_advance_head and
+\*                       appends_keep_dense (INV_LogDense),
+\*                       writeFree_at_snapshot (INV_WriteFreeConsistent); the
+\*                       REDs exempt_decision_breaks_serial
+\*                       (Red_DecideOnLogRead, Red_PartsNamesOther) and
+\*                       promoted_read_skew (Red_WriteFreePessimistic).
+\*   MergeOperator.lean  fold_eq_grouping, fold_eq_any_grouping and
+\*                       steps_preserve_fold (an exact partial_merge folds to
+\*                       full_merge in any grouping), groupings_agree,
+\*                       touches_law and touches_survives_compaction (an
+\*                       operand touching no named part leaves those parts
+\*                       unchanged), inexact_breaks_fold (the RED), and
+\*                       part_operator_* (this model's part operand keeps the
+\*                       contract).
+\* What Lean does not cover: the interleavings (TLC does), and the
+\* invariants that tie a workload's protocol together (INV_NoDanglingReference
+\* needs the collector, the pins and the holds at once).
 
-EXTENDS Naturals, FiniteSets, TLC
+EXTENDS RepeatableReadCommit
 
-CONSTANTS
-  Appenders, \* naturals; an appender's id is also its block id
-  Seed,      \* the block already established as the head, a natural
-  Pruner,    \* transaction ids, naturals outside Appenders
-  Writer,
-  Patcher,
-  Mergers,      \* transactions applying the remote block, possibly none
-  Remote,       \* the remote block, a natural
-  RemoteParents,\* the parents the remote block names, fixed by its content
-  Incrementers, \* transactions blind-merging the counter, possibly none
-  ReadMergers,  \* transactions reading the counter and merging into it, possibly none
-  Rebasers,     \* transactions putting the counter and merging into it, possibly none
-  Resetters,    \* transactions deleting the counter, possibly none
-  Clearers,     \* plain range deletes over the counter's range, possibly none
-  Migrators,    \* transactions rewriting the definition after a scan, possibly none
-  CommutativeRanges, \* ranges the KeyClassifier declares commutative
-  ContentAddressedRanges, \* ranges the KeyClassifier declares content-addressed
-  Level,     \* "ReadCommitted" | "SnapshotIsolation" | "RepeatableRead" | "Serializable" | "DefraLevel"
-  Mutant     \* "none", or the line a RED config breaks (MUTANTS above)
-
-CounterTxns == Incrementers \cup ReadMergers \cup Rebasers \cup Resetters \cup Clearers
-ExtraTxns   == Mergers \cup CounterTxns \cup Migrators
-
-ASSUME Appenders # {} /\ Appenders \subseteq Nat
-ASSUME Seed \in Nat /\ Seed \notin Appenders
-ASSUME {Pruner, Writer, Patcher} \subseteq Nat
-ASSUME Cardinality({Pruner, Writer, Patcher}) = 3
-ASSUME {Pruner, Writer, Patcher} \cap Appenders = {}
-ASSUME Level \in {"ReadCommitted", "SnapshotIsolation", "RepeatableRead", "Serializable",
-                  "DefraLevel"}
-ASSUME Mutant \in {"none", "ReadMergeBlind", "PutMergeBlind", "PutMergeElides",
-                   "MergeIgnoresReplacement", "RangeDeleteNotReplacement",
-                   "PolicyIgnoresRange"}
-ASSUME Remote \in Nat /\ Remote \notin Appenders \cup {Seed}
-ASSUME RemoteParents \subseteq Appenders \cup {Seed}
-ASSUME ExtraTxns \subseteq Nat
-ASSUME ExtraTxns \cap (Appenders \cup {Pruner, Writer, Patcher}) = {}
-\* The extra workloads are pairwise disjoint.
-ASSUME Cardinality(ExtraTxns) =
-         Cardinality(Mergers) + Cardinality(Incrementers) + Cardinality(ReadMergers)
-         + Cardinality(Rebasers) + Cardinality(Resetters) + Cardinality(Clearers)
-         + Cardinality(Migrators)
-
-Blocks == Appenders \cup {Seed} \cup (IF Mergers = {} THEN {} ELSE {Remote})
-Txns   == Appenders \cup {Pruner, Writer, Patcher} \cup ExtraTxns
-
-\* Keys are <<range, p, c>>. Ranges sort head < marker < def < doc < counter
-\* < block, and inside a range a key sorts by the blocks it names: the order a
-\* scan walks. A range is also the prefix a KeyClassifier declares.
-HeadRange    == 1
-MarkerRange  == 2
-DefRange     == 3
-DocRange     == 4
-CounterRange == 5
-BlockRange   == 6
-ASSUME CommutativeRanges \subseteq {HeadRange, MarkerRange}
-\* A key has one class.
-ASSUME /\ ContentAddressedRanges \subseteq {HeadRange, MarkerRange, DefRange, DocRange,
-                                             CounterRange, BlockRange}
-       /\ ContentAddressedRanges \cap CommutativeRanges = {}
-
-HeadKey(b)      == <<HeadRange, b, b>>
-MarkerKey(p, c) == <<MarkerRange, p, c>>
-DefKey          == <<DefRange, 0, 0>>
-DocKey          == <<DocRange, 0, 0>>
-CounterKey      == <<CounterRange, 0, 0>>
-\* A block's content-addressed key: written once, identically by anyone.
-BlockKey(b)     == <<BlockRange, b, b>>
-
-Keys == {HeadKey(b) : b \in Blocks}
-        \cup {MarkerKey(p, c) : p \in Blocks, c \in Blocks}
-        \cup {DefKey, DocKey, CounterKey}
-        \cup {BlockKey(b) : b \in Blocks}
-
-KeyLeq(a, b) ==
-  \/ a[1] < b[1]
-  \/ a[1] = b[1] /\ a[2] < b[2]
-  \/ a[1] = b[1] /\ a[2] = b[2] /\ a[3] <= b[3]
-
-MinKey(S) == CHOOSE k \in S : \A j \in S : KeyLeq(k, j)
-MaxKey(S) == CHOOSE k \in S : \A j \in S : KeyLeq(j, k)
-
-\* A value is a natural; 0 is an absent key, and a delete intends 0. The
-\* counter's value is its count, so an absent counter counts 0.
-Absent == 0
-
-VARIABLES
-  clock,     \* the engine sequence, advanced by every commit that writes
-  store,     \* [Keys -> Nat] what each key holds
-  latest,    \* [Keys -> Nat] sequence of the last commit that wrote each key
-  replaced,  \* [Keys -> Nat] sequence of the last put, delete or range delete of each key
-  phase,     \* [Txns -> {"idle", "open", "committed", "aborted"}]
-  snap,      \* [Txns -> Nat] begin snapshot
-  tracked,   \* [Txns -> SUBSET Keys] keys recorded as reads
-  runs,      \* [Txns -> SUBSET (Keys \X Keys)] stretches scans walked
-  written,   \* [Txns -> SUBSET Keys] keys the commit puts or deletes
-  merged,    \* [Txns -> SUBSET Keys] keys the commit merges an operand into
-  intended,  \* [Txns -> [Keys -> Nat]] what each put or deleted key is set to
-  seen,      \* [Txns -> Nat] the value a write was derived from: the definition
-             \* the writer or a migrator read, the count a read-merger read
-  parents,   \* [Blocks -> SUBSET Blocks] parents each committed block recorded
-  stale,     \* TRUE once a write committed over a definition replaced after it was read
-  dupRefused,    \* TRUE once a merger was refused over writes identical to its own
-  wrongReceipt,  \* TRUE once a read-merger committed over a count that moved
-  needlessRefusal, \* TRUE once a blind increment was refused that could have committed
-  cbase,     \* ghost: what the last put, delete or range delete stored in the counter
-  cepoch,    \* ghost: the sequence it committed at
-  cinc       \* ghost: commit sequences of the increments counted on top of it
-
-vars == <<clock, store, latest, replaced, phase, snap, tracked, runs, written, merged,
-          intended, seen, parents, stale, dupRefused, wrongReceipt, needlessRefusal,
-          cbase, cepoch, cinc>>
-
-Stored == {k \in Keys : store[k] # Absent}
+\* The Extras a config names (Extras <- ...): which ids play which role.
+NoExtras == [r \in RoleNames |-> {}]
+\* The content-addressed collection: a collector, two linkers, a holder.
+ContentAddressedWorkload ==
+  [NoExtras EXCEPT !["Collectors"] = {20}, !["Linkers"] = {21, 22}, !["Holders"] = {23}]
+\* Projected reads: a part reader, a rewriter, two part writers.
+PartsWorkload ==
+  [NoExtras EXCEPT !["PartReaders"] = {30}, !["PartRewriters"] = {31},
+                   !["PartWriters"] = {32, 33}]
+\* Value-validated reads: a reader and two version writers.
+ValueWorkload ==
+  [NoExtras EXCEPT !["ValueReaders"] = {40}, !["VersionWriters"] = {41, 42}]
+\* Write-free transactions: a read-only, a promoter and a skew writer.
+WriteFreeWorkload ==
+  [NoExtras EXCEPT !["ReadOnlys"] = {50}, !["Promoters"] = {51}, !["SkewWriters"] = {52}]
+\* The log: two appenders and a reader that appends too.
+LogWorkload ==
+  [NoExtras EXCEPT !["LogAppenders"] = {60, 61}, !["LogReaders"] = {62}]
+\* The log misuse: an appender and a decider on the log's length.
+LogDecisionWorkload ==
+  [NoExtras EXCEPT !["LogAppenders"] = {60}, !["LogDeciders"] = {63}]
+\* E11: two merges into one commutative key, each then scanning its prefix.
+TallyWorkload ==
+  [NoExtras EXCEPT !["TallyMergers"] = {70, 71}]
+\* Read-your-own-writes: two transactions with two operations each.
+OwnWritesWorkload ==
+  [NoExtras EXCEPT !["OwnWriters"] = {80, 81}]
+\* Validated scans: a checker, a revoker and a granter.
+ScanWorkload ==
+  [NoExtras EXCEPT !["Checkers"] = {90}, !["Revokers"] = {91}, !["Granters"] = {92}]
 
 \* The head set a scan of S derives: a stored head key no stored marker
 \* names as a parent.
 Heads(S) ==
   {b \in Blocks : HeadKey(b) \in S /\ ~\E c \in Blocks : MarkerKey(b, c) \in S}
 
+\* The blocks a scan of S finds superseded: a stored head some stored
+\* marker names as a parent, which the sweep may reclaim.
 Superseded(S) ==
   {b \in Blocks : HeadKey(b) \in S /\ \E c \in Blocks : MarkerKey(b, c) \in S}
 
 ----------------------------------------------------------------------------
-\* One forward scan over the snapshot S, from the first key of range lo
-\* through the last key of range hi.
-
-\* The keys it yields.
-Yield(S, lo, hi) == {k \in S : lo <= k[1] /\ k[1] <= hi}
-
-\* TxnScanStream::yield_cursor: the stretch it records, first and last key,
-\* none when it yields nothing.
-Stretch(Y) == IF Y = {} THEN {} ELSE {<<MinKey(Y), MaxKey(Y)>>}
-
-\* TxnScanStream::yield_cursor: the yielded keys it records as reads, only
-\* where IsolationLevel::validates_scanned_keys holds.
-ScanReads(Y) == IF Level = "Serializable" THEN Y ELSE {}
-
-----------------------------------------------------------------------------
+\* The start: nothing committed, every transaction idle, every key at its
+\* initial value (InitStore), no history and no flag.
 Init ==
   /\ clock     = 0
-  /\ store     = [k \in Keys |-> IF k \in {HeadKey(Seed), DefKey, BlockKey(Seed)} THEN 1 ELSE Absent]
-  /\ latest    = [k \in Keys |-> 0]
-  /\ replaced  = [k \in Keys |-> 0]
+  /\ store     = InitStore
+  /\ hist      = {}
   /\ phase     = [t \in Txns |-> "idle"]
   /\ snap      = [t \in Txns |-> 0]
   /\ tracked   = [t \in Txns |-> {}]
@@ -318,6 +316,9 @@ Init ==
   /\ merged    = [t \in Txns |-> {}]
   /\ intended  = [t \in Txns |-> [k \in Keys |-> Absent]]
   /\ seen      = [t \in Txns |-> 0]
+  /\ ops       = [t \in Txns |-> <<>>]
+  /\ forUpdate = [t \in Txns |-> {}]
+  /\ flags     = {}
   /\ parents   = [b \in Blocks |-> {}]
   /\ stale     = FALSE
   /\ dupRefused      = FALSE
@@ -343,11 +344,12 @@ BeginMerger(m) ==
      /\ runs'     = [runs EXCEPT ![m] = Stretch(heads) \cup Stretch(markers)]
      /\ written'  = [written EXCEPT ![m] = keys]
      /\ intended' = [intended EXCEPT ![m] = [k \in Keys |-> IF k \in keys THEN 1 ELSE Absent]]
-     /\ UNCHANGED <<merged, seen>>
+     /\ UNCHANGED <<merged, seen, ops>>
 
+\* An increment merged into the counter, reading nothing.
 BeginIncrementer(i) ==
   /\ merged' = [merged EXCEPT ![i] = {CounterKey}]
-  /\ UNCHANGED <<tracked, runs, written, intended, seen>>
+  /\ UNCHANGED <<tracked, runs, written, intended, seen, ops>>
 
 \* Transaction::get on the counter, then an increment merged into it. The
 \* receipt, the count read plus one, is kept in `seen`: no other transaction
@@ -356,18 +358,20 @@ BeginReadMerger(r) ==
   /\ tracked' = [tracked EXCEPT ![r] = {CounterKey}]
   /\ merged'  = [merged EXCEPT ![r] = {CounterKey}]
   /\ seen'    = [seen EXCEPT ![r] = store[CounterKey]]
-  /\ UNCHANGED <<runs, written, intended>>
+  /\ UNCHANGED <<runs, written, intended, ops>>
 
+\* The counter put to 1 and an increment merged on top, in one batch.
 BeginRebaser(r) ==
   /\ written'  = [written EXCEPT ![r] = {CounterKey}]
   /\ merged'   = [merged EXCEPT ![r] = {CounterKey}]
   /\ intended' = [intended EXCEPT ![r] = [k \in Keys |-> IF k = CounterKey THEN 1 ELSE Absent]]
-  /\ UNCHANGED <<tracked, runs, seen>>
+  /\ UNCHANGED <<tracked, runs, seen, ops>>
 
+\* A delete of the counter.
 BeginResetter(r) ==
   /\ written'  = [written EXCEPT ![r] = {CounterKey}]
   /\ intended' = [intended EXCEPT ![r] = [k \in Keys |-> Absent]]
-  /\ UNCHANGED <<tracked, runs, merged, seen>>
+  /\ UNCHANGED <<tracked, runs, merged, seen, ops>>
 
 \* One stream from the head range through the definition: its stretch starts
 \* in the head prefix and ends on the definition.
@@ -379,8 +383,10 @@ BeginMigrator(g) ==
      /\ intended' = [intended EXCEPT ![g] =
                       [k \in Keys |-> IF k = DefKey THEN store[DefKey] + 1 ELSE Absent]]
      /\ seen'     = [seen EXCEPT ![g] = store[DefKey]]
-     /\ UNCHANGED merged
+     /\ UNCHANGED <<merged, ops>>
 
+\* Scan the heads and markers, then write its own head, its block, and a
+\* marker naming itself against every live head.
 BeginAppender(a) ==
   LET heads   == Yield(Stored, HeadRange, HeadRange)
       markers == Yield(Stored, MarkerRange, MarkerRange)
@@ -389,7 +395,7 @@ BeginAppender(a) ==
      /\ runs'     = [runs EXCEPT ![a] = Stretch(heads) \cup Stretch(markers)]
      /\ written'  = [written EXCEPT ![a] = keys]
      /\ intended' = [intended EXCEPT ![a] = [k \in Keys |-> IF k \in keys THEN 1 ELSE Absent]]
-     /\ UNCHANGED <<merged, seen>>
+     /\ UNCHANGED <<merged, seen, ops>>
 
 \* Enabled once something is reclaimable, as the real sweep is a no-op
 \* otherwise. One head per pass, chosen freely, with the markers against it
@@ -404,7 +410,7 @@ BeginPruner ==
      /\ intended' = [intended EXCEPT ![Pruner] = [k \in Keys |-> Absent]]
      /\ tracked'  = [tracked EXCEPT ![Pruner] = ScanReads(heads) \cup ScanReads(markers)]
      /\ runs'     = [runs EXCEPT ![Pruner] = Stretch(heads) \cup Stretch(markers)]
-     /\ UNCHANGED <<merged, seen>>
+     /\ UNCHANGED <<merged, seen, ops>>
 
 \* Transaction::observe on the definition, then a document carrying it.
 BeginWriter ==
@@ -413,121 +419,342 @@ BeginWriter ==
   /\ intended' = [intended EXCEPT ![Writer] =
                    [k \in Keys |-> IF k = DocKey THEN store[DefKey] ELSE Absent]]
   /\ seen'     = [seen EXCEPT ![Writer] = store[DefKey]]
-  /\ UNCHANGED <<runs, merged>>
+  /\ UNCHANGED <<runs, merged, ops>>
 
+\* The definition replaced by the next version.
 BeginPatcher ==
   /\ written'  = [written EXCEPT ![Patcher] = {DefKey}]
   /\ intended' = [intended EXCEPT ![Patcher] =
                    [k \in Keys |-> IF k = DefKey THEN store[DefKey] + 1 ELSE Absent]]
-  /\ UNCHANGED <<tracked, runs, merged, seen>>
+  /\ UNCHANGED <<tracked, runs, merged, seen, ops>>
 
+----------------------------------------------------------------------------
+\* The later workloads' begins. Do(t, ...) records, in one step, the point
+\* reads, scan stretches, written keys, merged keys and intended values of
+\* transaction t; `it` maps each written key to what it stores.
+
+\* No written key.
+NoIntent == [k \in {} |-> Absent]
+\* `it` as a function over every key, absent where it says nothing.
+Intend(it) == [k \in Keys |-> IF k \in DOMAIN it THEN it[k] ELSE Absent]
+
+\* Record t's reads, stretches, written and merged keys, and intended values.
+Do(t, rd, rn, wr, mg, it) ==
+  /\ tracked'  = [tracked EXCEPT ![t] = rd]
+  /\ runs'     = [runs EXCEPT ![t] = rn]
+  /\ written'  = [written EXCEPT ![t] = wr]
+  /\ merged'   = [merged EXCEPT ![t] = mg]
+  /\ intended' = [intended EXCEPT ![t] = Intend(it)]
+
+\* Enabled once the shared block is stored and nothing refers to it at the
+\* snapshot. The pin scan is a plain scan, and an empty one records no
+\* stretch: the collector relies on every pinner putting the block again,
+\* which its validated delete sees. A hold is a point read of a key the
+\* collector must see change, so it is validated in full.
+BeginCollector(c) ==
+  /\ store[Shared] # Absent
+  /\ Yield(Stored, PinRange, PinRange) = {}
+  /\ \A h \in Holders : store[HoldKey(h)] # 1
+  /\ Do(c, {Shared} \cup {HoldKey(h) : h \in Holders}, {}, {Shared}, {}, Shared :> Absent)
+  /\ UNCHANGED <<seen, ops>>
+
+\* A pin re-puts the block it refers to, or merges the block's own bytes
+\* into it (an idempotent operand): either way the commit stores the block.
+BeginLinker(l) ==
+  \E how \in {"put", "merge"} :
+    /\ Do(l, {Shared}, {},
+          {PinKey(l)} \cup (IF how = "put" THEN {Shared} ELSE {}),
+          IF how = "merge" THEN {Shared} ELSE {},
+          (PinKey(l) :> 1) @@ (Shared :> 1))
+    /\ ops' = [ops EXCEPT ![l] = <<how>>]
+    /\ UNCHANGED seen
+
+\* The holder's record: 1 refers to the block, 2 says it is missing.
+BeginHolder(h) ==
+  /\ Do(h, {Shared}, {}, {HoldKey(h)}, {},
+        HoldKey(h) :> IF store[Shared] # Absent THEN 1 ELSE 2)
+  /\ UNCHANGED <<seen, ops>>
+
+\* The part reader's get_parts is recorded by role (PartRead); its decision,
+\* part 1 as read, goes to its output key.
+BeginPartReader(r) ==
+  /\ Do(r, {}, {}, {OutKey(r)}, {}, OutKey(r) :> Part(store[PartKey], 1))
+  /\ UNCHANGED <<seen, ops>>
+
+\* The rewrite: part 1 one up, part 2 as read.
+Rewrite(v) == PartValue(Part(v, 1) + 1, Part(v, 2))
+
+\* get_parts(part key, {1}) (by role), then a put of the rewrite.
+BeginPartRewriter(w) ==
+  /\ Do(w, {}, {}, {PartKey}, {}, PartKey :> Rewrite(store[PartKey]))
+  /\ UNCHANGED <<seen, ops>>
+
+\* One blind write: the value read again ("same"), the value read with
+\* part 2 one up ("other"), a delete, or an operand touching one part.
+BeginPartWriter(w) ==
+  \E op \in {"same", "other", "delete", "touch1", "touch2"} :
+    /\ ops' = [ops EXCEPT ![w] = <<op>>]
+    /\ IF op \in {"touch1", "touch2"}
+         THEN Do(w, {}, {}, {}, {PartKey}, NoIntent)
+         ELSE Do(w, {}, {}, {PartKey}, {},
+                 PartKey :> CASE op = "same"   -> store[PartKey]
+                              [] op = "other"  -> PartValue(Part(store[PartKey], 1),
+                                                            Part(store[PartKey], 2) + 1)
+                              [] op = "delete" -> Absent)
+    /\ UNCHANGED seen
+
+\* A read of the version key; its value goes to the output key.
+BeginValueReader(r) ==
+  /\ Do(r, {VersionKey}, {}, {OutKey(r)}, {}, OutKey(r) :> store[VersionKey])
+  /\ UNCHANGED <<seen, ops>>
+
+\* The version key holds 1 or 2; "other" toggles it.
+BeginVersionWriter(w) ==
+  \E op \in {"same", "other"} :
+    /\ Do(w, {}, {}, {VersionKey}, {},
+          VersionKey :> IF op = "same" THEN store[VersionKey] ELSE 3 - store[VersionKey])
+    /\ UNCHANGED <<seen, ops>>
+
+\* Both skew keys read at the snapshot, nothing written.
+BeginReadOnly(r) ==
+  /\ Do(r, {SkewA, SkewB}, {}, {}, {}, NoIntent)
+  /\ UNCHANGED <<seen, ops>>
+
+\* The read of B comes later, in Promote.
+BeginPromoter(p) ==
+  /\ Do(p, {SkewA}, {}, {}, {}, NoIntent)
+  /\ UNCHANGED <<seen, ops>>
+
+\* Both skew keys one more, blind.
+BeginSkewWriter(w) ==
+  /\ Do(w, {}, {}, {SkewA, SkewB}, {}, (SkewA :> store[SkewA] + 1) @@ (SkewB :> store[SkewB] + 1))
+  /\ UNCHANGED <<seen, ops>>
+
+\* An append records nothing at begin: its position is assigned at commit.
+BeginLogAppender(a) ==
+  /\ Do(a, {}, {}, {}, {}, NoIntent)
+  /\ UNCHANGED <<seen, ops>>
+
+\* The head it read becomes its cursor; its own append is not in the head.
+BeginLogReader(r) ==
+  /\ Do(r, {LogHead}, {}, {OutKey(r)}, {}, OutKey(r) :> store[LogHead])
+  /\ UNCHANGED <<seen, ops>>
+
+\* The head read (never validated) and written down as how many entries
+\* the log holds: a decision on a Log read.
+BeginLogDecider(d) ==
+  /\ Do(d, {LogHead}, {}, {OutKey(d)}, {}, OutKey(d) :> store[LogHead])
+  /\ UNCHANGED <<seen, ops>>
+
+\* The merge comes first; the scan of the tally prefix then yields the key,
+\* made visible by the transaction's own operand, as one stretch inside the
+\* prefix. E11: the scan reads the operands-only key's base without
+\* recording it (MUTANT MergeBeforeScanReadsBase records it).
+BeginTallyMerger(m) ==
+  /\ Do(m, IF Mutant = "MergeBeforeScanReadsBase" THEN {TallyKey} ELSE {},
+        {<<TallyKey, TallyKey>>}, {}, {TallyKey}, NoIntent)
+  /\ UNCHANGED <<seen, ops>>
+
+\* The operation orders an own-writer may choose.
+OpSeqs == {<<"merge", "put">>, <<"put", "merge">>, <<"delete", "merge">>,
+           <<"merge", "merge">>, <<"merge", "delete">>}
+
+\* An own-writer's buffered operations, as the commit sees them: the newest
+\* put or delete decides what the key is set to, and the key is merged into
+\* when the commit's last operation on it is a merge. Its read back depends
+\* on the committed value only when it has no put or delete, and then it is
+\* recorded as a read: reading a merged key makes the merge a
+\* read-modify-write [3.9].
+BeginOwnWriter(o) ==
+  \E s \in OpSeqs :
+    LET applied == IF Mutant = "PutsBeforeMerges" THEN PutsFirst(s) ELSE s
+        reps    == SelectSeq(applied, LAMBDA x : x # "merge")
+    IN /\ ops' = [ops EXCEPT ![o] = s]
+       /\ Do(o, IF reps = <<>> THEN {OwnKey} ELSE {}, {},
+             IF reps = <<>> THEN {} ELSE {OwnKey},
+             IF applied[Len(applied)] = "merge" THEN {OwnKey} ELSE {},
+             IF reps = <<>> THEN NoIntent
+             ELSE OwnKey :> (IF reps[Len(reps)] = "put" THEN 5 ELSE Absent))
+       /\ UNCHANGED seen
+
+\* The checker's decision, the number of grants, goes to its output key. The
+\* validated range is recorded by role (ScanDecider); the plain stretch is
+\* recorded as for any scan.
+BeginChecker(c) ==
+  LET grants == Yield(Stored, AclRange, AclRange)
+  IN /\ Do(c, {}, Stretch(grants), {OutKey(c)}, {}, OutKey(c) :> Cardinality(grants))
+     /\ UNCHANGED <<seen, ops>>
+
+\* The grant deleted.
+BeginRevoker(r) ==
+  /\ Do(r, {}, {}, {AclKey(1)}, {}, AclKey(1) :> Absent)
+  /\ UNCHANGED <<seen, ops>>
+
+\* A new grant put.
+BeginGranter(g) ==
+  /\ Do(g, {}, {}, {AclKey(2)}, {}, AclKey(2) :> 1)
+  /\ UNCHANGED <<seen, ops>>
+
+\* Transaction t begins: it takes its snapshot and records what its role
+\* reads and writes.
 Begin(t) ==
   /\ phase[t] = "idle"
   /\ phase' = [phase EXCEPT ![t] = "open"]
   /\ snap'  = [snap EXCEPT ![t] = clock]
-  /\ CASE t \in Appenders    -> BeginAppender(t)
-       [] t = Pruner         -> BeginPruner
-       [] t = Writer         -> BeginWriter
-       [] t = Patcher        -> BeginPatcher
-       [] t \in Mergers      -> BeginMerger(t)
-       [] t \in Incrementers -> BeginIncrementer(t)
-       [] t \in ReadMergers  -> BeginReadMerger(t)
-       [] t \in Rebasers     -> BeginRebaser(t)
-       [] t \in Resetters    -> BeginResetter(t)
-       [] t \in Migrators    -> BeginMigrator(t)
-  /\ UNCHANGED <<clock, store, latest, replaced, parents, stale, dupRefused, wrongReceipt,
+  /\ CASE t \in Appenders      -> BeginAppender(t)
+       [] t = Pruner           -> BeginPruner
+       [] t = Writer           -> BeginWriter
+       [] t = Patcher          -> BeginPatcher
+       [] t \in Mergers        -> BeginMerger(t)
+       [] t \in Incrementers   -> BeginIncrementer(t)
+       [] t \in ReadMergers    -> BeginReadMerger(t)
+       [] t \in Rebasers       -> BeginRebaser(t)
+       [] t \in Resetters      -> BeginResetter(t)
+       [] t \in Migrators      -> BeginMigrator(t)
+       [] t \in Collectors     -> BeginCollector(t)
+       [] t \in Linkers        -> BeginLinker(t)
+       [] t \in Holders        -> BeginHolder(t)
+       [] t \in PartReaders    -> BeginPartReader(t)
+       [] t \in PartRewriters  -> BeginPartRewriter(t)
+       [] t \in PartWriters    -> BeginPartWriter(t)
+       [] t \in ValueReaders   -> BeginValueReader(t)
+       [] t \in VersionWriters -> BeginVersionWriter(t)
+       [] t \in ReadOnlys      -> BeginReadOnly(t)
+       [] t \in Promoters      -> BeginPromoter(t)
+       [] t \in SkewWriters    -> BeginSkewWriter(t)
+       [] t \in LogAppenders   -> BeginLogAppender(t)
+       [] t \in LogReaders     -> BeginLogReader(t)
+       [] t \in LogDeciders    -> BeginLogDecider(t)
+       [] t \in TallyMergers   -> BeginTallyMerger(t)
+       [] t \in OwnWriters     -> BeginOwnWriter(t)
+       [] t \in Checkers       -> BeginChecker(t)
+       [] t \in Revokers       -> BeginRevoker(t)
+       [] t \in Granters       -> BeginGranter(t)
+  /\ UNCHANGED <<clock, store, hist, forUpdate, flags, parents, stale, dupRefused,
+                 wrongReceipt, needlessRefusal, cbase, cepoch, cinc>>
+
+\* A pessimistic promoter reads skew key B with get_for_update at the
+\* current horizon, past its snapshot [3.8].
+Promote(p) ==
+  /\ phase[p] = "open"
+  /\ forUpdate[p] = {}
+  /\ forUpdate' = [forUpdate EXCEPT ![p] = {<<SkewB, clock>>}]
+  /\ UNCHANGED <<clock, store, hist, phase, snap, tracked, runs, written, merged, intended,
+                 seen, ops, flags, parents, stale, dupRefused, wrongReceipt,
                  needlessRefusal, cbase, cepoch, cinc>>
 
 ----------------------------------------------------------------------------
-\* The commit, transcribed.
+\* The ghosts the later workloads' invariants read, computed when a
+\* transaction ends, from the history: what it read is the value at its
+\* snapshot (ValueAt), what holds now is `store`.
 
-\* IsolationLevel::validates_every_read.
-EveryRead == Level \in {"RepeatableRead", "Serializable", "DefraLevel"}
+\* What an own-writer read back: its operations folded onto the value at its
+\* snapshot, in operation order [3.9]. MUTANT OwnMergesInvisible skips its
+\* merges.
+OwnRead(t) ==
+  LET s == IF Mutant = "OwnMergesInvisible" THEN SelectSeq(ops[t], LAMBDA o : o # "merge")
+           ELSE ops[t]
+  IN Fold(s, ValueAt(OwnKey, snap[t]))
 
-\* No get_for_update in this workload.
-ForUpdate(t) == {}
+\* A part reader's decision inputs: whether the key exists, and part 1.
+PartDecision(v) == <<v # Absent, Part(v, 1)>>
 
-\* KeyClass::ContentAddressed, applied at DefraLevel: a key validated nowhere.
-\* A read of it records nothing, and none of the checks below looks at it.
-ContentAddressed(k) == Level = "DefraLevel" /\ k[1] \in ContentAddressedRanges
+\* What a write-free transaction read of the two skew keys, B at the horizon
+\* its get_for_update was served at, if any.
+SkewSeen(t) ==
+  <<ValueAt(SkewA, snap[t]),
+    IF forUpdate[t] = {} THEN ValueAt(SkewB, snap[t])
+    ELSE ValueAt(SkewB, (CHOOSE f \in forUpdate[t] : TRUE)[2])>>
 
-\* Transaction::validation_set: the recorded reads the level validates.
-ValidatedReads(t) ==
-  {k \in tracked[t] :
-     /\ ~ContentAddressed(k)
-     /\ IF EveryRead THEN TRUE
-        ELSE IF Level = "ReadCommitted" THEN k \in written[t]
-        ELSE k \in ForUpdate(t) \/ k \in written[t]}
+\* Some single point in time between its snapshot and now shows both values
+\* it read.
+Consistent(t) ==
+  \E s \in snap[t]..clock : <<ValueAt(SkewA, s), ValueAt(SkewB, s)>> = SkewSeen(t)
 
-\* scan_range::cover: every written or merged key inside a stretch a scan
-\* walked joins the reads. Each read is already anchored at the begin
-\* snapshot, so the re-anchoring `cover` also performs is the identity here.
-\* policy::run_is_commutative: at DefraLevel a stretch whose two ends lie in
-\* one declared range is dropped before cover sees it.
-Commutative(s) ==
-  /\ Level = "DefraLevel"
-  /\ IF Mutant = "PolicyIgnoresRange"
-       THEN s[1][1] \in CommutativeRanges \/ s[2][1] \in CommutativeRanges
-       ELSE s[1][1] \in CommutativeRanges /\ s[2][1] = s[1][1]
-CoveredRuns(t) == {s \in runs[t] : ~Commutative(s)}
+\* What a log reader saw of the log: positions 1..head at its snapshot, and,
+\* under MUTANT OwnAppendVisible, its own entry at the next position.
+LogSeen(t) ==
+  LET h == ValueAt(LogHead, snap[t])
+  IN [p \in 1..(h + IF Mutant = "OwnAppendVisible" THEN 1 ELSE 0) |->
+        IF p <= h THEN ValueAt(LogEntry(p), snap[t]) ELSE t]
 
-Walked(t, k) == \E s \in CoveredRuns(t) : KeyLeq(s[1], k) /\ KeyLeq(k, s[2])
+\* The grants present at sequence s.
+GrantsAt(s) == {i \in {1, 2} : ValueAt(AclKey(i), s) # Absent}
 
-Reads(t) ==
-  ValidatedReads(t) \cup {k \in (written[t] \cup merged[t]) : Walked(t, k) /\ ~ContentAddressed(k)}
+\* [3.14] What the transaction did with the reason's key is what `mine`
+\* says.
+Did(t, mine, k) ==
+  CASE mine \in {"Read", "ReadPresence"} -> k \in tracked[t] \/ (k = PartKey /\ t \in PartTxns)
+    [] mine = "ReadParts"        -> k = PartKey /\ t \in PartTxns
+    [] mine = "ReadForUpdate"    -> \E f \in forUpdate[t] : f[1] = k
+    [] mine = "ScannedThenWrote" -> k \in written[t] \cup merged[t]
+    [] mine = "ScannedRange"     -> t \in Checkers /\ k[1] = AclRange
+    [] mine = "Put"              -> k \in written[t] /\ intended[t][k] # Absent
+    [] mine = "Delete"           -> k \in written[t] /\ intended[t][k] = Absent
+    [] mine = "Merge"            -> k \in merged[t]
+    [] OTHER                     -> FALSE
 
-\* Engine::commit_locked, the write loop: a merged key takes the blind-merge
-\* path only when the transaction did not read it, the read loop having
-\* validated it, and the batch neither puts nor deletes it (`Replaced`), its
-\* put being validated in this loop and never elided. Here each key is
-\* validated by exactly one of the three checks below; the engine checks a
-\* put and the merge on top of it one after the other, to the same verdict.
-BlindMerged(t) ==
-  merged[t] \ ((IF Mutant = "ReadMergeBlind" THEN {} ELSE Reads(t))
-               \cup (IF Mutant = "PutMergeBlind" THEN {} ELSE written[t]))
+\* [3.14] A write of kind w.kind can decide a race for access `mine`: a
+\* presence read loses only to a removal, a projected read only to a
+\* replacement or an operand touching its parts, a blind merge only to a
+\* replacement; any write can decide the others.
+Decides(mine, w, parts) ==
+  CASE mine = "ReadPresence" -> w.kind \in {"Delete", "RangeDelete"}
+    [] mine = "ReadParts"    -> w.kind \in Replacing \/ w.touch \cap parts # {}
+    [] mine = "Merge"        -> w.kind \in Replacing
+    [] OTHER                 -> TRUE
 
-\* Engine::commit_locked, the read loop: a read aborts on any newer write.
-ReadConflict(t) == \E k \in Reads(t) \ BlindMerged(t) : latest[k] > snap[t]
+\* The reason r of t's abort holds against the history at the abort: what
+\* t did with the key is what `mine` says, and a write of the key newer than
+\* the anchor, of kind `theirs` at sequence `latest`, can decide that race.
+ReasonHolds(t, r) ==
+  /\ r \in [key : Keys, mine : Accesses, theirs : Kinds, observed : Nat, latest : Nat,
+            parts : SUBSET Parts]
+  /\ Did(t, r.mine, r.key)
+  /\ \E w \in hist : /\ w.key = r.key /\ w.seq = r.latest /\ w.kind = r.theirs
+                     /\ w.seq > r.observed /\ Decides(r.mine, w, r.parts)
 
-\* write_matches_committed: the write stores what the key already holds, and
-\* the batch merges nothing on top of it.
-Elided(t, k) ==
-  /\ intended[t][k] = store[k]
-  /\ k \notin merged[t] \/ Mutant = "PutMergeElides"
+\* A refusal the relaxations promise never happens, or a reason that does not
+\* hold.
+AbortFlags(t) ==
+  (IF ReasonHolds(t, ReasonOf(t)) THEN {} ELSE {"BadReason"})
+  \cup (IF /\ t \in PartReaders
+           /\ Found(PartKey, snap[t])
+           /\ \A w \in After(PartKey, snap[t]) : w.kind = "Merge" /\ 1 \notin w.touch
+        THEN {"PartsRefusedNeedlessly"} ELSE {})
+  \cup (IF /\ t \in ValueReaders
+           /\ store[VersionKey] = ValueAt(VersionKey, snap[t])
+           /\ ~NewestIsOperand(VersionKey)
+        THEN {"IdenticalRewriteRefused"} ELSE {})
 
-\* Engine::commit_locked, the write loop with `writes_at` the begin snapshot:
-\* a written key not among the reads aborts on a newer write, unless the
-\* write is elided.
-WriteConflict(t) ==
-  \E k \in written[t] \ (Reads(t) \cup BlindMerged(t)) :
-     ~ContentAddressed(k) /\ latest[k] > snap[t] /\ ~Elided(t, k)
+\* A committed decision on inputs that changed before the commit.
+CommitFlags(t) ==
+  (IF t \in Holders /\ (store[Shared] # Absent) # Found(Shared, snap[t])
+   THEN {"HoldStale"} ELSE {})
+  \cup (IF t \in PartReaders
+           /\ PartDecision(store[PartKey]) # PartDecision(ValueAt(PartKey, snap[t]))
+        THEN {"PartsStale"} ELSE {})
+  \cup (IF t \in PartRewriters /\ store[PartKey] # ValueAt(PartKey, snap[t])
+        THEN {"PartsStale"} ELSE {})
+  \cup (IF t \in ValueReaders /\ store[VersionKey] # ValueAt(VersionKey, snap[t])
+        THEN {"ValueStale"} ELSE {})
+  \cup (IF t \in ReadOnlys \cup Promoters /\ ~Consistent(t) THEN {"Skew"} ELSE {})
+  \cup (IF t \in LogDeciders /\ store[LogHead] # ValueAt(LogHead, snap[t])
+        THEN {"LogDecisionStale"} ELSE {})
+  \cup (IF t \in LogReaders /\ \E p \in DOMAIN LogSeen(t) : NewValue(t, LogEntry(p)) # LogSeen(t)[p]
+        THEN {"PhantomAppend"} ELSE {})
+  \cup (IF t \in OwnWriters /\ NewValue(t, OwnKey) # OwnRead(t) THEN {"OwnMismatch"} ELSE {})
+  \cup (IF t \in Checkers /\ GrantsAt(clock) # GrantsAt(snap[t]) THEN {"ScanStale"} ELSE {})
 
-\* The same loop for a key the commit only merges into: a merge is never
-\* elided. At DefraLevel (IsolationLevel::blind_merges_commute) it aborts only
-\* on a newer write that replaced the key (newest_terminator_seq_above),
-\* walking past newer operands.
-MergeConflict(t) ==
-  \E k \in BlindMerged(t) :
-     /\ ~ContentAddressed(k)
-     /\ IF Level = "DefraLevel"
-          THEN Mutant # "MergeIgnoresReplacement" /\ replaced[k] > snap[t]
-          ELSE latest[k] > snap[t]
-
-Conflicts(t) == ReadConflict(t) \/ WriteConflict(t) \/ MergeConflict(t)
-
-\* A put or delete first, then a merge on top of what it left.
-Applied(t, k) ==
-  IF k \in written[t] THEN intended[t][k] + (IF k \in merged[t] THEN 1 ELSE 0)
-  ELSE IF k \in merged[t] THEN store[k] + 1
-  ELSE store[k]
-
-\* The counter's contract, kept apart from the engine's bookkeeping (latest,
-\* replaced) so that a slip there shows up as a wrong value. A put or delete
+\* The counter's contract, kept apart from the engine's bookkeeping (the
+\* history) so that a slip there shows up as a wrong value. A put or delete
 \* of the counter starts an epoch at the value it stores, with the merge its
 \* own batch puts on top counted in it, and discards only the increments it
 \* saw: one committed after its snapshot stays counted although the put
 \* erased it from the store. An increment counts if no put, delete or range
-\* delete committed after it began.
+\* delete committed after it began, or if it was derived from a read of the
+\* counter that still holds the count it read: that read is current, so the
+\* increment serializes at its commit, after every reset.
 Count(t, n) ==
   IF CounterKey \in written[t]
     THEN /\ cbase'  = intended[t][CounterKey]
@@ -535,26 +762,32 @@ Count(t, n) ==
          /\ cinc'   = {s \in cinc : s > snap[t]}
                       \cup (IF CounterKey \in merged[t] THEN {n} ELSE {})
   ELSE IF CounterKey \in merged[t]
-    THEN /\ cinc' = IF snap[t] >= cepoch THEN cinc \cup {n} ELSE cinc
+    THEN /\ cinc' = IF \/ snap[t] >= cepoch
+                       \/ CounterKey \in tracked[t] /\ store[CounterKey] = seen[t]
+                    THEN cinc \cup {n} ELSE cinc
          /\ UNCHANGED <<cbase, cepoch>>
   ELSE UNCHANGED <<cbase, cepoch, cinc>>
 
+\* The commit: abort with a reason when a check fails (Conflicts), or apply
+\* every write at the next sequence and add it to the history. A promoter
+\* commits only after its get_for_update.
 Commit(t) ==
   /\ phase[t] = "open"
+  /\ t \in Promoters => forUpdate[t] # {}
   /\ IF Conflicts(t)
-       THEN /\ phase' = [phase EXCEPT ![t] = "aborted"]
+       THEN /\ phase'  = [phase EXCEPT ![t] = "aborted"]
+            /\ flags'  = flags \cup AbortFlags(t)
             /\ needlessRefusal' = (needlessRefusal \/ (t \in Incrementers /\ snap[t] >= cepoch))
             /\ dupRefused' = (dupRefused \/
                               (t \in Mergers /\ \A k \in written[t] :
-                                  latest[k] > snap[t] => store[k] = intended[t][k]))
-            /\ UNCHANGED <<clock, store, latest, replaced, parents, stale, wrongReceipt,
-                           cbase, cepoch, cinc>>
+                                  After(k, snap[t]) # {} => store[k] = intended[t][k]))
+            /\ hist'   = Prune(hist, phase', clock)
+            /\ UNCHANGED <<clock, store, parents, stale, wrongReceipt, cbase, cepoch, cinc>>
        ELSE /\ phase'    = [phase EXCEPT ![t] = "committed"]
             /\ clock'    = clock + 1
-            /\ store'    = [k \in Keys |-> Applied(t, k)]
-            /\ latest'   = [k \in Keys |->
-                              IF k \in written[t] \cup merged[t] THEN clock + 1 ELSE latest[k]]
-            /\ replaced' = [k \in Keys |-> IF k \in written[t] THEN clock + 1 ELSE replaced[k]]
+            /\ store'    = [k \in Keys |-> NewValue(t, k)]
+            /\ hist'     = Prune(hist \cup Records(t, clock + 1), phase', clock + 1)
+            /\ flags'    = flags \cup CommitFlags(t)
             /\ parents'  = IF t \in Appenders
                              THEN [parents EXCEPT ![t] = {h \in Blocks : MarkerKey(h, t) \in written[t]}]
                              ELSE IF t \in Mergers /\ written[t] # {}
@@ -564,44 +797,52 @@ Commit(t) ==
             /\ wrongReceipt' = (wrongReceipt \/ (t \in ReadMergers /\ store[CounterKey] # seen[t]))
             /\ Count(t, clock + 1)
             /\ UNCHANGED <<needlessRefusal, dupRefused>>
-  /\ UNCHANGED <<snap, tracked, runs, written, intended, merged, seen>>
+  /\ UNCHANGED <<snap, tracked, runs, written, intended, merged, seen, ops, forUpdate>>
 
 \* Db::delete_range over the counter's range: a plain write, applied at once
 \* and validated against nothing. A covering range tombstone is the newest
 \* write of each key it covers (latest_version_in_view) and replaces each
-\* one (newest_terminator_seq_above). Applied at once, it saw every
-\* increment it discards.
+\* one (newest_terminator_seq_above; MUTANT RangeDeleteNotReplacement
+\* forgets that, in MergeDecider). Applied at once, it saw every increment
+\* it discards.
 Clear(c) ==
   LET covered == {k \in Keys : k[1] = CounterRange}
   IN /\ phase[c]  = "idle"
      /\ phase'    = [phase EXCEPT ![c] = "committed"]
      /\ clock'    = clock + 1
      /\ store'    = [k \in Keys |-> IF k \in covered THEN Absent ELSE store[k]]
-     /\ latest'   = [k \in Keys |-> IF k \in covered THEN clock + 1 ELSE latest[k]]
-     /\ replaced' = [k \in Keys |->
-                       IF k \in covered /\ Mutant # "RangeDeleteNotReplacement"
-                       THEN clock + 1 ELSE replaced[k]]
+     /\ hist'     = Prune(hist \cup {[seq |-> clock + 1, key |-> k, kind |-> "RangeDelete",
+                                      val |-> Absent, touch |-> Parts] : k \in covered},
+                          phase', clock + 1)
      /\ cbase'    = Absent
      /\ cepoch'   = clock + 1
      /\ cinc'     = {}
-     /\ UNCHANGED <<snap, tracked, runs, written, intended, merged, seen, parents, stale,
-                    dupRefused, wrongReceipt, needlessRefusal>>
+     /\ UNCHANGED <<snap, tracked, runs, written, intended, merged, seen, ops, forUpdate,
+                    flags, parents, stale, dupRefused, wrongReceipt, needlessRefusal>>
 
+\* Every step: a begin, a commit, a promotion or a range delete.
 Next == \/ \E t \in Txns \ Clearers : Begin(t) \/ Commit(t)
+        \/ \E p \in Promoters : Promote(p)
         \/ \E c \in Clearers : Clear(c)
 
+\* Every behaviour, with weak fairness so every enabled step is taken.
 Spec == Init /\ [][Next]_vars /\ WF_vars(Next)
 
 ----------------------------------------------------------------------------
+\* The shape of a history record.
+Records_ == [seq : Nat, key : Keys, kind : Kinds, val : Nat, touch : SUBSET Parts]
+
+\* Every variable holds what its comment says.
 TypeOK ==
   /\ clock \in Nat
   /\ store \in [Keys -> Nat]
-  /\ latest \in [Keys -> Nat]
-  /\ replaced \in [Keys -> Nat]
+  /\ hist \subseteq Records_
   /\ phase \in [Txns -> {"idle", "open", "committed", "aborted"}]
   /\ \A t \in Txns : tracked[t] \subseteq Keys /\ written[t] \subseteq Keys /\ merged[t] \subseteq Keys
   /\ \A t \in Txns : \A s \in runs[t] : s \in Keys \X Keys /\ KeyLeq(s[1], s[2])
   /\ seen \in [Txns -> Nat]
+  /\ \A t \in Txns : forUpdate[t] \subseteq Keys \X Nat
+  /\ flags \subseteq FlagNames
   /\ cbase \in Nat /\ cepoch \in Nat /\ cinc \subseteq Nat
   /\ stale \in BOOLEAN
 
@@ -647,17 +888,89 @@ INV_ReceiptsExact == ~wrongReceipt
 \* so concurrent increments never refuse each other.
 INV_IncrementsCommitUnlessReplaced == ~needlessRefusal
 
+\* E17. Every stored pin or holder reference names a stored block: a
+\* collection never deletes a block from under a reference.
+INV_NoDanglingReference ==
+  (\E l \in Linkers : store[PinKey(l)] # Absent) \/ (\E h \in Holders : store[HoldKey(h)] = 1)
+    => store[Shared] # Absent
+
+\* Two creates of one block both commit: a linker is never refused.
+INV_LinksCommit == \A l \in Linkers : phase[l] # "aborted"
+
+\* A holder's record (present or missing) is still true at its commit.
+INV_HoldsCurrent == "HoldStale" \notin flags
+
+\* No projected reader commits after the key's existence or a part its
+\* decision used changed.
+INV_PartsCurrent == "PartsStale" \notin flags
+
+\* A part reader that found the key is not refused when every newer write is
+\* an operand that touches only part 2: the relaxation projected reads exist
+\* for.
+INV_PartsRelaxed == "PartsRefusedNeedlessly" \notin flags
+
+\* No value reader commits after the value it read changed.
+INV_ValueReadsCurrent == "ValueStale" \notin flags
+
+\* No value reader is refused while the key holds the value it read, the
+\* newest write being a put: an identical rewrite, or a value that came back.
+INV_IdenticalRewritesCommit == "IdenticalRewriteRefused" \notin flags
+
+\* A write-free DefraLevel transaction never conflicts.
+INV_WriteFreeCommits == \A r \in ReadOnlys : phase[r] # "aborted"
+
+\* Every committed write-free transaction read the state of one point in
+\* time: no read skew.
+INV_WriteFreeConsistent == "Skew" \notin flags
+
+\* Appends and log reads are never validated, so no appender or log reader
+\* is refused.
+INV_LogNeverConflicts == \A t \in LogAppenders \cup LogReaders : phase[t] # "aborted"
+
+\* The log holds entries 1..head, and nothing beyond: positions are dense.
+INV_LogDense ==
+  \A p \in LogPositions : (store[LogEntry(p)] # Absent) <=> p <= store[LogHead]
+
+\* Every entry a log reader saw is in the log at its commit, at the position
+\* it saw: a reader never sees a position its own append did not get.
+INV_NoPhantomAppend == "PhantomAppend" \notin flags
+
+\* No decision on the log's length went stale. Log reads are exempt, so a
+\* caller must not decide on them [3.1]: this fails by design.
+INV_LogDecisionsCurrent == "LogDecisionStale" \notin flags
+
+\* A merge before a commutative scan stays blind: no tally merger is
+\* refused, and no increment is lost.
+INV_TallyMergesCommit == \A m \in TallyMergers : phase[m] # "aborted"
+INV_TallyExact == store[TallyKey] = Cardinality({m \in TallyMergers : phase[m] = "committed"})
+
+\* The value a commit leaves on the own key is the value its transaction
+\* read back through its own writes.
+INV_ReadYourOwnWrites == "OwnMismatch" \notin flags
+
+\* No checker commits after a grant was revoked or a new one appeared.
+INV_ScanDecisionsCurrent == "ScanStale" \notin flags
+
+\* [3.14] Every abort's reason names a key the transaction did what `mine`
+\* says with, and a committed write of that key newer than the anchor, with
+\* the kind `theirs` and the sequence `latest`, that can decide such a race
+\* (ReasonHolds, checked when the transaction aborts).
+INV_ReasonsExact == "BadReason" \notin flags
+
 \* State constraints that spend a config's states on one workload: the
 \* transactions of every other one stay idle.
 CounterWorkloadOnly ==
   \A t \in Appenders \cup {Pruner, Writer, Patcher} \cup Mergers \cup Migrators :
      phase[t] = "idle"
+\* The writer, the patcher and the migrators only.
 DefinitionWorkloadOnly ==
   \A t \in Appenders \cup {Pruner} \cup Mergers \cup CounterTxns : phase[t] = "idle"
 \* The writer and the patcher touch no key of the DAG and read none through a
 \* scan, so idling them loses no interleaving of the head set.
 HeadsWorkloadOnly ==
   \A t \in {Writer, Patcher} \cup CounterTxns \cup Migrators : phase[t] = "idle"
+\* The later workloads touch no key of the first ones.
+NewWorkloadOnly == \A t \in OldTxns : phase[t] = "idle"
 
 \* Under the level that refuses no append, every append lands.
 EventuallyAllAppendsCommit == <>[](\A a \in Appenders : phase[a] = "committed")

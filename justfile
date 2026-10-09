@@ -360,6 +360,35 @@ tla:
     check MC_DefraLevel_Red_RangeDeleteNotReplacement  RED INV_CounterExact
     check MC_DefraLevel_Red_PolicyIgnoresRange         RED INV_NoStaleDefinition
     check MC_DefraLevel_Red_DefinitionContentAddressed RED INV_NoStaleDefinition
+    # DefraLevel's key classes and mechanisms (plan 3.1 to 3.15). Lean:
+    # Regolith/Validation.lean, all_classes_serial; Regolith/Relaxations.lean;
+    # Regolith/MergeOperator.lean.
+    check MC_DefraLevel_Green_ContentAddressed         GREEN
+    check MC_DefraLevel_Red_CaDeleteExempt             RED INV_NoDanglingReference
+    check MC_DefraLevel_Red_PresenceReadFull           RED INV_LinksCommit
+    check MC_DefraLevel_Red_PresenceUnchecked          RED INV_HoldsCurrent
+    check MC_DefraLevel_Green_Parts                    GREEN
+    check MC_DefraLevel_Red_PartsIgnorePut             RED INV_PartsCurrent
+    check MC_DefraLevel_Red_PartsIgnoreTouch           RED INV_PartsCurrent
+    check MC_DefraLevel_Red_PartsNoAbsentFallback      RED INV_PartsCurrent
+    check MC_DefraLevel_Red_PartsNoPutFallback         RED INV_PartsCurrent
+    check MC_DefraLevel_Red_PartsNamesOther            RED INV_PartsCurrent
+    check MC_DefraLevel_Red_Parts_RepeatableRead       RED INV_PartsRelaxed
+    check MC_DefraLevel_Green_ValueReads               GREEN
+    check MC_DefraLevel_Red_SeqOnlyValidation          RED INV_IdenticalRewritesCommit
+    check MC_DefraLevel_Green_WriteFree                GREEN
+    check MC_DefraLevel_Red_WriteFreePessimistic       RED INV_WriteFreeConsistent
+    check MC_DefraLevel_Green_Log                      GREEN
+    check MC_DefraLevel_Red_OwnAppendVisible           RED INV_NoPhantomAppend
+    check MC_DefraLevel_Red_DecideOnLogRead            RED INV_LogDecisionsCurrent
+    check MC_DefraLevel_Green_MergeBeforeScan          GREEN
+    check MC_DefraLevel_Red_MergeBeforeScanReadsBase   RED INV_TallyMergesCommit
+    check MC_DefraLevel_Green_OwnWrites                GREEN
+    check MC_DefraLevel_Red_PutsBeforeMerges           RED INV_ReadYourOwnWrites
+    check MC_DefraLevel_Red_OwnMergesInvisible         RED INV_ReadYourOwnWrites
+    check MC_DefraLevel_Green_ValidatedScan            GREEN
+    check MC_DefraLevel_Red_PlainScanDecides           RED INV_ScanDecisionsCurrent
+    check MC_DefraLevel_Red_ReasonNewestWrite          RED INV_ReasonsExact
     # E1. Lean: Regolith/LsmOrder.lean, compact_range_reads_newest.
     spec=LsmOrder
     check MC_LsmOrder_Green                            GREEN
