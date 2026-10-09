@@ -11,6 +11,10 @@
 //!   restored database holds what its backup holds: its MANIFEST records
 //!   every log below the backup's next file id as in tables, so no log the
 //!   restore target held is replayed into it.
+//! - **Queue reads of sealed tables** (#269 x #266). The read a queue runs
+//!   opens a sealed block before it lands, applies an ingested table's
+//!   sequence, and reports a block that fails its tag once, naming the table.
+//!   Every read path on an encrypted database is in `io_queue_paths.rs`.
 
 mod common;
 
@@ -20,8 +24,12 @@ use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use common::faulty_env::{FaultyEnv, Refuse, logs};
+use common::keys::Keys;
 use regolith::env::Env;
-use regolith::{BackupEngine, Db, Options, Statistics, Ticker};
+use regolith::{
+    BackupEngine, Db, Error, IngestOptions, IoBudget, IoQueue, Options, ReadMode, SstFileWriter,
+    Statistics, Ticker,
+};
 use tempfile::TempDir;
 
 /// Bytes of filler each write carries, so a few writes fill a memtable.
@@ -261,4 +269,151 @@ fn a_restored_database_replays_no_log_its_target_held() {
     );
     assert_eq!(restored.get(b"only-in-a-log").unwrap(), None);
     assert!(!stray.exists(), "the open removed the log below min_wal_id");
+}
+
+/// Run `read` until it stops waiting, polling `queue` after each wait.
+fn through_queue<T>(
+    queue: &mut IoQueue,
+    mut read: impl FnMut() -> regolith::Result<T>,
+) -> regolith::Result<T> {
+    for _ in 0..10_000 {
+        match read() {
+            Err(Error::WouldBlock(_)) => {
+                queue.poll(IoBudget::ALL);
+            }
+            other => return other,
+        }
+    }
+    panic!("the read never finished");
+}
+
+fn sealed_options() -> Options {
+    Options::default()
+        .key_provider(Keys::new(&[1]))
+        .block_size(256)
+}
+
+fn numbered(i: usize) -> Vec<u8> {
+    format!("key/{i:04}").into_bytes()
+}
+
+/// The table files of the database at `db`.
+fn tables(db: &Path) -> Vec<PathBuf> {
+    let mut tables: Vec<PathBuf> = std::fs::read_dir(db.join("sst"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.extension().is_some_and(|e| e == "sst"))
+        .collect();
+    tables.sort();
+    tables
+}
+
+/// A sealed data block the device returns damaged fails its tag in the read
+/// the queue runs. The read run again reports it once, as corruption naming
+/// the table; the read after that asks the device again instead of handing
+/// out the old failure.
+#[test]
+fn a_damaged_sealed_block_read_through_a_queue_is_reported_once_naming_the_table() {
+    let dir = TempDir::new().unwrap();
+    {
+        let db = Db::open(dir.path(), sealed_options()).unwrap();
+        for i in 0..400 {
+            db.put(&numbered(i), format!("value {i}").as_bytes())
+                .unwrap();
+        }
+        db.flush().unwrap();
+        db.close().unwrap();
+    }
+    let table = tables(dir.path()).pop().expect("the flush wrote a table");
+    let mut bytes = std::fs::read(&table).unwrap();
+    // A third of the way in: among the data blocks, which come first.
+    let at = bytes.len() / 3;
+    bytes[at] ^= 0x01;
+    std::fs::write(&table, &bytes).unwrap();
+    let name = table.file_stem().unwrap().to_string_lossy().into_owned();
+
+    let db = Db::open(dir.path(), sealed_options()).unwrap();
+    let victim = (0..400)
+        .find(|&i| matches!(db.get(&numbered(i)), Err(Error::Corruption(_))))
+        .expect("the damage lies in a data block");
+    let mut queue = db.io_queue();
+    let snapshot = db
+        .snapshot()
+        .with_read_mode(ReadMode::CacheOnly(queue.id()));
+    for round in 0..2 {
+        assert!(
+            matches!(snapshot.get(&numbered(victim)), Err(Error::WouldBlock(_))),
+            "round {round}: the read queues a device read"
+        );
+        queue.poll(IoBudget::ALL);
+        match snapshot.get(&numbered(victim)) {
+            Err(Error::Corruption(err)) => {
+                let message = err.to_string();
+                assert!(
+                    message.contains(&format!("table {name}"))
+                        && message.contains("does not verify"),
+                    "round {round}: {message}"
+                );
+            }
+            other => {
+                panic!("round {round}: expected the damaged block's corruption, got {other:?}")
+            }
+        }
+    }
+    // A block the damage missed reads through the queue as it reads blocking.
+    let fine = (0..400)
+        .rev()
+        .find(|&i| db.get(&numbered(i)).is_ok())
+        .expect("most blocks are whole");
+    assert_eq!(
+        through_queue(&mut queue, || snapshot.get(&numbered(fine))).unwrap(),
+        db.get(&numbered(fine)).unwrap()
+    );
+}
+
+/// An ingested table's blocks read through a queue on an encrypted database
+/// carry the sequence the manifest records for the table, as blocking reads
+/// do: a scan merging it with an older table of the same keys yields the
+/// ingested versions, which a block read without its stamp would put below
+/// the older table's.
+#[test]
+fn an_ingested_table_read_through_a_queue_on_an_encrypted_database_reads_at_its_sequence() {
+    let dir = TempDir::new().unwrap();
+    let source = dir.path().with_extension("ingest.sst");
+    {
+        let db = Db::open(dir.path(), sealed_options()).unwrap();
+        for i in 0..200 {
+            db.put(&numbered(i), b"old").unwrap();
+        }
+        db.flush().unwrap();
+        let mut writer = SstFileWriter::create(&source, &Options::default()).unwrap();
+        for i in (0..200).step_by(2) {
+            writer.put(&numbered(i), b"new").unwrap();
+        }
+        writer.finish().unwrap();
+        db.ingest_external_files(std::slice::from_ref(&source), IngestOptions::default())
+            .unwrap();
+        db.close().unwrap();
+    }
+    // Cold: every block the reads below need is read through the queue.
+    let db = Db::open(dir.path(), sealed_options()).unwrap();
+    let mut queue = db.io_queue();
+    let snapshot = db
+        .snapshot()
+        .with_read_mode(ReadMode::CacheOnly(queue.id()));
+    let scanned = through_queue(&mut queue, || snapshot.scan(None, None)).unwrap();
+    let expected: Vec<(Vec<u8>, Vec<u8>)> = (0..200)
+        .map(|i| {
+            let value: &[u8] = if i % 2 == 0 { b"new" } else { b"old" };
+            (numbered(i), value.to_vec())
+        })
+        .collect();
+    assert_eq!(scanned, expected);
+    for i in [0, 1, 98, 99] {
+        assert_eq!(
+            through_queue(&mut queue, || snapshot.get(&numbered(i))).unwrap(),
+            Some(expected[i].1.clone()),
+            "key {i}"
+        );
+    }
 }
