@@ -28,6 +28,25 @@
 \* adds the table, "every log below this number is in tables" (min_wal_id),
 \* and recovery skips those logs. A failed delete is reported and retried.
 \*
+\* WHERE THE PHASE 6 PACKAGES MEET, two more ways to go wrong.
+\*   Encryption seals every batch, so its bytes are noise until the batch
+\*   is opened with its key. The judge of a damaged end asks of each whole
+\*   batch after the damage "did the writer sync you?". Asked of the noise,
+\*   the answer is "cannot tell, so yes", for a reservation too.
+\*   Tiny example: a flush reserves a log number (R1) and a table number
+\*   (R2), then appends "table 3 is in" (T); the power goes during T's sync;
+\*   R1 comes back torn, R2 and T whole. R2 is whole, "needed a sync", and
+\*   has T after it, so the judge calls R1's damage proved synced and
+\*   refuses a database a crash left. The fix opens each batch first.
+\*   Group commit flushes on several threads (the compaction worker, a
+\*   writer after its commit, a writer stopped by a stall), and several
+\*   memtables can wait at once. min_wal_id says "every log up to mine is in
+\*   tables", which is only true if the oldest memtable is flushed first.
+\*   Tiny example: memtable M1 (log 1, a = 1) and M2 (log 2, b = 2) wait; a
+\*   flush takes M2 first and records min_wal_id = 3; the power goes before
+\*   M1 is flushed; recovery skips log 1, and a = 1, acknowledged, is gone.
+\*   Every flush path takes the oldest under one exclusion (`flushing`).
+\*
 \* WHAT THIS MODEL SHOWS. At every reachable state, for every way a power
 \* cut can mangle the unsynced end of the manifest:
 \*   RecoveryOpens  the open never refuses a state a crash produced;
@@ -51,25 +70,42 @@
 \*                               version of its key (ReadsNewest)
 \*   no_sync_before_next_refuses_a_crash, stale_without_min_wal
 \*                               the RED cases, as counterexamples
+\*   crash_never_proves_opened   the judge that opens each batch before it
+\*                               reads the batch's flag accepts every crash
+\*                               state, sealed or not (RecoveryOpens, Sealed)
+\*   judging_ciphertext_refuses_a_crash
+\*                               RED JudgeCiphertext, as a counterexample
+\*   oldest_first_keeps_every_log every version of every log is replayed or
+\*                               in a table when the flushed logs are the
+\*                               oldest ones (AckedSurvive, MaxFrozen = 2)
+\*   newest_first_loses_a_log    RED NewestFirst, as a counterexample
 \*
 \* THE ENGINE, and the action that mirrors each part.
 \*   Put            RegolithEngine::write path: a write lands in the active
 \*                  memtable and its log, synced (Immediate durability).
 \*   Seal           RegolithEngine::seal_active: reserve the next log's
 \*                  number (SetNextFileId, unsynced) and freeze the memtable.
-\*   FlushTable     flush_oldest_frozen_inner: reserve the table's number
-\*                  (unsynced) and write the table file.
+\*   FlushTable     Flusher::flush_oldest_inner (src/engine/flush.rs): take
+\*                  the oldest frozen memtable, reserve the table's number
+\*                  (unsynced) and write the table file. Every thread that
+\*                  flushes runs this one function under `flushing`: the
+\*                  compaction worker (flush_all_frozen), a writer after its
+\*                  commit (run_owed_step), a writer stopped by a stall
+\*                  (run_one_background_step), a rotation a whole memtable
+\*                  behind, flush, a checkpoint and an ingest.
 \*   FlushInstall   the same, `versions.apply([AddFile, SetLastSeq,
 \*                  SetMinWalId])`: one batch, which needs a sync.
 \*   SyncManifest   VersionSet::apply's `writer.sync_all()`.
-\*   FlushRetire    RegolithEngine::remove_sealed_wal ->
+\*   FlushRetire    Flusher::remove_sealed_wal ->
 \*                  RetiredLogs::retire (src/engine/log_retirement.rs): unlink
 \*                  the flushed log and any left below it; each may fail.
 \*   Ingest         RegolithEngine::install (src/engine/ingest.rs): a new
 \*                  table holding a key no memtable holds, its batch synced.
 \*   the crash      VersionSet::open_with_policy -> judge_end -> tail::judge
 \*                  (src/engine/manifest/tail.rs), then replay of the logs at
-\*                  or above min_wal_id (`should_replay_wal`).
+\*                  or above min_wal_id (`should_replay_wal`). On a sealed
+\*                  manifest tail::needs_sync opens each batch
+\*                  (sealed::open_batch) before it reads the batch's flag.
 \*
 \* WHAT THE MODEL LEAVES OUT, and why that loses nothing.
 \*   - Bytes inside a batch: a batch is whole or damaged. tail.rs finds whole
@@ -90,6 +126,10 @@
 \*   MC_ManifestRecovery_Red_RetireBeforeTable  AckedSurvive fails
 \*   MC_ManifestRecovery_Red_NoMinWalId         ReadsNewest fails
 \*   MC_ManifestRecovery_Red_IgnoreProof        RotSafe fails
+\*   MC_ManifestRecovery_Green_Sealed           the fix, on a sealed manifest
+\*   MC_ManifestRecovery_Red_JudgeCiphertext    RecoveryOpens fails
+\*   MC_ManifestRecovery_Green_Frozen2          the fix, two memtables waiting
+\*   MC_ManifestRecovery_Red_NewestFirst        AckedSurvive fails
 
 \* We use numbers, sequences, finite sets, and TLC's function helpers.
 EXTENDS Naturals, Sequences, FiniteSets, TLC
@@ -102,12 +142,23 @@ CONSTANTS
   MaxSeq,
   \* How many batches the manifest may hold; keeps runs finite.
   MaxBatches,
+  \* How many sealed memtables may wait for a flush at once
+  \* (max_write_buffer_number less the active one): 1 or 2 here.
+  MaxFrozen,
+  \* TRUE when the database is encrypted, so every batch is sealed and reads
+  \* as noise until it is opened (src/engine/manifest/sealed.rs).
+  Sealed,
   \* Which bug to plant: "none" is the fixed engine.
   Mutant
 
 \* The mutant must be one we know how to plant.
 ASSUME Mutant \in {"none", "OldGuard", "NoSyncBeforeNext", "UnlinkBeforeSync",
-                   "RetireBeforeTable", "NoMinWalId", "IgnoreProof"} \* the RED names
+                   "RetireBeforeTable", "NoMinWalId", "IgnoreProof",
+                   "JudgeCiphertext", "NewestFirst"} \* the RED names
+\* At least one memtable can wait, or nothing would ever be flushed.
+ASSUME MaxFrozen \in Nat \ {0}
+\* The database is encrypted or it is not.
+ASSUME Sealed \in BOOLEAN
 
 \* A batch, as the manifest holds it:
 \*   sync    does the writer wait for it to reach the disk (it adds a table);
@@ -118,8 +169,6 @@ ASSUME Mutant \in {"none", "OldGuard", "NoSyncBeforeNext", "UnlinkBeforeSync",
 Reserve == [sync |-> FALSE, table |-> 0, minWal |-> 0, whole |-> TRUE]
 \* What a damaged batch reads as: nothing usable at all.
 Torn == [sync |-> FALSE, table |-> 0, minWal |-> 0, whole |-> FALSE]
-\* No frozen memtable: an empty write set and log number 0.
-NoFrozen == [w |-> {}, log |-> 0]
 \* No flush under way.
 Idle == [stage |-> "idle", table |-> 0, log |-> 0, at |-> 0]
 
@@ -135,7 +184,8 @@ VARIABLES
   logs,
   \* The log numbers whose files are still in the wal/ folder.
   onDisk,
-  \* The frozen memtable waiting for its flush, or NoFrozen (ReadView::frozen).
+  \* The frozen memtables waiting for a flush, oldest first, each its writes
+  \* and its log number (ReadView::frozen, a Vec<Arc<MemTable>>).
   frozen,
   \* The next file number to hand out (Version::next_file_id).
   nextId,
@@ -192,13 +242,24 @@ FirstTorn(img) == IF TornAt(img) = {} THEN Len(img) + 1 ELSE MinOf(TornAt(img))
 \* The batches replay keeps: everything before the first damage.
 Replayed(img) == SubSeq(img, 1, FirstTorn(img) - 1)
 
+\* tail::needs_sync: what the judge reads off a whole batch for "did the
+\* writer sync you?". The fixed engine opens a sealed batch first
+\* (sealed::open_batch) and reads the true answer. RED JudgeCiphertext reads
+\* the sealed bytes as if they were plain records: they decode as nothing it
+\* knows, and "cannot tell" counts as "yes", even for a reservation.
+JudgedSync(b) ==
+  \* The planted bug, on an encrypted database: every whole batch says yes.
+  IF Sealed /\ Mutant = "JudgeCiphertext" THEN TRUE
+  \* Otherwise the batch's own answer, read in plain or after opening it.
+  ELSE b.sync
+
 \* tail::proof_past: a whole batch after the damage that needed a sync and
 \* has a batch after it. Its sync finished before that next batch was
 \* written, and a sync covers every byte before it, the damage included.
 Proof(img) ==
   \* Some position after the damage, but not the very last one, holds a
-  \* whole batch of the kind the writer syncs before it writes on.
-  \E j \in (FirstTorn(img) + 1)..(Len(img) - 1) : img[j].whole /\ img[j].sync
+  \* whole batch the judge reads as one the writer syncs before it writes on.
+  \E j \in (FirstTorn(img) + 1)..(Len(img) - 1) : img[j].whole /\ JudgedSync(img[j])
 
 \* Does the open refuse this image?
 Refuses(img) ==
@@ -275,8 +336,8 @@ Init ==
   /\ logs = (1 :> {})
   \* Its file is on disk.
   /\ onDisk = {1}
-  \* Nothing is frozen.
-  /\ frozen = NoFrozen
+  \* Nothing is frozen: the queue of waiting memtables is empty.
+  /\ frozen = <<>>
   \* File number 2 is next.
   /\ nextId = 2
   \* No table file yet.
@@ -316,16 +377,17 @@ Put(k) ==
 Seal ==
   \* There is something to freeze.
   /\ mem # {}
-  \* The previous frozen memtable is flushed already (one at a time here).
-  /\ frozen = NoFrozen
+  \* Room for one more waiting memtable (a rotation that would pass the
+  \* cap flushes first, which here is waiting for a FlushRetire).
+  /\ Len(frozen) < MaxFrozen
   \* The manifest writer is free.
   /\ CanAppend
   \* The manifest has room in this bounded run.
   /\ Len(man) < MaxBatches
   \* Append the reservation of the new log's number; it needs no sync.
   /\ man' = Append(man, Reserve)
-  \* The old memtable and its log wait for a flush.
-  /\ frozen' = [w |-> mem, log |-> memLog]
+  \* The old memtable and its log join the back of the queue: the newest.
+  /\ frozen' = Append(frozen, [w |-> mem, log |-> memLog])
   \* A fresh, empty memtable takes new writes.
   /\ mem' = {}
   \* It writes to the new log.
@@ -339,22 +401,30 @@ Seal ==
   \* Nothing else changes.
   /\ UNCHANGED <<seq, files, synced, pending, toAck, acked, flushing>>
 
+\* Which waiting memtables a flush may take. Every flush path runs
+\* Flusher::flush_oldest under the `flushing` exclusion and takes the front
+\* of the queue, whichever thread runs it. RED NewestFirst lets a flush take
+\* any of them, as two threads racing for different memtables would.
+Victims == IF Mutant = "NewestFirst" THEN 1..Len(frozen) ELSE 1..1
+
 \* The flush reserves a number for its table and writes the table file.
 FlushTable ==
   \* A memtable is frozen.
-  /\ frozen.log # 0
-  \* No flush is under way.
+  /\ Len(frozen) > 0
+  \* No flush is under way: one flush at a time, the `flushing` exclusion.
   /\ flushing = Idle
   \* The manifest writer is free.
   /\ CanAppend
   \* The manifest has room.
   /\ Len(man) < MaxBatches
+  \* The flush picks its memtable: the oldest, unless the RED is planted.
+  /\ \E i \in Victims :
+       \* The table file holds that memtable's writes.
+       /\ files' = files @@ (nextId :> frozen[i].w)
+       \* The flush remembers its table and the log that table covers.
+       /\ flushing' = [stage |-> "written", table |-> nextId, log |-> frozen[i].log, at |-> 0]
   \* Append the reservation of the table's number; it needs no sync.
   /\ man' = Append(man, Reserve)
-  \* The table file holds the frozen memtable's writes.
-  /\ files' = files @@ (nextId :> frozen.w)
-  \* The flush remembers its table and the log that table covers.
-  /\ flushing' = [stage |-> "written", table |-> nextId, log |-> frozen.log, at |-> 0]
   \* That number is used.
   /\ nextId' = nextId + 1
   \* Nothing else changes.
@@ -419,8 +489,9 @@ FlushRetire ==
   \* Some of the flushed logs go; the rest failed to unlink and stay.
   /\ \E gone \in SUBSET {l \in onDisk : l <= flushing.log} :
        onDisk' = onDisk \ gone \* those files leave the wal/ folder
-  \* The frozen memtable is retired.
-  /\ frozen' = NoFrozen
+  \* The flushed memtable leaves the queue, found by its log
+  \* (ReadViewCell::retire_memtable, by identity, not by position).
+  /\ frozen' = SelectSeq(frozen, LAMBDA f : f.log # flushing.log)
   \* The flush is over.
   /\ flushing' = Idle
   \* Nothing else changes.
@@ -433,8 +504,8 @@ FlushRetire ==
 Ingest(k) ==
   \* There is a sequence left to take.
   /\ seq < MaxSeq
-  \* No memtable holds k.
-  /\ ~\E w \in mem \cup frozen.w : w[1] = k
+  \* No memtable holds k: not the active one, and no waiting one.
+  /\ ~\E w \in mem \cup UNION {frozen[i].w : i \in 1..Len(frozen)} : w[1] = k
   \* The manifest writer is free.
   /\ CanAppend
   \* There is room for the reservation and the table's batch.
