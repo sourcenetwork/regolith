@@ -148,7 +148,7 @@ pub mod loom_exports {
     //! check, and this module is the seam that lets the test target call
     //! them. It does not exist in an ordinary build.
 
-    pub use crate::engine::loom_model::{arena, handoff, skiplist, slice, version};
+    pub use crate::engine::loom_model::{arena, handoff, io_queue, skiplist, slice, version};
 }
 
 #[cfg(feature = "fuzzing")]

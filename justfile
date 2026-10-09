@@ -282,7 +282,14 @@ loom-debug:
 loom-sync:
     RUSTFLAGS="--cfg loom" cargo test --release --test loom_sync
 
-loom-all: loom loom-debug loom-sync
+# Loom models for the per-thread I/O queues (D53): the unit claim, the
+# completion pushed to every waiting queue, the idle waker, and a read's
+# wait, with four calibrations that must fail. Release only, like
+# `loom-sync`: the wait model explores close to 0.8 million interleavings.
+loom-io:
+    RUSTFLAGS="--cfg loom" cargo test --release --test loom_io_queue
+
+loom-all: loom loom-debug loom-sync loom-io
 
 # The read-view chaos workload at full size: 6 instances x 2 rounds x 400
 # versions. Measured at over 20 minutes wall and 4h of CPU unoptimized,
