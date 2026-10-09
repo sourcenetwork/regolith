@@ -166,6 +166,35 @@ fn a_torn_sealed_batch_is_dropped_like_any_torn_batch() {
     }
 }
 
+/// The batch a crash tore with its length intact: zeros or garbage where
+/// its body was. Its checksum fails before any key is consulted, so it is
+/// dropped like a format 1 torn batch, and the open keeps the batches
+/// before it. Were the tag to replace the checksum here, the torn batch
+/// could not be told from one under a wrong key: refusing it would refuse a
+/// crash the open must survive, and dropping it would drop a wrong key's
+/// whole manifest.
+#[test]
+fn a_torn_batch_with_its_length_intact_is_dropped_before_any_key_is_used() {
+    let (env, db_dir, sst_dir) = fixture();
+    let ring = keyring(&[1]);
+    let mut vs = open(&env, &db_dir, &sst_dir, Some(ring.clone())).unwrap();
+    vs.apply(&[VersionEdit::SetLastSeq(5)]).unwrap();
+    vs.apply(&[VersionEdit::SetLastSeq(6)]).unwrap();
+    drop(vs);
+    let data = manifest(&env, &db_dir);
+    let last = *batch_offsets(&data, SEALED_STAMP_LEN).last().unwrap();
+    for fill in [0x00u8, 0x5A] {
+        let mut torn = data.clone();
+        for b in &mut torn[last + 4..] {
+            *b = fill;
+        }
+        env.write(&db_dir.join("MANIFEST"), &torn).unwrap();
+        let vs = open(&env, &db_dir, &sst_dir, Some(ring.clone()))
+            .unwrap_or_else(|e| panic!("fill {fill:#x}: a torn batch refused the open: {e}"));
+        assert_eq!(vs.current().last_seq, 5, "fill {fill:#x}");
+    }
+}
+
 #[test]
 fn a_batch_whose_checksum_holds_and_whose_tag_fails_refuses() {
     let (env, db_dir, sst_dir) = fixture();
