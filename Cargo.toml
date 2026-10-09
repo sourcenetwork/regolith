@@ -229,3 +229,7 @@ harness = false
 [[bench]]
 name = "cf_drop"
 harness = false
+
+[[bench]]
+name = "per_core"
+harness = false
