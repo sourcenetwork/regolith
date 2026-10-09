@@ -325,7 +325,11 @@ tla:
     check() {
         local cfg="$1" expect="$2" inv="${3:-}" out broke verdict states took
         out=$(./tools/tlc -metadir "states/$cfg" -config "$cfg.cfg" "$spec.tla" 2>&1)
-        broke=$(sed -n 's/^Error: Invariant \(.*\) is violated\.$/\1/p' <<<"$out" | head -1)
+        # TLC words a broken invariant two ways: "is violated." when the search reaches a bad
+        # state, and "is violated by the initial state:" when the very first state is already
+        # bad. Both name the invariant, and both count.
+        broke=$(sed -n -e 's/^Error: Invariant \(.*\) is violated\.$/\1/p' \
+                       -e 's/^Error: Invariant \(.*\) is violated by the initial state:$/\1/p' <<<"$out" | head -1)
         states=$(sed -n 's/^.* states generated, \([0-9,]*\) distinct states found.*$/\1/p' <<<"$out" | tail -1)
         took=$(sed -n 's/^Finished in \(.*\) at (.*$/\1/p' <<<"$out" | tail -1)
         if grep -q "No error has been found" <<<"$out"; then
@@ -360,10 +364,49 @@ tla:
     check MC_DefraLevel_Red_RangeDeleteNotReplacement  RED INV_CounterExact
     check MC_DefraLevel_Red_PolicyIgnoresRange         RED INV_NoStaleDefinition
     check MC_DefraLevel_Red_DefinitionContentAddressed RED INV_NoStaleDefinition
+    # DefraLevel's key classes and mechanisms (plan 3.1 to 3.15). Lean:
+    # Regolith/Validation.lean, all_classes_serial; Regolith/Relaxations.lean;
+    # Regolith/MergeOperator.lean.
+    check MC_DefraLevel_Green_ContentAddressed         GREEN
+    check MC_DefraLevel_Red_CaDeleteExempt             RED INV_NoDanglingReference
+    check MC_DefraLevel_Red_PresenceReadFull           RED INV_LinksCommit
+    check MC_DefraLevel_Red_PresenceUnchecked          RED INV_HoldsCurrent
+    check MC_DefraLevel_Green_Parts                    GREEN
+    check MC_DefraLevel_Red_PartsIgnorePut             RED INV_PartsCurrent
+    check MC_DefraLevel_Red_PartsIgnoreTouch           RED INV_PartsCurrent
+    check MC_DefraLevel_Red_PartsNoAbsentFallback      RED INV_PartsCurrent
+    check MC_DefraLevel_Red_PartsNoPutFallback         RED INV_PartsCurrent
+    check MC_DefraLevel_Red_PartsNamesOther            RED INV_PartsCurrent
+    check MC_DefraLevel_Red_Parts_RepeatableRead       RED INV_PartsRelaxed
+    check MC_DefraLevel_Green_ValueReads               GREEN
+    check MC_DefraLevel_Red_SeqOnlyValidation          RED INV_IdenticalRewritesCommit
+    check MC_DefraLevel_Green_WriteFree                GREEN
+    check MC_DefraLevel_Red_WriteFreePessimistic       RED INV_WriteFreeConsistent
+    check MC_DefraLevel_Green_Log                      GREEN
+    check MC_DefraLevel_Red_OwnAppendVisible           RED INV_NoPhantomAppend
+    check MC_DefraLevel_Red_DecideOnLogRead            RED INV_LogDecisionsCurrent
+    check MC_DefraLevel_Green_MergeBeforeScan          GREEN
+    check MC_DefraLevel_Red_MergeBeforeScanReadsBase   RED INV_TallyMergesCommit
+    check MC_DefraLevel_Green_OwnWrites                GREEN
+    check MC_DefraLevel_Red_PutsBeforeMerges           RED INV_ReadYourOwnWrites
+    check MC_DefraLevel_Red_OwnMergesInvisible         RED INV_ReadYourOwnWrites
+    check MC_DefraLevel_Green_ValidatedScan            GREEN
+    check MC_DefraLevel_Red_PlainScanDecides           RED INV_ScanDecisionsCurrent
+    check MC_DefraLevel_Red_ReasonNewestWrite          RED INV_ReasonsExact
     # E1. Lean: Regolith/LsmOrder.lean, compact_range_reads_newest.
     spec=LsmOrder
     check MC_LsmOrder_Green                            GREEN
     check MC_LsmOrder_Red_Intersect                    RED ReadNewest
+    # Flush order, ingest placement, overlap demotion (E14, D13), binary
+    # search. Lean: Regolith/LsmOrder.lean, install_oldest_same_order,
+    # ingest_ordered, demote_reads_newest, level_read_bsearch.
+    check MC_LsmOrder_Green_Flush                      GREEN
+    check MC_LsmOrder_Red_FlushAnyOrder                RED ReadNewest
+    check MC_LsmOrder_Green_Ingest                     GREEN
+    check MC_LsmOrder_Red_IngestIgnoresUpper           RED ReadNewest
+    check MC_LsmOrder_Green_Demote                     GREEN
+    check MC_LsmOrder_Red_DemoteLevelOnly              RED ReadNewest
+    check MC_LsmOrder_Red_NoDemotion                   RED ReadNewest
     # E6. Lean: Regolith/BatchView.lean, batch_one_view_newest.
     spec=BatchRead
     check MC_BatchRead_Green                           GREEN
@@ -379,6 +422,160 @@ tla:
     check MC_WalRotation_Green                         GREEN
     check MC_WalRotation_Red_NoSync                    RED RecoversPrefix
     check MC_WalRotation_Red_NoSync_Gap                RED NoGap
+    # Plan 3.6, commit-ordered append (supersedes defradb.rs #1911). Each
+    # Teeth row is GREEN: its mutant breaks nothing but its RED's invariant.
+    # Lean: Regolith/Append.lean, dense_from_one, unique_positions,
+    # at_most_once, commit_order, snapshot_sees_prefix.
+    spec=CommitOrderedAppend
+    check MC_CommitOrderedAppend_Green_Writers                 GREEN
+    check MC_CommitOrderedAppend_Green_Groups                  GREEN
+    check MC_CommitOrderedAppend_Green_Faults                  GREEN
+    check MC_CommitOrderedAppend_Green_Pipeline                GREEN
+    check MC_CommitOrderedAppend_Red_Counter                   RED INV_NoDisjointConflict
+    check MC_CommitOrderedAppend_Red_Detached                  RED INV_OneCommitPerWrite
+    check MC_CommitOrderedAppend_Red_DetachedOrder             RED INV_CommitOrder
+    check MC_CommitOrderedAppend_Red_DetachedNumbering         RED INV_NumberedAtCommit
+    check MC_CommitOrderedAppend_Red_LatestBound               RED INV_NoSkip
+    check MC_CommitOrderedAppend_Red_Stamps                    RED INV_Dense
+    check MC_CommitOrderedAppend_Red_ViewOnlyHead              RED INV_UniqueCursors
+    check MC_CommitOrderedAppend_Red_OnceFromView              RED INV_AtMostOnce
+    check MC_CommitOrderedAppend_Red_AssignBeforeValidation    RED INV_Dense
+    check MC_CommitOrderedAppend_Red_HeadCache                 RED INV_Dense
+    check MC_CommitOrderedAppend_Red_PublishedView             RED INV_UniqueCursors
+    check MC_CommitOrderedAppend_Teeth_Counter                 GREEN
+    check MC_CommitOrderedAppend_Teeth_Detached                GREEN
+    check MC_CommitOrderedAppend_Teeth_LatestBound             GREEN
+    check MC_CommitOrderedAppend_Teeth_Stamps                  GREEN
+    check MC_CommitOrderedAppend_Teeth_ViewOnlyHead            GREEN
+    check MC_CommitOrderedAppend_Teeth_OnceFromView            GREEN
+    check MC_CommitOrderedAppend_Teeth_AssignBeforeValidation  GREEN
+    check MC_CommitOrderedAppend_Teeth_HeadCache               GREEN
+    check MC_CommitOrderedAppend_Teeth_PublishedView           GREEN
+    # Plan 3.6 across crashes, per durability mode. Green_Eventual is also
+    # the RED's teeth. Lean: Regolith/Append.lean, snapshot_sees_prefix;
+    # Regolith/WalRecovery.lean, recovers_prefix.
+    spec=CommitOrderedAppendCrash
+    check MC_CommitOrderedAppendCrash_Green_Immediate          GREEN
+    check MC_CommitOrderedAppendCrash_Green_Eventual           GREEN
+    check MC_CommitOrderedAppendCrash_Red_EventualExternal     RED INV_ExternalStable
+    # Plan 3.7, conflict-free allocation. Lean: Regolith/Allocate.lean,
+    # ranges_disjoint, ranges_grow, uses_allocated, alloc_fresh.
+    spec=Allocate
+    check MC_Allocate_Green_Immediate                          GREEN
+    check MC_Allocate_Green_Eventual                           GREEN
+    check MC_Allocate_Red_InTxn                                RED INV_NeverConflicts
+    check MC_Allocate_Red_LogAfterUse                          RED INV_UseDurable
+    check MC_Allocate_Red_LogAfterUse_Reuse                    RED INV_UsesUnique
+    check MC_Allocate_Teeth_InTxn                              GREEN
+    check MC_Allocate_Teeth_LogAfterUse                        GREEN
+    # 4.2, E3: WAL format 2 replay. Lean: Regolith/WalRecovery.lean,
+    # recovers_prefix2.
+    spec=WalRecovery
+    check MC_WalRecovery_Green_Immediate               GREEN
+    check MC_WalRecovery_Green_Eventual                GREEN
+    check MC_WalRecovery_Green_Residual                GREEN
+    check MC_WalRecovery_Green_Aead                    GREEN
+    check MC_WalRecovery_Red_DropBelowP                RED NoProvenLoss
+    check MC_WalRecovery_Red_RefuseAboveP              RED RecoveryOpens
+    check MC_WalRecovery_Red_Format1                   RED RecoveryOpens
+    check MC_WalRecovery_Red_CloseWithoutSync          RED RecoveryOpens
+    check MC_WalRecovery_Red_NoTruncate                RED RecoveryOpens
+    check MC_WalRecovery_Red_StampNotSealed            RED AckedSurvive
+    # 4.8, E5: compaction per snapshot stripe. Lean: Regolith/Stripes.lean,
+    # reduce_reads.
+    spec=StripeCompaction
+    check MC_StripeCompaction_Green                    GREEN
+    check MC_StripeCompaction_Green_Filter             GREEN
+    check MC_StripeCompaction_Green_Inexact            GREEN
+    check MC_StripeCompaction_Red_CaptureEarly         RED SnapshotReadsKept
+    check MC_StripeCompaction_Red_InexactFold          RED HeadKept
+    check MC_StripeCompaction_Red_IgnoreStripes        RED SnapshotReadsKept
+    # 4.6: the lock-free snapshot registry. Lean:
+    # Regolith/SnapshotRegistry.lean, scan_respects_live.
+    spec=SnapshotRegistry
+    check MC_SnapshotRegistry_Green                    GREEN
+    check MC_SnapshotRegistry_Red_NoConfirm            RED MinBelowLive
+    check MC_SnapshotRegistry_Red_ScanThenSample       RED MinBelowLive
+    # E10, group commit. Lean: Regolith/GroupCommit.lean, group_eq_serial.
+    spec=GroupCommit
+    check MC_GroupCommit_Green                         GREEN
+    check MC_GroupCommit_Red_ViewOnly                  RED SerialEquivalent
+    check MC_GroupCommit_Red_PublishBeforeSync         RED DurableBeforeVisible
+    # 4.7, the lock-free commit pipeline. Lean: Regolith/Pipeline.lean,
+    # seqs_dense and reader_sees_published.
+    spec=CommitPipeline
+    check MC_CommitPipeline_Green                      GREEN
+    check MC_CommitPipeline_Red_OutOfOrder             RED ReadersSeePrefix
+    check MC_CommitPipeline_Red_AbortHole              RED NoHole
+    check MC_CommitPipeline_Red_NoHelping              RED NoLiveThreadBlocked
+    check MC_CommitPipeline_Red_SyncPastGap            RED DurableImpliesWritten
+    check MC_CommitPipeline_Red_ValidatePublished      RED NoLostUpdate
+    # R13, non-blocking calls: tickets, poll_io, io_pending, CacheOnly reads.
+    # TLC only; wakeups are interleavings with no law over sizes to prove.
+    spec=NonBlocking
+    check MC_NonBlocking_Green_Pool                    GREEN
+    check MC_NonBlocking_Green_Single                  GREEN
+    check MC_NonBlocking_Red_LostWakeup                RED NoLostWakeup
+    check MC_NonBlocking_Red_SilentSelfIo              RED IoPendingFires
+    # regolith::sync's locks after D49: barging with bounded bypass, for
+    # Mutex, Semaphore and ReentrantMutex. Lean: Regolith/Sync.lean,
+    # mutual_exclusion, bounded_bypass, owed_exclusive.
+    spec=Sync
+    check MC_Sync_Green_Mutex                          GREEN
+    check MC_Sync_Green_Semaphore                      GREEN
+    check MC_Sync_Green_Reentrant                      GREEN
+    check MC_Sync_Green_ReentrantLive                  GREEN
+    check MC_Sync_Red_UnboundedBarging                 RED BoundedBypass
+    check MC_Sync_Red_ReleaseNoWake                    RED NoLostWakeup
+    check MC_Sync_Red_LoseQueuePosition                RED BoundedBypass
+    check MC_Sync_Red_CancelNoPassOn                   RED CancelPassesOn
+    check MC_Sync_Red_NoRecheck                        RED NoLostWakeup
+    check MC_Sync_Red_IgnoreOwed                       RED HandoffExclusive
+    check MC_Sync_Red_NoDepth                          RED ReentrancyDepth
+    # regolith::sync::Notify, which keeps FIFO handoff. Lean:
+    # Regolith/SyncFifo.lean, fifo_served, no_stranded_waiter.
+    spec=SyncNotify
+    check MC_SyncNotify_Green                          GREEN
+    check MC_SyncNotify_Red_WakeBeforeHandoff          RED NoLostWakeup
+    check MC_SyncNotify_Red_CancelNoPassOn             RED CancelPassesOn
+    check MC_SyncNotify_Red_NoRecheck                  RED NoLostWakeup
+    check MC_SyncNotify_Red_NoGenCheck                 RED NoLostWakeup
+    # regolith::sync::RwLock and ReentrantRwLock after D49, with D50's
+    # upgradable read.
+    spec=SyncRwLock
+    check MC_SyncRwLock_Green_Plain                    GREEN
+    check MC_SyncRwLock_Green_WriterLive               GREEN
+    check MC_SyncRwLock_Green_ReaderLive               GREEN
+    check MC_SyncRwLock_Green_Reentrant                GREEN
+    check MC_SyncRwLock_Green_ReentrantLive            GREEN
+    check MC_SyncRwLock_Red_UnboundedBarging           RED BoundedBypass
+    check MC_SyncRwLock_Red_AnyReaderUpgrade           RED NoUpgradeDeadlock
+    check MC_SyncRwLock_Red_UpgradeNoHoldBack          RED UpgradeHoldsBack
+    check MC_SyncRwLock_Red_OwnerUnaware               RED NoSelfDeadlock
+    # regolith::sync::Event, Latch and Barrier.
+    spec=SyncLatch
+    check MC_SyncLatch_Green_Event                     GREEN
+    check MC_SyncLatch_Green_Latch                     GREEN
+    check MC_SyncLatch_Green_Barrier                   GREEN
+    check MC_SyncLatch_Red_NoRecheck                   RED NoLostWakeup
+    check MC_SyncLatch_Red_CountCheck                  RED NoLostWakeup
+    # regolith::sync::OnceCell and Lazy: exactly one value is published.
+    spec=SyncOnce
+    check MC_SyncOnce_Green                            GREEN
+    check MC_SyncOnce_Red_CancelNoReset                RED NoLostWakeup
+    check MC_SyncOnce_Red_PlainStore                   RED PublishedOnce
+    check MC_SyncOnce_Red_NoRecheck                    RED NoLostWakeup
+    check MC_SyncOnce_Red_ReparkStale                  RED NoLostWakeup
+    # Transaction callbacks (3.16). Lean: Regolith/Callbacks.lean,
+    # exactly_once, order, attempts_isolated.
+    spec=TxnCallbacks
+    check MC_TxnCallbacks_Green_Immediate              GREEN
+    check MC_TxnCallbacks_Green_Eventual               GREEN
+    check MC_TxnCallbacks_Red_CommitBeforeDurable      RED CommitAfterDurable
+    check MC_TxnCallbacks_Red_SkipCallbackWrites       RED NoLostUpdate
+    check MC_TxnCallbacks_Red_CallbacksSurvive         RED AttemptIsolation
+    check MC_TxnCallbacks_Red_HelperNoClaim            RED AtMostOnce
+    check MC_TxnCallbacks_Red_CloseNoClaim             RED AtMostOnce
     rm -rf states ./*_TTrace_*.tla ./*_TTrace_*.bin
     exit $fail
 
