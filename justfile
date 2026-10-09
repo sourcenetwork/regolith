@@ -325,7 +325,11 @@ tla:
     check() {
         local cfg="$1" expect="$2" inv="${3:-}" out broke verdict states took
         out=$(./tools/tlc -metadir "states/$cfg" -config "$cfg.cfg" "$spec.tla" 2>&1)
-        broke=$(sed -n 's/^Error: Invariant \(.*\) is violated\.$/\1/p' <<<"$out" | head -1)
+        # TLC words a broken invariant two ways: "is violated." when the search reaches a bad
+        # state, and "is violated by the initial state:" when the very first state is already
+        # bad. Both name the invariant, and both count.
+        broke=$(sed -n -e 's/^Error: Invariant \(.*\) is violated\.$/\1/p' \
+                       -e 's/^Error: Invariant \(.*\) is violated by the initial state:$/\1/p' <<<"$out" | head -1)
         states=$(sed -n 's/^.* states generated, \([0-9,]*\) distinct states found.*$/\1/p' <<<"$out" | tail -1)
         took=$(sed -n 's/^Finished in \(.*\) at (.*$/\1/p' <<<"$out" | tail -1)
         if grep -q "No error has been found" <<<"$out"; then
