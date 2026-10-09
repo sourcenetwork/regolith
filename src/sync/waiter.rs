@@ -284,6 +284,27 @@ impl Waiter {
         }
     }
 
+    /// Takes back the owed mark of a node still waiting. False when it
+    /// left the waiting phase first, so the queue settles the mark as it
+    /// lets the node go.
+    fn unowe(&self) -> bool {
+        let mut state = self.state.load(Ordering::Acquire);
+        loop {
+            if state & PHASE != WAITING || state & OWED == 0 {
+                return false;
+            }
+            match self.state.compare_exchange_weak(
+                state,
+                state & !OWED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(actual) => state = actual,
+            }
+        }
+    }
+
     /// Moves a waiting node to cancelled, taking its armed waker, and
     /// reports whether a nudge had reached it unused. `None` when it was
     /// already granted.
@@ -678,6 +699,16 @@ impl Wait {
         };
         // SAFETY: this future holds its reference.
         unsafe { node.as_ref() }.owe()
+    }
+
+    /// Takes back the node's owed mark. False when it already left the
+    /// waiting phase, and the queue settles the mark.
+    pub(super) fn unowe(&self) -> bool {
+        let Some(node) = self.node else {
+            return false;
+        };
+        // SAFETY: this future holds its reference.
+        unsafe { node.as_ref() }.unowe()
     }
 
     /// Leaves the queue: the future was dropped, or took what it waits

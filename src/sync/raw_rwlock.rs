@@ -106,26 +106,6 @@ impl RawRwLock {
         self.try_take(kind).is_ok()
     }
 
-    /// Takes `kind` for a handoff, which may pass the owed bit because it
-    /// serves the queue.
-    fn take_for_waiter(&self, kind: usize) -> bool {
-        let mut state = self.queue.state.load(Ordering::Acquire);
-        loop {
-            if !admits(kind, state) {
-                return false;
-            }
-            match self.queue.state.compare_exchange_weak(
-                state,
-                enter(kind, state),
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => return true,
-                Err(actual) => state = actual,
-            }
-        }
-    }
-
     /// Drops one read. One `fetch_sub` when no waiter needs telling.
     pub(super) fn read_unlock(&self) {
         let before = self.queue.state.fetch_sub(ONE_READER, Ordering::AcqRel);
@@ -229,22 +209,8 @@ impl RawRwLock {
 }
 
 impl Lock for RawRwLock {
-    fn try_take(&self, kind: usize) -> Result<(), usize> {
-        let mut state = self.queue.state.load(Ordering::Relaxed);
-        loop {
-            if state & HANDOFF != 0 || !admits(kind, state) {
-                return Err(state);
-            }
-            match self.queue.state.compare_exchange_weak(
-                state,
-                enter(kind, state),
-                Ordering::Acquire,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => return Ok(()),
-                Err(actual) => state = actual,
-            }
-        }
+    fn admit(&self, state: usize, kind: usize) -> Option<usize> {
+        admits(kind, state).then(|| enter(kind, state))
     }
 
     fn give_back(&self, kind: usize) {
@@ -299,7 +265,7 @@ impl Policy for RawRwLock {
             // the bypass, and is owed a handoff in the end. Readers and an
             // upgradable read behind a sharing front are woken with it
             // while they could share.
-            if !queue.owes()
+            if !queue.hands_off()
                 && let Some(front) = list.front(queue)
             {
                 let mut sharing = queue.state.load(Ordering::Acquire);

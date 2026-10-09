@@ -16,7 +16,7 @@ use core::future::Future;
 use core::pin::Pin;
 use core::task::{Context, Poll, Waker};
 
-use super::contend::{Contend, Lock};
+use super::contend::{self, Contend, Lock};
 use super::internal::{Ordering, UnsafeCell};
 use super::list::List;
 use super::queue::{
@@ -100,52 +100,23 @@ impl RawSemaphore {
             }
         });
     }
-
-    /// Takes `n` permits for a handoff, which may pass the owed bit
-    /// because it serves the queue.
-    fn take_for_waiter(&self, n: usize) -> bool {
-        let mut state = self.queue.state.load(Ordering::Acquire);
-        loop {
-            if state >> SHIFT < n {
-                return false;
-            }
-            match self.queue.state.compare_exchange_weak(
-                state,
-                state - (n << SHIFT),
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => return true,
-                Err(actual) => state = actual,
-            }
-        }
-    }
 }
 
 impl Lock for RawSemaphore {
-    fn try_take(&self, need: usize) -> Result<(), usize> {
-        if need == 0 {
-            return Ok(());
-        }
-        let mut state = self.queue.state.load(Ordering::Relaxed);
-        loop {
-            if state & HANDOFF != 0 || state >> SHIFT < need {
-                return Err(state);
-            }
-            match self.queue.state.compare_exchange_weak(
-                state,
-                state - (need << SHIFT),
-                Ordering::Acquire,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => return Ok(()),
-                Err(actual) => state = actual,
-            }
-        }
+    fn admit(&self, state: usize, need: usize) -> Option<usize> {
+        (state >> SHIFT >= need).then(|| state - (need << SHIFT))
     }
 
     fn give_back(&self, need: usize) {
         self.release(need);
+    }
+
+    fn try_take(&self, need: usize) -> Result<(), usize> {
+        // Nothing to take, so nothing to wait for, owed handoff or not.
+        if need == 0 {
+            return Ok(());
+        }
+        contend::take(self, need, false)
     }
 }
 
@@ -179,7 +150,7 @@ impl Policy for RawSemaphore {
             // permits cannot cover still tries, loses, counts the bypass,
             // and is owed a handoff in the end rather than starving behind
             // smaller callers.
-            if !queue.owes() && waiting.front(queue).is_some() {
+            if !queue.hands_off() && waiting.front(queue).is_some() {
                 let mut budget = queue.state.load(Ordering::Acquire) >> SHIFT;
                 let mut nudges = Nudges::new(woken, queue);
                 for (at, node) in waiting.iter().enumerate() {

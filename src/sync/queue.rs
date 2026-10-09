@@ -39,12 +39,16 @@
 //! nudge whose waiter has not polled yet; releases skip the drain pass
 //! while it is set, since a wake is already on its way.
 //!
-//! A nudged waiter that loses again counts one bypass. At
-//! [`MAX_BYPASS`](super::MAX_BYPASS) it marks itself owed, and the queue's
-//! owed count and the [`HANDOFF`] bit stop every barging acquire: the drain
-//! pass then hands what is released straight to the waiters in queue
-//! order, and the bit clears once no owed waiter is left. So a waiter is
-//! passed over at most `MAX_BYPASS` times.
+//! A nudged waiter that loses again counts one bypass. The attempt that
+//! would be its [`MAX_BYPASS`](super::MAX_BYPASS)th loss marks it owed
+//! first, then either takes what it asks for or raises the [`HANDOFF`]
+//! bit in the same compare-and-swap. While the bit is up every barging
+//! acquire is refused, so what a release frees stays parked in the state
+//! word for the drain pass, which hands it to the waiters in queue order;
+//! the bit clears once no owed waiter is left. No release can fall between
+//! the last loss and the bit: one ordered before the swap is seen by it,
+//! and the waiter takes what it freed. So a waiter is passed over at most
+//! `MAX_BYPASS` times.
 
 #![allow(unsafe_code)]
 
@@ -154,9 +158,13 @@ impl WaitQueue {
         self.cancels.load(Ordering::Relaxed)
     }
 
-    /// Whether any queued waiter is still owed a handoff.
-    pub(super) fn owes(&self) -> bool {
-        self.owed.load(Ordering::Acquire) != 0
+    /// Whether the queue serves its waiters by handoff alone: the
+    /// [`HANDOFF`] bit is up and a queued waiter is still owed. A pass then
+    /// grants in queue order and wakes nobody to compete. The count alone
+    /// is not enough: a waiter counts itself owed just before its last
+    /// attempt, and may take what it asks for instead.
+    pub(super) fn hands_off(&self) -> bool {
+        self.state.load(Ordering::Acquire) & HANDOFF != 0 && self.owed.load(Ordering::Acquire) != 0
     }
 
     /// Settles one owed waiter, which the queue let go of.
@@ -315,16 +323,57 @@ pub(super) trait Policy {
         self.transition(|state| Step::Drain(state | WAKE_FRONT));
     }
 
-    /// Marks `wait` owed a handoff and stops barging until it is served.
-    fn owe(&self, wait: &Wait) {
+    /// The attempt that would be `wait`'s last counted loss. It marks the
+    /// waiter owed, then in one compare-and-swap either takes what it asks
+    /// for (`take` gives the state with it taken, or `None` when it does
+    /// not fit) or raises [`HANDOFF`], so a release ordered after the loss
+    /// finds barging shut and leaves what it frees for the drain to hand
+    /// over. A take, or a handoff already owed to someone else (then the
+    /// loss does not count), leaves the waiter un-owed. On failure, the
+    /// state the attempt saw.
+    fn owe_or_take(
+        &self,
+        wait: &Wait,
+        mut take: impl FnMut(usize) -> Option<usize>,
+    ) -> Result<(), usize> {
         let queue = self.queue();
         // Counted before the node is marked, so the drainer that settles
-        // the mark never takes the count below zero.
+        // the mark never takes the count below zero, and before the bit
+        // is raised, so a drain that sees the bit sees the count too.
         queue.owed.fetch_add(1, Ordering::AcqRel);
-        if wait.owe() {
-            self.transition(|state| Step::Drain(state | HANDOFF));
+        let marked = wait.owe();
+        let mut took = false;
+        let seen = if marked {
+            self.transition(|state| {
+                took = false;
+                if state & HANDOFF != 0 {
+                    return Step::Keep;
+                }
+                match take(state) {
+                    Some(next) => {
+                        took = true;
+                        Step::Set(next)
+                    }
+                    None => Step::Drain(state | HANDOFF),
+                }
+            })
         } else {
-            queue.owed.fetch_sub(1, Ordering::AcqRel);
+            // Granted already: the next look at the node finds it.
+            queue.state.load(Ordering::Acquire)
+        };
+        if !marked || took || seen & HANDOFF != 0 {
+            // A node already granted keeps no mark; the queue settles one
+            // that a grant beat this to.
+            if !marked || wait.unowe() {
+                queue.forgive();
+            }
+            // A drain that counted this waiter meanwhile kept the bit up
+            // for it, so one more pass decides. A read-modify-write, to
+            // see that drain's exit if it came first.
+            if queue.state.fetch_or(0, Ordering::AcqRel) & HANDOFF != 0 {
+                self.transition(Step::Drain);
+            }
         }
+        if took { Ok(()) } else { Err(seen) }
     }
 }
