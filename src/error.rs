@@ -81,10 +81,14 @@ impl Error {
     /// Render this engine error as the `io::Error` a caller on an
     /// `io::Result` boundary sees, preserving the kind and message a
     /// direct `io::Error` path (a closed handle, a read-only handle)
-    /// already uses for the same condition. The one function both
-    /// [`crate::transaction::TransactionError`]'s `From<Error>` impl and
-    /// the engine's own `io::Result` commit path call, so the two never
-    /// drift apart on what a given `Error` variant reads as.
+    /// already uses for the same condition.
+    ///
+    /// The variants that carry no payload beyond what the error itself says
+    /// travel inside the `io::Error` as its source, and `From<io::Error>`
+    /// takes them back out, so a caller on the other side matches the
+    /// variant and never the message. Every `io::Result` path in the engine
+    /// goes through this one function, so none drifts from the others on what
+    /// a given `Error` variant reads as.
     pub(crate) fn into_io_error(self) -> std::io::Error {
         match self {
             Self::Io(io) | Self::Corruption(io) => io,
@@ -92,36 +96,55 @@ impl Error {
             Self::InvalidArgument(message) | Self::InvalidColumnFamily(message) => {
                 std::io::Error::new(std::io::ErrorKind::InvalidInput, message)
             }
-            Self::ReadOnly => std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                "database was opened read-only",
-            ),
-            Self::Closed => {
-                std::io::Error::new(std::io::ErrorKind::NotConnected, "database is closed")
+            Self::ReadOnly => {
+                std::io::Error::new(std::io::ErrorKind::PermissionDenied, Self::ReadOnly)
             }
-            limit @ Self::DataBlockLimitExceeded { .. } => std::io::Error::other(limit),
+            Self::Closed => std::io::Error::new(std::io::ErrorKind::NotConnected, Self::Closed),
+            typed @ (Self::DataBlockLimitExceeded { .. } | Self::Busy(_)) => {
+                std::io::Error::other(typed)
+            }
             other => std::io::Error::other(other.to_string()),
+        }
+    }
+}
+
+/// The payload-free variant `err` carries as its source, if
+/// [`Error::into_io_error`] built it from one.
+fn carried(err: &std::io::Error) -> Option<Error> {
+    match err.get_ref()?.downcast_ref::<Error>()? {
+        Error::DataBlockLimitExceeded {
+            max_data_block_bytes,
+        } => Some(Error::DataBlockLimitExceeded {
+            max_data_block_bytes: *max_data_block_bytes,
+        }),
+        Error::Closed => Some(Error::Closed),
+        Error::ReadOnly => Some(Error::ReadOnly),
+        Error::Busy(reason) => Some(Error::Busy(reason)),
+        _ => None,
+    }
+}
+
+impl Error {
+    /// A copy of `err`, for a failure handed to several callers:
+    /// `io::Error` is not `Clone`. Kind and message are rebuilt, and a typed
+    /// variant the error carries stays that variant.
+    pub(crate) fn clone_io(err: &std::io::Error) -> std::io::Error {
+        match carried(err) {
+            Some(typed) => typed.into_io_error(),
+            None => std::io::Error::new(err.kind(), err.to_string()),
         }
     }
 }
 
 impl From<std::io::Error> for Error {
     fn from(err: std::io::Error) -> Self {
-        if let Some(Self::DataBlockLimitExceeded {
-            max_data_block_bytes,
-        }) = err.get_ref().and_then(|e| e.downcast_ref::<Self>())
-        {
-            return Self::DataBlockLimitExceeded {
-                max_data_block_bytes: *max_data_block_bytes,
-            };
+        if let Some(typed) = carried(&err) {
+            return typed;
         }
         match err.kind() {
             std::io::ErrorKind::InvalidInput => Self::InvalidArgument(err.to_string()),
             std::io::ErrorKind::InvalidData | std::io::ErrorKind::UnexpectedEof => {
                 Self::Corruption(err)
-            }
-            std::io::ErrorKind::NotConnected if err.to_string() == "database is closed" => {
-                Self::Closed
             }
             _ => Self::Io(err),
         }
@@ -156,6 +179,42 @@ mod tests {
             let e: Error = ioe.into();
             assert!(matches!(e, Error::Corruption(source) if source.kind() == kind));
         }
+    }
+
+    #[test]
+    fn typed_variants_survive_a_round_trip_through_io_error() {
+        for typed in [
+            Error::Closed,
+            Error::ReadOnly,
+            Error::Busy("too many L0 files"),
+            Error::DataBlockLimitExceeded {
+                max_data_block_bytes: 4096,
+            },
+        ] {
+            let text = typed.to_string();
+            let io = typed.into_io_error();
+            assert_eq!(io.to_string(), text);
+            let back = Error::from(io);
+            assert_eq!(back.to_string(), text);
+            assert!(!matches!(back, Error::Io(_)), "{back:?} lost its variant");
+        }
+    }
+
+    #[test]
+    fn a_cloned_io_error_keeps_its_variant() {
+        for typed in [Error::Closed, Error::ReadOnly, Error::Busy("stalled")] {
+            let text = typed.to_string();
+            let copy = Error::clone_io(&typed.into_io_error());
+            assert_eq!(copy.to_string(), text);
+            assert!(!matches!(Error::from(copy), Error::Io(_)));
+        }
+    }
+
+    #[test]
+    fn closed_keeps_its_io_kind_and_message() {
+        let io = Error::Closed.into_io_error();
+        assert_eq!(io.kind(), std::io::ErrorKind::NotConnected);
+        assert_eq!(io.to_string(), "database is closed");
     }
 
     #[test]

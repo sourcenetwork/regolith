@@ -894,7 +894,7 @@ impl RegolithEngine {
     }
 
     fn closed_error() -> std::io::Error {
-        std::io::Error::new(std::io::ErrorKind::NotConnected, "database is closed")
+        crate::Error::Closed.into_io_error()
     }
 
     fn ensure_open(&self) -> std::io::Result<()> {
@@ -906,10 +906,7 @@ impl RegolithEngine {
     }
 
     fn read_only_error() -> std::io::Error {
-        std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            "database was opened read-only",
-        )
+        crate::Error::ReadOnly.into_io_error()
     }
 
     pub(crate) fn ensure_writable(&self) -> std::io::Result<()> {
@@ -2387,7 +2384,7 @@ impl RegolithEngine {
                 let hazard = self.background_health.record_failure(Job::Flush, &e);
                 tracing::error!(error = %e, hazard = hazard.label(), "Flush failed");
                 if !self.options.listeners.is_empty() {
-                    let err = crate::Error::from(std::io::Error::new(e.kind(), e.to_string()));
+                    let err = crate::Error::from(crate::Error::clone_io(&e));
                     crate::event_listener::dispatch(&self.options.listeners, |l| {
                         l.on_background_error(
                             crate::event_listener::BackgroundErrorReason::Flush,

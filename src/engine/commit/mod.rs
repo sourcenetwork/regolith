@@ -139,13 +139,6 @@ impl Pipeline {
     }
 }
 
-/// `io::Error` is not `Clone`, but a failed group has to hand the same
-/// failure to every member. Kind and message are the whole of what a
-/// caller can observe, so reconstructing them is lossless here.
-fn clone_io_error(err: &io::Error) -> io::Error {
-    io::Error::new(err.kind(), err.to_string())
-}
-
 /// Give staging memory back when neither of the last two groups needed it,
 /// and never keep more than `MAX_KEPT_STAGE_BYTES` regardless.
 ///
@@ -707,7 +700,7 @@ impl RegolithEngine {
             if let Some(slot) = ticket.slot {
                 slot.complete(match &result {
                     Ok(_) => Ok(last),
-                    Err(e) => Err(io::Error::new(e.kind(), e.to_string())),
+                    Err(e) => Err(crate::Error::clone_io(e)),
                 });
             }
             seq = last.saturating_add(1);
@@ -871,7 +864,7 @@ impl RegolithEngine {
     /// Tell the registered listeners a write-ahead-log operation failed.
     pub(super) fn notify_wal_error(&self, cause: &io::Error) {
         if !self.options.listeners.is_empty() {
-            let err = crate::Error::from(clone_io_error(cause));
+            let err = crate::Error::from(crate::Error::clone_io(cause));
             crate::event_listener::dispatch(&self.options.listeners, |l| {
                 l.on_background_error(
                     crate::event_listener::BackgroundErrorReason::WriteAheadLog,
@@ -942,7 +935,7 @@ mod tests {
     #[test]
     fn cloned_errors_keep_kind_and_message() {
         let err = io::Error::new(io::ErrorKind::StorageFull, "disk is full");
-        let cloned = clone_io_error(&err);
+        let cloned = crate::Error::clone_io(&err);
         assert_eq!(cloned.kind(), err.kind());
         assert_eq!(cloned.to_string(), err.to_string());
     }

@@ -2,8 +2,6 @@
 //! whose framed WAL record would exceed the limit is refused before it
 //! waits, applies nothing and consumes no sequence number.
 
-use std::io;
-
 use tempfile::TempDir;
 
 use super::*;
@@ -52,12 +50,11 @@ fn refuses_an_oversized_commit(db: &Db, tx: Transaction) {
     let err = tx
         .commit()
         .expect_err("an oversized commit must be refused");
-    let TransactionError::Io(e) = err else {
-        panic!("expected TransactionError::Io, got {err:?}");
+    let TransactionError::Engine(Error::InvalidArgument(message)) = err else {
+        panic!("expected TransactionError::Engine(InvalidArgument), got {err:?}");
     };
-    assert_eq!(e.kind(), io::ErrorKind::InvalidInput);
     assert_eq!(
-        e.to_string(),
+        message,
         format!(
             "write is too large: it would log {} bytes and one write can log at most {}; \
              split it into smaller writes",

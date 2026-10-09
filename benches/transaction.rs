@@ -116,7 +116,7 @@ struct Attempts {
     commits: u64,
     conflicts: u64,
     busy: u64,
-    io_errors: u64,
+    engine_errors: u64,
     other_errors: u64,
     abandoned: u64,
 }
@@ -126,7 +126,7 @@ impl Attempts {
         self.commits += o.commits;
         self.conflicts += o.conflicts;
         self.busy += o.busy;
-        self.io_errors += o.io_errors;
+        self.engine_errors += o.engine_errors;
         self.other_errors += o.other_errors;
         self.abandoned += o.abandoned;
     }
@@ -135,18 +135,18 @@ impl Attempts {
         match e {
             TransactionError::Conflict { .. } => self.conflicts += 1,
             TransactionError::Busy(_) => self.busy += 1,
-            TransactionError::Io(_) => self.io_errors += 1,
+            TransactionError::Engine(_) => self.engine_errors += 1,
             _ => self.other_errors += 1,
         }
     }
 
     fn json(&self) -> String {
         format!(
-            "{{\"commits\":{},\"conflicts\":{},\"busy\":{},\"io_errors\":{},\"other_errors\":{},\"abandoned\":{}}}",
+            "{{\"commits\":{},\"conflicts\":{},\"busy\":{},\"engine_errors\":{},\"other_errors\":{},\"abandoned\":{}}}",
             self.commits,
             self.conflicts,
             self.busy,
-            self.io_errors,
+            self.engine_errors,
             self.other_errors,
             self.abandoned
         )

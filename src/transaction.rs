@@ -130,12 +130,14 @@ const DEFAULT_LOCK_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Reasons a transaction can fail to commit. Not a variant of
 /// [`crate::Error`]: a conflict is a retry-able business outcome,
-/// distinct from an I/O failure.
+/// distinct from an engine failure.
 #[derive(Debug, thiserror::Error)]
 pub enum TransactionError {
-    /// Propagated I/O error from the underlying engine.
+    /// The underlying engine failed, with the same typed [`Error`] a plain
+    /// read or write reports: [`Error::Closed`] for a closed database,
+    /// [`Error::Busy`] for a write stall the engine cannot relieve, and so on.
     #[error(transparent)]
-    Io(#[from] std::io::Error),
+    Engine(#[from] Error),
     /// A key in the transaction's validation set was written by
     /// someone else after this transaction first observed it: after
     /// the begin snapshot for an optimistic transaction, or after
@@ -170,9 +172,16 @@ pub enum TransactionError {
 /// Convenience alias for results returned by transaction methods.
 pub type TxResult<T> = std::result::Result<T, TransactionError>;
 
-impl From<Error> for TransactionError {
-    fn from(e: Error) -> Self {
-        TransactionError::Io(e.into_io_error())
+/// A failed point read of `prefixed` as a transaction reports it: the typed
+/// error a plain `get` gives, so a merge the operator declined is
+/// [`Error::MergeFailed`] carrying the key.
+fn read_error(err: std::io::Error, prefixed: &[u8]) -> TransactionError {
+    TransactionError::Engine(crate::map_point_read_error(err, prefixed))
+}
+
+impl From<std::io::Error> for TransactionError {
+    fn from(e: std::io::Error) -> Self {
+        TransactionError::Engine(e.into())
     }
 }
 
@@ -747,7 +756,7 @@ impl Transaction {
         match self.read_own(&prefixed, committed)? {
             Some(own) => Ok(own),
             None => Ok(committed()
-                .map_err(TransactionError::Io)?
+                .map_err(|e| read_error(e, &prefixed))?
                 .map(DbSlice::into_vec)),
         }
     }
@@ -763,7 +772,7 @@ impl Transaction {
         let committed = || self.read_committed(&prefixed);
         match self.read_own(&prefixed, committed)? {
             Some(own) => Ok(own.map(DbSlice::from)),
-            None => committed().map_err(TransactionError::Io),
+            None => committed().map_err(|e| read_error(e, &prefixed)),
         }
     }
 
@@ -807,7 +816,7 @@ impl Transaction {
             prefixed,
             committed,
         )
-        .map_err(TransactionError::Io)
+        .map_err(|e| read_error(e, prefixed))
     }
 
     /// Scan a key range without materializing it, merging this
@@ -963,7 +972,7 @@ impl Transaction {
         match self.read_own(&prefixed, committed)? {
             Some(own) => Ok(own),
             None => Ok(committed()
-                .map_err(TransactionError::Io)?
+                .map_err(|e| read_error(e, &prefixed))?
                 .map(DbSlice::into_vec)),
         }
     }
@@ -1108,10 +1117,10 @@ impl Transaction {
     /// active, before the conflict check and before any commit lock is
     /// taken. A wait that admits the commit is charged to
     /// [`crate::Ticker::WriteStallMicros`]. A stall the engine cannot
-    /// relieve surfaces as [`TransactionError::Io`] carrying the same
-    /// reason a plain write reports through [`crate::Error::Busy`]. A
-    /// commit too large to log fails with [`TransactionError::Io`] of kind
-    /// [`std::io::ErrorKind::InvalidInput`] and applies nothing; split it
+    /// relieve surfaces as [`TransactionError::Engine`] carrying the same
+    /// [`crate::Error::Busy`] reason a plain write reports. A
+    /// commit too large to log fails with [`TransactionError::Engine`] of
+    /// [`crate::Error::InvalidArgument`] and applies nothing; split it
     /// into smaller transactions. A commit with no buffered writes never
     /// waits: it validates its read set and returns. A pessimistic
     /// transaction keeps its key locks for the duration of the wait.
@@ -1178,10 +1187,13 @@ impl Transaction {
         // `commit_optimistic`, after its own `ensure_writable` and
         // `validate_ops_sizes` and before the pipeline mutex, gated on
         // the commit carrying an op. See the comment there for why.
-        let outcome = self
-            .engine
-            .commit_with_conflict_check(&checks, writes, range_deletes, merges, self.durability)
-            .map_err(TransactionError::Io)?;
+        let outcome = self.engine.commit_with_conflict_check(
+            &checks,
+            writes,
+            range_deletes,
+            merges,
+            self.durability,
+        )?;
         match outcome {
             CommitOutcome::Ok => {
                 if let Some(s) = self.engine.statistics() {
@@ -1512,7 +1524,7 @@ impl TxnScanStream<'_> {
     /// error. It is the same contract as [`crate::ScanStream::status`].
     pub fn status(&self) -> Result<()> {
         if let Some(e) = &self.error {
-            return Err(std::io::Error::new(e.kind(), e.to_string()).into());
+            return Err(Error::clone_io(e).into());
         }
         self.cursor.status()
     }
@@ -2538,11 +2550,8 @@ mod tests {
         tx.put(b"k", b"v").unwrap();
         db.db().close().unwrap();
         match tx.commit() {
-            Err(TransactionError::Io(e)) => {
-                assert_eq!(e.kind(), std::io::ErrorKind::NotConnected);
-                assert_eq!(e.to_string(), "database is closed");
-            }
-            other => panic!("expected a closed-handle Io error, got {other:?}"),
+            Err(TransactionError::Engine(Error::Closed)) => {}
+            other => panic!("expected Engine(Closed), got {other:?}"),
         }
     }
 
@@ -2579,14 +2588,14 @@ mod tests {
         let tx = db.begin(&TxnOptions::new());
         tx.put(b"txn", b"v").unwrap();
         match tx.commit() {
-            Err(TransactionError::Io(e)) => {
+            Err(TransactionError::Engine(Error::Io(e))) => {
                 assert!(
                     e.to_string()
                         .contains("write-ahead log left in an unknown state"),
                     "expected the WAL failure reason, got: {e}"
                 );
             }
-            other => panic!("expected a WAL-failure Io error, got {other:?}"),
+            other => panic!("expected an Engine(Io) WAL failure, got {other:?}"),
         }
         assert_eq!(
             stats.get_ticker(Ticker::WriteStallMicros),

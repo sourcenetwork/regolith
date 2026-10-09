@@ -15,7 +15,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use regolith::{
-    Db, IsolationLevel, MergeOperator, OptimisticTransactionDb, Options, Transaction,
+    Db, Error, IsolationLevel, MergeOperator, OptimisticTransactionDb, Options, Transaction,
     TransactionDb, TransactionError, TxnOptions,
 };
 
@@ -279,10 +279,10 @@ fn a_failing_merge_is_an_error_not_a_stale_value() {
             tx.get_slice(b"k").map(|_| ()),
             tx.get_for_update(b"k").map(|_| ()),
         ] {
-            let Err(TransactionError::Io(e)) = result else {
+            let Err(TransactionError::Engine(Error::MergeFailed(key))) = result else {
                 panic!("expected the merge failure, got {result:?}");
             };
-            assert!(e.to_string().contains("counter"), "{e}");
+            assert_eq!(key, b"k");
         }
     });
 }

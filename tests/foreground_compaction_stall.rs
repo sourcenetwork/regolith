@@ -608,10 +608,10 @@ fn probe_transactional_stall(
         let tx = begin(iso);
         tx.put(&key, &val(1)).unwrap();
         match tx.commit() {
-            Err(TransactionError::Io(e)) => {
-                assert!(
-                    e.to_string().ends_with(&reason),
-                    "{label}/{iso:?}: expected the plain write's stall reason ({reason}), got: {e}"
+            Err(TransactionError::Engine(Error::Busy(got))) => {
+                assert_eq!(
+                    got, reason,
+                    "{label}/{iso:?}: expected the plain write's stall reason"
                 );
                 assert!(
                     plain.get(&key).unwrap().is_none(),
@@ -671,19 +671,13 @@ fn probe_oversized_commit_under_a_stop(
     let tx = begin();
     tx.put(b"oversized", &oversized).unwrap();
     match tx.commit() {
-        Err(TransactionError::Io(e)) => {
+        Err(TransactionError::Engine(Error::InvalidArgument(got))) => {
             assert_eq!(
-                e.kind(),
-                std::io::ErrorKind::InvalidInput,
-                "{label}: expected the size error's kind, got {e:?}"
-            );
-            assert_eq!(
-                e.to_string(),
-                message,
+                got, message,
                 "{label}: expected the plain write's size message"
             );
         }
-        other => panic!("{label}: expected a size Io error, got {other:?}"),
+        other => panic!("{label}: expected a size InvalidArgument, got {other:?}"),
     }
 }
 
@@ -753,10 +747,10 @@ fn probe_merge_only_commit_under_a_stop(
     let tx = begin();
     tx.merge(b"counter", b"x").unwrap();
     match tx.commit() {
-        Err(TransactionError::Io(e)) => {
-            assert!(
-                e.to_string().ends_with(&reason),
-                "{label}: expected the plain write's stall reason ({reason}), got: {e}"
+        Err(TransactionError::Engine(Error::Busy(got))) => {
+            assert_eq!(
+                got, reason,
+                "{label}: expected the plain write's stall reason"
             );
         }
         other => panic!("{label}: expected the plain write's stall, got {other:?}"),

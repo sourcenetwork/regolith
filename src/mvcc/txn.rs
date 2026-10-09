@@ -127,7 +127,7 @@ impl MvccTxn<'_> {
         // miss might be a failure. Checking here turns a wrong answer
         // into a reported one.
         if let Some(err) = self.storage.take_failure() {
-            return Err(TransactionError::Io(err));
+            return Err(TransactionError::from(err));
         }
         Ok(value)
     }
@@ -182,7 +182,7 @@ impl MvccTxn<'_> {
         let keys = self
             .storage
             .keys_in_range(start, end, self.inner.start_ts())
-            .map_err(TransactionError::Io)?;
+            .map_err(TransactionError::from)?;
         for key in keys {
             self.staged.insert(key, None);
         }
@@ -202,7 +202,7 @@ impl MvccTxn<'_> {
         operand: &[u8],
     ) -> TxResult<()> {
         let op = merge_operator.ok_or_else(|| {
-            TransactionError::Io(std::io::Error::other(
+            TransactionError::from(std::io::Error::other(
                 "merge called with no merge operator configured; set Options::merge_operator",
             ))
         })?;
@@ -210,7 +210,7 @@ impl MvccTxn<'_> {
         let merged = op
             .full_merge(k, existing.as_deref(), std::slice::from_ref(&operand))
             .ok_or_else(|| {
-                TransactionError::Io(std::io::Error::other("merge operator rejected the operand"))
+                TransactionError::from(std::io::Error::other("merge operator rejected the operand"))
             })?;
         self.staged.insert(k.to_vec(), Some(merged));
         Ok(())
@@ -253,7 +253,7 @@ impl MvccTxn<'_> {
         // A storage failure during the commit's own writes would
         // otherwise be invisible: the protocol saw every call succeed.
         if let Some(err) = storage.take_failure() {
-            return Err(TransactionError::Io(err));
+            return Err(TransactionError::from(err));
         }
         Ok(commit_ts)
     }
@@ -285,12 +285,12 @@ fn map_error(err: MvccError) -> TransactionError {
             latest_seq: 0,
         },
         MvccError::PrimaryLockMissing { .. } | MvccError::PrimaryLockMismatch => {
-            TransactionError::Io(std::io::Error::other(
+            TransactionError::from(std::io::Error::other(
                 "transaction lost its primary lock, which means another writer \
                  resolved it; retry the transaction",
             ))
         }
-        MvccError::StorageError(msg) => TransactionError::Io(std::io::Error::other(msg)),
+        MvccError::StorageError(msg) => TransactionError::from(std::io::Error::other(msg)),
     }
 }
 
