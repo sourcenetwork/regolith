@@ -1562,11 +1562,11 @@ impl RegolithEngine {
     /// per input key in the same order as `keys`. Duplicate keys in the
     /// input produce duplicate results.
     ///
-    /// The batch amortizes per-call overhead - a single version snapshot,
-    /// a single memtable lock acquisition per level, one logical walk of
-    /// the source hierarchy - and short-circuits once every key has been
-    /// resolved. All keys see the **same** consistent view, regardless of
-    /// concurrent writers.
+    /// The batch amortizes per-call overhead - one loaded view, one
+    /// sequence, one logical walk of the source hierarchy - and
+    /// short-circuits once every key has been resolved. All keys are read
+    /// at that one sequence from that one view, with or without a merge
+    /// operator, so a concurrent writer cannot make two keys disagree.
     pub(crate) fn multi_get_latest(&self, keys: &[&[u8]]) -> std::io::Result<Vec<Option<Vec<u8>>>> {
         self.ensure_open()?;
         let view = self.view.load();

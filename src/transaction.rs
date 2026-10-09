@@ -23,8 +23,10 @@
 //!
 //! # Isolation level
 //!
-//! Both flavors provide **snapshot isolation** and both prevent
-//! lost updates, but they anchor their reads at different points.
+//! A transaction runs at the [`IsolationLevel`] it is begun with, which
+//! defaults to snapshot isolation. At every level it reads from a snapshot,
+//! and at snapshot isolation and above both flavors prevent lost updates.
+//! The two anchor their reads at different points.
 //!
 //! An optimistic transaction reads everything as of the engine seq
 //! captured at begin. A pessimistic transaction reads a key it has
@@ -755,7 +757,7 @@ impl Transaction {
     /// or, when it made neither, onto the value read as above. A merge that
     /// the operator declines is an error, as it is for a read of the database.
     ///
-    /// Takes no lock. The read is remembered, so writing the same
+    /// Takes no key lock. The read is remembered, so writing the same
     /// key later turns it into a read-modify-write that is validated
     /// at commit and aborts with [`TransactionError::Conflict`]
     /// rather than losing the update. Below
@@ -1148,9 +1150,11 @@ impl Transaction {
     /// [`crate::Error::Busy`] reason a plain write reports. A
     /// commit too large to log fails with [`TransactionError::Engine`] of
     /// [`crate::Error::InvalidArgument`] and applies nothing; split it
-    /// into smaller transactions. A commit with no buffered writes never
-    /// waits: it validates its read set and returns. A pessimistic
-    /// transaction keeps its key locks for the duration of the wait.
+    /// into smaller transactions. A commit with no buffered writes skips the
+    /// stall wait: it validates its read set and returns. That validation
+    /// still runs under the write pipeline, so it can wait behind a commit
+    /// group that is writing the log. A pessimistic transaction keeps its key
+    /// locks for the duration of the wait.
     ///
     /// A conflict is reported to every [`crate::EventListener`] once, after
     /// the commit has released the pipeline and this transaction its key

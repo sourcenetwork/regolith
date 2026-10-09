@@ -4,15 +4,19 @@
 //! Regolith: ACID, performance oriented, embedded key-value database engine for edge systems.
 //!
 //! Regolith provides a fast, embedded key-value store with:
-//! - **Read committed, snapshot isolation, repeatable read, or serializable**
-//!   per transaction, via MVCC sequence numbers
-//! - **Lock-free transactions** whose reads and writes take `&self`, so
-//!   one transaction can be shared across threads without a lock
+//! - **Read committed, snapshot isolation, repeatable read, serializable, or
+//!   DefraLevel** per transaction, via MVCC sequence numbers
+//! - **Shareable transactions** whose reads and writes take `&self`, so one
+//!   transaction can be used from several threads. An optimistic transaction
+//!   takes no key locks; every commit passes through one write pipeline
 //! - **Crash recovery** via write-ahead logging (WAL)
 //! - **LZ4 compression** for data blocks
 //! - **Bloom filters** for fast negative lookups
-//! - **Level-based compaction** on a dedicated OS thread
-//! - **Lock-free reads** via an arena-backed skip list memtable
+//! - **Level-based compaction** on background worker threads, or inline on a
+//!   target that has none
+//! - **An arena-backed skip list memtable** that readers walk without a lock
+//!   until a range delete lands in it. A block-cache hit is lock-free; a miss
+//!   inserts under its shard's lock
 //! - **Zero-copy reads** via [`DbSlice`], which borrows the bytes the
 //!   database already holds
 //!

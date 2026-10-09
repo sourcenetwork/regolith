@@ -33,7 +33,8 @@ pub enum KeyClass {
     /// `len` bytes is in the same class.
     ///
     /// This class has an effect only for an optimistic transaction at
-    /// [`IsolationLevel::DefraLevel`]. There, the commit disregards a scan
+    /// [`IsolationLevel::DefraLevel`] with a [`KeyClassifier`] installed.
+    /// There, the commit disregards a scan
     /// stretch that stays inside one such prefix. The keys that scan
     /// returned are not validated as reads, as for any scan at
     /// [`IsolationLevel::RepeatableRead`]. A write or merge the transaction
@@ -96,8 +97,8 @@ pub enum KeyClass {
 /// column-family prefix. It must be pure, deterministic and allocation-free:
 /// commit calls it while it holds the transaction and before it takes the
 /// write pipeline, at most once for the start of each scan stretch and at
-/// most once for each distinct key the transaction reads, puts, deletes or
-/// merges.
+/// most once for each distinct key the transaction reads, puts or merges. A
+/// key it only deletes is not classified.
 pub trait KeyClassifier: Send + Sync {
     /// The class `key` belongs to.
     fn classify(&self, key: &[u8]) -> KeyClass;

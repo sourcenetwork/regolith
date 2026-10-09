@@ -48,13 +48,22 @@
 //! * A whole record that fails its checksum, carries an unknown type, or
 //!   does not parse is corruption, and is an error. A torn write cannot
 //!   produce it: every byte the record claims is present, and they are
-//!   wrong.
+//!   wrong. The one exception is a record that fails its checksum or
+//!   carries an unknown type with nothing but zero bytes from its start to
+//!   the end of the file. Bytes a crash never wrote read back as zeros, and
+//!   so can a power cut that zeroed a region already written, so that tail
+//!   is the end of the log, discarded and reported like a torn one.
 //! * An incomplete record from which the rest of the file still parses as
 //!   whole records, ending exactly at the last byte, is not a torn tail
 //!   either. A torn write leaves nothing behind it, so a remainder that
 //!   tiles that way means real records lie beyond the damage and the
 //!   length field was mangled; stopping there would discard them
 //!   silently. Replay refuses, naming the file and both offsets.
+//!
+//! Both tolerances apply to the newest log only. A log a rotation already
+//! closed was synced before the next one was created, so no crash can have
+//! left a partial or zeroed tail in it, and either shape there refuses the
+//! open.
 //!
 //! Two limits of that rule are worth stating, because both are properties
 //! of the format rather than of this implementation.
