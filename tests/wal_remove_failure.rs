@@ -8,119 +8,20 @@
 //! reported, with a warn line and `regolith.wal.remove_failed`, and the log
 //! is removed again by the next flush or the next open.
 
-use std::io;
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+mod common;
 
-use regolith::env::{
-    Capabilities, DirEntry, Env, FileLock, FileMeta, JoinHandle, ReadFile, StdEnv, WriteFile,
-    WriteMode,
-};
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
+
+use common::faulty_env::{FaultyEnv, Refuse};
+use regolith::env::Env;
 use regolith::{Db, IngestOptions, Options, SstFileWriter, Statistics, Ticker};
 use tempfile::TempDir;
 
-/// Which log removals [`LogRemoveFails`] refuses.
-#[derive(Debug, Default, Clone)]
-enum Refuse {
-    #[default]
-    Nothing,
-    /// Every write-ahead log.
-    EveryLog,
-    /// This log only.
-    Log(PathBuf),
-}
-
-/// Delegates to [`StdEnv`], but refuses the removals it is armed for, the
-/// way a file another process holds open is refused on Windows.
-#[derive(Debug, Default)]
-struct LogRemoveFails {
-    inner: StdEnv,
-    refuse: Mutex<Refuse>,
-    refused: AtomicUsize,
-}
-
-impl LogRemoveFails {
-    fn arm(&self, refuse: Refuse) {
-        *self.refuse.lock().unwrap() = refuse;
-    }
-
-    fn refuses(&self, path: &Path) -> bool {
-        match &*self.refuse.lock().unwrap() {
-            Refuse::Nothing => false,
-            Refuse::EveryLog => is_log(path),
-            Refuse::Log(log) => path == log,
-        }
-    }
-}
-
-fn is_log(path: &Path) -> bool {
-    path.extension().is_some_and(|ext| ext == "log")
-}
-
-impl Env for LogRemoveFails {
-    fn create_dir_all(&self, path: &Path) -> io::Result<()> {
-        self.inner.create_dir_all(path)
-    }
-    fn read_dir(&self, path: &Path) -> io::Result<Vec<DirEntry>> {
-        self.inner.read_dir(path)
-    }
-    fn open_read(&self, path: &Path) -> io::Result<Box<dyn ReadFile>> {
-        self.inner.open_read(path)
-    }
-    fn open_write(&self, path: &Path, mode: WriteMode) -> io::Result<Box<dyn WriteFile>> {
-        self.inner.open_write(path, mode)
-    }
-    fn metadata(&self, path: &Path) -> io::Result<FileMeta> {
-        self.inner.metadata(path)
-    }
-    fn remove_file(&self, path: &Path) -> io::Result<()> {
-        if self.refuses(path) {
-            self.refused.fetch_add(1, Ordering::SeqCst);
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "the log is held open elsewhere",
-            ));
-        }
-        self.inner.remove_file(path)
-    }
-    fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
-        self.inner.rename(from, to)
-    }
-    fn hard_link(&self, src: &Path, dst: &Path) -> io::Result<()> {
-        self.inner.hard_link(src, dst)
-    }
-    fn sync_dir(&self, path: &Path) -> io::Result<()> {
-        self.inner.sync_dir(path)
-    }
-    fn lock_file(&self, path: &Path, exclusive: bool) -> io::Result<Box<dyn FileLock>> {
-        self.inner.lock_file(path, exclusive)
-    }
-    fn capabilities(&self) -> Capabilities {
-        self.inner.capabilities()
-    }
-    fn now_micros(&self) -> Option<u64> {
-        self.inner.now_micros()
-    }
-    fn unix_secs(&self) -> Option<u64> {
-        self.inner.unix_secs()
-    }
-    fn spawn(
-        &self,
-        name: &str,
-        body: Box<dyn FnOnce() + Send + 'static>,
-    ) -> io::Result<Box<dyn JoinHandle>> {
-        self.inner.spawn(name, body)
-    }
-    fn sleep(&self, dur: Duration) {
-        self.inner.sleep(dur)
-    }
-}
-
 struct Fixture {
     dir: TempDir,
-    env: Arc<LogRemoveFails>,
+    env: Arc<FaultyEnv>,
     stats: Arc<Statistics>,
 }
 
@@ -128,7 +29,7 @@ impl Fixture {
     fn new() -> Self {
         Self {
             dir: TempDir::new().unwrap(),
-            env: Arc::new(LogRemoveFails::default()),
+            env: Arc::new(FaultyEnv::default()),
             stats: Arc::new(Statistics::new()),
         }
     }
@@ -145,13 +46,7 @@ impl Fixture {
     }
 
     fn logs(&self) -> Vec<PathBuf> {
-        let mut logs: Vec<PathBuf> = std::fs::read_dir(self.dir.path().join("wal"))
-            .unwrap()
-            .map(|e| e.unwrap().path())
-            .filter(|p| is_log(p))
-            .collect();
-        logs.sort();
-        logs
+        common::faulty_env::logs(self.dir.path())
     }
 
     fn remove_failures(&self) -> u64 {

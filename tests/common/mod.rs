@@ -101,3 +101,7 @@ pub mod wal_format;
 /// An `Env` that counts SSTable opens and reads, and can hold reads at the
 /// device: what the non-blocking read tests pin.
 pub mod device_env;
+
+/// An `Env` that refuses chosen log removals and, while armed, table
+/// creations: what the flush retirement tests pin.
+pub mod faulty_env;
