@@ -88,6 +88,16 @@
 //! found a value is validated for its presence only, and a delete of it, or a
 //! read that found nothing, is validated as for any key.
 //!
+//! # Callbacks
+//!
+//! [`Transaction::before_commit`], [`Transaction::on_commit`] and
+//! [`Transaction::on_abort`] attach code to one transaction, and
+//! [`TransactionHooks`] (through [`crate::Options::transaction_hooks`]) to
+//! every transaction of a database, at every isolation level. Exactly one of
+//! `on_commit` and `on_abort` runs for each transaction, once per callback,
+//! whichever way it ends. The rules are on [`TransactionHooks`] and on each
+//! method.
+//!
 //! # A constant write is not a claim
 //!
 //! A write of exactly the bytes the key holds at commit is not a conflict
@@ -137,16 +147,22 @@ use crate::engine::{
 use crate::{Access, Conflict, Db, DbSlice, Error, Options, Result};
 
 mod append;
+mod callbacks;
+mod claim;
 mod cursor;
 mod early;
 mod policy;
 mod projection;
+mod queue;
 mod receipt;
 mod retry;
 mod scan_range;
 mod txn_options;
 mod validated_range;
 mod write_buffer;
+pub use callbacks::{AbortReason, CommitInfo, TransactionHooks};
+use callbacks::{Callbacks, Prepare};
+pub(crate) use claim::Claim;
 pub use cursor::{Page, ScanCheck, TxnCursor, TxnScanStream};
 pub use policy::{KeyClass, KeyClassifier};
 use projection::Projection;
@@ -672,7 +688,9 @@ enum TxMode {
 ///
 /// Dropping a `Transaction` without committing is equivalent to
 /// calling [`Transaction::rollback`]: buffered writes are
-/// discarded and any held locks are released.
+/// discarded and any held locks are released. Its `on_abort`
+/// callbacks see [`AbortReason::Dropped`] rather than
+/// [`AbortReason::Rollback`].
 pub struct Transaction {
     engine: Arc<RegolithEngine>,
     /// What the commit-time validation covers. See [`IsolationLevel`].
@@ -736,6 +754,15 @@ pub struct Transaction {
     /// refuses every non-empty range), so a savepoint has nothing in it to
     /// take back.
     savepoints: Vec<Savepoint>,
+    /// What the caller registered to run when the transaction ends. Nothing,
+    /// and no allocation, until the first registration.
+    callbacks: Callbacks,
+    /// Shared with the engine so `close` can abort the transaction; made when
+    /// the first `on_abort` callback is registered, or at once under a
+    /// database with [`TransactionHooks`].
+    claim: Option<Arc<Claim>>,
+    /// How far [`Transaction::prepare`] got.
+    prepare_state: Prepare,
     /// Keys for which this transaction holds a pessimistic lock.
     /// A set rather than a list: membership is checked on every
     /// locking operation, and release order does not matter.
@@ -817,6 +844,10 @@ impl Transaction {
         policy: Option<Arc<dyn KeyClassifier>>,
         early_validation: bool,
     ) -> Self {
+        let claim = engine
+            .transaction_hooks()
+            .is_some()
+            .then(|| Claim::track(&engine));
         Self {
             engine,
             snapshot_seq,
@@ -834,6 +865,9 @@ impl Transaction {
             early_validation,
             promoted_seq: AtomicU64::new(snapshot_seq),
             savepoints: Vec::new(),
+            callbacks: Callbacks::default(),
+            claim,
+            prepare_state: Prepare::Pending,
             held_locks: TxnBuffer::new(keys_inline),
             lock_manager,
             lock_timeout,
@@ -1226,8 +1260,24 @@ impl Transaction {
     ///
     /// The [`CommitReceipt`] carries the sequence the writes became visible
     /// at. A commit with no writes returns the sequence of its snapshot.
+    ///
+    /// The commit begins with [`Transaction::prepare`]: the transaction's
+    /// `before_commit` callbacks, then the database's
+    /// [`TransactionHooks::before_commit`], whose writes are validated with the
+    /// rest. An error from either fails the commit. Once the outcome is known
+    /// and the locks and snapshot are released, the transaction's `on_commit`
+    /// callbacks run on this thread if it committed, and its `on_abort`
+    /// callbacks if it did not, and then the database's hook for the same
+    /// outcome.
     pub fn commit(mut self) -> TxResult<CommitReceipt> {
-        let result = self.commit_inner();
+        // `close` may have aborted the transaction since it began: the commit
+        // is then refused, and `close` ran the abort callbacks.
+        let claimed = self.claim.as_ref().is_none_or(|claim| claim.begin_commit());
+        let result = if claimed {
+            self.commit_inner()
+        } else {
+            Err(Error::Closed.into())
+        };
         self.resolved = true;
         // Locks and snapshot go before a listener runs, so a callback holds
         // nothing of this transaction. Drop finds them released.
@@ -1235,18 +1285,23 @@ impl Transaction {
         if let Err(TransactionError::Conflict(conflict)) = &result {
             self.engine.notify_conflict(conflict);
         }
+        self.finish(claimed, &result);
         result
     }
 
     /// Discard the transaction's buffered writes and release any
     /// pessimistic locks. Equivalent to dropping the transaction,
-    /// but surfaces as an explicit call in user code.
+    /// but surfaces as an explicit call in user code. Its `on_abort`
+    /// callbacks run with [`AbortReason::Rollback`], and its `on_commit`
+    /// callbacks are dropped.
     pub fn rollback(mut self) {
         self.resolved = true;
         self.release_resources();
+        self.finish_rolled_back();
     }
 
     fn commit_inner(&mut self) -> TxResult<CommitReceipt> {
+        self.prepare()?;
         // `&mut self` here means buffering is over, so draining the
         // concurrent buffers cannot race. Every buffer is moved out
         // rather than copied: the transaction is being consumed, so
@@ -1659,6 +1714,9 @@ impl Transaction {
             return;
         }
         self.resources_released = true;
+        if let Some(claim) = &self.claim {
+            self.engine.open_transactions().remove(claim.id);
+        }
         if let Some(lm) = self.lock_manager.as_ref()
             && let TxMode::Pessimistic { tx_id } = self.mode
         {
@@ -1705,10 +1763,12 @@ fn strip_cf_prefix(key: Vec<u8>) -> Vec<u8> {
 
 impl Drop for Transaction {
     fn drop(&mut self) {
-        if !self.resolved {
-            self.resolved = true;
-        }
+        let abandoned = !self.resolved;
+        self.resolved = true;
         self.release_resources();
+        if abandoned {
+            self.finish_dropped();
+        }
     }
 }
 

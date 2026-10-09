@@ -23,6 +23,7 @@ pub(crate) mod lookup_key;
 pub mod loom_model;
 pub(crate) mod manifest;
 pub(crate) mod memtable;
+pub(crate) mod open_transactions;
 pub(crate) mod orphan_sweep;
 pub(crate) mod pending_outputs;
 pub(crate) mod range_tombstone;
@@ -334,6 +335,7 @@ pub(crate) struct EngineOptions {
     pub(crate) prefix_extractor: Option<Arc<dyn crate::options::PrefixExtractor>>,
     pub(crate) merge_operator: Option<Arc<dyn crate::options::MergeOperator>>,
     pub(crate) listeners: Vec<Arc<dyn crate::event_listener::EventListener>>,
+    pub(crate) transaction_hooks: Option<Arc<dyn crate::TransactionHooks>>,
     pub(crate) statistics: Option<Arc<crate::statistics::Statistics>>,
     pub(crate) rate_limiter: Option<Arc<dyn crate::rate_limiter::RateLimiter>>,
     pub(crate) level0_slowdown_writes_trigger: usize,
@@ -444,6 +446,7 @@ impl Default for EngineOptions {
             prefix_extractor: None,
             merge_operator: None,
             listeners: Vec::new(),
+            transaction_hooks: None,
             statistics: None,
             rate_limiter: None,
             level0_slowdown_writes_trigger: 20,
@@ -498,6 +501,8 @@ pub(crate) struct RegolithEngine {
     visible_seq: ReadHorizon,
     close_state: AtomicU8,
     close_lock: Mutex<()>,
+    /// Transactions that `close` must abort. See `open_transactions`.
+    open_transactions: open_transactions::OpenTransactions,
     active_wal: Mutex<Option<Wal>>,
     wal_id: AtomicU64,
     sst_dir: PathBuf,
@@ -729,6 +734,7 @@ impl RegolithEngine {
             visible_seq: ReadHorizon::new(latest_seq),
             close_state: AtomicU8::new(CLOSE_STATE_OPEN),
             close_lock: Mutex::new(()),
+            open_transactions: open_transactions::OpenTransactions::new(),
             active_wal: Mutex::new(Some(wal)),
             wal_id: AtomicU64::new(wal_id),
             sst_dir,
@@ -865,6 +871,7 @@ impl RegolithEngine {
             visible_seq: ReadHorizon::new(latest_seq),
             close_state: AtomicU8::new(CLOSE_STATE_OPEN),
             close_lock: Mutex::new(()),
+            open_transactions: open_transactions::OpenTransactions::new(),
             active_wal: Mutex::new(None),
             wal_id: AtomicU64::new(wal_id),
             sst_dir,
@@ -934,6 +941,16 @@ impl RegolithEngine {
         self.merge_operator()
             .map(|_| ())
             .ok_or(crate::Error::NoMergeOperator)
+    }
+
+    /// The transactions `close` aborts.
+    pub(crate) fn open_transactions(&self) -> &open_transactions::OpenTransactions {
+        &self.open_transactions
+    }
+
+    /// The database-wide transaction callbacks, if any are installed.
+    pub(crate) fn transaction_hooks(&self) -> Option<&Arc<dyn crate::TransactionHooks>> {
+        self.options.transaction_hooks.as_ref()
     }
 
     pub(crate) fn is_closed(&self) -> bool {
@@ -3538,6 +3555,9 @@ impl RegolithEngine {
         self.close_state
             .store(CLOSE_STATE_CLOSING, Ordering::Release);
         self.stall_signal.notify_all();
+        // A transaction still open ends here, on this thread, before the final
+        // sync; one already committing is left to finish through it.
+        self.open_transactions.abort_all(self);
 
         match self.close_inner() {
             Ok(()) => {

@@ -114,18 +114,19 @@ pub use statistics::{Histogram, HistogramSnapshot, Statistics, Ticker};
 pub use stream_writer::{StreamOptions, StreamingWriter};
 pub use tailing::TailingIter;
 pub use transaction::{
-    CommitReceipt, IsolationLevel, KeyClass, KeyClassifier, OptimisticTransactionDb, Page,
-    RetryPolicy, ScanCheck, ScanDirection, TransactError, Transaction, TransactionDb,
-    TransactionError, TxResult, TxnCursor, TxnOptions, TxnScanStream,
+    AbortReason, CommitInfo, CommitReceipt, IsolationLevel, KeyClass, KeyClassifier,
+    OptimisticTransactionDb, Page, RetryPolicy, ScanCheck, ScanDirection, TransactError,
+    Transaction, TransactionDb, TransactionError, TransactionHooks, TxResult, TxnCursor,
+    TxnOptions, TxnScanStream,
 };
 
 /// The transactional API and the traits a caller implements, in one import:
 /// `use regolith::prelude::*;`.
 pub mod prelude {
     pub use crate::{
-        CommitReceipt, Conflict, Db, IsolationLevel, KeyClass, KeyClassifier, LogLayout,
-        MergeOperator, OptimisticTransactionDb, Options, RetryPolicy, TransactError, Transaction,
-        TransactionError, TxResult, TxnOptions,
+        AbortReason, CommitInfo, CommitReceipt, Conflict, Db, IsolationLevel, KeyClass,
+        KeyClassifier, LogLayout, MergeOperator, OptimisticTransactionDb, Options, RetryPolicy,
+        TransactError, Transaction, TransactionError, TransactionHooks, TxResult, TxnOptions,
     };
 }
 pub use ttl::{DbWithTtl, TtlCompactionFilter, strip_timestamp};
@@ -1595,6 +1596,14 @@ impl Db {
     /// After a successful close, result-returning operations on this
     /// handle fail with [`Error::Closed`]. Calling `close` more than
     /// once is allowed.
+    ///
+    /// A transaction still open when `close` begins is aborted: its
+    /// [`Transaction::on_abort`](crate::Transaction::on_abort) callbacks and
+    /// the database's [`TransactionHooks::on_abort`] run on this thread with
+    /// [`AbortReason::Closed`], before the data is flushed, and the
+    /// transaction's later commit fails with [`Error::Closed`]. A transaction
+    /// that had begun to commit is left to finish. Those callbacks must not
+    /// call back into the database.
     pub fn close(&self) -> Result<()> {
         self.engine.close().map_err(Error::from)
     }

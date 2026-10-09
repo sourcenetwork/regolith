@@ -985,6 +985,12 @@ impl RegolithEngine {
         crate::event_listener::dispatch(&self.options.listeners, |l| l.on_conflict(conflict));
     }
 
+    /// Tell the registered listeners a transaction callback panicked after its
+    /// transaction's outcome was decided.
+    pub(crate) fn notify_callback_panic(&self, callback: &'static str) {
+        crate::event_listener::dispatch(&self.options.listeners, |l| l.on_callback_panic(callback));
+    }
+
     /// Tell the registered listeners a write-ahead-log operation failed.
     /// `Err` is a listener's panic, caught because this runs in the ordered
     /// step.

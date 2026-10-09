@@ -483,6 +483,7 @@ pub struct Options {
     pub(crate) merge_operator: Option<Arc<dyn MergeOperator>>,
     pub(crate) atomic_flush: bool,
     pub(crate) listeners: Vec<Arc<dyn crate::EventListener>>,
+    pub(crate) transaction_hooks: Option<Arc<dyn crate::TransactionHooks>>,
     pub(crate) statistics: Option<Arc<crate::Statistics>>,
     pub(crate) rate_limiter: Option<Arc<dyn crate::RateLimiter>>,
     pub(crate) level0_slowdown_writes_trigger: usize,
@@ -529,6 +530,7 @@ impl Default for Options {
             merge_operator: None,
             atomic_flush: false,
             listeners: Vec::new(),
+            transaction_hooks: None,
             statistics: None,
             rate_limiter: None,
             level0_slowdown_writes_trigger: 20,
@@ -589,6 +591,7 @@ impl std::fmt::Debug for Options {
             )
             .field("atomic_flush", &self.atomic_flush)
             .field("listeners", &self.listeners.len())
+            .field("transaction_hooks", &self.transaction_hooks.is_some())
             .field("statistics", &self.statistics.is_some())
             .field("rate_limiter", &self.rate_limiter.is_some())
             .field(
@@ -1132,6 +1135,7 @@ impl Options {
             prefix_extractor: self.prefix_extractor.clone(),
             merge_operator: self.merge_operator.clone(),
             listeners: self.listeners.clone(),
+            transaction_hooks: self.transaction_hooks.clone(),
             statistics: self.statistics.clone(),
             rate_limiter: self.rate_limiter.clone(),
             level0_slowdown_writes_trigger: self.level0_slowdown_writes_trigger,

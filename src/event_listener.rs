@@ -232,6 +232,15 @@ pub trait EventListener: Send + Sync + 'static {
     fn on_conflict(&self, conflict: &Conflict) {
         let _ = conflict;
     }
+
+    /// Called when a transaction callback panics after its transaction's
+    /// outcome was decided: `callback` is `"on_commit"`, `"on_abort"`,
+    /// `"TransactionHooks::on_commit"` or `"TransactionHooks::on_abort"`.
+    /// The panic is caught, the outcome stands, and the transaction's other
+    /// callbacks still run. Called on the thread that completed the outcome.
+    fn on_callback_panic(&self, callback: &'static str) {
+        let _ = callback;
+    }
 }
 
 /// Dispatch a closure over every listener in a slice. Silences

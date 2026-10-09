@@ -208,6 +208,17 @@ impl Options {
         self
     }
 
+    /// Database-wide transaction callbacks, run for every transaction of a
+    /// [`crate::OptimisticTransactionDb`] or [`crate::TransactionDb`] opened
+    /// with these options, at every isolation level. See
+    /// [`crate::TransactionHooks`] for when each runs and what it may do.
+    /// Unset by default, in which case a transaction pays nothing for them.
+    #[must_use]
+    pub fn transaction_hooks(mut self, hooks: Arc<dyn crate::TransactionHooks>) -> Self {
+        self.transaction_hooks = Some(hooks);
+        self
+    }
+
     /// Optional statistics sink. When set, every hot path in
     /// the engine updates the provided [`crate::Statistics`]
     /// object with tickers and histograms. The caller polls the

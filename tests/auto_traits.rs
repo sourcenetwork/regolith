@@ -11,10 +11,10 @@
 #![cfg(not(target_arch = "wasm32"))]
 
 use regolith::{
-    CfIter, CommitReceipt, Conflict, Db, DbSlice, DbWithTtl, Entries, Error, Iter,
-    OptimisticTransactionDb, OwnedSnapshotIter, Page, RetryPolicy, ScanCheck, ScanStream, Snapshot,
-    TailingIter, TransactError, Transaction, TransactionDb, TransactionError, TxnCursor,
-    TxnScanStream,
+    AbortReason, CfIter, CommitInfo, CommitReceipt, Conflict, Db, DbSlice, DbWithTtl, Entries,
+    Error, Iter, OptimisticTransactionDb, OwnedSnapshotIter, Page, RetryPolicy, ScanCheck,
+    ScanStream, Snapshot, TailingIter, TransactError, Transaction, TransactionDb, TransactionError,
+    TxnCursor, TxnScanStream,
 };
 
 const fn assert_send<T: Send>() {}
@@ -34,6 +34,8 @@ fn handles_are_send_and_sync() {
     assert_send_sync::<TransactionError>();
     assert_send_sync::<Conflict>();
     assert_send_sync::<CommitReceipt>();
+    assert_send_sync::<CommitInfo>();
+    assert_send_sync::<AbortReason<'static>>();
     assert_send_sync::<RetryPolicy>();
     assert_send_sync::<ScanCheck>();
     assert_send_sync::<Page>();

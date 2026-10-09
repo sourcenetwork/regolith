@@ -71,7 +71,13 @@ fn run<T, E>(
     let mut attempts_left = policy.max_attempts();
     loop {
         let mut txn = begin();
-        let value = f(&mut txn, previous.as_ref()).map_err(TransactError::Closure)?;
+        let value = match f(&mut txn, previous.as_ref()) {
+            Ok(value) => value,
+            Err(error) => {
+                txn.rollback();
+                return Err(TransactError::Closure(error));
+            }
+        };
         match txn.commit() {
             Ok(receipt) => return Ok((value, receipt)),
             Err(TransactionError::Conflict(conflict)) => {

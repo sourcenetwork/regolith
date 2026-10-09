@@ -17,14 +17,21 @@
 
 mod common;
 
+use std::sync::Arc;
 use std::time::Instant;
 
-use regolith::{OptimisticTransactionDb, Options, TransactionDb, TxnOptions};
+use regolith::{
+    AbortReason, CommitInfo, OptimisticTransactionDb, Options, TransactionDb, TransactionHooks,
+    TxnOptions,
+};
 
 const BLOCKS: usize = 21;
 const OPS_PER_BLOCK: usize = 4_000;
 /// Savepoint operations per block times the buffer size, held about constant.
 const SAVEPOINT_OPS: usize = 2_000_000;
+
+type Report<'a> = &'a mut dyn FnMut(&str, (f64, f64));
+type PerOp<'a> = &'a dyn Fn(&mut dyn FnMut(u64)) -> (f64, f64);
 
 /// Median and minimum over `blocks` blocks of the mean microseconds one `op`
 /// takes.
@@ -43,6 +50,18 @@ fn micros_per_op(blocks: usize, ops_per_block: usize, op: &mut dyn FnMut(u64)) -
     (common::median(&mut samples), fastest)
 }
 
+struct CountingHook;
+
+impl TransactionHooks for CountingHook {
+    fn on_commit(&self, info: &CommitInfo) {
+        std::hint::black_box(info.receipt().seq());
+    }
+
+    fn on_abort(&self, reason: &AbortReason<'_>) {
+        std::hint::black_box(reason);
+    }
+}
+
 fn open_pair(
     tag: &str,
     options: Options,
@@ -57,6 +76,64 @@ fn open_pair(
     opt.db().put(b"seed", b"v").expect("seed");
     pes.db().put(b"seed", b"v").expect("seed");
     (opt, pes, dirs)
+}
+
+fn callback_commits(per_op: PerOp<'_>, report: Report<'_>) {
+    let (opt, _, _dirs) = open_pair("callbacks", Options::default());
+    report(
+        "commit, one on_commit, write, optimistic",
+        per_op(&mut |n| {
+            let mut txn = opt.begin(&TxnOptions::new());
+            txn.put(b"k", &n.to_le_bytes()).expect("put");
+            txn.on_commit(|receipt| {
+                std::hint::black_box(receipt.seq());
+            });
+            txn.commit().expect("commit");
+        }),
+    );
+    report(
+        "commit, one on_commit, read-only, optimistic",
+        per_op(&mut |_| {
+            let mut txn = opt.begin(&TxnOptions::new());
+            txn.get(b"seed").expect("get");
+            txn.on_commit(|receipt| {
+                std::hint::black_box(receipt.seq());
+            });
+            txn.commit().expect("commit");
+        }),
+    );
+    report(
+        "commit, one before_commit, write, optimistic",
+        per_op(&mut |n| {
+            let mut txn = opt.begin(&TxnOptions::new());
+            txn.put(b"k", &n.to_le_bytes()).expect("put");
+            txn.before_commit(|_| Ok(()));
+            txn.commit().expect("commit");
+        }),
+    );
+    report(
+        "commit, one on_abort (tracked), write, optimistic",
+        per_op(&mut |n| {
+            let mut txn = opt.begin(&TxnOptions::new());
+            txn.put(b"k", &n.to_le_bytes()).expect("put");
+            txn.on_abort(|reason| {
+                std::hint::black_box(reason);
+            });
+            txn.commit().expect("commit");
+        }),
+    );
+    let (hooked, _, _dirs) = open_pair(
+        "hooked",
+        Options::default().transaction_hooks(Arc::new(CountingHook)),
+    );
+    report(
+        "commit, database hook, write, optimistic",
+        per_op(&mut |n| {
+            let txn = hooked.begin(&TxnOptions::new());
+            txn.put(b"k", &n.to_le_bytes()).expect("put");
+            txn.commit().expect("commit");
+        }),
+    );
 }
 
 fn main() {
@@ -115,6 +192,7 @@ fn main() {
     if plain_only {
         return;
     }
+    callback_commits(&per_op, &mut report);
 
     println!("txn savepoints: median microseconds per operation, by buffered writes");
     for buffered in [16usize, 256, 4_096, 65_536] {
