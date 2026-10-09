@@ -259,6 +259,9 @@ impl SlotTable {
     /// when the record goes away; a slot a reader holds right now (one that
     /// joined, saw another owner and is about to leave) is left to CLOCK.
     pub(crate) fn release_owner(&self, owner: u64) {
+        // vertexia: one pass over every slot per dropped table, O(capacity);
+        // a per-record count of the slots it holds if a very large
+        // max_open_files ever shows this in a profile.
         for slot in self.slots.iter() {
             if slot.owner.load(Ordering::Acquire) != owner {
                 continue;
