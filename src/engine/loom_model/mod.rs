@@ -84,6 +84,7 @@ pub mod handoff;
 pub mod io_queue;
 pub mod skiplist;
 pub mod slice;
+pub mod tombstones;
 pub mod version;
 
 use std::sync::Arc as StdArc;

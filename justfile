@@ -289,7 +289,21 @@ loom-sync:
 loom-io:
     RUSTFLAGS="--cfg loom" cargo test --release --test loom_io_queue
 
-loom-all: loom loom-debug loom-sync loom-io
+# Loom models for the per-core read path (Phase 7b): the read view's
+# compare-and-swap publication, its reclamation and its freshness; the
+# block cache's pin check, racing hands and byte bound; and the range-
+# tombstone log's prefix publication, run against the real log. Each has
+# a calibration that must fail.
+loom-view:
+    RUSTFLAGS="--cfg loom" cargo test --release --test loom_read_view
+
+loom-cache:
+    RUSTFLAGS="--cfg loom" cargo test --release --test loom_block_cache
+
+loom-tombstones:
+    RUSTFLAGS="--cfg loom" cargo test --release --test loom_range_tombstones
+
+loom-all: loom loom-debug loom-sync loom-io loom-view loom-cache loom-tombstones
 
 # The read-view chaos workload at full size: 6 instances x 2 rounds x 400
 # versions. Measured at over 20 minutes wall and 4h of CPU unoptimized,
