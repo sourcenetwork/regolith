@@ -34,13 +34,16 @@ fn value(i: usize) -> Vec<u8> {
 }
 
 /// Small buffers, so a few hundred writes flush into several tables, and no
-/// background compaction, so which key each table is sealed under is the
-/// test's to decide.
+/// compaction, so which key each table is sealed under is the test's to
+/// decide: no worker, and an L0 trigger out of reach, because with no worker
+/// the write after a flush runs one compaction step once L0 reaches its
+/// trigger (E16).
 fn options(keys: &Arc<Keys>) -> Options {
     Options::default()
         .write_buffer_size(16 * 1024)
         .block_size(1024)
         .max_background_compactions(0)
+        .l0_compaction_trigger(1000)
         .key_provider(keys.clone())
 }
 
