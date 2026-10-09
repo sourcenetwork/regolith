@@ -701,3 +701,53 @@ proptest! {
         prop_assert_eq!(grouped.snapshot_seq(), serial.snapshot_seq());
     }
 }
+
+fn wal_offset(engine: &RegolithEngine) -> u64 {
+    engine
+        .active_wal
+        .lock()
+        .as_ref()
+        .map(|wal| wal.offset())
+        .unwrap()
+}
+
+/// Encryption meets group commit (#266 x #265): the members of a group land
+/// as one record, and on an encrypted database that record is one sealed
+/// frame for the whole group, so a group pays one seal however many members
+/// it carries. Unsealed, the same group is one plain record.
+#[test]
+fn a_group_lands_as_one_record_sealed_or_not() {
+    let writes: [Vec<(&'static [u8], Write)>; 3] = [
+        vec![(b"a", Write::Put(1))],
+        vec![(b"b", Write::Put(2)), (b"c", Write::Delete)],
+        vec![(b"d", Write::Merge(3))],
+    ];
+    let stage: usize = writes.iter().map(|w| ops_record_len(&plain_ops(w))).sum();
+    for sealed in [false, true] {
+        let dir = TempDir::new().unwrap();
+        let engine = RegolithEngine::open(
+            dir.path(),
+            EngineOptions {
+                merge_operator: Some(Arc::new(Concat)),
+                keyring: sealed.then(|| crate::engine::seal::test_keys::keyring(&[1])),
+                ..EngineOptions::default()
+            },
+        )
+        .unwrap();
+        let before = wal_offset(&engine);
+        let members: Vec<Member> = writes.iter().cloned().map(Member::Plain).collect();
+        let settled = commit_as_group(&engine, &members);
+        assert!(settled.iter().all(Result::is_ok), "{settled:?}");
+        let frame = if sealed {
+            crate::engine::seal::OVERHEAD
+        } else {
+            0
+        };
+        assert_eq!(
+            wal_offset(&engine) - before,
+            (super::super::wal_frame::HEADER_LEN + frame + stage) as u64,
+            "sealed {sealed}: the group is one record of one frame"
+        );
+        assert_eq!(read_now(&engine, b"b").as_deref(), Some(&b"2"[..]));
+    }
+}

@@ -7,6 +7,7 @@
 //!   version. A flush that unlinked its log before its table's batch was
 //!   durable loses acknowledged writes here. (A flush that records no
 //!   `min_wal_id` shows only once an unlink fails: `phase6_integration.rs`.)
+//!   Every cut runs plain and encrypted at rest (#266).
 //! - **A sealed manifest's torn tail** (#266 x #268). On an encrypted
 //!   database a crash can tear an unsynced reservation batch and leave the
 //!   reservation after it whole. The open opens each batch before it judges
@@ -227,10 +228,10 @@ fn manifest_sync(nth: u64, before: bool) -> Trigger {
 
 /// Cut `path`'s run at `trigger`, tear what was never synced with `tear`,
 /// reopen and check every key.
-fn cut(path: FlushPath, trigger: Trigger, tear: TearMode) {
+fn cut(path: FlushPath, trigger: Trigger, tear: TearMode, encrypted: bool) {
     let tmp = TempDir::new().unwrap();
     let db = tmp.path().join("db");
-    let out = CrashRun::new(spec(path, &db))
+    let out = CrashRun::new(spec(path, &db).encrypted(encrypted))
         .trigger(trigger.clone())
         .timeout(CHILD_TIMEOUT)
         .run();
@@ -242,8 +243,13 @@ fn cut(path: FlushPath, trigger: Trigger, tear: TearMode) {
         CutPoint::End,
         &PowerLossOptions::default().tear(tear),
     );
-    let what = format!("{path:?}, {trigger:?}, {tear:?}");
-    let reopened = Db::open(&db, Options::default()).unwrap_or_else(|e| {
+    let what = format!("{path:?}, {trigger:?}, {tear:?}, encrypted {encrypted}");
+    let options = if encrypted {
+        Options::default().key_provider(Keys::new(&[1]))
+    } else {
+        Options::default()
+    };
+    let reopened = Db::open(&db, options).unwrap_or_else(|e| {
         panic!(
             "{what}: the database refuses to open: {e}\n{}",
             report.summary()
@@ -273,7 +279,9 @@ fn cut_everywhere(path: FlushPath) {
     ];
     for trigger in triggers {
         for tear in TEARS {
-            cut(path, trigger.clone(), tear);
+            for encrypted in [false, true] {
+                cut(path, trigger.clone(), tear, encrypted);
+            }
         }
     }
 }
