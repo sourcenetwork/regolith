@@ -21,6 +21,8 @@ mod suspects;
 mod tail;
 pub(crate) use tail::DroppedTail;
 
+mod legacy_overlap;
+
 /// Maximum number of levels in the LSM tree.
 pub(crate) const MAX_LEVELS: usize = 7;
 
@@ -479,6 +481,7 @@ pub(crate) struct VersionSet {
     /// Every key a batch of the manifest on disk is sealed under, so a
     /// rotation can tell whether the file still names a retired key.
     sealed_under: Vec<KeyId>,
+    tables_demoted_at_open: u64,
 }
 
 struct ManifestReplay {
@@ -491,6 +494,7 @@ struct ManifestReplay {
     salt: Option<[u8; 16]>,
     /// Every key a replayed batch was sealed under.
     key_ids: Vec<KeyId>,
+    repair: legacy_overlap::Repair,
 }
 
 impl VersionSet {
@@ -516,6 +520,7 @@ impl VersionSet {
     ) -> io::Result<Self> {
         let manifest_path = db_dir.join("MANIFEST");
 
+        let mut repair = legacy_overlap::Repair::default();
         let manifest_bytes;
         let mut dropped_tail = None;
         let salt;
@@ -540,6 +545,7 @@ impl VersionSet {
             if replayed_cleanly && env.capabilities().file_lock {
                 super::orphan_sweep::sweep_unreferenced_tables(&**env, sst_dir, &replay.version)?;
             }
+            repair = replay.repair;
 
             // Trim through its own handle, and close it before the
             // append handle is opened. A torn or corrupt tail is the
@@ -590,7 +596,22 @@ impl VersionSet {
             keyring,
             sealing,
             sealed_under,
+            tables_demoted_at_open: repair.tables,
         };
+        // Recovery is not published until the repair batch is synced.
+        // An error drops this writer; the next open replays its tail.
+        let (repair_bytes, repair_key) = repair.persist(
+            set.manifest_writer.as_mut().unwrap(),
+            set.manifest_bytes,
+            set.sealing.as_ref(),
+        )?;
+        set.manifest_bytes += repair_bytes;
+        if let Some(id) = repair_key
+            && !set.sealed_under.contains(&id)
+        {
+            set.sealed_under.push(id);
+        }
+        repair.report(&set.manifest_path, false);
         // The one-time conversion of a database written without encryption
         // and opened with a key provider: its manifest names every table
         // and key range in plaintext, so it is rewritten sealed now rather
@@ -688,6 +709,7 @@ impl VersionSet {
             keyring.as_deref(),
         )?;
         let sealing = Self::sealing(keyring.as_ref(), replay.salt)?;
+        replay.repair.report(&manifest_path, true);
 
         Ok(Self {
             current: Arc::new(replay.version),
@@ -699,6 +721,7 @@ impl VersionSet {
             keyring,
             sealing,
             sealed_under: replay.key_ids,
+            tables_demoted_at_open: replay.repair.tables,
         })
     }
 
@@ -716,6 +739,11 @@ impl VersionSet {
     /// Get the current version.
     pub(crate) fn current(&self) -> Arc<Version> {
         Arc::clone(&self.current)
+    }
+
+    /// Tables demoted by this open; zero after a persisted repair reopens.
+    pub(crate) fn tables_demoted_at_open(&self) -> u64 {
+        self.tables_demoted_at_open
     }
 
     /// Path of the manifest file on disk.
@@ -1140,6 +1168,8 @@ impl VersionSet {
             valid_len = offset;
         }
 
+        let repair = legacy_overlap::Repair::prepare(&mut surviving)?;
+
         // Below L0 a level is one sorted run. The log lists a level's tables in
         // the order they arrived, which is how `Version::add_file` placed
         // them, so a stable sort puts each back where it was.
@@ -1186,12 +1216,17 @@ impl VersionSet {
             stamp_len: stamp,
             salt,
             key_ids,
+            repair,
         })
     }
 }
 
 #[cfg(test)]
 mod atomic_tests;
+#[cfg(test)]
+mod legacy_overlap_fault_tests;
+#[cfg(test)]
+mod legacy_overlap_tests;
 #[cfg(test)]
 mod level_order_tests;
 

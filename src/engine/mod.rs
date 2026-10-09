@@ -2755,6 +2755,11 @@ impl RegolithEngine {
             .unwrap_or(0)
     }
 
+    pub(crate) fn tables_demoted_at_open(&self) -> u64 {
+        self.versions
+            .run(|versions| versions.tables_demoted_at_open())
+    }
+
     /// Total size in bytes across every level of the current
     /// version - sum of every `LiveSst::meta.file_size`.
     pub(crate) fn total_sst_size(&self) -> u64 {
