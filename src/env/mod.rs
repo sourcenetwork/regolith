@@ -37,6 +37,7 @@
 mod buffered;
 mod db_lock;
 mod mem_env;
+pub(crate) mod mem_file;
 pub(crate) mod open_file_limit;
 mod types;
 // The browser's Origin Private File System. Only compiled for

@@ -64,12 +64,12 @@ mod pool;
 mod sah;
 mod store;
 
-use std::collections::BTreeSet;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use kovan_map::HashMap;
 use wasm_bindgen::JsValue;
 
 use crate::env::{
@@ -476,13 +476,14 @@ impl Env for OpfsEnv {
     }
 }
 
-/// A file's ancestors, for the virtual directory set. Stops at the first
-/// ancestor already present: the chain is always inserted whole, so a
-/// present directory implies its parents are too.
-pub(super) fn register_ancestors(dirs: &mut BTreeSet<PathBuf>, path: &Path) {
+/// A file's ancestors, for the virtual directory set (a lock-free map used
+/// as a set). Stops at the first ancestor already present: the chain is
+/// always inserted from the leaf up, so a present directory implies its
+/// parents are, or are being, inserted too.
+pub(super) fn register_ancestors(dirs: &HashMap<PathBuf, ()>, path: &Path) {
     let mut cursor = path.parent();
     while let Some(dir) = cursor {
-        if dir.as_os_str().is_empty() || !dirs.insert(dir.to_path_buf()) {
+        if dir.as_os_str().is_empty() || dirs.insert_if_absent(dir.to_path_buf(), ()).is_some() {
             break;
         }
         cursor = dir.parent();
@@ -490,17 +491,17 @@ pub(super) fn register_ancestors(dirs: &mut BTreeSet<PathBuf>, path: &Path) {
 }
 
 /// Entries directly under `dir`, sorted, files and directories together.
-pub(super) fn children<'a>(
+pub(super) fn children(
     dir: &Path,
-    files: impl Iterator<Item = &'a PathBuf>,
-    dirs: impl Iterator<Item = &'a PathBuf>,
+    files: impl Iterator<Item = PathBuf>,
+    dirs: impl Iterator<Item = PathBuf>,
 ) -> Vec<(PathBuf, bool)> {
     let mut out: Vec<(PathBuf, bool)> = files
         .filter(|path| path.parent() == Some(dir))
-        .map(|path| (path.clone(), false))
+        .map(|path| (path, false))
         .chain(
             dirs.filter(|path| path.parent() == Some(dir))
-                .map(|path| (path.clone(), true)),
+                .map(|path| (path, true)),
         )
         .collect();
     out.sort();
@@ -527,11 +528,11 @@ mod tests {
 
     #[wasm_bindgen_test]
     fn ancestors_register_the_whole_chain() {
-        let mut dirs = BTreeSet::new();
-        register_ancestors(&mut dirs, Path::new("db/sst/000001.sst"));
-        assert!(dirs.contains(Path::new("db")));
-        assert!(dirs.contains(Path::new("db/sst")));
-        assert!(!dirs.contains(Path::new("db/sst/000001.sst")));
+        let dirs = HashMap::with_capacity(64);
+        register_ancestors(&dirs, Path::new("db/sst/000001.sst"));
+        assert!(dirs.contains_key(Path::new("db")));
+        assert!(dirs.contains_key(Path::new("db/sst")));
+        assert!(!dirs.contains_key(Path::new("db/sst/000001.sst")));
     }
 
     #[wasm_bindgen_test]
@@ -541,7 +542,7 @@ mod tests {
             PathBuf::from("db/sst/000001.sst"),
         ];
         let dirs = [PathBuf::from("db"), PathBuf::from("db/sst")];
-        let listed = children(Path::new("db"), files.iter(), dirs.iter());
+        let listed = children(Path::new("db"), files.into_iter(), dirs.into_iter());
         assert_eq!(
             listed,
             vec![

@@ -13,31 +13,46 @@
 //!
 //! # Shape
 //!
-//! A flat `BTreeMap` from path to file, plus a set of directories.
-//! Files are `Arc<Mutex<Vec<u8>>>` so a reader and a writer can hold
-//! the same file without holding the directory lock, which is what
-//! keeps a compaction reading one file while a flush writes another
-//! from deadlocking.
+//! Two lock-free maps (kovan): path to file, and the set of directories.
+//! A file is a `MemFile` behind an `Arc`, so a reader and a writer hold
+//! the same file without touching either map, and every read is a copy
+//! out of the file with no lock at all. The clocks are atomics. No call
+//! here takes a lock; the directory registry (`open_dirs`) is the only
+//! exclusion, and it is taken only by `lock_file`.
 
-use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::sync::internal::Mutex;
+use kovan_map::HashMap;
+
+use crate::portability::{AtomicU64, Ordering};
 
 use super::db_lock::DirectoryRegistry;
+use super::mem_file::{Free, MemFile};
 use super::{
     Capabilities, DirEntry, Env, FileLock, FileMeta, JoinHandle, ReadFile, WriteFile, WriteMode,
 };
 
-type SharedFile = Arc<Mutex<Vec<u8>>>;
+/// Buckets each map starts with; they grow on demand.
+const BUCKETS: usize = 64;
 
-#[derive(Default)]
+/// A clock that is not there: `None` from `now_micros` or `unix_secs`.
+const ABSENT: u64 = u64::MAX;
+
 struct MemFs {
-    files: BTreeMap<PathBuf, SharedFile>,
-    dirs: BTreeSet<PathBuf>,
+    files: HashMap<PathBuf, Arc<MemFile>>,
+    dirs: HashMap<PathBuf, ()>,
+}
+
+impl Default for MemFs {
+    fn default() -> Self {
+        Self {
+            files: HashMap::with_capacity(BUCKETS),
+            dirs: HashMap::with_capacity(BUCKETS),
+        }
+    }
 }
 
 /// An [`Env`] whose filesystem is a map in memory.
@@ -45,10 +60,14 @@ struct MemFs {
 /// Clones share one filesystem, so a `MemEnv` handed to
 /// [`crate::Options::env`] can be kept by the caller and inspected
 /// after the database closes.
+///
+/// Every call is lock-free. A read copies out of the file while appends,
+/// overwrites and renames go on beside it, and sees every write that
+/// returned before it began.
 #[derive(Clone, Default)]
 pub struct MemEnv {
-    fs: Arc<Mutex<MemFs>>,
-    clock: Arc<Mutex<MemClock>>,
+    fs: Arc<MemFs>,
+    clock: Arc<MemClock>,
     /// Exclusion between database handles on this filesystem. Scoped
     /// to the `MemEnv` rather than the process because two `MemEnv`s
     /// are two unrelated filesystems that may legitimately hold the
@@ -56,27 +75,38 @@ pub struct MemEnv {
     open_dirs: Arc<DirectoryRegistry>,
 }
 
-#[derive(Debug, Clone, Copy)]
+/// The two clocks, each [`ABSENT`] when removed. Present values saturate
+/// one below it.
 struct MemClock {
-    micros: Option<u64>,
-    unix_secs: Option<u64>,
+    micros: AtomicU64,
+    unix_secs: AtomicU64,
 }
 
 impl Default for MemClock {
     fn default() -> Self {
         Self {
-            micros: Some(0),
-            unix_secs: Some(0),
+            micros: AtomicU64::new(0),
+            unix_secs: AtomicU64::new(0),
         }
     }
 }
 
+fn clock_value(raw: u64) -> Option<u64> {
+    (raw != ABSENT).then_some(raw)
+}
+
+/// Advance a present clock by `by`, saturating below [`ABSENT`].
+fn advance(clock: &AtomicU64, by: u64) {
+    let _ = clock.fetch_update(Ordering::AcqRel, Ordering::Acquire, |now| {
+        (now != ABSENT).then(|| now.saturating_add(by).min(ABSENT - 1))
+    });
+}
+
 impl std::fmt::Debug for MemEnv {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let fs = self.fs.lock();
         f.debug_struct("MemEnv")
-            .field("files", &fs.files.len())
-            .field("dirs", &fs.dirs.len())
+            .field("files", &self.fs.files.len())
+            .field("dirs", &self.fs.dirs.len())
             .finish()
     }
 }
@@ -94,45 +124,35 @@ impl MemEnv {
     /// that depends on elapsed time is deterministic instead of
     /// racing the machine it runs on.
     pub fn advance_micros(&self, micros: u64) {
-        let mut clock = self.clock.lock();
-        if let Some(now) = clock.micros {
-            clock.micros = Some(now.saturating_add(micros));
-        }
-        if let Some(secs) = clock.unix_secs {
-            clock.unix_secs = Some(secs.saturating_add(micros / 1_000_000));
-        }
+        advance(&self.clock.micros, micros);
+        advance(&self.clock.unix_secs, micros / 1_000_000);
     }
 
     /// Remove the monotonic clock, the wall clock, or both, to
     /// exercise what regolith does on a platform that has none.
     pub fn set_clocks(&self, micros: Option<u64>, unix_secs: Option<u64>) {
-        let mut clock = self.clock.lock();
-        clock.micros = micros;
-        clock.unix_secs = unix_secs;
+        let store = |clock: &AtomicU64, value: Option<u64>| {
+            clock.store(
+                value.map_or(ABSENT, |v| v.min(ABSENT - 1)),
+                Ordering::Release,
+            );
+        };
+        store(&self.clock.micros, micros);
+        store(&self.clock.unix_secs, unix_secs);
     }
 
     /// Total bytes currently held across every file.
     pub fn total_bytes(&self) -> u64 {
-        self.fs
-            .lock()
-            .files
-            .values()
-            .map(|f| f.lock().len() as u64)
-            .sum()
+        self.fs.files.values().map(|f| f.len()).sum()
     }
 
     /// Number of files currently present.
     pub fn file_count(&self) -> usize {
-        self.fs.lock().files.len()
+        self.fs.files.len()
     }
 
-    fn lookup(&self, path: &Path) -> io::Result<SharedFile> {
-        self.fs
-            .lock()
-            .files
-            .get(path)
-            .cloned()
-            .ok_or_else(|| not_found(path))
+    fn lookup(&self, path: &Path) -> io::Result<Arc<MemFile>> {
+        self.fs.files.get(path).ok_or_else(|| not_found(path))
     }
 }
 
@@ -143,46 +163,40 @@ fn not_found(path: &Path) -> io::Error {
     )
 }
 
+/// The entries of `paths` directly under `dir`, in path order.
+fn children(dir: &Path, paths: Vec<PathBuf>, is_dir: bool) -> impl Iterator<Item = DirEntry> {
+    let mut paths: Vec<PathBuf> = paths
+        .into_iter()
+        .filter(|p| p.parent() == Some(dir))
+        .collect();
+    paths.sort();
+    paths.into_iter().map(move |path| DirEntry { path, is_dir })
+}
+
 impl Env for MemEnv {
     fn create_dir_all(&self, path: &Path) -> io::Result<()> {
-        let mut fs = self.fs.lock();
         let mut cursor = Some(path);
         while let Some(dir) = cursor {
-            if fs.files.contains_key(dir) {
+            if self.fs.files.contains_key(dir) {
                 return Err(io::Error::new(
                     io::ErrorKind::AlreadyExists,
                     format!("{} exists and is not a directory", dir.display()),
                 ));
             }
-            fs.dirs.insert(dir.to_path_buf());
+            self.fs.dirs.insert(dir.to_path_buf(), ());
             cursor = dir.parent().filter(|p| !p.as_os_str().is_empty());
         }
         Ok(())
     }
 
     fn read_dir(&self, path: &Path) -> io::Result<Vec<DirEntry>> {
-        let fs = self.fs.lock();
-        if !fs.dirs.contains(path) {
+        if !self.fs.dirs.contains_key(path) {
             return Err(not_found(path));
         }
-        let mut out = Vec::new();
-        for file in fs.files.keys() {
-            if file.parent() == Some(path) {
-                out.push(DirEntry {
-                    path: file.clone(),
-                    is_dir: false,
-                });
-            }
-        }
-        for dir in &fs.dirs {
-            if dir.parent() == Some(path) {
-                out.push(DirEntry {
-                    path: dir.clone(),
-                    is_dir: true,
-                });
-            }
-        }
-        Ok(out)
+        // Files first, then directories, each in path order.
+        Ok(children(path, self.fs.files.keys().collect(), false)
+            .chain(children(path, self.fs.dirs.keys().collect(), true))
+            .collect())
     }
 
     fn open_read(&self, path: &Path) -> io::Result<Box<dyn ReadFile>> {
@@ -192,30 +206,33 @@ impl Env for MemEnv {
     }
 
     fn open_write(&self, path: &Path, mode: WriteMode) -> io::Result<Box<dyn WriteFile>> {
-        let mut fs = self.fs.lock();
         if let Some(parent) = path.parent()
             && !parent.as_os_str().is_empty()
-            && !fs.dirs.contains(parent)
+            && !self.fs.dirs.contains_key(parent)
         {
             return Err(not_found(parent));
         }
-        let data = fs.files.entry(path.to_path_buf()).or_default().clone();
-        drop(fs);
+        let data = match self.fs.files.get(path) {
+            Some(data) => data,
+            None => self
+                .fs
+                .files
+                .get_or_insert(path.to_path_buf(), Arc::new(MemFile::new())),
+        };
         if mode == WriteMode::Truncate {
-            data.lock().clear();
+            data.set_len(0, &Free)?;
         }
         Ok(Box::new(MemWriteFile { data }))
     }
 
     fn metadata(&self, path: &Path) -> io::Result<FileMeta> {
-        let fs = self.fs.lock();
-        if let Some(file) = fs.files.get(path) {
+        if let Some(file) = self.fs.files.get(path) {
             return Ok(FileMeta {
-                len: file.lock().len() as u64,
+                len: file.len(),
                 is_dir: false,
             });
         }
-        if fs.dirs.contains(path) {
+        if self.fs.dirs.contains_key(path) {
             return Ok(FileMeta {
                 len: 0,
                 is_dir: true,
@@ -226,7 +243,6 @@ impl Env for MemEnv {
 
     fn remove_file(&self, path: &Path) -> io::Result<()> {
         self.fs
-            .lock()
             .files
             .remove(path)
             .map(|_| ())
@@ -234,9 +250,14 @@ impl Env for MemEnv {
     }
 
     fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
-        let mut fs = self.fs.lock();
-        let file = fs.files.remove(from).ok_or_else(|| not_found(from))?;
-        fs.files.insert(to.to_path_buf(), file);
+        if from == to {
+            return self.lookup(from).map(|_| ());
+        }
+        // The file is taken from `from` first, so two renames of one file
+        // cannot both move it, then put at `to` in one map write, which
+        // replaces whatever was there: `to` always names a whole file.
+        let file = self.fs.files.remove(from).ok_or_else(|| not_found(from))?;
+        self.fs.files.insert(to.to_path_buf(), file);
         Ok(())
     }
 
@@ -263,11 +284,11 @@ impl Env for MemEnv {
     }
 
     fn now_micros(&self) -> Option<u64> {
-        self.clock.lock().micros
+        clock_value(self.clock.micros.load(Ordering::Acquire))
     }
 
     fn unix_secs(&self) -> Option<u64> {
-        self.clock.lock().unix_secs
+        clock_value(self.clock.unix_secs.load(Ordering::Acquire))
     }
 
     fn spawn(
@@ -285,38 +306,21 @@ impl Env for MemEnv {
 }
 
 struct MemReadFile {
-    data: SharedFile,
+    data: Arc<MemFile>,
 }
 
 impl ReadFile for MemReadFile {
     fn read_exact_at(&self, offset: u64, buf: &mut [u8]) -> io::Result<()> {
-        let data = self.data.lock();
-        let start = usize::try_from(offset).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "offset is too large to address",
-            )
-        })?;
-        let end = start
-            .checked_add(buf.len())
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "read range overflows"))?;
-        if end > data.len() {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "failed to fill whole buffer",
-            ));
-        }
-        buf.copy_from_slice(&data[start..end]);
-        Ok(())
+        self.data.read_exact_at(offset, buf)
     }
 
     fn len(&self) -> io::Result<u64> {
-        Ok(self.data.lock().len() as u64)
+        Ok(self.data.len())
     }
 }
 
 struct MemWriteFile {
-    data: SharedFile,
+    data: Arc<MemFile>,
 }
 
 impl WriteFile for MemWriteFile {
@@ -324,18 +328,9 @@ impl WriteFile for MemWriteFile {
         self.write_all_vectored(&[buf])
     }
 
-    /// One lock and one reservation for every slice.
+    /// One append for every slice: they land together, at the end.
     fn write_all_vectored(&mut self, slices: &[&[u8]]) -> io::Result<()> {
-        let len = slices.iter().map(|s| s.len()).sum::<usize>();
-        let mut data = self.data.lock();
-        data.try_reserve(len).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::OutOfMemory,
-                format!("cannot grow a MemEnv file by {len} bytes"),
-            )
-        })?;
-        slices.iter().for_each(|s| data.extend_from_slice(s));
-        Ok(())
+        self.data.append(slices, &Free).map(|_| ())
     }
 
     fn flush(&mut self) -> io::Result<()> {
@@ -347,25 +342,11 @@ impl WriteFile for MemWriteFile {
     }
 
     fn set_len(&mut self, len: u64) -> io::Result<()> {
-        let len = usize::try_from(len).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "length is too large to address",
-            )
-        })?;
-        let mut data = self.data.lock();
-        let grow_by = len.saturating_sub(data.len());
-        if grow_by > 0 {
-            data.try_reserve(grow_by).map_err(|_| {
-                io::Error::new(io::ErrorKind::OutOfMemory, "cannot extend a MemEnv file")
-            })?;
-        }
-        data.resize(len, 0);
-        Ok(())
+        self.data.set_len(len, &Free).map(|_| ())
     }
 
     fn len(&self) -> io::Result<u64> {
-        Ok(self.data.lock().len() as u64)
+        Ok(self.data.len())
     }
 }
 
@@ -544,5 +525,162 @@ mod tests {
             two.lock_file(Path::new("/db"), true).is_ok(),
             "two MemEnvs are two filesystems and must not share exclusion"
         );
+    }
+
+    #[test]
+    fn a_removed_clock_stays_removed_and_a_present_one_saturates() {
+        let env = MemEnv::new();
+        env.set_clocks(Some(u64::MAX - 5), None);
+        env.advance_micros(100);
+        assert_eq!(env.now_micros(), Some(u64::MAX - 1));
+        assert_eq!(env.unix_secs(), None);
+    }
+
+    /// Writers append to their own files, rename them into place and remove
+    /// the old ones, while readers read every file that exists. Each read
+    /// is a prefix of what its writer wrote, and the final filesystem holds
+    /// exactly the renamed files, whole.
+    #[test]
+    fn concurrent_file_operations_never_tear_a_read() {
+        const WRITERS: usize = 6;
+        const ROUNDS: usize = 200;
+        let env = env();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let readers: Vec<_> = (0..3)
+            .map(|_| {
+                let (env, stop) = (env.clone(), std::sync::Arc::clone(&stop));
+                std::thread::spawn(move || {
+                    while !stop.load(std::sync::atomic::Ordering::Acquire) {
+                        for entry in env.read_dir(Path::new("/db")).unwrap() {
+                            let Ok(file) = env.open_read(&entry.path) else {
+                                continue;
+                            };
+                            let mut bytes = vec![0u8; file.len().unwrap() as usize];
+                            file.read_exact_at(0, &mut bytes).unwrap();
+                            // Every byte a writer writes is its own number.
+                            assert!(bytes.windows(2).all(|w| w[0] == w[1]), "{bytes:?}");
+                        }
+                    }
+                })
+            })
+            .collect();
+        let writers: Vec<_> = (0..WRITERS)
+            .map(|w| {
+                let env = env.clone();
+                std::thread::spawn(move || {
+                    for round in 0..ROUNDS {
+                        let tmp = PathBuf::from(format!("/db/w{w}.tmp"));
+                        let live = PathBuf::from(format!("/db/w{w}"));
+                        let mut file = env.open_write(&tmp, WriteMode::Truncate).unwrap();
+                        for _ in 0..=round % 7 {
+                            file.write_all(&[w as u8; 16]).unwrap();
+                        }
+                        drop(file);
+                        env.rename(&tmp, &live).unwrap();
+                        if round % 5 == 0 {
+                            env.remove_file(&live).unwrap();
+                        }
+                    }
+                })
+            })
+            .collect();
+        for writer in writers {
+            writer.join().unwrap();
+        }
+        stop.store(true, std::sync::atomic::Ordering::Release);
+        for reader in readers {
+            reader.join().unwrap();
+        }
+        let names: Vec<String> = env
+            .read_dir(Path::new("/db"))
+            .unwrap()
+            .iter()
+            .map(DirEntry::file_name)
+            .collect();
+        let want: Vec<String> = (0..WRITERS).map(|w| format!("w{w}")).collect();
+        assert_eq!(names, want);
+        for w in 0..WRITERS {
+            let bytes = env.read(Path::new(&format!("/db/w{w}"))).unwrap();
+            assert_eq!(bytes, vec![w as u8; 16 * ((ROUNDS - 1) % 7 + 1)]);
+        }
+    }
+
+    mod model {
+        use super::*;
+        use proptest::prelude::*;
+        use std::collections::BTreeMap;
+
+        #[derive(Clone, Debug)]
+        enum Op {
+            Write(u8, Vec<u8>, bool),
+            Remove(u8),
+            Rename(u8, u8),
+            Read(u8),
+        }
+
+        fn op() -> impl Strategy<Value = Op> {
+            prop_oneof![
+                (
+                    0u8..4,
+                    prop::collection::vec(any::<u8>(), 0..40),
+                    any::<bool>()
+                )
+                    .prop_map(|(f, b, t)| Op::Write(f, b, t)),
+                (0u8..4).prop_map(Op::Remove),
+                (0u8..4, 0u8..4).prop_map(|(a, b)| Op::Rename(a, b)),
+                (0u8..4).prop_map(Op::Read),
+            ]
+        }
+
+        proptest! {
+            /// The filesystem's files and their contents follow a
+            /// `BTreeMap` through writes, removes, renames and reads.
+            #[test]
+            fn the_env_follows_a_map(ops in prop::collection::vec(op(), 1..60)) {
+                let env = env();
+                let path = |f: u8| PathBuf::from(format!("/db/f{f}"));
+                let mut model: BTreeMap<u8, Vec<u8>> = BTreeMap::new();
+                for op in ops {
+                    match op {
+                        Op::Write(f, bytes, truncate) => {
+                            let mode = if truncate { WriteMode::Truncate } else { WriteMode::Append };
+                            env.open_write(&path(f), mode).unwrap().write_all(&bytes).unwrap();
+                            let file = model.entry(f).or_default();
+                            if truncate {
+                                file.clear();
+                            }
+                            file.extend_from_slice(&bytes);
+                        }
+                        Op::Remove(f) => {
+                            prop_assert_eq!(env.remove_file(&path(f)).is_ok(), model.remove(&f).is_some());
+                        }
+                        Op::Rename(a, b) => {
+                            let got = env.rename(&path(a), &path(b));
+                            match model.remove(&a) {
+                                Some(bytes) => {
+                                    prop_assert!(got.is_ok());
+                                    model.insert(b, bytes);
+                                }
+                                None => prop_assert!(got.is_err()),
+                            }
+                        }
+                        Op::Read(f) => match (env.read(&path(f)), model.get(&f)) {
+                            (Ok(bytes), Some(want)) => prop_assert_eq!(&bytes, want),
+                            (Err(e), None) => prop_assert_eq!(e.kind(), io::ErrorKind::NotFound),
+                            (got, want) => prop_assert!(false, "{got:?} vs {want:?}"),
+                        },
+                    }
+                    let names: Vec<String> = env
+                        .read_dir(Path::new("/db"))
+                        .unwrap()
+                        .iter()
+                        .map(DirEntry::file_name)
+                        .collect();
+                    let want: Vec<String> = model.keys().map(|f| format!("f{f}")).collect();
+                    prop_assert_eq!(names, want);
+                    prop_assert_eq!(env.total_bytes(), model.values().map(|b| b.len() as u64).sum::<u64>());
+                }
+            }
+        }
     }
 }
