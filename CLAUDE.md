@@ -81,6 +81,7 @@ src/
 ├── stream_writer.rs    # StreamingWriter: bounded-memory write stream
 ├── sync.rs             # Std-backed Mutex, RwLock, Condvar and Gate, swapped for loom's under --cfg loom
 ├── tailing.rs          # Tailing iterator API
+├── testing.rs          # `testing` feature: property checks a caller runs against its own trait implementations
 ├── transaction.rs      # Optimistic and pessimistic transactions, isolation levels
 ├── transaction/        # policy.rs (KeyClassifier, key classes), txn_options.rs (TxnOptions),
 │                       # scan_range.rs (scan stretches), write_buffer.rs (buffered puts, deletes, merges)

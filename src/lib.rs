@@ -77,6 +77,8 @@ mod statistics;
 mod stream_writer;
 mod sync;
 mod tailing;
+#[cfg(all(feature = "testing", not(target_family = "wasm")))]
+pub mod testing;
 mod transaction;
 mod ttl;
 mod txn_buffer;
