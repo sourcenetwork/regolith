@@ -148,6 +148,34 @@ pub struct ExternalFileIngestionInfo {
     pub file_size: u64,
 }
 
+/// A discarded end of the newest write-ahead log, passed to
+/// [`EventListener::on_wal_tail_discarded`].
+///
+/// Opening a database replays its write-ahead logs. When the newest one
+/// holds a record that is torn, zeroed or garbled, and no surviving record
+/// proves that record was synced, everything from it to the end of the
+/// file is dropped: under [`crate::DurabilityMode::Immediate`] no
+/// acknowledged write is among it, and under
+/// [`crate::DurabilityMode::Eventual`] the database keeps a gap-free
+/// prefix of the writes, up to `last_sequence`. Damage to bytes a sync
+/// had made durable, bit rot or a torn write over a sector already
+/// written, can read the same way; reporting every discard is what keeps
+/// that case from passing silently.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct WalTailDiscardedInfo {
+    /// The log the bytes were dropped from.
+    pub file_path: PathBuf,
+    /// Offset of the first byte dropped: where the first unusable record
+    /// starts.
+    pub offset: u64,
+    /// How many bytes were dropped, through the end of the file.
+    pub discarded_bytes: u64,
+    /// The newest sequence number the open kept, across every log and
+    /// table. Every write at or below it that was in the logs survived.
+    pub last_sequence: u64,
+}
+
 /// Reason passed to [`EventListener::on_background_error`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -240,6 +268,16 @@ pub trait EventListener: Send + Sync + 'static {
     /// callbacks still run. Called on the thread that completed the outcome.
     fn on_callback_panic(&self, callback: &'static str) {
         let _ = callback;
+    }
+
+    /// Called while a database opens, once, when replay dropped the end of
+    /// the newest write-ahead log (see [`WalTailDiscardedInfo`]). By then a
+    /// read-write open has already truncated the bytes away durably; a
+    /// read-only open leaves them, and reports them again on the next open.
+    /// Called on the opening thread, before the open returns; a panic here
+    /// fails the open.
+    fn on_wal_tail_discarded(&self, info: &WalTailDiscardedInfo) {
+        let _ = info;
     }
 }
 

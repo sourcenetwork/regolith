@@ -36,9 +36,13 @@ pub(crate) mod snapshot_registry;
 pub(crate) mod source_walk;
 pub(crate) mod sstable;
 pub(crate) mod wal;
+#[cfg(test)]
+mod wal_close_tests;
+pub(crate) mod wal_frame;
 pub(crate) mod wal_replay;
 #[cfg(test)]
 mod wal_rotation_tests;
+pub(crate) mod wal_v1;
 
 use crate::portability::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::collections::{BTreeMap, HashSet};
@@ -64,7 +68,7 @@ use range_tombstone::table_key_range;
 use read_horizon::ReadHorizon;
 pub(crate) use read_rule::ReadRule;
 use read_view::{ReadView, ReadViewCell, VersionStore};
-use recovery::rewrite_recovered_memtable_to_wal;
+use recovery::{replay_logs, report_discarded_tail, rewrite_recovered_memtable_to_wal};
 use skiplist::InsertHint;
 use snapshot_registry::SnapshotRegistry;
 use source_walk::Source;
@@ -76,7 +80,6 @@ use sstable::{
     sst_filename,
 };
 use wal::{RecordLen, Wal, WalEntry, check_write_len, wal_filename};
-use wal_replay::{WalPosition, WalReplayIter};
 
 /// Controls when data is flushed to disk after a commit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -622,7 +625,7 @@ impl RegolithEngine {
         let version_set =
             VersionSet::open_with_policy(&env, db_dir, &sst_dir, options.metadata_policy())?;
         let version = version_set.current();
-        let mut latest_seq = version.last_seq;
+        let latest_seq = version.last_seq;
 
         // Replay WAL files to recover memtable state
         let memtable_config = MemTableConfig::new(
@@ -635,34 +638,15 @@ impl RegolithEngine {
         wal_files.sort();
         wal_files.retain(|path| should_replay_wal(path, version.min_wal_id));
 
-        let mut discarded_tails = Vec::new();
-        let mut entries_per_file = Vec::with_capacity(wal_files.len());
-        for (i, wal_path) in wal_files.iter().enumerate() {
-            tracing::info!(path = %wal_path.display(), "Replaying WAL");
-            // `wal_files` is in id order, so only the last one can hold
-            // a record a crash left half-written.
-            let position = if i + 1 == wal_files.len() {
-                WalPosition::Newest
-            } else {
-                WalPosition::Earlier
-            };
-            let mut replay = WalReplayIter::open(&env, wal_path, position)?;
-            let mut entries = 0usize;
-            while let Some(entry) = replay.next_entry()? {
-                entries += 1;
-                latest_seq = latest_seq.max(apply_replayed_wal_entry(&memtable, entry));
-            }
-            if let Some(tail) = replay.discarded_tail() {
-                discarded_tails.push((wal_path.clone(), tail.offset, tail.discarded_bytes));
-            }
-            entries_per_file.push(entries);
-        }
-        reject_tail_discard_before_live_wal(&wal_files, &entries_per_file, &discarded_tails)?;
-        if let Some(stats) = options.statistics.as_ref() {
-            stats.add(
-                crate::statistics::Ticker::WalTailDiscarded,
-                discarded_tails.len() as u64,
-            );
+        let (latest_seq, discarded) = replay_logs(&env, &wal_files, &memtable, latest_seq)?;
+        if let Some((path, tail)) = discarded {
+            // Before the next log exists, so the newest log is complete
+            // when it becomes an earlier one (WalRecovery.tla, RED
+            // `NoTruncate`): a crash before the old logs are removed below
+            // leaves it beside the new one, and an earlier log with a
+            // damaged tail refuses the open.
+            wal::truncate_durably(&*env, &path, tail.offset)?;
+            report_discarded_tail(&options, &path, tail, latest_seq);
         }
 
         let wal_id = next_wal_id(version.next_file_id, &wal_files);
@@ -807,39 +791,18 @@ impl RegolithEngine {
         let version_set =
             VersionSet::open_read_only(&env, db_dir, &sst_dir, options.metadata_policy())?;
         let version = version_set.current();
-        let mut latest_seq = version.last_seq;
+        let latest_seq = version.last_seq;
 
         let memtable = Arc::new(MemTable::new(&memtable_config)?);
         let mut wal_files = list_wal_files(&*env, &wal_dir)?;
         wal_files.sort();
         wal_files.retain(|path| should_replay_wal(path, version.min_wal_id));
 
-        let mut discarded_tails = Vec::new();
-        let mut entries_per_file = Vec::with_capacity(wal_files.len());
-        for (i, wal_path) in wal_files.iter().enumerate() {
-            tracing::info!(path = %wal_path.display(), "Replaying WAL for read-only open");
-            let position = if i + 1 == wal_files.len() {
-                WalPosition::Newest
-            } else {
-                WalPosition::Earlier
-            };
-            let mut replay = WalReplayIter::open(&env, wal_path, position)?;
-            let mut entries = 0usize;
-            while let Some(entry) = replay.next_entry()? {
-                entries += 1;
-                latest_seq = latest_seq.max(apply_replayed_wal_entry(&memtable, entry));
-            }
-            if let Some(tail) = replay.discarded_tail() {
-                discarded_tails.push((wal_path.clone(), tail.offset, tail.discarded_bytes));
-            }
-            entries_per_file.push(entries);
-        }
-        reject_tail_discard_before_live_wal(&wal_files, &entries_per_file, &discarded_tails)?;
-        if let Some(stats) = options.statistics.as_ref() {
-            stats.add(
-                crate::statistics::Ticker::WalTailDiscarded,
-                discarded_tails.len() as u64,
-            );
+        // A read-only open writes nothing, so the tail stays in the file;
+        // the next read-write open drops it again and truncates it.
+        let (latest_seq, discarded) = replay_logs(&env, &wal_files, &memtable, latest_seq)?;
+        if let Some((path, tail)) = discarded {
+            report_discarded_tail(&options, &path, tail, latest_seq);
         }
 
         let cache = Arc::new(
@@ -3583,11 +3546,22 @@ impl RegolithEngine {
 
         self.flush_memtables_for_close()?;
 
-        self.active_wal
-            .lock()
-            .as_mut()
-            .ok_or_else(Self::read_only_error)?
-            .sync_data()?;
+        {
+            let mut guard = self.active_wal.lock();
+            let wal = guard.as_mut().ok_or_else(Self::read_only_error)?;
+            // A latched log may end in bytes nobody can account for, and
+            // CLOSE would vouch for them: replay would then refuse the
+            // crash it should survive. Such a log is left for recovery to
+            // judge. Checked under the lock a failing commit latches under.
+            if self.write_latched.load(Ordering::Acquire) {
+                wal.sync_data()?;
+            } else if let Err(err) = wal.close() {
+                drop(guard);
+                tracing::error!(error = %err, "closing the write-ahead log failed");
+                self.latch_wal_failure(&err);
+                return Err(err);
+            }
+        }
         // Signal under the mutex, join without it.
         //
         // A worker parked in `compaction_lock.read()` cannot exit until
@@ -3973,48 +3947,6 @@ fn next_wal_id(manifest_next_file_id: u64, wal_files: &[PathBuf]) -> u64 {
         .filter_map(|path| wal_file_id(path))
         .map(|id| id.saturating_add(1))
         .fold(manifest_next_file_id, u64::max)
-}
-
-/// Refuse an open where a WAL file dropped a tail while a *later* WAL
-/// file still yielded records.
-///
-/// `Wal::replay` judges one file's bytes and reports the discard rather
-/// than deciding, because the torn-tail rule is only sound for the newest
-/// file that contributes to replay. A torn write leaves nothing after it
-/// anywhere, so records in a later file are proof that the earlier file's
-/// missing tail is damage in the middle of the history. Opening on it
-/// would serve a state that never existed: later writes present, earlier
-/// acknowledged ones gone.
-fn reject_tail_discard_before_live_wal(
-    wal_files: &[PathBuf],
-    entries_per_file: &[usize],
-    discarded_tails: &[(PathBuf, u64, u64)],
-) -> std::io::Result<()> {
-    for (path, offset, discarded_bytes) in discarded_tails {
-        let Some(index) = wal_files.iter().position(|p| p == path) else {
-            continue;
-        };
-        let later = entries_per_file
-            .iter()
-            .enumerate()
-            .skip(index + 1)
-            .find(|(_, count)| **count > 0);
-        let Some((later_index, later_count)) = later else {
-            continue;
-        };
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!(
-                "{} is corrupt: the WAL record at offset {offset} is incomplete, but {later_count} \
-                 later WAL record(s) follow it in {}, so the {discarded_bytes} discarded byte(s) \
-                 are damage in the middle of the history rather than a torn write. Refusing to \
-                 open rather than serve a state that never existed.",
-                path.display(),
-                wal_files[later_index].display(),
-            ),
-        ));
-    }
-    Ok(())
 }
 
 fn apply_replayed_wal_entry(memtable: &MemTable, entry: WalEntry) -> u64 {

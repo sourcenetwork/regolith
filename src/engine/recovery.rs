@@ -1,10 +1,85 @@
+//! Recovery from the write-ahead logs at open: replay them into a
+//! memtable, deal with the newest log's discarded tail, and rewrite what
+//! was recovered into a fresh log.
+
 use std::io;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use super::internal_key;
 use super::memtable::MemTable;
-use super::wal::{self, Wal};
+use super::wal::{self, TailVerdict, Wal};
+use super::wal_replay::{WalPosition, WalReplayIter};
+use crate::env::Env;
+use crate::event_listener::WalTailDiscardedInfo;
+use crate::statistics::Ticker;
 
 const GROUP_BYTES: usize = 64 * 1024;
+
+/// Replay `wal_files`, in id order, into `memtable`.
+///
+/// Returns the largest sequence number recovered, at least
+/// `latest_seq`, and the tail the newest log dropped, if it dropped one,
+/// with that log's path. Only the newest log can drop a tail; damage in
+/// an earlier one is an error.
+pub(super) fn replay_logs(
+    env: &Arc<dyn Env>,
+    wal_files: &[PathBuf],
+    memtable: &MemTable,
+    mut latest_seq: u64,
+) -> io::Result<(u64, Option<(PathBuf, TailVerdict)>)> {
+    let mut discarded = None;
+    for (i, path) in wal_files.iter().enumerate() {
+        tracing::info!(path = %path.display(), "Replaying WAL");
+        let position = if i + 1 == wal_files.len() {
+            WalPosition::Newest
+        } else {
+            WalPosition::Earlier
+        };
+        let mut replay = WalReplayIter::open(env, path, position)?;
+        while let Some(entry) = replay.next_entry()? {
+            latest_seq = latest_seq.max(super::apply_replayed_wal_entry(memtable, entry));
+        }
+        if let Some(tail) = replay.discarded_tail() {
+            discarded = Some((path.clone(), tail));
+        }
+    }
+    Ok((latest_seq, discarded))
+}
+
+/// Tell the operator that replay dropped `tail` of the log at `path`:
+/// a warn line, the `WalTailDiscarded` and `WalTailDiscardedBytes`
+/// tickers, and every listener's
+/// [`crate::EventListener::on_wal_tail_discarded`]. `last_sequence` is
+/// the newest write the open kept.
+///
+/// Runs on the thread that opens the database. A listener that panics
+/// fails that open, like any panic outside a commit.
+pub(super) fn report_discarded_tail(
+    options: &super::EngineOptions,
+    path: &Path,
+    tail: TailVerdict,
+    last_sequence: u64,
+) {
+    tracing::warn!(
+        path = %path.display(),
+        offset = tail.offset,
+        discarded_bytes = tail.discarded_bytes,
+        last_sequence,
+        "discarded the end of the write-ahead log: no surviving record proves it was made durable"
+    );
+    if let Some(stats) = options.statistics.as_ref() {
+        stats.add(Ticker::WalTailDiscarded, 1);
+        stats.add(Ticker::WalTailDiscardedBytes, tail.discarded_bytes);
+    }
+    let info = WalTailDiscardedInfo {
+        file_path: path.to_path_buf(),
+        offset: tail.offset,
+        discarded_bytes: tail.discarded_bytes,
+        last_sequence,
+    };
+    crate::event_listener::dispatch(&options.listeners, |l| l.on_wal_tail_discarded(&info));
+}
 
 pub(super) fn rewrite_recovered_memtable_to_wal(
     memtable: &MemTable,

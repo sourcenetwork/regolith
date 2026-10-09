@@ -4,7 +4,7 @@ mod recording_env;
 
 use std::sync::Arc;
 
-use recording_env::{Recording, RecordingEnv};
+pub(crate) use recording_env::{Recording, RecordingEnv};
 
 use super::{MemTable, Wal, WalEntry, rewrite_recovered_memtable_to_wal};
 
@@ -133,9 +133,18 @@ fn recovery_groups_bound_writes_and_keep_large_records_separate() {
         records[6..].concat(),
     ];
     let events = recording.events.lock().unwrap();
-    assert_eq!(events.writes, expected);
+    assert_eq!(payloads(&events.writes), expected);
     assert_eq!(events.data_syncs, 1);
     assert_eq!(Wal::replay(&path).unwrap().len(), records.len());
+}
+
+/// Each host write is one group record: its frame, then its operations.
+/// The operations, with the frames taken off.
+fn payloads(writes: &[Vec<u8>]) -> Vec<Vec<u8>> {
+    writes
+        .iter()
+        .map(|w| w[super::wal_frame::HEADER_LEN..].to_vec())
+        .collect()
 }
 
 #[test]
@@ -150,8 +159,9 @@ fn recovery_packs_small_records_into_four_host_writes() {
     rewrite_recovered_memtable_to_wal(&memtable, &mut wal).unwrap();
     let events = recording.events.lock().unwrap();
     assert_eq!(events.writes.len(), 4);
-    assert!(events.writes.iter().all(|write| write.len() == 64 * 1024));
-    assert_eq!(events.writes.concat(), records.concat());
+    let groups = payloads(&events.writes);
+    assert!(groups.iter().all(|group| group.len() == 64 * 1024));
+    assert_eq!(groups.concat(), records.concat());
     assert_eq!(events.data_syncs, 1);
 }
 
@@ -224,4 +234,59 @@ fn partial_recovery_write_keeps_original_logs_for_retry() {
     }
     db.put(b"after-retry", b"ok").unwrap();
     assert_eq!(db.get(b"after-retry").unwrap().unwrap().as_slice(), b"ok");
+}
+
+/// RED `NoTruncate` (`WalRecovery.tla`): recovery truncates the newest
+/// log's dropped tail, durably, before it creates the next log. An open
+/// that fails while writing that next log leaves the old log beside it as
+/// an earlier log, so the old log must already be complete: no tail.
+#[test]
+fn a_dropped_tail_is_truncated_durably_before_the_next_log_exists() {
+    let dir = tempfile::tempdir().unwrap();
+    let recording = Arc::new(RecordingEnv::default());
+    let options = crate::Options::default()
+        .env(recording.clone())
+        .max_background_compactions(0);
+    let db = crate::Db::open(dir.path(), options.clone()).unwrap();
+    for seq in 1..=20u64 {
+        db.put(&seq.to_be_bytes(), &[7; 512]).unwrap();
+    }
+    drop(db);
+    let log = std::fs::read_dir(dir.path().join("wal"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .next()
+        .unwrap();
+    let whole = std::fs::read(&log).unwrap();
+    let mut damaged = whole.clone();
+    damaged.extend_from_slice(&[0x5A; 333]);
+    std::fs::write(&log, &damaged).unwrap();
+
+    *recording.events.lock().unwrap() = Recording {
+        // The next log's stamp, then its first group fails part way.
+        fail_on_write: Some(2),
+        ..Default::default()
+    };
+    assert!(crate::Db::open(dir.path(), options.clone()).is_err());
+    assert_eq!(
+        std::fs::read(&log).unwrap(),
+        whole,
+        "the tail is gone before the next log was written"
+    );
+    let events = recording.events.lock().unwrap();
+    assert_eq!(
+        events.log.first().map(String::as_str),
+        Some("sync"),
+        "the truncation is synced before anything else is written: {:?}",
+        events.log
+    );
+    drop(events);
+
+    let db = crate::Db::open(dir.path(), options).unwrap();
+    for seq in 1..=20u64 {
+        assert_eq!(
+            db.get(&seq.to_be_bytes()).unwrap().unwrap().as_slice(),
+            &[7; 512]
+        );
+    }
 }

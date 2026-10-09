@@ -11,10 +11,10 @@ use crate::engine::wal::fault;
 use crate::{Db, Options};
 
 /// Fails every WAL sync under one directory until dropped.
-struct SyncFault(PathBuf);
+pub(super) struct SyncFault(PathBuf);
 
 impl SyncFault {
-    fn arm(dir: &TempDir) -> Self {
+    pub(super) fn arm(dir: &TempDir) -> Self {
         fault::arm_sync_failure(dir.path());
         Self(dir.path().to_path_buf())
     }

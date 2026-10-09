@@ -191,26 +191,25 @@ fn a_write_batch_record_cut_in_half_is_never_half_applied() {
 // "was it killed" is a POSIX signal question that Windows cannot
 // answer, so the assertion would be vacuous there.
 #[cfg(target_os = "linux")]
-/// Every byte of a WAL record is covered by its checksum: the length, the
-/// type byte and the payload all feed `checksum::wal_record`, and the
-/// stored checksum is the last four bytes. So every single-bit flip must
-/// be caught and no flipped WAL may ever be replayed as data. A flip that
-/// opens is a hole in the checksum's coverage and is reported as one.
+/// Every byte of a WAL record is covered by a check: the header check
+/// covers the header, and the payload check, which the header check
+/// covers, covers the payload. So no flipped record may ever be replayed
+/// as data. Every record but the last is followed by one that proves it
+/// synced (the fixture writes at `Immediate` durability), so a flip there
+/// must refuse.
 ///
-/// The four length bytes of the *last* record are the one exception, and
-/// it is inherent to the format rather than a hole: the checksum sits
-/// after the payload, so the length has to be trusted to find it, which
-/// makes a length inflated past the end of the file indistinguishable
-/// from the short trailing record every crash leaves behind. Replay is
-/// required to treat it as one, so either a refusal or an open serving
-/// exactly the records before that last one is correct there. Nothing
-/// else is: the blast radius stays that one record.
+/// The *last* record is the one exception, and it is inherent to the
+/// format rather than a hole: nothing after it proves it was synced, so
+/// damage to it cannot be told from the record a crash tore, which replay
+/// is required to drop. Either a refusal or an open serving exactly the
+/// records before that last one is correct there, and the drop is
+/// reported. Nothing else is: the blast radius stays that one record.
 fn wal_flip_sweep(positions: &[u64], what: &str, progress: &AtomicU64) {
     let fixture = wal_fixture();
     let rel = fixture.only(".log");
     let frames = wal_frames(fixture.bytes(&rel));
     let last = *frames.last().expect("at least one record");
-    let ambiguous = last.start..last.start + 4;
+    let ambiguous = last.start..last.end;
     let root = TempDir::new().expect("tempdir");
     let db = root.path().join("db");
     let mut tally = Tally::default();
@@ -232,9 +231,9 @@ fn wal_flip_sweep(positions: &[u64], what: &str, progress: &AtomicU64) {
                     match validate_prefix_of_state(state, &fixture.history) {
                         Ok(report) if report.valid_ks.contains(&before_last) => tally.matched += 1,
                         Ok(report) => tally.violation(format!(
-                            "{label}: the flip is in the last record's length field, so at most \
-                             that record may be lost, but the state matches prefix lengths {:?} \
-                             rather than {before_last}",
+                            "{label}: the flip is in the last record, so at most that record \
+                             may be lost, but the state matches prefix lengths {:?} rather than \
+                             {before_last}",
                             report.valid_ks
                         )),
                         Err(e) => tally.violation(format!("{label}: {e}")),
@@ -326,7 +325,7 @@ fn a_wal_record_header_promising_more_bytes_than_exist_is_refused_unless_it_is_t
 
         for frame in [frames[0], last] {
             let is_tail = frame.start == last.start;
-            let real = (frame.end - frame.start - 9) as u32;
+            let real = (frame.end - frame.start) as u32 - common::wal_format::HEADER_LEN as u32;
             for extra in [1u32, 7, 64, 1 << 20, u32::MAX - real] {
                 progress.fetch_add(1, Ordering::Relaxed);
                 let claimed = real + extra;

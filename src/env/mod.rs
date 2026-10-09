@@ -264,10 +264,9 @@ pub trait WriteFile: Send {
     ///
     /// The default implementation writes the slices one at a time, which is
     /// always correct. An environment backed by a POSIX file overrides this
-    /// with `writev` so a record assembled from a header, a payload and a
-    /// trailer costs one syscall rather than one per piece. That matters on
-    /// the WAL path, where a payload at or above the buffer capacity would
-    /// otherwise force the 5-byte header out in a syscall of its own.
+    /// with `writev` so a record assembled from a header and a payload costs
+    /// one syscall rather than one per piece. That matters on the WAL path,
+    /// which appends a large commit group that way.
     ///
     /// This is a throughput and syscall-count optimization, NOT an atomicity
     /// guarantee: a vectored write can still be torn by a crash, exactly as a
@@ -459,6 +458,12 @@ impl<F: std::ops::Deref<Target = dyn ReadFile>> ReadFileCursor<F> {
     /// `ReadFile::len` call, which for OPFS is a call into JS.
     pub(crate) fn len(&self) -> u64 {
         self.end
+    }
+
+    /// The file under the cursor, for a positioned read that must not
+    /// move it.
+    pub(crate) fn file(&self) -> &dyn ReadFile {
+        &*self.file
     }
 }
 
