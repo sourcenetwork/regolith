@@ -94,14 +94,6 @@ theorem blindMerge_commutes (E : Env)
       rw [merge_at, merge_at, merge_at, merge_at]
       exact hcomm _ _ _
 
-/-- **Why the rule refuses a newer replacement.** With a put between its
-snapshot and its commit, a merge placed at its commit lands on the put and
-counts, while placed at its snapshot the put erases it: the two positions
-disagree, so the merge has no position both before and after a replacement.
-Here: one operand of `+1` and a put of 5. -/
-theorem blindMerge_across_replacement :
-    (5 : Nat) + 1 ≠ 5 := by decide
-
 /-- **An identical rewrite is not a change (plan 3.5).** A read that found
 `v`, with a newer put of the same `v`, passes the value rule and fails the
 sequence rule. -/
@@ -353,5 +345,20 @@ theorem promoted_read_skew :
          applyWrites demo demo.init [.put 1 1, .put 2 1] 2 = 1) := by
   -- Key 1 and key 2 before the writer, and after it.
   simp [applyWrites, applyWrite, upd, demo]
+
+
+/-- **`blindMerge_across_replacement`: why the blind-merge rule refuses a newer
+replacement.** With a put of key 7 between a merge's snapshot and its
+commit, the merge placed at its commit lands on the put and counts, while
+placed at its snapshot the put erases it: the two positions disagree, so a
+merge that crossed a replacement has no single place in the history that
+both its snapshot and its effect agree with
+(`MC_DefraLevel_Red_MergeIgnoresReplacement`). -/
+theorem blindMerge_across_replacement (σ : State) (o : Nat) :
+    applyWrite demo (applyWrite demo σ (.put 7 5)) (.merge 7 o) 7 ≠
+      applyWrite demo (applyWrite demo σ (.merge 7 o)) (.put 7 5) 7 := by
+  -- At its commit it gives 5 + o + 1; at its snapshot the put leaves 5.
+  simp [applyWrite, upd, demo]
+  omega
 
 end Regolith.Validation
