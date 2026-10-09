@@ -12,7 +12,27 @@
 
 #![cfg(not(target_arch = "wasm32"))]
 
-use regolith::{CompactionStyle, Db, Error, FifoCompactionOptions, Options};
+use std::sync::Arc;
+
+use regolith::{CompactionStyle, Db, Error, FifoCompactionOptions, MergeOperator, Options};
+
+/// Configured so `merge_cf` reaches the stall instead of being refused for
+/// having no operator.
+struct Concat;
+
+impl MergeOperator for Concat {
+    fn full_merge(&self, _key: &[u8], base: Option<&[u8]>, operands: &[&[u8]]) -> Option<Vec<u8>> {
+        let mut out = base.map(<[u8]>::to_vec).unwrap_or_default();
+        for op in operands {
+            out.extend_from_slice(op);
+        }
+        Some(out)
+    }
+
+    fn name(&self) -> &'static str {
+        "cf-write-stall-concat"
+    }
+}
 
 #[test]
 fn every_column_family_write_is_stopped_with_the_default_column_family() {
@@ -24,6 +44,7 @@ fn every_column_family_write_is_stopped_with_the_default_column_family() {
             .level0_slowdown_writes_trigger(3)
             .level0_stop_writes_trigger(4)
             .max_background_compactions(0)
+            .merge_operator(Some(Arc::new(Concat)))
             .compaction_style(CompactionStyle::Fifo)
             .fifo_compaction_options(FifoCompactionOptions {
                 max_table_files_size: 1024 * 1024 * 1024,

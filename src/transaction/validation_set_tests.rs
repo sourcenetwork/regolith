@@ -278,6 +278,20 @@ fn has_operands(tx: &Transaction, prefixed: &[u8]) -> bool {
     found
 }
 
+/// Whether merge operands were buffered for `prefixed` after its newest put
+/// or delete, so the key reads as those operands applied to that entry.
+fn operands_above_terminator(tx: &Transaction, prefixed: &[u8]) -> bool {
+    let mut found = false;
+    tx.writes.walk_chain(prefixed, |write| {
+        if write.is_terminator() {
+            return ControlFlow::Break(());
+        }
+        found |= matches!(write, Write::Merge(_));
+        ControlFlow::Continue(())
+    });
+    found
+}
+
 /// The put or delete the transaction buffered for `prefixed`, if any. Merge
 /// operands alone are not one: a scan reads the entry beneath them, and
 /// yields the key with the operands applied even when the snapshot holds
@@ -298,7 +312,7 @@ fn replacement(tx: &Transaction, prefixed: &[u8]) -> Option<Write> {
 /// The keys the stretches of one scan of `[start, end)` cover, worked out
 /// independently of `TxnScanStream`: the snapshot holds exactly the keys in
 /// `seeded`, an entry of the write buffer ends a stretch (and is yielded when
-/// it is a put), a snapshot key already promoted past the begin snapshot ends
+/// it is a put, or a delete with merge operands above it), a snapshot key already promoted past the begin snapshot ends
 /// a stretch (and is yielded when the engine has it at its read sequence),
 /// every other snapshot key extends the stretch, a key that only has merge
 /// operands is read like a snapshot key whether or not the snapshot holds it
@@ -334,7 +348,11 @@ fn expected_cover(
         let prefixed = prefix_key(DEFAULT_CF_ID, &[key]);
         if let Some(replaced) = replacement(tx, &prefixed) {
             close(&mut stretch);
-            yielded += usize::from(matches!(replaced, Write::Put(_)));
+            // A put reads as a value, and so does a delete with operands
+            // buffered above it: they apply to nothing and yield.
+            yielded += usize::from(
+                matches!(replaced, Write::Put(_)) || operands_above_terminator(tx, &prefixed),
+            );
             continue;
         }
         let merged = has_operands(tx, &prefixed);
