@@ -1074,7 +1074,10 @@ impl VersionSet {
         if replay.valid_len == data.len() {
             return Ok(None);
         }
-        tail::judge(data, replay.valid_len, manifest_path).map(Some)
+        let sealed = keyring
+            .zip(replay.salt.as_ref())
+            .map(|(keyring, salt)| tail::Opener { keyring, salt });
+        tail::judge(data, replay.valid_len, manifest_path, sealed).map(Some)
     }
 
     /// The unreferenced `*.sst` files that could plausibly hold live data.

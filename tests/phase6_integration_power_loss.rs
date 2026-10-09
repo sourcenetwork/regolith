@@ -7,6 +7,11 @@
 //!   version. A flush that unlinked its log before its table's batch was
 //!   durable loses acknowledged writes here. (A flush that records no
 //!   `min_wal_id` shows only once an unlink fails: `phase6_integration.rs`.)
+//! - **A sealed manifest's torn tail** (#266 x #268). On an encrypted
+//!   database a crash can tear an unsynced reservation batch and leave the
+//!   reservation after it whole. The open opens each batch before it judges
+//!   whether the writer synced it, so the tail is dropped and the database
+//!   opens with the right key, and with no other.
 //!
 //! Each write of the workload overwrites one of a few keys and puts a key of
 //! its own, in one batch, each value carrying the index of the write, at
@@ -32,8 +37,9 @@ use common::fault::{
     Trigger,
 };
 use common::faulty_env::FaultyEnv;
+use common::keys::Keys;
 use regolith::env::Env;
-use regolith::{Db, DurabilityMode, Options, WriteBatch};
+use regolith::{Db, DurabilityMode, Error, Options, Statistics, Ticker, WriteBatch};
 use tempfile::TempDir;
 
 /// Keys the workload overwrites.
@@ -285,4 +291,89 @@ fn a_power_cut_around_a_flush_after_a_commit_keeps_every_acknowledged_write() {
 #[test]
 fn a_power_cut_around_a_stall_step_flush_keeps_every_acknowledged_write() {
     cut_everywhere(FlushPath::StallStep);
+}
+
+/// The spans `[start, end)` of the whole batches of `data` from `from` on:
+/// `[len u32][len bytes][checksum u32]`, the framing a sealed batch keeps.
+fn batch_spans(data: &[u8], from: usize) -> Vec<(usize, usize)> {
+    let mut spans = Vec::new();
+    let mut at = from;
+    while at + 4 <= data.len() {
+        let len = u32::from_le_bytes(data[at..at + 4].try_into().unwrap()) as usize;
+        let end = at + 4 + len + 4;
+        if end > data.len() {
+            break;
+        }
+        spans.push((at, end));
+        at = end;
+    }
+    spans
+}
+
+/// Kill an encrypted run before its `nth` manifest sync, then leave what a
+/// crash may leave of the unsynced batches: the first torn, every later one
+/// whole. The open must drop them as a crash's tail with the right key, and
+/// refuse with a wrong one.
+fn sealed_tail(nth: u64) {
+    let tmp = TempDir::new().unwrap();
+    let db = tmp.path().join("db");
+    let spec = spec(FlushPath::AfterCommit, &db).encrypted(true);
+    let out = CrashRun::new(spec)
+        .trigger(manifest_sync(nth, true))
+        .timeout(CHILD_TIMEOUT)
+        .run();
+    out.assert_killed();
+    let manifest = db.join("MANIFEST");
+    let written = std::fs::read(&manifest).unwrap();
+    fault::simulate_power_loss_with(
+        &db,
+        &out.journal,
+        CutPoint::End,
+        &PowerLossOptions::default().tear(TearMode::Truncate),
+    );
+    // The power cut left the synced prefix; every byte after it is a crash's
+    // to keep, drop or tear, batch by batch.
+    let synced = std::fs::metadata(&manifest).unwrap().len() as usize;
+    let unsynced = batch_spans(&written, synced);
+    assert!(
+        unsynced.len() >= 3,
+        "cut {nth}: the unsynced end holds {} batches; the case needs a torn one, a whole \
+         reservation and a batch after it",
+        unsynced.len()
+    );
+    let mut image = written.clone();
+    let (start, end) = unsynced[0];
+    // Zeroed under its length: its checksum fails, as a torn write's does.
+    image[start + 4..end].fill(0);
+    std::fs::write(&manifest, &image).unwrap();
+
+    assert!(
+        Db::open(&db, Options::default().key_provider(Keys::wrong(&[1]))).is_err(),
+        "cut {nth}: a wrong key opened the database"
+    );
+    assert!(matches!(
+        Db::open(&db, Options::default()),
+        Err(Error::KeyProviderRequired)
+    ));
+    let stats = Arc::new(Statistics::new());
+    let reopened = Db::open(
+        &db,
+        Options::default()
+            .key_provider(Keys::new(&[1]))
+            .statistics(Some(Arc::clone(&stats))),
+    )
+    .unwrap_or_else(|e| panic!("cut {nth}: the right key refuses a crash's torn sealed tail: {e}"));
+    assert_eq!(
+        stats.get_ticker(Ticker::ManifestTailDiscarded),
+        1,
+        "cut {nth}: the open reported the tail it dropped"
+    );
+    check_overwrites(&reopened, &out, &format!("sealed tail, cut {nth}"));
+}
+
+#[test]
+fn a_torn_sealed_reservation_before_whole_ones_opens_with_the_right_key() {
+    for nth in [2, 3, 5] {
+        sealed_tail(nth);
+    }
 }
