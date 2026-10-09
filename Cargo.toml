@@ -199,6 +199,10 @@ name = "memory"
 harness = false
 
 [[bench]]
+name = "wal_replay"
+harness = false
+
+[[bench]]
 name = "soak"
 harness = false
 
@@ -212,4 +216,12 @@ harness = false
 
 [[bench]]
 name = "sync"
+harness = false
+
+[[bench]]
+name = "ingest"
+harness = false
+
+[[bench]]
+name = "cf_drop"
 harness = false

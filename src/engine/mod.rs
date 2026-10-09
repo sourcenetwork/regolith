@@ -12,6 +12,7 @@ pub(crate) mod compaction_backoff;
 pub(crate) mod disk_check;
 pub(crate) mod filter_block;
 pub(crate) mod index_block;
+mod ingest;
 #[cfg(test)]
 mod ingest_range_tests;
 #[cfg(test)]
@@ -36,9 +37,13 @@ pub(crate) mod snapshot_registry;
 pub(crate) mod source_walk;
 pub(crate) mod sstable;
 pub(crate) mod wal;
+#[cfg(test)]
+mod wal_close_tests;
+pub(crate) mod wal_frame;
 pub(crate) mod wal_replay;
 #[cfg(test)]
 mod wal_rotation_tests;
+pub(crate) mod wal_v1;
 
 use crate::portability::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::collections::{BTreeMap, HashSet};
@@ -60,11 +65,10 @@ use memtable::{MemTable, MemTableConfig};
 
 const STOP_TOO_MANY_MEMTABLES: &str = "stop: too many memtables";
 use pending_outputs::PendingOutputs;
-use range_tombstone::table_key_range;
 use read_horizon::ReadHorizon;
 pub(crate) use read_rule::ReadRule;
 use read_view::{ReadView, ReadViewCell, VersionStore};
-use recovery::rewrite_recovered_memtable_to_wal;
+use recovery::{replay_logs, report_discarded_tail, rewrite_recovered_memtable_to_wal};
 use skiplist::InsertHint;
 use snapshot_registry::SnapshotRegistry;
 use source_walk::Source;
@@ -76,7 +80,6 @@ use sstable::{
     sst_filename,
 };
 use wal::{RecordLen, Wal, WalEntry, check_write_len, wal_filename};
-use wal_replay::{WalPosition, WalReplayIter};
 
 /// Controls when data is flushed to disk after a commit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -546,10 +549,12 @@ pub(crate) struct RegolithEngine {
     /// acknowledged write disappears, and a reader that had already seen
     /// it reads an older version instead.
     ///
-    /// An ingest does not take it. It drains every frozen memtable under
-    /// the pipeline mutex and keeps that mutex until its file is installed,
-    /// so no memtable can be sealed, let alone flushed, before the file
-    /// takes its place in L0 install order.
+    /// An ingest takes it only through `flush_until_retired`, for the
+    /// memtables holding a key of its file's range, and holds the pipeline
+    /// mutex until the file is installed. A memtable holding none of its
+    /// keys may be flushed after it and land in front of it in L0, which
+    /// changes no read: the two share no key (LsmOrder.tla, Lean
+    /// `ingest_ordered`).
     flushing: Mutex<()>,
     /// Latched write-path failure. Set only when a failed commit group
     /// could not be rolled back out of the WAL, which leaves the log with
@@ -622,7 +627,7 @@ impl RegolithEngine {
         let version_set =
             VersionSet::open_with_policy(&env, db_dir, &sst_dir, options.metadata_policy())?;
         let version = version_set.current();
-        let mut latest_seq = version.last_seq;
+        let latest_seq = version.last_seq;
 
         // Replay WAL files to recover memtable state
         let memtable_config = MemTableConfig::new(
@@ -635,34 +640,15 @@ impl RegolithEngine {
         wal_files.sort();
         wal_files.retain(|path| should_replay_wal(path, version.min_wal_id));
 
-        let mut discarded_tails = Vec::new();
-        let mut entries_per_file = Vec::with_capacity(wal_files.len());
-        for (i, wal_path) in wal_files.iter().enumerate() {
-            tracing::info!(path = %wal_path.display(), "Replaying WAL");
-            // `wal_files` is in id order, so only the last one can hold
-            // a record a crash left half-written.
-            let position = if i + 1 == wal_files.len() {
-                WalPosition::Newest
-            } else {
-                WalPosition::Earlier
-            };
-            let mut replay = WalReplayIter::open(&env, wal_path, position)?;
-            let mut entries = 0usize;
-            while let Some(entry) = replay.next_entry()? {
-                entries += 1;
-                latest_seq = latest_seq.max(apply_replayed_wal_entry(&memtable, entry));
-            }
-            if let Some(tail) = replay.discarded_tail() {
-                discarded_tails.push((wal_path.clone(), tail.offset, tail.discarded_bytes));
-            }
-            entries_per_file.push(entries);
-        }
-        reject_tail_discard_before_live_wal(&wal_files, &entries_per_file, &discarded_tails)?;
-        if let Some(stats) = options.statistics.as_ref() {
-            stats.add(
-                crate::statistics::Ticker::WalTailDiscarded,
-                discarded_tails.len() as u64,
-            );
+        let (latest_seq, discarded) = replay_logs(&env, &wal_files, &memtable, latest_seq)?;
+        if let Some((path, tail)) = discarded {
+            // Before the next log exists, so the newest log is complete
+            // when it becomes an earlier one (WalRecovery.tla, RED
+            // `NoTruncate`): a crash before the old logs are removed below
+            // leaves it beside the new one, and an earlier log with a
+            // damaged tail refuses the open.
+            wal::truncate_durably(&*env, &path, tail.offset)?;
+            report_discarded_tail(&options, &path, tail, latest_seq);
         }
 
         let wal_id = next_wal_id(version.next_file_id, &wal_files);
@@ -807,39 +793,18 @@ impl RegolithEngine {
         let version_set =
             VersionSet::open_read_only(&env, db_dir, &sst_dir, options.metadata_policy())?;
         let version = version_set.current();
-        let mut latest_seq = version.last_seq;
+        let latest_seq = version.last_seq;
 
         let memtable = Arc::new(MemTable::new(&memtable_config)?);
         let mut wal_files = list_wal_files(&*env, &wal_dir)?;
         wal_files.sort();
         wal_files.retain(|path| should_replay_wal(path, version.min_wal_id));
 
-        let mut discarded_tails = Vec::new();
-        let mut entries_per_file = Vec::with_capacity(wal_files.len());
-        for (i, wal_path) in wal_files.iter().enumerate() {
-            tracing::info!(path = %wal_path.display(), "Replaying WAL for read-only open");
-            let position = if i + 1 == wal_files.len() {
-                WalPosition::Newest
-            } else {
-                WalPosition::Earlier
-            };
-            let mut replay = WalReplayIter::open(&env, wal_path, position)?;
-            let mut entries = 0usize;
-            while let Some(entry) = replay.next_entry()? {
-                entries += 1;
-                latest_seq = latest_seq.max(apply_replayed_wal_entry(&memtable, entry));
-            }
-            if let Some(tail) = replay.discarded_tail() {
-                discarded_tails.push((wal_path.clone(), tail.offset, tail.discarded_bytes));
-            }
-            entries_per_file.push(entries);
-        }
-        reject_tail_discard_before_live_wal(&wal_files, &entries_per_file, &discarded_tails)?;
-        if let Some(stats) = options.statistics.as_ref() {
-            stats.add(
-                crate::statistics::Ticker::WalTailDiscarded,
-                discarded_tails.len() as u64,
-            );
+        // A read-only open writes nothing, so the tail stays in the file;
+        // the next read-write open drops it again and truncates it.
+        let (latest_seq, discarded) = replay_logs(&env, &wal_files, &memtable, latest_seq)?;
+        if let Some((path, tail)) = discarded {
+            report_discarded_tail(&options, &path, tail, latest_seq);
         }
 
         let cache = Arc::new(
@@ -2644,6 +2609,7 @@ impl RegolithEngine {
                 largest_key: summary.largest_user_key,
                 file_size,
                 num_entries,
+                global_seq: None,
             },
             reader,
         );
@@ -2816,376 +2782,6 @@ impl RegolithEngine {
             end,
             &self.snapshot_registry,
         )
-    }
-
-    /// Bulk-ingest a set of externally-built SSTable files. Each file
-    /// is re-emitted into `sst_dir` so its entries are rewritten with
-    /// a freshly allocated sequence number (one per file), then the
-    /// file is added to the version at an appropriate level:
-    ///
-    /// - L0 if the file's user-key range overlaps any file at any
-    ///   existing level;
-    /// - otherwise the deepest level whose files are all strictly
-    ///   disjoint from the input range.
-    ///
-    /// If `ingest_behind` is set the file is forced to the bottommost
-    /// level - any overlap is an error. If `snapshot_consistency` is
-    /// set the call is rejected while any snapshot is pinned (ingest
-    /// would otherwise inject a new seq that older snapshots cannot
-    /// consistently observe).
-    ///
-    /// The call waits for any flush already in progress, and writes wait
-    /// while each file is rewritten and installed, so the ingested entries
-    /// order after every write acknowledged before the call and before
-    /// every write acknowledged after it, and no snapshot sees them appear
-    /// under it.
-    pub(crate) fn ingest_external_files<F>(
-        &self,
-        files: &[PathBuf],
-        ingest_opts: &crate::sst_file_writer::IngestOptions,
-        mut validate_user_key: F,
-    ) -> std::io::Result<()>
-    where
-        F: FnMut(&[u8]) -> std::io::Result<()>,
-    {
-        use crate::engine::internal_key::decode_internal_key;
-
-        self.ensure_writable()?;
-
-        if files.is_empty() {
-            return Ok(());
-        }
-
-        if ingest_opts.snapshot_consistency && self.oldest_live_seq() != u64::MAX {
-            return Err(std::io::Error::other(
-                "ingest_external_files: snapshot isolation would be violated \
-                 because a live snapshot is pinned (use snapshot_consistency=false \
-                 to override)",
-            ));
-        }
-
-        // Pre-open every source file and compute its key range, so we
-        // can reject bad inputs before we start mutating anything.
-        let mut sources: Vec<IngestSource> = Vec::with_capacity(files.len());
-        let _cache_guard = IngestCacheGuard::new(&self.cache, files.len());
-        for (source_idx, path) in files.iter().enumerate() {
-            // Source files are read through the engine's shared block
-            // cache, which is keyed `(file_id, offset)`. They are not in
-            // the version, so they have no allocated id; giving every
-            // source the same one (or one a live file already owns) makes
-            // the second source read the first source's cached blocks and
-            // silently ingest the wrong bytes. Ids are handed out from the
-            // top of the space, which `next_file_id` counts up from 1 and
-            // never reaches.
-            let cache_id = ingest_probe_file_id(source_idx);
-            let reader =
-                SsTableReader::open_with(&self.env, path, cache_id, self.options.metadata_policy())
-                    .map_err(|e| {
-                        std::io::Error::new(
-                            e.kind(),
-                            format!("ingest: open {}: {e}", path.display()),
-                        )
-                    })?;
-            // Stream the source instead of materialising it: the
-            // validation pass holds one entry and one data block, and
-            // tracks the key range as it goes.
-            let mut first_user_key: Option<Vec<u8>> = None;
-            let mut last_user_key: Vec<u8> = Vec::new();
-            {
-                let mut entries = reader.iter_internal_stream(&self.cache)?;
-                while let Some((ik, value)) = entries.next_entry()? {
-                    let (user_key, _, _) = decode_internal_key(&ik);
-                    self.validate_prefixed_key_size(user_key).map_err(|e| {
-                        std::io::Error::new(
-                            e.kind(),
-                            format!(
-                                "ingest: source file {} contains an over-sized key: {e}",
-                                path.display()
-                            ),
-                        )
-                    })?;
-                    self.validate_value_size(&value).map_err(|e| {
-                        std::io::Error::new(
-                            e.kind(),
-                            format!(
-                                "ingest: source file {} contains an over-sized value: {e}",
-                                path.display()
-                            ),
-                        )
-                    })?;
-                    validate_user_key(user_key).map_err(|e| {
-                    std::io::Error::new(
-                        e.kind(),
-                        format!(
-                            "ingest: source file {} contains a key outside live column families: {e}",
-                            path.display()
-                        ),
-                    )
-                })?;
-                    if first_user_key.is_none() {
-                        first_user_key = Some(user_key.to_vec());
-                    }
-                    last_user_key.clear();
-                    last_user_key.extend_from_slice(user_key);
-                }
-            }
-            let rts = reader.range_tombstones();
-            for rt in rts {
-                self.validate_prefixed_key_size(&rt.start).map_err(|e| {
-                    std::io::Error::new(
-                        e.kind(),
-                        format!(
-                            "ingest: source file {} contains an over-sized range tombstone start: {e}",
-                            path.display()
-                        ),
-                    )
-                })?;
-                self.validate_prefixed_key_size(&rt.end).map_err(|e| {
-                    std::io::Error::new(
-                        e.kind(),
-                        format!(
-                            "ingest: source file {} contains an over-sized range tombstone end: {e}",
-                            path.display()
-                        ),
-                    )
-                })?;
-                validate_user_key(&rt.start).map_err(|e| {
-                    std::io::Error::new(
-                        e.kind(),
-                        format!(
-                            "ingest: source file {} contains a range tombstone start outside live column families: {e}",
-                            path.display()
-                        ),
-                    )
-                })?;
-                validate_user_key(&rt.end).map_err(|e| {
-                    std::io::Error::new(
-                        e.kind(),
-                        format!(
-                            "ingest: source file {} contains a range tombstone end outside live column families: {e}",
-                            path.display()
-                        ),
-                    )
-                })?;
-            }
-            // The range the installed table will be recorded with, tombstones
-            // included, because that is what must not overlap the level the
-            // table is placed in.
-            let points = first_user_key.map(|first| (first, last_user_key));
-            let Some((smallest, largest)) = table_key_range(points, rts) else {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    format!("ingest: source file {} is empty", path.display()),
-                ));
-            };
-            sources.push(IngestSource {
-                path: path.clone(),
-                reader,
-                smallest,
-                largest,
-            });
-        }
-
-        // Exclude all background workers for the duration of the
-        // ingest, the same pattern as `compact_range`.
-        let _compact_guard = self.compaction_lock.write();
-        self.ensure_writable()?;
-
-        for source in &sources {
-            self.ingest_one(source, ingest_opts)?;
-        }
-
-        self.compaction.lock().notify();
-        Ok(())
-    }
-
-    fn ingest_one(
-        &self,
-        source: &IngestSource,
-        ingest_opts: &crate::sst_file_writer::IngestOptions,
-    ) -> std::io::Result<()> {
-        // The pipeline mutex is held from the sequence allocation through the
-        // install, as a commit group holds it from its allocation through its
-        // publish. Groups do not pipeline, so no group can publish a horizon
-        // past this sequence before the table is in place. Released earlier,
-        // a group committing in between would: a snapshot taken then reads the
-        // old value of a key the ingest carries and later the ingested one,
-        // and a transaction that read the old value does not see the ingest
-        // as newer at commit. The rewrite stamps every entry with this
-        // sequence, so it has to run inside the hold, and writers wait for it.
-        let (table, ingest_seq) = {
-            let _write_guard = self.pipeline.lock();
-            // Drained, not merely rotated: an ingest is ordered like a flush.
-            // L0 recency is install order, so a memtable sealed below this
-            // sequence that landed after the ingested file would shadow the
-            // version the ingest carries.
-            let view = self.view.load();
-            if !view.active.is_empty() || !view.active.clone_range_tombstones().is_empty() {
-                drop(view);
-                self.rotate_memtable()?;
-            } else if let Some(newest_frozen) = view.frozen.last().cloned() {
-                drop(view);
-                self.flush_until_retired(&newest_frozen)?;
-            }
-            let ingest_seq = self.latest_seq.fetch_add(1, Ordering::AcqRel) + 1;
-
-            #[cfg(test)]
-            if let Some(hook) = AFTER_INGEST_SEQ.with(|slot| slot.borrow_mut().take()) {
-                hook();
-            }
-
-            (
-                self.install_ingested(source, ingest_opts, ingest_seq)?,
-                ingest_seq,
-            )
-        };
-
-        // Run with the pipeline released: a listener is user code.
-        if !self.options.listeners.is_empty() {
-            // Fire the table-created event first (file-level
-            // observation) and then the ingest-specific event
-            // (caller-level observation carrying the original
-            // external path).
-            let create_info = event_listener::TableFileCreationInfo {
-                file_id: table.file_id,
-                file_path: table.path.clone(),
-                level: table.level,
-                reason: event_listener::TableFileCreationReason::Recovery,
-                file_size: table.file_size,
-                num_entries: table.num_entries,
-            };
-            event_listener::dispatch(&self.options.listeners, |l| {
-                l.on_table_file_created(&create_info)
-            });
-            let ingest_info = event_listener::ExternalFileIngestionInfo {
-                external_file_path: source.path.clone(),
-                internal_file_id: table.file_id,
-                level: table.level,
-                num_entries: table.num_entries,
-                file_size: table.file_size,
-            };
-            event_listener::dispatch(&self.options.listeners, |l| {
-                l.on_external_file_ingested(&ingest_info)
-            });
-        }
-
-        tracing::info!(
-            file_id = table.file_id,
-            target_level = table.level,
-            ingest_seq,
-            entries = table.num_entries,
-            size = table.file_size,
-            source = %source.path.display(),
-            "Ingested external SSTable"
-        );
-        Ok(())
-    }
-
-    /// Rewrite `source` at `ingest_seq` into the SSTable directory and
-    /// install it. The caller holds the pipeline mutex.
-    fn install_ingested(
-        &self,
-        source: &IngestSource,
-        ingest_opts: &crate::sst_file_writer::IngestOptions,
-        ingest_seq: u64,
-    ) -> std::io::Result<IngestedTable> {
-        use crate::engine::internal_key::{decode_internal_key, encode_internal_key};
-
-        // Compute the target level from the current version.
-        let version = self.published_version();
-        let target_level = compute_target_level(
-            &version,
-            &source.smallest,
-            &source.largest,
-            ingest_opts.ingest_behind,
-        )?;
-
-        // Allocate a new file_id.
-        let file_id = {
-            let mut guard = self.versions.lock();
-            let current = guard.current();
-            let id = current.next_file_id;
-            guard.apply(&[VersionEdit::SetNextFileId(id + 1)])?;
-            id
-        };
-
-        let dest_path = self.sst_dir.join(sst_filename(file_id));
-        let mut writer = SsTableWriter::new_in(
-            &self.env,
-            &dest_path,
-            self.options.block_size,
-            self.options.bloom_bits_per_key,
-            self.options.compression_for_level(target_level),
-            self.options.prefix_extractor.clone(),
-            self.options.partitioned_index,
-            self.options.metadata_block_size,
-        )?;
-
-        // Re-encode every point entry with the ingest seq. The second
-        // pass streams too, so an ingest never holds more than one
-        // source data block regardless of how large the file is.
-        let mut entries = source.reader.iter_internal_stream(&self.cache)?;
-        while let Some((ik, value)) = entries.next_entry()? {
-            let (uk, _old_seq, vt) = decode_internal_key(&ik);
-            let new_ik = encode_internal_key(uk, ingest_seq, vt);
-            writer.add(&new_ik, &value)?;
-        }
-        drop(entries);
-        // Carry range tombstones across with the same seq rewrite.
-        for rt in source.reader.range_tombstones() {
-            writer.add_range_tombstone(&rt.start, &rt.end, ingest_seq);
-        }
-
-        let summary = match writer.finish()? {
-            Some(s) => s,
-            None => {
-                let _ = self.env.remove_file(&dest_path);
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    format!(
-                        "ingest: source file {} produced empty output",
-                        source.path.display()
-                    ),
-                ));
-            }
-        };
-
-        let file_size = self.env.metadata(&dest_path)?.len;
-        let reader = Arc::new(SsTableReader::open_with(
-            &self.env,
-            &dest_path,
-            file_id,
-            self.options.metadata_policy(),
-        )?);
-        let live = LiveSst::new(
-            SsTableMeta {
-                file_id,
-                smallest_key: summary.smallest_user_key,
-                largest_key: summary.largest_user_key,
-                file_size,
-                num_entries: summary.num_entries,
-            },
-            reader,
-        );
-
-        let edits = vec![
-            VersionEdit::AddFile {
-                level: target_level,
-                file: live,
-            },
-            VersionEdit::SetLastSeq(ingest_seq),
-        ];
-        self.versions.lock().apply(&edits)?;
-
-        self.visible_seq.publish(ingest_seq);
-
-        Ok(IngestedTable {
-            file_id,
-            path: dest_path,
-            level: target_level,
-            file_size,
-            num_entries: summary.num_entries,
-        })
     }
 
     /// Atomically capture a consistent snapshot of the on-disk state
@@ -3583,11 +3179,22 @@ impl RegolithEngine {
 
         self.flush_memtables_for_close()?;
 
-        self.active_wal
-            .lock()
-            .as_mut()
-            .ok_or_else(Self::read_only_error)?
-            .sync_data()?;
+        {
+            let mut guard = self.active_wal.lock();
+            let wal = guard.as_mut().ok_or_else(Self::read_only_error)?;
+            // A latched log may end in bytes nobody can account for, and
+            // CLOSE would vouch for them: replay would then refuse the
+            // crash it should survive. Such a log is left for recovery to
+            // judge. Checked under the lock a failing commit latches under.
+            if self.write_latched.load(Ordering::Acquire) {
+                wal.sync_data()?;
+            } else if let Err(err) = wal.close() {
+                drop(guard);
+                tracing::error!(error = %err, "closing the write-ahead log failed");
+                self.latch_wal_failure(&err);
+                return Err(err);
+            }
+        }
         // Signal under the mutex, join without it.
         //
         // A worker parked in `compaction_lock.read()` cannot exit until
@@ -3704,128 +3311,12 @@ impl RegolithEngine {
     }
 }
 
-/// Block-cache file id for the `n`-th source of one ingest call.
-///
-/// Live file ids are allocated upward from 1 by `next_file_id`, so ids
-/// taken from the top of the space cannot collide with a real file, and
-/// distinct sources cannot collide with each other.
 /// Whether a drain must flush the active memtable unconditionally, or
 /// only once it has grown past the write buffer.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ActiveFlush {
     WhenFull,
     Always,
-}
-
-fn ingest_probe_file_id(source_idx: usize) -> u64 {
-    u64::MAX - source_idx as u64
-}
-
-/// Drops the ingest sources' blocks from the shared block cache when the
-/// ingest call returns, by any path.
-///
-/// Source blocks are read twice (validate, then rewrite) and are useless
-/// afterwards, so leaving them resident would hold block-cache budget for
-/// bytes no reader can ask for again.
-struct IngestCacheGuard<'a> {
-    cache: &'a BlockCache,
-    sources: usize,
-}
-
-impl<'a> IngestCacheGuard<'a> {
-    fn new(cache: &'a BlockCache, sources: usize) -> Self {
-        Self { cache, sources }
-    }
-}
-
-impl Drop for IngestCacheGuard<'_> {
-    fn drop(&mut self) {
-        for source_idx in 0..self.sources {
-            self.cache.evict_file(ingest_probe_file_id(source_idx));
-        }
-    }
-}
-
-/// The table one ingest source was installed as, kept for the listeners
-/// and the log that run once the pipeline mutex is released.
-struct IngestedTable {
-    file_id: u64,
-    path: PathBuf,
-    level: usize,
-    file_size: u64,
-    num_entries: u64,
-}
-
-/// A validated ingest source: an open reader plus its user-key range.
-struct IngestSource {
-    path: PathBuf,
-    reader: SsTableReader,
-    smallest: Vec<u8>,
-    largest: Vec<u8>,
-}
-
-#[cfg(test)]
-thread_local! {
-    /// Test seam: runs once, on this thread, right after the next ingest
-    /// has taken its sequence and before it installs its table.
-    /// Thread-local so a parallel test never fires another test's hook.
-    static AFTER_INGEST_SEQ: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
-        const { std::cell::RefCell::new(None) };
-}
-
-/// Test-only: run `hook` once, on this thread, right after the next ingest
-/// has taken its sequence and before it installs its table.
-#[cfg(test)]
-pub(crate) fn after_next_ingest_seq(hook: impl FnOnce() + 'static) {
-    AFTER_INGEST_SEQ.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
-}
-
-/// Choose the target level for an ingest file covering the user-key
-/// range `[smallest, largest]`. Returns L0 when the range overlaps any
-/// existing file at any level; otherwise walks upward from the
-/// bottommost non-empty level and picks the deepest level whose files
-/// are all strictly disjoint from the input range. Level 0 is the
-/// fallback when every other level also overlaps or when every level
-/// is empty.
-///
-/// When `ingest_behind` is true the target is forced to the
-/// bottommost level (MAX_LEVELS-1) and the call errors if any file at
-/// any level overlaps the input range.
-fn compute_target_level(
-    version: &manifest::Version,
-    smallest: &[u8],
-    largest: &[u8],
-    ingest_behind: bool,
-) -> std::io::Result<usize> {
-    let overlaps_level = |level: usize| -> bool {
-        version.levels[level].iter().any(|f| {
-            f.meta.smallest_key.as_slice() <= largest && f.meta.largest_key.as_slice() >= smallest
-        })
-    };
-
-    if ingest_behind {
-        for level in 0..manifest::MAX_LEVELS {
-            if overlaps_level(level) {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "ingest_behind: input range overlaps existing SSTable",
-                ));
-            }
-        }
-        return Ok(manifest::MAX_LEVELS - 1);
-    }
-
-    // Any overlap at any level → land at L0. L0 is the only level
-    // that tolerates overlapping files, so this is the only safe
-    // destination when the ingest range is not disjoint from the
-    // existing tree.
-    for level in 0..manifest::MAX_LEVELS {
-        if overlaps_level(level) {
-            return Ok(0);
-        }
-    }
-    // Every level is disjoint (or empty): land at the deepest level.
-    Ok(manifest::MAX_LEVELS - 1)
 }
 
 /// A consistent snapshot of on-disk state captured by
@@ -3973,48 +3464,6 @@ fn next_wal_id(manifest_next_file_id: u64, wal_files: &[PathBuf]) -> u64 {
         .filter_map(|path| wal_file_id(path))
         .map(|id| id.saturating_add(1))
         .fold(manifest_next_file_id, u64::max)
-}
-
-/// Refuse an open where a WAL file dropped a tail while a *later* WAL
-/// file still yielded records.
-///
-/// `Wal::replay` judges one file's bytes and reports the discard rather
-/// than deciding, because the torn-tail rule is only sound for the newest
-/// file that contributes to replay. A torn write leaves nothing after it
-/// anywhere, so records in a later file are proof that the earlier file's
-/// missing tail is damage in the middle of the history. Opening on it
-/// would serve a state that never existed: later writes present, earlier
-/// acknowledged ones gone.
-fn reject_tail_discard_before_live_wal(
-    wal_files: &[PathBuf],
-    entries_per_file: &[usize],
-    discarded_tails: &[(PathBuf, u64, u64)],
-) -> std::io::Result<()> {
-    for (path, offset, discarded_bytes) in discarded_tails {
-        let Some(index) = wal_files.iter().position(|p| p == path) else {
-            continue;
-        };
-        let later = entries_per_file
-            .iter()
-            .enumerate()
-            .skip(index + 1)
-            .find(|(_, count)| **count > 0);
-        let Some((later_index, later_count)) = later else {
-            continue;
-        };
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!(
-                "{} is corrupt: the WAL record at offset {offset} is incomplete, but {later_count} \
-                 later WAL record(s) follow it in {}, so the {discarded_bytes} discarded byte(s) \
-                 are damage in the middle of the history rather than a torn write. Refusing to \
-                 open rather than serve a state that never existed.",
-                path.display(),
-                wal_files[later_index].display(),
-            ),
-        ));
-    }
-    Ok(())
 }
 
 fn apply_replayed_wal_entry(memtable: &MemTable, entry: WalEntry) -> u64 {

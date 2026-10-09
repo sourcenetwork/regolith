@@ -84,6 +84,10 @@ struct BackupFileEntry {
     smallest_key: Vec<u8>,
     largest_key: Vec<u8>,
     num_entries: u64,
+    /// The sequence an ingested table's entries read at, which lives in
+    /// the manifest and not in the file. Without it a restored ingested
+    /// table would read at the sequences the file stores.
+    global_seq: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -97,8 +101,12 @@ struct BackupManifest {
 /// Identifier at the head of a backup manifest: `REGOMBKP`.
 const BACKUP_MANIFEST_MAGIC: [u8; 8] = *b"REGOMBKP";
 
-/// On-disk backup manifest version.
-const BACKUP_MANIFEST_VERSION: u32 = 2;
+/// On-disk backup manifest version. Version 3 adds each table's ingest
+/// sequence, 0 for none; a version 2 manifest has none and still reads.
+const BACKUP_MANIFEST_VERSION: u32 = 3;
+
+/// The oldest backup manifest version this build reads.
+const BACKUP_MANIFEST_OLDEST_VERSION: u32 = 2;
 
 impl BackupEngine {
     /// Open or create a backup repository at `backup_dir` on the
@@ -172,6 +180,7 @@ impl BackupEngine {
                         smallest_key: file.meta.smallest_key.clone(),
                         largest_key: file.meta.largest_key.clone(),
                         num_entries: file.meta.num_entries,
+                        global_seq: file.meta.global_seq,
                     });
                 }
             }
@@ -249,7 +258,7 @@ impl BackupEngine {
             copy_file_atomic(&*self.env, &src, &dst).map_err(Error::from)?;
         }
 
-        let manifest_bytes = encode_engine_manifest(&manifest);
+        let manifest_bytes = encode_engine_manifest(&manifest).map_err(Error::from)?;
         let manifest_path = target_dir.join("MANIFEST");
         atomic_write(&*self.env, &manifest_path, &manifest_bytes).map_err(Error::from)?;
         Ok(())
@@ -458,6 +467,7 @@ fn encode_manifest(m: &BackupManifest) -> Vec<u8> {
         body.extend_from_slice(&f.smallest_key);
         body.extend_from_slice(&(f.largest_key.len() as u32).to_le_bytes());
         body.extend_from_slice(&f.largest_key);
+        body.extend_from_slice(&f.global_seq.unwrap_or(0).to_le_bytes());
     }
     let checksum = checksum::backup_manifest(&body);
     let mut out = Vec::with_capacity(body.len() + 8);
@@ -489,7 +499,7 @@ fn decode_manifest(data: &[u8]) -> io::Result<BackupManifest> {
     }
     let mut p = BACKUP_MANIFEST_MAGIC.len();
     let version = read_u32(body, &mut p)?;
-    if version != BACKUP_MANIFEST_VERSION {
+    if !(BACKUP_MANIFEST_OLDEST_VERSION..=BACKUP_MANIFEST_VERSION).contains(&version) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("unsupported backup manifest version {version}"),
@@ -508,6 +518,11 @@ fn decode_manifest(data: &[u8]) -> io::Result<BackupManifest> {
         let hash = read_u128(body, &mut p)?;
         let smallest_key = read_var_bytes(body, &mut p)?;
         let largest_key = read_var_bytes(body, &mut p)?;
+        // Sequences start at 1, so 0 is the encoding of "none".
+        let global_seq = match version {
+            BACKUP_MANIFEST_OLDEST_VERSION => None,
+            _ => Some(read_u64(body, &mut p)?).filter(|&seq| seq != 0),
+        };
         files.push(BackupFileEntry {
             level,
             file_id,
@@ -516,6 +531,7 @@ fn decode_manifest(data: &[u8]) -> io::Result<BackupManifest> {
             hash,
             smallest_key,
             largest_key,
+            global_seq,
         });
     }
     Ok(BackupManifest {
@@ -563,54 +579,27 @@ fn read_var_bytes(data: &[u8], p: &mut usize) -> io::Result<Vec<u8>> {
     Ok(v)
 }
 
-/// Encode a restored backup as an engine-compatible MANIFEST stream.
-///
-/// The stamp comes from [`VersionSet::encode_stamp`] so a restored
-/// manifest cannot drift from the one the engine writes. The records
-/// use the legacy single-edit frames understood by the engine:
-/// `[len u32][body][cksum u32]`, with the same checksum as the batched
-/// frames written by [`crate::engine::manifest`].
-fn encode_engine_manifest(m: &BackupManifest) -> Vec<u8> {
-    const TAG_ADD_FILE: u8 = 1;
-    const TAG_LAST_SEQ: u8 = 3;
-    const TAG_NEXT_FILE_ID: u8 = 4;
-
-    let mut records: Vec<Vec<u8>> = Vec::new();
-    {
-        let mut r = Vec::new();
-        r.push(TAG_NEXT_FILE_ID);
-        r.extend_from_slice(&m.next_file_id.to_le_bytes());
-        records.push(r);
-    }
-    {
-        let mut r = Vec::new();
-        r.push(TAG_LAST_SEQ);
-        r.extend_from_slice(&m.last_seq.to_le_bytes());
-        records.push(r);
-    }
-    for f in &m.files {
-        let mut r = Vec::new();
-        r.push(TAG_ADD_FILE);
-        r.extend_from_slice(&f.level.to_le_bytes());
-        r.extend_from_slice(&f.file_id.to_le_bytes());
-        r.extend_from_slice(&(f.smallest_key.len() as u32).to_le_bytes());
-        r.extend_from_slice(&f.smallest_key);
-        r.extend_from_slice(&(f.largest_key.len() as u32).to_le_bytes());
-        r.extend_from_slice(&f.largest_key);
-        r.extend_from_slice(&f.file_size.to_le_bytes());
-        r.extend_from_slice(&f.num_entries.to_le_bytes());
-        records.push(r);
-    }
-
-    let mut out = crate::engine::manifest::VersionSet::encode_stamp().to_vec();
-    for record_buf in &records {
-        let len = record_buf.len() as u32;
-        let checksum = checksum::manifest_record(len, record_buf);
-        out.extend_from_slice(&len.to_le_bytes());
-        out.extend_from_slice(record_buf);
-        out.extend_from_slice(&checksum.to_le_bytes());
-    }
-    out
+/// Encode a restored backup as an engine MANIFEST, through the engine's own
+/// encoder so a restored manifest cannot drift from the one it writes.
+fn encode_engine_manifest(m: &BackupManifest) -> io::Result<Vec<u8>> {
+    crate::engine::manifest::encode_manifest_image(
+        m.next_file_id,
+        m.last_seq,
+        0,
+        m.files.iter().map(|f| {
+            (
+                f.level as usize,
+                crate::engine::sstable::SsTableMeta {
+                    file_id: f.file_id,
+                    smallest_key: f.smallest_key.clone(),
+                    largest_key: f.largest_key.clone(),
+                    file_size: f.file_size,
+                    num_entries: f.num_entries,
+                    global_seq: f.global_seq,
+                },
+            )
+        }),
+    )
 }
 
 #[cfg(test)]
@@ -702,6 +691,62 @@ mod tests {
 
         let reopened = Db::open(tgt_dir.path(), Options::default()).unwrap();
         assert_has(&reopened, "k", 300);
+    }
+
+    #[test]
+    fn an_ingested_table_restores_at_its_recorded_sequence() {
+        let src_dir = TempDir::new().unwrap();
+        let bkp_dir = TempDir::new().unwrap();
+        let tgt_dir = TempDir::new().unwrap();
+        let db = Db::open(src_dir.path(), Options::default()).unwrap();
+        db.put(b"k", b"old").unwrap();
+        db.compact_range(None, None).unwrap();
+        let source = src_dir.path().join("source.sst");
+        let mut writer = crate::SstFileWriter::create(&source, &Options::default()).unwrap();
+        writer.put(b"k", b"new").unwrap();
+        writer.finish().unwrap();
+        // Lands above the old table, and stays uncompacted, so the restore
+        // reads it through the sequence its manifest record carries.
+        db.ingest_external_files(&[source], crate::IngestOptions::default())
+            .unwrap();
+
+        let mut engine = BackupEngine::open(bkp_dir.path()).unwrap();
+        let id = engine.create_backup(&db).unwrap();
+        engine.restore(id, tgt_dir.path()).unwrap();
+        let restored = Db::open(tgt_dir.path(), Options::default()).unwrap();
+        assert_eq!(restored.get(b"k").unwrap().as_deref(), Some(&b"new"[..]));
+    }
+
+    #[test]
+    fn a_version_2_backup_manifest_still_reads() {
+        let manifest = BackupManifest {
+            created_at_unix: 1,
+            files: vec![BackupFileEntry {
+                level: 6,
+                file_id: 9,
+                file_size: 100,
+                hash: 7,
+                smallest_key: b"a".to_vec(),
+                largest_key: b"b".to_vec(),
+                num_entries: 2,
+                global_seq: Some(5),
+            }],
+            next_file_id: 10,
+            last_seq: 5,
+        };
+        let current = decode_manifest(&encode_manifest(&manifest)).unwrap();
+        assert_eq!(current.files[0].global_seq, Some(5));
+
+        // Version 2: the same body with no sequence per table.
+        let mut body = encode_manifest(&manifest);
+        body.truncate(body.len() - 8 - 8);
+        let at = BACKUP_MANIFEST_MAGIC.len();
+        body[at..at + 4].copy_from_slice(&2u32.to_le_bytes());
+        let checksum = checksum::backup_manifest(&body);
+        body.extend_from_slice(&checksum.to_le_bytes());
+        let older = decode_manifest(&body).unwrap();
+        assert_eq!(older.files[0].global_seq, None);
+        assert_eq!(older.files[0].largest_key, b"b");
     }
 
     #[test]

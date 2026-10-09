@@ -96,6 +96,7 @@ pub use error::Error;
 pub use event_listener::{
     BackgroundErrorReason, CompactionJobInfo, EventListener, ExternalFileIngestionInfo,
     FlushJobInfo, TableFileCreationInfo, TableFileCreationReason, TableFileDeletionInfo,
+    WalTailDiscardedInfo,
 };
 pub use iter::Iter;
 pub use log_layout::LogLayout;
@@ -1567,22 +1568,25 @@ impl Db {
     }
 
     /// Bulk-ingest one or more externally-built SSTable files. Each
-    /// file must have been produced by [`SstFileWriter`]; on success
-    /// every ingested file is placed at the appropriate level and its
-    /// keys become visible to new reads and iterators. See
-    /// [`IngestOptions`] for the snapshot-consistency and placement
-    /// rules.
+    /// file must have been produced by [`SstFileWriter`], or hold at most
+    /// one entry per key as it does; a file holding a key twice is
+    /// refused. On success every ingested file is placed at the
+    /// appropriate level and its keys become visible to new reads and
+    /// iterators. See [`IngestOptions`] for the snapshot-consistency,
+    /// placement and move rules.
     ///
-    /// The source files are left untouched on disk - the engine
-    /// re-emits each file into the database's own SSTable directory
-    /// so it can rewrite entry sequence numbers. Callers may delete
-    /// the source files or re-ingest them at any time.
-    ///
-    /// The call waits for any flush already in progress, and writes wait
-    /// while each file is rewritten and installed, so the ingested entries
-    /// order after every write acknowledged before the call and before
-    /// every write acknowledged after it, and no snapshot sees them appear
-    /// under it.
+    /// Each file takes a fresh sequence number, and every entry in it
+    /// reads at that sequence. The file is not rewritten: it is copied
+    /// into the database's own SSTable directory, or linked when
+    /// [`IngestOptions::move_files`] is set, with no lock held, so writers
+    /// never wait for the copy. They wait only for the flush of a memtable
+    /// holding a key of the file's range, when there is one, and for the
+    /// manifest edit that installs the file. So the ingested entries order
+    /// after every write acknowledged before the call and before every
+    /// write acknowledged after it, no snapshot sees them appear under it,
+    /// and a write running alongside the call orders on one side of it.
+    /// Files are installed one at a time, each at its own sequence; an
+    /// error leaves the files before it installed.
     pub fn ingest_external_files(
         &self,
         files: &[std::path::PathBuf],
@@ -1601,6 +1605,14 @@ impl Db {
     /// After a successful close, result-returning operations on this
     /// handle fail with [`Error::Closed`]. Calling `close` more than
     /// once is allowed.
+    ///
+    /// Close syncs the write-ahead log and ends it with a record saying it
+    /// is complete, so every write survives a power cut after `close`
+    /// returns, under either durability mode. A close whose sync fails
+    /// returns the error and leaves the database refusing writes until it
+    /// is reopened, since what reached the device is unknown; the next
+    /// open recovers it as it would after a crash. A database dropped
+    /// without `close` is recovered the same way.
     ///
     /// A transaction still open when `close` begins is aborted: its
     /// [`Transaction::on_abort`](crate::Transaction::on_abort) callbacks and
@@ -3365,17 +3377,15 @@ mod tests {
         batch.put(b"b", b"2");
         db.write(batch).unwrap();
 
-        // Records begin after the file stamp; the type byte is the fifth
-        // byte of the first record.
-        let stamp = crate::engine::wal::WAL_STAMP_LEN;
+        // One group record after the stamp holds both operations, so
+        // replay restores the batch whole or not at all.
+        use crate::engine::wal_frame::{HEADER_LEN, KIND_GROUP, STAMP_LEN};
         let wal = std::fs::read(first_wal_path(&dir)).unwrap();
-        assert!(wal.len() >= stamp + 5);
         assert_eq!(&wal[0..4], b"REGO", "the log must carry its stamp");
-        assert_eq!(
-            wal[stamp + 4],
-            0x05,
-            "multi-op WriteBatch must use RECORD_BATCH"
-        );
+        assert_eq!(wal[STAMP_LEN + 4], KIND_GROUP);
+        let len = u32::from_le_bytes(wal[STAMP_LEN..STAMP_LEN + 4].try_into().unwrap()) as usize;
+        assert_eq!(STAMP_LEN + HEADER_LEN + len, wal.len(), "one record");
+        assert!(len > 2 * 4, "the record holds both operations");
     }
 
     #[test]
@@ -4018,19 +4028,23 @@ mod tests {
     #[test]
     fn test_gc_preserves_tombstone_hiding_older_entries() {
         // A tombstone newer than any live snapshot still needs to
-        // survive compaction - it's the newest version and reads
-        // must resolve to "deleted".
+        // survive compaction while it hides an older version that
+        // survives with it: here one a snapshot below it keeps, which
+        // reads must still resolve to "deleted" at the head. With
+        // nothing left beneath it, it retires (E27).
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), tiny_flush_opts()).unwrap();
 
         for v in 0..5 {
             db.put(b"k", format!("v{}", v).as_bytes()).unwrap();
         }
+        let before = db.snapshot();
         db.delete(b"k").unwrap();
 
         db.compact_range(None, None).unwrap();
 
         assert_eq!(db.get(b"k").unwrap(), None);
+        assert_eq!(before.get(b"k").unwrap(), Some(b"v4".to_vec()));
 
         // The newest surviving version is a tombstone - look for it
         // on disk.
@@ -4361,6 +4375,9 @@ mod tests {
         db.put(b"y", b"old-right").unwrap();
         db.compact_range(None, None).unwrap();
 
+        // A snapshot older than the tombstone holds it at the bottom level,
+        // where it would otherwise retire (E27), so the pass writes it out.
+        let before = db.snapshot();
         db.delete_range(b"a", b"z").unwrap();
         db.put(b"m", b"new").unwrap();
         db.compact_range(None, None).unwrap();
@@ -4368,6 +4385,7 @@ mod tests {
         assert_eq!(db.get(b"b").unwrap(), None);
         assert_eq!(db.get(b"m").unwrap(), Some(b"new".to_vec()));
         assert_eq!(db.get(b"y").unwrap(), None);
+        assert_eq!(before.get(b"b").unwrap(), Some(b"old-left".to_vec()));
 
         let version = db.engine.current_version();
         let rt_only_files = version

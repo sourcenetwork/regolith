@@ -33,12 +33,17 @@
 //!
 //! # Crash behaviour
 //!
-//! Contents are written before the header, and the header is rewritten
-//! only on `sync_all` or `sync_dir`. A crash between the two loses the
-//! tail of the file, which is the case regolith already handles: a torn WAL
-//! tail fails its per-record checksum during replay, and an SSTable only
-//! enters a version after the manifest edit that references it, so a torn
-//! SSTable is an unreferenced orphan.
+//! Contents are written before the header, and the header, which records
+//! the logical length, is rewritten only when the file is synced, then
+//! flushed with the contents in one `flush`. That flush does not order
+//! them: a crash during it can persist the new length before the bytes it
+//! covers, which then read back as whatever the slot held there.
+//! regolith handles both shapes. A WAL tail past its last completed sync,
+//! torn, zeroed or garbled alike, is dropped and reported by format 2
+//! replay, and a record copied from a slot's earlier contents never
+//! verifies, since each record's header check is bound to its log's nonce
+//! and its own offset. An SSTable only enters a version after the manifest
+//! edit that references it, so a torn SSTable is an unreferenced orphan.
 //!
 //! Rename is crash-safe without an atomic rename primitive, which OPFS
 //! does not offer. The destination binding is written to the source slot
