@@ -1648,6 +1648,13 @@ impl Db {
     /// does not require this wait, and a database closed with snapshots
     /// live is consistent, just not tidy.
     ///
+    /// The timeout is measured on the clock of [`Options::env`]. Where the
+    /// env has no clock the wait is one wait of `timeout`, ended early by
+    /// the last release. On a target with a single thread (wasm without
+    /// the `atomics` feature) nothing can release a pin while this call
+    /// waits, so it returns the count at once without waiting: release the
+    /// snapshots first, then call it.
+    ///
     /// ```
     /// # use std::time::Duration;
     /// # use regolith::{Db, Options};
