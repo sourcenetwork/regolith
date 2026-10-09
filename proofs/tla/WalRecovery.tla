@@ -62,9 +62,30 @@
 \* reports every byte it held: the outcome of the crash state in which
 \* every record is unusable, which CrashStates holds whenever synced = 0.
 \* Every invariant below is checked against that outcome, so the model
-\* needs no state of its own for it. (With AEAD the stamp is sealed and
-\* synced at creation, RED StampNotSealed; the engine has no encryption
-\* at rest yet.)
+\* needs no state of its own for it.
+\*
+\* THE ENGINE UNDER AEAD (Frame = "AEAD"; src/engine/wal_seal.rs, with
+\* Options::key_provider set).
+\*   Usable         a sealed record is usable when its header check holds
+\*                  and its AES-256-GCM-SIV tag verifies under the key the
+\*                  stamp names (wal_seal::open_record); the tag's
+\*                  associated data is the header check's input, so it
+\*                  binds the payload to `st`, the offset and the log. The
+\*                  scan past damage (wal_frame::proof_past) reads P only
+\*                  from records whose tag verifies.
+\*   StampOk        the stamp is sealed under the log's key: a stamp whose
+\*                  tag fails refuses the open, naming the file
+\*                  (wal_seal::open_stamp), so a wrong key refuses and
+\*                  never drops the log (WrongKeyRefuses).
+\*   Init, Rotate   the log the model creates with its stamp already
+\*                  synced: the engine writes the sealed stamp to a staging
+\*                  file, syncs it, renames it into place and syncs the
+\*                  directory (wal_seal::create_durably) before the log
+\*                  takes a record, so a crash leaves no log or one whose
+\*                  whole stamp is durable (RED StampNotSealed).
+\*   keyOk = FALSE  a provider handing other bytes under the key id the
+\*                  stamp names; a key id it does not provide at all is
+\*                  refused before any tag is checked (Error::UnknownKey).
 \*
 \* WHAT A CRASH LEAVES (the crash states, `CrashStates`).
 \*   - Under powersafe overwrite (D6: assumed, synced groups are not padded
