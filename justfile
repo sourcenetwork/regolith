@@ -275,7 +275,14 @@ loom:
 loom-debug:
     RUSTFLAGS="--cfg loom" cargo test --test loom_memtable
 
-loom-all: loom loom-debug
+# Loom models for `regolith::sync`: every primitive's wait protocol,
+# with two calibrations that must fail. Release only: the three-thread
+# models explore 0.2 to 0.5 million interleavings each, which a debug
+# build multiplies several times over.
+loom-sync:
+    RUSTFLAGS="--cfg loom" cargo test --release --test loom_sync
+
+loom-all: loom loom-debug loom-sync
 
 # The read-view chaos workload at full size: 6 instances x 2 rounds x 400
 # versions. Measured at over 20 minutes wall and 4h of CPU unoptimized,

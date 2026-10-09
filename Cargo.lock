@@ -806,6 +806,7 @@ dependencies = [
  "kovan-channel",
  "kovan-map",
  "kovan-queue",
+ "libc",
  "loom",
  "lz4_flex",
  "portable-atomic",

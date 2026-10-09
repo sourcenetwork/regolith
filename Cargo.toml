@@ -107,6 +107,11 @@ wasm-bindgen-test = "0.3"
 criterion = { version = "0.5", features = ["html_reports"] }
 proptest = "1"
 
+# `tests/sync_no_syscall.rs` installs a seccomp filter around the
+# `regolith::sync` hot loops; seccomp is Linux-only.
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+libc = "0.2"
+
 # The test suite is compute-bound: compaction merges, checksums, bloom
 # hashing and skip-list walks, driven millions of times by the
 # adversarial and property tests. Unoptimized those dominate the gate's
