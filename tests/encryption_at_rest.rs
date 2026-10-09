@@ -706,7 +706,9 @@ fn a_backup_holding_an_ingested_table_restores_under_the_keys() {
     let id = engine.create_backup(&db).unwrap();
     drop(db);
     let restored = TempDir::new().unwrap();
-    engine.restore(id, restored.path()).unwrap();
+    engine
+        .restore(id, restored.path(), Some(keys.clone()))
+        .unwrap();
     assert!(matches!(
         Db::open(restored.path(), Options::default()),
         Err(Error::KeyProviderRequired)
@@ -744,7 +746,9 @@ fn checkpoints_and_backups_of_an_encrypted_database_open_under_its_keys() {
     drop(db);
 
     let restored = TempDir::new().unwrap();
-    engine.restore(id, restored.path()).unwrap();
+    engine
+        .restore(id, restored.path(), Some(keys.clone()))
+        .unwrap();
     for at in [checkpoint_dir.as_path(), restored.path()] {
         assert!(matches!(
             Db::open(
