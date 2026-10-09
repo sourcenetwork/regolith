@@ -420,7 +420,8 @@ tla:
     check MC_IngestPublication_Green                   GREEN
     check MC_IngestPublication_Red_CommitPassesSlot    RED RepeatableSnapshot
     check MC_IngestPublication_Red_IngestPublishesEarly RED RepeatableSnapshot
-    # D48: an ingest syncs the log before its manifest record. TLC only.
+    # D48: an ingest syncs the log before its manifest record. Lean:
+    # Regolith/IngestDurability.lean, surviving_ingest_keeps_prefix.
     spec=IngestDurability
     check MC_IngestDurability_Green                    GREEN
     check MC_IngestDurability_Red_NoLogSync            RED GapFreePrefix
@@ -488,6 +489,18 @@ tla:
     check MC_WalRecovery_Red_CloseWithoutSync          RED RecoveryOpens
     check MC_WalRecovery_Red_NoTruncate                RED RecoveryOpens
     check MC_WalRecovery_Red_StampNotSealed            RED AckedSurvive
+    # E29, E30: the manifest's torn end and the logs a flush retires. Lean:
+    # Regolith/ManifestRecovery.lean, crash_never_proves, replay_keeps_synced,
+    # replay_never_above_newer_table.
+    spec=ManifestRecovery
+    check MC_ManifestRecovery_Green                    GREEN
+    check MC_ManifestRecovery_Green_Refuses            RED NeverRefusesRot
+    check MC_ManifestRecovery_Red_OldGuard             RED RecoveryOpens
+    check MC_ManifestRecovery_Red_NoSyncBeforeNext     RED RecoveryOpens
+    check MC_ManifestRecovery_Red_UnlinkBeforeSync     RED AckedSurvive
+    check MC_ManifestRecovery_Red_RetireBeforeTable    RED AckedSurvive
+    check MC_ManifestRecovery_Red_NoMinWalId           RED ReadsNewest
+    check MC_ManifestRecovery_Red_IgnoreProof          RED RotSafe
     # 4.8, E5: compaction per snapshot stripe. Lean: Regolith/Stripes.lean,
     # reduce_reads.
     spec=StripeCompaction
@@ -499,7 +512,7 @@ tla:
     check MC_StripeCompaction_Red_IgnoreStripes        RED SnapshotReadsKept
     # E27: a pass retires a range tombstone below its range and every
     # snapshot. Green_Retires is the witness that the fix retires at all.
-    # TLC only.
+    # Lean: Regolith/TombstoneRetirement.lean, retire_keeps_reads.
     spec=TombstoneRetirement
     check MC_TombstoneRetirement_Green                 GREEN
     check MC_TombstoneRetirement_Green_Retires         RED NothingRetired
