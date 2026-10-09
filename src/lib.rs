@@ -62,6 +62,7 @@ mod backup;
 mod checkpoint;
 mod column_family;
 mod conflict;
+mod encryption;
 mod engine;
 pub mod env;
 mod error;
@@ -88,6 +89,7 @@ pub use backup::{BackupEngine, BackupId, BackupInfo};
 pub use checkpoint::Checkpoint;
 pub use column_family::{ColumnFamilyHandle, DEFAULT_CF_NAME};
 pub use conflict::{Access, Conflict, WriteKind};
+pub use encryption::{KeyId, KeyMaterial, KeyProvider};
 pub use engine::compaction::CompactionOutcome;
 #[cfg(target_os = "wasi")]
 pub use env::WasiEnv;
@@ -126,8 +128,9 @@ pub use transaction::{
 pub mod prelude {
     pub use crate::{
         AbortReason, CommitInfo, CommitReceipt, Conflict, Db, IsolationLevel, KeyClass,
-        KeyClassifier, LogLayout, MergeOperator, OptimisticTransactionDb, Options, RetryPolicy,
-        TransactError, Transaction, TransactionError, TransactionHooks, TxResult, TxnOptions,
+        KeyClassifier, KeyId, KeyMaterial, KeyProvider, LogLayout, MergeOperator,
+        OptimisticTransactionDb, Options, RetryPolicy, TransactError, Transaction,
+        TransactionError, TransactionHooks, TxResult, TxnOptions,
     };
 }
 pub use ttl::{DbWithTtl, TtlCompactionFilter, strip_timestamp};
@@ -179,6 +182,7 @@ pub mod fuzzing {
                 &crate::env::std_env(),
                 path,
                 crate::engine::wal_replay::WalPosition::Newest,
+                None,
             ) else {
                 return;
             };
@@ -196,6 +200,7 @@ pub mod fuzzing {
                 path,
                 0,
                 crate::engine::sstable::MetadataPolicy::Pinned,
+                None,
             );
         });
     }
@@ -1260,6 +1265,13 @@ impl Db {
     /// L0 first. The call blocks until the requested compaction work
     /// is finished and is serialized with the background compaction
     /// scheduler so the two paths can't fight over the same inputs.
+    ///
+    /// On a database encrypted at rest ([`Options::key_provider`]) it also
+    /// re-seals the whole database, whatever the range: every table not
+    /// sealed under the provider's current key, the active write-ahead log,
+    /// and a manifest holding a batch under another key are rewritten under
+    /// it. This is the one-time re-encryption after encryption is turned on
+    /// and after a key rotation; once it returns, no file names another key.
     pub fn compact_range(&self, start: Option<&[u8]>, end: Option<&[u8]>) -> Result<()> {
         self.ensure_writable()?;
         if let Some(start) = start {

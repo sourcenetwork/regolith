@@ -98,6 +98,20 @@ pub enum Error {
     /// [`crate::Transaction::append`] writes the keys of a commit-ordered log.
     #[error("this key belongs to a commit-ordered log; write it with append")]
     LogKeyWrite,
+    /// The database is encrypted at rest and was opened without a key
+    /// provider. Set [`crate::Options::key_provider`] to the provider it was
+    /// written with.
+    #[error("this database is encrypted; open it with Options::key_provider")]
+    KeyProviderRequired,
+    /// A file names a key the [`crate::KeyProvider`] does not provide, or the
+    /// provider's current key is one it does not provide. Nothing sealed
+    /// under that key can be read, and no file can be sealed, until the
+    /// provider provides it.
+    #[error("the key provider does not provide key id {id}, which this database needs")]
+    UnknownKey {
+        /// The key id the provider returned no key for.
+        id: crate::KeyId,
+    },
     /// An underlying I/O error from the filesystem or operating system.
     #[error("I/O error: {0}")]
     Io(#[source] std::io::Error),
@@ -144,7 +158,9 @@ impl Error {
             typed @ (Self::DataBlockLimitExceeded { .. }
             | Self::Busy(_)
             | Self::ContentMismatch
-            | Self::CallbackPanicked { .. }) => std::io::Error::other(typed),
+            | Self::CallbackPanicked { .. }
+            | Self::KeyProviderRequired
+            | Self::UnknownKey { .. }) => std::io::Error::other(typed),
             other => std::io::Error::other(other.to_string()),
         }
     }
@@ -167,11 +183,19 @@ fn carried(err: &std::io::Error) -> Option<Error> {
             callback,
             latched: *latched,
         }),
+        Error::KeyProviderRequired => Some(Error::KeyProviderRequired),
+        Error::UnknownKey { id } => Some(Error::UnknownKey { id: *id }),
         _ => None,
     }
 }
 
 impl Error {
+    /// Whether `err` carries a typed variant, which context added around it
+    /// must not flatten into a plain message.
+    pub(crate) fn is_typed(err: &std::io::Error) -> bool {
+        carried(err).is_some()
+    }
+
     /// The trait named by the [`Error::CallbackPanicked`] that `err` carries,
     /// if it carries one.
     pub(crate) fn callback_panic_of(err: &std::io::Error) -> Option<&'static str> {
@@ -254,6 +278,10 @@ mod tests {
             },
             Error::DataBlockLimitExceeded {
                 max_data_block_bytes: 4096,
+            },
+            Error::KeyProviderRequired,
+            Error::UnknownKey {
+                id: crate::KeyId(9),
             },
         ] {
             let text = typed.to_string();

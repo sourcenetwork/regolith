@@ -64,6 +64,15 @@ xxhash-rust = { version = "0.8", features = ["xxh3"] }
 tracing = "0.1"
 thiserror = "1.0"
 
+# Encryption at rest (`Options::key_provider`). AES-256-GCM-SIV from
+# RustCrypto: pure Rust, with AES-NI/CLMUL (x86) and the ARMv8 crypto
+# extensions detected at run time, and constant-time software AES
+# elsewhere (wasm32, armv7). `zeroize` wipes a cached key schedule when
+# it drops; `getrandom` draws each frame's nonce from the OS.
+aes-gcm-siv = { version = "0.12", default-features = false, features = ["aes", "zeroize"] }
+zeroize = "1"
+getrandom = "0.4"
+
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "1.1", features = ["fs"] }
 
@@ -83,6 +92,9 @@ loom = "0.7"
 js-sys = "0.3"
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
+# The browser has no OS randomness call; `wasm_js` reaches
+# `crypto.getRandomValues` instead.
+getrandom = { version = "0.4", features = ["wasm_js"] }
 
 [dev-dependencies]
 tempfile = "3.8"
