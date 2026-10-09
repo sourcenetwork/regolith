@@ -1,31 +1,24 @@
-//! Adversarial probe for the discarded-table open guard (the discarded-table open guard) under the
-//! tear modes a real filesystem produces that are not `Truncate`.
+//! A power cut inside a database's first flush, under every tear mode a
+//! real filesystem produces (E29).
 //!
-//! The guard dismisses an unreferenced table only when the file proves
-//! it holds nothing: it is zero bytes long, or its footer parses and its
-//! index block is empty. Everything else counts, and the open refuses.
+//! The cut leaves a table no durable manifest batch names, whole, zeroed or
+//! torn, beside a manifest whose unsynced tail is torn. ext4 with the
+//! blocks already allocated leaves zeros at full length, and a device that
+//! tears at sector granularity leaves a prefix followed by unrelated bytes.
 //!
-//! A power cut inside the first flush does not always leave a
-//! zero-length file. ext4 with the blocks already allocated leaves zeros
-//! at full length, and a device that tears at sector granularity leaves
-//! a prefix followed by unrelated bytes. Both keep every acknowledged
-//! write in the fsynced WAL, so ideally both would open. Neither can be
-//! told apart from a *complete* table whose tail a lost or misdirected
-//! write zeroed or garbled, and the manifest that would have said which
-//! is the thing that is damaged.
+//! The open used to refuse whenever such a table could hold data and the
+//! manifest named no table, because it could not tell this crash from a
+//! manifest whose first durable batch was later damaged. It now judges the
+//! manifest's end by the rule a write-ahead log's tail follows: no later
+//! batch proves the torn bytes were synced, so a crash left them, the table
+//! is no part of the database, and every acknowledged write is in the
+//! fsynced WAL. So every tear opens with every acknowledged write, and the
+//! orphan is removed by the next open that replays the manifest whole.
 //!
-//! So the two sides of the trade are:
-//!
-//! * dismiss the file and the open silently serves a database missing
-//!   everything a real table held;
-//! * count it and the open refuses loudly, names the file, deletes
-//!   nothing, and the operator moves it aside and recovers every
-//!   acknowledged write from the WAL.
-//!
-//! The second is the standing choice, because it is the recoverable one.
-//! `a_first_flush_cut_that_leaves_an_unprovable_orphan_refuses_and_salvages`
-//! measures its cost rather than hiding it, and is the regression gate
-//! for that contract.
+//! The refusal remains for what no crash produces: damage below a batch a
+//! later sync proves (`src/engine/manifest/tail_tests.rs`), and a manifest
+//! with no header beside a table that may hold data
+//! (`open_and_corruption.rs`, `adversarial_open_guard.rs`).
 
 // The whole file drives the `LD_PRELOAD` syscall shim, which exists
 // only on Linux: on macOS the loader equivalent is blocked by system
@@ -88,59 +81,35 @@ fn probe_opens(tear: TearMode) {
     }
 }
 
-/// A tear that leaves bytes the guard cannot prove empty must refuse,
-/// and the refusal must be recoverable: the error names the orphan, the
-/// orphan is left byte-for-byte on disk, and moving it aside brings back
-/// every acknowledged write.
-fn probe_refuses_and_salvages(tear: TearMode) {
+/// A tear that leaves an orphan whose bytes prove nothing still opens with
+/// every acknowledged write, leaves the orphan where it is, and the next
+/// open, which replays the manifest whole, removes it.
+fn probe_opens_and_sweeps(tear: TearMode) {
     let tmp = TempDir::new().unwrap();
     let db = tmp.path().join("db");
     let out = cut_first_flush(&db, tear);
     let orphans = fault::find_ssts(&db);
-    let before: Vec<u64> = orphans.iter().map(|p| fault::file_len(p)).collect();
     assert!(
-        !orphans.is_empty() && before.iter().all(|n| *n > 0),
-        "{tear:?} must leave a non-empty orphan for this probe, got {orphans:?} {before:?}",
+        !orphans.is_empty() && orphans.iter().all(|p| fault::file_len(p) > 0),
+        "{tear:?} must leave a non-empty orphan for this probe, got {orphans:?}",
     );
     assert!(out.acked_count() > 0, "no write was acknowledged");
 
-    let err = match fault::recover_and_validate(&db, opts(8 * 1024), &out.history) {
-        Recovery::RefusedToOpen(e) => e.to_string(),
-        Recovery::Recovered(_) => panic!(
-            "{tear:?}: an orphan that cannot be proved empty must not be dismissed; \
-             dismissing it opens the database without whatever the table held",
-        ),
-    };
-    for orphan in &orphans {
-        let name = orphan.file_name().unwrap().to_string_lossy().into_owned();
-        assert!(
-            err.contains(&name),
-            "{tear:?}: the refusal must name the file it is holding the database for: {err}",
-        );
-    }
-
-    let after: Vec<u64> = orphans.iter().map(|p| fault::file_len(p)).collect();
-    assert_eq!(
-        before, after,
-        "{tear:?}: a refused open must leave every orphan exactly as it found it",
-    );
-
-    let salvage = tmp.path().join("salvage");
-    fault::copy_tree(&db, &salvage);
-    for sst in fault::find_ssts(&salvage) {
-        std::fs::remove_file(&sst).unwrap();
-    }
-    match fault::recover_and_validate(&salvage, opts(8 * 1024), &out.history) {
-        Recovery::Recovered(r) => {
-            fault::assert_acked_survived(&r, &out.acked);
-            println!(
-                "{tear:?}: refused with {} acked write(s) behind it, all {} recovered after \
-                 moving the orphan aside",
-                out.acked_count(),
-                r.k,
-            );
+    match fault::recover_and_validate(&db, opts(8 * 1024), &out.history) {
+        Recovery::Recovered(r) => fault::assert_acked_survived(&r, &out.acked),
+        Recovery::RefusedToOpen(e) => {
+            panic!("{tear:?}: a first-flush cut is a crash's doing and must open: {e}")
         }
-        Recovery::RefusedToOpen(e) => panic!("{tear:?}: the salvage path also refused: {e}"),
+    }
+
+    let d = regolith::Db::open(&db, opts(8 * 1024))
+        .unwrap_or_else(|e| panic!("{tear:?}: the second open refused: {e}"));
+    drop(d);
+    for orphan in &orphans {
+        assert!(
+            !orphan.exists(),
+            "{tear:?}: the open that replays the manifest whole removes {orphan:?}",
+        );
     }
 }
 
@@ -149,31 +118,14 @@ fn a_first_flush_cut_that_tears_a_sector_keeps_every_acknowledged_write() {
     probe_opens(TearMode::TornSector);
 }
 
-/// The measured cost of the standing choice, recorded rather than
-/// hidden.
-///
 /// `TearMode::Zero` is the ext4 delayed-allocation shape and
-/// `TearMode::Garbage` is the harness's harshest synthetic one. Both
-/// leave an orphan the guard cannot prove empty, so both refuse, and
-/// every acknowledged write sits intact in the fsynced WAL behind a
-/// database that will not open until an operator moves the file aside.
-///
-/// That cost is real and this test measures it. It is taken because the
-/// alternative is worse and silent: a rule that dismissed either shape
-/// would also dismiss a *complete* table whose final block a lost write
-/// zeroed, and a wiped manifest next to one of those would open and
-/// serve a database missing everything that table held, with no error.
-/// `adv_review_g28_guard::a_real_table_whose_tail_block_was_zeroed_is_dismissed_at_sector_and_block_sizes`
-/// is the probe that holds that door shut, and
-/// `open_and_corruption::a_wiped_manifest_next_to_an_unreadable_orphan_table_refuses_to_open`
-/// and
-/// `adversarial_open_guard::a_truncated_but_non_empty_orphan_table_refuses_at_every_length`
-/// are the two that hold it shut for the truncated and unreadable
-/// shapes.
+/// `TearMode::Garbage` the harness's harshest synthetic one. Both leave an
+/// orphan whose bytes prove nothing about what it held; the manifest's end
+/// proves it is no part of the database.
 #[test]
-fn a_first_flush_cut_that_leaves_an_unprovable_orphan_refuses_and_salvages() {
-    probe_refuses_and_salvages(TearMode::Zero);
-    probe_refuses_and_salvages(TearMode::Garbage);
+fn a_first_flush_cut_that_leaves_an_unprovable_orphan_opens_with_every_acknowledged_write() {
+    probe_opens_and_sweeps(TearMode::Zero);
+    probe_opens_and_sweeps(TearMode::Garbage);
 }
 
 /// Convergence: after a zero-length orphan lets the open through, the

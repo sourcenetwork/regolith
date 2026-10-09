@@ -23,6 +23,7 @@ mod ingest_range_tests;
 mod ingest_window_tests;
 pub(crate) mod internal_key;
 pub(crate) mod iterator;
+pub(crate) mod log_retirement;
 pub(crate) mod lookup_key;
 #[cfg(loom)]
 pub mod loom_model;
@@ -69,10 +70,14 @@ use manifest::{VersionEdit, VersionSet};
 use memtable::{MemTable, MemTableConfig};
 
 const STOP_TOO_MANY_MEMTABLES: &str = "stop: too many memtables";
+use log_retirement::RetiredLogs;
 use read_horizon::ReadHorizon;
 pub(crate) use read_rule::ReadRule;
 use read_view::{ReadView, ReadViewCell, VersionStore};
-use recovery::{replay_logs, report_discarded_tail, rewrite_recovered_memtable_to_wal};
+use recovery::{
+    replay_logs, report_discarded_tail, report_dropped_manifest_tail,
+    rewrite_recovered_memtable_to_wal,
+};
 use skiplist::InsertHint;
 use snapshot_registry::SnapshotRegistry;
 use source_walk::Source;
@@ -511,6 +516,8 @@ pub(crate) struct RegolithEngine {
     wal_id: AtomicU64,
     sst_dir: PathBuf,
     wal_dir: PathBuf,
+    /// The logs flushes have put in tables, and whether a removal is owed.
+    retired_logs: RetiredLogs,
     compaction: Mutex<CompactionScheduler>,
     /// Engine-wide RwLock that coordinates foreground and background
     /// compaction. Background workers each hold a read lock so they
@@ -618,6 +625,9 @@ impl RegolithEngine {
 
         let version_set =
             VersionSet::open_with_policy(&env, db_dir, &sst_dir, options.metadata_policy())?;
+        if let Some(tail) = version_set.dropped_tail() {
+            report_dropped_manifest_tail(&options, version_set.manifest_path(), tail);
+        }
         let version = version_set.current();
         let latest_seq = version.last_seq;
 
@@ -649,16 +659,6 @@ impl RegolithEngine {
 
         rewrite_recovered_memtable_to_wal(&memtable, &mut wal)?;
 
-        for replayed_wal_path in &wal_files {
-            if replayed_wal_path != &wal_path {
-                match Wal::remove_in(&*env, replayed_wal_path) {
-                    Ok(()) => {}
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(e) => return Err(e),
-                }
-            }
-        }
-
         let versions = Arc::new(VersionStore::new(version_set));
         let view = Arc::new(ReadViewCell::new(ReadView {
             active: Arc::clone(&memtable),
@@ -667,9 +667,17 @@ impl RegolithEngine {
         }));
         versions.attach_view(Arc::clone(&view));
 
-        versions
-            .lock()
-            .apply(&[VersionEdit::SetNextFileId(wal_id + 1)])?;
+        // The new log holds every write the replayed ones did, so they are
+        // retired with the logs flushes left behind. Recorded unsynced: if
+        // the record is lost, the replayed logs are replayed again beside
+        // the new one, which repeats their writes and nothing older.
+        versions.lock().apply(&[
+            VersionEdit::SetNextFileId(wal_id + 1),
+            VersionEdit::SetMinWalId(wal_id),
+        ])?;
+        let removed =
+            log_retirement::remove_below(&*env, &wal_dir, wal_id, options.statistics.as_deref());
+        let retired_logs = RetiredLogs::new(wal_dir.clone(), !removed);
 
         let cache = Arc::new(
             BlockCache::with_config(
@@ -735,6 +743,7 @@ impl RegolithEngine {
             wal_id: AtomicU64::new(wal_id),
             sst_dir,
             wal_dir,
+            retired_logs,
             compaction: Mutex::new(compaction),
             compaction_lock,
             snapshot_registry,
@@ -804,6 +813,9 @@ impl RegolithEngine {
         );
         let version_set =
             VersionSet::open_read_only(&env, db_dir, &sst_dir, options.metadata_policy())?;
+        if let Some(tail) = version_set.dropped_tail() {
+            report_dropped_manifest_tail(&options, version_set.manifest_path(), tail);
+        }
         let version = version_set.current();
         let latest_seq = version.last_seq;
 
@@ -865,6 +877,7 @@ impl RegolithEngine {
             active_wal: Mutex::new(None),
             wal_id: AtomicU64::new(wal_id),
             sst_dir,
+            retired_logs: RetiredLogs::new(wal_dir.clone(), false),
             wal_dir,
             compaction: Mutex::new(CompactionScheduler::disabled()),
             compaction_lock,

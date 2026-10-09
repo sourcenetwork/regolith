@@ -62,3 +62,13 @@ import Regolith.SyncFifo
 -- outcome, in the stated order, and attempts are isolated. Backs
 -- `proofs/tla/TxnCallbacks.tla`.
 import Regolith.Callbacks
+-- E29, E30: the open accepts every crash state of the manifest, keeps every
+-- synced batch, and replays no version above a newer table. Backs
+-- `proofs/tla/ManifestRecovery.tla`.
+import Regolith.ManifestRecovery
+-- D48: an ingest that survives a crash keeps every commit ordered before it.
+-- Backs `proofs/tla/IngestDurability.tla`.
+import Regolith.IngestDurability
+-- E27: retiring a tombstone no deeper run meets and no live snapshot is below
+-- changes no snapshot's read. Backs `proofs/tla/TombstoneRetirement.tla`.
+import Regolith.TombstoneRetirement

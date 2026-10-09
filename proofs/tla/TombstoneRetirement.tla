@@ -3,6 +3,18 @@
 \* leave range tombstones, and a tombstone a pass carries forever makes every
 \* later pass over its range pay for it.
 \*
+\* PROVED FOR EVERY SIZE in Lean, proofs/lean/Regolith/TombstoneRetirement.lean:
+\*   retire_keeps_reads             at a live snapshot or the head, the same
+\*                                  put wins every key's read before and after
+\*                                  a pass that retires by the fix's rule
+\*                                  (SnapshotReadsKept and HeadKept here, for
+\*                                  any keys, writes and snapshots)
+\*   retire_keeps_read_value        so every read returns the same value
+\*   ignore_snapshots_breaks_reads, ignore_deeper_breaks_reads
+\*                                  the RED cases, as counterexamples
+\* The Lean proof tests a deeper run entry by entry rather than by its span,
+\* a weaker condition than the model's, so it covers the model's rule too.
+\*
 \* THE ENGINE.
 \*   Retirement::carried_tombstones     src/engine/compaction/retire.rs
 \*     The range tombstones a pass writes out: all of its inputs' tombstones

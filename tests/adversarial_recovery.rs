@@ -312,11 +312,15 @@ fn corruption_in_an_earlier_wal_is_not_skipped() {
 
     // The control: the split alone serves every write.
     fs::write(&target, &earlier).unwrap();
+    let manifest = dir.path().join("MANIFEST");
+    let before_control = fs::read(&manifest).unwrap();
     {
         let db = Db::open(dir.path(), opts()).expect("the split alone opens");
         assert_eq!(db.scan(None, None).unwrap(), expected(COUNT));
     }
-    // That open rewrote the logs, so lay the pair down again, damaged.
+    // That open rewrote the logs and recorded the pair as retired, so lay
+    // the pair and the manifest down again, the pair damaged.
+    fs::write(&manifest, &before_control).unwrap();
     for path in wal_files(dir.path()) {
         fs::remove_file(path).unwrap();
     }
