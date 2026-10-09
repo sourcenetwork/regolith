@@ -88,4 +88,6 @@
 //! a checkpoint and `drop_all` wait on. A commit follower parks on its slot
 //! and a stalled writer parks on a kovan signal, neither on a condvar.
 
-pub(crate) use portable_atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
+pub(crate) use portable_atomic::{
+    AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering,
+};

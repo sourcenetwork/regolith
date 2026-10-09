@@ -51,6 +51,7 @@ mod allocate;
 mod append;
 mod content;
 mod counter;
+mod families;
 mod range_rule;
 mod read_rules;
 mod replaced;
@@ -389,6 +390,10 @@ impl RegolithEngine {
         durability: DurabilityMode,
     ) -> io::Result<CommitOutcome> {
         let mut pipe = self.pipeline.lock();
+        // In the ordered step, before any sequence: a write to a family a
+        // drop already retired is refused, never committed past its
+        // tombstone.
+        self.cf_fence_ops(&ops)?;
 
         let view = self.view.load();
         // Counted while validating, recorded once off the pipeline mutex and
@@ -652,6 +657,12 @@ impl RegolithEngine {
     /// drain anything that arrived while it ran. Returns that request's
     /// outcome.
     pub(super) fn lead_with(&self, pipe: &mut Pipeline, request: WriteRequest) -> io::Result<u64> {
+        // The leader's own request is fenced where every follower's is: at
+        // admission, in the ordered step.
+        if let Err(err) = self.cf_fence(&request) {
+            self.drain_locked(pipe);
+            return Err(err);
+        }
         release_stranded(&mut pipe.group);
         pipe.group.push(GroupTicket {
             slot: None,
@@ -739,6 +750,14 @@ impl RegolithEngine {
                     }
                 }
             };
+            // Admission is the ordered step's last look before a sequence:
+            // a request naming a dropped family is refused here, whole.
+            if let Err(err) = self.cf_fence(&ticket.request) {
+                if let Some(slot) = ticket.slot {
+                    slot.complete(Err(err));
+                }
+                continue;
+            }
             let len = ticket.request.staged_len();
             // One append may not stage more than one record's limit. A
             // popped ticket cannot go back to the head of the ring, so it

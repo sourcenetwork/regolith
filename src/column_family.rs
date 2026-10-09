@@ -63,10 +63,25 @@
 //! of how many keys the CF contained; space is reclaimed on the
 //! next compaction over the range. Dropped CFs leave no trace on
 //! reopen.
+//!
+//! ## Creating and dropping against concurrent writes
+//!
+//! A create or a drop commits as a write group of its own, and the
+//! registry changes inside that same ordered step, right after the
+//! group is durable and applied. Every write checks the families it
+//! touches in the ordered step too, before it takes a sequence. So a
+//! write racing a drop either takes a sequence below the drop's range
+//! tombstone, which then deletes it, or is refused with
+//! [`crate::Error::InvalidColumnFamily`]: it never lands in a family
+//! that is already dropped, and never reports success for bytes no
+//! handle can read. The registry itself takes no lock: liveness is one
+//! lookup in a lock-free map.
 
 use std::sync::Arc;
 
-use crate::sync::internal::Mutex;
+use kovan_map::HashMap;
+
+use crate::portability::{AtomicU32, Ordering};
 
 /// Reserved column-family id used to store the CF registry. Users
 /// cannot create a CF with this id; user-facing CFs start at
@@ -120,6 +135,21 @@ impl Eq for ColumnFamilyHandle {}
 /// Length of the big-endian CF id [`prefix_key`] puts in front of a key.
 pub(crate) const CF_PREFIX_LEN: usize = 4;
 
+/// The error a write or a read gets for a handle whose family is not live
+/// in this database: dropped, or another database's.
+pub(crate) fn invalid_handle_error(cf: &ColumnFamilyHandle) -> crate::Error {
+    crate::Error::invalid_column_family(format!(
+        "column family handle '{}' with id {} is not live",
+        cf.name(),
+        cf.id()
+    ))
+}
+
+/// The error a write gets when a key names a family id that is not live.
+pub(crate) fn dropped_family_error(cf_id: u32) -> crate::Error {
+    crate::Error::invalid_column_family(format!("column family id {cf_id} is not live"))
+}
+
 /// Encode a user key for a given CF. Returns
 /// `cf_id_be(4) || user_key`.
 pub(crate) fn prefix_key(cf_id: u32, key: &[u8]) -> Vec<u8> {
@@ -137,7 +167,7 @@ pub(crate) fn prefix_key(cf_id: u32, key: &[u8]) -> Vec<u8> {
 /// `cf_id` is never above [`MAX_CF_ID`]: no byte string is greater than
 /// every key prefixed with `u32::MAX`, because byte strings have no
 /// upper bound, so the id space stops one short of it and
-/// [`CfRegistry::allocate`] refuses to mint `u32::MAX`. The saturating
+/// [`CfRegistry::next_id`] refuses to mint `u32::MAX`. The saturating
 /// add keeps the function total anyway, degrading to an empty range
 /// rather than wrapping to zero and aliasing the reserved metadata CF.
 pub(crate) fn cf_upper_bound(cf_id: u32) -> Vec<u8> {
@@ -192,119 +222,150 @@ pub(crate) mod meta {
     }
 }
 
-/// In-memory cache of the on-disk CF registry. Guarded by a
-/// single mutex - CF creation and drop are rare relative to point
-/// writes, and the common path (`column_family(name)`) only reads.
-/// The default column family is answered without the lock; see
-/// `contains_id`.
+/// Buckets each registry map starts with. A database holds a handful of
+/// column families, and the maps grow on demand past this.
+const REGISTRY_BUCKETS: usize = 64;
+
+/// In-memory mirror of the on-disk CF registry, read without any lock.
+///
+/// # Invariants
+///
+/// - **Liveness is one entry.** A family is live exactly while `by_id`
+///   holds its id. Every check a write or a read makes ([`Self::contains_id`],
+///   [`Self::is_live_handle`]) is one lock-free lookup there, and the two
+///   transitions are one map write each: [`Self::publish`] inserts the id
+///   (the family is born), [`Self::retire`] removes it (the family is
+///   dropped). `by_name` only finds the id for a name, and a name whose id
+///   `by_id` does not hold is absent.
+/// - **A family's life moves one way.** Ids are never reused: `next_id` only
+///   grows, and it is persisted with every create. So an id goes from
+///   unborn to live to dropped and never back, and a stale handle can never
+///   name a newer family.
+/// - **Births and deaths are ordered with the writes.** The engine publishes
+///   and retires a family only inside its ordered commit step, right after
+///   the write that persists the change, and every write checks the families
+///   it touches in that same step (`RegolithEngine::create_family`,
+///   `drop_family`, `cf_fence`). So a write either commits before a drop,
+///   and the drop's range tombstone deletes it, or is refused because the
+///   family is gone; it never lands after the tombstone.
 pub(crate) struct CfRegistry {
-    inner: Mutex<CfRegistryInner>,
+    /// id → the live family with that id.
+    by_id: HashMap<u32, Arc<CfEntry>>,
+    /// name → id of the live family with that name.
+    by_name: HashMap<String, u32>,
+    /// The id the next create takes. Advanced only inside the ordered
+    /// commit step, so two creates never draw one id.
+    next_id: AtomicU32,
 }
 
-struct CfRegistryInner {
-    /// Next CF id to allocate. Persisted in meta under
-    /// [`meta::next_id_key`].
-    next_id: u32,
-    /// name → id map. Kept in sync with the on-disk `name:*`
-    /// entries.
-    by_name: std::collections::HashMap<String, u32>,
-    /// id → name reverse lookup. Populated lazily.
-    by_id: std::collections::HashMap<u32, String>,
+/// What the registry keeps per live family.
+struct CfEntry {
+    /// Shared with every handle made for the family, so a lookup by name
+    /// allocates nothing.
+    name: Arc<String>,
 }
 
 impl CfRegistry {
     pub(crate) fn new() -> Self {
         Self {
-            inner: Mutex::new(CfRegistryInner {
-                next_id: DEFAULT_CF_ID + 1,
-                by_name: std::collections::HashMap::new(),
-                by_id: std::collections::HashMap::new(),
-            }),
+            by_id: HashMap::with_capacity(REGISTRY_BUCKETS),
+            by_name: HashMap::with_capacity(REGISTRY_BUCKETS),
+            next_id: AtomicU32::new(DEFAULT_CF_ID + 1),
         }
     }
 
+    /// Replace the registry's contents with what the meta CF holds. Called
+    /// once by `Db::open`, before any handle exists.
     pub(crate) fn load(&self, entries: impl IntoIterator<Item = (String, u32)>, next_id: u32) {
-        let mut inner = self.inner.lock();
-        inner.next_id = next_id;
-        inner.by_name.clear();
-        inner.by_id.clear();
+        self.by_id.clear();
+        self.by_name.clear();
         for (name, id) in entries {
-            inner.by_name.insert(name.clone(), id);
-            inner.by_id.insert(id, name);
+            let _ = self.insert(id, name);
         }
+        self.next_id.store(next_id, Ordering::Release);
+    }
+
+    fn insert(&self, id: u32, name: String) -> Arc<String> {
+        let shared = Arc::new(name.clone());
+        let entry = Arc::new(CfEntry {
+            name: Arc::clone(&shared),
+        });
+        // `by_id` first: the family is live from this insert, and only then
+        // findable by name.
+        self.by_id.insert(id, entry);
+        self.by_name.insert(name, id);
+        shared
     }
 
     pub(crate) fn get(&self, name: &str) -> Option<ColumnFamilyHandle> {
-        let inner = self.inner.lock();
-        inner.by_name.get(name).map(|&id| ColumnFamilyHandle {
-            name: Arc::new(name.to_string()),
+        let id = self.by_name.get(name)?;
+        let entry = self.by_id.get(&id)?;
+        (*entry.name == name).then(|| ColumnFamilyHandle {
+            name: Arc::clone(&entry.name),
             id,
         })
     }
 
-    /// Whether `id` names a live column family.
+    /// Whether `id` names a live column family. One lock-free lookup.
     ///
     /// The default column family is live for as long as the database is
     /// open, without a lookup: `Db::open` registers it on every load
     /// (`Db::load_cf_registry`) and `Db::drop_column_family` refuses to
-    /// drop it, so `remove` can never take it out. Answering it from the
+    /// drop it, so `retire` can never take it out. Answering it from the
     /// constant keeps the common batch, which is entirely in the default
-    /// column family, off the mutex.
+    /// column family, off the map.
     pub(crate) fn contains_id(&self, id: u32) -> bool {
-        id == DEFAULT_CF_ID || self.inner.lock().by_id.contains_key(&id)
+        id == DEFAULT_CF_ID || self.by_id.contains_key(&id)
     }
 
+    /// Whether `cf` names a live family of this database: its id is live
+    /// and carries its name.
     pub(crate) fn is_live_handle(&self, cf: &ColumnFamilyHandle) -> bool {
-        let inner = self.inner.lock();
-        inner
-            .by_name
-            .get(cf.name())
-            .is_some_and(|&id| id == cf.id())
-            && inner
-                .by_id
-                .get(&cf.id())
-                .is_some_and(|name| name == cf.name())
+        self.by_id
+            .get(&cf.id())
+            .is_some_and(|entry| *entry.name == *cf.name)
     }
 
-    /// Allocate a fresh CF id for `name`. The caller is responsible
-    /// for persisting `(next_id_after, name → id)` to the meta CF
-    /// atomically before returning the handle to user code.
+    /// The id the next create would take, or `None` once the id space is
+    /// exhausted. The last id is never minted: [`cf_upper_bound`] cannot
+    /// express an exclusive bound above it, so a CF holding it could be
+    /// neither iterated nor dropped.
     ///
-    /// `None` once the id space is exhausted. The last id is never
-    /// minted: [`cf_upper_bound`] cannot express an exclusive bound
-    /// above it, so a CF holding it could be neither iterated nor
-    /// dropped.
-    pub(crate) fn allocate(&self, name: &str) -> Option<(ColumnFamilyHandle, u32)> {
-        let mut inner = self.inner.lock();
-        let id = inner.next_id;
-        if id > MAX_CF_ID {
-            return None;
-        }
-        inner.next_id = id + 1;
-        inner.by_name.insert(name.to_string(), id);
-        inner.by_id.insert(id, name.to_string());
-        Some((
-            ColumnFamilyHandle {
-                name: Arc::new(name.to_string()),
-                id,
-            },
-            inner.next_id,
-        ))
+    /// Only the engine's ordered commit step calls this, and it publishes
+    /// the id before any other create can read it.
+    pub(crate) fn next_id(&self) -> Option<u32> {
+        let id = self.next_id.load(Ordering::Acquire);
+        (id <= MAX_CF_ID).then_some(id)
     }
 
-    /// Remove a CF from the in-memory registry. The caller is
-    /// responsible for deleting the on-disk `name:*` entry and
-    /// issuing the data-range delete.
-    pub(crate) fn remove(&self, name: &str) {
-        let mut inner = self.inner.lock();
-        if let Some(id) = inner.by_name.remove(name) {
-            inner.by_id.remove(&id);
+    /// Make the family `name` with `id` live, after its meta entry is
+    /// committed, and return its handle. `id` came from [`Self::next_id`]
+    /// in the same ordered step.
+    pub(crate) fn publish(&self, id: u32, name: &str) -> ColumnFamilyHandle {
+        let name = self.insert(id, name.to_string());
+        self.next_id.fetch_max(id + 1, Ordering::AcqRel);
+        ColumnFamilyHandle { name, id }
+    }
+
+    /// Drop the family `id`, after the range tombstone and the meta delete
+    /// that drop it are committed. Its removal from `by_id` is the moment it
+    /// stops being live; the name goes after, and only if it still names
+    /// this id.
+    pub(crate) fn retire(&self, id: u32) {
+        if let Some(entry) = self.by_id.remove(&id) {
+            self.by_name
+                .remove_if(entry.name.as_str(), |held| *held == id);
         }
     }
 
-    /// Snapshot of every registered CF name in arbitrary order.
+    /// Every live family's name, in arbitrary order: each family live for
+    /// the whole call is listed once, and one created or dropped meanwhile
+    /// may or may not be.
     pub(crate) fn names(&self) -> Vec<String> {
-        self.inner.lock().by_name.keys().cloned().collect()
+        self.by_id
+            .values()
+            .map(|entry| entry.name.as_str().to_string())
+            .collect()
     }
 }
 
@@ -360,21 +421,26 @@ mod tests {
         // dropped. The registry stops one short instead.
         let r = CfRegistry::new();
         r.load(std::iter::empty(), MAX_CF_ID);
-        let (last, next) = r.allocate("last").expect("one id left");
+        let id = r.next_id().expect("one id left");
+        let last = r.publish(id, "last");
         assert_eq!(last.id, MAX_CF_ID);
-        assert_eq!(next, MAX_CF_ID + 1);
-        assert!(r.allocate("one too many").is_none());
+        assert!(r.next_id().is_none());
         assert!(cf_lower_bound(last.id) < cf_upper_bound(last.id));
     }
 
     #[test]
-    fn registry_allocate_is_monotonic() {
+    fn registry_ids_are_monotonic_and_never_reused() {
         let r = CfRegistry::new();
-        let (a, _) = r.allocate("alpha").expect("id space");
-        let (b, _) = r.allocate("beta").expect("id space");
+        let a = r.publish(r.next_id().expect("id space"), "alpha");
+        let b = r.publish(r.next_id().expect("id space"), "beta");
         assert!(a.id < b.id);
         assert_eq!(r.get("alpha").unwrap(), a);
         assert_eq!(r.get("beta").unwrap(), b);
+        r.retire(b.id);
+        let again = r.publish(r.next_id().expect("id space"), "beta");
+        assert!(again.id > b.id, "a dropped id is never handed out again");
+        assert!(!r.is_live_handle(&b));
+        assert!(r.is_live_handle(&again));
     }
 
     #[test]
@@ -384,10 +450,36 @@ mod tests {
         assert!(!r.contains_id(META_CF_ID));
         assert!(!r.contains_id(DEFAULT_CF_ID + 1));
 
-        let (h, _) = r.allocate("x").expect("id space");
+        let h = r.publish(r.next_id().expect("id space"), "x");
         assert!(r.contains_id(h.id));
-        r.remove("x");
+        r.retire(h.id);
         assert!(!r.contains_id(h.id));
+        assert!(r.get("x").is_none());
         assert!(r.contains_id(DEFAULT_CF_ID));
+    }
+
+    #[test]
+    fn a_handle_names_its_family_by_id_and_name() {
+        let r = CfRegistry::new();
+        let h = r.publish(r.next_id().expect("id space"), "x");
+        let renamed = ColumnFamilyHandle {
+            name: Arc::new("y".to_string()),
+            id: h.id,
+        };
+        assert!(r.is_live_handle(&h));
+        assert!(!r.is_live_handle(&renamed), "another database's handle");
+    }
+
+    #[test]
+    fn retiring_a_reused_name_leaves_the_newer_family() {
+        let r = CfRegistry::new();
+        let old = r.publish(r.next_id().expect("id space"), "x");
+        r.retire(old.id);
+        let new = r.publish(r.next_id().expect("id space"), "x");
+        // A second retire of the old id must not take the name from the new
+        // family.
+        r.retire(old.id);
+        assert_eq!(r.get("x"), Some(new));
+        assert_eq!(r.names(), vec!["x".to_string()]);
     }
 }

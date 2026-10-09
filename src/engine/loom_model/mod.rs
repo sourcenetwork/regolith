@@ -80,6 +80,7 @@
 //! found the bug, not how large its search space is.
 
 pub mod arena;
+pub mod families;
 pub mod handoff;
 pub mod io_queue;
 pub mod skiplist;
@@ -127,11 +128,11 @@ fn probe(user_key: &[u8]) -> LookupKey {
 /// executing one. The witness count is that missing half, and [`explore`]
 /// fails a model whose witness stays at zero.
 #[derive(Clone)]
-pub(super) struct Witness(StdArc<AtomicUsize>);
+pub(crate) struct Witness(StdArc<AtomicUsize>);
 
 impl Witness {
     /// Record that this execution reached the interesting state.
-    pub(super) fn record(&self) {
+    pub(crate) fn record(&self) {
         self.0.fetch_add(1, StdOrdering::Relaxed);
     }
 
@@ -169,7 +170,7 @@ impl Drop for Report {
 /// exists to check. A model that fails either floor fails, because a
 /// model that explores one schedule, or that never reaches its own
 /// interesting branch, is worse than no model at all.
-fn explore(
+pub(crate) fn explore(
     name: &'static str,
     min_interleavings: usize,
     min_witnesses: usize,
