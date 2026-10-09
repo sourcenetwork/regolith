@@ -332,7 +332,11 @@ tla:
     check() {
         local cfg="$1" expect="$2" inv="${3:-}" out broke verdict states took
         out=$(./tools/tlc -metadir "states/$cfg" -config "$cfg.cfg" "$spec.tla" 2>&1)
-        broke=$(sed -n 's/^Error: Invariant \(.*\) is violated\.$/\1/p' <<<"$out" | head -1)
+        # TLC words a broken invariant two ways: "is violated." when the search reaches a bad
+        # state, and "is violated by the initial state:" when the very first state is already
+        # bad. Both name the invariant, and both count.
+        broke=$(sed -n -e 's/^Error: Invariant \(.*\) is violated\.$/\1/p' \
+                       -e 's/^Error: Invariant \(.*\) is violated by the initial state:$/\1/p' <<<"$out" | head -1)
         states=$(sed -n 's/^.* states generated, \([0-9,]*\) distinct states found.*$/\1/p' <<<"$out" | tail -1)
         took=$(sed -n 's/^Finished in \(.*\) at (.*$/\1/p' <<<"$out" | tail -1)
         if grep -q "No error has been found" <<<"$out"; then
@@ -488,6 +492,30 @@ tla:
     check MC_WalRecovery_Red_CloseWithoutSync          RED RecoveryOpens
     check MC_WalRecovery_Red_NoTruncate                RED RecoveryOpens
     check MC_WalRecovery_Red_StampNotSealed            RED AckedSurvive
+    check MC_WalRecovery_Red_StampUnsynced             RED RecoveryOpens
+    # 4.12, D45: a sealed manifest batch keeps its checksum, checked before
+    # any key. Lean: Regolith/ManifestSeal.lean, replay_opens_with_right_keys,
+    # open_ends_only_at_a_torn_batch.
+    spec=ManifestSeal
+    check MC_ManifestSeal_Green                        GREEN
+    check MC_ManifestSeal_Red_TagOnlyStop              RED OnlyTornEnds
+    check MC_ManifestSeal_Red_TagOnlyRefuse            RED RecoveryOpens
+    # 4.12, D57: a backup of an encrypted database seals its metadata, and a
+    # restore checks every key before its first write. Lean:
+    # Regolith/BackupSeal.lean, entitled_restore_is_faithful,
+    # refusal_writes_nothing, collect_keeps_listed, last_write_holds_all.
+    spec=BackupSeal
+    check MC_BackupSeal_Green                          GREEN
+    check MC_BackupSeal_Red_PlainMeta                  RED SealedMetadata
+    check MC_BackupSeal_Red_PlainRestore               RED SealedMetadata
+    check MC_BackupSeal_Red_OpenUnderCurrent           RED RightKeysRestore
+    check MC_BackupSeal_Red_ListingUnbound             RED FaithfulRestore
+    check MC_BackupSeal_Red_IdUnbound                  RED FaithfulRestore
+    check MC_BackupSeal_Red_ManifestFirst              RED FaithfulRestore
+    check MC_BackupSeal_Red_OverDatabase               RED FaithfulRestore
+    check MC_BackupSeal_Red_CheckAfterCopy             RED RefusalWritesNothing
+    check MC_BackupSeal_Red_GcSkipsSealed              RED ListedRestores
+    check MC_BackupSeal_Red_MetaFirst                  RED ListedRestores
     # 4.8, E5: compaction per snapshot stripe. Lean: Regolith/Stripes.lean,
     # reduce_reads.
     spec=StripeCompaction

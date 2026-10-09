@@ -32,6 +32,7 @@ pub(crate) mod read_horizon;
 mod read_rule;
 pub(crate) mod read_view;
 mod recovery;
+pub(crate) mod seal;
 pub(crate) mod skiplist;
 pub(crate) mod snapshot_registry;
 pub(crate) mod source_walk;
@@ -43,6 +44,7 @@ pub(crate) mod wal_frame;
 pub(crate) mod wal_replay;
 #[cfg(test)]
 mod wal_rotation_tests;
+pub(crate) mod wal_seal;
 pub(crate) mod wal_v1;
 
 use crate::portability::{AtomicBool, AtomicU8, AtomicU64, Ordering};
@@ -339,6 +341,9 @@ pub(crate) struct EngineOptions {
     pub(crate) merge_operator: Option<Arc<dyn crate::options::MergeOperator>>,
     pub(crate) listeners: Vec<Arc<dyn crate::event_listener::EventListener>>,
     pub(crate) transaction_hooks: Option<Arc<dyn crate::TransactionHooks>>,
+    /// Set when the database is encrypted at rest: every file the engine
+    /// writes is sealed under its current key.
+    pub(crate) keyring: Option<Arc<seal::Keyring>>,
     pub(crate) statistics: Option<Arc<crate::statistics::Statistics>>,
     pub(crate) rate_limiter: Option<Arc<dyn crate::rate_limiter::RateLimiter>>,
     pub(crate) level0_slowdown_writes_trigger: usize,
@@ -413,6 +418,7 @@ impl EngineOptions {
             max_background_compactions: self.max_background_compactions,
             partitioned_index: self.partitioned_index,
             metadata_block_size: self.metadata_block_size,
+            keyring: self.keyring.clone(),
             env: Arc::clone(&self.env),
         }
     }
@@ -450,6 +456,7 @@ impl Default for EngineOptions {
             merge_operator: None,
             listeners: Vec::new(),
             transaction_hooks: None,
+            keyring: None,
             statistics: None,
             rate_limiter: None,
             level0_slowdown_writes_trigger: 20,
@@ -624,8 +631,19 @@ impl RegolithEngine {
         env.create_dir_all(&sst_dir)?;
         env.create_dir_all(&wal_dir)?;
 
-        let version_set =
-            VersionSet::open_with_policy(&env, db_dir, &sst_dir, options.metadata_policy())?;
+        // Every file this open writes is sealed under the current key, so a
+        // current key the provider cannot provide refuses here, before
+        // anything is written.
+        if let Some(keyring) = &options.keyring {
+            keyring.current()?;
+        }
+        let version_set = VersionSet::open_with_policy(
+            &env,
+            db_dir,
+            &sst_dir,
+            options.metadata_policy(),
+            options.keyring.clone(),
+        )?;
         let version = version_set.current();
         let latest_seq = version.last_seq;
 
@@ -636,11 +654,18 @@ impl RegolithEngine {
             options.max_write_buffer_number,
         );
         let memtable = Arc::new(MemTable::new(&memtable_config)?);
+        wal_seal::remove_staged(&*env, &wal_dir)?;
         let mut wal_files = list_wal_files(&*env, &wal_dir)?;
         wal_files.sort();
         wal_files.retain(|path| should_replay_wal(path, version.min_wal_id));
 
-        let (latest_seq, discarded) = replay_logs(&env, &wal_files, &memtable, latest_seq)?;
+        let (latest_seq, discarded) = replay_logs(
+            &env,
+            &wal_files,
+            &memtable,
+            latest_seq,
+            options.keyring.as_deref(),
+        )?;
         if let Some((path, tail)) = discarded {
             // Before the next log exists, so the newest log is complete
             // when it becomes an earlier one (WalRecovery.tla, RED
@@ -653,7 +678,7 @@ impl RegolithEngine {
 
         let wal_id = next_wal_id(version.next_file_id, &wal_files);
         let wal_path = wal_dir.join(wal_filename(wal_id));
-        let mut wal = Wal::create_in(&env, &wal_path)?;
+        let mut wal = Wal::create_in(&env, &wal_path, options.keyring.as_deref())?;
 
         rewrite_recovered_memtable_to_wal(&memtable, &mut wal)?;
 
@@ -790,8 +815,13 @@ impl RegolithEngine {
             options.write_buffer_size,
             options.max_write_buffer_number,
         );
-        let version_set =
-            VersionSet::open_read_only(&env, db_dir, &sst_dir, options.metadata_policy())?;
+        let version_set = VersionSet::open_read_only(
+            &env,
+            db_dir,
+            &sst_dir,
+            options.metadata_policy(),
+            options.keyring.clone(),
+        )?;
         let version = version_set.current();
         let latest_seq = version.last_seq;
 
@@ -802,7 +832,13 @@ impl RegolithEngine {
 
         // A read-only open writes nothing, so the tail stays in the file;
         // the next read-write open drops it again and truncates it.
-        let (latest_seq, discarded) = replay_logs(&env, &wal_files, &memtable, latest_seq)?;
+        let (latest_seq, discarded) = replay_logs(
+            &env,
+            &wal_files,
+            &memtable,
+            latest_seq,
+            options.keyring.as_deref(),
+        )?;
         if let Some((path, tail)) = discarded {
             report_discarded_tail(&options, &path, tail, latest_seq);
         }
@@ -875,6 +911,12 @@ impl RegolithEngine {
     /// own and must do it on the same host.
     pub(crate) fn env(&self) -> &Arc<dyn Env> {
         &self.env
+    }
+
+    /// The keyring this database seals its files through, when it is
+    /// encrypted at rest. A backup seals its metadata through it too.
+    pub(crate) fn keyring(&self) -> Option<&Arc<seal::Keyring>> {
+        self.options.keyring.as_ref()
     }
 
     /// Microseconds elapsed since `start`, or `None` when this
@@ -1007,7 +1049,11 @@ impl RegolithEngine {
             self.notify_wal_error(&err)?;
             return Err(err);
         }
-        let new_wal = Wal::create_in(&self.env, &self.wal_dir.join(wal_filename(new_wal_id)))?;
+        let new_wal = Wal::create_in(
+            &self.env,
+            &self.wal_dir.join(wal_filename(new_wal_id)),
+            self.options.keyring.as_deref(),
+        )?;
         guard.replace(new_wal).ok_or_else(Self::read_only_error)
     }
 
@@ -2551,6 +2597,7 @@ impl RegolithEngine {
             self.options.prefix_extractor.clone(),
             self.options.partitioned_index,
             self.options.metadata_block_size,
+            self.options.keyring.as_deref(),
         )?;
 
         // Walk the memtable in internal-key order and copy every version
@@ -2601,6 +2648,7 @@ impl RegolithEngine {
             &sst_path,
             file_id,
             self.options.metadata_policy(),
+            self.options.keyring.as_deref(),
         )?);
         let file = LiveSst::new(
             SsTableMeta {
@@ -2734,7 +2782,12 @@ impl RegolithEngine {
         //    overlaps the range is materialized in L0. We only touch
         //    the write lock if there's actually data to flush. "Data"
         //    here includes range tombstones, not just point entries.
-        let needs_flush = |mt: &MemTable| !mt.is_empty() || !mt.clone_range_tombstones().is_empty();
+        // A log sealed under a key other than the current one is rotated
+        // away even when its memtable is empty, so a full compaction leaves
+        // no file naming a rotated key.
+        let needs_flush = |mt: &MemTable| {
+            !mt.is_empty() || !mt.clone_range_tombstones().is_empty() || self.wal_key_is_stale()
+        };
         if needs_flush(&self.view.load().active) {
             let _write_guard = self.pipeline.lock();
             if needs_flush(&self.view.load().active) {
@@ -2748,40 +2801,70 @@ impl RegolithEngine {
         // synchronous compact_range just flushes the memtable and
         // runs the FIFO picker so any pending files over the cap
         // get dropped deterministically.
-        if matches!(
-            self.options.compaction_style,
-            crate::options::CompactionStyle::Fifo
-        ) {
-            let _ = compaction::run_fifo_pass(&self.versions, &self.sst_dir, &compaction_opts)?;
-            return Ok(());
+        match self.options.compaction_style {
+            crate::options::CompactionStyle::Fifo => {
+                let _ = compaction::run_fifo_pass(&self.versions, &self.sst_dir, &compaction_opts)?;
+            }
+            // Under Universal compaction a manual compact_range folds
+            // every L0 file into one run, matching the "force full
+            // compaction" semantics a caller expects.
+            crate::options::CompactionStyle::Universal => {
+                compaction::run_universal_full_compaction(
+                    &self.versions,
+                    &self.sst_dir,
+                    &self.cache,
+                    &compaction_opts,
+                    &self.snapshot_registry,
+                )?;
+            }
+            _ => compaction::run_compact_range(
+                &self.versions,
+                &self.sst_dir,
+                &self.cache,
+                &compaction_opts,
+                start,
+                end,
+                &self.snapshot_registry,
+            )?,
         }
 
-        // Under Universal compaction a manual compact_range folds
-        // every L0 file into one run, matching the "force full
-        // compaction" semantics a caller expects.
-        if matches!(
-            self.options.compaction_style,
-            crate::options::CompactionStyle::Universal
-        ) {
-            compaction::run_universal_full_compaction(
+        // On an encrypted database a manual compaction also re-seals, over
+        // the whole database whatever the range: every table not sealed under
+        // the current key (written before encryption was turned on, or under
+        // a key since rotated away, or left untouched by the passes above)
+        // is rewritten, and so is a manifest holding a batch under another
+        // key. With the log rotated above, no file names any other key after.
+        if self.options.keyring.is_some() {
+            compaction::reseal_tables(
                 &self.versions,
                 &self.sst_dir,
                 &self.cache,
                 &compaction_opts,
                 &self.snapshot_registry,
             )?;
-            return Ok(());
+            let mut versions = self.versions.lock();
+            if versions.has_stale_seals() {
+                versions.compact_manifest()?;
+            }
         }
+        Ok(())
+    }
 
-        compaction::run_compact_range(
-            &self.versions,
-            &self.sst_dir,
-            &self.cache,
-            &compaction_opts,
-            start,
-            end,
-            &self.snapshot_registry,
-        )
+    /// Whether, on an encrypted database, a log may name a key other than
+    /// the current one: the active log is sealed under another key or not
+    /// sealed at all, or a frozen memtable's log is still on disk (a
+    /// rotation flushes it, and its log with it).
+    fn wal_key_is_stale(&self) -> bool {
+        let Some(keyring) = &self.options.keyring else {
+            return false;
+        };
+        let current = keyring.current_id();
+        !self.view.load().frozen.is_empty()
+            || self
+                .active_wal
+                .lock()
+                .as_ref()
+                .is_some_and(|wal| wal.seal_key() != Some(current))
     }
 
     /// Atomically capture a consistent snapshot of the on-disk state
@@ -3063,7 +3146,7 @@ impl RegolithEngine {
             let old_version = versions.current();
             let id = old_version.next_file_id;
             let wal_path = self.wal_dir.join(wal_filename(id));
-            let new_wal = Wal::create_in(&self.env, &wal_path)?;
+            let new_wal = Wal::create_in(&self.env, &wal_path, self.options.keyring.as_deref())?;
             versions.apply(&[VersionEdit::Reset {
                 next_file_id: id + 1,
                 min_wal_id: id,

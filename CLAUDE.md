@@ -67,6 +67,7 @@ src/
 ├── checkpoint.rs       # Hardlinked checkpoint creation
 ├── column_family.rs    # Column-family handles and descriptors
 ├── conflict.rs         # Conflict reasons: Conflict, Access, WriteKind
+├── encryption.rs       # Encryption at rest: KeyProvider, KeyId, KeyMaterial
 ├── error.rs            # Error enum, Result alias
 ├── event_listener.rs   # Flush/compaction event callbacks
 ├── iter.rs             # Public iterator wrappers
@@ -98,14 +99,16 @@ src/
     ├── compaction.rs   # Level/FIFO/universal compaction planning and worker loop
     ├── compaction/     # Per-snapshot-stripe folding of versions and merge chains
     ├── manifest.rs     # VersionSet, VersionEdit log, level tracking
-    ├── manifest/       # Manifest tests
+    ├── manifest/       # Sealed manifests (format 2), manifest tests
     ├── memtable.rs     # Arena-backed skip list memtable plus its range tombstones
     ├── skiplist/       # Insert-only concurrent skip list over the arena
     ├── sstable.rs      # SSTable reader/writer, footer, index block
-    ├── sstable/        # SSTable key walks and size limits
+    ├── sstable/        # SSTable key walks, size limits, sealed tables (V7, V8)
     ├── wal.rs          # Write-ahead log writer (format 2), CLOSE, format 1 reading rules
     ├── wal_frame.rs    # WAL format 2: stamp, group record frame, the scan past damage
     ├── wal_replay.rs   # Streaming reader over one WAL file: the O < P rule
+    ├── wal_seal.rs     # Sealed WAL: the stamp sealed and durable at creation, sealed records
+    ├── seal.rs         # AES-256-GCM-SIV frames and the keyring over a KeyProvider
     ├── recovery.rs     # Replaying the WALs at open, the dropped-tail report, the rewrite
     ├── arena.rs        # Bump allocator for one memtable
     ├── block.rs        # Data blocks: prefix compression, restart points, varint

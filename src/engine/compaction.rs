@@ -352,6 +352,9 @@ pub(crate) struct CompactionOptions {
     pub(crate) partitioned_index: bool,
     pub(crate) metadata_block_size: usize,
     pub(crate) cache_index_and_filter_blocks: bool,
+    /// Set when the database is encrypted at rest; every output table is
+    /// sealed under its current key.
+    pub(crate) keyring: Option<Arc<super::seal::Keyring>>,
     /// The host platform. Compaction reads, writes, and unlinks
     /// SSTables through it, and starts its workers on it.
     pub(crate) env: Arc<dyn Env>,
@@ -403,6 +406,7 @@ impl Default for CompactionOptions {
             partitioned_index: false,
             metadata_block_size: 4096,
             cache_index_and_filter_blocks: false,
+            keyring: None,
             env: crate::env::std_env(),
         }
     }
@@ -1101,6 +1105,56 @@ pub(crate) fn run_compact_range(
     Ok(())
 }
 
+/// Rewrite, each in place at its own level, every table that is not sealed
+/// under the keyring's current key: one written before encryption was
+/// turned on, or sealed under a key since rotated away. Does nothing on a
+/// database without a keyring, and costs one pass over the table list when
+/// every table is current.
+///
+/// The tables are listed once, so a key rotated while this runs cannot keep
+/// it going. Each rewrite is an ordinary one-table compaction into the same
+/// level (L0 keeps its order), so it reduces versions exactly as any
+/// compaction would. The caller holds the compaction lock.
+pub(crate) fn reseal_tables(
+    versions: &Arc<VersionStore>,
+    sst_dir: &Path,
+    cache: &BlockCache,
+    opts: &CompactionOptions,
+    snapshots: &SnapshotRegistry,
+) -> std::io::Result<()> {
+    let Some(keyring) = &opts.keyring else {
+        return Ok(());
+    };
+    let current = Some(keyring.current_id());
+    let version = versions.lock().current();
+    let stale: Vec<(usize, Arc<LiveSst>)> = version
+        .levels
+        .iter()
+        .enumerate()
+        .flat_map(|(level, files)| {
+            files
+                .iter()
+                .filter(|f| f.reader.seal_key() != current)
+                .map(move |f| (level, Arc::clone(f)))
+        })
+        .collect();
+    drop(version);
+    for (level, file) in stale {
+        perform_compaction_to(
+            versions,
+            sst_dir,
+            cache,
+            opts,
+            level,
+            level,
+            vec![file],
+            Vec::new(),
+            snapshots,
+        )?;
+    }
+    Ok(())
+}
+
 /// The L0 tables a `[start, end)` compaction pushes down: those that
 /// intersect it, and every older table whose keys overlap theirs.
 ///
@@ -1720,6 +1774,7 @@ impl<'a> StreamingCompactionWriter<'a> {
             self.opts.prefix_extractor.clone(),
             self.opts.partitioned_index,
             self.opts.metadata_block_size,
+            self.opts.keyring.as_deref(),
         )?;
 
         self.current = Some(StreamingOutputBuilder {
@@ -1776,6 +1831,7 @@ impl<'a> StreamingCompactionWriter<'a> {
             &current.path,
             current.file_id,
             self.opts.metadata_policy(),
+            self.opts.keyring.as_deref(),
         )?);
         let (smallest_key, largest_key) = match (
             current.smallest_user_key.take(),
@@ -1863,6 +1919,7 @@ impl<'a> StreamingCompactionWriter<'a> {
             self.opts.prefix_extractor.clone(),
             self.opts.partitioned_index,
             self.opts.metadata_block_size,
+            self.opts.keyring.as_deref(),
         )?;
         for rt in tombstones {
             writer.add_range_tombstone(&rt.start, &rt.end, rt.seq);
@@ -1888,6 +1945,7 @@ impl<'a> StreamingCompactionWriter<'a> {
             &path,
             file_id,
             self.opts.metadata_policy(),
+            self.opts.keyring.as_deref(),
         )?);
         let new_file = LiveSst::new(
             SsTableMeta {
