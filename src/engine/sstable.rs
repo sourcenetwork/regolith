@@ -59,7 +59,7 @@ use std::fs;
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, OnceLock, Weak};
 
 use std::ops::ControlFlow;
 
@@ -72,6 +72,9 @@ use super::index_block::IndexBlock;
 use super::internal_key::{
     VALUE_TYPE_DELETION, VALUE_TYPE_MERGE, decode_internal_key, user_key_of,
 };
+use super::io::Landed;
+use super::io::scope;
+use super::io::unit::{UnitKey, Work};
 use super::lookup_key::LookupKey;
 use super::range_tombstone::{RangeTombstone, RangeTombstoneSet, table_key_range};
 use crate::DbSlice;
@@ -340,6 +343,9 @@ impl LiveSst {
             meta.global_seq, reader.global_seq,
             "a table's reader reads at the sequence its metadata records"
         );
+        // Every table a read can reach is made here, so this is where its
+        // reader learns how to hand a queued read its own handle.
+        let _ = reader.me.set(Arc::downgrade(&reader));
         Arc::new(Self { meta, reader })
     }
 }
@@ -1090,6 +1096,10 @@ pub(crate) struct SsTableReader {
     /// The sequence every entry reads at, for an ingested table. See the
     /// `global_seq` module for the seams that apply it.
     global_seq: Option<u64>,
+    /// This reader's own handle, set when its table goes live
+    /// ([`LiveSst::new`]). A `CacheOnly` miss hands it to the unit that
+    /// reads the block later, on whichever thread claims it.
+    me: OnceLock<Weak<SsTableReader>>,
     /// Number of index leaves actually read from disk, i.e. block-cache
     /// misses. Cached leaf hits do not count.
     #[cfg(test)]
@@ -1253,6 +1263,7 @@ impl SsTableReader {
             range_tombstones: RangeTombstoneSet::from_vec(range_tombstones),
             partitioned,
             global_seq: None,
+            me: OnceLock::new(),
             #[cfg(test)]
             index_leaf_reads: AtomicUsize::new(0),
         })
@@ -1346,12 +1357,23 @@ impl SsTableReader {
         if let Some(block) = cache.get_index(self.file_id, handle.offset) {
             return Ok(MetaRef::Owned(block));
         }
+        if let Some(landed) = self.queue_miss(cache, handle, None, |reader| {
+            Box::new(move |cache| reader.load_index(handle, cache).map(Landed::Index))
+        }) {
+            return Ok(MetaRef::Owned(landed?.into_index()?));
+        }
+        self.load_index(handle, cache).map(MetaRef::Owned)
+    }
+
+    /// Read a cached flat index from the device, into the block cache, or
+    /// pinned when the cache refuses it.
+    fn load_index(&self, handle: BlockHandle, cache: &BlockCache) -> io::Result<Arc<IndexBlock>> {
         let data = self.read_metadata_region(handle, checksum::META_KIND_INDEX, "index block")?;
         let block = Arc::new(IndexBlock::decode(data)?);
         if !cache.insert_index(self.file_id, handle.offset, Arc::clone(&block)) {
             let _ = self.index_fallback.set(Arc::clone(&block));
         }
-        Ok(MetaRef::Owned(block))
+        Ok(block)
     }
 
     /// The filter region, from wherever this reader keeps it.
@@ -1366,13 +1388,51 @@ impl SsTableReader {
         if let Some(block) = cache.get_filter(self.file_id, handle.offset) {
             return Ok(MetaRef::Owned(block));
         }
+        if let Some(landed) = self.queue_miss(cache, handle, None, |reader| {
+            Box::new(move |cache| reader.load_filter(handle, cache).map(Landed::Filter))
+        }) {
+            return Ok(MetaRef::Owned(landed?.into_filter()?));
+        }
+        self.load_filter(handle, cache).map(MetaRef::Owned)
+    }
+
+    /// Read a cached filter region from the device, into the block cache, or
+    /// pinned when the cache refuses it.
+    fn load_filter(&self, handle: BlockHandle, cache: &BlockCache) -> io::Result<Arc<FilterBlock>> {
         let region =
             self.read_metadata_region(handle, checksum::META_KIND_BLOOM, "bloom region")?;
         let block = Arc::new(FilterBlock::decode(&region)?);
         if !cache.insert_filter(self.file_id, handle.offset, Arc::clone(&block)) {
             let _ = self.filter_fallback.set(Arc::clone(&block));
         }
-        Ok(MetaRef::Owned(block))
+        Ok(block)
+    }
+
+    /// The device seam. The block cache just missed `handle`: in a
+    /// `CacheOnly` scope, hand the read to the scope's queue, and return
+    /// what landed for it or the `WouldBlock` that records it; `None` in a
+    /// `Blocking` scope, whose caller reads the device itself. `work` makes
+    /// the read the unit runs later, from this reader's own handle.
+    fn queue_miss(
+        &self,
+        cache: &BlockCache,
+        handle: BlockHandle,
+        guard: Option<usize>,
+        work: impl FnOnce(Arc<SsTableReader>) -> Work,
+    ) -> Option<io::Result<Landed>> {
+        let queue = scope::current()?;
+        let key = UnitKey {
+            file_id: self.file_id,
+            offset: handle.offset,
+            guard,
+        };
+        let bytes = usize::try_from(handle.size).unwrap_or(usize::MAX);
+        Some(cache.io().miss(queue, key, bytes, || {
+            let reader = self.me.get().and_then(Weak::upgrade).ok_or_else(|| {
+                io::Error::other("this table cannot be read through an I/O queue")
+            })?;
+            Ok(work(reader))
+        }))
     }
 
     /// Read one metadata region, bounded by the start of the footer and
@@ -1409,6 +1469,11 @@ impl SsTableReader {
     ) -> io::Result<Arc<IndexBlock>> {
         if let Some(leaf) = cache.get_index(self.file_id, handle.offset) {
             return Ok(leaf);
+        }
+        if let Some(landed) = self.queue_miss(cache, handle, None, |reader| {
+            Box::new(move |cache| reader.read_index_leaf(handle, cache).map(Landed::Index))
+        }) {
+            return landed?.into_index();
         }
 
         #[cfg(test)]
@@ -1948,6 +2013,30 @@ impl SsTableReader {
             check_data_block_limit(handle.size, block.decoded_buffer_capacity() as u64, limit)?;
             return Ok(block);
         }
+        self.fetch_block(handle, cache, limit)
+    }
+
+    /// Read the data block at `handle`, which the block cache just missed:
+    /// from the device, or, in a `CacheOnly` scope, through the scope's
+    /// queue. `limit` is the per-block allocation guard, applied to a block
+    /// that landed for the queue as to one the cache held.
+    pub(crate) fn fetch_block(
+        &self,
+        handle: BlockHandle,
+        cache: &BlockCache,
+        limit: Option<usize>,
+    ) -> io::Result<Arc<Block>> {
+        if let Some(landed) = self.queue_miss(cache, handle, limit, |reader| {
+            Box::new(move |cache| {
+                reader
+                    .read_block_with_limit(handle, cache, limit)
+                    .map(Landed::Data)
+            })
+        }) {
+            let block = landed?.into_data()?;
+            check_data_block_limit(handle.size, block.decoded_buffer_capacity() as u64, limit)?;
+            return Ok(block);
+        }
 
         if handle.size < 5 {
             return Err(invalid_data("block frame too short"));
@@ -1984,7 +2073,20 @@ impl SsTableReader {
     /// volume that latency, not bandwidth, is what the scan waits on. The
     /// sequential reader above pulls a span covering many blocks at once
     /// and decodes them out of it.
-    pub(crate) fn read_span(&self, offset: u64, len: u64) -> io::Result<Vec<u8>> {
+    ///
+    /// `first` is the block the span starts with. A `CacheOnly` scope reads
+    /// no span: `first` alone goes through its queue, and the span comes
+    /// back empty, so the caller takes the block from where it landed.
+    pub(crate) fn read_span(
+        &self,
+        first: BlockHandle,
+        len: u64,
+        cache: &BlockCache,
+    ) -> io::Result<Vec<u8>> {
+        if scope::current().is_some() {
+            return self.fetch_block(first, cache, None).map(|_| Vec::new());
+        }
+        let offset = first.offset;
         let len = len.min(self.data_end.saturating_sub(offset));
         read_file_region(&*self.file, offset, len, self.data_end, "data span")
     }
@@ -2672,6 +2774,7 @@ mod tests {
             range_tombstones: RangeTombstoneSet::default(),
             partitioned: false,
             global_seq: None,
+            me: OnceLock::new(),
             index_leaf_reads: AtomicUsize::new(0),
         };
         let cache = BlockCache::new(1024);

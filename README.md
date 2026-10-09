@@ -125,6 +125,36 @@ A crash partway through leaves a valid prefix of the stream, never a
 half-applied flush. Work that must land all-or-nothing wants a single
 `WriteBatch` and has to pay the memory for it.
 
+## Reads that never block
+
+A thread that must never wait on the disk reads through a `CacheOnly` handle.
+Such a read never touches the device: when it needs a block the cache does not
+hold, it returns `Error::WouldBlock` at once and records the block on the
+thread's own I/O queue. The thread polls that queue when it has nothing else
+to run, which reads the blocks it waits on, and then runs the read again:
+
+```rust
+use regolith::{Error, IoBudget, ReadMode, WouldBlock};
+
+let mut queue = db.io_queue(); // one per thread
+let snap = db.snapshot().with_read_mode(ReadMode::CacheOnly(queue.id()));
+let value = loop {
+    match snap.get(b"key") {
+        Err(Error::WouldBlock(WouldBlock::Io(wait))) => {
+            queue.poll(IoBudget::ALL); // or `wait.await` while other tasks run
+        }
+        other => break other?,
+    }
+};
+```
+
+A block several threads miss is read once, by whichever thread's poll claims
+it first, and every waiting queue is told. A completion only ever reaches the
+queue that asked, and `IoQueue::idle_waker` wakes an idle thread when one
+arrives, never a busy one. Iterators, transaction cursors and streams pick up
+exactly where a wait stopped them. Transactions take the mode from
+`TxnOptions::read_mode`.
+
 ## Transactions
 
 Pick the isolation a unit of work actually needs. The level decides how much of the

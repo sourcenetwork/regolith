@@ -66,6 +66,7 @@ mod engine;
 pub mod env;
 mod error;
 mod event_listener;
+mod io_queue;
 mod iter;
 mod log_layout;
 mod options;
@@ -98,6 +99,7 @@ pub use event_listener::{
     FlushJobInfo, TableFileCreationInfo, TableFileCreationReason, TableFileDeletionInfo,
     WalTailDiscardedInfo,
 };
+pub use io_queue::{IoBudget, IoProgress, IoQueue, IoUnit, IoWait, QueueId, ReadMode, WouldBlock};
 pub use iter::Iter;
 pub use log_layout::LogLayout;
 pub use options::{
@@ -125,9 +127,10 @@ pub use transaction::{
 /// `use regolith::prelude::*;`.
 pub mod prelude {
     pub use crate::{
-        AbortReason, CommitInfo, CommitReceipt, Conflict, Db, IsolationLevel, KeyClass,
-        KeyClassifier, LogLayout, MergeOperator, OptimisticTransactionDb, Options, RetryPolicy,
-        TransactError, Transaction, TransactionError, TransactionHooks, TxResult, TxnOptions,
+        AbortReason, CommitInfo, CommitReceipt, Conflict, Db, IoBudget, IoQueue, IsolationLevel,
+        KeyClass, KeyClassifier, LogLayout, MergeOperator, OptimisticTransactionDb, Options,
+        QueueId, ReadMode, RetryPolicy, TransactError, Transaction, TransactionError,
+        TransactionHooks, TxResult, TxnOptions, WouldBlock,
     };
 }
 pub use ttl::{DbWithTtl, TtlCompactionFilter, strip_timestamp};
@@ -145,7 +148,7 @@ pub mod loom_exports {
     //! check, and this module is the seam that lets the test target call
     //! them. It does not exist in an ordinary build.
 
-    pub use crate::engine::loom_model::{arena, handoff, skiplist, slice, version};
+    pub use crate::engine::loom_model::{arena, handoff, io_queue, skiplist, slice, version};
 }
 
 #[cfg(feature = "fuzzing")]
@@ -1134,7 +1137,26 @@ impl Db {
             engine: Arc::clone(&self.engine),
             cfs: Arc::clone(&self.cfs),
             seq,
+            mode: ReadMode::Blocking,
         }
+    }
+
+    /// A new I/O queue for the calling thread (plan 4.10, D53).
+    ///
+    /// Hand its [`IoQueue::id`] to the read handles this thread uses, in
+    /// [`ReadMode::CacheOnly`] through [`Snapshot::with_read_mode`] or
+    /// [`TxnOptions::read_mode`]: their reads then never touch the device,
+    /// and return [`Error::WouldBlock`] when they need a block the cache
+    /// does not hold. The thread polls the queue with [`IoQueue::poll`] when
+    /// it has nothing else to run, which reads those blocks, and runs the
+    /// reads again. regolith adds no thread for this: each thread does its
+    /// own I/O.
+    ///
+    /// One queue per thread; only the thread holding it polls it. A queue
+    /// costs nothing while it waits on nothing, and a database that never
+    /// opens one pays nothing for the mechanism.
+    pub fn io_queue(&self) -> IoQueue {
+        self.engine.io_queue()
     }
 
     /// Scan a key range lazily, holding one entry rather than the range.
@@ -2081,6 +2103,15 @@ impl<'a> CfIter<'a> {
         self.inner.seek_for_prev(&prefix_key(self.cf_id, target));
     }
 
+    /// Position the cursor at the last key strictly below `end` in the CF,
+    /// and set the scan direction to reverse.
+    pub(crate) fn seek_before(&mut self, end: &[u8]) {
+        if !self.valid_cf {
+            return;
+        }
+        self.inner.seek_to_last_before(&prefix_key(self.cf_id, end));
+    }
+
     /// Position the cursor at the first key in this CF that starts
     /// with `prefix`, and bound subsequent forward iteration to
     /// that prefix. Delegates to the underlying [`Iter::seek_prefix`],
@@ -2108,6 +2139,15 @@ impl<'a> CfIter<'a> {
             return;
         }
         self.inner.prev();
+    }
+
+    /// Run the seek or step a [`WouldBlock`] interrupted again, once the
+    /// queue it names was polled. See [`Iter::resume`].
+    pub fn resume(&mut self) {
+        if !self.valid_cf {
+            return;
+        }
+        self.inner.resume();
     }
 
     /// Whether the caller has positioned this cursor at all. See
@@ -2186,7 +2226,8 @@ pub struct OwnedSnapshotIter {
 impl OwnedSnapshotIter {
     fn new(snapshot: Snapshot) -> Self {
         let inner = Iter::<'static>::from_internal(snapshot.engine.new_iter_at(snapshot.seq))
-            .with_stats(snapshot.engine.statistics_arc());
+            .with_stats(snapshot.engine.statistics_arc())
+            .with_mode(snapshot.mode);
         Self {
             inner: CfIter::new(inner, DEFAULT_CF_ID),
             _snapshot: snapshot,
@@ -2232,6 +2273,18 @@ impl OwnedSnapshotIter {
     /// Move the cursor backward.
     pub fn prev(&mut self) {
         self.inner.prev();
+    }
+
+    /// Run the seek or step a [`WouldBlock`] interrupted again, once the
+    /// queue it names was polled. See [`Iter::resume`].
+    ///
+    /// A cursor made from a [`ReadMode::CacheOnly`] snapshot stops on a block
+    /// the cache does not hold: [`valid`](Self::valid) turns `false` and
+    /// [`status`](Self::status) reports [`Error::WouldBlock`]. This carries
+    /// the walk on from exactly where it stopped, so a walk interrupted any
+    /// number of times yields the same entries as one that never was.
+    pub fn resume(&mut self) {
+        self.inner.resume();
     }
 
     /// Whether the caller has positioned this cursor at all. See
@@ -2282,6 +2335,10 @@ impl OwnedSnapshotIter {
 /// `None`. The entries before the `Err` are a prefix of the range and the
 /// rest was never read; `collect::<Result<Vec<_>>>()` keeps the rows only
 /// when the whole range was read.
+///
+/// The one `Err` that does not end the stream is [`Error::WouldBlock`], from
+/// a stream of a [`ReadMode::CacheOnly`] snapshot: poll the queue it names
+/// and take the next item, and the scan carries on exactly where it stopped.
 ///
 /// The scan runs against a pinned snapshot, so writes that land while it
 /// is being drained are invisible to it and the range cannot shift
@@ -2340,6 +2397,12 @@ impl std::fmt::Debug for ScanStream {
 /// ends with one `Err` item, so a failed scan is never read as a short one.
 /// After it, or after the end of the range, the iterator returns `None`.
 ///
+/// [`Error::WouldBlock`] is the one error that does not end the walk: a
+/// cursor read in [`ReadMode::CacheOnly`] hands it out when it needs a block
+/// the cache does not hold. Poll the queue it names, then ask for the next
+/// item: the cursor resumes where it stopped, and the items that follow are
+/// exactly those an uninterrupted walk would have yielded.
+///
 /// This is the seam to build a `Stream` on. regolith's IO is synchronous
 /// and it requires no async runtime, so wrapping a ready iterator with
 /// `futures::stream::iter` belongs where the async context is rather than
@@ -2350,6 +2413,9 @@ pub struct Entries<C> {
     reverse: bool,
     /// The range ended or the walk failed; nothing more is read.
     ended: bool,
+    /// The last item was a `WouldBlock`: the next one resumes the cursor
+    /// instead of stepping it.
+    blocked: bool,
 }
 
 impl<C> Entries<C> {
@@ -2359,6 +2425,7 @@ impl<C> Entries<C> {
             started: false,
             reverse,
             ended: false,
+            blocked: false,
         }
     }
 
@@ -2380,7 +2447,11 @@ macro_rules! impl_entries {
                 if self.ended {
                     return None;
                 }
-                if self.started {
+                if self.blocked {
+                    // The step or seek the last item interrupted runs again.
+                    self.blocked = false;
+                    self.cursor.resume();
+                } else if self.started {
                     if self.reverse {
                         self.cursor.prev();
                     } else {
@@ -2405,9 +2476,22 @@ macro_rules! impl_entries {
                     // identical from the position alone: the range ended, or
                     // the walk failed. The status tells them apart, and a
                     // failure is handed out as an item so it cannot pass for
-                    // the end of the range.
-                    self.ended = true;
-                    return self.cursor.status().err().map(Err);
+                    // the end of the range. A `WouldBlock` pauses the walk
+                    // rather than ending it.
+                    return match self.cursor.status() {
+                        Ok(()) => {
+                            self.ended = true;
+                            None
+                        }
+                        Err(error @ Error::WouldBlock(_)) => {
+                            self.blocked = true;
+                            Some(Err(error))
+                        }
+                        Err(error) => {
+                            self.ended = true;
+                            Some(Err(error))
+                        }
+                    };
                 }
                 let key = self.cursor.key()?.to_vec();
                 let value = self.cursor.value_slice()?;
@@ -2467,10 +2551,16 @@ impl<'a> CfIter<'a> {
 }
 
 /// A point-in-time snapshot for consistent reads.
+///
+/// A snapshot reads in a [`ReadMode`], `Blocking` unless
+/// [`Snapshot::with_read_mode`] says otherwise, and every iterator, cursor and
+/// stream made from it reads in the same mode.
 pub struct Snapshot {
     engine: Arc<RegolithEngine>,
     cfs: Arc<CfRegistry>,
     seq: u64,
+    /// Where this snapshot's block-cache misses go.
+    mode: ReadMode,
 }
 
 impl Drop for Snapshot {
@@ -2499,7 +2589,34 @@ impl Snapshot {
             engine: Arc::clone(&self.engine),
             cfs: Arc::clone(&self.cfs),
             seq: self.seq,
+            mode: self.mode,
         }
+    }
+
+    /// This snapshot, reading in `mode` from now on.
+    ///
+    /// Under [`ReadMode::CacheOnly`] no read through this snapshot touches
+    /// the device: a point read, a scan, an iterator step or a stream item
+    /// that needs a block the cache does not hold returns
+    /// [`Error::WouldBlock`], and the block is read when the queue the mode
+    /// names is polled. Run the read again after that poll; an iterator or a
+    /// stream resumes where it stopped. A point read run again reads the same
+    /// sequence, so it sees what the first attempt would have seen.
+    pub fn with_read_mode(mut self, mode: ReadMode) -> Self {
+        self.mode = mode;
+        self
+    }
+
+    /// The mode this snapshot reads in.
+    pub fn read_mode(&self) -> ReadMode {
+        self.mode
+    }
+
+    /// Run `read` in this snapshot's mode. `Blocking` sets nothing.
+    #[inline]
+    fn reading<T>(&self, read: impl FnOnce() -> T) -> T {
+        let _scope = self.mode.scope();
+        read()
     }
 
     fn validate_cf_handle(&self, cf: &ColumnFamilyHandle) -> Result<()> {
@@ -2544,8 +2661,7 @@ impl Snapshot {
     }
 
     fn lookup_slice(&self, lk: &LookupKey) -> Result<Option<DbSlice>> {
-        self.engine
-            .get_slice(lk)
+        self.reading(|| self.engine.get_slice(lk))
             .map_err(|err| map_point_read_error(err, lk.prefixed_user_key()))
     }
 
@@ -2600,8 +2716,7 @@ impl Snapshot {
     }
 
     fn lookup_size(&self, lk: &LookupKey, limit: Option<usize>) -> Result<Option<usize>> {
-        self.engine
-            .get_size(lk, limit)
+        self.reading(|| self.engine.get_size(lk, limit))
             .map_err(|err| map_point_read_error(err, lk.prefixed_user_key()))
     }
 
@@ -2609,8 +2724,7 @@ impl Snapshot {
     pub fn multi_get(&self, keys: &[&[u8]]) -> Result<Vec<Option<Vec<u8>>>> {
         let owned: Vec<Vec<u8>> = keys.iter().map(|k| prefix_key(DEFAULT_CF_ID, k)).collect();
         let refs: Vec<&[u8]> = owned.iter().map(|k| k.as_slice()).collect();
-        self.engine
-            .multi_get_at(&refs, self.seq)
+        self.reading(|| self.engine.multi_get_at(&refs, self.seq))
             .map_err(Error::from)
     }
 
@@ -2633,7 +2747,8 @@ impl Snapshot {
             Some(e) => prefix_key(DEFAULT_CF_ID, e),
             None => cf_upper_bound(DEFAULT_CF_ID),
         };
-        let raw = collect_range(self.engine.new_iter_at(self.seq), Some(&lo), Some(&hi))?;
+        let raw = self
+            .reading(|| collect_range(self.engine.new_iter_at(self.seq), Some(&lo), Some(&hi)))?;
         strip_cf_prefix_entries(raw)
     }
 
@@ -2656,7 +2771,7 @@ impl Snapshot {
             Some(e) => prefix_key(DEFAULT_CF_ID, e),
             None => cf_upper_bound(DEFAULT_CF_ID),
         };
-        collect_page(self.engine.new_iter_at(self.seq), &lo, &hi, limit)
+        self.reading(|| collect_page(self.engine.new_iter_at(self.seq), &lo, &hi, limit))
             .and_then(strip_cf_prefix_page)
     }
 
@@ -2665,7 +2780,8 @@ impl Snapshot {
     pub fn iter(&self) -> CfIter<'_> {
         CfIter::new(
             Iter::from_internal(self.engine.new_iter_at(self.seq))
-                .with_stats(self.engine.statistics_arc()),
+                .with_stats(self.engine.statistics_arc())
+                .with_mode(self.mode),
             DEFAULT_CF_ID,
         )
     }
@@ -2725,8 +2841,7 @@ impl Snapshot {
         self.validate_cf_handle(cf)?;
         let owned: Vec<Vec<u8>> = keys.iter().map(|k| prefix_key(cf.id(), k)).collect();
         let refs: Vec<&[u8]> = owned.iter().map(|k| k.as_slice()).collect();
-        self.engine
-            .multi_get_at(&refs, self.seq)
+        self.reading(|| self.engine.multi_get_at(&refs, self.seq))
             .map_err(Error::from)
     }
 
@@ -2752,7 +2867,8 @@ impl Snapshot {
             Some(e) => prefix_key(cf.id(), e),
             None => cf_upper_bound(cf.id()),
         };
-        let raw = collect_range(self.engine.new_iter_at(self.seq), Some(&lo), Some(&hi))?;
+        let raw = self
+            .reading(|| collect_range(self.engine.new_iter_at(self.seq), Some(&lo), Some(&hi)))?;
         strip_cf_prefix_entries(raw)
     }
 
@@ -2778,14 +2894,15 @@ impl Snapshot {
             Some(e) => prefix_key(cf.id(), e),
             None => cf_upper_bound(cf.id()),
         };
-        collect_page(self.engine.new_iter_at(self.seq), &lo, &hi, limit)
+        self.reading(|| collect_page(self.engine.new_iter_at(self.seq), &lo, &hi, limit))
             .and_then(strip_cf_prefix_page)
     }
 
     /// CF-scoped streaming iterator at this snapshot.
     pub fn iter_cf<'a>(&'a self, cf: &ColumnFamilyHandle) -> CfIter<'a> {
         let inner = Iter::from_internal(self.engine.new_iter_at(self.seq))
-            .with_stats(self.engine.statistics_arc());
+            .with_stats(self.engine.statistics_arc())
+            .with_mode(self.mode);
         if self.is_live_cf_handle(cf) {
             CfIter::new(inner, cf.id())
         } else {

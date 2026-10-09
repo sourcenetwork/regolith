@@ -1,419 +1,887 @@
 ---- MODULE NonBlocking ----
-\* R13, non-blocking calls (plan 4.10): no regolith call waits for another
-\* thread. A call that would wait returns a handle instead: a CommitTicket
-\* from commit_nowait, or WouldBlock::Io(IoWait) from a CacheOnly read that
-\* misses the block cache. The caller's own threads do the I/O through
-\* poll_io, and wait for work on io_pending.
+\* ===========================================================================
+\* THE STORY
+\* ===========================================================================
+\* regolith reads a table block from the disk when a reader needs it and the
+\* block cache does not hold it. A thread that must never block cannot wait
+\* for that disk read. So each such thread holds its own "I/O queue" (an
+\* IoQueue in src/io_queue/queue.rs), and reads through a CacheOnly handle:
+\*   - the read looks in the cache; on a miss it does NOT touch the disk.
+\*     It records the block on its own queue and returns WouldBlock at once;
+\*   - later, when the thread has nothing else to do, it polls its queue.
+\*     The poll does the disk reads its thread is waiting for, and hands
+\*     every waiting read a "you can run again now" note;
+\*   - the read runs again and finds its block.
 \*
-\* NO LEAN COUNTERPART. What this model checks is about interleavings:
-\* wakeups, notifications and who runs the I/O. There is no law over sizes
-\* to prove, so TLC is the whole check. The commits whose tickets complete
-\* here are the pipeline's slots (CommitPipeline.tla; Lean Pipeline.lean).
+\* Tiny example. Two threads, A and B, both miss block 7 at the same moment.
+\* There is ONE "unit" for block 7 (a single-flight read, src/engine/io/unit.rs).
+\* A polls first and grabs the unit with one compare-and-swap; B's poll sees
+\* it taken and leaves it alone. A reads block 7 once, then puts one "done"
+\* note into A's inbox and one into B's inbox. B was asleep ("idle"), so the
+\* note to B also wakes B up. A was awake, so nothing wakes A: it just finds
+\* the note at its next poll.
 \*
-\* THE API (4.10, 3.0).
-\*   Transaction::commit_nowait -> CommitTicket
-\*     Decides and writes the commit and returns at once. The ticket is a
-\*     Future that resolves when the commit is durable (at Immediate) and
-\*     visible. on_complete(f) runs f once, on the thread that completes
-\*     the ticket, or at once if it is already complete.
-\*   ReadMode::CacheOnly
-\*     A read that misses the block cache never touches the device: it
-\*     returns WouldBlock::Io(IoWait) and queues the block read for
-\*     poll_io, once per block however many readers missed it
-\*     (single-flight). IoWait is a Future that resolves when the block is
-\*     cached; the read is then run again.
-\*   Db::poll_io(budget) -> IoProgress { completed, more_pending }
-\*     Does at most budget units of pending I/O (the durability sync, queued
-\*     block reads, a flush owed with no worker, the disk check) and
-\*     returns at once when none is pending.
-\*   Db::io_pending() -> Notified
-\*     Fires whenever regolith queues I/O, including I/O it starts itself,
-\*     so the caller's I/O threads wait on it instead of polling.
+\* What can go wrong, and what this model checks cannot happen:
+\*   - a note lands in the wrong thread's inbox, so the wrong thread finishes
+\*     a read and the right one never hears (OwnQueue);
+\*   - a thread is told twice, or a thread that asked is never told
+\*     (ExactlyOnce, EveryWaiterTold);
+\*   - two threads both grab the same unit and read the block twice
+\*     (SingleRun);
+\*   - a thread goes to sleep right as a note arrives and sleeps forever with
+\*     a note in its inbox (NoLostIdleWakeup);
+\*   - a thread that is busy gets woken anyway (BusyNeverWoken);
+\*   - some I/O regolith starts by itself is put on nobody's queue, so it
+\*     never runs (NoOrphanUnit);
+\*   - and, over whole runs: every read and every job finishes, with many
+\*     threads or with one (the single-threaded wasm case) (AllDone).
 \*
-\* HOW A FUTURE IS POLLED HERE. A task awaiting a ticket or an IoWait first
-\* registers its waker on the handle, then checks whether the handle is
-\* ready, and parks only if it is not. Whoever makes a handle ready takes
-\* the registered wakers and wakes them in the same step. Mutant
-\* LostWakeup checks first and registers after, with no recheck: a
-\* completion in between finds no waker, and the task parks on a ready
-\* handle for good.
+\* WHAT IS MODELLED, and the code each piece mirrors:
+\*   unit        a single-flight read: Unit, src/engine/io/unit.rs
+\*   table       the unit table: IoRuntime::units, src/engine/io/mod.rs
+\*   inbox       a queue's lock-free inbox: QueueShared::inbox,
+\*               src/engine/io/shared.rs, a Stack with an IDLE flag bit
+\*   waiting     the units a queue registered on: IoQueue::waiting
+\*   slot        one read's wait: WaitSlot, behind each IoWait
+\*   have        what a re-run read finds for its queue: the reads that
+\*               landed for the queue (QueueShared::landed). The block cache
+\*               is left out on purpose: it only ever makes a re-run find its
+\*               block sooner, so this is the hard case, the one where only
+\*               the landing carries the read (a disabled cache).
 \*
-\* CHOICES WHERE THE PLAN IS SILENT.
-\*   - Each poll_io call does one unit (budget 1), the smallest budget. A
-\*     thread that sees more_pending calls again; a larger budget runs the
-\*     same units with fewer returns.
-\*   - io_pending is a Notify that stores one permit when nobody waits, so
-\*     a notification sent while the I/O thread is busy is not lost.
-\*   - on_complete registration is one CAS on the ticket's state word: it
-\*     either queues the callback for the completer or, finding the ticket
-\*     complete, runs it at once. Exactly one of the two runs it.
-\*   - Single-threaded wasm: one thread runs every task and calls poll_io
-\*     only when no task can run. It never waits on io_pending.
+\* WHAT IS LEFT OUT, and why that loses nothing:
+\*   - Memory ordering and the exact CAS loops: the loom models check those
+\*     (tests/loom_io_queue.rs). Here each CAS is one atomic step.
+\*   - The byte bound on a queue: it delays a read (a "room" wait) but never
+\*     changes who is told what.
+\*   - A dropped queue: it releases its units exactly as close does (Release
+\*     below), so it adds no new kind of step.
+\*   - Read failures: a failed unit is told to its waiters like a landed one;
+\*     only what lands differs.
+\*   - Jobs (I/O regolith starts itself, a flush with no worker) are not in
+\*     the read package's code yet: the commit side adds them. They take the
+\*     very same path as a read's miss (a unit, a request on the starting
+\*     thread's own queue), which is why the queue was built this way; the
+\*     model shows that path is enough for them.
 \*
-\* WHAT THE MODEL LEAVES OUT, and why that loses nothing.
-\*   - Commits at Eventual durability: their ticket is ready once applied
-\*     and owes no I/O, so no wakeup can be lost on it.
-\*   - The blocking commit() and get(): they run the same I/O units on the
-\*     calling thread.
-\*   - Cache eviction between a block's arrival and the re-read: the re-read
-\*     misses again and takes the same path once more.
-\*   - Write stalls (WouldBlock::Stall) and lock waits (WouldBlock::Locked):
-\*     the same register-then-recheck handle, woken by a flush or a release
-\*     instead of by I/O.
-\*   - close(), which completes every ticket and wakes every IoWait with
-\*     Closed: one more completer.
+\* CONFIGURATIONS (each GREEN must pass, each RED must break the one
+\* invariant it names):
+\*   MC_NonBlocking_Green_Pool       two threads miss one block, and one of
+\*                                   them a second block of its own.
+\*   MC_NonBlocking_Green_Jobs       two threads miss one block while a
+\*                                   call on one of them starts a job.
+\*   MC_NonBlocking_Green_Single     one thread does everything (wasm).
+\*   (Both pool setups at once, two blocks and a job, also passes: 2,283,135
+\*   distinct states, about three minutes on eight workers; too slow for
+\*   the recipe's single worker, so the recipe checks the two halves.)
+\*   MC_NonBlocking_Red_WrongQueue   a read's request goes to the other
+\*                                   thread's queue: OwnQueue breaks.
+\*   MC_NonBlocking_Red_LostIdleWakeup  an owner checks "inbox empty" and
+\*                                   marks itself idle in two steps:
+\*                                   NoLostIdleWakeup breaks.
+\*   MC_NonBlocking_Red_DoubleRun    a claim that also succeeds on a claimed
+\*                                   unit: SingleRun breaks.
+\*   MC_NonBlocking_Red_SelfIoNowhere  a job's unit is put on no queue:
+\*                                   NoOrphanUnit breaks.
+\*   MC_NonBlocking_Red_BusyWoken    a poll that forgets to clear the idle
+\*                                   flag: BusyNeverWoken breaks.
 \*
-\* CONFIGURATIONS.
-\*   MC_NonBlocking_Green_Pool        Mode = "pool": two commits (one with a
-\*     callback), two reads of one block, one self-started unit, two I/O
-\*     threads on io_pending. Every invariant and the liveness properties
-\*     hold.
-\*   MC_NonBlocking_Green_Single      Mode = "single": one thread does it
-\*     all, polling I/O when idle. Every invariant and the liveness
-\*     properties hold.
-\*   MC_NonBlocking_Red_LostWakeup    Mutant = "LostWakeup".
-\*     NoLostWakeup fails.
-\*   MC_NonBlocking_Red_SilentSelfIo  Mutant = "SilentSelfIo": I/O regolith
-\*     starts itself does not fire io_pending. IoPendingFires fails.
+\* Lean, proofs/lean/Regolith/IoQueue.lean, proves the same rules for every
+\* number of threads and units.
 
-EXTENDS Naturals, FiniteSets
+\* We use numbers, sequences (for inboxes) and finite sets.
+EXTENDS Naturals, Sequences, FiniteSets
 
+\* The fixed inputs of a configuration.
 CONSTANTS
-  CommitTasks,  \* tasks that call commit_nowait at Immediate and await the ticket
-  Callbacks,    \* the commit tasks that also register an on_complete callback
-  ReadTasks,    \* tasks that read one block through a CacheOnly handle
-  Blocks,       \* the blocks those reads need, none cached at the start
-  BlockOf,      \* [ReadTasks -> Blocks]: the block each read needs
-  IoThreads,    \* the caller's threads reserved for I/O (pool mode)
-  SelfJobs,     \* how many units of I/O regolith starts itself in a run
-  Mode,         \* "pool" or "single"
-  Mutant        \* "none", "LostWakeup" or "SilentSelfIo"
+  \* The threads. Each holds exactly one queue, named after it.
+  Threads,
+  \* The blocks reads can miss.
+  Blocks,
+  \* [Threads -> SUBSET Blocks]: the blocks each thread's reads need.
+  Want,
+  \* Names for I/O regolith starts itself; disjoint from Blocks.
+  Jobs,
+  \* [Jobs -> Threads]: the thread whose call started each job.
+  JobOf,
+  \* How many units may ever be made (each miss of a gone unit makes one).
+  MaxUnits,
+  \* "none" for the real code, or the name of one planted bug.
+  Mutant
 
-\* Every task.
-Tasks == CommitTasks \cup ReadTasks
+\* Unit number 0 means "no unit".
+NoUnit == 0
+\* The unit numbers that can exist.
+Ids == 1..MaxUnits
+\* Everything a unit can read: a block or a job.
+Things == Blocks \cup Jobs
+\* What thread t is waiting to see finished: its reads and its jobs.
+Goal(t) == Want[t] \cup {j \in Jobs : JobOf[j] = t}
+\* The other thread (only used by the WrongQueue bug, with two threads).
+Other(t) == CHOOSE o \in Threads : o # t
 
-ASSUME CommitTasks \cap ReadTasks = {}
-ASSUME Callbacks \subseteq CommitTasks
-ASSUME BlockOf \in [ReadTasks -> Blocks]
-ASSUME SelfJobs \in Nat
-ASSUME Mode \in {"pool", "single"}
-ASSUME Mode = "single" => IoThreads = {}
-ASSUME Mutant \in {"none", "LostWakeup", "SilentSelfIo"}
+\* Blocks and jobs are different things.
+ASSUME Blocks \cap Jobs = {}
+\* Each thread wants a set of blocks.
+ASSUME Want \in [Threads -> SUBSET Blocks]
+\* Each job belongs to one thread.
+ASSUME JobOf \in [Jobs -> Threads]
+\* Unit counts are natural numbers.
+ASSUME MaxUnits \in Nat
+\* The bug names this model knows.
+ASSUME Mutant \in {"none", "WrongQueue", "LostIdleWakeup", "DoubleRun",
+                   "SelfIoNowhere", "BusyWoken"}
 
+\* The state that changes from step to step.
 VARIABLES
-  tpc,       \* [Tasks -> phase]: "start", "await" (about to poll its handle),
-             \* "registered" (waker registered, recheck next), "checked"
-             \* (Mutant LostWakeup: checked, not registered), "parked",
-             \* "retry" (a read whose block arrived, to run again), "done"
-  ticket,    \* [CommitTasks -> {"none", "pending", "complete"}]
-  unsynced,  \* the commits written but not yet durable: the sync owed
-  synced,    \* the commits a sync made durable
-  cb,        \* [CommitTasks -> {"none", "registered", "ran"}]: on_complete
-  cbRuns,    \* [CommitTasks -> Nat]: how many times the callback ran
-  reg,       \* the tasks whose waker is registered on the handle they await
-  cached,    \* the blocks in the block cache
-  queued,    \* the block reads queued for poll_io
-  devReads,  \* [Blocks -> Nat]: device reads of each block
-  jobs,      \* self-started units of I/O queued (a flush with no worker,
-             \* the disk check)
-  started,   \* self-started units so far
-  permit,    \* io_pending holds a stored notification
-  io         \* [IoThreads -> {"waiting", "polling"}]
+  \* [Things -> Ids \cup {NoUnit}]: which unit the table holds for each
+  \* block or job right now (IoRuntime::units).
+  table,
+  \* [Ids -> Things \cup {NoUnit}]: what each unit reads.
+  what,
+  \* [Ids -> {"none","free","claimed","done"}]: Unit::state. "none" means
+  \* the number is not handed out yet.
+  state,
+  \* [Ids -> {"none","landed","released"}]: how a done unit ended: it read
+  \* its block ("landed"), or close let it go without reading ("released").
+  outcome,
+  \* [Ids -> SUBSET Threads]: queues registered on the unit (its waiter
+  \* Stack).
+  waiters,
+  \* [Ids -> BOOLEAN]: the SHUT flag on the unit's waiter Stack.
+  shut,
+  \* [Ids -> SUBSET Threads]: ghost, every queue whose registration
+  \* succeeded, kept to check who must be told.
+  regd,
+  \* [Ids -> SUBSET Threads]: threads that claimed the unit and have not
+  \* finished running it.
+  runners,
+  \* [Ids -> Nat]: ghost, how many times the unit's disk read ran.
+  runs,
+  \* [Ids -> SUBSET Threads]: queues the finishing thread still has to put
+  \* a "done" note into.
+  toTell,
+  \* [Threads -> [Ids -> Nat]]: ghost, "done" notes each queue was given
+  \* for each unit.
+  told,
+  \* The next unit number to hand out.
+  next,
+  \* [Threads -> Seq(message)]: each queue's inbox, oldest first.
+  inbox,
+  \* [Threads -> BOOLEAN]: the IDLE flag bit in each inbox's head word.
+  idleFlag,
+  \* [Threads -> Seq(message)]: notes the owner took out of its inbox and
+  \* is still handling, one by one.
+  taken,
+  \* [Threads -> SUBSET Ids]: units each queue registered on (IoQueue::
+  \* waiting).
+  waiting,
+  \* [Threads -> [Ids -> SUBSET Threads]]: for each queue and unit, the
+  \* threads whose reads that queue recorded for it (the WaitSlots kept in
+  \* the waiting entry).
+  attached,
+  \* [Threads -> [Things -> {"none","pending","ready"}]]: each read's wait:
+  \* none, waiting, or ready to run again.
+  slot,
+  \* [Threads -> SUBSET Things]: blocks that landed for each queue.
+  have,
+  \* [Threads -> SUBSET Things]: reads that returned an answer, and jobs
+  \* whose I/O finished.
+  done,
+  \* The jobs regolith has started.
+  started,
+  \* [Threads -> {"busy","idle"}]: is the owner thread running or asleep.
+  own,
+  \* [Threads -> BOOLEAN]: the owner's idle waker fired and it has not run
+  \* since.
+  woken,
+  \* [Threads -> BOOLEAN]: bug LostIdleWakeup only: the owner saw an empty
+  \* inbox and has not marked itself idle yet.
+  checking,
+  \* close() has run.
+  closedDb
 
-\* Every variable, so a step that changes none of them is a stutter.
-vars == <<tpc, ticket, unsynced, synced, cb, cbRuns, reg, cached, queued, devReads,
-          jobs, started, permit, io>>
+\* Every variable, so "nothing changed" can be written once.
+vars == <<table, what, state, outcome, waiters, shut, regd, runners, runs,
+          toTell, told, next, inbox, idleFlag, taken, waiting, attached,
+          slot, have, done, started, own, woken, checking, closedDb>>
 
-----------------------------------------------------------------------------
-\* Helpers.
+\* A note in an inbox: "read" (a read recorded unit u for reader r) or
+\* "done" (unit u finished).
+Msg == [kind : {"read", "done"}, u : Ids, reader : Threads \cup {0}]
 
-\* The handle task t awaits is ready: its ticket completed, or its block is
-\* cached.
-Ready(t) ==
-  IF t \in CommitTasks THEN ticket[t] = "complete" ELSE BlockOf[t] \in cached
-
-\* Where task t goes once its handle is ready: a commit is done; a read
-\* runs again.
-After(t) == IF t \in CommitTasks THEN "done" ELSE "retry"
-
-\* Task t can take a step: it is neither parked nor done.
-Runnable(t) == tpc[t] \notin {"parked", "done"}
-
-\* Some I/O is queued: a sync owed, a block read, or a self-started unit.
-PendingIo == unsynced # {} \/ queued # {} \/ jobs > 0
-
-\* Wake the tasks in W whose wakers are registered: a parked one runs again
-\* and polls its handle anew; one between registering and its recheck
-\* finds the handle ready at the recheck. Either way the waker is used up.
-WakeTpc(W) == [t \in Tasks |-> IF t \in W /\ t \in reg /\ tpc[t] = "parked" THEN "await" ELSE tpc[t]]
-
-----------------------------------------------------------------------------
-\* Actions of the tasks.
-
-\* The start: no commit, nothing cached or queued, no notification, every
-\* I/O thread waiting on io_pending.
+\* The start: no unit, empty inboxes, every thread busy, nothing done.
 Init ==
-  /\ tpc      = [t \in Tasks |-> "start"]
-  /\ ticket   = [c \in CommitTasks |-> "none"]
-  /\ unsynced = {}
-  /\ synced   = {}
-  /\ cb       = [c \in CommitTasks |-> "none"]
-  /\ cbRuns   = [c \in CommitTasks |-> 0]
-  /\ reg      = {}
-  /\ cached   = {}
-  /\ queued   = {}
-  /\ devReads = [b \in Blocks |-> 0]
-  /\ jobs     = 0
-  /\ started  = 0
-  /\ permit   = FALSE
-  /\ io       = [th \in IoThreads |-> "waiting"]
+  \* No block or job has a unit in the table.
+  /\ table = [x \in Things |-> NoUnit]
+  \* No unit number reads anything yet.
+  /\ what = [u \in Ids |-> NoUnit]
+  \* No unit number is in use.
+  /\ state = [u \in Ids |-> "none"]
+  \* No unit has ended.
+  /\ outcome = [u \in Ids |-> "none"]
+  \* Nobody waits on any unit.
+  /\ waiters = [u \in Ids |-> {}]
+  \* Every waiter list is open.
+  /\ shut = [u \in Ids |-> FALSE]
+  \* Nobody has registered anywhere.
+  /\ regd = [u \in Ids |-> {}]
+  \* Nobody is running a unit.
+  /\ runners = [u \in Ids |-> {}]
+  \* No disk read has run.
+  /\ runs = [u \in Ids |-> 0]
+  \* Nobody is owed a note.
+  /\ toTell = [u \in Ids |-> {}]
+  \* No note has been given.
+  /\ told = [q \in Threads |-> [u \in Ids |-> 0]]
+  \* The first unit gets number 1.
+  /\ next = 1
+  \* Every inbox is empty.
+  /\ inbox = [q \in Threads |-> <<>>]
+  \* No owner is marked idle.
+  /\ idleFlag = [q \in Threads |-> FALSE]
+  \* Nobody is in the middle of handling notes.
+  /\ taken = [q \in Threads |-> <<>>]
+  \* No queue is registered on a unit.
+  /\ waiting = [q \in Threads |-> {}]
+  \* No queue holds a read for a unit.
+  /\ attached = [q \in Threads |-> [u \in Ids |-> {}]]
+  \* No read is waiting.
+  /\ slot = [t \in Threads |-> [x \in Things |-> "none"]]
+  \* Nothing has landed anywhere.
+  /\ have = [q \in Threads |-> {}]
+  \* No read has answered.
+  /\ done = [t \in Threads |-> {}]
+  \* No job has started.
+  /\ started = {}
+  \* Every thread is running.
+  /\ own = [t \in Threads |-> "busy"]
+  \* No waker has fired.
+  /\ woken = [t \in Threads |-> FALSE]
+  \* Nobody is half way into going idle.
+  /\ checking = [t \in Threads |-> FALSE]
+  \* The database is open.
+  /\ closedDb = FALSE
 
-\* Commit task c calls commit_nowait: the commit is decided and written, a
-\* sync is owed, io_pending fires, and c holds a pending ticket.
-CommitNowait(c) ==
-  /\ tpc[c] = "start"
-  /\ tpc'      = [tpc EXCEPT ![c] = "await"]
-  /\ ticket'   = [ticket EXCEPT ![c] = "pending"]
-  /\ unsynced' = unsynced \cup {c}
-  /\ permit'   = TRUE
-  /\ UNCHANGED <<synced, cb, cbRuns, reg, cached, queued, devReads, jobs, started, io>>
+-----------------------------------------------------------------------------
+\* HELPERS
 
-\* Commit task c registers its on_complete callback with one CAS: queued
-\* for the completer while the ticket is pending, run at once on c's own
-\* thread when the ticket is already complete.
-OnComplete(c) ==
-  /\ c \in Callbacks
-  /\ cb[c] = "none"
-  /\ tpc[c] = "await"
-  /\ IF ticket[c] = "complete"
-       THEN /\ cb'     = [cb EXCEPT ![c] = "ran"]
-            /\ cbRuns' = [cbRuns EXCEPT ![c] = @ + 1]
-       ELSE /\ cb'     = [cb EXCEPT ![c] = "registered"]
-            /\ UNCHANGED cbRuns
-  /\ UNCHANGED <<tpc, ticket, unsynced, synced, reg, cached, queued, devReads, jobs, started,
-                 permit, io>>
+\* Put note m at the back of queue q's inbox (QueueShared::deliver). If q
+\* was marked idle, this push is the one that clears the mark and wakes q.
+Push(q, m) ==
+  \* The note goes to the back of q's inbox.
+  /\ inbox' = [inbox EXCEPT ![q] = Append(@, m)]
+  \* Any push clears the IDLE bit (the CAS writes a word without it).
+  /\ idleFlag' = [idleFlag EXCEPT ![q] = FALSE]
+  \* If the bit was set, this push wakes q's idle waker.
+  /\ woken' = [woken EXCEPT ![q] = @ \/ idleFlag[q]]
 
-\* Read task r reads its block through a CacheOnly handle. A hit finishes
-\* it. A miss returns WouldBlock::Io(IoWait) without touching the device and
-\* queues the block read, unless one is already queued (single-flight);
-\* queuing it fires io_pending.
-Read(r) ==
-  LET b == BlockOf[r]
-  IN /\ tpc[r] \in {"start", "retry"}
-     /\ IF b \in cached
-          THEN /\ tpc' = [tpc EXCEPT ![r] = "done"]
-               /\ UNCHANGED <<queued, permit>>
-          ELSE /\ tpc'    = [tpc EXCEPT ![r] = "await"]
-               /\ queued' = queued \cup {b}
-               /\ permit' = IF b \in queued THEN permit ELSE TRUE
-     /\ UNCHANGED <<ticket, unsynced, synced, cb, cbRuns, reg, cached, devReads, jobs, started,
-                    io>>
+\* Queue q keeps what unit u read, if it read anything, for q's re-runs.
+Land(q, u) ==
+  \* A landed unit leaves its block for q; a released one leaves nothing.
+  have' = [have EXCEPT ![q] = IF outcome[u] = "landed" THEN @ \cup {what[u]} ELSE @]
 
-\* A commit task registers its callback before it awaits, if it has one.
-CallbackSettled(t) == t \in CommitTasks /\ t \in Callbacks => cb[t] # "none"
+\* Mark ready the waits of readers rs for thing x (WaitSlot::complete).
+Ready(rs, x) ==
+  \* Each reader in rs that waits on x is now ready to run again.
+  slot' = [t \in Threads |-> IF t \in rs /\ slot[t][x] = "pending"
+                             THEN [slot[t] EXCEPT ![x] = "ready"] ELSE slot[t]]
 
-\* Polling, first half. The fix: register the waker. Mutant LostWakeup:
-\* check readiness first, without registering.
-PollFirst(t) ==
-  /\ tpc[t] = "await"
-  /\ CallbackSettled(t)
-  /\ IF Mutant = "LostWakeup"
-       THEN /\ tpc' = [tpc EXCEPT ![t] = IF Ready(t) THEN After(t) ELSE "checked"]
-            /\ UNCHANGED reg
-       ELSE /\ tpc' = [tpc EXCEPT ![t] = "registered"]
-            /\ reg'  = reg \cup {t}
-  /\ UNCHANGED <<ticket, unsynced, synced, cb, cbRuns, cached, queued, devReads, jobs, started,
-                 permit, io>>
+\* Is unit u free and held by nobody: in no queue's waiting set and no
+\* inbox? Such a unit would never run.
+Held(u) ==
+  \* Some queue has registered on u, or has a request for u on its way.
+  \E q \in Threads :
+    \* q registered on u.
+    \/ u \in waiting[q]
+    \* A request for u sits in q's inbox.
+    \/ \E i \in 1..Len(inbox[q]) : inbox[q][i].kind = "read" /\ inbox[q][i].u = u
+    \* A request for u is among the notes q is handling.
+    \/ \E i \in 1..Len(taken[q]) : taken[q][i].kind = "read" /\ taken[q][i].u = u
 
-\* Polling, second half. The fix: recheck readiness after registering, and
-\* park only if the handle is still not ready. Mutant LostWakeup: register
-\* now and park, with no recheck.
-PollSecond(t) ==
-  \/ /\ tpc[t] = "registered"
-     /\ IF Ready(t)
-          THEN /\ tpc' = [tpc EXCEPT ![t] = After(t)]
-               /\ reg' = reg \ {t}
-          ELSE /\ tpc' = [tpc EXCEPT ![t] = "parked"]
-               /\ UNCHANGED reg
-     /\ UNCHANGED <<ticket, unsynced, synced, cb, cbRuns, cached, queued, devReads, jobs, started,
-                    permit, io>>
-  \/ /\ tpc[t] = "checked"
-     /\ tpc' = [tpc EXCEPT ![t] = "parked"]
-     /\ reg' = reg \cup {t}
-     /\ UNCHANGED <<ticket, unsynced, synced, cb, cbRuns, cached, queued, devReads, jobs, started,
-                    permit, io>>
+\* Thread t's tasks have nothing to run: every goal is done or waiting.
+Quiet(t) ==
+  \* Each read is answered, or waits on the queue.
+  /\ \A x \in Goal(t) : x \in done[t] \/ slot[t][x] = "pending"
+  \* Every job of t has been started.
+  /\ \A j \in Jobs : JobOf[j] = t => j \in started
+  \* t is not in the middle of running a unit.
+  /\ \A u \in Ids : t \notin runners[u]
+  \* t has no notes left to handle.
+  /\ taken[t] = <<>>
 
-\* Any step of task t.
-TaskStep(t) ==
-  \/ t \in CommitTasks /\ (CommitNowait(t) \/ OnComplete(t))
-  \/ t \in ReadTasks /\ Read(t)
-  \/ PollFirst(t)
-  \/ PollSecond(t)
+-----------------------------------------------------------------------------
+\* WHAT A READER DOES (on its own thread, while the thread is busy)
 
-----------------------------------------------------------------------------
-\* Units of I/O. poll_io runs them, one per call; nothing else does.
+\* Thread t runs its read of block x and finds it: it landed for t's queue,
+\* or the database is closed (the read then answers Closed). Either way the
+\* read is over.
+Hit(t, x) ==
+  \* Only a running thread runs reads.
+  /\ own[t] = "busy"
+  \* t wants x and has no answer yet.
+  /\ x \in Want[t] \ done[t]
+  \* No earlier read of x is still waiting.
+  /\ slot[t][x] = "none"
+  \* The block is there, or the database is closed.
+  /\ x \in have[t] \/ closedDb
+  \* The read returns its answer.
+  /\ done' = [done EXCEPT ![t] = @ \cup {x}]
+  \* Nothing else changes.
+  /\ UNCHANGED <<table, what, state, outcome, waiters, shut, regd, runners, runs,
+                 toTell, told, next, inbox, idleFlag, taken, waiting, attached,
+                 slot, have, started, own, woken, checking, closedDb>>
 
-\* The durability sync: every written commit becomes durable and visible,
-\* and its ticket completes on this thread, in this step: the registered
-\* callbacks run here, once, and the registered wakers are woken.
-DoSync ==
-  /\ unsynced # {}
-  /\ ticket'   = [c \in CommitTasks |-> IF c \in unsynced THEN "complete" ELSE ticket[c]]
-  /\ synced'   = synced \cup unsynced
-  /\ unsynced' = {}
-  /\ cb'       = [c \in CommitTasks |-> IF c \in unsynced /\ cb[c] = "registered" THEN "ran" ELSE cb[c]]
-  /\ cbRuns'   = [c \in CommitTasks |->
-                    IF c \in unsynced /\ cb[c] = "registered" THEN cbRuns[c] + 1 ELSE cbRuns[c]]
-  /\ tpc'      = WakeTpc(unsynced)
-  /\ reg'      = reg \ unsynced
-  /\ UNCHANGED <<cached, queued, devReads, jobs, started, permit, io>>
+\* Thread t runs its read of block x and misses (IoRuntime::miss). It does
+\* not touch the disk: it finds or makes the unit for x, puts a "read" note
+\* on its own queue, and returns WouldBlock.
+Miss(t, x) ==
+  \* The unit the table holds for x now.
+  LET cur == table[x]
+      \* No live unit: this miss makes a new one (a finished one is replaced).
+      fresh == cur = NoUnit \/ state[cur] = "done"
+      \* The unit this read waits on.
+      u == IF fresh THEN next ELSE cur
+      \* The queue the note goes to: t's own, unless the WrongQueue bug.
+      q == IF Mutant = "WrongQueue" THEN Other(t) ELSE t
+  \* With those names, the step is:
+  IN
+  \* Only a running thread runs reads.
+  /\ own[t] = "busy"
+  \* t wants x and has no answer yet.
+  /\ x \in Want[t] \ done[t]
+  \* No earlier read of x is still waiting.
+  /\ slot[t][x] = "none"
+  \* The block has not landed for t.
+  /\ x \notin have[t]
+  \* The database is open (a closed one answers Closed, in Hit).
+  /\ ~closedDb
+  \* A new unit needs a free number.
+  /\ fresh => next <= MaxUnits
+  \* A new unit goes into the table for x...
+  /\ table' = IF fresh THEN [table EXCEPT ![x] = next] ELSE table
+  \* ...reading x...
+  /\ what' = IF fresh THEN [what EXCEPT ![next] = x] ELSE what
+  \* ...and free: nobody has claimed it.
+  /\ state' = IF fresh THEN [state EXCEPT ![next] = "free"] ELSE state
+  \* The next number moves on when one was used.
+  /\ next' = IF fresh THEN next + 1 ELSE next
+  \* The "read" note goes to the queue.
+  /\ Push(q, [kind |-> "read", u |-> u, reader |-> t])
+  \* The read now waits.
+  /\ slot' = [slot EXCEPT ![t][x] = "pending"]
+  \* Nothing else changes.
+  /\ UNCHANGED <<outcome, waiters, shut, regd, runners, runs, toTell, told, taken,
+                 waiting, attached, have, done, started, own, checking, closedDb>>
 
-\* A queued block read: the block is read from the device once, enters the
-\* cache, and every read waiting on its IoWait is woken.
-DoRead(b) ==
-  LET waiters == {r \in ReadTasks : BlockOf[r] = b}
-  IN /\ b \in queued
-     /\ cached'   = cached \cup {b}
-     /\ queued'   = queued \ {b}
-     /\ devReads' = [devReads EXCEPT ![b] = @ + 1]
-     /\ tpc'      = WakeTpc(waiters)
-     /\ reg'      = reg \ waiters
-     /\ UNCHANGED <<ticket, unsynced, synced, cb, cbRuns, jobs, started, permit, io>>
+\* A call on thread t makes regolith start job j itself (a flush with no
+\* worker). The job takes the miss path: a unit, and a "read" note on the
+\* starting thread's own queue. Bug SelfIoNowhere puts it on no queue.
+SelfStart(t, j) ==
+  \* Only a running thread makes calls.
+  /\ own[t] = "busy"
+  \* j belongs to t and has not started.
+  /\ JobOf[j] = t /\ j \notin started
+  \* A free unit number is needed.
+  /\ next <= MaxUnits
+  \* The job's unit goes into the table...
+  /\ table' = [table EXCEPT ![j] = next]
+  \* ...doing job j...
+  /\ what' = [what EXCEPT ![next] = j]
+  \* ...unclaimed.
+  /\ state' = [state EXCEPT ![next] = "free"]
+  \* The next number moves on.
+  /\ next' = next + 1
+  \* The job counts as started.
+  /\ started' = started \cup {j}
+  \* The call that started it waits for it on t's queue.
+  /\ slot' = [slot EXCEPT ![t][j] = "pending"]
+  \* The note goes to t's own queue; bug SelfIoNowhere sends it nowhere.
+  /\ IF Mutant = "SelfIoNowhere"
+       \* Nothing is pushed anywhere.
+       THEN UNCHANGED <<inbox, idleFlag, woken>>
+       \* The note lands on the starting thread's own queue.
+       ELSE Push(t, [kind |-> "read", u |-> next, reader |-> t])
+  \* Nothing else changes.
+  /\ UNCHANGED <<outcome, waiters, shut, regd, runners, runs, toTell, told, taken,
+                 waiting, attached, have, done, own, checking, closedDb>>
 
-\* A self-started unit: a flush owed with no compaction worker, or the
-\* disk check.
-DoJob ==
-  /\ jobs > 0
-  /\ jobs' = jobs - 1
-  /\ UNCHANGED <<tpc, ticket, unsynced, synced, cb, cbRuns, reg, cached, queued, devReads,
-                 started, permit, io>>
+\* Thread t's wait for x is ready: it runs again (Hit or Miss decide what
+\* happens). A job's caller just sees its job finished.
+Rerun(t, x) ==
+  \* Only a running thread runs tasks.
+  /\ own[t] = "busy"
+  \* The wait for x is ready.
+  /\ slot[t][x] = "ready"
+  \* The wait is used up.
+  /\ slot' = [slot EXCEPT ![t][x] = "none"]
+  \* A job is finished for its caller; a read will run again.
+  /\ done' = IF x \in Jobs THEN [done EXCEPT ![t] = @ \cup {x}] ELSE done
+  \* Nothing else changes.
+  /\ UNCHANGED <<table, what, state, outcome, waiters, shut, regd, runners, runs,
+                 toTell, told, next, inbox, idleFlag, taken, waiting, attached,
+                 have, started, own, woken, checking, closedDb>>
 
-\* One unit of pending I/O, whichever is chosen.
-IoUnit == DoSync \/ (\E b \in Blocks : DoRead(b)) \/ DoJob
+-----------------------------------------------------------------------------
+\* WHAT A QUEUE'S OWNER DOES WHEN IT POLLS (IoQueue::poll)
 
-----------------------------------------------------------------------------
-\* Who runs the I/O.
+\* The owner takes its whole inbox in one swap, which also clears IDLE.
+Take(t) ==
+  \* Only a running owner polls.
+  /\ own[t] = "busy"
+  \* Something is in the inbox.
+  /\ inbox[t] # <<>>
+  \* The notes join the ones being handled, oldest first.
+  /\ taken' = [taken EXCEPT ![t] = @ \o inbox[t]]
+  \* The inbox is empty now.
+  /\ inbox' = [inbox EXCEPT ![t] = <<>>]
+  \* The swap writes a word with no IDLE bit.
+  /\ idleFlag' = [idleFlag EXCEPT ![t] = FALSE]
+  \* Nothing else changes.
+  /\ UNCHANGED <<table, what, state, outcome, waiters, shut, regd, runners, runs,
+                 toTell, told, next, waiting, attached, slot, have, done, started,
+                 own, woken, checking, closedDb>>
 
-\* Pool mode, I/O thread th: io_pending fired, so it consumes the stored
-\* notification and starts calling poll_io.
-IoWake(th) ==
-  /\ io[th] = "waiting"
-  /\ permit
-  /\ permit' = FALSE
-  /\ io'     = [io EXCEPT ![th] = "polling"]
-  /\ UNCHANGED <<tpc, ticket, unsynced, synced, cb, cbRuns, reg, cached, queued, devReads,
-                 jobs, started>>
+\* The owner handles its oldest taken note.
+Handle(t) ==
+  \* Only a running owner handles notes.
+  /\ own[t] = "busy"
+  \* There is a note to handle.
+  /\ taken[t] # <<>>
+  \* The note, and the unit it names.
+  /\ LET m == Head(taken[t])
+         \* The unit the note is about.
+         u == m.u
+     \* With those names, the step is:
+     IN
+     \* The note is handled now.
+     /\ taken' = [taken EXCEPT ![t] = Tail(@)]
+     \* What else happens depends on the note and the unit:
+     /\ CASE
+          \* A read of a unit this queue already registered on: the read
+          \* joins it (one more WaitSlot in the waiting entry).
+          m.kind = "read" /\ u \in waiting[t] ->
+            \* The reader is recorded with the unit.
+            /\ attached' = [attached EXCEPT ![t][u] = @ \cup {m.reader}]
+            \* Nothing else changes.
+            /\ UNCHANGED <<waiters, shut, regd, waiting, slot, have>>
+          \* A read of a unit this queue has not registered on, still open:
+          \* register (one CAS push onto the unit's waiter Stack).
+          [] m.kind = "read" /\ u \notin waiting[t] /\ ~shut[u] ->
+            \* This queue is on the unit's waiter list now.
+            /\ waiters' = [waiters EXCEPT ![u] = @ \cup {t}]
+            \* Ghost: the registration succeeded.
+            /\ regd' = [regd EXCEPT ![u] = @ \cup {t}]
+            \* The queue waits on the unit.
+            /\ waiting' = [waiting EXCEPT ![t] = @ \cup {u}]
+            \* The reader is recorded with the unit.
+            /\ attached' = [attached EXCEPT ![t][u] = {m.reader}]
+            \* Nothing else changes.
+            /\ UNCHANGED <<shut, slot, have>>
+          \* A read of a unit that finished before the queue could register:
+          \* the push is refused, and the queue reads the outcome itself.
+          [] m.kind = "read" /\ u \notin waiting[t] /\ shut[u] ->
+            \* Whatever the unit read lands for this queue.
+            /\ Land(t, u)
+            \* The reader's wait is ready.
+            /\ Ready({m.reader}, what[u])
+            \* Nothing else changes.
+            /\ UNCHANGED <<waiters, shut, regd, waiting, attached>>
+          \* A unit this queue waits on finished: what it read lands, and
+          \* every read the queue recorded for it is ready.
+          [] m.kind = "done" /\ u \in waiting[t] ->
+            \* The queue stops waiting on the unit.
+            /\ waiting' = [waiting EXCEPT ![t] = @ \ {u}]
+            \* Whatever the unit read lands for this queue.
+            /\ Land(t, u)
+            \* Every read recorded here for the unit is ready.
+            /\ Ready(attached[t][u], what[u])
+            \* The entry is gone.
+            /\ attached' = [attached EXCEPT ![t][u] = {}]
+            \* Nothing else changes.
+            /\ UNCHANGED <<waiters, shut, regd>>
+          \* A "done" note for a unit the queue no longer waits on: nothing.
+          [] OTHER ->
+            \* Nothing changes.
+            UNCHANGED <<waiters, shut, regd, waiting, attached, slot, have>>
+  \* Nothing else changes.
+  /\ UNCHANGED <<table, what, state, outcome, runners, runs, toTell, told, next,
+                 inbox, idleFlag, done, started, own, woken, checking, closedDb>>
 
-\* Pool mode: poll_io does one unit; more_pending keeps th calling.
-IoPoll(th) ==
-  /\ io[th] = "polling"
-  /\ IoUnit
+\* The owner claims a unit it waits on with ONE compare-and-swap from free
+\* to claimed (Unit::claim). Bug DoubleRun also lets a claimed unit be
+\* claimed again.
+Claim(t, u) ==
+  \* Only a running owner claims.
+  /\ own[t] = "busy"
+  \* The queue waits on u.
+  /\ u \in waiting[t]
+  \* The CAS succeeds only on a free unit (the bug: also on a claimed one).
+  /\ \/ state[u] = "free"
+     \* The bug: a unit someone else already claimed.
+     \/ Mutant = "DoubleRun" /\ state[u] = "claimed" /\ t \notin runners[u]
+  \* The unit is claimed.
+  /\ state' = [state EXCEPT ![u] = "claimed"]
+  \* t is running it now.
+  /\ runners' = [runners EXCEPT ![u] = @ \cup {t}]
+  \* Nothing else changes.
+  /\ UNCHANGED <<table, what, outcome, waiters, shut, regd, runs, toTell, told,
+                 next, inbox, idleFlag, taken, waiting, attached, slot, have,
+                 done, started, own, woken, checking, closedDb>>
 
-\* Pool mode: poll_io found nothing pending, so th awaits io_pending again.
-IoIdle(th) ==
-  /\ io[th] = "polling"
-  /\ ~PendingIo
-  /\ io' = [io EXCEPT ![th] = "waiting"]
-  /\ UNCHANGED <<tpc, ticket, unsynced, synced, cb, cbRuns, reg, cached, queued, devReads,
-                 jobs, started, permit>>
+\* The claimer reads the block and finishes the unit (Unit::finish): it
+\* writes the outcome, marks the unit done, shuts the waiter list in ONE
+\* swap (taking every registered queue), and drops the unit from the table.
+Finish(t, u) ==
+  \* t is running u.
+  /\ t \in runners[u]
+  \* t is done running it.
+  /\ runners' = [runners EXCEPT ![u] = @ \ {t}]
+  \* Ghost: the disk read ran once more.
+  /\ runs' = [runs EXCEPT ![u] = @ + 1]
+  \* The first finisher ends the unit; under the bug a second finisher
+  \* finds it already done and only adds a read.
+  /\ IF state[u] = "claimed"
+       \* The unit ends here.
+       THEN /\ state' = [state EXCEPT ![u] = "done"]
+            \* It read its block.
+            /\ outcome' = [outcome EXCEPT ![u] = "landed"]
+            \* The waiter list is shut: later registrations are refused.
+            /\ shut' = [shut EXCEPT ![u] = TRUE]
+            \* Every queue on the list is owed one "done" note.
+            /\ toTell' = [toTell EXCEPT ![u] = waiters[u]]
+            \* The list is empty (it was taken whole).
+            /\ waiters' = [waiters EXCEPT ![u] = {}]
+            \* The table forgets the unit.
+            /\ table' = IF table[what[u]] = u THEN [table EXCEPT ![what[u]] = NoUnit] ELSE table
+       \* Already ended by the first finisher.
+       ELSE UNCHANGED <<state, outcome, shut, toTell, waiters, table>>
+  \* Nothing else changes.
+  /\ UNCHANGED <<what, regd, told, next, inbox, idleFlag, taken, waiting,
+                 attached, slot, have, done, started, own, woken, checking, closedDb>>
 
-\* Any step of I/O thread th.
-IoStep(th) == IoWake(th) \/ IoPoll(th) \/ IoIdle(th)
+\* The finishing thread puts the "done" note for u into queue q's inbox:
+\* one push per queue it took off the waiter list.
+Tell(u, q) ==
+  \* q is still owed its note.
+  /\ q \in toTell[u]
+  \* The note goes to q (and wakes q if q is idle).
+  /\ Push(q, [kind |-> "done", u |-> u, reader |-> 0])
+  \* q is no longer owed.
+  /\ toTell' = [toTell EXCEPT ![u] = @ \ {q}]
+  \* Ghost: q was given one more note for u.
+  /\ told' = [told EXCEPT ![q][u] = @ + 1]
+  \* Nothing else changes.
+  /\ UNCHANGED <<table, what, state, outcome, waiters, shut, regd, runners, runs,
+                 next, taken, waiting, attached, slot, have, done, started,
+                 own, checking, closedDb>>
 
-\* Single mode: the one thread's event loop calls poll_io only when no
-\* task can run.
-LoopIo ==
-  /\ Mode = "single"
-  /\ \A t \in Tasks : ~Runnable(t)
-  /\ IoUnit
+-----------------------------------------------------------------------------
+\* GOING IDLE AND WAKING UP (IoQueue::idle_waker, QueueShared::rest)
 
-\* regolith queues I/O of its own (a rotation with no worker queues a
-\* flush; the disk check comes due) and fires io_pending. Mutant
-\* SilentSelfIo does not fire it.
-SelfStart ==
-  /\ started < SelfJobs
-  /\ jobs'    = jobs + 1
-  /\ started' = started + 1
-  /\ permit'  = IF Mutant = "SilentSelfIo" THEN permit ELSE TRUE
-  /\ UNCHANGED <<tpc, ticket, unsynced, synced, cb, cbRuns, reg, cached, queued, devReads, io>>
+\* The owner has nothing to run and goes idle: it registers its waker and
+\* sets IDLE with one CAS that succeeds only on an empty inbox. If a unit
+\* it waits on is still free (only it can run that one), or a note is
+\* already in the inbox, it is woken at once instead: this action is then
+\* simply not taken. Bug LostIdleWakeup does the "inbox empty?" look and
+\* the marking as two steps.
+Rest(t) ==
+  \* Only a running owner goes idle.
+  /\ own[t] = "busy"
+  \* Its tasks have nothing to run.
+  /\ Quiet(t)
+  \* No unit it waits on is left for it to run.
+  /\ \A u \in waiting[t] : state[u] # "free"
+  \* Its inbox is empty (the CAS checks this).
+  /\ inbox[t] = <<>>
+  \* Not already half way into going idle.
+  /\ ~checking[t]
+  \* How the owner goes idle depends on the bug:
+  /\ IF Mutant = "LostIdleWakeup"
+       \* The bug: only the look happens now; the mark comes later.
+       THEN /\ checking' = [checking EXCEPT ![t] = TRUE]
+            \* Nothing else changes yet.
+            /\ UNCHANGED <<idleFlag, own>>
+       \* The real code: the look and the mark are the same CAS.
+       ELSE /\ idleFlag' = [idleFlag EXCEPT ![t] = TRUE]
+            \* The owner sleeps.
+            /\ own' = [own EXCEPT ![t] = "idle"]
+            \* Nothing else changes.
+            /\ UNCHANGED checking
+  \* Nothing else changes.
+  /\ UNCHANGED <<table, what, state, outcome, waiters, shut, regd, runners, runs,
+                 toTell, told, next, inbox, taken, waiting, attached, slot, have,
+                 done, started, woken, closedDb>>
 
-\* Every step the system can take.
+\* Bug LostIdleWakeup, second half: mark idle without looking again. A note
+\* pushed between the look and this mark saw no IDLE bit and woke nobody.
+MarkIdle(t) ==
+  \* The look was done.
+  /\ checking[t]
+  \* The look is over.
+  /\ checking' = [checking EXCEPT ![t] = FALSE]
+  \* The IDLE bit is set, whatever the inbox holds now.
+  /\ idleFlag' = [idleFlag EXCEPT ![t] = TRUE]
+  \* The owner sleeps.
+  /\ own' = [own EXCEPT ![t] = "idle"]
+  \* Nothing else changes.
+  /\ UNCHANGED <<table, what, state, outcome, waiters, shut, regd, runners, runs,
+                 toTell, told, next, inbox, taken, waiting, attached, slot, have,
+                 done, started, woken, closedDb>>
+
+\* An idle owner whose waker fired runs again.
+Wake(t) ==
+  \* It was asleep.
+  /\ own[t] = "idle"
+  \* Its waker fired.
+  /\ woken[t]
+  \* It runs.
+  /\ own' = [own EXCEPT ![t] = "busy"]
+  \* The wake is used up.
+  /\ woken' = [woken EXCEPT ![t] = FALSE]
+  \* Nothing else changes.
+  /\ UNCHANGED <<table, what, state, outcome, waiters, shut, regd, runners, runs,
+                 toTell, told, next, inbox, idleFlag, taken, waiting, attached,
+                 slot, have, done, started, checking, closedDb>>
+
+\* An idle owner runs again on its own (its executor got other work) and
+\* polls, which clears IDLE first (QueueShared::wake_up). Bug BusyWoken
+\* forgets to clear it. Not fair: an owner may never do this.
+SelfWake(t) ==
+  \* It was asleep.
+  /\ own[t] = "idle"
+  \* It runs.
+  /\ own' = [own EXCEPT ![t] = "busy"]
+  \* Its poll clears IDLE (the bug leaves it set).
+  /\ idleFlag' = IF Mutant = "BusyWoken" THEN idleFlag ELSE [idleFlag EXCEPT ![t] = FALSE]
+  \* A wake that fired meanwhile is used up by this run.
+  /\ woken' = [woken EXCEPT ![t] = FALSE]
+  \* Nothing else changes.
+  /\ UNCHANGED <<table, what, state, outcome, waiters, shut, regd, runners, runs,
+                 toTell, told, next, inbox, taken, waiting, attached, slot, have,
+                 done, started, checking, closedDb>>
+
+-----------------------------------------------------------------------------
+\* CLOSE (RegolithEngine::close -> IoRuntime::close)
+
+\* The database closes. Reads run after this answer Closed.
+Close ==
+  \* Not closed yet.
+  /\ ~closedDb
+  \* Closed now.
+  /\ closedDb' = TRUE
+  \* Nothing else changes.
+  /\ UNCHANGED <<table, what, state, outcome, waiters, shut, regd, runners, runs,
+                 toTell, told, next, inbox, idleFlag, taken, waiting, attached,
+                 slot, have, done, started, own, woken, checking>>
+
+\* Close lets a free unit in the table go without reading it: it claims it
+\* (so no runner can) and finishes it as "released", telling every
+\* registered queue. A unit someone is running finishes on its own.
+Release(u) ==
+  \* The database is closing.
+  /\ closedDb
+  \* u is free and in the table.
+  /\ state[u] = "free" /\ table[what[u]] = u
+  \* u ends here, unread.
+  /\ state' = [state EXCEPT ![u] = "done"]
+  \* It read nothing.
+  /\ outcome' = [outcome EXCEPT ![u] = "released"]
+  \* Its waiter list is shut.
+  /\ shut' = [shut EXCEPT ![u] = TRUE]
+  \* Every registered queue is owed a note.
+  /\ toTell' = [toTell EXCEPT ![u] = waiters[u]]
+  \* The list was taken whole.
+  /\ waiters' = [waiters EXCEPT ![u] = {}]
+  \* The table forgets it.
+  /\ table' = [table EXCEPT ![what[u]] = NoUnit]
+  \* Nothing else changes.
+  /\ UNCHANGED <<what, regd, runners, runs, told, next, inbox, idleFlag, taken,
+                 waiting, attached, slot, have, done, started, own, woken,
+                 checking, closedDb>>
+
+-----------------------------------------------------------------------------
+\* THE WHOLE SYSTEM
+
+\* Any step of thread t (as reader, owner, or runner).
+ThreadStep(t) ==
+  \* A read that finds its block, or the database closed.
+  \/ \E x \in Blocks : Hit(t, x)
+  \* A read that misses.
+  \/ \E x \in Blocks : Miss(t, x)
+  \* A job regolith starts on t's call.
+  \/ \E j \in Jobs : SelfStart(t, j)
+  \* A ready wait runs again.
+  \/ \E x \in Things : Rerun(t, x)
+  \* The poll takes the inbox.
+  \/ Take(t)
+  \* The poll handles a note.
+  \/ Handle(t)
+  \* The poll claims a unit.
+  \/ \E u \in Ids : Claim(t, u)
+  \* A claimed unit's read finishes.
+  \/ \E u \in Ids : Finish(t, u)
+  \* The owner goes idle.
+  \/ Rest(t)
+  \* Bug only: the second half of going idle.
+  \/ MarkIdle(t)
+  \* A woken owner runs.
+  \/ Wake(t)
+
+\* Every possible step.
 Next ==
-  \/ \E t \in Tasks : TaskStep(t)
-  \/ \E th \in IoThreads : IoStep(th)
-  \/ LoopIo
-  \/ SelfStart
+  \* Some thread steps.
+  \/ \E t \in Threads : ThreadStep(t)
+  \* An owner wakes on its own.
+  \/ \E t \in Threads : SelfWake(t)
+  \* A finisher tells a queue.
+  \/ \E u \in Ids, q \in Threads : Tell(u, q)
+  \* The database closes.
+  \/ Close
+  \* Close lets a unit go.
+  \/ \E u \in Ids : Release(u)
 
-\* Every behaviour: start in Init, take Next steps, and never stop while a
-\* step is possible. No step spins or waits, so every behaviour is finite
-\* and ends where no step is possible.
-Spec == Init /\ [][Next]_vars /\ WF_vars(Next)
+\* The behaviours: start at Init, take Next steps, and never stop a step
+\* that stays possible (weak fairness). An owner waking on its own and
+\* close are not forced: liveness must not lean on them.
+Spec ==
+  \* Start.
+  /\ Init
+  \* Step.
+  /\ [][Next]_vars
+  \* Each thread keeps going while it can.
+  /\ \A t \in Threads :
+       \* Its reads that hit.
+       /\ WF_vars(\E x \in Blocks : Hit(t, x))
+       \* Its reads that miss.
+       /\ WF_vars(\E x \in Blocks : Miss(t, x))
+       \* Its jobs.
+       /\ WF_vars(\E j \in Jobs : SelfStart(t, j))
+       \* Its ready waits.
+       /\ WF_vars(\E x \in Things : Rerun(t, x))
+       \* Taking its inbox.
+       /\ WF_vars(Take(t))
+       \* Handling its notes.
+       /\ WF_vars(Handle(t))
+       \* Claiming.
+       /\ WF_vars(\E u \in Ids : Claim(t, u))
+       \* Finishing what it claimed.
+       /\ WF_vars(\E u \in Ids : Finish(t, u))
+       \* Waking when woken.
+       /\ WF_vars(Wake(t))
+       \* The bug's second half (the real code has none).
+       /\ WF_vars(MarkIdle(t))
+  \* Every finisher tells every queue it owes.
+  /\ \A u \in Ids : WF_vars(\E q \in Threads : Tell(u, q))
+  \* Close, once it began, lets every free unit go.
+  /\ \A u \in Ids : WF_vars(Release(u))
 
-----------------------------------------------------------------------------
-\* Invariants.
+-----------------------------------------------------------------------------
+\* WHAT MUST ALWAYS HOLD
 
-\* Every variable holds what its comment says.
+\* Every variable holds the kind of value it should.
 TypeOK ==
-  /\ tpc \in [Tasks -> {"start", "await", "registered", "checked", "parked", "retry", "done"}]
-  /\ ticket \in [CommitTasks -> {"none", "pending", "complete"}]
-  /\ unsynced \subseteq CommitTasks /\ synced \subseteq CommitTasks
-  /\ cb \in [CommitTasks -> {"none", "registered", "ran"}]
-  /\ reg \subseteq Tasks
-  /\ cached \subseteq Blocks /\ queued \subseteq Blocks
-  /\ jobs \in 0..SelfJobs /\ started \in 0..SelfJobs
-  /\ permit \in BOOLEAN
-  /\ io \in [IoThreads -> {"waiting", "polling"}]
+  \* Table entries are unit numbers or none.
+  /\ table \in [Things -> Ids \cup {NoUnit}]
+  \* Each unit reads a thing, or nothing yet.
+  /\ what \in [Ids -> Things \cup {NoUnit}]
+  \* Each unit is in one of four states.
+  /\ state \in [Ids -> {"none", "free", "claimed", "done"}]
+  \* Each unit has one of three outcomes.
+  /\ outcome \in [Ids -> {"none", "landed", "released"}]
+  \* Waiter lists are sets of queues.
+  /\ waiters \in [Ids -> SUBSET Threads]
+  \* SHUT flags are booleans.
+  /\ shut \in [Ids -> BOOLEAN]
+  \* Inboxes are sequences of notes.
+  /\ \A q \in Threads : \A i \in 1..Len(inbox[q]) : inbox[q][i] \in Msg
+  \* Taken notes are notes too.
+  /\ \A q \in Threads : \A i \in 1..Len(taken[q]) : taken[q][i] \in Msg
+  \* Waits have one of three values.
+  /\ slot \in [Threads -> [Things -> {"none", "pending", "ready"}]]
+  \* Owners are busy or idle.
+  /\ own \in [Threads -> {"busy", "idle"}]
 
-\* THE HEADLINE. No lost wakeup: a parked task awaits a handle that is not
-\* ready, with its waker registered, so whoever makes the handle ready
-\* wakes it.
-NoLostWakeup == \A t \in Tasks : tpc[t] = "parked" => ~Ready(t) /\ t \in reg
+\* A unit's disk read runs at most once: one claim, one run.
+\* Rules out: A and B both claiming block 7's unit and reading it twice.
+SingleRun == \A u \in Ids : runs[u] <= 1
 
-\* A ticket completes when, and only when, the I/O that makes its commit
-\* durable has run.
-TicketCompletesWithItsIo ==
-  \A c \in CommitTasks : (ticket[c] = "complete") <=> (c \in synced)
+\* A queue is given at most one "done" note per unit, and only if it
+\* registered on that unit.
+\* Rules out: B being told twice, or C being told about a read it never
+\* asked for.
+ExactlyOnce ==
+  \* For every queue and unit:
+  \A q \in Threads, u \in Ids :
+    \* at most one note...
+    /\ told[q][u] <= 1
+    \* ...and only to a queue that registered.
+    /\ told[q][u] = 1 => q \in regd[u]
 
-\* on_complete runs at most once, only on a complete ticket.
-CallbackOnce ==
-  \A c \in CommitTasks :
-    /\ cbRuns[c] <= 1
-    /\ (cb[c] = "ran") <=> (cbRuns[c] = 1)
-    /\ (cb[c] = "ran" => ticket[c] = "complete")
+\* Once a finished unit has told everyone it owed, every queue that
+\* registered got its note.
+\* Rules out: B registering on block 7's unit and never hearing it finished.
+EveryWaiterTold ==
+  \* For every unit that ended and has nobody left to tell:
+  \A u \in Ids : (state[u] = "done" /\ toTell[u] = {}) =>
+    \* each queue that registered got exactly one note.
+    \A q \in regd[u] : told[q][u] = 1
 
-\* Single-flight: the device is read only to fill the cache, once per
-\* block, however many CacheOnly reads missed it; a read never touches the
-\* device itself.
-SingleFlight == \A b \in Blocks : devReads[b] = IF b \in cached THEN 1 ELSE 0
+\* A read's request sits only on its own thread's queue, so only that
+\* queue's poll can ever finish it.
+\* Rules out: A's read recorded on B's queue, finished by B's poll on B's
+\* thread, while A never hears.
+OwnQueue ==
+  \* In every queue's inbox and taken notes...
+  \A q \in Threads :
+    \* every "read" note in the inbox is from q's own reader...
+    /\ \A i \in 1..Len(inbox[q]) : inbox[q][i].kind = "read" => inbox[q][i].reader = q
+    \* ...and so is every one being handled.
+    /\ \A i \in 1..Len(taken[q]) : taken[q][i].kind = "read" => taken[q][i].reader = q
 
-\* io_pending fires whenever I/O is queued: in pool mode, while any I/O is
-\* queued, an I/O thread is polling or a notification is stored to wake
-\* one.
-IoPendingFires ==
-  Mode = "pool" /\ PendingIo => permit \/ \E th \in IoThreads : io[th] = "polling"
+\* An idle owner that nobody has woken has an empty inbox.
+\* Rules out: B going to sleep right as A's "done" note lands, sleeping
+\* forever with the note unread.
+NoLostIdleWakeup ==
+  \* For every thread: asleep and not woken means nothing in the inbox.
+  \A t \in Threads : (own[t] = "idle" /\ ~woken[t]) => inbox[t] = <<>>
 
-\* Nothing is ever stuck: when no step is possible, every task is done and
-\* no I/O is queued. In single mode this is "one thread completes
-\* everything".
-NothingStuck == (~ENABLED Next) => (\A t \in Tasks : tpc[t] = "done") /\ ~PendingIo
+\* Only an idle owner is ever woken.
+\* Rules out: a note waking A while A is busy running its own reads.
+BusyNeverWoken ==
+  \* For every thread: a fired waker means the thread was asleep.
+  \A t \in Threads : woken[t] => own[t] = "idle"
 
-----------------------------------------------------------------------------
-\* Liveness.
+\* Every free unit in the table is held by some queue (registered there, or
+\* on its way in a "read" note), so some poll will run it.
+\* Rules out: a job started with no queue, which no poll ever runs.
+NoOrphanUnit ==
+  \* For every block or job:
+  \A x \in Things :
+    \* If the table holds a free unit for x...
+    (table[x] # NoUnit /\ state[table[x]] = "free") =>
+      \* ...some queue holds it.
+      Held(table[x])
 
-\* Every ticket completes once its I/O runs, and its I/O does run.
-EveryTicketCompletes == <>(\A c \in CommitTasks : ticket[c] = "complete")
+\* Over a whole run: every thread's reads and jobs all finish. With one
+\* thread this is the wasm case: it finishes everything by itself.
+AllDone == <>(\A t \in Threads : done[t] = Goal(t))
 
-\* Every task finishes, every registered callback has run, and no I/O is
-\* left queued.
-AllTasksFinish ==
-  <>(/\ \A t \in Tasks : tpc[t] = "done"
-     /\ \A c \in Callbacks : cbRuns[c] = 1
-     /\ ~PendingIo)
+-----------------------------------------------------------------------------
+\* THE SETUPS THE CONFIGURATIONS NAME
 
-----------------------------------------------------------------------------
-\* Workloads, chosen by the configurations.
-
-\* Every read needs block 1, so their misses share one queued read.
-OneBlock == [r \in ReadTasks |-> 1]
+\* Two threads: thread 1 reads blocks 1 and 2, thread 2 reads block 1 (the
+\* block both miss; block 2 is thread 1's alone).
+WantPool == [t \in {1, 2} |-> IF t = 1 THEN {1, 2} ELSE {1}]
+\* No jobs in that setup.
+JobOfNone == [j \in {} |-> 1]
+\* Two threads that both read block 1, while thread 2's call starts job 3.
+WantJobs == [t \in {1, 2} |-> {1}]
+\* Job 3 belongs to thread 2.
+JobOfJobs == [j \in {3} |-> 2]
+\* One thread reads both blocks and starts the job itself.
+WantSingle == [t \in {1} |-> {1, 2}]
+\* Job 3 belongs to the one thread.
+JobOfSingle == [j \in {3} |-> 1]
 
 ====
