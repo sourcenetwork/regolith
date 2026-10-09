@@ -532,13 +532,19 @@ tla:
     check MC_CommitPipeline_Red_NoHelping              RED NoLiveThreadBlocked
     check MC_CommitPipeline_Red_SyncPastGap            RED DurableImpliesWritten
     check MC_CommitPipeline_Red_ValidatePublished      RED NoLostUpdate
-    # R13, non-blocking calls: tickets, poll_io, io_pending, CacheOnly reads.
-    # TLC only; wakeups are interleavings with no law over sizes to prove.
+    # R13 and D53, non-blocking reads on per-thread I/O queues: single-flight
+    # units claimed by one CAS, completions only on the asking queue, idle
+    # wakeups. Lean: Regolith/IoQueue.lean, claim_once, told_exactly_once,
+    # no_lost_idle_wakeup, busy_never_woken, single_thread_finishes.
     spec=NonBlocking
     check MC_NonBlocking_Green_Pool                    GREEN
+    check MC_NonBlocking_Green_Jobs                    GREEN
     check MC_NonBlocking_Green_Single                  GREEN
-    check MC_NonBlocking_Red_LostWakeup                RED NoLostWakeup
-    check MC_NonBlocking_Red_SilentSelfIo              RED IoPendingFires
+    check MC_NonBlocking_Red_WrongQueue                RED OwnQueue
+    check MC_NonBlocking_Red_LostIdleWakeup            RED NoLostIdleWakeup
+    check MC_NonBlocking_Red_DoubleRun                 RED SingleRun
+    check MC_NonBlocking_Red_SelfIoNowhere             RED NoOrphanUnit
+    check MC_NonBlocking_Red_BusyWoken                 RED BusyNeverWoken
     # regolith::sync's locks after D49: barging with bounded bypass, for
     # Mutex, Semaphore and ReentrantMutex. Lean: Regolith/Sync.lean,
     # mutual_exclusion, bounded_bypass, owed_exclusive.
