@@ -1361,12 +1361,17 @@ impl Db {
 
     /// Return the integer value of a named property, or `None` if
     /// `name` isn't recognized or doesn't have an integer form.
+    /// `regolith.recovery.tables_demoted` counts tables moved from legacy
+    /// overlapping levels during this open. A later open reports zero
+    /// once the repair has been persisted; read-only opens repair only
+    /// their in-memory view.
     pub fn get_int_property(&self, name: &str) -> Option<u64> {
         if let Some(level_str) = name.strip_prefix("regolith.num-files-at-level") {
             let level: usize = level_str.parse().ok()?;
             return Some(self.engine.num_files_at_level(level));
         }
         match name {
+            "regolith.recovery.tables_demoted" => Some(self.engine.tables_demoted_at_open()),
             "regolith.total-sst-files-size" => Some(self.engine.total_sst_size()),
             "regolith.cur-size-active-mem-table" => Some(self.engine.active_memtable_size()),
             "regolith.memtable-reserved-bytes" => Some(self.engine.memtables_reserved_size()),
