@@ -34,7 +34,7 @@ fn fixture() -> (Arc<dyn Env>, PathBuf, PathBuf) {
 }
 
 fn open(env: &Arc<dyn Env>, db_dir: &Path, sst_dir: &Path) -> VersionSet {
-    VersionSet::open_with_policy(env, db_dir, sst_dir, MetadataPolicy::Pinned).unwrap()
+    VersionSet::open_with_policy(env, db_dir, sst_dir, MetadataPolicy::Pinned, None).unwrap()
 }
 
 fn assert_version(vs: &VersionSet, next_file_id: u64, last_seq: u64, min_wal_id: u64) {

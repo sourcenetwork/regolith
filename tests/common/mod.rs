@@ -87,6 +87,10 @@ pub fn force_compaction(db: &Db) {
 /// power cut.
 pub mod fault;
 
+/// A key provider for encryption at rest, with keys by id and a movable
+/// current key.
+pub mod keys;
+
 /// A merge operator over values of three counters, with `touches`.
 pub mod parted;
 

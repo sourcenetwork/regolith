@@ -9,8 +9,9 @@ fn stamp() -> Vec<u8> {
     VersionSet::encode_stamp().to_vec()
 }
 
+/// A plain batch: the offset it lands at binds only a sealed one.
 fn batch(records: &[ManifestRecord]) -> Vec<u8> {
-    VersionSet::encode_records(records).unwrap()
+    VersionSet::encode_records(records, 0, None).unwrap().0
 }
 
 /// A batch that only reserves a file id: never synced on its own.

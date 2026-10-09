@@ -225,6 +225,7 @@ impl Flusher {
             self.options.prefix_extractor.clone(),
             self.options.partitioned_index,
             self.options.metadata_block_size,
+            self.options.keyring.as_deref(),
         )?;
 
         // Walk the memtable in internal-key order and copy every version
@@ -275,6 +276,7 @@ impl Flusher {
             &sst_path,
             file_id,
             self.options.metadata_policy(),
+            self.options.keyring.as_deref(),
         )?);
         let file = LiveSst::new(
             SsTableMeta {

@@ -219,6 +219,29 @@ impl Options {
         self
     }
 
+    /// Encrypt the database at rest under keys from `provider`. Unset by
+    /// default, in which case nothing is encrypted and nothing is paid.
+    ///
+    /// Every table block, write-ahead log record and manifest batch written
+    /// with a provider set is sealed with AES-256-GCM-SIV under
+    /// [`crate::KeyProvider::current`]; see [`crate::KeyProvider`] for the
+    /// key rules. A database written without encryption opens with a
+    /// provider and is sealed as its files are rewritten. An encrypted
+    /// database must always be opened with a provider that still provides
+    /// every key its files name: without one the open refuses with
+    /// [`crate::Error::KeyProviderRequired`], and a missing key refuses it
+    /// with [`crate::Error::UnknownKey`]. The provider's current key must be
+    /// one it provides, or the open refuses with
+    /// [`crate::Error::UnknownKey`].
+    ///
+    /// Also applies to [`crate::SstFileWriter`], which seals the tables it
+    /// builds under the same key.
+    #[must_use]
+    pub fn key_provider(mut self, provider: Arc<dyn crate::KeyProvider>) -> Self {
+        self.key_provider = Some(provider);
+        self
+    }
+
     /// Optional statistics sink. When set, every hot path in
     /// the engine updates the provided [`crate::Statistics`]
     /// object with tickers and histograms. The caller polls the

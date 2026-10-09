@@ -39,6 +39,7 @@ use common::fault::{
     self, ChildSpec, CrashRun, CutPoint, DieKind, OpValue, Phase, PowerLossOptions, TearMode,
     Trigger,
 };
+use common::keys::Keys;
 use regolith::{Db, IngestOptions, Options, SstFileWriter};
 use tempfile::TempDir;
 
@@ -87,7 +88,9 @@ fn workload(spec: &ChildSpec, over: bool) {
     }
 
     let source = sidecar(&spec.db_path, "ingest-source");
-    let mut writer = SstFileWriter::create(&source, &Options::default()).expect("child: writer");
+    // Under the database's own options, so an encrypted run ingests a
+    // sealed table, installed as it is.
+    let mut writer = SstFileWriter::create(&source, &spec.options()).expect("child: writer");
     let mut keys: Vec<Vec<u8>> = (0..INGESTED).map(ingested_key).collect();
     if over {
         // The key of the last write before the ingest, which the memtable
@@ -135,10 +138,17 @@ enum Ingest {
     Present,
 }
 
-fn cut(name: &str, trigger: Trigger, tear: TearMode) -> Ingest {
+fn cut(name: &str, trigger: Trigger, tear: TearMode, encrypted: bool) -> Ingest {
     let tmp = TempDir::new().unwrap();
     let db_path = tmp.path().join("db");
-    let spec = ChildSpec::new(Phase::Custom(name.to_string()), &db_path).delete_every(0);
+    let spec = ChildSpec::new(Phase::Custom(name.to_string()), &db_path)
+        .delete_every(0)
+        .encrypted(encrypted);
+    let reopen = if encrypted {
+        Options::default().key_provider(Keys::new(&[1]))
+    } else {
+        Options::default()
+    };
     let history = spec.history();
     let out = CrashRun::new(spec)
         .trigger(trigger.clone())
@@ -165,8 +175,18 @@ fn cut(name: &str, trigger: Trigger, tear: TearMode) -> Ingest {
         &PowerLossOptions::default().tear(tear),
     );
     let returned = sidecar(&db_path, "ingested").exists();
+    if encrypted {
+        // The run really was encrypted: without the key nothing opens.
+        assert!(
+            matches!(
+                Db::open_read_only(&db_path, Options::default()),
+                Err(regolith::Error::KeyProviderRequired)
+            ),
+            "{name}: an encrypted run left a database that opens without its key"
+        );
+    }
 
-    let db = Db::open(&db_path, Options::default()).unwrap_or_else(|e| {
+    let db = Db::open(&db_path, reopen).unwrap_or_else(|e| {
         panic!(
             "{name}, {trigger:?}, {tear:?}: the database refuses to open after a power cut \
              during an ingest: {e}\n{}",
@@ -234,10 +254,19 @@ fn cut(name: &str, trigger: Trigger, tear: TearMode) -> Ingest {
     outcome
 }
 
+/// The cut under both tear modes, on a plain and on an encrypted database,
+/// which must all agree.
 fn both_tears(name: &str, trigger: Trigger) -> Ingest {
-    let truncated = cut(name, trigger.clone(), TearMode::Truncate);
-    let torn = cut(name, trigger, TearMode::TornSector);
-    assert_eq!(truncated, torn, "the two tear modes disagree");
+    let truncated = cut(name, trigger.clone(), TearMode::Truncate, false);
+    for encrypted in [false, true] {
+        let torn = cut(name, trigger.clone(), TearMode::TornSector, encrypted);
+        assert_eq!(
+            truncated, torn,
+            "the tear modes disagree (encrypted: {encrypted})"
+        );
+    }
+    let sealed = cut(name, trigger, TearMode::Truncate, true);
+    assert_eq!(truncated, sealed, "an encrypted database disagrees");
     truncated
 }
 

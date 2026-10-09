@@ -19,6 +19,9 @@ pub(crate) struct Recording {
     /// Writes and syncs in the order they happened: `write <len>` and
     /// `sync`.
     pub log: Vec<String>,
+    /// Everything `log` holds, plus every rename and directory sync, in
+    /// the order they happened: `rename <to>` and `sync dir`.
+    pub ops: Vec<String>,
 }
 
 #[derive(Debug, Default)]
@@ -37,6 +40,7 @@ impl WriteFile for RecordingWrite {
         let mut events = self.events.lock().unwrap();
         events.writes.push(bytes.to_vec());
         events.log.push(format!("write {}", bytes.len()));
+        events.ops.push(format!("write {}", bytes.len()));
         if events.fail_on_write == Some(events.writes.len()) {
             events.fail_on_write = None;
             events.partial_failures += 1;
@@ -65,6 +69,7 @@ impl WriteFile for RecordingWrite {
         let mut events = self.events.lock().unwrap();
         events.data_syncs += 1;
         events.log.push("sync".to_string());
+        events.ops.push("sync".to_string());
         drop(events);
         self.inner.sync_data()
     }
@@ -110,12 +115,19 @@ impl Env for RecordingEnv {
         self.inner.remove_file(path)
     }
     fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
+        let name = to.file_name().map(|n| n.to_string_lossy().into_owned());
+        self.events
+            .lock()
+            .unwrap()
+            .ops
+            .push(format!("rename {}", name.unwrap_or_default()));
         self.inner.rename(from, to)
     }
     fn hard_link(&self, from: &Path, to: &Path) -> io::Result<()> {
         self.inner.hard_link(from, to)
     }
     fn sync_dir(&self, path: &Path) -> io::Result<()> {
+        self.events.lock().unwrap().ops.push("sync dir".to_string());
         self.inner.sync_dir(path)
     }
     fn lock_file(&self, path: &Path, exclusive: bool) -> io::Result<Box<dyn FileLock>> {

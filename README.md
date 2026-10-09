@@ -346,6 +346,26 @@ silent.
 A database written by 0.1.x opens, and the open rewrites its log in format 2, which 0.1.x
 refuses to open: the upgrade is one-way.
 
+## Encryption at rest
+
+```rust,ignore
+let opts = Options::default().key_provider(Arc::new(MyKeys));
+```
+
+With a `KeyProvider` installed, every table block, log record and manifest batch is sealed
+with AES-256-GCM-SIV under the provider's current key, and its tag takes the place of the
+checksum: a random-access read still decrypts one block, and a frame whose tag fails is
+treated exactly as a failed checksum is, the torn-tail rule of the log included. Values are
+plaintext inside the engine, so merges, byte-equality checks, value-validated reads,
+content-addressed keys, appends and allocations all work unchanged.
+
+Each file names the key it was sealed under, so a rotated key keeps old data readable for
+as long as the provider still provides it. An encrypted database opened without a provider,
+or with a provider missing a key some file names, refuses to open. An unencrypted database
+opens with a provider and is sealed as compaction rewrites it; `Db::compact_range` on an
+encrypted database rewrites everything not sealed under the current key at once, which is
+how a key is retired.
+
 ## Platforms
 
 | Target | Status |

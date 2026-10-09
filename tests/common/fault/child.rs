@@ -213,6 +213,9 @@ pub struct ChildSpec {
     pub durability: DurabilityMode,
     pub write_buffer_size: usize,
     pub ack_path: PathBuf,
+    /// The database is encrypted at rest under [`crate::common::keys::Keys`]
+    /// key 1.
+    pub encrypted: bool,
 }
 
 impl ChildSpec {
@@ -247,7 +250,15 @@ impl ChildSpec {
             durability,
             write_buffer_size,
             ack_path,
+            encrypted: false,
         }
+    }
+
+    /// Encrypt the database at rest, under the key [`ChildSpec::options`]
+    /// installs.
+    pub fn encrypted(mut self, encrypted: bool) -> Self {
+        self.encrypted = encrypted;
+        self
     }
 
     pub fn seed(mut self, seed: u64) -> Self {
@@ -280,9 +291,14 @@ impl ChildSpec {
     }
 
     pub fn options(&self) -> Options {
-        Options::default()
+        let options = Options::default()
             .write_buffer_size(self.write_buffer_size)
-            .durability(self.durability)
+            .durability(self.durability);
+        if self.encrypted {
+            options.key_provider(crate::common::keys::Keys::new(&[1]))
+        } else {
+            options
+        }
     }
 
     /// The exact ordered history this spec produces, computed identically
@@ -320,6 +336,10 @@ impl ChildSpec {
                 "REGOLITH_CRASH_ACK".into(),
                 self.ack_path.display().to_string(),
             ),
+            (
+                "REGOLITH_CRASH_KEYS".into(),
+                if self.encrypted { "1" } else { "0" }.into(),
+            ),
         ]
     }
 
@@ -348,6 +368,7 @@ impl ChildSpec {
             },
             write_buffer_size: num("REGOLITH_CRASH_WBS", 1 << 20),
             ack_path: PathBuf::from(std::env::var("REGOLITH_CRASH_ACK").unwrap_or_default()),
+            encrypted: num("REGOLITH_CRASH_KEYS", 0) == 1,
         })
     }
 }

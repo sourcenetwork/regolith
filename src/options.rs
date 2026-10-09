@@ -484,6 +484,7 @@ pub struct Options {
     pub(crate) atomic_flush: bool,
     pub(crate) listeners: Vec<Arc<dyn crate::EventListener>>,
     pub(crate) transaction_hooks: Option<Arc<dyn crate::TransactionHooks>>,
+    pub(crate) key_provider: Option<Arc<dyn crate::KeyProvider>>,
     pub(crate) statistics: Option<Arc<crate::Statistics>>,
     pub(crate) rate_limiter: Option<Arc<dyn crate::RateLimiter>>,
     pub(crate) level0_slowdown_writes_trigger: usize,
@@ -531,6 +532,7 @@ impl Default for Options {
             atomic_flush: false,
             listeners: Vec::new(),
             transaction_hooks: None,
+            key_provider: None,
             statistics: None,
             rate_limiter: None,
             level0_slowdown_writes_trigger: 20,
@@ -592,6 +594,7 @@ impl std::fmt::Debug for Options {
             .field("atomic_flush", &self.atomic_flush)
             .field("listeners", &self.listeners.len())
             .field("transaction_hooks", &self.transaction_hooks.is_some())
+            .field("key_provider", &self.key_provider.is_some())
             .field("statistics", &self.statistics.is_some())
             .field("rate_limiter", &self.rate_limiter.is_some())
             .field(
@@ -1136,6 +1139,7 @@ impl Options {
             merge_operator: self.merge_operator.clone(),
             listeners: self.listeners.clone(),
             transaction_hooks: self.transaction_hooks.clone(),
+            keyring: self.keyring(),
             statistics: self.statistics.clone(),
             rate_limiter: self.rate_limiter.clone(),
             level0_slowdown_writes_trigger: self.level0_slowdown_writes_trigger,
@@ -1163,6 +1167,13 @@ impl Options {
                 Arc::clone(&self.env)
             },
         }
+    }
+
+    /// The keyring over [`Options::key_provider`], when one is set.
+    pub(crate) fn keyring(&self) -> Option<Arc<crate::engine::seal::Keyring>> {
+        self.key_provider
+            .as_ref()
+            .map(|p| Arc::new(crate::engine::seal::Keyring::new(Arc::clone(p))))
     }
 }
 

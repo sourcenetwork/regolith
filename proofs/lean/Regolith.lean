@@ -78,3 +78,8 @@ import Regolith.TombstoneRetirement
 -- never, and one thread finishes everything. Backs
 -- `proofs/tla/NonBlocking.tla`.
 import Regolith.IoQueue
+-- 4.12, D45: a sealed manifest batch keeps its checksum, checked before any
+-- key, so a torn batch and a wrong or missing key are never confused.
+-- Backs `proofs/tla/ManifestSeal.tla`. (The sealed log stamp is in
+-- WalRecovery.lean.)
+import Regolith.ManifestSeal
