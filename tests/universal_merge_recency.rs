@@ -19,19 +19,17 @@ use regolith::{
 /// Universal compaction with tiny files, so a handful of writes produces
 /// several L0 runs and the merge has something to fold.
 fn universal_options(workers: usize) -> Options {
-    Options {
-        compaction_style: CompactionStyle::Universal,
-        universal_compaction_options: UniversalCompactionOptions::default(),
-        write_buffer_size: 32 * 1024,
-        block_size: 4 * 1024,
-        block_cache_size: 0,
-        target_file_size: 64 * 1024,
-        l0_compaction_trigger: 2,
-        level0_slowdown_writes_trigger: 0,
-        level0_stop_writes_trigger: 0,
-        max_background_compactions: workers,
-        ..Options::default()
-    }
+    Options::default()
+        .compaction_style(CompactionStyle::Universal)
+        .universal_compaction_options(UniversalCompactionOptions::default())
+        .write_buffer_size(32 * 1024)
+        .block_size(4 * 1024)
+        .block_cache_size(0)
+        .target_file_size(64 * 1024)
+        .l0_compaction_trigger(2)
+        .level0_slowdown_writes_trigger(0)
+        .level0_stop_writes_trigger(0)
+        .max_background_compactions(workers)
 }
 
 /// Fill enough to leave several L0 files behind.

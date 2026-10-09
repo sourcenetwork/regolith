@@ -258,17 +258,15 @@ fn run(flavor: Flavor, style: CompactionStyle, ops: &[Op]) -> Result<(), TestCas
     let dir = tempfile::tempdir().unwrap();
     let db = Db::open(
         dir.path(),
-        Options {
-            merge_operator: Some(flavor.operator()),
-            compaction_style: style,
+        Options::default()
+            .merge_operator(Some(flavor.operator()))
+            .compaction_style(style)
             // Compaction runs only where the case asks for it.
-            max_background_compactions: 0,
-            l0_compaction_trigger: 2,
+            .max_background_compactions(0)
+            .l0_compaction_trigger(2)
             // One key's versions per output file, so a compaction splits the
             // tree into many files and later ones pick among them.
-            target_file_size: 1,
-            ..Options::default()
-        },
+            .target_file_size(1),
     )
     .unwrap();
 
@@ -384,13 +382,11 @@ fn counter(db: &Db) -> i64 {
 
 /// Options for a counter database; `fold` is whether two deltas fold alone.
 fn counter_options(fold: bool) -> Options {
-    Options {
-        merge_operator: Some(Arc::new(Sum { fold })),
+    Options::default()
+        .merge_operator(Some(Arc::new(Sum { fold })))
         // Raw bytes, so file sizes follow the entry count.
-        compression: CompressionType::None,
-        max_background_compactions: 0,
-        ..Options::default()
-    }
+        .compression(CompressionType::None)
+        .max_background_compactions(0)
 }
 
 /// Merge [`OPERANDS`] increments of one into the counter.
@@ -480,11 +476,9 @@ fn the_background_worker_folds_above_a_live_snapshot() {
     let dir = tempfile::tempdir().unwrap();
     let db = Db::open(
         dir.path(),
-        Options {
-            max_background_compactions: 1,
-            l0_compaction_trigger: 2,
-            ..counter_options(true)
-        },
+        counter_options(true)
+            .max_background_compactions(1)
+            .l0_compaction_trigger(2),
     )
     .unwrap();
     db.put(b"counter", &100i64.to_be_bytes()).unwrap();
@@ -534,12 +528,10 @@ fn an_expired_value_is_reclaimed_by_compaction_while_a_snapshot_is_live() {
     env.set_clocks(Some(0), Some(1_000_000));
     let db = DbWithTtl::open(
         root,
-        Options {
-            env: Arc::new(env.clone()),
-            compression: CompressionType::None,
-            max_background_compactions: 0,
-            ..Options::default()
-        },
+        Options::default()
+            .env(Arc::new(env.clone()))
+            .compression(CompressionType::None)
+            .max_background_compactions(0),
         TTL,
     )
     .unwrap();
@@ -595,11 +587,9 @@ fn the_range_delete_filter_runs_while_a_snapshot_is_live() {
     let dir = tempfile::tempdir().unwrap();
     let db = Db::open(
         dir.path(),
-        Options {
-            compaction_filter: Some(Arc::new(DropRangeDeletes)),
-            max_background_compactions: 0,
-            ..Options::default()
-        },
+        Options::default()
+            .compaction_filter(Some(Arc::new(DropRangeDeletes)))
+            .max_background_compactions(0),
     )
     .unwrap();
     for key in b'a'..=b'f' {

@@ -62,26 +62,17 @@ impl MergeOperator for AppendMerge {
 }
 
 fn counting() -> Options {
-    Options {
-        merge_operator: Some(Arc::new(CounterMerge)),
-        ..Options::default()
-    }
+    Options::default().merge_operator(Some(Arc::new(CounterMerge)))
 }
 
 fn appending() -> Options {
-    Options {
-        merge_operator: Some(Arc::new(AppendMerge)),
-        ..Options::default()
-    }
+    Options::default().merge_operator(Some(Arc::new(AppendMerge)))
 }
 
 /// `counting`, with a write buffer that never builds an index, so a lookup
 /// always walks the list.
 fn counting_unindexed() -> Options {
-    Options {
-        transaction_keys_inline: 0,
-        ..counting()
-    }
+    counting().transaction_keys_inline(0)
 }
 
 /// `counting` with both buffer shapes: indexed past the default size, and

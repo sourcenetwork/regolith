@@ -70,11 +70,9 @@ fn num(x: f64) -> String {
 /// resident in the memtable, the SSTable read path is never exercised, and
 /// the hot/cold split measures nothing.
 fn build(tag: &str, block_cache_size: usize, keys: &[Vec<u8>]) -> (common::TempDb, Db) {
-    let opts = Options {
-        write_buffer_size: 8 * 1024 * 1024,
-        block_cache_size,
-        ..Options::default()
-    };
+    let opts = Options::default()
+        .write_buffer_size(8 * 1024 * 1024)
+        .block_cache_size(block_cache_size);
     let (tmp, db) = common::open(tag, opts);
     let mut rng = common::Rng::new(0x5EED_5EED);
     let mut i = 0u64;

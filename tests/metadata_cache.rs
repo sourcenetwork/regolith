@@ -15,15 +15,13 @@ use tempfile::TempDir;
 /// Small files and small blocks, so a modest fill produces several
 /// SSTables with non-trivial indexes.
 fn opts(partitioned: bool, cache_metadata: bool) -> Options {
-    Options {
-        write_buffer_size: 128 * 1024,
-        block_size: 1024,
-        target_file_size: 256 * 1024,
-        partitioned_index: partitioned,
-        metadata_block_size: 1024,
-        cache_index_and_filter_blocks: cache_metadata,
-        ..Options::default()
-    }
+    Options::default()
+        .write_buffer_size(128 * 1024)
+        .block_size(1024)
+        .target_file_size(256 * 1024)
+        .partitioned_index(partitioned)
+        .metadata_block_size(1024)
+        .cache_index_and_filter_blocks(cache_metadata)
 }
 
 const KEYS: usize = 8_000;
@@ -148,11 +146,9 @@ fn a_tiny_cache_still_answers_correctly_with_metadata_cached() {
 
     // One shard, 64 KiB: index leaves and filters are evicted
     // constantly. Correctness must not depend on them staying resident.
-    let tiny = Options {
-        block_cache_size: 64 * 1024,
-        block_cache_num_shard_bits: 0,
-        ..opts(true, true)
-    };
+    let tiny = opts(true, true)
+        .block_cache_size(64 * 1024)
+        .block_cache_num_shard_bits(0);
     let db = Db::open(dir.path(), tiny).unwrap();
     verify(&db);
     db.close().unwrap();

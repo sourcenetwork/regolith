@@ -2,6 +2,9 @@ use std::sync::Arc;
 
 use crate::engine::internal_key::INTERNAL_KEY_SUFFIX_LEN;
 
+mod builder;
+mod getters;
+
 /// Default maximum user-key length accepted by write APIs: 8 MiB.
 pub const DEFAULT_MAX_KEY_SIZE: usize = 8 * 1024 * 1024;
 
@@ -414,329 +417,63 @@ pub enum CompressionType {
 pub use crate::engine::arena::ArenaProfile;
 
 /// Configuration options for a regolith database.
+///
+/// Start from [`Options::default`] or one of the presets
+/// ([`Options::embedded`], [`Options::wasm`], [`Options::memory`]) and chain
+/// one builder method per option. A method is named after the option it
+/// sets, and a new option is a new method, so an existing chain keeps
+/// compiling.
+///
+/// ```
+/// use regolith::{DurabilityMode, Options};
+///
+/// let options = Options::default()
+///     .write_buffer_size(8 * 1024 * 1024)
+///     .durability(DurabilityMode::Immediate);
+/// ```
 #[derive(Clone)]
 pub struct Options {
-    /// Write buffer (memtable) size before flush. Must be greater
-    /// than zero. Default: 64 MB.
-    ///
-    /// This bounds the memtable's arena bytes: the node header, tower,
-    /// internal key and value of every entry, rounded to alignment. A
-    /// memtable's arena reserves at most
-    /// `write_buffer_size + max(arena_profile.max_chunk_size,
-    /// largest single entry)` between writes, because the engine rotates
-    /// as soon as the budget is reached. A single `WriteBatch` larger
-    /// than the remaining budget overshoots by that batch's size, so
-    /// batch size is the caller's to bound.
-    pub write_buffer_size: usize,
-    /// Chunk sizing policy for the memtable arena. Default:
-    /// [`ArenaProfile::SERVER`]; [`Options::embedded`] selects the
-    /// small-footprint preset.
-    pub arena_profile: ArenaProfile,
-    /// Data block size in SSTables. Must be greater than zero.
-    /// Default: 16 KB.
-    pub block_size: usize,
-    /// Block cache size in bytes for decompressed data blocks.
-    /// `0` disables the block cache entirely: nothing is allocated
-    /// for it, no block is retained, every read goes to the file,
-    /// and the block-cache tickers stay at zero. Default: 512 MB.
-    ///
-    /// What the cache allocates tracks this budget, not the shard
-    /// count: shard maps start empty and each shard caps its entry
-    /// count at its share of the budget.
-    pub block_cache_size: usize,
-    /// Base-2 log of the block cache shard count. The block cache
-    /// is split into `2^block_cache_num_shard_bits` shards keyed
-    /// by `hash(file_id, offset)` so concurrent readers contend
-    /// only with other readers that hash to the same shard.
-    /// Must be <= [`MAX_BLOCK_CACHE_SHARD_BITS`]. Tiny cache budgets
-    /// may use fewer effective shards so each shard has usable
-    /// capacity, and a [`Options::block_cache_size`] of 0 makes this
-    /// setting irrelevant because no shard is allocated.
-    /// Default: 6 (64 shards).
-    pub block_cache_num_shard_bits: u32,
-    /// If `true`, the block cache refuses to admit a single entry
-    /// that is larger than one shard's byte capacity; the caller
-    /// uses the block directly without caching it. If `false`
-    /// (default), an oversized entry evicts everything else in
-    /// its shard and is admitted anyway.
-    pub strict_capacity_limit: bool,
-    /// Bloom filter bits per key. Must be in
-    /// `1..=MAX_BLOOM_BITS_PER_KEY`. Default: 10.
-    pub bloom_bits_per_key: usize,
-    /// Default block compression codec. Used at every level unless
-    /// overridden by [`Options::compression_per_level`]. Default: LZ4.
-    pub compression: CompressionType,
-    /// Per-level compression override. When set, entry `i` selects the
-    /// codec for level `i`. Levels beyond the vector's length fall
-    /// back to [`Options::compression`]. `None` (default) means "use
-    /// the default codec at every level".
-    pub compression_per_level: Option<Vec<CompressionType>>,
-    /// Number of L0 SSTables before triggering compaction. Must be
-    /// greater than zero. Default: 4.
-    pub l0_compaction_trigger: usize,
-    /// Target size for level 1. Must be greater than zero.
-    /// Default: 256 MB.
-    pub level_base_bytes: u64,
-    /// Size multiplier between levels. Must be greater than zero.
-    /// Default: 10.
-    pub level_size_multiplier: u64,
-    /// Target SSTable file size during compaction. Must be greater
-    /// than zero. Default: 64 MB.
-    pub target_file_size: u64,
-    /// Durability mode. Default: Eventual.
-    pub durability: DurabilityMode,
-    /// Optional user hook invoked during compaction for every point
-    /// entry and range tombstone. See [`CompactionFilter`] for
-    /// semantics and snapshot-isolation rules.
-    pub compaction_filter: Option<Arc<dyn CompactionFilter>>,
-    /// Optional prefix extractor. When set, SSTable writers build an
-    /// additional prefix-keyed bloom filter that `Iter::seek_prefix`
-    /// consults to skip files that cannot contain the scanned prefix.
-    /// Point lookups are unaffected.
-    pub prefix_extractor: Option<Arc<dyn PrefixExtractor>>,
-    /// Optional associative merge operator. When set, callers may
-    /// emit merge operands via [`crate::Db::merge`] /
-    /// [`crate::WriteBatch::merge`] instead of doing
-    /// read-modify-write, and readers collapse the merge chain via
-    /// [`MergeOperator::full_merge`] at visibility time.
-    pub merge_operator: Option<Arc<dyn MergeOperator>>,
-    /// Opt-in flag accepted for parity with storage engines that
-    /// require an explicit switch to get atomic multi-CF flushes.
-    /// Regolith's column-family implementation is key-prefix based:
-    /// every CF shares one memtable, one WAL, one manifest, and
-    /// one flush path, so a multi-CF [`crate::WriteBatch`] is
-    /// **always** atomic across CFs regardless of this flag's
-    /// value. A flush either persists every participant's half of
-    /// a batch or persists none of it.
-    pub atomic_flush: bool,
-    /// Event listeners subscribed to engine lifecycle events
-    /// (flush, compaction, ingest, background errors). Dispatch
-    /// is synchronous on the firing thread - listeners **must not
-    /// block or re-enter the database**. See
-    /// [`crate::EventListener`] for the full contract.
-    pub listeners: Vec<Arc<dyn crate::EventListener>>,
-    /// Optional statistics sink. When set, every hot path in
-    /// the engine updates the provided [`crate::Statistics`]
-    /// object with tickers and histograms. The caller polls the
-    /// same object to export metrics to their monitoring stack.
-    /// `None` (default) short-circuits every instrumentation site
-    /// at a branch, so disabled stats cost almost nothing.
-    pub statistics: Option<Arc<crate::Statistics>>,
-    /// Optional rate limiter. When set, flush and compaction output
-    /// writes are throttled via [`crate::RateLimiter::request`]
-    /// before the engine moves on to the next job, capping the
-    /// combined background-I/O rate at the limiter's configured
-    /// bytes/second. Foreground (user) writes are not throttled.
-    /// `None` (default) means background I/O is uncapped.
-    pub rate_limiter: Option<Arc<dyn crate::RateLimiter>>,
-    /// Start slowing foreground writes when the number of L0
-    /// SSTables reaches this threshold. Each affected write
-    /// incurs a small fixed delay, back-pressuring callers so
-    /// background compaction can catch up. `0` disables this
-    /// trigger. If both L0 triggers are enabled, this must be <=
-    /// [`Options::level0_stop_writes_trigger`]. Default: 20.
-    ///
-    /// Level-style, with the same caveat as
-    /// [`Options::level0_stop_writes_trigger`]: under FIFO and
-    /// universal compaction the L0 file count is not what the picker
-    /// reduces, so this delay can become permanent rather than
-    /// transient.
-    pub level0_slowdown_writes_trigger: usize,
-    /// Stop foreground writes entirely when the number of L0
-    /// SSTables reaches this threshold. Writers block on a
-    /// condvar that compaction notifies once it reduces the
-    /// count below the slowdown trigger. Plain writes, column-family
-    /// writes (including creating and dropping a column family) and
-    /// transactional commits that carry writes are stopped alike.
-    /// `0` disables this trigger. Default: 36.
-    ///
-    /// # This is a level-style trigger
-    ///
-    /// Only [`CompactionStyle::Level`] reduces the L0 *file count*
-    /// in response to this threshold. Under [`CompactionStyle::Fifo`]
-    /// nothing ever merges L0 files (only the byte cap unlinks them),
-    /// and under [`CompactionStyle::Universal`] the picker merges on
-    /// its own size-ratio and amplification rules, which a healthy
-    /// size tier can satisfy while sitting above this count. With
-    /// either of those styles the threshold can therefore be reached
-    /// and never relieved, and writes then fail with
-    /// [`crate::Error::Busy`] until the configuration changes. The
-    /// error message names the style and this field. Set this to `0`
-    /// with those styles and bound memory with
-    /// [`Options::max_write_buffer_number`] and
-    /// [`Options::hard_pending_compaction_bytes_limit`] instead,
-    /// which both apply to every style.
-    pub level0_stop_writes_trigger: usize,
-    /// Start slowing writes when total bytes in L0 (regolith's
-    /// approximation of "pending compaction bytes") reach this
-    /// limit. `0` disables this trigger. If both pending-byte
-    /// triggers are enabled, this must be <=
-    /// [`Options::hard_pending_compaction_bytes_limit`].
-    /// Default: 64 GB.
-    pub soft_pending_compaction_bytes_limit: u64,
-    /// Stop writes when total bytes in L0 reach this limit. `0`
-    /// disables this trigger. Default: 256 GB.
-    pub hard_pending_compaction_bytes_limit: u64,
-    /// Soft cap on the number of in-memory memtables (active +
-    /// frozen). Reaching this count slows writes; reaching
-    /// `2 * max_write_buffer_number` stops them. `0` disables
-    /// this trigger. Default: 2.
-    pub max_write_buffer_number: usize,
-    /// Compaction strategy. See [`CompactionStyle`] for the
-    /// trade-offs. Default: [`CompactionStyle::Level`].
-    pub compaction_style: CompactionStyle,
-    /// Tunables for [`CompactionStyle::Fifo`]. Ignored when the
-    /// style is [`CompactionStyle::Level`].
-    pub fifo_compaction_options: FifoCompactionOptions,
-    /// Tunables for [`CompactionStyle::Universal`]. Ignored when
-    /// the style is not Universal.
-    pub universal_compaction_options: UniversalCompactionOptions,
-    /// Number of background threads available for compaction.
-    ///
-    /// `0` starts no background worker at all. Compaction then runs
-    /// on whichever thread asks for it: a writer that reaches a
-    /// write-stall threshold performs a compaction job itself before
-    /// retrying instead of parking on a condvar nobody would ever
-    /// signal. This is the only mode that works on a single-threaded
-    /// host such as `wasm32-wasip1`, where `std::thread::spawn`
-    /// reports [`std::io::ErrorKind::Unsupported`], and it is what
-    /// [`Options::embedded`] selects.
-    ///
-    /// When `> 1`, multiple non-overlapping compaction jobs can
-    /// run concurrently (e.g. L1→L2 at key range `[a,m)` on one
-    /// worker while L2→L3 at `[m,z)` runs on another). L0
-    /// compactions are exclusive - only one L0 job runs at a
-    /// time because L0 files can overlap arbitrarily.
-    ///
-    /// `1` keeps compaction single-threaded and matches
-    /// pre-multi-worker behavior. It is the default off wasm; see
-    /// [`DEFAULT_MAX_BACKGROUND_COMPACTIONS`] for why every wasm
-    /// target defaults to `0` instead, so that [`crate::Db::open`]
-    /// with [`Options::default`] works there too. On wasm any other
-    /// value is rejected by [`Options::validate`].
-    pub max_background_compactions: usize,
-    /// Accepted for compatibility with earlier releases.
-    ///
-    /// Compaction now streams a k-way merge with bounded memory
-    /// and writes outputs on the compaction worker thread, so this
-    /// knob does not change behavior.
-    pub max_subcompactions: usize,
-    /// Hint the OS page cache to drop pages backing SSTables
-    /// that are read or written by background compaction.
-    ///
-    /// Without the hint, gigabytes of sequentially-consumed
-    /// compaction data pollute the page cache and evict hot
-    /// foreground reads. With the hint, the kernel is told to
-    /// discard those pages immediately after the compaction
-    /// finishes with them, billing the page cache cost strictly
-    /// to foreground data.
-    ///
-    /// Currently implemented as `posix_fadvise(DONTNEED)` on
-    /// Linux; on other targets the flag is accepted but the
-    /// hint is a no-op. `false` by default - callers who care
-    /// about foreground latency stability on Linux should turn
-    /// it on.
-    pub evict_compaction_data_from_page_cache: bool,
-    /// Split the SSTable index into small leaf blocks on disk and keep
-    /// only a compact top-level index in memory. Reduces resident
-    /// memory when thousands of SSTables are open, at the cost of one
-    /// extra disk read per point lookup (amortized by the OS page
-    /// cache). Default: `false` (flat index loaded eagerly).
-    pub partitioned_index: bool,
-    /// Charge SSTable index and filter blocks to the block cache
-    /// instead of pinning them in each open reader.
-    ///
-    /// With this off (the default), every open SSTable holds its whole
-    /// index and its bloom filters resident for the reader's lifetime,
-    /// outside [`Options::block_cache_size`]. With it on they are read
-    /// through the cache and are evictable, so `block_cache_size`
-    /// bounds index and filter bytes as well as data bytes. The cost is
-    /// one cache lookup on the point-read path and a re-read from disk
-    /// whenever an evicted filter is next consulted, which is why the
-    /// default is off.
-    ///
-    /// Independent of [`Options::partitioned_index`]: the *leaves* of a
-    /// partitioned index always go through the cache, and a partitioned
-    /// file's top-level index is always pinned. This option decides
-    /// where a flat file's whole index and every file's filter region
-    /// live.
-    ///
-    /// `Db::get_int_property("regolith.pinned-metadata-bytes")` reports
-    /// what the open files are holding outside the cache budget either
-    /// way.
-    ///
-    /// Default: `false`.
-    pub cache_index_and_filter_blocks: bool,
-    /// Target size for each index leaf block when
-    /// [`Options::partitioned_index`] is enabled. Must be greater
-    /// than zero. Ignored when partitioned indexing is off.
-    /// Default: 4096.
-    pub metadata_block_size: usize,
-    /// Open an existing database without creating files, rewriting
-    /// recovered WALs, compacting, or allowing writes. Mutating APIs
-    /// return [`crate::Error::ReadOnly`].
-    ///
-    /// Default: `false`.
-    pub read_only: bool,
-    /// Maximum user-key length accepted by write APIs. Default: 8 MiB.
-    /// A logged write is still refused if its framed record exceeds the
-    /// write-ahead log's 1 GiB limit, whatever this allows; a write with
-    /// `disable_wal` is exempt from that limit.
-    pub max_key_size: usize,
-    /// Maximum value and merge-operand length accepted by write APIs.
-    /// Default: 64 MiB. A logged write is still refused if its framed
-    /// record exceeds the write-ahead log's 1 GiB limit, whatever this
-    /// allows; a write with `disable_wal` is exempt from that limit.
-    pub max_value_size: usize,
-    /// Keys one transaction buffers before it builds a hash index over
-    /// them.
-    ///
-    /// A transaction keeps its own writes and reads in a linear buffer,
-    /// which costs no table and answers a lookup by walking a handful of
-    /// entries. Past this many keys the walk stops being the cheap option
-    /// and the buffer indexes itself, which costs one table and one entry
-    /// per key on top of the buffer itself.
-    ///
-    /// Set it to the number of keys the workload's transactions actually
-    /// touch. Too low and a transaction pays for an index it did not need;
-    /// too high and a large transaction walks further than it should. A
-    /// value of `0` disables the count-based index, so an ordinary lookup
-    /// always walks the list; that suits a workload of uniformly tiny
-    /// transactions and is a poor choice for any other. It is not
-    /// absolute: a pessimistic transaction that promotes a key through
-    /// `get_for_update` and then scans still builds the index on first
-    /// need, because a transactional scan cannot afford to walk it once
-    /// per yielded key.
-    ///
-    /// Default: 32.
-    pub transaction_keys_inline: usize,
-    /// The host platform this database runs on: its filesystem, its
-    /// clock, and its threads.
-    ///
-    /// Defaults to [`crate::env::StdEnv`], which is `std::fs` +
-    /// `std::time` + `std::thread` and behaves exactly as regolith did
-    /// before this field existed. Replace it to run on a filesystem
-    /// regolith does not know about, or on [`crate::env::MemEnv`] to keep
-    /// a database entirely in memory.
-    ///
-    /// What the environment can actually do is reported by
-    /// [`crate::env::Env::capabilities`] and handed back to callers
-    /// through [`crate::Db::capabilities`].
-    pub env: Arc<dyn crate::env::Env>,
-
-    /// Most SSTables that keep a file descriptor open at once. `0`, the
-    /// default, keeps every live table's file open, one descriptor per
-    /// table.
-    ///
-    /// A store needs a descriptor per live table, plus those a compaction
-    /// is reading and writing, so a large store or a process with a low
-    /// `RLIMIT_NOFILE` (256 under macOS launchd) runs out and compaction
-    /// fails with EMFILE. With a limit, the least recently read tables
-    /// have their descriptor closed and reopened on the next read; a
-    /// read that misses the block cache on such a table pays an `open`.
-    /// The limit is soft: tables a compaction has just deleted stay open
-    /// until no snapshot or iterator can read them.
-    pub max_open_files: usize,
+    pub(crate) write_buffer_size: usize,
+    pub(crate) arena_profile: ArenaProfile,
+    pub(crate) block_size: usize,
+    pub(crate) block_cache_size: usize,
+    pub(crate) block_cache_num_shard_bits: u32,
+    pub(crate) strict_capacity_limit: bool,
+    pub(crate) bloom_bits_per_key: usize,
+    pub(crate) compression: CompressionType,
+    pub(crate) compression_per_level: Option<Vec<CompressionType>>,
+    pub(crate) l0_compaction_trigger: usize,
+    pub(crate) level_base_bytes: u64,
+    pub(crate) level_size_multiplier: u64,
+    pub(crate) target_file_size: u64,
+    pub(crate) durability: DurabilityMode,
+    pub(crate) compaction_filter: Option<Arc<dyn CompactionFilter>>,
+    pub(crate) prefix_extractor: Option<Arc<dyn PrefixExtractor>>,
+    pub(crate) merge_operator: Option<Arc<dyn MergeOperator>>,
+    pub(crate) atomic_flush: bool,
+    pub(crate) listeners: Vec<Arc<dyn crate::EventListener>>,
+    pub(crate) statistics: Option<Arc<crate::Statistics>>,
+    pub(crate) rate_limiter: Option<Arc<dyn crate::RateLimiter>>,
+    pub(crate) level0_slowdown_writes_trigger: usize,
+    pub(crate) level0_stop_writes_trigger: usize,
+    pub(crate) soft_pending_compaction_bytes_limit: u64,
+    pub(crate) hard_pending_compaction_bytes_limit: u64,
+    pub(crate) max_write_buffer_number: usize,
+    pub(crate) compaction_style: CompactionStyle,
+    pub(crate) fifo_compaction_options: FifoCompactionOptions,
+    pub(crate) universal_compaction_options: UniversalCompactionOptions,
+    pub(crate) max_background_compactions: usize,
+    pub(crate) max_subcompactions: usize,
+    pub(crate) evict_compaction_data_from_page_cache: bool,
+    pub(crate) partitioned_index: bool,
+    pub(crate) cache_index_and_filter_blocks: bool,
+    pub(crate) metadata_block_size: usize,
+    pub(crate) read_only: bool,
+    pub(crate) max_key_size: usize,
+    pub(crate) max_value_size: usize,
+    pub(crate) transaction_keys_inline: usize,
+    pub(crate) env: Arc<dyn crate::env::Env>,
+    pub(crate) max_open_files: usize,
 }
 
 impl Default for Options {
@@ -1122,8 +859,7 @@ impl Options {
     ///
     /// ```ignore
     /// let opfs = OpfsEnv::mount("my-db", OpfsOptions::default()).await?;
-    /// let mut options = Options::wasm();
-    /// options.env = opfs.as_env();
+    /// let options = Options::wasm().env(opfs.as_env());
     /// let db = Db::open(opfs.db_path(), options)?;
     /// ```
     ///
@@ -1499,25 +1235,18 @@ mod tests {
     fn options_validate_accepts_defaults_and_disabled_stall_triggers() {
         Options::default().validate().unwrap();
 
-        let opts = Options {
-            level0_slowdown_writes_trigger: 0,
-            level0_stop_writes_trigger: 0,
-            soft_pending_compaction_bytes_limit: 0,
-            hard_pending_compaction_bytes_limit: 0,
-            max_write_buffer_number: 0,
-            ..Options::default()
-        };
+        let opts = Options::default()
+            .level0_slowdown_writes_trigger(0)
+            .level0_stop_writes_trigger(0)
+            .soft_pending_compaction_bytes_limit(0)
+            .hard_pending_compaction_bytes_limit(0)
+            .max_write_buffer_number(0);
         opts.validate().unwrap();
     }
 
     #[test]
     fn options_validate_accepts_zero_block_cache_size() {
-        Options {
-            block_cache_size: 0,
-            ..Options::default()
-        }
-        .validate()
-        .unwrap();
+        Options::default().block_cache_size(0).validate().unwrap();
     }
 
     #[test]
@@ -1525,11 +1254,9 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let db = crate::Db::open(
             dir.path(),
-            Options {
-                block_cache_size: 0,
-                write_buffer_size: 4 * 1024,
-                ..Options::default()
-            },
+            Options::default()
+                .block_cache_size(0)
+                .write_buffer_size(4 * 1024),
         )
         .unwrap();
         for i in 0..500u32 {
@@ -1552,53 +1279,20 @@ mod tests {
 
     #[test]
     fn options_validate_rejects_zero_core_sizes() {
+        assert_invalid_option(Options::default().write_buffer_size(0), "write_buffer_size");
+        assert_invalid_option(Options::default().block_size(0), "block_size");
         assert_invalid_option(
-            Options {
-                write_buffer_size: 0,
-                ..Options::default()
-            },
-            "write_buffer_size",
-        );
-        assert_invalid_option(
-            Options {
-                block_size: 0,
-                ..Options::default()
-            },
-            "block_size",
-        );
-        assert_invalid_option(
-            Options {
-                l0_compaction_trigger: 0,
-                ..Options::default()
-            },
+            Options::default().l0_compaction_trigger(0),
             "l0_compaction_trigger",
         );
+        assert_invalid_option(Options::default().level_base_bytes(0), "level_base_bytes");
         assert_invalid_option(
-            Options {
-                level_base_bytes: 0,
-                ..Options::default()
-            },
-            "level_base_bytes",
-        );
-        assert_invalid_option(
-            Options {
-                level_size_multiplier: 0,
-                ..Options::default()
-            },
+            Options::default().level_size_multiplier(0),
             "level_size_multiplier",
         );
+        assert_invalid_option(Options::default().target_file_size(0), "target_file_size");
         assert_invalid_option(
-            Options {
-                target_file_size: 0,
-                ..Options::default()
-            },
-            "target_file_size",
-        );
-        assert_invalid_option(
-            Options {
-                metadata_block_size: 0,
-                ..Options::default()
-            },
+            Options::default().metadata_block_size(0),
             "metadata_block_size",
         );
     }
@@ -1606,36 +1300,25 @@ mod tests {
     #[test]
     fn options_validate_rejects_unsupported_ranges() {
         assert_invalid_option(
-            Options {
-                block_cache_num_shard_bits: MAX_BLOCK_CACHE_SHARD_BITS + 1,
-                ..Options::default()
-            },
+            Options::default().block_cache_num_shard_bits(MAX_BLOCK_CACHE_SHARD_BITS + 1),
             "block_cache_num_shard_bits",
         );
         assert_invalid_option(
-            Options {
-                bloom_bits_per_key: 0,
-                ..Options::default()
-            },
+            Options::default().bloom_bits_per_key(0),
             "bloom_bits_per_key",
         );
         assert_invalid_option(
-            Options {
-                bloom_bits_per_key: MAX_BLOOM_BITS_PER_KEY + 1,
-                ..Options::default()
-            },
+            Options::default().bloom_bits_per_key(MAX_BLOOM_BITS_PER_KEY + 1),
             "bloom_bits_per_key",
         );
     }
 
     #[test]
     fn zero_background_compactions_is_a_supported_configuration() {
-        Options {
-            max_background_compactions: 0,
-            ..Options::default()
-        }
-        .validate()
-        .expect("zero background workers selects foreground compaction, not an error");
+        Options::default()
+            .max_background_compactions(0)
+            .validate()
+            .expect("zero background workers selects foreground compaction, not an error");
     }
 
     #[test]
@@ -1766,87 +1449,71 @@ mod tests {
     #[test]
     fn options_validate_rejects_inconsistent_stall_thresholds() {
         assert_invalid_option(
-            Options {
-                level0_slowdown_writes_trigger: 10,
-                level0_stop_writes_trigger: 5,
-                ..Options::default()
-            },
+            Options::default()
+                .level0_slowdown_writes_trigger(10)
+                .level0_stop_writes_trigger(5),
             "level0_slowdown_writes_trigger",
         );
         assert_invalid_option(
-            Options {
-                soft_pending_compaction_bytes_limit: 10,
-                hard_pending_compaction_bytes_limit: 5,
-                ..Options::default()
-            },
+            Options::default()
+                .soft_pending_compaction_bytes_limit(10)
+                .hard_pending_compaction_bytes_limit(5),
             "soft_pending_compaction_bytes_limit",
         );
     }
 
     #[test]
     fn options_validate_checks_selected_compaction_style_options() {
-        Options {
-            fifo_compaction_options: FifoCompactionOptions {
+        Options::default()
+            .fifo_compaction_options(FifoCompactionOptions {
                 max_table_files_size: 0,
-            },
-            ..Options::default()
-        }
-        .validate()
-        .unwrap();
+            })
+            .validate()
+            .unwrap();
 
         assert_invalid_option(
-            Options {
-                compaction_style: CompactionStyle::Fifo,
-                fifo_compaction_options: FifoCompactionOptions {
+            Options::default()
+                .compaction_style(CompactionStyle::Fifo)
+                .fifo_compaction_options(FifoCompactionOptions {
                     max_table_files_size: 0,
-                },
-                ..Options::default()
-            },
+                }),
             "fifo_compaction_options.max_table_files_size",
         );
         assert_invalid_option(
-            Options {
-                compaction_style: CompactionStyle::Universal,
-                universal_compaction_options: UniversalCompactionOptions {
+            Options::default()
+                .compaction_style(CompactionStyle::Universal)
+                .universal_compaction_options(UniversalCompactionOptions {
                     size_ratio: 0,
                     ..UniversalCompactionOptions::default()
-                },
-                ..Options::default()
-            },
+                }),
             "universal_compaction_options.size_ratio",
         );
         assert_invalid_option(
-            Options {
-                compaction_style: CompactionStyle::Universal,
-                universal_compaction_options: UniversalCompactionOptions {
+            Options::default()
+                .compaction_style(CompactionStyle::Universal)
+                .universal_compaction_options(UniversalCompactionOptions {
                     min_merge_width: 1,
                     ..UniversalCompactionOptions::default()
-                },
-                ..Options::default()
-            },
+                }),
             "universal_compaction_options.min_merge_width",
         );
         assert_invalid_option(
-            Options {
-                compaction_style: CompactionStyle::Universal,
-                universal_compaction_options: UniversalCompactionOptions {
+            Options::default()
+                .compaction_style(CompactionStyle::Universal)
+                .universal_compaction_options(UniversalCompactionOptions {
                     min_merge_width: 4,
                     max_merge_width: 3,
                     ..UniversalCompactionOptions::default()
-                },
-                ..Options::default()
-            },
+                }),
             "universal_compaction_options.max_merge_width",
         );
         assert_invalid_option(
-            Options {
-                compaction_style: CompactionStyle::Universal,
-                universal_compaction_options: UniversalCompactionOptions {
+            Options::default()
+                .compaction_style(CompactionStyle::Universal)
+                .universal_compaction_options(UniversalCompactionOptions {
                     max_size_amplification_percent: 0,
                     ..UniversalCompactionOptions::default()
-                },
-                ..Options::default()
-            },
+                }),
             "universal_compaction_options.max_size_amplification_percent",
         );
     }
@@ -1890,10 +1557,7 @@ mod tests {
         ];
         for profile in bad {
             assert!(!profile.is_valid(), "{profile:?} must be rejected");
-            let opts = Options {
-                arena_profile: profile,
-                ..Options::default()
-            };
+            let opts = Options::default().arena_profile(profile);
             match opts.validate() {
                 Err(crate::Error::InvalidArgument(message)) => {
                     assert!(message.contains("arena_profile"), "{message}")
@@ -1913,17 +1577,11 @@ mod tests {
         for (name, opts) in [
             (
                 "max_key_size",
-                Options {
-                    max_key_size: u32::MAX as usize + 1,
-                    ..Options::default()
-                },
+                Options::default().max_key_size(u32::MAX as usize + 1),
             ),
             (
                 "max_value_size",
-                Options {
-                    max_value_size: u32::MAX as usize + 1,
-                    ..Options::default()
-                },
+                Options::default().max_value_size(u32::MAX as usize + 1),
             ),
         ] {
             match opts.validate() {

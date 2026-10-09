@@ -141,10 +141,7 @@ fn has_with_a_merge_operator_reports_the_collapsed_chain() {
     // operator configured, `has` and `get_size` answer about the value
     // `full_merge` produces, which means they materialize the chain.
     let dir = TempDir::new().unwrap();
-    let opts = Options {
-        merge_operator: Some(std::sync::Arc::new(Concat)),
-        ..Options::default()
-    };
+    let opts = Options::default().merge_operator(Some(std::sync::Arc::new(Concat)));
     let db = Db::open(dir.path(), opts).unwrap();
 
     db.put(b"k", b"base").unwrap();
@@ -189,11 +186,9 @@ fn iterator_value_slice_matches_value_and_outlives_the_step() {
 #[test]
 fn iterator_value_slice_covers_memtable_reverse_and_merge_sources() {
     let dir = TempDir::new().unwrap();
-    let opts = Options {
-        merge_operator: Some(std::sync::Arc::new(Concat)),
-        write_buffer_size: 4 * 1024,
-        ..Options::default()
-    };
+    let opts = Options::default()
+        .merge_operator(Some(std::sync::Arc::new(Concat)))
+        .write_buffer_size(4 * 1024);
     let db = Db::open(dir.path(), opts).unwrap();
 
     let mut batch = WriteBatch::new();

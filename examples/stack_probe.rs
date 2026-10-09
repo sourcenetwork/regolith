@@ -21,16 +21,14 @@
 use regolith::{Db, Options, WriteBatch};
 
 fn opts() -> Options {
-    Options {
-        write_buffer_size: 32 * 1024,
-        target_file_size: 48 * 1024,
-        level_base_bytes: 128 * 1024,
-        block_cache_size: 0,
-        max_background_compactions: 0,
-        max_key_size: 8 * 1024 * 1024,
-        max_value_size: 8 * 1024 * 1024,
-        ..Options::default()
-    }
+    Options::default()
+        .write_buffer_size(32 * 1024)
+        .target_file_size(48 * 1024)
+        .level_base_bytes(128 * 1024)
+        .block_cache_size(0)
+        .max_background_compactions(0)
+        .max_key_size(8 * 1024 * 1024)
+        .max_value_size(8 * 1024 * 1024)
 }
 
 /// Build a multi-level database with many overlapping L0 files.

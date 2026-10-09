@@ -227,12 +227,10 @@ struct Fixture {
 }
 
 fn options() -> Options {
-    Options {
+    Options::default()
         // Comfortably larger than the data set, so a warm read never
         // re-reads an evicted block.
-        block_cache_size: 256 * 1024 * 1024,
-        ..Options::default()
-    }
+        .block_cache_size(256 * 1024 * 1024)
 }
 
 fn open() -> Fixture {
@@ -571,11 +569,9 @@ fn iterator_disclosure() {
 /// for the whole cost of a write.
 fn rotation_disclosure() {
     let dir = TempDir::new().expect("tempdir");
-    let opts = Options {
-        write_buffer_size: 1024 * 1024,
-        block_cache_size: 64 * 1024 * 1024,
-        ..Options::default()
-    };
+    let opts = Options::default()
+        .write_buffer_size(1024 * 1024)
+        .block_cache_size(64 * 1024 * 1024);
     let db = Db::open(dir.path(), opts).expect("open");
     let value = vec![b'v'; VALUE_LEN];
     let keys: Vec<String> = (0..OPS).map(key_at).collect();

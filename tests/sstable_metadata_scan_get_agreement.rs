@@ -30,13 +30,11 @@ fn value(i: usize) -> Vec<u8> {
 }
 
 fn build_opts(partitioned: bool) -> Options {
-    Options {
-        write_buffer_size: 1 << 20,
-        partitioned_index: partitioned,
-        metadata_block_size: if partitioned { 128 } else { 4096 },
-        block_size: 256,
-        ..Options::default()
-    }
+    Options::default()
+        .write_buffer_size(1 << 20)
+        .partitioned_index(partitioned)
+        .metadata_block_size(if partitioned { 128 } else { 4096 })
+        .block_size(256)
 }
 
 /// One file of a planted database directory: its path relative to the

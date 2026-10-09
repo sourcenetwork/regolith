@@ -177,10 +177,7 @@ mod tests {
     use tempfile::TempDir;
 
     fn tiny_flush_opts() -> Options {
-        Options {
-            write_buffer_size: 4 * 1024,
-            ..Options::default()
-        }
+        Options::default().write_buffer_size(4 * 1024)
     }
 
     fn force_flush(db: &Db, tag: &str) {
@@ -268,10 +265,7 @@ mod tests {
     /// nothing else can flush it, so sealing without draining loses the
     /// data every time.
     fn no_background_flush() -> Options {
-        Options {
-            max_background_compactions: 0,
-            ..Default::default()
-        }
+        Options::default().max_background_compactions(0)
     }
 
     /// A checkpoint captures the SSTables the current version names and

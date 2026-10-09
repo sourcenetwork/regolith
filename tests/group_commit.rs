@@ -19,11 +19,9 @@ use regolith::{Db, DurabilityMode, Options, Statistics, Ticker, WriteBatch, Writ
 use tempfile::TempDir;
 
 fn durable_opts(stats: Option<Arc<Statistics>>) -> Options {
-    Options {
-        durability: DurabilityMode::Immediate,
-        statistics: stats,
-        ..Options::default()
-    }
+    Options::default()
+        .durability(DurabilityMode::Immediate)
+        .statistics(stats)
 }
 
 #[test]
@@ -269,10 +267,7 @@ fn every_synced_write_replays_from_the_wal_without_a_close() {
         let db = Arc::new(
             Db::open(
                 dir.path(),
-                Options {
-                    write_buffer_size: 64 * 1024 * 1024,
-                    ..durable_opts(None)
-                },
+                durable_opts(None).write_buffer_size(64 * 1024 * 1024),
             )
             .unwrap(),
         );
@@ -350,16 +345,8 @@ fn administrative_operations_still_exclude_writers() {
     // `compact_range` and `close` take the same pipeline mutex the commit
     // leader does, so they cannot interleave with a group.
     let dir = TempDir::new().unwrap();
-    let db = Arc::new(
-        Db::open(
-            dir.path(),
-            Options {
-                write_buffer_size: 8 * 1024,
-                ..Options::default()
-            },
-        )
-        .unwrap(),
-    );
+    let db =
+        Arc::new(Db::open(dir.path(), Options::default().write_buffer_size(8 * 1024)).unwrap());
 
     let stop = Arc::new(AtomicBool::new(false));
     let mut writers = Vec::new();

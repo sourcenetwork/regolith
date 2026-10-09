@@ -217,13 +217,11 @@ fn run_instance(versions: u64, min_rounds: u64) -> Vec<String> {
     let db = Arc::new(
         Db::open(
             dir.path(),
-            Options {
-                write_buffer_size: 8 * 1024,
-                block_cache_size: 4 * 1024,
-                max_write_buffer_number: env("REGOLITH_CHAOS_MAX_MEMTABLES", 2) as usize,
-                level0_stop_writes_trigger: env("REGOLITH_CHAOS_L0_STOP", 36) as usize,
-                ..Options::default()
-            },
+            Options::default()
+                .write_buffer_size(8 * 1024)
+                .block_cache_size(4 * 1024)
+                .max_write_buffer_number(env("REGOLITH_CHAOS_MAX_MEMTABLES", 2) as usize)
+                .level0_stop_writes_trigger(env("REGOLITH_CHAOS_L0_STOP", 36) as usize),
         )
         .expect("open"),
     );

@@ -272,20 +272,21 @@ both modes.
 
 Pure Rust throughout: no C toolchain, no FFI, no linker surprises. Compaction runs on an
 ordinary OS thread; no async runtime is required. On a target without threads, set
-`max_background_compactions = 0` and compaction runs on the calling thread.
+`max_background_compactions(0)` and compaction runs on the calling thread.
 
 ## Configuration
 
 ```rust
 use regolith::{CompressionType, Options};
 
-let opts = Options {
-    write_buffer_size: 64 * 1024 * 1024,
-    block_cache_size: 512 * 1024 * 1024,
-    compression: CompressionType::Lz4,
-    ..Default::default()
-};
+let opts = Options::default()
+    .write_buffer_size(64 * 1024 * 1024)
+    .block_cache_size(512 * 1024 * 1024)
+    .compression(CompressionType::Lz4);
 ```
+
+Every option is a builder method named after it, so a new option in a later release is a
+new method and an existing chain keeps compiling.
 
 Three ready-made profiles: `Options::default()` for a server, `Options::embedded()` for a
 1-4 MiB budget, and `Options::wasm()` for a browser or wasi module. Every value and the

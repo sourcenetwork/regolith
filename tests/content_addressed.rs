@@ -61,10 +61,7 @@ impl KeyClassifier for Keys {
 }
 
 fn options() -> Options {
-    Options {
-        merge_operator: Some(Arc::new(CounterMerge)),
-        ..Options::default()
-    }
+    Options::default().merge_operator(Some(Arc::new(CounterMerge)))
 }
 
 fn open(dir: &Path) -> OptimisticTransactionDb {

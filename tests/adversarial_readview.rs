@@ -166,11 +166,9 @@ pub fn run(scale: &Scale, surface: Surface) -> Outcome {
     let stats = Arc::new(Statistics::new());
     let db = Db::open(
         dir.path(),
-        Options {
-            write_buffer_size: 16 * 1024,
-            statistics: Some(Arc::clone(&stats)),
-            ..Options::default()
-        },
+        Options::default()
+            .write_buffer_size(16 * 1024)
+            .statistics(Some(Arc::clone(&stats))),
     )
     .expect("open failed");
     let db = Arc::new(db);
@@ -489,14 +487,7 @@ fn snapshot_churn_instance() -> (u64, Vec<String>) {
     let scale = default_scale();
     let dir = TempDir::new().expect("tempdir");
     let db = Arc::new(
-        Db::open(
-            dir.path(),
-            Options {
-                write_buffer_size: 16 * 1024,
-                ..Options::default()
-            },
-        )
-        .expect("open"),
+        Db::open(dir.path(), Options::default().write_buffer_size(16 * 1024)).expect("open"),
     );
 
     let keys: Vec<Vec<u8>> = (0..scale.writers)
@@ -599,14 +590,7 @@ fn snapshot_churn_instance() -> (u64, Vec<String>) {
 fn drop_all_racing_every_read_surface_never_invents_data() {
     let dir = TempDir::new().expect("tempdir");
     let db = Arc::new(
-        Db::open(
-            dir.path(),
-            Options {
-                write_buffer_size: 8 * 1024,
-                ..Options::default()
-            },
-        )
-        .expect("open"),
+        Db::open(dir.path(), Options::default().write_buffer_size(8 * 1024)).expect("open"),
     );
     let keys: Vec<Vec<u8>> = (0..64).map(|i| key_of(0, i)).collect();
     let refs: Vec<&[u8]> = keys.iter().map(|k| k.as_slice()).collect();

@@ -162,12 +162,10 @@ fn enospc_child_body(mount: &Path) {
     measured("ENOSPC on a full 8 MiB tmpfs", || {
         let db_path = mount.join("db");
         let background = Arc::new(BackgroundErrorLog::default());
-        let opts = Options {
-            write_buffer_size: 32 * 1024,
-            target_file_size: 64 * 1024,
-            listeners: vec![background.clone()],
-            ..Options::default()
-        };
+        let opts = Options::default()
+            .write_buffer_size(32 * 1024)
+            .target_file_size(64 * 1024)
+            .listeners(vec![background.clone()]);
         let db = Db::open(&db_path, opts.clone()).expect("opening on an empty tmpfs");
 
         let ballast = mount.join("ballast");

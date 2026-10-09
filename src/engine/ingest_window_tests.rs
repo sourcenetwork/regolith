@@ -25,10 +25,7 @@ use crate::{
 };
 
 fn options() -> Options {
-    Options {
-        max_background_compactions: 0,
-        ..Options::default()
-    }
+    Options::default().max_background_compactions(0)
 }
 
 /// An external table holding `k = new`.

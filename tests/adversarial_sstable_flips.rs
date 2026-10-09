@@ -63,13 +63,11 @@ fn copy_tree_into(from: &Path, prefix: &str, out: &mut Vec<(String, Vec<u8>)>) {
 fn build(partitioned: bool) -> Fixture {
     let root = TempDir::new().expect("tempdir");
     let db_dir = root.path().join("db");
-    let opts = Options {
-        write_buffer_size: 4096,
-        block_size: 256,
-        partitioned_index: partitioned,
-        metadata_block_size: 256,
-        ..Options::default()
-    };
+    let opts = Options::default()
+        .write_buffer_size(4096)
+        .block_size(256)
+        .partitioned_index(partitioned)
+        .metadata_block_size(256);
     let db = Db::open(&db_dir, opts.clone()).expect("open");
 
     let mut truth = BTreeMap::new();

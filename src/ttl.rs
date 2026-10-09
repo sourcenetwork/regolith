@@ -376,10 +376,7 @@ mod tests {
     use tempfile::TempDir;
 
     fn tiny_opts() -> Options {
-        Options {
-            write_buffer_size: 4 * 1024,
-            ..Options::default()
-        }
+        Options::default().write_buffer_size(4 * 1024)
     }
 
     fn force_flush(db: &DbWithTtl, tag: &str) {

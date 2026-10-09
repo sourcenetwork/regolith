@@ -290,11 +290,9 @@ fn recover_with_large_wal_replays_every_entry() {
     // must replay correctly on reopen.
     let dir = TempDir::new().unwrap();
     {
-        let opts = Options {
+        let opts = Options::default()
             // Big buffer so nothing flushes; everything survives as WAL.
-            write_buffer_size: 64 * 1024 * 1024,
-            ..Options::default()
-        };
+            .write_buffer_size(64 * 1024 * 1024);
         let db = Db::open(dir.path(), opts).unwrap();
         for i in 0..5_000 {
             let k = format!("k_{:06}", i);

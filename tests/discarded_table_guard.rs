@@ -26,11 +26,9 @@ use regolith::{Db, DurabilityMode, Options, SstFileWriter};
 use tempfile::TempDir;
 
 fn opts() -> Options {
-    Options {
-        write_buffer_size: 8 * 1024 * 1024,
-        durability: DurabilityMode::Immediate,
-        ..Options::default()
-    }
+    Options::default()
+        .write_buffer_size(8 * 1024 * 1024)
+        .durability(DurabilityMode::Immediate)
 }
 
 fn copy_tree(from: &Path, to: &Path) {

@@ -59,11 +59,9 @@ impl KeyClassifier for HeadPrefix {
 }
 
 fn open(dir: &std::path::Path, stats: Arc<Statistics>) -> OptimisticTransactionDb {
-    let options = Options {
-        merge_operator: Some(Arc::new(CounterMerge)),
-        statistics: Some(stats),
-        ..Options::default()
-    };
+    let options = Options::default()
+        .merge_operator(Some(Arc::new(CounterMerge)))
+        .statistics(Some(stats));
     OptimisticTransactionDb::open(dir, options)
         .unwrap()
         .with_policy(Arc::new(HeadPrefix))
@@ -197,10 +195,7 @@ fn a_scan_leaving_the_prefix_keeps_its_stretch() {
 #[test]
 fn without_statistics_nothing_panics_and_the_commit_still_runs() {
     let dir = tempfile::tempdir().unwrap();
-    let options = Options {
-        merge_operator: Some(Arc::new(CounterMerge)),
-        ..Options::default()
-    };
+    let options = Options::default().merge_operator(Some(Arc::new(CounterMerge)));
     let db = OptimisticTransactionDb::open(dir.path(), options)
         .unwrap()
         .with_policy(Arc::new(HeadPrefix));
@@ -364,10 +359,7 @@ fn an_aborted_commit_counts_no_dropped_scan_stretches() {
 }
 
 fn pessimistic(dir: &std::path::Path, stats: Arc<Statistics>) -> regolith::TransactionDb {
-    let options = Options {
-        statistics: Some(stats),
-        ..Options::default()
-    };
+    let options = Options::default().statistics(Some(stats));
     regolith::TransactionDb::open(dir, options)
         .unwrap()
         .with_lock_timeout(std::time::Duration::from_millis(50))

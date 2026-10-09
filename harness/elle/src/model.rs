@@ -5,9 +5,9 @@
 //! match the ones in the completion record even when an optimistic
 //! transaction has to be replayed.
 
-use regolith::{TxnOptions, 
+use regolith::{
     Db, IsolationLevel, OptimisticTransactionDb, Options, Transaction, TransactionDb,
-    TransactionError, TxResult,
+    TransactionError, TxResult, TxnOptions,
 };
 use std::collections::HashSet;
 use std::path::Path;
@@ -234,10 +234,7 @@ impl TxDb {
             Isolation::DefraLevel => Ok(TxDb::Defra(
                 OptimisticTransactionDb::open(
                     path,
-                    Options {
-                        merge_operator: Some(Arc::new(ListAppend)),
-                        ..opts
-                    },
+                    opts.merge_operator(Some(Arc::new(ListAppend))),
                 )?
                 .with_isolation(IsolationLevel::DefraLevel),
             )),

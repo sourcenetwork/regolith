@@ -49,17 +49,15 @@ where
 }
 
 fn zero_worker_opts() -> Options {
-    Options {
-        write_buffer_size: 16 * 1024,
-        target_file_size: 32 * 1024,
-        level_base_bytes: 64 * 1024,
-        l0_compaction_trigger: 2,
-        level0_slowdown_writes_trigger: 3,
-        level0_stop_writes_trigger: 4,
-        max_background_compactions: 0,
-        block_cache_size: 0,
-        ..Options::default()
-    }
+    Options::default()
+        .write_buffer_size(16 * 1024)
+        .target_file_size(32 * 1024)
+        .level_base_bytes(64 * 1024)
+        .l0_compaction_trigger(2)
+        .level0_slowdown_writes_trigger(3)
+        .level0_stop_writes_trigger(4)
+        .max_background_compactions(0)
+        .block_cache_size(0)
 }
 
 fn val(n: usize) -> Vec<u8> {
@@ -148,10 +146,7 @@ fn fifo_l0_count_trigger_reports_busy_instead_of_hanging() {
 fn universal_l0_count_trigger_reports_busy_instead_of_hanging() {
     with_deadline("universal_zero_workers", 120, || {
         let dir = tempfile::tempdir().unwrap();
-        let opts = Options {
-            compaction_style: CompactionStyle::Universal,
-            ..zero_worker_opts()
-        };
+        let opts = zero_worker_opts().compaction_style(CompactionStyle::Universal);
         let db = Db::open(dir.path(), opts).unwrap();
         let reason = first_stall_reason(&db, "universal");
         assert!(
@@ -170,15 +165,13 @@ fn disabling_the_l0_count_trigger_unblocks_fifo_and_universal() {
     with_deadline("trigger_off", 180, || {
         for style in [CompactionStyle::Fifo, CompactionStyle::Universal] {
             let dir = tempfile::tempdir().unwrap();
-            let opts = Options {
-                compaction_style: style,
-                level0_slowdown_writes_trigger: 0,
-                level0_stop_writes_trigger: 0,
-                fifo_compaction_options: FifoCompactionOptions {
+            let opts = zero_worker_opts()
+                .compaction_style(style)
+                .level0_slowdown_writes_trigger(0)
+                .level0_stop_writes_trigger(0)
+                .fifo_compaction_options(FifoCompactionOptions {
                     max_table_files_size: 1024 * 1024 * 1024,
-                },
-                ..zero_worker_opts()
-            };
+                });
             let db = Db::open(dir.path(), opts).unwrap();
             for i in 0..5_000usize {
                 let k = format!("k{i:08}");
@@ -234,13 +227,11 @@ fn busy_from_a_stall_must_not_have_written_anything() {
     // a rejected write that landed anyway is silent corruption.
     with_deadline("busy_atomicity", 120, || {
         let dir = tempfile::tempdir().unwrap();
-        let opts = Options {
-            compaction_style: CompactionStyle::Fifo,
-            fifo_compaction_options: FifoCompactionOptions {
+        let opts = zero_worker_opts()
+            .compaction_style(CompactionStyle::Fifo)
+            .fifo_compaction_options(FifoCompactionOptions {
                 max_table_files_size: 1024 * 1024 * 1024,
-            },
-            ..zero_worker_opts()
-        };
+            });
         let db = Db::open(dir.path(), opts).unwrap();
         for i in 0..20_000usize {
             let k = format!("k{i:08}");
@@ -266,13 +257,11 @@ fn busy_from_a_stall_must_not_have_written_anything() {
 /// one the error message names, and the data must still be intact.
 fn probe_recovery(style: CompactionStyle, label: &str) {
     let dir = tempfile::tempdir().unwrap();
-    let opts = Options {
-        compaction_style: style,
-        fifo_compaction_options: FifoCompactionOptions {
+    let opts = zero_worker_opts()
+        .compaction_style(style)
+        .fifo_compaction_options(FifoCompactionOptions {
             max_table_files_size: 1024 * 1024 * 1024,
-        },
-        ..zero_worker_opts()
-    };
+        });
     let stalled_at;
     {
         let db = Db::open(dir.path(), opts.clone()).unwrap();
@@ -307,11 +296,9 @@ fn probe_recovery(style: CompactionStyle, label: &str) {
     // The documented remedy: this trigger is level-style, so turn it off.
     // Writing must resume, and nothing written before the stall may have
     // been lost by it.
-    let unblocked = Options {
-        level0_slowdown_writes_trigger: 0,
-        level0_stop_writes_trigger: 0,
-        ..opts
-    };
+    let unblocked = opts
+        .level0_slowdown_writes_trigger(0)
+        .level0_stop_writes_trigger(0);
     let db = Db::open(dir.path(), unblocked).unwrap();
     if style == CompactionStyle::Universal {
         // FIFO legitimately unlinks old files once over its byte cap;
@@ -348,14 +335,12 @@ fn universal_busy_names_a_remedy_that_works() {
 }
 
 fn fifo_opts(workers: usize) -> Options {
-    Options {
-        compaction_style: CompactionStyle::Fifo,
-        fifo_compaction_options: FifoCompactionOptions {
+    zero_worker_opts()
+        .compaction_style(CompactionStyle::Fifo)
+        .fifo_compaction_options(FifoCompactionOptions {
             max_table_files_size: 1024 * 1024 * 1024,
-        },
-        max_background_compactions: workers,
-        ..zero_worker_opts()
-    }
+        })
+        .max_background_compactions(workers)
 }
 
 /// A stall that a reopen silently cleared would be worse than one that
@@ -404,10 +389,7 @@ fn back_pressure_is_armed_before_the_first_write_after_a_reopen() {
 fn universal_compact_step_converges() {
     with_deadline("universal_converges", 120, || {
         let dir = tempfile::tempdir().unwrap();
-        let opts = Options {
-            compaction_style: CompactionStyle::Universal,
-            ..zero_worker_opts()
-        };
+        let opts = zero_worker_opts().compaction_style(CompactionStyle::Universal);
         let db = Db::open(dir.path(), opts).unwrap();
         for i in 0..300usize {
             let k = format!("k{i:08}");
@@ -436,12 +418,10 @@ fn immediate_durability_on_a_non_durable_env_is_refused() {
         !caps.durable_sync,
         "precondition: MemEnv must report durable_sync = false"
     );
-    let opts = Options {
-        env: env.clone(),
-        durability: regolith::DurabilityMode::Immediate,
-        max_background_compactions: 0,
-        ..Options::default()
-    };
+    let opts = Options::default()
+        .env(env.clone())
+        .durability(regolith::DurabilityMode::Immediate)
+        .max_background_compactions(0);
     match Db::open("/mem-durability", opts) {
         Err(e) => {
             println!("refused as documented: {e:?}");
@@ -465,15 +445,13 @@ fn immediate_durability_on_a_non_durable_env_is_refused() {
 fn compact_step_racing_workers_and_compact_range_loses_nothing() {
     with_deadline("compact_step_race", 300, || {
         let dir = tempfile::tempdir().unwrap();
-        let opts = Options {
-            write_buffer_size: 24 * 1024,
-            target_file_size: 48 * 1024,
-            level_base_bytes: 96 * 1024,
-            l0_compaction_trigger: 2,
-            max_background_compactions: 2,
-            block_cache_size: 0,
-            ..Options::default()
-        };
+        let opts = Options::default()
+            .write_buffer_size(24 * 1024)
+            .target_file_size(48 * 1024)
+            .level_base_bytes(96 * 1024)
+            .l0_compaction_trigger(2)
+            .max_background_compactions(2)
+            .block_cache_size(0);
         let db = std::sync::Arc::new(Db::open(dir.path(), opts).unwrap());
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let total = 30_000usize;
@@ -545,10 +523,10 @@ fn a_second_handle_is_refused_even_without_a_cross_process_lock() {
         !env.capabilities().file_lock,
         "precondition: MemEnv reports no cross-process file lock"
     );
-    let opts = || Options {
-        env: env.clone(),
-        max_background_compactions: 0,
-        ..Options::default()
+    let opts = || {
+        Options::default()
+            .env(env.clone())
+            .max_background_compactions(0)
     };
 
     let first = Db::open("/lockless", opts()).unwrap();
@@ -662,7 +640,7 @@ fn probe_oversized_commit_under_a_stop(
     // a broken admission order would see the stall ahead of the size check.
     let _ = first_stall_reason(plain, label);
 
-    let oversized = vec![0u8; Options::default().max_value_size + 1];
+    let oversized = vec![0u8; regolith::DEFAULT_MAX_VALUE_SIZE + 1];
     let message = match plain.put(b"oversized", &oversized) {
         Err(Error::InvalidArgument(message)) => message,
         other => panic!("{label}: expected an oversized-value InvalidArgument, got {other:?}"),
@@ -726,10 +704,7 @@ impl MergeOperator for ConcatMerge {
 }
 
 fn fifo_merge_opts(workers: usize) -> Options {
-    Options {
-        merge_operator: Some(std::sync::Arc::new(ConcatMerge)),
-        ..fifo_opts(workers)
-    }
+    fifo_opts(workers).merge_operator(Some(std::sync::Arc::new(ConcatMerge)))
 }
 
 /// A commit whose only buffered op is a merge must be admitted the same way

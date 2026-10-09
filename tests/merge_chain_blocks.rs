@@ -46,21 +46,15 @@ impl MergeOperator for CounterMerge {
 }
 
 fn options() -> Options {
-    Options {
-        merge_operator: Some(Arc::new(CounterMerge)),
-        block_size: 512,
-        write_buffer_size: 4 * 1024 * 1024,
-        max_background_compactions: 0,
-        ..Options::default()
-    }
+    Options::default()
+        .merge_operator(Some(Arc::new(CounterMerge)))
+        .block_size(512)
+        .write_buffer_size(4 * 1024 * 1024)
+        .max_background_compactions(0)
 }
 
 fn partitioned() -> Options {
-    Options {
-        partitioned_index: true,
-        metadata_block_size: 512,
-        ..options()
-    }
+    options().partitioned_index(true).metadata_block_size(512)
 }
 
 fn counter(db: &Db) -> i64 {

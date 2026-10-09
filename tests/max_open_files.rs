@@ -16,13 +16,11 @@ fn value(i: u32) -> Vec<u8> {
 fn many_tables(dir: &std::path::Path, max_open_files: usize, tables: u32, per: u32) -> Db {
     let db = Db::open(
         dir,
-        Options {
-            max_open_files,
-            l0_compaction_trigger: 10_000,
-            level0_slowdown_writes_trigger: 0,
-            level0_stop_writes_trigger: 0,
-            ..Options::default()
-        },
+        Options::default()
+            .max_open_files(max_open_files)
+            .l0_compaction_trigger(10_000)
+            .level0_slowdown_writes_trigger(0)
+            .level0_stop_writes_trigger(0),
     )
     .unwrap();
     for t in 0..tables {

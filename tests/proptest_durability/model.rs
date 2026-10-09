@@ -138,12 +138,10 @@ impl MergeOperator for Append {
 }
 
 pub(crate) fn opts(write_buffer_size: usize, durability: DurabilityMode) -> Options {
-    Options {
-        write_buffer_size,
-        durability,
-        merge_operator: Some(Arc::new(Append)),
-        ..Options::default()
-    }
+    Options::default()
+        .write_buffer_size(write_buffer_size)
+        .durability(durability)
+        .merge_operator(Some(Arc::new(Append)))
 }
 
 /// Small enough that a generated sequence flushes several memtables and

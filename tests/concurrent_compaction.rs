@@ -20,23 +20,21 @@ use regolith::{CompactionOutcome, Db, Options, WriteBatch};
 /// Small enough that a few megabytes reach L1 through many separate
 /// compaction jobs, which is what gives the workers something to race over.
 fn contended_options(workers: usize) -> Options {
-    Options {
+    Options::default()
         // Deliberately tiny. Small files and a trigger of one turn a few
         // tens of megabytes into hundreds of separate compaction jobs, and
         // it is the number of independent picks, not the volume of data,
         // that decides whether two workers ever choose the same input.
-        write_buffer_size: 128 * 1024,
-        block_size: 4 * 1024,
-        block_cache_size: 256 * 1024,
-        target_file_size: 64 * 1024,
-        level_base_bytes: 128 * 1024,
-        l0_compaction_trigger: 1,
-        level0_slowdown_writes_trigger: 0,
-        level0_stop_writes_trigger: 0,
-        max_background_compactions: workers,
-        max_subcompactions: workers,
-        ..Options::default()
-    }
+        .write_buffer_size(128 * 1024)
+        .block_size(4 * 1024)
+        .block_cache_size(256 * 1024)
+        .target_file_size(64 * 1024)
+        .level_base_bytes(128 * 1024)
+        .l0_compaction_trigger(1)
+        .level0_slowdown_writes_trigger(0)
+        .level0_stop_writes_trigger(0)
+        .max_background_compactions(workers)
+        .max_subcompactions(workers)
 }
 
 fn write_dense_keys(db: &Db, count: u64) {

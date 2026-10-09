@@ -60,31 +60,24 @@ fn open_with(dir: &std::path::Path, options: Options) -> OptimisticTransactionDb
 fn open(dir: &std::path::Path) -> OptimisticTransactionDb {
     open_with(
         dir,
-        Options {
-            merge_operator: Some(Arc::new(CounterMerge)),
-            ..Options::default()
-        },
+        Options::default().merge_operator(Some(Arc::new(CounterMerge))),
     )
 }
 
 /// Small blocks, so a key's merge chain spans many of them, and no
 /// background compaction to fold the chain away.
 fn block_spanning() -> Options {
-    Options {
-        merge_operator: Some(Arc::new(CounterMerge)),
-        block_size: 512,
-        max_background_compactions: 0,
-        ..Options::default()
-    }
+    Options::default()
+        .merge_operator(Some(Arc::new(CounterMerge)))
+        .block_size(512)
+        .max_background_compactions(0)
 }
 
 /// `block_spanning` with a partitioned index of small leaves.
 fn block_spanning_partitioned() -> Options {
-    Options {
-        partitioned_index: true,
-        metadata_block_size: 512,
-        ..block_spanning()
-    }
+    block_spanning()
+        .partitioned_index(true)
+        .metadata_block_size(512)
 }
 
 /// Both index shapes, as constructors so a test can open several databases

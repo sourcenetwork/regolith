@@ -14,10 +14,7 @@ use regolith::{Db, OptimisticTransactionDb, Options, TransactionError, TxnOption
 use tempfile::TempDir;
 
 fn options() -> Options {
-    Options {
-        max_background_compactions: 0,
-        ..Options::default()
-    }
+    Options::default().max_background_compactions(0)
 }
 
 #[test]

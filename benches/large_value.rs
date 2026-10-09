@@ -151,10 +151,7 @@ fn main() {
         println!(
             "REGOLITH_BENCH_HUGE=1: running the {HUGE_MIB} MiB case with max_value_size raised"
         );
-        let opts = regolith::Options {
-            max_value_size: HUGE_MIB * MIB,
-            ..common::default_opts()
-        };
+        let opts = common::default_opts().max_value_size(HUGE_MIB * MIB);
         let mut result = run_size(HUGE_MIB, 1, opts);
         report(&mut result)
     } else {
@@ -169,8 +166,8 @@ fn main() {
              \"compression\":\"{:?}\",\"default_max_value_mib\":{},\
              \"sizes\":[{}],\"gib_case\":{gib_case},\
              \"gib_note\":\"the {HUGE_MIB} MiB case raises max_value_size and runs only with REGOLITH_BENCH_HUGE=1\"}}",
-            common::default_opts().compression,
-            common::default_opts().max_value_size / MIB,
+            common::default_opts().get_compression(),
+            common::default_opts().get_max_value_size() / MIB,
             sizes.join(",")
         ),
     );

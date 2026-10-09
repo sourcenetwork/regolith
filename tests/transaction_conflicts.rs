@@ -220,10 +220,7 @@ fn an_external_merge_on_a_tracked_key_is_detected() {
     let dir = TempDir::new().unwrap();
     let db = TransactionDb::open(
         dir.path(),
-        Options {
-            merge_operator: Some(Arc::new(Concat)),
-            ..Options::default()
-        },
+        Options::default().merge_operator(Some(Arc::new(Concat))),
     )
     .unwrap();
     db.db().put(b"k", b"a").unwrap();
@@ -332,15 +329,9 @@ fn increments_survive_flush_and_compaction_mid_run() {
     const COUNTER: &[u8] = b"counter";
 
     let dir = TempDir::new().unwrap();
-    let db = TransactionDb::open(
-        dir.path(),
-        Options {
-            write_buffer_size: 4 * 1024,
-            ..Options::default()
-        },
-    )
-    .unwrap()
-    .with_lock_timeout(Duration::from_secs(10));
+    let db = TransactionDb::open(dir.path(), Options::default().write_buffer_size(4 * 1024))
+        .unwrap()
+        .with_lock_timeout(Duration::from_secs(10));
 
     std::thread::scope(|scope| {
         for _ in 0..THREADS {

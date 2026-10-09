@@ -225,10 +225,7 @@ fn a_stale_get_for_update_still_conflicts_when_the_write_matches() {
 #[test]
 fn concurrent_merges_still_conflict() {
     let dir = tempfile::tempdir().unwrap();
-    let options = Options {
-        merge_operator: Some(std::sync::Arc::new(CounterMerge)),
-        ..Options::default()
-    };
+    let options = Options::default().merge_operator(Some(std::sync::Arc::new(CounterMerge)));
     let db = OptimisticTransactionDb::open(dir.path(), options).unwrap();
 
     let first = db.begin(&TxnOptions::new().isolation(IsolationLevel::Serializable));
@@ -262,10 +259,7 @@ fn sequential_identical_writes_commit() {
 }
 
 fn counter_db(dir: &std::path::Path) -> OptimisticTransactionDb {
-    let options = Options {
-        merge_operator: Some(std::sync::Arc::new(CounterMerge)),
-        ..Options::default()
-    };
+    let options = Options::default().merge_operator(Some(std::sync::Arc::new(CounterMerge)));
     OptimisticTransactionDb::open(dir, options).unwrap()
 }
 

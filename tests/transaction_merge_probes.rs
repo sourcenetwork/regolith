@@ -51,11 +51,9 @@ fn a_key_merged_many_times_is_probed_once() {
 
     let dir = tempfile::tempdir().unwrap();
     let stats = Arc::new(Statistics::new());
-    let options = Options {
-        merge_operator: Some(Arc::new(CounterMerge)),
-        statistics: Some(stats.clone()),
-        ..Options::default()
-    };
+    let options = Options::default()
+        .merge_operator(Some(Arc::new(CounterMerge)))
+        .statistics(Some(stats.clone()));
     let db = OptimisticTransactionDb::open(dir.path(), options).unwrap();
 
     // Flush the base value so every probe below has to reach the SSTable
@@ -89,11 +87,9 @@ fn keys_merged_in_an_interleaved_order_are_probed_once_each() {
 
     let dir = tempfile::tempdir().unwrap();
     let stats = Arc::new(Statistics::new());
-    let options = Options {
-        merge_operator: Some(Arc::new(CounterMerge)),
-        statistics: Some(stats.clone()),
-        ..Options::default()
-    };
+    let options = Options::default()
+        .merge_operator(Some(Arc::new(CounterMerge)))
+        .statistics(Some(stats.clone()));
     let db = OptimisticTransactionDb::open(dir.path(), options).unwrap();
 
     // Flushed, as above, so every probe has to consult the SSTable's bloom
@@ -148,10 +144,7 @@ fn operands_merged_in_an_interleaved_order_read_back_in_the_order_they_were_buff
     const OPERANDS: usize = 90;
 
     let dir = tempfile::tempdir().unwrap();
-    let options = Options {
-        merge_operator: Some(Arc::new(AppendMerge)),
-        ..Options::default()
-    };
+    let options = Options::default().merge_operator(Some(Arc::new(AppendMerge)));
     let db = OptimisticTransactionDb::open(dir.path(), options).unwrap();
 
     let tx = db.begin(&TxnOptions::new().isolation(IsolationLevel::SnapshotIsolation));
@@ -198,10 +191,7 @@ fn a_newer_merge_operand_conflicts_a_point_read_wherever_it_is_stored() {
         OperandAt::SameTable,
     ] {
         let dir = tempfile::tempdir().unwrap();
-        let options = Options {
-            merge_operator: Some(Arc::new(CounterMerge)),
-            ..Options::default()
-        };
+        let options = Options::default().merge_operator(Some(Arc::new(CounterMerge)));
         let db = OptimisticTransactionDb::open(dir.path(), options).unwrap();
         db.db().put(b"counter", &0i64.to_be_bytes()).unwrap();
         db.db().flush().unwrap();

@@ -18,16 +18,14 @@ const N: usize = 4_000;
 /// Options pinned identically on every target so the bytes on disk are
 /// a function of the data alone.
 fn opts() -> Options {
-    Options {
-        write_buffer_size: 32 * 1024,
-        target_file_size: 64 * 1024,
-        level_base_bytes: 256 * 1024,
-        block_size: 4 * 1024,
-        block_cache_size: 0,
-        max_background_compactions: 0,
-        bloom_bits_per_key: 10,
-        ..Options::default()
-    }
+    Options::default()
+        .write_buffer_size(32 * 1024)
+        .target_file_size(64 * 1024)
+        .level_base_bytes(256 * 1024)
+        .block_size(4 * 1024)
+        .block_cache_size(0)
+        .max_background_compactions(0)
+        .bloom_bits_per_key(10)
 }
 
 fn key(i: usize) -> Vec<u8> {

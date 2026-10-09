@@ -23,10 +23,7 @@ fn batch_key(writer: usize, round: usize, k: usize) -> Vec<u8> {
 }
 
 fn opts() -> Options {
-    Options {
-        write_buffer_size: 8 * 1024,
-        ..Options::default()
-    }
+    Options::default().write_buffer_size(8 * 1024)
 }
 
 /// Many writers, so a commit group really carries several batches at
@@ -257,10 +254,7 @@ fn every_acknowledged_durable_write_survives_a_reopen() {
         let db = Arc::new(
             Db::open(
                 dir.path(),
-                Options {
-                    write_buffer_size: 1024 * 1024,
-                    ..Options::default()
-                },
+                Options::default().write_buffer_size(1024 * 1024),
             )
             .unwrap(),
         );

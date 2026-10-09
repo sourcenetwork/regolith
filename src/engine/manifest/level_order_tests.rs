@@ -417,14 +417,12 @@ proptest! {
         steps in proptest::collection::vec(step(), 1..60),
     ) {
         let dir = TempDir::new().unwrap();
-        let options = Options {
-            max_background_compactions: 0,
-            write_buffer_size: 4 * 1024,
-            target_file_size: 1024,
-            block_size: 256,
-            level_base_bytes: 8 * 1024,
-            ..Options::default()
-        };
+        let options = Options::default()
+.max_background_compactions(0)
+.write_buffer_size(4 * 1024)
+.target_file_size(1024)
+.block_size(256)
+.level_base_bytes(8 * 1024);
         let db = Db::open(dir.path(), options.clone()).unwrap();
         let mut model: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
         for (index, step) in steps.iter().enumerate() {

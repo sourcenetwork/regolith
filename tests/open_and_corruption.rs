@@ -20,10 +20,7 @@ use regolith::{Db, DurabilityMode, Options, RateLimiter};
 use tempfile::TempDir;
 
 fn opts() -> Options {
-    Options {
-        write_buffer_size: 4 * 1024,
-        ..Options::default()
-    }
+    Options::default().write_buffer_size(4 * 1024)
 }
 
 fn fill(db: &Db, n: usize) {
@@ -188,11 +185,9 @@ fn wal_only_copy(keys: usize) -> TempDir {
     let live = TempDir::new().unwrap();
     let db = Db::open(
         live.path(),
-        Options {
-            write_buffer_size: 8 * 1024 * 1024,
-            durability: DurabilityMode::Immediate,
-            ..Options::default()
-        },
+        Options::default()
+            .write_buffer_size(8 * 1024 * 1024)
+            .durability(DurabilityMode::Immediate),
     )
     .unwrap();
     fill(&db, keys);
@@ -307,14 +302,7 @@ fn a_wal_claiming_a_huge_record_does_not_allocate_it() {
     // to accept as the end of the log.
     let dir = TempDir::new().unwrap();
     let record = {
-        let db = Db::open(
-            dir.path(),
-            Options {
-                durability: DurabilityMode::Immediate,
-                ..opts()
-            },
-        )
-        .unwrap();
+        let db = Db::open(dir.path(), opts().durability(DurabilityMode::Immediate)).unwrap();
         db.put(b"k", b"v").unwrap();
         let wal = files_with_ext(&dir.path().join("wal"), "log")
             .pop()
@@ -474,10 +462,7 @@ fn close_does_not_wait_out_a_condvar_timeout_per_worker() {
         let dir = TempDir::new().unwrap();
         let db = Db::open(
             dir.path(),
-            Options {
-                max_background_compactions: workers,
-                ..Options::default()
-            },
+            Options::default().max_background_compactions(workers),
         )
         .unwrap();
         db.put(b"k", b"v").unwrap();

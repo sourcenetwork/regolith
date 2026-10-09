@@ -12,11 +12,9 @@ fn guarded_public_reads_preserve_snapshot_tombstone_and_cf_visibility() {
         let dir = TempDir::new().unwrap();
         let db = Db::open(
             dir.path(),
-            Options {
-                compression,
-                l0_compaction_trigger: 100,
-                ..Options::default()
-            },
+            Options::default()
+                .compression(compression)
+                .l0_compaction_trigger(100),
         )
         .unwrap();
         let cf = db.create_column_family("other").unwrap();
@@ -96,10 +94,7 @@ fn guarded_reads_reject_configured_merges_even_for_missing_keys() {
     let dir = TempDir::new().unwrap();
     let db = Db::open(
         dir.path(),
-        Options {
-            merge_operator: Some(Arc::new(NeverMerge)),
-            ..Options::default()
-        },
+        Options::default().merge_operator(Some(Arc::new(NeverMerge))),
     )
     .unwrap();
     let cf = db.create_column_family("other").unwrap();

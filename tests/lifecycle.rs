@@ -47,10 +47,7 @@ fn crash_child() {
 /// A 4 KiB write buffer so a few hundred keys really do flush, and the
 /// reopen paths exercise files rather than one memtable.
 fn opts() -> Options {
-    Options {
-        write_buffer_size: 4 * 1024,
-        ..Options::default()
-    }
+    Options::default().write_buffer_size(4 * 1024)
 }
 
 fn key(i: usize) -> Vec<u8> {

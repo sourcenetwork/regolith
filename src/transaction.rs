@@ -2475,20 +2475,18 @@ mod tests {
     // -- Write-stall admission --------------------------------------------
 
     fn slowdown_opts(stats: &Arc<Statistics>) -> Options {
-        Options {
+        Options::default()
             // Tiny memtable so every handful of puts rolls an L0 file.
-            write_buffer_size: 4 * 1024,
+            .write_buffer_size(4 * 1024)
             // Disable automatic compaction so L0 can't drain on us.
-            l0_compaction_trigger: 1000,
+            .l0_compaction_trigger(1000)
             // Slow down once L0 has 2 files, never stop (high trigger).
-            level0_slowdown_writes_trigger: 2,
-            level0_stop_writes_trigger: 10_000,
+            .level0_slowdown_writes_trigger(2)
+            .level0_stop_writes_trigger(10_000)
             // Disable the memtable-count trigger so this isolates the L0
             // slowdown path.
-            max_write_buffer_number: 0,
-            statistics: Some(Arc::clone(stats)),
-            ..Options::default()
-        }
+            .max_write_buffer_number(0)
+            .statistics(Some(Arc::clone(stats)))
     }
 
     /// Drive `plain` past the slowdown trigger with the same recipe as
@@ -2674,10 +2672,7 @@ mod tests {
             (IsolationLevel::Serializable, 1),
         ] {
             let dir = TempDir::new().unwrap();
-            let opts = Options {
-                merge_operator: Some(Arc::new(Append)),
-                ..Options::default()
-            };
+            let opts = Options::default().merge_operator(Some(Arc::new(Append)));
             let db = OptimisticTransactionDb::open(dir.path(), opts).unwrap();
             db.db().put(b"k", b"base").unwrap();
             let tx = db.begin(&TxnOptions::new().isolation(level));
@@ -2714,10 +2709,7 @@ mod tests {
         // only thing that can index `tracked` in this test is the lazy
         // build `scan_read_seq` triggers, isolated from the unrelated
         // "past N keys" auto-index a bigger default would also trigger.
-        let opts = Options {
-            transaction_keys_inline: 0,
-            ..Options::default()
-        };
+        let opts = Options::default().transaction_keys_inline(0);
         let db = TransactionDb::open(dir.path(), opts).unwrap();
         for i in 0..64u32 {
             db.db().put(format!("k{i:04}").as_bytes(), b"0").unwrap();

@@ -92,7 +92,7 @@ fn run() -> Result<bool, String> {
         phase.name(),
         profile.name(),
         db_dir.display(),
-        options().max_background_compactions
+        options().get_max_background_compactions()
     ));
 
     match phase {

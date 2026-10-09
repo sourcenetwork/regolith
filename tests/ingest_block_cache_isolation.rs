@@ -27,12 +27,10 @@ use tempfile::TempDir;
 const PER_FILE: u32 = 2000;
 
 fn opts(block_cache_size: usize) -> Options {
-    Options {
-        write_buffer_size: 64 * 1024 * 1024,
-        durability: DurabilityMode::Eventual,
-        block_cache_size,
-        ..Options::default()
-    }
+    Options::default()
+        .write_buffer_size(64 * 1024 * 1024)
+        .durability(DurabilityMode::Eventual)
+        .block_cache_size(block_cache_size)
 }
 
 fn make(path: &Path, prefix: &str) {

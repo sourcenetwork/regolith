@@ -26,13 +26,11 @@ fn a_hot_counter_stays_folded_under_rolling_transactions() {
     let dir = TempDir::new().unwrap();
     let db = OptimisticTransactionDb::open(
         dir.path(),
-        Options {
-            merge_operator: Some(Arc::new(Sum)),
+        Options::default()
+            .merge_operator(Some(Arc::new(Sum)))
             // Compaction runs only where this test asks for it, so the
             // counts below do not depend on a worker's timing.
-            max_background_compactions: 0,
-            ..Options::default()
-        },
+            .max_background_compactions(0),
     )
     .unwrap();
     let counter = prefix_key(DEFAULT_CF_ID, b"counter");

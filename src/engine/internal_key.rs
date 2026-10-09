@@ -231,11 +231,9 @@ mod tests {
         }
 
         let dir = tempfile::tempdir().unwrap();
-        let opts = crate::Options {
-            block_size: 64 * 1024,
-            compression: crate::CompressionType::None,
-            ..crate::Options::default()
-        };
+        let opts = crate::Options::default()
+            .block_size(64 * 1024)
+            .compression(crate::CompressionType::None);
         {
             let db = crate::Db::open(dir.path(), opts.clone()).unwrap();
             for i in 0..8 {

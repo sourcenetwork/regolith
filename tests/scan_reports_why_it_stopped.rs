@@ -15,15 +15,13 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use regolith::{Db, Options, TxnOptions, WriteBatch};
 
 fn small_options() -> Options {
-    Options {
-        write_buffer_size: 64 * 1024,
-        block_size: 4 * 1024,
-        block_cache_size: 0,
-        target_file_size: 256 * 1024,
-        l0_compaction_trigger: 8,
-        max_background_compactions: 0,
-        ..Options::default()
-    }
+    Options::default()
+        .write_buffer_size(64 * 1024)
+        .block_size(4 * 1024)
+        .block_cache_size(0)
+        .target_file_size(256 * 1024)
+        .l0_compaction_trigger(8)
+        .max_background_compactions(0)
 }
 
 const KEYS: u64 = 20_000;

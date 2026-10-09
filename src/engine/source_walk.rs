@@ -121,10 +121,7 @@ mod tests {
 
     /// A database where only an explicit flush moves data between sources.
     fn open(dir: &TempDir) -> Db {
-        let options = Options {
-            max_background_compactions: 0,
-            ..Options::default()
-        };
+        let options = Options::default().max_background_compactions(0);
         Db::open(dir.path(), options).unwrap()
     }
 

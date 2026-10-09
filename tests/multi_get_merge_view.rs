@@ -49,14 +49,12 @@ impl MergeOperator for Interfering {
 fn a_multi_get_resolves_every_key_against_one_view() {
     let dir = TempDir::new().unwrap();
     let slot = Arc::new(OnceLock::new());
-    let options = Options {
-        max_background_compactions: 0,
-        merge_operator: Some(Arc::new(Interfering {
+    let options = Options::default()
+        .max_background_compactions(0)
+        .merge_operator(Some(Arc::new(Interfering {
             db: Arc::clone(&slot),
             fired: AtomicBool::new(false),
-        })),
-        ..Options::default()
-    };
+        })));
     let db = Arc::new(Db::open(dir.path(), options).unwrap());
     slot.set(Arc::downgrade(&db)).unwrap();
 

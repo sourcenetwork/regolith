@@ -34,8 +34,7 @@
 //! use regolith::{Db, Options};
 //!
 //! let env = OpfsEnv::mount("my-db", OpfsOptions::default()).await?;
-//! let mut options = Options::embedded();
-//! options.env = env.as_env();
+//! let options = Options::embedded().env(env.as_env());
 //! let db = Db::open(env.db_path(), options)?;
 //!
 //! db.put(b"k", b"v")?;

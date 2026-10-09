@@ -420,10 +420,7 @@ fn the_buffer_threshold_is_configurable_and_correct_at_every_setting() {
 
     for keys_inline in [0, 1, 8, 32, 1024] {
         let dir = TempDir::new().expect("tempdir");
-        let opts = Options {
-            transaction_keys_inline: keys_inline,
-            ..Options::default()
-        };
+        let opts = Options::default().transaction_keys_inline(keys_inline);
         let db = Arc::new(OptimisticTransactionDb::open(dir.path(), opts).expect("open"));
         let txn = db.begin(&TxnOptions::new().isolation(IsolationLevel::Serializable));
 

@@ -192,11 +192,9 @@ fn manifest_deleted_prevents_reopen_of_nonempty_db() {
 }
 
 fn manifest_options() -> Options {
-    Options {
-        max_background_compactions: 0,
-        l0_compaction_trigger: 100,
-        ..Options::default()
-    }
+    Options::default()
+        .max_background_compactions(0)
+        .l0_compaction_trigger(100)
 }
 
 #[test]

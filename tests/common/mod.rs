@@ -21,10 +21,7 @@ use tempfile::TempDir;
 /// trigger quickly - useful for exercising flush and compaction paths
 /// in tests without having to write megabytes of data.
 pub fn small_opts() -> Options {
-    Options {
-        write_buffer_size: 4 * 1024,
-        ..Options::default()
-    }
+    Options::default().write_buffer_size(4 * 1024)
 }
 
 /// Open a fresh regolith DB in `dir` using [`small_opts`].

@@ -54,10 +54,10 @@ fn oversized_size_lookup_rejects_without_value_sized_allocation() {
         CompressionType::Snappy,
     ] {
         let directory = tempfile::tempdir().unwrap();
-        let options = || Options {
-            compression,
-            block_cache_size: 0,
-            ..Options::default()
+        let options = || {
+            Options::default()
+                .compression(compression)
+                .block_cache_size(0)
         };
         {
             let db = Db::open(directory.path(), options()).unwrap();

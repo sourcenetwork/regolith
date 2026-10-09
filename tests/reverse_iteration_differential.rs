@@ -123,13 +123,10 @@ fn oracle(keys: &[Vec<u8>]) -> BTreeMap<Vec<u8>, Vec<u8>> {
 fn check(set_name: &str, keys: &[Vec<u8>], state: State, surface: Surface) -> Vec<String> {
     let want = oracle(keys);
     let dir = TempDir::new().expect("tempdir");
-    let opts = Options {
-        write_buffer_size: match state {
-            State::Memtable => 64 * 1024 * 1024,
-            _ => 4 * 1024,
-        },
-        ..Options::default()
-    };
+    let opts = Options::default().write_buffer_size(match state {
+        State::Memtable => 64 * 1024 * 1024,
+        _ => 4 * 1024,
+    });
     let db = Db::open(dir.path(), opts).expect("open");
     let cf = match surface {
         Surface::NamedCf => Some(db.create_column_family("attack").expect("create cf")),
@@ -287,14 +284,8 @@ fn seek_for_prev_matches_the_oracle_at_every_adversarial_probe() {
     for (name, keys) in key_sets() {
         let want = oracle(&keys);
         let dir = TempDir::new().expect("tempdir");
-        let db = Db::open(
-            dir.path(),
-            Options {
-                write_buffer_size: 4 * 1024,
-                ..Options::default()
-            },
-        )
-        .expect("open");
+        let db =
+            Db::open(dir.path(), Options::default().write_buffer_size(4 * 1024)).expect("open");
         for (k, v) in &want {
             db.put(k, v).expect("put");
         }

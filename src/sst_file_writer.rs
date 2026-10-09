@@ -214,13 +214,7 @@ mod tests {
     fn test_create_rejects_invalid_options() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("bad-options.sst");
-        match SstFileWriter::create(
-            &path,
-            &Options {
-                block_size: 0,
-                ..Options::default()
-            },
-        ) {
+        match SstFileWriter::create(&path, &Options::default().block_size(0)) {
             Ok(_) => panic!("expected invalid options error"),
             Err(crate::Error::InvalidArgument(message)) => assert!(message.contains("block_size")),
             Err(other) => panic!("expected invalid argument, got {other:?}"),
@@ -273,11 +267,7 @@ mod tests {
     fn test_configured_key_value_size_limits_are_enforced() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("limited.sst");
-        let opts = Options {
-            max_key_size: 3,
-            max_value_size: 4,
-            ..Options::default()
-        };
+        let opts = Options::default().max_key_size(3).max_value_size(4);
         let mut w = SstFileWriter::create(&path, &opts).unwrap();
 
         w.put(b"abc", b"1234").unwrap();

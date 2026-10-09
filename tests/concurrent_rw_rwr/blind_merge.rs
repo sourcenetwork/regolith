@@ -29,9 +29,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use regolith::{
-    Db, IsolationLevel, MergeOperator, OptimisticTransactionDb, Options, TransactionError,
-};
+use regolith::{Db, IsolationLevel, MergeOperator, OptimisticTransactionDb, TransactionError};
 
 use super::support::{Findings, Rendezvous, STORAGES, Storage, table_lookups};
 use super::{Flavour, LEVELS, THREADS, commit_with_retry, with_forced_writes};
@@ -207,10 +205,7 @@ fn blind_merge_rounds(level: IsolationLevel, storage: Storage, rounds: &[Round])
     let dir = tempfile::tempdir().unwrap();
     let db = OptimisticTransactionDb::open(
         dir.path(),
-        Options {
-            merge_operator: Some(Arc::new(Sum)),
-            ..storage.options()
-        },
+        storage.options().merge_operator(Some(Arc::new(Sum))),
     )
     .unwrap();
     db.db().put(COUNTER, &0i64.to_le_bytes()).unwrap();

@@ -299,10 +299,7 @@ fn an_ingest_waits_for_a_flush_of_a_memtable_sealed_before_it() {
     let dir = TempDir::new().unwrap();
     let staging = TempDir::new().unwrap();
     let limiter = PauseFirstLowRequest::new();
-    let opts = Options {
-        rate_limiter: Some(limiter.clone()),
-        ..Options::default()
-    };
+    let opts = Options::default().rate_limiter(Some(limiter.clone()));
     let db = Arc::new(Db::open(dir.path(), opts.clone()).unwrap());
 
     db.put(b"k", b"old").unwrap();
@@ -336,10 +333,7 @@ fn an_ingest_waits_for_a_flush_of_a_memtable_sealed_before_it() {
     drop(db);
 
     let reopen_limiter = PauseFirstLowRequest::new();
-    let reopen_opts = Options {
-        rate_limiter: Some(reopen_limiter),
-        ..opts
-    };
+    let reopen_opts = opts.rate_limiter(Some(reopen_limiter));
     let db = Db::open(dir.path(), reopen_opts).unwrap();
 
     // Before the fix, `last_seq` was lowered to the flush's sealed
@@ -368,10 +362,7 @@ fn a_write_issued_during_an_ingest_lands_above_the_ingested_file() {
     let dir = TempDir::new().unwrap();
     let staging = TempDir::new().unwrap();
     let env = NthSstOpen::new(dir.path(), 2, 0);
-    let opts = Options {
-        env: env.clone(),
-        ..Options::default()
-    };
+    let opts = Options::default().env(env.clone());
     let db = Arc::new(Db::open(dir.path(), opts.clone()).unwrap());
 
     db.put(b"k", b"old").unwrap();
@@ -408,10 +399,7 @@ fn a_write_issued_during_an_ingest_lands_above_the_ingested_file() {
     drop(db);
 
     let reopen_env = NthSstOpen::new(dir.path(), 0, 0);
-    let reopen_opts = Options {
-        env: reopen_env,
-        ..opts
-    };
+    let reopen_opts = opts.env(reopen_env);
     let db = Db::open(dir.path(), reopen_opts).unwrap();
 
     // Before the fix the ingest's stamp was applied after the flush's
@@ -445,10 +433,7 @@ fn a_write_issued_during_an_ingest_lands_above_the_ingested_file() {
 fn an_ingest_drains_a_memtable_left_frozen_by_a_failed_flush() {
     let dir = TempDir::new().unwrap();
     let staging = TempDir::new().unwrap();
-    let opts = Options {
-        env: NthSstOpen::new(dir.path(), 0, 1),
-        ..Options::default()
-    };
+    let opts = Options::default().env(NthSstOpen::new(dir.path(), 0, 1));
     let db = Db::open(dir.path(), opts.clone()).unwrap();
 
     db.put(b"k", b"old").unwrap();
@@ -469,14 +454,7 @@ fn an_ingest_drains_a_memtable_left_frozen_by_a_failed_flush() {
     let before = db.latest_sequence();
     drop(db);
 
-    let db = Db::open(
-        dir.path(),
-        Options {
-            env: NthSstOpen::new(dir.path(), 0, 0),
-            ..opts
-        },
-    )
-    .unwrap();
+    let db = Db::open(dir.path(), opts.env(NthSstOpen::new(dir.path(), 0, 0))).unwrap();
 
     // Without the maximum rule, M1's later stamp would lower
     // `last_seq` below the ingest's, and the reopened counter would
@@ -502,11 +480,9 @@ fn a_write_that_fills_the_memtable_during_an_ingest_lands_above_the_ingested_fil
     // The first SST open is the flush of `old` below; the second is the
     // ingest's table.
     let env = NthSstOpen::new(dir.path(), 2, 0);
-    let opts = Options {
-        env: env.clone(),
-        write_buffer_size: 4 * 1024,
-        ..Options::default()
-    };
+    let opts = Options::default()
+        .env(env.clone())
+        .write_buffer_size(4 * 1024);
     let db = Arc::new(Db::open(dir.path(), opts.clone()).unwrap());
 
     // An L0 file holding `k`: the ingested file overlaps it, so it lands
@@ -547,14 +523,7 @@ fn a_write_that_fills_the_memtable_during_an_ingest_lands_above_the_ingested_fil
     let before = db.latest_sequence();
     drop(db);
 
-    let db = Db::open(
-        dir.path(),
-        Options {
-            env: NthSstOpen::new(dir.path(), 0, 0),
-            ..opts
-        },
-    )
-    .unwrap();
+    let db = Db::open(dir.path(), opts.env(NthSstOpen::new(dir.path(), 0, 0))).unwrap();
     let mut batch = WriteBatch::new();
     batch.put(b"z", b"v");
     let seq = db.write_sequenced(batch).unwrap();
@@ -574,11 +543,9 @@ fn writes_issued_during_an_ingest_that_fails_commit_once_it_gives_up() {
     let staging = TempDir::new().unwrap();
     // The ingest's table is the first SST open: it pauses, then fails.
     let env = NthSstOpen::new(dir.path(), 1, 1);
-    let opts = Options {
-        env: env.clone(),
-        write_buffer_size: 4 * 1024,
-        ..Options::default()
-    };
+    let opts = Options::default()
+        .env(env.clone())
+        .write_buffer_size(4 * 1024);
     let db = Arc::new(Db::open(dir.path(), opts.clone()).unwrap());
 
     let ingest_path = build_ingest_file(staging.path(), &opts, b"k", b"new");
@@ -614,14 +581,7 @@ fn writes_issued_during_an_ingest_that_fails_commit_once_it_gives_up() {
     assert_eq!(db.get(b"k").unwrap(), Some(b"v2".to_vec()));
 
     drop(db);
-    let db = Db::open(
-        dir.path(),
-        Options {
-            env: NthSstOpen::new(dir.path(), 0, 0),
-            ..opts
-        },
-    )
-    .unwrap();
+    let db = Db::open(dir.path(), opts.env(NthSstOpen::new(dir.path(), 0, 0))).unwrap();
     assert_eq!(db.get(b"k").unwrap(), Some(b"v2".to_vec()));
     assert_eq!(db.get(b"f0").unwrap(), Some(vec![0u8; 1024]));
 }

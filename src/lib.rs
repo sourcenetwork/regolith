@@ -3102,14 +3102,7 @@ mod tests {
     #[test]
     fn test_db_open_rejects_invalid_options() {
         let dir = TempDir::new().unwrap();
-        let err = Db::open(
-            dir.path(),
-            Options {
-                write_buffer_size: 0,
-                ..Options::default()
-            },
-        )
-        .unwrap_err();
+        let err = Db::open(dir.path(), Options::default().write_buffer_size(0)).unwrap_err();
         match err {
             Error::InvalidArgument(message) => assert!(message.contains("write_buffer_size")),
             other => panic!("expected invalid argument, got {other:?}"),
@@ -3120,10 +3113,7 @@ mod tests {
     fn test_open_read_only_replays_wal_without_mutating_files() {
         let dir = TempDir::new().unwrap();
         {
-            let opts = Options {
-                durability: DurabilityMode::Immediate,
-                ..Options::default()
-            };
+            let opts = Options::default().durability(DurabilityMode::Immediate);
             let db = Db::open(dir.path(), opts).unwrap();
             db.put(b"wal_only", b"value").unwrap();
         }
@@ -3256,11 +3246,7 @@ mod tests {
     #[test]
     fn test_configured_key_value_size_limits_are_enforced() {
         let dir = TempDir::new().unwrap();
-        let opts = Options {
-            max_key_size: 8,
-            max_value_size: 4,
-            ..Options::default()
-        };
+        let opts = Options::default().max_key_size(8).max_value_size(4);
         let db = Db::open(dir.path(), opts).unwrap();
 
         db.put(b"abc", b"1234").unwrap();
@@ -3288,10 +3274,7 @@ mod tests {
 
     /// Options that force flushes early so tests can exercise the SSTable path.
     fn tiny_flush_opts() -> Options {
-        Options {
-            write_buffer_size: 4 * 1024,
-            ..Options::default()
-        }
+        Options::default().write_buffer_size(4 * 1024)
     }
 
     /// Write enough filler bytes to push the active memtable past
@@ -4195,11 +4178,9 @@ mod tests {
     #[test]
     fn test_compact_range_bounded_compacts_default_cf_files() {
         let dir = TempDir::new().unwrap();
-        let opts = Options {
-            write_buffer_size: 4 * 1024,
-            l0_compaction_trigger: 1_000,
-            ..Options::default()
-        };
+        let opts = Options::default()
+            .write_buffer_size(4 * 1024)
+            .l0_compaction_trigger(1_000);
         let db = Db::open(dir.path(), opts).unwrap();
         let payload = vec![0u8; 512];
 
@@ -4851,11 +4832,9 @@ mod tests {
         // then reopens and runs `seek_for_prev` with a target larger
         // than every key.
         let dir = TempDir::new().unwrap();
-        let opts = Options {
-            block_size: 128,
-            write_buffer_size: 64 * 1024,
-            ..Options::default()
-        };
+        let opts = Options::default()
+            .block_size(128)
+            .write_buffer_size(64 * 1024);
         {
             let db = Db::open(dir.path(), opts.clone()).unwrap();
             for i in 0..60u32 {
@@ -5208,11 +5187,9 @@ mod tests {
     // ── compression codecs ──────────────────────────────────────────────────
 
     fn compression_opts(codec: CompressionType) -> Options {
-        Options {
-            write_buffer_size: 4 * 1024,
-            compression: codec,
-            ..Options::default()
-        }
+        Options::default()
+            .write_buffer_size(4 * 1024)
+            .compression(codec)
     }
 
     fn write_and_read_back(opts: Options) {
@@ -5269,16 +5246,14 @@ mod tests {
         // database must hold blocks compressed with both codecs and
         // still read back correctly.
         let dir = TempDir::new().unwrap();
-        let opts = Options {
-            write_buffer_size: 4 * 1024,
-            compression: CompressionType::Lz4,
-            compression_per_level: Some(vec![
+        let opts = Options::default()
+            .write_buffer_size(4 * 1024)
+            .compression(CompressionType::Lz4)
+            .compression_per_level(Some(vec![
                 CompressionType::Snappy, // L0
                 CompressionType::Lz4,    // L1
                 CompressionType::None,   // L2 (unused here, just to exercise the slot)
-            ]),
-            ..Options::default()
-        };
+            ]));
         let payload: Vec<u8> = (0..256).map(|i| (i % 17) as u8).collect();
         {
             let db = Db::open(dir.path(), opts.clone()).unwrap();
@@ -5314,12 +5289,10 @@ mod tests {
     fn test_compression_per_level_falls_back_to_default() {
         // Override only L0; L1+ should fall back to `compression`.
         let dir = TempDir::new().unwrap();
-        let opts = Options {
-            write_buffer_size: 4 * 1024,
-            compression: CompressionType::Snappy,
-            compression_per_level: Some(vec![CompressionType::None]),
-            ..Options::default()
-        };
+        let opts = Options::default()
+            .write_buffer_size(4 * 1024)
+            .compression(CompressionType::Snappy)
+            .compression_per_level(Some(vec![CompressionType::None]));
         let db = Db::open(dir.path(), opts).unwrap();
         for i in 0..50 {
             db.put(format!("k_{i:03}").as_bytes(), b"v").unwrap();
@@ -5402,11 +5375,9 @@ mod tests {
         let filter = Arc::new(DropOddKeysFilter {
             calls: AtomicUsize::new(0),
         });
-        let opts = Options {
-            write_buffer_size: 4 * 1024,
-            compaction_filter: Some(filter.clone()),
-            ..Options::default()
-        };
+        let opts = Options::default()
+            .write_buffer_size(4 * 1024)
+            .compaction_filter(Some(filter.clone()));
         let db = Db::open(dir.path(), opts).unwrap();
         // 20 keys: k0..k9 written twice so compaction has work. Use
         // longer payloads so the tiny write buffer triggers flushes.
@@ -5436,11 +5407,9 @@ mod tests {
     #[test]
     fn test_compaction_filter_rewrites_values() {
         let dir = TempDir::new().unwrap();
-        let opts = Options {
-            write_buffer_size: 4 * 1024,
-            compaction_filter: Some(Arc::new(UppercaseValuesFilter)),
-            ..Options::default()
-        };
+        let opts = Options::default()
+            .write_buffer_size(4 * 1024)
+            .compaction_filter(Some(Arc::new(UppercaseValuesFilter)));
         let db = Db::open(dir.path(), opts).unwrap();
         for i in 0..20 {
             db.put(format!("k{i:02}").as_bytes(), b"hello world")
@@ -5461,11 +5430,9 @@ mod tests {
     #[test]
     fn test_compaction_filter_runs_in_every_snapshot_stripe() {
         let dir = TempDir::new().unwrap();
-        let opts = Options {
-            write_buffer_size: 4 * 1024,
-            compaction_filter: Some(Arc::new(UppercaseValuesFilter)),
-            ..Options::default()
-        };
+        let opts = Options::default()
+            .write_buffer_size(4 * 1024)
+            .compaction_filter(Some(Arc::new(UppercaseValuesFilter)));
         let db = Db::open(dir.path(), opts).unwrap();
         for i in 0..20 {
             db.put(format!("k{i:02}").as_bytes(), b"hello").unwrap();
@@ -5490,11 +5457,9 @@ mod tests {
     #[test]
     fn test_compaction_filter_drops_range_tombstones() {
         let dir = TempDir::new().unwrap();
-        let opts = Options {
-            write_buffer_size: 4 * 1024,
-            compaction_filter: Some(Arc::new(DropRangeTombstonesFilter)),
-            ..Options::default()
-        };
+        let opts = Options::default()
+            .write_buffer_size(4 * 1024)
+            .compaction_filter(Some(Arc::new(DropRangeTombstonesFilter)));
         let db = Db::open(dir.path(), opts).unwrap();
         for c in b'a'..=b'f' {
             db.put(&[c], &[c]).unwrap();
@@ -5521,11 +5486,9 @@ mod tests {
     }
 
     fn prefix_opts() -> Options {
-        Options {
-            write_buffer_size: 4 * 1024,
-            prefix_extractor: Some(std::sync::Arc::new(FixedLengthPrefix(10))),
-            ..Options::default()
-        }
+        Options::default()
+            .write_buffer_size(4 * 1024)
+            .prefix_extractor(Some(std::sync::Arc::new(FixedLengthPrefix(10))))
     }
 
     #[test]
@@ -5573,14 +5536,12 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let db = Db::open(
             dir.path(),
-            Options {
-                write_buffer_size: 4 * 1024,
-                l0_compaction_trigger: 1_000,
-                bloom_bits_per_key: 64,
-                prefix_extractor: Some(Arc::new(FixedLengthPrefix(8))),
-                statistics: Some(stats.clone()),
-                ..Options::default()
-            },
+            Options::default()
+                .write_buffer_size(4 * 1024)
+                .l0_compaction_trigger(1_000)
+                .bloom_bits_per_key(64)
+                .prefix_extractor(Some(Arc::new(FixedLengthPrefix(8))))
+                .statistics(Some(stats.clone())),
         )
         .unwrap();
 
@@ -5666,14 +5627,7 @@ mod tests {
         // files.
         let dir = TempDir::new().unwrap();
         {
-            let db = Db::open(
-                dir.path(),
-                Options {
-                    write_buffer_size: 4 * 1024,
-                    ..Options::default()
-                },
-            )
-            .unwrap();
+            let db = Db::open(dir.path(), Options::default().write_buffer_size(4 * 1024)).unwrap();
             db.put(b"tenant_001:old", b"old").unwrap();
             force_flush(&db, "a");
         }
@@ -5729,10 +5683,7 @@ mod tests {
         // already survives a clean close - this test's real content
         // is that the sync flag doesn't break the normal code path.)
         let dir = TempDir::new().unwrap();
-        let opts = Options {
-            durability: DurabilityMode::Eventual,
-            ..Options::default()
-        };
+        let opts = Options::default().durability(DurabilityMode::Eventual);
         {
             let db = Db::open(dir.path(), opts.clone()).unwrap();
             db.put_opt(&WriteOptions::sync(), b"critical", b"payload")
@@ -5928,11 +5879,9 @@ mod tests {
     }
 
     fn counter_opts() -> Options {
-        Options {
-            write_buffer_size: 4 * 1024,
-            merge_operator: Some(Arc::new(CounterMerge)),
-            ..Options::default()
-        }
+        Options::default()
+            .write_buffer_size(4 * 1024)
+            .merge_operator(Some(Arc::new(CounterMerge)))
     }
 
     fn encode_i64(n: i64) -> Vec<u8> {
@@ -6089,10 +6038,7 @@ mod tests {
     #[test]
     fn test_merge_append_operator() {
         let dir = TempDir::new().unwrap();
-        let opts = Options {
-            merge_operator: Some(Arc::new(AppendMerge)),
-            ..Options::default()
-        };
+        let opts = Options::default().merge_operator(Some(Arc::new(AppendMerge)));
         let db = Db::open(dir.path(), opts).unwrap();
         db.put(b"s", b"hello").unwrap();
         db.merge(b"s", b" ").unwrap();
@@ -6811,11 +6757,9 @@ mod tests {
         // zero-filled payload compresses to near-nothing and would
         // undercut the accuracy window we're checking.
         let dir = TempDir::new().unwrap();
-        let opts = Options {
-            write_buffer_size: 4 * 1024,
-            compression: CompressionType::None,
-            ..Options::default()
-        };
+        let opts = Options::default()
+            .write_buffer_size(4 * 1024)
+            .compression(CompressionType::None);
         let db = Db::open(dir.path(), opts).unwrap();
         let payload: Vec<u8> = (0..256).map(|i| (i % 251) as u8).collect();
         for i in 0..100 {
@@ -6991,10 +6935,7 @@ mod tests {
         // The flag is a no-op for API parity - both values must
         // open cleanly and produce the same atomic behavior.
         let dir = TempDir::new().unwrap();
-        let opts = Options {
-            atomic_flush: true,
-            ..Options::default()
-        };
+        let opts = Options::default().atomic_flush(true);
         let db = Db::open(dir.path(), opts).unwrap();
         let cf = db.create_column_family("cf1").unwrap();
         db.put_cf(&cf, b"k", b"v").unwrap();
@@ -7077,11 +7018,9 @@ mod tests {
     fn test_listener_fires_on_flush() {
         let listener = Arc::new(CountingListener::default());
         let dir = TempDir::new().unwrap();
-        let opts = Options {
-            write_buffer_size: 4 * 1024,
-            listeners: vec![listener.clone() as Arc<dyn EventListener>],
-            ..Options::default()
-        };
+        let opts = Options::default()
+            .write_buffer_size(4 * 1024)
+            .listeners(vec![listener.clone() as Arc<dyn EventListener>]);
         let db = Db::open(dir.path(), opts).unwrap();
         force_flush(&db, "listener");
 
@@ -7104,11 +7043,9 @@ mod tests {
     fn test_listener_fires_on_compaction() {
         let listener = Arc::new(CountingListener::default());
         let dir = TempDir::new().unwrap();
-        let opts = Options {
-            write_buffer_size: 4 * 1024,
-            listeners: vec![listener.clone() as Arc<dyn EventListener>],
-            ..Options::default()
-        };
+        let opts = Options::default()
+            .write_buffer_size(4 * 1024)
+            .listeners(vec![listener.clone() as Arc<dyn EventListener>]);
         let db = Db::open(dir.path(), opts).unwrap();
         // Drive enough writes to generate L0 files, then manually
         // compact the range so the compaction callbacks fire on
@@ -7143,10 +7080,7 @@ mod tests {
     fn test_listener_fires_on_ingest() {
         let listener = Arc::new(CountingListener::default());
         let dir = TempDir::new().unwrap();
-        let opts = Options {
-            listeners: vec![listener.clone() as Arc<dyn EventListener>],
-            ..Options::default()
-        };
+        let opts = Options::default().listeners(vec![listener.clone() as Arc<dyn EventListener>]);
         let db = Db::open(dir.path(), opts.clone()).unwrap();
 
         let sst_path = dir.path().join("ingest.sst");
@@ -7178,14 +7112,12 @@ mod tests {
         let a = Arc::new(CountingListener::default());
         let b = Arc::new(CountingListener::default());
         let dir = TempDir::new().unwrap();
-        let opts = Options {
-            write_buffer_size: 4 * 1024,
-            listeners: vec![
+        let opts = Options::default()
+            .write_buffer_size(4 * 1024)
+            .listeners(vec![
                 a.clone() as Arc<dyn EventListener>,
                 b.clone() as Arc<dyn EventListener>,
-            ],
-            ..Options::default()
-        };
+            ]);
         let db = Db::open(dir.path(), opts).unwrap();
         force_flush(&db, "multi");
 
@@ -7221,11 +7153,9 @@ mod tests {
             captured: Mutex::new(None),
         });
         let dir = TempDir::new().unwrap();
-        let opts = Options {
-            write_buffer_size: 4 * 1024,
-            listeners: vec![listener.clone() as Arc<dyn EventListener>],
-            ..Options::default()
-        };
+        let opts = Options::default()
+            .write_buffer_size(4 * 1024)
+            .listeners(vec![listener.clone() as Arc<dyn EventListener>]);
         let db = Db::open(dir.path(), opts).unwrap();
         for i in 0..400 {
             db.put(format!("k_{i:04}").as_bytes(), b"v").unwrap();
@@ -7246,18 +7176,13 @@ mod tests {
     // ── statistics ──────────────────────────────────────────────────────
 
     fn stats_opts(stats: Arc<Statistics>) -> Options {
-        Options {
-            statistics: Some(stats),
-            ..Options::default()
-        }
+        Options::default().statistics(Some(stats))
     }
 
     fn tiny_flush_stats_opts(stats: Arc<Statistics>) -> Options {
-        Options {
-            write_buffer_size: 4 * 1024,
-            statistics: Some(stats),
-            ..Options::default()
-        }
+        Options::default()
+            .write_buffer_size(4 * 1024)
+            .statistics(Some(stats))
     }
 
     #[test]
@@ -7416,11 +7341,9 @@ mod tests {
     fn test_stats_wal_counters() {
         let stats = Arc::new(Statistics::new());
         let dir = TempDir::new().unwrap();
-        let opts = Options {
-            statistics: Some(stats.clone()),
-            durability: DurabilityMode::Immediate,
-            ..Options::default()
-        };
+        let opts = Options::default()
+            .statistics(Some(stats.clone()))
+            .durability(DurabilityMode::Immediate);
         let db = Db::open(dir.path(), opts).unwrap();
         db.put(b"k", b"v").unwrap();
         db.put(b"k2", b"v2").unwrap();
@@ -7633,10 +7556,7 @@ mod tests {
     #[test]
     fn test_property_stats_string_includes_level_header_and_counters() {
         let stats = Arc::new(Statistics::new());
-        let opts = Options {
-            statistics: Some(stats),
-            ..Options::default()
-        };
+        let opts = Options::default().statistics(Some(stats));
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), opts).unwrap();
         db.put(b"k", b"v").unwrap();
@@ -7719,13 +7639,11 @@ mod tests {
         // files that trigger multiple concurrent L1+ compactions.
         // Every key must still read back its latest value after
         // the dust settles.
-        let opts = Options {
-            write_buffer_size: 4 * 1024,
-            max_background_compactions: 4,
-            l0_compaction_trigger: 2,
-            target_file_size: 8 * 1024,
-            ..Options::default()
-        };
+        let opts = Options::default()
+            .write_buffer_size(4 * 1024)
+            .max_background_compactions(4)
+            .l0_compaction_trigger(2)
+            .target_file_size(8 * 1024);
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), opts).unwrap();
 
@@ -7763,11 +7681,9 @@ mod tests {
         // max_background_compactions=1 must behave identically to
         // the default (which is also 1). Sanity check that the
         // RwLock path doesn't break the single-worker case.
-        let opts = Options {
-            write_buffer_size: 4 * 1024,
-            max_background_compactions: 1,
-            ..Options::default()
-        };
+        let opts = Options::default()
+            .write_buffer_size(4 * 1024)
+            .max_background_compactions(1);
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), opts).unwrap();
         for i in 0..500 {
@@ -7785,12 +7701,10 @@ mod tests {
     fn test_partitioned_index_reads_are_correct() {
         // Enable partitioned index with a tiny metadata_block_size
         // so the test actually exercises the two-level path.
-        let opts = Options {
-            write_buffer_size: 4 * 1024,
-            partitioned_index: true,
-            metadata_block_size: 128,
-            ..Options::default()
-        };
+        let opts = Options::default()
+            .write_buffer_size(4 * 1024)
+            .partitioned_index(true)
+            .metadata_block_size(128);
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), opts).unwrap();
 
@@ -7818,12 +7732,10 @@ mod tests {
         // Scans must produce identical results.
         let write_and_scan = |partitioned: bool| -> Vec<(Vec<u8>, Vec<u8>)> {
             let dir = TempDir::new().unwrap();
-            let opts = Options {
-                write_buffer_size: 4 * 1024,
-                partitioned_index: partitioned,
-                metadata_block_size: 128,
-                ..Options::default()
-            };
+            let opts = Options::default()
+                .write_buffer_size(4 * 1024)
+                .partitioned_index(partitioned)
+                .metadata_block_size(128);
             let db = Db::open(dir.path(), opts).unwrap();
             for i in 0..200 {
                 let k = format!("k{i:04}");
@@ -7841,12 +7753,10 @@ mod tests {
     #[test]
     fn test_partitioned_index_survives_reopen() {
         let dir = TempDir::new().unwrap();
-        let opts = Options {
-            write_buffer_size: 4 * 1024,
-            partitioned_index: true,
-            metadata_block_size: 128,
-            ..Options::default()
-        };
+        let opts = Options::default()
+            .write_buffer_size(4 * 1024)
+            .partitioned_index(true)
+            .metadata_block_size(128);
         {
             let db = Db::open(dir.path(), opts.clone()).unwrap();
             for i in 0..200 {
@@ -7870,11 +7780,9 @@ mod tests {
         // file types must work correctly.
         let dir = TempDir::new().unwrap();
         {
-            let opts = Options {
-                write_buffer_size: 4 * 1024,
-                partitioned_index: false,
-                ..Options::default()
-            };
+            let opts = Options::default()
+                .write_buffer_size(4 * 1024)
+                .partitioned_index(false);
             let db = Db::open(dir.path(), opts).unwrap();
             for i in 0..100 {
                 let k = format!("k{i:04}");
@@ -7883,12 +7791,10 @@ mod tests {
             db.compact_range(None, None).unwrap();
         }
         {
-            let opts = Options {
-                write_buffer_size: 4 * 1024,
-                partitioned_index: true,
-                metadata_block_size: 128,
-                ..Options::default()
-            };
+            let opts = Options::default()
+                .write_buffer_size(4 * 1024)
+                .partitioned_index(true)
+                .metadata_block_size(128);
             let db = Db::open(dir.path(), opts).unwrap();
             for i in 100..200 {
                 let k = format!("k{i:04}");
@@ -7897,10 +7803,7 @@ mod tests {
             // Don't compact - leave V1 files at lower levels and
             // V2 files in L0/L1.
         }
-        let opts = Options {
-            partitioned_index: true,
-            ..Options::default()
-        };
+        let opts = Options::default().partitioned_index(true);
         let db = Db::open(dir.path(), opts).unwrap();
         for i in 0..100 {
             let k = format!("k{i:04}");
@@ -7917,12 +7820,10 @@ mod tests {
         // A compaction large enough to span multiple output files;
         // read everything back and confirm the streaming path keeps
         // the latest version for every user key.
-        let opts = Options {
-            write_buffer_size: 4 * 1024,
-            max_subcompactions: 4,
-            target_file_size: 8 * 1024,
-            ..Options::default()
-        };
+        let opts = Options::default()
+            .write_buffer_size(4 * 1024)
+            .max_subcompactions(4)
+            .target_file_size(8 * 1024);
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), opts).unwrap();
 
@@ -7961,12 +7862,10 @@ mod tests {
         // max_subcompactions is accepted for API compatibility, but
         // the streaming compaction path writes from the compaction
         // worker thread.
-        let opts = Options {
-            write_buffer_size: 4 * 1024,
-            max_subcompactions: 1,
-            target_file_size: 8 * 1024,
-            ..Options::default()
-        };
+        let opts = Options::default()
+            .write_buffer_size(4 * 1024)
+            .max_subcompactions(1)
+            .target_file_size(8 * 1024);
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), opts).unwrap();
         for i in 0..256 {
@@ -7985,11 +7884,9 @@ mod tests {
         // The compatibility knob should not change correctness even
         // though output writing is now part of the bounded-memory
         // streaming path.
-        let opts = Options {
-            write_buffer_size: 4 * 1024,
-            max_subcompactions: 8,
-            ..Options::default()
-        };
+        let opts = Options::default()
+            .write_buffer_size(4 * 1024)
+            .max_subcompactions(8);
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), opts).unwrap();
         for i in 0..32 {
@@ -8055,11 +7952,9 @@ mod tests {
         // platforms it's a no-op. Either way, the output SSTs
         // contain the same data as the leveled baseline, so
         // readers must see identical values afterward.
-        let opts = Options {
-            write_buffer_size: 4 * 1024,
-            evict_compaction_data_from_page_cache: true,
-            ..Options::default()
-        };
+        let opts = Options::default()
+            .write_buffer_size(4 * 1024)
+            .evict_compaction_data_from_page_cache(true);
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), opts).unwrap();
 
@@ -8096,11 +7991,9 @@ mod tests {
         // Write a batch under Universal, force a full merge via
         // compact_range, and verify every key is still readable
         // with the most recent value.
-        let opts = Options {
-            write_buffer_size: 4 * 1024,
-            compaction_style: CompactionStyle::Universal,
-            ..Options::default()
-        };
+        let opts = Options::default()
+            .write_buffer_size(4 * 1024)
+            .compaction_style(CompactionStyle::Universal);
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), opts).unwrap();
 
@@ -8139,12 +8032,10 @@ mod tests {
     fn test_universal_compaction_never_creates_l1_files() {
         // Every Universal merge output should stay at L0 - the
         // level-size push-down rule must not fire for this style.
-        let opts = Options {
-            write_buffer_size: 4 * 1024,
-            l0_compaction_trigger: 1,
-            compaction_style: CompactionStyle::Universal,
-            ..Options::default()
-        };
+        let opts = Options::default()
+            .write_buffer_size(4 * 1024)
+            .l0_compaction_trigger(1)
+            .compaction_style(CompactionStyle::Universal);
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), opts).unwrap();
         for i in 0..64 {
@@ -8168,11 +8059,9 @@ mod tests {
         // After a full universal compact_range, we expect the
         // output to be a single L0 file (min cardinality). This
         // exercises the compact_range full-merge path.
-        let opts = Options {
-            write_buffer_size: 4 * 1024,
-            compaction_style: CompactionStyle::Universal,
-            ..Options::default()
-        };
+        let opts = Options::default()
+            .write_buffer_size(4 * 1024)
+            .compaction_style(CompactionStyle::Universal);
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), opts).unwrap();
         for i in 0..32 {
@@ -8197,14 +8086,12 @@ mod tests {
         // Tiny memtable + tight FIFO cap: sustained writes should
         // produce many L0 files, and after each flush the oldest
         // ones should be unlinked so the total stays bounded.
-        let opts = Options {
-            write_buffer_size: 4 * 1024,
-            compaction_style: CompactionStyle::Fifo,
-            fifo_compaction_options: FifoCompactionOptions {
+        let opts = Options::default()
+            .write_buffer_size(4 * 1024)
+            .compaction_style(CompactionStyle::Fifo)
+            .fifo_compaction_options(FifoCompactionOptions {
                 max_table_files_size: 32 * 1024,
-            },
-            ..Options::default()
-        };
+            });
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), opts).unwrap();
 
@@ -8248,14 +8135,12 @@ mod tests {
         // A single oversized file must not be deleted - FIFO
         // refuses to drop the last surviving SST because that
         // would wipe the database.
-        let opts = Options {
-            write_buffer_size: 4 * 1024,
-            compaction_style: CompactionStyle::Fifo,
-            fifo_compaction_options: FifoCompactionOptions {
+        let opts = Options::default()
+            .write_buffer_size(4 * 1024)
+            .compaction_style(CompactionStyle::Fifo)
+            .fifo_compaction_options(FifoCompactionOptions {
                 max_table_files_size: 1, // 1 byte cap: always over limit
-            },
-            ..Options::default()
-        };
+            });
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), opts).unwrap();
         for i in 0..32 {
@@ -8278,15 +8163,13 @@ mod tests {
         // Under FIFO, the background scheduler should never
         // promote files from L0 to L1. The `l0_compaction_trigger`
         // knob is a level-style knob and must have no effect.
-        let opts = Options {
-            write_buffer_size: 4 * 1024,
-            l0_compaction_trigger: 2,
-            compaction_style: CompactionStyle::Fifo,
-            fifo_compaction_options: FifoCompactionOptions {
+        let opts = Options::default()
+            .write_buffer_size(4 * 1024)
+            .l0_compaction_trigger(2)
+            .compaction_style(CompactionStyle::Fifo)
+            .fifo_compaction_options(FifoCompactionOptions {
                 max_table_files_size: 10 * 1024 * 1024,
-            },
-            ..Options::default()
-        };
+            });
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), opts).unwrap();
         for i in 0..64 {
@@ -8345,10 +8228,7 @@ mod tests {
         // Tiny write_buffer so writes between drains roll
         // memtables and produce L0 files. The tailing iter must
         // pick up those new SSTs on the next refresh.
-        let opts = Options {
-            write_buffer_size: 4 * 1024,
-            ..Options::default()
-        };
+        let opts = Options::default().write_buffer_size(4 * 1024);
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), opts).unwrap();
 
@@ -8454,11 +8334,9 @@ mod tests {
         // `regolith.block-cache-usage` property must report a
         // positive number once at least one read has happened
         // against a file that isn't entirely in the memtable.
-        let opts = Options {
-            write_buffer_size: 4 * 1024,
-            block_cache_size: 1024 * 1024,
-            ..Options::default()
-        };
+        let opts = Options::default()
+            .write_buffer_size(4 * 1024)
+            .block_cache_size(1024 * 1024);
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), opts).unwrap();
 
@@ -8510,12 +8388,10 @@ mod tests {
             Duration::from_millis(50),
             5_000,
         ));
-        let opts = Options {
-            write_buffer_size: 16 * 1024 * 1024,
-            compression: CompressionType::None,
-            rate_limiter: Some(limiter.clone() as Arc<dyn RateLimiter>),
-            ..Options::default()
-        };
+        let opts = Options::default()
+            .write_buffer_size(16 * 1024 * 1024)
+            .compression(CompressionType::None)
+            .rate_limiter(Some(limiter.clone() as Arc<dyn RateLimiter>));
 
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), opts).unwrap();
@@ -8558,20 +8434,18 @@ mod tests {
         use std::sync::Arc;
 
         let stats = Arc::new(Statistics::new());
-        let opts = Options {
+        let opts = Options::default()
             // Tiny memtable so every handful of puts rolls an L0 file.
-            write_buffer_size: 4 * 1024,
+            .write_buffer_size(4 * 1024)
             // Disable automatic compaction so L0 can't drain on us.
-            l0_compaction_trigger: 1000,
+            .l0_compaction_trigger(1000)
             // Slow down once L0 has 2 files, never stop (high trigger).
-            level0_slowdown_writes_trigger: 2,
-            level0_stop_writes_trigger: 10_000,
+            .level0_slowdown_writes_trigger(2)
+            .level0_stop_writes_trigger(10_000)
             // Disable the memtable-count trigger for this test so we
             // isolate the L0 slowdown path.
-            max_write_buffer_number: 0,
-            statistics: Some(stats.clone()),
-            ..Options::default()
-        };
+            .max_write_buffer_number(0)
+            .statistics(Some(stats.clone()));
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), opts).unwrap();
 
@@ -8594,14 +8468,12 @@ mod tests {
 
     #[test]
     fn test_write_stall_no_slowdown_returns_busy() {
-        let opts = Options {
-            write_buffer_size: 4 * 1024,
-            l0_compaction_trigger: 1000,
-            level0_slowdown_writes_trigger: 2,
-            level0_stop_writes_trigger: 10_000,
-            max_write_buffer_number: 0,
-            ..Options::default()
-        };
+        let opts = Options::default()
+            .write_buffer_size(4 * 1024)
+            .l0_compaction_trigger(1000)
+            .level0_slowdown_writes_trigger(2)
+            .level0_stop_writes_trigger(10_000)
+            .max_write_buffer_number(0);
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), opts).unwrap();
 
@@ -8632,14 +8504,12 @@ mod tests {
         use std::time::{Duration, Instant};
 
         // Stop writes entirely once L0 hits 2 files.
-        let opts = Options {
-            write_buffer_size: 4 * 1024,
-            l0_compaction_trigger: 1000,
-            level0_slowdown_writes_trigger: 0,
-            level0_stop_writes_trigger: 2,
-            max_write_buffer_number: 0,
-            ..Options::default()
-        };
+        let opts = Options::default()
+            .write_buffer_size(4 * 1024)
+            .l0_compaction_trigger(1000)
+            .level0_slowdown_writes_trigger(0)
+            .level0_stop_writes_trigger(2)
+            .max_write_buffer_number(0);
         let dir = TempDir::new().unwrap();
         let db = Arc::new(Db::open(dir.path(), opts).unwrap());
 
@@ -8698,10 +8568,7 @@ mod tests {
         // branch.
         use std::time::Instant;
 
-        let opts = Options {
-            write_buffer_size: 64 * 1024,
-            ..Options::default()
-        };
+        let opts = Options::default().write_buffer_size(64 * 1024);
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), opts).unwrap();
 
