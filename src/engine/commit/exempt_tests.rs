@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 
 use tempfile::TempDir;
 
-use super::super::{ConflictKey, EngineOptions, ValidationSet};
+use super::super::{ConflictKey, EngineOptions, ReadRule, ValidationSet};
 use super::*;
 use crate::column_family::{DEFAULT_CF_ID, prefix_key};
 use crate::{Access, WriteBatchOp, WriteKind};
@@ -37,6 +37,7 @@ fn commit_after_newer_writes(exempt: &[&[u8]], puts: &[&[u8]], merged: &[&[u8]])
         writes_at: Some(observed),
         blind_merges_commute: false,
         exempt: exempt.iter().copied().map(key_of).collect(),
+        ranges: Vec::new(),
     };
     // An exempt key names its bytes, so it is put with the bytes that landed
     // beside it; an ordinary key is put with others, so it cannot pass as an
@@ -164,10 +165,12 @@ fn commit_read_of_a_present_key(
             } else {
                 Access::Read
             },
+            rule: ReadRule::Seq,
         }],
         writes_at: Some(observed),
         blind_merges_commute: false,
         exempt: Vec::new(),
+        ranges: Vec::new(),
     };
     let point_ops: BTreeMap<Vec<u8>, Option<Vec<u8>>> =
         delete.then(|| (key_of(b"c"), None)).into_iter().collect();

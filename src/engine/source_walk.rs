@@ -49,6 +49,19 @@ pub(crate) struct Skip {
     pub(crate) stop_type: u8,
 }
 
+/// How one source's visit of a key's entries above a floor ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Above<R> {
+    /// The visit broke with a result.
+    Broke(R),
+    /// It reached an entry at or below the floor, so every older entry, in
+    /// this source and the older ones, is below it too.
+    Floor,
+    /// This source's entries for the key ran out above the floor; an older
+    /// source may hold more.
+    Exhausted,
+}
+
 impl ReadView {
     /// Visits the sources of this view that may hold `key`, newest first: the
     /// active memtable, the frozen ones, every L0 table, then each deeper

@@ -384,6 +384,53 @@ fn neither_the_error_nor_the_conflict_prints_the_key() {
     assert_eq!(conflict.key(), key, "the bytes stay reachable on purpose");
 }
 
+#[test]
+fn a_busy_lock_names_its_key_by_length_and_hash_and_never_by_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = TransactionDb::open(dir.path(), options())
+        .unwrap()
+        .with_lock_timeout(Duration::from_millis(20));
+    let key = b"SECRET-user-key-bytes";
+    let holder = db.begin(&TxnOptions::new());
+    holder.put(key, b"v").unwrap();
+    let waiter = db.begin(&TxnOptions::new());
+    let err = waiter.put(key, b"w").unwrap_err();
+    let TransactionError::Busy(ref reported) = err else {
+        panic!("expected a busy lock, got {err:?}");
+    };
+    assert_eq!(
+        reported.as_slice(),
+        key,
+        "the bytes stay reachable on purpose"
+    );
+
+    let hex: String = key.iter().map(|b| format!("{b:02x}")).collect();
+    let bytes = format!("{:?}", key.to_vec());
+    let texts = [err.to_string(), format!("{err:?}"), format!("{err:#?}")];
+    for text in &texts {
+        for leaked in ["SECRET", "user-key", hex.as_str(), bytes.as_str()] {
+            assert!(!text.contains(leaked), "{leaked:?} leaked into: {text}");
+        }
+        assert!(text.contains("21-byte key (hash "), "{text}");
+    }
+    // The same key shows the same hash, a different one does not.
+    let other = db.begin(&TxnOptions::new());
+    other.put(b"another", b"v").unwrap();
+    let again = db
+        .begin(&TxnOptions::new())
+        .put(key, b"x")
+        .unwrap_err()
+        .to_string();
+    assert_eq!(again, texts[0]);
+    let elsewhere = db
+        .begin(&TxnOptions::new())
+        .put(b"another", b"v")
+        .unwrap_err()
+        .to_string();
+    assert_ne!(elsewhere, texts[0]);
+    holder.rollback();
+}
+
 /// Runs `work` on another thread, and says whether it finished in time. Work
 /// that waits for something the calling thread still holds never does.
 fn finishes(work: impl FnOnce() + Send + 'static) -> bool {

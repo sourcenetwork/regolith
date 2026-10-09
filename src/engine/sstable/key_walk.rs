@@ -7,7 +7,7 @@ use std::ops::ControlFlow;
 use std::sync::Arc;
 
 use super::super::MergeChain;
-use super::super::source_walk::Skip;
+use super::super::source_walk::{Above, Skip};
 use super::{
     Block, BlockCache, DbSlice, LookupKey, SsTableReader, VALUE_TYPE_MERGE, decode_internal_key,
     invalid_data,
@@ -84,6 +84,68 @@ impl SsTableReader {
             passed,
             stop: stop.map(|(seq, _)| seq),
             stop_type: stop.map_or(0, |(_, vt)| vt),
+        })
+    }
+
+    /// [`MemTable::newer_in_range`](crate::engine::memtable::MemTable::newer_in_range)
+    /// for one table: every data block that holds a key of `[lo, hi)` is read,
+    /// since a table keeps no sequence range of its own to rule it out.
+    pub(crate) fn newer_in_range(
+        &self,
+        lo: &[u8],
+        hi: &[u8],
+        floor: u64,
+        key_buf: &mut Vec<u8>,
+        cache: &BlockCache,
+    ) -> io::Result<Option<(Vec<u8>, u64, u8)>> {
+        let start = LookupKey::from_prefixed(lo, u64::MAX);
+        let search_key = start.internal();
+        let mut cursor = self.seek_block_cursor(search_key, cache)?;
+        while let Some(at) = cursor {
+            let block = self.load_block_at_cursor(&at, cache)?;
+            let ended = block.scan_from(search_key, key_buf, |ik, _, _| {
+                let (user_key, seq, vt) = decode_internal_key(ik);
+                if user_key >= hi {
+                    return ControlFlow::Break(None);
+                }
+                if seq > floor {
+                    return ControlFlow::Break(Some((user_key.to_vec(), seq, vt)));
+                }
+                ControlFlow::Continue(())
+            });
+            match ended {
+                Some(found) => return Ok(found),
+                None => cursor = self.next_block_cursor(&at, cache)?,
+            }
+        }
+        Ok(None)
+    }
+
+    /// [`MemTable::visit_above`](crate::engine::memtable::MemTable::visit_above)
+    /// for one table: `lk`'s entries newest first among those at or below the
+    /// lookup's snapshot and above `floor`, carrying on into the following
+    /// data blocks for as long as the key does, until `visit` breaks.
+    pub(crate) fn visit_above<R>(
+        &self,
+        lk: &LookupKey,
+        floor: u64,
+        key_buf: &mut Vec<u8>,
+        cache: &BlockCache,
+        mut visit: impl FnMut(u64, u8, DbSlice) -> ControlFlow<R>,
+    ) -> io::Result<Above<R>> {
+        let ended = self.scan_key(lk, key_buf, cache, |block, seq, vt, offset, len| {
+            if seq <= floor {
+                return ControlFlow::Break(Ok(None));
+            }
+            let Some(value) = DbSlice::from_block(Arc::clone(block), offset, len) else {
+                return ControlFlow::Break(Err(invalid_data("block value extends past block")));
+            };
+            visit(seq, vt, value).map_break(|result| Ok(Some(result)))
+        })?;
+        Ok(match ended.transpose()? {
+            None => Above::Exhausted,
+            Some(None) => Above::Floor,
+            Some(Some(result)) => Above::Broke(result),
         })
     }
 

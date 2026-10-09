@@ -270,6 +270,24 @@ impl MemTable {
         self.range_tombstones.lock().as_slice().to_vec()
     }
 
+    /// A range tombstone overlapping `[lo, hi)` with a sequence above
+    /// `floor`, as the first key of the range it deletes and its sequence.
+    pub(crate) fn newer_range_tombstone(
+        &self,
+        lo: &[u8],
+        hi: &[u8],
+        floor: u64,
+    ) -> Option<(Vec<u8>, u64)> {
+        if self.range_tombstone_bytes.load(Ordering::Acquire) == 0 {
+            return None;
+        }
+        self.range_tombstones
+            .lock()
+            .iter()
+            .find(|t| t.seq > floor && t.overlaps(lo, hi))
+            .map(|t| (t.start.as_slice().max(lo).to_vec(), t.seq))
+    }
+
     /// Largest seq of any range tombstone covering `user_key` that is
     /// visible at `snapshot_seq`. Returns `0` if no such tombstone
     /// exists - `0` is a safe sentinel because real seqs start at 1.

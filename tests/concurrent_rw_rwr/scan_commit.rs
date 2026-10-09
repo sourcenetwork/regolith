@@ -68,7 +68,7 @@ fn scan_then_commit<D: Flavour>(db: &D, level: IsolationLevel, storage: Storage,
                     Some(format!("scan/{r}/").as_bytes()),
                     Some(format!("scan/{r}0").as_bytes()),
                 )
-                .map(|(key, _)| key)
+                .map(|item| item.unwrap().0)
                 .collect();
             assert_eq!(
                 walked,

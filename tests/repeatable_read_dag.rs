@@ -70,11 +70,11 @@ fn parse_marker(key: &[u8]) -> (u64, u64) {
 fn live_heads(txn: &Transaction) -> Vec<u64> {
     let heads: Vec<u64> = txn
         .scan_stream(Some(b"h/"), Some(b"h0"))
-        .map(|(key, _)| parse_head(&key))
+        .map(|item| parse_head(&item.unwrap().0))
         .collect();
     let named_as_parent: HashSet<u64> = txn
         .scan_stream(Some(b"m/"), Some(b"m0"))
-        .map(|(key, _)| parse_marker(&key).0)
+        .map(|item| parse_marker(&item.unwrap().0).0)
         .collect();
     heads
         .into_iter()
@@ -135,11 +135,11 @@ fn try_prune(db: &OptimisticTransactionDb, level: IsolationLevel, conflicts: &At
         let txn = db.begin(&TxnOptions::new().isolation(level));
         let heads: Vec<u64> = txn
             .scan_stream(Some(b"h/"), Some(b"h0"))
-            .map(|(key, _)| parse_head(&key))
+            .map(|item| parse_head(&item.unwrap().0))
             .collect();
         let markers: Vec<(u64, u64)> = txn
             .scan_stream(Some(b"m/"), Some(b"m0"))
-            .map(|(key, _)| parse_marker(&key))
+            .map(|item| parse_marker(&item.unwrap().0))
             .collect();
         let named_as_parent: HashSet<u64> = markers.iter().map(|&(parent, _)| parent).collect();
         let superseded: HashSet<u64> = heads

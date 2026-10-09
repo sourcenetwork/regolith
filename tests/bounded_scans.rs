@@ -30,6 +30,16 @@ fn keys<V>(entries: impl IntoIterator<Item = (Vec<u8>, V)>) -> Vec<String> {
         .collect()
 }
 
+/// The keys of a transaction scan, whose items carry their errors.
+fn txn_keys(
+    stream: impl IntoIterator<Item = regolith::TxResult<(Vec<u8>, regolith::DbSlice)>>,
+) -> Vec<String> {
+    stream
+        .into_iter()
+        .map(|item| String::from_utf8(item.unwrap().0).unwrap())
+        .collect()
+}
+
 fn a_keys() -> Vec<String> {
     (0..5).map(|i| format!("a/{i}")).collect()
 }
@@ -40,8 +50,7 @@ fn a_transaction_scan_returns_its_range_and_no_further() {
     let db = db_with_tombstones_after_a(&dir);
     let txn = db.begin(&TxnOptions::new());
     let mut stream = txn.scan_stream(Some(b"a/"), Some(b"b/"));
-    assert_eq!(keys(&mut stream), a_keys());
-    stream.status().unwrap();
+    assert_eq!(txn_keys(&mut stream), a_keys());
 }
 
 #[test]
@@ -50,8 +59,7 @@ fn a_transaction_scan_without_a_start_still_stops_at_its_end() {
     let db = db_with_tombstones_after_a(&dir);
     let txn = db.begin(&TxnOptions::new());
     let mut stream = txn.scan_stream(None, Some(b"b/"));
-    assert_eq!(keys(&mut stream), a_keys());
-    stream.status().unwrap();
+    assert_eq!(txn_keys(&mut stream), a_keys());
 }
 
 #[test]
@@ -63,12 +71,10 @@ fn a_transaction_scan_merges_its_writes_on_both_sides_of_the_bound() {
     txn.delete(b"a/0").unwrap();
     txn.put(b"b/0500", b"past the end").unwrap();
     let mut stream = txn.scan_stream(Some(b"a/"), Some(b"b/"));
-    assert_eq!(keys(&mut stream), ["a/1", "a/2", "a/3", "a/4", "a/9"]);
-    stream.status().unwrap();
+    assert_eq!(txn_keys(&mut stream), ["a/1", "a/2", "a/3", "a/4", "a/9"]);
 
     let mut past = txn.scan_stream(Some(b"b/"), None);
-    assert_eq!(keys(&mut past), ["b/0500", "c/0"]);
-    past.status().unwrap();
+    assert_eq!(txn_keys(&mut past), ["b/0500", "c/0"]);
 }
 
 #[test]

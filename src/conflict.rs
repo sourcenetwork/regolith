@@ -15,6 +15,25 @@ use xxhash_rust::xxh3::xxh3_64;
 
 use crate::column_family::CF_PREFIX_LEN;
 
+/// A key as an error message may show it: its length and a short hash, never
+/// its bytes, since a key can hold user data. Equal keys show the same hash,
+/// so two messages can be told to name one key.
+pub(crate) struct RedactedKey<'a>(pub(crate) &'a [u8]);
+
+impl RedactedKey<'_> {
+    /// A 32-bit digest of the key, for telling errors on one key from errors
+    /// on another without printing it.
+    fn hash(&self) -> u32 {
+        xxh3_64(self.0) as u32
+    }
+}
+
+impl fmt::Display for RedactedKey<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}-byte key (hash {:08x})", self.0.len(), self.hash())
+    }
+}
+
 /// What a transaction did with a key that a newer write then overtook.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[non_exhaustive]
@@ -153,22 +172,15 @@ impl Conflict {
     pub fn latest_seq(&self) -> u64 {
         self.latest_seq
     }
-
-    /// A 32-bit digest of the key, for telling conflicts on one key from
-    /// conflicts on another without printing it.
-    fn key_hash(&self) -> u32 {
-        xxh3_64(&self.key) as u32
-    }
 }
 
 impl fmt::Display for Conflict {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "transaction conflict on a {}-byte key (hash {:08x}): this transaction's {} at seq {} \
+            "transaction conflict on a {}: this transaction's {} at seq {} \
              was overtaken by a {} at seq {}; retry the transaction",
-            self.key.len(),
-            self.key_hash(),
+            RedactedKey(&self.key),
             self.mine.phrase(),
             self.observed_seq,
             self.theirs.phrase(),
@@ -181,7 +193,10 @@ impl fmt::Debug for Conflict {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Conflict")
             .field("key_len", &self.key.len())
-            .field("key_hash", &format_args!("{:08x}", self.key_hash()))
+            .field(
+                "key_hash",
+                &format_args!("{:08x}", RedactedKey(&self.key).hash()),
+            )
             .field("mine", &self.mine)
             .field("theirs", &self.theirs)
             .field("observed_seq", &self.observed_seq)
@@ -222,8 +237,9 @@ mod tests {
 
     #[test]
     fn the_hash_tells_keys_apart() {
-        assert_eq!(conflict(b"a").key_hash(), conflict(b"a").key_hash());
-        assert_ne!(conflict(b"a").key_hash(), conflict(b"b").key_hash());
+        let shown = |key: &[u8]| RedactedKey(key).to_string();
+        assert_eq!(shown(b"a"), shown(b"a"));
+        assert_ne!(shown(b"a"), shown(b"b"));
     }
 
     #[test]

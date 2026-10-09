@@ -369,13 +369,30 @@ fn a_delete_of_a_block_is_validated_like_a_delete_of_any_other_key() {
         put.commit().unwrap();
         assert_eq!(conflict_key(delete.commit()), Some(key.to_vec()), "{name}");
 
-        // So does a delete of a key the transaction read first, even though
-        // the put left the key as it was read.
+        // A delete of an ordinary key the transaction read first holds while
+        // the key holds the bytes the read returned: a put that left them as
+        // they were is not a change, so it commits and the delete follows it.
+        // A block's read is for its presence only and does not stand for the
+        // delete, which is checked as the write it is: the put beat it.
         let (_dir, db) = fresh();
         let (delete, put) = (begin(&db), begin(&db));
         assert!(delete.get_for_update(key).unwrap().is_some());
         delete.delete(key).unwrap();
         put.put(key, b"bytes").unwrap();
+        put.commit().unwrap();
+        if key == b"ordinary" {
+            delete.commit().unwrap();
+            assert_eq!(db.db().get(key).unwrap(), None, "{name}");
+        } else {
+            assert_eq!(conflict_key(delete.commit()), Some(key.to_vec()), "{name}");
+        }
+
+        // A put that changed the bytes beats the delete on either.
+        let (_dir, db) = fresh();
+        let (delete, put) = (begin(&db), begin(&db));
+        assert!(delete.get_for_update(key).unwrap().is_some());
+        delete.delete(key).unwrap();
+        put.put(key, b"changed").unwrap();
         put.commit().unwrap();
         assert_eq!(conflict_key(delete.commit()), Some(key.to_vec()), "{name}");
 
@@ -418,9 +435,12 @@ fn a_block_read_as_present_conflicts_once_it_is_gone() {
                     if write_elsewhere {
                         tx.put(b"elsewhere", b"x").unwrap();
                     }
+                    // A transaction that writes nothing validates the reads it
+                    // asked to have checked, and no other.
+                    let checked = write_elsewhere || matches!(read, Read::GetForUpdate);
                     assert_eq!(
                         conflict_key(tx.commit()),
-                        Some(b"b/block".to_vec()),
+                        checked.then(|| b"b/block".to_vec()),
                         "{read:?} {removal:?} flush={flush} write_elsewhere={write_elsewhere}"
                     );
                 }

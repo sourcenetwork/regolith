@@ -29,7 +29,10 @@ fn a_snapshot_cursor_iterates_in_key_order() {
         .snapshot()
         .owned_iter()
         .into_iter()
-        .map(|(key, value)| (key, value.to_vec()))
+        .map(|item| {
+            let (key, value) = item.unwrap();
+            (key, value.to_vec())
+        })
         .collect();
 
     assert_eq!(
@@ -53,7 +56,8 @@ fn iteration_yields_values_without_copying_them() {
         .owned_iter()
         .into_iter()
         .next()
-        .expect("one entry");
+        .expect("one entry")
+        .unwrap();
 
     assert_eq!(key, b"k".to_vec());
     // `DbSlice` derefs to the stored bytes; no `to_vec` needed to read it.
@@ -68,7 +72,7 @@ fn a_cursor_iterates_backward_on_request() {
         .snapshot()
         .owned_iter()
         .entries_rev()
-        .map(|(key, _)| key)
+        .map(|item| item.unwrap().0)
         .collect();
 
     assert_eq!(keys, vec![b"c".to_vec(), b"b".to_vec(), b"a".to_vec()]);
@@ -84,7 +88,7 @@ fn iteration_resumes_from_a_seek() {
     let mut cursor = snapshot.owned_iter();
     cursor.seek(b"c");
 
-    let keys: Vec<Vec<u8>> = cursor.entries().map(|(key, _)| key).collect();
+    let keys: Vec<Vec<u8>> = cursor.entries().map(|item| item.unwrap().0).collect();
 
     assert_eq!(keys, vec![b"c".to_vec(), b"d".to_vec()]);
 }
@@ -107,7 +111,7 @@ fn iteration_stops_early_without_draining_the_range() {
         .owned_iter()
         .into_iter()
         .take(3)
-        .map(|(key, _)| key)
+        .map(|item| item.unwrap().0)
         .collect();
 
     assert_eq!(
@@ -330,7 +334,8 @@ mod txn_scan {
         hi: Option<&[u8]>,
     ) -> Vec<(String, String)> {
         txn.scan_stream(lo, hi)
-            .map(|(k, v)| {
+            .map(|item| {
+                let (k, v) = item.unwrap();
                 (
                     String::from_utf8_lossy(&k).into_owned(),
                     String::from_utf8_lossy(&v).into_owned(),

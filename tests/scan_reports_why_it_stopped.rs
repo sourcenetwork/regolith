@@ -119,6 +119,69 @@ fn a_scan_cut_short_by_damage_says_so_instead_of_looking_complete() {
     }
 }
 
+/// The iterator form of a cursor carries the failure as an item, so no caller
+/// has to remember to ask: a short answer ends with its reason.
+#[test]
+fn the_entries_of_a_cursor_end_with_an_err_when_damage_cut_them_short() {
+    let dir = tempfile::tempdir().unwrap();
+    build(dir.path());
+    damage_a_data_block(dir.path());
+
+    let db = Db::open(dir.path(), small_options()).unwrap();
+    let mut entries = db.snapshot().into_owned_iter().entries();
+    let mut rows = 0u64;
+    let mut failed = false;
+    for item in entries.by_ref() {
+        match item {
+            Ok(_) => assert!(!failed, "nothing follows the error"),
+            Err(_) => failed = true,
+        }
+        rows += u64::from(!failed);
+    }
+    assert!(
+        entries.next().is_none(),
+        "the iterator is finished after the error"
+    );
+    assert_eq!(
+        failed,
+        rows < KEYS,
+        "a short scan ended with its reason, a full one without"
+    );
+}
+
+/// The same through a transaction's cursor, a page at a time.
+#[test]
+fn a_transaction_cursor_cut_short_by_damage_returns_the_error() {
+    use regolith::{OptimisticTransactionDb, ScanCheck, ScanDirection};
+
+    let dir = tempfile::tempdir().unwrap();
+    build(dir.path());
+    damage_a_data_block(dir.path());
+
+    let db = OptimisticTransactionDb::open(dir.path(), small_options()).unwrap();
+    let txn = db.begin(&TxnOptions::new());
+    let mut cursor = txn.cursor(None, None, ScanDirection::Forward, ScanCheck::Stretch);
+    let mut rows = 0u64;
+    let outcome = loop {
+        match cursor.next_page(&txn, 64 * 1024) {
+            Ok(page) => {
+                rows += page.entries.len() as u64;
+                if page.done {
+                    break Ok(());
+                }
+            }
+            Err(e) => break Err(e),
+        }
+    };
+    match outcome {
+        Err(_) => {
+            assert!(rows < KEYS);
+            assert!(cursor.next_page(&txn, 1).is_err(), "the error is final");
+        }
+        Ok(()) => assert_eq!(rows, KEYS, "a scan that ended must have returned every row"),
+    }
+}
+
 #[test]
 fn an_undamaged_scan_reports_success_and_returns_everything() {
     let dir = tempfile::tempdir().unwrap();
@@ -131,9 +194,9 @@ fn an_undamaged_scan_reports_success_and_returns_everything() {
     assert_eq!(rows as u64, KEYS);
 }
 
-/// The same contract on the transaction side. A merged stream that loses its
-/// snapshot cursor finishes on the buffered writes alone, which looks exactly
-/// like a range that ended.
+/// The same contract on the transaction side, stronger: the items carry the
+/// error, so a merged stream that loses its snapshot cursor cannot finish on
+/// the buffered writes alone and look like a range that ended.
 #[test]
 fn a_transaction_scan_cut_short_says_so_too() {
     use regolith::TransactionDb;
@@ -147,21 +210,21 @@ fn a_transaction_scan_cut_short_says_so_too() {
     let txn = tdb.begin(&TxnOptions::new());
     txn.put(b"zzz", b"buffered").unwrap();
 
-    let mut scan = txn.scan_stream(None, None);
-    let before = scan.by_ref().count();
-    scan.status().expect("an intact snapshot must scan clean");
-    assert_eq!(before, 11, "ten committed rows plus the buffered write");
+    let rows: Vec<_> = txn.scan_stream(None, None).collect();
+    assert_eq!(rows.len(), 11, "ten committed rows plus the buffered write");
+    assert!(rows.iter().all(Result::is_ok));
 
     // Closing the database makes every iterator built afterwards carry a
-    // terminal error. Without a status to consult, the merged stream would
-    // return the one buffered write and look like a complete range.
+    // terminal error. The stream must hand it out as an item, not return the
+    // one buffered write and look like a complete range.
     tdb.db().close().unwrap();
 
-    let mut scan = txn.scan_stream(None, None);
-    let after = scan.by_ref().count();
+    let after: Vec<_> = txn.scan_stream(None, None).collect();
     assert!(
-        scan.status().is_err(),
-        "the snapshot side died, so a scan returning {after} of {before} rows \
-         must report why rather than read as a complete range"
+        after.last().is_some_and(Result::is_err),
+        "the snapshot side died, so the scan must end with the reason rather than \
+         read as a complete range of {} rows",
+        after.len()
     );
+    assert_eq!(after.iter().filter(|item| item.is_err()).count(), 1);
 }

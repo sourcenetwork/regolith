@@ -46,7 +46,7 @@ fn seed(db: &regolith::Db, keys: &[&[u8]]) {
 /// yielded the key it reasons about before reasoning about the commit.
 /// A scan that silently yielded nothing would prove nothing.
 fn scanned_keys(stream: regolith::TxnScanStream<'_>) -> Vec<Vec<u8>> {
-    stream.map(|(key, _)| key).collect()
+    stream.map(|item| item.unwrap().0).collect()
 }
 
 fn is_conflict<T>(r: &regolith::TxResult<T>) -> bool {
@@ -167,7 +167,8 @@ fn a_scan_then_write_of_the_same_bytes_never_loses_an_update() {
             let mut stream = txn.scan_stream(Some(b"counter"), Some(b"counter\0"));
             let (key, value) = stream
                 .next()
-                .unwrap_or_else(|| panic!("{level:?}: counter must be yielded"));
+                .unwrap_or_else(|| panic!("{level:?}: counter must be yielded"))
+                .unwrap();
             assert_eq!(key, b"counter".to_vec());
             assert_eq!(u64::from_le_bytes(value.as_slice().try_into().unwrap()), 5);
             drop(stream);
@@ -208,7 +209,8 @@ fn a_scan_then_write_of_the_same_bytes_never_loses_an_update() {
             let mut stream = a.scan_stream(Some(b"counter"), Some(b"counter\0"));
             let (key, value) = stream
                 .next()
-                .unwrap_or_else(|| panic!("{level:?}: counter must be yielded"));
+                .unwrap_or_else(|| panic!("{level:?}: counter must be yielded"))
+                .unwrap();
             assert_eq!(key, b"counter".to_vec());
             assert_eq!(u64::from_le_bytes(value.as_slice().try_into().unwrap()), 5);
         }
@@ -384,7 +386,8 @@ enum Step {
 /// includes the counter itself and any neighbour keys T7 seeded beside
 /// it, so the tracked key is not the only one this scan records.
 fn scan_counter(txn: &regolith::Transaction, direction: ScanDirection) -> u64 {
-    for (key, value) in txn.scan_stream_in(Some(b"c"), Some(b"d"), direction) {
+    for item in txn.scan_stream_in(Some(b"c"), Some(b"d"), direction) {
+        let (key, value) = item.unwrap();
         if key == b"counter" {
             return u64::from_le_bytes(value.as_slice().try_into().expect("8-byte counter"));
         }
@@ -519,7 +522,8 @@ fn counter_of(value: &[u8]) -> u64 {
 fn scan_counter_value(txn: &regolith::Transaction) -> Option<u64> {
     let mut seen = Vec::new();
     let mut counter = None;
-    for (key, value) in txn.scan_stream(Some(b"count"), Some(b"counter3")) {
+    for item in txn.scan_stream(Some(b"count"), Some(b"counter3")) {
+        let (key, value) = item.unwrap();
         if key == b"counter" {
             counter = Some(counter_of(value.as_slice()));
         }
@@ -601,7 +605,7 @@ fn a_scan_skips_a_locked_key_deleted_before_the_lock() {
 
         assert_eq!(a.get_for_update(b"k").unwrap(), None);
         let stream = a.scan_stream(Some(b"a"), Some(b"zz"));
-        let seen: Vec<Vec<u8>> = stream.map(|(key, _)| key).collect();
+        let seen: Vec<Vec<u8>> = stream.map(|item| item.unwrap().0).collect();
         assert_eq!(seen, [b"a".to_vec(), b"z".to_vec()], "{level:?}");
     }
 }

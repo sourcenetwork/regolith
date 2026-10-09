@@ -313,7 +313,10 @@ fn a_merge_made_before_a_scan_of_a_commutative_prefix_stays_blind() {
         let second = db.begin(&TxnOptions::new().isolation(IsolationLevel::DefraLevel));
         for tx in [&first, &second] {
             tx.merge(b"h/m", &1i64.to_be_bytes()).unwrap();
-            let walked: Vec<_> = tx.scan_stream(Some(b"h/"), Some(b"h0")).collect();
+            let walked: Vec<_> = tx
+                .scan_stream(Some(b"h/"), Some(b"h0"))
+                .map(Result::unwrap)
+                .collect();
             assert_eq!(walked.len(), 3, "flush={flush}");
             assert_eq!(
                 walked[1].1.to_vec(),

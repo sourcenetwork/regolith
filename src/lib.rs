@@ -114,9 +114,9 @@ pub use statistics::{Histogram, HistogramSnapshot, Statistics, Ticker};
 pub use stream_writer::{StreamOptions, StreamingWriter};
 pub use tailing::TailingIter;
 pub use transaction::{
-    CommitReceipt, IsolationLevel, KeyClass, KeyClassifier, OptimisticTransactionDb, RetryPolicy,
-    ScanDirection, TransactError, Transaction, TransactionDb, TransactionError, TxResult,
-    TxnOptions, TxnScanStream,
+    CommitReceipt, IsolationLevel, KeyClass, KeyClassifier, OptimisticTransactionDb, Page,
+    RetryPolicy, ScanCheck, ScanDirection, TransactError, Transaction, TransactionDb,
+    TransactionError, TxResult, TxnCursor, TxnOptions, TxnScanStream,
 };
 
 /// The transactional API and the traits a caller implements, in one import:
@@ -2292,7 +2292,9 @@ impl Iterator for ScanStream {
         if self.done {
             return None;
         }
-        let (key, value) = self.entries.next()?;
+        // An error ends the scan here and is reported by `status`; the
+        // iterator form of this type has nowhere else to carry it.
+        let (key, value) = self.entries.next()?.ok()?;
         if let Some(end) = &self.end
             && key.as_slice() >= end.as_slice()
         {
@@ -2322,6 +2324,10 @@ impl std::fmt::Debug for ScanStream {
 /// buffer the cursor owns and has to be copied out, while a value is
 /// stored whole and can be handed over by reference.
 ///
+/// Each item is a `Result`: a walk that failed in the middle of the range
+/// ends with one `Err` item, so a failed scan is never read as a short one.
+/// After it, or after the end of the range, the iterator returns `None`.
+///
 /// This is the seam to build a `Stream` on. regolith's IO is synchronous
 /// and it requires no async runtime, so wrapping a ready iterator with
 /// `futures::stream::iter` belongs where the async context is rather than
@@ -2330,6 +2336,8 @@ pub struct Entries<C> {
     cursor: C,
     started: bool,
     reverse: bool,
+    /// The range ended or the walk failed; nothing more is read.
+    ended: bool,
 }
 
 impl<C> Entries<C> {
@@ -2338,6 +2346,7 @@ impl<C> Entries<C> {
             cursor,
             started: false,
             reverse,
+            ended: false,
         }
     }
 
@@ -2353,9 +2362,12 @@ impl<C> Entries<C> {
 macro_rules! impl_entries {
     ($cursor:ty $(, $lt:lifetime)?) => {
         impl$(<$lt>)? Iterator for Entries<$cursor> {
-            type Item = (Vec<u8>, DbSlice);
+            type Item = Result<(Vec<u8>, DbSlice)>;
 
             fn next(&mut self) -> Option<Self::Item> {
+                if self.ended {
+                    return None;
+                }
                 if self.started {
                     if self.reverse {
                         self.cursor.prev();
@@ -2378,23 +2390,16 @@ macro_rules! impl_entries {
                 }
                 if !self.cursor.valid() {
                     // A cursor goes invalid for two reasons that look
-                    // identical from here: the range ended, or the walk
-                    // failed. `Iterator` has nowhere to put the difference,
-                    // so say it out loud rather than let a failed scan read
-                    // as a complete one. `Entries::status` returns it to a
-                    // caller that checks.
-                    if let Err(e) = self.cursor.status() {
-                        tracing::error!(
-                            error = %e,
-                            "scan ended early: the iterator failed mid-range, \
-                             so the rows returned are a prefix and not the range"
-                        );
-                    }
-                    return None;
+                    // identical from the position alone: the range ended, or
+                    // the walk failed. The status tells them apart, and a
+                    // failure is handed out as an item so it cannot pass for
+                    // the end of the range.
+                    self.ended = true;
+                    return self.cursor.status().err().map(Err);
                 }
                 let key = self.cursor.key()?.to_vec();
                 let value = self.cursor.value_slice()?;
-                Some((key, value))
+                Some(Ok((key, value)))
             }
         }
 
@@ -2412,7 +2417,7 @@ macro_rules! impl_entries {
         }
 
         impl$(<$lt>)? IntoIterator for $cursor {
-            type Item = (Vec<u8>, DbSlice);
+            type Item = Result<(Vec<u8>, DbSlice)>;
             type IntoIter = Entries<$cursor>;
 
             fn into_iter(self) -> Self::IntoIter {

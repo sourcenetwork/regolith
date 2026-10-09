@@ -12,8 +12,9 @@
 
 use regolith::{
     CfIter, CommitReceipt, Conflict, Db, DbSlice, DbWithTtl, Entries, Error, Iter,
-    OptimisticTransactionDb, OwnedSnapshotIter, RetryPolicy, ScanStream, Snapshot, TailingIter,
-    TransactError, Transaction, TransactionDb, TransactionError, TxnScanStream,
+    OptimisticTransactionDb, OwnedSnapshotIter, Page, RetryPolicy, ScanCheck, ScanStream, Snapshot,
+    TailingIter, TransactError, Transaction, TransactionDb, TransactionError, TxnCursor,
+    TxnScanStream,
 };
 
 const fn assert_send<T: Send>() {}
@@ -34,6 +35,8 @@ fn handles_are_send_and_sync() {
     assert_send_sync::<Conflict>();
     assert_send_sync::<CommitReceipt>();
     assert_send_sync::<RetryPolicy>();
+    assert_send_sync::<ScanCheck>();
+    assert_send_sync::<Page>();
     assert_send_sync::<TransactError<Error>>();
 }
 
@@ -46,4 +49,5 @@ fn iterators_are_send() {
     assert_send::<ScanStream>();
     assert_send::<Entries<OwnedSnapshotIter>>();
     assert_send::<TxnScanStream<'static>>();
+    assert_send::<TxnCursor>();
 }

@@ -5,7 +5,7 @@
 use std::ops::ControlFlow;
 
 use super::super::MergeChain;
-use super::{LookupKey, MemTable, NodeRef, VALUE_TYPE_MERGE, decode_internal_key};
+use super::{DbSlice, LookupKey, MemTable, NodeRef, VALUE_TYPE_MERGE, decode_internal_key};
 
 /// Visits one entry of a key in a memtable: its node, sequence and value type.
 pub(crate) trait VisitNode<'mem, R>:
@@ -14,7 +14,7 @@ pub(crate) trait VisitNode<'mem, R>:
 }
 
 impl<'mem, R, F> VisitNode<'mem, R> for F where F: FnMut(NodeRef<'mem>, u64, u8) -> ControlFlow<R> {}
-use super::super::source_walk::Skip;
+use super::super::source_walk::{Above, Skip};
 
 impl MemTable {
     /// Visits `lk`'s entries newest first among those at or below the lookup's
@@ -88,6 +88,55 @@ impl MemTable {
             passed,
             stop: stop.map(|(seq, _)| seq),
             stop_type: stop.map_or(0, |(_, value_type)| value_type),
+        }
+    }
+}
+
+impl MemTable {
+    /// The first entry, in key order, whose user key lies in `[lo, hi)` and
+    /// whose sequence is above `floor`: its user key, sequence and value
+    /// type. Reads in place, and walks every entry of the range, old versions
+    /// included, since a skip list has no order by sequence.
+    pub(crate) fn newer_in_range(
+        &self,
+        lo: &[u8],
+        hi: &[u8],
+        floor: u64,
+    ) -> Option<(Vec<u8>, u64, u8)> {
+        let start = LookupKey::from_prefixed(lo, u64::MAX);
+        let mut node = self.list.seek_ge(start.internal());
+        while let Some(current) = node {
+            let (user_key, seq, value_type) = decode_internal_key(current.key());
+            if user_key >= hi {
+                return None;
+            }
+            if seq > floor {
+                return Some((user_key.to_vec(), seq, value_type));
+            }
+            node = current.next();
+        }
+        None
+    }
+
+    /// Visits `lk`'s entries newest first among those at or below the lookup's
+    /// snapshot and above `floor`, until `visit` breaks. `visit` sees each
+    /// entry's sequence, value type and value, the value as a view of the
+    /// arena that keeps it alive.
+    pub(crate) fn visit_above<R>(
+        &self,
+        lk: &LookupKey,
+        floor: u64,
+        mut visit: impl FnMut(u64, u8, DbSlice) -> ControlFlow<R>,
+    ) -> Above<R> {
+        match self.scan_key(lk, |node, seq, value_type| {
+            if seq <= floor {
+                return ControlFlow::Break(None);
+            }
+            visit(seq, value_type, self.value_slice(&node)).map_break(Some)
+        }) {
+            None => Above::Exhausted,
+            Some(None) => Above::Floor,
+            Some(Some(result)) => Above::Broke(result),
         }
     }
 }

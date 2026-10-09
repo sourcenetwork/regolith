@@ -17,9 +17,18 @@ fn seeded(dir: &std::path::Path) -> Db {
     db
 }
 
-fn keys(entries: impl Iterator<Item = (Vec<u8>, regolith::DbSlice)>) -> Vec<String> {
+/// The keys of a `scan_stream`, whose items are plain entries.
+fn scan_keys(entries: impl Iterator<Item = (Vec<u8>, regolith::DbSlice)>) -> Vec<String> {
     entries
         .map(|(key, _)| String::from_utf8(key).unwrap())
+        .collect()
+}
+
+fn keys(
+    entries: impl Iterator<Item = regolith::Result<(Vec<u8>, regolith::DbSlice)>>,
+) -> Vec<String> {
+    entries
+        .map(|item| String::from_utf8(item.unwrap().0).unwrap())
         .collect()
 }
 
@@ -27,14 +36,14 @@ fn keys(entries: impl Iterator<Item = (Vec<u8>, regolith::DbSlice)>) -> Vec<Stri
 fn scan_stream_from_past_the_last_key_is_empty() {
     let dir = tempfile::tempdir().unwrap();
     let db = seeded(dir.path());
-    assert!(keys(db.scan_stream(Some(b"z"), None).unwrap()).is_empty());
+    assert!(scan_keys(db.scan_stream(Some(b"z"), None).unwrap()).is_empty());
 }
 
 #[test]
 fn snapshot_scan_stream_from_past_the_last_key_is_empty() {
     let dir = tempfile::tempdir().unwrap();
     let db = seeded(dir.path());
-    assert!(keys(db.snapshot().scan_stream(Some(b"z"), None)).is_empty());
+    assert!(scan_keys(db.snapshot().scan_stream(Some(b"z"), None)).is_empty());
 }
 
 #[test]
@@ -42,7 +51,7 @@ fn scan_stream_from_below_the_first_key_returns_the_range() {
     let dir = tempfile::tempdir().unwrap();
     let db = seeded(dir.path());
     assert_eq!(
-        keys(db.scan_stream(Some(b"A"), None).unwrap()),
+        scan_keys(db.scan_stream(Some(b"A"), None).unwrap()),
         ["a", "b", "c"]
     );
 }

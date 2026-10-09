@@ -5,6 +5,7 @@
 use super::*;
 use proptest::prelude::*;
 use std::collections::BTreeMap;
+use std::ops::ControlFlow;
 use tempfile::TempDir;
 
 /// Appends every operand to the base. These tests need a database that
@@ -433,8 +434,8 @@ proptest! {
                 covered.extend(expected_cover(&scan_tx, seeded, key[0], end[0], reverse, take));
                 let direction = if reverse { ScanDirection::Reverse } else { ScanDirection::Forward };
                 let mut stream = scan_tx.scan_stream_in(Some(&key), Some(&end), direction);
-                let entries: Vec<Vec<u8>> = stream.by_ref().take(take).map(|(k, _)| k).collect();
-                prop_assert!(stream.status().is_ok());
+                let entries: Vec<Vec<u8>> =
+                    stream.by_ref().take(take).map(|item| item.unwrap().0).collect();
                 drop(stream);
                 for entry in entries {
                     let buffered = replacement(&scan_tx, &prefix_key(DEFAULT_CF_ID, &entry)).is_some();
@@ -456,7 +457,14 @@ proptest! {
             let mut checks = tx.validation_set(tracked, &writes, &merges);
             if let Some(runs) = tx.scan_runs.take() {
                 let runs = drain(&runs);
-                scan_range::cover(&mut checks.reads, &runs, &writes, &merges, tx.snapshot_seq);
+                scan_range::cover(
+                    &mut checks.reads,
+                    &runs,
+                    &writes,
+                    &merges,
+                    tx.snapshot_seq,
+                    &tx.full_read_rule(),
+                );
             }
             let written: std::collections::BTreeSet<Vec<u8>> =
                 writes.keys().chain(merges.iter().map(|(key, _)| key)).cloned().collect();

@@ -298,7 +298,10 @@ fn a_merge_without_an_operator_is_refused_and_buffers_nothing() {
         assert_eq!(reads(&tx, b"absent"), None);
         let scanned: Vec<_> = tx
             .scan_stream(None, None)
-            .map(|(key, value)| (key, value.to_vec()))
+            .map(|item| {
+                let (key, value) = item.unwrap();
+                (key, value.to_vec())
+            })
             .collect();
         assert_eq!(
             scanned,
@@ -326,12 +329,13 @@ fn scanned(
         regolith::ScanDirection::Forward
     };
     let mut stream = tx.scan_stream_in(start, end, direction);
-    let got = stream
+    stream
         .by_ref()
-        .map(|(key, value)| (key, counter(Some(value.to_vec())).unwrap()))
-        .collect();
-    stream.status().unwrap();
-    got
+        .map(|item| {
+            let (key, value) = item.unwrap();
+            (key, counter(Some(value.to_vec())).unwrap())
+        })
+        .collect()
 }
 
 #[test]
@@ -373,7 +377,11 @@ fn a_scan_lays_the_merges_over_the_snapshot_in_both_directions() {
             inner
         });
 
-        let first: Vec<_> = tx.scan_stream(None, None).take(1).collect();
+        let first: Vec<_> = tx
+            .scan_stream(None, None)
+            .take(1)
+            .map(Result::unwrap)
+            .collect();
         assert_eq!(
             first.len(),
             1,
@@ -526,17 +534,16 @@ fn scanned_text(
         regolith::ScanDirection::Forward
     };
     let mut stream = tx.scan_stream_in(start, end, direction);
-    let got = stream
+    stream
         .by_ref()
-        .map(|(key, value)| {
+        .map(|item| {
+            let (key, value) = item.unwrap();
             (
                 String::from_utf8(key).unwrap(),
                 String::from_utf8(value.to_vec()).unwrap(),
             )
         })
-        .collect();
-    stream.status().unwrap();
-    got
+        .collect()
 }
 
 #[test]

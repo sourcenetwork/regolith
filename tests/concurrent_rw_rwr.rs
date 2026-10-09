@@ -633,7 +633,7 @@ fn late(r: usize) -> Vec<u8> {
 
 fn scanned(tx: &Transaction) -> BTreeSet<Vec<u8>> {
     tx.scan_stream(Some(b"row/"), Some(b"row0"))
-        .map(|(key, _)| key)
+        .map(|item| item.unwrap().0)
         .collect()
 }
 

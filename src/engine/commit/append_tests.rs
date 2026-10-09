@@ -146,6 +146,7 @@ fn no_checks(engine: &RegolithEngine) -> ValidationSet {
         writes_at: Some(engine.snapshot_seq()),
         blind_merges_commute: false,
         exempt: Vec::new(),
+        ranges: Vec::new(),
     }
 }
 
@@ -451,10 +452,12 @@ fn a_commit_that_fails_validation_takes_no_position() {
             observed_seq: observed,
             found: false,
             access: Access::Read,
+            rule: crate::engine::ReadRule::Seq,
         }],
         writes_at: Some(observed),
         blind_merges_commute: false,
         exempt: Vec::new(),
+        ranges: Vec::new(),
     };
 
     let lost = commit(

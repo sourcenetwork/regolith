@@ -27,6 +27,7 @@ pub(crate) mod orphan_sweep;
 pub(crate) mod pending_outputs;
 pub(crate) mod range_tombstone;
 pub(crate) mod read_horizon;
+mod read_rule;
 pub(crate) mod read_view;
 mod recovery;
 pub(crate) mod skiplist;
@@ -60,6 +61,7 @@ const STOP_TOO_MANY_MEMTABLES: &str = "stop: too many memtables";
 use pending_outputs::PendingOutputs;
 use range_tombstone::table_key_range;
 use read_horizon::ReadHorizon;
+pub(crate) use read_rule::ReadRule;
 use read_view::{ReadView, ReadViewCell, VersionStore};
 use recovery::rewrite_recovered_memtable_to_wal;
 use skiplist::InsertHint;
@@ -168,6 +170,8 @@ pub(crate) struct ConflictKey {
     /// never differ that returned a value, so it is lost only when the key
     /// is gone: see [`ConflictKey::presence_only`].
     pub access: Access,
+    /// What counts as a change to the key since the read.
+    pub rule: ReadRule,
 }
 
 impl ConflictKey {
@@ -178,6 +182,16 @@ impl ConflictKey {
     pub fn presence_only(&self) -> bool {
         self.access == Access::ReadPresence
     }
+}
+
+/// A key range a validated scan covered, as prefixed keys `[lo, hi)`: no
+/// write may have landed in it after `observed_seq`. Sorted and disjoint in a
+/// [`ValidationSet`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RangeCheck {
+    pub lo: Vec<u8>,
+    pub hi: Vec<u8>,
+    pub observed_seq: u64,
 }
 
 /// What a commit validates on top of the operations it carries.
@@ -212,6 +226,10 @@ pub(crate) struct ValidationSet {
     /// named some, so a commit without one pays nothing. Their reads are not
     /// in `reads`, and a key the commit deletes is never listed.
     pub exempt: Vec<Vec<u8>>,
+    /// Ranges a validated scan covered, which conflict with any write newer
+    /// than their `observed_seq` inside them (see `commit::range_rule`).
+    /// Empty unless the transaction used a validated scan.
+    pub ranges: Vec<RangeCheck>,
 }
 
 fn batch_op_wal_bytes(op: &WriteBatchOp) -> u64 {
@@ -1368,19 +1386,31 @@ impl RegolithEngine {
     ) -> std::io::Result<Option<PointValue>> {
         self.ensure_open()?;
         let view = self.view.load();
+        self.lookup_loaded(lk, materialize, &view)
+    }
+
+    /// [`Self::lookup`] against a view the caller already loaded, so a commit
+    /// check reads a value the way a `get` does: a configured merge operator
+    /// collapses the key's operands first.
+    fn lookup_loaded(
+        &self,
+        lk: &LookupKey,
+        materialize: Materialize,
+        view: &ReadView,
+    ) -> std::io::Result<Option<PointValue>> {
         if self.options.merge_operator.is_some() {
             Self::reject_guarded_merge(materialize)?;
             // A merge operator decides inside `full_merge` whether a
             // value exists at all, so a length-only request has to
             // collapse the chain exactly like a full read does.
-            return Ok(self.get_with_merge(lk, &view)?.map(PointValue::Value));
+            return Ok(self.get_with_merge(lk, view)?.map(PointValue::Value));
         }
         self.lookup_in_view(
             lk.prefixed_user_key(),
             lk.snapshot_seq(),
             lk,
             materialize,
-            &view,
+            view,
         )
     }
 
@@ -2262,6 +2292,33 @@ impl RegolithEngine {
             return Ok(false);
         };
 
+        self.committed_equals(key, intended, view)
+    }
+
+    /// [`Self::committed_equals`] for a key whose newest version is `newest`:
+    /// an operand on top means a read replays it, so what the key stores is
+    /// not what a lookup of its value returns, and the write never matches.
+    fn committed_equals_after(
+        &self,
+        key: &[u8],
+        intended: Option<&[u8]>,
+        view: &ReadView,
+        newest: WriteKind,
+    ) -> std::io::Result<bool> {
+        if newest == WriteKind::Merge {
+            return Ok(false);
+        }
+        self.committed_equals(key, intended, view)
+    }
+
+    /// Whether `key` holds exactly `intended` (`None`: nothing) in `view`,
+    /// whose newest version is a value or a deletion, never an operand.
+    fn committed_equals(
+        &self,
+        key: &[u8],
+        intended: Option<&[u8]>,
+        view: &ReadView,
+    ) -> std::io::Result<bool> {
         let snap = u64::MAX;
         let lk = LookupKey::from_prefixed(key, snap);
         let committed = self.lookup_in_view(key, snap, &lk, Materialize::Value, view)?;
@@ -2292,12 +2349,24 @@ impl RegolithEngine {
     /// is accumulated on the way down, mirroring the read path: a
     /// tombstone in a newer source outranks a point entry found in an
     /// older one.
+    #[inline]
     fn latest_version_in_view(
         &self,
         key: &[u8],
         view: &ReadView,
     ) -> std::io::Result<Option<(u64, WriteKind)>> {
-        let snap = u64::MAX;
+        self.latest_version_upto(key, u64::MAX, view)
+    }
+
+    /// [`Self::latest_version_in_view`] among the writes at or below `snap`,
+    /// for a check that runs without the pipeline mutex and so must not see
+    /// a group that is still being published.
+    fn latest_version_upto(
+        &self,
+        key: &[u8],
+        snap: u64,
+        view: &ReadView,
+    ) -> std::io::Result<Option<(u64, WriteKind)>> {
         let lk = LookupKey::from_prefixed(key, snap);
         let walked = view.walk_newest_first(key, snap, |source, max_rt_seq| {
             let version = match source {

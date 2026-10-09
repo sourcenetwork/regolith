@@ -51,11 +51,14 @@ mod allocate;
 mod append;
 mod content;
 mod counter;
+mod range_rule;
+mod read_rules;
 mod replaced;
 mod request;
 mod slot;
 mod stall;
 mod terminator;
+mod write_check;
 
 use append::AppendOrder;
 pub(crate) use append::PendingAppend;
@@ -64,6 +67,8 @@ pub(crate) use request::WriteRequest;
 pub(crate) use slot::WriteSlot;
 pub(crate) use stall::StallSignal;
 use terminator::Landed;
+pub(crate) use write_check::EarlyWrite;
+use write_check::WriteCheck;
 
 /// Largest number of WAL bytes one group stages before it stops admitting.
 ///
@@ -328,6 +333,48 @@ impl RegolithEngine {
         self.commit_locked(checks, ops, appends, durability)
     }
 
+    /// Commit a transaction that writes nothing: check the reads it asked to
+    /// have validated, if any, and take no part in the write pipeline.
+    ///
+    /// The check runs against the newest published state, not under the
+    /// pipeline mutex, so a group a leader is still writing is not seen: only
+    /// a write at or below the sequence readers may see counts. That is a
+    /// commit point of its own, after every commit that returned before this
+    /// one began, which is all a transaction with nothing to apply needs.
+    /// A commit with no reads to check does nothing at all.
+    pub(crate) fn commit_write_free(
+        &self,
+        checks: &crate::engine::ValidationSet,
+    ) -> io::Result<CommitOutcome> {
+        self.ensure_open()?;
+        if checks.reads.is_empty() {
+            return Ok(CommitOutcome::Ok { seq: None });
+        }
+        // The view is loaded before the sequence is sampled, for the reason
+        // `get_slice_latest` gives.
+        let view = self.view.load();
+        let ceil = self.visible_seq.visible();
+        for check in &checks.reads {
+            if let Some((latest_seq, newest)) = self.latest_version_upto(&check.key, ceil, &view)?
+                && latest_seq > check.observed_seq
+                && let Some((seq, theirs)) =
+                    self.read_changed(check, (latest_seq, newest), ceil, &view)?
+            {
+                if let Some(s) = self.statistics() {
+                    s.add(Ticker::CommitConflictsOnRead, 1);
+                }
+                return Ok(CommitOutcome::Conflict(Conflict::new(
+                    check.key.clone(),
+                    check.access,
+                    theirs,
+                    check.observed_seq,
+                    seq,
+                )));
+            }
+        }
+        Ok(CommitOutcome::Ok { seq: None })
+    }
+
     /// The conflict check and the apply, under one uninterrupted hold of
     /// the pipeline mutex. Split out of [`Self::commit_optimistic`] so the
     /// admission wait above does not share a function body with this loop
@@ -356,24 +403,46 @@ impl RegolithEngine {
         for check in &checks.reads {
             if let Some((latest_seq, newest)) = self.latest_version_in_view(&check.key, &view)?
                 && latest_seq > check.observed_seq
-                // A presence-only read found a value of a key whose bytes
-                // never differ, so only the key being gone (a deletion, or a
-                // range delete over it) can have changed what it decided.
-                && (!check.presence_only() || newest.is_deletion())
+                // Only a newer version can have changed what the read
+                // decided, and the read's rule says whether this one did: a
+                // presence-only read needs the key gone, a value read the
+                // bytes different, a projected read a part touched.
+                && let Some((seq, theirs)) =
+                    self.read_changed(check, (latest_seq, newest), u64::MAX, &view)?
             {
-                // A key the transaction *read* always aborts, since the stale
-                // read may have changed what it decided. The commit-level
-                // `CommitConflicts` ticker is recorded once per commit where
-                // the outcome is mapped; this is the per-key subset.
+                // A key the transaction *read* aborts when the rule says the
+                // stale read may have changed what it decided. The
+                // commit-level `CommitConflicts` ticker is recorded once per
+                // commit where the outcome is mapped; this is the per-key
+                // subset.
                 if let Some(s) = self.statistics() {
                     s.add(Ticker::CommitConflictsOnRead, 1);
                 }
                 return Ok(CommitOutcome::Conflict(Conflict::new(
                     check.key.clone(),
                     check.access,
-                    newest,
+                    theirs,
                     check.observed_seq,
-                    latest_seq,
+                    seq,
+                )));
+            }
+        }
+        // A validated scan decided on a whole range, so a write anywhere in it
+        // after the snapshot is a conflict, a key that left it or appeared in
+        // it alike.
+        for range in &checks.ranges {
+            if let Some((key, seq, theirs)) =
+                self.written_in_range(&range.lo, &range.hi, range.observed_seq, &view)?
+            {
+                if let Some(s) = self.statistics() {
+                    s.add(Ticker::CommitConflictsOnRead, 1);
+                }
+                return Ok(CommitOutcome::Conflict(Conflict::new(
+                    key,
+                    Access::ScannedRange,
+                    theirs,
+                    range.observed_seq,
+                    seq,
                 )));
             }
         }
@@ -450,55 +519,29 @@ impl RegolithEngine {
                 {
                     continue;
                 }
-                // Operands commute, so a key the batch only merges into
-                // conflicts only with a replacement newer than the snapshot,
-                // and one walk settles that and tells whether operands landed
-                // too. That walk names the replacement, which is the write
-                // that decided the race even when operands sit on top of it.
-                let mut replacement = None;
-                if mine == Access::Merge
-                    && let Some(replaced) = &replaced
-                    && !replaced.contains(key)
-                {
-                    match self.landed_above(key, observed_seq, &view)? {
-                        Landed::Replaced { seq, kind } => replacement = Some((seq, kind)),
-                        Landed::Operands => {
-                            // Operands commute, so a newer merge operand never
-                            // invalidates a blind merge: the key is accepted
-                            // despite the newer write.
-                            merges_commuted += 1;
-                            continue;
+                match self.check_write(
+                    key,
+                    mine,
+                    observed_seq,
+                    replaced.as_ref(),
+                    &view,
+                    |theirs| self.write_matches_committed(key, &ops, &view, theirs),
+                )? {
+                    WriteCheck::Clean => {}
+                    WriteCheck::Commuted => merges_commuted += 1,
+                    WriteCheck::Elided => writes_elided += 1,
+                    WriteCheck::Conflict { seq, theirs } => {
+                        if let Some(s) = self.statistics() {
+                            s.add(Ticker::CommitConflictsOnWrite, 1);
                         }
-                        Landed::Nothing => continue,
+                        return Ok(CommitOutcome::Conflict(Conflict::new(
+                            key.clone(),
+                            mine,
+                            theirs,
+                            observed_seq,
+                            seq,
+                        )));
                     }
-                }
-                let newest = match replacement {
-                    Some(newest) => Some(newest),
-                    None => self.latest_version_in_view(key, &view)?,
-                };
-                if let Some((latest_seq, theirs)) = newest
-                    && latest_seq > observed_seq
-                {
-                    // A blind write of the value the key already holds is not a
-                    // conflict: the schedule has a serial equivalent reaching the
-                    // same state. A merge never is one, so a replacement found
-                    // above needs no check.
-                    if replacement.is_none()
-                        && self.write_matches_committed(key, &ops, &view, theirs)?
-                    {
-                        writes_elided += 1;
-                        continue;
-                    }
-                    if let Some(s) = self.statistics() {
-                        s.add(Ticker::CommitConflictsOnWrite, 1);
-                    }
-                    return Ok(CommitOutcome::Conflict(Conflict::new(
-                        key.clone(),
-                        mine,
-                        theirs,
-                        observed_seq,
-                        latest_seq,
-                    )));
                 }
             }
         }

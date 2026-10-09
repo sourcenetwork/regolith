@@ -119,7 +119,7 @@ use kovan_queue::seg_queue::SegQueue;
 
 use crate::txn_buffer::TxnBuffer;
 use std::collections::{BTreeMap, HashMap};
-use std::ops::{ControlFlow, Range};
+use std::ops::Range;
 use std::path::Path;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
@@ -127,24 +127,33 @@ use std::time::Duration;
 use crate::sync::internal::{Condvar, Mutex};
 
 use crate::column_family::{DEFAULT_CF_ID, prefix_key};
+use crate::conflict::RedactedKey;
+use crate::engine::commit::EarlyWrite;
 use crate::engine::{
-    CommitOutcome, ConflictKey, PendingAppend, RegolithEngine, ValidationSet, callback,
+    CommitOutcome, ConflictKey, PendingAppend, ReadRule, RegolithEngine, ValidationSet, callback,
 };
 use crate::{Access, Conflict, Db, DbSlice, Error, Options, Result};
 
 mod append;
+mod cursor;
+mod early;
 mod policy;
+mod projection;
 mod receipt;
 mod retry;
 mod scan_range;
 mod txn_options;
+mod validated_range;
 mod write_buffer;
+pub use cursor::{Page, ScanCheck, TxnCursor, TxnScanStream};
 pub use policy::{KeyClass, KeyClassifier};
+use projection::Projection;
 pub use receipt::CommitReceipt;
 pub use retry::{RetryPolicy, TransactError};
-use scan_range::{OpenRun, ScanRun};
+use scan_range::ScanRun;
 pub use txn_options::TxnOptions;
-use write_buffer::{KeyWrites, Write, fold_by_key, read_buffered, settle};
+use validated_range::RangeRecord;
+use write_buffer::{Write, read_buffered, settle};
 
 /// Default lock-acquisition timeout for [`TransactionDb`] when the
 /// caller doesn't specify one on [`TransactionDb::with_lock_timeout`].
@@ -155,7 +164,7 @@ const DEFAULT_LOCK_TIMEOUT: Duration = Duration::from_secs(1);
 /// Reasons a transaction can fail to commit. Not a variant of
 /// [`crate::Error`]: a conflict is a retry-able business outcome,
 /// distinct from an engine failure.
-#[derive(Debug, thiserror::Error)]
+#[derive(thiserror::Error)]
 #[non_exhaustive]
 pub enum TransactionError {
     /// The underlying engine failed, with the same typed [`Error`] a plain
@@ -176,8 +185,11 @@ pub enum TransactionError {
     /// A pessimistic transaction could not acquire a key lock in
     /// time. Indicates either high contention or a deadlock; the
     /// caller should roll back and retry (possibly with a
-    /// different operation order).
-    #[error("transaction busy acquiring lock on key {0:?}")]
+    /// different operation order). The payload is the key, without the
+    /// column-family prefix; neither the message nor the `Debug` output
+    /// prints its bytes, only its length and a short hash, since a key can
+    /// hold user data.
+    #[error("transaction busy acquiring the lock on a {}; retry the transaction", RedactedKey(.0))]
     Busy(Vec<u8>),
     /// The caller tried to use a savepoint that was never set.
     #[error("no savepoint to roll back to")]
@@ -186,6 +198,23 @@ pub enum TransactionError {
     /// participate in conflict detection or range locking.
     #[error("transactional range deletes are not supported")]
     UnsupportedRangeDelete,
+}
+
+// A hand-written `Debug`, because the derived one would print a `Busy` key's
+// bytes into a log or a panic message.
+impl std::fmt::Debug for TransactionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Engine(e) => f.debug_tuple("Engine").field(e).finish(),
+            Self::Conflict(c) => f.debug_tuple("Conflict").field(c).finish(),
+            Self::Busy(key) => f
+                .debug_tuple("Busy")
+                .field(&format_args!("{}", RedactedKey(key)))
+                .finish(),
+            Self::NoSavepoint => f.write_str("NoSavepoint"),
+            Self::UnsupportedRangeDelete => f.write_str("UnsupportedRangeDelete"),
+        }
+    }
 }
 
 /// Convenience alias for results returned by transaction methods.
@@ -291,6 +320,7 @@ impl OptimisticTransactionDb {
             opts.resolve_isolation(self.isolation),
             self.inner.transaction_keys_inline(),
             self.policy.clone(),
+            opts.early(),
         )
     }
 
@@ -385,6 +415,7 @@ impl TransactionDb {
             opts.resolve_isolation(self.isolation),
             self.inner.transaction_keys_inline(),
             None,
+            false,
         )
     }
 
@@ -518,17 +549,20 @@ pub enum IsolationLevel {
     /// Validate the entire read set, including every key a transactional
     /// scan yields.
     Serializable,
-    /// [`IsolationLevel::RepeatableRead`] with four relaxations, for
+    /// [`IsolationLevel::RepeatableRead`] with relaxations, for
     /// optimistic transactions only. A pessimistic transaction at this
     /// level validates exactly as at `RepeatableRead`.
     ///
     /// What the commit validates, by kind of key (the first is
-    /// `RepeatableRead` itself, the other four are the relaxations):
+    /// `RepeatableRead` itself, the rest are the relaxations):
     ///
     /// - An ordinary key. Every point read of it is validated, whether it
     ///   found a value or not, and a put or delete of it conflicts with any
     ///   commit to the key since the transaction began, unless the key
-    ///   already holds what the write would leave.
+    ///   already holds what the write would leave. A read is validated by
+    ///   value: it is current while the key holds the bytes it returned, so
+    ///   a rewrite of the same bytes, or a change that came back, is not a
+    ///   change. A merge operand on top always is, whatever it adds.
     /// - Blind merges commute. A key the transaction only merges into (it
     ///   did not read the key, did not walk it in a scan, and did not put or
     ///   delete it) conflicts only with a newer put, delete or covering
@@ -557,6 +591,21 @@ pub enum IsolationLevel {
     ///   [`KeyClass::Log`] is never validated, and a put, delete or merge of
     ///   one is refused with [`Error::LogKeyWrite`]. Only
     ///   [`Transaction::append`] writes them.
+    /// - Projected reads. [`Transaction::get_parts`] names the parts of a
+    ///   value its decision used; it is refused only by a newer write that
+    ///   changes one of them (see [`crate::MergeOperator::touches`]).
+    /// - Write-free transactions. A transaction that writes nothing
+    ///   validates no plain read and never conflicts: it read one snapshot,
+    ///   and nothing it did can have moved. It checks only the reads it
+    ///   made through [`Transaction::get_for_update`], against the newest
+    ///   published state, and takes no part in the commit pipeline, so it
+    ///   commits while a writer holds the pipeline. A pessimistic transaction
+    ///   at this level is not write-free, since its `get_for_update` reads
+    ///   can see two points in time.
+    ///
+    /// A scan checked with [`ScanCheck::Range`] is stricter than any of
+    /// these: any write inside the range it covered since the snapshot
+    /// conflicts, at this level and every other.
     ///
     /// A transaction reads its own puts, deletes and merges in the order it
     /// made them, and the commit applies them in that order: an operand
@@ -570,8 +619,10 @@ pub enum IsolationLevel {
     /// first committer wins does not apply to merge operands. When every
     /// transaction uses only point reads, puts, deletes and merges, the
     /// committed transactions are serializable in commit order, because
-    /// every point read is validated; a content-addressed key is outside
-    /// that statement. The keys a scan returns are not validated, as at
+    /// every point read is validated: a writing transaction as of its commit,
+    /// a write-free one as of its snapshot. A content-addressed key, a log
+    /// key and a read by parts are outside that statement as far as they are
+    /// relaxed above. The keys a scan returns are not validated, as at
     /// `RepeatableRead`, so phantoms are possible: a key another transaction
     /// inserts into a scanned range is detected only when this transaction
     /// also reads or writes it.
@@ -658,6 +709,16 @@ pub struct Transaction {
     /// stays off the `Transaction` struct itself: every commit moves this
     /// value, and a transaction that never scans must not pay for it.
     scan_runs: OnceLock<Box<SegQueue<Arc<ScanRun>>>>,
+    /// The ranges the validated scans ([`ScanCheck::Range`]) cover, one record
+    /// per cursor. Boxed for the reason `scan_runs` is.
+    scan_ranges: OnceLock<Box<SegQueue<Arc<RangeRecord>>>>,
+    /// How many times a savepoint rollback rebuilt the write buffer. With the
+    /// buffer's length it tells a cursor whether the writes it folded are
+    /// still the writes the transaction holds.
+    rollbacks: u64,
+    /// Each write is checked against newer versions as it is made
+    /// ([`TxnOptions::early_validation`]). Optimistic transactions only.
+    early_validation: bool,
     /// Highest sequence [`Transaction::get_for_update`] has ever promoted a
     /// key to; `snapshot_seq` while nothing has been promoted past it.
     /// Lets `scan_read_seq` skip the `tracked` lookup outright for a
@@ -721,6 +782,11 @@ struct KeyState {
     /// read that must see the key stay present from one that found nothing.
     /// Latches on, like `for_update`.
     found: AtomicBool,
+    /// The parts the key was read by, when its first read was
+    /// [`Transaction::get_parts`]. `None` for a key read in whole. A cell with
+    /// a projection is widened to the whole value by any other kind of read,
+    /// which `Projection::widen_to_full` records.
+    projection: Option<Box<Projection>>,
 }
 
 impl KeyState {
@@ -730,6 +796,7 @@ impl KeyState {
             read_seq: AtomicU64::new(horizon),
             for_update: AtomicBool::new(for_update),
             found: AtomicBool::new(false),
+            projection: None,
         }
     }
 }
@@ -746,6 +813,7 @@ impl Transaction {
         isolation: IsolationLevel,
         keys_inline: usize,
         policy: Option<Arc<dyn KeyClassifier>>,
+        early_validation: bool,
     ) -> Self {
         Self {
             engine,
@@ -759,6 +827,9 @@ impl Transaction {
             appends: OnceLock::new(),
             tracked: TxnBuffer::new(keys_inline),
             scan_runs: OnceLock::new(),
+            scan_ranges: OnceLock::new(),
+            rollbacks: 0,
+            early_validation,
             promoted_seq: AtomicU64::new(snapshot_seq),
             savepoints: Vec::new(),
             held_locks: TxnBuffer::new(keys_inline),
@@ -874,8 +945,11 @@ impl Transaction {
     /// with them applied to nothing. The value the operands apply to is read
     /// when the scan reaches the key, as the snapshot key it is: it joins the
     /// stretch and is recorded as a read only where a scan records every key.
-    /// A merge the operator declines ends the stream, and
-    /// [`TxnScanStream::status`] says why.
+    /// A merge the operator declines, or a read that fails, reaches the caller
+    /// as an `Err` item and ends the stream: the items are `TxResult`s so an
+    /// error is never mistaken for the end of the range. Writes this
+    /// transaction makes while the stream is open are seen when they lie
+    /// ahead of its position.
     ///
     /// What the scan leaves in the transaction depends on the level. Below
     /// [`IsolationLevel::Serializable`] it records each unbroken stretch of
@@ -911,6 +985,9 @@ impl Transaction {
     /// the stream is exhausted or dropped. A stream that is never dropped
     /// (leaked) counts as having walked to the end of the keyspace in its
     /// direction.
+    ///
+    /// This is [`Transaction::cursor`] with [`ScanCheck::Stretch`], one entry
+    /// at a time.
     pub fn scan_stream(&self, start: Option<&[u8]>, end: Option<&[u8]>) -> TxnScanStream<'_> {
         self.scan_stream_in(start, end, ScanDirection::Forward)
     }
@@ -931,61 +1008,7 @@ impl Transaction {
         end: Option<&[u8]>,
         direction: ScanDirection,
     ) -> TxnScanStream<'_> {
-        // `scan_read_seq` indexes `tracked` itself, lazily, the first time
-        // it finds a promotion; a `&self` stream and `&self` `get_for_update`
-        // mean a promotion can land after this call returns, so indexing
-        // only here would miss it. See `scan_read_seq`.
-        let lo = start.map(|s| prefix_key(DEFAULT_CF_ID, s));
-        let hi = end.map(|e| prefix_key(DEFAULT_CF_ID, e));
-        let reverse = direction == ScanDirection::Reverse;
-
-        let buffered = fold_by_key(
-            self.writes.chains_matching(
-                |key| {
-                    lo.as_ref().is_none_or(|lo| key >= lo) && hi.as_ref().is_none_or(|hi| key < hi)
-                },
-                Write::is_terminator,
-            ),
-            reverse,
-            self.engine.merge_operator(),
-        );
-
-        let mut cursor = crate::CfIter::new(
-            crate::Iter::from_internal(self.engine.new_iter_at(self.snapshot_seq)),
-            DEFAULT_CF_ID,
-        );
-        if reverse {
-            match &hi {
-                // `end` is exclusive, so a backward walk starts below it.
-                Some(hi) => {
-                    let end = &hi[4..];
-                    cursor.seek_for_prev(end);
-                    if cursor.valid() && cursor.key() == Some(end) {
-                        cursor.prev();
-                    }
-                }
-                None => cursor.seek_to_last(),
-            }
-        } else {
-            // The bound must reach the cursor, not only `peek_cursor`: the
-            // cursor skips entries this snapshot cannot see before it
-            // reports a key, and without it that skip runs past `end`.
-            let target = lo.as_deref().map_or(&[][..], |lo| &lo[4..]);
-            cursor.seek_bounded(target, hi.as_deref().map(|hi| &hi[4..]));
-        }
-
-        TxnScanStream {
-            txn: self,
-            cursor,
-            cursor_done: false,
-            buffered: buffered.into_iter().peekable(),
-            start: lo.map(|lo| lo[4..].to_vec()),
-            end: hi.map(|hi| hi[4..].to_vec()),
-            reverse,
-            run: None,
-            probe: Vec::new(),
-            error: None,
-        }
+        TxnScanStream::new(self, start, end, direction)
     }
 
     /// Read `key`, flag it for conflict detection at commit, and,
@@ -1033,6 +1056,7 @@ impl Transaction {
         self.refuse_log_key(key)?;
         let prefixed = prefix_key(DEFAULT_CF_ID, key);
         self.lock_key(&prefixed)?;
+        self.validate_early(&prefixed, EarlyWrite::Put(value))?;
         self.writes.insert(prefixed, Write::Put(value.to_vec()));
         Ok(())
     }
@@ -1043,6 +1067,7 @@ impl Transaction {
         self.refuse_log_key(key)?;
         let prefixed = prefix_key(DEFAULT_CF_ID, key);
         self.lock_key(&prefixed)?;
+        self.validate_early(&prefixed, EarlyWrite::Delete)?;
         self.writes.insert(prefixed, Write::Delete);
         Ok(())
     }
@@ -1096,6 +1121,7 @@ impl Transaction {
         self.engine.require_merge_operator()?;
         let prefixed = prefix_key(DEFAULT_CF_ID, key);
         self.lock_key(&prefixed)?;
+        self.validate_early(&prefixed, EarlyWrite::Merge)?;
         self.writes.insert(prefixed, Write::Merge(operand.to_vec()));
         Ok(())
     }
@@ -1133,6 +1159,7 @@ impl Transaction {
     /// that landed around the lock manager in the meantime.
     pub fn rollback_to_savepoint(&mut self) -> TxResult<()> {
         let sp = self.savepoints.pop().ok_or(TransactionError::NoSavepoint)?;
+        self.rollbacks += 1;
         self.writes = TxnBuffer::new(self.keys_inline);
         // Oldest first, so the buffer's newest-first order comes out as it was.
         for (key, write) in sp.writes.into_iter().rev() {
@@ -1184,8 +1211,11 @@ impl Transaction {
     /// into smaller transactions. A commit with no buffered writes skips the
     /// stall wait: it validates its read set and returns. That validation
     /// still runs under the write pipeline, so it can wait behind a commit
-    /// group that is writing the log. A pessimistic transaction keeps its key
-    /// locks for the duration of the wait.
+    /// group that is writing the log. An optimistic transaction at
+    /// [`IsolationLevel::DefraLevel`] that writes nothing is the exception: it
+    /// takes no part in the pipeline and validates only its
+    /// [`Transaction::get_for_update`] reads. A pessimistic transaction keeps
+    /// its key locks for the duration of the wait.
     ///
     /// A conflict is reported to every [`crate::EventListener`] once, after
     /// the commit has released the pipeline and this transaction its key
@@ -1225,6 +1255,22 @@ impl Transaction {
         let appends = self.appends.take().map_or_else(Vec::new, |q| drain(&q));
         let tracked = self.tracked.drain();
         let mut checks = self.validation_set(tracked, &writes, &merges);
+        // A write-free transaction at DefraLevel read one consistent snapshot
+        // and changes nothing, so no read of it can be stale in a way that
+        // matters, except a read it asked to have checked. Only an optimistic
+        // transaction qualifies: a pessimistic one validates as at
+        // RepeatableRead, since its `get_for_update` reads past the snapshot
+        // can see two points in time.
+        let write_free = self.projects()
+            && writes.is_empty()
+            && merges.is_empty()
+            && range_deletes.is_empty()
+            && appends.is_empty();
+        if write_free {
+            checks
+                .reads
+                .retain(|read| read.access == Access::ReadForUpdate);
+        }
         // Only an optimistic transaction at `DefraLevel` has a classifier to
         // consult: the policy is installed on the optimistic database alone,
         // and every other level ignores it.
@@ -1237,7 +1283,7 @@ impl Transaction {
         // Behind the `take`, not threaded through `validation_set`, so a
         // transaction that never scans (the common case) pays no `Vec`
         // round trip for an empty run list on its commit path.
-        if let Some(runs) = self.scan_runs.take() {
+        if let Some(runs) = self.scan_runs.take().filter(|_| !write_free) {
             let mut runs = drain(&runs);
             if let Some(classifier) = classifier {
                 let before = runs.len();
@@ -1252,7 +1298,11 @@ impl Transaction {
                 &writes,
                 &merges,
                 self.snapshot_seq,
+                &self.full_read_rule(),
             );
+        }
+        if let Some(records) = self.scan_ranges.take().filter(|_| !write_free) {
+            checks.ranges = validated_range::checks(&drain(&records), self.snapshot_seq);
         }
         // After the scans are folded in, so the reads they added for put or
         // merged keys are dropped with the rest.
@@ -1268,14 +1318,18 @@ impl Transaction {
         // `commit_optimistic`, after its own `ensure_writable` and
         // `validate_ops_sizes` and before the pipeline mutex, gated on
         // the commit carrying an op. See the comment there for why.
-        let outcome = self.engine.commit_with_conflict_check(
-            &checks,
-            writes,
-            range_deletes,
-            merges,
-            appends,
-            self.durability,
-        )?;
+        let outcome = if write_free {
+            self.engine.commit_write_free(&checks)?
+        } else {
+            self.engine.commit_with_conflict_check(
+                &checks,
+                writes,
+                range_deletes,
+                merges,
+                appends,
+                self.durability,
+            )?
+        };
         match outcome {
             CommitOutcome::Ok { seq } => {
                 if let Some(s) = self.engine.statistics() {
@@ -1357,18 +1411,19 @@ impl Transaction {
         // (`get_or_insert` settles a race by re-reading, newest first).
         tracked.sort_by(|a, b| a.0.cmp(&b.0));
         tracked.dedup_by(|later, first| later.0 == first.0);
+        let value_rule = self.projects();
         let reads = tracked
             .into_iter()
             .filter(|(key, state)| {
                 let written =
-                    writes.contains_key(key) || merges.iter().any(|(merged, _)| merged == key);
+                    || writes.contains_key(key) || merges.iter().any(|(merged, _)| merged == key);
                 if every_read {
                     // Every read, whether or not the transaction wrote it.
                     true
                 } else if read_committed {
-                    written
+                    written()
                 } else {
-                    state.for_update.load(Ordering::Acquire) || written
+                    state.for_update.load(Ordering::Acquire) || written()
                 }
             })
             // Any read at all, whatever the level. This flag exists to
@@ -1384,15 +1439,37 @@ impl Transaction {
             // writes 7. `first_read_seq` anchors the check at the read for
             // exactly this reason, and honouring the anchor is what makes
             // the abort correct.
-            .map(|(key, state)| ConflictKey {
-                key,
-                observed_seq: state.first_read_seq,
-                found: state.found.load(Ordering::Acquire),
-                access: if state.for_update.load(Ordering::Acquire) {
-                    Access::ReadForUpdate
+            .filter_map(|(key, state)| {
+                let for_update = state.for_update.load(Ordering::Acquire);
+                let full = if value_rule {
+                    ReadRule::Value
                 } else {
-                    Access::Read
-                },
+                    ReadRule::Seq
+                };
+                let (rule, access) =
+                    match state.projection.as_deref().and_then(Projection::take_parts) {
+                        // A read by no parts decided on nothing in the value.
+                        Some(parts) if parts.is_empty() => return None,
+                        // A put or delete replaces every part, and what it
+                        // replaces was read by some: validated in whole.
+                        Some(_) if writes.contains_key(&key) => (full, Access::ReadParts),
+                        Some(parts) => (ReadRule::Parts(parts.into()), Access::ReadParts),
+                        None => (
+                            full,
+                            if for_update {
+                                Access::ReadForUpdate
+                            } else {
+                                Access::Read
+                            },
+                        ),
+                    };
+                Some(ConflictKey {
+                    key,
+                    observed_seq: state.first_read_seq,
+                    found: state.found.load(Ordering::Acquire),
+                    access,
+                    rule,
+                })
             })
             .collect();
         ValidationSet {
@@ -1400,6 +1477,18 @@ impl Transaction {
             writes_at: optimistic.then_some(self.snapshot_seq),
             blind_merges_commute: self.isolation.blind_merges_commute(),
             exempt: Vec::new(),
+            ranges: Vec::new(),
+        }
+    }
+
+    /// The rule a read of a key's whole value is validated by. DefraLevel's
+    /// relaxations apply to an optimistic transaction only; a pessimistic one
+    /// validates as RepeatableRead, by sequence.
+    fn full_read_rule(&self) -> ReadRule {
+        if self.projects() {
+            ReadRule::Value
+        } else {
+            ReadRule::Seq
         }
     }
 
@@ -1450,6 +1539,10 @@ impl Transaction {
         // wins and every other caller folds its observation into that
         // one. Each fold is monotonic, so the result does not depend on
         // the order they land in.
+        if let Some(projection) = &state.projection {
+            // A read of the whole value: no set of parts narrows it again.
+            projection.widen_to_full();
+        }
         // `first_read_seq` is deliberately not touched here. It is set
         // once, by whichever call created the cell, and every later read
         // of the key is served at `read_seq`, which only rises. So every
@@ -1517,6 +1610,14 @@ impl Transaction {
         }
     }
 
+    /// Register the range a validated scan covers, so commit sees it however
+    /// far the cursor got.
+    fn record_scan_range(&self, range: Arc<RangeRecord>) {
+        self.scan_ranges
+            .get_or_init(|| Box::new(SegQueue::new()))
+            .push(range);
+    }
+
     /// Register a stretch a scan began, so commit sees it even if the stream
     /// is never closed.
     fn record_scan_run(&self, run: Arc<ScanRun>) {
@@ -1553,305 +1654,6 @@ impl Transaction {
             }
         }
         self.engine.release_snapshot(self.snapshot_seq);
-    }
-}
-
-/// The transaction's own writes for a range, folded per key, sorted and
-/// ready to merge.
-type BufferedWrites = std::iter::Peekable<std::vec::IntoIter<(Vec<u8>, KeyWrites)>>;
-
-/// A transaction's view of a key range, streamed.
-///
-/// Merges the transaction's buffered writes over a snapshot cursor, so a
-/// scan inside a transaction sees its own uncommitted writes without
-/// either side being materialized: the database side is a cursor, and the
-/// buffered side is bounded by what this transaction wrote.
-///
-/// A buffered delete hides the snapshot's entry for that key, and a
-/// buffered put replaces it. Buffered merge operands are applied to the put,
-/// or else to the value the transaction reads for the key, as
-/// [`Transaction::get`] applies them. Each unbroken stretch of snapshot
-/// entries it yields is recorded in the transaction once, as the first and
-/// the last key of the stretch (per key as well at Serializable); entries
-/// that come from the transaction's own writes are not recorded and end the
-/// stretch, except a merged key whose operands lie on a snapshot entry, which
-/// joins it.
-pub struct TxnScanStream<'txn> {
-    /// The transaction this scan reads for: its stretches are registered
-    /// there, and a key it already promoted through `get_for_update` is
-    /// served at that key's read sequence.
-    txn: &'txn Transaction,
-    cursor: crate::CfIter<'txn>,
-    cursor_done: bool,
-    buffered: BufferedWrites,
-    /// Inclusive lower bound, user-visible form. Where a reverse walk stops.
-    start: Option<Vec<u8>>,
-    /// Exclusive upper bound, user-visible form. Where a forward walk stops.
-    end: Option<Vec<u8>>,
-    reverse: bool,
-    /// The stretch of snapshot keys being yielded. Dropping it closes it.
-    run: Option<OpenRun>,
-    /// The key being handed out, CF-prefixed, reused across yields.
-    probe: Vec<u8>,
-    /// A read of a key served past the begin snapshot that failed.
-    error: Option<std::io::Error>,
-}
-
-impl TxnScanStream<'_> {
-    /// Why the snapshot side of the walk stopped.
-    ///
-    /// `Ok(())` means the range ended. An error means it did not: the
-    /// entries handed out are the transaction's buffered writes merged with
-    /// a *prefix* of what the database holds, and the rest was never read,
-    /// or a read of a key this transaction already locked through
-    /// [`Transaction::get_for_update`] failed, or reading the value a merge
-    /// builds on failed, or the merge operator declined a key the transaction
-    /// merged into.
-    ///
-    /// A merged stream cannot report this any other way. `Iterator` has
-    /// nowhere to put a failure, and a cursor that dies mid-range goes
-    /// invalid exactly as one that reached the end does, after which the
-    /// merge finishes on the buffered side alone and looks complete. Check
-    /// this after iterating whenever a missing row would be worse than an
-    /// error. It is the same contract as [`crate::ScanStream::status`].
-    pub fn status(&self) -> Result<()> {
-        if let Some(e) = &self.error {
-            return Err(Error::clone_io(e).into());
-        }
-        self.cursor.status()
-    }
-
-    /// The next snapshot entry inside the range, or `None` past the end.
-    ///
-    /// Whichever way the walk runs, it stops at the bound it is running
-    /// towards: `end` is exclusive going forward, `start` inclusive going
-    /// back.
-    fn peek_cursor(&mut self) -> Option<Vec<u8>> {
-        if self.cursor_done || !self.cursor.valid() {
-            // The cursor going invalid means one of two things and this is
-            // where they become indistinguishable: the range ended, or the
-            // walk failed and the merge is about to finish on the buffered
-            // side as though the database held nothing more. Say it out
-            // loud; `status` returns it to a caller that checks.
-            if let Err(e) = self.cursor.status() {
-                tracing::error!(
-                    error = %e,
-                    "transaction scan ended early: the snapshot cursor failed \
-                     mid-range, so the rows returned are a prefix and not the range"
-                );
-            }
-            return None;
-        }
-        let key = self.cursor.key()?.to_vec();
-        let past_bound = if self.reverse {
-            self.start
-                .as_ref()
-                .is_some_and(|start| key.as_slice() < start.as_slice())
-        } else {
-            self.end
-                .as_ref()
-                .is_some_and(|end| key.as_slice() >= end.as_slice())
-        };
-        if past_bound {
-            self.cursor_done = true;
-            return None;
-        }
-        Some(key)
-    }
-
-    /// Step the snapshot cursor the way this scan runs.
-    fn step_cursor(&mut self) {
-        if self.reverse {
-            self.cursor.prev();
-        } else {
-            self.cursor.next();
-        }
-    }
-
-    /// Whether `first` comes before `second` in this scan's order.
-    fn precedes(&self, first: &[u8], second: &[u8]) -> std::cmp::Ordering {
-        if self.reverse {
-            second.cmp(first)
-        } else {
-            first.cmp(second)
-        }
-    }
-
-    /// Hand out the entry under the cursor and record the read.
-    ///
-    /// `Break(Some(entry))` hands `entry` out, `Break(None)` ends the stream,
-    /// `Continue` moves on to the next entry.
-    ///
-    /// A key a pessimistic transaction already promoted past the begin
-    /// snapshot through `get_for_update` is served where `get` serves it, at
-    /// its `read_seq`, and is skipped when nothing is visible there. Its cell
-    /// already records that read, so it ends the current stretch instead of
-    /// joining it: the stretch must hold only keys observed at the begin
-    /// snapshot. Every other key is served from the cursor at the begin
-    /// snapshot and extends the stretch (starting one, and registering it,
-    /// on the first such key). At Serializable the key is also recorded per
-    /// key through `observe`.
-    fn yield_cursor(&mut self, key: Vec<u8>) -> ControlFlow<Option<(Vec<u8>, DbSlice)>> {
-        let txn = self.txn;
-        self.probe.clear();
-        self.probe.extend_from_slice(&DEFAULT_CF_ID.to_be_bytes());
-        self.probe.extend_from_slice(&key);
-        let read_seq = txn.scan_read_seq(&self.probe);
-        if read_seq > txn.snapshot_seq {
-            self.step_cursor();
-            self.run = None;
-            return match txn.engine.get_slice_at(&self.probe, read_seq) {
-                Ok(Some(value)) => ControlFlow::Break(Some((key, value))),
-                Ok(None) => ControlFlow::Continue(()),
-                Err(e) => {
-                    tracing::error!(
-                        error = %e,
-                        "transaction scan ended early: a read failed mid-range, \
-                         so the rows returned are a prefix and not the range"
-                    );
-                    self.error = Some(e);
-                    self.cursor_done = true;
-                    ControlFlow::Continue(())
-                }
-            };
-        }
-        let Some(value) = self.cursor.value_slice() else {
-            self.run = None;
-            return ControlFlow::Break(None);
-        };
-        self.step_cursor();
-        Self::join_stretch(txn, &mut self.run, self.reverse, &self.probe);
-        ControlFlow::Break(Some((key, value)))
-    }
-
-    /// Take `key` (CF-prefixed), a snapshot key the walk read at the begin
-    /// snapshot, into the stretch in `run`, starting and registering one if
-    /// none is open. At Serializable the key is also recorded per key through
-    /// `observe`.
-    fn join_stretch(txn: &Transaction, run: &mut Option<OpenRun>, reverse: bool, key: &[u8]) {
-        match run {
-            Some(open) => open.extend(key),
-            None => {
-                let (record, open) = OpenRun::start(key, reverse);
-                txn.record_scan_run(record);
-                *run = Some(open);
-            }
-        }
-        if txn.isolation.validates_scanned_keys() {
-            txn.observe(key, txn.snapshot_seq, false);
-        }
-    }
-
-    /// Hand out the transaction's own entry at the head of `buffered`.
-    ///
-    /// The same protocol as `yield_cursor`. A key the transaction merged into
-    /// and did not replace has its operands lie on a snapshot key, which the
-    /// walk reads as it reads any other: at the key's read sequence, joining
-    /// the stretch when that is the begin snapshot and ending it when a
-    /// promotion moved it past that, and recording a read of it only at
-    /// Serializable. Every other entry comes from the write buffer and ends
-    /// the stretch. A merge the operator declines ends the stream, with the
-    /// reason left for `status`.
-    fn yield_buffered(&mut self) -> ControlFlow<Option<(Vec<u8>, DbSlice)>> {
-        let Some((prefixed, writes)) = self.buffered.next() else {
-            return ControlFlow::Break(None);
-        };
-        let txn = self.txn;
-        // Only an entry that reads its base uses the sequence: `apply` takes
-        // the closure below for nothing else.
-        let read_seq = if writes.reads_base() {
-            let read_seq = txn.scan_read_seq(&prefixed);
-            if read_seq > txn.snapshot_seq {
-                self.run = None;
-            } else {
-                Self::join_stretch(txn, &mut self.run, self.reverse, &prefixed);
-            }
-            read_seq
-        } else {
-            self.run = None;
-            txn.snapshot_seq
-        };
-        let found = writes.apply(txn.engine.merge_operator(), &prefixed, || {
-            txn.engine.get_slice_at(&prefixed, read_seq)
-        });
-        match found {
-            Ok(Some(Some(value))) => {
-                ControlFlow::Break(Some((prefixed[4..].to_vec(), DbSlice::from(value))))
-            }
-            Ok(_) => ControlFlow::Continue(()),
-            Err(e) => {
-                tracing::error!(
-                    error = %e,
-                    "transaction scan ended early: reading a merged key failed mid-range, \
-                     so the rows returned are a prefix and not the range"
-                );
-                self.error = Some(e);
-                self.cursor_done = true;
-                self.buffered = Vec::new().into_iter().peekable();
-                ControlFlow::Break(None)
-            }
-        }
-    }
-}
-
-impl Iterator for TxnScanStream<'_> {
-    type Item = (Vec<u8>, DbSlice);
-
-    fn next(&mut self) -> Option<Self::Item> {
-        loop {
-            let cursor_key = self.peek_cursor();
-            // Buffered keys carry the CF prefix; the cursor reports the
-            // user-visible key, so compare on the stripped form.
-            let buffered_key = self.buffered.peek().map(|(key, _)| key[4..].to_vec());
-
-            match (cursor_key, buffered_key) {
-                (None, None) => {
-                    self.run = None;
-                    return None;
-                }
-                // Only the transaction has this key.
-                (None, Some(_)) => {
-                    if let ControlFlow::Break(item) = self.yield_buffered() {
-                        return item;
-                    }
-                }
-                // Only the database has it.
-                (Some(key), None) => {
-                    if let ControlFlow::Break(item) = self.yield_cursor(key) {
-                        return item;
-                    }
-                }
-                (Some(ckey), Some(bkey)) => match self.precedes(&ckey, &bkey) {
-                    std::cmp::Ordering::Less => {
-                        if let ControlFlow::Break(item) = self.yield_cursor(ckey) {
-                            return item;
-                        }
-                    }
-                    std::cmp::Ordering::Greater => {
-                        if let ControlFlow::Break(item) = self.yield_buffered() {
-                            return item;
-                        }
-                    }
-                    // The transaction wrote a key the snapshot also has,
-                    // so its write wins and the snapshot entry is skipped
-                    // whether that write was a put or a delete. Operands
-                    // with no put or delete beneath them read the entry
-                    // themselves, as `get` would.
-                    std::cmp::Ordering::Equal => {
-                        self.step_cursor();
-                        if let ControlFlow::Break(item) = self.yield_buffered() {
-                            return item;
-                        }
-                    }
-                },
-            }
-        }
-    }
-}
-
-impl std::fmt::Debug for TxnScanStream<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("TxnScanStream").finish_non_exhaustive()
     }
 }
 
@@ -2776,7 +2578,10 @@ mod tests {
 
             let walked: Vec<(Vec<u8>, Vec<u8>)> = tx
                 .scan_stream(None, None)
-                .map(|(key, value)| (key, value.to_vec()))
+                .map(|item| {
+                    let (key, value) = item.unwrap();
+                    (key, value.to_vec())
+                })
                 .collect();
             assert_eq!(walked, [(b"k".to_vec(), b"base+op".to_vec())]);
             assert_eq!(tx.tracked.len(), recorded, "{level:?}");
@@ -2813,7 +2618,7 @@ mod tests {
         let tx = db.begin(&TxnOptions::new());
 
         let mut stream = tx.scan_stream(None, None);
-        assert_eq!(stream.next().unwrap().0, b"k0000".to_vec());
+        assert_eq!(stream.next().unwrap().unwrap().0, b"k0000".to_vec());
         assert!(
             !tx.tracked.is_indexed(),
             "nothing is promoted yet: scan_stream_in must not index speculatively"
@@ -2837,7 +2642,12 @@ mod tests {
         // these calls used to fall back to walking the list, O(1) here but
         // O(tracked keys) had more been promoted, because construction-time
         // indexing had already run and missed this promotion.
-        let rest: Vec<(Vec<u8>, Vec<u8>)> = stream.map(|(k, v)| (k, v.to_vec())).collect();
+        let rest: Vec<(Vec<u8>, Vec<u8>)> = stream
+            .map(|item| {
+                let (k, v) = item.unwrap();
+                (k, v.to_vec())
+            })
+            .collect();
         assert!(
             tx.tracked.is_indexed(),
             "scan_read_seq must index tracked lazily on first need, mid-stream, \

@@ -18,7 +18,8 @@ fn db(dir: &std::path::Path) -> OptimisticTransactionDb {
 
 fn collect(stream: regolith::TxnScanStream<'_>) -> Vec<(String, String)> {
     stream
-        .map(|(key, value)| {
+        .map(|item| {
+            let (key, value) = item.unwrap();
             (
                 String::from_utf8(key).unwrap(),
                 String::from_utf8(value.to_vec()).unwrap(),

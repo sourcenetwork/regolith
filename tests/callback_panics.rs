@@ -112,6 +112,9 @@ fn a_classifier_that_panics_on_a_scanned_stretch_fails_the_commit_too() {
 
     let tx = begin(&db);
     assert_eq!(tx.scan_stream(Some(b"boom/"), Some(b"boom0")).count(), 2);
+    // A transaction that writes nothing validates nothing, so it never asks the
+    // classifier about its stretches.
+    tx.put(b"elsewhere", b"v").unwrap();
     assert!(panicked("KeyClassifier", &tx.commit()));
     assert!(matches!(
         db.db().put(b"after", b"v"),

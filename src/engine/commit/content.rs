@@ -100,6 +100,7 @@ mod tests {
             writes_at: Some(observed),
             blind_merges_commute: false,
             exempt: vec![key_of(b"c")],
+            ranges: Vec::new(),
         };
         let puts: BTreeMap<Vec<u8>, Option<Vec<u8>>> =
             BTreeMap::from([(key_of(b"c"), Some(mine.to_vec()))]);

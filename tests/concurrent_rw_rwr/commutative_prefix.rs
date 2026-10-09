@@ -111,7 +111,7 @@ fn stage(
     let tx = db.begin(&TxnOptions::new().isolation(level));
     let seen = tx
         .scan_stream(Some(b"h/"), Some(walk.end()))
-        .map(|(key, _)| key)
+        .map(|item| item.unwrap().0)
         .collect();
     tx.put(&unique(round, t), &[t as u8]).unwrap();
     tx.put(&fresh(round), SHARED_VALUE).unwrap();

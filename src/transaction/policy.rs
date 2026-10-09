@@ -137,7 +137,10 @@ pub enum KeyClass {
 ///
 /// Before commit, `put`, `delete` and `merge` call it once with the key they
 /// are given, to refuse a [`KeyClass::Log`] key, and `append` calls it for
-/// each key of the log it names.
+/// each key of the log it names. A transaction begun with
+/// [`TxnOptions::early_validation`](crate::TxnOptions::early_validation) asks
+/// once more for each key it puts or merges, to leave a content-addressed one
+/// unchecked.
 ///
 /// A panic in `classify` during the commit fails the commit with
 /// [`Error::CallbackPanicked`](crate::Error::CallbackPanicked) and latches the
@@ -155,6 +158,7 @@ pub(super) fn run_is_commutative(classifier: &dyn KeyClassifier, run: &ScanRun) 
     let (first, Some(last)) = run.bounds() else {
         return false;
     };
+    let last = last.as_slice();
     if first.len() < CF_PREFIX_LEN
         || last.len() < CF_PREFIX_LEN
         || first[..CF_PREFIX_LEN] != last[..CF_PREFIX_LEN]
@@ -175,6 +179,12 @@ pub(super) fn run_is_commutative(classifier: &dyn KeyClassifier, run: &ScanRun) 
 fn class_of(classifier: &dyn KeyClassifier, key: &[u8]) -> KeyClass {
     key.get(CF_PREFIX_LEN..)
         .map_or(KeyClass::Ordinary, |key| classifier.classify(key))
+}
+
+/// Whether `classifier` declares `key`, which carries the column-family
+/// prefix, content-addressed.
+pub(super) fn is_content_addressed(classifier: &dyn KeyClassifier, key: &[u8]) -> bool {
+    class_of(classifier, key) == KeyClass::ContentAddressed
 }
 
 /// The classifier a transaction at `isolation` consults: only
@@ -283,7 +293,7 @@ impl IsolationLevel {
 mod tests {
     use super::*;
     use crate::column_family::{DEFAULT_CF_ID, prefix_key};
-    use crate::engine::ConflictKey;
+    use crate::engine::{ConflictKey, ReadRule};
 
     /// Keys that start with `c` are content-addressed, those with `p` are in a
     /// commutative prefix, those with `l` are log keys, the rest are ordinary.
@@ -310,6 +320,7 @@ mod tests {
             observed_seq: 3,
             found,
             access: Access::Read,
+            rule: ReadRule::Seq,
         }
     }
 
@@ -319,6 +330,7 @@ mod tests {
             writes_at: Some(3),
             blind_merges_commute: true,
             exempt: Vec::new(),
+            ranges: Vec::new(),
         }
     }
 
