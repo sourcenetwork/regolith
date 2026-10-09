@@ -39,13 +39,12 @@ use std::time::Duration;
 
 use kovan_queue::array_queue::ArrayQueue;
 
-use super::internal_key::VALUE_TYPE_DELETION;
 use super::memtable::MemTable;
 use super::wal::{MAX_RECORD_LEN, Wal, check_write_len};
 use super::{CommitOutcome, DurabilityMode, ReadView, RegolithEngine, grouped_batch_ops};
-use crate::WriteBatchOp;
 use crate::perf_context::{PerfTimer, PerfTimerField};
 use crate::statistics::{Histogram, Ticker};
+use crate::{Access, Conflict, WriteBatchOp};
 
 mod replaced;
 mod request;
@@ -343,12 +342,12 @@ impl RegolithEngine {
         // sorted by key, so a multi-key conflict names the same key on
         // every run.
         for check in &checks.reads {
-            if let Some((latest_seq, newest_type)) = self.latest_version_in_view(&check.key, &view)?
+            if let Some((latest_seq, newest)) = self.latest_version_in_view(&check.key, &view)?
                 && latest_seq > check.observed_seq
                 // A presence-only read found a value of a key whose bytes
                 // never differ, so only the key being gone (a deletion, or a
                 // range delete over it) can have changed what it decided.
-                && (!check.presence_only || newest_type == VALUE_TYPE_DELETION)
+                && (!check.presence_only() || newest.is_deletion())
             {
                 // A key the transaction *read* always aborts, since the stale
                 // read may have changed what it decided. The commit-level
@@ -357,11 +356,13 @@ impl RegolithEngine {
                 if let Some(s) = self.statistics() {
                     s.add(Ticker::CommitConflictsOnRead, 1);
                 }
-                return Ok(CommitOutcome::Conflict {
-                    key: check.key.clone(),
-                    observed_seq: check.observed_seq,
+                return Ok(CommitOutcome::Conflict(Conflict::new(
+                    check.key.clone(),
+                    check.access,
+                    newest,
+                    check.observed_seq,
                     latest_seq,
-                });
+                )));
             }
         }
         // The merges arrive sorted by key, so a key merged N times in one
@@ -380,14 +381,15 @@ impl RegolithEngine {
             let replaced = checks.blind_merges_commute.then(|| Replaced::of(&ops));
             let mut last_merged: Option<&[u8]> = None;
             for op in &ops {
-                let (key, merged) = match op {
-                    WriteBatchOp::Put { key, .. } | WriteBatchOp::Delete { key } => (key, false),
+                let (key, mine) = match op {
+                    WriteBatchOp::Put { key, .. } => (key, Access::Put),
+                    WriteBatchOp::Delete { key } => (key, Access::Delete),
                     WriteBatchOp::Merge { key, .. } => {
                         if last_merged == Some(key.as_slice()) {
                             continue;
                         }
                         last_merged = Some(key.as_slice());
-                        (key, true)
+                        (key, Access::Merge)
                     }
                     // Range deletes are not validated (transaction.rs:459-460).
                     WriteBatchOp::DeleteRange { .. } => continue,
@@ -414,22 +416,22 @@ impl RegolithEngine {
                 if checks
                     .reads
                     .binary_search_by(|read| read.key.as_slice().cmp(key))
-                    .is_ok_and(|at| !checks.reads[at].presence_only)
+                    .is_ok_and(|at| !checks.reads[at].presence_only())
                 {
                     continue;
                 }
                 // Operands commute, so a key the batch only merges into
                 // conflicts only with a replacement newer than the snapshot,
                 // and one walk settles that and tells whether operands landed
-                // too. The probe below then runs for such a key only once it
-                // is about to conflict anyway.
-                if merged
+                // too. That walk names the replacement, which is the write
+                // that decided the race even when operands sit on top of it.
+                let mut replacement = None;
+                if mine == Access::Merge
                     && let Some(replaced) = &replaced
                     && !replaced.contains(key)
                 {
                     match self.landed_above(key, observed_seq, &view)? {
-                        // The probe below conflicts.
-                        Landed::Replaced => {}
+                        Landed::Replaced { seq, kind } => replacement = Some((seq, kind)),
                         Landed::Operands => {
                             // Operands commute, so a newer merge operand never
                             // invalidates a blind merge: the key is accepted
@@ -440,24 +442,33 @@ impl RegolithEngine {
                         Landed::Nothing => continue,
                     }
                 }
-                if let Some((latest_seq, newest_type)) = self.latest_version_in_view(key, &view)?
+                let newest = match replacement {
+                    Some(newest) => Some(newest),
+                    None => self.latest_version_in_view(key, &view)?,
+                };
+                if let Some((latest_seq, theirs)) = newest
                     && latest_seq > observed_seq
                 {
                     // A blind write of the value the key already holds is not a
                     // conflict: the schedule has a serial equivalent reaching the
-                    // same state.
-                    if self.write_matches_committed(key, &ops, &view, newest_type)? {
+                    // same state. A merge never is one, so a replacement found
+                    // above needs no check.
+                    if replacement.is_none()
+                        && self.write_matches_committed(key, &ops, &view, theirs)?
+                    {
                         writes_elided += 1;
                         continue;
                     }
                     if let Some(s) = self.statistics() {
                         s.add(Ticker::CommitConflictsOnWrite, 1);
                     }
-                    return Ok(CommitOutcome::Conflict {
-                        key: key.clone(),
+                    return Ok(CommitOutcome::Conflict(Conflict::new(
+                        key.clone(),
+                        mine,
+                        theirs,
                         observed_seq,
                         latest_seq,
-                    });
+                    )));
                 }
             }
         }
@@ -467,8 +478,9 @@ impl RegolithEngine {
         // conflict a lost-update check exists to catch. Short-circuit
         // only after the check, never before it.
         if ops.is_empty() {
-            return Ok(CommitOutcome::Ok);
+            return Ok(CommitOutcome::Ok { seq: None });
         }
+        let op_count = ops.len() as u64;
 
         let request = WriteRequest::Batch {
             ops,
@@ -494,7 +506,12 @@ impl RegolithEngine {
                 s.add(Ticker::CommitWritesElided, writes_elided);
             }
         }
-        result.map(|_| CommitOutcome::Ok)
+        // The group is this commit alone, so its base sequence is the first of
+        // the `op_count` this batch took, and the last is where its writes
+        // became visible.
+        result.map(|base_seq| CommitOutcome::Ok {
+            seq: Some(base_seq + op_count - 1),
+        })
     }
 
     /// Hand `request` to the commit pipeline and block until its group is
@@ -859,6 +876,12 @@ impl RegolithEngine {
             self.latch_wal_failure(&rollback_err);
         }
         self.notify_wal_error(cause);
+    }
+
+    /// Tell the registered listeners a commit lost a race. Called after the
+    /// pipeline mutex is released.
+    pub(crate) fn notify_conflict(&self, conflict: &Conflict) {
+        crate::event_listener::dispatch(&self.options.listeners, |l| l.on_conflict(conflict));
     }
 
     /// Tell the registered listeners a write-ahead-log operation failed.

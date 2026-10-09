@@ -59,7 +59,7 @@ fn write_skew_pairs(isolation: IsolationLevel, rounds: usize) -> usize {
                 if seen.as_deref() == Some(b"0".as_ref()) {
                     tx.put(&mine, b"1").expect("write");
                 }
-                matches!(tx.commit(), Ok(()))
+                tx.commit().is_ok()
             }));
         }
         let committed = handles

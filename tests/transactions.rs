@@ -39,13 +39,13 @@ fn decode(raw: Option<Vec<u8>>) -> u64 {
 
 /// Run `attempt` until it commits, retrying only the two retry-able
 /// outcomes. Panics with the attempt budget if it never commits.
-fn commit_with_retry<F>(key: &[u8], mut attempt: F)
+fn commit_with_retry<T, F>(key: &[u8], mut attempt: F)
 where
-    F: FnMut() -> TxResult<()>,
+    F: FnMut() -> TxResult<T>,
 {
     for _ in 0..MAX_ATTEMPTS {
         match attempt() {
-            Ok(()) => return,
+            Ok(_) => return,
             Err(TransactionError::Busy(_)) | Err(TransactionError::Conflict { .. }) => {
                 std::thread::yield_now();
             }
@@ -59,14 +59,14 @@ fn pessimistic_increment(db: &TransactionDb, key: &[u8]) -> TxResult<()> {
     let tx = db.begin(&TxnOptions::new());
     let current = decode(tx.get_for_update(key)?);
     tx.put(key, &(current + 1).to_le_bytes())?;
-    tx.commit()
+    tx.commit().map(|_| ())
 }
 
 fn optimistic_increment(db: &OptimisticTransactionDb, key: &[u8]) -> TxResult<()> {
     let tx = db.begin(&TxnOptions::new());
     let current = decode(tx.get_for_update(key)?);
     tx.put(key, &(current + 1).to_le_bytes())?;
-    tx.commit()
+    tx.commit().map(|_| ())
 }
 
 #[test]

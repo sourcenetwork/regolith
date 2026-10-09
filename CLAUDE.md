@@ -64,6 +64,7 @@ src/
 ├── backup.rs           # BackupEngine and restore flow
 ├── checkpoint.rs       # Hardlinked checkpoint creation
 ├── column_family.rs    # Column-family handles and descriptors
+├── conflict.rs         # Conflict reasons: Conflict, Access, WriteKind
 ├── error.rs            # Error enum, Result alias
 ├── event_listener.rs   # Flush/compaction event callbacks
 ├── iter.rs             # Public iterator wrappers

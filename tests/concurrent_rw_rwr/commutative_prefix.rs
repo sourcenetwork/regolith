@@ -166,10 +166,11 @@ fn heads_overlap(level: IsolationLevel, walk: Walk, storage: Storage) {
                         sync.wait();
                     }
                     match first {
-                        Ok(()) => {
+                        Ok(_) => {
                             first_commits.fetch_add(1, Ordering::Relaxed);
                         }
-                        Err(TransactionError::Conflict { key, .. }) => {
+                        Err(TransactionError::Conflict(conflict)) => {
+                            let key = conflict.key();
                             findings.check(key == fresh(round), || {
                                 format!("{case} round {round}: conflict on {key:?}")
                             });

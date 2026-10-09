@@ -52,7 +52,7 @@ fn stored(db: &TxDb, key: i64) -> Option<Vec<u8>> {
     db.db().get(&key_bytes(key)).unwrap()
 }
 
-fn conflicted(result: TxResult<()>) -> bool {
+fn conflicted<T>(result: TxResult<T>) -> bool {
     matches!(result, Err(TransactionError::Conflict { .. }))
 }
 
@@ -68,7 +68,7 @@ fn commit_second_then_first(
     first.execute(Model::ListAppend, blind, &mut a).unwrap();
     second.execute(Model::ListAppend, blind, &mut b).unwrap();
     b.commit().unwrap();
-    a.commit()
+    a.commit().map(|_| ())
 }
 
 #[test]

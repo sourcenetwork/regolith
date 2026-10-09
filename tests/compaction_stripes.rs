@@ -613,7 +613,7 @@ fn the_range_delete_filter_runs_while_a_snapshot_is_live() {
 // --- DefraLevel ---------------------------------------------------------
 
 /// Whether a commit failed on a conflict.
-fn conflicted(result: TxResult<()>) -> bool {
+fn conflicted<T>(result: TxResult<T>) -> bool {
     matches!(result, Err(TransactionError::Conflict { .. }))
 }
 

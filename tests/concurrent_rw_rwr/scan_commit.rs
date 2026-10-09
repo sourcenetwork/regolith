@@ -86,8 +86,8 @@ fn scan_then_commit<D: Flavour>(db: &D, level: IsolationLevel, storage: Storage,
                 matches!(then, Then::WriteScannedRow) || level == IsolationLevel::Serializable;
             if aborts {
                 match result {
-                    Err(TransactionError::Conflict { key, .. }) => assert_eq!(
-                        key,
+                    Err(TransactionError::Conflict(conflict)) => assert_eq!(
+                        conflict.key(),
                         row(r, OVERWRITTEN),
                         "{level:?} {then:?}: reader {r} conflicts on the overwritten row"
                     ),

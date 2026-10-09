@@ -362,7 +362,7 @@ fn optimistic_transactions_do_not_lose_conflicts_under_group_commit() {
                 txn.put(b"counter", (current + 1).to_string().as_bytes())
                     .unwrap();
                 match txn.commit() {
-                    Ok(()) => {
+                    Ok(_) => {
                         committed.fetch_add(1, Ordering::Relaxed);
                     }
                     Err(_) => {

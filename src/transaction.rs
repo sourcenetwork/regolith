@@ -111,13 +111,15 @@ use crate::sync::{Condvar, Mutex};
 
 use crate::column_family::{DEFAULT_CF_ID, prefix_key};
 use crate::engine::{CommitOutcome, ConflictKey, RegolithEngine, ValidationSet};
-use crate::{Db, DbSlice, Error, Options, Result};
+use crate::{Access, Conflict, Db, DbSlice, Error, Options, Result};
 
 mod policy;
+mod receipt;
 mod scan_range;
 mod txn_options;
 mod write_buffer;
 pub use policy::{KeyClass, KeyClassifier};
+pub use receipt::CommitReceipt;
 use scan_range::{OpenRun, ScanRun};
 pub use txn_options::TxnOptions;
 use write_buffer::{KeyWrites, Write, fold_by_key, read_buffered, settle};
@@ -143,18 +145,12 @@ pub enum TransactionError {
     /// someone else after this transaction first observed it: after
     /// the begin snapshot for an optimistic transaction, or after
     /// the read that the pessimistic transaction is about to
-    /// overwrite. The caller should roll back and retry.
-    #[error(
-        "transaction conflict on key {key:?}: observed seq {observed_seq}, latest seq {latest_seq}"
-    )]
-    Conflict {
-        /// The offending user key.
-        key: Vec<u8>,
-        /// The seq the transaction observed the key at.
-        observed_seq: u64,
-        /// The newest seq found for the key during the commit check.
-        latest_seq: u64,
-    },
+    /// overwrite. The [`Conflict`] says what this transaction did with the
+    /// key and what the newer write was; its message names the reason and
+    /// the sequences but never the key's bytes. The caller should roll back
+    /// and retry.
+    #[error("{0}")]
+    Conflict(Conflict),
     /// A pessimistic transaction could not acquire a key lock in
     /// time. Indicates either high contention or a deadlock; the
     /// caller should roll back and retry (possibly with a
@@ -1125,10 +1121,22 @@ impl Transaction {
     /// into smaller transactions. A commit with no buffered writes never
     /// waits: it validates its read set and returns. A pessimistic
     /// transaction keeps its key locks for the duration of the wait.
-    pub fn commit(mut self) -> TxResult<()> {
+    ///
+    /// A conflict is reported to every [`crate::EventListener`] once, after
+    /// the commit has released the pipeline and this transaction its key
+    /// locks, and then returned as [`TransactionError::Conflict`].
+    ///
+    /// The [`CommitReceipt`] carries the sequence the writes became visible
+    /// at. A commit with no writes returns the sequence of its snapshot.
+    pub fn commit(mut self) -> TxResult<CommitReceipt> {
         let result = self.commit_inner();
         self.resolved = true;
-        // Drop runs the cleanup (release locks, release snapshot).
+        // Locks and snapshot go before a listener runs, so a callback holds
+        // nothing of this transaction. Drop finds them released.
+        self.release_resources();
+        if let Err(TransactionError::Conflict(conflict)) = &result {
+            self.engine.notify_conflict(conflict);
+        }
         result
     }
 
@@ -1140,7 +1148,7 @@ impl Transaction {
         self.release_resources();
     }
 
-    fn commit_inner(&mut self) -> TxResult<()> {
+    fn commit_inner(&mut self) -> TxResult<CommitReceipt> {
         // `&mut self` here means buffering is over, so draining the
         // concurrent buffers cannot race. Every buffer is moved out
         // rather than copied: the transaction is being consumed, so
@@ -1196,28 +1204,21 @@ impl Transaction {
             self.durability,
         )?;
         match outcome {
-            CommitOutcome::Ok => {
+            CommitOutcome::Ok { seq } => {
                 if let Some(s) = self.engine.statistics() {
                     s.add(crate::Ticker::CommitCount, 1);
                     if scan_runs_dropped > 0 {
                         s.add(crate::Ticker::PolicyScanRunsDropped, scan_runs_dropped);
                     }
                 }
-                Ok(())
+                Ok(CommitReceipt::new(seq.unwrap_or(self.snapshot_seq)))
             }
-            CommitOutcome::Conflict {
-                key,
-                observed_seq,
-                latest_seq,
-            } => {
+            CommitOutcome::Conflict(mut conflict) => {
+                conflict.strip_cf_prefix();
                 if let Some(s) = self.engine.statistics() {
                     s.add(crate::Ticker::CommitConflicts, 1);
                 }
-                Err(TransactionError::Conflict {
-                    key: strip_cf_prefix(key),
-                    observed_seq,
-                    latest_seq,
-                })
+                Err(TransactionError::Conflict(conflict))
             }
         }
     }
@@ -1301,7 +1302,11 @@ impl Transaction {
                 key,
                 observed_seq: state.first_read_seq,
                 found: state.found.load(Ordering::Acquire),
-                presence_only: false,
+                access: if state.for_update.load(Ordering::Acquire) {
+                    Access::ReadForUpdate
+                } else {
+                    Access::Read
+                },
             })
             .collect();
         ValidationSet {
@@ -1885,7 +1890,7 @@ mod record_limit_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Statistics, Ticker};
+    use crate::{Statistics, Ticker, WriteKind};
     use tempfile::TempDir;
 
     fn opt_db() -> (OptimisticTransactionDb, TempDir) {
@@ -1959,8 +1964,12 @@ mod tests {
         db.db().put(b"k", b"v1").unwrap();
         tx1.put(b"k", b"v2").unwrap();
         match tx1.commit() {
-            Err(TransactionError::Conflict { key, .. }) => {
-                assert_eq!(key, b"k".to_vec());
+            Err(TransactionError::Conflict(conflict)) => {
+                assert_eq!(conflict.key(), b"k");
+                assert_eq!(
+                    (conflict.mine(), conflict.theirs()),
+                    (Access::Read, WriteKind::Put)
+                );
             }
             other => panic!("expected conflict, got {other:?}"),
         }
@@ -1980,8 +1989,9 @@ mod tests {
         // conflict detection, so commit must still detect.
         tx.put(b"other", b"stuff").unwrap();
         match tx.commit() {
-            Err(TransactionError::Conflict { key, .. }) => {
-                assert_eq!(key, b"k".to_vec());
+            Err(TransactionError::Conflict(conflict)) => {
+                assert_eq!(conflict.key(), b"k");
+                assert_eq!(conflict.mine(), Access::ReadForUpdate);
             }
             other => panic!("expected conflict, got {other:?}"),
         }
@@ -1999,7 +2009,7 @@ mod tests {
         db.db().put(b"z", b"v1").unwrap();
         db.db().put(b"a", b"v1").unwrap();
         match tx.commit() {
-            Err(TransactionError::Conflict { key, .. }) => assert_eq!(key, b"a".to_vec()),
+            Err(TransactionError::Conflict(conflict)) => assert_eq!(conflict.key(), b"a"),
             other => panic!("expected conflict, got {other:?}"),
         }
     }
@@ -2291,7 +2301,7 @@ mod tests {
         db.db().put(b"k", b"racer").unwrap();
         tx.put(b"k", b"mine").unwrap();
         match tx.commit() {
-            Err(TransactionError::Conflict { key, .. }) => assert_eq!(key, b"k".to_vec()),
+            Err(TransactionError::Conflict(conflict)) => assert_eq!(conflict.key(), b"k"),
             other => panic!("expected conflict, got {other:?}"),
         }
         assert_eq!(db.db().get(b"k").unwrap(), Some(b"racer".to_vec()));

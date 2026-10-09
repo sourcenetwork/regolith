@@ -217,6 +217,16 @@ check sees it.
 `TransactionDb` is the pessimistic flavour: it takes key locks, so contention waits
 instead of retrying. `OptimisticTransactionDb` validates at commit and retries.
 
+A commit that loses a race returns `TransactionError::Conflict`. Its `Conflict` names the
+key, what the transaction did with it (`Access`) and the newer write that won
+(`WriteKind`), with the two sequences. Its message gives the key's length and a short hash,
+never its bytes, since a key can hold user data. An `EventListener::on_conflict` hears each
+conflict once, after the commit released its locks, so a caller can count the reasons.
+
+`commit` returns a `CommitReceipt` whose `seq()` is the sequence its writes became visible
+at, or the snapshot's sequence for a commit that wrote nothing. A sequence orders commits
+within one database; do not keep it across `drop_all` or in a restored database.
+
 Buffering a read or a write takes `&self`, so one transaction can be shared across
 threads without a lock around it. The write buffer and the read set are lock-free, and
 every read is folded into the commit-time validation set no matter which thread recorded

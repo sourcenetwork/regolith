@@ -106,7 +106,7 @@ fn a_transaction_fits_a_static_trait_object() {
     impl Unit for Transaction {
         fn run(self: Box<Self>) -> Result<(), TransactionError> {
             self.put(b"boxed", b"value")?;
-            (*self).commit()
+            (*self).commit().map(|_| ())
         }
     }
 

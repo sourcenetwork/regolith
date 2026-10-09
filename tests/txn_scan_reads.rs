@@ -49,7 +49,7 @@ fn scanned_keys(stream: regolith::TxnScanStream<'_>) -> Vec<Vec<u8>> {
     stream.map(|(key, _)| key).collect()
 }
 
-fn is_conflict(r: &regolith::TxResult<()>) -> bool {
+fn is_conflict<T>(r: &regolith::TxResult<T>) -> bool {
     matches!(r, Err(TransactionError::Conflict { .. }))
 }
 
@@ -86,7 +86,7 @@ fn serializable_aborts_when_a_scanned_key_is_overwritten() {
     a.put(b"other", b"1").unwrap();
 
     match a.commit() {
-        Err(TransactionError::Conflict { key, .. }) => assert_eq!(key, b"k".to_vec()),
+        Err(TransactionError::Conflict(conflict)) => assert_eq!(conflict.key(), b"k"),
         other => panic!("expected a conflict on k, got {other:?}"),
     }
 }
@@ -305,7 +305,7 @@ fn reverse_and_prefix_scans_record_their_keys_too() {
         db.db().put(b"k", b"1").unwrap();
         a.put(b"other", b"1").unwrap();
         match a.commit() {
-            Err(TransactionError::Conflict { key, .. }) => assert_eq!(key, b"k".to_vec()),
+            Err(TransactionError::Conflict(conflict)) => assert_eq!(conflict.key(), b"k"),
             other => panic!("expected a conflict on k, got {other:?}"),
         }
     }
@@ -336,7 +336,7 @@ fn reverse_and_prefix_scans_record_their_keys_too() {
         db.db().put(b"p:k", b"1").unwrap();
         a.put(b"other", b"1").unwrap();
         match a.commit() {
-            Err(TransactionError::Conflict { key, .. }) => assert_eq!(key, b"p:k".to_vec()),
+            Err(TransactionError::Conflict(conflict)) => assert_eq!(conflict.key(), b"p:k"),
             other => panic!("expected a conflict on p:k, got {other:?}"),
         }
     }
@@ -416,7 +416,7 @@ fn advance(
             (Step::Ready(txn), false)
         }
         Step::Ready(txn) => match txn.commit() {
-            Ok(()) => (Step::Committed, false),
+            Ok(_) => (Step::Committed, false),
             Err(TransactionError::Conflict { .. }) => (Step::NotBegun, true),
             Err(e) => panic!("unexpected transaction error: {e}"),
         },
@@ -811,7 +811,7 @@ fn repeatable_read_aborts_when_a_point_read_key_is_overwritten() {
     a.put(b"other", b"1").unwrap();
 
     match a.commit() {
-        Err(TransactionError::Conflict { key, .. }) => assert_eq!(key, b"k".to_vec()),
+        Err(TransactionError::Conflict(conflict)) => assert_eq!(conflict.key(), b"k"),
         other => panic!("expected a conflict on k, got {other:?}"),
     }
 
@@ -827,7 +827,7 @@ fn repeatable_read_aborts_when_a_point_read_key_is_overwritten() {
     a.put(b"other", b"1").unwrap();
 
     match a.commit() {
-        Err(TransactionError::Conflict { key, .. }) => assert_eq!(key, b"k".to_vec()),
+        Err(TransactionError::Conflict(conflict)) => assert_eq!(conflict.key(), b"k"),
         other => panic!("pessimistic: expected a conflict on k, got {other:?}"),
     }
 }

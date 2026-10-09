@@ -193,7 +193,7 @@ fn bump(db: &dyn TxnDb, key: &[u8]) -> Attempts {
             continue;
         }
         match tx.commit() {
-            Ok(()) => {
+            Ok(_) => {
                 acc.commits += 1;
                 return acc;
             }

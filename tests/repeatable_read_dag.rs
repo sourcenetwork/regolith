@@ -108,7 +108,7 @@ fn try_append(
                 .unwrap_or_else(|e| panic!("put marker {parent}/{block}: {e}"));
         }
         match txn.commit() {
-            Ok(()) => {
+            Ok(_) => {
                 log.lock()
                     .unwrap_or_else(|e| panic!("log lock: {e}"))
                     .push((block, heads));
@@ -157,7 +157,7 @@ fn try_prune(db: &OptimisticTransactionDb, level: IsolationLevel, conflicts: &At
             }
         }
         match txn.commit() {
-            Ok(()) => return,
+            Ok(_) => return,
             Err(TransactionError::Busy(_)) => continue,
             Err(TransactionError::Conflict { .. }) => {
                 conflicts.fetch_add(1, Ordering::Relaxed);
@@ -382,7 +382,7 @@ fn repeatable_read_read_modify_write_of_a_register_never_loses_an_update() {
             txn.put(b"counter", &(current + 1).to_le_bytes())
                 .unwrap_or_else(|e| panic!("write counter: {e}"));
             match txn.commit() {
-                Ok(()) => return,
+                Ok(_) => return,
                 Err(TransactionError::Conflict { .. } | TransactionError::Busy(_)) => {
                     thread::yield_now();
                 }

@@ -289,7 +289,7 @@ pub fn run_txn(db: &TxDb, model: Model, plan: &TxnPlan) -> Outcome {
         let mut tx = db.begin();
         match plan.execute(model, db.blind_appends(), &mut tx) {
             Ok(observed) => match tx.commit() {
-                Ok(()) => return Outcome::Committed(observed),
+                Ok(_) => return Outcome::Committed(observed),
                 Err(TransactionError::Conflict { .. }) | Err(TransactionError::Busy(_)) => {
                     last_retryable = true;
                 }

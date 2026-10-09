@@ -67,7 +67,7 @@ fn open(dir: &std::path::Path, stats: Arc<Statistics>) -> OptimisticTransactionD
         .with_policy(Arc::new(HeadPrefix))
 }
 
-fn conflicted(result: TxResult<()>) -> bool {
+fn conflicted<T>(result: TxResult<T>) -> bool {
     matches!(result, Err(TransactionError::Conflict { .. }))
 }
 

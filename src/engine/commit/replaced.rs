@@ -260,7 +260,7 @@ mod tests {
     #[test]
     fn a_merge_beside_a_newer_operand_commits_unless_the_batch_range_deletes_its_key() {
         let outcome = commit_beside_a_newer_operand(Vec::new());
-        assert!(matches!(outcome, CommitOutcome::Ok), "{outcome:?}");
+        assert!(matches!(outcome, CommitOutcome::Ok { .. }), "{outcome:?}");
 
         let outcome = commit_beside_a_newer_operand(vec![(key_of(b"a"), key_of(b"z"))]);
         assert!(
@@ -269,7 +269,7 @@ mod tests {
         );
 
         let outcome = commit_beside_a_newer_operand(vec![(key_of(b"a"), key_of(b"k"))]);
-        assert!(matches!(outcome, CommitOutcome::Ok), "{outcome:?}");
+        assert!(matches!(outcome, CommitOutcome::Ok { .. }), "{outcome:?}");
     }
 
     /// A key of up to two letters over `a..=d`, the empty key included.

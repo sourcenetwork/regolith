@@ -1,4 +1,5 @@
-//! Lifecycle event callbacks for flush, compaction, and ingest.
+//! Lifecycle event callbacks for flush, compaction, ingest, and transaction
+//! conflicts.
 //!
 //! Callers register one or more [`EventListener`] implementations via
 //! [`crate::Options::listeners`] to react to engine lifecycle events.
@@ -13,8 +14,10 @@
 //! triggered them - flush events on the thread that ran the flush (a
 //! writer, or an ingest writing out the memtables written before it),
 //! compaction events on the compaction thread, ingest events on
-//! the ingest caller's thread. Listeners **MUST NOT block** or re-enter
-//! the database. The contract is "do a cheap thing or spawn a task."
+//! the ingest caller's thread, conflict events on the thread whose commit
+//! lost the race, once the commit has released its locks. Listeners
+//! **MUST NOT block** or re-enter the database. The contract is "do a
+//! cheap thing or spawn a task."
 //! Blocking inside a listener stalls the engine and will starve
 //! background compaction / flush pipelines.
 //!
@@ -31,7 +34,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use crate::Error;
+use crate::{Conflict, Error};
 
 /// Why the flush / compaction path chose to produce a file, used
 /// by [`TableFileCreationInfo::reason`].
@@ -215,6 +218,15 @@ pub trait EventListener: Send + Sync + 'static {
     fn on_background_error(&self, reason: BackgroundErrorReason, err: &Error) {
         let _ = (reason, err);
     }
+
+    /// Called once for each transaction commit that lost a race, on the
+    /// thread that committed, after the commit released its locks. The
+    /// [`Conflict`] says what the transaction did with the key and what the
+    /// newer write was, so a caller can count the reasons in its own
+    /// telemetry.
+    fn on_conflict(&self, conflict: &Conflict) {
+        let _ = conflict;
+    }
 }
 
 /// Dispatch a closure over every listener in a slice. Silences
@@ -232,6 +244,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{Access, WriteKind};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -300,6 +313,13 @@ mod tests {
         n.on_flush_completed(&sample_flush());
         n.on_compaction_begin(&sample_compaction());
         n.on_compaction_completed(&sample_compaction());
+        n.on_conflict(&Conflict::new(
+            b"k".to_vec(),
+            Access::Read,
+            WriteKind::Put,
+            1,
+            2,
+        ));
         // No panic reaching here is the assertion.
     }
 

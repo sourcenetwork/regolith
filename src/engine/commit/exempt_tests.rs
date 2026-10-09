@@ -8,8 +8,8 @@ use tempfile::TempDir;
 
 use super::super::{ConflictKey, EngineOptions, ValidationSet};
 use super::*;
-use crate::WriteBatchOp;
 use crate::column_family::{DEFAULT_CF_ID, prefix_key};
+use crate::{Access, WriteBatchOp, WriteKind};
 
 /// `name` as the default column family stores it.
 fn key_of(name: &[u8]) -> Vec<u8> {
@@ -60,7 +60,7 @@ fn commit_after_newer_writes(exempt: &[&[u8]], puts: &[&[u8]], merged: &[&[u8]])
 #[test]
 fn an_exempt_key_is_written_beside_a_newer_write_and_an_ordinary_key_is_not() {
     let outcome = commit_after_newer_writes(&[b"c"], &[b"c"], &[]);
-    assert!(matches!(outcome, CommitOutcome::Ok), "{outcome:?}");
+    assert!(matches!(outcome, CommitOutcome::Ok { .. }), "{outcome:?}");
 
     let outcome = commit_after_newer_writes(&[], &[b"c"], &[]);
     assert!(
@@ -69,16 +69,20 @@ fn an_exempt_key_is_written_beside_a_newer_write_and_an_ordinary_key_is_not() {
     );
 
     let outcome = commit_after_newer_writes(&[b"c"], &[b"a", b"c"], &[]);
-    let CommitOutcome::Conflict { key, .. } = outcome else {
+    let CommitOutcome::Conflict(conflict) = outcome else {
         panic!("the ordinary key beside the exempt one must conflict: {outcome:?}");
     };
-    assert_eq!(key, key_of(b"a"));
+    assert_eq!(conflict.key(), key_of(b"a"));
+    assert_eq!(
+        (conflict.mine(), conflict.theirs()),
+        (Access::Put, WriteKind::Put)
+    );
 }
 
 #[test]
 fn an_exempt_key_is_merged_beside_a_newer_write_and_an_ordinary_key_is_not() {
     let outcome = commit_after_newer_writes(&[b"c"], &[], &[b"c"]);
-    assert!(matches!(outcome, CommitOutcome::Ok), "{outcome:?}");
+    assert!(matches!(outcome, CommitOutcome::Ok { .. }), "{outcome:?}");
 
     let outcome = commit_after_newer_writes(&[], &[], &[b"c"]);
     assert!(
@@ -87,10 +91,14 @@ fn an_exempt_key_is_merged_beside_a_newer_write_and_an_ordinary_key_is_not() {
     );
 
     let outcome = commit_after_newer_writes(&[b"c"], &[], &[b"a", b"c"]);
-    let CommitOutcome::Conflict { key, .. } = outcome else {
+    let CommitOutcome::Conflict(conflict) = outcome else {
         panic!("the ordinary key beside the exempt one must conflict: {outcome:?}");
     };
-    assert_eq!(key, key_of(b"a"));
+    assert_eq!(conflict.key(), key_of(b"a"));
+    assert_eq!(
+        (conflict.mine(), conflict.theirs()),
+        (Access::Merge, WriteKind::Put)
+    );
 }
 
 fn put_c() -> WriteBatchOp {
@@ -140,7 +148,11 @@ fn commit_read_of_a_present_key(
             key: key_of(b"c"),
             observed_seq: observed,
             found: true,
-            presence_only,
+            access: if presence_only {
+                Access::ReadPresence
+            } else {
+                Access::Read
+            },
         }],
         writes_at: Some(observed),
         blind_merges_commute: false,
@@ -164,7 +176,7 @@ fn a_presence_only_read_is_lost_only_when_its_key_is_gone() {
     for flush in [false, true] {
         let committed = |history: Vec<WriteBatchOp>, presence_only: bool| {
             let outcome = commit_read_of_a_present_key(history, presence_only, false, flush);
-            matches!(outcome, CommitOutcome::Ok)
+            matches!(outcome, CommitOutcome::Ok { .. })
         };
         assert!(
             committed(vec![put_c()], true),
@@ -201,11 +213,16 @@ fn a_presence_only_read_is_lost_only_when_its_key_is_gone() {
 fn a_presence_only_read_does_not_stand_for_a_delete_of_the_same_key() {
     for flush in [false, true] {
         let outcome = commit_read_of_a_present_key(vec![put_c()], true, true, flush);
-        let CommitOutcome::Conflict { key, .. } = outcome else {
+        let CommitOutcome::Conflict(conflict) = outcome else {
             panic!(
                 "flush={flush}: the delete is checked on its own against the newer put: {outcome:?}"
             );
         };
-        assert_eq!(key, key_of(b"c"));
+        assert_eq!(conflict.key(), key_of(b"c"));
+        assert_eq!(
+            (conflict.mine(), conflict.theirs()),
+            (Access::Delete, WriteKind::Put),
+            "flush={flush}"
+        );
     }
 }

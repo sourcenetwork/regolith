@@ -92,7 +92,7 @@ fn counter(db: &OptimisticTransactionDb) -> i64 {
     )
 }
 
-fn conflicted(result: TxResult<()>) -> bool {
+fn conflicted<T>(result: TxResult<T>) -> bool {
     matches!(result, Err(TransactionError::Conflict { .. }))
 }
 
@@ -377,8 +377,8 @@ fn a_merged_key_inside_a_scanned_stretch_is_a_read_unless_the_stretch_is_commuta
                 let name = format!("{newer:?} flush={flush} {}", String::from_utf8_lossy(key));
                 if conflicts {
                     match committed {
-                        Err(TransactionError::Conflict { key: named, .. }) => {
-                            assert_eq!(named, key, "{name}");
+                        Err(TransactionError::Conflict(conflict)) => {
+                            assert_eq!(conflict.key(), key, "{name}");
                         }
                         other => panic!("{name}: expected a conflict, got {other:?}"),
                     }

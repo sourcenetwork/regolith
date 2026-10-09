@@ -44,6 +44,9 @@ pub(crate) struct Skip {
     /// or any entry at or below it. `None` when the key's entries here ran
     /// out first.
     pub(crate) stop: Option<u64>,
+    /// The value type of the entry `stop` names. Meaningless when `stop` is
+    /// `None`.
+    pub(crate) stop_type: u8,
 }
 
 impl ReadView {

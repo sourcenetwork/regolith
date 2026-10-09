@@ -38,13 +38,13 @@ fn decode(raw: Option<Vec<u8>>) -> u64 {
 
 /// Run `attempt` until it commits, retrying only the two retry-able
 /// outcomes. Panics with the attempt budget if it never commits.
-fn commit_with_retry<F>(what: &str, mut attempt: F)
+fn commit_with_retry<T, F>(what: &str, mut attempt: F)
 where
-    F: FnMut() -> TxResult<()>,
+    F: FnMut() -> TxResult<T>,
 {
     for _ in 0..MAX_ATTEMPTS {
         match attempt() {
-            Ok(()) => return,
+            Ok(_) => return,
             Err(TransactionError::Busy(_)) | Err(TransactionError::Conflict { .. }) => {
                 std::thread::yield_now();
             }
@@ -494,7 +494,7 @@ fn a_blind_write_conflicts_with_a_range_delete_that_landed_after_begin() {
         assert!(
             matches!(
                 tx.commit(),
-                Err(TransactionError::Conflict { ref key, .. }) if key == b"k"
+                Err(TransactionError::Conflict(ref conflict)) if conflict.key() == b"k"
             ),
             "{level:?}: a range delete landing after begin must conflict with a blind write"
         );

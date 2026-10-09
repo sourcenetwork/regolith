@@ -12,6 +12,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use crate::Access;
 use crate::engine::ValidationSet;
 use crate::transaction::IsolationLevel;
 
@@ -207,10 +208,13 @@ pub(super) fn exempt_content_addressed(
         }
         // A key the commit puts or merges was classified above, and is not
         // exempt.
-        read.presence_only = read.found
+        if read.found
             && !is_put(&read.key)
             && merged.binary_search(&read.key.as_slice()).is_err()
-            && content_addressed(&read.key);
+            && content_addressed(&read.key)
+        {
+            read.access = Access::ReadPresence;
+        }
         true
     });
     checks.exempt = exempt;
@@ -254,7 +258,7 @@ mod tests {
             key: key(name),
             observed_seq: 3,
             found,
-            presence_only: false,
+            access: Access::Read,
         }
     }
 
@@ -272,7 +276,7 @@ mod tests {
         checks
             .reads
             .iter()
-            .map(|read| (read.key.clone(), read.presence_only))
+            .map(|read| (read.key.clone(), read.presence_only()))
             .collect()
     }
 

@@ -138,7 +138,7 @@ fn decode(raw: Option<Vec<u8>>) -> u64 {
     })
 }
 
-fn retryable(result: &TxResult<()>) -> bool {
+fn retryable<T>(result: &TxResult<T>) -> bool {
     matches!(
         result,
         Err(TransactionError::Busy(_) | TransactionError::Conflict { .. })
@@ -163,11 +163,11 @@ fn back_off(refused: usize) {
 /// Bounded twice, by attempts and by `RETRY_DEADLINE`, with a growing
 /// back-off between attempts, so a livelock fails loudly and a slow machine
 /// is not hammered while it waits.
-fn commit_with_retry(what: &str, mut attempt: impl FnMut() -> TxResult<()>) -> u64 {
+fn commit_with_retry<T>(what: &str, mut attempt: impl FnMut() -> TxResult<T>) -> u64 {
     let deadline = Instant::now() + RETRY_DEADLINE;
     for refused in 0..MAX_ATTEMPTS {
         match attempt() {
-            Ok(()) => return refused as u64,
+            Ok(_) => return refused as u64,
             result if retryable(&result) => back_off(refused),
             Err(e) => panic!("{what}: unexpected transaction error: {e}"),
         }
@@ -342,7 +342,7 @@ fn transfer(db: &impl Flavour, level: IsolationLevel, from: u64, to: u64) -> TxR
     }
     tx.put(&account(from), &encode(a - 1))?;
     tx.put(&account(to), &encode(b + 1))?;
-    tx.commit()
+    tx.commit().map(|_| ())
 }
 
 fn audit(tx: &Transaction) -> u64 {

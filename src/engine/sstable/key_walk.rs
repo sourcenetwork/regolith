@@ -74,13 +74,17 @@ impl SsTableReader {
         let mut passed = false;
         let stop = self.scan_key(lk, key_buf, cache, |_, seq, vt, _, _| {
             if seq <= floor || vt != VALUE_TYPE_MERGE {
-                ControlFlow::Break(seq)
+                ControlFlow::Break((seq, vt))
             } else {
                 passed = true;
                 ControlFlow::Continue(())
             }
         })?;
-        Ok(Skip { passed, stop })
+        Ok(Skip {
+            passed,
+            stop: stop.map(|(seq, _)| seq),
+            stop_type: stop.map_or(0, |(_, vt)| vt),
+        })
     }
 
     /// Visits `lk`'s entries newest first from the lookup's snapshot, carrying
@@ -216,8 +220,8 @@ mod tests {
         count
     }
 
-    /// `skip_merges_above` for `key` read at `snapshot_seq`.
-    fn skip(
+    /// `skip_merges_above` for `key` read at `snapshot_seq`, as reported.
+    fn skip_typed(
         reader: &SsTableReader,
         cache: &BlockCache,
         key: &[u8],
@@ -230,9 +234,57 @@ mod tests {
             .unwrap()
     }
 
+    /// [`skip_typed`] without the stop's value type, which the model test and
+    /// `the_stop_names_the_value_type_of_the_entry_it_ended_at` check apart, so
+    /// the cases below stay about where the skip ended.
+    fn skip(
+        reader: &SsTableReader,
+        cache: &BlockCache,
+        key: &[u8],
+        snapshot_seq: u64,
+        floor: u64,
+    ) -> Skip {
+        Skip {
+            stop_type: 0,
+            ..skip_typed(reader, cache, key, snapshot_seq, floor)
+        }
+    }
+
     /// A skip that passed an operand or not, and stopped at `stop`.
     fn ended(passed: bool, stop: Option<u64>) -> Skip {
-        Skip { passed, stop }
+        Skip {
+            passed,
+            stop,
+            stop_type: 0,
+        }
+    }
+
+    #[test]
+    fn the_stop_names_the_value_type_of_the_entry_it_ended_at() {
+        let mut entries = vec![(b"k".as_slice(), 1, Kind::Put)];
+        entries.extend(operands(b"k", 2..=3));
+        entries.push((b"k", 4, Kind::Delete));
+        entries.extend(operands(b"k", 5..=6));
+        entries.push((b"l", 7, Kind::Put));
+        for_both_indexes(&entries, |reader, cache| {
+            let stopped = skip_typed(reader, cache, b"k", u64::MAX, 0);
+            assert_eq!(
+                (stopped.passed, stopped.stop, stopped.stop_type),
+                (true, Some(4), VALUE_TYPE_DELETION)
+            );
+            let stopped = skip_typed(reader, cache, b"l", u64::MAX, 0);
+            assert_eq!(
+                (stopped.stop, stopped.stop_type),
+                (Some(7), VALUE_TYPE_VALUE)
+            );
+            // At the floor the skip stops on whatever entry is there, an
+            // operand included.
+            let stopped = skip_typed(reader, cache, b"k", u64::MAX, 6);
+            assert_eq!(
+                (stopped.stop, stopped.stop_type),
+                (Some(6), VALUE_TYPE_MERGE)
+            );
+        });
     }
 
     /// `collect_merge_chain` for `key` read at `snapshot_seq`.
@@ -272,6 +324,7 @@ mod tests {
         for (_, seq, kind) in visible(entries, key, snapshot_seq) {
             if seq <= floor || kind != Kind::Merge {
                 skip.stop = Some(seq);
+                skip.stop_type = kind.value_type();
                 break;
             }
             skip.passed = true;
@@ -577,7 +630,7 @@ mod tests {
                 let cache = BlockCache::new(1024 * 1024);
                 for key in KEYS.into_iter().chain([b"absent".as_slice()]) {
                     prop_assert_eq!(
-                        skip(&reader, &cache, key, snapshot_seq, floor),
+                        skip_typed(&reader, &cache, key, snapshot_seq, floor),
                         model_skip(&entries, key, snapshot_seq, floor),
                         "skip, partitioned={}", partitioned
                     );

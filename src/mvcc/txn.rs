@@ -56,6 +56,7 @@ use kovan_mvcc::{IsolationLevel as MvccIsolation, KovanMVCC, MvccError};
 use super::storage::RegolithStorage;
 use crate::engine::{DurabilityMode, RegolithEngine};
 use crate::transaction::{IsolationLevel, TransactionError, TxResult};
+use crate::{Access, Conflict, WriteKind};
 
 /// Transactions over one database, executed by kovan-mvcc.
 pub(crate) struct MvccTransactions {
@@ -259,6 +260,12 @@ impl MvccTxn<'_> {
     }
 }
 
+/// A conflict on `key` that this transaction met as `mine`, lost to a put
+/// committed at `latest_seq`.
+fn conflict(key: Vec<u8>, mine: Access, latest_seq: u64) -> TransactionError {
+    TransactionError::Conflict(Conflict::new(key, mine, WriteKind::Put, 0, latest_seq))
+}
+
 /// Map kovan-mvcc's failures onto regolith's.
 ///
 /// The distinction that matters to a caller is whether retrying can
@@ -267,23 +274,19 @@ impl MvccTxn<'_> {
 fn map_error(err: MvccError) -> TransactionError {
     match err {
         MvccError::LockConflict { key, .. } => TransactionError::Busy(key),
+        // kovan-mvcc reports neither the sequence this transaction observed
+        // nor the kind of the write that won, so the reason below is the
+        // commonest one and the sequence 0 says "not reported". The adapter is
+        // not wired to a database.
         MvccError::WriteConflict {
             key,
             conflicting_ts,
-        }
-        | MvccError::SerializationFailure {
+        } => conflict(key, Access::Put, conflicting_ts),
+        MvccError::SerializationFailure {
             key,
             conflicting_ts,
-        } => TransactionError::Conflict {
-            key,
-            observed_seq: 0,
-            latest_seq: conflicting_ts,
-        },
-        MvccError::RollbackRecord { key } => TransactionError::Conflict {
-            key,
-            observed_seq: 0,
-            latest_seq: 0,
-        },
+        } => conflict(key, Access::Read, conflicting_ts),
+        MvccError::RollbackRecord { key } => conflict(key, Access::Put, 0),
         MvccError::PrimaryLockMissing { .. } | MvccError::PrimaryLockMismatch => {
             TransactionError::from(std::io::Error::other(
                 "transaction lost its primary lock, which means another writer \

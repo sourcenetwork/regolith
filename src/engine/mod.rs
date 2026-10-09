@@ -65,7 +65,7 @@ use snapshot_registry::SnapshotRegistry;
 use source_walk::Source;
 
 use crate::env::{Capabilities, Env, FileLock};
-use crate::{DbSlice, WriteBatchOp, event_listener};
+use crate::{Access, Conflict, DbSlice, WriteBatchOp, WriteKind, event_listener};
 use sstable::{
     LiveSst, LookupResult, Materialize, PointValue, SsTableMeta, SsTableReader, SsTableWriter,
     sst_filename,
@@ -86,12 +86,11 @@ pub(crate) enum DurabilityMode {
 /// the caller typically surfaces this as a retry-able error.
 #[derive(Debug)]
 pub(crate) enum CommitOutcome {
-    Ok,
-    Conflict {
-        key: Vec<u8>,
-        observed_seq: u64,
-        latest_seq: u64,
-    },
+    /// The commit validated. `seq` is the sequence its writes became visible
+    /// at, and `None` for a commit that carried no write.
+    Ok { seq: Option<u64> },
+    /// The reason, with the key still carrying its column-family prefix.
+    Conflict(Conflict),
 }
 
 /// Lay a commit's writes out as one batch: point operations in ascending key
@@ -154,11 +153,21 @@ pub(crate) struct ConflictKey {
     /// with a key classifier, which narrows it to `presence_only`; the
     /// commit does not look at it.
     pub found: bool,
-    /// The read returned a value of a key whose bytes never differ, so it
-    /// is lost only when the key is gone: a newer version conflicts only if
-    /// the newest is a deletion, a covering range delete included. It does
-    /// not stand for a write of the same key, which takes its own check.
-    pub presence_only: bool,
+    /// What the transaction did with the key, which is what a conflict on it
+    /// reports. [`Access::ReadPresence`] marks a read of a key whose bytes
+    /// never differ that returned a value, so it is lost only when the key
+    /// is gone: see [`ConflictKey::presence_only`].
+    pub access: Access,
+}
+
+impl ConflictKey {
+    /// The read returned a value of a key whose bytes never differ, so a newer
+    /// version conflicts only if the newest is a deletion, a covering range
+    /// delete included. It does not stand for a write of the same key, which
+    /// takes its own check.
+    pub fn presence_only(&self) -> bool {
+        self.access == Access::ReadPresence
+    }
 }
 
 /// What a commit validates on top of the operations it carries.
@@ -2165,12 +2174,12 @@ impl RegolithEngine {
         key: &[u8],
         ops: &[WriteBatchOp],
         view: &ReadView,
-        newest_type: u8,
+        newest: WriteKind,
     ) -> std::io::Result<bool> {
         // Unresolved merge operands on top mean a point read replays them, so
         // what it returns is not what this key stores. Beneath a newest value
         // or deletion, any operands are already folded and the read is exact.
-        if newest_type == internal_key::VALUE_TYPE_MERGE {
+        if newest == WriteKind::Merge {
             return Ok(false);
         }
 
@@ -2221,10 +2230,10 @@ impl RegolithEngine {
         })
     }
 
-    /// Return the sequence number and value type of the newest write that
+    /// Return the sequence number and kind of the newest write that
     /// touched `key` across every source, or `None` if nothing ever wrote
     /// it. A covering range tombstone that outranks every point entry
-    /// reports as a deletion.
+    /// reports as a range delete.
     /// Used by transaction commit to detect conflicts, so it counts
     /// every kind of write: point entries, point tombstones, merge
     /// operands, and range tombstones that cover the key. The caller
@@ -2238,9 +2247,7 @@ impl RegolithEngine {
         &self,
         key: &[u8],
         view: &ReadView,
-    ) -> std::io::Result<Option<(u64, u8)>> {
-        use internal_key::VALUE_TYPE_DELETION;
-
+    ) -> std::io::Result<Option<(u64, WriteKind)>> {
         let snap = u64::MAX;
         let lk = LookupKey::from_prefixed(key, snap);
         let walked = view.walk_newest_first(key, snap, |source, max_rt_seq| {
@@ -2251,19 +2258,21 @@ impl RegolithEngine {
                 }
             };
             // A covering range tombstone that outranks the point entry
-            // stands in for it, as a deletion.
+            // stands in for it.
             Ok(match version {
                 Some((point_seq, _)) if max_rt_seq > point_seq => {
-                    ControlFlow::Break((max_rt_seq, VALUE_TYPE_DELETION))
+                    ControlFlow::Break((max_rt_seq, WriteKind::RangeDelete))
                 }
-                Some(version) => ControlFlow::Break(version),
+                Some((seq, value_type)) => {
+                    ControlFlow::Break((seq, internal_key::write_kind(value_type)))
+                }
                 None => ControlFlow::Continue(()),
             })
         })?;
         Ok(match walked {
             ControlFlow::Break(version) => Some(version),
             ControlFlow::Continue(max_rt_seq) => {
-                (max_rt_seq > 0).then_some((max_rt_seq, VALUE_TYPE_DELETION))
+                (max_rt_seq > 0).then_some((max_rt_seq, WriteKind::RangeDelete))
             }
         })
     }

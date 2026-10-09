@@ -56,6 +56,7 @@
 mod backup;
 mod checkpoint;
 mod column_family;
+mod conflict;
 mod engine;
 pub mod env;
 mod error;
@@ -79,6 +80,7 @@ mod txn_buffer;
 pub use backup::{BackupEngine, BackupId, BackupInfo};
 pub use checkpoint::Checkpoint;
 pub use column_family::{ColumnFamilyHandle, DEFAULT_CF_NAME};
+pub use conflict::{Access, Conflict, WriteKind};
 pub use engine::compaction::CompactionOutcome;
 #[cfg(target_os = "wasi")]
 pub use env::WasiEnv;
@@ -104,16 +106,16 @@ pub use statistics::{Histogram, HistogramSnapshot, Statistics, Ticker};
 pub use stream_writer::{StreamOptions, StreamingWriter};
 pub use tailing::TailingIter;
 pub use transaction::{
-    IsolationLevel, KeyClass, KeyClassifier, OptimisticTransactionDb, ScanDirection, Transaction,
-    TransactionDb, TransactionError, TxResult, TxnOptions, TxnScanStream,
+    CommitReceipt, IsolationLevel, KeyClass, KeyClassifier, OptimisticTransactionDb, ScanDirection,
+    Transaction, TransactionDb, TransactionError, TxResult, TxnOptions, TxnScanStream,
 };
 
 /// The transactional API and the traits a caller implements, in one import:
 /// `use regolith::prelude::*;`.
 pub mod prelude {
     pub use crate::{
-        Db, IsolationLevel, KeyClass, KeyClassifier, MergeOperator, OptimisticTransactionDb,
-        Options, Transaction, TransactionError, TxResult, TxnOptions,
+        CommitReceipt, Conflict, Db, IsolationLevel, KeyClass, KeyClassifier, MergeOperator,
+        OptimisticTransactionDb, Options, Transaction, TransactionError, TxResult, TxnOptions,
     };
 }
 pub use ttl::{DbWithTtl, TtlCompactionFilter, strip_timestamp};

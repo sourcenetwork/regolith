@@ -70,14 +70,14 @@ fn open(dir: &Path) -> OptimisticTransactionDb {
         .with_policy(Arc::new(Keys))
 }
 
-fn conflicted(result: TxResult<()>) -> bool {
+fn conflicted<T>(result: TxResult<T>) -> bool {
     matches!(result, Err(TransactionError::Conflict { .. }))
 }
 
 /// The key a failed commit named, if it failed on a conflict.
-fn conflict_key(result: TxResult<()>) -> Option<Vec<u8>> {
+fn conflict_key<T>(result: TxResult<T>) -> Option<Vec<u8>> {
     match result {
-        Err(TransactionError::Conflict { key, .. }) => Some(key),
+        Err(TransactionError::Conflict(conflict)) => Some(conflict.key().to_vec()),
         _ => None,
     }
 }
@@ -148,7 +148,7 @@ fn both_create(db: &OptimisticTransactionDb, level: IsolationLevel, key: &[u8]) 
         tx.put(key, b"bytes").unwrap();
     }
     first.commit().unwrap();
-    second.commit()
+    second.commit().map(|_| ())
 }
 
 #[test]
@@ -407,7 +407,7 @@ fn reads_blocks_that_stay_present(level: IsolationLevel, read: Read, flush: bool
         db.db().flush().unwrap();
     }
     tx.put(b"elsewhere", b"x").unwrap();
-    tx.commit()
+    tx.commit().map(|_| ())
 }
 
 #[test]

@@ -282,8 +282,9 @@ fn blind_merge_rounds(level: IsolationLevel, storage: Storage, rounds: &[Round])
                     )
                 });
                 let refused = match first {
-                    Ok(()) => 0,
-                    Err(TransactionError::Conflict { key, .. }) => {
+                    Ok(_) => 0,
+                    Err(TransactionError::Conflict(conflict)) => {
+                        let key = conflict.key();
                         findings.check(key == COUNTER, || {
                             format!("{case} round {round} reader {r}: conflict on {key:?}")
                         });

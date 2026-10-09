@@ -22,6 +22,7 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, OnceLock};
 
+use crate::Access;
 use crate::engine::ConflictKey;
 
 /// One stretch of snapshot keys a scan yielded, recorded once however many
@@ -188,7 +189,7 @@ pub(super) fn cover(
             key: key.clone(),
             observed_seq: begin_seq,
             found: false,
-            presence_only: false,
+            access: Access::ScannedThenWrote,
         })
         .collect();
     if added.is_empty() {
@@ -268,13 +269,13 @@ mod tests {
                 key: b"a".to_vec(),
                 observed_seq: 9,
                 found: false,
-                presence_only: false,
+                access: Access::Read,
             },
             ConflictKey {
                 key: b"c".to_vec(),
                 observed_seq: 9,
                 found: false,
-                presence_only: false,
+                access: Access::Read,
             },
         ];
         let writes: BTreeMap<Vec<u8>, Option<Vec<u8>>> = [

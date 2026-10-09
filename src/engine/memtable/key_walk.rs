@@ -78,13 +78,17 @@ impl MemTable {
         let mut passed = false;
         let stop = self.scan_key(lk, |_, seq, value_type| {
             if seq <= floor || value_type != VALUE_TYPE_MERGE {
-                ControlFlow::Break(seq)
+                ControlFlow::Break((seq, value_type))
             } else {
                 passed = true;
                 ControlFlow::Continue(())
             }
         });
-        Skip { passed, stop }
+        Skip {
+            passed,
+            stop: stop.map(|(seq, _)| seq),
+            stop_type: stop.map_or(0, |(_, value_type)| value_type),
+        }
     }
 }
 
@@ -121,14 +125,66 @@ mod tests {
         LookupKey::from_prefixed(key, snapshot_seq)
     }
 
-    /// `skip_merges_above` for `key` read at `snapshot_seq`.
-    fn skip(mt: &MemTable, key: &[u8], snapshot_seq: u64, floor: u64) -> Skip {
+    impl Kind {
+        /// The value type an entry of this kind carries in its internal key.
+        fn value_type(self) -> u8 {
+            match self {
+                Self::Put => VALUE_TYPE_VALUE,
+                Self::Delete => VALUE_TYPE_DELETION,
+                Self::Merge => VALUE_TYPE_MERGE,
+            }
+        }
+    }
+
+    /// `skip_merges_above` for `key` read at `snapshot_seq`, as reported.
+    fn skip_typed(mt: &MemTable, key: &[u8], snapshot_seq: u64, floor: u64) -> Skip {
         mt.skip_merges_above(&probe(key, snapshot_seq), floor)
+    }
+
+    /// [`skip_typed`] without the stop's value type, which the model test and
+    /// `the_stop_names_the_value_type_of_the_entry_it_ended_at` check apart, so
+    /// the cases below stay about where the skip ended.
+    fn skip(mt: &MemTable, key: &[u8], snapshot_seq: u64, floor: u64) -> Skip {
+        Skip {
+            stop_type: 0,
+            ..skip_typed(mt, key, snapshot_seq, floor)
+        }
     }
 
     /// A skip that passed an operand or not, and stopped at `stop`.
     fn ended(passed: bool, stop: Option<u64>) -> Skip {
-        Skip { passed, stop }
+        Skip {
+            passed,
+            stop,
+            stop_type: 0,
+        }
+    }
+
+    #[test]
+    fn the_stop_names_the_value_type_of_the_entry_it_ended_at() {
+        let mt = memtable();
+        write(&mt, b"k", 1, Kind::Put);
+        write(&mt, b"k", 2, Kind::Merge);
+        write(&mt, b"k", 3, Kind::Delete);
+        write(&mt, b"k", 4, Kind::Merge);
+        write(&mt, b"j", 5, Kind::Put);
+        let stopped = skip_typed(&mt, b"k", u64::MAX, 0);
+        assert_eq!(
+            (stopped.passed, stopped.stop, stopped.stop_type),
+            (true, Some(3), VALUE_TYPE_DELETION)
+        );
+        let stopped = skip_typed(&mt, b"j", u64::MAX, 0);
+        assert_eq!(
+            (stopped.stop, stopped.stop_type),
+            (Some(5), VALUE_TYPE_VALUE)
+        );
+        // At the floor the skip stops on whatever entry is there, an operand
+        // included.
+        let stopped = skip_typed(&mt, b"k", u64::MAX, 4);
+        assert_eq!(
+            (stopped.stop, stopped.stop_type),
+            (Some(4), VALUE_TYPE_MERGE)
+        );
     }
 
     #[test]
@@ -342,11 +398,12 @@ mod tests {
                 for (_, seq, kind) in visible {
                     if seq <= floor || kind != Kind::Merge {
                         expected.stop = Some(seq);
+                        expected.stop_type = kind.value_type();
                         break;
                     }
                     expected.passed = true;
                 }
-                prop_assert_eq!(skip(&mt, name, snapshot_seq, floor), expected);
+                prop_assert_eq!(skip_typed(&mt, name, snapshot_seq, floor), expected);
             }
         }
     }
