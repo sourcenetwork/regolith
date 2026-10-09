@@ -67,3 +67,8 @@ import Regolith.Callbacks
 -- Backs `proofs/tla/ManifestSeal.tla`. (The sealed log stamp is in
 -- WalRecovery.lean.)
 import Regolith.ManifestSeal
+-- 4.12, D57: a backup of an encrypted database seals its metadata; a
+-- restore checks every key before its first write, copies exactly what the
+-- tag covers and writes a sealed MANIFEST last. Backs
+-- `proofs/tla/BackupSeal.tla`.
+import Regolith.BackupSeal
