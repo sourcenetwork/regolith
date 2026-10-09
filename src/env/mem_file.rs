@@ -384,6 +384,10 @@ impl MemFile {
         // SAFETY: `WRITER` is held, and `[from, to)` is above every length
         // published on this extent.
         unsafe { change.fill(extent, from) };
+        #[cfg(test)]
+        if let Some(hook) = BETWEEN_WRITE_AND_PUBLISH.with(|slot| slot.borrow_mut().take()) {
+            hook();
+        }
         // Release: the bytes are visible to every reader that loads this
         // length. Fails only when a copy froze the extent meanwhile.
         extent
@@ -422,6 +426,10 @@ impl MemFile {
             change.fill(&fresh, at as usize);
         }
         fresh.state.store(end, Ordering::Relaxed);
+        #[cfg(test)]
+        if let Some(hook) = BETWEEN_BUILD_AND_FREEZE.with(|slot| slot.borrow_mut().take()) {
+            hook();
+        }
         // Freeze: from here no append publishes on the old extent, so the
         // bytes copied above are all it will ever hold. A frozen extent
         // stays frozen; only the swap below decides.
@@ -461,6 +469,38 @@ impl Default for MemFile {
     fn default() -> Self {
         Self::new()
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Runs once, on this thread, inside the next copy, after it built its
+    /// new extent and before it freezes the old one: the window where
+    /// another write may publish or freeze.
+    static BETWEEN_BUILD_AND_FREEZE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Run `hook` inside this thread's next copy, between its build and its
+/// freeze.
+#[cfg(test)]
+fn between_build_and_freeze(hook: impl FnOnce() + 'static) {
+    BETWEEN_BUILD_AND_FREEZE.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Runs once, on this thread, inside the next append in place, after it
+    /// wrote its bytes and before its publishing CAS: the window where a
+    /// copy may freeze the extent.
+    static BETWEEN_WRITE_AND_PUBLISH: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Run `hook` inside this thread's next append in place, between its write
+/// and its publish.
+#[cfg(test)]
+fn between_write_and_publish(hook: impl FnOnce() + 'static) {
+    BETWEEN_WRITE_AND_PUBLISH.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
 }
 
 #[cfg(test)]

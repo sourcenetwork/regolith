@@ -44,6 +44,57 @@ fn an_extension_after_a_cut_reads_zeros_not_old_bytes() {
     assert_eq!(file.to_vec(), [0u8; 6]);
 }
 
+/// An append publishes in place while a copy is between its build and its
+/// freeze. The copy's freeze CAS expects the word it built from, so it fails,
+/// and the copy writes again from the longer file: the append survives.
+#[test]
+fn a_copy_racing_an_append_in_place_starts_again() {
+    let file = Arc::new(file_with(b"a"));
+    let racing = Arc::clone(&file);
+    between_build_and_freeze(move || {
+        racing.append(&[b"b"], &Free).unwrap();
+    });
+    file.write_at(0, b"x", &Free).unwrap();
+    assert_eq!(file.to_vec(), b"xb");
+}
+
+/// The copy's extent is frozen by another copy after this one built. The
+/// length may have grown before that freeze, so this copy must not trust
+/// "frozen now" and swap the copy it built: it writes again. Planting the
+/// stale check (`MC_EnvFiles_Red_StaleFrozen`) loses the append.
+#[test]
+fn a_copy_built_before_another_freeze_starts_again() {
+    let file = Arc::new(file_with(b"a"));
+    let racing = Arc::clone(&file);
+    between_build_and_freeze(move || {
+        racing.append(&[b"b"], &Free).unwrap();
+        // Another copy froze the extent and has not swapped yet.
+        racing
+            .current
+            .load()
+            .state
+            .fetch_or(FROZEN, Ordering::AcqRel);
+    });
+    file.write_at(0, b"x", &Free).unwrap();
+    assert_eq!(file.to_vec(), b"xb");
+}
+
+/// An append in place wrote its bytes, and before it publishes a copy (an
+/// overwrite) freezes the extent and swaps a new one in. The append's
+/// publishing CAS fails on the frozen word, and it appends again on the new
+/// extent: it lands once, after the overwrite. A plain store in place of the
+/// CAS would publish on the dead extent and lose it.
+#[test]
+fn an_append_frozen_out_appends_again_once() {
+    let file = Arc::new(file_with(b"a"));
+    let racing = Arc::clone(&file);
+    between_write_and_publish(move || {
+        racing.write_at(0, b"x", &Free).unwrap();
+    });
+    file.append(&[b"b"], &Free).unwrap();
+    assert_eq!(file.to_vec(), b"xb");
+}
+
 /// A charge that refuses past a bound, counting what it holds.
 struct Bounded {
     held: StdAtomicU64,
