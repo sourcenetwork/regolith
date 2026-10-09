@@ -141,9 +141,13 @@ pub enum Ticker {
     /// Bytes discarded from the end of the newest write-ahead log at open,
     /// summed over the discards [`Ticker::WalTailDiscarded`] counts.
     WalTailDiscardedBytes = 32,
+    /// Write-ahead logs that could not be removed once their writes were in
+    /// tables. Each is logged, never replayed, and removed again by the
+    /// next flush or open.
+    WalRemoveFailed = 33,
 }
 
-const NUM_TICKERS: usize = 33;
+const NUM_TICKERS: usize = 34;
 
 impl Ticker {
     /// Every defined ticker, in discriminant order. Adding a variant
@@ -182,6 +186,7 @@ impl Ticker {
         Ticker::PolicyBlindMergesCommuted,
         Ticker::PolicyScanRunsDropped,
         Ticker::WalTailDiscardedBytes,
+        Ticker::WalRemoveFailed,
     ];
 
     /// Stable string name for exporting to monitoring systems.
@@ -220,6 +225,7 @@ impl Ticker {
             Ticker::PolicyBlindMergesCommuted => "regolith.policy.blind_merges_commuted",
             Ticker::PolicyScanRunsDropped => "regolith.policy.scan_runs_dropped",
             Ticker::WalTailDiscardedBytes => "regolith.wal.tail_discarded_bytes",
+            Ticker::WalRemoveFailed => "regolith.wal.remove_failed",
         }
     }
 }

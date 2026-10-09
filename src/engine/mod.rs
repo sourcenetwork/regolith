@@ -19,6 +19,7 @@ mod ingest_range_tests;
 mod ingest_window_tests;
 pub(crate) mod internal_key;
 pub(crate) mod iterator;
+pub(crate) mod log_retirement;
 pub(crate) mod lookup_key;
 #[cfg(loom)]
 pub mod loom_model;
@@ -64,6 +65,7 @@ use manifest::{VersionEdit, VersionSet};
 use memtable::{MemTable, MemTableConfig};
 
 const STOP_TOO_MANY_MEMTABLES: &str = "stop: too many memtables";
+use log_retirement::RetiredLogs;
 use pending_outputs::PendingOutputs;
 use read_horizon::ReadHorizon;
 pub(crate) use read_rule::ReadRule;
@@ -510,6 +512,8 @@ pub(crate) struct RegolithEngine {
     wal_id: AtomicU64,
     sst_dir: PathBuf,
     wal_dir: PathBuf,
+    /// The logs flushes have put in tables, and whether a removal is owed.
+    retired_logs: RetiredLogs,
     compaction: Mutex<CompactionScheduler>,
     /// Engine-wide RwLock that coordinates foreground and background
     /// compaction. Background workers each hold a read lock so they
@@ -657,16 +661,6 @@ impl RegolithEngine {
 
         rewrite_recovered_memtable_to_wal(&memtable, &mut wal)?;
 
-        for replayed_wal_path in &wal_files {
-            if replayed_wal_path != &wal_path {
-                match Wal::remove_in(&*env, replayed_wal_path) {
-                    Ok(()) => {}
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(e) => return Err(e),
-                }
-            }
-        }
-
         let versions = Arc::new(VersionStore::new(version_set));
         let view = Arc::new(ReadViewCell::new(ReadView {
             active: Arc::clone(&memtable),
@@ -675,9 +669,17 @@ impl RegolithEngine {
         }));
         versions.attach_view(Arc::clone(&view));
 
-        versions
-            .lock()
-            .apply(&[VersionEdit::SetNextFileId(wal_id + 1)])?;
+        // The new log holds every write the replayed ones did, so they are
+        // retired with the logs flushes left behind. Recorded unsynced: if
+        // the record is lost, the replayed logs are replayed again beside
+        // the new one, which repeats their writes and nothing older.
+        versions.lock().apply(&[
+            VersionEdit::SetNextFileId(wal_id + 1),
+            VersionEdit::SetMinWalId(wal_id),
+        ])?;
+        let removed =
+            log_retirement::remove_below(&*env, &wal_dir, wal_id, options.statistics.as_deref());
+        let retired_logs = RetiredLogs::new(wal_dir.clone(), !removed);
 
         let cache = Arc::new(
             BlockCache::with_config(
@@ -725,6 +727,7 @@ impl RegolithEngine {
             wal_id: AtomicU64::new(wal_id),
             sst_dir,
             wal_dir,
+            retired_logs,
             compaction: Mutex::new(compaction),
             compaction_lock,
             snapshot_registry,
@@ -840,6 +843,7 @@ impl RegolithEngine {
             active_wal: Mutex::new(None),
             wal_id: AtomicU64::new(wal_id),
             sst_dir,
+            retired_logs: RetiredLogs::new(wal_dir.clone(), false),
             wal_dir,
             compaction: Mutex::new(CompactionScheduler::disabled()),
             compaction_lock,
@@ -1823,7 +1827,10 @@ impl RegolithEngine {
     }
 
     /// Unlink the log that backed `flushed`, now that its records are in
-    /// an SSTable the published version references.
+    /// an SSTable the published version references, and any log a failed
+    /// unlink left below it. A failure is reported and retried by the next
+    /// flush or open; the log is never replayed meanwhile, because the
+    /// table's batch recorded it as flushed (`log_retirement.rs`).
     ///
     /// Keyed off the memtable rather than off whatever log the caller
     /// happened to seal. A flush and the seal that fed it are not
@@ -1833,9 +1840,8 @@ impl RegolithEngine {
     /// log would delete the only durable copy of a memtable that has not
     /// been flushed, and a crash would then lose every write in it.
     fn remove_sealed_wal(&self, flushed: &MemTable) {
-        if let Some(path) = flushed.sealed_wal() {
-            let _ = Wal::remove_in(&*self.env, path);
-        }
+        self.retired_logs
+            .retire(&*self.env, flushed, self.statistics());
     }
 
     /// Snapshot the current write-stall inputs: L0 file count,
@@ -2623,10 +2629,13 @@ impl RegolithEngine {
         let seq = memtable
             .sealed_seq()
             .unwrap_or_else(|| self.latest_seq.load(Ordering::Acquire));
-        let edits = vec![
+        let mut edits = vec![
             VersionEdit::AddFile { level: 0, file },
             VersionEdit::SetLastSeq(seq),
         ];
+        // In the table's batch, so the log is skipped by recovery exactly
+        // when the table is durable (E30).
+        edits.extend(log_retirement::min_wal_id_after(&memtable).map(VersionEdit::SetMinWalId));
         pending.offered_to_manifest();
         self.versions.lock().apply(&edits)?;
 

@@ -131,6 +131,7 @@ pub(crate) enum VersionEdit {
     RemoveFile { level: usize, file_id: u64 },
     SetLastSeq(u64),
     SetNextFileId(u64),
+    SetMinWalId(u64),
     Reset { next_file_id: u64, min_wal_id: u64 },
 }
 
@@ -170,6 +171,7 @@ impl VersionEdit {
             },
             VersionEdit::SetLastSeq(seq) => ManifestRecord::SetLastSeq(*seq),
             VersionEdit::SetNextFileId(id) => ManifestRecord::SetNextFileId(*id),
+            VersionEdit::SetMinWalId(id) => ManifestRecord::SetMinWalId(*id),
             VersionEdit::Reset {
                 next_file_id,
                 min_wal_id,
@@ -179,16 +181,24 @@ impl VersionEdit {
             },
         }
     }
-
-    fn requires_manifest_sync(&self) -> bool {
-        // File-id reservations do not make new data reachable on
-        // their own. They are flushed here and become durable with
-        // the next synced AddFile/RemoveFile/SetLastSeq edit.
-        !matches!(self, VersionEdit::SetNextFileId(_))
-    }
 }
 
 impl ManifestRecord {
+    /// Whether a batch holding this record is synced before
+    /// [`VersionSet::apply`] returns.
+    ///
+    /// A file-id reservation and a log retirement change no read if lost:
+    /// the ids a lost reservation handed out name nothing a durable batch
+    /// names, and the logs a lost retirement covered are replayed again,
+    /// holding only writes that the log the open rewrote them into also
+    /// holds. Each becomes durable with the next synced batch.
+    fn requires_sync(&self) -> bool {
+        !matches!(
+            self,
+            ManifestRecord::SetNextFileId(_) | ManifestRecord::SetMinWalId(_)
+        )
+    }
+
     fn encode(&self, buf: &mut Vec<u8>) {
         match self {
             ManifestRecord::AddFile { level, meta } => {
@@ -611,6 +621,7 @@ impl VersionSet {
                 }
                 VersionEdit::SetLastSeq(_)
                 | VersionEdit::SetNextFileId(_)
+                | VersionEdit::SetMinWalId(_)
                 | VersionEdit::Reset { .. } => {}
             }
         }
@@ -630,6 +641,9 @@ impl VersionSet {
                 }
                 VersionEdit::SetNextFileId(id) => {
                     version.next_file_id = *id;
+                }
+                VersionEdit::SetMinWalId(id) => {
+                    version.min_wal_id = *id;
                 }
                 VersionEdit::Reset {
                     next_file_id,
@@ -653,7 +667,7 @@ impl VersionSet {
 
         let records: Vec<ManifestRecord> = edits.iter().map(VersionEdit::to_record).collect();
         let encoded = Self::encode_records(&records)?;
-        let requires_sync = edits.iter().any(VersionEdit::requires_manifest_sync);
+        let requires_sync = records.iter().any(ManifestRecord::requires_sync);
         // An append or sync error leaves an uncertain tail. Only reopen
         // may decide which complete frames survived; neither a later
         // append nor a rewrite from the old version may bypass that tail.
