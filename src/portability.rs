@@ -68,7 +68,6 @@
 //! | `lz4_flex` | `no_std` covers the block format, which is all regolith uses | low: `default-features = false` |
 //! | `thiserror` 1.0 | no `no_std` support | medium: bump to 2.x |
 //! | `snap` | no `no_std` path at all; regolith uses only `snap::raw` | medium: upstream a feature, vendor `raw.rs`, or drop Snappy on `no_std` |
-//! | `kovan-mvcc` | pulls `parking_lot`, which is `std`-only | medium: the transactional layer is not part of a tier-B build and can be feature-gated off |
 //! | **locks** | **[`crate::sync`] is `std::sync`-backed** | **medium, see below** |
 //!
 //! ## Locks, specifically

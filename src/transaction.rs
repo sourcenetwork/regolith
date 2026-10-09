@@ -450,13 +450,8 @@ pub enum ScanDirection {
 /// would cost commit time and abort transactions no serial order needed
 /// to abort.
 ///
-/// This is the native transaction's contract, the one both
-/// [`OptimisticTransactionDb`] and [`TransactionDb`] run today. The
-/// kovan-mvcc adapter in `mvcc::txn`, not yet wired to either, has no
-/// per-stretch scan record and maps this level to its Serializable, which
-/// validates every key a scan yields: switching the entry points over
-/// makes a reclamation under a scan abort at this level until the adapter
-/// learns the distinction.
+/// This is the contract both [`OptimisticTransactionDb`] and
+/// [`TransactionDb`] run.
 ///
 /// # Why write skew survives snapshot isolation
 ///

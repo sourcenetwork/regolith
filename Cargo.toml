@@ -47,7 +47,6 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
 [dependencies]
 kovan = "0.1.22"
 kovan-map = "0.1.22"
-kovan-mvcc = "0.1.22"
 kovan-queue = "0.1.22"
 kovan-channel = "0.1.22"
 

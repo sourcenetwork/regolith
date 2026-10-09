@@ -66,7 +66,6 @@ pub mod env;
 mod error;
 mod event_listener;
 mod iter;
-mod mvcc;
 mod options;
 mod perf_context;
 mod portability;
