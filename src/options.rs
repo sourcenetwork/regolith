@@ -217,6 +217,10 @@ impl WriteOptions {
 ///
 /// Point lookups are unaffected - they always consult the user-key
 /// bloom filter and do not call the extractor.
+///
+/// A panic in this trait's code while a commit's memtable rotation runs it
+/// fails that commit with [`crate::Error::CallbackPanicked`] and latches the
+/// database read-only until it is reopened.
 pub trait PrefixExtractor: Send + Sync + 'static {
     /// Return the portion of `key` that the prefix bloom should index,
     /// or `None` if `key` cannot produce a prefix (e.g., it's shorter

@@ -104,6 +104,10 @@ pub enum KeyClass {
 /// write pipeline, at most once for the start of each scan stretch and at
 /// most once for each distinct key the transaction reads, puts or merges. A
 /// key it only deletes is not classified.
+///
+/// A panic in `classify` fails the commit with
+/// [`Error::CallbackPanicked`](crate::Error::CallbackPanicked) and latches the
+/// database read-only until it is reopened.
 pub trait KeyClassifier: Send + Sync {
     /// The class `key` belongs to.
     fn classify(&self, key: &[u8]) -> KeyClass;

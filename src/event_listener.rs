@@ -170,6 +170,10 @@ pub enum BackgroundErrorReason {
 ///
 /// **Listeners must not block or re-enter the database.** See the
 /// module-level docs for the dispatch contract.
+///
+/// A panic in this trait's code while a commit's memtable rotation runs it
+/// fails that commit with [`crate::Error::CallbackPanicked`] and latches the
+/// database read-only until it is reopened.
 pub trait EventListener: Send + Sync + 'static {
     /// Called after a memtable has been flushed to a new L0
     /// SSTable and the manifest edit has been applied.
@@ -240,6 +244,22 @@ where
     for l in listeners {
         f(l.as_ref());
     }
+}
+
+/// [`dispatch`] for a call that can run inside a commit's ordered step: there
+/// a listener's panic is caught and returned as
+/// [`Error::CallbackPanicked`](crate::Error::CallbackPanicked), and the
+/// listeners after it are not told.
+pub(crate) fn dispatch_contained<F>(
+    listeners: &[std::sync::Arc<dyn EventListener>],
+    f: F,
+) -> Result<(), crate::Error>
+where
+    F: Fn(&dyn EventListener),
+{
+    listeners
+        .iter()
+        .try_for_each(|l| crate::engine::callback::contain("EventListener", || f(l.as_ref())))
 }
 
 #[cfg(test)]

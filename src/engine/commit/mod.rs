@@ -39,6 +39,7 @@ use std::time::Duration;
 
 use kovan_queue::array_queue::ArrayQueue;
 
+use super::callback::InCommit;
 use super::memtable::MemTable;
 use super::wal::{MAX_RECORD_LEN, Wal, check_write_len};
 use super::{CommitOutcome, DurabilityMode, ReadView, RegolithEngine, grouped_batch_ops};
@@ -701,6 +702,7 @@ impl RegolithEngine {
     /// Completion happens after [`Self::run_group`] has published the read
     /// horizon (the lost-update fix) and hands the same outcome to every member (G2).
     fn run_and_complete(&self, pipe: &mut Pipeline, view: Arc<ReadView>) -> io::Result<u64> {
+        let _commit = InCommit::enter();
         let Pipeline {
             stage,
             group,
@@ -725,6 +727,13 @@ impl RegolithEngine {
                 Err(err)
             }
         };
+        // A caller's code panicked inside the group: the step it left half
+        // done is not one any later write may build on.
+        if let Err(err) = &result
+            && let Some(callback) = crate::Error::callback_panic_of(err)
+        {
+            self.latch_callback_panic(callback);
+        }
         // Each ticket learns the sequence *its own* operations were
         // assigned, not the group's maximum. An upper layer ordering its
         // versions against regolith's needs the sequence of the write it
@@ -831,14 +840,14 @@ impl RegolithEngine {
             let start_offset = wal.offset();
 
             if let Err(err) = wal.append_group(stage) {
-                self.abandon_group(wal, start_offset, &err);
+                self.abandon_group(wal, start_offset, &err)?;
                 return Err(err);
             }
 
             let mut synced = 0u64;
             if any_immediate {
                 if let Err(err) = wal.sync_data() {
-                    self.abandon_group(wal, start_offset, &err);
+                    self.abandon_group(wal, start_offset, &err)?;
                     return Err(err);
                 }
                 synced = 1;
@@ -888,13 +897,14 @@ impl RegolithEngine {
     /// partially written group never survives as a torn record. If the
     /// truncation itself fails the log's tail is unknown, so the engine
     /// latches and every later write fails loud rather than appending
-    /// after bytes nobody can account for.
-    fn abandon_group(&self, wal: &mut Wal, start_offset: u64, cause: &io::Error) {
+    /// after bytes nobody can account for. `Err` is a listener's panic while
+    /// it was told of the failure.
+    fn abandon_group(&self, wal: &mut Wal, start_offset: u64, cause: &io::Error) -> io::Result<()> {
         tracing::error!(error = %cause, "commit group failed; discarding its WAL bytes");
         if let Err(rollback_err) = wal.rollback_to(start_offset) {
             self.latch_wal_failure(&rollback_err);
         }
-        self.notify_wal_error(cause);
+        self.notify_wal_error(cause)
     }
 
     /// Tell the registered listeners a commit lost a race. Called after the
@@ -904,16 +914,20 @@ impl RegolithEngine {
     }
 
     /// Tell the registered listeners a write-ahead-log operation failed.
-    pub(super) fn notify_wal_error(&self, cause: &io::Error) {
-        if !self.options.listeners.is_empty() {
-            let err = crate::Error::from(crate::Error::clone_io(cause));
-            crate::event_listener::dispatch(&self.options.listeners, |l| {
-                l.on_background_error(
-                    crate::event_listener::BackgroundErrorReason::WriteAheadLog,
-                    &err,
-                )
-            });
+    /// `Err` is a listener's panic, caught because this runs in the ordered
+    /// step.
+    pub(super) fn notify_wal_error(&self, cause: &io::Error) -> io::Result<()> {
+        if self.options.listeners.is_empty() {
+            return Ok(());
         }
+        let err = crate::Error::from(crate::Error::clone_io(cause));
+        crate::event_listener::dispatch_contained(&self.options.listeners, |l| {
+            l.on_background_error(
+                crate::event_listener::BackgroundErrorReason::WriteAheadLog,
+                &err,
+            )
+        })
+        .map_err(crate::Error::into_io_error)
     }
 }
 

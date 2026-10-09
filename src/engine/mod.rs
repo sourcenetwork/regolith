@@ -3,6 +3,7 @@ pub(crate) mod background_health;
 pub(crate) mod block;
 pub(crate) mod block_cache;
 pub(crate) mod bloom;
+pub(crate) mod callback;
 pub(crate) mod checksum;
 pub(crate) mod commit;
 pub(crate) mod compaction;
@@ -91,6 +92,14 @@ pub(crate) enum CommitOutcome {
     Ok { seq: Option<u64> },
     /// The reason, with the key still carrying its column-family prefix.
     Conflict(Conflict),
+}
+
+/// Why the engine stopped taking writes, see `RegolithEngine::write_latch`.
+enum WriteLatch {
+    /// A failed commit group could not be rolled back out of the log.
+    Wal(std::io::ErrorKind, String),
+    /// A caller's code of this trait panicked inside the ordered step.
+    CallbackPanicked(&'static str),
 }
 
 /// Lay a commit's writes out as one batch: point operations in ascending key
@@ -520,11 +529,13 @@ pub(crate) struct RegolithEngine {
     flushing: Mutex<()>,
     /// Latched write-path failure. Set only when a failed commit group
     /// could not be rolled back out of the WAL, which leaves the log with
-    /// a tail no later write may extend. Once set, every write fails loud
-    /// with the original reason instead of appending after unknown bytes.
-    wal_failure: Mutex<Option<(std::io::ErrorKind, String)>>,
-    /// Cheap gate on `wal_failure`, checked on every write.
-    wal_failed: AtomicBool,
+    /// a tail no later write may extend, or when a caller's code panicked
+    /// inside the commit's ordered step. Once set, every write fails loud
+    /// with the original reason instead of appending after unknown bytes or
+    /// state.
+    write_latch: Mutex<Option<WriteLatch>>,
+    /// Cheap gate on `write_latch`, checked on every write.
+    write_latched: AtomicBool,
     /// Signal used by foreground writers to wait out a "stop writes"
     /// condition (too many L0 files, too many unflushed memtables).
     /// The background compaction thread holds a clone of this `Arc`
@@ -711,8 +722,8 @@ impl RegolithEngine {
             commit_ring: Self::new_commit_ring(),
             pipeline: Mutex::new(Pipeline::new()),
             flushing: Mutex::new(()),
-            wal_failure: Mutex::new(None),
-            wal_failed: AtomicBool::new(false),
+            write_latch: Mutex::new(None),
+            write_latched: AtomicBool::new(false),
             stall_signal,
             cached_stall_level: AtomicU8::new(0),
             compaction_in_progress,
@@ -852,8 +863,8 @@ impl RegolithEngine {
             commit_ring: Self::new_commit_ring(),
             pipeline: Mutex::new(Pipeline::new()),
             flushing: Mutex::new(()),
-            wal_failure: Mutex::new(None),
-            wal_failed: AtomicBool::new(false),
+            write_latch: Mutex::new(None),
+            write_latched: AtomicBool::new(false),
             stall_signal,
             cached_stall_level: AtomicU8::new(0),
             compaction_in_progress: Arc::new(Mutex::new(HashSet::new())),
@@ -928,8 +939,8 @@ impl RegolithEngine {
 
     pub(crate) fn ensure_writable(&self) -> std::io::Result<()> {
         self.ensure_open()?;
-        if self.wal_failed.load(Ordering::Acquire) {
-            return Err(self.wal_failure_error());
+        if self.write_latched.load(Ordering::Acquire) {
+            return Err(self.latched_error());
         }
         if self.is_read_only() {
             Err(Self::read_only_error())
@@ -942,16 +953,32 @@ impl RegolithEngine {
     /// on its own, so every later write fails loud with the reason
     /// rather than appending after a tail nobody can account for.
     pub(crate) fn latch_wal_failure(&self, err: &std::io::Error) {
-        *self.wal_failure.lock() = Some((err.kind(), err.to_string()));
-        self.wal_failed.store(true, Ordering::Release);
+        self.latch(WriteLatch::Wal(err.kind(), err.to_string()));
     }
 
-    fn wal_failure_error(&self) -> std::io::Error {
-        match self.wal_failure.lock().as_ref() {
-            Some((kind, message)) => std::io::Error::new(
+    /// Latch the engine read-only because a caller's `callback` panicked
+    /// inside the commit's ordered step, which left that step's shared state
+    /// unaccounted for. Every later write fails with
+    /// [`crate::Error::CallbackPanicked`] until the database is reopened.
+    pub(crate) fn latch_callback_panic(&self, callback: &'static str) {
+        self.latch(WriteLatch::CallbackPanicked(callback));
+    }
+
+    /// Keep the first reason: it is the one that explains the rest.
+    fn latch(&self, latch: WriteLatch) {
+        self.write_latch.lock().get_or_insert(latch);
+        self.write_latched.store(true, Ordering::Release);
+    }
+
+    fn latched_error(&self) -> std::io::Error {
+        match self.write_latch.lock().as_ref() {
+            Some(WriteLatch::Wal(kind, message)) => std::io::Error::new(
                 *kind,
                 format!("write-ahead log left in an unknown state: {message}"),
             ),
+            Some(WriteLatch::CallbackPanicked(callback)) => {
+                crate::Error::CallbackPanicked { callback }.into_io_error()
+            }
             None => std::io::Error::other("write-ahead log left in an unknown state"),
         }
     }
@@ -974,7 +1001,7 @@ impl RegolithEngine {
             drop(guard);
             tracing::error!(error = %err, "syncing the write-ahead log before sealing it failed");
             self.latch_wal_failure(&err);
-            self.notify_wal_error(&err);
+            self.notify_wal_error(&err)?;
             return Err(err);
         }
         let new_wal = Wal::create_in(&self.env, &self.wal_dir.join(wal_filename(new_wal_id)))?;
@@ -2402,12 +2429,13 @@ impl RegolithEngine {
                 tracing::error!(error = %e, hazard = hazard.label(), "Flush failed");
                 if !self.options.listeners.is_empty() {
                     let err = crate::Error::from(crate::Error::clone_io(&e));
-                    crate::event_listener::dispatch(&self.options.listeners, |l| {
+                    crate::event_listener::dispatch_contained(&self.options.listeners, |l| {
                         l.on_background_error(
                             crate::event_listener::BackgroundErrorReason::Flush,
                             &err,
                         )
-                    });
+                    })
+                    .map_err(crate::Error::into_io_error)?;
                 }
                 Err(e)
             }
@@ -2463,7 +2491,15 @@ impl RegolithEngine {
         // The walk streams straight out of the arena: a flush holds one
         // entry plus the block builder, never a second copy of the
         // whole memtable.
-        memtable.try_for_each_entry(|internal_key, value| writer.add(internal_key, value))?;
+        let mut walk =
+            || memtable.try_for_each_entry(|internal_key, value| writer.add(internal_key, value));
+        // Only a prefix extractor runs caller code in the walk, so only then
+        // is there a panic to catch.
+        if self.options.prefix_extractor.is_some() {
+            callback::contain("PrefixExtractor", walk).map_err(crate::Error::into_io_error)??;
+        } else {
+            walk()?;
+        }
 
         // Persist range tombstones alongside the point entries.
         for rt in &range_tombstones {
@@ -2487,7 +2523,10 @@ impl RegolithEngine {
         // starve foreground traffic. Rate-limiting is opt-in via
         // `Options::rate_limiter`; a `None` limiter is a no-op.
         if let Some(limiter) = &self.options.rate_limiter {
-            limiter.request(file_size, crate::rate_limiter::Priority::Low);
+            callback::contain("RateLimiter", || {
+                limiter.request(file_size, crate::rate_limiter::Priority::Low)
+            })
+            .map_err(crate::Error::into_io_error)?;
         }
 
         let reader = Arc::new(SsTableReader::open_with(
@@ -2580,12 +2619,14 @@ impl RegolithEngine {
                 largest_key: largest,
                 duration,
             };
-            event_listener::dispatch(&self.options.listeners, |l| {
+            event_listener::dispatch_contained(&self.options.listeners, |l| {
                 l.on_table_file_created(&create_info)
-            });
-            event_listener::dispatch(&self.options.listeners, |l| {
+            })
+            .map_err(crate::Error::into_io_error)?;
+            event_listener::dispatch_contained(&self.options.listeners, |l| {
                 l.on_flush_completed(&flush_info)
-            });
+            })
+            .map_err(crate::Error::into_io_error)?;
         }
 
         tracing::info!(

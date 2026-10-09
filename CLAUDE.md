@@ -105,6 +105,7 @@ src/
     ├── arena.rs        # Bump allocator for one memtable
     ├── block.rs        # Data blocks: prefix compression, restart points, varint
     ├── block_cache.rs  # Sharded CLOCK cache for decompressed SSTable blocks
+    ├── callback.rs     # Catching a panic in caller code inside a commit and naming its trait
     ├── bloom.rs        # Bloom filter (double-hashed xxh3)
     ├── checksum.rs     # Checksum helpers
     ├── filter_block.rs # SSTable filter region: user-key and prefix bloom filters

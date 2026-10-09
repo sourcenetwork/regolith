@@ -127,7 +127,7 @@ use std::time::Duration;
 use crate::sync::{Condvar, Mutex};
 
 use crate::column_family::{DEFAULT_CF_ID, prefix_key};
-use crate::engine::{CommitOutcome, ConflictKey, RegolithEngine, ValidationSet};
+use crate::engine::{CommitOutcome, ConflictKey, RegolithEngine, ValidationSet, callback};
 use crate::{Access, Conflict, Db, DbSlice, Error, Options, Result};
 
 mod policy;
@@ -1196,6 +1196,8 @@ impl Transaction {
         // consult: the policy is installed on the optimistic database alone,
         // and every other level ignores it.
         let classifier = policy::classifier_for(&self.policy, self.isolation);
+        // The classifier is the caller's code, and a panic in it is caught.
+        let _commit = classifier.map(|_| callback::InCommit::enter());
         // Counted here, recorded only once the commit succeeded: a commit
         // that aborts or fails dropped nothing.
         let mut scan_runs_dropped = 0u64;
@@ -1206,7 +1208,9 @@ impl Transaction {
             let mut runs = drain(&runs);
             if let Some(classifier) = classifier {
                 let before = runs.len();
-                runs.retain(|run| !policy::run_is_commutative(classifier, run));
+                self.contain_classifier(|| {
+                    runs.retain(|run| !policy::run_is_commutative(classifier, run))
+                })?;
                 scan_runs_dropped = (before - runs.len()) as u64;
             }
             scan_range::cover(
@@ -1220,7 +1224,9 @@ impl Transaction {
         // After the scans are folded in, so the reads they added for put or
         // merged keys are dropped with the rest.
         if let Some(classifier) = classifier {
-            policy::exempt_content_addressed(classifier, &mut checks, &writes, &merges);
+            self.contain_classifier(|| {
+                policy::exempt_content_addressed(classifier, &mut checks, &writes, &merges)
+            })?;
         }
 
         // The write-stall admission (same order as a plain write with
@@ -1254,6 +1260,19 @@ impl Transaction {
                 Err(TransactionError::Conflict(conflict))
             }
         }
+    }
+
+    /// Run `f`, which calls the caller's [`KeyClassifier`]. A panic in it
+    /// fails this commit with [`Error::CallbackPanicked`] and latches the
+    /// database read-only, as a panic anywhere in the commit's ordered step
+    /// does.
+    fn contain_classifier<T>(&self, f: impl FnOnce() -> T) -> TxResult<T> {
+        callback::contain("KeyClassifier", f).map_err(|err| {
+            if let Error::CallbackPanicked { callback } = err {
+                self.engine.latch_callback_panic(callback);
+            }
+            TransactionError::Engine(err)
+        })
     }
 
     /// What this commit validates beyond the keys it writes: every tracked

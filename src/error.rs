@@ -52,6 +52,21 @@ pub enum Error {
     /// commit applied nothing; name the key by the bytes it holds.
     #[error("a content-addressed key already holds different bytes, so the commit applied nothing")]
     ContentMismatch,
+    /// Code the caller supplied panicked while a commit ran it: an
+    /// implementation of the trait named by `callback`, such as
+    /// [`crate::KeyClassifier`]. The panic was caught and the commit applied
+    /// nothing. The commit's shared state can no longer be vouched for, so the
+    /// database is read-only until it is reopened, and every later write
+    /// fails with this error too. A panic outside a commit unwinds into the
+    /// call that ran it and nothing else.
+    #[error(
+        "the {callback} you provided panicked while committing, so the database is read-only \
+         until it is reopened"
+    )]
+    CallbackPanicked {
+        /// The trait the panicking code implements, such as `KeyClassifier`.
+        callback: &'static str,
+    },
     /// A write was stalled behind background work (a flush or a
     /// compaction) whose most recent attempt failed, so waiting would not
     /// end. `source` carries the failure, OS error code included, so a
@@ -113,7 +128,8 @@ impl Error {
             Self::Closed => std::io::Error::new(std::io::ErrorKind::NotConnected, Self::Closed),
             typed @ (Self::DataBlockLimitExceeded { .. }
             | Self::Busy(_)
-            | Self::ContentMismatch) => std::io::Error::other(typed),
+            | Self::ContentMismatch
+            | Self::CallbackPanicked { .. }) => std::io::Error::other(typed),
             other => std::io::Error::other(other.to_string()),
         }
     }
@@ -132,11 +148,21 @@ fn carried(err: &std::io::Error) -> Option<Error> {
         Error::ReadOnly => Some(Error::ReadOnly),
         Error::Busy(reason) => Some(Error::Busy(reason)),
         Error::ContentMismatch => Some(Error::ContentMismatch),
+        Error::CallbackPanicked { callback } => Some(Error::CallbackPanicked { callback }),
         _ => None,
     }
 }
 
 impl Error {
+    /// The trait named by the [`Error::CallbackPanicked`] that `err` carries,
+    /// if it carries one.
+    pub(crate) fn callback_panic_of(err: &std::io::Error) -> Option<&'static str> {
+        match carried(err)? {
+            Error::CallbackPanicked { callback } => Some(callback),
+            _ => None,
+        }
+    }
+
     /// A copy of `err`, for a failure handed to several callers:
     /// `io::Error` is not `Clone`. Kind and message are rebuilt, and a typed
     /// variant the error carries stays that variant.
@@ -200,6 +226,9 @@ mod tests {
             Error::ReadOnly,
             Error::Busy("too many L0 files"),
             Error::ContentMismatch,
+            Error::CallbackPanicked {
+                callback: "KeyClassifier",
+            },
             Error::DataBlockLimitExceeded {
                 max_data_block_bytes: 4096,
             },
@@ -220,12 +249,30 @@ mod tests {
             Error::ReadOnly,
             Error::Busy("stalled"),
             Error::ContentMismatch,
+            Error::CallbackPanicked {
+                callback: "EventListener",
+            },
         ] {
             let text = typed.to_string();
             let copy = Error::clone_io(&typed.into_io_error());
             assert_eq!(copy.to_string(), text);
             assert!(!matches!(Error::from(copy), Error::Io(_)));
         }
+    }
+
+    #[test]
+    fn a_callback_panic_is_named_through_an_io_error() {
+        let err = Error::CallbackPanicked {
+            callback: "RateLimiter",
+        }
+        .into_io_error();
+        assert_eq!(Error::callback_panic_of(&err), Some("RateLimiter"));
+        assert_eq!(
+            Error::callback_panic_of(&Error::Closed.into_io_error()),
+            None
+        );
+        let plain = std::io::Error::other("not typed");
+        assert_eq!(Error::callback_panic_of(&plain), None);
     }
 
     #[test]
