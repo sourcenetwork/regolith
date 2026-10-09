@@ -48,11 +48,16 @@ import Regolith.Validation
 -- Each key class's relaxation stated exactly, and the RED counterexamples.
 -- Backs `proofs/tla/RepeatableRead.tla`.
 import Regolith.Relaxations
--- regolith::sync: the FIFO waiter queue with handoff before wake gives
--- mutual exclusion, FIFO service and no lost wakeup, cancellation
--- included. Backs `proofs/tla/Sync.tla` and the queues of
--- `SyncRwLock.tla`, `SyncLatch.tla` and `SyncOnce.tla`.
+-- regolith::sync's locks after D49: barging with a bypass bound gives
+-- mutual exclusion, at most BOUND lost races per waiter, an exclusive owed
+-- handoff and no stranded head. Backs `proofs/tla/Sync.tla` and the write
+-- side of `SyncRwLock.tla`.
 import Regolith.Sync
+-- regolith::sync::Notify: the FIFO waiter queue with handoff before wake
+-- gives FIFO service and no lost wakeup, cancellation included. Backs
+-- `proofs/tla/SyncNotify.tla` and the waiter lists of `SyncLatch.tla` and
+-- `SyncOnce.tla`.
+import Regolith.SyncFifo
 -- 3.16: every transaction callback runs exactly once, of its attempt's
 -- outcome, in the stated order, and attempts are isolated. Backs
 -- `proofs/tla/TxnCallbacks.tla`.
