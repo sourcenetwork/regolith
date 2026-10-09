@@ -582,7 +582,11 @@ fn a_failing_callback_is_rolled_back_and_the_later_ones_stay_queued() {
         txn.put(b"kept", b"1").unwrap();
         txn.set_savepoint();
         let l = Arc::clone(&log);
+        let mut failed = false;
         txn.before_commit(move |txn| {
+            if std::mem::replace(&mut failed, true) {
+                return Ok(());
+            }
             txn.put(b"doomed", b"x")?;
             txn.set_savepoint();
             let (c, a) = (Arc::clone(&l), Arc::clone(&l));
@@ -682,7 +686,11 @@ fn a_failing_callbacks_appends_are_taken_back_with_its_writes() {
     let log: Arc<dyn regolith::LogLayout> = Arc::new(Journal);
     let mut txn = db.begin(&TxnOptions::new());
     let doomed = Arc::clone(&log);
+    let mut failed = false;
     txn.before_commit(move |txn| {
+        if std::mem::replace(&mut failed, true) {
+            return Ok(());
+        }
         txn.append(&doomed, b"doomed", None)?;
         Err(TransactionError::NoSavepoint)
     });

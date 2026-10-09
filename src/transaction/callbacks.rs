@@ -22,7 +22,9 @@
 //!   outcome the transaction's callbacks run in registration order, then the
 //!   hook's.
 //! - Before the outcome a panic or an error undoes the callback's effects
-//!   (writes, savepoints and registrations) and fails the commit. After the
+//!   (writes, savepoints and registrations) and fails the commit; a
+//!   `before_commit` callback that returned an error stays queued, in its
+//!   place, and runs again at the next `prepare`. After the
 //!   outcome a panic is caught and reported to
 //!   [`crate::EventListener::on_callback_panic`], and the outcome stands.
 //! - No lock. The `on_abort` callbacks are handed from the owner to whichever
@@ -150,7 +152,7 @@ pub trait TransactionHooks: Send + Sync + 'static {
     }
 }
 
-type BeforeCommit = Box<dyn FnOnce(&mut Transaction) -> TxResult<()> + Send>;
+type BeforeCommit = Box<dyn FnMut(&mut Transaction) -> TxResult<()> + Send>;
 type OnCommit = Box<dyn FnOnce(&CommitReceipt) + Send>;
 pub(super) type OnAbort = Box<dyn FnOnce(&AbortReason<'_>) + Send>;
 
@@ -248,19 +250,24 @@ impl Transaction {
     /// commit and validated like any other write. It may register further
     /// callbacks of any kind; the `before_commit` ones run in the same pass.
     ///
-    /// An error from `f` fails the commit with that error and runs the
-    /// `on_abort` callbacks. A panic in `f` does the same with
-    /// [`Error::CallbackPanicked`], and leaves the database writable. Either
-    /// way the writes `f` made, the savepoints it set and the callbacks it
-    /// registered are taken back, and `f` is consumed: it is `FnOnce` and
-    /// cannot run again.
+    /// `f` may mutate what it captured. It runs again only when it returned an
+    /// error: an error from `f` takes back the writes it made, the savepoints
+    /// it set and the callbacks it registered, and leaves `f` queued where it
+    /// was, so the next [`Transaction::prepare`], or the commit, runs it
+    /// again. `f` must therefore not assume it runs once; what it captured
+    /// keeps what its failed run did to it. A commit that gets such an error
+    /// fails with it, and runs the `on_abort` callbacks.
+    ///
+    /// A panic in `f` fails the commit with [`Error::CallbackPanicked`] and
+    /// leaves the database writable. It takes back the same effects, and `f`
+    /// is dropped: the transaction can only be rolled back.
     ///
     /// [`Transaction::prepare`] runs the pending callbacks early, and
     /// [`Transaction::commit`] runs whatever is left. A callback does not run
     /// for a transaction that is rolled back or dropped.
     pub fn before_commit(
         &mut self,
-        f: impl FnOnce(&mut Transaction) -> TxResult<()> + Send + 'static,
+        f: impl FnMut(&mut Transaction) -> TxResult<()> + Send + 'static,
     ) {
         self.callbacks.queues().before_commit.push(Box::new(f));
     }
@@ -316,15 +323,18 @@ impl Transaction {
     /// registered after a successful call runs at the next one, after the
     /// hook.
     ///
-    /// An error from a callback is returned, the writes, savepoints and
-    /// registrations that callback made are taken back, and the callback is
-    /// consumed because it is `FnOnce`. The callbacks after it stay queued, so
-    /// a second call runs them. An error from the hook leaves the hook to run
-    /// again. A callback that panics returns [`Error::CallbackPanicked`], and
-    /// so does every later call: the transaction can only be rolled back.
+    /// An error from a callback is returned and the writes, savepoints and
+    /// registrations that callback made are taken back. The callback stays
+    /// queued, ahead of the ones behind it, so a second call runs it again and
+    /// then them. An error from the hook leaves the hook to run again. A
+    /// callback that panics returns [`Error::CallbackPanicked`], and so does
+    /// every later call: the transaction can only be rolled back.
     ///
     /// A callback that calls `prepare` on the transaction it was handed runs
-    /// the callbacks queued behind it inside itself.
+    /// the callbacks queued behind it, and the hook if it has not run, inside
+    /// itself. If that callback then fails, they are taken back with it and
+    /// run again at the next call; one that ran inside it is dropped only
+    /// when the transaction ends.
     pub fn prepare(&mut self) -> TxResult<()> {
         if let Prepare::Panicked(callback) = self.prepare_state {
             return Err(Error::CallbackPanicked { callback }.into());
@@ -343,12 +353,29 @@ impl Transaction {
     /// Run every queued `before_commit` callback, including those they
     /// register.
     fn run_before_commit(&mut self) -> TxResult<()> {
-        while let Some(f) = self
+        while let Some((at, mut f)) = self
             .callbacks
             .existing()
-            .and_then(|queues| queues.before_commit.pop())
+            .and_then(|queues| queues.before_commit.take())
         {
-            self.guarded("before_commit", f)?;
+            let outcome = self.guarded("before_commit", |txn| f(txn));
+            // A callback run inside another one is kept, in place, because
+            // that one failing runs it again. At the top it is done with.
+            let nested = self.callbacks.running > 0;
+            let panicked = matches!(self.prepare_state, Prepare::Panicked(_));
+            if let Some(queues) = self.callbacks.existing() {
+                match &outcome {
+                    Ok(()) if nested => queues.before_commit.put_back(at, f),
+                    // A failed callback runs again, with the ones that ran
+                    // inside it; after a panic nothing runs again.
+                    Err(_) if !panicked => {
+                        queues.before_commit.put_back(at, f);
+                        queues.before_commit.reset(at);
+                    }
+                    _ => {}
+                }
+            }
+            outcome?;
         }
         Ok(())
     }
@@ -360,6 +387,7 @@ impl Transaction {
         run: impl FnOnce(&mut Transaction) -> TxResult<()>,
     ) -> TxResult<()> {
         let mark = self.mark();
+        let state = self.prepare_state;
         self.callbacks.running += 1;
         let outcome = caught(callback, || run(self));
         self.callbacks.running -= 1;
@@ -375,6 +403,10 @@ impl Transaction {
             }
         };
         self.rewind(mark);
+        // A hook that ran inside the callback was rewound with it.
+        if !matches!(self.prepare_state, Prepare::Panicked(_)) {
+            self.prepare_state = state;
+        }
         Err(error)
     }
 
