@@ -65,7 +65,7 @@ src/
 ├── lib.rs              # Public API: Db, Snapshot, WriteBatch, column families, re-exports
 ├── backup.rs           # BackupEngine and restore flow
 ├── checkpoint.rs       # Hardlinked checkpoint creation
-├── column_family.rs    # Column-family handles and descriptors
+├── column_family.rs    # Column-family handles, descriptors, and the lock-free registry
 ├── conflict.rs         # Conflict reasons: Conflict, Access, WriteKind
 ├── error.rs            # Error enum, Result alias
 ├── event_listener.rs   # Flush/compaction event callbacks
@@ -93,10 +93,12 @@ src/
 │   ├── waiter.rs       # Waiter nodes, their free list, the wake list
 │   └── internal.rs     # The engine's private std/loom atomics and locks
 ├── txn_buffer.rs       # Concurrent write and read-set buffer of one transaction
-├── env/                # Env trait and backends: StdEnv, MemEnv, WASI, OPFS; db_lock.rs, open_file_limit.rs
+├── env/                # Env trait and backends: StdEnv, MemEnv, WASI, OPFS; db_lock.rs
+│   ├── mem_file.rs     # Lock-free in-memory file behind MemEnv and the OPFS mirror
+│   └── open_file_limit/ # max_open_files: lock-free slot table (slots.rs), rename-aside removal
 └── engine/
     ├── mod.rs          # RegolithEngine orchestration, read paths, rotation, recovery
-    ├── commit/         # Group commit pipeline: ring, leader, conflict check, stall signal
+    ├── commit/         # Group commit pipeline: ring, leader, conflict check, stall signal, column-family fence
     ├── compaction.rs   # Level/FIFO/universal compaction planning and worker loop
     ├── compaction/     # Per-snapshot-stripe folding of versions and merge chains
     ├── manifest.rs     # VersionSet, VersionEdit log, level tracking
