@@ -175,6 +175,10 @@ name = "transaction"
 harness = false
 
 [[bench]]
+name = "append"
+harness = false
+
+[[bench]]
 name = "scan_commit"
 harness = false
 

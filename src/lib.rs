@@ -57,6 +57,7 @@
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
 
+mod allocate;
 mod backup;
 mod checkpoint;
 mod column_family;

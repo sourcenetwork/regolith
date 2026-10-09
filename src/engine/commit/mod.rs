@@ -47,6 +47,7 @@ use crate::perf_context::{PerfTimer, PerfTimerField};
 use crate::statistics::{Histogram, Ticker};
 use crate::{Access, Conflict, WriteBatchOp};
 
+mod allocate;
 mod append;
 mod content;
 mod counter;

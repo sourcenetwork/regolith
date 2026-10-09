@@ -119,7 +119,7 @@ use kovan_queue::seg_queue::SegQueue;
 
 use crate::txn_buffer::TxnBuffer;
 use std::collections::{BTreeMap, HashMap};
-use std::ops::ControlFlow;
+use std::ops::{ControlFlow, Range};
 use std::path::Path;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
@@ -305,6 +305,12 @@ impl OptimisticTransactionDb {
     pub fn isolation(&self) -> IsolationLevel {
         self.isolation
     }
+
+    /// [`Db::allocate`] on the underlying database: reserves `n` values of
+    /// the counter at `key`, outside any transaction and never a conflict.
+    pub fn allocate(&self, key: &[u8], n: u64) -> Result<Range<u64>> {
+        self.inner.allocate(key, n)
+    }
 }
 
 /// Pessimistic-concurrency-control wrapper over a [`Db`].
@@ -392,6 +398,12 @@ impl TransactionDb {
     /// The default level [`Self::begin`] uses when its [`TxnOptions`] set none.
     pub fn isolation(&self) -> IsolationLevel {
         self.isolation
+    }
+
+    /// [`Db::allocate`] on the underlying database: reserves `n` values of
+    /// the counter at `key`, outside any transaction and never a conflict.
+    pub fn allocate(&self, key: &[u8], n: u64) -> Result<Range<u64>> {
+        self.inner.allocate(key, n)
     }
 }
 
