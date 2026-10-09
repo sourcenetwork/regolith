@@ -19,6 +19,7 @@ use std::io;
 
 use super::super::{DurabilityMode, ReadView, RegolithEngine, ValidationSet};
 use super::append::PendingAppend;
+use super::early::{Early, Mark};
 use super::replaced::Replaced;
 use super::write_check::WriteCheck;
 use crate::perf_context::{PerfContextSnapshot, PerfLevel};
@@ -42,6 +43,9 @@ pub(crate) struct TxnRequest {
     /// The committing thread's perf level: the leader counts the member's
     /// validation at it, on that thread's behalf.
     pub(crate) perf: PerfLevel,
+    /// The check the transaction ran at a horizon before it queued; the
+    /// leader checks only what landed above it.
+    pub(crate) early: Early,
 }
 
 /// The leader's verdict on one transaction member.
@@ -97,6 +101,9 @@ impl RegolithEngine {
     /// scans, then its written keys in operation order, so a multi-key
     /// conflict names the same key on every run.
     ///
+    /// `early` is the check the transaction ran at a horizon before it
+    /// queued: an item it found clean is checked here only if something
+    /// landed on it above that horizon, and then in full (`early.rs`).
     /// `ceiling` is the newest sequence `view` holds, the earlier members of
     /// the group included; a content-addressed put looks itself up only when
     /// something landed above the transaction's snapshot.
@@ -104,12 +111,24 @@ impl RegolithEngine {
         &self,
         checks: &ValidationSet,
         ops: &[WriteBatchOp],
+        early: &Early,
         view: &ReadView,
         ceiling: u64,
     ) -> io::Result<Verdict> {
         let mut merges_commuted = 0u64;
         let mut writes_elided = 0u64;
-        for check in &checks.reads {
+        let horizon = early.horizon;
+        // No table holds a sequence above the horizon, so whatever landed
+        // above it is in a memtable of the view.
+        let memtables_only = view.version.last_seq <= horizon;
+        let landed = |key: &[u8], mark: Mark| -> io::Result<bool> {
+            Ok(mark == Mark::Dirty
+                || self.landed_above_horizon(key, horizon, view, memtables_only)?)
+        };
+        for (at, check) in checks.reads.iter().enumerate() {
+            if !landed(&check.key, early.mark(at))? {
+                continue;
+            }
             if let Some((latest_seq, newest)) = self.latest_version_in_view(&check.key, view)?
                 && latest_seq > check.observed_seq
                 // Only a newer version can have changed what the read
@@ -136,10 +155,15 @@ impl RegolithEngine {
         }
         // A validated scan decided on a whole range, so a write anywhere in it
         // after the snapshot is a conflict, a key that left it or appeared in
-        // it alike.
-        for range in &checks.ranges {
+        // it alike. One found clean at the horizon looks only above it.
+        let reads = checks.reads.len();
+        for (at, range) in checks.ranges.iter().enumerate() {
+            let (floor, memtables_only) = match early.mark(reads + at) {
+                Mark::Dirty => (range.observed_seq, false),
+                _ => (horizon.max(range.observed_seq), memtables_only),
+            };
             if let Some((key, seq, theirs)) =
-                self.written_in_range(&range.lo, &range.hi, range.observed_seq, view)?
+                self.written_in_range_of(&range.lo, &range.hi, floor, view, memtables_only)?
             {
                 if let Some(s) = self.statistics() {
                     s.add(Ticker::CommitConflictsOnRead, 1);
@@ -170,7 +194,9 @@ impl RegolithEngine {
             // newer, no put is looked up.
             let landed_since = !checks.exempt.is_empty() && ceiling > observed_seq;
             let mut last_merged: Option<&[u8]> = None;
-            for op in ops {
+            let first_op = reads + checks.ranges.len();
+            for (at, op) in ops.iter().enumerate() {
+                let mark = early.mark(first_op + at);
                 let (key, mine) = match op {
                     WriteBatchOp::Put { key, .. } => (key, Access::Put),
                     WriteBatchOp::Delete { key } => (key, Access::Delete),
@@ -202,6 +228,7 @@ impl RegolithEngine {
                     // contract and the commit is refused loudly.
                     if landed_since
                         && let WriteBatchOp::Put { value, .. } = op
+                        && landed(key, mark)?
                         && self.content_mismatch(key, value, observed_seq, view)?
                     {
                         tracing::error!(
@@ -216,11 +243,15 @@ impl RegolithEngine {
                 // at the read's anchor and without the elision below. A
                 // presence-only read does not stand for the write, so that
                 // key goes on to the check below.
-                if checks
-                    .reads
-                    .binary_search_by(|read| read.key.as_slice().cmp(key))
-                    .is_ok_and(|at| !checks.reads[at].presence_only())
-                {
+                if Self::read_stands_for(checks, key) {
+                    continue;
+                }
+                // Clean at the horizon and nothing above it: clean, or, for a
+                // blind merge only operands landed on, commuting.
+                if !landed(key, mark)? {
+                    if mark == Mark::Commuted {
+                        merges_commuted += 1;
+                    }
                     continue;
                 }
                 match self.check_write(

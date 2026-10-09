@@ -134,9 +134,10 @@ impl RegolithEngine {
             mut ops,
             appends,
             durability,
+            early,
             ..
         } = txn;
-        let verdict = match self.validate(&checks, &ops, view, ceiling) {
+        let verdict = match self.validate(&checks, &ops, &early, view, ceiling) {
             Ok(Verdict::Conflict(conflict)) => {
                 return Ok((WriteRequest::Idle, Ok(Verdict::Conflict(conflict))));
             }

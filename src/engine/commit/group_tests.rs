@@ -14,6 +14,7 @@ use tempfile::TempDir;
 
 use super::super::wal::{fault, ops_record_len};
 use super::super::{ConflictKey, EngineOptions, ReadRule, ValidationSet};
+use super::early::EarlyVerdict;
 use super::*;
 use crate::column_family::{DEFAULT_CF_ID, prefix_key};
 use crate::{Access, WriteKind};
@@ -78,6 +79,8 @@ struct Txn {
     points: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
     merges: Vec<(Vec<u8>, Vec<u8>)>,
     blind: bool,
+    /// Keys a classifier exempted from validation.
+    exempt: Vec<Vec<u8>>,
     durability: DurabilityMode,
 }
 
@@ -89,6 +92,7 @@ impl Txn {
             points: BTreeMap::new(),
             merges: Vec::new(),
             blind: false,
+            exempt: Vec::new(),
             durability: DurabilityMode::Eventual,
         }
     }
@@ -140,23 +144,31 @@ impl Txn {
             reads,
             writes_at: Some(self.snapshot),
             blind_merges_commute: self.blind,
-            exempt: Vec::new(),
+            exempt: self.exempt.clone(),
             ranges: Vec::new(),
         }
     }
 
-    /// The request the pipeline carries for this commit.
-    fn request(&self) -> WriteRequest {
+    /// The request the pipeline carries for this commit, after the check a
+    /// transaction runs at the horizon before it queues, or the conflict
+    /// that check settled it with.
+    fn request(&self, engine: &RegolithEngine) -> Result<WriteRequest, Conflict> {
         let ops = grouped_batch_ops(self.points.clone(), Vec::new(), self.merges.clone());
-        WriteRequest::Txn(TxnRequest {
-            checks: self.checks(),
+        let checks = self.checks();
+        let early = match engine.check_early(&checks, &ops).unwrap() {
+            EarlyVerdict::Conflict(conflict) => return Err(conflict),
+            EarlyVerdict::Marks(early) => early,
+        };
+        Ok(WriteRequest::Txn(TxnRequest {
+            checks,
             record_bound: ops_record_len(&ops),
             cost_bound: ops.iter().map(batch_op_memtable_cost).sum(),
             ops,
             appends: Vec::new(),
             durability: self.durability,
             perf: crate::PerfContext::level(),
-        })
+            early,
+        }))
     }
 
     /// Commit alone, as the one-at-a-time run does.
@@ -180,14 +192,14 @@ enum Member {
 }
 
 impl Member {
-    fn request(&self) -> WriteRequest {
+    fn request(&self, engine: &RegolithEngine) -> Result<WriteRequest, Conflict> {
         match self {
-            Member::Txn(txn) => txn.request(),
-            Member::Plain(writes) => WriteRequest::Batch {
+            Member::Txn(txn) => txn.request(engine),
+            Member::Plain(writes) => Ok(WriteRequest::Batch {
                 ops: plain_ops(writes),
                 durability: DurabilityMode::Eventual,
                 disable_wal: false,
-            },
+            }),
         }
     }
 }
@@ -197,12 +209,25 @@ fn plain_ops(writes: &[(&'static [u8], Write)]) -> Vec<WriteBatchOp> {
 }
 
 /// Commit `members` as one group, in order, and return what each learned.
+/// Every member queues: none may be settled by its check at the horizon.
 fn commit_as_group(engine: &RegolithEngine, members: &[Member]) -> Vec<io::Result<Settled>> {
-    let slots: Vec<Arc<WriteSlot>> = members
+    let requests = members
         .iter()
-        .map(|member| {
+        .map(|member| member.request(engine).expect("queues for the group"))
+        .collect();
+    commit_requests(engine, requests)
+}
+
+/// Commit `requests` as one group, in order, and return what each learned.
+fn commit_requests(
+    engine: &RegolithEngine,
+    requests: Vec<WriteRequest>,
+) -> Vec<io::Result<Settled>> {
+    let slots: Vec<Arc<WriteSlot>> = requests
+        .into_iter()
+        .map(|request| {
             let slot = Arc::new(WriteSlot::new());
-            slot.arm(member.request()).expect("a fresh slot arms");
+            slot.arm(request).expect("a fresh slot arms");
             slot
         })
         .collect();
@@ -455,37 +480,22 @@ fn a_member_whose_own_check_fails_fails_alone() {
     let snapshot = put_now(&engine, b"k", b"v0");
     put_now(&engine, b"addressed", b"other bytes");
     // A content-addressed key put beside different bytes breaks its contract.
-    let mut addressed = Txn::at(snapshot).put(b"addressed", b"mine").request();
-    if let WriteRequest::Txn(txn) = &mut addressed {
-        txn.checks.exempt = vec![key_of(b"addressed")];
-    }
-    let slots: Vec<Arc<WriteSlot>> = [addressed, Txn::at(snapshot).put(b"j", b"lands").request()]
-        .into_iter()
-        .map(|request| {
-            let slot = Arc::new(WriteSlot::new());
-            slot.arm(request).unwrap();
-            slot
-        })
-        .collect();
-    {
-        let mut pipe = engine.pipeline.lock();
-        for slot in &slots {
-            let request = slot.take_request();
-            pipe.group
-                .push(GroupTicket::new(Some(Arc::clone(slot)), request));
-        }
-        assert!(
-            engine
-                .run_and_complete(&mut pipe, engine.view.load())
-                .is_none()
-        );
-    }
-    let err = slots[0].finish_settled().unwrap_err();
+    let mut addressed = Txn::at(snapshot).put(b"addressed", b"mine");
+    addressed.exempt = vec![key_of(b"addressed")];
+    let settled = commit_as_group(
+        &engine,
+        &[
+            Member::Txn(addressed),
+            Member::Txn(Txn::at(snapshot).put(b"j", b"lands")),
+        ],
+    );
+    let mut settled = settled.into_iter();
+    let err = settled.next().unwrap().unwrap_err();
     assert!(
         matches!(crate::Error::from(err), crate::Error::ContentMismatch),
         "the content-addressed put is refused"
     );
-    committed_seq(&slots[1].finish_settled());
+    committed_seq(&settled.next().unwrap());
     assert_eq!(
         read_now(&engine, b"addressed"),
         Some(b"other bytes".to_vec())
@@ -595,7 +605,7 @@ fn member_of(generated: &GenMember, seqs: &[u64]) -> Member {
 }
 
 /// What a member decided, in a form both runs report.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum Decided {
     Wrote(u64),
     Landed(Option<u64>),
@@ -642,16 +652,36 @@ proptest! {
         }
         let members: Vec<Member> = members.iter().map(|m| member_of(m, &seqs)).collect();
 
-        let in_group: Vec<Decided> = commit_as_group(&grouped, &members)
-            .into_iter()
-            .map(|settled| match settled.unwrap() {
-                Settled::Write(seq) => Decided::Wrote(seq),
-                Settled::Committed { seq, .. } => Decided::Landed(seq),
-                Settled::Conflict { conflict, .. } => lost(&conflict),
-            })
-            .collect();
-        let one_at_a_time: Vec<Decided> = members
+        // Each transaction checks itself at the horizon before it queues. One
+        // that conflicts there is decided then, ahead of the whole group: the
+        // order decisions are made in is the order to commit one at a time.
+        let mut decided_early = Vec::new();
+        let mut queued = Vec::new();
+        let mut requests = Vec::new();
+        for member in &members {
+            match member.request(&grouped) {
+                Ok(request) => {
+                    requests.push(request);
+                    queued.push(member);
+                }
+                Err(conflict) => decided_early.push((member, lost(&conflict))),
+            }
+        }
+        let in_group: Vec<Decided> = decided_early
             .iter()
+            .map(|(_, decided)| decided.clone())
+            .chain(
+                commit_requests(&grouped, requests)
+                    .into_iter()
+                    .map(|settled| match settled.unwrap() {
+                        Settled::Write(seq) => Decided::Wrote(seq),
+                        Settled::Committed { seq, .. } => Decided::Landed(seq),
+                        Settled::Conflict { conflict, .. } => lost(&conflict),
+                    }),
+            )
+            .collect();
+        let decision_order = decided_early.iter().map(|(member, _)| *member).chain(queued);
+        let one_at_a_time: Vec<Decided> = decision_order
             .map(|member| match member {
                 Member::Plain(writes) => Decided::Wrote(
                     serial

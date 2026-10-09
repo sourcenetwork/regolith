@@ -59,6 +59,7 @@ mod allocate;
 mod append;
 mod content;
 mod counter;
+mod early;
 mod group;
 mod range_rule;
 mod read_rules;
@@ -71,6 +72,7 @@ mod txn;
 mod write_check;
 
 pub(crate) use append::PendingAppend;
+use early::EarlyVerdict;
 use replaced::Replaced;
 pub(crate) use request::WriteRequest;
 use request::batch_op_memtable_cost;
@@ -382,6 +384,12 @@ impl RegolithEngine {
                 .map_err(crate::Error::into_io_error)?;
         }
 
+        // Checked up to the horizon here, on this thread and outside the
+        // pipeline mutex; the leader checks only what landed above it.
+        let early = match self.check_early(&checks, &ops)? {
+            EarlyVerdict::Conflict(conflict) => return Ok(CommitOutcome::Conflict(conflict)),
+            EarlyVerdict::Marks(early) => early,
+        };
         let settled = self.submit_settled(WriteRequest::Txn(TxnRequest {
             checks,
             ops,
@@ -390,6 +398,7 @@ impl RegolithEngine {
             record_bound,
             cost_bound,
             perf: crate::PerfContext::level(),
+            early,
         }))?;
         match settled {
             Settled::Committed {
@@ -902,6 +911,9 @@ mod append_tests;
 
 #[cfg(test)]
 mod exempt_tests;
+
+#[cfg(test)]
+mod early_tests;
 
 #[cfg(test)]
 mod group_tests;

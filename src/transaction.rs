@@ -1262,7 +1262,10 @@ impl Transaction {
     /// it in the group had committed one at a time before it, so it conflicts
     /// with them exactly as it would with any earlier commit, and its outcome
     /// is its own. A group whose log write or fsync fails fails every commit
-    /// in it with that error.
+    /// in it with that error. Before it queues, an optimistic commit checks
+    /// itself on the calling thread against everything committed up to that
+    /// moment, so the group only checks what landed after, and a conflict
+    /// that is already certain returns without waiting for the group.
     ///
     /// A conflict is reported to every [`crate::EventListener`] once, after
     /// the commit has released the pipeline and this transaction its key
