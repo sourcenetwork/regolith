@@ -43,6 +43,7 @@ use crate::portability::{AtomicU64, Ordering};
 /// up a ticker is `O(1)` and thread-safe.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(usize)]
+#[non_exhaustive]
 pub enum Ticker {
     /// Total key + value bytes written to the memtable. Counts
     /// raw user bytes; does not include internal encoding
@@ -224,6 +225,7 @@ impl Ticker {
 /// across histograms.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(usize)]
+#[non_exhaustive]
 pub enum Histogram {
     /// Wall-clock microseconds per `Db::get` call.
     DbGet = 0,

@@ -51,6 +51,7 @@ pub enum TableFileCreationReason {
 
 /// Information about a flush that just completed.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct FlushJobInfo {
     /// Numeric id of the SSTable that now holds the flushed
     /// memtable's contents.
@@ -76,6 +77,7 @@ pub struct FlushJobInfo {
 /// [`EventListener::on_compaction_begin`] and
 /// [`EventListener::on_compaction_completed`].
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct CompactionJobInfo {
     /// Source level (the level compaction is reading from).
     pub input_level: usize,
@@ -101,6 +103,7 @@ pub struct CompactionJobInfo {
 /// both flush output and compaction output, distinguished by
 /// [`TableFileCreationReason`].
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct TableFileCreationInfo {
     /// Numeric id of the SSTable.
     pub file_id: u64,
@@ -121,6 +124,7 @@ pub struct TableFileCreationInfo {
 /// that removed the file from the live set and the physical
 /// `unlink(2)` has succeeded.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct TableFileDeletionInfo {
     /// Numeric id of the unlinked file.
     pub file_id: u64,
@@ -131,6 +135,7 @@ pub struct TableFileDeletionInfo {
 /// Information about a file ingested via
 /// [`crate::Db::ingest_external_files`].
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct ExternalFileIngestionInfo {
     /// Path the caller supplied to `ingest_external_files`.
     pub external_file_path: PathBuf,
@@ -159,6 +164,7 @@ pub struct WalFullInfo {
 
 /// Reason passed to [`EventListener::on_background_error`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum BackgroundErrorReason {
     /// A background flush (memtable → L0) failed.
     Flush,

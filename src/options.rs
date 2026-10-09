@@ -46,6 +46,7 @@ pub const DEFAULT_MAX_BACKGROUND_COMPACTIONS: usize = 1;
 
 /// Decision returned by a [`CompactionFilter`] for each entry it sees.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum CompactionDecision {
     /// Leave the entry untouched.
     Keep,
@@ -379,6 +380,7 @@ impl Default for UniversalCompactionOptions {
 
 /// Controls when data is flushed to disk after a write.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum DurabilityMode {
     /// Flush to disk on every write. Safe against process and OS crashes.
     Immediate,

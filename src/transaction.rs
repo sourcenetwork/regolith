@@ -132,6 +132,7 @@ const DEFAULT_LOCK_TIMEOUT: Duration = Duration::from_secs(1);
 /// [`crate::Error`]: a conflict is a retry-able business outcome,
 /// distinct from an engine failure.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum TransactionError {
     /// The underlying engine failed, with the same typed [`Error`] a plain
     /// read or write reports: [`Error::Closed`] for a closed database,

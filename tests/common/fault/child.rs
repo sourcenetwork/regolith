@@ -311,6 +311,7 @@ impl ChildSpec {
                 match self.durability {
                     DurabilityMode::Immediate => "immediate".into(),
                     DurabilityMode::Eventual => "eventual".into(),
+                    other => panic!("no crash-harness encoding for {other:?}"),
                 },
             ),
             (
