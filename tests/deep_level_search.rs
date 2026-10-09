@@ -28,13 +28,11 @@ fn value(n: usize, generation: u8) -> Vec<u8> {
 /// Compaction runs only when asked, and cuts small tables, so one pass leaves
 /// hundreds of them in the bottom level.
 fn options(target_file_size: u64) -> Options {
-    Options {
-        max_background_compactions: 0,
-        write_buffer_size: 256 * 1024,
-        target_file_size,
-        block_size: 1024,
-        ..Options::default()
-    }
+    Options::default()
+        .max_background_compactions(0)
+        .write_buffer_size(256 * 1024)
+        .target_file_size(target_file_size)
+        .block_size(1024)
 }
 
 /// A small deterministic generator, so a failure reproduces.

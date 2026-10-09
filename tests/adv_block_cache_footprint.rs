@@ -94,11 +94,9 @@ fn adv_footprint_child() {
     let heap_before = LIVE.load(Ordering::Relaxed);
     let db = Db::open(
         dir.path(),
-        Options {
-            block_cache_size: BUDGET,
-            block_cache_num_shard_bits: bits,
-            ..Options::default()
-        },
+        Options::default()
+            .block_cache_size(BUDGET)
+            .block_cache_num_shard_bits(bits),
     )
     .unwrap();
     let heap_after = LIVE.load(Ordering::Relaxed);

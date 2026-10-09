@@ -280,11 +280,9 @@ impl ChildSpec {
     }
 
     pub fn options(&self) -> Options {
-        Options {
-            write_buffer_size: self.write_buffer_size,
-            durability: self.durability,
-            ..Options::default()
-        }
+        Options::default()
+            .write_buffer_size(self.write_buffer_size)
+            .durability(self.durability)
     }
 
     /// The exact ordered history this spec produces, computed identically
@@ -311,6 +309,7 @@ impl ChildSpec {
                 match self.durability {
                     DurabilityMode::Immediate => "immediate".into(),
                     DurabilityMode::Eventual => "eventual".into(),
+                    other => panic!("no crash-harness encoding for {other:?}"),
                 },
             ),
             (

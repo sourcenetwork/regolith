@@ -128,13 +128,10 @@ impl Env for CountingEnv {
 fn a_large_wal_record_costs_one_host_write() {
     let dir = TempDir::new().unwrap();
     let counters = Arc::new(Counters::default());
-    let opts = Options {
-        env: Arc::new(CountingEnv {
-            inner: StdEnv,
-            counters: Arc::clone(&counters),
-        }),
-        ..Default::default()
-    };
+    let opts = Options::default().env(Arc::new(CountingEnv {
+        inner: StdEnv,
+        counters: Arc::clone(&counters),
+    }));
     let db = Db::open(dir.path(), opts).unwrap();
 
     // Settle: opening writes MANIFEST records of its own.

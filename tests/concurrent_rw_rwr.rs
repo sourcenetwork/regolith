@@ -66,7 +66,7 @@ use std::time::{Duration, Instant};
 
 use regolith::{
     Db, IsolationLevel, OptimisticTransactionDb, Transaction, TransactionDb, TransactionError,
-    TxResult,
+    TxResult, TxnOptions,
 };
 use tempfile::TempDir;
 
@@ -138,7 +138,7 @@ fn decode(raw: Option<Vec<u8>>) -> u64 {
     })
 }
 
-fn retryable(result: &TxResult<()>) -> bool {
+fn retryable<T>(result: &TxResult<T>) -> bool {
     matches!(
         result,
         Err(TransactionError::Busy(_) | TransactionError::Conflict { .. })
@@ -163,11 +163,11 @@ fn back_off(refused: usize) {
 /// Bounded twice, by attempts and by `RETRY_DEADLINE`, with a growing
 /// back-off between attempts, so a livelock fails loudly and a slow machine
 /// is not hammered while it waits.
-fn commit_with_retry(what: &str, mut attempt: impl FnMut() -> TxResult<()>) -> u64 {
+fn commit_with_retry<T>(what: &str, mut attempt: impl FnMut() -> TxResult<T>) -> u64 {
     let deadline = Instant::now() + RETRY_DEADLINE;
     for refused in 0..MAX_ATTEMPTS {
         match attempt() {
-            Ok(()) => return refused as u64,
+            Ok(_) => return refused as u64,
             result if retryable(&result) => back_off(refused),
             Err(e) => panic!("{what}: unexpected transaction error: {e}"),
         }
@@ -192,13 +192,13 @@ impl Drop for StopOnDrop<'_> {
 
 /// Both transaction flavours behind one interface.
 trait Flavour: Sync {
-    fn begin(&self, level: IsolationLevel) -> Transaction<'_>;
+    fn begin_at(&self, level: IsolationLevel) -> Transaction;
     fn raw(&self) -> &Db;
 }
 
 impl Flavour for OptimisticTransactionDb {
-    fn begin(&self, level: IsolationLevel) -> Transaction<'_> {
-        self.begin_transaction_with(level)
+    fn begin_at(&self, level: IsolationLevel) -> Transaction {
+        self.begin(&TxnOptions::new().isolation(level))
     }
     fn raw(&self) -> &Db {
         self.db()
@@ -206,8 +206,8 @@ impl Flavour for OptimisticTransactionDb {
 }
 
 impl Flavour for TransactionDb {
-    fn begin(&self, level: IsolationLevel) -> Transaction<'_> {
-        self.begin_transaction_with(level)
+    fn begin_at(&self, level: IsolationLevel) -> Transaction {
+        self.begin(&TxnOptions::new().isolation(level))
     }
     fn raw(&self) -> &Db {
         self.db()
@@ -244,7 +244,7 @@ fn lost_update(db: &impl Flavour, level: IsolationLevel, storage: Storage) {
         for t in 0..THREADS {
             let (all_read, phase, first_round_commits) = (&all_read, &phase, &first_round_commits);
             scope.spawn(move || {
-                let tx = db.begin(level);
+                let tx = db.begin_at(level);
                 // Arrive at the rendezvous whatever the read did, so one
                 // failed reader cannot strand the other seven; judge it after.
                 let read = tx.get(b"counter");
@@ -285,7 +285,7 @@ fn lost_update(db: &impl Flavour, level: IsolationLevel, storage: Storage) {
                     }
                     // The stale write lost; increment again from a fresh read.
                     commit_with_retry("counter retry", || {
-                        let tx = db.begin(level);
+                        let tx = db.begin_at(level);
                         let value = decode(tx.get(b"counter")?);
                         tx.put(b"counter", &encode(value + 1))?;
                         tx.commit()
@@ -334,7 +334,7 @@ fn account(i: u64) -> Vec<u8> {
 }
 
 fn transfer(db: &impl Flavour, level: IsolationLevel, from: u64, to: u64) -> TxResult<()> {
-    let tx = db.begin(level);
+    let tx = db.begin_at(level);
     let a = decode(tx.get(&account(from))?);
     let b = decode(tx.get(&account(to))?);
     if a == 0 {
@@ -342,10 +342,10 @@ fn transfer(db: &impl Flavour, level: IsolationLevel, from: u64, to: u64) -> TxR
     }
     tx.put(&account(from), &encode(a - 1))?;
     tx.put(&account(to), &encode(b + 1))?;
-    tx.commit()
+    tx.commit().map(|_| ())
 }
 
-fn audit(tx: &Transaction<'_>) -> u64 {
+fn audit(tx: &Transaction) -> u64 {
     (0..ACCOUNTS)
         .map(|i| decode(tx.get(&account(i)).unwrap()))
         .sum()
@@ -361,7 +361,7 @@ fn snapshot_sum(db: &impl Flavour, level: IsolationLevel, storage: Storage) {
     // one it has not, commits in the middle of the audit. On `Tables` a
     // flush and a compaction follow it while the audit's snapshot is pinned:
     // the versions the audit has yet to read must survive both.
-    let auditor = db.begin(level);
+    let auditor = db.begin_at(level);
     let first = decode(auditor.get(&account(0)).unwrap());
     let (_, lookups) = table_lookups(|| {
         commit_with_retry("forced transfer", || transfer(db, level, 0, ACCOUNTS - 1))
@@ -428,7 +428,7 @@ fn snapshot_sum(db: &impl Flavour, level: IsolationLevel, storage: Storage) {
                 overlapped.load(Ordering::Acquire),
                 reached_tables.load(Ordering::Acquire)
             );
-            let tx = db.begin(level);
+            let tx = db.begin_at(level);
             let began = db.raw().snapshot().sequence();
             assert_eq!(audit(&tx), TOTAL, "{level:?}: audit {audits}");
             if db.raw().snapshot().sequence() > began {
@@ -438,7 +438,7 @@ fn snapshot_sum(db: &impl Flavour, level: IsolationLevel, storage: Storage) {
         }
     });
 
-    let tx = db.begin(level);
+    let tx = db.begin_at(level);
     assert_eq!(audit(&tx), TOTAL, "{level:?}: final total");
 }
 
@@ -532,7 +532,7 @@ enum Read {
 const READS: [Read; 2] = [Read::Plain, Read::ForUpdate];
 
 impl Read {
-    fn of(self, tx: &Transaction<'_>, key: &[u8]) -> Option<Vec<u8>> {
+    fn of(self, tx: &Transaction, key: &[u8]) -> Option<Vec<u8>> {
         match self {
             Self::Plain => tx.get(key),
             Self::ForUpdate => tx.get_for_update(key),
@@ -563,7 +563,7 @@ fn point_read_repeats<D: Flavour>(db: &D, level: IsolationLevel, storage: Storag
             storage.flush(db.raw());
         },
         |r, force| {
-            let tx = db.begin(level);
+            let tx = db.begin_at(level);
             let first = decode(read.of(&tx, &shared(r)));
             force();
             assert_eq!(
@@ -631,9 +631,9 @@ fn late(r: usize) -> Vec<u8> {
     format!("row/late-{r}").into_bytes()
 }
 
-fn scanned(tx: &Transaction<'_>) -> BTreeSet<Vec<u8>> {
+fn scanned(tx: &Transaction) -> BTreeSet<Vec<u8>> {
     tx.scan_stream(Some(b"row/"), Some(b"row0"))
-        .map(|(key, _)| key)
+        .map(|item| item.unwrap().0)
         .collect()
 }
 
@@ -656,7 +656,7 @@ fn scan_repeats<D: Flavour>(db: &D, level: IsolationLevel, storage: Storage, rea
             storage.flush(db.raw());
         },
         |r, force| {
-            let tx = db.begin(level);
+            let tx = db.begin_at(level);
             // A row read before the scan: a pessimistic `get_for_update`
             // locks it, and the scan has to serve it where `get` does, in the
             // middle of a stretch.
@@ -691,7 +691,7 @@ fn scan_repeats<D: Flavour>(db: &D, level: IsolationLevel, storage: Storage, rea
             let inserted = format!("row/new-{r}").into_bytes();
             assert!(!second.contains(&inserted));
             assert!(
-                scanned(&db.begin(level)).contains(&inserted),
+                scanned(&db.begin_at(level)).contains(&inserted),
                 "{level:?} {read:?}: a later transaction sees the insertion"
             );
         },

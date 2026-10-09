@@ -35,6 +35,16 @@ pub(crate) const VALUE_TYPE_MERGE: u8 = 2;
 /// Size of the trailing `(seq, value_type)` suffix in an internal key.
 pub(crate) const INTERNAL_KEY_SUFFIX_LEN: usize = 9;
 
+/// The kind of write an entry of `value_type` records. A conflict names the
+/// newer write by it.
+pub(crate) fn write_kind(value_type: u8) -> crate::WriteKind {
+    match value_type {
+        VALUE_TYPE_DELETION => crate::WriteKind::Delete,
+        VALUE_TYPE_MERGE => crate::WriteKind::Merge,
+        _ => crate::WriteKind::Put,
+    }
+}
+
 pub(crate) fn encode_internal_key(user_key: &[u8], seq: u64, value_type: u8) -> Vec<u8> {
     let mut key = Vec::with_capacity(user_key.len() + INTERNAL_KEY_SUFFIX_LEN);
     key.extend_from_slice(user_key);
@@ -127,7 +137,15 @@ fn raw_cmp_split(a: &[u8], b1: &[u8], b2: &[u8]) -> std::cmp::Ordering {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::WriteKind;
     use proptest::prelude::*;
+
+    #[test]
+    fn each_value_type_records_its_own_kind_of_write() {
+        assert_eq!(write_kind(VALUE_TYPE_VALUE), WriteKind::Put);
+        assert_eq!(write_kind(VALUE_TYPE_DELETION), WriteKind::Delete);
+        assert_eq!(write_kind(VALUE_TYPE_MERGE), WriteKind::Merge);
+    }
 
     #[test]
     fn roundtrip() {
@@ -231,11 +249,9 @@ mod tests {
         }
 
         let dir = tempfile::tempdir().unwrap();
-        let opts = crate::Options {
-            block_size: 64 * 1024,
-            compression: crate::CompressionType::None,
-            ..crate::Options::default()
-        };
+        let opts = crate::Options::default()
+            .block_size(64 * 1024)
+            .compression(crate::CompressionType::None);
         {
             let db = crate::Db::open(dir.path(), opts.clone()).unwrap();
             for i in 0..8 {

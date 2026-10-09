@@ -22,7 +22,7 @@ use std::time::Duration;
 #[cfg(test)]
 use std::time::Instant;
 
-use crate::sync::{Condvar, Mutex};
+use crate::sync::internal::{Condvar, Mutex};
 
 /// Priority of a rate-limited I/O request. High-priority waiters are
 /// always served before low-priority waiters; within a priority class
@@ -50,6 +50,10 @@ impl Priority {
 /// most `get_bytes_per_second()` bytes over time. Requests block until
 /// quota is available; shutdown (on drop or via an implementation-
 /// specific `stop()` call) must wake every blocked waiter.
+///
+/// A panic in this trait's code while a commit's memtable rotation runs it
+/// fails that commit with [`crate::Error::CallbackPanicked`] and latches the
+/// database read-only until it is reopened.
 pub trait RateLimiter: Send + Sync + 'static {
     /// Request `bytes` worth of I/O quota. Blocks until the request is
     /// served or the limiter is shut down.

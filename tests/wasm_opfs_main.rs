@@ -69,8 +69,7 @@ async fn a_database_opened_on_the_main_thread_round_trips_through_persist() {
         let env = OpfsEnv::mount(name, OpfsOptions::default())
             .await
             .expect("mount");
-        let mut options = Options::embedded();
-        options.env = env.as_env();
+        let options = Options::embedded().env(env.as_env());
 
         let db = Db::open(env.db_path(), options).expect("open");
         db.put(b"main", b"thread").expect("put");
@@ -84,8 +83,7 @@ async fn a_database_opened_on_the_main_thread_round_trips_through_persist() {
     let env = OpfsEnv::mount(name, OpfsOptions::default())
         .await
         .expect("remount");
-    let mut options = Options::embedded();
-    options.env = env.as_env();
+    let options = Options::embedded().env(env.as_env());
     let db = Db::open(env.db_path(), options).expect("reopen");
     assert_eq!(
         db.get(b"main").expect("get").as_deref(),
@@ -101,8 +99,7 @@ async fn a_database_larger_than_the_mirror_bound_is_refused_at_mount() {
         let env = OpfsEnv::mount(name, OpfsOptions::default())
             .await
             .expect("mount");
-        let mut options = Options::embedded();
-        options.env = env.as_env();
+        let options = Options::embedded().env(env.as_env());
         let db = Db::open(env.db_path(), options).expect("open");
         for i in 0..64u32 {
             db.put(format!("k{i:04}").as_bytes(), &[b'v'; 512])
@@ -146,12 +143,10 @@ async fn mirror_mode_refuses_immediate_durability() {
         "precondition: mirror mode does not provide durable sync"
     );
 
-    let options = Options {
-        env: std::sync::Arc::new(env.clone()),
-        durability: regolith::DurabilityMode::Immediate,
-        max_background_compactions: 0,
-        ..Options::default()
-    };
+    let options = Options::default()
+        .env(std::sync::Arc::new(env.clone()))
+        .durability(regolith::DurabilityMode::Immediate)
+        .max_background_compactions(0);
     let error = Db::open("/regolith-test-main-durability", options)
         .err()
         .expect("Immediate durability must be refused on a non-durable env");

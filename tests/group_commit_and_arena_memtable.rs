@@ -22,10 +22,7 @@ const BATCH_WIDTH: usize = 24;
 const MIN_READS: usize = 200_000;
 
 fn opts() -> Options {
-    Options {
-        write_buffer_size: 8 * 1024,
-        ..Options::default()
-    }
+    Options::default().write_buffer_size(8 * 1024)
 }
 
 fn batch_key(writer: usize, round: usize, k: usize) -> Vec<u8> {
@@ -236,11 +233,9 @@ fn slices_survive_drop_all_and_the_reuse_that_follows_it() {
     let dir = TempDir::new().unwrap();
     let db = Db::open(
         dir.path(),
-        Options {
-            write_buffer_size: 32 * 1024,
-            arena_profile: ArenaProfile::EMBEDDED,
-            ..Options::default()
-        },
+        Options::default()
+            .write_buffer_size(32 * 1024)
+            .arena_profile(ArenaProfile::EMBEDDED),
     )
     .unwrap();
 
@@ -299,10 +294,7 @@ fn a_second_ingest_must_not_be_served_the_first_sources_cached_blocks() {
 
     let dir = TempDir::new().unwrap();
     let staging = TempDir::new().unwrap();
-    let options = Options {
-        write_buffer_size: 32 * 1024,
-        ..Options::default()
-    };
+    let options = Options::default().write_buffer_size(32 * 1024);
     let db = Db::open(dir.path(), options.clone()).unwrap();
 
     for batch in 0..2usize {

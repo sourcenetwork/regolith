@@ -2,18 +2,18 @@
 
 ## 0. What Regolith Is
 
-**regolith** (crate: `regolith`, v0.1.1) is a pure Rust, embedded LSM-tree key-value store built from scratch. The architecture follows the LevelDB design (memtable → WAL → leveled SSTables → background compaction); the public API is shaped to slot into common embedded-KV abstraction layers so consuming applications can swap regolith in alongside other backends through the same trait.
+**regolith** (crate: `regolith`; the version is in `Cargo.toml`) is a pure Rust, embedded LSM-tree key-value store built from scratch. The architecture follows the LevelDB design (memtable → WAL → leveled SSTables → background compaction); the public API is shaped to slot into common embedded-KV abstraction layers so consuming applications can swap regolith in alongside other backends through the same trait.
 
 Early-stage. The public API (`Db`, `Snapshot`, `WriteBatch`, `Options`) is small and stable-shaped, but breakage is allowed pre-1.0.
 
 ### Design goals
 
-- **Pure Rust, no FFI** — no C/C++ toolchain, no `bindgen`, no linker surprises in the library or checked-in workspace tools
-- **LSM-tree** — write-optimized with level-based background compaction
-- **MVCC** — point-in-time consistent reads via global sequence numbers
-- **Crash recovery** — WAL with xxhash-checksummed records
-- **Concurrent reads** — lock-free memtable via `crossbeam-skiplist`
-- **No async runtime required** — compaction runs on a dedicated OS thread
+- **Pure Rust, no FFI**: no C/C++ toolchain, no `bindgen`, no linker surprises in the library or checked-in workspace tools
+- **LSM-tree**: write-optimized with level-based background compaction
+- **MVCC**: point-in-time consistent reads via global sequence numbers
+- **Crash recovery**: WAL with xxhash-checksummed records
+- **Concurrent reads**: an arena-backed skip list memtable (`src/engine/skiplist/`) that readers walk without a lock until a range delete lands in it; a block-cache hit is lock-free
+- **No async runtime required**: compaction runs on background worker threads (`Options::max_background_compactions`), or inline on a target that has none
 
 ---
 
@@ -50,9 +50,11 @@ Workspace layout:
 ```text
 src/                    # Publishable regolith library crate
 tests/                  # Public-API integration, corruption, concurrency, and property tests
+tests/auto_traits.rs    # Compile-time Send and Sync assertions for the public handles
 tools/regolith-bench/       # Pure-Rust benchmark CLI
 tools/regolith-stress/      # Pure-Rust stress CLI
 tools/regolith-ycsb/        # Pure-Rust YCSB-style workload CLI
+tools/regolith-wasm-probe/  # Pure-Rust wasm probe
 fuzz/                   # cargo-fuzz harnesses, outside the normal workspace
 ```
 
@@ -60,39 +62,71 @@ Library modules:
 
 ```text
 src/
-├── lib.rs              # Public API: Db, Snapshot, WriteBatch, column families, transactions, re-exports
+├── lib.rs              # Public API: Db, Snapshot, WriteBatch, column families, re-exports
 ├── backup.rs           # BackupEngine and restore flow
 ├── checkpoint.rs       # Hardlinked checkpoint creation
 ├── column_family.rs    # Column-family handles and descriptors
+├── conflict.rs         # Conflict reasons: Conflict, Access, WriteKind
 ├── error.rs            # Error enum, Result alias
 ├── event_listener.rs   # Flush/compaction event callbacks
 ├── iter.rs             # Public iterator wrappers
-├── options.rs          # Options and tuning enums
-├── os_hint.rs          # Best-effort OS cache hints
+├── options.rs          # Options, tuning enums, MergeOperator, CompactionFilter
+├── options/            # Options builder methods (builder.rs) and getters (getters.rs)
 ├── perf_context.rs     # Per-operation performance counters
+├── portability.rs      # Atomics shim and the portability tier map
 ├── rate_limiter.rs     # Token-bucket rate limiter
+├── slice.rs            # DbSlice: zero-copy value handle
 ├── sst_file_writer.rs  # External SSTable writer API
 ├── statistics.rs       # Tickers, histograms, and properties
+├── stream_writer.rs    # StreamingWriter: bounded-memory write stream
+├── sync.rs             # Std-backed Mutex, RwLock, Condvar and Gate, swapped for loom's under --cfg loom
 ├── tailing.rs          # Tailing iterator API
-├── transaction.rs      # Optimistic and pessimistic transaction wrappers
+├── testing.rs          # `testing` feature: property checks a caller runs against its own trait implementations
+├── transaction.rs      # Optimistic and pessimistic transactions, isolation levels
+├── transaction/        # policy.rs (KeyClassifier, key classes), txn_options.rs (TxnOptions),
+│                       # scan_range.rs (scan stretches), write_buffer.rs (buffered puts, deletes, merges)
 ├── ttl.rs              # TTL database wrapper
+├── sync/               # Public regolith::sync: async locks, semaphore, notify, event, latch, barrier, once cell
+│   ├── queue.rs        # Wait queue and drain role every primitive builds on
+│   ├── waiter.rs       # Waiter nodes, their free list, the wake list
+│   └── internal.rs     # The engine's private std/loom atomics and locks
+├── txn_buffer.rs       # Concurrent write and read-set buffer of one transaction
+├── env/                # Env trait and backends: StdEnv, MemEnv, WASI, OPFS; db_lock.rs, open_file_limit.rs
 └── engine/
-    ├── mod.rs          # RegolithEngine orchestration, read/write paths, recovery
+    ├── mod.rs          # RegolithEngine orchestration, read paths, rotation, recovery
+    ├── commit/         # Group commit pipeline: ring, leader, conflict check, stall signal
+    ├── compaction.rs   # Level/FIFO/universal compaction planning and worker loop
+    ├── compaction/     # Per-snapshot-stripe folding of versions and merge chains
+    ├── manifest.rs     # VersionSet, VersionEdit log, level tracking
+    ├── manifest/       # Manifest tests
+    ├── memtable.rs     # Arena-backed skip list memtable plus its range tombstones
+    ├── skiplist/       # Insert-only concurrent skip list over the arena
+    ├── sstable.rs      # SSTable reader/writer, footer, index block
+    ├── sstable/        # SSTable key walks and size limits
+    ├── wal.rs          # Write-ahead log: append, replay discriminator, checksummed records
+    ├── wal_replay.rs   # Streaming reader over one WAL file
+    ├── recovery.rs     # Rebuilding the memtable from the WALs at open
+    ├── arena.rs        # Bump allocator for one memtable
     ├── block.rs        # Data blocks: prefix compression, restart points, varint
-    ├── block_cache.rs  # Sharded LRU cache for decompressed SSTable blocks
+    ├── block_cache.rs  # Sharded CLOCK cache for decompressed SSTable blocks
+    ├── callback.rs     # Catching a panic in caller code inside a commit and naming its trait
     ├── bloom.rs        # Bloom filter (double-hashed xxh3)
     ├── checksum.rs     # Checksum helpers
-    ├── compaction.rs   # Level/FIFO/universal compaction planning and worker loop
-    ├── db_lock.rs      # Cross-process DB lock file handling
-    ├── durability.rs   # Directory sync helper
+    ├── filter_block.rs # SSTable filter region: user-key and prefix bloom filters
+    ├── index_block.rs  # Decoded SSTable index blocks
     ├── internal_key.rs # MVCC internal key encoding
+    ├── lookup_key.rs   # Inline-first internal key used by every read path
     ├── iterator.rs     # Engine iterator merge logic
-    ├── manifest.rs     # VersionSet, VersionEdit log, level tracking
-    ├── memtable.rs     # Lock-free skip list memtable
     ├── range_tombstone.rs # Range-delete tombstone encoding
+    ├── read_view.rs    # The published set of memtables and version a reader loads
+    ├── read_horizon.rs # Newest sequence whose data is durable and applied
     ├── snapshot_registry.rs # Active snapshot sequence tracking
-    ├── sstable.rs      # SSTable reader/writer, footer, index block
-    └── wal.rs          # Write-ahead log: append, replay, checksummed records
+    ├── source_walk.rs  # Newest-first walk over a view's sources for one key
+    ├── background_health.rs # Whether flush or compaction is failing, and why
+    ├── compaction_backoff.rs # Retry pacing for a failing compaction worker
+    ├── disk_check.rs   # Open-time warning when the filesystem is nearly full
+    ├── orphan_sweep.rs # Removal of SSTables the manifest does not reference
+    └── pending_outputs.rs # Compaction outputs not yet offered to the manifest
 ```
 
 ### Public API surface
@@ -102,12 +136,16 @@ src/
 and `Result`. Extension surfaces such as column families, transactions,
 TTL, backups, checkpoints, external SST ingestion, statistics, event
 listeners, merge operators, compaction filters, and rate limiting are
-also re-exported from `lib.rs`. Anything not re-exported is internal.
+also re-exported from `lib.rs`. `regolith::sync` is a public module of
+its own: runtime-free async primitives (barging with bounded bypass,
+cancellation-safe, no system call but kovan's `sched_yield`) plus
+kovan's channels, map, queues and `Atom`. Anything not re-exported is
+internal.
 
 ### File Size Guidelines
 
 - Under 200 lines: Fine
-- 200–400 lines: Check if doing one thing
+- 200 to 400 lines: Check if doing one thing
 - Over 400 lines: Consider splitting
 
 Several core engine files are intentionally larger today because they
@@ -178,14 +216,14 @@ workspace test run.
 1. `cargo test --workspace` passes
 2. `cargo clippy --workspace --all-targets -- -D warnings` clean
 3. `cargo fmt --all -- --check` clean
-4. `cargo deny check` clean — surfaces RUSTSEC advisories, license violations, and duplicate crates against the allow-list in `deny.toml`
+4. `cargo deny check` clean: surfaces RUSTSEC advisories, license violations, and duplicate crates against the allow-list in `deny.toml`
 
 These are the local gates mirrored in CI (`.github/workflows/ci.yml`).
 CI also builds docs with `cargo doc --workspace --no-deps`, checks the
 library and tools on the MSRV toolchain with `cargo check --workspace`,
 and runs scheduled ignored stress tests.
 
-CI also publishes a coverage summary via `cargo llvm-cov --summary-only` on every push; run it locally with `cargo llvm-cov` (HTML report lands in `target/llvm-cov/html/`) when a change touches a file whose coverage you care about. No hard gate yet — the baseline at the time of writing is ~93% regions / ~91% lines.
+CI also publishes a coverage summary via `cargo llvm-cov --summary-only` on every push; run it locally with `cargo llvm-cov` (HTML report lands in `target/llvm-cov/html/`) when a change touches a file whose coverage you care about. No hard gate yet; the baseline at the time of writing is ~93% regions / ~91% lines.
 
 ## Goal
 

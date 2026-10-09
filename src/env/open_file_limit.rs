@@ -34,7 +34,7 @@ use super::{
     Capabilities, DirEntry, Env, FileLock, FileMeta, JoinHandle, ReadFile, WriteFile, WriteMode,
 };
 use crate::portability::{AtomicBool, AtomicUsize, Ordering};
-use crate::sync::Mutex;
+use crate::sync::internal::Mutex;
 
 #[derive(Debug)]
 pub(crate) struct OpenFileLimit {

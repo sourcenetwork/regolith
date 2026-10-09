@@ -3,6 +3,7 @@ pub(crate) mod background_health;
 pub(crate) mod block;
 pub(crate) mod block_cache;
 pub(crate) mod bloom;
+pub(crate) mod callback;
 pub(crate) mod checksum;
 pub(crate) mod commit;
 pub(crate) mod compaction;
@@ -22,10 +23,12 @@ pub(crate) mod lookup_key;
 pub mod loom_model;
 pub(crate) mod manifest;
 pub(crate) mod memtable;
+pub(crate) mod open_transactions;
 pub(crate) mod orphan_sweep;
 pub(crate) mod pending_outputs;
 pub(crate) mod range_tombstone;
 pub(crate) mod read_horizon;
+mod read_rule;
 pub(crate) mod read_view;
 mod recovery;
 pub(crate) mod skiplist;
@@ -43,11 +46,12 @@ use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::sync::{Gate, Mutex, MutexGuard, OwnedGateWriteGuard};
+use crate::sync::internal::{Gate, Mutex, MutexGuard, OwnedGateWriteGuard};
 use kovan_queue::array_queue::ArrayQueue;
 
 use background_health::{BackgroundHealth, Hazard, Job};
 use block_cache::BlockCache;
+pub(crate) use commit::PendingAppend;
 use commit::{Pipeline, StallSignal, WriteSlot};
 use compaction::{CompactionOptions, CompactionOutcome, CompactionScheduler};
 use lookup_key::{LookupKey, with_key_scratch};
@@ -58,6 +62,7 @@ const STOP_TOO_MANY_MEMTABLES: &str = "stop: too many memtables";
 use pending_outputs::PendingOutputs;
 use range_tombstone::table_key_range;
 use read_horizon::ReadHorizon;
+pub(crate) use read_rule::ReadRule;
 use read_view::{ReadView, ReadViewCell, VersionStore};
 use recovery::rewrite_recovered_memtable_to_wal;
 use skiplist::InsertHint;
@@ -65,7 +70,7 @@ use snapshot_registry::SnapshotRegistry;
 use source_walk::Source;
 
 use crate::env::{Capabilities, Env, FileLock};
-use crate::{DbSlice, WriteBatchOp, event_listener};
+use crate::{Access, Conflict, DbSlice, WriteBatchOp, WriteKind, event_listener};
 use sstable::{
     LiveSst, LookupResult, Materialize, PointValue, SsTableMeta, SsTableReader, SsTableWriter,
     sst_filename,
@@ -86,12 +91,19 @@ pub(crate) enum DurabilityMode {
 /// the caller typically surfaces this as a retry-able error.
 #[derive(Debug)]
 pub(crate) enum CommitOutcome {
-    Ok,
-    Conflict {
-        key: Vec<u8>,
-        observed_seq: u64,
-        latest_seq: u64,
-    },
+    /// The commit validated. `seq` is the sequence its writes became visible
+    /// at, and `None` for a commit that carried no write.
+    Ok { seq: Option<u64> },
+    /// The reason, with the key still carrying its column-family prefix.
+    Conflict(Conflict),
+}
+
+/// Why the engine stopped taking writes, see `RegolithEngine::write_latch`.
+enum WriteLatch {
+    /// A failed commit group could not be rolled back out of the log.
+    Wal(std::io::ErrorKind, String),
+    /// A caller's code of this trait panicked inside the ordered step.
+    CallbackPanicked(&'static str),
 }
 
 /// Lay a commit's writes out as one batch: point operations in ascending key
@@ -154,11 +166,33 @@ pub(crate) struct ConflictKey {
     /// with a key classifier, which narrows it to `presence_only`; the
     /// commit does not look at it.
     pub found: bool,
-    /// The read returned a value of a key whose bytes never differ, so it
-    /// is lost only when the key is gone: a newer version conflicts only if
-    /// the newest is a deletion, a covering range delete included. It does
-    /// not stand for a write of the same key, which takes its own check.
-    pub presence_only: bool,
+    /// What the transaction did with the key, which is what a conflict on it
+    /// reports. [`Access::ReadPresence`] marks a read of a key whose bytes
+    /// never differ that returned a value, so it is lost only when the key
+    /// is gone: see [`ConflictKey::presence_only`].
+    pub access: Access,
+    /// What counts as a change to the key since the read.
+    pub rule: ReadRule,
+}
+
+impl ConflictKey {
+    /// The read returned a value of a key whose bytes never differ, so a newer
+    /// version conflicts only if the newest is a deletion, a covering range
+    /// delete included. It does not stand for a write of the same key, which
+    /// takes its own check.
+    pub fn presence_only(&self) -> bool {
+        self.access == Access::ReadPresence
+    }
+}
+
+/// A key range a validated scan covered, as prefixed keys `[lo, hi)`: no
+/// write may have landed in it after `observed_seq`. Sorted and disjoint in a
+/// [`ValidationSet`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RangeCheck {
+    pub lo: Vec<u8>,
+    pub hi: Vec<u8>,
+    pub observed_seq: u64,
 }
 
 /// What a commit validates on top of the operations it carries.
@@ -193,6 +227,10 @@ pub(crate) struct ValidationSet {
     /// named some, so a commit without one pays nothing. Their reads are not
     /// in `reads`, and a key the commit deletes is never listed.
     pub exempt: Vec<Vec<u8>>,
+    /// Ranges a validated scan covered, which conflict with any write newer
+    /// than their `observed_seq` inside them (see `commit::range_rule`).
+    /// Empty unless the transaction used a validated scan.
+    pub ranges: Vec<RangeCheck>,
 }
 
 fn batch_op_wal_bytes(op: &WriteBatchOp) -> u64 {
@@ -297,6 +335,7 @@ pub(crate) struct EngineOptions {
     pub(crate) prefix_extractor: Option<Arc<dyn crate::options::PrefixExtractor>>,
     pub(crate) merge_operator: Option<Arc<dyn crate::options::MergeOperator>>,
     pub(crate) listeners: Vec<Arc<dyn crate::event_listener::EventListener>>,
+    pub(crate) transaction_hooks: Option<Arc<dyn crate::TransactionHooks>>,
     pub(crate) statistics: Option<Arc<crate::statistics::Statistics>>,
     pub(crate) rate_limiter: Option<Arc<dyn crate::rate_limiter::RateLimiter>>,
     pub(crate) level0_slowdown_writes_trigger: usize,
@@ -407,6 +446,7 @@ impl Default for EngineOptions {
             prefix_extractor: None,
             merge_operator: None,
             listeners: Vec::new(),
+            transaction_hooks: None,
             statistics: None,
             rate_limiter: None,
             level0_slowdown_writes_trigger: 20,
@@ -461,6 +501,8 @@ pub(crate) struct RegolithEngine {
     visible_seq: ReadHorizon,
     close_state: AtomicU8,
     close_lock: Mutex<()>,
+    /// Transactions that `close` must abort. See `open_transactions`.
+    open_transactions: open_transactions::OpenTransactions,
     active_wal: Mutex<Option<Wal>>,
     wal_id: AtomicU64,
     sst_dir: PathBuf,
@@ -511,11 +553,13 @@ pub(crate) struct RegolithEngine {
     flushing: Mutex<()>,
     /// Latched write-path failure. Set only when a failed commit group
     /// could not be rolled back out of the WAL, which leaves the log with
-    /// a tail no later write may extend. Once set, every write fails loud
-    /// with the original reason instead of appending after unknown bytes.
-    wal_failure: Mutex<Option<(std::io::ErrorKind, String)>>,
-    /// Cheap gate on `wal_failure`, checked on every write.
-    wal_failed: AtomicBool,
+    /// a tail no later write may extend, or when a caller's code panicked
+    /// inside the commit's ordered step. Once set, every write fails loud
+    /// with the original reason instead of appending after unknown bytes or
+    /// state.
+    write_latch: Mutex<Option<WriteLatch>>,
+    /// Cheap gate on `write_latch`, checked on every write.
+    write_latched: AtomicBool,
     /// Signal used by foreground writers to wait out a "stop writes"
     /// condition (too many L0 files, too many unflushed memtables).
     /// The background compaction thread holds a clone of this `Arc`
@@ -690,6 +734,7 @@ impl RegolithEngine {
             visible_seq: ReadHorizon::new(latest_seq),
             close_state: AtomicU8::new(CLOSE_STATE_OPEN),
             close_lock: Mutex::new(()),
+            open_transactions: open_transactions::OpenTransactions::new(),
             active_wal: Mutex::new(Some(wal)),
             wal_id: AtomicU64::new(wal_id),
             sst_dir,
@@ -702,8 +747,8 @@ impl RegolithEngine {
             commit_ring: Self::new_commit_ring(),
             pipeline: Mutex::new(Pipeline::new()),
             flushing: Mutex::new(()),
-            wal_failure: Mutex::new(None),
-            wal_failed: AtomicBool::new(false),
+            write_latch: Mutex::new(None),
+            write_latched: AtomicBool::new(false),
             stall_signal,
             cached_stall_level: AtomicU8::new(0),
             compaction_in_progress,
@@ -826,6 +871,7 @@ impl RegolithEngine {
             visible_seq: ReadHorizon::new(latest_seq),
             close_state: AtomicU8::new(CLOSE_STATE_OPEN),
             close_lock: Mutex::new(()),
+            open_transactions: open_transactions::OpenTransactions::new(),
             active_wal: Mutex::new(None),
             wal_id: AtomicU64::new(wal_id),
             sst_dir,
@@ -843,8 +889,8 @@ impl RegolithEngine {
             commit_ring: Self::new_commit_ring(),
             pipeline: Mutex::new(Pipeline::new()),
             flushing: Mutex::new(()),
-            wal_failure: Mutex::new(None),
-            wal_failed: AtomicBool::new(false),
+            write_latch: Mutex::new(None),
+            write_latched: AtomicBool::new(false),
             stall_signal,
             cached_stall_level: AtomicU8::new(0),
             compaction_in_progress: Arc::new(Mutex::new(HashSet::new())),
@@ -889,12 +935,30 @@ impl RegolithEngine {
         self.options.merge_operator.as_deref()
     }
 
+    /// Refuses a merge write on a database with no operator to fold it, which
+    /// reads would otherwise disagree about.
+    pub(crate) fn require_merge_operator(&self) -> Result<(), crate::Error> {
+        self.merge_operator()
+            .map(|_| ())
+            .ok_or(crate::Error::NoMergeOperator)
+    }
+
+    /// The transactions `close` aborts.
+    pub(crate) fn open_transactions(&self) -> &open_transactions::OpenTransactions {
+        &self.open_transactions
+    }
+
+    /// The database-wide transaction callbacks, if any are installed.
+    pub(crate) fn transaction_hooks(&self) -> Option<&Arc<dyn crate::TransactionHooks>> {
+        self.options.transaction_hooks.as_ref()
+    }
+
     pub(crate) fn is_closed(&self) -> bool {
         self.close_state.load(Ordering::Acquire) != CLOSE_STATE_OPEN
     }
 
     fn closed_error() -> std::io::Error {
-        std::io::Error::new(std::io::ErrorKind::NotConnected, "database is closed")
+        crate::Error::Closed.into_io_error()
     }
 
     fn ensure_open(&self) -> std::io::Result<()> {
@@ -906,16 +970,13 @@ impl RegolithEngine {
     }
 
     fn read_only_error() -> std::io::Error {
-        std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            "database was opened read-only",
-        )
+        crate::Error::ReadOnly.into_io_error()
     }
 
     pub(crate) fn ensure_writable(&self) -> std::io::Result<()> {
         self.ensure_open()?;
-        if self.wal_failed.load(Ordering::Acquire) {
-            return Err(self.wal_failure_error());
+        if self.write_latched.load(Ordering::Acquire) {
+            return Err(self.latched_error());
         }
         if self.is_read_only() {
             Err(Self::read_only_error())
@@ -928,16 +989,34 @@ impl RegolithEngine {
     /// on its own, so every later write fails loud with the reason
     /// rather than appending after a tail nobody can account for.
     pub(crate) fn latch_wal_failure(&self, err: &std::io::Error) {
-        *self.wal_failure.lock() = Some((err.kind(), err.to_string()));
-        self.wal_failed.store(true, Ordering::Release);
+        self.latch(WriteLatch::Wal(err.kind(), err.to_string()));
     }
 
-    fn wal_failure_error(&self) -> std::io::Error {
-        match self.wal_failure.lock().as_ref() {
-            Some((kind, message)) => std::io::Error::new(
+    /// Latch the engine read-only because a caller's `callback` panicked
+    /// inside the commit's ordered step, which left that step's shared state
+    /// unaccounted for. Every later write fails with
+    /// [`crate::Error::CallbackPanicked`] until the database is reopened.
+    pub(crate) fn latch_callback_panic(&self, callback: &'static str) {
+        self.latch(WriteLatch::CallbackPanicked(callback));
+    }
+
+    /// Keep the first reason: it is the one that explains the rest.
+    fn latch(&self, latch: WriteLatch) {
+        self.write_latch.lock().get_or_insert(latch);
+        self.write_latched.store(true, Ordering::Release);
+    }
+
+    fn latched_error(&self) -> std::io::Error {
+        match self.write_latch.lock().as_ref() {
+            Some(WriteLatch::Wal(kind, message)) => std::io::Error::new(
                 *kind,
                 format!("write-ahead log left in an unknown state: {message}"),
             ),
+            Some(WriteLatch::CallbackPanicked(callback)) => crate::Error::CallbackPanicked {
+                callback,
+                latched: true,
+            }
+            .into_io_error(),
             None => std::io::Error::other("write-ahead log left in an unknown state"),
         }
     }
@@ -960,7 +1039,7 @@ impl RegolithEngine {
             drop(guard);
             tracing::error!(error = %err, "syncing the write-ahead log before sealing it failed");
             self.latch_wal_failure(&err);
-            self.notify_wal_error(&err);
+            self.notify_wal_error(&err)?;
             return Err(err);
         }
         let new_wal = Wal::create_in(&self.env, &self.wal_dir.join(wal_filename(new_wal_id)))?;
@@ -968,7 +1047,12 @@ impl RegolithEngine {
     }
 
     fn validate_prefixed_key_size(&self, key: &[u8]) -> std::io::Result<()> {
-        let user_key_len = key.len().saturating_sub(4);
+        self.validate_user_key_len(key.len().saturating_sub(4))
+    }
+
+    /// [`Self::validate_prefixed_key_size`] for a key known by its length,
+    /// without the column-family prefix.
+    fn validate_user_key_len(&self, user_key_len: usize) -> std::io::Result<()> {
         if user_key_len <= self.options.max_key_size {
             return Ok(());
         }
@@ -1321,19 +1405,31 @@ impl RegolithEngine {
     ) -> std::io::Result<Option<PointValue>> {
         self.ensure_open()?;
         let view = self.view.load();
+        self.lookup_loaded(lk, materialize, &view)
+    }
+
+    /// [`Self::lookup`] against a view the caller already loaded, so a commit
+    /// check reads a value the way a `get` does: a configured merge operator
+    /// collapses the key's operands first.
+    fn lookup_loaded(
+        &self,
+        lk: &LookupKey,
+        materialize: Materialize,
+        view: &ReadView,
+    ) -> std::io::Result<Option<PointValue>> {
         if self.options.merge_operator.is_some() {
             Self::reject_guarded_merge(materialize)?;
             // A merge operator decides inside `full_merge` whether a
             // value exists at all, so a length-only request has to
             // collapse the chain exactly like a full read does.
-            return Ok(self.get_with_merge(lk, &view)?.map(PointValue::Value));
+            return Ok(self.get_with_merge(lk, view)?.map(PointValue::Value));
         }
         self.lookup_in_view(
             lk.prefixed_user_key(),
             lk.snapshot_seq(),
             lk,
             materialize,
-            &view,
+            view,
         )
     }
 
@@ -1548,11 +1644,11 @@ impl RegolithEngine {
     /// per input key in the same order as `keys`. Duplicate keys in the
     /// input produce duplicate results.
     ///
-    /// The batch amortizes per-call overhead - a single version snapshot,
-    /// a single memtable lock acquisition per level, one logical walk of
-    /// the source hierarchy - and short-circuits once every key has been
-    /// resolved. All keys see the **same** consistent view, regardless of
-    /// concurrent writers.
+    /// The batch amortizes per-call overhead - one loaded view, one
+    /// sequence, one logical walk of the source hierarchy - and
+    /// short-circuits once every key has been resolved. All keys are read
+    /// at that one sequence from that one view, with or without a merge
+    /// operator, so a concurrent writer cannot make two keys disagree.
     pub(crate) fn multi_get_latest(&self, keys: &[&[u8]]) -> std::io::Result<Vec<Option<Vec<u8>>>> {
         self.ensure_open()?;
         let view = self.view.load();
@@ -2143,9 +2239,17 @@ impl RegolithEngine {
         point_ops: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
         range_deletes: Vec<(Vec<u8>, Vec<u8>)>,
         merges: Vec<(Vec<u8>, Vec<u8>)>,
+        appends: Vec<PendingAppend>,
         durability: DurabilityMode,
     ) -> std::io::Result<CommitOutcome> {
-        self.commit_optimistic(checks, point_ops, range_deletes, merges, durability)
+        self.commit_optimistic(
+            checks,
+            point_ops,
+            range_deletes,
+            merges,
+            appends,
+            durability,
+        )
     }
 
     /// Whether this commit's write for `key` would store exactly what `key`
@@ -2168,12 +2272,12 @@ impl RegolithEngine {
         key: &[u8],
         ops: &[WriteBatchOp],
         view: &ReadView,
-        newest_type: u8,
+        newest: WriteKind,
     ) -> std::io::Result<bool> {
         // Unresolved merge operands on top mean a point read replays them, so
         // what it returns is not what this key stores. Beneath a newest value
         // or deletion, any operands are already folded and the read is exact.
-        if newest_type == internal_key::VALUE_TYPE_MERGE {
+        if newest == WriteKind::Merge {
             return Ok(false);
         }
 
@@ -2207,6 +2311,33 @@ impl RegolithEngine {
             return Ok(false);
         };
 
+        self.committed_equals(key, intended, view)
+    }
+
+    /// [`Self::committed_equals`] for a key whose newest version is `newest`:
+    /// an operand on top means a read replays it, so what the key stores is
+    /// not what a lookup of its value returns, and the write never matches.
+    fn committed_equals_after(
+        &self,
+        key: &[u8],
+        intended: Option<&[u8]>,
+        view: &ReadView,
+        newest: WriteKind,
+    ) -> std::io::Result<bool> {
+        if newest == WriteKind::Merge {
+            return Ok(false);
+        }
+        self.committed_equals(key, intended, view)
+    }
+
+    /// Whether `key` holds exactly `intended` (`None`: nothing) in `view`,
+    /// whose newest version is a value or a deletion, never an operand.
+    fn committed_equals(
+        &self,
+        key: &[u8],
+        intended: Option<&[u8]>,
+        view: &ReadView,
+    ) -> std::io::Result<bool> {
         let snap = u64::MAX;
         let lk = LookupKey::from_prefixed(key, snap);
         let committed = self.lookup_in_view(key, snap, &lk, Materialize::Value, view)?;
@@ -2224,10 +2355,10 @@ impl RegolithEngine {
         })
     }
 
-    /// Return the sequence number and value type of the newest write that
+    /// Return the sequence number and kind of the newest write that
     /// touched `key` across every source, or `None` if nothing ever wrote
     /// it. A covering range tombstone that outranks every point entry
-    /// reports as a deletion.
+    /// reports as a range delete.
     /// Used by transaction commit to detect conflicts, so it counts
     /// every kind of write: point entries, point tombstones, merge
     /// operands, and range tombstones that cover the key. The caller
@@ -2237,14 +2368,24 @@ impl RegolithEngine {
     /// is accumulated on the way down, mirroring the read path: a
     /// tombstone in a newer source outranks a point entry found in an
     /// older one.
+    #[inline]
     fn latest_version_in_view(
         &self,
         key: &[u8],
         view: &ReadView,
-    ) -> std::io::Result<Option<(u64, u8)>> {
-        use internal_key::VALUE_TYPE_DELETION;
+    ) -> std::io::Result<Option<(u64, WriteKind)>> {
+        self.latest_version_upto(key, u64::MAX, view)
+    }
 
-        let snap = u64::MAX;
+    /// [`Self::latest_version_in_view`] among the writes at or below `snap`,
+    /// for a check that runs without the pipeline mutex and so must not see
+    /// a group that is still being published.
+    fn latest_version_upto(
+        &self,
+        key: &[u8],
+        snap: u64,
+        view: &ReadView,
+    ) -> std::io::Result<Option<(u64, WriteKind)>> {
         let lk = LookupKey::from_prefixed(key, snap);
         let walked = view.walk_newest_first(key, snap, |source, max_rt_seq| {
             let version = match source {
@@ -2254,19 +2395,21 @@ impl RegolithEngine {
                 }
             };
             // A covering range tombstone that outranks the point entry
-            // stands in for it, as a deletion.
+            // stands in for it.
             Ok(match version {
                 Some((point_seq, _)) if max_rt_seq > point_seq => {
-                    ControlFlow::Break((max_rt_seq, VALUE_TYPE_DELETION))
+                    ControlFlow::Break((max_rt_seq, WriteKind::RangeDelete))
                 }
-                Some(version) => ControlFlow::Break(version),
+                Some((seq, value_type)) => {
+                    ControlFlow::Break((seq, internal_key::write_kind(value_type)))
+                }
                 None => ControlFlow::Continue(()),
             })
         })?;
         Ok(match walked {
             ControlFlow::Break(version) => Some(version),
             ControlFlow::Continue(max_rt_seq) => {
-                (max_rt_seq > 0).then_some((max_rt_seq, VALUE_TYPE_DELETION))
+                (max_rt_seq > 0).then_some((max_rt_seq, WriteKind::RangeDelete))
             }
         })
     }
@@ -2387,13 +2530,14 @@ impl RegolithEngine {
                 let hazard = self.background_health.record_failure(Job::Flush, &e);
                 tracing::error!(error = %e, hazard = hazard.label(), "Flush failed");
                 if !self.options.listeners.is_empty() {
-                    let err = crate::Error::from(std::io::Error::new(e.kind(), e.to_string()));
-                    crate::event_listener::dispatch(&self.options.listeners, |l| {
+                    let err = crate::Error::from(crate::Error::clone_io(&e));
+                    crate::event_listener::dispatch_contained(&self.options.listeners, |l| {
                         l.on_background_error(
                             crate::event_listener::BackgroundErrorReason::Flush,
                             &err,
                         )
-                    });
+                    })
+                    .map_err(crate::Error::into_io_error)?;
                 }
                 Err(e)
             }
@@ -2449,7 +2593,15 @@ impl RegolithEngine {
         // The walk streams straight out of the arena: a flush holds one
         // entry plus the block builder, never a second copy of the
         // whole memtable.
-        memtable.try_for_each_entry(|internal_key, value| writer.add(internal_key, value))?;
+        let mut walk =
+            || memtable.try_for_each_entry(|internal_key, value| writer.add(internal_key, value));
+        // Only a prefix extractor runs caller code in the walk, so only then
+        // is there a panic to catch.
+        if self.options.prefix_extractor.is_some() {
+            callback::contain("PrefixExtractor", walk).map_err(crate::Error::into_io_error)??;
+        } else {
+            walk()?;
+        }
 
         // Persist range tombstones alongside the point entries.
         for rt in &range_tombstones {
@@ -2473,7 +2625,10 @@ impl RegolithEngine {
         // starve foreground traffic. Rate-limiting is opt-in via
         // `Options::rate_limiter`; a `None` limiter is a no-op.
         if let Some(limiter) = &self.options.rate_limiter {
-            limiter.request(file_size, crate::rate_limiter::Priority::Low);
+            callback::contain("RateLimiter", || {
+                limiter.request(file_size, crate::rate_limiter::Priority::Low)
+            })
+            .map_err(crate::Error::into_io_error)?;
         }
 
         let reader = Arc::new(SsTableReader::open_with(
@@ -2566,12 +2721,14 @@ impl RegolithEngine {
                 largest_key: largest,
                 duration,
             };
-            event_listener::dispatch(&self.options.listeners, |l| {
+            event_listener::dispatch_contained(&self.options.listeners, |l| {
                 l.on_table_file_created(&create_info)
-            });
-            event_listener::dispatch(&self.options.listeners, |l| {
+            })
+            .map_err(crate::Error::into_io_error)?;
+            event_listener::dispatch_contained(&self.options.listeners, |l| {
                 l.on_flush_completed(&flush_info)
-            });
+            })
+            .map_err(crate::Error::into_io_error)?;
         }
 
         tracing::info!(
@@ -3400,6 +3557,9 @@ impl RegolithEngine {
         self.close_state
             .store(CLOSE_STATE_CLOSING, Ordering::Release);
         self.stall_signal.notify_all();
+        // A transaction still open ends here, on this thread, before the final
+        // sync; one already committing is left to finish through it.
+        self.open_transactions.abort_all(self);
 
         match self.close_inner() {
             Ok(()) => {

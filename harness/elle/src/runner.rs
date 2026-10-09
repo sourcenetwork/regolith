@@ -22,14 +22,11 @@ const CHILD_PROCESS_STRIDE: u64 = 1000;
 const CHILD_VALUE_STRIDE: i64 = 1_000_000;
 
 fn options(sync: bool) -> Options {
-    Options {
-        durability: if sync {
-            DurabilityMode::Immediate
-        } else {
-            DurabilityMode::Eventual
-        },
-        ..Default::default()
-    }
+    Options::default().durability(if sync {
+        DurabilityMode::Immediate
+    } else {
+        DurabilityMode::Eventual
+    })
 }
 
 pub fn run(cfg: &Config) -> Result<usize, String> {

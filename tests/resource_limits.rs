@@ -107,10 +107,7 @@ fn measured<T>(label: &str, f: impl FnOnce() -> T) -> T {
 // ---------------------------------------------------------------------
 
 fn opts_with(write_buffer_size: usize) -> Options {
-    Options {
-        write_buffer_size,
-        ..Options::default()
-    }
+    Options::default().write_buffer_size(write_buffer_size)
 }
 
 fn expect_invalid_argument(result: regolith::Result<()>, what: &str) {
@@ -362,11 +359,9 @@ fn the_value_size_limit_is_exact_on_the_point_and_batch_paths() {
     let dir = TempDir::new().unwrap();
     let db = Db::open(
         dir.path(),
-        Options {
-            max_value_size: LIMIT,
-            write_buffer_size: 64 * 1024,
-            ..Options::default()
-        },
+        Options::default()
+            .max_value_size(LIMIT)
+            .write_buffer_size(64 * 1024),
     )
     .unwrap();
 
@@ -410,11 +405,9 @@ fn the_key_size_limit_is_exact_on_the_point_and_batch_paths() {
     let dir = TempDir::new().unwrap();
     let db = Db::open(
         dir.path(),
-        Options {
-            max_key_size: LIMIT,
-            write_buffer_size: 64 * 1024,
-            ..Options::default()
-        },
+        Options::default()
+            .max_key_size(LIMIT)
+            .write_buffer_size(64 * 1024),
     )
     .unwrap();
 
@@ -766,15 +759,13 @@ fn a_deep_level_structure_still_answers_every_read() {
     measured("cascade to L6", || {
         const KEYS: usize = 6_000;
         let dir = TempDir::new().unwrap();
-        let opts = Options {
-            write_buffer_size: 8 * 1024,
-            block_size: 1024,
-            target_file_size: 8 * 1024,
-            level_base_bytes: 1024,
-            level_size_multiplier: 2,
-            l0_compaction_trigger: 2,
-            ..Options::default()
-        };
+        let opts = Options::default()
+            .write_buffer_size(8 * 1024)
+            .block_size(1024)
+            .target_file_size(8 * 1024)
+            .level_base_bytes(1024)
+            .level_size_multiplier(2)
+            .l0_compaction_trigger(2);
         let db = Db::open(dir.path(), opts.clone()).unwrap();
 
         let mut expected = BTreeMap::new();

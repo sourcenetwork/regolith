@@ -23,10 +23,7 @@ use regolith::{Db, Options, WriteBatch};
 use tempfile::TempDir;
 
 fn tiny() -> Options {
-    Options {
-        write_buffer_size: 4 * 1024,
-        ..Options::default()
-    }
+    Options::default().write_buffer_size(4 * 1024)
 }
 
 fn one_instance(seed_keys: usize, checkpoints: usize) -> Option<String> {

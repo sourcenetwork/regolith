@@ -35,11 +35,9 @@ fn keys_of(w: u32) -> impl Iterator<Item = u32> {
 }
 
 fn opts() -> Options {
-    Options {
-        write_buffer_size: 16 * 1024,
-        durability: DurabilityMode::Eventual,
-        ..Options::default()
-    }
+    Options::default()
+        .write_buffer_size(16 * 1024)
+        .durability(DurabilityMode::Eventual)
 }
 
 fn key(i: u32) -> Vec<u8> {

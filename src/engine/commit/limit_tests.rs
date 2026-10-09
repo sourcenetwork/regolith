@@ -274,6 +274,7 @@ fn an_oversized_write_is_refused_before_it_reaches_the_pipeline() {
                 writes_at: None,
                 blind_merges_commute: false,
                 exempt: Vec::new(),
+                ranges: Vec::new(),
             };
             engine
                 .commit_optimistic(
@@ -281,6 +282,7 @@ fn an_oversized_write_is_refused_before_it_reaches_the_pipeline() {
                     point_ops,
                     range_deletes,
                     merges,
+                    Vec::new(),
                     DurabilityMode::Eventual,
                 )
                 .map(|_outcome| 0)

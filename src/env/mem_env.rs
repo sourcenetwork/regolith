@@ -25,7 +25,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::sync::Mutex;
+use crate::sync::internal::Mutex;
 
 use super::db_lock::DirectoryRegistry;
 use super::{

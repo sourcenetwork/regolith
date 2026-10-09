@@ -5,7 +5,7 @@
 
 #![cfg(not(target_arch = "wasm32"))]
 
-use regolith::{OptimisticTransactionDb, Options};
+use regolith::{OptimisticTransactionDb, Options, TxnOptions};
 use tempfile::TempDir;
 
 /// Live `a/0..a/4`, then deleted `b/0000..b/0999`, then live `c/0`.
@@ -30,6 +30,16 @@ fn keys<V>(entries: impl IntoIterator<Item = (Vec<u8>, V)>) -> Vec<String> {
         .collect()
 }
 
+/// The keys of a transaction scan, whose items carry their errors.
+fn txn_keys(
+    stream: impl IntoIterator<Item = regolith::TxResult<(Vec<u8>, regolith::DbSlice)>>,
+) -> Vec<String> {
+    stream
+        .into_iter()
+        .map(|item| String::from_utf8(item.unwrap().0).unwrap())
+        .collect()
+}
+
 fn a_keys() -> Vec<String> {
     (0..5).map(|i| format!("a/{i}")).collect()
 }
@@ -38,49 +48,46 @@ fn a_keys() -> Vec<String> {
 fn a_transaction_scan_returns_its_range_and_no_further() {
     let dir = TempDir::new().unwrap();
     let db = db_with_tombstones_after_a(&dir);
-    let txn = db.begin_transaction();
+    let txn = db.begin(&TxnOptions::new());
     let mut stream = txn.scan_stream(Some(b"a/"), Some(b"b/"));
-    assert_eq!(keys(&mut stream), a_keys());
-    stream.status().unwrap();
+    assert_eq!(txn_keys(&mut stream), a_keys());
 }
 
 #[test]
 fn a_transaction_scan_without_a_start_still_stops_at_its_end() {
     let dir = TempDir::new().unwrap();
     let db = db_with_tombstones_after_a(&dir);
-    let txn = db.begin_transaction();
+    let txn = db.begin(&TxnOptions::new());
     let mut stream = txn.scan_stream(None, Some(b"b/"));
-    assert_eq!(keys(&mut stream), a_keys());
-    stream.status().unwrap();
+    assert_eq!(txn_keys(&mut stream), a_keys());
 }
 
 #[test]
 fn a_transaction_scan_merges_its_writes_on_both_sides_of_the_bound() {
     let dir = TempDir::new().unwrap();
     let db = db_with_tombstones_after_a(&dir);
-    let txn = db.begin_transaction();
+    let txn = db.begin(&TxnOptions::new());
     txn.put(b"a/9", b"mine").unwrap();
     txn.delete(b"a/0").unwrap();
     txn.put(b"b/0500", b"past the end").unwrap();
     let mut stream = txn.scan_stream(Some(b"a/"), Some(b"b/"));
-    assert_eq!(keys(&mut stream), ["a/1", "a/2", "a/3", "a/4", "a/9"]);
-    stream.status().unwrap();
+    assert_eq!(txn_keys(&mut stream), ["a/1", "a/2", "a/3", "a/4", "a/9"]);
 
     let mut past = txn.scan_stream(Some(b"b/"), None);
-    assert_eq!(keys(&mut past), ["b/0500", "c/0"]);
-    past.status().unwrap();
+    assert_eq!(txn_keys(&mut past), ["b/0500", "c/0"]);
 }
 
 #[test]
 fn snapshot_and_db_scans_return_their_range_and_no_further() {
     let dir = TempDir::new().unwrap();
     let db = db_with_tombstones_after_a(&dir);
-    let mut stream = db
+    let rows = db
         .db()
         .snapshot()
-        .into_scan_stream(Some(b"a/"), Some(b"b/"));
-    assert_eq!(keys(&mut stream), a_keys());
-    stream.status().unwrap();
+        .into_scan_stream(Some(b"a/"), Some(b"b/"))
+        .collect::<regolith::Result<Vec<_>>>()
+        .unwrap();
+    assert_eq!(keys(rows), a_keys());
     assert_eq!(
         keys(db.db().scan(Some(b"a/"), Some(b"b/")).unwrap()),
         a_keys()

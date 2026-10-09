@@ -4,15 +4,19 @@
 //! Regolith: ACID, performance oriented, embedded key-value database engine for edge systems.
 //!
 //! Regolith provides a fast, embedded key-value store with:
-//! - **Read committed, snapshot isolation, repeatable read, or serializable**
-//!   per transaction, via MVCC sequence numbers
-//! - **Lock-free transactions** whose reads and writes take `&self`, so
-//!   one transaction can be shared across threads without a lock
+//! - **Read committed, snapshot isolation, repeatable read, serializable, or
+//!   DefraLevel** per transaction, via MVCC sequence numbers
+//! - **Shareable transactions** whose reads and writes take `&self`, so one
+//!   transaction can be used from several threads. An optimistic transaction
+//!   takes no key locks; every commit passes through one write pipeline
 //! - **Crash recovery** via write-ahead logging (WAL)
 //! - **LZ4 compression** for data blocks
 //! - **Bloom filters** for fast negative lookups
-//! - **Level-based compaction** on a dedicated OS thread
-//! - **Lock-free reads** via an arena-backed skip list memtable
+//! - **Level-based compaction** on background worker threads, or inline on a
+//!   target that has none
+//! - **An arena-backed skip list memtable** that readers walk without a lock
+//!   until a range delete lands in it. A block-cache hit is lock-free; a miss
+//!   inserts under its shard's lock
 //! - **Zero-copy reads** via [`DbSlice`], which borrows the bytes the
 //!   database already holds
 //!
@@ -53,15 +57,17 @@
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
 
+mod allocate;
 mod backup;
 mod checkpoint;
 mod column_family;
+mod conflict;
 mod engine;
 pub mod env;
 mod error;
 mod event_listener;
 mod iter;
-mod mvcc;
+mod log_layout;
 mod options;
 mod perf_context;
 mod portability;
@@ -70,8 +76,10 @@ mod slice;
 mod sst_file_writer;
 mod statistics;
 mod stream_writer;
-mod sync;
+pub mod sync;
 mod tailing;
+#[cfg(all(feature = "testing", not(target_family = "wasm")))]
+pub mod testing;
 mod transaction;
 mod ttl;
 mod txn_buffer;
@@ -79,6 +87,7 @@ mod txn_buffer;
 pub use backup::{BackupEngine, BackupId, BackupInfo};
 pub use checkpoint::Checkpoint;
 pub use column_family::{ColumnFamilyHandle, DEFAULT_CF_NAME};
+pub use conflict::{Access, Conflict, WriteKind};
 pub use engine::compaction::CompactionOutcome;
 #[cfg(target_os = "wasi")]
 pub use env::WasiEnv;
@@ -87,9 +96,9 @@ pub use error::Error;
 pub use event_listener::{
     BackgroundErrorReason, CompactionJobInfo, EventListener, ExternalFileIngestionInfo,
     FlushJobInfo, TableFileCreationInfo, TableFileCreationReason, TableFileDeletionInfo,
-    WalFullInfo,
 };
 pub use iter::Iter;
+pub use log_layout::LogLayout;
 pub use options::{
     ArenaProfile, CompactionDecision, CompactionFilter, CompactionStyle, CompressionType,
     DEFAULT_MAX_BACKGROUND_COMPACTIONS, DEFAULT_MAX_KEY_SIZE, DEFAULT_MAX_VALUE_SIZE,
@@ -105,16 +114,19 @@ pub use statistics::{Histogram, HistogramSnapshot, Statistics, Ticker};
 pub use stream_writer::{StreamOptions, StreamingWriter};
 pub use tailing::TailingIter;
 pub use transaction::{
-    IsolationLevel, KeyClass, KeyClassifier, OptimisticTransactionDb, OwnedTransaction,
-    ScanDirection, Transaction, TransactionDb, TransactionError, TxResult, TxnScanStream,
+    AbortReason, CommitInfo, CommitReceipt, IsolationLevel, KeyClass, KeyClassifier,
+    OptimisticTransactionDb, Page, RetryPolicy, ScanCheck, ScanDirection, TransactError,
+    Transaction, TransactionDb, TransactionError, TransactionHooks, TxResult, TxnCursor,
+    TxnOptions, TxnScanStream,
 };
 
 /// The transactional API and the traits a caller implements, in one import:
 /// `use regolith::prelude::*;`.
 pub mod prelude {
     pub use crate::{
-        Db, IsolationLevel, KeyClass, KeyClassifier, MergeOperator, OptimisticTransactionDb,
-        Options, OwnedTransaction, Transaction, TransactionError, TxResult,
+        AbortReason, CommitInfo, CommitReceipt, Conflict, Db, IsolationLevel, KeyClass,
+        KeyClassifier, LogLayout, MergeOperator, OptimisticTransactionDb, Options, RetryPolicy,
+        TransactError, Transaction, TransactionError, TransactionHooks, TxResult, TxnOptions,
     };
 }
 pub use ttl::{DbWithTtl, TtlCompactionFilter, strip_timestamp};
@@ -720,7 +732,8 @@ impl Db {
     /// Layer a merge operand on top of `key` in the default
     /// column family.
     ///
-    /// Requires an [`Options::merge_operator`] to be configured. The
+    /// Requires an [`Options::merge_operator`] to be configured, and returns
+    /// [`Error::NoMergeOperator`] without writing when none is. The
     /// operand is written cheaply (no read-modify-write); readers
     /// collapse the chain of merges plus any base value via the
     /// configured operator at visibility time.
@@ -731,6 +744,7 @@ impl Db {
     /// [`Db::merge`] with an explicit [`WriteOptions`] override.
     pub fn merge_opt(&self, opts: &WriteOptions, key: &[u8], operand: &[u8]) -> Result<()> {
         self.ensure_writable()?;
+        self.engine.require_merge_operator()?;
         self.validate_write_kv_sizes(key, operand)?;
         self.wait_for_write_capacity(opts)?;
         if let Some(s) = self.stats() {
@@ -1033,6 +1047,7 @@ impl Db {
                     record.delete_range(start, end);
                 }
                 WriteBatchOp::Merge { key, operand } => {
+                    self.engine.require_merge_operator()?;
                     self.validate_prefixed_key_size(key)?;
                     self.validate_value_size(operand)?;
                     record.merge(key, operand);
@@ -1131,10 +1146,15 @@ impl Db {
     /// The scan is served from a snapshot pinned when it is created, so
     /// concurrent writes cannot shift the range underneath it.
     ///
+    /// Each item is a `Result`. A scan that fails part-way ends with one
+    /// `Err`, then `None`, so a failure is never read as the end of the
+    /// range.
+    ///
     /// ```no_run
     /// # use regolith::{Db, Options};
     /// # let db = Db::open("/tmp/scan_stream_doc", Options::default()).unwrap();
-    /// for (key, value) in db.scan_stream(Some(b"user:"), Some(b"user;"))? {
+    /// for entry in db.scan_stream(Some(b"user:"), Some(b"user;"))? {
+    ///     let (key, value) = entry?;
     ///     println!("{} is {} bytes", String::from_utf8_lossy(&key), value.len());
     /// }
     /// # Ok::<(), regolith::Error>(())
@@ -1581,6 +1601,14 @@ impl Db {
     /// After a successful close, result-returning operations on this
     /// handle fail with [`Error::Closed`]. Calling `close` more than
     /// once is allowed.
+    ///
+    /// A transaction still open when `close` begins is aborted: its
+    /// [`Transaction::on_abort`](crate::Transaction::on_abort) callbacks and
+    /// the database's [`TransactionHooks::on_abort`] run on this thread with
+    /// [`AbortReason::Closed`], before the data is flushed, and the
+    /// transaction's later commit fails with [`Error::Closed`]. A transaction
+    /// that had begun to commit is left to finish. Those callbacks must not
+    /// call back into the database.
     pub fn close(&self) -> Result<()> {
         self.engine.close().map_err(Error::from)
     }
@@ -1822,9 +1850,11 @@ impl Db {
     }
 
     /// Layer a merge operand on top of `key` in column family `cf`.
-    /// Requires [`Options::merge_operator`] to be set.
+    /// Requires [`Options::merge_operator`] to be set, and returns
+    /// [`Error::NoMergeOperator`] without writing when it is not.
     pub fn merge_cf(&self, cf: &ColumnFamilyHandle, key: &[u8], operand: &[u8]) -> Result<()> {
         self.ensure_writable()?;
+        self.engine.require_merge_operator()?;
         self.validate_cf_handle(cf)?;
         self.validate_write_kv_sizes(key, operand)?;
         self.wait_for_write_capacity(&WriteOptions::default())?;
@@ -2227,11 +2257,19 @@ impl OwnedSnapshotIter {
 
 /// A lazy, bounded scan over a key range.
 ///
-/// Returned by [`Db::scan_stream`] and [`Snapshot::scan_stream`]. Holds
-/// one entry at a time rather than the range, so a caller that stops
-/// early pays only for what it read: the opposite of [`Db::scan`], which
-/// reads the whole range up front. The value is a [`DbSlice`], so no
-/// value bytes are copied.
+/// Returned by [`Db::scan_stream`], [`Snapshot::scan_stream`] and
+/// [`Snapshot::into_scan_stream`]. Holds one entry at a time rather than
+/// the range, so a caller that stops early pays only for what it read: the
+/// opposite of [`Db::scan`], which reads the whole range up front. The
+/// value is a [`DbSlice`], so no value bytes are copied.
+///
+/// Each item is a `Result`: a scan that fails in the middle of the range
+/// (a corrupt block, a failed read, a key the merge operator declines) ends
+/// with one `Err` item, so a failed scan is never read as a short one.
+/// After the `Err`, or after the end of the range, the stream returns
+/// `None`. The entries before the `Err` are a prefix of the range and the
+/// rest was never read; `collect::<Result<Vec<_>>>()` keeps the rows only
+/// when the whole range was read.
 ///
 /// The scan runs against a pinned snapshot, so writes that land while it
 /// is being drained are invisible to it and the range cannot shift
@@ -2244,39 +2282,19 @@ pub struct ScanStream {
     done: bool,
 }
 
-impl ScanStream {
-    /// Why the scan stopped.
-    ///
-    /// `Ok(())` means the range ended. An error means it did not: what the
-    /// stream yielded is a prefix of the range and the rest was never read.
-    ///
-    /// This matters because [`Iterator`] cannot carry a failure. A scan that
-    /// dies on a corrupt block ends exactly like one that reached the end of
-    /// its range, and a caller that only iterates cannot tell a short answer
-    /// from a complete one. Check this after iterating whenever a missing row
-    /// would be worse than an error.
-    ///
-    /// ```no_run
-    /// # use regolith::{Db, Options};
-    /// # let db = Db::open("/tmp/scan_status_doc", Options::default()).unwrap();
-    /// let mut scan = db.scan_stream(None, None)?;
-    /// let rows: Vec<_> = scan.by_ref().collect();
-    /// scan.status()?;  // the rows above are the whole range only if this is Ok
-    /// # Ok::<(), regolith::Error>(())
-    /// ```
-    pub fn status(&self) -> Result<()> {
-        self.entries.status()
-    }
-}
-
 impl Iterator for ScanStream {
-    type Item = (Vec<u8>, DbSlice);
+    type Item = Result<(Vec<u8>, DbSlice)>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.done {
             return None;
         }
-        let (key, value) = self.entries.next()?;
+        // `Entries` hands a failure out once and is finished after it, so
+        // passing the item on is all it takes to keep that contract here.
+        let (key, value) = match self.entries.next()? {
+            Ok(entry) => entry,
+            Err(error) => return Some(Err(error)),
+        };
         if let Some(end) = &self.end
             && key.as_slice() >= end.as_slice()
         {
@@ -2285,7 +2303,7 @@ impl Iterator for ScanStream {
             self.done = true;
             return None;
         }
-        Some((key, value))
+        Some(Ok((key, value)))
     }
 }
 
@@ -2306,6 +2324,10 @@ impl std::fmt::Debug for ScanStream {
 /// buffer the cursor owns and has to be copied out, while a value is
 /// stored whole and can be handed over by reference.
 ///
+/// Each item is a `Result`: a walk that failed in the middle of the range
+/// ends with one `Err` item, so a failed scan is never read as a short one.
+/// After it, or after the end of the range, the iterator returns `None`.
+///
 /// This is the seam to build a `Stream` on. regolith's IO is synchronous
 /// and it requires no async runtime, so wrapping a ready iterator with
 /// `futures::stream::iter` belongs where the async context is rather than
@@ -2314,6 +2336,8 @@ pub struct Entries<C> {
     cursor: C,
     started: bool,
     reverse: bool,
+    /// The range ended or the walk failed; nothing more is read.
+    ended: bool,
 }
 
 impl<C> Entries<C> {
@@ -2322,6 +2346,7 @@ impl<C> Entries<C> {
             cursor,
             started: false,
             reverse,
+            ended: false,
         }
     }
 
@@ -2337,9 +2362,12 @@ impl<C> Entries<C> {
 macro_rules! impl_entries {
     ($cursor:ty $(, $lt:lifetime)?) => {
         impl$(<$lt>)? Iterator for Entries<$cursor> {
-            type Item = (Vec<u8>, DbSlice);
+            type Item = Result<(Vec<u8>, DbSlice)>;
 
             fn next(&mut self) -> Option<Self::Item> {
+                if self.ended {
+                    return None;
+                }
                 if self.started {
                     if self.reverse {
                         self.cursor.prev();
@@ -2362,23 +2390,16 @@ macro_rules! impl_entries {
                 }
                 if !self.cursor.valid() {
                     // A cursor goes invalid for two reasons that look
-                    // identical from here: the range ended, or the walk
-                    // failed. `Iterator` has nowhere to put the difference,
-                    // so say it out loud rather than let a failed scan read
-                    // as a complete one. `Entries::status` returns it to a
-                    // caller that checks.
-                    if let Err(e) = self.cursor.status() {
-                        tracing::error!(
-                            error = %e,
-                            "scan ended early: the iterator failed mid-range, \
-                             so the rows returned are a prefix and not the range"
-                        );
-                    }
-                    return None;
+                    // identical from the position alone: the range ended, or
+                    // the walk failed. The status tells them apart, and a
+                    // failure is handed out as an item so it cannot pass for
+                    // the end of the range.
+                    self.ended = true;
+                    return self.cursor.status().err().map(Err);
                 }
                 let key = self.cursor.key()?.to_vec();
                 let value = self.cursor.value_slice()?;
-                Some((key, value))
+                Some(Ok((key, value)))
             }
         }
 
@@ -2396,7 +2417,7 @@ macro_rules! impl_entries {
         }
 
         impl$(<$lt>)? IntoIterator for $cursor {
-            type Item = (Vec<u8>, DbSlice);
+            type Item = Result<(Vec<u8>, DbSlice)>;
             type IntoIter = Entries<$cursor>;
 
             fn into_iter(self) -> Self::IntoIter {
@@ -2943,6 +2964,10 @@ impl WriteBatch {
     /// existing value or merge chain and collapsed at read time.
     /// Multiple merges on the same key in a single batch are
     /// allowed and applied in insertion order.
+    ///
+    /// A batch does not know its database, so the operator is checked when
+    /// the batch is applied: [`Db::write`] returns [`Error::NoMergeOperator`]
+    /// and applies none of the batch when the database has no operator.
     pub fn merge(&mut self, key: &[u8], operand: &[u8]) {
         self.ops.push(WriteBatchOp::Merge {
             key: prefix_key(DEFAULT_CF_ID, key),
@@ -2976,7 +3001,9 @@ impl WriteBatch {
         });
     }
 
-    /// Add a merge operand scoped to column family `cf`.
+    /// Add a merge operand scoped to column family `cf`. As for
+    /// [`WriteBatch::merge`], applying the batch to a database with no merge
+    /// operator returns [`Error::NoMergeOperator`].
     pub fn merge_cf(&mut self, cf: &ColumnFamilyHandle, key: &[u8], operand: &[u8]) {
         self.ops.push(WriteBatchOp::Merge {
             key: prefix_key(cf.id(), key),
@@ -3102,14 +3129,7 @@ mod tests {
     #[test]
     fn test_db_open_rejects_invalid_options() {
         let dir = TempDir::new().unwrap();
-        let err = Db::open(
-            dir.path(),
-            Options {
-                write_buffer_size: 0,
-                ..Options::default()
-            },
-        )
-        .unwrap_err();
+        let err = Db::open(dir.path(), Options::default().write_buffer_size(0)).unwrap_err();
         match err {
             Error::InvalidArgument(message) => assert!(message.contains("write_buffer_size")),
             other => panic!("expected invalid argument, got {other:?}"),
@@ -3120,10 +3140,7 @@ mod tests {
     fn test_open_read_only_replays_wal_without_mutating_files() {
         let dir = TempDir::new().unwrap();
         {
-            let opts = Options {
-                durability: DurabilityMode::Immediate,
-                ..Options::default()
-            };
+            let opts = Options::default().durability(DurabilityMode::Immediate);
             let db = Db::open(dir.path(), opts).unwrap();
             db.put(b"wal_only", b"value").unwrap();
         }
@@ -3256,11 +3273,10 @@ mod tests {
     #[test]
     fn test_configured_key_value_size_limits_are_enforced() {
         let dir = TempDir::new().unwrap();
-        let opts = Options {
-            max_key_size: 8,
-            max_value_size: 4,
-            ..Options::default()
-        };
+        let opts = Options::default()
+            .max_key_size(8)
+            .max_value_size(4)
+            .merge_operator(Some(Arc::new(AppendMerge)));
         let db = Db::open(dir.path(), opts).unwrap();
 
         db.put(b"abc", b"1234").unwrap();
@@ -3288,10 +3304,7 @@ mod tests {
 
     /// Options that force flushes early so tests can exercise the SSTable path.
     fn tiny_flush_opts() -> Options {
-        Options {
-            write_buffer_size: 4 * 1024,
-            ..Options::default()
-        }
+        Options::default().write_buffer_size(4 * 1024)
     }
 
     /// Write enough filler bytes to push the active memtable past
@@ -4195,11 +4208,9 @@ mod tests {
     #[test]
     fn test_compact_range_bounded_compacts_default_cf_files() {
         let dir = TempDir::new().unwrap();
-        let opts = Options {
-            write_buffer_size: 4 * 1024,
-            l0_compaction_trigger: 1_000,
-            ..Options::default()
-        };
+        let opts = Options::default()
+            .write_buffer_size(4 * 1024)
+            .l0_compaction_trigger(1_000);
         let db = Db::open(dir.path(), opts).unwrap();
         let payload = vec![0u8; 512];
 
@@ -4851,11 +4862,9 @@ mod tests {
         // then reopens and runs `seek_for_prev` with a target larger
         // than every key.
         let dir = TempDir::new().unwrap();
-        let opts = Options {
-            block_size: 128,
-            write_buffer_size: 64 * 1024,
-            ..Options::default()
-        };
+        let opts = Options::default()
+            .block_size(128)
+            .write_buffer_size(64 * 1024);
         {
             let db = Db::open(dir.path(), opts.clone()).unwrap();
             for i in 0..60u32 {
@@ -5208,11 +5217,9 @@ mod tests {
     // ── compression codecs ──────────────────────────────────────────────────
 
     fn compression_opts(codec: CompressionType) -> Options {
-        Options {
-            write_buffer_size: 4 * 1024,
-            compression: codec,
-            ..Options::default()
-        }
+        Options::default()
+            .write_buffer_size(4 * 1024)
+            .compression(codec)
     }
 
     fn write_and_read_back(opts: Options) {
@@ -5269,16 +5276,14 @@ mod tests {
         // database must hold blocks compressed with both codecs and
         // still read back correctly.
         let dir = TempDir::new().unwrap();
-        let opts = Options {
-            write_buffer_size: 4 * 1024,
-            compression: CompressionType::Lz4,
-            compression_per_level: Some(vec![
+        let opts = Options::default()
+            .write_buffer_size(4 * 1024)
+            .compression(CompressionType::Lz4)
+            .compression_per_level(Some(vec![
                 CompressionType::Snappy, // L0
                 CompressionType::Lz4,    // L1
                 CompressionType::None,   // L2 (unused here, just to exercise the slot)
-            ]),
-            ..Options::default()
-        };
+            ]));
         let payload: Vec<u8> = (0..256).map(|i| (i % 17) as u8).collect();
         {
             let db = Db::open(dir.path(), opts.clone()).unwrap();
@@ -5314,12 +5319,10 @@ mod tests {
     fn test_compression_per_level_falls_back_to_default() {
         // Override only L0; L1+ should fall back to `compression`.
         let dir = TempDir::new().unwrap();
-        let opts = Options {
-            write_buffer_size: 4 * 1024,
-            compression: CompressionType::Snappy,
-            compression_per_level: Some(vec![CompressionType::None]),
-            ..Options::default()
-        };
+        let opts = Options::default()
+            .write_buffer_size(4 * 1024)
+            .compression(CompressionType::Snappy)
+            .compression_per_level(Some(vec![CompressionType::None]));
         let db = Db::open(dir.path(), opts).unwrap();
         for i in 0..50 {
             db.put(format!("k_{i:03}").as_bytes(), b"v").unwrap();
@@ -5402,11 +5405,9 @@ mod tests {
         let filter = Arc::new(DropOddKeysFilter {
             calls: AtomicUsize::new(0),
         });
-        let opts = Options {
-            write_buffer_size: 4 * 1024,
-            compaction_filter: Some(filter.clone()),
-            ..Options::default()
-        };
+        let opts = Options::default()
+            .write_buffer_size(4 * 1024)
+            .compaction_filter(Some(filter.clone()));
         let db = Db::open(dir.path(), opts).unwrap();
         // 20 keys: k0..k9 written twice so compaction has work. Use
         // longer payloads so the tiny write buffer triggers flushes.
@@ -5436,11 +5437,9 @@ mod tests {
     #[test]
     fn test_compaction_filter_rewrites_values() {
         let dir = TempDir::new().unwrap();
-        let opts = Options {
-            write_buffer_size: 4 * 1024,
-            compaction_filter: Some(Arc::new(UppercaseValuesFilter)),
-            ..Options::default()
-        };
+        let opts = Options::default()
+            .write_buffer_size(4 * 1024)
+            .compaction_filter(Some(Arc::new(UppercaseValuesFilter)));
         let db = Db::open(dir.path(), opts).unwrap();
         for i in 0..20 {
             db.put(format!("k{i:02}").as_bytes(), b"hello world")
@@ -5461,11 +5460,9 @@ mod tests {
     #[test]
     fn test_compaction_filter_runs_in_every_snapshot_stripe() {
         let dir = TempDir::new().unwrap();
-        let opts = Options {
-            write_buffer_size: 4 * 1024,
-            compaction_filter: Some(Arc::new(UppercaseValuesFilter)),
-            ..Options::default()
-        };
+        let opts = Options::default()
+            .write_buffer_size(4 * 1024)
+            .compaction_filter(Some(Arc::new(UppercaseValuesFilter)));
         let db = Db::open(dir.path(), opts).unwrap();
         for i in 0..20 {
             db.put(format!("k{i:02}").as_bytes(), b"hello").unwrap();
@@ -5490,11 +5487,9 @@ mod tests {
     #[test]
     fn test_compaction_filter_drops_range_tombstones() {
         let dir = TempDir::new().unwrap();
-        let opts = Options {
-            write_buffer_size: 4 * 1024,
-            compaction_filter: Some(Arc::new(DropRangeTombstonesFilter)),
-            ..Options::default()
-        };
+        let opts = Options::default()
+            .write_buffer_size(4 * 1024)
+            .compaction_filter(Some(Arc::new(DropRangeTombstonesFilter)));
         let db = Db::open(dir.path(), opts).unwrap();
         for c in b'a'..=b'f' {
             db.put(&[c], &[c]).unwrap();
@@ -5521,11 +5516,9 @@ mod tests {
     }
 
     fn prefix_opts() -> Options {
-        Options {
-            write_buffer_size: 4 * 1024,
-            prefix_extractor: Some(std::sync::Arc::new(FixedLengthPrefix(10))),
-            ..Options::default()
-        }
+        Options::default()
+            .write_buffer_size(4 * 1024)
+            .prefix_extractor(Some(std::sync::Arc::new(FixedLengthPrefix(10))))
     }
 
     #[test]
@@ -5573,14 +5566,12 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let db = Db::open(
             dir.path(),
-            Options {
-                write_buffer_size: 4 * 1024,
-                l0_compaction_trigger: 1_000,
-                bloom_bits_per_key: 64,
-                prefix_extractor: Some(Arc::new(FixedLengthPrefix(8))),
-                statistics: Some(stats.clone()),
-                ..Options::default()
-            },
+            Options::default()
+                .write_buffer_size(4 * 1024)
+                .l0_compaction_trigger(1_000)
+                .bloom_bits_per_key(64)
+                .prefix_extractor(Some(Arc::new(FixedLengthPrefix(8))))
+                .statistics(Some(stats.clone())),
         )
         .unwrap();
 
@@ -5666,14 +5657,7 @@ mod tests {
         // files.
         let dir = TempDir::new().unwrap();
         {
-            let db = Db::open(
-                dir.path(),
-                Options {
-                    write_buffer_size: 4 * 1024,
-                    ..Options::default()
-                },
-            )
-            .unwrap();
+            let db = Db::open(dir.path(), Options::default().write_buffer_size(4 * 1024)).unwrap();
             db.put(b"tenant_001:old", b"old").unwrap();
             force_flush(&db, "a");
         }
@@ -5729,10 +5713,7 @@ mod tests {
         // already survives a clean close - this test's real content
         // is that the sync flag doesn't break the normal code path.)
         let dir = TempDir::new().unwrap();
-        let opts = Options {
-            durability: DurabilityMode::Eventual,
-            ..Options::default()
-        };
+        let opts = Options::default().durability(DurabilityMode::Eventual);
         {
             let db = Db::open(dir.path(), opts.clone()).unwrap();
             db.put_opt(&WriteOptions::sync(), b"critical", b"payload")
@@ -5928,11 +5909,9 @@ mod tests {
     }
 
     fn counter_opts() -> Options {
-        Options {
-            write_buffer_size: 4 * 1024,
-            merge_operator: Some(Arc::new(CounterMerge)),
-            ..Options::default()
-        }
+        Options::default()
+            .write_buffer_size(4 * 1024)
+            .merge_operator(Some(Arc::new(CounterMerge)))
     }
 
     fn encode_i64(n: i64) -> Vec<u8> {
@@ -6089,10 +6068,7 @@ mod tests {
     #[test]
     fn test_merge_append_operator() {
         let dir = TempDir::new().unwrap();
-        let opts = Options {
-            merge_operator: Some(Arc::new(AppendMerge)),
-            ..Options::default()
-        };
+        let opts = Options::default().merge_operator(Some(Arc::new(AppendMerge)));
         let db = Db::open(dir.path(), opts).unwrap();
         db.put(b"s", b"hello").unwrap();
         db.merge(b"s", b" ").unwrap();
@@ -6811,11 +6787,9 @@ mod tests {
         // zero-filled payload compresses to near-nothing and would
         // undercut the accuracy window we're checking.
         let dir = TempDir::new().unwrap();
-        let opts = Options {
-            write_buffer_size: 4 * 1024,
-            compression: CompressionType::None,
-            ..Options::default()
-        };
+        let opts = Options::default()
+            .write_buffer_size(4 * 1024)
+            .compression(CompressionType::None);
         let db = Db::open(dir.path(), opts).unwrap();
         let payload: Vec<u8> = (0..256).map(|i| (i % 251) as u8).collect();
         for i in 0..100 {
@@ -6991,10 +6965,7 @@ mod tests {
         // The flag is a no-op for API parity - both values must
         // open cleanly and produce the same atomic behavior.
         let dir = TempDir::new().unwrap();
-        let opts = Options {
-            atomic_flush: true,
-            ..Options::default()
-        };
+        let opts = Options::default().atomic_flush(true);
         let db = Db::open(dir.path(), opts).unwrap();
         let cf = db.create_column_family("cf1").unwrap();
         db.put_cf(&cf, b"k", b"v").unwrap();
@@ -7077,11 +7048,9 @@ mod tests {
     fn test_listener_fires_on_flush() {
         let listener = Arc::new(CountingListener::default());
         let dir = TempDir::new().unwrap();
-        let opts = Options {
-            write_buffer_size: 4 * 1024,
-            listeners: vec![listener.clone() as Arc<dyn EventListener>],
-            ..Options::default()
-        };
+        let opts = Options::default()
+            .write_buffer_size(4 * 1024)
+            .listeners(vec![listener.clone() as Arc<dyn EventListener>]);
         let db = Db::open(dir.path(), opts).unwrap();
         force_flush(&db, "listener");
 
@@ -7104,11 +7073,9 @@ mod tests {
     fn test_listener_fires_on_compaction() {
         let listener = Arc::new(CountingListener::default());
         let dir = TempDir::new().unwrap();
-        let opts = Options {
-            write_buffer_size: 4 * 1024,
-            listeners: vec![listener.clone() as Arc<dyn EventListener>],
-            ..Options::default()
-        };
+        let opts = Options::default()
+            .write_buffer_size(4 * 1024)
+            .listeners(vec![listener.clone() as Arc<dyn EventListener>]);
         let db = Db::open(dir.path(), opts).unwrap();
         // Drive enough writes to generate L0 files, then manually
         // compact the range so the compaction callbacks fire on
@@ -7143,10 +7110,7 @@ mod tests {
     fn test_listener_fires_on_ingest() {
         let listener = Arc::new(CountingListener::default());
         let dir = TempDir::new().unwrap();
-        let opts = Options {
-            listeners: vec![listener.clone() as Arc<dyn EventListener>],
-            ..Options::default()
-        };
+        let opts = Options::default().listeners(vec![listener.clone() as Arc<dyn EventListener>]);
         let db = Db::open(dir.path(), opts.clone()).unwrap();
 
         let sst_path = dir.path().join("ingest.sst");
@@ -7178,14 +7142,12 @@ mod tests {
         let a = Arc::new(CountingListener::default());
         let b = Arc::new(CountingListener::default());
         let dir = TempDir::new().unwrap();
-        let opts = Options {
-            write_buffer_size: 4 * 1024,
-            listeners: vec![
+        let opts = Options::default()
+            .write_buffer_size(4 * 1024)
+            .listeners(vec![
                 a.clone() as Arc<dyn EventListener>,
                 b.clone() as Arc<dyn EventListener>,
-            ],
-            ..Options::default()
-        };
+            ]);
         let db = Db::open(dir.path(), opts).unwrap();
         force_flush(&db, "multi");
 
@@ -7215,17 +7177,15 @@ mod tests {
                 *self.captured.lock() = Some(info.clone());
             }
         }
-        use crate::sync::Mutex;
+        use crate::sync::internal::Mutex;
 
         let listener = Arc::new(CaptureListener {
             captured: Mutex::new(None),
         });
         let dir = TempDir::new().unwrap();
-        let opts = Options {
-            write_buffer_size: 4 * 1024,
-            listeners: vec![listener.clone() as Arc<dyn EventListener>],
-            ..Options::default()
-        };
+        let opts = Options::default()
+            .write_buffer_size(4 * 1024)
+            .listeners(vec![listener.clone() as Arc<dyn EventListener>]);
         let db = Db::open(dir.path(), opts).unwrap();
         for i in 0..400 {
             db.put(format!("k_{i:04}").as_bytes(), b"v").unwrap();
@@ -7246,18 +7206,13 @@ mod tests {
     // ── statistics ──────────────────────────────────────────────────────
 
     fn stats_opts(stats: Arc<Statistics>) -> Options {
-        Options {
-            statistics: Some(stats),
-            ..Options::default()
-        }
+        Options::default().statistics(Some(stats))
     }
 
     fn tiny_flush_stats_opts(stats: Arc<Statistics>) -> Options {
-        Options {
-            write_buffer_size: 4 * 1024,
-            statistics: Some(stats),
-            ..Options::default()
-        }
+        Options::default()
+            .write_buffer_size(4 * 1024)
+            .statistics(Some(stats))
     }
 
     #[test]
@@ -7416,11 +7371,9 @@ mod tests {
     fn test_stats_wal_counters() {
         let stats = Arc::new(Statistics::new());
         let dir = TempDir::new().unwrap();
-        let opts = Options {
-            statistics: Some(stats.clone()),
-            durability: DurabilityMode::Immediate,
-            ..Options::default()
-        };
+        let opts = Options::default()
+            .statistics(Some(stats.clone()))
+            .durability(DurabilityMode::Immediate);
         let db = Db::open(dir.path(), opts).unwrap();
         db.put(b"k", b"v").unwrap();
         db.put(b"k2", b"v2").unwrap();
@@ -7633,10 +7586,7 @@ mod tests {
     #[test]
     fn test_property_stats_string_includes_level_header_and_counters() {
         let stats = Arc::new(Statistics::new());
-        let opts = Options {
-            statistics: Some(stats),
-            ..Options::default()
-        };
+        let opts = Options::default().statistics(Some(stats));
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), opts).unwrap();
         db.put(b"k", b"v").unwrap();
@@ -7719,13 +7669,11 @@ mod tests {
         // files that trigger multiple concurrent L1+ compactions.
         // Every key must still read back its latest value after
         // the dust settles.
-        let opts = Options {
-            write_buffer_size: 4 * 1024,
-            max_background_compactions: 4,
-            l0_compaction_trigger: 2,
-            target_file_size: 8 * 1024,
-            ..Options::default()
-        };
+        let opts = Options::default()
+            .write_buffer_size(4 * 1024)
+            .max_background_compactions(4)
+            .l0_compaction_trigger(2)
+            .target_file_size(8 * 1024);
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), opts).unwrap();
 
@@ -7763,11 +7711,9 @@ mod tests {
         // max_background_compactions=1 must behave identically to
         // the default (which is also 1). Sanity check that the
         // RwLock path doesn't break the single-worker case.
-        let opts = Options {
-            write_buffer_size: 4 * 1024,
-            max_background_compactions: 1,
-            ..Options::default()
-        };
+        let opts = Options::default()
+            .write_buffer_size(4 * 1024)
+            .max_background_compactions(1);
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), opts).unwrap();
         for i in 0..500 {
@@ -7785,12 +7731,10 @@ mod tests {
     fn test_partitioned_index_reads_are_correct() {
         // Enable partitioned index with a tiny metadata_block_size
         // so the test actually exercises the two-level path.
-        let opts = Options {
-            write_buffer_size: 4 * 1024,
-            partitioned_index: true,
-            metadata_block_size: 128,
-            ..Options::default()
-        };
+        let opts = Options::default()
+            .write_buffer_size(4 * 1024)
+            .partitioned_index(true)
+            .metadata_block_size(128);
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), opts).unwrap();
 
@@ -7818,12 +7762,10 @@ mod tests {
         // Scans must produce identical results.
         let write_and_scan = |partitioned: bool| -> Vec<(Vec<u8>, Vec<u8>)> {
             let dir = TempDir::new().unwrap();
-            let opts = Options {
-                write_buffer_size: 4 * 1024,
-                partitioned_index: partitioned,
-                metadata_block_size: 128,
-                ..Options::default()
-            };
+            let opts = Options::default()
+                .write_buffer_size(4 * 1024)
+                .partitioned_index(partitioned)
+                .metadata_block_size(128);
             let db = Db::open(dir.path(), opts).unwrap();
             for i in 0..200 {
                 let k = format!("k{i:04}");
@@ -7841,12 +7783,10 @@ mod tests {
     #[test]
     fn test_partitioned_index_survives_reopen() {
         let dir = TempDir::new().unwrap();
-        let opts = Options {
-            write_buffer_size: 4 * 1024,
-            partitioned_index: true,
-            metadata_block_size: 128,
-            ..Options::default()
-        };
+        let opts = Options::default()
+            .write_buffer_size(4 * 1024)
+            .partitioned_index(true)
+            .metadata_block_size(128);
         {
             let db = Db::open(dir.path(), opts.clone()).unwrap();
             for i in 0..200 {
@@ -7870,11 +7810,9 @@ mod tests {
         // file types must work correctly.
         let dir = TempDir::new().unwrap();
         {
-            let opts = Options {
-                write_buffer_size: 4 * 1024,
-                partitioned_index: false,
-                ..Options::default()
-            };
+            let opts = Options::default()
+                .write_buffer_size(4 * 1024)
+                .partitioned_index(false);
             let db = Db::open(dir.path(), opts).unwrap();
             for i in 0..100 {
                 let k = format!("k{i:04}");
@@ -7883,12 +7821,10 @@ mod tests {
             db.compact_range(None, None).unwrap();
         }
         {
-            let opts = Options {
-                write_buffer_size: 4 * 1024,
-                partitioned_index: true,
-                metadata_block_size: 128,
-                ..Options::default()
-            };
+            let opts = Options::default()
+                .write_buffer_size(4 * 1024)
+                .partitioned_index(true)
+                .metadata_block_size(128);
             let db = Db::open(dir.path(), opts).unwrap();
             for i in 100..200 {
                 let k = format!("k{i:04}");
@@ -7897,10 +7833,7 @@ mod tests {
             // Don't compact - leave V1 files at lower levels and
             // V2 files in L0/L1.
         }
-        let opts = Options {
-            partitioned_index: true,
-            ..Options::default()
-        };
+        let opts = Options::default().partitioned_index(true);
         let db = Db::open(dir.path(), opts).unwrap();
         for i in 0..100 {
             let k = format!("k{i:04}");
@@ -7917,12 +7850,10 @@ mod tests {
         // A compaction large enough to span multiple output files;
         // read everything back and confirm the streaming path keeps
         // the latest version for every user key.
-        let opts = Options {
-            write_buffer_size: 4 * 1024,
-            max_subcompactions: 4,
-            target_file_size: 8 * 1024,
-            ..Options::default()
-        };
+        let opts = Options::default()
+            .write_buffer_size(4 * 1024)
+            .max_subcompactions(4)
+            .target_file_size(8 * 1024);
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), opts).unwrap();
 
@@ -7961,12 +7892,10 @@ mod tests {
         // max_subcompactions is accepted for API compatibility, but
         // the streaming compaction path writes from the compaction
         // worker thread.
-        let opts = Options {
-            write_buffer_size: 4 * 1024,
-            max_subcompactions: 1,
-            target_file_size: 8 * 1024,
-            ..Options::default()
-        };
+        let opts = Options::default()
+            .write_buffer_size(4 * 1024)
+            .max_subcompactions(1)
+            .target_file_size(8 * 1024);
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), opts).unwrap();
         for i in 0..256 {
@@ -7985,11 +7914,9 @@ mod tests {
         // The compatibility knob should not change correctness even
         // though output writing is now part of the bounded-memory
         // streaming path.
-        let opts = Options {
-            write_buffer_size: 4 * 1024,
-            max_subcompactions: 8,
-            ..Options::default()
-        };
+        let opts = Options::default()
+            .write_buffer_size(4 * 1024)
+            .max_subcompactions(8);
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), opts).unwrap();
         for i in 0..32 {
@@ -8055,11 +7982,9 @@ mod tests {
         // platforms it's a no-op. Either way, the output SSTs
         // contain the same data as the leveled baseline, so
         // readers must see identical values afterward.
-        let opts = Options {
-            write_buffer_size: 4 * 1024,
-            evict_compaction_data_from_page_cache: true,
-            ..Options::default()
-        };
+        let opts = Options::default()
+            .write_buffer_size(4 * 1024)
+            .evict_compaction_data_from_page_cache(true);
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), opts).unwrap();
 
@@ -8096,11 +8021,9 @@ mod tests {
         // Write a batch under Universal, force a full merge via
         // compact_range, and verify every key is still readable
         // with the most recent value.
-        let opts = Options {
-            write_buffer_size: 4 * 1024,
-            compaction_style: CompactionStyle::Universal,
-            ..Options::default()
-        };
+        let opts = Options::default()
+            .write_buffer_size(4 * 1024)
+            .compaction_style(CompactionStyle::Universal);
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), opts).unwrap();
 
@@ -8139,12 +8062,10 @@ mod tests {
     fn test_universal_compaction_never_creates_l1_files() {
         // Every Universal merge output should stay at L0 - the
         // level-size push-down rule must not fire for this style.
-        let opts = Options {
-            write_buffer_size: 4 * 1024,
-            l0_compaction_trigger: 1,
-            compaction_style: CompactionStyle::Universal,
-            ..Options::default()
-        };
+        let opts = Options::default()
+            .write_buffer_size(4 * 1024)
+            .l0_compaction_trigger(1)
+            .compaction_style(CompactionStyle::Universal);
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), opts).unwrap();
         for i in 0..64 {
@@ -8168,11 +8089,9 @@ mod tests {
         // After a full universal compact_range, we expect the
         // output to be a single L0 file (min cardinality). This
         // exercises the compact_range full-merge path.
-        let opts = Options {
-            write_buffer_size: 4 * 1024,
-            compaction_style: CompactionStyle::Universal,
-            ..Options::default()
-        };
+        let opts = Options::default()
+            .write_buffer_size(4 * 1024)
+            .compaction_style(CompactionStyle::Universal);
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), opts).unwrap();
         for i in 0..32 {
@@ -8197,14 +8116,12 @@ mod tests {
         // Tiny memtable + tight FIFO cap: sustained writes should
         // produce many L0 files, and after each flush the oldest
         // ones should be unlinked so the total stays bounded.
-        let opts = Options {
-            write_buffer_size: 4 * 1024,
-            compaction_style: CompactionStyle::Fifo,
-            fifo_compaction_options: FifoCompactionOptions {
+        let opts = Options::default()
+            .write_buffer_size(4 * 1024)
+            .compaction_style(CompactionStyle::Fifo)
+            .fifo_compaction_options(FifoCompactionOptions {
                 max_table_files_size: 32 * 1024,
-            },
-            ..Options::default()
-        };
+            });
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), opts).unwrap();
 
@@ -8248,14 +8165,12 @@ mod tests {
         // A single oversized file must not be deleted - FIFO
         // refuses to drop the last surviving SST because that
         // would wipe the database.
-        let opts = Options {
-            write_buffer_size: 4 * 1024,
-            compaction_style: CompactionStyle::Fifo,
-            fifo_compaction_options: FifoCompactionOptions {
+        let opts = Options::default()
+            .write_buffer_size(4 * 1024)
+            .compaction_style(CompactionStyle::Fifo)
+            .fifo_compaction_options(FifoCompactionOptions {
                 max_table_files_size: 1, // 1 byte cap: always over limit
-            },
-            ..Options::default()
-        };
+            });
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), opts).unwrap();
         for i in 0..32 {
@@ -8278,15 +8193,13 @@ mod tests {
         // Under FIFO, the background scheduler should never
         // promote files from L0 to L1. The `l0_compaction_trigger`
         // knob is a level-style knob and must have no effect.
-        let opts = Options {
-            write_buffer_size: 4 * 1024,
-            l0_compaction_trigger: 2,
-            compaction_style: CompactionStyle::Fifo,
-            fifo_compaction_options: FifoCompactionOptions {
+        let opts = Options::default()
+            .write_buffer_size(4 * 1024)
+            .l0_compaction_trigger(2)
+            .compaction_style(CompactionStyle::Fifo)
+            .fifo_compaction_options(FifoCompactionOptions {
                 max_table_files_size: 10 * 1024 * 1024,
-            },
-            ..Options::default()
-        };
+            });
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), opts).unwrap();
         for i in 0..64 {
@@ -8345,10 +8258,7 @@ mod tests {
         // Tiny write_buffer so writes between drains roll
         // memtables and produce L0 files. The tailing iter must
         // pick up those new SSTs on the next refresh.
-        let opts = Options {
-            write_buffer_size: 4 * 1024,
-            ..Options::default()
-        };
+        let opts = Options::default().write_buffer_size(4 * 1024);
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), opts).unwrap();
 
@@ -8454,11 +8364,9 @@ mod tests {
         // `regolith.block-cache-usage` property must report a
         // positive number once at least one read has happened
         // against a file that isn't entirely in the memtable.
-        let opts = Options {
-            write_buffer_size: 4 * 1024,
-            block_cache_size: 1024 * 1024,
-            ..Options::default()
-        };
+        let opts = Options::default()
+            .write_buffer_size(4 * 1024)
+            .block_cache_size(1024 * 1024);
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), opts).unwrap();
 
@@ -8510,12 +8418,10 @@ mod tests {
             Duration::from_millis(50),
             5_000,
         ));
-        let opts = Options {
-            write_buffer_size: 16 * 1024 * 1024,
-            compression: CompressionType::None,
-            rate_limiter: Some(limiter.clone() as Arc<dyn RateLimiter>),
-            ..Options::default()
-        };
+        let opts = Options::default()
+            .write_buffer_size(16 * 1024 * 1024)
+            .compression(CompressionType::None)
+            .rate_limiter(Some(limiter.clone() as Arc<dyn RateLimiter>));
 
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), opts).unwrap();
@@ -8558,20 +8464,18 @@ mod tests {
         use std::sync::Arc;
 
         let stats = Arc::new(Statistics::new());
-        let opts = Options {
+        let opts = Options::default()
             // Tiny memtable so every handful of puts rolls an L0 file.
-            write_buffer_size: 4 * 1024,
+            .write_buffer_size(4 * 1024)
             // Disable automatic compaction so L0 can't drain on us.
-            l0_compaction_trigger: 1000,
+            .l0_compaction_trigger(1000)
             // Slow down once L0 has 2 files, never stop (high trigger).
-            level0_slowdown_writes_trigger: 2,
-            level0_stop_writes_trigger: 10_000,
+            .level0_slowdown_writes_trigger(2)
+            .level0_stop_writes_trigger(10_000)
             // Disable the memtable-count trigger for this test so we
             // isolate the L0 slowdown path.
-            max_write_buffer_number: 0,
-            statistics: Some(stats.clone()),
-            ..Options::default()
-        };
+            .max_write_buffer_number(0)
+            .statistics(Some(stats.clone()));
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), opts).unwrap();
 
@@ -8594,14 +8498,12 @@ mod tests {
 
     #[test]
     fn test_write_stall_no_slowdown_returns_busy() {
-        let opts = Options {
-            write_buffer_size: 4 * 1024,
-            l0_compaction_trigger: 1000,
-            level0_slowdown_writes_trigger: 2,
-            level0_stop_writes_trigger: 10_000,
-            max_write_buffer_number: 0,
-            ..Options::default()
-        };
+        let opts = Options::default()
+            .write_buffer_size(4 * 1024)
+            .l0_compaction_trigger(1000)
+            .level0_slowdown_writes_trigger(2)
+            .level0_stop_writes_trigger(10_000)
+            .max_write_buffer_number(0);
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), opts).unwrap();
 
@@ -8632,14 +8534,12 @@ mod tests {
         use std::time::{Duration, Instant};
 
         // Stop writes entirely once L0 hits 2 files.
-        let opts = Options {
-            write_buffer_size: 4 * 1024,
-            l0_compaction_trigger: 1000,
-            level0_slowdown_writes_trigger: 0,
-            level0_stop_writes_trigger: 2,
-            max_write_buffer_number: 0,
-            ..Options::default()
-        };
+        let opts = Options::default()
+            .write_buffer_size(4 * 1024)
+            .l0_compaction_trigger(1000)
+            .level0_slowdown_writes_trigger(0)
+            .level0_stop_writes_trigger(2)
+            .max_write_buffer_number(0);
         let dir = TempDir::new().unwrap();
         let db = Arc::new(Db::open(dir.path(), opts).unwrap());
 
@@ -8698,10 +8598,7 @@ mod tests {
         // branch.
         use std::time::Instant;
 
-        let opts = Options {
-            write_buffer_size: 64 * 1024,
-            ..Options::default()
-        };
+        let opts = Options::default().write_buffer_size(64 * 1024);
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), opts).unwrap();
 

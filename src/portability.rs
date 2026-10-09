@@ -68,13 +68,12 @@
 //! | `lz4_flex` | `no_std` covers the block format, which is all regolith uses | low: `default-features = false` |
 //! | `thiserror` 1.0 | no `no_std` support | medium: bump to 2.x |
 //! | `snap` | no `no_std` path at all; regolith uses only `snap::raw` | medium: upstream a feature, vendor `raw.rs`, or drop Snappy on `no_std` |
-//! | `kovan-mvcc` | pulls `parking_lot`, which is `std`-only | medium: the transactional layer is not part of a tier-B build and can be feature-gated off |
-//! | **locks** | **[`crate::sync`] is `std::sync`-backed** | **medium, see below** |
+//! | **locks** | **[`crate::sync::internal`] is `std::sync`-backed** | **medium, see below** |
 //!
 //! ## Locks, specifically
 //!
 //! Every `Mutex`, `RwLock` and `Gate` in the engine comes from
-//! [`crate::sync`], which is `std::sync` on a normal build and
+//! [`crate::sync::internal`], which is `std::sync` on a normal build and
 //! `loom::sync` under `--cfg loom`. That is one seam rather than sixty
 //! call sites, so the remaining work for tier B is to add a third arm
 //! to that module backed by `spin` or `critical-section`.
@@ -82,8 +81,11 @@
 //! The `Condvar` half is more subtle than the `Mutex` half: on a
 //! single-threaded target there is no other thread to wake, so a
 //! blocking wait has to be replaced by the caller doing the work itself
-//! rather than by a different condvar. Two waits exist today, both
-//! outside the engine's storage path: the rate limiter's refill wait
-//! and the pessimistic transaction lock table's acquisition wait.
+//! rather than by a different condvar. Four condvar waits exist today: the
+//! rate limiter's refill wait, the pessimistic transaction lock table's
+//! acquisition wait, the snapshot registry's wait for snapshots to drain,
+//! and the compaction gate, which `compact_range`, an external file ingest,
+//! a checkpoint and `drop_all` wait on. A commit follower parks on its slot
+//! and a stalled writer parks on a kovan signal, neither on a condvar.
 
 pub(crate) use portable_atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};

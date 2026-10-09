@@ -19,10 +19,7 @@ impl MergeOperator for Concat {
 }
 
 fn opts() -> Options {
-    Options {
-        merge_operator: Some(Arc::new(Concat)),
-        ..Options::default()
-    }
+    Options::default().merge_operator(Some(Arc::new(Concat)))
 }
 
 #[test]

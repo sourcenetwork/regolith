@@ -5,13 +5,16 @@
 //! [`KeyClassifier`], and the level relaxes validation for those keys on the
 //! caller's word: a scan inside a commutative prefix is not validated as a
 //! read, a put or merge of a content-addressed key is not validated, and a
-//! read of one that found it is validated for its presence only. Anything
-//! else is validated as at [`IsolationLevel::RepeatableRead`]. The classifier
-//! does not govern blind merges, which commute at this level for every key.
+//! read of one that found it is validated for its presence only, a read of a
+//! key of a commit-ordered log is never validated, and a write to one is
+//! refused. Anything else is validated as at
+//! [`IsolationLevel::RepeatableRead`]. The classifier does not govern blind
+//! merges, which commute at this level for every key.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use crate::Access;
 use crate::engine::ValidationSet;
 use crate::transaction::IsolationLevel;
 
@@ -32,7 +35,8 @@ pub enum KeyClass {
     /// `len` bytes is in the same class.
     ///
     /// This class has an effect only for an optimistic transaction at
-    /// [`IsolationLevel::DefraLevel`]. There, the commit disregards a scan
+    /// [`IsolationLevel::DefraLevel`] with a [`KeyClassifier`] installed.
+    /// There, the commit disregards a scan
     /// stretch that stays inside one such prefix. The keys that scan
     /// returned are not validated as reads, as for any scan at
     /// [`IsolationLevel::RepeatableRead`]. A write or merge the transaction
@@ -61,8 +65,8 @@ pub enum KeyClass {
     /// [`IsolationLevel::DefraLevel`] with a [`KeyClassifier`] installed.
     /// There:
     ///
-    /// - A put or merge of the key is never checked against newer writes, and
-    ///   neither is a read of a key the transaction puts or merges, so two
+    /// - A put or merge of the key never conflicts with a newer write, and
+    ///   neither does a read of a key the transaction puts or merges, so two
     ///   transactions that create the same key both commit. The newest write
     ///   of a key decides: a key the transaction deletes and then puts or
     ///   merges counts as put or merged.
@@ -83,10 +87,43 @@ pub enum KeyClass {
     /// Other levels, and transactions without a classifier, are unchanged.
     ///
     /// The caller's contract is that the bytes under the key never differ.
-    /// regolith cannot check it: a transaction that writes other bytes under
-    /// the key commits as well, and the last commit to land decides what the
-    /// key holds.
+    /// regolith checks it where that costs nothing on the common path. When
+    /// a commit made after the transaction began left the key a value, and
+    /// the transaction puts different bytes, the commit applies nothing and
+    /// fails with [`crate::Error::ContentMismatch`]. A put of the same bytes
+    /// commits. The check does not look at a key whose newest version is a
+    /// delete or a merge operand, at a merge, or at bytes that were already
+    /// different before the transaction began, so the contract still rests on
+    /// the caller.
     ContentAddressed,
+    /// The key belongs to a commit-ordered log: its head key, an entry key or
+    /// a once key, as the log's [`crate::LogLayout`] and the `once_key` of
+    /// [`crate::Transaction::append`] name them. Only `append` writes them.
+    ///
+    /// This class has an effect only for an optimistic transaction at
+    /// [`IsolationLevel::DefraLevel`] with a [`KeyClassifier`] installed.
+    /// There:
+    ///
+    /// - A read of the key (`get`, `get_slice`, `get_for_update`) is never
+    ///   validated. A reader that reads a log in a snapshot sees a dense
+    ///   prefix of it, and entries appended later are not a conflict.
+    /// - A `put`, `delete` or `merge` of the key is refused with
+    ///   [`crate::Error::LogKeyWrite`] when it is called, and nothing is
+    ///   buffered.
+    /// - `append` checks that the layout's head and entry keys and the
+    ///   `once_key` are all declared `Log`, and refuses the call with
+    ///   [`crate::Error::InvalidArgument`] when one is not.
+    ///
+    /// Other levels, pessimistic transactions and transactions without a
+    /// classifier are unchanged: a pessimistic transaction consults no
+    /// classifier, so its writes to log keys are not refused, and a write
+    /// through [`crate::Db`] is not either. That is the caller's contract.
+    ///
+    /// Declare a key `Log` only when every writer of it is `append`, and when
+    /// nothing the transaction writes depends on entries the log did not yet
+    /// hold: a decision taken on a read of a log may be overtaken by entries
+    /// appended after the transaction's snapshot.
+    Log,
 }
 
 /// Classifies keys for [`IsolationLevel::DefraLevel`].
@@ -95,8 +132,20 @@ pub enum KeyClass {
 /// column-family prefix. It must be pure, deterministic and allocation-free:
 /// commit calls it while it holds the transaction and before it takes the
 /// write pipeline, at most once for the start of each scan stretch and at
-/// most once for each distinct key the transaction reads, puts, deletes or
-/// merges.
+/// most once for each distinct key the transaction reads, puts or merges. A
+/// key it only deletes is not classified there.
+///
+/// Before commit, `put`, `delete` and `merge` call it once with the key they
+/// are given, to refuse a [`KeyClass::Log`] key, and `append` calls it for
+/// each key of the log it names. A transaction begun with
+/// [`TxnOptions::early_validation`](crate::TxnOptions::early_validation) asks
+/// once more for each key it puts or merges, to leave a content-addressed one
+/// unchecked.
+///
+/// A panic in `classify` during the commit fails the commit with
+/// [`Error::CallbackPanicked`](crate::Error::CallbackPanicked) and latches the
+/// database read-only until it is reopened. A panic in one of the calls before
+/// the commit unwinds into that call and fails only it.
 pub trait KeyClassifier: Send + Sync {
     /// The class `key` belongs to.
     fn classify(&self, key: &[u8]) -> KeyClass;
@@ -109,6 +158,7 @@ pub(super) fn run_is_commutative(classifier: &dyn KeyClassifier, run: &ScanRun) 
     let (first, Some(last)) = run.bounds() else {
         return false;
     };
+    let last = last.as_slice();
     if first.len() < CF_PREFIX_LEN
         || last.len() < CF_PREFIX_LEN
         || first[..CF_PREFIX_LEN] != last[..CF_PREFIX_LEN]
@@ -120,7 +170,7 @@ pub(super) fn run_is_commutative(classifier: &dyn KeyClassifier, run: &ScanRun) 
         KeyClass::CommutativePrefix { len } => {
             first.len() >= len && last.len() >= len && first[..len] == last[..len]
         }
-        KeyClass::Ordinary | KeyClass::ContentAddressed => false,
+        KeyClass::Ordinary | KeyClass::ContentAddressed | KeyClass::Log => false,
     }
 }
 
@@ -129,6 +179,12 @@ pub(super) fn run_is_commutative(classifier: &dyn KeyClassifier, run: &ScanRun) 
 fn class_of(classifier: &dyn KeyClassifier, key: &[u8]) -> KeyClass {
     key.get(CF_PREFIX_LEN..)
         .map_or(KeyClass::Ordinary, |key| classifier.classify(key))
+}
+
+/// Whether `classifier` declares `key`, which carries the column-family
+/// prefix, content-addressed.
+pub(super) fn is_content_addressed(classifier: &dyn KeyClassifier, key: &[u8]) -> bool {
+    class_of(classifier, key) == KeyClass::ContentAddressed
 }
 
 /// The classifier a transaction at `isolation` consults: only
@@ -157,6 +213,11 @@ pub(super) fn classifier_for(
 ///
 /// Every other read of a content-addressed key that found a value is marked
 /// presence-only, and one that found nothing stays a read like any other.
+///
+/// A read of a key of a commit-ordered log is dropped, found or not: nothing a
+/// transaction decides on a log read is validated. The commit never writes a
+/// log key, since a put, delete or merge of one is refused when it is made,
+/// and an append is not validated.
 ///
 /// The listing is a sorted copy of the exempt keys, built here before the
 /// commit takes the write pipeline. The engine finds a written key in it by
@@ -206,11 +267,14 @@ pub(super) fn exempt_content_addressed(
             return false;
         }
         // A key the commit puts or merges was classified above, and is not
-        // exempt.
-        read.presence_only = read.found
-            && !is_put(&read.key)
-            && merged.binary_search(&read.key.as_slice()).is_err()
-            && content_addressed(&read.key);
+        // exempt, nor can it be a log key, which a write refuses.
+        if !is_put(&read.key) && merged.binary_search(&read.key.as_slice()).is_err() {
+            match class_of(classifier, &read.key) {
+                KeyClass::Log => return false,
+                KeyClass::ContentAddressed if read.found => read.access = Access::ReadPresence,
+                _ => {}
+            }
+        }
         true
     });
     checks.exempt = exempt;
@@ -229,10 +293,10 @@ impl IsolationLevel {
 mod tests {
     use super::*;
     use crate::column_family::{DEFAULT_CF_ID, prefix_key};
-    use crate::engine::ConflictKey;
+    use crate::engine::{ConflictKey, ReadRule};
 
     /// Keys that start with `c` are content-addressed, those with `p` are in a
-    /// commutative prefix, the rest are ordinary.
+    /// commutative prefix, those with `l` are log keys, the rest are ordinary.
     struct ByFirstByte;
 
     impl KeyClassifier for ByFirstByte {
@@ -240,6 +304,7 @@ mod tests {
             match key.first() {
                 Some(b'c') => KeyClass::ContentAddressed,
                 Some(b'p') => KeyClass::CommutativePrefix { len: 1 },
+                Some(b'l') => KeyClass::Log,
                 _ => KeyClass::Ordinary,
             }
         }
@@ -254,7 +319,8 @@ mod tests {
             key: key(name),
             observed_seq: 3,
             found,
-            presence_only: false,
+            access: Access::Read,
+            rule: ReadRule::Seq,
         }
     }
 
@@ -264,6 +330,7 @@ mod tests {
             writes_at: Some(3),
             blind_merges_commute: true,
             exempt: Vec::new(),
+            ranges: Vec::new(),
         }
     }
 
@@ -272,7 +339,7 @@ mod tests {
         checks
             .reads
             .iter()
-            .map(|read| (read.key.clone(), read.presence_only))
+            .map(|read| (read.key.clone(), read.presence_only()))
             .collect()
     }
 
@@ -320,6 +387,25 @@ mod tests {
             "c3 is put, so its read is gone; a content-addressed read that found a value is \
              presence-only, one that found nothing is an ordinary read, and c5 is deleted but \
              not exempt"
+        );
+    }
+
+    #[test]
+    fn a_read_of_a_log_key_is_dropped_found_or_not_and_other_reads_stay() {
+        let mut checks = checks_of(vec![
+            read(b"a", true),
+            read(b"l1", true),
+            read(b"l2", false),
+            read(b"p", true),
+        ]);
+        let writes = BTreeMap::from([(key(b"b"), Some(b"v".to_vec()))]);
+
+        exempt_content_addressed(&ByFirstByte, &mut checks, &writes, &[]);
+
+        assert_eq!(kept(&checks), [(key(b"a"), false), (key(b"p"), false)]);
+        assert!(
+            checks.exempt.is_empty(),
+            "a log key is never written, so never listed"
         );
     }
 

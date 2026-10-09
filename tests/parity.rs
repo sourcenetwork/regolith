@@ -280,11 +280,9 @@ fn compression_none_produces_larger_files_than_lz4() {
     let dir_lz4 = TempDir::new().unwrap();
 
     let write = |dir: &TempDir, compression: CompressionType| {
-        let opts = Options {
-            write_buffer_size: 4 * 1024,
-            compression,
-            ..Options::default()
-        };
+        let opts = Options::default()
+            .write_buffer_size(4 * 1024)
+            .compression(compression);
         let db = Db::open(dir.path(), opts).unwrap();
         let payload = vec![0xABu8; 256];
         for i in 0..500 {
@@ -308,14 +306,12 @@ fn compression_none_produces_larger_files_than_lz4() {
 #[test]
 fn fifo_drops_oldest_file_when_over_cap() {
     let dir = TempDir::new().unwrap();
-    let opts = Options {
-        write_buffer_size: 4 * 1024,
-        compaction_style: CompactionStyle::Fifo,
-        fifo_compaction_options: FifoCompactionOptions {
+    let opts = Options::default()
+        .write_buffer_size(4 * 1024)
+        .compaction_style(CompactionStyle::Fifo)
+        .fifo_compaction_options(FifoCompactionOptions {
             max_table_files_size: 32 * 1024,
-        },
-        ..Options::default()
-    };
+        });
     let db = Db::open(dir.path(), opts).unwrap();
     let payload = vec![0xEEu8; 256];
     for i in 0..256 {

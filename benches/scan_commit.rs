@@ -12,7 +12,7 @@ mod common;
 
 use std::time::Instant;
 
-use regolith::{IsolationLevel, OptimisticTransactionDb};
+use regolith::{IsolationLevel, OptimisticTransactionDb, TxnOptions};
 
 const LEVELS: [(IsolationLevel, &str); 3] = [
     (IsolationLevel::SnapshotIsolation, "snapshot"),
@@ -45,7 +45,7 @@ fn micros(
     let mut total = Vec::with_capacity(reps);
     for rep in 0..reps {
         let started = Instant::now();
-        let txn = db.begin_transaction_with(level);
+        let txn = db.begin(&TxnOptions::new().isolation(level));
         let yielded = txn.scan_stream(Some(RANGE.0), Some(RANGE.1)).count();
         assert_eq!(
             yielded, n,

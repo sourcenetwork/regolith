@@ -5,7 +5,30 @@
 use super::*;
 use proptest::prelude::*;
 use std::collections::BTreeMap;
+use std::ops::ControlFlow;
 use tempfile::TempDir;
+
+/// Appends every operand to the base. These tests need a database that
+/// accepts merges, not any particular fold.
+struct Append;
+
+impl crate::MergeOperator for Append {
+    fn name(&self) -> &'static str {
+        "append"
+    }
+
+    fn full_merge(&self, _key: &[u8], base: Option<&[u8]>, operands: &[&[u8]]) -> Option<Vec<u8>> {
+        let mut out = base.map(<[u8]>::to_vec).unwrap_or_default();
+        operands
+            .iter()
+            .for_each(|operand| out.extend_from_slice(operand));
+        Some(out)
+    }
+}
+
+fn with_operator() -> Options {
+    Options::default().merge_operator(Some(Arc::new(Append)))
+}
 
 /// The dedupe `commit_inner` ran before this branch (a `HashSet` over
 /// cloned keys) followed by the old `validation_set` body (a `BTreeMap`
@@ -13,7 +36,7 @@ use tempfile::TempDir;
 /// oracle the proptest below checks the new code against; nothing here
 /// is meant to be idiomatic, only faithful to what shipped before.
 fn oracle(
-    tx: &Transaction<'_>,
+    tx: &Transaction,
     tracked: Vec<(Vec<u8>, Arc<KeyState>)>,
     writes: &BTreeMap<Vec<u8>, Option<Vec<u8>>>,
     merges: &[(Vec<u8>, Vec<u8>)],
@@ -90,10 +113,10 @@ enum AnyDb {
 }
 
 impl AnyDb {
-    fn begin(&self, isolation: IsolationLevel) -> Transaction<'_> {
+    fn begin(&self, isolation: IsolationLevel) -> Transaction {
         match self {
-            AnyDb::Optimistic(db) => db.begin_transaction_with(isolation),
-            AnyDb::Pessimistic(db) => db.begin_transaction_with(isolation),
+            AnyDb::Optimistic(db) => db.begin(&TxnOptions::new().isolation(isolation)),
+            AnyDb::Pessimistic(db) => db.begin(&TxnOptions::new().isolation(isolation)),
         }
     }
 
@@ -141,11 +164,11 @@ proptest! {
         let dir = TempDir::new().expect("tempdir");
         let db = if flavor == 0 {
             AnyDb::Optimistic(
-                OptimisticTransactionDb::open(dir.path(), Options::default()).expect("open"),
+                OptimisticTransactionDb::open(dir.path(), with_operator()).expect("open"),
             )
         } else {
             AnyDb::Pessimistic(
-                TransactionDb::open(dir.path(), Options::default())
+                TransactionDb::open(dir.path(), with_operator())
                     .expect("open")
                     .with_lock_timeout(Duration::from_secs(10)),
             )
@@ -165,8 +188,7 @@ proptest! {
         }
 
         // Drained exactly as `commit_inner` drains them. This never
-        // reaches the engine: no merge operator is configured, and
-        // nothing here commits.
+        // reaches the engine: nothing here commits.
         let (writes, merges) = settle(tx.writes.drain());
         let tracked = tx.tracked.drain();
 
@@ -204,7 +226,7 @@ proptest! {
 fn duplicate_tracked_cells_are_deduped_keeping_the_newest() {
     let dir = TempDir::new().expect("tempdir");
     let db = OptimisticTransactionDb::open(dir.path(), Options::default()).expect("open");
-    let tx = db.begin_transaction_with(IsolationLevel::SnapshotIsolation);
+    let tx = db.begin(&TxnOptions::new().isolation(IsolationLevel::SnapshotIsolation));
     let seq = tx.snapshot_seq;
 
     // Case 1: catches a dedupe that keeps the wrong (older) cell. Newest
@@ -237,23 +259,45 @@ fn duplicate_tracked_cells_are_deduped_keeping_the_newest() {
 
 fn open_any(flavor: u8, dir: &TempDir) -> AnyDb {
     if flavor == 0 {
-        AnyDb::Optimistic(
-            OptimisticTransactionDb::open(dir.path(), Options::default()).expect("open"),
-        )
+        AnyDb::Optimistic(OptimisticTransactionDb::open(dir.path(), with_operator()).expect("open"))
     } else {
         AnyDb::Pessimistic(
-            TransactionDb::open(dir.path(), Options::default())
+            TransactionDb::open(dir.path(), with_operator())
                 .expect("open")
                 .with_lock_timeout(Duration::from_secs(10)),
         )
     }
 }
 
+/// Whether the transaction buffered a merge operand for `prefixed`.
+fn has_operands(tx: &Transaction, prefixed: &[u8]) -> bool {
+    let mut found = false;
+    tx.writes.walk_chain(prefixed, |write| {
+        found |= matches!(write, Write::Merge(_));
+        ControlFlow::Continue(())
+    });
+    found
+}
+
+/// Whether merge operands were buffered for `prefixed` after its newest put
+/// or delete, so the key reads as those operands applied to that entry.
+fn operands_above_terminator(tx: &Transaction, prefixed: &[u8]) -> bool {
+    let mut found = false;
+    tx.writes.walk_chain(prefixed, |write| {
+        if write.is_terminator() {
+            return ControlFlow::Break(());
+        }
+        found |= matches!(write, Write::Merge(_));
+        ControlFlow::Continue(())
+    });
+    found
+}
+
 /// The put or delete the transaction buffered for `prefixed`, if any. Merge
-/// operands alone are not one: with no merge operator configured, which is
-/// the case throughout this file, a scan neither yields them nor skips the
-/// snapshot entry beneath them.
-fn replacement(tx: &Transaction<'_>, prefixed: &[u8]) -> Option<Write> {
+/// operands alone are not one: a scan reads the entry beneath them, and
+/// yields the key with the operands applied even when the snapshot holds
+/// nothing there.
+fn replacement(tx: &Transaction, prefixed: &[u8]) -> Option<Write> {
     let mut found = None;
     tx.writes.walk_chain(prefixed, |write| {
         found = write.is_terminator().then(|| write.clone());
@@ -269,12 +313,14 @@ fn replacement(tx: &Transaction<'_>, prefixed: &[u8]) -> Option<Write> {
 /// The keys the stretches of one scan of `[start, end)` cover, worked out
 /// independently of `TxnScanStream`: the snapshot holds exactly the keys in
 /// `seeded`, an entry of the write buffer ends a stretch (and is yielded when
-/// it is a put), a snapshot key already promoted past the begin snapshot ends
+/// it is a put, or a delete with merge operands above it), a snapshot key already promoted past the begin snapshot ends
 /// a stretch (and is yielded when the engine has it at its read sequence),
-/// every other snapshot key extends the stretch, and the walk stops once
-/// `take` entries were yielded. Called before the scan runs.
+/// every other snapshot key extends the stretch, a key that only has merge
+/// operands is read like a snapshot key whether or not the snapshot holds it
+/// and is always yielded, and the walk stops once `take` entries were
+/// yielded. Called before the scan runs.
 fn expected_cover(
-    tx: &Transaction<'_>,
+    tx: &Transaction,
     seeded: u8,
     start: u8,
     end: u8,
@@ -303,10 +349,15 @@ fn expected_cover(
         let prefixed = prefix_key(DEFAULT_CF_ID, &[key]);
         if let Some(replaced) = replacement(tx, &prefixed) {
             close(&mut stretch);
-            yielded += usize::from(matches!(replaced, Write::Put(_)));
+            // A put reads as a value, and so does a delete with operands
+            // buffered above it: they apply to nothing and yield.
+            yielded += usize::from(
+                matches!(replaced, Write::Put(_)) || operands_above_terminator(tx, &prefixed),
+            );
             continue;
         }
-        if key >= 6 || seeded & (1 << key) == 0 {
+        let merged = has_operands(tx, &prefixed);
+        if !merged && (key >= 6 || seeded & (1 << key) == 0) {
             continue;
         }
         let promoted = matches!(tx.mode, TxMode::Pessimistic { .. })
@@ -320,7 +371,8 @@ fn expected_cover(
                 .engine
                 .get_slice_at(&prefixed, read_seq)
                 .expect("engine read");
-            yielded += usize::from(visible.is_some());
+            // Operands apply to nothing when the key is not visible.
+            yielded += usize::from(merged || visible.is_some());
             continue;
         }
         stretch = Some(stretch.map_or((key, key), |(first, _)| (first, key)));
@@ -382,8 +434,8 @@ proptest! {
                 covered.extend(expected_cover(&scan_tx, seeded, key[0], end[0], reverse, take));
                 let direction = if reverse { ScanDirection::Reverse } else { ScanDirection::Forward };
                 let mut stream = scan_tx.scan_stream_in(Some(&key), Some(&end), direction);
-                let entries: Vec<Vec<u8>> = stream.by_ref().take(take).map(|(k, _)| k).collect();
-                prop_assert!(stream.status().is_ok());
+                let entries: Vec<Vec<u8>> =
+                    stream.by_ref().take(take).map(|item| item.unwrap().0).collect();
                 drop(stream);
                 for entry in entries {
                     let buffered = replacement(&scan_tx, &prefix_key(DEFAULT_CF_ID, &entry)).is_some();
@@ -399,13 +451,20 @@ proptest! {
             }
         }
 
-        let settle = |tx: &mut Transaction<'_>| {
+        let settle = |tx: &mut Transaction| {
             let (writes, merges) = write_buffer::settle(tx.writes.drain());
             let tracked = tx.tracked.drain();
             let mut checks = tx.validation_set(tracked, &writes, &merges);
             if let Some(runs) = tx.scan_runs.take() {
                 let runs = drain(&runs);
-                scan_range::cover(&mut checks.reads, &runs, &writes, &merges, tx.snapshot_seq);
+                scan_range::cover(
+                    &mut checks.reads,
+                    &runs,
+                    &writes,
+                    &merges,
+                    tx.snapshot_seq,
+                    &tx.full_read_rule(),
+                );
             }
             let written: std::collections::BTreeSet<Vec<u8>> =
                 writes.keys().chain(merges.iter().map(|(key, _)| key)).cloned().collect();

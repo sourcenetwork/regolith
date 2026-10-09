@@ -39,25 +39,36 @@ use std::time::Duration;
 
 use kovan_queue::array_queue::ArrayQueue;
 
-use super::internal_key::VALUE_TYPE_DELETION;
+use super::callback::InCommit;
 use super::memtable::MemTable;
 use super::wal::{MAX_RECORD_LEN, Wal, check_write_len};
 use super::{CommitOutcome, DurabilityMode, ReadView, RegolithEngine, grouped_batch_ops};
-use crate::WriteBatchOp;
 use crate::perf_context::{PerfTimer, PerfTimerField};
 use crate::statistics::{Histogram, Ticker};
+use crate::{Access, Conflict, WriteBatchOp};
 
+mod allocate;
+mod append;
+mod content;
+mod counter;
+mod range_rule;
+mod read_rules;
 mod replaced;
 mod request;
 mod slot;
 mod stall;
 mod terminator;
+mod write_check;
 
+use append::AppendOrder;
+pub(crate) use append::PendingAppend;
 use replaced::Replaced;
 pub(crate) use request::WriteRequest;
 pub(crate) use slot::WriteSlot;
 pub(crate) use stall::StallSignal;
 use terminator::Landed;
+pub(crate) use write_check::EarlyWrite;
+use write_check::WriteCheck;
 
 /// Largest number of WAL bytes one group stages before it stops admitting.
 ///
@@ -137,13 +148,6 @@ impl Pipeline {
             held: None,
         }
     }
-}
-
-/// `io::Error` is not `Clone`, but a failed group has to hand the same
-/// failure to every member. Kind and message are the whole of what a
-/// caller can observe, so reconstructing them is lossless here.
-fn clone_io_error(err: &io::Error) -> io::Error {
-    io::Error::new(err.kind(), err.to_string())
 }
 
 /// Give staging memory back when neither of the last two groups needed it,
@@ -301,11 +305,15 @@ impl RegolithEngine {
         point_ops: std::collections::BTreeMap<Vec<u8>, Option<Vec<u8>>>,
         range_deletes: Vec<(Vec<u8>, Vec<u8>)>,
         merges: Vec<(Vec<u8>, Vec<u8>)>,
+        appends: Vec<PendingAppend>,
         durability: DurabilityMode,
     ) -> io::Result<CommitOutcome> {
         self.ensure_writable()?;
         let ops = grouped_batch_ops(point_ops, range_deletes, merges);
         self.validate_ops_sizes(&ops, false)?;
+        if !appends.is_empty() {
+            self.validate_append_sizes(&ops, &appends)?;
+        }
 
         // The write-stall admission a plain write pays with
         // `WriteOptions::default()`, in the same order: closed/WAL-failed/
@@ -316,13 +324,55 @@ impl RegolithEngine {
         // held. A commit that writes nothing (`ops` empty, e.g. a
         // `get_for_update` with no write) takes no capacity and skips the
         // wait, though its conflict check below still runs under the
-        // mutex like any other commit.
-        if !ops.is_empty() {
+        // mutex like any other commit. An append is a write.
+        if !ops.is_empty() || !appends.is_empty() {
             self.wait_for_write_capacity(false)
                 .map_err(crate::Error::into_io_error)?;
         }
 
-        self.commit_locked(checks, ops, durability)
+        self.commit_locked(checks, ops, appends, durability)
+    }
+
+    /// Commit a transaction that writes nothing: check the reads it asked to
+    /// have validated, if any, and take no part in the write pipeline.
+    ///
+    /// The check runs against the newest published state, not under the
+    /// pipeline mutex, so a group a leader is still writing is not seen: only
+    /// a write at or below the sequence readers may see counts. That is a
+    /// commit point of its own, after every commit that returned before this
+    /// one began, which is all a transaction with nothing to apply needs.
+    /// A commit with no reads to check does nothing at all.
+    pub(crate) fn commit_write_free(
+        &self,
+        checks: &crate::engine::ValidationSet,
+    ) -> io::Result<CommitOutcome> {
+        self.ensure_open()?;
+        if checks.reads.is_empty() {
+            return Ok(CommitOutcome::Ok { seq: None });
+        }
+        // The view is loaded before the sequence is sampled, for the reason
+        // `get_slice_latest` gives.
+        let view = self.view.load();
+        let ceil = self.visible_seq.visible();
+        for check in &checks.reads {
+            if let Some((latest_seq, newest)) = self.latest_version_upto(&check.key, ceil, &view)?
+                && latest_seq > check.observed_seq
+                && let Some((seq, theirs)) =
+                    self.read_changed(check, (latest_seq, newest), ceil, &view)?
+            {
+                if let Some(s) = self.statistics() {
+                    s.add(Ticker::CommitConflictsOnRead, 1);
+                }
+                return Ok(CommitOutcome::Conflict(Conflict::new(
+                    check.key.clone(),
+                    check.access,
+                    theirs,
+                    check.observed_seq,
+                    seq,
+                )));
+            }
+        }
+        Ok(CommitOutcome::Ok { seq: None })
     }
 
     /// The conflict check and the apply, under one uninterrupted hold of
@@ -334,7 +384,8 @@ impl RegolithEngine {
     fn commit_locked(
         &self,
         checks: &crate::engine::ValidationSet,
-        ops: Vec<WriteBatchOp>,
+        mut ops: Vec<WriteBatchOp>,
+        appends: Vec<PendingAppend>,
         durability: DurabilityMode,
     ) -> io::Result<CommitOutcome> {
         let mut pipe = self.pipeline.lock();
@@ -350,25 +401,49 @@ impl RegolithEngine {
         // sorted by key, so a multi-key conflict names the same key on
         // every run.
         for check in &checks.reads {
-            if let Some((latest_seq, newest_type)) = self.latest_version_in_view(&check.key, &view)?
+            if let Some((latest_seq, newest)) = self.latest_version_in_view(&check.key, &view)?
                 && latest_seq > check.observed_seq
-                // A presence-only read found a value of a key whose bytes
-                // never differ, so only the key being gone (a deletion, or a
-                // range delete over it) can have changed what it decided.
-                && (!check.presence_only || newest_type == VALUE_TYPE_DELETION)
+                // Only a newer version can have changed what the read
+                // decided, and the read's rule says whether this one did: a
+                // presence-only read needs the key gone, a value read the
+                // bytes different, a projected read a part touched.
+                && let Some((seq, theirs)) =
+                    self.read_changed(check, (latest_seq, newest), u64::MAX, &view)?
             {
-                // A key the transaction *read* always aborts, since the stale
-                // read may have changed what it decided. The commit-level
-                // `CommitConflicts` ticker is recorded once per commit where
-                // the outcome is mapped; this is the per-key subset.
+                // A key the transaction *read* aborts when the rule says the
+                // stale read may have changed what it decided. The
+                // commit-level `CommitConflicts` ticker is recorded once per
+                // commit where the outcome is mapped; this is the per-key
+                // subset.
                 if let Some(s) = self.statistics() {
                     s.add(Ticker::CommitConflictsOnRead, 1);
                 }
-                return Ok(CommitOutcome::Conflict {
-                    key: check.key.clone(),
-                    observed_seq: check.observed_seq,
-                    latest_seq,
-                });
+                return Ok(CommitOutcome::Conflict(Conflict::new(
+                    check.key.clone(),
+                    check.access,
+                    theirs,
+                    check.observed_seq,
+                    seq,
+                )));
+            }
+        }
+        // A validated scan decided on a whole range, so a write anywhere in it
+        // after the snapshot is a conflict, a key that left it or appeared in
+        // it alike.
+        for range in &checks.ranges {
+            if let Some((key, seq, theirs)) =
+                self.written_in_range(&range.lo, &range.hi, range.observed_seq, &view)?
+            {
+                if let Some(s) = self.statistics() {
+                    s.add(Ticker::CommitConflictsOnRead, 1);
+                }
+                return Ok(CommitOutcome::Conflict(Conflict::new(
+                    key,
+                    Access::ScannedRange,
+                    theirs,
+                    range.observed_seq,
+                    seq,
+                )));
             }
         }
         // The merges arrive sorted by key, so a key merged N times in one
@@ -385,16 +460,22 @@ impl RegolithEngine {
             // Borrows the batch and allocates nothing: the loop below runs
             // under the pipeline mutex.
             let replaced = checks.blind_merges_commute.then(|| Replaced::of(&ops));
+            // Whether anything committed since the snapshot, which only an
+            // exempt put has any use for: with no exempt key, or nothing
+            // newer, no put is looked up.
+            let landed_since =
+                !checks.exempt.is_empty() && self.latest_seq.load(Ordering::Acquire) > observed_seq;
             let mut last_merged: Option<&[u8]> = None;
             for op in &ops {
-                let (key, merged) = match op {
-                    WriteBatchOp::Put { key, .. } | WriteBatchOp::Delete { key } => (key, false),
+                let (key, mine) = match op {
+                    WriteBatchOp::Put { key, .. } => (key, Access::Put),
+                    WriteBatchOp::Delete { key } => (key, Access::Delete),
                     WriteBatchOp::Merge { key, .. } => {
                         if last_merged == Some(key.as_slice()) {
                             continue;
                         }
                         last_merged = Some(key.as_slice());
-                        (key, true)
+                        (key, Access::Merge)
                     }
                     // Range deletes are not validated (transaction.rs:459-460).
                     WriteBatchOp::DeleteRange { .. } => continue,
@@ -412,6 +493,19 @@ impl RegolithEngine {
                     .binary_search_by(|exempt| exempt.as_slice().cmp(key))
                     .is_ok()
                 {
+                    // The one lookup an exempt put can cost: the key names
+                    // its bytes, so a put beside different ones breaks the
+                    // contract and the commit is refused loudly.
+                    if landed_since
+                        && let WriteBatchOp::Put { value, .. } = op
+                        && self.content_mismatch(key, value, observed_seq, &view)?
+                    {
+                        tracing::error!(
+                            "a content-addressed key was put with bytes that differ from \
+                             the bytes it holds; the commit was refused"
+                        );
+                        return Err(crate::Error::ContentMismatch.into_io_error());
+                    }
                     continue;
                 }
                 // A written key the transaction also read was validated above,
@@ -421,52 +515,54 @@ impl RegolithEngine {
                 if checks
                     .reads
                     .binary_search_by(|read| read.key.as_slice().cmp(key))
-                    .is_ok_and(|at| !checks.reads[at].presence_only)
+                    .is_ok_and(|at| !checks.reads[at].presence_only())
                 {
                     continue;
                 }
-                // Operands commute, so a key the batch only merges into
-                // conflicts only with a replacement newer than the snapshot,
-                // and one walk settles that and tells whether operands landed
-                // too. The probe below then runs for such a key only once it
-                // is about to conflict anyway.
-                if merged
-                    && let Some(replaced) = &replaced
-                    && !replaced.contains(key)
-                {
-                    match self.landed_above(key, observed_seq, &view)? {
-                        // The probe below conflicts.
-                        Landed::Replaced => {}
-                        Landed::Operands => {
-                            // Operands commute, so a newer merge operand never
-                            // invalidates a blind merge: the key is accepted
-                            // despite the newer write.
-                            merges_commuted += 1;
-                            continue;
+                match self.check_write(
+                    key,
+                    mine,
+                    observed_seq,
+                    replaced.as_ref(),
+                    &view,
+                    |theirs| self.write_matches_committed(key, &ops, &view, theirs),
+                )? {
+                    WriteCheck::Clean => {}
+                    WriteCheck::Commuted => merges_commuted += 1,
+                    WriteCheck::Elided => writes_elided += 1,
+                    WriteCheck::Conflict { seq, theirs } => {
+                        if let Some(s) = self.statistics() {
+                            s.add(Ticker::CommitConflictsOnWrite, 1);
                         }
-                        Landed::Nothing => continue,
+                        return Ok(CommitOutcome::Conflict(Conflict::new(
+                            key.clone(),
+                            mine,
+                            theirs,
+                            observed_seq,
+                            seq,
+                        )));
                     }
-                }
-                if let Some((latest_seq, newest_type)) = self.latest_version_in_view(key, &view)?
-                    && latest_seq > observed_seq
-                {
-                    // A blind write of the value the key already holds is not a
-                    // conflict: the schedule has a serial equivalent reaching the
-                    // same state.
-                    if self.write_matches_committed(key, &ops, &view, newest_type)? {
-                        writes_elided += 1;
-                        continue;
-                    }
-                    if let Some(s) = self.statistics() {
-                        s.add(Ticker::CommitConflictsOnWrite, 1);
-                    }
-                    return Ok(CommitOutcome::Conflict {
-                        key: key.clone(),
-                        observed_seq,
-                        latest_seq,
-                    });
                 }
             }
+        }
+
+        // The commit validated, so its appends take their positions now, and
+        // only now: in the ordered step, after validation and before the
+        // record is staged. The group is this commit alone, so the order
+        // starts from the view and nothing outlives the group.
+        if !appends.is_empty() {
+            // The layout is the caller's code, so a panic in it is caught
+            // and latches the database read-only, as one anywhere in the
+            // ordered step does.
+            let _commit = InCommit::enter();
+            let mut order = AppendOrder::default();
+            if let Err(err) = order.number(self, &view, appends, &mut ops) {
+                if let Some(callback) = crate::Error::callback_panic_of(&err) {
+                    self.latch_callback_panic(callback);
+                }
+                return Err(err);
+            }
+            order.finish(&mut ops);
         }
 
         // A read-only transaction still has to be validated: a
@@ -474,8 +570,9 @@ impl RegolithEngine {
         // conflict a lost-update check exists to catch. Short-circuit
         // only after the check, never before it.
         if ops.is_empty() {
-            return Ok(CommitOutcome::Ok);
+            return Ok(CommitOutcome::Ok { seq: None });
         }
+        let op_count = ops.len() as u64;
 
         let request = WriteRequest::Batch {
             ops,
@@ -501,7 +598,12 @@ impl RegolithEngine {
                 s.add(Ticker::CommitWritesElided, writes_elided);
             }
         }
-        result.map(|_| CommitOutcome::Ok)
+        // The group is this commit alone, so its base sequence is the first of
+        // the `op_count` this batch took, and the last is where its writes
+        // became visible.
+        result.map(|base_seq| CommitOutcome::Ok {
+            seq: Some(base_seq + op_count - 1),
+        })
     }
 
     /// Hand `request` to the commit pipeline and block until its group is
@@ -672,6 +774,7 @@ impl RegolithEngine {
     /// Completion happens after [`Self::run_group`] has published the read
     /// horizon (the lost-update fix) and hands the same outcome to every member (G2).
     fn run_and_complete(&self, pipe: &mut Pipeline, view: Arc<ReadView>) -> io::Result<u64> {
+        let _commit = InCommit::enter();
         let Pipeline {
             stage,
             group,
@@ -696,6 +799,13 @@ impl RegolithEngine {
                 Err(err)
             }
         };
+        // A caller's code panicked inside the group: the step it left half
+        // done is not one any later write may build on.
+        if let Err(err) = &result
+            && let Some(callback) = crate::Error::callback_panic_of(err)
+        {
+            self.latch_callback_panic(callback);
+        }
         // Each ticket learns the sequence *its own* operations were
         // assigned, not the group's maximum. An upper layer ordering its
         // versions against regolith's needs the sequence of the write it
@@ -707,7 +817,7 @@ impl RegolithEngine {
             if let Some(slot) = ticket.slot {
                 slot.complete(match &result {
                     Ok(_) => Ok(last),
-                    Err(e) => Err(io::Error::new(e.kind(), e.to_string())),
+                    Err(e) => Err(crate::Error::clone_io(e)),
                 });
             }
             seq = last.saturating_add(1);
@@ -802,14 +912,14 @@ impl RegolithEngine {
             let start_offset = wal.offset();
 
             if let Err(err) = wal.append_group(stage) {
-                self.abandon_group(wal, start_offset, &err);
+                self.abandon_group(wal, start_offset, &err)?;
                 return Err(err);
             }
 
             let mut synced = 0u64;
             if any_immediate {
                 if let Err(err) = wal.sync_data() {
-                    self.abandon_group(wal, start_offset, &err);
+                    self.abandon_group(wal, start_offset, &err)?;
                     return Err(err);
                 }
                 synced = 1;
@@ -859,28 +969,48 @@ impl RegolithEngine {
     /// partially written group never survives as a torn record. If the
     /// truncation itself fails the log's tail is unknown, so the engine
     /// latches and every later write fails loud rather than appending
-    /// after bytes nobody can account for.
-    fn abandon_group(&self, wal: &mut Wal, start_offset: u64, cause: &io::Error) {
+    /// after bytes nobody can account for. `Err` is a listener's panic while
+    /// it was told of the failure.
+    fn abandon_group(&self, wal: &mut Wal, start_offset: u64, cause: &io::Error) -> io::Result<()> {
         tracing::error!(error = %cause, "commit group failed; discarding its WAL bytes");
         if let Err(rollback_err) = wal.rollback_to(start_offset) {
             self.latch_wal_failure(&rollback_err);
         }
-        self.notify_wal_error(cause);
+        self.notify_wal_error(cause)
+    }
+
+    /// Tell the registered listeners a commit lost a race. Called after the
+    /// pipeline mutex is released.
+    pub(crate) fn notify_conflict(&self, conflict: &Conflict) {
+        crate::event_listener::dispatch(&self.options.listeners, |l| l.on_conflict(conflict));
+    }
+
+    /// Tell the registered listeners a transaction callback panicked after its
+    /// transaction's outcome was decided.
+    pub(crate) fn notify_callback_panic(&self, callback: &'static str) {
+        crate::event_listener::dispatch(&self.options.listeners, |l| l.on_callback_panic(callback));
     }
 
     /// Tell the registered listeners a write-ahead-log operation failed.
-    pub(super) fn notify_wal_error(&self, cause: &io::Error) {
-        if !self.options.listeners.is_empty() {
-            let err = crate::Error::from(clone_io_error(cause));
-            crate::event_listener::dispatch(&self.options.listeners, |l| {
-                l.on_background_error(
-                    crate::event_listener::BackgroundErrorReason::WriteAheadLog,
-                    &err,
-                )
-            });
+    /// `Err` is a listener's panic, caught because this runs in the ordered
+    /// step.
+    pub(super) fn notify_wal_error(&self, cause: &io::Error) -> io::Result<()> {
+        if self.options.listeners.is_empty() {
+            return Ok(());
         }
+        let err = crate::Error::from(crate::Error::clone_io(cause));
+        crate::event_listener::dispatch_contained(&self.options.listeners, |l| {
+            l.on_background_error(
+                crate::event_listener::BackgroundErrorReason::WriteAheadLog,
+                &err,
+            )
+        })
+        .map_err(crate::Error::into_io_error)
     }
 }
+
+#[cfg(test)]
+mod append_tests;
 
 #[cfg(test)]
 mod exempt_tests;
@@ -892,7 +1022,7 @@ mod limit_tests;
 mod tests {
     use super::super::{EngineOptions, wal::fault};
     use super::*;
-    use crate::sync::Mutex;
+    use crate::sync::internal::Mutex;
     use proptest::prelude::*;
     use tempfile::TempDir;
 
@@ -942,7 +1072,7 @@ mod tests {
     #[test]
     fn cloned_errors_keep_kind_and_message() {
         let err = io::Error::new(io::ErrorKind::StorageFull, "disk is full");
-        let cloned = clone_io_error(&err);
+        let cloned = crate::Error::clone_io(&err);
         assert_eq!(cloned.kind(), err.kind());
         assert_eq!(cloned.to_string(), err.to_string());
     }

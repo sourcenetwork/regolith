@@ -20,14 +20,12 @@ use std::time::{Duration, Instant};
 use regolith::{CompactionOutcome, Db, Error, Options, WriteBatch};
 
 fn small() -> Options {
-    Options {
-        write_buffer_size: 64 * 1024,
-        block_size: 4 * 1024,
-        block_cache_size: 0,
-        target_file_size: 128 * 1024,
-        l0_compaction_trigger: 2,
-        ..Options::default()
-    }
+    Options::default()
+        .write_buffer_size(64 * 1024)
+        .block_size(4 * 1024)
+        .block_cache_size(0)
+        .target_file_size(128 * 1024)
+        .l0_compaction_trigger(2)
 }
 
 #[test]
@@ -85,10 +83,7 @@ fn drop_all_is_not_undone_by_a_compaction_that_was_already_running() {
     // than hoped for.
     for round in 0..8 {
         let dir = tempfile::tempdir().unwrap();
-        let opts = Options {
-            max_background_compactions: 4,
-            ..small()
-        };
+        let opts = small().max_background_compactions(4);
         let db = Db::open(dir.path(), opts.clone()).unwrap();
 
         let value = [b'v'; 128];
@@ -139,10 +134,7 @@ fn close_returns_while_an_ingest_holds_the_compaction_gate() {
     // assertion is simply that this returns.
     for round in 0..6 {
         let dir = tempfile::tempdir().unwrap();
-        let opts = Options {
-            max_background_compactions: 4,
-            ..small()
-        };
+        let opts = small().max_background_compactions(4);
         let db = Arc::new(Db::open(dir.path(), opts).unwrap());
 
         let value = [b'v'; 128];

@@ -24,18 +24,16 @@ use regolith::{
 /// A small database whose memtable fills after a few writes, so tests
 /// reach L0 and the stall thresholds in a bounded amount of work.
 fn foreground_options() -> Options {
-    Options {
-        write_buffer_size: 32 * 1024,
-        block_size: 4 * 1024,
-        block_cache_size: 64 * 1024,
-        target_file_size: 64 * 1024,
-        level_base_bytes: 128 * 1024,
-        l0_compaction_trigger: 2,
-        level0_slowdown_writes_trigger: 4,
-        level0_stop_writes_trigger: 8,
-        max_background_compactions: 0,
-        ..Options::default()
-    }
+    Options::default()
+        .write_buffer_size(32 * 1024)
+        .block_size(4 * 1024)
+        .block_cache_size(64 * 1024)
+        .target_file_size(64 * 1024)
+        .level_base_bytes(128 * 1024)
+        .l0_compaction_trigger(2)
+        .level0_slowdown_writes_trigger(4)
+        .level0_stop_writes_trigger(8)
+        .max_background_compactions(0)
 }
 
 fn value(i: usize) -> Vec<u8> {
@@ -109,10 +107,7 @@ fn inline_compaction_bounds_the_work_one_write_performs() {
     let dir = tempfile::tempdir().unwrap();
     let db = Db::open(
         dir.path(),
-        Options {
-            listeners: vec![counter.clone()],
-            ..foreground_options()
-        },
+        foreground_options().listeners(vec![counter.clone()]),
     )
     .unwrap();
 
@@ -147,15 +142,13 @@ fn a_stalled_write_reports_busy_instead_of_blocking() {
     let dir = tempfile::tempdir().unwrap();
     let db = Db::open(
         dir.path(),
-        Options {
+        foreground_options()
             // Nothing can ever be compacted out of L0 into L1 while the
             // stop trigger is this low and a snapshot pins the data, so
             // the engine has to surface the dead end.
-            level0_stop_writes_trigger: 2,
-            level0_slowdown_writes_trigger: 2,
-            l0_compaction_trigger: 64,
-            ..foreground_options()
-        },
+            .level0_stop_writes_trigger(2)
+            .level0_slowdown_writes_trigger(2)
+            .l0_compaction_trigger(64),
     )
     .unwrap();
 
@@ -186,12 +179,10 @@ fn no_slowdown_still_returns_busy_immediately() {
     let dir = tempfile::tempdir().unwrap();
     let db = Db::open(
         dir.path(),
-        Options {
-            level0_slowdown_writes_trigger: 1,
-            level0_stop_writes_trigger: 2,
-            l0_compaction_trigger: 64,
-            ..foreground_options()
-        },
+        foreground_options()
+            .level0_slowdown_writes_trigger(1)
+            .level0_stop_writes_trigger(2)
+            .l0_compaction_trigger(64),
     )
     .unwrap();
 
@@ -221,14 +212,12 @@ fn a_full_memtable_becomes_an_l0_file_with_no_worker() {
     let dir = tempfile::tempdir().unwrap();
     let db = Db::open(
         dir.path(),
-        Options {
+        foreground_options()
             // High enough that nothing compacts L0 away underneath the
             // assertion below.
-            l0_compaction_trigger: 64,
-            level0_slowdown_writes_trigger: 0,
-            level0_stop_writes_trigger: 0,
-            ..foreground_options()
-        },
+            .l0_compaction_trigger(64)
+            .level0_slowdown_writes_trigger(0)
+            .level0_stop_writes_trigger(0),
     )
     .unwrap();
 
@@ -247,14 +236,7 @@ fn a_full_memtable_becomes_an_l0_file_with_no_worker() {
 #[test]
 fn explicit_flush_writes_an_l0_file_and_is_idempotent() {
     let dir = tempfile::tempdir().unwrap();
-    let db = Db::open(
-        dir.path(),
-        Options {
-            l0_compaction_trigger: 64,
-            ..foreground_options()
-        },
-    )
-    .unwrap();
+    let db = Db::open(dir.path(), foreground_options().l0_compaction_trigger(64)).unwrap();
 
     db.put(b"a", b"1").unwrap();
     db.flush().unwrap();
@@ -325,10 +307,7 @@ fn compact_step_works_with_a_background_worker_running() {
     let dir = tempfile::tempdir().unwrap();
     let db = Db::open(
         dir.path(),
-        Options {
-            max_background_compactions: 2,
-            ..foreground_options()
-        },
+        foreground_options().max_background_compactions(2),
     )
     .unwrap();
 

@@ -6,7 +6,7 @@
 //! still replaces the snapshot entry it shadows, a buffered delete still hides
 //! one, and the walk stops at the bound it is running towards.
 
-use regolith::{IsolationLevel, OptimisticTransactionDb, Options, ScanDirection};
+use regolith::{IsolationLevel, OptimisticTransactionDb, Options, ScanDirection, TxnOptions};
 
 fn db(dir: &std::path::Path) -> OptimisticTransactionDb {
     let db = OptimisticTransactionDb::open(dir, Options::default()).unwrap();
@@ -18,7 +18,8 @@ fn db(dir: &std::path::Path) -> OptimisticTransactionDb {
 
 fn collect(stream: regolith::TxnScanStream<'_>) -> Vec<(String, String)> {
     stream
-        .map(|(key, value)| {
+        .map(|item| {
+            let (key, value) = item.unwrap();
             (
                 String::from_utf8(key).unwrap(),
                 String::from_utf8(value.to_vec()).unwrap(),
@@ -35,7 +36,7 @@ fn keys(stream: regolith::TxnScanStream<'_>) -> Vec<String> {
 fn reverse_returns_the_range_in_descending_order() {
     let dir = tempfile::tempdir().unwrap();
     let db = db(dir.path());
-    let txn = db.begin_transaction_with(IsolationLevel::Serializable);
+    let txn = db.begin(&TxnOptions::new().isolation(IsolationLevel::Serializable));
 
     assert_eq!(
         keys(txn.scan_stream_in(None, None, ScanDirection::Reverse)),
@@ -48,7 +49,7 @@ fn reverse_returns_the_range_in_descending_order() {
 fn forward_and_reverse_agree_on_the_set() {
     let dir = tempfile::tempdir().unwrap();
     let db = db(dir.path());
-    let txn = db.begin_transaction_with(IsolationLevel::Serializable);
+    let txn = db.begin(&TxnOptions::new().isolation(IsolationLevel::Serializable));
     txn.put(b"bb", b"pending").unwrap();
     txn.delete(b"d").unwrap();
 
@@ -63,7 +64,7 @@ fn forward_and_reverse_agree_on_the_set() {
 fn reverse_sees_a_pending_insert() {
     let dir = tempfile::tempdir().unwrap();
     let db = db(dir.path());
-    let txn = db.begin_transaction_with(IsolationLevel::Serializable);
+    let txn = db.begin(&TxnOptions::new().isolation(IsolationLevel::Serializable));
     txn.put(b"bb", b"pending").unwrap();
 
     assert_eq!(
@@ -77,7 +78,7 @@ fn reverse_sees_a_pending_insert() {
 fn reverse_prefers_a_pending_overwrite() {
     let dir = tempfile::tempdir().unwrap();
     let db = db(dir.path());
-    let txn = db.begin_transaction_with(IsolationLevel::Serializable);
+    let txn = db.begin(&TxnOptions::new().isolation(IsolationLevel::Serializable));
     txn.put(b"c", b"pending").unwrap();
 
     let entries = collect(txn.scan_stream_in(None, None, ScanDirection::Reverse));
@@ -98,7 +99,7 @@ fn reverse_prefers_a_pending_overwrite() {
 fn reverse_hides_a_pending_delete() {
     let dir = tempfile::tempdir().unwrap();
     let db = db(dir.path());
-    let txn = db.begin_transaction_with(IsolationLevel::Serializable);
+    let txn = db.begin(&TxnOptions::new().isolation(IsolationLevel::Serializable));
     txn.delete(b"c").unwrap();
 
     assert_eq!(
@@ -113,7 +114,7 @@ fn reverse_hides_a_pending_delete() {
 fn reverse_honours_the_same_half_open_range() {
     let dir = tempfile::tempdir().unwrap();
     let db = db(dir.path());
-    let txn = db.begin_transaction_with(IsolationLevel::Serializable);
+    let txn = db.begin(&TxnOptions::new().isolation(IsolationLevel::Serializable));
 
     assert_eq!(
         keys(txn.scan_stream_in(Some(b"b"), Some(b"d"), ScanDirection::Reverse)),
@@ -132,7 +133,7 @@ fn reverse_excludes_a_single_entry_sitting_at_the_end_bound() {
     let dir = tempfile::tempdir().unwrap();
     let db = OptimisticTransactionDb::open(dir.path(), Options::default()).unwrap();
     db.db().put(b"c", b"committed").unwrap();
-    let txn = db.begin_transaction_with(IsolationLevel::Serializable);
+    let txn = db.begin(&TxnOptions::new().isolation(IsolationLevel::Serializable));
 
     assert!(keys(txn.scan_stream_in(None, Some(b"c"), ScanDirection::Reverse)).is_empty());
 }
@@ -142,7 +143,7 @@ fn reverse_excludes_a_single_entry_sitting_at_the_end_bound() {
 fn reverse_ignores_pending_writes_beyond_the_bounds() {
     let dir = tempfile::tempdir().unwrap();
     let db = db(dir.path());
-    let txn = db.begin_transaction_with(IsolationLevel::Serializable);
+    let txn = db.begin(&TxnOptions::new().isolation(IsolationLevel::Serializable));
     txn.put(b"aa", b"pending").unwrap();
     txn.put(b"zz", b"pending").unwrap();
 
@@ -159,7 +160,7 @@ fn reverse_ignores_pending_writes_beyond_the_bounds() {
 fn reverse_terminates_at_the_low_end() {
     let dir = tempfile::tempdir().unwrap();
     let db = db(dir.path());
-    let txn = db.begin_transaction_with(IsolationLevel::Serializable);
+    let txn = db.begin(&TxnOptions::new().isolation(IsolationLevel::Serializable));
 
     let walked = keys(txn.scan_stream_in(None, None, ScanDirection::Reverse));
     assert_eq!(walked.len(), 5, "stopped once, not restarted: {walked:?}");
@@ -170,7 +171,7 @@ fn reverse_terminates_at_the_low_end() {
 fn reverse_over_pending_writes_alone() {
     let dir = tempfile::tempdir().unwrap();
     let db = OptimisticTransactionDb::open(dir.path(), Options::default()).unwrap();
-    let txn = db.begin_transaction_with(IsolationLevel::Serializable);
+    let txn = db.begin(&TxnOptions::new().isolation(IsolationLevel::Serializable));
     for key in ["a", "b", "c"] {
         txn.put(key.as_bytes(), b"pending").unwrap();
     }
@@ -186,7 +187,7 @@ fn reverse_over_pending_writes_alone() {
 fn the_undirected_scan_is_still_forward() {
     let dir = tempfile::tempdir().unwrap();
     let db = db(dir.path());
-    let txn = db.begin_transaction_with(IsolationLevel::Serializable);
+    let txn = db.begin(&TxnOptions::new().isolation(IsolationLevel::Serializable));
 
     assert_eq!(keys(txn.scan_stream(None, None)), ["a", "b", "c", "d", "e"]);
 }

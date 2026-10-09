@@ -46,14 +46,12 @@ fn value_of(writer: usize, i: u64) -> Vec<u8> {
 }
 
 fn opts() -> Options {
-    Options {
+    Options::default()
         // Small enough that the writers rotate constantly, which is what
         // puts a flush in flight for the drain to collide with.
-        write_buffer_size: 16 * 1024,
-        max_write_buffer_number: 4,
-        durability: DurabilityMode::Eventual,
-        ..Options::default()
-    }
+        .write_buffer_size(16 * 1024)
+        .max_write_buffer_number(4)
+        .durability(DurabilityMode::Eventual)
 }
 
 #[test]

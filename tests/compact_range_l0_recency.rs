@@ -10,14 +10,11 @@
 // threads and the filesystem, neither of which exists there.
 #![cfg(not(target_arch = "wasm32"))]
 
-use regolith::{Db, OptimisticTransactionDb, Options, TransactionError};
+use regolith::{Db, OptimisticTransactionDb, Options, TransactionError, TxnOptions};
 use tempfile::TempDir;
 
 fn options() -> Options {
-    Options {
-        max_background_compactions: 0,
-        ..Options::default()
-    }
+    Options::default().max_background_compactions(0)
 }
 
 #[test]
@@ -90,7 +87,7 @@ fn a_transaction_that_read_a_key_still_conflicts_after_a_bounded_compact_range()
     db.db().put(b"k16", b"old").unwrap();
     db.db().flush().unwrap();
 
-    let tx = db.begin_transaction();
+    let tx = db.begin(&TxnOptions::new());
     assert_eq!(tx.get(b"k16").unwrap().as_deref(), Some(&b"old"[..]));
 
     db.db().put(b"k72", b"x").unwrap();

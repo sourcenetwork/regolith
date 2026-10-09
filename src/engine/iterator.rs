@@ -1601,7 +1601,7 @@ impl RegolithIterator {
 
     pub(crate) fn status(&self) -> io::Result<()> {
         match &self.error {
-            Some(e) => Err(io::Error::new(e.kind(), e.to_string())),
+            Some(e) => Err(crate::Error::clone_io(e)),
             None => Ok(()),
         }
     }

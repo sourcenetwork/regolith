@@ -29,9 +29,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use regolith::{
-    Db, IsolationLevel, MergeOperator, OptimisticTransactionDb, Options, TransactionError,
-};
+use regolith::{Db, IsolationLevel, MergeOperator, OptimisticTransactionDb, TransactionError};
 
 use super::support::{Findings, Rendezvous, STORAGES, Storage, table_lookups};
 use super::{Flavour, LEVELS, THREADS, commit_with_retry, with_forced_writes};
@@ -207,10 +205,7 @@ fn blind_merge_rounds(level: IsolationLevel, storage: Storage, rounds: &[Round])
     let dir = tempfile::tempdir().unwrap();
     let db = OptimisticTransactionDb::open(
         dir.path(),
-        Options {
-            merge_operator: Some(Arc::new(Sum)),
-            ..storage.options()
-        },
+        storage.options().merge_operator(Some(Arc::new(Sum))),
     )
     .unwrap();
     db.db().put(COUNTER, &0i64.to_le_bytes()).unwrap();
@@ -239,7 +234,7 @@ fn blind_merge_rounds(level: IsolationLevel, storage: Storage, rounds: &[Round])
         |r, force| {
             for (round, plan) in rounds.iter().enumerate() {
                 lockstep.wait(); // the previous round is settled
-                let tx = db.begin(level);
+                let tx = db.begin_at(level);
                 if matches!(plan.shape, Shape::ReadsFirst) {
                     tx.get(COUNTER).unwrap();
                 }
@@ -287,13 +282,14 @@ fn blind_merge_rounds(level: IsolationLevel, storage: Storage, rounds: &[Round])
                     )
                 });
                 let refused = match first {
-                    Ok(()) => 0,
-                    Err(TransactionError::Conflict { key, .. }) => {
+                    Ok(_) => 0,
+                    Err(TransactionError::Conflict(conflict)) => {
+                        let key = conflict.key();
                         findings.check(key == COUNTER, || {
                             format!("{case} round {round} reader {r}: conflict on {key:?}")
                         });
                         commit_with_retry("increment", || {
-                            let tx = db.begin(level);
+                            let tx = db.begin_at(level);
                             tx.merge(COUNTER, &1i64.to_le_bytes())?;
                             tx.commit()
                         })

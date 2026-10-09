@@ -172,11 +172,9 @@ fn partial_recovery_write_keeps_original_logs_for_retry() {
     let dir = tempfile::tempdir().unwrap();
     let wal_dir = dir.path().join("wal");
     let recording = Arc::new(RecordingEnv::default());
-    let options = crate::Options {
-        env: recording.clone(),
-        max_background_compactions: 0,
-        ..Default::default()
-    };
+    let options = crate::Options::default()
+        .env(recording.clone())
+        .max_background_compactions(0);
     let db = crate::Db::open(dir.path(), options.clone()).unwrap();
     for seq in 1..=100u64 {
         db.put(&seq.to_be_bytes(), &[42; 2048]).unwrap();

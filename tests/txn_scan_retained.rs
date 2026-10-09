@@ -8,7 +8,7 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 
-use regolith::{IsolationLevel, OptimisticTransactionDb, Options};
+use regolith::{IsolationLevel, OptimisticTransactionDb, Options, TxnOptions};
 use tempfile::TempDir;
 
 static ARMED: AtomicBool = AtomicBool::new(false);
@@ -79,7 +79,7 @@ fn a_scan_below_serializable_holds_no_memory_per_key() {
         IsolationLevel::SnapshotIsolation,
         IsolationLevel::RepeatableRead,
     ] {
-        let txn = db.begin_transaction_with(level);
+        let txn = db.begin(&TxnOptions::new().isolation(level));
         LIVE.store(0, Ordering::Relaxed);
         ARMED.store(true, Ordering::Relaxed);
         let yielded = txn.scan_stream(None, None).count();

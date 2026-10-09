@@ -32,15 +32,13 @@ fn readers_never_see_a_wrong_block_while_compaction_evicts_files() {
     let db = Arc::new(
         Db::open(
             dir.path(),
-            Options {
+            Options::default()
                 // Far smaller than the data, so the hand never stops.
-                block_cache_size: 256 * 1024,
-                block_cache_num_shard_bits: 4,
-                block_size: 1024,
-                write_buffer_size: 256 * 1024,
-                statistics: Some(Arc::clone(&stats)),
-                ..Options::default()
-            },
+                .block_cache_size(256 * 1024)
+                .block_cache_num_shard_bits(4)
+                .block_size(1024)
+                .write_buffer_size(256 * 1024)
+                .statistics(Some(Arc::clone(&stats))),
         )
         .unwrap(),
     );
@@ -118,13 +116,11 @@ fn a_disabled_cache_serves_the_same_storm() {
     let db = Arc::new(
         Db::open(
             dir.path(),
-            Options {
-                block_cache_size: 0,
-                block_cache_num_shard_bits: 8,
-                block_size: 1024,
-                write_buffer_size: 256 * 1024,
-                ..Options::default()
-            },
+            Options::default()
+                .block_cache_size(0)
+                .block_cache_num_shard_bits(8)
+                .block_size(1024)
+                .write_buffer_size(256 * 1024),
         )
         .unwrap(),
     );

@@ -40,6 +40,14 @@ multiple-versions = "deny"
 # tree in ways the lockfile can't constrain. Allow them
 # internally (for path dependencies) but warn on external crates.
 wildcards = "allow"
+# proptest 1.11 (the newest) pulls getrandom 0.3 through rand 0.9 and
+# getrandom 0.4 through tempfile 3.27. The opt-in `testing` feature makes
+# proptest a normal dependency, so `--all-features` sees both. cargo-deny
+# warns once a skip no longer matches; drop these entries then.
+skip = [
+    { crate = "getrandom@0.3.4", reason = "proptest pulls two getrandom versions" },
+    { crate = "r-efi@5.3.0", reason = "getrandom 0.3 on UEFI, through proptest" },
+]
 
 [sources]
 # Only trust crates.io. Git and local registries require an

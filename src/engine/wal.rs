@@ -48,13 +48,22 @@
 //! * A whole record that fails its checksum, carries an unknown type, or
 //!   does not parse is corruption, and is an error. A torn write cannot
 //!   produce it: every byte the record claims is present, and they are
-//!   wrong.
+//!   wrong. The one exception is a record that fails its checksum or
+//!   carries an unknown type with nothing but zero bytes from its start to
+//!   the end of the file. Bytes a crash never wrote read back as zeros, and
+//!   so can a power cut that zeroed a region already written, so that tail
+//!   is the end of the log, discarded and reported like a torn one.
 //! * An incomplete record from which the rest of the file still parses as
 //!   whole records, ending exactly at the last byte, is not a torn tail
 //!   either. A torn write leaves nothing behind it, so a remainder that
 //!   tiles that way means real records lie beyond the damage and the
 //!   length field was mangled; stopping there would discard them
 //!   silently. Replay refuses, naming the file and both offsets.
+//!
+//! Both tolerances apply to the newest log only. A log a rotation already
+//! closed was synced before the next one was created, so no crash can have
+//! left a partial or zeroed tail in it, and either shape there refuses the
+//! open.
 //!
 //! Two limits of that rule are worth stating, because both are properties
 //! of the format rather than of this implementation.
@@ -374,7 +383,7 @@ impl Wal {
 pub(crate) mod fault {
     use std::path::{Path, PathBuf};
 
-    use crate::sync::Mutex;
+    use crate::sync::internal::Mutex;
 
     /// Every directory currently armed. A list rather than a single
     /// slot because tests run in parallel in one process: with one slot,
@@ -630,6 +639,11 @@ impl RecordLen {
     pub(crate) fn put(&mut self, key: &[u8], value: &[u8]) {
         self.push(put_payload_len(key, value))
     }
+    /// A put whose key and value have the given lengths, for a bound taken
+    /// before the bytes exist.
+    pub(crate) fn put_sized(&mut self, key_len: usize, value_len: usize) {
+        self.push(put_payload_size(key_len, value_len))
+    }
     pub(crate) fn delete(&mut self, key: &[u8]) {
         self.push(delete_payload_len(key))
     }
@@ -730,7 +744,11 @@ fn encode_merge_payload(out: &mut Vec<u8>, key: &[u8], operand: &[u8], seq: u64)
 }
 
 fn put_payload_len(key: &[u8], value: &[u8]) -> usize {
-    4 + key.len() + 4 + value.len() + 8
+    put_payload_size(key.len(), value.len())
+}
+
+fn put_payload_size(key_len: usize, value_len: usize) -> usize {
+    4 + key_len + 4 + value_len + 8
 }
 
 fn delete_payload_len(key: &[u8]) -> usize {

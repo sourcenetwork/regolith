@@ -62,13 +62,13 @@ fn scan_then_commit<D: Flavour>(db: &D, level: IsolationLevel, storage: Storage,
             storage.flush(db.raw());
         },
         |r, force| {
-            let tx = db.begin(level);
+            let tx = db.begin_at(level);
             let walked: BTreeSet<Vec<u8>> = tx
                 .scan_stream(
                     Some(format!("scan/{r}/").as_bytes()),
                     Some(format!("scan/{r}0").as_bytes()),
                 )
-                .map(|(key, _)| key)
+                .map(|item| item.unwrap().0)
                 .collect();
             assert_eq!(
                 walked,
@@ -86,8 +86,8 @@ fn scan_then_commit<D: Flavour>(db: &D, level: IsolationLevel, storage: Storage,
                 matches!(then, Then::WriteScannedRow) || level == IsolationLevel::Serializable;
             if aborts {
                 match result {
-                    Err(TransactionError::Conflict { key, .. }) => assert_eq!(
-                        key,
+                    Err(TransactionError::Conflict(conflict)) => assert_eq!(
+                        conflict.key(),
                         row(r, OVERWRITTEN),
                         "{level:?} {then:?}: reader {r} conflicts on the overwritten row"
                     ),

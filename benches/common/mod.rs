@@ -185,12 +185,10 @@ pub fn default_opts() -> regolith::Options {
 
 /// Small enough to force flushes and compaction inside a bench run.
 pub fn small_opts() -> regolith::Options {
-    regolith::Options {
-        write_buffer_size: 4 * 1024 * 1024,
-        block_cache_size: 8 * 1024 * 1024,
-        block_cache_num_shard_bits: 0,
-        ..regolith::Options::default()
-    }
+    regolith::Options::default()
+        .write_buffer_size(4 * 1024 * 1024)
+        .block_cache_size(8 * 1024 * 1024)
+        .block_cache_num_shard_bits(0)
 }
 
 #[allow(clippy::ptr_arg)]

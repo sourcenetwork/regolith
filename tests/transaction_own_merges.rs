@@ -15,8 +15,8 @@ use std::path::Path;
 use std::sync::Arc;
 
 use regolith::{
-    Db, IsolationLevel, MergeOperator, OptimisticTransactionDb, Options, Transaction,
-    TransactionDb, TransactionError,
+    Db, Error, IsolationLevel, MergeOperator, OptimisticTransactionDb, Options, Transaction,
+    TransactionDb, TransactionError, TxnOptions,
 };
 
 /// Sums big-endian i64 deltas onto the base.
@@ -62,26 +62,17 @@ impl MergeOperator for AppendMerge {
 }
 
 fn counting() -> Options {
-    Options {
-        merge_operator: Some(Arc::new(CounterMerge)),
-        ..Options::default()
-    }
+    Options::default().merge_operator(Some(Arc::new(CounterMerge)))
 }
 
 fn appending() -> Options {
-    Options {
-        merge_operator: Some(Arc::new(AppendMerge)),
-        ..Options::default()
-    }
+    Options::default().merge_operator(Some(Arc::new(AppendMerge)))
 }
 
 /// `counting`, with a write buffer that never builds an index, so a lookup
 /// always walks the list.
 fn counting_unindexed() -> Options {
-    Options {
-        transaction_keys_inline: 0,
-        ..counting()
-    }
+    counting().transaction_keys_inline(0)
 }
 
 /// `counting` with both buffer shapes: indexed past the default size, and
@@ -107,10 +98,10 @@ impl Flavour {
         }
     }
 
-    fn begin(&self) -> Transaction<'_> {
+    fn begin(&self) -> Transaction {
         match self {
-            Self::Optimistic(db) => db.begin_transaction(),
-            Self::Pessimistic(db) => db.begin_transaction(),
+            Self::Optimistic(db) => db.begin(&TxnOptions::new()),
+            Self::Pessimistic(db) => db.begin(&TxnOptions::new()),
         }
     }
 
@@ -136,7 +127,7 @@ fn counter(bytes: Option<Vec<u8>>) -> Option<i64> {
 
 /// What the transaction reads for `key` through each of its point reads,
 /// which must agree.
-fn reads(tx: &Transaction<'_>, key: &[u8]) -> Option<Vec<u8>> {
+fn reads(tx: &Transaction, key: &[u8]) -> Option<Vec<u8>> {
     let got = tx.get(key).unwrap();
     assert_eq!(
         tx.get_slice(key).unwrap().map(|slice| slice.to_vec()),
@@ -279,29 +270,38 @@ fn a_failing_merge_is_an_error_not_a_stale_value() {
             tx.get_slice(b"k").map(|_| ()),
             tx.get_for_update(b"k").map(|_| ()),
         ] {
-            let Err(TransactionError::Io(e)) = result else {
+            let Err(TransactionError::Engine(Error::MergeFailed(key))) = result else {
                 panic!("expected the merge failure, got {result:?}");
             };
-            assert!(e.to_string().contains("counter"), "{e}");
+            assert_eq!(key, b"k");
         }
     });
 }
 
 #[test]
-fn without_a_merge_operator_reads_ignore_buffered_merges() {
+fn a_merge_without_an_operator_is_refused_and_buffers_nothing() {
     each_flavour(Options::default, |flavour| {
         flavour.db().put(b"committed", b"v").unwrap();
         let tx = flavour.begin();
-        tx.merge(b"committed", b"op").unwrap();
+        for key in [&b"committed"[..], b"absent"] {
+            assert!(
+                matches!(
+                    tx.merge(key, b"op"),
+                    Err(TransactionError::Engine(Error::NoMergeOperator))
+                ),
+                "merge into {key:?}"
+            );
+        }
         tx.put(b"put", b"p").unwrap();
-        tx.merge(b"put", b"op").unwrap();
-        tx.merge(b"absent", b"op").unwrap();
         assert_eq!(reads(&tx, b"committed").as_deref(), Some(&b"v"[..]));
         assert_eq!(reads(&tx, b"put").as_deref(), Some(&b"p"[..]));
         assert_eq!(reads(&tx, b"absent"), None);
         let scanned: Vec<_> = tx
             .scan_stream(None, None)
-            .map(|(key, value)| (key, value.to_vec()))
+            .map(|item| {
+                let (key, value) = item.unwrap();
+                (key, value.to_vec())
+            })
             .collect();
         assert_eq!(
             scanned,
@@ -310,12 +310,15 @@ fn without_a_merge_operator_reads_ignore_buffered_merges() {
                 (b"put".to_vec(), b"p".to_vec()),
             ]
         );
+        tx.commit().unwrap();
+        assert_eq!(flavour.db().get(b"absent").unwrap(), None);
+        assert_eq!(flavour.db().get(b"committed").unwrap(), Some(b"v".to_vec()));
     });
 }
 
 /// `(key, value)` pairs of a transaction scan as counters.
 fn scanned(
-    tx: &Transaction<'_>,
+    tx: &Transaction,
     start: Option<&[u8]>,
     end: Option<&[u8]>,
     reverse: bool,
@@ -326,12 +329,13 @@ fn scanned(
         regolith::ScanDirection::Forward
     };
     let mut stream = tx.scan_stream_in(start, end, direction);
-    let got = stream
+    stream
         .by_ref()
-        .map(|(key, value)| (key, counter(Some(value.to_vec())).unwrap()))
-        .collect();
-    stream.status().unwrap();
-    got
+        .map(|item| {
+            let (key, value) = item.unwrap();
+            (key, counter(Some(value.to_vec())).unwrap())
+        })
+        .collect()
 }
 
 #[test]
@@ -373,7 +377,11 @@ fn a_scan_lays_the_merges_over_the_snapshot_in_both_directions() {
             inner
         });
 
-        let first: Vec<_> = tx.scan_stream(None, None).take(1).collect();
+        let first: Vec<_> = tx
+            .scan_stream(None, None)
+            .take(1)
+            .map(Result::unwrap)
+            .collect();
         assert_eq!(
             first.len(),
             1,
@@ -498,7 +506,7 @@ fn a_scan_that_reaches_a_merged_key_validates_it_as_a_read_at_every_level() {
         let dir = tempfile::tempdir().unwrap();
         let db = OptimisticTransactionDb::open(dir.path(), counting()).unwrap();
         db.db().put(b"k", &delta(10)).unwrap();
-        let tx = db.begin_transaction_with(level);
+        let tx = db.begin(&TxnOptions::new().isolation(level));
         tx.merge(b"k", &delta(1)).unwrap();
         assert_eq!(
             scanned(&tx, None, None, false),
@@ -515,7 +523,7 @@ fn a_scan_that_reaches_a_merged_key_validates_it_as_a_read_at_every_level() {
 
 /// `(key, value)` pairs of a transaction scan as text.
 fn scanned_text(
-    tx: &Transaction<'_>,
+    tx: &Transaction,
     start: Option<&[u8]>,
     end: Option<&[u8]>,
     reverse: bool,
@@ -526,17 +534,16 @@ fn scanned_text(
         regolith::ScanDirection::Forward
     };
     let mut stream = tx.scan_stream_in(start, end, direction);
-    let got = stream
+    stream
         .by_ref()
-        .map(|(key, value)| {
+        .map(|item| {
+            let (key, value) = item.unwrap();
             (
                 String::from_utf8(key).unwrap(),
                 String::from_utf8(value.to_vec()).unwrap(),
             )
         })
-        .collect();
-    stream.status().unwrap();
-    got
+        .collect()
 }
 
 #[test]
@@ -649,7 +656,7 @@ fn reading_a_merged_key_makes_the_merge_a_read_modify_write() {
     let db = OptimisticTransactionDb::open(dir.path(), counting()).unwrap();
     db.db().put(b"k", &delta(10)).unwrap();
 
-    let tx = db.begin_transaction_with(IsolationLevel::DefraLevel);
+    let tx = db.begin(&TxnOptions::new().isolation(IsolationLevel::DefraLevel));
     tx.merge(b"k", &delta(1)).unwrap();
     assert_eq!(counter(tx.get(b"k").unwrap()), Some(11));
     db.db().merge(b"k", &delta(1)).unwrap();
@@ -658,7 +665,7 @@ fn reading_a_merged_key_makes_the_merge_a_read_modify_write() {
         "the value the transaction read is stale"
     );
 
-    let blind = db.begin_transaction_with(IsolationLevel::DefraLevel);
+    let blind = db.begin(&TxnOptions::new().isolation(IsolationLevel::DefraLevel));
     blind.merge(b"k", &delta(1)).unwrap();
     db.db().merge(b"k", &delta(1)).unwrap();
     blind.commit().expect("a blind merge still commutes");

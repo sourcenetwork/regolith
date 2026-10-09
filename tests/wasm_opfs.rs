@@ -31,9 +31,7 @@ wasm_bindgen_test_configure!(run_in_dedicated_worker);
 /// Options for a database that fits a browser tab and runs compaction on
 /// the calling thread, which is the only thread this target has.
 fn db_options(env: &OpfsEnv) -> Options {
-    let mut options = Options::embedded();
-    options.env = env.as_env();
-    options
+    Options::embedded().env(env.as_env())
 }
 
 /// The shipped wasm profile, pointed at OPFS. Unlike [`db_options`]
@@ -41,9 +39,7 @@ fn db_options(env: &OpfsEnv) -> Options {
 /// separate from `Options::embedded`: a browser tab has no OS page
 /// cache to absorb a miss.
 fn wasm_profile_options(env: &OpfsEnv) -> Options {
-    let mut options = Options::wasm();
-    options.env = env.as_env();
-    options
+    Options::wasm().env(env.as_env())
 }
 
 #[wasm_bindgen_test]
@@ -500,7 +496,7 @@ async fn the_wasm_profile_survives_a_full_lifecycle_in_a_browser() {
             .expect("mount");
         let options = wasm_profile_options(&env);
         assert!(
-            options.block_cache_size > 0,
+            options.get_block_cache_size() > 0,
             "the wasm profile must keep a block cache; there is no page cache behind it"
         );
         let db = Db::open(env.db_path(), options).expect("open with Options::wasm()");
@@ -550,8 +546,7 @@ async fn a_background_compaction_worker_is_rejected_at_the_option() {
         .await
         .expect("mount");
 
-    let mut options = wasm_profile_options(&env);
-    options.max_background_compactions = 1;
+    let options = wasm_profile_options(&env).max_background_compactions(1);
     let message = options
         .validate()
         .expect_err("wasm has no threads, so a worker count must not validate")
@@ -562,13 +557,12 @@ async fn a_background_compaction_worker_is_rejected_at_the_option() {
     );
 
     // And the rejection must reach `Db::open`, not just `validate`.
-    let mut options = wasm_profile_options(&env);
-    options.max_background_compactions = 1;
+    let options = wasm_profile_options(&env).max_background_compactions(1);
     Db::open(env.db_path(), options).expect_err("open must refuse a worker count on wasm");
 
     // Both shipped profiles must be openable as they ship.
-    assert_eq!(Options::wasm().max_background_compactions, 0);
-    assert_eq!(Options::default().max_background_compactions, 0);
+    assert_eq!(Options::wasm().get_max_background_compactions(), 0);
+    assert_eq!(Options::default().get_max_background_compactions(), 0);
     Options::default()
         .validate()
         .expect("Options::default must be valid on wasm, or nothing opens without tuning");

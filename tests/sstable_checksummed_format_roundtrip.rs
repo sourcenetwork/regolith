@@ -24,12 +24,10 @@ fn value(i: usize) -> Vec<u8> {
 }
 
 fn opts(partitioned: bool) -> Options {
-    Options {
-        write_buffer_size: 16 * 1024,
-        partitioned_index: partitioned,
-        metadata_block_size: if partitioned { 256 } else { 4096 },
-        ..Options::default()
-    }
+    Options::default()
+        .write_buffer_size(16 * 1024)
+        .partitioned_index(partitioned)
+        .metadata_block_size(if partitioned { 256 } else { 4096 })
 }
 
 fn fill(db: &Db) {

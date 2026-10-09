@@ -9,7 +9,7 @@
 // use the filesystem. The browser suite lives in tests/wasm_opfs*.rs.
 #![cfg(not(target_arch = "wasm32"))]
 
-use regolith::{Db, Options, StreamOptions};
+use regolith::{Db, Options, StreamOptions, TxnOptions};
 use tempfile::TempDir;
 
 fn db_with(entries: &[(&str, &str)]) -> (Db, TempDir) {
@@ -29,7 +29,10 @@ fn a_snapshot_cursor_iterates_in_key_order() {
         .snapshot()
         .owned_iter()
         .into_iter()
-        .map(|(key, value)| (key, value.to_vec()))
+        .map(|item| {
+            let (key, value) = item.unwrap();
+            (key, value.to_vec())
+        })
         .collect();
 
     assert_eq!(
@@ -53,7 +56,8 @@ fn iteration_yields_values_without_copying_them() {
         .owned_iter()
         .into_iter()
         .next()
-        .expect("one entry");
+        .expect("one entry")
+        .unwrap();
 
     assert_eq!(key, b"k".to_vec());
     // `DbSlice` derefs to the stored bytes; no `to_vec` needed to read it.
@@ -68,7 +72,7 @@ fn a_cursor_iterates_backward_on_request() {
         .snapshot()
         .owned_iter()
         .entries_rev()
-        .map(|(key, _)| key)
+        .map(|item| item.unwrap().0)
         .collect();
 
     assert_eq!(keys, vec![b"c".to_vec(), b"b".to_vec(), b"a".to_vec()]);
@@ -84,7 +88,7 @@ fn iteration_resumes_from_a_seek() {
     let mut cursor = snapshot.owned_iter();
     cursor.seek(b"c");
 
-    let keys: Vec<Vec<u8>> = cursor.entries().map(|(key, _)| key).collect();
+    let keys: Vec<Vec<u8>> = cursor.entries().map(|item| item.unwrap().0).collect();
 
     assert_eq!(keys, vec![b"c".to_vec(), b"d".to_vec()]);
 }
@@ -107,7 +111,7 @@ fn iteration_stops_early_without_draining_the_range() {
         .owned_iter()
         .into_iter()
         .take(3)
-        .map(|(key, _)| key)
+        .map(|item| item.unwrap().0)
         .collect();
 
     assert_eq!(
@@ -269,7 +273,7 @@ fn scan_stream_respects_the_range_bounds() {
     let keys: Vec<Vec<u8>> = db
         .scan_stream(Some(b"b"), Some(b"d"))
         .expect("scan_stream")
-        .map(|(key, _)| key)
+        .map(|entry| entry.expect("scan row").0)
         .collect();
 
     assert_eq!(keys, vec![b"b".to_vec(), b"c".to_vec()]);
@@ -282,7 +286,7 @@ fn scan_stream_with_open_bounds_covers_everything() {
     let keys: Vec<Vec<u8>> = db
         .scan_stream(None, None)
         .expect("scan_stream")
-        .map(|(key, _)| key)
+        .map(|entry| entry.expect("scan row").0)
         .collect();
 
     assert_eq!(keys, vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec()]);
@@ -303,7 +307,10 @@ fn scan_stream_agrees_with_the_materializing_scan() {
     let streamed: Vec<(Vec<u8>, Vec<u8>)> = db
         .scan_stream(Some(b"key/0100"), Some(b"key/0200"))
         .expect("scan_stream")
-        .map(|(key, value)| (key, value.to_vec()))
+        .map(|entry| {
+            let (key, value) = entry.expect("scan row");
+            (key, value.to_vec())
+        })
         .collect();
 
     assert_eq!(streamed, materialized);
@@ -325,12 +332,13 @@ mod txn_scan {
     }
 
     fn collect(
-        txn: &regolith::OwnedTransaction,
+        txn: &regolith::Transaction,
         lo: Option<&[u8]>,
         hi: Option<&[u8]>,
     ) -> Vec<(String, String)> {
         txn.scan_stream(lo, hi)
-            .map(|(k, v)| {
+            .map(|item| {
+                let (k, v) = item.unwrap();
                 (
                     String::from_utf8_lossy(&k).into_owned(),
                     String::from_utf8_lossy(&v).into_owned(),
@@ -342,7 +350,7 @@ mod txn_scan {
     #[test]
     fn a_transaction_scan_sees_the_committed_state() {
         let (db, _dir) = txn_db(&[("a", "1"), ("b", "2"), ("c", "3")]);
-        let txn = db.begin_transaction_owned(IsolationLevel::Serializable);
+        let txn = db.begin(&TxnOptions::new().isolation(IsolationLevel::Serializable));
 
         assert_eq!(
             collect(&txn, None, None),
@@ -357,7 +365,7 @@ mod txn_scan {
     #[test]
     fn a_transaction_scan_sees_its_own_uncommitted_writes() {
         let (db, _dir) = txn_db(&[("a", "1"), ("c", "3")]);
-        let txn = db.begin_transaction_owned(IsolationLevel::Serializable);
+        let txn = db.begin(&TxnOptions::new().isolation(IsolationLevel::Serializable));
         txn.put(b"b", b"2").expect("put");
 
         assert_eq!(
@@ -373,7 +381,7 @@ mod txn_scan {
     #[test]
     fn a_buffered_write_overrides_the_committed_value() {
         let (db, _dir) = txn_db(&[("a", "1"), ("b", "old"), ("c", "3")]);
-        let txn = db.begin_transaction_owned(IsolationLevel::Serializable);
+        let txn = db.begin(&TxnOptions::new().isolation(IsolationLevel::Serializable));
         txn.put(b"b", b"new").expect("put");
 
         assert_eq!(
@@ -389,7 +397,7 @@ mod txn_scan {
     #[test]
     fn a_buffered_delete_hides_the_committed_value() {
         let (db, _dir) = txn_db(&[("a", "1"), ("b", "2"), ("c", "3")]);
-        let txn = db.begin_transaction_owned(IsolationLevel::Serializable);
+        let txn = db.begin(&TxnOptions::new().isolation(IsolationLevel::Serializable));
         txn.delete(b"b").expect("delete");
 
         assert_eq!(
@@ -401,7 +409,7 @@ mod txn_scan {
     #[test]
     fn a_transaction_scan_respects_the_range_bounds() {
         let (db, _dir) = txn_db(&[("a", "1"), ("b", "2"), ("c", "3"), ("d", "4")]);
-        let txn = db.begin_transaction_owned(IsolationLevel::Serializable);
+        let txn = db.begin(&TxnOptions::new().isolation(IsolationLevel::Serializable));
         txn.put(b"bb", b"buffered").expect("put");
 
         assert_eq!(
@@ -417,14 +425,14 @@ mod txn_scan {
     #[test]
     fn a_transaction_scan_over_an_empty_range_yields_nothing() {
         let (db, _dir) = txn_db(&[("a", "1")]);
-        let txn = db.begin_transaction_owned(IsolationLevel::Serializable);
+        let txn = db.begin(&TxnOptions::new().isolation(IsolationLevel::Serializable));
         assert_eq!(collect(&txn, Some(b"m"), Some(b"n")), vec![]);
     }
 
     #[test]
     fn a_transaction_read_can_avoid_copying_the_value() {
         let (db, _dir) = txn_db(&[("k", "committed-bytes")]);
-        let txn = db.begin_transaction_owned(IsolationLevel::Serializable);
+        let txn = db.begin(&TxnOptions::new().isolation(IsolationLevel::Serializable));
 
         let slice = txn.get_slice(b"k").expect("get_slice").expect("present");
         assert_eq!(&*slice, b"committed-bytes");

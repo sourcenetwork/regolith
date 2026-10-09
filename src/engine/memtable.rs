@@ -21,7 +21,7 @@ use super::lookup_key::LookupKey;
 use super::range_tombstone::{RangeTombstone, RangeTombstoneSet};
 use super::skiplist::{ArenaSkipList, InsertHint, NodeRef};
 use crate::DbSlice;
-use crate::sync::{Arc, AtomicUsize, Mutex, Ordering};
+use crate::sync::internal::{Arc, AtomicUsize, Mutex, Ordering};
 
 mod key_walk;
 
@@ -268,6 +268,24 @@ impl MemTable {
     /// and by the iterator / scan paths to query cover info.
     pub(crate) fn clone_range_tombstones(&self) -> Vec<RangeTombstone> {
         self.range_tombstones.lock().as_slice().to_vec()
+    }
+
+    /// A range tombstone overlapping `[lo, hi)` with a sequence above
+    /// `floor`, as the first key of the range it deletes and its sequence.
+    pub(crate) fn newer_range_tombstone(
+        &self,
+        lo: &[u8],
+        hi: &[u8],
+        floor: u64,
+    ) -> Option<(Vec<u8>, u64)> {
+        if self.range_tombstone_bytes.load(Ordering::Acquire) == 0 {
+            return None;
+        }
+        self.range_tombstones
+            .lock()
+            .iter()
+            .find(|t| t.seq > floor && t.overlaps(lo, hi))
+            .map(|t| (t.start.as_slice().max(lo).to_vec(), t.seq))
     }
 
     /// Largest seq of any range tombstone covering `user_key` that is

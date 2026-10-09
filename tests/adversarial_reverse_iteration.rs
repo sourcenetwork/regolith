@@ -21,11 +21,7 @@ use regolith::{Db, Options};
 use tempfile::TempDir;
 
 fn opts() -> Options {
-    Options {
-        write_buffer_size: 4096,
-        block_size: 128,
-        ..Options::default()
-    }
+    Options::default().write_buffer_size(4096).block_size(128)
 }
 
 fn forward(db: &Db) -> Vec<Vec<u8>> {

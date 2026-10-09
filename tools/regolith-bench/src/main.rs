@@ -83,13 +83,11 @@ fn main() {
         _ => CompressionType::Lz4,
     };
 
-    let opts = Options {
-        write_buffer_size: args.write_buffer_size,
-        block_size: args.block_size,
-        bloom_bits_per_key: args.bloom_bits,
-        compression,
-        ..Options::default()
-    };
+    let opts = Options::default()
+        .write_buffer_size(args.write_buffer_size)
+        .block_size(args.block_size)
+        .bloom_bits_per_key(args.bloom_bits)
+        .compression(compression);
 
     let seed = if args.seed == 0 {
         rand::random()

@@ -30,11 +30,9 @@ impl Storage {
     pub fn options(self) -> Options {
         match self {
             Self::Memtable => Options::default(),
-            Self::Tables => Options {
-                write_buffer_size: 4 * 1024,
-                l0_compaction_trigger: 2,
-                ..Options::default()
-            },
+            Self::Tables => Options::default()
+                .write_buffer_size(4 * 1024)
+                .l0_compaction_trigger(2),
         }
     }
 

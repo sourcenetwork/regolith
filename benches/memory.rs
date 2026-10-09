@@ -118,11 +118,9 @@ fn fill(db: &Db, mib: u64, value_len: usize) {
 }
 
 fn child_shards(bits: u32) -> Fields {
-    let opts = Options {
-        block_cache_size: PINNED_CACHE,
-        block_cache_num_shard_bits: bits,
-        ..Options::default()
-    };
+    let opts = Options::default()
+        .block_cache_size(PINNED_CACHE)
+        .block_cache_num_shard_bits(bits);
     let (_tmp, db) = common::open("mem-shards", opts);
     assert!(
         db.get(b"absent").expect("get on empty db").is_none(),
@@ -135,13 +133,11 @@ fn child_shards(bits: u32) -> Fields {
 }
 
 fn child_fill(mib: u64, bits: u32) -> Fields {
-    let opts = Options {
-        write_buffer_size: FILL_WRITE_BUFFER,
-        max_write_buffer_number: 2,
-        block_cache_size: FILL_CACHE,
-        block_cache_num_shard_bits: bits,
-        ..Options::default()
-    };
+    let opts = Options::default()
+        .write_buffer_size(FILL_WRITE_BUFFER)
+        .max_write_buffer_number(2)
+        .block_cache_size(FILL_CACHE)
+        .block_cache_num_shard_bits(bits);
     let (_tmp, db) = common::open("mem-fill", opts);
     let started = Instant::now();
     fill(&db, mib, 1024);
@@ -156,16 +152,14 @@ fn child_fill(mib: u64, bits: u32) -> Fields {
 /// Every byte-sized knob is driven off one scale so the floor ladder has a
 /// single independent variable.
 fn floor_opts(scale: usize) -> Options {
-    Options {
-        write_buffer_size: scale,
-        block_size: std::cmp::max(scale, 64),
-        block_cache_size: scale,
-        block_cache_num_shard_bits: 0,
-        level_base_bytes: scale as u64,
-        target_file_size: scale as u64,
-        metadata_block_size: std::cmp::max(scale, 64),
-        ..Options::default()
-    }
+    Options::default()
+        .write_buffer_size(scale)
+        .block_size(std::cmp::max(scale, 64))
+        .block_cache_size(scale)
+        .block_cache_num_shard_bits(0)
+        .level_base_bytes(scale as u64)
+        .target_file_size(scale as u64)
+        .metadata_block_size(std::cmp::max(scale, 64))
 }
 
 fn child_floor(scale: usize) -> Fields {
@@ -192,16 +186,14 @@ fn child_floor(scale: usize) -> Fields {
 }
 
 fn child_embedded(mib: u64) -> Fields {
-    let opts = Options {
-        write_buffer_size: EMBEDDED_WRITE_BUFFER,
-        max_write_buffer_number: 2,
-        block_cache_size: EMBEDDED_CACHE,
-        block_cache_num_shard_bits: 0,
-        block_size: 4096,
-        level_base_bytes: 4 * 1024 * 1024,
-        target_file_size: 1024 * 1024,
-        ..Options::default()
-    };
+    let opts = Options::default()
+        .write_buffer_size(EMBEDDED_WRITE_BUFFER)
+        .max_write_buffer_number(2)
+        .block_cache_size(EMBEDDED_CACHE)
+        .block_cache_num_shard_bits(0)
+        .block_size(4096)
+        .level_base_bytes(4 * 1024 * 1024)
+        .target_file_size(1024 * 1024);
     let (_tmp, db) = common::open("mem-embedded", opts);
     let empty_rss = common::rss_kib();
     fill(&db, mib, 256);
@@ -219,13 +211,11 @@ fn child_embedded(mib: u64) -> Fields {
 /// A write buffer larger than the payload keeps every record in the one WAL, so
 /// the reopen below has to replay the whole log instead of reading an SSTable.
 fn crash_opts(mib: u64) -> Options {
-    Options {
-        write_buffer_size: (mib as usize + 64) * 1024 * 1024,
-        max_write_buffer_number: 2,
-        block_cache_size: 1024 * 1024,
-        block_cache_num_shard_bits: 0,
-        ..Options::default()
-    }
+    Options::default()
+        .write_buffer_size((mib as usize + 64) * 1024 * 1024)
+        .max_write_buffer_number(2)
+        .block_cache_size(1024 * 1024)
+        .block_cache_num_shard_bits(0)
 }
 
 fn child_crash(mib: u64, path: &Path) -> ! {
@@ -482,7 +472,7 @@ fn parent(cfg: Cfg) {
         shard_json = format!("[{}]", rows.join(","));
 
         sections.push("write_sweep");
-        let default_bits = Options::default().block_cache_num_shard_bits;
+        let default_bits = Options::default().get_block_cache_num_shard_bits();
         let variants: Vec<u32> = if default_bits == 0 {
             vec![0]
         } else {

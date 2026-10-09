@@ -19,19 +19,17 @@ use regolith::{
 /// Universal compaction with tiny files, so a handful of writes produces
 /// several L0 runs and the merge has something to fold.
 fn universal_options(workers: usize) -> Options {
-    Options {
-        compaction_style: CompactionStyle::Universal,
-        universal_compaction_options: UniversalCompactionOptions::default(),
-        write_buffer_size: 32 * 1024,
-        block_size: 4 * 1024,
-        block_cache_size: 0,
-        target_file_size: 64 * 1024,
-        l0_compaction_trigger: 2,
-        level0_slowdown_writes_trigger: 0,
-        level0_stop_writes_trigger: 0,
-        max_background_compactions: workers,
-        ..Options::default()
-    }
+    Options::default()
+        .compaction_style(CompactionStyle::Universal)
+        .universal_compaction_options(UniversalCompactionOptions::default())
+        .write_buffer_size(32 * 1024)
+        .block_size(4 * 1024)
+        .block_cache_size(0)
+        .target_file_size(64 * 1024)
+        .l0_compaction_trigger(2)
+        .level0_slowdown_writes_trigger(0)
+        .level0_stop_writes_trigger(0)
+        .max_background_compactions(workers)
 }
 
 /// Fill enough to leave several L0 files behind.
@@ -113,10 +111,12 @@ fn a_universal_merge_keeps_every_key_it_folded() {
     db.flush().unwrap();
     while db.compact_step().unwrap() == CompactionOutcome::DidWork {}
 
-    let mut scan = db.scan_stream(None, None).unwrap();
-    let seen = scan.by_ref().count();
-    scan.status().unwrap();
-    assert_eq!(seen as u64, N, "a merge must not drop or duplicate keys");
+    let seen = db
+        .scan_stream(None, None)
+        .unwrap()
+        .try_fold(0u64, |seen, entry| entry.map(|_| seen + 1))
+        .unwrap();
+    assert_eq!(seen, N, "a merge must not drop or duplicate keys");
 
     for i in (0..N).step_by(97) {
         assert_eq!(

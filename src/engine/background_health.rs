@@ -12,7 +12,7 @@
 use std::io;
 
 use crate::portability::{AtomicU64, Ordering};
-use crate::sync::Mutex;
+use crate::sync::internal::Mutex;
 
 /// The background jobs a stalled writer can be waiting on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

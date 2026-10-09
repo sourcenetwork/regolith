@@ -281,10 +281,7 @@ impl MergeOperator for AppendMerge {
 #[test]
 fn merge_operator_reads_route_through_get_slice() {
     let dir = TempDir::new().unwrap();
-    let opts = Options {
-        merge_operator: Some(std::sync::Arc::new(AppendMerge)),
-        ..Options::default()
-    };
+    let opts = Options::default().merge_operator(Some(std::sync::Arc::new(AppendMerge)));
     let db = Db::open(dir.path(), opts).unwrap();
     db.put(b"k", b"base").unwrap();
     db.merge(b"k", b"+1").unwrap();

@@ -37,14 +37,12 @@ fn key(writer: usize, index: usize) -> Vec<u8> {
 }
 
 fn opts(durability: DurabilityMode) -> Options {
-    Options {
+    Options::default()
         // Small enough that the run rotates memtables and flushes while
         // the writers are still going, so the kill lands with live frozen
         // memtables and a compaction in flight.
-        write_buffer_size: 32 * 1024,
-        durability,
-        ..Options::default()
-    }
+        .write_buffer_size(32 * 1024)
+        .durability(durability)
 }
 
 /// The child half: write flat out from `WRITERS` threads, then exit

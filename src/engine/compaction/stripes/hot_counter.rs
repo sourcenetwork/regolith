@@ -12,7 +12,7 @@ use std::sync::Arc;
 use tempfile::TempDir;
 
 use crate::column_family::{DEFAULT_CF_ID, prefix_key};
-use crate::{IsolationLevel, OptimisticTransactionDb, Options};
+use crate::{IsolationLevel, OptimisticTransactionDb, Options, TxnOptions};
 
 use super::fixtures::Sum;
 
@@ -26,13 +26,11 @@ fn a_hot_counter_stays_folded_under_rolling_transactions() {
     let dir = TempDir::new().unwrap();
     let db = OptimisticTransactionDb::open(
         dir.path(),
-        Options {
-            merge_operator: Some(Arc::new(Sum)),
+        Options::default()
+            .merge_operator(Some(Arc::new(Sum)))
             // Compaction runs only where this test asks for it, so the
             // counts below do not depend on a worker's timing.
-            max_background_compactions: 0,
-            ..Options::default()
-        },
+            .max_background_compactions(0),
     )
     .unwrap();
     let counter = prefix_key(DEFAULT_CF_ID, b"counter");
@@ -52,7 +50,7 @@ fn a_hot_counter_stays_folded_under_rolling_transactions() {
     let mut open = VecDeque::new();
     let mut worst = 0;
     for commit in 1..=COMMITS {
-        let tx = db.begin_transaction_with(IsolationLevel::DefraLevel);
+        let tx = db.begin(&TxnOptions::new().isolation(IsolationLevel::DefraLevel));
         tx.merge(b"counter", &1i64.to_be_bytes()).unwrap();
         open.push_back(tx);
         if open.len() > WINDOW {

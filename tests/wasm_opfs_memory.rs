@@ -46,8 +46,7 @@ async fn the_whole_lifecycle_fits_the_embedded_budget() {
     let env = OpfsEnv::mount("regolith-test-memory", OpfsOptions::default())
         .await
         .expect("mount");
-    let mut options = Options::embedded();
-    options.env = env.as_env();
+    let options = Options::embedded().env(env.as_env());
     let db = Db::open(env.db_path(), options).expect("open");
 
     for i in 0..5000u32 {

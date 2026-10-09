@@ -48,10 +48,7 @@ fn num(x: f64) -> String {
 /// The fill skips the WAL: it is setup, not a measured write path, and the
 /// compaction that follows puts every key in an SSTable anyway.
 fn build(keys: &[Vec<u8>]) -> (common::TempDb, Db) {
-    let opts = Options {
-        block_cache_size: BLOCK_CACHE,
-        ..Options::default()
-    };
+    let opts = Options::default().block_cache_size(BLOCK_CACHE);
     let (tmp, db) = common::open("scan", opts);
     let wopts = WriteOptions {
         disable_wal: true,

@@ -79,14 +79,12 @@ fn main() {
     }
 
     let defaults = Options::default();
-    let buffers = defaults.max_write_buffer_number;
-    let block_kib = defaults.block_size / 1024;
-    let opts = Options {
-        write_buffer_size: (wb_mib * 1024 * 1024) as usize,
-        block_cache_size: (cache_mib * 1024 * 1024) as usize,
-        block_cache_num_shard_bits: shard_bits,
-        ..defaults
-    };
+    let buffers = defaults.get_max_write_buffer_number();
+    let block_kib = defaults.get_block_size() / 1024;
+    let opts = defaults
+        .write_buffer_size((wb_mib * 1024 * 1024) as usize)
+        .block_cache_size((cache_mib * 1024 * 1024) as usize)
+        .block_cache_num_shard_bits(shard_bits);
 
     let (tmp, db) = common::open(&format!("soak-{tag}"), opts);
     let shards = 1u64 << shard_bits;

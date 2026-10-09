@@ -105,11 +105,9 @@ impl Live {
 
 pub fn instrumented(write_buffer_size: usize) -> (Options, Arc<Statistics>) {
     let stats = Arc::new(Statistics::new());
-    let opts = Options {
-        write_buffer_size,
-        statistics: Some(Arc::clone(&stats)),
-        ..Options::default()
-    };
+    let opts = Options::default()
+        .write_buffer_size(write_buffer_size)
+        .statistics(Some(Arc::clone(&stats)));
     (opts, stats)
 }
 

@@ -132,11 +132,11 @@ transaction's footprint is validated at commit, so a stricter level refuses more
 commits fewer.
 
 ```rust
-use regolith::{IsolationLevel, OptimisticTransactionDb, Options};
+use regolith::{IsolationLevel, OptimisticTransactionDb, Options, TxnOptions};
 
 let db = OptimisticTransactionDb::open("/tmp/txn_db", Options::default())?;
 
-let mut txn = db.begin_transaction_with(IsolationLevel::Serializable);
+let mut txn = db.begin(&TxnOptions::new().isolation(IsolationLevel::Serializable));
 let balance = txn.get(b"account")?.unwrap_or_default();
 txn.put(b"account", b"debited")?;
 txn.commit()?;
@@ -169,10 +169,10 @@ at `Serializable` holds one read-set entry per key it yields until the transacti
 resolves, and its commit checks each one while every writer waits; below it, a scan holds
 one entry per stretch of keys it walked.
 
-`DefraLevel` is `RepeatableRead` with three relaxations, which apply to optimistic
+`DefraLevel` is `RepeatableRead` with four relaxations, which apply to optimistic
 transactions only. A pessimistic transaction at this level validates as `RepeatableRead`.
 What the commit validates, by kind of key (the first is `RepeatableRead` itself, the other
-three are the relaxations):
+four are the relaxations):
 
 - An ordinary key: every point read of it is validated, whether it found a value or not,
   and a put or delete of it conflicts with any commit to the key since the transaction
@@ -196,6 +196,20 @@ three are the relaxations):
   caller's contract is that the key determines its bytes, as a content hash does; regolith
   cannot check it, and a transaction that writes other bytes under the key commits too, the
   last commit to land winning.
+- A key declared `KeyClass::Log`, with the same classifier: a read of it is never validated,
+  and a put, delete or merge of it is refused with `Error::LogKeyWrite`. Only
+  `Transaction::append` writes the keys of a commit-ordered log.
+
+`Transaction::append(&log, entry, once_key)` adds an entry to a commit-ordered log, whose
+keys a `LogLayout` names. At commit, in the ordered step after validation, the entry takes
+the log's next position, dense from 1, and the entry, its once key and the head key are
+written in the same atomic commit. Positions follow commit order, a transaction that
+aborts takes none, an append is never validated so it never conflicts (at every level, for
+both flavours), and an append whose once key already holds a position writes nothing.
+`Db::allocate(key, n)` reserves `n` values of a `u64` counter in the same ordered step. It
+is never a conflict, never waits on a write stall, and is logged before any commit that
+uses one of its values, so after a crash no value a surviving commit used is returned
+again. Values reserved by a transaction that aborts are skipped.
 
 A transaction reads its own puts, deletes and merges in the order it made them, and the
 commit applies them in that order: an operand applies to the put or delete before it, and a
@@ -217,6 +231,36 @@ check sees it.
 `TransactionDb` is the pessimistic flavour: it takes key locks, so contention waits
 instead of retrying. `OptimisticTransactionDb` validates at commit and retries.
 
+A commit that loses a race returns `TransactionError::Conflict`. Its `Conflict` names the
+key, what the transaction did with it (`Access`) and the newer write that won
+(`WriteKind`), with the two sequences. Its message gives the key's length and a short hash,
+never its bytes, since a key can hold user data. An `EventListener::on_conflict` hears each
+conflict once, after the commit released its locks, so a caller can count the reasons.
+
+`transact` runs a closure in a transaction and commits it. After a conflict it runs the
+closure again at once, in a fresh transaction, handing it the conflict it lost to, up to the
+policy's `max_attempts`. The closure can settle the race from that reason instead of
+redoing its work blindly. An error from the closure ends the attempt and is not retried.
+
+```rust
+use regolith::{RetryPolicy, TransactionError, WriteKind};
+
+let (_, receipt) = db.transact(&RetryPolicy::default(), |txn, lost| {
+    // `lost` is the conflict the previous attempt lost to, `None` on the first run.
+    if lost.is_some_and(|conflict| conflict.theirs() == WriteKind::Delete) {
+        return Ok(()); // the document was deleted by the writer that won
+    }
+    txn.get_for_update(b"doc")?;
+    txn.delete(b"doc")?;
+    Ok::<_, TransactionError>(())
+})?;
+println!("visible at sequence {}", receipt.seq());
+```
+
+`commit` returns a `CommitReceipt` whose `seq()` is the sequence its writes became visible
+at, or the snapshot's sequence for a commit that wrote nothing. A sequence orders commits
+within one database; do not keep it across `drop_all` or in a restored database.
+
 Buffering a read or a write takes `&self`, so one transaction can be shared across
 threads without a lock around it. The write buffer and the read set are lock-free, and
 every read is folded into the commit-time validation set no matter which thread recorded
@@ -225,15 +269,13 @@ those are the points where the buffer stops changing.
 
 ```rust
 use std::sync::Arc;
-use regolith::{IsolationLevel, OptimisticTransactionDb, Options};
+use regolith::{IsolationLevel, OptimisticTransactionDb, Options, TxnOptions};
 
-let db = Arc::new(OptimisticTransactionDb::open("/tmp/shared_db", Options::default())?);
+let db = OptimisticTransactionDb::open("/tmp/shared_db", Options::default())?;
 
-// `begin_transaction` borrows the database, so the transaction cannot outlive it or be
-// stored in a `'static` container. `begin_transaction_owned` returns an
-// `OwnedTransaction`, which carries an `Arc` on the database instead and can be boxed,
-// shared, and moved freely.
-let txn = Arc::new(db.begin_transaction_owned(IsolationLevel::Serializable));
+// A `Transaction` has no lifetime and borrows nothing from the database, so it can be
+// boxed, shared, and moved freely, and it outlives the handle that began it.
+let txn = Arc::new(db.begin(&TxnOptions::new().isolation(IsolationLevel::Serializable)));
 
 std::thread::scope(|scope| {
     for thread in 0..4 {
@@ -274,20 +316,21 @@ both modes.
 
 Pure Rust throughout: no C toolchain, no FFI, no linker surprises. Compaction runs on an
 ordinary OS thread; no async runtime is required. On a target without threads, set
-`max_background_compactions = 0` and compaction runs on the calling thread.
+`max_background_compactions(0)` and compaction runs on the calling thread.
 
 ## Configuration
 
 ```rust
 use regolith::{CompressionType, Options};
 
-let opts = Options {
-    write_buffer_size: 64 * 1024 * 1024,
-    block_cache_size: 512 * 1024 * 1024,
-    compression: CompressionType::Lz4,
-    ..Default::default()
-};
+let opts = Options::default()
+    .write_buffer_size(64 * 1024 * 1024)
+    .block_cache_size(512 * 1024 * 1024)
+    .compression(CompressionType::Lz4);
 ```
+
+Every option is a builder method named after it, so a new option in a later release is a
+new method and an existing chain keeps compiling.
 
 Three ready-made profiles: `Options::default()` for a server, `Options::embedded()` for a
 1-4 MiB budget, and `Options::wasm()` for a browser or wasi module. Every value and the

@@ -17,9 +17,11 @@ fn seeded(dir: &std::path::Path) -> Db {
     db
 }
 
-fn keys(entries: impl Iterator<Item = (Vec<u8>, regolith::DbSlice)>) -> Vec<String> {
+fn keys(
+    entries: impl Iterator<Item = regolith::Result<(Vec<u8>, regolith::DbSlice)>>,
+) -> Vec<String> {
     entries
-        .map(|(key, _)| String::from_utf8(key).unwrap())
+        .map(|item| String::from_utf8(item.unwrap().0).unwrap())
         .collect()
 }
 
