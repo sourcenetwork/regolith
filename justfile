@@ -420,6 +420,10 @@ tla:
     check MC_IngestPublication_Green                   GREEN
     check MC_IngestPublication_Red_CommitPassesSlot    RED RepeatableSnapshot
     check MC_IngestPublication_Red_IngestPublishesEarly RED RepeatableSnapshot
+    # D48: an ingest syncs the log before its manifest record. TLC only.
+    spec=IngestDurability
+    check MC_IngestDurability_Green                    GREEN
+    check MC_IngestDurability_Red_NoLogSync            RED GapFreePrefix
     # E2. Lean: Regolith/WalRecovery.lean, reachable_recovers_prefix.
     spec=WalRotation
     check MC_WalRotation_Green                         GREEN

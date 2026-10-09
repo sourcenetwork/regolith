@@ -15,10 +15,12 @@
 \* commits, one ingest and two readers.
 \*
 \* THE ENGINE.
-\*   RegolithEngine::ingest_one         src/engine/mod.rs
-\*     Draws `ingest_seq` from `latest_seq`, rewrites the external table at
-\*     that sequence, installs it in the version, and only then publishes
-\*     `ingest_seq` on the read horizon.
+\*   RegolithEngine::install            src/engine/ingest.rs
+\*     Under the commit pipeline's mutex, draws the sequence from
+\*     `latest_seq`, installs the table in the version with a manifest edit
+\*     recording that every entry of it reads at that sequence (D48), and
+\*     only then publishes the sequence on the read horizon. A commit draws
+\*     and publishes under the same mutex, so none publishes in between.
 \*   ReadHorizon::publish               src/engine/read_horizon.rs
 \*     A `fetch_max`: the horizon only rises. A commit that drew a later
 \*     sequence publishes it as soon as its own data is applied.
