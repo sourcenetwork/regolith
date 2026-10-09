@@ -83,7 +83,8 @@
 \*     of the key by sequence, which is what the engine's read order returns
 \*     on an ordered tree (LsmOrder.tla, Lean read_newest).
 \*   - Range tombstones (`Stripes::shadowed`): they act as deletions with a
-\*     sequence and follow the same stripe rule.
+\*     sequence and follow the same stripe rule. When a pass may drop the
+\*     tombstone itself (E27) is TombstoneRetirement.tla.
 \*   - Several concurrent compactions: their windows are disjoint and each
 \*     reads the list after fixing its own inputs, so each is the case here.
 \*   - The configurations use one key: the reduction treats each key on its

@@ -497,6 +497,14 @@ tla:
     check MC_StripeCompaction_Red_CaptureEarly         RED SnapshotReadsKept
     check MC_StripeCompaction_Red_InexactFold          RED HeadKept
     check MC_StripeCompaction_Red_IgnoreStripes        RED SnapshotReadsKept
+    # E27: a pass retires a range tombstone below its range and every
+    # snapshot. Green_Retires is the witness that the fix retires at all.
+    # TLC only.
+    spec=TombstoneRetirement
+    check MC_TombstoneRetirement_Green                 GREEN
+    check MC_TombstoneRetirement_Green_Retires         RED NothingRetired
+    check MC_TombstoneRetirement_Red_IgnoreSnapshots   RED SnapshotReadsKept
+    check MC_TombstoneRetirement_Red_IgnoreDeeper      RED SnapshotReadsKept
     # 4.6: the lock-free snapshot registry. Lean:
     # Regolith/SnapshotRegistry.lean, scan_respects_live.
     spec=SnapshotRegistry
