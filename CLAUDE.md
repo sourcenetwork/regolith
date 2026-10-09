@@ -12,7 +12,7 @@ Early-stage. The public API (`Db`, `Snapshot`, `WriteBatch`, `Options`) is small
 - **LSM-tree**: write-optimized with level-based background compaction
 - **MVCC**: point-in-time consistent reads via global sequence numbers
 - **Crash recovery**: WAL whose records carry the offset the last sync made durable, so replay tells a crash from damage
-- **Concurrent reads**: an arena-backed skip list memtable (`src/engine/skiplist/`) that readers walk without a lock until a range delete lands in it; a block-cache hit is lock-free
+- **Concurrent reads**: no read takes a lock. A read loads the published view wait-free (`src/engine/read_view.rs`, a kovan `Atom`), walks the arena-backed skip list memtable (`src/engine/skiplist/`) and its append-only range-tombstone log, and uses a lock-free CLOCK block cache
 - **No async runtime required**: compaction runs on background worker threads (`Options::max_background_compactions`), or inline on a target that has none
 
 ---
@@ -102,6 +102,7 @@ src/
     ├── manifest.rs     # VersionSet, VersionEdit log, level tracking
     ├── manifest/       # Manifest tests
     ├── memtable.rs     # Arena-backed skip list memtable plus its range tombstones
+    ├── memtable/       # Key walks, probe tests, and tombstones.rs: the append-only, lock-free range-tombstone log
     ├── skiplist/       # Insert-only concurrent skip list over the arena
     ├── sstable.rs      # SSTable reader/writer, footer, index block
     ├── sstable/        # SSTable key walks and size limits
@@ -111,7 +112,8 @@ src/
     ├── recovery.rs     # Replaying the WALs at open, the dropped-tail report, the rewrite
     ├── arena.rs        # Bump allocator for one memtable
     ├── block.rs        # Data blocks: prefix compression, restart points, varint
-    ├── block_cache.rs  # Sharded CLOCK cache for decompressed SSTable blocks
+    ├── block_cache.rs  # Sharded lock-free CLOCK cache for decompressed SSTable blocks: pins, byte bound
+    ├── block_cache/    # ring.rs: the lock-free CLOCK ring of slot words; tests.rs
     ├── callback.rs     # Catching a panic in caller code inside a commit and naming its trait
     ├── bloom.rs        # Bloom filter (double-hashed xxh3)
     ├── checksum.rs     # Checksum helpers
@@ -123,7 +125,8 @@ src/
     ├── lookup_key.rs   # Inline-first internal key used by every read path
     ├── iterator.rs     # Engine iterator merge logic
     ├── range_tombstone.rs # Range-delete tombstone encoding
-    ├── read_view.rs    # The published set of memtables and version a reader loads
+    ├── read_view.rs    # The published set of memtables and version a reader loads, wait-free (kovan Atom)
+    ├── reclaim.rs      # Prompt kovan reclamation for retired views and tombstone indexes
     ├── read_horizon.rs # Newest sequence whose data is durable and applied
     ├── snapshot_registry.rs # Active snapshot sequence tracking
     ├── source_walk.rs  # Newest-first walk over a view's sources for one key
