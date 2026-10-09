@@ -186,7 +186,10 @@ fn check_recovered(out: &ChildOutcome, durability: DurabilityMode, commits: usiz
 }
 
 const TEARS: [TearMode; 2] = [TearMode::Truncate, TearMode::TornSector];
-const COMMITS: usize = 30;
+/// Commits per writer. A group holds at most one commit of each of the
+/// `THREADS` writers, so this many commits per writer make at least this many
+/// log writes and log fsyncs: enough for every cut below to fire.
+const COMMITS: usize = 100;
 
 #[test]
 fn a_power_cut_keeps_whole_transactions_and_every_acknowledged_one_at_immediate() {
