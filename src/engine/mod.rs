@@ -1579,6 +1579,11 @@ impl RegolithEngine {
             return Ok(results);
         }
         let mut entries = grouped_multi_get_entries(keys);
+        for entry in &mut entries {
+            entry.max_rt = view
+                .version
+                .l0_range_tombstone_seq(&entry.key, snapshot_seq);
+        }
         let mut unresolved = entries.len();
         // One encoder, re-pointed per key, instead of one per key per
         // source.
@@ -1639,12 +1644,6 @@ impl RegolithEngine {
             for entry in &mut entries {
                 if entry.resolved || !file_covers_key(file, &entry.key) {
                     continue;
-                }
-                let rt = file
-                    .reader
-                    .covering_range_tombstone_seq(&entry.key, snapshot_seq);
-                if rt > entry.max_rt {
-                    entry.max_rt = rt;
                 }
                 lk.reset_prefixed(&entry.key, snapshot_seq);
                 match with_key_scratch(|buf| file.reader.get(&lk, buf, &self.cache))? {
@@ -3207,6 +3206,10 @@ impl RegolithEngine {
             .get(level)
             .map(|files| files.len() as u64)
             .unwrap_or(0)
+    }
+
+    pub(crate) fn tables_demoted_at_open(&self) -> u64 {
+        self.versions.lock().tables_demoted_at_open()
     }
 
     /// Total size in bytes across every level of the current

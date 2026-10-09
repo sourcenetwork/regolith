@@ -314,8 +314,8 @@ tla:
     cd proofs/tla
     fail=0
     check() {
-        local cfg="$1" expect="$2" inv="${3:-}" out broke verdict
-        out=$(./tools/tlc -metadir "states/$cfg" -config "$cfg.cfg" RepeatableRead.tla 2>&1)
+        local cfg="$1" expect="$2" inv="${3:-}" model="${4:-RepeatableRead}" out broke verdict
+        out=$(./tools/tlc -metadir "states/$cfg" -config "$cfg.cfg" "$model.tla" 2>&1)
         broke=$(sed -n 's/^Error: Invariant \(.*\) is violated\.$/\1/p' <<<"$out" | head -1)
         if grep -q "No error has been found" <<<"$out"; then
             verdict=GREEN
@@ -348,6 +348,8 @@ tla:
     check MC_DefraLevel_Red_RangeDeleteNotReplacement  RED INV_CounterExact
     check MC_DefraLevel_Red_PolicyIgnoresRange         RED INV_NoStaleDefinition
     check MC_DefraLevel_Red_DefinitionContentAddressed RED INV_NoStaleDefinition
+    check MC_LegacyRangeRead_Green                     GREEN '' LegacyRangeRead
+    check MC_LegacyRangeRead_Red_NoPreScan              RED ReadNewest LegacyRangeRead
     rm -rf states ./*_TTrace_*.tla ./*_TTrace_*.bin
     exit $fail
 

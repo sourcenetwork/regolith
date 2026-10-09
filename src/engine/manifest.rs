@@ -16,6 +16,8 @@ use super::sstable::{
     LiveSst, MetadataPolicy, SsTableMeta, SsTableReader, sst_filename, table_carries_data,
 };
 
+mod legacy_overlap;
+
 /// Maximum number of levels in the LSM tree.
 pub(crate) const MAX_LEVELS: usize = 7;
 
@@ -37,6 +39,7 @@ pub(crate) const MAX_LEVELS: usize = 7;
 #[derive(Clone)]
 pub(crate) struct Version {
     pub(crate) levels: Vec<Vec<Arc<LiveSst>>>,
+    l0_has_range_tombstones: bool,
     pub(crate) next_file_id: u64,
     pub(crate) last_seq: u64,
     pub(crate) min_wal_id: u64,
@@ -46,6 +49,7 @@ impl Version {
     pub(crate) fn new() -> Self {
         Self {
             levels: (0..MAX_LEVELS).map(|_| Vec::new()).collect(),
+            l0_has_range_tombstones: false,
             next_file_id: 1,
             last_seq: 0,
             min_wal_id: 0,
@@ -60,6 +64,27 @@ impl Version {
     /// Total size of SSTables at a given level.
     pub(crate) fn level_size(&self, level: usize) -> u64 {
         self.levels[level].iter().map(|f| f.meta.file_size).sum()
+    }
+
+    pub(crate) fn refresh_l0_range_tombstones(&mut self) {
+        self.l0_has_range_tombstones = self.levels[0]
+            .iter()
+            .any(|file| !file.reader.range_tombstones().is_empty());
+    }
+
+    /// A legacy ingest's tombstone can be newer than a shallow point
+    /// demoted ahead of it, or an older point replayed into a memtable.
+    /// Gather deletes before a point lookup can stop at either source.
+    /// The cached flag keeps tombstone-free L0 runs out of the scan.
+    pub(crate) fn l0_range_tombstone_seq(&self, key: &[u8], snapshot_seq: u64) -> u64 {
+        if !self.l0_has_range_tombstones {
+            return 0;
+        }
+        self.levels[0]
+            .iter()
+            .map(|file| file.reader.covering_range_tombstone_seq(key, snapshot_seq))
+            .max()
+            .unwrap_or(0)
     }
 
     /// Place `file` in `level`: at the end of L0, whose order is age, and
@@ -376,11 +401,13 @@ pub(crate) struct VersionSet {
     /// and rewrites are refused until recovery reopens the log.
     manifest_writer: Option<BufferedWriter>,
     env: Arc<dyn Env>,
+    tables_demoted_at_open: u64,
 }
 
 struct ManifestReplay {
     version: Version,
     valid_len: usize,
+    repair: legacy_overlap::Repair,
 }
 
 /// An unreferenced `*.sst` file that the discarded-table guard could not
@@ -433,6 +460,7 @@ impl VersionSet {
     ) -> io::Result<Self> {
         let manifest_path = db_dir.join("MANIFEST");
 
+        let mut repair = legacy_overlap::Repair::default();
         let manifest_bytes;
         let (version, writer) = if env.exists(&manifest_path) {
             let data = env.read(&manifest_path)?;
@@ -447,6 +475,7 @@ impl VersionSet {
             if replayed_cleanly && env.capabilities().file_lock {
                 super::orphan_sweep::sweep_unreferenced_tables(&**env, sst_dir, &replay.version)?;
             }
+            repair = replay.repair;
 
             // Trim through its own handle, and close it before the
             // append handle is opened. A torn or corrupt tail is the
@@ -486,13 +515,19 @@ impl VersionSet {
             (version, BufferedWriter::new(file))
         };
 
-        Ok(Self {
+        let mut versions = Self {
             current: Arc::new(RwLock::new(Arc::new(version))),
             manifest_path,
             manifest_bytes,
             manifest_writer: Some(writer),
             env: Arc::clone(env),
-        })
+            tables_demoted_at_open: repair.tables,
+        };
+        // Recovery is not published until the repair batch is synced.
+        // An error drops this writer; the next open replays its tail.
+        versions.manifest_bytes += repair.persist(versions.manifest_writer.as_mut().unwrap())?;
+        repair.report(&versions.manifest_path, false);
+        Ok(versions)
     }
 
     /// Create or recover a VersionSet through the standard
@@ -522,6 +557,7 @@ impl VersionSet {
         let data = env.read(&manifest_path)?;
         let replay = Self::replay_manifest(env, &data, sst_dir, policy)?;
         Self::reject_discarded_tables(&**env, &replay, data.len(), sst_dir, &manifest_path)?;
+        replay.repair.report(&manifest_path, true);
 
         Ok(Self {
             current: Arc::new(RwLock::new(Arc::new(replay.version))),
@@ -529,12 +565,18 @@ impl VersionSet {
             manifest_bytes: replay.valid_len as u64,
             manifest_writer: None,
             env: Arc::clone(env),
+            tables_demoted_at_open: replay.repair.tables,
         })
     }
 
     /// Get the current version.
     pub(crate) fn current(&self) -> Arc<Version> {
         Arc::clone(&*self.current.read())
+    }
+
+    /// Tables demoted by this open; zero after a persisted repair reopens.
+    pub(crate) fn tables_demoted_at_open(&self) -> u64 {
+        self.tables_demoted_at_open
     }
 
     /// Path of the manifest file on disk.
@@ -594,6 +636,7 @@ impl VersionSet {
         // Checked once the whole batch is in: a compaction removes its inputs
         // and adds its outputs in one batch, so the level is only expected to
         // be sound at the end of it.
+        version.refresh_l0_range_tombstones();
         debug_assert!(
             version.levels_are_sorted_runs(),
             "a level below L0 holds tables that overlap beyond a shared boundary key"
@@ -974,6 +1017,8 @@ impl VersionSet {
             valid_len = offset;
         }
 
+        let repair = legacy_overlap::Repair::prepare(&mut surviving)?;
+
         // Below L0 a level is one sorted run. The log lists a level's tables in
         // the order they arrived, which is how `Version::add_file` placed
         // them, so a stable sort puts each back where it was.
@@ -997,6 +1042,7 @@ impl VersionSet {
                 version.levels[level].push(LiveSst::new(meta, reader));
             }
         }
+        version.refresh_l0_range_tombstones();
         // The log is untrusted input, and a level that is not one sorted run
         // cannot be searched, so a manifest that says so is refused.
         if let Some((level, left, right)) = version.find_overlap() {
@@ -1009,12 +1055,20 @@ impl VersionSet {
             ));
         }
 
-        Ok(ManifestReplay { version, valid_len })
+        Ok(ManifestReplay {
+            version,
+            valid_len,
+            repair,
+        })
     }
 }
 
 #[cfg(test)]
 mod atomic_tests;
+#[cfg(test)]
+mod legacy_overlap_fault_tests;
+#[cfg(test)]
+mod legacy_overlap_tests;
 #[cfg(test)]
 mod level_order_tests;
 
