@@ -1742,7 +1742,11 @@ impl Db {
     /// returns the existing handle (idempotent).
     ///
     /// The new CF is persisted to the on-disk metadata before this
-    /// call returns, so it survives a crash and a reopen.
+    /// call returns, so it survives a crash and a reopen. It becomes
+    /// visible only once that write is committed, and concurrent creates
+    /// of one name return the same handle. Ids are never reused: a name
+    /// created again after a drop is a new family, and a handle to the
+    /// old one stays refused.
     pub fn create_column_family(&self, name: &str) -> Result<ColumnFamilyHandle> {
         self.ensure_writable()?;
         if name.is_empty() {
@@ -1772,6 +1776,13 @@ impl Db {
     ///
     /// Dropping the default column family is not allowed and
     /// returns an error.
+    ///
+    /// A write to the family that races the drop either commits before
+    /// it, and the range tombstone deletes it, or is refused with
+    /// [`Error::InvalidColumnFamily`]; it never lands after the
+    /// tombstone. Every later write, read or drop through a handle to the
+    /// family is refused the same way. Two drops of one family race to
+    /// one success.
     pub fn drop_column_family(&self, cf: ColumnFamilyHandle) -> Result<()> {
         self.ensure_writable()?;
         if cf.id() == DEFAULT_CF_ID {
