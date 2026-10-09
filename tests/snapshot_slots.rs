@@ -35,8 +35,9 @@ fn snapshots_dropped_on_other_threads_are_released_exactly() {
     let db = Arc::new(Db::open(dir.path(), options()).unwrap());
     let held = Arc::new(Barrier::new(THREADS + 1));
     let release = Arc::new(Barrier::new(THREADS + 1));
-    let (senders, receivers): (Vec<_>, Vec<_>) =
-        (0..THREADS).map(|_| mpsc::channel::<regolith::Snapshot>()).unzip();
+    let (senders, receivers): (Vec<_>, Vec<_>) = (0..THREADS)
+        .map(|_| mpsc::channel::<regolith::Snapshot>())
+        .unzip();
     let workers: Vec<_> = receivers
         .into_iter()
         .enumerate()
@@ -157,13 +158,8 @@ fn statistics_counted_on_many_threads_sum_exactly() {
     const READS: usize = 200;
     let stats = Arc::new(Statistics::new());
     let dir = TempDir::new().unwrap();
-    let db = Arc::new(
-        Db::open(
-            dir.path(),
-            options().statistics(Some(Arc::clone(&stats))),
-        )
-        .unwrap(),
-    );
+    let db =
+        Arc::new(Db::open(dir.path(), options().statistics(Some(Arc::clone(&stats)))).unwrap());
     db.put(b"k", b"value").unwrap();
     stats.reset();
     let start = Arc::new(Barrier::new(THREADS));
