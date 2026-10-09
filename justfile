@@ -379,6 +379,52 @@ tla:
     check MC_WalRotation_Green                         GREEN
     check MC_WalRotation_Red_NoSync                    RED RecoversPrefix
     check MC_WalRotation_Red_NoSync_Gap                RED NoGap
+    # Plan 3.6, commit-ordered append (supersedes defradb.rs #1911). Each
+    # Teeth row is GREEN: its mutant breaks nothing but its RED's invariant.
+    # Lean: Regolith/Append.lean, dense_from_one, unique_positions,
+    # at_most_once, commit_order, snapshot_sees_prefix.
+    spec=CommitOrderedAppend
+    check MC_CommitOrderedAppend_Green_Writers                 GREEN
+    check MC_CommitOrderedAppend_Green_Groups                  GREEN
+    check MC_CommitOrderedAppend_Green_Faults                  GREEN
+    check MC_CommitOrderedAppend_Green_Pipeline                GREEN
+    check MC_CommitOrderedAppend_Red_Counter                   RED INV_NoDisjointConflict
+    check MC_CommitOrderedAppend_Red_Detached                  RED INV_OneCommitPerWrite
+    check MC_CommitOrderedAppend_Red_DetachedOrder             RED INV_CommitOrder
+    check MC_CommitOrderedAppend_Red_DetachedNumbering         RED INV_NumberedAtCommit
+    check MC_CommitOrderedAppend_Red_LatestBound               RED INV_NoSkip
+    check MC_CommitOrderedAppend_Red_Stamps                    RED INV_Dense
+    check MC_CommitOrderedAppend_Red_ViewOnlyHead              RED INV_UniqueCursors
+    check MC_CommitOrderedAppend_Red_OnceFromView              RED INV_AtMostOnce
+    check MC_CommitOrderedAppend_Red_AssignBeforeValidation    RED INV_Dense
+    check MC_CommitOrderedAppend_Red_HeadCache                 RED INV_Dense
+    check MC_CommitOrderedAppend_Red_PublishedView             RED INV_UniqueCursors
+    check MC_CommitOrderedAppend_Teeth_Counter                 GREEN
+    check MC_CommitOrderedAppend_Teeth_Detached                GREEN
+    check MC_CommitOrderedAppend_Teeth_LatestBound             GREEN
+    check MC_CommitOrderedAppend_Teeth_Stamps                  GREEN
+    check MC_CommitOrderedAppend_Teeth_ViewOnlyHead            GREEN
+    check MC_CommitOrderedAppend_Teeth_OnceFromView            GREEN
+    check MC_CommitOrderedAppend_Teeth_AssignBeforeValidation  GREEN
+    check MC_CommitOrderedAppend_Teeth_HeadCache               GREEN
+    check MC_CommitOrderedAppend_Teeth_PublishedView           GREEN
+    # Plan 3.6 across crashes, per durability mode. Green_Eventual is also
+    # the RED's teeth. Lean: Regolith/Append.lean, snapshot_sees_prefix;
+    # Regolith/WalRecovery.lean, recovers_prefix.
+    spec=CommitOrderedAppendCrash
+    check MC_CommitOrderedAppendCrash_Green_Immediate          GREEN
+    check MC_CommitOrderedAppendCrash_Green_Eventual           GREEN
+    check MC_CommitOrderedAppendCrash_Red_EventualExternal     RED INV_ExternalStable
+    # Plan 3.7, conflict-free allocation. Lean: Regolith/Allocate.lean,
+    # ranges_disjoint, ranges_grow, uses_allocated, alloc_fresh.
+    spec=Allocate
+    check MC_Allocate_Green_Immediate                          GREEN
+    check MC_Allocate_Green_Eventual                           GREEN
+    check MC_Allocate_Red_InTxn                                RED INV_NeverConflicts
+    check MC_Allocate_Red_LogAfterUse                          RED INV_UseDurable
+    check MC_Allocate_Red_LogAfterUse_Reuse                    RED INV_UsesUnique
+    check MC_Allocate_Teeth_InTxn                              GREEN
+    check MC_Allocate_Teeth_LogAfterUse                        GREEN
     rm -rf states ./*_TTrace_*.tla ./*_TTrace_*.bin
     exit $fail
 
