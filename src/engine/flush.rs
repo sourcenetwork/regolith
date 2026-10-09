@@ -22,7 +22,7 @@ use super::memtable::MemTable;
 use super::pending_outputs::PendingOutputs;
 use super::read_view::{ReadViewCell, VersionStore};
 use super::sstable::{LiveSst, SsTableMeta, SsTableReader, SsTableWriter, sst_filename};
-use super::wal::Wal;
+use super::log_retirement::{self, RetiredLogs};
 use super::{EngineOptions, event_listener, stall_state};
 use crate::env::Env;
 use crate::portability::AtomicU8;
@@ -33,6 +33,10 @@ pub(crate) struct Flusher {
     view: Arc<ReadViewCell>,
     versions: Arc<VersionStore>,
     sst_dir: PathBuf,
+    /// The logs flushes have put in tables, and whether a removal is owed
+    /// (`log_retirement.rs`). Every flush path runs through this flusher,
+    /// so every one retires its log the same way.
+    retired_logs: RetiredLogs,
     options: EngineOptions,
     env: Arc<dyn Env>,
     health: Arc<BackgroundHealth>,
@@ -63,10 +67,12 @@ pub(crate) struct Flusher {
 }
 
 impl Flusher {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         view: Arc<ReadViewCell>,
         versions: Arc<VersionStore>,
         sst_dir: PathBuf,
+        retired_logs: RetiredLogs,
         options: EngineOptions,
         health: Arc<BackgroundHealth>,
         stall_signal: Arc<StallSignal>,
@@ -76,6 +82,7 @@ impl Flusher {
             view,
             versions,
             sst_dir,
+            retired_logs,
             env: Arc::clone(&options.env),
             options,
             health,
@@ -124,7 +131,10 @@ impl Flusher {
     }
 
     /// Unlink the log that backed `flushed`, now that its records are in
-    /// an SSTable the published version references.
+    /// an SSTable the published version references, and any log a failed
+    /// unlink left below it. A failure is reported and retried by the next
+    /// flush or open; the log is never replayed meanwhile, because the
+    /// table's batch recorded it as flushed (`log_retirement.rs`).
     ///
     /// Keyed off the memtable rather than off whatever log the caller
     /// happened to seal. A flush and the seal that fed it are not
@@ -134,9 +144,8 @@ impl Flusher {
     /// log would delete the only durable copy of a memtable that has not
     /// been flushed, and a crash would then lose every write in it.
     fn remove_sealed_wal(&self, flushed: &MemTable) {
-        if let Some(path) = flushed.sealed_wal() {
-            let _ = Wal::remove_in(&*self.env, path);
-        }
+        self.retired_logs
+            .retire(&*self.env, flushed, self.options.statistics.as_deref());
     }
 
     /// Write the oldest frozen memtable out to an L0 SSTable and retire
@@ -288,10 +297,13 @@ impl Flusher {
         let seq = memtable
             .sealed_seq()
             .ok_or_else(|| std::io::Error::other("a memtable was flushed before it was sealed"))?;
-        let edits = vec![
+        let mut edits = vec![
             VersionEdit::AddFile { level: 0, file },
             VersionEdit::SetLastSeq(seq),
         ];
+        // In the table's batch, so the log is skipped by recovery exactly
+        // when the table is durable (E30).
+        edits.extend(log_retirement::min_wal_id_after(&memtable).map(VersionEdit::SetMinWalId));
         pending.offered_to_manifest();
         self.versions.lock().apply(&edits)?;
 

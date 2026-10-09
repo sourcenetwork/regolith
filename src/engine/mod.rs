@@ -516,8 +516,6 @@ pub(crate) struct RegolithEngine {
     wal_id: AtomicU64,
     sst_dir: PathBuf,
     wal_dir: PathBuf,
-    /// The logs flushes have put in tables, and whether a removal is owed.
-    retired_logs: RetiredLogs,
     compaction: Mutex<CompactionScheduler>,
     /// Engine-wide RwLock that coordinates foreground and background
     /// compaction. Background workers each hold a read lock so they
@@ -719,6 +717,7 @@ impl RegolithEngine {
             Arc::clone(&view),
             Arc::clone(&versions),
             sst_dir.clone(),
+            retired_logs,
             options.clone(),
             Arc::clone(&background_health),
             Arc::clone(&stall_signal),
@@ -743,7 +742,6 @@ impl RegolithEngine {
             wal_id: AtomicU64::new(wal_id),
             sst_dir,
             wal_dir,
-            retired_logs,
             compaction: Mutex::new(compaction),
             compaction_lock,
             snapshot_registry,
@@ -858,6 +856,7 @@ impl RegolithEngine {
             Arc::clone(&view),
             Arc::clone(&versions),
             sst_dir.clone(),
+            RetiredLogs::new(wal_dir.clone(), false),
             options.clone(),
             Arc::clone(&background_health),
             Arc::clone(&stall_signal),
@@ -877,7 +876,6 @@ impl RegolithEngine {
             active_wal: Mutex::new(None),
             wal_id: AtomicU64::new(wal_id),
             sst_dir,
-            retired_logs: RetiredLogs::new(wal_dir.clone(), false),
             wal_dir,
             compaction: Mutex::new(CompactionScheduler::disabled()),
             compaction_lock,
