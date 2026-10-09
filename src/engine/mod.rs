@@ -1956,9 +1956,28 @@ impl RegolithEngine {
     /// satisfies this because it runs before the write path takes
     /// `write_lock`, never inside it.
     pub(crate) fn run_one_compaction_pass(&self) -> std::io::Result<CompactionOutcome> {
+        self.run_one_compaction_pass_on(true)
+    }
+
+    /// [`Self::run_one_compaction_pass`], or, unless `wait`, `Contended`
+    /// at once when a `compact_range`, an ingest, a checkpoint or a
+    /// `drop_all` holds the compaction lock or waits for it. A write's owed
+    /// step never waits: the thread that owes it may be the one holding the
+    /// lock.
+    pub(crate) fn run_one_compaction_pass_on(
+        &self,
+        wait: bool,
+    ) -> std::io::Result<CompactionOutcome> {
         self.ensure_writable()?;
         let outcome = {
-            let _guard = self.compaction_lock.read();
+            let _guard = if wait {
+                self.compaction_lock.read()
+            } else {
+                match self.compaction_lock.try_read() {
+                    Some(guard) => guard,
+                    None => return Ok(CompactionOutcome::Contended),
+                }
+            };
             self.ensure_writable()?;
             compaction::pick_and_run_compaction(
                 &self.versions,
@@ -2037,7 +2056,7 @@ impl RegolithEngine {
                         StallPolicy::CompactInline => {
                             // A frozen memtable is flushed first: with no
                             // worker, nothing else writes it out.
-                            match self.run_one_background_step()? {
+                            match self.run_one_background_step(true)? {
                                 // Files came out of L0; the next
                                 // `stall_state()` sees it. Only real
                                 // work counts against the budget,
@@ -2102,7 +2121,7 @@ impl RegolithEngine {
                         // which is what makes the write rate track
                         // compaction on a single-threaded host.
                         StallPolicy::CompactInline => {
-                            self.run_one_background_step()?;
+                            self.run_one_background_step(true)?;
                         }
                     }
                     // One slowdown delay per call - don't loop, or
@@ -2432,12 +2451,13 @@ impl RegolithEngine {
     }
 
     /// Write the oldest frozen memtable out to an L0 SSTable and retire
-    /// it, then wake the compaction worker. Returns `false` when there was
+    /// it, then wake the compaction worker, or, with none, owe the next
+    /// write a bounded step. Returns `false` when there was
     /// nothing frozen to flush. See [`Flusher::flush_oldest`].
     fn flush_oldest_frozen(&self, flushing: &MutexGuard<'_, ()>) -> std::io::Result<bool> {
         let flushed = self.flusher.flush_oldest(flushing)?;
         if flushed {
-            self.compaction.lock().notify();
+            self.after_flush();
         }
         Ok(flushed)
     }

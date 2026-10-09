@@ -205,3 +205,77 @@ fn frozen_memtables_install_in_l0_oldest_first_whoever_flushes() {
         "the newest version answers once every memtable is in L0"
     );
 }
+
+/// A rotation leaves at most `max_write_buffer_number` memtables: when the
+/// flush before it has not finished, the write that fills the next memtable
+/// writes the oldest out itself, and waits for the flush exclusion to do so.
+#[test]
+fn a_rotation_never_leaves_more_memtables_than_the_cap() {
+    let dir = TempDir::new().unwrap();
+    // The default cap of two: the active memtable and one frozen.
+    let engine = RegolithEngine::open(dir.path(), tiny(1)).unwrap();
+    let held = engine.flusher.flushing.lock();
+    write_until_sealed(&engine, "first");
+    assert_eq!(engine.view.load().frozen.len(), 1);
+    let (done, returned) = mpsc::channel();
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            done.send(write_until_sealed(&engine, "second")).unwrap();
+        });
+        // The worker cannot flush while the exclusion is held, so the
+        // second rotation has to wait to write the first memtable out.
+        assert!(
+            returned.recv_timeout(Duration::from_millis(200)).is_err(),
+            "a second rotation sealed past the cap while the first flush was pending"
+        );
+        assert!(engine.view.load().frozen.len() <= 1);
+        drop(held);
+        returned
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the rotation finished once the exclusion was free");
+    });
+    assert!(engine.view.load().frozen.len() <= 1);
+    assert_eq!(
+        engine.get(&key_of(b"first000"), u64::MAX).unwrap(),
+        Some(vec![7u8; 1024])
+    );
+}
+
+/// E16: with no worker, the write after the flush that brings L0 to
+/// `l0_compaction_trigger` compacts it, so L0 stays at the trigger instead of
+/// growing to the slowdown trigger before anything compacts.
+#[test]
+fn without_a_worker_writes_compact_once_l0_reaches_its_trigger() {
+    let dir = TempDir::new().unwrap();
+    let engine = RegolithEngine::open(
+        dir.path(),
+        EngineOptions {
+            l0_compaction_trigger: 2,
+            level0_slowdown_writes_trigger: 20,
+            level0_stop_writes_trigger: 36,
+            ..tiny(0)
+        },
+    )
+    .unwrap();
+    let mut peak_l0 = 0;
+    for round in 0..12 {
+        write_until_sealed(&engine, &format!("r{round:02}-"));
+        peak_l0 = peak_l0.max(engine.view.load().version.levels[0].len());
+    }
+    assert!(
+        peak_l0 <= 2,
+        "L0 reached {peak_l0} tables with a trigger of 2: nothing compacted"
+    );
+    assert!(
+        !engine.view.load().version.levels[1].is_empty(),
+        "nothing was compacted into L1"
+    );
+    for round in 0..12 {
+        assert_eq!(
+            engine
+                .get(&key_of(format!("r{round:02}-000").as_bytes()), u64::MAX)
+                .unwrap(),
+            Some(vec![7u8; 1024])
+        );
+    }
+}

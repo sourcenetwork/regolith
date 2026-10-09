@@ -9,9 +9,11 @@
 //!   every frozen memtable, oldest first, before it compacts.
 //! - With none, the writer owes one bounded step, which it runs once its own
 //!   commit returned from the pipeline: one flush of the oldest frozen
-//!   memtable, or, with nothing frozen, one compaction pass. A step that
-//!   leaves work behind owes the next one, so writes pace the work and none
-//!   pays more than one step.
+//!   memtable, or, with nothing frozen, one compaction pass. A step that did
+//!   work owes the next one, so writes pace the work and none pays more than
+//!   one step. Every flush owes one too, so the write after the flush that
+//!   brings L0 to `l0_compaction_trigger` compacts it (E16), where before
+//!   nothing compacted until a stall trigger.
 //!
 //! A caller's code that panics in such a step (a listener, a prefix
 //! extractor, a rate limiter) fails that flush alone; it is reported and
@@ -41,6 +43,17 @@ impl RegolithEngine {
         }
     }
 
+    /// What a flush owes the background once it installed a table: a wake
+    /// of the worker, or, with none, one bounded step the next write runs,
+    /// which compacts once L0 reaches its trigger (E16).
+    pub(super) fn after_flush(&self) {
+        if self.has_worker {
+            self.compaction.lock().notify();
+        } else {
+            self.background_owed.store(true, Ordering::Release);
+        }
+    }
+
     /// Run the step this thread's writes left owing, if any: one bounded
     /// step of background work on a database with no worker. A no-op, one
     /// atomic load, when nothing is owed.
@@ -50,27 +63,40 @@ impl RegolithEngine {
         {
             return;
         }
-        // The writer's own commit already returned: a failure here is the
-        // background's, recorded where the step records it, and not the
-        // writer's. The stall triggers stop writes it keeps failing.
-        if let Err(e) = self.run_one_background_step() {
-            tracing::debug!(error = %e, "an owed background step failed");
-        }
-        if self.background_work_left() {
+        // A step that did work, or found another thread doing it, may have
+        // left more: the next write takes the next step. One that found
+        // nothing to do, or failed, owes nothing more until the next seal
+        // or flush, so a failing flush is not retried on every write; the
+        // stall triggers stop writes it keeps failing. The writer's own
+        // commit already returned, so a failure is the background's,
+        // recorded where the step records it.
+        let again = match self.run_one_background_step(false) {
+            Ok(CompactionOutcome::DidWork | CompactionOutcome::Contended) => true,
+            Ok(CompactionOutcome::Idle) => false,
+            Err(e) => {
+                tracing::debug!(error = %e, "an owed background step failed");
+                false
+            }
+        };
+        if again {
             self.background_owed.store(true, Ordering::Release);
         }
     }
 
     /// One bounded step of background work on the calling thread: flush the
     /// oldest frozen memtable if there is one, else run one compaction pass.
-    /// `Contended` when another thread is flushing. A failed flush is
+    /// `Contended` when another thread is flushing, or, unless `wait`, holds
+    /// the compaction lock. A failed flush is
     /// [`crate::Error::BackgroundFailed`], as a stopped writer that retries one
     /// reports it.
-    pub(crate) fn run_one_background_step(&self) -> Result<CompactionOutcome, crate::Error> {
+    pub(crate) fn run_one_background_step(
+        &self,
+        wait: bool,
+    ) -> Result<CompactionOutcome, crate::Error> {
         self.ensure_writable()?;
         let _background = InBackground::enter();
         if self.view.load().frozen.is_empty() {
-            return Ok(self.run_one_compaction_pass()?);
+            return Ok(self.run_one_compaction_pass_on(wait)?);
         }
         let Some(flushing) = self.flusher.flushing.try_lock() else {
             return Ok(CompactionOutcome::Contended);
@@ -87,11 +113,5 @@ impl RegolithEngine {
                 source,
             }),
         }
-    }
-
-    /// Whether a database with no worker still owes background work: a
-    /// frozen memtable to flush.
-    fn background_work_left(&self) -> bool {
-        !self.view.load().frozen.is_empty()
     }
 }
