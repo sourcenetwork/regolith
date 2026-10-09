@@ -759,6 +759,10 @@ pub struct Transaction {
     /// the first `on_abort` callback is registered, or at once under a
     /// database with [`TransactionHooks`].
     claim: Option<Arc<Claim>>,
+    /// The owner won the commit claim, so a claim made from here on, by an
+    /// `on_abort` registered inside a `before_commit` callback, starts as
+    /// committing too: `close` must not abort a commit that began.
+    committing: bool,
     /// How far [`Transaction::prepare`] got.
     prepare_state: Prepare,
     /// Keys for which this transaction holds a pessimistic lock.
@@ -845,7 +849,7 @@ impl Transaction {
         let claim = engine
             .transaction_hooks()
             .is_some()
-            .then(|| Claim::track(&engine));
+            .then(|| Claim::track(&engine, false));
         Self {
             engine,
             snapshot_seq,
@@ -864,6 +868,7 @@ impl Transaction {
             savepoints: Vec::new(),
             callbacks: Callbacks::default(),
             claim,
+            committing: false,
             prepare_state: Prepare::Pending,
             held_locks: TxnBuffer::new(keys_inline),
             lock_manager,
@@ -1269,6 +1274,7 @@ impl Transaction {
         // `close` may have aborted the transaction since it began: the commit
         // is then refused, and `close` ran the abort callbacks.
         let claimed = self.claim.as_ref().is_none_or(|claim| claim.begin_commit());
+        self.committing = claimed;
         let result = if claimed {
             self.commit_inner()
         } else {
@@ -1853,6 +1859,9 @@ mod validation_set_tests;
 
 #[cfg(test)]
 mod record_limit_tests;
+
+#[cfg(test)]
+mod commit_claim_tests;
 
 #[cfg(test)]
 mod tests {

@@ -242,9 +242,12 @@ struct Mark {
 }
 
 impl Transaction {
-    /// The transaction's claim, made on the first `on_abort` registration.
+    /// The transaction's claim, made on the first `on_abort` registration. A
+    /// claim made once the commit began starts as committing, so a sweep by
+    /// `close` finds nothing to abort.
     fn claim(&mut self) -> &Arc<Claim> {
-        self.claim.get_or_insert_with(|| Claim::track(&self.engine))
+        self.claim
+            .get_or_insert_with(|| Claim::track(&self.engine, self.committing))
     }
 
     /// Run `f` at commit, before validation, on the committing thread.

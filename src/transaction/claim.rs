@@ -38,16 +38,20 @@ pub(crate) struct Claim {
 }
 
 impl Claim {
-    /// A claim on a new transaction, listed with the engine so `close` finds
-    /// it. Nothing is listed once the database has begun to close: the closer
-    /// has already swept, and the owner ends the transaction itself.
-    pub(super) fn track(engine: &RegolithEngine) -> Arc<Self> {
+    /// A claim on a transaction, listed with the engine so `close` finds it.
+    /// Nothing is listed once the database has begun to close: the closer has
+    /// already swept, and the owner ends the transaction itself.
+    ///
+    /// `committing` is for a transaction whose commit has begun but which had
+    /// no claim until now: the claim starts as committing and is not listed,
+    /// since `close` never aborts a commit that began.
+    pub(super) fn track(engine: &RegolithEngine, committing: bool) -> Arc<Self> {
         let claim = Arc::new(Self {
             id: engine.open_transactions().next_id(),
-            state: AtomicU8::new(OPEN),
+            state: AtomicU8::new(if committing { COMMITTING } else { OPEN }),
             on_abort: Handoff::default(),
         });
-        if !engine.is_closed() {
+        if !committing && !engine.is_closed() {
             engine.open_transactions().insert(Arc::clone(&claim));
         }
         claim
