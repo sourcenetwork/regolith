@@ -8550,25 +8550,29 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let db = Arc::new(Db::open(dir.path(), opts).unwrap());
 
-        // Fill L0 to the stop trigger. Writes go through until the
-        // snapshot after the flush shows L0 >= 2; from then on the
-        // next write would block, so we time it carefully with a
-        // spawned thread.
+        // Fill L0 to the stop trigger. Writes go through until two
+        // memtables are sealed; the worker writes them out to L0, and
+        // from then on the next write would block, so we time it
+        // carefully with a spawned thread.
         let payload = vec![0x12u8; 600];
+        let l0 = || {
+            db.get_int_property("regolith.num-files-at-level0")
+                .unwrap_or(0)
+        };
         for i in 0..32 {
             let k = format!("fill{i:04}");
             db.put(k.as_bytes(), &payload).unwrap();
-            if db
-                .get_int_property("regolith.num-files-at-level0")
-                .unwrap_or(0)
-                >= 2
-            {
+            if l0() + db.engine.frozen_memtables() as u64 >= 2 {
                 break;
             }
         }
-        let l0 = db
-            .get_int_property("regolith.num-files-at-level0")
-            .unwrap_or(0);
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let mut pause = Duration::from_millis(1);
+        while l0() < 2 && Instant::now() < deadline {
+            thread::sleep(pause);
+            pause = (pause * 2).min(Duration::from_millis(50));
+        }
+        let l0 = l0();
         assert!(l0 >= 2, "precondition: need L0 >= 2, got {l0}");
 
         let db_writer = db.clone();

@@ -485,8 +485,16 @@ impl RegolithEngine {
 
     /// Hand `request` to the commit pipeline and block until its group is
     /// durable and applied, or until that group fails, and return what the
-    /// group decided for it.
+    /// group decided for it. Then, on a database with no worker, run the
+    /// bounded step of background work the writes left owing, if any, now
+    /// that this commit holds nothing of the pipeline.
     fn submit_settled(&self, request: WriteRequest) -> io::Result<Settled> {
+        let settled = self.commit_through_pipeline(request);
+        self.run_owed_step();
+        settled
+    }
+
+    fn commit_through_pipeline(&self, request: WriteRequest) -> io::Result<Settled> {
         // Uncontended path: nobody is committing, so lead a group carrying
         // this request plus anything already queued behind it. One fsync
         // covers all of it.

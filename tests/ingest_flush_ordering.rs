@@ -78,6 +78,23 @@ fn frozen_bytes(db: &Db) -> u64 {
     all - active
 }
 
+/// The bytes still frozen once the background has had time to write every
+/// frozen memtable out: a rotation seals on the commit path and the
+/// compaction worker flushes (E9). Waits with a deadline and a bounded
+/// backoff, so a fast machine returns at once and a loaded one still does.
+fn frozen_bytes_once_flushed(db: &Db) -> u64 {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut pause = Duration::from_millis(1);
+    loop {
+        let frozen = frozen_bytes(db);
+        if frozen == 0 || Instant::now() >= deadline {
+            return frozen;
+        }
+        std::thread::sleep(pause);
+        pause = (pause * 2).min(Duration::from_millis(50));
+    }
+}
+
 /// Writes eight 1 KiB values under `prefix`. With a 4 KiB write buffer
 /// that fills the active memtable and rotates it at least once, whatever
 /// it already held.
@@ -470,9 +487,9 @@ fn an_ingest_drains_a_memtable_left_frozen_by_a_failed_flush() {
 }
 
 /// A write that fills the memtable while an ingest writes its table
-/// commits once the table is installed, and its rotation flushes the
-/// memtable it seals as any rotation does, so the write lands above the
-/// file and nothing is left frozen.
+/// commits once the table is installed, and the memtable its rotation seals
+/// is flushed by the background as any sealed memtable is, so the write
+/// lands above the file and nothing is left frozen.
 #[test]
 fn a_write_that_fills_the_memtable_during_an_ingest_lands_above_the_ingested_file() {
     let dir = TempDir::new().unwrap();
@@ -514,7 +531,7 @@ fn a_write_that_fills_the_memtable_during_an_ingest_lands_above_the_ingested_fil
     writer.join().unwrap().unwrap();
 
     assert_eq!(
-        frozen_bytes(&db),
+        frozen_bytes_once_flushed(&db),
         0,
         "a rotation during an ingest left its memtable unflushed"
     );
@@ -535,8 +552,8 @@ fn a_write_that_fills_the_memtable_during_an_ingest_lands_above_the_ingested_fil
 }
 
 /// An ingest that fails after it allocated its sequence lets the writes
-/// issued while it ran commit: they land, a rotation among them flushes
-/// its memtable as usual, and nothing is stranded in memory.
+/// issued while it ran commit: they land, the memtable a rotation among them
+/// seals is flushed as usual, and nothing is stranded in memory.
 #[test]
 fn writes_issued_during_an_ingest_that_fails_commit_once_it_gives_up() {
     let dir = TempDir::new().unwrap();
@@ -574,7 +591,7 @@ fn writes_issued_during_an_ingest_that_fails_commit_once_it_gives_up() {
         "unexpected ingest error: {err}"
     );
     assert_eq!(
-        frozen_bytes(&db),
+        frozen_bytes_once_flushed(&db),
         0,
         "a rotation during a failed ingest left its memtable unflushed"
     );

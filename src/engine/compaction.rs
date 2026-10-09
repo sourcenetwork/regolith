@@ -59,6 +59,11 @@ pub(crate) const DEFAULT_TARGET_FILE_SIZE: u64 = 64 * 1024 * 1024;
 #[cfg(not(target_arch = "wasm32"))]
 const WORKER_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
+/// What a worker runs on every wake-up before it compacts: the engine's
+/// flush of its frozen memtables, oldest first (E9). Set once the engine
+/// exists, which is after its workers start.
+type FlushHook = Arc<std::sync::OnceLock<Box<dyn Fn() + Send + Sync>>>;
+
 /// Manages background compaction on one or more dedicated OS threads.
 pub(crate) struct CompactionScheduler {
     shutdown: Arc<AtomicBool>,
@@ -71,6 +76,8 @@ pub(crate) struct CompactionScheduler {
     /// Joined through the env, so a target that cannot spawn threads
     /// runs compaction in the foreground instead of failing to build.
     handles: Vec<Box<dyn JoinHandle>>,
+    /// The flush the workers run before compacting.
+    flush: FlushHook,
 }
 
 impl CompactionScheduler {
@@ -82,7 +89,20 @@ impl CompactionScheduler {
             trigger,
             pending: Arc::new(AtomicBool::new(false)),
             handles: Vec::new(),
+            flush: FlushHook::default(),
         }
+    }
+
+    /// Whether background workers run here. Without one, a writer that
+    /// seals a memtable or fills L0 owes the work itself (E9, E16).
+    pub(crate) fn has_workers(&self) -> bool {
+        !self.handles.is_empty()
+    }
+
+    /// Install what the workers run before compacting: the engine's flush
+    /// of its frozen memtables. The first call wins; the engine makes one.
+    pub(crate) fn set_flush(&self, flush: Box<dyn Fn() + Send + Sync>) {
+        let _ = self.flush.set(flush);
     }
 
     /// Start one or more background compaction threads.
@@ -159,6 +179,7 @@ impl CompactionScheduler {
                 trigger,
                 pending: Arc::clone(&pending),
                 handles: Vec::with_capacity(worker_count),
+                flush: FlushHook::default(),
             };
 
             for i in 0..worker_count {
@@ -174,9 +195,11 @@ impl CompactionScheduler {
                 let stall_clone = Arc::clone(&stall_signal);
                 let in_progress_clone = Arc::clone(&in_progress);
                 let health_clone = Arc::clone(&health);
+                let flush_clone = Arc::clone(&scheduler.flush);
 
                 let spawned = spawn_worker(&*opts.env, i, move || {
                     compaction_loop(
+                        flush_clone,
                         shutdown_clone,
                         receiver_clone,
                         pending_clone,
@@ -408,6 +431,7 @@ impl Default for CompactionOptions {
 #[cfg(not(target_arch = "wasm32"))]
 #[allow(clippy::too_many_arguments)]
 fn compaction_loop(
+    flush: FlushHook,
     shutdown: Arc<AtomicBool>,
     trigger: Receiver<()>,
     pending: Arc<AtomicBool>,
@@ -434,6 +458,12 @@ fn compaction_loop(
 
         if shutdown.load(Ordering::Acquire) {
             break;
+        }
+        // Frozen memtables first, oldest first: a flush feeds L0, and the
+        // commit path left it to this thread (E9). Not held back by the
+        // compaction backoff, which is about compaction failing.
+        if let Some(flush) = flush.get() {
+            flush();
         }
         if !backoff.ready(Instant::now()) {
             continue;
