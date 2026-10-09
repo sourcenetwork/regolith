@@ -10,12 +10,13 @@
 //! answers "absent", or answers with a stamp below one the same reader
 //! already saw, is a read-path violation.
 //!
-//! A watchdog thread fails the test rather than hanging if the workload
-//! stops making progress, so a lock-order inversion between the version
-//! store and the read view's publish mutex surfaces as a failure
-//! instead of a timeout.
+//! Every workload thread bumps its own progress counter after each
+//! operation, and the coordinator fails the instance with every thread's
+//! stack once any unfinished thread stops advancing, so a deadlock, or a
+//! livelock where some threads spin while one waits forever, surfaces as
+//! a failure instead of a harness timeout.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -65,6 +66,90 @@ fn env(name: &str, default: u64) -> u64 {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(default)
+}
+
+/// One workload thread and the counter it bumps after every operation.
+struct Worker {
+    role: String,
+    beat: Arc<AtomicU64>,
+    handle: thread::JoinHandle<()>,
+}
+
+fn worker(role: String, body: impl FnOnce(&AtomicU64) + Send + 'static) -> Worker {
+    let beat = Arc::new(AtomicU64::new(0));
+    let counter = Arc::clone(&beat);
+    Worker {
+        role,
+        beat,
+        handle: thread::spawn(move || body(&counter)),
+    }
+}
+
+/// Every thread's stack, from whichever debugger the host has: no
+/// in-process API can walk the stack of a thread other than the caller.
+fn stack_dump() -> String {
+    let pid = std::process::id().to_string();
+    let tools: [(&str, &[&str]); 2] = [
+        ("eu-stack", &["-i", "-s", "-p", &pid]),
+        ("gdb", &["-batch", "-ex", "thread apply all bt", "-p", &pid]),
+    ];
+    for (tool, args) in tools {
+        if let Ok(out) = std::process::Command::new(tool).args(args).output()
+            && out.status.success()
+            && !out.stdout.is_empty()
+        {
+            return String::from_utf8_lossy(&out.stdout).into_owned();
+        }
+    }
+    "no stack dump: neither eu-stack nor gdb could attach to this process".to_string()
+}
+
+/// Wait for every worker, failing with a report the moment an unfinished
+/// one has not advanced its counter for `limit`. A live thread that never
+/// advances is the hang this workload hunts, whether everything else is
+/// parked too (a deadlock) or still spinning (a livelock); a watch over
+/// the readers alone misses the second, because they spin until every
+/// writer is done.
+fn watch(workers: &[Worker], db: &Db, limit: Duration) -> Result<(), String> {
+    let mut seen: Vec<(u64, Instant)> = workers
+        .iter()
+        .map(|w| (w.beat.load(Ordering::Relaxed), Instant::now()))
+        .collect();
+    let mut backoff = Duration::from_millis(1);
+    while workers.iter().any(|w| !w.handle.is_finished()) {
+        thread::sleep(backoff);
+        backoff = (backoff * 2).min(Duration::from_millis(200));
+        for (w, (beat, since)) in workers.iter().zip(&mut seen) {
+            let now = w.beat.load(Ordering::Relaxed);
+            if now != *beat {
+                *beat = now;
+                *since = Instant::now();
+            } else if !w.handle.is_finished() && since.elapsed() > limit {
+                let threads: Vec<String> = workers
+                    .iter()
+                    .map(|w| {
+                        let done = w.handle.is_finished();
+                        format!(
+                            "{} done={done} at {}",
+                            w.role,
+                            w.beat.load(Ordering::Relaxed)
+                        )
+                    })
+                    .collect();
+                return Err(format!(
+                    "WEDGED: {} made no progress for {limit:?} at {now} operations\n\
+                     L0 files {:?}, memtable bytes {:?}\n\
+                     threads: {}\n{}",
+                    w.role,
+                    db.get_int_property("regolith.num-files-at-level0"),
+                    db.get_int_property("regolith.cur-size-all-mem-tables"),
+                    threads.join(", "),
+                    stack_dump(),
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Which read surface a reader thread hammers.
@@ -153,24 +238,22 @@ fn run_instance(versions: u64, min_rounds: u64) -> Vec<String> {
     }
 
     let live = Arc::new(AtomicU64::new(WRITERS as u64));
-    let stop = Arc::new(AtomicBool::new(false));
-    let progress = Arc::new(AtomicU64::new(0));
     let bad: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let mask = env("REGOLITH_CHAOS_MASK", 0b1111);
     let enabled = |bit: u64| mask & bit != 0;
-    // `1 +` is the stall probe below, which is spawned unconditionally.
-    let chaos_threads = 1 + [1u64, 2, 4, 8].iter().filter(|b| enabled(**b)).count();
+    let chaos_threads = [1u64, 2, 4, 8].iter().filter(|b| enabled(**b)).count();
     let gate_participants = WRITERS + readers() + chaos_threads + 1;
     let gate = Arc::new(Barrier::new(gate_participants));
-    let mut handles = Vec::new();
+    let mut workers = Vec::new();
 
     for w in 0..WRITERS {
         let (db, live, gate) = (Arc::clone(&db), Arc::clone(&live), Arc::clone(&gate));
-        handles.push(thread::spawn(move || {
+        workers.push(worker(format!("writer {w}"), move |beat| {
             gate.wait();
             for v in 1..=versions {
                 for i in 0..KEYS_PER_WRITER {
                     db.put(&key_of(w, i), &value_of(v)).expect("put");
+                    beat.fetch_add(1, Ordering::Relaxed);
                 }
             }
             live.fetch_sub(1, Ordering::AcqRel);
@@ -179,20 +262,15 @@ fn run_instance(versions: u64, min_rounds: u64) -> Vec<String> {
 
     // Chaos 1: user-thread compact_range.
     if enabled(1) {
-        let (db, live, gate, stop) = (
-            Arc::clone(&db),
-            Arc::clone(&live),
-            Arc::clone(&gate),
-            Arc::clone(&stop),
-        );
-        handles.push(thread::spawn(move || {
+        let (db, live, gate) = (Arc::clone(&db), Arc::clone(&live), Arc::clone(&gate));
+        workers.push(worker("compact_range".to_string(), move |beat| {
             gate.wait();
             let mut n = 0u64;
             loop {
                 db.compact_range(None, None).expect("compact_range");
                 n += 1;
-                if n >= COMPACT_PASSES_PER_INSTANCE
-                    || (n >= 2 && live.load(Ordering::Acquire) == 0 && stop.load(Ordering::Acquire))
+                beat.fetch_add(1, Ordering::Relaxed);
+                if n >= COMPACT_PASSES_PER_INSTANCE || (n >= 2 && live.load(Ordering::Acquire) == 0)
                 {
                     break;
                 }
@@ -202,13 +280,8 @@ fn run_instance(versions: u64, min_rounds: u64) -> Vec<String> {
 
     // Chaos 2: column families created and dropped underneath the readers.
     if enabled(2) {
-        let (db, live, gate, stop) = (
-            Arc::clone(&db),
-            Arc::clone(&live),
-            Arc::clone(&gate),
-            Arc::clone(&stop),
-        );
-        handles.push(thread::spawn(move || {
+        let (db, live, gate) = (Arc::clone(&db), Arc::clone(&live), Arc::clone(&gate));
+        workers.push(worker("cf churn".to_string(), move |beat| {
             gate.wait();
             let mut n = 0u64;
             loop {
@@ -219,7 +292,8 @@ fn run_instance(versions: u64, min_rounds: u64) -> Vec<String> {
                     db.drop_column_family(h).expect("drop_cf");
                 }
                 n += 1;
-                if n >= 2 && live.load(Ordering::Acquire) == 0 && stop.load(Ordering::Acquire) {
+                beat.fetch_add(1, Ordering::Relaxed);
+                if n >= 2 && live.load(Ordering::Acquire) == 0 {
                     break;
                 }
             }
@@ -230,14 +304,9 @@ fn run_instance(versions: u64, min_rounds: u64) -> Vec<String> {
     // keys the readers then have to walk, and an unbounded ingest loop
     // turns the reader cost quadratic in the run length.
     if enabled(4) {
-        let (db, live, gate, stop) = (
-            Arc::clone(&db),
-            Arc::clone(&live),
-            Arc::clone(&gate),
-            Arc::clone(&stop),
-        );
+        let (db, live, gate) = (Arc::clone(&db), Arc::clone(&live), Arc::clone(&gate));
         let ext = ext_dir.path().to_path_buf();
-        handles.push(thread::spawn(move || {
+        workers.push(worker("ingest".to_string(), move |beat| {
             gate.wait();
             let mut n = 0u64;
             loop {
@@ -245,9 +314,8 @@ fn run_instance(versions: u64, min_rounds: u64) -> Vec<String> {
                 db.ingest_external_files(&[p], IngestOptions::default())
                     .expect("ingest");
                 n += 1;
-                if n >= INGESTS_PER_INSTANCE
-                    || (n >= 2 && live.load(Ordering::Acquire) == 0 && stop.load(Ordering::Acquire))
-                {
+                beat.fetch_add(1, Ordering::Relaxed);
+                if n >= INGESTS_PER_INSTANCE || (n >= 2 && live.load(Ordering::Acquire) == 0) {
                     break;
                 }
             }
@@ -257,14 +325,9 @@ fn run_instance(versions: u64, min_rounds: u64) -> Vec<String> {
     // Chaos 4: checkpoint capture, which rotates the memtable and holds
     // the compaction lock.
     if enabled(8) {
-        let (db, live, gate, stop) = (
-            Arc::clone(&db),
-            Arc::clone(&live),
-            Arc::clone(&gate),
-            Arc::clone(&stop),
-        );
+        let (db, live, gate) = (Arc::clone(&db), Arc::clone(&live), Arc::clone(&gate));
         let cp = cp_dir.path().to_path_buf();
-        handles.push(thread::spawn(move || {
+        workers.push(worker("checkpoint".to_string(), move |beat| {
             gate.wait();
             let mut n = 0u64;
             loop {
@@ -272,9 +335,8 @@ fn run_instance(versions: u64, min_rounds: u64) -> Vec<String> {
                 db.checkpoint(&target).expect("checkpoint");
                 std::fs::remove_dir_all(&target).expect("rm checkpoint");
                 n += 1;
-                if n >= CHECKPOINTS_PER_INSTANCE
-                    || (n >= 2 && live.load(Ordering::Acquire) == 0 && stop.load(Ordering::Acquire))
-                {
+                beat.fetch_add(1, Ordering::Relaxed);
+                if n >= CHECKPOINTS_PER_INSTANCE || (n >= 2 && live.load(Ordering::Acquire) == 0) {
                     break;
                 }
             }
@@ -287,15 +349,14 @@ fn run_instance(versions: u64, min_rounds: u64) -> Vec<String> {
             1 => Surface::MultiGet,
             _ => Surface::Iter,
         };
-        let (db, live, gate, bad, progress, keys) = (
+        let (db, live, gate, bad, keys) = (
             Arc::clone(&db),
             Arc::clone(&live),
             Arc::clone(&gate),
             Arc::clone(&bad),
-            Arc::clone(&progress),
             keys.clone(),
         );
-        handles.push(thread::spawn(move || {
+        workers.push(worker(format!("reader {r}"), move |beat| {
             let mut seen = vec![0u64; keys.len()];
             gate.wait();
             let mut round = 0u64;
@@ -320,7 +381,7 @@ fn run_instance(versions: u64, min_rounds: u64) -> Vec<String> {
                     }
                 }
                 round += 1;
-                progress.fetch_add(1, Ordering::Relaxed);
+                beat.fetch_add(1, Ordering::Relaxed);
                 if round >= min_rounds && live.load(Ordering::Acquire) == 0 {
                     break;
                 }
@@ -328,98 +389,37 @@ fn run_instance(versions: u64, min_rounds: u64) -> Vec<String> {
         }));
     }
 
-    // Diagnostic: when the writers stop advancing, report what the
-    // engine's stall inputs look like, so a stalled run says which
-    // threshold is holding it rather than only that it is slow.
-    {
-        let (db, stop) = (Arc::clone(&db), Arc::clone(&stop));
-        let live = Arc::clone(&live);
-        let gate = Arc::clone(&gate);
-        handles.push(thread::spawn(move || {
-            // Counted by the `1 +` in `chaos_threads`, so it must reach
-            // the gate: a participant the barrier is sized for but that
-            // never arrives wedges every other thread forever.
-            gate.wait();
-            let mut ticks = 0u32;
-            while !stop.load(Ordering::Relaxed) && live.load(Ordering::Acquire) > 0 {
-                thread::sleep(Duration::from_secs(5));
-                ticks += 1;
-                if ticks.is_multiple_of(2) {
-                    // `no_slowdown` turns any active stall condition into
-                    // `Error::Busy(reason)`, which names the threshold.
-                    let mut probe_opts = regolith::WriteOptions::new();
-                    probe_opts.no_slowdown = true;
-                    let busy = db.put_opt(&probe_opts, b"__stall_probe", b"1");
-                    eprintln!("stall reason: {busy:?}");
-                    eprintln!(
-                        "stall probe: L0={:?} imm_memtables={:?} all_memtable_bytes={:?} live_writers={}",
-                        db.get_property("regolith.num-files-at-level0"),
-                        db.get_property("regolith.num-entries-imm-mem-tables"),
-                        db.get_property("regolith.cur-size-all-mem-tables"),
-                        live.load(Ordering::Acquire),
-                    );
-                }
-            }
-        }));
-    }
-
-    // Watchdog: a lock-order inversion shows up as no progress at all.
-    let watchdog_stop = Arc::new(AtomicBool::new(false));
-    let wd = {
-        let (progress, watchdog_stop) = (Arc::clone(&progress), Arc::clone(&watchdog_stop));
-        thread::spawn(move || {
-            let mut last = 0u64;
-            let mut stalled_since = Instant::now();
-            while !watchdog_stop.load(Ordering::Relaxed) {
-                thread::sleep(Duration::from_millis(200));
-                let now = progress.load(Ordering::Relaxed);
-                if now != last {
-                    last = now;
-                    stalled_since = Instant::now();
-                } else if stalled_since.elapsed() > Duration::from_secs(120) {
-                    return Some(format!(
-                        "no reader made progress for 120s at {now} rounds; the workload is wedged"
-                    ));
-                }
-            }
-            None
-        })
-    };
-
-    // Every gate participant is also pushed into `handles`, and the
-    // watchdog is not, so this is the whole invariant. A barrier sized
-    // for a thread that never arrives is a permanent, silent wedge -
-    // exactly what happened when the stall probe was added and counted
-    // here without being given a `gate.wait()`. Fail loudly here
-    // instead, before anything blocks.
+    // A barrier sized for a thread that never arrives is a permanent,
+    // silent wedge, so fail loudly here instead, before anything blocks.
     assert_eq!(
-        handles.len() + 1,
+        workers.len() + 1,
         gate_participants,
         "barrier is sized for {gate_participants} threads but {} will reach it \
          (+1 coordinator); every thread counted by the gate must call gate.wait()",
-        handles.len(),
+        workers.len(),
     );
 
     gate.wait();
-    for h in handles.drain(..) {
-        if !h.is_finished() {
-            stop.store(true, Ordering::Release);
-        }
-        h.join().expect("worker panicked");
+    let stall_limit = Duration::from_secs(env("REGOLITH_CHAOS_STALL_SECS", 60));
+    if let Err(wedged) = watch(&workers, &db, stall_limit) {
+        // The wedged threads still use these directories, and they are
+        // what a post-mortem needs, so they outlive the failure.
+        return vec![format!(
+            "{wedged}\ndatabase left at {}, ingest sources at {}, checkpoints at {}",
+            dir.keep().display(),
+            ext_dir.keep().display(),
+            cp_dir.keep().display(),
+        )];
     }
-    stop.store(true, Ordering::Release);
-    watchdog_stop.store(true, Ordering::Relaxed);
-
-    let mut out = std::mem::take(&mut *bad.lock().expect("lock"));
-    if let Some(w) = wd.join().expect("watchdog") {
-        out.push(w);
+    for w in workers {
+        w.handle.join().expect("worker panicked");
     }
-    out
+    std::mem::take(&mut *bad.lock().expect("lock"))
 }
 
 #[test]
 fn the_read_view_survives_compaction_cf_churn_ingest_and_checkpoint() {
-    // Defaults sized for the ordinary gate, measured at 5s. The full
+    // Defaults sized for the ordinary gate, measured at 0.07s. The full
     // workload (6 / 2 / 400 / 40) is `just chaos`, and it is over 20
     // minutes wall and 4h of CPU unoptimized, which is why it is not
     // what `cargo test` runs. Every value is overridable, so a wedge
