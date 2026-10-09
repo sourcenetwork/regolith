@@ -553,6 +553,10 @@ tla:
     check MC_LsmOrder_Green_Demote                     GREEN
     check MC_LsmOrder_Red_DemoteLevelOnly              RED ReadNewest
     check MC_LsmOrder_Red_NoDemotion                   RED ReadNewest
+    # A demoted table's range tombstone, read before any point (E14).
+    spec=LegacyRangeRead
+    check MC_LegacyRangeRead_Green                     GREEN
+    check MC_LegacyRangeRead_Red_NoPreScan             RED ReadNewest
     # E6. Lean: Regolith/BatchView.lean, batch_one_view_newest.
     spec=BatchRead
     check MC_BatchRead_Green                           GREEN
