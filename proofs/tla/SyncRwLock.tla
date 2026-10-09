@@ -1,76 +1,87 @@
 ---- MODULE SyncRwLock ----
-\* regolith::sync::RwLock and ReentrantRwLock (plan 4.11): phase-fair
-\* reader-writer locks on the waiter queue of Sync.tla.
+\* regolith::sync::RwLock and ReentrantRwLock after D49 (barging with bounded
+\* bypass between readers and writers) and D50 (the upgradable read).
 \*
 \* PROVED FOR EVERY SIZE in Lean, proofs/lean/Regolith/Sync.lean: the
-\* waiter queue's laws (at_most_one_owner, fifo_served, no_stranded_waiter,
-\* handed_holds) that each of this lock's two queues obeys. The phase-fair
-\* policy and the reentrant owner rules are checked here only, for three
-\* tasks; no Lean theorem covers them.
+\* barging lock's laws (mutual_exclusion, bounded_bypass, owed_exclusive)
+\* for an exclusive lock, which this lock's write side follows. The
+\* reader-writer sharing, the upgradable read and the reentrant owner rules
+\* are checked here only, for three tasks; no Lean theorem covers them.
 \*
-\* THE DESIGN (plan 4.11). `RwLock<T>`: try_read, try_write, read(),
-\* write(); phase-fair, so readers and writers alternate when both wait and
-\* neither starves. `ReentrantRwLock<T>`: read(owner), write(owner) and try_
-\* forms; an owner holding write may also read; owner-aware queueing, so an
-\* owner never deadlocks on itself behind a queued writer.
-\*
-\* THE POLICY MODELLED. Two FIFO queues, readers and writers.
-\*   - A fresh read enters at once only if no writer holds or waits;
-\*     otherwise it queues. So readers that arrive while a writer waits wait
-\*     for that writer: the read phase in progress does not grow past it.
-\*   - A fresh write enters at once only if nobody holds and nobody waits.
-\*   - When a write phase ends, every queued reader is admitted together:
-\*     the next phase is a read phase, even if writers wait. When a read
-\*     phase ends, the oldest waiting writer is handed the lock.
-\*   - A reentrant request by a task whose Owner already holds what it
-\*     needs (read under its own read or write, write under its own write)
-\*     enters at once, whatever waits. That is what keeps an owner from
-\*     queueing behind a writer that waits for the owner itself.
-\*   - Cancellation as in Sync.tla: a waiting node leaves its queue; a
-\*     granted one passes its guard on. A waiting writer that leaves admits
-\*     the readers that were queued only because of writers.
-\*
-\* DESIGN CHOICES WHERE THE PLAN IS SILENT, recorded in the final report.
-\*   - Upgrade. A task holding a read guard of a ReentrantRwLock, and not
-\*     the write, may not ask for write: it would wait for its own read to
-\*     end. The model does not offer that step; the implementation must
-\*     refuse it with an error, not wait. Another task of the same Owner
-\*     may queue for write while its owner reads: it waits for the other
-\*     task, not for itself.
-\*   - Phase fairness is stated as bounded bypass, the classical form: a
-\*     waiting reader sees at most one write phase begin, and a waiting
-\*     writer sees readers admitted only in the batches that end the write
-\*     phases ahead of it.
+\* THE DESIGN.
+\*   - D49, as for the Mutex (Sync.tla): a fast path that succeeds whenever
+\*     the request fits the lock's state and no handoff is owed, even with
+\*     waiters queued (readers barge past waiting writers, writers past
+\*     waiting readers); every release with waiters wakes the head waiter,
+\*     which competes when polled; a head that loses keeps its place and
+\*     counts the loss; once it has lost Bound times the next release sets
+\*     the owed bit, which shuts barging, and when the holders have drained
+\*     the lock passes straight to the head.
+\*   - D50, `upgradable_read()`: at most one upgradable guard at a time. It
+\*     coexists with plain readers and excludes writers and other
+\*     upgradable guards. `upgrade()` holds new plain readers back, waits
+\*     for the plain readers to drain, then holds write. Only one upgrader
+\*     can exist, and plain readers never wait on the lock while holding a
+\*     guard, so an upgrade never deadlocks. Plain read guards have no
+\*     upgrade method.
 \*
 \* WHAT THE MODEL LEAVES OUT, and why that loses nothing.
-\*   - The queue mechanics. Registration, the re-check after the push, the
-\*     drain token and the node CAS are Sync.tla's, checked there step by
-\*     step. Here a handoff, a cancel and an admission are each one step;
-\*     the wakes that follow a handoff are separate steps, so the order
-\*     handoff, then wake is still checked.
-\*   - Memory ordering: loom's (plan 7.1).
+\*   - The queue mechanics. Registration with the re-check, the drain token,
+\*     the node CAS and the woken bit are Sync.tla's, checked there step by
+\*     step for the same protocol. Here a registration with its re-check, a
+\*     release with the decisions it triggers, a poll and a cancel are each
+\*     one step; the wakes a step decides are separate steps, so handoff
+\*     before wake is still checked.
+\*   - Memory ordering is loom's (plan 7.1).
+\*
+\* DESIGN CHOICES WHERE THE NOTES ARE SILENT, recorded in the report.
+\*   - A release wakes the head even when its request does not fit yet (a
+\*     writer while readers remain): it competes and counts the loss. Only
+\*     so does a writer facing readers that keep overlapping reach Bound.
+\*   - A waiter that takes the lock, or is cancelled, wakes the next head
+\*     if that head's request fits now (consecutive readers enter one after
+\*     another; a dropped head's wake is not lost). An owed handoff passes
+\*     to the next head, or clears when nobody waits.
+\*   - A poll counts a loss only if its own node was notified, which is the
+\*     node's woken bit set by the release that woke it; a spurious poll (a
+\*     stale wake meant for a node since served or dropped) re-registers
+\*     without counting. Counting every poll as a loss let one release's
+\*     late wake cost a re-registered waiter a second loss with no release
+\*     in between to hand it the lock, past Bound (TLC found it).
+\*   - The upgradable read is on the plain RwLock. ReentrantRwLock keeps its
+\*     re-entry rules (read under the owner's read or write, write under
+\*     its write) and has no upgrade: a task holding only read never asks
+\*     for write, and the implementation refuses it.
 \*
 \* CONFIGURATIONS.
-\*   MC_SyncRwLock_Green_Plain       RwLock, three tasks reading and
-\*                                   writing: every invariant, and every
-\*                                   waiter is eventually served.
+\*   MC_SyncRwLock_Green_Plain       RwLock, three tasks each reading,
+\*                                   writing, taking upgradable reads and
+\*                                   upgrading, Bound 1: every safety
+\*                                   invariant.
+\*   MC_SyncRwLock_Green_WriterLive  task 1 writes and upgrades, tasks 2
+\*                                   and 3 read: the writer is served and
+\*                                   the upgrade completes, however the
+\*                                   readers overlap.
+\*   MC_SyncRwLock_Green_ReaderLive  task 1 reads, tasks 2 and 3 write: the
+\*                                   reader is served.
+\*     (Liveness over the all-roles configuration costs minutes on one
+\*     worker; these two roles carry the starvation cases.)
 \*   MC_SyncRwLock_Green_Reentrant   ReentrantRwLock, tasks 1 and 2 of one
-\*                                   owner, nesting up to two guards: every
+\*                                   owner nesting up to two guards: every
 \*                                   safety invariant.
-\*   MC_SyncRwLock_Green_ReentrantLive  the same with one guard per task
-\*                                   (re-entry across the owner's two
-\*                                   tasks): if no owner holds forever,
-\*                                   every waiter is served.
-\*   MC_SyncRwLock_Red_WriterPreference  a write release hands to the next
-\*                                   writer while readers wait:
-\*                                   ReadersWaitOnePhase.
-\*   MC_SyncRwLock_Red_ReaderBarging a fresh read enters while a writer
-\*                                   waits: WritersBoundedBypass.
-\*   MC_SyncRwLock_Red_OwnerUnaware  an owner's second read queues behind a
-\*                                   waiting writer: NoSelfDeadlock.
-\*   MC_SyncRwLock_Red_WriterCancelStrands  a waiting writer leaves and the
-\*                                   readers behind it stay queued:
-\*                                   NoLostWakeup.
+\*   MC_SyncRwLock_Green_ReentrantLive  the same with one guard per task:
+\*                                   if no owner holds forever, every waiter
+\*                                   is served.
+\*   MC_SyncRwLock_Red_UnboundedBarging  the owed bit is never set: readers
+\*                                   keep barging past a writer head:
+\*                                   BoundedBypass.
+\*   MC_SyncRwLock_Red_AnyReaderUpgrade  plain readers may upgrade (the
+\*                                   removed any-reader upgrade): two wait
+\*                                   for each other, NoUpgradeDeadlock.
+\*   MC_SyncRwLock_Red_UpgradeNoHoldBack  new plain readers enter while an
+\*                                   upgrade waits: UpgradeHoldsBack.
+\*   MC_SyncRwLock_Red_OwnerUnaware  an owner's second read queues while it
+\*                                   holds read: NoSelfDeadlock.
 
 EXTENDS Naturals, Sequences, FiniteSets
 
@@ -79,63 +90,81 @@ CONSTANTS
   Kind,      \* "Plain" (RwLock) or "Reentrant" (ReentrantRwLock)
   Owner,     \* [Tasks -> positive naturals]: the Owner token of each task
   MaxDepth,  \* the most guards one task holds at once
-  Watched,   \* the tasks whose liveness is checked: one per role (below)
+  Bound,     \* BOUND: the losses after which the next release hands off
+  Watched,   \* the tasks whose liveness is checked: one per role
+  Asks,      \* [Tasks -> SUBSET {"read", "write", "upread"}]: what each task
+             \* may request (all of them, or a role for a liveness check)
   Mutant     \* "none" for the design, or the name of one defect
 
-\* The value "no owner holds write".
+\* The value "no owner holds write", and "no task".
 NoOwner == 0
 \* Every Owner token some task uses.
 Owners == {Owner[t] : t \in Tasks}
 
 ASSUME Kind \in {"Plain", "Reentrant"}
 ASSUME Tasks \subseteq Nat \ {0} /\ Owners \subseteq Nat \ {0}
-ASSUME MaxDepth \in Nat \ {0} /\ Watched \subseteq Tasks
+ASSUME MaxDepth \in Nat \ {0} /\ Bound \in Nat \ {0} /\ Watched \subseteq Tasks
 ASSUME Kind = "Plain" => MaxDepth = 1 /\ \A t, u \in Tasks : t # u => Owner[t] # Owner[u]
-ASSUME Mutant \in {"none", "WriterPreference", "ReaderBarging", "OwnerUnaware",
-                   "WriterCancelStrands"}
+ASSUME Mutant \in {"none", "UnboundedBarging", "AnyReaderUpgrade", "UpgradeNoHoldBack",
+                   "OwnerUnaware"}
 
 \* Configuration helpers, named in the MC_SyncRwLock_*.cfg files.
 \* Every task is its own Owner (a plain RwLock).
 OwnerEach == [t \in Tasks |-> t]
 \* Tasks 1 and 2 share Owner 1, task 3 is Owner 2.
 OwnerPair == [t \in Tasks |-> IF t = 3 THEN 2 ELSE 1]
+\* Every task may make every request (the reentrant lock has no upgradable
+\* read, so it never asks for one).
+AsksAll == [t \in Tasks |-> IF Kind = "Plain" THEN {"read", "write", "upread"}
+                            ELSE {"read", "write"}]
+\* Task 1 writes and takes upgradable reads; tasks 2 and 3 only read: can
+\* readers that keep overlapping starve a writer or an upgrade?
+AsksWriterVsReaders == [t \in Tasks |-> IF t = 1 THEN {"write", "upread"} ELSE {"read"}]
+\* Task 1 only reads; tasks 2 and 3 only write: can writers starve a reader?
+AsksReaderVsWriters == [t \in Tasks |-> IF t = 1 THEN {"read"} ELSE {"write"}]
 
 VARIABLES
-  rd,      \* [Tasks -> Nat]: read guards each task holds
-  wr,      \* [Tasks -> Nat]: write guards each task holds
-  rdepth,  \* [Owners -> Nat]: the lock's per-owner read depth
-  wowner,  \* the Owner holding write, or NoOwner
-  wdepth,  \* write guards out
-  rq,      \* queued readers, oldest first
-  wq,      \* queued writers, oldest first
-  node,    \* [Tasks -> {"none", "waiting", "granted"}]
-  want,    \* [Tasks -> {"read", "write"}]: what a queued task waits for
-  woken,   \* [Tasks -> BOOLEAN]: Waker::wake ran since it was registered
-  towake,  \* [Tasks -> SUBSET Tasks]: waiters a task handed to, not yet woken
-  ret,     \* [Tasks -> pc]: where a task resumes once its wakes are done
-  pc,      \* [Tasks -> {"idle", "holding", "parked", "wake"}]
-  wph,     \* ghost [Tasks -> Nat]: write phases begun while a reader waits
-  bypass,  \* ghost [Tasks -> Nat]: readers admitted while a writer waits
-  ahead    \* ghost [Tasks -> Nat]: writers queued ahead of a writer at enqueue
+  rd,         \* [Tasks -> Nat]: plain read guards each task holds
+  wr,         \* [Tasks -> Nat]: write guards each task holds
+  up,         \* [Tasks -> 0..1]: the upgradable guard, held or not
+  rdepth,     \* [Owners -> Nat]: the lock's per-owner read depth
+  wowner,     \* the Owner holding write, or NoOwner
+  wdepth,     \* write guards out
+  uholder,    \* the task holding the upgradable guard, or 0
+  upgrading,  \* the upgradable holder waits to upgrade: plain readers held back
+  q,          \* the waiter queue, oldest first
+  want,       \* [Tasks -> {"read", "write", "upread"}]: what a waiter asks for
+  node,       \* [Tasks -> {"none", "waiting", "handed"}]
+  bypass,     \* [Tasks -> Nat]: the node's bypass count
+  lost,       \* ghost [Tasks -> Nat]: races lost during the current request
+  woken,      \* [Tasks -> BOOLEAN]: Waker::wake ran since it was registered
+  owed,       \* the handoff-owed bit: barging is shut
+  towake,     \* [Tasks -> SUBSET Tasks]: waiters a task has yet to wake
+  ret,        \* [Tasks -> pc]: where a task resumes once its wakes are done
+  pc,         \* [Tasks -> {"idle", "holding", "parked", "upwait", "rupwait", "wake"}]
+  bargedOwed, \* ghost: a fast-path entry while a handoff was owed
+  readInUpgrade \* ghost: a plain reader entered while an upgrade waited
 
 \* Every variable, so a step that changes none of them is a stutter.
-vars == <<rd, wr, rdepth, wowner, wdepth, rq, wq, node, want, woken, towake,
-          ret, pc, wph, bypass, ahead>>
+vars == <<rd, wr, up, rdepth, wowner, wdepth, uholder, upgrading, q, want, node,
+          bypass, lost, woken, owed, towake, ret, pc, bargedOwed, readInUpgrade>>
 
 ----------------------------------------------------------------------------
-\* The lock's words as one record, so a guard drop and the handoff it
-\* triggers compose as functions: L1 == Drop(L), L2 == Handoff(L1).
+\* The lock's words as one record, so a guard drop and the decisions it
+\* triggers compose as functions: L1 == Drop(L), L2 == Dispatch(L1).
 
 \* The current lock state.
-Lock == [rd |-> rd, wr |-> wr, rdepth |-> rdepth, wowner |-> wowner,
-         wdepth |-> wdepth, rq |-> rq, wq |-> wq, node |-> node,
-         wph |-> wph, bypass |-> bypass, ahead |-> ahead]
+Lock == [rd |-> rd, wr |-> wr, up |-> up, rdepth |-> rdepth, wowner |-> wowner,
+         wdepth |-> wdepth, uholder |-> uholder, upgrading |-> upgrading, q |-> q,
+         node |-> node, bypass |-> bypass, lost |-> lost, woken |-> woken,
+         owed |-> owed, wake |-> {}]
 
 \* Make lock state L the next state.
 Apply(L) ==
-  /\ rd' = L.rd /\ wr' = L.wr /\ rdepth' = L.rdepth /\ wowner' = L.wowner
-  /\ wdepth' = L.wdepth /\ rq' = L.rq /\ wq' = L.wq /\ node' = L.node
-  /\ wph' = L.wph /\ bypass' = L.bypass /\ ahead' = L.ahead
+  /\ rd' = L.rd /\ wr' = L.wr /\ up' = L.up /\ rdepth' = L.rdepth
+  /\ wowner' = L.wowner /\ wdepth' = L.wdepth /\ uholder' = L.uholder
+  /\ upgrading' = L.upgrading /\ q' = L.q /\ node' = L.node /\ bypass' = L.bypass
+  /\ lost' = L.lost /\ woken' = L.woken /\ owed' = L.owed
 
 \* The set of elements of a sequence.
 Range(s) == {s[i] : i \in 1..Len(s)}
@@ -145,88 +174,113 @@ RECURSIVE SumOf(_, _)
 SumOf(f, S) == IF S = {} THEN 0
                ELSE LET x == CHOOSE y \in S : TRUE IN f[x] + SumOf(f, S \ {x})
 
-\* No owner holds a read guard in L.
+\* No owner holds a plain read guard in L.
 NoReaders(L) == \A o \in Owners : L.rdepth[o] = 0
 
-\* Task t waits in L's queues for `w` ("read" or "write").
-WaitsFor(L, t, w) == L.node[t] = "waiting" /\ want[t] = w
+\* A request of kind w fits lock state L now (ignoring the owed bit):
+\* a read while no writer holds and no upgrade holds readers back (mutant
+\* UpgradeNoHoldBack: whatever the upgrade); an upgradable read while no
+\* writer and no other upgradable guard hold; a write while nobody holds.
+Fits(L, w) ==
+  CASE w = "read"   -> L.wowner = NoOwner /\ (~L.upgrading \/ Mutant = "UpgradeNoHoldBack")
+    [] w = "upread" -> L.wowner = NoOwner /\ L.uholder = 0
+    [] OTHER        -> L.wowner = NoOwner /\ NoReaders(L) /\ L.uholder = 0
 
-\* Admit every queued reader at once. Each waiting writer counts them as
-\* readers that passed it.
-AdmitAll(L) ==
-  LET R == Range(L.rq) IN
-  [L EXCEPT !.rd     = [t \in Tasks |-> IF t \in R THEN L.rd[t] + 1 ELSE L.rd[t]],
-            !.rdepth = [o \in Owners |-> L.rdepth[o] + Cardinality({t \in R : Owner[t] = o})],
-            !.node   = [t \in Tasks |-> IF t \in R THEN "granted" ELSE L.node[t]],
-            !.rq     = <<>>,
-            !.wph    = [t \in Tasks |-> IF t \in R THEN 0 ELSE L.wph[t]],
-            !.bypass = [t \in Tasks |-> IF WaitsFor(L, t, "write")
-                                          THEN L.bypass[t] + Cardinality(R) ELSE L.bypass[t]]]
+\* Task t enters lock state L with a guard of kind w.
+Enter(L, t, w) ==
+  CASE w = "read" ->
+         [L EXCEPT !.rd = [@ EXCEPT ![t] = @ + 1],
+                   !.rdepth = [@ EXCEPT ![Owner[t]] = @ + 1]]
+    [] w = "upread" ->
+         [L EXCEPT !.up = [@ EXCEPT ![t] = 1], !.uholder = t]
+    [] OTHER ->
+         [L EXCEPT !.wr = [@ EXCEPT ![t] = @ + 1], !.wowner = Owner[t],
+                   !.wdepth = @ + 1]
 
-\* Hand write to the oldest waiting writer: a write phase begins, and each
-\* waiting reader counts it.
-GrantWriter(L) ==
-  LET w == Head(L.wq) IN
-  [L EXCEPT !.wr     = [L.wr EXCEPT ![w] = @ + 1],
-            !.wowner = Owner[w],
-            !.wdepth = 1,
-            !.node   = [L.node EXCEPT ![w] = "granted"],
-            !.wq     = Tail(L.wq),
-            !.bypass = [L.bypass EXCEPT ![w] = 0],
-            !.ahead  = [L.ahead EXCEPT ![w] = 0],
-            !.wph    = [t \in Tasks |-> IF WaitsFor(L, t, "read") THEN L.wph[t] + 1 ELSE L.wph[t]]]
+\* The head is served by handoff: one is owed already, or it has lost
+\* Bound times. (Mutant UnboundedBarging: only if owed already.)
+HandoffMode(L, h) == L.owed \/ (L.bypass[h] >= Bound /\ Mutant # "UnboundedBarging")
 
-\* After a write guard drops. If the write phase ended, the readers queued
-\* during it go next, all together; with none queued, the oldest writer
-\* (once no reader holds). Mutant WriterPreference: the next writer goes
-\* first.
-AfterWrite(L) ==
-  IF L.wowner # NoOwner THEN L
-  ELSE IF Mutant = "WriterPreference" /\ L.wq # <<>> /\ NoReaders(L) THEN GrantWriter(L)
-  ELSE IF L.rq # <<>> THEN AdmitAll(L)
-  ELSE IF L.wq # <<>> /\ NoReaders(L) THEN GrantWriter(L)
+\* Task h is woken already, or a wake for it is decided and not delivered.
+Notified(L, h) == L.woken[h] \/ h \in L.wake \/ \E d \in Tasks : h \in towake[d]
+
+\* Wake task h: its woken bit is set when the wake is delivered (by the
+\* deciding task, in later steps); here it joins the wake list.
+WakeIn(L, h) == [L EXCEPT !.wake = @ \cup {h}]
+
+\* The queue step after anything that may let the head proceed. With
+\* nobody queued, an owed bit clears. In handoff mode the owed bit is set
+\* and, if the head's request fits, the lock passes to it: it is popped,
+\* holds its guard, and is woken. Otherwise the head is woken if it is not
+\* already and either `release` says a release just happened (it then
+\* competes, even if it does not fit) or its request fits now.
+QueueStep(L, release) ==
+  IF L.q = <<>> THEN [L EXCEPT !.owed = FALSE]
+  ELSE LET h == Head(L.q) IN
+       IF HandoffMode(L, h)
+         THEN IF Fits(L, want[h])
+                THEN WakeIn([Enter(L, h, want[h]) EXCEPT !.owed = TRUE,
+                               !.node = [@ EXCEPT ![h] = "handed"],
+                               !.q = Tail(@)], h)
+                ELSE [L EXCEPT !.owed = TRUE]
+         ELSE IF ~Notified(L, h) /\ (release \/ Fits(L, want[h]))
+                THEN WakeIn(L, h)
+                ELSE L
+
+\* The upgrade step: an upgradable holder that waits gets write once no
+\* plain reader remains (it is woken). Mutant AnyReaderUpgrade: a plain
+\* reader waiting to upgrade gets write once it is the only reader.
+UpgradeStep(L) ==
+  IF L.upgrading /\ L.uholder # 0 /\ pc[L.uholder] = "upwait" /\ NoReaders(L)
+     /\ L.wowner = NoOwner
+    THEN LET u == L.uholder IN
+         WakeIn([L EXCEPT !.up = [@ EXCEPT ![u] = 0], !.uholder = 0,
+                          !.upgrading = FALSE,
+                          !.wr = [@ EXCEPT ![u] = 1], !.wowner = Owner[u],
+                          !.wdepth = 1], u)
+  ELSE IF Mutant = "AnyReaderUpgrade" /\ L.upgrading /\ L.wowner = NoOwner /\ L.uholder = 0
+       /\ \E r \in Tasks : pc[r] = "rupwait" /\ SumOf(L.rd, Tasks) = L.rd[r]
+    THEN LET r == CHOOSE x \in Tasks : pc[x] = "rupwait" /\ SumOf(L.rd, Tasks) = L.rd[x] IN
+         WakeIn([L EXCEPT !.rd = [@ EXCEPT ![r] = 0],
+                          !.rdepth = [@ EXCEPT ![Owner[r]] = @ - L.rd[r]],
+                          !.upgrading = FALSE,
+                          !.wr = [@ EXCEPT ![r] = 1], !.wowner = Owner[r],
+                          !.wdepth = 1], r)
   ELSE L
 
-\* After a read guard drops. If the read phase ended, the oldest writer
-\* goes next. (Readers queue only behind writers, so with no writer left
-\* the queued readers enter.)
-AfterRead(L) ==
-  IF L.wowner # NoOwner \/ ~NoReaders(L) THEN L
-  ELSE IF L.wq # <<>> THEN GrantWriter(L)
-  ELSE IF L.rq # <<>> THEN AdmitAll(L)
-  ELSE L
+\* Everything a release triggers: the upgrade step, then the queue step.
+Dispatch(L) == QueueStep(UpgradeStep(L), TRUE)
 
-\* After a waiting writer leaves its queue: if no writer holds or waits any
-\* more, the readers queued behind writers enter. Mutant
-\* WriterCancelStrands: they stay queued.
-AfterWriterLeaves(L) ==
-  IF Mutant # "WriterCancelStrands" /\ L.wq = <<>> /\ L.wowner = NoOwner /\ L.rq # <<>>
-    THEN AdmitAll(L)
-    ELSE L
-
-\* Task t drops one read guard.
+\* Task t drops one plain read guard.
 DropRead(L, t) ==
-  [L EXCEPT !.rd = [@ EXCEPT ![t] = @ - 1],
-            !.rdepth = [@ EXCEPT ![Owner[t]] = @ - 1]]
+  [L EXCEPT !.rd = [@ EXCEPT ![t] = @ - 1], !.rdepth = [@ EXCEPT ![Owner[t]] = @ - 1]]
 
 \* Task t drops one write guard; the last one frees write.
 DropWrite(L, t) ==
-  [L EXCEPT !.wr = [@ EXCEPT ![t] = @ - 1],
-            !.wdepth = @ - 1,
+  [L EXCEPT !.wr = [@ EXCEPT ![t] = @ - 1], !.wdepth = @ - 1,
             !.wowner = IF L.wdepth = 1 THEN NoOwner ELSE L.wowner]
 
-\* The waiters a step handed the lock to: waiting in L1, granted in L2.
-Granted(L1, L2) == {t \in Tasks : L1.node[t] = "waiting" /\ L2.node[t] = "granted"}
+\* Task t drops its upgradable guard.
+DropUp(L, t) == [L EXCEPT !.up = [@ EXCEPT ![t] = 0], !.uholder = 0]
 
-\* Task t ends its step: if it handed the lock to anyone it goes on to wake
-\* them, and resumes at `next` afterwards.
-Finish(t, G, next) ==
-  IF G = {}
-    THEN /\ pc' = [pc EXCEPT ![t] = next]
-         /\ UNCHANGED <<towake, ret>>
-    ELSE /\ pc' = [pc EXCEPT ![t] = "wake"]
-         /\ towake' = [towake EXCEPT ![t] = G]
-         /\ ret' = [ret EXCEPT ![t] = next]
+\* Task t ends its step with lock state L: it goes on to deliver L's wakes
+\* (if any), then resumes at `next`. Undelivered wakes addressed to the
+\* requests of the tasks in `gone`, which have just left the queue, are
+\* dropped: a wake belongs to a node, and one reaching a task whose node is
+\* gone finds no notified node, so the poll it causes is spurious and
+\* counts no loss (design rule below).
+FinishDrop(t, L, next, gone) ==
+  /\ Apply(L)
+  /\ IF L.wake = {}
+       THEN /\ pc' = [pc EXCEPT ![t] = next]
+            /\ towake' = [d \in Tasks |-> towake[d] \ gone]
+            /\ UNCHANGED ret
+       ELSE /\ pc' = [pc EXCEPT ![t] = "wake"]
+            /\ towake' = [d \in Tasks |-> IF d = t THEN L.wake ELSE towake[d] \ gone]
+            /\ ret' = [ret EXCEPT ![t] = next]
+
+\* Finish with no request leaving the queue.
+Finish(t, L, next) == FinishDrop(t, L, next, {})
 
 \* Task t's Owner already holds the lock in a mode that covers a read.
 OwnerCoversRead(t) ==
@@ -234,83 +288,86 @@ OwnerCoversRead(t) ==
   /\ \/ wowner = Owner[t]
      \/ rdepth[Owner[t]] > 0 /\ Mutant # "OwnerUnaware"
 
+\* The guards task t holds.
+Guards(t) == rd[t] + wr[t] + up[t]
+
 ----------------------------------------------------------------------------
 \* Actions.
 
-\* read() / read(owner) / try_read. Re-entry when the owner covers it;
-\* otherwise in at once only when no writer holds or waits (mutant
-\* ReaderBarging: when no writer holds); otherwise queue.
-Read(t) ==
+\* read(), upgradable_read() or write(), first poll, or a reentrant entry.
+\* A reentrant request the owner covers enters at once. Otherwise the fast
+\* path enters if the request fits and no handoff is owed, barging past any
+\* waiters; if not, the task registers at the tail (and its re-check, here
+\* the same instant, fails as well).
+Request(t, w) ==
   /\ pc[t] \in {"idle", "holding"}
-  /\ rd[t] + wr[t] < MaxDepth
-  /\ IF OwnerCoversRead(t)
-       THEN /\ rd' = [rd EXCEPT ![t] = @ + 1]
-            /\ rdepth' = [rdepth EXCEPT ![Owner[t]] = @ + 1]
-            /\ pc' = [pc EXCEPT ![t] = "holding"]
-            /\ UNCHANGED <<wr, wowner, wdepth, rq, wq, node, want, woken, wph, bypass, ahead>>
-       ELSE IF wowner = NoOwner /\ (wq = <<>> \/ Mutant = "ReaderBarging")
-       THEN /\ rd' = [rd EXCEPT ![t] = @ + 1]
-            /\ rdepth' = [rdepth EXCEPT ![Owner[t]] = @ + 1]
-            /\ bypass' = [u \in Tasks |-> IF WaitsFor(Lock, u, "write") THEN bypass[u] + 1 ELSE bypass[u]]
-            /\ pc' = [pc EXCEPT ![t] = "holding"]
-            /\ UNCHANGED <<wr, wowner, wdepth, rq, wq, node, want, woken, wph, ahead>>
-       ELSE /\ rq' = Append(rq, t)
-            /\ node' = [node EXCEPT ![t] = "waiting"]
-            /\ want' = [want EXCEPT ![t] = "read"]
-            /\ woken' = [woken EXCEPT ![t] = FALSE]
-            /\ pc' = [pc EXCEPT ![t] = "parked"]
-            /\ UNCHANGED <<rd, wr, rdepth, wowner, wdepth, wq, wph, bypass, ahead>>
-  /\ UNCHANGED <<towake, ret>>
+  /\ w \in Asks[t]
+  /\ Guards(t) < MaxDepth
+  /\ w = "upread" => Kind = "Plain"
+  \* A task holding only plain read never asks for write: no upgrade method.
+  /\ w = "write" => (rd[t] = 0 \/ wowner = Owner[t])
+  /\ LET reenter == \/ w = "read" /\ OwnerCoversRead(t)
+                    \/ w = "write" /\ Kind = "Reentrant" /\ wowner = Owner[t]
+     IN IF reenter
+          THEN /\ Apply(Enter(Lock, t, w))
+               /\ pc' = [pc EXCEPT ![t] = "holding"]
+               /\ UNCHANGED <<want, towake, ret, bargedOwed, readInUpgrade>>
+        ELSE IF Fits(Lock, w) /\ ~owed
+          THEN /\ Apply(Enter(Lock, t, w))
+               /\ pc' = [pc EXCEPT ![t] = "holding"]
+               /\ bargedOwed' = (bargedOwed \/ owed)
+               /\ readInUpgrade' = (readInUpgrade \/ (w = "read" /\ upgrading))
+               /\ UNCHANGED <<want, towake, ret>>
+        ELSE /\ q' = Append(q, t)
+             /\ node' = [node EXCEPT ![t] = "waiting"]
+             /\ want' = [want EXCEPT ![t] = w]
+             /\ bypass' = [bypass EXCEPT ![t] = 0]
+             /\ lost' = [lost EXCEPT ![t] = 0]
+             /\ woken' = [woken EXCEPT ![t] = FALSE]
+             /\ pc' = [pc EXCEPT ![t] = "parked"]
+             /\ UNCHANGED <<rd, wr, up, rdepth, wowner, wdepth, uholder, upgrading,
+                            owed, towake, ret, bargedOwed, readInUpgrade>>
 
-\* write() / write(owner) / try_write. Re-entry under the owner's own
-\* write; a task holding only read may not ask (no upgrade); otherwise in at
-\* once only when nobody holds or waits; otherwise queue.
-Write(t) ==
-  /\ pc[t] \in {"idle", "holding"}
-  /\ rd[t] + wr[t] < MaxDepth
-  /\ IF Kind = "Reentrant" /\ wowner = Owner[t]
-       THEN /\ wr' = [wr EXCEPT ![t] = @ + 1]
-            /\ wdepth' = wdepth + 1
-            /\ pc' = [pc EXCEPT ![t] = "holding"]
-            /\ UNCHANGED <<rd, rdepth, wowner, rq, wq, node, want, woken, wph, bypass, ahead>>
-       ELSE /\ rd[t] = 0
-            /\ IF wowner = NoOwner /\ NoReaders(Lock) /\ wq = <<>> /\ rq = <<>>
-                 THEN /\ wr' = [wr EXCEPT ![t] = 1]
-                      /\ wowner' = Owner[t]
-                      /\ wdepth' = 1
-                      /\ pc' = [pc EXCEPT ![t] = "holding"]
-                      /\ UNCHANGED <<rd, rdepth, rq, wq, node, want, woken, wph, bypass, ahead>>
-                 ELSE /\ wq' = Append(wq, t)
-                      /\ node' = [node EXCEPT ![t] = "waiting"]
-                      /\ want' = [want EXCEPT ![t] = "write"]
-                      /\ woken' = [woken EXCEPT ![t] = FALSE]
-                      /\ ahead' = [ahead EXCEPT ![t] = Len(wq)]
-                      /\ pc' = [pc EXCEPT ![t] = "parked"]
-                      /\ UNCHANGED <<rd, wr, rdepth, wowner, wdepth, rq, wph, bypass>>
-  /\ UNCHANGED <<towake, ret>>
-
-\* A read guard drops, and the handoff it triggers happens with it.
-ReleaseRead(t) ==
+\* A guard drops; everything it triggers happens with it.
+Release(t) ==
   /\ pc[t] = "holding"
-  /\ rd[t] > 0
-  /\ LET L1 == DropRead(Lock, t)
-         L2 == AfterRead(L1)
-     IN /\ Apply(L2)
-        /\ Finish(t, Granted(L1, L2), IF L2.rd[t] + L2.wr[t] > 0 THEN "holding" ELSE "idle")
-  /\ UNCHANGED <<want, woken>>
+  /\ \/ rd[t] > 0 /\ Finish(t, Dispatch(DropRead(Lock, t)), IF Guards(t) > 1 THEN "holding" ELSE "idle")
+     \/ wr[t] > 0 /\ Finish(t, Dispatch(DropWrite(Lock, t)), IF Guards(t) > 1 THEN "holding" ELSE "idle")
+     \/ up[t] > 0 /\ ~upgrading /\ Finish(t, Dispatch(DropUp(Lock, t)), "idle")
+  /\ UNCHANGED <<want, bargedOwed, readInUpgrade>>
 
-\* A write guard drops, and the handoff it triggers happens with it.
-ReleaseWrite(t) ==
+\* upgrade() on the upgradable guard: with no plain reader left, write at
+\* once; otherwise hold new plain readers back and wait for them to drain.
+Upgrade(t) ==
   /\ pc[t] = "holding"
-  /\ wr[t] > 0
-  /\ LET L1 == DropWrite(Lock, t)
-         L2 == AfterWrite(L1)
-     IN /\ Apply(L2)
-        /\ Finish(t, Granted(L1, L2), IF L2.rd[t] + L2.wr[t] > 0 THEN "holding" ELSE "idle")
-  /\ UNCHANGED <<want, woken>>
+  /\ up[t] = 1
+  /\ IF NoReaders(Lock)
+       THEN /\ up' = [up EXCEPT ![t] = 0]
+            /\ uholder' = 0
+            /\ wr' = [wr EXCEPT ![t] = 1]
+            /\ wowner' = Owner[t]
+            /\ wdepth' = 1
+            /\ UNCHANGED <<upgrading, pc>>
+       ELSE /\ upgrading' = TRUE
+            /\ pc' = [pc EXCEPT ![t] = "upwait"]
+            /\ UNCHANGED <<up, uholder, wr, wowner, wdepth>>
+  /\ UNCHANGED <<rd, rdepth, q, want, node, bypass, lost, woken, owed, towake, ret,
+                 bargedOwed, readInUpgrade>>
 
-\* A task that handed the lock over wakes those it handed to, one per step,
-\* after the handoff.
+\* Mutant AnyReaderUpgrade only: a plain reader asks to upgrade, holds new
+\* readers back, and waits to be the only reader. (The upgradable guard
+\* stays unused in that configuration.)
+ReaderUpgrade(t) ==
+  /\ Mutant = "AnyReaderUpgrade"
+  /\ pc[t] = "holding"
+  /\ rd[t] = 1 /\ wr[t] = 0 /\ up[t] = 0 /\ uholder = 0
+  /\ upgrading' = TRUE
+  /\ pc' = [pc EXCEPT ![t] = "rupwait"]
+  /\ UNCHANGED <<rd, wr, up, rdepth, wowner, wdepth, uholder, q, want, node, bypass,
+                 lost, woken, owed, towake, ret, bargedOwed, readInUpgrade>>
+
+\* A task delivers the wakes it decided, one per step, after the handoffs
+\* they announce.
 Wake(t) ==
   /\ pc[t] = "wake"
   /\ IF towake[t] = {}
@@ -321,40 +378,64 @@ Wake(t) ==
               /\ woken' = [woken EXCEPT ![u] = TRUE]
               /\ towake' = [towake EXCEPT ![t] = @ \ {u}]
               /\ UNCHANGED <<pc, ret>>
-  /\ UNCHANGED <<rd, wr, rdepth, wowner, wdepth, rq, wq, node, want, wph, bypass, ahead>>
+  /\ UNCHANGED <<rd, wr, up, rdepth, wowner, wdepth, uholder, upgrading, q, want,
+                 node, bypass, lost, owed, bargedOwed, readInUpgrade>>
 
-\* The executor polls a woken future: granted, it holds its guard;
-\* otherwise it registers its waker again.
+\* The executor polls a woken waiter. Handed: it holds its guard; the owed
+\* bit clears. Otherwise it tries its fast path (only the head is ever
+\* woken, and an owed handoff is its own): entering, it leaves the queue.
+\* Either way the next head is woken if its request fits now. Losing: it
+\* keeps its place, counts the loss, and registers its waker again.
 Poll(t) ==
   /\ pc[t] = "parked"
   /\ woken[t]
-  /\ woken' = [woken EXCEPT ![t] = FALSE]
-  /\ IF node[t] = "granted"
-       THEN /\ node' = [node EXCEPT ![t] = "none"]
-            /\ pc' = [pc EXCEPT ![t] = "holding"]
-       ELSE UNCHANGED <<node, pc>>
-  /\ UNCHANGED <<rd, wr, rdepth, wowner, wdepth, rq, wq, want, towake, ret, wph, bypass, ahead>>
+  /\ IF node[t] = "handed"
+       THEN FinishDrop(t, QueueStep([Lock EXCEPT !.node = [@ EXCEPT ![t] = "none"],
+                                         !.woken = [@ EXCEPT ![t] = FALSE],
+                                         !.owed = FALSE,
+                                         !.bypass = [@ EXCEPT ![t] = 0],
+                                         !.lost = [@ EXCEPT ![t] = 0]], FALSE), "holding", {t})
+     ELSE IF Fits(Lock, want[t]) /\ ~owed
+       THEN FinishDrop(t, QueueStep([Enter(Lock, t, want[t]) EXCEPT
+                                         !.node = [@ EXCEPT ![t] = "none"],
+                                         !.woken = [@ EXCEPT ![t] = FALSE],
+                                         !.q = SelectSeq(@, LAMBDA u : u # t),
+                                         !.bypass = [@ EXCEPT ![t] = 0],
+                                         !.lost = [@ EXCEPT ![t] = 0]], FALSE), "holding", {t})
+     ELSE /\ lost' = [lost EXCEPT ![t] = @ + 1]
+          /\ bypass' = [bypass EXCEPT ![t] = @ + 1]
+          /\ woken' = [woken EXCEPT ![t] = FALSE]
+          /\ UNCHANGED <<rd, wr, up, rdepth, wowner, wdepth, uholder, upgrading, q,
+                         node, owed, towake, ret, pc>>
+  /\ UNCHANGED <<want, bargedOwed, readInUpgrade>>
 
-\* The pending future is dropped. A waiting node leaves its queue (a writer
-\* leaving may let the readers behind it in). A granted one passes its
-\* guard on through the same handoff as a release.
+\* The upgrader, woken after the last plain reader left, holds write.
+UpPoll(t) ==
+  /\ pc[t] \in {"upwait", "rupwait"}
+  /\ woken[t]
+  /\ wr[t] > 0
+  /\ woken' = [woken EXCEPT ![t] = FALSE]
+  /\ pc' = [pc EXCEPT ![t] = "holding"]
+  /\ UNCHANGED <<rd, wr, up, rdepth, wowner, wdepth, uholder, upgrading, q, want, node,
+                 bypass, lost, owed, towake, ret, bargedOwed, readInUpgrade>>
+
+\* The pending future is dropped. A waiting node leaves the queue, and the
+\* next head is woken if its request fits (a wake the dropped head had is
+\* passed on; an owed handoff passes to it, or clears). A handed one drops
+\* the guard it was handed, through the same steps as a release.
 Cancel(t) ==
   /\ pc[t] = "parked"
-  /\ woken' = [woken EXCEPT ![t] = FALSE]
   /\ LET L0 == [Lock EXCEPT !.node = [@ EXCEPT ![t] = "none"],
-                            !.wph = [@ EXCEPT ![t] = 0],
+                            !.woken = [@ EXCEPT ![t] = FALSE],
                             !.bypass = [@ EXCEPT ![t] = 0],
-                            !.ahead = [@ EXCEPT ![t] = 0]]
-         L1 == IF node[t] = "waiting"
-                 THEN [L0 EXCEPT !.rq = SelectSeq(@, LAMBDA u : u # t),
-                                 !.wq = SelectSeq(@, LAMBDA u : u # t)]
-               ELSE IF want[t] = "read" THEN DropRead(L0, t) ELSE DropWrite(L0, t)
-         L2 == IF node[t] = "waiting"
-                 THEN IF want[t] = "write" THEN AfterWriterLeaves(L1) ELSE L1
-               ELSE IF want[t] = "read" THEN AfterRead(L1) ELSE AfterWrite(L1)
-     IN /\ Apply(L2)
-        /\ Finish(t, Granted(L1, L2), "idle")
-  /\ UNCHANGED want
+                            !.lost = [@ EXCEPT ![t] = 0]]
+     IN IF node[t] = "waiting"
+          THEN FinishDrop(t, QueueStep([L0 EXCEPT !.q = SelectSeq(@, LAMBDA u : u # t)], FALSE),
+                          "idle", {t})
+        ELSE IF want[t] = "read" THEN FinishDrop(t, Dispatch(DropRead(L0, t)), "idle", {t})
+        ELSE IF want[t] = "upread" THEN FinishDrop(t, Dispatch(DropUp(L0, t)), "idle", {t})
+        ELSE FinishDrop(t, Dispatch(DropWrite(L0, t)), "idle", {t})
+  /\ UNCHANGED <<want, bargedOwed, readInUpgrade>>
 
 ----------------------------------------------------------------------------
 \* The specification.
@@ -363,33 +444,39 @@ Cancel(t) ==
 Init ==
   /\ rd = [t \in Tasks |-> 0]
   /\ wr = [t \in Tasks |-> 0]
+  /\ up = [t \in Tasks |-> 0]
   /\ rdepth = [o \in Owners |-> 0]
   /\ wowner = NoOwner
   /\ wdepth = 0
-  /\ rq = <<>>
-  /\ wq = <<>>
-  /\ node = [t \in Tasks |-> "none"]
+  /\ uholder = 0
+  /\ upgrading = FALSE
+  /\ q = <<>>
   /\ want = [t \in Tasks |-> "read"]
+  /\ node = [t \in Tasks |-> "none"]
+  /\ bypass = [t \in Tasks |-> 0]
+  /\ lost = [t \in Tasks |-> 0]
   /\ woken = [t \in Tasks |-> FALSE]
+  /\ owed = FALSE
   /\ towake = [t \in Tasks |-> {}]
   /\ ret = [t \in Tasks |-> "idle"]
   /\ pc = [t \in Tasks |-> "idle"]
-  /\ wph = [t \in Tasks |-> 0]
-  /\ bypass = [t \in Tasks |-> 0]
-  /\ ahead = [t \in Tasks |-> 0]
+  /\ bargedOwed = FALSE
+  /\ readInUpgrade = FALSE
 
 \* Every step the system can take.
 Next ==
   \E t \in Tasks :
-    Read(t) \/ Write(t) \/ ReleaseRead(t) \/ ReleaseWrite(t) \/ Wake(t) \/ Poll(t) \/ Cancel(t)
+    \/ \E w \in {"read", "write", "upread"} : Request(t, w)
+    \/ Release(t) \/ Upgrade(t) \/ ReaderUpgrade(t) \/ Wake(t) \/ Poll(t) \/ UpPoll(t)
+    \/ Cancel(t)
 
 \* Fairness: wakes are delivered, woken futures are polled, and a holder
-\* eventually drops a guard. Asking for the lock and cancelling are the
+\* eventually drops a guard. Requests, upgrades and cancels are the
 \* caller's choices.
 Fairness ==
   \A t \in Tasks :
-    /\ WF_vars(Wake(t) \/ Poll(t))
-    /\ WF_vars(ReleaseRead(t) \/ ReleaseWrite(t))
+    /\ WF_vars(Wake(t) \/ Poll(t) \/ UpPoll(t))
+    /\ WF_vars(Release(t))
 
 \* Every behaviour: start in Init, take Next steps or stutter, fairly.
 Spec == Init /\ [][Next]_vars /\ Fairness
@@ -401,72 +488,89 @@ Spec == Init /\ [][Next]_vars /\ Fairness
 TypeOK ==
   /\ rd \in [Tasks -> 0..MaxDepth]
   /\ wr \in [Tasks -> 0..MaxDepth]
-  /\ rdepth \in [Owners -> Nat]
+  /\ up \in [Tasks -> 0..1]
   /\ wowner \in Owners \cup {NoOwner}
-  /\ node \in [Tasks -> {"none", "waiting", "granted"}]
-  /\ want \in [Tasks -> {"read", "write"}]
-  /\ pc \in [Tasks -> {"idle", "holding", "parked", "wake"}]
-  /\ Range(rq) \subseteq Tasks /\ Range(wq) \subseteq Tasks
+  /\ uholder \in Tasks \cup {0}
+  /\ node \in [Tasks -> {"none", "waiting", "handed"}]
+  /\ pc \in [Tasks -> {"idle", "holding", "parked", "upwait", "rupwait", "wake"}]
+  /\ Range(q) \subseteq Tasks
 
 \* MUTUAL EXCLUSION. While an owner holds write, no other owner holds read
-\* or write; and every guard a task holds is counted on the lock.
+\* and no upgradable guard is out; every guard is counted on the lock.
+\* Lean (exclusive side): mutual_exclusion.
 MutualExclusion ==
-  /\ wowner # NoOwner => \A o \in Owners \ {wowner} : rdepth[o] = 0
+  /\ wowner # NoOwner => uholder = 0 /\ \A o \in Owners \ {wowner} : rdepth[o] = 0
   /\ \A t \in Tasks : wr[t] > 0 => Owner[t] = wowner
   /\ \A t \in Tasks : rd[t] > 0 => rdepth[Owner[t]] > 0
+
+\* AT MOST ONE UPGRADABLE GUARD, and the lock names its holder.
+UpgradableExclusive ==
+  /\ \A t, u \in Tasks : up[t] = 1 /\ up[u] = 1 => t = u
+  /\ \A t \in Tasks : up[t] = 1 <=> uholder = t
 
 \* REENTRANCY DEPTH. The lock's depths are exactly the guards out, and
 \* write is held exactly when its depth is not 0.
 ReentrancyDepth ==
   /\ wdepth = SumOf(wr, Tasks)
-  /\ \A o \in Owners :
-       rdepth[o] = SumOf(rd, {t \in Tasks : Owner[t] = o})
+  /\ \A o \in Owners : rdepth[o] = SumOf(rd, {t \in Tasks : Owner[t] = o})
   /\ (wowner = NoOwner <=> wdepth = 0)
 
-\* PHASE FAIRNESS, readers. A waiting reader sees at most one write phase
-\* begin before it is admitted.
-ReadersWaitOnePhase ==
-  \A t \in Tasks : WaitsFor(Lock, t, "read") => wph[t] <= 1
+\* BOUNDED BYPASS. A waiter, reader or writer, loses the race at most Bound
+\* times; then a release hands it the lock. Neither side starves.
+\* Lean: bounded_bypass.
+BoundedBypass == \A t \in Tasks : lost[t] <= Bound
 
-\* PHASE FAIRNESS, writers. A waiting writer sees readers admitted only in
-\* the batches that end the write phases ahead of it: at most one batch per
-\* writer ahead, plus one for the phase in progress.
-WritersBoundedBypass ==
+\* HANDOFF EXCLUSIVE. Nobody enters through the fast path while a handoff
+\* is owed. Lean: owed_blocks_barging.
+HandoffExclusive == ~bargedOwed
+
+\* UPGRADE HOLDS READERS BACK. No plain reader enters while an upgrade
+\* waits.
+UpgradeHoldsBack == ~readInUpgrade
+
+\* NO UPGRADE DEADLOCK. Every reader an upgrader waits for is free to drop
+\* its guard: it is running (holding, or delivering wakes), or it was handed
+\* its guard and only awaits its own poll, which needs nothing from the
+\* lock. It is never itself waiting on the lock. With one upgrader and no
+\* upgrade from plain read, this holds, so every upgrade completes.
+NoUpgradeDeadlock ==
   \A t \in Tasks :
-    WaitsFor(Lock, t, "write") => bypass[t] <= (ahead[t] + 1) * (Cardinality(Tasks) - 1)
+    pc[t] \in {"upwait", "rupwait"} =>
+      \A u \in Tasks \ {t} :
+        rd[u] > 0 => (pc[u] \in {"holding", "wake"} \/ (pc[u] = "parked" /\ node[u] = "handed"))
 
-\* NO SELF-DEADLOCK. A task never waits on the lock while it holds a guard
-\* of it: whatever it waits for would need its own guard to drop.
-NoSelfDeadlock ==
-  \A t \in Tasks : node[t] = "waiting" => rd[t] + wr[t] = 0
+\* NO SELF-DEADLOCK. A queued task holds no guard of the lock.
+NoSelfDeadlock == \A t \in Tasks : node[t] = "waiting" => Guards(t) = 0
 
-\* A queued task that nobody will ever hand the lock to: readers queued
-\* with no writer holding or waiting, or a writer queued while nobody holds.
+\* A queued head left asleep though it could proceed: its request fits,
+\* nobody has woken it or decided to, and no handed waiter is still to take
+\* an owed handoff (that waiter's take clears the owed bit and wakes the
+\* head); or an upgrade left waiting with every plain reader gone.
 Stranded ==
-  \/ rq # <<>> /\ wowner = NoOwner /\ wq = <<>>
-  \/ wq # <<>> /\ wowner = NoOwner /\ NoReaders(Lock)
+  \/ /\ q # <<>>
+     /\ LET h == Head(q) IN Fits(Lock, want[h]) /\ ~Notified(Lock, h)
+     /\ ~(owed /\ \E t \in Tasks : node[t] = "handed")
+  \/ /\ upgrading /\ uholder # 0 /\ NoReaders(Lock) /\ wowner = NoOwner
 
 \* NO LOST WAKEUP. A parked future handed the lock has been woken or is
-\* about to be, and no queued task is stranded.
+\* about to be, and no head or upgrader is stranded. Lean: no_stranded_head.
 NoLostWakeup ==
   /\ \A t \in Tasks :
-       pc[t] = "parked" /\ node[t] = "granted" =>
-         woken[t] \/ \E d \in Tasks : t \in towake[d]
+       pc[t] = "parked" /\ node[t] = "handed" => woken[t] \/ \E d \in Tasks : t \in towake[d]
   /\ ~Stranded
 
 \* CANCELLATION PASSES ON. An idle task holds no guard.
-CancelPassesOn == \A t \in Tasks : pc[t] = "idle" => rd[t] + wr[t] = 0
+CancelPassesOn == \A t \in Tasks : pc[t] = "idle" => Guards(t) = 0
 
 ----------------------------------------------------------------------------
-\* Liveness.
-
-\* Liveness is checked for the tasks in Watched only. Tasks with the same
-\* Owner role are interchangeable: renaming them (and their owners) maps
-\* every behaviour to a behaviour, a starving one to a starving one, so one
-\* task of each role covers all, at a fraction of TLC's liveness cost.
+\* Liveness. Checked for the tasks in Watched: tasks with the same Owner
+\* role are interchangeable, so one per role stands for all.
 
 \* Every parked waiter stops waiting: it is served, unless it cancels.
 EveryWaiterServed == \A t \in Watched : (pc[t] = "parked") ~> (pc[t] # "parked")
+
+\* Every upgrade completes: the upgrader comes to hold write.
+UpgradeCompletes == \A t \in Watched : (pc[t] = "upwait") ~> (pc[t] = "holding")
 
 \* Owner o holds the lock in some mode.
 OwnerHolds(o) == rdepth[o] > 0 \/ wowner = o

@@ -3,10 +3,11 @@
 \* reusable gates whose waiters all pass together.
 \*
 \* PROVED FOR EVERY SIZE in Lean: nothing specific to these gates. Their
-\* waiter list is the registration-then-re-check pattern of Sync.tla,
-\* whose queue laws proofs/lean/Regolith/Sync.lean proves (handed_holds,
+\* waiter list is the registration-then-re-check pattern of SyncNotify.tla,
+\* whose queue laws proofs/lean/Regolith/SyncFifo.lean proves (handed_holds,
 \* no_stranded_waiter); the gate conditions are checked here only, for
-\* three tasks.
+\* three tasks. D49 changes nothing here: a gate releases every waiter at
+\* once, so there is no handoff to replace with barging.
 \*
 \* THE DESIGN (plan 4.11).
 \*   Event   `set`, `wait()`, `is_set`: a one-shot event. It is a Latch of

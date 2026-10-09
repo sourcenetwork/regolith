@@ -513,30 +513,41 @@ tla:
     check MC_NonBlocking_Green_Single                  GREEN
     check MC_NonBlocking_Red_LostWakeup                RED NoLostWakeup
     check MC_NonBlocking_Red_SilentSelfIo              RED IoPendingFires
-    # regolith::sync, the waiter queue: Mutex, Semaphore, ReentrantMutex,
-    # Notify. Lean: Regolith/Sync.lean, at_most_one_owner, fifo_served.
+    # regolith::sync's locks after D49: barging with bounded bypass, for
+    # Mutex, Semaphore and ReentrantMutex. Lean: Regolith/Sync.lean,
+    # mutual_exclusion, bounded_bypass, owed_exclusive.
     spec=Sync
     check MC_Sync_Green_Mutex                          GREEN
     check MC_Sync_Green_Semaphore                      GREEN
     check MC_Sync_Green_Reentrant                      GREEN
-    check MC_Sync_Green_Notify                         GREEN
-    check MC_Sync_Red_Barging                          RED FifoHandoff
-    check MC_Sync_Red_WakeBeforeHandoff                RED NoLostWakeup
+    check MC_Sync_Green_ReentrantLive                  GREEN
+    check MC_Sync_Red_UnboundedBarging                 RED BoundedBypass
+    check MC_Sync_Red_ReleaseNoWake                    RED NoLostWakeup
+    check MC_Sync_Red_LoseQueuePosition                RED BoundedBypass
     check MC_Sync_Red_CancelNoPassOn                   RED CancelPassesOn
     check MC_Sync_Red_NoRecheck                        RED NoLostWakeup
-    check MC_Sync_Red_DrainNoRecheck                   RED NoLostWakeup
-    check MC_Sync_Red_CancelNoDrain                    RED NoLostWakeup
+    check MC_Sync_Red_IgnoreOwed                       RED HandoffExclusive
     check MC_Sync_Red_NoDepth                          RED ReentrancyDepth
-    check MC_Sync_Red_NoGenCheck                       RED NoLostWakeup
-    # regolith::sync::RwLock and ReentrantRwLock, phase-fair.
+    # regolith::sync::Notify, which keeps FIFO handoff. Lean:
+    # Regolith/SyncFifo.lean, fifo_served, no_stranded_waiter.
+    spec=SyncNotify
+    check MC_SyncNotify_Green                          GREEN
+    check MC_SyncNotify_Red_WakeBeforeHandoff          RED NoLostWakeup
+    check MC_SyncNotify_Red_CancelNoPassOn             RED CancelPassesOn
+    check MC_SyncNotify_Red_NoRecheck                  RED NoLostWakeup
+    check MC_SyncNotify_Red_NoGenCheck                 RED NoLostWakeup
+    # regolith::sync::RwLock and ReentrantRwLock after D49, with D50's
+    # upgradable read.
     spec=SyncRwLock
     check MC_SyncRwLock_Green_Plain                    GREEN
+    check MC_SyncRwLock_Green_WriterLive               GREEN
+    check MC_SyncRwLock_Green_ReaderLive               GREEN
     check MC_SyncRwLock_Green_Reentrant                GREEN
     check MC_SyncRwLock_Green_ReentrantLive            GREEN
-    check MC_SyncRwLock_Red_WriterPreference           RED ReadersWaitOnePhase
-    check MC_SyncRwLock_Red_ReaderBarging              RED WritersBoundedBypass
+    check MC_SyncRwLock_Red_UnboundedBarging           RED BoundedBypass
+    check MC_SyncRwLock_Red_AnyReaderUpgrade           RED NoUpgradeDeadlock
+    check MC_SyncRwLock_Red_UpgradeNoHoldBack          RED UpgradeHoldsBack
     check MC_SyncRwLock_Red_OwnerUnaware               RED NoSelfDeadlock
-    check MC_SyncRwLock_Red_WriterCancelStrands        RED NoLostWakeup
     # regolith::sync::Event, Latch and Barrier.
     spec=SyncLatch
     check MC_SyncLatch_Green_Event                     GREEN

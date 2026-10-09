@@ -3,9 +3,15 @@
 \* published, whatever the initializers race, fail or get dropped.
 \*
 \* PROVED FOR EVERY SIZE in Lean: nothing specific to OnceCell. Its waiter
-\* list is the registration-then-re-check pattern of Sync.tla, whose queue
-\* laws proofs/lean/Regolith/Sync.lean proves; the publish-once property is
-\* checked here only, for three tasks.
+\* list is the registration-then-re-check pattern of SyncNotify.tla, whose
+\* queue laws proofs/lean/Regolith/SyncFifo.lean proves; the publish-once
+\* property is checked here only, for three tasks.
+\*
+\* D49. The waiters already follow the barging rule: a reset wakes every
+\* waiter and each competes for the initializer role with a CAS, with no
+\* handoff; once a value is published every waiter gets it. So the D49
+\* note's "make that consistent" changes nothing in this model. (No bypass
+\* bound is needed: a value, once published, serves every waiter.)
 \*
 \* THE DESIGN (plan 4.11). `OnceCell<T>`: `get`, `get_or_init(future)`,
 \* `get_or_try_init`; synchronous `const fn new`, `set(v)` (one CAS,
