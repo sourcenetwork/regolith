@@ -4028,19 +4028,23 @@ mod tests {
     #[test]
     fn test_gc_preserves_tombstone_hiding_older_entries() {
         // A tombstone newer than any live snapshot still needs to
-        // survive compaction - it's the newest version and reads
-        // must resolve to "deleted".
+        // survive compaction while it hides an older version that
+        // survives with it: here one a snapshot below it keeps, which
+        // reads must still resolve to "deleted" at the head. With
+        // nothing left beneath it, it retires (E27).
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), tiny_flush_opts()).unwrap();
 
         for v in 0..5 {
             db.put(b"k", format!("v{}", v).as_bytes()).unwrap();
         }
+        let before = db.snapshot();
         db.delete(b"k").unwrap();
 
         db.compact_range(None, None).unwrap();
 
         assert_eq!(db.get(b"k").unwrap(), None);
+        assert_eq!(before.get(b"k").unwrap(), Some(b"v4".to_vec()));
 
         // The newest surviving version is a tombstone - look for it
         // on disk.
@@ -4371,6 +4375,9 @@ mod tests {
         db.put(b"y", b"old-right").unwrap();
         db.compact_range(None, None).unwrap();
 
+        // A snapshot older than the tombstone holds it at the bottom level,
+        // where it would otherwise retire (E27), so the pass writes it out.
+        let before = db.snapshot();
         db.delete_range(b"a", b"z").unwrap();
         db.put(b"m", b"new").unwrap();
         db.compact_range(None, None).unwrap();
@@ -4378,6 +4385,7 @@ mod tests {
         assert_eq!(db.get(b"b").unwrap(), None);
         assert_eq!(db.get(b"m").unwrap(), Some(b"new".to_vec()));
         assert_eq!(db.get(b"y").unwrap(), None);
+        assert_eq!(before.get(b"b").unwrap(), Some(b"old-left".to_vec()));
 
         let version = db.engine.current_version();
         let rt_only_files = version

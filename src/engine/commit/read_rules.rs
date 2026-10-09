@@ -297,9 +297,11 @@ mod tests {
             )
             .unwrap();
             let mut log: Vec<(u64, Op)> = Vec::new();
-            // A snapshot after every write keeps every entry and every range
-            // tombstone alive through compaction, so no operand is folded.
-            let mut snapshots = Vec::new();
+            // A snapshot before the first write and after every write keeps
+            // every entry and every range tombstone alive through compaction,
+            // so no operand is folded and no tombstone retires (E27): every
+            // floor below is one a snapshot protects, as a transaction's are.
+            let mut snapshots = vec![db.snapshot()];
             for op in &ops {
                 match *op {
                     Op::Put(k, v) => db.put(KEYS[k], &[v]).unwrap(),

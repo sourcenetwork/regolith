@@ -186,9 +186,12 @@ mod tests {
             let options = Options::default().merge_operator(Some(Arc::new(Keep)));
             let db = Db::open(dir.path(), options).unwrap();
             let mut log: Vec<(u64, &Op)> = Vec::new();
-            // A snapshot after every write keeps every entry and every
-            // range tombstone alive through compaction.
-            let mut snapshots = Vec::new();
+            // A snapshot before the first write and after every write keeps
+            // every entry and every range tombstone alive through compaction:
+            // a pass retires a tombstone only with no live snapshot below it
+            // (E27), and every floor below is one a snapshot protects, as a
+            // transaction's are.
+            let mut snapshots = vec![db.snapshot()];
             for op in &ops {
                 match *op {
                     Op::Put(k) => db.put(KEYS[k], b"v").unwrap(),
