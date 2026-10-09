@@ -736,10 +736,6 @@ pub struct Transaction {
     /// The ranges the validated scans ([`ScanCheck::Range`]) cover, one record
     /// per cursor. Boxed for the reason `scan_runs` is.
     scan_ranges: OnceLock<Box<SegQueue<Arc<RangeRecord>>>>,
-    /// How many times a savepoint rollback rebuilt the write buffer. With the
-    /// buffer's length it tells a cursor whether the writes it folded are
-    /// still the writes the transaction holds.
-    rollbacks: u64,
     /// Each write is checked against newer versions as it is made
     /// ([`TxnOptions::early_validation`]). Optimistic transactions only.
     early_validation: bool,
@@ -863,7 +859,6 @@ impl Transaction {
             tracked: TxnBuffer::new(keys_inline),
             scan_runs: OnceLock::new(),
             scan_ranges: OnceLock::new(),
-            rollbacks: 0,
             early_validation,
             promoted_seq: AtomicU64::new(snapshot_seq),
             savepoints: Vec::new(),
@@ -1196,7 +1191,6 @@ impl Transaction {
     /// Returns [`TransactionError::NoSavepoint`] when no savepoint is set.
     pub fn rollback_to_savepoint(&mut self) -> TxResult<()> {
         let mark = self.savepoints.pop().ok_or(TransactionError::NoSavepoint)?;
-        self.rollbacks += 1;
         self.writes.truncate(mark.writes);
         self.truncate_appends(mark.appends);
         Ok(())

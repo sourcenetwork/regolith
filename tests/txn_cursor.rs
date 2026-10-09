@@ -12,7 +12,7 @@
 
 mod common;
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use common::parted::{Parted, add, value};
 use regolith::{
@@ -276,6 +276,50 @@ fn a_savepoint_rollback_between_pages_does_not_leave_a_stale_fold() {
     // The buffer is as long as it was before `b`, and is then as long as it
     // was when the cursor folded it: a length alone would call that unchanged.
     txn.put(b"c", b"second").unwrap();
+    assert_eq!(names(&keys(&mut cursor, &txn, usize::MAX)), ["c", "e"]);
+}
+
+/// A failed `before_commit` takes its writes back without a savepoint
+/// rollback, and the buffer then regrows to the length the cursor folded.
+#[test]
+fn a_failed_before_commit_between_pages_does_not_leave_a_stale_fold() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open(dir.path());
+    seed(db.db(), &["a", "e"]);
+    let mut txn = begin(&db, IsolationLevel::SnapshotIsolation);
+    let cursor = Arc::new(Mutex::new(txn.cursor(
+        None,
+        None,
+        ScanDirection::Forward,
+        ScanCheck::Stretch,
+    )));
+    assert_eq!(
+        cursor
+            .lock()
+            .unwrap()
+            .next_page(&txn, 0)
+            .unwrap()
+            .entries
+            .len(),
+        1
+    );
+
+    let held = Arc::clone(&cursor);
+    let mut failed = false;
+    txn.before_commit(move |txn| {
+        if std::mem::replace(&mut failed, true) {
+            return Ok(());
+        }
+        txn.put(b"b", b"from the callback")?;
+        // Seen: the fold now holds `b`.
+        let page = held.lock().unwrap().next_page(txn, 0).unwrap();
+        assert_eq!(page.entries[0].0, b"b");
+        Err(TransactionError::NoSavepoint)
+    });
+    assert!(txn.prepare().is_err());
+    // `b` is gone and the buffer is as long as when the cursor folded it.
+    txn.put(b"c", b"mine").unwrap();
+    let mut cursor = cursor.lock().unwrap();
     assert_eq!(names(&keys(&mut cursor, &txn, usize::MAX)), ["c", "e"]);
 }
 

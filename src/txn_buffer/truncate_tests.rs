@@ -176,3 +176,85 @@ proptest! {
         }
     }
 }
+
+#[test]
+fn the_generation_grows_on_every_insert_and_every_truncate_that_drops_something() {
+    for spill_at in [0, 2] {
+        let mut buffer = TxnBuffer::new(spill_at);
+        let empty = buffer.generation();
+        buffer.insert(1u8, 1u32);
+        buffer.insert(2, 2);
+        let two = buffer.generation();
+        assert!(two > empty);
+
+        buffer.truncate(1);
+        let one = buffer.generation();
+        assert!(one > two, "a truncate is a change");
+
+        // The length is the one it had before the second insert, and the
+        // buffer holds a different second entry: the generation tells.
+        buffer.insert(3, 3);
+        assert_eq!(buffer.len(), 2);
+        assert!(buffer.generation() > one);
+        assert_ne!(buffer.generation(), two);
+
+        let before = buffer.generation();
+        buffer.truncate(2);
+        buffer.truncate(99);
+        assert_eq!(buffer.generation(), before, "nothing was dropped");
+
+        buffer.drain();
+        assert!(buffer.generation() > before, "a drain is a change");
+        let drained = buffer.generation();
+        buffer.insert(4, 4);
+        assert!(buffer.generation() > drained);
+    }
+}
+
+proptest! {
+    /// The generation changes exactly when the buffer does, and only upward,
+    /// whatever the order of inserts, truncations and drains: so two reads of
+    /// it that agree saw the same buffer.
+    #[test]
+    fn the_generation_never_repeats_for_two_different_buffers(
+        spill_at in prop_oneof![Just(0usize), Just(2)],
+        ops in prop::collection::vec(
+            prop_oneof![
+                6 => (0u8..6, any::<u32>()).prop_map(|(k, v)| Op::Insert(k, v)),
+                3 => (0usize..40).prop_map(Op::Truncate),
+                1 => Just(Op::Index),
+            ],
+            0..120,
+        ),
+        drain_at in prop::option::of(0usize..120),
+    ) {
+        let mut buffer = TxnBuffer::new(spill_at);
+        let mut model: Vec<(u8, u32)> = Vec::new();
+        let mut seen: Vec<(u64, Vec<(u8, u32)>)> = vec![(buffer.generation(), Vec::new())];
+        for (step, op) in ops.into_iter().enumerate() {
+            let before = buffer.generation();
+            match op {
+                Op::Insert(key, value) => {
+                    buffer.insert(key, value);
+                    model.push((key, value));
+                }
+                Op::Truncate(len) => {
+                    buffer.truncate(len);
+                    model.truncate(len);
+                }
+                Op::Index => buffer.ensure_indexed(),
+            }
+            if drain_at == Some(step) {
+                buffer.drain();
+                model.clear();
+            }
+            let after = buffer.generation();
+            prop_assert!(after >= before, "the generation fell");
+            if let Some((_, was)) = seen.iter().find(|(generation, _)| *generation == after) {
+                prop_assert_eq!(was, &model, "one generation, two buffers");
+            } else {
+                seen.push((after, model.clone()));
+            }
+        }
+    }
+}

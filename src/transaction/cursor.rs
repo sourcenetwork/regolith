@@ -144,8 +144,8 @@ pub struct TxnCursor {
     cursor: CfIter<'static>,
     cursor_done: bool,
     buffered: BufferedWrites,
-    /// The write buffer's state when `buffered` was folded.
-    folded_at: (u64, usize),
+    /// The write buffer's generation when `buffered` was folded.
+    folded_at: u64,
     /// Inclusive lower bound, CF-prefixed.
     lo: Option<Vec<u8>>,
     /// Exclusive upper bound, CF-prefixed.
@@ -195,10 +195,11 @@ impl Transaction {
         TxnCursor::new(self, start, end, direction, check)
     }
 
-    /// The write buffer's state: changes whenever a write lands or a
-    /// rollback rebuilds it, and never returns to an earlier value.
-    pub(super) fn write_mark(&self) -> (u64, usize) {
-        (self.rollbacks, self.writes.len())
+    /// The write buffer's generation: changes whenever a write lands or the
+    /// buffer is cut back (by a savepoint rollback or a failed callback), and
+    /// never returns to an earlier value.
+    pub(super) fn write_mark(&self) -> u64 {
+        self.writes.generation()
     }
 }
 
@@ -376,6 +377,9 @@ impl TxnCursor {
     /// walk has yet to reach.
     fn fold(&mut self, txn: &Transaction) {
         let (lo, hi, position, reverse) = (&self.lo, &self.hi, &self.position, self.reverse);
+        // Read before the buffer is, so a write that lands during the fold
+        // makes the next step fold again instead of being taken for folded.
+        let generation = txn.write_mark();
         let chains = txn.writes.chains_matching(
             |key| {
                 lo.as_ref().is_none_or(|lo| key >= lo)
@@ -389,7 +393,7 @@ impl TxnCursor {
         self.buffered = fold_by_key(chains, reverse, txn.engine.merge_operator())
             .into_iter()
             .peekable();
-        self.folded_at = txn.write_mark();
+        self.folded_at = generation;
     }
 
     /// Record `failure` and return the error it reports.
