@@ -1599,6 +1599,13 @@ impl Db {
     /// and a write running alongside the call orders on one side of it.
     /// Files are installed one at a time, each at its own sequence; an
     /// error leaves the files before it installed.
+    ///
+    /// On a database encrypted at rest ([`Options::key_provider`]) a file
+    /// sealed under any key the provider has is installed as it is, while
+    /// a plaintext file is written in sealed under the current key instead
+    /// of copied or linked, with no lock held: an encrypted database holds
+    /// no table in plaintext. A sealed file under a key the provider lacks
+    /// is refused with [`Error::UnknownKey`].
     pub fn ingest_external_files(
         &self,
         files: &[std::path::PathBuf],

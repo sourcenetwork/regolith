@@ -9,12 +9,13 @@
 //! changed does.
 //!
 //! Each frame's nonce is 12 bytes from the operating system's random
-//! source, drawn per frame, so no assumption about how a file is written
-//! (appends, a rollback that rewrites an offset, a file copied and both
-//! copies written on) can make two frames share one. The chance that any
-//! two of `n` frames under one key draw the same nonce is at most
-//! `n^2 / 2^97`, and GCM-SIV keeps even that case to revealing only whether
-//! the two frames were identical.
+//! source, drawn per frame, so how a file is written (appends, a rollback
+//! that rewrites an offset, a file copied and both copies written on) has
+//! no bearing on whether two frames share one: only two random draws
+//! colliding can. The chance that any two of `n` frames under one key draw
+//! the same nonce is at most `n^2 / 2^97`, and GCM-SIV keeps even that case
+//! to revealing only whether the two frames were identical. The full
+//! argument is in [`crate::encryption`].
 
 use std::io;
 use std::ops::Range;

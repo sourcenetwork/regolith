@@ -3,14 +3,56 @@
 //! With [`crate::Options::key_provider`] set, regolith seals every frame it
 //! writes with AES-256-GCM-SIV (RFC 8452): each SSTable data, index and
 //! filter block, each write-ahead log record, and each manifest edit batch.
-//! The 16-byte tag takes the place of the frame's checksum, so a
-//! random-access read still decrypts exactly one block, and a frame whose
+//! A random-access read still decrypts exactly one block, and a frame whose
 //! tag fails is treated as corruption wherever a failed checksum is.
 //!
 //! Values are plaintext inside the engine: the memtable, the block cache,
 //! merge operators, byte-equality checks, value-validated reads,
-//! content-addressed keys, appends and allocations all see the bytes the
-//! caller wrote, so every mechanism works unchanged on an encrypted store.
+//! content-addressed keys, appends, allocations and ingested tables read at
+//! their sequence all see the bytes the caller wrote, so every mechanism
+//! works unchanged on an encrypted store.
+//!
+//! # Where the tag replaces the checksum, and where it cannot
+//!
+//! - **Table blocks, index and filter regions, and the table footer**: the
+//!   tag replaces the checksum. Nothing in a table is read before its frame
+//!   opens, and a failure is a corrupt table either way.
+//! - **Write-ahead log records**: the tag replaces the payload check. The
+//!   header keeps its own check, because replay tests every offset after a
+//!   damaged record for a header (to read P past the damage) and that test
+//!   must stay one short hash, with no key. The tag binds the payload to
+//!   that header, its offset and its log. A record whose tag fails is an
+//!   unusable record under the same O < P rule as one whose check fails:
+//!   dropped and reported in the newest log's unsynced tail, refused below
+//!   P or in an earlier log, naming the file.
+//! - **The write-ahead log stamp**: sealed under the log's key, with its own
+//!   check kept, and durable before the log exists. A wrong key then fails
+//!   the stamp and refuses the open instead of failing every record and
+//!   reading as a torn tail (`proofs/tla/WalRecovery.tla`, RED
+//!   `StampNotSealed` and `StampUnsynced`).
+//! - **Manifest batches**: the checksum stays, checked first and without a
+//!   key. Only it can tell a batch a crash tore (dropped, as ever) from a
+//!   whole batch under a wrong or missing key (refused): with the tag alone
+//!   the two read alike, and one of them would be handled wrongly
+//!   (`proofs/tla/ManifestSeal.tla`).
+//!
+//! # Nonces never repeat under one key
+//!
+//! Every frame draws a fresh 96-bit nonce from the operating system's
+//! random source at the moment it is sealed; nothing is derived from a file
+//! id or an offset. That is deliberate: the engine rewrites offsets (a
+//! failed group is truncated away and the next group is written at the
+//! same offset; a manifest's torn tail is trimmed and appended over), file
+//! ids can be reused after a crash, and a checkpoint or a restored backup
+//! is a second database writing the same ids under the same keys. A
+//! position-derived nonce would repeat in every one of those cases.
+//!
+//! Random 96-bit nonces repeat with probability at most `n^2 / 2^97` among
+//! `n` frames under one key (the birthday bound): about 2^-17 after 2^40
+//! frames, which is four pebibytes of 4 KiB blocks, and rotating the key
+//! starts the count again. Even then, GCM-SIV is misuse resistant: two
+//! frames that did draw one nonce reveal only whether the two frames were
+//! identical, never the key stream or the key.
 //!
 //! # Keys and rotation
 //!
@@ -40,16 +82,13 @@
 //! file names any other key and nothing is left in plaintext; the same call
 //! completes a key rotation, after which the provider may drop the old key.
 //!
+//! [`crate::Db::ingest_external_files`] installs a table sealed under any
+//! key the provider has as it is; a plaintext table is written in sealed
+//! under the current key on its way in, so build tables to ingest with
+//! [`crate::SstFileWriter`] under the same provider to skip that rewrite.
+//!
 //! An encrypted database opened without a provider refuses with
 //! [`crate::Error::KeyProviderRequired`]; it never reads as empty.
-//!
-//! # Nonces
-//!
-//! Every frame draws a fresh 96-bit nonce from the operating system's
-//! random source. GCM-SIV is nonce-misuse resistant: were two frames ever
-//! to draw the same nonce under one key, that would reveal only whether
-//! the two frames were identical, never the key stream. The chance of any
-//! repeat among `n` frames under one key is at most `n^2 / 2^97`.
 //!
 //! # What this does not hide
 //!
