@@ -851,29 +851,12 @@ impl RegolithEngine {
             // are on, so a write with them off pays no clock read at
             // all.
             let wal_start = self.statistics().and_then(|_| self.env.now_micros());
-            let mut guard = self.active_wal.lock();
-            let wal = guard.as_mut().ok_or_else(Self::read_only_error)?;
-            let start_offset = wal.offset();
-
-            if let Err(err) = wal.append_group(stage) {
-                self.abandon_group(wal, start_offset, &err)?;
-                return Err(err);
-            }
-
-            let mut synced = 0u64;
-            if any_immediate {
-                if let Err(err) = wal.sync_data() {
-                    self.abandon_group(wal, start_offset, &err)?;
-                    return Err(err);
-                }
-                synced = 1;
-            }
-            drop(guard);
+            let synced = self.log_group(stage, any_immediate)?;
 
             if let Some(s) = self.statistics() {
                 s.add(Ticker::WalBytesWritten, reported_bytes);
-                if synced > 0 {
-                    s.add(Ticker::WalSyncCount, synced);
+                if synced {
+                    s.add(Ticker::WalSyncCount, 1);
                 }
                 // `None` means the platform has no clock. Skip the
                 // recording rather than publishing a zero that reads
@@ -905,6 +888,36 @@ impl RegolithEngine {
         // followers only after this returns.
         self.visible_seq.publish(base_seq + total_ops - 1);
         Ok(base_seq)
+    }
+
+    /// Append a group's records to the log in one write, and make them
+    /// durable with the group's one fsync when `sync` (a member asked for
+    /// Immediate durability). Returns whether it synced. A failure of either
+    /// discards the group's bytes, so no member reads as committed (G2).
+    fn log_group(&self, stage: &[u8], sync: bool) -> io::Result<bool> {
+        let mut guard = self.active_wal.lock();
+        let wal = guard.as_mut().ok_or_else(Self::read_only_error)?;
+        let start_offset = wal.offset();
+        if let Err(err) = wal.append_group(stage) {
+            self.abandon_group(wal, start_offset, &err)?;
+            return Err(err);
+        }
+        if sync {
+            self.sync_group(wal, start_offset)?;
+        }
+        Ok(sync)
+    }
+
+    /// The group's fsync: one `fdatasync` that makes every record the group
+    /// appended at `start_offset` and after durable, and the one place an
+    /// Immediate commit waits for the device. Nothing of the group is applied
+    /// or visible before it returns. A failure discards the group's bytes.
+    fn sync_group(&self, wal: &mut Wal, start_offset: u64) -> io::Result<()> {
+        if let Err(err) = wal.sync_data() {
+            self.abandon_group(wal, start_offset, &err)?;
+            return Err(err);
+        }
+        Ok(())
     }
 
     /// Discard a group whose WAL work failed.
