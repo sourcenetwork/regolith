@@ -513,6 +513,54 @@ tla:
     check MC_NonBlocking_Green_Single                  GREEN
     check MC_NonBlocking_Red_LostWakeup                RED NoLostWakeup
     check MC_NonBlocking_Red_SilentSelfIo              RED IoPendingFires
+    # regolith::sync, the waiter queue: Mutex, Semaphore, ReentrantMutex,
+    # Notify. Lean: Regolith/Sync.lean, at_most_one_owner, fifo_served.
+    spec=Sync
+    check MC_Sync_Green_Mutex                          GREEN
+    check MC_Sync_Green_Semaphore                      GREEN
+    check MC_Sync_Green_Reentrant                      GREEN
+    check MC_Sync_Green_Notify                         GREEN
+    check MC_Sync_Red_Barging                          RED FifoHandoff
+    check MC_Sync_Red_WakeBeforeHandoff                RED NoLostWakeup
+    check MC_Sync_Red_CancelNoPassOn                   RED CancelPassesOn
+    check MC_Sync_Red_NoRecheck                        RED NoLostWakeup
+    check MC_Sync_Red_DrainNoRecheck                   RED NoLostWakeup
+    check MC_Sync_Red_CancelNoDrain                    RED NoLostWakeup
+    check MC_Sync_Red_NoDepth                          RED ReentrancyDepth
+    check MC_Sync_Red_NoGenCheck                       RED NoLostWakeup
+    # regolith::sync::RwLock and ReentrantRwLock, phase-fair.
+    spec=SyncRwLock
+    check MC_SyncRwLock_Green_Plain                    GREEN
+    check MC_SyncRwLock_Green_Reentrant                GREEN
+    check MC_SyncRwLock_Green_ReentrantLive            GREEN
+    check MC_SyncRwLock_Red_WriterPreference           RED ReadersWaitOnePhase
+    check MC_SyncRwLock_Red_ReaderBarging              RED WritersBoundedBypass
+    check MC_SyncRwLock_Red_OwnerUnaware               RED NoSelfDeadlock
+    check MC_SyncRwLock_Red_WriterCancelStrands        RED NoLostWakeup
+    # regolith::sync::Event, Latch and Barrier.
+    spec=SyncLatch
+    check MC_SyncLatch_Green_Event                     GREEN
+    check MC_SyncLatch_Green_Latch                     GREEN
+    check MC_SyncLatch_Green_Barrier                   GREEN
+    check MC_SyncLatch_Red_NoRecheck                   RED NoLostWakeup
+    check MC_SyncLatch_Red_CountCheck                  RED NoLostWakeup
+    # regolith::sync::OnceCell and Lazy: exactly one value is published.
+    spec=SyncOnce
+    check MC_SyncOnce_Green                            GREEN
+    check MC_SyncOnce_Red_CancelNoReset                RED NoLostWakeup
+    check MC_SyncOnce_Red_PlainStore                   RED PublishedOnce
+    check MC_SyncOnce_Red_NoRecheck                    RED NoLostWakeup
+    check MC_SyncOnce_Red_ReparkStale                  RED NoLostWakeup
+    # Transaction callbacks (3.16). Lean: Regolith/Callbacks.lean,
+    # exactly_once, order, attempts_isolated.
+    spec=TxnCallbacks
+    check MC_TxnCallbacks_Green_Immediate              GREEN
+    check MC_TxnCallbacks_Green_Eventual               GREEN
+    check MC_TxnCallbacks_Red_CommitBeforeDurable      RED CommitAfterDurable
+    check MC_TxnCallbacks_Red_SkipCallbackWrites       RED NoLostUpdate
+    check MC_TxnCallbacks_Red_CallbacksSurvive         RED AttemptIsolation
+    check MC_TxnCallbacks_Red_HelperNoClaim            RED AtMostOnce
+    check MC_TxnCallbacks_Red_CloseNoClaim             RED AtMostOnce
     rm -rf states ./*_TTrace_*.tla ./*_TTrace_*.bin
     exit $fail
 
