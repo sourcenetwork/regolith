@@ -5,10 +5,10 @@
 //! compare-and-swap and reading it is a single load: nobody ever sees a
 //! half-written value, and nobody waits for a writer to finish. The
 //! asynchronous initializers take turns through a one-permit semaphore, so
-//! exactly one runs at a time, and a dropped or failed one hands the turn
-//! to the next waiter. Whoever publishes (an initializer, `set` or a
-//! racing builder) opens the semaphore wide, which lets every task queued
-//! for a turn through at once to find the value.
+//! exactly one runs at a time, and a dropped or failed one gives the turn
+//! up, which wakes the next waiter. Whoever publishes (an initializer,
+//! `set` or a racing builder) opens the semaphore wide, which wakes every
+//! task queued for a turn at once to find the value.
 
 #![allow(unsafe_code)]
 

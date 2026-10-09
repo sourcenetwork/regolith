@@ -229,10 +229,15 @@ struct Shared {
 fn contend(shared: &Shared, rounds: usize, waker: &Waker, flag: &Flag) {
     for i in 0..rounds {
         *spin_on(shared.mutex.lock(), waker, flag) += 1;
-        if i % 4 == 0 {
-            *spin_on(shared.rwlock.write(), waker, flag) += 1;
-        } else {
-            let _ = *spin_on(shared.rwlock.read(), waker, flag);
+        match i % 4 {
+            0 => *spin_on(shared.rwlock.write(), waker, flag) += 1,
+            1 => {
+                let upgradable = spin_on(shared.rwlock.upgradable_read(), waker, flag);
+                *spin_on(upgradable.upgrade(), waker, flag) += 1;
+            }
+            _ => {
+                let _ = *spin_on(shared.rwlock.read(), waker, flag);
+            }
         }
         let _permit = spin_on(shared.semaphore.acquire(1 + i % 2), waker, flag);
     }
@@ -283,10 +288,21 @@ fn single_thread_loops(rounds: usize, waker: &Waker, flag: &Flag) {
             inner.set(outer.get() + 1);
         }
         {
-            let read = reentrant_rw.try_read(&owner).expect("free");
-            let write = spin_on(reentrant_rw.write(&owner), waker, flag);
+            let write = spin_on(reentrant_rw.write(&owner), waker, flag).expect("no read held");
+            let read = reentrant_rw.try_read(&owner).expect("a writer may read");
             write.fetch_add(1, Ordering::Relaxed);
             drop((write, read));
+        }
+        {
+            let upgradable = spin_on(rwlock.upgradable_read(), waker, flag);
+            let read = rwlock.try_read().expect("shares with the upgradable read");
+            let mut upgrade = pin!(upgradable.upgrade());
+            assert!(poll_once(&mut upgrade, waker).is_pending());
+            drop(read);
+            match poll_once(&mut upgrade, waker) {
+                std::task::Poll::Ready(mut write) => *write += 1,
+                std::task::Poll::Pending => panic!("the reader left"),
+            }
         }
         {
             notify.notify_one();

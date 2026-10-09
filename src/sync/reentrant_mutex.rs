@@ -17,8 +17,8 @@ use super::raw_semaphore::{PermitWait, RawSemaphore};
 /// A mutex the owner holding it can lock again without waiting.
 ///
 /// Each lock by the holding owner deepens a count; the mutex unlocks when
-/// the last of its guards drops, and then hands itself to the oldest
-/// waiting owner, as [`Mutex`](super::Mutex) does.
+/// the last of its guards drops, and then wakes the oldest waiting
+/// owner, with the bounded bypass of [`Mutex`](super::Mutex).
 ///
 /// A guard gives `&T`, since two guards of one owner are alive at once;
 /// mutate through a `Cell` or `RefCell` inside. Guards and lock futures
@@ -74,8 +74,8 @@ impl<T> ReentrantMutex<T> {
 }
 
 impl<T: ?Sized> ReentrantMutex<T> {
-    /// Locks the mutex if `owner` holds it, or if it is free and nobody
-    /// waits.
+    /// Locks the mutex if `owner` holds it, or if it is free and no
+    /// handoff is owed.
     pub fn try_lock<'a>(&'a self, owner: &'a Owner) -> Option<ReentrantMutexGuard<'a, T>> {
         if self.reenter(owner) || self.sem.try_acquire(1) && self.enter(owner) {
             return Some(ReentrantMutexGuard::new(self));

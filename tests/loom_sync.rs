@@ -2,7 +2,12 @@
 //!
 //! ```text
 //! RUSTFLAGS="--cfg loom" cargo test --release --test loom_sync
+//! RUSTFLAGS="--cfg loom" cargo test --release --test loom_sync -- --ignored
 //! ```
+//!
+//! The second line runs the `#[ignore]`d twins: the models whose three
+//! threads all contend for one lock, at a deeper preemption bound (see
+//! `contended!`).
 //!
 //! Under `--cfg loom` every atomic and protocol cell in the primitives is
 //! loom's instrumented one, so these models check the wait protocol itself
@@ -16,21 +21,24 @@
 //!   which parks the loom thread until its waker fires; a wakeup that is
 //!   never delivered leaves every thread parked and loom reports the
 //!   deadlock.
-//! - **FIFO handoff and phase fairness**: waiters queue in a known order
-//!   (each one's first poll is seen to return `Pending` before the next
-//!   starts) and record the order they are granted in.
+//! - **Barging with bounded bypass**: `MAX_BYPASS` is 2 under loom, so a
+//!   waiter that a barging thread keeps passing over reaches its handoff
+//!   within a few operations, and the model covers the owed state, the
+//!   handoff and the return to barging.
 //! - **Cancellation at every await point**: a future polled once and then
-//!   dropped races the release that may hand it the lock; whatever it was
-//!   given must reach the next waiter.
+//!   dropped races the release that may hand it the lock or nudge it;
+//!   whatever it was given must reach the next waiter.
 //! - **Reentrancy depth**: an owner nests and unwinds while another owner
 //!   waits.
+//! - **The upgradable read**: it shares with readers, upgrades while they
+//!   come and go, and excludes writers.
 //!
-//! The waiter-node free list is a pass-through to the allocator under
-//! loom (see `Pool`), so node recycling itself is covered by miri and the
-//! unit tests rather than here. Two calibration models deliberately get
-//! something wrong and must fail; without them a search that never
-//! reached the bad interleaving would pass for the same reason a broken
-//! one does.
+//! The waiter-node free list is a pass-through to the allocator under loom
+//! (see `Pool`), so node recycling itself is covered by miri and the unit
+//! tests rather than here. Two calibration models deliberately expect
+//! something the protocol does not guarantee and must fail; without them
+//! a search that never reached the bad interleaving would pass for the
+//! same reason a broken one does.
 
 #![cfg(loom)]
 
@@ -45,15 +53,15 @@ use loom::sync::{Arc, Notify as Park};
 use loom::thread;
 
 use regolith::sync::{
-    Barrier, Event, Latch, Mutex, Notify, OnceCell, Owner, ReentrantMutex, ReentrantRwLock, RwLock,
-    Semaphore,
+    Barrier, Event, Latch, MAX_BYPASS, Mutex, Notify, OnceCell, Owner, ReentrantMutex,
+    ReentrantRwLock, RwLock, Semaphore,
 };
 
 /// Runs `model` under loom with at most `preemptions` preemptions per
 /// schedule (`LOOM_MAX_PREEMPTIONS` overrides it) and fails it if the
-/// search was implausibly small. Three-thread models take two
-/// preemptions, two-thread models three: past that the searches run for
-/// hours without reaching a new kind of interleaving.
+/// search was implausibly small. Two-thread models take three
+/// preemptions and three-thread models two, except the ones
+/// `contended!` declares.
 fn explore(
     name: &str,
     preemptions: usize,
@@ -77,6 +85,25 @@ fn explore(
         explored >= min_interleavings,
         "{name} explored only {explored} interleavings, below the {min_interleavings} floor"
     );
+}
+
+/// A model whose three threads all contend for one lock or semaphore.
+/// The normal run explores it at preemption bound 1; an `#[ignore]`d twin
+/// explores it at bound 2, which takes hours, so it runs nightly (`just
+/// loom-sync-deep`).
+macro_rules! contended {
+    ($name:ident, $deep:ident, $min:literal, $model:expr) => {
+        #[test]
+        fn $name() {
+            explore(stringify!($name), 1, $min, $model);
+        }
+
+        #[test]
+        #[ignore = "preemption bound 2 takes hours: run nightly by `just loom-sync-deep`"]
+        fn $deep() {
+            explore(stringify!($deep), 2, $min, $model);
+        }
+    };
 }
 
 struct Unpark(Park);
@@ -163,9 +190,11 @@ fn read(cell: &UnsafeCell<usize>) -> usize {
     cell.with(|value| unsafe { *value })
 }
 
-#[test]
-fn mutex_excludes_and_loses_no_wakeup() {
-    explore("mutex_excludes_and_loses_no_wakeup", 2, 10, || {
+contended!(
+    mutex_excludes_and_loses_no_wakeup,
+    mutex_excludes_and_loses_no_wakeup_at_bound_2,
+    10,
+    || {
         let mutex = Arc::new(Mutex::new(UnsafeCell::new(0usize)));
         let others: Vec<_> = (0..2)
             .map(|_| {
@@ -178,138 +207,165 @@ fn mutex_excludes_and_loses_no_wakeup() {
             other.join().expect("locker");
         }
         assert_eq!(read(&mutex.try_lock().expect("free at the end")), 3);
-    });
-}
+    }
+);
 
 #[test]
-fn mutex_hands_off_in_arrival_order() {
-    explore("mutex_hands_off_in_arrival_order", 2, 5, || {
-        let mutex = Arc::new(Mutex::new(Vec::new()));
-        let held = mutex.try_lock().expect("free");
-        let (first_queued, second_queued) = (
-            Arc::new(AtomicBool::new(false)),
-            Arc::new(AtomicBool::new(false)),
-        );
-        let first = {
-            let (mutex, flag) = (Arc::clone(&mutex), Arc::clone(&first_queued));
-            thread::spawn(move || block_on(flag_when_queued(mutex.lock(), &flag)).push(1))
-        };
-        wait_for(&first_queued);
-        let second = {
-            let (mutex, flag) = (Arc::clone(&mutex), Arc::clone(&second_queued));
-            thread::spawn(move || block_on(flag_when_queued(mutex.lock(), &flag)).push(2))
-        };
-        wait_for(&second_queued);
-        assert!(mutex.try_lock().is_none(), "try_lock overtook the queue");
-        drop(held);
-        first.join().expect("first");
-        second.join().expect("second");
-        assert_eq!(*mutex.try_lock().expect("free"), vec![1, 2]);
-    });
-}
-
-#[test]
-fn a_cancelled_mutex_waiter_racing_the_handoff_loses_nothing() {
+fn a_waiter_barged_past_max_bypass_times_is_handed_the_mutex() {
     explore(
-        "a_cancelled_mutex_waiter_racing_the_handoff_loses_nothing",
+        "a_waiter_barged_past_max_bypass_times_is_handed_the_mutex",
         2,
         10,
         || {
             let mutex = Arc::new(Mutex::new(UnsafeCell::new(0usize)));
-            let held = mutex.try_lock().expect("free");
-            let canceller = {
-                let mutex = Arc::clone(&mutex);
-                thread::spawn(move || poll_once_then_drop(mutex.lock()))
-            };
+            let mut held = Some(mutex.try_lock().expect("free"));
+            let queued = Arc::new(AtomicBool::new(false));
             let waiter = {
-                let mutex = Arc::clone(&mutex);
-                thread::spawn(move || bump(&block_on(mutex.lock())))
+                let (mutex, flag) = (Arc::clone(&mutex), Arc::clone(&queued));
+                thread::spawn(move || bump(&block_on(flag_when_queued(mutex.lock(), &flag))))
             };
+            wait_for(&queued);
+            // Barge back in after every release, once more than the bound
+            // allows: past it the release must go to the waiter.
+            let mut barged = 0;
+            for _ in 0..=MAX_BYPASS {
+                drop(held.take());
+                held = mutex.try_lock();
+                if let Some(guard) = &held {
+                    bump(guard);
+                    barged += 1;
+                }
+            }
             drop(held);
-            canceller.join().expect("canceller");
             waiter.join().expect("waiter");
-            assert_eq!(read(&mutex.try_lock().expect("the lock was not leaked")), 1);
+            assert_eq!(read(&mutex.try_lock().expect("free")), barged + 1);
         },
     );
 }
 
+contended!(
+    a_cancelled_mutex_waiter_racing_the_handoff_loses_nothing,
+    a_cancelled_mutex_waiter_racing_the_handoff_loses_nothing_at_bound_2,
+    10,
+    || {
+        let mutex = Arc::new(Mutex::new(UnsafeCell::new(0usize)));
+        let held = mutex.try_lock().expect("free");
+        let canceller = {
+            let mutex = Arc::clone(&mutex);
+            thread::spawn(move || poll_once_then_drop(mutex.lock()))
+        };
+        let waiter = {
+            let mutex = Arc::clone(&mutex);
+            thread::spawn(move || bump(&block_on(mutex.lock())))
+        };
+        drop(held);
+        canceller.join().expect("canceller");
+        waiter.join().expect("waiter");
+        assert_eq!(read(&mutex.try_lock().expect("the lock was not leaked")), 1);
+    }
+);
+
+contended!(
+    a_semaphore_never_hands_out_more_permits_than_it_has,
+    a_semaphore_never_hands_out_more_permits_than_it_has_at_bound_2,
+    10,
+    || {
+        let sem = Arc::new(Semaphore::new(2));
+        let out = Arc::new(AtomicUsize::new(0));
+        let held = sem.try_acquire(2).expect("free");
+        let takers: Vec<_> = [2, 1]
+            .into_iter()
+            .map(|n| {
+                let (sem, out) = (Arc::clone(&sem), Arc::clone(&out));
+                thread::spawn(move || {
+                    let permit = block_on(sem.acquire(n));
+                    assert!(out.fetch_add(n, Ordering::SeqCst) + n <= 2, "overdrawn");
+                    out.fetch_sub(n, Ordering::SeqCst);
+                    drop(permit);
+                })
+            })
+            .collect();
+        drop(held);
+        for taker in takers {
+            taker.join().expect("taker");
+        }
+        assert_eq!(sem.available_permits(), 2);
+    }
+);
+
 #[test]
-fn a_semaphore_serves_a_large_request_before_a_smaller_one_behind_it() {
+fn a_large_request_behind_small_callers_is_owed_its_permits() {
     explore(
-        "a_semaphore_serves_a_large_request_before_a_smaller_one_behind_it",
-        2,
+        "a_large_request_behind_small_callers_is_owed_its_permits",
+        3,
         5,
         || {
             let sem = Arc::new(Semaphore::new(2));
-            let order = Arc::new(std::sync::Mutex::new(Vec::new()));
-            let held = sem.try_acquire(2).expect("free");
+            let mut small = sem.try_acquire(1);
+            let other = sem.try_acquire(1).expect("free");
             let queued = Arc::new(AtomicBool::new(false));
             let big = {
-                let (sem, order, flag) =
-                    (Arc::clone(&sem), Arc::clone(&order), Arc::clone(&queued));
-                thread::spawn(move || {
-                    let permit = block_on(flag_when_queued(sem.acquire(2), &flag));
-                    order.lock().expect("order").push(2);
-                    drop(permit);
-                })
+                let (sem, flag) = (Arc::clone(&sem), Arc::clone(&queued));
+                thread::spawn(move || block_on(flag_when_queued(sem.acquire(2), &flag)).count())
             };
             wait_for(&queued);
-            let small = {
-                let (sem, order) = (Arc::clone(&sem), Arc::clone(&order));
-                thread::spawn(move || {
-                    let _permit = block_on(sem.acquire(1));
-                    order.lock().expect("order").push(1);
-                })
-            };
-            drop(held);
-            big.join().expect("big");
-            small.join().expect("small");
-            assert_eq!(*order.lock().expect("order"), vec![2, 1]);
+            // One permit at a time comes free and a small caller takes it
+            // whenever it may, once more than the bound allows.
+            for _ in 0..=MAX_BYPASS {
+                drop(small.take());
+                small = sem.try_acquire(1);
+            }
+            drop(small);
+            drop(other);
+            assert_eq!(big.join().expect("big"), 2);
             assert_eq!(sem.available_permits(), 2);
         },
     );
 }
 
+contended!(
+    an_upgradable_read_upgrades_while_readers_and_a_writer_contend,
+    an_upgradable_read_upgrades_while_readers_and_a_writer_contend_at_bound_2,
+    10,
+    || {
+        let lock = Arc::new(RwLock::new(UnsafeCell::new(0usize)));
+        let upgrader = {
+            let lock = Arc::clone(&lock);
+            thread::spawn(move || {
+                let upgradable = block_on(lock.upgradable_read());
+                let _ = read(&upgradable);
+                bump(&block_on(upgradable.upgrade()));
+            })
+        };
+        let reader = {
+            let lock = Arc::clone(&lock);
+            thread::spawn(move || {
+                let _ = read(&block_on(lock.read()));
+            })
+        };
+        bump(&block_on(lock.write()));
+        upgrader.join().expect("upgrader");
+        reader.join().expect("reader");
+        assert_eq!(read(&lock.try_write().expect("free")), 2);
+    }
+);
+
 #[test]
-fn a_rwlock_admits_waiting_readers_before_the_next_writer() {
+fn a_dropped_upgrade_racing_the_last_reader_leaves_nothing_held() {
     explore(
-        "a_rwlock_admits_waiting_readers_before_the_next_writer",
-        2,
+        "a_dropped_upgrade_racing_the_last_reader_leaves_nothing_held",
+        3,
         5,
         || {
-            let lock = Arc::new(RwLock::new(UnsafeCell::new(0usize)));
-            let order = Arc::new(std::sync::Mutex::new(Vec::new()));
-            let held = lock.try_write().expect("free");
-            let reader_queued = Arc::new(AtomicBool::new(false));
+            let lock = Arc::new(RwLock::new(()));
+            let upgradable = lock.try_upgradable_read().expect("free");
             let reader = {
-                let (lock, order, flag) = (
-                    Arc::clone(&lock),
-                    Arc::clone(&order),
-                    Arc::clone(&reader_queued),
-                );
-                thread::spawn(move || {
-                    let guard = block_on(flag_when_queued(lock.read(), &flag));
-                    order.lock().expect("order").push("read");
-                    read(&guard);
-                })
+                let lock = Arc::clone(&lock);
+                thread::spawn(move || drop(lock.try_read()))
             };
-            wait_for(&reader_queued);
-            let writer = {
-                let (lock, order) = (Arc::clone(&lock), Arc::clone(&order));
-                thread::spawn(move || {
-                    let guard = block_on(lock.write());
-                    order.lock().expect("order").push("write");
-                    bump(&guard);
-                })
-            };
-            drop(held);
+            poll_once_then_drop(upgradable.upgrade());
             reader.join().expect("reader");
-            writer.join().expect("writer");
-            let order = order.lock().expect("order").clone();
-            // The writer may have arrived after the handoff, but it never
-            // overtakes the reader that waited through the writer phase.
-            assert_eq!(order[0], "read", "{order:?}");
-            assert_eq!(read(&lock.try_read().expect("free")), 1);
+            assert!(lock.try_write().is_some(), "nothing was left held");
         },
     );
 }
@@ -382,7 +438,9 @@ fn a_reentrant_reader_never_waits_behind_a_writer_waiting_for_it() {
                 let lock = Arc::clone(&lock);
                 thread::spawn(move || {
                     let owner = Owner::new();
-                    block_on(lock.write(&owner)).fetch_add(1, Ordering::Relaxed);
+                    block_on(lock.write(&owner))
+                        .expect("this owner holds no read")
+                        .fetch_add(1, Ordering::Relaxed);
                 })
             };
             let second = block_on(lock.read(&owner));
@@ -514,58 +572,62 @@ fn once_cell_initializers_agree_on_one_value() {
     });
 }
 
-#[test]
-fn a_cancelled_rwlock_writer_racing_the_last_reader_loses_nothing() {
-    explore(
-        "a_cancelled_rwlock_writer_racing_the_last_reader_loses_nothing",
-        2,
-        10,
-        || {
-            let lock = Arc::new(RwLock::new(UnsafeCell::new(0usize)));
-            let held = lock.try_read().expect("free");
-            let canceller = {
-                let lock = Arc::clone(&lock);
-                thread::spawn(move || poll_once_then_drop(lock.write()))
-            };
-            let writer = {
-                let lock = Arc::clone(&lock);
-                thread::spawn(move || bump(&block_on(lock.write())))
-            };
-            drop(held);
-            canceller.join().expect("canceller");
-            writer.join().expect("writer");
-            assert_eq!(read(&lock.try_write().expect("the lock was not leaked")), 1);
-        },
-    );
-}
+contended!(
+    a_cancelled_rwlock_writer_racing_the_last_reader_loses_nothing,
+    a_cancelled_rwlock_writer_racing_the_last_reader_loses_nothing_at_bound_2,
+    10,
+    || {
+        let lock = Arc::new(RwLock::new(UnsafeCell::new(0usize)));
+        let held = lock.try_read().expect("free");
+        let canceller = {
+            let lock = Arc::clone(&lock);
+            thread::spawn(move || poll_once_then_drop(lock.write()))
+        };
+        let writer = {
+            let lock = Arc::clone(&lock);
+            thread::spawn(move || bump(&block_on(lock.write())))
+        };
+        drop(held);
+        canceller.join().expect("canceller");
+        writer.join().expect("writer");
+        assert_eq!(read(&lock.try_write().expect("the lock was not leaked")), 1);
+    }
+);
 
 #[test]
-fn a_reentrant_reader_upgrades_once_the_other_reader_leaves() {
+fn a_reentrant_write_becomes_its_owners_read_while_another_owner_waits() {
     explore(
-        "a_reentrant_reader_upgrades_once_the_other_reader_leaves",
+        "a_reentrant_write_becomes_its_owners_read_while_another_owner_waits",
         3,
         5,
         || {
             let lock = Arc::new(ReentrantRwLock::new(AtomicUsize::new(0)));
             let owner = Owner::new();
-            let mine = lock.try_read(&owner).expect("free");
+            let write = lock.try_write(&owner).expect("free");
+            let read = lock.try_read(&owner).expect("a writer may read");
             let other = {
                 let lock = Arc::clone(&lock);
                 thread::spawn(move || {
                     let owner = Owner::new();
-                    if let Some(read) = lock.try_read(&owner) {
-                        read.load(Ordering::Relaxed);
-                    }
+                    block_on(lock.write(&owner))
+                        .expect("this owner holds no read")
+                        .fetch_add(1, Ordering::Relaxed);
                 })
             };
-            block_on(lock.write(&owner)).fetch_add(1, Ordering::Relaxed);
-            drop(mine);
-            other.join().expect("other reader");
+            write.fetch_add(1, Ordering::Relaxed);
+            drop(write);
+            assert_eq!(
+                read.load(Ordering::Relaxed),
+                1,
+                "the read outlives the write"
+            );
+            drop(read);
+            other.join().expect("other owner");
             assert_eq!(
                 lock.try_write(&Owner::new())
                     .expect("free")
                     .load(Ordering::Relaxed),
-                1
+                2
             );
         },
     );
@@ -687,30 +749,31 @@ fn calibration_an_unguarded_write_is_caught() {
     });
 }
 
+/// A queued waiter does not keep the lock from a caller that finds it
+/// free: barging is the design, so expecting the queue to win must fail.
 #[test]
-#[should_panic(expected = "assertion `left == right` failed")]
-fn calibration_the_reverse_order_is_never_granted() {
+#[should_panic(expected = "a release went to a caller ahead of the queued waiter")]
+fn calibration_a_queued_waiter_can_be_barged_past() {
     explore(
-        "calibration_the_reverse_order_is_never_granted",
+        "calibration_a_queued_waiter_can_be_barged_past",
         3,
         1,
         || {
-            let mutex = Arc::new(Mutex::new(Vec::new()));
+            let mutex = Arc::new(Mutex::new(()));
             let held = mutex.try_lock().expect("free");
-            let first_queued = Arc::new(AtomicBool::new(false));
-            let first = {
-                let (mutex, flag) = (Arc::clone(&mutex), Arc::clone(&first_queued));
-                thread::spawn(move || block_on(flag_when_queued(mutex.lock(), &flag)).push(1))
+            let queued = Arc::new(AtomicBool::new(false));
+            let waiter = {
+                let (mutex, flag) = (Arc::clone(&mutex), Arc::clone(&queued));
+                thread::spawn(move || drop(block_on(flag_when_queued(mutex.lock(), &flag))))
             };
-            wait_for(&first_queued);
-            let second = {
-                let mutex = Arc::clone(&mutex);
-                thread::spawn(move || block_on(mutex.lock()).push(2))
-            };
+            wait_for(&queued);
             drop(held);
-            first.join().expect("first");
-            second.join().expect("second");
-            assert_eq!(*mutex.try_lock().expect("free"), vec![2, 1]);
+            let barged = mutex.try_lock().is_some();
+            waiter.join().expect("waiter");
+            assert!(
+                !barged,
+                "a release went to a caller ahead of the queued waiter"
+            );
         },
     );
 }

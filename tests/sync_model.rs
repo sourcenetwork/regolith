@@ -1,18 +1,28 @@
 //! Property tests for `regolith::sync` against sequential models.
 //!
 //! Each case drives one primitive with a random schedule of acquires,
-//! polls, cancellations (dropping a pending future), releases and `try_`
-//! calls on a single-threaded executor, and after every step compares it
-//! with a plain sequential model of the contract:
+//! polls, cancellations (dropping a pending future), releases, `try_`
+//! calls and storms on a single-threaded executor that polls every woken
+//! future until nothing more is woken. A storm releases what is held and
+//! lets a barging `try_` call take it before the woken waiter runs, which
+//! is what passes a waiter over. After every step the case checks:
 //!
-//! - every `try_` call and every poll returns what the model says;
-//! - a waiter's waker has fired exactly once if the model has granted it
-//!   and never otherwise, so no wakeup is lost and nobody is woken for
-//!   nothing;
-//! - a cancelled waiter that had been granted passes its grant on.
+//! - **Exclusion and accounting:** permits held and free add up; a writer
+//!   holds alone; one upgradable read at most.
+//! - **No stranded waiter:** once quiet, nobody waits for what is free.
+//!   For a semaphore, the oldest waiter needs more than is free; for a lock,
+//!   someone holds it.
+//! - **Bounded bypass:** a waiter that is woken and loses is passed over;
+//!   it is passed over at most [`MAX_BYPASS`] times, plus once for each
+//!   handoff owed to another waiter in the meantime.
 //!
-//! Single-threaded schedules cover the ordering contract; the loom models
-//! in `tests/loom_sync.rs` cover the interleavings.
+//! At the end everything held is released, round after round, and every
+//! waiter must finish: nothing is lost and nothing deadlocks, upgrades
+//! included. Notify keeps its own exact model: it hands notifications over
+//! in order.
+//!
+//! Single-threaded schedules cover the protocol's decisions; the loom
+//! models in `tests/loom_sync.rs` cover the interleavings.
 
 use std::collections::VecDeque;
 use std::future::Future;
@@ -22,7 +32,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll, Wake, Waker};
 
 use proptest::prelude::*;
-use regolith::sync::{Mutex, Notify, RwLock, Semaphore};
+use regolith::sync::{
+    MAX_BYPASS, Mutex, MutexGuard, Notify, RwLock, RwLockReadGuard, RwLockUpgradableReadGuard,
+    RwLockWriteGuard, Semaphore, SemaphorePermit,
+};
 
 struct Counter(AtomicUsize);
 
@@ -37,6 +50,9 @@ struct Polled<F: Future> {
     future: Pin<Box<F>>,
     counter: Arc<Counter>,
     waker: Waker,
+    seen: usize,
+    /// Polls after a wake that came back `Pending`: times passed over.
+    losses: usize,
 }
 
 impl<F: Future> Polled<F> {
@@ -46,6 +62,8 @@ impl<F: Future> Polled<F> {
             future: Box::pin(future),
             waker: Waker::from(Arc::clone(&counter)),
             counter,
+            seen: 0,
+            losses: 0,
         }
     }
 
@@ -58,6 +76,30 @@ impl<F: Future> Polled<F> {
     fn wakes(&self) -> usize {
         self.counter.0.load(Ordering::SeqCst)
     }
+
+    fn woken(&self) -> bool {
+        self.wakes() > self.seen
+    }
+}
+
+/// Polls every woken task until none is, moving the finished ones'
+/// outputs into `done`.
+fn run<F: Future>(tasks: &mut Vec<Polled<F>>, done: &mut Vec<F::Output>) {
+    for _ in 0..10_000 {
+        let Some(at) = tasks.iter().position(Polled::woken) else {
+            return;
+        };
+        let task = &mut tasks[at];
+        task.seen = task.wakes();
+        match task.poll() {
+            Poll::Ready(output) => {
+                tasks.remove(at);
+                done.push(output);
+            }
+            Poll::Pending => task.losses += 1,
+        }
+    }
+    panic!("the executor never went quiet: a wake loop");
 }
 
 /// One step of a schedule. Indices pick among the live futures or held
@@ -69,16 +111,18 @@ enum Step {
     Cancel(usize),
     Release(usize),
     Try(usize),
+    Storm(usize),
     Add(usize),
 }
 
 fn steps() -> impl Strategy<Value = Vec<Step>> {
     let step = prop_oneof![
-        3 => (1usize..4).prop_map(Step::Start),
-        3 => any::<usize>().prop_map(Step::Poll),
+        3 => (0usize..4).prop_map(Step::Start),
+        2 => any::<usize>().prop_map(Step::Poll),
         2 => any::<usize>().prop_map(Step::Cancel),
         3 => any::<usize>().prop_map(Step::Release),
-        1 => (1usize..4).prop_map(Step::Try),
+        1 => (0usize..4).prop_map(Step::Try),
+        2 => (1usize..24).prop_map(Step::Storm),
         1 => (1usize..3).prop_map(Step::Add),
     ];
     prop::collection::vec(step, 1..80)
@@ -88,405 +132,320 @@ fn pick(len: usize, i: usize) -> Option<usize> {
     (len != 0).then(|| i % len)
 }
 
-/// The weighted FIFO contract a semaphore keeps.
-#[derive(Default)]
-struct SemaphoreModel {
-    free: usize,
-    /// Waiting requests, oldest first: (id, permits).
-    queue: VecDeque<(usize, usize)>,
-    /// Granted requests whose future has not seen the grant yet.
-    granted: Vec<(usize, usize)>,
-}
-
-impl SemaphoreModel {
-    fn grant(&mut self) {
-        while let Some(&(id, n)) = self.queue.front() {
-            if self.free < n {
-                break;
-            }
-            self.free -= n;
-            self.queue.pop_front();
-            self.granted.push((id, n));
-        }
-    }
-
-    fn try_acquire(&mut self, n: usize) -> bool {
-        let ok = self.queue.is_empty() && self.free >= n;
-        if ok {
-            self.free -= n;
-        }
-        ok
-    }
-
-    fn release(&mut self, n: usize) {
-        self.free += n;
-        self.grant();
-    }
-
-    fn is_granted(&self, id: usize) -> bool {
-        self.granted.iter().any(|(g, _)| *g == id)
-    }
-
-    fn cancel(&mut self, id: usize) {
-        if let Some(at) = self.granted.iter().position(|(g, _)| *g == id) {
-            let (_, n) = self.granted.remove(at);
-            self.release(n);
-        } else {
-            self.queue.retain(|(q, _)| *q != id);
-            self.grant();
-        }
-    }
+/// The bypass bound for one waiter: `MAX_BYPASS`, plus one loss for each
+/// handoff owed to another waiter, at most one per waiter ever queued.
+fn bypass_bound(queued: usize) -> usize {
+    MAX_BYPASS as usize + queued
 }
 
 fn run_semaphore(initial: usize, schedule: &[Step], weighted: bool) -> Result<(), TestCaseError> {
     let sem = Semaphore::new(initial);
-    let mut model = SemaphoreModel {
-        free: initial,
-        ..SemaphoreModel::default()
+    let mut total = initial;
+    let mut tasks = Vec::new();
+    let mut needs: VecDeque<(usize, usize)> = VecDeque::new();
+    let mut held: Vec<SemaphorePermit<'_>> = Vec::new();
+    let mut queued = 0;
+    let need = |n: usize| {
+        if weighted {
+            (1 + n % 3).min(initial)
+        } else {
+            1
+        }
     };
-    let mut waiting = Vec::new();
-    let mut held = Vec::new();
-    for (next_id, step) in schedule.iter().enumerate() {
+    for step in schedule {
+        let mut done = Vec::new();
         match *step {
             Step::Start(n) => {
-                let n = if weighted { n } else { 1 };
-                let ready_now = model.try_acquire(n);
-                let mut future = Polled::new(sem.acquire(n));
-                match future.poll() {
-                    Poll::Ready(permit) => {
-                        prop_assert!(ready_now, "acquired with others queued or too few free");
-                        held.push(permit);
-                    }
+                let mut task = Polled::new(sem.acquire(need(n)));
+                match task.poll() {
+                    Poll::Ready(permit) => held.push(permit),
                     Poll::Pending => {
-                        prop_assert!(!ready_now, "waited although the permits were free");
-                        model.queue.push_back((next_id, n));
-                        waiting.push((next_id, future));
+                        queued += 1;
+                        needs.push_back((Arc::as_ptr(&task.counter) as usize, need(n)));
+                        tasks.push(task);
                     }
                 }
             }
             Step::Poll(i) => {
-                if let Some(at) = pick(waiting.len(), i) {
-                    let id = waiting[at].0;
-                    match waiting[at].1.poll() {
-                        Poll::Ready(permit) => {
-                            prop_assert!(model.is_granted(id), "ready without a grant");
-                            model.granted.retain(|(g, _)| *g != id);
-                            held.push(permit);
-                            waiting.remove(at);
-                        }
-                        Poll::Pending => prop_assert!(!model.is_granted(id), "granted but pending"),
-                    }
+                if let Some(at) = pick(tasks.len(), i)
+                    && let Poll::Ready(permit) = tasks[at].poll()
+                {
+                    tasks.remove(at);
+                    held.push(permit);
                 }
             }
             Step::Cancel(i) => {
-                if let Some(at) = pick(waiting.len(), i) {
-                    let (id, future) = waiting.remove(at);
-                    drop(future);
-                    model.cancel(id);
+                if let Some(at) = pick(tasks.len(), i) {
+                    tasks.remove(at);
                 }
             }
             Step::Release(i) => {
                 if let Some(at) = pick(held.len(), i) {
-                    let permit = held.remove(at);
-                    model.release(permit.count());
+                    drop(held.remove(at));
                 }
             }
-            Step::Try(n) => {
-                let n = if weighted { n } else { 1 };
-                let expected = model.try_acquire(n);
-                match sem.try_acquire(n) {
-                    Some(permit) => {
-                        prop_assert!(expected, "try_acquire jumped the queue");
-                        held.push(permit);
+            Step::Try(n) => held.extend(sem.try_acquire(need(n))),
+            Step::Storm(rounds) => {
+                for _ in 0..rounds {
+                    if held.is_empty() {
+                        break;
                     }
-                    None => prop_assert!(!expected, "try_acquire refused free permits"),
+                    drop(held.remove(0));
+                    held.extend(sem.try_acquire(1));
+                    run(&mut tasks, &mut done);
+                    held.append(&mut done);
                 }
             }
             Step::Add(n) => {
                 sem.add_permits(n);
-                model.release(n);
+                total += n;
             }
         }
-        prop_assert_eq!(sem.available_permits(), model.free);
-        for (id, future) in &waiting {
-            let expected = usize::from(model.is_granted(*id));
-            prop_assert_eq!(future.wakes(), expected, "waiter {} woken wrongly", id);
+        run(&mut tasks, &mut done);
+        held.append(&mut done);
+        let live: Vec<usize> = tasks
+            .iter()
+            .map(|t| Arc::as_ptr(&t.counter) as usize)
+            .collect();
+        needs.retain(|(id, _)| live.contains(id));
+        let out: usize = held.iter().map(SemaphorePermit::count).sum();
+        prop_assert_eq!(out + sem.available_permits(), total, "permits leaked");
+        if let Some(&(_, front)) = needs.front() {
+            prop_assert!(
+                front > sem.available_permits(),
+                "the oldest waiter needs {} and {} are free, yet it sleeps",
+                front,
+                sem.available_permits()
+            );
         }
-    }
-    Ok(())
-}
-
-/// The phase-fair contract a reader-writer lock keeps.
-#[derive(Default)]
-struct RwModel {
-    readers: usize,
-    writer: bool,
-    last_read: bool,
-    waiting_readers: VecDeque<usize>,
-    waiting_writers: VecDeque<usize>,
-    granted: Vec<usize>,
-}
-
-impl RwModel {
-    fn grant(&mut self) {
-        loop {
-            if self.writer {
-                return;
-            }
-            let readers_turn = !self.last_read || self.waiting_writers.is_empty();
-            if readers_turn && !self.waiting_readers.is_empty() {
-                while let Some(id) = self.waiting_readers.pop_front() {
-                    self.readers += 1;
-                    self.granted.push(id);
-                }
-                self.last_read = true;
-                continue;
-            }
-            if self.readers == 0
-                && let Some(id) = self.waiting_writers.pop_front()
-            {
-                self.writer = true;
-                self.last_read = false;
-                self.granted.push(id);
-            }
-            return;
+        for task in &tasks {
+            prop_assert!(
+                task.losses <= bypass_bound(queued),
+                "a waiter was passed over {} times",
+                task.losses
+            );
         }
     }
-
-    fn try_read(&mut self) -> bool {
-        let ok = !self.writer && self.waiting_writers.is_empty();
-        if ok {
-            self.readers += 1;
-            self.last_read = true;
+    for _ in 0..1_000 {
+        if tasks.is_empty() {
+            return Ok(());
         }
-        ok
+        held.clear();
+        let mut done = Vec::new();
+        run(&mut tasks, &mut done);
+        held.append(&mut done);
     }
-
-    fn try_write(&mut self) -> bool {
-        let ok = !self.writer
-            && self.readers == 0
-            && self.waiting_writers.is_empty()
-            && self.waiting_readers.is_empty();
-        if ok {
-            self.writer = true;
-            self.last_read = false;
-        }
-        ok
-    }
-}
-
-enum RwGuard<'a> {
-    Read(regolith::sync::RwLockReadGuard<'a, ()>),
-    Write(regolith::sync::RwLockWriteGuard<'a, ()>),
-}
-
-enum RwFuture<'a> {
-    Read(Polled<regolith::sync::Read<'a, ()>>),
-    Write(Polled<regolith::sync::Write<'a, ()>>),
-}
-
-impl<'a> RwFuture<'a> {
-    fn poll(&mut self) -> Poll<RwGuard<'a>> {
-        match self {
-            Self::Read(f) => f.poll().map(RwGuard::Read),
-            Self::Write(f) => f.poll().map(RwGuard::Write),
-        }
-    }
-
-    fn wakes(&self) -> usize {
-        match self {
-            Self::Read(f) => f.wakes(),
-            Self::Write(f) => f.wakes(),
-        }
-    }
-}
-
-fn run_rwlock(schedule: &[Step]) -> Result<(), TestCaseError> {
-    let lock = RwLock::new(());
-    let mut model = RwModel {
-        last_read: true,
-        ..RwModel::default()
-    };
-    let mut waiting: Vec<(usize, bool, RwFuture<'_>)> = Vec::new();
-    let mut held: Vec<RwGuard<'_>> = Vec::new();
-    for (id, step) in schedule.iter().enumerate() {
-        match *step {
-            Step::Start(n) => {
-                let write = n == 1;
-                let ready_now = if write {
-                    model.try_write()
-                } else {
-                    model.try_read()
-                };
-                let mut future = if write {
-                    RwFuture::Write(Polled::new(lock.write()))
-                } else {
-                    RwFuture::Read(Polled::new(lock.read()))
-                };
-                match future.poll() {
-                    Poll::Ready(guard) => {
-                        prop_assert!(ready_now, "entered past a waiter or a holder");
-                        held.push(guard);
-                    }
-                    Poll::Pending => {
-                        prop_assert!(!ready_now, "waited although the lock was free to it");
-                        if write {
-                            model.waiting_writers.push_back(id);
-                        } else {
-                            model.waiting_readers.push_back(id);
-                        }
-                        waiting.push((id, write, future));
-                    }
-                }
-            }
-            Step::Poll(i) => {
-                if let Some(at) = pick(waiting.len(), i) {
-                    let id = waiting[at].0;
-                    match waiting[at].2.poll() {
-                        Poll::Ready(guard) => {
-                            prop_assert!(model.granted.contains(&id), "ready without a grant");
-                            model.granted.retain(|g| *g != id);
-                            held.push(guard);
-                            waiting.remove(at);
-                        }
-                        Poll::Pending => prop_assert!(!model.granted.contains(&id)),
-                    }
-                }
-            }
-            Step::Cancel(i) => {
-                if let Some(at) = pick(waiting.len(), i) {
-                    let (id, write, future) = waiting.remove(at);
-                    drop(future);
-                    if let Some(g) = model.granted.iter().position(|g| *g == id) {
-                        model.granted.remove(g);
-                        if write {
-                            model.writer = false;
-                        } else {
-                            model.readers -= 1;
-                        }
-                    } else {
-                        model.waiting_readers.retain(|q| *q != id);
-                        model.waiting_writers.retain(|q| *q != id);
-                    }
-                    model.grant();
-                }
-            }
-            Step::Release(i) => {
-                if let Some(at) = pick(held.len(), i) {
-                    match held.remove(at) {
-                        RwGuard::Read(guard) => {
-                            drop(guard);
-                            model.readers -= 1;
-                        }
-                        RwGuard::Write(guard) => {
-                            drop(guard);
-                            model.writer = false;
-                        }
-                    }
-                    model.grant();
-                }
-            }
-            Step::Try(n) => {
-                if n == 1 {
-                    let expected = model.try_write();
-                    match lock.try_write() {
-                        Some(guard) => {
-                            prop_assert!(expected, "try_write overtook");
-                            held.push(RwGuard::Write(guard));
-                        }
-                        None => prop_assert!(!expected, "try_write refused a free lock"),
-                    }
-                } else {
-                    let expected = model.try_read();
-                    match lock.try_read() {
-                        Some(guard) => {
-                            prop_assert!(expected, "try_read overtook a writer");
-                            held.push(RwGuard::Read(guard));
-                        }
-                        None => prop_assert!(!expected, "try_read refused a free lock"),
-                    }
-                }
-            }
-            Step::Add(_) => {}
-        }
-        for (id, _, future) in &waiting {
-            let expected = usize::from(model.granted.contains(id));
-            prop_assert_eq!(future.wakes(), expected, "waiter {} woken wrongly", id);
-        }
-    }
+    prop_assert!(tasks.is_empty(), "{} waiters never finished", tasks.len());
     Ok(())
 }
 
 fn run_mutex(schedule: &[Step]) -> Result<(), TestCaseError> {
     let mutex = Mutex::new(());
-    let mut model = SemaphoreModel {
-        free: 1,
-        ..SemaphoreModel::default()
-    };
-    let mut waiting = Vec::new();
-    let mut held = Vec::new();
-    for (id, step) in schedule.iter().enumerate() {
+    let mut tasks = Vec::new();
+    let mut held: Vec<MutexGuard<'_, ()>> = Vec::new();
+    let mut queued = 0;
+    for step in schedule {
+        let mut done = Vec::new();
         match *step {
             Step::Start(_) => {
-                let ready_now = model.try_acquire(1);
-                let mut future = Polled::new(mutex.lock());
-                match future.poll() {
-                    Poll::Ready(guard) => {
-                        prop_assert!(ready_now, "locked past a waiter or the holder");
-                        held.push(guard);
-                    }
+                let mut task = Polled::new(mutex.lock());
+                match task.poll() {
+                    Poll::Ready(guard) => held.push(guard),
                     Poll::Pending => {
-                        prop_assert!(!ready_now, "waited on a free mutex");
-                        model.queue.push_back((id, 1));
-                        waiting.push((id, future));
+                        queued += 1;
+                        tasks.push(task);
                     }
                 }
             }
             Step::Poll(i) => {
-                if let Some(at) = pick(waiting.len(), i) {
-                    let id = waiting[at].0;
-                    match waiting[at].1.poll() {
-                        Poll::Ready(guard) => {
-                            prop_assert!(model.is_granted(id));
-                            model.granted.clear();
-                            held.push(guard);
-                            waiting.remove(at);
-                        }
-                        Poll::Pending => prop_assert!(!model.is_granted(id)),
-                    }
+                if let Some(at) = pick(tasks.len(), i)
+                    && let Poll::Ready(guard) = tasks[at].poll()
+                {
+                    tasks.remove(at);
+                    held.push(guard);
                 }
             }
             Step::Cancel(i) => {
-                if let Some(at) = pick(waiting.len(), i) {
-                    let (id, future) = waiting.remove(at);
-                    drop(future);
-                    model.cancel(id);
+                if let Some(at) = pick(tasks.len(), i) {
+                    tasks.remove(at);
                 }
             }
-            Step::Release(i) => {
-                if pick(held.len(), i).is_some() {
-                    held.clear();
-                    model.release(1);
-                }
-            }
-            Step::Try(_) => {
-                let expected = model.try_acquire(1);
-                match mutex.try_lock() {
-                    Some(guard) => {
-                        prop_assert!(expected, "try_lock barged");
-                        held.push(guard);
+            Step::Release(_) => held.clear(),
+            Step::Try(_) => held.extend(mutex.try_lock()),
+            Step::Storm(rounds) => {
+                for _ in 0..rounds {
+                    if held.is_empty() {
+                        break;
                     }
-                    None => prop_assert!(!expected, "try_lock refused a free mutex"),
+                    held.clear();
+                    held.extend(mutex.try_lock());
+                    run(&mut tasks, &mut done);
+                    held.append(&mut done);
                 }
             }
             Step::Add(_) => {}
         }
+        run(&mut tasks, &mut done);
+        held.append(&mut done);
         prop_assert!(held.len() <= 1, "two guards at once");
-        for (id, future) in &waiting {
-            let expected = usize::from(model.is_granted(*id));
-            prop_assert_eq!(future.wakes(), expected, "waiter {} woken wrongly", id);
+        prop_assert!(
+            tasks.is_empty() || !held.is_empty(),
+            "the mutex is free yet {} waiters sleep",
+            tasks.len()
+        );
+        for task in &tasks {
+            // One permit: only the oldest waiter is ever woken, and it is
+            // the one owed the handoff, so the bound is exact.
+            prop_assert!(
+                task.losses <= MAX_BYPASS as usize,
+                "a waiter was passed over {} times",
+                task.losses
+            );
         }
     }
+    prop_assert!(queued >= tasks.len());
+    for _ in 0..1_000 {
+        if tasks.is_empty() {
+            return Ok(());
+        }
+        held.clear();
+        let mut done = Vec::new();
+        run(&mut tasks, &mut done);
+        held.append(&mut done);
+    }
+    prop_assert!(tasks.is_empty(), "{} waiters never finished", tasks.len());
+    Ok(())
+}
+
+enum Guard<'a> {
+    Read(RwLockReadGuard<'a, ()>),
+    Write(RwLockWriteGuard<'a, ()>),
+    Upgradable(RwLockUpgradableReadGuard<'a, ()>),
+}
+
+impl Guard<'_> {
+    /// Reaches the value through the guard, as its holder would.
+    fn touch(&self) {
+        match self {
+            Self::Read(guard) => **guard,
+            Self::Write(guard) => **guard,
+            Self::Upgradable(guard) => **guard,
+        }
+    }
+}
+
+type RwFuture<'a> = Pin<Box<dyn Future<Output = Guard<'a>> + 'a>>;
+
+fn run_rwlock(schedule: &[Step]) -> Result<(), TestCaseError> {
+    let lock = RwLock::new(());
+    let mut tasks: Vec<Polled<RwFuture<'_>>> = Vec::new();
+    let mut held: Vec<Guard<'_>> = Vec::new();
+    let mut queued = 0;
+    let start = |kind: usize| -> RwFuture<'_> {
+        match kind {
+            0 | 3 => Box::pin(async { Guard::Read(lock.read().await) }),
+            1 => Box::pin(async { Guard::Write(lock.write().await) }),
+            _ => Box::pin(async { Guard::Upgradable(lock.upgradable_read().await) }),
+        }
+    };
+    for step in schedule {
+        let mut done = Vec::new();
+        match *step {
+            Step::Start(kind) => {
+                // An upgrade of a held upgradable read, when there is one.
+                let upgradable = held.iter().position(|g| matches!(g, Guard::Upgradable(_)));
+                let future = match (kind, upgradable) {
+                    (3, Some(at)) => match held.remove(at) {
+                        Guard::Upgradable(up) => {
+                            Box::pin(async { Guard::Write(up.upgrade().await) }) as RwFuture<'_>
+                        }
+                        _ => unreachable!("matched above"),
+                    },
+                    _ => start(kind),
+                };
+                let mut task = Polled::new(future);
+                match task.poll() {
+                    Poll::Ready(guard) => held.push(guard),
+                    Poll::Pending => {
+                        queued += 1;
+                        tasks.push(task);
+                    }
+                }
+            }
+            Step::Poll(i) => {
+                if let Some(at) = pick(tasks.len(), i)
+                    && let Poll::Ready(guard) = tasks[at].poll()
+                {
+                    tasks.remove(at);
+                    held.push(guard);
+                }
+            }
+            Step::Cancel(i) => {
+                if let Some(at) = pick(tasks.len(), i) {
+                    tasks.remove(at);
+                }
+            }
+            Step::Release(i) => {
+                if let Some(at) = pick(held.len(), i) {
+                    drop(held.remove(at));
+                }
+            }
+            Step::Try(kind) => match kind {
+                0 | 3 => held.extend(lock.try_read().map(Guard::Read)),
+                1 => held.extend(lock.try_write().map(Guard::Write)),
+                _ => held.extend(lock.try_upgradable_read().map(Guard::Upgradable)),
+            },
+            Step::Storm(rounds) => {
+                for round in 0..rounds {
+                    if held.is_empty() {
+                        break;
+                    }
+                    drop(held.remove(0));
+                    if round % 2 == 0 {
+                        held.extend(lock.try_read().map(Guard::Read));
+                    } else {
+                        held.extend(lock.try_write().map(Guard::Write));
+                    }
+                    run(&mut tasks, &mut done);
+                    held.append(&mut done);
+                }
+            }
+            Step::Add(_) => {}
+        }
+        run(&mut tasks, &mut done);
+        held.append(&mut done);
+        held.iter().for_each(Guard::touch);
+        let writers = held.iter().filter(|g| matches!(g, Guard::Write(_))).count();
+        let upgradable = held
+            .iter()
+            .filter(|g| matches!(g, Guard::Upgradable(_)))
+            .count();
+        prop_assert!(writers <= 1, "two writers");
+        prop_assert!(writers == 0 || held.len() == 1, "a writer shares the lock");
+        prop_assert!(upgradable <= 1, "two upgradable reads");
+        prop_assert!(
+            tasks.is_empty() || !held.is_empty(),
+            "the lock is free yet {} waiters sleep",
+            tasks.len()
+        );
+        for task in &tasks {
+            prop_assert!(
+                task.losses <= bypass_bound(queued),
+                "a waiter was passed over {} times",
+                task.losses
+            );
+        }
+    }
+    for _ in 0..1_000 {
+        if tasks.is_empty() {
+            return Ok(());
+        }
+        held.clear();
+        let mut done = Vec::new();
+        run(&mut tasks, &mut done);
+        held.append(&mut done);
+    }
+    prop_assert!(tasks.is_empty(), "{} waiters never finished", tasks.len());
     Ok(())
 }
 
@@ -539,7 +498,7 @@ fn run_notify(schedule: &[Step]) -> Result<(), TestCaseError> {
                     }
                 }
             }
-            Step::Release(_) | Step::Add(_) => {
+            Step::Release(_) | Step::Add(_) | Step::Storm(_) => {
                 notify.notify_one();
                 match queue.pop_front() {
                     Some(next) => granted.push((next, true)),
@@ -561,22 +520,28 @@ fn run_notify(schedule: &[Step]) -> Result<(), TestCaseError> {
 
 proptest! {
     #[test]
-    fn a_semaphore_follows_the_weighted_fifo_model(initial in 0usize..4, schedule in steps()) {
+    fn a_semaphore_keeps_its_permits_and_bounds_every_bypass(
+        initial in 1usize..4,
+        schedule in steps(),
+    ) {
         run_semaphore(initial, &schedule, true)?;
     }
 
     #[test]
-    fn a_unit_semaphore_follows_the_fifo_model(initial in 0usize..3, schedule in steps()) {
+    fn a_unit_semaphore_keeps_its_permits_and_bounds_every_bypass(
+        initial in 1usize..3,
+        schedule in steps(),
+    ) {
         run_semaphore(initial, &schedule, false)?;
     }
 
     #[test]
-    fn a_mutex_follows_the_handoff_model(schedule in steps()) {
+    fn a_mutex_excludes_and_passes_a_waiter_over_at_most_max_bypass_times(schedule in steps()) {
         run_mutex(&schedule)?;
     }
 
     #[test]
-    fn a_rwlock_follows_the_phase_fair_model(schedule in steps()) {
+    fn a_rwlock_excludes_never_strands_and_bounds_every_bypass(schedule in steps()) {
         run_rwlock(&schedule)?;
     }
 
@@ -584,4 +549,28 @@ proptest! {
     fn notify_follows_its_model(schedule in steps()) {
         run_notify(&schedule)?;
     }
+}
+
+/// The storm the generator relies on does reach the handoff: without it
+/// the bypass bound would be checked on schedules that never approach it.
+#[test]
+fn a_storm_drives_a_waiter_to_its_handoff() {
+    let mutex = Mutex::new(());
+    let mut held = vec![mutex.try_lock().expect("free")];
+    let mut tasks = vec![Polled::new(mutex.lock())];
+    assert!(tasks[0].poll().is_pending());
+    let mut done = Vec::new();
+    for _ in 0..MAX_BYPASS {
+        held.clear();
+        held.extend(mutex.try_lock());
+        run(&mut tasks, &mut done);
+    }
+    assert_eq!(tasks[0].losses, MAX_BYPASS as usize);
+    held.clear();
+    assert!(
+        mutex.try_lock().is_none(),
+        "the release went straight to the owed waiter"
+    );
+    run(&mut tasks, &mut done);
+    assert!(tasks.is_empty() && done.len() == 1, "handed the lock");
 }

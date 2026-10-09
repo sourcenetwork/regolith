@@ -255,6 +255,31 @@ jobs:
       - name: Run ignored tests (stress / soak / concurrency)
         run: just test-slow
 
+  # The five `regolith::sync` loom models whose three threads all contend
+  # for one lock or semaphore, at preemption bound 2. The model-checking
+  # workflow runs them at bound 1 on every change; TIMING_PLACEHOLDER, so
+  # they run here, nightly, one job per model.
+  loom-sync-deep:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        model:
+          - mutex_excludes_and_loses_no_wakeup_at_bound_2
+          - a_cancelled_mutex_waiter_racing_the_handoff_loses_nothing_at_bound_2
+          - a_semaphore_never_hands_out_more_permits_than_it_has_at_bound_2
+          - an_upgradable_read_upgrades_while_readers_and_a_writer_contend_at_bound_2
+          - a_cancelled_rwlock_writer_racing_the_last_reader_loses_nothing_at_bound_2
+    steps:
+      - uses: actions/checkout@v4
+      - uses: extractions/setup-just@v2
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Loom ${{ matrix.model }}
+        run: just loom-sync-deep ${{ matrix.model }}
+
   # Durability, split out from `test` because it fails for different
   # reasons and is worth reading on its own: crash recovery, power loss,
   # the fault shim, the lifecycle sweep and the MVCC invariants.
