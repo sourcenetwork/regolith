@@ -15,6 +15,10 @@
 //!   opens a sealed block before it lands, applies an ingested table's
 //!   sequence, and reports a block that fails its tag once, naming the table.
 //!   Every read path on an encrypted database is in `io_queue_paths.rs`.
+//! - **Queue reads and close** (#269 x #265). Close releases the units reads
+//!   wait on, then flushes and joins the worker, while reads already under
+//!   way and the worker's flushes go on: every wait completes, no unit is
+//!   left, and a close that fails leaves queue reads working.
 
 mod common;
 
@@ -27,8 +31,8 @@ use common::faulty_env::{FaultyEnv, Refuse, logs};
 use common::keys::Keys;
 use regolith::env::Env;
 use regolith::{
-    BackupEngine, Db, Error, IngestOptions, IoBudget, IoQueue, Options, ReadMode, SstFileWriter,
-    Statistics, Ticker,
+    BackupEngine, Db, Error, IngestOptions, IoBudget, IoQueue, IoWait, Options, ReadMode,
+    SstFileWriter, Statistics, Ticker, WouldBlock,
 };
 use tempfile::TempDir;
 
@@ -416,4 +420,133 @@ fn an_ingested_table_read_through_a_queue_on_an_encrypted_database_reads_at_its_
             "key {i}"
         );
     }
+}
+
+fn queued_wait(read: regolith::Result<Option<Vec<u8>>>) -> IoWait {
+    match read {
+        Err(Error::WouldBlock(WouldBlock::Io(wait))) => wait,
+        other => panic!("expected the read to wait on its queue, got {other:?}"),
+    }
+}
+
+/// Close while a writer keeps sealing memtables that the worker flushes off
+/// the commit path, with reads waiting on a queue: close's own flush and the
+/// worker's race nothing into a lost completion. Every wait completes, the
+/// queue owes nothing after, the reads run again answer `Closed`, and every
+/// write the writer was told landed survives the reopen.
+#[test]
+fn close_while_the_worker_flushes_completes_every_queued_read() {
+    let dir = TempDir::new().unwrap();
+    let stats = Arc::new(Statistics::new());
+    let options = || {
+        Options::default()
+            .write_buffer_size(4 * 1024)
+            .block_size(256)
+            .max_background_compactions(1)
+            // The worker only flushes: no compaction fills the cache.
+            .l0_compaction_trigger(1000)
+            .statistics(Some(Arc::clone(&stats)))
+    };
+    {
+        let db = Db::open(dir.path(), options()).unwrap();
+        for i in 0..2000 {
+            db.put(&numbered(i), b"in a table").unwrap();
+        }
+        db.flush().unwrap();
+        db.close().unwrap();
+    }
+    let db = Arc::new(Db::open(dir.path(), options()).unwrap());
+    let mut queue = db.io_queue();
+    let snapshot = db
+        .snapshot()
+        .with_read_mode(ReadMode::CacheOnly(queue.id()));
+    let waits: Vec<IoWait> = (125..2000)
+        .step_by(250)
+        .map(|i| queued_wait(snapshot.get(&numbered(i))))
+        .collect();
+
+    let flushes = stats.get_ticker(Ticker::FlushCount);
+    let writer = {
+        let db = Arc::clone(&db);
+        std::thread::spawn(move || {
+            let mut landed = 0usize;
+            loop {
+                match db.put(format!("late/{landed:06}").as_bytes(), &[b'w'; 512]) {
+                    Ok(()) => landed += 1,
+                    Err(Error::Closed) => return landed,
+                    Err(other) => panic!("a write failed with {other:?}"),
+                }
+            }
+        })
+    };
+    wait_until("the worker flushes what the writer seals", || {
+        stats.get_ticker(Ticker::FlushCount) > flushes + 2
+    });
+    db.close().unwrap();
+    let landed = writer.join().unwrap();
+
+    let progress = queue.poll(IoBudget::ALL);
+    assert_eq!(progress.completed, waits.len(), "every wait completed");
+    assert!(!progress.more_pending, "the queue owes nothing after close");
+    assert!(waits.iter().all(IoWait::is_ready));
+    assert!(matches!(snapshot.get(&numbered(0)), Err(Error::Closed)));
+    drop((snapshot, queue));
+    drop(db);
+
+    let db = Db::open(dir.path(), options()).unwrap();
+    for i in 0..landed {
+        assert!(
+            db.get(format!("late/{i:06}").as_bytes()).unwrap().is_some(),
+            "write {i} of {landed}, told it landed, is gone"
+        );
+    }
+}
+
+/// A close whose final flush fails leaves the database open, and reads
+/// through a queue opened before it make units again: the close released
+/// what waited and marked the queues' table closed, and the failure reopens
+/// it.
+#[test]
+fn a_close_that_fails_leaves_reads_through_queues_working() {
+    let dir = TempDir::new().unwrap();
+    let env = Arc::new(FaultyEnv::default());
+    let db = Db::open(
+        dir.path(),
+        Options::default()
+            .env(Arc::clone(&env) as Arc<dyn Env>)
+            .write_buffer_size(8 * 1024)
+            .block_size(256)
+            .block_cache_size(0)
+            .max_background_compactions(0),
+    )
+    .unwrap();
+    for i in 0..400 {
+        db.put(&numbered(i), b"in a table").unwrap();
+    }
+    db.flush().unwrap();
+    let mut queue = db.io_queue();
+    // A frozen memtable whose flush fails, so the close's flush fails.
+    env.fail_tables(true);
+    let mut filler = 0;
+    while db
+        .get_int_property("regolith.num-entries-imm-mem-tables")
+        .unwrap()
+        == 0
+    {
+        db.put(format!("filler/{filler:06}").as_bytes(), &[b'f'; 1024])
+            .unwrap();
+        filler += 1;
+    }
+    assert!(db.close().is_err(), "the close's flush fails");
+    env.fail_tables(false);
+
+    let snapshot = db
+        .snapshot()
+        .with_read_mode(ReadMode::CacheOnly(queue.id()));
+    assert_eq!(
+        through_queue(&mut queue, || snapshot.get(&numbered(7))).unwrap(),
+        Some(b"in a table".to_vec()),
+        "a read through the queue after the failed close"
+    );
+    db.close().unwrap();
 }

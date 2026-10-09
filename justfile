@@ -291,8 +291,9 @@ loom-sync-deep model="":
     RUSTFLAGS="--cfg loom" cargo test --release --test loom_sync -- --ignored {{model}}
 
 # Loom models for the per-thread I/O queues (D53): the unit claim, the
-# completion pushed to every waiting queue, the idle waker, and a read's
-# wait, with four calibrations that must fail. Release only, like
+# completion pushed to every waiting queue, the idle waker, a read's wait,
+# and close meeting a miss under way, with five calibrations that must
+# fail. Release only, like
 # `loom-sync`: the wait model explores close to 0.8 million interleavings.
 loom-io:
     RUSTFLAGS="--cfg loom" cargo test --release --test loom_io_queue

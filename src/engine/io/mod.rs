@@ -29,6 +29,17 @@
 //!   the queue that requested it is dropped. So the table never holds more
 //!   units than the open queues' byte bounds admit, plus the ones being run
 //!   right now.
+//! - **No unit outlives close.** A read checks that the database is open
+//!   when it starts, and close may come between that check and its miss
+//!   (group commit's close flushes and joins its workers after it releases
+//!   the units, while reads still in flight go on). Every miss is counted in
+//!   one atomic word that close marks with one read-modify-write: a miss
+//!   that starts after the mark answers `Closed`, one under way when the mark
+//!   lands releases its own unit when it ends, and one that ended before it
+//!   inserted its unit where close's sweep, which comes after the mark,
+//!   finds it. So once close returns, no unit is left in the table, and every
+//!   queue waiting on one has its completion (`NonBlocking.tla`, Release;
+//!   the loom model `no_unit_outlives_close`).
 //!
 //! `scope` carries a handle's mode to the device seam; `crate::IoQueue` is
 //! the owner's side.
@@ -49,6 +60,7 @@ use super::block_cache::BlockCache;
 use super::filter_block::FilterBlock;
 use super::index_block::IndexBlock;
 use crate::io_queue::{IoWait, QueueId};
+use crate::sync::internal::{AtomicUsize, Ordering};
 use shared::{Landing, Message, QueueShared, WaitSlot};
 use unit::{Unit, UnitKey, Work};
 
@@ -56,6 +68,51 @@ use unit::{Unit, UnitKey, Work};
 const UNIT_BUCKETS: usize = 256;
 /// Buckets the queue registry starts with.
 const QUEUE_BUCKETS: usize = 64;
+
+/// The bit of a [`CloseGate`] close sets. The bits above it count the misses
+/// under way, one [`MISS`] each.
+const CLOSED: usize = 1;
+/// One miss under way in a [`CloseGate`].
+const MISS: usize = 2;
+
+/// The one word close and a miss meet on, so no unit outlives close (the
+/// module docs): close marks it, and a miss counts itself in before it looks
+/// for a unit and out once its unit is in the table.
+pub(crate) struct CloseGate(AtomicUsize);
+
+impl CloseGate {
+    pub(crate) fn new() -> Self {
+        Self(AtomicUsize::new(0))
+    }
+
+    /// Count a miss in. `false` once close began: the miss then makes no
+    /// unit, and answers `Closed`.
+    pub(crate) fn enter(&self) -> bool {
+        if self.0.fetch_add(MISS, Ordering::AcqRel) & CLOSED != 0 {
+            self.0.fetch_sub(MISS, Ordering::AcqRel);
+            return false;
+        }
+        true
+    }
+
+    /// Count a miss out. `true` when close began while the miss was under
+    /// way: its sweep may have run before the miss's unit was in the table,
+    /// so the miss lets that unit go itself. Otherwise this release is
+    /// ordered before close's mark, and the sweep after the mark finds it.
+    pub(crate) fn leave(&self) -> bool {
+        self.0.fetch_sub(MISS, Ordering::AcqRel) & CLOSED != 0
+    }
+
+    /// Mark close, before its sweep.
+    pub(crate) fn close(&self) {
+        self.0.fetch_or(CLOSED, Ordering::AcqRel);
+    }
+
+    /// A close that failed: misses make units again.
+    pub(crate) fn reopen(&self) {
+        self.0.fetch_and(!CLOSED, Ordering::AcqRel);
+    }
+}
 
 /// What a unit read from the device.
 #[derive(Clone)]
@@ -115,6 +172,8 @@ fn aliased() -> io::Error {
 pub(crate) struct IoRuntime {
     units: HashMap<UnitKey, Arc<Unit>>,
     queues: HashMap<QueueId, Arc<QueueShared>>,
+    /// Where close and the misses meet, so no unit outlives close.
+    gate: CloseGate,
 }
 
 impl IoRuntime {
@@ -122,6 +181,7 @@ impl IoRuntime {
         Self {
             units: HashMap::with_capacity(UNIT_BUCKETS),
             queues: HashMap::with_capacity(QUEUE_BUCKETS),
+            gate: CloseGate::new(),
         }
     }
 
@@ -142,8 +202,29 @@ impl IoRuntime {
     ///
     /// Returns what already landed for the queue, or the error a failed unit
     /// left for it, or an `io::Error` carrying `WouldBlock::Io` after
-    /// recording the read on its queue. Never reads the device.
+    /// recording the read on its queue, or `Closed` once the database began
+    /// to close. Never reads the device.
     pub(crate) fn miss(
+        &self,
+        queue: QueueId,
+        key: UnitKey,
+        bytes: usize,
+        work: impl FnOnce() -> io::Result<Work>,
+    ) -> io::Result<Landed> {
+        if !self.gate.enter() {
+            return Err(crate::Error::Closed.into_io_error());
+        }
+        let missed = self.miss_counted(queue, key, bytes, work);
+        if self.gate.leave()
+            && let Some(unit) = self.units.get(&key)
+        {
+            self.release(&unit);
+        }
+        missed
+    }
+
+    /// [`Self::miss`], counted as under way.
+    fn miss_counted(
         &self,
         queue: QueueId,
         key: UnitKey,
@@ -240,11 +321,19 @@ impl IoRuntime {
     /// `close`: finish every unit nobody is running with nothing read, so
     /// every queue waiting on one gets its completion now. A unit being run
     /// finishes on its own; a read run again after either finds the database
-    /// closed.
+    /// closed. Marked first, so a miss from now on answers `Closed` and a
+    /// miss under way lets its own unit go (see the module docs).
     pub(crate) fn close(&self) {
+        self.gate.close();
         for unit in self.units.values() {
             self.release(&unit);
         }
+    }
+
+    /// A close that failed and left the database open: misses make units
+    /// again.
+    pub(crate) fn reopen(&self) {
+        self.gate.reopen();
     }
 
     /// Units in the table now.

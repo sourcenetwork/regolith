@@ -77,3 +77,34 @@ fn a_dropped_queue_leaves_no_unit_behind() {
     drop(queue);
     assert_eq!(watcher.runtime().units_in_flight(), 0);
 }
+
+/// A read that checked the database open before close and misses after it,
+/// the window the close gate shuts, answers `Closed` and leaves no unit; a
+/// close that failed reopens the table to misses.
+#[test]
+fn a_miss_after_close_answers_closed_and_leaves_no_unit() {
+    use crate::engine::io::unit::{UnitKey, Work};
+
+    let (_dir, db) = cold();
+    let queue = db.io_queue();
+    let runtime = queue.runtime();
+    let key = UnitKey {
+        file_id: 1,
+        offset: 0,
+        guard: None,
+    };
+    let work =
+        || -> std::io::Result<Work> { Ok(Box::new(|_| Err(std::io::Error::other("never read")))) };
+    runtime.close();
+    let Err(err) = runtime.miss(queue.id(), key, 1, work) else {
+        panic!("a closed table answered a miss");
+    };
+    assert!(matches!(Error::from(err), Error::Closed));
+    assert_eq!(runtime.units_in_flight(), 0);
+    runtime.reopen();
+    let Err(err) = runtime.miss(queue.id(), key, 1, work) else {
+        panic!("a miss answered without a read");
+    };
+    assert!(matches!(Error::from(err), Error::WouldBlock(_)));
+    assert_eq!(runtime.units_in_flight(), 1);
+}

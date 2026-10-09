@@ -679,6 +679,13 @@ impl BlockCache {
         }
     }
 
+    /// A close that failed: reads through queues make units again.
+    pub(crate) fn reopen_io(&self) {
+        if let Some(io) = self.io.get() {
+            io.reopen();
+        }
+    }
+
     /// Attach an optional statistics sink. Called once at engine
     /// open after the cache has been constructed; subsequent
     /// `get` / `insert` calls will update the provided tickers.

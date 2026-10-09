@@ -1,6 +1,6 @@
 //! Models of the per-thread I/O queues (D53): the claim of a unit, the
 //! completion pushed to every queue waiting on it, the owner's idle waker,
-//! and the wait a read hands back.
+//! the wait a read hands back, and close meeting a miss under way.
 //!
 //! Each positive model drives the production types: `Unit`, `QueueShared`,
 //! `WaitSlot` and `IoWait`, whose atomics and cells come from
@@ -19,6 +19,7 @@ use loom::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use loom::thread;
 
 use super::super::block_cache::BlockCache;
+use super::super::io::CloseGate;
 use super::super::io::shared::{Message, QueueShared, WaitSlot};
 use super::super::io::unit::{Unit, UnitKey};
 use super::explore;
@@ -404,6 +405,83 @@ pub fn calibration_a_wait_without_a_second_look_hangs() {
             assert!(
                 !pending || wakes.0.load(Ordering::SeqCst) > 0,
                 "a wait parked with nobody left to wake it"
+            );
+        },
+    );
+}
+
+/// A read that checked the database open goes on to miss while close runs:
+/// the miss counts itself in at the production `CloseGate`, puts its unit in
+/// the table and counts itself out, while close marks the gate and then
+/// sweeps the table. In every interleaving the unit is released once both
+/// are done, by close's sweep or by the miss itself, and the witness counts
+/// the runs where the sweep came too early and the miss let its own unit go.
+/// The table is one flag here, standing for the map's insert and its
+/// iteration, which loom does not see inside the map.
+pub fn no_unit_outlives_close() {
+    explore("no_unit_outlives_close", 3, 1, |witness| {
+        let gate = StdArc::new(CloseGate::new());
+        let in_table = Arc::new(AtomicBool::new(false));
+        let runs = Arc::new(AtomicUsize::new(0));
+        let unit = counted_unit(&runs);
+        let reader = {
+            let (gate, in_table, unit) = (
+                StdArc::clone(&gate),
+                Arc::clone(&in_table),
+                StdArc::clone(&unit),
+            );
+            thread::spawn(move || {
+                if !gate.enter() {
+                    return (false, false);
+                }
+                in_table.store(true, Ordering::Release);
+                let released_here = gate.leave() && unit.release();
+                (true, released_here)
+            })
+        };
+        gate.close();
+        if in_table.load(Ordering::Acquire) {
+            unit.release();
+        }
+        let (inserted, released_here) = reader.join().expect("reader");
+        assert!(!inserted || unit.is_done(), "a unit outlived close");
+        assert_eq!(runs.load(Ordering::SeqCst), 0, "a released unit never runs");
+        if released_here {
+            witness.record();
+        }
+    });
+}
+
+/// A miss that checks for close only once, when it starts, and then puts
+/// its unit in the table: close's sweep can come between the two, and the
+/// unit outlives close.
+pub fn calibration_a_miss_checked_only_when_it_starts_outlives_close() {
+    explore(
+        "calibration_a_miss_checked_only_when_it_starts_outlives_close",
+        2,
+        0,
+        |_witness| {
+            let closed = Arc::new(AtomicBool::new(false));
+            let in_table = Arc::new(AtomicBool::new(false));
+            let released = Arc::new(AtomicBool::new(false));
+            let reader = {
+                let (closed, in_table) = (Arc::clone(&closed), Arc::clone(&in_table));
+                thread::spawn(move || {
+                    if closed.load(Ordering::Acquire) {
+                        return false;
+                    }
+                    in_table.store(true, Ordering::Release);
+                    true
+                })
+            };
+            closed.store(true, Ordering::Release);
+            if in_table.load(Ordering::Acquire) {
+                released.store(true, Ordering::SeqCst);
+            }
+            let inserted = reader.join().expect("reader");
+            assert!(
+                !inserted || released.load(Ordering::SeqCst),
+                "a unit outlived close"
             );
         },
     );

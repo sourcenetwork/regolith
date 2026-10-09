@@ -3037,6 +3037,9 @@ impl RegolithEngine {
                 Ok(())
             }
             Err(err) => {
+                // Reads through queues work again on the database the failed
+                // close left open.
+                self.cache.reopen_io();
                 self.close_state.store(CLOSE_STATE_OPEN, Ordering::Release);
                 self.stall_signal.notify_all();
                 Err(err)

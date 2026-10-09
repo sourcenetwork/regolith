@@ -17,6 +17,9 @@
 //! - **No lost wakeup on a wait**: a task polls a read's wait, then again
 //!   with a new waker, while the owner completes it; the waker it last gave
 //!   is woken. A clone polled on another thread is woken through its own.
+//! - **No unit outlives close**: a miss that started before close puts its
+//!   unit in the table while close sweeps it; the unit is released by the
+//!   sweep or by the miss itself.
 //!
 //! Each is paired with a calibration that writes the one step the wrong way
 //! and must fail; without them a search that never reached the bad
@@ -78,4 +81,15 @@ fn calibration_an_idle_mark_apart_from_the_inbox_loses_a_wakeup() {
 #[should_panic(expected = "a wait parked with nobody left to wake it")]
 fn calibration_a_wait_without_a_second_look_hangs() {
     io_queue::calibration_a_wait_without_a_second_look_hangs();
+}
+
+#[test]
+fn no_unit_outlives_close() {
+    io_queue::no_unit_outlives_close();
+}
+
+#[test]
+#[should_panic(expected = "a unit outlived close")]
+fn calibration_a_miss_checked_only_when_it_starts_outlives_close() {
+    io_queue::calibration_a_miss_checked_only_when_it_starts_outlives_close();
 }
