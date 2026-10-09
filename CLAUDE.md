@@ -86,6 +86,10 @@ src/
 ├── transaction/        # policy.rs (KeyClassifier, key classes), txn_options.rs (TxnOptions),
 │                       # scan_range.rs (scan stretches), write_buffer.rs (buffered puts, deletes, merges)
 ├── ttl.rs              # TTL database wrapper
+├── sync/               # Public regolith::sync: async locks, semaphore, notify, event, latch, barrier, once cell
+│   ├── queue.rs        # Wait queue and drain role every primitive builds on
+│   ├── waiter.rs       # Waiter nodes, their free list, the wake list
+│   └── internal.rs     # The engine's private std/loom atomics and locks
 ├── txn_buffer.rs       # Concurrent write and read-set buffer of one transaction
 ├── env/                # Env trait and backends: StdEnv, MemEnv, WASI, OPFS; db_lock.rs, open_file_limit.rs
 └── engine/
@@ -132,7 +136,10 @@ src/
 and `Result`. Extension surfaces such as column families, transactions,
 TTL, backups, checkpoints, external SST ingestion, statistics, event
 listeners, merge operators, compaction filters, and rate limiting are
-also re-exported from `lib.rs`. Anything not re-exported is internal.
+also re-exported from `lib.rs`. `regolith::sync` is a public module of
+its own: runtime-free async primitives (FIFO, cancellation-safe, no
+system call but kovan's `sched_yield`) plus kovan's channels, map,
+queues and `Atom`. Anything not re-exported is internal.
 
 ### File Size Guidelines
 

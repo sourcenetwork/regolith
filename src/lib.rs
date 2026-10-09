@@ -74,7 +74,7 @@ mod slice;
 mod sst_file_writer;
 mod statistics;
 mod stream_writer;
-mod sync;
+pub mod sync;
 mod tailing;
 #[cfg(all(feature = "testing", not(target_family = "wasm")))]
 pub mod testing;
