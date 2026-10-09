@@ -489,6 +489,13 @@ tla:
     check MC_WalRecovery_Red_NoTruncate                RED RecoveryOpens
     check MC_WalRecovery_Red_StampNotSealed            RED AckedSurvive
     check MC_WalRecovery_Red_StampUnsynced             RED RecoveryOpens
+    # 4.12, D45: a sealed manifest batch keeps its checksum, checked before
+    # any key. Lean: Regolith/ManifestSeal.lean, replay_opens_with_right_keys,
+    # open_ends_only_at_a_torn_batch.
+    spec=ManifestSeal
+    check MC_ManifestSeal_Green                        GREEN
+    check MC_ManifestSeal_Red_TagOnlyStop              RED OnlyTornEnds
+    check MC_ManifestSeal_Red_TagOnlyRefuse            RED RecoveryOpens
     # 4.8, E5: compaction per snapshot stripe. Lean: Regolith/Stripes.lean,
     # reduce_reads.
     spec=StripeCompaction
