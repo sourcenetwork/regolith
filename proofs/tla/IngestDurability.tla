@@ -10,6 +10,16 @@
 \* now flushes only a memtable holding a key of its file's range, so the
 \* commits in the other memtables may still be only in the log, unsynced.
 \*
+\* PROVED FOR EVERY SIZE in Lean, proofs/lean/Regolith/IngestDurability.lean:
+\*   step_inv, reachable_inv        the fixed protocol keeps its invariant:
+\*                                  once installed, every commit before the
+\*                                  ingest's place is synced
+\*   surviving_ingest_keeps_prefix  so an ingest that survives a power cut
+\*                                  keeps every commit before it, and what
+\*                                  survives is a gap-free prefix (GapFreePrefix
+\*                                  here, for any number of commits)
+\*   no_log_sync_loses_commit       RED NoLogSync, as a counterexample
+\*
 \* THE ENGINE.
 \*   RegolithEngine::install            src/engine/ingest.rs
 \*     Under the pipeline mutex: sync the active log
