@@ -179,6 +179,10 @@ name = "append"
 harness = false
 
 [[bench]]
+name = "txn_callbacks"
+harness = false
+
+[[bench]]
 name = "scan_commit"
 harness = false
 

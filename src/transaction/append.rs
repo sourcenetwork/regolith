@@ -7,11 +7,10 @@
 
 use std::sync::Arc;
 
-use kovan_queue::seg_queue::SegQueue;
-
 use super::policy::classifier_for;
-use super::{KeyClass, KeyClassifier, Transaction, TransactionError, TxResult, drain};
+use super::{KeyClass, KeyClassifier, Transaction, TransactionError, TxResult};
 use crate::engine::PendingAppend;
+use crate::txn_buffer::TxnBuffer;
 use crate::{Error, LogLayout};
 
 impl Transaction {
@@ -102,12 +101,15 @@ impl Transaction {
             classifier_for(&self.policy, self.isolation),
         )?;
         self.appends
-            .get_or_init(|| Box::new(SegQueue::new()))
-            .push(PendingAppend {
-                log: Arc::clone(log),
-                entry: entry.to_vec(),
-                once_key: once_key.map(<[u8]>::to_vec),
-            });
+            .get_or_init(|| Box::new(TxnBuffer::new(0)))
+            .insert(
+                (),
+                PendingAppend {
+                    log: Arc::clone(log),
+                    entry: entry.to_vec(),
+                    once_key: once_key.map(<[u8]>::to_vec),
+                },
+            );
         Ok(())
     }
 
@@ -123,25 +125,16 @@ impl Transaction {
         }
     }
 
-    /// The appends made so far, copied, for a savepoint. Exclusive access
-    /// means no producer is pushing, so the drain is complete.
-    pub(super) fn save_appends(&self) -> Vec<PendingAppend> {
-        let Some(queue) = self.appends.get() else {
-            return Vec::new();
-        };
-        let saved = drain(queue);
-        saved.iter().for_each(|append| queue.push(append.clone()));
-        saved
+    /// How many appends the transaction has made: the mark a savepoint keeps.
+    pub(super) fn appends_len(&self) -> usize {
+        self.appends.get().map_or(0, |appends| appends.len())
     }
 
-    /// Replaces the appends with those a savepoint saved.
-    pub(super) fn restore_appends(&mut self, saved: Vec<PendingAppend>) {
-        self.appends = std::sync::OnceLock::new();
-        if saved.is_empty() {
-            return;
+    /// Takes back the appends made after a savepoint that marked `len` of them.
+    pub(super) fn truncate_appends(&mut self, len: usize) {
+        if let Some(appends) = self.appends.get_mut() {
+            appends.truncate(len);
         }
-        let queue = self.appends.get_or_init(|| Box::new(SegQueue::new()));
-        saved.into_iter().for_each(|append| queue.push(append));
     }
 }
 

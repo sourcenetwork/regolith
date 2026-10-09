@@ -67,7 +67,9 @@
 //!
 //! Rolling back to a savepoint discards buffered writes; it does not
 //! discard what the transaction has already read, so a read anchor
-//! survives the rollback and still guards the commit.
+//! survives the rollback and still guards the commit. A savepoint is a
+//! mark on the write buffer's entry count, so setting one is O(1) and
+//! rolling back costs the writes it discards.
 //!
 //! Below [`IsolationLevel::RepeatableRead`] a plain read ([`Transaction::get`],
 //! [`Transaction::get_slice`] or a transactional scan) of a key the
@@ -191,8 +193,9 @@ pub enum TransactionError {
     /// hold user data.
     #[error("transaction busy acquiring the lock on a {}; retry the transaction", RedactedKey(.0))]
     Busy(Vec<u8>),
-    /// The caller tried to use a savepoint that was never set.
-    #[error("no savepoint to roll back to")]
+    /// The caller tried to roll back to or release a savepoint when none is
+    /// set.
+    #[error("no savepoint is set")]
     NoSavepoint,
     /// Transactional range deletes are disabled until they can
     /// participate in conflict detection or range locking.
@@ -693,8 +696,9 @@ pub struct Transaction {
     /// their positions do not exist until the commit orders them, so nothing
     /// in the transaction can read them. Allocated by the first `append`, and
     /// boxed for the reason `scan_runs` is: a transaction that never appends
-    /// pays nothing for it.
-    appends: OnceLock<Box<SegQueue<PendingAppend>>>,
+    /// pays nothing for it. A buffer rather than a queue so a savepoint can
+    /// take the appends made after it back.
+    appends: OnceLock<Box<TxnBuffer<(), PendingAppend>>>,
     /// What this transaction has observed about each key it read,
     /// through a point read, or through a scan at Serializable. Sorted
     /// at commit so a multi-key conflict always reports the same key.
@@ -725,8 +729,12 @@ pub struct Transaction {
     /// pessimistic scan that could not possibly find a promoted key,
     /// instead of walking `tracked` once per yielded key.
     promoted_seq: AtomicU64,
-    /// Savepoint stack. Each entry captures the full write buffer
-    /// and a count of locks held at that point.
+    /// Savepoint stack: how much of each buffer the transaction held when each
+    /// was set.
+    ///
+    /// `range_deletes` is not marked: it has no producer (`delete_range`
+    /// refuses every non-empty range), so a savepoint has nothing in it to
+    /// take back.
     savepoints: Vec<Savepoint>,
     /// Keys for which this transaction holds a pessimistic lock.
     /// A set rather than a list: membership is checked on every
@@ -736,21 +744,15 @@ pub struct Transaction {
     held_locks: TxnBuffer<Vec<u8>, ()>,
     lock_manager: Option<Arc<LockManager>>,
     lock_timeout: Duration,
-    /// See [`crate::Options::transaction_keys_inline`]. Kept so a
-    /// savepoint rollback rebuilds the buffer the same way.
-    keys_inline: usize,
     resolved: bool,
     resources_released: bool,
 }
 
-#[derive(Clone)]
+/// The mark a savepoint keeps: the entry counts of the buffers it rolls back.
+#[derive(Clone, Copy)]
 struct Savepoint {
-    /// Every key's writes since it was last put or deleted, newest first:
-    /// all the buffer needs to be rebuilt as it was.
-    writes: Vec<(Vec<u8>, Write)>,
-    range_deletes: Vec<(Vec<u8>, Vec<u8>)>,
-    appends: Vec<PendingAppend>,
-    held_lock_count: usize,
+    writes: usize,
+    appends: usize,
 }
 
 /// What one transaction knows about one key it has read.
@@ -835,7 +837,6 @@ impl Transaction {
             held_locks: TxnBuffer::new(keys_inline),
             lock_manager,
             lock_timeout,
-            keys_inline,
             resolved: false,
             resources_released: false,
         }
@@ -1126,53 +1127,55 @@ impl Transaction {
         Ok(())
     }
 
-    /// Save the current state of buffered writes. A later call to
-    /// [`Transaction::rollback_to_savepoint`] reverts every buffered
-    /// write made after this call.
+    /// Set a savepoint at the current state of the buffered writes. A later
+    /// call to [`Transaction::rollback_to_savepoint`] reverts every buffered
+    /// write made after this call, and [`Transaction::release_savepoint`]
+    /// forgets the savepoint and keeps the writes.
+    ///
+    /// O(1): the savepoint is the number of entries the write buffer holds,
+    /// and nothing is copied. Savepoints nest; each rollback or release takes
+    /// the most recently set one that is still open.
     pub fn set_savepoint(&mut self) {
         // `&mut self` is what makes this coherent: a savepoint over a
         // buffer another thread is still writing would capture a torn
         // state, so taking one is an exclusive operation even though
         // buffering is not.
         self.savepoints.push(Savepoint {
-            writes: self.writes.chains_matching(|_| true, Write::is_terminator),
-            range_deletes: drain(&self.range_deletes),
-            appends: self.save_appends(),
-            held_lock_count: self.held_locks.len(),
+            writes: self.writes.len(),
+            appends: self.appends_len(),
         });
-        // `drain` emptied it, so put back what the savepoint captured.
-        if let Some(sp) = self.savepoints.last() {
-            for entry in &sp.range_deletes {
-                self.range_deletes.push(entry.clone());
-            }
-        }
     }
 
-    /// Roll back to the most recent savepoint. Discards every
-    /// buffered write made after the savepoint. Locks acquired
-    /// after the savepoint stay held: regolith's pessimistic lock
-    /// manager does not release mid-transaction locks.
+    /// Roll back to the most recent savepoint and forget it. Discards every
+    /// buffered write made after the savepoint, in time proportional to the
+    /// writes discarded. Locks acquired after the savepoint stay held:
+    /// regolith's pessimistic lock manager does not release mid-transaction
+    /// locks.
     ///
     /// Reads are not rolled back. A key this transaction has already
     /// read keeps the sequence it was read at, so a rollback can
     /// neither rewind a later read of that key nor launder a write
     /// that landed around the lock manager in the meantime.
+    ///
+    /// Returns [`TransactionError::NoSavepoint`] when no savepoint is set.
     pub fn rollback_to_savepoint(&mut self) -> TxResult<()> {
-        let sp = self.savepoints.pop().ok_or(TransactionError::NoSavepoint)?;
+        let mark = self.savepoints.pop().ok_or(TransactionError::NoSavepoint)?;
         self.rollbacks += 1;
-        self.writes = TxnBuffer::new(self.keys_inline);
-        // Oldest first, so the buffer's newest-first order comes out as it was.
-        for (key, write) in sp.writes.into_iter().rev() {
-            self.writes.insert(key, write);
-        }
-        self.range_deletes = SegQueue::new();
-        for entry in sp.range_deletes {
-            self.range_deletes.push(entry);
-        }
-        self.restore_appends(sp.appends);
-        // Locks acquired after the savepoint remain held.
-        let _ = sp.held_lock_count;
+        self.writes.truncate(mark.writes);
+        self.truncate_appends(mark.appends);
         Ok(())
+    }
+
+    /// Forget the most recent savepoint without rolling back: the writes made
+    /// since it stay, and an older savepoint, if one is set, becomes the
+    /// current one. O(1).
+    ///
+    /// Returns [`TransactionError::NoSavepoint`] when no savepoint is set.
+    pub fn release_savepoint(&mut self) -> TxResult<()> {
+        self.savepoints
+            .pop()
+            .map(drop)
+            .ok_or(TransactionError::NoSavepoint)
     }
 
     /// Commit the transaction. Every key in the validation set is
@@ -1252,7 +1255,12 @@ impl Transaction {
         // one. `settle` says what the drained writes commit as.
         let (writes, merges) = settle(self.writes.drain());
         let range_deletes = drain(&self.range_deletes);
-        let appends = self.appends.take().map_or_else(Vec::new, |q| drain(&q));
+        let appends = self.appends.take().map_or_else(Vec::new, |mut buffer| {
+            // Newest first out of the buffer; the commit wants the order made.
+            let mut made = buffer.drain();
+            made.reverse();
+            made.into_iter().map(|(_, append)| append).collect()
+        });
         let tracked = self.tracked.drain();
         let mut checks = self.validation_set(tracked, &writes, &merges);
         // A write-free transaction at DefraLevel read one consistent snapshot
