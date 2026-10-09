@@ -38,8 +38,10 @@ What is proved, in plain words:
    resolved against the view it began with answers every key as of one
    point in time; a batch that loads a view per key can answer a key from a
    view a flush has already thinned.
-7. `install_oldest_same_order`: installing the oldest frozen memtable as
-   the newest L0 file leaves the read order as it was;
+7. `install_oldest_same_order`, `install_oldest_all` and
+   `install_oldest_all_reads`: installing the oldest frozen memtables, one by
+   one, as the newest L0 files (every flush off the commit path, E9,
+   whichever thread runs it) leaves the read order and every read as it was;
    `install_newer_breaks_reads` is the RED case of installing a newer one
    first.
 8. `ingest_ordered`: an ingested file, newer than everything, placed where
@@ -992,26 +994,67 @@ theorem red_closure_picks_both :
 
 /-! ## Frozen memtables: install in memtable order
 
-Rotation freezes the memtable; frozen memtables are read after the active
-one, newest first, and before L0. A flush that runs off the commit path
-installs its file as the newest L0 file. The TLA+ configurations
-`MC_LsmOrder_Green_Flush` and `MC_LsmOrder_Red_FlushAnyOrder` check this. -/
+The story. A writer fills the memtable and seals it (rotation): the sealed
+memtable joins the frozen ones, which a read asks after the active memtable,
+newest first, and before L0. Since E9 the writer does not flush it; the
+compaction worker does, or the next write when there is no worker, or a
+rotation at the memtable cap, or an explicit flush. Several threads can be
+flushing, so the code makes every flush take the `flushing` exclusion and the
+OLDEST frozen memtable (`Flusher::flush_oldest` in `src/engine/flush.rs`).
+
+What can go wrong: two frozen memtables, the newer holding key 1 at sequence
+2, the older key 1 at sequence 1. If the newer one's flush finishes first, its
+file goes into L0, behind the older frozen memtable that a read still asks
+first, and the read of key 1 goes back from 2 to 1. The theorems below show
+the oldest-first install changes no read, for any number of memtables and
+flushes, and the newer-first install breaking one. The TLA+ configurations
+`MC_LsmOrder_Green_Flush` and `MC_LsmOrder_Red_FlushAnyOrder` check the same
+over interleavings. -/
 
 /-- **Installing the oldest frozen memtable leaves the read order as it
 was.** The oldest frozen memtable is the last one read before L0; as the
 newest L0 file it is the first one read in L0: the same position. So the
 order stays ordered and every read is unchanged. -/
 theorem install_oldest_same_order (mem : Source) (imm l0 deeper : List Source) (f : Source) :
+    -- Before: the active memtable, the frozen ones with `f` the oldest, L0,
+    -- the deeper levels. After: `f` is the newest L0 file. Same list.
     mem :: (imm ++ [f]) ++ l0 ++ deeper = mem :: imm ++ (f :: l0) ++ deeper := by
+  -- Both sides are the same list once the appends are flattened.
   simp
+
+/-- **Flushing any number of frozen memtables, oldest first, changes no
+read.** Moving the oldest `old` frozen memtables, one by one and oldest first,
+to the front of L0 leaves the sources in the same order, so every read of
+every key at every snapshot answers as before. This is every flush of E9 in
+a row, whichever threads ran them. -/
+theorem install_oldest_all (mem : Source) (imm old l0 deeper : List Source) :
+    -- Before: `old` are the oldest frozen memtables, after `imm`. After:
+    -- they are the newest L0 files, in the same order.
+    mem :: (imm ++ old) ++ l0 ++ deeper = mem :: imm ++ (old ++ l0) ++ deeper := by
+  -- Flatten the appends: both sides are the same list.
+  simp
+
+/-- The reads are unchanged too: a read of key `k` at snapshot `snap` gives
+the same answer before and after the oldest-first flushes. -/
+theorem install_oldest_all_reads (mem : Source) (imm old l0 deeper : List Source)
+    (k snap : Nat) :
+    -- The read before equals the read after.
+    read (mem :: (imm ++ old) ++ l0 ++ deeper) k snap =
+      read (mem :: imm ++ (old ++ l0) ++ deeper) k snap := by
+  -- The two source lists are equal, so the reads are.
+  rw [install_oldest_all]
 
 /-- **`install_newer_breaks_reads`.** Two frozen memtables, the newer
 holding key 1 at 2 and the older key 1 at 1. Installing the newer one
 first puts it behind the older one, which is still read before L0: the
 read of key 1 answers 1 where it answered 2. -/
 theorem install_newer_breaks_reads :
+    -- Before any flush: the read of key 1 finds 2 in the newer frozen one.
     read ([] :: [[(1, 2)], [(1, 1)]] ++ []) 1 10 = some 2 ∧
+    -- After the newer one's file reaches L0 first: the older frozen one
+    -- is asked first and answers 1.
     read ([] :: [[(1, 1)]] ++ ([(1, 2)] :: [])) 1 10 = some 1 := by
+  -- Concrete lists: evaluate both reads.
   decide
 
 /-! ## Ingest placement
