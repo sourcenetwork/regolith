@@ -13,6 +13,11 @@
 //! `GroupCommit.tla`), and only the members that validate take sequences
 //! and records. Each member learns its own outcome.
 //!
+//! A leader commits one group, of at most [`MAX_GROUP_MEMBERS`] members and
+//! [`MAX_GROUP_BYTES`] staged bytes, then hands the pipeline to the ticket
+//! at the head of the ring and wakes its writer (E21), so no writer serves an
+//! unbounded queue of others.
+//!
 //! Three invariants outrank throughput here, and every design choice below
 //! is subordinate to them.
 //!
@@ -93,6 +98,16 @@ pub(crate) use write_check::EarlyWrite;
 /// [`RegolithEngine::admit_from_ring`]).
 const MAX_GROUP_BYTES: usize = 1024 * 1024;
 
+/// Most members one group admits, the leader's own request included (E21).
+///
+/// With [`MAX_GROUP_BYTES`] this bounds what one leadership turn costs: a
+/// leader commits one group and hands the pipeline on, so no writer serves
+/// an unbounded queue of others. Members are bounded as well as bytes
+/// because the decide stage validates each transaction in turn, so a group
+/// of many small transactions costs the leader more than its bytes say.
+/// 128 lets a group carry every writer of a 64-writer burst under one fsync.
+const MAX_GROUP_MEMBERS: usize = 128;
+
 /// Ceiling on how much stage capacity `trim_stage` ever keeps.
 ///
 /// Without a ceiling a single one-off giant group parks its whole peak
@@ -114,12 +129,14 @@ const MAX_KEPT_STAGE_BYTES: usize = 16 * MAX_GROUP_BYTES;
 const PARK_SLICE: Duration = Duration::from_micros(200);
 
 /// Ring capacity for pending commit tickets, sized from the machine's
-/// parallelism and clamped so a huge core count cannot balloon it.
+/// parallelism and clamped so a huge core count cannot balloon it. Never
+/// under two full groups, so a queue deeper than one group is what bounds a
+/// leader's turn (E21), not the ring.
 fn commit_ring_capacity() -> usize {
     thread::available_parallelism()
         .map(|n| n.get().saturating_mul(4))
         .unwrap_or(16)
-        .clamp(16, 1024)
+        .clamp(2 * MAX_GROUP_MEMBERS, 1024)
 }
 
 /// A group member: the work, plus the slot to complete when the group is
@@ -183,11 +200,10 @@ pub(crate) struct Pipeline {
     /// `trim_stage` keeps, so a group cannot shrink a stage the group
     /// before it just grew.
     prev_staged: usize,
-    /// A ticket admission popped but could not add without taking the
-    /// group past the record limit. It heads the next group. `None`
-    /// whenever the pipeline mutex is released by a normal return: every
-    /// path that admits ends in `drain_locked`, which does not return
-    /// while it holds one.
+    /// The ticket that heads the next group: one admission popped but could
+    /// not add without taking the group past the record limit, or the head
+    /// of the ring a leader took out to hand the pipeline to (E21). Whoever
+    /// leads next admits it first.
     held: Option<GroupTicket>,
 }
 
@@ -523,10 +539,13 @@ impl RegolithEngine {
         }
 
         while !slot.is_done() {
-            // Anyone may lead. Whoever wins the mutex drains for everyone,
-            // which may complete this very ticket.
-            if self.try_drain() {
-                continue;
+            // Anyone may lead one group, which may complete this very ticket.
+            // A leader hands the pipeline to the ticket at the head of the
+            // ring and wakes its writer, so this one parks after a turn
+            // instead of serving the queue behind it (E21); it wakes when its
+            // ticket completes, or when the pipeline is handed to it.
+            if self.try_drain() && slot.is_done() {
+                break;
             }
             thread::park_timeout(PARK_SLICE);
         }
@@ -534,9 +553,9 @@ impl RegolithEngine {
         slot.finish_settled()
     }
 
-    /// Lead a group whose first member is the caller's own `request`, then
-    /// drain anything that arrived while it ran. Returns that request's
-    /// outcome.
+    /// Lead one group whose first member is the caller's own `request`, then
+    /// hand the pipeline to the next writer waiting (E21). Returns that
+    /// request's outcome.
     pub(super) fn lead_with(
         &self,
         pipe: &mut Pipeline,
@@ -552,50 +571,66 @@ impl RegolithEngine {
                 "a commit group finished without the leader's own write",
             ))
         });
-        self.drain_locked(pipe);
+        self.hand_off(pipe);
         result
     }
 
-    /// Become the leader if nobody else is, and drain the ring dry.
-    /// Returns whether this call held the pipeline mutex.
+    /// Become the leader if nobody else is, commit one group from the ring,
+    /// and hand the pipeline on. Returns whether this call held the
+    /// pipeline mutex.
     fn try_drain(&self) -> bool {
         let Some(mut pipe) = self.pipeline.try_lock() else {
             return false;
         };
-        self.drain_locked(&mut pipe);
+        self.lead_one(&mut pipe);
         true
     }
 
-    /// Run group after group until the ring is empty and no ticket is
-    /// held.
-    ///
-    /// Re-checking the ring after each group is half of what closes the
-    /// drain-then-push race; the other half is the follower's own
-    /// `try_drain` retry, which covers a ticket pushed after this loop's
-    /// last `pop` but before the mutex is released.
-    fn drain_locked(&self, pipe: &mut Pipeline) {
-        loop {
-            release_stranded(&mut pipe.group);
-            // The common exit: nothing queued behind the group just run,
-            // and no ticket was held back for the next one. Checked
-            // before the view load so the empty pass costs no lock and no
-            // Arc.
-            if pipe.held.is_none() && self.commit_ring.is_empty() {
-                return;
-            }
-            let view = self.view.load();
-            self.admit_from_ring(pipe, &view, MAX_RECORD_LEN as usize);
-            if pipe.group.is_empty() {
-                return;
-            }
-            // A drain leads no request of its own.
+    /// Commit one group of the tickets waiting, the held one first, then
+    /// hand the pipeline on. A drain leads no request of its own.
+    fn lead_one(&self, pipe: &mut Pipeline) {
+        release_stranded(&mut pipe.group);
+        // The common exit: nothing queued and nothing held. Checked before
+        // the view load so the empty pass costs no lock and no Arc.
+        if pipe.held.is_none() && self.commit_ring.is_empty() {
+            return;
+        }
+        let view = self.view.load();
+        self.admit_from_ring(pipe, &view, MAX_RECORD_LEN as usize);
+        if !pipe.group.is_empty() {
             let _ = self.run_and_complete(pipe, view);
+        }
+        self.hand_off(pipe);
+    }
+
+    /// End a leadership turn (E21): a leader commits one bounded group and
+    /// no more, so the ticket at the head of the ring leads the next one. It
+    /// is taken out of the ring to head that group, which keeps ring order,
+    /// and its writer is woken to lead it.
+    ///
+    /// If that writer is slow to run, any writer that takes the pipeline
+    /// first commits the held ticket in its own group, so nothing waits on
+    /// one thread. A writer that pushes its ticket after the ring was found
+    /// empty here and before the mutex is released is covered by its own
+    /// `try_drain` after the push, and by its bounded park.
+    fn hand_off(&self, pipe: &mut Pipeline) {
+        if pipe.held.is_none()
+            && let Some(slot) = self.commit_ring.pop()
+        {
+            let request = slot.take_request();
+            pipe.held = Some(GroupTicket::new(Some(slot), request));
+        }
+        if let Some(GroupTicket {
+            slot: Some(slot), ..
+        }) = &pipe.held
+        {
+            slot.wake();
         }
     }
 
     /// Pop tickets into the current group until the ring is empty, the
-    /// group's staged byte cap is reached, or the group would carry the
-    /// active memtable past `write_buffer_size`.
+    /// group's staged byte cap or member cap is reached, or the group would
+    /// carry the active memtable past `write_buffer_size`.
     ///
     /// The first ticket is always admitted, whatever it costs, so a write
     /// larger than either cap commits alone instead of starving. That one
@@ -615,7 +650,11 @@ impl RegolithEngine {
         let mut staged: usize = pipe.group.iter().map(|t| t.request.staged_len()).sum();
         let mut projected: usize = pipe.group.iter().map(|t| t.request.memtable_cost()).sum();
         loop {
-            if !pipe.group.is_empty() && (staged >= MAX_GROUP_BYTES || projected >= room) {
+            if !pipe.group.is_empty()
+                && (staged >= MAX_GROUP_BYTES
+                    || projected >= room
+                    || pipe.group.len() >= MAX_GROUP_MEMBERS)
+            {
                 return;
             }
             let ticket = match pipe.held.take() {
@@ -925,6 +964,9 @@ mod early_tests;
 
 #[cfg(test)]
 mod group_tests;
+
+#[cfg(test)]
+mod leader_tests;
 
 #[cfg(test)]
 mod limit_tests;

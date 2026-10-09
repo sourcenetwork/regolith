@@ -85,6 +85,12 @@ impl WriteSlot {
         self.thread.unpark();
     }
 
+    /// Leader side: wake the writer so it leads the next group (E21). Its
+    /// ticket stays pending; the writer finds the pipeline free.
+    pub(super) fn wake(&self) {
+        self.thread.unpark();
+    }
+
     pub(super) fn is_done(&self) -> bool {
         self.state.load(Ordering::Acquire) == SLOT_DONE
     }
