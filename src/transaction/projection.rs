@@ -145,6 +145,7 @@ impl Transaction {
     /// the parts scheme the operator's `touches` understands should not be
     /// read this way.
     pub fn get_parts(&self, key: &[u8], parts: &[u32]) -> TxResult<Option<DbSlice>> {
+        let _scope = self.read_scope();
         if !self.projects() {
             return self.get_slice(key);
         }

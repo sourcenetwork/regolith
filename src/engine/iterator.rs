@@ -382,6 +382,11 @@ impl SsTableLevelIter {
         if let Some(block) = self.cache.get(self.reader.file_id, handle.offset) {
             return Ok(block);
         }
+        if super::io::scope::current().is_some() {
+            // A `CacheOnly` walk reads no span: the block alone goes to the
+            // walk's queue.
+            return self.reader.fetch_block(handle, &self.cache, None);
+        }
 
         // A handle comes out of the index, and an index read off a damaged
         // file can say anything: an offset near u64::MAX, a size that runs
@@ -403,7 +408,7 @@ impl SsTableLevelIter {
                 .clamp(handle.size, self.span_cap.max(handle.size));
             // Widen the next one: a walk earns its readahead by continuing.
             self.span_blocks = (self.span_blocks * 2).min(SCAN_SPAN_BLOCKS);
-            self.span = self.reader.read_span(handle.offset, want)?;
+            self.span = self.reader.read_span(handle, want, &self.cache)?;
             self.span_start = handle.offset;
             if (self.span.len() as u64) < handle.size {
                 // Ran into the end of the data area; the block is not
@@ -1538,28 +1543,65 @@ impl RegolithIterator {
         if !self.valid() {
             return;
         }
+        self.step_forward();
+    }
+
+    /// The body of `next`. Each part stops at the first failed read: the
+    /// merge is then half moved, and walking on would report the wreck (a
+    /// key seen twice reads as corruption) instead of the failure.
+    fn step_forward(&mut self) {
         if self.direction == Direction::Reverse {
             self.flip_to_forward();
+            if self.stopped() {
+                return;
+            }
         }
         self.merge_result = None;
         if self.pending_consume {
             self.consume_curr_user_key_forward();
             self.pending_consume = false;
+            if self.stopped() {
+                return;
+            }
         }
         self.materialize_next_visible();
+    }
+
+    /// Whether the last read failed. If so the cursor leaves its entry, so
+    /// nothing reads the half-moved merge as a position.
+    fn stopped(&mut self) -> bool {
+        if self.error.is_none() {
+            return false;
+        }
+        self.valid_entry = false;
+        self.merge_result = None;
+        self.reverse_curr = None;
+        true
     }
 
     pub(crate) fn prev(&mut self) {
         if !self.valid() {
             return;
         }
+        self.step_backward();
+    }
+
+    /// The body of `prev`, stopping at the first failed read as
+    /// `step_forward` does.
+    fn step_backward(&mut self) {
         if self.pending_consume {
             self.consume_curr_user_key_forward();
             self.pending_consume = false;
+            if self.stopped() {
+                return;
+            }
         }
         self.merge_result = None;
         if self.direction == Direction::Forward {
             self.flip_to_reverse();
+            if self.stopped() {
+                return;
+            }
         }
         self.reverse_curr = None;
         self.materialize_prev_visible();
@@ -1727,6 +1769,9 @@ impl RegolithIterator {
                 self.curr_user_key.clear();
                 self.curr_user_key.extend_from_slice(uk);
                 self.consume_curr_user_key_forward();
+                if self.error.is_some() {
+                    return;
+                }
                 continue;
             }
             match vt {
@@ -1734,11 +1779,16 @@ impl RegolithIterator {
                     self.curr_user_key.clear();
                     self.curr_user_key.extend_from_slice(uk);
                     self.consume_curr_user_key_forward();
+                    if self.error.is_some() {
+                        return;
+                    }
                     continue;
                 }
                 VALUE_TYPE_MERGE => {
                     let uk_owned = uk.to_vec();
                     match self.collapse_merge_chain_forward(&uk_owned, rt_seq) {
+                        // A read under the chain failed part way.
+                        Ok(_) if self.error.is_some() => return,
                         Ok(Some(v)) => {
                             self.curr_user_key.clear();
                             self.curr_user_key.extend_from_slice(&uk_owned);

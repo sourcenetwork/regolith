@@ -18,6 +18,7 @@ mod ingest_range_tests;
 #[cfg(test)]
 mod ingest_window_tests;
 pub(crate) mod internal_key;
+pub(crate) mod io;
 pub(crate) mod iterator;
 pub(crate) mod lookup_key;
 #[cfg(loom)]
@@ -476,6 +477,11 @@ impl Default for EngineOptions {
 const CLOSE_STATE_OPEN: u8 = 0;
 const CLOSE_STATE_CLOSING: u8 = 1;
 const CLOSE_STATE_CLOSED: u8 = 2;
+
+/// Blocks of the configured block size one I/O queue may owe before a
+/// further miss waits for room. Enough for a seek through every level and a
+/// deep L0 at once, with each level's index leaf and filter.
+const IO_QUEUE_BLOCKS: usize = 256;
 
 /// The core LSM-tree engine.
 pub(crate) struct RegolithEngine {
@@ -1092,6 +1098,18 @@ impl RegolithEngine {
     /// boundary where a borrowed reference wouldn't reach.
     pub(crate) fn statistics_arc(&self) -> Option<Arc<crate::statistics::Statistics>> {
         self.options.statistics.clone()
+    }
+
+    /// A new I/O queue for one thread, on this database's block cache.
+    ///
+    /// What the queue may owe is bounded by bytes: [`IO_QUEUE_BLOCKS`]
+    /// blocks of the configured block size, so the bound follows the block
+    /// size the reads are made of.
+    pub(crate) fn io_queue(&self) -> crate::IoQueue {
+        crate::IoQueue::open(
+            Arc::clone(&self.cache),
+            self.options.block_size.saturating_mul(IO_QUEUE_BLOCKS),
+        )
     }
 
     /// Register a new live snapshot at `seq` so compaction keeps
@@ -3153,6 +3171,9 @@ impl RegolithEngine {
         self.close_state
             .store(CLOSE_STATE_CLOSING, Ordering::Release);
         self.stall_signal.notify_all();
+        // Every queue waiting on a read gets its completion now, and the read
+        // run again sees the database closing.
+        self.cache.close_io();
         // A transaction still open ends here, on this thread, before the final
         // sync; one already committing is left to finish through it.
         self.open_transactions.abort_all(self);

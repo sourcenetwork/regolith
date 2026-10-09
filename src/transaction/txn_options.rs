@@ -5,6 +5,7 @@
 //! database it is begun on is configured with.
 
 use super::IsolationLevel;
+use crate::{QueueId, ReadMode};
 
 /// Settings for one transaction, passed to
 /// [`OptimisticTransactionDb::begin`](super::OptimisticTransactionDb::begin) or
@@ -21,6 +22,16 @@ use super::IsolationLevel;
 pub struct TxnOptions {
     isolation: Option<IsolationLevel>,
     early_validation: bool,
+    reading: Reading,
+}
+
+/// How a transaction reads the device, and the queue it belongs to.
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct Reading {
+    /// Where its block-cache misses go.
+    pub(super) mode: ReadMode,
+    /// The queue named by [`TxnOptions::io_queue`].
+    pub(super) queue: Option<QueueId>,
 }
 
 impl TxnOptions {
@@ -29,6 +40,10 @@ impl TxnOptions {
         Self {
             isolation: None,
             early_validation: false,
+            reading: Reading {
+                mode: ReadMode::Blocking,
+                queue: None,
+            },
         }
     }
 
@@ -68,9 +83,50 @@ impl TxnOptions {
         self
     }
 
+    /// Read in `mode`: [`ReadMode::Blocking`] by default.
+    ///
+    /// Under [`ReadMode::CacheOnly`] no point read the transaction makes
+    /// touches the device: [`Transaction::get`](super::Transaction::get),
+    /// `get_slice`, `get_for_update`, `get_parts`, and the reads a merge
+    /// needs underneath them each return
+    /// [`crate::TransactionError::WouldBlock`] when they need a block the
+    /// cache does not hold. Poll the queue it names and run the call again: a
+    /// read run again returns what the first attempt would have. Cursors and
+    /// scan streams read blocking.
+    ///
+    /// The reads [`Transaction::commit`](super::Transaction::commit) makes,
+    /// the `before_commit` callbacks' included, read the device whatever the
+    /// mode: `commit` does its own I/O.
+    ///
+    /// A read that returns `WouldBlock` may already have recorded the key as
+    /// read, the same record the read run again makes. A caller that gives
+    /// the read up instead leaves that record behind, which can only add a
+    /// conflict at commit, never hide one.
+    pub const fn read_mode(mut self, mode: ReadMode) -> Self {
+        self.reading.mode = mode;
+        self
+    }
+
+    /// Name the queue this transaction's completions belong to.
+    ///
+    /// Recorded on the transaction and reported by
+    /// [`Transaction::io_queue`](super::Transaction::io_queue). Today only
+    /// reads complete through a queue, and they go to the queue their
+    /// [`read_mode`](Self::read_mode) names; this names it for a transaction
+    /// whose reads block.
+    pub const fn io_queue(mut self, queue: QueueId) -> Self {
+        self.reading.queue = Some(queue);
+        self
+    }
+
     /// Whether writes are checked as they are made.
     pub(super) fn early(&self) -> bool {
         self.early_validation
+    }
+
+    /// The read mode and queue the transaction takes.
+    pub(super) fn reading(&self) -> Reading {
+        self.reading
     }
 
     /// The level this transaction runs at, given the database's configured
@@ -125,5 +181,19 @@ mod tests {
             TxnOptions::default().resolve_isolation(IsolationLevel::RepeatableRead),
             TxnOptions::new().resolve_isolation(IsolationLevel::RepeatableRead)
         );
+        assert_eq!(TxnOptions::default().reading().mode, ReadMode::Blocking);
+        assert_eq!(TxnOptions::new().reading().mode, ReadMode::Blocking);
+        assert_eq!(TxnOptions::new().reading().queue, None);
+    }
+
+    #[test]
+    fn reads_block_until_told_otherwise() {
+        let queue = crate::engine::io::shared::test_id();
+        let opts = TxnOptions::new().read_mode(ReadMode::CacheOnly(queue));
+        assert_eq!(opts.reading().mode, ReadMode::CacheOnly(queue));
+        assert_eq!(opts.reading().queue, None);
+        let opts = TxnOptions::new().io_queue(queue);
+        assert_eq!(opts.reading().mode, ReadMode::Blocking);
+        assert_eq!(opts.reading().queue, Some(queue));
     }
 }

@@ -93,3 +93,7 @@ pub mod parted;
 /// The format 2 write-ahead log layout, for tests that edit log bytes, and
 /// a listener that records the tails an open discards.
 pub mod wal_format;
+
+/// An `Env` that counts SSTable opens and reads, and can hold reads at the
+/// device: what the non-blocking read tests pin.
+pub mod device_env;

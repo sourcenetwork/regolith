@@ -12,9 +12,10 @@
 
 use regolith::{
     AbortReason, CfIter, CommitInfo, CommitReceipt, Conflict, Db, DbSlice, DbWithTtl, Entries,
-    Error, Iter, OptimisticTransactionDb, OwnedSnapshotIter, Page, RetryPolicy, ScanCheck,
-    ScanStream, Snapshot, TailingIter, TransactError, Transaction, TransactionDb, TransactionError,
-    TxnCursor, TxnScanStream,
+    Error, IoBudget, IoProgress, IoQueue, IoUnit, IoWait, Iter, OptimisticTransactionDb,
+    OwnedSnapshotIter, Page, QueueId, ReadMode, RetryPolicy, ScanCheck, ScanStream, Snapshot,
+    TailingIter, TransactError, Transaction, TransactionDb, TransactionError, TxnCursor,
+    TxnScanStream, WouldBlock,
 };
 
 const fn assert_send<T: Send>() {}
@@ -40,6 +41,21 @@ fn handles_are_send_and_sync() {
     assert_send_sync::<ScanCheck>();
     assert_send_sync::<Page>();
     assert_send_sync::<TransactError<Error>>();
+    assert_send_sync::<IoWait>();
+    assert_send_sync::<WouldBlock>();
+    assert_send_sync::<ReadMode>();
+    assert_send_sync::<QueueId>();
+    assert_send_sync::<IoBudget>();
+    assert_send_sync::<IoProgress>();
+    assert_send_sync::<IoUnit>();
+}
+
+/// An I/O queue moves to the thread that will own it, and only that thread
+/// polls it: `Send`, and not `Sync` (the doc test on `IoQueue` fails to
+/// compile a shared one).
+#[test]
+fn an_io_queue_is_send() {
+    assert_send::<IoQueue>();
 }
 
 #[test]

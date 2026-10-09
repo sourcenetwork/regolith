@@ -66,6 +66,7 @@ mod engine;
 pub mod env;
 mod error;
 mod event_listener;
+mod io_queue;
 mod iter;
 mod log_layout;
 mod options;
@@ -98,6 +99,7 @@ pub use event_listener::{
     FlushJobInfo, TableFileCreationInfo, TableFileCreationReason, TableFileDeletionInfo,
     WalTailDiscardedInfo,
 };
+pub use io_queue::{IoBudget, IoProgress, IoQueue, IoUnit, IoWait, QueueId, ReadMode, WouldBlock};
 pub use iter::Iter;
 pub use log_layout::LogLayout;
 pub use options::{
@@ -125,9 +127,10 @@ pub use transaction::{
 /// `use regolith::prelude::*;`.
 pub mod prelude {
     pub use crate::{
-        AbortReason, CommitInfo, CommitReceipt, Conflict, Db, IsolationLevel, KeyClass,
-        KeyClassifier, LogLayout, MergeOperator, OptimisticTransactionDb, Options, RetryPolicy,
-        TransactError, Transaction, TransactionError, TransactionHooks, TxResult, TxnOptions,
+        AbortReason, CommitInfo, CommitReceipt, Conflict, Db, IoBudget, IoQueue, IsolationLevel,
+        KeyClass, KeyClassifier, LogLayout, MergeOperator, OptimisticTransactionDb, Options,
+        QueueId, ReadMode, RetryPolicy, TransactError, Transaction, TransactionError,
+        TransactionHooks, TxResult, TxnOptions, WouldBlock,
     };
 }
 pub use ttl::{DbWithTtl, TtlCompactionFilter, strip_timestamp};
@@ -1134,7 +1137,26 @@ impl Db {
             engine: Arc::clone(&self.engine),
             cfs: Arc::clone(&self.cfs),
             seq,
+            mode: ReadMode::Blocking,
         }
+    }
+
+    /// A new I/O queue for the calling thread (plan 4.10, D53).
+    ///
+    /// Hand its [`IoQueue::id`] to the read handles this thread uses, in
+    /// [`ReadMode::CacheOnly`] through [`Snapshot::with_read_mode`] or
+    /// [`TxnOptions::read_mode`]: their reads then never touch the device,
+    /// and return [`Error::WouldBlock`] when they need a block the cache
+    /// does not hold. The thread polls the queue with [`IoQueue::poll`] when
+    /// it has nothing else to run, which reads those blocks, and runs the
+    /// reads again. regolith adds no thread for this: each thread does its
+    /// own I/O.
+    ///
+    /// One queue per thread; only the thread holding it polls it. A queue
+    /// costs nothing while it waits on nothing, and a database that never
+    /// opens one pays nothing for the mechanism.
+    pub fn io_queue(&self) -> IoQueue {
+        self.engine.io_queue()
     }
 
     /// Scan a key range lazily, holding one entry rather than the range.
@@ -2467,10 +2489,16 @@ impl<'a> CfIter<'a> {
 }
 
 /// A point-in-time snapshot for consistent reads.
+///
+/// A snapshot reads in a [`ReadMode`], `Blocking` unless
+/// [`Snapshot::with_read_mode`] says otherwise. Its point reads and one-shot
+/// scans read in that mode; its iterators and streams read blocking.
 pub struct Snapshot {
     engine: Arc<RegolithEngine>,
     cfs: Arc<CfRegistry>,
     seq: u64,
+    /// Where this snapshot's block-cache misses go.
+    mode: ReadMode,
 }
 
 impl Drop for Snapshot {
@@ -2499,7 +2527,33 @@ impl Snapshot {
             engine: Arc::clone(&self.engine),
             cfs: Arc::clone(&self.cfs),
             seq: self.seq,
+            mode: self.mode,
         }
+    }
+
+    /// This snapshot, reading in `mode` from now on.
+    ///
+    /// Under [`ReadMode::CacheOnly`] no point read or one-shot scan through
+    /// this snapshot touches the device: one that needs a block the cache
+    /// does not hold returns [`Error::WouldBlock`], and the block is read when
+    /// the queue the mode names is polled. Run the read again after that
+    /// poll: it reads the same sequence, so it sees what the first attempt
+    /// would have seen.
+    pub fn with_read_mode(mut self, mode: ReadMode) -> Self {
+        self.mode = mode;
+        self
+    }
+
+    /// The mode this snapshot reads in.
+    pub fn read_mode(&self) -> ReadMode {
+        self.mode
+    }
+
+    /// Run `read` in this snapshot's mode. `Blocking` sets nothing.
+    #[inline]
+    fn reading<T>(&self, read: impl FnOnce() -> T) -> T {
+        let _scope = self.mode.scope();
+        read()
     }
 
     fn validate_cf_handle(&self, cf: &ColumnFamilyHandle) -> Result<()> {
@@ -2544,8 +2598,7 @@ impl Snapshot {
     }
 
     fn lookup_slice(&self, lk: &LookupKey) -> Result<Option<DbSlice>> {
-        self.engine
-            .get_slice(lk)
+        self.reading(|| self.engine.get_slice(lk))
             .map_err(|err| map_point_read_error(err, lk.prefixed_user_key()))
     }
 
@@ -2600,8 +2653,7 @@ impl Snapshot {
     }
 
     fn lookup_size(&self, lk: &LookupKey, limit: Option<usize>) -> Result<Option<usize>> {
-        self.engine
-            .get_size(lk, limit)
+        self.reading(|| self.engine.get_size(lk, limit))
             .map_err(|err| map_point_read_error(err, lk.prefixed_user_key()))
     }
 
@@ -2609,8 +2661,7 @@ impl Snapshot {
     pub fn multi_get(&self, keys: &[&[u8]]) -> Result<Vec<Option<Vec<u8>>>> {
         let owned: Vec<Vec<u8>> = keys.iter().map(|k| prefix_key(DEFAULT_CF_ID, k)).collect();
         let refs: Vec<&[u8]> = owned.iter().map(|k| k.as_slice()).collect();
-        self.engine
-            .multi_get_at(&refs, self.seq)
+        self.reading(|| self.engine.multi_get_at(&refs, self.seq))
             .map_err(Error::from)
     }
 
@@ -2633,7 +2684,8 @@ impl Snapshot {
             Some(e) => prefix_key(DEFAULT_CF_ID, e),
             None => cf_upper_bound(DEFAULT_CF_ID),
         };
-        let raw = collect_range(self.engine.new_iter_at(self.seq), Some(&lo), Some(&hi))?;
+        let raw = self
+            .reading(|| collect_range(self.engine.new_iter_at(self.seq), Some(&lo), Some(&hi)))?;
         strip_cf_prefix_entries(raw)
     }
 
@@ -2656,7 +2708,7 @@ impl Snapshot {
             Some(e) => prefix_key(DEFAULT_CF_ID, e),
             None => cf_upper_bound(DEFAULT_CF_ID),
         };
-        collect_page(self.engine.new_iter_at(self.seq), &lo, &hi, limit)
+        self.reading(|| collect_page(self.engine.new_iter_at(self.seq), &lo, &hi, limit))
             .and_then(strip_cf_prefix_page)
     }
 
@@ -2725,8 +2777,7 @@ impl Snapshot {
         self.validate_cf_handle(cf)?;
         let owned: Vec<Vec<u8>> = keys.iter().map(|k| prefix_key(cf.id(), k)).collect();
         let refs: Vec<&[u8]> = owned.iter().map(|k| k.as_slice()).collect();
-        self.engine
-            .multi_get_at(&refs, self.seq)
+        self.reading(|| self.engine.multi_get_at(&refs, self.seq))
             .map_err(Error::from)
     }
 
@@ -2752,7 +2803,8 @@ impl Snapshot {
             Some(e) => prefix_key(cf.id(), e),
             None => cf_upper_bound(cf.id()),
         };
-        let raw = collect_range(self.engine.new_iter_at(self.seq), Some(&lo), Some(&hi))?;
+        let raw = self
+            .reading(|| collect_range(self.engine.new_iter_at(self.seq), Some(&lo), Some(&hi)))?;
         strip_cf_prefix_entries(raw)
     }
 
@@ -2778,7 +2830,7 @@ impl Snapshot {
             Some(e) => prefix_key(cf.id(), e),
             None => cf_upper_bound(cf.id()),
         };
-        collect_page(self.engine.new_iter_at(self.seq), &lo, &hi, limit)
+        self.reading(|| collect_page(self.engine.new_iter_at(self.seq), &lo, &hi, limit))
             .and_then(strip_cf_prefix_page)
     }
 
