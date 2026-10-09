@@ -175,7 +175,8 @@ impl Options {
     /// emit merge operands via [`crate::Db::merge`] /
     /// [`crate::WriteBatch::merge`] instead of doing
     /// read-modify-write, and readers collapse the merge chain via
-    /// [`MergeOperator::full_merge`] at visibility time.
+    /// [`MergeOperator::full_merge`] at visibility time. Without one, every
+    /// merge write is refused with [`crate::Error::NoMergeOperator`].
     #[must_use]
     pub fn merge_operator(mut self, merge_operator: Option<Arc<dyn MergeOperator>>) -> Self {
         self.merge_operator = merge_operator;

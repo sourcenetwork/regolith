@@ -279,14 +279,20 @@ fn a_failing_merge_is_an_error_not_a_stale_value() {
 }
 
 #[test]
-fn without_a_merge_operator_reads_ignore_buffered_merges() {
+fn a_merge_without_an_operator_is_refused_and_buffers_nothing() {
     each_flavour(Options::default, |flavour| {
         flavour.db().put(b"committed", b"v").unwrap();
         let tx = flavour.begin();
-        tx.merge(b"committed", b"op").unwrap();
+        for key in [&b"committed"[..], b"absent"] {
+            assert!(
+                matches!(
+                    tx.merge(key, b"op"),
+                    Err(TransactionError::Engine(Error::NoMergeOperator))
+                ),
+                "merge into {key:?}"
+            );
+        }
         tx.put(b"put", b"p").unwrap();
-        tx.merge(b"put", b"op").unwrap();
-        tx.merge(b"absent", b"op").unwrap();
         assert_eq!(reads(&tx, b"committed").as_deref(), Some(&b"v"[..]));
         assert_eq!(reads(&tx, b"put").as_deref(), Some(&b"p"[..]));
         assert_eq!(reads(&tx, b"absent"), None);
@@ -301,6 +307,9 @@ fn without_a_merge_operator_reads_ignore_buffered_merges() {
                 (b"put".to_vec(), b"p".to_vec()),
             ]
         );
+        tx.commit().unwrap();
+        assert_eq!(flavour.db().get(b"absent").unwrap(), None);
+        assert_eq!(flavour.db().get(b"committed").unwrap(), Some(b"v".to_vec()));
     });
 }
 

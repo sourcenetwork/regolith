@@ -95,9 +95,28 @@ mod tests {
     use crate::column_family::{DEFAULT_CF_ID, prefix_key};
     use crate::{Db, Options, WriteKind};
     use proptest::prelude::*;
+    use std::sync::Arc;
     use tempfile::TempDir;
 
     const KEYS: [&[u8]; 5] = [b"a", b"b", b"c", b"d", b"e"];
+
+    /// Keeps the newest operand; the walk under test never reads a value.
+    struct Keep;
+
+    impl crate::MergeOperator for Keep {
+        fn name(&self) -> &'static str {
+            "keep"
+        }
+
+        fn full_merge(
+            &self,
+            _key: &[u8],
+            _base: Option<&[u8]>,
+            operands: &[&[u8]],
+        ) -> Option<Vec<u8>> {
+            operands.last().map(|operand| operand.to_vec())
+        }
+    }
 
     /// Keys a point write can name; `e` only bounds a range delete.
     const WRITABLE: usize = 4;
@@ -162,8 +181,10 @@ mod tests {
             ops in proptest::collection::vec(op(), 0..40),
         ) {
             let dir = TempDir::new().unwrap();
-            // No merge operator, so compaction never folds the operands.
-            let db = Db::open(dir.path(), Options::default()).unwrap();
+            // The snapshots below leave each stripe one entry, so the
+            // operator is never asked to fold.
+            let options = Options::default().merge_operator(Some(Arc::new(Keep)));
+            let db = Db::open(dir.path(), options).unwrap();
             let mut log: Vec<(u64, &Op)> = Vec::new();
             // A snapshot after every write keeps every entry and every
             // range tombstone alive through compaction.

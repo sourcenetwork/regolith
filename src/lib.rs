@@ -723,7 +723,8 @@ impl Db {
     /// Layer a merge operand on top of `key` in the default
     /// column family.
     ///
-    /// Requires an [`Options::merge_operator`] to be configured. The
+    /// Requires an [`Options::merge_operator`] to be configured, and returns
+    /// [`Error::NoMergeOperator`] without writing when none is. The
     /// operand is written cheaply (no read-modify-write); readers
     /// collapse the chain of merges plus any base value via the
     /// configured operator at visibility time.
@@ -734,6 +735,7 @@ impl Db {
     /// [`Db::merge`] with an explicit [`WriteOptions`] override.
     pub fn merge_opt(&self, opts: &WriteOptions, key: &[u8], operand: &[u8]) -> Result<()> {
         self.ensure_writable()?;
+        self.engine.require_merge_operator()?;
         self.validate_write_kv_sizes(key, operand)?;
         self.wait_for_write_capacity(opts)?;
         if let Some(s) = self.stats() {
@@ -1036,6 +1038,7 @@ impl Db {
                     record.delete_range(start, end);
                 }
                 WriteBatchOp::Merge { key, operand } => {
+                    self.engine.require_merge_operator()?;
                     self.validate_prefixed_key_size(key)?;
                     self.validate_value_size(operand)?;
                     record.merge(key, operand);
@@ -1825,9 +1828,11 @@ impl Db {
     }
 
     /// Layer a merge operand on top of `key` in column family `cf`.
-    /// Requires [`Options::merge_operator`] to be set.
+    /// Requires [`Options::merge_operator`] to be set, and returns
+    /// [`Error::NoMergeOperator`] without writing when it is not.
     pub fn merge_cf(&self, cf: &ColumnFamilyHandle, key: &[u8], operand: &[u8]) -> Result<()> {
         self.ensure_writable()?;
+        self.engine.require_merge_operator()?;
         self.validate_cf_handle(cf)?;
         self.validate_write_kv_sizes(key, operand)?;
         self.wait_for_write_capacity(&WriteOptions::default())?;
@@ -2946,6 +2951,10 @@ impl WriteBatch {
     /// existing value or merge chain and collapsed at read time.
     /// Multiple merges on the same key in a single batch are
     /// allowed and applied in insertion order.
+    ///
+    /// A batch does not know its database, so the operator is checked when
+    /// the batch is applied: [`Db::write`] returns [`Error::NoMergeOperator`]
+    /// and applies none of the batch when the database has no operator.
     pub fn merge(&mut self, key: &[u8], operand: &[u8]) {
         self.ops.push(WriteBatchOp::Merge {
             key: prefix_key(DEFAULT_CF_ID, key),
@@ -2979,7 +2988,9 @@ impl WriteBatch {
         });
     }
 
-    /// Add a merge operand scoped to column family `cf`.
+    /// Add a merge operand scoped to column family `cf`. As for
+    /// [`WriteBatch::merge`], applying the batch to a database with no merge
+    /// operator returns [`Error::NoMergeOperator`].
     pub fn merge_cf(&mut self, cf: &ColumnFamilyHandle, key: &[u8], operand: &[u8]) {
         self.ops.push(WriteBatchOp::Merge {
             key: prefix_key(cf.id(), key),
@@ -3249,7 +3260,10 @@ mod tests {
     #[test]
     fn test_configured_key_value_size_limits_are_enforced() {
         let dir = TempDir::new().unwrap();
-        let opts = Options::default().max_key_size(8).max_value_size(4);
+        let opts = Options::default()
+            .max_key_size(8)
+            .max_value_size(4)
+            .merge_operator(Some(Arc::new(AppendMerge)));
         let db = Db::open(dir.path(), opts).unwrap();
 
         db.put(b"abc", b"1234").unwrap();

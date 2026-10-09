@@ -739,7 +739,6 @@ impl Transaction {
     /// it made them, onto the value of its newest put or delete of the key,
     /// or, when it made neither, onto the value read as above. A merge that
     /// the operator declines is an error, as it is for a read of the database.
-    /// With no merge operator configured, the operands are not applied.
     ///
     /// Takes no lock. The read is remembered, so writing the same
     /// key later turns it into a read-modify-write that is validated
@@ -1022,6 +1021,10 @@ impl Transaction {
     /// level, so two optimistic transactions that run concurrently cannot
     /// both commit a merge to the same key.
     ///
+    /// Refused with [`TransactionError::Engine`] carrying
+    /// [`Error::NoMergeOperator`], buffering nothing, when the database has
+    /// no [`crate::MergeOperator`] configured.
+    ///
     /// [`IsolationLevel::DefraLevel`] is the exception, for a key the
     /// transaction only merges into: it did not read the key, did not walk
     /// it in a scan, and did not put or delete it. That merge conflicts only
@@ -1035,6 +1038,7 @@ impl Transaction {
     /// when it made one earlier, and a put or a delete made after the operand
     /// replaces the key outright, so the operand has no effect.
     pub fn merge(&self, key: &[u8], operand: &[u8]) -> TxResult<()> {
+        self.engine.require_merge_operator()?;
         let prefixed = prefix_key(DEFAULT_CF_ID, key);
         self.lock_key(&prefixed)?;
         self.writes.insert(prefixed, Write::Merge(operand.to_vec()));

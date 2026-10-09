@@ -898,6 +898,14 @@ impl RegolithEngine {
         self.options.merge_operator.as_deref()
     }
 
+    /// Refuses a merge write on a database with no operator to fold it, which
+    /// reads would otherwise disagree about.
+    pub(crate) fn require_merge_operator(&self) -> Result<(), crate::Error> {
+        self.merge_operator()
+            .map(|_| ())
+            .ok_or(crate::Error::NoMergeOperator)
+    }
+
     pub(crate) fn is_closed(&self) -> bool {
         self.close_state.load(Ordering::Acquire) != CLOSE_STATE_OPEN
     }

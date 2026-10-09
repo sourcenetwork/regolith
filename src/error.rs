@@ -41,6 +41,11 @@ pub enum Error {
     /// diagnostics.
     #[error("merge operator failed for key {0:?}")]
     MergeFailed(Vec<u8>),
+    /// A merge was written to a database that has no
+    /// [`crate::MergeOperator`] configured. Set [`crate::Options::merge_operator`]
+    /// before opening, or write the value with a put.
+    #[error("no merge operator is configured; set Options::merge_operator to write merges")]
+    NoMergeOperator,
     /// A write was stalled behind background work (a flush or a
     /// compaction) whose most recent attempt failed, so waiting would not
     /// end. `source` carries the failure, OS error code included, so a
