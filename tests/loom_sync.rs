@@ -28,9 +28,7 @@
 //! - **The upgradable read**: it shares with readers, upgrades while they
 //!   come and go, and excludes writers.
 //!
-//! Loom does not spin: the acquire's spin is set to none under loom, since
-//! a spin is only repeated attempts and loom would explore each one. The
-//! waiter-node free list is a pass-through to the allocator under loom
+//! The waiter-node free list is a pass-through to the allocator under loom
 //! (see `Pool`), so node recycling itself is covered by miri and the unit
 //! tests rather than here. Two calibration models deliberately expect
 //! something the protocol does not guarantee and must fail; without them

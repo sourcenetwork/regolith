@@ -23,7 +23,7 @@
 //!     one thread it deadlocks.
 //!
 //! The locks barge: a caller takes a free lock even while others wait,
-//! after a brief spin before it queues, and a release only wakes a waiter
+//! and queues at once when it is held, and a release only wakes a waiter
 //! to compete again, so the releasing thread takes the lock straight back,
 //! as with `std::sync::Mutex`. A waiter passed over `MAX_BYPASS` times is
 //! handed the lock directly, which costs a context switch for that one

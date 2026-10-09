@@ -18,7 +18,7 @@ use super::raw_semaphore::{PermitWait, RawSemaphore};
 /// Uncontended, [`try_lock`](Self::try_lock) and a guard's drop are one
 /// atomic read-modify-write each and allocate nothing. A caller takes the
 /// lock whenever it is free, even while others wait; under contention
-/// [`lock`](Self::lock) spins briefly, then queues and returns `Pending`.
+/// [`lock`](Self::lock) queues and returns `Pending`.
 /// An unlock wakes the oldest waiter to try again; a waiter that loses
 /// [`MAX_BYPASS`](super::MAX_BYPASS) times is handed the lock directly,
 /// and `try_lock` fails until it has had it.

@@ -1,24 +1,31 @@
 //! The acquire every lock-like primitive shares: take what is free at
-//! once, spin briefly, then wait in the queue with a bounded bypass.
+//! once, otherwise wait in the queue with a bounded bypass.
 //!
 //! A caller takes what it asks for whenever it is free and no handoff is
 //! owed, even past queued waiters: the thread that has just released a
 //! lock and asks again takes it straight back, with no context switch.
-//! When the first attempt fails and nobody is queued yet, the caller
-//! retries for [`SPIN`] rounds with `core::hint::spin_loop` between them;
-//! then it queues and returns `Pending`. A release wakes the front
-//! waiter, whatever it asks for, and the waiters behind it the free
-//! permits could serve; a woken waiter tries again when polled. Each time
-//! it cannot take its whole request it counts one bypass. The attempt
-//! that would be its [`MAX_BYPASS`]th loss is owed a handoff in the same
-//! compare-and-swap that finds it short, so barging stops before anything
-//! more is freed, and released permits gather for it until its request is
-//! met. No clock is read: fairness is counted, not timed.
+//! When that one attempt fails, the caller queues and returns `Pending`;
+//! it does not spin first. A release wakes the front waiter, whatever it
+//! asks for, and the waiters behind it the free permits could serve; a
+//! woken waiter tries again when polled. Each time it cannot take its
+//! whole request it counts one bypass. The attempt that would be its
+//! [`MAX_BYPASS`]th loss is owed a handoff in the same compare-and-swap
+//! that finds it short, so barging stops before anything more is freed,
+//! and released permits gather for it until its request is met. No clock
+//! is read: fairness is counted, not timed.
+//!
+//! Why no spin before queueing, measured with `benches/sync.rs`: spinning
+//! on every contended poll, at 16 or 64 rounds, cost two to five times the
+//! throughput in every shape. Spinning 16 rounds only while nobody was
+//! queued measured within 6% of not spinning across threads in every
+//! shape (medians of six runs on a loaded host, less than the run-to-run
+//! spread), and 9% slower with two tasks on one thread, where the holder
+//! cannot run until the spinner gives up.
 
 use core::task::{Poll, Waker};
 
 use super::internal::Ordering;
-use super::queue::{HANDOFF, Policy, QUEUED};
+use super::queue::{HANDOFF, Policy};
 use super::waiter::{Cancel, Park, Wait};
 
 /// How many times a waiter can be passed over before it is owed a
@@ -30,25 +37,6 @@ pub const MAX_BYPASS: u32 = 16;
 /// handoff.
 #[cfg(loom)]
 pub const MAX_BYPASS: u32 = 2;
-
-/// Retries a contended acquire makes before it queues, and only while no
-/// waiter is queued: once one is, the holder is likely suspended (a task
-/// holding across an await, on this thread or another), and a spin only
-/// burns the time it would have run. Measured with `benches/sync.rs`:
-/// spinning on every contended poll, at 16 or 64 rounds, cost two to five
-/// times the throughput of not spinning in every shape; 16 rounds that
-/// stop at the first queued waiter measured the same as no spin. None
-/// where a spin cannot help: on a single-threaded target nobody else runs
-/// while the caller spins, and under loom a spin is only more
-/// interleavings.
-pub(super) const SPIN: u32 = if cfg!(any(
-    loom,
-    all(target_family = "wasm", not(target_feature = "atomics"))
-)) {
-    0
-} else {
-    16
-};
 
 /// A primitive whose waits take something and give it back.
 pub(super) trait Lock: Policy {
@@ -102,22 +90,6 @@ pub(super) fn take<L: Lock + ?Sized>(lock: &L, need: usize, for_waiter: bool) ->
     }
 }
 
-/// [`Lock::try_take`], retried through the spin while nobody is queued
-/// and no handoff is owed.
-pub(super) fn spin_take<L: Lock>(lock: &L, need: usize) -> Result<(), usize> {
-    let mut result = lock.try_take(need);
-    for _ in 0..SPIN {
-        match result {
-            Ok(()) => return Ok(()),
-            Err(seen) if seen & (HANDOFF | QUEUED) != 0 => return Err(seen),
-            Err(_) => {}
-        }
-        core::hint::spin_loop();
-        result = lock.try_take(need);
-    }
-    result
-}
-
 /// A future's contended acquire.
 pub(super) struct Contend {
     wait: Wait,
@@ -144,7 +116,7 @@ impl Contend {
         // passed the waiter yet, the holder was simply there first.
         let mut arriving = !self.wait.is_queued();
         let mut park = if arriving {
-            if spin_take(lock, need).is_ok() {
+            if lock.try_take(need).is_ok() {
                 return Poll::Ready(());
             }
             lock.enqueue(&mut self.wait, need, waker);
@@ -165,7 +137,7 @@ impl Contend {
                     let attempt = if !arriving && self.bypass + 1 == MAX_BYPASS {
                         lock.take_or_owe(&self.wait, need)
                     } else {
-                        spin_take(lock, need)
+                        lock.try_take(need)
                     };
                     match attempt {
                         Ok(()) => {

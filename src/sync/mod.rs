@@ -14,9 +14,9 @@
 //!   caller's `Waker` and returns `Pending`. What a wake does belongs to
 //!   the caller's executor.
 //! - **Fast under contention.** The locks and the semaphore let a caller
-//!   take what is free even while others wait, after a brief spin before
-//!   it queues, so a release never waits for a suspended task to run: the
-//!   thread that released takes the lock straight back.
+//!   take what is free even while others wait, so a release never waits
+//!   for a suspended task to run: the thread that released takes the lock
+//!   straight back.
 //! - **Bounded bypass.** A release wakes the oldest waiters it could
 //!   serve to compete again. One that loses [`MAX_BYPASS`] times is owed a
 //!   handoff: nobody gets in ahead of it, and the next release hands it

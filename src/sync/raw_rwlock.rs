@@ -24,7 +24,7 @@
 use core::ptr::NonNull;
 use core::task::{Poll, Waker};
 
-use super::contend::{Contend, Lock, SPIN};
+use super::contend::{Contend, Lock};
 use super::internal::{Ordering, UnsafeCell};
 use super::list::List;
 use super::queue::{
@@ -379,11 +379,8 @@ impl UpgradeWait {
             self.started = true;
             lock.queue.state.fetch_or(UPGRADING, Ordering::AcqRel);
         }
-        for _ in 0..=SPIN {
-            if lock.try_upgrade() {
-                return Poll::Ready(());
-            }
-            core::hint::spin_loop();
+        if lock.try_upgrade() {
+            return Poll::Ready(());
         }
         lock.enqueue(&mut self.wait, UPGRADE, waker);
         match self.wait.park(&lock.queue, None) {

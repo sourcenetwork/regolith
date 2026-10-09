@@ -11,8 +11,8 @@ use super::raw_semaphore::{MAX, PermitWait, RawSemaphore};
 /// A counting semaphore whose waits are futures.
 ///
 /// A request for `n` permits takes them whenever `n` are free, even while
-/// others wait; under contention [`acquire`](Self::acquire) spins briefly,
-/// then queues. A release wakes the oldest waiters the freed permits could
+/// others wait; under contention [`acquire`](Self::acquire) queues. A
+/// release wakes the oldest waiters the freed permits could
 /// serve, stopping at the first that does not fit, so a large request at
 /// the front is not skipped for smaller ones behind it. A waiter that
 /// loses [`MAX_BYPASS`](super::MAX_BYPASS) times is owed a handoff: until
