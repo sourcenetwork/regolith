@@ -1,3 +1,6 @@
+use crate::io_queue::WouldBlock;
+use crate::io_queue::wait::{copy_would_block, take_would_block};
+
 /// Errors returned by regolith operations.
 #[non_exhaustive]
 #[derive(Debug, thiserror::Error)]
@@ -98,6 +101,12 @@ pub enum Error {
     /// [`crate::Transaction::append`] writes the keys of a commit-ordered log.
     #[error("this key belongs to a commit-ordered log; write it with append")]
     LogKeyWrite,
+    /// The call returned instead of waiting. A read through a
+    /// [`crate::ReadMode::CacheOnly`] handle needed a block the cache does
+    /// not hold: poll the queue the wait names, then run the call again. The
+    /// call left nothing half done; a scan resumes where it stopped.
+    #[error("{0}")]
+    WouldBlock(WouldBlock),
     /// An underlying I/O error from the filesystem or operating system.
     #[error("I/O error: {0}")]
     Io(#[source] std::io::Error),
@@ -141,6 +150,9 @@ impl Error {
                 std::io::Error::new(std::io::ErrorKind::PermissionDenied, Self::ReadOnly)
             }
             Self::Closed => std::io::Error::new(std::io::ErrorKind::NotConnected, Self::Closed),
+            Self::WouldBlock(would_block) => {
+                std::io::Error::new(std::io::ErrorKind::WouldBlock, would_block)
+            }
             typed @ (Self::DataBlockLimitExceeded { .. }
             | Self::Busy(_)
             | Self::ContentMismatch
@@ -151,8 +163,12 @@ impl Error {
 }
 
 /// The payload-free variant `err` carries as its source, if
-/// [`Error::into_io_error`] built it from one.
+/// [`Error::into_io_error`] built it from one. A wait it carries comes back
+/// as a clone, which waits on the same read.
 fn carried(err: &std::io::Error) -> Option<Error> {
+    if let Some(would_block) = copy_would_block(err) {
+        return Some(Error::WouldBlock(would_block));
+    }
     match err.get_ref()?.downcast_ref::<Error>()? {
         Error::DataBlockLimitExceeded {
             max_data_block_bytes,
@@ -198,6 +214,11 @@ impl Error {
 
 impl From<std::io::Error> for Error {
     fn from(err: std::io::Error) -> Self {
+        // A wait is moved out, not copied: the read it names is this one.
+        let err = match take_would_block(err) {
+            Ok(would_block) => return Self::WouldBlock(would_block),
+            Err(err) => err,
+        };
         if let Some(typed) = carried(&err) {
             return typed;
         }
@@ -347,6 +368,50 @@ mod tests {
                 Error::CallbackPanicked { latched: l, .. } if l == latched
             ));
         }
+    }
+
+    fn a_wait() -> WouldBlock {
+        use crate::engine::io::shared::{QueueShared, WaitSlot, test_id};
+        let queue = QueueShared::new(test_id(), 1);
+        WouldBlock::Io(crate::IoWait::new(
+            &queue,
+            None,
+            std::sync::Arc::new(WaitSlot::new()),
+        ))
+    }
+
+    #[test]
+    fn a_wait_moves_through_an_io_error_and_back() {
+        let io = Error::WouldBlock(a_wait()).into_io_error();
+        assert_eq!(io.kind(), std::io::ErrorKind::WouldBlock);
+        // A copy waits on the same read, and the original moves out whole.
+        let copy = Error::clone_io(&io);
+        assert!(matches!(
+            Error::from(copy),
+            Error::WouldBlock(WouldBlock::Io(_))
+        ));
+        let Error::WouldBlock(WouldBlock::Io(wait)) = Error::from(io) else {
+            panic!("the wait was lost on the way out");
+        };
+        assert_eq!(wait.queue(), crate::engine::io::shared::test_id());
+        assert!(wait.unit().is_none());
+        assert!(!wait.is_ready());
+    }
+
+    #[test]
+    fn a_wait_is_a_transaction_wait_never_an_engine_failure() {
+        let from_error = crate::TransactionError::from(Error::WouldBlock(a_wait()));
+        assert!(matches!(
+            from_error,
+            crate::TransactionError::WouldBlock(WouldBlock::Io(_))
+        ));
+        let from_io = crate::TransactionError::from(Error::WouldBlock(a_wait()).into_io_error());
+        assert!(matches!(
+            from_io,
+            crate::TransactionError::WouldBlock(WouldBlock::Io(_))
+        ));
+        let message = Error::WouldBlock(a_wait()).to_string();
+        assert!(message.contains("poll its I/O queue"), "{message}");
     }
 
     #[test]

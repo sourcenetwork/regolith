@@ -233,3 +233,7 @@ harness = false
 [[bench]]
 name = "cf_drop"
 harness = false
+
+[[bench]]
+name = "io_queue"
+harness = false

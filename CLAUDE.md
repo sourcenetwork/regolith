@@ -69,6 +69,8 @@ src/
 ├── conflict.rs         # Conflict reasons: Conflict, Access, WriteKind
 ├── error.rs            # Error enum, Result alias
 ├── event_listener.rs   # Flush/compaction event callbacks
+├── io_queue.rs         # Non-blocking reads: ReadMode, QueueId, IoBudget, IoProgress
+├── io_queue/           # queue.rs (IoQueue: poll, idle_waker), wait.rs (IoWait, WouldBlock)
 ├── iter.rs             # Public iterator wrappers
 ├── options.rs          # Options, tuning enums, MergeOperator, CompactionFilter
 ├── options/            # Options builder methods (builder.rs) and getters (getters.rs)
@@ -120,6 +122,8 @@ src/
     ├── filter_block.rs # SSTable filter region: user-key and prefix bloom filters
     ├── index_block.rs  # Decoded SSTable index blocks
     ├── internal_key.rs # MVCC internal key encoding
+    ├── io/             # CacheOnly misses: unit table and single-flight units (unit.rs), per-queue
+    │                   # inbox and landings (shared.rs), the mode scope (scope.rs), stack.rs, atomic_waker.rs
     ├── lookup_key.rs   # Inline-first internal key used by every read path
     ├── iterator.rs     # Engine iterator merge logic
     ├── range_tombstone.rs # Range-delete tombstone encoding
