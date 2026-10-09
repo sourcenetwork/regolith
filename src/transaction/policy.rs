@@ -63,8 +63,8 @@ pub enum KeyClass {
     /// [`IsolationLevel::DefraLevel`] with a [`KeyClassifier`] installed.
     /// There:
     ///
-    /// - A put or merge of the key is never checked against newer writes, and
-    ///   neither is a read of a key the transaction puts or merges, so two
+    /// - A put or merge of the key never conflicts with a newer write, and
+    ///   neither does a read of a key the transaction puts or merges, so two
     ///   transactions that create the same key both commit. The newest write
     ///   of a key decides: a key the transaction deletes and then puts or
     ///   merges counts as put or merged.
@@ -85,9 +85,14 @@ pub enum KeyClass {
     /// Other levels, and transactions without a classifier, are unchanged.
     ///
     /// The caller's contract is that the bytes under the key never differ.
-    /// regolith cannot check it: a transaction that writes other bytes under
-    /// the key commits as well, and the last commit to land decides what the
-    /// key holds.
+    /// regolith checks it where that costs nothing on the common path. When
+    /// a commit made after the transaction began left the key a value, and
+    /// the transaction puts different bytes, the commit applies nothing and
+    /// fails with [`crate::Error::ContentMismatch`]. A put of the same bytes
+    /// commits. The check does not look at a key whose newest version is a
+    /// delete or a merge operand, at a merge, or at bytes that were already
+    /// different before the transaction began, so the contract still rests on
+    /// the caller.
     ContentAddressed,
 }
 

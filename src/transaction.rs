@@ -248,8 +248,10 @@ impl OptimisticTransactionDb {
     /// This is safe only when nothing the transaction writes outside the
     /// prefix depends on which keys of the prefix the scan returned, its
     /// writes inside the prefix are unique keys or identical rewrites, and a
-    /// content-addressed key never holds different bytes. regolith cannot
-    /// check that, so it rests on the caller's word.
+    /// content-addressed key never holds different bytes. regolith catches a
+    /// put of different bytes beside a newer commit of the key with
+    /// [`Error::ContentMismatch`], and cannot check the rest, so it rests on
+    /// the caller's word.
     ///
     /// The classifier does not change how blind merges are validated: they
     /// commute at this level for every key.
@@ -532,7 +534,9 @@ pub enum IsolationLevel {
     /// - Content-addressed keys. With the same classifier, a put or merge of
     ///   a key it declares [`KeyClass::ContentAddressed`] is never
     ///   validated, nor is a read of a key the transaction puts or merges,
-    ///   so two transactions that create the same key both commit. A delete
+    ///   so two transactions that create the same key both commit when they
+    ///   put the same bytes, and a put of different bytes beside a newer
+    ///   commit of the key fails with [`Error::ContentMismatch`]. A delete
     ///   of it is validated like a delete of an ordinary key. A point read
     ///   that found it is validated for presence only: it conflicts at
     ///   commit when the key is gone, and not when a newer put or merge left

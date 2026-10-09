@@ -38,9 +38,19 @@ fn commit_after_newer_writes(exempt: &[&[u8]], puts: &[&[u8]], merged: &[&[u8]])
         blind_merges_commute: false,
         exempt: exempt.iter().copied().map(key_of).collect(),
     };
+    // An exempt key names its bytes, so it is put with the bytes that landed
+    // beside it; an ordinary key is put with others, so it cannot pass as an
+    // identical rewrite.
     let point_ops: BTreeMap<Vec<u8>, Option<Vec<u8>>> = puts
         .iter()
-        .map(|name| (key_of(name), Some(b"mine".to_vec())))
+        .map(|name| {
+            let bytes: &[u8] = if exempt.contains(name) {
+                b"newer"
+            } else {
+                b"mine"
+            };
+            (key_of(name), Some(bytes.to_vec()))
+        })
         .collect();
     let merges: Vec<(Vec<u8>, Vec<u8>)> = merged
         .iter()

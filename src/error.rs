@@ -46,6 +46,12 @@ pub enum Error {
     /// before opening, or write the value with a put.
     #[error("no merge operator is configured; set Options::merge_operator to write merges")]
     NoMergeOperator,
+    /// A transaction put a [`crate::KeyClass::ContentAddressed`] key with
+    /// bytes that differ from the bytes a commit made after the transaction
+    /// began left under it. Such a key must always hold the same bytes, so the
+    /// commit applied nothing; name the key by the bytes it holds.
+    #[error("a content-addressed key already holds different bytes, so the commit applied nothing")]
+    ContentMismatch,
     /// A write was stalled behind background work (a flush or a
     /// compaction) whose most recent attempt failed, so waiting would not
     /// end. `source` carries the failure, OS error code included, so a
@@ -105,9 +111,9 @@ impl Error {
                 std::io::Error::new(std::io::ErrorKind::PermissionDenied, Self::ReadOnly)
             }
             Self::Closed => std::io::Error::new(std::io::ErrorKind::NotConnected, Self::Closed),
-            typed @ (Self::DataBlockLimitExceeded { .. } | Self::Busy(_)) => {
-                std::io::Error::other(typed)
-            }
+            typed @ (Self::DataBlockLimitExceeded { .. }
+            | Self::Busy(_)
+            | Self::ContentMismatch) => std::io::Error::other(typed),
             other => std::io::Error::other(other.to_string()),
         }
     }
@@ -125,6 +131,7 @@ fn carried(err: &std::io::Error) -> Option<Error> {
         Error::Closed => Some(Error::Closed),
         Error::ReadOnly => Some(Error::ReadOnly),
         Error::Busy(reason) => Some(Error::Busy(reason)),
+        Error::ContentMismatch => Some(Error::ContentMismatch),
         _ => None,
     }
 }
@@ -192,6 +199,7 @@ mod tests {
             Error::Closed,
             Error::ReadOnly,
             Error::Busy("too many L0 files"),
+            Error::ContentMismatch,
             Error::DataBlockLimitExceeded {
                 max_data_block_bytes: 4096,
             },
@@ -207,7 +215,12 @@ mod tests {
 
     #[test]
     fn a_cloned_io_error_keeps_its_variant() {
-        for typed in [Error::Closed, Error::ReadOnly, Error::Busy("stalled")] {
+        for typed in [
+            Error::Closed,
+            Error::ReadOnly,
+            Error::Busy("stalled"),
+            Error::ContentMismatch,
+        ] {
             let text = typed.to_string();
             let copy = Error::clone_io(&typed.into_io_error());
             assert_eq!(copy.to_string(), text);

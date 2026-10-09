@@ -46,6 +46,7 @@ use crate::perf_context::{PerfTimer, PerfTimerField};
 use crate::statistics::{Histogram, Ticker};
 use crate::{Access, Conflict, WriteBatchOp};
 
+mod content;
 mod replaced;
 mod request;
 mod slot;
@@ -379,6 +380,11 @@ impl RegolithEngine {
             // Borrows the batch and allocates nothing: the loop below runs
             // under the pipeline mutex.
             let replaced = checks.blind_merges_commute.then(|| Replaced::of(&ops));
+            // Whether anything committed since the snapshot, which only an
+            // exempt put has any use for: with no exempt key, or nothing
+            // newer, no put is looked up.
+            let landed_since =
+                !checks.exempt.is_empty() && self.latest_seq.load(Ordering::Acquire) > observed_seq;
             let mut last_merged: Option<&[u8]> = None;
             for op in &ops {
                 let (key, mine) = match op {
@@ -407,6 +413,19 @@ impl RegolithEngine {
                     .binary_search_by(|exempt| exempt.as_slice().cmp(key))
                     .is_ok()
                 {
+                    // The one lookup an exempt put can cost: the key names
+                    // its bytes, so a put beside different ones breaks the
+                    // contract and the commit is refused loudly.
+                    if landed_since
+                        && let WriteBatchOp::Put { value, .. } = op
+                        && self.content_mismatch(key, value, observed_seq, &view)?
+                    {
+                        tracing::error!(
+                            "a content-addressed key was put with bytes that differ from \
+                             the bytes it holds; the commit was refused"
+                        );
+                        return Err(crate::Error::ContentMismatch.into_io_error());
+                    }
                     continue;
                 }
                 // A written key the transaction also read was validated above,
