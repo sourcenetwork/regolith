@@ -1,11 +1,14 @@
 /-!
-# LsmOrder: the read order of the LSM tree, the L0 closure rule, one view per batch
+# LsmOrder: the read order of the LSM tree, the L0 closure rule, one view per batch, flush order, ingest placement, overlap demotion, binary search
 
 This file backs two TLA+ models in `proofs/tla`:
 
 * `LsmOrder.tla`, invariant `ReadNewest` (configurations `MC_LsmOrder_Green`
   and `MC_LsmOrder_Red_Intersect`). Defect E1: `compact_range` at L0 must
-  pick a closed input set.
+  pick a closed input set. The same model's flush order, ingest placement,
+  overlap demotion (E14, D13) and binary search configurations
+  (`MC_LsmOrder_*_Flush*`, `*_Ingest*`, `*_Demote*`, `*_NoDemotion`, and
+  the invariant `BisectIsScan`) are backed by items 7 to 10 below.
 * `BatchRead.tla`, invariants `BatchConsistent` and `BatchExact`
   (configurations `MC_BatchRead_*`). Defect E6: a batch read resolves every
   key against one view.
@@ -35,6 +38,21 @@ What is proved, in plain words:
    resolved against the view it began with answers every key as of one
    point in time; a batch that loads a view per key can answer a key from a
    view a flush has already thinned.
+7. `install_oldest_same_order`: installing the oldest frozen memtable as
+   the newest L0 file leaves the read order as it was;
+   `install_newer_breaks_reads` is the RED case of installing a newer one
+   first.
+8. `ingest_ordered`: an ingested file, newer than everything, placed where
+   no source read before it shares a key, keeps the sources ordered;
+   `ingest_below_holder_breaks_reads` is the RED case.
+9. `demote_reads_newest`: demoting every level from L1 down to an
+   overlapping one to the end of L0, in age order, keeps the read order and
+   every read; `noShared_level_ordered` says the overlapping level's tables
+   are ordered in any order; `demote_level_only_breaks_reads` is the RED
+   case of demoting the overlapping level alone.
+10. `bsearch_eq_scan` and `level_read_bsearch`: on a level in key order
+   whose tables do not overlap, binary search finds the table a linear scan
+   finds, and reads what a linear read of the level reads.
 
 How to read the Lean: `def` defines a function or a property, `theorem`
 states a fact and its proof follows `:= by`. Lines starting with `--` are
@@ -971,5 +989,394 @@ theorem red_closure_picks_both :
     pickL0 1 1 [redNewer, redOlder] = [(redNewer, true), (redOlder, true)] ∧
     read (after [] (pickL0 1 1 [redNewer, redOlder]) []) 5 10 = some 4 := by
   decide
+
+/-! ## Frozen memtables: install in memtable order
+
+Rotation freezes the memtable; frozen memtables are read after the active
+one, newest first, and before L0. A flush that runs off the commit path
+installs its file as the newest L0 file. The TLA+ configurations
+`MC_LsmOrder_Green_Flush` and `MC_LsmOrder_Red_FlushAnyOrder` check this. -/
+
+/-- **Installing the oldest frozen memtable leaves the read order as it
+was.** The oldest frozen memtable is the last one read before L0; as the
+newest L0 file it is the first one read in L0: the same position. So the
+order stays ordered and every read is unchanged. -/
+theorem install_oldest_same_order (mem : Source) (imm l0 deeper : List Source) (f : Source) :
+    mem :: (imm ++ [f]) ++ l0 ++ deeper = mem :: imm ++ (f :: l0) ++ deeper := by
+  simp
+
+/-- **`install_newer_breaks_reads`.** Two frozen memtables, the newer
+holding key 1 at 2 and the older key 1 at 1. Installing the newer one
+first puts it behind the older one, which is still read before L0: the
+read of key 1 answers 1 where it answered 2. -/
+theorem install_newer_breaks_reads :
+    read ([] :: [[(1, 2)], [(1, 1)]] ++ []) 1 10 = some 2 ∧
+    read ([] :: [[(1, 1)]] ++ ([(1, 2)] :: [])) 1 10 = some 1 := by
+  decide
+
+/-! ## Ingest placement
+
+An ingested file holds versions at one fresh sequence, newer than every
+version in the tree. It may sit anywhere in the read order where every
+source read before it holds none of its keys. The TLA+ configurations
+`MC_LsmOrder_Green_Ingest` and `MC_LsmOrder_Red_IngestIgnoresUpper` check
+the placement rule that guarantees this. -/
+
+/-- `NoShared a b`: the sources `a` and `b` hold no version of a common
+key. -/
+def NoShared (a b : Source) : Prop := ∀ k s t, (k, s) ∈ a → (k, t) ∈ b → False
+
+/-- Sources with no common key are `Newer` each way, vacuously. -/
+theorem newer_of_noShared {a b : Source} (h : NoShared a b) : Newer a b :=
+  fun k s t hs ht => (h k s t hs ht).elim
+
+/-- **`ingest_ordered`.** Put the file `f` between `pre` (the sources read
+before it) and `post` (those read after). If no source of `pre` shares a
+key with `f`, and every version of `f` is newer than every version already
+held, the read order stays ordered. -/
+theorem ingest_ordered {pre post : List Source} {f : Source}
+    -- The read order before the ingest is ordered.
+    (hord : Ordered (pre ++ post))
+    -- Nothing read before the file holds one of its keys.
+    (hpre : ∀ src ∈ pre, NoShared src f)
+    -- The file's versions are newer than every version held.
+    (hfresh : ∀ v ∈ f, ∀ w, Holds (pre ++ post) w → w.2 < v.2) :
+    Ordered (pre ++ f :: post) := by
+  unfold Ordered at *
+  rw [List.pairwise_append] at hord ⊢
+  obtain ⟨hp, hq, hpq⟩ := hord
+  refine ⟨hp, List.Pairwise.cons ?_ hq, ?_⟩
+  · -- The file is newer than every source after it.
+    intro b hb k s t hs ht
+    exact hfresh (k, s) hs (k, t) ⟨b, List.mem_append_right _ hb, ht⟩
+  · -- A source before the file is newer than the file (no common key) and
+    -- than every source after it (as before).
+    intro a ha b hb
+    rcases List.mem_cons.mp hb with rfl | hb'
+    · exact newer_of_noShared (hpre a ha)
+    · exact hpq a ha b hb'
+
+/-- **`ingest_below_holder_breaks_reads`.** L1 holds key 1 at 1. An
+ingested file holding key 1 at 2, placed in L2 below it, is read after
+it: the read answers 1. Placed in front, it answers 2. -/
+theorem ingest_below_holder_breaks_reads :
+    read [[], [(1, 1)], [(1, 2)]] 1 10 = some 1 ∧
+    read [[], [(1, 2)], [(1, 1)]] 1 10 = some 2 := by
+  decide
+
+/-! ## Demotion of an overlapping level at open (E14, D13)
+
+A tree's read order is its memtables, its L0 files newest first, then each
+level's tables. Within a level whose tables do not overlap, at most one
+table can hold a key, so reading the level's tables one after another
+answers what reading the one table binary search finds answers
+(`level_read_bsearch`, below). So a tree's read order is the flat list
+`treeOrder`. A level whose recorded ranges overlap breaks the binary
+search; the TLA+ configuration `MC_LsmOrder_Red_NoDemotion` shows the read
+it gets wrong. -/
+
+/-- The flat read order of a tree. -/
+def treeOrder (mems l0 : List Source) (levels : List (List Source)) : List Source :=
+  mems ++ l0 ++ levels.flatten
+
+/-- The L0 files after the open demotes levels `1..d`: the old L0 files,
+then those levels' tables, level by level, each level in the order given
+(age order: newest first). -/
+def demoteL0 (d : Nat) (l0 : List Source) (levels : List (List Source)) : List Source :=
+  l0 ++ (levels.take d).flatten
+
+/-- The levels after the open demotes levels `1..d`: those are empty, the
+deeper ones unchanged. -/
+def demoteLevels (d : Nat) (levels : List (List Source)) : List (List Source) :=
+  (levels.take d).map (fun _ => []) ++ levels.drop d
+
+/-- Demoting levels `1..d` leaves the flat read order exactly as it was. -/
+theorem demote_same_order (mems l0 : List Source) (levels : List (List Source)) (d : Nat) :
+    treeOrder mems (demoteL0 d l0 levels) (demoteLevels d levels) = treeOrder mems l0 levels := by
+  -- The emptied levels contribute nothing, and the demoted tables sit
+  -- exactly where they were: after L0 and before the deeper levels.
+  unfold treeOrder demoteL0 demoteLevels
+  have hnil : ((levels.take d).map (fun _ => ([] : List Source))).flatten = [] := by
+    rw [List.flatten_eq_nil_iff]
+    intro l hl
+    obtain ⟨_, _, rfl⟩ := List.mem_map.mp hl
+    rfl
+  rw [List.flatten_append, hnil, List.nil_append]
+  conv => rhs; rw [← List.take_append_drop d levels, List.flatten_append]
+  simp only [List.append_assoc]
+
+/-- **`demote_reads_newest`.** If the tree's read order is ordered, with
+the overlapping level's tables in age order, then after the open demotes
+every level from L1 down to it, the read order is still ordered and every
+read answers as before: by `read_newest`, the newest visible version. -/
+theorem demote_reads_newest {mems l0 : List Source} {levels : List (List Source)} (d : Nat)
+    -- The read order before the open is ordered.
+    (hord : Ordered (treeOrder mems l0 levels)) :
+    Ordered (treeOrder mems (demoteL0 d l0 levels) (demoteLevels d levels)) ∧
+    ∀ k snap, read (treeOrder mems (demoteL0 d l0 levels) (demoteLevels d levels)) k snap =
+      read (treeOrder mems l0 levels) k snap := by
+  rw [demote_same_order]
+  exact ⟨hord, fun _ _ => rfl⟩
+
+/-- The tables of the overlapping level E14 leaves behind share no key:
+0.1.x placed the ingested file by its point keys, and only its recorded
+range overlaps. Tables sharing no key are ordered among themselves in
+any order, so age order is ordered. -/
+theorem noShared_level_ordered {T : List Source}
+    -- No two tables of the level share a key.
+    (h : T.Pairwise NoShared) : Ordered T :=
+  h.imp newer_of_noShared
+
+/-- The defect: the open demotes only level `d`, moving it to the end of
+L0, in front of levels `1..d-1`. -/
+def demoteOnly (d : Nat) (l0 : List Source) (levels : List (List Source)) :
+    List Source × List (List Source) :=
+  (l0 ++ levels.getD (d - 1) [], levels.set (d - 1) [])
+
+/-- **`demote_level_only_breaks_reads`.** L1 holds key 1 at 2; L2's tables
+overlap and hold key 2 at 3 and key 1 at 1. Before the open, the read of
+key 1 answers 2. Demoting L2 alone puts its tables in front of L1, and
+the read answers 1. Demoting L1 with it keeps the answer 2. -/
+theorem demote_level_only_breaks_reads :
+    read (treeOrder [[]] [] [[[(1, 2)]], [[(2, 3)], [(1, 1)]]]) 1 10 = some 2 ∧
+    read (treeOrder [[]] (demoteOnly 2 [] [[[(1, 2)]], [[(2, 3)], [(1, 1)]]]).1
+      (demoteOnly 2 [] [[[(1, 2)]], [[(2, 3)], [(1, 1)]]]).2) 1 10 = some 1 ∧
+    read (treeOrder [[]] (demoteL0 2 [] [[[(1, 2)]], [[(2, 3)], [(1, 1)]]])
+      (demoteLevels 2 [[[(1, 2)]], [[(2, 3)], [(1, 1)]]])) 1 10 = some 2 := by
+  decide
+
+/-! ## Binary search within a level
+
+Below L0, a read of key `k` binary-searches a level's tables, which are in
+key order, for the first table whose range ends at or above `k`, and reads
+that table if its range starts at or below `k`. -/
+
+/-- Binary search over positions `[a, b)`: the least position `i` with
+`k ≤ hi i`, or `b` when there is none, halving the interval each step.
+`hi i` is the greatest key table `i` records. -/
+def bsearch (hi : Nat → Nat) (k : Nat) (a b : Nat) : Nat :=
+  if a < b then
+    if hi ((a + b) / 2) < k then bsearch hi k ((a + b) / 2 + 1) b
+    else bsearch hi k a ((a + b) / 2)
+  else a
+termination_by b - a
+decreasing_by all_goals omega
+
+/-- The linear scan: the least position `i` in `[a, b)` with `k ≤ hi i`,
+or `b`, trying each position in turn. -/
+def scan (hi : Nat → Nat) (k : Nat) (a b : Nat) : Nat :=
+  if a < b then (if k ≤ hi a then a else scan hi k (a + 1) b) else a
+termination_by b - a
+
+/-- `IsFirst hi k a b r`: `r` is the least position in `[a, b)` whose
+`hi` reaches `k`, or `b` when none does. -/
+def IsFirst (hi : Nat → Nat) (k a b r : Nat) : Prop :=
+  a ≤ r ∧ r ≤ b ∧ (∀ i, a ≤ i → i < r → hi i < k) ∧ (r < b → k ≤ hi r)
+
+/-- `MonoUpTo hi n`: `hi` never decreases over positions `0..n-1`, as the
+greatest keys of a key-ordered level's tables do. -/
+def MonoUpTo (hi : Nat → Nat) (n : Nat) : Prop := ∀ i j, i ≤ j → j < n → hi i ≤ hi j
+
+/-- Two positions both first are the same position. -/
+theorem isFirst_unique {hi : Nat → Nat} {k a b r1 r2 : Nat}
+    (h1 : IsFirst hi k a b r1) (h2 : IsFirst hi k a b r2) : r1 = r2 := by
+  obtain ⟨ha1, hb1, hlt1, hge1⟩ := h1
+  obtain ⟨ha2, hb2, hlt2, hge2⟩ := h2
+  -- If one were smaller, it would lie below the other, where every `hi`
+  -- is below `k`, yet its own `hi` reaches `k`.
+  rcases Nat.lt_trichotomy r1 r2 with h | h | h
+  · have := hlt2 r1 ha1 h
+    have := hge1 (by omega)
+    omega
+  · exact h
+  · have := hlt1 r2 ha2 h
+    have := hge2 (by omega)
+    omega
+
+/-- The linear scan finds the first position. -/
+theorem scan_spec (hi : Nat → Nat) (k : Nat) (a b : Nat) (hab : a ≤ b) :
+    IsFirst hi k a b (scan hi k a b) := by
+  rw [scan]
+  split
+  · rename_i hlt
+    split
+    · -- Position `a` reaches `k`: it is first.
+      rename_i hk
+      exact ⟨Nat.le_refl a, hab, fun i h1 h2 => absurd h2 (by omega), fun _ => hk⟩
+    · -- It does not: the first is further on.
+      rename_i hk
+      obtain ⟨h1, h2, h3, h4⟩ := scan_spec hi k (a + 1) b (by omega)
+      refine ⟨by omega, h2, fun i hi1 hi2 => ?_, h4⟩
+      by_cases hia : i = a
+      · subst hia
+        omega
+      · exact h3 i (by omega) hi2
+  · -- An empty interval: the answer is its end.
+    exact ⟨Nat.le_refl a, hab, fun i h1 h2 => absurd h2 (by omega), fun h => absurd h (by omega)⟩
+termination_by b - a
+
+/-- Binary search finds the first position, when `hi` never decreases. -/
+theorem bsearch_spec (hi : Nat → Nat) (k : Nat) {n : Nat} (hmono : MonoUpTo hi n)
+    (a b : Nat) (hab : a ≤ b) (hbn : b ≤ n) :
+    IsFirst hi k a b (bsearch hi k a b) := by
+  rw [bsearch]
+  split
+  · rename_i hlt
+    split
+    · -- The middle is below `k`, and so is everything before it: the
+      -- first lies after the middle.
+      rename_i hmid
+      obtain ⟨h1, h2, h3, h4⟩ := bsearch_spec hi k hmono ((a + b) / 2 + 1) b (by omega) hbn
+      refine ⟨by omega, h2, fun i hi1 hi2 => ?_, h4⟩
+      by_cases hi3 : i ≤ (a + b) / 2
+      · have := hmono i ((a + b) / 2) hi3 (by omega)
+        omega
+      · exact h3 i (by omega) hi2
+    · -- The middle reaches `k`: the first is at or before it.
+      rename_i hmid
+      obtain ⟨h1, h2, h3, h4⟩ := bsearch_spec hi k hmono a ((a + b) / 2) (by omega) (by omega)
+      refine ⟨h1, by omega, h3, fun _ => ?_⟩
+      by_cases heq : bsearch hi k a ((a + b) / 2) = (a + b) / 2
+      · rw [heq]
+        omega
+      · exact h4 (by omega)
+  · -- An empty interval: the answer is its end.
+    exact ⟨Nat.le_refl a, hab, fun i h1 h2 => absurd h2 (by omega), fun h => absurd h (by omega)⟩
+termination_by b - a
+
+/-- **`bsearch_eq_scan`.** On positions whose `hi` never decreases, binary
+search finds the position the linear scan finds. -/
+theorem bsearch_eq_scan (hi : Nat → Nat) (k : Nat) {n : Nat} (hmono : MonoUpTo hi n)
+    (a b : Nat) (hab : a ≤ b) (hbn : b ≤ n) :
+    bsearch hi k a b = scan hi k a b :=
+  isFirst_unique (bsearch_spec hi k hmono a b hab hbn) (scan_spec hi k a b hab)
+
+/-- A level table: the key range the manifest records and the versions. -/
+structure Table where
+  /-- The least key the range records. -/
+  lo : Nat
+  /-- The greatest key the range records. -/
+  hi : Nat
+  /-- The versions the table holds. -/
+  src : Source
+
+/-- `SortedLevel T`: each table's range is a range, holds every key of
+the table, and ends below where every later table's range begins: a
+level in key order whose tables do not overlap. -/
+def SortedLevel (T : List Table) : Prop :=
+  (∀ t ∈ T, t.lo ≤ t.hi ∧ ∀ v ∈ t.src, t.lo ≤ v.1 ∧ v.1 ≤ t.hi) ∧
+  T.Pairwise (fun t u => t.hi < u.lo)
+
+/-- The greatest key of table `i`, or 0 past the end. -/
+def hiAt (T : List Table) (i : Nat) : Nat := (T[i]?.map Table.hi).getD 0
+
+/-- In a sorted level the greatest keys never decrease. -/
+theorem sorted_mono {T : List Table} (hT : SortedLevel T) : MonoUpTo (hiAt T) T.length := by
+  obtain ⟨hrange, hpair⟩ := hT
+  intro i j hij hj
+  have hi' : i < T.length := by omega
+  simp only [hiAt, List.getElem?_eq_getElem hi', List.getElem?_eq_getElem hj, Option.map_some,
+    Option.getD_some]
+  rcases Nat.lt_or_eq_of_le hij with h | h
+  · -- An earlier table ends below where a later one begins.
+    have := List.pairwise_iff_getElem.mp hpair i j hi' hj h
+    have := (hrange T[j] (List.getElem_mem hj)).1
+    omega
+  · subst h
+    exact Nat.le_refl _
+
+/-- The read of a level through binary search: find the first table whose
+range ends at or above `k`, and read it if its range starts at or below
+`k`. -/
+def levelReadB (T : List Table) (k snap : Nat) : Option Nat :=
+  match T[bsearch (hiAt T) k 0 T.length]? with
+  | some t => if t.lo ≤ k then newestIn t.src k snap else none
+  | none => none
+
+/-- A source holding no version of `k` answers nothing. -/
+theorem newestIn_of_absent {src : Source} {k snap : Nat} (h : ∀ s, (k, s) ∉ src) :
+    newestIn src k snap = none :=
+  newestIn_eq_none.mpr fun s hs => absurd hs (h s)
+
+/-- When every source but the one at position `r` holds no version of
+`k`, a read answers what that one source answers. -/
+theorem read_only_at {k snap : Nat} :
+    ∀ (l : List Source) (r : Nat),
+      (∀ i (hi : i < l.length), i ≠ r → ∀ s, (k, s) ∉ l[i]) →
+      read l k snap = (match l[r]? with | some src => newestIn src k snap | none => none)
+  | [], _, _ => rfl
+  | src :: rest, 0, h => by
+    -- Every later source holds nothing of `k`, so the read is the first's.
+    have hrest : read rest k snap = none := by
+      refine read_eq_none.mpr fun s ⟨src', hsrc', hs⟩ => ?_
+      obtain ⟨i, hi, rfl⟩ := List.getElem_of_mem hsrc'
+      exact absurd hs (h (i + 1) (by simp; omega) (by omega) s)
+    simp only [read, List.getElem?_cons_zero]
+    cases newestIn src k snap with
+    | some v => rfl
+    | none => exact hrest
+  | src :: rest, r + 1, h => by
+    -- The first source holds nothing of `k`: the read is the rest's.
+    have hfirst : newestIn src k snap = none :=
+      newestIn_of_absent fun s => h 0 (by simp) (by omega) s
+    simp only [read, hfirst, List.getElem?_cons_succ]
+    exact read_only_at rest r fun i hi hne s => h (i + 1) (by simp; omega) (by omega) s
+
+/-- **`level_read_bsearch`.** On a level in key order whose tables do not
+overlap, the read through binary search answers what a linear read of
+every table in order answers. -/
+theorem level_read_bsearch {T : List Table} (hT : SortedLevel T) (k snap : Nat) :
+    levelReadB T k snap = read (T.map Table.src) k snap := by
+  have hspec := bsearch_spec (hiAt T) k (sorted_mono hT) 0 T.length (Nat.zero_le _) (Nat.le_refl _)
+  generalize hr : bsearch (hiAt T) k 0 T.length = r at hspec
+  obtain ⟨-, hrle, hbelow, hat⟩ := hspec
+  obtain ⟨hrange, hpair⟩ := hT
+  -- The greatest key of a table in the level, by position.
+  have hiAt_eq : ∀ i (hi : i < T.length), hiAt T i = T[i].hi := by
+    intro i hi
+    simp [hiAt, List.getElem?_eq_getElem hi]
+  -- No table before `r` holds `k`: its keys end below `k`.
+  have hbefore : ∀ i (hi : i < T.length), i < r → ∀ s, (k, s) ∉ T[i].src := by
+    intro i hi hir s hs
+    have h1 := hbelow i (Nat.zero_le _) hir
+    rw [hiAt_eq i hi] at h1
+    have := ((hrange T[i] (List.getElem_mem hi)).2 _ hs).2
+    simp only at this
+    omega
+  -- No table after `r` holds `k`: its keys start above table `r`'s end,
+  -- which reaches `k`.
+  have hafter : ∀ i (hi : i < T.length), r < i → ∀ s, (k, s) ∉ T[i].src := by
+    intro i hi hri s hs
+    have hrl : r < T.length := by omega
+    have h1 := hat hrl
+    rw [hiAt_eq r hrl] at h1
+    have h2 := List.pairwise_iff_getElem.mp hpair r i hrl hi hri
+    have := ((hrange T[i] (List.getElem_mem hi)).2 _ hs).1
+    simp only at this
+    omega
+  -- So only table `r` can answer, and a linear read answers what it does.
+  have honly : ∀ i (hi : i < (T.map Table.src).length), i ≠ r → ∀ s, (k, s) ∉ (T.map Table.src)[i] := by
+    intro i hi hne s
+    simp only [List.length_map] at hi
+    simp only [List.getElem_map]
+    rcases Nat.lt_or_gt_of_ne hne with h | h
+    · exact hbefore i hi h s
+    · exact hafter i hi h s
+  rw [read_only_at _ r honly]
+  unfold levelReadB
+  rw [hr, List.getElem?_map]
+  cases hT : T[r]? with
+  | none => rfl
+  | some t =>
+    simp only [Option.map_some]
+    split
+    · rfl
+    · -- Table `r`'s range starts above `k`, so it holds no version of `k`.
+      rename_i hlo
+      have hmem : t ∈ T := List.mem_of_getElem? hT
+      exact (newestIn_of_absent fun s hs => by
+        have := ((hrange t hmem).2 _ hs).1
+        simp only at this
+        omega).symm
 
 end Regolith.LsmOrder

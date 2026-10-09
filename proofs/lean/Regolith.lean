@@ -20,3 +20,14 @@ import Regolith.Append
 -- Plan 3.7: conflict-free allocation reserves ranges that never overlap,
 -- only grow, and survive crashes. Backs `proofs/tla/Allocate.tla`.
 import Regolith.Allocate
+-- 4.8, E5: reducing a key's versions per snapshot stripe, with an exact
+-- partial_merge, changes no read at a live snapshot or at the head. Backs
+-- `proofs/tla/StripeCompaction.tla`.
+import Regolith.Stripes
+-- 4.6: lock-free registration (announce, sample, confirm) keeps the
+-- compaction's minimum at or below every live snapshot. Backs
+-- `proofs/tla/SnapshotRegistry.tla`.
+import Regolith.SnapshotRegistry
+-- WalRecovery.lean also holds format 2 replay (4.2), backing
+-- `proofs/tla/WalRecovery.tla`; LsmOrder.lean also holds flush order,
+-- ingest placement, overlap demotion (E14) and binary search.
