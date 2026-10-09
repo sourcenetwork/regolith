@@ -500,6 +500,22 @@ tla:
     check MC_ManifestSeal_Green                        GREEN
     check MC_ManifestSeal_Red_TagOnlyStop              RED OnlyTornEnds
     check MC_ManifestSeal_Red_TagOnlyRefuse            RED RecoveryOpens
+    # 4.12, D57: a backup of an encrypted database seals its metadata, and a
+    # restore checks every key before its first write. Lean:
+    # Regolith/BackupSeal.lean, entitled_restore_is_faithful,
+    # refusal_writes_nothing, collect_keeps_listed, last_write_holds_all.
+    spec=BackupSeal
+    check MC_BackupSeal_Green                          GREEN
+    check MC_BackupSeal_Red_PlainMeta                  RED SealedMetadata
+    check MC_BackupSeal_Red_PlainRestore               RED SealedMetadata
+    check MC_BackupSeal_Red_OpenUnderCurrent           RED RightKeysRestore
+    check MC_BackupSeal_Red_ListingUnbound             RED FaithfulRestore
+    check MC_BackupSeal_Red_IdUnbound                  RED FaithfulRestore
+    check MC_BackupSeal_Red_ManifestFirst              RED FaithfulRestore
+    check MC_BackupSeal_Red_OverDatabase               RED FaithfulRestore
+    check MC_BackupSeal_Red_CheckAfterCopy             RED RefusalWritesNothing
+    check MC_BackupSeal_Red_GcSkipsSealed              RED ListedRestores
+    check MC_BackupSeal_Red_MetaFirst                  RED ListedRestores
     # 4.8, E5: compaction per snapshot stripe. Lean: Regolith/Stripes.lean,
     # reduce_reads.
     spec=StripeCompaction
