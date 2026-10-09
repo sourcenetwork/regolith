@@ -354,7 +354,10 @@ Miss(t, x) ==
   /\ slot[t][x] = "none"
   \* The block has not landed for t.
   /\ x \notin have[t]
-  \* The database is open (a closed one answers Closed, in Hit).
+  \* The database is open (a closed one answers Closed, in Hit). In the code
+  \* the read checked this when it started, and checks again as the miss
+  \* counts itself in at the close gate (IoRuntime::miss, CloseGate::enter),
+  \* so a miss either comes before close's mark or answers Closed.
   /\ ~closedDb
   \* A new unit needs a free number.
   /\ fresh => next <= MaxUnits
@@ -663,6 +666,13 @@ SelfWake(t) ==
 
 -----------------------------------------------------------------------------
 \* CLOSE (RegolithEngine::close -> IoRuntime::close)
+\*
+\* Close marks the gate (CloseGate::close), then sweeps the table. A miss
+\* already counted in when the mark lands releases its own unit when it
+\* counts itself out (CloseGate::leave), so Release below stands for the
+\* sweep and for that miss alike, and no unit outlives close. The loom model
+\* no_unit_outlives_close checks the gate itself, with a calibration that
+\* checks for close only when the miss starts and leaves a unit behind.
 
 \* The database closes. Reads run after this answer Closed.
 Close ==
