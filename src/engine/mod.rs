@@ -1045,8 +1045,13 @@ impl RegolithEngine {
     }
 
     /// `disable_wal` skips the record-length check, since the write
-    /// produces no WAL record; key and value limits still apply.
-    fn validate_ops_sizes(&self, ops: &[WriteBatchOp], disable_wal: bool) -> std::io::Result<()> {
+    /// produces no WAL record; key and value limits still apply. Returns the
+    /// framed length of the batch's record.
+    fn validate_ops_sizes(
+        &self,
+        ops: &[WriteBatchOp],
+        disable_wal: bool,
+    ) -> std::io::Result<usize> {
         let mut record = RecordLen::default();
         for op in ops {
             match op {
@@ -1074,7 +1079,7 @@ impl RegolithEngine {
         if !disable_wal {
             check_write_len(record.framed())?;
         }
-        Ok(())
+        Ok(record.framed())
     }
 
     /// Borrow the engine's `Statistics` sink if one is configured.
@@ -2198,7 +2203,7 @@ impl RegolithEngine {
 
     pub(crate) fn commit_with_conflict_check(
         &self,
-        checks: &ValidationSet,
+        checks: ValidationSet,
         point_ops: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
         range_deletes: Vec<(Vec<u8>, Vec<u8>)>,
         merges: Vec<(Vec<u8>, Vec<u8>)>,
