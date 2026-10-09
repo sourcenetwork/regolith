@@ -97,11 +97,20 @@
 //! it to its file and position, but a database opened with a provider still
 //! reads files written before encryption was turned on, so an attacker who
 //! can replace whole files with unsealed ones, or with older sealed ones, is
-//! outside what this protects against. Backups made by
-//! [`crate::BackupEngine`] copy sealed tables byte for byte, but record each
-//! table's smallest and largest key in their own metadata in plaintext, and
-//! a restored database's manifest stays plaintext until its first open with
-//! a provider.
+//! outside what this protects against.
+//!
+//! # Backups
+//!
+//! [`crate::BackupEngine`] copies sealed tables byte for byte and seals
+//! each backup's own metadata (which table goes where, its key range, the
+//! key it names) through the database's provider, under the current key,
+//! naming that key like every other frame. Each table's content id and
+//! size, which the backup directory's file names and sizes show anyway,
+//! stay readable, so listing and deleting backups needs no key; the tag
+//! covers them and the backup's id all the same. A restore takes a
+//! provider, refuses without one or without a key it needs before writing
+//! anything, and writes the restored MANIFEST sealed under the provider's
+//! current key. A backup of a database without a provider stays plaintext.
 
 use std::fmt;
 

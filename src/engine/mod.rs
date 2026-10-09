@@ -957,6 +957,12 @@ impl RegolithEngine {
         &self.env
     }
 
+    /// The keyring this database seals its files through, when it is
+    /// encrypted at rest. A backup seals its metadata through it too.
+    pub(crate) fn keyring(&self) -> Option<&Arc<seal::Keyring>> {
+        self.options.keyring.as_ref()
+    }
+
     /// Microseconds elapsed since `start`, or `None` when this
     /// platform has no monotonic clock.
     ///

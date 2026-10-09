@@ -15,12 +15,16 @@
 
 mod common;
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use common::keys::Keys;
 use regolith::prelude::*;
-use regolith::{BackupEngine, Checkpoint, Db, DurabilityMode, Error, IngestOptions, SstFileWriter};
+use regolith::{
+    BackupEngine, Checkpoint, Db, DurabilityMode, Error, EventListener, IngestOptions,
+    SstFileWriter,
+};
 use tempfile::TempDir;
 
 /// Bytes no file of an encrypted database may hold in plaintext.
@@ -356,6 +360,84 @@ fn a_missing_key_and_an_unprovided_current_key_refuse_to_open() {
     );
 }
 
+/// Every file under `dir` with its bytes, to tell whether anything wrote.
+fn contents_under(dir: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+    files_under(dir)
+        .into_iter()
+        .map(|path| {
+            let bytes = std::fs::read(&path).unwrap();
+            (path, bytes)
+        })
+        .collect()
+}
+
+/// The open checks the provider's current key before it writes anything.
+/// This directory makes an open write twice before it would first need the
+/// current key (to seal the next log): the manifest's torn tail is trimmed
+/// and the newest log's dropped tail truncated. A provider that cannot
+/// provide its current key must refuse with every byte left as it was, and
+/// the same directory must then open, dropping that tail, under a provider
+/// that can.
+#[test]
+fn a_refused_open_writes_nothing_first_not_even_a_dropped_log_tail() {
+    let live = TempDir::new().unwrap();
+    let dir = TempDir::new().unwrap();
+    let keys = Keys::new(&[1]);
+    {
+        let opts = options(&keys)
+            .write_buffer_size(64 << 20)
+            .durability(DurabilityMode::Immediate);
+        let db = Db::open(live.path(), opts).unwrap();
+        fill(&db, 0, 20);
+        // Copied while open, so the copy is what a power cut leaves right
+        // after the last acknowledged write: no clean close.
+        for path in files_under(live.path()) {
+            let to = dir.path().join(path.strip_prefix(live.path()).unwrap());
+            std::fs::create_dir_all(to.parent().unwrap()).unwrap();
+            std::fs::copy(&path, &to).unwrap();
+        }
+    }
+    let append = |path: &Path, bytes: &[u8]| {
+        let mut file = std::fs::OpenOptions::new().append(true).open(path).unwrap();
+        std::io::Write::write_all(&mut file, bytes).unwrap();
+    };
+    let log = files_under(&dir.path().join("wal"))
+        .into_iter()
+        .find(|p| p.extension().is_some_and(|e| e == "log"))
+        .unwrap();
+    // Torn tails: a record header the power cut left half written, and a
+    // manifest batch whose length says more than the file holds.
+    append(&log, &[0xA5; 11]);
+    append(
+        &dir.path().join("MANIFEST"),
+        &[0xFF, 0x00, 0x00, 0x00, 0x01],
+    );
+    let before = contents_under(dir.path());
+
+    let unprovided = Keys::new(&[1]);
+    unprovided.set_current(9);
+    let result = Db::open(dir.path(), options(&unprovided));
+    assert!(
+        matches!(result, Err(Error::UnknownKey { id: KeyId(9) })),
+        "{result:?}"
+    );
+    assert!(
+        contents_under(dir.path()) == before,
+        "the refused open wrote before it refused"
+    );
+
+    let reports = common::wal_format::TailReports::new();
+    let db = Db::open(
+        dir.path(),
+        options(&keys).listeners(vec![reports.clone() as Arc<dyn EventListener>]),
+    )
+    .unwrap();
+    check(&db, 0, 20);
+    let tails = reports.taken();
+    assert_eq!(tails.len(), 1, "the newest log's tail was not dropped");
+    assert_eq!(tails[0].discarded_bytes, 11);
+}
+
 #[test]
 fn a_wrong_key_under_the_right_id_refuses_to_open() {
     let dir = TempDir::new().unwrap();
@@ -624,7 +706,9 @@ fn a_backup_holding_an_ingested_table_restores_under_the_keys() {
     let id = engine.create_backup(&db).unwrap();
     drop(db);
     let restored = TempDir::new().unwrap();
-    engine.restore(id, restored.path()).unwrap();
+    engine
+        .restore(id, restored.path(), Some(keys.clone()))
+        .unwrap();
     assert!(matches!(
         Db::open(restored.path(), Options::default()),
         Err(Error::KeyProviderRequired)
@@ -662,7 +746,9 @@ fn checkpoints_and_backups_of_an_encrypted_database_open_under_its_keys() {
     drop(db);
 
     let restored = TempDir::new().unwrap();
-    engine.restore(id, restored.path()).unwrap();
+    engine
+        .restore(id, restored.path(), Some(keys.clone()))
+        .unwrap();
     for at in [checkpoint_dir.as_path(), restored.path()] {
         assert!(matches!(
             Db::open(

@@ -389,13 +389,20 @@ fn raised_last_seq(current: u64, stamp: u64) -> u64 {
 ///
 /// The one encoder of a canonical manifest: the rewrite that bounds the log
 /// and a backup restore both write it, so the two cannot drift apart.
+///
+/// With a `keyring` the image is sealed, under a fresh salt and the
+/// keyring's current key, exactly as the open's rewrite seals one; a
+/// current key the keyring cannot provide fails with
+/// [`crate::Error::UnknownKey`].
 pub(crate) fn encode_manifest_image(
     next_file_id: u64,
     last_seq: u64,
     min_wal_id: u64,
     files: impl IntoIterator<Item = (usize, SsTableMeta)>,
+    keyring: Option<&Arc<Keyring>>,
 ) -> io::Result<Vec<u8>> {
-    Ok(encode_image(next_file_id, last_seq, min_wal_id, files, None)?.0)
+    let sealing = VersionSet::fresh_sealing(keyring)?;
+    Ok(encode_image(next_file_id, last_seq, min_wal_id, files, sealing.as_ref())?.0)
 }
 
 /// [`encode_manifest_image`], sealed under `sealing` when given: its salt in
@@ -670,6 +677,14 @@ impl VersionSet {
         }
     }
 
+    /// How a manifest written whole is sealed: under a fresh salt when there
+    /// is a keyring, not at all when there is none. The rewrite and a
+    /// backup restore both seal through this.
+    fn fresh_sealing(keyring: Option<&Arc<Keyring>>) -> io::Result<Option<ManifestSeal>> {
+        let salt = keyring.is_some().then(sealed::fresh_salt).transpose()?;
+        Self::sealing(keyring, salt)
+    }
+
     /// Create or recover a VersionSet through the standard
     /// environment.
     #[cfg(any(test, feature = "fuzzing"))]
@@ -869,12 +884,7 @@ impl VersionSet {
         if self.manifest_writer.is_none() {
             return Err(self.writer_unavailable());
         }
-        let salt = self
-            .keyring
-            .is_some()
-            .then(sealed::fresh_salt)
-            .transpose()?;
-        let sealing = Self::sealing(self.keyring.as_ref(), salt)?;
+        let sealing = Self::fresh_sealing(self.keyring.as_ref())?;
         let version = self.current();
         let (image, sealed_under) = encode_image(
             version.next_file_id,

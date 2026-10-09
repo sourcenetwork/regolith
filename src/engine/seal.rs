@@ -42,6 +42,7 @@ pub(crate) const OVERHEAD: usize = NONCE_LEN + TAG_LEN;
 pub(crate) const DOMAIN_SST: u8 = b'S';
 pub(crate) const DOMAIN_WAL: u8 = b'W';
 pub(crate) const DOMAIN_MANIFEST: u8 = b'M';
+pub(crate) const DOMAIN_BACKUP: u8 = b'B';
 
 /// A database's key provider, with the key schedule of every key it has
 /// handed out, derived once and wiped when the keyring drops.
