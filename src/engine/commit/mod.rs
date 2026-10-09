@@ -615,6 +615,7 @@ impl RegolithEngine {
     /// `try_drain` after the push, and by its bounded park.
     fn hand_off(&self, pipe: &mut Pipeline) {
         if pipe.held.is_none()
+            && !self.commit_ring.is_empty()
             && let Some(slot) = self.commit_ring.pop()
         {
             let request = slot.take_request();
@@ -643,6 +644,10 @@ impl RegolithEngine {
     /// it, which `run_and_complete` refuses. A held ticket is taken
     /// before the ring, which keeps ring order.
     fn admit_from_ring(&self, pipe: &mut Pipeline, view: &ReadView, record_limit: usize) {
+        // Nothing waits: the common uncontended commit sizes nothing.
+        if pipe.held.is_none() && self.commit_ring.is_empty() {
+            return;
+        }
         let room = self.memtable_room(view);
         // `lead_with` seeds the group with the leader's own request
         // before calling in, so the running totals start from what is
@@ -660,6 +665,11 @@ impl RegolithEngine {
             let ticket = match pipe.held.take() {
                 Some(ticket) => ticket,
                 None => {
+                    // Two plain loads; a `pop` of an empty ring pays a full
+                    // fence to say so, on every commit nobody queued behind.
+                    if self.commit_ring.is_empty() {
+                        return;
+                    }
                     let Some(slot) = self.commit_ring.pop() else {
                         return;
                     };

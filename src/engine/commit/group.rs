@@ -86,7 +86,8 @@ impl RegolithEngine {
         // The group's sequences, drawn later under this same mutex, start
         // here; `run_group` checks they did.
         let mut next_seq = self.latest_seq.load(Ordering::Acquire) + 1;
-        let mut order = AppendOrder::default();
+        // Made for the first member that appends: most groups have none.
+        let mut order: Option<AppendOrder> = None;
         for (at, ticket) in group.iter_mut().enumerate().take(last_txn + 1) {
             match std::mem::replace(&mut ticket.request, WriteRequest::Idle) {
                 WriteRequest::Txn(txn) => {
@@ -127,7 +128,7 @@ impl RegolithEngine {
         txn: TxnRequest,
         view: &ReadView,
         ceiling: u64,
-        order: &mut AppendOrder,
+        order: &mut Option<AppendOrder>,
     ) -> io::Result<(WriteRequest, io::Result<Verdict>)> {
         let TxnRequest {
             checks,
@@ -147,7 +148,9 @@ impl RegolithEngine {
         // Positions are taken after validation and never before, so a member
         // that aborted took none (RED AssignBeforeValidation).
         if !appends.is_empty()
-            && let Err(err) = order.number(self, view, appends, &mut ops)
+            && let Err(err) = order
+                .get_or_insert_with(AppendOrder::default)
+                .number(self, view, appends, &mut ops)
         {
             return Self::member_failed(err);
         }
