@@ -276,9 +276,9 @@ loom-debug:
     RUSTFLAGS="--cfg loom" cargo test --test loom_memtable
 
 # Loom models for `regolith::sync`: every primitive's wait protocol,
-# with two calibrations that must fail. Release only: the three-thread
-# models explore 0.2 to 0.5 million interleavings each, which a debug
-# build multiplies several times over.
+# with two calibrations that must fail. Release only: the larger models
+# explore 0.1 to 3 million interleavings each (about eight minutes in
+# all), which a debug build multiplies several times over.
 loom-sync:
     RUSTFLAGS="--cfg loom" cargo test --release --test loom_sync
 

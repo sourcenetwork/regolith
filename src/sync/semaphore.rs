@@ -8,12 +8,16 @@ use std::sync::Arc;
 
 use super::raw_semaphore::{MAX, PermitWait, RawSemaphore};
 
-/// A fair counting semaphore whose waits are futures.
+/// A counting semaphore whose waits are futures.
 ///
-/// Permits are handed to waiters in the order they asked, each request
-/// whole: a request for `n` permits waits until `n` are free and every
-/// older request is served. [`try_acquire`](Self::try_acquire) fails while
-/// anyone waits, so it never jumps the queue.
+/// A request for `n` permits takes them whenever `n` are free, even while
+/// others wait; under contention [`acquire`](Self::acquire) spins briefly,
+/// then queues. A release wakes the oldest waiters the freed permits could
+/// serve, stopping at the first that does not fit, so a large request at
+/// the front is not skipped for smaller ones behind it. A waiter that
+/// loses [`MAX_BYPASS`](super::MAX_BYPASS) times is owed a handoff: until
+/// it is served, [`try_acquire`](Self::try_acquire) fails and releases go
+/// to the waiters in queue order.
 ///
 /// ```
 /// use regolith::sync::Semaphore;
@@ -29,7 +33,7 @@ pub struct Semaphore {
 }
 
 impl Semaphore {
-    /// The most permits a semaphore can hold: `usize::MAX >> 3`.
+    /// The most permits a semaphore can hold: `usize::MAX >> 6`.
     pub const MAX_PERMITS: usize = MAX;
 
     loom_const_fn! {
@@ -48,7 +52,7 @@ impl Semaphore {
         self.raw.available()
     }
 
-    /// Takes `n` permits if they are free and nobody is waiting.
+    /// Takes `n` permits if they are free and no handoff is owed.
     pub fn try_acquire(&self, n: usize) -> Option<SemaphorePermit<'_>> {
         self.raw
             .try_acquire(n)
@@ -256,8 +260,24 @@ mod tests {
         assert_eq!(sem.available_permits(), 3);
     }
 
+    /// A semaphore of one permit whose waiter has been passed over
+    /// `MAX_BYPASS` times, so it is owed the permit; returns the holder.
+    fn owe<'a>(
+        sem: &'a Semaphore,
+        waiter: &mut Polled<Acquire<'a>>,
+        mut holder: SemaphorePermit<'a>,
+    ) -> SemaphorePermit<'a> {
+        for round in 0..crate::sync::MAX_BYPASS {
+            drop(holder);
+            assert_eq!(waiter.wakes() as u32, round + 1, "a release nudges it");
+            holder = sem.try_acquire(1).expect("a free permit is taken at once");
+            waiter.pending();
+        }
+        holder
+    }
+
     #[test]
-    fn a_large_request_at_the_front_is_not_overtaken() {
+    fn a_release_wakes_the_front_request_and_none_it_cannot_serve() {
         let sem = Semaphore::new(2);
         let held = sem.try_acquire(2).expect("free");
         let mut big = Polled::new(sem.acquire(2));
@@ -265,8 +285,8 @@ mod tests {
         let mut small = Polled::new(sem.acquire(1));
         small.pending();
         drop(held);
-        assert_eq!(big.wakes(), 1, "the front request is granted and woken");
-        assert_eq!(small.wakes(), 0, "the request behind it waits its turn");
+        assert_eq!(big.wakes(), 1, "the front request is woken");
+        assert_eq!(small.wakes(), 0, "the freed permits are all the front's");
         let big = big.ready();
         small.pending();
         drop(big);
@@ -275,49 +295,84 @@ mod tests {
     }
 
     #[test]
-    fn try_acquire_fails_while_anyone_waits() {
-        let sem = Semaphore::new(3);
-        let held = sem.try_acquire(2).expect("free");
-        let mut waiter = Polled::new(sem.acquire(2));
+    fn a_free_permit_is_taken_past_a_waiter_until_it_is_owed() {
+        let sem = Semaphore::new(1);
+        let holder = sem.try_acquire(1).expect("free");
+        let mut waiter = Polled::new(sem.acquire(1));
         waiter.pending();
-        assert_eq!(sem.available_permits(), 1);
+        let holder = owe(&sem, &mut waiter, holder);
         assert!(
             sem.try_acquire(1).is_none(),
-            "a free permit must not jump the queue"
+            "nobody barges past an owed waiter"
         );
-        drop(held);
+        drop(holder);
+        assert_eq!(sem.available_permits(), 0, "the permit went to the waiter");
         drop(waiter.ready());
-        assert!(sem.try_acquire(1).is_some());
+        assert!(
+            sem.try_acquire(1).is_some(),
+            "barging resumes once it is served"
+        );
+    }
+
+    #[test]
+    fn a_large_request_is_not_starved_by_small_callers() {
+        let sem = Semaphore::new(2);
+        let mut small = sem.try_acquire(1).expect("free");
+        let other = sem.try_acquire(1).expect("free");
+        let mut big = Polled::new(sem.acquire(2));
+        big.pending();
+        for round in 0..crate::sync::MAX_BYPASS {
+            drop(small);
+            assert_eq!(
+                big.wakes() as u32,
+                round + 1,
+                "a release wakes the front whatever it asks for"
+            );
+            small = sem
+                .try_acquire(1)
+                .expect("a small caller takes the freed permit");
+            big.pending();
+        }
+        drop(small);
+        assert!(
+            sem.try_acquire(1).is_none(),
+            "the freed permit is kept for the owed request"
+        );
+        drop(other);
+        assert_eq!(big.ready().count(), 2);
     }
 
     #[test]
     fn a_withdrawn_front_waiter_unblocks_the_one_behind() {
         let sem = Semaphore::new(2);
-        let held = sem.try_acquire(1).expect("free");
+        let first = sem.try_acquire(1).expect("free");
+        let second = sem.try_acquire(1).expect("free");
         let mut big = Polled::new(sem.acquire(2));
         big.pending();
         let mut small = Polled::new(sem.acquire(1));
         small.pending();
+        drop(first);
+        assert_eq!(small.wakes(), 0, "one permit is not enough for the front");
         drop(big);
         assert_eq!(small.wakes(), 1);
         drop(small.ready());
-        drop(held);
+        drop(second);
         assert_eq!(sem.available_permits(), 2);
     }
 
     #[test]
-    fn a_granted_but_dropped_waiter_passes_its_permits_on() {
+    fn a_handoff_dropped_unseen_passes_its_permit_on() {
         let sem = Semaphore::new(1);
-        let held = sem.try_acquire(1).expect("free");
-        let mut first = Polled::new(sem.acquire(1));
-        first.pending();
-        let mut second = Polled::new(sem.acquire(1));
-        second.pending();
-        drop(held);
-        assert_eq!(first.wakes(), 1);
-        drop(first);
-        assert_eq!(second.wakes(), 1, "the dropped grant moved on");
-        drop(second.ready());
+        let holder = sem.try_acquire(1).expect("free");
+        let mut owed = Polled::new(sem.acquire(1));
+        owed.pending();
+        let holder = owe(&sem, &mut owed, holder);
+        let mut next = Polled::new(sem.acquire(1));
+        next.pending();
+        drop(holder);
+        drop(owed);
+        assert_eq!(next.wakes(), 1, "the dropped handoff moved on");
+        drop(next.ready());
         assert_eq!(sem.available_permits(), 1);
     }
 

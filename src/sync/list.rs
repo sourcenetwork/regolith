@@ -14,7 +14,7 @@
 use core::ptr::{self, NonNull};
 
 use super::queue::{Arrivals, WaitQueue};
-use super::waiter::{Pool, Waiter, release_queued};
+use super::waiter::{Waiter, release_queued};
 
 pub(super) struct List {
     head: *mut Waiter,
@@ -57,11 +57,11 @@ impl List {
 
     /// Appends every arrival still waiting, in arrival order, and lets go
     /// of the ones that already withdrew.
-    pub(super) fn absorb(&mut self, arrivals: Arrivals, pool: &Pool) {
+    pub(super) fn absorb(&mut self, arrivals: Arrivals, queue: &WaitQueue) {
         for node in arrivals {
             // SAFETY: the arrival stack handed over the queue's reference.
             if unsafe { node.as_ref() }.is_cancelled() {
-                release_queued(node, pool);
+                release_queued(node, queue);
             } else {
                 self.push_back(node);
             }
@@ -82,16 +82,34 @@ impl List {
 
     /// The oldest waiter still waiting, after letting go of every
     /// withdrawn one ahead of it.
-    pub(super) fn front(&mut self, pool: &Pool) -> Option<NonNull<Waiter>> {
+    pub(super) fn front(&mut self, queue: &WaitQueue) -> Option<NonNull<Waiter>> {
         while let Some(node) = NonNull::new(self.head) {
             // SAFETY: the head is a node this list holds.
             if !unsafe { node.as_ref() }.is_cancelled() {
                 return Some(node);
             }
             self.pop_front();
-            release_queued(node, pool);
+            release_queued(node, queue);
         }
         None
+    }
+
+    /// The waiters still waiting, oldest first, left in place. A node
+    /// that withdraws during the walk is still yielded; touching it is
+    /// harmless, since a withdrawn node ignores grants and nudges.
+    pub(super) fn iter(&self) -> impl Iterator<Item = NonNull<Waiter>> + '_ {
+        let mut cursor = self.head;
+        core::iter::from_fn(move || {
+            loop {
+                let node = NonNull::new(cursor)?;
+                // SAFETY: `cursor` walks nodes this list holds.
+                let waiter = unsafe { node.as_ref() };
+                cursor = waiter.next();
+                if !waiter.is_cancelled() {
+                    return Some(node);
+                }
+            }
+        })
     }
 
     /// Sweeps out withdrawn waiters once enough have piled up (module
@@ -100,11 +118,11 @@ impl List {
         let cancels = queue.cancels();
         if cancels.wrapping_sub(self.swept) > self.len / 2 {
             self.swept = cancels;
-            self.sweep(queue.pool());
+            self.sweep(queue);
         }
     }
 
-    fn sweep(&mut self, pool: &Pool) {
+    fn sweep(&mut self, queue: &WaitQueue) {
         let mut prev: *mut Waiter = ptr::null_mut();
         let mut cursor = self.head;
         while let Some(node) = NonNull::new(cursor) {
@@ -124,15 +142,15 @@ impl List {
                 self.tail = prev;
             }
             self.len -= 1;
-            release_queued(node, pool);
+            release_queued(node, queue);
         }
     }
 
     /// Lets go of every node; used when the primitive is dropped, when no
     /// future can still hold one.
-    pub(super) fn clear(&mut self, pool: &Pool) {
+    pub(super) fn clear(&mut self, queue: &WaitQueue) {
         while let Some(node) = self.pop_front() {
-            release_queued(node, pool);
+            release_queued(node, queue);
         }
     }
 }
