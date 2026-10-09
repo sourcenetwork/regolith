@@ -48,11 +48,12 @@
 //! descriptor of every SSTable in it, so a late drop holds memory, file
 //! descriptors and the disk blocks of tables a compaction already
 //! unlinked. [`quiesce`] bounds that: every publication that retires
-//! a view hands this thread's retired batch to the reclaimer at once,
-//! and regolith's own background thread calls it before it idles. A
-//! thread that read once and then parked holds back only the views
-//! retired before its last load, never the ones retired after it
-//! (`tests/adv_atom_reclaim.rs` checks both, at the descriptor level).
+//! a view hands it to the reclaimer at once, in a batch of its own that
+//! kovan can place, and regolith's compaction thread calls [`idle`]
+//! before it waits for work. A thread that read once and then parked
+//! holds back only the views born before its last load, never the ones
+//! born after it (`tests/adv_atom_reclaim.rs` checks both, at the
+//! descriptor level).
 //!
 //! # Progress
 //!
