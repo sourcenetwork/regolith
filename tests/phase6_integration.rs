@@ -7,6 +7,10 @@
 //!   `min_wal_id` in the table's batch and retire the log through
 //!   `RetiredLogs`, so a log whose removal failed is reported, retried, and
 //!   never replayed above a newer table.
+//! - **A restore and the retired logs** (#266's sealed backups x #268). A
+//!   restored database holds what its backup holds: its MANIFEST records
+//!   every log below the backup's next file id as in tables, so no log the
+//!   restore target held is replayed into it.
 
 mod common;
 
@@ -17,7 +21,7 @@ use std::time::{Duration, Instant};
 
 use common::faulty_env::{FaultyEnv, Refuse, logs};
 use regolith::env::Env;
-use regolith::{Db, Options, Statistics, Ticker};
+use regolith::{BackupEngine, Db, Options, Statistics, Ticker};
 use tempfile::TempDir;
 
 /// Bytes of filler each write carries, so a few writes fill a memtable.
@@ -221,3 +225,34 @@ fn the_stall_step_flush_retires_its_log_and_records_it_flushed() {
     a_log_left_behind_is_counted_and_never_replayed(FlushPath::StallStep);
 }
 
+#[test]
+fn a_restored_database_replays_no_log_its_target_held() {
+    let source = TempDir::new().unwrap();
+    let db = Db::open(source.path(), Options::default()).unwrap();
+    db.put(b"k", b"backed-up").unwrap();
+    let backups = TempDir::new().unwrap();
+    let mut engine = BackupEngine::open(backups.path()).unwrap();
+    let id = engine.create_backup(&db).unwrap();
+    // Writes after the backup, held only by the log the backup's flush
+    // started, whose number is below the backup's next file id.
+    db.put(b"k", b"after").unwrap();
+    db.put(b"only-in-a-log", b"v").unwrap();
+    let log = logs(source.path()).pop().expect("the source's active log");
+    drop(db);
+
+    let root = TempDir::new().unwrap();
+    let target = root.path().join("restored");
+    std::fs::create_dir_all(target.join("wal")).unwrap();
+    let stray = target.join("wal").join(log.file_name().unwrap());
+    std::fs::copy(&log, &stray).unwrap();
+    engine.restore(id, &target, None).unwrap();
+
+    let restored = Db::open(&target, Options::default()).unwrap();
+    assert_eq!(
+        restored.get(b"k").unwrap().as_deref(),
+        Some(&b"backed-up"[..]),
+        "the restored database replayed a log its backup does not hold"
+    );
+    assert_eq!(restored.get(b"only-in-a-log").unwrap(), None);
+    assert!(!stray.exists(), "the open removed the log below min_wal_id");
+}

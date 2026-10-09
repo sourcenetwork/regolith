@@ -529,6 +529,10 @@ fn parse_backup_id(name: &str) -> Option<u64> {
 /// Encode a restored backup as an engine MANIFEST, through the engine's own
 /// encoder so a restored manifest cannot drift from the one it writes:
 /// sealed under the keyring's current key when there is one.
+///
+/// Every write the backup holds is in its tables, so `min_wal_id` is the
+/// backup's next file id: no log numbered below it is ever replayed into the
+/// restored database, whatever the target's `wal/` holds (E30).
 fn encode_engine_manifest(
     m: &BackupManifest,
     keyring: Option<&Arc<Keyring>>,
@@ -536,7 +540,7 @@ fn encode_engine_manifest(
     crate::engine::manifest::encode_manifest_image(
         m.next_file_id,
         m.last_seq,
-        0,
+        m.next_file_id,
         m.files.iter().map(|f| {
             (
                 f.level as usize,
