@@ -27,10 +27,6 @@
 //! - Per-column-family filtering is out of scope. A listener sees
 //!   every event from every CF; callers that only care about a
 //!   subset should filter in the callback.
-//! - `on_wal_full` is declared so listener implementations can
-//!   target a common shape across storage backends, but regolith
-//!   itself never fires it - the WAL is rotated alongside every
-//!   memtable, so there's no separate "WAL-full" condition.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -149,19 +145,6 @@ pub struct ExternalFileIngestionInfo {
     pub file_size: u64,
 }
 
-/// Information about a full WAL. The struct is declared so that
-/// listener implementations can target a common shape across
-/// storage backends; regolith itself never fires this callback,
-/// because the engine rotates the WAL alongside every memtable
-/// and there is no separate "WAL-full" condition.
-#[derive(Debug, Clone)]
-pub struct WalFullInfo {
-    /// Numeric id of the full WAL file.
-    pub wal_id: u64,
-    /// Size of the full WAL file in bytes.
-    pub size: u64,
-}
-
 /// Reason passed to [`EventListener::on_background_error`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -232,13 +215,6 @@ pub trait EventListener: Send + Sync + 'static {
     fn on_background_error(&self, reason: BackgroundErrorReason, err: &Error) {
         let _ = (reason, err);
     }
-
-    /// Declared so listeners can target a common shape across
-    /// storage backends; regolith itself never fires this callback.
-    /// See the module-level docs.
-    fn on_wal_full(&self, info: &WalFullInfo) {
-        let _ = info;
-    }
 }
 
 /// Dispatch a closure over every listener in a slice. Silences
@@ -270,7 +246,6 @@ mod tests {
         files_deleted: AtomicUsize,
         ingests: AtomicUsize,
         bg_errors: AtomicUsize,
-        wal_fulls: AtomicUsize,
     }
 
     impl EventListener for CountingListener {
@@ -291,9 +266,6 @@ mod tests {
         }
         fn on_background_error(&self, _: BackgroundErrorReason, _: &Error) {
             self.bg_errors.fetch_add(1, Ordering::Relaxed);
-        }
-        fn on_wal_full(&self, _: &WalFullInfo) {
-            self.wal_fulls.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -328,7 +300,6 @@ mod tests {
         n.on_flush_completed(&sample_flush());
         n.on_compaction_begin(&sample_compaction());
         n.on_compaction_completed(&sample_compaction());
-        n.on_wal_full(&WalFullInfo { wal_id: 1, size: 0 });
         // No panic reaching here is the assertion.
     }
 

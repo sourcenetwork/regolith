@@ -87,7 +87,6 @@ pub use error::Error;
 pub use event_listener::{
     BackgroundErrorReason, CompactionJobInfo, EventListener, ExternalFileIngestionInfo,
     FlushJobInfo, TableFileCreationInfo, TableFileCreationReason, TableFileDeletionInfo,
-    WalFullInfo,
 };
 pub use iter::Iter;
 pub use options::{
