@@ -7,7 +7,7 @@ use crate::portability::{AtomicUsize, Ordering};
 
 use kovan_map::HopscotchMap;
 
-use crate::sync::Mutex;
+use crate::sync::internal::Mutex;
 use xxhash_rust::xxh3::xxh3_64;
 
 use super::block::Block;

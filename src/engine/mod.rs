@@ -44,7 +44,7 @@ use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::sync::{Gate, Mutex, MutexGuard, OwnedGateWriteGuard};
+use crate::sync::internal::{Gate, Mutex, MutexGuard, OwnedGateWriteGuard};
 use kovan_queue::array_queue::ArrayQueue;
 
 use background_health::{BackgroundHealth, Hazard, Job};

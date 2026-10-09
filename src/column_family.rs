@@ -66,7 +66,7 @@
 
 use std::sync::Arc;
 
-use crate::sync::Mutex;
+use crate::sync::internal::Mutex;
 
 /// Reserved column-family id used to store the CF registry. Users
 /// cannot create a CF with this id; user-facing CFs start at

@@ -21,7 +21,7 @@ use super::lookup_key::LookupKey;
 use super::range_tombstone::{RangeTombstone, RangeTombstoneSet};
 use super::skiplist::{ArenaSkipList, InsertHint, NodeRef};
 use crate::DbSlice;
-use crate::sync::{Arc, AtomicUsize, Mutex, Ordering};
+use crate::sync::internal::{Arc, AtomicUsize, Mutex, Ordering};
 
 mod key_walk;
 

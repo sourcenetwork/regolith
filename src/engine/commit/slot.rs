@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::thread::{self, Thread};
 
-use crate::sync::Mutex;
+use crate::sync::internal::Mutex;
 
 use super::request::WriteRequest;
 

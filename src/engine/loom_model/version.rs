@@ -5,7 +5,7 @@
 //! `engine::manifest::VersionSet` writes a manifest record and
 //! opens an `engine::sstable::SsTableReader` inside `apply`, and
 //! its locks come from `std::sync` rather than from
-//! `crate::sync`, so loom can neither run it nor see its
+//! `crate::sync::internal`, so loom can neither run it nor see its
 //! ordering. What is reproduced here is the part loom can decide:
 //!
 //! - `current()` clones the `Arc<Version>` under a read lock, so a

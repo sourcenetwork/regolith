@@ -68,12 +68,12 @@
 //! | `lz4_flex` | `no_std` covers the block format, which is all regolith uses | low: `default-features = false` |
 //! | `thiserror` 1.0 | no `no_std` support | medium: bump to 2.x |
 //! | `snap` | no `no_std` path at all; regolith uses only `snap::raw` | medium: upstream a feature, vendor `raw.rs`, or drop Snappy on `no_std` |
-//! | **locks** | **[`crate::sync`] is `std::sync`-backed** | **medium, see below** |
+//! | **locks** | **[`crate::sync::internal`] is `std::sync`-backed** | **medium, see below** |
 //!
 //! ## Locks, specifically
 //!
 //! Every `Mutex`, `RwLock` and `Gate` in the engine comes from
-//! [`crate::sync`], which is `std::sync` on a normal build and
+//! [`crate::sync::internal`], which is `std::sync` on a normal build and
 //! `loom::sync` under `--cfg loom`. That is one seam rather than sixty
 //! call sites, so the remaining work for tier B is to add a third arm
 //! to that module backed by `spin` or `critical-section`.

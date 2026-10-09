@@ -22,7 +22,7 @@ use std::time::Duration;
 #[cfg(test)]
 use std::time::Instant;
 
-use crate::sync::{Condvar, Mutex};
+use crate::sync::internal::{Condvar, Mutex};
 
 /// Priority of a rate-limited I/O request. High-priority waiters are
 /// always served before low-priority waiters; within a priority class

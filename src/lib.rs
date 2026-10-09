@@ -7169,7 +7169,7 @@ mod tests {
                 *self.captured.lock() = Some(info.clone());
             }
         }
-        use crate::sync::Mutex;
+        use crate::sync::internal::Mutex;
 
         let listener = Arc::new(CaptureListener {
             captured: Mutex::new(None),

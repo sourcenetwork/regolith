@@ -941,7 +941,7 @@ mod limit_tests;
 mod tests {
     use super::super::{EngineOptions, wal::fault};
     use super::*;
-    use crate::sync::Mutex;
+    use crate::sync::internal::Mutex;
     use proptest::prelude::*;
     use tempfile::TempDir;
 

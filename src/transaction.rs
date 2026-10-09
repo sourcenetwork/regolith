@@ -124,7 +124,7 @@ use std::path::Path;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-use crate::sync::{Condvar, Mutex};
+use crate::sync::internal::{Condvar, Mutex};
 
 use crate::column_family::{DEFAULT_CF_ID, prefix_key};
 use crate::engine::{CommitOutcome, ConflictKey, RegolithEngine, ValidationSet, callback};
