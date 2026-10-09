@@ -84,6 +84,21 @@
 //! found a value is validated for its presence only, and a delete of it, or a
 //! read that found nothing, is validated as for any key.
 //!
+//! # A constant write is not a claim
+//!
+//! A write of exactly the bytes the key holds at commit is not a conflict
+//! (identical-write elision), because the schedule has a serial order that
+//! reaches the same state. So two optimistic transactions that each put the
+//! same constant under a key neither read both commit: writing a sentinel
+//! does not claim the key.
+//!
+//! To claim a key, read it with [`Transaction::get_for_update`] first. At
+//! commit that read is validated, so the later committer conflicts; under a
+//! pessimistic transaction the read is taken under the key's lock and sees
+//! what the earlier holder committed. An optimistic transaction can also write
+//! a value unique to the writer, such as its own id: the later committer's
+//! bytes then differ from the committed ones and it conflicts.
+//!
 //! # Out of scope (follow-ups)
 //!
 //! - Phantom detection. A transactional scan records the stretches of keys
@@ -958,6 +973,10 @@ impl Transaction {
     ///
     /// The transaction's own writes lie over the value read, as for
     /// [`Transaction::get`], merge operands included.
+    ///
+    /// This is how a transaction claims a key: a bare put of a constant is not
+    /// a claim, since a write of the bytes the key already holds does not
+    /// conflict (see the module documentation).
     pub fn get_for_update(&self, key: &[u8]) -> TxResult<Option<Vec<u8>>> {
         let prefixed = prefix_key(DEFAULT_CF_ID, key);
         let already_held = self.lock_key(&prefixed)?;
@@ -977,6 +996,11 @@ impl Transaction {
 
     /// Buffer a put. For pessimistic transactions, acquires an
     /// exclusive lock on the key if not already held.
+    ///
+    /// A put of a constant claims nothing: if the key holds exactly these
+    /// bytes at commit, the write does not conflict. Read the key with
+    /// [`Transaction::get_for_update`] first, or write a value unique to
+    /// the writer, to make a claim (see the module documentation).
     pub fn put(&self, key: &[u8], value: &[u8]) -> TxResult<()> {
         let prefixed = prefix_key(DEFAULT_CF_ID, key);
         self.lock_key(&prefixed)?;
