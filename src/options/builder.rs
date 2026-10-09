@@ -317,10 +317,19 @@ impl Options {
         self
     }
 
-    /// Soft cap on the number of in-memory memtables (active +
-    /// frozen). Reaching this count slows writes; reaching
-    /// `2 * max_write_buffer_number` stops them. `0` disables
-    /// this trigger. Default: 2.
+    /// Cap on the number of in-memory memtables (active + frozen).
+    ///
+    /// A write that fills the active memtable seals it, and the
+    /// background writes it out to a table: the compaction worker, or,
+    /// with none, the write that sealed it once it has committed. When
+    /// the flushes before it have not finished and one more sealed
+    /// memtable would pass this count, the write that fills the active
+    /// memtable writes the oldest out first, so a rotation never leaves
+    /// more than this many. `1` writes every sealed memtable out in the
+    /// write that sealed it. Memtables that cannot be written out (a
+    /// failing flush) still count: past this count writes slow down, and
+    /// at `2 * max_write_buffer_number` they stop. `0` disables the cap
+    /// and both triggers. Default: 2.
     #[must_use]
     pub fn max_write_buffer_number(mut self, max_write_buffer_number: usize) -> Self {
         self.max_write_buffer_number = max_write_buffer_number;

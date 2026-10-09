@@ -29,14 +29,10 @@ use super::{
 /// does not provide.
 const SUPPORTS_DIR_SYNC: bool = cfg!(unix) && !cfg!(target_family = "wasm");
 
-/// Whether this target can start a thread.
-///
-/// A wasm module built without the `atomics` target feature has
-/// exactly one thread, and `std::thread::spawn` there reports
-/// [`std::io::ErrorKind::Unsupported`]. Declaring that up front lets
-/// a caller choose a single-threaded configuration before an open
-/// fails rather than after.
-const SUPPORTS_THREADS: bool = !cfg!(all(target_family = "wasm", not(target_feature = "atomics")));
+/// Whether this target can start a thread: see [`super::PLATFORM_THREADS`].
+/// Declaring that up front lets a caller choose a single-threaded
+/// configuration before an open fails rather than after.
+const SUPPORTS_THREADS: bool = super::PLATFORM_THREADS;
 
 /// The host platform as regolith has always used it.
 #[derive(Debug, Default, Clone, Copy)]

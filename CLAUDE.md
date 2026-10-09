@@ -94,7 +94,11 @@ src/
 ├── env/                # Env trait and backends: StdEnv, MemEnv, WASI, OPFS; db_lock.rs, open_file_limit.rs
 └── engine/
     ├── mod.rs          # RegolithEngine orchestration, read paths, rotation, recovery
-    ├── commit/         # Group commit pipeline: ring, leader, conflict check, stall signal
+    ├── commit/         # Group commit pipeline: ring, bounded leader, transaction members decided in
+    │                   # group order (group.rs, txn.rs), the check up to a horizon (early.rs), stall signal
+    ├── flush.rs        # Writing a frozen memtable to L0, shared with the compaction workers
+    ├── background_step.rs # Flushes off the commit path; the bounded step a write owes with no worker
+    ├── stall_state.rs  # Write-stall thresholds and the level writers cache
     ├── compaction.rs   # Level/FIFO/universal compaction planning and worker loop
     ├── compaction/     # Per-snapshot-stripe folding of versions and merge chains
     ├── manifest.rs     # VersionSet, VersionEdit log, level tracking
@@ -110,7 +114,7 @@ src/
     ├── arena.rs        # Bump allocator for one memtable
     ├── block.rs        # Data blocks: prefix compression, restart points, varint
     ├── block_cache.rs  # Sharded CLOCK cache for decompressed SSTable blocks
-    ├── callback.rs     # Catching a panic in caller code inside a commit and naming its trait
+    ├── callback.rs     # Catching a panic in caller code inside a commit or a background step
     ├── bloom.rs        # Bloom filter (double-hashed xxh3)
     ├── checksum.rs     # Checksum helpers
     ├── filter_block.rs # SSTable filter region: user-key and prefix bloom filters

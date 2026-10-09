@@ -1255,6 +1255,18 @@ impl Transaction {
     /// [`Transaction::get_for_update`] reads. A pessimistic transaction keeps
     /// its key locks for the duration of the wait.
     ///
+    /// Concurrent commits share commit groups with each other and with plain
+    /// writes: one log write and, at [`crate::DurabilityMode::Immediate`], one
+    /// fsync per group, and the commit becomes visible only once that fsync
+    /// returned. Each commit in a group is validated as if the commits ahead of
+    /// it in the group had committed one at a time before it, so it conflicts
+    /// with them exactly as it would with any earlier commit, and its outcome
+    /// is its own. A group whose log write or fsync fails fails every commit
+    /// in it with that error. Before it queues, an optimistic commit checks
+    /// itself on the calling thread against everything committed up to that
+    /// moment, so the group only checks what landed after, and a conflict
+    /// that is already certain returns without waiting for the group.
+    ///
     /// A conflict is reported to every [`crate::EventListener`] once, after
     /// the commit has released the pipeline and this transaction its key
     /// locks, and then returned as [`TransactionError::Conflict`].
@@ -1387,7 +1399,7 @@ impl Transaction {
             self.engine.commit_write_free(&checks)?
         } else {
             self.engine.commit_with_conflict_check(
-                &checks,
+                checks,
                 writes,
                 range_deletes,
                 merges,
