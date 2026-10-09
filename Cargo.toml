@@ -197,3 +197,7 @@ harness = false
 [[bench]]
 name = "collect"
 harness = false
+
+[[bench]]
+name = "sync"
+harness = false
