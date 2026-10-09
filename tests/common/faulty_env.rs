@@ -90,8 +90,7 @@ impl Env for FaultyEnv {
         self.inner.open_read(path)
     }
     fn open_write(&self, path: &Path, mode: WriteMode) -> io::Result<Box<dyn WriteFile>> {
-        if self.fail_tables.load(Ordering::SeqCst) && path.extension().is_some_and(|e| e == "sst")
-        {
+        if self.fail_tables.load(Ordering::SeqCst) && path.extension().is_some_and(|e| e == "sst") {
             self.tables_refused.fetch_add(1, Ordering::SeqCst);
             return Err(io::Error::new(
                 io::ErrorKind::StorageFull,

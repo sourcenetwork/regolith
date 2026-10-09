@@ -199,7 +199,10 @@ fn a_log_left_behind_is_counted_and_never_replayed(path: FlushPath) {
         leftover
     };
     f.env.arm(Refuse::Nothing);
-    assert!(leftover.exists(), "{path:?}: the leftover reaches the reopen");
+    assert!(
+        leftover.exists(),
+        "{path:?}: the leftover reaches the reopen"
+    );
 
     let db = f.open();
     assert_eq!(
@@ -207,7 +210,10 @@ fn a_log_left_behind_is_counted_and_never_replayed(path: FlushPath) {
         Some(&b"new"[..]),
         "{path:?}: recovery replayed a flushed log above the newer table"
     );
-    assert!(!leftover.exists(), "{path:?}: the open removed the leftover");
+    assert!(
+        !leftover.exists(),
+        "{path:?}: the open removed the leftover"
+    );
 }
 
 #[test]

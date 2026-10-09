@@ -181,12 +181,18 @@ fn check_overwrites(db: &Db, out: &ChildOutcome, what: &str) {
     for (k, acked) in last_acked.iter().enumerate() {
         let read = db.get(&key(k)).unwrap();
         let Some(read) = read else {
-            assert!(acked.is_none(), "{what}: key {k} lost its acknowledged write {acked:?}");
+            assert!(
+                acked.is_none(),
+                "{what}: key {k} lost its acknowledged write {acked:?}"
+            );
             continue;
         };
         let index: usize = std::str::from_utf8(&read[..8]).unwrap().parse().unwrap();
         assert_eq!(index % KEYS, k, "{what}: key {k} reads another key's value");
-        assert!(index < out.spec.ops, "{what}: key {k} reads a write never made");
+        assert!(
+            index < out.spec.ops,
+            "{what}: key {k} reads a write never made"
+        );
         if let Some(acked) = acked {
             assert!(
                 index >= *acked,
