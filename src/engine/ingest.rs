@@ -19,10 +19,13 @@
 //!    front of L0 (LsmOrder.tla, `Ingest = "Placed"`; Lean
 //!    `ingest_ordered`). A flush in step 1 lands in L0 holding such a key,
 //!    so it places the table in L0;
-//! 3. draw the table's sequence;
-//! 4. one manifest edit adds the table, recording the sequence its entries
+//! 3. sync the active log, so every commit ordered before the ingest is
+//!    durable before the ingest is: the memtables step 1 left alone may
+//!    hold commits only the log has (IngestDurability.tla);
+//! 4. draw the table's sequence;
+//! 5. one manifest edit adds the table, recording the sequence its entries
 //!    read at (`SsTableMeta::global_seq`), and raises the last sequence;
-//! 5. publish the sequence on the read horizon.
+//! 6. publish the sequence on the read horizon.
 //!
 //! A commit draws and publishes under the same mutex, so from the draw to
 //! the publish the sequence is a pending slot no publication passes
@@ -324,7 +327,7 @@ impl RegolithEngine {
         Ok((first.map(|first| (first, last)), count))
     }
 
-    /// Install one staged table: steps 1 to 5 of the module docs.
+    /// Install one staged table: steps 1 to 6 of the module docs.
     fn install(&self, table: StagedTable, opts: &IngestOptions) -> io::Result<IngestedTable> {
         let (lo, hi) = (table.smallest.as_slice(), table.largest.as_slice());
         let probed = if opts.ingest_behind {
