@@ -25,19 +25,23 @@
 //!   (writes, savepoints and registrations) and fails the commit. After the
 //!   outcome a panic is caught and reported to
 //!   [`crate::EventListener::on_callback_panic`], and the outcome stands.
+//! - No lock. The `on_abort` callbacks are handed from the owner to whichever
+//!   thread ends the transaction through a lock-free list, and a callback
+//!   that is still running keeps its own `on_abort` registrations apart until
+//!   it returns `Ok`, so undoing a failed one never touches that list.
 //! - A transaction that registered nothing, under a database with no hooks,
 //!   pays one empty-option check at each point and allocates nothing.
 
 use std::sync::Arc;
 
 use super::claim::Claim;
+use super::exclusive::Exclusive;
 use super::queue::Queue;
 use super::{
     CommitReceipt, Conflict, Error, IsolationLevel, Transaction, TransactionError, TxResult,
 };
 use crate::engine::RegolithEngine;
 use crate::engine::callback::{InCommit, contain};
-use crate::sync::internal::Mutex;
 
 /// Why a transaction ended without committing, as its
 /// [`Transaction::on_abort`] callbacks and [`TransactionHooks::on_abort`] see
@@ -172,31 +176,38 @@ pub(super) fn survive(engine: &RegolithEngine, callback: &'static str, f: impl F
 struct Queues {
     before_commit: Queue<BeforeCommit>,
     on_commit: Queue<OnCommit>,
+    /// The `on_abort` callbacks a running `before_commit` callback has
+    /// registered so far. They join the claim's list only once the outermost
+    /// callback returns `Ok`, so a failed one takes them back without
+    /// reaching into the list `close` may be taking from.
+    on_abort: Queue<OnAbort>,
 }
 
 /// The `before_commit` and `on_commit` callbacks one transaction registered:
 /// nothing until the first registration, then one allocation. (The
-/// `on_abort` ones are in the transaction's claim.)
-///
-/// A [`Mutex`] only so a `Transaction` stays `Sync` although the closures are
-/// `Send` and not `Sync`: the queues are reached through `&mut Transaction` or
-/// by value, with `get_mut`, and never locked.
+/// `on_abort` ones are in the transaction's claim, except while a callback is
+/// running; see `Queues::on_abort`.)
 #[derive(Default)]
-pub(super) struct Callbacks(Option<Box<Mutex<Queues>>>);
+pub(super) struct Callbacks {
+    queues: Option<Box<Exclusive<Queues>>>,
+    /// `before_commit` callbacks and hooks running now, outermost first: while
+    /// there is one, an `on_abort` registration goes to `Queues::on_abort`.
+    running: u32,
+}
 
 impl Callbacks {
     fn queues(&mut self) -> &mut Queues {
-        self.0
-            .get_or_insert_with(|| Box::new(Mutex::new(Queues::default())))
+        self.queues
+            .get_or_insert_with(|| Box::new(Exclusive::new(Queues::default())))
             .get_mut()
     }
 
     fn existing(&mut self) -> Option<&mut Queues> {
-        self.0.as_mut().map(|queues| queues.get_mut())
+        self.queues.as_mut().map(|queues| queues.get_mut())
     }
 
     fn take(&mut self) -> Option<Queues> {
-        self.0.take().map(|queues| (*queues).into_inner())
+        self.queues.take().map(|queues| (*queues).into_inner())
     }
 }
 
@@ -282,8 +293,17 @@ impl Transaction {
     /// transaction's later commit fails with [`Error::Closed`]. That holds even
     /// if the close then fails, as the transaction stays aborted. A
     /// transaction that had begun to commit is not touched.
+    ///
+    /// Registered from inside a [`Transaction::before_commit`] callback or a
+    /// [`TransactionHooks::before_commit`], `f` counts as registered when that
+    /// callback returns `Ok`; a callback that fails takes it back.
     pub fn on_abort(&mut self, f: impl FnOnce(&AbortReason<'_>) + Send + 'static) {
-        self.claim().push(Box::new(f));
+        let f = Box::new(f);
+        if self.callbacks.running > 0 {
+            self.callbacks.queues().on_abort.push(f);
+        } else {
+            self.claim().push(f);
+        }
     }
 
     /// Run the pending `before_commit` callbacks now, then the database's
@@ -340,8 +360,14 @@ impl Transaction {
         run: impl FnOnce(&mut Transaction) -> TxResult<()>,
     ) -> TxResult<()> {
         let mark = self.mark();
-        let error = match caught(callback, || run(self)) {
-            Ok(Ok(())) => return Ok(()),
+        self.callbacks.running += 1;
+        let outcome = caught(callback, || run(self));
+        self.callbacks.running -= 1;
+        let error = match outcome {
+            Ok(Ok(())) => {
+                self.publish_on_abort();
+                return Ok(());
+            }
             Ok(Err(error)) => error,
             Err(panicked) => {
                 self.prepare_state = Prepare::Panicked(callback);
@@ -352,18 +378,37 @@ impl Transaction {
         Err(error)
     }
 
+    /// Hand the claim the `on_abort` callbacks the callbacks that just
+    /// succeeded registered, once the outermost of them has returned.
+    fn publish_on_abort(&mut self) {
+        if self.callbacks.running > 0 {
+            return;
+        }
+        let Some(queues) = self.callbacks.existing() else {
+            return;
+        };
+        let mut staged = std::mem::take(&mut queues.on_abort);
+        while let Some(f) = staged.pop() {
+            self.claim().push(f);
+        }
+    }
+
     fn mark(&mut self) -> Mark {
-        let (before_commit, on_commit) = self
-            .callbacks
-            .existing()
-            .map_or((0, 0), |q| (q.before_commit.mark(), q.on_commit.mark()));
+        let (before_commit, on_commit, on_abort) =
+            self.callbacks.existing().map_or((0, 0, 0), |q| {
+                (
+                    q.before_commit.mark(),
+                    q.on_commit.mark(),
+                    q.on_abort.mark(),
+                )
+            });
         Mark {
             writes: self.writes.len(),
             appends: self.appends_len(),
             savepoints: self.savepoints.len(),
             before_commit,
             on_commit,
-            on_abort: self.claim.as_ref().map_or(0, |claim| claim.mark()),
+            on_abort,
         }
     }
 
@@ -374,9 +419,7 @@ impl Transaction {
         if let Some(queues) = self.callbacks.existing() {
             queues.before_commit.truncate(mark.before_commit);
             queues.on_commit.truncate(mark.on_commit);
-        }
-        if let Some(claim) = &self.claim {
-            claim.truncate(mark.on_abort);
+            queues.on_abort.truncate(mark.on_abort);
         }
     }
 

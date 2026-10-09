@@ -13,16 +13,18 @@
 //!   owner by rollback or drop, or `close`. The winner runs the abort
 //!   callbacks and the database hook; a loser runs neither.
 //!
-//! The `on_abort` callbacks live here, behind a mutex that is held only to
-//! push or pop one, so each runs once however many threads reach for it.
+//! The `on_abort` callbacks live here, in a lock-free [`Handoff`]: the owner
+//! pushes, and whoever ends the transaction takes the whole list once and runs
+//! it, so each runs once however many threads reach for it. One registered
+//! after the winner took the list stays in it, and the owner takes it at the
+//! end of the transaction.
 
 use std::sync::Arc;
 
 use super::callbacks::{AbortReason, OnAbort, survive};
-use super::queue::Queue;
+use super::handoff::Handoff;
 use crate::engine::RegolithEngine;
 use crate::portability::{AtomicU8, Ordering};
-use crate::sync::internal::Mutex;
 
 const OPEN: u8 = 0;
 const COMMITTING: u8 = 1;
@@ -32,7 +34,7 @@ const ABORTED: u8 = 2;
 pub(crate) struct Claim {
     pub(crate) id: u64,
     state: AtomicU8,
-    on_abort: Mutex<Queue<OnAbort>>,
+    on_abort: Handoff<OnAbort>,
 }
 
 impl Claim {
@@ -43,7 +45,7 @@ impl Claim {
         let claim = Arc::new(Self {
             id: engine.open_transactions().next_id(),
             state: AtomicU8::new(OPEN),
-            on_abort: Mutex::new(Queue::default()),
+            on_abort: Handoff::default(),
         });
         if !engine.is_closed() {
             engine.open_transactions().insert(Arc::clone(&claim));
@@ -82,25 +84,13 @@ impl Claim {
     }
 
     pub(super) fn push(&self, f: OnAbort) {
-        self.on_abort.lock().push(f);
+        self.on_abort.push(f);
     }
 
-    pub(super) fn mark(&self) -> usize {
-        self.on_abort.lock().mark()
-    }
-
-    pub(super) fn truncate(&self, mark: usize) {
-        self.on_abort.lock().truncate(mark);
-    }
-
-    fn pop(&self) -> Option<OnAbort> {
-        self.on_abort.lock().pop()
-    }
-
-    /// Run the `on_abort` callbacks still queued, oldest first, each at most
-    /// once. The lock is not held while one runs.
+    /// Run the `on_abort` callbacks still registered, oldest first, each at
+    /// most once: this call took them, so no other thread has them.
     pub(super) fn run_callbacks(&self, engine: &RegolithEngine, reason: &AbortReason<'_>) {
-        while let Some(f) = self.pop() {
+        for f in self.on_abort.take() {
             survive(engine, "on_abort", || f(reason));
         }
     }

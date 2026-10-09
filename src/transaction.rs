@@ -151,6 +151,8 @@ mod callbacks;
 mod claim;
 mod cursor;
 mod early;
+mod exclusive;
+mod handoff;
 mod policy;
 mod projection;
 mod queue;
