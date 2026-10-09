@@ -69,6 +69,7 @@ mod event_listener;
 mod iter;
 mod log_layout;
 mod options;
+mod per_thread;
 mod perf_context;
 mod portability;
 mod rate_limiter;

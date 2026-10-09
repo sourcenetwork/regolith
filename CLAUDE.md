@@ -72,12 +72,13 @@ src/
 ├── iter.rs             # Public iterator wrappers
 ├── options.rs          # Options, tuning enums, MergeOperator, CompactionFilter
 ├── options/            # Options builder methods (builder.rs) and getters (getters.rs)
+├── per_thread.rs       # A small number per thread (bounded pool, given back on exit) for per-core shards
 ├── perf_context.rs     # Per-operation performance counters
 ├── portability.rs      # Atomics shim and the portability tier map
 ├── rate_limiter.rs     # Token-bucket rate limiter
 ├── slice.rs            # DbSlice: zero-copy value handle
 ├── sst_file_writer.rs  # External SSTable writer API
-├── statistics.rs       # Tickers, histograms, and properties
+├── statistics.rs       # Tickers and histograms, sharded per thread, summed when read
 ├── stream_writer.rs    # StreamingWriter: bounded-memory write stream
 ├── sync.rs             # Std-backed Mutex, RwLock, Condvar and Gate, swapped for loom's under --cfg loom
 ├── tailing.rs          # Tailing iterator API
