@@ -282,7 +282,13 @@ loom-debug:
 loom-sync:
     RUSTFLAGS="--cfg loom" cargo test --release --test loom_sync
 
-loom-all: loom loom-debug loom-sync
+# Loom models for the snapshot registry's per-thread slots: the slot and
+# thread-number claims, a moved pin's release, announce-sample-confirm and
+# the drain wake, with four calibrations that must fail. Release only.
+loom-snapshots:
+    RUSTFLAGS="--cfg loom" cargo test --release --test loom_snapshots
+
+loom-all: loom loom-debug loom-sync loom-snapshots
 
 # The read-view chaos workload at full size: 6 instances x 2 rounds x 400
 # versions. Measured at over 20 minutes wall and 4h of CPU unoptimized,

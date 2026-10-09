@@ -126,7 +126,8 @@ src/
     ├── range_tombstone.rs # Range-delete tombstone encoding
     ├── read_view.rs    # The published set of memtables and version a reader loads
     ├── read_horizon.rs # Newest sequence whose data is durable and applied
-    ├── snapshot_registry.rs # Active snapshot sequence tracking
+    ├── snapshot_registry.rs # Live snapshot sequences on per-thread slots: announce, sample, confirm
+    ├── snapshot_registry/   # chain.rs: a slot's chunks of counted entries; unit, model and property tests
     ├── source_walk.rs  # Newest-first walk over a view's sources for one key
     ├── background_health.rs # Whether flush or compaction is failing, and why
     ├── compaction_backoff.rs # Retry pacing for a failing compaction worker
