@@ -107,15 +107,18 @@ fn cut(trigger: &Trigger, tear: TearMode) -> u64 {
         .run();
     out.assert_killed();
     if let Trigger::Syscall { path_contains, .. } = trigger {
-        let last = out
-            .journal
-            .records
-            .last()
-            .expect("the journal holds the fatal call");
+        // The compaction worker flushes while the writer goes on writing the
+        // log (E9), so the writer's calls can follow the fatal one in the
+        // journal. The thread that died ends on the file it was cut in.
+        let mut last_per_thread = std::collections::HashMap::new();
+        for record in &out.journal.records {
+            last_per_thread.insert(record.tid, &record.path);
+        }
         assert!(
-            last.path.to_string_lossy().contains(path_contains.as_str()),
-            "the cut landed on {:?}, not on {path_contains}\n{}",
-            last.path,
+            last_per_thread
+                .values()
+                .any(|path| path.to_string_lossy().contains(path_contains.as_str())),
+            "no thread's last call was on {path_contains}\n{}",
             out.journal
         );
     }
