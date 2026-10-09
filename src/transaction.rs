@@ -197,8 +197,9 @@ pub enum TransactionError {
     /// The call returned instead of waiting: a read through a transaction
     /// begun with [`ReadMode::CacheOnly`](crate::ReadMode::CacheOnly)
     /// needed a block the cache does not hold. Poll the queue the wait
-    /// names, then run the call again (see [`TxnOptions::read_mode`]). Not a
-    /// reason to roll back.
+    /// names, then run the call again (see [`TxnOptions::read_mode`]); a
+    /// cursor or stream carries on where it stopped. Not a reason to roll
+    /// back.
     #[error("{0}")]
     WouldBlock(crate::WouldBlock),
     /// A key in the transaction's validation set was written by

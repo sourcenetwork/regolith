@@ -15,7 +15,7 @@ use std::sync::Arc;
 use crate::engine::RegolithEngine;
 use crate::engine::iterator::RegolithIterator;
 use crate::statistics::{Histogram, Statistics, Ticker, TimeScope};
-use crate::{DbSlice, Result};
+use crate::{DbSlice, ReadMode, Result};
 
 /// Streaming iterator over a consistent view of the database.
 ///
@@ -48,6 +48,16 @@ use crate::{DbSlice, Result};
 ///     it.next();
 /// }
 /// ```
+///
+/// # Non-blocking walks
+///
+/// An iterator made from a snapshot read in [`ReadMode::CacheOnly`] never
+/// touches the device. A seek or a step that needs a block the cache does not
+/// hold stops, [`valid`](Self::valid) turns `false`, and
+/// [`status`](Self::status) reports [`crate::Error::WouldBlock`]. Poll the
+/// queue it names, then call [`resume`](Self::resume): the interrupted seek
+/// or step runs again and the walk carries on exactly where it would have,
+/// skipping nothing and repeating nothing.
 pub struct Iter<'a> {
     inner: RegolithIterator,
     /// Optional statistics sink captured from the parent `Db`'s
@@ -55,6 +65,8 @@ pub struct Iter<'a> {
     /// ticker increments and timing histograms through this
     /// handle, guarded by a single `Option` branch.
     stats: Option<Arc<Statistics>>,
+    /// Where this iterator's block-cache misses go.
+    mode: ReadMode,
     // Ties the iterator's lifetime to its parent `Db` / `Snapshot` so the
     // borrow checker prevents the iterator from outliving the engine it
     // was built from.
@@ -66,6 +78,7 @@ impl<'a> Iter<'a> {
         Self {
             inner,
             stats: None,
+            mode: ReadMode::Blocking,
             _marker: PhantomData,
         }
     }
@@ -73,6 +86,31 @@ impl<'a> Iter<'a> {
     pub(crate) fn with_stats(mut self, stats: Option<Arc<Statistics>>) -> Self {
         self.stats = stats;
         self
+    }
+
+    /// Read in `mode` from now on.
+    pub(crate) fn with_mode(mut self, mode: ReadMode) -> Self {
+        self.mode = mode;
+        self.resumable(mode.is_cache_only())
+    }
+
+    /// Keep what [`Iter::resume`] needs, for an iterator whose caller sets
+    /// the read mode around each call itself.
+    pub(crate) fn resumable(mut self, on: bool) -> Self {
+        self.inner.track_resume(on);
+        self
+    }
+
+    /// Run the seek or step a [`crate::WouldBlock`] interrupted again, once
+    /// the queue it names was polled.
+    ///
+    /// The walk continues exactly where the interrupted call would have left
+    /// it: after a step, on the entry that step would have reached, nothing
+    /// skipped and nothing repeated. It may stop on `WouldBlock` again, for
+    /// another block. Does nothing when the last call did not stop on one.
+    pub fn resume(&mut self) {
+        let _scope = self.mode.scope();
+        self.inner.resume();
     }
 
     fn tick_seek(&self) {
@@ -93,6 +131,7 @@ impl<'a> Iter<'a> {
     pub fn seek(&mut self, target: &[u8]) {
         self.tick_seek();
         let _t = TimeScope::new(self.stats.as_deref(), Histogram::DbIterSeek);
+        let _scope = self.mode.scope();
         self.inner.seek(target);
     }
 
@@ -106,6 +145,7 @@ impl<'a> Iter<'a> {
     pub fn seek_bounded(&mut self, target: &[u8], upper_bound: &[u8]) {
         self.tick_seek();
         let _t = TimeScope::new(self.stats.as_deref(), Histogram::DbIterSeek);
+        let _scope = self.mode.scope();
         self.inner.seek_bounded(target, upper_bound);
     }
 
@@ -116,6 +156,7 @@ impl<'a> Iter<'a> {
     pub fn seek_for_prev(&mut self, target: &[u8]) {
         self.tick_seek();
         let _t = TimeScope::new(self.stats.as_deref(), Histogram::DbIterSeek);
+        let _scope = self.mode.scope();
         self.inner.seek_for_prev(target);
     }
 
@@ -134,6 +175,7 @@ impl<'a> Iter<'a> {
     pub fn seek_prefix(&mut self, prefix: &[u8]) {
         self.tick_seek();
         let _t = TimeScope::new(self.stats.as_deref(), Histogram::DbIterSeek);
+        let _scope = self.mode.scope();
         self.inner.seek_prefix(prefix);
     }
 
@@ -142,6 +184,7 @@ impl<'a> Iter<'a> {
     pub fn seek_to_first(&mut self) {
         self.tick_seek();
         let _t = TimeScope::new(self.stats.as_deref(), Histogram::DbIterSeek);
+        let _scope = self.mode.scope();
         self.inner.seek_to_first();
     }
 
@@ -150,6 +193,7 @@ impl<'a> Iter<'a> {
     pub fn seek_to_last(&mut self) {
         self.tick_seek();
         let _t = TimeScope::new(self.stats.as_deref(), Histogram::DbIterSeek);
+        let _scope = self.mode.scope();
         self.inner.seek_to_last();
     }
 
@@ -159,6 +203,7 @@ impl<'a> Iter<'a> {
     pub(crate) fn seek_to_last_before(&mut self, exclusive_upper: &[u8]) {
         self.tick_seek();
         let _t = TimeScope::new(self.stats.as_deref(), Histogram::DbIterSeek);
+        let _scope = self.mode.scope();
         self.inner.seek_to_last_before(exclusive_upper);
     }
 
@@ -167,6 +212,7 @@ impl<'a> Iter<'a> {
     /// the iterator is not valid.
     pub fn next(&mut self) {
         let _t = TimeScope::new(self.stats.as_deref(), Histogram::DbIterNext);
+        let _scope = self.mode.scope();
         self.inner.next();
         // Only count the step when it produced a key - an
         // end-of-stream `next` that invalidates the iterator
@@ -181,6 +227,7 @@ impl<'a> Iter<'a> {
     /// A no-op if the iterator is not valid.
     pub fn prev(&mut self) {
         let _t = TimeScope::new(self.stats.as_deref(), Histogram::DbIterNext);
+        let _scope = self.mode.scope();
         self.inner.prev();
         if self.inner.valid() {
             self.tick_next();

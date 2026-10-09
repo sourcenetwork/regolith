@@ -85,14 +85,15 @@ impl TxnOptions {
 
     /// Read in `mode`: [`ReadMode::Blocking`] by default.
     ///
-    /// Under [`ReadMode::CacheOnly`] no point read the transaction makes
-    /// touches the device: [`Transaction::get`](super::Transaction::get),
-    /// `get_slice`, `get_for_update`, `get_parts`, and the reads a merge
-    /// needs underneath them each return
+    /// Under [`ReadMode::CacheOnly`] no read the transaction makes touches
+    /// the device: [`Transaction::get`](super::Transaction::get),
+    /// `get_slice`, `get_for_update`, `get_parts`, a cursor's
+    /// [`next_page`](super::TxnCursor::next_page), a scan stream's next
+    /// item, and the reads a merge needs underneath them each return
     /// [`crate::TransactionError::WouldBlock`] when they need a block the
     /// cache does not hold. Poll the queue it names and run the call again: a
-    /// read run again returns what the first attempt would have. Cursors and
-    /// scan streams read blocking.
+    /// read run again returns what the first attempt would have, and a cursor
+    /// or stream continues where it stopped, skipping and repeating nothing.
     ///
     /// The reads [`Transaction::commit`](super::Transaction::commit) makes,
     /// the `before_commit` callbacks' included, read the device whatever the

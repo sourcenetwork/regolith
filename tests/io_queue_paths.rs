@@ -18,7 +18,7 @@ use common::device_env::{Device, DeviceEnv};
 use common::parted::{self, Parted};
 use regolith::{
     Db, Error, IoBudget, IoQueue, IsolationLevel, OptimisticTransactionDb, Options, ReadMode,
-    Snapshot, TransactionError, TxnOptions, WouldBlock,
+    ScanCheck, ScanDirection, Snapshot, TransactionDb, TransactionError, TxnOptions, WouldBlock,
 };
 use tempfile::TempDir;
 
@@ -31,6 +31,9 @@ const DELETED: usize = 157;
 /// More `WouldBlock`s than any one read here can meet: a read past it never
 /// finished, which fails the test rather than spinning.
 const MOST_WAITS: usize = 10_000;
+
+/// The entries a walk yielded, keys without the column-family prefix.
+type Walked = Vec<(Vec<u8>, Vec<u8>)>;
 
 #[derive(Clone, Copy, Debug)]
 enum Layout {
@@ -310,6 +313,193 @@ fn a_size_guard_answers_through_the_queue_as_it_does_blocking() {
     }
 }
 
+/// Walk a cursor to its end, resuming it after every `WouldBlock`.
+fn walk_cursor(
+    device: &Device,
+    queue: &mut IoQueue,
+    seek: impl FnOnce(&mut regolith::OwnedSnapshotIter),
+    mut iter: regolith::OwnedSnapshotIter,
+    reverse: bool,
+) -> (Walked, usize) {
+    let mut waits = 0;
+    let before = device.touches();
+    seek(&mut iter);
+    assert_eq!(device.touches(), before);
+    let mut out = Vec::new();
+    loop {
+        if iter.valid() {
+            out.push((iter.key().unwrap().to_vec(), iter.value().unwrap().to_vec()));
+            let before = device.touches();
+            if reverse {
+                iter.prev();
+            } else {
+                iter.next();
+            }
+            assert_eq!(device.touches(), before, "a step touched the device");
+            continue;
+        }
+        match iter.status() {
+            Ok(()) => return (out, waits),
+            Err(Error::WouldBlock(_)) => {
+                waits += 1;
+                assert!(waits < MOST_WAITS);
+                queue.poll(IoBudget::ALL);
+                let before = device.touches();
+                iter.resume();
+                assert_eq!(device.touches(), before, "a resume touched the device");
+            }
+            Err(other) => panic!("{other}"),
+        }
+    }
+}
+
+#[test]
+fn cursors_resume_where_a_wait_stopped_them() {
+    for layout in LAYOUTS {
+        for reverse in [false, true] {
+            let (_dir, db, device) = cold(layout);
+            let db = db.db();
+            let mut queue = db.io_queue();
+            let iter = db
+                .snapshot()
+                .with_read_mode(ReadMode::CacheOnly(queue.id()))
+                .into_owned_iter();
+            let seek = |it: &mut regolith::OwnedSnapshotIter| {
+                if reverse {
+                    it.seek_to_last()
+                } else {
+                    it.seek_to_first()
+                }
+            };
+            let (walked, waits) = walk_cursor(&device, &mut queue, seek, iter, reverse);
+            assert!(waits > 0, "{layout:?}: a cold walk must wait");
+            let mut expected = db.scan(None, None).unwrap();
+            if reverse {
+                expected.reverse();
+            }
+            assert_eq!(walked, expected, "{layout:?} reverse={reverse}");
+        }
+    }
+}
+
+#[test]
+fn a_backward_step_that_waited_keeps_the_forward_bound() {
+    for layout in LAYOUTS {
+        let (_dir, db, _device) = cold(layout);
+        let db = db.db();
+        let mut queue = db.io_queue();
+        let walk = |iter: &mut regolith::OwnedSnapshotIter, queue: &mut IoQueue| {
+            let mut seen = Vec::new();
+            let mut settle = |iter: &mut regolith::OwnedSnapshotIter| {
+                while matches!(iter.status(), Err(Error::WouldBlock(_))) {
+                    queue.poll(IoBudget::ALL);
+                    iter.resume();
+                }
+            };
+            // A step back from where the seek landed reads blocks the seek
+            // did not, so a cold walk waits on it.
+            iter.seek_bounded(&key(180), &key(200));
+            settle(iter);
+            iter.prev();
+            settle(iter);
+            while iter.valid() {
+                seen.push(iter.key().unwrap().to_vec());
+                iter.next();
+                settle(iter);
+            }
+            seen
+        };
+        let mut blocking = db.snapshot().into_owned_iter();
+        let mut cache_only = db
+            .snapshot()
+            .with_read_mode(ReadMode::CacheOnly(queue.id()))
+            .into_owned_iter();
+        let expected = walk(&mut blocking, &mut queue);
+        assert_eq!(expected.last(), Some(&key(199)), "the bound ends the walk");
+        assert_eq!(walk(&mut cache_only, &mut queue), expected, "{layout:?}");
+    }
+}
+
+#[test]
+fn a_bounded_cursor_keeps_its_bound_across_a_resume() {
+    for layout in LAYOUTS {
+        let (_dir, db, device) = cold(layout);
+        let db = db.db();
+        let mut queue = db.io_queue();
+        let iter = db
+            .snapshot()
+            .with_read_mode(ReadMode::CacheOnly(queue.id()))
+            .into_owned_iter();
+        let seek = |it: &mut regolith::OwnedSnapshotIter| it.seek_bounded(&key(120), &key(250));
+        let (walked, waits) = walk_cursor(&device, &mut queue, seek, iter, false);
+        assert!(waits > 0);
+        assert_eq!(walked, db.scan(Some(&key(120)), Some(&key(250))).unwrap());
+    }
+}
+
+#[test]
+fn streams_carry_on_after_a_wait() {
+    for layout in LAYOUTS {
+        let (_dir, db, device) = cold(layout);
+        let db = db.db();
+        let mut queue = db.io_queue();
+        let snapshot = db
+            .snapshot()
+            .with_read_mode(ReadMode::CacheOnly(queue.id()));
+        let mut stream = snapshot.scan_stream(Some(&key(107)), Some(&key(299)));
+        let mut got = Vec::new();
+        let mut waits = 0;
+        loop {
+            let before = device.touches();
+            let item = stream.next();
+            assert_eq!(device.touches(), before);
+            match item {
+                None => break,
+                Some(Ok((k, v))) => got.push((k, v.to_vec())),
+                Some(Err(Error::WouldBlock(_))) => {
+                    waits += 1;
+                    assert!(waits < MOST_WAITS);
+                    queue.poll(IoBudget::ALL);
+                }
+                Some(Err(other)) => panic!("{other}"),
+            }
+        }
+        assert!(waits > 0, "{layout:?}");
+        assert_eq!(got, db.scan(Some(&key(107)), Some(&key(299))).unwrap());
+    }
+}
+
+#[test]
+fn an_entries_walk_carries_on_after_a_wait() {
+    for layout in LAYOUTS {
+        let (_dir, db, device) = cold(layout);
+        let db2 = db.db();
+        let mut queue = db2.io_queue();
+        let mut entries = db2
+            .snapshot()
+            .with_read_mode(ReadMode::CacheOnly(queue.id()))
+            .into_owned_iter()
+            .entries_rev();
+        let mut got = Vec::new();
+        loop {
+            let before = device.touches();
+            let item = entries.next();
+            assert_eq!(device.touches(), before);
+            match item {
+                None => break,
+                Some(Ok((k, v))) => got.push((k, v.to_vec())),
+                Some(Err(Error::WouldBlock(_))) => {
+                    queue.poll(IoBudget::ALL);
+                }
+                Some(Err(other)) => panic!("{other}"),
+            }
+        }
+        let mut expected = db2.scan(None, None).unwrap();
+        expected.reverse();
+        assert_eq!(got, expected, "{layout:?}");
+    }
+}
+
 type TxnRead = fn(&regolith::Transaction) -> Result<String, TransactionError>;
 
 fn transaction_reads() -> Vec<(&'static str, TxnRead)> {
@@ -351,6 +541,147 @@ fn every_transaction_read_waits_then_answers_as_blocking() {
             blocking.merge(&key(121), &parted::add(0, 100)).unwrap();
             assert_eq!(answer, read(&blocking).unwrap(), "{layout:?} {name}");
         }
+    }
+}
+
+/// Page through `[start, end)` with a cursor, calling again after every
+/// `WouldBlock`.
+fn pages(
+    device: &Device,
+    queue: &mut IoQueue,
+    txn: &regolith::Transaction,
+    direction: ScanDirection,
+    page_bytes: usize,
+) -> (Walked, usize) {
+    let cache_only = txn.read_mode() != ReadMode::Blocking;
+    let before = device.touches();
+    let mut cursor = txn.cursor(
+        Some(&key(3)),
+        Some(&key(311)),
+        direction,
+        ScanCheck::Stretch,
+    );
+    assert!(!cache_only || device.touches() == before);
+    let mut got: Walked = Vec::new();
+    let mut waits = 0;
+    loop {
+        assert!(
+            got.len() <= KEYS,
+            "{direction:?} {page_bytes}: the walk repeats entries: {:?}",
+            got.iter()
+                .take(40)
+                .map(|(k, _)| String::from_utf8_lossy(k).into_owned())
+                .collect::<Vec<_>>()
+        );
+        let before = device.touches();
+        let page = cursor.next_page(txn, page_bytes);
+        assert!(
+            !cache_only || device.touches() == before,
+            "a CacheOnly page touched the device"
+        );
+        match page {
+            Ok(page) => {
+                got.extend(page.entries.into_iter().map(|(k, v)| (k, v.to_vec())));
+                if page.done {
+                    return (got, waits);
+                }
+            }
+            Err(TransactionError::WouldBlock(_)) => {
+                waits += 1;
+                assert!(waits < MOST_WAITS);
+                queue.poll(IoBudget::ALL);
+            }
+            Err(other) => panic!("{other}"),
+        }
+    }
+}
+
+#[test]
+fn a_transaction_cursor_pages_through_waits_without_skipping_or_repeating() {
+    for layout in LAYOUTS {
+        for direction in [ScanDirection::Forward, ScanDirection::Reverse] {
+            for page_bytes in [0, 100, 1 << 20] {
+                let (_dir, db, device) = cold(layout);
+                let mut queue = db.db().io_queue();
+                let txn = db.begin(&TxnOptions::new().read_mode(ReadMode::CacheOnly(queue.id())));
+                // The transaction's own writes merge into the walk.
+                txn.put(&key(150), b"mine").unwrap();
+                txn.delete(&key(151)).unwrap();
+                txn.merge(&key(154), &parted::add(0, 1)).unwrap();
+                let (got, waits) = pages(&device, &mut queue, &txn, direction, page_bytes);
+                assert!(waits > 0, "{layout:?}");
+                let blocking = db.begin(&TxnOptions::new());
+                blocking.put(&key(150), b"mine").unwrap();
+                blocking.delete(&key(151)).unwrap();
+                blocking.merge(&key(154), &parted::add(0, 1)).unwrap();
+                let (expected, _) = pages(&device, &mut queue, &blocking, direction, page_bytes);
+                assert_eq!(got, expected, "{layout:?} {direction:?} {page_bytes}");
+            }
+        }
+    }
+}
+
+#[test]
+fn a_transaction_stream_carries_on_after_a_wait() {
+    for layout in LAYOUTS {
+        let (_dir, db, device) = cold(layout);
+        let mut queue = db.db().io_queue();
+        let txn = db.begin(&TxnOptions::new().read_mode(ReadMode::CacheOnly(queue.id())));
+        txn.merge(&key(109), &parted::add(0, 3)).unwrap();
+        let mut got = Vec::new();
+        let mut waits = 0;
+        let mut stream = txn.scan_stream(Some(&key(0)), None);
+        loop {
+            let before = device.touches();
+            let item = stream.next();
+            assert_eq!(device.touches(), before);
+            match item {
+                None => break,
+                Some(Ok((k, v))) => got.push((k, v.to_vec())),
+                Some(Err(TransactionError::WouldBlock(_))) => {
+                    waits += 1;
+                    assert!(waits < MOST_WAITS);
+                    queue.poll(IoBudget::ALL);
+                }
+                Some(Err(other)) => panic!("{other}"),
+            }
+        }
+        drop(stream);
+        assert!(waits > 0);
+        let blocking = db.begin(&TxnOptions::new());
+        blocking.merge(&key(109), &parted::add(0, 3)).unwrap();
+        let expected: Vec<_> = blocking
+            .scan_stream(Some(&key(0)), None)
+            .map(|item| item.map(|(k, v)| (k, v.to_vec())).unwrap())
+            .collect();
+        assert_eq!(got, expected, "{layout:?}");
+    }
+}
+
+#[test]
+fn a_pessimistic_cursor_waits_on_a_key_read_past_its_snapshot() {
+    for layout in LAYOUTS {
+        let dir = TempDir::new().unwrap();
+        let (env, device) = DeviceEnv::new();
+        {
+            let db = TransactionDb::open(dir.path(), options(layout, Arc::clone(&env))).unwrap();
+            fill(db.db());
+            db.db().close().unwrap();
+        }
+        let db = TransactionDb::open(dir.path(), options(layout, env)).unwrap();
+        let mut queue = db.db().io_queue();
+        let txn = db.begin(&TxnOptions::new().read_mode(ReadMode::CacheOnly(queue.id())));
+        // A commit after the snapshot, then a locked read that sees it: the
+        // scan serves that key at the lock horizon, a read of its own.
+        db.db().put(&key(140), b"newer").unwrap();
+        let (locked, _) = drive(&device, &mut queue, || {
+            txn.get_for_update(&key(140)).map_err(plain)
+        });
+        assert_eq!(locked, Some(b"newer".to_vec()));
+        let (got, waits) = pages(&device, &mut queue, &txn, ScanDirection::Forward, 64);
+        assert!(waits > 0, "{layout:?}");
+        assert!(got.contains(&(key(140), b"newer".to_vec())));
+        assert_eq!(got.len(), (3..311).filter(|i| *i != DELETED).count());
     }
 }
 

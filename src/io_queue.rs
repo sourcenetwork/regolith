@@ -47,7 +47,10 @@
 //!
 //! A read that returns `WouldBlock` is run again after its queue's poll, and
 //! then finds its block: in the cache, or, when the cache did not keep it,
-//! among the reads that landed for its queue.
+//! among the reads that landed for its queue. A scan resumes from where it
+//! stopped ([`OwnedSnapshotIter::resume`](crate::OwnedSnapshotIter::resume),
+//! [`TxnCursor::next_page`](crate::TxnCursor::next_page)), without skipping
+//! or repeating an entry.
 
 mod queue;
 pub(crate) mod wait;
@@ -78,9 +81,8 @@ impl QueueId {
 ///
 /// Set per handle: [`TxnOptions::read_mode`](crate::TxnOptions::read_mode)
 /// for a transaction and [`Snapshot::with_read_mode`](crate::Snapshot::with_read_mode)
-/// for a snapshot, where it governs point reads and one-shot scans (their
-/// iterators, cursors and streams read blocking). It is checked where a read
-/// would touch the device: data block,
+/// for a snapshot, and inherited by the iterators, cursors and streams made
+/// from them. It is checked where a read would touch the device: data block,
 /// index, index leaf and filter reads, the readahead of a scan, and so the
 /// reopening of a file `max_open_files` closed, which happens only inside a
 /// device read.
@@ -114,6 +116,10 @@ impl ReadMode {
             Self::Blocking => None,
             Self::CacheOnly(queue) => Some(scope::cache_only(queue)),
         }
+    }
+
+    pub(crate) fn is_cache_only(self) -> bool {
+        matches!(self, Self::CacheOnly(_))
     }
 }
 

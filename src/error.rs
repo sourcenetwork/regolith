@@ -104,7 +104,7 @@ pub enum Error {
     /// The call returned instead of waiting. A read through a
     /// [`crate::ReadMode::CacheOnly`] handle needed a block the cache does
     /// not hold: poll the queue the wait names, then run the call again. The
-    /// call left nothing half done.
+    /// call left nothing half done; a scan resumes where it stopped.
     #[error("{0}")]
     WouldBlock(WouldBlock),
     /// An underlying I/O error from the filesystem or operating system.
