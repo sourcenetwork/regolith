@@ -8621,7 +8621,7 @@ mod tests {
 
     /// Wait, with a deadline and a bounded backoff, until the background
     /// has written L0 up to `files` tables.
-    fn wait_for_l0_files(db: &Db, files: u64) {
+    pub(crate) fn wait_for_l0_files(db: &Db, files: u64) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
         let mut pause = std::time::Duration::from_millis(1);
         while db

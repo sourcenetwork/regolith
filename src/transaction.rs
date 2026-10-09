@@ -2543,16 +2543,28 @@ mod tests {
             .statistics(Some(Arc::clone(stats)))
     }
 
-    /// Drive `plain` past the slowdown trigger with the same recipe as
-    /// `test_write_stall_slowdown_accumulates_micros`, then check that a
-    /// commit through `begin` is charged the wait only when it carries a
-    /// write.
-    fn probe_slowdown_ticker(plain: &Db, stats: &Statistics, begin: impl Fn() -> Transaction) {
+    /// Write `plain` past the slowdown trigger with the recipe of
+    /// `test_write_stall_slowdown_accumulates_micros`. The worker writes the
+    /// sealed memtables out off the commit path, and a loaded host can let
+    /// the writes outrun it, so the second half waits for L0 to reach the
+    /// trigger: those writes pay the slowdown.
+    fn cross_slowdown(plain: &Db) {
         let payload = vec![0xCDu8; 600];
-        for i in 0..128 {
+        for i in 0..64 {
             let k = format!("k{i:04}");
             plain.put(k.as_bytes(), &payload).unwrap();
         }
+        crate::tests::wait_for_l0_files(plain, 2);
+        for i in 64..128 {
+            let k = format!("k{i:04}");
+            plain.put(k.as_bytes(), &payload).unwrap();
+        }
+    }
+
+    /// Drive `plain` past the slowdown trigger, then check that a commit
+    /// through `begin` is charged the wait only when it carries a write.
+    fn probe_slowdown_ticker(plain: &Db, stats: &Statistics, begin: impl Fn() -> Transaction) {
+        cross_slowdown(plain);
         let stall = stats.get_ticker(Ticker::WriteStallMicros);
         assert!(
             stall > 0,
@@ -2622,11 +2634,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let db = OptimisticTransactionDb::open(dir.path(), slowdown_opts(&stats)).unwrap();
 
-        let payload = vec![0xCDu8; 600];
-        for i in 0..128 {
-            let k = format!("k{i:04}");
-            db.db().put(k.as_bytes(), &payload).unwrap();
-        }
+        cross_slowdown(db.db());
         let stall = stats.get_ticker(Ticker::WriteStallMicros);
         assert!(
             stall > 0,
