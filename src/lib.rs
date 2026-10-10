@@ -4076,7 +4076,10 @@ mod tests {
         const N: usize = 10_000;
         for i in 0..N {
             let k = format!("key_{:06}", i);
-            db.put(k.as_bytes(), b"v").unwrap();
+            // Ten thousand writes into a 4 KiB buffer can outrun the
+            // worker's compactions and meet the L0 stop, which a write
+            // reports rather than waits out; this test is about the scan.
+            through_stalls(|| db.put(k.as_bytes(), b"v")).unwrap();
         }
 
         let mut it = db.iter();
@@ -5027,7 +5030,10 @@ mod tests {
         const N: usize = 10_000;
         for i in 0..N {
             let k = format!("key_{:06}", i);
-            db.put(k.as_bytes(), b"v").unwrap();
+            // Ten thousand writes into a 4 KiB buffer can outrun the
+            // worker's compactions and meet the L0 stop, which a write
+            // reports rather than waits out; this test is about the scan.
+            through_stalls(|| db.put(k.as_bytes(), b"v")).unwrap();
         }
 
         let mut it = db.iter();
