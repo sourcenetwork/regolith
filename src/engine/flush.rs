@@ -102,6 +102,10 @@ impl Flusher {
     pub(crate) fn flush_all_frozen(&self) {
         let _background = InBackground::enter();
         loop {
+            // The worker may wait here on a writer's or a checkpoint's
+            // flush, a whole table write: release the views its last read
+            // holds back first, as it does before every other wait.
+            super::read_view::idle();
             let flushing = self.flushing.lock();
             let flushed = self.flush_oldest(&flushing);
             drop(flushing);
