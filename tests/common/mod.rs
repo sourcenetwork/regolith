@@ -78,7 +78,7 @@ fn count_with_extension(dir: &Path, ext: &str) -> usize {
 /// Force a full flush + compaction by calling `compact_range(None, None)`.
 /// Blocks until the compaction scheduler reports completion.
 pub fn force_compaction(db: &Db) {
-    db.compact_range(None, None).unwrap();
+    db.compact_range(None, None).wait().unwrap();
 }
 
 /// Fault injection: subprocess crash harness, power-loss simulation,

@@ -134,9 +134,6 @@ impl Env for SstBudgetEnv {
     ) -> io::Result<Box<dyn JoinHandle>> {
         self.inner.spawn(name, body)
     }
-    fn sleep(&self, dur: Duration) {
-        self.inner.sleep(dur)
-    }
 }
 
 fn sst_files(dir: &Path) -> Vec<PathBuf> {
@@ -175,7 +172,7 @@ fn a_compaction_that_fails_midway_leaves_no_outputs_behind() {
     // Room for one output, so the failure lands after a finished file.
     env.allow_ssts(1);
     for _ in 0..5 {
-        assert!(db.compact_range(None, None).is_err());
+        assert!(db.compact_range(None, None).wait().is_err());
         assert_eq!(
             sst_files(dir.path()),
             live_before,
@@ -184,7 +181,7 @@ fn a_compaction_that_fails_midway_leaves_no_outputs_behind() {
     }
 
     env.allow_ssts(UNLIMITED);
-    db.compact_range(None, None).unwrap();
+    db.compact_range(None, None).wait().unwrap();
     for i in 0..8_000u32 {
         assert!(db.get(&key(i)).unwrap().is_some(), "key {i} lost");
     }

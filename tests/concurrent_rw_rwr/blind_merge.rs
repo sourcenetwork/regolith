@@ -169,7 +169,7 @@ impl Maintenance {
     fn run_at(self, now: Stage, db: &Db) {
         match self {
             Self::Flush(at) if at == now => db.flush().unwrap(),
-            Self::Compact(at) if at == now => db.compact_range(None, None).unwrap(),
+            Self::Compact(at) if at == now => db.compact_range(None, None).wait().unwrap(),
             _ => {}
         }
     }
@@ -343,7 +343,7 @@ fn blind_merge_rounds(level: IsolationLevel, storage: Storage, rounds: &[Round])
             counter(db.db())
         )
     });
-    db.db().compact_range(None, None).unwrap();
+    db.db().compact_range(None, None).wait().unwrap();
     findings.check(counter(db.db()) == model, || {
         format!(
             "{case}: after a last compaction the counter is {:?}, the model says {model:?}",

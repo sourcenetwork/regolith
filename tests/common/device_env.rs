@@ -206,7 +206,4 @@ impl Env for DeviceEnv {
     ) -> io::Result<Box<dyn JoinHandle>> {
         self.inner.spawn(name, f)
     }
-    fn sleep(&self, d: std::time::Duration) {
-        self.inner.sleep(d)
-    }
 }

@@ -92,6 +92,7 @@ pub fn compact(dir: &std::path::Path, opts: Options, report: &mut Report) -> Res
     report.stage("after flush");
 
     db.compact_range(None, None)
+        .wait()
         .map_err(|e| format!("compact_range failed: {e}"))?;
     report.stage("after compact_range");
 

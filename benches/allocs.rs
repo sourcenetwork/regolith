@@ -249,7 +249,7 @@ fn filled(to_sstables: bool) -> Fixture {
         f.db.put(key_at(i).as_bytes(), &value).expect("put");
     }
     if to_sstables {
-        f.db.compact_range(None, None).expect("compact");
+        f.db.compact_range(None, None).wait().expect("compact");
     }
     // Without this the two residency variants could silently measure the
     // same path: one reads an SSTable only if the memtable is actually

@@ -104,7 +104,7 @@ fn a_chain_a_snapshot_kept_unfolded_reads_whole_and_compacts_whole() {
         merge_operands(&db);
         db.flush().unwrap();
         let flushed = sst_bytes(&db);
-        db.compact_range(None, None).unwrap();
+        db.compact_range(None, None).wait().unwrap();
         assert!(
             sst_bytes(&db) > flushed / 2,
             "the chain stayed unfolded: {} bytes from {flushed}",
@@ -121,7 +121,7 @@ fn a_chain_a_snapshot_kept_unfolded_reads_whole_and_compacts_whole() {
         let unfolded = sst_bytes(&db);
         db.merge(b"counter", &1i64.to_be_bytes()).unwrap();
         db.flush().unwrap();
-        db.compact_range(None, None).unwrap();
+        db.compact_range(None, None).wait().unwrap();
         assert!(
             sst_bytes(&db) < unfolded / 4,
             "the chain was folded: {} bytes from {unfolded}",

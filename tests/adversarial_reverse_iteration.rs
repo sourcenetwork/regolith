@@ -75,7 +75,7 @@ fn check(label: &str, keys: &[Vec<u8>]) {
             db.put(k, b"v").expect("put");
         }
         if compact {
-            db.compact_range(None, None).expect("compact_range");
+            db.compact_range(None, None).wait().expect("compact_range");
         }
         let ctx = format!("{label} [{stage}]");
 
@@ -153,7 +153,7 @@ fn check(label: &str, keys: &[Vec<u8>]) {
     for k in &sorted {
         db.put_cf(&other, k, b"other").expect("put_cf");
     }
-    db.compact_range(None, None).expect("compact_range");
+    db.compact_range(None, None).wait().expect("compact_range");
 
     let mut it = db.iter_cf(&cf);
     it.seek_to_last();

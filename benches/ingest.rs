@@ -135,6 +135,7 @@ fn main() {
                 ..IngestOptions::default()
             },
         )
+        .wait()
         .unwrap_or_else(|e| panic!("ingest {}: {e}", path.display()));
         let took = started.elapsed();
         let from = started.duration_since(origin).as_nanos() as u64;
@@ -199,6 +200,7 @@ fn cold_reads(path: &std::path::Path, file: usize, entries: usize) -> String {
         std::slice::from_ref(&path.to_path_buf()),
         IngestOptions::default(),
     )
+    .wait()
     .unwrap_or_else(|e| panic!("ingest {}: {e}", path.display()));
     let mut rng = common::Rng::new(0x5EAD);
     let reads = entries.min(50_000);

@@ -111,10 +111,13 @@ impl TxnOptions {
     /// Name the queue this transaction's completions belong to.
     ///
     /// Recorded on the transaction and reported by
-    /// [`Transaction::io_queue`](super::Transaction::io_queue). Today only
-    /// reads complete through a queue, and they go to the queue their
-    /// [`read_mode`](Self::read_mode) names; this names it for a transaction
-    /// whose reads block.
+    /// [`Transaction::io_queue`](super::Transaction::io_queue).
+    /// [`Transaction::commit_nowait`](super::Transaction::commit_nowait)
+    /// delivers its [`CommitTicket`](crate::CommitTicket) through this
+    /// queue: the ticket completes only at this queue's poll, on the thread
+    /// that owns it. Without one the commit syncs inline and hands back a
+    /// ticket that is already complete. Reads that miss the cache go to the
+    /// queue their [`read_mode`](Self::read_mode) names.
     pub const fn io_queue(mut self, queue: QueueId) -> Self {
         self.reading.queue = Some(queue);
         self

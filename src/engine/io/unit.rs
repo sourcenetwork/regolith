@@ -1,18 +1,12 @@
 //! One unit of device I/O, run once however many queues wait on it.
 //!
 //! A unit is born in the `Free` state when the first `CacheOnly` read misses
-//! its block. It moves forward exactly once per step:
-//!
-//! ```text
-//! Free --claim (one CAS)--> Claimed --finish--> Done
-//!   \--release (close, a dropped queue): claim, then finish with nothing--/
-//! ```
-//!
-//! The claim is the only way to `Claimed`, so the work runs at most once.
-//! `finish` writes the outcome, publishes `Done`, and then closes the list of
-//! waiting queues with one swap and pushes one `Done` message to each queue
-//! on it. A queue that registers after that swap is refused and reads the
-//! outcome itself. So every queue that registered gets exactly one
+//! its block, and moves through the states `flight.rs` describes: one claim
+//! by compare-and-swap, then one `finish`, which writes the outcome and lands
+//! the flight, pushing one `Done` message to each queue that registered. A
+//! release (close, a dropped queue) claims the unit and finishes it with
+//! nothing read. A queue that registers after the landing is refused and
+//! reads the outcome itself. So every queue that registered gets exactly one
 //! completion, and none is lost.
 
 #![allow(unsafe_code)]
@@ -21,14 +15,10 @@ use std::io;
 use std::sync::Arc;
 
 use super::Landed;
+use super::flight::Flight;
 use super::shared::{Message, QueueShared};
-use super::stack::{SHUT, Stack};
 use crate::engine::block_cache::BlockCache;
-use crate::sync::internal::{AtomicUsize, Ordering, UnsafeCell};
-
-const FREE: usize = 0;
-const CLAIMED: usize = 1;
-const DONE: usize = 2;
+use crate::sync::internal::UnsafeCell;
 
 /// What names one unit in the shared table: the block cache's key for the
 /// block, and the per-block allocation guard of a size-limited read. Reads of
@@ -59,13 +49,11 @@ pub(crate) struct Unit {
     key: UnitKey,
     /// What the unit reads from the device: the frame of the block.
     bytes: usize,
-    state: AtomicUsize,
+    flight: Flight,
     /// Taken by the claim holder.
     work: UnsafeCell<Option<Work>>,
     /// Written by the claim holder before `Done`, read only after it.
     outcome: UnsafeCell<Option<Outcome>>,
-    /// The queues waiting on this unit, closed with [`SHUT`] by `finish`.
-    waiters: Stack<Arc<QueueShared>>,
 }
 
 // SAFETY: `work` is only touched by the one thread whose claim succeeded,
@@ -79,10 +67,9 @@ impl Unit {
         Self {
             key,
             bytes,
-            state: AtomicUsize::new(FREE),
+            flight: Flight::new(),
             work: UnsafeCell::new(Some(work)),
             outcome: UnsafeCell::new(None),
-            waiters: Stack::new(),
         }
     }
 
@@ -95,33 +82,30 @@ impl Unit {
     }
 
     pub(crate) fn is_done(&self) -> bool {
-        self.state.load(Ordering::Acquire) == DONE
+        self.flight.is_done()
     }
 
     /// Nobody has claimed the unit yet: a waiting queue's owner may run it.
     pub(crate) fn is_free(&self) -> bool {
-        self.state.load(Ordering::Acquire) == FREE
+        self.flight.is_free()
     }
 
     /// Take the unit for this thread with one compare-and-swap. `true` for
     /// exactly one caller over the unit's life; that caller must then
     /// [`run`](Self::run) or [`finish`](Self::finish) it.
     pub(crate) fn claim(&self) -> bool {
-        self.state
-            .compare_exchange(FREE, CLAIMED, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
+        self.flight.claim()
     }
 
     /// Record `queue` as waiting. `false` when the unit already finished: the
     /// caller then reads [`outcome`](Self::outcome) itself.
     pub(crate) fn register(&self, queue: Arc<QueueShared>) -> bool {
-        self.waiters.push(queue, SHUT).is_ok()
+        self.flight.register(queue)
     }
 
     /// Run the work on this thread and finish. Only after this caller's
     /// [`claim`](Self::claim) succeeded.
     pub(crate) fn run(self: &Arc<Self>, cache: &BlockCache) {
-        debug_assert_eq!(self.state.load(Ordering::Relaxed), CLAIMED);
         // A panic in the work still finishes the unit, so no waiting queue
         // is left on a claim nobody will ever complete.
         struct Unwind<'a>(Option<&'a Arc<Unit>>);
@@ -164,8 +148,7 @@ impl Unit {
         self.work.with_mut(|work| unsafe { *work = None });
         self.outcome
             .with_mut(|cell| unsafe { *cell = Some(outcome) });
-        self.state.store(DONE, Ordering::Release);
-        for queue in self.waiters.take(SHUT) {
+        for queue in self.flight.land() {
             // A queue dropped since it registered refuses the message; it has
             // nobody left to tell.
             let _ = queue.deliver(Message::Done(Arc::clone(self)));

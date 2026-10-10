@@ -29,7 +29,7 @@ use std::path::PathBuf;
 use clap::Parser;
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
-use regolith::{Db, Options};
+use regolith::{Db, Options, through_stalls};
 
 /// Random-op correctness harness for regolith.
 #[derive(Parser)]
@@ -171,7 +171,7 @@ fn main() {
             0..=4 => {
                 let key = random_key(&mut rng, args.key_range);
                 let val = random_value(&mut rng, args.value_size);
-                db.put(&key, &val).unwrap();
+                through_stalls(|| db.put(&key, &val)).unwrap();
                 if let Some(w) = shadow.as_mut() {
                     writeln!(w, "PUT {} {}", hex(&key), hex(&val)).unwrap();
                     // Flush every write so a SIGKILL can't lose the
@@ -185,7 +185,7 @@ fn main() {
             // delete (15%)
             5 => {
                 let key = random_key(&mut rng, args.key_range);
-                let _ = db.delete(&key);
+                let _ = through_stalls(|| db.delete(&key));
                 if let Some(w) = shadow.as_mut() {
                     writeln!(w, "DEL {}", hex(&key)).unwrap();
                     w.flush().unwrap();
@@ -250,7 +250,7 @@ fn main() {
         // Periodic compaction to exercise the background merge
         // path against the reference.
         if args.compact_every > 0 && writes_since_compact >= args.compact_every {
-            db.compact_range(None, None).unwrap();
+            db.compact_range(None, None).wait().unwrap();
             writes_since_compact = 0;
         }
     }

@@ -81,6 +81,7 @@ fn write(dir: &str) -> Result<(), String> {
         .map_err(|e| format!("delete_range: {e:?}"))?;
     db.flush().map_err(|e| format!("flush: {e:?}"))?;
     db.compact_range(None, None)
+        .wait()
         .map_err(|e| format!("compact_range: {e:?}"))?;
     db.close().map_err(|e| format!("close: {e:?}"))?;
     println!("WROTE {N} records to {dir}");

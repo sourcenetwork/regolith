@@ -39,7 +39,7 @@ impl Layer {
             Self::Table => db.flush().unwrap(),
             Self::Compacted => {
                 db.flush().unwrap();
-                db.compact_range(None, None).unwrap();
+                db.compact_range(None, None).wait().unwrap();
             }
         }
     }

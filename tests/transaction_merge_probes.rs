@@ -231,7 +231,7 @@ fn a_newer_merge_operand_conflicts_a_point_read_wherever_it_is_stored() {
             OperandAt::SeparateTable => db.db().flush().unwrap(),
             OperandAt::SameTable => {
                 db.db().flush().unwrap();
-                db.db().compact_range(None, None).unwrap();
+                db.db().compact_range(None, None).wait().unwrap();
             }
         }
 

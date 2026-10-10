@@ -144,7 +144,9 @@ fn build(keys: &[Vec<u8>]) -> (common::TempDb, Db) {
         }
         db.write_opt(&wopts, batch).expect("fill write");
     }
-    db.compact_range(None, None).expect("fill compaction");
+    db.compact_range(None, None)
+        .wait()
+        .expect("fill compaction");
     (tmp, db)
 }
 

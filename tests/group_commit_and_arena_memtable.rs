@@ -48,7 +48,7 @@ fn one_long_lived_snapshot_agrees_with_itself_across_every_read_surface() {
         for k in 0..BATCH_WIDTH {
             batch.put(&batch_key(99, round, k), format!("seed{round}").as_bytes());
         }
-        db.write(batch).unwrap();
+        regolith::through_stalls(|| db.write(batch.clone())).unwrap();
     }
     let snap = db.snapshot();
     let pinned: Vec<(Vec<u8>, Vec<u8>)> = (0..seeded)
@@ -77,7 +77,7 @@ fn one_long_lived_snapshot_agrees_with_itself_across_every_read_surface() {
                 // snapshot has to hold a genuinely older version rather
                 // than the only version.
                 batch.put(&batch_key(99, round % seeded, w), b"clobbered");
-                db.write(batch).unwrap();
+                regolith::through_stalls(|| db.write(batch.clone())).unwrap();
             }
             frontier[w].store(rounds, Ordering::Release);
         }));
@@ -173,7 +173,7 @@ fn one_long_lived_snapshot_agrees_with_itself_across_every_read_surface() {
             // probe" is enforced rather than hoped for.
             let mut n = 0usize;
             while n == 0 || !stop.load(Ordering::Relaxed) {
-                db.compact_range(None, None).unwrap();
+                db.compact_range(None, None).wait().unwrap();
                 n += 1;
             }
             n
@@ -242,7 +242,7 @@ fn slices_survive_drop_all_and_the_reuse_that_follows_it() {
     let value: Vec<u8> = (0..3000u32).map(|i| (i % 251) as u8).collect();
     let mut held: Vec<DbSlice> = Vec::new();
     for i in 0..32 {
-        db.put(format!("pinned_{i:03}").as_bytes(), &value).unwrap();
+        regolith::through_stalls(|| db.put(format!("pinned_{i:03}").as_bytes(), &value)).unwrap();
         held.push(
             db.get_slice(format!("pinned_{i:03}").as_bytes())
                 .unwrap()
@@ -250,7 +250,7 @@ fn slices_survive_drop_all_and_the_reuse_that_follows_it() {
         );
     }
     // Some of the held slices come from an SSTable rather than the arena.
-    db.compact_range(None, None).unwrap();
+    db.compact_range(None, None).wait().unwrap();
     for i in 0..32 {
         held.push(
             db.get_slice(format!("pinned_{i:03}").as_bytes())
@@ -265,10 +265,10 @@ fn slices_survive_drop_all_and_the_reuse_that_follows_it() {
     // Refill hard, so every recycled chunk and every evicted block frame
     // is handed to somebody else.
     for i in 0..6000 {
-        db.put(format!("after_{i:05}").as_bytes(), &[b'z'; 200])
+        regolith::through_stalls(|| db.put(format!("after_{i:05}").as_bytes(), &[b'z'; 200]))
             .unwrap();
     }
-    db.compact_range(None, None).unwrap();
+    db.compact_range(None, None).wait().unwrap();
 
     for (i, slice) in held.iter().enumerate() {
         assert_eq!(
@@ -313,7 +313,7 @@ fn a_second_ingest_must_not_be_served_the_first_sources_cached_blocks() {
         // A plain write between the ingests is what forces the second
         // source's blocks to be looked up rather than served from the
         // reader that is still open.
-        db.put(format!("plain{batch}").as_bytes(), b"p").unwrap();
+        regolith::through_stalls(|| db.put(format!("plain{batch}").as_bytes(), b"p")).unwrap();
         db.ingest_external_files(
             std::slice::from_ref(&path),
             IngestOptions {
@@ -321,6 +321,7 @@ fn a_second_ingest_must_not_be_served_the_first_sources_cached_blocks() {
                 ..IngestOptions::default()
             },
         )
+        .wait()
         .unwrap();
     }
 

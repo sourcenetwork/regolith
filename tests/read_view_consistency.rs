@@ -89,7 +89,7 @@ fn a_never_deleted_key_never_reads_absent_under_compaction_and_rotation() {
             let (db, stop) = (Arc::clone(&db), Arc::clone(&stop));
             s.spawn(move || {
                 while !stop.load(Ordering::Relaxed) {
-                    let _ = db.compact_range(None, None);
+                    let _ = db.compact_range(None, None).wait();
                 }
             })
         };
@@ -266,7 +266,7 @@ fn a_snapshot_survives_the_compaction_that_unlinks_every_file_under_it() {
     for i in 0..KEYS {
         db.put(&key(i), &value(1)).expect("seed");
     }
-    db.compact_range(None, None).expect("compact");
+    db.compact_range(None, None).wait().expect("compact");
 
     let snap = db.snapshot();
     let captured: Vec<(Vec<u8>, Vec<u8>)> = snap.scan(None, None).expect("scan");
@@ -282,7 +282,7 @@ fn a_snapshot_survives_the_compaction_that_unlinks_every_file_under_it() {
         for i in 0..KEYS {
             db.put(&key(i), &value(generation)).expect("put");
         }
-        db.compact_range(None, None).expect("compact");
+        db.compact_range(None, None).wait().expect("compact");
     }
 
     for i in 0..KEYS {

@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use clap::Parser;
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
-use regolith::{Db, Options};
+use regolith::{Db, Options, through_stalls};
 
 /// YCSB benchmark driver for regolith.
 #[derive(Parser)]
@@ -164,7 +164,7 @@ fn load_phase(db: &Db, num: u64, field_size: usize, rng: &mut SmallRng) {
     for i in 0..num {
         let key = ycsb_key(i);
         let val = random_value(rng, field_size);
-        db.put(&key, &val).unwrap();
+        through_stalls(|| db.put(&key, &val)).unwrap();
     }
     let elapsed = start.elapsed();
     report("load", elapsed, num, num * field_size as u64);
@@ -197,7 +197,7 @@ fn run_phase(
             let key = ycsb_key(idx);
             let val = random_value(rng, args.field_size);
             let t = Instant::now();
-            let _ = db.put(&key, &val);
+            let _ = through_stalls(|| db.put(&key, &val));
             write_latencies.push(t.elapsed());
         } else if r < workload.read_proportion
             + workload.update_proportion
@@ -208,7 +208,7 @@ fn run_phase(
             next_insert_key += 1;
             let val = random_value(rng, args.field_size);
             let t = Instant::now();
-            let _ = db.put(&key, &val);
+            let _ = through_stalls(|| db.put(&key, &val));
             write_latencies.push(t.elapsed());
         } else if r < workload.read_proportion
             + workload.update_proportion
@@ -230,7 +230,7 @@ fn run_phase(
             let t = Instant::now();
             let _ = db.get(&key);
             let val = random_value(rng, args.field_size);
-            let _ = db.put(&key, &val);
+            let _ = through_stalls(|| db.put(&key, &val));
             write_latencies.push(t.elapsed());
         }
     }

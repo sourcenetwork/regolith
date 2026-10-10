@@ -138,15 +138,15 @@ proptest! {
                     head.retain(|k, _| !(*a..*b).contains(k));
                 }
                 Op::Flush => db.flush().unwrap(),
-                Op::CompactRange(a, b) => db.compact_range(Some(&key(*a)), Some(&key(*b))).unwrap(),
-                Op::CompactAll => db.compact_range(None, None).unwrap(),
+                Op::CompactRange(a, b) => db.compact_range(Some(&key(*a)), Some(&key(*b))).wait().unwrap(),
+                Op::CompactAll => db.compact_range(None, None).wait().unwrap(),
                 Op::Ingest(entries) => {
                     let path = ingest_file(dir.path(), step, entries, &value);
                     db.ingest_external_files(
                         &[path],
                         IngestOptions { snapshot_consistency: false, ..IngestOptions::default() },
                     )
-                    .unwrap();
+                    .wait().unwrap();
                     for (&k, &put) in entries {
                         if put {
                             head.insert(k, value.clone());

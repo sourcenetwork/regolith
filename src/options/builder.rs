@@ -418,6 +418,33 @@ impl Options {
         self
     }
 
+    /// With no compaction worker ([`Options::max_background_compactions`]
+    /// `0`), let a write a stall stopped run the step that relieves it.
+    /// Off by default; the [`Options::embedded`] and [`Options::wasm`]
+    /// presets turn it on.
+    ///
+    /// A write stopped by a stall threshold never waits: it applies nothing
+    /// and returns [`crate::Error::WouldBlock`] with a
+    /// [`crate::StallWait`]. With a worker, the worker's flushes and
+    /// compactions clear the stall. With none, nothing clears it unless a
+    /// caller compacts, and this option says who:
+    ///
+    /// - **On.** The stopped write leaves the step (one flush or one
+    ///   compaction pass) on its thread's [`crate::IoQueue`], run at that
+    ///   queue's polls, one per poll, until the stall clears; a thread with
+    ///   no queue runs the steps inline instead, bounded, and its write goes
+    ///   on once they cleared the stall. A slowed write, under a slowdown
+    ///   threshold, owes one step the same way.
+    /// - **Off.** The caller clears the stall with [`crate::Db::compact_step`]
+    ///   or [`crate::Db::flush`]; the stopped writes' waits complete then.
+    ///
+    /// Ignored when a worker runs.
+    #[must_use]
+    pub fn inline_compaction(mut self, inline_compaction: bool) -> Self {
+        self.inline_compaction = inline_compaction;
+        self
+    }
+
     /// Accepted for compatibility with earlier releases.
     ///
     /// Compaction now streams a k-way merge with bounded memory
@@ -602,7 +629,6 @@ impl Options {
 mod tests {
     use super::*;
     use crate::rate_limiter::TokenBucketRateLimiter;
-    use std::time::Duration;
 
     struct KeepAll;
 
@@ -711,7 +737,6 @@ mod tests {
             .statistics(Some(Arc::new(crate::Statistics::new())))
             .rate_limiter(Some(Arc::new(TokenBucketRateLimiter::new(
                 1 << 20,
-                Duration::from_millis(10),
                 1 << 20,
             ))));
         assert_eq!(options.compaction_filter.unwrap().name(), "keep-all");

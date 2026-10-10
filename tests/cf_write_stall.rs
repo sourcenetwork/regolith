@@ -7,8 +7,10 @@
 //! stopped writers waited, each compaction had more of them to carry, the
 //! stop never cleared, and the loop only ends once those writers finish.
 //!
-//! FIFO with no worker makes the stop permanent and every admitted write
-//! report `Busy` at once, so the property is checked without any timing.
+//! FIFO with no worker makes the stop permanent; with inline compaction on
+//! and no queue, every admitted write runs the steps itself, finds none
+//! relieves the stop and reports `Busy` at once, so the property is checked
+//! without any timing.
 
 #![cfg(not(target_arch = "wasm32"))]
 
@@ -44,6 +46,7 @@ fn every_column_family_write_is_stopped_with_the_default_column_family() {
             .level0_slowdown_writes_trigger(3)
             .level0_stop_writes_trigger(4)
             .max_background_compactions(0)
+            .inline_compaction(true)
             .merge_operator(Some(Arc::new(Concat)))
             .compaction_style(CompactionStyle::Fifo)
             .fifo_compaction_options(FifoCompactionOptions {

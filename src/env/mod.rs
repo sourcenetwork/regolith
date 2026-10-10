@@ -68,7 +68,6 @@ pub(crate) use open_file_limit::OpenFileLimit;
 use std::io;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
 
 /// Whether the target has more than one thread at all. A wasm module built
 /// without the `atomics` target feature has exactly one, and
@@ -167,14 +166,6 @@ pub trait Env: Send + Sync + std::fmt::Debug {
         name: &str,
         body: Box<dyn FnOnce() + Send + 'static>,
     ) -> io::Result<Box<dyn JoinHandle>>;
-
-    /// Block the calling thread for `dur`.
-    ///
-    /// A no-op on a platform that cannot block. The only caller is the
-    /// per-write slowdown delay, which is back-pressure rather than
-    /// correctness, so skipping it costs throughput smoothing and
-    /// nothing else.
-    fn sleep(&self, dur: Duration);
 
     /// Free and total space on the filesystem holding `path`.
     ///

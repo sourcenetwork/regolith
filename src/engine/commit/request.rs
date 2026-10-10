@@ -58,6 +58,11 @@ impl WriteRequest {
         }
     }
 
+    /// A transaction committed by `commit_nowait`.
+    pub(super) fn is_nowait(&self) -> bool {
+        matches!(self, WriteRequest::Txn(txn) if txn.nowait)
+    }
+
     pub(super) fn durability(&self) -> DurabilityMode {
         match self {
             WriteRequest::Idle => DurabilityMode::Eventual,

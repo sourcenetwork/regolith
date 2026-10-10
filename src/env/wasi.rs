@@ -150,16 +150,6 @@ impl Env for WasiEnv {
         ))
     }
 
-    /// Blocks the single thread through `poll_oneoff`, which wasmtime
-    /// implements.
-    ///
-    /// Only the write-slowdown delay calls this, and a database on
-    /// this target runs with no background worker, so the stall path
-    /// compacts inline and never reaches it.
-    fn sleep(&self, dur: Duration) {
-        self.fs.sleep(dur);
-    }
-
     /// Nothing to do: WASI has no `posix_fadvise`.
     fn drop_page_cache(&self, path: &Path) {
         let _ = path;

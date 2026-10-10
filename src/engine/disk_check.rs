@@ -1,15 +1,20 @@
-//! Warn at open when the database's filesystem is close to full.
+//! Warn soon after open when the database's filesystem is close to full.
 //!
 //! A full disk does not announce itself: flushes and compactions start
 //! failing with ENOSPC, and a filesystem out of inodes fails the same way
-//! with bytes to spare. Checking once at open turns that into a warning an
-//! operator sees before the first failed write. The check runs on its own
-//! thread so a slow filesystem (a stalled network mount, say) never delays
-//! the open, and it only ever logs: nothing is gated on the answer.
+//! with bytes to spare. Checking once after open turns that into a warning
+//! an operator sees before the first failed write. The check is background
+//! work (D15): never on the open path, so a slow filesystem (a stalled
+//! network mount, say) never delays the open, and never on a thread of its
+//! own. The compaction worker runs it; a database with no worker owes it to
+//! its first write, which runs it on its thread's queue, or inline with no
+//! queue (`background_step.rs`). It only ever logs: nothing is gated on the
+//! answer.
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use super::io::job::JobBody;
 use crate::env::{DiskSpace, Env};
 
 /// Below this many free bytes the disk counts as low, however large it is.
@@ -40,21 +45,30 @@ pub(crate) fn assess(space: &DiskSpace) -> Shortage {
     }
 }
 
-/// Check the filesystem holding `dir` on a background thread and log a
-/// warning if it is low on space or inodes. Where the environment cannot
-/// spawn a thread, the check is skipped: it is advisory.
-pub(crate) fn spawn(env: &Arc<dyn Env>, dir: PathBuf) {
-    let checker = Arc::clone(env);
-    let spawned = env.spawn(
-        "regolith-disk-check",
-        Box::new(move || check(&*checker, &dir)),
-    );
-    if let Err(e) = spawned {
-        tracing::debug!(error = %e, "disk space check not started");
+/// The disk check as a job for the compaction worker.
+pub(crate) struct DiskCheck {
+    env: Arc<dyn Env>,
+    dir: PathBuf,
+}
+
+impl DiskCheck {
+    pub(crate) fn new(env: Arc<dyn Env>, dir: PathBuf) -> Self {
+        Self { env, dir }
     }
 }
 
-fn check(env: &dyn Env, dir: &std::path::Path) {
+impl JobBody for DiskCheck {
+    fn run(self: Box<Self>) {
+        check(&*self.env, &self.dir);
+    }
+
+    /// Skipped when the worker stopped first: the check is advisory.
+    fn release(self: Box<Self>) {}
+}
+
+/// Check the filesystem holding `dir` and log a warning if it is low on
+/// space or inodes. One `statvfs`-style call through `env`.
+pub(crate) fn check(env: &dyn Env, dir: &std::path::Path) {
     let space = match env.disk_space(dir) {
         Ok(Some(space)) => space,
         Ok(None) => return,

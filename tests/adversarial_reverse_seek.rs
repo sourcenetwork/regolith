@@ -30,7 +30,7 @@ fn probe(label: &str, opts: Options, compact: bool) {
     db.delete_range(b"k0000", b"k0386").unwrap();
     db.put(b"k0192", b"live").unwrap();
     if compact {
-        db.compact_range(None, None).unwrap();
+        db.compact_range(None, None).wait().unwrap();
     }
 
     assert_eq!(
@@ -87,7 +87,7 @@ fn seek_for_prev_past_a_key_written_after_a_covering_range_tombstone() {
     let db = Db::open(dir.path(), Options::default()).unwrap();
     db.delete_range(b"k0000", b"k0386").unwrap();
     db.put(b"k0192", b"live").unwrap();
-    db.compact_range(None, None).unwrap();
+    db.compact_range(None, None).wait().unwrap();
 
     let mut it = db.iter();
     it.seek_for_prev(b"k0999");
@@ -104,7 +104,7 @@ fn reverse_iteration_from_the_key_itself() {
     let db = Db::open(dir.path(), Options::default()).unwrap();
     db.delete_range(b"a", b"z").unwrap();
     db.put(b"m", b"live").unwrap();
-    db.compact_range(None, None).unwrap();
+    db.compact_range(None, None).wait().unwrap();
 
     let mut it = db.iter();
     it.seek_to_last();

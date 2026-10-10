@@ -8,7 +8,6 @@
 use std::fs::{File, OpenOptions};
 use std::io::{self, Seek, SeekFrom, Write};
 use std::path::Path;
-use std::time::Duration;
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -175,10 +174,6 @@ impl Env for StdEnv {
             s.f_favail,
             s.f_files,
         )))
-    }
-
-    fn sleep(&self, dur: Duration) {
-        std::thread::sleep(dur);
     }
 
     fn drop_page_cache(&self, path: &Path) {

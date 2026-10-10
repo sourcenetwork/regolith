@@ -52,7 +52,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // a memtable, or this measures the skip list instead of the read
     // path the Env sits behind.
     db.flush()?;
-    db.compact_range(None, None)?;
+    db.compact_range(None, None).wait()?;
     for k in keys.iter() {
         assert!(db.get(k)?.is_some(), "seed key missing");
     }

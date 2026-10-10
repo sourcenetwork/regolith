@@ -192,6 +192,7 @@ fn assert_functional(db: &Db, tag: &str) {
     drop(it);
 
     db.compact_range(None, None)
+        .wait()
         .unwrap_or_else(|e| panic!("{tag}: compaction on a recovered database failed: {e}"));
     assert_eq!(
         db.get(probe).unwrap(),
@@ -949,7 +950,7 @@ fn twenty_four_crash_and_reopen_cycles_accumulate_data_monotonically() {
         assert_no_dangling_files(&recovered, &db, &tag);
         assert_functional(&recovered, &tag);
         if cycle % 4 == 3 {
-            recovered.compact_range(None, None).unwrap();
+            recovered.compact_range(None, None).wait().unwrap();
             let after = fault::assert_valid_prefix(&recovered, &cumulative);
             assert_eq!(
                 after.k, report.k,

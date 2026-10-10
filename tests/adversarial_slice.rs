@@ -33,7 +33,7 @@ fn a_memtable_slice_outlives_the_database_that_produced_it() {
         let db = Db::open(dir.path(), embedded_opts()).unwrap();
         let mut held = Vec::new();
         for i in 0..24 {
-            db.put(format!("live_{i:03}").as_bytes(), &value).unwrap();
+            regolith::through_stalls(|| db.put(format!("live_{i:03}").as_bytes(), &value)).unwrap();
             held.push(
                 db.get_slice(format!("live_{i:03}").as_bytes())
                     .unwrap()
@@ -42,10 +42,10 @@ fn a_memtable_slice_outlives_the_database_that_produced_it() {
         }
         // Push every held slice's memtable out from under it.
         for i in 0..4000 {
-            db.put(format!("churn_{i:05}").as_bytes(), &[b'z'; 256])
+            regolith::through_stalls(|| db.put(format!("churn_{i:05}").as_bytes(), &[b'z'; 256]))
                 .unwrap();
         }
-        db.compact_range(None, None).unwrap();
+        db.compact_range(None, None).wait().unwrap();
         // Chunks really did go back to the recycling pool and get taken
         // out again, so a violation of the pinning contract would have
         // handed one of these slices' chunks to a later memtable.
@@ -57,9 +57,9 @@ fn a_memtable_slice_outlives_the_database_that_produced_it() {
             "no chunks were recycled, so this probe proves nothing"
         );
         for i in 0..4000 {
-            db.delete(format!("churn_{i:05}").as_bytes()).unwrap();
+            regolith::through_stalls(|| db.delete(format!("churn_{i:05}").as_bytes())).unwrap();
         }
-        db.compact_range(None, None).unwrap();
+        db.compact_range(None, None).wait().unwrap();
         db.close().unwrap();
         drop(db);
         held
@@ -84,9 +84,9 @@ fn an_sstable_slice_survives_the_compaction_that_unlinks_its_file() {
 
     let db = Db::open(dir.path(), embedded_opts()).unwrap();
     for i in 0..600 {
-        db.put(format!("k_{i:05}").as_bytes(), &value).unwrap();
+        regolith::through_stalls(|| db.put(format!("k_{i:05}").as_bytes(), &value)).unwrap();
     }
-    db.compact_range(None, None).unwrap();
+    db.compact_range(None, None).wait().unwrap();
 
     // Warm the read so the slice is definitely block-backed.
     let held: Vec<DbSlice> = (0..64)
@@ -101,10 +101,12 @@ fn an_sstable_slice_survives_the_compaction_that_unlinks_its_file() {
     // old ones, then churn the block cache far past its capacity.
     for round in 0..4 {
         for i in 0..600 {
-            db.put(format!("k_{i:05}").as_bytes(), &[round as u8; 2048])
-                .unwrap();
+            regolith::through_stalls(|| {
+                db.put(format!("k_{i:05}").as_bytes(), &[round as u8; 2048])
+            })
+            .unwrap();
         }
-        db.compact_range(None, None).unwrap();
+        db.compact_range(None, None).wait().unwrap();
     }
     db.close().unwrap();
     drop(db);
@@ -126,13 +128,15 @@ fn two_slices_into_one_block_are_independent() {
     let db = Db::open(dir.path(), embedded_opts()).unwrap();
     // Small values so many keys land in the same data block.
     for i in 0..512 {
-        db.put(
-            format!("b_{i:04}").as_bytes(),
-            format!("v{i:04}").as_bytes(),
-        )
+        regolith::through_stalls(|| {
+            db.put(
+                format!("b_{i:04}").as_bytes(),
+                format!("v{i:04}").as_bytes(),
+            )
+        })
         .unwrap();
     }
-    db.compact_range(None, None).unwrap();
+    db.compact_range(None, None).wait().unwrap();
 
     let a = db.get_slice(b"b_0000").unwrap().unwrap();
     let b = db.get_slice(b"b_0001").unwrap().unwrap();
@@ -152,13 +156,13 @@ fn empty_values_and_minimal_keys_round_trip() {
     let dir = TempDir::new().unwrap();
     let db = Db::open(dir.path(), embedded_opts()).unwrap();
 
-    db.put(b"e", b"").unwrap();
-    db.put(b"", b"").unwrap();
-    db.put(b"", b"nonempty").unwrap();
+    regolith::through_stalls(|| db.put(b"e", b"")).unwrap();
+    regolith::through_stalls(|| db.put(b"", b"")).unwrap();
+    regolith::through_stalls(|| db.put(b"", b"nonempty")).unwrap();
     let mut batch = WriteBatch::new();
     batch.put(b"be", b"");
     batch.put(b"", b"");
-    db.write(batch).unwrap();
+    regolith::through_stalls(|| db.write(batch.clone())).unwrap();
 
     for source in ["memtable", "sstable"] {
         assert_eq!(db.get(b"e").unwrap(), Some(Vec::new()), "{source}");
@@ -170,12 +174,12 @@ fn empty_values_and_minimal_keys_round_trip() {
         assert_eq!(db.get(b"").unwrap(), Some(Vec::new()), "{source}");
         assert_eq!(db.get(b"be").unwrap(), Some(Vec::new()), "{source}");
         if source == "memtable" {
-            db.compact_range(None, None).unwrap();
+            db.compact_range(None, None).wait().unwrap();
         }
     }
 
     // A deleted key and an empty value must stay distinguishable.
-    db.delete(b"e").unwrap();
+    regolith::through_stalls(|| db.delete(b"e")).unwrap();
     assert_eq!(db.get(b"e").unwrap(), None);
     assert!(!db.has(b"e").unwrap());
     assert_eq!(db.get_size(b"e").unwrap(), None);
@@ -206,7 +210,7 @@ fn values_far_larger_than_a_chunk_round_trip() {
     let mut expected = Vec::new();
     for (i, size) in sizes.iter().copied().enumerate() {
         let value: Vec<u8> = (0..size).map(|b| ((b + i) % 256) as u8).collect();
-        db.put(format!("big_{i}").as_bytes(), &value).unwrap();
+        regolith::through_stalls(|| db.put(format!("big_{i}").as_bytes(), &value)).unwrap();
         expected.push(value);
     }
 
@@ -225,7 +229,7 @@ fn values_far_larger_than_a_chunk_round_trip() {
         assert_eq!(db.get_size(key.as_bytes()).unwrap(), Some(value.len()));
     }
 
-    db.compact_range(None, None).unwrap();
+    db.compact_range(None, None).wait().unwrap();
     for (i, value) in expected.iter().enumerate() {
         let key = format!("big_{i}");
         assert_eq!(
@@ -256,7 +260,7 @@ fn allocations_that_straddle_a_chunk_boundary_stay_intact() {
     for (n, size) in (0..4200).step_by(7).enumerate() {
         let key = format!("s_{n:05}");
         let value: Vec<u8> = (0..size).map(|b| ((b ^ n) % 256) as u8).collect();
-        db.put(key.as_bytes(), &value).unwrap();
+        regolith::through_stalls(|| db.put(key.as_bytes(), &value)).unwrap();
         expected.push((key, value));
     }
 
@@ -267,7 +271,7 @@ fn allocations_that_straddle_a_chunk_boundary_stay_intact() {
             "chunk-boundary value for {key} came back wrong"
         );
     }
-    db.compact_range(None, None).unwrap();
+    db.compact_range(None, None).wait().unwrap();
     for (key, value) in &expected {
         assert_eq!(db.get(key.as_bytes()).unwrap().as_ref(), Some(value));
     }
@@ -283,7 +287,7 @@ fn range_tombstones_stay_consistent_under_concurrent_inserts() {
 
     // Keys "r_00000".."r_00999" exist up front.
     for i in 0..1000 {
-        db.put(format!("r_{i:05}").as_bytes(), b"base").unwrap();
+        regolith::through_stalls(|| db.put(format!("r_{i:05}").as_bytes(), b"base")).unwrap();
     }
 
     let stop = Arc::new(AtomicBool::new(false));
@@ -304,7 +308,7 @@ fn range_tombstones_stay_consistent_under_concurrent_inserts() {
                         format!("v{round}").as_bytes(),
                     );
                 }
-                db.write(batch).unwrap();
+                regolith::through_stalls(|| db.write(batch.clone())).unwrap();
             }
         })
     };
@@ -378,7 +382,7 @@ fn slices_taken_during_flush_stay_readable_after_it() {
     let db = Arc::new(Db::open(dir.path(), embedded_opts()).unwrap());
     let value: Vec<u8> = (0..1024u32).map(|i| (i % 241) as u8).collect();
     for i in 0..64 {
-        db.put(format!("pin_{i:03}").as_bytes(), &value).unwrap();
+        regolith::through_stalls(|| db.put(format!("pin_{i:03}").as_bytes(), &value)).unwrap();
     }
 
     let stop = Arc::new(AtomicBool::new(false));
@@ -388,8 +392,10 @@ fn slices_taken_during_flush_stay_readable_after_it() {
         thread::spawn(move || {
             let mut i = 0u64;
             while !stop.load(Ordering::Relaxed) {
-                db.put(format!("churn_{i:08}").as_bytes(), &[b'q'; 512])
-                    .unwrap();
+                regolith::through_stalls(|| {
+                    db.put(format!("churn_{i:08}").as_bytes(), &[b'q'; 512])
+                })
+                .unwrap();
                 i += 1;
             }
             i

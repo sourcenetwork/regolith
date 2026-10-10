@@ -87,7 +87,7 @@ fn a_checkpoint_drain_racing_a_rotation_never_loses_an_acknowledged_write() {
                 // A checkpoint can legitimately refuse while the
                 // engine is busy; the race is in the drain it ran
                 // before refusing, so a refusal is not a failure here.
-                if db.checkpoint(&into).is_ok() {
+                if db.checkpoint(&into).wait().is_ok() {
                     drains.fetch_add(1, Ordering::Relaxed);
                     let _ = std::fs::remove_dir_all(&into);
                 }

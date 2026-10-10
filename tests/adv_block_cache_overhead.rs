@@ -164,7 +164,7 @@ fn a_cached_entry_costs_no_more_heap_than_it_is_charged() {
         for i in 0..KEYS {
             db.put(&key(i), &[(i % 251) as u8; 96]).unwrap();
         }
-        db.compact_range(None, None).unwrap();
+        db.compact_range(None, None).wait().unwrap();
         db.close().unwrap();
         dir
     };

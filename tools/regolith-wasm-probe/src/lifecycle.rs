@@ -77,6 +77,7 @@ pub fn run(
     reporter.pass("iterator seek + walk");
 
     db.compact_range(None, None)
+        .wait()
         .map_err(|e| format!("compact_range failed: {e}"))?;
     reporter.pass("flush + compact_range");
 

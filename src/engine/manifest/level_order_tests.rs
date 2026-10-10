@@ -449,9 +449,9 @@ proptest! {
                 Step::Pick => {
                     db.compact_step().unwrap();
                 }
-                Step::Settle => db.compact_range(None, None).unwrap(),
+                Step::Settle => db.compact_range(None, None).wait().unwrap(),
                 Step::Bounded(lo, hi) => {
-                    db.compact_range(Some(&key(lo)), Some(&key(hi))).unwrap();
+                    db.compact_range(Some(&key(lo)), Some(&key(hi))).wait().unwrap();
                 }
             }
             prop_assert!(

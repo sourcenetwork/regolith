@@ -41,6 +41,14 @@ What is proved, in plain words:
 6. `panic_aborts`: a panic in before_commit ends the attempt with the
    reason `panic`, runs every on_abort callback of the attempt, and no
    on_commit callback.
+7. `delivered_once`: an outcome that comes back through a `CommitTicket` is
+   delivered, and its callbacks run, at most once, and exactly once when
+   the ticket is ready, however many paths try (the queue's poll, the
+   queue's drop, the commit's own fallback); `no_claim_delivers_twice` is
+   the RED case.
+8. `delivered_on_queue_thread`: every delivery runs on the thread that
+   holds the commit's queue, never on a committer that decided or synced
+   it (D53, the committing thread).
 
 How to read the Lean: `def` defines a function or a property, `theorem`
 states a fact and its proof follows `:= by`. Lines starting with `--` are
@@ -1383,5 +1391,227 @@ theorem surviving_callbacks_break_isolation :
       (.step (.hookBefore _ [] rfl rfl)))
       (.step (.validate _ true rfl)))
       (.step (.finishCommit _ rfl)), by decide, by decide, by decide⟩
+
+/-! ## Delivery on the committing thread (D53)
+
+Above, an attempt's outcome runs its callbacks once. Here is who runs them
+and how often, once the outcome comes back through a `CommitTicket`. The
+ticket's `Completion` (`src/io_queue/completion.rs`) is decided by the
+pipeline, then *delivered*: one compare-and-swap from "decided" to
+"delivering" lets one deliverer in, and only that one runs the callbacks.
+Every deliverer runs on the thread that holds the commit's queue at that
+moment: the queue's poll, the queue's drop (the queue may have moved to
+another thread, which then holds it), or the commit's own fallback when its
+queue went away before the ticket was registered. A committer that decided
+or synced the group is never a deliverer.
+
+Tiny example. Thread A commits with `commit_nowait`; thread B's poll lands
+A's group. B only puts a note in A's inbox. A's next poll claims the outcome
+and runs A's `on_commit` on A. If A drops its queue at the same moment, the
+drop and the poll race for the claim; one wins, and `on_commit` runs once. -/
+
+/-- Who can run an outcome's callbacks: the thread holding the commit's
+queue, or (only in the RED case) a committer. -/
+inductive Runner where
+  /-- The thread `t` that holds the commit's queue. -/
+  | holder (t : Nat)
+  /-- A committer `c` that decided or synced the commit. -/
+  | committer (c : Nat)
+  -- Two runners can be compared for equality.
+  deriving DecidableEq
+
+/-- Where a ticket's outcome is (`Completion`'s state word). -/
+inductive DState where
+  /-- Not decided yet. -/
+  | pending
+  /-- Decided by the pipeline, not delivered. -/
+  | decided
+  /-- One deliverer won the claim and is running the callbacks. -/
+  | delivering
+  /-- Delivered: the ticket is ready. -/
+  | ready
+  -- Two states can be compared for equality.
+  deriving DecidableEq
+
+/-- One commit's ticket. -/
+structure Ticket where
+  /-- The thread holding the commit's queue now. -/
+  holder : Nat
+  /-- The outcome's state. -/
+  st : DState
+  /-- Ghost: every run of the outcome callbacks, by who ran it. -/
+  ran : List Runner
+
+/-- The steps of one ticket, one atomic step each. -/
+inductive DStep : Ticket → Ticket → Prop
+  /-- The pipeline decides the outcome. -/
+  | decide (k : Ticket)
+      -- It was not decided.
+      (h : k.st = .pending) :
+      -- The state after the step:
+      DStep k { k with st := .decided }
+  /-- The queue moves to thread `t`, which holds it from now on (the queue is
+  `Send`). -/
+  | move (k : Ticket) (t : Nat) :
+      -- The state after the step:
+      DStep k { k with holder := t }
+  /-- A deliverer on the holding thread (the poll, the drop, or the commit's
+  own fallback) claims the decided outcome with one CAS and runs the
+  callbacks there. -/
+  | deliver (k : Ticket)
+      -- The CAS succeeds only on a decided outcome.
+      (h : k.st = .decided) :
+      -- The state after the step:
+      DStep k { k with st := .delivering, ran := .holder k.holder :: k.ran }
+  /-- The deliverer finishes: the ticket is ready. -/
+  | finish (k : Ticket)
+      -- It is the winner, delivering.
+      (h : k.st = .delivering) :
+      -- The state after the step:
+      DStep k { k with st := .ready }
+
+/-- Any number of ticket steps, one after another. -/
+inductive DSteps : Ticket → Ticket → Prop
+  /-- No step at all. -/
+  | refl (k : Ticket) : DSteps k k
+  /-- Some steps, then one more. -/
+  | tail {a b c : Ticket} : DSteps a b → DStep b c → DSteps a c
+
+/-- What holds of a ticket in every reachable state. -/
+structure DInv (k : Ticket) : Prop where
+  /-- Before the claim nobody ran the callbacks. -/
+  before : k.st = .pending ∨ k.st = .decided → k.ran = []
+  /-- After it, exactly one run. -/
+  after : k.st = .delivering ∨ k.st = .ready → k.ran.length = 1
+  /-- Every run was by a thread holding the queue. -/
+  holder : ∀ r ∈ k.ran, ∃ t, r = .holder t
+
+/-- A fresh ticket, its queue on thread `t`, satisfies the invariant. -/
+theorem dinv_init (t : Nat) : DInv ⟨t, .pending, []⟩ := by
+  -- Nothing ran; the state is pending, never delivering or ready.
+  refine ⟨fun _ => rfl, fun h => ?_, fun r hr => ?_⟩
+  · -- Pending is neither delivering nor ready.
+    rcases h with h | h <;> cases h
+  · -- No run is on the empty list.
+    cases hr
+
+/-- **One step keeps the invariant.** -/
+theorem dstep_inv {k k' : Ticket}
+    -- The invariant holds before the step.
+    (hi : DInv k)
+    -- One step.
+    (h : DStep k k') :
+    -- Then:
+    DInv k' := by
+  -- Look at the step.
+  cases h with
+  -- Deciding: from pending to decided, still nothing ran.
+  | decide hp =>
+    -- Nothing ran before, as the outcome was pending.
+    have hr : k.ran = [] := hi.before (Or.inl hp)
+    -- Decided is not delivering or ready, and the runs are untouched.
+    refine ⟨fun _ => hr, fun h => ?_, hi.holder⟩
+    -- Decided is neither delivering nor ready.
+    rcases h with h | h <;> cases h
+  -- Moving the queue changes only who holds it.
+  | move t =>
+    -- The state and the runs are untouched.
+    exact ⟨hi.before, hi.after, hi.holder⟩
+  -- The claim: one run, by the holder.
+  | deliver hd =>
+    -- Nothing ran before, as the outcome was only decided.
+    have hr : k.ran = [] := hi.before (Or.inr hd)
+    -- Delivering now, with exactly the one new run.
+    refine ⟨fun h => ?_, fun _ => ?_, fun r hm => ?_⟩
+    · -- Delivering is neither pending nor decided.
+      rcases h with h | h <;> cases h
+    · -- One run: the new one on an empty list.
+      simp [hr]
+    · -- The only run is the holder's.
+      simp [hr] at hm
+      -- It is `.holder` of the thread that held the queue.
+      exact ⟨k.holder, hm⟩
+  -- Finishing: ready, the runs untouched.
+  | finish hd =>
+    -- The single run stays.
+    have hl : k.ran.length = 1 := hi.after (Or.inl hd)
+    -- Ready is neither pending nor decided.
+    refine ⟨fun h => ?_, fun _ => hl, hi.holder⟩
+    -- Ready is neither pending nor decided.
+    rcases h with h | h <;> cases h
+
+/-- **The invariant holds after any number of steps.** -/
+theorem dsteps_inv {k k' : Ticket}
+    -- Steps from `k` to `k'`.
+    (h : DSteps k k')
+    -- The invariant holds at `k`.
+    (hi : DInv k) :
+    -- Then:
+    DInv k' := by
+  -- By induction on the steps.
+  induction h with
+  -- No step: the same state.
+  | refl => exact hi
+  -- Steps, then one more: the last step keeps it.
+  | tail _ hs ih => exact dstep_inv ih hs
+
+/-- **An outcome is delivered at most once, and exactly once when the
+ticket is ready**, however many paths (the poll, the drop, the fallback)
+try. TLA+: `AtMostOnce` and `ExactlyOnce` (`TxnCallbacks.tla`, with
+`MC_TxnCallbacks_Red_DeliverNoClaim` as the RED). Rules out: the poll and
+the queue's drop both running A's `on_commit`. -/
+theorem delivered_once {t : Nat} {k : Ticket}
+    -- `k` is reachable from a fresh ticket.
+    (h : DSteps ⟨t, .pending, []⟩ k) :
+    -- Then:
+    k.ran.length ≤ 1 ∧ (k.st = .ready → k.ran.length = 1) := by
+  -- The invariant of `k`.
+  have hi := dsteps_inv h (dinv_init t)
+  -- The second half is one field.
+  refine ⟨?_, fun hr => hi.after (Or.inr hr)⟩
+  -- Every state is before or after the claim; count the runs in each.
+  cases hs : k.st with
+  -- Pending: no run.
+  | pending => simp [hi.before (Or.inl hs)]
+  -- Decided: no run.
+  | decided => simp [hi.before (Or.inr hs)]
+  -- Delivering: one run.
+  | delivering => simp [hi.after (Or.inl hs)]
+  -- Ready: one run.
+  | ready => simp [hi.after (Or.inr hs)]
+
+/-- **Every delivery runs on the thread that holds the commit's queue**,
+never on a committer. TLA+: `OnCommittingThread`, with
+`MC_TxnCallbacks_Red_HelperDelivers` as the RED. Rules out: thread B, which
+landed A's group, running A's `on_commit` on B. -/
+theorem delivered_on_queue_thread {t : Nat} {k : Ticket}
+    -- `k` is reachable from a fresh ticket.
+    (h : DSteps ⟨t, .pending, []⟩ k)
+    -- A run of the outcome callbacks.
+    {r : Runner} (hr : r ∈ k.ran) :
+    -- Then:
+    ∃ q, r = .holder q :=
+  -- One field of the invariant.
+  (dsteps_inv h (dinv_init t)).holder r hr
+
+/-! ### RED: delivering without the claim
+
+The bug: a deliverer checks that the outcome is decided and runs the
+callbacks, but does not CAS the state word, so a second path delivers
+too. -/
+
+/-- The broken deliver: the outcome stays decided. -/
+def deliverNoClaim (k : Ticket) : Ticket :=
+  -- One more run by the holder; the state word is left as it was.
+  { k with ran := .holder k.holder :: k.ran }
+
+/-- **RED: without the claim an outcome is delivered twice.** The poll and
+the queue's drop both find the outcome decided and both run its
+callbacks. TLA+: `MC_TxnCallbacks_Red_DeliverNoClaim` breaks `AtMostOnce`. -/
+theorem no_claim_delivers_twice :
+    -- Two broken deliveries of a decided outcome make two runs.
+    (deliverNoClaim (deliverNoClaim ⟨1, .decided, []⟩)).ran.length = 2 := by
+  -- Two runs, one per broken delivery.
+  rfl
 
 end Regolith.Callbacks
