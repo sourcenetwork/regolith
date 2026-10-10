@@ -318,7 +318,14 @@ loom-cache:
 loom-tombstones:
     RUSTFLAGS="--cfg loom" cargo test --release --test loom_range_tombstones
 
-loom-all: loom loom-debug loom-sync loom-io loom-snapshots loom-view loom-cache loom-tombstones
+# Loom models for the open-file slot table (acquire, evict, release, drain)
+# and the column-family registry (create, drop and use racing in the
+# ordered step), with three calibrations that must fail. Release, like
+# `loom-io`.
+loom-tables:
+    RUSTFLAGS="--cfg loom" cargo test --release --test loom_tables
+
+loom-all: loom loom-debug loom-sync loom-io loom-snapshots loom-view loom-cache loom-tombstones loom-tables
 
 # The read-view chaos workload at full size: 6 instances x 2 rounds x 400
 # versions. Measured at over 20 minutes wall and 4h of CPU unoptimized,
@@ -717,6 +724,32 @@ tla:
     check MC_TombstoneLog_Green                        GREEN
     check MC_TombstoneLog_Red_LenFirst                 RED PrefixWhole
     check MC_TombstoneLog_Red_HorizonFirst             RED PublishedSeen
+    # 4.6, Phase 7c1: the open-file slot table under max_open_files. Lean:
+    # Regolith/OpenFileTable.lean, open_le_cap, never_closes_in_use,
+    # reads_own_file.
+    spec=OpenFileTable
+    check MC_OpenFileTable_Green                       GREEN
+    check MC_OpenFileTable_Green_TwoSlots              GREEN
+    check MC_OpenFileTable_Red_IgnoreReaders           RED NeverClosedInUse
+    check MC_OpenFileTable_Red_NoOwnerRecheck          RED ReadsOwnFile
+    check MC_OpenFileTable_Red_OutsideTable            RED AtMostCap
+    # 4.6, Phase 7c1: column-family create, drop and use, fenced in the
+    # ordered step. Lean: Regolith/CfRegistry.lean, no_write_after_drop,
+    # no_write_before_birth, life_in_order.
+    spec=CfRegistry
+    check MC_CfRegistry_Green                          GREEN
+    check MC_CfRegistry_Red_FenceOutside               RED NoWriteAfterDrop
+    check MC_CfRegistry_Red_RetireLate                 RED NoWriteAfterDrop
+    check MC_CfRegistry_Red_ReuseId                    RED LifeInOrder
+    # 4.6, Phase 7c1: the env file maps, positional reads and lock-free
+    # in-memory files. Lean: Regolith/EnvFiles.lean, positional_reads_own,
+    # current_holds_finished, read_sees_finished.
+    spec=EnvFiles
+    check MC_EnvFiles_Green                            GREEN
+    check MC_EnvFiles_Green_ThreeWriters               GREEN
+    check MC_EnvFiles_Red_SharedCursor                 RED ReadsOwnBytes
+    check MC_EnvFiles_Red_NoFreeze                     RED CurrentHoldsFinished
+    check MC_EnvFiles_Red_StaleFrozen                  RED CurrentHoldsFinished
     rm -rf states ./*_TTrace_*.tla ./*_TTrace_*.bin
     exit $fail
 

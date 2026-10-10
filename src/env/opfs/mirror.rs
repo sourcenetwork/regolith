@@ -21,17 +21,23 @@
 //! and `\` becomes `%5C`. Every mirror file carries the `.regolith-file-`
 //! prefix so a mirror database and a slot pool can share one directory.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
+use kovan_map::HashMap;
+
+use crate::env::mem_file::{Charge, MemFile};
 use crate::env::persist_order::persist_rank;
-use crate::sync::internal::Mutex;
+use crate::portability::{AtomicU64, AtomicUsize, Ordering};
 use wasm_bindgen::JsValue;
 
 use super::js;
 
 const FILE_PREFIX: &str = ".regolith-file-";
+
+/// Buckets each map starts with; they grow on demand.
+const BUCKETS: usize = 64;
 
 /// Escape a logical path into a single OPFS entry name.
 fn encode_name(path: &Path) -> String {
@@ -77,28 +83,91 @@ fn decode_name(name: &str) -> Option<PathBuf> {
 /// version that made it dirty, and the bytes to send.
 type PendingWrite = (PathBuf, u64, Vec<u8>);
 
+/// One mirrored file: its bytes, read without a lock, and the versions
+/// that say whether `persist` still owes it a write.
 struct Entry {
-    data: Vec<u8>,
-    /// Bumped on every mutation so [`MirrorFs::take_persist_batch`] can
-    /// tell a file that was re-dirtied during the await from one that
-    /// was not.
-    version: u64,
+    data: MemFile,
+    /// The version of the last mutation: every mutation takes a fresh one
+    /// from [`MirrorFs::next_version`].
+    version: AtomicU64,
+    /// The newest version `persist` wrote out. The file is dirty while
+    /// `version` is above it, so a mutation that lands during a persist's
+    /// await keeps it dirty.
+    persisted: AtomicU64,
 }
 
-struct State {
-    files: HashMap<PathBuf, Entry>,
-    dirs: BTreeSet<PathBuf>,
-    dirty: HashSet<PathBuf>,
-    deleted: HashSet<PathBuf>,
-    resident: usize,
-    next_version: u64,
+impl Entry {
+    fn new(data: MemFile, version: u64, persisted: u64) -> Arc<Self> {
+        Arc::new(Self {
+            data,
+            version: AtomicU64::new(version),
+            persisted: AtomicU64::new(persisted),
+        })
+    }
+
+    fn touch(&self, version: u64) {
+        self.version.fetch_max(version, Ordering::AcqRel);
+    }
+
+    fn is_dirty(&self) -> bool {
+        self.version.load(Ordering::Acquire) > self.persisted.load(Ordering::Acquire)
+    }
 }
 
 /// The in-memory mirror of an OPFS-backed database.
+///
+/// Every map is a lock-free kovan map and every file a lock-free
+/// `MemFile`, so no call takes a lock. A browser module runs this on one
+/// thread, where the persist's `await`s are the only interleaving; the
+/// atomics keep it correct beyond that too.
 pub(super) struct MirrorFs {
-    state: Mutex<State>,
-    max_resident: usize,
+    files: HashMap<PathBuf, Arc<Entry>>,
+    dirs: HashMap<PathBuf, ()>,
+    /// Paths removed since the last persist, whose OPFS entries persist
+    /// deletes after it writes the batch.
+    deleted: HashMap<PathBuf, ()>,
+    resident: Resident,
+    next_version: AtomicU64,
     mount: super::sah::MountId,
+}
+
+/// The bytes the mirror holds, bounded by `max`.
+struct Resident {
+    bytes: AtomicUsize,
+    max: usize,
+}
+
+impl Resident {
+    fn quota_error(&self, want: usize) -> io::Error {
+        io::Error::other(format!(
+            "OPFS mirror mode holds the whole database in memory and this write \
+             would reach {want} bytes, over the {} byte limit; raise \
+             OpfsOptions::max_resident_bytes or open the database in a worker, \
+             where OpfsMode::Sah streams to storage instead",
+            self.max
+        ))
+    }
+}
+
+impl Charge for Resident {
+    fn reserve(&self, bytes: u64) -> io::Result<()> {
+        let bytes = usize::try_from(bytes).unwrap_or(usize::MAX);
+        self.bytes
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |held| {
+                held.checked_add(bytes).filter(|want| *want <= self.max)
+            })
+            .map(|_| ())
+            .map_err(|held| self.quota_error(held.saturating_add(bytes)))
+    }
+
+    fn release(&self, bytes: u64) {
+        let bytes = usize::try_from(bytes).unwrap_or(usize::MAX);
+        let _ = self
+            .bytes
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |held| {
+                Some(held.saturating_sub(bytes))
+            });
+    }
 }
 
 impl Drop for MirrorFs {
@@ -109,18 +178,16 @@ impl Drop for MirrorFs {
 
 impl std::fmt::Debug for MirrorFs {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // `try_lock` so formatting an error while the state is held
-        // cannot deadlock a single-threaded module.
-        let mut out = f.debug_struct("MirrorFs");
-        match self.state.try_lock() {
-            Some(state) => out
-                .field("files", &state.files.len())
-                .field("resident_bytes", &state.resident),
-            None => out.field("state", &"locked"),
-        }
-        .field("max_resident_bytes", &self.max_resident)
-        .finish()
+        f.debug_struct("MirrorFs")
+            .field("files", &self.files.len())
+            .field("resident_bytes", &self.resident_bytes())
+            .field("max_resident_bytes", &self.resident.max)
+            .finish()
     }
+}
+
+fn removed_while_open() -> io::Error {
+    io::Error::new(io::ErrorKind::NotFound, "file was removed while open")
 }
 
 impl MirrorFs {
@@ -130,24 +197,25 @@ impl MirrorFs {
         loaded: Vec<(PathBuf, Vec<u8>)>,
         max_resident: usize,
     ) -> Self {
-        let mut state = State {
-            files: HashMap::with_capacity(loaded.len()),
-            dirs: BTreeSet::new(),
-            dirty: HashSet::new(),
-            deleted: HashSet::new(),
-            resident: 0,
-            next_version: 1,
+        let fs = Self {
+            files: HashMap::with_capacity(BUCKETS.max(loaded.len())),
+            dirs: HashMap::with_capacity(BUCKETS),
+            deleted: HashMap::with_capacity(BUCKETS),
+            resident: Resident {
+                bytes: AtomicUsize::new(0),
+                max: max_resident,
+            },
+            next_version: AtomicU64::new(1),
+            mount,
         };
         for (path, data) in loaded {
-            state.resident += data.len();
-            super::register_ancestors(&mut state.dirs, &path);
-            state.files.insert(path, Entry { data, version: 0 });
+            fs.resident.bytes.fetch_add(data.len(), Ordering::Relaxed);
+            super::register_ancestors(&fs.dirs, &path);
+            // Loaded from storage: persisted as it is.
+            fs.files
+                .insert(path, Entry::new(MemFile::from_vec(data), 0, 0));
         }
-        Self {
-            state: Mutex::new(state),
-            max_resident,
-            mount,
-        }
+        fs
     }
 
     /// Read every mirror file out of an OPFS directory.
@@ -164,51 +232,53 @@ impl MirrorFs {
     }
 
     pub(super) fn resident_bytes(&self) -> usize {
-        self.state.lock().resident
+        self.resident.bytes.load(Ordering::Acquire)
     }
 
     pub(super) fn pending_bytes(&self) -> usize {
-        let state = self.state.lock();
-        state
-            .dirty
-            .iter()
-            .filter_map(|path| state.files.get(path))
-            .map(|entry| entry.data.len())
+        self.files
+            .values()
+            .filter(|entry| entry.is_dirty())
+            .map(|entry| entry.data.len() as usize)
             .sum()
     }
 
-    /// Snapshot the work `persist` has to do, releasing the lock before
-    /// any `await`. The writes come tables first and the MANIFEST last
-    /// (`persist_order`), and `persist` deletes only after writing, so a
-    /// batch cut short never leaves a manifest naming a table it lost.
+    fn version(&self) -> u64 {
+        self.next_version.fetch_add(1, Ordering::AcqRel)
+    }
+
+    /// Snapshot the work `persist` has to do; nothing is held across any
+    /// `await`. The writes come tables first and the MANIFEST last
+    /// (`persist_order`, E20), and `persist` deletes only after writing, so
+    /// a batch cut short never leaves a manifest naming a table it lost.
     fn take_persist_batch(&self) -> (Vec<PendingWrite>, Vec<PathBuf>) {
-        let state = self.state.lock();
-        let mut writes: Vec<PendingWrite> = state
-            .dirty
+        let mut writes: Vec<PendingWrite> = self
+            .files
             .iter()
-            .filter_map(|path| {
-                state
-                    .files
-                    .get(path)
-                    .map(|entry| (path.clone(), entry.version, entry.data.clone()))
+            .filter(|(_, entry)| entry.is_dirty())
+            .map(|(path, entry)| {
+                // The version before the bytes: a mutation between the two
+                // makes the bytes newer than the version, never older, so
+                // the file stays dirty and is written again.
+                let version = entry.version.load(Ordering::Acquire);
+                (path, version, entry.data.to_vec())
             })
             .collect();
         writes.sort_by_key(|(path, _, _)| persist_rank(path));
-        let deletes = state.deleted.iter().cloned().collect();
+        let deletes = self.deleted.keys().collect();
         (writes, deletes)
     }
 
-    /// Clear the tracking entries that `persist` actually wrote out. A
-    /// file mutated while the write was in flight keeps its dirty mark.
+    /// Record what `persist` actually wrote out. A file mutated while the
+    /// write was in flight has a newer version and stays dirty.
     fn settle(&self, written: &[(PathBuf, u64)], deleted: &[PathBuf]) {
-        let mut state = self.state.lock();
         for (path, version) in written {
-            if state.files.get(path).map(|e| e.version) == Some(*version) {
-                state.dirty.remove(path);
+            if let Some(entry) = self.files.get(path) {
+                entry.persisted.fetch_max(*version, Ordering::AcqRel);
             }
         }
         for path in deleted {
-            state.deleted.remove(path);
+            self.deleted.remove(path);
         }
     }
 
@@ -237,178 +307,105 @@ impl MirrorFs {
         Ok(())
     }
 
-    fn quota_error(&self, want: usize) -> io::Error {
-        io::Error::other(format!(
-            "OPFS mirror mode holds the whole database in memory and this write \
-             would reach {want} bytes, over the {} byte limit; raise \
-             OpfsOptions::max_resident_bytes or open the database in a worker, \
-             where OpfsMode::Sah streams to storage instead",
-            self.max_resident
-        ))
+    fn entry(&self, path: &Path) -> io::Result<Arc<Entry>> {
+        self.files.get(path).ok_or_else(removed_while_open)
     }
 
     pub(super) fn write_at(&self, path: &Path, at: u64, buf: &[u8]) -> io::Result<()> {
-        let mut state = self.state.lock();
-        let at = at as usize;
-        let entry = state.files.get(path).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotFound, "file was removed while open")
-        })?;
-        let old_len = entry.data.len();
-        let new_len = old_len.max(at.saturating_add(buf.len()));
-        let projected = state.resident.saturating_sub(old_len) + new_len;
-        if projected > self.max_resident {
-            return Err(self.quota_error(projected));
-        }
-
-        let version = state.next_version;
-        state.next_version += 1;
-        let entry = state.files.get_mut(path).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotFound, "file was removed while open")
-        })?;
-        if entry.data.len() < new_len {
-            entry.data.resize(new_len, 0);
-        }
-        entry.data[at..at + buf.len()].copy_from_slice(buf);
-        entry.version = version;
-        state.resident = projected;
-        state.dirty.insert(path.to_path_buf());
+        let entry = self.entry(path)?;
+        let version = self.version();
+        entry.data.write_at(at, buf, &self.resident)?;
+        entry.touch(version);
         Ok(())
     }
 
     pub(super) fn read_at(&self, path: &Path, at: u64, buf: &mut [u8]) -> io::Result<usize> {
-        let state = self.state.lock();
-        let entry = state.files.get(path).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotFound, "file was removed while open")
-        })?;
-        let at = at as usize;
-        if at >= entry.data.len() {
-            return Ok(0);
-        }
-        let n = buf.len().min(entry.data.len() - at);
-        buf[..n].copy_from_slice(&entry.data[at..at + n]);
-        Ok(n)
+        Ok(self.entry(path)?.data.read_at(at, buf))
     }
 
     pub(super) fn file_len(&self, path: &Path) -> io::Result<u64> {
-        let state = self.state.lock();
-        state
-            .files
-            .get(path)
-            .map(|entry| entry.data.len() as u64)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "file was removed while open"))
+        Ok(self.entry(path)?.data.len())
     }
 
     pub(super) fn set_len(&self, path: &Path, len: u64) -> io::Result<()> {
-        let mut state = self.state.lock();
-        let version = state.next_version;
-        state.next_version += 1;
-        let entry = state.files.get_mut(path).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotFound, "file was removed while open")
-        })?;
-        let old_len = entry.data.len();
-        let len = len as usize;
-        entry.data.resize(len, 0);
-        entry.version = version;
-        state.resident = state.resident.saturating_sub(old_len) + len;
-        state.dirty.insert(path.to_path_buf());
+        let entry = self.entry(path)?;
+        let version = self.version();
+        entry.data.set_len(len, &self.resident)?;
+        entry.touch(version);
         Ok(())
     }
 
     /// Create the file when absent, optionally emptying it first.
     /// Returns the resulting length.
     pub(super) fn create(&self, path: &Path, truncate: bool) -> io::Result<u64> {
-        let mut state = self.state.lock();
-        let version = state.next_version;
-        state.next_version += 1;
-        let old_len = state.files.get(path).map(|entry| entry.data.len());
-        match state.files.get_mut(path) {
-            Some(entry) if truncate => {
-                entry.data.clear();
-                entry.version = version;
-            }
-            Some(_) => {}
-            None => {
-                state.files.insert(
-                    path.to_path_buf(),
-                    Entry {
-                        data: Vec::new(),
-                        version,
-                    },
-                );
-            }
-        }
-        let len = match (old_len, truncate) {
-            (Some(old), true) => {
-                state.resident = state.resident.saturating_sub(old);
-                0
-            }
-            (Some(old), false) => old,
-            (None, _) => 0,
+        let version = self.version();
+        let entry = match self.files.get(path) {
+            Some(entry) => entry,
+            None => self
+                .files
+                .get_or_insert(path.to_path_buf(), Entry::new(MemFile::new(), version, 0)),
         };
-        state.dirty.insert(path.to_path_buf());
-        state.deleted.remove(path);
-        super::register_ancestors(&mut state.dirs, path);
-        Ok(len as u64)
+        if truncate {
+            entry.data.set_len(0, &self.resident)?;
+        }
+        entry.touch(version);
+        self.deleted.remove(path);
+        super::register_ancestors(&self.dirs, path);
+        Ok(entry.data.len())
     }
 
     pub(super) fn create_dir_all(&self, path: &Path) -> io::Result<()> {
-        let mut state = self.state.lock();
-        state.dirs.insert(path.to_path_buf());
-        super::register_ancestors(&mut state.dirs, path);
+        self.dirs.insert(path.to_path_buf(), ());
+        super::register_ancestors(&self.dirs, path);
         Ok(())
     }
 
     pub(super) fn exists(&self, path: &Path) -> bool {
-        let state = self.state.lock();
-        state.files.contains_key(path) || state.dirs.contains(path)
+        self.files.contains_key(path) || self.dirs.contains_key(path)
     }
 
     pub(super) fn metadata(&self, path: &Path) -> io::Result<(u64, bool)> {
-        let state = self.state.lock();
-        if let Some(entry) = state.files.get(path) {
-            return Ok((entry.data.len() as u64, false));
+        if let Some(entry) = self.files.get(path) {
+            return Ok((entry.data.len(), false));
         }
-        if state.dirs.contains(path) {
+        if self.dirs.contains_key(path) {
             return Ok((0, true));
         }
         Err(super::not_found(path))
     }
 
     pub(super) fn read_dir(&self, path: &Path) -> io::Result<Vec<(PathBuf, bool)>> {
-        let state = self.state.lock();
-        if !state.dirs.contains(path) {
+        if !self.dirs.contains_key(path) {
             return Err(super::not_found(path));
         }
-        Ok(super::children(path, state.files.keys(), state.dirs.iter()))
+        Ok(super::children(path, self.files.keys(), self.dirs.keys()))
     }
 
     pub(super) fn remove_file(&self, path: &Path) -> io::Result<()> {
-        let mut state = self.state.lock();
-        match state.files.remove(path) {
-            Some(entry) => {
-                state.resident = state.resident.saturating_sub(entry.data.len());
-                state.dirty.remove(path);
-                state.deleted.insert(path.to_path_buf());
-                Ok(())
-            }
-            None => Err(super::not_found(path)),
-        }
+        let entry = self
+            .files
+            .remove(path)
+            .ok_or_else(|| super::not_found(path))?;
+        self.resident.release(entry.data.len());
+        self.deleted.insert(path.to_path_buf(), ());
+        Ok(())
     }
 
     pub(super) fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
-        let mut state = self.state.lock();
-        let entry = state
+        if from == to {
+            return self.entry(from).map(|_| ());
+        }
+        let entry = self
             .files
             .remove(from)
             .ok_or_else(|| super::not_found(from))?;
-        if let Some(replaced) = state.files.insert(to.to_path_buf(), entry) {
-            state.resident = state.resident.saturating_sub(replaced.data.len());
+        entry.touch(self.version());
+        if let Some(replaced) = self.files.insert(to.to_path_buf(), entry) {
+            self.resident.release(replaced.data.len());
         }
-        state.dirty.remove(from);
-        state.deleted.insert(from.to_path_buf());
-        state.dirty.insert(to.to_path_buf());
-        state.deleted.remove(to);
-        super::register_ancestors(&mut state.dirs, to);
+        self.deleted.insert(from.to_path_buf(), ());
+        self.deleted.remove(to);
+        super::register_ancestors(&self.dirs, to);
         Ok(())
     }
 }

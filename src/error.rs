@@ -157,8 +157,13 @@ impl Error {
         match self {
             Self::Io(io) | Self::Corruption(io) => io,
             Self::BackgroundFailed { source, .. } => source,
-            Self::InvalidArgument(message) | Self::InvalidColumnFamily(message) => {
+            Self::InvalidArgument(message) => {
                 std::io::Error::new(std::io::ErrorKind::InvalidInput, message)
+            }
+            // Carried typed, so a write the commit leader refuses for a
+            // dropped family reaches the caller as this variant.
+            typed @ Self::InvalidColumnFamily(_) => {
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, typed)
             }
             Self::ReadOnly => {
                 std::io::Error::new(std::io::ErrorKind::PermissionDenied, Self::ReadOnly)
@@ -192,6 +197,7 @@ fn carried(err: &std::io::Error) -> Option<Error> {
             max_data_block_bytes: *max_data_block_bytes,
         }),
         Error::Closed => Some(Error::Closed),
+        Error::InvalidColumnFamily(message) => Some(Error::InvalidColumnFamily(message.clone())),
         Error::ReadOnly => Some(Error::ReadOnly),
         Error::Busy(reason) => Some(Error::Busy(reason)),
         Error::ContentMismatch => Some(Error::ContentMismatch),

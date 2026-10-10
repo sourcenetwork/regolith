@@ -546,6 +546,11 @@ pub(crate) struct RegolithEngine {
     /// the list with [`SnapshotRegistry::live_seqs`] once its inputs are
     /// fixed.
     snapshot_registry: Arc<SnapshotRegistry>,
+    /// The database's column-family registry, attached by `Db::open` before
+    /// the first write. The commit leader fences every write against it in
+    /// the ordered step (`commit::families`); an engine with none fences
+    /// nothing. Read with one atomic load once set.
+    families: std::sync::OnceLock<Arc<crate::column_family::CfRegistry>>,
     options: EngineOptions,
     /// Bounded ring of writers waiting for a commit group. Writers push a
     /// ticket here and park; they never block on `pipeline`, which is what
@@ -778,6 +783,7 @@ impl RegolithEngine {
             compaction: Mutex::new(compaction),
             compaction_lock,
             snapshot_registry,
+            families: std::sync::OnceLock::new(),
             stall_policy: options.stall_policy(),
             has_worker,
             background_owed: AtomicBool::new(false),
@@ -930,6 +936,7 @@ impl RegolithEngine {
             // so this policy can only ever produce an error, never a
             // wait that nobody will end.
             stall_policy: StallPolicy::CompactInline,
+            families: std::sync::OnceLock::new(),
             has_worker: false,
             background_owed: AtomicBool::new(false),
             options,

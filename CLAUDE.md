@@ -67,7 +67,7 @@ src/
 ├── backup.rs           # BackupEngine: backups, metadata sealed through the KeyProvider (D57), restore
 ├── backup/             # format.rs: the .backup metadata, plain (version 3) and sealed (version 4)
 ├── checkpoint.rs       # Hardlinked checkpoint creation
-├── column_family.rs    # Column-family handles and descriptors
+├── column_family.rs    # Column-family handles, descriptors, and the lock-free registry
 ├── conflict.rs         # Conflict reasons: Conflict, Access, WriteKind
 ├── encryption.rs       # Encryption at rest: KeyProvider, KeyId, KeyMaterial
 ├── error.rs            # Error enum, Result alias
@@ -98,11 +98,14 @@ src/
 │   ├── waiter.rs       # Waiter nodes, their free list, the wake list
 │   └── internal.rs     # The engine's private std/loom atomics, Mutex, RwLock, Condvar and Gate
 ├── txn_buffer.rs       # Concurrent write and read-set buffer of one transaction
-├── env/                # Env trait and backends: StdEnv, MemEnv, WASI, OPFS; db_lock.rs, open_file_limit.rs
+├── env/                # Env trait and backends: StdEnv, MemEnv, WASI, OPFS; db_lock.rs
+│   ├── mem_file.rs     # Lock-free in-memory file behind MemEnv and the OPFS mirror
+│   └── open_file_limit/ # max_open_files: lock-free slot table (slots.rs), rename-aside removal
 └── engine/
     ├── mod.rs          # RegolithEngine orchestration, read paths, rotation, recovery
     ├── commit/         # Group commit pipeline: ring, bounded leader, transaction members decided in
-    │                   # group order (group.rs, txn.rs), the check up to a horizon (early.rs), stall signal
+    │                   # group order (group.rs, txn.rs), the check up to a horizon (early.rs), stall signal,
+    │                   # the column-family fence in the ordered step (families.rs)
     ├── flush.rs        # Writing a frozen memtable to L0, shared with the compaction workers
     ├── background_step.rs # Flushes off the commit path; the bounded step a write owes with no worker
     ├── stall_state.rs  # Write-stall thresholds and the level writers cache

@@ -63,7 +63,7 @@
 //! |---|---|---|
 //! | `xxhash-rust` | already `#![no_std]` | none |
 //! | `lru` | already `#![no_std]`, hashbrown-backed | none |
-//! | `rustix` | already `cfg(unix)`-gated | none |
+//! | `rustix` | already gated to Unix and WASI | none |
 //! | `tracing` | `no_std` via `default-features = false` | low |
 //! | `lz4_flex` | `no_std` covers the block format, which is all regolith uses | low: `default-features = false` |
 //! | `thiserror` 1.0 | no `no_std` support | medium: bump to 2.x |
@@ -90,5 +90,5 @@
 //! its releases wake; none of them on a condvar.
 
 pub(crate) use portable_atomic::{
-    AtomicBool, AtomicPtr, AtomicU8, AtomicU64, AtomicUsize, Ordering,
+    AtomicBool, AtomicPtr, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering,
 };

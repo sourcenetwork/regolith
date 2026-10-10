@@ -107,3 +107,15 @@ import Regolith.ClockCache
 -- a whole prefix of the appends, including every one a snapshot they took
 -- includes. Backs `proofs/tla/TombstoneLog.tla`.
 import Regolith.TombstoneLog
+-- 4.6, Phase 7c1: the open-file slot table under max_open_files. Never
+-- more open files than slots, never a file closed under a reader, and a
+-- read returns its own table. Backs `proofs/tla/OpenFileTable.tla`.
+import Regolith.OpenFileTable
+-- 4.6, Phase 7c1: column families created and dropped in the ordered step.
+-- No write lands after its family's tombstone or before its birth, and a
+-- family's life only moves forward. Backs `proofs/tla/CfRegistry.tla`.
+import Regolith.CfRegistry
+-- 4.6, Phase 7c1: the env file maps. A positional read gets its own
+-- offset's bytes, and an in-memory read sees every append that finished
+-- before it began. Backs `proofs/tla/EnvFiles.tla`.
+import Regolith.EnvFiles

@@ -154,8 +154,9 @@ pub mod loom_exports {
     //! them. It does not exist in an ordinary build.
 
     pub use crate::engine::loom_model::{
-        arena, handoff, io_queue, skiplist, slice, snapshots, tombstones, version,
+        arena, families, handoff, io_queue, skiplist, slice, snapshots, tombstones, version,
     };
+    pub use crate::env::open_file_limit::loom_model as open_files;
 }
 
 #[cfg(feature = "fuzzing")]
@@ -257,11 +258,7 @@ use std::sync::Arc;
 use engine::RegolithEngine;
 
 fn invalid_cf_handle_error(cf: &ColumnFamilyHandle) -> Error {
-    Error::invalid_column_family(format!(
-        "column family handle '{}' with id {} is not live",
-        cf.name(),
-        cf.id()
-    ))
+    column_family::invalid_handle_error(cf)
 }
 
 fn invalid_input_error(message: impl Into<String>) -> Error {
@@ -269,7 +266,7 @@ fn invalid_input_error(message: impl Into<String>) -> Error {
 }
 
 fn invalid_cf_id_error(cf_id: u32) -> Error {
-    Error::invalid_column_family(format!("column family id {cf_id} is not live"))
+    column_family::dropped_family_error(cf_id)
 }
 
 fn invalid_cf_id_io_error(cf_id: u32) -> std::io::Error {
@@ -455,6 +452,9 @@ impl Db {
             RegolithEngine::open(path.as_ref(), engine_opts)?
         };
         let cfs = Arc::new(CfRegistry::new());
+        // Attached before the first write, so the commit leader fences every
+        // write against the registry from the start.
+        engine.attach_families(Arc::clone(&cfs));
         let db = Self {
             engine,
             durability,
@@ -1095,8 +1095,8 @@ impl Db {
     }
 
     /// Check one prefixed key's column family, remembering the last id
-    /// found live so a run of ops in one column family takes the
-    /// registry lock once.
+    /// found live so a run of ops in one column family costs one registry
+    /// lookup.
     fn validate_prefixed_cf(&self, live: &mut Option<u32>, prefixed_key: &[u8]) -> Result<()> {
         let cf_id = prefixed_cf_id(prefixed_key).map_err(Error::from)?;
         if *live == Some(cf_id) {
@@ -1110,12 +1110,14 @@ impl Db {
     }
 
     fn validate_batch_cf_liveness(&self, batch: &WriteBatch) -> Result<()> {
-        // A batch is usually one column family, or a few long runs of one,
-        // and every distinct run still reaches the registry once. A drop
-        // that lands between two runs of the same id in one call is the
-        // same race the per-op form had: the lock was never held across the
-        // batch, so neither form promises more than "rejected or applied
-        // as a whole" for a drop that overlaps the write.
+        // The early check, at the API boundary: a batch naming a family
+        // already gone is refused before any work. A batch is usually one
+        // column family, or a few long runs of one, and every distinct run
+        // reaches the registry once. A drop that lands after this check is
+        // caught by the commit leader's fence in the ordered step
+        // (`engine::commit::families`), which refuses the batch whole, so a
+        // batch racing a drop is applied whole before the tombstone or
+        // refused whole, never split across it.
         let mut live = None;
         for op in &batch.ops {
             match op {
@@ -1771,7 +1773,11 @@ impl Db {
     /// returns the existing handle (idempotent).
     ///
     /// The new CF is persisted to the on-disk metadata before this
-    /// call returns, so it survives a crash and a reopen.
+    /// call returns, so it survives a crash and a reopen. It becomes
+    /// visible only once that write is committed, and concurrent creates
+    /// of one name return the same handle. Ids are never reused: a name
+    /// created again after a drop is a new family, and a handle to the
+    /// old one stays refused.
     pub fn create_column_family(&self, name: &str) -> Result<ColumnFamilyHandle> {
         self.ensure_writable()?;
         if name.is_empty() {
@@ -1783,25 +1789,14 @@ impl Db {
             return Ok(existing);
         }
         self.validate_prefixed_key_size(&meta::name_key(name))?;
-        // Before the allocation, so a write that cannot be admitted leaves
+        // Before the ordered step, so a write that cannot be admitted leaves
         // no name registered.
         self.wait_for_write_capacity(&WriteOptions::default())?;
-        let Some((handle, next_id)) = self.cfs.allocate(name) else {
-            return Err(Error::invalid_argument(
-                "the column-family id space is exhausted",
-            ));
-        };
-        let mut batch = BTreeMap::new();
-        batch.insert(
-            meta::name_key(name),
-            Some(handle.id().to_be_bytes().to_vec()),
-        );
-        batch.insert(meta::next_id_key(), Some(next_id.to_be_bytes().to_vec()));
+        // The id is drawn, persisted and published in one ordered step, so a
+        // racing create of the same name returns this family.
         self.engine
-            .apply_grouped_batch(batch, Vec::new(), Vec::new(), self.durability, false)
-            .map(|_| ())
-            .map_err(Error::from)?;
-        Ok(handle)
+            .create_family(name, self.durability)
+            .map_err(Error::from)
     }
 
     /// Drop a column family. Every key stored in the CF is removed
@@ -1812,6 +1807,13 @@ impl Db {
     ///
     /// Dropping the default column family is not allowed and
     /// returns an error.
+    ///
+    /// A write to the family that races the drop either commits before
+    /// it, and the range tombstone deletes it, or is refused with
+    /// [`Error::InvalidColumnFamily`]; it never lands after the
+    /// tombstone. Every later write, read or drop through a handle to the
+    /// family is refused the same way. Two drops of one family race to
+    /// one success.
     pub fn drop_column_family(&self, cf: ColumnFamilyHandle) -> Result<()> {
         self.ensure_writable()?;
         if cf.id() == DEFAULT_CF_ID {
@@ -1826,20 +1828,14 @@ impl Db {
         }
         self.validate_cf_handle(&cf)?;
         self.wait_for_write_capacity(&WriteOptions::default())?;
-        let lo = cf_lower_bound(cf.id());
-        let hi = cf_upper_bound(cf.id());
-        // Apply the data range-delete and the metadata entry
-        // removal in a single atomic batch so a crash mid-drop
-        // either leaves the CF fully present or fully removed.
-        let mut point_ops = BTreeMap::new();
-        point_ops.insert(meta::name_key(cf.name()), None);
-        let range_deletes = vec![(lo, hi)];
+        // The range tombstone and the meta delete commit as one group, so a
+        // crash mid-drop leaves the CF fully present or fully removed, and
+        // the family is retired in the same ordered step: a write racing the
+        // drop is either deleted by the tombstone or refused, never committed
+        // after it.
         self.engine
-            .apply_grouped_batch(point_ops, range_deletes, Vec::new(), self.durability, false)
-            .map(|_| ())
-            .map_err(Error::from)?;
-        self.cfs.remove(cf.name());
-        Ok(())
+            .drop_family(&cf, self.durability)
+            .map_err(Error::from)
     }
 
     /// Read `key` from column family `cf`. Same semantics as
@@ -3245,6 +3241,9 @@ impl WriteBatch {
 
 #[cfg(test)]
 mod write_limit_tests;
+
+#[cfg(all(test, not(target_family = "wasm")))]
+mod cf_race_tests;
 
 #[cfg(test)]
 mod tests {
