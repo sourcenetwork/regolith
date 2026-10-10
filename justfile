@@ -583,6 +583,12 @@ tla:
     check MC_GroupCommit_Red_PublishBeforeSync         RED DurableBeforeVisible
     # E21, the bounded leader: one group per turn, then hand off.
     check MC_GroupCommit_Red_DrainAll                  RED BoundedTurn
+    # D53, the group fsync as a claimable job for commit_nowait members.
+    # Green_Nowait_Owes is the witness that the GREEN run leaves groups owed.
+    # Lean: Regolith/IoQueue.lean, group_sync_once, group_visible_after_sync.
+    check MC_GroupCommit_Green_Nowait                  GREEN
+    check MC_GroupCommit_Green_Nowait_Owes             RED NothingOwed
+    check MC_GroupCommit_Red_DoubleClaim               RED SingleSync
     # 4.7, the lock-free commit pipeline. Lean: Regolith/Pipeline.lean,
     # seqs_dense and reader_sees_published.
     spec=CommitPipeline
@@ -605,6 +611,17 @@ tla:
     check MC_NonBlocking_Red_DoubleRun                 RED SingleRun
     check MC_NonBlocking_Red_SelfIoNowhere             RED NoOrphanUnit
     check MC_NonBlocking_Red_BusyWoken                 RED BusyNeverWoken
+    # D53, the commit side's units: a group's fsync claimed by one member's
+    # poll and told to every member's own queue, and a stall's passive unit
+    # landed by its clearer or by a writer's second look. Lean:
+    # Regolith/IoQueue.lean, group_sync_once, group_visible_after_sync,
+    # ticket_ready_only_at_own_poll, stall_lands_when_clear.
+    check MC_NonBlocking_Green_Commit                  GREEN
+    check MC_NonBlocking_Green_Stall                   GREEN
+    check MC_NonBlocking_Red_DoubleSync                RED SingleRun
+    check MC_NonBlocking_Red_PublishAtWrite            RED VisibleAfterSync
+    check MC_NonBlocking_Red_DeliverOnLander           RED DeliveredOnOwnPoll
+    check MC_NonBlocking_Red_NoRecheck                 RED StallLandsWhenClear
     # regolith::sync's locks after D49: barging with bounded bypass, for
     # Mutex, Semaphore and ReentrantMutex. Lean: Regolith/Sync.lean,
     # mutual_exclusion, bounded_bypass, owed_exclusive.
@@ -654,15 +671,17 @@ tla:
     check MC_SyncOnce_Red_PlainStore                   RED PublishedOnce
     check MC_SyncOnce_Red_NoRecheck                    RED NoLostWakeup
     check MC_SyncOnce_Red_ReparkStale                  RED NoLostWakeup
-    # Transaction callbacks (3.16). Lean: Regolith/Callbacks.lean,
-    # exactly_once, order, attempts_isolated.
+    # Transaction callbacks (3.16), delivered on the committing thread (D53).
+    # Lean: Regolith/Callbacks.lean, exactly_once, order, attempts_isolated,
+    # delivered_once, delivered_on_queue_thread.
     spec=TxnCallbacks
     check MC_TxnCallbacks_Green_Immediate              GREEN
     check MC_TxnCallbacks_Green_Eventual               GREEN
     check MC_TxnCallbacks_Red_CommitBeforeDurable      RED CommitAfterDurable
     check MC_TxnCallbacks_Red_SkipCallbackWrites       RED NoLostUpdate
     check MC_TxnCallbacks_Red_CallbacksSurvive         RED AttemptIsolation
-    check MC_TxnCallbacks_Red_HelperNoClaim            RED AtMostOnce
+    check MC_TxnCallbacks_Red_DeliverNoClaim           RED AtMostOnce
+    check MC_TxnCallbacks_Red_HelperDelivers           RED OnCommittingThread
     check MC_TxnCallbacks_Red_CloseNoClaim             RED AtMostOnce
     rm -rf states ./*_TTrace_*.tla ./*_TTrace_*.bin
     exit $fail

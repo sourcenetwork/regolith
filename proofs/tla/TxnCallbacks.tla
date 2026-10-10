@@ -1,8 +1,8 @@
 ---- MODULE TxnCallbacks ----
 \* Transaction callbacks (plan 3.16, D44): before_commit, on_commit,
 \* on_abort and the database-wide TransactionHooks, for transactions run by
-\* `transact` (3.10) and completed by a committer, a helping committer,
-\* `close` or the owner.
+\* `transact` (3.10) and completed on the committing thread (the queue's
+\* poll or drop), by `close` or by the owner.
 \*
 \* PROVED FOR EVERY SIZE in Lean, proofs/lean/Regolith/Callbacks.lean:
 \*   step_inv, reachable_inv   the outcome machine's invariant holds in
@@ -25,13 +25,28 @@
 \*   panic_aborts              a panic in before_commit ends the attempt
 \*                             aborted, with its on_abort run (PanicAborts)
 \*   surviving_callbacks_break_isolation   the RED case, as a counterexample
+\*   delivered_once            however many paths try to deliver a decided
+\*                             outcome, one CAS lets one of them run it
+\*                             (AtMostOnce here, for the delivery paths)
+\*   delivered_on_queue_thread every delivery runs on the thread that holds
+\*                             the commit's queue (OnCommittingThread here)
+\*   no_claim_delivers_twice   the RED case DeliverNoClaim, as a
+\*                             counterexample
 \* TLC checks the concurrent machine here: two transact calls, two
-\* committers that help each other, and close, for two attempts each.
+\* committers that decide and sync, the committing threads that deliver
+\* each outcome, and close, for two attempts each.
 \*
 \* THE DESIGN (plan 3.16).
 \*   - Exactly one outcome. For every transaction, exactly one of on_commit
 \*     or on_abort runs, once per registered callback, however the outcome
-\*     arrives: a ticket, a helping committer, close or a drop.
+\*     arrives: a ticket, close or a drop.
+\*   - On the committing thread (D53). A committed or conflicted outcome is
+\*     delivered, and its callbacks run, only on the thread that owns the
+\*     commit's queue: at that queue's poll, or when the queue is dropped
+\*     (on the dropping thread, which then holds it). Never on a committer
+\*     that decided it or synced it. Close runs only the on_abort of
+\*     transactions still open, on the closing thread; the owner's own
+\*     rollback, drop or error runs on the owner's thread.
 \*   - Order. At commit, the transaction's before_commit callbacks run, then
 \*     the database hooks', then validation; a write a callback makes is
 \*     part of the commit and is validated. After the outcome, the
@@ -50,9 +65,10 @@
 \*     by its owner's commit or to "aborted" by a rollback, a drop, an
 \*     error or close. Whoever loses the CAS runs nothing: a commit that
 \*     finds the transaction aborted by close returns Closed.
-\*   - The commit's outcome word: once the pipeline decides it, "decided"
-\*     is CAS'd once to "claimed" by the committer (or helping committer,
-\*     or I/O thread) that completes it; only the winner runs callbacks.
+\*   - The commit's outcome word (the ticket's Completion): once the
+\*     pipeline decides it, "decided" is CAS'd once to "claimed" by the path
+\*     that delivers it, the queue's poll or the queue's drop, both on the
+\*     queue holder's thread; only the winner runs callbacks.
 \*
 \* THE WORKLOAD. Each transaction's body writes a key of its own; its
 \* before_commit callback reads a shared counter at the transaction's
@@ -74,8 +90,9 @@
 \*
 \* CONFIGURATIONS.
 \*   MC_TxnCallbacks_Green_Immediate   two transact calls, two committers,
-\*                                     close, at Immediate: every invariant,
-\*                                     and everything settles.
+\*                                     delivery by poll or drop, close, at
+\*                                     Immediate: every invariant, and
+\*                                     everything settles.
 \*   MC_TxnCallbacks_Green_Eventual    the same at Eventual.
 \*   MC_TxnCallbacks_Red_CommitBeforeDurable  on_commit runs before the
 \*                                     fsync at Immediate: CommitAfterDurable.
@@ -85,8 +102,13 @@
 \*   MC_TxnCallbacks_Red_CallbacksSurvive     a conflicted attempt's
 \*                                     callbacks stay registered for the
 \*                                     re-run: AttemptIsolation.
-\*   MC_TxnCallbacks_Red_HelperNoClaim  completers do not claim the outcome:
-\*                                     two run it, AtMostOnce.
+\*   MC_TxnCallbacks_Red_DeliverNoClaim the poll and the drop deliver without
+\*                                     claiming the outcome: both run it,
+\*                                     AtMostOnce.
+\*   MC_TxnCallbacks_Red_HelperDelivers a committer delivers the outcome it
+\*                                     decided, as before D53: the callbacks
+\*                                     run off the committing thread,
+\*                                     OnCommittingThread.
 \*   MC_TxnCallbacks_Red_CloseNoClaim  close aborts without claiming the
 \*                                     transaction, and its commit goes on:
 \*                                     AtMostOnce.
@@ -103,7 +125,12 @@ CONSTANTS
 ASSUME MaxAttempts \in Nat \ {0}
 ASSUME Durability \in {"Immediate", "Eventual"}
 ASSUME Mutant \in {"none", "CommitBeforeDurable", "SkipCallbackWrites",
-                   "CallbacksSurvive", "HelperNoClaim", "CloseNoClaim"}
+                   "CallbacksSurvive", "DeliverNoClaim", "HelperDelivers",
+                   "CloseNoClaim"}
+
+\* The two ways a commit's outcome reaches its ticket, both on the thread
+\* that holds the commit's queue: that queue's poll, or the queue's drop.
+Paths == {"poll", "drop"}
 
 \* Attempt numbers.
 Attempts == 1..MaxAttempts
@@ -148,23 +175,27 @@ VARIABLES
   validated, \* [Owners -> [Attempts -> BOOLEAN]]: validation ran
   committed, \* [Owners -> [Attempts -> BOOLEAN]]: the attempt committed
   panicked,  \* [Owners -> [Attempts -> BOOLEAN]]: its before_commit panicked
-  ranFor     \* <<owner, callback's attempt, outcome's attempt>> for every run
+  ranFor,    \* <<owner, callback's attempt, outcome's attempt>> for every run
+  \* The delivery of each owner's outcome, per path.
+  dpc,       \* [Owners -> [Paths -> {"idle", "callbacks", "hooks"}]]: where it is
+  \* A ghost: who ran each set of outcome callbacks.
+  runBy      \* <<owner, runner>>: "poll", "drop", "owner", "closer" or "committer"
 
 \* Every variable, so a step that changes none of them is a stutter.
 vars == <<seq, durable, ctr, ctrSeq, closed, att, opc, ost, snap, readv, buf,
           vset, reg, ps, verdict, cseq, subq, cpc, ctarget, clpc, cltarget,
           clseen, ranC, ranA, hookC, hookA, beforeRan, hookBefore, validated,
-          committed, panicked, ranFor>>
+          committed, panicked, ranFor, runBy, dpc>>
 
 \* The ghosts, grouped so steps that leave them alone say so briefly.
 ghosts == <<ranC, ranA, hookC, hookA, beforeRan, hookBefore, validated,
-            committed, panicked, ranFor>>
+            committed, panicked, ranFor, runBy>>
 \* The owners' attempt state.
 owner == <<att, opc, ost, snap, readv, buf, vset, reg, ps, verdict, cseq>>
 \* The database words.
 db == <<seq, durable, ctr, ctrSeq, closed>>
 \* The committers' and the closer's state.
-workers == <<subq, cpc, ctarget, clpc, cltarget, clseen>>
+workers == <<subq, cpc, ctarget, clpc, cltarget, clseen, dpc>>
 
 ----------------------------------------------------------------------------
 \* Helpers.
@@ -176,13 +207,17 @@ Set2(g, x, a, v) == [g EXCEPT ![x][a] = v]
 Bump(g, x, B) == [g EXCEPT ![x] = [b \in Attempts |-> IF b \in B THEN g[x][b] + 1 ELSE g[x][b]]]
 
 \* Run the transaction's on_commit (kind "C") or on_abort (kind "A")
-\* callbacks: every callback it holds runs once, and each run is recorded
-\* with the attempt whose outcome it reports.
-RunCallbacks(x, kind) ==
+\* callbacks on the thread `who`: every callback it holds runs once, and
+\* each run is recorded with the attempt whose outcome it reports.
+RunCallbacks(x, kind, who) ==
+  \* The callbacks of the kind run, one more time each.
   /\ IF kind = "C"
        THEN ranC' = Bump(ranC, x, reg[x]) /\ UNCHANGED ranA
        ELSE ranA' = Bump(ranA, x, reg[x]) /\ UNCHANGED ranC
+  \* Each run is recorded with the outcome's attempt.
   /\ ranFor' = ranFor \cup {<<x, b, att[x]>> : b \in reg[x]}
+  \* And with the thread that ran it.
+  /\ runBy' = runBy \cup {<<x, who>>}
 
 \* Run the hooks' on_commit or on_abort for x's current attempt.
 RunHook(x, kind) ==
@@ -245,7 +280,7 @@ BeforeOk(x) ==
   /\ beforeRan' = Set2(beforeRan, x, att[x], TRUE)
   /\ opc' = [opc EXCEPT ![x] = "hook"]
   /\ UNCHANGED <<att, ost, snap, readv, vset, reg, ps, verdict, cseq, db, workers>>
-  /\ UNCHANGED <<ranC, ranA, hookC, hookA, hookBefore, validated, committed, panicked, ranFor>>
+  /\ UNCHANGED <<ranC, ranA, hookC, hookA, hookBefore, validated, committed, panicked, ranFor, runBy>>
 
 \* The transaction's before_commit panics: the commit fails with
 \* CallbackPanicked and the attempt goes to on_abort.
@@ -255,7 +290,7 @@ BeforePanic(x) ==
   /\ panicked' = Set2(panicked, x, att[x], TRUE)
   /\ opc' = [opc EXCEPT ![x] = "abortcb"]
   /\ UNCHANGED <<att, ost, snap, readv, buf, vset, reg, ps, verdict, cseq, db, workers>>
-  /\ UNCHANGED <<ranC, ranA, hookC, hookA, hookBefore, validated, committed, ranFor>>
+  /\ UNCHANGED <<ranC, ranA, hookC, hookA, hookBefore, validated, committed, ranFor, runBy>>
 
 \* The hooks' before_commit runs after the transaction's; then the write
 \* set to validate is fixed: every write the transaction holds, the
@@ -267,7 +302,7 @@ HookBefore(x) ==
   /\ vset' = [vset EXCEPT ![x] = IF Mutant = "SkipCallbackWrites" THEN {"own"} ELSE buf[x]]
   /\ opc' = [opc EXCEPT ![x] = "submit"]
   /\ UNCHANGED <<att, ost, snap, readv, buf, reg, ps, verdict, cseq, db, workers>>
-  /\ UNCHANGED <<ranC, ranA, hookC, hookA, beforeRan, validated, committed, panicked, ranFor>>
+  /\ UNCHANGED <<ranC, ranA, hookC, hookA, beforeRan, validated, committed, panicked, ranFor, runBy>>
 
 \* commit_nowait: submit to the pipeline, or, once close has begun, fail
 \* with Closed and go to on_abort (one atomic admission check).
@@ -280,12 +315,12 @@ Submit(x) ==
             /\ ps' = [ps EXCEPT ![x] = "queued"]
             /\ opc' = [opc EXCEPT ![x] = "waiting"]
   /\ UNCHANGED <<att, ost, snap, readv, buf, vset, reg, verdict, cseq, db>>
-  /\ UNCHANGED <<cpc, ctarget, clpc, cltarget, clseen, ghosts>>
+  /\ UNCHANGED <<cpc, ctarget, clpc, cltarget, clseen, dpc, ghosts>>
 
 \* The owner's thread runs the transaction's on_abort callbacks.
 OwnerAbortCallbacks(x) ==
   /\ opc[x] = "abortcb"
-  /\ RunCallbacks(x, "A")
+  /\ RunCallbacks(x, "A", "owner")
   /\ opc' = [opc EXCEPT ![x] = "aborthook"]
   /\ UNCHANGED <<att, ost, snap, readv, buf, vset, reg, ps, verdict, cseq, db, workers>>
   /\ UNCHANGED <<hookC, hookA, beforeRan, hookBefore, validated, committed, panicked>>
@@ -296,7 +331,66 @@ OwnerAbortHook(x) ==
   /\ RunHook(x, "A")
   /\ opc' = [opc EXCEPT ![x] = "done"]
   /\ UNCHANGED <<att, ost, snap, readv, buf, vset, reg, ps, verdict, cseq, db, workers>>
-  /\ UNCHANGED <<ranC, ranA, beforeRan, hookBefore, validated, committed, panicked, ranFor>>
+  /\ UNCHANGED <<ranC, ranA, beforeRan, hookBefore, validated, committed, panicked, ranFor, runBy>>
+
+\* The committing thread delivers its decided outcome along path p: its
+\* queue's poll takes the "done" note, or its queue is dropped and the drop
+\* delivers what the queue held. It claims the outcome with one CAS,
+\* "decided" to "claimed". A commit at Immediate is delivered only once
+\* durable (its group landed: synced, then applied and published). Mutant
+\* CommitBeforeDurable: at once. Mutant DeliverNoClaim: without the CAS, so
+\* the other path may deliver it too.
+Deliver(x, p) ==
+  \* The transaction waits for its ticket.
+  /\ opc[x] = "waiting"
+  \* The pipeline decided it.
+  /\ ps[x] = "decided"
+  \* This path is not delivering already.
+  /\ dpc[x][p] = "idle"
+  \* A conflict is told at once; a commit once its group landed.
+  /\ \/ verdict[x] = "conflict"
+     \/ Durability = "Eventual"
+     \/ durable >= cseq[x]
+     \/ Mutant = "CommitBeforeDurable"
+  \* The CAS: the outcome is claimed (the bug leaves it to be claimed again).
+  /\ ps' = [ps EXCEPT ![x] = IF Mutant = "DeliverNoClaim" THEN @ ELSE "claimed"]
+  \* This path runs the callbacks next.
+  /\ dpc' = [dpc EXCEPT ![x][p] = "callbacks"]
+  \* Nothing else changes.
+  /\ UNCHANGED <<db, att, opc, ost, snap, readv, buf, vset, reg, verdict, cseq>>
+  \* The pipeline, the committers and the closer are untouched.
+  /\ UNCHANGED <<subq, cpc, ctarget, clpc, cltarget, clseen, ghosts>>
+
+\* The delivering path runs the transaction's callbacks of the outcome's
+\* kind, on the committing thread.
+DeliverCallbacks(x, p) ==
+  \* This path claimed the outcome.
+  /\ dpc[x][p] = "callbacks"
+  \* The callbacks run here, recorded as run by this path.
+  /\ RunCallbacks(x, IF verdict[x] = "commit" THEN "C" ELSE "A", p)
+  \* The hooks are next.
+  /\ dpc' = [dpc EXCEPT ![x][p] = "hooks"]
+  \* Nothing else changes.
+  /\ UNCHANGED <<db, owner, subq, cpc, ctarget, clpc, cltarget, clseen>>
+  \* The other ghosts are untouched.
+  /\ UNCHANGED <<hookC, hookA, beforeRan, hookBefore, validated, committed, panicked>>
+
+\* Then the hooks', and the ticket is ready.
+DeliverHooks(x, p) ==
+  \* This path ran the callbacks.
+  /\ dpc[x][p] = "hooks"
+  \* The hooks' outcome runs.
+  /\ RunHook(x, IF verdict[x] = "commit" THEN "C" ELSE "A")
+  \* The ticket is ready.
+  /\ ps' = [ps EXCEPT ![x] = "resolved"]
+  \* The path is done.
+  /\ dpc' = [dpc EXCEPT ![x][p] = "idle"]
+  \* Nothing else changes.
+  /\ UNCHANGED <<db, att, opc, ost, snap, readv, buf, vset, reg, verdict, cseq>>
+  \* The pipeline, the committers and the closer are untouched.
+  /\ UNCHANGED <<subq, cpc, ctarget, clpc, cltarget, clseen>>
+  \* The other ghosts are untouched.
+  /\ UNCHANGED <<ranC, ranA, beforeRan, hookBefore, validated, committed, panicked, ranFor, runBy>>
 
 \* The ticket resolves. A commit ends the transact call; a conflict re-runs
 \* the closure in a fresh attempt while attempts remain (Exhausted after).
@@ -308,8 +402,9 @@ Resolve(x) ==
   /\ UNCHANGED <<att, ost, snap, readv, buf, vset, reg, ps, verdict, cseq, db, workers, ghosts>>
 
 ----------------------------------------------------------------------------
-\* The committers: decide, sync, complete. Any committer completes any
-\* decided outcome (a helping committer, or the I/O thread at Immediate).
+\* The committers: decide and sync. They never deliver an outcome: that is
+\* the committing thread's (Deliver). Mutant HelperDelivers puts back the
+\* design before D53, where any committer completed any decided outcome.
 
 \* Validate the oldest submitted transaction, first-committer-wins on its
 \* validated write set, and apply it if it commits.
@@ -332,8 +427,8 @@ Decide(c) ==
                        ELSE UNCHANGED <<ctr, ctrSeq>>
                   /\ committed' = Set2(committed, x, att[x], TRUE)
   /\ UNCHANGED <<durable, closed, att, opc, ost, snap, readv, buf, vset, reg>>
-  /\ UNCHANGED <<cpc, ctarget, clpc, cltarget, clseen>>
-  /\ UNCHANGED <<ranC, ranA, hookC, hookA, beforeRan, hookBefore, panicked, ranFor>>
+  /\ UNCHANGED <<cpc, ctarget, clpc, cltarget, clseen, dpc>>
+  /\ UNCHANGED <<ranC, ranA, hookC, hookA, beforeRan, hookBefore, panicked, ranFor, runBy>>
 
 \* A WAL sync: everything committed so far is durable.
 Fsync(c) ==
@@ -342,29 +437,28 @@ Fsync(c) ==
   /\ durable' = seq
   /\ UNCHANGED <<seq, ctr, ctrSeq, closed, owner, workers, ghosts>>
 
-\* Claim a decided outcome: CAS "decided" to "claimed". A commit at
-\* Immediate is claimed only once durable. Mutant CommitBeforeDurable: at
-\* once. Mutant HelperNoClaim: without the CAS, so another completer may
-\* claim it too.
+\* Mutant HelperDelivers only: a committer claims a decided outcome, CAS
+\* "decided" to "claimed", to complete it on its own thread.
 Claim(c, x) ==
+  \* Only the planted bug lets a committer deliver.
+  /\ Mutant = "HelperDelivers"
   /\ cpc[c] = "idle"
   /\ ps[x] = "decided"
   /\ \/ verdict[x] = "conflict"
      \/ Durability = "Eventual"
      \/ durable >= cseq[x]
-     \/ Mutant = "CommitBeforeDurable"
-  /\ ps' = [ps EXCEPT ![x] = IF Mutant = "HelperNoClaim" THEN @ ELSE "claimed"]
+  /\ ps' = [ps EXCEPT ![x] = "claimed"]
   /\ cpc' = [cpc EXCEPT ![c] = "callbacks"]
   /\ ctarget' = [ctarget EXCEPT ![c] = x]
   /\ UNCHANGED <<db, att, opc, ost, snap, readv, buf, vset, reg, verdict, cseq>>
-  /\ UNCHANGED <<subq, clpc, cltarget, clseen, ghosts>>
+  /\ UNCHANGED <<subq, clpc, cltarget, clseen, dpc, ghosts>>
 
 \* The claimer runs the transaction's callbacks of the outcome's kind.
 CommitterCallbacks(c) ==
   /\ cpc[c] = "callbacks"
-  /\ LET x == ctarget[c] IN RunCallbacks(x, IF verdict[x] = "commit" THEN "C" ELSE "A")
+  /\ LET x == ctarget[c] IN RunCallbacks(x, IF verdict[x] = "commit" THEN "C" ELSE "A", "committer")
   /\ cpc' = [cpc EXCEPT ![c] = "hooks"]
-  /\ UNCHANGED <<db, owner, subq, ctarget, clpc, cltarget, clseen>>
+  /\ UNCHANGED <<db, owner, subq, ctarget, clpc, cltarget, clseen, dpc>>
   /\ UNCHANGED <<hookC, hookA, beforeRan, hookBefore, validated, committed, panicked>>
 
 \* Then the hooks', and the ticket resolves, waking the owner.
@@ -376,8 +470,8 @@ CommitterHooks(c) ==
   /\ cpc' = [cpc EXCEPT ![c] = "idle"]
   /\ ctarget' = [ctarget EXCEPT ![c] = NoOwner]
   /\ UNCHANGED <<db, att, opc, ost, snap, readv, buf, vset, reg, verdict, cseq>>
-  /\ UNCHANGED <<subq, clpc, cltarget, clseen>>
-  /\ UNCHANGED <<ranC, ranA, beforeRan, hookBefore, validated, committed, panicked, ranFor>>
+  /\ UNCHANGED <<subq, clpc, cltarget, clseen, dpc>>
+  /\ UNCHANGED <<ranC, ranA, beforeRan, hookBefore, validated, committed, panicked, ranFor, runBy>>
 
 ----------------------------------------------------------------------------
 \* close.
@@ -387,7 +481,7 @@ Close ==
   /\ clpc = "idle"
   /\ closed' = TRUE
   /\ clpc' = "closing"
-  /\ UNCHANGED <<seq, durable, ctr, ctrSeq, owner, subq, cpc, ctarget, cltarget, clseen, ghosts>>
+  /\ UNCHANGED <<seq, durable, ctr, ctrSeq, owner, subq, cpc, ctarget, cltarget, clseen, dpc, ghosts>>
 
 \* close aborts a transaction still open: CAS "open" to "aborted", then
 \* run its on_abort. Mutant CloseNoClaim: no CAS, so its owner may still
@@ -402,14 +496,15 @@ CloseAbort(x) ==
   /\ clpc' = "clcb"
   /\ cltarget' = x
   /\ UNCHANGED <<db, att, opc, snap, readv, buf, vset, reg, ps, verdict, cseq>>
-  /\ UNCHANGED <<subq, cpc, ctarget, ghosts>>
+  \* No delivery changes either.
+  /\ UNCHANGED <<subq, cpc, ctarget, ghosts, dpc>>
 
 \* The closer runs the aborted transaction's on_abort callbacks.
 CloseCallbacks ==
   /\ clpc = "clcb"
-  /\ RunCallbacks(cltarget, "A")
+  /\ RunCallbacks(cltarget, "A", "closer")
   /\ clpc' = "clhook"
-  /\ UNCHANGED <<db, owner, subq, cpc, ctarget, cltarget, clseen>>
+  /\ UNCHANGED <<db, owner, subq, cpc, ctarget, cltarget, clseen, dpc>>
   /\ UNCHANGED <<hookC, hookA, beforeRan, hookBefore, validated, committed, panicked>>
 
 \* Then the hooks' on_abort.
@@ -417,8 +512,8 @@ CloseHook ==
   /\ clpc = "clhook"
   /\ RunHook(cltarget, "A")
   /\ clpc' = "closing"
-  /\ UNCHANGED <<db, owner, subq, cpc, ctarget, cltarget, clseen>>
-  /\ UNCHANGED <<ranC, ranA, beforeRan, hookBefore, validated, committed, panicked, ranFor>>
+  /\ UNCHANGED <<db, owner, subq, cpc, ctarget, cltarget, clseen, dpc>>
+  /\ UNCHANGED <<ranC, ranA, beforeRan, hookBefore, validated, committed, panicked, ranFor, runBy>>
 
 \* No open transaction is left to abort: the final sync, and close is done.
 CloseFinish ==
@@ -426,7 +521,7 @@ CloseFinish ==
   /\ ~\E x \in Owners : x \notin clseen /\ opc[x] = "open" /\ ost[x] = "open"
   /\ durable' = seq
   /\ clpc' = "closed"
-  /\ UNCHANGED <<seq, ctr, ctrSeq, closed, owner, subq, cpc, ctarget, cltarget, clseen, ghosts>>
+  /\ UNCHANGED <<seq, ctr, ctrSeq, closed, owner, subq, cpc, ctarget, cltarget, clseen, dpc, ghosts>>
 
 ----------------------------------------------------------------------------
 \* The specification.
@@ -459,12 +554,18 @@ Init ==
   /\ committed = [x \in Owners |-> [a \in Attempts |-> FALSE]]
   /\ panicked = [x \in Owners |-> [a \in Attempts |-> FALSE]]
   /\ ranFor = {}
+  \* No path is delivering anything.
+  /\ dpc = [x \in Owners |-> [p \in Paths |-> "idle"]]
+  \* Nobody ran any callback.
+  /\ runBy = {}
 
 \* An owner's step. Its closure ends one way or another, and its commit
-\* runs to an outcome: all of these happen.
+\* runs to an outcome, delivered on its own thread: all of these happen.
 OwnerStep(x) ==
   \/ Begin(x) \/ OwnerCommit(x) \/ OwnerAbort(x) \/ BeforeOk(x) \/ BeforePanic(x)
   \/ HookBefore(x) \/ Submit(x) \/ OwnerAbortCallbacks(x) \/ OwnerAbortHook(x) \/ Resolve(x)
+  \* Delivery of the ticket, by the queue's poll or the queue's drop.
+  \/ \E p \in Paths : Deliver(x, p) \/ DeliverCallbacks(x, p) \/ DeliverHooks(x, p)
 
 \* A committer's step.
 CommitterStep(c) ==
@@ -501,6 +602,8 @@ TypeOK ==
   /\ verdict \in [Owners -> {"none", "commit", "conflict"}]
   /\ cpc \in [Committers -> {"idle", "callbacks", "hooks"}]
   /\ clpc \in {"idle", "closing", "clcb", "clhook", "closed"}
+  \* Each delivery path is idle, or running callbacks, or the hooks.
+  /\ dpc \in [Owners -> [Paths -> {"idle", "callbacks", "hooks"}]]
 
 \* AT MOST ONCE. No attempt's callbacks run twice or both ways, and the
 \* hooks' outcome runs at most once per attempt. Lean: exactly_once.
@@ -514,6 +617,8 @@ AtMostOnce ==
 AllSettled ==
   /\ \A x \in Owners : opc[x] = "done"
   /\ \A c \in Committers : cpc[c] = "idle"
+  \* No delivery is under way.
+  /\ \A x \in Owners, p \in Paths : dpc[x][p] = "idle"
   /\ clpc \in {"idle", "closed"}
   /\ subq = <<>>
 
@@ -553,6 +658,15 @@ NoLostUpdate ==
 \* its own attempt: a re-run never runs a previous attempt's callbacks.
 \* Lean: attempts_isolated.
 AttemptIsolation == \A r \in ranFor : r[2] = r[3]
+
+\* ON THE COMMITTING THREAD (D53). Every outcome callback ran on the thread
+\* that holds the commit's queue (its poll, or its drop), on the owner's
+\* own thread for an abort it chose, or on the closing thread for a
+\* transaction close aborted; never on a committer. Example ruled out: the
+\* leader that synced a group running a member's on_commit on its own
+\* thread while the member's thread is busy. Lean: Callbacks.lean,
+\* delivered_on_queue_thread.
+OnCommittingThread == \A r \in runBy : r[2] # "committer"
 
 \* on_commit runs only once the commit is durable, at Immediate.
 CommitAfterDurable ==
