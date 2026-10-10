@@ -304,7 +304,21 @@ loom-io:
 loom-snapshots:
     RUSTFLAGS="--cfg loom" cargo test --release --test loom_snapshots
 
-loom-all: loom loom-debug loom-sync loom-io loom-snapshots
+# Loom models for the per-core read path (Phase 7b): the read view's
+# compare-and-swap publication, its reclamation and its freshness; the
+# block cache's pin check, racing hands and byte bound; and the range-
+# tombstone log's prefix publication, run against the real log. Each has
+# a calibration that must fail.
+loom-view:
+    RUSTFLAGS="--cfg loom" cargo test --release --test loom_read_view
+
+loom-cache:
+    RUSTFLAGS="--cfg loom" cargo test --release --test loom_block_cache
+
+loom-tombstones:
+    RUSTFLAGS="--cfg loom" cargo test --release --test loom_range_tombstones
+
+loom-all: loom loom-debug loom-sync loom-io loom-snapshots loom-view loom-cache loom-tombstones
 
 # The read-view chaos workload at full size: 6 instances x 2 rounds x 400
 # versions. Measured at over 20 minutes wall and 4h of CPU unoptimized,
@@ -682,6 +696,27 @@ tla:
     check MC_TxnCallbacks_Red_CallbacksSurvive         RED AttemptIsolation
     check MC_TxnCallbacks_Red_HelperNoClaim            RED AtMostOnce
     check MC_TxnCallbacks_Red_CloseNoClaim             RED AtMostOnce
+    # 4.6, Phase 7b: the wait-free read view (D54). Lean:
+    # Regolith/ReadView.lean, reachable_safe and cas_chain.
+    spec=ReadView
+    check MC_ReadView_Green                            GREEN
+    check MC_ReadView_Red_FreeEarly                    RED NoFreedRead
+    check MC_ReadView_Red_StaleLoad                    RED FreshLoad
+    check MC_ReadView_Red_PlainStore                   RED ChainOfPublications
+    # 4.6, Phase 7b: the lock-free CLOCK block cache. Lean:
+    # Regolith/ClockCache.lean, evict_only_unpinned, reachable_safe,
+    # two_level_bounded and used_exact.
+    spec=ClockCache
+    check MC_ClockCache_Green                          GREEN
+    check MC_ClockCache_Red_IgnorePins                 RED NoFreedPin
+    check MC_ClockCache_Red_Unbounded                  RED ByteBound
+    check MC_ClockCache_Red_LandingUnheld              RED LandedReadable
+    # 4.6, Phase 7b: a memtable's append-only range-tombstone log. Lean:
+    # Regolith/TombstoneLog.lean, prefix_whole and published_seen.
+    spec=TombstoneLog
+    check MC_TombstoneLog_Green                        GREEN
+    check MC_TombstoneLog_Red_LenFirst                 RED PrefixWhole
+    check MC_TombstoneLog_Red_HorizonFirst             RED PublishedSeen
     rm -rf states ./*_TTrace_*.tla ./*_TTrace_*.bin
     exit $fail
 

@@ -257,3 +257,7 @@ harness = false
 [[bench]]
 name = "per_core"
 harness = false
+
+[[bench]]
+name = "per_core_reads"
+harness = false

@@ -52,74 +52,114 @@ where
     }
 }
 
-/// The structural contract of a shard, checked under its own lock:
+/// Whether two entries are the same cached block.
+fn same_entry(a: &CacheEntry, b: &CacheEntry) -> bool {
+    match (a, b) {
+        (CacheEntry::Data(x), CacheEntry::Data(y)) => Arc::ptr_eq(x, y),
+        (CacheEntry::Index(x), CacheEntry::Index(y)) => Arc::ptr_eq(x, y),
+        (CacheEntry::Filter(x), CacheEntry::Filter(y)) => Arc::ptr_eq(x, y),
+        _ => false,
+    }
+}
+
+/// The structural contract of a shard, checked once every thread that
+/// touched the cache has finished:
 ///
-/// * every live ring slot holds the entry the map holds for that key,
+/// * no slot is left busy, and no doomed entry is left in the ring,
+/// * every live ring slot holds the entry the map names for its key, by
+///   slot and generation, and the map's handle pins that very block,
 /// * the map holds nothing the ring does not,
-/// * `ring.used` is exactly the sum of the live entries' charges,
-/// * the free list names only empty slots, once each,
-/// * the hand is in bounds.
+/// * the shard's `used` is exactly the sum of the live entries' charges,
+/// * the free stack names only empty slots, once each, and every slot the
+///   ring ever handed out is either live or free,
+/// * the ring stayed within its slot bound.
 fn assert_shard_invariants(cache: &BlockCache, context: &str) {
     for (idx, shard) in cache.shards.iter().enumerate() {
-        let ring = shard.ring.lock();
-        let live: Vec<(usize, Arc<ClockEntry>)> = ring
-            .slots
-            .iter()
-            .enumerate()
-            .filter_map(|(i, slot)| slot.as_ref().map(|e| (i, Arc::clone(e))))
-            .collect();
+        let Some(state) = shard.state() else {
+            assert_eq!(
+                shard.used.load(Ordering::Acquire),
+                0,
+                "{context}: shard {idx} charges bytes without ever having stored"
+            );
+            continue;
+        };
+        let range = state.ring.high_water();
+        let mut live: Vec<(usize, u32, CacheKey, usize, CacheEntry)> = Vec::new();
+        for slot in 0..range {
+            assert_eq!(
+                state.ring.flags(slot) & ring::BUSY,
+                0,
+                "{context}: shard {idx} slot {slot} was left busy"
+            );
+            if let Some(mut claim) = state.ring.claim_any(slot) {
+                let generation = claim.generation();
+                let node = claim.node();
+                let entry = node
+                    .entry
+                    .as_ref()
+                    .map(CacheEntry::clone_ref)
+                    .unwrap_or_else(|| panic!("{context}: shard {idx} slot {slot} lost its block"));
+                live.push((slot, generation, node.key, node.charge, entry));
+                assert!(
+                    claim.release().is_none(),
+                    "{context}: shard {idx} slot {slot} was doomed and left in the ring"
+                );
+            }
+        }
 
-        let charged: usize = live.iter().map(|(_, e)| e.charge).sum();
+        let charged: usize = live.iter().map(|(_, _, _, charge, _)| charge).sum();
+        let used = shard.used.load(Ordering::Acquire);
         assert_eq!(
-            charged, ring.used,
-            "{context}: shard {idx} ring.used={} but live slots charge {charged}",
-            ring.used
+            charged, used,
+            "{context}: shard {idx} used={used} but live slots charge {charged}"
         );
-
-        let map_len = shard.map.get().map_or(0, |m| m.len());
         assert_eq!(
-            map_len,
+            state.map.len(),
             live.len(),
-            "{context}: shard {idx} map holds {map_len} entries, ring holds {}",
+            "{context}: shard {idx} map holds {} entries, ring holds {}",
+            state.map.len(),
             live.len()
         );
-
-        for (i, entry) in &live {
-            assert_eq!(
-                entry.slot as usize, *i,
-                "{context}: shard {idx} slot index drifted"
-            );
-            let found = shard
+        for (slot, generation, key, _, entry) in &live {
+            let found = state
                 .map
-                .get()
-                .and_then(|m| m.get(&entry.key))
-                .as_ref()
-                .and_then(std::sync::Weak::upgrade)
-                .unwrap_or_else(|| {
-                    panic!("{context}: shard {idx} slot {i} is not reachable through the map")
-                });
+                .get(key)
+                .unwrap_or_else(|| panic!("{context}: shard {idx} slot {slot} is not in the map"));
             assert!(
-                Arc::ptr_eq(&found, entry),
-                "{context}: shard {idx} slot {i} and the map disagree on the entry"
+                found.names(*slot, *generation),
+                "{context}: shard {idx} slot {slot} and the map disagree on the entry"
+            );
+            let pinned = found.entry.upgrade().unwrap_or_else(|| {
+                panic!("{context}: shard {idx} slot {slot}: the map's handle no longer pins it")
+            });
+            assert!(
+                same_entry(&pinned, entry),
+                "{context}: shard {idx} slot {slot}: the map pins another block"
             );
         }
 
-        let mut seen = vec![false; ring.slots.len()];
-        for &slot in &ring.free {
-            assert!(slot < ring.slots.len(), "{context}: free slot out of range");
-            assert!(
-                ring.slots[slot].is_none(),
+        let free = state.ring.free_indices();
+        let mut seen = std::collections::HashSet::new();
+        for &slot in &free {
+            assert!(slot < range, "{context}: free slot out of range");
+            assert_eq!(
+                state.ring.flags(slot) & ring::OCCUPIED,
+                0,
                 "{context}: shard {idx} free-lists a live slot"
             );
             assert!(
-                !seen[slot],
+                seen.insert(slot),
                 "{context}: shard {idx} free-lists a slot twice"
             );
-            seen[slot] = true;
         }
+        assert_eq!(
+            live.len() + free.len(),
+            range,
+            "{context}: shard {idx} lost track of a slot"
+        );
         assert!(
-            ring.hand < ring.slots.len().max(1),
-            "{context}: shard {idx} hand out of range"
+            range <= shard.max_slots,
+            "{context}: shard {idx} ring grew past its bound"
         );
     }
     assert_eq!(
@@ -437,13 +477,19 @@ fn a_mixed_storm_keeps_the_accounting_exact() {
             }
         }));
     }
+    // `usage()` is the one word every insert reserves against before it
+    // touches a shard and every removal releases last, so it is the exact
+    // bound at every instant and never reads below what the shards hold.
+    // A running sum of the shards read one after another is not an
+    // instant at all once no lock freezes them, so the monitor samples the
+    // word, and the shards are checked against it when the storm settles.
     let monitor = {
         let cache = Arc::clone(&cache);
         let stop = Arc::clone(&stop);
         std::thread::spawn(move || {
             let mut worst = 0usize;
             while !stop.load(Ordering::Relaxed) {
-                worst = worst.max(cache.true_usage());
+                worst = worst.max(cache.usage());
             }
             worst
         })
@@ -504,11 +550,13 @@ fn oversized_inserts_racing_normal_inserts_stay_in_budget() {
 /// the test depending on how the scheduler treated it.
 const MONITOR_SAMPLE_FLOOR: u64 = 1_000;
 
-/// Attack: the cache-wide reservation for an oversized entry reads
-/// `total_used`, which an insert in flight on another shard has not
-/// published yet. If that lag is exploitable the committed per-shard
-/// totals go over budget for real, so a monitor samples them under
-/// their own locks while the race runs rather than only after it.
+/// Attack: an oversized entry is admitted against the cache-wide budget
+/// while normal inserts race it on every other shard. Every insert, of
+/// either kind, reserves against the cache-wide total by CAS before it
+/// touches a shard, so if any path skipped or reordered that the total
+/// would go over budget for real. A monitor samples the total, which is
+/// the exact figure at every instant, while the race runs rather than
+/// only after it, and the shards are checked against it when it ends.
 #[test]
 fn the_oversized_reservation_cannot_be_raced_over_budget() {
     let cache = Arc::new(BlockCache::with_config(8 * 64 * 1024, 3, false));
@@ -525,7 +573,7 @@ fn the_oversized_reservation_cannot_be_raced_over_budget() {
             // makes the test fail on a loaded machine for a reason that
             // has nothing to do with the budget being respected.
             while !stop.load(Ordering::Relaxed) || samples < MONITOR_SAMPLE_FLOOR {
-                worst = worst.max(cache.true_usage());
+                worst = worst.max(cache.usage());
                 samples += 1;
             }
             (worst, samples)
@@ -607,7 +655,11 @@ fn the_ring_reuses_slots_instead_of_growing_with_the_insert_count() {
     for i in 0..200_000u64 {
         cache.insert(1, i * 64, dummy_block(0));
     }
-    let slots: usize = cache.shards.iter().map(|s| s.ring.lock().slots.len()).sum();
+    let slots: usize = cache
+        .shards
+        .iter()
+        .map(|s| s.state().map_or(0, |state| state.ring.high_water()))
+        .sum();
     let live = cache.entry_count();
     assert!(
         slots <= live * 2 + 8,
@@ -922,8 +974,10 @@ fn build_trace(name: &str, ops: usize, universe: usize) -> Vec<u64> {
 fn clock_hit_rate_against_exact_lru_on_fixed_traces() {
     const OPS: usize = 300_000;
     const UNIVERSE: usize = 20_000;
-    let block = dummy_block(1024);
-    let charge = entry_charge(&CacheEntry::Data(Arc::clone(&block)));
+    // Every miss caches a block of its own, as every block the engine
+    // reads from a table is its own allocation: one `Arc` cached under
+    // every key would pin every entry (see `BlockCache::insert`).
+    let charge = entry_charge(&CacheEntry::Data(dummy_block(1024)));
 
     let mut worst: Option<(String, usize, f64)> = None;
     println!("\ntrace                entries    LRU hits   LRU %   CLOCK hits CLOCK %   delta");
@@ -950,7 +1004,7 @@ fn clock_hit_rate_against_exact_lru_on_fixed_traces() {
                 if cache.get(key.file_id, key.offset).is_some() {
                     clock_hits += 1;
                 } else {
-                    cache.insert(key.file_id, key.offset, Arc::clone(&block));
+                    cache.insert(key.file_id, key.offset, dummy_block(1024));
                 }
                 if lru.access(key, charge) {
                     lru_hits += 1;
@@ -1038,10 +1092,12 @@ fn evict_file_covers_a_sparse_offset_range_and_stops_at_the_next_file() {
     assert_shard_invariants(&cache, "sparse evict_file");
 }
 
-/// The ring `Vec`s keep their capacity after the entries they indexed
-/// are gone, so `usage()` can read zero while the shard still holds
-/// bytes. That retention has to stay bounded by the byte budget rather
-/// than by how many inserts the cache has ever seen.
+/// The ring's segments stay allocated after the entries they held are
+/// gone, so `usage()` can read zero while the shard still holds slot
+/// memory. That retention has to stay bounded by the byte budget rather
+/// than by how many inserts the cache has ever seen, after `evict_file`
+/// and after `clear` alike: a lock-free ring cannot free a segment another
+/// thread may be indexing, so `clear` empties it without shrinking it.
 #[test]
 fn an_emptied_cache_retains_only_budget_bounded_ring_capacity() {
     let budget = 1024 * 1024;
@@ -1049,38 +1105,38 @@ fn an_emptied_cache_retains_only_budget_bounded_ring_capacity() {
     for i in 0..300_000u64 {
         cache.insert(1, i * 64, dummy_block(0));
     }
-    cache.evict_file(1);
-    assert_eq!(cache.usage(), 0);
     let ring_bytes = |cache: &BlockCache| -> usize {
         cache
             .shards
             .iter()
-            .map(|s| {
-                let ring = s.ring.lock();
-                ring.slots.capacity() * std::mem::size_of::<Option<Arc<ClockEntry>>>()
-                    + ring.free.capacity() * std::mem::size_of::<usize>()
-            })
+            .map(|s| s.state().map_or(0, |state| state.ring.allocated_bytes()))
             .sum()
     };
+    let full = ring_bytes(&cache);
+    cache.evict_file(1);
+    assert_eq!(cache.usage(), 0);
     let retained = ring_bytes(&cache);
     println!(
         "ADVRETAIN emptied cache still holds {retained} ring bytes against a {budget}-byte budget"
     );
+    assert_eq!(retained, full, "evicting entries never grows the ring");
     assert!(
         retained <= budget / 4,
         "an emptied cache retains {retained} ring bytes against a {budget}-byte budget"
     );
     assert_shard_invariants(&cache, "emptied ring retention");
 
-    // `evict_file` keeps the reserve for the blocks that replace the
-    // ones it dropped; `clear` is the call that means "give it back",
-    // and it has to actually release rather than empty in place.
+    // Refilling reuses the retained slots rather than growing past them.
+    for i in 0..300_000u64 {
+        cache.insert(2, i * 64, dummy_block(0));
+    }
     cache.clear();
     assert_eq!(cache.usage(), 0);
+    assert_eq!(cache.entry_count(), 0);
     assert_eq!(
         ring_bytes(&cache),
-        0,
-        "clear emptied the ring without releasing its capacity"
+        retained,
+        "a refill after the eviction grew the ring instead of reusing it"
     );
     assert_shard_invariants(&cache, "cleared ring retention");
 }

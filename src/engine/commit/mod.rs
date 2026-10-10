@@ -54,7 +54,8 @@ use super::callback::InCommit;
 use super::memtable::MemTable;
 use super::wal::{MAX_RECORD_LEN, Wal, check_write_len};
 use super::{
-    CommitOutcome, DurabilityMode, ReadView, RegolithEngine, ValidationSet, grouped_batch_ops,
+    CommitOutcome, DurabilityMode, ReadView, RegolithEngine, ValidationSet, ViewGuard,
+    grouped_batch_ops,
 };
 use crate::perf_context::{PerfContextSnapshot, PerfTimer, PerfTimerField};
 use crate::statistics::{Histogram, Ticker};
@@ -720,7 +721,7 @@ impl RegolithEngine {
     fn run_and_complete(
         &self,
         pipe: &mut Pipeline,
-        view: Arc<ReadView>,
+        view: ViewGuard<'_>,
     ) -> Option<io::Result<Settled>> {
         let _commit = InCommit::enter();
         let Pipeline {
@@ -792,7 +793,7 @@ impl RegolithEngine {
         &self,
         stage: &mut Vec<u8>,
         group: &[GroupTicket],
-        view: Arc<ReadView>,
+        view: ViewGuard<'_>,
         staged: usize,
     ) -> io::Result<u64> {
         // Cleared first, ahead of every early return (`ensure_writable`,

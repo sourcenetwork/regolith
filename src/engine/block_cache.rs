@@ -1,13 +1,11 @@
-use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, OnceLock, Weak};
 
 // Through the portability shim: a 32-bit target without a 64-bit atomic
 // instruction gets the fallback implementation rather than failing to build.
-use crate::portability::{AtomicUsize, Ordering};
+use crate::portability::{AtomicPtr, AtomicUsize, Ordering};
 
 use kovan_map::HopscotchMap;
 
-use crate::sync::internal::Mutex;
 use xxhash_rust::xxh3::xxh3_64;
 
 use super::block::Block;
@@ -17,8 +15,12 @@ use super::io::IoRuntime;
 use crate::options::MAX_BLOCK_CACHE_SHARD_BITS;
 use crate::statistics::{Statistics, Ticker};
 
+mod ring;
+
+use ring::{Claim, Hand, Node, Ring};
+
 /// Cache key: (file_id, block_offset).
-#[derive(Hash, Eq, PartialEq, Clone, Copy)]
+#[derive(Hash, Eq, PartialEq, Clone, Copy, Debug)]
 struct CacheKey {
     file_id: u64,
     offset: u64,
@@ -36,16 +38,14 @@ const MAX_SHARD_BITS: u32 = MAX_BLOCK_CACHE_SHARD_BITS;
 const MIN_SHARD_CAPACITY: usize = 64 * 1024;
 
 /// Bookkeeping bytes an entry costs beyond [`Block::charge`]: the map
-/// node with its embedded reclamation header, the bucket link, the
-/// [`ClockEntry`] allocation and its `Arc` counts, and the ring slot.
+/// node with its embedded reclamation header and the weak reference it
+/// holds, the ring's [`Node`] allocation, and the ring slot.
 ///
-/// Measured, not estimated. A counting global allocator over 6,000 live
-/// entries with no eviction in flight puts real bookkeeping at 165.2
-/// bytes per entry; `tests/adv_block_cache_overhead.rs` re-measures it
-/// on every run and fails if the charge drifts more than 16 bytes below
-/// the truth, so this constant cannot rot quietly. The allocator counts
-/// requested layout sizes, so the real figure is higher again by
-/// whatever the size classes round up.
+/// Every live entry is charged at least this, which is also what bounds
+/// the ring: a shard never has more slots in use than its bytes allow.
+/// `tests/adv_block_cache_overhead.rs` re-measures the real bookkeeping
+/// with a counting allocator on every run and fails if it drifts more
+/// than 16 bytes past this charge, so the constant cannot rot quietly.
 const ENTRY_OVERHEAD: usize = 160;
 
 /// Bytes per entry assumed when sizing a shard's bucket array: the
@@ -53,6 +53,12 @@ const ENTRY_OVERHEAD: usize = 160;
 /// estimate; the map grows past a 0.75 load factor on its own and never
 /// shrinks below what it was built with.
 const ESTIMATED_ENTRY_BYTES: usize = 4 * 1024 + ENTRY_OVERHEAD;
+
+/// The most hand steps one revolution of an insert's search takes. A shard
+/// with more entries than this sweeps it per insert rather than the whole
+/// ring, so an insert into a large shard that readers have mostly pinned
+/// costs at most `2 * SWEEP + 1` steps before it is refused.
+const SWEEP: usize = 4096;
 
 /// Floor on a shard's bucket count. A cache small enough to estimate
 /// fewer entries than this still gets a table worth hashing into.
@@ -64,26 +70,7 @@ const MIN_MAP_BUCKETS: usize = 64;
 /// on demand instead.
 const MAX_MAP_BUCKETS: usize = 64 * 1024;
 
-/// Map removals a shard performs between drains of the calling thread's
-/// retired entries.
-///
-/// The reclaimer does not free an evicted entry on its own here: with no
-/// drain at all the cache retains 144 bytes per insert forever, measured
-/// at 7.9 MB after 40,000 inserts through a 2 MiB budget and 71.3 MB
-/// after 480,000, growing with churn rather than with the working set.
-///
-/// Draining is only safe because this map probes a bounded neighbourhood
-/// of table slots. A drain advances the reclaimer's global epoch, and a
-/// reader is protected only for pointers it loaded from a location the
-/// retirer writes when it unlinks. Every pointer read here comes out of
-/// a slot that `remove` clears before it retires, so that holds. It does
-/// not hold for a chaining map, whose reader follows `next` links that
-/// an already-retired node froze, and driving the epoch under one of
-/// those is a use-after-free.
-const REMOVALS_PER_RECLAIM: u64 = 2048;
-
-/// Bytes one cached entry costs the cache.
-/// What a cache slot holds.
+/// What a cache slot holds: the cache's own strong reference to a block.
 ///
 /// Data blocks, index blocks and filter blocks share one key space
 /// because they occupy disjoint byte ranges of the same file: the
@@ -94,6 +81,16 @@ enum CacheEntry {
     Data(Arc<Block>),
     Index(Arc<IndexBlock>),
     Filter(Arc<FilterBlock>),
+}
+
+/// The map's handle on an entry: weak, so a reader that finds it takes
+/// its pin by upgrading, and an eviction that wins the pin check leaves
+/// nothing for a later upgrade to reach.
+#[derive(Clone)]
+enum WeakEntry {
+    Data(Weak<Block>),
+    Index(Weak<IndexBlock>),
+    Filter(Weak<FilterBlock>),
 }
 
 impl CacheEntry {
@@ -112,473 +109,274 @@ impl CacheEntry {
             Self::Filter(b) => Self::Filter(Arc::clone(b)),
         }
     }
+
+    fn downgrade(&self) -> WeakEntry {
+        match self {
+            Self::Data(b) => WeakEntry::Data(Arc::downgrade(b)),
+            Self::Index(b) => WeakEntry::Index(Arc::downgrade(b)),
+            Self::Filter(b) => WeakEntry::Filter(Arc::downgrade(b)),
+        }
+    }
+
+    /// Give up the cache's reference, but only when no reader holds the
+    /// block: the pin check and the retraction are one compare-and-swap of
+    /// the block's strong count from one (the cache's) to zero, after which
+    /// no reader can take a new pin through the map. `Err` hands the
+    /// reference back when a reader holds one.
+    fn release_if_unpinned(self) -> Result<(), Self> {
+        match self {
+            Self::Data(b) => Arc::try_unwrap(b).map(drop).map_err(Self::Data),
+            Self::Index(b) => Arc::try_unwrap(b).map(drop).map_err(Self::Index),
+            Self::Filter(b) => Arc::try_unwrap(b).map(drop).map_err(Self::Filter),
+        }
+    }
+}
+
+impl WeakEntry {
+    /// Pin the entry for a reader, if the cache still holds it.
+    fn upgrade(&self) -> Option<CacheEntry> {
+        match self {
+            Self::Data(b) => b.upgrade().map(CacheEntry::Data),
+            Self::Index(b) => b.upgrade().map(CacheEntry::Index),
+            Self::Filter(b) => b.upgrade().map(CacheEntry::Filter),
+        }
+    }
 }
 
 fn entry_charge(entry: &CacheEntry) -> usize {
     entry.payload_charge() + ENTRY_OVERHEAD
 }
 
-/// One cached block plus the CLOCK bookkeeping the hand reads.
-///
-/// The ring holds the only strong reference; the map holds a [`Weak`] to
-/// the same allocation, so a reader that reaches the entry through the
-/// map sets the same reference bit the hand later clears.
-///
-/// Weak rather than strong so that eviction frees the block's bytes at
-/// the moment the hand takes the ring slot, under the ring mutex, rather
-/// than whenever the map's reclamation scheme gets around to freeing the
-/// node the entry was reached through. That difference is the whole
-/// bound: a strong reference in the map makes [`BlockCache::usage`] a
-/// bound on what the cache *accounts*, and only the reclaimer's
-/// promptness bounds what it *holds*. Measured on the small-block
-/// overhead probe, holding a strong reference put live heap at 11.1x the
-/// byte budget. A `Weak` leaves the retired node pinning the entry's own
-/// allocation, tens of bytes, and never the kilobytes of block.
-///
-/// A `Weak` that fails to upgrade reads as a miss, which is correct: the
-/// entry it named is gone. It cannot happen while the ring mutex is
-/// held, because every drop of the strong reference happens under it.
-struct ClockEntry {
-    entry: CacheEntry,
-    /// The map key, so the hand can unlink the entry it evicts without
-    /// a reverse lookup.
-    key: CacheKey,
-    /// [`entry_charge`] at insert time, so an eviction subtracts exactly
-    /// what the insert added.
-    charge: usize,
-    /// Ring index, fixed for the entry's lifetime: a replace or an
-    /// `evict_file` reaches the slot in O(1) instead of scanning.
-    ///
-    /// 32 bits, not 64: slots are bounded by the live entry count,
-    /// which the byte budget bounds in turn. Overflowing this would
-    /// take more than 4.29 billion resident entries, or upwards of
-    /// 500 GiB of cache at the per-entry charge below. Narrowing it
-    /// pays for the payload enum's discriminant, so a cache entry
-    /// stays the same size it was when it could only hold a data
-    /// block.
+/// The map's value for a key: the weak handle readers pin through, and
+/// the `(slot, generation)` that names the ring entry holding the strong
+/// reference.
+#[derive(Clone)]
+struct Indexed {
+    entry: WeakEntry,
     slot: u32,
-    /// Set by every reader through `&self`, cleared by the hand.
-    /// Advisory only, so `Relaxed` is enough: no data is published
-    /// through the bit, and a lost update costs one extra miss rather
-    /// than correctness.
-    referenced: AtomicBool,
+    generation: u32,
 }
 
-/// The CLOCK ring: one slot per live entry, plus the hand.
-///
-/// Grows on demand and reuses freed slots, so its length is the peak
-/// live entry count, which the byte budget already bounds. Nothing here
-/// is sized from `capacity` or from the shard count.
-///
-/// A shard drained by `evict_file` keeps the two vectors' capacity as a
-/// reserve for the blocks that replace the ones it just dropped, so
-/// `used` can read 0 while the ring still holds 16 bytes per
-/// peak-live-entry. That reserve is bounded by the budget the entries
-/// were charged against, and 16 of each entry's [`ENTRY_OVERHEAD`]
-/// bytes are those two slots, so it is paid for while the entries live.
-/// [`ClockRing::reset`], which is what `BlockCache::clear` runs, hands
-/// it back.
-struct ClockRing {
-    slots: Vec<Option<Arc<ClockEntry>>>,
-    free: Vec<usize>,
-    /// Slot the hand inspects next. Kept below `slots.len()`; `reset`
-    /// clears both together.
-    hand: usize,
-    /// Bytes currently held by this shard, per [`entry_charge`]. A plain
-    /// field rather than an atomic because every mutation happens under
-    /// the ring mutex anyway.
-    used: usize,
-    /// Removals since this shard last drained. See
-    /// [`REMOVALS_PER_RECLAIM`].
-    removals: u64,
-}
-
-impl ClockRing {
-    const fn new() -> Self {
-        Self {
-            slots: Vec::new(),
-            free: Vec::new(),
-            hand: 0,
-            used: 0,
-            removals: 0,
-        }
-    }
-
-    /// Reserve a ring slot, reusing a freed one before growing.
-    /// The returned index is always in bounds for `slots`.
-    fn alloc_slot(&mut self) -> usize {
-        if let Some(slot) = self.free.pop() {
-            return slot;
-        }
-        self.slots.push(None);
-        self.slots.len() - 1
-    }
-
-    /// Drain this thread's retired map entries, every
-    /// [`REMOVALS_PER_RECLAIM`] removals.
-    fn record_removal(&mut self) {
-        self.removals += 1;
-        if self.removals.is_multiple_of(REMOVALS_PER_RECLAIM) {
-            kovan::flush();
-        }
-    }
-
-    /// Release `slot` and the bytes the entry it held charged.
-    fn release(&mut self, slot: usize, charge: usize) {
-        if let Some(held) = self.slots.get_mut(slot)
-            && held.take().is_some()
-        {
-            self.free.push(slot);
-            self.used = self.used.saturating_sub(charge);
-        }
-    }
-
-    /// Drop every entry and hand the slot vectors' capacity back to the
-    /// allocator. Assigning fresh vectors rather than clearing in place
-    /// is the difference between `clear` releasing the reserve and
-    /// merely emptying it.
-    fn reset(&mut self) {
-        self.slots = Vec::new();
-        self.free = Vec::new();
-        self.hand = 0;
-        self.used = 0;
-        self.removals = 0;
+impl Indexed {
+    fn names(&self, slot: usize, generation: u32) -> bool {
+        self.slot as usize == slot && self.generation == generation
     }
 }
 
-/// Per-shard state: a lock-free map the readers share, and a ring the
-/// writers take a mutex for.
-///
-/// Every mutation of `map`, of `ring`, and of `ring.used` happens under
-/// `ring`'s mutex, so a shard has one writer at a time and any number of
-/// concurrent readers. [`CacheShard::get`] takes no lock at all.
+/// A shard's structures, built on its first insert.
+struct ShardState {
+    map: HopscotchMap<CacheKey, Indexed>,
+    ring: Ring,
+}
+
+/// One shard: its byte budget, the bytes charged against it, and its
+/// lazily built map and ring.
 struct CacheShard {
-    /// Created on the shard's first insert, sized from this shard's own
-    /// byte budget. Building the bucket array up front would put the
-    /// cache's own footprint back under the shard count; an empty shard
-    /// costs the `OnceLock` and the ring instead. A reader on an
-    /// uninitialized shard sees `None` and misses, which is correct: the
-    /// shard holds nothing.
-    map: OnceLock<Box<HopscotchMap<CacheKey, Weak<ClockEntry>>>>,
     /// Byte budget for this shard: total capacity / num_shards.
     capacity: usize,
-    ring: Mutex<ClockRing>,
+    /// Bytes charged by this shard's entries and by inserts that have
+    /// reserved but not yet published. Reserved by compare-and-swap, so
+    /// it never passes `capacity` except by an oversized entry the
+    /// cache-wide budget admitted.
+    used: AtomicUsize,
+    /// Built on the shard's first insert and freed with the shard. An
+    /// empty shard costs this pointer and the two words above, so the
+    /// cache's footprint follows its budget, not its shard count.
+    state: AtomicPtr<ShardState>,
+    /// The most ring slots the shard may use: what the whole cache's
+    /// budget allows at [`ENTRY_OVERHEAD`] an entry.
+    max_slots: usize,
 }
 
 impl CacheShard {
-    fn new(capacity: usize) -> Self {
+    fn new(capacity: usize, max_slots: usize) -> Self {
         Self {
-            map: OnceLock::new(),
             capacity,
-            ring: Mutex::new(ClockRing::new()),
+            used: AtomicUsize::new(0),
+            state: AtomicPtr::new(std::ptr::null_mut()),
+            max_slots,
         }
     }
 
-    /// This shard's map, created on first use.
-    ///
-    /// Sized from the byte budget rather than left at the map's own
-    /// default, which is a 524,288-bucket table: at 8 bytes a bucket
-    /// that is 4 MiB per shard, so a 16-shard cache would allocate
-    /// 64 MiB of buckets before holding a single block. The estimate
-    /// below is entries at the default block size, so the table starts
-    /// within one growth step of its steady state and the array stays
-    /// proportional to the budget instead of to the shard count.
-    fn map(&self) -> &HopscotchMap<CacheKey, Weak<ClockEntry>> {
-        self.map.get_or_init(|| {
-            let estimate =
-                (self.capacity / ESTIMATED_ENTRY_BYTES).clamp(MIN_MAP_BUCKETS, MAX_MAP_BUCKETS);
-            Box::new(HopscotchMap::with_capacity(estimate))
-        })
+    #[allow(unsafe_code)]
+    fn state(&self) -> Option<&ShardState> {
+        let state = self.state.load(Ordering::Acquire);
+        // SAFETY: a non-null pointer is the `Box<ShardState>` installed by
+        // `state_or_init`, freed only by `Drop` with `&mut self`.
+        (!state.is_null()).then(|| unsafe { &*state })
     }
 
-    /// Look up `key`, giving the entry a second chance against the hand.
+    /// This shard's structures, built on first use. Lock-free: racing
+    /// builders each make one and all but the first drop theirs.
     ///
-    /// Lock-free: the map read is a bucket-list walk under the map's own
-    /// reclamation guard and the reference bit is a plain atomic store,
-    /// so a reader never waits on an insert that is freeing blocks.
+    /// The map is sized from the shard's own byte budget rather than left
+    /// at the map's default 524,288 buckets, which at 8 bytes a bucket
+    /// would cost 4 MiB per shard before holding a single block.
+    #[allow(unsafe_code)]
+    fn state_or_init(&self) -> &ShardState {
+        if let Some(state) = self.state() {
+            return state;
+        }
+        let estimate =
+            (self.capacity / ESTIMATED_ENTRY_BYTES).clamp(MIN_MAP_BUCKETS, MAX_MAP_BUCKETS);
+        let built = Box::into_raw(Box::new(ShardState {
+            map: HopscotchMap::with_capacity(estimate),
+            ring: Ring::new(self.max_slots),
+        }));
+        match self.state.compare_exchange(
+            std::ptr::null_mut(),
+            built,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            // SAFETY: just installed; freed only by `Drop`.
+            Ok(_) => unsafe { &*built },
+            Err(winner) => {
+                // SAFETY: `built` was never published, so this is its only
+                // owner; `winner` is the installed state, as in `state`.
+                drop(unsafe { Box::from_raw(built) });
+                unsafe { &*winner }
+            }
+        }
+    }
+
+    /// Look up `key` and pin its block, giving the entry a second chance
+    /// against the hand.
+    ///
+    /// Lock-free and wait-free past the map: one map read under the map's
+    /// own reclamation guard, one upgrade of the weak handle (the pin), and
+    /// one load of the slot word, plus one CAS the first time the entry is
+    /// read after the hand passed it.
     fn get(&self, key: &CacheKey) -> Option<CacheEntry> {
-        let entry = self.map.get()?.get(key)?.upgrade()?;
-        // The entry has to agree that it is the one asked for. The map
-        // resolves a key by walking a bucket chain, and its own contract
-        // distinguishes removing one version of a key from evicting the
-        // key outright, so a chain can outlive what put it there. Two
-        // `u64` compares on the read path buy the guarantee that a hit
-        // is never another file's block, and a disagreement reads as a
-        // miss, which is always a safe answer for a cache.
-        if entry.key != *key {
-            return None;
-        }
-        entry.referenced.store(true, Ordering::Relaxed);
-        Some(entry.entry.clone_ref())
-    }
-
-    /// Drop any entry already stored at `key` so a re-insert replaces
-    /// rather than double-counts, returning its ring slot to the free
-    /// list.
-    fn take_existing(&self, ring: &mut ClockRing, key: &CacheKey) {
-        let Some(map) = self.map.get() else {
-            return;
-        };
-        // `force_remove`, not `remove`: an insert racing a remove can
-        // transiently leave more than one node for a key, and a plain
-        // remove unlinks only the first, which makes an older version
-        // visible again. For a cache that means a reader is handed the
-        // block that used to be at this key, and the shard's byte
-        // accounting no longer matches what the map holds.
-        if let Some(entry) = map.force_remove(key).as_ref().and_then(Weak::upgrade) {
-            ring.release(entry.slot as usize, entry.charge);
-        }
-    }
-
-    /// Advance the CLOCK hand to the next evictable entry and drop it.
-    /// Returns `false` only when the ring holds no live entry.
-    ///
-    /// The first revolution clears every reference bit it passes; from
-    /// the second the hand takes whatever it lands on. A reader that
-    /// keeps re-setting bits therefore costs at most one extra miss and
-    /// can never stall an insert, and the search is bounded at
-    /// `2 * slots.len() + 1` steps. Refusing the insert instead would
-    /// make admission depend on reader timing, which is a silent
-    /// hit-rate cliff rather than one extra miss.
-    fn evict_one(&self, ring: &mut ClockRing) -> bool {
-        let len = ring.slots.len();
-        if len == 0 {
-            return false;
-        }
-        if ring.hand >= len {
-            ring.hand = 0;
-        }
-        for step in 0..=2 * len {
-            let hand = ring.hand;
-            ring.hand = if hand + 1 == len { 0 } else { hand + 1 };
-            let forced = step >= len;
-            let Some(entry) = ring.slots[hand]
-                .take_if(|entry| forced || !entry.referenced.swap(false, Ordering::Relaxed))
-            else {
-                continue;
-            };
-            ring.free.push(hand);
-            ring.used = ring.used.saturating_sub(entry.charge);
-            if let Some(map) = self.map.get() {
-                map.force_remove(&entry.key);
-            }
-            ring.record_removal();
-            return true;
-        }
-        false
-    }
-
-    /// Insert `(key, block)` within this shard's byte budget, running
-    /// the hand to make room. Returns `false` without storing anything
-    /// when `size` exceeds the whole shard budget; the caller then
-    /// decides whether the cache-wide budget can still absorb it.
-    fn insert_within_budget(
-        &self,
-        ring: &mut ClockRing,
-        key: CacheKey,
-        entry: &CacheEntry,
-        size: usize,
-    ) -> bool {
-        // Checked before the replace-path removal so a refusal leaves
-        // `used` untouched and the caller's byte accounting exact.
-        if size > self.capacity {
-            return false;
-        }
-        self.take_existing(ring, &key);
-        while ring.used + size > self.capacity {
-            if !self.evict_one(ring) {
-                break;
-            }
-        }
-        self.store(ring, key, entry.clone_ref(), size);
-        true
-    }
-
-    /// Publish one entry into the ring and the map together.
-    fn store(&self, ring: &mut ClockRing, key: CacheKey, entry: CacheEntry, size: usize) {
-        let slot = ring.alloc_slot();
-        let slot_entry = Arc::new(ClockEntry {
-            entry,
-            key,
-            charge: size,
-            slot: slot as u32,
-            // A fresh entry starts unreferenced. Inserting with the bit
-            // already set is what classic VM CLOCK does and it costs
-            // 0.9 to 2.0 points of hit rate against LRU on every trace
-            // replayed for this change; starting it clear gains 0.5 to
-            // 1.4 points instead.
-            referenced: AtomicBool::new(false),
-        });
-        self.map().insert(key, Arc::downgrade(&slot_entry));
-        ring.slots[slot] = Some(slot_entry);
-        ring.used += size;
-    }
-
-    /// Replace the whole shard with one entry that is larger than the
-    /// shard's own share of the budget. Only reached once the caller has
-    /// reserved `size` against the cache-wide budget.
-    fn replace_all_with(
-        &self,
-        ring: &mut ClockRing,
-        key: CacheKey,
-        entry: CacheEntry,
-        size: usize,
-    ) {
-        self.clear(ring);
-        self.store(ring, key, entry, size);
-    }
-
-    /// Drop every entry belonging to `file_id`.
-    ///
-    /// Driven off the ring rather than the map. The ring holds an `Arc`
-    /// to every live entry (they are inserted and removed together under
-    /// this mutex), so scanning it visits exactly the shard's entries
-    /// once, in a contiguous `Vec`, and allocates nothing. Ordering the
-    /// map by `(file_id, offset)` would turn this into a range walk, but
-    /// only at the cost of a comparison-ordered map on the read path,
-    /// which is the hot one: `evict_file` runs once per obsolete file
-    /// after a compaction, `get` runs on every block read.
-    fn evict_file(&self, ring: &mut ClockRing, file_id: u64) {
-        let Some(map) = self.map.get() else {
-            return;
-        };
-        for slot in 0..ring.slots.len() {
-            let Some(entry) = ring.slots[slot].as_ref() else {
-                continue;
-            };
-            if entry.key.file_id != file_id {
-                continue;
-            }
-            let (key, charge) = (entry.key, entry.charge);
-            map.force_remove(&key);
-            ring.release(slot, charge);
-        }
-    }
-
-    fn clear(&self, ring: &mut ClockRing) {
-        if let Some(map) = self.map.get() {
-            map.clear();
-        }
-        ring.reset();
+        let state = self.state()?;
+        let found = state.map.get(key)?;
+        let entry = found.entry.upgrade()?;
+        state.ring.touch(found.slot as usize, found.generation);
+        Some(entry)
     }
 }
 
-/// Sharded CLOCK block cache for decompressed SSTable data blocks.
+impl Drop for CacheShard {
+    #[allow(unsafe_code)]
+    fn drop(&mut self) {
+        let state = self.state.load(Ordering::Acquire);
+        if !state.is_null() {
+            // SAFETY: installed by `state_or_init` from `Box::into_raw`,
+            // and `&mut self` excludes every other user.
+            drop(unsafe { Box::from_raw(state) });
+        }
+    }
+}
+
+/// Reserve `size` against `counter` unless that would take it past
+/// `limit`. One compare-and-swap per attempt; retried only when another
+/// thread changed the counter.
+fn bounded_add(counter: &AtomicUsize, size: usize, limit: usize) -> bool {
+    let mut current = counter.load(Ordering::Acquire);
+    loop {
+        let Some(after) = current.checked_add(size).filter(|after| *after <= limit) else {
+            return false;
+        };
+        match counter.compare_exchange_weak(current, after, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return true,
+            Err(actual) => current = actual,
+        }
+    }
+}
+
+/// Sharded, lock-free CLOCK block cache for decompressed SSTable blocks.
 ///
-/// The cache is split into `2^shard_bits` independent shards keyed
-/// by `xxh3(file_id, offset)`. Each shard holds a lock-free hash map of
-/// its entries plus a mutex-guarded CLOCK ring and byte counter.
+/// The cache is split into `2^shard_bits` independent shards keyed by
+/// `xxh3(file_id, offset)`. Each shard holds a lock-free hash map from key
+/// to entry and a lock-free CLOCK ring of the entries themselves
+/// (`block_cache/ring.rs`). No path takes a lock: a hit, an insert, an
+/// eviction, `evict_file` and `clear` are compare-and-swaps on the map, the
+/// ring's slot words and two byte counters.
 ///
-/// # Reads take no lock
+/// # Reads
 ///
-/// A hit is one bucket-list walk under the map's own reclamation guard
-/// followed by one relaxed
-/// atomic store of the entry's reference bit, so readers never block
-/// each other and never wait behind an insert that is freeing evicted
-/// blocks. That is what CLOCK buys over a true LRU, whose `get` has to
-/// reorder a recency list and therefore needs `&mut`.
+/// A hit is one map read, one upgrade of the map's weak handle to the
+/// block, which is the reader's pin, and one load of the entry's slot word,
+/// plus one CAS to set the reference bit the first time the entry is read
+/// after the hand passed it. Readers never wait for an insert or an
+/// eviction.
 ///
-/// CLOCK is an approximation of LRU and the hit rate differs: the
-/// reference bit ranks entries into "touched since the hand last
-/// passed" or not, where LRU ranks them exactly. On the traces replayed
-/// for this change (zipfian point reads, zipfian plus a compaction
-/// sweep, and an LSM level-shaped mix, at four budgets each) it lands
-/// 0.46 to 1.25 points above LRU on every one of them, because an
-/// unre-read block admitted by a scan is dropped a revolution later
-/// instead of being promoted to the head of the list. It does not fix
-/// the cyclic-sweep pathology: on a working set 1.5x the budget both
-/// policies score zero.
+/// CLOCK approximates LRU: the reference bit ranks entries into "touched
+/// since the hand last passed" or not, where LRU ranks them exactly. On the
+/// traces replayed for this cache (zipfian point reads, zipfian plus a
+/// compaction sweep, and an LSM level-shaped mix, at four budgets each) it
+/// lands within a point of LRU on every one of them. It does not fix the
+/// cyclic-sweep pathology: on a working set 1.5x the budget both policies
+/// score zero.
+///
+/// # Eviction and pins
+///
+/// An insert that does not fit runs its shard's hand: one step inspects one
+/// slot, claimed by one CAS, so concurrent inserters inspect different
+/// slots. The first revolution clears reference bits; from the second the
+/// hand takes whatever it lands on, so a reader that keeps re-setting bits
+/// costs at most one extra miss and never stalls an insert.
+///
+/// **A block a reader holds is never evicted.** The cache holds the only
+/// strong reference to a block it caches; a reader's pin is a clone of it.
+/// The hand evicts by one compare-and-swap of that strong count from one to
+/// zero, which fails while any reader holds the block and leaves the entry
+/// in place, and after which no reader can pin it. An entry the hand cannot
+/// evict is passed over. An insert that finds nothing it may evict within
+/// two revolutions is refused, and the caller uses its block uncached.
+///
+/// Three removals are explicit rather than CLOCK's and do not wait for
+/// readers, because the entry they drop is obsolete: a re-insert of the
+/// same key replaces it, `evict_file` drops a deleted table's blocks and
+/// `clear` drops everything. A reader holding such a block keeps its own
+/// reference; the cache stops counting it.
 ///
 /// # Capacity
 ///
-/// `Options::block_cache_size` is the total byte budget. It is a hard
-/// bound on [`BlockCache::usage`], the figure the cache accounts and
-/// the `regolith.block-cache-usage` property publishes: that total never
-/// exceeds the budget, whatever the shard count, block size, or value
-/// size, and every shard enforces its share exactly under its own ring
-/// mutex. It is a close bound, not a hard one, on resident memory. See
-/// the allocation section below for the measured gap and where it comes
-/// from. The budget is split evenly across shards; each shard runs its
+/// `Options::block_cache_size` is the total byte budget, and it is a hard
+/// bound on [`BlockCache::usage`], the figure the cache accounts and the
+/// `regolith.block-cache-usage` property publishes: every insert reserves
+/// its charge against the cache-wide total by CAS before it reserves
+/// against its shard, so neither can be raced past its bound, and the sum
+/// of the shards never exceeds the total. Pinned blocks stay charged until
+/// their entries go, so the budget bounds every cached block a reader is
+/// using too. The budget is split evenly across shards; each shard runs its
 /// own hand as inserts would push it over its share.
 ///
 /// An entry larger than one shard's share is handled by
 /// [`Options::strict_capacity_limit`]:
 ///
-/// * `false` (default): the per-shard split is a soft target. The
-///   shard is emptied and the entry admitted, but only once the
-///   entry has been reserved against the cache-wide budget, so no
-///   number of shards can add up past `block_cache_size`. An entry
-///   larger than the whole budget is never cached.
-/// * `true`: the shard refuses the insert and leaves the caller to
-///   use the block directly; nothing is cached.
+/// * `false` (default): the per-shard split is a soft target. The entry is
+///   reserved against the cache-wide budget and the shard is emptied of
+///   every entry no reader holds, so no number of shards can add up past
+///   `block_cache_size`. An entry larger than the whole budget is never
+///   cached.
+/// * `true`: the shard refuses the insert and leaves the caller to use the
+///   block directly; nothing is cached.
 ///
-/// The cache-wide reservation is checked against the published total,
-/// which can lag inserts still in flight on other threads; the
-/// per-shard budget is always exact because it is enforced under the
-/// shard's own ring mutex.
-///
-/// A budget of 0 disables the cache: no shard is allocated, every
-/// `get` misses, every `insert` is dropped, and the block-cache
-/// tickers stay at zero.
+/// A budget of 0 disables the cache: no shard is allocated, every `get`
+/// misses, every `insert` is dropped, and the block-cache tickers stay at
+/// zero.
 ///
 /// # Allocation
 ///
-/// Everything the cache allocates is driven by the byte budget, never
-/// by the shard count: a shard's map and ring are not created until the
+/// Everything the cache allocates is driven by the byte budget, never by
+/// the shard count: a shard's map and ring are not created until the
 /// shard's first insert, the map's bucket array is then sized from that
-/// shard's share of the budget, and each entry is charged
-/// [`Block::charge`] plus [`ENTRY_OVERHEAD`] for the map node, the ring
-/// slot, and the `Arc` headers that `Block::charge` cannot see. An empty
-/// shard costs 96 bytes, measured with a counting global allocator at 1,
-/// 4, 16, 64 and 128 shards, so the empty-cache footprint is flat in the
-/// shard count rather than proportional to it.
+/// shard's share of the budget, the ring grows in doubling segments as
+/// entries arrive, and each entry is charged [`Block::charge`] plus
+/// [`ENTRY_OVERHEAD`] for its bookkeeping. An empty shard costs four words.
 ///
-/// Two costs `usage()` does not cover, both measured, neither growing
-/// without bound:
+/// The ring's segments stay allocated once grown, `clear` included: a
+/// lock-free ring cannot free a segment another thread may be indexing.
+/// They hold at most twice the peak number of live entries at 16 bytes a
+/// slot, which the budget bounds.
 ///
-/// * [`ENTRY_OVERHEAD`] under-charges the real bookkeeping by about 8%
-///   (138.6 bytes measured against 128 charged).
-/// * The map defers reclaiming an evicted entry's node until no reader
-///   can still be traversing the bucket it sat in. The node holds the
-///   key and a [`Weak`], so what it defers is the entry's own
-///   allocation and never the block's bytes: those are freed under the
-///   ring mutex the moment the hand takes the slot.
-///
-/// Together those put live heap above the budget at saturation by a
-/// margin that is NOT bounded today, and this is a known open defect
-/// rather than a documented cost. Measured on the small-block probe:
-/// 3.8x the byte budget after 40,000 inserts through a 2 MiB cache, and
-/// 9.3x after 120,000. It grows with churn, not with the working set,
-/// so a long-running database keeps climbing.
-///
-/// The cause is that the map's retired nodes are not reclaimed in this
-/// process without an explicit `kovan::flush()`, and calling that from
-/// a live thread while readers hold guards corrupts memory: the block
-/// cache's own adversarial test aborted with SIGSEGV and with a
-/// misaligned pointer dereference inside the map's own traversal.
-/// `force_remove` rather than `remove` closes a separate hazard, a
-/// stale version of a key becoming visible again, but it does not
-/// change retention at all: both measure the same bytes.
-///
-/// The map's reclamation guard is taken and dropped inside each map
-/// call, so no guard is ever held across a lock acquisition or a wait,
-/// and a stalled reader delays reclamation without ever blocking an
-/// insert.
-///
-/// # Why the ring keeps a mutex
-///
-/// Only inserts and evictions take it; `get` does not. Sharding is what
-/// keeps it off the critical path, and the effect is large: measured on
-/// a 36-core x86_64 box over a fully resident working set, the shipped
-/// 64-shard cache holds 31.4 Mops/s at 8 threads against 30.4 at one,
-/// while the same code at a single shard collapses from 30.9 to 2.1.
-/// Making the ring lock-free too would still have to publish the
-/// reference bit and the byte total somewhere, and on the two targets
-/// where regolith cares most it would be a loss rather than a win:
-/// single-threaded wasm never contends the lock at all, so every extra
-/// read-modify-write is pure overhead, and a target with no
-/// compare-and-swap emulates one with a critical section, which is a
-/// global lock and strictly worse than a sharded one.
+/// The map defers reclaiming a removed entry's node until no reader can
+/// still be traversing it. The node holds the key and a weak handle, so
+/// what it defers is a few dozen bytes and never the block: the block's
+/// bytes are freed at the eviction, by the compare-and-swap that wins the
+/// pin check.
 pub(crate) struct BlockCache {
     shards: Box<[CacheShard]>,
     /// Total capacity across all shards, in bytes. Kept
@@ -593,9 +391,9 @@ pub(crate) struct BlockCache {
     /// production paths go through `shard_mask` directly.
     #[cfg(test)]
     num_shards: usize,
-    /// Approximate total bytes currently held across all shards.
-    /// Updated under each shard's ring mutex via atomic ops so
-    /// `usage()` can be called without taking any lock.
+    /// Bytes reserved across all shards. Every reservation is made here
+    /// first and every release taken from here last, so this is never
+    /// below the sum of the shards and never above `capacity`.
     total_used: AtomicUsize,
     /// Whether strict capacity is enforced. See struct doc.
     strict: bool,
@@ -648,13 +446,18 @@ impl BlockCache {
             num_shards /= 2;
         }
         let per_shard = capacity_bytes / num_shards;
+        let capacity = per_shard * num_shards;
+        // A shard holds at most what the whole budget can pay for: its own
+        // share, or more only through oversized entries the cache-wide
+        // reservation admitted.
+        let max_slots = capacity / ENTRY_OVERHEAD + 2;
         let shards: Box<[CacheShard]> = (0..num_shards)
-            .map(|_| CacheShard::new(per_shard))
+            .map(|_| CacheShard::new(per_shard, max_slots))
             .collect::<Vec<_>>()
             .into_boxed_slice();
         Self {
             shards,
-            capacity: per_shard * num_shards,
+            capacity,
             shard_mask: (num_shards - 1) as u64,
             #[cfg(test)]
             num_shards,
@@ -702,10 +505,9 @@ impl BlockCache {
         (xxh3_64(&buf) & self.shard_mask) as usize
     }
 
-    /// Try to get a block from the cache. A disabled cache
-    /// (`block_cache_size` of 0) always misses and records nothing:
-    /// there was no cache lookup to count.
-    /// Look one slot up and project out the requested payload kind.
+    /// Look one slot up and project out the requested payload kind. A
+    /// disabled cache (`block_cache_size` of 0) always misses and records
+    /// nothing: there was no cache lookup to count.
     ///
     /// A slot holding another kind reads as a miss and is left in place:
     /// the key space is disjoint by construction, so a mismatch means a
@@ -715,14 +517,14 @@ impl BlockCache {
         &self,
         file_id: u64,
         offset: u64,
-        project: fn(&CacheEntry) -> Option<Arc<T>>,
+        project: fn(CacheEntry) -> Option<Arc<T>>,
     ) -> Option<Arc<T>> {
         if self.shards.is_empty() {
             return None;
         }
         let key = CacheKey { file_id, offset };
         let idx = self.shard_index(&key);
-        let hit = self.shards[idx].get(&key).as_ref().and_then(project);
+        let hit = self.shards[idx].get(&key).and_then(project);
         if let Some(s) = self.stats.as_deref() {
             if hit.is_some() {
                 s.add(Ticker::BlockCacheHit, 1);
@@ -734,25 +536,27 @@ impl BlockCache {
         hit
     }
 
+    /// Try to get a data block. The returned `Arc` pins the block: the
+    /// cache will not evict it while it is held.
     pub(crate) fn get(&self, file_id: u64, offset: u64) -> Option<Arc<Block>> {
         self.lookup(file_id, offset, |entry| match entry {
-            CacheEntry::Data(block) => Some(Arc::clone(block)),
+            CacheEntry::Data(block) => Some(block),
             _ => None,
         })
     }
 
-    /// Try to get an SSTable index block.
+    /// Try to get an SSTable index block, pinned as [`Self::get`] pins.
     pub(crate) fn get_index(&self, file_id: u64, offset: u64) -> Option<Arc<IndexBlock>> {
         self.lookup(file_id, offset, |entry| match entry {
-            CacheEntry::Index(block) => Some(Arc::clone(block)),
+            CacheEntry::Index(block) => Some(block),
             _ => None,
         })
     }
 
-    /// Try to get an SSTable filter block.
+    /// Try to get an SSTable filter block, pinned as [`Self::get`] pins.
     pub(crate) fn get_filter(&self, file_id: u64, offset: u64) -> Option<Arc<FilterBlock>> {
         self.lookup(file_id, offset, |entry| match entry {
-            CacheEntry::Filter(block) => Some(Arc::clone(block)),
+            CacheEntry::Filter(block) => Some(block),
             _ => None,
         })
     }
@@ -771,6 +575,12 @@ impl BlockCache {
     /// `Arc`: the caller's clone is the one they continue to
     /// use, and the cache's copy is managed internally. A disabled
     /// cache (`block_cache_size` of 0) drops the block.
+    ///
+    /// Every strong reference to the block beyond the cache's own counts as
+    /// a reader's pin, so the caller's clone pins the entry for as long as
+    /// the caller keeps it, and one `Arc` cached under two keys pins both
+    /// entries until one of them is removed. Each block read from a table
+    /// is its own allocation, so the engine never does the latter.
     pub(crate) fn insert(&self, file_id: u64, offset: u64, block: Arc<Block>) {
         self.store(file_id, offset, CacheEntry::Data(block));
     }
@@ -783,46 +593,17 @@ impl BlockCache {
         }
         let key = CacheKey { file_id, offset };
         let size = entry_charge(&entry);
-        let idx = self.shard_index(&key);
-        let stored = {
-            let shard = &self.shards[idx];
-            let mut ring = shard.ring.lock();
-            let before = ring.used;
-            if shard.insert_within_budget(&mut ring, key, &entry, size) {
-                self.publish(before, ring.used);
-                true
-            } else if self.strict || size > self.capacity {
-                // Too big for one shard, and either strict mode or too
-                // big for the whole cache. `insert_within_budget`
-                // refuses before it touches the ring, so `used` is
-                // still `before` and there is no delta to publish.
-                false
-            } else {
-                // Non-strict oversized. Reserve the entry against the
-                // cache-wide budget before touching the shard, so the
-                // total cannot creep up with the shard count the way an
-                // unchecked per-shard overshoot would. The winning
-                // exchange is itself the publish: it writes the total
-                // this shard will hold once `replace_all_with` has
-                // dropped `before` bytes and stored `size`.
-                loop {
-                    let current = self.total_used.load(Ordering::Acquire);
-                    let after = current.saturating_sub(before).saturating_add(size);
-                    if after > self.capacity {
-                        return false;
-                    }
-                    if self
-                        .total_used
-                        .compare_exchange_weak(current, after, Ordering::AcqRel, Ordering::Acquire)
-                        .is_ok()
-                    {
-                        break;
-                    }
-                }
-                shard.replace_all_with(&mut ring, key, entry, size);
-                true
-            }
+        let shard = &self.shards[self.shard_index(&key)];
+        let reserved = if size <= shard.capacity {
+            self.admit(shard, size)
+        } else if self.strict || size > self.capacity {
+            // Too big for one shard, and either strict mode or too big for
+            // the whole cache. Nothing was reserved or touched.
+            false
+        } else {
+            self.admit_oversized(shard, size)
         };
+        let stored = reserved && self.install(shard, key, entry, size);
         // Counted only when the block was actually cached: the ticker
         // documents itself as one per miss that populated the cache, and
         // a refusal populates nothing.
@@ -832,14 +613,181 @@ impl BlockCache {
         stored
     }
 
-    /// Publish a shard's byte delta to the lock-free running total.
-    /// Adds and subtracts commute, so deltas from different shards can
-    /// land in any order without drifting.
-    fn publish(&self, before: usize, after: usize) {
-        if after >= before {
-            self.total_used.fetch_add(after - before, Ordering::Relaxed);
+    /// Reserve `size` for an entry that fits its shard's share, running the
+    /// shard's hand until it fits. `false` when two sweeps found nothing
+    /// the hand may evict: every entry it reached pinned by a reader, or
+    /// held by another inserter's hand.
+    ///
+    /// A sweep is one revolution of the ring, capped at [`SWEEP`] steps: the
+    /// first honours reference bits, the second takes whatever is not
+    /// pinned. The cap bounds what one insert pays when most of a large
+    /// shard is pinned; the hand is shared, so the inserts that follow
+    /// carry on round the ring from where this one stopped.
+    fn admit(&self, shard: &CacheShard, size: usize) -> bool {
+        let state = shard.state_or_init();
+        let mut steps = 0usize;
+        loop {
+            if self.reserve(shard, size) {
+                return true;
+            }
+            let sweep = state.ring.high_water().min(SWEEP);
+            if sweep == 0 || steps > 2 * sweep {
+                return false;
+            }
+            self.hand_step(shard, state, steps >= sweep);
+            steps += 1;
+        }
+    }
+
+    /// Reserve `size` for an entry larger than its shard's share: against
+    /// the cache-wide budget only, emptying the shard of every entry no
+    /// reader holds. `false` when even an emptied shard would not make room.
+    fn admit_oversized(&self, shard: &CacheShard, size: usize) -> bool {
+        let state = shard.state_or_init();
+        if !bounded_add(&self.total_used, size, self.capacity) {
+            // Only worth emptying the shard when what the other shards hold
+            // leaves room; an estimate, the reservation below decides.
+            let others = self
+                .total_used
+                .load(Ordering::Acquire)
+                .saturating_sub(shard.used.load(Ordering::Acquire));
+            if others.saturating_add(size) > self.capacity {
+                return false;
+            }
+            self.evict_unpinned(shard, state);
+            if !bounded_add(&self.total_used, size, self.capacity) {
+                return false;
+            }
         } else {
-            self.total_used.fetch_sub(before - after, Ordering::Relaxed);
+            self.evict_unpinned(shard, state);
+        }
+        // The cache-wide reservation came first, so the shards never sum
+        // past the total.
+        shard.used.fetch_add(size, Ordering::AcqRel);
+        true
+    }
+
+    /// Reserve `size` against the cache-wide budget, then the shard's.
+    fn reserve(&self, shard: &CacheShard, size: usize) -> bool {
+        if !bounded_add(&self.total_used, size, self.capacity) {
+            return false;
+        }
+        if bounded_add(&shard.used, size, shard.capacity) {
+            return true;
+        }
+        self.total_used.fetch_sub(size, Ordering::AcqRel);
+        false
+    }
+
+    /// Return `size` an entry or a refused reservation held: the shard
+    /// first, the total last, the reverse of [`Self::reserve`].
+    fn release(&self, shard: &CacheShard, size: usize) {
+        shard.used.fetch_sub(size, Ordering::AcqRel);
+        self.total_used.fetch_sub(size, Ordering::AcqRel);
+    }
+
+    /// Publish a reserved entry into its shard's ring and map. Returns
+    /// `false`, with the reservation returned, only when the ring is at its
+    /// slot bound, which the reservation makes unreachable.
+    fn install(&self, shard: &CacheShard, key: CacheKey, entry: CacheEntry, size: usize) -> bool {
+        let state = shard.state_or_init();
+        let Some(slot) = state.ring.take() else {
+            self.release(shard, size);
+            return false;
+        };
+        // Pinned by this insert until the map names it, so the hand cannot
+        // evict an entry the map has not filed yet and leave the map naming
+        // a dead one.
+        let pin = entry.clone_ref();
+        let handle = entry.downgrade();
+        let node = Box::new(Node {
+            entry: Some(entry),
+            key,
+            charge: size,
+        });
+        let Some(generation) = state.ring.publish(slot, node) else {
+            state.ring.give(slot);
+            self.release(shard, size);
+            return false;
+        };
+        let indexed = Indexed {
+            entry: handle,
+            slot: slot as u32,
+            generation,
+        };
+        if let Some(replaced) = state.map.insert(key, indexed)
+            && let Some(claim) = state.ring.doom(replaced.slot as usize, replaced.generation)
+        {
+            self.remove(shard, state, claim);
+        }
+        // A `clear` may have removed this entry between its publication and
+        // the map insert above, finding nothing in the map to unlink. One
+        // side or the other sees the other's write (both fence), so the map
+        // never keeps naming an entry the ring dropped.
+        std::sync::atomic::fence(Ordering::SeqCst);
+        if !state.ring.is_live(slot, generation) {
+            state
+                .map
+                .remove_if(&key, |found| found.names(slot, generation));
+        }
+        drop(pin);
+        true
+    }
+
+    /// One step of `shard`'s hand: evict what it lands on if no reader
+    /// holds it, finish a removal another thread asked for, or pass.
+    fn hand_step(&self, shard: &CacheShard, state: &ShardState, forced: bool) {
+        if let Hand::Claimed(claim) = state.ring.step(forced) {
+            self.evict_or_keep(shard, state, claim);
+        }
+    }
+
+    /// Evict the claimed entry unless a reader holds it; a doomed entry
+    /// goes whatever its pins.
+    fn evict_or_keep(&self, shard: &CacheShard, state: &ShardState, mut claim: Claim<'_>) {
+        if claim.doomed() {
+            self.remove(shard, state, claim);
+            return;
+        }
+        let Some(entry) = claim.node().entry.take() else {
+            self.remove(shard, state, claim);
+            return;
+        };
+        match entry.release_if_unpinned() {
+            Ok(()) => self.remove(shard, state, claim),
+            Err(pinned) => {
+                claim.node().entry = Some(pinned);
+                if let Some(doomed) = claim.release() {
+                    self.remove(shard, state, doomed);
+                }
+            }
+        }
+    }
+
+    /// Take the claimed entry out of the ring and the map, give its slot
+    /// back and return its charge. Drops the cache's reference if the entry
+    /// still holds one (an explicit removal).
+    fn remove(&self, shard: &CacheShard, state: &ShardState, claim: Claim<'_>) {
+        let (slot, generation) = (claim.index(), claim.generation());
+        let node = claim.remove();
+        // Pairs with the fence in `install`: see there.
+        std::sync::atomic::fence(Ordering::SeqCst);
+        state
+            .map
+            .remove_if(&node.key, |found| found.names(slot, generation));
+        // The slot goes back before the bytes do, so a slot in use always
+        // carries a charge and the ring never outgrows the budget.
+        state.ring.give(slot);
+        self.release(shard, node.charge);
+    }
+
+    /// Evict every entry of `shard` no reader holds, reference bits
+    /// ignored.
+    fn evict_unpinned(&self, shard: &CacheShard, state: &ShardState) {
+        for slot in 0..state.ring.high_water() {
+            if let Some(claim) = state.ring.claim_any(slot) {
+                self.evict_or_keep(shard, state, claim);
+            }
         }
     }
 
@@ -865,36 +813,51 @@ impl BlockCache {
     }
 
     /// Evict all blocks belonging to a specific file.
+    ///
+    /// Driven off each shard's map, which names every filed entry with its
+    /// `(slot, generation)`: the entry is unlinked from the map and its ring
+    /// slot doomed, so a slot another thread holds right now is removed by
+    /// that thread. An insert of the same file racing this call may land
+    /// after the walk passed its key; its block stays charged until the
+    /// hand evicts it, which costs memory and never a wrong read, since a
+    /// file id is never reused.
     pub(crate) fn evict_file(&self, file_id: u64) {
         for shard in self.shards.iter() {
-            let (before, after) = {
-                let mut ring = shard.ring.lock();
-                let before = ring.used;
-                shard.evict_file(&mut ring, file_id);
-                (before, ring.used)
+            let Some(state) = shard.state() else {
+                continue;
             };
-            if before > after {
-                self.total_used.fetch_sub(before - after, Ordering::Relaxed);
+            for (key, found) in state.map.iter() {
+                if key.file_id != file_id {
+                    continue;
+                }
+                if state
+                    .map
+                    .remove_if(&key, |now| now.names(found.slot as usize, found.generation))
+                    .is_some()
+                    && let Some(claim) = state.ring.doom(found.slot as usize, found.generation)
+                {
+                    self.remove(shard, state, claim);
+                }
             }
         }
     }
 
     /// Clear the entire cache.
     ///
-    /// Each shard publishes exactly the bytes it dropped, under its own
-    /// lock. Storing a flat zero into the running total instead would
-    /// race an `insert` whose delta has not landed yet and leave
-    /// `usage()` permanently under-reporting what the shards hold.
+    /// Every published entry is doomed and removed, each returning exactly
+    /// the bytes it charged, so the running total stays exact under racing
+    /// inserts. An insert racing the walk may land behind it and stay.
     pub(crate) fn clear(&self) {
         for shard in self.shards.iter() {
-            let freed = {
-                let mut ring = shard.ring.lock();
-                let freed = ring.used;
-                shard.clear(&mut ring);
-                freed
+            let Some(state) = shard.state() else {
+                continue;
             };
-            if freed > 0 {
-                self.total_used.fetch_sub(freed, Ordering::Relaxed);
+            for slot in 0..state.ring.high_water() {
+                if let Some(generation) = state.ring.live_generation(slot)
+                    && let Some(claim) = state.ring.doom(slot, generation)
+                {
+                    self.remove(shard, state, claim);
+                }
             }
         }
     }
@@ -902,10 +865,10 @@ impl BlockCache {
     /// Total bytes currently held across every shard, counting each
     /// entry's [`Block::charge`] plus [`ENTRY_OVERHEAD`]. Used by the
     /// `regolith.block-cache-usage` property and by unit tests to verify
-    /// eviction. Lock-free, so it can lag an insert in flight on
-    /// another thread by that insert's charge.
+    /// eviction. Lock-free; it includes an insert's reservation from the
+    /// moment it is made, so it never reads below what the shards hold.
     pub(crate) fn usage(&self) -> usize {
-        self.total_used.load(Ordering::Relaxed)
+        self.total_used.load(Ordering::Acquire)
     }
 
     /// Total byte capacity: the sum of every shard's budget.
@@ -916,10 +879,12 @@ impl BlockCache {
     pub(crate) fn capacity(&self) -> usize {
         self.capacity
     }
+}
 
+#[cfg(test)]
+impl BlockCache {
     /// Number of shards in this cache. Exposed for tests that
     /// want to verify multi-shard distribution.
-    #[cfg(test)]
     pub(crate) fn num_shards(&self) -> usize {
         self.num_shards
     }
@@ -927,424 +892,34 @@ impl BlockCache {
     /// Number of shards currently holding at least one entry.
     /// Used by tests to confirm sharding actually distributes
     /// inserts across the shard array.
-    #[cfg(test)]
     pub(crate) fn populated_shards(&self) -> usize {
         self.shards
             .iter()
-            .filter(|s| s.ring.lock().used > 0)
+            .filter(|s| s.used.load(Ordering::Acquire) > 0)
             .count()
     }
 
-    /// Bytes actually held, recomputed from the shards under their
-    /// own locks. The ground truth `usage()`'s lock-free atomic is
-    /// supposed to track.
-    #[cfg(test)]
+    /// Bytes the shards hold, summed. Never above [`Self::usage`], which
+    /// takes every reservation first and every release last.
     pub(crate) fn true_usage(&self) -> usize {
-        // One consistent snapshot, not a running sum. Locking each shard
-        // in turn and adding as it goes can report a total that never
-        // existed: an insert that moves bytes while the walk is in
-        // progress is counted in the shard it left and again in the one
-        // it reached. Every ring is held at once so the sum is a real
-        // instant. Acquiring in index order is safe because no path ever
-        // holds two ring locks.
-        let held: Vec<_> = self.shards.iter().map(|s| s.ring.lock()).collect();
-        held.iter().map(|ring| ring.used).sum()
+        self.shards
+            .iter()
+            .map(|s| s.used.load(Ordering::Acquire))
+            .sum()
     }
 
-    /// Entries currently held across every shard.
-    #[cfg(test)]
+    /// Entries currently filed in the shards' maps.
     pub(crate) fn entry_count(&self) -> usize {
         self.shards
             .iter()
-            .map(|s| s.map.get().map_or(0, |m| m.len()))
+            .map(|s| s.state().map_or(0, |state| state.map.len()))
             .sum()
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The per-entry footprint is charged against the byte budget, so
-    /// growing it silently would let the cache hold more heap than the
-    /// budget admits. `ENTRY_OVERHEAD` already under-charges the real
-    /// bookkeeping deliberately; this pins the part of it that a code
-    /// change could move without anyone noticing.
-    #[test]
-    fn a_cache_entry_does_not_outgrow_its_charge() {
-        assert_eq!(
-            std::mem::size_of::<ClockEntry>(),
-            48,
-            "ClockEntry grew: either shrink it again or raise ENTRY_OVERHEAD \
-             and re-measure the hit rate, because admission changes with it"
-        );
-    }
-
-    use crate::engine::block::{BlockBuilder, RESTART_INTERVAL};
-
-    fn dummy_block(size: usize) -> Arc<Block> {
-        let mut builder = BlockBuilder::new(RESTART_INTERVAL);
-        let value = vec![0u8; size];
-        builder.add(b"k", &value);
-        Arc::new(Block::decode(builder.finish()).expect("decode"))
-    }
-
-    #[test]
-    fn single_insert_then_get() {
-        let cache = BlockCache::new(1024 * 1024);
-        let blk = dummy_block(256);
-        cache.insert(1, 0, blk.clone());
-        assert!(cache.get(1, 0).is_some());
-        assert!(cache.usage() >= 256);
-    }
-
-    #[test]
-    fn eviction_bounds_total_usage() {
-        // 4 KB capacity, 1 shard (MIN_SHARD_CAPACITY fallback
-        // collapses to 1 since 4 KB / 64 = 64 bytes per shard).
-        let cache = BlockCache::with_config(4 * 1024, 6, false);
-        // Insert many 1 KB blocks. Only a handful should survive.
-        for i in 0..32u64 {
-            cache.insert(1, i * 100, dummy_block(1024));
-        }
-        let usage = cache.usage();
-        assert!(
-            usage <= cache.capacity(),
-            "usage {usage} exceeded capacity {}",
-            cache.capacity()
-        );
-        // Oldest entry should have been evicted.
-        assert!(cache.get(1, 0).is_none());
-    }
-
-    #[test]
-    fn strict_capacity_rejects_oversized_entry() {
-        let cache = BlockCache::with_config(64 * 1024, 0, true);
-        // Single shard, 64 KB capacity. A 128 KB block won't fit.
-        let big = dummy_block(128 * 1024);
-        cache.insert(1, 0, big);
-        assert!(
-            cache.get(1, 0).is_none(),
-            "strict cache must reject oversized entries"
-        );
-        assert_eq!(cache.usage(), 0);
-    }
-
-    #[test]
-    fn non_strict_cache_admits_an_entry_bigger_than_one_shard() {
-        // 8 shards of 64 KiB. A 128 KiB block does not fit its own
-        // shard but fits the 512 KiB cache-wide budget, so the
-        // non-strict cache empties the shard and takes it.
-        let cache = BlockCache::with_config(512 * 1024, 3, false);
-        assert_eq!(cache.num_shards(), 8);
-        cache.insert(1, 0, dummy_block(128 * 1024));
-        assert!(
-            cache.get(1, 0).is_some(),
-            "non-strict cache should admit an entry larger than one shard"
-        );
-        assert!(cache.usage() <= cache.capacity());
-    }
-
-    #[test]
-    fn non_strict_cache_refuses_an_entry_bigger_than_the_whole_budget() {
-        let cache = BlockCache::with_config(64 * 1024, 0, false);
-        cache.insert(1, 0, dummy_block(128 * 1024));
-        assert!(
-            cache.get(1, 0).is_none(),
-            "a block larger than the entire budget must not be cached"
-        );
-        assert_eq!(cache.usage(), 0);
-    }
-
-    #[test]
-    fn oversized_admissions_stay_inside_the_budget_at_every_shard_count() {
-        // One oversized entry per shard used to be admitted with no
-        // cache-wide check, so resident bytes scaled with the shard
-        // count instead of the budget.
-        let budget = 256 * 64 * 1024;
-        let mut usages = Vec::new();
-        for bits in [0u32, 4, 8] {
-            let cache = BlockCache::with_config(budget, bits, false);
-            for file_id in 0..4096u64 {
-                cache.insert(file_id, 0, dummy_block(256 * 1024));
-            }
-            assert!(
-                cache.usage() <= cache.capacity(),
-                "shard_bits {bits}: usage {} over capacity {}",
-                cache.usage(),
-                cache.capacity()
-            );
-            usages.push(cache.usage());
-        }
-        assert_eq!(
-            usages[0], usages[2],
-            "resident bytes still track the shard count"
-        );
-    }
-
-    #[test]
-    fn sharding_distributes_inserts_across_shards() {
-        // 64 MB so we get the full 64-shard default. Insert 1024
-        // entries across many different (file_id, offset) pairs
-        // and verify more than one shard ends up populated.
-        let cache = BlockCache::with_config(64 * 1024 * 1024, 6, false);
-        for i in 0..1024u64 {
-            cache.insert(i, i * 4096, dummy_block(1024));
-        }
-        let populated = cache.populated_shards();
-        assert_eq!(cache.num_shards(), 64);
-        assert!(
-            populated > 16,
-            "expected inserts to fan out across shards, populated = {populated}"
-        );
-    }
-
-    #[test]
-    fn evict_file_removes_only_that_files_blocks() {
-        let cache = BlockCache::with_config(64 * 1024 * 1024, 6, false);
-        for off in 0..16u64 {
-            cache.insert(1, off * 4096, dummy_block(1024));
-            cache.insert(2, off * 4096, dummy_block(1024));
-        }
-        cache.evict_file(1);
-        // File 1 is gone.
-        for off in 0..16u64 {
-            assert!(cache.get(1, off * 4096).is_none());
-            assert!(cache.get(2, off * 4096).is_some());
-        }
-    }
-
-    #[test]
-    fn clear_zeroes_usage() {
-        let cache = BlockCache::with_config(64 * 1024 * 1024, 6, false);
-        for i in 0..64u64 {
-            cache.insert(1, i * 4096, dummy_block(1024));
-        }
-        assert!(cache.usage() > 0);
-        cache.clear();
-        assert_eq!(cache.usage(), 0);
-        assert!(cache.get(1, 0).is_none());
-    }
-
-    #[test]
-    fn repeated_insert_at_same_key_does_not_double_count() {
-        let cache = BlockCache::with_config(64 * 1024, 0, false);
-        cache.insert(1, 0, dummy_block(1024));
-        let first_usage = cache.usage();
-        cache.insert(1, 0, dummy_block(1024));
-        cache.insert(1, 0, dummy_block(1024));
-        // Re-inserting the same key replaces rather than accumulating.
-        let final_usage = cache.usage();
-        assert_eq!(first_usage, final_usage);
-    }
-
-    #[test]
-    fn miss_on_absent_key_returns_none() {
-        let cache = BlockCache::with_config(64 * 1024, 0, false);
-        assert!(cache.get(99, 999).is_none());
-    }
-
-    #[test]
-    fn capacity_reflects_rounded_budget() {
-        // 100 KB / 64 shards would drop below MIN_SHARD_CAPACITY, so
-        // the constructor collapses to fewer shards. Capacity is the
-        // actual rounded budget after collapse, not the request.
-        let cache = BlockCache::with_config(100_000, 6, false);
-        assert!(cache.capacity() <= 100_000);
-        assert!(cache.capacity() > 0);
-    }
-
-    #[test]
-    fn resident_bytes_track_the_byte_budget_not_the_shard_count() {
-        // The defect this guards: every shard used to preallocate a
-        // fixed 1,000,000-entry map, so the cache's own footprint
-        // scaled with the shard count and ignored the byte budget.
-        // Nothing is allocated up front now, and the budget is the
-        // only bound at any shard count.
-        let budget = 8 * 1024 * 1024;
-        let mut usages = Vec::new();
-        for bits in [0u32, 2, 4, 6] {
-            let cache = BlockCache::with_config(budget, bits, false);
-            assert_eq!(cache.usage(), 0, "a fresh cache holds nothing");
-            for i in 0..8192u64 {
-                cache.insert(1, i * 4096, dummy_block(4096));
-            }
-            assert!(
-                cache.usage() <= cache.capacity(),
-                "shard_bits {bits}: usage {} over capacity {}",
-                cache.usage(),
-                cache.capacity()
-            );
-            usages.push(cache.usage());
-        }
-        // Every configuration converges on the same budget, within one
-        // entry per shard of rounding.
-        let spread =
-            usages.iter().max().copied().unwrap_or(0) - usages.iter().min().copied().unwrap_or(0);
-        assert!(
-            spread <= budget / 16,
-            "resident bytes moved with shard_bits: {usages:?}"
-        );
-    }
-
-    #[test]
-    fn per_entry_overhead_is_charged_against_the_budget() {
-        // A budget filled with tiny blocks is bounded by the entry
-        // overhead, not just by payload bytes: without charging it, a
-        // 1 MiB budget would hold millions of 64-byte blocks.
-        let cache = BlockCache::with_config(1024 * 1024, 0, false);
-        for i in 0..100_000u64 {
-            cache.insert(1, i * 64, dummy_block(0));
-        }
-        assert!(cache.usage() <= cache.capacity());
-        assert!(
-            cache.entry_count() <= cache.capacity() / ENTRY_OVERHEAD,
-            "held {} entries against a {}-byte budget",
-            cache.entry_count(),
-            cache.capacity()
-        );
-    }
-
-    #[test]
-    fn a_working_set_that_fits_the_budget_is_kept_whole() {
-        // The regression this guards: an entry-count cap derived from
-        // the configured `block_size` evicted entries that fit inside
-        // the byte budget, silently shrinking the cache.
-        let cache = BlockCache::with_config(8 * 1024 * 1024, 0, false);
-        let mut offered = 0usize;
-        for i in 0..3500u64 {
-            let blk = dummy_block(1024);
-            offered += entry_charge(&CacheEntry::Data(Arc::clone(&blk)));
-            cache.insert(1, i * 4096, blk);
-        }
-        assert!(
-            offered <= cache.capacity(),
-            "test setup: the working set must fit the byte budget"
-        );
-        assert_eq!(
-            cache.entry_count(),
-            3500,
-            "the cache evicted entries that fit inside its byte budget"
-        );
-        assert_eq!(cache.usage(), offered);
-    }
-
-    #[test]
-    fn zero_budget_disables_the_cache() {
-        let cache = BlockCache::with_config(0, 6, false);
-        assert_eq!(cache.num_shards(), 0);
-        assert_eq!(cache.capacity(), 0);
-        cache.insert(1, 0, dummy_block(256));
-        assert!(cache.get(1, 0).is_none());
-        assert_eq!(cache.usage(), 0);
-        cache.evict_file(1);
-        cache.clear();
-        assert_eq!(cache.usage(), 0);
-    }
-
-    #[test]
-    fn zero_budget_strict_cache_is_also_disabled() {
-        let cache = BlockCache::with_config(0, 0, true);
-        cache.insert(1, 0, dummy_block(256));
-        assert!(cache.get(1, 0).is_none());
-        assert_eq!(cache.usage(), 0);
-    }
-
-    #[test]
-    fn tiny_budget_still_admits_a_block_that_fits() {
-        let cache = BlockCache::with_config(4096, 6, false);
-        cache.insert(1, 0, dummy_block(128));
-        assert!(cache.get(1, 0).is_some());
-        assert!(cache.usage() <= cache.capacity());
-    }
-
-    /// Byte accounting is exact: `usage()` is the sum of every live
-    /// entry's charge, which backs the `regolith.block-cache-usage`
-    /// property.
-    #[test]
-    fn byte_accounting_is_exact() {
-        let cache = BlockCache::with_config(64 * 1024 * 1024, 0, false);
-        let mut expected = 0usize;
-        for i in 0..64u64 {
-            let blk = dummy_block(512);
-            expected += entry_charge(&CacheEntry::Data(Arc::clone(&blk)));
-            cache.insert(1, i * 4096, blk);
-        }
-        assert_eq!(cache.usage(), expected);
-    }
-
-    /// `clear()` used to store a flat zero into the running total
-    /// outside the shard locks, so a concurrent `insert` could add its
-    /// delta afterwards and leave `usage()` reporting bytes the cache
-    /// does not hold, permanently.
-    #[test]
-    fn usage_does_not_drift_when_clear_races_insert() {
-        use std::sync::atomic::AtomicBool;
-        for _ in 0..50 {
-            let cache = Arc::new(BlockCache::with_config(64 * 1024 * 1024, 6, false));
-            let stop = Arc::new(AtomicBool::new(false));
-            let writer = {
-                let cache = Arc::clone(&cache);
-                let stop = Arc::clone(&stop);
-                std::thread::spawn(move || {
-                    let mut i = 0u64;
-                    while !stop.load(Ordering::Relaxed) {
-                        cache.insert(i % 97, i * 4096, dummy_block(256));
-                        i += 1;
-                    }
-                })
-            };
-            for _ in 0..300 {
-                cache.clear();
-            }
-            stop.store(true, Ordering::Relaxed);
-            writer.join().expect("writer");
-            assert_eq!(
-                cache.usage(),
-                cache.true_usage(),
-                "usage() drifted away from the real byte total"
-            );
-        }
-    }
-
-    /// Concurrent readers and writers racing eviction: the byte budget
-    /// holds under contention.
-    #[test]
-    fn concurrent_inserts_respect_the_budget() {
-        let cache = Arc::new(BlockCache::with_config(1024 * 1024, 2, false));
-        let mut handles = Vec::new();
-        for t in 0..8u64 {
-            let cache = Arc::clone(&cache);
-            handles.push(std::thread::spawn(move || {
-                for i in 0..4000u64 {
-                    cache.insert(t, i * 64, dummy_block(64));
-                    let _ = cache.get(t, (i / 2) * 64);
-                }
-            }));
-        }
-        for h in handles {
-            h.join().expect("worker");
-        }
-        assert!(
-            cache.true_usage() <= cache.capacity(),
-            "usage {} over capacity {}",
-            cache.true_usage(),
-            cache.capacity()
-        );
-    }
-
-    #[test]
-    fn evict_file_does_not_touch_other_files() {
-        let cache = BlockCache::with_config(64 * 1024 * 1024, 6, false);
-        cache.insert(7, 0, dummy_block(1024));
-        cache.insert(8, 0, dummy_block(1024));
-        let before = cache.usage();
-        cache.evict_file(99); // a file id that was never inserted
-        assert_eq!(cache.usage(), before);
-        assert!(cache.get(7, 0).is_some());
-        assert!(cache.get(8, 0).is_some());
-    }
-}
+#[path = "block_cache/tests.rs"]
+mod tests;
 
 #[cfg(test)]
 #[path = "block_cache_adversarial.rs"]

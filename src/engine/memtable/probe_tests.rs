@@ -3,8 +3,6 @@
 
 use super::*;
 use proptest::prelude::*;
-use std::sync::mpsc::{RecvTimeoutError, channel};
-use std::time::Duration;
 
 fn memtable() -> MemTable {
     MemTable::new(&MemTableConfig::default()).expect("memtable")
@@ -34,49 +32,55 @@ fn covering_seq_is_zero_before_any_range_delete_and_found_after_one() {
 }
 
 #[test]
-fn a_lookup_on_a_tombstone_free_memtable_takes_no_lock() {
+fn a_tombstone_free_memtable_answers_from_the_gate_alone() {
     let mt = memtable();
-    let guard = mt.range_tombstones.lock();
-    let (tx, rx) = channel();
-    std::thread::scope(|scope| {
-        scope.spawn(|| {
-            let result = mt.covering_range_tombstone_seq(b"k", u64::MAX);
-            let _ = tx.send(result);
-        });
-        match rx.recv_timeout(Duration::from_secs(10)) {
-            Ok(result) => assert_eq!(result, 0),
-            Err(RecvTimeoutError::Timeout) => {
-                // Drop the guard so the spawned thread can finish before the
-                // scope tries to join it, then fail with the real cause.
-                drop(guard);
-                panic!("lookup took the tombstone lock on a memtable with no tombstones");
-            }
-            Err(RecvTimeoutError::Disconnected) => {
-                drop(guard);
-                panic!("lookup thread ended without sending a result");
-            }
-        }
-    });
+    assert!(!mt.has_range_tombstones());
+    assert_eq!(mt.covering_range_tombstone_seq(b"k", u64::MAX), 0);
+    assert_eq!(mt.newer_range_tombstone(b"a", b"z", 0), None);
+    mt.delete_range(b"a", b"z", 1);
+    assert!(mt.has_range_tombstones());
 }
 
+/// The rule a commit relies on: a range delete published before a read
+/// began is seen by that read, while the writer keeps appending and no
+/// reader ever waits for it. The writer publishes how far it has appended
+/// with a release store after each append, the way the commit leader
+/// publishes the read horizon after applying; a reader that acquires `p`
+/// must find tombstone `p`.
 #[test]
-fn a_lookup_takes_the_lock_once_a_tombstone_exists() {
+fn a_read_sees_every_range_delete_published_before_it_while_appends_continue() {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as StdOrdering};
+    const APPENDS: u64 = 3_000;
     let mt = memtable();
-    mt.delete_range(b"a", b"z", 1);
-    let guard = mt.range_tombstones.lock();
-    let (tx, rx) = channel();
+    let published = AtomicU64::new(0);
+    let done = AtomicBool::new(false);
     std::thread::scope(|scope| {
-        scope.spawn(|| {
-            let result = mt.covering_range_tombstone_seq(b"k", u64::MAX);
-            let _ = tx.send(result);
-        });
-        assert_eq!(
-            rx.recv_timeout(Duration::from_millis(200)),
-            Err(RecvTimeoutError::Timeout),
-            "a lookup on a memtable holding a tombstone must take the lock"
-        );
-        drop(guard);
-        assert_eq!(rx.recv().expect("lookup completes once unblocked"), 1);
+        for _ in 0..4 {
+            scope.spawn(|| {
+                let mut lookups = 0u64;
+                while !done.load(StdOrdering::Acquire) {
+                    let p = published.load(StdOrdering::Acquire);
+                    if p == 0 {
+                        continue;
+                    }
+                    let key = format!("k{p:06}").into_bytes();
+                    assert_eq!(
+                        mt.covering_range_tombstone_seq(&key, u64::MAX),
+                        p,
+                        "a range delete published before this read was not seen"
+                    );
+                    lookups += 1;
+                }
+                assert!(lookups > 0, "a reader never ran a lookup");
+            });
+        }
+        for seq in 1..=APPENDS {
+            let start = format!("k{seq:06}").into_bytes();
+            let end = format!("k{seq:06}\x00").into_bytes();
+            mt.delete_range(&start, &end, seq);
+            published.store(seq, StdOrdering::Release);
+        }
+        done.store(true, StdOrdering::Release);
     });
 }
 

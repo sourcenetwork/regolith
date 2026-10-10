@@ -1,7 +1,9 @@
 //! The per-core hot paths under contention: snapshot registration and
 //! statistics tickers (plan 4.6, D54).
 //!
-//! Run with `cargo bench --bench per_core`.
+//! Run with `cargo bench --bench per_core`. The read path's per-core
+//! structures (the read view, the block cache, range tombstones) are in
+//! `per_core_reads`.
 //!
 //! Each case runs on 1, 4, 16 and 64 threads at once against one database;
 //! one element is one operation on one thread, and the reported time is the

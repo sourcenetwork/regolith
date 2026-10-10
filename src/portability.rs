@@ -89,4 +89,6 @@
 //! and a wait for snapshots to drain parks on a `regolith::sync::Notify`
 //! its releases wake; none of them on a condvar.
 
-pub(crate) use portable_atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
+pub(crate) use portable_atomic::{
+    AtomicBool, AtomicPtr, AtomicU8, AtomicU64, AtomicUsize, Ordering,
+};
