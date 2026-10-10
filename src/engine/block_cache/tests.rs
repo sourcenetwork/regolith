@@ -452,6 +452,100 @@ fn a_shard_full_of_pinned_blocks_refuses_inserts_and_holds_its_budget() {
     );
 }
 
+/// Every insert a shard full of held blocks refuses is counted (plan D58),
+/// and only those: an insert that found a block to evict, and one that
+/// fitted, count nothing.
+#[test]
+fn a_refused_insert_is_counted_once_and_an_admitted_one_never() {
+    let stats = Arc::new(Statistics::new());
+    let cache = BlockCache::with_config(16 * 1024, 0, false).with_stats(Some(Arc::clone(&stats)));
+    let refused = || stats.get_ticker(Ticker::BlockCacheAddRefusedHeld);
+    let mut held = Vec::new();
+    let mut i = 0u64;
+    loop {
+        cache.insert(1, i * 4096, dummy_block(1024));
+        match cache.get(1, i * 4096) {
+            Some(block) => held.push(block),
+            None => break,
+        }
+        i += 1;
+    }
+    assert_eq!(refused(), 1, "the insert that ended the fill was refused");
+    let added = stats.get_ticker(Ticker::BlockCacheAdd);
+    for j in 0..64u64 {
+        cache.insert(2, j * 4096, dummy_block(1024));
+    }
+    assert_eq!(refused(), 65, "each refused insert counts once");
+    assert_eq!(
+        stats.get_ticker(Ticker::BlockCacheAdd),
+        added,
+        "a refused insert counted as an add"
+    );
+    held.pop();
+    cache.insert(3, 0, dummy_block(1024));
+    assert!(cache.get(3, 0).is_some());
+    assert_eq!(refused(), 65, "an insert that evicted counted as refused");
+}
+
+/// An entry larger than its shard's share is refused, and counted, when the
+/// blocks its shard still holds after it empties the shard leave no room.
+/// Refused because the other shards are full, it is not counted: those
+/// blocks were never offered to its hand.
+#[test]
+fn an_oversized_insert_refused_for_held_blocks_is_counted() {
+    let stats = Arc::new(Statistics::new());
+    // Four shards of 64 KiB.
+    let cache = BlockCache::with_config(256 * 1024, 2, false).with_stats(Some(Arc::clone(&stats)));
+    let shard_of = |file_id: u64, offset: u64| cache.shard_index(&CacheKey { file_id, offset });
+    let target = shard_of(9, 0);
+    let big = || dummy_block(40 * 1024);
+    assert!(
+        entry_charge(&CacheEntry::Data(big())) > cache.shards[target].capacity,
+        "setup: the entry is larger than its shard's share"
+    );
+    // Fill the target shard with blocks a reader holds.
+    let mut held = Vec::new();
+    let mut offset = 0u64;
+    while cache.shards[target].used.load(Ordering::Acquire) < 48 * 1024 {
+        offset += 4096;
+        if shard_of(1, offset) != target {
+            continue;
+        }
+        cache.insert(1, offset, dummy_block(8 * 1024));
+        held.push(cache.get(1, offset).expect("setup: the shard admits it"));
+    }
+    // Other shards hold unpinned blocks, few enough that the entry would
+    // fit beside them were the target shard empty.
+    let in_target = cache.shards[target].used.load(Ordering::Acquire);
+    let mut other = 0u64;
+    while cache.total_used.load(Ordering::Acquire) - in_target < 136 * 1024 {
+        other += 4096;
+        if shard_of(2, other) == target {
+            continue;
+        }
+        cache.insert(2, other, dummy_block(8 * 1024));
+    }
+    let before = stats.get_ticker(Ticker::BlockCacheAddRefusedHeld);
+    cache.insert(9, 0, big());
+    assert!(
+        cache.get(9, 0).is_none(),
+        "setup: the held blocks leave no room"
+    );
+    assert_eq!(
+        stats.get_ticker(Ticker::BlockCacheAddRefusedHeld),
+        before + 1,
+        "an oversized insert refused for held blocks went uncounted"
+    );
+    // With the target's blocks released, the same insert fits.
+    held.clear();
+    cache.insert(9, 0, big());
+    assert!(cache.get(9, 0).is_some(), "an insert was refused with room");
+    assert_eq!(
+        stats.get_ticker(Ticker::BlockCacheAddRefusedHeld),
+        before + 1
+    );
+}
+
 /// Explicit removals do not wait for readers: a re-insert, `evict_file`
 /// and `clear` drop the cache's reference, and the reader keeps its own.
 #[test]

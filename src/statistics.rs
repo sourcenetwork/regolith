@@ -163,9 +163,15 @@ pub enum Ticker {
     /// Bytes discarded from the end of the MANIFEST at open, summed over the
     /// discards [`Ticker::ManifestTailDiscarded`] counts.
     ManifestTailDiscardedBytes = 35,
+    /// Blocks the block cache refused to keep because every block its hand
+    /// could take was held by a reader (or by another insert's hand), so
+    /// keeping one more would pass the byte budget. The read that loaded the
+    /// block still uses it, uncached. A steady count means the cache is too
+    /// small for the blocks readers hold at once.
+    BlockCacheAddRefusedHeld = 36,
 }
 
-const NUM_TICKERS: usize = 36;
+const NUM_TICKERS: usize = 37;
 
 impl Ticker {
     /// Every defined ticker, in discriminant order. Adding a variant
@@ -207,6 +213,7 @@ impl Ticker {
         Ticker::WalRemoveFailed,
         Ticker::ManifestTailDiscarded,
         Ticker::ManifestTailDiscardedBytes,
+        Ticker::BlockCacheAddRefusedHeld,
     ];
 
     /// Stable string name for exporting to monitoring systems.
@@ -248,6 +255,7 @@ impl Ticker {
             Ticker::WalRemoveFailed => "regolith.wal.remove_failed",
             Ticker::ManifestTailDiscarded => "regolith.manifest.tail_discarded",
             Ticker::ManifestTailDiscardedBytes => "regolith.manifest.tail_discarded_bytes",
+            Ticker::BlockCacheAddRefusedHeld => "regolith.block_cache.add_refused_held",
         }
     }
 }
