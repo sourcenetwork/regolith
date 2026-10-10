@@ -589,8 +589,17 @@ impl Options {
     /// fails with EMFILE. With a limit, the least recently read tables
     /// have their descriptor closed and reopened on the next read; a
     /// read that misses the block cache on such a table pays an `open`.
-    /// The limit is soft: tables a compaction has just deleted stay open
-    /// until no snapshot or iterator can read them.
+    ///
+    /// The limit is hard: SSTable descriptors never number more than
+    /// `max_open_files`, and none is closed while a read uses it. A table
+    /// a compaction deletes while a snapshot or iterator still reads it is
+    /// renamed aside rather than unlinked, so its descriptor stays closable
+    /// and reopens under the new name; the last reader unlinks it, and a
+    /// crash leaves it for the next writable open to remove. When more
+    /// threads read distinct tables at once than there are descriptors, a
+    /// read waits for one of the reads already running to finish. A
+    /// `CacheOnly` handle never reopens a table itself: its miss goes to
+    /// its I/O queue like any other device read.
     #[must_use]
     pub fn max_open_files(mut self, max_open_files: usize) -> Self {
         self.max_open_files = max_open_files;

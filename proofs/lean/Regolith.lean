@@ -24,10 +24,15 @@ import Regolith.Allocate
 -- partial_merge, changes no read at a live snapshot or at the head. Backs
 -- `proofs/tla/StripeCompaction.tla`.
 import Regolith.Stripes
--- 4.6: lock-free registration (announce, sample, confirm) keeps the
--- compaction's minimum at or below every live snapshot. Backs
--- `proofs/tla/SnapshotRegistry.tla`.
+-- 4.6: per-thread slots with counted entries (announce, sample, confirm;
+-- copies join, releases go where the pin was recorded) keep the
+-- compaction's minimum at or below every live snapshot and every count
+-- exact. Backs `proofs/tla/SnapshotRegistry.tla`.
 import Regolith.SnapshotRegistry
+-- 4.6: per-thread statistics shards sum to every increment, and a read
+-- concurrent with adds is bounded and never goes backwards. Backs
+-- `proofs/tla/ShardedStats.tla`.
+import Regolith.ShardedStats
 -- WalRecovery.lean also holds format 2 replay (4.2), backing
 -- `proofs/tla/WalRecovery.tla`; LsmOrder.lean also holds flush order,
 -- ingest placement, overlap demotion (E14) and binary search.
@@ -88,3 +93,34 @@ import Regolith.ManifestSeal
 -- tag covers and writes a sealed MANIFEST last. Backs
 -- `proofs/tla/BackupSeal.tla`.
 import Regolith.BackupSeal
+-- 4.6, Phase 7b: the wait-free read view. A reader never holds a freed
+-- view nor one older than what was published when its load began, and the
+-- compare-and-swap publication loses no publication. Backs
+-- `proofs/tla/ReadView.tla`.
+import Regolith.ReadView
+-- 4.6, Phase 7 integration: every publisher of the read view (a rotation, a
+-- flush's install and retire on every flush path, a compaction, an ingest)
+-- publishes by compare-and-swap, so no memtable or table is lost and no
+-- retired memtable comes back. Backs `proofs/tla/ReadViewPublishers.tla`.
+import Regolith.ReadViewPublishers
+-- 4.6, Phase 7b: the lock-free CLOCK block cache. The hand evicts only a
+-- block nobody holds and no landing names, counts stay exact, and the
+-- two-level reservation keeps the byte bound. Backs
+-- `proofs/tla/ClockCache.tla`.
+import Regolith.ClockCache
+-- 4.6, Phase 7b: a memtable's append-only range-tombstone log. Readers see
+-- a whole prefix of the appends, including every one a snapshot they took
+-- includes. Backs `proofs/tla/TombstoneLog.tla`.
+import Regolith.TombstoneLog
+-- 4.6, Phase 7c1: the open-file slot table under max_open_files. Never
+-- more open files than slots, never a file closed under a reader, and a
+-- read returns its own table. Backs `proofs/tla/OpenFileTable.tla`.
+import Regolith.OpenFileTable
+-- 4.6, Phase 7c1: column families created and dropped in the ordered step.
+-- No write lands after its family's tombstone or before its birth, and a
+-- family's life only moves forward. Backs `proofs/tla/CfRegistry.tla`.
+import Regolith.CfRegistry
+-- 4.6, Phase 7c1: the env file maps. A positional read gets its own
+-- offset's bytes, and an in-memory read sees every append that finished
+-- before it began. Backs `proofs/tla/EnvFiles.tla`.
+import Regolith.EnvFiles

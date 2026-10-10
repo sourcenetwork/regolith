@@ -54,7 +54,8 @@ use super::callback::InCommit;
 use super::memtable::MemTable;
 use super::wal::{MAX_RECORD_LEN, Wal, check_write_len};
 use super::{
-    CommitOutcome, DurabilityMode, ReadView, RegolithEngine, ValidationSet, grouped_batch_ops,
+    CommitOutcome, DurabilityMode, ReadView, RegolithEngine, ValidationSet, ViewGuard,
+    grouped_batch_ops,
 };
 use crate::perf_context::{PerfContextSnapshot, PerfTimer, PerfTimerField};
 use crate::statistics::{Histogram, Ticker};
@@ -65,6 +66,7 @@ mod append;
 mod content;
 mod counter;
 mod early;
+mod families;
 mod group;
 mod range_rule;
 mod read_rules;
@@ -146,7 +148,8 @@ struct GroupTicket {
     slot: Option<Arc<WriteSlot>>,
     request: WriteRequest,
     /// The decide stage's verdict on a transaction member; `None` for a
-    /// plain write, which is not validated.
+    /// plain write, which is not validated. The column-family fence sets it
+    /// to the refusal, on a member of either kind, before the decide stage.
     verdict: Option<io::Result<Verdict>>,
     /// What deciding a transaction member counted, for its own thread's
     /// perf context; `None` unless that thread counts.
@@ -720,7 +723,7 @@ impl RegolithEngine {
     fn run_and_complete(
         &self,
         pipe: &mut Pipeline,
-        view: Arc<ReadView>,
+        view: ViewGuard<'_>,
     ) -> Option<io::Result<Settled>> {
         let _commit = InCommit::enter();
         let Pipeline {
@@ -732,6 +735,10 @@ impl RegolithEngine {
         // Emptied first, so a group that fails before it encodes leaves no
         // previous group's length behind for the trim below.
         stage.clear();
+        // Before the decide stage and before any sequence: every member, by
+        // whatever path it was admitted, is checked against the live column
+        // families here, where a drop's retire is ordered (`families.rs`).
+        self.fence_group(group);
         let result = self.decide(group, &view).and_then(|()| {
             // Summed after the decide stage, which turned every transaction
             // into what it actually stages, and not carried over from
@@ -792,7 +799,7 @@ impl RegolithEngine {
         &self,
         stage: &mut Vec<u8>,
         group: &[GroupTicket],
-        view: Arc<ReadView>,
+        view: ViewGuard<'_>,
         staged: usize,
     ) -> io::Result<u64> {
         // Cleared first, ahead of every early return (`ensure_writable`,

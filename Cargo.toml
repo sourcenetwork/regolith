@@ -73,7 +73,7 @@ aes-gcm-siv = { version = "0.12", default-features = false, features = ["aes", "
 zeroize = "1"
 getrandom = "0.4"
 
-[target.'cfg(unix)'.dependencies]
+[target.'cfg(any(unix, target_os = "wasi"))'.dependencies]
 rustix = { version = "1.1", features = ["fs"] }
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
@@ -252,4 +252,16 @@ harness = false
 
 [[bench]]
 name = "encryption"
+harness = false
+
+[[bench]]
+name = "per_core"
+harness = false
+
+[[bench]]
+name = "per_core_reads"
+harness = false
+
+[[bench]]
+name = "tables"
 harness = false

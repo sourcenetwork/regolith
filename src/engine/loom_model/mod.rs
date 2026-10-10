@@ -80,10 +80,13 @@
 //! found the bug, not how large its search space is.
 
 pub mod arena;
+pub mod families;
 pub mod handoff;
 pub mod io_queue;
 pub mod skiplist;
 pub mod slice;
+pub mod snapshots;
+pub mod tombstones;
 pub mod version;
 
 use std::sync::Arc as StdArc;
@@ -127,11 +130,11 @@ fn probe(user_key: &[u8]) -> LookupKey {
 /// executing one. The witness count is that missing half, and [`explore`]
 /// fails a model whose witness stays at zero.
 #[derive(Clone)]
-pub(super) struct Witness(StdArc<AtomicUsize>);
+pub(crate) struct Witness(StdArc<AtomicUsize>);
 
 impl Witness {
     /// Record that this execution reached the interesting state.
-    pub(super) fn record(&self) {
+    pub(crate) fn record(&self) {
         self.0.fetch_add(1, StdOrdering::Relaxed);
     }
 
@@ -169,8 +172,23 @@ impl Drop for Report {
 /// exists to check. A model that fails either floor fails, because a
 /// model that explores one schedule, or that never reaches its own
 /// interesting branch, is worse than no model at all.
-fn explore(
+pub(crate) fn explore(
     name: &'static str,
+    min_interleavings: usize,
+    min_witnesses: usize,
+    model: impl Fn(&Witness) + Sync + Send + 'static,
+) {
+    explore_bounded(name, None, min_interleavings, min_witnesses, model);
+}
+
+/// [`explore`] with at most `preemptions` preemptions per schedule, or
+/// none when `None`. `LOOM_MAX_PREEMPTIONS` overrides a bound given here.
+/// Models with three threads that each make several atomic accesses need
+/// one: unbounded, their search runs for hours without reaching a new kind
+/// of interleaving.
+fn explore_bounded(
+    name: &'static str,
+    preemptions: Option<usize>,
     min_interleavings: usize,
     min_witnesses: usize,
     model: impl Fn(&Witness) + Sync + Send + 'static,
@@ -191,7 +209,9 @@ fn explore(
         }
     };
 
-    loom::model::Builder::new().check(counted);
+    let mut builder = loom::model::Builder::new();
+    builder.preemption_bound = builder.preemption_bound.or(preemptions);
+    builder.check(counted);
 
     let explored = runs.load(StdOrdering::Relaxed);
     let witnessed = witness.count();

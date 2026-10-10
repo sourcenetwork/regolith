@@ -279,3 +279,56 @@ fn without_a_worker_writes_compact_once_l0_reaches_its_trigger() {
         );
     }
 }
+
+/// The worker waits on the flush exclusion while a writer or a checkpoint
+/// flushes, a whole table write. It releases the views its last read holds
+/// back before it waits, as it does before every other wait, so a view
+/// retired meanwhile is freed during the wait rather than after it.
+#[test]
+fn a_worker_waiting_on_the_flush_exclusion_holds_back_no_retired_view() {
+    let dir = TempDir::new().unwrap();
+    let engine = RegolithEngine::open(dir.path(), tiny(0)).unwrap();
+    // A memtable only the published view names, so it is dropped exactly
+    // when the view that names it is freed.
+    let probe = {
+        let doomed = Arc::new(super::MemTable::new(&engine.memtable_config).unwrap());
+        let probe = Arc::downgrade(&doomed);
+        engine
+            .view
+            .update_memtables(|_, frozen| (Arc::clone(&doomed), frozen.to_vec(), ()));
+        probe
+    };
+    let held = engine.flusher.flushing.lock();
+    let (waiting_tx, waiting) = mpsc::channel();
+    std::thread::scope(|scope| {
+        let worker = scope.spawn(|| {
+            // The worker's last read: a load after the probe's view was
+            // published, released at once.
+            assert!(engine.view.load().active.is_empty());
+            waiting_tx.send(()).unwrap();
+            engine.flusher.flush_all_frozen();
+        });
+        waiting.recv().unwrap();
+        // Retire the probe's view while the worker waits for the exclusion.
+        let fresh = Arc::new(super::MemTable::new(&engine.memtable_config).unwrap());
+        engine
+            .view
+            .update_memtables(|_, frozen| (Arc::clone(&fresh), frozen.to_vec(), ()));
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut backoff = Duration::from_millis(1);
+        while probe.upgrade().is_some() && std::time::Instant::now() < deadline {
+            assert!(!worker.is_finished(), "the worker passed a held exclusion");
+            super::read_view::idle();
+            drop(engine.view.load());
+            std::thread::sleep(backoff);
+            backoff = (backoff * 2).min(Duration::from_millis(50));
+        }
+        let freed = probe.upgrade().is_none();
+        drop(held);
+        worker.join().unwrap();
+        assert!(
+            freed,
+            "a view retired while the worker waited on the flush exclusion stayed alive"
+        );
+    });
+}

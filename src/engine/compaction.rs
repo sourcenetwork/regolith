@@ -454,6 +454,10 @@ fn compaction_loop(
 ) {
     let mut backoff = FailureBackoff::default();
     loop {
+        // About to idle: release the read views this thread's last pass
+        // was holding back, so an idle worker never pins a replaced
+        // version's table descriptors.
+        crate::engine::read_view::idle();
         // Wait for a trigger, or fall through on the periodic poll.
         // The gate is reopened before the pass runs, so a notification
         // that lands mid-pass queues a token instead of being swallowed.
@@ -483,6 +487,11 @@ fn compaction_loop(
         // all workers finish their current pass.
         loop {
             let did_work = {
+                // A foreground `compact_range`, ingest or checkpoint may
+                // hold the gate for a long time, and every view it retires
+                // meanwhile would otherwise wait on this thread's
+                // reservation until it resumes.
+                crate::engine::read_view::idle();
                 let _guard = compaction_lock.read();
                 match pick_and_run_compaction(
                     &versions,

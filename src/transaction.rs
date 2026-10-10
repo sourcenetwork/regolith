@@ -353,10 +353,11 @@ impl OptimisticTransactionDb {
     /// the database handle that began it.
     pub fn begin(&self, opts: &TxnOptions) -> Transaction {
         let engine = self.inner.engine_arc();
-        let snapshot_seq = engine.register_snapshot_at_horizon();
+        let (snapshot_seq, snapshot_pin) = engine.register_snapshot_at_horizon();
         Transaction::new(
             engine,
             snapshot_seq,
+            snapshot_pin,
             self.inner.durability(),
             TxMode::Optimistic,
             None,
@@ -448,11 +449,12 @@ impl TransactionDb {
     /// the database handle that began it.
     pub fn begin(&self, opts: &TxnOptions) -> Transaction {
         let engine = self.inner.engine_arc();
-        let snapshot_seq = engine.register_snapshot_at_horizon();
+        let (snapshot_seq, snapshot_pin) = engine.register_snapshot_at_horizon();
         let id = self.tx_id.fetch_add(1, Ordering::Relaxed);
         Transaction::new(
             engine,
             snapshot_seq,
+            snapshot_pin,
             self.inner.durability(),
             TxMode::Pessimistic { tx_id: id },
             Some(Arc::clone(&self.lock_manager)),
@@ -725,6 +727,10 @@ pub struct Transaction {
     /// The key classes [`IsolationLevel::DefraLevel`] applies.
     policy: Option<Arc<dyn KeyClassifier>>,
     snapshot_seq: u64,
+    /// Where `snapshot_seq` is pinned in the engine's snapshot registry.
+    /// Released exactly there when the transaction ends, on whichever
+    /// thread that happens.
+    snapshot_pin: crate::engine::SnapshotPin,
     durability: crate::engine::DurabilityMode,
     mode: TxMode,
     /// Buffer of the transaction's writes: puts, deletes and merge
@@ -866,6 +872,7 @@ impl Transaction {
     fn new(
         engine: Arc<RegolithEngine>,
         snapshot_seq: u64,
+        snapshot_pin: crate::engine::SnapshotPin,
         durability: crate::engine::DurabilityMode,
         mode: TxMode,
         lock_manager: Option<Arc<LockManager>>,
@@ -883,6 +890,7 @@ impl Transaction {
         Self {
             engine,
             snapshot_seq,
+            snapshot_pin,
             durability,
             mode,
             isolation,
@@ -1794,7 +1802,7 @@ impl Transaction {
                 lm.release(&key, tx_id);
             }
         }
-        self.engine.release_snapshot(self.snapshot_seq);
+        self.engine.release_snapshot(self.snapshot_pin.take());
     }
 }
 

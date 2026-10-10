@@ -37,6 +37,7 @@ pub(crate) mod range_tombstone;
 pub(crate) mod read_horizon;
 mod read_rule;
 pub(crate) mod read_view;
+mod reclaim;
 mod recovery;
 pub(crate) mod seal;
 pub(crate) mod skiplist;
@@ -76,12 +77,13 @@ const STOP_TOO_MANY_MEMTABLES: &str = "stop: too many memtables";
 use log_retirement::RetiredLogs;
 use read_horizon::ReadHorizon;
 pub(crate) use read_rule::ReadRule;
-use read_view::{ReadView, ReadViewCell, VersionStore};
+use read_view::{ReadView, ReadViewCell, VersionStore, ViewGuard};
 use recovery::{
     replay_logs, report_discarded_tail, report_dropped_manifest_tail,
     rewrite_recovered_memtable_to_wal,
 };
 use skiplist::InsertHint;
+pub(crate) use snapshot_registry::SnapshotPin;
 use snapshot_registry::SnapshotRegistry;
 use source_walk::Source;
 
@@ -255,7 +257,7 @@ fn batch_op_wal_bytes(op: &WriteBatchOp) -> u64 {
 }
 
 fn memtable_needs_flush(memtable: &MemTable) -> bool {
-    !memtable.is_empty() || !memtable.clone_range_tombstones().is_empty()
+    !memtable.is_empty() || memtable.has_range_tombstones()
 }
 
 /// Apply one batch op to `memtable`, threading `hint` through the point
@@ -544,6 +546,11 @@ pub(crate) struct RegolithEngine {
     /// the list with [`SnapshotRegistry::live_seqs`] once its inputs are
     /// fixed.
     snapshot_registry: Arc<SnapshotRegistry>,
+    /// The database's column-family registry, attached by `Db::open` before
+    /// the first write. The commit leader fences every write against it in
+    /// the ordered step (`commit::families`); an engine with none fences
+    /// nothing. Read with one atomic load once set.
+    families: std::sync::OnceLock<Arc<crate::column_family::CfRegistry>>,
     options: EngineOptions,
     /// Bounded ring of writers waiting for a commit group. Writers push a
     /// ticket here and park; they never block on `pipeline`, which is what
@@ -776,6 +783,7 @@ impl RegolithEngine {
             compaction: Mutex::new(compaction),
             compaction_lock,
             snapshot_registry,
+            families: std::sync::OnceLock::new(),
             stall_policy: options.stall_policy(),
             has_worker,
             background_owed: AtomicBool::new(false),
@@ -928,6 +936,7 @@ impl RegolithEngine {
             // so this policy can only ever produce an error, never a
             // wait that nobody will end.
             stall_policy: StallPolicy::CompactInline,
+            families: std::sync::OnceLock::new(),
             has_worker: false,
             background_owed: AtomicBool::new(false),
             options,
@@ -1201,40 +1210,44 @@ impl RegolithEngine {
         )
     }
 
-    /// Register a new live snapshot at `seq` so compaction keeps
-    /// every version it might need to see. Balanced by
-    /// [`Self::release_snapshot`] when the snapshot drops.
-    pub(crate) fn register_snapshot(&self, seq: u64) {
+    /// Pin a copy of the snapshot `pin` holds, so compaction keeps every
+    /// version it might need to see for as long as the copy lives. The copy
+    /// shares the original's entry and is covered from the moment the
+    /// original was. Balanced by [`Self::release_snapshot`].
+    pub(crate) fn clone_snapshot_pin(&self, pin: &SnapshotPin) -> SnapshotPin {
+        let copy = self.snapshot_registry.clone_pin(pin);
+        if copy.is_registered()
+            && let Some(s) = self.statistics()
+        {
+            s.add(crate::statistics::Ticker::SnapshotsRegistered, 1);
+        }
+        copy
+    }
+
+    /// Pin a snapshot at the current read horizon by announce, sample and
+    /// confirm (see `snapshot_registry`), so a concurrent compaction either
+    /// lists the pin or saw a horizon no newer than it. Returns the pinned
+    /// sequence and the pin, released by [`Self::release_snapshot`] on
+    /// whatever thread drops the handle. A closed database pins nothing.
+    pub(crate) fn register_snapshot_at_horizon(&self) -> (u64, SnapshotPin) {
         if self.is_closed() {
+            return (self.visible_seq.visible(), SnapshotPin::none());
+        }
+        let pinned = self.snapshot_registry.pin(&self.visible_seq);
+        if let Some(s) = self.statistics() {
+            s.add(crate::statistics::Ticker::SnapshotsRegistered, 1);
+        }
+        pinned
+    }
+
+    /// Release a snapshot pin taken by
+    /// [`Self::register_snapshot_at_horizon`] or
+    /// [`Self::clone_snapshot_pin`], exactly where it was announced.
+    pub(crate) fn release_snapshot(&self, pin: SnapshotPin) {
+        if !pin.is_registered() {
             return;
         }
-        self.snapshot_registry.register(seq);
-        if let Some(s) = self.statistics() {
-            s.add(crate::statistics::Ticker::SnapshotsRegistered, 1);
-        }
-    }
-
-    /// Pin a snapshot at the current read horizon, sampling the
-    /// horizon and registering the pin as one step so a concurrent
-    /// compaction cannot cut its stripes from a registry that does
-    /// not yet contain this pin. Returns the pinned sequence.
-    pub(crate) fn register_snapshot_at_horizon(&self) -> u64 {
-        if self.is_closed() {
-            return self.visible_seq.visible();
-        }
-        let seq = self
-            .snapshot_registry
-            .register_at(|| self.visible_seq.visible());
-        if let Some(s) = self.statistics() {
-            s.add(crate::statistics::Ticker::SnapshotsRegistered, 1);
-        }
-        seq
-    }
-
-    /// Release a snapshot pin previously taken via
-    /// [`Self::register_snapshot`].
-    pub(crate) fn release_snapshot(&self, seq: u64) {
-        self.snapshot_registry.release(seq);
+        self.snapshot_registry.release(pin);
         if let Some(s) = self.statistics() {
             s.add(crate::statistics::Ticker::SnapshotsReleased, 1);
         }
@@ -2409,10 +2422,15 @@ impl RegolithEngine {
     /// group applies into: the same one when nothing rotated, a fresh load
     /// otherwise. The active memtable changes only under the pipeline mutex,
     /// so between the two nothing else can have replaced it.
-    fn rotate_if_full(&self, view: Arc<ReadView>) -> std::io::Result<Arc<ReadView>> {
+    fn rotate_if_full<'v>(&'v self, view: ViewGuard<'v>) -> std::io::Result<ViewGuard<'v>> {
         if view.active.approximate_size() < self.options.write_buffer_size {
             return Ok(view);
         }
+        // Released before anything below publishes or waits on the
+        // background flush, so the views it retires are handed to the
+        // reclaimer at once rather than when this group is done (see
+        // `read_view::quiesce`), and no view is held across a wait.
+        drop(view);
         // A rotation leaves at most `max_write_buffer_number` memtables. One
         // that may leave none but the fresh active one flushes what it seals
         // here, as every rotation did before flushes left the commit path.
@@ -2489,7 +2507,7 @@ impl RegolithEngine {
             let sealed = Arc::clone(active);
             let mut next_frozen = frozen.to_vec();
             next_frozen.push(Arc::clone(&sealed));
-            (fresh, next_frozen, sealed)
+            (Arc::clone(&fresh), next_frozen, sealed)
         });
         debug_assert!(Arc::ptr_eq(&sealed, &sealing));
         self.wal_id.store(new_wal_id, Ordering::Release);
@@ -2567,9 +2585,8 @@ impl RegolithEngine {
         // A log sealed under a key other than the current one is rotated
         // away even when its memtable is empty, so a full compaction leaves
         // no file naming a rotated key.
-        let needs_flush = |mt: &MemTable| {
-            !mt.is_empty() || !mt.clone_range_tombstones().is_empty() || self.wal_key_is_stale()
-        };
+        let needs_flush =
+            |mt: &MemTable| !mt.is_empty() || mt.has_range_tombstones() || self.wal_key_is_stale();
         if needs_flush(&self.view.load().active) {
             let _write_guard = self.pipeline.lock();
             if needs_flush(&self.view.load().active) {
@@ -2926,7 +2943,8 @@ impl RegolithEngine {
         // readers: a concurrent reader may still briefly observe
         // pre-drop SSTable data, exactly as before this view existed.
         let fresh = Arc::new(MemTable::new(&self.memtable_config)?);
-        self.view.update_memtables(|_, _| (fresh, Vec::new(), ()));
+        self.view
+            .update_memtables(|_, _| (Arc::clone(&fresh), Vec::new(), ()));
 
         let (old_version, wal_id, wal_path, new_wal) = {
             let mut versions = self.versions.lock();
@@ -2966,7 +2984,7 @@ impl RegolithEngine {
     #[cfg(test)]
     pub(crate) fn active_memtable_is_empty(&self) -> bool {
         let view = self.view.load();
-        view.active.is_empty() && view.active.clone_range_tombstones().is_empty()
+        view.active.is_empty() && !view.active.has_range_tombstones()
     }
 
     /// Test-only: number of SSTable files at `level` in the current
@@ -3125,17 +3143,13 @@ impl RegolithEngine {
     #[cfg(test)]
     pub(crate) fn memtables_hold_no_data(&self) -> bool {
         let view = self.view.load();
-        view.frozen.is_empty()
-            && view.active.is_empty()
-            && view.active.clone_range_tombstones().is_empty()
+        view.frozen.is_empty() && view.active.is_empty() && !view.active.has_range_tombstones()
     }
 
     fn drain_memtables(&self, active: ActiveFlush) -> std::io::Result<()> {
         let active_pending = |view: &ReadView| match active {
             ActiveFlush::WhenFull => memtable_needs_flush(&view.active),
-            ActiveFlush::Always => {
-                !view.active.is_empty() || !view.active.clone_range_tombstones().is_empty()
-            }
+            ActiveFlush::Always => !view.active.is_empty() || view.active.has_range_tombstones(),
         };
 
         // The set to drain is fixed here and never extended. A drain that
@@ -3178,7 +3192,7 @@ impl RegolithEngine {
                     let sealed = Arc::clone(active);
                     let mut next_frozen = frozen.to_vec();
                     next_frozen.push(Arc::clone(&sealed));
-                    (fresh, next_frozen, sealed)
+                    (Arc::clone(&fresh), next_frozen, sealed)
                 });
                 debug_assert!(Arc::ptr_eq(&sealed, &sealing));
                 self.wal_id.store(new_wal_id, Ordering::Release);

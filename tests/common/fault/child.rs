@@ -216,6 +216,9 @@ pub struct ChildSpec {
     /// The database is encrypted at rest under [`crate::common::keys::Keys`]
     /// key 1.
     pub encrypted: bool,
+    /// Compaction workers, when the run needs a number other than the
+    /// default. With none, the writing thread runs every flush itself.
+    pub workers: Option<usize>,
 }
 
 impl ChildSpec {
@@ -251,7 +254,16 @@ impl ChildSpec {
             write_buffer_size,
             ack_path,
             encrypted: false,
+            workers: None,
         }
+    }
+
+    /// Run with `n` compaction workers. `0` makes the writing thread the one
+    /// thread that flushes, so a crash on the nth table write is a crash in
+    /// that thread's flush and in no other.
+    pub fn workers(mut self, n: usize) -> Self {
+        self.workers = Some(n);
+        self
     }
 
     /// Encrypt the database at rest, under the key [`ChildSpec::options`]
@@ -291,9 +303,12 @@ impl ChildSpec {
     }
 
     pub fn options(&self) -> Options {
-        let options = Options::default()
+        let mut options = Options::default()
             .write_buffer_size(self.write_buffer_size)
             .durability(self.durability);
+        if let Some(workers) = self.workers {
+            options = options.max_background_compactions(workers);
+        }
         if self.encrypted {
             options.key_provider(crate::common::keys::Keys::new(&[1]))
         } else {
@@ -340,6 +355,10 @@ impl ChildSpec {
                 "REGOLITH_CRASH_KEYS".into(),
                 if self.encrypted { "1" } else { "0" }.into(),
             ),
+            (
+                "REGOLITH_CRASH_WORKERS".into(),
+                self.workers.map(|n| n.to_string()).unwrap_or_default(),
+            ),
         ]
     }
 
@@ -369,6 +388,9 @@ impl ChildSpec {
             write_buffer_size: num("REGOLITH_CRASH_WBS", 1 << 20),
             ack_path: PathBuf::from(std::env::var("REGOLITH_CRASH_ACK").unwrap_or_default()),
             encrypted: num("REGOLITH_CRASH_KEYS", 0) == 1,
+            workers: std::env::var("REGOLITH_CRASH_WORKERS")
+                .ok()
+                .and_then(|v| v.parse().ok()),
         })
     }
 }
@@ -511,12 +533,14 @@ impl CrashRun {
         let stdout_path = sidecar(&db, "stdout");
         let stderr_path = sidecar(&db, "stderr");
         let started_path = started_path_for(&db);
+        let loaded_path = sidecar(&db, "shim-loaded");
         for p in [
             &journal,
             &spec.ack_path,
             &stdout_path,
             &stderr_path,
             &started_path,
+            &loaded_path,
         ] {
             let _ = std::fs::remove_file(p);
         }
@@ -543,14 +567,16 @@ impl CrashRun {
             "REGOLITH_FAULT_DIE_NTH",
             "REGOLITH_FAULT_DIE_WHEN",
             "REGOLITH_FAULT_JOURNAL",
+            "REGOLITH_FAULT_LOADED",
         ] {
             cmd.env_remove(k);
         }
 
         let needs_shim = self.record_io || matches!(self.trigger, Trigger::Syscall { .. });
-        if needs_shim {
-            let lib = shim::require();
-            cmd.env("LD_PRELOAD", shim::preload_value(&lib));
+        let shim_lib = needs_shim.then(shim::require);
+        if let Some(lib) = &shim_lib {
+            cmd.env("LD_PRELOAD", shim::preload_value(lib));
+            cmd.env("REGOLITH_FAULT_LOADED", &loaded_path);
             cmd.env("REGOLITH_FAULT_ROOT", root_filter_for(&db));
             if self.record_io {
                 cmd.env("REGOLITH_FAULT_JOURNAL", &journal);
@@ -585,6 +611,20 @@ impl CrashRun {
             std::fs::read_to_string(&stdout_path).unwrap_or_default(),
             std::fs::read_to_string(&stderr_path).unwrap_or_default(),
         );
+        // A child that ran without the shim fires no fault and records
+        // nothing, which would read as a crash that never came or a journal
+        // with nothing in it: say why instead.
+        if let Some(lib) = &shim_lib {
+            assert!(
+                loaded_path.is_file(),
+                "the fault shim {} was preloaded but never loaded into the child, so no \
+                 fault could fire and no I/O was recorded. Check that the dynamic linker \
+                 accepts it (LD_PRELOAD errors are in the child's stderr below); if it was \
+                 replaced while this run used it, run again.\nchild stderr:\n{}",
+                lib.display(),
+                std::fs::read_to_string(&stderr_path).unwrap_or_default(),
+            );
+        }
 
         #[cfg(unix)]
         let signal = {

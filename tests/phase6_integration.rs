@@ -19,6 +19,10 @@
 //!   wait on, then flushes and joins the worker, while reads already under
 //!   way and the worker's flushes go on: every wait completes, no unit is
 //!   left, and a close that fails leaves queue reads working.
+//! - **Log retirement under a hard open-file bound** (#268 x Phase 7c1). The
+//!   open-file table renames a removed table aside while a reader holds it,
+//!   and passes every other file through, so a log's removal, its failure
+//!   and its retry behave on every flush path exactly as without the bound.
 
 mod common;
 
@@ -60,6 +64,8 @@ struct Fixture {
     stats: Arc<Statistics>,
     path: FlushPath,
     filler: usize,
+    /// `Options::max_open_files`; 0 for no bound.
+    open_files: usize,
 }
 
 impl Fixture {
@@ -70,14 +76,22 @@ impl Fixture {
             stats: Arc::new(Statistics::new()),
             path,
             filler: 0,
+            open_files: 0,
         }
+    }
+
+    /// The same fixture under a hard bound of `n` open tables.
+    fn open_files(mut self, n: usize) -> Self {
+        self.open_files = n;
+        self
     }
 
     fn options(&self) -> Options {
         let options = Options::default()
             .env(Arc::clone(&self.env) as Arc<dyn Env>)
             .statistics(Some(Arc::clone(&self.stats)))
-            .write_buffer_size(WRITE_BUFFER);
+            .write_buffer_size(WRITE_BUFFER)
+            .max_open_files(self.open_files);
         match self.path {
             FlushPath::Worker => options.max_background_compactions(1),
             FlushPath::AfterCommit => options.max_background_compactions(0),
@@ -182,7 +196,11 @@ fn active_log(db: &Path) -> PathBuf {
 /// `k = new` retries that removal and fails again, and the reopen reads
 /// `new`. Each failure is counted, and the reopen removes the leftover.
 fn a_log_left_behind_is_counted_and_never_replayed(path: FlushPath) {
-    let mut f = Fixture::new(path);
+    a_log_left_behind_is_counted_and_never_replayed_in(Fixture::new(path));
+}
+
+fn a_log_left_behind_is_counted_and_never_replayed_in(mut f: Fixture) {
+    let path = f.path;
     let leftover = {
         let db = f.open();
         if let FlushPath::StallStep = path {
@@ -241,6 +259,27 @@ fn the_flush_after_a_commit_retires_its_log_and_records_it_flushed() {
 #[test]
 fn the_stall_step_flush_retires_its_log_and_records_it_flushed() {
     a_log_left_behind_is_counted_and_never_replayed(FlushPath::StallStep);
+}
+
+#[test]
+fn under_a_hard_open_file_bound_the_worker_flush_retires_its_log() {
+    a_log_left_behind_is_counted_and_never_replayed_in(
+        Fixture::new(FlushPath::Worker).open_files(2),
+    );
+}
+
+#[test]
+fn under_a_hard_open_file_bound_the_flush_after_a_commit_retires_its_log() {
+    a_log_left_behind_is_counted_and_never_replayed_in(
+        Fixture::new(FlushPath::AfterCommit).open_files(2),
+    );
+}
+
+#[test]
+fn under_a_hard_open_file_bound_the_stall_step_flush_retires_its_log() {
+    a_log_left_behind_is_counted_and_never_replayed_in(
+        Fixture::new(FlushPath::StallStep).open_files(2),
+    );
 }
 
 #[test]

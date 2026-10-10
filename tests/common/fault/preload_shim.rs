@@ -10,11 +10,12 @@
 //!
 //! # Why interposition works here
 //!
-//! regolith performs every data read and write through `std::fs`, which on
+//! regolith performs every write through `std::fs`, which on
 //! `*-linux-gnu` calls the glibc `write`/`pwrite64`/`writev`/`fsync`/
 //! `fdatasync`/`open64`/`openat` symbols through the PLT. It uses `rustix`
-//! (raw syscalls, NOT interposable) only for `flock` and `fadvise`, which
-//! move no file data. There is no `mmap` write path.
+//! (raw syscalls, NOT interposable) only for `flock`, `fadvise` and the
+//! positional reads of its tables (`pread`), none of which writes file data.
+//! There is no `mmap` write path.
 //!
 //! # Journal format
 //!
@@ -47,6 +48,9 @@
 //! * `REGOLITH_FAULT_DIE_PATH`  substring the path must contain to count.
 //! * `REGOLITH_FAULT_DIE_NTH`   1-based index of the matching operation to die on.
 //! * `REGOLITH_FAULT_DIE_WHEN`  `after` (default) or `before` the real call.
+//! * `REGOLITH_FAULT_LOADED`    a file the shim appends its pid to when the
+//!   dynamic linker loads it, so the parent can tell a child that ran with
+//!   the shim from one that ran without it.
 
 #![allow(clippy::missing_safety_doc)]
 
@@ -640,3 +644,37 @@ pub unsafe extern "C" fn unlink(path: *const c_char) -> c_int {
 pub extern "C" fn regolith_fault_shim_present() -> c_long {
     1
 }
+
+/// Run by the dynamic linker as it loads the shim into a process: append
+/// this pid to `REGOLITH_FAULT_LOADED`, the parent's proof that the child
+/// ran instrumented. Through the real `open` and `write`, never the
+/// interposers, so the record is not journaled.
+extern "C" fn announce_load() {
+    let Some(path) = env("REGOLITH_FAULT_LOADED") else {
+        return;
+    };
+    unsafe {
+        let mut c = path.into_bytes();
+        c.push(0);
+        let open = real!(o, OpenFn, "open64");
+        let fd = open(
+            c.as_ptr() as *const c_char,
+            1 | O_CREAT | O_APPEND,
+            0o644u32,
+        );
+        if fd < 0 {
+            return;
+        }
+        let mut r = Rec::new();
+        r.num(getpid() as i64);
+        r.raw(b"\n");
+        let w = real!(w, WriteFn, "write");
+        w(fd, r.buf.as_ptr() as *const c_void, r.len);
+        let close = real!(c, CloseFn, "close");
+        close(fd);
+    }
+}
+
+#[used]
+#[link_section = ".init_array"]
+static ANNOUNCE_LOAD: extern "C" fn() = announce_load;

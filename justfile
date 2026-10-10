@@ -298,7 +298,34 @@ loom-sync-deep model="":
 loom-io:
     RUSTFLAGS="--cfg loom" cargo test --release --test loom_io_queue
 
-loom-all: loom loom-debug loom-sync loom-io
+# Loom models for the snapshot registry's per-thread slots: the slot and
+# thread-number claims, a moved pin's release, announce-sample-confirm and
+# the drain wake, with four calibrations that must fail. Release only.
+loom-snapshots:
+    RUSTFLAGS="--cfg loom" cargo test --release --test loom_snapshots
+
+# Loom models for the per-core read path (Phase 7b): the read view's
+# compare-and-swap publication, its reclamation and its freshness; the
+# block cache's pin check, racing hands and byte bound; and the range-
+# tombstone log's prefix publication, run against the real log. Each has
+# a calibration that must fail.
+loom-view:
+    RUSTFLAGS="--cfg loom" cargo test --release --test loom_read_view
+
+loom-cache:
+    RUSTFLAGS="--cfg loom" cargo test --release --test loom_block_cache
+
+loom-tombstones:
+    RUSTFLAGS="--cfg loom" cargo test --release --test loom_range_tombstones
+
+# Loom models for the open-file slot table (acquire, evict, release, drain)
+# and the column-family registry (create, drop and use racing in the
+# ordered step), with three calibrations that must fail. Release, like
+# `loom-io`.
+loom-tables:
+    RUSTFLAGS="--cfg loom" cargo test --release --test loom_tables
+
+loom-all: loom loom-debug loom-sync loom-io loom-snapshots loom-view loom-cache loom-tombstones loom-tables
 
 # The read-view chaos workload at full size: 6 instances x 2 rounds x 400
 # versions. Measured at over 20 minutes wall and 4h of CPU unoptimized,
@@ -568,12 +595,24 @@ tla:
     check MC_TombstoneRetirement_Green_Retires         RED NothingRetired
     check MC_TombstoneRetirement_Red_IgnoreSnapshots   RED SnapshotReadsKept
     check MC_TombstoneRetirement_Red_IgnoreDeeper      RED SnapshotReadsKept
-    # 4.6: the lock-free snapshot registry. Lean:
-    # Regolith/SnapshotRegistry.lean, scan_respects_live.
+    # 4.6, D54: the snapshot registry on per-thread slots with counted
+    # entries, moved handles, copies and shared slots. Lean:
+    # Regolith/SnapshotRegistry.lean, scan_respects_live,
+    # clone_respects_live, pins_exact.
     spec=SnapshotRegistry
     check MC_SnapshotRegistry_Green                    GREEN
     check MC_SnapshotRegistry_Red_NoConfirm            RED MinBelowLive
     check MC_SnapshotRegistry_Red_ScanThenSample       RED MinBelowLive
+    check MC_SnapshotRegistry_Red_ReleaseHere          RED LiveCovered
+    check MC_SnapshotRegistry_Red_CloneFresh           RED LiveCovered
+    check MC_SnapshotRegistry_Red_PlainClaim           RED MinBelowLive
+    check MC_SnapshotRegistry_Red_JoinNoRecheck        RED LiveEntryExact
+    # 4.6, D54: per-thread statistics shards. Lean: Regolith/ShardedStats.lean,
+    # total_after_adds, read_between, reads_monotone.
+    spec=ShardedStats
+    check MC_ShardedStats_Green                        GREEN
+    check MC_ShardedStats_Red_LostUpdate               RED QuiescentExact
+    check MC_ShardedStats_Red_PartialRead              RED ReadBetween
     # E10, group commit. Lean: Regolith/GroupCommit.lean, group_eq_serial.
     spec=GroupCommit
     check MC_GroupCommit_Green                         GREEN
@@ -664,6 +703,67 @@ tla:
     check MC_TxnCallbacks_Red_CallbacksSurvive         RED AttemptIsolation
     check MC_TxnCallbacks_Red_HelperNoClaim            RED AtMostOnce
     check MC_TxnCallbacks_Red_CloseNoClaim             RED AtMostOnce
+    # 4.6, Phase 7b: the wait-free read view (D54). Lean:
+    # Regolith/ReadView.lean, reachable_safe and cas_chain.
+    spec=ReadView
+    check MC_ReadView_Green                            GREEN
+    check MC_ReadView_Red_FreeEarly                    RED NoFreedRead
+    check MC_ReadView_Red_StaleLoad                    RED FreshLoad
+    check MC_ReadView_Red_PlainStore                   RED ChainOfPublications
+    # Phase 7 integration: the read view's publishers as group commit and the
+    # flush off the commit path left them, every one by compare-and-swap.
+    # Lean: Regolith/ReadViewPublishers.lean, no_lost_memtable,
+    # retired_stay_gone, plain_retire_loses_a_seal, plain_version_loses_a_seal.
+    spec=ReadViewPublishers
+    check MC_ReadViewPublishers_Green                  GREEN
+    check MC_ReadViewPublishers_Red_PlainRetire        RED NoLostMemtable
+    check MC_ReadViewPublishers_Red_PlainVersion       RED NoLostMemtable
+    # 4.6, Phase 7b: the lock-free CLOCK block cache. Lean:
+    # Regolith/ClockCache.lean, evict_only_unpinned, reachable_safe,
+    # two_level_bounded and used_exact.
+    spec=ClockCache
+    check MC_ClockCache_Green                          GREEN
+    check MC_ClockCache_Red_IgnorePins                 RED NoFreedPin
+    check MC_ClockCache_Red_Unbounded                  RED ByteBound
+    check MC_ClockCache_Red_LandingUnheld              RED LandedReadable
+    # 4.6, Phase 7b: a memtable's append-only range-tombstone log. Lean:
+    # Regolith/TombstoneLog.lean, prefix_whole and published_seen.
+    spec=TombstoneLog
+    check MC_TombstoneLog_Green                        GREEN
+    check MC_TombstoneLog_Red_LenFirst                 RED PrefixWhole
+    check MC_TombstoneLog_Red_HorizonFirst             RED PublishedSeen
+    # 4.6, Phase 7c1: the open-file slot table under max_open_files. Lean:
+    # Regolith/OpenFileTable.lean, open_le_cap, never_closes_in_use,
+    # reads_own_file.
+    spec=OpenFileTable
+    check MC_OpenFileTable_Green                       GREEN
+    check MC_OpenFileTable_Green_TwoSlots              GREEN
+    check MC_OpenFileTable_Red_IgnoreReaders           RED NeverClosedInUse
+    check MC_OpenFileTable_Red_NoOwnerRecheck          RED ReadsOwnFile
+    check MC_OpenFileTable_Red_OutsideTable            RED AtMostCap
+    # 4.6, Phase 7c1: column-family create, drop and use, fenced in the
+    # ordered step. Lean: Regolith/CfRegistry.lean, no_write_after_drop,
+    # no_write_before_birth, life_in_order.
+    spec=CfRegistry
+    check MC_CfRegistry_Green                          GREEN
+    check MC_CfRegistry_Red_FenceOutside               RED NoWriteAfterDrop
+    check MC_CfRegistry_Red_RetireLate                 RED NoWriteAfterDrop
+    check MC_CfRegistry_Red_ReuseId                    RED LifeInOrder
+    # Phase 7 integration: the fence on every group-commit path (the
+    # leader's own request, a queued ticket, the hand-off's held ticket, a
+    # transaction member, an ingest's install). Lean: group_no_write_after_drop,
+    # fenced_at_hand_off_lands_after_drop.
+    check MC_CfRegistry_Red_FenceAtHandOff             RED NoWriteAfterDrop
+    check MC_CfRegistry_Red_TxnUnfenced                RED NoWriteAfterDrop
+    # 4.6, Phase 7c1: the env file maps, positional reads and lock-free
+    # in-memory files. Lean: Regolith/EnvFiles.lean, positional_reads_own,
+    # current_holds_finished, read_sees_finished.
+    spec=EnvFiles
+    check MC_EnvFiles_Green                            GREEN
+    check MC_EnvFiles_Green_ThreeWriters               GREEN
+    check MC_EnvFiles_Red_SharedCursor                 RED ReadsOwnBytes
+    check MC_EnvFiles_Red_NoFreeze                     RED CurrentHoldsFinished
+    check MC_EnvFiles_Red_StaleFrozen                  RED CurrentHoldsFinished
     rm -rf states ./*_TTrace_*.tla ./*_TTrace_*.bin
     exit $fail
 
