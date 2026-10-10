@@ -132,3 +132,8 @@ import Regolith.CfRegistry
 -- offset's bytes, and an in-memory read sees every append that finished
 -- before it began. Backs `proofs/tla/EnvFiles.tla`.
 import Regolith.EnvFiles
+-- A table renamed aside while its handles reopen it: the Env's rename adds
+-- the new name before it drops the old, and a reopen that found nothing
+-- loads the names again, so it always finds the file. Backs Part 3 of
+-- `proofs/tla/EnvFiles.tla`.
+import Regolith.EnvFilesRename
