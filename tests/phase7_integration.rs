@@ -380,6 +380,56 @@ fn a_cache_full_of_held_sealed_blocks_refuses_counts_and_queued_reads_still_land
     );
 }
 
+/// Queued reads of sealed blocks wait on their queue while readers hold
+/// every block the cache can keep, then the database closes: close and the
+/// misses meet at one gate, so every wait completes, the queue owes nothing,
+/// and the reads run again answer `Closed`.
+#[test]
+fn close_completes_queued_reads_of_sealed_blocks_the_cache_cannot_keep() {
+    let dir = TempDir::new().unwrap();
+    let stats = Arc::new(Statistics::new());
+    {
+        let db = Db::open(dir.path(), small_sealed_cache(&stats)).unwrap();
+        for i in 0..4_000u64 {
+            db.put(&numbered(i), &[b'v'; 200]).unwrap();
+        }
+        db.flush().unwrap();
+        db.compact_range(None, None).unwrap();
+        db.close().unwrap();
+    }
+    let db = Db::open(dir.path(), small_sealed_cache(&stats)).unwrap();
+    let refused = || stats.get_ticker(Ticker::BlockCacheAddRefusedHeld);
+    let before = refused();
+    let mut held: Vec<DbSlice> = Vec::new();
+    let mut i = 0u64;
+    while refused() == before {
+        held.push(db.get_slice(&numbered(i)).unwrap().unwrap());
+        i += 5;
+    }
+    let mut queue = db.io_queue();
+    let snapshot = db
+        .snapshot()
+        .with_read_mode(ReadMode::CacheOnly(queue.id()));
+    let waits: Vec<regolith::IoWait> = (i + 500..4_000)
+        .step_by(500)
+        .map(|k| match snapshot.get(&numbered(k)) {
+            Err(Error::WouldBlock(regolith::WouldBlock::Io(wait))) => wait,
+            other => panic!("expected the read of key {k} to wait, got {other:?}"),
+        })
+        .collect();
+    assert!(!waits.is_empty());
+    db.close().unwrap();
+    let progress = queue.poll(IoBudget::ALL);
+    assert_eq!(progress.completed, waits.len(), "every wait completed");
+    assert!(!progress.more_pending, "the queue owes nothing after close");
+    assert!(waits.iter().all(regolith::IoWait::is_ready));
+    assert!(matches!(
+        snapshot.get(&numbered(i + 500)),
+        Err(Error::Closed)
+    ));
+    drop(held);
+}
+
 // The open-file table, encryption and ingest ---------------------------------
 
 /// Many sealed tables, one ingested table stamped above them, two
