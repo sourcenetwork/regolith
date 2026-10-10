@@ -318,9 +318,10 @@ loom-cache:
 loom-tombstones:
     RUSTFLAGS="--cfg loom" cargo test --release --test loom_range_tombstones
 
-# Loom models for the open-file slot table (acquire, evict, release, drain)
+# Loom models for the open-file slot table (acquire, evict, release, drain,
+# and D60's park of a reopen that may not wait and the wake of a freed slot)
 # and the column-family registry (create, drop and use racing in the
-# ordered step), with three calibrations that must fail. Release, like
+# ordered step), with five calibrations that must fail. Release, like
 # `loom-io`.
 loom-tables:
     RUSTFLAGS="--cfg loom" cargo test --release --test loom_tables
