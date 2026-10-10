@@ -77,6 +77,9 @@ struct StagedTable {
     largest: Vec<u8>,
     file_size: u64,
     num_entries: u64,
+    /// The column families the table holds keys of, ascending, each once.
+    /// The install fences them in the ordered step, as a write's keys are.
+    families: Vec<u32>,
     /// Unlinks the staged file if the ingest ends before the manifest
     /// edit names it.
     pending: PendingOutputs,
@@ -241,11 +244,13 @@ impl RegolithEngine {
             self.options.metadata_policy(),
         )
         .map_err(named)?;
+        let mut families = Vec::new();
         let (points, num_entries) = self
-            .validate_entries(&reader, validate_user_key)
+            .validate_entries(&reader, validate_user_key, &mut families)
             .map_err(named)?;
         let tombstones = reader.range_tombstones();
         for rt in tombstones {
+            note_family(&mut families, &rt.start);
             for (bound, which) in [(&rt.start, "start"), (&rt.end, "end")] {
                 self.validate_prefixed_key_size(bound)
                     .and_then(|()| validate_user_key(bound))
@@ -269,6 +274,8 @@ impl RegolithEngine {
             ));
         };
         let file_size = self.env.metadata(&path)?.len;
+        families.sort_unstable();
+        families.dedup();
         Ok(StagedTable {
             source: source.to_path_buf(),
             path,
@@ -278,6 +285,7 @@ impl RegolithEngine {
             largest,
             file_size,
             num_entries,
+            families,
             pending,
         })
     }
@@ -290,6 +298,7 @@ impl RegolithEngine {
         &self,
         reader: &SsTableReader,
         validate_user_key: &mut F,
+        families: &mut Vec<u32>,
     ) -> io::Result<(Option<(Vec<u8>, Vec<u8>)>, u64)>
     where
         F: FnMut(&[u8]) -> io::Result<()>,
@@ -320,6 +329,7 @@ impl RegolithEngine {
             if first.is_none() {
                 first = Some(user_key.to_vec());
             }
+            note_family(families, user_key);
             last.clear();
             last.extend_from_slice(user_key);
             count += 1;
@@ -337,6 +347,10 @@ impl RegolithEngine {
         };
 
         let _pipeline = self.pipeline.lock();
+        // The ordered step: a family the table writes into that a drop
+        // retired since the table was validated refuses the install, before
+        // it takes a sequence.
+        self.cf_fence_ids(&table.families)?;
         let level = if opts.ingest_behind {
             self.behind_level(lo, hi)?
         } else if self.flush_memtables_holding(lo, hi)? {
@@ -515,6 +529,17 @@ impl RegolithEngine {
 /// The table's recorded range meets `[lo, hi]`.
 fn meets(file: &LiveSst, lo: &[u8], hi: &[u8]) -> bool {
     file.meta.smallest_key.as_slice() <= hi && lo <= file.meta.largest_key.as_slice()
+}
+
+/// Record the column family `key` belongs to, once per run of keys in one
+/// family. Keys arrive sorted, so the run ends only when the family does.
+fn note_family(families: &mut Vec<u32>, key: &[u8]) {
+    if let Some(prefix) = key.first_chunk::<{ crate::column_family::CF_PREFIX_LEN }>() {
+        let id = u32::from_be_bytes(*prefix);
+        if families.last() != Some(&id) {
+            families.push(id);
+        }
+    }
 }
 
 /// LsmOrder.tla's placement of a table of range `[lo, hi]`, nothing in the
