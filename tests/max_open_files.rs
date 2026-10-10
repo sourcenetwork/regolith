@@ -135,11 +135,25 @@ fn concurrent_readers_survive_compactions_with_two_descriptors() {
     for reader in readers {
         reader.join().unwrap();
     }
-    let leftovers: Vec<String> = std::fs::read_dir(dir.path().join("sst"))
-        .unwrap()
-        .filter_map(|entry| entry.ok())
-        .map(|entry| entry.file_name().to_string_lossy().into_owned())
-        .filter(|name| name.contains(".removed-"))
-        .collect();
-    assert!(leftovers.is_empty(), "{leftovers:?}");
+    let leftovers = || -> Vec<String> {
+        std::fs::read_dir(dir.path().join("sst"))
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains(".removed-"))
+            .collect()
+    };
+    // A table renamed aside goes with its last handle, and the last handle
+    // goes with the last read view naming the table. A replaced view is freed
+    // by the reclaimer once no thread can still reach it, not at the instant
+    // it is replaced, so wait for that, with reads on this thread moving the
+    // reclaimer on.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let mut backoff = std::time::Duration::from_millis(1);
+    while !leftovers().is_empty() && std::time::Instant::now() < deadline {
+        db.get(&key(0)).unwrap();
+        std::thread::sleep(backoff);
+        backoff = (backoff * 2).min(std::time::Duration::from_millis(50));
+    }
+    assert!(leftovers().is_empty(), "{:?}", leftovers());
 }
