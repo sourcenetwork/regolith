@@ -198,11 +198,64 @@ impl RegolithEngine {
                 .map_err(Error::from),
             Work::Checkpoint { target } => crate::checkpoint::create(self, &target),
         }));
-        ran.unwrap_or_else(|_| {
+        let result = ran.unwrap_or_else(|_| {
             tracing::error!("a background job panicked");
             Err(Error::Io(io::Error::other(
                 "the job panicked in code it ran on the caller's behalf, such as a compaction filter or a listener",
             )))
-        })
+        });
+        self.relieve_after_foreground();
+        result
+    }
+
+    /// Relieve a stop the job's hold on the compaction gate kept writers
+    /// from relieving.
+    ///
+    /// On a database with no worker and inline compaction on, a stopped
+    /// writer relieves the stop with compaction steps on its own thread. A
+    /// step that finds the gate held is contended, and the writer waits for
+    /// the thread holding it to relieve the stop. A foreground job holds the
+    /// gate for its whole run, and an ingest or a checkpoint only adds L0
+    /// tables, so here that thread is this one: once the gate is released it
+    /// runs the same bounded steps a stopped writer would. A stop that stays
+    /// (nothing left to compact, the bound reached, a step failing) lands
+    /// the waiters' unit anyway, so each writer looks again and relieves it
+    /// or reports why it cannot, instead of waiting for a relief nobody is
+    /// running. A step contended by another writer's relief leaves the stop
+    /// to that writer.
+    fn relieve_after_foreground(&self) {
+        if self.has_worker || !self.inline_compaction {
+            return;
+        }
+        let mut passes = 0usize;
+        let mut idle = 0usize;
+        while matches!(self.stall_state(), Some((_, true))) {
+            match self.run_one_background_step(false) {
+                Ok(super::compaction::CompactionOutcome::DidWork) => {
+                    idle = 0;
+                    passes += 1;
+                    if passes > Self::MAX_INLINE_PASSES {
+                        break;
+                    }
+                }
+                Ok(super::compaction::CompactionOutcome::Idle) => {
+                    idle += 1;
+                    if idle > Self::MAX_IDLE_PASSES {
+                        break;
+                    }
+                }
+                Ok(super::compaction::CompactionOutcome::Contended) => return,
+                Err(err) => {
+                    tracing::debug!(error = %err, "a step relieving a stop after a job failed");
+                    break;
+                }
+            }
+        }
+        // Lands the unit when the stop cleared ...
+        self.refresh_stall_level();
+        // ... and when it did not, so the waiting writers look again.
+        if matches!(self.stall_state(), Some((_, true))) {
+            self.stall_signal.land();
+        }
     }
 }
