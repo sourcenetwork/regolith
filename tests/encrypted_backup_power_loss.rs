@@ -286,7 +286,7 @@ fn opens_under_its_key_holding(dir: &Path, expected: &[(Vec<u8>, Vec<u8>)], cont
 /// the repository takes and restores a new backup of the reopened source.
 fn check_backups(root: &Path, history: &History, listed: &[u64], context: &str) {
     let engine = BackupEngine::open(backup_dir(root)).unwrap();
-    let found: Vec<u64> = engine.list_backups().iter().map(|i| i.id.0).collect();
+    let found: Vec<u64> = engine.list_backups().map(|i| i.unwrap().id.0).collect();
     assert_eq!(found, listed, "{context}: the backups listed");
     for (id, what) in [(1, "backup1"), (2, "backup2")] {
         if marker(root, what).exists() {

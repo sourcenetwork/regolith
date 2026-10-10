@@ -89,7 +89,7 @@ mod transaction;
 mod ttl;
 mod txn_buffer;
 
-pub use backup::{BackupEngine, BackupId, BackupInfo};
+pub use backup::{BackupEngine, BackupId, BackupInfo, Backups};
 pub use checkpoint::Checkpoint;
 pub use column_family::{ColumnFamilyHandle, DEFAULT_CF_NAME};
 pub use conflict::{Access, Conflict, WriteKind};

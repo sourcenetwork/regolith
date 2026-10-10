@@ -2,10 +2,16 @@ use std::fs;
 
 use super::*;
 use crate::Options;
+use crate::env::walk_fault::WalkFault;
 use tempfile::TempDir;
 
 fn tiny_flush_opts() -> Options {
     Options::default().write_buffer_size(4 * 1024)
+}
+
+/// Every backup the engine lists, in order.
+fn listed(engine: &BackupEngine) -> Vec<BackupInfo> {
+    engine.list_backups().collect::<Result<_>>().unwrap()
 }
 
 fn populate(db: &Db, prefix: &str, n: usize) {
@@ -77,7 +83,7 @@ fn backup_and_restore_roundtrip() {
 
     let mut engine = BackupEngine::open(bkp_dir.path()).unwrap();
     let id = engine.create_backup(&db).unwrap();
-    let infos = engine.list_backups();
+    let infos = listed(&engine);
     assert_eq!(infos.len(), 1);
     assert_eq!(infos[0].id, id);
     assert!(infos[0].file_count >= 1);
@@ -134,7 +140,7 @@ fn incremental_backup_dedupes() {
 
     assert_eq!(shared_bytes_1, shared_bytes_2);
     assert_eq!(shared_count_1, shared_count_2);
-    assert_eq!(engine.list_backups().len(), 2);
+    assert_eq!(listed(&engine).len(), 2);
 }
 
 #[test]
@@ -216,7 +222,7 @@ fn delete_backup_gcs_unreferenced_files() {
     engine.delete_backup(id1).unwrap();
     let shared_after_delete = shared_count(bkp_dir.path());
     assert!(shared_after_delete <= shared_after_2);
-    assert_eq!(engine.list_backups().len(), 1);
+    assert_eq!(listed(&engine).len(), 1);
 
     // backup 2 still restores cleanly.
     let tgt_dir = TempDir::new().unwrap();
@@ -240,7 +246,7 @@ fn delete_only_backup_removes_all_shared() {
 
     engine.delete_backup(id).unwrap();
     assert_eq!(shared_count(bkp_dir.path()), 0);
-    assert_eq!(engine.list_backups().len(), 0);
+    assert_eq!(listed(&engine).len(), 0);
 }
 
 #[test]
@@ -263,7 +269,7 @@ fn purge_keeps_newest() {
     let b3 = engine.create_backup(&db).unwrap();
 
     engine.purge_old_backups(1).unwrap();
-    let infos = engine.list_backups();
+    let infos = listed(&engine);
     assert_eq!(infos.len(), 1);
     assert_eq!(infos[0].id, b3);
 }
@@ -287,4 +293,115 @@ fn restore_independent_of_source() {
     engine.restore(id, tgt_dir.path(), None).unwrap();
     let reopened = Db::open(tgt_dir.path(), Options::default()).unwrap();
     assert_has(&reopened, "ind", 250);
+}
+
+/// A database and a backup repository on one [`WalkFault`] env: backup 1
+/// holds the tables of the first writes, backup 2 those of more writes,
+/// and backups 3 to `copies + 2` are copies of backup 1's plaintext
+/// metadata (which binds no id), so `meta/` has many entries cheaply and
+/// every table backup 1 lists is listed again by each copy.
+fn walk_fault_repository(copies: u64) -> (Arc<WalkFault>, BackupEngine) {
+    let env = Arc::new(WalkFault::default());
+    let db = Db::open("/db", fault_options(&env)).unwrap();
+    populate(&db, "a", 200);
+    db.flush().unwrap();
+    let mut engine = BackupEngine::open_with_env("/bk", env.clone()).unwrap();
+    assert_eq!(engine.create_backup(&db).unwrap(), BackupId(1));
+    populate(&db, "z", 200);
+    db.flush().unwrap();
+    assert_eq!(engine.create_backup(&db).unwrap(), BackupId(2));
+    let first = env.read(Path::new("/bk/meta/000001.backup")).unwrap();
+    for id in 3..copies + 3 {
+        env.write(&Path::new("/bk/meta").join(backup_filename(id)), &first)
+            .unwrap();
+    }
+    (env, engine)
+}
+
+fn fault_options(env: &Arc<WalkFault>) -> Options {
+    tiny_flush_opts()
+        .env(env.clone())
+        .max_background_compactions(0)
+}
+
+/// Every shared file in the repository on `env`, sorted.
+fn shared_on(env: &WalkFault) -> Vec<PathBuf> {
+    let mut paths: Vec<PathBuf> = env
+        .read_dir(Path::new("/bk/shared"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path)
+        .collect();
+    paths.sort();
+    paths
+}
+
+/// The collection must see every remaining listing before it removes a
+/// file. A walk of `meta/` that breaks part way fails the delete, and no
+/// shared file goes: a collection that took the break at the first entry
+/// for the end of the walk would remove every table backup 1's copies
+/// still list.
+#[test]
+fn a_collection_whose_walk_of_meta_breaks_removes_nothing() {
+    let (env, mut engine) = walk_fault_repository(20);
+    let before = shared_on(&env);
+    assert!(!before.is_empty());
+    let first = env.read(Path::new("/bk/meta/000001.backup")).unwrap();
+    for after in [0, 1, 7] {
+        env.arm(Path::new("/bk/meta"), after);
+        let err = engine.delete_backup(BackupId(1)).unwrap_err();
+        assert!(err.to_string().contains("the walk broke"), "{err}");
+        assert_eq!(shared_on(&env), before, "a file went after {after} entries");
+        // The metadata went before the collection; put it back for the
+        // next cut.
+        env.write(Path::new("/bk/meta/000001.backup"), &first)
+            .unwrap();
+    }
+    env.arm(Path::new("/nowhere"), 0);
+    for id in 1..23 {
+        let target = PathBuf::from(format!("/restored-{id}"));
+        engine.restore(BackupId(id), &target, None).unwrap();
+    }
+    for id in [1, 2, 3, 22] {
+        let restored = Db::open(format!("/restored-{id}"), fault_options(&env)).unwrap();
+        assert_has(&restored, "a", 200);
+        if id == 2 {
+            assert_has(&restored, "z", 200);
+        }
+    }
+    // Whole again, the walk lets the delete finish, and the copies keep
+    // every table backup 1 listed.
+    engine.delete_backup(BackupId(1)).unwrap();
+    assert_eq!(shared_on(&env), before);
+}
+
+/// The purge keeps the newest `keep` whatever `keep` is, through the window
+/// that deletes a backup once `keep` newer ones followed it.
+#[test]
+fn purge_keeps_exactly_the_newest_for_every_window() {
+    for (keep, left) in [
+        (100, (1..=6).collect::<Vec<u64>>()),
+        (6, (1..=6).collect()),
+        (5, (2..=6).collect()),
+        (2, vec![5, 6]),
+        (0, vec![]),
+    ] {
+        let (_env, mut engine) = walk_fault_repository(4);
+        engine.purge_old_backups(keep).unwrap();
+        let ids: Vec<u64> = listed(&engine).iter().map(|b| b.id.0).collect();
+        assert_eq!(ids, left, "keep {keep}");
+    }
+}
+
+/// A listing whose walk breaks part way is reported, never a short list,
+/// and a purge over it deletes nothing.
+#[test]
+fn a_listing_whose_walk_breaks_says_so() {
+    let (env, mut engine) = walk_fault_repository(4);
+    env.arm(Path::new("/bk/meta"), 3);
+    let items: Vec<Result<BackupInfo>> = engine.list_backups().collect();
+    assert_eq!(items.len(), 1, "{items:?}");
+    assert!(items[0].is_err());
+    assert!(engine.purge_old_backups(0).is_err());
+    env.arm(Path::new("/nowhere"), 0);
+    assert_eq!(listed(&engine).len(), 6);
 }
