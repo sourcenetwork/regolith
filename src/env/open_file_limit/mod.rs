@@ -16,7 +16,11 @@
 //!
 //! A table's descriptor is reopened inside a device read, so a `CacheOnly`
 //! handle never reopens one: its miss goes to its I/O queue as a unit, and
-//! the unit's read, run by the polling thread, does the reopen.
+//! the unit's read, run by the polling thread, does the reopen. That reopen
+//! never waits (D60): when every slot is in use by running reads, the unit
+//! parks on its queue, and the read that frees a slot tells the queue. Only
+//! a `Blocking` read, which chose to block, waits for one slot's running
+//! reads to finish.
 //!
 //! # Removed tables
 //!
@@ -33,6 +37,8 @@
 
 #[cfg(loom)]
 pub mod loom_model;
+#[cfg(test)]
+mod park_tests;
 pub(crate) mod slots;
 #[cfg(test)]
 mod tests;
@@ -48,6 +54,7 @@ use kovan_map::HashMap;
 use super::{
     Capabilities, DirEntry, Env, FileLock, FileMeta, JoinHandle, ReadFile, WriteFile, WriteMode,
 };
+use crate::engine::io::scope;
 use crate::portability::{AtomicU64, AtomicUsize, Ordering};
 use slots::{Held, SlotTable};
 
@@ -352,6 +359,12 @@ impl Shared {
 
     /// A handle's descriptor, held for one read: the slot it was last seen
     /// in, or a slot taken now and the file reopened into it.
+    ///
+    /// A `Blocking` read, which chose to block, may wait for the reads
+    /// running in one slot when every slot has some (the drain). A unit a
+    /// `CacheOnly` read queued never waits (D60): finding no slot, it parks
+    /// on the queue running it and fails this read, and the unit runs again
+    /// once a slot frees.
     fn hold(&self, record: &Record) -> io::Result<Held<'_>> {
         if let Some(held) = self
             .slots
@@ -359,9 +372,20 @@ impl Shared {
         {
             return Ok(held);
         }
-        let held = self
-            .slots
-            .load(record.id, || record.entry.reopen(&*self.inner))?;
+        let open = || record.entry.reopen(&*self.inner);
+        let held = match scope::reopen_waiter() {
+            None => self.slots.load(record.id, open)?,
+            Some(waiter) => match self.slots.load_or_park(record.id, waiter, open)? {
+                Some(held) => held,
+                None => {
+                    scope::note_parked();
+                    return Err(io::Error::new(
+                        io::ErrorKind::ResourceBusy,
+                        "every open-file slot is in use; the read runs again once one frees",
+                    ));
+                }
+            },
+        };
         record.hint.store(held.index(), Ordering::Relaxed);
         Ok(held)
     }

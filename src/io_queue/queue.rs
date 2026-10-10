@@ -11,7 +11,7 @@ use super::{IoBudget, IoProgress, QueueId};
 use crate::engine::block_cache::BlockCache;
 use crate::engine::io::IoRuntime;
 use crate::engine::io::shared::{Landing, Message, QueueShared, WaitSlot};
-use crate::engine::io::unit::{Outcome, Unit, UnitKey};
+use crate::engine::io::unit::{Outcome, Ran, Unit, UnitKey};
 
 /// Queue ids are unique in the process, so a handle that names a queue of
 /// another database is caught instead of read through a stranger's queue.
@@ -60,6 +60,9 @@ pub struct IoQueue {
     waiting: HashMap<usize, Waiting>,
     /// Registered units in arrival order, for `poll` to run.
     order: VecDeque<Arc<Unit>>,
+    /// Units this queue's polls parked because every open-file slot was in
+    /// use (D60), run again once a slot frees. A subset of `waiting`.
+    parked: Vec<Arc<Unit>>,
     /// Reads that found the byte bound full.
     room: Vec<Arc<WaitSlot>>,
     /// What landed for this queue, oldest first, with what each costs.
@@ -94,6 +97,7 @@ impl IoQueue {
             cache,
             waiting: HashMap::new(),
             order: VecDeque::new(),
+            parked: Vec::new(),
             room: Vec::new(),
             landed: VecDeque::new(),
             landed_bytes: 0,
@@ -123,6 +127,13 @@ impl IoQueue {
     /// waking the tasks that await them. Returns at once when the queue owes
     /// nothing.
     ///
+    /// Never waits on another thread. Under
+    /// [`Options::max_open_files`](crate::Options::max_open_files), a read
+    /// that must reopen its table and finds every descriptor in use by reads
+    /// running on other threads is not run: it stays pending, and the poll
+    /// goes on (D60). The read that next frees a descriptor tells this queue,
+    /// waking its owner if it idles, and the poll after that runs it again.
+    ///
     /// Only the thread holding the queue calls this; it is the only place a
     /// wait recorded here is completed.
     pub fn poll(&mut self, budget: IoBudget) -> IoProgress {
@@ -141,9 +152,14 @@ impl IoQueue {
             if !self.waiting.contains_key(&address(&unit)) {
                 continue;
             }
-            // Lost the claim: the winner pushes the completion here.
+            // Lost the claim: the winner pushes the completion here, or
+            // parked the unit and runs it again when a slot frees.
             if unit.claim() {
-                self.cache.io().run(&unit, &self.cache);
+                if self.cache.io().run(&unit, &self.shared, &self.cache) == Ran::Parked {
+                    // A slot freed since the park reaches the inbox, taken
+                    // below or at the next poll, after this push.
+                    self.parked.push(unit);
+                }
                 ran += 1;
             }
         }
@@ -192,6 +208,17 @@ impl IoQueue {
                         *completed += 1;
                     }
                 }
+                Message::SlotFreed => self.unpark(),
+            }
+        }
+    }
+
+    /// A slot freed: every unit this queue parked goes back in line to run.
+    /// One that close or a drop released since is done, and is dropped.
+    fn unpark(&mut self) {
+        for unit in self.parked.drain(..) {
+            if unit.unpark() {
+                self.order.push_back(unit);
             }
         }
     }
@@ -268,6 +295,12 @@ impl IoQueue {
     pub(crate) fn runtime(&self) -> &IoRuntime {
         self.cache.io()
     }
+
+    /// The half of this queue other threads reach.
+    #[cfg(test)]
+    pub(crate) fn shared(&self) -> &Arc<QueueShared> {
+        &self.shared
+    }
 }
 
 impl Drop for IoQueue {
@@ -285,8 +318,9 @@ impl Drop for IoQueue {
                     }
                 }
                 Message::Room(slot) => slot.complete(),
-                // Its unit is in `waiting`, and is handled there.
-                Message::Done(_) => {}
+                // Its unit is in `waiting`, and is handled there; so is every
+                // unit this queue parked.
+                Message::Done(_) | Message::SlotFreed => {}
             }
         }
         for (_, waiting) in self.waiting.drain() {

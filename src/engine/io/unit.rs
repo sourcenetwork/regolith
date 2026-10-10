@@ -1,14 +1,25 @@
 //! One unit of device I/O, run once however many queues wait on it.
 //!
 //! A unit is born in the `Free` state when the first `CacheOnly` read misses
-//! its block. It moves forward exactly once per step:
+//! its block. It moves through these states:
 //!
 //! ```text
 //! Free --claim (one CAS)--> Claimed --finish--> Done
-//!   \--release (close, a dropped queue): claim, then finish with nothing--/
+//!   ^                        |
+//!   |                        +--park: a reopen found no open-file slot
+//!   +--unpark (one CAS)-- Parked
+//!   \--release (close, a dropped queue): from Free or Parked, claim, then
+//!      finish with nothing--/
 //! ```
 //!
-//! The claim is the only way to `Claimed`, so the work runs at most once.
+//! The claim is the only way to `Claimed`, so the work runs on one thread
+//! at a time and finishes at most once. A run whose reopen under
+//! `max_open_files` found every slot busy does not wait (D60): it puts its
+//! work back and parks the unit, and the slot table tells the queue that ran
+//! it when a slot frees; that queue's poll unparks the unit and runs it
+//! again. A parked unit is still in flight: reads of its block join it, so
+//! the block is read once.
+//!
 //! `finish` writes the outcome, publishes `Done`, and then closes the list of
 //! waiting queues with one swap and pushes one `Done` message to each queue
 //! on it. A queue that registers after that swap is refused and reads the
@@ -29,6 +40,7 @@ use crate::sync::internal::{AtomicUsize, Ordering, UnsafeCell};
 const FREE: usize = 0;
 const CLAIMED: usize = 1;
 const DONE: usize = 2;
+const PARKED: usize = 3;
 
 /// What names one unit in the shared table: the block cache's key for the
 /// block, and the per-block allocation guard of a size-limited read. Reads of
@@ -41,8 +53,19 @@ pub(crate) struct UnitKey {
 }
 
 /// The device read a unit performs, filling the block cache as the blocking
-/// read does and handing back what it read.
-pub(crate) type Work = Box<dyn FnOnce(&BlockCache) -> io::Result<Landed> + Send>;
+/// read does and handing back what it read. Run again after a park, so it
+/// must leave nothing behind when its reopen parks.
+pub(crate) type Work = Box<dyn FnMut(&BlockCache) -> io::Result<Landed> + Send>;
+
+/// How one [`Unit::run`] ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Ran {
+    /// The unit is done, and its waiting queues have their completions.
+    Finished,
+    /// A reopen found no open-file slot: the unit waits, parked, for the
+    /// queue that ran it to be told a slot freed.
+    Parked,
+}
 
 /// How a unit ended.
 pub(crate) enum Outcome {
@@ -60,7 +83,7 @@ pub(crate) struct Unit {
     /// What the unit reads from the device: the frame of the block.
     bytes: usize,
     state: AtomicUsize,
-    /// Taken by the claim holder.
+    /// Taken by the claim holder, and put back by it before a park.
     work: UnsafeCell<Option<Work>>,
     /// Written by the claim holder before `Done`, read only after it.
     outcome: UnsafeCell<Option<Outcome>>,
@@ -68,10 +91,13 @@ pub(crate) struct Unit {
     waiters: Stack<Arc<QueueShared>>,
 }
 
-// SAFETY: `work` is only touched by the one thread whose claim succeeded,
-// and `outcome` is written by that thread before `Done` is released and only
-// read after `Done` is acquired. `Work` is `Send`, and an `Outcome` is
-// `Send + Sync`.
+// SAFETY: `work` is only touched by the thread whose claim succeeded, and a
+// claim succeeds again only after the holder's park released the unit
+// (Release store of `Parked`, read by the unpark CAS whose `Free` the next
+// claim's Acquire CAS reads), so two holders never overlap and each sees
+// the work the last one put back. `outcome` is written by the holder before
+// `Done` is released and only read after `Done` is acquired. `Work` is
+// `Send`, and an `Outcome` is `Send + Sync`.
 unsafe impl Sync for Unit {}
 
 impl Unit {
@@ -118,9 +144,11 @@ impl Unit {
         self.waiters.push(queue, SHUT).is_ok()
     }
 
-    /// Run the work on this thread and finish. Only after this caller's
+    /// Run the work on this thread and finish, or park when `parked` says a
+    /// reopen in the work found no open-file slot (the work's error is then
+    /// that, not the read's outcome). Only after this caller's
     /// [`claim`](Self::claim) succeeded.
-    pub(crate) fn run(self: &Arc<Self>, cache: &BlockCache) {
+    pub(crate) fn run(self: &Arc<Self>, cache: &BlockCache, parked: impl FnOnce() -> bool) -> Ran {
         debug_assert_eq!(self.state.load(Ordering::Relaxed), CLAIMED);
         // A panic in the work still finishes the unit, so no waiting queue
         // is left on a claim nobody will ever complete.
@@ -136,21 +164,69 @@ impl Unit {
         // SAFETY: the claim gave this thread `work`.
         let work = self.work.with_mut(|work| unsafe { (*work).take() });
         let outcome = match work {
-            Some(work) => match work(cache) {
+            Some(mut work) => match work(cache) {
                 Ok(landed) => Outcome::Landed(landed),
-                Err(err) => Outcome::Failed(Arc::new(err)),
+                Err(err) => {
+                    if parked() {
+                        // SAFETY: still the claim holder; the park below
+                        // publishes the work to the next one.
+                        self.work.with_mut(|cell| unsafe { *cell = Some(work) });
+                        unwind.0 = None;
+                        self.park();
+                        return Ran::Parked;
+                    }
+                    Outcome::Failed(Arc::new(err))
+                }
             },
             None => Outcome::Released,
         };
         unwind.0 = None;
         self.finish(outcome);
+        Ran::Finished
     }
 
-    /// Close a unit nobody is running, without reading. `false` when another
-    /// thread had already claimed it; that thread finishes it.
+    /// Park the unit this thread holds claimed: it is neither run nor
+    /// finished until [`unpark`](Self::unpark) or
+    /// [`release`](Self::release). Only the claim holder writes a claimed
+    /// unit's state, so a store suffices; Release hands the work put back
+    /// to whoever claims it next.
+    pub(crate) fn park(&self) {
+        debug_assert_eq!(self.state.load(Ordering::Relaxed), CLAIMED);
+        self.state.store(PARKED, Ordering::Release);
+    }
+
+    /// Make a parked unit claimable again, after a slot freed. `true` for
+    /// the one call that did; `false` when the unit was not parked (it was
+    /// unparked already, released, or finished).
+    pub(crate) fn unpark(&self) -> bool {
+        self.state
+            .compare_exchange(PARKED, FREE, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    /// Whether the unit is parked for an open-file slot.
+    #[cfg(test)]
+    pub(crate) fn is_parked(&self) -> bool {
+        self.state.load(Ordering::Acquire) == PARKED
+    }
+
+    /// Close a unit nobody is running, parked or not, without reading.
+    /// `false` when another thread holds it claimed; that thread finishes or
+    /// parks it, and a park after close is released by the thread that
+    /// parked it (`IoRuntime::run`).
     pub(crate) fn release(self: &Arc<Self>) -> bool {
-        if !self.claim() {
-            return false;
+        let mut state = self.state.load(Ordering::Acquire);
+        loop {
+            if state != FREE && state != PARKED {
+                return false;
+            }
+            match self
+                .state
+                .compare_exchange(state, CLAIMED, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => break,
+                Err(now) => state = now,
+            }
         }
         self.finish(Outcome::Released);
         true
@@ -225,7 +301,7 @@ mod tests {
         let unit = Arc::new(Unit::new(key(0), 10, failing()));
         assert!(unit.outcome().is_none());
         assert!(unit.claim());
-        unit.run(&cache);
+        unit.run(&cache, || false);
         assert!(unit.is_done());
         assert!(
             matches!(unit.outcome(), Some(Outcome::Failed(err)) if err.to_string() == "device says no")
@@ -241,7 +317,8 @@ mod tests {
         let cache = BlockCache::new(0);
         let unit = Arc::new(Unit::new(key(0), 10, Box::new(|_| panic!("work panics"))));
         assert!(unit.claim());
-        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unit.run(&cache)));
+        let caught =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unit.run(&cache, || false)));
         assert!(caught.is_err());
         assert!(matches!(unit.outcome(), Some(Outcome::Released)));
     }
@@ -256,5 +333,74 @@ mod tests {
         assert!(unit.release());
         assert!(matches!(unit.outcome(), Some(Outcome::Released)));
         assert!(!unit.claim());
+    }
+
+    /// A work that finds no slot on its first run and reads on its second,
+    /// counting its runs.
+    fn parks_once(runs: &Arc<std::sync::atomic::AtomicUsize>) -> Work {
+        let runs = Arc::clone(runs);
+        Box::new(move |_| {
+            if runs.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                Err(io::Error::other("no open-file slot"))
+            } else {
+                Err(io::Error::other("the second run read"))
+            }
+        })
+    }
+
+    #[test]
+    fn a_parked_run_keeps_its_work_and_runs_it_again_once_unparked() {
+        let cache = BlockCache::new(0);
+        let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let unit = Arc::new(Unit::new(key(0), 10, parks_once(&runs)));
+        assert!(unit.claim());
+        assert_eq!(unit.run(&cache, || true), Ran::Parked);
+        assert!(unit.is_parked());
+        assert!(!unit.is_done() && !unit.is_free());
+        assert!(unit.outcome().is_none(), "a park is not an outcome");
+        // Parked, nobody claims it: the poll that sees it skips it.
+        assert!(!unit.claim());
+        assert!(unit.unpark());
+        assert!(!unit.unpark(), "one unpark per park");
+        assert!(unit.claim());
+        assert_eq!(unit.run(&cache, || false), Ran::Finished);
+        assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert!(
+            matches!(unit.outcome(), Some(Outcome::Failed(err)) if err.to_string() == "the second run read")
+        );
+        assert!(!unit.unpark(), "a finished unit is never unparked");
+    }
+
+    #[test]
+    fn a_release_closes_a_parked_unit_and_a_late_unpark_does_nothing() {
+        let cache = BlockCache::new(0);
+        let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let unit = Arc::new(Unit::new(key(0), 10, parks_once(&runs)));
+        let queue = Arc::new(QueueShared::new(super::super::shared::test_id(), 1 << 20));
+        assert!(unit.register(Arc::clone(&queue)));
+        assert!(unit.claim());
+        assert_eq!(unit.run(&cache, || true), Ran::Parked);
+        assert!(
+            unit.release(),
+            "close and a dropped queue release a parked unit"
+        );
+        assert!(matches!(unit.outcome(), Some(Outcome::Released)));
+        assert!(!unit.unpark());
+        assert!(!unit.claim());
+        assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let done = queue
+            .take_inbox()
+            .filter(|message| matches!(message, super::super::shared::Message::Done(_)))
+            .count();
+        assert_eq!(done, 1, "the waiting queue gets its completion");
+    }
+
+    #[test]
+    fn a_failed_read_that_did_not_park_finishes() {
+        let cache = BlockCache::new(0);
+        let unit = Arc::new(Unit::new(key(0), 10, failing()));
+        assert!(unit.claim());
+        assert_eq!(unit.run(&cache, || false), Ran::Finished);
+        assert!(unit.is_done());
     }
 }

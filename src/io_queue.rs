@@ -44,6 +44,12 @@
 //!   owner registered it as about to idle does so, once.
 //! - **No thread is added.** Each thread does its own I/O when it polls; the
 //!   blocking calls read inline as before.
+//! - **A poll never waits on another thread.** It reads the device for the
+//!   units it runs, and nothing else. Under
+//!   [`Options::max_open_files`](crate::Options::max_open_files) a unit that
+//!   must reopen its table while every descriptor is in use by other
+//!   threads' reads stays pending, and runs again at the poll after one
+//!   frees (D60).
 //!
 //! A read that returns `WouldBlock` is run again after its queue's poll, and
 //! then finds its block: in the cache, or, when the cache did not keep it,
@@ -96,6 +102,13 @@ pub enum ReadMode {
     /// [`WouldBlock::Io`] and the block is read when the named queue is
     /// polled. Naming a queue that is not open on the handle's database makes
     /// such a read fail with [`Error::InvalidArgument`](crate::Error::InvalidArgument).
+    ///
+    /// Neither the read nor the poll ever waits on another thread. Under
+    /// [`Options::max_open_files`](crate::Options::max_open_files), a block
+    /// read whose table must be reopened while every descriptor is in use by
+    /// reads on other threads stays pending on the queue instead of waiting
+    /// for one: the read that frees a descriptor tells the queue, and its
+    /// next poll reads the block.
     CacheOnly(QueueId),
 }
 

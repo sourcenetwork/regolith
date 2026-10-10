@@ -595,11 +595,25 @@ impl Options {
     /// a compaction deletes while a snapshot or iterator still reads it is
     /// renamed aside rather than unlinked, so its descriptor stays closable
     /// and reopens under the new name; the last reader unlinks it, and a
-    /// crash leaves it for the next writable open to remove. When more
-    /// threads read distinct tables at once than there are descriptors, a
-    /// read waits for one of the reads already running to finish. A
-    /// `CacheOnly` handle never reopens a table itself: its miss goes to
-    /// its I/O queue like any other device read.
+    /// crash leaves it for the next writable open to remove.
+    ///
+    /// When more threads read distinct tables at once than there are
+    /// descriptors, what a read does depends on its
+    /// [`ReadMode`](crate::ReadMode):
+    ///
+    /// - A `Blocking` read, which chose to block, may wait for the reads
+    ///   running on one descriptor to finish, and then reopens its table
+    ///   there.
+    /// - A `CacheOnly` read never waits. It never reopens a table itself:
+    ///   its miss goes to its I/O queue like any other device read. When the
+    ///   queue's [`poll`](crate::IoQueue::poll) runs that read and finds
+    ///   every descriptor in use by reads running on other threads, the read
+    ///   stays pending on the queue and the poll returns. The first of those
+    ///   reads to finish tells the queue, waking its owner if it registered
+    ///   [`idle_waker`](crate::IoQueue::idle_waker), and the next poll runs
+    ///   the read again. A pending read is retried each time a descriptor
+    ///   frees, but `Blocking` reads that claim the freed descriptor first
+    ///   can keep it pending for as long as they do.
     #[must_use]
     pub fn max_open_files(mut self, max_open_files: usize) -> Self {
         self.max_open_files = max_open_files;

@@ -2,9 +2,11 @@
 //! the bytes of reads it owes, and the reads that landed for it.
 //!
 //! Only the queue's owner takes from the inbox; any thread pushes to it. A
-//! `CacheOnly` read pushes a request there, whatever thread it runs on, and
-//! the thread that finishes a unit pushes the completion there. A push that
-//! finds the owner idle wakes it, once; a push to a busy owner wakes nobody.
+//! `CacheOnly` read pushes a request there, whatever thread it runs on, the
+//! thread that finishes a unit pushes the completion there, and the thread
+//! whose read frees an open-file slot a parked unit wanted pushes that
+//! there. A push that finds the owner idle wakes it, once; a push to a busy
+//! owner wakes nobody.
 
 use std::io;
 use std::sync::{Arc, OnceLock};
@@ -15,6 +17,7 @@ use super::Landed;
 use super::atomic_waker::AtomicWaker;
 use super::stack::{IDLE, Rest, SHUT, Stack};
 use super::unit::{Unit, UnitKey};
+use crate::env::open_file_limit::slots::SlotWaiter;
 use crate::io_queue::QueueId;
 use crate::sync::internal::{AtomicUsize, Ordering};
 
@@ -34,6 +37,9 @@ pub(crate) enum Message {
     Room(Arc<WaitSlot>),
     /// `unit` finished; one per unit this queue registered on.
     Done(Arc<Unit>),
+    /// An open-file slot freed that a unit this queue parked was waiting
+    /// for (D60): run the queue's parked units again.
+    SlotFreed,
 }
 
 /// What a finished unit left for the reads of one queue.
@@ -180,6 +186,16 @@ impl QueueShared {
         if let Some(landed) = self.landed.get() {
             landed.remove(key);
         }
+    }
+}
+
+/// A queue is what a unit's reopen parks on the open-file table: a freed
+/// slot reaches the queue's owner as a message, so the owner learns of it at
+/// its next poll, or is woken for it when idle, and a busy owner never is.
+impl SlotWaiter for QueueShared {
+    fn slot_freed(&self) {
+        // A dropped queue refuses, and its drop released its parked units.
+        let _ = self.deliver(Message::SlotFreed);
     }
 }
 
