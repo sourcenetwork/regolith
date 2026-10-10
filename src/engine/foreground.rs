@@ -259,3 +259,7 @@ impl RegolithEngine {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "foreground_tests.rs"]
+mod tests;
