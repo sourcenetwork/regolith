@@ -350,3 +350,56 @@ fn only_the_names_the_engine_writes_parse() {
         assert_eq!(parse_shared_filename(&name), None, "{name}");
     }
 }
+
+#[test]
+fn a_listing_whose_sizes_overflow_is_reported_not_summed() {
+    let bkp = TempDir::new().unwrap();
+    let engine = BackupEngine::open(bkp.path()).unwrap();
+    let table = |hash: u128| BackupFileEntry {
+        level: 1,
+        file_id: hash as u64,
+        file_size: u64::MAX,
+        hash,
+        smallest_key: b"a".to_vec(),
+        largest_key: b"z".to_vec(),
+        num_entries: 1,
+        global_seq: None,
+        seal_key: None,
+    };
+    let manifest = BackupManifest {
+        created_at_unix: 1,
+        files: vec![table(1), table(2)],
+        next_file_id: 3,
+        last_seq: 1,
+        sealed_under: None,
+    };
+    let id = BackupId(1);
+    fs::write(
+        meta_file(bkp.path(), id),
+        format::encode(&manifest, id, None).unwrap(),
+    )
+    .unwrap();
+
+    let bad = unreadable(&engine, id);
+    assert!(matches!(bad.reason, Error::Corruption(_)), "{bad:?}");
+    assert!(
+        bad.to_string()
+            .ends_with("backup 1: its tables' sizes overflow"),
+        "{bad}"
+    );
+}
+
+#[test]
+fn the_largest_backup_id_refuses_the_next_backup_instead_of_wrapping() {
+    let src = TempDir::new().unwrap();
+    let bkp = TempDir::new().unwrap();
+    let db = Db::open(src.path(), Options::default()).unwrap();
+    db.put(b"k", b"v").unwrap();
+    let mut engine = BackupEngine::open(bkp.path()).unwrap();
+    fs::write(meta_file(bkp.path(), BackupId(u64::MAX)), b"").unwrap();
+
+    let err = engine.create_backup(&db).unwrap_err();
+    assert!(matches!(err, Error::Corruption(_)), "{err:?}");
+    assert!(shared_now(bkp.path()).is_empty());
+    assert_eq!(listed(&engine), [(u64::MAX, false)]);
+}

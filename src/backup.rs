@@ -482,18 +482,28 @@ impl BackupEngine {
 
     fn next_backup_id(&self) -> Result<BackupId> {
         let last = self.backup_ids()?.last().map_or(0, |id| id.0);
-        Ok(BackupId(last + 1))
+        last.checked_add(1).map(BackupId).ok_or_else(|| {
+            Error::corruption(format!(
+                "backup {last} has the largest id there is, so no backup can follow it"
+            ))
+        })
     }
 }
 
 /// What [`BackupEngine::list_backups`] reports for a backup whose listing
-/// reads.
+/// reads. A listing whose sizes add up past `u64` is damaged: no backup
+/// holds that many bytes.
 fn summarize(id: BackupId, listing: &Listing) -> io::Result<BackupInfo> {
+    let bytes = listing
+        .objects
+        .iter()
+        .try_fold(0u64, |sum, &(_, size)| sum.checked_add(size))
+        .ok_or_else(|| invalid_data(format!("backup {id}: its tables' sizes overflow")))?;
     Ok(BackupInfo {
         id,
         created_at_unix: listing.created_at_unix,
         file_count: listing.objects.len(),
-        bytes: listing.objects.iter().map(|&(_, size)| size).sum(),
+        bytes,
     })
 }
 
