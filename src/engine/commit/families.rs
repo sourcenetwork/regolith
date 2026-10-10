@@ -36,7 +36,7 @@ use super::{GroupTicket, WriteRequest, release_stranded};
 use crate::WriteBatchOp;
 use crate::column_family::{
     CF_PREFIX_LEN, CfRegistry, ColumnFamilyHandle, DEFAULT_CF_ID, META_CF_ID, cf_lower_bound,
-    cf_upper_bound, dropped_family_error, invalid_handle_error, meta,
+    cf_upper_bound, cf_upper_bound_bytes, dropped_family_error, invalid_handle_error, meta,
 };
 
 impl RegolithEngine {
@@ -83,7 +83,7 @@ impl RegolithEngine {
                     // A range that ends at the next family's first key (a
                     // whole-family delete) writes nothing in that family.
                     let whole_family = family_of(start)
-                        .is_some_and(|id| end.as_slice() == cf_upper_bound(id).as_slice());
+                        .is_some_and(|id| end.as_slice() == cf_upper_bound_bytes(id));
                     if !whole_family {
                         fence_key(families, &mut last, end)?;
                     }

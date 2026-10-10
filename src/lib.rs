@@ -1088,8 +1088,8 @@ impl Db {
     }
 
     /// Check one prefixed key's column family, remembering the last id
-    /// found live so a run of ops in one column family takes the
-    /// registry lock once.
+    /// found live so a run of ops in one column family costs one registry
+    /// lookup.
     fn validate_prefixed_cf(&self, live: &mut Option<u32>, prefixed_key: &[u8]) -> Result<()> {
         let cf_id = prefixed_cf_id(prefixed_key).map_err(Error::from)?;
         if *live == Some(cf_id) {
@@ -1103,12 +1103,14 @@ impl Db {
     }
 
     fn validate_batch_cf_liveness(&self, batch: &WriteBatch) -> Result<()> {
-        // A batch is usually one column family, or a few long runs of one,
-        // and every distinct run still reaches the registry once. A drop
-        // that lands between two runs of the same id in one call is the
-        // same race the per-op form had: the lock was never held across the
-        // batch, so neither form promises more than "rejected or applied
-        // as a whole" for a drop that overlaps the write.
+        // The early check, at the API boundary: a batch naming a family
+        // already gone is refused before any work. A batch is usually one
+        // column family, or a few long runs of one, and every distinct run
+        // reaches the registry once. A drop that lands after this check is
+        // caught by the commit leader's fence in the ordered step
+        // (`engine::commit::families`), which refuses the batch whole, so a
+        // batch racing a drop is applied whole before the tombstone or
+        // refused whole, never split across it.
         let mut live = None;
         for op in &batch.ops {
             match op {

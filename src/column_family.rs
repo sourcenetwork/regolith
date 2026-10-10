@@ -171,7 +171,13 @@ pub(crate) fn prefix_key(cf_id: u32, key: &[u8]) -> Vec<u8> {
 /// add keeps the function total anyway, degrading to an empty range
 /// rather than wrapping to zero and aliasing the reserved metadata CF.
 pub(crate) fn cf_upper_bound(cf_id: u32) -> Vec<u8> {
-    cf_id.saturating_add(1).to_be_bytes().to_vec()
+    cf_upper_bound_bytes(cf_id).to_vec()
+}
+
+/// [`cf_upper_bound`] without the allocation, for a comparison on the
+/// commit leader's path.
+pub(crate) fn cf_upper_bound_bytes(cf_id: u32) -> [u8; CF_PREFIX_LEN] {
+    cf_id.saturating_add(1).to_be_bytes()
 }
 
 /// Lower bound (inclusive) of the CF's key range.
