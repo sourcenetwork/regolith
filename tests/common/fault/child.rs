@@ -213,6 +213,9 @@ pub struct ChildSpec {
     pub durability: DurabilityMode,
     pub write_buffer_size: usize,
     pub ack_path: PathBuf,
+    /// Compaction workers, when the run needs a number other than the
+    /// default. With none, the writing thread runs every flush itself.
+    pub workers: Option<usize>,
 }
 
 impl ChildSpec {
@@ -247,7 +250,16 @@ impl ChildSpec {
             durability,
             write_buffer_size,
             ack_path,
+            workers: None,
         }
+    }
+
+    /// Run with `n` compaction workers. `0` makes the writing thread the one
+    /// thread that flushes, so a crash on the nth table write is a crash in
+    /// that thread's flush and in no other.
+    pub fn workers(mut self, n: usize) -> Self {
+        self.workers = Some(n);
+        self
     }
 
     pub fn seed(mut self, seed: u64) -> Self {
@@ -280,9 +292,13 @@ impl ChildSpec {
     }
 
     pub fn options(&self) -> Options {
-        Options::default()
+        let mut options = Options::default()
             .write_buffer_size(self.write_buffer_size)
-            .durability(self.durability)
+            .durability(self.durability);
+        if let Some(workers) = self.workers {
+            options = options.max_background_compactions(workers);
+        }
+        options
     }
 
     /// The exact ordered history this spec produces, computed identically
@@ -320,6 +336,10 @@ impl ChildSpec {
                 "REGOLITH_CRASH_ACK".into(),
                 self.ack_path.display().to_string(),
             ),
+            (
+                "REGOLITH_CRASH_WORKERS".into(),
+                self.workers.map(|n| n.to_string()).unwrap_or_default(),
+            ),
         ]
     }
 
@@ -348,6 +368,9 @@ impl ChildSpec {
             },
             write_buffer_size: num("REGOLITH_CRASH_WBS", 1 << 20),
             ack_path: PathBuf::from(std::env::var("REGOLITH_CRASH_ACK").unwrap_or_default()),
+            workers: std::env::var("REGOLITH_CRASH_WORKERS")
+                .ok()
+                .and_then(|v| v.parse().ok()),
         })
     }
 }
