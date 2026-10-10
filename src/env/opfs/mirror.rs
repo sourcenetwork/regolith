@@ -391,22 +391,59 @@ impl MirrorFs {
         Ok(())
     }
 
+    /// Move `from` to `to`, replacing `to`. Atomic to a concurrent open, as
+    /// `MemEnv`'s rename is: the file is published at `to` before it leaves
+    /// `from`, so one of the two names always holds it.
     pub(super) fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
         if from == to {
             return self.entry(from).map(|_| ());
         }
-        let entry = self
-            .files
-            .remove(from)
-            .ok_or_else(|| super::not_found(from))?;
-        entry.touch(self.version());
-        if let Some(replaced) = self.files.insert(to.to_path_buf(), entry) {
-            self.resident.release(replaced.data.len());
+        loop {
+            let entry = self.entry(from)?;
+            // Dirty under its new name before anyone can see it there, so a
+            // persist that finds it at `to` writes it.
+            entry.touch(self.version());
+            // `to` stops being a pending deletion before it names a file
+            // again, so a persist never writes it and then deletes it.
+            let was_deleted = self.deleted.remove(to).is_some();
+            let replaced = self.files.insert(to.to_path_buf(), Arc::clone(&entry));
+            if self
+                .files
+                .remove_if(from, |held| Arc::ptr_eq(held, &entry))
+                .is_some()
+            {
+                if let Some(replaced) = replaced {
+                    self.resident.release(replaced.data.len());
+                }
+                self.deleted.insert(from.to_path_buf(), ());
+                super::register_ancestors(&self.dirs, to);
+                return Ok(());
+            }
+            // Another rename or a removal took `from` first: put `to` back
+            // as it was, unless something replaced it since, and look again.
+            // The namespace is exact whatever races; the resident byte
+            // count is exact unless two renames or a rename and a removal
+            // race on one source, which regolith never issues (a mirror runs
+            // on one thread, and the open-file table serializes moves).
+            match replaced {
+                Some(previous) => {
+                    let bytes = previous.data.len();
+                    if self
+                        .files
+                        .replace_if(to.to_path_buf(), previous, |held| Arc::ptr_eq(held, &entry))
+                        .is_err()
+                    {
+                        self.resident.release(bytes);
+                    }
+                }
+                None => {
+                    self.files.remove_if(to, |held| Arc::ptr_eq(held, &entry));
+                    if was_deleted && !self.files.contains_key(to) {
+                        self.deleted.insert(to.to_path_buf(), ());
+                    }
+                }
+            }
         }
-        self.deleted.insert(from.to_path_buf(), ());
-        self.deleted.remove(to);
-        super::register_ancestors(&self.dirs, to);
-        Ok(())
     }
 }
 

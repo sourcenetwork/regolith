@@ -16,7 +16,11 @@
 //!
 //! A table's descriptor is reopened inside a device read, so a `CacheOnly`
 //! handle never reopens one: its miss goes to its I/O queue as a unit, and
-//! the unit's read, run by the polling thread, does the reopen.
+//! the unit's read, run by the polling thread, does the reopen. That reopen
+//! never waits (D60): when every slot is in use by running reads, the unit
+//! parks on its queue, and the read that frees a slot tells the queue. Only
+//! a `Blocking` read, which chose to block, waits for one slot's running
+//! reads to finish.
 //!
 //! # Removed tables
 //!
@@ -33,6 +37,10 @@
 
 #[cfg(loom)]
 pub mod loom_model;
+#[cfg(test)]
+mod move_tests;
+#[cfg(test)]
+mod park_tests;
 pub(crate) mod slots;
 #[cfg(test)]
 mod tests;
@@ -48,6 +56,7 @@ use kovan_map::HashMap;
 use super::{
     Capabilities, DirEntry, Env, FileLock, FileMeta, JoinHandle, ReadFile, WriteFile, WriteMode,
 };
+use crate::engine::io::scope;
 use crate::portability::{AtomicU64, AtomicUsize, Ordering};
 use slots::{Held, SlotTable};
 
@@ -162,16 +171,36 @@ impl PathEntry {
         }
     }
 
+    /// Open the file wherever it is now. A whole move can finish between
+    /// loading the names and opening (the names said `from`, and the file is
+    /// already at `to`); a NotFound then loads the names again and, if a move
+    /// changed them, tries the new ones. Each retry needs a move to have
+    /// published new names, and a table moves only a bounded number of times
+    /// (a removal moves it once, for good), so this never spins.
     fn reopen(&self, inner: &dyn Env) -> io::Result<Arc<dyn ReadFile>> {
-        let names = self.names.load();
-        if let Some(previous) = &names.previous {
-            match inner.open_read(previous) {
+        let mut names = self.names.load();
+        loop {
+            if let Some(previous) = &names.previous {
+                match inner.open_read(previous) {
+                    Ok(file) => return Ok(Arc::from(file)),
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(e),
+                }
+            }
+            match inner.open_read(&names.current) {
                 Ok(file) => return Ok(Arc::from(file)),
-                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                    let now = self.names.load();
+                    // The guard on the names first loaded keeps them alive,
+                    // so a different address is a newer store, never a reuse.
+                    if std::ptr::eq(&*now, &*names) {
+                        return Err(e);
+                    }
+                    names = now;
+                }
                 Err(e) => return Err(e),
             }
         }
-        inner.open_read(&names.current).map(Arc::from)
     }
 }
 
@@ -352,6 +381,12 @@ impl Shared {
 
     /// A handle's descriptor, held for one read: the slot it was last seen
     /// in, or a slot taken now and the file reopened into it.
+    ///
+    /// A `Blocking` read, which chose to block, may wait for the reads
+    /// running in one slot when every slot has some (the drain). A unit a
+    /// `CacheOnly` read queued never waits (D60): finding no slot, it parks
+    /// on the queue running it and fails this read, and the unit runs again
+    /// once a slot frees.
     fn hold(&self, record: &Record) -> io::Result<Held<'_>> {
         if let Some(held) = self
             .slots
@@ -359,9 +394,20 @@ impl Shared {
         {
             return Ok(held);
         }
-        let held = self
-            .slots
-            .load(record.id, || record.entry.reopen(&*self.inner))?;
+        let open = || record.entry.reopen(&*self.inner);
+        let held = match scope::reopen_waiter() {
+            None => self.slots.load(record.id, open)?,
+            Some(waiter) => match self.slots.load_or_park(record.id, waiter, open)? {
+                Some(held) => held,
+                None => {
+                    scope::note_parked();
+                    return Err(io::Error::new(
+                        io::ErrorKind::ResourceBusy,
+                        "every open-file slot is in use; the read runs again once one frees",
+                    ));
+                }
+            },
+        };
         record.hint.store(held.index(), Ordering::Relaxed);
         Ok(held)
     }

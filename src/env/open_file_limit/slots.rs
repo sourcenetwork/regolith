@@ -12,6 +12,9 @@
 //!              joins, and that thread takes the slot once the readers leave
 //! bits 34..36  the phase: EMPTY, CLAIMED (one thread owns the slot and its
 //!              descriptor exclusively) or OPEN (readers may join)
+//! bit  36      WANTED, set by a reopen that may not wait and found the slot
+//!              busy: the step that makes the slot claimable again clears it
+//!              and wakes every parked waiter
 //! ```
 //!
 //! # Invariants
@@ -26,12 +29,26 @@
 //! - **A reader reads its own file.** A slot's owner (the record whose file
 //!   it holds) changes only while `CLAIMED`. A reader that joined checks the
 //!   owner again after its CAS: joined, the owner cannot change under it.
-//! - **A starving reader is served.** A thread that sweeps every slot twice
-//!   without a claim (every slot is mid-read) sets `DRAIN` on one: the slot
-//!   takes no new reader, and its current readers each finish one read. This
-//!   is the only wait, and it is on reads already running.
+//! - **A starving `Blocking` reader is served.** A thread that sweeps every
+//!   slot twice without a claim (every slot is mid-read) sets `DRAIN` on
+//!   one: the slot takes no new reader, and its current readers each finish
+//!   one read. This is the only wait, it is on reads already running, and
+//!   only a `Blocking` read takes it (D60).
+//! - **A reopen that may not wait never waits** (D60). The unit a `CacheOnly`
+//!   read queued sweeps once ([`SlotTable::load_or_park`]); finding no slot,
+//!   it parks ([`SlotTable::park`]) and returns.
+//! - **No parked waiter is forgotten.** A park first pushes its waiter on
+//!   `parked`, then looks at every slot again: one it may claim, it claims;
+//!   on every busy one it sets `WANTED`. Every write to a state word keeps
+//!   `WANTED`, except the one step that makes a wanted slot claimable (a
+//!   reader's leave, an unwinding claim, a closing owner): that step clears
+//!   it and wakes every waiter on `parked`. The push comes before the look
+//!   and the clear before the take, so a slot that frees after the park
+//!   looked at it either shows its waiter on `parked` or was seen free by
+//!   the park itself.
 //!
-//! `OpenFileTable.tla` and `Regolith/OpenFileTable.lean` model this protocol;
+//! `OpenFileTable.tla` and `Regolith/OpenFileTable.lean` model this protocol
+//! (`Regolith/OpenFileNoWait.lean` the park and the wake);
 //! `open_file_limit::loom_model` checks it under every interleaving loom permits.
 
 #![allow(unsafe_code)]
@@ -39,6 +56,7 @@
 use std::io;
 use std::sync::Arc;
 
+use crate::engine::io::stack::Stack;
 use crate::env::ReadFile;
 use crate::sync::internal::{AtomicU64, AtomicUsize, Ordering, UnsafeCell};
 
@@ -52,9 +70,36 @@ const PHASE: u64 = 0b11 << 34;
 const EMPTY: u64 = 0;
 const CLAIMED: u64 = 1 << 34;
 const OPEN: u64 = 2 << 34;
+/// A parked waiter needs this slot: the step that makes it claimable wakes
+/// `SlotTable::parked`.
+const WANTED: u64 = 1 << 36;
+/// What `fill` adds to a `CLAIMED` word to publish it `OPEN`, referenced and
+/// held by its one reader, keeping `WANTED`. While `CLAIMED` the readers,
+/// `REF` and `DRAIN` are zero (the claim CAS wrote them so, and only the
+/// claimer writes them until it publishes), so the add touches nothing else.
+const PUBLISH: u64 = (OPEN - CLAIMED) + REF + 1;
 
 /// No record owns a slot.
 pub(crate) const NO_OWNER: u64 = 0;
+
+/// A reopen that may not wait and found every slot busy: told when a slot
+/// it marked wanted is free to claim (D60).
+pub(crate) trait SlotWaiter: Send + Sync {
+    /// A slot this waiter wanted can be claimed now. Runs on the thread that
+    /// freed the slot, in the middle of its read's return, so it must be
+    /// quick and must never wait.
+    fn slot_freed(&self);
+}
+
+/// Whether `state` is a slot a claim may take: empty, or open with no
+/// reader and no drain. The CLOCK bit only orders claims, so it is ignored.
+fn claimable(state: u64) -> bool {
+    match state & PHASE {
+        EMPTY => true,
+        OPEN => state & (READERS | DRAIN) == 0,
+        _ => false,
+    }
+}
 
 /// One descriptor's place in the table.
 pub(super) struct Slot {
@@ -69,7 +114,7 @@ pub(super) struct Slot {
 
 // SAFETY: `file` is written only by the one thread that won the slot's
 // CAS to `CLAIMED`, and read only by threads counted as readers in `state`,
-// which no claim can win while non-zero. The publishing store to `OPEN` is
+// which no claim can win while non-zero. The publishing add to `OPEN` is
 // Release and every join is an Acquire CAS, so a reader sees the write.
 unsafe impl Sync for Slot {}
 
@@ -89,6 +134,12 @@ pub(crate) struct SlotTable {
     hand: AtomicUsize,
     /// Descriptors held right now: one per slot holding one.
     open: AtomicUsize,
+    /// Waiters that parked since a wanted slot last freed, woken whole by
+    /// the next one that does.
+    // vertexia: one node per park, freed at the next wake; it holds at most
+    // the reopens parked since a wanted slot last freed, so only a read that
+    // never returns lets it grow.
+    parked: Stack<Arc<dyn SlotWaiter>>,
     /// The one step a loom calibration plants wrong.
     #[cfg(loom)]
     mutant: Mutant,
@@ -105,6 +156,21 @@ pub(crate) enum Mutant {
     IgnoreReaders,
     /// A join trusts its owner check from before the CAS.
     NoOwnerRecheck,
+    /// A park marks the busy slots wanted before it puts its waiter on the
+    /// parked list.
+    MarkBeforeRegister,
+    /// Publishing a loaded slot stores its word whole, dropping `WANTED`.
+    PublishDropsWanted,
+}
+
+/// What [`SlotTable::park`] did.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Parking {
+    /// Every slot was busy; each is marked wanted, and the waiter is told
+    /// when one frees.
+    Parked,
+    /// A slot freed meanwhile, and this park claimed it: fill it.
+    Claimed(usize),
 }
 
 /// A reader's hold on one slot's descriptor. Leaving is one decrement.
@@ -138,23 +204,34 @@ impl Drop for Held<'_> {
     fn drop(&mut self) {
         // Release: this reader's use of the descriptor happens before the
         // CAS that may then claim the slot and close it.
-        self.table.slots[self.index]
+        let before = self.table.slots[self.index]
             .state
             .fetch_sub(1, Ordering::Release);
+        // The last reader of an open, undrained, wanted slot made it
+        // claimable: wake the parked. A drained slot goes to its drainer,
+        // whose own read wakes them when it leaves. The acquire this needs
+        // (the park pushed its waiter before marking) is `freed`'s own
+        // read-modify-write of the word, so a read that frees an unwanted
+        // slot pays nothing more than it did before.
+        if before & (READERS | DRAIN | PHASE | WANTED) == OPEN | WANTED | 1 {
+            self.table.freed(self.index);
+        }
     }
 }
 
 /// Puts a slot back to `EMPTY` if its claimer unwinds before publishing.
 struct Claimed<'a> {
-    slot: &'a Slot,
+    table: &'a SlotTable,
+    index: usize,
     armed: bool,
 }
 
 impl Drop for Claimed<'_> {
     fn drop(&mut self) {
         if self.armed {
-            self.slot.owner.store(NO_OWNER, Ordering::Relaxed);
-            self.slot.state.store(EMPTY, Ordering::Release);
+            let slot = &self.table.slots[self.index];
+            slot.owner.store(NO_OWNER, Ordering::Relaxed);
+            self.table.settle(slot, EMPTY);
         }
     }
 }
@@ -165,6 +242,7 @@ impl SlotTable {
             slots: (0..capacity.max(1)).map(|_| Slot::new()).collect(),
             hand: AtomicUsize::new(0),
             open: AtomicUsize::new(0),
+            parked: Stack::new(),
             #[cfg(loom)]
             mutant: Mutant::None,
         }
@@ -186,6 +264,18 @@ impl SlotTable {
     /// Descriptors held right now. Never above [`Self::capacity`].
     pub(crate) fn open_count(&self) -> usize {
         self.open.load(Ordering::Relaxed)
+    }
+
+    /// Whether slot `index` is marked wanted by a parked waiter.
+    #[cfg(test)]
+    pub(crate) fn wanted(&self, index: usize) -> bool {
+        self.slots[index].state.load(Ordering::Acquire) & WANTED != 0
+    }
+
+    /// Whether a `Blocking` claimer is draining slot `index`.
+    #[cfg(test)]
+    pub(crate) fn drained(&self, index: usize) -> bool {
+        self.slots[index].state.load(Ordering::Acquire) & DRAIN != 0
     }
 
     /// Join the descriptor slot `index` holds for `owner`, if it still does.
@@ -225,15 +315,52 @@ impl SlotTable {
     /// Take a slot for `owner`: open its file with `open` there, closing
     /// whatever the slot held first, and return the slot held by this one
     /// reader. Waits only when every slot is mid-read, and then only for
-    /// the reads already running on the one it drains.
+    /// the reads already running on the one it drains. For a `Blocking`
+    /// read, which chose to block (D60).
     pub(crate) fn load(
         &self,
         owner: u64,
         open: impl FnOnce() -> io::Result<Arc<dyn ReadFile>>,
     ) -> io::Result<Held<'_>> {
         let index = self.claim();
+        self.fill(index, owner, open)
+    }
+
+    /// [`Self::load`] for a reopen that may not wait (D60): one sweep, and
+    /// when it finds nothing, a [`park`](Self::park) of `waiter`. `None`
+    /// when parked: `waiter` is told once a slot frees, and the caller
+    /// returns at once.
+    pub(crate) fn load_or_park(
+        &self,
+        owner: u64,
+        waiter: Arc<dyn SlotWaiter>,
+        open: impl FnOnce() -> io::Result<Arc<dyn ReadFile>>,
+    ) -> io::Result<Option<Held<'_>>> {
+        let index = match self.sweep() {
+            Some(index) => index,
+            None => match self.park(waiter) {
+                Parking::Claimed(index) => index,
+                Parking::Parked => return Ok(None),
+            },
+        };
+        self.fill(index, owner, open).map(Some)
+    }
+
+    /// Open `owner`'s file in slot `index`, which this thread holds
+    /// `CLAIMED`, after closing what it held, and publish it with this
+    /// thread as its one reader.
+    pub(crate) fn fill(
+        &self,
+        index: usize,
+        owner: u64,
+        open: impl FnOnce() -> io::Result<Arc<dyn ReadFile>>,
+    ) -> io::Result<Held<'_>> {
         let slot = &self.slots[index];
-        let mut claimed = Claimed { slot, armed: true };
+        let mut claimed = Claimed {
+            table: self,
+            index,
+            armed: true,
+        };
         // SAFETY: this thread holds the slot `CLAIMED`: no reader is counted
         // and none can join, so nobody else touches `file`.
         let old = slot.file.with_mut(|file| unsafe { (*file).take() });
@@ -250,9 +377,107 @@ impl SlotTable {
         self.open.fetch_add(1, Ordering::Relaxed);
         claimed.armed = false;
         // Release: the owner and the descriptor are visible to every reader
-        // whose join CAS reads this store. One reader: this thread.
-        slot.state.store(OPEN | REF | 1, Ordering::Release);
+        // whose join CAS reads this word. One reader: this thread. An add,
+        // not a store, because a park may have marked the slot wanted while
+        // it was claimed, and that mark must survive until the slot frees.
+        #[cfg(loom)]
+        if self.mutant == Mutant::PublishDropsWanted {
+            slot.state.store(OPEN | REF | 1, Ordering::Release);
+            return Ok(Held { table: self, index });
+        }
+        slot.state.fetch_add(PUBLISH, Ordering::AcqRel);
         Ok(Held { table: self, index })
+    }
+
+    /// Put `waiter` on the parked list and look at every slot again: claim
+    /// one that freed since the sweep, or mark every busy one wanted, so
+    /// the step that frees any of them wakes `waiter` (the module docs).
+    /// Never waits on another thread: each slot is one compare-and-swap,
+    /// retried only when another thread changed its word.
+    pub(crate) fn park(&self, waiter: Arc<dyn SlotWaiter>) -> Parking {
+        #[cfg(loom)]
+        if self.mutant == Mutant::MarkBeforeRegister {
+            let parking = self.mark_or_claim();
+            if parking == Parking::Parked {
+                self.register(waiter);
+            }
+            return parking;
+        }
+        self.register(waiter);
+        let parking = self.mark_or_claim();
+        if let Parking::Claimed(_) = parking {
+            // A slot freed between the sweep and this look, and this park
+            // took it. Whoever freed it may have found no slot wanted and
+            // woken nobody, so wake the list now: the waiters on it get a
+            // try at the next free slot, and this waiter's own node goes
+            // instead of staying behind until some later wake.
+            self.wake();
+        }
+        parking
+    }
+
+    fn register(&self, waiter: Arc<dyn SlotWaiter>) {
+        // The list is never shut, so the push always lands. AcqRel: the
+        // marks that follow are ordered after the push for every waker
+        // that reads them.
+        let _ = self.parked.push(waiter, 0);
+    }
+
+    fn mark_or_claim(&self) -> Parking {
+        for (index, slot) in self.slots.iter().enumerate() {
+            let mut state = slot.state.load(Ordering::Acquire);
+            loop {
+                let claim = claimable(state);
+                let next = if claim {
+                    CLAIMED | (state & WANTED)
+                } else if state & WANTED == 0 {
+                    state | WANTED
+                } else {
+                    break;
+                };
+                // AcqRel: Release orders the push before this mark for the
+                // waker that reads it; Acquire orders a claim after the
+                // readers' leave, as `try_claim`'s does.
+                match slot
+                    .state
+                    .compare_exchange(state, next, Ordering::AcqRel, Ordering::Acquire)
+                {
+                    Ok(_) if claim => return Parking::Claimed(index),
+                    Ok(_) => break,
+                    Err(now) => state = now,
+                }
+            }
+        }
+        Parking::Parked
+    }
+
+    /// Slot `index` became claimable while wanted: clear the mark, then
+    /// wake every parked waiter. Clearing first is what makes a park that
+    /// saw the mark still set (and so did not mark again) one this wake
+    /// finds on the list.
+    fn freed(&self, index: usize) {
+        // Acquire: this reads the word in the release sequence of the CAS
+        // that marked it, so the marking park's push onto the list happens
+        // before the take below.
+        self.slots[index].state.fetch_and(!WANTED, Ordering::AcqRel);
+        self.wake();
+    }
+
+    /// Take the parked list whole and tell each waiter a slot is free.
+    fn wake(&self) {
+        // AcqRel: Acquire takes the pushes; Release orders the clear above
+        // before any later push that reads this take.
+        for waiter in self.parked.take(0) {
+            waiter.slot_freed();
+        }
+    }
+
+    /// Store `state`, a claimable word, into `slot`, which this thread holds
+    /// `CLAIMED`; a park that marked it wanted meanwhile is woken.
+    fn settle(&self, slot: &Slot, state: u64) {
+        if slot.state.swap(state & !WANTED, Ordering::AcqRel) & WANTED != 0 {
+            self.wake();
+        }
     }
 
     /// Close every descriptor `owner` holds that no reader is using. Called
@@ -272,7 +497,12 @@ impl SlotTable {
             }
             if slot
                 .state
-                .compare_exchange(state, CLAIMED, Ordering::AcqRel, Ordering::Acquire)
+                .compare_exchange(
+                    state,
+                    CLAIMED | (state & WANTED),
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
                 .is_err()
             {
                 continue;
@@ -280,7 +510,7 @@ impl SlotTable {
             // Claimed: is it still this owner's? A claim between the check
             // and the CAS reloaded it for someone else; put it back.
             if slot.owner.load(Ordering::Acquire) != owner {
-                slot.state.store(state, Ordering::Release);
+                self.settle(slot, state);
                 continue;
             }
             // SAFETY: `CLAIMED` by this thread; no reader is counted.
@@ -290,7 +520,7 @@ impl SlotTable {
             }
             drop(old);
             slot.owner.store(NO_OWNER, Ordering::Relaxed);
-            slot.state.store(EMPTY, Ordering::Release);
+            self.settle(slot, EMPTY);
         }
     }
 
@@ -298,13 +528,9 @@ impl SlotTable {
     /// reading whose reference bit is clear, clearing set bits on the way.
     /// After two fruitless sweeps every slot is mid-read: drain one.
     fn claim(&self) -> usize {
-        let n = self.slots.len();
         loop {
-            for _ in 0..2 * n {
-                let index = self.hand.fetch_add(1, Ordering::Relaxed) % n;
-                if self.try_claim(index) {
-                    return index;
-                }
+            if let Some(index) = self.sweep() {
+                return index;
             }
             if let Some(index) = self.drain() {
                 return index;
@@ -312,6 +538,17 @@ impl SlotTable {
             // Every slot is being loaded or drained by another thread.
             pause();
         }
+    }
+
+    /// Two turns of the CLOCK hand over the table: the claimed slot, or
+    /// `None` when every slot it reached was mid-read, being loaded or
+    /// drained, or referenced twice over. Never waits.
+    fn sweep(&self) -> Option<usize> {
+        let n = self.slots.len();
+        (0..2 * n).find_map(|_| {
+            let index = self.hand.fetch_add(1, Ordering::Relaxed) % n;
+            self.try_claim(index).then_some(index)
+        })
     }
 
     fn try_claim(&self, index: usize) -> bool {
@@ -345,11 +582,17 @@ impl SlotTable {
             _ => false,
         };
         // Acquire: every reader's leave (Release) happens before the close
-        // this claim leads to.
+        // this claim leads to. `WANTED` stays: the slot is busy again, and a
+        // parked waiter still needs its next free.
         claimable
             && slot
                 .state
-                .compare_exchange(state, CLAIMED, Ordering::AcqRel, Ordering::Acquire)
+                .compare_exchange(
+                    state,
+                    CLAIMED | (state & WANTED),
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
                 .is_ok()
     }
 
@@ -378,13 +621,19 @@ impl SlotTable {
             }
         }
         // Only this thread takes a drained slot. Its readers each finish one
-        // read and leave; no new one joins.
+        // read and leave; no new one joins. A `Blocking` read only: a reopen
+        // that may not wait never comes here (D60).
         loop {
             let state = slot.state.load(Ordering::Acquire);
             if state & READERS == 0
                 && slot
                     .state
-                    .compare_exchange(state, CLAIMED, Ordering::AcqRel, Ordering::Acquire)
+                    .compare_exchange(
+                        state,
+                        CLAIMED | (state & WANTED),
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
                     .is_ok()
             {
                 return Some(index);

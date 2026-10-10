@@ -116,6 +116,14 @@ import Regolith.TombstoneLog
 -- more open files than slots, never a file closed under a reader, and a
 -- read returns its own table. Backs `proofs/tla/OpenFileTable.tla`.
 import Regolith.OpenFileTable
+-- D60: a queue unit's reopen under max_open_files never waits for a slot,
+-- and a parked one is never forgotten: its message is there, or a WANTED
+-- busy slot or a wake on its way will bring it. The model and NeverWaits;
+-- the invariant proof of RetryNeverLost; the four RED counterexamples.
+-- Backs the D60 rows of `proofs/tla/OpenFileTable.tla`.
+import Regolith.OpenFileNoWait
+import Regolith.OpenFileNoWaitProof
+import Regolith.OpenFileNoWaitRed
 -- 4.6, Phase 7c1: column families created and dropped in the ordered step.
 -- No write lands after its family's tombstone or before its birth, and a
 -- family's life only moves forward. Backs `proofs/tla/CfRegistry.tla`.
@@ -124,3 +132,8 @@ import Regolith.CfRegistry
 -- offset's bytes, and an in-memory read sees every append that finished
 -- before it began. Backs `proofs/tla/EnvFiles.tla`.
 import Regolith.EnvFiles
+-- A table renamed aside while its handles reopen it: the Env's rename adds
+-- the new name before it drops the old, and a reopen that found nothing
+-- loads the names again, so it always finds the file. Backs Part 3 of
+-- `proofs/tla/EnvFiles.tla`.
+import Regolith.EnvFilesRename

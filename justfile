@@ -318,9 +318,10 @@ loom-cache:
 loom-tombstones:
     RUSTFLAGS="--cfg loom" cargo test --release --test loom_range_tombstones
 
-# Loom models for the open-file slot table (acquire, evict, release, drain)
+# Loom models for the open-file slot table (acquire, evict, release, drain,
+# and D60's park of a reopen that may not wait and the wake of a freed slot)
 # and the column-family registry (create, drop and use racing in the
-# ordered step), with three calibrations that must fail. Release, like
+# ordered step), with five calibrations that must fail. Release, like
 # `loom-io`.
 loom-tables:
     RUSTFLAGS="--cfg loom" cargo test --release --test loom_tables
@@ -741,6 +742,16 @@ tla:
     check MC_OpenFileTable_Red_IgnoreReaders           RED NeverClosedInUse
     check MC_OpenFileTable_Red_NoOwnerRecheck          RED ReadsOwnFile
     check MC_OpenFileTable_Red_OutsideTable            RED AtMostCap
+    # D60: a queue unit's reopen never waits for a slot, and a parked one is
+    # never forgotten. Lean: Regolith/OpenFileNoWait.lean, never_waits;
+    # Regolith/OpenFileNoWaitProof.lean, retry_never_lost; the REDs in
+    # Regolith/OpenFileNoWaitRed.lean.
+    check MC_OpenFileTable_Green_NoWait                GREEN
+    check MC_OpenFileTable_Green_NoWaitTwoSlots        GREEN
+    check MC_OpenFileTable_Red_Waits                   RED NeverWaits
+    check MC_OpenFileTable_Red_MarkFirst               RED RetryNeverLost
+    check MC_OpenFileTable_Red_PublishDropsWanted      RED RetryNeverLost
+    check MC_OpenFileTable_Red_WakeNeedsParked         RED RetryNeverLost
     # 4.6, Phase 7c1: column-family create, drop and use, fenced in the
     # ordered step. Lean: Regolith/CfRegistry.lean, no_write_after_drop,
     # no_write_before_birth, life_in_order.
@@ -764,6 +775,13 @@ tla:
     check MC_EnvFiles_Red_SharedCursor                 RED ReadsOwnBytes
     check MC_EnvFiles_Red_NoFreeze                     RED CurrentHoldsFinished
     check MC_EnvFiles_Red_StaleFrozen                  RED CurrentHoldsFinished
+    # A table renamed aside while its handles reopen it: the Env's rename adds
+    # the new name before it drops the old, and a reopen that found nothing
+    # loads the names again. Lean: Regolith/EnvFilesRename.lean,
+    # open_finds_file, and the REDs remove_first_loses and no_reload_loses.
+    check MC_EnvFiles_Green_Rename                     GREEN
+    check MC_EnvFiles_Red_RemoveFirst                  RED OpenFindsFile
+    check MC_EnvFiles_Red_NoReload                     RED OpenFindsFile
     rm -rf states ./*_TTrace_*.tla ./*_TTrace_*.bin
     exit $fail
 

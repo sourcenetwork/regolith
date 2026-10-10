@@ -40,6 +40,16 @@
 //!   finds it. So once close returns, no unit is left in the table, and every
 //!   queue waiting on one has its completion (`NonBlocking.tla`, Release;
 //!   the loom model `no_unit_outlives_close`).
+//! - **A unit never waits for an open-file slot** (D60). Its reopen under
+//!   `max_open_files` sweeps the slot table once; finding every slot in use
+//!   by running reads, it parks the unit on the queue running it and the
+//!   poll goes on. The read that next frees a slot the park marked wanted
+//!   pushes a message to that queue, and its poll unparks and runs the unit
+//!   again (`env::open_file_limit::slots`, `OpenFileTable.tla`). A parked
+//!   unit stays in the table, so reads of its block join it. Close releases
+//!   it like any unit nobody runs; a park that comes after close's sweep sees
+//!   the mark (one read-modify-write after the park) and releases the unit
+//!   itself.
 //!
 //! `scope` carries a handle's mode to the device seam; `crate::IoQueue` is
 //! the owner's side.
@@ -62,7 +72,7 @@ use super::index_block::IndexBlock;
 use crate::io_queue::{IoWait, QueueId};
 use crate::sync::internal::{AtomicUsize, Ordering};
 use shared::{Landing, Message, QueueShared, WaitSlot};
-use unit::{Unit, UnitKey, Work};
+use unit::{Ran, Unit, UnitKey, Work};
 
 /// Buckets the unit table starts with; it grows past this on demand.
 const UNIT_BUCKETS: usize = 256;
@@ -106,6 +116,15 @@ impl CloseGate {
     /// Mark close, before its sweep.
     pub(crate) fn close(&self) {
         self.0.fetch_or(CLOSED, Ordering::AcqRel);
+    }
+
+    /// Whether close began, read by a unit just parked. A read-modify-write,
+    /// not a load: either it comes after close's mark and sees it, or the
+    /// mark reads it and so close's sweep comes after the park and finds the
+    /// unit parked. A plain load could miss the mark while the sweep missed
+    /// the park.
+    pub(crate) fn closing(&self) -> bool {
+        self.0.fetch_or(0, Ordering::AcqRel) & CLOSED != 0
     }
 
     /// A close that failed: misses make units again.
@@ -297,12 +316,33 @@ impl IoRuntime {
         }
     }
 
-    /// Run a unit this thread claimed, reading the device whatever scope the
-    /// caller is in, then drop it from the table.
-    pub(crate) fn run(&self, unit: &Arc<Unit>, cache: &BlockCache) {
-        let _device = scope::blocking();
-        unit.run(cache);
-        self.forget(unit);
+    /// Run a unit this thread claimed for `queue`, reading the device
+    /// whatever scope the caller is in, then drop it from the table. A
+    /// reopen in it that finds every open-file slot busy parks it on
+    /// `queue` instead of waiting (D60): it stays in the table, and the
+    /// queue runs it again once told a slot freed.
+    pub(crate) fn run(
+        &self,
+        unit: &Arc<Unit>,
+        queue: &Arc<QueueShared>,
+        cache: &BlockCache,
+    ) -> Ran {
+        let ran = {
+            let run = scope::unit_run(queue);
+            unit.run(cache, || run.parked())
+        };
+        match ran {
+            Ran::Finished => self.forget(unit),
+            // Close marks its gate and then sweeps the table: a park that
+            // landed after the sweep passed this unit finds the mark here
+            // and lets the unit go itself (the module docs).
+            Ran::Parked if self.gate.closing() => {
+                self.release(unit);
+                return Ran::Finished;
+            }
+            Ran::Parked => {}
+        }
+        ran
     }
 
     /// Close `unit` without reading, unless another thread is running it,
@@ -340,6 +380,12 @@ impl IoRuntime {
     #[cfg(test)]
     pub(crate) fn units_in_flight(&self) -> usize {
         self.units.len()
+    }
+
+    /// The unit in the table for `key`.
+    #[cfg(test)]
+    pub(crate) fn unit(&self, key: &UnitKey) -> Option<Arc<Unit>> {
+        self.units.get(key)
     }
 }
 

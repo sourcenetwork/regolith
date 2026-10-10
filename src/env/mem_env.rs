@@ -156,6 +156,23 @@ impl MemEnv {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// A step a test sets to run once, on the renaming thread, between a
+    /// rename's two map writes: the instant a concurrent open or removal is
+    /// most likely to see the rename half done.
+    static BETWEEN_RENAME_WRITES: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Run the step a test set for this instant, if any.
+#[cfg(test)]
+fn between_rename_writes() {
+    if let Some(step) = BETWEEN_RENAME_WRITES.with(|hook| hook.borrow_mut().take()) {
+        step();
+    }
+}
+
 fn not_found(path: &Path) -> io::Error {
     io::Error::new(
         io::ErrorKind::NotFound,
@@ -253,12 +270,44 @@ impl Env for MemEnv {
         if from == to {
             return self.lookup(from).map(|_| ());
         }
-        // The file is taken from `from` first, so two renames of one file
-        // cannot both move it, then put at `to` in one map write, which
-        // replaces whatever was there: `to` always names a whole file.
-        let file = self.fs.files.remove(from).ok_or_else(|| not_found(from))?;
-        self.fs.files.insert(to.to_path_buf(), file);
-        Ok(())
+        loop {
+            let file = self.lookup(from)?;
+            // Published at `to` first, in one map write that replaces
+            // whatever was there, and only then taken from `from`: at every
+            // instant one of the two names holds the file, so an open that
+            // tries the old name and then the new one always finds it (the
+            // open-file table's reopen of a table renamed aside does exactly
+            // that). For a moment both names hold it, as with a hard link.
+            let replaced = self.fs.files.insert(to.to_path_buf(), Arc::clone(&file));
+            #[cfg(test)]
+            between_rename_writes();
+            // Taken from `from` only if `from` still names this file, so two
+            // renames or a rename and a removal of one file cannot both
+            // move it.
+            if self
+                .fs
+                .files
+                .remove_if(from, |held| Arc::ptr_eq(held, &file))
+                .is_some()
+            {
+                return Ok(());
+            }
+            // Another rename or a removal took `from` first. Put `to` back
+            // as it was, unless something replaced it since, and look at
+            // `from` again: it is gone (this rename then fails as POSIX's
+            // would) or names a newer file, which this rename then moves.
+            match replaced {
+                Some(previous) => {
+                    let _ = self
+                        .fs
+                        .files
+                        .replace_if(to.to_path_buf(), previous, |held| Arc::ptr_eq(held, &file));
+                }
+                None => {
+                    self.fs.files.remove_if(to, |held| Arc::ptr_eq(held, &file));
+                }
+            }
+        }
     }
 
     fn hard_link(&self, _src: &Path, _dst: &Path) -> io::Result<()> {
@@ -421,6 +470,123 @@ mod tests {
             .unwrap();
         assert_eq!(env.read(Path::new("/db/live")).unwrap(), b"new");
         assert!(!env.exists(Path::new("/db/tmp")));
+    }
+
+    /// A rename is atomic to a concurrent open: one that tries the old name
+    /// and then the new one always finds the file under one of them, as the
+    /// open-file table's reopen of a table renamed aside does. Each round
+    /// writes a fresh file and renames it once while readers probe both of
+    /// its names.
+    #[test]
+    fn an_open_racing_a_rename_finds_the_file_under_one_of_its_names() {
+        use std::sync::atomic::{AtomicUsize, Ordering as StdOrdering};
+
+        const ROUNDS: usize = 20_000;
+        let env = env();
+        env.create_dir_all(Path::new("/db")).unwrap();
+        let names = |round: usize| {
+            (
+                PathBuf::from(format!("/db/{round}.sst")),
+                PathBuf::from(format!("/db/{round}.sst.removed-{round}")),
+            )
+        };
+        // The round whose file readers probe; it exists from before this
+        // is published until the end.
+        let current = AtomicUsize::new(usize::MAX);
+        let done = AtomicUsize::new(0);
+        let missed = AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            for _ in 0..3 {
+                scope.spawn(|| {
+                    while done.load(StdOrdering::Acquire) == 0 {
+                        let round = current.load(StdOrdering::Acquire);
+                        if round == usize::MAX {
+                            continue;
+                        }
+                        let (from, to) = names(round);
+                        if env.open_read(&from).is_err() && env.open_read(&to).is_err() {
+                            missed.fetch_add(1, StdOrdering::Relaxed);
+                        }
+                    }
+                });
+            }
+            for round in 0..ROUNDS {
+                let (from, to) = names(round);
+                env.write(&from, b"table").unwrap();
+                current.store(round, StdOrdering::Release);
+                env.rename(&from, &to).unwrap();
+            }
+            done.store(1, StdOrdering::Release);
+        });
+        assert_eq!(
+            missed.load(StdOrdering::Relaxed),
+            0,
+            "an open found the file under neither name while it was renamed"
+        );
+    }
+
+    /// Run `step` once, between the two map writes of the next rename on
+    /// this thread.
+    fn between_rename_writes(step: impl FnOnce() + 'static) {
+        BETWEEN_RENAME_WRITES.with(|hook| *hook.borrow_mut() = Some(Box::new(step)));
+    }
+
+    /// At the instant between a rename's two map writes, an open of the old
+    /// name or of the new one finds the file: the rename adds the new name
+    /// before it drops the old.
+    #[test]
+    fn halfway_through_a_rename_one_of_the_two_names_holds_the_file() {
+        let env = env();
+        let (from, to) = (
+            Path::new("/db/000001.sst"),
+            Path::new("/db/000001.sst.removed-1"),
+        );
+        env.write(from, b"table").unwrap();
+        let seen = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        {
+            let (env, seen) = (env.clone(), std::sync::Arc::clone(&seen));
+            between_rename_writes(move || {
+                let found = env.open_read(from).is_ok() || env.open_read(to).is_ok();
+                seen.store(found, std::sync::atomic::Ordering::SeqCst);
+            });
+        }
+        env.rename(from, to).unwrap();
+        assert!(
+            seen.load(std::sync::atomic::Ordering::SeqCst),
+            "halfway through the rename neither name held the file"
+        );
+        assert_eq!(env.read(to).unwrap(), b"table");
+        assert!(!env.exists(from));
+    }
+
+    /// A removal of the source lands between a rename's two writes, after
+    /// the rename already put the source's file at the destination. The
+    /// rename then fails, as one whose source was removed first does, and
+    /// the destination holds the bytes it held before.
+    #[test]
+    fn a_removal_landing_halfway_through_a_rename_fails_it_and_restores_the_destination() {
+        let env = env();
+        let (from, to) = (Path::new("/db/tmp"), Path::new("/db/live"));
+        env.write(from, b"new").unwrap();
+        env.write(to, b"old").unwrap();
+        {
+            let env = env.clone();
+            between_rename_writes(move || env.remove_file(from).unwrap());
+        }
+        let err = env.rename(from, to).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+        assert!(!env.exists(from));
+        assert_eq!(env.read(to).unwrap(), b"old");
+
+        // And when the destination did not exist, it does not after.
+        let fresh = Path::new("/db/fresh");
+        env.write(from, b"new").unwrap();
+        {
+            let env = env.clone();
+            between_rename_writes(move || env.remove_file(from).unwrap());
+        }
+        assert!(env.rename(from, fresh).is_err());
+        assert!(!env.exists(fresh) && !env.exists(from));
     }
 
     #[test]
