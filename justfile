@@ -666,13 +666,18 @@ tla:
     check MC_NonBlocking_Red_PublishAtWrite            RED VisibleAfterSync
     check MC_NonBlocking_Red_DeliverOnLander           RED DeliveredOnOwnPoll
     check MC_NonBlocking_Red_NoRecheck                 RED StallLandsWhenClear
-    # Phase 7 integration: a foreground job that held the compaction gate
-    # relieves the stop it kept stopped writers from relieving (no worker,
-    # inline compaction). Lean: Regolith/StallRelief.lean,
-    # job_end_strands_no_waiter, no_relief_strands_waiters.
+    # Phase 7 integration: with no worker and inline compaction on, no
+    # stopped writer waits on a relief nobody runs. Every piece of progress
+    # lands the stall's unit (relief handed back), a contended writer reads
+    # the progress count again once registered, and a foreground job that
+    # held the gate relieves the stop. Lean: Regolith/StallRelief.lean,
+    # no_stranded_wait, no_relief_strands_a_waiter,
+    # no_hand_back_strands_a_waiter, no_recheck_strands_a_waiter.
     spec=StallRelief
     check MC_StallRelief_Green                         GREEN
     check MC_StallRelief_Red_NoRelief                  RED NoStrandedWait
+    check MC_StallRelief_Red_NoHandBack                RED NoStrandedWait
+    check MC_StallRelief_Red_NoRecheck                 RED NoStrandedWait
     # regolith::sync's locks after D49: barging with bounded bypass, for
     # Mutex, Semaphore and ReentrantMutex. Lean: Regolith/Sync.lean,
     # mutual_exclusion, bounded_bypass, owed_exclusive.
