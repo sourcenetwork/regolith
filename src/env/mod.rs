@@ -49,6 +49,8 @@ pub mod opfs;
 #[cfg(any(test, all(target_arch = "wasm32", target_os = "unknown")))]
 mod persist_order;
 mod std_env;
+#[cfg(test)]
+pub(crate) mod walk_fault;
 // WASI has `std::fs` but no threads. `WasiEnv` delegates every
 // filesystem call to `StdEnv` and says so where it matters: a spawn
 // that explains itself instead of a bare `Unsupported`, and no

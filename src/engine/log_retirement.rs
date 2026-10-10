@@ -76,24 +76,32 @@ pub(crate) fn remove_below(
     min_wal_id: u64,
     stats: Option<&Statistics>,
 ) -> bool {
-    let logs = match super::list_wal_files(env, wal_dir) {
-        Ok(logs) => logs,
-        Err(error) => {
-            tracing::warn!(
-                dir = %wal_dir.display(),
-                %error,
-                "could not list the write-ahead logs to remove the ones in tables; trying again at the next flush or open"
-            );
-            return false;
-        }
+    let unlisted = |error: std::io::Error| {
+        tracing::warn!(
+            dir = %wal_dir.display(),
+            %error,
+            "could not list the write-ahead logs to remove the ones in tables; trying again at the next flush or open"
+        );
+        false
     };
-    // Every log is tried, whether or not one before it stayed.
-    let stayed = logs
-        .iter()
-        .filter(|path| super::wal_file_id(path).is_some_and(|id| id < min_wal_id))
-        .filter(|path| !remove_log(env, path, stats))
-        .count();
-    stayed == 0
+    let logs = match super::wal_scan::walk(env, wal_dir) {
+        Ok(logs) => logs,
+        Err(error) => return unlisted(error),
+    };
+    // Each log is removed as the walk reaches it, and every one is tried,
+    // whether or not one before it stayed. A walk cut short by an error
+    // leaves the rest for the retry the `false` asks for.
+    let mut none_stayed = true;
+    for log in logs {
+        let path = match log {
+            Ok(path) => path,
+            Err(error) => return unlisted(error),
+        };
+        if super::wal_file_id(&path).is_some_and(|id| id < min_wal_id) {
+            none_stayed &= remove_log(env, &path, stats);
+        }
+    }
+    none_stayed
 }
 
 /// Remove one log whose writes are in tables. A log already gone counts as
@@ -113,5 +121,64 @@ fn remove_log(env: &dyn Env, path: &Path, stats: Option<&Statistics>) -> bool {
             }
             false
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::env::MemEnv;
+    use crate::env::walk_fault::WalkFault;
+
+    fn logs(env: &dyn Env, ids: impl IntoIterator<Item = u64>) {
+        env.create_dir_all(Path::new("/db/wal")).unwrap();
+        for id in ids {
+            let path = PathBuf::from(format!("/db/wal/{}", crate::engine::wal::wal_filename(id)));
+            env.write(&path, b"").unwrap();
+        }
+    }
+
+    fn names(env: &dyn Env) -> Vec<String> {
+        let mut names: Vec<String> = env
+            .read_dir(Path::new("/db/wal"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// Thousands of retired logs, far more than one bucket of the map the
+    /// walk goes through, are removed as the walk reaches them; the live
+    /// ones and the files that are not logs stay.
+    #[test]
+    fn removes_every_log_below_the_minimum_and_nothing_else() {
+        let env = MemEnv::new();
+        logs(&env, 0..5_003);
+        env.write(Path::new("/db/wal/notes"), b"").unwrap();
+        assert!(remove_below(&env, Path::new("/db/wal"), 5_000, None));
+        assert_eq!(
+            names(&env),
+            vec![
+                "notes",
+                "wal_005000.log",
+                "wal_005001.log",
+                "wal_005002.log"
+            ]
+        );
+    }
+
+    /// A walk that breaks part way removes what it reached and owes a
+    /// retry; the retry, over a whole walk, removes the rest.
+    #[test]
+    fn a_walk_that_breaks_owes_a_retry() {
+        let env = WalkFault::default();
+        logs(&env, 0..100);
+        env.arm(Path::new("/db/wal"), 10);
+        assert!(!remove_below(&env, Path::new("/db/wal"), 100, None));
+        assert_eq!(names(&env.inner).len(), 90);
+        env.arm(Path::new("/nowhere"), 0);
+        assert!(remove_below(&env, Path::new("/db/wal"), 100, None));
+        assert!(names(&env).is_empty());
     }
 }
