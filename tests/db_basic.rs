@@ -80,7 +80,7 @@ fn get_from_immutable_memtable_still_visible() {
     // a flush + compaction); the pinned key must still be visible.
     for i in 0..200 {
         let k = format!("filler_{:04}", i);
-        db.put(k.as_bytes(), &[0u8; 64]).unwrap();
+        regolith::through_stalls(|| db.put(k.as_bytes(), &[0u8; 64])).unwrap();
     }
     assert_eq!(db.get(b"pinned").unwrap(), Some(b"v".to_vec()));
 }
@@ -127,7 +127,7 @@ fn get_encounters_empty_level_between_populated_ones() {
     let db = open(&dir);
     for i in 0..1000 {
         let k = format!("k_{:06}", i);
-        db.put(k.as_bytes(), b"v").unwrap();
+        regolith::through_stalls(|| db.put(k.as_bytes(), b"v")).unwrap();
     }
     force_compaction(&db);
     assert_eq!(db.get(b"k_000500").unwrap(), Some(b"v".to_vec()));
@@ -350,7 +350,7 @@ fn approximate_sizes_grows_with_range_width() {
     let db = open(&dir);
     for i in 0..1_000 {
         let k = format!("k_{:06}", i);
-        db.put(k.as_bytes(), &[0u8; 128]).unwrap();
+        regolith::through_stalls(|| db.put(k.as_bytes(), &[0u8; 128])).unwrap();
     }
     force_compaction(&db);
     let narrow = db.get_approximate_sizes(&[Range::new(b"k_000000", b"k_000001")]);
