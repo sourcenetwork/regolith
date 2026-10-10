@@ -253,3 +253,7 @@ harness = false
 [[bench]]
 name = "encryption"
 harness = false
+
+[[bench]]
+name = "per_core"
+harness = false

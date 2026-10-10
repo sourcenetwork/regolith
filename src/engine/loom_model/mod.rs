@@ -84,6 +84,7 @@ pub mod handoff;
 pub mod io_queue;
 pub mod skiplist;
 pub mod slice;
+pub mod snapshots;
 pub mod version;
 
 use std::sync::Arc as StdArc;
@@ -175,6 +176,21 @@ fn explore(
     min_witnesses: usize,
     model: impl Fn(&Witness) + Sync + Send + 'static,
 ) {
+    explore_bounded(name, None, min_interleavings, min_witnesses, model);
+}
+
+/// [`explore`] with at most `preemptions` preemptions per schedule, or
+/// none when `None`. `LOOM_MAX_PREEMPTIONS` overrides a bound given here.
+/// Models with three threads that each make several atomic accesses need
+/// one: unbounded, their search runs for hours without reaching a new kind
+/// of interleaving.
+fn explore_bounded(
+    name: &'static str,
+    preemptions: Option<usize>,
+    min_interleavings: usize,
+    min_witnesses: usize,
+    model: impl Fn(&Witness) + Sync + Send + 'static,
+) {
     let runs = StdArc::new(AtomicUsize::new(0));
     let witness = Witness(StdArc::new(AtomicUsize::new(0)));
     let report = Report {
@@ -191,7 +207,9 @@ fn explore(
         }
     };
 
-    loom::model::Builder::new().check(counted);
+    let mut builder = loom::model::Builder::new();
+    builder.preemption_bound = builder.preemption_bound.or(preemptions);
+    builder.check(counted);
 
     let explored = runs.load(StdOrdering::Relaxed);
     let witnessed = witness.count();

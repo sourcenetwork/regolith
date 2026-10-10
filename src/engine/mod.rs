@@ -82,6 +82,7 @@ use recovery::{
     rewrite_recovered_memtable_to_wal,
 };
 use skiplist::InsertHint;
+pub(crate) use snapshot_registry::SnapshotPin;
 use snapshot_registry::SnapshotRegistry;
 use source_walk::Source;
 
@@ -1201,40 +1202,44 @@ impl RegolithEngine {
         )
     }
 
-    /// Register a new live snapshot at `seq` so compaction keeps
-    /// every version it might need to see. Balanced by
-    /// [`Self::release_snapshot`] when the snapshot drops.
-    pub(crate) fn register_snapshot(&self, seq: u64) {
+    /// Pin a copy of the snapshot `pin` holds, so compaction keeps every
+    /// version it might need to see for as long as the copy lives. The copy
+    /// shares the original's entry and is covered from the moment the
+    /// original was. Balanced by [`Self::release_snapshot`].
+    pub(crate) fn clone_snapshot_pin(&self, pin: &SnapshotPin) -> SnapshotPin {
+        let copy = self.snapshot_registry.clone_pin(pin);
+        if copy.is_registered()
+            && let Some(s) = self.statistics()
+        {
+            s.add(crate::statistics::Ticker::SnapshotsRegistered, 1);
+        }
+        copy
+    }
+
+    /// Pin a snapshot at the current read horizon by announce, sample and
+    /// confirm (see `snapshot_registry`), so a concurrent compaction either
+    /// lists the pin or saw a horizon no newer than it. Returns the pinned
+    /// sequence and the pin, released by [`Self::release_snapshot`] on
+    /// whatever thread drops the handle. A closed database pins nothing.
+    pub(crate) fn register_snapshot_at_horizon(&self) -> (u64, SnapshotPin) {
         if self.is_closed() {
+            return (self.visible_seq.visible(), SnapshotPin::none());
+        }
+        let pinned = self.snapshot_registry.pin(&self.visible_seq);
+        if let Some(s) = self.statistics() {
+            s.add(crate::statistics::Ticker::SnapshotsRegistered, 1);
+        }
+        pinned
+    }
+
+    /// Release a snapshot pin taken by
+    /// [`Self::register_snapshot_at_horizon`] or
+    /// [`Self::clone_snapshot_pin`], exactly where it was announced.
+    pub(crate) fn release_snapshot(&self, pin: SnapshotPin) {
+        if !pin.is_registered() {
             return;
         }
-        self.snapshot_registry.register(seq);
-        if let Some(s) = self.statistics() {
-            s.add(crate::statistics::Ticker::SnapshotsRegistered, 1);
-        }
-    }
-
-    /// Pin a snapshot at the current read horizon, sampling the
-    /// horizon and registering the pin as one step so a concurrent
-    /// compaction cannot cut its stripes from a registry that does
-    /// not yet contain this pin. Returns the pinned sequence.
-    pub(crate) fn register_snapshot_at_horizon(&self) -> u64 {
-        if self.is_closed() {
-            return self.visible_seq.visible();
-        }
-        let seq = self
-            .snapshot_registry
-            .register_at(|| self.visible_seq.visible());
-        if let Some(s) = self.statistics() {
-            s.add(crate::statistics::Ticker::SnapshotsRegistered, 1);
-        }
-        seq
-    }
-
-    /// Release a snapshot pin previously taken via
-    /// [`Self::register_snapshot`].
-    pub(crate) fn release_snapshot(&self, seq: u64) {
-        self.snapshot_registry.release(seq);
+        self.snapshot_registry.release(pin);
         if let Some(s) = self.statistics() {
             s.add(crate::statistics::Ticker::SnapshotsReleased, 1);
         }

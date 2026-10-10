@@ -24,8 +24,16 @@
 //! `Options::statistics = None` short-circuits every instrumentation
 //! site behind an `Option::is_some` check plus an `Arc` clone at
 //! open time. The hot-path overhead is a single branch. Reaching
-//! for a non-`None` statistics object adds one `fetch_add` per
-//! ticker update and a few atomic operations per histogram sample.
+//! for a non-`None` statistics object adds one relaxed `fetch_add` per
+//! ticker update and a few atomic operations per histogram sample, all
+//! on the calling thread's own shard.
+//!
+//! # Per-thread shards (plan 4.6, D54)
+//!
+//! Every ticker and histogram is kept once per thread number (see
+//! `per_thread`), each copy on cache lines of its own, so threads on
+//! different cores never write the same line. A read sums the copies.
+//! [`Statistics`] states what a read sees while updates run.
 //!
 //! # Histograms
 //!
@@ -35,6 +43,8 @@
 //! scope for v1 - adding an HDR-style bucket array is a follow-up
 //! that drops in behind the existing API without breaking
 //! callers.
+
+use kovan::CachePadded;
 
 use crate::portability::{AtomicU64, Ordering};
 
@@ -372,23 +382,14 @@ impl HistogramData {
         self.max.fetch_max(value, Ordering::Relaxed);
     }
 
-    fn snapshot(&self) -> HistogramSnapshot {
-        let count = self.count.load(Ordering::Relaxed);
-        if count == 0 {
-            return HistogramSnapshot {
-                count: 0,
-                sum: 0,
-                min: 0,
-                max: 0,
-            };
-        }
-        let min = self.min.load(Ordering::Relaxed);
-        HistogramSnapshot {
-            count,
-            sum: self.sum.load(Ordering::Relaxed),
-            min: if min == u64::MAX { 0 } else { min },
-            max: self.max.load(Ordering::Relaxed),
-        }
+    /// Folds this shard's state into `acc`: counts and sums add, the
+    /// minimum and maximum widen. `acc.min` is `u64::MAX` until a shard
+    /// with a sample is folded in.
+    fn fold_into(&self, acc: &mut HistogramSnapshot) {
+        acc.count = acc.count.wrapping_add(self.count.load(Ordering::Relaxed));
+        acc.sum = acc.sum.saturating_add(self.sum.load(Ordering::Relaxed));
+        acc.min = acc.min.min(self.min.load(Ordering::Relaxed));
+        acc.max = acc.max.max(self.max.load(Ordering::Relaxed));
     }
 
     fn clear(&self) {
@@ -399,13 +400,58 @@ impl HistogramData {
     }
 }
 
+/// One thread number's copy of every ticker and histogram.
+#[derive(Debug)]
+struct Shard {
+    tickers: [AtomicU64; NUM_TICKERS],
+    histograms: [HistogramData; NUM_HISTOGRAMS],
+}
+
+impl Shard {
+    fn new() -> Self {
+        // `AtomicU64` is not `Copy`, so `[x; N]` does not apply.
+        Self {
+            tickers: std::array::from_fn(|_| AtomicU64::new(0)),
+            histograms: std::array::from_fn(|_| HistogramData::default()),
+        }
+    }
+}
+
 /// Engine-wide counters and histograms. Constructed by the
 /// caller and passed to [`crate::Options::statistics`]. The
 /// engine clones the `Arc` into the paths it wants to
 /// instrument and updates it with lock-free atomics.
+///
+/// # Per-thread shards
+///
+/// Each ticker and histogram is kept once per thread number, each copy on
+/// cache lines of its own: one per core, rounded up to a power of two and
+/// capped, with threads past the cap sharing copies. An update is one
+/// relaxed atomic add on the calling thread's copy (a histogram sample a
+/// few), so cores never contend on a line. A read adds the copies up.
+///
+/// # What a read sees
+///
+/// - **Exact once quiescent.** With no update running, [`get_ticker`]
+///   returns the sum of every amount added since the last [`reset`],
+///   modulo 2^64, and a histogram snapshot counts every sample recorded.
+///   Two threads sharing a copy lose nothing: every update is an atomic
+///   read-modify-write.
+/// - **Monotonic while updates run.** A ticker read returns a total
+///   between the ticker's total when the read began and its total when the
+///   read ended. It is never less than a total an earlier read of the same
+///   ticker returned, where "earlier" means that read's result reached this
+///   one's thread (the same thread, or through any synchronisation), unless
+///   a [`reset`] ran in between.
+/// - **Not a snapshot across metrics.** Two tickers read one after the
+///   other may each include an update the other does not, and a histogram
+///   sample being recorded may show in its count before its sum.
+///
+/// [`get_ticker`]: Statistics::get_ticker
+/// [`reset`]: Statistics::reset
 pub struct Statistics {
-    tickers: [AtomicU64; NUM_TICKERS],
-    histograms: [HistogramData; NUM_HISTOGRAMS],
+    /// One per thread number; the length is a power of two.
+    shards: Box<[CachePadded<Shard>]>,
 }
 
 impl std::fmt::Debug for Statistics {
@@ -422,39 +468,67 @@ impl Default for Statistics {
 
 impl Statistics {
     /// Construct a fresh `Statistics` with every ticker and
-    /// histogram at zero.
+    /// histogram at zero, with one shard per thread number.
     pub fn new() -> Self {
-        // `AtomicU64` is not `Copy`, so we can't use the
-        // `[x; N]` syntax. `std::array::from_fn` is the
-        // cleanest alternative.
-        let tickers = std::array::from_fn(|_| AtomicU64::new(0));
-        let histograms = std::array::from_fn(|_| HistogramData::default());
+        Self::with_shards(crate::per_thread::width())
+    }
+
+    /// A `Statistics` with `shards` copies (rounded up to a power of two).
+    fn with_shards(shards: usize) -> Self {
+        let shards = shards.max(1).next_power_of_two();
         Self {
-            tickers,
-            histograms,
+            shards: (0..shards)
+                .map(|_| CachePadded::new(Shard::new()))
+                .collect(),
         }
     }
 
-    /// Read the current value of a ticker. Guaranteed to be
-    /// consistent with the corresponding `fetch_add` via
-    /// `Ordering::Relaxed` - callers that need stronger
-    /// ordering should wrap their own fences.
-    pub fn get_ticker(&self, ticker: Ticker) -> u64 {
-        self.tickers[ticker as usize].load(Ordering::Relaxed)
+    /// The calling thread's shard.
+    #[inline]
+    fn shard(&self) -> &Shard {
+        &self.shards[crate::per_thread::index() & (self.shards.len() - 1)]
     }
 
-    /// Return an immutable snapshot of a histogram's state.
+    /// Read the current total of a ticker: the sum of every shard. See
+    /// [`Statistics`] for what a read concurrent with updates returns.
+    pub fn get_ticker(&self, ticker: Ticker) -> u64 {
+        self.shards
+            .iter()
+            .map(|shard| shard.tickers[ticker as usize].load(Ordering::Relaxed))
+            .fold(0, u64::wrapping_add)
+    }
+
+    /// Return an immutable snapshot of a histogram's state, merged across
+    /// every shard.
     pub fn get_histogram_snapshot(&self, hist: Histogram) -> HistogramSnapshot {
-        self.histograms[hist as usize].snapshot()
+        let mut merged = HistogramSnapshot {
+            count: 0,
+            sum: 0,
+            min: u64::MAX,
+            max: 0,
+        };
+        for shard in self.shards.iter() {
+            shard.histograms[hist as usize].fold_into(&mut merged);
+        }
+        if merged.count == 0 {
+            return HistogramSnapshot::default();
+        }
+        if merged.min == u64::MAX {
+            // A sample counted before its minimum landed.
+            merged.min = 0;
+        }
+        merged
     }
 
     /// Zero every ticker and clear every histogram.
     pub fn reset(&self) {
-        for t in &self.tickers {
-            t.store(0, Ordering::Relaxed);
-        }
-        for h in &self.histograms {
-            h.clear();
+        for shard in self.shards.iter() {
+            for t in &shard.tickers {
+                t.store(0, Ordering::Relaxed);
+            }
+            for h in &shard.histograms {
+                h.clear();
+            }
         }
     }
 
@@ -467,12 +541,12 @@ impl Statistics {
             out.push_str(&format!(
                 "{:40} {}\n",
                 ticker.name(),
-                self.tickers[*ticker as usize].load(Ordering::Relaxed)
+                self.get_ticker(*ticker)
             ));
         }
         out.push_str("-- histograms --\n");
         for hist in ALL_HISTOGRAMS {
-            let snap = self.histograms[*hist as usize].snapshot();
+            let snap = self.get_histogram_snapshot(*hist);
             out.push_str(&format!(
                 "{:40} count={} sum={} min={} max={} avg={}\n",
                 hist.name(),
@@ -486,15 +560,24 @@ impl Statistics {
         out
     }
 
-    /// Add `amount` to `ticker`. `Ordering::Relaxed` - callers
-    /// that need stronger ordering should provide their own.
+    /// Add `amount` to `ticker`: one relaxed `fetch_add` on the calling
+    /// thread's shard.
+    #[inline]
     pub(crate) fn add(&self, ticker: Ticker, amount: u64) {
-        self.tickers[ticker as usize].fetch_add(amount, Ordering::Relaxed);
+        self.shard().tickers[ticker as usize].fetch_add(amount, Ordering::Relaxed);
     }
 
-    /// Record a single sample into `hist`.
+    /// Record a single sample into `hist`, in the calling thread's shard.
+    #[inline]
     pub(crate) fn record(&self, hist: Histogram, value: u64) {
-        self.histograms[hist as usize].record(value);
+        self.shard().histograms[hist as usize].record(value);
+    }
+
+    /// [`Self::add`] into shard `shard` (taken modulo the shard count).
+    #[cfg(test)]
+    fn add_to(&self, shard: usize, ticker: Ticker, amount: u64) {
+        self.shards[shard & (self.shards.len() - 1)].tickers[ticker as usize]
+            .fetch_add(amount, Ordering::Relaxed);
     }
 }
 
@@ -558,6 +641,104 @@ mod tests {
         assert_eq!(snap.sum, (1..=80_000u64).sum::<u64>());
         assert_eq!(snap.min, 1);
         assert_eq!(snap.max, 80_000);
+    }
+
+    /// More threads than shards, so shards are shared: once every writer
+    /// has finished, each ticker's total is exactly the sum of its adds.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn ticker_totals_are_exact_once_writers_are_quiescent() {
+        const ADDS: u64 = 50_000;
+        let stats = std::sync::Arc::new(Statistics::with_shards(4));
+        let start = std::sync::Arc::new(std::sync::Barrier::new(16));
+        let threads: Vec<_> = (0..16u64)
+            .map(|t| {
+                let (stats, start) = (std::sync::Arc::clone(&stats), std::sync::Arc::clone(&start));
+                std::thread::spawn(move || {
+                    start.wait();
+                    for i in 0..ADDS {
+                        stats.add(Ticker::KeysRead, 1);
+                        stats.add(Ticker::BytesRead, t + i);
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        assert_eq!(stats.get_ticker(Ticker::KeysRead), 16 * ADDS);
+        let expected: u64 = (0..16u64)
+            .map(|t| (0..ADDS).map(|i| t + i).sum::<u64>())
+            .sum();
+        assert_eq!(stats.get_ticker(Ticker::BytesRead), expected);
+        assert_eq!(
+            stats.get_ticker(Ticker::KeysWritten),
+            0,
+            "untouched tickers stay zero"
+        );
+    }
+
+    #[test]
+    fn a_read_sums_every_shard() {
+        let stats = Statistics::with_shards(8);
+        for shard in 0..8 {
+            stats.add_to(shard, Ticker::WalSyncCount, 1 << shard);
+        }
+        assert_eq!(stats.get_ticker(Ticker::WalSyncCount), 0xFF);
+        stats.reset();
+        assert_eq!(
+            stats.get_ticker(Ticker::WalSyncCount),
+            0,
+            "reset clears every shard"
+        );
+    }
+
+    /// While writers run, no read of a ticker returns less than an earlier
+    /// read of it did.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn concurrent_reads_never_go_backwards() {
+        let stats = std::sync::Arc::new(Statistics::with_shards(4));
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writers: Vec<_> = (0..6)
+            .map(|_| {
+                let (stats, stop) = (std::sync::Arc::clone(&stats), std::sync::Arc::clone(&stop));
+                std::thread::spawn(move || {
+                    let mut added = 0u64;
+                    while !stop.load(std::sync::atomic::Ordering::Relaxed) || added < 10_000 {
+                        stats.add(Ticker::IterNextCount, 3);
+                        added += 1;
+                    }
+                    added
+                })
+            })
+            .collect();
+        let mut last = 0u64;
+        for _ in 0..20_000 {
+            let now = stats.get_ticker(Ticker::IterNextCount);
+            assert!(now >= last, "read {now} after reading {last}");
+            assert_eq!(now % 3, 0, "a read sums whole adds");
+            last = now;
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let total: u64 = writers.into_iter().map(|w| w.join().unwrap()).sum();
+        assert!(last <= total * 3);
+        assert_eq!(stats.get_ticker(Ticker::IterNextCount), total * 3);
+    }
+
+    #[test]
+    fn a_histogram_merges_its_shards() {
+        let stats = Statistics::with_shards(4);
+        for (shard, value) in [(0usize, 7u64), (1, 2), (1, 30), (3, 11)] {
+            stats.shards[shard].histograms[Histogram::DbGet as usize].record(value);
+        }
+        let snap = stats.get_histogram_snapshot(Histogram::DbGet);
+        assert_eq!((snap.count, snap.sum, snap.min, snap.max), (4, 50, 2, 30));
+        stats.reset();
+        assert_eq!(
+            stats.get_histogram_snapshot(Histogram::DbGet),
+            HistogramSnapshot::default()
+        );
     }
 
     #[test]
