@@ -4,11 +4,11 @@ use super::*;
 use crate::Options;
 use tempfile::TempDir;
 
-fn tiny_flush_opts() -> Options {
+pub(super) fn tiny_flush_opts() -> Options {
     Options::default().write_buffer_size(4 * 1024)
 }
 
-fn populate(db: &Db, prefix: &str, n: usize) {
+pub(super) fn populate(db: &Db, prefix: &str, n: usize) {
     let filler = vec![0u8; 256];
     for i in 0..n {
         let k = format!("{}_{:05}", prefix, i);
@@ -18,7 +18,7 @@ fn populate(db: &Db, prefix: &str, n: usize) {
     }
 }
 
-fn assert_has(db: &Db, prefix: &str, n: usize) {
+pub(super) fn assert_has(db: &Db, prefix: &str, n: usize) {
     let filler = vec![0u8; 256];
     for i in 0..n {
         let k = format!("{}_{:05}", prefix, i);
@@ -48,7 +48,7 @@ fn shared_count(dir: &Path) -> usize {
         .unwrap_or(0)
 }
 
-fn shared_file_paths(dir: &Path) -> Vec<PathBuf> {
+pub(super) fn shared_file_paths(dir: &Path) -> Vec<PathBuf> {
     let shared = dir.join("shared");
     let mut paths: Vec<_> = fs::read_dir(&shared)
         .unwrap()
@@ -57,6 +57,16 @@ fn shared_file_paths(dir: &Path) -> Vec<PathBuf> {
         .collect();
     paths.sort();
     paths
+}
+
+/// Every backup the engine lists, each one asserted readable.
+pub(super) fn readable(engine: &BackupEngine) -> Vec<BackupInfo> {
+    engine
+        .list_backups()
+        .unwrap()
+        .into_iter()
+        .map(|entry| entry.unwrap())
+        .collect()
 }
 
 fn corrupt_file_same_size(path: &Path) {
@@ -77,7 +87,7 @@ fn backup_and_restore_roundtrip() {
 
     let mut engine = BackupEngine::open(bkp_dir.path()).unwrap();
     let id = engine.create_backup(&db).unwrap();
-    let infos = engine.list_backups();
+    let infos = readable(&engine);
     assert_eq!(infos.len(), 1);
     assert_eq!(infos[0].id, id);
     assert!(infos[0].file_count >= 1);
@@ -134,7 +144,7 @@ fn incremental_backup_dedupes() {
 
     assert_eq!(shared_bytes_1, shared_bytes_2);
     assert_eq!(shared_count_1, shared_count_2);
-    assert_eq!(engine.list_backups().len(), 2);
+    assert_eq!(readable(&engine).len(), 2);
 }
 
 #[test]
@@ -216,7 +226,7 @@ fn delete_backup_gcs_unreferenced_files() {
     engine.delete_backup(id1).unwrap();
     let shared_after_delete = shared_count(bkp_dir.path());
     assert!(shared_after_delete <= shared_after_2);
-    assert_eq!(engine.list_backups().len(), 1);
+    assert_eq!(readable(&engine).len(), 1);
 
     // backup 2 still restores cleanly.
     let tgt_dir = TempDir::new().unwrap();
@@ -240,7 +250,7 @@ fn delete_only_backup_removes_all_shared() {
 
     engine.delete_backup(id).unwrap();
     assert_eq!(shared_count(bkp_dir.path()), 0);
-    assert_eq!(engine.list_backups().len(), 0);
+    assert!(engine.list_backups().unwrap().is_empty());
 }
 
 #[test]
@@ -263,7 +273,7 @@ fn purge_keeps_newest() {
     let b3 = engine.create_backup(&db).unwrap();
 
     engine.purge_old_backups(1).unwrap();
-    let infos = engine.list_backups();
+    let infos = readable(&engine);
     assert_eq!(infos.len(), 1);
     assert_eq!(infos[0].id, b3);
 }
