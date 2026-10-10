@@ -1,9 +1,11 @@
-//! Power cuts during a backup and a restore of a database encrypted at
-//! rest (D57).
+//! Power cuts during a backup, a restore and a purge of a database
+//! encrypted at rest (D57).
 //!
 //! The child opens an encrypted database, writes half its workload, takes
 //! backup 1, writes the rest, takes backup 2 and, in the restore phase,
-//! restores backup 2 under the database's key. It runs under the
+//! restores backup 2 under the database's key; in the purge phase it
+//! compacts before backup 2, so backup 1 holds tables backup 2 does not,
+//! and purges every backup but backup 2. It runs under the
 //! `LD_PRELOAD` shim, which kills it at a chosen call; the directory is then
 //! rebuilt as the filesystem would have left it, every byte never synced
 //! discarded. Whatever the cut:
@@ -16,12 +18,14 @@
 //!   database; the restore runs again over what the cut left and finishes;
 //! - a target the restore finished opens under the right key only;
 //! - the repository still takes and restores a new backup of the reopened
-//!   source.
+//!   source;
+//! - a purge cut short leaves backup 2 whole, and the next purge leaves the
+//!   pool holding exactly the tables the backup it keeps lists.
 //!
 //! The cut points are counted in calls read off one uncut run of the same
 //! workload, so a change in how many tables a backup copies moves them
 //! with it. The rules are `proofs/tla/BackupSeal.tla`'s `ListedRestores`
-//! and `RestoredComplete`.
+//! and `FaithfulRestore`.
 //!
 //! # Linux only
 //!
@@ -45,6 +49,7 @@ use tempfile::TempDir;
 
 const BACKUP: &str = "encrypted_backup_cut";
 const RESTORE: &str = "encrypted_restore_cut";
+const PURGE: &str = "encrypted_purge_cut";
 const TEARS: [TearMode; 2] = [TearMode::Truncate, TearMode::TornSector];
 
 #[test]
@@ -54,8 +59,9 @@ fn crash_child() {
 
 fn dispatch(spec: &ChildSpec) {
     match &spec.phase {
-        Phase::Custom(name) if name == BACKUP => workload(spec, false),
-        Phase::Custom(name) if name == RESTORE => workload(spec, true),
+        Phase::Custom(name) if name == BACKUP || name == RESTORE || name == PURGE => {
+            workload(spec, name)
+        }
         _ => fault::builtin_workload(spec),
     }
 }
@@ -108,7 +114,8 @@ fn apply(db: &Db, op: &WriteOp) {
     }
 }
 
-fn workload(spec: &ChildSpec, restore: bool) {
+/// The two backups, then what phase `then` does after them.
+fn workload(spec: &ChildSpec, then: &str) {
     let root = &spec.db_path;
     let db = Db::open(db_dir(root), db_options(spec)).expect("child: open");
     let history = spec.history();
@@ -119,13 +126,22 @@ fn workload(spec: &ChildSpec, restore: bool) {
     engine.create_backup(&db).expect("child: first backup");
     mark(root, "backup1");
     ops[half..].iter().for_each(|op| apply(&db, op));
+    if then == PURGE {
+        // Every table rewritten, so the purge has tables of backup 1 to
+        // remove.
+        db.compact_range(None, None).expect("child: compact");
+    }
     engine.create_backup(&db).expect("child: second backup");
     mark(root, "backup2");
-    if restore {
+    if then == RESTORE {
         engine
             .restore(BackupId(2), target_dir(root), keys())
             .expect("child: restore");
         mark(root, "restored");
+    }
+    if then == PURGE {
+        mark(root, "purging");
+        engine.purge_old_backups(1).expect("child: purge");
     }
     fault::kill_self();
 }
@@ -281,15 +297,28 @@ fn opens_under_its_key_holding(dir: &Path, expected: &[(Vec<u8>, Vec<u8>)], cont
     );
 }
 
-/// After a cut during a backup: exactly `listed` backups are listed with no
-/// key, each restores under the right key only to the writes before it, and
-/// the repository takes and restores a new backup of the reopened source.
-fn check_backups(root: &Path, history: &History, listed: &[u64], context: &str) {
+/// After a cut during a backup or a purge: exactly `listed` backups are
+/// listed with no key, each restores under the right key only to the writes
+/// before it, and the repository takes and restores a new backup of the
+/// reopened source, whose id this returns.
+fn check_backups(root: &Path, history: &History, listed: &[u64], context: &str) -> BackupId {
     let engine = BackupEngine::open(backup_dir(root)).unwrap();
-    let found: Vec<u64> = engine.list_backups().iter().map(|i| i.id.0).collect();
+    let found: Vec<u64> = engine
+        .list_backups()
+        .unwrap()
+        .into_iter()
+        .map(|entry| {
+            entry
+                .unwrap_or_else(|bad| panic!("{context}: a cut left a backup unreadable: {bad}"))
+                .id
+                .0
+        })
+        .collect();
     assert_eq!(found, listed, "{context}: the backups listed");
+    // A backup that returned stays, unless a purge was asked to delete it.
+    let purging = marker(root, "purging").exists();
     for (id, what) in [(1, "backup1"), (2, "backup2")] {
-        if marker(root, what).exists() {
+        if marker(root, what).exists() && !(purging && id == 1) {
             assert!(
                 found.contains(&id),
                 "{context}: backup {id} returned and is lost"
@@ -334,6 +363,36 @@ fn check_backups(root: &Path, history: &History, listed: &[u64], context: &str) 
     let target = checks.path().join("after");
     engine.restore(id, &target, keys()).unwrap();
     opens_under_its_key_holding(&target, &held, &format!("{context}, new backup"));
+    id
+}
+
+/// After a cut during the purge of backup 1: backup 2 alone is listed and
+/// restores, and a purge run again leaves the pool holding exactly the
+/// tables of the one backup it keeps, whatever the cut left behind.
+fn check_purge(root: &Path, history: &History, context: &str) {
+    let newest = check_backups(root, history, &[2], context);
+    let mut engine = BackupEngine::open(backup_dir(root)).unwrap();
+    engine
+        .purge_old_backups(1)
+        .unwrap_or_else(|e| panic!("{context}: the purge does not run again: {e}"));
+    let kept: Vec<_> = engine
+        .list_backups()
+        .unwrap()
+        .into_iter()
+        .map(|entry| entry.unwrap_or_else(|bad| panic!("{context}: {bad}")))
+        .collect();
+    assert_eq!(
+        kept.iter().map(|info| info.id).collect::<Vec<_>>(),
+        [newest],
+        "{context}: the backups a purge keeps"
+    );
+    let pool = std::fs::read_dir(backup_dir(root).join("shared"))
+        .unwrap()
+        .count();
+    assert_eq!(
+        pool, kept[0].file_count,
+        "{context}: the pool holds a table no backup lists"
+    );
 }
 
 /// After a cut during the restore: the target has a MANIFEST exactly when
@@ -360,6 +419,8 @@ fn check_restore(root: &Path, history: &History, finished: bool, context: &str) 
 }
 
 const SHARED: &str = "/backups/shared/";
+const SHARED_DIR: &str = "/backups/shared";
+const META_DIR: &str = "/backups/meta";
 const META_1: &str = "/backups/meta/000001";
 const META_2: &str = "/backups/meta/000002";
 const TARGET_TABLES: &str = "/restored/sst/";
@@ -488,6 +549,63 @@ fn a_cut_during_a_restore_leaves_a_target_that_finishes_and_opens_under_the_key_
             let label = format!("restore-{i}-{tear:?}");
             let (root, history) = cut(&tmp, &label, RESTORE, trigger.clone(), tear);
             check_restore(&root, &history, false, &format!("{name}, {tear:?}"));
+        }
+    }
+}
+
+#[test]
+fn a_cut_during_a_purge_keeps_every_listed_backup_whole_and_the_next_purge_collects() {
+    let tmp = TempDir::new().unwrap();
+    // First, for the reason the backup test gives.
+    let (root, history) = cut(
+        &tmp,
+        "returned",
+        PURGE,
+        Trigger::Workload,
+        TearMode::TornSector,
+    );
+    check_purge(&root, &history, "after the purge returned");
+
+    let journal = probe(PURGE);
+    let unlinked = |needle: &str| {
+        journal
+            .records
+            .iter()
+            .find(|r| {
+                r.kind == OpKind::Unlink
+                    && r.succeeded()
+                    && r.path.to_string_lossy().contains(needle)
+            })
+            .unwrap_or_else(|| panic!("the uncut purge removed nothing under {needle}"))
+            .seq
+    };
+    // The sync of `meta/` after backup 1's metadata is removed, and the
+    // sync of `shared/` after its tables are: each the first sync of its
+    // directory after that removal.
+    let meta_sync = calls_before(&journal, OpKind::Sync, META_DIR, unlinked(META_1)) + 1;
+    let shared_sync = calls_before(&journal, OpKind::Sync, SHARED_DIR, unlinked(SHARED)) + 1;
+    // The power-loss model keeps every unlink (common/fault/power.rs), so
+    // backup 1 is gone after each cut; a disk that brought its metadata
+    // back would bring back the state before the purge, every table kept.
+    let cuts = [
+        (
+            "backup 1 metadata removed, meta/ before its sync",
+            at_call(DieKind::Fsync, META_DIR, meta_sync, true),
+        ),
+        (
+            "backup 1 tables removed, shared/ before its sync",
+            at_call(DieKind::Fsync, SHARED_DIR, shared_sync, true),
+        ),
+        (
+            "backup 1 tables removed, shared/ synced",
+            at_call(DieKind::Fsync, SHARED_DIR, shared_sync, false),
+        ),
+    ];
+    for (i, (name, trigger)) in cuts.into_iter().enumerate() {
+        for tear in TEARS {
+            let label = format!("purge-{i}-{tear:?}");
+            let (root, history) = cut(&tmp, &label, PURGE, trigger.clone(), tear);
+            check_purge(&root, &history, &format!("{name}, {tear:?}"));
         }
     }
 }
