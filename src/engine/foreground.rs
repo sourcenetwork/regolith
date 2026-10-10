@@ -222,7 +222,8 @@ impl RegolithEngine {
     /// the waiters' unit anyway, so each writer looks again and relieves it
     /// or reports why it cannot, instead of waiting for a relief nobody is
     /// running. A step contended by another writer's relief leaves the stop
-    /// to that writer.
+    /// to that writer. `proofs/tla/StallRelief.tla` checks that no stopped
+    /// writer is left waiting once the job is done.
     fn relieve_after_foreground(&self) {
         if self.has_worker || !self.inline_compaction {
             return;
