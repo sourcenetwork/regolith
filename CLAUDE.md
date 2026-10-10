@@ -98,9 +98,11 @@ src/
 │   ├── waiter.rs       # Waiter nodes, their free list, the wake list
 │   └── internal.rs     # The engine's private std/loom atomics, Mutex, RwLock, Condvar and Gate
 ├── txn_buffer.rs       # Concurrent write and read-set buffer of one transaction
-├── env/                # Env trait and backends: StdEnv, MemEnv, WASI, OPFS; db_lock.rs
+├── env/                # Env trait and backends: StdEnv (positional reads), MemEnv, WASI, OPFS; db_lock.rs
 │   ├── mem_file.rs     # Lock-free in-memory file behind MemEnv and the OPFS mirror
-│   └── open_file_limit/ # max_open_files: lock-free slot table (slots.rs), rename-aside removal
+│   ├── open_file_limit/ # max_open_files: lock-free slot table (slots.rs), rename-aside removal
+│   ├── opfs/           # Browser OPFS backend: lock-free pool and mirror over sync access handles
+│   └── persist_order.rs # The order OPFS mirror mode writes files back: tables, manifest, deletions (E20)
 └── engine/
     ├── mod.rs          # RegolithEngine orchestration, read paths, rotation, recovery
     ├── commit/         # Group commit pipeline: ring, bounded leader, transaction members decided in
@@ -132,6 +134,7 @@ src/
     ├── recovery.rs     # Replaying the WALs at open, the dropped-tail report, the rewrite
     ├── arena.rs        # Bump allocator for one memtable
     ├── block.rs        # Data blocks: prefix compression, restart points, varint
+    ├── block/          # stamp.rs: an ingested table's blocks read at its one sequence (D48)
     ├── block_cache.rs  # Sharded lock-free CLOCK cache for decompressed SSTable blocks: pins, byte bound
     ├── block_cache/    # ring.rs: the lock-free CLOCK ring of slot words; tests.rs
     ├── callback.rs     # Catching a panic in caller code inside a commit or a background step
@@ -156,7 +159,8 @@ src/
     ├── background_health.rs # Whether flush or compaction is failing, and why
     ├── compaction_backoff.rs # Retry pacing for a failing compaction worker
     ├── disk_check.rs   # Open-time warning when the filesystem is nearly full
-    ├── orphan_sweep.rs # Removal of SSTables the manifest does not reference
+    ├── orphan_sweep.rs # Removal at a writable open of SSTables the manifest does not reference and
+    │                   # of tables renamed aside on removal that a crash left
     └── pending_outputs.rs # Compaction outputs not yet offered to the manifest
 ```
 
