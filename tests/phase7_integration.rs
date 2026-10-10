@@ -37,7 +37,7 @@ use std::time::{Duration, Instant};
 use common::keys::Keys;
 use regolith::{
     BackupEngine, Checkpoint, Db, DbSlice, Error, IngestOptions, IoBudget, IoQueue, Options,
-    ReadMode, SstFileWriter, Statistics, Ticker,
+    ReadMode, SstFileWriter, Statistics, Ticker, through_stalls,
 };
 use tempfile::TempDir;
 
@@ -125,7 +125,7 @@ fn publishers_racing_readers(options: Options, ingest_dir: &Path) {
                         for k in 0..KEYS {
                             let mut value = v.to_be_bytes().to_vec();
                             value.resize(512, b'f');
-                            db.put(&key(w, k), &value).unwrap();
+                            through_stalls(|| db.put(&key(w, k), &value)).unwrap();
                         }
                     }
                 })
@@ -169,14 +169,19 @@ fn publishers_racing_readers(options: Options, ingest_dir: &Path) {
                 })
             })
             .collect();
-        for writer in writers {
-            writer.join().unwrap();
-        }
-        ingest.join().unwrap();
+        // Every writer's and the ingest's outcome first, then the readers
+        // are stopped, so a writer that fails is reported rather than
+        // leaving the readers spinning.
+        let wrote: Vec<_> = writers.into_iter().map(|w| w.join()).collect();
+        let ingested = ingest.join();
         done.store(true, Ordering::Release);
         for reader in readers {
             reader.join().unwrap();
         }
+        for outcome in wrote {
+            outcome.unwrap();
+        }
+        ingested.unwrap();
     });
     assert!(reads.load(Ordering::Relaxed) > 0);
     db.compact_range(None, None).wait().unwrap();
@@ -213,7 +218,8 @@ fn every_view_publisher_racing_readers_loses_no_write_with_a_worker() {
 }
 
 /// With no worker, every flush and compaction is a step a writer runs after
-/// its commit, or inside a stall: those publish the read view too.
+/// its commit, or the compaction a stopped writer runs to relieve the stall
+/// (inline compaction): those publish the read view too.
 #[test]
 fn every_view_publisher_racing_readers_loses_no_write_without_a_worker() {
     let ingest_dir = TempDir::new().unwrap();
@@ -221,6 +227,7 @@ fn every_view_publisher_racing_readers_loses_no_write_without_a_worker() {
         Options::default()
             .write_buffer_size(4 * 1024)
             .max_background_compactions(0)
+            .inline_compaction(true)
             .level0_slowdown_writes_trigger(2)
             .l0_compaction_trigger(3),
         ingest_dir.path(),
@@ -252,7 +259,7 @@ fn snapshots_moved_across_threads_keep_their_versions_through_compaction() {
                 for k in 0..20u64 {
                     let mut value = v.to_be_bytes().to_vec();
                     value.resize(256, b'f');
-                    db.put(&numbered(k), &value).unwrap();
+                    through_stalls(|| db.put(&numbered(k), &value)).unwrap();
                 }
                 send.send((v, db.snapshot())).unwrap();
                 if v % 5 == 4 {
@@ -326,7 +333,7 @@ fn a_cache_full_of_held_sealed_blocks_refuses_counts_and_queued_reads_still_land
     {
         let db = Db::open(dir.path(), small_sealed_cache(&stats)).unwrap();
         for i in 0..4_000u64 {
-            db.put(&numbered(i), &[b'v'; 200]).unwrap();
+            through_stalls(|| db.put(&numbered(i), &[b'v'; 200])).unwrap();
         }
         db.flush().unwrap();
         db.compact_range(None, None).wait().unwrap();
@@ -392,7 +399,7 @@ fn close_completes_queued_reads_of_sealed_blocks_the_cache_cannot_keep() {
     {
         let db = Db::open(dir.path(), small_sealed_cache(&stats)).unwrap();
         for i in 0..4_000u64 {
-            db.put(&numbered(i), &[b'v'; 200]).unwrap();
+            through_stalls(|| db.put(&numbered(i), &[b'v'; 200])).unwrap();
         }
         db.flush().unwrap();
         db.compact_range(None, None).wait().unwrap();
