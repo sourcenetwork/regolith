@@ -27,7 +27,15 @@
 \*     because the engine holds no key and skipped what it could not read;
 \*   - a power cut leaves metadata that lists a table the pool never got,
 \*     or a MANIFEST naming a table the target never got;
-\*   - a restore runs over a target that is already a database.
+\*   - a restore runs over a target that is already a database;
+\*   - backup 2's metadata stops reading (a flipped bit, a file a newer
+\*     build wrote, a disk that fails the read) and the listing quietly
+\*     leaves it out, so whoever reads the list believes it has every
+\*     backup when it does not; or the listing needs a key, and leaves out
+\*     every sealed backup;
+\*   - a delete counts only the listings it can read, and removes the
+\*     tables unreadable backup 2 lists, which a newer build, or the disk
+\*     once it reads again, would need.
 \*
 \* WHAT THE CODE DOES (each line below is one of these, by name).
 \*   create_backup resolves the sealer for the current key first, copies
@@ -45,9 +53,16 @@
 \*     the file is the one this id wrote), and it has its current key and
 \*     every key a table names. Then it copies every listed table into the
 \*     target, and writes the MANIFEST last, sealed under the current key.
-\*   delete_backup removes the metadata, then removes every pool file that
-\*     backup listed and no other backup's listing names. It reads every
-\*     other listing, sealed or not, and stops if one cannot be read.
+\*   list_backups names every metadata file in meta/ by its backup id, with
+\*     its summary when its metadata reads and the reason when it does not.
+\*     It reads only the clear listing, so it needs no key.
+\*   delete_backup removes one backup's metadata, purge_old_backups the
+\*     metadata of every backup but the newest `keep` by id, readable or
+\*     not. Both make that durable, then remove every pool file no
+\*     remaining backup's listing names: those the deleted backups held, and
+\*     those a backup cut short copied and never listed. They read every
+\*     remaining listing, sealed or not, and remove no pool file if one
+\*     cannot be read.
 \*
 \* WHAT IS CHECKED.
 \*   SealedMetadata        no backup's metadata, and no restored MANIFEST, is
@@ -58,7 +73,10 @@
 \*                         backup recorded when it was taken.
 \*   RefusalWritesNothing  a refused restore wrote nothing.
 \*   ListedRestores        every table an untampered backup lists is in the
-\*                         pool, after any delete and any power cut.
+\*                         pool, after any delete and any power cut, even
+\*                         while its metadata does not read.
+\*   ListingNamesEvery     the listing names every backup the repository
+\*                         holds: readable or not, sealed or not.
 \*
 \* THE DEFECTS, one per Mutant value, and the promise each breaks.
 \*   "PlainMeta"         the metadata is written plain.     SealedMetadata
@@ -71,7 +89,12 @@
 \*   "OverDatabase"      a restore over a finished target.   FaithfulRestore
 \*   "CheckAfterCopy"    key checks after the copies.   RefusalWritesNothing
 \*   "GcSkipsSealed"     a delete counts only plain listings.  ListedRestores
+\*   "GcSkipsUnreadable" a delete counts only listings that read.
+\*                                                          ListedRestores
 \*   "MetaFirst"         metadata before the tables.          ListedRestores
+\*   "ListSkipsUnreadable" the listing leaves out a file that does not read,
+\*                       as list_backups did before.      ListingNamesEvery
+\*   "ListNeedsKey"      the listing leaves out a sealed file. ListingNamesEvery
 \*
 \* WHAT THE MODEL LEAVES OUT, and why that loses nothing.
 \*   - Bytes. A table is its content id <<t, k>>: table slot t sealed under
@@ -84,13 +107,18 @@
 \*     here. A power cut is the Crash step, which drops what was in flight.
 \*   - Unencrypted databases: their backups stay plain, as they always were,
 \*     and none of these rules is about them.
+\*   - Why a file does not read. A flipped bit (the checksum fails), a
+\*     version a newer build wrote, and a disk that fails the read all look
+\*     the same to the engine: the metadata does not decode. One flag,
+\*     `reads`, stands for all three.
 \*
 \* CONFIGURATIONS.
 \*   MC_BackupSeal_Green                   every invariant holds
 \*   MC_BackupSeal_Red_<defect>            the promise named above fails
 
-\* Naturals for counting backups and restores.
-EXTENDS Naturals
+\* Naturals for counting backups and restores; FiniteSets for counting how
+\* many backups are newer than one, which a purge needs.
+EXTENDS Naturals, FiniteSets
 
 CONSTANTS
   \* How many backups the model may take in one behaviour: bounds it.
@@ -107,7 +135,8 @@ ASSUME MaxRestores \in Nat \ {0}
 \* Only the engine and the defects above.
 ASSUME Mutant \in {"none", "PlainMeta", "PlainRestore", "OpenUnderCurrent",
                    "ListingUnbound", "IdUnbound", "ManifestFirst", "OverDatabase",
-                   "CheckAfterCopy", "GcSkipsSealed", "MetaFirst"}
+                   "CheckAfterCopy", "GcSkipsSealed", "GcSkipsUnreadable", "MetaFirst",
+                   "ListSkipsUnreadable", "ListNeedsKey"}
 
 \* The two key ids the database rotates between (KeyId).
 Keys == {1, 2}
@@ -156,9 +185,10 @@ Held(f) == {f[t] : t \in Tables} \ {NoObj}
 \* The largest number in a non-empty set.
 Max(S) == CHOOSE x \in S : \A y \in S : y <= x
 
-\* A metadata file that does not exist (`on` says whether one does).
+\* A metadata file that does not exist (`on` says whether one does). There
+\* is nothing to read, so `reads` is TRUE only to give the field a value.
 Absent == [on |-> FALSE, key |-> Plain, listing |-> Empty, sealed |-> Empty,
-           body |-> Empty, bound |-> 1]
+           body |-> Empty, bound |-> 1, reads |-> TRUE]
 
 \* A target with no MANIFEST (`on` says whether it has one).
 NoManifest == [on |-> FALSE, body |-> Empty, sealed |-> FALSE, want |-> Empty]
@@ -185,7 +215,10 @@ VARIABLES
   \*   sealed   the listing the tag was computed over when it was written;
   \*   body     the sealed part: which table each slot gets (file id, key
   \*            range, the key the table names);
-  \*   bound    the backup id the tag binds (the file's name when written).
+  \*   bound    the backup id the tag binds (the file's name when written);
+\*   reads    whether the engine can read it at all: FALSE once a bit
+\*            flipped, a newer build rewrote it, or the disk fails the read
+\*            (format::decode_listing returns an error).
   meta,
   \* What backup b held when it was taken, by id: a ghost the checks read,
   \* nothing in the program stores it.
@@ -210,7 +243,9 @@ VARIABLES
   made,
   \* How many restores were started: bounds the model.
   restores,
-  \* How many times the attacker acted: at most once.
+  \* How many times a file changed behind the engine's back (the attacker
+  \* edited a listing or swapped two files, or a file stopped reading): at
+  \* most once, which keeps the model small and is all any rule needs.
   adv
 
 \* Every variable, so a step that changes none of them is a stutter.
@@ -328,10 +363,11 @@ WriteMeta ==
   \* The file: sealed under the backup's key (plain under PlainMeta), the
   \* listing in the clear and the same listing under the tag, the body, and
   \* the id the tag binds.
+  \* A file the engine just wrote reads.
   /\ meta' = [meta EXCEPT ![bk.id] =
                 [on |-> TRUE, key |-> IF Mutant = "PlainMeta" THEN Plain ELSE bk.key,
                  listing |-> bk.objs, sealed |-> bk.objs, body |-> bk.objs,
-                 bound |-> bk.id]]
+                 bound |-> bk.id, reads |-> TRUE]]
   \* What this id now holds, for the checks.
   /\ recorded' = [recorded EXCEPT ![bk.id] = bk.objs]
   \* The backup is done.
@@ -340,39 +376,59 @@ WriteMeta ==
   /\ UNCHANGED <<live, current, shared, tgt, tman, rs, made, restores, adv>>
 
 ----------------------------------------------------------------------------
-\* Deleting a backup (BackupEngine::delete_backup, gc_shared).
+\* Deleting backups (BackupEngine::delete_backup, purge_old_backups,
+\* remove_backups, collect_shared).
 
-\* Backup b's metadata goes, then every pool file it listed that no other
-\* backup's listing names.
-Delete(b) ==
-  \* It exists.
-  /\ meta[b].on
-  \* Nothing in flight on this engine (delete takes &mut self).
+\* The ids whose metadata file is in meta/ right now.
+Present == {b \in Ids : meta[b].on}
+
+\* The metadata of every backup in `gone` goes, then the pool keeps only
+\* what a remaining backup's listing names. delete_backup and
+\* purge_old_backups both end here. Picture backups 1 and 2, where 2 cannot
+\* be read: deleting 1 removes its file, then finds 2 unreadable and
+\* removes no pool file, since it cannot know which ones 2 needs.
+Remove(gone) ==
+  \* No backup in flight on this engine (both calls take &mut self).
   /\ bk.phase = "idle"
   \* And no restore running.
   /\ rs.phase = "idle"
-  \* The other backups whose listing the collection counts: every one, as
-  \* each listing reads with no key. GcSkipsSealed counts only plain ones.
-  /\ LET others == {c \in Ids \ {b} : meta[c].on}
-         counted == IF Mutant = "GcSkipsSealed"
-                    THEN {c \in others : meta[c].key = Plain}
-                    ELSE others
+  \* The backups left once `gone` is removed...
+  /\ LET left == Present \ gone
+         \* ...and the ones whose listing the collection reads: every one, as
+         \* each listing reads with no key. GcSkipsSealed reads only plain
+         \* ones; GcSkipsUnreadable passes over the ones that do not read.
+         counted == CASE Mutant = "GcSkipsSealed" -> {c \in left : meta[c].key = Plain}
+                      [] Mutant = "GcSkipsUnreadable" -> {c \in left : meta[c].reads}
+                      [] OTHER -> left
          \* Every pool file a counted listing names.
          refs == UNION {Held(meta[c].listing) : c \in counted}
-     \* Remove what b listed and nothing counted names.
-     IN shared' = shared \ {o \in Held(meta[b].listing) : o \notin refs}
-  \* The file is gone.
-  /\ meta' = [meta EXCEPT ![b] = Absent]
+     \* One counted backup that does not read stops the collection: the pool
+     \* stays as it was. Otherwise every pool file nobody names goes.
+     IN shared' = IF \E c \in counted : ~meta[c].reads THEN shared ELSE shared \cap refs
+  \* Every file in `gone` is removed (one that is not there stays absent).
+  /\ meta' = [b \in Ids |-> IF b \in gone THEN Absent ELSE meta[b]]
   \* Nothing else moves.
   /\ UNCHANGED <<live, current, recorded, bk, tgt, tman, rs, made, restores, adv>>
+
+\* delete_backup(b): backup b goes, whether or not its file reads, and even
+\* when there is no such backup, in which case only the collection runs.
+Delete(b) == Remove({b})
+
+\* purge_old_backups(keep): every backup with at least `keep` newer backups
+\* goes, readable or not. With backups 1 and 2, keep = 1 removes 1, keep = 0
+\* removes both, and keep = 2 removes none.
+Purge(keep) == Remove({b \in Present : Cardinality({c \in Present : c > b}) >= keep})
 
 ----------------------------------------------------------------------------
 \* Restoring a backup (BackupEngine::restore).
 
 \* Whether provider p has everything restoring backup b from file m needs:
 \* the key the file names, the right bytes, its current key, every key a
-\* table names, and a file that is the one id b wrote, unchanged.
+\* table names, and a file that is the one id b wrote, unchanged and
+\* readable.
 Entitled(m, b, p) ==
+  \* The file reads: no key opens metadata that does not decode.
+  /\ m.reads
   \* A provider, with the right bytes.
   /\ p.given
   /\ p.right
@@ -388,22 +444,25 @@ Entitled(m, b, p) ==
 
 \* Whether the engine opens file m as backup b under p (format::decode).
 MetaOpens(m, b, p) ==
+  \* A file that does not read opens under nothing: the checksum or the
+  \* version check refuses it before any key is looked at.
+  /\ m.reads
   \* Plain metadata needs no key.
-  IF m.key = Plain THEN TRUE
-  ELSE
-    \* A sealed file needs a provider (Error::KeyProviderRequired)...
-    /\ p.given
-    \* ...with the key the file names (Error::UnknownKey). OpenUnderCurrent
-    \* opens it under the provider's current key instead.
-    /\ IF Mutant = "OpenUnderCurrent"
-       THEN p.cur = m.key /\ p.cur \in p.has
-       ELSE m.key \in p.has
-    \* The tag holds only under the right bytes...
-    /\ p.right
-    \* ...over the listing as it was sealed (ListingUnbound skips this)...
-    /\ Mutant = "ListingUnbound" \/ m.listing = m.sealed
-    \* ...and the id it was sealed as (IdUnbound skips this).
-    /\ Mutant = "IdUnbound" \/ m.bound = b
+  /\ IF m.key = Plain THEN TRUE
+     ELSE
+       \* A sealed file needs a provider (Error::KeyProviderRequired)...
+       /\ p.given
+       \* ...with the key the file names (Error::UnknownKey). OpenUnderCurrent
+       \* opens it under the provider's current key instead.
+       /\ IF Mutant = "OpenUnderCurrent"
+          THEN p.cur = m.key /\ p.cur \in p.has
+          ELSE m.key \in p.has
+       \* The tag holds only under the right bytes...
+       /\ p.right
+       \* ...over the listing as it was sealed (ListingUnbound skips this)...
+       /\ Mutant = "ListingUnbound" \/ m.listing = m.sealed
+       \* ...and the id it was sealed as (IdUnbound skips this).
+       /\ Mutant = "IdUnbound" \/ m.bound = b
 
 \* Whether p has its current key and every key a table names, the checks
 \* restore makes before its first write.
@@ -510,14 +569,15 @@ ResetTarget ==
   /\ UNCHANGED <<live, current, shared, meta, recorded, bk, rs, made, restores, adv>>
 
 ----------------------------------------------------------------------------
-\* Power cuts and the attacker.
+\* Power cuts, the attacker, and files that stop reading.
 
 \* The power goes. Every file is whole or absent (staging name, sync,
 \* rename), so the disk keeps what it has; whatever was in flight stops.
 Crash ==
   \* Something was in flight.
   /\ bk.phase # "idle" \/ rs.phase # "idle"
-  \* The backup stops: its pool files stay, unlisted until a later backup.
+  \* The backup stops: its pool files stay, unlisted until a later backup
+  \* lists them or a delete removes them.
   /\ bk' = IdleBk
   \* The restore stops: its copies stay, with no MANIFEST after them.
   /\ rs' = IdleRs
@@ -555,6 +615,25 @@ Swap ==
   \* Nothing else moves.
   /\ UNCHANGED <<live, current, shared, recorded, bk, tgt, tman, rs, made, restores>>
 
+\* Backup b's metadata file stops reading: a bit flips on the disk, a newer
+\* build rewrites it in a format this one does not read, or the disk fails
+\* every read of it. The file is still there, under its name.
+Damage(b) ==
+  \* Once, in place of the attacker's one act.
+  /\ adv = 0
+  \* The file exists...
+  /\ meta[b].on
+  \* ...and reads until now.
+  /\ meta[b].reads
+  \* From now on the engine cannot decode it. What it said stays in the
+  \* record, because the tables it named still matter: a newer build, or
+  \* the disk once it reads again, would restore them.
+  /\ meta' = [meta EXCEPT ![b].reads = FALSE]
+  \* It happened.
+  /\ adv' = 1
+  \* Nothing else moves.
+  /\ UNCHANGED <<live, current, shared, recorded, bk, tgt, tman, rs, made, restores>>
+
 \* Every step anything can take.
 Next ==
   \* A flush or a compaction writes a table; a copy lands in the pool or in
@@ -568,6 +647,8 @@ Next ==
   \/ WriteMeta
   \* A backup is deleted, with the pool files nothing else lists.
   \/ \E b \in Ids : Delete(b)
+  \* All but the newest `keep` backups are deleted, the same way.
+  \/ \E keep \in 0..MaxBackups : Purge(keep)
   \* A restore of any backup starts, under any provider.
   \/ \E b \in Ids, p \in Providers : StartRestore(b, p)
   \* The restore runs its checks.
@@ -582,8 +663,10 @@ Next ==
   \/ Crash
   \* The attacker edits a listing...
   \/ \E b \in Ids, t \in Tables, o \in Slot : TamperListing(b, t, o)
-  \* ...or swaps two files' names.
+  \* ...or swaps two files' names...
   \/ Swap
+  \* ...or a metadata file stops reading.
+  \/ \E b \in Ids : Damage(b)
 
 \* Start at Init, then take steps or stutter.
 Spec == Init /\ [][Next]_vars
@@ -593,7 +676,8 @@ Spec == Init /\ [][Next]_vars
 
 \* A metadata file as the engine writes it.
 MetaType == [on : BOOLEAN, key : Keys \cup {Plain}, listing : [Tables -> Slot],
-             sealed : [Tables -> Slot], body : [Tables -> Slot], bound : Ids]
+             sealed : [Tables -> Slot], body : [Tables -> Slot], bound : Ids,
+             reads : BOOLEAN]
 
 \* Every variable holds what its comment says.
 TypeOK ==
@@ -660,14 +744,44 @@ FaithfulRestore ==
 RefusalWritesNothing == rs.phase = "refused" => ~rs.wrote
 
 \* Every table a backup lists is in the pool, unless the attacker edited
-\* that listing. It rules out the GcSkipsSealed story (deleting backup 1
-\* removes a table sealed backup 2 still lists) and the MetaFirst story (a
-\* power cut after the metadata and before its tables).
+\* that listing, and even while the file does not read: the read may come
+\* back, or a newer build read it. It rules out the GcSkipsSealed story
+\* (deleting backup 1 removes a table sealed backup 2 still lists), the
+\* GcSkipsUnreadable story (deleting backup 1 removes a table unreadable
+\* backup 2 still lists) and the MetaFirst story (a power cut after the
+\* metadata and before its tables).
 ListedRestores ==
   \A b \in Ids :
     \* For a file whose listing is the one it was sealed with...
     (meta[b].on /\ meta[b].listing = meta[b].sealed) =>
       \* ...every table it lists is in the pool.
       \A t \in Tables : meta[b].listing[t] # NoObj => meta[b].listing[t] \in shared
+
+\* What list_backups returns at this moment: the id of every backup it
+\* names, each with its summary or the reason it cannot be read (the model
+\* keeps only the ids, which is what the rule below is about). It reads the
+\* directory and each file's clear listing, so it changes nothing and needs
+\* no key: it is a function of the files, checked in every state.
+\* ListSkipsUnreadable leaves out a file that does not read, as the code did
+\* before; ListNeedsKey leaves out a sealed file, as a listing that opened
+\* the seal would with no key at hand.
+Listing ==
+  \* Of the ids whose file is in meta/, the ones the listing names:
+  {b \in Present :
+     \* all of them for the engine; the first defect drops each file that
+     \* does not read...
+     /\ Mutant = "ListSkipsUnreadable" => meta[b].reads
+     \* ...and the second drops each sealed one.
+     /\ Mutant = "ListNeedsKey" => meta[b].key = Plain}
+
+\* The listing names every backup the repository holds, readable or not,
+\* sealed or not, and nothing else. It rules out the ListSkipsUnreadable
+\* story (backup 2's metadata flips a bit, the list shows only backup 1,
+\* and the caller believes backup 1 is all there is) and the ListNeedsKey
+\* story (an engine with no key lists no backup of an encrypted database).
+\* A caller deciding what to keep, delete or restore needs the whole list.
+ListingNamesEvery ==
+  \* The ids the listing names are exactly the ids with a file in meta/.
+  Listing = Present
 
 ====

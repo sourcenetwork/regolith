@@ -18,6 +18,13 @@ without a provider, without key 1, with other bytes under key 1, or after
 someone edited the listing or renamed the file, must refuse, and must not
 have copied a single table first.
 
+Picture too backups 1, 2 and 3, where a bit flips in backup 3's metadata.
+The listing must still name backup 3, saying it cannot be read, or whoever
+reads the list believes there are two backups; a purge keeping one must
+count backup 3 as the newest; and no delete may remove a table backup 3
+lists, because a newer build, or the disk once it reads again, would need
+it.
+
 This file backs `proofs/tla/BackupSeal.tla` (configurations
 `MC_BackupSeal_*`). What is proved, for backups of every size:
 
@@ -37,9 +44,17 @@ This file backs `proofs/tla/BackupSeal.tla` (configurations
    `backup_metadata_follows_its_tables`: whatever prefix of the writes a
    power cut keeps, if it kept the last write it kept every one before it
    (`FaithfulRestore`, `ListedRestores` under power cuts).
-6. `collect_keeps_listed`: a delete never removes a pool file another
-   backup lists (`ListedRestores`).
-7. The RED cases as counterexamples, one per defect of the model.
+6. `collect_keeps_listed`, `collect_stops_on_unreadable` and
+   `collect_removes_every_unlisted`: a delete or a purge never removes a
+   pool file a remaining backup lists, removes none while one cannot be
+   read, and otherwise leaves no pool file nobody lists (`ListedRestores`).
+7. `listing_names_every_backup`, `unreadable_is_listed` and
+   `readable_is_listed_sealed_or_not`: the listing names every metadata
+   file, in order, each once, saying which ones cannot be read, and needs
+   no key (`ListingNamesEvery`).
+8. `purge_keeps_the_newest`: a purge keeps the newest `keep` backups,
+   readable or not, and deletes exactly the rest.
+9. The RED cases as counterexamples, one per defect of the model.
 -/
 
 -- Everything below lives in its own namespace.
@@ -347,27 +362,174 @@ theorem backup_metadata_follows_its_tables (objs : List Nat) :
   -- No pool copy is the metadata.
   simp
 
-/-! ## Deleting a backup -/
+/-! ## Deleting backups -/
 
-/-- The pool files a delete removes (`gc_shared`): those the deleted backup
-listed that no remaining backup's listing names. Every listing counts,
-sealed or not: each is readable without a key. -/
-def collect (removed : List Nat) (remaining : List (List Nat)) : List Nat :=
-  -- Keep each removed file that no remaining listing contains.
-  removed.filter fun o => !(remaining.any fun l => l.contains o)
+/-- The pool files a delete or a purge removes (`collect_shared`), once the
+deleted backups' metadata is gone. `pool` is every file in `shared/`;
+`remaining` holds each remaining backup's listing, `none` for one whose
+metadata does not read. Every listing counts, sealed or not: each reads
+with no key. Nothing from a deleted backup is needed, so a backup whose
+metadata does not read can be deleted too. -/
+def collect (pool : List Nat) (remaining : List (Option (List Nat))) : List Nat :=
+  -- Only when every remaining backup reads...
+  if remaining.all Option.isSome then
+    -- ...is each pool file no remaining listing names removed.
+    pool.filter fun o => !(remaining.any fun l => (l.getD []).contains o)
+  -- One that does not read stops it: nothing is removed.
+  else []
 
-/-- **A delete never removes a file another backup lists.** -/
-theorem collect_keeps_listed (removed : List Nat) (remaining : List (List Nat)) (o : Nat)
+/-- **A delete never removes a file a remaining backup lists.** It rules
+out a table vanishing from under a backup that still names it. -/
+theorem collect_keeps_listed (pool : List Nat) (remaining : List (Option (List Nat)))
+    -- A pool file.
+    (o : Nat)
     -- The delete removes `o`.
-    (h : o ∈ collect removed remaining) :
+    (h : o ∈ collect pool remaining) :
     -- Then no remaining listing names `o`.
-    ∀ l ∈ remaining, o ∉ l := by
+    ∀ l, some l ∈ remaining → o ∉ l := by
   -- Take a remaining listing, and suppose it names `o`.
   intro l hl ho
-  -- Being collected means being in `removed` and in no remaining listing.
-  simp only [collect, List.mem_filter, Bool.not_eq_true', List.any_eq_false] at h
-  -- That listing names `o`, which contradicts it.
-  exact h.2 l hl (by simp [ho])
+  -- Open up the collection, then look at both of its branches.
+  unfold collect at h
+  -- Split on whether every remaining backup reads.
+  split at h
+  -- They all read: `o` was kept by the filter, so no listing contains it.
+  · simp only [List.mem_filter, Bool.not_eq_eq_eq_not, Bool.not_true,
+      List.any_eq_false] at h
+    -- That listing contains `o`, which contradicts it.
+    exact h.2 (some l) hl (by simp [ho])
+  -- One does not read: nothing is removed, so `o` cannot have been.
+  · simp at h
+
+/-- **A backup that does not read stops the collection**: no pool file is
+removed, because nothing can tell which ones it needs. -/
+theorem collect_stops_on_unreadable (pool : List Nat) (remaining : List (Option (List Nat)))
+    -- A remaining backup's metadata does not read.
+    (h : none ∈ remaining) :
+    collect pool remaining = [] := by
+  -- Not every remaining backup reads: that one is the witness.
+  have hall : remaining.all Option.isSome = false := by
+    -- `all` is false when some member fails; `none` is that member.
+    simp only [List.all_eq_false]
+    -- Name it, and show it fails.
+    exact ⟨none, h, by simp⟩
+  -- So the collection takes its second branch, which removes nothing.
+  simp [collect, hall]
+
+/-- **Nothing unlisted is left behind.** When every remaining backup reads,
+a pool file no remaining listing names is removed, whichever backup held
+it, or none: a deleted one, or one a crash cut short. -/
+theorem collect_removes_every_unlisted (pool : List Nat)
+    -- The remaining backups' listings, and a pool file.
+    (remaining : List (Option (List Nat))) (o : Nat)
+    -- Every remaining backup reads...
+    (hall : ∀ r ∈ remaining, r.isSome = true)
+    -- ...`o` is in the pool...
+    (ho : o ∈ pool)
+    -- ...and no remaining listing names it.
+    (hun : ∀ l, some l ∈ remaining → o ∉ l) :
+    o ∈ collect pool remaining := by
+  -- Every remaining backup reads, so the collection takes its first branch.
+  have hread : remaining.all Option.isSome = true := by
+    -- `all` holds because each member does.
+    simpa [List.all_eq_true] using hall
+  -- Open the collection on that branch: `o` must pass the filter.
+  simp only [collect, hread, ↓reduceIte, List.mem_filter]
+  -- It is in the pool; it remains to show no remaining listing contains it.
+  refine ⟨ho, ?_⟩
+  -- Turn "not any contains it" into "each one does not".
+  simp only [Bool.not_eq_eq_eq_not, Bool.not_true, List.any_eq_false]
+  -- Take a remaining entry, and suppose it contains `o`.
+  intro r hr hc
+  -- It reads, so it is `some l` for a listing `l`.
+  obtain ⟨l, rfl⟩ := Option.isSome_iff_exists.mp (hall r hr)
+  -- Then `l` names `o`, which no remaining listing does.
+  exact hun l hr (by simpa using hc)
+
+/-! ## Listing the backups -/
+
+/-- One metadata file in `meta/`, as `list_backups` finds it. -/
+structure File where
+  /-- The backup id its name carries (`parse_backup_id`). -/
+  id : Nat
+  /-- Its clear listing when the file decodes; `none` when it does not: a
+  flipped bit, a version a newer build wrote, or a failed read. -/
+  listing : Option (List Nat)
+  /-- Whether the rest of it is sealed under a key. -/
+  sealed : Bool
+
+/-- What `list_backups` returns for one file: the backup's id, and `true`
+for `Ok` (its summary) or `false` for `Err` (its reason). -/
+def entry (f : File) : Nat × Bool :=
+  -- The id, and whether its listing decoded.
+  (f.id, f.listing.isSome)
+
+/-- The engine's listing (`BackupEngine::list_backups`): one entry per
+file, in the order the files come, which is by id. It takes no key. -/
+def listBackups (dir : List File) : List (Nat × Bool) :=
+  -- Every file, none skipped.
+  dir.map entry
+
+/-- **The listing names every backup, in order, each once.** It rules out
+a list that looks whole and is not: its ids are exactly the files' ids. -/
+theorem listing_names_every_backup (dir : List File) :
+    (listBackups dir).map Prod.fst = dir.map File.id := by
+  -- Mapping twice is mapping the composition, and the id of an entry is
+  -- the file's id.
+  simp [listBackups, entry]
+
+/-- **A backup that cannot be read is listed, as unreadable.** -/
+theorem unreadable_is_listed (dir : List File) (f : File)
+    -- The file is in `meta/`...
+    (hf : f ∈ dir)
+    -- ...and its metadata does not decode.
+    (h : f.listing = none) :
+    (f.id, false) ∈ listBackups dir := by
+  -- Being in the listing means being some file's entry.
+  simp only [listBackups, List.mem_map]
+  -- This file's entry is the one: its id, and `false`.
+  exact ⟨f, hf, by simp [entry, h]⟩
+
+/-- **A backup that reads is listed as readable, sealed or not**: the
+listing needs no key. -/
+theorem readable_is_listed_sealed_or_not (dir : List File) (f : File) (l : List Nat)
+    -- The file is in `meta/`...
+    (hf : f ∈ dir)
+    -- ...and its listing decodes, whatever `f.sealed` is.
+    (h : f.listing = some l) :
+    (f.id, true) ∈ listBackups dir := by
+  -- Being in the listing means being some file's entry.
+  simp only [listBackups, List.mem_map]
+  -- This file's entry is the one: its id, and `true`.
+  exact ⟨f, hf, by simp [entry, h]⟩
+
+/-! ## Purging backups -/
+
+/-- The backups `purge_old_backups(keep)` deletes, given every backup's id
+oldest first, readable or not: all but the newest `keep`. -/
+def purgeDoomed (ids : List Nat) (keep : Nat) : List Nat :=
+  -- The oldest ones, as many as there are beyond `keep`.
+  ids.take (ids.length - keep)
+
+/-- The backups it keeps. -/
+def purgeKept (ids : List Nat) (keep : Nat) : List Nat :=
+  -- The rest: the newest `keep`, or all when there are fewer.
+  ids.drop (ids.length - keep)
+
+/-- **A purge keeps the newest `keep` backups and deletes exactly the
+rest.** It keeps `keep` of them, or all when there are fewer, and every
+backup is either deleted or kept, never both. -/
+theorem purge_keeps_the_newest (ids : List Nat) (keep : Nat) :
+    (purgeKept ids keep).length = min keep ids.length ∧
+      purgeDoomed ids keep ++ purgeKept ids keep = ids := by
+  -- Two halves.
+  constructor
+  -- What a drop keeps is the length less what it drops: arithmetic.
+  · simp only [purgeKept, List.length_drop]
+    -- `n - (n - keep)` is `keep` when `keep ≤ n`, and `n` otherwise.
+    omega
+  -- A list is what `take` keeps followed by what `drop` keeps.
+  · exact List.take_append_drop _ _
 
 /-! ## The defects, as counterexamples -/
 
@@ -522,18 +684,95 @@ theorem metadata_first_loses_a_table :
 /-- The defect `GcSkipsSealed`: a delete counts only the listings it can
 read without a key, so it skips the sealed ones. Each remaining backup is
 (whether it is sealed, its listing). -/
-def collectSkipsSealed (removed : List Nat) (remaining : List (Bool × List Nat)) : List Nat :=
+def collectSkipsSealed (pool : List Nat) (remaining : List (Bool × Option (List Nat))) :
+    List Nat :=
   -- Only plain listings count.
-  collect removed ((remaining.filter fun b => !b.1).map Prod.snd)
+  collect pool ((remaining.filter fun b => !b.1).map Prod.snd)
 
 /-- **RED `GcSkipsSealed`.** Backups 1 and 2 share pool file 5, backup 2
 sealed. Deleting backup 1: the engine keeps file 5, the defect removes the
 file sealed backup 2 still lists. -/
 theorem gc_skips_sealed_removes_a_listed_file :
     -- The engine removes nothing...
-    collect [5] [[5]] = [] ∧
+    collect [5] [some [5]] = [] ∧
     -- ...the defect removes file 5.
-    collectSkipsSealed [5] [(true, [5])] = [5] :=
+    collectSkipsSealed [5] [(true, some [5])] = [5] :=
+  -- Both are evaluations Lean can run.
+  ⟨by decide, by decide⟩
+
+/-- The defect `GcSkipsUnreadable`: a delete passes over every remaining
+backup whose metadata does not read. -/
+def collectSkipsUnreadable (pool : List Nat) (remaining : List (Option (List Nat))) :
+    List Nat :=
+  -- Only the listings that read count.
+  collect pool (remaining.filter Option.isSome)
+
+/-- **RED `GcSkipsUnreadable`.** Backups 1 and 2 share pool file 5, and
+backup 2's metadata no longer reads. Deleting backup 1: the engine removes
+nothing, the defect removes file 5, which backup 2 needs once it reads
+again. -/
+theorem gc_skips_unreadable_removes_a_file_it_cannot_see :
+    -- The engine removes nothing...
+    collect [5] [none] = [] ∧
+    -- ...the defect removes file 5.
+    collectSkipsUnreadable [5] [none] = [5] :=
+  -- Both are evaluations Lean can run.
+  ⟨by decide, by decide⟩
+
+/-- The defect `ListSkipsUnreadable`: the listing before this rule, which
+left out every file whose metadata did not read. -/
+def listSkipping (dir : List File) : List (Nat × Bool) :=
+  -- Only the files that decode, then their entries.
+  (dir.filter fun f => f.listing.isSome).map entry
+
+/-- The defect `ListNeedsKey`: a listing that opens each seal, with no key
+at hand, leaves out every sealed file. -/
+def listNeedingKey (dir : List File) : List (Nat × Bool) :=
+  -- Only the plain files, then their entries.
+  (dir.filter fun f => !f.sealed).map entry
+
+/-- Backups 1 and 2 readable, backup 3's metadata damaged; none sealed. -/
+def lastDamaged : List File :=
+  -- Each file: its id, its listing or `none`, and whether it is sealed.
+  [⟨1, some [5], false⟩, ⟨2, some [6], false⟩, ⟨3, none, false⟩]
+
+/-- One backup of an encrypted database: its metadata sealed. -/
+def oneSealed : List File :=
+  -- Its id, its clear listing, and sealed.
+  [⟨1, some [5], true⟩]
+
+/-- **RED `ListSkipsUnreadable` and `ListNeedsKey`.** The engine names
+backups 1, 2 and 3, and the sealed backup; the first defect names only 1
+and 2, the second no backup at all. -/
+theorem skipping_listings_leave_out_backups :
+    -- The engine: every backup, damaged one included...
+    (listBackups lastDamaged).map Prod.fst = [1, 2, 3] ∧
+    -- ...the first defect: backup 3 is gone from the list...
+    (listSkipping lastDamaged).map Prod.fst = [1, 2] ∧
+    -- ...the engine again: the sealed backup, with no key...
+    (listBackups oneSealed).map Prod.fst = [1] ∧
+    -- ...the second defect: nothing.
+    (listNeedingKey oneSealed).map Prod.fst = [] :=
+  -- Each is an evaluation Lean can run.
+  ⟨by decide, by decide, by decide, by decide⟩
+
+/-- What is left after a purge that chooses from the skipping listing: it
+deletes the oldest of the backups that list, so a backup left out of the
+list is never counted. -/
+def leftBySkippingPurge (dir : List File) (keep : Nat) : List Nat :=
+  -- The ones it deletes, chosen from the ids the skipping listing shows...
+  let doomed := purgeDoomed ((listSkipping dir).map Prod.fst) keep
+  -- ...and every backup on disk that it did not delete.
+  (dir.map File.id).filter fun id => !(doomed.contains id)
+
+/-- **RED: a purge over the skipping listing keeps too many.** Keeping one
+of backups 1, 2 and 3, with 3 damaged: the engine keeps backup 3 alone;
+the defect counts two backups, deletes backup 1 only, and leaves two. -/
+theorem skipping_purge_keeps_too_many :
+    -- The engine keeps only the newest, damaged or not...
+    purgeKept ((listBackups lastDamaged).map Prod.fst) 1 = [3] ∧
+    -- ...the defect leaves backups 2 and 3.
+    leftBySkippingPurge lastDamaged 1 = [2, 3] :=
   -- Both are evaluations Lean can run.
   ⟨by decide, by decide⟩
 
