@@ -742,6 +742,16 @@ tla:
     check MC_OpenFileTable_Red_IgnoreReaders           RED NeverClosedInUse
     check MC_OpenFileTable_Red_NoOwnerRecheck          RED ReadsOwnFile
     check MC_OpenFileTable_Red_OutsideTable            RED AtMostCap
+    # D60: a queue unit's reopen never waits for a slot, and a parked one is
+    # never forgotten. Lean: Regolith/OpenFileNoWait.lean, never_waits;
+    # Regolith/OpenFileNoWaitProof.lean, retry_never_lost; the REDs in
+    # Regolith/OpenFileNoWaitRed.lean.
+    check MC_OpenFileTable_Green_NoWait                GREEN
+    check MC_OpenFileTable_Green_NoWaitTwoSlots        GREEN
+    check MC_OpenFileTable_Red_Waits                   RED NeverWaits
+    check MC_OpenFileTable_Red_MarkFirst               RED RetryNeverLost
+    check MC_OpenFileTable_Red_PublishDropsWanted      RED RetryNeverLost
+    check MC_OpenFileTable_Red_WakeNeedsParked         RED RetryNeverLost
     # 4.6, Phase 7c1: column-family create, drop and use, fenced in the
     # ordered step. Lean: Regolith/CfRegistry.lean, no_write_after_drop,
     # no_write_before_birth, life_in_order.
