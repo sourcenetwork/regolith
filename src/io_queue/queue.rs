@@ -251,6 +251,9 @@ impl IoQueue {
                 let _ = self.shared.wake_up();
                 return output;
             }
+            // Parked until another thread's completion: release what this
+            // thread's reads hold back first (`read_view::idle`).
+            crate::engine::read_view::idle();
             std::thread::park();
         }
     }

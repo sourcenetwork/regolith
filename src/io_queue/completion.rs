@@ -204,9 +204,16 @@ impl<T: Send + Sync + 'static> Completion<T> {
     /// delivery (the callbacks, the ticket's readiness) still happens where
     /// it always does.
     pub(crate) fn wait_decided(&self) -> &T {
-        loop {
+        if let Some(outcome) = self.decided_outcome() {
+            return outcome;
+        }
+        // A wait for another thread: release what this thread's last read
+        // holds back first, and what the views retired meanwhile placed on
+        // it once the wait is over (`read_view::idle`).
+        crate::engine::read_view::idle();
+        let outcome = loop {
             if let Some(outcome) = self.decided_outcome() {
-                return outcome;
+                break outcome;
             }
             // Refused once the decision took the sleepers: decided now.
             if self.sleepers.push(thread::current(), SHUT).is_ok() {
@@ -214,7 +221,9 @@ impl<T: Send + Sync + 'static> Completion<T> {
                     thread::park();
                 }
             }
-        }
+        };
+        crate::engine::read_view::idle();
+        outcome
     }
 
     fn decided_outcome(&self) -> Option<&T> {

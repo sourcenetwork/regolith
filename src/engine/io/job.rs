@@ -160,6 +160,19 @@ impl Job {
 
     /// Block this thread until the job has landed.
     pub(crate) fn wait_landed(&self) {
+        if self.is_done() {
+            return;
+        }
+        // A wait for another thread: release what this thread's last read
+        // holds back first, and what the views retired meanwhile placed on
+        // it once the wait is over (`read_view::idle`).
+        super::super::read_view::idle();
+        self.park_until_landed();
+        super::super::read_view::idle();
+    }
+
+    /// [`Self::wait_landed`]'s parking.
+    fn park_until_landed(&self) {
         while !self.is_done() {
             // A refused push means the lander already took the sleepers: the
             // job is done.
