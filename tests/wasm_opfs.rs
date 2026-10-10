@@ -114,7 +114,7 @@ async fn the_full_lifecycle_survives_a_remount() {
         drop(cursor);
 
         db.flush().expect("flush");
-        db.compact_range(None, None).expect("compact");
+        db.compact_range(None, None).wait().expect("compact");
         while db.compact_step().expect("compact step") == CompactionOutcome::DidWork {}
         db.close().expect("close");
     }
@@ -508,7 +508,7 @@ async fn the_wasm_profile_survives_a_full_lifecycle_in_a_browser() {
                 .expect("put");
         }
         db.flush().expect("flush");
-        db.compact_range(None, None).expect("compact");
+        db.compact_range(None, None).wait().expect("compact");
         while db.compact_step().expect("compact step") == CompactionOutcome::DidWork {}
 
         for i in (0..2000u32).step_by(97) {
