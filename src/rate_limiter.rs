@@ -202,6 +202,7 @@ impl TokenBucketRateLimiter {
 
     /// Sleep until `ready_at` on the platform clock, or until stopped.
     /// `false` when stopped first.
+    #[cfg(not(target_arch = "wasm32"))]
     fn wait_until(&self, ready_at: u64) -> bool {
         loop {
             if self.shutdown.load(Ordering::Acquire) {
@@ -213,13 +214,15 @@ impl TokenBucketRateLimiter {
             if now >= ready_at {
                 return true;
             }
-            #[cfg(not(target_arch = "wasm32"))]
             std::thread::sleep(SLEEP_SLICE.min(Duration::from_nanos(ready_at - now)));
-            // A target with no thread to sleep serves at once rather than
-            // spin: nothing on it calls a limiter that must block.
-            #[cfg(target_arch = "wasm32")]
-            return true;
         }
+    }
+
+    /// A target with no thread to sleep serves at once rather than spin:
+    /// nothing on it calls a limiter that must block. `false` when stopped.
+    #[cfg(target_arch = "wasm32")]
+    fn wait_until(&self, _ready_at: u64) -> bool {
+        !self.shutdown.load(Ordering::Acquire)
     }
 
     fn count(&self, bytes: u64, pri: Priority) {
