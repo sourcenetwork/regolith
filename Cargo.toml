@@ -239,6 +239,10 @@ name = "group_commit"
 harness = false
 
 [[bench]]
+name = "commit_nowait"
+harness = false
+
+[[bench]]
 name = "ingest"
 harness = false
 
