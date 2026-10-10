@@ -219,11 +219,13 @@ impl RegolithEngine {
     /// tables, so here that thread is this one: once the gate is released it
     /// runs the same bounded steps a stopped writer would. A stop that stays
     /// (nothing left to compact, the bound reached, a step failing) lands
-    /// the waiters' unit anyway, so each writer looks again and relieves it
-    /// or reports why it cannot, instead of waiting for a relief nobody is
-    /// running. A step contended by another writer's relief leaves the stop
-    /// to that writer. `proofs/tla/StallRelief.tla` checks that no stopped
-    /// writer is left waiting once the job is done.
+    /// the waiters' unit anyway, as every piece of progress does here
+    /// (`StallSignal`, relief handed back), so each writer looks again and
+    /// relieves it or reports why it cannot, instead of waiting for a relief
+    /// nobody is running. A step contended by another thread's work leaves
+    /// the stop to that thread, which hands it back the same way.
+    /// `proofs/tla/StallRelief.tla` checks that no stopped writer is left
+    /// waiting once nobody is relieving.
     fn relieve_after_foreground(&self) {
         if self.has_worker || !self.inline_compaction {
             return;
@@ -252,12 +254,8 @@ impl RegolithEngine {
                 }
             }
         }
-        // Lands the unit when the stop cleared ...
+        // Lands the unit, the stop cleared or not.
         self.refresh_stall_level();
-        // ... and when it did not, so the waiting writers look again.
-        if matches!(self.stall_state(), Some((_, true))) {
-            self.stall_signal.land();
-        }
     }
 }
 
