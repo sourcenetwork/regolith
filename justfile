@@ -690,6 +690,13 @@ tla:
     check MC_NonBlocking_Red_PublishAtWrite            RED VisibleAfterSync
     check MC_NonBlocking_Red_DeliverOnLander           RED DeliveredOnOwnPoll
     check MC_NonBlocking_Red_NoRecheck                 RED StallLandsWhenClear
+    # Phase 7 integration: a foreground job that held the compaction gate
+    # relieves the stop it kept stopped writers from relieving (no worker,
+    # inline compaction). Lean: Regolith/StallRelief.lean,
+    # job_end_strands_no_waiter, no_relief_strands_waiters.
+    spec=StallRelief
+    check MC_StallRelief_Green                         GREEN
+    check MC_StallRelief_Red_NoRelief                  RED NoStrandedWait
     # regolith::sync's locks after D49: barging with bounded bypass, for
     # Mutex, Semaphore and ReentrantMutex. Lean: Regolith/Sync.lean,
     # mutual_exclusion, bounded_bypass, owed_exclusive.
