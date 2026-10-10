@@ -202,30 +202,46 @@ impl RegolithEngine {
         self.ensure_writable()?;
         let dropped = {
             let mut pipe = self.pipeline.lock();
-            if !families.is_live_handle(cf) {
-                return Err(invalid_handle_error(cf).into_io_error());
-            }
-            let mut point_ops = BTreeMap::new();
-            point_ops.insert(meta::name_key(cf.name()), None);
-            let range = (cf_lower_bound(cf.id()), cf_upper_bound(cf.id()));
-            let landed = self.lead_alone(
-                &mut pipe,
-                WriteRequest::Batch {
-                    ops: grouped_batch_ops(point_ops, vec![range], Vec::new()),
-                    durability,
-                    disable_wal: false,
-                },
-            );
-            if landed.is_ok() {
-                // The tombstone is durable and applied: from this retire on,
-                // the fence refuses every write to the family.
-                families.retire(cf.id());
-            }
+            let dropped = self.drop_family_locked(&mut pipe, families, cf, durability);
             self.hand_off(&mut pipe);
-            landed.map(|_| ())
+            dropped
         };
         self.run_owed_step();
         dropped
+    }
+
+    /// The ordered step of [`Self::drop_family`], under the pipeline the
+    /// caller holds: refuse a handle that is no longer live, commit the
+    /// tombstone and the meta delete as a group of one, and retire the family
+    /// once that group landed. Every group after it is fenced against the
+    /// retired family.
+    fn drop_family_locked(
+        &self,
+        pipe: &mut Pipeline,
+        families: &CfRegistry,
+        cf: &ColumnFamilyHandle,
+        durability: DurabilityMode,
+    ) -> io::Result<()> {
+        if !families.is_live_handle(cf) {
+            return Err(invalid_handle_error(cf).into_io_error());
+        }
+        let mut point_ops = BTreeMap::new();
+        point_ops.insert(meta::name_key(cf.name()), None);
+        let range = (cf_lower_bound(cf.id()), cf_upper_bound(cf.id()));
+        let landed = self.lead_alone(
+            pipe,
+            WriteRequest::Batch {
+                ops: grouped_batch_ops(point_ops, vec![range], Vec::new()),
+                durability,
+                disable_wal: false,
+            },
+        );
+        if landed.is_ok() {
+            // The tombstone is durable and applied: from this retire on, the
+            // fence refuses every write to the family.
+            families.retire(cf.id());
+        }
+        landed.map(|_| ())
     }
 
     /// Commit `request` as a group of its own and return its outcome. The
@@ -242,6 +258,10 @@ impl RegolithEngine {
         })
     }
 }
+
+#[cfg(test)]
+#[path = "families_tests.rs"]
+mod tests;
 
 /// The family a prefixed key belongs to, or `None` for a key too short to
 /// carry one.
