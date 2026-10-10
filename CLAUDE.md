@@ -72,8 +72,9 @@ src/
 ├── encryption.rs       # Encryption at rest: KeyProvider, KeyId, KeyMaterial
 ├── error.rs            # Error enum, Result alias
 ├── event_listener.rs   # Flush/compaction event callbacks
-├── io_queue.rs         # Non-blocking reads: ReadMode, QueueId, IoBudget, IoProgress
-├── io_queue/           # queue.rs (IoQueue: poll, idle_waker), wait.rs (IoWait, WouldBlock)
+├── io_queue.rs         # Non-blocking calls: ReadMode, QueueId, IoBudget, IoProgress
+├── io_queue/           # queue.rs (IoQueue: poll, idle_waker, block_on), wait.rs (IoWait, StallWait,
+│                       # WouldBlock), ticket.rs (CommitTicket, JobTicket), completion.rs (deliver once)
 ├── iter.rs             # Public iterator wrappers
 ├── log_layout.rs       # LogLayout: the key layout of a commit-ordered log
 ├── options.rs          # Options, tuning enums, MergeOperator, CompactionFilter
@@ -89,7 +90,8 @@ src/
 ├── testing.rs          # `testing` feature: property checks a caller runs against its own trait implementations
 ├── transaction.rs      # Optimistic and pessimistic transactions, isolation levels
 ├── transaction/        # policy.rs (KeyClassifier, key classes), txn_options.rs (TxnOptions),
-│                       # scan_range.rs (scan stretches), write_buffer.rs (buffered puts, deletes, merges)
+│                       # scan_range.rs (scan stretches), write_buffer.rs (buffered puts, deletes, merges),
+│                       # nowait.rs (commit_nowait), retry.rs (transact, transact_async, ready)
 ├── ttl.rs              # TTL database wrapper
 ├── sync/               # Public regolith::sync: async locks, semaphore, notify, event, latch, barrier, once cell
 │   ├── queue.rs        # Wait queue and drain role every primitive builds on
@@ -101,9 +103,11 @@ src/
 └── engine/
     ├── mod.rs          # RegolithEngine orchestration, read paths, rotation, recovery
     ├── commit/         # Group commit pipeline: ring, bounded leader, transaction members decided in
-    │                   # group order (group.rs, txn.rs), the check up to a horizon (early.rs), stall signal
+    │                   # group order (group.rs, txn.rs), the check up to a horizon (early.rs), the group
+    │                   # fsync as a claimable job (deferred.rs), the stall as a unit writers wait on (stall.rs)
     ├── flush.rs        # Writing a frozen memtable to L0, shared with the compaction workers
-    ├── background_step.rs # Flushes off the commit path; the bounded step a write owes with no worker
+    ├── background_step.rs # Flushes off the commit path; owed work run as a job on the writer's queue
+    ├── foreground.rs   # compact_range, ingest, checkpoint run as jobs behind a JobTicket
     ├── stall_state.rs  # Write-stall thresholds and the level writers cache
     ├── compaction.rs   # Level/FIFO/universal compaction planning and worker loop
     ├── compaction/     # Per-snapshot-stripe folding of versions and merge chains
@@ -134,9 +138,10 @@ src/
     ├── filter_block.rs # SSTable filter region: user-key and prefix bloom filters
     ├── index_block.rs  # Decoded SSTable index blocks
     ├── internal_key.rs # MVCC internal key encoding
-    ├── io/             # CacheOnly misses: unit table, the close gate (mod.rs), single-flight units
-    │                   # (unit.rs), per-queue inbox and landings (shared.rs), the mode scope (scope.rs),
-    │                   # stack.rs, atomic_waker.rs
+    ├── io/             # Per-thread queues: unit and job tables, the close gate (mod.rs), single-flight
+    │                   # read units (unit.rs) and jobs (job.rs) over one claim (flight.rs), per-queue
+    │                   # inbox and landings (shared.rs), thread binding (bind.rs), the mode scope
+    │                   # (scope.rs), stack.rs, atomic_waker.rs
     ├── loom_model/     # Loom models of the engine's lock-free protocols (--cfg loom)
     ├── lookup_key.rs   # Inline-first internal key used by every read path
     ├── iterator.rs     # Engine iterator merge logic
@@ -147,7 +152,7 @@ src/
     ├── source_walk.rs  # Newest-first walk over a view's sources for one key
     ├── background_health.rs # Whether flush or compaction is failing, and why
     ├── compaction_backoff.rs # Retry pacing for a failing compaction worker
-    ├── disk_check.rs   # Open-time warning when the filesystem is nearly full
+    ├── disk_check.rs   # Warning when the filesystem is nearly full, run once after open
     ├── orphan_sweep.rs # Removal of SSTables the manifest does not reference
     └── pending_outputs.rs # Compaction outputs not yet offered to the manifest
 ```
