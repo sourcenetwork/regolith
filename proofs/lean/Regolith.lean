@@ -98,6 +98,11 @@ import Regolith.BackupSeal
 -- compare-and-swap publication loses no publication. Backs
 -- `proofs/tla/ReadView.tla`.
 import Regolith.ReadView
+-- 4.6, Phase 7 integration: every publisher of the read view (a rotation, a
+-- flush's install and retire on every flush path, a compaction, an ingest)
+-- publishes by compare-and-swap, so no memtable or table is lost and no
+-- retired memtable comes back. Backs `proofs/tla/ReadViewPublishers.tla`.
+import Regolith.ReadViewPublishers
 -- 4.6, Phase 7b: the lock-free CLOCK block cache. The hand evicts only a
 -- block nobody holds and no landing names, counts stay exact, and the
 -- two-level reservation keeps the byte bound. Backs

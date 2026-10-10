@@ -33,6 +33,12 @@
 //!   which each is a function of its predecessor and no publication is
 //!   lost. Publishers never exclude each other: one that loses the swap
 //!   rebuilds on whatever won. That is what replaced the publish mutex.
+//!   Every publisher goes through it, since [`ReadViewCell::publish`] is the
+//!   only writer of the cell: a rotation (under the pipeline mutex), a
+//!   flush's install and retire on each flush path (the worker's, a
+//!   writer's after its commit, a stall step's), a compaction, an ingest
+//!   and `drop_all`. `proofs/tla/ReadViewPublishers.tla` checks that racing,
+//!   they lose no memtable and no table.
 //! * **A load never returns a view older than one already published
 //!   before the load began.** The swap is a release, the load an
 //!   acquire of the same word, so a publication that happened before a

@@ -710,6 +710,14 @@ tla:
     check MC_ReadView_Red_FreeEarly                    RED NoFreedRead
     check MC_ReadView_Red_StaleLoad                    RED FreshLoad
     check MC_ReadView_Red_PlainStore                   RED ChainOfPublications
+    # Phase 7 integration: the read view's publishers as group commit and the
+    # flush off the commit path left them, every one by compare-and-swap.
+    # Lean: Regolith/ReadViewPublishers.lean, no_lost_memtable,
+    # retired_stay_gone, plain_retire_loses_a_seal, plain_version_loses_a_seal.
+    spec=ReadViewPublishers
+    check MC_ReadViewPublishers_Green                  GREEN
+    check MC_ReadViewPublishers_Red_PlainRetire        RED NoLostMemtable
+    check MC_ReadViewPublishers_Red_PlainVersion       RED NoLostMemtable
     # 4.6, Phase 7b: the lock-free CLOCK block cache. Lean:
     # Regolith/ClockCache.lean, evict_only_unpinned, reachable_safe,
     # two_level_bounded and used_exact.
