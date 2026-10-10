@@ -38,6 +38,8 @@
 #[cfg(loom)]
 pub mod loom_model;
 #[cfg(test)]
+mod move_tests;
+#[cfg(test)]
 mod park_tests;
 pub(crate) mod slots;
 #[cfg(test)]
@@ -169,16 +171,36 @@ impl PathEntry {
         }
     }
 
+    /// Open the file wherever it is now. A whole move can finish between
+    /// loading the names and opening (the names said `from`, and the file is
+    /// already at `to`); a NotFound then loads the names again and, if a move
+    /// changed them, tries the new ones. Each retry needs a move to have
+    /// published new names, and a table moves only a bounded number of times
+    /// (a removal moves it once, for good), so this never spins.
     fn reopen(&self, inner: &dyn Env) -> io::Result<Arc<dyn ReadFile>> {
-        let names = self.names.load();
-        if let Some(previous) = &names.previous {
-            match inner.open_read(previous) {
+        let mut names = self.names.load();
+        loop {
+            if let Some(previous) = &names.previous {
+                match inner.open_read(previous) {
+                    Ok(file) => return Ok(Arc::from(file)),
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(e),
+                }
+            }
+            match inner.open_read(&names.current) {
                 Ok(file) => return Ok(Arc::from(file)),
-                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                    let now = self.names.load();
+                    // The guard on the names first loaded keeps them alive,
+                    // so a different address is a newer store, never a reuse.
+                    if std::ptr::eq(&*now, &*names) {
+                        return Err(e);
+                    }
+                    names = now;
+                }
                 Err(e) => return Err(e),
             }
         }
-        inner.open_read(&names.current).map(Arc::from)
     }
 }
 
