@@ -13,9 +13,10 @@
 //! - the ordered step is one mutex, and inside it a write takes the next
 //!   sequence (`run_group`'s `fetch_add`);
 //! - a write checks the family in the ordered step before it takes a
-//!   sequence (`cf_fence` at admission);
+//!   sequence (`fence_group`, the first act of every group, whatever path
+//!   admitted its members);
 //! - a drop takes the tombstone's sequence in the ordered step and retires
-//!   the family before it leaves it (`drop_family`);
+//!   the family before it leaves it (`drop_family_locked`);
 //! - a create publishes the family in the ordered step after its meta
 //!   entry's sequence (`create_family`).
 //!

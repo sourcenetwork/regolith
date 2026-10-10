@@ -39,6 +39,15 @@ one thread at a time.
    retire after the ordered step does too (`late_retire_lands_after_drop`);
    reusing a dropped id brings a family back to life
    (`reused_id_goes_back`).
+5. Group commit: a whole group, its members checked when the group runs,
+   is a run of the steps above (`runGroup_steps`), so the rules hold after
+   any group however its members were admitted
+   (`group_no_write_after_drop`, `group_no_write_before_birth`). The ticket
+   the hand-off holds across a drop is refused when its group runs
+   (`fenced_when_run_refuses_after_drop`); checked at the hand-off instead,
+   or a transaction left unchecked, it lands over the tombstone
+   (`fenced_at_hand_off_lands_after_drop`, TLA+ REDs `FenceAtHandOff` and
+   `TxnUnfenced`).
 
 ## How to read the Lean
 
@@ -487,6 +496,112 @@ theorem reused_id_goes_back :
     (dropped.life 1).rank > (reborn.life 1).rank := by
   -- Dead is rank 2, live is rank 1.
   simp [dropped, created, set, Life.rank]
+
+/-! ## Part 5. Group commit: every member is fenced when its group runs
+
+The commit pipeline runs writes in groups (`src/engine/commit/mod.rs`). A
+member reaches a group by one of several paths: the leader's own request,
+a ticket another writer queued on the ring, the ticket the bounded leader's
+hand-off held across the end of one turn and the start of the next, an
+optimistic transaction's commit. Whatever the path, the group's first act,
+before any sequence, is to check every member against the registry as it
+stands then (`fence_group`). Here a whole group is one function of the
+state, and it is shown to be a run of the single `land` and `refuse` steps
+above, so every rule proved for them holds after any group. -/
+
+/-- One group run in the ordered step (`run_and_complete`): the members'
+families, in group order, each checked against the registry as it stands
+when the group runs. A member whose family is live takes the next sequence
+and lands; one whose family is not is refused and takes none. -/
+def runGroup : State → List Nat → State
+  -- No member left: the state as it is.
+  | s, [] => s
+  -- The next member, of family `f`, then the rest of the group.
+  | s, f :: rest =>
+    -- The rest runs on the state this member leaves behind ...
+    runGroup
+      -- ... which, when `f` is live, holds one more landed write at the
+      -- next sequence, ...
+      (if s.life f = .live then
+        { s with seq := s.seq + 1, landed := (f, s.seq + 1) :: s.landed }
+      -- ... and otherwise is unchanged: the member was refused.
+      else s) rest
+
+/-- A group run is a run of single steps: one `land` or one `refuse` per
+member, in group order. -/
+theorem runGroup_steps (s : State) (ms : List Nat) : Steps s (runGroup s ms) := by
+  -- By the number of members, for every starting state.
+  induction ms generalizing s with
+  | nil =>
+    -- No member: zero steps.
+    exact Steps.refl s
+  | cons f rest ih =>
+    -- Split on whether the member's family is live when the group runs.
+    by_cases h : s.life f = .live
+    · -- Live: unfold one member of the group; the `if` takes its first branch.
+      simp only [runGroup, h, ↓reduceIte]
+      -- The member is one `land` step, and the rest are more steps.
+      exact Steps.cons (Step.land s f h) (ih _)
+    · -- Not live: unfold one member; the `if` takes its second branch.
+      simp only [runGroup, h, ↓reduceIte]
+      -- The member is one `refuse` step, and the rest are more steps.
+      exact Steps.cons (Step.refuse s f h) (ih _)
+
+/-- Any number of steps from a reachable state reach a reachable state. -/
+theorem reach_steps {s t : State} (hs : Reach s) (h : Steps s t) : Reach t := by
+  -- By the number of steps.
+  induction h with
+  | refl =>
+    -- No step: the state is the reachable one we started from.
+    exact hs
+  | cons hst _ ih =>
+    -- One step reaches a reachable state, and the rest follow from it.
+    exact ih (Reach.step hs hst)
+
+/-- **`group_no_write_after_drop`.** After any group run from a reachable
+state, every write that landed in a dropped family is below its tombstone:
+however its members were admitted, the check when the group runs is what
+keeps the rule (TLA+ `NoWriteAfterDrop` on `MC_CfRegistry_Green`). -/
+theorem group_no_write_after_drop {s : State} (h : Reach s) (ms : List Nat) :
+    -- The claim itself; its proof follows.
+    ∀ p ∈ (runGroup s ms).landed,
+      (runGroup s ms).tomb p.1 = 0 ∨ p.2 < (runGroup s ms).tomb p.1 :=
+  -- The group is a run of steps, so its end is reachable, and every
+  -- reachable state keeps the rule.
+  no_write_after_drop (reach_steps h (runGroup_steps s ms))
+
+/-- **`group_no_write_before_birth`.** After any group run from a reachable
+state, every write that landed is above its family's creation. -/
+theorem group_no_write_before_birth {s : State} (h : Reach s) (ms : List Nat) :
+    -- The claim itself; its proof follows.
+    ∀ p ∈ (runGroup s ms).landed,
+      0 < (runGroup s ms).born p.1 ∧ (runGroup s ms).born p.1 < p.2 :=
+  -- As above: the group's end is reachable.
+  no_write_before_birth (reach_steps h (runGroup_steps s ms))
+
+/-- In the story, the real code refuses the held ticket: its group runs
+after the drop, finds family 1 dead, and lands nothing. -/
+theorem fenced_when_run_refuses_after_drop : runGroup dropped [1] = dropped := by
+  -- Family 1 is dead in `dropped`, so the one member is refused.
+  simp [runGroup, dropped, created, set, init]
+
+/-- **`fenced_at_hand_off_lands_after_drop`.** The ticket the hand-off holds,
+checked when the hand-off took it rather than when its group runs (bug
+`FenceAtHandOff`): the check passes in `created`, where family 1 is live;
+the drop's group then runs (tombstone at 2, family 1 dead); the held
+ticket's group runs on that earlier pass, which is a landing with no check,
+and the write at 3 sits over the tombstone at 2. A transaction member that
+skips the check (bug `TxnUnfenced`) lands the same way. -/
+theorem fenced_at_hand_off_lands_after_drop :
+    -- The check at hand-off passes, then the drop, then the unchecked
+    -- landing, and the rule fails.
+    created.life 1 = .live ∧ BlindStep created dropped ∧ BlindStep dropped landedLate ∧
+    ¬ (∀ p ∈ landedLate.landed, landedLate.tomb p.1 = 0 ∨ p.2 < landedLate.tomb p.1) := by
+  -- The drop, the unchecked landing and the broken rule are the story of
+  -- `fence_outside_lands_after_drop`.
+  obtain ⟨_, hdrop, hland, hbad⟩ := fence_outside_lands_after_drop
+  -- Family 1 is live in `created`; the rest is that story.
+  exact ⟨by simp [created, set], hdrop, hland, hbad⟩
 
 -- The end of this file's names.
 end Regolith.CfRegistry

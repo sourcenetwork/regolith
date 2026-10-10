@@ -250,8 +250,9 @@ const REGISTRY_BUCKETS: usize = 64;
 /// - **Births and deaths are ordered with the writes.** The engine publishes
 ///   and retires a family only inside its ordered commit step, right after
 ///   the write that persists the change, and every write checks the families
-///   it touches in that same step (`RegolithEngine::create_family`,
-///   `drop_family`, `cf_fence`). So a write either commits before a drop,
+///   it touches in that same step, when the group it is in runs
+///   (`RegolithEngine::create_family`, `drop_family`, `fence_group`). So a
+///   write either commits before a drop,
 ///   and the drop's range tombstone deletes it, or is refused because the
 ///   family is gone; it never lands after the tombstone.
 pub(crate) struct CfRegistry {

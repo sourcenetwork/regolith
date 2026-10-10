@@ -741,6 +741,12 @@ tla:
     check MC_CfRegistry_Red_FenceOutside               RED NoWriteAfterDrop
     check MC_CfRegistry_Red_RetireLate                 RED NoWriteAfterDrop
     check MC_CfRegistry_Red_ReuseId                    RED LifeInOrder
+    # Phase 7 integration: the fence on every group-commit path (the
+    # leader's own request, a queued ticket, the hand-off's held ticket, a
+    # transaction member, an ingest's install). Lean: group_no_write_after_drop,
+    # fenced_at_hand_off_lands_after_drop.
+    check MC_CfRegistry_Red_FenceAtHandOff             RED NoWriteAfterDrop
+    check MC_CfRegistry_Red_TxnUnfenced                RED NoWriteAfterDrop
     # 4.6, Phase 7c1: the env file maps, positional reads and lock-free
     # in-memory files. Lean: Regolith/EnvFiles.lean, positional_reads_own,
     # current_holds_finished, read_sees_finished.
