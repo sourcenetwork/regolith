@@ -94,7 +94,13 @@ impl<'db> Checkpoint<'db> {
         env.create_dir_all(&target_sst).map_err(Error::from)?;
         env.create_dir_all(&target_wal).map_err(Error::from)?;
 
-        if !env.read_dir(&target_sst).map_err(Error::from)?.is_empty() {
+        // One entry is enough to know, so the walk stops at the first.
+        let occupied = env
+            .read_dir(&target_sst)
+            .and_then(|mut walk| walk.next().transpose())
+            .map_err(Error::from)?
+            .is_some();
+        if occupied {
             return Err(Error::Io(std::io::Error::new(
                 std::io::ErrorKind::AlreadyExists,
                 "checkpoint target sst directory is not empty",

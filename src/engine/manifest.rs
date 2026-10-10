@@ -1098,7 +1098,10 @@ impl VersionSet {
         sst_dir: &Path,
         keyring: Option<&Keyring>,
     ) -> Vec<SuspectTable> {
-        let entries = match env.read_dir(sst_dir) {
+        let entries = match env
+            .read_dir(sst_dir)
+            .and_then(|walk| walk.collect::<io::Result<Vec<_>>>())
+        {
             Ok(entries) => entries,
             Err(e) => {
                 tracing::warn!(

@@ -22,7 +22,7 @@ use std::thread::JoinHandle as StdJoinHandle;
 use std::time::{Duration, Instant};
 
 use regolith::env::{
-    Capabilities, DirEntry, Env, FileLock, FileMeta, JoinHandle, ReadFile, StdEnv, WriteFile,
+    Capabilities, Env, FileLock, FileMeta, JoinHandle, ReadDir, ReadFile, StdEnv, WriteFile,
     WriteMode,
 };
 use regolith::{Db, IngestOptions, Options, Priority, RateLimiter, SstFileWriter, WriteBatch};
@@ -255,7 +255,7 @@ impl Env for NthSstOpen {
     fn create_dir_all(&self, p: &Path) -> io::Result<()> {
         self.inner.create_dir_all(p)
     }
-    fn read_dir(&self, p: &Path) -> io::Result<Vec<DirEntry>> {
+    fn read_dir(&self, p: &Path) -> io::Result<ReadDir<'_>> {
         self.inner.read_dir(p)
     }
     fn open_read(&self, p: &Path) -> io::Result<Box<dyn ReadFile>> {

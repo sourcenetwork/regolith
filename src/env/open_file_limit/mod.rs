@@ -46,7 +46,7 @@ use kovan::Atom;
 use kovan_map::HashMap;
 
 use super::{
-    Capabilities, DirEntry, Env, FileLock, FileMeta, JoinHandle, ReadFile, WriteFile, WriteMode,
+    Capabilities, Env, FileLock, FileMeta, JoinHandle, ReadDir, ReadFile, WriteFile, WriteMode,
 };
 use crate::portability::{AtomicU64, AtomicUsize, Ordering};
 use slots::{Held, SlotTable};
@@ -471,7 +471,7 @@ impl Env for OpenFileLimit {
     fn create_dir_all(&self, path: &Path) -> io::Result<()> {
         self.shared.inner.create_dir_all(path)
     }
-    fn read_dir(&self, path: &Path) -> io::Result<Vec<DirEntry>> {
+    fn read_dir(&self, path: &Path) -> io::Result<ReadDir<'_>> {
         self.shared.inner.read_dir(path)
     }
     fn open_write(&self, path: &Path, mode: WriteMode) -> io::Result<Box<dyn WriteFile>> {

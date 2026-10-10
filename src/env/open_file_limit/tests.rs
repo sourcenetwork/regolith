@@ -108,7 +108,7 @@ impl Env for Counted {
     fn create_dir_all(&self, path: &Path) -> io::Result<()> {
         self.inner.create_dir_all(path)
     }
-    fn read_dir(&self, path: &Path) -> io::Result<Vec<DirEntry>> {
+    fn read_dir(&self, path: &Path) -> io::Result<ReadDir<'_>> {
         self.inner.read_dir(path)
     }
     fn metadata(&self, path: &Path) -> io::Result<FileMeta> {
@@ -155,8 +155,7 @@ fn names(env: &dyn Env, dir: &Path) -> Vec<String> {
     let mut names: Vec<String> = env
         .read_dir(dir)
         .unwrap()
-        .iter()
-        .map(|entry| entry.file_name())
+        .map(|entry| entry.unwrap().file_name())
         .collect();
     names.sort();
     names

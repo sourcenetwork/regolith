@@ -32,7 +32,7 @@ use crate::portability::{AtomicU64, Ordering};
 use super::db_lock::DirectoryRegistry;
 use super::mem_file::{Free, MemFile};
 use super::{
-    Capabilities, DirEntry, Env, FileLock, FileMeta, JoinHandle, ReadFile, WriteFile, WriteMode,
+    Capabilities, Env, FileLock, FileMeta, JoinHandle, ReadDir, ReadFile, WriteFile, WriteMode,
 };
 
 /// Buckets each map starts with; they grow on demand.
@@ -163,16 +163,6 @@ fn not_found(path: &Path) -> io::Error {
     )
 }
 
-/// The entries of `paths` directly under `dir`, in path order.
-fn children(dir: &Path, paths: Vec<PathBuf>, is_dir: bool) -> impl Iterator<Item = DirEntry> {
-    let mut paths: Vec<PathBuf> = paths
-        .into_iter()
-        .filter(|p| p.parent() == Some(dir))
-        .collect();
-    paths.sort();
-    paths.into_iter().map(move |path| DirEntry { path, is_dir })
-}
-
 impl Env for MemEnv {
     fn create_dir_all(&self, path: &Path) -> io::Result<()> {
         let mut cursor = Some(path);
@@ -189,14 +179,19 @@ impl Env for MemEnv {
         Ok(())
     }
 
-    fn read_dir(&self, path: &Path) -> io::Result<Vec<DirEntry>> {
+    fn read_dir(&self, path: &Path) -> io::Result<ReadDir<'_>> {
         if !self.fs.dirs.contains_key(path) {
             return Err(not_found(path));
         }
-        // Files first, then directories, each in path order.
-        Ok(children(path, self.fs.files.keys().collect(), false)
-            .chain(children(path, self.fs.dirs.keys().collect(), true))
-            .collect())
+        // The namespace is flat, so the walk passes every path and keeps
+        // the direct children, one bucket of each map at a time. Each map
+        // walk pins a kovan guard until it ends (a node it passed is not
+        // freed meanwhile) and takes no lock.
+        Ok(super::flat_children(
+            path,
+            self.fs.files.keys(),
+            self.fs.dirs.keys(),
+        ))
     }
 
     fn open_read(&self, path: &Path) -> io::Result<Box<dyn ReadFile>> {
@@ -353,11 +348,23 @@ impl WriteFile for MemWriteFile {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::env::DirEntry;
 
     fn env() -> MemEnv {
         let env = MemEnv::new();
         env.create_dir_all(Path::new("/db")).unwrap();
         env
+    }
+
+    /// The names under `dir`, sorted: a walk's order is unspecified.
+    fn names(env: &MemEnv, dir: &str) -> Vec<String> {
+        let mut names: Vec<String> = env
+            .read_dir(Path::new(dir))
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        names.sort();
+        names
     }
 
     #[test]
@@ -402,14 +409,56 @@ mod tests {
         env.write(Path::new("/db/MANIFEST"), b"m").unwrap();
         env.write(Path::new("/db/sst/1.sst"), b"s").unwrap();
 
-        let mut names: Vec<String> = env
+        assert_eq!(names(&env, "/db"), vec!["MANIFEST", "sst"]);
+        let entries: Vec<DirEntry> = env
             .read_dir(Path::new("/db"))
             .unwrap()
-            .iter()
-            .map(|e| e.file_name())
+            .map(Result::unwrap)
             .collect();
-        names.sort();
-        assert_eq!(names, vec!["MANIFEST".to_string(), "sst".to_string()]);
+        assert!(entries.iter().any(|e| e.file_name() == "sst" && e.is_dir));
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.file_name() == "MANIFEST" && !e.is_dir)
+        );
+    }
+
+    #[test]
+    fn a_walk_of_a_missing_directory_is_not_found() {
+        let err = env()
+            .read_dir(Path::new("/nowhere"))
+            .map(|_| ())
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+    }
+
+    /// A directory far larger than one map bucket is walked whole, each
+    /// entry once, while the walker removes every entry it was handed and
+    /// files elsewhere in the namespace come and go.
+    #[test]
+    fn a_large_walk_yields_each_entry_once_while_the_walker_removes_them() {
+        const FILES: usize = 5_000;
+        let env = env();
+        env.create_dir_all(Path::new("/other")).unwrap();
+        for i in 0..FILES {
+            env.write(Path::new(&format!("/db/{i:06}.sst")), b"x")
+                .unwrap();
+        }
+        let mut seen = std::collections::HashSet::new();
+        for (n, entry) in env.read_dir(Path::new("/db")).unwrap().enumerate() {
+            let entry = entry.unwrap();
+            assert!(seen.insert(entry.path.clone()), "{:?} twice", entry.path);
+            env.remove_file(&entry.path).unwrap();
+            // Churn outside the walked directory, which a flat namespace
+            // shares with it.
+            let other = PathBuf::from(format!("/other/{n}"));
+            env.write(&other, b"y").unwrap();
+            if n % 2 == 0 {
+                env.remove_file(&other).unwrap();
+            }
+        }
+        assert_eq!(seen.len(), FILES);
+        assert!(names(&env, "/db").is_empty());
     }
 
     #[test]
@@ -552,7 +601,7 @@ mod tests {
                 std::thread::spawn(move || {
                     while !stop.load(std::sync::atomic::Ordering::Acquire) {
                         for entry in env.read_dir(Path::new("/db")).unwrap() {
-                            let Ok(file) = env.open_read(&entry.path) else {
+                            let Ok(file) = env.open_read(&entry.unwrap().path) else {
                                 continue;
                             };
                             let mut bytes = vec![0u8; file.len().unwrap() as usize];
@@ -591,14 +640,8 @@ mod tests {
         for reader in readers {
             reader.join().unwrap();
         }
-        let names: Vec<String> = env
-            .read_dir(Path::new("/db"))
-            .unwrap()
-            .iter()
-            .map(DirEntry::file_name)
-            .collect();
         let want: Vec<String> = (0..WRITERS).map(|w| format!("w{w}")).collect();
-        assert_eq!(names, want);
+        assert_eq!(names(&env, "/db"), want);
         for w in 0..WRITERS {
             let bytes = env.read(Path::new(&format!("/db/w{w}"))).unwrap();
             assert_eq!(bytes, vec![w as u8; 16 * ((ROUNDS - 1) % 7 + 1)]);
@@ -670,14 +713,8 @@ mod tests {
                             (got, want) => prop_assert!(false, "{got:?} vs {want:?}"),
                         },
                     }
-                    let names: Vec<String> = env
-                        .read_dir(Path::new("/db"))
-                        .unwrap()
-                        .iter()
-                        .map(DirEntry::file_name)
-                        .collect();
                     let want: Vec<String> = model.keys().map(|f| format!("f{f}")).collect();
-                    prop_assert_eq!(names, want);
+                    prop_assert_eq!(names(&env, "/db"), want);
                     prop_assert_eq!(env.total_bytes(), model.values().map(|b| b.len() as u64).sum::<u64>());
                 }
             }

@@ -3265,6 +3265,7 @@ fn list_wal_files(env: &dyn Env, dir: &Path) -> std::io::Result<Vec<PathBuf>> {
     let mut files = Vec::new();
     if env.exists(dir) {
         for entry in env.read_dir(dir)? {
+            let entry = entry?;
             if entry
                 .path
                 .extension()

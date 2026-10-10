@@ -219,7 +219,11 @@ impl BackupEngine {
     /// whose metadata cannot be read is left out.
     pub fn list_backups(&self) -> Vec<BackupInfo> {
         let mut out = Vec::new();
-        let Ok(entries) = self.env.read_dir(&self.meta_dir) else {
+        let Ok(entries) = self
+            .env
+            .read_dir(&self.meta_dir)
+            .and_then(|walk| walk.collect::<io::Result<Vec<_>>>())
+        else {
             return out;
         };
         let mut ids: Vec<u64> = entries
@@ -363,6 +367,7 @@ impl BackupEngine {
     fn gc_shared(&self, removed: &Listing) -> Result<()> {
         let mut still_referenced = HashSet::new();
         for entry in self.env.read_dir(&self.meta_dir).map_err(Error::from)? {
+            let entry = entry.map_err(Error::from)?;
             let Some(id) = parse_backup_id(&entry.file_name()) else {
                 continue;
             };
@@ -406,7 +411,7 @@ impl BackupEngine {
     fn next_backup_id(&self) -> Result<u64> {
         let mut max_id = 0u64;
         for entry in self.env.read_dir(&self.meta_dir).map_err(Error::from)? {
-            if let Some(id) = parse_backup_id(&entry.file_name())
+            if let Some(id) = parse_backup_id(&entry.map_err(Error::from)?.file_name())
                 && id > max_id
             {
                 max_id = id;

@@ -16,7 +16,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use super::DiskSpace;
 use super::db_lock;
 use super::{
-    Capabilities, DirEntry, Env, FileLock, FileMeta, JoinHandle, ReadFile, WriteFile, WriteMode,
+    Capabilities, DirEntry, Env, FileLock, FileMeta, JoinHandle, ReadDir, ReadFile, WriteFile,
+    WriteMode,
 };
 
 /// Whether this target has a real directory fsync.
@@ -54,17 +55,21 @@ impl Env for StdEnv {
         std::fs::create_dir_all(path)
     }
 
-    fn read_dir(&self, path: &Path) -> io::Result<Vec<DirEntry>> {
-        let mut out = Vec::new();
-        for entry in std::fs::read_dir(path)? {
+    fn read_dir(&self, path: &Path) -> io::Result<ReadDir<'_>> {
+        // `std::fs::ReadDir` is `readdir` itself: one kernel buffer of
+        // entries at a time, refilled as the walk goes.
+        Ok(Box::new(std::fs::read_dir(path)?.map(|entry| {
             let entry = entry?;
+            // An entry whose type cannot be read (it went between the
+            // listing and the `lstat` a filesystem without `d_type` needs)
+            // is reported as a file: every caller skips what it cannot
+            // parse, and one that acts on it meets the same error there.
             let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
-            out.push(DirEntry {
+            Ok(DirEntry {
                 path: entry.path(),
                 is_dir,
-            });
-        }
-        Ok(out)
+            })
+        })))
     }
 
     fn open_read(&self, path: &Path) -> io::Result<Box<dyn ReadFile>> {
@@ -536,13 +541,49 @@ mod tests {
         env.create_dir_all(&dir.path().join("sub")).unwrap();
         env.write(&dir.path().join("file"), b"x").unwrap();
 
-        let mut entries = env.read_dir(dir.path()).unwrap();
+        let mut entries: Vec<_> = env
+            .read_dir(dir.path())
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
         entries.sort_by(|a, b| a.path.cmp(&b.path));
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].file_name(), "file");
         assert!(!entries[0].is_dir);
         assert_eq!(entries[1].file_name(), "sub");
         assert!(entries[1].is_dir);
+    }
+
+    /// A directory of many `readdir` buffers is walked whole, each entry
+    /// once, while the walker removes every entry it was handed.
+    #[test]
+    fn a_large_walk_yields_each_entry_once_while_the_walker_removes_them() {
+        const FILES: usize = 5_000;
+        let dir = TempDir::new().unwrap();
+        let env = std_env();
+        for i in 0..FILES {
+            env.write(&dir.path().join(format!("{i:06}.sst")), b"x")
+                .unwrap();
+        }
+        let mut seen = std::collections::HashSet::new();
+        for entry in env.read_dir(dir.path()).unwrap() {
+            let entry = entry.unwrap();
+            assert!(!entry.is_dir);
+            assert!(seen.insert(entry.path.clone()), "{:?} twice", entry.path);
+            env.remove_file(&entry.path).unwrap();
+        }
+        assert_eq!(seen.len(), FILES);
+        assert_eq!(env.read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn a_walk_of_a_missing_directory_is_not_found() {
+        let dir = TempDir::new().unwrap();
+        let err = std_env()
+            .read_dir(&dir.path().join("missing"))
+            .map(|_| ())
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
     }
 
     #[test]
