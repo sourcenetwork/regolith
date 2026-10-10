@@ -302,6 +302,11 @@ impl ReadViewCell {
     }
 }
 
+/// Whether a [`ViewGuard`] is live on this thread.
+fn holds_view() -> bool {
+    HELD.with(|held| held.get().0 != 0)
+}
+
 /// Hand the views this thread retired to the reclaimer, padded so kovan
 /// places them at once (see `engine::reclaim`).
 ///
@@ -310,11 +315,6 @@ impl ReadViewCell {
 /// own reservation, which a thread that publishes and then idles would
 /// never release; the release is therefore owed, and paid by a flush the
 /// moment the last guard is dropped. Wait-free either way.
-/// Whether a [`ViewGuard`] is live on this thread.
-fn holds_view() -> bool {
-    HELD.with(|held| held.get().0 != 0)
-}
-
 pub(crate) fn quiesce() {
     super::reclaim::submit();
     HELD.with(|held| {
