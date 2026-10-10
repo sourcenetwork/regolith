@@ -469,7 +469,7 @@ fn a_hard_open_file_limit_reads_sealed_tables_and_an_ingest_at_its_sequence() {
         db.close().unwrap();
     }
     let expected = |i: u64| -> Vec<u8> {
-        if i % 10 == 0 {
+        if i.is_multiple_of(10) {
             b"ingested".to_vec()
         } else {
             format!("t{}", i / 50).into_bytes()
