@@ -155,9 +155,9 @@ async fn mirror_mode_refuses_immediate_durability() {
         .env(std::sync::Arc::new(env.clone()))
         .durability(regolith::DurabilityMode::Immediate)
         .max_background_compactions(0);
-    let error = Db::open("/regolith-test-main-durability", options)
-        .err()
-        .expect("Immediate durability must be refused on a non-durable env");
+    let Err(error) = Db::open("/regolith-test-main-durability", options) else {
+        panic!("Immediate durability must be refused on a non-durable env");
+    };
     let text = error.to_string();
     assert!(
         text.contains("durable_sync"),
@@ -189,7 +189,7 @@ async fn a_batch_of_new_tables_a_manifest_and_deletions_reopens() {
             db.flush().expect("flush");
         }
         env.persist().await.expect("persist the flushed tables");
-        db.compact_range(None, None).expect("compact");
+        db.compact_range(None, None).wait().expect("compact");
         db.put(b"after", b"compaction").expect("put");
         db.flush().expect("flush");
         db.close().expect("close");
