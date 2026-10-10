@@ -19,10 +19,11 @@
 \*     (seal_active, and drain_memtables's seal), under the pipeline mutex;
 \*   - a flush, by the compaction worker, by a writer after its commit, or
 \*     by a writer inside its stall step (Flusher::flush_oldest), takes the
-\*     oldest frozen memtable, installs its table (a version publish), then
-\*     retires the memtable from the frozen list (a memtable publish). The
-\*     three flush paths share the `flushing` exclusion, so one flush runs
-\*     at a time, and it is not under the pipeline mutex;
+\*     oldest frozen memtable, writes its table, and installs the table and
+\*     retires the memtable in ONE version publish
+\*     (VersionGuard::retire_with_version). The three flush paths share the
+\*     `flushing` exclusion, so one flush runs at a time, and it is not
+\*     under the pipeline mutex;
 \*   - a compaction installs its output, and an ingest installs its table
 \*     (version publishes, under the version-set mutex, which every version
 \*     publish holds while it publishes: VersionGuard::drop).
@@ -44,8 +45,16 @@
 \* (active 2, frozen [], tables {1}): memtable 3, where writers have been
 \* appending, is in no view at all, and every write in it is lost.
 \*
+\* A flush that published its table first and retired its memtable in a
+\* second publication left a view between the two that held both: every
+\* entry twice, at the same sequence. A read collects a key's merge operands
+\* from every source, so it applied each operand twice ("ab" read as "abab").
+\* That is why the two are one publication.
+\*
 \* What this model checks cannot happen:
 \*   - a memtable's data is in no published place (NoLostMemtable);
+\*   - a memtable's data is in two published places at once, the memtable
+\*     and its table (NoDoubleSource);
 \*   - an ingested table is not in the published version (NoLostIngest);
 \*   - a memtable a flush retired comes back (RetiredStayGone), which would
 \*     flush it twice and install an old table over a newer one;
@@ -60,7 +69,8 @@
 \*   sPhase...  the rotation's progress inside ReadViewCell::publish: idle,
 \*              or built (it loaded sBase and built sNext)
 \*   fPhase...  the flush's progress: idle, picked (it took the oldest
-\*              frozen memtable fTarget), installBuilt, installed,
+\*              frozen memtable fTarget), installBuilt, and, only with the
+\*              split publication of the RED cases, installed and
 \*              retireBuilt
 \*   cPhase...  the compaction or ingest's progress: idle, built, or
 \*              retry (its swap lost and it builds again)
@@ -77,9 +87,14 @@
 \* CONFIGURATIONS (each GREEN must pass, each RED must break the one
 \* invariant it names):
 \*   MC_ReadViewPublishers_Green              every publisher swaps by CAS.
-\*   MC_ReadViewPublishers_Red_PlainRetire    a flush's retire stores its
-\*                                            view without the CAS: a seal
-\*                                            racing it is lost,
+\*   MC_ReadViewPublishers_Red_SplitRetire    a flush publishes its table,
+\*                                            then retires its memtable in a
+\*                                            second publication: the view
+\*                                            between holds both,
+\*                                            NoDoubleSource breaks.
+\*   MC_ReadViewPublishers_Red_PlainRetire    the split publication, with
+\*                                            the retire stored without the
+\*                                            CAS: a seal racing it is lost,
 \*                                            NoLostMemtable breaks.
 \*   MC_ReadViewPublishers_Red_PlainVersion   a compaction's or an ingest's
 \*                                            version publish stores without
@@ -104,7 +119,10 @@ CONSTANTS
   Mode
 
 \* The bug names this model knows.
-ASSUME Mode \in {"Green", "PlainRetire", "PlainVersion"}
+ASSUME Mode \in {"Green", "SplitRetire", "PlainRetire", "PlainVersion"}
+
+\* The bugs whose flush publishes its table and retires its memtable apart.
+Split == Mode \in {"SplitRetire", "PlainRetire"}
 
 \* The table id ingest n installs: well apart from memtable ids.
 IngestTable(n) == 100 + n
@@ -223,7 +241,9 @@ FlushPick ==
 
 \* The flush installs its table: under the version-set mutex, it builds a
 \* view whose version holds the new table (VersionSet::apply of AddFile,
-\* then VersionGuard::drop's publication).
+\* then VersionGuard::drop's publication), and whose frozen list no longer
+\* holds the memtable (retire_with_version). The split bugs leave the
+\* memtable frozen for a retire of its own.
 FlushInstallBuild ==
   \* The table is written, and the mutex is free or already the flush's.
   /\ fPhase = "picked"
@@ -232,7 +252,12 @@ FlushInstallBuild ==
   /\ vOwner' = "flush"
   \* It built from the view published now, adding its table.
   /\ fBase' = pub
-  /\ fNext' = [pub EXCEPT !.tables = pub.tables \cup {fTarget}]
+  /\ fNext' = IF Split
+               \* The split bugs: the table only.
+               THEN [pub EXCEPT !.tables = pub.tables \cup {fTarget}]
+               \* The real code: the table, and the memtable gone, together.
+               ELSE [pub EXCEPT !.tables = pub.tables \cup {fTarget},
+                                !.frozen = Without(pub.frozen, fTarget)]
   /\ fPhase' = "installBuilt"
   \* Nothing else changes.
   /\ UNCHANGED <<pub, nextMt, ingested, compacted, sPhase, sBase, sNext, fTarget,
@@ -247,17 +272,24 @@ FlushInstallSwap ==
   /\ IF Swaps(fBase, Mode = "PlainVersion")
      \* In: the version with the table is published; the mutex is free.
      THEN /\ pub' = fNext
-          /\ fPhase' = "installed"
           /\ vOwner' = "none"
+          \* The real code retired the memtable in it: the flush is done.
+          \* The split bugs still owe the retire.
+          /\ IF Split
+             THEN /\ fPhase' = "installed"
+                  /\ UNCHANGED retired
+             ELSE /\ fPhase' = "idle"
+                  /\ retired' = retired \cup {fTarget}
      \* Out: back to build, the mutex still its own.
      ELSE /\ fPhase' = "picked"
-          /\ UNCHANGED <<pub, vOwner>>
+          /\ UNCHANGED <<pub, vOwner, retired>>
   \* Nothing else changes.
   /\ UNCHANGED <<nextMt, ingested, compacted, sPhase, sBase, sNext, fTarget, fBase, fNext,
-                 cPhase, cIngest, cBase, cNext, retired>>
+                 cPhase, cIngest, cBase, cNext>>
 
-\* The flush retires its memtable: it builds a view whose frozen list lacks
-\* it, by identity (retire_memtable's closure).
+\* The split bugs only: the flush retires its memtable in a publication of
+\* its own, building a view whose frozen list lacks it, by identity
+\* (retire_memtable's closure). The real code never reaches this step.
 FlushRetireBuild ==
   \* The table is installed.
   /\ fPhase = "installed"
@@ -390,6 +422,17 @@ NoLostMemtable ==
 NoLostIngest ==
   \* Every ingest so far has its table in the version.
   \A n \in 1..ingested : IngestTable(n) \in pub.tables
+
+\* A memtable's data is never in two published places at once: a frozen
+\* memtable's table is not in the version. Rules out the split flush: its
+\* view between the two publications held memtable 1 frozen and table 1
+\* installed, and a read applied each of memtable 1's merge operands twice.
+\* Lean: flush_keeps_sources_disjoint.
+NoDoubleSource ==
+  \* No frozen memtable ...
+  \A m \in Range(pub.frozen) :
+    \* ... has its table installed.
+    m \notin pub.tables
 
 \* A memtable a flush retired never comes back. Rules out a stale view
 \* republishing a frozen list that still names it: the next flush would

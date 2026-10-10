@@ -45,6 +45,14 @@ the newer view instead.
 6. The RED cases, as counterexamples: a retire stored without the CAS loses
    a racing seal (`plain_retire_loses_a_seal`), and so does a compaction's
    version publish stored without it (`plain_version_loses_a_seal`).
+7. One publication per flush: the code installs a flushed memtable's table
+   and retires the memtable in one view (`flushView`). Every such run is a
+   run of the steps above (`real_reach_reach`), so items 2 to 5 hold for
+   it, and in it no view ever holds a memtable and its table at once
+   (`flush_keeps_sources_disjoint`, TLA+ `NoDoubleSource`). Publishing the
+   two apart leaves a view that holds both
+   (`split_install_holds_a_memtable_twice`), in which a read applied each
+   of the memtable's merge operands twice.
 
 ## How to read the Lean
 
@@ -450,7 +458,130 @@ theorem frozen_sorted {w : World} (h : Reach w) :
   -- One of the facts every reachable world keeps.
   (inv_reach h).frozen_sorted
 
-/-! ## Part 4. The RED cases -/
+/-! ## Part 4. One publication per flush
+
+The steps of Part 2 publish a flush's install and its retire apart, and
+the facts hold for every interleaving of them. The code publishes the two
+together (`VersionGuard::retire_with_version`): here that is one step, and
+no view it makes holds a memtable and its table at once. -/
+
+/-- A flush as the code publishes it: the table installed and the memtable
+retired, in one view. -/
+def flushView (m : Nat) (v : View) : View :=
+  -- Install, then retire, applied to the same view, published once.
+  retire m (install m v)
+
+/-- The publications as the code makes them. -/
+inductive RealStep : World → World → Prop
+  /-- A rotation, as in Part 2. -/
+  | rotate (w : World) :
+      -- The view sealed, and one more memtable exists.
+      RealStep w { w with view := rotate (w.made + 1) w.view, made := w.made + 1 }
+  /-- A flush of frozen memtable `m`: one publication. -/
+  | flush (w : World) (m : Nat) (h : m ∈ w.view.frozen) :
+      -- The table in, the memtable out, and `m` noted as retired.
+      RealStep w { w with view := flushView m w.view, retired := m :: w.retired }
+  /-- An ingest, as in Part 2. -/
+  | ingest (w : World) (t : Nat) :
+      -- The version holds `t`, and it is noted as ingested.
+      RealStep w { w with view := ingest t w.view, ingested := t :: w.ingested }
+  /-- A compaction, as in Part 2. -/
+  | compact (w : World) :
+      -- The places data lives in are the same.
+      RealStep w { w with view := compact w.view }
+
+/-- The worlds the code's publications reach from the start. -/
+inductive RealReach : World → Prop
+  /-- The start is reachable. -/
+  | init : RealReach init
+  /-- One publication from a reachable world reaches another. -/
+  | step {w u : World} : RealReach w → RealStep w u → RealReach u
+
+/-- **`real_reach_reach`.** Every world the code reaches is one the steps of
+Part 2 reach: a flush is an install followed by a retire. -/
+theorem real_reach_reach {w : World} (h : RealReach w) : Reach w := by
+  -- By how `w` was reached.
+  induction h with
+  | init => exact Reach.init
+  | step _ hst ih =>
+    -- One case per publication.
+    cases hst with
+    -- A rotation is a step of Part 2.
+    | rotate => exact Reach.step ih (Step.rotate _)
+    -- A flush: the install, then the retire, whose table is now installed.
+    | flush m hm =>
+      -- First the install.
+      have h1 := Reach.step ih (Step.install _ m hm)
+      -- Then the retire: `m`'s table is the first one in the list.
+      exact Reach.step h1 (Step.retire _ m (by simp [install]))
+    -- An ingest is a step of Part 2.
+    | ingest t => exact Reach.step ih (Step.ingest _ t)
+    -- A compaction is a step of Part 2.
+    | compact => exact Reach.step ih (Step.compact _)
+
+/-- **`flush_keeps_sources_disjoint`.** In every world the code reaches, no
+frozen memtable has its table installed: no view holds a memtable's data
+twice. Rules out a read applying a merge operand twice. -/
+theorem flush_keeps_sources_disjoint {w : World} (h : RealReach w) :
+    -- The claim itself; its proof follows.
+    ∀ m ∈ w.view.frozen, m ∉ w.view.tables := by
+  -- By how `w` was reached.
+  induction h with
+  | init =>
+    -- Nothing is frozen at the start.
+    intro m hm; simp [init] at hm
+  | step hr hst ih =>
+    -- The facts of Part 2 for the world before the step.
+    have hi := inv_reach (real_reach_reach hr)
+    -- One case per publication.
+    cases hst with
+    | rotate =>
+      -- Take a frozen memtable of the new view.
+      intro m hm
+      -- It was frozen before, or it is the old active one.
+      simp only [rotate, List.mem_append, List.mem_singleton] at hm ⊢
+      -- Split on which.
+      rcases hm with hm | hm
+      -- Frozen before: its table was not installed then, and tables are
+      -- unchanged.
+      · exact ih m hm
+      -- The old active one: every installed table is older than it.
+      · intro ht; have := hi.tables_old m ht; rw [hm, hi.active_newest] at this; omega
+    | flush f hf =>
+      -- Take a frozen memtable of the new view.
+      intro m hm
+      -- It survived the filter: it was frozen before and is not `f`.
+      simp only [flushView, retire, install, List.mem_filter, bne_iff_ne, ne_eq] at hm ⊢
+      -- Not `f`, and its table was not installed before.
+      intro ht
+      -- A member of `f :: l` is `f` or in `l`.
+      simp only [List.mem_cons] at ht
+      -- Split on which.
+      rcases ht with ht | ht
+      -- It is `f`: but the filter removed `f`.
+      · exact hm.2 ht
+      -- Installed before: but it was frozen before and not installed.
+      · exact ih m hm.1 ht
+    | ingest t =>
+      -- Ingests do not touch memtables or their tables.
+      simpa [ingest] using ih
+    | compact =>
+      -- Nothing changes.
+      simpa [compact] using ih
+
+/-- **`split_install_holds_a_memtable_twice`.** Publishing a flush's install
+without its retire (bug `SplitRetire`): memtable 1, sealed behind 2, has its
+table installed while it is still frozen. A view in that state holds its
+data twice. -/
+theorem split_install_holds_a_memtable_twice :
+    -- Memtable 1 sealed, its table not installed yet.
+    let sealed : View := ⟨2, [1], [], []⟩
+    -- After the install alone, 1 is both frozen and installed.
+    1 ∈ (install 1 sealed).frozen ∧ 1 ∈ (install 1 sealed).tables := by
+  -- Both are read off the lists.
+  simp [install]
+
+/-! ## Part 5. The RED cases -/
 
 /-- The view in the story: memtable 1 flushed and installed, 2 active. -/
 def flushed : View := ⟨2, [1], [1], []⟩
