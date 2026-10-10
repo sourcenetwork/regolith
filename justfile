@@ -564,12 +564,20 @@ tla:
     check MC_ManifestSeal_Red_TagOnlyRefuse            RED RecoveryOpens
     # 4.12, D57: a backup of an encrypted database seals its metadata, and a
     # restore checks every key before its first write; the listing names
-    # every backup, and a delete or purge removes no listed table. Lean:
+    # every backup, a page of ids at a time, and a delete or purge sweeps
+    # the pool a batch at a time, reading each listing as its walk of meta/
+    # reaches it, and removes every unlisted table and no listed one. Lean:
     # Regolith/BackupSeal.lean, entitled_restore_is_faithful,
     # refusal_writes_nothing, collect_keeps_listed, last_write_holds_all,
-    # listing_names_every_backup, purge_keeps_the_newest.
+    # listing_names_every_backup, purge_keeps_the_newest, collect_stream_eq,
+    # stream_holds_one_batch, sweep_eq, sweep_removes_every_unlisted,
+    # list_pages_all.
     spec=BackupSeal
     check MC_BackupSeal_Green                          GREEN
+    check MC_BackupSeal_Green_Stream                   GREEN
+    check MC_BackupSeal_Green_Sweep                    GREEN
+    check MC_BackupSeal_Red_StreamSkips                RED ListedRestores
+    check MC_BackupSeal_Red_SweepSkips                 RED SweepRemovesEveryUnlisted
     check MC_BackupSeal_Red_PlainMeta                  RED SealedMetadata
     check MC_BackupSeal_Red_PlainRestore               RED SealedMetadata
     check MC_BackupSeal_Red_OpenUnderCurrent           RED RightKeysRestore

@@ -1,6 +1,6 @@
 use super::*;
 use crate::env::{
-    Capabilities, DirEntry, FileLock, FileMeta, JoinHandle, MemEnv, ReadFile, WriteFile,
+    Capabilities, FileLock, FileMeta, JoinHandle, MemEnv, ReadDir, ReadFile, WriteFile,
 };
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -225,7 +225,7 @@ impl Env for RewriteFailureEnv {
         self.inner.create_dir_all(path)
     }
 
-    fn read_dir(&self, path: &Path) -> io::Result<Vec<DirEntry>> {
+    fn read_dir(&self, path: &Path) -> io::Result<ReadDir<'_>> {
         self.inner.read_dir(path)
     }
 

@@ -228,12 +228,14 @@ pub(crate) fn create_durably(
 /// Remove the staging files [`create_durably`] leaves in `wal_dir` when a
 /// crash comes before the rename: no log was ever named by one, so nothing
 /// in them is needed. Called by a read-write open, which holds the
-/// directory lock, so no creation is in progress.
+/// directory lock, so no creation is in progress. Each one is removed as
+/// the walk reaches it, so the walk holds one entry at a time.
 pub(crate) fn remove_staged(env: &dyn Env, wal_dir: &Path) -> io::Result<()> {
     if !env.exists(wal_dir) {
         return Ok(());
     }
     for entry in env.read_dir(wal_dir)? {
+        let entry = entry?;
         if entry.path.extension().is_some_and(|ext| ext == "tmp") {
             match env.remove_file(&entry.path) {
                 Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),

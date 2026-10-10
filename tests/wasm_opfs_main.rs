@@ -110,6 +110,12 @@ async fn a_database_larger_than_the_mirror_bound_is_refused_at_mount() {
         env.persist().await.expect("persist");
     }
 
+    // What the stored database occupies once loaded whole.
+    let stored = OpfsEnv::mount(name, OpfsOptions::default())
+        .await
+        .expect("mount within the bound")
+        .resident_bytes();
+
     let tiny = OpfsOptions {
         max_resident_bytes: 1024,
         ..OpfsOptions::default()
@@ -117,9 +123,11 @@ async fn a_database_larger_than_the_mirror_bound_is_refused_at_mount() {
     let error = OpfsEnv::mount(name, tiny)
         .await
         .expect_err("a database over the bound must be refused, not silently loaded");
+    // The mount stops reading once past the bound and only sums the sizes of
+    // the rest, so it reports the whole size without holding it.
     assert!(
-        matches!(error, OpfsError::ResidencyExceeded { .. }),
-        "expected ResidencyExceeded, got {error:?}"
+        matches!(error, OpfsError::ResidencyExceeded { resident, limit: 1024 } if resident == stored),
+        "expected ResidencyExceeded of {stored} bytes, got {error:?}"
     );
     assert!(
         error.to_string().contains("worker"),

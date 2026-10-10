@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
 use regolith::env::{
-    Capabilities, DirEntry, Env, FileLock, FileMeta, JoinHandle, ReadFile, StdEnv, WriteFile,
+    Capabilities, Env, FileLock, FileMeta, JoinHandle, ReadDir, ReadFile, StdEnv, WriteFile,
     WriteMode,
 };
 
@@ -169,7 +169,7 @@ impl Env for DeviceEnv {
     fn create_dir_all(&self, p: &Path) -> io::Result<()> {
         self.inner.create_dir_all(p)
     }
-    fn read_dir(&self, p: &Path) -> io::Result<Vec<DirEntry>> {
+    fn read_dir(&self, p: &Path) -> io::Result<ReadDir<'_>> {
         self.inner.read_dir(p)
     }
     fn metadata(&self, p: &Path) -> io::Result<FileMeta> {

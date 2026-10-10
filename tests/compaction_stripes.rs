@@ -505,7 +505,8 @@ fn the_background_worker_folds_above_a_live_snapshot() {
 
 /// Whether any SSTable under `dir` holds `needle`.
 fn tables_hold(env: &MemEnv, dir: &Path, needle: &[u8]) -> bool {
-    env.read_dir(dir).unwrap().into_iter().any(|entry| {
+    env.read_dir(dir).unwrap().any(|entry| {
+        let entry = entry.unwrap();
         if entry.is_dir {
             tables_hold(env, &entry.path, needle)
         } else if entry.path.extension().is_some_and(|ext| ext == "sst") {

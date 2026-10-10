@@ -44,9 +44,7 @@ fn meta_file(bkp: &Path, id: BackupId) -> PathBuf {
 fn listed(engine: &BackupEngine) -> Vec<(u64, bool)> {
     engine
         .list_backups()
-        .unwrap()
-        .iter()
-        .map(|entry| match entry {
+        .map(|item| match item.unwrap() {
             Ok(info) => (info.id.0, true),
             Err(bad) => (bad.id.0, false),
         })
@@ -57,8 +55,7 @@ fn listed(engine: &BackupEngine) -> Vec<(u64, bool)> {
 fn unreadable(engine: &BackupEngine, id: BackupId) -> UnreadableBackup {
     engine
         .list_backups()
-        .unwrap()
-        .into_iter()
+        .map(Result::unwrap)
         .find_map(|entry| entry.err().filter(|bad| bad.id == id))
         .unwrap_or_else(|| panic!("backup {id} is not listed as unreadable"))
 }
@@ -111,7 +108,7 @@ fn a_damaged_backup_is_listed_with_its_reason_and_never_left_out() {
     let (bkp, engine, ids) = backups(3);
     damage(&meta_file(bkp.path(), ids[1]));
 
-    let entries = engine.list_backups().unwrap();
+    let entries: Vec<_> = engine.list_backups().map(Result::unwrap).collect();
     assert_eq!(entries.len(), 3);
     assert_eq!(entries[0].as_ref().unwrap().id, ids[0]);
     assert_eq!(entries[2].as_ref().unwrap().id, ids[2]);
@@ -212,7 +209,10 @@ fn listing_deleting_and_purging_fail_loud_when_the_meta_directory_cannot_be_read
     assert!(!shared.is_empty());
     fs::remove_dir_all(bkp.path().join("meta")).unwrap();
 
-    assert!(matches!(engine.list_backups(), Err(Error::Io(_))));
+    assert!(matches!(
+        engine.list_backups().collect::<Result<Vec<_>>>(),
+        Err(Error::Io(_))
+    ));
     assert!(matches!(engine.purge_old_backups(0), Err(Error::Io(_))));
     assert!(matches!(engine.delete_backup(ids[0]), Err(Error::Io(_))));
     // No backup could be read, so none could be counted: nothing removed.

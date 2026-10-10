@@ -50,7 +50,7 @@ use std::time::Duration;
 
 use super::std_env::StdEnv;
 use super::{
-    Capabilities, DirEntry, Env, FileLock, FileMeta, JoinHandle, ReadFile, WriteFile, WriteMode,
+    Capabilities, Env, FileLock, FileMeta, JoinHandle, ReadDir, ReadFile, WriteFile, WriteMode,
 };
 
 /// The WASI host: `std::fs` over a preopened directory, with no
@@ -77,7 +77,7 @@ impl Env for WasiEnv {
         self.fs.create_dir_all(path)
     }
 
-    fn read_dir(&self, path: &Path) -> io::Result<Vec<DirEntry>> {
+    fn read_dir(&self, path: &Path) -> io::Result<ReadDir<'_>> {
         self.fs.read_dir(path)
     }
 

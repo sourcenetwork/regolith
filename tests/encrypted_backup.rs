@@ -318,9 +318,7 @@ fn listing_deleting_and_purging_need_no_key_and_keep_what_sealed_backups_share()
     let mut engine = BackupEngine::open(backups.path()).unwrap();
     let infos: Vec<_> = engine
         .list_backups()
-        .unwrap()
-        .into_iter()
-        .map(|entry| entry.unwrap())
+        .map(|entry| entry.unwrap().unwrap())
         .collect();
     assert_eq!(
         infos.iter().map(|i| i.id).collect::<Vec<_>>(),
@@ -339,7 +337,7 @@ fn listing_deleting_and_purging_need_no_key_and_keep_what_sealed_backups_share()
     check(&Db::open(&target, options(&keys)).unwrap(), 0, 600);
 
     engine.purge_old_backups(0).unwrap();
-    assert!(engine.list_backups().unwrap().is_empty());
+    assert_eq!(engine.list_backups().count(), 0);
     assert_eq!(shared_count(backups.path()), 0);
 }
 
@@ -371,9 +369,7 @@ fn a_backup_that_cannot_be_read_stops_a_delete_from_removing_shared_files() {
     // left out.
     let listed: Vec<_> = engine
         .list_backups()
-        .unwrap()
-        .into_iter()
-        .map(|entry| entry.map(|info| info.id).map_err(|bad| bad.id))
+        .map(|entry| entry.unwrap().map(|info| info.id).map_err(|bad| bad.id))
         .collect();
     assert_eq!(listed, [Err(second)]);
 }

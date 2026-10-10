@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use regolith::env::{
-    Capabilities, DirEntry, DiskSpace, Env, FileLock, FileMeta, JoinHandle, ReadFile, StdEnv,
+    Capabilities, DiskSpace, Env, FileLock, FileMeta, JoinHandle, ReadDir, ReadFile, StdEnv,
     WriteFile, WriteMode,
 };
 use regolith::{Db, IoBudget, Options, Statistics, Ticker};
@@ -34,7 +34,7 @@ impl Env for CountsDiskChecks {
     fn create_dir_all(&self, p: &Path) -> io::Result<()> {
         self.inner.create_dir_all(p)
     }
-    fn read_dir(&self, p: &Path) -> io::Result<Vec<DirEntry>> {
+    fn read_dir(&self, p: &Path) -> io::Result<ReadDir<'_>> {
         self.inner.read_dir(p)
     }
     fn metadata(&self, p: &Path) -> io::Result<FileMeta> {

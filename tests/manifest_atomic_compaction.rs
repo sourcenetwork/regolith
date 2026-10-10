@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use regolith::env::{
-    Capabilities, DirEntry, Env, FileLock, FileMeta, JoinHandle, MemEnv, ReadFile, WriteFile,
+    Capabilities, Env, FileLock, FileMeta, JoinHandle, MemEnv, ReadDir, ReadFile, WriteFile,
     WriteMode,
 };
 use regolith::{CompactionStyle, Db, DurabilityMode, Options, UniversalCompactionOptions};
@@ -27,6 +27,7 @@ struct CrashImage {
 
 fn collect_files(env: &MemEnv, dir: &Path, files: &mut Vec<(PathBuf, Vec<u8>)>) {
     for entry in env.read_dir(dir).unwrap() {
+        let entry = entry.unwrap();
         if entry.is_dir {
             collect_files(env, &entry.path, files);
         } else {
@@ -95,7 +96,7 @@ impl Env for CaptureEnv {
         self.inner.create_dir_all(path)
     }
 
-    fn read_dir(&self, path: &Path) -> io::Result<Vec<DirEntry>> {
+    fn read_dir(&self, path: &Path) -> io::Result<ReadDir<'_>> {
         self.inner.read_dir(path)
     }
 

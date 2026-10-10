@@ -2,6 +2,7 @@ use std::fs;
 
 use super::*;
 use crate::Options;
+use crate::env::walk_fault::WalkFault;
 use tempfile::TempDir;
 
 pub(super) fn tiny_flush_opts() -> Options {
@@ -59,13 +60,11 @@ pub(super) fn shared_file_paths(dir: &Path) -> Vec<PathBuf> {
     paths
 }
 
-/// Every backup the engine lists, each one asserted readable.
+/// Every backup the engine lists, in order, each one asserted readable.
 pub(super) fn readable(engine: &BackupEngine) -> Vec<BackupInfo> {
     engine
         .list_backups()
-        .unwrap()
-        .into_iter()
-        .map(|entry| entry.unwrap())
+        .map(|entry| entry.unwrap().unwrap())
         .collect()
 }
 
@@ -251,7 +250,7 @@ fn delete_only_backup_removes_all_shared() {
 
     engine.delete_backup(id).unwrap();
     assert_eq!(shared_count(bkp_dir.path()), 0);
-    assert!(engine.list_backups().unwrap().is_empty());
+    assert_eq!(engine.list_backups().count(), 0);
 }
 
 #[test]
@@ -298,4 +297,143 @@ fn restore_independent_of_source() {
     engine.restore(id, tgt_dir.path(), None).unwrap();
     let reopened = Db::open(tgt_dir.path(), Options::default()).unwrap();
     assert_has(&reopened, "ind", 250);
+}
+
+/// A database and a backup repository on one [`WalkFault`] env: backup 1
+/// holds the tables of the first writes, backup 2 those of more writes,
+/// and backups 3 to `copies + 2` are copies of backup 1's plaintext
+/// metadata (which binds no id), so `meta/` has many entries cheaply and
+/// every table backup 1 lists is listed again by each copy.
+fn walk_fault_repository(copies: u64) -> (Arc<WalkFault>, BackupEngine) {
+    let env = Arc::new(WalkFault::default());
+    let db = Db::open("/db", fault_options(&env)).unwrap();
+    populate(&db, "a", 200);
+    db.flush().unwrap();
+    let mut engine = BackupEngine::open_with_env("/bk", env.clone()).unwrap();
+    assert_eq!(engine.create_backup(&db).unwrap(), BackupId(1));
+    populate(&db, "z", 200);
+    db.flush().unwrap();
+    assert_eq!(engine.create_backup(&db).unwrap(), BackupId(2));
+    let first = env.read(Path::new("/bk/meta/000001.backup")).unwrap();
+    for id in 3..copies + 3 {
+        env.write(
+            &Path::new("/bk/meta").join(backup_filename(BackupId(id))),
+            &first,
+        )
+        .unwrap();
+    }
+    (env, engine)
+}
+
+fn fault_options(env: &Arc<WalkFault>) -> Options {
+    tiny_flush_opts()
+        .env(env.clone())
+        .max_background_compactions(0)
+}
+
+/// Every shared file in the repository on `env`, sorted.
+fn shared_on(env: &WalkFault) -> Vec<PathBuf> {
+    let mut paths: Vec<PathBuf> = env
+        .read_dir(Path::new("/bk/shared"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path)
+        .collect();
+    paths.sort();
+    paths
+}
+
+/// The collection must see every remaining listing before it removes a
+/// file. A walk of `meta/` that breaks part way fails the delete, and no
+/// shared file goes: a collection that took the break at the first entry
+/// for the end of the walk would remove every table backup 1's copies
+/// still list.
+#[test]
+fn a_collection_whose_walk_of_meta_breaks_removes_nothing() {
+    let (env, mut engine) = walk_fault_repository(20);
+    let before = shared_on(&env);
+    assert!(!before.is_empty());
+    let first = env.read(Path::new("/bk/meta/000001.backup")).unwrap();
+    for after in [0, 1, 7] {
+        env.arm(Path::new("/bk/meta"), after);
+        let err = engine.delete_backup(BackupId(1)).unwrap_err();
+        assert!(err.to_string().contains("the walk broke"), "{err}");
+        assert_eq!(shared_on(&env), before, "a file went after {after} entries");
+        // The metadata went before the collection; put it back for the
+        // next cut.
+        env.write(Path::new("/bk/meta/000001.backup"), &first)
+            .unwrap();
+    }
+    env.arm(Path::new("/nowhere"), 0);
+    for id in 1..23 {
+        let target = PathBuf::from(format!("/restored-{id}"));
+        engine.restore(BackupId(id), &target, None).unwrap();
+    }
+    for id in [1, 2, 3, 22] {
+        let restored = Db::open(format!("/restored-{id}"), fault_options(&env)).unwrap();
+        assert_has(&restored, "a", 200);
+        if id == 2 {
+            assert_has(&restored, "z", 200);
+        }
+    }
+    // Whole again, the walk lets the delete finish, and the copies keep
+    // every table backup 1 listed.
+    engine.delete_backup(BackupId(1)).unwrap();
+    assert_eq!(shared_on(&env), before);
+}
+
+/// The purge keeps the newest `keep` whatever `keep` is, through the window
+/// that deletes a backup once `keep` newer ones followed it.
+#[test]
+fn purge_keeps_exactly_the_newest_for_every_window() {
+    for (keep, left) in [
+        (100, (1..=6).collect::<Vec<u64>>()),
+        (6, (1..=6).collect()),
+        (5, (2..=6).collect()),
+        (2, vec![5, 6]),
+        (0, vec![]),
+    ] {
+        let (_env, mut engine) = walk_fault_repository(4);
+        engine.purge_old_backups(keep).unwrap();
+        let ids: Vec<u64> = readable(&engine).iter().map(|b| b.id.0).collect();
+        assert_eq!(ids, left, "keep {keep}");
+    }
+}
+
+/// A listing whose walk breaks part way is reported, never a short list,
+/// and a purge over it deletes nothing.
+#[test]
+fn a_listing_whose_walk_breaks_says_so() {
+    let (env, mut engine) = walk_fault_repository(4);
+    env.arm(Path::new("/bk/meta"), 3);
+    let items: Vec<_> = engine.list_backups().collect();
+    assert_eq!(items.len(), 1, "{items:?}");
+    assert!(items[0].is_err());
+    assert!(engine.purge_old_backups(0).is_err());
+    env.arm(Path::new("/nowhere"), 0);
+    assert_eq!(readable(&engine).len(), 6);
+}
+
+/// The sweep hands `shared/` out in batches: more unlisted tables than two
+/// batches hold, mixed in the walk with the tables backups 1 and 2 list,
+/// all go, and every listed one stays, wherever a batch boundary falls.
+#[test]
+fn a_sweep_across_batches_removes_every_unlisted_table_and_no_listed_one() {
+    let (env, mut engine) = walk_fault_repository(0);
+    let listed = shared_on(&env);
+    assert!(!listed.is_empty());
+    for k in 0..(collect::SWEEP as u128 * 2 + 1) {
+        env.write(
+            &Path::new("/bk/shared").join(shared_filename(0xF000_0000 + k)),
+            b"x",
+        )
+        .unwrap();
+    }
+    engine.delete_backup(BackupId(99)).unwrap();
+    assert_eq!(shared_on(&env), listed);
+    for id in [1, 2] {
+        let target = PathBuf::from(format!("/restored-{id}"));
+        engine.restore(BackupId(id), &target, None).unwrap();
+        let restored = Db::open(&target, fault_options(&env)).unwrap();
+        assert_has(&restored, "a", 200);
+    }
 }
