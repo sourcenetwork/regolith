@@ -23,7 +23,6 @@
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
 
 use kovan_map::HashMap;
 
@@ -301,8 +300,6 @@ impl Env for MemEnv {
             "MemEnv does not start threads; see Capabilities::threads",
         ))
     }
-
-    fn sleep(&self, _dur: Duration) {}
 }
 
 struct MemReadFile {

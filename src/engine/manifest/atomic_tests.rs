@@ -3,7 +3,6 @@ use crate::env::{
     Capabilities, DirEntry, FileLock, FileMeta, JoinHandle, MemEnv, ReadFile, WriteFile,
 };
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
 
 fn legacy_manifest() -> Vec<u8> {
     // Spell out the original format so the fixture cannot change with
@@ -287,10 +286,6 @@ impl Env for RewriteFailureEnv {
         body: Box<dyn FnOnce() + Send + 'static>,
     ) -> io::Result<Box<dyn JoinHandle>> {
         self.inner.spawn(name, body)
-    }
-
-    fn sleep(&self, dur: Duration) {
-        self.inner.sleep(dur)
     }
 }
 

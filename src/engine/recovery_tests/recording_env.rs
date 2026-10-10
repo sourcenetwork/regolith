@@ -149,7 +149,4 @@ impl Env for RecordingEnv {
     ) -> io::Result<Box<dyn JoinHandle>> {
         self.inner.spawn(name, body)
     }
-    fn sleep(&self, duration: std::time::Duration) {
-        self.inner.sleep(duration)
-    }
 }

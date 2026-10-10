@@ -20,6 +20,13 @@
 //! - **No unit outlives close**: a miss that started before close puts its
 //!   unit in the table while close sweeps it; the unit is released by the
 //!   sweep or by the miss itself.
+//! - **A group's sync runs once**: three member threads race the job a
+//!   commit group's fsync is; one claim wins and the sync runs once.
+//! - **Exactly one completion per member queue**: member queues register on
+//!   the group's job while another member runs it; each that registered is
+//!   pushed one completion.
+//! - **A ticket's callback runs exactly once**: `on_complete` races the
+//!   delivery of the outcome; the callback runs once, with the outcome.
 //!
 //! Each is paired with a calibration that writes the one step the wrong way
 //! and must fail; without them a search that never reached the bad
@@ -27,7 +34,7 @@
 
 #![cfg(loom)]
 
-use regolith::loom_exports::io_queue;
+use regolith::loom_exports::{io_queue, jobs};
 
 #[test]
 fn a_unit_is_claimed_once_and_runs_once() {
@@ -92,4 +99,31 @@ fn no_unit_outlives_close() {
 #[should_panic(expected = "a unit outlived close")]
 fn calibration_a_miss_checked_only_when_it_starts_outlives_close() {
     io_queue::calibration_a_miss_checked_only_when_it_starts_outlives_close();
+}
+
+#[test]
+fn a_job_is_claimed_once_and_runs_once() {
+    jobs::a_job_is_claimed_once_and_runs_once();
+}
+
+#[test]
+fn every_member_queue_gets_one_completion() {
+    jobs::every_member_queue_gets_one_completion();
+}
+
+#[test]
+fn a_ticket_callback_runs_exactly_once() {
+    jobs::a_ticket_callback_runs_exactly_once();
+}
+
+#[test]
+#[should_panic(expected = "the group synced twice")]
+fn calibration_a_job_claimed_without_a_cas_runs_twice() {
+    jobs::calibration_a_job_claimed_without_a_cas_runs_twice();
+}
+
+#[test]
+#[should_panic(expected = "the callback was lost")]
+fn calibration_a_callback_pushed_after_the_take_is_lost() {
+    jobs::calibration_a_callback_pushed_after_the_take_is_lost();
 }

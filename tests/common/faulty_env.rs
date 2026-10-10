@@ -12,7 +12,6 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::time::Duration;
 
 use regolith::env::{
     Capabilities, DirEntry, Env, FileLock, FileMeta, JoinHandle, ReadFile, StdEnv, WriteFile,
@@ -139,8 +138,5 @@ impl Env for FaultyEnv {
         body: Box<dyn FnOnce() + Send + 'static>,
     ) -> io::Result<Box<dyn JoinHandle>> {
         self.inner.spawn(name, body)
-    }
-    fn sleep(&self, dur: Duration) {
-        self.inner.sleep(dur)
     }
 }

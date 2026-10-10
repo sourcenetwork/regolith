@@ -78,6 +78,59 @@ fn a_dropped_queue_leaves_no_unit_behind() {
     assert_eq!(watcher.runtime().units_in_flight(), 0);
 }
 
+/// A job a queue owns is listed until it lands, run or settled: the step a
+/// write leaves owing is on the table until the queue's owner polls.
+#[test]
+fn a_job_a_queue_owns_is_listed_until_it_lands() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = Db::open(
+        dir.path(),
+        Options::default()
+            .max_background_compactions(0)
+            .write_buffer_size(4 * 1024),
+    )
+    .unwrap();
+    let mut queue = db.io_queue();
+    let runtime = queue.runtime();
+    let mut seen = false;
+    for i in 0..64u32 {
+        db.put(&key(i), &[7u8; 512]).unwrap();
+        seen |= runtime.jobs_in_flight() == 1;
+    }
+    assert!(
+        seen,
+        "a write that sealed a memtable left its flush on the queue"
+    );
+    assert!(
+        runtime.jobs_in_flight() <= 1,
+        "one owed job waits at a time"
+    );
+    while queue.poll(IoBudget::ALL).more_pending {}
+    assert_eq!(queue.runtime().jobs_in_flight(), 0);
+}
+
+/// Close settles every job a queue owns before that queue polls again: the
+/// job leaves the table at close, unrun, and the poll after it only delivers
+/// the `Closed` the close decided.
+#[test]
+fn close_settles_a_job_a_queue_owns_before_its_poll() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = Db::open(dir.path(), Options::default().max_background_compactions(0)).unwrap();
+    db.put(b"a", b"1").unwrap();
+    db.flush().unwrap();
+    db.put(b"b", b"2").unwrap();
+    db.flush().unwrap();
+    let mut queue = db.io_queue();
+    let runtime = queue.runtime();
+    let job = db.compact_range(None, None);
+    assert_eq!(runtime.jobs_in_flight(), 1, "the job waits for the poll");
+    db.close().unwrap();
+    assert_eq!(runtime.jobs_in_flight(), 0, "close settled it");
+    assert!(!job.is_ready(), "the poll delivers it");
+    queue.poll(IoBudget::ALL);
+    assert!(matches!(job.wait(), Err(Error::Closed)));
+}
+
 /// A read that checked the database open before close and misses after it,
 /// the window the close gate shuts, answers `Closed` and leaves no unit; a
 /// close that failed reopens the table to misses.

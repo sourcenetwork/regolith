@@ -270,7 +270,7 @@ proptest! {
                 }
                 Action::Commit(slot) => finish(&mut open[*slot], &mut writers)?,
                 Action::Flush => db.db().flush().unwrap(),
-                Action::Compact => db.db().compact_range(None, None).unwrap(),
+                Action::Compact => db.db().compact_range(None, None).wait().unwrap(),
             }
         }
         for slot in &mut open {

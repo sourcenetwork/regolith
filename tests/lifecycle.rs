@@ -120,9 +120,9 @@ fn sweep_every_mutation(db: &Db, scratch: &Path, expect: fn(&str, regolith::Resu
         "write_with_durability",
         db.write_with_durability(batch(), sync),
     );
-    expect("compact_range", db.compact_range(None, None));
+    expect("compact_range", db.compact_range(None, None).wait());
     expect("drop_all", db.drop_all());
-    expect("checkpoint", db.checkpoint(scratch.join("cp")));
+    expect("checkpoint", db.checkpoint(scratch.join("cp")).wait());
     expect(
         "create_column_family",
         db.create_column_family("late").map(drop),
@@ -133,7 +133,7 @@ fn sweep_every_mutation(db: &Db, scratch: &Path, expect: fn(&str, regolith::Resu
     expect("merge_cf", db.merge_cf(&cf, b"k", b"op"));
     expect("delete_range_cf", db.delete_range_cf(&cf, &key(0), &key(9)));
     let ingest = db.ingest_external_files(&[], IngestOptions::default());
-    expect("ingest_external_files", ingest);
+    expect("ingest_external_files", ingest.wait());
 }
 
 // ---- open, close, reopen ----
@@ -497,7 +497,7 @@ fn drop_all_empties_the_database_and_the_emptiness_survives_a_reopen() {
     let dir = TempDir::new().unwrap();
     let db = Db::open(dir.path(), opts()).unwrap();
     write_range(&db, 0, 500);
-    db.compact_range(None, None).unwrap();
+    db.compact_range(None, None).wait().unwrap();
 
     db.drop_all().unwrap();
     assert!(
@@ -538,7 +538,7 @@ fn repeated_drop_all_cycles_leave_no_sstables_and_exactly_one_wal() {
 
     for round in 0..10 {
         write_range(&db, 0, 500);
-        db.compact_range(None, None).unwrap();
+        db.compact_range(None, None).wait().unwrap();
         assert!(
             common::count_sst_files(dir.path()) > 0,
             "round {round}: nothing was written, so drop_all would have nothing to reclaim"
@@ -688,7 +688,7 @@ fn opening_a_directory_with_unrelated_files_leaves_them_untouched() {
 
     let db = Db::open(dir.path(), opts()).unwrap();
     write_range(&db, 0, 500);
-    db.compact_range(None, None).unwrap();
+    db.compact_range(None, None).wait().unwrap();
     db.drop_all().unwrap();
     write_range(&db, 0, 100);
     db.close().unwrap();
@@ -748,7 +748,7 @@ fn an_sstable_from_an_unknown_format_version_is_rejected_with_a_clear_error() {
     let dir = TempDir::new().unwrap();
     let db = Db::open(dir.path(), opts()).unwrap();
     write_range(&db, 0, 500);
-    db.compact_range(None, None).unwrap();
+    db.compact_range(None, None).wait().unwrap();
     db.close().unwrap();
     drop(db);
 
@@ -806,7 +806,7 @@ fn ingesting_an_sstable_from_an_unknown_format_version_changes_nothing() {
     let dir = TempDir::new().unwrap();
     let db = Db::open(dir.path(), opts()).unwrap();
     write_range(&db, 0, 200);
-    db.compact_range(None, None).unwrap();
+    db.compact_range(None, None).wait().unwrap();
 
     let build = |path: &Path| {
         let mut writer = SstFileWriter::create(path, &Options::default()).unwrap();
@@ -820,6 +820,7 @@ fn ingesting_an_sstable_from_an_unknown_format_version_changes_nothing() {
     let clean = dir.path().join("clean.sst");
     build(&clean);
     db.ingest_external_files(&[clean], IngestOptions::default())
+        .wait()
         .unwrap();
     for i in 5000..5100 {
         assert_eq!(db.get(&key(i)).unwrap(), Some(value(i)), "ingested key {i}");
@@ -835,6 +836,7 @@ fn ingesting_an_sstable_from_an_unknown_format_version_changes_nothing() {
 
     let err = db
         .ingest_external_files(&[future], IngestOptions::default())
+        .wait()
         .unwrap_err();
     assert!(
         err.to_string().contains("magic"),

@@ -145,9 +145,6 @@ impl Env for Counted {
     ) -> io::Result<Box<dyn JoinHandle>> {
         self.inner.spawn(name, body)
     }
-    fn sleep(&self, dur: Duration) {
-        self.inner.sleep(dur)
-    }
 }
 
 /// Every name in `dir`, sorted.

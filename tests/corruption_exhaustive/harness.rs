@@ -212,7 +212,10 @@ pub fn table_fixture() -> &'static Fixture {
             handle.put(k.as_bytes(), v.as_bytes()).expect("fixture put");
             history.put(k.into_bytes(), v.into_bytes());
         }
-        handle.compact_range(None, None).expect("fixture compact");
+        handle
+            .compact_range(None, None)
+            .wait()
+            .expect("fixture compact");
         handle.close().expect("fixture close");
         drop(handle);
         let files = capture(&db);

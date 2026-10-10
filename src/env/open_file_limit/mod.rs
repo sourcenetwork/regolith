@@ -40,7 +40,6 @@ mod tests;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
 
 use kovan::Atom;
 use kovan_map::HashMap;
@@ -504,9 +503,6 @@ impl Env for OpenFileLimit {
         body: Box<dyn FnOnce() + Send + 'static>,
     ) -> io::Result<Box<dyn JoinHandle>> {
         self.shared.inner.spawn(name, body)
-    }
-    fn sleep(&self, dur: Duration) {
-        self.shared.inner.sleep(dur)
     }
     fn drop_page_cache(&self, path: &Path) {
         self.shared.inner.drop_page_cache(path)

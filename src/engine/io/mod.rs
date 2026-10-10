@@ -41,10 +41,22 @@
 //!   queue waiting on one has its completion (`NonBlocking.tla`, Release;
 //!   the loom model `no_unit_outlives_close`).
 //!
-//! `scope` carries a handle's mode to the device seam; `crate::IoQueue` is
-//! the owner's side.
+//! - **Jobs.** I/O that is not a block read is a *job* (`job.rs`) on the
+//!   queue of the thread that asked for it. A job a queue owns alone (the
+//!   step a write left owing, a foreground job with no worker) is listed in
+//!   the job table here, through the same close gate as a miss, so close
+//!   finds and settles every one ([`IoRuntime::submit`]). A job many queues
+//!   share (a commit group's fsync, a stall) is owned elsewhere, and close
+//!   settles it there; a queue only waits on it ([`IoRuntime::wait_on`]).
+//!
+//! `scope` carries a handle's mode to the device seam, `bind` remembers each
+//! thread's queue for I/O regolith starts itself, and `crate::IoQueue` is the
+//! owner's side.
 
 pub(crate) mod atomic_waker;
+pub(crate) mod bind;
+pub(crate) mod flight;
+pub(crate) mod job;
 pub(crate) mod scope;
 pub(crate) mod shared;
 pub(crate) mod stack;
@@ -61,6 +73,7 @@ use super::filter_block::FilterBlock;
 use super::index_block::IndexBlock;
 use crate::io_queue::{IoWait, QueueId};
 use crate::sync::internal::{AtomicUsize, Ordering};
+use job::{Delivery, Job};
 use shared::{Landing, Message, QueueShared, WaitSlot};
 use unit::{Unit, UnitKey, Work};
 
@@ -68,6 +81,8 @@ use unit::{Unit, UnitKey, Work};
 const UNIT_BUCKETS: usize = 256;
 /// Buckets the queue registry starts with.
 const QUEUE_BUCKETS: usize = 64;
+/// Buckets the job table starts with.
+const JOB_BUCKETS: usize = 64;
 
 /// The bit of a [`CloseGate`] close sets. The bits above it count the misses
 /// under way, one [`MISS`] each.
@@ -172,8 +187,18 @@ fn aliased() -> io::Error {
 pub(crate) struct IoRuntime {
     units: HashMap<UnitKey, Arc<Unit>>,
     queues: HashMap<QueueId, Arc<QueueShared>>,
+    /// The jobs a single queue owns, by address, until they land. What bounds
+    /// it: each entry is a step a write owes (at most one per database at a
+    /// time, `background_owed`) or a foreground job its caller asked for and
+    /// holds a ticket on.
+    jobs: HashMap<usize, Arc<Job>>,
     /// Where close and the misses meet, so no unit outlives close.
     gate: CloseGate,
+}
+
+/// The `jobs` key of `job`: its address, unique while the table holds it.
+fn job_key(job: &Arc<Job>) -> usize {
+    Arc::as_ptr(job).addr()
 }
 
 impl IoRuntime {
@@ -181,6 +206,7 @@ impl IoRuntime {
         Self {
             units: HashMap::with_capacity(UNIT_BUCKETS),
             queues: HashMap::with_capacity(QUEUE_BUCKETS),
+            jobs: HashMap::with_capacity(JOB_BUCKETS),
             gate: CloseGate::new(),
         }
     }
@@ -195,6 +221,93 @@ impl IoRuntime {
     /// Forget a dropped queue: reads that name it from now on fail.
     pub(crate) fn close_queue(&self, id: QueueId) {
         self.queues.remove(&id);
+    }
+
+    /// The open queue `id` names on this database.
+    pub(crate) fn queue(&self, id: QueueId) -> Option<Arc<QueueShared>> {
+        self.queues.get(&id)
+    }
+
+    /// Remember `id` as the calling thread's queue on this database.
+    pub(crate) fn bind_current(&self, id: QueueId) {
+        bind::bind(std::ptr::from_ref(self).addr(), id);
+    }
+
+    /// The calling thread's queue on this database, if it has one open. A
+    /// queue another thread polled since is that thread's, not this one's.
+    pub(crate) fn current_queue(&self) -> Option<Arc<QueueShared>> {
+        bind::bound(std::ptr::from_ref(self).addr())
+            .and_then(|id| self.queue(id))
+            .filter(|queue| queue.owned_here())
+    }
+
+    /// Leave `job`, which `queue` alone waits on, for `queue`'s owner to run
+    /// when it polls, listed in the job table so close settles it.
+    /// `waiter`, when there is one, is told on the owner's thread once the
+    /// job lands.
+    ///
+    /// `Err` hands the job back unsubmitted: once close began, or when the
+    /// queue was dropped. The caller then settles it itself.
+    pub(crate) fn submit(
+        &self,
+        queue: &QueueShared,
+        job: Arc<Job>,
+        waiter: Option<Arc<dyn Delivery>>,
+    ) -> Result<(), Arc<Job>> {
+        if !self.gate.enter() {
+            return Err(job);
+        }
+        self.jobs.insert(job_key(&job), Arc::clone(&job));
+        let pushed = queue.deliver(Message::Job {
+            job: Arc::clone(&job),
+            waiter,
+        });
+        let closing = self.gate.leave();
+        if pushed.is_err() {
+            self.jobs.remove(&job_key(&job));
+            return Err(job);
+        }
+        // Close began while this was under way: its sweep may have come
+        // before the insert, so settle the job here (a no-op if the sweep
+        // already did).
+        if closing {
+            self.release_job(&job);
+        }
+        Ok(())
+    }
+
+    /// Make `queue`'s owner wait on `job`, which others own (a commit
+    /// group's fsync, a stall). `false` when the queue was dropped.
+    pub(crate) fn wait_on(
+        &self,
+        queue: &QueueShared,
+        job: Arc<Job>,
+        waiter: Option<Arc<dyn Delivery>>,
+    ) -> bool {
+        queue.deliver(Message::Job { job, waiter }).is_ok()
+    }
+
+    /// Run a job this thread claimed, whatever scope the caller is in, then
+    /// drop it from the job table.
+    pub(crate) fn run_job(&self, job: &Arc<Job>) {
+        let _device = scope::blocking();
+        job.run();
+        self.forget_job(job);
+    }
+
+    /// Settle `job` without running it, unless another thread claimed it,
+    /// and drop it from the job table.
+    pub(crate) fn release_job(&self, job: &Arc<Job>) -> bool {
+        let released = job.release();
+        if released {
+            self.forget_job(job);
+        }
+        released
+    }
+
+    fn forget_job(&self, job: &Arc<Job>) {
+        self.jobs
+            .remove_if(&job_key(job), |held| Arc::ptr_eq(held, job));
     }
 
     /// A read in a `CacheOnly` scope on `queue` missed the block cache for
@@ -328,6 +441,11 @@ impl IoRuntime {
         for unit in self.units.values() {
             self.release(&unit);
         }
+        // A job a queue owns is settled the same way: its waiters are told
+        // now, with the outcome its body gives a closed database.
+        for job in self.jobs.values() {
+            self.release_job(&job);
+        }
     }
 
     /// A close that failed and left the database open: misses make units
@@ -340,6 +458,12 @@ impl IoRuntime {
     #[cfg(test)]
     pub(crate) fn units_in_flight(&self) -> usize {
         self.units.len()
+    }
+
+    /// Jobs in the table now.
+    #[cfg(test)]
+    pub(crate) fn jobs_in_flight(&self) -> usize {
+        self.jobs.len()
     }
 }
 

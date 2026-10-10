@@ -247,7 +247,7 @@ fn enospc_child_body(mount: &Path) {
         // it is not allowed to report the failure as corruption, and it is
         // not allowed to leave the data it did not manage to rewrite
         // unreadable.
-        match db.compact_range(None, None) {
+        match db.compact_range(None, None).wait() {
             Ok(()) => println!("[resource_limits] compact_range succeeded on a full disk"),
             Err(Error::Io(io)) => {
                 println!("[resource_limits] compact_range on a full disk: {io}")

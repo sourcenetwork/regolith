@@ -177,7 +177,7 @@ pub fn run(scale: &Scale, surface: Surface) -> Outcome {
         .flat_map(|w| (0..scale.keys_per_writer).map(move |i| key_of(w, i)))
         .collect();
     for k in &keys {
-        db.put(k, &value_of(0)).expect("seed put failed");
+        regolith::through_stalls(|| db.put(k, &value_of(0))).expect("seed put failed");
     }
 
     let writers_live = Arc::new(AtomicU64::new(scale.writers as u64));
@@ -199,7 +199,8 @@ pub fn run(scale: &Scale, surface: Surface) -> Outcome {
             gate.wait();
             for v in 1..=versions {
                 for i in 0..keys_each {
-                    db.put(&key_of(w, i), &value_of(v)).expect("put failed");
+                    regolith::through_stalls(|| db.put(&key_of(w, i), &value_of(v)))
+                        .expect("put failed");
                 }
             }
             live.fetch_sub(1, Ordering::AcqRel);
@@ -215,7 +216,9 @@ pub fn run(scale: &Scale, surface: Surface) -> Outcome {
             gate.wait();
             let mut n = 0u64;
             loop {
-                db.compact_range(None, None).expect("compact_range failed");
+                db.compact_range(None, None)
+                    .wait()
+                    .expect("compact_range failed");
                 n += 1;
                 if n >= 3 && live.load(Ordering::Acquire) == 0 && stop.load(Ordering::Acquire) {
                     break;
@@ -494,7 +497,7 @@ fn snapshot_churn_instance() -> (u64, Vec<String>) {
         .flat_map(|w| (0..scale.keys_per_writer).map(move |i| key_of(w, i)))
         .collect();
     for k in &keys {
-        db.put(k, &value_of(0)).expect("seed put");
+        regolith::through_stalls(|| db.put(k, &value_of(0))).expect("seed put");
     }
 
     let live = Arc::new(AtomicU64::new(scale.writers as u64));
@@ -510,7 +513,7 @@ fn snapshot_churn_instance() -> (u64, Vec<String>) {
             gate.wait();
             for v in 1..=versions {
                 for i in 0..keys_each {
-                    db.put(&key_of(w, i), &value_of(v)).expect("put");
+                    regolith::through_stalls(|| db.put(&key_of(w, i), &value_of(v))).expect("put");
                 }
             }
             live.fetch_sub(1, Ordering::AcqRel);
@@ -524,7 +527,7 @@ fn snapshot_churn_instance() -> (u64, Vec<String>) {
             gate.wait();
             let mut n = 0u64;
             loop {
-                db.compact_range(None, None).expect("compact_range");
+                db.compact_range(None, None).wait().expect("compact_range");
                 n += 1;
                 if n >= 3 && live.load(Ordering::Acquire) == 0 {
                     break;
@@ -605,10 +608,12 @@ fn drop_all_racing_every_read_surface_never_invents_data() {
             while !stop.load(Ordering::Acquire) {
                 v += 1;
                 for i in 0..64 {
-                    db.put(&key_of(0, i), &value_of(v * 10 + w as u64))
-                        .expect("put");
+                    regolith::through_stalls(|| {
+                        db.put(&key_of(0, i), &value_of(v * 10 + w as u64))
+                    })
+                    .expect("put");
                 }
-                db.delete_range(&key_of(0, 10), &key_of(0, 20))
+                regolith::through_stalls(|| db.delete_range(&key_of(0, 10), &key_of(0, 20)))
                     .expect("delete_range");
             }
         }));
@@ -619,7 +624,7 @@ fn drop_all_racing_every_read_surface_never_invents_data() {
         handles.push(thread::spawn(move || {
             while !stop.load(Ordering::Acquire) {
                 db.drop_all().expect("drop_all");
-                db.compact_range(None, None).expect("compact_range");
+                db.compact_range(None, None).wait().expect("compact_range");
             }
         }));
     }
@@ -661,7 +666,7 @@ fn drop_all_racing_every_read_surface_never_invents_data() {
     }
 
     // Quiesced: every surface must now agree.
-    db.compact_range(None, None).expect("compact_range");
+    db.compact_range(None, None).wait().expect("compact_range");
     let mut it = db.iter();
     it.seek_to_first();
     let mut fwd = Vec::new();

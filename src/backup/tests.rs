@@ -96,7 +96,7 @@ fn an_ingested_table_restores_at_its_recorded_sequence() {
     let tgt_dir = TempDir::new().unwrap();
     let db = Db::open(src_dir.path(), Options::default()).unwrap();
     db.put(b"k", b"old").unwrap();
-    db.compact_range(None, None).unwrap();
+    db.compact_range(None, None).wait().unwrap();
     let source = src_dir.path().join("source.sst");
     let mut writer = crate::SstFileWriter::create(&source, &Options::default()).unwrap();
     writer.put(b"k", b"new").unwrap();
@@ -104,6 +104,7 @@ fn an_ingested_table_restores_at_its_recorded_sequence() {
     // Lands above the old table, and stays uncompacted, so the restore
     // reads it through the sequence its manifest record carries.
     db.ingest_external_files(&[source], crate::IngestOptions::default())
+        .wait()
         .unwrap();
 
     let mut engine = BackupEngine::open(bkp_dir.path()).unwrap();
@@ -119,7 +120,7 @@ fn incremental_backup_dedupes() {
     let bkp_dir = TempDir::new().unwrap();
     let db = Db::open(src_dir.path(), tiny_flush_opts()).unwrap();
     populate(&db, "x", 400);
-    db.compact_range(None, None).unwrap();
+    db.compact_range(None, None).wait().unwrap();
 
     let mut engine = BackupEngine::open(bkp_dir.path()).unwrap();
     let _id1 = engine.create_backup(&db).unwrap();
@@ -144,7 +145,7 @@ fn create_backup_replaces_corrupt_existing_shared_object() {
     let tgt_dir = TempDir::new().unwrap();
     let db = Db::open(src_dir.path(), tiny_flush_opts()).unwrap();
     populate(&db, "r", 400);
-    db.compact_range(None, None).unwrap();
+    db.compact_range(None, None).wait().unwrap();
 
     let mut engine = BackupEngine::open(bkp_dir.path()).unwrap();
     let _id1 = engine.create_backup(&db).unwrap();
@@ -176,7 +177,7 @@ fn restore_rejects_corrupt_shared_object() {
     let tgt_dir = TempDir::new().unwrap();
     let db = Db::open(src_dir.path(), tiny_flush_opts()).unwrap();
     populate(&db, "bad", 300);
-    db.compact_range(None, None).unwrap();
+    db.compact_range(None, None).wait().unwrap();
 
     let mut engine = BackupEngine::open(bkp_dir.path()).unwrap();
     let id = engine.create_backup(&db).unwrap();
@@ -198,7 +199,7 @@ fn delete_backup_gcs_unreferenced_files() {
     let bkp_dir = TempDir::new().unwrap();
     let db = Db::open(src_dir.path(), tiny_flush_opts()).unwrap();
     populate(&db, "a", 200);
-    db.compact_range(None, None).unwrap();
+    db.compact_range(None, None).wait().unwrap();
 
     let mut engine = BackupEngine::open(bkp_dir.path()).unwrap();
     let id1 = engine.create_backup(&db).unwrap();
@@ -207,7 +208,7 @@ fn delete_backup_gcs_unreferenced_files() {
 
     // New data that doesn't overlap prior SSTs.
     populate(&db, "z", 200);
-    db.compact_range(None, None).unwrap();
+    db.compact_range(None, None).wait().unwrap();
     let id2 = engine.create_backup(&db).unwrap();
     let shared_after_2 = shared_count(bkp_dir.path());
 
@@ -232,7 +233,7 @@ fn delete_only_backup_removes_all_shared() {
     let bkp_dir = TempDir::new().unwrap();
     let db = Db::open(src_dir.path(), tiny_flush_opts()).unwrap();
     populate(&db, "q", 300);
-    db.compact_range(None, None).unwrap();
+    db.compact_range(None, None).wait().unwrap();
 
     let mut engine = BackupEngine::open(bkp_dir.path()).unwrap();
     let id = engine.create_backup(&db).unwrap();
@@ -250,16 +251,16 @@ fn purge_keeps_newest() {
     let db = Db::open(src_dir.path(), tiny_flush_opts()).unwrap();
 
     populate(&db, "g1", 100);
-    db.compact_range(None, None).unwrap();
+    db.compact_range(None, None).wait().unwrap();
     let mut engine = BackupEngine::open(bkp_dir.path()).unwrap();
     let _b1 = engine.create_backup(&db).unwrap();
 
     populate(&db, "g2", 100);
-    db.compact_range(None, None).unwrap();
+    db.compact_range(None, None).wait().unwrap();
     let _b2 = engine.create_backup(&db).unwrap();
 
     populate(&db, "g3", 100);
-    db.compact_range(None, None).unwrap();
+    db.compact_range(None, None).wait().unwrap();
     let b3 = engine.create_backup(&db).unwrap();
 
     engine.purge_old_backups(1).unwrap();

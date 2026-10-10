@@ -68,7 +68,7 @@ fn build(dir: &Path, target_file_size: u64, keys: usize) -> (Db, BTreeMap<Vec<u8
         model.insert(key(n), value(n, 0));
     }
     db.flush().unwrap();
-    db.compact_range(None, None).unwrap();
+    db.compact_range(None, None).wait().unwrap();
 
     // Overwrites and point deletes scattered through the range.
     let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
@@ -94,7 +94,7 @@ fn build(dir: &Path, target_file_size: u64, keys: usize) -> (Db, BTreeMap<Vec<u8
         model.insert(key(n), value(n, 2));
     }
     db.flush().unwrap();
-    db.compact_range(None, None).unwrap();
+    db.compact_range(None, None).wait().unwrap();
     (db, model)
 }
 

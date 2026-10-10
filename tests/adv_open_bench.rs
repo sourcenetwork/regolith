@@ -188,9 +188,6 @@ impl Env for CountingEnv {
     ) -> io::Result<Box<dyn JoinHandle>> {
         self.inner.spawn(name, f)
     }
-    fn sleep(&self, d: std::time::Duration) {
-        self.inner.sleep(d)
-    }
 }
 
 fn bench_opts(env: Arc<dyn Env>) -> Options {

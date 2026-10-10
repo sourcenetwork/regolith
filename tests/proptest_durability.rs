@@ -262,7 +262,7 @@ proptest! {
         let db = Db::open(dir.path(), opts(WRITE_BUFFER, DurabilityMode::Eventual))
             .map_err(|e| TestCaseError::fail(format!("reopen after drop failed: {e}")))?;
         compare(&db, &model).map_err(|e| TestCaseError::fail(format!("after reopen: {e}")))?;
-        db.compact_range(None, None).unwrap();
+        db.compact_range(None, None).wait().unwrap();
         compare(&db, &model)
             .map_err(|e| TestCaseError::fail(format!("after reopen and compaction: {e}")))?;
     }
@@ -297,7 +297,7 @@ proptest! {
                 pinned.push((db.snapshot(), model.clone(), i));
             }
         }
-        db.compact_range(None, None).unwrap();
+        db.compact_range(None, None).wait().unwrap();
 
         for (snap, want, i) in &pinned {
             let got = snap
@@ -364,7 +364,7 @@ proptest! {
         let db = Db::open(dir.path(), opts(WRITE_BUFFER, DurabilityMode::Eventual))
             .map_err(|e| TestCaseError::fail(format!("reopen failed: {e}")))?;
         compare_scan_only(&db, &model, "after reopen")?;
-        db.compact_range(None, None).unwrap();
+        db.compact_range(None, None).wait().unwrap();
         compare_scan_only(&db, &model, "after compaction")?;
     }
 
@@ -422,7 +422,7 @@ proptest! {
         }
 
         check_order(&db, &sorted, &probes, "in the memtable")?;
-        db.compact_range(None, None).unwrap();
+        db.compact_range(None, None).wait().unwrap();
         check_order(&db, &sorted, &probes, "after compaction")?;
     }
 }

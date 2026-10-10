@@ -42,6 +42,18 @@ asleep, the note to B wakes B up; A is awake, so nothing wakes A.
    idle in two steps loses a wakeup (`split_rest_loses_wakeup`); a poll that
    leaves the idle bit set wakes a busy owner (`stale_idle_bit_wakes_busy`);
    a job put on no queue is never run (`orphan_never_runs`).
+7. The commit side (Part 5). A group of `commit_nowait` commits leaves its
+   fsync as one job, a unit like any other, so 1 and 2 hold for it: one
+   claim, one fsync, one note per member queue. On top of that:
+   `group_sync_once`, the fsync runs at most once (TLA+ `SingleRun` on a
+   group); `group_visible_after_sync`, readers see the group only after its
+   fsync (TLA+ `VisibleAfterSync`); `ticket_ready_only_at_own_poll`, a
+   member's ticket becomes ready only at its own queue's poll (TLA+
+   `DeliveredOnOwnPoll`); `stall_lands_when_clear`, a cleared stall leaves
+   no unlanded unit behind except one a writer is about to land (TLA+
+   `StallLandsWhenClear`). RED: a lander that readies the members' tickets
+   itself (`lander_delivery_breaks_own_poll`), and a writer that does not
+   look at the stall again (`no_recheck_strands_stall`).
 
 ## How to read the Lean
 
@@ -1219,6 +1231,468 @@ theorem orphan_never_runs (u q b : Nat) :
   intro n j hh hr
   -- The bad start leaves `u` unheld and not run.
   exact key n (startNowhere j u) hh hr
+
+/-! ## Part 5. The commit side: a group's fsync, and a stall's unit
+
+This part mirrors the units the commit side adds (D53). A group of commits
+made by `commit_nowait` that needs an fsync is written by its leader and
+left as one job (`GroupSync`, `src/engine/commit/deferred.rs`). That job
+is a unit of Part 1, so Part 1 already says it is claimed by one CAS and
+that every member's queue gets one "done" note. Here we follow what the
+claimer does with it (sync, then apply and publish, then tell), and where
+each member's ticket becomes ready: at that member's own poll.
+
+Then the write stall (`StallSignal`, `src/engine/commit/stall.rs`). A write
+a stall stops waits on a *passive* unit, which no poll runs: only the
+stall's clearing lands it. A stopped writer finds or installs the unit,
+registers, and only then looks at the stall again, landing the unit itself
+if the stall cleared meanwhile. Tiny example of what that second look
+saves: writer A sees the stall; the clearer clears it and finds no unit to
+land; A installs a fresh unit. Without A's second look, nobody would ever
+land it, and A's write would wait forever. -/
+
+/-- One group's fsync job, how far its claimer got, and its members'
+tickets. -/
+structure Group where
+  /-- The member queues, each registered on the job. -/
+  members : List Nat
+  /-- The job's state: free, claimed by a thread, or done. -/
+  st : UState
+  /-- How far the claimer got: 0 claimed, 1 synced, 2 published. -/
+  phase : Nat
+  /-- Ghost: how many times the group's fsync ran. -/
+  syncs : Nat
+  /-- The fsync ran: the group's records are durable. -/
+  synced : Bool
+  /-- The group is applied and published: readers see it. -/
+  visible : Bool
+  /-- The member queues the claimer still owes a "done" note. -/
+  owed : List Nat
+  /-- How many "done" notes wait in each queue's inbox. -/
+  inbox : Nat → Nat
+  /-- Ghost: (member queue, thread whose step made its ticket ready). -/
+  ready : List (Nat × Nat)
+
+/-- A group just written: its job free, nothing synced, told or ready. -/
+def Group.init (members : List Nat) : Group :=
+  -- Only the members are set; everything else starts empty.
+  ⟨members, .free, 0, 0, false, false, [], fun _ => 0, []⟩
+
+/-- The steps of one group's job, one atomic step each. -/
+inductive GStep : Group → Group → Prop
+  /-- Thread `t` claims the job with one CAS from free: a member's poll, a
+  blocking member, or the next thread to take the pipeline. -/
+  | claim (g : Group) (t : Nat)
+      -- The CAS succeeds only on a free job.
+      (h : g.st = .free) :
+      -- The state after the step:
+      GStep g { g with st := .claimed t }
+  /-- The claimer runs the group's fsync. -/
+  | sync (g : Group) (t : Nat)
+      -- `t` holds the claim.
+      (h : g.st = .claimed t)
+      -- It has not synced yet.
+      (hp : g.phase = 0) :
+      -- The state after the step:
+      GStep g { g with phase := 1, syncs := g.syncs + 1, synced := true }
+  /-- The claimer applies the group and publishes it to readers. -/
+  | publish (g : Group) (t : Nat)
+      -- `t` holds the claim.
+      (h : g.st = .claimed t)
+      -- It synced.
+      (hp : g.phase = 1) :
+      -- The state after the step:
+      GStep g { g with phase := 2, visible := true }
+  /-- The claimer finishes: the job is done and every member queue is owed
+  a "done" note. -/
+  | finish (g : Group) (t : Nat)
+      -- `t` holds the claim.
+      (h : g.st = .claimed t)
+      -- It published.
+      (hp : g.phase = 2) :
+      -- The state after the step:
+      GStep g { g with st := .done, owed := g.members }
+  /-- The claimer puts the "done" note into member queue `q`'s inbox. -/
+  | tell (g : Group) (q : Nat)
+      -- `q` is still owed its note.
+      (h : q ∈ g.owed) :
+      -- The state after the step:
+      GStep g { g with owed := g.owed.erase q, inbox := set g.inbox q (g.inbox q + 1) }
+  /-- Queue `q`'s owner polls, takes the note, and the ticket is ready: the
+  step is `q`'s own thread's. -/
+  | deliver (g : Group) (q : Nat)
+      -- A note waits in `q`'s inbox.
+      (h : 0 < g.inbox q) :
+      -- The state after the step:
+      GStep g { g with inbox := set g.inbox q (g.inbox q - 1), ready := (q, q) :: g.ready }
+
+/-- Any number of group steps, one after another. -/
+inductive GSteps : Group → Group → Prop
+  /-- No step at all. -/
+  | refl (g : Group) : GSteps g g
+  /-- Some steps, then one more. -/
+  | tail {a b c : Group} : GSteps a b → GStep b c → GSteps a c
+
+/-- What holds of a group's job in every reachable state. -/
+structure GInv (g : Group) : Prop where
+  /-- The fsync ran once if the group is synced, and never otherwise. -/
+  syncs_eq : g.syncs = if g.synced then 1 else 0
+  /-- Synced exactly when the claimer got past its fsync. -/
+  synced_phase : g.synced = true ↔ 1 ≤ g.phase
+  /-- A free job has nobody's progress on it. -/
+  free_phase : g.st = .free → g.phase = 0
+  /-- Readers see the group only once it is synced. -/
+  vis_synced : g.visible = true → g.synced = true
+  /-- Every ready ticket was made ready by its own queue's thread. -/
+  own : ∀ p ∈ g.ready, p.1 = p.2
+
+/-- A group just written satisfies the invariant. -/
+theorem ginv_init (m : List Nat) : GInv (Group.init m) := by
+  -- Each field holds because everything starts empty or false.
+  refine ⟨?_, ?_, ?_, ?_, ?_⟩ <;> simp [Group.init]
+
+/-- **One step keeps the invariant.** Each kind of step is checked in turn. -/
+theorem gstep_inv {g g' : Group}
+    -- The invariant holds before the step.
+    (hi : GInv g)
+    -- One step.
+    (h : GStep g g') :
+    -- Then:
+    GInv g' := by
+  -- Look at the step.
+  cases h with
+  -- A claim only changes the job's state, to claimed.
+  | claim t hfree =>
+    -- The rest of the invariant is untouched; a claimed job is not free.
+    exact ⟨hi.syncs_eq, hi.synced_phase, fun h => by simp at h, hi.vis_synced, hi.own⟩
+  -- The fsync.
+  | sync t hcl hp =>
+    -- Before it the group was not synced: the claimer was at phase 0.
+    have hs : g.synced = false := by
+      -- Either it was synced or not.
+      cases hsy : g.synced with
+      -- Not synced: that is the claim.
+      | false => rfl
+      -- Synced would mean phase at least 1, but it is 0.
+      | true => have := hi.synced_phase.1 hsy; omega
+    -- So the fsync had run no times.
+    have h0 : g.syncs = 0 := by simpa [hs] using hi.syncs_eq
+    -- Now it ran once, the group is synced, at phase 1.
+    refine ⟨?_, ?_, ?_, ?_, hi.own⟩
+    · -- One fsync, and synced.
+      simp [h0]
+    · -- Synced, and past phase 0.
+      simp
+    · -- The job is claimed, not free.
+      intro h
+      -- The step left the job's state as it was.
+      have h' : g.st = .free := h
+      -- It was claimed by `t`, not free.
+      rw [hcl] at h'
+      -- Claimed and free are different states.
+      cases h'
+    · -- Synced now.
+      intro _; rfl
+  -- The publication.
+  | publish t hcl hp =>
+    -- The claimer is at phase 1, so the group is synced.
+    have hs : g.synced = true := hi.synced_phase.2 (by omega)
+    -- Visible now, still synced, at phase 2.
+    refine ⟨hi.syncs_eq, ?_, ?_, ?_, hi.own⟩
+    · -- Synced, and past phase 0.
+      simp [hs]
+    · -- The job is claimed, not free.
+      intro h
+      -- The step left the job's state as it was.
+      have h' : g.st = .free := h
+      -- It was claimed by `t`, not free.
+      rw [hcl] at h'
+      -- Claimed and free are different states.
+      cases h'
+    · -- Visible, and synced.
+      intro _; exact hs
+  -- The finish only marks the job done and owes the notes.
+  | finish t hcl hp =>
+    -- A done job is not free; the rest is untouched.
+    exact ⟨hi.syncs_eq, hi.synced_phase, fun h => by simp at h, hi.vis_synced, hi.own⟩
+  -- A note told changes only the inboxes and what is owed.
+  | tell q hq =>
+    -- Nothing the invariant reads changes.
+    exact ⟨hi.syncs_eq, hi.synced_phase, hi.free_phase, hi.vis_synced, hi.own⟩
+  -- A delivery adds one ticket, made ready by its own queue's thread.
+  | deliver q hq =>
+    -- Everything else is untouched; check the new ready ticket.
+    refine ⟨hi.syncs_eq, hi.synced_phase, hi.free_phase, hi.vis_synced, ?_⟩
+    -- A ready ticket is the new one or an old one.
+    intro p hp
+    -- Split the list membership.
+    rcases List.mem_cons.1 hp with rfl | hp'
+    · -- The new one: queue `q`, made ready by `q`.
+      rfl
+    · -- An old one: the invariant had it.
+      exact hi.own p hp'
+
+/-- **The invariant holds after any number of steps.** -/
+theorem gsteps_inv {g g' : Group}
+    -- Steps from `g` to `g'`.
+    (h : GSteps g g')
+    -- The invariant holds at `g`.
+    (hi : GInv g) :
+    -- Then:
+    GInv g' := by
+  -- By induction on the steps.
+  induction h with
+  -- No step: the same state.
+  | refl => exact hi
+  -- Steps, then one more: the last step keeps it.
+  | tail _ hs ih => exact gstep_inv ih hs
+
+/-- **A group's fsync runs at most once.** One CAS lets one claimer in, and
+only the claimer syncs. TLA+: `SingleRun` on a group
+(`MC_NonBlocking_Green_Commit`), `SingleSync` (`GroupCommit.tla`). Rules
+out: members 1 and 2 both polling and both syncing group 4. -/
+theorem group_sync_once {m : List Nat} {g : Group}
+    -- `g` is reachable from the group just written.
+    (h : GSteps (Group.init m) g) :
+    -- Then:
+    g.syncs ≤ 1 := by
+  -- The invariant of `g`.
+  have hi := gsteps_inv h (ginv_init m)
+  -- The count is 1 or 0 by the invariant.
+  rw [hi.syncs_eq]
+  -- Either way it is at most 1.
+  split <;> omega
+
+/-- **Readers see a group only after its fsync.** TLA+: `VisibleAfterSync`,
+`DurableBeforeVisible` (`GroupCommit.tla`). Rules out: group 4 visible
+while its fsync still waits as a job on the members' queues. -/
+theorem group_visible_after_sync {m : List Nat} {g : Group}
+    -- `g` is reachable from the group just written.
+    (h : GSteps (Group.init m) g)
+    -- The group is visible.
+    (hv : g.visible = true) :
+    -- Then:
+    g.synced = true :=
+  -- One field of the invariant.
+  (gsteps_inv h (ginv_init m)).vis_synced hv
+
+/-- **A member's ticket becomes ready only at its own queue's poll.** TLA+:
+`DeliveredOnOwnPoll`. Rules out: member 2's thread landing group 4 and
+making member 1's ticket ready on thread 2, running 1's callbacks there
+while thread 1 is busy. -/
+theorem ticket_ready_only_at_own_poll {m : List Nat} {g : Group}
+    -- `g` is reachable from the group just written.
+    (h : GSteps (Group.init m) g)
+    -- A ticket that is ready, and the thread whose step made it so.
+    {q t : Nat} (hr : (q, t) ∈ g.ready) :
+    -- Then:
+    t = q :=
+  -- One field of the invariant, read backwards.
+  ((gsteps_inv h (ginv_init m)).own (q, t) hr).symm
+
+/-! ### RED: the lander readies the members' tickets itself
+
+The bug: the thread that lands the group tells every member by making its
+ticket ready right there, instead of putting a note in the member's inbox
+for its own poll. -/
+
+/-- The bad finish: the job is done and every member's ticket is ready,
+made so by the landing thread `t`. -/
+def finishDelivering (g : Group) (t : Nat) : Group :=
+  -- Done, and each member marked ready by `t`.
+  { g with st := .done, ready := g.members.map (fun q => (q, t)) ++ g.ready }
+
+/-- **RED: a lander that readies the tickets breaks `ticket_ready_only_at_own_poll`.**
+Members 1 and 2; thread 2 lands the group and makes member 1's ticket ready
+on thread 2. TLA+: `MC_NonBlocking_Red_DeliverOnLander` breaks
+`DeliveredOnOwnPoll`. -/
+theorem lander_delivery_breaks_own_poll :
+    -- Some ticket ends up ready by a thread that is not its own.
+    ∃ q t, (q, t) ∈ (finishDelivering (Group.init [1, 2]) 2).ready ∧ t ≠ q := by
+  -- Member 1, made ready by thread 2.
+  refine ⟨1, 2, ?_, by decide⟩
+  -- It is on the list the bad finish builds.
+  simp [finishDelivering, Group.init]
+
+/-- Where a writer the stall stopped is: running, it saw the stall, or it
+registered its wait and is about to look at the stall again. -/
+inductive WPhase where
+  /-- Not inside a stopped write. -/
+  | none
+  /-- It saw the stall. -/
+  | seen
+  /-- It registered its wait and will look at the stall again. -/
+  | recheck
+  -- Two phases can be compared for equality.
+  deriving DecidableEq
+
+/-- One stall, its passive unit, and its writers. -/
+structure Stall where
+  /-- The stall is in force. -/
+  stalled : Bool
+  /-- An unlanded unit for the stall is installed. -/
+  pending : Bool
+  /-- Each writer's phase. -/
+  writer : Nat → WPhase
+
+/-- The start: the stall is in force, no unit is installed, nobody wrote. -/
+def Stall.init : Stall :=
+  -- In force, nothing installed, every writer outside a stopped write.
+  ⟨true, false, fun _ => .none⟩
+
+/-- The steps of a stall, one atomic step each, as the code takes them. -/
+inductive SStep : Stall → Stall → Prop
+  /-- Writer `w`'s write meets the stall and stops. -/
+  | see (s : Stall) (w : Nat)
+      -- The stall is in force.
+      (hst : s.stalled = true)
+      -- `w` is not inside another stopped write.
+      (hw : s.writer w = .none) :
+      -- The state after the step:
+      SStep s { s with writer := set s.writer w .seen }
+  /-- Writer `w` finds or installs the stall's unit and registers on it. -/
+  | install (s : Stall) (w : Nat)
+      -- `w` saw the stall.
+      (hw : s.writer w = .seen) :
+      -- The state after the step:
+      SStep s { s with pending := true, writer := set s.writer w .recheck }
+  /-- Writer `w` looks at the stall again: if it cleared, `w` lands the
+  unit itself. -/
+  | recheck (s : Stall) (w : Nat)
+      -- `w` registered and has not looked again.
+      (hw : s.writer w = .recheck) :
+      -- The state after the step:
+      SStep s { s with pending := s.pending && s.stalled, writer := set s.writer w .none }
+  /-- Background work clears the stall and lands the unit, if one is
+  installed. -/
+  | clear (s : Stall)
+      -- The stall is in force.
+      (hst : s.stalled = true) :
+      -- The state after the step:
+      SStep s { s with stalled := false, pending := false }
+
+/-- Any number of stall steps, one after another. -/
+inductive SSteps : Stall → Stall → Prop
+  /-- No step at all. -/
+  | refl (s : Stall) : SSteps s s
+  /-- Some steps, then one more. -/
+  | tail {a b c : Stall} : SSteps a b → SStep b c → SSteps a c
+
+/-- The promise: a cleared stall with an unlanded unit has a writer about to
+look again, which will land it. -/
+def StallSafe (s : Stall) : Prop :=
+  -- Cleared and still pending means somebody will land it.
+  s.stalled = false → s.pending = true → ∃ w, s.writer w = .recheck
+
+/-- **Every step leaves the promise true**, whatever came before: the
+order (register, then look again) carries it on its own. -/
+theorem sstep_safe {s s' : Stall}
+    -- One step.
+    (h : SStep s s') :
+    -- Then:
+    StallSafe s' := by
+  -- Look at the step.
+  cases h with
+  -- A write that meets the stall needs it in force, and it stays so.
+  | see w hst hw =>
+    -- Assume the stall cleared: it did not.
+    intro hc _
+    -- The step left the stall as it was: in force.
+    simp [hst] at hc
+  -- Installing: the installer itself is about to look again.
+  | install w hw =>
+    -- Whatever the stall, `w` is the writer that will land it.
+    intro _ _
+    -- `w` is at its second look.
+    exact ⟨w, by simp⟩
+  -- The second look lands the unit if the stall cleared.
+  | recheck w hw =>
+    -- Assume the stall cleared and the unit is still pending.
+    intro hc hp
+    -- The step leaves the stall as it was, so it had cleared.
+    simp only at hc
+    -- Then the second look landed the unit: not pending.
+    simp [hc] at hp
+  -- Clearing lands the unit.
+  | clear hst =>
+    -- Assume the unit is still pending after the clear.
+    intro _ hp
+    -- The clear set it landed.
+    simp at hp
+
+/-- **A cleared stall leaves no unlanded unit behind, except one a writer
+is about to land.** TLA+: `StallLandsWhenClear`. Rules out: a writer
+installing its unit just after the clearer looked, and nobody landing it. -/
+theorem stall_lands_when_clear {s : Stall}
+    -- `s` is reachable from the start.
+    (h : SSteps Stall.init s) :
+    -- Then:
+    StallSafe s := by
+  -- By induction on the steps.
+  induction h with
+  -- At the start the stall is in force, so the promise is empty.
+  | refl => intro hc; simp [Stall.init] at hc
+  -- Steps, then one more: the last step makes it true.
+  | tail _ hs _ => exact sstep_safe hs
+
+/-! ### RED: a writer that never looks at the stall again
+
+The bug: a stopped writer installs or finds the unit, registers, and stops
+there. -/
+
+/-- The broken steps: seeing the stall, clearing it, and an install with no
+second look. -/
+inductive BadStall : Stall → Stall → Prop
+  /-- Writer `w`'s write meets the stall and stops. -/
+  | see (s : Stall) (w : Nat)
+      -- The stall is in force.
+      (hst : s.stalled = true)
+      -- `w` is not inside another stopped write.
+      (hw : s.writer w = .none) :
+      -- The state after the step:
+      BadStall s { s with writer := set s.writer w .seen }
+  /-- Background work clears the stall and lands the unit, if installed. -/
+  | clear (s : Stall)
+      -- The stall is in force.
+      (hst : s.stalled = true) :
+      -- The state after the step:
+      BadStall s { s with stalled := false, pending := false }
+  /-- The bug: `w` installs the unit and leaves, never looking again. -/
+  | installAndLeave (s : Stall) (w : Nat)
+      -- `w` saw the stall.
+      (hw : s.writer w = .seen) :
+      -- The state after the step:
+      BadStall s { s with pending := true, writer := set s.writer w .none }
+
+/-- Any number of broken steps. -/
+inductive BadStalls : Stall → Stall → Prop
+  /-- No step at all. -/
+  | refl (s : Stall) : BadStalls s s
+  /-- Some steps, then one more. -/
+  | tail {a b c : Stall} : BadStalls a b → BadStall b c → BadStalls a c
+
+/-- **RED: without the second look a unit is stranded.** Writer 1 sees the
+stall; the stall clears with no unit to land; writer 1 installs one and
+leaves. The stall is cleared, the unit unlanded, and no writer will look
+again. TLA+: `MC_NonBlocking_Red_NoRecheck` breaks `StallLandsWhenClear`. -/
+theorem no_recheck_strands_stall :
+    -- Some reachable state breaks the promise.
+    ∃ s, BadStalls Stall.init s ∧ ¬ StallSafe s := by
+  -- The three steps: 1 sees, the stall clears, 1 installs and leaves.
+  refine ⟨_, .tail (.tail (.tail (.refl _) (.see _ 1 rfl rfl)) (.clear _ rfl))
+    (.installAndLeave _ 1 (by simp [Stall.init])), ?_⟩
+  -- The promise would need a writer at its second look.
+  intro hs
+  -- The stall is cleared and the unit pending, so the promise names one.
+  obtain ⟨w, hw⟩ := hs rfl rfl
+  -- But every writer is outside a stopped write.
+  by_cases h1 : w = 1
+  · -- Writer 1 left.
+    subst h1
+    -- Its phase is none.
+    simp at hw
+  · -- Any other writer never wrote.
+    simp [Stall.init, set, h1] at hw
 
 -- The end of the Regolith.IoQueue names.
 end Regolith.IoQueue

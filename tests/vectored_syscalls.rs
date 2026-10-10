@@ -116,9 +116,6 @@ impl Env for CountingEnv {
     ) -> io::Result<Box<dyn JoinHandle>> {
         self.inner.spawn(name, f)
     }
-    fn sleep(&self, d: std::time::Duration) {
-        self.inner.sleep(d)
-    }
 }
 
 /// A record whose payload is at or above the buffer capacity bypasses the

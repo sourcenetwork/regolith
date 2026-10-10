@@ -86,6 +86,27 @@ impl Drop for InBackground {
     }
 }
 
+/// Run `f`, code the caller attached to an outcome already decided: a
+/// transaction's `on_commit` and `on_abort` callbacks and hooks, a ticket's
+/// `on_complete`. A panic cannot change the outcome, so it is caught, reported
+/// to the listeners of `engine` (when it is still open to tell), and the
+/// outcome stands. The one function every such point calls.
+pub(crate) fn survive(
+    engine: Option<&super::RegolithEngine>,
+    callback: &'static str,
+    f: impl FnOnce(),
+) {
+    if catch_unwind(AssertUnwindSafe(f)).is_err() {
+        tracing::error!(
+            callback,
+            "a callback panicked after its outcome was decided"
+        );
+        if let Some(engine) = engine {
+            engine.notify_callback_panic(callback);
+        }
+    }
+}
+
 /// Run `f`, a call into the caller's implementation of the trait `callback`.
 ///
 /// Inside a commit or a background step a panic is caught and returned as

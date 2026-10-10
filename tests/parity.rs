@@ -108,7 +108,7 @@ fn reopen_after_compact_range() {
         for i in 0..500 {
             db.put(format!("k{i:04}").as_bytes(), b"v").unwrap();
         }
-        db.compact_range(None, None).unwrap();
+        db.compact_range(None, None).wait().unwrap();
     }
     let db = open(&dir);
     for i in 0..500 {
@@ -145,7 +145,7 @@ fn snapshot_survives_compaction() {
     for i in 0..200 {
         db.put(format!("k{i:04}").as_bytes(), b"new").unwrap();
     }
-    db.compact_range(None, None).unwrap();
+    db.compact_range(None, None).wait().unwrap();
     // Snapshot still sees old values.
     for i in 0..200 {
         assert_eq!(
@@ -192,7 +192,7 @@ fn iter_full_forward_scan_matches_scan() {
         db.put(format!("k{i:04}").as_bytes(), format!("v{i}").as_bytes())
             .unwrap();
     }
-    db.compact_range(None, None).unwrap();
+    db.compact_range(None, None).wait().unwrap();
 
     let scan_result = db.scan(None, None).unwrap();
     let mut iter_result = Vec::new();
@@ -212,7 +212,7 @@ fn iter_reverse_scan_after_compact() {
     for i in 0..50 {
         db.put(format!("k{i:02}").as_bytes(), b"v").unwrap();
     }
-    db.compact_range(None, None).unwrap();
+    db.compact_range(None, None).wait().unwrap();
 
     let mut it = db.iter();
     it.seek_to_last();
@@ -238,7 +238,7 @@ fn compact_range_merges_l0_to_l1() {
     }
     let l0_before = db.get_int_property("regolith.num-files-at-level0").unwrap();
     assert!(l0_before > 0);
-    db.compact_range(None, None).unwrap();
+    db.compact_range(None, None).wait().unwrap();
     let l0_after = db.get_int_property("regolith.num-files-at-level0").unwrap();
     assert_eq!(l0_after, 0, "compact_range should drain L0");
     // Data still readable.
@@ -260,7 +260,7 @@ fn compaction_drops_shadowed_deletions() {
     for i in 0..100 {
         db.delete(format!("k{i:02}").as_bytes()).unwrap();
     }
-    db.compact_range(None, None).unwrap();
+    db.compact_range(None, None).wait().unwrap();
     let total = db
         .get_int_property("regolith.total-sst-files-size")
         .unwrap();
@@ -288,7 +288,7 @@ fn compression_none_produces_larger_files_than_lz4() {
         for i in 0..500 {
             db.put(format!("k{i:04}").as_bytes(), &payload).unwrap();
         }
-        db.compact_range(None, None).unwrap();
+        db.compact_range(None, None).wait().unwrap();
         db.get_int_property("regolith.total-sst-files-size")
             .unwrap()
     };
@@ -318,7 +318,7 @@ fn fifo_drops_oldest_file_when_over_cap() {
         db.put(format!("k{i:04}").as_bytes(), &payload).unwrap();
     }
     std::thread::sleep(std::time::Duration::from_millis(200));
-    db.compact_range(None, None).unwrap();
+    db.compact_range(None, None).wait().unwrap();
     let total = db
         .get_int_property("regolith.total-sst-files-size")
         .unwrap();
@@ -358,7 +358,7 @@ fn range_delete_survives_compaction() {
         db.put(format!("k{i:02}").as_bytes(), b"v").unwrap();
     }
     db.delete_range(b"k20", b"k80").unwrap();
-    db.compact_range(None, None).unwrap();
+    db.compact_range(None, None).wait().unwrap();
     assert_eq!(db.get(b"k19").unwrap(), Some(b"v".to_vec()));
     assert_eq!(db.get(b"k20").unwrap(), None);
     assert_eq!(db.get(b"k79").unwrap(), None);

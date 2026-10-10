@@ -52,11 +52,16 @@
 //! [`TxnCursor::next_page`](crate::TxnCursor::next_page)), without skipping
 //! or repeating an entry.
 
+pub(crate) mod completion;
 mod queue;
+mod ticket;
 pub(crate) mod wait;
 
 pub use queue::IoQueue;
-pub use wait::{IoUnit, IoWait, WouldBlock};
+pub use ticket::{CommitTicket, JobTicket};
+#[cfg(not(target_arch = "wasm32"))]
+pub use wait::through_stalls;
+pub use wait::{IoUnit, IoWait, StallWait, WouldBlock};
 
 use std::num::NonZeroU64;
 

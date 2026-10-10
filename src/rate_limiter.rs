@@ -1,47 +1,40 @@
 //! Token-bucket rate limiter for background I/O.
 //!
-//! A [`RateLimiter`] throttles byte-denominated work (flush and
-//! compaction writes) so bursts of background I/O don't saturate the
-//! disk and push foreground latency off a cliff. The engine calls
-//! [`RateLimiter::request`] with a byte count and a [`Priority`]; the
-//! call blocks until enough tokens have accumulated, then returns.
+//! A [`RateLimiter`] throttles byte-denominated background work (flush and
+//! compaction writes) so bursts of it don't saturate the disk and push
+//! foreground latency off a cliff. The engine calls [`RateLimiter::request`]
+//! with a byte count before it installs what it wrote, and only on its
+//! compaction worker threads: a caller's call is never throttled, whether it
+//! flushes, compacts a step on its own thread, or runs a job at its queue's
+//! poll (plan 4.10). Work regolith runs on a caller's thread is the caller's
+//! I/O, paced by the caller.
 //!
-//! [`TokenBucketRateLimiter`] is the stock implementation: a single
-//! token bucket with a configurable refill rate and burst capacity,
-//! served by a FIFO queue that always drains [`Priority::High`] waiters
-//! before [`Priority::Low`]. It is the only implementation regolith ships;
-//! the trait is public so callers can drop in their own (e.g. for test
-//! harnesses or a shared limiter across multiple databases).
+//! [`TokenBucketRateLimiter`] is the stock implementation: one token bucket
+//! kept in a few atomics, with no lock and no condition variable. It is the
+//! only implementation regolith ships; the trait is public so callers can
+//! drop in their own (e.g. for test harnesses or a shared limiter across
+//! multiple databases).
 
-use crate::portability::{AtomicU64, Ordering};
-use std::collections::BTreeSet;
+use std::cell::Cell;
+use std::sync::Arc;
+#[cfg(not(target_arch = "wasm32"))]
 use std::time::Duration;
+
+use crate::portability::{AtomicBool, AtomicU64, Ordering};
 
 // The module's own tests measure real elapsed time to prove the
 // limiter actually blocks.
 #[cfg(test)]
 use std::time::Instant;
 
-use crate::sync::internal::{Condvar, Mutex};
-
-/// Priority of a rate-limited I/O request. High-priority waiters are
-/// always served before low-priority waiters; within a priority class
-/// waiters are served in FIFO order.
+/// Priority of a rate-limited I/O request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Priority {
-    /// Foreground work. Served first.
+    /// Served at once: it takes its bytes from the bucket without waiting,
+    /// so the requests behind it wait for them instead.
     High,
-    /// Background work (flush, compaction). Yields to [`Priority::High`].
+    /// Background work (flush, compaction): waits its turn.
     Low,
-}
-
-impl Priority {
-    fn class(self) -> u8 {
-        match self {
-            Priority::High => 0,
-            Priority::Low => 1,
-        }
-    }
 }
 
 /// A byte-denominated rate limiter.
@@ -49,17 +42,20 @@ impl Priority {
 /// Implementations throttle callers of [`RateLimiter::request`] to at
 /// most `get_bytes_per_second()` bytes over time. Requests block until
 /// quota is available; shutdown (on drop or via an implementation-
-/// specific `stop()` call) must wake every blocked waiter.
+/// specific `stop()` call) must release every blocked request.
 ///
-/// A panic in this trait's code while a commit's memtable rotation runs it
-/// fails that commit with [`crate::Error::CallbackPanicked`] and latches the
-/// database read-only until it is reopened.
+/// regolith calls it only on its compaction worker threads, never on a
+/// caller's thread, so a blocking `request` never blocks a caller.
+///
+/// A panic in this trait's code while a flush runs it fails that flush
+/// with [`crate::Error::CallbackPanicked`]; the flush is retried as any
+/// failing flush is.
 pub trait RateLimiter: Send + Sync + 'static {
     /// Request `bytes` worth of I/O quota. Blocks until the request is
     /// served or the limiter is shut down.
     fn request(&self, bytes: u64, pri: Priority);
 
-    /// Update the refill rate. Takes effect on the next refill tick.
+    /// Update the refill rate. Takes effect for the requests after it.
     fn set_bytes_per_second(&self, bytes_per_second: u64);
 
     /// Return the currently configured refill rate in bytes/sec.
@@ -70,42 +66,85 @@ pub trait RateLimiter: Send + Sync + 'static {
     fn get_total_bytes_through(&self, pri: Priority) -> u64;
 }
 
-/// Internal waiter identity: priority class first so the high class
-/// sorts before the low class, seq second for FIFO within a class.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-struct WaiterKey {
-    class: u8,
-    seq: u64,
+thread_local! {
+    /// The thread is a compaction worker: the only threads the engine
+    /// throttles.
+    static ON_WORKER: Cell<bool> = const { Cell::new(false) };
 }
 
-struct State {
-    bytes_per_second: u64,
-    available: i128,
-    /// Nanoseconds from the platform clock at the last refill.
-    last_refill: u64,
-    next_seq: u64,
-    waiters: BTreeSet<WaiterKey>,
-    shutdown: bool,
+/// Mark the calling thread as a compaction worker for the rest of its life.
+#[cfg(any(test, not(target_arch = "wasm32")))]
+pub(crate) fn mark_worker_thread() {
+    ON_WORKER.with(|on| on.set(true));
 }
 
-/// Default rate-limiter implementation: a single token bucket refilled
-/// at `bytes_per_second` bytes/sec with a burst capacity of `burst_bytes`.
+/// Throttle `bytes` of background I/O through `limiter`, on a compaction
+/// worker only: the one function every engine call site uses, so no caller's
+/// call is ever throttled.
 ///
-/// All waiters share one mutex and one condition variable; on wakeup, each
-/// waiter checks whether it is at the front of the FIFO queue (highest
-/// priority, lowest seq) and, if so, whether enough tokens have
-/// accumulated. Waiters that aren't at the front simply go back to
-/// sleep.
+/// The limiter is the caller's code: a panic in it fails the flush or the
+/// compaction that asked, as [`crate::Error::CallbackPanicked`], instead of
+/// unwinding through the worker.
+pub(crate) fn throttle_background(
+    limiter: Option<&Arc<dyn RateLimiter>>,
+    bytes: u64,
+) -> std::io::Result<()> {
+    let Some(limiter) = limiter else {
+        return Ok(());
+    };
+    if !ON_WORKER.with(Cell::get) {
+        return Ok(());
+    }
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        limiter.request(bytes, Priority::Low)
+    }))
+    .map_err(|_| {
+        tracing::error!("the rate limiter panicked in background I/O");
+        crate::Error::CallbackPanicked {
+            callback: "RateLimiter",
+            latched: false,
+        }
+        .into_io_error()
+    })
+}
+
+/// The longest a blocked request sleeps before it checks for shutdown
+/// again.
+#[cfg(not(target_arch = "wasm32"))]
+const SLEEP_SLICE: Duration = Duration::from_millis(50);
+
+/// Nanoseconds `bytes` take at `rate` bytes per second, saturating.
+fn nanos_for(bytes: u64, rate: u64) -> u64 {
+    let nanos = u128::from(bytes).saturating_mul(1_000_000_000) / u128::from(rate.max(1));
+    u64::try_from(nanos).unwrap_or(u64::MAX)
+}
+
+/// Bytes `nanos` buy at `rate` bytes per second, saturating.
+fn bytes_for(nanos: u64, rate: u64) -> u64 {
+    let bytes = u128::from(nanos).saturating_mul(u128::from(rate)) / 1_000_000_000;
+    u64::try_from(bytes).unwrap_or(u64::MAX)
+}
+
+/// Default rate-limiter implementation: one token bucket refilled
+/// continuously at `bytes_per_second`, holding at most `burst_bytes`.
 ///
-/// `refill_period` controls the granularity at which tokens are
-/// credited to the bucket: a smaller period smooths bursts at the cost
-/// of more wakeups; a larger period is cheaper but chunkier. 100 ms is
-/// a reasonable starting point for most workloads.
+/// The bucket is a single clock reading kept in an atomic: the time at which
+/// every byte served so far will have been paid for at the rate (the
+/// "theoretical arrival time" of the generic cell rate algorithm). A request
+/// for `n` bytes moves it forward by `n / rate` with one compare-and-swap,
+/// from now if the bucket had refilled meanwhile, and may proceed once the
+/// new time is within `burst_bytes / rate` of now; until then it sleeps.
+/// Reservations are taken in the order the compare-and-swaps land, so
+/// requests are served first come, first served, and a request larger than
+/// the burst simply waits for the bytes past it. Nobody takes a lock.
+///
+/// A fresh bucket is full: the first `burst_bytes` are served at once.
 pub struct TokenBucketRateLimiter {
-    state: Mutex<State>,
-    cv: Condvar,
+    rate: AtomicU64,
     burst_bytes: u64,
-    refill_period: Duration,
+    /// Platform-clock nanoseconds at which every reserved byte is paid for.
+    paid_until: AtomicU64,
+    shutdown: AtomicBool,
     total_high: AtomicU64,
     total_low: AtomicU64,
 }
@@ -115,188 +154,137 @@ impl TokenBucketRateLimiter {
     ///
     /// * `bytes_per_second` - sustained refill rate. `0` disables the
     ///   limiter (every request is served instantly).
-    /// * `refill_period` - how often tokens are credited. A zero
-    ///   period credits tokens continuously: every request refills
-    ///   the bucket for exactly the time that has elapsed.
     /// * `burst_bytes` - maximum number of tokens the bucket can hold.
     ///   A fresh bucket starts full so the first `burst_bytes` worth of
     ///   work is served without blocking. Clamped to at least 1.
     ///
     /// Never panics: out-of-range arguments are clamped rather than
     /// asserted, because this is a public constructor.
-    pub fn new(bytes_per_second: u64, refill_period: Duration, burst_bytes: u64) -> Self {
-        let burst_bytes = burst_bytes.max(1);
+    pub fn new(bytes_per_second: u64, burst_bytes: u64) -> Self {
         Self {
-            state: Mutex::new(State {
-                bytes_per_second,
-                available: burst_bytes as i128,
-                last_refill: crate::env::platform_nanos().unwrap_or(0),
-                next_seq: 0,
-                waiters: BTreeSet::new(),
-                shutdown: false,
-            }),
-            cv: Condvar::new(),
-            burst_bytes,
-            refill_period,
+            rate: AtomicU64::new(bytes_per_second),
+            burst_bytes: burst_bytes.max(1),
+            paid_until: AtomicU64::new(0),
+            shutdown: AtomicBool::new(false),
             total_high: AtomicU64::new(0),
             total_low: AtomicU64::new(0),
         }
     }
 
-    /// Wake every blocked waiter and return. Subsequent calls to
+    /// Release every blocked request and return. Subsequent calls to
     /// [`RateLimiter::request`] also return immediately without
     /// consuming tokens. Called automatically when the limiter is
     /// dropped.
     pub fn stop(&self) {
-        let mut state = self.state.lock();
-        state.shutdown = true;
-        self.cv.notify_all();
+        self.shutdown.store(true, Ordering::Release);
     }
 
-    /// Refill the bucket based on elapsed time since `last_refill`.
-    /// Caller holds the lock.
-    fn refill_locked(&self, state: &mut State, now: u64) {
-        let elapsed = u128::from(now.saturating_sub(state.last_refill));
-        if elapsed < self.refill_period.as_nanos() {
-            return;
+    /// Reserve `bytes` at `rate`, at `now`, and return the time the request
+    /// may proceed.
+    fn reserve(&self, bytes: u64, rate: u64, now: u64) -> u64 {
+        let cost = nanos_for(bytes, rate);
+        let burst = nanos_for(self.burst_bytes, rate);
+        let mut current = self.paid_until.load(Ordering::Acquire);
+        loop {
+            // A bucket idle long enough refilled: the debt starts now.
+            let next = current.max(now).saturating_add(cost);
+            match self.paid_until.compare_exchange_weak(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return next.saturating_sub(burst),
+                Err(actual) => current = actual,
+            }
         }
-        let period_nanos: u128 = self.refill_period.as_nanos().max(1);
-        let periods = (elapsed / period_nanos) as u64;
-        if periods == 0 {
-            return;
-        }
-        // tokens = rate * (periods * refill_period)
-        let rate = state.bytes_per_second as u128;
-        let tokens = rate
-            .saturating_mul(period_nanos)
-            .saturating_mul(periods as u128)
-            / 1_000_000_000u128;
-        state.available = (state.available + tokens as i128).min(self.burst_bytes as i128);
-        state.last_refill = state
-            .last_refill
-            .saturating_add((period_nanos.saturating_mul(periods as u128)) as u64);
     }
 
-    /// Internal: serve one chunk (at most `burst_bytes`).
-    fn request_chunk(&self, bytes: u64, pri: Priority) -> bool {
-        if bytes == 0 {
+    /// Sleep until `ready_at` on the platform clock, or until stopped.
+    /// `false` when stopped first.
+    fn wait_until(&self, ready_at: u64) -> bool {
+        loop {
+            if self.shutdown.load(Ordering::Acquire) {
+                return false;
+            }
+            let Some(now) = crate::env::platform_nanos() else {
+                return true;
+            };
+            if now >= ready_at {
+                return true;
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            std::thread::sleep(SLEEP_SLICE.min(Duration::from_nanos(ready_at - now)));
+            // A target with no thread to sleep serves at once rather than
+            // spin: nothing on it calls a limiter that must block.
+            #[cfg(target_arch = "wasm32")]
             return true;
         }
-        // Rate limiting is a function of elapsed time. A platform
-        // with no monotonic clock cannot measure it, so the limiter
-        // serves every request immediately instead of blocking on a
-        // bucket that could never refill.
-        let Some(mut now) = crate::env::platform_nanos() else {
-            return true;
+    }
+
+    fn count(&self, bytes: u64, pri: Priority) {
+        match pri {
+            Priority::High => self.total_high.fetch_add(bytes, Ordering::Relaxed),
+            Priority::Low => self.total_low.fetch_add(bytes, Ordering::Relaxed),
         };
-        let class = pri.class();
-        let mut state = self.state.lock();
-        if state.shutdown {
-            return false;
-        }
-        let my_seq = state.next_seq;
-        state.next_seq += 1;
-        let key = WaiterKey { class, seq: my_seq };
-        state.waiters.insert(key);
-
-        let served = loop {
-            if state.shutdown {
-                break false;
-            }
-
-            self.refill_locked(&mut state, now);
-
-            let Some(front) = state.waiters.iter().next().copied() else {
-                break false;
-            };
-            if front == key && state.available >= bytes as i128 {
-                state.available -= bytes as i128;
-                break true;
-            }
-
-            // Either we aren't at the front or tokens aren't ready.
-            // Compute how long until the next refill and sleep that
-            // long - a spurious wakeup just re-enters the loop.
-            now = crate::env::platform_nanos().unwrap_or(now);
-            let wait = self
-                .refill_period
-                .saturating_sub(Duration::from_nanos(now.saturating_sub(state.last_refill)));
-            let wait = if wait.is_zero() {
-                self.refill_period
-            } else {
-                wait
-            };
-            state = self
-                .cv
-                .wait_timeout(state, wait)
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .0;
-        };
-
-        state.waiters.remove(&key);
-        // Front of queue may have changed; wake the new front.
-        self.cv.notify_all();
-
-        if served {
-            match pri {
-                Priority::High => {
-                    self.total_high.fetch_add(bytes, Ordering::Relaxed);
-                }
-                Priority::Low => {
-                    self.total_low.fetch_add(bytes, Ordering::Relaxed);
-                }
-            }
-        }
-        served
     }
 }
 
 impl Drop for TokenBucketRateLimiter {
     fn drop(&mut self) {
-        // Dropping doesn't actually wake external waiters (they hold
-        // &self), but `stop()` is idempotent and flags state.shutdown
-        // for any future request calls that race the drop.
         self.stop();
     }
 }
 
 impl RateLimiter for TokenBucketRateLimiter {
     fn request(&self, bytes: u64, pri: Priority) {
-        if self.get_bytes_per_second() == 0 {
-            match pri {
-                Priority::High => {
-                    self.total_high.fetch_add(bytes, Ordering::Relaxed);
-                }
-                Priority::Low => {
-                    self.total_low.fetch_add(bytes, Ordering::Relaxed);
-                }
-            }
+        if self.shutdown.load(Ordering::Acquire) {
             return;
         }
-        let mut remaining = bytes;
-        while remaining > 0 {
-            let chunk = remaining.min(self.burst_bytes);
-            if !self.request_chunk(chunk, pri) {
-                // Shutdown: stop trying.
-                return;
-            }
-            remaining -= chunk;
+        let rate = self.rate.load(Ordering::Acquire);
+        // Rate limiting is a function of elapsed time. A platform with no
+        // monotonic clock cannot measure it, so the limiter serves every
+        // request at once instead of blocking on a bucket that could never
+        // refill; a rate of zero turns it off.
+        let now = crate::env::platform_nanos();
+        let (Some(now), true) = (now, rate > 0 && bytes > 0) else {
+            self.count(bytes, pri);
+            return;
+        };
+        let ready_at = self.reserve(bytes, rate, now);
+        if pri == Priority::High || self.wait_until(ready_at) {
+            self.count(bytes, pri);
         }
     }
 
+    /// Change the rate. The bytes still owed are carried over at the new
+    /// rate, so the change takes effect cleanly from now.
     fn set_bytes_per_second(&self, bytes_per_second: u64) {
-        let mut state = self.state.lock();
-        // Catch up on any pending refill at the old rate before
-        // switching, so the change takes effect cleanly from "now".
-        if let Some(now) = crate::env::platform_nanos() {
-            self.refill_locked(&mut state, now);
+        let old = self.rate.swap(bytes_per_second, Ordering::AcqRel);
+        let (Some(now), true) = (
+            crate::env::platform_nanos(),
+            old > 0 && bytes_per_second > 0,
+        ) else {
+            return;
+        };
+        let mut current = self.paid_until.load(Ordering::Acquire);
+        loop {
+            let owed = bytes_for(current.saturating_sub(now), old);
+            let next = now.saturating_add(nanos_for(owed, bytes_per_second));
+            match self.paid_until.compare_exchange_weak(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return,
+                Err(actual) => current = actual,
+            }
         }
-        state.bytes_per_second = bytes_per_second;
-        self.cv.notify_all();
     }
 
     fn get_bytes_per_second(&self) -> u64 {
-        self.state.lock().bytes_per_second
+        self.rate.load(Ordering::Acquire)
     }
 
     fn get_total_bytes_through(&self, pri: Priority) -> u64 {
@@ -310,12 +298,12 @@ impl RateLimiter for TokenBucketRateLimiter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
+    use std::sync::Mutex;
     use std::thread;
 
     #[test]
     fn single_request_within_burst_is_instant() {
-        let lim = TokenBucketRateLimiter::new(1_000_000, Duration::from_millis(100), 1_000_000);
+        let lim = TokenBucketRateLimiter::new(1_000_000, 1_000_000);
         let start = Instant::now();
         lim.request(500_000, Priority::Low);
         assert!(start.elapsed() < Duration::from_millis(50));
@@ -327,7 +315,7 @@ mod tests {
         // The bucket starts full (1 MB burst) so a 10 MB request
         // sees 1 MB of free credit up front - expected wait is
         // ~9 seconds, not 10. Assert >= 9 to match.
-        let lim = TokenBucketRateLimiter::new(1_000_000, Duration::from_millis(100), 1_000_000);
+        let lim = TokenBucketRateLimiter::new(1_000_000, 1_000_000);
         let start = Instant::now();
         lim.request(10_000_000, Priority::Low);
         let elapsed = start.elapsed();
@@ -340,27 +328,26 @@ mod tests {
     }
 
     #[test]
-    fn high_priority_preempts_low() {
-        // Tune the bucket so every waiter needs several refill
-        // periods' worth of tokens: that gives us a wide window to
-        // inject a high-priority request into the queue while low-
-        // priority waiters are still blocked, and lets the priority
-        // order determine who drains each refill.
-        //
-        // rate:          100_000 bytes/sec
-        // refill_period: 100 ms  → +10_000 bytes per period
-        // burst:         10_000 bytes
-        //
-        // Each waiter asks for 30_000 bytes, i.e. three refills'
-        // worth of credit.
-        let lim = Arc::new(TokenBucketRateLimiter::new(
-            100_000,
-            Duration::from_millis(100),
-            10_000,
-        ));
+    fn requests_are_served_in_the_order_they_reserved() {
+        // 100 KB/s with a 10 KB burst: after the burst is drained, each
+        // 10 KB waits 100 ms behind the one before it.
+        let lim = Arc::new(TokenBucketRateLimiter::new(100_000, 10_000));
+        lim.request(10_000, Priority::Low);
+        let start = Instant::now();
+        lim.request(10_000, Priority::Low);
+        lim.request(10_000, Priority::Low);
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(180),
+            "two 10 KB requests at 100 KB/s took {elapsed:?}"
+        );
+    }
 
+    #[test]
+    fn high_priority_preempts_low() {
+        let lim = Arc::new(TokenBucketRateLimiter::new(100_000, 10_000));
         // Drain the initial burst so every following waiter has to
-        // queue for refills.
+        // wait for refills.
         lim.request(10_000, Priority::Low);
 
         let order: Arc<Mutex<Vec<&'static str>>> = Arc::new(Mutex::new(Vec::new()));
@@ -372,23 +359,20 @@ mod tests {
                 thread::spawn(move || {
                     lim.request(30_000, Priority::Low);
                     let label = if i == 0 { "lo1" } else { "lo2" };
-                    order.lock().push(label);
+                    order.lock().unwrap().push(label);
                 })
             })
             .collect();
 
-        // Brief sleep to ensure both low waiters have registered
-        // in the BTreeSet before we enqueue the high-priority one.
-        // Well below one refill_period so no low waiter can have
-        // been served yet.
+        // The low requests reserved first; the high one arrives after,
+        // takes its bytes at once and is served first.
         thread::sleep(Duration::from_millis(30));
-
         let high = {
             let lim = lim.clone();
             let order = order.clone();
             thread::spawn(move || {
                 lim.request(30_000, Priority::High);
-                order.lock().push("high");
+                order.lock().unwrap().push("high");
             })
         };
 
@@ -397,10 +381,8 @@ mod tests {
             h.join().unwrap();
         }
 
-        let order = order.lock();
+        let order = order.lock().unwrap();
         let high_idx = order.iter().position(|&s| s == "high").unwrap();
-        // High must land strictly before at least one low waiter
-        // despite arriving last in wall-clock order.
         assert!(
             high_idx < 2,
             "high did not preempt any low: order = {:?}",
@@ -409,20 +391,16 @@ mod tests {
     }
 
     #[test]
-    fn shutdown_wakes_blocked_waiters() {
-        let lim = Arc::new(TokenBucketRateLimiter::new(
-            1_000,
-            Duration::from_secs(60),
-            1_000,
-        ));
-        // Drain the burst so the next request has to wait ~60s.
+    fn shutdown_releases_blocked_requests() {
+        let lim = Arc::new(TokenBucketRateLimiter::new(1_000, 1_000));
+        // Drain the burst so the next request has to wait ~1s per KB.
         lim.request(1_000, Priority::Low);
 
         let blocked = {
             let lim = lim.clone();
             thread::spawn(move || {
                 let start = Instant::now();
-                lim.request(1_000, Priority::Low);
+                lim.request(60_000, Priority::Low);
                 start.elapsed()
             })
         };
@@ -432,18 +410,19 @@ mod tests {
         let waited = blocked.join().unwrap();
         assert!(
             waited < Duration::from_secs(5),
-            "blocked waiter did not wake promptly after stop: {:?}",
+            "blocked request was not released promptly after stop: {:?}",
             waited
+        );
+        assert_eq!(
+            lim.get_total_bytes_through(Priority::Low),
+            1_000,
+            "a request released by shutdown was not served"
         );
     }
 
     #[test]
     fn set_bytes_per_second_live_update_is_respected() {
-        let lim = Arc::new(TokenBucketRateLimiter::new(
-            100_000,
-            Duration::from_millis(50),
-            100_000,
-        ));
+        let lim = Arc::new(TokenBucketRateLimiter::new(100_000, 100_000));
         lim.request(100_000, Priority::Low); // drain burst
         assert_eq!(lim.get_bytes_per_second(), 100_000);
 
@@ -464,7 +443,7 @@ mod tests {
 
     #[test]
     fn zero_rate_disables_limiter() {
-        let lim = TokenBucketRateLimiter::new(0, Duration::from_millis(100), 1);
+        let lim = TokenBucketRateLimiter::new(0, 1);
         let start = Instant::now();
         lim.request(100_000_000, Priority::Low);
         assert!(start.elapsed() < Duration::from_millis(50));
@@ -473,11 +452,80 @@ mod tests {
 
     #[test]
     fn get_total_bytes_through_tracks_both_classes() {
-        let lim = TokenBucketRateLimiter::new(10_000_000, Duration::from_millis(50), 10_000_000);
+        let lim = TokenBucketRateLimiter::new(10_000_000, 10_000_000);
         lim.request(1_000, Priority::High);
         lim.request(2_000, Priority::Low);
         lim.request(3_000, Priority::High);
         assert_eq!(lim.get_total_bytes_through(Priority::High), 4_000);
         assert_eq!(lim.get_total_bytes_through(Priority::Low), 2_000);
+    }
+
+    /// A limiter that serves every request at once and counts the bytes.
+    #[derive(Default)]
+    struct Counting(AtomicU64);
+
+    impl RateLimiter for Counting {
+        fn request(&self, bytes: u64, _: Priority) {
+            self.0.fetch_add(bytes, Ordering::SeqCst);
+        }
+        fn set_bytes_per_second(&self, _: u64) {}
+        fn get_bytes_per_second(&self) -> u64 {
+            0
+        }
+        fn get_total_bytes_through(&self, _: Priority) -> u64 {
+            self.0.load(Ordering::SeqCst)
+        }
+    }
+
+    /// The engine throttles a worker thread only: a caller's thread never
+    /// asks the limiter at all.
+    #[test]
+    fn only_a_worker_thread_is_throttled() {
+        let counting = Arc::new(Counting::default());
+        let limiter: Arc<dyn RateLimiter> = Arc::clone(&counting) as Arc<dyn RateLimiter>;
+        throttle_background(Some(&limiter), 1_000_000).unwrap();
+        assert_eq!(counting.0.load(Ordering::SeqCst), 0, "a caller asked");
+        let throttled = Arc::clone(&limiter);
+        thread::spawn(move || {
+            mark_worker_thread();
+            throttle_background(Some(&throttled), 1).unwrap();
+        })
+        .join()
+        .unwrap();
+        assert_eq!(counting.0.load(Ordering::SeqCst), 1, "the worker asked");
+    }
+
+    /// A limiter that panics fails the I/O that asked, as an error, and
+    /// leaves the worker running.
+    #[test]
+    fn a_panicking_limiter_fails_the_request_instead_of_the_worker() {
+        struct Panics;
+        impl RateLimiter for Panics {
+            fn request(&self, _: u64, _: Priority) {
+                panic!("limiter panics");
+            }
+            fn set_bytes_per_second(&self, _: u64) {}
+            fn get_bytes_per_second(&self) -> u64 {
+                0
+            }
+            fn get_total_bytes_through(&self, _: Priority) -> u64 {
+                0
+            }
+        }
+        let limiter: Arc<dyn RateLimiter> = Arc::new(Panics);
+        let failed = thread::spawn(move || {
+            mark_worker_thread();
+            throttle_background(Some(&limiter), 1)
+        })
+        .join()
+        .expect("the panic did not unwind through the worker");
+        let err = crate::Error::from(failed.unwrap_err());
+        assert!(matches!(
+            err,
+            crate::Error::CallbackPanicked {
+                callback: "RateLimiter",
+                latched: false
+            }
+        ));
     }
 }

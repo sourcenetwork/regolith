@@ -142,6 +142,7 @@ fn publishers_racing_readers(options: Options, ingest_dir: &Path) {
                 }
                 writer.finish().unwrap();
                 db.ingest_external_files(&[source], IngestOptions::default())
+                    .wait()
                     .unwrap();
             }
         });
@@ -178,7 +179,7 @@ fn publishers_racing_readers(options: Options, ingest_dir: &Path) {
         }
     });
     assert!(reads.load(Ordering::Relaxed) > 0);
-    db.compact_range(None, None).unwrap();
+    db.compact_range(None, None).wait().unwrap();
     for w in 0..WRITERS {
         for k in 0..KEYS {
             let value = db.get(&key(w, k)).unwrap().expect("a write was lost");
@@ -265,7 +266,7 @@ fn snapshots_moved_across_threads_keep_their_versions_through_compaction() {
             while let Ok((v, snapshot)) = receive.recv() {
                 held.push((v, snapshot));
                 if held.len() % 7 == 0 {
-                    db.compact_range(None, None).unwrap();
+                    db.compact_range(None, None).wait().unwrap();
                 }
                 for (v, snapshot) in &held {
                     let value = snapshot.get(&numbered(*v % 20)).unwrap().unwrap();
@@ -292,7 +293,7 @@ fn snapshots_moved_across_threads_keep_their_versions_through_compaction() {
         assert_eq!(waiter.join().unwrap(), 0, "the wait missed a release");
     });
     assert_eq!(db.get_int_property("regolith.num-snapshots"), Some(0));
-    db.compact_range(None, None).unwrap();
+    db.compact_range(None, None).wait().unwrap();
     for k in 0..20u64 {
         let value = db.get(&numbered(k)).unwrap().unwrap();
         assert_eq!(
@@ -328,7 +329,7 @@ fn a_cache_full_of_held_sealed_blocks_refuses_counts_and_queued_reads_still_land
             db.put(&numbered(i), &[b'v'; 200]).unwrap();
         }
         db.flush().unwrap();
-        db.compact_range(None, None).unwrap();
+        db.compact_range(None, None).wait().unwrap();
         db.close().unwrap();
     }
     let db = Db::open(dir.path(), small_sealed_cache(&stats)).unwrap();
@@ -394,7 +395,7 @@ fn close_completes_queued_reads_of_sealed_blocks_the_cache_cannot_keep() {
             db.put(&numbered(i), &[b'v'; 200]).unwrap();
         }
         db.flush().unwrap();
-        db.compact_range(None, None).unwrap();
+        db.compact_range(None, None).wait().unwrap();
         db.close().unwrap();
     }
     let db = Db::open(dir.path(), small_sealed_cache(&stats)).unwrap();
@@ -465,6 +466,7 @@ fn a_hard_open_file_limit_reads_sealed_tables_and_an_ingest_at_its_sequence() {
         }
         writer.finish().unwrap();
         db.ingest_external_files(std::slice::from_ref(&source), IngestOptions::default())
+            .wait()
             .unwrap();
         db.close().unwrap();
     }
@@ -544,7 +546,7 @@ fn backups_and_checkpoints_never_copy_a_table_renamed_aside() {
     for i in 0..200 {
         db.put(&numbered(i), b"after").unwrap();
     }
-    db.compact_range(None, None).unwrap();
+    db.compact_range(None, None).wait().unwrap();
     // The four the iterator holds; the table the compaction flushed first is
     // held only by views the reclaimer has yet to free, and may go any time.
     let aside: Vec<PathBuf> = table_dir_files(&dir, REMOVED)
@@ -563,7 +565,11 @@ fn backups_and_checkpoints_never_copy_a_table_renamed_aside() {
     );
 
     let checkpoint = root.path().join("checkpoint");
-    Checkpoint::new(&db).unwrap().create(&checkpoint).unwrap();
+    Checkpoint::new(&db)
+        .unwrap()
+        .create(&checkpoint)
+        .wait()
+        .unwrap();
     let backups = root.path().join("backups");
     let mut engine = BackupEngine::open(&backups).unwrap();
     let id = engine.create_backup(&db).unwrap();

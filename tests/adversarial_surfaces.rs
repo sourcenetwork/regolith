@@ -19,12 +19,12 @@ fn dbslice_hash_and_eq_agree_across_every_owner() {
     let db = Db::open(dir.path(), Options::default().write_buffer_size(4 * 1024)).unwrap();
 
     let payload = vec![b'q'; 300];
-    db.put(b"same_a", &payload).unwrap();
+    regolith::through_stalls(|| db.put(b"same_a", &payload)).unwrap();
     // Arena-backed, straight out of the memtable.
     let arena_slice = db.get_slice(b"same_a").unwrap().unwrap();
 
-    db.put(b"same_b", &payload).unwrap();
-    db.compact_range(None, None).unwrap();
+    regolith::through_stalls(|| db.put(b"same_b", &payload)).unwrap();
+    db.compact_range(None, None).wait().unwrap();
     // Block-backed, out of an SSTable.
     let block_slice = db.get_slice(b"same_b").unwrap().unwrap();
 
@@ -56,8 +56,8 @@ fn dbslice_hash_and_eq_agree_across_every_owner() {
     assert!(!set.insert(sub), "an equal subslice hashed differently");
 
     // Ordering must agree with the bytes.
-    db.put(b"low", b"aaa").unwrap();
-    db.put(b"high", b"zzz").unwrap();
+    regolith::through_stalls(|| db.put(b"low", b"aaa")).unwrap();
+    regolith::through_stalls(|| db.put(b"high", b"zzz")).unwrap();
     let lo = db.get_slice(b"low").unwrap().unwrap();
     let hi = db.get_slice(b"high").unwrap().unwrap();
     assert!(lo < hi, "DbSlice ordering disagreed with byte ordering");
@@ -92,7 +92,7 @@ fn a_cross_column_family_batch_is_atomic_under_group_commit() {
                         batch.put_cf(cf, format!("w{w}_{round:05}_{k}").as_bytes(), b"v");
                     }
                 }
-                db.write(batch).unwrap();
+                regolith::through_stalls(|| db.write(batch.clone())).unwrap();
                 frontier.fetch_max(round, Ordering::Release);
             }
         }));
@@ -178,7 +178,7 @@ fn a_checkpoint_taken_under_load_is_a_consistent_point_in_time() {
                         format!("w{w}r{round}").as_bytes(),
                     );
                 }
-                db.write(batch).unwrap();
+                regolith::through_stalls(|| db.write(batch.clone())).unwrap();
                 round += 1;
             }
             round
@@ -188,7 +188,7 @@ fn a_checkpoint_taken_under_load_is_a_consistent_point_in_time() {
     let target = TempDir::new().unwrap();
     let cp_dir = target.path().join("cp");
     thread::sleep(std::time::Duration::from_millis(60));
-    db.checkpoint(&cp_dir).unwrap();
+    db.checkpoint(&cp_dir).wait().unwrap();
     thread::sleep(std::time::Duration::from_millis(20));
     stop.store(true, Ordering::Relaxed);
     for w in writers {
@@ -244,7 +244,7 @@ fn a_backup_taken_under_load_restores_whole_batches() {
                         format!("w{w}r{round}").as_bytes(),
                     );
                 }
-                db.write(batch).unwrap();
+                regolith::through_stalls(|| db.write(batch.clone())).unwrap();
                 round += 1;
             }
         }));
@@ -300,7 +300,7 @@ fn a_tailing_iterator_never_surfaces_a_partial_batch() {
                 for k in 0..10 {
                     batch.put(format!("t{w}_{round:05}_{k}").as_bytes(), b"v");
                 }
-                db.write(batch).unwrap();
+                regolith::through_stalls(|| db.write(batch.clone())).unwrap();
             }
         }));
     }

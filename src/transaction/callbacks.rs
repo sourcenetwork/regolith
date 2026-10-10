@@ -184,11 +184,14 @@ fn panicked(callback: &'static str) -> Error {
 }
 
 /// Run a callback after the outcome is decided: a panic cannot change the
-/// outcome, so it is caught and reported to the listeners.
-pub(super) fn survive(engine: &RegolithEngine, callback: &'static str, f: impl FnOnce()) {
-    if caught(callback, f).is_err() {
-        engine.notify_callback_panic(callback);
-    }
+/// outcome, so it is caught and reported to the listeners of `engine`, when
+/// it is still there to tell.
+pub(super) fn survive_after(
+    engine: Option<&RegolithEngine>,
+    callback: &'static str,
+    f: impl FnOnce(),
+) {
+    crate::engine::callback::survive(engine, callback, f);
 }
 
 #[derive(Default)]
@@ -207,7 +210,7 @@ struct Queues {
 /// `on_abort` ones are in the transaction's claim, except while a callback is
 /// running; see `Queues::on_abort`.)
 #[derive(Default)]
-pub(super) struct Callbacks {
+pub(crate) struct Callbacks {
     queues: Option<Box<Exclusive<Queues>>>,
     /// `before_commit` callbacks and hooks running now, outermost first: while
     /// there is one, an `on_abort` registration goes to `Queues::on_abort`.
@@ -488,54 +491,44 @@ impl Transaction {
     /// outcome's. `claimed` is whether the owner won the commit claim; if
     /// `close` aborted the transaction first, `close` ran its callbacks and
     /// only those registered since are left.
+    ///
+    /// A transaction with nothing to run (no callback, no claim, no hooks)
+    /// pays this one check.
     pub(super) fn finish(&mut self, claimed: bool, result: &TxResult<CommitReceipt>) {
-        match (claimed, result) {
-            (true, Ok(receipt)) => self.finish_commit(*receipt),
-            (true, Err(error)) => self.finish_abort(&AbortReason::of(error)),
-            (false, _) => self.finish_closed(),
+        if self.has_ending() {
+            self.ending().finish(claimed, result);
         }
     }
 
-    fn finish_commit(&mut self, receipt: CommitReceipt) {
-        if let Some(mut own) = self.callbacks.take() {
-            while let Some(f) = own.on_commit.pop() {
-                survive(&self.engine, "on_commit", || f(&receipt));
-            }
-        }
-        if let Some(hooks) = self.engine.transaction_hooks() {
-            let info = CommitInfo {
-                receipt,
-                isolation: self.isolation,
-            };
-            survive(&self.engine, "TransactionHooks::on_commit", || {
-                hooks.on_commit(&info)
-            });
-        }
+    fn has_ending(&self) -> bool {
+        self.callbacks.queues.is_some()
+            || self.claim.is_some()
+            || self.engine.transaction_hooks().is_some()
     }
 
-    fn finish_abort(&mut self, reason: &AbortReason<'_>) {
-        drop(self.callbacks.take());
-        if let Some(claim) = &self.claim {
-            claim.run_abort(&self.engine, reason);
-        }
-    }
-
-    /// `close` already ended this transaction and ran its callbacks; run the
-    /// ones registered after it did.
-    fn finish_closed(&mut self) {
-        drop(self.callbacks.take());
-        if let Some(claim) = &self.claim {
-            claim.run_callbacks(&self.engine, &AbortReason::Closed);
+    /// What ending this transaction runs, taken out of it: its `on_commit`
+    /// callbacks, its claim on the `on_abort` ones, and the database hooks.
+    /// A commit whose outcome is delivered through its ticket carries this to
+    /// the thread that delivers it.
+    pub(super) fn ending(&mut self) -> Ending {
+        Ending {
+            callbacks: std::mem::take(&mut self.callbacks),
+            claim: self.claim.clone(),
+            isolation: self.isolation,
+            hooks: self.engine.transaction_hooks().cloned(),
+            report: Arc::downgrade(&self.engine),
         }
     }
 
     /// End a transaction the owner rolled back or dropped before any commit
     /// claimed it. The owner wins the abort unless `close` did.
     fn end_open(&mut self, reason: &AbortReason<'_>) {
-        if self.claim.as_ref().is_some_and(|claim| claim.owner_abort()) {
-            self.finish_abort(reason);
+        let won = self.claim.as_ref().is_some_and(|claim| claim.owner_abort());
+        let mut ending = self.ending();
+        if won {
+            ending.abort(reason);
         } else {
-            self.finish_closed();
+            ending.closed();
         }
     }
 
@@ -555,5 +548,71 @@ impl Transaction {
             AbortReason::Dropped
         };
         self.end_open(&reason);
+    }
+}
+
+/// What ending a transaction runs, detached from it: its own `on_commit`
+/// callbacks, its claim (which holds its `on_abort` callbacks), and the
+/// database hooks. The one place the outcome's callbacks run, whether the
+/// committing call ends the transaction or a ticket's delivery does.
+///
+/// Holds the database weakly, only to report a panicking callback to its
+/// listeners; the hooks are held themselves, so they still run when the
+/// last handle went away before a ticket was delivered.
+pub(crate) struct Ending {
+    callbacks: Callbacks,
+    claim: Option<Arc<Claim>>,
+    isolation: IsolationLevel,
+    hooks: Option<Arc<dyn TransactionHooks>>,
+    report: std::sync::Weak<RegolithEngine>,
+}
+
+impl Ending {
+    /// Run the callbacks of the outcome `result` is, and drop the other
+    /// outcome's. `claimed`: as for [`Transaction::finish`].
+    pub(crate) fn finish(mut self, claimed: bool, result: &TxResult<CommitReceipt>) {
+        match (claimed, result) {
+            (true, Ok(receipt)) => self.commit(*receipt),
+            (true, Err(error)) => self.abort(&AbortReason::of(error)),
+            (false, _) => self.closed(),
+        }
+    }
+
+    fn commit(&mut self, receipt: CommitReceipt) {
+        let report = self.report.upgrade();
+        if let Some(mut own) = self.callbacks.take() {
+            while let Some(f) = own.on_commit.pop() {
+                survive_after(report.as_deref(), "on_commit", || f(&receipt));
+            }
+        }
+        if let Some(hooks) = &self.hooks {
+            let info = CommitInfo {
+                receipt,
+                isolation: self.isolation,
+            };
+            survive_after(report.as_deref(), "TransactionHooks::on_commit", || {
+                hooks.on_commit(&info)
+            });
+        }
+    }
+
+    fn abort(&mut self, reason: &AbortReason<'_>) {
+        drop(self.callbacks.take());
+        if let Some(claim) = &self.claim {
+            claim.run_abort(
+                self.report.upgrade().as_deref(),
+                self.hooks.as_ref(),
+                reason,
+            );
+        }
+    }
+
+    /// `close` already ended this transaction and ran its callbacks; run the
+    /// ones registered after it did.
+    fn closed(&mut self) {
+        drop(self.callbacks.take());
+        if let Some(claim) = &self.claim {
+            claim.run_callbacks(self.report.upgrade().as_deref(), &AbortReason::Closed);
+        }
     }
 }

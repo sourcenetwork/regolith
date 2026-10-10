@@ -67,7 +67,6 @@ mod store;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
 
 use kovan_map::HashMap;
 use wasm_bindgen::JsValue;
@@ -467,12 +466,6 @@ impl Env for OpfsEnv {
             "this wasm target has no threads; set Options::max_background_compactions = 0 \
              to run compaction on the calling thread",
         ))
-    }
-
-    fn sleep(&self, _duration: Duration) {
-        // Nothing on this target can block the only thread there is. The
-        // caller is the write-slowdown delay, which runs
-        // `StallPolicy::CompactInline` here and never reaches this.
     }
 }
 

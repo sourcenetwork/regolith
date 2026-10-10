@@ -1,4 +1,4 @@
-//! What a non-blocking read hands back instead of waiting.
+//! What a non-blocking call hands back instead of waiting.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -7,6 +7,7 @@ use std::task::{Context, Poll};
 
 use super::QueueId;
 use crate::engine::io::atomic_waker::AtomicWaker;
+use crate::engine::io::job::Job;
 use crate::engine::io::shared::{QueueShared, WaitSlot};
 use crate::engine::io::unit::UnitKey;
 
@@ -24,6 +25,12 @@ pub enum WouldBlock {
     /// names; poll that queue, then run the read again.
     #[error("the read needs a block that is not cached; poll its I/O queue and run the read again")]
     Io(IoWait),
+    /// A write met a write stall: too many level-0 tables, too many memtables
+    /// waiting to be flushed, or too much data waiting to be compacted. The
+    /// write applied nothing. Wait for the stall to clear, then run the write
+    /// again.
+    #[error("writes are stalled behind background work ({}); wait for the stall to clear and run the write again", .0.reason())]
+    Stall(StallWait),
 }
 
 /// Names the device read an [`IoWait`] waits on. Two waits name the same
@@ -45,6 +52,58 @@ impl From<UnitKey> for IoUnit {
     }
 }
 
+/// One wait on a [`WaitSlot`]: the slot, and this wait's own registration on
+/// it, made by its first pending poll and reused after. Shared by every wait
+/// a call hands back.
+struct Listen {
+    slot: Arc<WaitSlot>,
+    listener: Option<Arc<AtomicWaker>>,
+}
+
+impl Listen {
+    fn new(slot: Arc<WaitSlot>) -> Self {
+        Self {
+            slot,
+            listener: None,
+        }
+    }
+
+    fn is_ready(&self) -> bool {
+        self.slot.is_ready()
+    }
+
+    fn poll(&mut self, cx: &mut Context<'_>) -> Poll<()> {
+        if self.slot.is_ready() {
+            return Poll::Ready(());
+        }
+        match &self.listener {
+            Some(listener) => listener.register(cx.waker()),
+            None => {
+                let listener = Arc::new(AtomicWaker::new());
+                listener.register(cx.waker());
+                // Refused only when the wait is ready already.
+                if !self.slot.listen(Arc::clone(&listener)) {
+                    return Poll::Ready(());
+                }
+                self.listener = Some(listener);
+            }
+        }
+        // The slot may have completed between the check above and the
+        // registration: it then woke the old waker or none, so look again.
+        if self.slot.is_ready() {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
+    }
+}
+
+impl Clone for Listen {
+    fn clone(&self) -> Self {
+        Self::new(Arc::clone(&self.slot))
+    }
+}
+
 /// A wait for one `CacheOnly` read, ready once the queue it was recorded on
 /// has finished the read.
 ///
@@ -59,11 +118,9 @@ impl From<UnitKey> for IoUnit {
 /// through its own registration, so several tasks may await clones at once.
 /// Dropping a wait never cancels the read: the queue completes it all the
 /// same.
+#[derive(Clone)]
 pub struct IoWait {
-    slot: Arc<WaitSlot>,
-    /// This wait's own registration on `slot`, made by its first pending
-    /// poll and reused after.
-    listener: Option<Arc<AtomicWaker>>,
+    listen: Listen,
     queue: QueueId,
     unit: Option<IoUnit>,
 }
@@ -73,8 +130,7 @@ impl IoWait {
     /// room in the queue's byte bound).
     pub(crate) fn new(queue: &QueueShared, unit: Option<UnitKey>, slot: Arc<WaitSlot>) -> Self {
         Self {
-            slot,
-            listener: None,
+            listen: Listen::new(slot),
             queue: queue.id(),
             unit: unit.map(IoUnit::from),
         }
@@ -95,24 +151,13 @@ impl IoWait {
 
     /// Whether the queue finished this read. Never waits.
     pub fn is_ready(&self) -> bool {
-        self.slot.is_ready()
+        self.listen.is_ready()
     }
 
     /// This wait as the `io::Error` the engine's read paths carry it in; the
     /// public error types take it back out by value.
     pub(crate) fn into_io_error(self) -> std::io::Error {
         std::io::Error::new(std::io::ErrorKind::WouldBlock, WouldBlock::Io(self))
-    }
-}
-
-impl Clone for IoWait {
-    fn clone(&self) -> Self {
-        Self {
-            slot: Arc::clone(&self.slot),
-            listener: None,
-            queue: self.queue,
-            unit: self.unit,
-        }
     }
 }
 
@@ -130,28 +175,127 @@ impl Future for IoWait {
     type Output = ();
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-        let this = self.get_mut();
-        if this.slot.is_ready() {
-            return Poll::Ready(());
+        self.get_mut().listen.poll(cx)
+    }
+}
+
+/// A wait for a write stall to clear, handed back by a write the stall
+/// stopped ([`WouldBlock::Stall`]).
+///
+/// The stall clears when background work catches up: a flush that writes a
+/// memtable out, a compaction that merges level-0 tables. Whoever's work
+/// clears it completes this wait. A write from a thread with an
+/// [`IoQueue`](crate::IoQueue) open records the wait on that queue, and it
+/// becomes ready only at that queue's [`poll`](crate::IoQueue::poll), on
+/// that thread; a write from a thread with none is completed directly, on
+/// the thread whose work cleared the stall, and [`StallWait::wait`] blocks
+/// for it. Ready means the write can run again; the stall may have come back
+/// by then, and the write run again says so.
+///
+/// On a database with no compaction worker, nothing clears a stall unless a
+/// caller compacts: with [`Options::inline_compaction`](crate::Options::inline_compaction)
+/// on, the stopped write also leaves the step that clears it on its thread's
+/// queue (or runs it inline when the thread has none); otherwise call
+/// [`Db::compact_step`](crate::Db::compact_step) or [`Db::flush`](crate::Db::flush).
+///
+/// It is a [`Future`] with output `()`. Clones wait on the same stall.
+/// Dropping a wait cancels nothing.
+#[derive(Clone)]
+pub struct StallWait {
+    listen: Listen,
+    /// The stall's unit, which lands when the stall clears. Read only by the
+    /// blocking wait, which `wasm32` lacks.
+    #[cfg_attr(target_arch = "wasm32", expect(dead_code))]
+    stall: Arc<Job>,
+    queue: Option<QueueId>,
+    reason: &'static str,
+}
+
+impl StallWait {
+    pub(crate) fn new(
+        slot: Arc<WaitSlot>,
+        stall: Arc<Job>,
+        queue: Option<QueueId>,
+        reason: &'static str,
+    ) -> Self {
+        Self {
+            listen: Listen::new(slot),
+            stall,
+            queue,
+            reason,
         }
-        match &this.listener {
-            Some(listener) => listener.register(cx.waker()),
-            None => {
-                let listener = Arc::new(AtomicWaker::new());
-                listener.register(cx.waker());
-                // Refused only when the read is ready already.
-                if !this.slot.listen(Arc::clone(&listener)) {
-                    return Poll::Ready(());
-                }
-                this.listener = Some(listener);
-            }
-        }
-        // The queue may have completed the read between the check above and
-        // the registration: it then woke the old waker or none, so look again.
-        if this.slot.is_ready() {
-            Poll::Ready(())
-        } else {
-            Poll::Pending
+    }
+
+    /// The queue this wait was recorded on, whose poll makes it ready; `None`
+    /// for a write from a thread with no queue.
+    pub fn queue(&self) -> Option<QueueId> {
+        self.queue
+    }
+
+    /// Which stall stopped the write.
+    pub fn reason(&self) -> &'static str {
+        self.reason
+    }
+
+    /// Whether the stall cleared. Never waits.
+    pub fn is_ready(&self) -> bool {
+        self.listen.is_ready()
+    }
+
+    /// Block this thread until the stall clears: a blocking caller's way to
+    /// wait. It waits for the stall itself, so it returns whether or not the
+    /// wait was recorded on a queue; a wait on a queue still becomes ready
+    /// only at that queue's poll.
+    ///
+    /// Not on `wasm32`, whose one thread would wait for work only it can do.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn wait(&self) {
+        self.stall.wait_landed();
+    }
+}
+
+impl std::fmt::Debug for StallWait {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StallWait")
+            .field("queue", &self.queue)
+            .field("reason", &self.reason)
+            .field("ready", &self.is_ready())
+            .finish()
+    }
+}
+
+impl Future for StallWait {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        self.get_mut().listen.poll(cx)
+    }
+}
+
+/// Run a write `call` until no write stall stops it: on
+/// [`WouldBlock::Stall`], block this thread until the stall clears
+/// ([`StallWait::wait`]) and call again. Any other outcome is returned.
+///
+/// For a blocking caller that would rather wait out a stall than handle it:
+/// the write itself never waits, so this is where the waiting is
+/// chosen, by the caller, on its own thread. On a database with no
+/// compaction worker the stall clears only when something compacts: inline
+/// compaction ([`Options::inline_compaction`](crate::Options::inline_compaction))
+/// on a thread with no queue relieves it inside the write itself, and
+/// otherwise this waits until another thread compacts.
+///
+/// ```no_run
+/// # use regolith::{Db, Options, through_stalls};
+/// # let db = Db::open("/tmp/through_stalls_doc", Options::default())?;
+/// through_stalls(|| db.put(b"key", b"value"))?;
+/// # Ok::<(), regolith::Error>(())
+/// ```
+#[cfg(not(target_arch = "wasm32"))]
+pub fn through_stalls<T>(mut call: impl FnMut() -> crate::Result<T>) -> crate::Result<T> {
+    loop {
+        match call() {
+            Err(crate::Error::WouldBlock(WouldBlock::Stall(stall))) => stall.wait(),
+            other => return other,
         }
     }
 }

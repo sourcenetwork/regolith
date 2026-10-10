@@ -50,7 +50,7 @@ fn many_writers_never_let_a_snapshot_see_a_torn_batch() {
                 for k in 0..BATCH_WIDTH {
                     batch.put(&batch_key(w, round, k), b"v");
                 }
-                db.write(batch).unwrap();
+                regolith::through_stalls(|| db.write(batch.clone())).unwrap();
             }
             frontier[w].store(batches_per_writer, Ordering::Release);
         }));
@@ -101,7 +101,7 @@ fn many_writers_never_let_a_snapshot_see_a_torn_batch() {
         thread::spawn(move || {
             let mut rounds = 0usize;
             while !stop.load(Ordering::Relaxed) {
-                db.compact_range(None, None).unwrap();
+                db.compact_range(None, None).wait().unwrap();
                 rounds += 1;
             }
             rounds
@@ -154,7 +154,7 @@ fn a_held_snapshot_never_changes_under_concurrent_commits() {
         .map(|i| format!("probe_{i:04}").into_bytes())
         .collect();
     for (i, k) in probe_keys.iter().enumerate() {
-        db.put(k, format!("gen0_{i}").as_bytes()).unwrap();
+        regolith::through_stalls(|| db.put(k, format!("gen0_{i}").as_bytes())).unwrap();
     }
 
     let snap = db.snapshot();
@@ -187,7 +187,7 @@ fn a_held_snapshot_never_changes_under_concurrent_commits() {
                     batch.put(format!("f{w}_{round}_{filler}").as_bytes(), &[b'x'; 128]);
                 }
                 batch.delete(&probe_keys[round % probe_keys.len()]);
-                db.write(batch).unwrap();
+                regolith::through_stalls(|| db.write(batch.clone())).unwrap();
                 round += 1;
             }
             round
@@ -199,7 +199,7 @@ fn a_held_snapshot_never_changes_under_concurrent_commits() {
         let stop = Arc::clone(&stop);
         thread::spawn(move || {
             while !stop.load(Ordering::Relaxed) {
-                db.compact_range(None, None).unwrap();
+                db.compact_range(None, None).wait().unwrap();
             }
         })
     };
@@ -315,7 +315,7 @@ fn mixed_durability_writers_keep_batches_atomic() {
                 for k in 0..BATCH_WIDTH {
                     batch.put(&batch_key(w, round, k), b"v");
                 }
-                db.write_opt(&wo, batch).unwrap();
+                regolith::through_stalls(|| db.write_opt(&wo, batch.clone())).unwrap();
             }
             frontier[w].store(400, Ordering::Release);
         }));

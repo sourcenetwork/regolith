@@ -36,7 +36,9 @@ impl RegolithEngine {
     /// counter.
     pub(crate) fn allocate(&self, key: Vec<u8>, n: u64) -> io::Result<Range<u64>> {
         self.ensure_writable()?;
-        let mut pipe = self.pipeline.lock();
+        // The group a nowait leader left owing lands first: it may hold the
+        // counter's last reservation, which the view must show.
+        let mut pipe = self.lock_pipeline();
         let view = self.view.load();
         let last = self.read_u64_in_view(&key, &view)?.unwrap_or(0);
         let first = last.saturating_add(1);
@@ -60,7 +62,13 @@ impl RegolithEngine {
             durability: DurabilityMode::Eventual,
             disable_wal: false,
         };
-        self.lead_with(&mut pipe, request)?;
+        // A group that a nowait member left owing its fsync is landed here:
+        // the reservation is handed out only once its record is in a group
+        // that did not fail, so a failed sync never hands out a value the log
+        // lost.
+        if let super::Settled::Pending { group, member } = self.lead_with(&mut pipe, request)? {
+            group.settle(self, member)?;
+        }
         Ok(first..end)
     }
 }

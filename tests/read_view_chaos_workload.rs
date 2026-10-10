@@ -265,7 +265,7 @@ fn run_instance(versions: u64, min_rounds: u64) -> Vec<String> {
             gate.wait();
             let mut n = 0u64;
             loop {
-                db.compact_range(None, None).expect("compact_range");
+                db.compact_range(None, None).wait().expect("compact_range");
                 n += 1;
                 beat.fetch_add(1, Ordering::Relaxed);
                 if n >= COMPACT_PASSES_PER_INSTANCE || (n >= 2 && live.load(Ordering::Acquire) == 0)
@@ -310,6 +310,7 @@ fn run_instance(versions: u64, min_rounds: u64) -> Vec<String> {
             loop {
                 let p = external_table(&ext, n);
                 db.ingest_external_files(&[p], IngestOptions::default())
+                    .wait()
                     .expect("ingest");
                 n += 1;
                 beat.fetch_add(1, Ordering::Relaxed);
@@ -330,7 +331,7 @@ fn run_instance(versions: u64, min_rounds: u64) -> Vec<String> {
             let mut n = 0u64;
             loop {
                 let target = cp.join(format!("cp_{n}"));
-                db.checkpoint(&target).expect("checkpoint");
+                db.checkpoint(&target).wait().expect("checkpoint");
                 std::fs::remove_dir_all(&target).expect("rm checkpoint");
                 n += 1;
                 beat.fetch_add(1, Ordering::Relaxed);

@@ -310,7 +310,7 @@ fn run(flavor: Flavor, style: CompactionStyle, ops: &[Op]) -> Result<(), TestCas
                 None
             }
             Op::Compact => {
-                db.compact_range(None, None).unwrap();
+                db.compact_range(None, None).wait().unwrap();
                 check(flavor, &db, &log, &held)?;
                 None
             }
@@ -406,7 +406,7 @@ fn operands_above_a_live_snapshot_fold_when_the_operator_can() {
     db.flush().unwrap();
     let flushed = sst_bytes(&db);
 
-    db.compact_range(None, None).unwrap();
+    db.compact_range(None, None).wait().unwrap();
 
     assert!(
         sst_bytes(&db) < flushed / 4,
@@ -427,7 +427,7 @@ fn operands_above_a_live_snapshot_stay_operands_when_the_operator_cannot_fold_th
     db.flush().unwrap();
     let flushed = sst_bytes(&db);
 
-    db.compact_range(None, None).unwrap();
+    db.compact_range(None, None).wait().unwrap();
 
     assert!(
         sst_bytes(&db) > flushed / 2,
@@ -449,7 +449,7 @@ fn a_put_above_a_live_snapshot_folds_the_operands_over_it_whatever_the_operator(
     db.flush().unwrap();
     let flushed = sst_bytes(&db);
 
-    db.compact_range(None, None).unwrap();
+    db.compact_range(None, None).wait().unwrap();
 
     assert!(
         sst_bytes(&db) < flushed / 4,
@@ -551,7 +551,7 @@ fn an_expired_value_is_reclaimed_by_compaction_while_a_snapshot_is_live() {
         "expired values read absent"
     );
 
-    db.compact_range(None, None).unwrap();
+    db.compact_range(None, None).wait().unwrap();
 
     assert!(
         !tables_hold(&env, root, MARKER),
@@ -600,7 +600,7 @@ fn the_range_delete_filter_runs_while_a_snapshot_is_live() {
     assert_eq!(snapshot.get(b"c").unwrap(), None, "the range delete holds");
     db.flush().unwrap();
 
-    db.compact_range(None, None).unwrap();
+    db.compact_range(None, None).wait().unwrap();
 
     // The filter removed the tombstone, so the values it hid read again, to
     // the snapshot as well as to the head.
@@ -629,7 +629,7 @@ fn a_blind_merge_commits_after_the_operands_beside_it_were_compacted() {
         merge_ones(db.db());
         db.db().flush().unwrap();
         let flushed = sst_bytes(db.db());
-        db.db().compact_range(None, None).unwrap();
+        db.db().compact_range(None, None).wait().unwrap();
         if fold {
             assert!(
                 sst_bytes(db.db()) < flushed / 4,
@@ -687,7 +687,7 @@ fn a_replacement_above_the_snapshot_still_conflicts_after_the_operands_over_it_w
             merge_ones(db.db());
             db.db().flush().unwrap();
             let flushed = sst_bytes(db.db());
-            db.db().compact_range(None, None).unwrap();
+            db.db().compact_range(None, None).wait().unwrap();
 
             // The operands fold onto a put or delete above the snapshot
             // whatever the operator, and into one another only if it can.

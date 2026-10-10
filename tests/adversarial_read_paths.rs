@@ -287,7 +287,7 @@ fn run(seed: u64, steps: usize, opts: Options) {
                 }
             }
             _ => {
-                db.compact_range(None, None).unwrap();
+                db.compact_range(None, None).wait().unwrap();
             }
         }
 

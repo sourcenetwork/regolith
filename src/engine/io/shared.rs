@@ -3,8 +3,10 @@
 //!
 //! Only the queue's owner takes from the inbox; any thread pushes to it. A
 //! `CacheOnly` read pushes a request there, whatever thread it runs on, and
-//! the thread that finishes a unit pushes the completion there. A push that
-//! finds the owner idle wakes it, once; a push to a busy owner wakes nobody.
+//! the thread that finishes a unit pushes the completion there. So does a
+//! call that leaves a job for the queue's thread (a commit's fsync, an owed
+//! step, a stall), and a thread that finished one. A push that finds the
+//! owner idle wakes it, once; a push to a busy owner wakes nobody.
 
 use std::io;
 use std::sync::{Arc, OnceLock};
@@ -13,6 +15,7 @@ use kovan_map::HashMap;
 
 use super::Landed;
 use super::atomic_waker::AtomicWaker;
+use super::job::{Delivery, Job};
 use super::stack::{IDLE, Rest, SHUT, Stack};
 use super::unit::{Unit, UnitKey};
 use crate::io_queue::QueueId;
@@ -34,6 +37,17 @@ pub(crate) enum Message {
     Room(Arc<WaitSlot>),
     /// `unit` finished; one per unit this queue registered on.
     Done(Arc<Unit>),
+    /// A call on this queue's thread waits on `job`; `waiter`, when there is
+    /// one, is told on this thread once the job lands.
+    Job {
+        job: Arc<Job>,
+        waiter: Option<Arc<dyn Delivery>>,
+    },
+    /// `job` landed; one per job this queue registered on.
+    JobDone(Arc<Job>),
+    /// A completion decided on another thread, to be told on this one: a
+    /// foreground job a worker ran for a caller on this queue.
+    Deliver(Arc<dyn Delivery>),
 }
 
 /// What a finished unit left for the reads of one queue.
@@ -58,6 +72,20 @@ pub(crate) struct QueueShared {
     /// Reads that landed for this queue, so a read run again finds its block
     /// even when the block cache did not keep it. Made by the first landing.
     landed: OnceLock<HashMap<UnitKey, Landing>>,
+    /// The thread that made or last polled the queue, as its
+    /// [`thread_token`]: I/O regolith starts on a thread goes to the queue
+    /// that thread owns.
+    owner: AtomicUsize,
+}
+
+thread_local! {
+    /// One byte per thread, whose address names the thread while it lives.
+    static TOKEN: u8 = const { 0 };
+}
+
+/// A number naming the calling thread, unique among the threads alive now.
+pub(crate) fn thread_token() -> usize {
+    TOKEN.with(|token| std::ptr::from_ref(token).addr())
 }
 
 impl QueueShared {
@@ -69,7 +97,20 @@ impl QueueShared {
             pending: AtomicUsize::new(0),
             bound,
             landed: OnceLock::new(),
+            owner: AtomicUsize::new(0),
         }
+    }
+
+    /// Record the calling thread as the queue's owner. `true` when it was
+    /// not already.
+    pub(crate) fn own(&self) -> bool {
+        let me = thread_token();
+        self.owner.swap(me, Ordering::Relaxed) != me
+    }
+
+    /// Whether the calling thread owns the queue.
+    pub(crate) fn owned_here(&self) -> bool {
+        self.owner.load(Ordering::Relaxed) == thread_token()
     }
 
     pub(crate) fn id(&self) -> QueueId {
@@ -213,6 +254,12 @@ impl WaitSlot {
     /// ready, and nothing was added.
     pub(crate) fn listen(&self, waker: Arc<AtomicWaker>) -> bool {
         self.wakers.push(waker, SHUT).is_ok()
+    }
+}
+
+impl Delivery for WaitSlot {
+    fn deliver(&self) {
+        self.complete();
     }
 }
 

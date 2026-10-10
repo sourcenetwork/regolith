@@ -193,7 +193,7 @@ mod tests {
                         continue;
                     }
                     Op::Compact => {
-                        db.compact_range(None, None).unwrap();
+                        db.compact_range(None, None).wait().unwrap();
                         continue;
                     }
                 }

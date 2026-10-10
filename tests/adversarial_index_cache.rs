@@ -42,7 +42,7 @@ fn seeded(partitioned: bool) -> TempDir {
     for i in 0..KEYS {
         db.put(&key_for(i), &value_for(i)).unwrap();
     }
-    db.compact_range(None, None).unwrap();
+    db.compact_range(None, None).wait().unwrap();
     db.close().unwrap();
     dir
 }

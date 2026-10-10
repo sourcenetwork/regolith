@@ -237,6 +237,7 @@ fn an_ingest_installed_after_the_drop_is_refused() {
     std::thread::scope(|scope| {
         let ingest = scope.spawn(|| {
             db.ingest_external_files(std::slice::from_ref(&source), IngestOptions::default())
+                .wait()
         });
         // The ingest takes the compaction gate once its table is staged and
         // validated, then waits here for the pipeline.

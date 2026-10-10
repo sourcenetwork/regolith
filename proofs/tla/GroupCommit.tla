@@ -25,6 +25,18 @@
 \* h. A leader that trusted the early check and skipped the part above h
 \* (RED TrustEarly) would miss a write that landed between the two.
 \*
+\* A commit made by `commit_nowait` must not wait for the fsync either, so
+\* a group that needs one and holds such a member is only written by its
+\* leader and left OWED: its fsync becomes a job that the first of its
+\* members to poll its own queue claims with one compare-and-swap and runs
+\* (sync, apply, publish, answer everyone). A blocking member, or the next
+\* writer to take the pipeline, claims it the same way. Tiny example:
+\* commits 1 and 3 share a group and both were made by commit_nowait. The
+\* leader writes the group and returns; 3's poll claims the job and runs the
+\* fsync; 1's poll finds it claimed and leaves it. The fsync runs once
+\* (RED DoubleClaim shows a claim that is not one CAS running it twice), and
+\* nothing in the group is visible before it (DurableBeforeVisible again).
+\*
 \* Three more promises are checked. A commit made durable by an fsync is
 \* visible only after that fsync (RED PublishBeforeSync shows a reader seeing
 \* a commit a power cut would erase). A leader commits one group and then
@@ -74,6 +86,12 @@
 \*   log_group, sync_group              Write and Sync: one append, one fsync.
 \*   run_group                          Apply and Publish, after the fsync.
 \*   run_and_complete                   Complete, or Fail for G2.
+\*   defer_group, GroupSync (deferred.rs) Defer: a group with a nowait member
+\*                                      that needs an fsync is left owed.
+\*   Job::claim, land_pending,          ClaimOwed: a member's poll, a
+\*     land_here                        blocking member or the next pipeline
+\*                                      holder claims the owed group with
+\*                                      one CAS; OwedSync is its fsync.
 \*   hand_off (E21)                     HandOff: pop the ring's head into
 \*                                      `held`, wake its writer, release.
 \*
@@ -101,6 +119,16 @@
 \*   MC_GroupCommit_Green_ReadOnly         a transaction that only reads
 \*                                         shares groups; every invariant
 \*                                         and AllTicketsComplete hold.
+\*   MC_GroupCommit_Green_Nowait           two of the commits are made by
+\*                                         commit_nowait: their groups are
+\*                                         left owed and claimed; every
+\*                                         invariant and AllTicketsComplete
+\*                                         hold.
+\*   MC_GroupCommit_Green_Nowait_Owes      the witness: the same setup must
+\*                                         break NothingOwed, so the GREEN
+\*                                         run did go through owed groups.
+\*   MC_GroupCommit_Red_DoubleClaim        a claim that also succeeds on a
+\*                                         claimed group: SingleSync fails.
 
 \* We use numbers, sequences (lists) and set sizes.
 EXTENDS Naturals, Sequences, FiniteSets
@@ -123,8 +151,11 @@ CONSTANTS
   MaxGroup,
   \* TRUE: a group's log write or fsync may fail (the G2 path).
   Faults,
+  \* The commits made by commit_nowait: they never wait for an fsync, so a
+  \* group holding one leaves its fsync owed, as a job someone claims.
+  Nowait,
   \* Which bug to plant: "none", "ViewOnly", "PublishBeforeSync",
-  \* "DrainAll" or "TrustEarly".
+  \* "DrainAll", "TrustEarly" or "DoubleClaim".
   Mutant
 
 \* Commits and keys are plain numbers.
@@ -142,8 +173,11 @@ ASSUME Immediate \subseteq Txns
 ASSUME MaxGroup \in Nat \ {0}
 \* Failures are on or off.
 ASSUME Faults \in BOOLEAN
+\* The nowait commits are some of the commits.
+ASSUME Nowait \subseteq Txns
 \* The bug to plant is one we know.
-ASSUME Mutant \in {"none", "ViewOnly", "PublishBeforeSync", "DrainAll", "TrustEarly"}
+ASSUME Mutant \in {"none", "ViewOnly", "PublishBeforeSync", "DrainAll", "TrustEarly",
+                   "DoubleClaim"}
 
 VARIABLES
   \* pc[t]: where commit t is. "idle" (not begun), "begun" (a transaction
@@ -206,12 +240,27 @@ VARIABLES
   \* store: the versions <<key, sequence>> in the memtable.
   store,
   \* visible: the newest sequence a new snapshot sees (visible_seq).
-  visible
+  visible,
+  \* owed: the group is written and its leader let go of the pipeline
+  \* without syncing it; its fsync waits as a job (Pipeline::pending).
+  owed,
+  \* claimers: the commits whose threads claimed the owed group's job. One
+  \* CAS lets exactly one in; the DoubleClaim bug lets a second in.
+  claimers,
+  \* syncedBy: the claimers that have run the owed group's fsync.
+  syncedBy,
+  \* syncRuns: how many times this group's fsync ran (a ghost, for
+  \* SingleSync).
+  syncRuns
 
 \* Every variable, so that a step that changes none of them is a stutter.
 vars == <<pc, snap, hor, queue, held, leader, turnGroups, group, gi, gview,   \* all of them,
           gacc, gwal, stage, synced, dec, seq, pos, npos, outcome,              \* listed once
-          completions, lastSeq, walEnd, durable, store, visible>>
+          completions, lastSeq, walEnd, durable, store, visible,
+          owed, claimers, syncedBy, syncRuns>>
+
+\* The owed group's bookkeeping, so a step that leaves it alone says so once.
+landing == <<owed, claimers, syncedBy, syncRuns>>
 
 ----------------------------------------------------------------------------
 \* Helpers.
@@ -245,6 +294,10 @@ Writers == {m \in Accepted : Writes[m] # {}}
 \* The group needs its fsync: an accepted member that writes asked for
 \* Immediate. A member that only read is no record and forces no sync.
 NeedsSync == Writers \cap Immediate # {}
+
+\* The group's fsync is left owed: it needs one, and some member (a writer
+\* or not) was made by commit_nowait, which must not wait for it.
+Deferred == NeedsSync /\ Members \cap Nowait # {}
 
 \* The versions t writes, all at t's sequence.
 VersionsOf(t) == {<<k, seq[t]>> : k \in Writes[t]}
@@ -318,6 +371,14 @@ Init ==
   /\ store       = {}
   \* Nothing visible.
   /\ visible     = 0
+  \* No group is owed.
+  /\ owed        = FALSE
+  \* Nobody claimed anything.
+  /\ claimers    = {}
+  \* Nobody ran an owed fsync.
+  /\ syncedBy    = {}
+  \* No fsync ran.
+  /\ syncRuns    = 0
 
 \* Transaction t begins (Transaction::begin): its snapshot is what is visible
 \* now, and every read it makes is answered as of that moment.
@@ -334,6 +395,8 @@ Begin(t) ==
   /\ UNCHANGED <<hor, queue, held, leader, turnGroups, group, gi, gview, gacc,
                  gwal, stage, synced, dec, seq, pos, npos, outcome,
                  completions, lastSeq, walEnd, durable, store, visible>>
+  \* The owed group is untouched.
+  /\ UNCHANGED landing
 
 \* Transaction t commits and runs its early check on its own thread, outside
 \* the mutex (check_early). It samples h, the visible sequence, first. If
@@ -366,6 +429,8 @@ Submit(t) ==
      /\ UNCHANGED <<snap, queue, held, leader, turnGroups, group, gi, gview,
                     gacc, gwal, stage, synced, seq, lastSeq, walEnd, durable,
                     store, visible>>
+     \* The owed group is untouched.
+     /\ UNCHANGED landing
 
 \* A plain write is handed to the pipeline: no snapshot, no check.
 PlainSubmit(t) ==
@@ -379,6 +444,8 @@ PlainSubmit(t) ==
   /\ UNCHANGED <<snap, hor, queue, held, leader, turnGroups, group, gi, gview,
                  gacc, gwal, stage, synced, dec, seq, pos, npos, outcome,
                  completions, lastSeq, walEnd, durable, store, visible>>
+  \* The owed group is untouched.
+  /\ UNCHANGED landing
 
 \* The group a new leader takes: `members` in order. It records the view it
 \* checks against, starts the decide cursor and an empty overlay, and marks
@@ -391,6 +458,10 @@ StartGroup(members) ==
   /\ gwal'   = walEnd            \* where the log ends, to cut back to on failure
   /\ stage'  = "deciding"        \* the leader starts deciding
   /\ synced' = FALSE             \* this group has not synced
+  /\ syncRuns' = 0               \* and its fsync has run no times
+  \* No group is owed when one starts (the guards make sure), so the rest
+  \* of the owed bookkeeping stays empty.
+  /\ UNCHANGED <<owed, claimers, syncedBy>>
 
 \* The writer of t finds the pipeline free (try_lock succeeds) and leads a
 \* group headed by its own commit, then up to MaxGroup - 1 waiting tickets,
@@ -399,6 +470,7 @@ LeadWith(t, k) ==
   \* t is about to commit and the mutex is free.
   /\ pc[t] = "ready"            \* its commit is about to go in
   /\ leader = 0                 \* and nobody holds the mutex
+  /\ ~owed                      \* and no group waits to be landed first
   \* It takes k - 1 others, as many as wait, at most the cap allows.
   /\ k \in 1..Min2(MaxGroup, 1 + Waiting)
   \* The group: its own commit, then the first waiting ones.
@@ -429,6 +501,8 @@ Push(t) ==
   /\ UNCHANGED <<snap, hor, held, leader, turnGroups, group, gi, gview, gacc,
                  gwal, stage, synced, dec, seq, pos, npos, outcome,
                  completions, lastSeq, walEnd, durable, store, visible>>
+  \* The owed group is untouched.
+  /\ UNCHANGED landing
 
 \* A waiting writer finds the pipeline free (its try_drain, after a hand-off
 \* woke it or its park timed out) and leads a group of the first k waiting
@@ -437,6 +511,7 @@ Drain(t, k) ==
   \* t's ticket waits and the mutex is free.
   /\ pc[t] = "queued"           \* t's writer is waiting
   /\ leader = 0                 \* and nobody holds the mutex
+  /\ ~owed                      \* and no group waits to be landed first
   \* Something waits, and it takes as many as it may.
   /\ k \in 1..Min2(MaxGroup, Waiting)
   \* The group: the first k waiting tickets.
@@ -493,6 +568,8 @@ Decide ==
      /\ UNCHANGED <<pc, snap, hor, queue, held, leader, turnGroups, group,
                     gview, gwal, stage, synced, outcome, completions, walEnd,
                     durable, store, visible>>
+     \* The owed group is untouched.
+     /\ UNCHANGED landing
 
 \* Every member is decided: the writers' records go to the log in one append
 \* (log_group). A group with no writer writes nothing.
@@ -508,21 +585,99 @@ Write ==
   /\ UNCHANGED <<pc, snap, hor, queue, held, leader, turnGroups, group, gi,
                  gview, gacc, gwal, synced, dec, seq, pos, npos, outcome,
                  completions, lastSeq, durable, store, visible>>
+  \* The owed group is untouched.
+  /\ UNCHANGED landing
 
 \* The group's one fsync (sync_group), when a writer asked for Immediate. It
-\* makes every record written so far durable.
+\* makes every record written so far durable. This is the leader's own sync,
+\* for a group it did not leave owed.
 Sync ==
   \* After the append, once.
   /\ stage \in {"written", "applied", "published"}   \* the records are in the log
   /\ ~synced                                         \* and not synced yet
   /\ NeedsSync                                       \* and somebody waits for it
+  /\ ~Deferred                                       \* and the leader keeps the group
   \* Everything in the log is durable now.
   /\ durable' = walEnd           \* durable up to the end of the log
   /\ synced'  = TRUE             \* and this group's sync is done
+  /\ syncRuns' = syncRuns + 1    \* the fsync ran one more time
   \* Nothing else changes.
   /\ UNCHANGED <<pc, snap, hor, queue, held, leader, turnGroups, group, gi,
                  gview, gacc, gwal, stage, dec, seq, pos, npos, outcome,
                  completions, lastSeq, walEnd, store, visible>>
+  \* Nobody claimed anything.
+  /\ UNCHANGED <<owed, claimers, syncedBy>>
+
+\* The leader of a group that needs an fsync and holds a nowait member does
+\* not sync it: it leaves the group owed, as a job, and lets go of the
+\* pipeline, handing it on as HandOff does (defer_group). Its own commit
+\* call returns now; the group becomes visible only when a claimer lands it.
+Defer ==
+  \* Written, not synced, and its fsync is to be claimed.
+  /\ stage = "written"           \* the records are in the log
+  /\ ~synced                     \* nothing synced them yet
+  /\ ~owed                       \* not already left owed
+  /\ Deferred                    \* and a nowait member must not wait
+  \* The group is owed now.
+  /\ owed' = TRUE
+  \* The ring's head is taken out to be held, when nothing is.
+  /\ IF held = 0 /\ queue # <<>>
+       THEN /\ held'  = Head(queue)      \* the oldest waiting ticket is held,
+            /\ queue' = Tail(queue)      \* out of the ring, and its writer woken
+       ELSE UNCHANGED <<held, queue>>    \* or nothing waits, or a ticket is held
+  \* The mutex is released and the turn is over.
+  /\ leader'     = 0             \* nobody holds the mutex
+  /\ turnGroups' = 0             \* the turn's count starts over
+  \* Nothing else changes: the group stays written, waiting for its claimer.
+  /\ UNCHANGED <<pc, snap, hor, group, gi, gview, gacc, gwal, stage, synced,
+                 dec, seq, pos, npos, outcome, completions, lastSeq, walEnd,
+                 durable, store, visible>>
+  \* Nobody claimed it yet.
+  /\ UNCHANGED <<claimers, syncedBy, syncRuns>>
+
+\* The thread of commit t claims the owed group's job with ONE CAS
+\* (Job::claim). It may do so as a member polling its own queue (a nowait
+\* member), as a blocking member waiting on its own group, or as the next
+\* writer to take the pipeline, which lands what is owed before anything
+\* else (land_pending). Bug DoubleClaim lets the CAS succeed on a claimed
+\* job too.
+ClaimOwed(t) ==
+  \* The group is owed.
+  /\ owed
+  \* t's thread can reach it: a member, or a writer about to lead.
+  /\ t \in Members \/ pc[t] \in {"ready", "queued"}
+  \* The CAS succeeds only if nobody claimed it (the bug: also if somebody
+  \* else did).
+  /\ \/ claimers = {}
+     \/ Mutant = "DoubleClaim" /\ t \notin claimers
+  \* t is a claimer now.
+  /\ claimers' = claimers \cup {t}
+  \* Nothing else changes.
+  /\ UNCHANGED <<pc, snap, hor, queue, held, leader, turnGroups, group, gi,
+                 gview, gacc, gwal, stage, synced, dec, seq, pos, npos, outcome,
+                 completions, lastSeq, walEnd, durable, store, visible>>
+  \* The rest of the bookkeeping is untouched.
+  /\ UNCHANGED <<owed, syncedBy, syncRuns>>
+
+\* The claimer t runs the owed group's fsync (GroupSync's landing, through
+\* sync_group): everything in the log is durable now.
+OwedSync(t) ==
+  \* t claimed the owed group and has not synced it.
+  /\ owed                        \* the group is owed
+  /\ t \in claimers              \* t won the claim
+  /\ t \notin syncedBy           \* and has not run its fsync yet
+  /\ stage = "written"           \* the group is still only written
+  \* Everything in the log is durable now.
+  /\ durable'  = walEnd          \* durable up to the end of the log
+  /\ synced'   = TRUE            \* this group's sync is done
+  /\ syncRuns' = syncRuns + 1    \* the fsync ran one more time
+  /\ syncedBy' = syncedBy \cup {t}   \* and t ran it
+  \* Nothing else changes.
+  /\ UNCHANGED <<pc, snap, hor, queue, held, leader, turnGroups, group, gi,
+                 gview, gacc, gwal, stage, dec, seq, pos, npos, outcome,
+                 completions, lastSeq, walEnd, store, visible>>
+  \* The claim stands.
+  /\ UNCHANGED <<owed, claimers>>
 
 \* The writers' versions go into the memtable (run_group), after the fsync
 \* when the group needs one. Mutant PublishBeforeSync does not wait for it.
@@ -530,6 +685,8 @@ Apply ==
   \* Written, and synced if it must be.
   /\ stage = "written"                                        \* the records are in the log
   /\ synced \/ ~NeedsSync \/ Mutant = "PublishBeforeSync"      \* and durable if they must be
+  \* An owed group is applied only by the thread that claimed it.
+  /\ owed => claimers # {}
   \* Every writer's versions are in the memtable.
   /\ store' = store \cup UNION {VersionsOf(m) : m \in Writers}
   \* The leader moves on.
@@ -538,6 +695,8 @@ Apply ==
   /\ UNCHANGED <<pc, snap, hor, queue, held, leader, turnGroups, group, gi,
                  gview, gacc, gwal, synced, dec, seq, pos, npos, outcome,
                  completions, lastSeq, walEnd, durable, visible>>
+  \* The owed group's bookkeeping is untouched.
+  /\ UNCHANGED landing
 
 \* The visible sequence moves to the group's last one (visible_seq.publish):
 \* the whole group becomes visible at once.
@@ -552,6 +711,8 @@ Publish ==
   /\ UNCHANGED <<pc, snap, hor, queue, held, leader, turnGroups, group, gi,
                  gview, gacc, gwal, synced, dec, seq, pos, npos, outcome,
                  completions, lastSeq, walEnd, durable, store>>
+  \* The owed group's bookkeeping is untouched.
+  /\ UNCHANGED landing
 
 \* Every member's caller gets its own answer, once (run_and_complete): an
 \* accepted one "commit", a conflicting one "conflict". The leader still
@@ -568,13 +729,20 @@ Complete ==
                                       ELSE outcome[t]]
   \* Each told once.
   /\ completions' = [t \in Txns |-> IF t \in Members THEN completions[t] + 1 ELSE completions[t]]
-  \* The group is over; the leader is about to hand off.
+  \* The group is over. A leader that kept it is about to hand off; an owed
+  \* group was handed off already, so the pipeline is simply free.
   /\ group'       = <<>>
-  /\ stage'       = "handoff"
+  /\ stage'       = IF owed THEN "idle" ELSE "handoff"
+  \* The owed job, if any, is landed: nothing is owed or claimed now.
+  /\ owed'        = FALSE
+  /\ claimers'    = {}
+  /\ syncedBy'    = {}
   \* Nothing else changes.
   /\ UNCHANGED <<snap, hor, queue, held, leader, turnGroups, gi, gview, gacc,
                  gwal, synced, dec, seq, pos, npos, lastSeq, walEnd, durable,
                  store, visible>>
+  \* The count of fsyncs stays, for SingleSync.
+  /\ UNCHANGED syncRuns
 
 \* G2: the group's append or fsync fails before anything is applied. The log
 \* is cut back to where the group began, nothing is applied or published, and
@@ -587,19 +755,28 @@ Fail ==
   /\ stage = "written"           \* the append happened
   /\ ~synced                     \* no fsync succeeded yet
   /\ Writers # {}                \* and there were records to lose
+  \* An owed group fails only in its claimer's fsync.
+  /\ owed => claimers # {}
   \* The log loses the group's bytes.
   /\ walEnd'      = gwal
   \* Every member is done, and failed.
   /\ pc'          = [t \in Txns |-> IF t \in Members THEN "done" ELSE pc[t]]
   /\ outcome'     = [t \in Txns |-> IF t \in Members THEN "failed" ELSE outcome[t]]
   /\ completions' = [t \in Txns |-> IF t \in Members THEN completions[t] + 1 ELSE completions[t]]
-  \* The group is over; the leader is about to hand off.
+  \* The group is over. A leader that kept it is about to hand off; an owed
+  \* group was handed off already.
   /\ group'       = <<>>
-  /\ stage'       = "handoff"
+  /\ stage'       = IF owed THEN "idle" ELSE "handoff"
+  \* Nothing is owed or claimed any more.
+  /\ owed'        = FALSE
+  /\ claimers'    = {}
+  /\ syncedBy'    = {}
   \* Nothing else changes.
   /\ UNCHANGED <<snap, hor, queue, held, leader, turnGroups, gi, gview, gacc,
                  gwal, synced, dec, seq, pos, npos, lastSeq, durable, store,
                  visible>>
+  \* The count of fsyncs stays.
+  /\ UNCHANGED syncRuns
 
 \* The leader ends its turn (hand_off, E21). If no ticket is held and the
 \* ring is not empty, the ring's head becomes the held ticket, heading the
@@ -620,6 +797,8 @@ HandOff ==
   /\ UNCHANGED <<pc, snap, hor, group, gi, gview, gacc, gwal, synced, dec,
                  seq, pos, npos, outcome, completions, lastSeq, walEnd,
                  durable, store, visible>>
+  \* The owed group's bookkeeping is untouched.
+  /\ UNCHANGED landing
 
 \* Mutant DrainAll: instead of handing off, the leader keeps the mutex and
 \* commits the next group of waiting tickets itself, as the code did before
@@ -627,6 +806,8 @@ HandOff ==
 LeadAgain(k) ==
   \* Only the planted bug does this.
   /\ Mutant = "DrainAll"
+  \* No group is owed (a group is owed only after a hand-off).
+  /\ ~owed
   \* The previous group's answers are given and tickets still wait.
   /\ stage = "handoff"                     \* the leader would hand off now
   /\ k \in 1..Min2(MaxGroup, Waiting)      \* but takes more waiting tickets
@@ -646,6 +827,8 @@ Next ==
   \/ \E t \in Txns : Begin(t) \/ Submit(t) \/ PlainSubmit(t) \/ Push(t)       \* a writer's own steps
   \/ \E t \in Txns : \E k \in 1..MaxGroup : LeadWith(t, k) \/ Drain(t, k)     \* a writer becomes leader
   \/ Decide \/ Write \/ Sync \/ Apply \/ Publish \/ Complete \/ Fail \/ HandOff \* the leader's steps
+  \/ Defer                                                                    \* a group left owed
+  \/ \E t \in Txns : ClaimOwed(t) \/ OwedSync(t)                              \* an owed group landed
   \/ \E k \in 1..MaxGroup : LeadAgain(k)                                      \* only the planted bug
 
 \* Every behaviour starts in Init, takes Next steps, and never stops while a
@@ -668,6 +851,8 @@ TypeOK ==
   /\ stage \in {"idle", "deciding", "written", "applied", "published", "handoff"}   \* a known step
   /\ store \subseteq Keys \X (1..lastSeq)                \* versions of known keys at handed-out sequences
   /\ durable <= walEnd /\ walEnd <= lastSeq /\ visible <= lastSeq   \* nothing runs ahead of what exists
+  /\ owed \in BOOLEAN                                    \* a group is owed, or not
+  /\ claimers \subseteq Txns /\ syncedBy \subseteq claimers   \* claimers are commits' threads
 
 \* What committing one at a time, in decision order, decides for
 \* transaction t: it aborts exactly when a commit that landed before it in
@@ -732,6 +917,20 @@ BoundedTurn == turnGroups <= 1   \* never a second group in one turn
 
 \* Nothing is stuck: when no step is possible, every commit has its answer.
 NoStuckTicket == (~ENABLED Next) => \A t \in Txns : pc[t] = "done"   \* stopped means finished
+
+\* An owed group's fsync runs once, however many members poll for it at
+\* once: one CAS lets one claimer in. Example ruled out: commits 1 and 3
+\* both polling, both claiming, and both syncing the same group.
+SingleSync == syncRuns <= 1   \* never a second fsync for one group
+
+\* A witness, not a promise: no group is ever left owed. The nowait
+\* configuration must break it, which shows its GREEN run really went
+\* through owed groups and their claims.
+NothingOwed == ~owed
+
+\* While a group is owed and not yet landed, the pipeline writes no other
+\* group: whoever takes it lands the owed one first.
+OwedBlocksNextGroup == owed => stage = "written" \/ stage = "applied" \/ stage = "published"
 
 ----------------------------------------------------------------------------
 \* Liveness: every commit eventually gets its answer, even though every
