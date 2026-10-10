@@ -24,8 +24,17 @@
 //!   the last reader unlinks it, no second open can sweep under a live
 //!   reader, and an open sweeps one a crash left.
 //!
-//! The column-family fence on each group-commit path is tested where the
-//! fence is, in `engine::commit::families`.
+//! - **The commit side** (#276 x Phase 7). Commits through `commit_nowait`
+//!   on each writer's own queue, with the flushes and steps they owe run as
+//!   jobs on that queue, publish the read view like every other publisher;
+//!   a `transact_async` attempt that suspends on a miss and re-runs on a
+//!   conflict holds one snapshot pin per attempt and releases each once; a
+//!   checkpoint run as a job, on the worker or on the caller's queue, under a
+//!   hard open-file bound copies only what the version names.
+//!
+//! The column-family fence on each group-commit path, the group left owing
+//! its fsync included, is tested where the fence is, in
+//! `engine::commit::families`.
 
 mod common;
 
@@ -36,8 +45,9 @@ use std::time::{Duration, Instant};
 
 use common::keys::Keys;
 use regolith::{
-    BackupEngine, Checkpoint, Db, DbSlice, Error, IngestOptions, IoBudget, IoQueue, Options,
-    ReadMode, SstFileWriter, Statistics, Ticker, through_stalls,
+    BackupEngine, Checkpoint, Db, DbSlice, DurabilityMode, Error, IngestOptions, IoBudget, IoQueue,
+    OptimisticTransactionDb, Options, ReadMode, RetryPolicy, SstFileWriter, Statistics, Ticker,
+    TransactionError, TxnOptions, ready, through_stalls,
 };
 use tempfile::TempDir;
 
@@ -634,4 +644,231 @@ fn backups_and_checkpoints_never_copy_a_table_renamed_aside() {
     let db = Db::open(&dir, options()).unwrap();
     assert!(!left.exists(), "the open left a table renamed aside");
     assert_eq!(db.get(&numbered(0)).unwrap(), Some(b"after".to_vec()));
+}
+
+// The commit side --------------------------------------------------------------
+
+/// Writers commit through `commit_nowait` on queues of their own at
+/// `Immediate` durability, with no worker: their groups are left owing their
+/// fsync and land at a poll, and the flushes and compaction steps their
+/// writes owe run as jobs on their queues. Readers on other threads never see
+/// a key go back, and every write lands.
+#[test]
+fn nowait_commits_and_owed_steps_on_queues_lose_no_write_under_readers() {
+    const WRITERS: u64 = 3;
+    const KEYS: u64 = 20;
+    const VERSIONS: u64 = 15;
+    let dir = TempDir::new().unwrap();
+    let db = OptimisticTransactionDb::open(
+        dir.path(),
+        Options::default()
+            .write_buffer_size(4 * 1024)
+            .max_background_compactions(0)
+            .inline_compaction(true)
+            .durability(DurabilityMode::Immediate),
+    )
+    .unwrap();
+    let key = |w: u64, k: u64| format!("w{w}/{k:03}").into_bytes();
+    let done = AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        let writers: Vec<_> = (0..WRITERS)
+            .map(|w| {
+                let db = &db;
+                scope.spawn(move || {
+                    // Made on this thread, so the I/O its writes owe is left
+                    // here and run at its polls.
+                    let mut queue = db.db().io_queue();
+                    for v in 1..=VERSIONS {
+                        for k in 0..KEYS {
+                            let mut value = v.to_be_bytes().to_vec();
+                            value.resize(256, b'n');
+                            loop {
+                                let txn = db.begin(&TxnOptions::new().io_queue(queue.id()));
+                                txn.put(&key(w, k), &value).unwrap();
+                                match queue.block_on(txn.commit_nowait()) {
+                                    Ok(_) => break,
+                                    Err(TransactionError::WouldBlock(stall)) => {
+                                        let _ = stall;
+                                        queue.poll(IoBudget::ALL);
+                                    }
+                                    Err(other) => panic!("a nowait commit failed: {other}"),
+                                }
+                            }
+                        }
+                    }
+                })
+            })
+            .collect();
+        let readers: Vec<_> = (0..2u64)
+            .map(|r| {
+                let (db, done) = (&db, &done);
+                scope.spawn(move || {
+                    let mut seen = vec![0u64; (WRITERS * KEYS) as usize];
+                    let mut i = r;
+                    while !done.load(Ordering::Acquire) {
+                        let (w, k) = (i % WRITERS, (i / WRITERS) % KEYS);
+                        if let Some(value) = db.db().get(&key(w, k)).unwrap() {
+                            let version = u64::from_be_bytes(value[..8].try_into().unwrap());
+                            let slot = &mut seen[(w * KEYS + k) as usize];
+                            assert!(version >= *slot, "a read of w{w}/{k:03} went back");
+                            *slot = version;
+                        }
+                        i = i.wrapping_add(5);
+                    }
+                })
+            })
+            .collect();
+        let wrote: Vec<_> = writers.into_iter().map(|w| w.join()).collect();
+        done.store(true, Ordering::Release);
+        for reader in readers {
+            reader.join().unwrap();
+        }
+        for outcome in wrote {
+            outcome.unwrap();
+        }
+    });
+    for w in 0..WRITERS {
+        for k in 0..KEYS {
+            let value = db.db().get(&key(w, k)).unwrap().expect("a write was lost");
+            assert_eq!(u64::from_be_bytes(value[..8].try_into().unwrap()), VERSIONS);
+        }
+    }
+}
+
+/// A `transact_async` attempt suspends on cache misses and resumes at the
+/// queue's polls; the first attempt then loses a race and the closure runs
+/// again. While suspended, exactly the running attempt's snapshot is pinned;
+/// once the future resolves, every attempt's pin was released exactly once.
+#[test]
+fn transact_async_attempts_pin_one_snapshot_each_and_release_it_once() {
+    let dir = TempDir::new().unwrap();
+    let stats = Arc::new(Statistics::new());
+    let options = || {
+        Options::default()
+            .block_size(256)
+            .statistics(Some(Arc::clone(&stats)))
+    };
+    {
+        let db = Db::open(dir.path(), options()).unwrap();
+        for i in 0..2_000u64 {
+            db.put(&numbered(i), b"cold").unwrap();
+        }
+        db.flush().unwrap();
+        db.close().unwrap();
+    }
+    // Reopened, so the reads below miss the cache and suspend.
+    let db = OptimisticTransactionDb::open(dir.path(), options()).unwrap();
+    let mut queue = db.db().io_queue();
+    let registered = || stats.get_ticker(Ticker::SnapshotsRegistered);
+    let released = || stats.get_ticker(Ticker::SnapshotsReleased);
+    let (reg0, rel0) = (registered(), released());
+    let attempts = std::cell::Cell::new(0u64);
+    let policy = RetryPolicy::new(4);
+    let future = db.transact_async(
+        queue.id(),
+        &policy,
+        async |txn: &mut regolith::Transaction, previous: Option<&regolith::Conflict>| {
+            attempts.set(attempts.get() + 1);
+            let first = ready(|| txn.get_slice(&numbered(10))).await?;
+            let second = ready(|| txn.get_slice(&numbered(1_900))).await?;
+            assert!(first.is_some() && second.is_some());
+            if previous.is_none() {
+                // Another writer changes what the attempt read: it conflicts.
+                db.db().put(&numbered(10), b"raced").unwrap();
+            }
+            txn.put(&numbered(10), b"mine")?;
+            Ok::<_, TransactionError>(())
+        },
+    );
+    let mut future = std::pin::pin!(future);
+    let waker = std::task::Waker::noop();
+    let mut cx = std::task::Context::from_waker(waker);
+    let mut suspensions = 0;
+    let outcome = loop {
+        match future.as_mut().poll(&mut cx) {
+            std::task::Poll::Ready(outcome) => break outcome,
+            std::task::Poll::Pending => {
+                suspensions += 1;
+                assert_eq!(
+                    db.db().get_int_property("regolith.num-snapshots"),
+                    Some(1),
+                    "a suspended attempt pins its own snapshot and no other"
+                );
+                queue.poll(IoBudget::ALL);
+                assert!(suspensions < 10_000, "the attempt never finished");
+            }
+        }
+    };
+    outcome.expect("the transaction committed on its second attempt");
+    assert!(suspensions > 0, "setup: the attempt suspended on a miss");
+    assert_eq!(attempts.get(), 2, "setup: the first attempt lost the race");
+    assert_eq!(registered() - reg0, 2, "one pin per attempt");
+    assert_eq!(released() - rel0, 2, "every attempt's pin released once");
+    assert_eq!(db.db().get_int_property("regolith.num-snapshots"), Some(0));
+    assert_eq!(db.db().get(&numbered(10)).unwrap(), Some(b"mine".to_vec()));
+}
+
+/// A checkpoint run as a job (on the compaction worker, or with no worker on
+/// the caller's queue), while a held iterator keeps tables a compaction
+/// renamed aside under a hard open-file bound: the checkpoint copies only the
+/// tables the version names, and opens with every key.
+fn checkpoint_job_under_an_open_file_bound(workers: usize) {
+    let root = TempDir::new().unwrap();
+    let dir = root.path().join("db");
+    let options = || {
+        Options::default()
+            .max_open_files(3)
+            .block_cache_size(0)
+            .max_background_compactions(workers)
+            .l0_compaction_trigger(64)
+    };
+    let db = Db::open(&dir, options()).unwrap();
+    let mut queue = db.io_queue();
+    for table in 0..4u64 {
+        for k in 0..50 {
+            db.put(&numbered(table * 50 + k), b"before").unwrap();
+        }
+        db.flush().unwrap();
+    }
+    let mut held = db.iter();
+    held.seek_to_first();
+    for i in 0..200 {
+        db.put(&numbered(i), b"after").unwrap();
+    }
+    db.compact_range(None, None).wait().unwrap();
+    assert!(
+        !table_dir_files(&dir, REMOVED).is_empty(),
+        "setup: the compaction renamed the tables the iterator holds aside"
+    );
+    let checkpoint = root.path().join("checkpoint");
+    let ticket = Checkpoint::new(&db).unwrap().create(&checkpoint);
+    // With no worker the job waits on this thread's queue for its poll.
+    queue.block_on(ticket).unwrap();
+    let names = all_names(&checkpoint);
+    assert!(
+        !names.iter().any(|n| n.contains(REMOVED)),
+        "a table renamed aside was copied: {names:?}"
+    );
+    let opened = Db::open(&checkpoint, options()).unwrap();
+    for i in 0..200 {
+        assert_eq!(opened.get(&numbered(i)).unwrap(), Some(b"after".to_vec()));
+    }
+    let mut read = 0;
+    while held.valid() {
+        assert_eq!(held.value(), Some(&b"before"[..]));
+        read += 1;
+        held.next();
+    }
+    held.status().unwrap();
+    assert_eq!(read, 200);
+}
+
+#[test]
+fn a_checkpoint_job_on_the_worker_under_an_open_file_bound_copies_only_live_tables() {
+    checkpoint_job_under_an_open_file_bound(1);
+}
+
+#[test]
+fn a_checkpoint_job_on_the_callers_queue_under_an_open_file_bound_copies_only_live_tables() {
+    checkpoint_job_under_an_open_file_bound(0);
 }
