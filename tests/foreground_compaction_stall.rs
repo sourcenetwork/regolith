@@ -57,6 +57,7 @@ fn zero_worker_opts() -> Options {
         .level0_slowdown_writes_trigger(3)
         .level0_stop_writes_trigger(4)
         .max_background_compactions(0)
+        .inline_compaction(true)
         .block_cache_size(0)
 }
 
@@ -204,7 +205,9 @@ fn concurrent_writers_with_zero_workers_never_return_busy() {
                 // `zero_worker_opts` sets.
                 for i in 0..1500usize {
                     let k = format!("t{t}k{i:08}");
-                    if let Err(e) = db.put(k.as_bytes(), &val(i)) {
+                    // A step another writer holds the inputs of hands this
+                    // one the stall's wait, which that writer's step lands.
+                    if let Err(e) = regolith::through_stalls(|| db.put(k.as_bytes(), &val(i))) {
                         return Err(format!("thread {t} put {i}: {e:?}"));
                     }
                 }
@@ -471,14 +474,14 @@ fn compact_step_racing_workers_and_compact_range_loses_nothing() {
             let stop = std::sync::Arc::clone(&stop);
             helpers.push(std::thread::spawn(move || {
                 while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-                    db.compact_range(None, None).expect("compact_range");
+                    db.compact_range(None, None).wait().expect("compact_range");
                 }
             }));
         }
 
         for i in 0..total {
             let k = format!("key/{i:09}");
-            db.put(k.as_bytes(), &val(i))
+            regolith::through_stalls(|| db.put(k.as_bytes(), &val(i)))
                 .unwrap_or_else(|e| panic!("put {i}: {e:?}"));
         }
         stop.store(true, std::sync::atomic::Ordering::Relaxed);

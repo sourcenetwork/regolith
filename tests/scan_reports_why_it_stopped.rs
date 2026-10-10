@@ -24,6 +24,7 @@ fn small_options() -> Options {
         .target_file_size(256 * 1024)
         .l0_compaction_trigger(8)
         .max_background_compactions(0)
+        .inline_compaction(true)
 }
 
 const KEYS: u64 = 20_000;
@@ -35,10 +36,11 @@ fn build(dir: &std::path::Path) {
     for i in 0..KEYS {
         batch.put(&i.to_be_bytes(), &value);
         if batch.buffered_bytes() >= 64 * 1024 {
-            db.write(std::mem::take(&mut batch)).unwrap();
+            let full = std::mem::take(&mut batch);
+            regolith::through_stalls(|| db.write(full.clone())).unwrap();
         }
     }
-    db.write(batch).unwrap();
+    regolith::through_stalls(|| db.write(batch.clone())).unwrap();
     db.flush().unwrap();
     db.close().unwrap();
 }
@@ -217,7 +219,7 @@ fn a_transaction_scan_cut_short_says_so_too() {
     let dir = tempfile::tempdir().unwrap();
     let tdb = TransactionDb::open(dir.path(), small_options()).unwrap();
     for i in 0..10u64 {
-        tdb.db().put(format!("k{i:02}").as_bytes(), b"v").unwrap();
+        regolith::through_stalls(|| tdb.db().put(format!("k{i:02}").as_bytes(), b"v")).unwrap();
     }
 
     let txn = tdb.begin(&TxnOptions::new());
@@ -273,9 +275,9 @@ fn declining_options() -> Options {
 fn declining(dir: &std::path::Path, flush: bool) -> Db {
     let db = Db::open(dir, declining_options()).unwrap();
     for key in ["k0", "k1", "k3", "k4"] {
-        db.put(key.as_bytes(), b"v").unwrap();
+        regolith::through_stalls(|| db.put(key.as_bytes(), b"v")).unwrap();
     }
-    db.merge(b"k2", b"bad").unwrap();
+    regolith::through_stalls(|| db.merge(b"k2", b"bad")).unwrap();
     if flush {
         db.flush().unwrap();
     }
@@ -329,8 +331,8 @@ fn a_snapshot_scan_stream_yields_the_error_where_a_key_failed_then_ends() {
 fn an_error_on_the_first_key_is_the_first_item() {
     let dir = tempfile::tempdir().unwrap();
     let db = Db::open(dir.path(), declining_options()).unwrap();
-    db.merge(b"a", b"bad").unwrap();
-    db.put(b"b", b"v").unwrap();
+    regolith::through_stalls(|| db.merge(b"a", b"bad")).unwrap();
+    regolith::through_stalls(|| db.put(b"b", b"v")).unwrap();
 
     let mut scan = db.scan_stream(None, None).unwrap();
     assert!(matches!(scan.next(), Some(Err(Error::Corruption(_)))));

@@ -49,8 +49,9 @@ enum FlushPath {
     /// The writer whose commit sealed it, once that commit returned, on a
     /// database with no worker.
     AfterCommit,
-    /// A writer stopped by a stall, inside the bounded step it runs before
-    /// its own write, on a database with no worker.
+    /// A writer slowed by a stall, in the bounded step its slowed write owes
+    /// on a database with no worker and inline compaction on, run once its
+    /// commit returned.
     StallStep,
 }
 
@@ -82,12 +83,14 @@ impl Fixture {
             FlushPath::Worker => options.max_background_compactions(1),
             FlushPath::AfterCommit => options.max_background_compactions(0),
             // With one table at L0 every write is slowed down, and a slowed
-            // write with no worker first runs one bounded step: the flush of
-            // the oldest frozen memtable when there is one. The compaction
-            // trigger is out of reach, so the steps between flushes find
-            // nothing to compact.
+            // write with no worker and inline compaction on owes one bounded
+            // step, run once its commit returned: the flush of the oldest
+            // frozen memtable when there is one. The compaction trigger is
+            // out of reach, so the steps between flushes find nothing to
+            // compact.
             FlushPath::StallStep => options
                 .max_background_compactions(0)
+                .inline_compaction(true)
                 .level0_slowdown_writes_trigger(1)
                 .l0_compaction_trigger(64),
         }
@@ -396,6 +399,7 @@ fn an_ingested_table_read_through_a_queue_on_an_encrypted_database_reads_at_its_
         }
         writer.finish().unwrap();
         db.ingest_external_files(std::slice::from_ref(&source), IngestOptions::default())
+            .wait()
             .unwrap();
         db.close().unwrap();
     }
@@ -471,7 +475,9 @@ fn close_while_the_worker_flushes_completes_every_queued_read() {
         std::thread::spawn(move || {
             let mut landed = 0usize;
             loop {
-                match db.put(format!("late/{landed:06}").as_bytes(), &[b'w'; 512]) {
+                match regolith::through_stalls(|| {
+                    db.put(format!("late/{landed:06}").as_bytes(), &[b'w'; 512])
+                }) {
                     Ok(()) => landed += 1,
                     Err(Error::Closed) => return landed,
                     Err(other) => panic!("a write failed with {other:?}"),

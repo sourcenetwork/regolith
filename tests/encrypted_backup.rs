@@ -263,7 +263,7 @@ fn a_backup_taken_across_a_key_rotation_restores_under_the_keys_it_names() {
     fill(&db, 420, 800);
     // Metadata under key 2, tables under both.
     let across = engine.create_backup(&db).unwrap();
-    db.compact_range(None, None).unwrap();
+    db.compact_range(None, None).wait().unwrap();
     // Everything under key 2.
     let after = engine.create_backup(&db).unwrap();
     drop(db);

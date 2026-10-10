@@ -54,7 +54,7 @@ fn seeded_db(keys: usize) -> TempDir {
     let dir = TempDir::new().unwrap();
     let db = Db::open(dir.path(), opts()).unwrap();
     fill(&db, keys);
-    db.compact_range(None, None).unwrap();
+    db.compact_range(None, None).wait().unwrap();
     db.close().unwrap();
     dir
 }
@@ -448,9 +448,13 @@ fn a_truncated_sstable_does_not_panic() {
 // ---- public constructors and shutdown ----
 
 #[test]
-fn a_zero_refill_period_rate_limiter_does_not_panic() {
-    let limiter = regolith::TokenBucketRateLimiter::new(1024, Duration::ZERO, 4096);
+fn a_rate_limiter_serves_a_high_priority_request_at_once() {
+    let limiter = regolith::TokenBucketRateLimiter::new(1024, 4096);
     limiter.request(128, regolith::Priority::High);
+    assert_eq!(
+        limiter.get_total_bytes_through(regolith::Priority::High),
+        128
+    );
 }
 
 #[test]

@@ -402,7 +402,7 @@ impl RegolithEngine {
             self.l0_holders(&self.published_version(), lo, hi)?
         };
 
-        let _pipeline = self.pipeline.lock();
+        let _pipeline = self.lock_pipeline();
         let level = if opts.ingest_behind {
             self.behind_level(lo, hi)?
         } else if self.flush_memtables_holding(lo, hi)? {

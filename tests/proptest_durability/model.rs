@@ -62,7 +62,7 @@ pub(crate) fn apply_to_db(db: &Db, op: &Op) -> regolith::Result<()> {
             }
             db.write(batch)
         }
-        Op::Compact => db.compact_range(None, None),
+        Op::Compact => db.compact_range(None, None).wait(),
     }
 }
 

@@ -111,7 +111,7 @@ fn readers_never_observe_a_freed_view_across_drop_all() {
                     db.drop_all().expect("drop_all");
                 }
                 if round.is_multiple_of(11) {
-                    db.compact_range(None, None).expect("compact");
+                    db.compact_range(None, None).wait().expect("compact");
                 }
             }
             done.store(true, Ordering::Release);

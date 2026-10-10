@@ -372,7 +372,7 @@ fn snapshot_sum(db: &impl Flavour, level: IsolationLevel, storage: Storage) {
             "{level:?}: the forced transfer never reached a table"
         );
         db.raw().flush().unwrap();
-        db.raw().compact_range(None, None).unwrap();
+        db.raw().compact_range(None, None).wait().unwrap();
     }
     let rest: u64 = (1..ACCOUNTS)
         .map(|i| decode(auditor.get(&account(i)).unwrap()))

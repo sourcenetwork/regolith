@@ -63,7 +63,7 @@ fn every_no_work_write_is_refused_by_a_read_only_handle() {
     );
     assert_read_only(
         "ingest_external_files(empty list)",
-        ro.ingest_external_files(&[], Default::default()),
+        ro.ingest_external_files(&[], Default::default()).wait(),
     );
 
     // Loaded controls: the same entry points with real work must refuse
@@ -75,7 +75,7 @@ fn every_no_work_write_is_refused_by_a_read_only_handle() {
     assert_read_only("put", ro.put(b"a", b"b"));
     assert_read_only("delete", ro.delete(b"a"));
     assert_read_only("drop_all", ro.drop_all());
-    assert_read_only("compact_range", ro.compact_range(None, None));
+    assert_read_only("compact_range", ro.compact_range(None, None).wait());
 
     // The handle still reads.
     assert_eq!(
@@ -111,7 +111,7 @@ fn every_no_work_write_is_refused_by_a_closed_handle() {
     );
     assert_closed(
         "ingest_external_files(empty list)",
-        db.ingest_external_files(&[], Default::default()),
+        db.ingest_external_files(&[], Default::default()).wait(),
     );
 
     // A closed read-only handle must report Closed, not ReadOnly.

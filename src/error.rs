@@ -29,12 +29,13 @@ pub enum Error {
     /// different database handle.
     #[error("invalid column family: {0}")]
     InvalidColumnFamily(String),
-    /// The engine refused to block the caller and returned early.
-    /// Returned when [`crate::WriteOptions::no_slowdown`] is set and
-    /// the engine is currently stalling writes (too many L0 files,
-    /// too many unflushed memtables, or pending compaction bytes
-    /// over the hard limit). The included string names the active
-    /// stall condition for diagnostics.
+    /// A write stall refused the write, and no wait would end it. Returned
+    /// when [`crate::WriteOptions::no_slowdown`] is set and the engine is
+    /// stalling writes (too many L0 files, too many unflushed memtables, or
+    /// pending compaction bytes over a limit), and when inline compaction
+    /// ([`crate::Options::inline_compaction`]) ran its bound of steps
+    /// without relieving a stop. The included string names the stall
+    /// condition for diagnostics.
     #[error("engine busy: {0}")]
     Busy(&'static str),
     /// The configured [`crate::MergeOperator`] returned `None` when
@@ -103,8 +104,10 @@ pub enum Error {
     LogKeyWrite,
     /// The call returned instead of waiting. A read through a
     /// [`crate::ReadMode::CacheOnly`] handle needed a block the cache does
-    /// not hold: poll the queue the wait names, then run the call again. The
-    /// call left nothing half done; a scan resumes where it stopped.
+    /// not hold ([`WouldBlock::Io`]), or a write met a write stall
+    /// ([`WouldBlock::Stall`]): poll the queue the wait names, or await the
+    /// wait, then run the call again. The call left nothing half done; a
+    /// scan resumes where it stopped, and a stalled write applied nothing.
     #[error("{0}")]
     WouldBlock(WouldBlock),
     /// The database is encrypted at rest and was opened without a key
@@ -218,6 +221,47 @@ impl Error {
         match carried(err)? {
             Error::CallbackPanicked { callback, .. } => Some(callback),
             _ => None,
+        }
+    }
+
+    /// A copy of this error, for an outcome several readers are handed: a
+    /// ticket's callbacks and the task that awaits it. An I/O error keeps its
+    /// kind, message and OS code (see [`Error::clone_io`]); every other
+    /// variant stays itself.
+    pub(crate) fn duplicate(&self) -> Self {
+        match self {
+            Self::InvalidArgument(message) => Self::InvalidArgument(message.clone()),
+            Self::DataBlockLimitExceeded {
+                max_data_block_bytes,
+            } => Self::DataBlockLimitExceeded {
+                max_data_block_bytes: *max_data_block_bytes,
+            },
+            Self::Corruption(err) => Self::Corruption(Self::clone_io(err)),
+            Self::ReadOnly => Self::ReadOnly,
+            Self::Closed => Self::Closed,
+            Self::InvalidColumnFamily(message) => Self::InvalidColumnFamily(message.clone()),
+            Self::Busy(reason) => Self::Busy(reason),
+            Self::MergeFailed(key) => Self::MergeFailed(key.clone()),
+            Self::NoMergeOperator => Self::NoMergeOperator,
+            Self::ContentMismatch => Self::ContentMismatch,
+            Self::CallbackPanicked { callback, latched } => Self::CallbackPanicked {
+                callback,
+                latched: *latched,
+            },
+            Self::BackgroundFailed {
+                job,
+                hazard,
+                source,
+            } => Self::BackgroundFailed {
+                job,
+                hazard,
+                source: Self::clone_io(source),
+            },
+            Self::LogKeyWrite => Self::LogKeyWrite,
+            Self::WouldBlock(would_block) => Self::WouldBlock(would_block.clone()),
+            Self::KeyProviderRequired => Self::KeyProviderRequired,
+            Self::UnknownKey { id } => Self::UnknownKey { id: *id },
+            Self::Io(err) => Self::Io(Self::clone_io(err)),
         }
     }
 

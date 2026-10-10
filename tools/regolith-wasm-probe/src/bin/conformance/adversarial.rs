@@ -137,7 +137,7 @@ pub fn crash_compact(
     report.check_u64("crash_compact.budget", budget);
 
     db.flush().map_err(|e| format!("flush failed: {e}"))?;
-    let outcome = match db.compact_range(None, None) {
+    let outcome = match db.compact_range(None, None).wait() {
         Ok(()) => "compaction finished without reaching the budget".to_string(),
         Err(err) => format!("compaction returned an error: {err}"),
     };

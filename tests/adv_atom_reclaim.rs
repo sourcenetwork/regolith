@@ -85,7 +85,7 @@ fn fill(db: &Db, rounds: usize, per_round: usize, tag: u8) {
         for i in 0..per_round {
             let key = format!("k{:06}", i).into_bytes();
             let value = vec![tag.wrapping_add(r as u8); 256];
-            db.put(&key, &value).expect("put");
+            regolith::through_stalls(|| db.put(&key, &value)).expect("put");
         }
     }
 }
@@ -99,7 +99,7 @@ fn unlinked_sstable_inodes_are_released_after_a_compaction() {
     let db = Db::open(dir.path(), Options::default().write_buffer_size(4 * 1024)).expect("open");
 
     fill(&db, 8, 400, b'a');
-    db.compact_range(None, None).expect("compact");
+    db.compact_range(None, None).wait().expect("compact");
 
     // Reclamation is RCU: the retired view is freed when the last
     // reader releases it, and a background compaction pass can still
@@ -155,7 +155,7 @@ fn dropping_the_db_closes_every_descriptor_it_opened() {
         let db =
             Db::open(dir.path(), Options::default().write_buffer_size(4 * 1024)).expect("open");
         fill(&db, 8, 400, b'b');
-        db.compact_range(None, None).expect("compact");
+        db.compact_range(None, None).wait().expect("compact");
     }
 
     let (live, deleted) = wait_for_reclamation(dir.path());
@@ -184,7 +184,7 @@ fn a_second_publication_from_the_same_thread_releases_the_pinned_inodes() {
     let db = Db::open(dir.path(), Options::default().write_buffer_size(4 * 1024)).expect("open");
 
     fill(&db, 8, 400, b'c');
-    db.compact_range(None, None).expect("compact");
+    db.compact_range(None, None).wait().expect("compact");
     let (_, first) = open_fds_under(dir.path());
 
     let mut counts = vec![first.len()];
@@ -193,9 +193,8 @@ fn a_second_publication_from_the_same_thread_releases_the_pinned_inodes() {
         .and_then(|v| v.parse().ok())
         .unwrap_or(6);
     for round in 0..drain_rounds {
-        db.put(format!("drain{round}").as_bytes(), b"x")
-            .expect("put");
-        db.compact_range(None, None).expect("compact");
+        regolith::through_stalls(|| db.put(format!("drain{round}").as_bytes(), b"x")).expect("put");
+        db.compact_range(None, None).wait().expect("compact");
         let (_, d) = open_fds_under(dir.path());
         counts.push(d.len());
     }
@@ -221,7 +220,7 @@ fn descriptors_survive_the_db_but_not_the_publishing_thread() {
     let handle = std::thread::spawn(move || {
         let db = Db::open(&path, Options::default().write_buffer_size(4 * 1024)).expect("open");
         fill(&db, 8, 400, b'd');
-        db.compact_range(None, None).expect("compact");
+        db.compact_range(None, None).wait().expect("compact");
         drop(db);
         let (live, deleted) = open_fds_under(&path);
         (live.len(), deleted.len())
@@ -255,7 +254,7 @@ fn pinned_inode_count_versus_workload_size() {
         let db =
             Db::open(dir.path(), Options::default().write_buffer_size(4 * 1024)).expect("open");
         fill(&db, rounds, 400, b'e');
-        db.compact_range(None, None).expect("compact");
+        db.compact_range(None, None).wait().expect("compact");
         let (live, deleted) = open_fds_under(dir.path());
         let on_disk = std::fs::read_dir(dir.path().join("sst"))
             .map(|d| d.flatten().count())
@@ -290,7 +289,7 @@ fn an_idle_reader_thread_does_not_gate_descriptors_created_after_it_idled() {
     let db = std::sync::Arc::new(
         Db::open(dir.path(), Options::default().write_buffer_size(4 * 1024)).expect("open"),
     );
-    db.put(b"seed", b"v").expect("put");
+    regolith::through_stalls(|| db.put(b"seed", b"v")).expect("put");
 
     let parked = std::sync::Arc::new(std::sync::Barrier::new(2));
     let forever = std::sync::Arc::new(std::sync::Barrier::new(2));
@@ -307,7 +306,7 @@ fn an_idle_reader_thread_does_not_gate_descriptors_created_after_it_idled() {
 
     // Everything below is born after the idler's last pin.
     fill(&db, 8, 400, b'f');
-    db.compact_range(None, None).expect("compact");
+    db.compact_range(None, None).wait().expect("compact");
 
     let (_, deleted) = wait_for_reclamation(dir.path());
     eprintln!(

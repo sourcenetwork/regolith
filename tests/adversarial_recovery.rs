@@ -80,7 +80,7 @@ fn a_zero_length_wal_opens_clean() {
         for i in 0..200 {
             db.put(format!("s{i:04}").as_bytes(), b"v").unwrap();
         }
-        db.compact_range(None, None).unwrap();
+        db.compact_range(None, None).wait().unwrap();
         db.close().unwrap();
     }
     for path in wal_files(dir.path()) {

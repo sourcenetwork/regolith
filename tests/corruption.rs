@@ -286,7 +286,7 @@ fn corrupted_completed_compaction_refuses_missing_inputs_without_rewriting() {
             .map(|entry| entry.unwrap().path())
             .collect();
         assert_eq!(inputs.len(), 2);
-        db.compact_range(None, None).unwrap();
+        db.compact_range(None, None).wait().unwrap();
         let end = fs::metadata(&manifest).unwrap().len() as usize;
         db.close().unwrap();
         (inputs, end)

@@ -158,7 +158,9 @@ fn compact_only(spec: &ChildSpec) {
         manual_compaction_opts(spec.write_buffer_size),
     )
     .expect("child: open db");
-    db.compact_range(None, None).expect("child: compact_range");
+    db.compact_range(None, None)
+        .wait()
+        .expect("child: compact_range");
     db.close().expect("child: close");
 }
 

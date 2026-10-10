@@ -45,7 +45,7 @@ fn a_source_whose_tombstone_reaches_existing_data_lands_above_it_not_beside_it()
         db.put(key, b"old").unwrap();
     }
     db.flush().unwrap();
-    db.compact_range(None, None).unwrap();
+    db.compact_range(None, None).wait().unwrap();
     let bottom = MAX_LEVELS - 1;
     assert_eq!(
         files_at(&db, bottom),
@@ -58,6 +58,7 @@ fn a_source_whose_tombstone_reaches_existing_data_lands_above_it_not_beside_it()
     let source = dir.path().join("source.sst");
     source_with_tombstone(&source, &[b"m", b"n", b"p"], b"a", b"g");
     db.ingest_external_files(&[source], IngestOptions::default())
+        .wait()
         .unwrap();
 
     // The deepest level whose tables, and every level's above it, the
@@ -93,12 +94,13 @@ fn a_source_whose_tombstone_stays_clear_of_existing_data_still_goes_to_the_botto
         db.put(key, b"old").unwrap();
     }
     db.flush().unwrap();
-    db.compact_range(None, None).unwrap();
+    db.compact_range(None, None).wait().unwrap();
     let bottom = MAX_LEVELS - 1;
 
     let source = dir.path().join("source.sst");
     source_with_tombstone(&source, &[b"m", b"n", b"p"], b"q", b"s");
     db.ingest_external_files(&[source], IngestOptions::default())
+        .wait()
         .unwrap();
 
     assert_eq!(files_at(&db, 0), 0);

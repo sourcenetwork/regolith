@@ -109,6 +109,7 @@ fn workload(spec: &ChildSpec, over: bool) {
             ..IngestOptions::default()
         },
     )
+    .wait()
     .expect("child: ingest");
     let marker = sidecar(&spec.db_path, "ingested");
     std::fs::write(&marker, b"1").expect("child: marker");

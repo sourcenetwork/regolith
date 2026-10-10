@@ -34,8 +34,10 @@ use crate::engine::background_health::BackgroundHealth;
 use crate::engine::background_health::Job;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::engine::compaction_backoff::FailureBackoff;
+use crate::engine::io::job::JobBody;
 use crate::engine::pending_outputs::PendingOutputs;
 use crate::env::{Env, JoinHandle};
+use kovan_queue::seg_queue::SegQueue;
 
 mod retire;
 mod stripes;
@@ -67,6 +69,43 @@ const WORKER_POLL_INTERVAL: Duration = Duration::from_secs(1);
 /// exists, which is after its workers start.
 type FlushHook = Arc<std::sync::OnceLock<Box<dyn Fn() + Send + Sync>>>;
 
+/// Jobs handed to the workers instead of run on a caller's thread: a
+/// foreground job (`compact_range`, an ingest, a checkpoint) and the disk
+/// check (D15, plan 4.10). Whichever worker wakes first runs each, in
+/// arrival order, before it flushes or compacts. What bounds it: each job is
+/// a call a caller made and holds a ticket for, plus one disk check per open.
+pub(crate) struct WorkerJobs {
+    jobs: SegQueue<Box<dyn JobBody>>,
+    /// Set by shutdown: no job is accepted after it.
+    closed: AtomicBool,
+}
+
+impl WorkerJobs {
+    fn new() -> Self {
+        Self {
+            jobs: SegQueue::new(),
+            closed: AtomicBool::new(false),
+        }
+    }
+
+    /// Run every job queued now, on this worker.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn run_queued(&self) {
+        while let Some(job) = self.jobs.pop() {
+            job.run();
+        }
+    }
+
+    /// Settle every job still queued without running it: the workers have
+    /// stopped. Called after they joined, so no job is left untold.
+    pub(crate) fn release_queued(&self) {
+        self.closed.store(true, Ordering::Release);
+        while let Some(job) = self.jobs.pop() {
+            job.release();
+        }
+    }
+}
+
 /// Manages background compaction on one or more dedicated OS threads.
 pub(crate) struct CompactionScheduler {
     shutdown: Arc<AtomicBool>,
@@ -81,6 +120,8 @@ pub(crate) struct CompactionScheduler {
     handles: Vec<Box<dyn JoinHandle>>,
     /// The flush the workers run before compacting.
     flush: FlushHook,
+    /// Jobs handed to the workers.
+    jobs: Arc<WorkerJobs>,
 }
 
 impl CompactionScheduler {
@@ -93,7 +134,25 @@ impl CompactionScheduler {
             pending: Arc::new(AtomicBool::new(false)),
             handles: Vec::new(),
             flush: FlushHook::default(),
+            jobs: Arc::new(WorkerJobs::new()),
         }
+    }
+
+    /// Hand `job` to the workers, waking one. `Err` hands it back when no
+    /// worker runs or they were told to stop.
+    pub(crate) fn submit(&self, job: Box<dyn JobBody>) -> Result<(), Box<dyn JobBody>> {
+        if self.handles.is_empty() || self.jobs.closed.load(Ordering::Acquire) {
+            return Err(job);
+        }
+        self.jobs.jobs.push(job);
+        // Re-checked after the push: a shutdown that began meanwhile may
+        // have released the queue before this job reached it.
+        if self.jobs.closed.load(Ordering::Acquire) {
+            self.jobs.release_queued();
+            return Ok(());
+        }
+        self.notify();
+        Ok(())
     }
 
     /// Whether background workers run here. Without one, a writer that
@@ -183,6 +242,7 @@ impl CompactionScheduler {
                 pending: Arc::clone(&pending),
                 handles: Vec::with_capacity(worker_count),
                 flush: FlushHook::default(),
+                jobs: Arc::new(WorkerJobs::new()),
             };
 
             for i in 0..worker_count {
@@ -199,10 +259,12 @@ impl CompactionScheduler {
                 let in_progress_clone = Arc::clone(&in_progress);
                 let health_clone = Arc::clone(&health);
                 let flush_clone = Arc::clone(&scheduler.flush);
+                let jobs_clone = Arc::clone(&scheduler.jobs);
 
                 let spawned = spawn_worker(&*opts.env, i, move || {
                     compaction_loop(
                         flush_clone,
+                        jobs_clone,
                         shutdown_clone,
                         receiver_clone,
                         pending_clone,
@@ -263,6 +325,13 @@ impl CompactionScheduler {
         for handle in self.take_handles() {
             handle.join();
         }
+        self.release_jobs();
+    }
+
+    /// Settle every job handed to the workers that they did not run, once
+    /// they stopped, and refuse every later one.
+    pub(crate) fn release_jobs(&self) {
+        self.jobs.release_queued();
     }
 
     /// Tell every worker to stop, without waiting for any of them.
@@ -439,6 +508,7 @@ impl Default for CompactionOptions {
 #[allow(clippy::too_many_arguments)]
 fn compaction_loop(
     flush: FlushHook,
+    jobs: Arc<WorkerJobs>,
     shutdown: Arc<AtomicBool>,
     trigger: Receiver<()>,
     pending: Arc<AtomicBool>,
@@ -452,6 +522,8 @@ fn compaction_loop(
     in_progress: Arc<crate::sync::internal::Mutex<HashSet<u64>>>,
     health: Arc<BackgroundHealth>,
 ) {
+    // The engine throttles this thread's I/O, and no caller's.
+    crate::rate_limiter::mark_worker_thread();
     let mut backoff = FailureBackoff::default();
     loop {
         // Wait for a trigger, or fall through on the periodic poll.
@@ -466,6 +538,8 @@ fn compaction_loop(
         if shutdown.load(Ordering::Acquire) {
             break;
         }
+        // Jobs callers handed over first: each is a call a caller waits on.
+        jobs.run_queued();
         // Frozen memtables first, oldest first: a flush feeds L0, and the
         // commit path left it to this thread (E9). Not held back by the
         // compaction backoff, which is about compaction failing.
@@ -478,10 +552,14 @@ fn compaction_loop(
 
         // Drive compactions until there's nothing to do. Each pass
         // takes a read lock so multiple workers can run concurrently.
-        // Foreground callers (`compact_range`, `ingest_external_files`,
-        // `checkpoint_capture`) take the write lock, which blocks until
-        // all workers finish their current pass.
+        // Foreground jobs (`compact_range`, an ingest, a checkpoint)
+        // take the write lock, which waits until every worker finishes
+        // its current pass.
         loop {
+            // A job a caller handed over runs between passes, never behind
+            // the whole run of them: writers that keep L0 busy would
+            // otherwise keep this loop going and the job waiting.
+            jobs.run_queued();
             let did_work = {
                 let _guard = compaction_lock.read();
                 match pick_and_run_compaction(
@@ -525,10 +603,10 @@ fn compaction_loop(
                 }
             };
 
-            // After each pass, wake any foreground writer that was
-            // blocked by a "stop writes" condition so it can re-check
-            // thresholds against the freshly-updated version.
-            stall_signal.notify_all();
+            // After each pass, re-classify the stall against the freshly
+            // updated version: writers a stop stopped are told once it no
+            // longer holds.
+            stall_signal.refresh();
 
             if !did_work || shutdown.load(Ordering::Acquire) {
                 break;
@@ -1848,9 +1926,8 @@ impl<'a> StreamingCompactionWriter<'a> {
         let num_entries = summary.num_entries;
         let file_size = self.opts.env.metadata(&current.path)?.len;
 
-        if let Some(limiter) = &self.opts.rate_limiter {
-            limiter.request(file_size, crate::rate_limiter::Priority::Low);
-        }
+        // On a worker only: a caller's own compaction is never throttled.
+        crate::rate_limiter::throttle_background(self.opts.rate_limiter.as_ref(), file_size)?;
 
         if self.opts.evict_compaction_data_from_page_cache {
             self.opts.env.drop_page_cache(&current.path);
@@ -1962,9 +2039,8 @@ impl<'a> StreamingCompactionWriter<'a> {
 
         let file_size = self.opts.env.metadata(&path)?.len;
 
-        if let Some(limiter) = &self.opts.rate_limiter {
-            limiter.request(file_size, crate::rate_limiter::Priority::Low);
-        }
+        // On a worker only: a caller's own compaction is never throttled.
+        crate::rate_limiter::throttle_background(self.opts.rate_limiter.as_ref(), file_size)?;
 
         if self.opts.evict_compaction_data_from_page_cache {
             self.opts.env.drop_page_cache(&path);
@@ -2200,7 +2276,7 @@ mod tests {
                 Arc::from(sst_dir.as_path()),
                 Arc::new(BlockCache::new(4096)),
                 opts,
-                Arc::new(crate::engine::StallSignal::new()),
+                Arc::new(crate::engine::StallSignal::for_tests(&versions)),
                 Arc::new(crate::sync::internal::Mutex::new(HashSet::new())),
                 Arc::new(BackgroundHealth::default()),
             )
@@ -2301,7 +2377,7 @@ mod tests {
                 Arc::from(sst_dir.as_path()),
                 Arc::new(BlockCache::new(4096)),
                 opts,
-                Arc::new(crate::engine::StallSignal::new()),
+                Arc::new(crate::engine::StallSignal::for_tests(&versions)),
                 Arc::new(crate::sync::internal::Mutex::new(HashSet::new())),
                 Arc::new(BackgroundHealth::default()),
             )

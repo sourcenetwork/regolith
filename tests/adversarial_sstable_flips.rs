@@ -88,7 +88,7 @@ fn build(partitioned: bool) -> Fixture {
         db.put(&k, &v).expect("put");
         truth.insert(k, v);
     }
-    db.compact_range(None, None).expect("compact_range");
+    db.compact_range(None, None).wait().expect("compact_range");
     db.close().expect("close");
     drop(db);
 

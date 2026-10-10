@@ -18,6 +18,13 @@
 //! at the head of the ring and wakes its writer (E21), so no writer serves an
 //! unbounded queue of others.
 //!
+//! A group with a member committed by `commit_nowait` that needs an fsync is
+//! written by its leader and left owing the rest of its landing (the fsync,
+//! the apply, the publication) as one claimable unit its members' queues
+//! wait on (`deferred.rs`, D53). The pipeline holds that group until it
+//! lands, and whoever takes the pipeline next lands it first, so the
+//! invariants below hold for it exactly as for a group landed inline.
+//!
 //! Three invariants outrank throughput here, and every design choice below
 //! is subordinate to them.
 //!
@@ -64,6 +71,7 @@ mod allocate;
 mod append;
 mod content;
 mod counter;
+mod deferred;
 mod early;
 mod group;
 mod range_rule;
@@ -77,6 +85,7 @@ mod txn;
 mod write_check;
 
 pub(crate) use append::PendingAppend;
+pub(crate) use deferred::GroupSync;
 use early::EarlyVerdict;
 use replaced::Replaced;
 pub(crate) use request::WriteRequest;
@@ -145,6 +154,10 @@ fn commit_ring_capacity() -> usize {
 struct GroupTicket {
     slot: Option<Arc<WriteSlot>>,
     request: WriteRequest,
+    /// The member was committed by `commit_nowait`: it must not wait for the
+    /// group's fsync. Read before the decide stage turns its request into a
+    /// batch.
+    nowait: bool,
     /// The decide stage's verdict on a transaction member; `None` for a
     /// plain write, which is not validated.
     verdict: Option<io::Result<Verdict>>,
@@ -157,6 +170,7 @@ impl GroupTicket {
     fn new(slot: Option<Arc<WriteSlot>>, request: WriteRequest) -> Self {
         Self {
             slot,
+            nowait: request.is_nowait(),
             request,
             verdict: None,
             perf: None,
@@ -205,6 +219,10 @@ pub(crate) struct Pipeline {
     /// of the ring a leader took out to hand the pipeline to (E21). Whoever
     /// leads next admits it first.
     held: Option<GroupTicket>,
+    /// The last group, written and still owed its fsync and landing
+    /// (`deferred.rs`). Whoever takes the pipeline lands it before anything
+    /// else, so groups land in the order they were written.
+    pending: Option<Arc<GroupSync>>,
 }
 
 impl Pipeline {
@@ -214,8 +232,67 @@ impl Pipeline {
             group: Vec::new(),
             prev_staged: 0,
             held: None,
+            pending: None,
         }
     }
+}
+
+/// What the log write of a group left for its landing: the group is numbered
+/// and its records are in the log, not yet synced, applied or published.
+pub(super) struct Written {
+    /// The view the group lands in, after any rotation its write made.
+    view: Arc<ReadView>,
+    /// The first sequence the group took.
+    base_seq: u64,
+    /// Sequences the group took; `0` for a group that writes nothing.
+    total_ops: u64,
+    /// Where the group's records start in the active log.
+    start_offset: u64,
+    /// The group put records in the log and a member asked for `Immediate`.
+    sync: bool,
+    /// How long the append took, when statistics are on and there is a clock.
+    append_micros: Option<u64>,
+}
+
+/// An optimistic transaction's commit, as the transaction hands it over.
+pub(crate) struct TxnCommit {
+    pub(crate) checks: ValidationSet,
+    pub(crate) point_ops: std::collections::BTreeMap<Vec<u8>, Option<Vec<u8>>>,
+    pub(crate) range_deletes: Vec<(Vec<u8>, Vec<u8>)>,
+    pub(crate) merges: Vec<(Vec<u8>, Vec<u8>)>,
+    pub(crate) appends: Vec<PendingAppend>,
+    pub(crate) durability: DurabilityMode,
+}
+
+/// A commit admitted to the pipeline, or decided before it.
+enum Requested {
+    /// The early check found a conflict: nothing is queued.
+    Decided(CommitOutcome),
+    /// The request the leader decides.
+    Queued(WriteRequest),
+}
+
+/// What `commit_nowait` learns from the pipeline.
+pub(crate) enum NowaitCommit {
+    /// The outcome: decided, landed or failed.
+    Done(CommitOutcome),
+    /// Decided and written, its group still owing its fsync: the outcome is
+    /// member `member` of `group` once it lands.
+    Pending {
+        group: Arc<GroupSync>,
+        member: usize,
+    },
+}
+
+/// How the group a leader ran ended up.
+enum Ran {
+    /// Landed inline: synced if it had to be, applied and published, from
+    /// this first sequence.
+    Landed(u64),
+    /// Written and owed its landing, which a nowait member's poll, a
+    /// blocking member or the next pipeline holder will run, against this
+    /// database.
+    Deferred(Written, Arc<RegolithEngine>),
 }
 
 /// Give staging memory back when neither of the last two groups needed it,
@@ -372,6 +449,48 @@ impl RegolithEngine {
         appends: Vec<PendingAppend>,
         durability: DurabilityMode,
     ) -> io::Result<CommitOutcome> {
+        let txn = TxnCommit {
+            checks,
+            point_ops,
+            range_deletes,
+            merges,
+            appends,
+            durability,
+        };
+        match self.request_commit(txn, false)? {
+            Requested::Decided(outcome) => Ok(outcome),
+            Requested::Queued(request) => self.conclude(self.submit_settled(request)?),
+        }
+    }
+
+    /// [`Self::commit_optimistic`] for `commit_nowait`: returns once the
+    /// commit is decided and written. When its group still owes its fsync,
+    /// [`NowaitCommit::Pending`] names the group and the member to take the
+    /// outcome from once it lands; the caller never waits for the device
+    /// here, except where the pipeline makes it land the group the last
+    /// leader left owing.
+    pub(crate) fn commit_optimistic_nowait(&self, txn: TxnCommit) -> io::Result<NowaitCommit> {
+        match self.request_commit(txn, true)? {
+            Requested::Decided(outcome) => Ok(NowaitCommit::Done(outcome)),
+            Requested::Queued(request) => match self.submit_nowait(request)? {
+                Settled::Pending { group, member } => Ok(NowaitCommit::Pending { group, member }),
+                settled => self.conclude(settled).map(NowaitCommit::Done),
+            },
+        }
+    }
+
+    /// Admit a commit (sizes, the write stall, the early check) and turn it
+    /// into the request the pipeline decides, or into the outcome the early
+    /// check already decided.
+    fn request_commit(&self, txn: TxnCommit, nowait: bool) -> io::Result<Requested> {
+        let TxnCommit {
+            checks,
+            point_ops,
+            range_deletes,
+            merges,
+            appends,
+            durability,
+        } = txn;
         self.ensure_writable()?;
         let ops = grouped_batch_ops(point_ops, range_deletes, merges);
         let mut record_bound = self.validate_ops_sizes(&ops, false)?;
@@ -396,17 +515,19 @@ impl RegolithEngine {
         // wait, though its conflict check still runs in a commit group like
         // any other commit. An append is a write.
         if !ops.is_empty() || !appends.is_empty() {
-            self.wait_for_write_capacity(false)
+            self.admit_write(false)
                 .map_err(crate::Error::into_io_error)?;
         }
 
         // Checked up to the horizon here, on this thread and outside the
         // pipeline mutex; the leader checks only what landed above it.
         let early = match self.check_early(&checks, &ops)? {
-            EarlyVerdict::Conflict(conflict) => return Ok(CommitOutcome::Conflict(conflict)),
+            EarlyVerdict::Conflict(conflict) => {
+                return Ok(Requested::Decided(CommitOutcome::Conflict(conflict)));
+            }
             EarlyVerdict::Marks(early) => early,
         };
-        let settled = self.submit_settled(WriteRequest::Txn(TxnRequest {
+        Ok(Requested::Queued(WriteRequest::Txn(TxnRequest {
             checks,
             ops,
             appends,
@@ -415,7 +536,27 @@ impl RegolithEngine {
             cost_bound,
             perf: crate::PerfContext::level(),
             early,
-        }))?;
+            nowait,
+        })))
+    }
+
+    /// What a transaction's commit learns from its landed group, as the
+    /// commit's outcome (see [`conclude_settled`]).
+    pub(crate) fn conclude(&self, settled: Settled) -> io::Result<CommitOutcome> {
+        conclude_settled(self.statistics(), settled)
+    }
+}
+
+/// What a transaction's commit learns from its landed group, as the commit's
+/// outcome: the perf the leader counted for it absorbed into this thread's
+/// context, and the counts its validation made recorded in `stats`. Called on
+/// the committing thread, or on the thread that delivers its ticket, once the
+/// group landed; a member still pending is taken from its landed group.
+pub(crate) fn conclude_settled(
+    stats: Option<&crate::Statistics>,
+    settled: Settled,
+) -> io::Result<CommitOutcome> {
+    {
         match settled {
             Settled::Committed {
                 seq,
@@ -428,7 +569,7 @@ impl RegolithEngine {
                 }
                 // Counted while validating, recorded here, off the commit
                 // pipeline and only once the commit landed.
-                if let Some(s) = self.statistics() {
+                if let Some(s) = stats {
                     if merges_commuted > 0 {
                         s.add(Ticker::PolicyBlindMergesCommuted, merges_commuted);
                     }
@@ -447,9 +588,24 @@ impl RegolithEngine {
             Settled::Write(_) => Err(io::Error::other(
                 "a transaction's commit settled as a plain write",
             )),
+            Settled::Pending { group, member } => group
+                .take(member)
+                .unwrap_or_else(|| {
+                    Err(io::Error::other(
+                        "a commit group's outcome was already taken for this commit",
+                    ))
+                })
+                .and_then(|settled| match settled {
+                    Settled::Pending { .. } => Err(io::Error::other(
+                        "a commit group left a member pending after it landed",
+                    )),
+                    landed => conclude_settled(stats, landed),
+                }),
         }
     }
+}
 
+impl RegolithEngine {
     /// Commit a transaction that writes nothing: check the reads it asked to
     /// have validated, if any, and take no part in the write pipeline.
     ///
@@ -504,10 +660,45 @@ impl RegolithEngine {
     /// group decided for it. Then, on a database with no worker, run the
     /// bounded step of background work the writes left owing, if any, now
     /// that this commit holds nothing of the pipeline.
+    ///
+    /// A group that a nowait member left owing its fsync is landed here, on
+    /// this thread, unless another thread already runs it: this call blocks,
+    /// and does its own I/O.
     fn submit_settled(&self, request: WriteRequest) -> io::Result<Settled> {
+        let settled = match self.commit_through_pipeline(request) {
+            Ok(Settled::Pending { group, member }) => group.settle(self, member),
+            other => other,
+        };
+        self.run_owed_step();
+        settled
+    }
+
+    /// Hand a nowait transaction's commit to the pipeline and return once it
+    /// is decided and written: the group's outcome, or, when its group still
+    /// owes its fsync, [`Settled::Pending`] naming the group to wait on.
+    pub(crate) fn submit_nowait(&self, request: WriteRequest) -> io::Result<Settled> {
         let settled = self.commit_through_pipeline(request);
         self.run_owed_step();
         settled
+    }
+
+    /// The pipeline, taken by a caller that may wait for it, with the group
+    /// the last leader left owing its landing landed first. Every
+    /// administrative caller that rotates the memtable or the log, or reads
+    /// the newest state under the pipeline, takes it this way.
+    pub(super) fn lock_pipeline(&self) -> crate::sync::internal::MutexGuard<'_, Pipeline> {
+        let mut pipe = self.pipeline.lock();
+        self.land_pending(&mut pipe);
+        pipe
+    }
+
+    /// Land the group the previous leader left owing, if any: run it here
+    /// when nobody has claimed it, or wait for the thread that runs it. The
+    /// pipeline is held, so no other group is written meanwhile.
+    fn land_pending(&self, pipe: &mut Pipeline) {
+        if let Some(group) = pipe.pending.take() {
+            group.land_here(self);
+        }
     }
 
     fn commit_through_pipeline(&self, request: WriteRequest) -> io::Result<Settled> {
@@ -523,7 +714,7 @@ impl RegolithEngine {
         // thread. Wait for the pipeline and commit inline rather than race
         // an in-flight handoff.
         if let Err(request) = slot.arm(request) {
-            let mut pipe = self.pipeline.lock();
+            let mut pipe = self.lock_pipeline();
             return self.lead_with(&mut pipe, request);
         }
 
@@ -561,6 +752,7 @@ impl RegolithEngine {
         pipe: &mut Pipeline,
         request: WriteRequest,
     ) -> io::Result<Settled> {
+        self.land_pending(pipe);
         release_stranded(&mut pipe.group);
         pipe.group.push(GroupTicket::new(None, request));
         let view = self.view.load();
@@ -589,6 +781,9 @@ impl RegolithEngine {
     /// Commit one group of the tickets waiting, the held one first, then
     /// hand the pipeline on. A drain leads no request of its own.
     fn lead_one(&self, pipe: &mut Pipeline) {
+        // Helping: a group the previous leader left owing lands first, here
+        // if nobody runs it yet, whether or not anything waits behind it.
+        self.land_pending(pipe);
         release_stranded(&mut pipe.group);
         // The common exit: nothing queued and nothing held. Checked before
         // the view load so the empty pass costs no lock and no Arc.
@@ -711,12 +906,17 @@ impl RegolithEngine {
     /// follower in it. Returns the outcome of the leader's own request, the
     /// one ticket with no slot, when the group carries one.
     ///
-    /// Completion happens after [`Self::run_group`] has published the read
+    /// Completion happens after the group's landing has published the read
     /// horizon (the lost-update fix). Each member learns its own outcome: a
     /// plain write its last sequence, a transaction its verdict. A group that
     /// fails hands every member the same error (G2), a member the leader had
     /// decided to abort included, as a run one at a time under the same
     /// persistent fault would fail it too.
+    ///
+    /// A group that needs an fsync and carries a nowait member is written
+    /// and left owing its landing (`deferred.rs`): every member, the leader
+    /// included, learns [`Settled::Pending`] naming the group, and the
+    /// pipeline keeps the group until it lands.
     fn run_and_complete(
         &self,
         pipe: &mut Pipeline,
@@ -727,12 +927,14 @@ impl RegolithEngine {
             stage,
             group,
             prev_staged,
+            pending,
             ..
         } = pipe;
         // Emptied first, so a group that fails before it encodes leaves no
         // previous group's length behind for the trim below.
         stage.clear();
-        let result = self.decide(group, &view).and_then(|()| {
+        let nowait = group.iter().any(|ticket| ticket.nowait);
+        let ran = self.decide(group, &view).and_then(|()| {
             // Summed after the decide stage, which turned every transaction
             // into what it actually stages, and not carried over from
             // admission, which summed bounds.
@@ -740,18 +942,37 @@ impl RegolithEngine {
             // The last line of defence, for a request that reached the
             // pipeline without its producer's check: admission never
             // combines requests past the limit, so a group over it is a
-            // single request, and it is refused whole before `run_group`
+            // single request, and it is refused whole before `write_group`
             // rotates, takes a sequence number or touches the log.
             check_write_len(staged)?;
-            self.run_group(stage, group, view, staged)
+            let written = self.write_group(stage, group, view, staged)?;
+            if nowait
+                && written.sync
+                && let Some(engine) = self.me.upgrade()
+            {
+                return Ok(Ran::Deferred(written, engine));
+            }
+            self.land_group(&written, group.iter().map(|t| &t.request))
+                .map(Ran::Landed)
         });
         // A caller's code panicked inside the group: the step it left half
         // done is not one any later write may build on.
-        if let Err(err) = &result
+        if let Err(err) = &ran
             && let Some(callback) = crate::Error::callback_panic_of(err)
         {
             self.latch_callback_panic(callback);
         }
+        let result = match ran {
+            Ok(Ran::Landed(base_seq)) => Ok(base_seq),
+            Ok(Ran::Deferred(written, engine)) => {
+                let own = Self::defer_group(engine, group, written, pending);
+                let used = stage.len();
+                trim_stage(stage, *prev_staged, used);
+                *prev_staged = used;
+                return own;
+            }
+            Err(err) => Err(err),
+        };
         // Each ticket learns the sequence *its own* operations were
         // assigned, not the group's maximum. An upper layer ordering its
         // versions against regolith's needs the sequence of the write it
@@ -787,7 +1008,37 @@ impl RegolithEngine {
         own
     }
 
-    /// Write, sync and apply one group.
+    /// Leave a written `group` owing its landing: one [`GroupSync`] its
+    /// members wait on, kept in the pipeline until it lands. Every follower's
+    /// slot completes with [`Settled::Pending`], so it returns or helps; the
+    /// leader's own request learns the same, which is returned.
+    fn defer_group(
+        engine: Arc<RegolithEngine>,
+        group: &mut Vec<GroupTicket>,
+        written: Written,
+        pending: &mut Option<Arc<GroupSync>>,
+    ) -> Option<io::Result<Settled>> {
+        let slots: Vec<Option<Arc<WriteSlot>>> =
+            group.iter().map(|ticket| ticket.slot.clone()).collect();
+        let sync = GroupSync::new(engine, written, group);
+        *pending = Some(Arc::clone(&sync));
+        let mut own = None;
+        for (member, slot) in slots.into_iter().enumerate() {
+            let settled = Ok(Settled::Pending {
+                group: Arc::clone(&sync),
+                member,
+            });
+            match slot {
+                Some(slot) => slot.complete(settled),
+                None => own = Some(settled),
+            }
+        }
+        own
+    }
+
+    /// Write and land one group inline: the log write, then the sync, the
+    /// apply and the publication. Returns the group's first sequence.
+    #[cfg(test)]
     fn run_group(
         &self,
         stage: &mut Vec<u8>,
@@ -795,6 +1046,20 @@ impl RegolithEngine {
         view: Arc<ReadView>,
         staged: usize,
     ) -> io::Result<u64> {
+        let written = self.write_group(stage, group, view, staged)?;
+        self.land_group(&written, group.iter().map(|t| &t.request))
+    }
+
+    /// The first half of a group: rotate if the memtable is full, number the
+    /// group, and append its records to the log in one write. Nothing is
+    /// synced, applied or published yet.
+    fn write_group(
+        &self,
+        stage: &mut Vec<u8>,
+        group: &[GroupTicket],
+        view: Arc<ReadView>,
+        staged: usize,
+    ) -> io::Result<Written> {
         // Cleared first, ahead of every early return (`ensure_writable`,
         // `rotate_if_full`, a refused reservation), so a group that never
         // reaches the encode loop leaves the stage empty instead of a
@@ -811,7 +1076,14 @@ impl RegolithEngine {
 
         let total_ops: u64 = group.iter().map(|t| t.request.op_count()).sum();
         if total_ops == 0 {
-            return Ok(self.visible_seq.visible());
+            return Ok(Written {
+                view,
+                base_seq: self.visible_seq.visible(),
+                total_ops: 0,
+                start_offset: 0,
+                sync: false,
+                append_micros: None,
+            });
         }
 
         // One allocation for the whole group, before any sequence number
@@ -849,6 +1121,14 @@ impl RegolithEngine {
             seq += ticket.request.op_count();
         }
 
+        let mut written = Written {
+            view,
+            base_seq,
+            total_ops,
+            start_offset: 0,
+            sync: false,
+            append_micros: None,
+        };
         if !stage.is_empty() {
             // Timed on the leader, which is the thread that does the WAL
             // work. A follower's own perf context records no WAL time
@@ -861,25 +1141,55 @@ impl RegolithEngine {
             // are on, so a write with them off pays no clock read at
             // all.
             let wal_start = self.statistics().and_then(|_| self.env.now_micros());
-            let synced = self.log_group(stage, any_immediate)?;
-
+            written.start_offset = self.log_group(stage)?;
+            written.sync = any_immediate;
+            written.append_micros = self.elapsed_micros(wal_start);
             if let Some(s) = self.statistics() {
                 s.add(Ticker::WalBytesWritten, reported_bytes);
-                if synced {
-                    s.add(Ticker::WalSyncCount, 1);
-                }
-                // `None` means the platform has no clock. Skip the
-                // recording rather than publishing a zero that reads
-                // like a measurement.
-                if let Some(micros) = self.elapsed_micros(wal_start) {
-                    s.record(Histogram::WalWriteTime, micros);
-                }
+            }
+        }
+        Ok(written)
+    }
+
+    /// The second half of a group: the fsync when it needs one, then the
+    /// apply of `requests` (the group's, in group order) and the
+    /// publication of the read horizon. Returns the group's first sequence.
+    fn land_group<'a>(
+        &self,
+        written: &Written,
+        requests: impl Iterator<Item = &'a WriteRequest>,
+    ) -> io::Result<u64> {
+        if written.total_ops == 0 {
+            return Ok(written.base_seq);
+        }
+        let sync_start = (written.sync && self.statistics().is_some())
+            .then(|| self.env.now_micros())
+            .flatten();
+        if written.sync {
+            let _perf_wal = PerfTimer::new(PerfTimerField::WriteWal);
+            self.sync_group(written.start_offset)?;
+        }
+        if let Some(s) = self.statistics() {
+            if written.sync {
+                s.add(Ticker::WalSyncCount, 1);
+            }
+            // The device time of the group's log: its append, plus its sync
+            // when it had one. `None` means the platform has no clock: the
+            // recording is skipped rather than a zero published that reads
+            // like a measurement.
+            let sync_micros = if written.sync {
+                self.elapsed_micros(sync_start)
+            } else {
+                Some(0)
+            };
+            if let (Some(append), Some(sync)) = (written.append_micros, sync_micros) {
+                s.record(Histogram::WalWriteTime, append.saturating_add(sync));
             }
         }
 
         {
             let _perf_mt = PerfTimer::new(PerfTimerField::WriteMemtable);
-            let memtable: &MemTable = &view.active;
+            let memtable: &MemTable = &written.view.active;
             // One hint per group: a commit's point ops arrive in key
             // order (`grouped_batch_ops`), so each insert after the
             // first starts where the previous one landed. The hint
@@ -887,24 +1197,43 @@ impl RegolithEngine {
             // with the block, so a rotation between groups can never
             // leave it pointing into a retired arena.
             let mut hint = memtable.insert_hint();
-            let mut seq = base_seq;
-            for ticket in group {
-                ticket.request.apply(memtable, &mut hint, &mut seq);
+            let mut seq = written.base_seq;
+            for request in requests {
+                request.apply(memtable, &mut hint, &mut seq);
             }
         }
 
         // the lost-update fix: the horizon moves only now that every record is durable and
         // every operation is applied, and `run_and_complete` releases the
         // followers only after this returns.
-        self.visible_seq.publish(base_seq + total_ops - 1);
-        Ok(base_seq)
+        self.visible_seq
+            .publish(written.base_seq + written.total_ops - 1);
+        Ok(written.base_seq)
     }
 
-    /// Append a group's records to the log in one write, and make them
-    /// durable with the group's one fsync when `sync` (a member asked for
-    /// Immediate durability). Returns whether it synced. A failure of either
-    /// discards the group's bytes, so no member reads as committed (G2).
-    fn log_group(&self, stage: &[u8], sync: bool) -> io::Result<bool> {
+    /// [`Self::land_group`] for a group a nowait member left owing, run as
+    /// its job on whichever thread claimed it, inside the ordered step: a
+    /// listener that panics while told of a failed sync latches the database
+    /// as it would inline.
+    pub(super) fn land_deferred<'a>(
+        &self,
+        written: &Written,
+        requests: impl Iterator<Item = &'a WriteRequest>,
+    ) -> io::Result<u64> {
+        let _commit = InCommit::enter();
+        let landed = self.land_group(written, requests);
+        if let Err(err) = &landed
+            && let Some(callback) = crate::Error::callback_panic_of(err)
+        {
+            self.latch_callback_panic(callback);
+        }
+        landed
+    }
+
+    /// Append a group's records to the log in one write, returning the
+    /// offset they start at. A failure discards the group's bytes, so no
+    /// member reads as committed (G2).
+    fn log_group(&self, stage: &[u8]) -> io::Result<u64> {
         let mut guard = self.active_wal.lock();
         let wal = guard.as_mut().ok_or_else(Self::read_only_error)?;
         let start_offset = wal.offset();
@@ -912,17 +1241,20 @@ impl RegolithEngine {
             self.abandon_group(wal, start_offset, &err)?;
             return Err(err);
         }
-        if sync {
-            self.sync_group(wal, start_offset)?;
-        }
-        Ok(sync)
+        Ok(start_offset)
     }
 
     /// The group's fsync: one `fdatasync` that makes every record the group
     /// appended at `start_offset` and after durable, and the one place an
     /// Immediate commit waits for the device. Nothing of the group is applied
     /// or visible before it returns. A failure discards the group's bytes.
-    fn sync_group(&self, wal: &mut Wal, start_offset: u64) -> io::Result<()> {
+    ///
+    /// The log it syncs is the one the group appended to: nothing rotates the
+    /// log between a group's write and its landing, since a rotation takes
+    /// the pipeline and lands the owed group first.
+    fn sync_group(&self, start_offset: u64) -> io::Result<()> {
+        let mut guard = self.active_wal.lock();
+        let wal = guard.as_mut().ok_or_else(Self::read_only_error)?;
         if let Err(err) = wal.sync_data() {
             self.abandon_group(wal, start_offset, &err)?;
             return Err(err);
@@ -984,6 +1316,9 @@ mod exempt_tests;
 
 #[cfg(test)]
 mod early_tests;
+
+#[cfg(test)]
+mod deferred_tests;
 
 #[cfg(test)]
 mod group_tests;

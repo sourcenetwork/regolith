@@ -77,7 +77,7 @@ fn workload(name: &str, dir: &str) {
         }
         "compact" => {
             let db = Db::open(dir, opts()).expect("open");
-            db.compact_range(None, None).expect("compact_range");
+            db.compact_range(None, None).wait().expect("compact_range");
             db.close().expect("close");
         }
         "long_key" => {

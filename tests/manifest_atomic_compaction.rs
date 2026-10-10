@@ -7,7 +7,6 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use regolith::env::{
     Capabilities, DirEntry, Env, FileLock, FileMeta, JoinHandle, MemEnv, ReadFile, WriteFile,
@@ -164,10 +163,6 @@ impl Env for CaptureEnv {
     ) -> io::Result<Box<dyn JoinHandle>> {
         self.inner.spawn(name, body)
     }
-
-    fn sleep(&self, dur: Duration) {
-        self.inner.sleep(dur);
-    }
 }
 
 fn options(env: Arc<dyn Env>, style: CompactionStyle) -> Options {
@@ -208,7 +203,7 @@ fn capture_compaction(style: CompactionStyle, expected: &[(Vec<u8>, Vec<u8>)]) -
 
     let db = Db::open(DB_PATH, options(env.clone(), style)).unwrap();
     env.armed.store(true, Ordering::SeqCst);
-    assert!(db.compact_range(None, None).is_err());
+    assert!(db.compact_range(None, None).wait().is_err());
     let image = env.captured.lock().unwrap().take().unwrap();
     assert!(!image.append.is_empty());
     assert_eq!(

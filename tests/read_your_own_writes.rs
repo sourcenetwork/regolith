@@ -53,9 +53,9 @@ fn a_writer_always_reads_back_at_least_its_own_write() {
                 if i % 3 == 0 {
                     let mut b = WriteBatch::new();
                     b.put(&key, &value);
-                    db.write(b).expect("write");
+                    regolith::through_stalls(|| db.write(b.clone())).expect("write");
                 } else {
-                    db.put(&key, &value).expect("put");
+                    regolith::through_stalls(|| db.put(&key, &value)).expect("put");
                 }
 
                 let got = db.get(&key).expect("get");
@@ -128,8 +128,10 @@ fn every_publisher_of_the_read_view_running_at_once_stays_live() {
         handles.push(thread::spawn(move || {
             let mut i = 0u64;
             while !stop.load(Ordering::Relaxed) {
-                db.put(format!("p{t}_{:05}", i % 4096).as_bytes(), &[b'x'; 96])
-                    .expect("put");
+                regolith::through_stalls(|| {
+                    db.put(format!("p{t}_{:05}", i % 4096).as_bytes(), &[b'x'; 96])
+                })
+                .expect("put");
                 i += 1;
             }
         }));
@@ -138,7 +140,7 @@ fn every_publisher_of_the_read_view_running_at_once_stays_live() {
         let (db, stop) = (Arc::clone(&db), Arc::clone(&stop));
         handles.push(thread::spawn(move || {
             while !stop.load(Ordering::Relaxed) {
-                db.compact_range(None, None).expect("compact_range");
+                db.compact_range(None, None).wait().expect("compact_range");
             }
         }));
     }
@@ -151,7 +153,7 @@ fn every_publisher_of_the_read_view_running_at_once_stays_live() {
                 if n.is_multiple_of(64) {
                     db.drop_all().expect("drop_all");
                 }
-                db.put(b"churn", &n.to_be_bytes()).expect("put");
+                regolith::through_stalls(|| db.put(b"churn", &n.to_be_bytes())).expect("put");
             }
         }));
     }

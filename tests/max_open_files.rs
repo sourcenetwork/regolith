@@ -63,7 +63,7 @@ fn an_iterator_outlives_the_compaction_that_deletes_its_tables() {
         seen += 1;
     }
 
-    db.compact_range(None, None).unwrap();
+    db.compact_range(None, None).wait().unwrap();
     // Churn the descriptor cache so nothing the iterator needs is still
     // open by luck.
     for k in (0..6_000u32).step_by(97) {

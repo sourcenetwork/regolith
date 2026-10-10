@@ -95,9 +95,12 @@ pub enum Ticker {
     IterSeekCount = 19,
     /// Number of `Iter::next` calls that produced a key.
     IterNextCount = 20,
-    /// Microseconds writers spent in write-stall waits that admitted the
-    /// write: plain writes and transactional commits that carry writes
-    /// alike. A wait that ends in a busy or closed error is not counted.
+    /// Microseconds writers spent relieving a write stall inline before the
+    /// write went on: plain writes and transactional commits that carry
+    /// writes alike, on a database with no compaction worker and
+    /// [`crate::Options::inline_compaction`] on. No write waits on a stall,
+    /// so nothing else is counted; relief that ends in a busy or closed
+    /// error is not counted either.
     WriteStallMicros = 21,
     /// Number of snapshots registered via `Db::snapshot`.
     SnapshotsRegistered = 22,

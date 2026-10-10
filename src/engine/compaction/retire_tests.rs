@@ -52,7 +52,7 @@ fn dropped_column_families_stop_costing_compaction() {
         db.flush().unwrap();
         // What the next pass has to carry, measured before it runs.
         carried.push(carried_tombstones(&db));
-        db.compact_range(None, None).unwrap();
+        db.compact_range(None, None).wait().unwrap();
         assert_eq!(
             carried_tombstones(&db),
             0,
@@ -89,13 +89,13 @@ fn deleted_keys_stay_deleted_once_their_tombstone_retires() {
     for i in 0..32u32 {
         db.put(format!("k{i:02}").as_bytes(), b"old").unwrap();
     }
-    db.compact_range(None, None).unwrap();
+    db.compact_range(None, None).wait().unwrap();
     db.delete_range(b"k04", b"k20").unwrap();
     db.flush().unwrap();
 
     // The first passes move the tombstone down past nothing it covers: the
     // keys it deletes are still deeper, so it must survive them.
-    db.compact_range(None, None).unwrap();
+    db.compact_range(None, None).wait().unwrap();
     assert_eq!(carried_tombstones(&db), 0);
     let check = |db: &Db| {
         for i in 0..32u32 {
@@ -120,10 +120,10 @@ fn a_tombstone_a_live_snapshot_needs_is_kept_until_a_pass_after_its_release() {
     for i in 0..8u32 {
         db.put(format!("k{i}").as_bytes(), b"old").unwrap();
     }
-    db.compact_range(None, None).unwrap();
+    db.compact_range(None, None).wait().unwrap();
     let before = db.snapshot();
     db.delete_range(b"k2", b"k6").unwrap();
-    db.compact_range(None, None).unwrap();
+    db.compact_range(None, None).wait().unwrap();
 
     assert_eq!(
         carried_tombstones(&db),
@@ -152,7 +152,7 @@ fn a_tombstone_a_live_snapshot_needs_is_kept_until_a_pass_after_its_release() {
     drop(before);
     let after = db.snapshot();
     db.put(b"k7", b"new").unwrap();
-    db.compact_range(None, None).unwrap();
+    db.compact_range(None, None).wait().unwrap();
     assert_eq!(carried_tombstones(&db), 0);
     for i in 0..8u32 {
         let key = format!("k{i}");

@@ -62,10 +62,12 @@ fn missing_after_ingest(block_cache_size: usize, prefixes: &[&str], one_call: bo
 
     if one_call {
         db.ingest_external_files(&staged, IngestOptions::default())
+            .wait()
             .expect("ingest reported success");
     } else {
         for path in staged {
             db.ingest_external_files(&[path], IngestOptions::default())
+                .wait()
                 .expect("ingest reported success");
         }
     }

@@ -55,7 +55,7 @@ fn fixture(partitioned: bool) -> Vec<PlantedFile> {
             db.put(&key(i), &value(i)).expect("put");
         }
         db.delete_range(b"k_000050", b"k_000060").expect("range");
-        db.compact_range(None, None).expect("compact");
+        db.compact_range(None, None).wait().expect("compact");
         db.close().expect("close");
     }
     let mut out = Vec::new();

@@ -208,10 +208,10 @@ impl DbWithTtl {
         &self.inner
     }
 
-    /// Synchronously compact every SSTable overlapping `[start, end)`
-    /// down the tree. Expired entries are physically removed via the
-    /// installed [`TtlCompactionFilter`].
-    pub fn compact_range(&self, start: Option<&[u8]>, end: Option<&[u8]>) -> Result<()> {
+    /// Compact every SSTable overlapping `[start, end)` down the tree, as
+    /// a job (see [`Db::compact_range`]). Expired entries are physically
+    /// removed via the installed [`TtlCompactionFilter`].
+    pub fn compact_range(&self, start: Option<&[u8]>, end: Option<&[u8]>) -> crate::JobTicket {
         self.inner.compact_range(start, end)
     }
 
@@ -403,7 +403,7 @@ mod tests {
         let db = DbWithTtl::open(dir.path(), Options::default(), 0).unwrap();
         db.put(b"k", b"v").unwrap();
         // Even after a compaction nothing should be dropped.
-        db.compact_range(None, None).unwrap();
+        db.compact_range(None, None).wait().unwrap();
         assert_eq!(db.get(b"k").unwrap(), Some(b"v".to_vec()));
     }
 
@@ -443,7 +443,7 @@ mod tests {
         }
 
         force_flush(&db, "ttl");
-        db.compact_range(None, None).unwrap();
+        db.compact_range(None, None).wait().unwrap();
 
         // Reads via DbWithTtl: stale is gone, fresh survives.
         for i in 0..20 {

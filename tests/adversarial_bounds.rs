@@ -54,7 +54,7 @@ fn a_single_writer_keeps_the_active_memtable_near_its_budget() {
 
     let mut peak = 0u64;
     for i in 0..20_000 {
-        db.put(format!("k{i:08}").as_bytes(), &[b'v'; 128]).unwrap();
+        regolith::through_stalls(|| db.put(format!("k{i:08}").as_bytes(), &[b'v'; 128])).unwrap();
         peak = peak.max(active_bytes(&db));
     }
     println!(
@@ -172,7 +172,7 @@ fn measure_with(
                 for k in 0..batch_ops {
                     batch.put(format!("w{w:02}_{round:05}_{k:03}").as_bytes(), &value);
                 }
-                db.write(batch).unwrap();
+                regolith::through_stalls(|| db.write(batch.clone())).unwrap();
             }
         }));
     }
@@ -211,7 +211,7 @@ fn one_request_cost(batch_ops: usize, value_len: usize) -> u64 {
     for k in 0..batch_ops {
         batch.put(format!("w00_00000_{k:03}").as_bytes(), &value);
     }
-    db.write(batch).unwrap();
+    regolith::through_stalls(|| db.write(batch.clone())).unwrap();
     active_bytes(&db)
 }
 
@@ -342,7 +342,7 @@ fn optimistic_transactions_do_not_lose_conflicts_under_group_commit() {
         )
         .unwrap(),
     );
-    tdb.db().put(b"counter", b"0").unwrap();
+    regolith::through_stalls(|| tdb.db().put(b"counter", b"0")).unwrap();
 
     let committed = Arc::new(AtomicUsize::new(0));
     let conflicts = Arc::new(AtomicUsize::new(0));
@@ -434,7 +434,7 @@ fn a_batch_larger_than_the_group_cap_stays_atomic() {
     for k in 0..width {
         batch.put(format!("huge_{k:05}").as_bytes(), &[b'h'; 512]);
     }
-    db.write(batch).unwrap();
+    regolith::through_stalls(|| db.write(batch.clone())).unwrap();
     stop.store(true, Ordering::Relaxed);
     reader.join().unwrap();
 
@@ -473,7 +473,7 @@ fn closing_under_concurrent_writers_never_hangs_or_lies() {
         handles.push(thread::spawn(move || {
             for i in 0..4_000usize {
                 let key = format!("c{w:02}_{i:05}");
-                if db.put(key.as_bytes(), b"v").is_ok() {
+                if regolith::through_stalls(|| db.put(key.as_bytes(), b"v")).is_ok() {
                     acknowledged.lock().unwrap().push(key);
                 } else {
                     break;

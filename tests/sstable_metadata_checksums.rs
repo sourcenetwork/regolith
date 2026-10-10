@@ -63,7 +63,7 @@ fn one_table_db() -> (TempDir, PathBuf) {
     for i in 0..KEYS {
         db.put(&key(i), &val(i)).expect("put");
     }
-    db.compact_range(None, None).expect("compact");
+    db.compact_range(None, None).wait().expect("compact");
     db.close().expect("close");
     drop(db);
     let mut ssts: Vec<PathBuf> = fs::read_dir(dir.path().join("sst"))

@@ -107,7 +107,7 @@ fn fill(flush_to_sstables: bool) -> Fixture {
         db.put(key_at(i).as_bytes(), &value).expect("put");
     }
     if flush_to_sstables {
-        db.compact_range(None, None).expect("compact");
+        db.compact_range(None, None).wait().expect("compact");
     }
     Fixture { db, _dir: dir }
 }

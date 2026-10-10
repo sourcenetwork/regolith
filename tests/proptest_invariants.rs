@@ -141,7 +141,7 @@ proptest! {
             expected.insert(k.clone(), v.clone());
         }
 
-        db.compact_range(None, None).unwrap();
+        db.compact_range(None, None).wait().unwrap();
 
         for (k, v) in &expected {
             let got = db.get(k).unwrap();
@@ -184,7 +184,7 @@ proptest! {
             expected.remove(k);
         }
 
-        db.compact_range(None, None).unwrap();
+        db.compact_range(None, None).wait().unwrap();
 
         // Deleted keys must be gone.
         for k in &deleted {
@@ -310,7 +310,7 @@ proptest! {
                 db.delete(k).unwrap();
                 deleted.push(k.clone());
             }
-            db.compact_range(None, None).unwrap();
+            db.compact_range(None, None).wait().unwrap();
             deleted
         };
         let db = open(&dir);

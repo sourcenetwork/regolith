@@ -79,7 +79,7 @@ fn a_checksummed_database_survives_backup_and_restore() {
         let src = TempDir::new().expect("tempdir");
         let db = Db::open(src.path(), opts(partitioned)).expect("open");
         fill(&db);
-        db.compact_range(None, None).expect("compact");
+        db.compact_range(None, None).wait().expect("compact");
 
         let backup_dir = TempDir::new().expect("tempdir");
         let mut engine = BackupEngine::open(backup_dir.path()).expect("backup engine");
@@ -105,11 +105,11 @@ fn a_checksummed_database_survives_a_checkpoint() {
         let src = TempDir::new().expect("tempdir");
         let db = Db::open(src.path(), opts(partitioned)).expect("open");
         fill(&db);
-        db.compact_range(None, None).expect("compact");
+        db.compact_range(None, None).wait().expect("compact");
 
         let holder = TempDir::new().expect("tempdir");
         let cp = holder.path().join("cp");
-        db.checkpoint(&cp).expect("checkpoint");
+        db.checkpoint(&cp).wait().expect("checkpoint");
         db.close().expect("close");
         drop(db);
 
@@ -151,6 +151,7 @@ fn a_checksummed_external_table_ingests_and_reads_back() {
         let dir = TempDir::new().expect("tempdir");
         let db = Db::open(dir.path(), opts(partitioned)).expect("open");
         db.ingest_external_files(&[path], IngestOptions::default())
+            .wait()
             .expect("ingest");
         for i in 0..N {
             assert_eq!(
@@ -171,7 +172,7 @@ fn a_partitioned_database_survives_compaction_and_reopen() {
     let db = Db::open(dir.path(), opts(true)).expect("open");
     fill(&db);
     for round in 0..3 {
-        db.compact_range(None, None).expect("compact");
+        db.compact_range(None, None).wait().expect("compact");
         check(&db, &format!("partitioned after compaction round {round}"));
     }
     db.close().expect("close");

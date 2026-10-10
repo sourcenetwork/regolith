@@ -209,7 +209,9 @@ fn values_reserved_by_a_transaction_that_aborts_are_skipped() {
 }
 
 /// A write under a hard stall that compaction cannot relieve fails with
-/// `Busy`; allocation is not a write the stall applies to.
+/// `Busy` (with inline compaction on and no queue, the write runs the steps
+/// itself and finds none relieves it); allocation is not a write the stall
+/// applies to.
 #[test]
 fn allocation_does_not_wait_while_writes_are_stalled() {
     let dir = TempDir::new().unwrap();
@@ -226,7 +228,8 @@ fn allocation_does_not_wait_while_writes_are_stalled() {
             .level0_stop_writes_trigger(2)
             .level0_slowdown_writes_trigger(2)
             .l0_compaction_trigger(64)
-            .max_background_compactions(0),
+            .max_background_compactions(0)
+            .inline_compaction(true),
     )
     .unwrap();
     let _pin = db.snapshot();
