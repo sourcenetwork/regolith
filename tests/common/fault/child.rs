@@ -216,6 +216,9 @@ pub struct ChildSpec {
     /// The database is encrypted at rest under [`crate::common::keys::Keys`]
     /// key 1.
     pub encrypted: bool,
+    /// Compaction workers, when the run needs a number other than the
+    /// default. With none, the writing thread runs every flush itself.
+    pub workers: Option<usize>,
 }
 
 impl ChildSpec {
@@ -251,7 +254,16 @@ impl ChildSpec {
             write_buffer_size,
             ack_path,
             encrypted: false,
+            workers: None,
         }
+    }
+
+    /// Run with `n` compaction workers. `0` makes the writing thread the one
+    /// thread that flushes, so a crash on the nth table write is a crash in
+    /// that thread's flush and in no other.
+    pub fn workers(mut self, n: usize) -> Self {
+        self.workers = Some(n);
+        self
     }
 
     /// Encrypt the database at rest, under the key [`ChildSpec::options`]
@@ -291,9 +303,12 @@ impl ChildSpec {
     }
 
     pub fn options(&self) -> Options {
-        let options = Options::default()
+        let mut options = Options::default()
             .write_buffer_size(self.write_buffer_size)
             .durability(self.durability);
+        if let Some(workers) = self.workers {
+            options = options.max_background_compactions(workers);
+        }
         if self.encrypted {
             options.key_provider(crate::common::keys::Keys::new(&[1]))
         } else {
@@ -340,6 +355,10 @@ impl ChildSpec {
                 "REGOLITH_CRASH_KEYS".into(),
                 if self.encrypted { "1" } else { "0" }.into(),
             ),
+            (
+                "REGOLITH_CRASH_WORKERS".into(),
+                self.workers.map(|n| n.to_string()).unwrap_or_default(),
+            ),
         ]
     }
 
@@ -369,6 +388,9 @@ impl ChildSpec {
             write_buffer_size: num("REGOLITH_CRASH_WBS", 1 << 20),
             ack_path: PathBuf::from(std::env::var("REGOLITH_CRASH_ACK").unwrap_or_default()),
             encrypted: num("REGOLITH_CRASH_KEYS", 0) == 1,
+            workers: std::env::var("REGOLITH_CRASH_WORKERS")
+                .ok()
+                .and_then(|v| v.parse().ok()),
         })
     }
 }
