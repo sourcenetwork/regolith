@@ -104,34 +104,58 @@ pub(super) async fn remove_entry(dir: &JsValue, name: &str) -> Result<(), JsValu
     Ok(())
 }
 
-/// File entries directly under `dir`, as `(name, FileSystemFileHandle)`.
-/// Subdirectories are skipped: regolith's OPFS layout is flat.
-pub(super) async fn list_files(dir: &JsValue) -> Result<Vec<(String, JsValue)>, JsValue> {
-    let values = method(dir, "values")?;
-    let iterator = values.call0(dir)?;
+/// A walk of the file entries directly under an OPFS directory, through
+/// the directory's async `values()` iterator.
+///
+/// Each [`FileWalk::next_file`] awaits one `next()` promise, the way every
+/// other asynchronous OPFS call here is awaited, so a walk holds one entry
+/// at a time and never the directory: a mount over a directory of any size
+/// costs the same memory. Subdirectories are skipped: regolith's OPFS
+/// layout is flat.
+pub(super) struct FileWalk {
+    iterator: JsValue,
+    next: Function,
+}
 
-    let mut files = Vec::new();
-    loop {
+impl FileWalk {
+    /// Start a walk of `dir`.
+    pub(super) fn new(dir: &JsValue) -> Result<Self, JsValue> {
+        let values = method(dir, "values")?;
+        let iterator = values.call0(dir)?;
         let next = method(&iterator, "next")?;
-        let step = await_promise(next.call0(&iterator)?, "values().next").await?;
+        Ok(Self { iterator, next })
+    }
 
-        if Reflect::get(&step, &JsValue::from_str("done"))?
-            .as_bool()
-            .unwrap_or(true)
-        {
-            break;
-        }
-
-        let handle = Reflect::get(&step, &JsValue::from_str("value"))?;
-        let kind = Reflect::get(&handle, &JsValue::from_str("kind"))?;
-        if kind.as_string().as_deref() != Some("file") {
-            continue;
-        }
-        if let Some(name) = Reflect::get(&handle, &JsValue::from_str("name"))?.as_string() {
-            files.push((name, handle));
+    /// The next file entry as `(name, FileSystemFileHandle)`, or `None`
+    /// once the directory is exhausted.
+    pub(super) async fn next_file(&mut self) -> Result<Option<(String, JsValue)>, JsValue> {
+        loop {
+            let step = await_promise(self.next.call0(&self.iterator)?, "values().next").await?;
+            if Reflect::get(&step, &JsValue::from_str("done"))?
+                .as_bool()
+                .unwrap_or(true)
+            {
+                return Ok(None);
+            }
+            let handle = Reflect::get(&step, &JsValue::from_str("value"))?;
+            let kind = Reflect::get(&handle, &JsValue::from_str("kind"))?;
+            if kind.as_string().as_deref() != Some("file") {
+                continue;
+            }
+            if let Some(name) = Reflect::get(&handle, &JsValue::from_str("name"))?.as_string() {
+                return Ok(Some((name, handle)));
+            }
         }
     }
-    Ok(files)
+}
+
+/// The size in bytes of the file behind `file_handle`, through `getFile()`,
+/// without reading its contents.
+pub(super) async fn file_size(file_handle: &JsValue) -> Result<u64, JsValue> {
+    let get_file = method(file_handle, "getFile")?;
+    let file = await_promise(get_file.call0(file_handle)?, "getFile").await?;
+    let size = number(&Reflect::get(&file, &JsValue::from_str("size"))?, "size")?;
+    Ok(size as u64)
 }
 
 /// `fileHandle.createSyncAccessHandle()`.

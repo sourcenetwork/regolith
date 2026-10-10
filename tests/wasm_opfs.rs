@@ -283,8 +283,7 @@ async fn directories_list_their_entries_after_a_remount() {
     let mut names: Vec<String> = env
         .read_dir(Path::new(&dir))
         .expect("read_dir")
-        .iter()
-        .map(|entry| entry.file_name())
+        .map(|entry| entry.expect("walk").file_name())
         .collect();
     names.sort();
     assert_eq!(names, vec!["000000.sst", "000001.sst", "000002.sst"]);

@@ -563,11 +563,15 @@ tla:
     check MC_ManifestSeal_Red_TagOnlyStop              RED OnlyTornEnds
     check MC_ManifestSeal_Red_TagOnlyRefuse            RED RecoveryOpens
     # 4.12, D57: a backup of an encrypted database seals its metadata, and a
-    # restore checks every key before its first write. Lean:
-    # Regolith/BackupSeal.lean, entitled_restore_is_faithful,
-    # refusal_writes_nothing, collect_keeps_listed, last_write_holds_all.
+    # restore checks every key before its first write. A delete streams its
+    # walk of meta/, reading each listing as the walk reaches it (Phase 8).
+    # Lean: Regolith/BackupSeal.lean, entitled_restore_is_faithful,
+    # refusal_writes_nothing, collect_keeps_listed, last_write_holds_all,
+    # collect_stream_eq, stream_keeps_listed, stream_holds_one_listing.
     spec=BackupSeal
     check MC_BackupSeal_Green                          GREEN
+    check MC_BackupSeal_Green_Stream                   GREEN
+    check MC_BackupSeal_Red_StreamSkips                RED ListedRestores
     check MC_BackupSeal_Red_PlainMeta                  RED SealedMetadata
     check MC_BackupSeal_Red_PlainRestore               RED SealedMetadata
     check MC_BackupSeal_Red_OpenUnderCurrent           RED RightKeysRestore

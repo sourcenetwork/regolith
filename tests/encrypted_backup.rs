@@ -315,7 +315,7 @@ fn listing_deleting_and_purging_need_no_key_and_keep_what_sealed_backups_share()
 
     // An engine that holds no key, as every engine does.
     let mut engine = BackupEngine::open(backups.path()).unwrap();
-    let infos = engine.list_backups();
+    let infos: Vec<_> = engine.list_backups().map(Result::unwrap).collect();
     assert_eq!(
         infos.iter().map(|i| i.id).collect::<Vec<_>>(),
         vec![first, second]
@@ -333,7 +333,7 @@ fn listing_deleting_and_purging_need_no_key_and_keep_what_sealed_backups_share()
     check(&Db::open(&target, options(&keys)).unwrap(), 0, 600);
 
     engine.purge_old_backups(0).unwrap();
-    assert!(engine.list_backups().is_empty());
+    assert_eq!(engine.list_backups().count(), 0);
     assert_eq!(shared_count(backups.path()), 0);
 }
 

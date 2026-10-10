@@ -8,7 +8,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::env::{Capabilities, DirEntry, FileMeta, ReadFile, WriteFile, WriteMode};
+use crate::env::{Capabilities, FileMeta, ReadDir, ReadFile, WriteFile, WriteMode};
 
 use super::mirror::MirrorFs;
 use super::pool::SahPool;
@@ -16,7 +16,7 @@ use super::pool::SahPool;
 /// The operations an OPFS strategy provides to the `Env` implementation.
 pub(super) trait OpfsStore: Send + Sync + std::fmt::Debug {
     fn create_dir_all(&self, path: &Path) -> io::Result<()>;
-    fn read_dir(&self, path: &Path) -> io::Result<Vec<DirEntry>>;
+    fn read_dir(&self, path: &Path) -> io::Result<ReadDir<'_>>;
     fn open_read(&self, path: &Path) -> io::Result<Box<dyn ReadFile>>;
     fn open_write(&self, path: &Path, mode: WriteMode) -> io::Result<Box<dyn WriteFile>>;
     fn metadata(&self, path: &Path) -> io::Result<FileMeta>;
@@ -25,12 +25,6 @@ pub(super) trait OpfsStore: Send + Sync + std::fmt::Debug {
     fn exists(&self, path: &Path) -> bool;
     fn sync_dir(&self, path: &Path) -> io::Result<()>;
     fn capabilities(&self) -> Capabilities;
-}
-
-fn entries(raw: Vec<(PathBuf, bool)>) -> Vec<DirEntry> {
-    raw.into_iter()
-        .map(|(path, is_dir)| DirEntry { path, is_dir })
-        .collect()
 }
 
 fn short_read(want: usize, got: usize) -> io::Error {
@@ -53,8 +47,8 @@ impl OpfsStore for PoolStore {
         self.0.create_dir_all(path)
     }
 
-    fn read_dir(&self, path: &Path) -> io::Result<Vec<DirEntry>> {
-        self.0.read_dir(path).map(entries)
+    fn read_dir(&self, path: &Path) -> io::Result<ReadDir<'_>> {
+        self.0.read_dir(path)
     }
 
     fn open_read(&self, path: &Path) -> io::Result<Box<dyn ReadFile>> {
@@ -191,8 +185,8 @@ impl OpfsStore for MirrorStore {
         self.0.create_dir_all(path)
     }
 
-    fn read_dir(&self, path: &Path) -> io::Result<Vec<DirEntry>> {
-        self.0.read_dir(path).map(entries)
+    fn read_dir(&self, path: &Path) -> io::Result<ReadDir<'_>> {
+        self.0.read_dir(path)
     }
 
     fn open_read(&self, path: &Path) -> io::Result<Box<dyn ReadFile>> {

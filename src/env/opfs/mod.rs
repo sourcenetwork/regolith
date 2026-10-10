@@ -73,10 +73,10 @@ use kovan_map::HashMap;
 use wasm_bindgen::JsValue;
 
 use crate::env::{
-    Capabilities, DirEntry, Env, FileLock, FileMeta, JoinHandle, ReadFile, WriteFile, WriteMode,
+    Capabilities, Env, FileLock, FileMeta, JoinHandle, ReadDir, ReadFile, WriteFile, WriteMode,
 };
 
-use mirror::MirrorFs;
+use mirror::{Loaded, MirrorFs};
 use pool::SahPool;
 use store::{MirrorStore, OpfsStore, PoolStore};
 
@@ -230,9 +230,6 @@ impl OpfsEnv {
         let directory = js::directory_handle(&root, db_name, true)
             .await
             .map_err(|e| OpfsError::Js(describe(&e)))?;
-        let existing = js::list_files(&directory)
-            .await
-            .map_err(|e| OpfsError::Js(describe(&e)))?;
 
         let db_path = PathBuf::from(db_name);
 
@@ -240,11 +237,11 @@ impl OpfsEnv {
             // Never open fewer slots than the directory already holds:
             // the files above the cut would be unreachable, and growing
             // back into them would overwrite live data.
-            let slots = options
-                .initial_slots
-                .max(1)
-                .max(sah::existing_slot_count(&existing));
-            match sah::open_slots(&directory, &existing, 0..slots).await {
+            let existing = sah::existing_slot_count(&directory)
+                .await
+                .map_err(|e| OpfsError::Js(describe(&e)))?;
+            let slots = options.initial_slots.max(1).max(existing);
+            match sah::open_slots(&directory, 0..slots).await {
                 Ok(opened) => {
                     let (handles, headers): (Vec<_>, Vec<_>) = opened.into_iter().unzip();
                     let mount = sah::register_mount(directory, handles);
@@ -271,16 +268,18 @@ impl OpfsEnv {
             }
         }
 
-        let loaded = MirrorFs::load(&directory)
+        let loaded = match MirrorFs::load(&directory, options.max_resident_bytes)
             .await
-            .map_err(|e| OpfsError::Js(describe(&e)))?;
-        let resident: usize = loaded.iter().map(|(_, data)| data.len()).sum();
-        if resident > options.max_resident_bytes {
-            return Err(OpfsError::ResidencyExceeded {
-                resident,
-                limit: options.max_resident_bytes,
-            });
-        }
+            .map_err(|e| OpfsError::Js(describe(&e)))?
+        {
+            Loaded::Files(files) => files,
+            Loaded::OverLimit(resident) => {
+                return Err(OpfsError::ResidencyExceeded {
+                    resident,
+                    limit: options.max_resident_bytes,
+                });
+            }
+        };
         let mount = sah::register_mount(directory, Vec::new());
         let fs = Arc::new(MirrorFs::new(mount, loaded, options.max_resident_bytes));
         Ok(Self {
@@ -369,7 +368,7 @@ impl OpfsEnv {
         // Growth reads each new slot's header exactly as mount does, so a
         // physical file that already carries a logical path is adopted
         // rather than blanked.
-        let opened = sah::open_slots(&directory, &[], first..first + additional)
+        let opened = sah::open_slots(&directory, first..first + additional)
             .await
             .map_err(|e| OpfsError::Js(describe(&e)))?;
         let (handles, headers): (Vec<_>, Vec<_>) = opened.into_iter().unzip();
@@ -392,7 +391,7 @@ impl Env for OpfsEnv {
         self.store().create_dir_all(path)
     }
 
-    fn read_dir(&self, path: &Path) -> io::Result<Vec<DirEntry>> {
+    fn read_dir(&self, path: &Path) -> io::Result<ReadDir<'_>> {
         self.store().read_dir(path)
     }
 
@@ -490,24 +489,6 @@ pub(super) fn register_ancestors(dirs: &HashMap<PathBuf, ()>, path: &Path) {
     }
 }
 
-/// Entries directly under `dir`, sorted, files and directories together.
-pub(super) fn children(
-    dir: &Path,
-    files: impl Iterator<Item = PathBuf>,
-    dirs: impl Iterator<Item = PathBuf>,
-) -> Vec<(PathBuf, bool)> {
-    let mut out: Vec<(PathBuf, bool)> = files
-        .filter(|path| path.parent() == Some(dir))
-        .map(|path| (path, false))
-        .chain(
-            dirs.filter(|path| path.parent() == Some(dir))
-                .map(|path| (path, true)),
-        )
-        .collect();
-    out.sort();
-    out
-}
-
 /// The error every OPFS backend reports for a path it does not hold.
 pub(super) fn not_found(path: &Path) -> io::Error {
     io::Error::new(
@@ -533,23 +514,6 @@ mod tests {
         assert!(dirs.contains_key(Path::new("db")));
         assert!(dirs.contains_key(Path::new("db/sst")));
         assert!(!dirs.contains_key(Path::new("db/sst/000001.sst")));
-    }
-
-    #[wasm_bindgen_test]
-    fn children_are_direct_entries_only() {
-        let files = [
-            PathBuf::from("db/MANIFEST"),
-            PathBuf::from("db/sst/000001.sst"),
-        ];
-        let dirs = [PathBuf::from("db"), PathBuf::from("db/sst")];
-        let listed = children(Path::new("db"), files.into_iter(), dirs.into_iter());
-        assert_eq!(
-            listed,
-            vec![
-                (PathBuf::from("db/MANIFEST"), false),
-                (PathBuf::from("db/sst"), true),
-            ]
-        );
     }
 
     #[wasm_bindgen_test]

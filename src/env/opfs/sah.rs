@@ -189,20 +189,27 @@ fn slot_name(index: usize) -> String {
     format!("{SLOT_PREFIX}{index:04}")
 }
 
-/// How many slots a directory already holds, as one past the highest
-/// index present.
+/// The slot index a physical file's name carries, or `None` for a file
+/// that is not a slot.
+fn slot_index(name: &str) -> Option<usize> {
+    name.strip_prefix(SLOT_PREFIX)?.parse().ok()
+}
+
+/// How many slots `directory` already holds, as one past the highest index
+/// present, from one walk that holds a single entry at a time.
 ///
 /// Mount opens at least this many, never fewer: a pool opened with fewer
 /// slots than a previous run would leave the files above the cut
 /// unreachable, and growing back into them would overwrite live data.
-pub(super) fn existing_slot_count(existing: &[(String, JsValue)]) -> usize {
-    existing
-        .iter()
-        .filter_map(|(name, _)| name.strip_prefix(SLOT_PREFIX))
-        .filter_map(|suffix| suffix.parse::<usize>().ok())
-        .map(|index| index + 1)
-        .max()
-        .unwrap_or(0)
+pub(super) async fn existing_slot_count(directory: &JsValue) -> Result<usize, JsValue> {
+    let mut walk = js::FileWalk::new(directory)?;
+    let mut count = 0;
+    while let Some((name, _)) = walk.next_file().await? {
+        if let Some(index) = slot_index(&name) {
+            count = count.max(index.saturating_add(1));
+        }
+    }
+    Ok(count)
 }
 
 /// Open, or create and open, the physical slots `indices` in `directory`.
@@ -213,17 +220,11 @@ pub(super) fn existing_slot_count(existing: &[(String, JsValue)]) -> usize {
 /// a worker, and that rejection is surfaced to the caller unchanged.
 pub(super) async fn open_slots(
     directory: &JsValue,
-    existing: &[(String, JsValue)],
     indices: std::ops::Range<usize>,
 ) -> Result<Vec<(JsValue, Option<SlotHeader>)>, JsValue> {
-    let mut by_name: HashMap<&str, &JsValue> = HashMap::new();
-    for (name, handle) in existing {
-        by_name.insert(name.as_str(), handle);
-    }
-
     let mut opened: Vec<(JsValue, Option<SlotHeader>)> = Vec::with_capacity(indices.len());
     for index in indices {
-        let step = open_one_slot(directory, &by_name, index).await;
+        let step = open_one_slot(directory, index).await;
         match step {
             Ok(slot) => opened.push(slot),
             Err(e) => {
@@ -242,14 +243,11 @@ pub(super) async fn open_slots(
 
 async fn open_one_slot(
     directory: &JsValue,
-    by_name: &HashMap<&str, &JsValue>,
     index: usize,
 ) -> Result<(JsValue, Option<SlotHeader>), JsValue> {
-    let name = slot_name(index);
-    let file = match by_name.get(name.as_str()) {
-        Some(handle) => (*handle).clone(),
-        None => js::file_handle(directory, &name, true).await?,
-    };
+    // `create: true` hands back the file a previous run left as it is, and
+    // creates the slot only when it is new.
+    let file = js::file_handle(directory, &slot_name(index), true).await?;
     let handle = js::sync_access_handle(&file).await?;
 
     let mut header = vec![0u8; SLOT_HEADER_LEN as usize];

@@ -52,6 +52,7 @@ pub(crate) mod wal_frame;
 pub(crate) mod wal_replay;
 #[cfg(test)]
 mod wal_rotation_tests;
+mod wal_scan;
 pub(crate) mod wal_seal;
 pub(crate) mod wal_v1;
 
@@ -668,9 +669,7 @@ impl RegolithEngine {
         );
         let memtable = Arc::new(MemTable::new(&memtable_config)?);
         wal_seal::remove_staged(&*env, &wal_dir)?;
-        let mut wal_files = list_wal_files(&*env, &wal_dir)?;
-        wal_files.sort();
-        wal_files.retain(|path| should_replay_wal(path, version.min_wal_id));
+        let wal_files = wal_scan::live(&*env, &wal_dir, version.min_wal_id)?;
 
         let (latest_seq, discarded) = replay_logs(
             &env,
@@ -862,9 +861,7 @@ impl RegolithEngine {
         let latest_seq = version.last_seq;
 
         let memtable = Arc::new(MemTable::new(&memtable_config)?);
-        let mut wal_files = list_wal_files(&*env, &wal_dir)?;
-        wal_files.sort();
-        wal_files.retain(|path| should_replay_wal(path, version.min_wal_id));
+        let wal_files = wal_scan::live(&*env, &wal_dir, version.min_wal_id)?;
 
         // A read-only open writes nothing, so the tail stays in the file;
         // the next read-write open drops it again and truncates it.
@@ -3261,22 +3258,6 @@ impl CheckpointSnapshot {
     }
 }
 
-fn list_wal_files(env: &dyn Env, dir: &Path) -> std::io::Result<Vec<PathBuf>> {
-    let mut files = Vec::new();
-    if env.exists(dir) {
-        for entry in env.read_dir(dir)? {
-            if entry
-                .path
-                .extension()
-                .is_some_and(|ext| ext == "log" || ext == "wal")
-            {
-                files.push(entry.path);
-            }
-        }
-    }
-    Ok(files)
-}
-
 fn remove_obsolete_sst_files(
     env: &dyn Env,
     sst_dir: &Path,
@@ -3301,7 +3282,8 @@ fn remove_obsolete_wal_files(
     keep_path: &Path,
 ) -> std::io::Result<()> {
     let mut removed_any = false;
-    for path in list_wal_files(env, wal_dir)? {
+    for path in wal_scan::walk(env, wal_dir)? {
+        let path = path?;
         if path == keep_path {
             continue;
         }

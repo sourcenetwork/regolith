@@ -39,7 +39,20 @@ This file backs `proofs/tla/BackupSeal.tla` (configurations
    (`FaithfulRestore`, `ListedRestores` under power cuts).
 6. `collect_keeps_listed`: a delete never removes a pool file another
    backup lists (`ListedRestores`).
-7. The RED cases as counterexamples, one per defect of the model.
+7. `collect_stream_eq` and `stream_keeps_listed`: the streamed delete, which
+   reads each listing as its walk of `meta/` reaches it, removes exactly
+   what the delete with every listing in hand removes, whatever batches and
+   order the walk hands the listings out in, so it too never removes a
+   listed file (`ListedRestores` with `WalkNext`).
+8. `stream_holds_one_listing`: its candidates never outgrow the deleted
+   backup's own listing, however many backups there are
+   (`CollectionBounded`).
+9. `list_pages_all`: listing the backups a page of ids at a time, each page
+   the smallest ids above the last one listed, names every backup once, in
+   id order, for every page size (`src/backup/listing.rs`).
+10. The RED cases as counterexamples, one per defect of the model, with
+   `stream_skip_removes_a_listed_file` for `StreamSkips` and
+   `page_skip_loses_a_backup` for a page that starts one id too far.
 -/
 
 -- Everything below lives in its own namespace.
@@ -369,7 +382,351 @@ theorem collect_keeps_listed (removed : List Nat) (remaining : List (List Nat)) 
   -- That listing names `o`, which contradicts it.
   exact h.2 l hl (by simp [ho])
 
+/-! ## Deleting a backup, streamed
+
+`gc_shared` does not gather every other listing before it decides. It walks
+`meta/` one entry at a time (`Env::read_dir` hands entries out a batch at a
+time, the way `readdir` fills its buffer), reads each listing as the walk
+reaches it, and strikes from the candidates every file that listing names.
+Only when the walk has handed out its last entry does it remove what is
+left.
+
+Picture backup 1 deleted, backups 2 and 3 left, backups 1 and 3 sharing
+pool file 5. The walk hands out backup 2, which strikes nothing, then
+backup 3, which strikes 5: file 5 stays. The theorems below show this is
+the same decision `collect` makes with every listing in hand, for every
+number of backups and every way the walk can batch and order them, and
+that the candidates never outgrow the deleted backup's own listing. -/
+
+/-- One read of the walk: keep only the candidates listing `l` does not
+name. -/
+def strike (cand : List Nat) (l : List Nat) : List Nat :=
+  -- A candidate the listing names must stay in the pool, so it stops being
+  -- a candidate.
+  cand.filter fun o => !l.contains o
+
+/-- The streamed collection: the walk hands out the remaining backups'
+listings in `batches`, each batch in its order, and each listing is struck
+as it comes. What is left is what the delete removes. -/
+def collectStream (removed : List Nat) (batches : List (List (List Nat))) : List Nat :=
+  -- Start from the deleted backup's own files, and strike batch after
+  -- batch, listing after listing.
+  batches.foldl (fun cand batch => batch.foldl strike cand) removed
+
+/-- Striking listing after listing is one filter: keep the files that no
+listing names. -/
+theorem foldl_strike (ls : List (List Nat)) (cand : List Nat) :
+    ls.foldl strike cand = cand.filter fun o => !(ls.any fun l => l.contains o) := by
+  -- Peel the listings off one at a time, for every starting candidate list.
+  induction ls generalizing cand with
+  -- No listing: nothing is struck, and "no listing names it" keeps all,
+  -- since a filter that keeps every file is the list itself.
+  | nil => exact (List.filter_eq_self.mpr fun _ _ => rfl).symm
+  -- One listing `l`, then the rest.
+  | cons l ls ih =>
+    -- Strike `l` first, then the rest by the hypothesis; two filters in a
+    -- row are one filter by "and", which is "neither `l` nor the rest".
+    simp only [List.foldl_cons, ih, strike, List.filter_filter, List.any_cons, Bool.not_or,
+      Bool.and_comm]
+
+/-- **However the walk batches and orders the listings, the streamed
+collection removes exactly what the collection with every listing in hand
+removes.** -/
+theorem collect_stream_eq (removed : List Nat) (batches : List (List (List Nat))) :
+    collectStream removed batches = collect removed batches.flatten := by
+  -- Peel the batches off one at a time, for every starting candidate list.
+  induction batches generalizing removed with
+  -- No batch: nothing read, nothing struck, both keep every file, since a
+  -- filter that keeps every file is the list itself.
+  | nil => exact (List.filter_eq_self.mpr fun _ _ => rfl).symm
+  -- One batch, then the rest.
+  | cons batch rest ih =>
+    -- The first batch strikes what its listings name; the rest strike the
+    -- remainder by the hypothesis; together that is one filter by "named
+    -- by no listing of the first batch or of the rest".
+    simp only [collectStream, List.foldl_cons] at ih ⊢
+    -- Rewrite the rest of the walk with the hypothesis, the first batch
+    -- with `foldl_strike`, and merge the two filters into one.
+    rw [ih, foldl_strike]
+    -- What is left is the same filter written two ways.
+    simp only [collect, List.filter_filter, List.flatten_cons, List.any_append, Bool.not_or,
+      Bool.and_comm]
+
+/-- **A streamed delete never removes a file another backup lists**,
+whatever batches the walk makes. -/
+theorem stream_keeps_listed (removed : List Nat) (batches : List (List (List Nat))) (o : Nat)
+    -- The streamed delete removes `o`.
+    (h : o ∈ collectStream removed batches) :
+    -- Then no listing the walk handed out names `o`.
+    ∀ l ∈ batches.flatten, o ∉ l := by
+  -- The streamed collection is the one with every listing in hand...
+  rw [collect_stream_eq] at h
+  -- ...which never removes a listed file.
+  exact collect_keeps_listed _ _ _ h
+
+/-- **The collection holds one listing's worth**: after any number of
+listings read, in any batches, the candidates are a sublist of the deleted
+backup's own files, so their number never passes that listing's length,
+however many backups the repository keeps. -/
+theorem stream_holds_one_listing (removed : List Nat) (batches : List (List (List Nat))) :
+    (collectStream removed batches).Sublist removed ∧
+      (collectStream removed batches).length ≤ removed.length := by
+  -- What is left is a filter of the deleted listing...
+  have sub : (collectStream removed batches).Sublist removed := by
+    -- ...by the theorem above...
+    rw [collect_stream_eq]
+    -- ...and a filter keeps a sublist.
+    exact List.filter_sublist
+  -- A sublist is no longer than the list it comes from.
+  exact ⟨sub, sub.length_le⟩
+
+/-! ## Listing the backups, a page at a time
+
+`BackupEngine::list_backups` (`src/backup/listing.rs`) lists every backup in
+id order without holding every id. Each page is one walk of `meta/` that
+keeps the `k` smallest ids above the last one listed (`page_after`, a heap
+of `k`), and a page that comes back short is the last (`Backups::next`).
+
+Picture ids 1 to 5 and pages of 2. Page one: 1, 2. Page two, above 2: 3, 4.
+Page three, above 4: just 5, short, so the listing ends: 1, 2, 3, 4, 5.
+The theorems below show the pages always add up to every id, once, in
+order, for every number of ids and every page size; the RED shows what one
+id too far at a page boundary loses.
+
+`s` stands for every id `meta/` holds, ascending (`page_after` returns its
+page sorted, whatever order the directory walk met the ids in). -/
+
+/-- Whether id `x` comes after the last id listed, `a`: every id does
+before the first page. -/
+def above (a : Option Nat) (x : Nat) : Bool :=
+  -- No id listed yet: everything is ahead. Otherwise only the larger ids.
+  a.all (· < x)
+
+/-- One page (`page_after`): the `k` smallest ids above `a`, ascending. -/
+def page (s : List Nat) (a : Option Nat) (k : Nat) : List Nat :=
+  -- The ids above `a`, in order, cut after the first `k`.
+  (s.filter (above a)).take k
+
+/-- The listing (`Backups::next`): page after page, each starting above the
+last id of the one before, until a page comes back short. `fuel` only
+bounds the recursion; one more than the number of ids is always enough. -/
+def listPages (s : List Nat) (k : Nat) : Nat → Option Nat → List Nat
+  -- Out of fuel: nothing more (never reached with enough fuel).
+  | 0, _ => []
+  -- Take the page above `a`...
+  | fuel + 1, a =>
+    -- ...and stop there when it is short...
+    if (page s a k).length < k then page s a k
+    -- ...or go on above its last id.
+    else page s a k ++ listPages s k fuel (page s a k).getLast?
+
+/-- In a list in strictly rising order, nothing comes after the last
+element: every element is at most the last one. -/
+theorem le_last {t : List Nat} (h : t.Pairwise (· < ·)) {m : Nat} (hm : t.getLast? = some m) :
+    ∀ x ∈ t, x ≤ m := by
+  -- Take any element `x` of the list.
+  intro x hx
+  -- A list with a last element is not empty.
+  have hne : t ≠ [] := by intro e; simp [e] at hm
+  -- Its last element is `m`.
+  have hlast : t.getLast hne = m := by
+    -- `getLast?` of a non-empty list is `getLast`, so the two agree.
+    rw [List.getLast?_eq_some_getLast hne] at hm; exact Option.some.inj hm
+  -- Split the list into everything before the last element, and the last.
+  rw [← List.dropLast_concat_getLast hne] at h hx
+  -- `x` is either before the last element or is the last element.
+  rcases List.mem_append.mp hx with hx | hx
+  -- Before it: the order puts `x` below the last element, which is `m`.
+  · have := (List.pairwise_append.mp h).2.2 x hx (t.getLast hne) (by simp)
+    -- So `x < m`, and in particular `x ≤ m`.
+    omega
+  -- It is the last element: `x = m`.
+  · simp at hx; omega
+
+/-- The page boundary loses nothing and repeats nothing: the ids above the
+last id of a page are exactly the ids after that page. -/
+theorem above_last_is_rest {s : List Nat} (hs : s.Pairwise (· < ·)) (a : Option Nat) (k : Nat)
+    {m : Nat} (hm : ((s.filter (above a)).take k).getLast? = some m) :
+    s.filter (above (some m)) = (s.filter (above a)).drop k := by
+  -- Call the ids above `a` by one name, `u`.
+  generalize hu : s.filter (above a) = u at hm
+  -- They rise strictly, as every part of `s` does.
+  have hu_pw : u.Pairwise (· < ·) := hu ▸ hs.filter _
+  -- `u` is the page followed by the rest.
+  have hsplit := List.take_append_drop k u
+  -- `m`, the page's last id, is on the page...
+  have hmt : m ∈ u.take k := List.mem_of_getLast? hm
+  -- ...so it is one of the ids above `a`...
+  have hmu : m ∈ u := List.mem_of_mem_take hmt
+  -- ...which means `m` itself is above `a`.
+  have ham : above a m = true := by
+    -- Membership in a filter says the filter's test held.
+    rw [← hu] at hmu; exact (List.mem_filter.mp hmu).2
+  -- An id above `m` is above `a` too, so filtering `s` by "above `m`" is
+  -- filtering the ids above `a` by it.
+  have hfilter : s.filter (above (some m)) = u.filter (above (some m)) := by
+    -- Two filters in a row are one filter by "and".
+    rw [← hu, List.filter_filter]
+    -- Show the two tests agree on every id.
+    apply List.filter_congr
+    -- Take any id `x`.
+    intro x _
+    -- Whether there was a last id `a` or not.
+    cases a with
+    -- No `a`: "above `a`" is always true, so both tests are "above `m`".
+    | none => simp [above]
+    -- Some `a` below `m`.
+    | some a =>
+      -- Spell both tests out as comparisons.
+      simp only [above, Option.all_some, decide_eq_true_eq] at ham ⊢
+      -- Either `x` is above `m` or it is not.
+      by_cases h : m < x
+      -- Above `m`, so above `a` as well, since `a < m`: both tests pass.
+      · simp [h, Nat.lt_trans ham h]
+      -- Not above `m`: both tests fail.
+      · simp [h]
+  -- The order across the split: the page rises, the rest rises, and every
+  -- page id is below every later id.
+  have hpw := hsplit ▸ hu_pw
+  -- Spell that out in its three parts.
+  rw [List.pairwise_append] at hpw
+  -- Nothing on the page is above its last id.
+  have hnil : (u.take k).filter (above (some m)) = [] := by
+    -- A filter is empty when no element passes it.
+    rw [List.filter_eq_nil_iff]
+    -- Take a page id `x`.
+    intro x hx
+    -- It is at most the page's last id.
+    have := le_last hpw.1 hm x hx
+    -- So it is not above it.
+    simp [above]; omega
+  -- Everything after the page is above its last id.
+  have hall : (u.drop k).filter (above (some m)) = u.drop k := by
+    -- A filter keeps the whole list when every element passes it.
+    rw [List.filter_eq_self]
+    -- Take an id `x` after the page.
+    intro x hx
+    -- The page's last id is below it.
+    have := hpw.2.2 m hmt x hx
+    -- So it is above `m`.
+    simp [above]; omega
+  -- Put it together: filtering `u` by "above `m`" drops the page, keeps the rest.
+  rw [hfilter]
+  -- Write `u` as the page and the rest...
+  calc u.filter (above (some m)) = (u.take k ++ u.drop k).filter (above (some m)) := by
+        -- ...which it is.
+        rw [hsplit]
+    -- ...filter each part: the page leaves nothing, the rest stays whole.
+    _ = u.drop k := by rw [List.filter_append, hnil, hall, List.nil_append]
+
+/-- **Page after page, the listing gives every id above `a`, once, in
+order**, for every page size `k` of at least one, given fuel past the
+number of those ids. -/
+theorem list_pages {s : List Nat} (hs : s.Pairwise (· < ·)) {k : Nat} (hk : 0 < k) :
+    ∀ fuel a, (s.filter (above a)).length < fuel → listPages s k fuel a = s.filter (above a) := by
+  -- By induction on the fuel.
+  intro fuel
+  -- One page at a time.
+  induction fuel with
+  -- No fuel: impossible, since the number of ids is below it.
+  | zero => intro a h; omega
+  -- Fuel for one more page.
+  | succ fuel ih =>
+    -- Take any last id `a`, with fewer ids above it than the fuel.
+    intro a hlen
+    -- Unfold one step of the listing.
+    rw [listPages]
+    -- Either this page comes back short or it is full.
+    by_cases hshort : (page s a k).length < k
+    -- Short: the listing ends with it.
+    · simp only [hshort, ↓reduceIte]
+      -- Spell the page out.
+      unfold page at hshort ⊢
+      -- A short page is shorter than `k` because the ids ran out.
+      rw [List.length_take] at hshort
+      -- So the page is every id above `a`.
+      rw [List.take_of_length_le]
+      -- That is what the shortness says.
+      omega
+    -- Full: the listing goes on above the page's last id.
+    · simp only [hshort, ↓reduceIte]
+      -- Spell the page out.
+      unfold page at hshort ⊢
+      -- A full page of at least one id is not empty...
+      have hne : (s.filter (above a)).take k ≠ [] := by
+        -- ...since an empty page would be short.
+        intro e; rw [e] at hshort; simp at hshort; omega
+      -- ...so it has a last id `m`.
+      obtain ⟨m, hm⟩ : ∃ m, ((s.filter (above a)).take k).getLast? = some m :=
+        -- `getLast?` of a non-empty list is its last element.
+        ⟨_, List.getLast?_eq_some_getLast hne⟩
+      -- The rest of the listing is every id above `m` (the hypothesis),
+      -- which is every id after the page (the boundary theorem), and the
+      -- page followed by the ids after it is every id above `a`.
+      rw [hm, ih (some m), above_last_is_rest hs a k hm, List.take_append_drop]
+      -- Left to show: fewer ids above `m` than the fuel that remains.
+      rw [above_last_is_rest hs a k hm, List.length_drop]
+      -- The full page took `k` of them, and `k` is at least one.
+      rw [List.length_take] at hshort
+      -- So the count fell by at least one, below the remaining fuel.
+      omega
+
+/-- **The listing names every backup once, in id order**, whatever the
+page size. -/
+theorem list_pages_all {s : List Nat} (hs : s.Pairwise (· < ·)) {k : Nat} (hk : 0 < k) :
+    listPages s k (s.length + 1) none = s := by
+  -- Before the first page every id is ahead.
+  have hnone : s.filter (above none) = s := List.filter_eq_self.mpr fun _ _ => rfl
+  -- The theorem above, with one more fuel than ids.
+  rw [list_pages hs hk (s.length + 1) none (by rw [hnone]; omega), hnone]
+
 /-! ## The defects, as counterexamples -/
+
+/-- The defect a page boundary invites: the next page starts above the id
+after the last one listed (`id <= after + 1` for `id <= after`). -/
+def listPagesSkip (s : List Nat) (k : Nat) : Nat → Option Nat → List Nat
+  -- Out of fuel: nothing more.
+  | 0, _ => []
+  -- The page above `a`, one id too far...
+  | fuel + 1, a =>
+    -- ...the ids more than one above `a`, cut after `k`...
+    let p := (s.filter fun x => a.all (· + 1 < x)).take k
+    -- ...ending when short, otherwise going on above its last id.
+    if p.length < k then p else p ++ listPagesSkip s k fuel p.getLast?
+
+/-- **RED: one id too far at a page boundary.** Backups 1, 2 and 3, one per
+page: the engine lists all three; the defect starts the second page above
+2 and never lists backup 2, so a purge would never count it. -/
+theorem page_skip_loses_a_backup :
+    -- The engine lists every backup...
+    listPages [1, 2, 3] 1 4 none = [1, 2, 3] ∧
+    -- ...the defect loses backup 2.
+    listPagesSkip [1, 2, 3] 1 4 none = [1, 3] :=
+  -- Both are evaluations Lean can run.
+  ⟨by decide, by decide⟩
+
+/-- The defect `StreamSkips`: once the first batch is used up, the walk
+starts every later batch one entry too far, so the first listing of each
+batch after the first is never read. -/
+def skipAtBoundary : List (List (List Nat)) → List (List (List Nat))
+  -- No batch: nothing to lose.
+  | [] => []
+  -- The first batch comes whole; each later one loses its first listing.
+  | first :: rest => first :: rest.map List.tail
+
+/-- **RED `StreamSkips`.** Backup 1 is deleted; it and backup 3 list pool
+file 5, backup 2 lists file 7. The walk hands out backup 2 in one batch and
+backup 3 in the next. The engine keeps file 5; the defect loses backup 3's
+listing at the boundary and removes file 5, which backup 3 still lists. -/
+theorem stream_skip_removes_a_listed_file :
+    -- The engine removes nothing...
+    collectStream [5] [[[7]], [[5]]] = [] ∧
+    -- ...the defect removes file 5...
+    collectStream [5] (skipAtBoundary [[[7]], [[5]]]) = [5] ∧
+    -- ...and file 5 is in a listing the walk had to hand out.
+    [5] ∈ ([[[7]], [[5]]] : List (List (List Nat))).flatten :=
+  -- Each is an evaluation Lean can run.
+  ⟨by decide, by decide, by decide⟩
 
 /-- The defect `CheckAfterCopy`: the key checks run after the copies. -/
 def restoreCheckAfterCopy (hasManifest : Bool) (id : Nat) (m : Meta) (p : Option Provider) : Run :=
