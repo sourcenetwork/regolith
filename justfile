@@ -775,6 +775,13 @@ tla:
     check MC_EnvFiles_Red_SharedCursor                 RED ReadsOwnBytes
     check MC_EnvFiles_Red_NoFreeze                     RED CurrentHoldsFinished
     check MC_EnvFiles_Red_StaleFrozen                  RED CurrentHoldsFinished
+    # A table renamed aside while its handles reopen it: the Env's rename adds
+    # the new name before it drops the old, and a reopen that found nothing
+    # loads the names again. Lean: Regolith/EnvFilesRename.lean,
+    # open_finds_file, and the REDs remove_first_loses and no_reload_loses.
+    check MC_EnvFiles_Green_Rename                     GREEN
+    check MC_EnvFiles_Red_RemoveFirst                  RED OpenFindsFile
+    check MC_EnvFiles_Red_NoReload                     RED OpenFindsFile
     rm -rf states ./*_TTrace_*.tla ./*_TTrace_*.bin
     exit $fail
 
