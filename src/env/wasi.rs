@@ -46,7 +46,6 @@
 
 use std::io;
 use std::path::Path;
-use std::time::Duration;
 
 use super::std_env::StdEnv;
 use super::{
