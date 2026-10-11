@@ -298,7 +298,14 @@ loom-sync-deep model="":
 loom-io:
     RUSTFLAGS="--cfg loom" cargo test --release --test loom_io_queue
 
-loom-all: loom loom-debug loom-sync loom-io
+# Loom models for the compaction gate (E28) and for a job that parks on its
+# queue instead of waiting for the gate, with three calibrations that must
+# fail: a job that skips the gate, the old writer-preferring gate, and a
+# parked job with no way back to its queue. Release only, like `loom-sync`.
+loom-gate:
+    RUSTFLAGS="--cfg loom" cargo test --release --test loom_gate
+
+loom-all: loom loom-debug loom-sync loom-io loom-gate
 
 # The read-view chaos workload at full size: 6 instances x 2 rounds x 400
 # versions. Measured at over 20 minutes wall and 4h of CPU unoptimized,
