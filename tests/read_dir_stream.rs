@@ -243,7 +243,10 @@ fn the_orphan_sweep_removes_each_table_as_its_walk_reaches_it() {
     }
 
     probe.reset();
-    let db = Db::open(dir.path(), options(&probe)).unwrap();
+    // No compaction worker: one that started compacting the live tables as
+    // soon as the open returned would remove them after the sweep's walk
+    // handed them out, and the probe would count them against the sweep.
+    let db = Db::open(dir.path(), options(&probe).max_background_compactions(0)).unwrap();
     holds_some(&db, 200);
     let (pulled, carried) = probe.walks_of(&sst);
     assert!(pulled >= MANY, "the sweep walked {pulled} entries");
