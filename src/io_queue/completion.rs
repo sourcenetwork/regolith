@@ -156,9 +156,8 @@ impl<T: Send + Sync + 'static> Completion<T> {
         for f in self.first.take(SHUT) {
             f(outcome);
         }
-        let report = self.report.upgrade();
         for f in self.on_complete.take(SHUT) {
-            crate::engine::callback::survive(report.as_deref(), self.name, || f(outcome));
+            crate::engine::callback::survive(|| self.report.upgrade(), self.name, || f(outcome));
         }
         self.state.store(READY, Ordering::Release);
         self.waker.wake();
@@ -178,8 +177,7 @@ impl<T: Send + Sync + 'static> Completion<T> {
 
     fn run_now(&self, f: Callback<T>) {
         if let Some(outcome) = self.outcome.get() {
-            let report = self.report.upgrade();
-            crate::engine::callback::survive(report.as_deref(), self.name, || f(outcome));
+            crate::engine::callback::survive(|| self.report.upgrade(), self.name, || f(outcome));
         }
     }
 

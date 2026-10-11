@@ -191,7 +191,7 @@ pub(super) fn survive_after(
     callback: &'static str,
     f: impl FnOnce(),
 ) {
-    crate::engine::callback::survive(engine, callback, f);
+    crate::engine::callback::survive(|| engine, callback, f);
 }
 
 #[derive(Default)]

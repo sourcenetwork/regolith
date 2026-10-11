@@ -91,8 +91,13 @@ impl Drop for InBackground {
 /// `on_complete`. A panic cannot change the outcome, so it is caught, reported
 /// to the listeners of `engine` (when it is still open to tell), and the
 /// outcome stands. The one function every such point calls.
-pub(crate) fn survive(
-    engine: Option<&super::RegolithEngine>,
+///
+/// `engine` is asked for only once `f` has panicked. A callback may run on a
+/// worker after the caller it answers was woken, and a worker holding the
+/// engine there would keep the database, and its directory lock, alive past
+/// the caller's drop of its handle.
+pub(crate) fn survive<E: std::ops::Deref<Target = super::RegolithEngine>>(
+    engine: impl FnOnce() -> Option<E>,
     callback: &'static str,
     f: impl FnOnce(),
 ) {
@@ -101,7 +106,7 @@ pub(crate) fn survive(
             callback,
             "a callback panicked after its outcome was decided"
         );
-        if let Some(engine) = engine {
+        if let Some(engine) = engine() {
             engine.notify_callback_panic(callback);
         }
     }
@@ -136,6 +141,22 @@ pub(crate) fn contain<T>(callback: &'static str, f: impl FnOnce() -> T) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A callback that returns holds no engine: a worker running it after
+    /// its caller was woken must not keep the database alive past the
+    /// caller's drop of it.
+    #[test]
+    fn the_engine_is_asked_for_only_when_a_callback_panics() {
+        let asked = std::cell::Cell::new(0);
+        let engine = || -> Option<&crate::engine::RegolithEngine> {
+            asked.set(asked.get() + 1);
+            None
+        };
+        survive(engine, "on_complete", || {});
+        assert_eq!(asked.get(), 0);
+        survive(engine, "on_complete", || panic!("boom"));
+        assert_eq!(asked.get(), 1);
+    }
 
     #[test]
     fn a_panic_inside_a_commit_is_caught_and_named() {
