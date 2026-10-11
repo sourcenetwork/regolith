@@ -231,11 +231,14 @@ fn iter_reverse_scan_after_compact() {
 #[test]
 fn compact_range_merges_l0_to_l1() {
     let dir = TempDir::new().unwrap();
-    let db = Db::open(dir.path(), opts()).unwrap();
+    // No compaction worker: one could flush late or drain L0 early, and
+    // then what L0 holds when it is read below would be a matter of timing.
+    let db = Db::open(dir.path(), opts().max_background_compactions(0)).unwrap();
     // Write enough to produce multiple L0 files.
     for i in 0..500 {
-        db.put(format!("k{i:04}").as_bytes(), b"v").unwrap();
+        regolith::through_stalls(|| db.put(format!("k{i:04}").as_bytes(), b"v")).unwrap();
     }
+    db.flush().unwrap();
     let l0_before = db.get_int_property("regolith.num-files-at-level0").unwrap();
     assert!(l0_before > 0);
     db.compact_range(None, None).wait().unwrap();
