@@ -9,8 +9,6 @@ use std::sync::Arc;
 
 use crate::env::{BufferedWriter, Env, WriteMode};
 
-use crate::sync::internal::RwLock;
-
 use super::checksum;
 use super::seal::Keyring;
 use super::sstable::{
@@ -460,7 +458,9 @@ const APPROX_ADD_FILE_RECORD_BYTES: u64 = 256;
 
 /// Manages the current version and persists version edits to a manifest log.
 pub(crate) struct VersionSet {
-    current: Arc<RwLock<Arc<Version>>>,
+    // No lock of its own: `apply` takes `&mut self`, and every caller
+    // reaches the set through the version store's guard.
+    current: Arc<Version>,
     manifest_path: PathBuf,
     /// Bytes the manifest holds on disk, tracked rather than stat'ed so
     /// the rewrite check costs nothing on the common path.
@@ -615,7 +615,7 @@ impl VersionSet {
         let sealing = Self::sealing(keyring.as_ref(), salt)?;
         let convert = keyring.is_some() && sealing.is_none();
         let mut set = Self {
-            current: Arc::new(RwLock::new(Arc::new(version))),
+            current: Arc::new(version),
             manifest_path,
             manifest_bytes,
             manifest_writer: Some(writer),
@@ -724,7 +724,7 @@ impl VersionSet {
         let sealing = Self::sealing(keyring.as_ref(), replay.salt)?;
 
         Ok(Self {
-            current: Arc::new(RwLock::new(Arc::new(replay.version))),
+            current: Arc::new(replay.version),
             manifest_path,
             manifest_bytes: replay.valid_len as u64,
             manifest_writer: None,
@@ -749,7 +749,7 @@ impl VersionSet {
 
     /// Get the current version.
     pub(crate) fn current(&self) -> Arc<Version> {
-        Arc::clone(&*self.current.read())
+        Arc::clone(&self.current)
     }
 
     /// Path of the manifest file on disk.
@@ -845,7 +845,7 @@ impl VersionSet {
         self.manifest_writer = Some(writer);
 
         let live_files: u64 = version.levels.iter().map(|l| l.len() as u64).sum();
-        *self.current.write() = Arc::new(version);
+        self.current = Arc::new(version);
         self.manifest_bytes += encoded.len() as u64;
         if let Some(id) = sealed_under
             && !self.sealed_under.contains(&id)
