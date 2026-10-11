@@ -1,30 +1,44 @@
 //! Foreground jobs: `compact_range`, an ingest and a checkpoint, run as
 //! background jobs instead of on the caller's call (plan 4.10).
 //!
-//! Each of them takes the compaction gate exclusively, which waits for every
-//! background pass in flight. A caller never waits on the gate: the call
+//! Each of them holds the compaction gate alone for part of its work
+//! (`compaction_gate.rs`). A caller never waits on the gate: the call
 //! returns a [`JobTicket`] at once, and the job runs
 //!
 //! - **on the compaction worker**, when the database has one: the worker
-//!   takes the gate between its own passes;
+//!   runs one job between its own passes and waits for the gate on its own
+//!   thread;
 //! - **as a job on the caller's queue**, with no worker: the caller's thread
 //!   runs it when it polls its [`IoQueue`](crate::IoQueue), as the I/O it
-//!   asked for;
+//!   asked for. The poll never waits for the gate either: while another
+//!   thread holds it, the job parks on the queue, keeping its place among
+//!   the gate's waiters, and the queue's owner is woken once the job may go
+//!   on;
 //! - **inline**, with neither: the call runs it before it returns, as the
-//!   blocking calls do their own I/O.
+//!   blocking calls do their own I/O, and waits for the gate on its own
+//!   thread, as [`JobTicket::wait`] does for a job it runs itself.
+//!
+//! A job has two parts. What needs no gate comes first, with the gate free
+//! for compaction: an ingest copies and validates its files, a checkpoint
+//! readies its target and drains the memtables. Then the job takes the gate
+//! and does the rest: the range's passes, the install, the capture and its
+//! links.
 //!
 //! The ticket is completed on the queue of the thread that made the call (at
 //! that queue's poll), or, for a caller with no queue, by whichever thread
 //! finished the job. Close settles a job not yet run with
 //! [`Error::Closed`]: the workers' queue when they stop, a queue's job in the
-//! job table's sweep.
+//! job table's sweep, parked or not.
 
 use std::io;
 use std::path::PathBuf;
 use std::sync::{Arc, Weak};
+use std::task::{Poll, Waker};
 
 use super::RegolithEngine;
-use super::io::job::{Delivery, Job, JobBody};
+use super::compaction_gate::{Admission, Exclusive};
+use super::ingest::Staged;
+use super::io::job::{Delivery, Job, JobBody, Step};
 use super::io::shared::{Message, QueueShared};
 use crate::io_queue::completion::Completion;
 use crate::{Error, IngestOptions, JobTicket};
@@ -47,6 +61,30 @@ pub(crate) enum Work {
     Checkpoint { target: PathBuf },
 }
 
+/// A job whose part before the gate is done: what it does holding the gate.
+enum Gated {
+    CompactRange {
+        lower: Vec<u8>,
+        upper: Vec<u8>,
+    },
+    Ingest {
+        staged: Staged,
+        options: IngestOptions,
+    },
+    Checkpoint {
+        target: PathBuf,
+    },
+}
+
+/// Where a job stands.
+enum Stage {
+    /// Nothing done yet.
+    Fresh(Work),
+    /// The part before the gate is done, and the job waits to hold the gate
+    /// alone, keeping its place among the gate's waiters.
+    Admitting(Gated, Admission),
+}
+
 /// Where a finished job's outcome is told.
 enum Tell {
     /// The job is a unit on the caller's queue: the queue tells it as the
@@ -63,7 +101,7 @@ enum Tell {
 /// The job's body: the work, and how its outcome reaches the ticket.
 struct Foreground {
     engine: Weak<RegolithEngine>,
-    work: Work,
+    stage: Stage,
     finish: Finish,
 }
 
@@ -92,21 +130,62 @@ impl Finish {
 }
 
 impl JobBody for Foreground {
+    /// On a worker, or for a blocking caller: waits for the gate here.
     fn run(self: Box<Self>) {
         let Foreground {
             engine,
-            work,
+            stage,
             finish,
         } = *self;
         let result = match engine.upgrade() {
-            Some(engine) => engine.run_foreground(work),
+            Some(engine) => engine.run_foreground(stage),
             None => Err(Error::Closed),
         };
         finish.finish(result);
     }
 
+    /// On a queue's poll: parks instead of waiting for the gate.
+    fn step(self: Box<Self>, waker: &Waker) -> Step {
+        let Foreground {
+            engine: weak,
+            stage,
+            finish,
+        } = *self;
+        let Some(engine) = weak.upgrade() else {
+            finish.finish(Err(Error::Closed));
+            return Step::Done;
+        };
+        let (gated, mut admission) = match stage {
+            Stage::Fresh(work) => match engine.before_gate(work) {
+                Ok(Some(gated)) => (gated, engine.compaction_gate.admit()),
+                Ok(None) => {
+                    finish.finish(Ok(()));
+                    return Step::Done;
+                }
+                Err(err) => {
+                    finish.finish(Err(err));
+                    return Step::Done;
+                }
+            },
+            Stage::Admitting(gated, admission) => (gated, admission),
+        };
+        match admission.poll(waker) {
+            Poll::Ready(gate) => {
+                finish.finish(engine.under_gate(gated, gate));
+                Step::Done
+            }
+            Poll::Pending => Step::Parked(Box::new(Foreground {
+                engine: weak,
+                stage: Stage::Admitting(gated, admission),
+                finish,
+            })),
+        }
+    }
+
     /// Settled without running: the database closed, or the queue that
-    /// would have run it was dropped.
+    /// would have run it was dropped. Dropping the stage gives back what it
+    /// holds: an ingest's staged files, and the job's place at the gate, with
+    /// the gate itself if it was handed over meanwhile.
     fn release(self: Box<Self>) {
         let closed = self
             .engine
@@ -119,6 +198,7 @@ impl JobBody for Foreground {
                 "the I/O queue that would have run this job was dropped before it ran; call again",
             ))
         };
+        drop(self.stage);
         self.finish.finish(result);
     }
 }
@@ -138,13 +218,13 @@ impl RegolithEngine {
         if self.has_worker {
             let body = Box::new(Foreground {
                 engine: self.me.clone(),
-                work,
+                stage: Stage::Fresh(work),
                 finish: Finish {
                     completion: Arc::clone(&completion),
                     tell: queue.map_or(Tell::Here, Tell::Queue),
                 },
             });
-            if let Err(body) = self.compaction.lock().submit(body) {
+            if let Err(body) = self.compaction.submit(body) {
                 // The workers stopped: the database is closing.
                 body.release();
             }
@@ -153,13 +233,13 @@ impl RegolithEngine {
         let Some(queue) = queue else {
             // No worker and no queue: the caller runs it, as a blocking call
             // does its own I/O.
-            completion.decide(self.run_foreground(work));
+            completion.decide(self.run_foreground(Stage::Fresh(work)));
             completion.deliver_decided();
             return ticket;
         };
         let job = Job::new(Box::new(Foreground {
             engine: self.me.clone(),
-            work,
+            stage: Stage::Fresh(work),
             finish: Finish {
                 completion: Arc::clone(&completion),
                 tell: Tell::AsWaiter,
@@ -181,28 +261,66 @@ impl RegolithEngine {
         }
     }
 
-    /// Do `work` on this thread: the worker, the caller's poll, or the
-    /// caller itself. A panic in code the job runs for the caller (a
-    /// compaction filter, a merge operator, a listener) fails the job alone.
-    fn run_foreground(&self, work: Work) -> Result<(), Error> {
-        let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match work {
-            Work::CompactRange { lower, upper } => self
-                .compact_range(Some(&lower), Some(&upper))
-                .map_err(Error::from),
+    /// Do a job from `stage` to its end on this thread, waiting here for the
+    /// gate: the worker, a blocking caller, or the call itself.
+    fn run_foreground(&self, stage: Stage) -> Result<(), Error> {
+        let (gated, admission) = match stage {
+            Stage::Fresh(work) => match self.before_gate(work)? {
+                Some(gated) => (gated, self.compaction_gate.admit()),
+                None => return Ok(()),
+            },
+            Stage::Admitting(gated, admission) => (gated, admission),
+        };
+        let gate = admission.wait()?;
+        self.under_gate(gated, gate)
+    }
+
+    /// A job's part before the gate. `None` when nothing is left to do under
+    /// it. A panic in code run for the caller (an ingest's key check) fails
+    /// the job alone.
+    fn before_gate(&self, work: Work) -> Result<Option<Gated>, Error> {
+        contained(|| match work {
+            Work::CompactRange { lower, upper } => {
+                self.ensure_writable()?;
+                Ok(Some(Gated::CompactRange { lower, upper }))
+            }
             Work::Ingest {
                 files,
                 options,
                 check,
-            } => self
-                .ingest_external_files(&files, &options, check)
-                .map_err(Error::from),
-            Work::Checkpoint { target } => crate::checkpoint::create(self, &target),
-        }));
-        ran.unwrap_or_else(|_| {
-            tracing::error!("a background job panicked");
-            Err(Error::Io(io::Error::other(
-                "the job panicked in code it ran on the caller's behalf, such as a compaction filter or a listener",
-            )))
+            } => {
+                let staged = self.ingest_stage(&files, &options, check)?;
+                Ok((!staged.is_empty()).then_some(Gated::Ingest { staged, options }))
+            }
+            Work::Checkpoint { target } => {
+                crate::checkpoint::prepare(self, &target)?;
+                Ok(Some(Gated::Checkpoint { target }))
+            }
         })
     }
+
+    /// A job's part holding the gate, which it releases when this returns. A
+    /// panic in code the job runs for the caller (a compaction filter, a
+    /// merge operator, a listener) fails the job alone.
+    fn under_gate(&self, gated: Gated, gate: Exclusive) -> Result<(), Error> {
+        contained(|| match gated {
+            Gated::CompactRange { lower, upper } => self
+                .compact_range(&gate, Some(&lower), Some(&upper))
+                .map_err(Error::from),
+            Gated::Ingest { staged, options } => self
+                .ingest_install(&gate, staged, &options)
+                .map_err(Error::from),
+            Gated::Checkpoint { target } => crate::checkpoint::capture_into(self, gate, &target),
+        })
+    }
+}
+
+/// Run one part of a job, turning a panic in it into the job's failure.
+fn contained<T>(part: impl FnOnce() -> Result<T, Error>) -> Result<T, Error> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(part)).unwrap_or_else(|_| {
+        tracing::error!("a background job panicked");
+        Err(Error::Io(io::Error::other(
+            "the job panicked in code it ran on the caller's behalf, such as a compaction filter or a listener",
+        )))
+    })
 }

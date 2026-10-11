@@ -80,6 +80,7 @@
 //! found the bug, not how large its search space is.
 
 pub mod arena;
+pub mod gate;
 pub mod handoff;
 pub mod io_queue;
 pub mod jobs;

@@ -12,6 +12,7 @@ pub(crate) mod commit;
 pub(crate) mod compaction;
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) mod compaction_backoff;
+pub(crate) mod compaction_gate;
 pub(crate) mod disk_check;
 pub(crate) mod filter_block;
 mod flush;
@@ -56,12 +57,13 @@ pub(crate) mod wal_seal;
 pub(crate) mod wal_v1;
 
 use crate::portability::{AtomicBool, AtomicU8, AtomicU64, Ordering};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::sync::internal::{Gate, Mutex, MutexGuard, OwnedGateWriteGuard};
+use crate::sync::OnceCell;
+use crate::sync::internal::{Mutex, wait_here};
 use kovan_queue::array_queue::ArrayQueue;
 
 use background_health::{BackgroundHealth, Job};
@@ -69,7 +71,8 @@ use block_cache::BlockCache;
 pub(crate) use commit::PendingAppend;
 pub(crate) use commit::{GroupSync, NowaitCommit, Settled, TxnCommit, conclude_settled};
 use commit::{Pipeline, StallSignal, WriteSlot};
-use compaction::{CompactionOptions, CompactionOutcome, CompactionScheduler};
+use compaction::{Claims, CompactionOptions, CompactionOutcome, CompactionScheduler};
+use compaction_gate::{CompactionGate, Exclusive};
 pub(crate) use foreground::Work;
 use lookup_key::{LookupKey, with_key_scratch};
 use manifest::{VersionEdit, VersionSet};
@@ -521,21 +524,26 @@ pub(crate) struct RegolithEngine {
     /// true lives in [`ReadHorizon`], which is where it is model-checked.
     visible_seq: ReadHorizon,
     close_state: AtomicU8,
-    close_lock: Mutex<()>,
+    /// One close at a time; a second caller waits for the first and then
+    /// reads what it left in `close_state`. A [`crate::sync::Mutex`], so no
+    /// thread sleeps in the kernel on it: close is a call that chose to
+    /// block, and waits on its own thread.
+    close_lock: crate::sync::Mutex<()>,
     /// Transactions that `close` must abort. See `open_transactions`.
     open_transactions: open_transactions::OpenTransactions,
     active_wal: Mutex<Option<Wal>>,
     wal_id: AtomicU64,
     sst_dir: PathBuf,
     wal_dir: PathBuf,
-    compaction: Mutex<CompactionScheduler>,
-    /// Engine-wide RwLock that coordinates foreground and background
-    /// compaction. Background workers each hold a read lock so they
-    /// can run concurrently; foreground callers (`compact_range`,
-    /// `ingest_external_files`, `checkpoint_capture`) hold the write
-    /// lock to exclude all background activity for the duration of
-    /// their pass.
-    compaction_lock: Arc<Gate>,
+    /// The compaction workers. Every call on it takes `&self` and none
+    /// waits, so nothing guards it.
+    compaction: CompactionScheduler,
+    /// The engine-wide gate that keeps a compaction pass and the operations
+    /// that must not see a table replaced underneath them apart: a pass,
+    /// on a worker or on a caller's thread, holds it shared, and
+    /// `compact_range`, an ingest, a checkpoint, `drop_all` and a backup's
+    /// capture hold it alone (`compaction_gate.rs`).
+    compaction_gate: CompactionGate,
     /// Tracks the sequence numbers of every live snapshot so compaction
     /// can cut each key's versions into stripes no snapshot straddles,
     /// and drop or fold what no reader can see. A snapshot registers
@@ -564,10 +572,9 @@ pub(crate) struct RegolithEngine {
     /// a tail no later write may extend, or when a caller's code panicked
     /// inside the commit's ordered step. Once set, every write fails loud
     /// with the original reason instead of appending after unknown bytes or
-    /// state.
-    write_latch: Mutex<Option<WriteLatch>>,
-    /// Cheap gate on `write_latch`, checked on every write.
-    write_latched: AtomicBool,
+    /// state. Written once, by one compare-and-swap, so the first reason is
+    /// the one kept; every write checks it with one load.
+    write_latch: OnceCell<WriteLatch>,
     /// The write stall: the level writers cache, and the unit writers a
     /// stop threshold stopped wait on (D23). Whoever relieves a threshold
     /// (a flush, a compaction pass on a worker or a caller's thread)
@@ -604,11 +611,12 @@ pub(crate) struct RegolithEngine {
     /// Steps in a row that found nothing to do while a stop held: past
     /// [`Self::MAX_IDLE_PASSES`] the stop is one no step relieves.
     stall_steps_idle: std::sync::atomic::AtomicUsize,
-    /// File ids currently being compacted, shared with every background
-    /// worker and with [`RegolithEngine::run_one_compaction_pass`]. One set
-    /// for the whole engine is what stops a foreground pass and a
-    /// worker from picking overlapping inputs.
-    compaction_in_progress: Arc<Mutex<HashSet<u64>>>,
+    /// The tables compaction passes are working on, shared with every
+    /// background worker and with [`RegolithEngine::run_one_compaction_pass`].
+    /// One record for the whole engine is what stops a pass on a caller's
+    /// thread and a worker from picking overlapping inputs
+    /// (`compaction/claims.rs`).
+    compaction_claims: Arc<Claims>,
     /// Whether background flushes and compactions are currently failing.
     background_health: Arc<BackgroundHealth>,
     /// The host platform. Cloned out of [`EngineOptions`] so the read
@@ -713,7 +721,7 @@ impl RegolithEngine {
         );
         let compaction_opts = options.to_compaction_options();
 
-        let compaction_lock = Arc::new(Gate::new());
+        let compaction_gate = CompactionGate::new();
         let snapshot_registry = Arc::new(SnapshotRegistry::with_env(Arc::clone(&env)));
         let cached_stall_level = Arc::new(AtomicU8::new(0));
         let stall_signal = Arc::new(StallSignal::new(
@@ -721,7 +729,7 @@ impl RegolithEngine {
             options.clone(),
             Arc::clone(&cached_stall_level),
         ));
-        let compaction_in_progress = Arc::new(Mutex::new(HashSet::new()));
+        let compaction_claims = Arc::new(Claims::new());
         let background_health = Arc::new(BackgroundHealth::default());
         // `max_background_compactions == 0` starts no worker, which is
         // how a single-threaded target opens at all. A platform that
@@ -729,14 +737,14 @@ impl RegolithEngine {
         // instead of aborting; the directory lock and the fresh WAL
         // drop with this return.
         let compaction = CompactionScheduler::start(
-            Arc::clone(&compaction_lock),
+            compaction_gate.clone(),
             Arc::clone(&snapshot_registry),
             Arc::clone(&versions),
             Arc::from(sst_dir.as_path()),
             Arc::clone(&cache),
             compaction_opts,
             Arc::clone(&stall_signal),
-            Arc::clone(&compaction_in_progress),
+            Arc::clone(&compaction_claims),
             Arc::clone(&background_health),
         )?;
         let has_worker = compaction.has_workers();
@@ -778,14 +786,14 @@ impl RegolithEngine {
             latest_seq: AtomicU64::new(latest_seq),
             visible_seq: ReadHorizon::new(latest_seq),
             close_state: AtomicU8::new(CLOSE_STATE_OPEN),
-            close_lock: Mutex::new(()),
+            close_lock: crate::sync::Mutex::new(()),
             open_transactions: open_transactions::OpenTransactions::new(),
             active_wal: Mutex::new(Some(wal)),
             wal_id: AtomicU64::new(wal_id),
             sst_dir,
             wal_dir,
-            compaction: Mutex::new(compaction),
-            compaction_lock,
+            compaction,
+            compaction_gate,
             snapshot_registry,
             inline_compaction: options.inline_compaction,
             has_worker,
@@ -798,11 +806,10 @@ impl RegolithEngine {
             commit_ring: Self::new_commit_ring(),
             pipeline: Mutex::new(Pipeline::new()),
             flusher,
-            write_latch: Mutex::new(None),
-            write_latched: AtomicBool::new(false),
+            write_latch: OnceCell::new(),
             stall_signal,
             cached_stall_level,
-            compaction_in_progress,
+            compaction_claims,
             background_health,
             env,
             _db_lock: db_lock,
@@ -901,7 +908,6 @@ impl RegolithEngine {
             version: versions.lock().current(),
         }));
         versions.attach_view(Arc::clone(&view));
-        let compaction_lock = Arc::new(Gate::new());
         let snapshot_registry = Arc::new(SnapshotRegistry::with_env(Arc::clone(&env)));
         let cached_stall_level = Arc::new(AtomicU8::new(0));
         let stall_signal = Arc::new(StallSignal::new(
@@ -932,14 +938,14 @@ impl RegolithEngine {
             latest_seq: AtomicU64::new(latest_seq),
             visible_seq: ReadHorizon::new(latest_seq),
             close_state: AtomicU8::new(CLOSE_STATE_OPEN),
-            close_lock: Mutex::new(()),
+            close_lock: crate::sync::Mutex::new(()),
             open_transactions: open_transactions::OpenTransactions::new(),
             active_wal: Mutex::new(None),
             wal_id: AtomicU64::new(wal_id),
             sst_dir,
             wal_dir,
-            compaction: Mutex::new(CompactionScheduler::disabled()),
-            compaction_lock,
+            compaction: CompactionScheduler::disabled(),
+            compaction_gate: CompactionGate::new(),
             snapshot_registry,
             // Writes are refused before they reach the stall, so a
             // read-only engine never stalls one.
@@ -954,11 +960,10 @@ impl RegolithEngine {
             commit_ring: Self::new_commit_ring(),
             pipeline: Mutex::new(Pipeline::new()),
             flusher,
-            write_latch: Mutex::new(None),
-            write_latched: AtomicBool::new(false),
+            write_latch: OnceCell::new(),
             stall_signal,
             cached_stall_level,
-            compaction_in_progress: Arc::new(Mutex::new(HashSet::new())),
+            compaction_claims: Arc::new(Claims::new()),
             background_health,
             env,
             _db_lock: db_lock,
@@ -1046,7 +1051,7 @@ impl RegolithEngine {
 
     pub(crate) fn ensure_writable(&self) -> std::io::Result<()> {
         self.ensure_open()?;
-        if self.write_latched.load(Ordering::Acquire) {
+        if self.is_latched() {
             return Err(self.latched_error());
         }
         if self.is_read_only() {
@@ -1071,14 +1076,32 @@ impl RegolithEngine {
         self.latch(WriteLatch::CallbackPanicked(callback));
     }
 
-    /// Keep the first reason: it is the one that explains the rest.
+    /// Keep the first reason: it is the one that explains the rest. One
+    /// compare-and-swap publishes it, and a later reason finds the cell
+    /// full and is dropped.
     fn latch(&self, latch: WriteLatch) {
-        self.write_latch.lock().get_or_insert(latch);
-        self.write_latched.store(true, Ordering::Release);
+        let _ = self.write_latch.set(latch);
+    }
+
+    /// Whether a failure latched the engine against writes. One load.
+    pub(crate) fn is_latched(&self) -> bool {
+        self.write_latch.get().is_some()
+    }
+
+    /// Test-only: the compaction gate.
+    #[cfg(test)]
+    pub(crate) fn compaction_gate(&self) -> &CompactionGate {
+        &self.compaction_gate
+    }
+
+    /// Test-only: no compaction pass holds a claim.
+    #[cfg(test)]
+    pub(crate) fn compaction_claims_idle(&self) -> bool {
+        self.compaction_claims.is_idle()
     }
 
     fn latched_error(&self) -> std::io::Error {
-        match self.write_latch.lock().as_ref() {
+        match self.write_latch.get() {
             Some(WriteLatch::Wal(kind, message)) => std::io::Error::new(
                 *kind,
                 format!("write-ahead log left in an unknown state: {message}"),
@@ -1986,39 +2009,20 @@ impl RegolithEngine {
     /// Run at most one pending compaction job on the calling thread and
     /// report whether any work was done.
     ///
-    /// Takes the read side of the engine-wide compaction lock, exactly
-    /// as a background worker does, and shares the engine's in-progress
-    /// file-id set, so a foreground pass and a worker can never pick
-    /// overlapping inputs.
+    /// Holds the engine-wide compaction gate shared, exactly as a
+    /// background worker does, and uses the engine's claims, so a pass here
+    /// and a worker never pick overlapping inputs.
     ///
-    /// Lock-order invariant: the caller must not hold `write_lock`.
-    /// `ingest_external_files` holds the write side of the compaction
-    /// lock while it takes `write_lock`, so acquiring them in the
-    /// opposite order here would invert the hierarchy. The stall path
-    /// satisfies this because it runs before the write path takes
-    /// `write_lock`, never inside it.
+    /// It never waits for another thread: when a `compact_range`, an
+    /// ingest, a checkpoint, a `drop_all` or a backup holds the gate alone,
+    /// or is owed it, this reports `Contended` at once. The thread asking
+    /// may be the one that holds it, and a caller's call waits for no other
+    /// thread (plan 4.10).
     pub(crate) fn run_one_compaction_pass(&self) -> std::io::Result<CompactionOutcome> {
-        self.run_one_compaction_pass_on(true)
-    }
-
-    /// [`Self::run_one_compaction_pass`], or, unless `wait`, `Contended`
-    /// at once when a `compact_range`, an ingest, a checkpoint or a
-    /// `drop_all` holds the compaction lock or waits for it. A write's owed
-    /// step never waits: the thread that owes it may be the one holding the
-    /// lock.
-    pub(crate) fn run_one_compaction_pass_on(
-        &self,
-        wait: bool,
-    ) -> std::io::Result<CompactionOutcome> {
         self.ensure_writable()?;
         let outcome = {
-            let _guard = if wait {
-                self.compaction_lock.read()
-            } else {
-                match self.compaction_lock.try_read() {
-                    Some(guard) => guard,
-                    None => return Ok(CompactionOutcome::Contended),
-                }
+            let Some(_pass) = self.compaction_gate.try_shared() else {
+                return Ok(CompactionOutcome::Contended);
             };
             self.ensure_writable()?;
             compaction::pick_and_run_compaction(
@@ -2027,7 +2031,7 @@ impl RegolithEngine {
                 &self.cache,
                 &self.options.to_compaction_options(),
                 &self.snapshot_registry,
-                &self.compaction_in_progress,
+                &self.compaction_claims,
             )?
         };
         // As a worker does after each pass: writers a stop stopped are told
@@ -2159,7 +2163,7 @@ impl RegolithEngine {
             let Some((reason, true)) = self.stall_state() else {
                 break Ok(());
             };
-            match self.run_one_background_step(false)? {
+            match self.run_one_background_step()? {
                 CompactionOutcome::DidWork => {
                     idle = 0;
                     passes += 1;
@@ -2405,7 +2409,7 @@ impl RegolithEngine {
         // only when the background has fallen a whole memtable behind.
         if let Some(room) = room {
             while self.view.load().frozen.len() >= room {
-                if !self.flush_oldest_frozen(&self.flusher.flushing.lock())? {
+                if !self.flush_oldest_frozen(&self.flusher.flushing()?)? {
                     break;
                 }
             }
@@ -2496,7 +2500,7 @@ impl RegolithEngine {
             .iter()
             .any(|mt| Arc::ptr_eq(mt, target))
         {
-            if !self.flush_oldest_frozen(&self.flusher.flushing.lock())? {
+            if !self.flush_oldest_frozen(&self.flusher.flushing()?)? {
                 break;
             }
         }
@@ -2507,7 +2511,10 @@ impl RegolithEngine {
     /// it, then wake the compaction worker, or, with none, owe the next
     /// write a bounded step. Returns `false` when there was
     /// nothing frozen to flush. See [`Flusher::flush_oldest`].
-    fn flush_oldest_frozen(&self, flushing: &MutexGuard<'_, ()>) -> std::io::Result<bool> {
+    fn flush_oldest_frozen(
+        &self,
+        flushing: &crate::sync::MutexGuard<'_, ()>,
+    ) -> std::io::Result<bool> {
         let flushed = self.flusher.flush_oldest(flushing)?;
         if flushed {
             self.after_flush();
@@ -2518,24 +2525,20 @@ impl RegolithEngine {
     /// Synchronously compact SSTables overlapping the user-key range
     /// `[start, end)` down to the bottommost non-empty level.
     ///
-    /// - Acquires the engine-wide compaction lock so the background
-    ///   scheduler can't pick an overlapping input set concurrently.
+    /// - The caller holds the compaction gate alone (`_gate`), so no
+    ///   compaction pass picks an overlapping input set meanwhile. It is
+    ///   held before the flush below, in the gate -> pipeline order an
+    ///   ingest and `drop_all` take too.
     /// - Flushes the active memtable first so any matching in-memory
     ///   data reaches L0 before compaction picks inputs.
     /// - Walks levels 0..MAX_LEVELS-1, picking range-overlapping files
     ///   and merging them into the next level.
     pub(crate) fn compact_range(
         &self,
+        _gate: &Exclusive,
         start: Option<&[u8]>,
         end: Option<&[u8]>,
     ) -> std::io::Result<()> {
-        self.ensure_writable()?;
-        // 1. Exclude all background workers for the duration of the
-        //    range walk. Write lock blocks until every in-flight
-        //    background pass releases its read lock. Taken before the
-        //    flush below, in the `compaction_lock -> pipeline` order an
-        //    ingest and `drop_all` take too.
-        let _compact_guard = self.compaction_lock.write();
         self.ensure_writable()?;
 
         // 2. Flush the active memtable so any in-memory data that
@@ -2630,33 +2633,44 @@ impl RegolithEngine {
                 .is_some_and(|wal| wal.seal_key() != Some(current))
     }
 
-    /// Atomically capture a consistent snapshot of the on-disk state
-    /// for checkpoint / backup purposes.
+    /// What a checkpoint or a backup does before it takes the compaction
+    /// gate: write every memtable out, so every write acknowledged so far is
+    /// in an SSTable.
     ///
-    /// Flushes the active memtable (if non-empty) under the write
-    /// lock so every live byte is in an SSTable, compacts the
-    /// manifest so the on-disk form is a single rewrite of the
-    /// current version, and returns the captured `Arc<Version>` plus
+    /// Drain, do not merely seal. A capture names the SSTables of the
+    /// current version and copies no WAL, so a memtable that is still
+    /// waiting on a background flush would be missing from the result
+    /// entirely.
+    pub(crate) fn checkpoint_drain(&self) -> std::io::Result<()> {
+        self.ensure_writable()?;
+        self.drain_memtables(ActiveFlush::Always)
+    }
+
+    /// [`Self::checkpoint_drain`] and [`Self::checkpoint_capture`] on this
+    /// thread, waiting here for the gate: a call that chose to block (a
+    /// backup).
+    pub(crate) fn checkpoint_capture_here(&self) -> std::io::Result<CheckpointSnapshot> {
+        self.checkpoint_drain()?;
+        self.checkpoint_capture(self.compaction_gate.exclusive()?)
+    }
+
+    /// Atomically capture a consistent snapshot of the on-disk state
+    /// for checkpoint / backup purposes, after
+    /// [`Self::checkpoint_drain`].
+    ///
+    /// Compacts the manifest so the on-disk form is a single rewrite of
+    /// the current version, and returns the captured `Arc<Version>` plus
     /// the paths of the files a caller needs to copy or hard-link.
     ///
-    /// The returned [`CheckpointSnapshot`] holds the engine's
-    /// compaction lock, pinning every referenced file against
-    /// concurrent unlink. Callers MUST drop the snapshot as soon as
-    /// their filesystem work is done - a snapshot whose lifetime
-    /// outlives the enclosing function scope can deadlock a
-    /// concurrent `db.close()` / `drop(db)` that joins the background
-    /// compaction thread (the thread will block on the same lock the
-    /// snapshot holds).
-    pub(crate) fn checkpoint_capture(&self) -> std::io::Result<CheckpointSnapshot> {
-        self.ensure_writable()?;
-        // Drain, do not merely seal. A checkpoint captures the SSTables
-        // the current version names and copies no WAL, so a memtable that
-        // is still waiting on a background flush would be missing from
-        // the result entirely. Done before the compaction lock is taken,
-        // because flushing needs it.
-        self.drain_memtables(ActiveFlush::Always)?;
-
-        let compaction_guard = Gate::write_owned(&self.compaction_lock);
+    /// The returned [`CheckpointSnapshot`] holds `gate`, the compaction
+    /// gate held alone, pinning every referenced file against concurrent
+    /// unlink. Callers drop the snapshot as soon as their filesystem work
+    /// is done: until then no compaction runs, and a `db.close()` that
+    /// joins a compaction worker waiting for the gate waits too.
+    pub(crate) fn checkpoint_capture(
+        &self,
+        gate: Exclusive,
+    ) -> std::io::Result<CheckpointSnapshot> {
         self.ensure_writable()?;
 
         let version;
@@ -2670,7 +2684,7 @@ impl RegolithEngine {
             version = versions.current();
             // Read here, under the same lock that produced `version`, so
             // the two cannot disagree. A concurrent flush takes this lock
-            // but not the compaction lock held above, so it is free to
+            // but not the compaction gate held above, so it is free to
             // append `AddFile` records naming files this checkpoint will
             // not copy, and a rewrite can replace the file entirely.
             let path = versions.manifest_path().to_path_buf();
@@ -2681,7 +2695,7 @@ impl RegolithEngine {
             version,
             manifest_bytes,
             sst_dir: self.sst_dir.clone(),
-            _compaction_guard: compaction_guard,
+            _gate: gate,
         })
     }
 
@@ -2881,8 +2895,8 @@ impl RegolithEngine {
     pub(crate) fn drop_all(&self) -> std::io::Result<()> {
         self.ensure_writable()?;
         // Exclude background compaction for the whole drop, as
-        // `compact_range`, `ingest_external_files` and `checkpoint_capture`
-        // do. Without it a worker holding the read side runs straight
+        // `compact_range`, an ingest's install and `checkpoint_capture`
+        // do. Without it a worker holding the gate shared runs straight
         // through the `Reset` below and then applies its `AddFile`, which
         // `VersionSet::apply` lays over whatever version is current: a file
         // full of pre-drop rows lands in the freshly emptied version, and
@@ -2890,15 +2904,17 @@ impl RegolithEngine {
         // version never named it. The drop reports success and the data is
         // still there, across a reopen.
         //
-        // Taken before `pipeline`, matching the `compaction_lock ->
-        // write_lock` order documented on `run_one_compaction_pass`.
-        let _compact_guard = self.compaction_lock.write();
+        // Taken before `pipeline`, in the gate -> pipeline order every
+        // exclusive user of the gate takes. `drop_all` is a call that does
+        // its own I/O and chose to block (plan 3.0), so it waits for the
+        // gate on its own thread.
+        let _gate = self.compaction_gate.exclusive()?;
         let _write_guard = self.lock_pipeline();
         // A flush the background is running took its memtable before the
         // drop and installs its table after it: held here, it finishes first
         // and the `Reset` below removes its table, instead of laying it over
         // the emptied version.
-        let _flushing = self.flusher.flushing.lock();
+        let _flushing = self.flusher.flushing()?;
         self.ensure_writable()?;
 
         // Published before the version `Reset` below, so no reader can
@@ -3012,7 +3028,9 @@ impl RegolithEngine {
     ///    joined; a foreground job the workers had not run fails with
     ///    `Closed`.
     pub(crate) fn close(&self) -> std::io::Result<()> {
-        let _close_guard = self.close_lock.lock();
+        // Close does its own I/O and chose to block (plan 3.0): a second
+        // close waits here, on its own thread, for the first.
+        let _close_guard = wait_here(self.close_lock.lock())?;
         match self.close_state.load(Ordering::Acquire) {
             CLOSE_STATE_CLOSED => return Ok(()),
             CLOSE_STATE_CLOSING => return Err(Self::closed_error()),
@@ -3053,7 +3071,7 @@ impl RegolithEngine {
 
     fn close_inner(&self) -> std::io::Result<()> {
         if self.is_read_only() {
-            self.compaction.lock().shutdown();
+            self.compaction.shutdown();
             return Ok(());
         }
 
@@ -3066,7 +3084,7 @@ impl RegolithEngine {
             // CLOSE would vouch for them: replay would then refuse the
             // crash it should survive. Such a log is left for recovery to
             // judge. Checked under the lock a failing commit latches under.
-            if self.write_latched.load(Ordering::Acquire) {
+            if self.is_latched() {
                 wal.sync_data()?;
             } else if let Err(err) = wal.close() {
                 drop(guard);
@@ -3075,25 +3093,13 @@ impl RegolithEngine {
                 return Err(err);
             }
         }
-        // Signal under the mutex, join without it.
-        //
-        // A worker parked in `compaction_lock.read()` cannot exit until
-        // whoever holds that gate is done, and `ingest_external_files` holds
-        // it across a call that wants this same mutex. Joining while holding
-        // the mutex therefore closes a cycle: close waits on the worker, the
-        // worker waits on the ingest gate, and ingest waits on this mutex.
-        // Dropping the guard before the join is what breaks it.
-        let handles = {
-            let mut scheduler = self.compaction.lock();
-            scheduler.signal_shutdown();
-            scheduler.take_handles()
-        };
-        for handle in handles {
-            handle.join();
-        }
-        // A foreground job the workers never ran fails with `Closed`, and
-        // its ticket is told.
-        self.compaction.lock().release_jobs();
+        // Stop and join regolith's threads. A worker waiting for the
+        // compaction gate exits once whoever holds the gate lets go: a job on
+        // another worker when it ends, a queue's job that was handed the
+        // gate while it was parked when the sweep above settled it. Then a
+        // foreground job the workers never ran fails with `Closed`, and its
+        // ticket is told.
+        self.compaction.shutdown();
 
         Ok(())
     }
@@ -3214,21 +3220,19 @@ enum ActiveFlush {
 
 /// A consistent snapshot of on-disk state captured by
 /// [`RegolithEngine::checkpoint_capture`]. Holds the engine's compaction
-/// lock for its entire lifetime, so no background or foreground
-/// compaction can unlink files referenced by `version` while the
-/// snapshot is alive. Callers MUST drop this snapshot as soon as
-/// they are done with the filesystem work - a snapshot whose
-/// lifetime outlives the enclosing function scope can deadlock a
-/// concurrent `db.close()` / `drop(db)` that joins the background
-/// compaction thread (the thread will block waiting for the same
-/// lock the snapshot holds).
+/// gate alone for its entire lifetime, so no compaction can unlink files
+/// referenced by `version` while the snapshot is alive. Callers MUST drop
+/// this snapshot as soon as they are done with the filesystem work: while
+/// it lives no compaction runs, and a concurrent `db.close()` /
+/// `drop(db)` that joins a compaction worker waiting for the gate waits
+/// for the snapshot too.
 pub(crate) struct CheckpointSnapshot {
     pub(crate) version: Arc<manifest::Version>,
     /// The manifest exactly as it described `version`, captured under
     /// the same lock.
     ///
     /// The bytes are held rather than a path and a length. A concurrent
-    /// flush takes `versions.lock()` but not the compaction lock this
+    /// flush takes `versions.lock()` but not the compaction gate this
     /// snapshot holds, so it can append `AddFile` records naming files
     /// this checkpoint will not copy, and a manifest rewrite can replace
     /// the file wholesale. Re-reading the path later would then pick up
@@ -3240,8 +3244,8 @@ pub(crate) struct CheckpointSnapshot {
     /// canonical size, so this is bounded by the live SSTable count.
     pub(crate) manifest_bytes: Vec<u8>,
     pub(crate) sst_dir: PathBuf,
-    /// Compaction lock guard, scoped to the snapshot's lifetime.
-    _compaction_guard: OwnedGateWriteGuard,
+    /// The compaction gate, held alone for the snapshot's lifetime.
+    _gate: Exclusive,
 }
 
 impl CheckpointSnapshot {
