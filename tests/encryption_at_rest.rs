@@ -371,6 +371,11 @@ fn contents_under(dir: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
         .collect()
 }
 
+/// Whether `path` is a database directory's lock file.
+fn is_lock_file(path: &Path) -> bool {
+    path.file_name().is_some_and(|name| name == "LOCK")
+}
+
 /// The open checks the provider's current key before it writes anything.
 /// This directory makes an open write twice before it would first need the
 /// current key (to seal the next log): the manifest's torn tail is trimmed
@@ -394,6 +399,11 @@ fn a_refused_open_writes_nothing_first_not_even_a_dropped_log_tail() {
         for path in files_under(live.path()) {
             let to = dir.path().join(path.strip_prefix(live.path()).unwrap());
             std::fs::create_dir_all(to.parent().unwrap()).unwrap();
+            // The lock file is no byte of the database, and Windows lets no
+            // other handle read it while the database holds it locked.
+            if is_lock_file(&path) {
+                continue;
+            }
             std::fs::copy(&path, &to).unwrap();
         }
     }
@@ -412,7 +422,13 @@ fn a_refused_open_writes_nothing_first_not_even_a_dropped_log_tail() {
         &dir.path().join("MANIFEST"),
         &[0xFF, 0x00, 0x00, 0x00, 0x01],
     );
-    let before = contents_under(dir.path());
+    let data_under = |dir: &Path| {
+        let mut contents = contents_under(dir);
+        // Taking the lock is where an open starts, before it reads a byte.
+        contents.retain(|path, _| !is_lock_file(path));
+        contents
+    };
+    let before = data_under(dir.path());
 
     let unprovided = Keys::new(&[1]);
     unprovided.set_current(9);
@@ -422,7 +438,7 @@ fn a_refused_open_writes_nothing_first_not_even_a_dropped_log_tail() {
         "{result:?}"
     );
     assert!(
-        contents_under(dir.path()) == before,
+        data_under(dir.path()) == before,
         "the refused open wrote before it refused"
     );
 
