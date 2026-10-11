@@ -188,21 +188,22 @@ mod tests {
         let (a, b, c) = (table(&dir, 1), table(&dir, 2), table(&dir, 3));
         let claims = Claims::new();
         let first = claims
-            .tables(vec![Arc::clone(&b), Arc::clone(&a)])
+            .tables(vec![Arc::clone(&c), Arc::clone(&b)])
             .expect("free");
+        // Claimed in id order: `a` is taken first, then `c` refuses.
         assert!(
             claims
-                .tables(vec![Arc::clone(&c), Arc::clone(&b)])
+                .tables(vec![Arc::clone(&c), Arc::clone(&a)])
                 .is_none(),
-            "b is held"
+            "c is held"
         );
         assert!(
-            !c.claimed.load(Ordering::Acquire),
+            !a.claimed.load(Ordering::Acquire),
             "a refused claim gives back what it took"
         );
-        let other = claims.tables(vec![Arc::clone(&c)]).expect("c is free");
+        let other = claims.tables(vec![Arc::clone(&a)]).expect("a is free");
         drop(first);
-        assert!(!a.claimed.load(Ordering::Acquire) && !b.claimed.load(Ordering::Acquire));
+        assert!(!b.claimed.load(Ordering::Acquire) && !c.claimed.load(Ordering::Acquire));
         drop(other);
         assert!(claims.is_idle());
     }
