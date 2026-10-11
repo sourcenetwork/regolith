@@ -38,11 +38,11 @@
 //! *process* on a target with no file locking, and there regolith says so
 //! through `Capabilities::file_lock` instead of pretending.
 
-use std::collections::HashMap;
-use std::collections::hash_map::Entry;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+
+use kovan_map::HopscotchMap;
 
 use super::FileLock;
 
@@ -53,11 +53,26 @@ use super::FileLock;
 /// marks the directory taken; dropping it releases the mark. One
 /// writer excludes every other holder, and any number of readers
 /// coexist.
+///
+/// A lock-free map, with no mutex around it: each acquire and each release
+/// is one atomic read-modify-write of the directory's entry
+/// ([`HopscotchMap::compute`]), which sees the holders the entry has then
+/// and writes the next state in the same step. So two opens of one
+/// directory never both see it free, and an open and a close of different
+/// directories never wait on each other.
 #[derive(Debug, Default)]
 pub(super) struct DirectoryRegistry {
-    /// `None` means one writer holds the path; `Some(n)` means `n`
-    /// readers do. A vacant entry means nobody does.
-    held: Mutex<HashMap<PathBuf, Option<usize>>>,
+    /// Who holds each path. An absent entry means nobody does.
+    held: HopscotchMap<PathBuf, Holders>,
+}
+
+/// The holders of one directory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Holders {
+    /// One read-write handle.
+    Writer,
+    /// This many read-only handles, at least one.
+    Readers(usize),
 }
 
 impl DirectoryRegistry {
@@ -72,20 +87,22 @@ impl DirectoryRegistry {
         exclusive: bool,
     ) -> io::Result<Box<dyn FileLock>> {
         let path = db_dir.to_path_buf();
-        let mut held = self
-            .held
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        match held.entry(path.clone()) {
-            Entry::Occupied(mut slot) => match (slot.get_mut(), exclusive) {
-                (Some(readers), false) => *readers += 1,
-                _ => return Err(conflict(&path)),
-            },
-            Entry::Vacant(slot) => {
-                slot.insert(if exclusive { None } else { Some(1) });
-            }
+        let mut taken = false;
+        // The closure runs once, on the entry as it is at that instant. A
+        // conflict writes the entry back as it found it.
+        self.held.compute(path.clone(), |held| {
+            let next = match (held, exclusive) {
+                (None, true) => Holders::Writer,
+                (None, false) => Holders::Readers(1),
+                (Some(Holders::Readers(readers)), false) => Holders::Readers(readers + 1),
+                (Some(conflicting), _) => return Some(*conflicting),
+            };
+            taken = true;
+            Some(next)
+        });
+        if !taken {
+            return Err(conflict(&path));
         }
-        drop(held);
         Ok(Box::new(RegistryLock {
             registry: Arc::clone(self),
             path,
@@ -94,22 +111,13 @@ impl DirectoryRegistry {
     }
 
     fn release(&self, path: &Path, exclusive: bool) {
-        let mut held = self
-            .held
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if exclusive {
-            held.remove(path);
-            return;
-        }
-        if let Entry::Occupied(mut slot) = held.entry(path.to_path_buf()) {
-            match slot.get_mut() {
-                Some(readers) if *readers > 1 => *readers -= 1,
-                _ => {
-                    slot.remove();
-                }
+        // `None` removes the entry: the writer left, or the last reader did.
+        self.held.compute(path.to_path_buf(), |held| match held {
+            Some(Holders::Readers(readers)) if !exclusive && *readers > 1 => {
+                Some(Holders::Readers(readers - 1))
             }
-        }
+            _ => None,
+        });
     }
 }
 
@@ -411,6 +419,74 @@ mod tests {
         );
         drop(second_reader);
         assert!(registry.acquire(dir, true).is_ok());
+    }
+
+    /// Opens racing on one directory: at no instant does a writer share it,
+    /// and when every handle is dropped the directory is free again.
+    #[test]
+    fn racing_opens_of_one_directory_never_admit_a_writer_with_anyone() {
+        use std::sync::atomic::{AtomicIsize, Ordering};
+
+        let registry: Arc<DirectoryRegistry> = Arc::default();
+        let dir = Path::new("/registry/raced");
+        // Readers inside count up; a writer inside is -1.
+        let inside = AtomicIsize::new(0);
+        std::thread::scope(|scope| {
+            for t in 0..6 {
+                let (registry, inside) = (&registry, &inside);
+                scope.spawn(move || {
+                    for round in 0..2_000 {
+                        let exclusive = (t + round) % 3 == 0;
+                        let Ok(lock) = registry.acquire(dir, exclusive) else {
+                            continue;
+                        };
+                        if exclusive {
+                            assert_eq!(inside.swap(-1, Ordering::SeqCst), 0, "a writer shared");
+                            std::hint::spin_loop();
+                            assert_eq!(inside.swap(0, Ordering::SeqCst), -1, "a writer shared");
+                        } else {
+                            assert!(
+                                inside.fetch_add(1, Ordering::SeqCst) >= 0,
+                                "beside a writer"
+                            );
+                            std::hint::spin_loop();
+                            inside.fetch_sub(1, Ordering::SeqCst);
+                        }
+                        drop(lock);
+                    }
+                });
+            }
+        });
+        assert!(
+            registry.acquire(dir, true).is_ok(),
+            "a holder was left behind"
+        );
+    }
+
+    /// Opens of different directories do not disturb each other's entries.
+    #[test]
+    fn many_directories_are_tracked_independently() {
+        let registry: Arc<DirectoryRegistry> = Arc::default();
+        std::thread::scope(|scope| {
+            for t in 0..4 {
+                let registry = &registry;
+                scope.spawn(move || {
+                    for round in 0..500 {
+                        let dir = PathBuf::from(format!("/registry/{t}/{round}"));
+                        let writer = registry.acquire(&dir, true).unwrap();
+                        assert!(registry.acquire(&dir, false).is_err());
+                        drop(writer);
+                        let reader = registry.acquire(&dir, false).unwrap();
+                        assert!(registry.acquire(&dir, true).is_err());
+                        drop(reader);
+                    }
+                });
+            }
+        });
+        assert!(
+            registry.held.is_empty(),
+            "every entry is removed with its last holder"
+        );
     }
 
     #[test]
