@@ -13,10 +13,8 @@
 //!
 //! # Merge operators
 //!
-//! [`check_touches`] checks the other law an operator carries: that
-//! [`MergeOperator::touches`] survives the early folding below.
-//!
-//! [`check_merge_operator`] and [`check_touches`] are the two checks.
+//! [`check_merge_operator`] and [`check_touches`] are the two checks, one for
+//! each law a [`MergeOperator`] carries.
 //!
 //! [`check_merge_operator`] checks the law that lets compaction fold operands
 //! early. For any run of operands, cut into contiguous groups, each group
@@ -68,6 +66,47 @@
 //! Without it a transaction that read some parts with
 //! [`Transaction::get_parts`](crate::Transaction::get_parts) could commit
 //! over a part a folded operand changed.
+//!
+//! ```
+//! use regolith::MergeOperator;
+//! use regolith::testing::check_touches;
+//! use regolith::testing::proptest::collection::vec;
+//! use regolith::testing::proptest::prelude::*;
+//!
+//! /// A value of two one-byte parts. An operand is `[part, delta]`: it adds
+//! /// `delta` to one part, and touches that part only.
+//! struct Fields;
+//!
+//! impl MergeOperator for Fields {
+//!     fn name(&self) -> &'static str {
+//!         "fields"
+//!     }
+//!
+//!     fn full_merge(&self, _key: &[u8], base: Option<&[u8]>, operands: &[&[u8]]) -> Option<Vec<u8>> {
+//!         let mut fields: [u8; 2] = base.map_or(Some([0; 2]), |base| base.try_into().ok())?;
+//!         for &operand in operands {
+//!             let &[part, delta] = operand else { return None };
+//!             let field = fields.get_mut(usize::from(part))?;
+//!             *field = field.wrapping_add(delta);
+//!         }
+//!         Some(fields.to_vec())
+//!     }
+//!
+//!     fn partial_merge(&self, _key: &[u8], left: &[u8], right: &[u8]) -> Option<Vec<u8>> {
+//!         let (&[part, a], &[other, b]) = (left, right) else { return None };
+//!         (part == other).then(|| vec![part, a.wrapping_add(b)])
+//!     }
+//!
+//!     fn touches(&self, _key: &[u8], operand: &[u8], parts: &[u32]) -> bool {
+//!         operand.first().is_none_or(|part| parts.contains(&u32::from(*part)))
+//!     }
+//! }
+//!
+//! let operands = || (0u8..2, any::<u8>()).prop_map(|(part, delta)| vec![part, delta]);
+//! let checked = check_touches(&Fields, any::<Vec<u8>>(), operands(), vec(0u32..2, 0..=2))?;
+//! assert!(checked.folds > 0, "no two operands folded, so the law was never tested");
+//! # Ok::<(), String>(())
+//! ```
 
 use std::cell::Cell;
 
