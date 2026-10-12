@@ -19,7 +19,7 @@ use common::keys::Keys;
 use common::overlap_fixture::{
     self as fixture, MOVED, assert_db_reads, assert_reads, moved, value,
 };
-use regolith::{Db, Error, Options, Statistics, Ticker};
+use regolith::{Db, Error, FixedLengthPrefix, Options, Statistics, Ticker};
 use tracing::field::{Field, Visit};
 use tracing::span;
 use tracing::{Event, Level, Metadata, Subscriber};
@@ -331,6 +331,76 @@ fn assert_db_reads_and(
         expected.get(extra),
         "{read}"
     );
+}
+
+/// The keys a prefix seek yields, in order.
+fn seek_prefix(db: &Db, prefix: &[u8]) -> Vec<Vec<u8>> {
+    let mut iter = db.iter();
+    iter.seek_prefix(prefix);
+    let mut keys = Vec::new();
+    while iter.valid() {
+        keys.push(iter.key().unwrap().to_vec());
+        iter.next();
+    }
+    iter.status().unwrap();
+    keys
+}
+
+/// A prefix seek returns what a full scan returns for that prefix, on a
+/// database opened with a prefix extractor it was not written with. The
+/// tables 0.1.9 wrote carry no prefix filter and are read whole; the tables
+/// this version writes afterwards carry one, built over their keys, and a
+/// range tombstone in a table its filter rules out is still in force: `b`,
+/// which the moved table's tombstone deletes, stays deleted at every stage.
+#[test]
+fn a_prefix_seek_over_the_moved_tables_returns_what_a_full_scan_returns() {
+    let (_tmp, db_dir) = fixture::fresh();
+    let expected = fixture::state();
+    let prefixed = || opts().prefix_extractor(Some(Arc::new(FixedLengthPrefix(1))));
+    let assert_seeks = |db: &Db, when: &str| {
+        let scanned: Vec<Vec<u8>> = db
+            .scan(None, None)
+            .unwrap()
+            .into_iter()
+            .map(|(key, _)| key)
+            .collect();
+        assert_eq!(
+            scanned,
+            expected.keys().cloned().collect::<Vec<_>>(),
+            "{when}: scan"
+        );
+        for first in b'a'..=b'r' {
+            let want: Vec<Vec<u8>> = scanned
+                .iter()
+                .filter(|key| key.first() == Some(&first))
+                .cloned()
+                .collect();
+            assert_eq!(
+                seek_prefix(db, &[first]),
+                want,
+                "{when}: prefix {}",
+                first as char
+            );
+        }
+    };
+
+    let db = Db::open(&db_dir, prefixed()).unwrap();
+    assert_eq!(moved(&db), MOVED);
+    assert_seeks(&db, "the first open");
+    // The ingested table, with its range tombstone, leaves level 0 in a
+    // table this version writes.
+    db.compact_range(Some(b"a"), Some(b"a0")).wait().unwrap();
+    assert_seeks(&db, "after compacting [a, a0)");
+    // What the open recovered, the copy of that tombstone with it, becomes
+    // a table too.
+    db.flush().unwrap();
+    assert_seeks(&db, "after a flush");
+    db.compact_range(None, None).wait().unwrap();
+    assert_seeks(&db, "after compacting everything");
+    db.close().unwrap();
+    drop(db);
+    let db = Db::open(&db_dir, prefixed()).unwrap();
+    assert_seeks(&db, "after a reopen");
 }
 
 /// The upgraded database takes writes like any other, and keeps them.
