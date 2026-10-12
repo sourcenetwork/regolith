@@ -1,4 +1,5 @@
-//! A stopped write is told when the engine fails (E35).
+//! A stopped write is told when the engine fails (E35), and when the work
+//! that would relieve its stop fails (E36).
 //!
 //! A write a stall stopped waits on the stall's unit, and the unit lands when
 //! the stall clears. An engine that latches a failure will not clear it:
@@ -7,10 +8,15 @@
 //! fresh write gets. A rotation that flushed and then could not seal changed
 //! what the stall counts, so it re-classifies on its way out too.
 //!
-//! Each test stops a write first and fails the engine second, through the
-//! log sync a rotation or a flush makes (`wal::fault`), and none sleeps: a
-//! flush is held in flight by a prefix extractor, and a blocked thread is
-//! watched through a channel with a deadline.
+//! A flush or a compaction that fails does not clear the stop either. A
+//! write that arrives then is told that failure; recording it lands the
+//! unit, so a write already waiting is told the same, at the same moment.
+//!
+//! Each test stops a write first and fails the engine second: through the
+//! log sync a rotation or a flush makes (`wal::fault`), or through a rate
+//! limiter or a prefix extractor that fails the background job that calls
+//! it. None sleeps: a job is held in flight by that same caller's code, and
+//! a blocked thread is watched through a channel with a deadline.
 
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
@@ -22,7 +28,10 @@ use crate::engine::wal::wal_filename;
 use crate::engine::wal_rotation_tests::SyncFault;
 use crate::engine::{DurabilityMode, EngineOptions, RegolithEngine};
 use crate::portability::{AtomicBool, Ordering};
-use crate::{Db, Error, IoBudget, Options, StallWait, WouldBlock, WriteBatchOp};
+use crate::{
+    Db, Error, IoBudget, Options, PrefixExtractor, Priority, RateLimiter, StallWait, WouldBlock,
+    WriteBatchOp,
+};
 
 /// How long a test waits for another thread before it calls the wait a hang.
 const DEADLINE: Duration = Duration::from_secs(60);
@@ -418,4 +427,440 @@ fn a_wait_registered_after_the_latch_is_told_the_latch_and_leaves_no_unit() {
     assert!(told.contains("unknown state"), "{told}");
     assert_eq!(told, fresh_write_error(&engine));
     assert!(!engine.stall_signal().has_unit());
+}
+
+// ---------- the relief that fails (E36) ----------
+
+/// A rate limiter the worker's flush or compaction stops in, once armed,
+/// until it is let go, and that fails every request while `failing` is set:
+/// a limiter that panics fails the background job that asked
+/// (`rate_limiter::throttle_background`). The engine asks it on a worker
+/// only, so a flush on the test's own thread goes through.
+struct HeldRelief {
+    armed: AtomicBool,
+    failing: AtomicBool,
+    entered: Mutex<mpsc::Sender<()>>,
+    release: Mutex<mpsc::Receiver<()>>,
+}
+
+impl RateLimiter for HeldRelief {
+    fn request(&self, _bytes: u64, _pri: Priority) {
+        if self.armed.swap(false, Ordering::AcqRel) {
+            let _ = self.entered.lock().unwrap().send(());
+            let _ = self.release.lock().unwrap().recv_timeout(DEADLINE);
+        }
+        if self.failing.load(Ordering::Acquire) {
+            panic!("the relief fails: a test's rate limiter");
+        }
+    }
+
+    fn set_bytes_per_second(&self, _bytes_per_second: u64) {}
+
+    fn get_bytes_per_second(&self) -> u64 {
+        0
+    }
+
+    fn get_total_bytes_through(&self, _pri: Priority) -> u64 {
+        0
+    }
+}
+
+/// A relief holder, the channel that says the worker entered it, and the
+/// one that lets the worker go.
+fn held_relief() -> (Arc<HeldRelief>, mpsc::Receiver<()>, mpsc::Sender<()>) {
+    let (entered, when_entered) = mpsc::channel();
+    let (release, when_released) = mpsc::channel();
+    let held = Arc::new(HeldRelief {
+        armed: AtomicBool::new(false),
+        failing: AtomicBool::new(false),
+        entered: Mutex::new(entered),
+        release: Mutex::new(when_released),
+    });
+    (held, when_entered, release)
+}
+
+impl HeldRelief {
+    /// Hold the worker's next background job, and fail it and every one
+    /// after it.
+    fn hold_and_fail(&self) {
+        self.failing.store(true, Ordering::Release);
+        self.armed.store(true, Ordering::Release);
+    }
+}
+
+/// A worker, two L0 tables at a stop of two, and the compaction that would
+/// relieve it held in flight in `held`: the stop is on, and its relief has
+/// not failed yet.
+fn stopped_with_the_compaction_held(
+    held: &Arc<HeldRelief>,
+    when_entered: &mpsc::Receiver<()>,
+) -> (tempfile::TempDir, Arc<RegolithEngine>) {
+    let dir = tempfile::TempDir::new().unwrap();
+    // Two L0 tables, written with no worker and nothing that compacts them.
+    {
+        let engine = RegolithEngine::open(
+            dir.path(),
+            EngineOptions {
+                max_background_compactions: 0,
+                l0_compaction_trigger: 100,
+                ..EngineOptions::default()
+            },
+        )
+        .unwrap();
+        for key in [b"k1", b"k2"] {
+            fill(&engine, key).unwrap();
+            engine.flush_active_memtable().unwrap();
+        }
+        engine.close().unwrap();
+    }
+    // Reopened with a worker whose only work is their compaction: no
+    // memtable is frozen, so the one job the limiter holds is that one.
+    held.hold_and_fail();
+    let engine = RegolithEngine::open(
+        dir.path(),
+        EngineOptions {
+            max_background_compactions: 1,
+            level0_stop_writes_trigger: 2,
+            l0_compaction_trigger: 2,
+            rate_limiter: Some(held.clone()),
+            ..EngineOptions::default()
+        },
+    )
+    .unwrap();
+    when_entered
+        .recv_timeout(DEADLINE)
+        .expect("the worker never started the compaction");
+    assert!(matches!(engine.stall_signal().classify(), Some((_, true))));
+    assert!(engine.background_health.failing(Job::Compaction).is_none());
+    (dir, engine)
+}
+
+/// Let the held job go, and return once the worker has recorded its failure
+/// and re-classified the stall after it: everything the failure does to the
+/// stall's unit is done by then.
+fn fail_the_held_relief(engine: &RegolithEngine, release: &mpsc::Sender<()>, relief: Job) {
+    let before = engine.stall_signal().progress();
+    release.send(()).unwrap();
+    let deadline = Instant::now() + DEADLINE;
+    while engine.stall_signal().progress() == before {
+        assert!(
+            Instant::now() < deadline,
+            "the worker never finished the failing job"
+        );
+        std::thread::yield_now();
+    }
+    assert!(
+        engine.background_health.failing(relief).is_some(),
+        "setup: the job failed"
+    );
+}
+
+/// A stopped write, run again while its relief is failing, gets the
+/// relief's failure, which is what a fresh write gets.
+fn assert_told_the_failing_relief(engine: &RegolithEngine, job: &str) {
+    match engine.admit_write(false) {
+        Err(Error::BackgroundFailed { job: failed, .. }) => assert_eq!(failed, job),
+        other => panic!("expected the {job} failure, got {other:?}"),
+    }
+}
+
+/// With a worker: a write waits for the compaction that would relieve the
+/// stop, the compaction fails, and the write is told then. A write that
+/// arrived after the failure was told already; the one that was waiting is
+/// told the same.
+#[test]
+fn a_failing_compaction_tells_the_write_that_waited_for_it() {
+    let (held, when_entered, release) = held_relief();
+    let (_dir, engine) = stopped_with_the_compaction_held(&held, &when_entered);
+    let wait = stopped_write(&engine);
+    assert!(!wait.is_ready());
+    fail_the_held_relief(&engine, &release, Job::Compaction);
+    assert!(
+        wait.is_ready(),
+        "the relief failed and the write that waited for it was not told"
+    );
+    assert_told_the_failing_relief(&engine, "compaction");
+}
+
+/// The same for a wait recorded on a queue: completed at that queue's poll.
+#[test]
+fn a_failing_compaction_completes_a_wait_on_a_queue_at_its_poll() {
+    let (held, when_entered, release) = held_relief();
+    let (_dir, engine) = stopped_with_the_compaction_held(&held, &when_entered);
+    let mut queue = engine.io_queue();
+    let wait = stopped_write(&engine);
+    assert_eq!(wait.queue(), Some(queue.id()));
+    queue.poll(IoBudget::ALL);
+    assert!(!wait.is_ready());
+    fail_the_held_relief(&engine, &release, Job::Compaction);
+    queue.poll(IoBudget::ALL);
+    assert!(
+        wait.is_ready(),
+        "the relief failed and the wait on the queue was not completed"
+    );
+    assert_told_the_failing_relief(&engine, "compaction");
+}
+
+/// With a worker and too many memtables: a write waits for the worker's
+/// flush, the flush fails, and the write is told then.
+#[test]
+fn a_failing_flush_tells_the_write_that_waited_for_the_worker() {
+    let (held, when_entered, release) = held_relief();
+    let dir = tempfile::TempDir::new().unwrap();
+    let engine = RegolithEngine::open(
+        dir.path(),
+        EngineOptions {
+            max_background_compactions: 1,
+            max_write_buffer_number: 2,
+            rate_limiter: Some(held.clone()),
+            ..EngineOptions::default()
+        },
+    )
+    .unwrap();
+    // The worker's first flush, whenever it starts, is held and then fails.
+    held.hold_and_fail();
+    // Three memtables sealed under the active one: the stop of four.
+    for key in [b"a", b"b", b"c"] {
+        fill(&engine, key).unwrap();
+        let _pipeline = engine.lock_pipeline();
+        engine.seal_active().unwrap();
+    }
+    engine.refresh_stall_level();
+    engine.flush_sealed_later();
+    when_entered
+        .recv_timeout(DEADLINE)
+        .expect("the worker never started the flush");
+    let wait = stopped_write(&engine);
+    assert_eq!(wait.reason(), crate::engine::STOP_TOO_MANY_MEMTABLES);
+    assert!(!wait.is_ready());
+    fail_the_held_relief(&engine, &release, Job::Flush);
+    assert!(
+        wait.is_ready(),
+        "the flush failed and the write that waited for it was not told"
+    );
+    assert_told_the_failing_relief(&engine, "flush");
+}
+
+/// The blocking form, through the public calls: a thread waits out the
+/// stall, the compaction that would relieve it fails, and the thread's
+/// write returns that failure, the one a fresh write gets, instead of
+/// waiting for a stop that will not clear.
+#[test]
+fn a_thread_waiting_out_a_stall_returns_the_failing_relief() {
+    let (held, when_entered, release) = held_relief();
+    let dir = tempfile::TempDir::new().unwrap();
+    // Two L0 tables, written with no worker and nothing that compacts them.
+    {
+        let db = Db::open(
+            dir.path(),
+            Options::default()
+                .max_background_compactions(0)
+                .l0_compaction_trigger(100),
+        )
+        .unwrap();
+        for key in [b"k1", b"k2"] {
+            db.put(key, b"v").unwrap();
+            db.flush().unwrap();
+        }
+        db.close().unwrap();
+    }
+    // Reopened with a worker whose only work is their compaction.
+    held.hold_and_fail();
+    let db = Db::open(
+        dir.path(),
+        Options::default()
+            .level0_slowdown_writes_trigger(2)
+            .level0_stop_writes_trigger(2)
+            .l0_compaction_trigger(2)
+            .rate_limiter(Some(held.clone())),
+    )
+    .unwrap();
+    when_entered
+        .recv_timeout(DEADLINE)
+        .expect("the worker never started the compaction");
+
+    let (told, when_told) = mpsc::channel();
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            let outcome = crate::through_stalls(|| db.put(b"stopped", b"v"));
+            told.send(outcome.map_err(|err| err.to_string())).unwrap();
+        });
+        // The write is stopped once the stall has its unit.
+        let deadline = Instant::now() + DEADLINE;
+        while !db.engine().stall_signal().has_unit() {
+            assert!(Instant::now() < deadline, "the write was never stopped");
+            std::thread::yield_now();
+        }
+        fail_the_held_relief(db.engine(), &release, Job::Compaction);
+        let outcome = when_told.recv_timeout(DEADLINE);
+        if outcome.is_err() {
+            // Closing completes every wait, so the thread ends and this
+            // test fails instead of hanging with it.
+            let _ = db.close();
+        }
+        let outcome = outcome.expect("the stopped write was still waiting after its relief failed");
+        let told = outcome.expect_err("the stop is on and its relief is failing");
+        assert!(told.contains("compaction"), "{told}");
+        assert_eq!(told, db.put(b"fresh", b"v").unwrap_err().to_string());
+    });
+}
+
+/// Holds the flush that calls it, once armed, until it is let go, and fails
+/// every flush while `failing` is set: a prefix extractor that panics in a
+/// background step fails that flush alone (`callback.rs`).
+struct FailingFlush {
+    armed: AtomicBool,
+    failing: AtomicBool,
+    entered: Mutex<mpsc::Sender<()>>,
+    release: Mutex<mpsc::Receiver<()>>,
+}
+
+impl PrefixExtractor for FailingFlush {
+    fn extract<'a>(&self, key: &'a [u8]) -> Option<&'a [u8]> {
+        if self.armed.swap(false, Ordering::AcqRel) {
+            let _ = self.entered.lock().unwrap().send(());
+            let _ = self.release.lock().unwrap().recv_timeout(DEADLINE);
+        }
+        if self.failing.load(Ordering::Acquire) {
+            panic!("the flush fails: a test's prefix extractor");
+        }
+        Some(key)
+    }
+
+    fn name(&self) -> &'static str {
+        "failing-flush"
+    }
+}
+
+/// No worker, inline compaction: a write whose own step finds another
+/// writer's owed flush in flight waits for that writer. The flush fails. The
+/// step that ran it hands the stop back whatever it came to, so the write
+/// looks again, runs the flush itself, and returns its failure.
+#[test]
+fn a_failing_owed_flush_tells_the_write_it_held_off() {
+    let (entered, when_entered) = mpsc::channel();
+    let (release, when_released) = mpsc::channel();
+    let held = Arc::new(FailingFlush {
+        armed: AtomicBool::new(false),
+        failing: AtomicBool::new(false),
+        entered: Mutex::new(entered),
+        release: Mutex::new(when_released),
+    });
+    let (_dir, engine) = stopped_engine_with(EngineOptions {
+        inline_compaction: true,
+        l0_compaction_trigger: 100,
+        write_buffer_size: 2 * 1024,
+        prefix_extractor: Some(held.clone()),
+        ..EngineOptions::default()
+    });
+    // Two 1 KiB puts fill the buffer, so the third seals it, and the step
+    // that write owes flushes it.
+    fill(&engine, b"a").unwrap();
+    fill(&engine, b"b").unwrap();
+    held.failing.store(true, Ordering::Release);
+    held.armed.store(true, Ordering::Release);
+    let wait = std::thread::scope(|scope| {
+        scope.spawn(|| fill(&engine, b"c").unwrap());
+        when_entered
+            .recv_timeout(DEADLINE)
+            .expect("the sealing write never flushed");
+        let wait = stopped_write(&engine);
+        assert!(!wait.is_ready());
+        release.send(()).unwrap();
+        wait
+    });
+    assert!(
+        engine.background_health.failing(Job::Flush).is_some(),
+        "setup: the owed flush failed"
+    );
+    assert!(
+        wait.is_ready(),
+        "the flush failed and the write it held off was not told"
+    );
+    assert_told_the_failing_relief(&engine, "flush");
+}
+
+/// The one place: recording a relief's failure lands the unit, so a write
+/// already waiting is told, as the one that arrives next is. Once the relief
+/// succeeds again, a stopped write waits as before, and is told when the
+/// stop clears.
+#[test]
+fn a_recorded_failure_lands_the_unit_and_a_recovered_relief_is_waited_for_again() {
+    let (_dir, engine) = stopped_engine_with(EngineOptions {
+        l0_compaction_trigger: 1,
+        ..EngineOptions::default()
+    });
+    let waiting = stopped_write(&engine);
+    assert!(!waiting.is_ready());
+    engine
+        .background_health
+        .record_failure(Job::Compaction, &std::io::Error::other("the relief fails"));
+    assert!(
+        waiting.is_ready(),
+        "the relief's failure was recorded and the waiting write was not told"
+    );
+    assert_told_the_failing_relief(&engine, "compaction");
+
+    engine.background_health.record_success(Job::Compaction);
+    let again = stopped_write(&engine);
+    assert!(
+        !again.is_ready(),
+        "the relief recovered: the stop is waited for"
+    );
+    engine.run_one_compaction_pass().unwrap();
+    assert!(again.is_ready(), "the pass cleared the stop");
+}
+
+/// The gap the re-read closes: a write found its relief working when it was
+/// stopped, and the failure landed the unit before the write registered on
+/// one. Registering reads the failure again, so the write is told it and no
+/// unit is left that nothing would land.
+#[test]
+fn a_wait_registered_after_the_relief_failed_is_told_and_leaves_no_unit() {
+    let (_dir, engine) = stopped_engine_with(EngineOptions {
+        l0_compaction_trigger: 1,
+        ..EngineOptions::default()
+    });
+    let Some((reason, true)) = engine.stall_signal().classify() else {
+        panic!("setup: the stop is on");
+    };
+    engine
+        .background_health
+        .record_failure(Job::Compaction, &std::io::Error::other("the relief fails"));
+    assert!(!engine.stall_signal().has_unit());
+    match engine.stall_wait(None, reason, None) {
+        Error::BackgroundFailed { job, .. } => assert_eq!(job, "compaction"),
+        other => panic!("expected the compaction failure, got {other:?}"),
+    }
+    assert!(!engine.stall_signal().has_unit());
+}
+
+/// The failure is read as a write that arrives now reads it: only under a
+/// stop. A write that registers after the stop cleared, with the relief's
+/// last failure still recorded, is handed a wait that is ready, runs again
+/// and goes in, as a fresh write does.
+#[test]
+fn a_wait_registered_after_the_stop_cleared_is_not_told_a_failure_a_fresh_write_is_not() {
+    let (_dir, engine) = stopped_engine_with(EngineOptions {
+        l0_compaction_trigger: 1,
+        ..EngineOptions::default()
+    });
+    let Some((reason, true)) = engine.stall_signal().classify() else {
+        panic!("setup: the stop is on");
+    };
+    engine
+        .background_health
+        .record_failure(Job::Compaction, &std::io::Error::other("the relief fails"));
+    // Another thread's pass clears the stop; nothing has cleared the
+    // recorded failure.
+    engine.run_one_compaction_pass().unwrap();
+    assert!(engine.stall_signal().classify().is_none());
+    assert!(engine.background_health.failing(Job::Compaction).is_some());
+    match engine.stall_wait(None, reason, None) {
+        Error::WouldBlock(WouldBlock::Stall(wait)) => assert!(wait.is_ready()),
+        other => panic!("expected a wait that is ready, got {other:?}"),
+    }
+    engine
+        .admit_write(false)
+        .expect("no stop: a fresh write goes in");
 }
