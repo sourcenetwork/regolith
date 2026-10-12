@@ -445,9 +445,11 @@ fn an_iterator_survives_the_compaction_that_unlinks_its_files() {
     let opts = opts.target_file_size(16 * 1024);
     let db = Db::open(dir.path(), opts).unwrap();
 
+    // Through stalls: a compaction worker that falls behind leaves this
+    // fill near the level-0 stop, and a stopped write waits for it.
     let total = 1_200usize;
     for i in 0..total {
-        db.put(&key_at(i), &stamped_value(1)).unwrap();
+        regolith::through_stalls(|| db.put(&key_at(i), &stamped_value(1))).unwrap();
     }
     // Land the whole view in files, so there is something to unlink.
     db.compact_range(None, None).wait().unwrap();
@@ -472,7 +474,7 @@ fn an_iterator_survives_the_compaction_that_unlinks_its_files() {
 
     // Rewrite everything underneath the half-consumed iterator.
     for i in 0..total {
-        db.put(&key_at(i), &stamped_value(2)).unwrap();
+        regolith::through_stalls(|| db.put(&key_at(i), &stamped_value(2))).unwrap();
     }
     db.compact_range(None, None).wait().unwrap();
 
