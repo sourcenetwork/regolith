@@ -177,6 +177,13 @@ impl std::task::Wake for Unpark {
 /// chose to block) waits on a [`crate::sync`] primitive. A wake that comes
 /// before the park is kept by the thread, so the park returns at once and
 /// nothing is lost.
+///
+/// Before each park the thread releases the read views its last read holds
+/// back ([`crate::engine::read_view::idle`]). The wait may be a long one (a
+/// whole table write behind the flush exclusion, a job behind the
+/// compaction gate), and whatever the thread read on its way here, inside
+/// the job or the flush that waits, would otherwise keep every view retired
+/// meanwhile alive until it resumes.
 #[cfg(not(any(loom, target_arch = "wasm32")))]
 pub(crate) fn block_on<F: core::future::Future>(future: F) -> F::Output {
     use core::task::{Context, Poll};
@@ -188,6 +195,7 @@ pub(crate) fn block_on<F: core::future::Future>(future: F) -> F::Output {
         if let Poll::Ready(output) = future.as_mut().poll(&mut cx) {
             return output;
         }
+        crate::engine::read_view::idle();
         std::thread::park();
     }
 }

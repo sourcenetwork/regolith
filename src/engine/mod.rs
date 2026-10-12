@@ -1100,6 +1100,12 @@ impl RegolithEngine {
         &self.compaction_gate
     }
 
+    /// Test-only: the scheduler, to hand a worker a job of the test's.
+    #[cfg(test)]
+    pub(crate) fn compaction_scheduler(&self) -> &CompactionScheduler {
+        &self.compaction
+    }
+
     /// Test-only: no compaction pass holds a claim.
     #[cfg(test)]
     pub(crate) fn compaction_claims_idle(&self) -> bool {

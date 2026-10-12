@@ -169,6 +169,22 @@ impl CompactionScheduler {
         Ok(())
     }
 
+    /// Test-only: run `work` on a worker, as a job in its next round.
+    #[cfg(test)]
+    pub(crate) fn run_on_worker(&self, work: impl FnOnce() + Send + 'static) {
+        struct OnWorker<F>(F);
+        impl<F: FnOnce() + Send> JobBody for OnWorker<F> {
+            fn run(self: Box<Self>) {
+                (self.0)();
+            }
+            fn release(self: Box<Self>) {}
+        }
+        assert!(
+            self.submit(Box::new(OnWorker(work))).is_ok(),
+            "no worker runs here"
+        );
+    }
+
     /// Whether background workers run here. Without one, a writer that
     /// seals a memtable or fills L0 owes the work itself (E9, E16).
     pub(crate) fn has_workers(&self) -> bool {
@@ -534,7 +550,9 @@ fn compaction_loop(
     loop {
         // About to idle: release the read views this thread's last pass
         // was holding back, so an idle worker never pins a replaced
-        // version's table descriptors.
+        // version's table descriptors. The waits inside a round (for the
+        // gate, for the flush exclusion) release them where they park
+        // (`sync::internal::block_on`).
         crate::engine::read_view::idle();
         // Wait for a trigger, or fall through on the periodic poll.
         // The gate is reopened before the pass runs, so a notification
@@ -553,10 +571,6 @@ fn compaction_loop(
             // One job a caller handed over: a call a caller holds a ticket
             // for. It takes the compaction gate alone, waiting here for the
             // passes other workers have in flight.
-            // The job may wait for the gate, and hold it for long: every
-            // view retired meanwhile would otherwise wait on this thread's
-            // reservation until it resumes.
-            crate::engine::read_view::idle();
             let ran_job = jobs.run_one();
             // Frozen memtables, oldest first: a flush feeds L0, and the
             // commit path left it to this thread (E9). Not held back by the
@@ -567,8 +581,6 @@ fn compaction_loop(
             // One compaction pass, holding the gate shared so that workers
             // run side by side.
             let did_work = backoff.ready(Instant::now()) && {
-                // A job holding the gate alone may keep this pass waiting.
-                crate::engine::read_view::idle();
                 let _pass = gate.shared();
                 match pick_and_run_compaction(
                     &versions,

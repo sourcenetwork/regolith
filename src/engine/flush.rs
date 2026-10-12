@@ -119,9 +119,8 @@ impl Flusher {
         let _background = InBackground::enter();
         loop {
             // The worker may wait here on a writer's or a checkpoint's
-            // flush, a whole table write: release the views its last read
-            // holds back first, as it does before every other wait.
-            super::read_view::idle();
+            // flush, a whole table write. The wait releases the views its
+            // last read holds back before it parks.
             let Ok(flushing) = self.flushing() else {
                 break;
             };
