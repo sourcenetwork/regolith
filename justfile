@@ -740,6 +740,8 @@ tla:
     check MC_CompactionGate_Green_Queue                GREEN
     check MC_CompactionGate_Green_Passes               GREEN
     check MC_CompactionGate_Green_Live                 GREEN
+    check MC_CompactionGate_Green_LiveWorker           GREEN
+    check MC_CompactionGate_Green_LiveCaller           GREEN
     check MC_CompactionGate_Red_OldGate                RED BoundedBypass
     check MC_CompactionGate_Red_NoHandoff              RED BoundedBypass
     check MC_CompactionGate_Red_DrainJobs              RED WorkerTakesTurns

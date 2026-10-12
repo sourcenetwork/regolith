@@ -89,8 +89,10 @@
 \*                     parks, one caller that waits on its own thread.
 \*   Green_Passes      two workers whose passes overlap, one caller: the
 \*                     fairness the other way round.
-\*   Green_Live        the worker's pass and every waiting job are served
-\*                     in the end, under fair scheduling.
+\*   Green_Live        the worker's pass gets its turn again and again,
+\*                     under fair scheduling.
+\*   Green_LiveWorker  the same run: a worker that waits gets in.
+\*   Green_LiveCaller  the same run: a caller that waits gets in.
 \*   Red_OldGate       the old rule "a waiting job holds every pass back".
 \*                     (Its file leaves out NoLostWake and
 \*                     OwedShutsBarging: they speak of a queue's front and
@@ -124,6 +126,9 @@ CONSTANTS
   \* queue has no such limit; a small one keeps the model finite while
   \* still letting a new job arrive every time the worker takes one.
   MaxJobs,
+  \* The threads whose wait for the gate must end, checked over whole runs
+  \* (EveryWaiterServed). Empty in a run that checks no such thing.
+  Watched,
   \* "none" for the real design, or the name of one planted defect.
   Mutant
 
@@ -137,6 +142,8 @@ None == "nobody"
 ASSUME Workers \cap Blockers = {} /\ Workers \cap Owners = {} /\ Blockers \cap Owners = {}
 \* "nobody" is not the name of a thread.
 ASSUME None \notin Threads
+\* Only threads of the model are watched.
+ASSUME Watched \subseteq Threads
 \* The bound and the queue limit are at least one.
 ASSUME Bound \in Nat \ {0} /\ MaxJobs \in Nat \ {0}
 \* Only the defects this module knows how to plant.
@@ -750,13 +757,15 @@ InsideMatches ==
     /\ (t \in shared \cup alone => pc[t] = "in" \/ (pc[t] = "queued" /\ handed[t]))
 
 ----------------------------------------------------------------------------
-\* WHAT MUST HAPPEN IN THE END (checked by Green_Live, under Fairness).
+\* WHAT MUST HAPPEN IN THE END (checked by Green_Live, Green_LiveWorker and
+\* Green_LiveCaller, under Fairness).
 
 \* E28 as a promise about the future: every worker's pass gets its turn
 \* again and again, however the jobs keep coming.
 WorkerAlwaysPasses == \A w \in Workers : []<>(w \in shared)
 
-\* Every thread that waits for the gate gets in.
-EveryWaiterServed == \A t \in Threads : (pc[t] = "queued") ~> (pc[t] = "in")
+\* Every watched thread that waits for the gate gets in. A check over whole
+\* runs costs time for every thread it follows, so a run watches one.
+EveryWaiterServed == \A t \in Watched : (pc[t] = "queued") ~> (pc[t] = "in")
 
 ====
