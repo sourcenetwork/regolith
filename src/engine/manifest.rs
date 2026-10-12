@@ -1223,8 +1223,10 @@ impl VersionSet {
                 version.levels[level].push(LiveSst::new(meta, reader));
             }
         }
-        // The log is untrusted input, and a level that is not one sorted run
-        // cannot be searched, so a manifest that says so is refused.
+        // Every level left below L0 is one sorted run now: the repair above
+        // moved the ones that were not. A read finds a key's tables in such
+        // a level by binary search and in no other, and the log is untrusted
+        // input, so this is checked rather than taken from the repair.
         if let Some((level, left, right)) = version.find_overlap() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
