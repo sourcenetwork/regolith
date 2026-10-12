@@ -89,19 +89,25 @@ fn explore(
 
 /// A model whose three threads all contend for one lock or semaphore.
 /// The normal run explores it at preemption bound 1; an `#[ignore]`d twin
-/// explores it at bound 2, which takes hours, so it runs nightly (`just
-/// loom-sync-deep`).
+/// explores it at bound 2, which takes 43 to 79 minutes a model, so it runs
+/// nightly (`just loom-sync-deep`). A twin may name a smaller scenario of
+/// its own where the shared one does not finish at bound 2.
 macro_rules! contended {
     ($name:ident, $deep:ident, $min:literal, $model:expr) => {
+        contended!($name, $deep, $min, $model, $model);
+    };
+    // With a model of its own for the twin, where the shared one does not
+    // finish at bound 2.
+    ($name:ident, $deep:ident, $min:literal, $model:expr, $deep_model:expr) => {
         #[test]
         fn $name() {
             explore(stringify!($name), 1, $min, $model);
         }
 
         #[test]
-        #[ignore = "preemption bound 2 takes hours: run nightly by `just loom-sync-deep`"]
+        #[ignore = "preemption bound 2 takes up to 79 minutes a model: run nightly by `just loom-sync-deep`"]
         fn $deep() {
-            explore(stringify!($deep), 2, $min, $model);
+            explore(stringify!($deep), 2, $min, $deep_model);
         }
     };
 }
@@ -346,6 +352,34 @@ contended!(
         bump(&block_on(lock.write()));
         upgrader.join().expect("upgrader");
         reader.join().expect("reader");
+        assert_eq!(read(&lock.try_write().expect("free")), 2);
+    },
+    // The bound-2 twin runs a smaller scenario. The one above did not finish
+    // at bound 2 (a run was stopped after 33 hours): three threads each park
+    // and wake on the lock, and two preemptions among them is too many
+    // interleavings. Here the upgradable read is held from the start, so no
+    // thread waits for it, and the reader only tries (`try_read`), so it
+    // never parks. What still races at bound 2 is the upgrade against a
+    // reader coming or going and against a writer queued behind it, with
+    // every wake the upgrade and the writer owe each other. Measured: 171149
+    // interleavings in 10 s. With a blocking reader in place of the trying
+    // one it did not finish in 30 minutes.
+    || {
+        let lock = Arc::new(RwLock::new(UnsafeCell::new(0usize)));
+        let upgradable = lock.try_upgradable_read().expect("free");
+        let reader = {
+            let lock = Arc::clone(&lock);
+            thread::spawn(move || {
+                let _ = lock.try_read().map(|shared| read(&shared));
+            })
+        };
+        let writer = {
+            let lock = Arc::clone(&lock);
+            thread::spawn(move || bump(&block_on(lock.write())))
+        };
+        bump(&block_on(upgradable.upgrade()));
+        reader.join().expect("reader");
+        writer.join().expect("writer");
         assert_eq!(read(&lock.try_write().expect("free")), 2);
     }
 );
