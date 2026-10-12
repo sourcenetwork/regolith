@@ -574,7 +574,7 @@ tla:
     check MC_WalRotation_Green                         GREEN
     check MC_WalRotation_Red_NoSync                    RED RecoversPrefix
     check MC_WalRotation_Red_NoSync_Gap                RED NoGap
-    # Plan 3.6, commit-ordered append (supersedes defradb.rs #1911). Each
+    # Plan 3.6, commit-ordered append. Each
     # Teeth row is GREEN: its mutant breaks nothing but its RED's invariant.
     # Lean: Regolith/Append.lean, dense_from_one, unique_positions,
     # at_most_once, commit_order, snapshot_sees_prefix.
