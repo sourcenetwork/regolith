@@ -20,3 +20,5 @@
 /// picked up as test binaries of their own.
 #[path = "caller_traits/rate_limiter.rs"]
 mod rate_limiter;
+#[path = "caller_traits/ttl_filter.rs"]
+mod ttl_filter;

@@ -54,16 +54,17 @@ impl std::fmt::Debug for DbWithTtl {
 
 impl DbWithTtl {
     /// Open or create a TTL-enabled database at `path`. The caller's
-    /// `opts` are forwarded to [`Db::open`] with one override: the
-    /// compaction filter slot is replaced with a [`TtlCompactionFilter`]
-    /// bound to `ttl_seconds`. Any user-supplied filter is dropped and
-    /// logged via `tracing::warn`.
+    /// `opts` are forwarded to [`Db::open`] with one change: a
+    /// [`TtlCompactionFilter`] bound to `ttl_seconds` is installed in the
+    /// compaction filter slot.
+    ///
+    /// A [`crate::CompactionFilter`] the caller set in `opts` keeps
+    /// running behind it. A value that has expired is removed without
+    /// asking it. Every other value is shown to it as the caller wrote it,
+    /// without the timestamp the database keeps behind it, and a value it
+    /// changes keeps the time it was written at. Its range deletes reach
+    /// it unchanged.
     pub fn open<P: AsRef<Path>>(path: P, mut opts: Options, ttl_seconds: u64) -> Result<Self> {
-        if opts.compaction_filter.is_some() {
-            tracing::warn!(
-                "DbWithTtl::open replaces the caller's compaction_filter with TtlCompactionFilter"
-            );
-        }
         // Every value carries a wall-clock stamp, so an environment
         // without a wall clock cannot serve this wrapper at all. Say
         // so at open rather than stamping every write with the epoch
@@ -77,6 +78,7 @@ impl DbWithTtl {
         opts.compaction_filter = Some(Arc::new(TtlCompactionFilter {
             ttl_seconds,
             env: Arc::clone(&env),
+            callers: opts.compaction_filter.take(),
         }));
         let inner = Db::open(path, opts)?;
         Ok(Self {
@@ -264,10 +266,6 @@ fn stamp(value: &[u8], ts: u64) -> Vec<u8> {
     out
 }
 
-fn timestamp_of(stamped: &[u8]) -> Option<u64> {
-    decode_ttl_suffix(stamped).map(|decoded| decoded.timestamp)
-}
-
 /// Seconds since the Unix epoch from the standard environment.
 #[cfg(test)]
 fn now_seconds() -> u64 {
@@ -307,6 +305,9 @@ fn decode_ttl_suffix(stamped: &[u8]) -> Option<DecodedTtlSuffix> {
 pub struct TtlCompactionFilter {
     ttl_seconds: u64,
     env: Arc<dyn Env>,
+    /// The filter the caller set on a [`DbWithTtl`], asked about every
+    /// value this one does not expire.
+    callers: Option<Arc<dyn CompactionFilter>>,
 }
 
 impl TtlCompactionFilter {
@@ -324,31 +325,58 @@ impl TtlCompactionFilter {
     /// filter is installed on, so compaction and the read path agree
     /// on what "now" means.
     pub fn with_env(ttl_seconds: u64, env: Arc<dyn Env>) -> Self {
-        Self { ttl_seconds, env }
-    }
-}
-
-impl CompactionFilter for TtlCompactionFilter {
-    fn filter(&self, _level: usize, _key: &[u8], value: &[u8]) -> CompactionDecision {
-        if self.ttl_seconds == 0 {
-            return CompactionDecision::Keep;
+        Self {
+            ttl_seconds,
+            env,
+            callers: None,
         }
-        let Some(ts) = timestamp_of(value) else {
-            return CompactionDecision::Keep;
-        };
+    }
+
+    /// Whether a value stamped `ts` has outlived the TTL.
+    fn expired(&self, ts: u64) -> bool {
+        if self.ttl_seconds == 0 {
+            return false;
+        }
         // No wall clock means nothing can be shown to have expired,
         // so everything is kept. Dropping data on a guess is the one
         // outcome this filter must never produce.
         let Some(now) = self.env.unix_secs() else {
-            return CompactionDecision::Keep;
+            return false;
         };
         // Saturating arithmetic so a clock skew into the past does
         // not accidentally expire everything.
-        let horizon = now.saturating_sub(self.ttl_seconds);
-        if ts < horizon {
-            CompactionDecision::Remove
-        } else {
-            CompactionDecision::Keep
+        ts < now.saturating_sub(self.ttl_seconds)
+    }
+}
+
+impl CompactionFilter for TtlCompactionFilter {
+    fn filter(&self, level: usize, key: &[u8], value: &[u8]) -> CompactionDecision {
+        let stamp = decode_ttl_suffix(value);
+        if stamp.as_ref().is_some_and(|s| self.expired(s.timestamp)) {
+            return CompactionDecision::Remove;
+        }
+        let Some(callers) = &self.callers else {
+            return CompactionDecision::Keep;
+        };
+        // The caller's filter is shown the value the caller wrote: what is
+        // in front of the stamp, or all of it for a value written past this
+        // wrapper, which has none.
+        let written = stamp.as_ref().map_or(value.len(), |s| s.value_len);
+        match callers.filter(level, key, &value[..written]) {
+            // A value the caller's filter rewrites is still this entry: it
+            // keeps the stamp it was written with.
+            CompactionDecision::Change(mut changed) => {
+                changed.extend_from_slice(&value[written..]);
+                CompactionDecision::Change(changed)
+            }
+            decision => decision,
+        }
+    }
+
+    fn filter_range_delete(&self, level: usize, start: &[u8], end: &[u8]) -> CompactionDecision {
+        match &self.callers {
+            Some(callers) => callers.filter_range_delete(level, start, end),
+            None => CompactionDecision::Keep,
         }
     }
 
@@ -521,7 +549,8 @@ mod tests {
     fn test_ttl_timestamp_uses_u64_encoding() {
         let far_future = u32::MAX as u64 + 100;
         let stamped = stamp(b"future", far_future);
-        assert_eq!(timestamp_of(&stamped), Some(far_future));
+        let decoded = decode_ttl_suffix(&stamped).expect("a stamped value");
+        assert_eq!(decoded.timestamp, far_future);
         assert_eq!(strip_timestamp(&stamped), Some(b"future".as_slice()));
     }
 
