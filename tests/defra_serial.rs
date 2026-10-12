@@ -42,8 +42,8 @@ use std::sync::Arc;
 use common::parted::{PARTS, Parted, add, parts_of, value};
 use proptest::prelude::*;
 use regolith::{
-    Db, IsolationLevel, KeyClass, KeyClassifier, LogLayout, OptimisticTransactionDb, Options,
-    ScanCheck, ScanDirection, Transaction, TransactionError, TxnOptions,
+    Db, IsolationLevel, KeyClass, KeyClassifier, LogLayout, MemEnv, OptimisticTransactionDb,
+    Options, ScanCheck, ScanDirection, Transaction, TransactionError, TxnOptions,
 };
 
 const KEYS: usize = 3;
@@ -532,15 +532,18 @@ fn run_schedule(
     actions: &[Action],
 ) -> Result<(), TestCaseError> {
     let dir = tempfile::tempdir().unwrap();
-    let db = OptimisticTransactionDb::open(
-        dir.path(),
-        Options::default().merge_operator(Some(Arc::new(Parted))),
-    )
-    .unwrap();
+    let options = Options::default().merge_operator(Some(Arc::new(Parted)));
     let db = if classified {
-        db.with_policy(Arc::new(Classes))
+        // In memory: the classes are rules of the commit, and a schedule of
+        // flushes and compactions exercises them the same without a disk.
+        let options = options
+            .env(Arc::new(MemEnv::new()))
+            .max_background_compactions(0);
+        OptimisticTransactionDb::open(dir.path(), options)
+            .unwrap()
+            .with_policy(Arc::new(Classes))
     } else {
-        db
+        OptimisticTransactionDb::open(dir.path(), options).unwrap()
     };
     for (key, parts) in seeded.iter().enumerate() {
         if let Some(parts) = parts {
