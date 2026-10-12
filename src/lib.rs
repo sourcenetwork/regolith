@@ -3308,6 +3308,9 @@ mod write_limit_tests;
 #[cfg(all(test, not(target_family = "wasm")))]
 mod cf_race_tests;
 
+#[cfg(all(test, not(target_family = "wasm")))]
+mod prefix_form_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
