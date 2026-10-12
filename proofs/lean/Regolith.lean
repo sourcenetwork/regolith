@@ -156,7 +156,9 @@ import Regolith.EnvFilesRename
 -- stopped writers from relieving, so no writer waits on a stall nobody will
 -- land. E35: an engine that latches lands the stall's unit, and a rotation
 -- counts its progress whether its seal went through or failed, so no writer
--- waits on a latched engine. Backs `proofs/tla/StallRelief.tla`.
+-- waits on a latched engine. E36: recording the failure of the work that
+-- relieves a stop lands the unit too, so a writer that was waiting is told
+-- what a fresh write is told. Backs `proofs/tla/StallRelief.tla`.
 import Regolith.StallRelief
 -- E15: waiting for the last snapshot. A sleeping waiter always has a pin
 -- still held or a release on its way to wake it, and on a target with one

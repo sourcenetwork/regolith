@@ -455,5 +455,9 @@ mod tests {
 mod failure_tests;
 
 #[cfg(all(test, not(loom)))]
+#[path = "stall_latch_tests.rs"]
+mod latch_tests;
+
+#[cfg(all(test, not(loom)))]
 #[path = "stall_rollback_tests.rs"]
 mod rollback_tests;
