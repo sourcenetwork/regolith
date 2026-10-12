@@ -94,7 +94,7 @@ impl RawSemaphore {
             };
             let next = (state & FLAGS) | (permits << SHIFT);
             if state & QUEUED != 0 {
-                Step::Drain(next | WAKE_FRONT)
+                Step::Wake(next | WAKE_FRONT)
             } else {
                 Step::Set(next)
             }
