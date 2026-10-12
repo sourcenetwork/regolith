@@ -14,7 +14,9 @@ pub(crate) mod compaction;
 pub(crate) mod compaction_backoff;
 pub(crate) mod compaction_gate;
 pub(crate) mod disk_check;
+mod drain;
 pub(crate) mod filter_block;
+pub(crate) mod filter_call;
 mod flush;
 mod foreground;
 pub(crate) mod index_block;
@@ -32,9 +34,14 @@ pub(crate) mod lookup_key;
 pub mod loom_model;
 pub(crate) mod manifest;
 pub(crate) mod memtable;
+pub(crate) mod merge_call;
 pub(crate) mod open_transactions;
 pub(crate) mod orphan_sweep;
+#[cfg(all(test, not(loom)))]
+mod park_support;
 pub(crate) mod pending_outputs;
+#[cfg(all(test, not(loom)))]
+mod poll_park_tests;
 pub(crate) mod range_tombstone;
 pub(crate) mod read_horizon;
 mod read_rule;
@@ -81,6 +88,7 @@ pub(crate) use commit::{NowaitCommit, PendingCommit, TxnCommit, conclude_settled
 use commit::{Pipeline, StallSignal};
 use compaction::{Claims, CompactionOptions, CompactionOutcome, CompactionScheduler};
 use compaction_gate::{CompactionGate, Exclusive};
+use drain::ActiveFlush;
 pub(crate) use foreground::Work;
 use lookup_key::{LookupKey, with_key_scratch};
 use manifest::{VersionEdit, VersionSet};
@@ -161,23 +169,6 @@ fn grouped_batch_ops(
         ops.push(WriteBatchOp::Merge { key, operand });
     }
     ops
-}
-
-/// Fold `operands`, oldest first, onto `base` with `op`. A read of the
-/// database and a transaction's read of its own merges both go through here,
-/// so both fail the same way when the operator declines.
-pub(crate) fn apply_merge(
-    op: &dyn crate::options::MergeOperator,
-    key: &[u8],
-    base: Option<&[u8]>,
-    operands: &[&[u8]],
-) -> std::io::Result<Vec<u8>> {
-    op.full_merge(key, base, operands).ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("merge operator {} failed for key", op.name()),
-        )
-    })
 }
 
 /// A key a commit validates because the transaction read it: the key and
@@ -1277,6 +1268,12 @@ impl RegolithEngine {
         self.options.statistics.clone()
     }
 
+    /// The statistics `Arc` exactly as the caller configured it, for
+    /// [`crate::Db::statistics`] to hand back.
+    pub(crate) fn statistics_shared(&self) -> Option<&Arc<crate::statistics::Statistics>> {
+        self.options.statistics.as_ref()
+    }
+
     /// The table of units and jobs in flight, and the registry of open
     /// queues, for this database.
     pub(crate) fn io(&self) -> &io::IoRuntime {
@@ -1292,6 +1289,7 @@ impl RegolithEngine {
         crate::IoQueue::open(
             Arc::clone(&self.cache),
             self.options.block_size.saturating_mul(IO_QUEUE_BLOCKS),
+            Arc::clone(&self.env),
         )
     }
 
@@ -1348,6 +1346,11 @@ impl RegolithEngine {
     /// were still outstanding when `timeout` elapsed.
     pub(crate) fn wait_for_snapshots(&self, timeout: std::time::Duration) -> u64 {
         self.snapshot_registry.wait_until_drained(timeout)
+    }
+
+    /// The same wait for a task: over once no snapshot is pinned.
+    pub(crate) fn snapshots_drained(&self) -> impl Future<Output = ()> + '_ {
+        self.snapshot_registry.until_drained()
     }
 
     /// Construct a streaming iterator over the latest published read
@@ -1806,7 +1809,7 @@ impl RegolithEngine {
             });
         }
 
-        apply_merge(merge_op.as_ref(), key, base_slice, &operands_owned)
+        merge_call::apply_merge(merge_op.as_ref(), key, base_slice, &operands_owned)
             .map(|merged| Some(DbSlice::from_vec(merged)))
     }
 
@@ -2066,25 +2069,45 @@ impl RegolithEngine {
     /// may be the one that holds it, and a caller's call waits for no other
     /// thread (plan 4.10).
     pub(crate) fn run_one_compaction_pass(&self) -> std::io::Result<CompactionOutcome> {
+        // A call that waits always gets an outcome.
+        self.compaction_pass(commit::Help::Wait)
+            .map(|outcome| outcome.unwrap_or(CompactionOutcome::Contended))
+    }
+
+    /// [`Self::run_one_compaction_pass`] for a caller that says what it does
+    /// about waits. A pass hands sections to the version store's step (a
+    /// file id per output, the install): a call that waits lets them wait
+    /// for the step's work under way, and a queue's poll takes the step
+    /// before the pass begins. `None` when the poll parked instead, with
+    /// its waker registered on the step and nothing held.
+    pub(crate) fn compaction_pass(
+        &self,
+        help: commit::Help<'_>,
+    ) -> std::io::Result<Option<CompactionOutcome>> {
         self.ensure_writable()?;
         let outcome = {
             let Some(_pass) = self.compaction_gate.try_shared() else {
-                return Ok(CompactionOutcome::Contended);
+                return Ok(Some(CompactionOutcome::Contended));
+            };
+            let Some(kept) = self.keep(commit::Needs::VERSIONS, help) else {
+                return Ok(None);
             };
             self.ensure_writable()?;
-            compaction::pick_and_run_compaction(
+            let outcome = compaction::pick_and_run_compaction(
                 &self.versions,
                 &self.sst_dir,
                 &self.cache,
                 &self.options.to_compaction_options(),
                 &self.snapshot_registry,
                 &self.compaction_claims,
-            )?
+            );
+            self.unkeep(kept);
+            outcome?
         };
         // As a worker does after each pass: writers a stop stopped are told
         // once the pass relieved it.
         self.refresh_stall_level();
-        Ok(outcome)
+        Ok(Some(outcome))
     }
 
     /// Write every memtable currently held in memory out to level-0
@@ -2260,7 +2283,11 @@ impl RegolithEngine {
                 break Ok(());
             };
             let seen = self.stall_signal.progress();
-            match self.run_one_background_step()? {
+            // This thread has no queue and chose to wait: its step waits.
+            match self
+                .run_one_background_step(commit::Help::Wait)?
+                .unwrap_or(CompactionOutcome::Contended)
+            {
                 CompactionOutcome::DidWork => {
                     idle = 0;
                     passes += 1;
@@ -2476,68 +2503,11 @@ impl RegolithEngine {
         })
     }
 
-    /// Seal the active memtable and flush it, and every frozen one before
-    /// it, on this thread: what `compact_range` needs before it reads L0.
-    /// The seal takes its turn through the commit pipeline; the flush runs
-    /// after it, off the pipeline. `needed` is asked again in the ordered
-    /// step, so a memtable another call sealed meanwhile is left alone.
-    fn rotate_memtable(
-        &self,
-        needed: impl Fn(&RegolithEngine, &MemTable) -> bool + Send + 'static,
-    ) -> std::io::Result<()> {
-        let sealed = self.ordered_needing(commit::Needs::VERSIONS, move |engine, ord| {
-            if needed(engine, ord.active()) {
-                ord.seal(true).map(Some)
-            } else {
-                Ok(None)
-            }
-        })?;
-        let Some(sealed) = sealed else {
-            return Ok(());
-        };
-        let flushed = self.flush_until_retired(&sealed);
-        // Even when the flush failed: the memtable it left frozen counts
-        // toward the stall thresholds, and skipping the refresh would let
-        // writers keep sealing memtables, without back-pressure, for as
-        // long as flushes keep failing.
-        self.refresh_stall_level();
-        flushed
-    }
-
     /// Move the active memtable to the frozen list behind a fresh one and
     /// a fresh WAL, in the ordered step, and return it.
     #[cfg(test)]
     pub(crate) fn seal_active(&self) -> std::io::Result<Arc<MemTable>> {
         self.ordered_needing(commit::Needs::VERSIONS, |_, ord| ord.seal(true))
-    }
-
-    /// Flush frozen memtables, oldest first, until `target` is no
-    /// longer in the frozen list.
-    ///
-    /// The caller names the memtable it needs durable rather than a
-    /// count of passes, so a concurrent rotation cannot extend the work
-    /// and a concurrent flush that already retired the target ends it
-    /// early. Each pass takes the oldest frozen memtable, whoever asked:
-    /// L0 files carry no sequence of their own and readers take the
-    /// most recently added as the newest, so flushing out of order would
-    /// publish an older file over a newer one and make a read travel
-    /// backwards.
-    ///
-    /// Each pass takes the `flushing` exclusion and releases it before the
-    /// next.
-    fn flush_until_retired(&self, target: &Arc<MemTable>) -> std::io::Result<()> {
-        while self
-            .view
-            .load()
-            .frozen
-            .iter()
-            .any(|mt| Arc::ptr_eq(mt, target))
-        {
-            if !self.flush_oldest_frozen(&self.flusher.flushing()?)? {
-                break;
-            }
-        }
-        Ok(())
     }
 
     /// Write the oldest frozen memtable out to an L0 SSTable and retire
@@ -2552,40 +2522,42 @@ impl RegolithEngine {
         Ok(flushed)
     }
 
-    /// Synchronously compact SSTables overlapping the user-key range
-    /// `[start, end)` down to the bottommost non-empty level.
+    /// The first part of a `compact_range`: the drain that brings the
+    /// memtables to L0, so in-memory data that overlaps the range is there
+    /// before the passes pick their inputs. `None` when nothing is in
+    /// memory. "Data" includes range tombstones, and a log sealed under a
+    /// key other than the current one is rotated away even when its
+    /// memtable is empty, so a full compaction leaves no file naming a
+    /// rotated key.
     ///
-    /// - The caller holds the compaction gate alone (`_gate`), so no
-    ///   compaction pass picks an overlapping input set meanwhile. It is
-    ///   held before the flush below, in the gate -> pipeline order an
-    ///   ingest and `drop_all` take too.
-    /// - Flushes the active memtable first so any matching in-memory
-    ///   data reaches L0 before compaction picks inputs.
-    /// - Walks levels 0..MAX_LEVELS-1, picking range-overlapping files
-    ///   and merging them into the next level.
-    pub(crate) fn compact_range(
+    /// The caller holds the compaction gate alone, before this drain, in
+    /// the gate -> pipeline order an ingest and `drop_all` take too.
+    pub(crate) fn compact_range_drain(&self) -> std::io::Result<Option<drain::Drain>> {
+        self.ensure_writable()?;
+        let needs_flush = |engine: &RegolithEngine, mt: &MemTable| {
+            !mt.is_empty() || mt.has_range_tombstones() || engine.wal_key_is_stale()
+        };
+        Ok(needs_flush(self, &self.view.load().active).then(|| self.drain_active_if(needs_flush)))
+    }
+
+    /// The second part of a `compact_range`, after its drain: compact the
+    /// tables overlapping the user-key range `[start, end)` down to the
+    /// bottommost non-empty level, on this thread.
+    ///
+    /// The caller holds the compaction gate alone, so no compaction pass
+    /// picks an overlapping input set meanwhile. Every pass hands sections
+    /// to the version store's step (a file id per output, the install), so
+    /// a queue's poll holds the step for the length of this call.
+    ///
+    /// Walks levels 0..MAX_LEVELS-1, picking range-overlapping files and
+    /// merging them into the next level.
+    pub(crate) fn compact_range_levels(
         &self,
-        _gate: &Exclusive,
         start: Option<&[u8]>,
         end: Option<&[u8]>,
     ) -> std::io::Result<()> {
         self.ensure_writable()?;
-
-        // 2. Flush the active memtable so any in-memory data that
-        //    overlaps the range is materialized in L0. We only touch
-        //    the write lock if there's actually data to flush. "Data"
-        //    here includes range tombstones, not just point entries.
-        // A log sealed under a key other than the current one is rotated
-        // away even when its memtable is empty, so a full compaction leaves
-        // no file naming a rotated key.
-        let needs_flush = |engine: &RegolithEngine, mt: &MemTable| {
-            !mt.is_empty() || mt.has_range_tombstones() || engine.wal_key_is_stale()
-        };
-        if needs_flush(self, &self.view.load().active) {
-            self.rotate_memtable(needs_flush)?;
-        }
-
-        // 3. Run the level-by-level push-down.
+        // Run the level-by-level push-down.
         let compaction_opts = self.options.to_compaction_options();
         // Under FIFO compaction there is no level push-down; a
         // synchronous compact_range just flushes the memtable and
@@ -2670,8 +2642,16 @@ impl RegolithEngine {
     /// waiting on a background flush would be missing from the result
     /// entirely.
     pub(crate) fn checkpoint_drain(&self) -> std::io::Result<()> {
+        let mut drain = self.checkpoint_drain_start()?;
+        self.drain_advance(&mut drain, commit::Help::Wait)
+            .map(|_| ())
+    }
+
+    /// [`Self::checkpoint_drain`] as a drain its caller advances: a job a
+    /// queue's poll runs, which may park in it.
+    pub(crate) fn checkpoint_drain_start(&self) -> std::io::Result<drain::Drain> {
         self.ensure_writable()?;
-        self.drain_memtables(ActiveFlush::Always)
+        Ok(self.drain_all(ActiveFlush::Always))
     }
 
     /// [`Self::checkpoint_drain`] and [`Self::checkpoint_capture`] on this
@@ -3161,21 +3141,6 @@ impl RegolithEngine {
         self.drain_memtables(ActiveFlush::WhenFull)
     }
 
-    /// Flush frozen memtables until none remain, and the active one
-    /// according to `active`.
-    ///
-    /// [`ActiveFlush::Always`] is what a checkpoint needs: it captures
-    /// the SSTables the current version names and copies no WAL, so any
-    /// write still sitting in a memtable would be absent from the
-    /// result. Sealing without waiting is not enough either, because a
-    /// sealed memtable is flushed by a background worker and the capture
-    /// would race it.
-    /// Whether no memtable holds anything a flush would write out.
-    ///
-    /// The postcondition of [`Self::drain_memtables`] with
-    /// [`ActiveFlush::Always`], and what a checkpoint depends on: the
-    /// capture names SSTables, so anything left in a memtable would be
-    /// absent from it.
     /// Rewrite the manifest now, the way growth does on its own.
     #[cfg(test)]
     pub(crate) fn force_manifest_rewrite(&self) -> std::io::Result<()> {
@@ -3188,57 +3153,14 @@ impl RegolithEngine {
         self.view.load().frozen.len()
     }
 
+    /// Whether no memtable holds anything a flush would write out: the
+    /// postcondition of a drain with [`ActiveFlush::Always`], and what a
+    /// checkpoint depends on.
     #[cfg(test)]
     pub(crate) fn memtables_hold_no_data(&self) -> bool {
         let view = self.view.load();
         view.frozen.is_empty() && view.active.is_empty() && !view.active.has_range_tombstones()
     }
-
-    fn drain_memtables(&self, active: ActiveFlush) -> std::io::Result<()> {
-        // The set to drain is fixed here and never extended. A drain that
-        // re-read the view each pass would chase memtables that writers
-        // created after it started, and under a steady write load it
-        // would never finish: `Db::checkpoint` calls this with
-        // `ActiveFlush::Always`, so a checkpoint taken while anything is
-        // writing would hang rather than capture.
-        let seals = commit::Needs::VERSIONS;
-        let targets: Vec<Arc<MemTable>> = self.ordered_needing(seals, move |engine, ord| {
-            let view = engine.view.load();
-            let seal_active = match active {
-                ActiveFlush::WhenFull => memtable_needs_flush(&view.active),
-                ActiveFlush::Always => {
-                    !view.active.is_empty() || view.active.has_range_tombstones()
-                }
-            };
-            let mut targets = view.frozen.clone();
-            drop(view);
-            if seal_active {
-                // Sealed without the writable check: a drain for close runs
-                // with the database already closing.
-                targets.push(ord.seal(false)?);
-            }
-            Ok(targets)
-        })?;
-        if targets.is_empty() {
-            return Ok(());
-        }
-
-        // Oldest first, which is also the order `flush_until_retired`
-        // writes them in, so a target that an earlier pass already
-        // flushed costs one list scan and no work.
-        for target in &targets {
-            self.flush_until_retired(target)?;
-        }
-        Ok(())
-    }
-}
-
-/// Whether a drain must flush the active memtable unconditionally, or
-/// only once it has grown past the write buffer.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum ActiveFlush {
-    WhenFull,
-    Always,
 }
 
 /// A consistent snapshot of on-disk state captured by

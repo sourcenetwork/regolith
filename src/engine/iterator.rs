@@ -70,6 +70,7 @@ use super::internal_key::{
 use super::lookup_key::LookupKey;
 use super::manifest::Version;
 use super::memtable::MemTable;
+use super::merge_call::apply_merge;
 use super::range_tombstone::{RangeTombstone, RangeTombstoneSet};
 use super::sstable::{LiveSst, SsTableBlockCursor, SsTableReader};
 use crate::DbSlice;
@@ -2068,13 +2069,7 @@ impl RegolithIterator {
             .rev()
             .map(|v| v.as_slice())
             .collect();
-        match merge_op.full_merge(user_key, base.as_deref(), &operand_refs) {
-            Some(v) => Ok(Some(v)),
-            None => Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("merge operator {} failed", merge_op.name()),
-            )),
-        }
+        apply_merge(merge_op.as_ref(), user_key, base.as_deref(), &operand_refs).map(Some)
     }
 
     /// Walk the merging iterator **backward** until we find a user key
@@ -2151,16 +2146,13 @@ impl RegolithIterator {
             };
             let operand_refs: Vec<&[u8]> = operand_slice.iter().map(|e| e.2.as_slice()).collect();
             let base_bytes = base.as_ref().map(DbSlice::as_slice);
-            match merge_op.full_merge(&group, base_bytes, &operand_refs) {
-                Some(v) => {
+            match apply_merge(merge_op.as_ref(), &group, base_bytes, &operand_refs) {
+                Ok(v) => {
                     self.reverse_curr = Some((group, DbSlice::from_vec(v)));
                     return;
                 }
-                None => {
-                    self.error = Some(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("merge operator {} failed", merge_op.name()),
-                    ));
+                Err(declined) => {
+                    self.error = Some(declined);
                     self.reverse_curr = None;
                     return;
                 }

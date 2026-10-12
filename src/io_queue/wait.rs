@@ -348,6 +348,33 @@ impl Future for LockWait {
     }
 }
 
+/// A timed wait recorded on a queue ([`IoRuntime::timer`]): ready once the
+/// queue's poll finds the database's clock at the wait's due time. Not
+/// handed to a caller: it is the pause a
+/// [`transact_async`](crate::OptimisticTransactionDb::transact_async)
+/// attempt takes before a re-run.
+///
+/// [`IoRuntime::timer`]: crate::engine::io::IoRuntime::timer
+pub(crate) struct Pause {
+    listen: Listen,
+}
+
+impl Pause {
+    pub(crate) fn new(slot: Arc<WaitSlot>) -> Self {
+        Self {
+            listen: Listen::new(slot),
+        }
+    }
+}
+
+impl Future for Pause {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        self.get_mut().listen.poll(cx)
+    }
+}
+
 /// Run a write `call` until no write stall stops it: on
 /// [`WouldBlock::Stall`], block this thread until the stall clears
 /// ([`StallWait::wait`]) and call again. Any other outcome is returned.
@@ -360,10 +387,11 @@ impl Future for LockWait {
 /// on a thread with no queue relieves it inside the write itself, and
 /// otherwise this waits until another thread compacts.
 ///
-/// ```no_run
+/// ```
 /// # use regolith::{Db, Options, through_stalls};
-/// # let db = Db::open("/tmp/through_stalls_doc", Options::default())?;
+/// # let db = Db::open("rows", Options::memory())?;
 /// through_stalls(|| db.put(b"key", b"value"))?;
+/// # assert_eq!(db.get(b"key")?.as_deref(), Some(&b"value"[..]));
 /// # Ok::<(), regolith::Error>(())
 /// ```
 #[cfg(not(target_arch = "wasm32"))]

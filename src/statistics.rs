@@ -6,7 +6,8 @@
 //! caller then polls the `Statistics` object (via
 //! [`Statistics::get_ticker`], [`Statistics::get_histogram_snapshot`],
 //! or [`Statistics::to_string`]) to export the values to their
-//! monitoring stack of choice.
+//! monitoring stack of choice. A caller that kept only the database
+//! reads the same object back with [`crate::Db::statistics`].
 //!
 //! # Metric names
 //!
@@ -177,15 +178,23 @@ pub enum Ticker {
     /// block still uses it, uncached. A steady count means the cache is too
     /// small for the blocks readers hold at once.
     BlockCacheAddRefusedHeld = 36,
+    /// The subset of [`Ticker::CommitConflicts`] where the newer write
+    /// that decided the race was a delete or a range delete: a key the
+    /// transaction read or wrote was removed after its snapshot. It says
+    /// what the newer write was, where [`Ticker::CommitConflictsOnRead`]
+    /// and [`Ticker::CommitConflictsOnWrite`] say what the transaction
+    /// did with the key, so one conflict can count here and there. A
+    /// key deleted and then put again counts as a conflict with the put.
+    CommitConflictsAfterDelete = 37,
     /// Tables an open moved to level 0 because an earlier release had left
     /// their level with overlapping key ranges, which a level below 0
     /// cannot hold. The data is unchanged, and the open is logged once. A
     /// read-write open records the move, so the next open counts nothing;
     /// a read-only open moves them in its own view, every time.
-    ManifestTablesDemoted = 37,
+    ManifestTablesDemoted = 38,
 }
 
-const NUM_TICKERS: usize = 38;
+const NUM_TICKERS: usize = 39;
 
 impl Ticker {
     /// Every defined ticker, in discriminant order. Adding a variant
@@ -228,6 +237,7 @@ impl Ticker {
         Ticker::ManifestTailDiscarded,
         Ticker::ManifestTailDiscardedBytes,
         Ticker::BlockCacheAddRefusedHeld,
+        Ticker::CommitConflictsAfterDelete,
         Ticker::ManifestTablesDemoted,
     ];
 
@@ -271,6 +281,7 @@ impl Ticker {
             Ticker::ManifestTailDiscarded => "regolith.manifest.tail_discarded",
             Ticker::ManifestTailDiscardedBytes => "regolith.manifest.tail_discarded_bytes",
             Ticker::BlockCacheAddRefusedHeld => "regolith.block_cache.add_refused_held",
+            Ticker::CommitConflictsAfterDelete => "regolith.commit.conflicts_after_delete",
             Ticker::ManifestTablesDemoted => "regolith.manifest.tables_demoted",
         }
     }

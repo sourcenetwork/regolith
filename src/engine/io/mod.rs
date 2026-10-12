@@ -252,6 +252,29 @@ impl IoRuntime {
         self.queues.get(&id)
     }
 
+    /// Record a timed wait on `queue`: the slot handed back is ready at the
+    /// first poll of that queue that finds its clock at `due` microseconds
+    /// or later, and only there. A queue whose owner idles is woken for the
+    /// record, once, so it learns how long it may idle
+    /// ([`crate::IoProgress::wake_in`]).
+    ///
+    /// When the queue is not open on this database, or was dropped, nothing
+    /// would ever complete the wait, so the slot comes back ready.
+    pub(crate) fn timer(&self, queue: QueueId, due: u64) -> Arc<WaitSlot> {
+        let slot = Arc::new(WaitSlot::new());
+        let recorded = self.queues.get(&queue).is_some_and(|queue| {
+            let timer = Message::Timer {
+                due,
+                slot: Arc::clone(&slot),
+            };
+            queue.deliver(timer).is_ok()
+        });
+        if !recorded {
+            slot.complete();
+        }
+        slot
+    }
+
     /// Remember `id` as the calling thread's queue on this database.
     pub(crate) fn bind_current(&self, id: QueueId) {
         bind::bind(std::ptr::from_ref(self).addr(), id);

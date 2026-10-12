@@ -8,9 +8,11 @@
 \* "pin" in a table called the snapshot registry.
 \*
 \* Before a program shuts the database down tidily it may want to wait until
-\* every snapshot is gone. `Db::wait_for_snapshots(timeout)` (src/lib.rs)
-\* does that: it comes back with the number of pins still held, 0 when the
-\* wait succeeded. The work is done by
+\* every snapshot is gone. `Db::wait_for_snapshots()` (src/lib.rs) hands back
+\* a `SnapshotWait` at once, and that handle's `wait(timeout)`
+\* (src/snapshot_wait.rs) does the waiting: it comes back with the number of
+\* pins still held, 0 when the wait succeeded. "The call" below is that wait.
+\* The work is done by
 \* `SnapshotRegistry::wait_until_drained` (src/engine/snapshot_registry.rs).
 \*
 \* There is no lock. The waiter and a thread that releases a pin talk
@@ -62,6 +64,10 @@
 \*   SnapshotRegistry::wait_drained            the rounds: count this waiter
 \*     in `watchers`; create the notification future; `watch` (mark every
 \*     chunk and read it); if something is taken, wait on the future.
+\*   SnapshotRegistry::until_drained           the same rounds for a task that
+\*     awaits the `SnapshotWait` instead of blocking: where the thread would
+\*     park, the task is suspended, and the wake resumes it. "parked" below
+\*     stands for both.
 \*   Chunk::watch, Chunk::unpin                src/engine/snapshot_registry/chain.rs
 \*     One read-modify-write each on the chunk's `taken` word: `watch` sets
 \*     the WATCHED bit and reads the entry bits; `unpin` clears an entry bit

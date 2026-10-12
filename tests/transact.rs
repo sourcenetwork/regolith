@@ -280,3 +280,151 @@ fn a_pessimistic_database_transacts_the_same_way() {
     assert_eq!(db.db().get(b"k").unwrap(), Some(b"mine".to_vec()));
     assert_eq!(receipt.seq(), db.db().latest_sequence());
 }
+
+/// Run a closure through `transact` that loses its first `losing` commits (a
+/// rival writes its key from inside the closure each time) and then wins.
+/// Returns the reading of `clock` at the start of each run.
+fn run_starts(
+    db: &OptimisticTransactionDb,
+    clock: &dyn Fn() -> u64,
+    policy: &RetryPolicy,
+    losing: u64,
+) -> Vec<u64> {
+    let mut starts = Vec::new();
+    let outcome = db.transact(policy, |tx, _| {
+        let run = starts.len() as u64;
+        starts.push(clock());
+        if run < losing {
+            db.db().put(b"k", format!("rival-{run}").as_bytes())?;
+        }
+        tx.put(b"k", b"mine")?;
+        Ok::<_, TransactionError>(())
+    });
+    outcome.expect("the run after the losing ones commits");
+    starts
+}
+
+fn gaps(starts: &[u64]) -> Vec<u64> {
+    starts.windows(2).map(|pair| pair[1] - pair[0]).collect()
+}
+
+/// A policy that asks for a backoff waits before each re-run: its first delay
+/// before the first, twice as long before each one after, never longer than
+/// its bound. The waits are measured on the clock of the database's
+/// environment, so each run starts at least its delay after the one before.
+#[test]
+fn a_backoff_waits_before_each_rerun_and_no_longer_than_its_bound() {
+    use std::time::Duration;
+
+    let dir = tempfile::tempdir().unwrap();
+    let options = Options::default();
+    let env = Arc::clone(options.get_env());
+    let db = OptimisticTransactionDb::open(dir.path(), options).unwrap();
+    let clock = || {
+        env.now_micros()
+            .expect("the standard environment has a clock")
+    };
+
+    let policy = RetryPolicy::new(5).backoff(Duration::from_millis(2), Duration::from_millis(5));
+    let waited = gaps(&run_starts(&db, &clock, &policy, 4));
+    assert_eq!(waited.len(), 4, "four losing runs, four re-runs");
+    for (waited, at_least) in waited.iter().zip([2_000, 4_000, 5_000, 5_000]) {
+        assert!(
+            *waited >= at_least,
+            "{waited} µs before a re-run owed {at_least}"
+        );
+    }
+
+    // The delays the policy answers with are the ones it took.
+    let delays: Vec<Duration> = (0..=5).map(|rerun| policy.backoff_before(rerun)).collect();
+    let millis = |ms: u64| Duration::from_millis(ms);
+    assert_eq!(
+        delays,
+        [
+            Duration::ZERO,
+            millis(2),
+            millis(4),
+            millis(5),
+            millis(5),
+            millis(5)
+        ]
+    );
+}
+
+/// Nothing waits unless the policy asks: without a backoff every re-run
+/// starts at once, on an environment whose clock never moves, where a wait
+/// measured on that clock would never end.
+#[test]
+fn without_a_backoff_a_rerun_waits_for_nothing() {
+    let options = Options::memory();
+    let env = Arc::clone(options.get_env());
+    let db = OptimisticTransactionDb::open("transact-no-backoff", options).unwrap();
+    let clock = || {
+        env.now_micros()
+            .expect("the memory environment has a clock")
+    };
+
+    let starts = run_starts(&db, &clock, &RetryPolicy::new(4), 3);
+    assert_eq!(starts, [0, 0, 0, 0], "four runs, and the clock stood still");
+    assert_eq!(
+        RetryPolicy::default().backoff_before(1),
+        std::time::Duration::ZERO
+    );
+}
+
+/// The wait is measured on the environment's clock and on no other: on an
+/// environment whose clock the test moves, each re-run starts once that clock
+/// has passed its delay. A pessimistic database waits the same way.
+#[test]
+fn a_backoff_is_measured_on_the_clock_of_the_environment() {
+    use std::sync::atomic::AtomicBool;
+    use std::time::Duration;
+
+    let env = regolith::MemEnv::new();
+    let shared: Arc<dyn regolith::Env> = Arc::new(env.clone());
+    let options = || Options::memory().env(Arc::clone(&shared));
+    let policy = RetryPolicy::new(4).backoff(Duration::from_millis(3), Duration::from_millis(4));
+    let done = AtomicBool::new(false);
+
+    let (optimistic, pessimistic) = std::thread::scope(|scope| {
+        let runs = scope.spawn(|| {
+            let db = OptimisticTransactionDb::open("transact-env-clock", options()).unwrap();
+            let clock = || shared.now_micros().unwrap();
+            let optimistic = run_starts(&db, &clock, &policy, 3);
+
+            let db = TransactionDb::open("transact-env-clock-locks", options()).unwrap();
+            let mut starts = Vec::new();
+            db.transact(&policy, |tx, _| {
+                let run = starts.len();
+                starts.push(clock());
+                tx.get_for_update(b"k")?;
+                if run == 0 {
+                    // Around the lock manager, so the commit's check sees it.
+                    db.db().put(b"k", b"rival")?;
+                }
+                tx.put(b"k", b"mine")?;
+                Ok::<_, TransactionError>(())
+            })
+            .unwrap();
+            done.store(true, Ordering::SeqCst);
+            (optimistic, starts)
+        });
+        // The only thing that moves the clock.
+        while !done.load(Ordering::SeqCst) {
+            env.advance_micros(250);
+            std::thread::yield_now();
+        }
+        runs.join().unwrap()
+    });
+
+    for (waited, at_least) in gaps(&optimistic).iter().zip([3_000, 4_000, 4_000]) {
+        assert!(
+            *waited >= at_least,
+            "{waited} µs before a re-run owed {at_least}"
+        );
+    }
+    assert_eq!(gaps(&optimistic).len(), 3);
+    let waited = gaps(&pessimistic);
+    assert_eq!(waited.len(), 1);
+    assert!(waited[0] >= 3_000, "{} µs before the re-run", waited[0]);
+}

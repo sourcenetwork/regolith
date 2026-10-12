@@ -19,7 +19,6 @@ use std::task::Waker;
 
 use super::super::RegolithEngine;
 use super::super::io::job::{Job, JobBody, Step};
-use super::super::io::scope;
 use super::descriptor::{After, Decision, Descriptor, Turned, Verdict as Fate, Work};
 use super::ordered::Ordered;
 use super::park::{Help, Needs};
@@ -49,7 +48,6 @@ impl JobBody for TurnCheck {
 
     /// On a queue's poll: parks instead of waiting for another thread.
     fn step(self: Box<Self>, waker: &Waker) -> Step {
-        let _no_wait = scope::no_wait();
         if self.go(Help::Park(waker)) {
             Step::Done
         } else {

@@ -364,8 +364,10 @@ impl Descriptor {
 
     /// Tell everyone listening that the slot landed. Every thread that
     /// publishes the slot calls this before it passes the frontier, and one
-    /// of them tells each listener, so a thread that stops here keeps no
-    /// listener waiting: the next one to reach the slot tells them.
+    /// of them tells each listener, so a thread that stops before it takes
+    /// the listeners keeps none waiting: the next one to reach the slot
+    /// tells them. A thread stopped after it took them keeps the ones it
+    /// took until it runs again.
     pub(super) fn land(&self) {
         for waiter in self.landing.take(SHUT) {
             waiter.deliver();
