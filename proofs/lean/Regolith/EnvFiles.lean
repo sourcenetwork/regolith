@@ -115,9 +115,11 @@ theorem positional_reads_own (data at_ : Nat → Nat) (sched : List Nat) (d : Di
     ∀ r v, (runPread data at_ d sched).got r = some v → v = data (at_ r) := by
   -- By the schedule, one read at a time, for any starting disk.
   induction sched generalizing d with
+  -- Case: no read at all.
   | nil =>
     -- No read: the starting fact.
     exact h0
+  -- Case: one read, then the rest, with the claim for the rest (ih) known.
   | cons q rest ih =>
     -- One read by `q`, then the rest: show the fact after `q`'s read.
     apply ih
@@ -125,13 +127,17 @@ theorem positional_reads_own (data at_ : Nat → Nat) (sched : List Nat) (d : Di
     intro r v hv
     -- Is `r` the reader who just read?
     by_cases hrq : r = q
-    · -- Yes: it got `data (at_ q)`, its own bytes.
+    -- Yes: it got `data (at_ q)`, its own bytes.
+    ·
+      -- Replace one side of `hrq` by the other everywhere.
       subst hrq
       -- Simplify the named facts with the definitions; a false one closes the goal.
       simp [Disk.step, set_same] at hv
       -- This is exactly what the goal asks.
       exact hv.symm
-    · -- No: its answer did not change.
+    -- No: its answer did not change.
+    ·
+      -- Read through `set` at a key it did not change in `hv`: the old value.
       simp only [Disk.step, set_other _ _ _ _ hrq] at hv
       -- This is exactly what the goal asks.
       exact h0 r v hv
@@ -432,10 +438,13 @@ theorem step_grows {s t : St} (hs : Inv s) (hst : Step s t) (e : Nat) (he : e < 
     ((s.ext e).frozen = true → (t.ext e).frozen = true ∧ (t.ext e).len = (s.ext e).len) := by
   -- One case per kind of step.
   cases hst with
+  -- Case: a writer claims the current extent and writes its record after the published ones.
   | claimWrite w hpc hb hf =>
     -- Only the current extent changes: its record goes at the length.
     by_cases hec : e = s.cur
-    · -- The current extent: same length, same records below it, not frozen.
+    -- The current extent: same length, same records below it, not frozen.
+    ·
+      -- Replace one side of `hec` by the other everywhere.
       subst hec
       -- Prove the parts one at a time; each `?_` becomes a goal of its own.
       refine ⟨Nat.le_refl _, ?_, ?_, ?_⟩
@@ -445,14 +454,19 @@ theorem step_grows {s t : St} (hs : Inv s) (hst : Step s t) (e : Nat) (he : e < 
       · intro i hi; simp [set_other _ _ _ _ (Nat.ne_of_lt hi)]
       -- It was not frozen, so there is nothing to keep.
       · intro hfz; rw [hf] at hfz; cases hfz
-    · -- Any other extent is untouched.
+    -- Any other extent is untouched.
+    ·
+      -- Read through `set` at a key it did not change: the old value.
       simp [set_other _ _ _ _ hec]
+  -- Case: an in-place writer publishes its record.
   | publishOk w hpc hf =>
     -- Only the writer's extent changes: one more record published.
     have hw := hs.writer w hpc
     -- Split on whether `e = s.wext w` holds.
     by_cases hew : e = s.wext w
-    · -- The writer's extent: the length was `wlen`, now `wlen + 1`.
+    -- The writer's extent: the length was `wlen`, now `wlen + 1`.
+    ·
+      -- Replace one side of `hew` by the other everywhere.
       subst hew
       -- Prove the parts one at a time; each `?_` becomes a goal of its own.
       refine ⟨Nat.le_refl _, ?_, ?_, ?_⟩
@@ -462,21 +476,29 @@ theorem step_grows {s t : St} (hs : Inv s) (hst : Step s t) (e : Nat) (he : e < 
       · intro i _; simp
       -- It was not frozen, so there is nothing to keep.
       · intro hfz; rw [hf] at hfz; cases hfz
-    · -- Any other extent is untouched.
+    -- Any other extent is untouched.
+    ·
+      -- Read through `set` at a key it did not change: the old value.
       simp [set_other _ _ _ _ hew]
+  -- Case: an in-place writer finds its extent frozen and starts over.
   | publishFail w hpc hf =>
     -- No extent changes.
     simp
+  -- Case: a writer builds a copy of the current extent with its record added.
   | build w hpc =>
     -- No extent changes.
     simp
+  -- Case: a copier that saw its extent frozen already goes straight on to the swap.
   | freezeSkip w hpc hz =>
     -- No extent changes.
     simp
+  -- Case: a copier freezes its extent.
   | freezeOk w hpc hz hl hb hf =>
     -- Only the frozen flag of the copier's extent changes.
     by_cases hew : e = s.wext w
-    · -- The copier's extent: same length and records, now frozen.
+    -- The copier's extent: same length and records, now frozen.
+    ·
+      -- Replace one side of `hew` by the other everywhere.
       subst hew
       -- Prove the parts one at a time; each `?_` becomes a goal of its own.
       refine ⟨Nat.le_refl _, ?_, ?_, ?_⟩
@@ -486,11 +508,15 @@ theorem step_grows {s t : St} (hs : Inv s) (hst : Step s t) (e : Nat) (he : e < 
       · intro i _; simp
       -- Frozen, at the same length.
       · intro _; simp
-    · -- Any other extent is untouched.
+    -- Any other extent is untouched.
+    ·
+      -- Read through `set` at a key it did not change: the old value.
       simp [set_other _ _ _ _ hew]
+  -- Case: a copier finds its extent's state word changed and starts over.
   | freezeFail w hpc hz hch =>
     -- No extent changes.
     simp
+  -- Case: a copier swaps its new extent in.
   | swapOk w hpc hc =>
     -- Only the new extent, numbered `next`, is written: `e` is below it.
     have hne : e ≠ s.next := Nat.ne_of_lt he
@@ -502,18 +528,23 @@ theorem step_grows {s t : St} (hs : Inv s) (hst : Step s t) (e : Nat) (he : e < 
     · intro i _; simp [set_other _ _ _ _ hne]
     -- The flags of `e` are unchanged.
     · intro hfz; simp [set_other _ _ _ _ hne, hfz]
+  -- Case: a copier finds the pointer moved and starts over.
   | swapFail w hpc hc =>
     -- No extent changes.
     simp
+  -- Case: a memory reader begins, noting the appends that have returned.
   | begin r hpc =>
     -- No extent changes.
     simp
+  -- Case: a memory reader loads the pointer.
   | load r hpc =>
     -- No extent changes.
     simp
+  -- Case: a memory reader reads its extent's published length.
   | lenRead r hpc =>
     -- No extent changes.
     simp
+  -- Case: a memory reader copies the published records.
   | copy r hpc =>
     -- No extent changes.
     simp
@@ -579,6 +610,7 @@ theorem old_frozen_step {s t : St} (hs : Inv s) (hst : Step s t) :
   have hst' := hst
   -- One case per kind of step.
   cases hst with
+  -- Case: a copier swaps its new extent in.
   | swapOk w hpc hc =>
     -- The new current extent is `next`; every other one is below it.
     intro e he hne
@@ -590,10 +622,15 @@ theorem old_frozen_step {s t : St} (hs : Inv s) (hst : Step s t) :
     simp only [set_other _ _ _ _ hne]
     -- Was `e` the old current extent?
     by_cases hec : e = s.cur
-    · -- Yes: the copier froze it before the swap.
+    -- Yes: the copier froze it before the swap.
+    ·
+      -- Rewrite the goal with the equalities given, then this is exactly what the goal asks.
       rw [hec, hc]; exact (hs.frozen_at w hpc).1
-    · -- No: it was frozen already.
+    -- No: it was frozen already.
+    ·
+      -- This is exactly what the goal asks.
       exact hs.old_frozen e hlt hec
+  -- Case: every other kind of step.
   | _ =>
     -- Every other step leaves the pointer and the number as they were, and
     -- only sets flags or extends an extent: frozen stays frozen.
@@ -616,29 +653,38 @@ theorem writer_step {s t : St} (hs : Inv s) (hst : Step s t) :
       (t.ext (t.wext w)).len = t.wlen w ∧ (t.ext (t.wext w)).buf (t.wlen w) = w := by
   -- One case per kind of step.
   cases hst with
+  -- Case: a writer claims the current extent and writes its record after the published ones.
   | claimWrite w0 hpc hb hf =>
+    -- Name what the goal starts with: `w`, `hw`.
     intro w hw
     -- Is `w` the writer that just claimed?
     by_cases hww : w = w0
-    · -- Yes: its extent is the current one, now with WRITER and its record.
+    -- Yes: its extent is the current one, now with WRITER and its record.
+    ·
+      -- Replace one side of `hww` by the other everywhere.
       subst hww
       -- Read the value `set` just wrote at this key.
       simp only [set_same]
       -- Put the pieces together.
       exact ⟨hs.cur_lt, by simp, by simp, by simp⟩
-    · -- No: it was writing before, on an extent with WRITER set, which is
+    -- No: it was writing before, on an extent with WRITER set, which is.
+    ·
       -- therefore not the current one (that one had no WRITER).
       simp only [set_other _ _ _ _ hww] at hw ⊢
       -- Unpack the facts on the right and name them.
       obtain ⟨hlt, hwb, hl, hbuf⟩ := hs.writer w hw
       -- First show this small fact; its proof follows on the next lines.
       have hne : s.wext w ≠ s.cur := by
+        -- Name what the goal starts with: `heq`, then rewrite `hwb` with the equalities given, then
+        -- split on the ways `hwb` can hold: none is left.
         intro heq; rw [heq, hb] at hwb; cases hwb
       -- Read through `set` at a key it did not change: the old value.
       simp only [set_other _ _ _ _ hne]
       -- Put the pieces together.
       exact ⟨hlt, hwb, hl, hbuf⟩
+  -- Case: an in-place writer publishes its record.
   | publishOk w0 hpc hf =>
+    -- Name what the goal starts with: `w`, `hw`.
     intro w hw
     -- `w0` is done now, so `w` is another writer.
     have hww : w ≠ w0 := by intro h; subst h; simp at hw
@@ -650,7 +696,9 @@ theorem writer_step {s t : St} (hs : Inv s) (hst : Step s t) :
     simp only [set_other _ _ _ _ hne]
     -- The state's `writer` fact from before the step gives exactly this.
     exact hs.writer w hw
+  -- Case: an in-place writer finds its extent frozen and starts over.
   | publishFail w0 hpc hf =>
+    -- Name what the goal starts with: `w`, `hw`.
     intro w hw
     -- `w0` starts over, so `w` is another writer, untouched.
     have hww : w ≠ w0 := by intro h; subst h; simp at hw
@@ -658,7 +706,9 @@ theorem writer_step {s t : St} (hs : Inv s) (hst : Step s t) :
     simp only [set_other _ _ _ _ hww] at hw
     -- The state's `writer` fact from before the step gives exactly this.
     exact hs.writer w hw
+  -- Case: a writer builds a copy of the current extent with its record added.
   | build w0 hpc =>
+    -- Name what the goal starts with: `w`, `hw`.
     intro w hw
     -- `w0` is a copier now, so `w` is another writer, untouched.
     have hww : w ≠ w0 := by intro h; subst h; simp at hw
@@ -666,7 +716,9 @@ theorem writer_step {s t : St} (hs : Inv s) (hst : Step s t) :
     simp only [set_other _ _ _ _ hww] at hw ⊢
     -- The state's `writer` fact from before the step gives exactly this.
     exact hs.writer w hw
+  -- Case: a copier that saw its extent frozen already goes straight on to the swap.
   | freezeSkip w0 hpc hz =>
+    -- Name what the goal starts with: `w`, `hw`.
     intro w hw
     -- `w0` is a copier, so `w` is another writer, untouched.
     have hww : w ≠ w0 := by intro h; subst h; simp at hw
@@ -674,7 +726,9 @@ theorem writer_step {s t : St} (hs : Inv s) (hst : Step s t) :
     simp only [set_other _ _ _ _ hww] at hw
     -- The state's `writer` fact from before the step gives exactly this.
     exact hs.writer w hw
+  -- Case: a copier freezes its extent.
   | freezeOk w0 hpc hz hl hb hf =>
+    -- Name what the goal starts with: `w`, `hw`.
     intro w hw
     -- `w0` is a copier, so `w` is another writer.
     have hww : w ≠ w0 := by intro h; subst h; simp at hw
@@ -688,7 +742,9 @@ theorem writer_step {s t : St} (hs : Inv s) (hst : Step s t) :
     · simp only [he, set_same]; rw [he] at hwb hlen hbuf; exact ⟨he ▸ hlt, hwb, hlen, hbuf⟩
     -- Read through `set` at a key it did not change: the old value, then put the pieces together.
     · simp only [set_other _ _ _ _ he]; exact ⟨hlt, hwb, hlen, hbuf⟩
+  -- Case: a copier finds its extent's state word changed and starts over.
   | freezeFail w0 hpc hz hch =>
+    -- Name what the goal starts with: `w`, `hw`.
     intro w hw
     -- `w0` starts over, so `w` is another writer, untouched.
     have hww : w ≠ w0 := by intro h; subst h; simp at hw
@@ -696,7 +752,9 @@ theorem writer_step {s t : St} (hs : Inv s) (hst : Step s t) :
     simp only [set_other _ _ _ _ hww] at hw
     -- The state's `writer` fact from before the step gives exactly this.
     exact hs.writer w hw
+  -- Case: a copier swaps its new extent in.
   | swapOk w0 hpc hc =>
+    -- Name what the goal starts with: `w`, `hw`.
     intro w hw
     -- `w0` is done, so `w` is another writer.
     have hww : w ≠ w0 := by intro h; subst h; simp at hw
@@ -710,7 +768,9 @@ theorem writer_step {s t : St} (hs : Inv s) (hst : Step s t) :
     simp only [set_other _ _ _ _ hne]
     -- Put the pieces together.
     exact ⟨by omega, hwb, hlen, hbuf⟩
+  -- Case: a copier finds the pointer moved and starts over.
   | swapFail w0 hpc hc =>
+    -- Name what the goal starts with: `w`, `hw`.
     intro w hw
     -- `w0` starts over, so `w` is another writer, untouched.
     have hww : w ≠ w0 := by intro h; subst h; simp at hw
@@ -718,15 +778,19 @@ theorem writer_step {s t : St} (hs : Inv s) (hst : Step s t) :
     simp only [set_other _ _ _ _ hww] at hw
     -- The state's `writer` fact from before the step gives exactly this.
     exact hs.writer w hw
+  -- Case: a memory reader begins, noting the appends that have returned.
   | begin r hpc =>
     -- Readers do not touch writers.
     exact hs.writer
+  -- Case: a memory reader loads the pointer.
   | load r hpc =>
     -- Readers do not touch writers.
     exact hs.writer
+  -- Case: a memory reader reads its extent's published length.
   | lenRead r hpc =>
     -- Readers do not touch writers.
     exact hs.writer
+  -- Case: a memory reader copies the published records.
   | copy r hpc =>
     -- Readers do not touch writers.
     exact hs.writer
@@ -737,11 +801,14 @@ theorem one_writer_step {s t : St} (hs : Inv s) (hst : Step s t) :
     ∀ w v, t.wpc w = .written → t.wpc v = .written → t.wext w = t.wext v → w = v := by
   -- One case per kind of step.
   cases hst with
+  -- Case: a writer claims the current extent and writes its record after the published ones.
   | claimWrite w0 hpc hb hf =>
+    -- Name what the goal starts with: `w`, `v`, `hw`, `hv`, `he`.
     intro w v hw hv he
     -- A writer other than `w0` was writing on an extent with WRITER set,
     -- so not on the current one, which `w0` just claimed.
     have other : ∀ u, u ≠ w0 → s.wpc u = .written → s.wext u ≠ s.cur := by
+      -- Name what the goal starts with: `u`, `hu`, `hup`, `heq`.
       intro u hu hup heq
       -- Keep this fact for the next step.
       have := (hs.writer u hup).2.1
@@ -749,25 +816,35 @@ theorem one_writer_step {s t : St} (hs : Inv s) (hst : Step s t) :
       rw [heq, hb] at this; cases this
     -- Split on whether `w = w0 <` holds.
     by_cases hww : w = w0 <;> by_cases hvw : v = w0
-    · -- Both are `w0`.
+    -- Both are `w0`.
+    ·
+      -- Rewrite the goal with the equalities given.
       rw [hww, hvw]
-    · -- `w` is `w0` on the current extent; `v` is not there.
+    -- `w` is `w0` on the current extent; `v` is not there.
+    ·
+      -- Replace one side of `hww` by the other everywhere.
       subst hww
       -- Read through `set`: the new value at the key it wrote, the old value elsewhere.
       simp only [set_same, set_other _ _ _ _ hvw] at hv he
       -- The two facts contradict each other.
       exact absurd he.symm (other v hvw hv)
-    · -- `v` is `w0` on the current extent; `w` is not there.
+    -- `v` is `w0` on the current extent; `w` is not there.
+    ·
+      -- Replace one side of `hvw` by the other everywhere.
       subst hvw
       -- Read through `set`: the new value at the key it wrote, the old value elsewhere.
       simp only [set_same, set_other _ _ _ _ hww] at hw he
       -- The two facts contradict each other.
       exact absurd he (other w hww hw)
-    · -- Neither is `w0`: as before.
+    -- Neither is `w0`: as before.
+    ·
+      -- Read through `set` at a key it did not change in `hw hv he`: the old value.
       simp only [set_other _ _ _ _ hww, set_other _ _ _ _ hvw] at hw hv he
       -- The state's `one_writer` fact from before the step gives exactly this.
       exact hs.one_writer w v hw hv he
+  -- Case: a writer builds a copy of the current extent with its record added.
   | build w0 hpc =>
+    -- Name what the goal starts with: `w`, `v`, `hw`, `hv`, `he`.
     intro w v hw hv he
     -- `w0` is a copier now: both are other writers, untouched.
     have hww : w ≠ w0 := by intro h; subst h; simp at hw
@@ -777,13 +854,16 @@ theorem one_writer_step {s t : St} (hs : Inv s) (hst : Step s t) :
     simp only [set_other _ _ _ _ hww, set_other _ _ _ _ hvw] at hw hv he
     -- The state's `one_writer` fact from before the step gives exactly this.
     exact hs.one_writer w v hw hv he
+  -- Case: every other kind of step.
   | _ =>
     -- Every other step moves at most one writer, off "written" (or not at
     -- all), and changes no writer's extent.
     intro w v hw hv he
     -- Try each way below in turn.
     first
+      -- First way: the old fact applies as it is.
       | exact hs.one_writer w v hw hv he
+      -- Second way, for a step that carries six arguments: name the writer that moved, w0.
       | (rename_i w0 _ _ _ _ _
          -- First show `w ≠ w0`, named `hww`, then replace one side of `h` by the other everywhere, then simplify the named facts with the definitions; a false one closes the goal.
          have hww : w ≠ w0 := by intro h; subst h; simp at hw
@@ -793,6 +873,7 @@ theorem one_writer_step {s t : St} (hs : Inv s) (hst : Step s t) :
          simp only [set_other _ _ _ _ hww, set_other _ _ _ _ hvw] at hw hv
          -- The state's `one_writer` fact from before the step gives exactly this.
          exact hs.one_writer w v hw hv he)
+      -- Third way, for a step that carries four arguments: name the writer that moved, w0.
       | (rename_i w0 _ _ _
          -- First show `w ≠ w0`, named `hww`, then replace one side of `h` by the other everywhere, then simplify the named facts with the definitions; a false one closes the goal.
          have hww : w ≠ w0 := by intro h; subst h; simp at hw
@@ -802,6 +883,7 @@ theorem one_writer_step {s t : St} (hs : Inv s) (hst : Step s t) :
          simp only [set_other _ _ _ _ hww, set_other _ _ _ _ hvw] at hw hv
          -- The state's `one_writer` fact from before the step gives exactly this.
          exact hs.one_writer w v hw hv he)
+      -- Fourth way, for a step that carries three arguments: name the writer that moved, w0.
       | (rename_i w0 _ _
          -- First show `w ≠ w0`, named `hww`, then replace one side of `h` by the other everywhere, then simplify the named facts with the definitions; a false one closes the goal.
          have hww : w ≠ w0 := by intro h; subst h; simp at hw
@@ -843,7 +925,9 @@ theorem copier_kept {s t : St} (hs : Inv s) (hst : Step s t) (w : Nat)
   rw [hpc, hext, hlen, hbuf, hz]
   -- Prove the parts one at a time; each `?_` becomes a goal of its own.
   refine ⟨?_, ?_, ?_⟩
-  · -- The copy facts: the extent grew and kept its records.
+  -- The copy facts: the extent grew and kept its records.
+  ·
+    -- Name what the goal starts with: `hw`.
     intro hw
     -- Unpack the facts on the right and name them.
     obtain ⟨hlt, hle, hcp, hlast⟩ := hs.copier w hw
@@ -855,7 +939,9 @@ theorem copier_kept {s t : St} (hs : Inv s) (hst : Step s t) (w : Nat)
     intro j hj
     -- Rewrite the goal with the equalities given.
     rw [hcp j hj, hkeep j (by omega)]
-  · -- Frozen when seen: still frozen, at the same length.
+  -- Frozen when seen: still frozen, at the same length.
+  ·
+    -- Name what the goal starts with: `hw`, `hzz`.
     intro hw hzz
     -- Unpack the facts on the right and name them.
     obtain ⟨hfz, hl⟩ := hs.saw_frozen w hw hzz
@@ -867,7 +953,9 @@ theorem copier_kept {s t : St} (hs : Inv s) (hst : Step s t) (w : Nat)
     obtain ⟨hfz', hl'⟩ := hstay hfz
     -- Put the pieces together.
     exact ⟨hfz', by rw [hl', hl]⟩
-  · -- Frozen after the freeze: still frozen, at the same length.
+  -- Frozen after the freeze: still frozen, at the same length.
+  ·
+    -- Name what the goal starts with: `hw`.
     intro hw
     -- Unpack the facts on the right and name them.
     obtain ⟨hfz, hl⟩ := hs.frozen_at w hw
@@ -894,44 +982,69 @@ theorem copier_step {s t : St} (hs : Inv s) (hst : Step s t) : CopierFacts t := 
         (t.ext (t.wext w)).frozen = true ∧ (t.ext (t.wext w)).len = t.wlen w) ∧
       (t.wpc w = .frz → (t.ext (t.wext w)).frozen = true ∧
         (t.ext (t.wext w)).len = t.wlen w) by
+    -- This is exactly what the goal asks.
     exact ⟨fun w => (h w).1, fun w => (h w).2.1, fun w => (h w).2.2⟩
   -- Name the things the goal is about: `w`.
   intro w
   -- One case per kind of step.
   cases hst with
+  -- Case: a writer claims the current extent and writes its record after the published ones.
   | claimWrite w0 hpc hb hf =>
+    -- Split on whether `w = w0` holds.
     by_cases hww : w = w0
-    · -- `w0` is an in-place writer now: none of the copier facts apply.
+    -- `w0` is an in-place writer now: none of the copier facts apply.
+    ·
+      -- Replace one side of `hww` by the other everywhere.
       subst hww
       -- Simplify with the definitions until the goal is closed or plain.
       simp
-    · -- Another copier: its fields are untouched.
+    -- Another copier: its fields are untouched.
+    ·
+      -- This is exactly what the goal asks.
       exact copier_kept hs hst' w (set_other _ _ _ _ hww) (set_other _ _ _ _ hww)
         -- The rest of the arguments: each condition of the step, checked.
         (set_other _ _ _ _ hww) rfl rfl
+  -- Case: an in-place writer publishes its record.
   | publishOk w0 hpc hf =>
+    -- Split on whether `w = w0` holds.
     by_cases hww : w = w0
-    · -- `w0` is done: none of the copier facts apply.
+    -- `w0` is done: none of the copier facts apply.
+    ·
+      -- Replace one side of `hww` by the other everywhere.
       subst hww
       -- Simplify with the definitions until the goal is closed or plain.
       simp
-    · -- Another copier: its fields are untouched.
+    -- Another copier: its fields are untouched.
+    ·
+      -- This is exactly what the goal asks.
       exact copier_kept hs hst' w (set_other _ _ _ _ hww) rfl rfl rfl rfl
+  -- Case: an in-place writer finds its extent frozen and starts over.
   | publishFail w0 hpc hf =>
+    -- Split on whether `w = w0` holds.
     by_cases hww : w = w0
-    · -- `w0` starts over: none of the copier facts apply.
+    -- `w0` starts over: none of the copier facts apply.
+    ·
+      -- Replace one side of `hww` by the other everywhere.
       subst hww
       -- Simplify with the definitions until the goal is closed or plain.
       simp
-    · -- Another copier: its fields are untouched.
+    -- Another copier: its fields are untouched.
+    ·
+      -- This is exactly what the goal asks.
       exact copier_kept hs hst' w (set_other _ _ _ _ hww) rfl rfl rfl rfl
+  -- Case: a writer builds a copy of the current extent with its record added.
   | build w0 hpc =>
+    -- Split on whether `w = w0` holds.
     by_cases hww : w = w0
-    · -- `w0` just built from the current extent.
+    -- `w0` just built from the current extent.
+    ·
+      -- Replace one side of `hww` by the other everywhere.
       subst hww
       -- Prove the parts one at a time; each `?_` becomes a goal of its own.
       refine ⟨?_, ?_, ?_⟩
-      · -- Its copy: the published records below the length, then its own.
+      -- Its copy: the published records below the length, then its own.
+      ·
+        -- Take the assumption the goal starts with.
         intro _
         -- Read the value `set` just wrote at this key.
         simp only [set_same]
@@ -941,23 +1054,32 @@ theorem copier_step {s t : St} (hs : Inv s) (hst : Step s t) : CopierFacts t := 
         intro j hj
         -- Simplify with the definitions until the goal is closed or plain.
         simp [hj]
-      · -- It saw FROZEN: the current extent is frozen, at the length seen.
+      -- It saw FROZEN: the current extent is frozen, at the length seen.
+      ·
+        -- Name what the goal starts with: `hz`.
         intro _ hz
         -- Read the value `set` just wrote at this key.
         simp only [set_same] at hz ⊢
         -- Put the pieces together.
         exact ⟨hz, trivial⟩
-      · -- It is built, not past its freeze.
+      -- It is built, not past its freeze.
+      ·
+        -- Name what the goal starts with: `h`.
         intro h
         -- Simplify the named facts with the definitions; a false one closes the goal.
         simp at h
-    · -- Another copier: its fields are untouched.
+    -- Another copier: its fields are untouched.
+    ·
+      -- This is exactly what the goal asks.
       exact copier_kept hs hst' w (set_other _ _ _ _ hww) (set_other _ _ _ _ hww)
         -- The rest of the arguments: each condition of the step, checked.
         (set_other _ _ _ _ hww) (set_other _ _ _ _ hww) (set_other _ _ _ _ hww)
+  -- Case: a copier that saw its extent frozen already goes straight on to the swap.
   | freezeSkip w0 hpc hz =>
+    -- Split on whether `w = w0` holds.
     by_cases hww : w = w0
-    · -- `w0` moves from built to frozen: it saw FROZEN, so the extent is
+    -- `w0` moves from built to frozen: it saw FROZEN, so the extent is.
+    ·
       -- frozen at the length it saw.
       subst hww
       -- Unpack the facts on the right and name them.
@@ -966,81 +1088,128 @@ theorem copier_step {s t : St} (hs : Inv s) (hst : Step s t) : CopierFacts t := 
       obtain ⟨hfz, hl⟩ := hs.saw_frozen w hpc hz
       -- Prove the parts one at a time; each `?_` becomes a goal of its own.
       refine ⟨?_, ?_, ?_⟩
-      · -- The copy facts carry over unchanged.
+      -- The copy facts carry over unchanged.
+      ·
+        -- Take the assumption the goal starts with.
         intro _
         -- Put the pieces together.
         exact ⟨hlt, hle, hcp, hlast⟩
-      · -- It is past its freeze, not built.
+      -- It is past its freeze, not built.
+      ·
+        -- Name what the goal starts with: `h`.
         intro h
         -- Simplify the named facts with the definitions; a false one closes the goal.
         simp at h
-      · -- Frozen, at the length it saw.
+      -- Frozen, at the length it saw.
+      ·
+        -- Take the assumption the goal starts with.
         intro _
         -- Put the pieces together.
         exact ⟨hfz, hl⟩
-    · -- Another copier: its fields are untouched.
+    -- Another copier: its fields are untouched.
+    ·
+      -- This is exactly what the goal asks.
       exact copier_kept hs hst' w (set_other _ _ _ _ hww) rfl rfl rfl rfl
+  -- Case: a copier freezes its extent.
   | freezeOk w0 hpc hz hl hb hf =>
+    -- Split on whether `w = w0` holds.
     by_cases hww : w = w0
-    · -- `w0` froze its extent at the length it saw.
+    -- `w0` froze its extent at the length it saw.
+    ·
+      -- Replace one side of `hww` by the other everywhere.
       subst hww
       -- Unpack the facts on the right and name them.
       obtain ⟨hlt, hle, hcp, hlast⟩ := hs.copier w (Or.inl hpc)
       -- Prove the parts one at a time; each `?_` becomes a goal of its own.
       refine ⟨?_, ?_, ?_⟩
-      · -- The copy facts carry over: the freeze changed only the flag.
+      -- The copy facts carry over: the freeze changed only the flag.
+      ·
+        -- Take the assumption the goal starts with.
         intro _
         -- Prove the parts one at a time; each `?_` becomes a goal of its own.
         refine ⟨hlt, ?_, ?_, hlast⟩
-        · -- The length is unchanged.
+        -- The length is unchanged.
+        ·
+          -- Read the value `set` just wrote at this key, then this is exactly what the goal asks.
           simp only [set_same]; exact hle
-        · -- The records are unchanged.
+        -- The records are unchanged.
+        ·
+          -- Name what the goal starts with: `j`, `hj`, then read the value `set` just wrote at this
+          -- key, then this is exactly what the goal asks.
           intro j hj; simp only [set_same]; exact hcp j hj
-      · -- It is past its freeze, not built.
+      -- It is past its freeze, not built.
+      ·
+        -- Name what the goal starts with: `h`.
         intro h
         -- Simplify the named facts with the definitions; a false one closes the goal.
         simp at h
-      · -- Frozen now, at the length it saw.
+      -- Frozen now, at the length it saw.
+      ·
+        -- Take the assumption the goal starts with.
         intro _
         -- Read the value `set` just wrote at this key.
         simp only [set_same]
         -- Put the pieces together.
         exact ⟨trivial, hl⟩
-    · -- Another copier: its fields are untouched.
+    -- Another copier: its fields are untouched.
+    ·
+      -- This is exactly what the goal asks.
       exact copier_kept hs hst' w (set_other _ _ _ _ hww) rfl rfl rfl rfl
+  -- Case: a copier finds its extent's state word changed and starts over.
   | freezeFail w0 hpc hz hch =>
+    -- Split on whether `w = w0` holds.
     by_cases hww : w = w0
-    · -- `w0` starts over: none of the copier facts apply.
+    -- `w0` starts over: none of the copier facts apply.
+    ·
+      -- Replace one side of `hww` by the other everywhere.
       subst hww
       -- Simplify with the definitions until the goal is closed or plain.
       simp
-    · -- Another copier: its fields are untouched.
+    -- Another copier: its fields are untouched.
+    ·
+      -- This is exactly what the goal asks.
       exact copier_kept hs hst' w (set_other _ _ _ _ hww) rfl rfl rfl rfl
+  -- Case: a copier swaps its new extent in.
   | swapOk w0 hpc hc =>
+    -- Split on whether `w = w0` holds.
     by_cases hww : w = w0
-    · -- `w0` is done: none of the copier facts apply.
+    -- `w0` is done: none of the copier facts apply.
+    ·
+      -- Replace one side of `hww` by the other everywhere.
       subst hww
       -- Simplify with the definitions until the goal is closed or plain.
       simp
-    · -- Another copier: its fields are untouched.
+    -- Another copier: its fields are untouched.
+    ·
+      -- This is exactly what the goal asks.
       exact copier_kept hs hst' w (set_other _ _ _ _ hww) rfl rfl rfl rfl
+  -- Case: a copier finds the pointer moved and starts over.
   | swapFail w0 hpc hc =>
+    -- Split on whether `w = w0` holds.
     by_cases hww : w = w0
-    · -- `w0` starts over: none of the copier facts apply.
+    -- `w0` starts over: none of the copier facts apply.
+    ·
+      -- Replace one side of `hww` by the other everywhere.
       subst hww
       -- Simplify with the definitions until the goal is closed or plain.
       simp
-    · -- Another copier: its fields are untouched.
+    -- Another copier: its fields are untouched.
+    ·
+      -- This is exactly what the goal asks.
       exact copier_kept hs hst' w (set_other _ _ _ _ hww) rfl rfl rfl rfl
+  -- Case: a memory reader begins, noting the appends that have returned.
   | begin r hpc =>
     -- Readers do not touch copiers.
     exact copier_kept hs hst' w rfl rfl rfl rfl rfl
+  -- Case: a memory reader loads the pointer.
   | load r hpc =>
     -- Readers do not touch copiers.
     exact copier_kept hs hst' w rfl rfl rfl rfl rfl
+  -- Case: a memory reader reads its extent's published length.
   | lenRead r hpc =>
     -- Readers do not touch copiers.
     exact copier_kept hs hst' w rfl rfl rfl rfl rfl
+  -- Case: a memory reader copies the published records.
   | copy r hpc =>
     -- Readers do not touch copiers.
     exact copier_kept hs hst' w rfl rfl rfl rfl rfl
@@ -1053,11 +1222,13 @@ theorem holds_step {s t : St} (hs : Inv s) (hst : Step s t) :
   have hst' := hst
   -- One case per kind of step.
   cases hst with
+  -- Case: an in-place writer publishes its record.
   | publishOk w0 hpc hf =>
     -- The writer's extent is not frozen, so it is the current one.
     obtain ⟨hlt, _, hlen, hbuf⟩ := hs.writer w0 hpc
     -- First show this small fact; its proof follows on the next lines.
     have hcur : s.wext w0 = s.cur := by
+      -- Split on whether `s.wext w0 = s.cur` holds.
       by_cases h : s.wext w0 = s.cur
       -- This is exactly what the goal asks.
       · exact h
@@ -1069,14 +1240,19 @@ theorem holds_step {s t : St} (hs : Inv s) (hst : Step s t) :
     simp only [List.mem_cons] at hx
     -- Split the `or` into its cases.
     rcases hx with rfl | hx
-    · -- The new record: at position `wlen`, now below the length.
+    -- The new record: at position `wlen`, now below the length.
+    ·
+      -- Give the shape of the answer; each `?_` becomes a goal of its own.
       refine ⟨s.wlen x, ?_, ?_⟩
       -- Simplify with the definitions until the goal is closed or plain, then the arithmetic over natural numbers that is left holds.
       · simp only [← hcur, set_same]; omega
       -- Simplify with the definitions until the goal is closed or plain, then this is exactly what the goal asks.
       · simp only [← hcur, set_same]; exact hbuf
-    · -- An older record: still published.
+    -- An older record: still published.
+    ·
+      -- This is exactly what the goal asks.
       exact inPub_step hs hst' hs.cur_lt (hs.holds x hx)
+  -- Case: a copier swaps its new extent in.
   | swapOk w0 hpc hc =>
     -- The old current extent is the copier's, frozen at the length it saw.
     obtain ⟨hlt, _, hcp, hlast⟩ := hs.copier w0 (Or.inr hpc)
@@ -1088,9 +1264,13 @@ theorem holds_step {s t : St} (hs : Inv s) (hst : Step s t) :
     simp only [List.mem_cons] at hx
     -- Split the `or` into its cases.
     rcases hx with rfl | hx
-    · -- The copier's own record: at position `wlen` of the new extent.
+    -- The copier's own record: at position `wlen` of the new extent.
+    ·
+      -- This is exactly what the goal asks.
       exact ⟨s.wlen x, by simp, by simp [hlast]⟩
-    · -- An older record: below the old length, copied to the new extent.
+    -- An older record: below the old length, copied to the new extent.
+    ·
+      -- Unpack the fact on the right and name its pieces.
       obtain ⟨i, hi, hix⟩ := hs.holds x hx
       -- Rewrite `hi` with the equalities given.
       rw [hc, hl] at hi
@@ -1102,6 +1282,7 @@ theorem holds_step {s t : St} (hs : Inv s) (hst : Step s t) :
       rw [hcp i hi, ← hc]
       -- This is exactly what the goal asks.
       exact hix
+  -- Case: every other kind of step.
   | _ =>
     -- Every other step keeps the pointer and the finished list, and only
     -- grows the current extent.
@@ -1115,17 +1296,26 @@ theorem r_begun_step {s t : St} (hs : Inv s) (hst : Step s t) :
     ∀ r, t.rpc r = .begun → ∀ x ∈ t.rfin r, x ∈ t.finished := by
   -- One case per kind of step.
   cases hst with
+  -- Case: a memory reader begins, noting the appends that have returned.
   | begin r0 hpc =>
+    -- Name what the goal starts with: `r`, `hr`, `x`, `hx`.
     intro r hr x hx
     -- Is `r` the reader that just began?
     by_cases hrr : r = r0
-    · -- Yes: it noted exactly the finished appends.
+    -- Yes: it noted exactly the finished appends.
+    ·
+      -- Replace one side of `hrr` by the other everywhere, then simplify with the definitions until
+      -- the fact given is the goal.
       subst hrr; simpa using hx
-    · -- No: untouched.
+    -- No: untouched.
+    ·
+      -- Read through `set` at a key it did not change in `hr hx`: the old value.
       simp only [set_other _ _ _ _ hrr] at hr hx
       -- The state's `r_begun` fact from before the step gives exactly this.
       exact hs.r_begun r hr x hx
+  -- Case: a memory reader loads the pointer.
   | load r0 hpc =>
+    -- Name what the goal starts with: `r`, `hr`, `x`, `hx`.
     intro r hr x hx
     -- `r0` loaded, so `r` is another reader, untouched.
     have hrr : r ≠ r0 := by intro h; subst h; simp at hr
@@ -1133,7 +1323,9 @@ theorem r_begun_step {s t : St} (hs : Inv s) (hst : Step s t) :
     simp only [set_other _ _ _ _ hrr] at hr
     -- The state's `r_begun` fact from before the step gives exactly this.
     exact hs.r_begun r hr x hx
+  -- Case: a memory reader reads its extent's published length.
   | lenRead r0 hpc =>
+    -- Name what the goal starts with: `r`, `hr`, `x`, `hx`.
     intro r hr x hx
     -- `r0` was loaded, not begun: `r` is another reader.
     have hrr : r ≠ r0 := by intro h; subst h; simp at hr
@@ -1141,7 +1333,9 @@ theorem r_begun_step {s t : St} (hs : Inv s) (hst : Step s t) :
     simp only [set_other _ _ _ _ hrr] at hr
     -- The state's `r_begun` fact from before the step gives exactly this.
     exact hs.r_begun r hr x hx
+  -- Case: a memory reader copies the published records.
   | copy r0 hpc =>
+    -- Name what the goal starts with: `r`, `hr`, `x`, `hx`.
     intro r hr x hx
     -- `r0` was past its length, not begun: `r` is another reader.
     have hrr : r ≠ r0 := by intro h; subst h; simp at hr
@@ -1149,16 +1343,19 @@ theorem r_begun_step {s t : St} (hs : Inv s) (hst : Step s t) :
     simp only [set_other _ _ _ _ hrr] at hr
     -- The state's `r_begun` fact from before the step gives exactly this.
     exact hs.r_begun r hr x hx
+  -- Case: an in-place writer publishes its record.
   | publishOk w0 hpc hf =>
     -- One more finished append: the old ones are still there.
     intro r hr x hx
     -- This is exactly what the goal asks.
     exact List.mem_cons_of_mem _ (hs.r_begun r hr x hx)
+  -- Case: a copier swaps its new extent in.
   | swapOk w0 hpc hc =>
     -- One more finished append: the old ones are still there.
     intro r hr x hx
     -- This is exactly what the goal asks.
     exact List.mem_cons_of_mem _ (hs.r_begun r hr x hx)
+  -- Case: every other kind of step.
   | _ =>
     -- Writer steps that finish nothing touch no reader.
     exact hs.r_begun
@@ -1173,6 +1370,7 @@ theorem r_loaded_step {s t : St} (hs : Inv s) (hst : Step s t) :
   -- For a reader the step left alone: its extent still holds what it held.
   have kept : ∀ r, s.rpc r = .loaded → t.rext r = s.rext r → t.rfin r = s.rfin r →
       t.rext r < t.next ∧ ∀ x ∈ t.rfin r, t.inPub (t.rext r) x := by
+    -- Name what the goal starts with: `r`, `hr`, `he`, `hf`.
     intro r hr he hf
     -- Unpack the facts on the right and name them.
     obtain ⟨hlt, hpub⟩ := hs.r_loaded r hr
@@ -1183,7 +1381,9 @@ theorem r_loaded_step {s t : St} (hs : Inv s) (hst : Step s t) :
       fun x hx => inPub_step hs hst' hlt (hpub x hx)⟩
   -- One case per kind of step.
   cases hst with
+  -- Case: a memory reader begins, noting the appends that have returned.
   | begin r0 hpc =>
+    -- Name what the goal starts with: `r`, `hr`.
     intro r hr
     -- `r0` began, so `r` is another reader.
     have hrr : r ≠ r0 := by intro h; subst h; simp at hr
@@ -1191,11 +1391,15 @@ theorem r_loaded_step {s t : St} (hs : Inv s) (hst : Step s t) :
     simp only [set_other _ _ _ _ hrr] at hr
     -- This is exactly what the goal asks.
     exact kept r hr rfl (set_other _ _ _ _ hrr)
+  -- Case: a memory reader loads the pointer.
   | load r0 hpc =>
+    -- Name what the goal starts with: `r`, `hr`.
     intro r hr
     -- Split on whether `r = r0` holds.
     by_cases hrr : r = r0
-    · -- `r0` loaded the current extent: every finished append is there.
+    -- `r0` loaded the current extent: every finished append is there.
+    ·
+      -- Replace one side of `hrr` by the other everywhere.
       subst hrr
       -- Read the value `set` just wrote at this key.
       simp only [set_same]
@@ -1205,11 +1409,15 @@ theorem r_loaded_step {s t : St} (hs : Inv s) (hst : Step s t) :
       intro x hx
       -- The state's `holds` fact from before the step gives exactly this.
       exact hs.holds x (hs.r_begun r hpc x hx)
-    · -- Another reader: untouched.
+    -- Another reader: untouched.
+    ·
+      -- Read through `set` at a key it did not change in `hr`: the old value.
       simp only [set_other _ _ _ _ hrr] at hr
       -- This is exactly what the goal asks.
       exact kept r hr (set_other _ _ _ _ hrr) rfl
+  -- Case: a memory reader reads its extent's published length.
   | lenRead r0 hpc =>
+    -- Name what the goal starts with: `r`, `hr`.
     intro r hr
     -- `r0` is past its length now, so `r` is another reader.
     have hrr : r ≠ r0 := by intro h; subst h; simp at hr
@@ -1217,7 +1425,9 @@ theorem r_loaded_step {s t : St} (hs : Inv s) (hst : Step s t) :
     simp only [set_other _ _ _ _ hrr] at hr
     -- This is exactly what the goal asks.
     exact kept r hr rfl rfl
+  -- Case: a memory reader copies the published records.
   | copy r0 hpc =>
+    -- Name what the goal starts with: `r`, `hr`.
     intro r hr
     -- `r0` is done, so `r` is another reader.
     have hrr : r ≠ r0 := by intro h; subst h; simp at hr
@@ -1225,6 +1435,7 @@ theorem r_loaded_step {s t : St} (hs : Inv s) (hst : Step s t) :
     simp only [set_other _ _ _ _ hrr] at hr
     -- This is exactly what the goal asks.
     exact kept r hr rfl rfl
+  -- Case: every other kind of step.
   | _ =>
     -- Writer steps touch no reader's fields.
     intro r hr
@@ -1245,6 +1456,7 @@ theorem r_len_step {s t : St} (hs : Inv s) (hst : Step s t) :
       t.rfin r = s.rfin r → t.rlen r = s.rlen r →
       t.rext r < t.next ∧ t.rlen r ≤ (t.ext (t.rext r)).len ∧
       ∀ x ∈ t.rfin r, ∃ i, i < t.rlen r ∧ (t.ext (t.rext r)).buf i = x := by
+    -- Name what the goal starts with: `r`, `hr`, `he`, `hf`, `hl`.
     intro r hr he hf hl
     -- Unpack the facts on the right and name them.
     obtain ⟨hlt, hle, hsee⟩ := hs.r_len r hr
@@ -1262,7 +1474,9 @@ theorem r_len_step {s t : St} (hs : Inv s) (hst : Step s t) :
     exact ⟨i, hi, by rw [hkeep i (by omega)]; exact hix⟩
   -- One case per kind of step.
   cases hst with
+  -- Case: a memory reader begins, noting the appends that have returned.
   | begin r0 hpc =>
+    -- Name what the goal starts with: `r`, `hr`.
     intro r hr
     -- `r0` began, so `r` is another reader.
     have hrr : r ≠ r0 := by intro h; subst h; simp at hr
@@ -1270,7 +1484,9 @@ theorem r_len_step {s t : St} (hs : Inv s) (hst : Step s t) :
     simp only [set_other _ _ _ _ hrr] at hr
     -- This is exactly what the goal asks.
     exact kept r hr rfl (set_other _ _ _ _ hrr) rfl
+  -- Case: a memory reader loads the pointer.
   | load r0 hpc =>
+    -- Name what the goal starts with: `r`, `hr`.
     intro r hr
     -- `r0` loaded, so `r` is another reader.
     have hrr : r ≠ r0 := by intro h; subst h; simp at hr
@@ -1278,11 +1494,15 @@ theorem r_len_step {s t : St} (hs : Inv s) (hst : Step s t) :
     simp only [set_other _ _ _ _ hrr] at hr
     -- This is exactly what the goal asks.
     exact kept r hr (set_other _ _ _ _ hrr) rfl rfl
+  -- Case: a memory reader reads its extent's published length.
   | lenRead r0 hpc =>
+    -- Name what the goal starts with: `r`, `hr`.
     intro r hr
     -- Split on whether `r = r0` holds.
     by_cases hrr : r = r0
-    · -- `r0` loaded its extent's length: what it must see is below it.
+    -- `r0` loaded its extent's length: what it must see is below it.
+    ·
+      -- Replace one side of `hrr` by the other everywhere.
       subst hrr
       -- Unpack the facts on the right and name them.
       obtain ⟨hlt, hpub⟩ := hs.r_loaded r hpc
@@ -1290,22 +1510,31 @@ theorem r_len_step {s t : St} (hs : Inv s) (hst : Step s t) :
       simp only [set_same]
       -- Put the pieces together.
       exact ⟨hlt, Nat.le_refl _, hpub⟩
-    · -- Another reader: untouched.
+    -- Another reader: untouched.
+    ·
+      -- Read through `set` at a key it did not change in `hr`: the old value.
       simp only [set_other _ _ _ _ hrr] at hr
       -- This is exactly what the goal asks.
       exact kept r hr rfl rfl (set_other _ _ _ _ hrr)
+  -- Case: a memory reader copies the published records.
   | copy r0 hpc =>
+    -- Name what the goal starts with: `r`, `hr`.
     intro r hr
     -- Split on whether `r = r0` holds.
     by_cases hrr : r = r0
-    · -- `r0` copied: its fields are as they were at its length.
+    -- `r0` copied: its fields are as they were at its length.
+    ·
+      -- Replace one side of `hrr` by the other everywhere.
       subst hrr
       -- This is exactly what the goal asks.
       exact kept r (Or.inl hpc) rfl rfl rfl
-    · -- Another reader: untouched.
+    -- Another reader: untouched.
+    ·
+      -- Read through `set` at a key it did not change in `hr`: the old value.
       simp only [set_other _ _ _ _ hrr] at hr
       -- This is exactly what the goal asks.
       exact kept r hr rfl rfl rfl
+  -- Case: every other kind of step.
   | _ =>
     -- Writer steps touch no reader's fields.
     intro r hr
@@ -1325,7 +1554,9 @@ theorem inv_step {s t : St} (hs : Inv s) (hst : Step s t) : Inv t := by
 theorem inv_reach {s : St} (h : Reach s) : Inv s := by
   -- By how `s` was reached: the start, or one step from a reachable state.
   induction h with
+  -- The start satisfies the invariant.
   | init => exact inv_init
+  -- One more step keeps it.
   | step _ hst ih => exact inv_step ih hst
 
 /-- **`current_holds_finished`.** Every append that returned is published in
