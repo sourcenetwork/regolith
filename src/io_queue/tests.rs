@@ -305,3 +305,105 @@ fn a_park_that_lands_after_close_swept_is_released_by_its_run() {
     assert!(wait.is_ready());
     queue.runtime().reopen();
 }
+
+/// A job that parks while `open` is unset, keeping the waker its step was
+/// given, and counts its runs.
+struct GatedJob {
+    open: Arc<std::sync::atomic::AtomicBool>,
+    runs: Arc<AtomicUsize>,
+    waker: Arc<std::sync::Mutex<Option<Waker>>>,
+}
+
+impl crate::engine::io::job::JobBody for GatedJob {
+    fn run(self: Box<Self>) {
+        self.runs.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn step(self: Box<Self>, waker: &Waker) -> crate::engine::io::job::Step {
+        if self.open.load(Ordering::SeqCst) {
+            self.run();
+            return crate::engine::io::job::Step::Done;
+        }
+        *self.waker.lock().unwrap() = Some(waker.clone());
+        crate::engine::io::job::Step::Parked(self)
+    }
+
+    fn release(self: Box<Self>) {}
+}
+
+/// One queue holds a read parked for an open-file slot (closed to claims
+/// until a slot frees, D60) and a job parked for something else (free to
+/// claim again once its waker says so). Each goes on for its own cause
+/// only, in either order: a freed slot runs the read and leaves the job
+/// parked, and the job's waker runs the job and leaves the read parked.
+#[test]
+fn a_parked_read_and_a_parked_job_on_one_queue_each_wake_for_their_own_cause() {
+    for slot_first in [true, false] {
+        let (_dir, db) = cold();
+        let mut queue = db.io_queue();
+        let reads = Arc::new(AtomicUsize::new(0));
+        let Err(err) = queue
+            .runtime()
+            .miss(queue.id(), PARKING_KEY, 1, parking_work(&reads))
+        else {
+            panic!("a miss answered without a read");
+        };
+        let wait = would_block(err);
+        let open = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let job_runs = Arc::new(AtomicUsize::new(0));
+        let waker = Arc::new(std::sync::Mutex::new(None));
+        let job = crate::engine::io::job::Job::new(Box::new(GatedJob {
+            open: Arc::clone(&open),
+            runs: Arc::clone(&job_runs),
+            waker: Arc::clone(&waker),
+        }));
+        assert!(
+            queue
+                .runtime()
+                .submit(queue.shared(), Arc::clone(&job), None)
+                .is_ok()
+        );
+
+        let progress = queue.poll(IoBudget::ALL);
+        assert_eq!(progress.completed, 0);
+        assert!(progress.more_pending, "both are still owed");
+        assert_eq!(reads.load(Ordering::SeqCst), 1, "the read ran and parked");
+        assert_eq!(job_runs.load(Ordering::SeqCst), 0, "the job parked");
+        queue.poll(IoBudget::ALL);
+        assert_eq!(reads.load(Ordering::SeqCst), 1, "a parked read is not run");
+
+        let free_the_slot = |queue: &mut crate::IoQueue| {
+            queue.shared().slot_freed();
+            queue.poll(IoBudget::ALL);
+        };
+        let wake_the_job = |queue: &mut crate::IoQueue| {
+            open.store(true, Ordering::SeqCst);
+            waker
+                .lock()
+                .unwrap()
+                .take()
+                .expect("the parked job kept its waker")
+                .wake();
+            queue.poll(IoBudget::ALL);
+        };
+        if slot_first {
+            free_the_slot(&mut queue);
+            assert!(wait.is_ready(), "the freed slot ran the read");
+            assert_eq!(job_runs.load(Ordering::SeqCst), 0, "and not the job");
+            assert!(!job.is_done());
+            wake_the_job(&mut queue);
+        } else {
+            wake_the_job(&mut queue);
+            assert_eq!(job_runs.load(Ordering::SeqCst), 1, "its waker ran the job");
+            assert!(!wait.is_ready(), "and not the read");
+            assert_eq!(reads.load(Ordering::SeqCst), 1);
+            free_the_slot(&mut queue);
+        }
+        assert!(wait.is_ready());
+        assert_eq!(reads.load(Ordering::SeqCst), 2, "the read ran once more");
+        assert_eq!(job_runs.load(Ordering::SeqCst), 1, "the job ran once");
+        assert!(job.is_done());
+        assert_eq!(queue.runtime().units_in_flight(), 0);
+        assert_eq!(queue.runtime().jobs_in_flight(), 0);
+    }
+}
