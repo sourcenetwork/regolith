@@ -88,6 +88,13 @@ impl Env for FaultyEnv {
     fn open_read(&self, path: &Path) -> io::Result<Box<dyn ReadFile>> {
         self.inner.open_read(path)
     }
+    fn open_log(
+        &self,
+        path: &Path,
+        mode: WriteMode,
+    ) -> io::Result<Box<dyn regolith::env::LogFile>> {
+        self.inner.open_log(path, mode)
+    }
     fn open_write(&self, path: &Path, mode: WriteMode) -> io::Result<Box<dyn WriteFile>> {
         if self.fail_tables.load(Ordering::SeqCst) && path.extension().is_some_and(|e| e == "sst") {
             self.tables_refused.fetch_add(1, Ordering::SeqCst);

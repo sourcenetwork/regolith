@@ -72,7 +72,8 @@ use kovan_map::HashMap;
 use wasm_bindgen::JsValue;
 
 use crate::env::{
-    Capabilities, Env, FileLock, FileMeta, JoinHandle, ReadDir, ReadFile, WriteFile, WriteMode,
+    Capabilities, Env, FileLock, FileMeta, JoinHandle, LogFile, ReadDir, ReadFile, WriteFile,
+    WriteMode,
 };
 
 use mirror::{Loaded, MirrorFs};
@@ -400,6 +401,12 @@ impl Env for OpfsEnv {
 
     fn open_write(&self, path: &Path, mode: WriteMode) -> io::Result<Box<dyn WriteFile>> {
         self.store().open_write(path, mode)
+    }
+
+    /// Written at an offset of the file's sync access handle, or of its
+    /// mirror in memory: no cursor and no lock.
+    fn open_log(&self, path: &Path, mode: WriteMode) -> io::Result<Box<dyn LogFile>> {
+        self.store().open_log(path, mode)
     }
 
     fn metadata(&self, path: &Path) -> io::Result<FileMeta> {

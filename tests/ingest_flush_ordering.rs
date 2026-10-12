@@ -161,6 +161,13 @@ impl NthSstOpen {
 }
 
 impl Env for NthSstOpen {
+    fn open_log(
+        &self,
+        path: &Path,
+        mode: WriteMode,
+    ) -> io::Result<Box<dyn regolith::env::LogFile>> {
+        self.inner.open_log(path, mode)
+    }
     fn open_write(&self, path: &Path, mode: WriteMode) -> io::Result<Box<dyn WriteFile>> {
         if path.parent() == Some(self.sst_dir.as_path()) {
             let n = self.count.fetch_add(1, Ordering::AcqRel) + 1;

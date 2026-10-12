@@ -1,5 +1,7 @@
 //! A [`LogFile`] over an append-only [`WriteFile`]: what [`Env::open_log`]
-//! hands out for an environment that cannot write at an offset.
+//! hands out for an environment outside this crate that has not said how
+//! it writes at an offset. No environment of this crate uses it: each has
+//! a log no write of which waits for another.
 //!
 //! The file only ever grows at its end, so the writes are put in offset
 //! order: one that starts at the end is appended, one that starts above it
@@ -37,8 +39,23 @@ struct Inner {
     held: BTreeMap<u64, Vec<u8>>,
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Serial logs this thread opened: what shows that no environment of
+    /// this crate hands one out.
+    static OPENED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Test-only: how many serial logs this thread has opened.
+#[cfg(test)]
+pub(super) fn opened_here() -> usize {
+    OPENED.with(std::cell::Cell::get)
+}
+
 impl SerialLog {
     pub(super) fn open<E: Env + ?Sized>(env: &E, path: &Path, mode: WriteMode) -> io::Result<Self> {
+        #[cfg(test)]
+        OPENED.with(|opened| opened.set(opened.get() + 1));
         let (file, end) = match mode {
             WriteMode::Truncate => (env.open_write(path, WriteMode::Truncate)?, 0),
             WriteMode::Append | WriteMode::Update => {
@@ -224,5 +241,49 @@ mod tests {
             let want: Vec<u8> = records.iter().flat_map(|(_, b)| b.clone()).collect();
             prop_assert_eq!(env.read(Path::new("/db/log")).unwrap(), want);
         }
+    }
+}
+
+#[cfg(test)]
+mod in_tree {
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::env::open_file_limit::OpenFileLimit;
+    use crate::env::walk_fault::WalkFault;
+    use crate::env::{MemEnv, std_env};
+
+    /// The serial log is for an environment outside this crate. Each one in
+    /// it that a database runs on, on this target, hands out a log of its
+    /// own, and a wrapper hands out the log of what it wraps.
+    #[test]
+    fn no_environment_of_this_crate_hands_out_the_serial_log() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let on_disk = dir.path().join("log");
+        let in_memory = Path::new("/db/log");
+        let mem = MemEnv::new();
+        mem.create_dir_all(Path::new("/db")).unwrap();
+        let faulted = WalkFault::default();
+        faulted.create_dir_all(Path::new("/db")).unwrap();
+
+        let before = opened_here();
+        std_env().open_log(&on_disk, WriteMode::Truncate).unwrap();
+        mem.open_log(in_memory, WriteMode::Truncate).unwrap();
+        OpenFileLimit::new(std_env(), 4)
+            .open_log(&on_disk, WriteMode::Update)
+            .unwrap();
+        OpenFileLimit::new(Arc::new(mem.clone()), 4)
+            .open_log(in_memory, WriteMode::Update)
+            .unwrap();
+        faulted.open_log(in_memory, WriteMode::Truncate).unwrap();
+        assert_eq!(
+            opened_here(),
+            before,
+            "an environment fell back to the lock"
+        );
+
+        // The count is live: the default does open one.
+        SerialLog::open(&mem, in_memory, WriteMode::Update).unwrap();
+        assert_eq!(opened_here(), before + 1);
     }
 }

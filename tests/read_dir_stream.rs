@@ -130,6 +130,14 @@ impl Env for WalkProbe {
         self.act(path);
         self.inner.open_read(path)
     }
+    fn open_log(
+        &self,
+        path: &Path,
+        mode: WriteMode,
+    ) -> io::Result<Box<dyn regolith::env::LogFile>> {
+        self.act(path);
+        self.inner.open_log(path, mode)
+    }
     fn open_write(&self, path: &Path, mode: WriteMode) -> io::Result<Box<dyn WriteFile>> {
         self.act(path);
         self.inner.open_write(path, mode)

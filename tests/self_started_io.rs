@@ -28,6 +28,9 @@ impl Env for CountsDiskChecks {
     fn open_read(&self, p: &Path) -> io::Result<Box<dyn ReadFile>> {
         self.inner.open_read(p)
     }
+    fn open_log(&self, p: &Path, mode: WriteMode) -> io::Result<Box<dyn regolith::env::LogFile>> {
+        self.inner.open_log(p, mode)
+    }
     fn open_write(&self, p: &Path, mode: WriteMode) -> io::Result<Box<dyn WriteFile>> {
         self.inner.open_write(p, mode)
     }

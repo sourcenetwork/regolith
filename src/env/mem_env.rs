@@ -18,7 +18,8 @@
 //! the same file without touching either map, and every read is a copy
 //! out of the file with no lock at all. The clocks are atomics. No call
 //! here takes a lock; the directory registry (`open_dirs`) is the only
-//! exclusion, and it is taken only by `lock_file`.
+//! exclusion, and it is taken only by `lock_file`. A write-ahead log is the
+//! same file written at offsets, with no lock either (`mem_log.rs`).
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -30,8 +31,10 @@ use crate::portability::{AtomicU64, Ordering};
 
 use super::db_lock::DirectoryRegistry;
 use super::mem_file::{Free, MemFile};
+use super::mem_log::MemLog;
 use super::{
-    Capabilities, Env, FileLock, FileMeta, JoinHandle, ReadDir, ReadFile, WriteFile, WriteMode,
+    Capabilities, Env, FileLock, FileMeta, JoinHandle, LogFile, ReadDir, ReadFile, WriteFile,
+    WriteMode,
 };
 
 /// Buckets each map starts with; they grow on demand.
@@ -153,6 +156,28 @@ impl MemEnv {
     fn lookup(&self, path: &Path) -> io::Result<Arc<MemFile>> {
         self.fs.files.get(path).ok_or_else(|| not_found(path))
     }
+
+    /// The file at `path` to write to: made when absent, and emptied for
+    /// [`WriteMode::Truncate`].
+    fn writable(&self, path: &Path, mode: WriteMode) -> io::Result<Arc<MemFile>> {
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+            && !self.fs.dirs.contains_key(parent)
+        {
+            return Err(not_found(parent));
+        }
+        let data = match self.fs.files.get(path) {
+            Some(data) => data,
+            None => self
+                .fs
+                .files
+                .get_or_insert(path.to_path_buf(), Arc::new(MemFile::new())),
+        };
+        if mode == WriteMode::Truncate {
+            data.set_len(0, &Free)?;
+        }
+        Ok(data)
+    }
 }
 
 #[cfg(test)]
@@ -217,23 +242,15 @@ impl Env for MemEnv {
     }
 
     fn open_write(&self, path: &Path, mode: WriteMode) -> io::Result<Box<dyn WriteFile>> {
-        if let Some(parent) = path.parent()
-            && !parent.as_os_str().is_empty()
-            && !self.fs.dirs.contains_key(parent)
-        {
-            return Err(not_found(parent));
-        }
-        let data = match self.fs.files.get(path) {
-            Some(data) => data,
-            None => self
-                .fs
-                .files
-                .get_or_insert(path.to_path_buf(), Arc::new(MemFile::new())),
-        };
-        if mode == WriteMode::Truncate {
-            data.set_len(0, &Free)?;
-        }
-        Ok(Box::new(MemWriteFile { data }))
+        Ok(Box::new(MemWriteFile {
+            data: self.writable(path, mode)?,
+        }))
+    }
+
+    /// The same file, written at offsets by any number of threads with no
+    /// lock (`mem_log.rs`).
+    fn open_log(&self, path: &Path, mode: WriteMode) -> io::Result<Box<dyn LogFile>> {
+        Ok(Box::new(MemLog::new(self.writable(path, mode)?)))
     }
 
     fn metadata(&self, path: &Path) -> io::Result<FileMeta> {

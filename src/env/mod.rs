@@ -38,6 +38,7 @@ mod buffered;
 mod db_lock;
 mod mem_env;
 pub(crate) mod mem_file;
+mod mem_log;
 pub(crate) mod open_file_limit;
 mod types;
 // The browser's Origin Private File System. Only compiled for
@@ -158,13 +159,21 @@ pub trait Env: Send + Sync + std::fmt::Debug {
     /// [`WriteMode::Truncate`] starts an empty log. Any other mode keeps
     /// what the file holds, so writes continue above it.
     ///
-    /// The default opens the file with [`Env::open_write`] and puts the
-    /// writes in offset order behind a lock, holding a write that arrives
-    /// ahead of a gap until the gap is filled. That is always correct, and
-    /// it keeps an environment that wraps `open_write` (to count, to fail
-    /// or to record writes) seeing every byte of the log. An environment
-    /// that can write at an offset natively should override this: then no
-    /// committing thread waits for another to write. [`StdEnv`] does.
+    /// The default is for an environment outside this crate that has not
+    /// said how it writes at an offset. It opens the file with
+    /// [`Env::open_write`] and puts the writes in offset order behind a
+    /// lock, holding a write that arrives ahead of a gap until the gap is
+    /// filled. That is always correct, and it is the one place a committing
+    /// thread waits for another to write.
+    ///
+    /// No environment of this crate uses the default. Every one a database
+    /// runs on has a log no write of which waits for another: [`StdEnv`]
+    /// and the WASI environment write at an offset on the host, [`MemEnv`]
+    /// appends without a lock, and the OPFS environment writes at an
+    /// offset of its handle or its mirror. An environment that wraps
+    /// another forwards to the one it wraps, and wraps the log it is handed
+    /// when it counts, fails or records writes. An environment of your own
+    /// that can write at an offset should override this too.
     fn open_log(&self, path: &Path, mode: WriteMode) -> io::Result<Box<dyn LogFile>> {
         Ok(Box::new(serial_log::SerialLog::open(self, path, mode)?))
     }

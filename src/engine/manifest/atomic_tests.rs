@@ -233,6 +233,9 @@ impl Env for RewriteFailureEnv {
         self.inner.open_read(path)
     }
 
+    fn open_log(&self, path: &Path, mode: WriteMode) -> io::Result<Box<dyn crate::env::LogFile>> {
+        self.inner.open_log(path, mode)
+    }
     fn open_write(&self, path: &Path, mode: WriteMode) -> io::Result<Box<dyn WriteFile>> {
         if matches!(mode, WriteMode::Append) && self.fail_append_open.swap(false, Ordering::SeqCst)
         {

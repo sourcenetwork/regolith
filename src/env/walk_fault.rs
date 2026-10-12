@@ -47,6 +47,9 @@ impl Env for WalkFault {
     fn open_read(&self, path: &Path) -> io::Result<Box<dyn ReadFile>> {
         self.inner.open_read(path)
     }
+    fn open_log(&self, path: &Path, mode: WriteMode) -> io::Result<Box<dyn super::LogFile>> {
+        self.inner.open_log(path, mode)
+    }
     fn open_write(&self, path: &Path, mode: WriteMode) -> io::Result<Box<dyn WriteFile>> {
         self.inner.open_write(path, mode)
     }
