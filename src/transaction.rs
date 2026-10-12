@@ -1942,6 +1942,9 @@ fn receipt_of(
             conflict.strip_cf_prefix();
             if let Some(s) = stats {
                 s.add(crate::Ticker::CommitConflicts, 1);
+                if conflict.theirs().is_deletion() {
+                    s.add(crate::Ticker::CommitConflictsAfterDelete, 1);
+                }
             }
             Err(TransactionError::Conflict(conflict))
         }
