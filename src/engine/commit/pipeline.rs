@@ -1,5 +1,6 @@
 //! The stages of the lock-free commit pipeline (plan 4.7;
-//! `proofs/tla/CommitPipeline.tla`, `proofs/lean/Regolith/Pipeline.lean`).
+//! `proofs/tla/CommitPipeline.tla`, `proofs/lean/Regolith/Pipeline.lean`,
+//! `proofs/lean/Regolith/PipelineHelping.lean`).
 //!
 //! A commit takes a slot of the ring (`ring.rs`) and then passes five
 //! stages. No stage belongs to a thread: whichever thread reaches a slot

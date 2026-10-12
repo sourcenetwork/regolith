@@ -13,7 +13,7 @@
 //!   [`Decision`] by one compare-and-swap. Every thread that computed one
 //!   for the slot proceeds with the one that was installed, whoever built
 //!   it, so the sequences, the log position and the verdict of a slot are
-//!   the same for every thread (model action `Decide`).
+//!   the same for every thread (model action `DecideCas`).
 //! - **D2, stages are flags that are set once.** `APPLIED`, `WRITTEN` and
 //!   `FAILED` are set by whichever thread finishes the stage, after its
 //!   work, and never cleared. A thread that sees a flag set skips the stage;

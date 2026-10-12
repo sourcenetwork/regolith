@@ -39,10 +39,16 @@ import Regolith.ShardedStats
 -- E10: a group commit decides every member as committing them one at a
 -- time would. Backs `proofs/tla/GroupCommit.tla`.
 import Regolith.GroupCommit
--- 4.7: deciding in ring order gives dense sequences in ring order, and a
--- reader at the published horizon sees exactly the published commits.
--- Backs `proofs/tla/CommitPipeline.tla`.
+-- 4.7: deciding in ring order gives dense sequences in ring order, a
+-- reader at the published horizon sees exactly the published commits, a
+-- rollback leaves the sequences as if the discarded slots had never been
+-- decided, and a sync vouches only for what is written. Backs
+-- `proofs/tla/CommitPipeline.tla`.
 import Regolith.Pipeline
+-- 4.7: every ordering rule of the pipeline looks back only, so one thread
+-- alone finishes every slot up to its own, wherever the others stopped.
+-- Backs `proofs/tla/CommitPipeline.tla`.
+import Regolith.PipelineHelping
 -- Plan 3.3: an exact partial_merge folds to full_merge in any grouping, and
 -- the touches law. Backs `proofs/tla/RepeatableRead.tla`.
 import Regolith.MergeOperator

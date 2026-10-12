@@ -706,18 +706,67 @@ tla:
     check MC_GroupCommit_Green_Nowait                  GREEN
     check MC_GroupCommit_Green_Nowait_Owes             RED NothingOwed
     check MC_GroupCommit_Red_DoubleClaim               RED SingleSync
-    # 4.7, the lock-free commit pipeline. Lean: Regolith/Pipeline.lean,
-    # seqs_dense and reader_sees_published.
+    # 4.7, the lock-free commit pipeline as built: helping, voiding, the
+    # check in two parts (early, then in ring order), the round (one claim
+    # on the log's device step), the rollback of a failed log, ordered
+    # units and rotation through the ring. A Green row whose name ends in
+    # Discards, Stale, Rotates, Voids, Helps or Aborts is a witness: the
+    # GREEN run beside it with one false claim added, which must break, so
+    # the GREEN run is known to reach the case. Lean:
+    # Regolith/Pipeline.lean, seqs_dense, reader_sees_published,
+    # rollback_as_if_never_decided, rollback_keeps_published,
+    # sync_covers_only_written; Regolith/PipelineHelping.lean,
+    # first_unfinished_can_step, helper_alone_finishes, helping_is_bounded;
+    # Regolith/GroupCommit.lean, group_eq_serial, early_check_split.
     spec=CommitPipeline
-    check MC_CommitPipeline_Green                      GREEN
-    check MC_CommitPipeline_Green_Live                 GREEN
-    check MC_CommitPipeline_Green_LiveIngest           GREEN
-    check MC_CommitPipeline_Green_LiveNoStop           GREEN
-    check MC_CommitPipeline_Red_OutOfOrder             RED ReadersSeePrefix
-    check MC_CommitPipeline_Red_AbortHole              RED NoHole
-    check MC_CommitPipeline_Red_NoHelping              RED NoLiveThreadBlocked
-    check MC_CommitPipeline_Red_SyncPastGap            RED DurableImpliesWritten
-    check MC_CommitPipeline_Red_ValidatePublished      RED NoLostUpdate
+    check MC_CommitPipeline_Green                           GREEN
+    check MC_CommitPipeline_Green_Stop                      GREEN
+    check MC_CommitPipeline_Green_Live                      GREEN
+    check MC_CommitPipeline_Green_LiveIngest                GREEN
+    check MC_CommitPipeline_Green_LiveApart                 GREEN
+    check MC_CommitPipeline_Green_LiveThree_Head1           GREEN
+    check MC_CommitPipeline_Green_LiveThree_Head2           GREEN
+    check MC_CommitPipeline_Green_LiveThree_Head3           GREEN
+    check MC_CommitPipeline_Green_Rollback                  GREEN
+    check MC_CommitPipeline_Green_Rollback_Discards         RED NothingThrownOut
+    check MC_CommitPipeline_Green_Rollback_Stale            RED NoStaleVerdict
+    check MC_CommitPipeline_Green_Rollback_Three            GREEN
+    check MC_CommitPipeline_Green_Rotation                  GREEN
+    check MC_CommitPipeline_Green_Rotation_Rotates          RED NeverRotated
+    check MC_CommitPipeline_Green_Rotation_Three            GREEN
+    check MC_CommitPipeline_Green_Unit_Rollback             GREEN
+    check MC_CommitPipeline_Green_Live_Voids                RED NothingVoided
+    check MC_CommitPipeline_Green_Live_Helps                RED StoppedStaysUnfinished
+    check MC_CommitPipeline_Green_Early                     GREEN
+    check MC_CommitPipeline_Green_Early_Aborts              RED NoEarlyAbort
+    check MC_CommitPipeline_Green_ReadOnly                  GREEN
+    check MC_CommitPipeline_Green_Plain                     GREEN
+    check MC_CommitPipeline_Red_OutOfOrder                  RED ReadersSeePrefix
+    check MC_CommitPipeline_Red_AbortHole                   RED NoHole
+    check MC_CommitPipeline_Red_NoHelping                   RED NoLiveThreadBlocked
+    check MC_CommitPipeline_Red_SyncPastGap                 RED DurableImpliesWritten
+    check MC_CommitPipeline_Red_ValidatePublished           RED NoLostUpdate
+    check MC_CommitPipeline_Red_VoidNotCas                  RED OwnerSeesItsFate
+    check MC_CommitPipeline_Red_TwoSyncs                    RED OneRound
+    check MC_CommitPipeline_Red_TwoSyncs_Durable            RED DurableWithinDecided
+    check MC_CommitPipeline_Red_FrontierFirst               RED PublishedIsVisible
+    check MC_CommitPipeline_Red_UnitNoDrain                 RED DurableImpliesWritten
+    check MC_CommitPipeline_Red_UnitNoDrain_SealedLog       RED InFlightInCurrentLog
+    check MC_CommitPipeline_Red_UnitNoDrain_Unit            RED DurableImpliesWritten
+    check MC_CommitPipeline_Red_SettleAnyEpoch              RED NoHole
+    check MC_CommitPipeline_Red_SettleAnyEpoch_Abort        RED AbortsHaveCause
+    check MC_CommitPipeline_Red_KeepMemtable                RED MemtableOnlyLive
+    check MC_CommitPipeline_Red_NoEpochGate                 RED RecordsAreLive
+    check MC_CommitPipeline_Red_PassBeforeApply             RED AppliedBeforePassed
+    check MC_CommitPipeline_Red_PassBeforeApply_LostUpdate  RED NoLostUpdate
+    check MC_CommitPipeline_Red_RollbackForgets             RED PublishedPrefix
+    check MC_CommitPipeline_Red_RollbackForgets_Ack         RED NoFalseAck
+    check MC_CommitPipeline_Red_NoFreeze                    RED NoHole
+    check MC_CommitPipeline_Red_TrustEarly                  RED NoLostUpdate
+    check MC_CommitPipeline_Red_PublishBeforeSync           RED DurableBeforeVisible
+    check MC_CommitPipeline_Red_DecideAnyOrder              RED DecidedIsPrefix
+    check MC_CommitPipeline_Red_DecideAnyOrder_Order        RED SeqInRingOrder
+    check MC_CommitPipeline_Red_StopHoldsClaim              RED NoLiveThreadBlocked
     # R13 and D53, non-blocking reads on per-thread I/O queues: single-flight
     # units claimed by one CAS, completions only on the asking queue, idle
     # wakeups. Lean: Regolith/IoQueue.lean, claim_once, told_exactly_once,
