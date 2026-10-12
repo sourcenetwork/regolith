@@ -637,7 +637,6 @@ impl RegolithEngine {
         );
         let memtable = Arc::new(MemTable::new(&memtable_config)?);
         let mut wal_files = list_wal_files(&*env, &wal_dir)?;
-        wal_files.sort();
         wal_files.retain(|path| should_replay_wal(path, version.min_wal_id));
 
         let (latest_seq, discarded) = replay_logs(&env, &wal_files, &memtable, latest_seq)?;
@@ -819,7 +818,6 @@ impl RegolithEngine {
 
         let memtable = Arc::new(MemTable::new(&memtable_config)?);
         let mut wal_files = list_wal_files(&*env, &wal_dir)?;
-        wal_files.sort();
         wal_files.retain(|path| should_replay_wal(path, version.min_wal_id));
 
         // A read-only open writes nothing, so the tail stays in the file;
@@ -3149,6 +3147,15 @@ impl CheckpointSnapshot {
     }
 }
 
+/// The WAL files in `dir`, oldest first.
+///
+/// The order is the id in each name read as a number. The names are padded
+/// to six digits, so as text `wal_1000000.log` sorts before
+/// `wal_999999.log`; recovery judges the last file of this list as the one
+/// a crash may have torn, so the text order would refuse a power cut in log
+/// 1,000,000 as damage and accept damage in log 999,999 as a torn tail.
+/// Every lister goes through here, so no caller orders the names itself. A
+/// name with no id sorts before every numbered log, by name.
 fn list_wal_files(env: &dyn Env, dir: &Path) -> std::io::Result<Vec<PathBuf>> {
     let mut files = Vec::new();
     if env.exists(dir) {
@@ -3162,6 +3169,7 @@ fn list_wal_files(env: &dyn Env, dir: &Path) -> std::io::Result<Vec<PathBuf>> {
             }
         }
     }
+    files.sort_by(|a, b| (wal_file_id(a), a).cmp(&(wal_file_id(b), b)));
     Ok(files)
 }
 
@@ -3277,3 +3285,6 @@ fn apply_replayed_wal_entry(memtable: &MemTable, entry: WalEntry) -> u64 {
 
 #[cfg(test)]
 mod recovery_tests;
+
+#[cfg(test)]
+mod wal_order_tests;
