@@ -775,7 +775,8 @@ fn a_deep_level_structure_still_answers_every_read() {
         for i in 0..KEYS {
             let key = format!("k{i:06}").into_bytes();
             let value = format!("value_for_{i:06}").into_bytes();
-            db.put(&key, &value).unwrap();
+            // Through stalls: a busy host's compaction worker falls behind.
+            regolith::through_stalls(|| db.put(&key, &value)).unwrap();
             expected.insert(key, value);
         }
 
