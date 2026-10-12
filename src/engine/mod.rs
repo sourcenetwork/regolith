@@ -1876,6 +1876,13 @@ impl RegolithEngine {
         stall_state::refresh(&self.cached_stall_level, &self.view.load(), &self.options);
     }
 
+    /// Test-only: the stall level writers cache: 0 for none, 1 for a
+    /// slowdown, 2 for a stop.
+    #[cfg(test)]
+    pub(crate) fn cached_stall_level(&self) -> u8 {
+        self.cached_stall_level.load(Ordering::Acquire)
+    }
+
     /// How long a stalled writer parks before re-checking its
     /// thresholds. The wait is bounded so a missed notification costs
     /// one re-check rather than wedging the writer forever.
