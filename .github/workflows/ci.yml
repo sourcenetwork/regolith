@@ -71,8 +71,13 @@ jobs:
       - run: just test
 
 
+  # Every job below carries a `timeout-minutes` a few times its measured
+  # run time, so one that hangs is cancelled in minutes and named, where
+  # GitHub's default would hold a runner for six hours.
   clippy:
     runs-on: ubuntu-latest
+    # Measured at 35 s.
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -85,6 +90,8 @@ jobs:
 
   fmt:
     runs-on: ubuntu-latest
+    # Measured at 13 s.
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -96,6 +103,8 @@ jobs:
 
   doc:
     runs-on: ubuntu-latest
+    # Measured at 30 s.
+    timeout-minutes: 15
     env:
       RUSTDOCFLAGS: -D warnings
     steps:
@@ -108,6 +117,8 @@ jobs:
 
   alloc-budget:
     runs-on: ubuntu-latest
+    # Measured at 45 s.
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -144,6 +155,8 @@ jobs:
   # unserialized insert only runs there.
   msrv:
     runs-on: ubuntu-latest
+    # Measured at 35 s.
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.90
@@ -164,6 +177,8 @@ jobs:
 
   deny:
     runs-on: ubuntu-latest
+    # Measured at 25 s.
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: EmbarkStudios/cargo-deny-action@v2
