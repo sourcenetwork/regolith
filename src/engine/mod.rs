@@ -23,6 +23,7 @@ mod ingest_range_tests;
 mod ingest_window_tests;
 pub(crate) mod internal_key;
 pub(crate) mod iterator;
+pub(crate) mod log_retirement;
 pub(crate) mod lookup_key;
 #[cfg(loom)]
 pub mod loom_model;
@@ -69,10 +70,14 @@ use manifest::{VersionEdit, VersionSet};
 use memtable::{MemTable, MemTableConfig};
 
 const STOP_TOO_MANY_MEMTABLES: &str = "stop: too many memtables";
+use log_retirement::RetiredLogs;
 use read_horizon::ReadHorizon;
 pub(crate) use read_rule::ReadRule;
 use read_view::{ReadView, ReadViewCell, VersionStore};
-use recovery::{replay_logs, report_discarded_tail, rewrite_recovered_memtable_to_wal};
+use recovery::{
+    replay_logs, report_discarded_tail, report_dropped_manifest_tail,
+    rewrite_recovered_memtable_to_wal,
+};
 use skiplist::InsertHint;
 pub(crate) use snapshot_registry::SnapshotPin;
 use snapshot_registry::SnapshotRegistry;
@@ -619,6 +624,9 @@ impl RegolithEngine {
 
         let version_set =
             VersionSet::open_with_policy(&env, db_dir, &sst_dir, options.metadata_policy())?;
+        if let Some(tail) = version_set.dropped_tail() {
+            report_dropped_manifest_tail(&options, version_set.manifest_path(), tail);
+        }
         let version = version_set.current();
         let latest_seq = version.last_seq;
 
@@ -650,16 +658,6 @@ impl RegolithEngine {
 
         rewrite_recovered_memtable_to_wal(&memtable, &mut wal)?;
 
-        for replayed_wal_path in &wal_files {
-            if replayed_wal_path != &wal_path {
-                match Wal::remove_in(&*env, replayed_wal_path) {
-                    Ok(()) => {}
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(e) => return Err(e),
-                }
-            }
-        }
-
         let versions = Arc::new(VersionStore::new(version_set));
         let view = Arc::new(ReadViewCell::new(ReadView {
             active: Arc::clone(&memtable),
@@ -668,9 +666,17 @@ impl RegolithEngine {
         }));
         versions.attach_view(Arc::clone(&view));
 
-        versions
-            .lock()
-            .apply(&[VersionEdit::SetNextFileId(wal_id + 1)])?;
+        // The new log holds every write the replayed ones did, so they are
+        // retired with the logs flushes left behind. Recorded unsynced: if
+        // the record is lost, the replayed logs are replayed again beside
+        // the new one, which repeats their writes and nothing older.
+        versions.lock().apply(&[
+            VersionEdit::SetNextFileId(wal_id + 1),
+            VersionEdit::SetMinWalId(wal_id),
+        ])?;
+        let removed =
+            log_retirement::remove_below(&*env, &wal_dir, wal_id, options.statistics.as_deref());
+        let retired_logs = RetiredLogs::new(wal_dir.clone(), !removed);
 
         let cache = Arc::new(
             BlockCache::with_config(
@@ -712,6 +718,7 @@ impl RegolithEngine {
             Arc::clone(&view),
             Arc::clone(&versions),
             sst_dir.clone(),
+            retired_logs,
             options.clone(),
             Arc::clone(&background_health),
             Arc::clone(&stall_signal),
@@ -805,6 +812,9 @@ impl RegolithEngine {
         );
         let version_set =
             VersionSet::open_read_only(&env, db_dir, &sst_dir, options.metadata_policy())?;
+        if let Some(tail) = version_set.dropped_tail() {
+            report_dropped_manifest_tail(&options, version_set.manifest_path(), tail);
+        }
         let version = version_set.current();
         let latest_seq = version.last_seq;
 
@@ -847,6 +857,7 @@ impl RegolithEngine {
             Arc::clone(&view),
             Arc::clone(&versions),
             sst_dir.clone(),
+            RetiredLogs::new(wal_dir.clone(), false),
             options.clone(),
             Arc::clone(&background_health),
             Arc::clone(&stall_signal),
@@ -1868,6 +1879,13 @@ impl RegolithEngine {
     /// changes those counters (memtable rotation, compaction pass).
     pub(crate) fn refresh_stall_level(&self) {
         stall_state::refresh(&self.cached_stall_level, &self.view.load(), &self.options);
+    }
+
+    /// Test-only: the stall level writers cache: 0 for none, 1 for a
+    /// slowdown, 2 for a stop.
+    #[cfg(test)]
+    pub(crate) fn cached_stall_level(&self) -> u8 {
+        self.cached_stall_level.load(Ordering::Acquire)
     }
 
     /// How long a stalled writer parks before re-checking its

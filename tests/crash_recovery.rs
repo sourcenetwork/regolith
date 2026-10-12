@@ -119,12 +119,34 @@ fn sst_id_of(path: &Path) -> u64 {
 /// Every live file must exist on disk. A version that names a file the
 /// crash never finished writing, or one a compaction already unlinked, is
 /// a dangling reference and the next read of that key range fails.
+///
+/// The recovered database has a compaction worker, which may install a new
+/// version while the directory is listed: a file it adds after the listing,
+/// or one it removes after the live set was read, is no dangling reference.
+/// So the live set is read before and after the listing, and only a listing
+/// the version did not change across is judged: a file is removed only once
+/// no version names it, so every file of a version live throughout the
+/// listing is in it.
 fn assert_no_dangling_files(db: &Db, db_dir: &Path, tag: &str) {
-    let on_disk: BTreeSet<u64> = fault::find_ssts(db_dir)
-        .iter()
-        .map(|p| sst_id_of(p))
-        .collect();
-    for id in live_file_ids(db) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let mut backoff = std::time::Duration::from_millis(1);
+    let (live, on_disk) = loop {
+        let before = live_file_ids(db);
+        let on_disk: BTreeSet<u64> = fault::find_ssts(db_dir)
+            .iter()
+            .map(|p| sst_id_of(p))
+            .collect();
+        if live_file_ids(db) == before {
+            break (before, on_disk);
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{tag}: the version kept changing while the table directory was listed",
+        );
+        std::thread::sleep(backoff);
+        backoff = (backoff * 2).min(std::time::Duration::from_millis(50));
+    };
+    for id in live {
         assert!(
             on_disk.contains(&id),
             "{tag}: the recovered version claims file {id:06}.sst is live but it is not on disk \
@@ -516,14 +538,17 @@ fn a_process_kill_between_the_wal_append_and_the_memtable_apply_can_only_gain_da
 /// in the recovered version.
 ///
 /// The crash lands on the 3rd `.sst` write syscall, so the file exists on
-/// disk with a partial data block and no footer. regolith flushes on the
-/// writing thread (`rotate_memtable` calls `flush_frozen_memtable`,
-/// `src/engine/mod.rs:1658`), and three L0 files is below the default
-/// compaction trigger, so exactly one thread has written SSTables at that
-/// point and the third write is unambiguously the torn file.
-/// `flush_frozen_memtable` only removes the old WAL after the `AddFile`
-/// edit is applied (`src/engine/mod.rs:1755`), which is the ordering this
-/// test checks from the outside.
+/// disk with a partial data block and no footer. The run has no compaction
+/// worker, so the writing thread runs every flush (the step a write owes
+/// with no worker, or the flush a rotation runs when the one before it is
+/// still pending), and three L0 files is below the default compaction
+/// trigger, so exactly one thread has written SSTables at that point and
+/// the third write is unambiguously the torn file. With a worker, the
+/// worker and the writer can both be inside a flush when the third write
+/// lands, and the journal cannot say which file was torn. A flush removes
+/// the old WAL only after the `AddFile` edit is applied
+/// (`Flusher::flush_oldest`), which is the ordering this test checks from
+/// the outside.
 ///
 /// Catches: a flush that publishes an SSTable into the version before its
 /// bytes are complete, and a flush that retires the WAL before the file
@@ -532,7 +557,7 @@ fn a_process_kill_between_the_wal_append_and_the_memtable_apply_can_only_gain_da
 fn a_process_kill_during_a_flush_installs_no_truncated_sstable() {
     let tmp = TempDir::new().unwrap();
     let db = tmp.path().join("db");
-    let spec = ChildSpec::new(Phase::DuringFlush, &db);
+    let spec = ChildSpec::new(Phase::DuringFlush, &db).workers(0);
     let opts = spec.options();
     let out = CrashRun::new(spec).run();
     out.assert_killed();

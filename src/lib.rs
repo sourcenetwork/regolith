@@ -147,6 +147,7 @@ pub mod loom_exports {
     //! them. It does not exist in an ordinary build.
 
     pub use crate::engine::loom_model::{arena, handoff, skiplist, slice, snapshots, version};
+    pub use crate::sync::loom_model as sync;
 }
 
 #[cfg(feature = "fuzzing")]
@@ -8491,7 +8492,7 @@ mod tests {
 
     /// Wait, with a deadline and a bounded backoff, until the background
     /// has written L0 up to `files` tables.
-    fn wait_for_l0_files(db: &Db, files: u64) {
+    pub(crate) fn wait_for_l0_files(db: &Db, files: u64) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
         let mut pause = std::time::Duration::from_millis(1);
         while db
@@ -8502,6 +8503,23 @@ mod tests {
             assert!(
                 std::time::Instant::now() < deadline,
                 "the background never wrote L0 up to {files} tables"
+            );
+            std::thread::sleep(pause);
+            pause = (pause * 2).min(std::time::Duration::from_millis(50));
+        }
+    }
+
+    /// Wait, with a deadline and a bounded backoff, until writers see a
+    /// stall. The worker refreshes the level writers cache once its flush
+    /// has retired the log, a moment after its table shows in L0, and a
+    /// write in between passes unstalled.
+    fn wait_for_stall(db: &Db) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let mut pause = std::time::Duration::from_millis(1);
+        while db.engine.cached_stall_level() == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "writers never saw the stall the L0 tables cause"
             );
             std::thread::sleep(pause);
             pause = (pause * 2).min(std::time::Duration::from_millis(50));
@@ -8571,6 +8589,7 @@ mod tests {
             db.put(k.as_bytes(), &payload).unwrap();
         }
         wait_for_l0_files(&db, 2);
+        wait_for_stall(&db);
 
         // A write with `no_slowdown` must now return Busy rather
         // than sleep or block.
@@ -8625,6 +8644,7 @@ mod tests {
         }
         let l0 = l0();
         assert!(l0 >= 2, "precondition: need L0 >= 2, got {l0}");
+        wait_for_stall(&db);
 
         let db_writer = db.clone();
         let blocked = thread::spawn(move || {

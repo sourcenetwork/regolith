@@ -16,6 +16,9 @@ use super::sstable::{
     LiveSst, MetadataPolicy, SsTableMeta, SsTableReader, sst_filename, table_carries_data,
 };
 
+mod tail;
+pub(crate) use tail::DroppedTail;
+
 /// Maximum number of levels in the LSM tree.
 pub(crate) const MAX_LEVELS: usize = 7;
 
@@ -131,6 +134,7 @@ pub(crate) enum VersionEdit {
     RemoveFile { level: usize, file_id: u64 },
     SetLastSeq(u64),
     SetNextFileId(u64),
+    SetMinWalId(u64),
     Reset { next_file_id: u64, min_wal_id: u64 },
 }
 
@@ -170,6 +174,7 @@ impl VersionEdit {
             },
             VersionEdit::SetLastSeq(seq) => ManifestRecord::SetLastSeq(*seq),
             VersionEdit::SetNextFileId(id) => ManifestRecord::SetNextFileId(*id),
+            VersionEdit::SetMinWalId(id) => ManifestRecord::SetMinWalId(*id),
             VersionEdit::Reset {
                 next_file_id,
                 min_wal_id,
@@ -179,16 +184,26 @@ impl VersionEdit {
             },
         }
     }
-
-    fn requires_manifest_sync(&self) -> bool {
-        // File-id reservations do not make new data reachable on
-        // their own. They are flushed here and become durable with
-        // the next synced AddFile/RemoveFile/SetLastSeq edit.
-        !matches!(self, VersionEdit::SetNextFileId(_))
-    }
 }
 
 impl ManifestRecord {
+    /// Whether a batch holding this record is synced before
+    /// [`VersionSet::apply`] returns. The one rule both the writer and the
+    /// open's tail judgment (`tail.rs`) read, so the two cannot disagree on
+    /// which batches a crash may lose.
+    ///
+    /// A file-id reservation and a log retirement change no read if lost:
+    /// the ids a lost reservation handed out name nothing a durable batch
+    /// names, and the logs a lost retirement covered are replayed again,
+    /// holding only writes that the log the open rewrote them into also
+    /// holds. Each becomes durable with the next synced batch.
+    fn requires_sync(&self) -> bool {
+        !matches!(
+            self,
+            ManifestRecord::SetNextFileId(_) | ManifestRecord::SetMinWalId(_)
+        )
+    }
+
     fn encode(&self, buf: &mut Vec<u8>) {
         match self {
             ManifestRecord::AddFile { level, meta } => {
@@ -428,11 +443,16 @@ pub(crate) struct VersionSet {
     /// and rewrites are refused until recovery reopens the log.
     manifest_writer: Option<BufferedWriter>,
     env: Arc<dyn Env>,
+    /// The damaged end the open dropped, for the engine to report.
+    dropped_tail: Option<DroppedTail>,
 }
 
 struct ManifestReplay {
     version: Version,
     valid_len: usize,
+    /// Bytes of the stamp replay found; `0` when the file is too short to
+    /// hold one, which is a crash while the manifest was created.
+    stamp_len: usize,
 }
 
 /// An unreferenced `*.sst` file that the discarded-table guard could not
@@ -486,10 +506,11 @@ impl VersionSet {
         let manifest_path = db_dir.join("MANIFEST");
 
         let manifest_bytes;
+        let mut dropped_tail = None;
         let (version, writer) = if env.exists(&manifest_path) {
             let data = env.read(&manifest_path)?;
             let replay = Self::replay_manifest(env, &data, sst_dir, policy)?;
-            Self::reject_discarded_tables(&**env, &replay, data.len(), sst_dir, &manifest_path)?;
+            dropped_tail = Self::judge_end(&**env, &replay, &data, sst_dir, &manifest_path)?;
             // A torn tail means the log lost records; keep every table
             // until a clean replay says which ones are unreferenced. And
             // only when the directory lock excludes other processes: where
@@ -544,6 +565,7 @@ impl VersionSet {
             manifest_bytes,
             manifest_writer: Some(writer),
             env: Arc::clone(env),
+            dropped_tail,
         })
     }
 
@@ -573,7 +595,7 @@ impl VersionSet {
         let manifest_path = db_dir.join("MANIFEST");
         let data = env.read(&manifest_path)?;
         let replay = Self::replay_manifest(env, &data, sst_dir, policy)?;
-        Self::reject_discarded_tables(&**env, &replay, data.len(), sst_dir, &manifest_path)?;
+        let dropped_tail = Self::judge_end(&**env, &replay, &data, sst_dir, &manifest_path)?;
 
         Ok(Self {
             current: Arc::new(RwLock::new(Arc::new(replay.version))),
@@ -581,6 +603,7 @@ impl VersionSet {
             manifest_bytes: replay.valid_len as u64,
             manifest_writer: None,
             env: Arc::clone(env),
+            dropped_tail,
         })
     }
 
@@ -592,6 +615,13 @@ impl VersionSet {
     /// Path of the manifest file on disk.
     pub(crate) fn manifest_path(&self) -> &Path {
         &self.manifest_path
+    }
+
+    /// The damaged end of the manifest this open dropped as a crash's
+    /// unsynced tail, if there was one. A read-write open has already
+    /// truncated it; a read-only open left it in the file.
+    pub(crate) fn dropped_tail(&self) -> Option<DroppedTail> {
+        self.dropped_tail
     }
 
     fn writer_unavailable(&self) -> io::Error {
@@ -611,6 +641,7 @@ impl VersionSet {
                 }
                 VersionEdit::SetLastSeq(_)
                 | VersionEdit::SetNextFileId(_)
+                | VersionEdit::SetMinWalId(_)
                 | VersionEdit::Reset { .. } => {}
             }
         }
@@ -630,6 +661,9 @@ impl VersionSet {
                 }
                 VersionEdit::SetNextFileId(id) => {
                     version.next_file_id = *id;
+                }
+                VersionEdit::SetMinWalId(id) => {
+                    version.min_wal_id = *id;
                 }
                 VersionEdit::Reset {
                     next_file_id,
@@ -653,7 +687,7 @@ impl VersionSet {
 
         let records: Vec<ManifestRecord> = edits.iter().map(VersionEdit::to_record).collect();
         let encoded = Self::encode_records(&records)?;
-        let requires_sync = edits.iter().any(VersionEdit::requires_manifest_sync);
+        let requires_sync = records.iter().any(ManifestRecord::requires_sync);
         // An append or sync error leaves an uncertain tail. Only reopen
         // may decide which complete frames survived; neither a later
         // append nor a rewrite from the old version may bypass that tail.
@@ -812,57 +846,57 @@ impl VersionSet {
         Ok(buf)
     }
 
-    /// Refuse to open when a manifest that did not replay cleanly ends up
-    /// referencing no SSTable at all while the table directory still holds
-    /// one that could carry data.
+    /// What the open makes of the end of the manifest, when replay
+    /// stopped short of it.
     ///
-    /// Replay stops at the first unreadable record and the tail is
-    /// discarded, which is correct for a record that a crash left half
-    /// written. When the *first* record is unreadable the same rule
-    /// silently turns a populated database into an empty one, so that
-    /// combination is reported instead of served: the table files are
-    /// still on disk and only the manifest needs repairing.
+    /// With its stamp in place the end is judged as a write-ahead log's is
+    /// (`tail.rs`): a crash's unsynced tail is dropped and handed back for
+    /// the engine to report, and damage that a later batch proves was
+    /// synced refuses the open, naming the file and both offsets.
     ///
-    /// A crash inside the very first flush leaves the opposite shape: a
-    /// table file that holds nothing, next to a WAL that holds every
-    /// acknowledged write. Refusing on that file would lose the writes
-    /// the WAL still has, so `suspect_tables` rules it out
-    /// before the count is taken.
-    fn reject_discarded_tables(
+    /// Without its stamp the file is one a crash caught while the database
+    /// was created, because the stamp is synced before any table exists. A
+    /// table that may hold data beside it is then no crash's doing, so the
+    /// open refuses, naming the tables, rather than serve an empty database
+    /// over them. A table that provably holds nothing is passed over.
+    fn judge_end(
         env: &dyn Env,
         replay: &ManifestReplay,
-        manifest_len: usize,
+        data: &[u8],
         sst_dir: &Path,
         manifest_path: &Path,
-    ) -> io::Result<()> {
-        let replayed_cleanly = manifest_len > 0 && replay.valid_len == manifest_len;
-        if replayed_cleanly || replay.version.levels.iter().any(|level| !level.is_empty()) {
-            return Ok(());
+    ) -> io::Result<Option<DroppedTail>> {
+        if replay.stamp_len == 0 {
+            let suspects = Self::suspect_tables(env, sst_dir);
+            if !suspects.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "{} is damaged at offset 0: it has no header, yet {} table file(s) in {} \
+                         may hold data ({}); the database is left untouched",
+                        manifest_path.display(),
+                        suspects.len(),
+                        sst_dir.display(),
+                        describe_suspects(&suspects),
+                    ),
+                ));
+            }
+            return Ok((!data.is_empty()).then_some(DroppedTail {
+                offset: 0,
+                bytes: data.len() as u64,
+            }));
         }
-        let suspects = Self::suspect_tables(env, sst_dir);
-        if suspects.is_empty() {
-            return Ok(());
+        if replay.valid_len == data.len() {
+            return Ok(None);
         }
-        Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "{} is corrupt: it references no SSTable, but {} table file(s) in {} may still hold data. \
-                 Opening would discard them, so the database is left untouched. Suspect tables: {}",
-                manifest_path.display(),
-                suspects.len(),
-                sst_dir.display(),
-                describe_suspects(&suspects),
-            ),
-        ))
+        tail::judge(data, replay.valid_len, manifest_path).map(Some)
     }
 
     /// The unreferenced `*.sst` files that could plausibly hold live data.
     ///
     /// A zero-length table, or one whose footer records no entry and no
-    /// range tombstone, is what a crash inside a flush leaves behind: the
-    /// directory entry reached the journal, the delayed-allocated data
-    /// blocks did not. Such a file cannot be a live table the manifest is
-    /// about to discard, so it is logged and skipped rather than counted.
+    /// range tombstone, holds nothing an open could lose, so it is logged
+    /// and skipped rather than counted.
     ///
     /// Everything else counts, including a file whose footer will not
     /// parse. An unreadable file cannot be proved empty, and keeping the
@@ -954,39 +988,19 @@ impl VersionSet {
         let mut min_wal_id: u64 = 0;
         // The stamp is not a record. `valid_len` starts past it so a
         // clean replay ends exactly at the file length, which is what
-        // `reject_discarded_tables` compares against.
+        // `judge_end` compares against.
         let stamp = Self::stamp_len(data)?;
         let mut offset = stamp;
         let mut valid_len = stamp;
 
         while offset < data.len() {
-            if data.len() - offset < 4 {
-                tracing::warn!("Truncated manifest record header, stopping replay");
+            // The first batch that does not read back whole ends replay;
+            // `judge_end` decides what the bytes from there on are.
+            let Some(batch) = tail::batch_at(data, offset) else {
                 break;
-            }
-
-            let len = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
-            offset += 4;
-
-            if len
-                .checked_add(4)
-                .is_none_or(|framed_len| framed_len > data.len() - offset)
-            {
-                tracing::warn!("Truncated manifest record, stopping replay");
-                break;
-            }
-
-            let record_data = &data[offset..offset + len];
-            offset += len;
-
-            let stored_checksum = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
-            offset += 4;
-
-            let computed_checksum = checksum::manifest_record(len as u32, record_data);
-            if stored_checksum != computed_checksum {
-                tracing::warn!("Manifest checksum mismatch, stopping replay");
-                break;
-            }
+            };
+            let record_data = batch.records;
+            offset = batch.end;
 
             let mut pos = 0;
             while let Some(record) = ManifestRecord::decode(record_data, &mut pos)? {
@@ -1059,7 +1073,11 @@ impl VersionSet {
             ));
         }
 
-        Ok(ManifestReplay { version, valid_len })
+        Ok(ManifestReplay {
+            version,
+            valid_len,
+            stamp_len: stamp,
+        })
     }
 }
 

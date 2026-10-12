@@ -213,6 +213,9 @@ pub struct ChildSpec {
     pub durability: DurabilityMode,
     pub write_buffer_size: usize,
     pub ack_path: PathBuf,
+    /// Compaction workers, when the run needs a number other than the
+    /// default. With none, the writing thread runs every flush itself.
+    pub workers: Option<usize>,
 }
 
 impl ChildSpec {
@@ -247,7 +250,16 @@ impl ChildSpec {
             durability,
             write_buffer_size,
             ack_path,
+            workers: None,
         }
+    }
+
+    /// Run with `n` compaction workers. `0` makes the writing thread the one
+    /// thread that flushes, so a crash on the nth table write is a crash in
+    /// that thread's flush and in no other.
+    pub fn workers(mut self, n: usize) -> Self {
+        self.workers = Some(n);
+        self
     }
 
     pub fn seed(mut self, seed: u64) -> Self {
@@ -280,9 +292,13 @@ impl ChildSpec {
     }
 
     pub fn options(&self) -> Options {
-        Options::default()
+        let mut options = Options::default()
             .write_buffer_size(self.write_buffer_size)
-            .durability(self.durability)
+            .durability(self.durability);
+        if let Some(workers) = self.workers {
+            options = options.max_background_compactions(workers);
+        }
+        options
     }
 
     /// The exact ordered history this spec produces, computed identically
@@ -320,6 +336,10 @@ impl ChildSpec {
                 "REGOLITH_CRASH_ACK".into(),
                 self.ack_path.display().to_string(),
             ),
+            (
+                "REGOLITH_CRASH_WORKERS".into(),
+                self.workers.map(|n| n.to_string()).unwrap_or_default(),
+            ),
         ]
     }
 
@@ -348,6 +368,9 @@ impl ChildSpec {
             },
             write_buffer_size: num("REGOLITH_CRASH_WBS", 1 << 20),
             ack_path: PathBuf::from(std::env::var("REGOLITH_CRASH_ACK").unwrap_or_default()),
+            workers: std::env::var("REGOLITH_CRASH_WORKERS")
+                .ok()
+                .and_then(|v| v.parse().ok()),
         })
     }
 }
@@ -490,12 +513,14 @@ impl CrashRun {
         let stdout_path = sidecar(&db, "stdout");
         let stderr_path = sidecar(&db, "stderr");
         let started_path = started_path_for(&db);
+        let loaded_path = sidecar(&db, "shim-loaded");
         for p in [
             &journal,
             &spec.ack_path,
             &stdout_path,
             &stderr_path,
             &started_path,
+            &loaded_path,
         ] {
             let _ = std::fs::remove_file(p);
         }
@@ -522,14 +547,16 @@ impl CrashRun {
             "REGOLITH_FAULT_DIE_NTH",
             "REGOLITH_FAULT_DIE_WHEN",
             "REGOLITH_FAULT_JOURNAL",
+            "REGOLITH_FAULT_LOADED",
         ] {
             cmd.env_remove(k);
         }
 
         let needs_shim = self.record_io || matches!(self.trigger, Trigger::Syscall { .. });
-        if needs_shim {
-            let lib = shim::require();
-            cmd.env("LD_PRELOAD", shim::preload_value(&lib));
+        let shim_lib = needs_shim.then(shim::require);
+        if let Some(lib) = &shim_lib {
+            cmd.env("LD_PRELOAD", shim::preload_value(lib));
+            cmd.env("REGOLITH_FAULT_LOADED", &loaded_path);
             cmd.env("REGOLITH_FAULT_ROOT", root_filter_for(&db));
             if self.record_io {
                 cmd.env("REGOLITH_FAULT_JOURNAL", &journal);
@@ -564,6 +591,38 @@ impl CrashRun {
             std::fs::read_to_string(&stdout_path).unwrap_or_default(),
             std::fs::read_to_string(&stderr_path).unwrap_or_default(),
         );
+        // A child that ran without the shim fires no fault and records
+        // nothing, which would read as a crash that never came or a journal
+        // with nothing in it: say why instead.
+        if let Some(lib) = &shim_lib {
+            assert!(
+                loaded_path.is_file(),
+                "the fault shim {} was preloaded but never loaded into the child, so no \
+                 fault could fire and no I/O was recorded. Check that the dynamic linker \
+                 accepts it (LD_PRELOAD errors are in the child's stderr below); if it was \
+                 replaced while this run used it, run again.\nchild stderr:\n{}",
+                lib.display(),
+                std::fs::read_to_string(&stderr_path).unwrap_or_default(),
+            );
+        }
+
+        let recorded = Journal::read(&journal).expect("crash run: read journal");
+        // A shim that loaded and saw no call is as blind as one that never
+        // loaded: every workload opens files under the root it watches, so
+        // an empty journal means the child's I/O did not go through the
+        // calls the shim interposes (a toolchain whose std reaches the
+        // kernel another way). A power cut simulated from it would discard
+        // nothing, and the run would pass having shown nothing.
+        if shim_lib.is_some() && self.record_io {
+            assert!(
+                !recorded.records.is_empty(),
+                "the fault shim loaded into the child but recorded none of its I/O, so no \
+                 fault could fire and no power cut can be simulated from this run. The \
+                 test binary's std does not go through the libc calls the shim \
+                 interposes; build the suite with the toolchain CI uses.\nchild stderr:\n{}",
+                std::fs::read_to_string(&stderr_path).unwrap_or_default(),
+            );
+        }
 
         #[cfg(unix)]
         let signal = {
@@ -578,7 +637,7 @@ impl CrashRun {
             signal,
             stdout: std::fs::read_to_string(&stdout_path).unwrap_or_default(),
             stderr: std::fs::read_to_string(&stderr_path).unwrap_or_default(),
-            journal: Journal::read(&journal).expect("crash run: read journal"),
+            journal: recorded,
             acked: read_acks(&spec.ack_path),
             history: spec.history(),
             trigger: self.trigger,

@@ -269,24 +269,45 @@ stress secs="600":
 # Seven of the models are `should_panic` calibrations that deliberately
 # get the ordering wrong; they are what make the passes mean anything.
 
+# Loom is bounded. Every recipe below builds its models first and then runs
+# them under a hard limit of 10 minutes (15 for the nightly twins): a run
+# that hits it fails. A model is sized to finish in under a minute and a
+# recipe in under five, by its scenario and by an explicit preemption bound
+# in its builder, never by `LOOM_MAX_DURATION`, which stops the search and
+# lets the test pass. A model that is shrunk says so in its comment.
 loom:
-    RUSTFLAGS="--cfg loom" cargo test --release --test loom_memtable
+    RUSTFLAGS="--cfg loom" cargo test --release --test loom_memtable --no-run
+    RUSTFLAGS="--cfg loom" timeout 10m cargo test --release --test loom_memtable
 
 loom-debug:
-    RUSTFLAGS="--cfg loom" cargo test --test loom_memtable
+    RUSTFLAGS="--cfg loom" cargo test --test loom_memtable --no-run
+    RUSTFLAGS="--cfg loom" timeout 10m cargo test --test loom_memtable
 
 # Loom models for `regolith::sync`: every primitive's wait protocol,
-# with two calibrations that must fail. Release only: the three-thread
-# models explore 0.2 to 0.5 million interleavings each, which a debug
-# build multiplies several times over.
+# with three calibrations that must fail. Release only: the larger models
+# explore 0.1 to 0.4 million interleavings each (about four minutes in
+# all), which a debug build multiplies several times over.
 loom-sync:
-    RUSTFLAGS="--cfg loom" cargo test --release --test loom_sync
+    RUSTFLAGS="--cfg loom" cargo test --release --test loom_sync --no-run
+    RUSTFLAGS="--cfg loom" timeout 10m cargo test --release --test loom_sync
+
+# The five sync models whose three threads all contend for one lock or
+# semaphore, at preemption bound 2 instead of the bound 1 `loom-sync`
+# runs them at: their `#[ignore]`d twins, or the one `model` names. Each
+# twin runs a smaller scenario of its own, because the shared one does not
+# finish at bound 2 in any useful time (43 to 79 minutes a model, and never
+# for the upgradable read). They take 2 s to 6 minutes each, so the nightly
+# CI run carries them, one job per model.
+loom-sync-deep model="":
+    RUSTFLAGS="--cfg loom" cargo test --release --test loom_sync --no-run
+    RUSTFLAGS="--cfg loom" timeout 15m cargo test --release --test loom_sync -- --ignored {{model}}
 
 # Loom models for the snapshot registry's per-thread slots: the slot and
 # thread-number claims, a moved pin's release, announce-sample-confirm and
 # the drain wake, with four calibrations that must fail. Release only.
 loom-snapshots:
-    RUSTFLAGS="--cfg loom" cargo test --release --test loom_snapshots
+    RUSTFLAGS="--cfg loom" cargo test --release --test loom_snapshots --no-run
+    RUSTFLAGS="--cfg loom" timeout 10m cargo test --release --test loom_snapshots
 
 loom-all: loom loom-debug loom-sync loom-snapshots
 
@@ -328,20 +349,62 @@ chaos instances="4" rounds="2" versions="120" min_rounds="20":
 # `WalRotation.tla` (E2, a rotation syncs the sealed log first).
 # Each row prints the distinct states TLC explored and its wall time.
 # TLC is fetched on first use, pinned by checksum in `proofs/tla/tools/tlc`.
+#
+# The suite is bounded. Every row runs on ONE TLC worker under a hard limit
+# of 120 seconds: a row that hits it is reported as TIMED OUT and fails the
+# recipe, it never passes. A configuration is sized to finish in under 60
+# seconds on one worker; one that does not is shrunk (its `.cfg` says what
+# was shrunk and what the smaller instance still covers), because the Lean
+# proof covers every size and TLC only has to show a small instance's
+# interleavings. Time a new row before adding it.
+#
+# As many rows run side by side as the machine has cores, each in a JVM
+# sized for its one worker, and their lines are printed in the order below
+# once all are done. With one worker a RED row stops at the shallowest
+# broken invariant, the same on every run.
+# Check every TLA+ row.
 tla:
     #!/usr/bin/env bash
     set -uo pipefail
     cd proofs/tla
-    fail=0
+    # Fetched once, before the rows run side by side.
+    ./tools/tlc --fetch-only >/dev/null || exit 1
+    results=$(mktemp -d)
+    trap 'rm -rf "$results"' EXIT
+    # The cores this run may use (`nproc` counts those it is confined to).
+    side=$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN)
+    row=0
     # The module the next rows check; each block below sets it.
     spec=RepeatableRead
+    # One row, started in the background: its line goes to a file named by
+    # its number, and a `.fail` file beside it marks a wrong verdict.
     check() {
-        local cfg="$1" expect="$2" inv="${3:-}" out broke verdict states took
-        out=$(./tools/tlc -metadir "states/$cfg" -config "$cfg.cfg" "$spec.tla" 2>&1)
-        broke=$(sed -n 's/^Error: Invariant \(.*\) is violated\.$/\1/p' <<<"$out" | head -1)
+        row=$((row + 1))
+        while [ "$(jobs -rp | wc -l)" -ge "$side" ]; do wait -n; done
+        run_row "$(printf '%04d' "$row")" "$spec" "$@" > "$results/$(printf '%04d' "$row").out" 2>&1 &
+    }
+    run_row() {
+        local n="$1" spec="$2" cfg="$3" expect="$4" inv="${5:-}" out code broke verdict states took
+        # A serial collector and two compiler threads: what one worker on
+        # one core uses. A temporary directory of its own, because TLC
+        # unpacks its standard modules into it and two rows must not share
+        # the files; the row's states go there too.
+        mkdir -p "$results/tmp.$n"
+        out=$(TLC_JVM_FLAGS="-XX:+UseSerialGC -XX:CICompilerCount=2 -Djava.io.tmpdir=$results/tmp.$n" \
+              timeout 120 ./tools/tlc -workers 1 -metadir "$results/tmp.$n/states" -config "$cfg.cfg" "$spec.tla" 2>&1)
+        code=$?
+        # TLC words a broken invariant two ways: "is violated." when the search reaches a bad
+        # state, and "is violated by the initial state:" when the very first state is already
+        # bad. Both name the invariant, and both count.
+        broke=$(sed -n -e 's/^Error: Invariant \(.*\) is violated\.$/\1/p' \
+                       -e 's/^Error: Invariant \(.*\) is violated by the initial state:$/\1/p' <<<"$out" | head -1)
         states=$(sed -n 's/^.* states generated, \([0-9,]*\) distinct states found.*$/\1/p' <<<"$out" | tail -1)
         took=$(sed -n 's/^Finished in \(.*\) at (.*$/\1/p' <<<"$out" | tail -1)
-        if grep -q "No error has been found" <<<"$out"; then
+        if [ "$code" -eq 124 ]; then
+            # The hard limit: a failure, whatever the row was meant to show.
+            verdict="TIMED OUT"
+            took="over 120s"
+        elif grep -q "No error has been found" <<<"$out"; then
             verdict=GREEN
         elif [ -n "$broke" ] && [ "$broke" = "$inv" ]; then
             verdict=RED
@@ -351,16 +414,18 @@ tla:
             verdict=BROKEN
             echo "$out" | tail -20
         fi
-        printf '  %-48s %-6s %9s states %8s  (expected %s)\n' \
+        printf '  %-48s %-9s %9s states %9s  (expected %s)\n' \
             "$cfg" "$verdict" "${states:-?}" "${took:-?}" "$expect${inv:+ on $inv}"
-        if [ "$verdict" != "$expect" ]; then fail=1; fi
+        if [ "$verdict" != "$expect" ]; then touch "$results/$n.fail"; fi
     }
     check MC_RepeatableRead_Green                      GREEN
+    check MC_RepeatableRead_Green_Live                 GREEN
     check MC_RepeatableRead_Red_Serializable           RED INV_AppendsCommit
     check MC_RepeatableRead_Red_SnapshotIsolation      RED INV_NoStaleDefinition
     check MC_RepeatableRead_Red_ReadCommitted          RED INV_NoStaleDefinition
     check MC_DefraLevel_Green_Heads                    GREEN
     check MC_DefraLevel_Green_Counters                 GREEN
+    check MC_DefraLevel_Green_Counters_Clear           GREEN
     check MC_DefraLevel_Green_Migrations               GREEN
     check MC_DefraLevel_Red_RepeatableRead_Merges      RED INV_DuplicateMergesCommit
     check MC_DefraLevel_Red_NoPolicy                   RED INV_DuplicateMergesCommit
@@ -381,6 +446,7 @@ tla:
     check MC_DefraLevel_Red_PresenceReadFull           RED INV_LinksCommit
     check MC_DefraLevel_Red_PresenceUnchecked          RED INV_HoldsCurrent
     check MC_DefraLevel_Green_Parts                    GREEN
+    check MC_DefraLevel_Green_Parts_Rewriter           GREEN
     check MC_DefraLevel_Red_PartsIgnorePut             RED INV_PartsCurrent
     check MC_DefraLevel_Red_PartsIgnoreTouch           RED INV_PartsCurrent
     check MC_DefraLevel_Red_PartsNoAbsentFallback      RED INV_PartsCurrent
@@ -404,6 +470,10 @@ tla:
     check MC_DefraLevel_Red_ReasonNewestWrite          RED INV_ReasonsExact
     # E1. Lean: Regolith/LsmOrder.lean, compact_range_reads_newest.
     spec=LsmOrder
+    # E31, a flush's table and its memtable's retirement are one publication.
+    # Lean: Regolith/LsmOrder.lean, flush_keeps_sources_disjoint,
+    # split_install_holds_a_memtable_twice.
+    check MC_LsmOrder_Red_SplitRetire                  RED NoDoubleSource
     check MC_LsmOrder_Green                            GREEN
     check MC_LsmOrder_Red_Intersect                    RED ReadNewest
     # Flush order, ingest placement, overlap demotion (E14, D13), binary
@@ -426,7 +496,8 @@ tla:
     check MC_IngestPublication_Green                   GREEN
     check MC_IngestPublication_Red_CommitPassesSlot    RED RepeatableSnapshot
     check MC_IngestPublication_Red_IngestPublishesEarly RED RepeatableSnapshot
-    # D48: an ingest syncs the log before its manifest record. TLC only.
+    # D48: an ingest syncs the log before its manifest record. Lean:
+    # Regolith/IngestDurability.lean, surviving_ingest_keeps_prefix.
     spec=IngestDurability
     check MC_IngestDurability_Green                    GREEN
     check MC_IngestDurability_Red_NoLogSync            RED GapFreePrefix
@@ -494,6 +565,18 @@ tla:
     check MC_WalRecovery_Red_CloseWithoutSync          RED RecoveryOpens
     check MC_WalRecovery_Red_NoTruncate                RED RecoveryOpens
     check MC_WalRecovery_Red_StampNotSealed            RED AckedSurvive
+    # E29, E30: the manifest's torn end and the logs a flush retires. Lean:
+    # Regolith/ManifestRecovery.lean, crash_never_proves, replay_keeps_synced,
+    # replay_never_above_newer_table.
+    spec=ManifestRecovery
+    check MC_ManifestRecovery_Green                    GREEN
+    check MC_ManifestRecovery_Green_Refuses            RED NeverRefusesRot
+    check MC_ManifestRecovery_Red_OldGuard             RED RecoveryOpens
+    check MC_ManifestRecovery_Red_NoSyncBeforeNext     RED RecoveryOpens
+    check MC_ManifestRecovery_Red_UnlinkBeforeSync     RED AckedSurvive
+    check MC_ManifestRecovery_Red_RetireBeforeTable    RED AckedSurvive
+    check MC_ManifestRecovery_Red_NoMinWalId           RED ReadsNewest
+    check MC_ManifestRecovery_Red_IgnoreProof          RED RotSafe
     # 4.8, E5: compaction per snapshot stripe. Lean: Regolith/Stripes.lean,
     # reduce_reads.
     spec=StripeCompaction
@@ -505,7 +588,7 @@ tla:
     check MC_StripeCompaction_Red_IgnoreStripes        RED SnapshotReadsKept
     # E27: a pass retires a range tombstone below its range and every
     # snapshot. Green_Retires is the witness that the fix retires at all.
-    # TLC only.
+    # Lean: Regolith/TombstoneRetirement.lean, retire_keeps_reads.
     spec=TombstoneRetirement
     check MC_TombstoneRetirement_Green                 GREEN
     check MC_TombstoneRetirement_Green_Retires         RED NothingRetired
@@ -533,6 +616,8 @@ tla:
     # E10, group commit. Lean: Regolith/GroupCommit.lean, group_eq_serial.
     spec=GroupCommit
     check MC_GroupCommit_Green                         GREEN
+    check MC_GroupCommit_Green_Live                    GREEN
+    check MC_GroupCommit_Green_LivePlain               GREEN
     check MC_GroupCommit_Green_ReadOnly                GREEN
     check MC_GroupCommit_Red_ViewOnly                  RED SerialEquivalent
     check MC_GroupCommit_Red_TrustEarly                RED SerialEquivalent
@@ -543,6 +628,9 @@ tla:
     # seqs_dense and reader_sees_published.
     spec=CommitPipeline
     check MC_CommitPipeline_Green                      GREEN
+    check MC_CommitPipeline_Green_Live                 GREEN
+    check MC_CommitPipeline_Green_LiveIngest           GREEN
+    check MC_CommitPipeline_Green_LiveApart            GREEN
     check MC_CommitPipeline_Red_OutOfOrder             RED ReadersSeePrefix
     check MC_CommitPipeline_Red_AbortHole              RED NoHole
     check MC_CommitPipeline_Red_NoHelping              RED NoLiveThreadBlocked
@@ -552,6 +640,7 @@ tla:
     # TLC only; wakeups are interleavings with no law over sizes to prove.
     spec=NonBlocking
     check MC_NonBlocking_Green_Pool                    GREEN
+    check MC_NonBlocking_Green_PoolLive                GREEN
     check MC_NonBlocking_Green_Single                  GREEN
     check MC_NonBlocking_Red_LostWakeup                RED NoLostWakeup
     check MC_NonBlocking_Red_SilentSelfIo              RED IoPendingFires
@@ -560,7 +649,9 @@ tla:
     # mutual_exclusion, bounded_bypass, owed_exclusive.
     spec=Sync
     check MC_Sync_Green_Mutex                          GREEN
+    check MC_Sync_Green_MutexLive                      GREEN
     check MC_Sync_Green_Semaphore                      GREEN
+    check MC_Sync_Green_SemaphoreLive                  GREEN
     check MC_Sync_Green_Reentrant                      GREEN
     check MC_Sync_Green_ReentrantLive                  GREEN
     check MC_Sync_Red_UnboundedBarging                 RED BoundedBypass
@@ -574,6 +665,7 @@ tla:
     # Regolith/SyncFifo.lean, fifo_served, no_stranded_waiter.
     spec=SyncNotify
     check MC_SyncNotify_Green                          GREEN
+    check MC_SyncNotify_Green_Live                     GREEN
     check MC_SyncNotify_Red_WakeBeforeHandoff          RED NoLostWakeup
     check MC_SyncNotify_Red_CancelNoPassOn             RED CancelPassesOn
     check MC_SyncNotify_Red_NoRecheck                  RED NoLostWakeup
@@ -614,8 +706,12 @@ tla:
     check MC_TxnCallbacks_Red_CallbacksSurvive         RED AttemptIsolation
     check MC_TxnCallbacks_Red_HelperNoClaim            RED AtMostOnce
     check MC_TxnCallbacks_Red_CloseNoClaim             RED AtMostOnce
-    rm -rf states ./*_TTrace_*.tla ./*_TTrace_*.bin
-    exit $fail
+    wait
+    rm -rf ./*_TTrace_*.tla ./*_TTrace_*.bin
+    cat "$results"/*.out
+    failed=$(find "$results" -name '*.fail' | wc -l)
+    echo "  $row rows, $failed with the wrong verdict"
+    [ "$failed" -eq 0 ]
 
 # `proofs/lean` is a Lake project named Regolith, plain Lean 4 core with no
 # dependencies, so it builds offline. Each module proves for every size what
@@ -772,7 +868,7 @@ wasm-native records="5000" sustained="20000":
     set -euo pipefail
     for profile in embedded wasm; do
         echo "== profile $profile =="
-        cargo run --release -p regolith-wasm-probe -- \
+        cargo run --release -p regolith-wasm-probe --bin regolith-wasm-probe -- \
             --profile "$profile" --records {{records}} --sustained {{sustained}} \
             --probe-host --report-memory
     done
@@ -782,9 +878,25 @@ wasm-native records="5000" sustained="20000":
 # `tests/`, and all but the three `wasm_opfs*` files are native-only.
 # The runner is named per target instead, so only the named test
 # binaries are built.
+#
+# Needs `wasm-bindgen-test-runner` from the `wasm-bindgen-cli` release that
+# Cargo.lock pins for `wasm-bindgen`, to the patch: the two share an
+# unstable schema, and a runner of another version refuses the test binary
+# with a schema error after the whole build. The recipe checks that first
+# and says what to install.
 wasm-browser:
     #!/usr/bin/env bash
     set -euo pipefail
+    pinned=$(awk '/^name = "wasm-bindgen"$/ { found = 1; next } found && /^version = / { gsub(/"/, "", $3); print $3; exit }' Cargo.lock)
+    if ! command -v wasm-bindgen-test-runner >/dev/null 2>&1; then
+        echo "error: wasm-bindgen-test-runner is not on PATH; install it with: cargo install wasm-bindgen-cli --version $pinned --locked" >&2
+        exit 1
+    fi
+    have=$(wasm-bindgen --version 2>/dev/null | awk '{ print $2 }')
+    if [ "$have" != "$pinned" ]; then
+        echo "error: wasm-bindgen-cli is ${have:-not installed} but Cargo.lock pins wasm-bindgen $pinned, and the two must match exactly; install it with: cargo install wasm-bindgen-cli --version $pinned --locked" >&2
+        exit 1
+    fi
     export CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER=wasm-bindgen-test-runner
     # wasm-bindgen's default per-test budget is 20s, which a headless
     # browser on a shared runner can exceed on a test that mounts OPFS

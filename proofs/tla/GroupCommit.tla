@@ -92,15 +92,21 @@
 \*     IngestPublication.tla.
 \*
 \* CONFIGURATIONS.
-\*   MC_GroupCommit_Green                  Mutant = "none": every invariant
-\*                                         and AllTicketsComplete hold.
+\*   MC_GroupCommit_Green                  Mutant = "none", four commits,
+\*                                         no failing group: every
+\*                                         invariant holds.
+\*   MC_GroupCommit_Green_Live             three transactions, a group may
+\*                                         fail: every invariant and
+\*                                         AllTicketsComplete hold.
+\*   MC_GroupCommit_Green_LivePlain        the same with a plain write.
 \*   MC_GroupCommit_Red_ViewOnly           SerialEquivalent fails.
 \*   MC_GroupCommit_Red_PublishBeforeSync  DurableBeforeVisible fails.
 \*   MC_GroupCommit_Red_DrainAll           BoundedTurn fails.
 \*   MC_GroupCommit_Red_TrustEarly         SerialEquivalent fails.
 \*   MC_GroupCommit_Green_ReadOnly         a transaction that only reads
-\*                                         shares groups; every invariant
-\*                                         and AllTicketsComplete hold.
+\*                                         shares groups, a group may fail;
+\*                                         every invariant and
+\*                                         AllTicketsComplete hold.
 
 \* We use numbers, sequences (lists) and set sizes.
 EXTENDS Naturals, Sequences, FiniteSets
