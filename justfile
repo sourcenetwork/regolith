@@ -601,6 +601,7 @@ tla:
     # listing_names_every_backup, purge_keeps_the_newest.
     spec=BackupSeal
     check MC_BackupSeal_Green                          GREEN
+    check MC_BackupSeal_Green_Attack                   GREEN
     check MC_BackupSeal_Red_PlainMeta                  RED SealedMetadata
     check MC_BackupSeal_Red_PlainRestore               RED SealedMetadata
     check MC_BackupSeal_Red_OpenUnderCurrent           RED RightKeysRestore
