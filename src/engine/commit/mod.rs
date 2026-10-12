@@ -995,6 +995,12 @@ mod leader_tests;
 mod limit_tests;
 
 #[cfg(test)]
+mod overlap_tests;
+
+#[cfg(test)]
+mod txn_overlap_tests;
+
+#[cfg(test)]
 mod tests {
     use super::super::{EngineOptions, wal::fault};
     use super::*;
