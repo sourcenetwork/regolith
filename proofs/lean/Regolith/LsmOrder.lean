@@ -5,7 +5,9 @@ This file backs two TLA+ models in `proofs/tla`:
 
 * `LsmOrder.tla`, invariant `ReadNewest` (configurations `MC_LsmOrder_Green`
   and `MC_LsmOrder_Red_Intersect`). Defect E1: `compact_range` at L0 must
-  pick a closed input set. The same model's flush order, ingest placement,
+  pick a closed input set. The same model's invariant `NoDoubleSource`
+  (configuration `MC_LsmOrder_Red_SplitRetire`, defect E31) is backed by
+  item 7 below. The same model's flush order, ingest placement,
   overlap demotion (E14, D13) and binary search configurations
   (`MC_LsmOrder_*_Flush*`, `*_Ingest*`, `*_Demote*`, `*_NoDemotion`, and
   the invariant `BisectIsScan`) are backed by items 7 to 10 below.
@@ -43,7 +45,11 @@ What is proved, in plain words:
    one, as the newest L0 files (every flush off the commit path, E9,
    whichever thread runs it) leaves the read order and every read as it was;
    `install_newer_breaks_reads` is the RED case of installing a newer one
-   first.
+   first. `flush_keeps_sources_disjoint`: a flush that installs its table
+   and retires its memtable in one step leaves no version in two sources
+   (TLA+ `NoDoubleSource`); `split_install_holds_a_memtable_twice` and
+   `split_install_reads_an_operand_twice` are the RED case (E31) of
+   publishing the table before the memtable is retired.
 8. `ingest_ordered`: an ingested file, newer than everything, placed where
    no source read before it shares a key, keeps the sources ordered;
    `ingest_below_holder_breaks_reads` is the RED case.
@@ -1055,6 +1061,120 @@ theorem install_newer_breaks_reads :
     -- is asked first and answers 1.
     read ([] :: [[(1, 1)]] ++ ([(1, 2)] :: [])) 1 10 = some 1 := by
   -- Concrete lists: evaluate both reads.
+  decide
+
+/-! ## A flush is one publication (E31)
+
+The story. When a flush has written its table it has two things to tell
+readers: "this table is now the newest L0 file" and "this memtable is no
+longer frozen". The table holds exactly what the memtable holds, version for
+version. If the flush says the first thing, and only later the second, a
+reader that looks in between is handed the memtable AND its table: every
+version twice.
+
+A point read does not mind, because both copies agree. A read of a merged key
+does: it gathers that key's operands from EVERY source and applies them all.
+Example: merges "a" (sequence 1) and "b" (sequence 2) on key 1 sit in a frozen
+memtable. The split flush publishes their table. A reader in the window finds
+operands 1 and 2 in the memtable and 1 and 2 again in the table, and returns
+"abab" where the answer is "ab".
+
+The code says both things in one publication of the read view
+(`VersionGuard::retire_with_version` in `src/engine/read_view.rs`, called by
+`Flusher::flush_oldest` in `src/engine/flush.rs`), so the window does not
+exist. The theorems below show that the one-step flush keeps every version in
+one source only, for any number of memtables, files and versions, and that the
+split one does not. The TLA+ configurations `MC_LsmOrder_Green_Flush` and
+`MC_LsmOrder_Red_SplitRetire` check the same over interleavings, as the
+invariant `NoDoubleSource`. -/
+
+/-- Two sources hold no version in common: nothing is in both `a` and `b`. -/
+def NoSharedVersion (a b : Source) : Prop := ∀ v, v ∈ a → v ∈ b → False
+
+/-- **No version in two sources.** Every source shares no version with any
+source after it in the list, which covers every pair. This is what a read
+that gathers from every source needs: each version turns up once. TLA+:
+`NoDoubleSource`. -/
+def NoDoubleSource (srcs : List Source) : Prop := srcs.Pairwise NoSharedVersion
+
+/-- **`flush_keeps_sources_disjoint`.** If no version is in two sources
+before a flush, none is after it, when the flush installs its table and
+retires its memtable in one step: the oldest frozen memtable `f` becomes the
+newest L0 file, and that is the very same list of sources. -/
+theorem flush_keeps_sources_disjoint (mem : Source) (imm l0 deeper : List Source) (f : Source)
+    -- Before the flush: `f` is the oldest frozen memtable, and no version is
+    -- in two sources.
+    (h : NoDoubleSource (mem :: (imm ++ [f]) ++ l0 ++ deeper)) :
+    -- After it: `f` is the newest L0 file, and still none is.
+    NoDoubleSource (mem :: imm ++ (f :: l0) ++ deeper) := by
+  -- The list after is the list before (`install_oldest_same_order`), so
+  -- rewrite the goal back into the "before" list.
+  rw [← install_oldest_same_order]
+  -- That is exactly what we were given.
+  exact h
+
+/-- **`split_install_holds_a_memtable_twice`.** The RED case, for every
+size. A flush that publishes its table while its memtable `f` is still
+frozen makes a view in which every version `v` of `f` is in two sources: the
+frozen memtable and the new L0 file. So `NoDoubleSource` fails for that view,
+whatever the other memtables, files and levels hold. -/
+theorem split_install_holds_a_memtable_twice (mem : Source) (imm l0 deeper : List Source)
+    (f : Source) (v : Version)
+    -- The flushed memtable holds at least this one version.
+    (hv : v ∈ f) :
+    -- The view between the two publications: `f` frozen AND `f` in L0.
+    ¬ NoDoubleSource (mem :: (imm ++ [f]) ++ (f :: l0) ++ deeper) := by
+  -- Suppose no version were in two sources of that view.
+  intro h
+  -- Regroup the list so the two copies of `f` stand side by side: first
+  -- everything read before them, then `f`, `f`, then everything after.
+  have hshape : mem :: (imm ++ [f]) ++ (f :: l0) ++ deeper
+      = (mem :: imm) ++ (f :: f :: (l0 ++ deeper)) := by
+    -- Both sides are the same list once the appends are flattened.
+    simp
+  -- Read the assumption on the regrouped list.
+  rw [NoDoubleSource, hshape] at h
+  -- A list is pairwise fine only if its second part is: keep that part,
+  -- which starts with the two copies of `f`.
+  have htail := (List.pairwise_append.mp h).2.1
+  -- The first `f` must share no version with anything after it, and the
+  -- second `f` comes right after it.
+  have hff : NoSharedVersion f f := (List.pairwise_cons.mp htail).1 f (by simp)
+  -- But `v` is in both copies: a contradiction.
+  exact hff v hv hv
+
+/-- What a read of key `k` gathers before it merges: the sequence of every
+version of `k`, from every source in read order. An operand that turns up
+twice here is applied twice. -/
+def gathered (srcs : List Source) (k : Nat) : List Nat :=
+  -- Lay the sources end to end, keep the versions of `k`, take their sequences.
+  (srcs.flatten.filter fun v => v.1 == k).map Prod.snd
+
+/-- **`together_gathers_the_same`.** A read gathers the same operands after a
+one-step flush as before it, for every key: nothing is added and nothing is
+lost. -/
+theorem together_gathers_the_same (mem : Source) (imm l0 deeper : List Source) (f : Source)
+    (k : Nat) :
+    -- Gathered before the flush equals gathered after it.
+    gathered (mem :: (imm ++ [f]) ++ l0 ++ deeper) k
+      = gathered (mem :: imm ++ (f :: l0) ++ deeper) k := by
+  -- The two source lists are the same list, so what is gathered is the same.
+  rw [install_oldest_same_order]
+
+/-- **`split_install_reads_an_operand_twice`.** The story above, in numbers.
+Key 1 has two merge operands, at sequences 1 and 2, in one frozen memtable.
+Before the flush a read gathers `[1, 2]`. After a one-step flush it still
+gathers `[1, 2]`. In the split flush's window it gathers `[1, 2, 1, 2]`: each
+operand twice, which is "abab" for "ab". -/
+theorem split_install_reads_an_operand_twice :
+    -- Before: an empty active memtable, the frozen one, nothing in L0.
+    gathered ([] :: ([] ++ [[(1, 1), (1, 2)]]) ++ [] ++ []) 1 = [1, 2] ∧
+    -- One-step flush: the frozen one is now the only L0 file.
+    gathered ([] :: [] ++ ([(1, 1), (1, 2)] :: []) ++ []) 1 = [1, 2] ∧
+    -- Split flush, in its window: still frozen, and already in L0.
+    gathered ([] :: ([] ++ [[(1, 1), (1, 2)]]) ++ ([(1, 1), (1, 2)] :: []) ++ []) 1
+      = [1, 2, 1, 2] := by
+  -- Concrete lists: evaluate all three.
   decide
 
 /-! ## Ingest placement
