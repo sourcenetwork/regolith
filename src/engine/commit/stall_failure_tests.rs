@@ -864,3 +864,55 @@ fn a_wait_registered_after_the_stop_cleared_is_not_told_a_failure_a_fresh_write_
         .admit_write(false)
         .expect("no stop: a fresh write goes in");
 }
+
+/// The order of the two steps a recorded failure takes: stored, then landed.
+/// A waiting write's waker runs where the unit lands, on the thread that
+/// records the failure, so a write run again from the waker looks as early
+/// as any woken write can. It is told the failure. Were the unit landed
+/// first, that write would find the relief still working, register on a
+/// fresh unit and wait there for good: the failure stored a moment later
+/// lands nothing.
+#[test]
+fn a_write_run_again_where_the_unit_lands_is_told_the_failure() {
+    struct RunAgain {
+        engine: Arc<RegolithEngine>,
+        told: Mutex<Option<Result<(), Error>>>,
+    }
+    impl std::task::Wake for RunAgain {
+        fn wake(self: Arc<Self>) {
+            *self.told.lock().unwrap() = Some(self.engine.admit_write(false));
+        }
+    }
+
+    let (_dir, engine) = stopped_engine_with(EngineOptions {
+        l0_compaction_trigger: 1,
+        ..EngineOptions::default()
+    });
+    let mut waiting = stopped_write(&engine);
+    let run_again = Arc::new(RunAgain {
+        engine: Arc::clone(&engine),
+        told: Mutex::new(None),
+    });
+    let waker = std::task::Waker::from(Arc::clone(&run_again));
+    let polled = std::future::Future::poll(
+        std::pin::Pin::new(&mut waiting),
+        &mut std::task::Context::from_waker(&waker),
+    );
+    assert!(polled.is_pending(), "setup: the write waits");
+
+    engine
+        .background_health
+        .record_failure(Job::Compaction, &std::io::Error::other("the relief fails"));
+
+    match run_again.told.lock().unwrap().take() {
+        Some(Err(Error::BackgroundFailed { job, .. })) => assert_eq!(job, "compaction"),
+        Some(other) => panic!(
+            "the write woken by the landing found no failure recorded yet, and was told {other:?}"
+        ),
+        None => panic!("recording the failure did not wake the waiting write"),
+    }
+    assert!(
+        !engine.stall_signal().has_unit(),
+        "the woken write left a unit nothing lands"
+    );
+}
