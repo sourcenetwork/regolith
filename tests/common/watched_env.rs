@@ -201,10 +201,6 @@ impl LogFile for WatchedLog {
         self.watch.note_caller();
         self.inner.set_len(len)
     }
-
-    fn len(&self) -> io::Result<u64> {
-        self.inner.len()
-    }
 }
 
 impl Env for WatchedEnv {
