@@ -11,6 +11,8 @@ pub(crate) mod compaction;
 pub(crate) mod compaction_backoff;
 pub(crate) mod disk_check;
 pub(crate) mod filter_block;
+#[cfg(test)]
+mod flush_window_tests;
 pub(crate) mod index_block;
 mod ingest;
 #[cfg(test)]
@@ -2646,11 +2648,19 @@ impl RegolithEngine {
             VersionEdit::SetLastSeq(seq),
         ];
         pending.offered_to_manifest();
-        self.versions.lock().apply(&edits)?;
-
-        // Retired only now: until the `AddFile` above is published, the
-        // flushed data lives in this memtable alone.
-        self.retire_frozen(&memtable);
+        {
+            let mut versions = self.versions.lock();
+            versions.apply(&edits)?;
+            // Retired in the publication of the version holding its table,
+            // not after it: until that version is published the flushed data
+            // lives in this memtable alone, and a view holding both would
+            // apply the memtable's merge operands twice.
+            versions.retire_with_version(&memtable);
+        }
+        #[cfg(test)]
+        if let Some(hook) = AFTER_FLUSH_INSTALL.with(|slot| slot.borrow_mut().take()) {
+            hook();
+        }
         self.remove_sealed_wal(&memtable);
         self.compaction.lock().notify();
 
@@ -3338,6 +3348,21 @@ impl RegolithEngine {
 enum ActiveFlush {
     WhenFull,
     Always,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test seam: runs once, on this thread, right after the next flush
+    /// published the version holding its table.
+    static AFTER_FLUSH_INSTALL: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Test-only: run `hook` once, on this thread, right after the next flush on
+/// it published the version holding its table.
+#[cfg(test)]
+pub(crate) fn after_next_flush_install(hook: impl FnOnce() + 'static) {
+    AFTER_FLUSH_INSTALL.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
 }
 
 /// A consistent snapshot of on-disk state captured by

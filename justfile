@@ -434,6 +434,10 @@ tla shard="1" shards="1":
     check MC_DefraLevel_Red_ReasonNewestWrite          RED INV_ReasonsExact
     # E1. Lean: Regolith/LsmOrder.lean, compact_range_reads_newest.
     spec=LsmOrder
+    # E31, a flush's table and its memtable's retirement are one publication.
+    # Lean: Regolith/LsmOrder.lean, flush_keeps_sources_disjoint,
+    # split_install_holds_a_memtable_twice.
+    check MC_LsmOrder_Red_SplitRetire                  RED NoDoubleSource
     check MC_LsmOrder_Green                            GREEN
     check MC_LsmOrder_Red_Intersect                    RED ReadNewest
     # Flush order, ingest placement, overlap demotion (E14, D13), binary
