@@ -1,28 +1,45 @@
 //! Waiter nodes, the free list that recycles them, and the wake list a
-//! drain pass hands granted waiters to.
+//! drain pass hands woken waiters to.
 //!
-//! A contended future parks one [`Waiter`] in its primitive's queue. Two
-//! parties hold the node at once: the future, until it completes or is
-//! dropped, and the queue, until a drain pass grants or prunes it. Each
-//! holds one reference bit in the node's state word, and whichever party
-//! clears the last bit returns the node to its primitive's [`Pool`]. No
-//! other path frees a node, so a node is never reachable by a party that
-//! has let it go, and no epoch scheme is needed.
+//! A contended future parks one [`Waiter`] in its primitive's queue. Up to
+//! three parties hold the node: the future, until it completes or is
+//! dropped; the queue, until a drain pass grants or prunes it; and a wake
+//! list, while a waker taken from the node waits to be called. Each holds
+//! one reference bit in the node's state word, and whichever party clears
+//! the last bit returns the node to its primitive's [`Pool`]. No other path
+//! frees a node, so a node is never reachable by a party that has let it
+//! go, and no epoch scheme is needed.
 //!
 //! # State word
 //!
 //! | bits | meaning |
 //! |---|---|
 //! | 0-1 | phase: waiting, granted or cancelled; it leaves waiting once |
-//! | 2 | the future is replacing its waker |
-//! | 3 | the queue's reference |
-//! | 4 | the future's reference |
+//! | 2 | registering: the future is writing a waker into a slot |
+//! | 3 | armed: the current slot holds a waker nobody has taken |
+//! | 4 | taking: a wake list is taking the waker from the taken slot |
+//! | 5 | the current slot: where the future last registered |
+//! | 6 | the taken slot: where the wake list takes from |
+//! | 7 | nudged: a release asked the waiter to try again |
+//! | 8 | owed: the waiter reached the bypass bound and is counted as owed |
+//! | 9-11 | references: queue, future, wake list |
 //!
-//! The future writes the waker slot only while it holds the registering
-//! bit in the waiting phase. A drainer reads the slot only after it moved
-//! the phase to granted while that bit was clear. A cancelling future
-//! reads it only after it moved the phase to cancelled. So no two parties
-//! ever touch the slot at once.
+//! A drainer *grants* a waiter (hands it what it waits for) or *nudges* it
+//! (wakes it to compete again, leaving it in the queue). Either may claim
+//! the armed waker: it marks the current slot as the taken one and hands
+//! the node to a wake list, which takes the waker and calls it once the
+//! drain role is given up.
+//!
+//! The waker lives in one of two slots so that neither side ever waits for
+//! the other. The future writes a slot only while it holds the registering
+//! bit, and it writes the slot that is not being taken; the wake list
+//! reads only the taken slot, and only while it holds the taking bit. A
+//! cancelling future reads the current slot only while it is armed. So no
+//! two parties touch one slot at once. A grant or nudge that finds the
+//! future registering, or a take already under way, only sets its bit: the
+//! future reads that bit as it finishes registering, and the wake list,
+//! once its take is done, claims a waker armed meanwhile whose node was
+//! granted or nudged, and calls that one too.
 
 #![allow(unsafe_code)]
 
@@ -38,8 +55,16 @@ const WAITING: usize = 0;
 const GRANTED: usize = 1;
 const CANCELLED: usize = 2;
 const REGISTERING: usize = 1 << 2;
-const QUEUE_REF: usize = 1 << 3;
-const FUTURE_REF: usize = 1 << 4;
+const ARMED: usize = 1 << 3;
+const TAKING: usize = 1 << 4;
+const CURRENT: usize = 1 << 5;
+const TAKEN: usize = 1 << 6;
+const NUDGED: usize = 1 << 7;
+const OWED: usize = 1 << 8;
+const QUEUE_REF: usize = 1 << 9;
+const FUTURE_REF: usize = 1 << 10;
+const WAKE_REF: usize = 1 << 11;
+const REFS: usize = QUEUE_REF | FUTURE_REF | WAKE_REF;
 
 /// Nodes a primitive keeps for reuse; past this the allocator gets them
 /// back, so a burst of contention cannot pin memory forever.
@@ -50,18 +75,41 @@ const POOL_CAPACITY: usize = 16;
 pub(super) struct Waiter {
     state: AtomicUsize,
     next: AtomicPtr<Waiter>,
+    wake_next: AtomicPtr<Waiter>,
     payload: AtomicUsize,
-    waker: UnsafeCell<Option<Waker>>,
+    slots: [UnsafeCell<Option<Waker>>; 2],
 }
 
-/// What a drainer's grant found.
-enum Granted {
-    /// Granted; the drainer owns the waker and must wake it.
-    Wake,
-    /// Granted while the future was mid-poll; it sees the grant itself.
-    Polling,
-    /// The future withdrew first.
-    Cancelled,
+/// What a grant or a nudge did to a node.
+enum Touch {
+    /// It claimed the armed waker; the node is on its way to a wake list.
+    Claimed,
+    /// It set its bit without the waker: the future is registering, its
+    /// waker was already taken, or a take is under way.
+    Marked,
+    /// It did nothing: the node left the waiting phase, or a nudge is
+    /// already pending.
+    Skipped,
+}
+
+/// What a future found when it looked at its node.
+enum Seen {
+    Granted,
+    Nudged,
+    Pending,
+}
+
+/// `state` with the armed waker claimed for a wake list: the current slot
+/// becomes the taken one.
+fn claim(state: usize) -> usize {
+    let taken = if state & CURRENT != 0 { TAKEN } else { 0 };
+    (state & !(ARMED | TAKEN)) | taken | TAKING | WAKE_REF
+}
+
+/// Whether a waker can be claimed from `state`: armed, and nobody is
+/// registering or taking.
+fn claimable(state: usize) -> bool {
+    state & (ARMED | REGISTERING | TAKING) == ARMED
 }
 
 impl Waiter {
@@ -69,13 +117,14 @@ impl Waiter {
         Self {
             state: AtomicUsize::new(0),
             next: AtomicPtr::new(ptr::null_mut()),
+            wake_next: AtomicPtr::new(ptr::null_mut()),
             payload: AtomicUsize::new(0),
-            waker: UnsafeCell::new(None),
+            slots: [UnsafeCell::new(None), UnsafeCell::new(None)],
         }
     }
 
-    /// The link the arrival stack, a waiting list or a wake list threads
-    /// through; only the party holding the node in that structure uses it.
+    /// The link the arrival stack or a waiting list threads through; only
+    /// the party holding the node in that structure uses it.
     pub(super) fn next(&self) -> *mut Waiter {
         self.next.load(Ordering::Relaxed)
     }
@@ -101,75 +150,131 @@ impl Waiter {
         self.state.load(Ordering::Acquire) & PHASE == CANCELLED
     }
 
+    fn is_owed(&self) -> bool {
+        self.state.load(Ordering::Acquire) & OWED != 0
+    }
+
+    /// The slot `bit` (current or taken) of `state` names.
+    fn slot(&self, state: usize, bit: usize) -> &UnsafeCell<Option<Waker>> {
+        &self.slots[usize::from(state & bit != 0)]
+    }
+
+    /// Fills a fresh node. It starts registering, since its future is
+    /// mid-poll: a grant or nudge during the enqueue sets its bit without
+    /// a wake, and [`park`](Self::park) with no waker settles it.
     fn arm(&self, payload: usize, waker: Waker) {
-        self.state
-            .store(WAITING | QUEUE_REF | FUTURE_REF, Ordering::Relaxed);
+        self.state.store(
+            WAITING | REGISTERING | QUEUE_REF | FUTURE_REF,
+            Ordering::Relaxed,
+        );
         self.next.store(ptr::null_mut(), Ordering::Relaxed);
+        self.wake_next.store(ptr::null_mut(), Ordering::Relaxed);
         self.payload.store(payload, Ordering::Relaxed);
         // SAFETY: the node came out of the pool, so nobody else sees it.
-        self.waker.with_mut(|slot| unsafe { *slot = Some(waker) });
+        self.slots[0].with_mut(|slot| unsafe { *slot = Some(waker) });
     }
 
-    /// Moves a waiting node to granted.
-    fn grant(&self) -> Granted {
+    /// Sets `bit` on a waiting node, claiming its waker if it can. `once`
+    /// skips a node that already carries `bit`.
+    fn touch(&self, bit: usize, once: bool) -> Touch {
         let mut state = self.state.load(Ordering::Acquire);
         loop {
-            if state & PHASE == CANCELLED {
-                return Granted::Cancelled;
+            if state & PHASE != WAITING || (once && state & bit != 0) {
+                return Touch::Skipped;
             }
-            debug_assert_eq!(state & PHASE, WAITING, "a waiter is granted twice");
-            match self.state.compare_exchange_weak(
-                state,
-                state | GRANTED,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) if state & REGISTERING != 0 => return Granted::Polling,
-                Ok(_) => return Granted::Wake,
+            let take = claimable(state);
+            let next = if take {
+                claim(state) | bit
+            } else {
+                state | bit
+            };
+            match self
+                .state
+                .compare_exchange_weak(state, next, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) if take => return Touch::Claimed,
+                Ok(_) => return Touch::Marked,
                 Err(actual) => state = actual,
             }
         }
     }
 
-    /// Replaces the waker unless the node is already granted. Returns
-    /// whether it is granted.
-    fn register(&self, waker: &Waker) -> bool {
+    /// Registers `waker` unless the node is granted or nudged, consuming a
+    /// pending nudge. With no waker, settles a node fresh from
+    /// [`arm`](Self::arm), whose waker is already in the slot.
+    fn park(&self, waker: Option<&Waker>) -> Seen {
+        if let Some(waker) = waker {
+            let mut state = self.state.load(Ordering::Acquire);
+            let target = loop {
+                if state & PHASE == GRANTED {
+                    return Seen::Granted;
+                }
+                if state & NUDGED != 0 {
+                    match self.state.compare_exchange_weak(
+                        state,
+                        state & !NUDGED,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    ) {
+                        Ok(_) => return Seen::Nudged,
+                        Err(actual) => {
+                            state = actual;
+                            continue;
+                        }
+                    }
+                }
+                // Write the slot a take under way is not reading.
+                let current = if state & TAKING != 0 {
+                    !state & TAKEN != 0
+                } else {
+                    state & CURRENT != 0
+                };
+                let next =
+                    (state & !(ARMED | CURRENT)) | REGISTERING | if current { CURRENT } else { 0 };
+                match self.state.compare_exchange_weak(
+                    state,
+                    next,
+                    Ordering::Acquire,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => break next,
+                    Err(actual) => state = actual,
+                }
+            };
+            // SAFETY: the registering bit makes the current slot this
+            // future's, and a take reads only the other one (module docs).
+            self.slot(target, CURRENT).with_mut(|slot| unsafe {
+                if !(*slot).as_ref().is_some_and(|w| w.will_wake(waker)) {
+                    *slot = Some(waker.clone());
+                }
+            });
+        }
         let mut state = self.state.load(Ordering::Acquire);
         loop {
-            if state & PHASE == GRANTED {
-                return true;
-            }
-            match self.state.compare_exchange_weak(
-                state,
-                state | REGISTERING,
-                Ordering::Acquire,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => break,
+            let next = (state & !(REGISTERING | NUDGED)) | ARMED;
+            match self
+                .state
+                .compare_exchange_weak(state, next, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) if state & PHASE == GRANTED => return Seen::Granted,
+                Ok(_) if state & NUDGED != 0 => return Seen::Nudged,
+                Ok(_) => return Seen::Pending,
                 Err(actual) => state = actual,
             }
         }
-        // SAFETY: the registering bit in the waiting phase keeps every
-        // drainer off the slot (module docs).
-        self.waker.with_mut(|slot| unsafe {
-            if !(*slot).as_ref().is_some_and(|w| w.will_wake(waker)) {
-                *slot = Some(waker.clone());
-            }
-        });
-        self.state.fetch_and(!REGISTERING, Ordering::AcqRel) & PHASE == GRANTED
     }
 
-    /// Moves a waiting node to cancelled. Returns false when it was
-    /// already granted.
-    fn withdraw(&self) -> bool {
+    /// Marks a waiting node as owed a handoff. False when it already left
+    /// the waiting phase.
+    fn owe(&self) -> bool {
         let mut state = self.state.load(Ordering::Acquire);
         loop {
-            if state & PHASE == GRANTED {
+            if state & PHASE != WAITING {
                 return false;
             }
             match self.state.compare_exchange_weak(
                 state,
-                state | CANCELLED,
+                state | OWED,
                 Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
@@ -179,32 +284,128 @@ impl Waiter {
         }
     }
 
-    /// # Safety
-    ///
-    /// The caller has exclusive access to the waker slot (module docs).
-    unsafe fn take_waker(&self) -> Option<Waker> {
-        // SAFETY: forwarded from the caller.
-        self.waker.with_mut(|slot| unsafe { (*slot).take() })
+    /// Takes back the owed mark of a node still waiting. False when it
+    /// left the waiting phase first, so the queue settles the mark as it
+    /// lets the node go.
+    fn unowe(&self) -> bool {
+        let mut state = self.state.load(Ordering::Acquire);
+        loop {
+            if state & PHASE != WAITING || state & OWED == 0 {
+                return false;
+            }
+            match self.state.compare_exchange_weak(
+                state,
+                state & !OWED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(actual) => state = actual,
+            }
+        }
+    }
+
+    /// Moves a waiting node to cancelled, taking its armed waker, and
+    /// reports whether a nudge had reached it unused. `None` when it was
+    /// already granted.
+    fn withdraw(&self) -> Option<(Option<Waker>, bool)> {
+        let mut state = self.state.load(Ordering::Acquire);
+        loop {
+            if state & PHASE == GRANTED {
+                return None;
+            }
+            // The future is not registering: it is being dropped.
+            let armed = state & ARMED != 0;
+            let nudged = state & NUDGED != 0;
+            match self.state.compare_exchange_weak(
+                state,
+                (state & !ARMED) | CANCELLED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                // SAFETY: an armed current slot is the future's, and a take
+                // under way reads the other one (module docs).
+                Ok(_) if armed => {
+                    let waker = self
+                        .slot(state, CURRENT)
+                        .with_mut(|slot| unsafe { (*slot).take() });
+                    return Some((waker, nudged));
+                }
+                Ok(_) => return Some((None, nudged)),
+                Err(actual) => state = actual,
+            }
+        }
+    }
+
+    /// Takes the waker a claim set aside, then gives the slot back. If a
+    /// grant or nudge marked a waker armed meanwhile, claims that one too
+    /// and reports [`Taken::Again`]. The caller holds the taking bit.
+    fn take_claimed(&self) -> (Option<Waker>, Taken) {
+        let mut state = self.state.load(Ordering::Acquire);
+        // SAFETY: the taking bit makes the taken slot this caller's.
+        let waker = self
+            .slot(state, TAKEN)
+            .with_mut(|slot| unsafe { (*slot).take() });
+        loop {
+            let again = state & (ARMED | REGISTERING) == ARMED
+                && (state & NUDGED != 0 || state & PHASE == GRANTED);
+            let next = if again {
+                claim(state & !TAKING)
+            } else {
+                state & !(TAKING | WAKE_REF)
+            };
+            match self
+                .state
+                .compare_exchange_weak(state, next, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) if again => return (waker, Taken::Again),
+                Ok(_) => return (waker, Taken::Done(state & REFS == WAKE_REF)),
+                Err(actual) => state = actual,
+            }
+        }
+    }
+
+    /// Drops whatever wakers the slots still hold. The caller owns the node
+    /// outright.
+    fn clear_slots(&self) {
+        for slot in &self.slots {
+            // SAFETY: forwarded from the caller.
+            drop(slot.with_mut(|slot| unsafe { (*slot).take() }));
+        }
     }
 }
 
+/// What [`Waiter::take_claimed`] left behind.
+enum Taken {
+    /// Another waker was claimed; take again.
+    Again,
+    /// The wake list let go of the node; `true` when it was the last
+    /// reference, so the node goes back to the pool.
+    Done(bool),
+}
+
 /// Drops one party's reference; the last party out recycles the node.
+/// Letting go of the queue's reference also settles the node's share of
+/// the owed count.
 ///
-/// The caller must hold `bit` on `node`.
-fn release(node: NonNull<Waiter>, bit: usize, pool: &Pool) {
+/// The caller must hold `bit` on `node`, and a node the queue lets go of
+/// has left the waiting phase, so its owed bit no longer changes.
+fn release(node: NonNull<Waiter>, bit: usize, queue: &WaitQueue) {
     // SAFETY: the caller still holds `bit`, so the node is live.
-    let prev = unsafe { node.as_ref() }
-        .state
-        .fetch_and(!bit, Ordering::AcqRel);
-    if prev & (QUEUE_REF | FUTURE_REF) == bit {
-        pool.put(node);
+    let waiter = unsafe { node.as_ref() };
+    if bit == QUEUE_REF && waiter.is_owed() {
+        queue.forgive();
+    }
+    let prev = waiter.state.fetch_and(!bit, Ordering::AcqRel);
+    if prev & REFS == bit {
+        queue.pool().put(node);
     }
 }
 
 /// Lets go of the queue's reference to `node`, which the caller took off
-/// its arrival stack or waiting list.
-pub(super) fn release_queued(node: NonNull<Waiter>, pool: &Pool) {
-    release(node, QUEUE_REF, pool);
+/// its arrival stack or waiting list, and which is not waiting any more.
+pub(super) fn release_queued(node: NonNull<Waiter>, queue: &WaitQueue) {
+    release(node, QUEUE_REF, queue);
 }
 
 /// A pooled node, owned by whoever holds this value.
@@ -248,9 +449,8 @@ impl Pool {
     }
 
     fn put(&self, node: NonNull<Waiter>) {
-        // SAFETY: both references are gone, so the caller owns the node
-        // and its waker slot outright.
-        drop(unsafe { node.as_ref().take_waker() });
+        // SAFETY: every reference is gone, so the caller owns the node.
+        unsafe { node.as_ref() }.clear_slots();
         #[cfg(not(loom))]
         let node = match self.ring().push(Pooled(node)) {
             Ok(()) => return,
@@ -305,20 +505,21 @@ impl Drop for Pool {
     }
 }
 
-/// Waiters a drain pass granted, woken in grant order once the pass has
-/// given up the drain role, so no executor code runs while it holds it.
+/// Waiters a drain pass granted or nudged, woken in order once the pass
+/// has given up the drain role, so no executor code runs while it holds
+/// it.
 pub(super) struct WakeList<'a> {
     head: *mut Waiter,
     tail: *mut Waiter,
-    pool: &'a Pool,
+    queue: &'a WaitQueue,
 }
 
 impl<'a> WakeList<'a> {
-    pub(super) fn new(pool: &'a Pool) -> Self {
+    pub(super) fn new(queue: &'a WaitQueue) -> Self {
         Self {
             head: ptr::null_mut(),
             tail: ptr::null_mut(),
-            pool,
+            queue,
         }
     }
 
@@ -327,41 +528,61 @@ impl<'a> WakeList<'a> {
     /// which case the caller gives back whatever it set aside for it.
     pub(super) fn grant(&mut self, node: NonNull<Waiter>) -> bool {
         // SAFETY: the caller holds the queue's reference.
-        match unsafe { node.as_ref() }.grant() {
-            Granted::Wake => {
-                // SAFETY: as above; the node is off every list.
-                unsafe { node.as_ref() }.set_next(ptr::null_mut());
-                match NonNull::new(self.tail) {
-                    // SAFETY: the tail is a node this list holds.
-                    Some(tail) => unsafe { tail.as_ref() }.set_next(node.as_ptr()),
-                    None => self.head = node.as_ptr(),
-                }
-                self.tail = node.as_ptr();
-                true
-            }
-            Granted::Polling => {
-                release(node, QUEUE_REF, self.pool);
-                true
-            }
-            Granted::Cancelled => {
-                release(node, QUEUE_REF, self.pool);
-                false
-            }
+        let touch = unsafe { node.as_ref() }.touch(GRANTED, false);
+        if let Touch::Claimed = touch {
+            self.push(node);
         }
+        release_queued(node, self.queue);
+        !matches!(touch, Touch::Skipped)
+    }
+
+    /// Nudges `node`, which stays on its waiting list: it is woken to try
+    /// again. Returns whether a nudge is now on its way to it.
+    pub(super) fn nudge(&mut self, node: NonNull<Waiter>) -> bool {
+        // SAFETY: the caller's list holds the queue's reference.
+        match unsafe { node.as_ref() }.touch(NUDGED, true) {
+            Touch::Claimed => {
+                self.push(node);
+                true
+            }
+            Touch::Marked => true,
+            Touch::Skipped => false,
+        }
+    }
+
+    fn push(&mut self, node: NonNull<Waiter>) {
+        // SAFETY: the claim gave this list the node's wake reference.
+        unsafe { node.as_ref() }
+            .wake_next
+            .store(ptr::null_mut(), Ordering::Relaxed);
+        match NonNull::new(self.tail) {
+            // SAFETY: the tail is a node this list holds.
+            Some(tail) => unsafe { tail.as_ref() }
+                .wake_next
+                .store(node.as_ptr(), Ordering::Relaxed),
+            None => self.head = node.as_ptr(),
+        }
+        self.tail = node.as_ptr();
     }
 
     fn pop(&mut self) -> Option<Option<Waker>> {
         let node = NonNull::new(self.head)?;
-        // SAFETY: this list holds the queue's reference to `node`.
+        // SAFETY: this list holds the node's wake reference.
         let waiter = unsafe { node.as_ref() };
-        self.head = waiter.next();
-        if self.head.is_null() {
-            self.tail = ptr::null_mut();
+        let (waker, taken) = waiter.take_claimed();
+        match taken {
+            // The node stays at the front for the waker just claimed.
+            Taken::Again => {}
+            Taken::Done(last) => {
+                self.head = waiter.wake_next.load(Ordering::Relaxed);
+                if self.head.is_null() {
+                    self.tail = ptr::null_mut();
+                }
+                if last {
+                    self.queue.pool().put(node);
+                }
+            }
         }
-        // SAFETY: granted while the future was not registering, so the
-        // slot is the drainer's (module docs).
-        let waker = unsafe { waiter.take_waker() };
-        release(node, QUEUE_REF, self.pool);
         Some(waker)
     }
 }
@@ -371,7 +592,8 @@ impl Drop for WakeList<'_> {
         while let Some(waker) = self.pop() {
             if let Some(waker) = waker {
                 // A waker that panics must not strand the waiters behind
-                // it: they already own what they were granted.
+                // it: they already own what they were granted, or must
+                // still be told to try again.
                 let rest = WakeRest(self);
                 waker.wake();
                 mem::forget(rest);
@@ -396,11 +618,22 @@ impl Drop for WakeRest<'_, '_> {
 pub(super) enum Cancel {
     /// It never queued, or it already completed.
     Idle,
-    /// It withdrew before anyone granted it; its owner tells the queue.
-    Withdrawn,
+    /// It withdrew before anyone granted it; its owner tells the queue,
+    /// passing on the nudge it carries unused, if it does.
+    Withdrawn(bool),
     /// It had been granted, so its owner passes the grant on. Carries the
     /// payload the drainer left.
     Granted(usize),
+}
+
+/// What a future's look at its node found.
+pub(super) enum Park {
+    /// Granted, with the payload the drainer left; the node is released.
+    Granted(usize),
+    /// A release asked it to try again; it is still queued.
+    Nudged,
+    /// Still waiting, its waker registered.
+    Pending,
 }
 
 /// A future's hold on its waiter node.
@@ -418,7 +651,8 @@ impl Wait {
     }
 
     /// Arms a node from `queue`'s pool and pushes it on the arrival
-    /// stack. The caller then publishes it with a draining transition.
+    /// stack. The caller then publishes it with a draining transition and
+    /// settles it with [`park`](Self::park) and no waker.
     pub(super) fn enqueue(&mut self, queue: &WaitQueue, payload: usize, waker: &Waker) {
         debug_assert!(self.node.is_none(), "a future queues twice");
         let node = queue.pool().take();
@@ -428,42 +662,71 @@ impl Wait {
         self.node = Some(node);
     }
 
-    /// Ready once granted, with the payload the drainer left; the node is
-    /// released then. With `waker`, registers it first.
-    pub(super) fn poll(&mut self, queue: &WaitQueue, waker: Option<&Waker>) -> Poll<usize> {
+    /// Looks at the node; with `waker`, registers it first. Right after
+    /// [`enqueue`](Self::enqueue) the waker is already in place, so pass
+    /// `None`.
+    pub(super) fn park(&mut self, queue: &WaitQueue, waker: Option<&Waker>) -> Park {
         let Some(node) = self.node else {
-            return Poll::Ready(0);
+            return Park::Granted(0);
         };
         // SAFETY: this future holds its reference until it clears `node`.
         let waiter = unsafe { node.as_ref() };
-        let granted = match waker {
-            Some(waker) => waiter.register(waker),
-            None => waiter.state.load(Ordering::Acquire) & PHASE == GRANTED,
-        };
-        if !granted {
-            return Poll::Pending;
+        match waiter.park(waker) {
+            Seen::Granted => {
+                let payload = waiter.payload();
+                self.node = None;
+                release(node, FUTURE_REF, queue);
+                Park::Granted(payload)
+            }
+            Seen::Nudged => Park::Nudged,
+            Seen::Pending => Park::Pending,
         }
-        let payload = waiter.payload();
-        self.node = None;
-        release(node, FUTURE_REF, queue.pool());
-        Poll::Ready(payload)
     }
 
-    /// Withdraws the waiter, or reports that it was granted first.
+    /// For a primitive that only grants: ready once granted.
+    pub(super) fn poll(&mut self, queue: &WaitQueue, waker: Option<&Waker>) -> Poll<usize> {
+        match self.park(queue, waker) {
+            Park::Granted(payload) => Poll::Ready(payload),
+            Park::Nudged | Park::Pending => Poll::Pending,
+        }
+    }
+
+    /// Marks the node owed a handoff. False when it already left the
+    /// waiting phase.
+    pub(super) fn owe(&self) -> bool {
+        let Some(node) = self.node else {
+            return false;
+        };
+        // SAFETY: this future holds its reference.
+        unsafe { node.as_ref() }.owe()
+    }
+
+    /// Takes back the node's owed mark. False when it already left the
+    /// waiting phase, and the queue settles the mark.
+    pub(super) fn unowe(&self) -> bool {
+        let Some(node) = self.node else {
+            return false;
+        };
+        // SAFETY: this future holds its reference.
+        unsafe { node.as_ref() }.unowe()
+    }
+
+    /// Leaves the queue: the future was dropped, or took what it waits
+    /// for on its own. Reports a grant that got there first.
     pub(super) fn cancel(&mut self, queue: &WaitQueue) -> Cancel {
         let Some(node) = self.node.take() else {
             return Cancel::Idle;
         };
         // SAFETY: this future held its reference until now.
         let waiter = unsafe { node.as_ref() };
-        let outcome = if waiter.withdraw() {
-            // SAFETY: a cancelled node's slot is the future's (module docs).
-            drop(unsafe { waiter.take_waker() });
-            Cancel::Withdrawn
-        } else {
-            Cancel::Granted(waiter.payload())
+        let outcome = match waiter.withdraw() {
+            Some((waker, nudged)) => {
+                drop(waker);
+                Cancel::Withdrawn(nudged)
+            }
+            None => Cancel::Granted(waiter.payload()),
         };
-        release(node, FUTURE_REF, queue.pool());
+        release(node, FUTURE_REF, queue);
         outcome
     }
 }

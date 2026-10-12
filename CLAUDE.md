@@ -138,9 +138,10 @@ and `Result`. Extension surfaces such as column families, transactions,
 TTL, backups, checkpoints, external SST ingestion, statistics, event
 listeners, merge operators, compaction filters, and rate limiting are
 also re-exported from `lib.rs`. `regolith::sync` is a public module of
-its own: runtime-free async primitives (FIFO, cancellation-safe, no
-system call but kovan's `sched_yield`) plus kovan's channels, map,
-queues and `Atom`. Anything not re-exported is internal.
+its own: runtime-free async primitives (barging with bounded bypass,
+cancellation-safe, no system call but kovan's `sched_yield`) plus
+kovan's channels, map, queues and `Atom`. Anything not re-exported is
+internal.
 
 ### File Size Guidelines
 

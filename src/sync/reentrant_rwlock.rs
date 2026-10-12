@@ -1,13 +1,12 @@
-//! A phase-fair asynchronous reader-writer lock its holders may lock
-//! again, keyed by [`Owner`].
+//! An asynchronous reader-writer lock its holders may lock again, keyed
+//! by [`Owner`].
 //!
-//! The lock queues owners, not calls. An owner that already reads reads
-//! again at once, even with a writer waiting, because that writer waits
-//! for this owner's read anyway; an owner that writes may also read; and
-//! an owner that reads and asks to write queues as an upgrade, ahead of
-//! plain writers, and is granted when its own read is the last one. So an
-//! owner never deadlocks on itself. Two readers that both ask to upgrade
-//! still deadlock each other, as with any reader-writer lock.
+//! The lock counts owners, not calls. An owner that already reads reads
+//! again at once, even with a writer owed a handoff, because that writer
+//! waits for this owner's read anyway; an owner that writes may also read.
+//! An owner that reads without writing and asks to write is refused with
+//! [`ReadHeldByOwner`]: the write would wait for its own read. So an owner
+//! never deadlocks on itself.
 //!
 //! Each reading owner has a record (owner id, read depth) in a lock-free
 //! list that only grows: a record is reused once its owner stops reading,
@@ -24,7 +23,7 @@ use core::task::{Context, Poll};
 
 use super::internal::{AtomicPtr, AtomicU64, AtomicUsize, Ordering, UnsafeCell};
 use super::owner::Owner;
-use super::raw_rwlock::{READ, RawRwLock, RwWait, UPGRADE, WRITE};
+use super::raw_rwlock::{READ, RawRwLock, RwWait, WRITE};
 
 /// One reading owner: its id (zero when free) and how many reads it holds.
 struct Record {
@@ -105,7 +104,8 @@ impl Drop for Records {
     }
 }
 
-/// A phase-fair reader-writer lock its holders may lock again.
+/// A reader-writer lock its holders may lock again, with the bounded
+/// bypass of [`RwLock`](super::RwLock).
 ///
 /// Both guards give `&T`, since one owner may hold several at once; the
 /// write side excludes every other owner, so mutate through interior
@@ -163,29 +163,24 @@ impl<T> ReentrantRwLock<T> {
 }
 
 impl<T: ?Sized> ReentrantRwLock<T> {
-    /// Reads if `owner` already reads or writes, or if no writer holds or
-    /// waits for the lock.
+    /// Reads if `owner` already reads or writes, or if no writer holds the
+    /// lock and no handoff is owed.
     pub fn try_read<'a>(&'a self, owner: &'a Owner) -> Option<ReentrantReadGuard<'a, T>> {
         let record = match self.reenter_read(owner) {
             Some(record) => record,
-            None if self.raw.try_read() => self.enter_read(owner),
+            None if self.raw.try_kind(READ) => self.enter_read(owner),
             None => return None,
         };
         Some(ReentrantReadGuard::new(self, owner, record))
     }
 
-    /// Writes if `owner` already writes; upgrades if `owner` is the only
-    /// reader; or writes if nobody holds or waits for the lock.
+    /// Writes if `owner` already writes, or if nobody holds the lock and
+    /// no handoff is owed. `None` too while `owner` reads without writing.
     pub fn try_write<'a>(&'a self, owner: &'a Owner) -> Option<ReentrantWriteGuard<'a, T>> {
         if self.reenter_write(owner) {
             return Some(ReentrantWriteGuard::new(self, owner));
         }
-        let taken = if self.readers.find(owner.id()).is_some() {
-            self.raw.try_upgrade()
-        } else {
-            self.raw.try_write()
-        };
-        taken.then(|| {
+        (self.readers.find(owner.id()).is_none() && self.raw.try_kind(WRITE)).then(|| {
             self.enter_write(owner);
             ReentrantWriteGuard::new(self, owner)
         })
@@ -200,14 +195,13 @@ impl<T: ?Sized> ReentrantRwLock<T> {
         }
     }
 
-    /// Waits to write, at once if `owner` already writes. An owner that
-    /// reads waits only for the other readers.
+    /// Waits to write, at once if `owner` already writes. Fails with
+    /// [`ReadHeldByOwner`] when `owner` reads without writing: the write
+    /// would wait for that read, which only `owner` can end.
     pub fn write<'a>(&'a self, owner: &'a Owner) -> ReentrantWrite<'a, T> {
         ReentrantWrite {
             lock: self,
             owner,
-            kind: WRITE,
-            pin: None,
             wait: RwWait::new(),
         }
     }
@@ -407,53 +401,52 @@ impl<T: ?Sized> fmt::Debug for ReentrantRead<'_, T> {
     }
 }
 
+/// Why a [`ReentrantRwLock::write`] failed: its owner reads without
+/// writing, so the write would wait for a read only that owner can end.
+/// Release the reads first, or take the write before reading.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ReadHeldByOwner;
+
+impl fmt::Display for ReadHeldByOwner {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("this owner holds a read of the lock; release it before writing")
+    }
+}
+
+impl std::error::Error for ReadHeldByOwner {}
+
 /// The future [`ReentrantRwLock::write`] returns.
 #[must_use = "futures do nothing unless polled"]
 pub struct ReentrantWrite<'a, T: ?Sized> {
     lock: &'a ReentrantRwLock<T>,
     owner: &'a Owner,
-    kind: usize,
-    /// While an upgrade waits it holds one more of the owner's reads, so
-    /// the read it converts cannot be released underneath it.
-    pin: Option<&'a Record>,
     wait: RwWait,
 }
 
 impl<'a, T: ?Sized> Future for ReentrantWrite<'a, T> {
-    type Output = ReentrantWriteGuard<'a, T>;
+    type Output = Result<ReentrantWriteGuard<'a, T>, ReadHeldByOwner>;
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<ReentrantWriteGuard<'a, T>> {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
         if !this.wait.is_queued() {
             if this.lock.reenter_write(this.owner) {
-                return Poll::Ready(ReentrantWriteGuard::new(this.lock, this.owner));
+                return Poll::Ready(Ok(ReentrantWriteGuard::new(this.lock, this.owner)));
             }
-            if this.pin.is_none()
-                && let Some(record) = this.lock.readers.find(this.owner.id())
-            {
-                record.reads.fetch_add(1, Ordering::Relaxed);
-                this.pin = Some(record);
+            if this.lock.readers.find(this.owner.id()).is_some() {
+                return Poll::Ready(Err(ReadHeldByOwner));
             }
-            this.kind = if this.pin.is_some() { UPGRADE } else { WRITE };
         }
-        this.wait
-            .poll(&this.lock.raw, this.kind, cx.waker())
-            .map(|()| {
-                this.lock.enter_write(this.owner);
-                if let Some(record) = this.pin.take() {
-                    this.lock.read_unlock(this.owner.id(), record);
-                }
-                ReentrantWriteGuard::new(this.lock, this.owner)
-            })
+        this.wait.poll(&this.lock.raw, WRITE, cx.waker()).map(|()| {
+            this.lock.enter_write(this.owner);
+            Ok(ReentrantWriteGuard::new(this.lock, this.owner))
+        })
     }
 }
 
 impl<T: ?Sized> Drop for ReentrantWrite<'_, T> {
     fn drop(&mut self) {
-        self.wait.cancel(&self.lock.raw, self.kind);
-        if let Some(record) = self.pin.take() {
-            self.lock.read_unlock(self.owner.id(), record);
-        }
+        self.wait.cancel(&self.lock.raw, WRITE);
     }
 }
 
@@ -468,26 +461,44 @@ impl<T: ?Sized> fmt::Debug for ReentrantWrite<'_, T> {
 #[cfg(all(test, not(loom)))]
 mod tests {
     use super::*;
+    use crate::sync::MAX_BYPASS;
     use crate::sync::test_support::Polled;
 
     #[test]
-    fn a_reader_reads_again_past_a_waiting_writer() {
+    fn a_reader_reads_again_while_a_writer_waits() {
         let lock = ReentrantRwLock::new(());
         let (me, writer) = (Owner::new(), Owner::new());
         let first = lock.try_read(&me).expect("free");
         let mut write = Polled::new(lock.write(&writer));
         write.pending();
-        assert!(
-            lock.try_read(&Owner::new()).is_none(),
-            "a new owner waits for the writer"
-        );
         let second = Polled::new(lock.read(&me)).ready();
         drop(first);
-        assert_eq!(write.wakes(), 0, "the owner still reads");
         drop(second);
-        assert_eq!(write.wakes(), 1);
-        drop(write.ready());
-        assert!(lock.try_write(&Owner::new()).is_some());
+        assert!(write.wakes() >= 1, "the last read out nudges the writer");
+        let held = write.ready().expect("the writer holds no read");
+        assert!(lock.try_read(&Owner::new()).is_none());
+        drop(held);
+    }
+
+    #[test]
+    fn an_owned_read_never_waits_behind_an_owed_writer() {
+        let lock = ReentrantRwLock::new(());
+        let (me, writer) = (Owner::new(), Owner::new());
+        let others: Vec<Owner> = (0..=MAX_BYPASS).map(|_| Owner::new()).collect();
+        let mine = lock.try_read(&me).expect("free");
+        let mut write = Polled::new(lock.write(&writer));
+        write.pending();
+        let mut other = lock.try_read(&others[0]).expect("barge");
+        for owner in &others[1..] {
+            let next = lock.try_read(owner).expect("a new owner barges");
+            drop(other);
+            other = next;
+            write.pending();
+        }
+        assert!(lock.try_read(&Owner::new()).is_none(), "the writer is owed");
+        let again = Polled::new(lock.read(&me)).ready();
+        drop((other, again, mine));
+        assert!(write.ready().is_ok());
     }
 
     #[test]
@@ -508,67 +519,16 @@ mod tests {
     }
 
     #[test]
-    fn the_only_reader_upgrades_at_once() {
+    fn a_reader_asking_to_write_is_refused_rather_than_deadlocked() {
         let lock = ReentrantRwLock::new(());
         let me = Owner::new();
         let read = lock.try_read(&me).expect("free");
-        let write = Polled::new(lock.write(&me)).ready();
-        assert!(lock.try_read(&Owner::new()).is_none());
-        drop(write);
-        assert!(
-            lock.try_write(&Owner::new()).is_none(),
-            "the read is still held"
+        assert!(lock.try_write(&me).is_none());
+        assert_eq!(
+            Polled::new(lock.write(&me)).ready().err(),
+            Some(ReadHeldByOwner)
         );
         drop(read);
-        assert!(lock.try_write(&Owner::new()).is_some());
-    }
-
-    #[test]
-    fn an_upgrade_waits_for_the_other_readers_ahead_of_plain_writers() {
-        let lock = ReentrantRwLock::new(());
-        let (me, them, writer) = (Owner::new(), Owner::new(), Owner::new());
-        let mine = lock.try_read(&me).expect("free");
-        let theirs = lock.try_read(&them).expect("readers share");
-        let mut write = Polled::new(lock.write(&writer));
-        write.pending();
-        let mut upgrade = Polled::new(lock.write(&me));
-        upgrade.pending();
-        drop(theirs);
-        assert_eq!((upgrade.wakes(), write.wakes()), (1, 0));
-        let upgraded = upgrade.ready();
-        drop(upgraded);
-        assert_eq!(write.wakes(), 0, "the upgrader still reads");
-        drop(mine);
-        assert_eq!(write.wakes(), 1);
-        drop(write.ready());
-    }
-
-    #[test]
-    fn a_withdrawn_upgrade_keeps_the_read_it_came_with() {
-        let lock = ReentrantRwLock::new(());
-        let (me, them) = (Owner::new(), Owner::new());
-        let mine = lock.try_read(&me).expect("free");
-        let theirs = lock.try_read(&them).expect("readers share");
-        Polled::new(lock.write(&me)).pending();
-        drop(theirs);
-        assert!(lock.try_write(&them).is_none(), "the owner still reads");
-        drop(mine);
-        assert!(lock.try_write(&them).is_some());
-    }
-
-    #[test]
-    fn a_granted_upgrade_dropped_unseen_turns_back_into_a_read() {
-        let lock = ReentrantRwLock::new(());
-        let (me, them) = (Owner::new(), Owner::new());
-        let mine = lock.try_read(&me).expect("free");
-        let theirs = lock.try_read(&them).expect("readers share");
-        let mut upgrade = Polled::new(lock.write(&me));
-        upgrade.pending();
-        drop(theirs);
-        assert_eq!(upgrade.wakes(), 1);
-        drop(upgrade);
-        assert!(lock.try_read(&them).is_some(), "back to a read phase");
-        drop(mine);
-        assert!(lock.try_write(&them).is_some());
+        assert!(Polled::new(lock.write(&me)).ready().is_ok());
     }
 }
