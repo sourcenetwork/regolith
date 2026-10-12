@@ -664,6 +664,24 @@ tla:
     check MC_SyncRwLock_Red_AnyReaderUpgrade           RED NoUpgradeDeadlock
     check MC_SyncRwLock_Red_UpgradeNoHoldBack          RED UpgradeHoldsBack
     check MC_SyncRwLock_Red_OwnerUnaware               RED NoSelfDeadlock
+    # The compaction gate (4.6, E28): a pass shares it, a job holds it
+    # alone, no waiter is passed over more than Bound times either way, the
+    # worker takes turns between jobs and passes, and a job parked on its
+    # queue is always woken. The old gate's rule is Red_OldGate. Lean:
+    # Regolith/CompactionGate.lean, mutual_exclusion, bounded_bypass,
+    # owed_only_gets_nearer, worker_takes_turns, parked_job_keeps_its_wake.
+    spec=CompactionGate
+    check MC_CompactionGate_Green                      GREEN
+    check MC_CompactionGate_Green_All                  GREEN
+    check MC_CompactionGate_Green_Queue                GREEN
+    check MC_CompactionGate_Green_Passes               GREEN
+    check MC_CompactionGate_Green_Live                 GREEN
+    check MC_CompactionGate_Red_OldGate                RED BoundedBypass
+    check MC_CompactionGate_Red_NoHandoff              RED BoundedBypass
+    check MC_CompactionGate_Red_DrainJobs              RED WorkerTakesTurns
+    check MC_CompactionGate_Red_WakeDropped            RED NoLostWake
+    check MC_CompactionGate_Red_StaleWaker             RED NoLostWake
+    check MC_CompactionGate_Red_SkipGate               RED MutualExclusion
     # regolith::sync::Event, Latch and Barrier.
     spec=SyncLatch
     check MC_SyncLatch_Green_Event                     GREEN
