@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::thread;
 
-use regolith::{Db, OptimisticTransactionDb, Options, TxnOptions, WriteBatch};
+use regolith::{Db, OptimisticTransactionDb, Options, TransactionError, TxnOptions, WriteBatch};
 use tempfile::TempDir;
 
 fn active_bytes(db: &Db) -> u64 {
@@ -365,8 +365,13 @@ fn optimistic_transactions_do_not_lose_conflicts_under_group_commit() {
                     Ok(_) => {
                         committed.fetch_add(1, Ordering::Relaxed);
                     }
-                    Err(_) => {
+                    Err(TransactionError::Conflict(_)) => {
                         conflicts.fetch_add(1, Ordering::Relaxed);
+                    }
+                    // Counted as a conflict, any other failure would pass
+                    // unseen: it applied nothing, so the totals still agree.
+                    Err(other) => {
+                        panic!("a commit failed for a reason other than a conflict: {other}")
                     }
                 }
             }
