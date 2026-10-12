@@ -669,8 +669,11 @@ tla:
     # single_thread_finishes.
     spec=NonBlocking
     check MC_NonBlocking_Green_Pool                    GREEN
+    check MC_NonBlocking_Green_PoolLive                GREEN
     check MC_NonBlocking_Green_Jobs                    GREEN
+    check MC_NonBlocking_Green_JobsLive                GREEN
     check MC_NonBlocking_Green_Single                  GREEN
+    check MC_NonBlocking_Green_SingleLive              GREEN
     check MC_NonBlocking_Red_WrongQueue                RED OwnQueue
     check MC_NonBlocking_Red_LostIdleWakeup            RED NoLostIdleWakeup
     check MC_NonBlocking_Red_DoubleRun                 RED SingleRun
