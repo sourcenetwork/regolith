@@ -54,18 +54,14 @@ jobs:
   # and the red configurations both run: a red one going green would mean
   # the model stopped telling the fix from the defect.
   #
-  # Every row runs, dealt out over six jobs side by side (`just tla N 6`
-  # takes each sixth row, starting at the Nth): checked one after another
-  # with one TLC worker the suite takes 41 minutes on a workstation. A GREEN
-  # row gets every core of its runner. Measured on four cores, the six
-  # shards take 2.5 to 9 minutes each, so each has 30.
+  # Every row runs in one job. The suite is bounded by its configurations,
+  # not by more runners: each row is sized to finish in under a minute on one
+  # TLC worker and is stopped, as a failure, at two (`just tla`), and the
+  # recipe runs as many rows side by side as the runner has cores. The whole
+  # suite is meant to take under 10 minutes on four cores, so the job has 15.
   tla:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
-    strategy:
-      fail-fast: false
-      matrix:
-        shard: [1, 2, 3, 4, 5, 6]
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-java@v4
@@ -73,8 +69,8 @@ jobs:
           distribution: temurin
           java-version: '21'
       - uses: extractions/setup-just@v2
-      - name: TLA+ models, every green and red configuration of this shard
-        run: just tla ${{ matrix.shard }} 6
+      - name: TLA+ models, every green and red configuration
+        run: just tla
 
   # The Lean proofs beside the TLA+ models: each module proves for every
   # size what a model checks for a few. Plain Lean 4 core, no dependencies.
