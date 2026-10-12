@@ -276,11 +276,21 @@ loom-debug:
     RUSTFLAGS="--cfg loom" cargo test --test loom_memtable
 
 # Loom models for `regolith::sync`: every primitive's wait protocol,
-# with two calibrations that must fail. Release only: the three-thread
-# models explore 0.2 to 0.5 million interleavings each, which a debug
-# build multiplies several times over.
+# with two calibrations that must fail. Release only: the larger models
+# explore 0.1 to 3 million interleavings each (about eight minutes in
+# all), which a debug build multiplies several times over.
 loom-sync:
     RUSTFLAGS="--cfg loom" cargo test --release --test loom_sync
+
+# The five sync models whose three threads all contend for one lock or
+# semaphore, at preemption bound 2 instead of the bound 1 `loom-sync`
+# runs them at: their `#[ignore]`d twins, or the one `model` names.
+# Four of them take 43 to 79 minutes each on a workstation; the fifth, the
+# upgradable read, runs a smaller scenario at bound 2 and takes 10 s (its
+# full one never finished). So the nightly CI run carries them, one job
+# per model, not the per-change one.
+loom-sync-deep model="":
+    RUSTFLAGS="--cfg loom" cargo test --release --test loom_sync -- --ignored {{model}}
 
 # Loom models for the per-thread I/O queues (D53): the unit claim, the
 # completion pushed to every waiting queue, the idle waker, and a read's
@@ -329,17 +339,36 @@ chaos instances="4" rounds="2" versions="120" min_rounds="20":
 # `WalRotation.tla` (E2, a rotation syncs the sealed log first).
 # Each row prints the distinct states TLC explored and its wall time.
 # TLC is fetched on first use, pinned by checksum in `proofs/tla/tools/tlc`.
-tla:
+#
+# `just tla` runs every row. `just tla N M` runs the rows of shard N of M:
+# the rows are dealt out in turn, so M runs side by side (CI's matrix) cover
+# every row once, and no shard holds two neighbouring heavy rows.
+#
+# A GREEN row explores its whole state space, in whatever order, so TLC
+# gets every core for it. A RED row stops at the first broken invariant it
+# meets, and with one worker that is always the shallowest one, the same on
+# every run; RED rows are short anyway.
+# Check every TLA+ row, or shard N of M of them (`just tla N M`).
+tla shard="1" shards="1":
     #!/usr/bin/env bash
     set -uo pipefail
     cd proofs/tla
     fail=0
+    row=0
     # The module the next rows check; each block below sets it.
     spec=RepeatableRead
     check() {
-        local cfg="$1" expect="$2" inv="${3:-}" out broke verdict states took
-        out=$(./tools/tlc -metadir "states/$cfg" -config "$cfg.cfg" "$spec.tla" 2>&1)
-        broke=$(sed -n 's/^Error: Invariant \(.*\) is violated\.$/\1/p' <<<"$out" | head -1)
+        local cfg="$1" expect="$2" inv="${3:-}" out broke verdict states took workers
+        row=$((row + 1))
+        if [ $(( (row - 1) % {{shards}} + 1 )) -ne {{shard}} ]; then return; fi
+        workers=1
+        if [ "$expect" = GREEN ]; then workers=auto; fi
+        out=$(./tools/tlc -workers "$workers" -metadir "states/$cfg" -config "$cfg.cfg" "$spec.tla" 2>&1)
+        # TLC words a broken invariant two ways: "is violated." when the search reaches a bad
+        # state, and "is violated by the initial state:" when the very first state is already
+        # bad. Both name the invariant, and both count.
+        broke=$(sed -n -e 's/^Error: Invariant \(.*\) is violated\.$/\1/p' \
+                       -e 's/^Error: Invariant \(.*\) is violated by the initial state:$/\1/p' <<<"$out" | head -1)
         states=$(sed -n 's/^.* states generated, \([0-9,]*\) distinct states found.*$/\1/p' <<<"$out" | tail -1)
         took=$(sed -n 's/^Finished in \(.*\) at (.*$/\1/p' <<<"$out" | tail -1)
         if grep -q "No error has been found" <<<"$out"; then
@@ -605,6 +634,7 @@ tla:
     check MC_TxnCallbacks_Red_HelperNoClaim            RED AtMostOnce
     check MC_TxnCallbacks_Red_CloseNoClaim             RED AtMostOnce
     rm -rf states ./*_TTrace_*.tla ./*_TTrace_*.bin
+    echo "  shard {{shard}} of {{shards}}: $row rows in all"
     exit $fail
 
 # `proofs/lean` is a Lake project named Regolith, plain Lean 4 core with no
@@ -762,7 +792,7 @@ wasm-native records="5000" sustained="20000":
     set -euo pipefail
     for profile in embedded wasm; do
         echo "== profile $profile =="
-        cargo run --release -p regolith-wasm-probe -- \
+        cargo run --release -p regolith-wasm-probe --bin regolith-wasm-probe -- \
             --profile "$profile" --records {{records}} --sustained {{sustained}} \
             --probe-host --report-memory
     done
@@ -772,9 +802,25 @@ wasm-native records="5000" sustained="20000":
 # `tests/`, and all but the three `wasm_opfs*` files are native-only.
 # The runner is named per target instead, so only the named test
 # binaries are built.
+#
+# Needs `wasm-bindgen-test-runner` from the `wasm-bindgen-cli` release that
+# Cargo.lock pins for `wasm-bindgen`, to the patch: the two share an
+# unstable schema, and a runner of another version refuses the test binary
+# with a schema error after the whole build. The recipe checks that first
+# and says what to install.
 wasm-browser:
     #!/usr/bin/env bash
     set -euo pipefail
+    pinned=$(awk '/^name = "wasm-bindgen"$/ { found = 1; next } found && /^version = / { gsub(/"/, "", $3); print $3; exit }' Cargo.lock)
+    if ! command -v wasm-bindgen-test-runner >/dev/null 2>&1; then
+        echo "error: wasm-bindgen-test-runner is not on PATH; install it with: cargo install wasm-bindgen-cli --version $pinned --locked" >&2
+        exit 1
+    fi
+    have=$(wasm-bindgen --version 2>/dev/null | awk '{ print $2 }')
+    if [ "$have" != "$pinned" ]; then
+        echo "error: wasm-bindgen-cli is ${have:-not installed} but Cargo.lock pins wasm-bindgen $pinned, and the two must match exactly; install it with: cargo install wasm-bindgen-cli --version $pinned --locked" >&2
+        exit 1
+    fi
     export CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER=wasm-bindgen-test-runner
     # wasm-bindgen's default per-test budget is 20s, which a headless
     # browser on a shared runner can exceed on a test that mounts OPFS

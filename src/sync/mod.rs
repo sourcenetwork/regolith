@@ -13,12 +13,16 @@
 //! - **No runtime.** A contended acquire queues a waiter, registers the
 //!   caller's `Waker` and returns `Pending`. What a wake does belongs to
 //!   the caller's executor.
-//! - **FIFO handoff.** A release hands ownership to the oldest waiter
-//!   before it wakes it, so a woken task never races for what it was
-//!   given, and a waiter is never overtaken.
-//! - **No barging.** A `try_` form fails while others wait.
+//! - **Fast under contention.** The locks and the semaphore let a caller
+//!   take what is free even while others wait, so a release never waits
+//!   for a suspended task to run: the thread that released takes the lock
+//!   straight back.
+//! - **Bounded bypass.** A release wakes the oldest waiters it could
+//!   serve to compete again. One that loses [`MAX_BYPASS`] times is owed a
+//!   handoff: nobody gets in ahead of it, and the next release hands it
+//!   what it waits for directly. Fairness is counted, never timed.
 //! - **Cancellation-safe.** Dropping a pending future withdraws its
-//!   waiter. If ownership was handed to it concurrently, the drop passes
+//!   waiter. If something was handed to it concurrently, the drop passes
 //!   it on. No wakeup is lost.
 //! - **Reentrancy by [`Owner`].** The reentrant locks are keyed by an
 //!   owner token rather than a thread, because a task can move between
@@ -33,12 +37,13 @@
 //!
 //! Each primitive keeps one state word, a lock-free stack of arriving
 //! waiters and a FIFO of the waiters already sorted. Uncontended calls
-//! touch the state word only. Anything that can make a waiter runnable (a
-//! release, a new waiter, a cancellation) takes the drain role with one
-//! compare-and-swap, or, when another thread holds it, marks the state
-//! dirty and returns, so no call ever waits for another. The holder
-//! grants what the state allows in FIFO order, rechecks until nothing
-//! changed while it worked, and wakes the granted waiters after it has
+//! touch the state word only, one atomic read-modify-write each. Anything
+//! that can make a waiter runnable (a release, a new waiter, a
+//! cancellation) takes the drain role with one compare-and-swap, or, when
+//! another thread holds it, marks the state dirty and returns, so no call
+//! ever waits for another. The holder wakes what the state allows (or,
+//! while a handoff is owed, grants it in queue order), rechecks until
+//! nothing changed while it worked, and calls the wakers after it has
 //! given the role up.
 //!
 //! Besides the primitives, this module re-exports kovan's lock-free
@@ -62,6 +67,7 @@ macro_rules! loom_const_fn {
 
 mod barrier;
 mod channel;
+mod contend;
 mod event;
 pub(crate) mod internal;
 mod latch;
@@ -86,6 +92,7 @@ pub use barrier::{Barrier, BarrierWait, BarrierWaitResult};
 pub use channel::{
     BoundedReceiver, BoundedSender, UnboundedReceiver, UnboundedSender, bounded, unbounded,
 };
+pub use contend::MAX_BYPASS;
 pub use event::{Event, EventWait};
 pub use latch::{Latch, LatchWait};
 pub use lazy::Lazy;
@@ -95,9 +102,13 @@ pub use once_cell::OnceCell;
 pub use owner::{Owner, ThreadOwner};
 pub use reentrant_mutex::{ReentrantMutex, ReentrantMutexGuard, ReentrantMutexLock};
 pub use reentrant_rwlock::{
-    ReentrantRead, ReentrantReadGuard, ReentrantRwLock, ReentrantWrite, ReentrantWriteGuard,
+    ReadHeldByOwner, ReentrantRead, ReentrantReadGuard, ReentrantRwLock, ReentrantWrite,
+    ReentrantWriteGuard,
 };
-pub use rwlock::{Read, RwLock, RwLockReadGuard, RwLockWriteGuard, Write};
+pub use rwlock::{
+    Read, RwLock, RwLockReadGuard, RwLockUpgradableReadGuard, RwLockWriteGuard, UpgradableRead,
+    Upgrade, Write,
+};
 pub use semaphore::{Acquire, AcquireOwned, OwnedSemaphorePermit, Semaphore, SemaphorePermit};
 
 pub use kovan::Atom;
@@ -125,6 +136,10 @@ mod tests {
         send_sync::<Write<'static, u8>>();
         send_sync::<RwLockReadGuard<'static, u8>>();
         send_sync::<RwLockWriteGuard<'static, u8>>();
+        send_sync::<RwLockUpgradableReadGuard<'static, u8>>();
+        send_sync::<UpgradableRead<'static, u8>>();
+        send_sync::<Upgrade<'static, u8>>();
+        send_sync::<ReadHeldByOwner>();
         send_sync::<Semaphore>();
         send_sync::<Acquire<'static>>();
         send_sync::<AcquireOwned>();

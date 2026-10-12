@@ -8,7 +8,8 @@
 //! kovan's bounded channel has no `try_send`, so a bounded channel here is
 //! kovan's unbounded channel with its capacity kept by a
 //! [`Semaphore`](super::Semaphore): a send takes a slot permit and a
-//! receive returns it. Senders waiting for room are served in order.
+//! receive returns it. Senders waiting for room are woken oldest first,
+//! with the semaphore's bounded bypass.
 
 use core::fmt;
 
@@ -121,7 +122,7 @@ pub struct BoundedSender<T: 'static> {
 }
 
 impl<T: 'static> BoundedSender<T> {
-    /// Sends `value` if the channel has room and no sender is waiting for
+    /// Sends `value` if the channel has room and no waiting sender is owed
     /// it; otherwise hands `value` back.
     pub fn try_send(&self, value: T) -> Result<(), T> {
         if !self.slots.try_acquire(1) {
@@ -203,7 +204,7 @@ mod tests {
         tx.try_send(1).expect("room for one");
         let mut waiting = Polled::new(tx.send_async(2));
         waiting.pending();
-        assert_eq!(tx.try_send(3), Err(3), "a waiting sender is not overtaken");
+        assert_eq!(tx.try_send(3), Err(3), "the channel is full");
         assert_eq!(rx.try_recv(), Some(1));
         assert_eq!(waiting.wakes(), 1);
         waiting.ready();
