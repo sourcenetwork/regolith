@@ -88,3 +88,10 @@ import Regolith.ManifestSeal
 -- tag covers and writes a sealed MANIFEST last. Backs
 -- `proofs/tla/BackupSeal.tla`.
 import Regolith.BackupSeal
+
+-- 4.6, 4.10: the pessimistic lock table. One holder per key, a retired
+-- table entry has no user, a waiter the lock may serve is told through its
+-- own inbox and nowhere else, a waiter loses at most BOUND races, and a
+-- commit keeps its lock until it is visible. Backs
+-- `proofs/tla/LockTable.tla`.
+import Regolith.LockTable
