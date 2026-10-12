@@ -842,12 +842,19 @@ tla:
     check MC_ClockCache_Red_IgnorePins                 RED NoFreedPin
     check MC_ClockCache_Red_Unbounded                  RED ByteBound
     check MC_ClockCache_Red_LandingUnheld              RED LandedReadable
-    # 4.6, Phase 7b: a memtable's append-only range-tombstone log. Lean:
-    # Regolith/TombstoneLog.lean, prefix_whole and published_seen.
+    # 4.6, Phase 7b and 4.7: a memtable's append-only range-tombstone log,
+    # appended to by whichever threads apply commits. Green_Twice is the
+    # witness that the GREEN run appends one tombstone twice. Lean:
+    # Regolith/TombstoneLog.lean, one_slot_each, ready_whole and
+    # published_seen.
     spec=TombstoneLog
-    check MC_TombstoneLog_Green                        GREEN
-    check MC_TombstoneLog_Red_LenFirst                 RED PrefixWhole
-    check MC_TombstoneLog_Red_HorizonFirst             RED PublishedSeen
+    check MC_TombstoneLog_Green               GREEN
+    check MC_TombstoneLog_Green_Readers       GREEN
+    check MC_TombstoneLog_Green_Twice         RED NeverTwice
+    check MC_TombstoneLog_Red_ReadyFirst      RED ReadWhole
+    check MC_TombstoneLog_Red_HorizonFirst    RED PublishedSeen
+    check MC_TombstoneLog_Red_LoadStore       RED OneSlotEach
+    check MC_TombstoneLog_Red_LoadStore_Lost  RED PublishedSeen
     # 4.6, Phase 7c1: the open-file slot table under max_open_files. Lean:
     # Regolith/OpenFileTable.lean, open_le_cap, never_closes_in_use,
     # reads_own_file.
