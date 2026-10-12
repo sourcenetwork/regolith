@@ -38,6 +38,8 @@ jobs:
   # harness itself cross-compilable.
   embedded-tier-a:
     runs-on: ubuntu-latest
+    # Measured at 25 to 40 s a target.
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
