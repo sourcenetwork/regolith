@@ -179,6 +179,46 @@ fn a_cached_shim_that_interposes_nothing_is_rebuilt() {
     );
 }
 
+/// Proves the cached shim belongs to the compiler that built it: another
+/// compiler names another object, and the one this run builds carries the
+/// key of the compiler this run uses.
+///
+/// Catches: a cache keyed on the shim's source alone. A shim built under
+/// one toolchain was then preloaded into a test binary built by another,
+/// fired no fault and recorded nothing, and every power-loss test failed
+/// until someone deleted the cache by hand.
+#[test]
+fn the_cached_shim_is_keyed_on_the_compiler_that_builds_it() {
+    let stable = "rustc 1.99.0 (b940084d7 2026-09-28)\nhost: x86_64-unknown-linux-gnu\n";
+    let nightly = "rustc 1.99.0-nightly (c79e8f894 2026-08-04)\nhost: x86_64-unknown-linux-gnu\n";
+    assert_eq!(
+        fault::shim::cache_key(stable),
+        fault::shim::cache_key(stable)
+    );
+    assert_ne!(
+        fault::shim::cache_key(stable),
+        fault::shim::cache_key(nightly),
+        "two compilers would share one cached shim"
+    );
+
+    let identity = fault::shim::compiler_identity().unwrap();
+    assert!(identity.contains("rustc"), "{identity}");
+    let dir = TempDir::new().unwrap();
+    let lib = fault::shim::build_in(dir.path()).unwrap();
+    let name = lib.file_name().unwrap().to_string_lossy().into_owned();
+    assert!(
+        name.contains(&format!("{:016x}", fault::shim::cache_key(&identity))),
+        "{name} is not named after this run's compiler"
+    );
+    // A shim left there by another compiler is not the one this run uses.
+    let other = dir.path().join(format!(
+        "libregolith_fault_shim_{:016x}.so",
+        fault::shim::cache_key("some other compiler")
+    ));
+    std::fs::write(&other, b"not this compiler's shim").unwrap();
+    assert_eq!(fault::shim::build_in(dir.path()).unwrap(), lib);
+}
+
 /// Proves a kill point is byte-exact rather than wall-clock: asking to die
 /// on the second MANIFEST write must kill the child by signal, with the
 /// last recorded operation being that MANIFEST write.
