@@ -78,7 +78,7 @@
 \*
 \* CONFIGURATIONS (each GREEN must pass, each RED must break the one
 \* invariant it names):
-\*   MC_StallRelief_Green           three writers, one job, the real code:
+\*   MC_StallRelief_Green           two writers, one job, the real code:
 \*                                  NoStrandedWait holds.
 \*   MC_StallRelief_Red_NoRelief    the job releases the gate and ends with
 \*                                  no relief: NoStrandedWait breaks.
