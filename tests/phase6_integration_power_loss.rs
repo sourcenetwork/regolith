@@ -27,8 +27,6 @@
 
 mod common;
 
-use std::fs::OpenOptions;
-use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -143,13 +141,7 @@ fn frozen_bytes(db: &Db) -> u64 {
 fn overwrite(spec: &ChildSpec, path: FlushPath) {
     let env = Arc::new(FaultyEnv::default());
     let db = Db::open(&spec.db_path, path.options(spec, Arc::clone(&env))).expect("child: open");
-    // One unbuffered write per acknowledgement, so a kill a microsecond
-    // later cannot lose the record of what was told.
-    let mut acks = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&spec.ack_path)
-        .unwrap();
+    let mut acks = fault::Acks::open(&spec.ack_path);
     if let FlushPath::StallStep = path {
         // The table that turns the slowdown on.
         regolith::through_stalls(|| db.put(b"seed", b"v")).expect("child: seed");
@@ -166,7 +158,7 @@ fn overwrite(spec: &ChildSpec, path: FlushPath) {
         batch.put(&key(i), &value(i));
         batch.put(&own_key(i), &value(i));
         regolith::through_stalls(|| db.write(batch.clone())).expect("child: write");
-        acks.write_all(format!("{i}\n").as_bytes()).unwrap();
+        acks.ack([i as u64]);
     }
     env.fail_tables(false);
     db.close().expect("child: close");
@@ -176,7 +168,7 @@ fn overwrite(spec: &ChildSpec, path: FlushPath) {
 /// acknowledged write's own key is there, and every overwritten key reads
 /// its last acknowledged version or a later one, never an older one.
 fn check_overwrites(db: &Db, out: &ChildOutcome, what: &str) {
-    for &i in &out.acked {
+    for &i in &out.acked() {
         assert_eq!(
             db.get(&own_key(i)).unwrap(),
             Some(value(i)),
@@ -184,7 +176,7 @@ fn check_overwrites(db: &Db, out: &ChildOutcome, what: &str) {
         );
     }
     let mut last_acked = [None; KEYS];
-    for &i in &out.acked {
+    for &i in &out.acked() {
         last_acked[i % KEYS] = Some(last_acked[i % KEYS].map_or(i, |was: usize| was.max(i)));
     }
     for (k, acked) in last_acked.iter().enumerate() {

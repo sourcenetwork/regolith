@@ -53,8 +53,6 @@
 mod common;
 
 use std::collections::BTreeSet;
-use std::fs::OpenOptions;
-use std::io::Write;
 use std::path::Path;
 
 use common::fault::{self, ChildSpec, CrashRun, DieKind, History, Phase, Trigger};
@@ -283,7 +281,7 @@ fn a_process_kill_after_n_writes_keeps_every_one_of_them() {
         let tag = format!("N={n}");
         let recovered = reopen(&db, opts);
         let report = fault::assert_valid_prefix(&recovered, &out.history);
-        fault::assert_acked_survived(&report, &out.acked);
+        fault::assert_acked_survived(&report, &out.acked());
         assert_eq!(
             report.k,
             n,
@@ -357,7 +355,7 @@ fn a_process_kill_between_a_batch_and_its_acknowledgement_recovers_the_whole_bat
 
     let recovered = reopen(&db, opts);
     let report = fault::assert_valid_prefix(&recovered, &out.history);
-    fault::assert_acked_survived(&report, &out.acked);
+    fault::assert_acked_survived(&report, &out.acked());
     assert!(
         out.history.batch_boundaries().contains(&report.k),
         "recovered prefix {} stops inside a batch; boundaries are {:?}",
@@ -457,7 +455,7 @@ fn a_process_kill_part_way_through_a_wal_record_must_not_lose_the_records_before
             }
         };
         let report = fault::assert_valid_prefix(&recovered, &out.history);
-        fault::assert_acked_survived(&report, &out.acked);
+        fault::assert_acked_survived(&report, &out.acked());
         assert!(
             out.history.batch_boundaries().contains(&report.k),
             "{label}: recovered prefix {} stops inside a batch; boundaries are {:?}",
@@ -520,7 +518,7 @@ fn a_process_kill_between_the_wal_append_and_the_memtable_apply_can_only_gain_da
 
     let recovered = reopen(&db, opts);
     let report = fault::assert_valid_prefix(&recovered, &out.history);
-    fault::assert_acked_survived(&report, &out.acked);
+    fault::assert_acked_survived(&report, &out.acked());
     assert_eq!(
         report.k,
         out.acked_count() + 1,
@@ -591,7 +589,7 @@ fn a_process_kill_during_a_flush_installs_no_truncated_sstable() {
 
     let recovered = reopen(&db, opts);
     let report = fault::assert_valid_prefix(&recovered, &out.history);
-    fault::assert_acked_survived(&report, &out.acked);
+    fault::assert_acked_survived(&report, &out.acked());
     assert!(
         !live_file_ids(&recovered).contains(&torn),
         "the truncated SSTable {torn:06}.sst was installed into the recovered version: {:?}",
@@ -656,7 +654,7 @@ fn a_process_kill_during_a_compaction_keeps_the_inputs_and_discards_the_output()
     );
     assert_no_dangling_files(&recovered, &db, "compaction");
     let report = fault::assert_valid_prefix(&recovered, &out.history);
-    fault::assert_acked_survived(&report, &out.acked);
+    fault::assert_acked_survived(&report, &out.acked());
 
     let promoted = (1..7).any(|level| {
         recovered
@@ -737,7 +735,7 @@ fn a_process_kill_on_an_unsynced_version_edit_leaves_a_consistent_version() {
         let (state, k) = {
             let recovered = reopen(&db, opts.clone());
             let report = fault::assert_valid_prefix(&recovered, &out.history);
-            fault::assert_acked_survived(&report, &out.acked);
+            fault::assert_acked_survived(&report, &out.acked());
             assert_no_dangling_files(&recovered, &db, &tag);
             let state = fault::recovered_state(&recovered).expect("recovered state");
             recovered.close().unwrap();
@@ -802,7 +800,7 @@ fn a_process_kill_during_the_closing_flush_loses_nothing() {
 
     let recovered = reopen(&db, opts);
     let report = fault::assert_valid_prefix(&recovered, &out.history);
-    fault::assert_acked_survived(&report, &out.acked);
+    fault::assert_acked_survived(&report, &out.acked());
     assert_eq!(
         report.k,
         out.history.len(),
@@ -861,7 +859,7 @@ fn a_process_kill_before_the_closing_wal_fsync_loses_nothing() {
 
     let recovered = reopen(&db, opts);
     let report = fault::assert_valid_prefix(&recovered, &out.history);
-    fault::assert_acked_survived(&report, &out.acked);
+    fault::assert_acked_survived(&report, &out.acked());
     assert_eq!(
         report.k,
         out.history.len(),
@@ -891,17 +889,10 @@ fn cycle_entries(spec: &ChildSpec) -> Vec<(Vec<u8>, Vec<u8>)> {
 /// statement about the union rather than about overwrites.
 fn cycle_workload(spec: &ChildSpec) {
     let db = Db::open(&spec.db_path, spec.options()).expect("child: open db");
-    let mut acks = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&spec.ack_path)
-        .expect("child: open ack file");
+    let mut acks = fault::Acks::open(&spec.ack_path);
     for (i, (key, value)) in cycle_entries(spec).into_iter().enumerate() {
         regolith::through_stalls(|| db.put(&key, &value)).expect("child: put");
-        // Unbuffered, so a SIGKILL a microsecond later cannot lose the
-        // record of what the caller was told.
-        acks.write_all(format!("{i}\n").as_bytes())
-            .expect("child: ack");
+        acks.ack([i as u64]);
     }
     fault::kill_self();
 }
