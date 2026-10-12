@@ -197,11 +197,15 @@ impl StallSignal {
 
 #[cfg(all(test, not(loom)))]
 mod tests {
+    use std::sync::{Mutex, mpsc};
+    use std::time::Duration;
+
     use super::*;
     use crate::column_family::{DEFAULT_CF_ID, prefix_key};
     use crate::engine::compaction::CompactionOutcome;
     use crate::engine::{DurabilityMode, RegolithEngine};
-    use crate::{Error, IoBudget, WouldBlock, WriteBatchOp};
+    use crate::portability::AtomicBool;
+    use crate::{Error, IoBudget, PrefixExtractor, WouldBlock, WriteBatchOp};
 
     fn put(key: &[u8]) -> Vec<WriteBatchOp> {
         vec![WriteBatchOp::Put {
@@ -354,5 +358,82 @@ mod tests {
         drop(queue_a);
         queue_b.poll(IoBudget::ALL);
         assert!(wait.is_ready(), "B looks again and leaves its own step");
+    }
+
+    /// Holds the flush that calls it, once armed, until it is let go.
+    struct HeldFlush {
+        armed: AtomicBool,
+        entered: Mutex<mpsc::Sender<()>>,
+        release: Mutex<mpsc::Receiver<()>>,
+    }
+
+    impl PrefixExtractor for HeldFlush {
+        fn extract<'a>(&self, key: &'a [u8]) -> Option<&'a [u8]> {
+            if self.armed.swap(false, Ordering::AcqRel) {
+                self.entered.lock().unwrap().send(()).unwrap();
+                self.release
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(60))
+                    .expect("the flush was never let go");
+            }
+            Some(key)
+        }
+
+        fn name(&self) -> &'static str {
+            "held-flush"
+        }
+    }
+
+    /// A stopped write whose own step finds another writer's owed flush in
+    /// flight waits for that writer. The flush adds an L0 table, so the stop
+    /// is still on when it ends, and that writer writes nothing more: the
+    /// stop is handed back, and the stopped write looks again instead of
+    /// waiting for a relief nobody runs.
+    #[test]
+    fn a_flush_that_leaves_the_stop_hands_it_back_to_the_writer_it_held_off() {
+        let (entered, when_entered) = mpsc::channel();
+        let (release, when_released) = mpsc::channel();
+        let held = Arc::new(HeldFlush {
+            armed: AtomicBool::new(false),
+            entered: Mutex::new(entered),
+            release: Mutex::new(when_released),
+        });
+        let (_dir, engine) = stopped_engine_with(EngineOptions {
+            inline_compaction: true,
+            l0_compaction_trigger: 100,
+            write_buffer_size: 2 * 1024,
+            prefix_extractor: Some(held.clone()),
+            ..EngineOptions::default()
+        });
+        let fill = |key: &[u8]| {
+            let ops = vec![WriteBatchOp::Put {
+                key: prefix_key(DEFAULT_CF_ID, key),
+                value: vec![7u8; 1024],
+            }];
+            engine
+                .apply_batch(ops, DurabilityMode::Eventual, false)
+                .unwrap();
+        };
+        // Two 1 KiB puts fill the buffer, so the third seals it, and the
+        // step that write owes flushes it.
+        fill(b"a");
+        fill(b"b");
+        held.armed.store(true, Ordering::Release);
+        let wait = std::thread::scope(|scope| {
+            scope.spawn(|| fill(b"c"));
+            when_entered
+                .recv_timeout(Duration::from_secs(60))
+                .expect("the sealing write never flushed");
+            let Err(Error::WouldBlock(WouldBlock::Stall(wait))) = engine.admit_write(false) else {
+                panic!("a relief contended by a flush in flight returns a wait");
+            };
+            assert!(!wait.is_ready());
+            release.send(()).unwrap();
+            wait
+        });
+        // The sealing write returned: its flush is done, and it writes no more.
+        assert!(matches!(engine.stall_signal().classify(), Some((_, true))));
+        assert!(wait.is_ready(), "handed back: the writer looks again");
     }
 }
