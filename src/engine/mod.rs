@@ -2074,12 +2074,28 @@ impl RegolithEngine {
                 &self.compaction_claims,
             );
             self.unkeep(kept);
-            outcome?
+            outcome.inspect_err(|err| self.compaction_failed(err))?
         };
         // As a worker does after each pass: writers a stop stopped are told
         // once the pass relieved it.
         self.refresh_stall_level();
         Ok(Some(outcome))
+    }
+
+    /// A compaction this thread ran failed with `err`: a step a write left
+    /// owing, one relieving a stall, [`crate::Db::compact_step`] or a
+    /// `compact_range`. Counted among the background errors and told to the
+    /// listeners as a worker's failing pass is
+    /// ([`compaction::tell_failure`]).
+    ///
+    /// Not recorded as the failure a stopped writer is told
+    /// (`BackgroundHealth::record_failure`): with no worker, a writer told
+    /// it would stop running the steps that are the only relief.
+    fn compaction_failed(&self, err: &std::io::Error) {
+        self.background_health.count_failure();
+        // A listener's panic, contained in a background step, was logged
+        // where it was caught: the caller gets the compaction's failure.
+        let _told = compaction::tell_failure(&self.options.listeners, err);
     }
 
     /// Write every memtable currently held in memory out to level-0
@@ -2648,13 +2664,24 @@ impl RegolithEngine {
     /// a queue's poll holds the step for the length of this call.
     ///
     /// Walks levels 0..MAX_LEVELS-1, picking range-overlapping files and
-    /// merging them into the next level.
+    /// merging them into the next level. A failure is told as any failing
+    /// compaction is ([`Self::compaction_failed`]).
     pub(crate) fn compact_range_levels(
         &self,
         start: Option<&[u8]>,
         end: Option<&[u8]>,
     ) -> std::io::Result<()> {
         self.ensure_writable()?;
+        self.compact_range_passes(start, end)
+            .inspect_err(|err| self.compaction_failed(err))
+    }
+
+    /// The passes of [`Self::compact_range_levels`].
+    fn compact_range_passes(
+        &self,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+    ) -> std::io::Result<()> {
         // Run the level-by-level push-down.
         let compaction_opts = self.options.to_compaction_options();
         // Under FIFO compaction there is no level push-down; a
@@ -2663,7 +2690,12 @@ impl RegolithEngine {
         // get dropped deterministically.
         match self.options.compaction_style {
             crate::options::CompactionStyle::Fifo => {
-                let _ = compaction::run_fifo_pass(&self.versions, &self.sst_dir, &compaction_opts)?;
+                let _ = compaction::run_fifo_pass(
+                    &self.versions,
+                    &self.sst_dir,
+                    &self.cache,
+                    &compaction_opts,
+                )?;
             }
             // Under Universal compaction a manual compact_range folds
             // every L0 file into one run, matching the "force full

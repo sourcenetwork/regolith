@@ -4,13 +4,15 @@
 //! on, the callback that panicked, and the log tail an open dropped.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
 use regolith::{
-    BackgroundErrorReason, CompactionJobInfo, CompactionOutcome, Conflict, Error, EventListener,
-    ExternalFileIngestionInfo, FlushJobInfo, IngestOptions, OptimisticTransactionDb, Options,
-    SstFileWriter, TableFileCreationInfo, TableFileCreationReason, TableFileDeletionInfo,
-    TransactionError, TxnOptions, WalTailDiscardedInfo,
+    BackgroundErrorReason, CompactionJobInfo, CompactionOutcome, CompactionStyle, Conflict, Db,
+    Error, EventListener, ExternalFileIngestionInfo, FifoCompactionOptions, FlushJobInfo,
+    IngestOptions, OptimisticTransactionDb, Options, SstFileWriter, TableFileCreationInfo,
+    TableFileCreationReason, TableFileDeletionInfo, TransactionError, TxnOptions,
+    WalTailDiscardedInfo,
 };
 
 use super::faulty_env::{FaultyEnv, logs};
@@ -250,4 +252,137 @@ fn every_method_is_called_with_what_the_workload_did() {
     assert_eq!(tail.offset + tail.discarded_bytes, bytes.len() as u64);
     assert!(tail.discarded_bytes > 0);
     drop(db);
+}
+
+/// The table files under `dir`'s table directory.
+fn tables_on_disk(dir: &Path) -> usize {
+    std::fs::read_dir(dir.join("sst")).unwrap().count()
+}
+
+/// The ids of the tables `events` tell were created.
+fn created(events: &[Event]) -> Vec<u64> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            Event::TableCreated(info) => Some(info.file_id),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The failures `events` tell of.
+fn failures(events: &[Event]) -> Vec<(BackgroundErrorReason, String)> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            Event::BackgroundError(reason, message) => Some((*reason, message.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A FIFO pass removes the oldest tables past its cap, and tells of each
+/// table it removed, as any compaction does.
+#[test]
+fn a_fifo_pass_tells_of_every_table_it_removes() {
+    let dir = tempfile::tempdir().unwrap();
+    let seen = Arc::new(Recording::default());
+    let db = Db::open(
+        dir.path(),
+        Options::default()
+            .compaction_style(CompactionStyle::Fifo)
+            .fifo_compaction_options(FifoCompactionOptions {
+                max_table_files_size: 1,
+            })
+            .max_background_compactions(0)
+            .inline_compaction(false)
+            .add_listener(seen.clone()),
+    )
+    .unwrap();
+    for i in 0..4u8 {
+        db.put(&[b'k', i], &[i; 64]).unwrap();
+        db.flush().unwrap();
+    }
+    db.compact_step().unwrap();
+    db.compact_range(None, None).wait().unwrap();
+
+    let events = seen.take();
+    let flushed = created(&events);
+    assert_eq!(flushed.len(), 4);
+    let removed: Vec<u64> = events
+        .iter()
+        .filter_map(|event| match event {
+            Event::TableDeleted(info) => {
+                assert!(!info.file_path.exists(), "{}", info.file_path.display());
+                Some(info.file_id)
+            }
+            _ => None,
+        })
+        .collect();
+    // The oldest first, the newest kept, and every table that is gone told.
+    assert_eq!(removed, flushed[..3], "{events:?}");
+    assert_eq!(tables_on_disk(dir.path()), 1);
+    assert_eq!(db.get(&[b'k', 3]).unwrap(), Some(vec![3; 64]));
+}
+
+/// A compaction pass that fails on a caller's thread is told to the
+/// listeners as one that fails on a worker is, by the job that failed, and
+/// counted among the background errors: run as a step a write left owing,
+/// asked for with `compact_step`, or run as a `compact_range`.
+#[test]
+fn a_compaction_failing_on_a_callers_thread_is_told() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = Arc::new(FaultyEnv::default());
+    let seen = Arc::new(Recording::default());
+    let db = Db::open(
+        dir.path(),
+        Options::default()
+            .env(env.clone())
+            .l0_compaction_trigger(2)
+            .max_background_compactions(0)
+            .add_listener(seen.clone()),
+    )
+    .unwrap();
+    let errors = || db.get_int_property("regolith.background-errors").unwrap();
+    db.put(b"a", b"1").unwrap();
+    db.put(b"c", b"1").unwrap();
+    db.flush().unwrap();
+    db.put(b"b", b"1").unwrap();
+    db.flush().unwrap();
+    seen.take();
+
+    // Two overlapping tables in level 0: the next write runs the compaction
+    // they leave owing, which cannot write its table.
+    env.fail_tables(true);
+    db.put(b"d", b"1").unwrap();
+    assert_eq!(env.tables_refused.load(Ordering::SeqCst), 1);
+    let told = failures(&seen.take());
+    assert_eq!(told.len(), 1, "{told:?}");
+    assert_eq!(told[0].0, BackgroundErrorReason::Compaction);
+    assert!(told[0].1.contains("no room for a table"), "{}", told[0].1);
+    assert_eq!(errors(), 1);
+
+    // `d` goes into a table of its own, so the memtable a `compact_range`
+    // flushes first is empty and the compaction is what fails below.
+    env.fail_tables(false);
+    db.flush().unwrap();
+    seen.take();
+    env.fail_tables(true);
+
+    // Asked for by the caller: the caller gets the error, and the listeners
+    // are told too.
+    assert!(db.compact_step().is_err());
+    assert_eq!(failures(&seen.take()).len(), 1);
+    assert!(db.compact_range(None, None).wait().is_err());
+    let told = failures(&seen.take());
+    assert_eq!(told.len(), 1, "{told:?}");
+    assert_eq!(told[0].0, BackgroundErrorReason::Compaction);
+    assert_eq!(errors(), 3);
+
+    // The disk has room again: the next pass compacts and tells of nothing
+    // failing.
+    env.fail_tables(false);
+    assert_eq!(db.compact_step().unwrap(), CompactionOutcome::DidWork);
+    assert!(failures(&seen.take()).is_empty());
+    assert_eq!(db.get(b"d").unwrap(), Some(b"1".to_vec()));
 }
