@@ -210,3 +210,36 @@ fn a_pessimistic_database_runs_the_same_contract() {
     assert_eq!(db.db().get(b"copy").unwrap(), Some(b"value-42".to_vec()));
     let _ = TxnOptions::new();
 }
+
+/// The future does not borrow the policy it was made from: it is made in one
+/// statement, from a policy that does not outlive that statement, and run in
+/// another. On both databases.
+#[test]
+fn the_future_outlives_the_policy_it_was_made_from() {
+    let dir = TempDir::new().unwrap();
+    let db = cold(&dir);
+    let mut queue = db.db().io_queue();
+    let attempt = db.transact_async(queue.id(), &RetryPolicy::default(), async |txn, _| {
+        txn.put(b"one-line", b"optimistic")?;
+        Ok::<_, regolith::TransactionError>(())
+    });
+    queue.block_on(attempt).unwrap();
+    assert_eq!(
+        db.db().get(b"one-line").unwrap(),
+        Some(b"optimistic".to_vec())
+    );
+    drop(queue);
+    drop(db);
+
+    let db = TransactionDb::open(dir.path(), Options::default().block_size(256)).unwrap();
+    let mut queue = db.db().io_queue();
+    let attempt = db.transact_async(queue.id(), &RetryPolicy::new(2), async |txn, _| {
+        txn.put(b"one-line", b"pessimistic")?;
+        Ok::<_, regolith::TransactionError>(())
+    });
+    queue.block_on(attempt).unwrap();
+    assert_eq!(
+        db.db().get(b"one-line").unwrap(),
+        Some(b"pessimistic".to_vec())
+    );
+}

@@ -144,7 +144,7 @@ async fn wait_out(would_block: WouldBlock) {
 /// stalled waits for the stall and runs the attempt again, uncounted, with
 /// the same `previous` conflict.
 async fn run_async<T, E>(
-    policy: &RetryPolicy,
+    policy: RetryPolicy,
     begin: impl Fn(&TxnOptions) -> Transaction,
     queue: QueueId,
     mut f: impl AsyncFnMut(&mut Transaction, Option<&Conflict>) -> Result<T, E>,
@@ -208,13 +208,20 @@ impl OptimisticTransactionDb {
     /// policy, and it gets the same previous conflict. An error from `f` ends
     /// the attempt with [`TransactError::Closure`] and is not retried; any
     /// failure but a conflict ends it with [`TransactError::Engine`].
-    pub fn transact_async<T, E>(
-        &self,
+    ///
+    /// The policy is copied into the future, which borrows the database and
+    /// `f` and nothing else: it may be made from a policy that does not
+    /// outlive the call.
+    pub fn transact_async<'db, T, E, F>(
+        &'db self,
         queue: QueueId,
         policy: &RetryPolicy,
-        f: impl AsyncFnMut(&mut Transaction, Option<&Conflict>) -> Result<T, E>,
-    ) -> impl Future<Output = Result<(T, CommitReceipt), TransactError<E>>> {
-        run_async(policy, |options| self.begin(options), queue, f)
+        f: F,
+    ) -> impl Future<Output = Result<(T, CommitReceipt), TransactError<E>>> + use<'db, T, E, F>
+    where
+        F: AsyncFnMut(&mut Transaction, Option<&Conflict>) -> Result<T, E>,
+    {
+        run_async(*policy, |options| self.begin(options), queue, f)
     }
 
     /// Run `f` in a transaction and commit it. When the commit loses a race
@@ -253,13 +260,16 @@ impl TransactionDb {
     /// transaction. Its key locks are taken as `get_for_update` and the writes
     /// take them, which can still wait for another holder; the reads and the
     /// commit never wait for the device.
-    pub fn transact_async<T, E>(
-        &self,
+    pub fn transact_async<'db, T, E, F>(
+        &'db self,
         queue: QueueId,
         policy: &RetryPolicy,
-        f: impl AsyncFnMut(&mut Transaction, Option<&Conflict>) -> Result<T, E>,
-    ) -> impl Future<Output = Result<(T, CommitReceipt), TransactError<E>>> {
-        run_async(policy, |options| self.begin(options), queue, f)
+        f: F,
+    ) -> impl Future<Output = Result<(T, CommitReceipt), TransactError<E>>> + use<'db, T, E, F>
+    where
+        F: AsyncFnMut(&mut Transaction, Option<&Conflict>) -> Result<T, E>,
+    {
+        run_async(*policy, |options| self.begin(options), queue, f)
     }
 
     /// [`OptimisticTransactionDb::transact`] for a pessimistic transaction.
