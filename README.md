@@ -494,6 +494,8 @@ just chaos      # the full-size read-view chaos workload
 just wasm       # the wasm32-wasip1 lifecycle under wasmtime
 ```
 
+`just test` and the other recipes that run under a limit need GNU `timeout` (coreutils).
+
 Each badge above is a workflow of its own, so a red one names exactly which property
 regressed.
 
