@@ -265,10 +265,20 @@ NoExtras == [r \in RoleNames |-> {}]
 \* The content-addressed collection: a collector, two linkers, a holder.
 ContentAddressedWorkload ==
   [NoExtras EXCEPT !["Collectors"] = {20}, !["Linkers"] = {21, 22}, !["Holders"] = {23}]
-\* Projected reads: a part reader, a rewriter, two part writers.
+\* Projected reads: a part reader, a rewriter, two part writers. The REDs
+\* run this whole workload; the two GREEN runs each take half of it.
 PartsWorkload ==
   [NoExtras EXCEPT !["PartReaders"] = {30}, !["PartRewriters"] = {31},
                    !["PartWriters"] = {32, 33}]
+\* The part reader beside two part writers, without the rewriter
+\* (MC_DefraLevel_Green_Parts).
+PartsWritersWorkload ==
+  [NoExtras EXCEPT !["PartReaders"] = {30}, !["PartWriters"] = {32, 33}]
+\* The part reader beside the rewriter and one part writer
+\* (MC_DefraLevel_Green_Parts_Rewriter).
+PartsRewriterWorkload ==
+  [NoExtras EXCEPT !["PartReaders"] = {30}, !["PartRewriters"] = {31},
+                   !["PartWriters"] = {32}]
 \* Value-validated reads: a reader and two version writers.
 ValueWorkload ==
   [NoExtras EXCEPT !["ValueReaders"] = {40}, !["VersionWriters"] = {41, 42}]

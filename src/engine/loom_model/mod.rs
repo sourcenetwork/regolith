@@ -77,6 +77,7 @@
 
 pub mod arena;
 pub mod families;
+pub mod gate;
 pub mod handoff;
 pub mod io_queue;
 pub mod jobs;

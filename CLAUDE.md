@@ -74,7 +74,7 @@ src/
 ├── event_listener.rs   # Flush/compaction event callbacks
 ├── io_queue.rs         # Non-blocking calls: ReadMode, QueueId, IoBudget, IoProgress
 ├── io_queue/           # queue.rs (IoQueue: poll, idle_waker, block_on), wait.rs (IoWait, StallWait,
-│                       # WouldBlock), ticket.rs (CommitTicket, JobTicket), completion.rs (deliver once)
+│                       # LockWait, WouldBlock), ticket.rs (CommitTicket, JobTicket), completion.rs (deliver once)
 ├── iter.rs             # Public iterator wrappers
 ├── log_layout.rs       # LogLayout: the key layout of a commit-ordered log
 ├── options.rs          # Options, tuning enums, MergeOperator, CompactionFilter
@@ -92,13 +92,17 @@ src/
 ├── transaction.rs      # Optimistic and pessimistic transactions, isolation levels
 ├── transaction/        # policy.rs (KeyClassifier, key classes), txn_options.rs (TxnOptions),
 │                       # scan_range.rs (scan stretches), write_buffer.rs (buffered puts, deletes, merges),
-│                       # nowait.rs (commit_nowait), retry.rs (transact, transact_async, ready)
+│                       # nowait.rs (commit_nowait), retry.rs (transact, transact_async, ready),
+│                       # lock_table.rs (the lock-free pessimistic lock table, a wait kept across calls),
+│                       # locking.rs (a transaction's lock calls: try, blocking with the timeout, release)
 ├── ttl.rs              # TTL database wrapper
 ├── sync/               # Public regolith::sync: async locks, semaphore, notify, event, latch, barrier, once cell
 │   ├── queue.rs        # Wait queue and drain role every primitive builds on
 │   ├── contend.rs      # The acquire every lock-like primitive shares: barging with bounded bypass (D49)
+│   ├── owned_lock.rs   # A lock whose holder is named in its state word: the pessimistic key lock
 │   ├── waiter.rs       # Waiter nodes, their free list, the wake list
-│   └── internal.rs     # The engine's private std/loom atomics, Mutex, RwLock, Condvar and Gate
+│   └── internal.rs     # The engine's private std/loom atomics and Mutex, and how its threads wait on a
+│                       # regolith::sync primitive (block_on, wait_here), releasing held-back views first
 ├── txn_buffer.rs       # Concurrent write and read-set buffer of one transaction
 ├── env/                # Env trait and backends: StdEnv (positional reads and log writes), MemEnv, WASI, OPFS;
 │                       # LogFile, a log written at offsets (serial_log.rs over an append-only file); db_lock.rs
@@ -118,10 +122,13 @@ src/
     │                   # for tests (hook.rs)
     ├── flush.rs        # Writing a frozen memtable to L0, shared with the compaction workers
     ├── background_step.rs # Flushes off the commit path; owed work run as a job on the writer's queue
-    ├── foreground.rs   # compact_range, ingest, checkpoint run as jobs behind a JobTicket
+    ├── foreground.rs   # compact_range, ingest, checkpoint run as jobs behind a JobTicket; a job on a
+    │                   # queue parks instead of waiting for the compaction gate
+    ├── compaction_gate.rs # The compaction gate: passes share it, jobs hold it alone, fair both ways (E28)
     ├── stall_state.rs  # Write-stall thresholds and the level writers cache
     ├── compaction.rs   # Level/FIFO/universal compaction planning and worker loop
-    ├── compaction/     # Per-snapshot-stripe folding of versions and merge chains
+    ├── compaction/     # Per-snapshot-stripe folding of versions and merge chains; claims.rs (the tables
+    │                   # passes are working on, claimed with atomics)
     ├── manifest.rs     # VersionSet, VersionEdit log, level tracking
     ├── version_store.rs # The version set behind its step; the current version is one load of the view
     ├── step.rs         # A step: sections run one at a time by whichever thread holds it, no mutex
@@ -157,7 +164,7 @@ src/
     ├── index_block.rs  # Decoded SSTable index blocks
     ├── internal_key.rs # MVCC internal key encoding
     ├── io/             # Per-thread queues: unit and job tables, the close gate (mod.rs), single-flight
-    │                   # read units (unit.rs) and jobs (job.rs) over one claim (flight.rs), per-queue
+    │                   # read units (unit.rs) and jobs (job.rs, with parking) over one claim (flight.rs), per-queue
     │                   # inbox and landings (shared.rs), thread binding (bind.rs), the mode scope
     │                   # (scope.rs), stack.rs, atomic_waker.rs
     ├── loom_model/     # Loom models of the engine's lock-free protocols (--cfg loom)

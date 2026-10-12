@@ -5,9 +5,16 @@
 //!
 //! ```text
 //! Free --claim (one CAS)--> Claimed --land--> Done
+//!   ^                          |
+//!   +---------- park ----------+
 //! ```
 //!
 //! The claim is the only way to `Claimed`, so the work runs at most once.
+//! A job that cannot go on without waiting for another thread *parks*: its
+//! claim holder hands the claim back before any of the gated work ran, and
+//! the job is claimed again once what it waits for may be free (`job.rs`).
+//! Only a claim holder parks, and a parked unit ran nothing, so the work
+//! still runs at most once.
 //! `land` publishes `Done` and then closes the list of waiting queues with
 //! one swap, handing the caller every queue that registered. A queue that
 //! registers after that swap is refused and reads the outcome itself. So
@@ -54,6 +61,15 @@ impl Flight {
         self.state
             .compare_exchange(FREE, CLAIMED, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
+    }
+
+    /// Hand the claim back without landing: the unit goes on later, under a
+    /// new claim. Only by the claim holder, after it put back whatever it
+    /// took from the unit: the `Release` store orders that before the next
+    /// claim's `Acquire`.
+    pub(crate) fn park(&self) {
+        debug_assert_eq!(self.state.load(Ordering::Relaxed), CLAIMED);
+        self.state.store(FREE, Ordering::Release);
     }
 
     /// Record `queue` as waiting. `false` when the unit already landed: the

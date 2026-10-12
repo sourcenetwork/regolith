@@ -112,17 +112,16 @@ impl Contend {
     /// handoff.
     pub(super) fn poll<L: Lock>(&mut self, lock: &L, need: usize, waker: &Waker) -> Poll<()> {
         let queue = lock.queue();
-        // A loss in the poll that queues is not a bypass: nobody has
-        // passed the waiter yet, the holder was simply there first.
-        let mut arriving = !self.wait.is_queued();
-        let mut park = if arriving {
+        let mut park = if self.wait.is_queued() {
+            self.wait.park(queue, Some(waker))
+        } else {
+            // Losing this first attempt is not a bypass: nobody has passed
+            // the caller yet, the holder was simply there first.
             if lock.try_take(need).is_ok() {
                 return Poll::Ready(());
             }
             lock.enqueue(&mut self.wait, need, waker);
             self.wait.park(queue, None)
-        } else {
-            self.wait.park(queue, Some(waker))
         };
         loop {
             match park {
@@ -132,9 +131,14 @@ impl Contend {
                     return Poll::Ready(());
                 }
                 Park::Pending => return Poll::Pending,
+                // A nudge means something was freed after this waiter
+                // queued, so losing the retry is a bypass even in the poll
+                // that queued it: the nudge may come from this waiter's own
+                // drain, and what others took during that drain has to be
+                // counted like any other loss.
                 Park::Nudged => {
                     queue.consume_nudge();
-                    let attempt = if !arriving && self.bypass + 1 == MAX_BYPASS {
+                    let attempt = if self.bypass + 1 == MAX_BYPASS {
                         lock.take_or_owe(&self.wait, need)
                     } else {
                         lock.try_take(need)
@@ -144,10 +148,15 @@ impl Contend {
                             self.cancel(lock, need);
                             return Poll::Ready(());
                         }
-                        Err(seen) if seen & HANDOFF == 0 && !arriving => self.bypass += 1,
+                        // Never past the bound: a waiter that is owed, was
+                        // granted, and retries on a nudge left over from
+                        // before loses once more to the permits taken for
+                        // itself, which is no bypass.
+                        Err(seen) if seen & HANDOFF == 0 => {
+                            self.bypass = (self.bypass + 1).min(MAX_BYPASS);
+                        }
                         Err(_) => {}
                     }
-                    arriving = false;
                     park = self.wait.park(queue, Some(waker));
                 }
             }
@@ -262,5 +271,290 @@ mod tests {
         assert!(!sem.try_acquire(1), "the waiter holds it");
         sem.release(1);
         assert!(sem.try_acquire(1), "barging resumes once it is served");
+    }
+
+    /// A semaphore raced by other threads at chosen instants of one
+    /// waiter's poll: as each pass of a drain that waiter runs begins and
+    /// ends (each is told the pass's number, from 1), and just before its
+    /// next attempt of each kind.
+    struct Raced<'a> {
+        sem: &'a RawSemaphore,
+        passes: Cell<u32>,
+        pass_begins: Box<dyn Fn(u32) + 'a>,
+        pass_ends: Box<dyn Fn(u32) + 'a>,
+        before_try: Cell<Option<Box<dyn FnOnce() + 'a>>>,
+        before_owe: Cell<Option<Box<dyn FnOnce() + 'a>>>,
+    }
+
+    impl<'a> Raced<'a> {
+        fn new(
+            sem: &'a RawSemaphore,
+            pass_begins: impl Fn(u32) + 'a,
+            pass_ends: impl Fn(u32) + 'a,
+        ) -> Self {
+            Self {
+                sem,
+                passes: Cell::new(0),
+                pass_begins: Box::new(pass_begins),
+                pass_ends: Box::new(pass_ends),
+                before_try: Cell::new(None),
+                before_owe: Cell::new(None),
+            }
+        }
+    }
+
+    impl Policy for Raced<'_> {
+        fn queue(&self) -> &WaitQueue {
+            self.sem.queue()
+        }
+
+        fn pass(&self, arrivals: Arrivals, woken: &mut WakeList<'_>, wake_front: bool) -> usize {
+            let pass = self.passes.get() + 1;
+            self.passes.set(pass);
+            (self.pass_begins)(pass);
+            let clear = self.sem.pass(arrivals, woken, wake_front);
+            (self.pass_ends)(pass);
+            clear
+        }
+    }
+
+    impl Lock for Raced<'_> {
+        fn admit(&self, state: usize, need: usize) -> Option<usize> {
+            self.sem.admit(state, need)
+        }
+
+        fn give_back(&self, need: usize) {
+            self.sem.give_back(need);
+        }
+
+        fn try_take(&self, need: usize) -> Result<(), usize> {
+            if let Some(first) = self.before_try.take() {
+                first();
+            }
+            self.sem.try_take(need)
+        }
+
+        fn take_or_owe(&self, wait: &Wait, need: usize) -> Result<(), usize> {
+            if let Some(first) = self.before_owe.take() {
+                first();
+            }
+            self.sem.take_or_owe(wait, need)
+        }
+    }
+
+    /// E32. A waiter that queues takes the drain role in the same poll.
+    /// The holder lets go as its first pass begins, and from then on
+    /// another caller takes the permit and gives it back after every pass,
+    /// before the drain can give its role up. The drain must still end,
+    /// and the waiter must get its turn.
+    #[test]
+    fn a_waiter_serving_the_queue_is_not_passed_over_without_bound() {
+        let sem = RawSemaphore::new(1);
+        let barged = Cell::new(0u32);
+        let rounds = 4 * MAX_BYPASS;
+        let raced = Raced::new(
+            &sem,
+            |pass| {
+                if pass == 1 {
+                    sem.release(1);
+                }
+            },
+            |pass| {
+                if pass <= rounds && sem.try_acquire(1) {
+                    barged.set(barged.get() + 1);
+                    sem.release(1);
+                }
+            },
+        );
+        assert!(sem.try_acquire(1));
+        let mut contend = Contend::new();
+        let mut waiter = Polled::new(core::future::poll_fn(|cx| {
+            contend.poll(&raced, 1, cx.waker())
+        }));
+        let served = waiter.poll().is_ready();
+        assert!(
+            barged.get() <= MAX_BYPASS,
+            "{} callers took the permit past a queued waiter in {} passes of its own drain, \
+             and it never got to retry (the bound is {MAX_BYPASS})",
+            barged.get(),
+            raced.passes.get(),
+        );
+        assert!(
+            raced.passes.get() <= 3,
+            "the waiter's drain ran {} passes: releases that come while its nudge is out \
+             must not ask for more",
+            raced.passes.get(),
+        );
+        assert!(
+            served,
+            "the permit the last caller gave back is the waiter's"
+        );
+        assert!(!sem.try_acquire(1), "the waiter holds it");
+    }
+
+    /// A nudge in the poll that queues a waiter means a permit was freed
+    /// after it queued. Losing the retry to a caller that took that permit
+    /// is a bypass like any other, also when the nudge and the loss both
+    /// happen inside the waiter's own drain.
+    #[test]
+    fn a_retry_lost_in_the_poll_that_queues_counts_as_a_bypass() {
+        let sem = RawSemaphore::new(1);
+        let raced = Raced::new(
+            &sem,
+            |pass| {
+                if pass == 1 {
+                    sem.release(1);
+                }
+            },
+            |pass| {
+                if pass == 1 {
+                    assert!(
+                        sem.try_acquire(1),
+                        "the freed permit is taken past the waiter"
+                    );
+                }
+            },
+        );
+        assert!(sem.try_acquire(1));
+        let mut contend = Contend::new();
+        let mut waiter = Polled::new(core::future::poll_fn(|cx| {
+            contend.poll(&raced, 1, cx.waker())
+        }));
+        waiter.pending();
+        drop(waiter);
+        assert_eq!(
+            contend.bypass, 1,
+            "the loss in the queueing poll is counted"
+        );
+        contend.cancel(&raced, 1);
+        sem.release(1);
+        assert!(sem.try_acquire(1), "nothing is left held or owed");
+    }
+
+    /// A waiter that raised the owed bit, was handed the permit, and then
+    /// retries on a nudge left over from before the handoff finds nothing
+    /// free: the permit was taken for the waiter itself. That is not a
+    /// bypass, and its count stays at the bound.
+    #[test]
+    fn a_loss_to_its_own_handoff_does_not_count_past_the_bound() {
+        let sem = RawSemaphore::new(1);
+        let raced = Raced::new(&sem, |_| {}, |_| {});
+        assert!(sem.try_acquire(1));
+        let mut contend = Contend::new();
+        let mut waiter = Polled::new(core::future::poll_fn(|cx| {
+            contend.poll(&raced, 1, cx.waker())
+        }));
+        waiter.pending();
+        // One loss short of the bound.
+        for _ in 1..MAX_BYPASS {
+            sem.release(1);
+            assert!(sem.try_acquire(1), "a free permit is taken past it");
+            waiter.pending();
+        }
+        sem.release(1);
+        assert!(sem.try_acquire(1), "a free permit is taken past it");
+        // Between the waiter's look at its node and its last counted
+        // attempt, a release nudges it again and the permit is taken again:
+        // the nudge stays on the node, unused.
+        raced.before_owe.set(Some(Box::new(|| {
+            sem.release(1);
+            assert!(sem.try_acquire(1), "a free permit is taken past it");
+        })));
+        // It then retries on that nudge. Just before it does, the holder
+        // lets go: the pass hands the permit to the owed waiter.
+        raced.before_try.set(Some(Box::new(|| sem.release(1))));
+        assert!(waiter.poll().is_ready(), "the handoff reached the waiter");
+        drop(waiter);
+        assert_eq!(
+            contend.bypass, MAX_BYPASS,
+            "a loss to the permit taken for the waiter itself was counted"
+        );
+        assert!(!sem.try_acquire(1), "the waiter holds it");
+    }
+
+    /// A thread that holds the drain role with nobody queued returns after
+    /// its pass, however many releases other threads make meanwhile: a
+    /// release that finds the role taken leaves only its request to wake
+    /// the front, and with no front that request is dropped.
+    #[test]
+    fn a_drain_that_found_nobody_queued_does_not_pass_again_for_releases() {
+        let sem = RawSemaphore::new(2);
+        let hammering = Cell::new(false);
+        let rounds = 4 * MAX_BYPASS;
+        let raced = Raced::new(
+            &sem,
+            |_| {},
+            |pass| {
+                if hammering.get() && pass <= rounds {
+                    // Another holder lets its permit go and takes it back,
+                    // before the drain can give its role up.
+                    sem.release(1);
+                    assert!(sem.try_acquire(1), "the permit is free again");
+                }
+            },
+        );
+        assert!(sem.try_acquire(1), "the other holder's permit");
+        let mut contend = Contend::new();
+        let mut waiter = Polled::new(core::future::poll_fn(|cx| {
+            contend.poll(&raced, 2, cx.waker())
+        }));
+        waiter.pending();
+        drop(waiter);
+        // The waiter gives up. Its withdrawal takes the drain role, and the
+        // pass finds nobody queued while the other holder hammers.
+        let before = raced.passes.get();
+        hammering.set(true);
+        contend.cancel(&raced, 2);
+        hammering.set(false);
+        assert_eq!(
+            raced.passes.get() - before,
+            1,
+            "the drain passed again for releases that had nobody to wake"
+        );
+        // Nothing is left behind: a waiter that queues now is not nudged for
+        // a release that came before it, so it counts nothing. And the next
+        // release reaches it.
+        let mut next = Contend::new();
+        let mut waiter = Polled::new(core::future::poll_fn(|cx| next.poll(&raced, 2, cx.waker())));
+        waiter.pending();
+        sem.release(1);
+        assert_eq!(waiter.wakes(), 1, "the release nudges the waiter");
+        assert!(waiter.poll().is_ready(), "both permits are its");
+        drop(waiter);
+        assert_eq!(
+            next.bypass, 0,
+            "it retried on a request from before it queued"
+        );
+        sem.release(2);
+        assert_eq!(sem.available(), 2, "a permit was lost or made up");
+    }
+
+    /// A release that comes while a pass runs must still reach the waiter
+    /// that pass found, though it leaves no dirty bit: the drain passes
+    /// again for its request.
+    #[test]
+    fn a_release_during_a_pass_that_found_a_waiter_reaches_it() {
+        let sem = RawSemaphore::new(1);
+        let raced = Raced::new(
+            &sem,
+            |_| {},
+            |pass| {
+                if pass == 1 {
+                    sem.release(1);
+                }
+            },
+        );
+        assert!(sem.try_acquire(1));
+        let mut contend = Contend::new();
+        let mut waiter = Polled::new(core::future::poll_fn(|cx| {
+            contend.poll(&raced, 1, cx.waker())
+        }));
+        // The waiter queues and serves the queue; the holder lets go right
+        // after its first pass read that nothing was free.
+        assert!(
+            waiter.poll().is_ready(),
+            "a release that found the drain role taken was lost"
+        );
+        assert!(!sem.try_acquire(1), "the waiter holds it");
     }
 }

@@ -100,7 +100,9 @@ impl std::fmt::Debug for CommitTicket {
 /// job runs on the compaction worker when the database has one, and
 /// otherwise as a job on the calling thread's [`IoQueue`](crate::IoQueue),
 /// run at that queue's poll; a caller with neither runs it inline, before
-/// the call returns. When it is done, the ticket is completed on the queue
+/// the call returns. A poll never waits for the gate either: while a
+/// compaction pass or another job holds it, the job stays pending on the
+/// queue, and the queue's owner is woken once it may go on. When it is done, the ticket is completed on the queue
 /// of the thread that made the call (at that queue's poll), or, for a caller
 /// with no queue, directly by whichever thread finished the job.
 ///
@@ -159,8 +161,13 @@ impl JobTicket {
     /// blocking caller's way to use the ticket.
     ///
     /// A job left on this thread's [`IoQueue`](crate::IoQueue) that no poll
-    /// has run yet is run here, on this thread, as a blocking call does its
-    /// own I/O; one a worker or a poll runs is waited for. The ticket's
+    /// has run to its end yet is run here, on this thread, as a blocking
+    /// call does its own I/O, waiting here for the compaction gate if a pass
+    /// or another job holds it; one a worker or a poll runs is waited for.
+    ///
+    /// A thread whose queue holds an older job still pending polls the queue
+    /// rather than waiting here: that older job may be the one the gate was
+    /// handed to, and only this thread's poll runs it. The ticket's
     /// delivery is unchanged: on a ticket completed on a queue, the
     /// `on_complete` callbacks still run at that queue's poll.
     pub fn wait(self) -> Result<(), Error> {

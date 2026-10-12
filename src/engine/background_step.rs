@@ -70,7 +70,7 @@ impl RegolithEngine {
     /// worker runs, and only the scheduler's when one does.
     pub(super) fn flush_sealed_later(&self) {
         if self.has_worker {
-            self.compaction.lock().notify();
+            self.compaction.notify();
         } else {
             self.owe(OWED_STEP);
         }
@@ -81,7 +81,7 @@ impl RegolithEngine {
     /// which compacts once L0 reaches its trigger (E16).
     pub(super) fn after_flush(&self) {
         if self.has_worker {
-            self.compaction.lock().notify();
+            self.compaction.notify();
         } else {
             self.owe(OWED_STEP);
         }
@@ -133,7 +133,7 @@ impl RegolithEngine {
         if owed & OWED_STEP == 0 {
             return;
         }
-        let again = match self.run_one_background_step(false) {
+        let again = match self.run_one_background_step() {
             Ok(CompactionOutcome::DidWork | CompactionOutcome::Contended) => true,
             Ok(CompactionOutcome::Idle) => false,
             Err(e) => {
@@ -172,7 +172,7 @@ impl RegolithEngine {
             self.refresh_stall_level();
             return;
         }
-        match self.run_one_background_step(false) {
+        match self.run_one_background_step() {
             Ok(CompactionOutcome::DidWork | CompactionOutcome::Contended) => {
                 self.stall_steps_idle.store(0, Ordering::Release);
             }
@@ -198,20 +198,17 @@ impl RegolithEngine {
 
     /// One bounded step of background work on the calling thread: flush the
     /// oldest frozen memtable if there is one, else run one compaction pass.
-    /// `Contended` when another thread is flushing, or, unless `wait`, holds
-    /// the compaction lock. A failed flush is
-    /// [`crate::Error::BackgroundFailed`], as a stopped writer that retries one
-    /// reports it.
-    pub(crate) fn run_one_background_step(
-        &self,
-        wait: bool,
-    ) -> Result<CompactionOutcome, crate::Error> {
+    /// It never waits for another thread: `Contended` when another thread is
+    /// flushing, or holds the compaction gate alone or is owed it. A failed
+    /// flush is [`crate::Error::BackgroundFailed`], as a stopped writer that
+    /// retries one reports it.
+    pub(crate) fn run_one_background_step(&self) -> Result<CompactionOutcome, crate::Error> {
         self.ensure_writable()?;
         let _background = InBackground::enter();
         if self.view.load().frozen.is_empty() {
-            return Ok(self.run_one_compaction_pass_on(wait)?);
+            return Ok(self.run_one_compaction_pass()?);
         }
-        let Some(flushing) = self.flusher.flushing.try_lock() else {
+        let Some(flushing) = self.flusher.try_flushing() else {
             return Ok(CompactionOutcome::Contended);
         };
         let flushed = self.flush_oldest_frozen(&flushing);

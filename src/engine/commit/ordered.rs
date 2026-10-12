@@ -476,6 +476,7 @@ impl RegolithEngine {
                 {
                     self.visible_seq.publish(last);
                 }
+                desc.land();
                 at += 1;
                 pipe.ring.set_frozen(at);
                 pipe.ring.retire(at);
@@ -554,6 +555,8 @@ impl RegolithEngine {
         for desc in &failed {
             desc.failure.put(crate::Error::clone_io(&cause));
             desc.mark(FAILED);
+            // Discarded is landed too: what waited for the commit is told.
+            desc.land();
         }
         if !failed.is_empty()
             && let Err(err) = self.notify_wal_error(&cause)
@@ -718,7 +721,14 @@ impl RegolithEngine {
         // only when the background has fallen a whole memtable behind.
         if let Some(room) = room {
             while self.view.load().frozen.len() >= room {
-                let flushed = self.flush_oldest_frozen(&self.flusher.flushing.lock());
+                // The exclusion is released before the level is refreshed.
+                let flushed = self
+                    .flusher
+                    .flushing()
+                    .and_then(|flushing| self.flush_oldest_frozen(&flushing));
+                // A failed flush too, once its exclusion is released: a
+                // stopped writer it held off looks again (`StallSignal`,
+                // relief handed back).
                 if flushed.is_err() {
                     self.refresh_stall_level();
                 }

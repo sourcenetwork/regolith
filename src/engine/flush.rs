@@ -9,7 +9,10 @@
 //!
 //! Every flush takes the `flushing` exclusion and the oldest frozen memtable,
 //! so frozen memtables install in L0 in the order they were sealed, whichever
-//! thread flushes (`LsmOrder.tla`, RED FlushAnyOrder).
+//! thread flushes (`LsmOrder.tla`, RED FlushAnyOrder). A flush installs its
+//! table and retires its memtable in one publication of the read view, so no
+//! view holds a memtable and its table at once (`LsmOrder.tla`,
+//! `NoDoubleSource`, RED SplitRetire).
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -26,7 +29,8 @@ use super::sstable::{LiveSst, SsTableMeta, SsTableReader, SsTableWriter, sst_fil
 use super::version_store::VersionStore;
 use super::{EngineOptions, event_listener};
 use crate::env::Env;
-use crate::sync::internal::{Mutex, MutexGuard};
+use crate::sync::internal::wait_here;
+use crate::sync::{Mutex, MutexGuard};
 
 /// What a flush needs, shared by the engine and its compaction workers.
 pub(crate) struct Flusher {
@@ -60,7 +64,14 @@ pub(crate) struct Flusher {
     /// mutex until the file is installed. A memtable holding none of its keys
     /// may be flushed after it and land in front of it in L0, which changes no
     /// read: the two share no key (LsmOrder.tla, Lean `ingest_ordered`).
-    pub(crate) flushing: Mutex<()>,
+    ///
+    /// A [`crate::sync::Mutex`]: one compare-and-swap to take when free, and
+    /// no thread sleeps in the kernel on it. A step a write owes only tries
+    /// it ([`Flusher::try_flushing`]); what must have a memtable flushed
+    /// before it goes on (a worker, a job's drain, close, a rotation at the
+    /// memtable cap) waits for the flush in flight on its own thread
+    /// ([`Flusher::flushing`]).
+    flushing: Mutex<()>,
 }
 
 impl Flusher {
@@ -87,6 +98,17 @@ impl Flusher {
         }
     }
 
+    /// The flush exclusion, waited for on this thread. Fails only on
+    /// `wasm32`, when this same thread is already inside a flush.
+    pub(crate) fn flushing(&self) -> std::io::Result<MutexGuard<'_, ()>> {
+        wait_here(self.flushing.lock())
+    }
+
+    /// The flush exclusion if no flush is in flight, without waiting.
+    pub(crate) fn try_flushing(&self) -> Option<MutexGuard<'_, ()>> {
+        self.flushing.try_lock()
+    }
+
     /// Flush every frozen memtable, oldest first, as a background step: what
     /// a compaction worker runs before it compacts.
     ///
@@ -98,10 +120,11 @@ impl Flusher {
         let _background = InBackground::enter();
         loop {
             // The worker may wait here on a writer's or a checkpoint's
-            // flush, a whole table write: release the views its last read
-            // holds back first, as it does before every other wait.
-            super::read_view::idle();
-            let flushing = self.flushing.lock();
+            // flush, a whole table write. The wait releases the views its
+            // last read holds back before it parks.
+            let Ok(flushing) = self.flushing() else {
+                break;
+            };
             let flushed = self.flush_oldest(&flushing);
             drop(flushing);
             // One memtable fewer and maybe one L0 file more: writers cache

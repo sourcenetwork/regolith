@@ -297,6 +297,17 @@ check sees it.
 `TransactionDb` is the pessimistic flavour: it takes key locks, so contention waits
 instead of retrying. `OptimisticTransactionDb` validates at commit and retries.
 
+The key locks live in a lock-free table: taking a free lock is one compare-and-swap, and no
+call takes a mutex or waits on a condition variable. A free lock goes to whoever asks first,
+even while others wait; a waiter passed over `regolith::sync::MAX_BYPASS` times is handed the
+lock, so none starves. `get_for_update`, `put`, `delete` and `merge` wait for a lock another
+transaction holds, up to `with_lock_timeout`, and then fail with `TransactionError::Busy`,
+which is also what ends a deadlock. `try_get_for_update` never waits: it returns
+`WouldBlock::Locked` with a `LockWait`, completed on the transaction's own `IoQueue` at
+that queue's poll once the lock may be free, and the call is then run again. A
+`commit_nowait` releases its locks when the commit lands, not when its ticket is delivered,
+so another transaction never waits for this one's owner to poll.
+
 A commit that loses a race returns `TransactionError::Conflict`. Its `Conflict` names the
 key, what the transaction did with it (`Access`) and the newer write that won
 (`WriteKind`), with the two sequences. Its message gives the key's length and a short hash,

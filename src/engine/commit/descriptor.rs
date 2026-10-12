@@ -30,10 +30,12 @@ use std::ops::Range;
 use std::ptr;
 use std::sync::Arc;
 
+use super::super::DurabilityMode;
+use super::super::io::job::{Delivery, Job};
+use super::super::io::stack::{SHUT, Stack};
 use super::super::memtable::MemTable;
 use super::super::take::Take;
 use super::super::wal_log::{Log, Place};
-use super::super::{DurabilityMode, io::job::Job};
 use super::WriteRequest;
 use super::ring::Linked;
 use crate::perf_context::PerfContextSnapshot;
@@ -326,6 +328,9 @@ pub(crate) struct Descriptor {
     pub(super) failure: Take<io::Error>,
     /// A unit's body, taken by the thread that runs it.
     pub(super) body: Take<super::ordered::Body>,
+    /// Who is told, on the landing thread, when the slot lands: a
+    /// pessimistic commit's key locks, released then. Closed with [`SHUT`].
+    landing: Stack<Arc<dyn Delivery>>,
 }
 
 impl Descriptor {
@@ -340,6 +345,24 @@ impl Descriptor {
             flags: AtomicU64::new(0),
             failure: Take::empty(),
             body: Take::empty(),
+            landing: Stack::new(),
+        }
+    }
+
+    /// Tell `waiter`, on the landing thread, when the slot lands: when its
+    /// commit is visible to readers, or discarded. `false` when it already
+    /// landed: the caller tells `waiter` itself.
+    pub(super) fn listen(&self, waiter: Arc<dyn Delivery>) -> bool {
+        self.landing.push(waiter, SHUT).is_ok()
+    }
+
+    /// Tell everyone listening that the slot landed. Every thread that
+    /// publishes the slot calls this before it passes the frontier, and one
+    /// of them tells each listener, so a thread that stops here keeps no
+    /// listener waiting: the next one to reach the slot tells them.
+    pub(super) fn land(&self) {
+        for waiter in self.landing.take(SHUT) {
+            waiter.deliver();
         }
     }
 

@@ -136,10 +136,9 @@ fn empty_db_footprint_is_flat_in_shard_count() {
         );
         let line = stdout
             .lines()
-            // On one CPU the harness runs the child test on its main
-            // thread and prints "test <name> ... " first, so the result
-            // does not start its line.
-            .find(|l| l.contains("ADVRESULT"))
+            // Anywhere in the line: with one test thread libtest prints
+            // "test <name> ... " in front of what the child prints.
+            .find_map(|l| l.find("ADVRESULT").map(|at| &l[at..]))
             .unwrap_or_else(|| panic!("child at shard_bits {bits} printed no result:\n{stdout}"))
             .to_string();
         let field = |name: &str| -> i64 {

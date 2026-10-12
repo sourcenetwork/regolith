@@ -158,6 +158,13 @@ pub(crate) struct PendingCommit {
 }
 
 impl PendingCommit {
+    /// Tell `waiter` when the commit lands (it is visible to readers, and
+    /// durable at `Immediate`, or it was discarded), on the thread that
+    /// lands it. `false` when it already landed: the caller tells `waiter`.
+    pub(crate) fn listen(&self, waiter: Arc<dyn super::io::job::Delivery>) -> bool {
+        self.desc.listen(waiter)
+    }
+
     /// What the commit learned, once it was told it is published or
     /// discarded.
     pub(crate) fn settled(&self) -> io::Result<Settled> {
@@ -570,6 +577,12 @@ mod limit_tests;
 
 #[cfg(test)]
 mod pipeline_order_tests;
+
+#[cfg(test)]
+mod overlap_tests;
+
+#[cfg(test)]
+mod txn_overlap_tests;
 
 #[cfg(test)]
 mod pipeline_tests;

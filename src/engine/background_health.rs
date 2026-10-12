@@ -8,11 +8,17 @@
 //! wait for it forever. The engine records the most recent failure of
 //! each job here so a stalled writer can fail with the real cause instead,
 //! and clears it on the job's next success.
+//!
+//! Each job's slot is one atomically swapped pointer ([`kovan::Atom`]), so
+//! recording and reading never wait on each other: a healthy job's success
+//! is one load, a failure is one swap, and a stalled writer reads the
+//! failure whole, never half of one and half of the next.
 
 use std::io;
 
+use kovan::Atom;
+
 use crate::portability::{AtomicU64, Ordering};
-use crate::sync::internal::Mutex;
 
 /// The background jobs a stalled writer can be waiting on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -114,22 +120,22 @@ impl Failure {
 #[derive(Debug)]
 pub(crate) struct BackgroundHealth {
     errors: AtomicU64,
-    flush: Mutex<Option<Failure>>,
-    compaction: Mutex<Option<Failure>>,
+    flush: Atom<Option<Failure>>,
+    compaction: Atom<Option<Failure>>,
 }
 
 impl Default for BackgroundHealth {
     fn default() -> Self {
         Self {
             errors: AtomicU64::new(0),
-            flush: Mutex::new(None),
-            compaction: Mutex::new(None),
+            flush: Atom::new(None),
+            compaction: Atom::new(None),
         }
     }
 }
 
 impl BackgroundHealth {
-    fn slot(&self, job: Job) -> &Mutex<Option<Failure>> {
+    fn slot(&self, job: Job) -> &Atom<Option<Failure>> {
         match job {
             Job::Flush => &self.flush,
             Job::Compaction => &self.compaction,
@@ -139,26 +145,35 @@ impl BackgroundHealth {
     pub(crate) fn record_failure(&self, job: Job, err: &io::Error) -> Hazard {
         self.errors.fetch_add(1, Ordering::Relaxed);
         let hazard = Hazard::of(err);
-        *self.slot(job).lock() = Some(Failure {
+        self.slot(job).store(Some(Failure {
             job,
             hazard,
             kind: err.kind(),
             raw_os_error: err.raw_os_error(),
             message: err.to_string(),
-        });
+        }));
         hazard
     }
 
+    /// Clear the failure this success follows. One load while the job is
+    /// healthy. A failure another thread records between the load and the
+    /// swap is newer than this success and stays.
     pub(crate) fn record_success(&self, job: Job) {
-        let mut slot = self.slot(job).lock();
-        if slot.is_some() {
-            *slot = None;
+        let slot = self.slot(job);
+        let seen = slot.load();
+        if seen.is_some() {
+            Self::clear(slot, &seen);
         }
+    }
+
+    /// Empty `slot` if it still holds the failure `seen`.
+    fn clear(slot: &Atom<Option<Failure>>, seen: &kovan::AtomGuard<'_, Option<Failure>>) {
+        let _ = slot.compare_and_swap(seen, None);
     }
 
     /// The most recent failure of `job`, if its last attempt failed.
     pub(crate) fn failing(&self, job: Job) -> Option<Failure> {
-        self.slot(job).lock().clone()
+        self.slot(job).load_clone()
     }
 
     /// Failed background job attempts since open.
@@ -211,6 +226,77 @@ mod tests {
         health.record_success(Job::Compaction);
         assert!(health.failing(Job::Compaction).is_none());
         assert_eq!(health.error_count(), 1);
+    }
+
+    /// Workers fail and succeed while writers read: a reader sees no failure
+    /// or one whole failure of the job it asked about, every failure is
+    /// counted, and once the jobs succeed last nothing is left failing.
+    #[test]
+    fn concurrent_records_never_tear_and_every_failure_is_counted() {
+        const THREADS: u64 = 4;
+        // Fewer rounds under miri, which runs each a hundred times slower.
+        const ROUNDS: u64 = if cfg!(miri) { 40 } else { 2_000 };
+        let health = BackgroundHealth::default();
+        std::thread::scope(|scope| {
+            for t in 0..THREADS {
+                let health = &health;
+                scope.spawn(move || {
+                    let job = if t % 2 == 0 {
+                        Job::Flush
+                    } else {
+                        Job::Compaction
+                    };
+                    for round in 0..ROUNDS {
+                        let err = io::Error::other(format!("{}-{t}-{round}", job.name()));
+                        health.record_failure(job, &err);
+                        health.record_success(job);
+                    }
+                });
+            }
+            for _ in 0..2 {
+                let health = &health;
+                scope.spawn(move || {
+                    for _ in 0..ROUNDS {
+                        for job in [Job::Flush, Job::Compaction] {
+                            if let Some(failure) = health.failing(job) {
+                                assert_eq!(failure.job, job, "a failure of the other job");
+                                assert!(
+                                    failure.message.starts_with(job.name()),
+                                    "a torn failure: {}",
+                                    failure.message
+                                );
+                                assert_eq!(failure.hazard, Hazard::Other);
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        assert_eq!(health.error_count(), THREADS * ROUNDS);
+        // Each thread's last record was a success, but a success only clears
+        // the failure it saw: one that raced a newer failure of the same job
+        // left it. One more success per job, with nothing racing, clears it.
+        health.record_success(Job::Flush);
+        health.record_success(Job::Compaction);
+        assert!(health.failing(Job::Flush).is_none());
+        assert!(health.failing(Job::Compaction).is_none());
+    }
+
+    /// A success never erases a failure recorded after the one it saw.
+    #[test]
+    fn a_success_clears_only_the_failure_it_saw() {
+        let health = BackgroundHealth::default();
+        health.record_failure(Job::Flush, &io::Error::other("first"));
+        let slot = health.slot(Job::Flush);
+        let seen = slot.load();
+        health.record_failure(Job::Flush, &io::Error::other("second"));
+        // What `record_success` does once it loaded `seen`.
+        BackgroundHealth::clear(slot, &seen);
+        assert_eq!(
+            health.failing(Job::Flush).unwrap().message,
+            "second",
+            "a success erased a failure recorded after the one it saw"
+        );
     }
 
     #[cfg(unix)]

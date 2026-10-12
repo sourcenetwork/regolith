@@ -107,8 +107,8 @@ pub use event_listener::{
 #[cfg(not(target_arch = "wasm32"))]
 pub use io_queue::through_stalls;
 pub use io_queue::{
-    CommitTicket, IoBudget, IoProgress, IoQueue, IoUnit, IoWait, JobTicket, QueueId, ReadMode,
-    StallWait, WouldBlock,
+    CommitTicket, IoBudget, IoProgress, IoQueue, IoUnit, IoWait, JobTicket, LockWait, QueueId,
+    ReadMode, StallWait, WouldBlock,
 };
 pub use iter::Iter;
 pub use log_layout::LogLayout;
@@ -139,9 +139,9 @@ pub mod prelude {
     pub use crate::{
         AbortReason, CommitInfo, CommitReceipt, CommitTicket, Conflict, Db, IoBudget, IoQueue,
         IsolationLevel, JobTicket, KeyClass, KeyClassifier, KeyId, KeyMaterial, KeyProvider,
-        LogLayout, MergeOperator, OptimisticTransactionDb, Options, QueueId, ReadMode, RetryPolicy,
-        StallWait, TransactError, Transaction, TransactionError, TransactionHooks, TxResult,
-        TxnOptions, WouldBlock,
+        LockWait, LogLayout, MergeOperator, OptimisticTransactionDb, Options, QueueId, ReadMode,
+        RetryPolicy, StallWait, TransactError, Transaction, TransactionError, TransactionHooks,
+        TxResult, TxnOptions, WouldBlock,
     };
 }
 pub use ttl::{DbWithTtl, TtlCompactionFilter, strip_timestamp};
@@ -161,10 +161,12 @@ pub mod loom_exports {
 
     pub use crate::engine::commit::loom_model as pipeline;
     pub use crate::engine::loom_model::{
-        arena, families, handoff, io_queue, jobs, skiplist, slice, snapshots, step, tombstones,
-        version,
+        arena, families, gate, handoff, io_queue, jobs, skiplist, slice, snapshots, step,
+        tombstones, version,
     };
     pub use crate::env::open_file_limit::loom_model as open_files;
+    pub use crate::sync::loom_model as sync;
+    pub use crate::transaction::lock_loom as locks;
 }
 
 #[cfg(feature = "fuzzing")]
@@ -1294,6 +1296,14 @@ impl Db {
     }
 
     /// Delete all data in the database.
+    ///
+    /// A call that does its own I/O and waits on this thread: for the
+    /// compaction pass or job in flight, and for the commit group in
+    /// flight, to end. Call it off a thread that must not block. On
+    /// `wasm32`, whose one thread cannot wait for itself, a call made from
+    /// inside a compaction or a checkpoint (a listener, a compaction filter)
+    /// fails with an I/O error of kind
+    /// [`WouldBlock`](std::io::ErrorKind::WouldBlock) instead.
     pub fn drop_all(&self) -> Result<()> {
         self.ensure_writable()?;
         self.engine.drop_all().map_err(Error::from)
@@ -1312,7 +1322,12 @@ impl Db {
     /// thread's [`IoQueue`] when it polls; a thread with neither runs it
     /// before this returns. It flushes the active memtable contents that
     /// fall in the range to L0 first, and is serialized with the background
-    /// compaction so the two can't fight over the same inputs. The ticket
+    /// compaction so the two can't fight over the same inputs. Neither
+    /// starves the other: a compaction pass waits out a bounded number of
+    /// jobs like this one, and a job a bounded number of passes
+    /// ([`sync::MAX_BYPASS`]). A poll never waits for a pass in flight
+    /// either: until the job may go on it stays pending on the queue, whose
+    /// owner is woken when it may. The ticket
     /// completes on this thread's queue (or, with none, when the job
     /// finished): await it, poll the queue, or [`JobTicket::wait`] for it
     /// from a thread with no queue. An invalid bound fails the ticket at
@@ -1384,9 +1399,12 @@ impl Db {
     /// pass can do nothing, because a caller has to act on them
     /// differently. [`CompactionOutcome::Idle`] means nothing was over
     /// its compaction trigger and the tree is settled.
-    /// [`CompactionOutcome::Contended`] means work is pending but
-    /// another thread holds the input files, so the right response is to
-    /// wait for that thread rather than conclude the engine is done.
+    /// [`CompactionOutcome::Contended`] means work may be pending but
+    /// another thread is in the way, so the right response is to try again
+    /// later rather than conclude the engine is done: another pass holds the
+    /// input files, or a [`Db::compact_range`], an ingest, a checkpoint, a
+    /// backup or a [`Db::drop_all`] holds the compaction gate alone or is
+    /// owed it. This call never waits for that thread.
     ///
     /// A drain therefore looks like this, and stops only on `Idle`:
     ///
@@ -1410,9 +1428,9 @@ impl Db {
     /// its own output.
     ///
     /// Safe to call with background workers running: the job is picked
-    /// under the same engine-wide compaction lock and the same
-    /// in-progress file set the workers use, so the two can never pick
-    /// overlapping inputs.
+    /// under the same engine-wide compaction gate and the same claims on
+    /// tables the workers use, so the two can never pick overlapping
+    /// inputs.
     pub fn compact_step(&self) -> Result<CompactionOutcome> {
         self.ensure_writable()?;
         self.engine.run_one_compaction_pass().map_err(Error::from)
@@ -8364,7 +8382,7 @@ mod tests {
 
         // Force any remaining flushes through and run one more
         // FIFO pass via compact_range (which acquires the
-        // compaction lock and drains pending work).
+        // compaction gate and drains pending work).
         db.compact_range(None, None).wait().unwrap();
         std::thread::sleep(std::time::Duration::from_millis(100));
 

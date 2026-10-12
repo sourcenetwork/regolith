@@ -409,6 +409,9 @@ pub(crate) struct SsTableMeta {
 pub(crate) struct LiveSst {
     pub(crate) meta: SsTableMeta,
     pub(crate) reader: Arc<SsTableReader>,
+    /// A compaction pass is working on this table and no other may pick it.
+    /// Set and cleared only through `compaction::claims`.
+    pub(crate) claimed: crate::portability::AtomicBool,
 }
 
 impl LiveSst {
@@ -423,7 +426,11 @@ impl LiveSst {
         // Every table a read can reach is made here, so this is where its
         // reader learns how to hand a queued read its own handle.
         let _ = reader.me.set(Arc::downgrade(&reader));
-        Arc::new(Self { meta, reader })
+        Arc::new(Self {
+            meta,
+            reader,
+            claimed: crate::portability::AtomicBool::new(false),
+        })
     }
 }
 

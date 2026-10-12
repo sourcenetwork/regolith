@@ -481,11 +481,12 @@ fn a_commit_that_finds_the_ring_full_waits_on_its_queue() {
     }
 }
 
-/// A pessimistic commit keeps its key locks until its outcome is delivered,
-/// so a second transaction cannot lock the key and read past a commit that is
-/// written but not yet visible.
+/// A pessimistic commit keeps its key locks until it lands, so a second
+/// transaction cannot lock the key and read past a commit that is written but
+/// not yet visible; and it lets them go when it lands, whoever lands it,
+/// without waiting for its own queue to deliver the outcome.
 #[test]
-fn a_pessimistic_nowait_commit_holds_its_locks_until_delivered() {
+fn a_pessimistic_nowait_commit_holds_its_locks_until_it_lands() {
     let dir = TempDir::new().unwrap();
     let db = TransactionDb::open(
         dir.path(),
@@ -498,15 +499,31 @@ fn a_pessimistic_nowait_commit_holds_its_locks_until_delivered() {
     txn.get_for_update(b"k").unwrap();
     txn.put(b"k", b"v").unwrap();
     let ticket = txn.commit_nowait();
+    assert!(!ticket.is_ready(), "the group owes its fsync");
     let rival = db.begin(&TxnOptions::new());
-    assert!(matches!(
-        rival.get_for_update(b"k"),
-        Err(TransactionError::Busy(_))
-    ));
-    queue.poll(IoBudget::ALL);
+    assert!(
+        matches!(rival.get_for_update(b"k"), Err(TransactionError::Busy(_))),
+        "written, not landed: the lock is still held"
+    );
+    drop(rival);
+    // Another thread's blocking write lands the owed group; this
+    // transaction's queue is not polled.
+    std::thread::scope(|scope| {
+        scope
+            .spawn(|| db.db().put(b"other", b"w").unwrap())
+            .join()
+            .unwrap();
+    });
+    assert!(!ticket.is_ready(), "landed is not delivered");
+    let rival = db.begin(&TxnOptions::new());
+    assert_eq!(
+        rival.get_for_update(b"k").unwrap(),
+        Some(b"v".to_vec()),
+        "landed: the lock is free and the commit is what the next holder reads"
+    );
+    drop(rival);
+    assert_eq!(queue.poll(IoBudget::ALL).completed, 1);
     assert!(ticket.is_ready());
-    let rival = db.begin(&TxnOptions::new());
-    assert_eq!(rival.get_for_update(b"k").unwrap(), Some(b"v".to_vec()));
 }
 
 /// The ticket is `Send + Sync`: its callbacks may be registered from any

@@ -794,6 +794,10 @@ impl RegolithEngine {
                     {
                         self.visible_seq.publish(last);
                     }
+                    // Landed: visible, or holding nothing. Told before the
+                    // frontier passes, so a publisher that stops between
+                    // the two leaves the telling to the next one here.
+                    desc.land();
                     if pipe.ring.pass_published(next) {
                         pipe.ring.retire(next);
                     }

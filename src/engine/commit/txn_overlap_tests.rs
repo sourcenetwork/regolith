@@ -1,26 +1,35 @@
-//! Optimistic transactions share commit groups (E10, `GroupCommit.tla`),
-//! through the public API.
+//! Optimistic transactions decided together in the commit pipeline (E10,
+//! `CommitPipeline.tla`), through the public API, with the first overlap
+//! made certain instead of left to the scheduler.
 //!
 //! Many threads run read-modify-write transactions over a few hot keys at
-//! Immediate durability, so commits queue behind each other's fsync and
-//! share groups. The history is then checked against a run of the committed
-//! transactions one at a time in receipt order: every value a committed
-//! transaction read through `get_for_update` is the value that run holds at
-//! its turn, and the database ends where that run ends. A group that let a
-//! member commit over an earlier member's write would show a read the serial
-//! run contradicts (RED ViewOnly), and a lost update would show in the final
-//! counters.
-#![cfg(not(target_arch = "wasm32"))]
+//! Immediate durability. The history is then checked against a run of the
+//! committed transactions one at a time in receipt order: every value a
+//! committed transaction read through `get_for_update` is the value that run
+//! holds at its turn, and the database ends where that run ends. A slot
+//! decided without the writes of the commits before it would show a read the
+//! serial run contradicts (RED PassBeforeApply), and a lost update would
+//! show in the final counters.
+//!
+//! Threads started together overlap only by luck: on one or two cores, or on
+//! a filesystem whose fsync returns at once, each commit can finish before
+//! the next begins. So the round, the one claim on the log's device step, is
+//! held, as a thread in the middle of a sync holds it, until every thread's
+//! first commit is decided: each is then in the ring, validated against the
+//! ones before it, and waits behind the round. When the round is let go, one
+//! sync covers them all, on any core count and any filesystem.
 
 use std::collections::BTreeMap;
-use std::sync::{Arc, Barrier};
+use std::sync::Arc;
 use std::thread;
 
-use regolith::{
-    DurabilityMode, IsolationLevel, OptimisticTransactionDb, Options, Statistics, Ticker,
-    TransactionError, TxnOptions,
-};
 use tempfile::TempDir;
+
+use super::overlap_tests::wait_until_decided;
+use crate::statistics::Ticker;
+use crate::{
+    IsolationLevel, OptimisticTransactionDb, Options, Statistics, TransactionError, TxnOptions,
+};
 
 const KEYS: usize = 6;
 const THREADS: usize = 12;
@@ -46,6 +55,10 @@ struct Committed {
 struct Rng(u64);
 
 impl Rng {
+    fn of_thread(t: usize) -> Self {
+        Rng(0xC0FF_EE00 ^ t as u64)
+    }
+
     fn next(&mut self) -> u64 {
         self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
         let mut z = self.0;
@@ -53,33 +66,62 @@ impl Rng {
         z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
         z ^ (z >> 31)
     }
+
+    /// The two keys a thread's next transaction reads; it writes the first.
+    fn pair(&mut self) -> (usize, usize) {
+        let a = self.next() as usize % KEYS;
+        let b = (a + 1 + self.next() as usize % (KEYS - 1)) % KEYS;
+        (a, b)
+    }
 }
 
-/// Run the workload once, check its history against the one-at-a-time run,
-/// and return how many fsyncs its commits took.
+/// Whichever thread's commit is decided first, some other thread's first
+/// transaction reads neither key the first one writes, so at least two of
+/// the first commits succeed and wait for the same sync.
+fn assert_two_first_commits_can_share() {
+    let pairs: Vec<(usize, usize)> = (0..THREADS).map(|t| Rng::of_thread(t).pair()).collect();
+    for (first, &(written, _)) in pairs.iter().enumerate() {
+        assert!(
+            pairs
+                .iter()
+                .enumerate()
+                .any(|(other, &(a, b))| other != first && a != written && b != written),
+            "setup: every first transaction reads key {written}, which thread {first} writes"
+        );
+    }
+}
+
+/// Run the workload, check its history against the one-at-a-time run, and
+/// return how many fsyncs its commits took.
 fn run_once(isolation: IsolationLevel) -> u64 {
+    assert_two_first_commits_can_share();
     let dir = TempDir::new().unwrap();
     let stats = Arc::new(Statistics::new());
     let db = Arc::new(
         OptimisticTransactionDb::open(
             dir.path(),
             Options::default()
-                .durability(DurabilityMode::Immediate)
+                .durability(crate::DurabilityMode::Immediate)
                 .statistics(Some(Arc::clone(&stats))),
         )
         .unwrap(),
     );
-    let barrier = Arc::new(Barrier::new(THREADS));
+    let engine = Arc::clone(&db.db().engine);
+    let pipe = engine.pipe().unwrap();
+    let before = pipe.ring.decided();
+
+    // Held as a thread holds it while it syncs: a commit that arrives is
+    // decided, and then waits for the round, as does a transaction that
+    // lost a conflict, whose answer comes in ring order.
+    let held = engine.hold_round(pipe);
     let handles: Vec<_> = (0..THREADS)
         .map(|t| {
-            let (db, barrier) = (Arc::clone(&db), Arc::clone(&barrier));
+            let db = Arc::clone(&db);
             thread::spawn(move || {
-                let mut rng = Rng(0xC0FF_EE00 ^ t as u64);
+                let mut rng = Rng::of_thread(t);
                 let mut committed = Vec::with_capacity(COMMITS_PER_THREAD);
-                barrier.wait();
                 for _ in 0..COMMITS_PER_THREAD {
-                    let a = rng.next() as usize % KEYS;
-                    let b = (a + 1 + rng.next() as usize % (KEYS - 1)) % KEYS;
+                    let (a, b) = rng.pair();
                     let mut attempts = 0;
                     loop {
                         attempts += 1;
@@ -110,6 +152,14 @@ fn run_once(isolation: IsolationLevel) -> u64 {
             })
         })
         .collect();
+    wait_until_decided(pipe, before + THREADS as u64);
+    assert_eq!(
+        stats.get_ticker(Ticker::CommitCount),
+        0,
+        "no commit returns while the round is held"
+    );
+    drop(held);
+
     let mut history: Vec<Committed> = handles
         .into_iter()
         .flat_map(|h| h.join().expect("a writer panicked"))
@@ -145,32 +195,24 @@ fn run_once(isolation: IsolationLevel) -> u64 {
     stats.get_ticker(Ticker::WalSyncCount)
 }
 
-/// Every run is checked against the serial run. Sharing is a scheduling
-/// outcome: on a loaded host every commit can legitimately land in a group of
-/// its own, so the workload runs until a commit shares a group's fsync, and
-/// fails only if none ever does.
+/// The run is checked against the serial run, and its first commits,
+/// decided behind the held round, share one fsync.
 fn run(isolation: IsolationLevel) {
-    const RUNS: usize = 5;
     let commits = (THREADS * COMMITS_PER_THREAD) as u64;
-    let mut fewest = u64::MAX;
-    for _ in 0..RUNS {
-        fewest = fewest.min(run_once(isolation));
-        if fewest < commits {
-            return;
-        }
-    }
-    panic!(
-        "{commits} Immediate commits by {THREADS} threads took {fewest} fsyncs at best \
-         in {RUNS} runs: no commit ever shared a group"
+    let fsyncs = run_once(isolation);
+    assert!(
+        fsyncs < commits,
+        "{commits} Immediate commits by {THREADS} threads took {fsyncs} fsyncs: \
+         no commit ever shared an fsync"
     );
 }
 
 #[test]
-fn concurrent_transactions_in_groups_equal_a_serial_run_in_commit_order() {
+fn concurrent_transactions_decided_together_equal_a_serial_run_in_commit_order() {
     run(IsolationLevel::SnapshotIsolation);
 }
 
 #[test]
-fn serializable_transactions_in_groups_equal_a_serial_run_in_commit_order() {
+fn serializable_transactions_decided_together_equal_a_serial_run_in_commit_order() {
     run(IsolationLevel::Serializable);
 }

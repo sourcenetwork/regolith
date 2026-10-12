@@ -47,12 +47,15 @@ fn racing_publishers_lose_nothing_and_readers_never_go_back() {
     let pushed: Vec<Vec<Arc<MemTable>>> = (0..PUBLISHERS)
         .map(|_| (0..EACH).map(|_| memtable()).collect())
         .collect();
+    const READERS: usize = 3;
     let done = AtomicBool::new(false);
     let loads = AtomicUsize::new(0);
+    let reading = AtomicUsize::new(0);
     std::thread::scope(|scope| {
-        for _ in 0..3 {
+        for _ in 0..READERS {
             scope.spawn(|| {
                 let (mut frozen, mut file_id) = (0usize, 0u64);
+                let mut counted = false;
                 while !done.load(Ordering::Acquire) {
                     let view = cell.load();
                     assert!(
@@ -66,8 +69,20 @@ fn racing_publishers_lose_nothing_and_readers_never_go_back() {
                     frozen = view.frozen.len();
                     file_id = view.version.next_file_id;
                     loads.fetch_add(1, Ordering::Relaxed);
+                    if !counted {
+                        counted = true;
+                        reading.fetch_add(1, Ordering::Release);
+                    }
                 }
             });
+        }
+        // The publishers start once every reader has loaded, so the readers
+        // run beside them on any number of cores: left to the scheduler,
+        // publishers on one core can finish before a reader runs once. A
+        // reader's first load compares against zero, so it cannot fail
+        // before it counts itself and this wait always ends.
+        while reading.load(Ordering::Acquire) < READERS {
+            std::thread::yield_now();
         }
         let publishers: Vec<_> = pushed
             .iter()

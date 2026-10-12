@@ -12,19 +12,37 @@
 //! construction and its lists need no synchronization of their own. The
 //! role is a bit in the state word, and nobody ever waits for it:
 //!
-//! - Every operation that may let a waiter run (a release, a new waiter, a
+//! - Every operation that changes who is queued (a new waiter, a
 //!   withdrawal, a notification) ends in a [`Step::Drain`] transition: one
 //!   compare-and-swap that applies the operation's own state change and
 //!   either claims the role or, when another thread holds it, sets the
 //!   dirty bit.
-//! - The holder clears the dirty bit, then takes the arrival stack, runs
-//!   its primitive's pass, and gives the role up with a compare-and-swap
-//!   that requires the dirty bit still clear. If anything changed while it
-//!   worked, that swap fails and it passes again.
+//! - A release ends in a [`Step::Wake`] transition: it claims the role the
+//!   same way, but when another thread holds it, it leaves only its request
+//!   ([`WAKE_FRONT`]) and no dirty bit. A release changes what a waiter
+//!   could take, not who waits, so it matters to the holder only if the
+//!   holder's pass found somebody queued.
+//! - The holder clears the dirty bit and the request, then takes the
+//!   arrival stack, runs its primitive's pass, and gives the role up with a
+//!   compare-and-swap that requires the dirty bit still clear, and the
+//!   request still clear unless the pass found nobody queued. Otherwise it
+//!   passes again.
 //!
 //! So every change made while a pass runs is seen by that pass or by a
 //! later one, and every change made after the role is given up claims it
 //! afresh: no wakeup is lost, and no call waits on another thread.
+//!
+//! # A drain ends
+//!
+//! The holder of the role returns after bounded work, whatever the other
+//! threads release. With nobody queued, a release leaves no dirty bit and
+//! its request is void, so the drain does not pass again for it. With
+//! somebody queued, the pass a release asks for nudges the front waiter or
+//! finds it nudged already; either way [`NUDGE_OUT`] stays up until that
+//! waiter looks, and the releases that follow skip the drain altogether.
+//! While a handoff is owed every release asks for a pass, but nobody can
+//! barge then, so only the holders there were can release. What is left is
+//! one pass for each waiter that queues or withdraws meanwhile.
 //!
 //! Arrivals push onto a Treiber stack. Pushing is ABA-safe because nothing
 //! pops single nodes: a pass takes the whole stack with one swap and
@@ -37,7 +55,9 @@
 //! release with waiters *nudges* the oldest ones it could serve: they stay
 //! queued, are woken, and compete again when polled. [`NUDGE_OUT`] marks a
 //! nudge whose waiter has not polled yet; releases skip the drain pass
-//! while it is set, since a wake is already on its way.
+//! while it is set, since a wake is already on its way. So a drain runs at
+//! most one more pass for each release that found the marker down, and none
+//! for the releases that come while a nudge is out.
 //!
 //! A nudged waiter that loses again counts one bypass. The attempt that
 //! would be its [`MAX_BYPASS`](super::MAX_BYPASS)th loss marks it owed
@@ -82,8 +102,15 @@ pub(super) fn wants_drain(prev: usize) -> bool {
 
 /// The nudges of one pass. It raises [`NUDGE_OUT`] before the first nudge
 /// leaves, so a waiter that polls at once still finds the marker to take
-/// back, and lowers it again if every nudge found its waiter gone or
-/// already nudged.
+/// back, and lowers it again only if every nudge found its waiter gone.
+///
+/// A waiter that still carries an earlier nudge keeps the marker up. Were
+/// it lowered then, every release would ask for a pass until that waiter
+/// polls; and when that waiter is the thread running these passes (it
+/// queued and took the drain role in the same poll), it cannot poll while
+/// they keep coming, so it would be passed over for as long as releases
+/// arrived. With the marker up those releases stay one read-modify-write,
+/// the drain ends, and the waiter retries.
 pub(super) struct Nudges<'p, 'a> {
     woken: &'p mut WakeList<'a>,
     queue: &'p WaitQueue,
@@ -124,6 +151,11 @@ pub(super) enum Step {
     Set(usize),
     /// Store this state and make sure a drain pass sees it.
     Drain(usize),
+    /// Store this state, which carries a release's [`WAKE_FRONT`] request,
+    /// and make sure a pass acts on it if somebody is queued: claim the
+    /// role, or leave the request with the thread that holds it, without
+    /// the dirty bit.
+    Wake(usize),
 }
 
 pub(super) struct WaitQueue {
@@ -245,11 +277,16 @@ pub(super) trait Policy {
     /// meanwhile. `wake_front` says a release (or a woken waiter's
     /// withdrawal) asked for the front waiter to be woken whatever it asks
     /// for.
+    ///
+    /// [`QUEUED`] among the returned bits says the pass found nobody
+    /// queued. The drain relies on it: a release's request that arrives
+    /// while such a pass runs has no front waiter to wake and is dropped.
     fn pass(&self, arrivals: Arrivals, woken: &mut WakeList<'_>, wake_front: bool) -> usize;
 
     /// Applies `f` to the state atomically and returns the state it last
     /// saw. A [`Step::Drain`] also claims the drain role, or marks its
-    /// holder dirty; a claimed role is drained before this returns.
+    /// holder dirty; a [`Step::Wake`] claims it, or leaves its request with
+    /// the holder; a claimed role is drained before this returns.
     fn transition(&self, mut f: impl FnMut(usize) -> Step) -> usize {
         let state = &self.queue().state;
         let mut current = state.load(Ordering::Acquire);
@@ -258,7 +295,8 @@ pub(super) trait Policy {
                 Step::Keep => return current,
                 Step::Set(next) => (next, false),
                 Step::Drain(next) if current & DRAINING != 0 => (next | DIRTY, false),
-                Step::Drain(next) => (next | DRAINING, true),
+                Step::Wake(next) if current & DRAINING != 0 => (next, false),
+                Step::Drain(next) | Step::Wake(next) => (next | DRAINING, true),
             };
             match state.compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Acquire) {
                 Ok(_) => {
@@ -275,6 +313,14 @@ pub(super) trait Policy {
     /// Runs passes until one finishes with nothing new, then gives the
     /// role up and wakes what the passes granted or nudged. The caller
     /// holds the role.
+    ///
+    /// "Nothing new" is: no dirty bit, and no release's request for a pass
+    /// that found somebody queued. A request that came while the pass found
+    /// nobody queued is dropped with the role, so releases by other threads
+    /// cannot keep this one passing over an empty queue. A waiter that
+    /// queued after the pass took the arrivals raises the dirty bit, or
+    /// finds the role free and passes itself, and reads what was released
+    /// from the state.
     fn drain(&self) {
         let queue = self.queue();
         let mut woken = WakeList::new(queue);
@@ -286,11 +332,16 @@ pub(super) trait Policy {
             if queue.owed.load(Ordering::Acquire) == 0 {
                 clear |= HANDOFF;
             }
+            let (wanted, gone) = if clear & QUEUED != 0 {
+                (0, DRAINING | WAKE_FRONT | clear)
+            } else {
+                (WAKE_FRONT, DRAINING | clear)
+            };
             let mut current = queue.state.load(Ordering::Acquire);
-            while current & DIRTY == 0 {
+            while current & (DIRTY | wanted) == 0 {
                 match queue.state.compare_exchange_weak(
                     current,
-                    current & !(DRAINING | clear),
+                    current & !gone,
                     Ordering::AcqRel,
                     Ordering::Acquire,
                 ) {
@@ -320,7 +371,7 @@ pub(super) trait Policy {
     /// After a release that found waiters: wake the front whatever it
     /// asks for.
     fn released(&self) {
-        self.transition(|state| Step::Drain(state | WAKE_FRONT));
+        self.transition(|state| Step::Wake(state | WAKE_FRONT));
     }
 
     /// The attempt that would be `wait`'s last counted loss. It marks the
