@@ -391,7 +391,10 @@ log cannot be told from a torn write, so it is dropped the same way: reported, n
 silent.
 
 A database written by 0.1.x opens, and the open rewrites its log in format 2, which 0.1.x
-refuses to open: the upgrade is one-way.
+refuses to open: the upgrade is one-way. A database a 0.1.x release left with tables of
+overlapping key ranges in one level opens too: the first open moves that level and the
+levels above it into level 0 and logs one warning (the `regolith.manifest.tables_demoted`
+ticker and property count the tables moved).
 
 ## Encryption at rest
 
