@@ -48,9 +48,13 @@ cov:
     @echo "report: target/llvm-cov/html/index.html"
 
 # ── suites CI runs as their own jobs, split by mechanism ─────
+#
+# Through nextest, for the profile's per-test bound, and with no retry:
+# `cargo test` had none, and a durability failure that passes the second
+# time is still a failure.
 
 test-fault:
-    cargo test --test fault_smoke
+    cargo nextest run --test fault_smoke --retries 0
 
 # The `#[ignore]`d fault tests: each spawns child processes and simulates a
 # power cut. Measured at well under a second each, but kept out of the
@@ -67,7 +71,7 @@ test-fault-slow:
 # high-water mark, and a concurrent test would inflate that number.
 
 test-crash:
-    cargo test --test crash_recovery
+    cargo nextest run --test crash_recovery --retries 0
 
 # Handle lifecycle: open, close, reopen under changed Options, locking,
 # and every misuse of a closed or read-only handle. Measured at 0.4s, so
@@ -75,7 +79,7 @@ test-crash:
 # here is `#[ignore]`d.
 
 test-power:
-    cargo test --test power_loss -- --skip crash_child --nocapture
+    cargo nextest run --test power_loss --retries 0 --no-capture -- --skip crash_child
 
 # Process-crash recovery: kill -9 at every point in the write path. Every
 # test in the file is in the default run already; this recipe just runs the
@@ -103,7 +107,7 @@ test-extremes:
 # at 1.1 s. Needs the LD_PRELOAD fault shim, so it is Linux only.
 
 test-lifecycle:
-    cargo test --test lifecycle -- --skip crash_child
+    cargo nextest run --test lifecycle --retries 0 -- --skip crash_child
 
 # MVCC and concurrency invariants: snapshot stability under concurrent
 # writers and compaction, WriteBatch atomicity seen by concurrent readers,
@@ -124,7 +128,7 @@ fault-shim-clean:
 # trials, measured at 1.2s of wall time.
 
 mvcc:
-    cargo test --test mvcc_invariants -- --skip crash_child
+    cargo nextest run --test mvcc_invariants --retries 0 -- --skip crash_child
 
 # The `#[ignore]`d full-scale MVCC soaks: 120,000 writes racing a snapshot
 # that pins every version of them, 30,000 WriteBatch generations checked by
