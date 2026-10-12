@@ -42,7 +42,7 @@ use super::slots::{Mutant, SlotTable, SlotWaiter};
 use crate::engine::block_cache::BlockCache;
 use crate::engine::io::shared::{Message, QueueShared};
 use crate::engine::io::unit::{Ran, Unit, UnitKey};
-use crate::engine::loom_model::{Witness, explore};
+use crate::engine::loom_model::{Witness, explore, explore_bounded};
 use crate::env::ReadFile;
 use crate::io_queue::QueueId;
 
@@ -288,6 +288,13 @@ fn next_poll(
     told
 }
 
+/// The preemption bound of the parked-reopen models. Each has two threads,
+/// and twelve is where their search stops growing: the leave model
+/// explores the same 16 schedules as with no bound, the load model the
+/// same 24,056, so the bound cuts nothing off today and keeps a later,
+/// longer scenario from running for hours.
+const PARK_PREEMPTIONS: Option<usize> = Some(12);
+
 fn queue() -> StdArc<QueueShared> {
     StdArc::new(QueueShared::new(QueueId::new(NonZeroU64::MIN), 1 << 20))
 }
@@ -358,8 +365,9 @@ fn parked_reopen_woken_through_a_load(mutant: Mutant, witness: &Witness) {
 /// D60: a reopen that may not wait, racing the read that frees the only
 /// slot, is never forgotten.
 pub fn a_parked_reopen_is_woken_by_the_read_that_frees_its_slot() {
-    explore(
+    explore_bounded(
         "a_parked_reopen_is_woken_by_the_read_that_frees_its_slot",
+        PARK_PREEMPTIONS,
         10,
         1,
         |witness| parked_reopen_woken_by_a_leave(Mutant::None, witness),
@@ -369,8 +377,9 @@ pub fn a_parked_reopen_is_woken_by_the_read_that_frees_its_slot() {
 /// D60: a park that marks a slot while another open loads it is woken when
 /// that open's read leaves.
 pub fn a_parked_reopen_is_woken_through_a_load_of_its_slot() {
-    explore(
+    explore_bounded(
         "a_parked_reopen_is_woken_through_a_load_of_its_slot",
+        PARK_PREEMPTIONS,
         20,
         1,
         |witness| parked_reopen_woken_through_a_load(Mutant::None, witness),
@@ -381,8 +390,9 @@ pub fn a_parked_reopen_is_woken_through_a_load_of_its_slot() {
 /// on the list; the reader leaves in between, wakes an empty list, and the
 /// unit parks with nobody left to wake it. Must fail.
 pub fn calibration_a_park_that_marks_before_it_registers_misses_the_free() {
-    explore(
+    explore_bounded(
         "calibration_a_park_that_marks_before_it_registers_misses_the_free",
+        PARK_PREEMPTIONS,
         1,
         0,
         |witness| parked_reopen_woken_by_a_leave(Mutant::MarkBeforeRegister, witness),
@@ -393,8 +403,9 @@ pub fn calibration_a_park_that_marks_before_it_registers_misses_the_free() {
 /// a park set while the slot was claimed; the loader's leave wakes nobody.
 /// Must fail.
 pub fn calibration_a_publish_that_drops_the_mark_misses_the_free() {
-    explore(
+    explore_bounded(
         "calibration_a_publish_that_drops_the_mark_misses_the_free",
+        PARK_PREEMPTIONS,
         1,
         0,
         |witness| parked_reopen_woken_through_a_load(Mutant::PublishDropsWanted, witness),
