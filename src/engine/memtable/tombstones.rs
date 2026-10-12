@@ -200,7 +200,6 @@ impl TombstoneLog {
     }
 
     /// The tombstone at a position the index covers: ready by T4.
-    #[cfg(not(loom))]
     #[inline]
     fn indexed(&self, position: u32) -> &RangeTombstone {
         static NEVER: std::sync::OnceLock<RangeTombstone> = std::sync::OnceLock::new();
@@ -422,7 +421,7 @@ impl TombstoneLog {
     pub(crate) fn any(&self, mut pred: impl FnMut(&RangeTombstone) -> bool) -> bool {
         (0..self.len())
             .filter_map(|position| self.get(position))
-            .any(|tombstone| pred(tombstone))
+            .any(&mut pred)
     }
 
     /// Every ready tombstone, sorted and deduplicated as the memtable has
