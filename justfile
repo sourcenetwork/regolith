@@ -881,9 +881,25 @@ wasm-native records="5000" sustained="20000":
 # `tests/`, and all but the three `wasm_opfs*` files are native-only.
 # The runner is named per target instead, so only the named test
 # binaries are built.
+#
+# Needs `wasm-bindgen-test-runner` from the `wasm-bindgen-cli` release that
+# Cargo.lock pins for `wasm-bindgen`, to the patch: the two share an
+# unstable schema, and a runner of another version refuses the test binary
+# with a schema error after the whole build. The recipe checks that first
+# and says what to install.
 wasm-browser:
     #!/usr/bin/env bash
     set -euo pipefail
+    pinned=$(awk '/^name = "wasm-bindgen"$/ { found = 1; next } found && /^version = / { gsub(/"/, "", $3); print $3; exit }' Cargo.lock)
+    if ! command -v wasm-bindgen-test-runner >/dev/null 2>&1; then
+        echo "error: wasm-bindgen-test-runner is not on PATH; install it with: cargo install wasm-bindgen-cli --version $pinned --locked" >&2
+        exit 1
+    fi
+    have=$(wasm-bindgen --version 2>/dev/null | awk '{ print $2 }')
+    if [ "$have" != "$pinned" ]; then
+        echo "error: wasm-bindgen-cli is ${have:-not installed} but Cargo.lock pins wasm-bindgen $pinned, and the two must match exactly; install it with: cargo install wasm-bindgen-cli --version $pinned --locked" >&2
+        exit 1
+    fi
     export CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER=wasm-bindgen-test-runner
     # wasm-bindgen's default per-test budget is 20s, which a headless
     # browser on a shared runner can exceed on a test that mounts OPFS
