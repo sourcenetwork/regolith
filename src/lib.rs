@@ -107,8 +107,8 @@ pub use event_listener::{
 #[cfg(not(target_arch = "wasm32"))]
 pub use io_queue::through_stalls;
 pub use io_queue::{
-    CommitTicket, IoBudget, IoProgress, IoQueue, IoUnit, IoWait, JobTicket, QueueId, ReadMode,
-    StallWait, WouldBlock,
+    CommitTicket, IoBudget, IoProgress, IoQueue, IoUnit, IoWait, JobTicket, LockWait, QueueId,
+    ReadMode, StallWait, WouldBlock,
 };
 pub use iter::Iter;
 pub use log_layout::LogLayout;
@@ -139,9 +139,9 @@ pub mod prelude {
     pub use crate::{
         AbortReason, CommitInfo, CommitReceipt, CommitTicket, Conflict, Db, IoBudget, IoQueue,
         IsolationLevel, JobTicket, KeyClass, KeyClassifier, KeyId, KeyMaterial, KeyProvider,
-        LogLayout, MergeOperator, OptimisticTransactionDb, Options, QueueId, ReadMode, RetryPolicy,
-        StallWait, TransactError, Transaction, TransactionError, TransactionHooks, TxResult,
-        TxnOptions, WouldBlock,
+        LockWait, LogLayout, MergeOperator, OptimisticTransactionDb, Options, QueueId, ReadMode,
+        RetryPolicy, StallWait, TransactError, Transaction, TransactionError, TransactionHooks,
+        TxResult, TxnOptions, WouldBlock,
     };
 }
 pub use ttl::{DbWithTtl, TtlCompactionFilter, strip_timestamp};
@@ -163,6 +163,7 @@ pub mod loom_exports {
         arena, families, handoff, io_queue, jobs, skiplist, slice, snapshots, tombstones, version,
     };
     pub use crate::env::open_file_limit::loom_model as open_files;
+    pub use crate::transaction::lock_loom as locks;
 }
 
 #[cfg(feature = "fuzzing")]

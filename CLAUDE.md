@@ -74,7 +74,7 @@ src/
 ├── event_listener.rs   # Flush/compaction event callbacks
 ├── io_queue.rs         # Non-blocking calls: ReadMode, QueueId, IoBudget, IoProgress
 ├── io_queue/           # queue.rs (IoQueue: poll, idle_waker, block_on), wait.rs (IoWait, StallWait,
-│                       # WouldBlock), ticket.rs (CommitTicket, JobTicket), completion.rs (deliver once)
+│                       # LockWait, WouldBlock), ticket.rs (CommitTicket, JobTicket), completion.rs (deliver once)
 ├── iter.rs             # Public iterator wrappers
 ├── log_layout.rs       # LogLayout: the key layout of a commit-ordered log
 ├── options.rs          # Options, tuning enums, MergeOperator, CompactionFilter
@@ -92,11 +92,14 @@ src/
 ├── transaction.rs      # Optimistic and pessimistic transactions, isolation levels
 ├── transaction/        # policy.rs (KeyClassifier, key classes), txn_options.rs (TxnOptions),
 │                       # scan_range.rs (scan stretches), write_buffer.rs (buffered puts, deletes, merges),
-│                       # nowait.rs (commit_nowait), retry.rs (transact, transact_async, ready)
+│                       # nowait.rs (commit_nowait), retry.rs (transact, transact_async, ready),
+│                       # lock_table.rs (the lock-free pessimistic lock table, a wait kept across calls),
+│                       # locking.rs (a transaction's lock calls: try, blocking with the timeout, release)
 ├── ttl.rs              # TTL database wrapper
 ├── sync/               # Public regolith::sync: async locks, semaphore, notify, event, latch, barrier, once cell
 │   ├── queue.rs        # Wait queue and drain role every primitive builds on
 │   ├── contend.rs      # The acquire every lock-like primitive shares: barging with bounded bypass (D49)
+│   ├── owned_lock.rs   # A lock whose holder is named in its state word: the pessimistic key lock
 │   ├── waiter.rs       # Waiter nodes, their free list, the wake list
 │   └── internal.rs     # The engine's private std/loom atomics, Mutex, RwLock, Condvar and Gate
 ├── txn_buffer.rs       # Concurrent write and read-set buffer of one transaction

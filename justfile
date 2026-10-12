@@ -343,7 +343,15 @@ loom-tables:
     RUSTFLAGS="--cfg loom" cargo test --release --test loom_tables --no-run
     RUSTFLAGS="--cfg loom" timeout 10m cargo test --release --test loom_tables
 
-loom-all: loom loom-debug loom-sync loom-io loom-snapshots loom-view loom-cache loom-tombstones loom-tables
+# Loom models for the pessimistic lock table (plan 4.6, 4.10): one holder
+# per key, the bypass bound, a wait delivered to its own queue, the table's
+# use count, and close meeting a wait being queued, with five calibrations
+# that must fail. Release only; the ten run in under ten seconds.
+loom-locks:
+    RUSTFLAGS="--cfg loom" cargo test --release --test loom_locks --no-run
+    RUSTFLAGS="--cfg loom" timeout 10m cargo test --release --test loom_locks
+
+loom-all: loom loom-debug loom-sync loom-io loom-snapshots loom-view loom-cache loom-tombstones loom-tables loom-locks
 
 # The read-view chaos workload at full size: 6 instances x 2 rounds x 400
 # versions. Measured at over 20 minutes wall and 4h of CPU unoptimized,
@@ -504,11 +512,14 @@ tla:
     spec=LsmOrder
     check MC_LsmOrder_Green                            GREEN
     check MC_LsmOrder_Red_Intersect                    RED ReadNewest
-    # Flush order, ingest placement, overlap demotion (E14, D13), binary
+    # Flush order, a flush's one publication of its table and its memtable's
+    # retirement (E31), ingest placement, overlap demotion (E14, D13), binary
     # search. Lean: Regolith/LsmOrder.lean, install_oldest_same_order,
+    # flush_keeps_sources_disjoint, split_install_holds_a_memtable_twice,
     # ingest_ordered, demote_reads_newest, level_read_bsearch.
     check MC_LsmOrder_Green_Flush                      GREEN
     check MC_LsmOrder_Red_FlushAnyOrder                RED ReadNewest
+    check MC_LsmOrder_Red_SplitRetire                  RED NoDoubleSource
     check MC_LsmOrder_Green_Ingest                     GREEN
     check MC_LsmOrder_Red_IngestIgnoresUpper           RED ReadNewest
     check MC_LsmOrder_Green_Demote                     GREEN
@@ -872,6 +883,31 @@ tla:
     check MC_EnvFiles_Red_SharedCursor                 RED ReadsOwnBytes
     check MC_EnvFiles_Red_NoFreeze                     RED CurrentHoldsFinished
     check MC_EnvFiles_Red_StaleFrozen                  RED CurrentHoldsFinished
+    # The pessimistic lock table (plan 4.6, 4.10): one holder per key, no
+    # lost wake-up, bounded bypass, a wait delivered to its own queue, and a
+    # lock released when its commit lands. Lean: Regolith/LockTable.lean,
+    # mutual_exclusion, retired_unused, no_stranded_front, handed_is_told,
+    # bounded_bypass, note_on_own_queue, ready_by_own_queue,
+    # isolation_at_landing.
+    spec=LockTable
+    check MC_LockTable_Green_Try                       GREEN
+    check MC_LockTable_Green_Bound2                    GREEN
+    check MC_LockTable_Green_Blocking                  GREEN
+    check MC_LockTable_Green_Nowait                    GREEN
+    check MC_LockTable_Green_Cancel                    GREEN
+    check MC_LockTable_Green_Table                     GREEN
+    check MC_LockTable_Green_Mixed                     GREEN
+    check MC_LockTable_Green_Four                      GREEN
+    check MC_LockTable_Red_RetireNoCas                 RED MutualExclusion
+    check MC_LockTable_Red_NoRecheck                   RED NoStrandedFront
+    check MC_LockTable_Red_ReleaseNoWake               RED NoStrandedFront
+    check MC_LockTable_Red_CancelNoPassOn              RED NoStrandedFront
+    check MC_LockTable_Red_NoteAfterPoll               RED WokenIsTold
+    check MC_LockTable_Red_UnboundedBarging            RED BoundedBypass
+    check MC_LockTable_Red_WrongQueue                  RED OwnQueue
+    check MC_LockTable_Red_CompleteOnWaker             RED OwnQueue
+    check MC_LockTable_Red_ReleaseAtWrite              RED IsolationAtLanding
+    check MC_LockTable_Red_ReleaseAtDelivery           RED HeldOnlyWhileNeeded
     wait
     rm -rf ./*_TTrace_*.tla ./*_TTrace_*.bin
     cat "$results"/*.out
