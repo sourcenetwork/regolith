@@ -133,7 +133,9 @@ import Regolith.EnvFiles
 -- Phase 7 integration: a foreground job that held the compaction gate,
 -- with no worker and inline compaction on, relieves the stop it kept
 -- stopped writers from relieving, so no writer waits on a stall nobody will
--- land. Backs `proofs/tla/StallRelief.tla`.
+-- land. E35: an engine that latches lands the stall's unit, and a rotation
+-- counts its progress whether its seal went through or failed, so no writer
+-- waits on a latched engine. Backs `proofs/tla/StallRelief.tla`.
 import Regolith.StallRelief
 
 -- 4.6, 4.10: the pessimistic lock table. One holder per key, a retired
