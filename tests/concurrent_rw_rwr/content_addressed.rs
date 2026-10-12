@@ -14,8 +14,8 @@
 //! in, and every document and the block must be there afterwards.
 //!
 //! Forced writes. Each of eight transactions takes a stored block of its own,
-//! a write to that block is forced between then and its commit, and what the
-//! commit makes of it is the class's contract:
+//! and when all eight have, a write to each block is forced before any of
+//! them commits. What the commit makes of it is the class's contract:
 //!
 //! * a read that found the block is validated for presence only, so a write
 //!   that leaves the block there (the same bytes again, an operand) never
@@ -27,9 +27,9 @@
 //!   that leaves the block there refuses it, and one that already took it
 //!   away is what the delete would have left.
 //!
-//! On `Tables` the first create commits alone and is flushed behind, and every
-//! forced write is flushed, so a refused commit is judged against a version
-//! that lives in a table.
+//! On `Tables` the first create commits alone and is flushed behind, and the
+//! forced writes are flushed before the commits, so a refused commit is judged
+//! against a version that lives in a table.
 //!
 //! Threads in the creates never assert between two rendezvous, since a thread
 //! that panicked would strand the rest; they record what they saw and the
@@ -44,8 +44,8 @@ use regolith::{
     Transaction, TransactionError, TxnOptions, WriteKind,
 };
 
-use super::support::{Findings, Rendezvous, STORAGES, Storage, table_lookups};
-use super::{Flavour, LEVELS, READS, Read, THREADS, commit_with_retry, with_forced_writes};
+use super::support::{Findings, Rendezvous, STORAGES, Storage, forced_between, table_lookups};
+use super::{Flavour, LEVELS, Read, THREADS, commit_with_retry};
 
 const ROUNDS: usize = 3;
 
@@ -223,18 +223,17 @@ fn creates_of_one_block_all_commit_only_with_the_classifier_at_defra_level() {
 
 // ---- forced writes --------------------------------------------------------
 
-/// The block transaction `r` works on.
-fn own_block(r: usize) -> Vec<u8> {
-    format!("b/own-{r}").into_bytes()
+/// The block transaction `r` works on in the `case`-th case of a run.
+fn own_block(case: usize, r: usize) -> Vec<u8> {
+    format!("b/own-{case:03}-{r}").into_bytes()
 }
 
-/// The key transaction `r` records its reference under.
-fn reference(r: usize) -> Vec<u8> {
-    format!("ref/{r}").into_bytes()
+/// The key transaction `r` records its reference under in that case.
+fn reference(case: usize, r: usize) -> Vec<u8> {
+    format!("ref/{case:03}-{r}").into_bytes()
 }
 
-/// One write the helper lands on a block between a transaction's begin and
-/// its commit.
+/// One write landed on a block between a transaction's begin and its commit.
 #[derive(Clone, Copy, Debug)]
 enum Forced {
     /// The same bytes again, as any other creator of the block stores them.
@@ -302,8 +301,8 @@ enum Mine {
 }
 
 const MINE: [Mine; 4] = [
-    Mine::Reads(READS[0]),
-    Mine::Reads(READS[1]),
+    Mine::Reads(Read::Plain),
+    Mine::Reads(Read::ForUpdate),
     Mine::Puts,
     Mine::Deletes,
 ];
@@ -337,84 +336,86 @@ impl Mine {
     }
 }
 
-fn forced_write(
-    level: IsolationLevel,
-    classified: bool,
-    storage: Storage,
-    mine: Mine,
-    forced: Forced,
-) {
-    let case = format!("{storage:?} {level:?} classified={classified} {mine:?} {forced:?}");
+/// Every way of taking a block against every forced write, in one database:
+/// each case has blocks of its own.
+fn forced_writes(level: IsolationLevel, classified: bool, storage: Storage) {
     let dir = tempfile::tempdir().unwrap();
     let db = open(&dir, storage, classified);
-    for r in 0..THREADS {
-        db.db().put(&own_block(r), BYTES).unwrap();
+    let cases: Vec<(Mine, Forced)> = MINE
+        .iter()
+        .flat_map(|mine| FORCED.iter().map(move |forced| (*mine, *forced)))
+        .collect();
+    for case in 0..cases.len() {
+        for r in 0..THREADS {
+            regolith::through_stalls(|| db.db().put(&own_block(case, r), BYTES)).unwrap();
+        }
     }
     storage.flush(db.db());
 
-    with_forced_writes(
-        &db,
-        |db, r| {
-            forced.land(db, &own_block(r));
-            // The commit that follows must find this version in a table.
-            storage.flush(db.raw());
-        },
-        |r, force| {
-            let block = own_block(r);
-            let tx = db.begin_at(level);
-            match mine {
-                Mine::Reads(read) => {
-                    assert_eq!(
-                        read.of(&tx, &block).as_deref(),
-                        Some(BYTES),
-                        "{case}: reader {r} finds its block"
-                    );
-                    tx.put(&reference(r), &block).unwrap();
+    for (case, (mine, forced)) in cases.into_iter().enumerate() {
+        let name = format!("{storage:?} {level:?} classified={classified} {mine:?} {forced:?}");
+        let refused = mine.refused(level, classified, forced);
+        forced_between(
+            THREADS,
+            |r| {
+                let block = own_block(case, r);
+                let tx = db.begin_at(level);
+                match mine {
+                    Mine::Reads(read) => {
+                        assert_eq!(
+                            read.of(&tx, &block).as_deref(),
+                            Some(BYTES),
+                            "{name}: reader {r} finds its block"
+                        );
+                        tx.put(&reference(case, r), &block).unwrap();
+                    }
+                    Mine::Puts => tx.put(&block, BYTES).unwrap(),
+                    Mine::Deletes => tx.delete(&block).unwrap(),
                 }
-                Mine::Puts => tx.put(&block, BYTES).unwrap(),
-                Mine::Deletes => tx.delete(&block).unwrap(),
-            }
-            force();
-            let (result, lookups) = table_lookups(|| tx.commit());
-            match (mine.refused(level, classified, forced), result) {
-                (None, Ok(_)) => {}
-                (Some(access), Err(TransactionError::Conflict(conflict))) => {
-                    assert_eq!(
-                        (conflict.key(), conflict.mine(), conflict.theirs()),
-                        (&block[..], access, forced.kind()),
-                        "{case}: reader {r}"
-                    );
-                    assert!(
-                        !storage.is_tables() || lookups > 0,
-                        "{case}: the refused commit never probed the table"
-                    );
-                    assert_eq!(
-                        db.db().get(&reference(r)).unwrap(),
-                        None,
-                        "{case}: a refused commit applied nothing"
-                    );
+                tx
+            },
+            || {
+                for r in 0..THREADS {
+                    forced.land(&db, &own_block(case, r));
                 }
-                (expected, got) => panic!("{case}: reader {r} expected {expected:?}, got {got:?}"),
-            }
-        },
-    );
+                // The commits that follow must find these versions in a table.
+                storage.flush(db.db());
+            },
+            |r, tx| {
+                let block = own_block(case, r);
+                let (result, lookups) = table_lookups(|| tx.commit());
+                match (refused, result) {
+                    (None, Ok(_)) => {}
+                    (Some(access), Err(TransactionError::Conflict(conflict))) => {
+                        assert_eq!(
+                            (conflict.key(), conflict.mine(), conflict.theirs()),
+                            (&block[..], access, forced.kind()),
+                            "{name}: reader {r}"
+                        );
+                        assert!(
+                            !storage.is_tables() || lookups > 0,
+                            "{name}: the refused commit never probed the table"
+                        );
+                        assert_eq!(
+                            db.db().get(&reference(case, r)).unwrap(),
+                            None,
+                            "{name}: a refused commit applied nothing"
+                        );
+                    }
+                    (expected, got) => {
+                        panic!("{name}: reader {r} expected {expected:?}, got {got:?}")
+                    }
+                }
+            },
+        );
+    }
 }
 
 #[test]
 fn a_block_is_validated_for_presence_when_read_never_when_put_and_in_full_when_deleted() {
     for storage in STORAGES {
         for classified in [true, false] {
-            for mine in MINE {
-                for forced in FORCED {
-                    forced_write(
-                        IsolationLevel::DefraLevel,
-                        classified,
-                        storage,
-                        mine,
-                        forced,
-                    );
-                }
-            }
+            forced_writes(IsolationLevel::DefraLevel, classified, storage);
         }
     }
 }
@@ -423,13 +424,8 @@ fn a_block_is_validated_for_presence_when_read_never_when_put_and_in_full_when_d
 fn below_defra_level_a_classifier_changes_nothing_about_a_block() {
     for storage in STORAGES {
         for level in LEVELS {
-            if level == IsolationLevel::DefraLevel {
-                continue;
-            }
-            for mine in MINE {
-                for forced in FORCED {
-                    forced_write(level, true, storage, mine, forced);
-                }
+            if level != IsolationLevel::DefraLevel {
+                forced_writes(level, true, storage);
             }
         }
     }

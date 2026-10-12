@@ -15,8 +15,8 @@
 //! thread that works on it, also after a compaction has folded the operands.
 //!
 //! Forced writes. Each of eight readers reads a document of its own by
-//! parts, a write to it is forced between that read and its commit, and the
-//! reader commits a key of its own. Where the level projects:
+//! parts, and when all eight have, a write to each document is forced before
+//! any reader commits a key of its own. Where the level projects:
 //!
 //! * a read that named a part is refused by an operand on that part, a put
 //!   of other bytes, a delete or a range delete, and by neither an operand on
@@ -29,8 +29,8 @@
 //! level validates a point read.
 //!
 //! On `Tables` the first commit on the shared document is made alone and
-//! flushed behind, and every forced write is flushed, so a refused commit is
-//! judged against a version that lives in a table.
+//! flushed behind, and the forced writes are flushed before the commits, so a
+//! refused commit is judged against a version that lives in a table.
 //!
 //! Threads on the shared document never assert between two rendezvous, since
 //! a thread that panicked would strand the rest; they record what they saw
@@ -46,10 +46,8 @@ use regolith::{
 };
 
 use super::parted::{PARTS, Parted, add, parts_of, value};
-use super::support::{Findings, Rendezvous, STORAGES, Storage, table_lookups};
-use super::{
-    Flavour, LEVELS, THREADS, commit_with_retry, own, validates_point_reads, with_forced_writes,
-};
+use super::support::{Findings, Rendezvous, STORAGES, Storage, forced_between, table_lookups};
+use super::{Flavour, LEVELS, THREADS, commit_with_retry, validates_point_reads};
 
 const ROUNDS: usize = 3;
 
@@ -220,9 +218,14 @@ fn increments_of_one_document_refuse_each_other_only_on_the_part_they_share() {
 
 // ---- forced writes --------------------------------------------------------
 
-/// The document reader `r` reads.
-fn document(r: usize) -> Vec<u8> {
-    format!("document/{r}").into_bytes()
+/// The document reader `r` reads in the `case`-th case of a run.
+fn document(case: usize, r: usize) -> Vec<u8> {
+    format!("document/{case:03}-{r}").into_bytes()
+}
+
+/// The key reader `r` writes its decision to in that case.
+fn decision(case: usize, r: usize) -> Vec<u8> {
+    format!("decision/{case:03}-{r}").into_bytes()
 }
 
 /// What the document holds when the reader reads it.
@@ -254,8 +257,7 @@ impl Reads {
     }
 }
 
-/// One write the helper lands on a document between a reader's read and its
-/// commit.
+/// One write landed on a document between a reader's read and its commit.
 #[derive(Clone, Copy, Debug)]
 enum Forced {
     /// An operand on the part the reader may have named.
@@ -316,85 +318,86 @@ impl Forced {
     }
 }
 
-fn forced_write<D: Flavour>(
-    db: &D,
-    level: IsolationLevel,
-    storage: Storage,
-    projects: bool,
-    reads: Reads,
-    forced: Forced,
-) {
-    let case = format!("{storage:?} {level:?} projects={projects} {reads:?} {forced:?}");
-    if reads.seeded() {
-        for r in 0..THREADS {
-            db.raw().put(&document(r), &value(SEEDED)).unwrap();
+/// Every kind of read by parts against every forced write, in one database:
+/// each case has documents of its own.
+fn forced_writes<D: Flavour>(db: &D, level: IsolationLevel, storage: Storage, projects: bool) {
+    let cases: Vec<(Reads, Forced)> = READS
+        .iter()
+        .flat_map(|reads| FORCED.iter().map(move |forced| (*reads, *forced)))
+        .collect();
+    for (case, (reads, _)) in cases.iter().enumerate() {
+        if reads.seeded() {
+            for r in 0..THREADS {
+                regolith::through_stalls(|| db.raw().put(&document(case, r), &value(SEEDED)))
+                    .unwrap();
+            }
         }
     }
     storage.flush(db.raw());
-    let refused = if projects {
-        forced.refuses(reads).then_some(Access::ReadParts)
-    } else {
-        validates_point_reads(level).then_some(Access::Read)
-    };
 
-    with_forced_writes(
-        db,
-        |db, r| {
-            forced.land(db.raw(), &document(r));
-            // The commit that follows must find this version in a table.
-            storage.flush(db.raw());
-        },
-        |r, force| {
-            let tx = db.begin_at(level);
-            let read = tx.get_parts(&document(r), reads.parts()).unwrap();
-            assert_eq!(
-                read.map(|bytes| parts_of(&bytes).unwrap()),
-                reads.seeded().then_some(SEEDED),
-                "{case}: reader {r} reads the whole value"
-            );
-            force();
-            tx.put(&own(r), b"decided").unwrap();
-            let (result, lookups) = table_lookups(|| tx.commit());
-            match (refused, result) {
-                (None, Ok(_)) => {}
-                (Some(access), Err(TransactionError::Conflict(conflict))) => {
-                    assert_eq!(
-                        (conflict.key(), conflict.mine(), conflict.theirs()),
-                        (&document(r)[..], access, forced.kind()),
-                        "{case}: reader {r}"
-                    );
-                    // A range tombstone is kept with its table's metadata, so
-                    // finding one over a key no table holds reads no block.
-                    let reads_a_block = reads.seeded() || !matches!(forced, Forced::RangeDelete);
-                    assert!(
-                        !storage.is_tables() || !reads_a_block || lookups > 0,
-                        "{case}: the refused commit never probed the table"
-                    );
+    for (case, (reads, forced)) in cases.into_iter().enumerate() {
+        let name = format!("{storage:?} {level:?} projects={projects} {reads:?} {forced:?}");
+        let refused = if projects {
+            forced.refuses(reads).then_some(Access::ReadParts)
+        } else {
+            validates_point_reads(level).then_some(Access::Read)
+        };
+        forced_between(
+            THREADS,
+            |r| {
+                let tx = db.begin_at(level);
+                let read = tx.get_parts(&document(case, r), reads.parts()).unwrap();
+                assert_eq!(
+                    read.map(|bytes| parts_of(&bytes).unwrap()),
+                    reads.seeded().then_some(SEEDED),
+                    "{name}: reader {r} reads the whole value"
+                );
+                tx
+            },
+            || {
+                for r in 0..THREADS {
+                    forced.land(db.raw(), &document(case, r));
                 }
-                (expected, got) => panic!("{case}: reader {r} expected {expected:?}, got {got:?}"),
-            }
-        },
-    );
+                // The commits that follow must find these versions in a table.
+                storage.flush(db.raw());
+            },
+            |r, tx| {
+                tx.put(&decision(case, r), b"decided").unwrap();
+                let (result, lookups) = table_lookups(|| tx.commit());
+                match (refused, result) {
+                    (None, Ok(_)) => {}
+                    (Some(access), Err(TransactionError::Conflict(conflict))) => {
+                        assert_eq!(
+                            (conflict.key(), conflict.mine(), conflict.theirs()),
+                            (&document(case, r)[..], access, forced.kind()),
+                            "{name}: reader {r}"
+                        );
+                        // A range tombstone is kept with its table's metadata,
+                        // so finding one over a key no table holds reads no
+                        // block.
+                        let reads_a_block =
+                            reads.seeded() || !matches!(forced, Forced::RangeDelete);
+                        assert!(
+                            !storage.is_tables() || !reads_a_block || lookups > 0,
+                            "{name}: the refused commit never probed the table"
+                        );
+                    }
+                    (expected, got) => {
+                        panic!("{name}: reader {r} expected {expected:?}, got {got:?}")
+                    }
+                }
+            },
+        );
+    }
 }
 
 #[test]
 fn a_read_by_parts_is_refused_only_by_a_write_that_changes_a_part_it_named() {
     for storage in STORAGES {
         for level in LEVELS {
-            for reads in READS {
-                for forced in FORCED {
-                    let dir = tempfile::tempdir().unwrap();
-                    let projects = level == IsolationLevel::DefraLevel;
-                    forced_write(
-                        &optimistic(&dir, storage),
-                        level,
-                        storage,
-                        projects,
-                        reads,
-                        forced,
-                    );
-                }
-            }
+            let dir = tempfile::tempdir().unwrap();
+            let projects = level == IsolationLevel::DefraLevel;
+            forced_writes(&optimistic(&dir, storage), level, storage, projects);
         }
     }
 }
@@ -403,19 +406,8 @@ fn a_read_by_parts_is_refused_only_by_a_write_that_changes_a_part_it_named() {
 fn a_read_by_parts_of_a_pessimistic_transaction_is_a_get_at_every_level() {
     for storage in STORAGES {
         for level in LEVELS {
-            for reads in READS {
-                for forced in FORCED {
-                    let dir = tempfile::tempdir().unwrap();
-                    forced_write(
-                        &pessimistic(&dir, storage),
-                        level,
-                        storage,
-                        false,
-                        reads,
-                        forced,
-                    );
-                }
-            }
+            let dir = tempfile::tempdir().unwrap();
+            forced_writes(&pessimistic(&dir, storage), level, storage, false);
         }
     }
 }
