@@ -197,6 +197,7 @@ theorem inv_init : Inv init := by
 theorem inv_step {s t : State} (hs : Inv s) (hst : Step s t) : Inv t := by
   -- One case per kind of step.
   cases hst with
+  -- Case: family f is created.
   | create f h =>
     -- What the facts say about `f` before its creation.
     obtain ⟨hb0, ht0, hnone⟩ := hs.unborn_clean f h
@@ -208,9 +209,13 @@ theorem inv_step {s t : State} (hs : Inv s) (hst : Step s t) : Inv t := by
     · intro g hg
       -- Split: is `g` the family just created?
       by_cases hgf : g = f
-      · -- It is: but `f` is live now, not unborn.
+      -- It is: but `f` is live now, not unborn.
+      ·
+        -- Replace g by f; "live = unborn" is false.
         subst hgf; simp at hg
-      · -- It is not: its stage, birth and tombstone are unchanged.
+      -- It is not: its stage, birth and tombstone are unchanged.
+      ·
+        -- Read g's entries through the update: they are the old ones.
         simp only [set_other _ _ _ _ hgf] at hg ⊢
         -- The state's `unborn_clean` fact from before the step gives exactly this.
         exact hs.unborn_clean g hg
@@ -218,9 +223,14 @@ theorem inv_step {s t : State} (hs : Inv s) (hst : Step s t) : Inv t := by
     · intro g hg
       -- Split on whether `g = f` holds.
       by_cases hgf : g = f
-      · -- `f`: no tombstone (it was unborn), born at the new sequence.
+      -- `f`: no tombstone (it was unborn), born at the new sequence.
+      ·
+        -- Replace g by f and read the values just written: no tombstone, and a birth sequence above
+        -- 0 and within the counter.
         subst hgf; simp only [set_same]; exact ⟨ht0, by omega, by omega⟩
-      · -- Another live id: unchanged, and the counter grew.
+      -- Another live id: unchanged, and the counter grew.
+      ·
+        -- Read g's entries through the update: they are the old ones.
         simp only [set_other _ _ _ _ hgf] at hg ⊢
         -- Keep this fact for the next step, then put the pieces together.
         have := hs.live_born g hg; exact ⟨this.1, this.2.1, by omega⟩
@@ -234,6 +244,7 @@ theorem inv_step {s t : State} (hs : Inv s) (hst : Step s t) : Inv t := by
       exact hs.after_birth p hp
     -- Tombstones are unchanged.
     · intro p hp; exact hs.before_tomb p hp
+  -- Case: family f is dropped.
   | drop f h =>
     -- What the facts say about `f` while live.
     obtain ⟨ht0, hb, hbs⟩ := hs.live_born f h
@@ -245,7 +256,9 @@ theorem inv_step {s t : State} (hs : Inv s) (hst : Step s t) : Inv t := by
     · intro g hg
       -- Split on whether `g = f` holds.
       by_cases hgf : g = f
-      · -- `f` is dead now, not unborn.
+      -- `f` is dead now, not unborn.
+      ·
+        -- Replace g by f; "dead = unborn" is false.
         subst hgf; simp at hg
       -- Read through `set` at a key it did not change: the old value.
       · simp only [set_other _ _ _ _ hgf] at hg ⊢
@@ -255,7 +268,9 @@ theorem inv_step {s t : State} (hs : Inv s) (hst : Step s t) : Inv t := by
     · intro g hg
       -- Split on whether `g = f` holds.
       by_cases hgf : g = f
-      · -- `f` is dead now, not live.
+      -- `f` is dead now, not live.
+      ·
+        -- Replace g by f; "dead = live" is false.
         subst hgf; simp at hg
       -- Read through `set` at a key it did not change: the old value.
       · simp only [set_other _ _ _ _ hgf] at hg ⊢
@@ -267,14 +282,20 @@ theorem inv_step {s t : State} (hs : Inv s) (hst : Step s t) : Inv t := by
     · intro p hp
       -- Split on whether `p.1 = f` holds.
       by_cases hpf : p.1 = f
-      · -- A write to `f`: it is at most the old counter, below the tombstone.
+      -- A write to `f`: it is at most the old counter, below the tombstone.
+      ·
+        -- The second alternative: the write is below the family's tombstone. Read the tombstone
+        -- just written.
         right; rw [hpf]; simp only [set_same]
         -- Keep this fact for the next step, then the arithmetic over natural numbers that is left holds.
         have := hs.landed_le p hp; omega
-      · -- A write to another family: its tombstone is unchanged.
+      -- A write to another family: its tombstone is unchanged.
+      ·
+        -- Read that family's tombstone through the update: it is the old one.
         simp only [set_other _ _ _ _ hpf]
         -- The state's `before_tomb` fact from before the step gives exactly this.
         exact hs.before_tomb p hp
+  -- Case: a write to family f lands.
   | land f h =>
     -- What the facts say about `f` while live.
     obtain ⟨ht0, hb, hbs⟩ := hs.live_born f h
@@ -302,7 +323,9 @@ theorem inv_step {s t : State} (hs : Inv s) (hst : Step s t) : Inv t := by
       simp only [List.mem_cons] at hp
       -- Split the `or` into its cases.
       rcases hp with rfl | hp
-      · -- The new write is to `f`, which is live, so not `g`.
+      -- The new write is to `f`, which is live, so not `g`.
+      ·
+        -- If g were f, f would be live and g not: impossible.
         intro hfg; simp only at hfg; subst hfg; rw [h] at hg; cases hg
       -- This is exactly what the goal asks.
       · exact h3 p hp
@@ -330,6 +353,7 @@ theorem inv_step {s t : State} (hs : Inv s) (hst : Step s t) : Inv t := by
       · left; exact ht0
       -- The state's `before_tomb` fact from before the step gives exactly this.
       · exact hs.before_tomb p hp
+  -- Case: a write to family f is refused.
   | refuse f h =>
     -- Nothing changed.
     exact hs
@@ -338,7 +362,9 @@ theorem inv_step {s t : State} (hs : Inv s) (hst : Step s t) : Inv t := by
 theorem inv_reach {s : State} (h : Reach s) : Inv s := by
   -- By how `s` was reached: the start, or one step from a reachable state.
   induction h with
+  -- The start keeps every fact.
   | init => exact inv_init
+  -- One more step keeps them.
   | step _ hst ih => exact inv_step ih hst
 
 /-! ## Part 3. The three rules -/
@@ -366,6 +392,7 @@ theorem step_rank_le {s t : State} (hst : Step s t) (g : Nat) :
     (s.life g).rank ≤ (t.life g).rank := by
   -- One case per kind of step.
   cases hst with
+  -- Case: a create.
   | create f h =>
     -- Only `f` changes, from unborn (0) to live (1).
     by_cases hgf : g = f
@@ -373,6 +400,7 @@ theorem step_rank_le {s t : State} (hst : Step s t) (g : Nat) :
     · subst hgf; simp [h, set_same, Life.rank]
     -- Read through `set` at a key it did not change: the old value.
     · simp [set_other _ _ _ _ hgf]
+  -- Case: a drop.
   | drop f h =>
     -- Only `f` changes, from live (1) to dead (2).
     by_cases hgf : g = f
@@ -380,9 +408,11 @@ theorem step_rank_le {s t : State} (hst : Step s t) (g : Nat) :
     · subst hgf; simp [h, set_same, Life.rank]
     -- Read through `set` at a key it did not change: the old value.
     · simp [set_other _ _ _ _ hgf]
+  -- Case: a write lands.
   | land f h =>
     -- No stage changes.
     simp
+  -- Case: a write is refused.
   | refuse f h =>
     -- Nothing changes.
     simp
@@ -404,7 +434,9 @@ theorem life_in_order {s u : State} (h : Steps s u) (g : Nat) :
     (s.life g).rank ≤ (u.life g).rank := by
   -- By the number of steps.
   induction h with
+  -- No step: the stage is the same.
   | refl => exact Nat.le_refl _
+  -- One step never lowers the stage, and the rest follow.
   | cons hst _ ih => exact Nat.le_trans (step_rank_le hst g) ih
 
 /-! ## Part 4. The RED cases -/
@@ -436,6 +468,7 @@ theorem fence_outside_lands_after_drop :
     -- The state after this step: only the fields named here change.
     BlindStep init created ∧ BlindStep created dropped ∧ BlindStep dropped landedLate ∧
     ¬ (∀ p ∈ landedLate.landed, landedLate.tomb p.1 = 0 ∨ p.2 < landedLate.tomb p.1) := by
+  -- Four parts: three steps, then the broken promise.
   refine ⟨?_, ?_, ?_, ?_⟩
   -- The create is a real step: id 1 was unborn.
   · exact .real (Step.create init 1 rfl)
@@ -472,6 +505,7 @@ theorem late_retire_lands_after_drop :
     -- The state after this step: only the fields named here change.
     LateStep init created ∧ LateStep created droppedLive ∧ LateStep droppedLive landedLate2 ∧
     ¬ (∀ p ∈ landedLate2.landed, landedLate2.tomb p.1 = 0 ∨ p.2 < landedLate2.tomb p.1) := by
+  -- Four parts: three steps, then the broken promise.
   refine ⟨?_, ?_, ?_, ?_⟩
   -- The create is a real step.
   · exact .real (Step.create init 1 rfl)
@@ -532,17 +566,23 @@ member, in group order. -/
 theorem runGroup_steps (s : State) (ms : List Nat) : Steps s (runGroup s ms) := by
   -- By the number of members, for every starting state.
   induction ms generalizing s with
+  -- Case: no member.
   | nil =>
     -- No member: zero steps.
     exact Steps.refl s
+  -- Case: a member f, then the rest, with the claim for the rest (ih) known.
   | cons f rest ih =>
     -- Split on whether the member's family is live when the group runs.
     by_cases h : s.life f = .live
-    · -- Live: unfold one member of the group; the `if` takes its first branch.
+    -- Live: unfold one member of the group; the `if` takes its first branch.
+    ·
+      -- Unfold one member of the group, its family being live.
       simp only [runGroup, h, ↓reduceIte]
       -- The member is one `land` step, and the rest are more steps.
       exact Steps.cons (Step.land s f h) (ih _)
-    · -- Not live: unfold one member; the `if` takes its second branch.
+    -- Not live: unfold one member; the `if` takes its second branch.
+    ·
+      -- Unfold one member of the group, its family not being live.
       simp only [runGroup, h, ↓reduceIte]
       -- The member is one `refuse` step, and the rest are more steps.
       exact Steps.cons (Step.refuse s f h) (ih _)
@@ -551,9 +591,11 @@ theorem runGroup_steps (s : State) (ms : List Nat) : Steps s (runGroup s ms) := 
 theorem reach_steps {s t : State} (hs : Reach s) (h : Steps s t) : Reach t := by
   -- By the number of steps.
   induction h with
+  -- Case: no step.
   | refl =>
     -- No step: the state is the reachable one we started from.
     exact hs
+  -- Case: one step, then the rest.
   | cons hst _ ih =>
     -- One step reaches a reachable state, and the rest follow from it.
     exact ih (Reach.step hs hst)

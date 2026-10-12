@@ -208,6 +208,7 @@ TypeOK ==
   /\ seq \in Nat
   \* Births and tombstones are sequence numbers or 0.
   /\ born \in [Families -> Nat]
+  \* Each family's tombstone is a sequence number, or 0 for none.
   /\ tomb \in [Families -> Nat]
   \* The late-retire flag is a yes or a no per family.
   /\ retiring \in [Families -> BOOLEAN]
@@ -230,6 +231,7 @@ Init ==
   /\ seq = 0
   \* No create, no tombstone.
   /\ born = [f \in Families |-> 0]
+  \* No family has a tombstone.
   /\ tomb = [f \in Families |-> 0]
   \* Nothing is waiting to be retired.
   /\ retiring = [f \in Families |-> FALSE]
@@ -241,6 +243,7 @@ Init ==
   /\ ring = <<>>
   \* ... and the hand-off holds nobody.
   /\ held = 0
+  \* No held ticket is marked as having passed a check.
   /\ heldPassed = FALSE
   \* No reader has looked yet.
   /\ seenLife = [r \in Readers |-> <<>>]
@@ -254,6 +257,7 @@ Members(s) == {s[i] : i \in 1..Len(s)}
 Create(f) ==
   \* The id is new, or (bug) dead and taken again.
   /\ \/ life[f] = "unborn"
+     \* or, under the bug ReuseId, dead and taken again.
      \/ Mutant = "ReuseId" /\ life[f] = "dead"
   \* The meta write takes the next sequence.
   /\ seq' = seq + 1
@@ -278,12 +282,17 @@ Drop(f) ==
   /\ ~retiring[f]
   \* The tombstone takes the next sequence.
   /\ seq' = seq + 1
+  \* The family's tombstone is that sequence.
   /\ tomb' = [tomb EXCEPT ![f] = seq + 1]
   \* The real code retires at once; the bug only marks it as pending.
   /\ IF Mutant = "RetireLate"
+     \* The bug: the id is only marked as waiting to be retired,
      THEN /\ retiring' = [retiring EXCEPT ![f] = TRUE]
+          \* and stays live.
           /\ UNCHANGED life
+     \* The design: the id is dead at once.
      ELSE /\ life' = [life EXCEPT ![f] = "dead"]
+          \* Nothing waits to be retired.
           /\ UNCHANGED retiring
   \* Nothing else changes.
   /\ UNCHANGED <<born, landed, wpc, ring, held, heldPassed, seenLife>>
@@ -294,6 +303,7 @@ RetireLater(f) ==
   /\ retiring[f]
   \* Now the registry drops the id.
   /\ life' = [life EXCEPT ![f] = "dead"]
+  \* It no longer waits to be retired.
   /\ retiring' = [retiring EXCEPT ![f] = FALSE]
   \* Nothing else changes.
   /\ UNCHANGED <<seq, born, tomb, landed, wpc, ring, held, heldPassed, seenLife>>
@@ -315,9 +325,11 @@ ApiCheck(w) ==
 Queue(w) ==
   \* The writer passed the API check and writes through the pipeline.
   /\ wpc[w] = "checked"
+  \* (Its write is not an ingest.)
   /\ Kind[w] # "ingest"
   \* Its ticket joins the end of the ring.
   /\ ring' = Append(ring, w)
+  \* The writer is queued.
   /\ wpc' = [wpc EXCEPT ![w] = "queued"]
   \* Nothing else changes.
   /\ UNCHANGED <<life, seq, born, tomb, retiring, landed, held, heldPassed, seenLife>>
@@ -363,6 +375,7 @@ HeldSeq == IF held = 0 THEN <<>> ELSE <<held>>
 Lead(w) ==
   \* The writer passed the API check and writes through the pipeline.
   /\ wpc[w] = "checked"
+  \* (Its write is not an ingest.)
   /\ Kind[w] # "ingest"
   \* It admits some number of queued tickets, from none to all.
   /\ \E k \in 0..Len(ring) :
@@ -372,6 +385,7 @@ Lead(w) ==
        /\ ring' = SubSeq(ring, k + 1, Len(ring))
   \* The held ticket is in this group now.
   /\ held' = 0
+  \* No held ticket is marked as having passed a check.
   /\ heldPassed' = FALSE
   \* Nothing else changes.
   /\ UNCHANGED <<life, born, tomb, retiring, seenLife>>
@@ -390,6 +404,7 @@ Drain ==
        /\ ring' = SubSeq(ring, k + 1, Len(ring))
   \* The held ticket is in this group now.
   /\ held' = 0
+  \* No held ticket is marked as having passed a check.
   /\ heldPassed' = FALSE
   \* Nothing else changes.
   /\ UNCHANGED <<life, born, tomb, retiring, seenLife>>
@@ -401,17 +416,22 @@ Drain ==
 HandOff ==
   \* Nobody is held, and somebody is queued.
   /\ held = 0
+  \* (The ring is not empty.)
   /\ ring # <<>>
   \* The head leaves the ring.
   /\ ring' = Tail(ring)
+  \* Under the bug FenceAtHandOff: is the head's family no longer live?
   /\ IF Mutant = "FenceAtHandOff" /\ life[WriteTo[Head(ring)]] # "live"
      \* The bug's check at hand-off refuses it.
      THEN /\ wpc' = [wpc EXCEPT ![Head(ring)] = "refused"]
+          \* Nobody is held.
           /\ UNCHANGED <<held, heldPassed>>
      \* Otherwise the head is held for the next group; the bug marks it
      \* as having passed its check.
      ELSE /\ held' = Head(ring)
+          \* Under the bug it is marked as having passed its check.
           /\ heldPassed' = (Mutant = "FenceAtHandOff")
+          \* No writer changes its place.
           /\ UNCHANGED wpc
   \* Nothing else changes.
   /\ UNCHANGED <<life, seq, born, tomb, retiring, landed, seenLife>>
@@ -422,6 +442,7 @@ HandOff ==
 Install(w) ==
   \* The ingest validated its table at the API boundary.
   /\ wpc[w] = "checked"
+  \* (Its write is an ingest.)
   /\ Kind[w] = "ingest"
   \* A group of one: the ingest's table.
   /\ RunGroup(<<w>>)
@@ -445,6 +466,7 @@ Next ==
   \/ \E w \in Writers : ApiCheck(w) \/ Queue(w) \/ Lead(w) \/ Install(w)
   \* A group with no request of its own, or a hand-off.
   \/ Drain
+  \* A hand-off.
   \/ HandOff
   \* A reader looks.
   \/ \E r \in Readers : Look(r)

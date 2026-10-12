@@ -258,6 +258,7 @@ theorem inv_start (n : Nat) (b : Bool) : Inv (start n b) := by
 
 /-- A free gate means no writer's step holds it. -/
 theorem holding_zero {s : State} (hw1 : s.gate = .writer ↔ s.holding = 1)
+    -- At most one writer's step holds the gate, and the gate is free.
     (hw2 : s.holding ≤ 1) (h : s.gate = .free) : s.holding = 0 := by
   -- One holding would mean a writer's gate, not a free one.
   have : s.holding ≠ 1 := fun h' => by rw [hw1.mpr h'] at h; cases h
@@ -270,6 +271,7 @@ theorem inv_step {s t : State} (hs : Inv s) (hst : Step .green s t) : Inv t := b
   obtain ⟨⟨hw1, hw2⟩, hj, hwait, hfresh⟩ := hs
   -- One case per kind of step.
   cases hst with
+  -- Case: the job takes the free gate.
   | jobStart h1 h2 =>
     -- The gate was free, so no writer's step held it.
     have h0 := holding_zero hw1 hw2 h2
@@ -285,6 +287,7 @@ theorem inv_step {s t : State} (hs : Inv s) (hst : Step .green s t) : Inv t := b
     · intro _; exact Or.inl rfl
     -- So does a fresh contended writer.
     · intro _; exact Or.inl rfl
+  -- Case: the job ends its work and releases the gate.
   | jobEnd h =>
     -- The job held the gate, so no writer's step did.
     have hg : s.gate = .job := hj.mpr h
@@ -300,6 +303,7 @@ theorem inv_step {s t : State} (hs : Inv s) (hst : Step .green s t) : Inv t := b
     · intro _; exact Or.inr (Or.inl rfl)
     -- So does a fresh contended writer.
     · intro _; exact Or.inr (Or.inl rfl)
+  -- Case: the job relieves, with the gate free.
   | jobRelieveFree b h1 h2 =>
     -- The gate is free, so no writer holds it.
     have h0 := holding_zero hw1 hw2 h2
@@ -315,6 +319,7 @@ theorem inv_step {s t : State} (hs : Inv s) (hst : Step .green s t) : Inv t := b
     · intro h; simp [land, count] at h
     -- Nobody is fresh.
     · intro h; simp [land, count] at h
+  -- Case: the job's relief finds a writer's step holding the gate.
   | jobRelieveHeld h1 h2 =>
     -- A writer's step holds the gate.
     have hrel : s.holding = 1 := hw1.mp h2
@@ -326,9 +331,11 @@ theorem inv_step {s t : State} (hs : Inv s) (hst : Step .green s t) : Inv t := b
     · intro _; exact Or.inr (Or.inr (Or.inl hrel))
     -- So does a fresh contended writer.
     · intro _; exact Or.inr (Or.inr (Or.inl hrel))
+  -- Case: a writer's write goes in.
   | write b h1 h2 =>
     -- Only the stop and two writer counts change: the facts stay.
     exact ⟨⟨hw1, hw2⟩, hj, hwait, hfresh⟩
+  -- Case: a stopped writer finds the gate free, and its step takes it.
   | relieve h1 h2 h3 =>
     -- The gate was free, so no writer's step held it.
     have h0 := holding_zero hw1 hw2 h3
@@ -346,6 +353,7 @@ theorem inv_step {s t : State} (hs : Inv s) (hst : Step .green s t) : Inv t := b
     · intro _; exact Or.inr (Or.inr (Or.inl (by simp only; omega)))
     -- So does a fresh contended writer.
     · intro _; exact Or.inr (Or.inr (Or.inl (by simp only; omega)))
+  -- Case: a stopped writer reads the count, and its step finds the gate held.
   | contend h1 h2 h3 =>
     -- The gate is held: by the job at work, or by a writer's step.
     have hp : Pending s := by
@@ -363,6 +371,7 @@ theorem inv_step {s t : State} (hs : Inv s) (hst : Step .green s t) : Inv t := b
     · intro _; exact hp
     -- So does the new fresh writer.
     · intro _; exact hp
+  -- Case: an owing writer's step finds the gate free and takes it.
   | owedTake h1 h2 =>
     -- The gate was free, so no writer's step held it.
     have h0 := holding_zero hw1 hw2 h2
@@ -380,9 +389,11 @@ theorem inv_step {s t : State} (hs : Inv s) (hst : Step .green s t) : Inv t := b
     · intro _; exact Or.inr (Or.inr (Or.inl (by simp only; omega)))
     -- So does a fresh contended writer.
     · intro _; exact Or.inr (Or.inr (Or.inl (by simp only; omega)))
+  -- Case: an owing writer's step finds the gate held, and the writer returns.
   | owedContended h1 h2 =>
     -- Only the owing count changes: the facts stay.
     exact ⟨⟨hw1, hw2⟩, hj, hwait, hfresh⟩
+  -- Case: a writer's step ends and releases the gate.
   | stepEnd b h =>
     -- A writer's step held the gate, so the job was not at work.
     have hg : s.gate = .writer := hw1.mpr (by omega)
@@ -400,6 +411,7 @@ theorem inv_step {s t : State} (hs : Inv s) (hst : Step .green s t) : Inv t := b
     · intro _; exact Or.inr (Or.inr (Or.inr (by simp only; omega)))
     -- So does a fresh contended writer.
     · intro _; exact Or.inr (Or.inr (Or.inr (by simp only; omega)))
+  -- Case: a writer counts its step's progress.
   | refresh back hb h =>
     -- Each fact: the gate as it was, nobody waits, nobody fresh.
     refine ⟨⟨?_, ?_⟩, ?_, ?_, ?_⟩
@@ -413,6 +425,7 @@ theorem inv_step {s t : State} (hs : Inv s) (hst : Step .green s t) : Inv t := b
     · intro h'; simp [progress, lands, land, count] at h'
     -- Nobody is fresh: the progress was counted.
     · intro h'; simp [progress, lands, land, count] at h'
+  -- Case: a contended writer that missed no progress registers and finds the stop cleared.
   | clearedFresh h1 h2 =>
     -- Each fact: the gate as it was, nobody waits, nobody fresh.
     refine ⟨⟨?_, ?_⟩, ?_, ?_, ?_⟩
@@ -426,6 +439,7 @@ theorem inv_step {s t : State} (hs : Inv s) (hst : Step .green s t) : Inv t := b
     · intro h'; simp [land, count] at h'
     -- Nobody is fresh.
     · intro h'; simp [land, count] at h'
+  -- Case: a contended writer that missed some progress registers and finds the stop cleared.
   | clearedStale h1 h2 =>
     -- Each fact: the gate as it was, nobody waits, nobody fresh.
     refine ⟨⟨?_, ?_⟩, ?_, ?_, ?_⟩
@@ -439,6 +453,7 @@ theorem inv_step {s t : State} (hs : Inv s) (hst : Step .green s t) : Inv t := b
     · intro h'; simp [land, count] at h'
     -- Nobody is fresh.
     · intro h'; simp [land, count] at h'
+  -- Case: a contended writer that missed some progress registers with the stop on.
   | registerStale h1 h2 =>
     -- Each fact: the real code lands the unit; the fresh are as they were.
     refine ⟨⟨?_, ?_⟩, ?_, ?_, ?_⟩
@@ -452,6 +467,7 @@ theorem inv_step {s t : State} (hs : Inv s) (hst : Step .green s t) : Inv t := b
     · intro h'; simp [land] at h'
     -- A fresh writer still waits on whoever it did.
     · intro h'; simp only [land, reduceCtorEq, ↓reduceIte] at h' ⊢; exact hfresh h'
+  -- Case: a contended writer that missed no progress registers with the stop on, and waits.
   | registerFresh h1 h2 =>
     -- It missed no progress, so someone is on the way.
     have hp : Pending s := hfresh h1
@@ -483,6 +499,7 @@ def OnlyWaiters (s : State) : Prop :=
 nobody is left but waiters, nobody waits: someone was always on the way to
 land the unit. Rules out the story's writer 2 waiting for ever. -/
 theorem no_stranded_wait {s : State} (h : Reach .green s) (ho : OnlyWaiters s) :
+    -- The statement: no writer is waiting.
     s.waiting = 0 := by
   -- The facts of the reachable state.
   have hi := inv_reach h
