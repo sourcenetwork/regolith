@@ -1347,26 +1347,28 @@ impl Transaction {
     /// applies nothing; split it into smaller transactions. A commit with no
     /// buffered writes skips the stall admission: it validates its read set
     /// and returns. That validation
-    /// still runs under the write pipeline, so it can wait behind a commit
-    /// group that is writing the log. An optimistic transaction at
+    /// still takes its turn in the write pipeline, behind the commits ahead
+    /// of it. An optimistic transaction at
     /// [`IsolationLevel::DefraLevel`] that writes nothing is the exception: it
     /// takes no part in the pipeline and validates only its
     /// [`Transaction::get_for_update`] reads.
     ///
-    /// Concurrent commits share commit groups with each other and with plain
-    /// writes: one log write and, at [`crate::DurabilityMode::Immediate`], one
-    /// fsync per group, and the commit becomes visible only once that fsync
-    /// returned. Each commit in a group is validated as if the commits ahead of
-    /// it in the group had committed one at a time before it, so it conflicts
+    /// Concurrent commits go through one pipeline with each other and with
+    /// plain writes, with no lock: each is decided in the order it entered,
+    /// by whichever thread gets there, written to the log, and, at
+    /// [`crate::DurabilityMode::Immediate`], made durable by an fsync it
+    /// shares with every commit written by then; it becomes visible only
+    /// once that fsync returned. Each commit is validated as if the commits
+    /// ahead of it had committed one at a time before it, so it conflicts
     /// with them exactly as it would with any earlier commit, and its outcome
-    /// is its own. A group whose log write or fsync fails fails every commit
-    /// in it with that error. Before it queues, an optimistic commit checks
-    /// itself on the calling thread against everything committed up to that
-    /// moment, so the group only checks what landed after, and a conflict
-    /// that is already certain returns without waiting for the group.
+    /// is its own. A log write or fsync that fails fails every commit not yet
+    /// visible with that error. Before it enters the pipeline, an optimistic
+    /// commit checks itself on the calling thread against everything
+    /// committed up to that moment, so the pipeline only checks what landed
+    /// after, and a conflict that is already certain returns at once.
     ///
     /// A conflict is reported to every [`crate::EventListener`] once, after
-    /// the commit has released the pipeline and this transaction its key
+    /// the commit has left the pipeline and this transaction released its key
     /// locks, and then returned as [`TransactionError::Conflict`].
     ///
     /// The [`CommitReceipt`] carries the sequence the writes became visible
@@ -1419,7 +1421,7 @@ impl Transaction {
         // `WriteOptions::default()`: closed/read-only, then size
         // validation, then the stall wait) runs inside
         // `commit_optimistic`, after its own `ensure_writable` and
-        // `validate_ops_sizes` and before the pipeline mutex, gated on
+        // `validate_ops_sizes` and before the commit takes a slot, gated on
         // the commit carrying an op. See the comment there for why.
         let outcome = if drained.write_free {
             self.engine.commit_write_free(&drained.commit.checks)
@@ -1526,6 +1528,7 @@ impl Transaction {
                 merges,
                 appends,
                 durability: self.durability,
+                read_queue: None,
             },
             write_free,
             scan_runs_dropped,

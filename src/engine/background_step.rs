@@ -3,9 +3,10 @@
 //! queue of the thread whose call left it owing, or inline when that thread
 //! has none (D53, `NonBlocking.tla` SelfStart and SelfIoNowhere).
 //!
-//! A writer whose group fills the active memtable seals it and swaps in a
-//! fresh one and a fresh log under the pipeline mutex, and does nothing more
-//! there: the sealed memtable is written out after the mutex is released.
+//! A write whose turn finds the active memtable full seals it and swaps in
+//! a fresh one and a fresh log in the ordered step of the commit pipeline,
+//! and does nothing more there: the sealed memtable is written out off the
+//! commit path.
 //!
 //! - With a compaction worker, the seal wakes it, and the worker flushes
 //!   every frozen memtable, oldest first, before it compacts.
@@ -65,7 +66,7 @@ pub(super) const OWED_DISK_CHECK: u8 = 0b10;
 impl RegolithEngine {
     /// Hand the memtable a writer just sealed to whoever flushes it: the
     /// worker when there is one, else the writer itself once it leaves the
-    /// pipeline. Called under the pipeline mutex; takes no other lock when no
+    /// pipeline. Called in the pipeline's ordered step; takes no lock when no
     /// worker runs, and only the scheduler's when one does.
     pub(super) fn flush_sealed_later(&self) {
         if self.has_worker {

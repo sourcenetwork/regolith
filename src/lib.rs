@@ -1129,7 +1129,7 @@ impl Db {
         // already gone is refused before any work. A batch is usually one
         // column family, or a few long runs of one, and every distinct run
         // reaches the registry once. A drop that lands after this check is
-        // caught by the commit leader's fence in the ordered step
+        // caught by the fence made when the batch's slot is decided
         // (`engine::commit::families`), which refuses the batch whole, so a
         // batch racing a drop is applied whole before the tombstone or
         // refused whole, never split across it.

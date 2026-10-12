@@ -66,13 +66,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::sync::internal::{Gate, Mutex, MutexGuard, OwnedGateWriteGuard};
-use kovan_queue::array_queue::ArrayQueue;
 
 use background_health::{BackgroundHealth, Job};
 use block_cache::BlockCache;
 pub(crate) use commit::PendingAppend;
-pub(crate) use commit::{GroupSync, NowaitCommit, Settled, TxnCommit, conclude_settled};
-use commit::{Pipeline, StallSignal, WriteSlot};
+pub(crate) use commit::{NowaitCommit, PendingCommit, TxnCommit, conclude_settled};
+use commit::{Pipeline, StallSignal};
 use compaction::{CompactionOptions, CompactionOutcome, CompactionScheduler};
 pub(crate) use foreground::Work;
 use lookup_key::{LookupKey, with_key_scratch};
@@ -83,7 +82,7 @@ const STOP_TOO_MANY_MEMTABLES: &str = "stop: too many memtables";
 use log_retirement::RetiredLogs;
 use read_horizon::ReadHorizon;
 pub(crate) use read_rule::ReadRule;
-use read_view::{ReadView, ReadViewCell, VersionStore, ViewGuard};
+use read_view::{ReadView, ReadViewCell, VersionStore};
 use recovery::{
     replay_logs, report_discarded_tail, report_dropped_manifest_tail,
     rewrite_recovered_memtable_to_wal,
@@ -120,7 +119,7 @@ pub(crate) enum CommitOutcome {
 
 /// Why the engine stopped taking writes, see `RegolithEngine::write_latch`.
 enum WriteLatch {
-    /// A failed commit group could not be rolled back out of the log.
+    /// Failed commits could not be rolled back out of the log.
     Wal(std::io::ErrorKind, String),
     /// A caller's code of this trait panicked inside the ordered step.
     CallbackPanicked(&'static str),
@@ -498,8 +497,8 @@ const IO_QUEUE_BLOCKS: usize = 256;
 
 /// The core LSM-tree engine.
 pub(crate) struct RegolithEngine {
-    /// This engine, for the work it leaves on a queue (a commit group's
-    /// fsync, an owed step): held weakly, so pending work never keeps a
+    /// This engine, for the work it leaves on a queue (a sync round, an
+    /// ordered unit, an owed step): held weakly, so pending work never keeps a
     /// database open that every caller dropped.
     me: std::sync::Weak<RegolithEngine>,
     /// The published read view: the active memtable, the frozen
@@ -515,12 +514,9 @@ pub(crate) struct RegolithEngine {
     /// it installs into `view`.
     versions: Arc<VersionStore>,
     cache: Arc<BlockCache>,
-    /// Sequence-number allocator. Advanced up front (before a write's
-    /// data lands) so WAL and memtable entries can be stamped, and used
-    /// as the durable "last sequence" marker for WAL replay.
-    latest_seq: AtomicU64,
     /// Published read horizon: the highest sequence whose data is fully
-    /// applied and durable. Snapshots read this, never `latest_seq`, so a
+    /// applied and durable. Snapshots read this, never the last sequence
+    /// the pipeline decided, so a
     /// snapshot taken mid-commit cannot observe a sequence whose WAL and
     /// memtable writes have not landed yet. The ordering that makes that
     /// true lives in [`ReadHorizon`], which is where it is model-checked.
@@ -529,7 +525,6 @@ pub(crate) struct RegolithEngine {
     close_lock: Mutex<()>,
     /// Transactions that `close` must abort. See `open_transactions`.
     open_transactions: open_transactions::OpenTransactions,
-    active_wal: Mutex<Option<Wal>>,
     wal_id: AtomicU64,
     sst_dir: PathBuf,
     wal_dir: PathBuf,
@@ -554,23 +549,21 @@ pub(crate) struct RegolithEngine {
     /// nothing. Read with one atomic load once set.
     families: std::sync::OnceLock<Arc<crate::column_family::CfRegistry>>,
     options: EngineOptions,
-    /// Bounded ring of writers waiting for a commit group. Writers push a
-    /// ticket here and park; they never block on `pipeline`, which is what
-    /// takes the WAL fsync off every writer's critical path.
-    commit_ring: ArrayQueue<Arc<WriteSlot>>,
-    /// Exclusion for the whole write pipeline, and the leader-owned
-    /// staging buffers. Acquiring it *is* becoming the commit leader, for one
-    /// group. Administrative operations that rotate the memtable or the WAL
-    /// (`compact_range`, `ingest_external_files`, `checkpoint_capture`,
-    /// `drop_all`, `close`) take it blockingly; no follower ever does. A
-    /// rotation seals under it and leaves the flush to the background (E9).
-    pipeline: Mutex<Pipeline>,
+    /// The lock-free commit pipeline (`commit::pipeline`): the ring every
+    /// commit takes a slot of, the state the next commit is decided from
+    /// (its sequence, the active log and the offset its record goes to, the
+    /// active memtable), and the current sync round. `None` on a database
+    /// opened read-only, which takes no write. Operations that rotate the
+    /// memtable or the log (`compact_range`, `ingest_external_files`,
+    /// `checkpoint_capture`, `drop_all`, `close`) take their turn through
+    /// it as ordered units (`commit::ordered`).
+    pipeline: Option<Pipeline>,
     /// What writes frozen memtables out, shared with the compaction
     /// workers, which flush on their own (E9) and hold no handle on the
     /// engine. Its `flushing` exclusion serializes every flush.
     flusher: Arc<flush::Flusher>,
-    /// Latched write-path failure. Set only when a failed commit group
-    /// could not be rolled back out of the WAL, which leaves the log with
+    /// Latched write-path failure. Set only when failed commits could
+    /// not be rolled back out of the WAL, which leaves the log with
     /// a tail no later write may extend, or when a caller's code panicked
     /// inside the commit's ordered step. Once set, every write fails loud
     /// with the original reason instead of appending after unknown bytes or
@@ -690,6 +683,10 @@ impl RegolithEngine {
         let mut wal = Wal::create_in(&env, &wal_path, options.keyring.as_deref())?;
 
         rewrite_recovered_memtable_to_wal(&memtable, &mut wal)?;
+        // From here on the log is written by position, by whichever thread
+        // reaches a decided commit (`wal_log`).
+        let (log, log_end) = wal.into_log()?;
+        let log = Arc::new(log);
 
         let versions = Arc::new(VersionStore::new(version_set));
         let view = Arc::new(ReadViewCell::new(ReadView {
@@ -783,12 +780,10 @@ impl RegolithEngine {
             memtable_config,
             versions,
             cache,
-            latest_seq: AtomicU64::new(latest_seq),
             visible_seq: ReadHorizon::new(latest_seq),
             close_state: AtomicU8::new(CLOSE_STATE_OPEN),
             close_lock: Mutex::new(()),
             open_transactions: open_transactions::OpenTransactions::new(),
-            active_wal: Mutex::new(Some(wal)),
             wal_id: AtomicU64::new(wal_id),
             sst_dir,
             wal_dir,
@@ -804,8 +799,19 @@ impl RegolithEngine {
             stall_step_queued: AtomicBool::new(false),
             stall_steps_idle: std::sync::atomic::AtomicUsize::new(0),
             options,
-            commit_ring: Self::new_commit_ring(),
-            pipeline: Mutex::new(Pipeline::new()),
+            pipeline: Some(Pipeline::new(
+                commit::commit_ring_capacity(),
+                commit::After {
+                    next_seq: latest_seq + 1,
+                    log,
+                    next_off: log_end,
+                    mem_used: memtable.approximate_size(),
+                    memtable,
+                    closed: false,
+                    epoch: 0,
+                },
+                me.clone(),
+            )),
             flusher,
             write_latch: Mutex::new(None),
             write_latched: AtomicBool::new(false),
@@ -936,12 +942,10 @@ impl RegolithEngine {
             memtable_config,
             versions,
             cache,
-            latest_seq: AtomicU64::new(latest_seq),
             visible_seq: ReadHorizon::new(latest_seq),
             close_state: AtomicU8::new(CLOSE_STATE_OPEN),
             close_lock: Mutex::new(()),
             open_transactions: open_transactions::OpenTransactions::new(),
-            active_wal: Mutex::new(None),
             wal_id: AtomicU64::new(wal_id),
             sst_dir,
             wal_dir,
@@ -959,8 +963,7 @@ impl RegolithEngine {
             stall_step_queued: AtomicBool::new(false),
             stall_steps_idle: std::sync::atomic::AtomicUsize::new(0),
             options,
-            commit_ring: Self::new_commit_ring(),
-            pipeline: Mutex::new(Pipeline::new()),
+            pipeline: None,
             flusher,
             write_latch: Mutex::new(None),
             write_latched: AtomicBool::new(false),
@@ -1100,33 +1103,15 @@ impl RegolithEngine {
         }
     }
 
-    /// Install a new log, named `new_wal_id`, as the active one and hand back
-    /// the log it seals.
-    ///
-    /// Recovery takes the newest log by file name and tolerates a torn tail
-    /// only there, so a log has to be complete on disk before any newer file
-    /// exists, an empty one included, and `Eventual` durability never syncs a
-    /// log on its own. Hence the order, all under the `active_wal` lock so no
-    /// commit appends to the old log in between: sync it, create the new
-    /// file, swap. A failed sync latches the log as unknown, since its tail
-    /// can no longer be vouched for and a retried sync may report success for
-    /// pages the kernel already dropped.
-    fn swap_wal(&self, new_wal_id: u64) -> std::io::Result<Wal> {
-        let mut guard = self.active_wal.lock();
-        let current = guard.as_mut().ok_or_else(Self::read_only_error)?;
-        if let Err(err) = current.sync_data() {
-            drop(guard);
-            tracing::error!(error = %err, "syncing the write-ahead log before sealing it failed");
-            self.latch_wal_failure(&err);
-            self.notify_wal_error(&err)?;
-            return Err(err);
+    /// The last sequence the commit pipeline decided: every commit decided
+    /// so far took sequences at or below it. A database opened read-only
+    /// decides none, so there it is the published horizon.
+    #[cfg(test)]
+    pub(crate) fn last_decided_seq(&self) -> u64 {
+        match self.pipeline_state() {
+            Some(tip) => tip.after.next_seq.saturating_sub(1),
+            None => self.visible_seq.visible(),
         }
-        let new_wal = Wal::create_in(
-            &self.env,
-            &self.wal_dir.join(wal_filename(new_wal_id)),
-            self.options.keyring.as_deref(),
-        )?;
-        guard.replace(new_wal).ok_or_else(Self::read_only_error)
     }
 
     fn validate_prefixed_key_size(&self, key: &[u8]) -> std::io::Result<()> {
@@ -2356,8 +2341,8 @@ impl RegolithEngine {
     }
 
     /// [`Self::latest_version_in_view`] among the writes at or below `snap`,
-    /// for a check that runs without the pipeline mutex and so must not see
-    /// a group that is still being published.
+    /// for a check that takes no slot of the commit ring and so must not see
+    /// a commit that is decided and not yet published.
     fn latest_version_upto(
         &self,
         key: &[u8],
@@ -2392,65 +2377,25 @@ impl RegolithEngine {
         })
     }
 
-    /// Rotate the active memtable when it has reached the write-buffer
-    /// size. Called at the *start* of a write path so that a rotation
-    /// failure is surfaced before the write is assigned a sequence or
-    /// applied - keeping write errors determinate: a returned error means
-    /// the write did not land, never that it landed but a later step
-    /// failed. Caller must hold the pipeline mutex.
-    ///
-    /// Takes the view the leader already loaded and hands back the view the
-    /// group applies into: the same one when nothing rotated, a fresh load
-    /// otherwise. The active memtable changes only under the pipeline mutex,
-    /// so between the two nothing else can have replaced it.
-    fn rotate_if_full<'v>(&'v self, view: ViewGuard<'v>) -> std::io::Result<ViewGuard<'v>> {
-        if view.active.approximate_size() < self.options.write_buffer_size {
-            return Ok(view);
-        }
-        // Released before anything below publishes or waits on the
-        // background flush, so the views it retires are handed to the
-        // reclaimer at once rather than when this group is done (see
-        // `read_view::quiesce`), and no view is held across a wait.
-        drop(view);
-        // A rotation leaves at most `max_write_buffer_number` memtables. One
-        // that may leave none but the fresh active one flushes what it seals
-        // here, as every rotation did before flushes left the commit path.
-        let room = self.options.max_write_buffer_number.checked_sub(1);
-        if room == Some(0) {
-            self.rotate_memtable()?;
-            return Ok(self.view.load());
-        }
-        // Normally the flushes behind it are done and nothing is written
-        // here. When they are not, the oldest frozen memtables are written
-        // out first: memory stays within the cap, and the commit path waits
-        // only when the background has fallen a whole memtable behind.
-        if let Some(room) = room {
-            while self.view.load().frozen.len() >= room {
-                let flushed = self.flush_oldest_frozen(&self.flusher.flushing.lock());
-                // A failed flush too, once its exclusion is released: a
-                // stopped writer it held off looks again (`StallSignal`,
-                // relief handed back).
-                if flushed.is_err() {
-                    self.refresh_stall_level();
-                }
-                if !flushed? {
-                    break;
-                }
-            }
-        }
-        // Sealed here and flushed off the commit path (E9): by the worker, or
-        // by the writer once it leaves the pipeline.
-        self.seal_active()?;
-        self.flush_sealed_later();
-        self.refresh_stall_level();
-        Ok(self.view.load())
-    }
-
     /// Seal the active memtable and flush it, and every frozen one before
-    /// it, on this thread: what `compact_range` and an ingest need before
-    /// they read L0. A writer only seals (`rotate_if_full`).
-    fn rotate_memtable(&self) -> std::io::Result<()> {
-        let sealed = self.seal_active()?;
+    /// it, on this thread: what `compact_range` needs before it reads L0.
+    /// The seal takes its turn through the commit pipeline; the flush runs
+    /// after it, off the pipeline. `needed` is asked again in the ordered
+    /// step, so a memtable another call sealed meanwhile is left alone.
+    fn rotate_memtable(
+        &self,
+        needed: impl Fn(&RegolithEngine, &MemTable) -> bool + Send + 'static,
+    ) -> std::io::Result<()> {
+        let sealed = self.ordered(move |engine, ord| {
+            if needed(engine, ord.active()) {
+                ord.seal(true).map(Some)
+            } else {
+                Ok(None)
+            }
+        })?;
+        let Some(sealed) = sealed else {
+            return Ok(());
+        };
         let flushed = self.flush_until_retired(&sealed);
         // Even when the flush failed: the memtable it left frozen counts
         // toward the stall thresholds, and skipping the refresh would let
@@ -2461,45 +2406,10 @@ impl RegolithEngine {
     }
 
     /// Move the active memtable to the frozen list behind a fresh one and
-    /// a fresh WAL, and return it. Caller must hold the pipeline mutex.
-    fn seal_active(&self) -> std::io::Result<Arc<MemTable>> {
-        self.ensure_writable()?;
-        // Everything fallible happens before the publication, so a rotation
-        // that fails leaves the view as it was.
-        let fresh = Arc::new(MemTable::new(&self.memtable_config)?);
-        let new_wal_id = {
-            let mut versions = self.versions.lock();
-            let version = versions.current();
-            let id = version.next_file_id;
-            versions.apply(&[VersionEdit::SetNextFileId(id + 1)])?;
-            id
-        };
-        let old_wal = self.swap_wal(new_wal_id)?;
-
-        // Stamped before it is published as frozen: from then on a flush on
-        // another thread may take it, and the flush reads both stamps. The
-        // pipeline mutex is held, so no write enters it after this and it
-        // stays the active memtable until the publication below.
-        let sealing = Arc::clone(&self.view.load().active);
-        sealing.seal_seq(self.latest_seq.load(Ordering::Acquire));
-        // The log that was active while it took writes is the one its
-        // records are in, and the only durable copy of them until a flush
-        // publishes an SSTable. Stamping it on the memtable is what lets
-        // that flush unlink the right one.
-        sealing.seal_wal(old_wal.path().to_path_buf());
-
-        // One publication: the sealed memtable joins `frozen` in the
-        // same view that hands writers the fresh active one, so no
-        // reader can catch it in neither.
-        let sealed = self.view.update_memtables(|active, frozen| {
-            let sealed = Arc::clone(active);
-            let mut next_frozen = frozen.to_vec();
-            next_frozen.push(Arc::clone(&sealed));
-            (Arc::clone(&fresh), next_frozen, sealed)
-        });
-        debug_assert!(Arc::ptr_eq(&sealed, &sealing));
-        self.wal_id.store(new_wal_id, Ordering::Release);
-        Ok(sealed)
+    /// a fresh WAL, in the ordered step, and return it.
+    #[cfg(test)]
+    pub(crate) fn seal_active(&self) -> std::io::Result<Arc<MemTable>> {
+        self.ordered(|_, ord| ord.seal(true))
     }
 
     /// Flush frozen memtables, oldest first, until `target` is no
@@ -2573,13 +2483,11 @@ impl RegolithEngine {
         // A log sealed under a key other than the current one is rotated
         // away even when its memtable is empty, so a full compaction leaves
         // no file naming a rotated key.
-        let needs_flush =
-            |mt: &MemTable| !mt.is_empty() || mt.has_range_tombstones() || self.wal_key_is_stale();
-        if needs_flush(&self.view.load().active) {
-            let _write_guard = self.lock_pipeline();
-            if needs_flush(&self.view.load().active) {
-                self.rotate_memtable()?;
-            }
+        let needs_flush = |engine: &RegolithEngine, mt: &MemTable| {
+            !mt.is_empty() || mt.has_range_tombstones() || engine.wal_key_is_stale()
+        };
+        if needs_flush(self, &self.view.load().active) {
+            self.rotate_memtable(needs_flush)?;
         }
 
         // 3. Run the level-by-level push-down.
@@ -2651,10 +2559,8 @@ impl RegolithEngine {
         let current = keyring.current_id();
         !self.view.load().frozen.is_empty()
             || self
-                .active_wal
-                .lock()
-                .as_ref()
-                .is_some_and(|wal| wal.seal_key() != Some(current))
+                .pipeline_state()
+                .is_some_and(|tip| tip.after.log.seal_key() != Some(current))
     }
 
     /// Atomically capture a consistent snapshot of the on-disk state
@@ -2931,7 +2837,12 @@ impl RegolithEngine {
         // Taken before `pipeline`, matching the `compaction_lock ->
         // write_lock` order documented on `run_one_compaction_pass`.
         let _compact_guard = self.compaction_lock.write();
-        let _write_guard = self.lock_pipeline();
+        self.ordered(|engine, ord| engine.drop_all_ordered(ord))
+    }
+
+    /// [`Self::drop_all`] in the ordered step: every earlier commit is
+    /// published and no later one is decided until this returns.
+    fn drop_all_ordered(&self, ord: &mut commit::Ordered<'_>) -> std::io::Result<()> {
         // A flush the background is running took its memtable before the
         // drop and installs its table after it: held here, it finishes first
         // and the `Reset` below removes its table, instead of laying it over
@@ -2940,32 +2851,34 @@ impl RegolithEngine {
         self.ensure_writable()?;
 
         // Published before the version `Reset` below, so no reader can
-        // see the pre-drop memtables against the post-drop version.
-        // `drop_all` holds `write_lock`, which excludes writers but not
-        // readers: a concurrent reader may still briefly observe
-        // pre-drop SSTable data, exactly as before this view existed.
+        // see the pre-drop memtables against the post-drop version. The
+        // ordered step excludes writers but not readers: a concurrent
+        // reader may still briefly observe pre-drop SSTable data, exactly
+        // as before this view existed.
         let fresh = Arc::new(MemTable::new(&self.memtable_config)?);
         self.view
             .update_memtables(|_, _| (Arc::clone(&fresh), Vec::new(), ()));
 
-        let (old_version, wal_id, wal_path, new_wal) = {
+        let (old_version, wal_id, wal_path, new_log) = {
             let mut versions = self.versions.lock();
             let old_version = versions.current();
             let id = old_version.next_file_id;
             let wal_path = self.wal_dir.join(wal_filename(id));
-            let new_wal = Wal::create_in(&self.env, &wal_path, self.options.keyring.as_deref())?;
+            let new_log =
+                wal_log::Log::create_in(&self.env, &wal_path, self.options.keyring.as_deref())?;
             versions.apply(&[VersionEdit::Reset {
                 next_file_id: id + 1,
                 min_wal_id: id,
             }])?;
-            (old_version, id, wal_path, new_wal)
+            (old_version, id, wal_path, new_log)
         };
 
         self.cache.clear();
-        let _old_wal = self.active_wal.lock().replace(new_wal);
+        // The sequence goes on from where it was: a commit published before
+        // the drop may still be raising the read horizon to its own
+        // sequence, which a horizon set back to zero would then jump to.
+        ord.replace(fresh, Arc::new(new_log));
         self.wal_id.store(wal_id, Ordering::Release);
-        self.latest_seq.store(0, Ordering::Release);
-        self.visible_seq.reset();
 
         self.versions.lock().compact_manifest().map_err(|e| {
             std::io::Error::new(e.kind(), format!("drop_all rewriting manifest: {e}"))
@@ -3057,9 +2970,12 @@ impl RegolithEngine {
 
         self.close_state
             .store(CLOSE_STATE_CLOSING, Ordering::Release);
-        // The tickets the final sync covers are resolved first: the owed
-        // group lands under the pipeline, and no group is written after.
-        drop(self.lock_pipeline());
+        // The tickets the final sync covers are resolved first: an ordered
+        // unit runs with every commit before it published, and every commit
+        // decided after this point finds the database closing.
+        if self.pipeline.is_some() {
+            let _ = self.ordered(|_, _| Ok(()));
+        }
         // Every write a stall stopped is told now, and finds the database
         // closing when it runs again.
         self.stall_signal.land();
@@ -3095,22 +3011,19 @@ impl RegolithEngine {
 
         self.flush_memtables_for_close()?;
 
-        {
-            let mut guard = self.active_wal.lock();
-            let wal = guard.as_mut().ok_or_else(Self::read_only_error)?;
-            // A latched log may end in bytes nobody can account for, and
-            // CLOSE would vouch for them: replay would then refuse the
-            // crash it should survive. Such a log is left for recovery to
-            // judge. Checked under the lock a failing commit latches under.
-            if self.write_latched.load(Ordering::Acquire) {
-                wal.sync_data()?;
-            } else if let Err(err) = wal.close() {
-                drop(guard);
-                tracing::error!(error = %err, "closing the write-ahead log failed");
-                self.latch_wal_failure(&err);
-                return Err(err);
-            }
-        }
+        // A latched log may end in bytes nobody can account for, and CLOSE
+        // would vouch for them: replay would then refuse the crash it should
+        // survive. Such a log is left for recovery to judge. Checked in the
+        // ordered step, where a failing commit latches.
+        self.ordered(|engine, ord| {
+            let latched = engine.write_latched.load(Ordering::Acquire);
+            ord.close_log(latched).inspect_err(|err| {
+                if !latched {
+                    tracing::error!(error = %err, "closing the write-ahead log failed");
+                    engine.latch_wal_failure(err);
+                }
+            })
+        })?;
         // Signal under the mutex, join without it.
         //
         // A worker parked in `compaction_lock.read()` cannot exit until
@@ -3172,59 +3085,32 @@ impl RegolithEngine {
     }
 
     fn drain_memtables(&self, active: ActiveFlush) -> std::io::Result<()> {
-        let active_pending = |view: &ReadView| match active {
-            ActiveFlush::WhenFull => memtable_needs_flush(&view.active),
-            ActiveFlush::Always => !view.active.is_empty() || view.active.has_range_tombstones(),
-        };
-
         // The set to drain is fixed here and never extended. A drain that
         // re-read the view each pass would chase memtables that writers
         // created after it started, and under a steady write load it
         // would never finish: `Db::checkpoint` calls this with
         // `ActiveFlush::Always`, so a checkpoint taken while anything is
         // writing would hang rather than capture.
-        let targets: Vec<Arc<MemTable>> = {
-            let _write_guard = self.lock_pipeline();
-            let view = self.view.load();
-            let seal_active = active_pending(&view);
-            if !seal_active && view.frozen.is_empty() {
-                return Ok(());
-            }
+        let targets: Vec<Arc<MemTable>> = self.ordered(move |engine, ord| {
+            let view = engine.view.load();
+            let seal_active = match active {
+                ActiveFlush::WhenFull => memtable_needs_flush(&view.active),
+                ActiveFlush::Always => {
+                    !view.active.is_empty() || view.active.has_range_tombstones()
+                }
+            };
             let mut targets = view.frozen.clone();
             drop(view);
-
             if seal_active {
-                let new_wal_id = {
-                    let mut versions = self.versions.lock();
-                    let version = versions.current();
-                    let id = version.next_file_id;
-                    versions.apply(&[VersionEdit::SetNextFileId(id + 1)])?;
-                    id
-                };
-                let fresh = Arc::new(MemTable::new(&self.memtable_config)?);
-                let old_wal = self.swap_wal(new_wal_id)?;
-
-                // Stamped before it is published as frozen, as
-                // `seal_active` stamps it: a worker may flush it at once.
-                let sealing = Arc::clone(&self.view.load().active);
-                sealing.seal_seq(self.latest_seq.load(Ordering::Acquire));
-                sealing.seal_wal(old_wal.path().to_path_buf());
-
-                // One publication for the seal and the enqueue: two
-                // would leave a window where the sealed memtable is in
-                // neither the active slot nor the frozen list.
-                let sealed = self.view.update_memtables(|active, frozen| {
-                    let sealed = Arc::clone(active);
-                    let mut next_frozen = frozen.to_vec();
-                    next_frozen.push(Arc::clone(&sealed));
-                    (Arc::clone(&fresh), next_frozen, sealed)
-                });
-                debug_assert!(Arc::ptr_eq(&sealed, &sealing));
-                self.wal_id.store(new_wal_id, Ordering::Release);
-                targets.push(sealed);
+                // Sealed without the writable check: a drain for close runs
+                // with the database already closing.
+                targets.push(ord.seal(false)?);
             }
-            targets
-        };
+            Ok(targets)
+        })?;
+        if targets.is_empty() {
+            return Ok(());
+        }
 
         // Oldest first, which is also the order `flush_until_retired`
         // writes them in, so a target that an earlier pass already

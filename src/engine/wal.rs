@@ -6,7 +6,7 @@
 //! Every log opens with a self-checksummed stamp whose `format` field says
 //! how the records after it are framed.
 //!
-//! - **Format 2** is what this build writes: one record per commit group,
+//! - **Format 2** is what this build writes: one record per commit,
 //!   each carrying `synced_through`, and a CLOSE record at the end of a
 //!   cleanly closed log. Its framing, and why it is shaped that way, is in
 //!   [`super::wal_frame`].
@@ -115,9 +115,9 @@ pub(crate) struct Wal {
     /// Through the host environment, so a log is written the same way on
     /// a filesystem, under wasi, and against OPFS in a browser.
     ///
-    /// Deliberately unbuffered. Group commit already coalesces every
-    /// writer in a group into a single append, so a buffer in front of it
-    /// saves no syscall, and it would change what a crash costs: a process
+    /// Deliberately unbuffered. A record is handed to the host in one
+    /// write, so a buffer in front of it saves no syscall, and it would
+    /// change what a crash costs: a process
     /// killed with bytes still in a userspace buffer loses them, where
     /// bytes handed to the host survive in its page cache. That
     /// distinction is the whole basis of `DurabilityMode::Eventual`.
@@ -155,8 +155,9 @@ pub(crate) struct Wal {
 /// vectored write costs less than the copy.
 const COALESCE_LEN: usize = 4096;
 
-/// Largest buffer a sealed log keeps between records. A larger group's
-/// buffer is released once written, so one huge group does not pin its size.
+/// Largest buffer a sealed log keeps between records. A larger record's
+/// buffer is released once written, so one huge record does not pin its
+/// size.
 const SEALED_KEEP_LEN: usize = 1 << 20;
 
 /// A replayed WAL entry.
@@ -240,12 +241,12 @@ impl Wal {
         Self::create_in(&crate::env::std_env(), path, None)
     }
 
-    /// Append one commit group, whose operations `entries` holds, as one
-    /// record, and advance the tracked offset.
+    /// Append one commit, whose operations `entries` holds, as one record,
+    /// and advance the tracked offset.
     ///
     /// `entries` must already be encoded by [`encode_op_record`],
     /// [`encode_ops_record`] or [`encode_put_record`]; this adds the
-    /// record's frame, in the same host write: a small group is copied next
+    /// record's frame, in the same host write: a small record is copied next
     /// to its frame, a large one leaves in one vectored write. On failure
     /// the tracked offset is left at the pre-call value so
     /// [`Wal::rollback_to`] can discard whatever prefix reached the file.
@@ -263,7 +264,7 @@ impl Wal {
         }
         debug_assert!(
             entries.len() as u64 <= MAX_RECORD_LEN as u64,
-            "a commit group over MAX_RECORD_LEN must be refused before it is staged"
+            "a commit over MAX_RECORD_LEN must be refused before it is staged"
         );
         self.write_record(wal_frame::KIND_GROUP, entries)
     }
@@ -311,6 +312,7 @@ impl Wal {
     /// and replay would refuse a crash it should survive. Once CLOSE may
     /// be in the file nothing else is appended, even when the final sync
     /// fails. Closing a closed log does nothing.
+    #[cfg(test)]
     pub(crate) fn close(&mut self) -> io::Result<()> {
         if self.closed {
             return Ok(());
@@ -322,20 +324,53 @@ impl Wal {
     }
 
     /// Byte offset one past the last successfully appended record.
+    #[cfg(test)]
     pub(crate) fn offset(&self) -> u64 {
         self.offset
     }
 
+    /// Hand this log to the commit pipeline: the same file, written by
+    /// position from here on (`super::wal_log`). Returns it with the offset
+    /// its records end at. The appending handle is closed first, so the
+    /// file is opened once at a time.
+    pub(crate) fn into_log(self) -> io::Result<(super::wal_log::Log, u64)> {
+        let Wal {
+            file,
+            offset,
+            path,
+            parent_synced,
+            env,
+            nonce,
+            synced_through,
+            seal,
+            stamp_len,
+            ..
+        } = self;
+        drop(file);
+        let log = super::wal_log::Log::adopt(
+            &env,
+            &path,
+            nonce,
+            seal,
+            stamp_len,
+            synced_through,
+            parent_synced,
+        )?;
+        Ok((log, offset))
+    }
+
     /// The key this log is sealed under, or `None` when it is not sealed.
+    #[cfg(test)]
     pub(crate) fn seal_key(&self) -> Option<crate::KeyId> {
         self.seal.as_ref().map(Sealer::id)
     }
 
     /// Truncate back to `offset` and reposition the write cursor there.
     ///
-    /// Called when a group's append or sync failed, so a partially
-    /// written group never survives as a torn record that replay would
-    /// have to reason about.
+    /// Called when an append or a sync failed, so a partially written
+    /// record never survives as a torn one that replay would have to
+    /// reason about.
+    #[cfg(test)]
     pub(crate) fn rollback_to(&mut self, offset: u64) -> io::Result<()> {
         // The stamp is not a record and is never rolled back over: doing
         // so would leave an unidentifiable file behind.
@@ -440,6 +475,7 @@ impl Wal {
     }
 
     /// Get the path to this WAL file.
+    #[cfg(test)]
     pub(crate) fn path(&self) -> &Path {
         &self.path
     }
@@ -547,11 +583,11 @@ pub(crate) mod fault {
     ///
     /// A test that needs both outcomes cannot get them from a fault that
     /// only ever fails: it has to rely on something else to supply the
-    /// successes, and the only thing available is which writers happen
-    /// to land in the same commit group. That is decided by thread
-    /// timing, so on a slower machine every group can contain a writer
-    /// that asked for a sync, every group fails, and the test that
-    /// wanted a mix gets none. Alternating here makes the mix a property
+    /// successes, and the only thing available is which commits happen
+    /// to be covered by the same sync. That is decided by thread timing,
+    /// so on a slower machine every sync can cover a writer that asked
+    /// for one, every one fails, and the test that wanted a mix gets
+    /// none. Alternating here makes the mix a property
     /// of the fault rather than of the scheduler.
     pub(crate) fn arm_flapping_sync_failure(dir: &Path, period: u64) {
         assert!(period > 1, "a flapping fault needs a period above one");

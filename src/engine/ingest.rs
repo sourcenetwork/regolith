@@ -27,16 +27,17 @@
 //!    read at (`SsTableMeta::global_seq`), and raises the last sequence;
 //! 6. publish the sequence on the read horizon.
 //!
-//! A commit draws and publishes under the same mutex, so from the draw to
-//! the publish the sequence is a pending slot no publication passes
+//! The install draws and publishes in one ordered step of the commit
+//! pipeline, so from the draw to the publish the sequence is a pending slot
+//! no publication passes
 //! (IngestPublication.tla, `RepeatableSnapshot`; Lean
 //! `repeatable_snapshot`). A snapshot taken before the publish reads none of
 //! the table, whose entries read at the new sequence, and one taken after
 //! reads all of it.
 //!
-//! Which L0 tables hold a key of the range is read before the mutex is
-//! taken, since it can read a block; under the mutex only a table that
-//! arrived in L0 since then is probed.
+//! Which L0 tables hold a key of the range is read before the ordered step,
+//! since it can read a block; inside the step only a table that arrived in
+//! L0 since then is probed.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -405,21 +406,35 @@ impl RegolithEngine {
 
     /// Install one staged table: steps 1 to 6 of the module docs.
     fn install(&self, table: StagedTable, opts: &IngestOptions) -> io::Result<IngestedTable> {
-        let (lo, hi) = (table.smallest.as_slice(), table.largest.as_slice());
-        let probed = if opts.ingest_behind {
+        let behind = opts.ingest_behind;
+        let probed = if behind {
             Vec::new()
         } else {
+            let (lo, hi) = (table.smallest.as_slice(), table.largest.as_slice());
             self.l0_holders(&self.published_version(), lo, hi)?
         };
+        // The install takes its turn through the commit pipeline: whichever
+        // thread reaches its slot runs it, with every earlier commit
+        // published and no later one decided until the table is installed
+        // and its sequence published.
+        self.ordered(move |engine, ord| engine.install_ordered(ord, table, behind, &probed))
+    }
 
-        let _pipeline = self.lock_pipeline();
-        // The ordered step: a family the table writes into that a drop
-        // retired since the table was validated refuses the install, before
-        // it takes a sequence.
+    /// [`Self::install`] in the ordered step.
+    fn install_ordered(
+        &self,
+        ord: &mut super::commit::Ordered<'_>,
+        table: StagedTable,
+        behind: bool,
+        probed: &[(u64, bool)],
+    ) -> io::Result<IngestedTable> {
+        let (lo, hi) = (table.smallest.as_slice(), table.largest.as_slice());
+        // A family the table writes into that a drop retired since the table
+        // was validated refuses the install, before it takes a sequence.
         self.cf_fence_ids(&table.families)?;
-        let level = if opts.ingest_behind {
+        let level = if behind {
             self.behind_level(lo, hi)?
-        } else if self.flush_memtables_holding(lo, hi)? {
+        } else if self.flush_memtables_holding(ord, lo, hi)? {
             0
         } else {
             let version = self.published_version();
@@ -430,9 +445,14 @@ impl RegolithEngine {
                 };
             placement(&version, lo, hi, &mut holds)?
         };
-        self.sync_active_wal()?;
+        // Every commit ordered before the ingest is durable before the
+        // manifest record that makes the ingest durable: under `Eventual` a
+        // power cut must leave a gap-free prefix of commit order, and the
+        // memtables holding none of the file's keys are not flushed. A
+        // failed sync latches the log, as a rotation's does.
+        ord.sync_log()?;
 
-        let seq = self.latest_seq.fetch_add(1, Ordering::AcqRel) + 1;
+        let seq = ord.take_seq();
 
         #[cfg(test)]
         if let Some(hook) = AFTER_INGEST_SEQ.with(|slot| slot.borrow_mut().take()) {
@@ -494,13 +514,18 @@ impl RegolithEngine {
     }
 
     /// Flush, oldest first, every memtable up to the newest one holding a
-    /// key of `[lo, hi]`, and say whether there was one. Caller holds the
-    /// pipeline mutex, so the active memtable takes no write meanwhile.
-    fn flush_memtables_holding(&self, lo: &[u8], hi: &[u8]) -> io::Result<bool> {
+    /// key of `[lo, hi]`, and say whether there was one. Runs in the ordered
+    /// step, so the active memtable takes no write meanwhile.
+    fn flush_memtables_holding(
+        &self,
+        ord: &mut super::commit::Ordered<'_>,
+        lo: &[u8],
+        hi: &[u8],
+    ) -> io::Result<bool> {
         let view = self.view.load();
         let target = if view.active.holds_key_in(lo, hi) {
             drop(view);
-            self.seal_active()?
+            ord.seal(true)?
         } else {
             match view.frozen.iter().rev().find(|mt| mt.holds_key_in(lo, hi)) {
                 Some(frozen) => Arc::clone(frozen),
@@ -513,28 +538,8 @@ impl RegolithEngine {
         Ok(true)
     }
 
-    /// Sync the active log, so every commit ordered before the ingest is
-    /// durable before the manifest record that makes the ingest durable:
-    /// under `Eventual` a power cut must leave a gap-free prefix of commit
-    /// order, and the memtables holding none of the file's keys are not
-    /// flushed. A failed sync latches the log, as a rotation's does. Caller
-    /// holds the pipeline mutex, so no group is appending.
-    fn sync_active_wal(&self) -> io::Result<()> {
-        let mut guard = self.active_wal.lock();
-        let wal = guard.as_mut().ok_or_else(Self::read_only_error)?;
-        if let Err(err) = wal.sync_data() {
-            drop(guard);
-            tracing::error!(error = %err, "syncing the write-ahead log before an ingest failed");
-            self.latch_wal_failure(&err);
-            self.notify_wal_error(&err)?;
-            return Err(err);
-        }
-        Ok(())
-    }
-
     /// `ingest_behind`'s level: the bottom one, refused when anything in the
-    /// tree holds or may hold a key of `[lo, hi]`. Caller holds the pipeline
-    /// mutex.
+    /// tree holds or may hold a key of `[lo, hi]`. Runs in the ordered step.
     fn behind_level(&self, lo: &[u8], hi: &[u8]) -> io::Result<usize> {
         let view = self.view.load();
         let in_memory = std::iter::once(&view.active)

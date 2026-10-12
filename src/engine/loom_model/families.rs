@@ -2,8 +2,8 @@
 //!
 //! A protocol model, and deliberately so. The production registry
 //! (`column_family::CfRegistry`) keeps liveness in a kovan map, whose
-//! atomics loom does not see, and the ordered step is the commit leader
-//! under the pipeline mutex, which needs a whole engine. What is reproduced
+//! atomics loom does not see, and the ordered step is the commit
+//! pipeline's, which needs a whole engine. What is reproduced
 //! here is the part loom can decide, each piece standing in for one line of
 //! `engine::commit::families`:
 //!

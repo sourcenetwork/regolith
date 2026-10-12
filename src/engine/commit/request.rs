@@ -1,9 +1,8 @@
-//! What a writer hands to the commit leader, and how the leader turns it
-//! into WAL bytes and memtable entries.
+//! What a writer hands to the commit pipeline, and how a decided commit
+//! turns into WAL bytes and memtable entries.
 
 use std::io;
 
-use super::super::skiplist::InsertHint;
 use super::super::wal::{
     check_record_len, encode_ops_record, encode_put_record, ops_record_len, put_record_len,
 };
@@ -11,15 +10,12 @@ use super::super::{DurabilityMode, MemTable, apply_batch_op_to_memtable, batch_o
 use super::txn::TxnRequest;
 use crate::WriteBatchOp;
 
-/// The unit of work one writer hands to the commit leader.
+/// The unit of work one writer hands to the commit pipeline.
 ///
 /// Every byte a request refers to is owned by the request, never borrowed
-/// from the submitting frame. That is what makes G3 hold: the leader can
-/// finish a ticket whose submitter has already unwound.
+/// from the submitting frame. That is what makes G3 hold: any thread can
+/// finish a commit whose submitter has already unwound.
 pub(crate) enum WriteRequest {
-    /// No work. The resting state of a handoff slot, and what the leader
-    /// leaves behind when it takes a request.
-    Idle,
     /// A single put, the shape [`crate::Db::put`] produces.
     Put {
         /// Column-family-prefixed key.
@@ -40,42 +36,24 @@ pub(crate) enum WriteRequest {
         /// Skip the WAL entirely for this writer's operations.
         disable_wal: bool,
     },
-    /// An optimistic transaction's commit. The leader validates it in group
-    /// order and turns it into a [`WriteRequest::Batch`] or into
-    /// [`WriteRequest::Idle`] before anything is staged, so the methods below
-    /// that size a request answer for it with upper bounds, and the ones that
-    /// stage or apply one never see it.
+    /// An optimistic transaction's commit. It is validated when its slot is
+    /// decided, and lands its own operations, or, when it carries appends,
+    /// the batch deciding it numbered them into.
     Txn(TxnRequest),
 }
 
 impl WriteRequest {
-    /// How many sequence numbers this request consumes.
-    pub(super) fn op_count(&self) -> u64 {
+    /// The operations the request carries, as the writer handed them over.
+    pub(super) fn ops(&self) -> Ops<'_> {
         match self {
-            WriteRequest::Idle | WriteRequest::Txn(_) => 0,
-            WriteRequest::Put { .. } => 1,
-            WriteRequest::Batch { ops, .. } => ops.len() as u64,
-        }
-    }
-
-    /// A transaction committed by `commit_nowait`.
-    pub(super) fn is_nowait(&self) -> bool {
-        matches!(self, WriteRequest::Txn(txn) if txn.nowait)
-    }
-
-    pub(super) fn durability(&self) -> DurabilityMode {
-        match self {
-            WriteRequest::Idle => DurabilityMode::Eventual,
-            WriteRequest::Put { durability, .. } | WriteRequest::Batch { durability, .. } => {
-                *durability
-            }
-            WriteRequest::Txn(txn) => txn.durability,
+            WriteRequest::Put { key, value, .. } => Ops::Put { key, value },
+            WriteRequest::Batch { ops, .. } => Ops::Batch(ops),
+            WriteRequest::Txn(txn) => Ops::Batch(&txn.ops),
         }
     }
 
     pub(super) fn skips_wal(&self) -> bool {
         match self {
-            WriteRequest::Idle => true,
             WriteRequest::Put { disable_wal, .. } | WriteRequest::Batch { disable_wal, .. } => {
                 *disable_wal
             }
@@ -83,21 +61,14 @@ impl WriteRequest {
         }
     }
 
-    /// Framed WAL bytes this request stages: exactly one record, or none
-    /// when it skips the log. Every producer refuses a request whose
-    /// record is over the limit, and admission sums it to cap a group. A
-    /// transaction counts the most it can stage once its appends are
-    /// numbered.
+    /// Bytes of operations this request's record carries: exactly one
+    /// record's payload, or none when it skips the log. Every producer
+    /// refuses a request whose record is over the limit.
     pub(super) fn staged_len(&self) -> usize {
         if self.skips_wal() {
             return 0;
         }
-        match self {
-            WriteRequest::Idle => 0,
-            WriteRequest::Put { key, value, .. } => put_record_len(key, value),
-            WriteRequest::Batch { ops, .. } => ops_record_len(ops),
-            WriteRequest::Txn(txn) => txn.record_bound,
-        }
+        self.ops().payload_len()
     }
 
     /// Refuse this request when its record is longer than `limit` bytes.
@@ -105,68 +76,97 @@ impl WriteRequest {
     pub(super) fn check_record_len(&self, limit: usize) -> io::Result<()> {
         check_record_len(self.staged_len(), limit)
     }
+}
 
-    /// Most memtable bytes this request can add when it is applied.
+/// A commit's operations, wherever they are held: in the request, or in the
+/// decision when deciding produced them (a transaction whose appends were
+/// numbered, a counter reservation).
+pub(super) enum Ops<'a> {
+    /// Nothing to land.
+    None,
+    Put {
+        key: &'a [u8],
+        value: &'a [u8],
+    },
+    Batch(&'a [WriteBatchOp]),
+}
+
+impl Ops<'_> {
+    /// How many sequence numbers the operations consume: one each.
+    pub(super) fn count(&self) -> u64 {
+        match self {
+            Ops::None => 0,
+            Ops::Put { .. } => 1,
+            Ops::Batch(ops) => ops.len() as u64,
+        }
+    }
+
+    /// Bytes of the record's payload: what [`Ops::encode`] appends.
+    pub(super) fn payload_len(&self) -> usize {
+        match self {
+            Ops::None => 0,
+            Ops::Put { key, value } => put_record_len(key, value),
+            Ops::Batch(ops) => ops_record_len(ops),
+        }
+    }
+
+    /// Most memtable bytes applying the operations can add.
     ///
-    /// The leader admits tickets against the active memtable's remaining
-    /// `write_buffer_size`, so this has to be an upper bound: over-stating
-    /// a cost ends a group one ticket early, while under-stating one lets
-    /// the group carry the memtable past its budget.
+    /// The pipeline counts every commit against the active memtable's
+    /// `write_buffer_size` with this, so it has to be an upper bound:
+    /// over-stating a cost runs the rotation check one commit early, while
+    /// under-stating one would let the memtable pass its budget unnoticed.
     ///
     /// A `DeleteRange` op costs range-tombstone heap rather than an arena
     /// node, and is charged the same way [`MemTable::delete_range`]
     /// charges it.
     pub(super) fn memtable_cost(&self) -> usize {
         match self {
-            WriteRequest::Idle => 0,
-            WriteRequest::Put { key, value, .. } => {
-                MemTable::max_entry_size(key.len(), value.len())
-            }
-            WriteRequest::Batch { ops, .. } => ops.iter().map(batch_op_memtable_cost).sum(),
-            WriteRequest::Txn(txn) => txn.cost_bound,
+            Ops::None => 0,
+            Ops::Put { key, value } => MemTable::max_entry_size(key.len(), value.len()),
+            Ops::Batch(ops) => ops
+                .iter()
+                .map(batch_op_memtable_cost)
+                .fold(0usize, usize::saturating_add),
         }
     }
 
-    /// Payload bytes reported to [`Ticker::WalBytesWritten`]. Counts the
-    /// same key, value and sequence bytes the per-write path counted
-    /// before group commit, so the ticker stays comparable across the
-    /// change.
+    /// Payload bytes reported to [`crate::statistics::Ticker::WalBytesWritten`].
+    /// Counts the key, value and sequence bytes of each operation and no
+    /// framing, as the ticker always has, so it stays comparable across log
+    /// formats.
     pub(super) fn reported_bytes(&self) -> u64 {
         match self {
-            WriteRequest::Idle => 0,
-            WriteRequest::Put { key, value, .. } => (key.len() + value.len() + 8) as u64,
-            WriteRequest::Batch { ops, .. } => ops.iter().map(batch_op_wal_bytes).sum(),
-            WriteRequest::Txn(_) => 0,
+            Ops::None => 0,
+            Ops::Put { key, value } => (key.len() + value.len() + 8) as u64,
+            Ops::Batch(ops) => ops.iter().map(batch_op_wal_bytes).sum(),
         }
     }
 
-    pub(super) fn encode_wal(&self, out: &mut Vec<u8>, base_seq: u64) {
+    /// Append the operations to `out` as a record's payload, the first of
+    /// them at `base_seq`.
+    pub(super) fn encode(&self, out: &mut Vec<u8>, base_seq: u64) {
         match self {
-            WriteRequest::Idle | WriteRequest::Txn(_) => {}
-            WriteRequest::Put { key, value, .. } => encode_put_record(out, key, value, base_seq),
-            WriteRequest::Batch { ops, .. } => encode_ops_record(out, ops, base_seq),
+            Ops::None => {}
+            Ops::Put { key, value } => encode_put_record(out, key, value, base_seq),
+            Ops::Batch(ops) => encode_ops_record(out, ops, base_seq),
         }
     }
 
-    /// Apply this request's ops to `memtable`, threading `hint` through
-    /// every point op so a key-sorted request needs no head descent
-    /// after its first entry.
-    pub(super) fn apply<'a>(
-        &self,
-        memtable: &'a MemTable,
-        hint: &mut InsertHint<'a>,
-        seq: &mut u64,
-    ) {
+    /// Apply the operations to `memtable`, the first of them at `base_seq`.
+    /// Idempotent: a second application, by this thread or another, adds
+    /// nothing (`engine::skiplist`, S2).
+    pub(super) fn apply(&self, memtable: &MemTable, base_seq: u64) {
+        // One hint per commit: a commit's point ops arrive in key order
+        // (`grouped_batch_ops`), so each insert after the first starts where
+        // the previous one landed.
+        let mut hint = memtable.insert_hint();
         match self {
-            WriteRequest::Idle | WriteRequest::Txn(_) => {}
-            WriteRequest::Put { key, value, .. } => {
-                memtable.put_hinted(hint, key, value, *seq);
-                *seq += 1;
-            }
-            WriteRequest::Batch { ops, .. } => {
-                for op in ops {
-                    apply_batch_op_to_memtable(memtable, hint, op, *seq);
-                    *seq += 1;
+            Ops::None => {}
+            Ops::Put { key, value } => memtable.put_hinted(&mut hint, key, value, base_seq),
+            Ops::Batch(ops) => {
+                for (op, seq) in ops.iter().zip(base_seq..) {
+                    apply_batch_op_to_memtable(memtable, &mut hint, op, seq);
                 }
             }
         }
@@ -190,7 +190,6 @@ pub(super) fn batch_op_memtable_cost(op: &WriteBatchOp) -> usize {
 impl std::fmt::Debug for WriteRequest {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            WriteRequest::Idle => f.write_str("WriteRequest::Idle"),
             WriteRequest::Put {
                 key,
                 value,
@@ -225,6 +224,7 @@ impl std::fmt::Debug for WriteRequest {
 
 #[cfg(test)]
 mod tests {
+    use super::super::super::memtable::MemTableConfig;
     use super::super::super::wal::RecordLen;
     use super::*;
     use proptest::prelude::*;
@@ -247,22 +247,19 @@ mod tests {
     }
 
     #[test]
-    fn op_count_matches_the_sequence_numbers_a_request_consumes() {
-        assert_eq!(WriteRequest::Idle.op_count(), 0);
-        assert_eq!(put(b"k", b"v").op_count(), 1);
+    fn the_count_matches_the_sequence_numbers_a_request_consumes() {
+        assert_eq!(Ops::None.count(), 0);
+        assert_eq!(put(b"k", b"v").ops().count(), 1);
         assert_eq!(
-            WriteRequest::Batch {
-                ops: vec![
-                    WriteBatchOp::Put {
-                        key: b"a".to_vec(),
-                        value: b"1".to_vec()
-                    },
-                    WriteBatchOp::Delete { key: b"b".to_vec() },
-                ],
-                durability: DurabilityMode::Eventual,
-                disable_wal: false,
-            }
-            .op_count(),
+            batch(vec![
+                WriteBatchOp::Put {
+                    key: b"a".to_vec(),
+                    value: b"1".to_vec()
+                },
+                WriteBatchOp::Delete { key: b"b".to_vec() },
+            ])
+            .ops()
+            .count(),
             2
         );
     }
@@ -271,7 +268,7 @@ mod tests {
     fn staged_len_matches_the_bytes_actually_encoded() {
         let request = put(b"key", b"value");
         let mut out = Vec::new();
-        request.encode_wal(&mut out, 7);
+        request.ops().encode(&mut out, 7);
         assert_eq!(out.len(), request.staged_len());
 
         let batch = WriteRequest::Batch {
@@ -289,7 +286,7 @@ mod tests {
             disable_wal: false,
         };
         let mut out = Vec::new();
-        batch.encode_wal(&mut out, 3);
+        batch.ops().encode(&mut out, 3);
         assert_eq!(out.len(), batch.staged_len());
     }
 
@@ -305,73 +302,38 @@ mod tests {
         assert!(request.skips_wal());
     }
 
+    /// Applying a commit's operations twice, as two threads helping one
+    /// slot do, leaves the memtable as one application does.
     #[test]
-    fn a_group_encodes_into_its_reservation_without_reallocating() {
-        // One of each shape `run_group` can stage: a lone put, a
-        // single-op batch (its own record), a multi-op batch (one batch
-        // record covering all four op kinds), an idle slot and a
-        // WAL-disabled put, the two members that stage nothing.
-        let group: Vec<WriteRequest> = vec![
-            put(b"solo", b"value"),
-            batch(vec![WriteBatchOp::Put {
-                key: b"one".to_vec(),
-                value: b"op".to_vec(),
-            }]),
-            batch(vec![
-                WriteBatchOp::Put {
-                    key: b"a".to_vec(),
-                    value: b"1".to_vec(),
-                },
-                WriteBatchOp::Delete { key: b"b".to_vec() },
-                WriteBatchOp::Merge {
-                    key: b"c".to_vec(),
-                    operand: b"2".to_vec(),
-                },
-                WriteBatchOp::DeleteRange {
-                    start: b"d".to_vec(),
-                    end: b"e".to_vec(),
-                },
-            ]),
-            WriteRequest::Idle,
-            WriteRequest::Put {
-                key: b"skipped".to_vec(),
-                value: b"never staged".to_vec(),
-                durability: DurabilityMode::Eventual,
-                disable_wal: true,
+    fn applying_the_same_operations_twice_adds_nothing() {
+        let config = MemTableConfig::default();
+        let once = MemTable::new(&config).unwrap();
+        let twice = MemTable::new(&config).unwrap();
+        let request = batch(vec![
+            WriteBatchOp::Put {
+                key: b"a".to_vec(),
+                value: b"1".to_vec(),
             },
-        ];
-
-        let staged: usize = group.iter().map(WriteRequest::staged_len).sum();
-        let mut stage = Vec::new();
-        stage.reserve_exact(staged);
-        let cap_before = stage.capacity();
-        let ptr_before = stage.as_ptr();
-
-        // The loop `run_group` runs: skip what stages nothing, advance
-        // the sequence by every request's op count regardless.
-        let mut seq = 1u64;
-        for request in &group {
-            if !request.skips_wal() {
-                request.encode_wal(&mut stage, seq);
-            }
-            seq += request.op_count();
-        }
-
+            WriteBatchOp::Merge {
+                key: b"a".to_vec(),
+                operand: b"+".to_vec(),
+            },
+            WriteBatchOp::Delete { key: b"b".to_vec() },
+            WriteBatchOp::DeleteRange {
+                start: b"c".to_vec(),
+                end: b"d".to_vec(),
+            },
+        ]);
+        request.ops().apply(&once, 5);
+        request.ops().apply(&twice, 5);
+        request.ops().apply(&twice, 5);
+        assert_eq!(once.iter_internal(), twice.iter_internal());
         assert_eq!(
-            stage.len(),
-            staged,
-            "the loop must write exactly the reserved length"
+            once.clone_range_tombstones().len(),
+            twice.clone_range_tombstones().len()
         );
-        assert_eq!(
-            stage.capacity(),
-            cap_before,
-            "encoding into an exact reservation must not reallocate"
-        );
-        assert_eq!(
-            stage.as_ptr(),
-            ptr_before,
-            "a stage that did not reallocate keeps its pointer"
-        );
+        assert_eq!(once.approximate_size(), twice.approximate_size());
+        assert_eq!(once.iter_internal().len(), 3);
     }
 
     /// One `WriteBatchOp`, covering every variant with short byte payloads.
@@ -406,7 +368,7 @@ mod tests {
             let staged_len = request.staged_len();
             let mut out = Vec::new();
             out.reserve_exact(staged_len);
-            request.encode_wal(&mut out, 1);
+            request.ops().encode(&mut out, 1);
             prop_assert_eq!(out.len(), staged_len);
             prop_assert_eq!(out.capacity(), staged_len);
             if let WriteRequest::Batch { ops, .. } = &request {

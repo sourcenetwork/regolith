@@ -44,6 +44,7 @@ impl<T> Take<T> {
     }
 
     /// Whether a value is there now.
+    #[cfg(test)]
     pub(crate) fn is_some(&self) -> bool {
         !self.0.load(Ordering::Acquire).is_null()
     }

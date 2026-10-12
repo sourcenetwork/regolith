@@ -1,13 +1,13 @@
-//! Validation outside the pipeline mutex (plan 4.4, `early_check_split` in
+//! Validation ahead of the pipeline (plan 4.4, `early_check_split` in
 //! `GroupCommit.lean`).
 //!
-//! Before a transaction joins a commit group it samples the read horizon `h`
-//! and checks every item of its commit (each read, each validated scan, each
-//! written key) against the versions committed up to `h`, on its own thread
-//! and outside the mutex. Under the mutex the leader then looks only above
-//! `h`: an item nothing landed on above `h` keeps the verdict it had at `h`,
-//! and an item something did land on is checked in full, exactly as a commit
-//! checked alone would check it. Splitting the check at `h` decides as one
+//! Before a transaction takes a slot of the commit ring it samples the read
+//! horizon `h` and checks every item of its commit (each read, each
+//! validated scan, each written key) against the versions committed up to
+//! `h`, on its own thread. Whichever thread then decides its slot looks only
+//! above `h`: an item nothing landed on above `h` keeps the verdict it had
+//! at `h`, and an item something did land on is checked in full, exactly as
+//! a commit checked alone would check it. Splitting the check at `h` decides as one
 //! check of every version does, per item and so for the whole commit.
 //!
 //! Why the split is exact, item by item:
@@ -18,15 +18,17 @@
 //!   If nothing lands on it above `h` either, a check of every version finds
 //!   nothing newer: clean. A blind merge marked as commuting saw only
 //!   operands; with no replacement above `h` it still commutes.
-//! - An item with a newer version is decided under the mutex in full, with
+//! - An item with a newer version is decided in full when the slot is, with
 //!   one exception, a conflict that no later version can undo: a read
 //!   validated by sequence, and a validated scan, conflict with any newer
 //!   version, and a blind merge with any newer replacement, so the
-//!   transaction aborts at once, without queueing (the model's early abort).
+//!   transaction aborts at once, without taking a slot (the model's early
+//!   abort).
 //!   It aborts only when every item before it is clean, so the conflict it
 //!   names is the first one in the commit's order, as a check of every item
-//!   would name it. Every version the view holds was applied, so its group
-//!   committed: the abort sorts after a commit the transaction did not see.
+//!   would name it.
+//!   Every version at or below `h` is of a published commit: the abort
+//!   sorts after a commit the transaction did not see.
 //! - Identical-write elision, value reads and content-addressed puts can be
 //!   undone by a later write of the same bytes, so for them a newer version
 //!   only marks the item for the full check.
@@ -34,8 +36,8 @@
 //! What lands above `h` is found in the memtables alone whenever the
 //! version's `last_seq` is at or below `h`: a flushed or ingested table holds
 //! no sequence above the `last_seq` it raised, so every version above `h` is
-//! still in a memtable the view holds, the group's overlay included. That is
-//! the work left under the mutex: one memtable probe per item.
+//! still in a memtable the view holds. That is the work left for deciding
+//! the slot: one memtable probe per item.
 
 use std::io;
 
@@ -53,11 +55,12 @@ pub(crate) enum Mark {
     Clean,
     /// A blind merge that only operands landed on up to the horizon.
     Commuted,
-    /// A newer version the full check under the mutex has to judge.
+    /// A newer version the full check, made when the slot is decided, has
+    /// to judge.
     Dirty,
 }
 
-/// The check at the horizon, carried into the commit group.
+/// The check at the horizon, carried into the commit's slot.
 #[derive(Debug)]
 pub(crate) struct Early {
     /// The read horizon the check ran at.
@@ -77,7 +80,7 @@ impl Early {
 }
 
 /// The early check's answer: a conflict found at the horizon, or the marks
-/// the leader finishes from.
+/// the slot's decision finishes from.
 pub(crate) enum EarlyVerdict {
     Conflict(Conflict),
     Marks(Early),
@@ -107,9 +110,9 @@ impl Marker {
 
 impl RegolithEngine {
     /// Check `checks` and `ops` against the versions committed up to the
-    /// current read horizon, outside the pipeline mutex. Returns the conflict
-    /// that settles the commit at once, or the marks the leader finishes the
-    /// check from.
+    /// current read horizon, before the commit takes a slot. Returns the
+    /// conflict that settles the commit at once, or the marks the slot's
+    /// decision finishes the check from.
     pub(super) fn check_early(
         &self,
         checks: &ValidationSet,

@@ -175,7 +175,7 @@ pub(crate) fn cf_upper_bound(cf_id: u32) -> Vec<u8> {
 }
 
 /// [`cf_upper_bound`] without the allocation, for a comparison on the
-/// commit leader's path.
+/// commit path.
 pub(crate) fn cf_upper_bound_bytes(cf_id: u32) -> [u8; CF_PREFIX_LEN] {
     cf_id.saturating_add(1).to_be_bytes()
 }

@@ -335,7 +335,7 @@ pub trait WriteFile: Send {
     /// always correct. An environment backed by a POSIX file overrides this
     /// with `writev` so a record assembled from a header and a payload costs
     /// one syscall rather than one per piece. That matters on the WAL path,
-    /// which appends a large commit group that way.
+    /// which appends a large record that way when a log is rewritten.
     ///
     /// This is a throughput and syscall-count optimization, NOT an atomicity
     /// guarantee: a vectored write can still be torn by a crash, exactly as a

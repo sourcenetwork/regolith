@@ -110,7 +110,7 @@ struct PipelineFreeDuringFlush {
 impl EventListener for PipelineFreeDuringFlush {
     fn on_flush_completed(&self, _: &FlushJobInfo) {
         if let Some(engine) = self.engine.get().and_then(Weak::upgrade) {
-            let free = engine.pipeline.try_lock().is_some();
+            let free = engine.pipeline_is_idle();
             self.free.lock().unwrap().push(free);
         }
     }

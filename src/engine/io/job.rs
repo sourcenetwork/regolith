@@ -4,8 +4,11 @@
 //! regolith hands every piece of I/O a non-blocking caller owes to the queue
 //! of the thread that asked for it, as a job:
 //!
-//! - a commit group's fsync, which every member of the group waits on, and
-//!   which the first member thread to poll runs (`engine::commit::deferred`);
+//! - a sync round of the commit pipeline, which every commit it covers
+//!   waits on, and which the first of their threads to poll runs
+//!   (`engine::commit::round`); an ordered unit of the pipeline, and the
+//!   decision of a slot left to a thread that may read the device, are jobs
+//!   too (`engine::commit::ordered`, `engine::commit::read_mode`);
 //! - the bounded step of background work a write left owing with no worker,
 //!   on the writing thread's queue (`engine::background_step`);
 //! - the stall a stopped write waits out, which does no work of its own and
@@ -40,7 +43,7 @@ pub(crate) trait JobBody: Send {
     fn run(self: Box<Self>);
     /// Settle the job without running it, when the database closes or the
     /// queue that would have run it is dropped. A job whose work cannot be
-    /// left undone (a commit group's fsync) runs it here instead.
+    /// left undone (a sync round commits wait on) runs it here instead.
     fn release(self: Box<Self>);
 }
 

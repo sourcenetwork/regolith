@@ -45,6 +45,25 @@ pub(crate) use loom::sync::atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering,
 #[cfg(not(loom))]
 pub(crate) use std::sync::atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering, fence};
 
+/// The point between the store and the load of one side of a handshake
+/// built from `SeqCst` accesses, for loom.
+///
+/// Two threads that each store one word and then load the other's ("I am
+/// here" against "it is gone") rely on the one total order C11 gives every
+/// `SeqCst` access of a program: whichever store comes second in that order,
+/// the load after it sees the other store, so at least one side sees the
+/// other. loom does not model that order for accesses, only for
+/// `fence(SeqCst)`, so the handshake fails under loom though it holds in
+/// every real execution. Each side calls this between its store and its
+/// load. Under `--cfg loom` it is a `SeqCst` fence, which gives the model
+/// the order the accesses have; in an ordinary build it is nothing, and the
+/// accesses carry the order themselves.
+#[inline(always)]
+pub(crate) fn seq_cst_handshake() {
+    #[cfg(loom)]
+    fence(Ordering::SeqCst);
+}
+
 #[cfg(loom)]
 use loom::sync as imp;
 #[cfg(not(loom))]

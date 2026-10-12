@@ -31,8 +31,8 @@
 //!   right now.
 //! - **No unit outlives close.** A read checks that the database is open
 //!   when it starts, and close may come between that check and its miss
-//!   (group commit's close flushes and joins its workers after it releases
-//!   the units, while reads still in flight go on). Every miss is counted in
+//!   (close flushes and joins its workers after it releases the units,
+//!   while reads still in flight go on). Every miss is counted in
 //!   one atomic word that close marks with one read-modify-write: a miss
 //!   that starts after the mark answers `Closed`, one under way when the mark
 //!   lands releases its own unit when it ends, and one that ended before it
@@ -46,7 +46,7 @@
 //!   step a write left owing, a foreground job with no worker) is listed in
 //!   the job table here, through the same close gate as a miss, so close
 //!   finds and settles every one ([`IoRuntime::submit`]). A job many queues
-//!   share (a commit group's fsync, a stall) is owned elsewhere, and close
+//!   share (a sync round of the commit pipeline, a stall) is owned elsewhere, and close
 //!   settles it there; a queue only waits on it ([`IoRuntime::wait_on`]).
 //!
 //! `scope` carries a handle's mode to the device seam, `bind` remembers each
@@ -277,7 +277,7 @@ impl IoRuntime {
     }
 
     /// Make `queue`'s owner wait on `job`, which others own (a commit
-    /// group's fsync, a stall). `false` when the queue was dropped.
+    /// pipeline's sync round, a stall). `false` when the queue was dropped.
     pub(crate) fn wait_on(
         &self,
         queue: &QueueShared,

@@ -1,0 +1,901 @@
+//! The stages of the lock-free commit pipeline (plan 4.7;
+//! `proofs/tla/CommitPipeline.tla`, `proofs/lean/Regolith/Pipeline.lean`).
+//!
+//! A commit takes a slot of the ring (`ring.rs`) and then passes five
+//! stages. No stage belongs to a thread: whichever thread reaches a slot
+//! does the slot's next stage, so a thread that stops anywhere in a stage
+//! holds nobody up, and a thread never waits for another thread's turn.
+//!
+//! 1. **Decide**, in ring order. The slot is refused, loses a conflict, or
+//!    takes its sequences, its byte range in the log and its place in the
+//!    memtable's budget, all from the state the slot before it left
+//!    ([`After`]). The decision is installed by one compare-and-swap, and
+//!    every thread proceeds with the installed one. A slot that takes
+//!    nothing takes no sequence and no record, so the log has no hole
+//!    (`NoHole`).
+//! 2. **Apply**, as the last act of deciding and before the next slot is
+//!    decided: the slot's operations go into the memtable, idempotent per
+//!    key and sequence (`engine::skiplist`, S2). The next slot's validation
+//!    therefore reads every commit before it straight from the view. Nothing
+//!    applied is visible to a reader until it is published: a snapshot reads
+//!    at the published horizon.
+//! 3. **Write**, in any order: the slot's record goes to its range of the
+//!    log, the same bytes whichever thread writes them
+//!    (`engine::wal_log`).
+//! 4. **Sync**, one round at a time, each a unit one thread claims with one
+//!    compare-and-swap (D53): the round syncs the written prefix of the log
+//!    and raises the durable offset over it. A log that failed is rolled
+//!    back in the round instead.
+//! 5. **Publish**, in ring order: the read horizon passes a slot once its
+//!    record is written and, at `Immediate` durability, durable
+//!    (`DurableBeforeVisible`). A commit made by a blocking call returns
+//!    then; one made by `commit_nowait` is told on its own queue.
+//!
+//! # What waits, and for what
+//!
+//! A thread never waits for a lock or for another thread to be scheduled. A
+//! blocking call does wait for device I/O that is under way: a sync round
+//! another thread claimed, or an ordered unit (`ordered.rs`) another thread
+//! is running. A call made through `commit_nowait` waits for neither: it
+//! leaves the unit on its queue and returns.
+//!
+//! # Invariants
+//!
+//! - **P1, decisions chain.** The decision of slot `i` is computed from the
+//!   tip, the decision of the newest decided slot that holds one, read
+//!   while `decided == i - 1`. The tip moves to slot `i`'s decision before
+//!   `decided` moves to `i`, so no thread can read a tip older than the slot
+//!   it is deciding against.
+//! - **P2, applied before the next decision.** `decided` passes a slot only
+//!   after its `APPLIED` flag is set.
+//! - **P3, the horizon moves before the frontier.** A publisher raises the
+//!   read horizon to the slot's last sequence and then moves `published`
+//!   past the slot, so a commit that sees itself published can read its own
+//!   writes. Only a slot every thread would call publishable is ever
+//!   published, so a rollback that freezes the frontier in between
+//!   publishes that slot itself rather than discard it.
+//! - **P4, a failure discards a suffix.** A failed log write or sync
+//!   poisons the log, and the rollback (`ordered.rs`), run by the thread
+//!   that holds the round, fails every slot decided and not yet published,
+//!   cuts their records out of the log and their operations out of the
+//!   memtable, and resumes from the published prefix (G2). Nothing
+//!   published is touched. It takes no slot of the ring, so it runs with
+//!   the ring full. It freezes both frontiers, and the state it leaves is
+//!   of a new epoch: a decision a thread was computing from the old state
+//!   carries the old epoch, and its slot is failed when it is settled.
+//! - **P5, helping is bounded.** A thread decides, writes and publishes only
+//!   slots at or below its own (a rollback slot aside), and each at most
+//!   once, so one call does at most a ring's worth of other commits' work
+//!   (E21).
+
+use std::io;
+use std::sync::Arc;
+
+use super::super::RegolithEngine;
+use super::super::callback::InCommit;
+use super::super::io::job::Job;
+use super::super::wal::check_write_len;
+use super::super::wal_frame::KIND_GROUP;
+use super::append::AppendOrder;
+use super::descriptor::{
+    APPLIED, APPLYING, After, DECIDING, Decision, Descriptor, FAILED, INSTALLED, Verdict as Fate,
+    WRITING, WRITTEN, Work, is_immediate,
+};
+use super::hook;
+use super::request::Ops;
+use super::ring::{ArcSlot, Installed, Loaded, Ring};
+use super::round::Round;
+use super::txn::{TxnRequest, Verdict};
+use super::{Settled, WriteRequest};
+use crate::perf_context::{PerfLevel, PerfTimer, PerfTimerField};
+use crate::statistics::{Histogram, Ticker};
+use crate::sync::internal::Arc as RingArc;
+use crate::{Access, WriteBatchOp};
+
+/// The commit pipeline of one database: the ring, the tip and the current
+/// sync round.
+pub(crate) struct Pipeline {
+    pub(super) ring: Ring<Descriptor>,
+    /// The decision of the newest decided slot that holds one (P1).
+    pub(super) tip: ArcSlot<Decision>,
+    /// The round a thread that needs the log durable, or rolled back,
+    /// claims or waits on. Replaced by the thread that ran it, before it
+    /// lands.
+    pub(super) round: ArcSlot<Round>,
+}
+
+impl Pipeline {
+    /// A pipeline with nothing in flight, whose first commit is decided from
+    /// `start`.
+    pub(crate) fn new(
+        capacity: usize,
+        start: After,
+        engine: std::sync::Weak<RegolithEngine>,
+    ) -> Self {
+        let ring = Ring::new(capacity);
+        let genesis = Decision::new(ring.capacity() - 1, Fate::Unit, start);
+        Self {
+            ring,
+            tip: ArcSlot::new(RingArc::new(genesis)),
+            round: ArcSlot::new(Round::new(engine)),
+        }
+    }
+}
+
+/// How far a helping call got.
+pub(super) enum Turn {
+    /// Every slot asked for is decided.
+    Done,
+    /// A unit another thread is running, or one this call may not run, is
+    /// in the way.
+    Blocked(Arc<Job>),
+}
+
+/// How far a publishing call got.
+pub(super) enum Progress {
+    /// Every slot asked for is published.
+    Published,
+    /// The next slot waits for its record to be durable.
+    NeedsSync,
+    /// The log failed, or a rollback is discarding the slots past the
+    /// frontier.
+    Failed,
+    /// The next slot is not decided yet.
+    Undecided,
+}
+
+/// The operations slot `desc` lands, decided as `decision`: the batch
+/// deciding it produced when there is one, else the request's own.
+fn ops_of<'a>(desc: &'a Descriptor, decision: &'a Decision) -> Ops<'a> {
+    if let Some(batch) = &decision.batch {
+        return Ops::Batch(batch);
+    }
+    match &desc.work {
+        Work::Request(request) => request.ops(),
+        Work::Allocate { .. } | Work::Unit { .. } => Ops::None,
+    }
+}
+
+/// Yields a thread gives another before repeating a stage that thread
+/// began, whatever the stage's size.
+const COURTESY_YIELDS: usize = 32;
+
+/// Give the thread already working on a stage about as long as the stage
+/// takes, `size` being a measure of its work, before the caller repeats it;
+/// returns once `done` says the stage is finished or the courtesy ran out.
+///
+/// Helping is what keeps a stopped thread from holding others (P5), but
+/// several threads repeating one stage at once is wasted work, and in the
+/// apply stage wasted memtable bytes. The courtesy is bounded, in yields and
+/// never in time, so a thread that did stop costs each helper a fixed number
+/// of yields and nothing more. A target with one thread has nobody to yield
+/// to.
+fn courtesy(size: usize, done: impl Fn() -> bool) {
+    if !crate::env::PLATFORM_THREADS {
+        return;
+    }
+    for _ in 0..COURTESY_YIELDS.saturating_add(size.saturating_mul(2)) {
+        if done() {
+            return;
+        }
+        std::thread::yield_now();
+    }
+}
+
+std::thread_local! {
+    /// This thread's buffer for the record it is writing, and the length of
+    /// the record before it (`trim_stage`'s one record of hysteresis).
+    static STAGE: std::cell::RefCell<(Vec<u8>, usize)> =
+        const { std::cell::RefCell::new((Vec::new(), 0)) };
+}
+
+/// Test-only: the capacity and the address of this thread's stage buffer.
+#[cfg(test)]
+pub(super) fn stage_buffer() -> (usize, *const u8) {
+    STAGE.with(|stage| {
+        let stage = stage.borrow();
+        (stage.0.capacity(), stage.0.as_ptr())
+    })
+}
+
+impl RegolithEngine {
+    /// The commit pipeline. A database opened read-only has none.
+    pub(super) fn pipe(&self) -> io::Result<&Pipeline> {
+        self.pipeline.as_ref().ok_or_else(Self::read_only_error)
+    }
+
+    /// The pipeline's state after the newest decided slot.
+    pub(crate) fn pipeline_state(&self) -> Option<RingArc<Decision>> {
+        self.pipeline.as_ref().map(|pipe| pipe.tip.load())
+    }
+
+    /// Test-only: whether nothing is in flight in the commit pipeline: every
+    /// slot handed out is decided and published.
+    #[cfg(test)]
+    pub(crate) fn pipeline_is_idle(&self) -> bool {
+        self.pipeline.as_ref().is_none_or(|pipe| {
+            let last = pipe.ring.tail() - 1;
+            pipe.ring.decided() == last && pipe.ring.published() == last
+        })
+    }
+
+    /// Test-only: how many slots the commit ring has handed out.
+    #[cfg(test)]
+    pub(crate) fn pipeline_slots_taken(&self) -> u64 {
+        self.pipeline.as_ref().map_or(0, |pipe| pipe.ring.tail())
+    }
+
+    /// Test-only: the offset the next commit's record goes to in the active
+    /// log.
+    #[cfg(test)]
+    pub(crate) fn log_end(&self) -> u64 {
+        self.pipeline_state().map_or(0, |tip| tip.after.next_off)
+    }
+
+    /// Take a slot for `desc` and install it: reserve an index with one
+    /// atomic add and put the descriptor in its cell, again with a new index
+    /// whenever a helper voided the one in hand. Returns the index.
+    pub(super) fn enter(&self, pipe: &Pipeline, desc: &RingArc<Descriptor>) -> u64 {
+        loop {
+            match self.try_enter(pipe, desc, true) {
+                Ok(index) => return index,
+                // Only a call that may not run a unit hands one back.
+                Err(job) => self.run_or_wait(&job),
+            }
+        }
+    }
+
+    /// [`Self::enter`] for a call that may not wait when `can_run` is unset:
+    /// a full ring then hands back the unit in the way of making room, and
+    /// the reservation is given up. A helper voids it, and the next attempt
+    /// reserves again.
+    pub(super) fn try_enter(
+        &self,
+        pipe: &Pipeline,
+        desc: &RingArc<Descriptor>,
+        can_run: bool,
+    ) -> Result<u64, Arc<Job>> {
+        loop {
+            let index = pipe.ring.reserve();
+            desc.set_index(index);
+            hook::at(hook::Stage::Reserve);
+            loop {
+                match pipe.ring.install(index, desc) {
+                    Installed::Done => {
+                        desc.mark(INSTALLED);
+                        return Ok(index);
+                    }
+                    Installed::Lost => break,
+                    // The ring is full: the slot one lap earlier is not
+                    // published yet, and this thread has no slot of its own
+                    // to wait in.
+                    Installed::Full => self.make_room(pipe, index, can_run)?,
+                }
+            }
+        }
+    }
+
+    /// Finish the slot a full ring's cell still holds for `index`: the one a
+    /// lap earlier. A blocking call brings it through like a commit of its
+    /// own; one that may not wait hands back the unit in the way.
+    fn make_room(&self, pipe: &Pipeline, index: u64, can_run: bool) -> Result<(), Arc<Job>> {
+        let lap = index - pipe.ring.capacity();
+        loop {
+            if pipe.ring.published() >= lap {
+                return Ok(());
+            }
+            if let Turn::Blocked(job) = self.help_decide(pipe, lap, can_run) {
+                if !can_run {
+                    return Err(job);
+                }
+                self.run_or_wait(&job);
+                continue;
+            }
+            match self.publish_upto(pipe, lap) {
+                Progress::Published => return Ok(()),
+                Progress::NeedsSync | Progress::Failed => {
+                    if !can_run {
+                        return Err(Arc::clone(&self.current_round(pipe).job));
+                    }
+                    self.sync_round(pipe);
+                }
+                Progress::Undecided => {}
+            }
+        }
+    }
+
+    /// Run `job` if nobody claimed it, else wait for the thread that did:
+    /// what a blocking call does about a unit in its way. The wait is for
+    /// device I/O under way.
+    pub(super) fn run_or_wait(&self, job: &Arc<Job>) {
+        if job.claim() {
+            self.io().run_job(job);
+        } else {
+            job.wait_landed();
+        }
+    }
+
+    /// Decide every slot up to and including `upto`, in ring order (P1),
+    /// voiding the ones reserved and never installed. With `can_run` unset
+    /// the call runs no unit: one in the way is handed back.
+    pub(super) fn help_decide(&self, pipe: &Pipeline, upto: u64, can_run: bool) -> Turn {
+        loop {
+            let decided = pipe.ring.decided();
+            if decided >= upto {
+                return Turn::Done;
+            }
+            if pipe.ring.is_deciding_frozen() {
+                // A rollback holds the frontier. It runs in the round.
+                let round = self.current_round(pipe);
+                if !can_run {
+                    return Turn::Blocked(Arc::clone(&round.job));
+                }
+                self.run_or_wait(&round.job);
+                continue;
+            }
+            let index = decided + 1;
+            match pipe.ring.load(index) {
+                // Void, or its cell already took a later lap: a void slot
+                // holds nothing, so its cell is not kept for it (R6).
+                Loaded::Void | Loaded::Gone => {
+                    pipe.ring.pass_decided(index);
+                }
+                Loaded::Empty => {
+                    // Reserved, not installed: its owner may have stopped.
+                    // Void it; the owner's install then fails and it
+                    // reserves again.
+                    pipe.ring.void(index);
+                }
+                Loaded::Full => {
+                    // The cell still holds the slot a lap earlier.
+                    match self.publish_upto(pipe, index - pipe.ring.capacity()) {
+                        Progress::Published | Progress::Undecided => {}
+                        Progress::NeedsSync | Progress::Failed => {
+                            let round = self.current_round(pipe);
+                            if !can_run {
+                                return Turn::Blocked(Arc::clone(&round.job));
+                            }
+                            self.run_or_wait(&round.job);
+                        }
+                    }
+                }
+                Loaded::Ready(desc) => {
+                    if desc.decision().is_none() {
+                        // Another thread is deciding it now: it is given
+                        // about as long as the decision takes before this
+                        // thread repeats the work (P5).
+                        if !desc.mark(DECIDING) {
+                            courtesy(desc.work_size(), || desc.decision().is_some());
+                        }
+                        if desc.decision().is_none() {
+                            hook::at(hook::Stage::Decide);
+                            if let Turn::Blocked(job) = self.decide(pipe, index, &desc, can_run) {
+                                return Turn::Blocked(job);
+                            }
+                        }
+                    }
+                    self.settle(pipe, index, &desc);
+                }
+            }
+        }
+    }
+
+    /// Give slot `index` its decision, unless it has one by the time this
+    /// returns or a unit is in the way.
+    fn decide(
+        &self,
+        pipe: &Pipeline,
+        index: u64,
+        desc: &RingArc<Descriptor>,
+        can_run: bool,
+    ) -> Turn {
+        // P1: the tip read here is the state after slot `index - 1` as long
+        // as that slot is still the newest decided one, which is checked
+        // after the read. A decision computed from an older tip loses the
+        // install below to the one that already decided the slot.
+        let mut prev = pipe.tip.load();
+        if !pipe.ring.is_next_to_decide(index) || desc.decision().is_some() {
+            return Turn::Done;
+        }
+        if let Work::Unit { job, .. } = &desc.work {
+            if job.is_done() {
+                // The unit's body ended without deciding the slot: it
+                // unwound. The pipeline goes on from where it was.
+                desc.decide(RingArc::new(Decision::new(
+                    index,
+                    Fate::Unit,
+                    prev.after.clone(),
+                )));
+                return Turn::Done;
+            }
+            if can_run && job.claim() {
+                self.io().run_job(job);
+                return Turn::Done;
+            }
+            return Turn::Blocked(Arc::clone(job));
+        }
+
+        let mut refused = None;
+        // Read after the tip: a tip the check already replaced means its
+        // job was made before, so it is seen here.
+        if desc.turn_job.get().is_some() || self.turn_is_due(desc, &prev.after) {
+            match self.take_turn(index, desc, can_run) {
+                Ok(turned) => refused = turned.refused.as_ref().map(crate::Error::clone_io),
+                Err(job) => return Turn::Blocked(job),
+            }
+            // The check left the state it made, rotated or not, in the tip,
+            // before its job landed.
+            prev = pipe.tip.load();
+            if !pipe.ring.is_next_to_decide(index) {
+                return Turn::Done;
+            }
+        }
+        let base = &prev.after;
+        let decision = match refused {
+            Some(err) => Decision::new(index, Fate::Refused(err), base.clone()),
+            None => match self.decide_reading(index, desc, base) {
+                Ok(decision) => decision,
+                Err(job) => return Turn::Blocked(job),
+            },
+        };
+        if let Fate::Conflict(conflict) = &decision.verdict {
+            let ticker = match conflict.mine() {
+                Access::Put | Access::Delete | Access::Merge => Ticker::CommitConflictsOnWrite,
+                _ => Ticker::CommitConflictsOnRead,
+            };
+            // Counted by the thread whose decision is the slot's (D1).
+            if desc.decide(RingArc::new(decision))
+                && let Some(s) = self.statistics()
+            {
+                s.add(ticker, 1);
+            }
+        } else {
+            desc.decide(RingArc::new(decision));
+        }
+        Turn::Done
+    }
+
+    /// The decision of a write, a transaction or a counter reservation from
+    /// `base`, the pipeline's state before the slot. Pure in what it
+    /// installs: two threads may compute it at once, and the slot keeps one.
+    pub(super) fn decide_work(&self, index: u64, desc: &Descriptor, base: &After) -> Decision {
+        let _commit = InCommit::enter();
+        let refuse = |err: io::Error| Decision::new(index, Fate::Refused(err), base.clone());
+        if base.closed {
+            return refuse(Self::closed_error());
+        }
+        if let Err(err) = self.ensure_writable() {
+            return refuse(err);
+        }
+        let mut decision = Decision::new(index, Fate::Write, base.clone());
+        match &desc.work {
+            Work::Request(request) => {
+                // The column-family fence, before any sequence (`families.rs`).
+                if let Err(err) = self.cf_fence(request) {
+                    return refuse(err);
+                }
+                match request {
+                    WriteRequest::Put {
+                        durability,
+                        disable_wal,
+                        ..
+                    }
+                    | WriteRequest::Batch {
+                        durability,
+                        disable_wal,
+                        ..
+                    } => {
+                        decision.immediate = is_immediate(*durability) && !disable_wal;
+                    }
+                    WriteRequest::Txn(txn) => {
+                        if let Err(err) = self.decide_txn(txn, base, &mut decision) {
+                            return refuse(err);
+                        }
+                        decision.immediate = is_immediate(txn.durability);
+                    }
+                }
+                if matches!(decision.verdict, Fate::Conflict(_)) {
+                    return decision;
+                }
+                let logged = !request.skips_wal();
+                if let Err(err) = Self::take_place(desc, &mut decision, logged) {
+                    return refuse(err);
+                }
+            }
+            Work::Allocate { key, n } => {
+                // Fenced like any write: the counter lives in a family.
+                if let Err(err) = self.cf_fence_keys(std::iter::once(key.as_slice())) {
+                    return refuse(err);
+                }
+                if let Err(err) = self.decide_allocation(key, *n, base, &mut decision) {
+                    return refuse(err);
+                }
+                if let Err(err) = Self::take_place(desc, &mut decision, true) {
+                    return refuse(err);
+                }
+            }
+            Work::Unit { .. } => {}
+        }
+        decision
+    }
+
+    /// Give `decision` its sequences, its record's place and its share of
+    /// the memtable's budget, from the state it already carries. A slot with
+    /// no operations takes nothing.
+    fn take_place(desc: &Descriptor, decision: &mut Decision, logged: bool) -> io::Result<()> {
+        let (ops, payload, cost) = {
+            let ops = ops_of(desc, decision);
+            (ops.count(), ops.payload_len(), ops.memtable_cost())
+        };
+        if ops == 0 {
+            decision.immediate = false;
+            return Ok(());
+        }
+        let after = &mut decision.after;
+        let place = if logged {
+            // The last line of defence for a request that reached the
+            // pipeline without its producer's check.
+            check_write_len(payload)?;
+            Some(after.log.place(after.next_off, payload, after.epoch)?)
+        } else {
+            None
+        };
+        decision.base_seq = after.next_seq;
+        decision.ops = ops;
+        after.next_seq += ops;
+        after.mem_used = after.mem_used.saturating_add(cost);
+        if let Some(place) = &place {
+            after.next_off = place.end();
+        }
+        decision.place = place;
+        Ok(())
+    }
+
+    /// Validate a transaction against the view, which holds every commit
+    /// decided before it (P2), and number its appends. Sets the verdict,
+    /// and the batch when the appends added operations.
+    fn decide_txn(
+        &self,
+        txn: &TxnRequest,
+        base: &After,
+        decision: &mut Decision,
+    ) -> io::Result<()> {
+        let run = || -> io::Result<(Fate, Option<Vec<WriteBatchOp>>)> {
+            let view = self.view.load();
+            let fate = match self.validate(
+                &txn.checks,
+                &txn.ops,
+                &txn.early,
+                &view,
+                base.next_seq.saturating_sub(1),
+            )? {
+                Verdict::Conflict(conflict) => return Ok((Fate::Conflict(conflict), None)),
+                Verdict::Accept {
+                    merges_commuted,
+                    writes_elided,
+                } => Fate::Commit {
+                    merges_commuted,
+                    writes_elided,
+                },
+            };
+            // Positions are taken after validation and never before, so a
+            // commit that aborted took none (RED AssignBeforeValidation).
+            if txn.appends.is_empty() {
+                return Ok((fate, None));
+            }
+            let mut ops = txn.ops.clone();
+            AppendOrder::default().number(self, &view, txn.appends.clone(), &mut ops)?;
+            Ok((fate, Some(ops)))
+        };
+        let decided = if txn.perf == PerfLevel::Disable {
+            run()
+        } else {
+            let (decided, counted) = crate::perf_context::on_behalf(txn.perf, run);
+            decision.perf = Some(counted);
+            decided
+        };
+        match decided {
+            Ok((fate, batch)) => {
+                decision.verdict = fate;
+                decision.batch = batch;
+                Ok(())
+            }
+            Err(err) => {
+                // A caller's code panicked inside the ordered step: the step
+                // it left half done is not one any later write may build on.
+                if let Some(callback) = crate::Error::callback_panic_of(&err) {
+                    self.latch_callback_panic(callback);
+                }
+                Err(err)
+            }
+        }
+    }
+
+    /// Finish deciding slot `index`: apply it, move the tip to its decision
+    /// and pass the decided frontier over it (P1, P2). A decision computed
+    /// from a state a rollback has since discarded lands nothing: its slot
+    /// is failed instead (P4).
+    pub(super) fn settle(&self, pipe: &Pipeline, index: u64, desc: &RingArc<Descriptor>) {
+        let Some(decision) = desc.decision_arc() else {
+            return;
+        };
+        loop {
+            let tip = pipe.tip.load();
+            if tip.index >= decision.index {
+                // Another thread moved the tip here, or a rollback took the
+                // slot in.
+                break;
+            }
+            if tip.after.epoch != decision.after.epoch {
+                // A rollback ran between the tip this decision was computed
+                // from and now. Nothing of the decision is used: its
+                // sequences and its place belong to the state that is gone.
+                desc.mark(FAILED);
+                break;
+            }
+            if decision.commits() && !desc.is(APPLIED) {
+                // Another thread is applying it now: the same courtesy as
+                // for a decision. Two threads applying one slot at once is
+                // harmless, and costs the arena every node that lost its
+                // race.
+                if !desc.mark(APPLYING) {
+                    courtesy(decision.ops as usize, || desc.is(APPLIED));
+                }
+                if !desc.is(APPLIED) {
+                    hook::at(hook::Stage::Apply);
+                    let _perf = PerfTimer::new(PerfTimerField::WriteMemtable);
+                    ops_of(desc, &decision).apply(&decision.after.memtable, decision.base_seq);
+                    desc.mark(APPLIED);
+                }
+            }
+            if pipe.tip.replace(&tip, RingArc::clone(&decision)) {
+                break;
+            }
+        }
+        pipe.ring.pass_decided(index);
+    }
+
+    /// Write slot `desc`'s record at its place, if it has one and it is not
+    /// written yet. Any thread may; all write the same bytes.
+    pub(super) fn write_slot(&self, desc: &Descriptor) {
+        let Some(decision) = desc.decision() else {
+            return;
+        };
+        let Some(place) = &decision.place else {
+            return;
+        };
+        if desc.is(WRITTEN) || desc.is(FAILED) {
+            return;
+        }
+        // Another thread is writing it now: the same courtesy before this
+        // thread writes the same bytes a second time.
+        if !desc.mark(WRITING) {
+            courtesy((place.len / 1024) as usize, || desc.is(WRITTEN));
+            if desc.is(WRITTEN) {
+                return;
+            }
+        }
+        hook::at(hook::Stage::Write);
+        let log = &decision.after.log;
+        let ops = ops_of(desc, decision);
+        let _perf = PerfTimer::new(PerfTimerField::WriteWal);
+        // Through `Env`, not `std::time::Instant`: browsers have a clock but
+        // `Instant::now` panics on `wasm32-unknown-unknown`. Read only when
+        // statistics are on.
+        let start = self.statistics().and_then(|_| self.env.now_micros());
+        let wrote = STAGE.with(|stage| {
+            let mut stage = stage.borrow_mut();
+            let (buf, prev) = &mut *stage;
+            buf.clear();
+            let prefix = log.prefix_len();
+            if buf.try_reserve_exact(place.len as usize).is_err() {
+                return Err(io::Error::new(
+                    io::ErrorKind::OutOfMemory,
+                    format!(
+                        "not enough memory to commit this write ({} bytes pending); retry, splitting any very large write batch",
+                        place.len
+                    ),
+                ));
+            }
+            buf.resize(prefix, 0);
+            ops.encode(buf, decision.base_seq);
+            let wrote = log
+                .finish_record(KIND_GROUP, place, buf)
+                .and_then(|()| log.write_record(place, buf));
+            let used = buf.len();
+            super::trim_stage(buf, *prev, used);
+            *prev = used;
+            wrote
+        });
+        match wrote {
+            Ok(true) => {
+                if desc.mark(WRITTEN)
+                    && let Some(s) = self.statistics()
+                {
+                    s.add(Ticker::WalBytesWritten, ops.reported_bytes());
+                    if let Some(micros) = self.elapsed_micros(start) {
+                        s.record(Histogram::WalWriteTime, micros);
+                    }
+                }
+            }
+            // The commit was discarded by a rollback since it was decided.
+            Ok(false) => {}
+            Err(err) => {
+                tracing::error!(error = %err, "writing a commit to the write-ahead log failed");
+                log.poison(err);
+            }
+        }
+    }
+
+    /// Whether slot `desc` may be published: it takes nothing, or its record
+    /// is written and, when it asked for `Immediate`, durable. A slot is
+    /// applied before it is decided (P2), so that is not asked here.
+    pub(super) fn publishable_slot(desc: &Descriptor, decision: &Decision) -> bool {
+        if !decision.commits() || desc.is(FAILED) {
+            return true;
+        }
+        match &decision.place {
+            None => true,
+            Some(place) => {
+                desc.is(WRITTEN)
+                    && (!decision.immediate || place.end() <= decision.after.log.durable())
+            }
+        }
+    }
+
+    /// Publish every slot up to and including `limit`, in ring order,
+    /// writing the records in the way (P3). Stops at the first slot that is
+    /// not publishable yet and says why.
+    pub(super) fn publish_upto(&self, pipe: &Pipeline, limit: u64) -> Progress {
+        loop {
+            if pipe.ring.is_frozen() {
+                return Progress::Failed;
+            }
+            let published = pipe.ring.published();
+            if published >= limit {
+                return Progress::Published;
+            }
+            let next = published + 1;
+            if next > pipe.ring.decided() {
+                return Progress::Undecided;
+            }
+            match pipe.ring.load(next) {
+                // As when deciding: a void slot, whose cell may have moved
+                // on (R6).
+                Loaded::Void | Loaded::Gone => {
+                    pipe.ring.pass_published(next);
+                }
+                Loaded::Empty | Loaded::Full => return Progress::Undecided,
+                Loaded::Ready(desc) => {
+                    let Some(decision) = desc.decision() else {
+                        return Progress::Undecided;
+                    };
+                    if !Self::publishable_slot(&desc, decision) {
+                        if decision.after.log.is_poisoned() {
+                            return Progress::Failed;
+                        }
+                        if !desc.is(WRITTEN) {
+                            self.write_slot(&desc);
+                            if desc.is(WRITTEN) {
+                                continue;
+                            }
+                            // The write failed, or a rollback discarded the
+                            // slot under it.
+                            return Progress::Failed;
+                        }
+                        return Progress::NeedsSync;
+                    }
+                    hook::at(hook::Stage::Publish);
+                    // P3: the horizon first, then the frontier. A failed
+                    // slot took no sequence that still exists.
+                    if !desc.is(FAILED)
+                        && let Some(last) = decision.last_seq()
+                    {
+                        self.visible_seq.publish(last);
+                    }
+                    if pipe.ring.pass_published(next) {
+                        pipe.ring.retire(next);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Take a slot for a `commit_nowait` commit, if it has none yet, and
+    /// drive it as far as it goes without waiting: `Err` is the unit in its
+    /// way.
+    pub(super) fn advance_nowait(
+        &self,
+        pipe: &Pipeline,
+        desc: &RingArc<Descriptor>,
+    ) -> Result<(), Arc<Job>> {
+        if !desc.is(INSTALLED) {
+            self.try_enter(pipe, desc, false)?;
+        }
+        self.drive_nowait(pipe, desc.index(), desc)
+    }
+
+    /// What `commit_nowait` learns from the pipeline.
+    pub(super) fn drive_nowait(
+        &self,
+        pipe: &Pipeline,
+        index: u64,
+        desc: &RingArc<Descriptor>,
+    ) -> Result<(), Arc<Job>> {
+        loop {
+            if let Turn::Blocked(job) = self.help_decide(pipe, index, false) {
+                return Err(job);
+            }
+            self.write_slot(desc);
+            match self.publish_upto(pipe, index) {
+                Progress::Published => return Ok(()),
+                Progress::NeedsSync | Progress::Failed => {
+                    return Err(Arc::clone(&self.current_round(pipe).job));
+                }
+                Progress::Undecided => {}
+            }
+        }
+    }
+
+    /// Bring slot `index` through every stage and return once it is
+    /// published or discarded: what a blocking commit does. It helps every
+    /// slot before its own, runs the units in its way, and waits only for
+    /// device I/O another thread has under way.
+    pub(super) fn drive(&self, pipe: &Pipeline, index: u64, desc: &RingArc<Descriptor>) {
+        loop {
+            if let Turn::Blocked(job) = self.help_decide(pipe, index, true) {
+                self.run_or_wait(&job);
+                continue;
+            }
+            self.write_slot(desc);
+            match self.publish_upto(pipe, index) {
+                Progress::Published => return,
+                Progress::NeedsSync | Progress::Failed => self.sync_round(pipe),
+                Progress::Undecided => {}
+            }
+        }
+    }
+
+    /// What slot `desc`, published or discarded, tells its owner.
+    pub(super) fn settled(desc: &Descriptor) -> io::Result<Settled> {
+        if desc.is(FAILED) {
+            return Err(desc.failure.take().unwrap_or_else(|| {
+                io::Error::other("the write-ahead log failed and this commit was discarded")
+            }));
+        }
+        let Some(decision) = desc.decision() else {
+            return Err(io::Error::other("a commit finished without a decision"));
+        };
+        let perf = decision.perf.map(Box::new);
+        match &decision.verdict {
+            Fate::Write => Ok(Settled::Write(decision.last_seq().unwrap_or(0))),
+            Fate::Commit {
+                merges_commuted,
+                writes_elided,
+            } => Ok(Settled::Committed {
+                seq: decision.last_seq(),
+                merges_commuted: *merges_commuted,
+                writes_elided: *writes_elided,
+                perf,
+            }),
+            Fate::Conflict(conflict) => Ok(Settled::Conflict {
+                conflict: conflict.clone(),
+                perf,
+            }),
+            Fate::Refused(err) => Err(crate::Error::clone_io(err)),
+            Fate::Allocated(_) | Fate::Unit => Err(io::Error::other(
+                "a commit settled as something that is not a commit",
+            )),
+        }
+    }
+
+    /// Hand `request` to the pipeline and block until it is published, or
+    /// until the pipeline discards it, and return what was decided for it.
+    pub(super) fn commit_through_pipeline(&self, request: WriteRequest) -> io::Result<Settled> {
+        let pipe = self.pipe()?;
+        let desc = RingArc::new(Descriptor::new(Work::Request(request)));
+        let index = self.enter(pipe, &desc);
+        self.drive(pipe, index, &desc);
+        Self::settled(&desc)
+    }
+}
