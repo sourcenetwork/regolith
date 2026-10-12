@@ -53,7 +53,7 @@ fn provider(keys: &Arc<Keys>) -> Option<Arc<dyn KeyProvider>> {
 
 fn fill(db: &Db, from: usize, to: usize) {
     for i in from..to {
-        db.put(&key(i), &value(i)).unwrap();
+        regolith::through_stalls(|| db.put(&key(i), &value(i))).unwrap();
     }
 }
 

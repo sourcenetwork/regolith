@@ -100,7 +100,7 @@ fn files_holding(dir: &Path, needle: &[u8]) -> Vec<PathBuf> {
 
 fn fill(db: &Db, from: usize, to: usize) {
     for i in from..to {
-        db.put(&key(i), &value(i)).unwrap();
+        regolith::through_stalls(|| db.put(&key(i), &value(i))).unwrap();
     }
 }
 
@@ -117,8 +117,8 @@ fn an_encrypted_database_round_trips_and_holds_no_plaintext_on_disk() {
     {
         let db = Db::open(dir.path(), options(&keys)).unwrap();
         fill(&db, 0, 600);
-        db.delete(&key(5)).unwrap();
-        db.delete_range(&key(10), &key(20)).unwrap();
+        regolith::through_stalls(|| db.delete(&key(5))).unwrap();
+        regolith::through_stalls(|| db.delete_range(&key(10), &key(20))).unwrap();
         db.flush().unwrap();
         db.compact_range(None, None).wait().unwrap();
         fill(&db, 600, 700);
@@ -154,9 +154,8 @@ fn merges_fold_plaintext_operands_across_flushes_and_compactions() {
     let keys = Keys::new(&[1]);
     let db = Db::open(dir.path(), options(&keys)).unwrap();
     for round in 0..300i64 {
-        db.merge(b"counter", &round.to_be_bytes()).unwrap();
-        db.put(&key(round as usize), &value(round as usize))
-            .unwrap();
+        regolith::through_stalls(|| db.merge(b"counter", &round.to_be_bytes())).unwrap();
+        regolith::through_stalls(|| db.put(&key(round as usize), &value(round as usize))).unwrap();
         if round % 100 == 99 {
             db.flush().unwrap();
         }
@@ -184,7 +183,7 @@ fn identical_writes_and_value_validated_reads_compare_plaintext_bytes() {
     let dir = TempDir::new().unwrap();
     let keys = Keys::new(&[1]);
     let db = txn_db(dir.path(), &keys);
-    db.db().put(b"version", b"v1").unwrap();
+    regolith::through_stalls(|| db.db().put(b"version", b"v1")).unwrap();
     db.db().flush().unwrap();
 
     // Byte equality: two blind writes of the same bytes, the first flushed
@@ -204,9 +203,9 @@ fn identical_writes_and_value_validated_reads_compare_plaintext_bytes() {
     let reader = db.begin(&TxnOptions::new().isolation(IsolationLevel::DefraLevel));
     assert_eq!(reader.get(b"version").unwrap().as_deref(), Some(&b"v1"[..]));
     reader.put(b"reader-wrote", b"x").unwrap();
-    db.db().put(b"version", b"v2").unwrap();
+    regolith::through_stalls(|| db.db().put(b"version", b"v2")).unwrap();
     db.db().flush().unwrap();
-    db.db().put(b"version", b"v1").unwrap();
+    regolith::through_stalls(|| db.db().put(b"version", b"v1")).unwrap();
     db.db().flush().unwrap();
     reader
         .commit()
@@ -216,7 +215,7 @@ fn identical_writes_and_value_validated_reads_compare_plaintext_bytes() {
     let reader = db.begin(&TxnOptions::new().isolation(IsolationLevel::DefraLevel));
     reader.get(b"version").unwrap();
     reader.put(b"reader-wrote", b"y").unwrap();
-    db.db().put(b"version", b"v3").unwrap();
+    regolith::through_stalls(|| db.db().put(b"version", b"v3")).unwrap();
     db.db().flush().unwrap();
     assert!(matches!(
         reader.commit(),
@@ -246,14 +245,14 @@ fn content_addressed_keys_compare_plaintext_bytes() {
 
     let tx = defra();
     tx.put(b"b/shared", MARKER).unwrap();
-    db.db().put(b"b/shared", MARKER).unwrap();
+    regolith::through_stalls(|| db.db().put(b"b/shared", MARKER)).unwrap();
     db.db().flush().unwrap();
     tx.commit()
         .expect("the same bytes under a content-addressed key");
 
     let tx = defra();
     tx.put(b"b/shared", b"other bytes").unwrap();
-    db.db().put(b"b/shared", MARKER).unwrap();
+    regolith::through_stalls(|| db.db().put(b"b/shared", MARKER)).unwrap();
     db.db().flush().unwrap();
     assert!(matches!(
         tx.commit(),

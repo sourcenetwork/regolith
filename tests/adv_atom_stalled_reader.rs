@@ -31,7 +31,7 @@ fn a_snapshot_read_after_many_publications_still_sees_its_own_instant() {
     let db = open(&dir);
 
     for i in 0..KEYS {
-        db.put(&key(i), format!("stamp{:04}", 0).as_bytes())
+        regolith::through_stalls(|| db.put(&key(i), format!("stamp{:04}", 0).as_bytes()))
             .expect("seed");
     }
     let snap = db.snapshot();
@@ -43,7 +43,7 @@ fn a_snapshot_read_after_many_publications_still_sees_its_own_instant() {
             let mut v = 1u32;
             while !stop.load(Ordering::Acquire) && v <= 60 {
                 for i in 0..KEYS {
-                    db.put(&key(i), format!("stamp{v:04}").as_bytes())
+                    regolith::through_stalls(|| db.put(&key(i), format!("stamp{v:04}").as_bytes()))
                         .expect("put");
                 }
                 db.compact_range(None, None).wait().expect("compact");
@@ -87,7 +87,7 @@ fn an_iterator_outlives_the_compaction_that_unlinks_its_files() {
     let dir = TempDir::new().expect("tempdir");
     let db = open(&dir);
     for i in 0..KEYS {
-        db.put(&key(i), b"v0").expect("seed");
+        regolith::through_stalls(|| db.put(&key(i), b"v0")).expect("seed");
     }
     db.compact_range(None, None).wait().expect("compact");
 
@@ -102,7 +102,7 @@ fn an_iterator_outlives_the_compaction_that_unlinks_its_files() {
 
     for v in 1..=20u32 {
         for i in 0..KEYS {
-            db.put(&key(i), format!("v{v}").as_bytes()).expect("put");
+            regolith::through_stalls(|| db.put(&key(i), format!("v{v}").as_bytes())).expect("put");
         }
         db.compact_range(None, None).wait().expect("compact");
     }

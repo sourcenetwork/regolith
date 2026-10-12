@@ -3525,7 +3525,7 @@ mod tests {
         let payload = vec![0u8; 512];
         for i in 0..32 {
             let key = format!("__flush_{}_{:04}", tag, i);
-            db.put(key.as_bytes(), &payload).unwrap();
+            crate::through_stalls(|| db.put(key.as_bytes(), &payload)).unwrap();
         }
     }
 
@@ -3533,7 +3533,7 @@ mod tests {
         let payload = vec![0u8; 512];
         for i in 0..32 {
             let key = format!("{prefix}_{i:04}");
-            db.put(key.as_bytes(), &payload).unwrap();
+            crate::through_stalls(|| db.put(key.as_bytes(), &payload)).unwrap();
         }
     }
 
@@ -3737,9 +3737,9 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), tiny_flush_opts()).unwrap();
 
-        db.put(b"flushed", b"old").unwrap();
+        crate::through_stalls(|| db.put(b"flushed", b"old")).unwrap();
         force_flush(&db, "drop-all-wal-floor");
-        db.put(b"unflushed", b"old").unwrap();
+        crate::through_stalls(|| db.put(b"unflushed", b"old")).unwrap();
         db.drop_all().unwrap();
         drop(db);
 
@@ -3762,10 +3762,10 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), tiny_flush_opts()).unwrap();
 
-        db.put(b"key", b"v1").unwrap();
+        crate::through_stalls(|| db.put(b"key", b"v1")).unwrap();
         let snap = db.snapshot();
 
-        db.put(b"key", b"v2").unwrap();
+        crate::through_stalls(|| db.put(b"key", b"v2")).unwrap();
         force_flush(&db, "snap");
 
         assert_eq!(snap.get(b"key").unwrap(), Some(b"v1".to_vec()));
@@ -3777,10 +3777,10 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), tiny_flush_opts()).unwrap();
 
-        db.put(b"key", b"v1").unwrap();
+        crate::through_stalls(|| db.put(b"key", b"v1")).unwrap();
         force_flush(&db, "a");
 
-        db.delete(b"key").unwrap();
+        crate::through_stalls(|| db.delete(b"key")).unwrap();
         force_flush(&db, "b");
 
         assert_eq!(db.get(b"key").unwrap(), None);
@@ -3982,13 +3982,13 @@ mod tests {
 
         for i in 0..10 {
             let k = format!("old{:02}", i);
-            db.put(k.as_bytes(), b"old").unwrap();
+            crate::through_stalls(|| db.put(k.as_bytes(), b"old")).unwrap();
         }
         force_flush(&db, "to-l0");
 
         for i in 0..5 {
             let k = format!("new{:02}", i);
-            db.put(k.as_bytes(), b"new").unwrap();
+            crate::through_stalls(|| db.put(k.as_bytes(), b"new")).unwrap();
         }
 
         let items = collect_iter(&db);
@@ -4008,11 +4008,11 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), tiny_flush_opts()).unwrap();
 
-        db.put(b"kept", b"v1").unwrap();
-        db.put(b"gone", b"v1").unwrap();
+        crate::through_stalls(|| db.put(b"kept", b"v1")).unwrap();
+        crate::through_stalls(|| db.put(b"gone", b"v1")).unwrap();
         force_flush(&db, "a");
 
-        db.delete(b"gone").unwrap();
+        crate::through_stalls(|| db.delete(b"gone")).unwrap();
 
         let items = collect_iter(&db);
         let keys: Vec<_> = items.iter().map(|(k, _)| k.clone()).collect();
@@ -4025,9 +4025,9 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), tiny_flush_opts()).unwrap();
 
-        db.put(b"k", b"v1").unwrap();
+        crate::through_stalls(|| db.put(b"k", b"v1")).unwrap();
         force_flush(&db, "a");
-        db.put(b"k", b"v2").unwrap();
+        crate::through_stalls(|| db.put(b"k", b"v2")).unwrap();
 
         let mut it = db.iter();
         it.seek(b"k");
@@ -4134,7 +4134,7 @@ mod tests {
         let db = Db::open(dir.path(), tiny_flush_opts()).unwrap();
 
         for v in 0..10 {
-            db.put(b"k", format!("v{}", v).as_bytes()).unwrap();
+            crate::through_stalls(|| db.put(b"k", format!("v{}", v).as_bytes())).unwrap();
         }
 
         db.compact_range(None, None).wait().unwrap();
@@ -4157,14 +4157,14 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), tiny_flush_opts()).unwrap();
 
-        db.put(b"k", b"v1").unwrap();
-        db.put(b"k", b"v2").unwrap();
-        db.put(b"k", b"v3").unwrap();
+        crate::through_stalls(|| db.put(b"k", b"v1")).unwrap();
+        crate::through_stalls(|| db.put(b"k", b"v2")).unwrap();
+        crate::through_stalls(|| db.put(b"k", b"v3")).unwrap();
         let snap = db.snapshot();
         // `snap` now pins seq=3 - the snapshot sees v3.
 
         for v in 4..10 {
-            db.put(b"k", format!("v{}", v).as_bytes()).unwrap();
+            crate::through_stalls(|| db.put(b"k", format!("v{}", v).as_bytes())).unwrap();
         }
 
         db.compact_range(None, None).wait().unwrap();
@@ -4182,7 +4182,7 @@ mod tests {
         let db = Db::open(dir.path(), tiny_flush_opts()).unwrap();
 
         for v in 0..5 {
-            db.put(b"k", format!("v{}", v).as_bytes()).unwrap();
+            crate::through_stalls(|| db.put(b"k", format!("v{}", v).as_bytes())).unwrap();
         }
 
         {
@@ -4193,7 +4193,7 @@ mod tests {
         assert_eq!(db.engine.oldest_live_seq(), u64::MAX);
 
         for v in 5..10 {
-            db.put(b"k", format!("v{}", v).as_bytes()).unwrap();
+            crate::through_stalls(|| db.put(b"k", format!("v{}", v).as_bytes())).unwrap();
         }
 
         db.compact_range(None, None).wait().unwrap();
@@ -4211,14 +4211,14 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), tiny_flush_opts()).unwrap();
 
-        db.put(b"k", b"v1").unwrap();
-        db.put(b"k", b"v2").unwrap();
+        crate::through_stalls(|| db.put(b"k", b"v1")).unwrap();
+        crate::through_stalls(|| db.put(b"k", b"v2")).unwrap();
         let old_snap = db.snapshot(); // pins seq 2
-        db.put(b"k", b"v3").unwrap();
-        db.put(b"k", b"v4").unwrap();
+        crate::through_stalls(|| db.put(b"k", b"v3")).unwrap();
+        crate::through_stalls(|| db.put(b"k", b"v4")).unwrap();
         let new_snap = db.snapshot(); // pins seq 4
-        db.put(b"k", b"v5").unwrap();
-        db.put(b"k", b"v6").unwrap();
+        crate::through_stalls(|| db.put(b"k", b"v5")).unwrap();
+        crate::through_stalls(|| db.put(b"k", b"v6")).unwrap();
 
         db.compact_range(None, None).wait().unwrap();
 
@@ -4239,10 +4239,10 @@ mod tests {
         let db = Db::open(dir.path(), tiny_flush_opts()).unwrap();
 
         for v in 0..5 {
-            db.put(b"k", format!("v{}", v).as_bytes()).unwrap();
+            crate::through_stalls(|| db.put(b"k", format!("v{}", v).as_bytes())).unwrap();
         }
         let before = db.snapshot();
-        db.delete(b"k").unwrap();
+        crate::through_stalls(|| db.delete(b"k")).unwrap();
 
         db.compact_range(None, None).wait().unwrap();
 
@@ -4264,9 +4264,9 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), tiny_flush_opts()).unwrap();
 
-        db.put(b"k", b"old").unwrap();
+        crate::through_stalls(|| db.put(b"k", b"old")).unwrap();
         let snap = db.snapshot();
-        db.delete_range(b"a", b"z").unwrap();
+        crate::through_stalls(|| db.delete_range(b"a", b"z")).unwrap();
 
         db.compact_range(None, None).wait().unwrap();
 
@@ -4284,10 +4284,12 @@ mod tests {
 
         for i in 0..200 {
             for v in 0..3 {
-                db.put(
-                    format!("k{:03}", i).as_bytes(),
-                    format!("v{}_{}", i, v).as_bytes(),
-                )
+                crate::through_stalls(|| {
+                    db.put(
+                        format!("k{:03}", i).as_bytes(),
+                        format!("v{}_{}", i, v).as_bytes(),
+                    )
+                })
                 .unwrap();
             }
         }
@@ -4330,7 +4332,7 @@ mod tests {
 
         for i in 0..500 {
             let k = format!("k{:04}", i);
-            db.put(k.as_bytes(), format!("v{}", i).as_bytes()).unwrap();
+            crate::through_stalls(|| db.put(k.as_bytes(), format!("v{}", i).as_bytes())).unwrap();
         }
 
         db.compact_range(None, None).wait().unwrap();
@@ -4376,7 +4378,7 @@ mod tests {
 
         for i in 0..200 {
             let k = format!("k{:04}", i);
-            db.put(k.as_bytes(), b"v").unwrap();
+            crate::through_stalls(|| db.put(k.as_bytes(), b"v")).unwrap();
         }
 
         db.compact_range(None, None).wait().unwrap();
@@ -4393,13 +4395,13 @@ mod tests {
 
         // Three disjoint ranges: low (a*), mid (m*), high (z*).
         for i in 0..100 {
-            db.put(format!("a{:03}", i).as_bytes(), b"a").unwrap();
+            crate::through_stalls(|| db.put(format!("a{:03}", i).as_bytes(), b"a")).unwrap();
         }
         for i in 0..100 {
-            db.put(format!("m{:03}", i).as_bytes(), b"m").unwrap();
+            crate::through_stalls(|| db.put(format!("m{:03}", i).as_bytes(), b"m")).unwrap();
         }
         for i in 0..100 {
-            db.put(format!("z{:03}", i).as_bytes(), b"z").unwrap();
+            crate::through_stalls(|| db.put(format!("z{:03}", i).as_bytes(), b"z")).unwrap();
         }
 
         // Only compact the mid range.
@@ -4432,7 +4434,7 @@ mod tests {
         let payload = vec![0u8; 512];
 
         for i in 0..32 {
-            db.put(format!("m{i:04}").as_bytes(), &payload).unwrap();
+            crate::through_stalls(|| db.put(format!("m{i:04}").as_bytes(), &payload)).unwrap();
         }
         force_flush_with_prefix(&db, "m_flush");
 
@@ -4457,11 +4459,11 @@ mod tests {
 
         for i in 0..200 {
             let k = format!("k{:03}", i);
-            db.put(k.as_bytes(), b"v1").unwrap();
+            crate::through_stalls(|| db.put(k.as_bytes(), b"v1")).unwrap();
         }
         for i in 0..200 {
             let k = format!("k{:03}", i);
-            db.put(k.as_bytes(), b"v2").unwrap();
+            crate::through_stalls(|| db.put(k.as_bytes(), b"v2")).unwrap();
         }
 
         db.compact_range(None, None).wait().unwrap();
@@ -4483,7 +4485,7 @@ mod tests {
         const N: usize = 2_000;
         for i in 0..N {
             let k = format!("key_{:05}", i);
-            db.put(k.as_bytes(), b"v").unwrap();
+            crate::through_stalls(|| db.put(k.as_bytes(), b"v")).unwrap();
         }
 
         db.compact_range(None, None).wait().unwrap();
@@ -4503,7 +4505,7 @@ mod tests {
 
         for i in 0..300 {
             let k = format!("k{:04}", i);
-            db.put(k.as_bytes(), b"v").unwrap();
+            crate::through_stalls(|| db.put(k.as_bytes(), b"v")).unwrap();
         }
 
         db.compact_range(None, None).wait().unwrap();
@@ -4530,12 +4532,12 @@ mod tests {
 
         for i in 0..50 {
             let k = format!("k{:02}", i);
-            db.put(k.as_bytes(), b"v").unwrap();
+            crate::through_stalls(|| db.put(k.as_bytes(), b"v")).unwrap();
         }
         // Delete half of them.
         for i in (0..50).step_by(2) {
             let k = format!("k{:02}", i);
-            db.delete(k.as_bytes()).unwrap();
+            crate::through_stalls(|| db.delete(k.as_bytes())).unwrap();
         }
 
         db.compact_range(None, None).wait().unwrap();
@@ -4556,12 +4558,12 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), tiny_flush_opts()).unwrap();
 
-        db.put(b"b", b"old").unwrap();
+        crate::through_stalls(|| db.put(b"b", b"old")).unwrap();
         force_flush_with_prefix(&db, "__old_flush");
         db.compact_range(None, None).wait().unwrap();
 
-        db.delete_range(b"a", b"z").unwrap();
-        db.put(b"m", b"new").unwrap();
+        crate::through_stalls(|| db.delete_range(b"a", b"z")).unwrap();
+        crate::through_stalls(|| db.put(b"m", b"new")).unwrap();
         force_flush_with_prefix(&db, "zz_new_flush");
         db.compact_range(None, None).wait().unwrap();
 
@@ -4574,15 +4576,15 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), tiny_flush_opts()).unwrap();
 
-        db.put(b"b", b"old-left").unwrap();
-        db.put(b"y", b"old-right").unwrap();
+        crate::through_stalls(|| db.put(b"b", b"old-left")).unwrap();
+        crate::through_stalls(|| db.put(b"y", b"old-right")).unwrap();
         db.compact_range(None, None).wait().unwrap();
 
         // A snapshot older than the tombstone holds it at the bottom level,
         // where it would otherwise retire (E27), so the pass writes it out.
         let before = db.snapshot();
-        db.delete_range(b"a", b"z").unwrap();
-        db.put(b"m", b"new").unwrap();
+        crate::through_stalls(|| db.delete_range(b"a", b"z")).unwrap();
+        crate::through_stalls(|| db.put(b"m", b"new")).unwrap();
         db.compact_range(None, None).wait().unwrap();
 
         assert_eq!(db.get(b"b").unwrap(), None);
@@ -4717,10 +4719,10 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), tiny_flush_opts()).unwrap();
 
-        db.put(b"keep", b"v").unwrap();
-        db.put(b"gone", b"v").unwrap();
+        crate::through_stalls(|| db.put(b"keep", b"v")).unwrap();
+        crate::through_stalls(|| db.put(b"gone", b"v")).unwrap();
         force_flush(&db, "x");
-        db.delete(b"gone").unwrap();
+        crate::through_stalls(|| db.delete(b"gone")).unwrap();
 
         let keys: &[&[u8]] = &[b"keep", b"gone"];
         let results = db.multi_get(keys).unwrap();
@@ -4732,12 +4734,12 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), tiny_flush_opts()).unwrap();
 
-        db.put(b"from_l0_1", b"v1").unwrap();
-        db.put(b"from_l0_2", b"v2").unwrap();
+        crate::through_stalls(|| db.put(b"from_l0_1", b"v1")).unwrap();
+        crate::through_stalls(|| db.put(b"from_l0_2", b"v2")).unwrap();
         force_flush(&db, "x");
 
-        db.put(b"from_mem_1", b"v3").unwrap();
-        db.put(b"from_mem_2", b"v4").unwrap();
+        crate::through_stalls(|| db.put(b"from_mem_1", b"v3")).unwrap();
+        crate::through_stalls(|| db.put(b"from_mem_2", b"v4")).unwrap();
 
         let keys: &[&[u8]] = &[b"from_mem_1", b"from_l0_1", b"from_mem_2", b"from_l0_2"];
         let results = db.multi_get(keys).unwrap();
@@ -4781,12 +4783,12 @@ mod tests {
 
         for i in 0..500 {
             let k = format!("k{:04}", i);
-            db.put(k.as_bytes(), format!("v{}", i).as_bytes()).unwrap();
+            crate::through_stalls(|| db.put(k.as_bytes(), format!("v{}", i).as_bytes())).unwrap();
         }
         // Delete some.
         for i in (0..500).step_by(7) {
             let k = format!("k{:04}", i);
-            db.delete(k.as_bytes()).unwrap();
+            crate::through_stalls(|| db.delete(k.as_bytes())).unwrap();
         }
 
         // Snapshot so individual gets and multi_get see the same thing.
@@ -4814,7 +4816,7 @@ mod tests {
         const N: usize = 2_000;
         for i in 0..N {
             let k = format!("key_{:05}", i);
-            db.put(k.as_bytes(), b"v").unwrap();
+            crate::through_stalls(|| db.put(k.as_bytes(), b"v")).unwrap();
         }
 
         let keys_owned: Vec<String> = (0..N).map(|i| format!("key_{:05}", i)).collect();
@@ -4834,10 +4836,10 @@ mod tests {
         for i in 0..30 {
             let key = format!("k{:02}", i);
             let value = format!("v{:02}", i);
-            db.put(key.as_bytes(), value.as_bytes()).unwrap();
+            crate::through_stalls(|| db.put(key.as_bytes(), value.as_bytes())).unwrap();
         }
         force_flush(&db, "base");
-        db.delete_range(b"k10", b"k20").unwrap();
+        crate::through_stalls(|| db.delete_range(b"k10", b"k20")).unwrap();
         db.compact_range(None, None).wait().unwrap();
 
         let version = db.engine.current_version();
@@ -4944,12 +4946,12 @@ mod tests {
 
         for i in 0..20 {
             let k = format!("k{:02}", i);
-            db.put(k.as_bytes(), b"v").unwrap();
+            crate::through_stalls(|| db.put(k.as_bytes(), b"v")).unwrap();
         }
         force_flush(&db, "a");
         for i in 20..30 {
             let k = format!("k{:02}", i);
-            db.put(k.as_bytes(), b"v").unwrap();
+            crate::through_stalls(|| db.put(k.as_bytes(), b"v")).unwrap();
         }
 
         let items = collect_reverse(&db);
@@ -4969,10 +4971,10 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), tiny_flush_opts()).unwrap();
 
-        db.put(b"keep", b"v").unwrap();
-        db.put(b"gone", b"v").unwrap();
+        crate::through_stalls(|| db.put(b"keep", b"v")).unwrap();
+        crate::through_stalls(|| db.put(b"gone", b"v")).unwrap();
         force_flush(&db, "a");
-        db.delete(b"gone").unwrap();
+        crate::through_stalls(|| db.delete(b"gone")).unwrap();
 
         let items = collect_reverse(&db);
         let keys: Vec<_> = items.iter().map(|(k, _)| k.clone()).collect();
@@ -5093,7 +5095,7 @@ mod tests {
             let db = Db::open(dir.path(), opts.clone()).unwrap();
             for i in 0..60u32 {
                 let k = format!("k{:03}", i);
-                db.put(k.as_bytes(), b"v").unwrap();
+                crate::through_stalls(|| db.put(k.as_bytes(), b"v")).unwrap();
             }
             db.close().unwrap();
         }
@@ -5117,11 +5119,11 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), tiny_flush_opts()).unwrap();
 
-        db.put(b"a", b"a1").unwrap();
-        db.put(b"b", b"b1").unwrap();
-        db.put(b"c", b"c1").unwrap();
+        crate::through_stalls(|| db.put(b"a", b"a1")).unwrap();
+        crate::through_stalls(|| db.put(b"b", b"b1")).unwrap();
+        crate::through_stalls(|| db.put(b"c", b"c1")).unwrap();
         force_flush(&db, "x");
-        db.delete(b"b").unwrap();
+        crate::through_stalls(|| db.delete(b"b")).unwrap();
 
         let mut it = db.iter();
         it.seek_for_prev(b"b");
@@ -5141,7 +5143,7 @@ mod tests {
 
         for i in 0..20 {
             let k = format!("pin{:03}", i);
-            db.put(k.as_bytes(), b"v").unwrap();
+            crate::through_stalls(|| db.put(k.as_bytes(), b"v")).unwrap();
         }
         force_flush(&db, "pinned");
 
@@ -5244,9 +5246,9 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), tiny_flush_opts()).unwrap();
         for i in 0..20 {
-            db.put(format!("key_{:02}", i).as_bytes(), b"v").unwrap();
+            crate::through_stalls(|| db.put(format!("key_{:02}", i).as_bytes(), b"v")).unwrap();
         }
-        db.delete_range(b"key_05", b"key_15").unwrap();
+        crate::through_stalls(|| db.delete_range(b"key_05", b"key_15")).unwrap();
         force_flush(&db, "rt");
         for i in 0..20 {
             let key = format!("key_{:02}", i);
@@ -5264,9 +5266,9 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), tiny_flush_opts()).unwrap();
         for i in 0..30 {
-            db.put(format!("key_{:02}", i).as_bytes(), b"v").unwrap();
+            crate::through_stalls(|| db.put(format!("key_{:02}", i).as_bytes(), b"v")).unwrap();
         }
-        db.delete_range(b"key_10", b"key_20").unwrap();
+        crate::through_stalls(|| db.delete_range(b"key_10", b"key_20")).unwrap();
         // Force several flushes + a manual compaction down to L1+.
         for tag in 0..6 {
             force_flush(&db, &format!("c{}", tag));
@@ -5453,7 +5455,7 @@ mod tests {
             let db = Db::open(dir.path(), opts.clone()).unwrap();
             for i in 0..200 {
                 let key = format!("key_{:04}", i);
-                db.put(key.as_bytes(), &payload).unwrap();
+                crate::through_stalls(|| db.put(key.as_bytes(), &payload)).unwrap();
             }
             // Force a flush so reads must go through the SSTable codec path.
             force_flush(&db, "comp");
@@ -5513,7 +5515,7 @@ mod tests {
             let db = Db::open(dir.path(), opts.clone()).unwrap();
             for i in 0..300 {
                 let key = format!("k_{:04}", i);
-                db.put(key.as_bytes(), &payload).unwrap();
+                crate::through_stalls(|| db.put(key.as_bytes(), &payload)).unwrap();
             }
             force_flush(&db, "mix");
             // Push everything down to L1 with the manual compaction path.
@@ -5549,7 +5551,7 @@ mod tests {
             .compression_per_level(Some(vec![CompressionType::None]));
         let db = Db::open(dir.path(), opts).unwrap();
         for i in 0..50 {
-            db.put(format!("k_{i:03}").as_bytes(), b"v").unwrap();
+            crate::through_stalls(|| db.put(format!("k_{i:03}").as_bytes(), b"v")).unwrap();
         }
         force_flush(&db, "fb");
         db.compact_range(None, None).wait().unwrap();
@@ -5638,7 +5640,7 @@ mod tests {
         let payload = vec![b'v'; 512];
         for _round in 0..4 {
             for i in 0..10 {
-                db.put(format!("k{i}").as_bytes(), &payload).unwrap();
+                crate::through_stalls(|| db.put(format!("k{i}").as_bytes(), &payload)).unwrap();
             }
         }
         db.compact_range(None, None).wait().unwrap();
@@ -5666,7 +5668,7 @@ mod tests {
             .compaction_filter(Some(Arc::new(UppercaseValuesFilter)));
         let db = Db::open(dir.path(), opts).unwrap();
         for i in 0..20 {
-            db.put(format!("k{i:02}").as_bytes(), b"hello world")
+            crate::through_stalls(|| db.put(format!("k{i:02}").as_bytes(), b"hello world"))
                 .unwrap();
         }
         // Force enough flushes + manual compaction to run the filter.
@@ -5689,11 +5691,11 @@ mod tests {
             .compaction_filter(Some(Arc::new(UppercaseValuesFilter)));
         let db = Db::open(dir.path(), opts).unwrap();
         for i in 0..20 {
-            db.put(format!("k{i:02}").as_bytes(), b"hello").unwrap();
+            crate::through_stalls(|| db.put(format!("k{i:02}").as_bytes(), b"hello")).unwrap();
         }
         let snap = db.snapshot();
         for i in 0..20 {
-            db.put(format!("k{i:02}").as_bytes(), b"world").unwrap();
+            crate::through_stalls(|| db.put(format!("k{i:02}").as_bytes(), b"world")).unwrap();
         }
         force_flush(&db, "snap_filter");
         db.compact_range(None, None).wait().unwrap();
@@ -5716,9 +5718,9 @@ mod tests {
             .compaction_filter(Some(Arc::new(DropRangeTombstonesFilter)));
         let db = Db::open(dir.path(), opts).unwrap();
         for c in b'a'..=b'f' {
-            db.put(&[c], &[c]).unwrap();
+            crate::through_stalls(|| db.put(&[c], &[c])).unwrap();
         }
-        db.delete_range(b"b", b"e").unwrap();
+        crate::through_stalls(|| db.delete_range(b"b", b"e")).unwrap();
         // Before compaction, the range-delete is honored - no snapshot
         // pinning, so the read path sees the memtable RT directly.
         for c in b'b'..=b'd' {
@@ -5775,7 +5777,7 @@ mod tests {
         let db = Db::open(dir.path(), prefix_opts()).unwrap();
         for i in 0..200 {
             let key = format!("tenant_001:k{:04}", i);
-            db.put(key.as_bytes(), b"v").unwrap();
+            crate::through_stalls(|| db.put(key.as_bytes(), b"v")).unwrap();
         }
         force_flush(&db, "p");
 
@@ -5799,8 +5801,8 @@ mod tests {
         )
         .unwrap();
 
-        db.put(b"aaaa:item", b"v").unwrap();
-        db.put(b"zzzz:item", b"v").unwrap();
+        crate::through_stalls(|| db.put(b"aaaa:item", b"v")).unwrap();
+        crate::through_stalls(|| db.put(b"zzzz:item", b"v")).unwrap();
         force_flush(&db, "long_prefix_probe");
 
         stats.reset();
@@ -5821,13 +5823,13 @@ mod tests {
         let db = Db::open(dir.path(), prefix_opts()).unwrap();
 
         // First generation → flushed to L0.
-        db.put(b"tenant_001:a", b"1a").unwrap();
-        db.put(b"tenant_002:a", b"2a").unwrap();
+        crate::through_stalls(|| db.put(b"tenant_001:a", b"1a")).unwrap();
+        crate::through_stalls(|| db.put(b"tenant_002:a", b"2a")).unwrap();
         force_flush(&db, "p1");
 
         // Second generation → stays in memtable at iteration time.
-        db.put(b"tenant_001:b", b"1b").unwrap();
-        db.put(b"tenant_002:b", b"2b").unwrap();
+        crate::through_stalls(|| db.put(b"tenant_001:b", b"1b")).unwrap();
+        crate::through_stalls(|| db.put(b"tenant_002:b", b"2b")).unwrap();
 
         let mut it = db.iter();
         it.seek_prefix(b"tenant_001");
@@ -5848,9 +5850,9 @@ mod tests {
         let db = Db::open(dir.path(), prefix_opts()).unwrap();
 
         for i in 0..50 {
-            db.put(format!("tenant_001:{:04}", i).as_bytes(), b"v")
+            crate::through_stalls(|| db.put(format!("tenant_001:{:04}", i).as_bytes(), b"v"))
                 .unwrap();
-            db.put(format!("tenant_002:{:04}", i).as_bytes(), b"v")
+            crate::through_stalls(|| db.put(format!("tenant_002:{:04}", i).as_bytes(), b"v"))
                 .unwrap();
         }
         force_flush(&db, "c1");
@@ -5882,13 +5884,13 @@ mod tests {
         let dir = TempDir::new().unwrap();
         {
             let db = Db::open(dir.path(), Options::default().write_buffer_size(4 * 1024)).unwrap();
-            db.put(b"tenant_001:old", b"old").unwrap();
+            crate::through_stalls(|| db.put(b"tenant_001:old", b"old")).unwrap();
             force_flush(&db, "a");
         }
 
         let db = Db::open(dir.path(), prefix_opts()).unwrap();
-        db.put(b"tenant_001:new", b"new").unwrap();
-        db.put(b"tenant_002:new", b"new").unwrap();
+        crate::through_stalls(|| db.put(b"tenant_001:new", b"new")).unwrap();
+        crate::through_stalls(|| db.put(b"tenant_002:new", b"new")).unwrap();
         force_flush(&db, "b");
 
         let mut it = db.iter();
@@ -6146,7 +6148,7 @@ mod tests {
     fn test_merge_counter_basic_chain_of_one() {
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), counter_opts()).unwrap();
-        db.merge(b"counter", &encode_i64(5)).unwrap();
+        crate::through_stalls(|| db.merge(b"counter", &encode_i64(5))).unwrap();
         assert_eq!(db.get(b"counter").unwrap(), Some(encode_i64(5)));
     }
 
@@ -6154,8 +6156,8 @@ mod tests {
     fn test_merge_counter_chain_of_two() {
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), counter_opts()).unwrap();
-        db.put(b"counter", &encode_i64(10)).unwrap();
-        db.merge(b"counter", &encode_i64(3)).unwrap();
+        crate::through_stalls(|| db.put(b"counter", &encode_i64(10))).unwrap();
+        crate::through_stalls(|| db.merge(b"counter", &encode_i64(3))).unwrap();
         assert_eq!(db.get(b"counter").unwrap(), Some(encode_i64(13)));
     }
 
@@ -6163,9 +6165,9 @@ mod tests {
     fn test_merge_counter_chain_of_ten() {
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), counter_opts()).unwrap();
-        db.put(b"counter", &encode_i64(100)).unwrap();
+        crate::through_stalls(|| db.put(b"counter", &encode_i64(100))).unwrap();
         for i in 1..=10 {
-            db.merge(b"counter", &encode_i64(i)).unwrap();
+            crate::through_stalls(|| db.merge(b"counter", &encode_i64(i))).unwrap();
         }
         // 100 + (1+2+...+10) = 155
         assert_eq!(db.get(b"counter").unwrap(), Some(encode_i64(155)));
@@ -6176,7 +6178,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), counter_opts()).unwrap();
         for _ in 0..1000 {
-            db.merge(b"counter", &encode_i64(1)).unwrap();
+            crate::through_stalls(|| db.merge(b"counter", &encode_i64(1))).unwrap();
         }
         assert_eq!(db.get(b"counter").unwrap(), Some(encode_i64(1000)));
     }
@@ -6186,8 +6188,8 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), counter_opts()).unwrap();
         // No put - counter starts at 0 (base=None).
-        db.merge(b"counter", &encode_i64(7)).unwrap();
-        db.merge(b"counter", &encode_i64(5)).unwrap();
+        crate::through_stalls(|| db.merge(b"counter", &encode_i64(7))).unwrap();
+        crate::through_stalls(|| db.merge(b"counter", &encode_i64(5))).unwrap();
         assert_eq!(db.get(b"counter").unwrap(), Some(encode_i64(12)));
     }
 
@@ -6195,7 +6197,7 @@ mod tests {
     fn test_merge_failure_surfaces_key() {
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), counter_opts()).unwrap();
-        db.merge(b"counter", b"not an i64").unwrap();
+        crate::through_stalls(|| db.merge(b"counter", b"not an i64")).unwrap();
 
         let err = db.get(b"counter").unwrap_err();
         match err {
@@ -6208,9 +6210,9 @@ mod tests {
     fn test_merge_snapshot_isolation() {
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), counter_opts()).unwrap();
-        db.put(b"counter", &encode_i64(10)).unwrap();
+        crate::through_stalls(|| db.put(b"counter", &encode_i64(10))).unwrap();
         let snap = db.snapshot();
-        db.merge(b"counter", &encode_i64(5)).unwrap();
+        crate::through_stalls(|| db.merge(b"counter", &encode_i64(5))).unwrap();
         // Live read sees 15; snapshot still sees 10.
         assert_eq!(db.get(b"counter").unwrap(), Some(encode_i64(15)));
         assert_eq!(snap.get(b"counter").unwrap(), Some(encode_i64(10)));
@@ -6220,9 +6222,9 @@ mod tests {
     fn test_merge_survives_flush() {
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), counter_opts()).unwrap();
-        db.put(b"counter", &encode_i64(0)).unwrap();
+        crate::through_stalls(|| db.put(b"counter", &encode_i64(0))).unwrap();
         for i in 1..=20 {
-            db.merge(b"counter", &encode_i64(i)).unwrap();
+            crate::through_stalls(|| db.merge(b"counter", &encode_i64(i))).unwrap();
         }
         // Push past the tiny write buffer so the chain crosses a
         // flush boundary (memtable → L0).
@@ -6235,9 +6237,9 @@ mod tests {
     fn test_merge_survives_compaction_and_collapses() {
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), counter_opts()).unwrap();
-        db.put(b"counter", &encode_i64(0)).unwrap();
+        crate::through_stalls(|| db.put(b"counter", &encode_i64(0))).unwrap();
         for i in 1..=50 {
-            db.merge(b"counter", &encode_i64(i)).unwrap();
+            crate::through_stalls(|| db.merge(b"counter", &encode_i64(i))).unwrap();
         }
         for tag in 0..4 {
             force_flush(&db, &format!("c{tag}"));
@@ -6252,12 +6254,12 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), counter_opts()).unwrap();
         // Value=10, then two merges, then delete, then two more merges.
-        db.put(b"k", &encode_i64(10)).unwrap();
-        db.merge(b"k", &encode_i64(5)).unwrap();
-        db.merge(b"k", &encode_i64(3)).unwrap();
-        db.delete(b"k").unwrap();
-        db.merge(b"k", &encode_i64(7)).unwrap();
-        db.merge(b"k", &encode_i64(1)).unwrap();
+        crate::through_stalls(|| db.put(b"k", &encode_i64(10))).unwrap();
+        crate::through_stalls(|| db.merge(b"k", &encode_i64(5))).unwrap();
+        crate::through_stalls(|| db.merge(b"k", &encode_i64(3))).unwrap();
+        crate::through_stalls(|| db.delete(b"k")).unwrap();
+        crate::through_stalls(|| db.merge(b"k", &encode_i64(7))).unwrap();
+        crate::through_stalls(|| db.merge(b"k", &encode_i64(1))).unwrap();
         // Reads layer the two latest merges on top of the deletion
         // (which resets the base to None → 0): 0 + 7 + 1 = 8.
         assert_eq!(db.get(b"k").unwrap(), Some(encode_i64(8)));
@@ -6267,10 +6269,10 @@ mod tests {
     fn test_merge_range_tombstone_interaction() {
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), counter_opts()).unwrap();
-        db.put(b"k", &encode_i64(10)).unwrap();
-        db.merge(b"k", &encode_i64(5)).unwrap();
-        db.delete_range(b"j", b"l").unwrap(); // hides the base
-        db.merge(b"k", &encode_i64(7)).unwrap();
+        crate::through_stalls(|| db.put(b"k", &encode_i64(10))).unwrap();
+        crate::through_stalls(|| db.merge(b"k", &encode_i64(5))).unwrap();
+        crate::through_stalls(|| db.delete_range(b"j", b"l")).unwrap(); // hides the base
+        crate::through_stalls(|| db.merge(b"k", &encode_i64(7))).unwrap();
         // After the RT, only the latest merge (7) applies to a None base.
         assert_eq!(db.get(b"k").unwrap(), Some(encode_i64(7)));
     }
@@ -6284,7 +6286,7 @@ mod tests {
         batch.merge(b"a", &encode_i64(2));
         batch.merge(b"a", &encode_i64(3));
         batch.put(b"b", &encode_i64(100));
-        db.write(batch).unwrap();
+        crate::through_stalls(|| db.write(batch.clone())).unwrap();
         assert_eq!(db.get(b"a").unwrap(), Some(encode_i64(6)));
         assert_eq!(db.get(b"b").unwrap(), Some(encode_i64(100)));
     }
@@ -6304,11 +6306,11 @@ mod tests {
     fn test_merge_iterator_sees_collapsed_value() {
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), counter_opts()).unwrap();
-        db.put(b"a", &encode_i64(0)).unwrap();
-        db.merge(b"a", &encode_i64(5)).unwrap();
-        db.put(b"b", &encode_i64(100)).unwrap();
-        db.merge(b"b", &encode_i64(10)).unwrap();
-        db.merge(b"b", &encode_i64(2)).unwrap();
+        crate::through_stalls(|| db.put(b"a", &encode_i64(0))).unwrap();
+        crate::through_stalls(|| db.merge(b"a", &encode_i64(5))).unwrap();
+        crate::through_stalls(|| db.put(b"b", &encode_i64(100))).unwrap();
+        crate::through_stalls(|| db.merge(b"b", &encode_i64(10))).unwrap();
+        crate::through_stalls(|| db.merge(b"b", &encode_i64(2))).unwrap();
 
         let pairs = db.scan(None, None).unwrap();
         assert_eq!(
@@ -6324,11 +6326,11 @@ mod tests {
     fn test_merge_iterator_reverse() {
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), counter_opts()).unwrap();
-        db.put(b"a", &encode_i64(0)).unwrap();
-        db.merge(b"a", &encode_i64(1)).unwrap();
-        db.put(b"b", &encode_i64(0)).unwrap();
-        db.merge(b"b", &encode_i64(2)).unwrap();
-        db.merge(b"b", &encode_i64(3)).unwrap();
+        crate::through_stalls(|| db.put(b"a", &encode_i64(0))).unwrap();
+        crate::through_stalls(|| db.merge(b"a", &encode_i64(1))).unwrap();
+        crate::through_stalls(|| db.put(b"b", &encode_i64(0))).unwrap();
+        crate::through_stalls(|| db.merge(b"b", &encode_i64(2))).unwrap();
+        crate::through_stalls(|| db.merge(b"b", &encode_i64(3))).unwrap();
 
         let mut iter = db.iter();
         iter.seek_to_last();
@@ -6351,9 +6353,9 @@ mod tests {
         let dir = TempDir::new().unwrap();
         {
             let db = Db::open(dir.path(), counter_opts()).unwrap();
-            db.put(b"counter", &encode_i64(0)).unwrap();
-            db.merge(b"counter", &encode_i64(7)).unwrap();
-            db.merge(b"counter", &encode_i64(3)).unwrap();
+            crate::through_stalls(|| db.put(b"counter", &encode_i64(0))).unwrap();
+            crate::through_stalls(|| db.merge(b"counter", &encode_i64(7))).unwrap();
+            crate::through_stalls(|| db.merge(b"counter", &encode_i64(3))).unwrap();
             // No close - memtable flush didn't happen; WAL must
             // survive the chain.
         }
@@ -7018,7 +7020,7 @@ mod tests {
         let db = Db::open(dir.path(), opts).unwrap();
         let payload: Vec<u8> = (0..256).map(|i| (i % 251) as u8).collect();
         for i in 0..100 {
-            db.put(format!("k_{i:04}").as_bytes(), &payload).unwrap();
+            crate::through_stalls(|| db.put(format!("k_{i:04}").as_bytes(), &payload)).unwrap();
         }
         force_flush(&db, "sizes");
         let sizes = db.get_approximate_sizes(&[Range::new(b"k_0000", b"k_9999")]);
@@ -7042,7 +7044,7 @@ mod tests {
         let db = Db::open(dir.path(), tiny_flush_opts()).unwrap();
         let payload = vec![0u8; 256];
         for i in 0..200 {
-            db.put(format!("k_{i:04}").as_bytes(), &payload).unwrap();
+            crate::through_stalls(|| db.put(format!("k_{i:04}").as_bytes(), &payload)).unwrap();
         }
         force_flush(&db, "multi");
         let ranges = vec![
@@ -7131,16 +7133,20 @@ mod tests {
         // Seed enough filler to push the tiny 4KB buffer over
         // on the next write.
         for i in 0..16 {
-            db.put_cf(&cf_a, format!("fill_a_{i:02}").as_bytes(), &[0u8; 256])
-                .unwrap();
-            db.put_cf(&cf_b, format!("fill_b_{i:02}").as_bytes(), &[0u8; 256])
-                .unwrap();
+            crate::through_stalls(|| {
+                db.put_cf(&cf_a, format!("fill_a_{i:02}").as_bytes(), &[0u8; 256])
+            })
+            .unwrap();
+            crate::through_stalls(|| {
+                db.put_cf(&cf_b, format!("fill_b_{i:02}").as_bytes(), &[0u8; 256])
+            })
+            .unwrap();
         }
 
         let mut batch = WriteBatch::new();
         batch.put_cf(&cf_a, b"pivot", b"A_PIVOT");
         batch.put_cf(&cf_b, b"pivot", b"B_PIVOT");
-        db.write(batch).unwrap();
+        crate::through_stalls(|| db.write(batch.clone())).unwrap();
         force_flush(&db, "atomic");
 
         assert_eq!(
@@ -7163,7 +7169,7 @@ mod tests {
         let cf_empty = db.create_column_family("empty").unwrap();
 
         for i in 0..50 {
-            db.put_cf(&cf_populated, format!("k{i:02}").as_bytes(), b"v")
+            crate::through_stalls(|| db.put_cf(&cf_populated, format!("k{i:02}").as_bytes(), b"v"))
                 .unwrap();
         }
         force_flush(&db, "empty_mix");
@@ -7178,7 +7184,7 @@ mod tests {
         assert_eq!(db.get_cf(&cf_empty, b"anything").unwrap(), None);
 
         // The empty CF still accepts new writes after the flush.
-        db.put_cf(&cf_empty, b"new", b"fresh").unwrap();
+        crate::through_stalls(|| db.put_cf(&cf_empty, b"new", b"fresh")).unwrap();
         assert_eq!(
             db.get_cf(&cf_empty, b"new").unwrap(),
             Some(b"fresh".to_vec())
@@ -7306,7 +7312,7 @@ mod tests {
         // compact the range so the compaction callbacks fire on
         // the calling thread.
         for i in 0..400 {
-            db.put(format!("k_{i:04}").as_bytes(), b"v").unwrap();
+            crate::through_stalls(|| db.put(format!("k_{i:04}").as_bytes(), b"v")).unwrap();
         }
         force_flush(&db, "listener");
         db.compact_range(None, None).wait().unwrap();
@@ -7414,7 +7420,7 @@ mod tests {
             .listeners(vec![listener.clone() as Arc<dyn EventListener>]);
         let db = Db::open(dir.path(), opts).unwrap();
         for i in 0..400 {
-            db.put(format!("k_{i:04}").as_bytes(), b"v").unwrap();
+            crate::through_stalls(|| db.put(format!("k_{i:04}").as_bytes(), b"v")).unwrap();
         }
         force_flush(&db, "capture");
         db.compact_range(None, None).wait().unwrap();
@@ -7493,7 +7499,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), tiny_flush_stats_opts(stats.clone())).unwrap();
         for i in 0..200 {
-            db.put(format!("k_{i:05}").as_bytes(), b"value").unwrap();
+            crate::through_stalls(|| db.put(format!("k_{i:05}").as_bytes(), b"value")).unwrap();
         }
         force_flush(&db, "cache");
         // Drain any pending compaction before measuring.
@@ -7529,7 +7535,7 @@ mod tests {
         let db = Db::open(dir.path(), tiny_flush_stats_opts(stats.clone())).unwrap();
         for i in 0..200 {
             let even = i * 2;
-            db.put(format!("k_{even:05}").as_bytes(), b"v").unwrap();
+            crate::through_stalls(|| db.put(format!("k_{even:05}").as_bytes(), b"v")).unwrap();
         }
         force_flush(&db, "bloom");
         db.compact_range(None, None).wait().unwrap();
@@ -7554,7 +7560,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), tiny_flush_stats_opts(stats.clone())).unwrap();
         for i in 0..100 {
-            db.put(format!("k_{i:04}").as_bytes(), b"v").unwrap();
+            crate::through_stalls(|| db.put(format!("k_{i:04}").as_bytes(), b"v")).unwrap();
         }
         force_flush(&db, "bloom_pos");
         db.compact_range(None, None).wait().unwrap();
@@ -7575,7 +7581,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), tiny_flush_stats_opts(stats.clone())).unwrap();
         for i in 0..200 {
-            db.put(format!("k_{i:04}").as_bytes(), b"v").unwrap();
+            crate::through_stalls(|| db.put(format!("k_{i:04}").as_bytes(), b"v")).unwrap();
         }
         force_flush(&db, "fcstats");
         db.compact_range(None, None).wait().unwrap();
@@ -7705,7 +7711,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), tiny_flush_opts()).unwrap();
         for i in 0..200 {
-            db.put(format!("k_{i:04}").as_bytes(), b"v").unwrap();
+            crate::through_stalls(|| db.put(format!("k_{i:04}").as_bytes(), b"v")).unwrap();
         }
         force_flush(&db, "props");
         // At this point we expect some L0 files.
@@ -7730,7 +7736,7 @@ mod tests {
             Some(0)
         );
         for i in 0..100 {
-            db.put(format!("k_{i:04}").as_bytes(), b"v").unwrap();
+            crate::through_stalls(|| db.put(format!("k_{i:04}").as_bytes(), b"v")).unwrap();
         }
         force_flush(&db, "size");
         let size = db
@@ -7773,7 +7779,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), tiny_flush_opts()).unwrap();
         for i in 0..100 {
-            db.put(format!("k_{i:04}").as_bytes(), b"v").unwrap();
+            crate::through_stalls(|| db.put(format!("k_{i:04}").as_bytes(), b"v")).unwrap();
         }
         force_flush(&db, "estimate");
         db.compact_range(None, None).wait().unwrap();
@@ -7835,7 +7841,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), tiny_flush_opts()).unwrap();
         for i in 0..50 {
-            db.put(format!("k_{i:03}").as_bytes(), b"v").unwrap();
+            crate::through_stalls(|| db.put(format!("k_{i:03}").as_bytes(), b"v")).unwrap();
         }
         force_flush(&db, "ssts");
         let text = db.get_property("regolith.sstables").unwrap();
@@ -7852,7 +7858,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), tiny_flush_opts()).unwrap();
         for i in 0..20 {
-            db.put(format!("k_{i:03}").as_bytes(), b"v").unwrap();
+            crate::through_stalls(|| db.put(format!("k_{i:03}").as_bytes(), b"v")).unwrap();
         }
         force_flush(&db, "lvl");
         let text = db.get_property("regolith.levelstats").unwrap();
@@ -7907,14 +7913,14 @@ mod tests {
         for i in 0..2048 {
             let k = format!("k{i:06}");
             let v = format!("v{i}");
-            db.put(k.as_bytes(), v.as_bytes()).unwrap();
+            crate::through_stalls(|| db.put(k.as_bytes(), v.as_bytes())).unwrap();
             expected.insert(k, v);
         }
         // Overwrite a window to exercise dedup across workers.
         for i in 100..300 {
             let k = format!("k{i:06}");
             let v = format!("v{i}-new");
-            db.put(k.as_bytes(), v.as_bytes()).unwrap();
+            crate::through_stalls(|| db.put(k.as_bytes(), v.as_bytes())).unwrap();
             expected.insert(k, v);
         }
 
@@ -7944,7 +7950,7 @@ mod tests {
         let db = Db::open(dir.path(), opts).unwrap();
         for i in 0..500 {
             let k = format!("k{i:04}");
-            db.put(k.as_bytes(), b"v").unwrap();
+            crate::through_stalls(|| db.put(k.as_bytes(), b"v")).unwrap();
         }
         db.compact_range(None, None).wait().unwrap();
         for i in 0..500 {
@@ -7967,7 +7973,7 @@ mod tests {
         for i in 0..500 {
             let k = format!("k{i:04}");
             let v = format!("v{i}");
-            db.put(k.as_bytes(), v.as_bytes()).unwrap();
+            crate::through_stalls(|| db.put(k.as_bytes(), v.as_bytes())).unwrap();
         }
         db.compact_range(None, None).wait().unwrap();
 
@@ -7996,7 +8002,7 @@ mod tests {
             for i in 0..200 {
                 let k = format!("k{i:04}");
                 let v = format!("v{i}");
-                db.put(k.as_bytes(), v.as_bytes()).unwrap();
+                crate::through_stalls(|| db.put(k.as_bytes(), v.as_bytes())).unwrap();
             }
             db.compact_range(None, None).wait().unwrap();
             db.scan(None, None).unwrap()
@@ -8017,7 +8023,7 @@ mod tests {
             let db = Db::open(dir.path(), opts.clone()).unwrap();
             for i in 0..200 {
                 let k = format!("k{i:04}");
-                db.put(k.as_bytes(), b"v").unwrap();
+                crate::through_stalls(|| db.put(k.as_bytes(), b"v")).unwrap();
             }
             db.compact_range(None, None).wait().unwrap();
         }
@@ -8042,7 +8048,7 @@ mod tests {
             let db = Db::open(dir.path(), opts).unwrap();
             for i in 0..100 {
                 let k = format!("k{i:04}");
-                db.put(k.as_bytes(), b"v1").unwrap();
+                crate::through_stalls(|| db.put(k.as_bytes(), b"v1")).unwrap();
             }
             db.compact_range(None, None).wait().unwrap();
         }
@@ -8054,7 +8060,7 @@ mod tests {
             let db = Db::open(dir.path(), opts).unwrap();
             for i in 100..200 {
                 let k = format!("k{i:04}");
-                db.put(k.as_bytes(), b"v2").unwrap();
+                crate::through_stalls(|| db.put(k.as_bytes(), b"v2")).unwrap();
             }
             // Don't compact - leave V1 files at lower levels and
             // V2 files in L0/L1.
@@ -8087,13 +8093,13 @@ mod tests {
             .map(|i| (format!("k{i:06}"), format!("v{i}")))
             .collect();
         for (k, v) in &expected {
-            db.put(k.as_bytes(), v.as_bytes()).unwrap();
+            crate::through_stalls(|| db.put(k.as_bytes(), v.as_bytes())).unwrap();
         }
         // Overwrite a window to exercise dedup across input files.
         for i in 100..200 {
             let k = format!("k{i:06}");
             let v = format!("v{i}-new");
-            db.put(k.as_bytes(), v.as_bytes()).unwrap();
+            crate::through_stalls(|| db.put(k.as_bytes(), v.as_bytes())).unwrap();
         }
 
         db.compact_range(None, None).wait().unwrap();
@@ -8126,7 +8132,7 @@ mod tests {
         let db = Db::open(dir.path(), opts).unwrap();
         for i in 0..256 {
             let k = format!("k{i:04}");
-            db.put(k.as_bytes(), b"v").unwrap();
+            crate::through_stalls(|| db.put(k.as_bytes(), b"v")).unwrap();
         }
         db.compact_range(None, None).wait().unwrap();
         for i in 0..256 {
@@ -8147,7 +8153,7 @@ mod tests {
         let db = Db::open(dir.path(), opts).unwrap();
         for i in 0..32 {
             let k = format!("k{i:02}");
-            db.put(k.as_bytes(), b"v").unwrap();
+            crate::through_stalls(|| db.put(k.as_bytes(), b"v")).unwrap();
         }
         db.compact_range(None, None).wait().unwrap();
         for i in 0..32 {
@@ -8217,13 +8223,13 @@ mod tests {
         for i in 0..128 {
             let k = format!("k{i:04}");
             let v = format!("v{i}");
-            db.put(k.as_bytes(), v.as_bytes()).unwrap();
+            crate::through_stalls(|| db.put(k.as_bytes(), v.as_bytes())).unwrap();
         }
         // Overwrite a few so dedup runs through the hint path.
         for i in 0..32 {
             let k = format!("k{i:04}");
             let v = format!("v{i}-new");
-            db.put(k.as_bytes(), v.as_bytes()).unwrap();
+            crate::through_stalls(|| db.put(k.as_bytes(), v.as_bytes())).unwrap();
         }
         db.compact_range(None, None).wait().unwrap();
 
@@ -8256,14 +8262,14 @@ mod tests {
         for i in 0..64 {
             let k = format!("k{i:04}");
             let v = format!("v{i}");
-            db.put(k.as_bytes(), v.as_bytes()).unwrap();
+            crate::through_stalls(|| db.put(k.as_bytes(), v.as_bytes())).unwrap();
         }
         // Overwrite the first 16 keys so dedup has to pick the
         // newest version during the merge.
         for i in 0..16 {
             let k = format!("k{i:04}");
             let v = format!("v{i}-updated");
-            db.put(k.as_bytes(), v.as_bytes()).unwrap();
+            crate::through_stalls(|| db.put(k.as_bytes(), v.as_bytes())).unwrap();
         }
 
         db.compact_range(None, None).wait().unwrap();
@@ -8296,7 +8302,7 @@ mod tests {
         let db = Db::open(dir.path(), opts).unwrap();
         for i in 0..64 {
             let k = format!("k{i:04}");
-            db.put(k.as_bytes(), &vec![0xCC; 256]).unwrap();
+            crate::through_stalls(|| db.put(k.as_bytes(), &vec![0xCC; 256])).unwrap();
         }
         db.compact_range(None, None).wait().unwrap();
         std::thread::sleep(std::time::Duration::from_millis(100));
@@ -8322,7 +8328,7 @@ mod tests {
         let db = Db::open(dir.path(), opts).unwrap();
         for i in 0..32 {
             let k = format!("k{i:04}");
-            db.put(k.as_bytes(), &vec![0xAA; 512]).unwrap();
+            crate::through_stalls(|| db.put(k.as_bytes(), &vec![0xAA; 512])).unwrap();
         }
         // Give the background scheduler a moment to potentially
         // kick off work, then force-merge synchronously.
@@ -8357,7 +8363,7 @@ mod tests {
         let payload = vec![0xEEu8; 256];
         for i in 0..256 {
             let k = format!("k{i:06}");
-            db.put(k.as_bytes(), &payload).unwrap();
+            crate::through_stalls(|| db.put(k.as_bytes(), &payload)).unwrap();
         }
 
         // Give the background compaction thread a moment to
@@ -8401,7 +8407,7 @@ mod tests {
         let db = Db::open(dir.path(), opts).unwrap();
         for i in 0..32 {
             let k = format!("k{i:04}");
-            db.put(k.as_bytes(), &vec![0xAA; 512]).unwrap();
+            crate::through_stalls(|| db.put(k.as_bytes(), &vec![0xAA; 512])).unwrap();
         }
         std::thread::sleep(std::time::Duration::from_millis(200));
         db.compact_range(None, None).wait().unwrap();
@@ -8430,7 +8436,7 @@ mod tests {
         let db = Db::open(dir.path(), opts).unwrap();
         for i in 0..64 {
             let k = format!("k{i:04}");
-            db.put(k.as_bytes(), &vec![0xBB; 256]).unwrap();
+            crate::through_stalls(|| db.put(k.as_bytes(), &vec![0xBB; 256])).unwrap();
         }
         std::thread::sleep(std::time::Duration::from_millis(200));
 
@@ -8490,7 +8496,7 @@ mod tests {
 
         for i in 0..16 {
             let k = format!("log/{i:04}");
-            db.put(k.as_bytes(), &vec![0xAA; 256]).unwrap();
+            crate::through_stalls(|| db.put(k.as_bytes(), &vec![0xAA; 256])).unwrap();
         }
 
         let mut tail = db.iter_tailing();
@@ -8508,7 +8514,7 @@ mod tests {
         db.compact_range(None, None).wait().unwrap();
         for i in 16..32 {
             let k = format!("log/{i:04}");
-            db.put(k.as_bytes(), &vec![0xBB; 256]).unwrap();
+            crate::through_stalls(|| db.put(k.as_bytes(), &vec![0xBB; 256])).unwrap();
         }
 
         tail.refresh();
@@ -8599,7 +8605,7 @@ mod tests {
         let payload = vec![0xABu8; 256];
         for i in 0..200 {
             let k = format!("k{i:04}");
-            db.put(k.as_bytes(), &payload).unwrap();
+            crate::through_stalls(|| db.put(k.as_bytes(), &payload)).unwrap();
         }
         // Force a flush so the reads below have to touch SST blocks.
         db.compact_range(None, None).wait().unwrap();
@@ -8735,7 +8741,7 @@ mod tests {
         let payload = vec![0xCDu8; 600];
         for i in 0..64 {
             let k = format!("k{i:04}");
-            db.put(k.as_bytes(), &payload).unwrap();
+            crate::through_stalls(|| db.put(k.as_bytes(), &payload)).unwrap();
         }
         // The worker writes the sealed memtables out off the commit path;
         // the writes after that run under the slowdown.
@@ -8746,7 +8752,7 @@ mod tests {
         );
         for i in 64..128 {
             let k = format!("k{i:04}");
-            db.put(k.as_bytes(), &payload).unwrap();
+            crate::through_stalls(|| db.put(k.as_bytes(), &payload)).unwrap();
         }
         assert_eq!(
             stats.get_ticker(Ticker::WriteStallMicros),
@@ -8772,7 +8778,7 @@ mod tests {
         let payload = vec![0xEFu8; 600];
         for i in 0..64 {
             let k = format!("k{i:04}");
-            db.put(k.as_bytes(), &payload).unwrap();
+            crate::through_stalls(|| db.put(k.as_bytes(), &payload)).unwrap();
         }
         wait_for_l0_files(&db, 2);
 
@@ -8817,7 +8823,7 @@ mod tests {
         };
         for i in 0..32 {
             let k = format!("fill{i:04}");
-            db.put(k.as_bytes(), &payload).unwrap();
+            crate::through_stalls(|| db.put(k.as_bytes(), &payload)).unwrap();
             if l0() + db.engine.frozen_memtables() as u64 >= 2 {
                 break;
             }
@@ -8840,7 +8846,7 @@ mod tests {
             "the clearing compaction completed the wait"
         );
 
-        db.put(b"stopkey", b"stopval").unwrap();
+        crate::through_stalls(|| db.put(b"stopkey", b"stopval")).unwrap();
         assert_eq!(db.get(b"stopkey").unwrap(), Some(b"stopval".to_vec()));
     }
 
@@ -8859,7 +8865,7 @@ mod tests {
         let payload = vec![0xABu8; 1024];
         for i in 0..256 {
             let k = format!("k{i:06}");
-            db.put(k.as_bytes(), &payload).unwrap();
+            crate::through_stalls(|| db.put(k.as_bytes(), &payload)).unwrap();
         }
 
         let start = Instant::now();

@@ -167,7 +167,7 @@ fn an_open_that_dismissed_a_zero_length_orphan_converges_over_repeated_reopens()
         }
         let k = format!("cycle_{cycle:03}").into_bytes();
         let v = format!("value_{cycle:03}").into_bytes();
-        d.put(&k, &v).expect("put");
+        regolith::through_stalls(|| d.put(&k, &v)).expect("put");
         extra.push((k, v));
         d.close().expect("close");
         drop(d);

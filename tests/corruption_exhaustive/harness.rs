@@ -209,7 +209,8 @@ pub fn table_fixture() -> &'static Fixture {
         let handle = Db::open(&db, opts).expect("table fixture: open");
         for i in 0..KEYS {
             let (k, v) = (format!("key_{i:04}"), format!("value_{i:04}"));
-            handle.put(k.as_bytes(), v.as_bytes()).expect("fixture put");
+            regolith::through_stalls(|| handle.put(k.as_bytes(), v.as_bytes()))
+                .expect("fixture put");
             history.put(k.into_bytes(), v.into_bytes());
         }
         handle

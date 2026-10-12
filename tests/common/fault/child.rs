@@ -861,8 +861,8 @@ pub fn builtin_workload(spec: &ChildSpec) {
         let group = &ops[i..end];
         let result = if group.len() == 1 {
             match &group[0].value {
-                OpValue::Put(v) => db.put(&group[0].key, v),
-                OpValue::Delete => db.delete(&group[0].key),
+                OpValue::Put(v) => regolith::through_stalls(|| db.put(&group[0].key, v)),
+                OpValue::Delete => regolith::through_stalls(|| db.delete(&group[0].key)),
             }
         } else {
             let mut wb = WriteBatch::new();
@@ -872,7 +872,7 @@ pub fn builtin_workload(spec: &ChildSpec) {
                     OpValue::Delete => wb.delete(&op.key),
                 }
             }
-            db.write(wb)
+            regolith::through_stalls(|| db.write(wb.clone()))
         };
         result.expect("child: write failed");
         acker.ack(i..end);
