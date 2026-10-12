@@ -17,6 +17,8 @@
 //! entries flow through compaction, any whose embedded timestamp is
 //! older than the TTL is dropped.
 
+mod merge;
+
 use crate::env::Env;
 use std::path::Path;
 use std::sync::Arc;
@@ -64,6 +66,18 @@ impl DbWithTtl {
     /// without the timestamp the database keeps behind it, and a value it
     /// changes keeps the time it was written at. Its range deletes reach
     /// it unchanged.
+    ///
+    /// A [`crate::MergeOperator`] the caller set is shown the base and the
+    /// operands the caller wrote, without their timestamps. A merge in
+    /// [`DbWithTtl::write`] is a write, stamped like a put: it gives the
+    /// value a new TTL, and what the operator returns expires with the
+    /// newest write it folded. What had already expired when a merge was
+    /// written is not folded into it: the merge starts the value over, as a
+    /// put would. Operands are not folded ahead of their base
+    /// ([`crate::MergeOperator::partial_merge`] is not asked). One limit:
+    /// a compaction that meets an expired value without the newer merge
+    /// that renewed it (the merge sits in a table the compaction does not
+    /// read) removes the value, and the merge then starts the value over.
     pub fn open<P: AsRef<Path>>(path: P, mut opts: Options, ttl_seconds: u64) -> Result<Self> {
         // Every value carries a wall-clock stamp, so an environment
         // without a wall clock cannot serve this wrapper at all. Say
@@ -80,6 +94,12 @@ impl DbWithTtl {
             env: Arc::clone(&env),
             callers: opts.compaction_filter.take(),
         }));
+        if let Some(callers) = opts.merge_operator.take() {
+            opts.merge_operator = Some(Arc::new(merge::TtlMergeOperator {
+                callers,
+                ttl_seconds,
+            }));
+        }
         let inner = Db::open(path, opts)?;
         Ok(Self {
             inner,
@@ -170,8 +190,9 @@ impl DbWithTtl {
     }
 
     /// Apply a batch of point writes atomically. Each `put` in the
-    /// batch gets its value stamped with the current timestamp; each
-    /// `delete` is passed through unchanged.
+    /// batch gets its value stamped with the current timestamp, and so
+    /// does each `merge` operand; each `delete` is passed through
+    /// unchanged.
     ///
     /// The input batch's original contents are consumed and the
     /// stamped/delegated version is applied.
@@ -192,8 +213,10 @@ impl DbWithTtl {
                 WriteBatchOp::DeleteRange { start, end } => {
                     stamped_batch.insert_raw_range_delete(start.clone(), end.clone());
                 }
+                // A merge is a write: its operand carries the time, and a
+                // fold of it expires with the newest write it holds.
                 WriteBatchOp::Merge { key, operand } => {
-                    stamped_batch.insert_raw_merge(key.clone(), operand.clone());
+                    stamped_batch.insert_raw_merge(key.clone(), stamp(operand, ts));
                 }
             }
         }
@@ -331,28 +354,34 @@ impl TtlCompactionFilter {
             callers: None,
         }
     }
+}
 
-    /// Whether a value stamped `ts` has outlived the TTL.
-    fn expired(&self, ts: u64) -> bool {
-        if self.ttl_seconds == 0 {
-            return false;
-        }
-        // No wall clock means nothing can be shown to have expired,
-        // so everything is kept. Dropping data on a guess is the one
-        // outcome this filter must never produce.
-        let Some(now) = self.env.unix_secs() else {
-            return false;
-        };
-        // Saturating arithmetic so a clock skew into the past does
-        // not accidentally expire everything.
-        ts < now.saturating_sub(self.ttl_seconds)
-    }
+/// Whether a value stamped `ts` has outlived `ttl_seconds` by `env`'s wall
+/// clock.
+fn expired(ttl_seconds: u64, env: &dyn Env, ts: u64) -> bool {
+    // No wall clock means nothing can be shown to have expired,
+    // so everything is kept. Dropping data on a guess is the one
+    // outcome this filter must never produce.
+    env.unix_secs()
+        .is_some_and(|now| outlived(ttl_seconds, ts, now))
+}
+
+/// Whether a value stamped `ts` had outlived `ttl_seconds` at `now`: the
+/// test compaction and a merge apply, as a read does. Never with a TTL of
+/// zero.
+fn outlived(ttl_seconds: u64, ts: u64, now: u64) -> bool {
+    // Saturating arithmetic so a clock skew into the past does
+    // not accidentally expire everything.
+    ttl_seconds > 0 && ts < now.saturating_sub(ttl_seconds)
 }
 
 impl CompactionFilter for TtlCompactionFilter {
     fn filter(&self, level: usize, key: &[u8], value: &[u8]) -> CompactionDecision {
         let stamp = decode_ttl_suffix(value);
-        if stamp.as_ref().is_some_and(|s| self.expired(s.timestamp)) {
+        if stamp
+            .as_ref()
+            .is_some_and(|s| expired(self.ttl_seconds, &*self.env, s.timestamp))
+        {
             return CompactionDecision::Remove;
         }
         let Some(callers) = &self.callers else {

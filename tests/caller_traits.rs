@@ -38,3 +38,5 @@ mod names;
 mod rate_limiter;
 #[path = "caller_traits/ttl_filter.rs"]
 mod ttl_filter;
+#[path = "caller_traits/ttl_merge.rs"]
+mod ttl_merge;
