@@ -269,25 +269,35 @@ stress secs="600":
 # Seven of the models are `should_panic` calibrations that deliberately
 # get the ordering wrong; they are what make the passes mean anything.
 
+# Loom is bounded. Every recipe below builds its models first and then runs
+# them under a hard limit of 10 minutes (15 for the nightly twins): a run
+# that hits it fails. A model is sized to finish in under a minute and a
+# recipe in under five, by its scenario and by an explicit preemption bound
+# in its builder, never by `LOOM_MAX_DURATION`, which stops the search and
+# lets the test pass. A model that is shrunk says so in its comment.
 loom:
-    RUSTFLAGS="--cfg loom" cargo test --release --test loom_memtable
+    RUSTFLAGS="--cfg loom" cargo test --release --test loom_memtable --no-run
+    RUSTFLAGS="--cfg loom" timeout 10m cargo test --release --test loom_memtable
 
 loom-debug:
-    RUSTFLAGS="--cfg loom" cargo test --test loom_memtable
+    RUSTFLAGS="--cfg loom" cargo test --test loom_memtable --no-run
+    RUSTFLAGS="--cfg loom" timeout 10m cargo test --test loom_memtable
 
 # Loom models for `regolith::sync`: every primitive's wait protocol,
 # with two calibrations that must fail. Release only: the three-thread
 # models explore 0.2 to 0.5 million interleavings each, which a debug
 # build multiplies several times over.
 loom-sync:
-    RUSTFLAGS="--cfg loom" cargo test --release --test loom_sync
+    RUSTFLAGS="--cfg loom" cargo test --release --test loom_sync --no-run
+    RUSTFLAGS="--cfg loom" timeout 10m cargo test --release --test loom_sync
 
 # Loom models for the per-thread I/O queues (D53): the unit claim, the
 # completion pushed to every waiting queue, the idle waker, and a read's
 # wait, with four calibrations that must fail. Release only, like
 # `loom-sync`: the wait model explores close to 0.8 million interleavings.
 loom-io:
-    RUSTFLAGS="--cfg loom" cargo test --release --test loom_io_queue
+    RUSTFLAGS="--cfg loom" cargo test --release --test loom_io_queue --no-run
+    RUSTFLAGS="--cfg loom" timeout 10m cargo test --release --test loom_io_queue
 
 # Loom models for the per-core read path (Phase 7b): the read view's
 # compare-and-swap publication, its reclamation and its freshness; the
@@ -295,13 +305,16 @@ loom-io:
 # tombstone log's prefix publication, run against the real log. Each has
 # a calibration that must fail.
 loom-view:
-    RUSTFLAGS="--cfg loom" cargo test --release --test loom_read_view
+    RUSTFLAGS="--cfg loom" cargo test --release --test loom_read_view --no-run
+    RUSTFLAGS="--cfg loom" timeout 10m cargo test --release --test loom_read_view
 
 loom-cache:
-    RUSTFLAGS="--cfg loom" cargo test --release --test loom_block_cache
+    RUSTFLAGS="--cfg loom" cargo test --release --test loom_block_cache --no-run
+    RUSTFLAGS="--cfg loom" timeout 10m cargo test --release --test loom_block_cache
 
 loom-tombstones:
-    RUSTFLAGS="--cfg loom" cargo test --release --test loom_range_tombstones
+    RUSTFLAGS="--cfg loom" cargo test --release --test loom_range_tombstones --no-run
+    RUSTFLAGS="--cfg loom" timeout 10m cargo test --release --test loom_range_tombstones
 
 loom-all: loom loom-debug loom-sync loom-io loom-view loom-cache loom-tombstones
 
