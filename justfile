@@ -429,11 +429,14 @@ tla shard="1" shards="1":
     spec=LsmOrder
     check MC_LsmOrder_Green                            GREEN
     check MC_LsmOrder_Red_Intersect                    RED ReadNewest
-    # Flush order, ingest placement, overlap demotion (E14, D13), binary
+    # Flush order, a flush's one publication of its table and its memtable's
+    # retirement (E31), ingest placement, overlap demotion (E14, D13), binary
     # search. Lean: Regolith/LsmOrder.lean, install_oldest_same_order,
+    # flush_keeps_sources_disjoint, split_install_holds_a_memtable_twice,
     # ingest_ordered, demote_reads_newest, level_read_bsearch.
     check MC_LsmOrder_Green_Flush                      GREEN
     check MC_LsmOrder_Red_FlushAnyOrder                RED ReadNewest
+    check MC_LsmOrder_Red_SplitRetire                  RED NoDoubleSource
     check MC_LsmOrder_Green_Ingest                     GREEN
     check MC_LsmOrder_Red_IngestIgnoresUpper           RED ReadNewest
     check MC_LsmOrder_Green_Demote                     GREEN
