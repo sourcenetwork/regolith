@@ -198,7 +198,14 @@ impl JobBody for Foreground {
                 "the I/O queue that would have run this job was dropped before it ran; call again",
             ))
         };
+        let held_a_place = matches!(self.stage, Stage::Admitting(..));
         drop(self.stage);
+        // The gate, handed to the job while it was parked, kept stopped
+        // writers' steps contended: with it given back they look again
+        // (`StallSignal`, relief handed back).
+        if held_a_place && let Some(engine) = self.engine.upgrade() {
+            engine.refresh_stall_level();
+        }
         self.finish.finish(result);
     }
 }
