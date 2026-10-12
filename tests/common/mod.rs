@@ -132,6 +132,10 @@ pub mod parted;
 /// a listener that records the tails an open discards.
 pub mod wal_format;
 
+/// The database 0.1.9 left with an overlapping bottom level, and what it
+/// holds.
+pub mod overlap_fixture;
+
 /// An `Env` that counts SSTable opens and reads, and can hold reads at the
 /// device: what the non-blocking read tests pin.
 pub mod device_env;
