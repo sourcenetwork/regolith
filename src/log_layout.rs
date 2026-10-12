@@ -46,10 +46,15 @@
 ///
 /// # Example
 ///
-/// ```
-/// use regolith::LogLayout;
+/// A log of rows: the head at `journal-head`, and each entry at `journal/`
+/// followed by its position as eight big-endian bytes, so the entries sort
+/// in position order and the key is built without allocating.
 ///
-/// /// Entries at `journal/<20 decimal digits>`, head at `journal-head`.
+/// ```
+/// use std::sync::Arc;
+///
+/// use regolith::{LogLayout, OptimisticTransactionDb, Options, TxnOptions};
+///
 /// struct Journal;
 ///
 /// impl LogLayout for Journal {
@@ -58,13 +63,39 @@
 ///     }
 ///
 ///     fn entry_key(&self, position: u64, out: &mut Vec<u8>) {
-///         out.extend_from_slice(format!("journal/{position:020}").as_bytes());
+///         out.extend_from_slice(b"journal/");
+///         out.extend_from_slice(&position.to_be_bytes());
 ///     }
 ///
 ///     fn max_entry_key_len(&self) -> usize {
-///         "journal/".len() + 20
+///         b"journal/".len() + 8
 ///     }
 /// }
+///
+/// let db = OptimisticTransactionDb::open("journal", Options::memory())?;
+/// let journal: Arc<dyn LogLayout> = Arc::new(Journal);
+///
+/// let first = db.begin(&TxnOptions::new());
+/// first.append(&journal, b"row one", None)?;
+/// first.append(&journal, b"row two", None)?;
+/// first.commit()?;
+/// let second = db.begin(&TxnOptions::new());
+/// second.append(&journal, b"row three", None)?;
+/// second.commit()?;
+///
+/// // A reader takes the head in a snapshot, then every entry up to it:
+/// // positions are dense from 1, in commit order.
+/// let reader = db.db().snapshot();
+/// let head = reader.get(Journal.head_key())?.expect("the log has entries");
+/// let head = u64::from_be_bytes(head.try_into().expect("eight bytes"));
+/// let mut rows = Vec::new();
+/// for position in 1..=head {
+///     let mut key = Vec::new();
+///     Journal.entry_key(position, &mut key);
+///     rows.push(reader.get(&key)?.expect("no position is skipped"));
+/// }
+/// assert_eq!(rows, [&b"row one"[..], b"row two", b"row three"]);
+/// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
 pub trait LogLayout: Send + Sync + 'static {
     /// The key holding the newest assigned position as an 8-byte big-endian

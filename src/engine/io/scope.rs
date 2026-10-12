@@ -19,14 +19,19 @@
 //! under `max_open_files` that finds every slot busy parks on the queue
 //! running the unit instead, and the run sees that it did.
 //!
-//! [`no_wait`] marks the stretch a queue's poll steps a job of the commit
-//! pipeline, which parks instead of waiting for another thread
-//! (`engine::commit::park`). Every place a thread goes to sleep or spins
-//! for another one calls [`waits`] first. A wait inside such a stretch is a
-//! defect: the job should have parked. In a build with debug assertions the
-//! stretch fails when it ends, naming what the wait was for. Not at the
-//! wait itself, which may sit where unwinding is not safe (a section handed
-//! to `engine::step` borrows from the frame that waits for it).
+//! [`no_wait`] marks the stretch a queue's poll steps a job, which parks
+//! instead of waiting for another thread (`engine::commit::park`). Every
+//! path of the engine that waits for another thread calls [`waits`] first:
+//! where a thread goes to sleep or spins for one, and where a call that
+//! chose to block takes something another thread may hold (a round or a
+//! unit in its way, the version store's step, the flush exclusion, the
+//! compaction gate), whether or not anything is in its way this time. So
+//! the check does not depend on a race being lost while a test runs. Such
+//! a path inside the stretch is a defect: the job should have parked. In a
+//! build with debug assertions the stretch fails when it ends, naming the
+//! path. Not at the wait itself, which may sit where unwinding is not safe
+//! (a section handed to `engine::step` borrows from the frame that waits
+//! for it).
 
 use std::cell::{Cell, RefCell};
 use std::num::NonZeroU64;
@@ -66,24 +71,25 @@ impl Drop for NoWait {
             && !std::thread::panicking()
             && let Some(what) = waited
         {
-            panic!("a queue's poll waited for another thread: {what}");
+            panic!("a queue's poll took a path that waits for another thread: {what}");
         }
     }
 }
 
 /// Mark what this thread does until the scope drops as a stretch that must
-/// not wait for another thread: a job of the commit pipeline stepped by a
-/// queue's poll.
+/// not wait for another thread: a job stepped by a queue's poll
+/// (`Job::step`).
 pub(crate) fn no_wait() -> NoWait {
     NoWait {
         previous: NO_WAIT.with(|no_wait| no_wait.replace(true)),
     }
 }
 
-/// This thread is about to wait for another one, for `what`. Inside a
-/// [`no_wait`] stretch that is a defect, noted here and reported when the
-/// stretch ends. A loom model's threads share the host's thread-locals, so
-/// nothing is noted there.
+/// This thread is on a path that waits for another one, for `what`: about
+/// to sleep or spin, or taking, as a call that blocks, something another
+/// thread may hold. Inside a [`no_wait`] stretch that is a defect, noted
+/// here and reported when the stretch ends. A loom model's threads share
+/// the host's thread-locals, so nothing is noted there.
 #[inline]
 pub(crate) fn waits(what: &'static str) {
     if cfg!(all(debug_assertions, not(loom))) && NO_WAIT.with(Cell::get) {

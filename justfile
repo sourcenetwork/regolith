@@ -4,7 +4,7 @@ default:
     @just --list
 
 # Everything CI enforces on every push, in the order it fails fastest.
-gate: fmt lint doc test deny
+gate: fmt lint doc test test-testing deny
 
 fmt:
     cargo fmt --all -- --check
@@ -12,11 +12,17 @@ fmt:
 fmt-fix:
     cargo fmt --all
 
+# The second pass of `lint`, `doc` and `msrv` turns on `testing`: the
+# feature adds `regolith::testing`, which no default build contains, so
+# the default pass never sees it.
+
 lint:
     cargo clippy --workspace --all-targets -- -D warnings
+    cargo clippy -p regolith --all-targets --features testing -- -D warnings
 
 doc:
     RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
+    RUSTDOCFLAGS="-D warnings" cargo doc -p regolith --no-deps --features testing
 
 # nextest, not `cargo test`: each test gets its own process, so a
 # wedged test fails on the profile's slow-timeout instead of holding the
@@ -26,11 +32,19 @@ test:
     cargo nextest run --workspace
     cargo test --workspace --doc
 
+# `regolith::testing` under its feature: the contract checks' own tests,
+# then every doc test again, which adds the ones that call the checks.
+
+test-testing:
+    cargo nextest run -p regolith --features testing --lib testing::
+    cargo test -p regolith --features testing --doc
+
 deny:
     cargo deny check
 
 msrv:
     cargo "+$(grep -m1 '^rust-version' Cargo.toml | cut -d'"' -f2)" check --workspace
+    cargo "+$(grep -m1 '^rust-version' Cargo.toml | cut -d'"' -f2)" check -p regolith --features testing
 
 # The summary line CI annotates a build with.
 # Through nextest, like the gate: one process per test, so a wedged
@@ -345,9 +359,10 @@ loom-tables:
 # helping, the watermark claim, publication, a rollback meeting a decision
 # under way, the step's sections, and parking (a queue's poll never waits:
 # a job its holder parks, a job parked for the step, a rollback parked for
-# a write in flight, the wake of a parked job against its landing), with
-# twelve calibrations that must fail. Twenty-five models, each bounded by a
-# ring of two cells, two or three threads and an explicit preemption bound;
+# a write in flight, the wake of a parked job against its landing and
+# against the claim of the thread that parks it), with thirteen
+# calibrations that must fail. Twenty-seven models, each bounded by a ring
+# of two cells, two or three threads and an explicit preemption bound;
 # measured at 1.3s in all, the largest at 4,214 interleavings. The limit is
 # a hard one: a run that reaches it has failed.
 loom-pipeline:

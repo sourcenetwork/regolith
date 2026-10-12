@@ -190,7 +190,7 @@ impl IoQueue {
     /// [`Options::max_open_files`](crate::Options::max_open_files), a read
     /// that must reopen its table and finds every descriptor in use by reads
     /// running on other threads is not run: it stays pending, and the poll
-    /// goes on (D60). The read that next frees a descriptor tells this queue,
+    /// goes on. The read that next frees a descriptor tells this queue,
     /// waking its owner if it idles, and the poll after that runs it again.
     ///
     /// A timed wait recorded here is completed by the first poll that finds
@@ -201,6 +201,37 @@ impl IoQueue {
     /// Only the thread holding the queue calls this; it is the only place a
     /// wait recorded here is completed. A poll also makes this the calling
     /// thread's queue for the I/O regolith starts itself (see the type docs).
+    ///
+    /// # Example
+    ///
+    /// A read that must not touch the device, and the poll that does its I/O:
+    ///
+    /// ```
+    /// use regolith::{Db, Error, IoBudget, IoProgress, Options, ReadMode, WouldBlock};
+    ///
+    /// let db = Db::open("rows", Options::memory())?;
+    /// db.put(b"row", b"1")?;
+    /// // Flushed to a table whose blocks the cache has not read yet.
+    /// db.flush()?;
+    ///
+    /// let mut queue = db.io_queue();
+    /// let snapshot = db.snapshot().with_read_mode(ReadMode::CacheOnly(queue.id()));
+    ///
+    /// // The read returns at once, and the block it needs is owed to the queue.
+    /// let missed = snapshot.get(b"row");
+    /// assert!(matches!(missed, Err(Error::WouldBlock(WouldBlock::Io(_)))));
+    /// assert!(queue.pending_bytes() > 0);
+    ///
+    /// // The poll reads the block, on this thread.
+    /// let progress = queue.poll(IoBudget::ALL);
+    /// assert_eq!((progress.completed, progress.more_pending), (1, false));
+    ///
+    /// // The same read, run again, finds the block.
+    /// assert_eq!(snapshot.get(b"row")?.as_deref(), Some(&b"1"[..]));
+    /// // A queue that owes nothing has nothing to do.
+    /// assert_eq!(queue.poll(IoBudget::ALL), IoProgress::default());
+    /// # Ok::<(), regolith::Error>(())
+    /// ```
     pub fn poll(&mut self, budget: IoBudget) -> IoProgress {
         // The owner is running: a push from now on must not wake it.
         let _ = self.shared.wake_up();

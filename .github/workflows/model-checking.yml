@@ -137,9 +137,15 @@ jobs:
   # an append, and the ring, the version store, the skip list and the
   # in-memory log race a handful of operations a thread, not hundreds.
   #
-  # Measured at 41 minutes for the 271 tests on a workstation
-  # shared with other work; the limit is nearly three times that. A run
-  # that passes it means a test was added at native size; size it as above.
+  # A test listed here keeps off the file system: miri does not sync a
+  # directory, which every durable write to a real file ends with. The
+  # version store's tests keep their manifest in the in-memory Env, and the
+  # positional log's run over the in-memory Env, whose log is this crate's
+  # own lock-free code, and natively over the file system too.
+  #
+  # Measured at 39 minutes for the 271 tests on a workstation
+  # shared with other work; the limit is three times that. A run that
+  # passes it means a test was added at native size; size it as above.
   miri:
     runs-on: ubuntu-latest
     timeout-minutes: 120

@@ -317,8 +317,10 @@ mod tests {
         // That thread runs one step, which leaves the stop on, and relieves
         // no further: an owed step after its commit, or a job that ended.
         assert!(matches!(
-            engine.run_one_background_step().unwrap(),
-            CompactionOutcome::Idle
+            engine
+                .run_one_background_step(super::super::Help::Wait)
+                .unwrap(),
+            Some(CompactionOutcome::Idle)
         ));
         assert!(matches!(engine.stall_signal().classify(), Some((_, true))));
         assert!(wait.is_ready(), "handed back: the writer looks again");

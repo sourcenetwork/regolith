@@ -31,7 +31,6 @@ use std::task::Waker;
 use super::super::RegolithEngine;
 use super::super::callback::InCommit;
 use super::super::io::job::{Job, JobBody, Step};
-use super::super::io::scope;
 use super::descriptor::{Decision, WRITTEN};
 use super::hook;
 use super::park::Help;
@@ -318,7 +317,6 @@ impl JobBody for SyncRound {
 
     /// On a queue's poll: parks instead of waiting for another thread.
     fn step(self: Box<Self>, waker: &Waker) -> Step {
-        let _no_wait = scope::no_wait();
         match self.sync(Help::Park(waker)) {
             Ok(()) => Step::Done,
             Err(body) => Step::Parked(body),

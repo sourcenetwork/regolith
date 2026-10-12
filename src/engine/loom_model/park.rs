@@ -2,7 +2,7 @@
 //! parks instead of waiting for another thread, and nobody who waits is
 //! left behind.
 //!
-//! Four handshakes carry it. In each, two sides write one word and then
+//! Five handshakes carry it. In each, two sides write one word and then
 //! read the other's, and a side that misses the other sleeps for ever:
 //!
 //! - a job its holder parks, against a thread blocked on it (`io::job`,
@@ -13,7 +13,10 @@
 //! - a rollback parked for the writes in flight on a failed log, against
 //!   the last write to leave (`wal_gate`, WG1 and WG3);
 //! - the wake of a parked job telling the queues registered on it, against
-//!   the thread that lands it (`io::job`, `Job::ready`).
+//!   the thread that lands it (`io::job`, `Job::ready`);
+//! - that wake against the park itself: a wait that ends before the thread
+//!   that stepped the job gave its claim up (`Job::ready` and `Job::watch`
+//!   against `Job::step`).
 //!
 //! Each positive model drives the production type, whose atomics, fences
 //! and parking are loom's under `--cfg loom`. Each calibration rebuilds the
@@ -26,9 +29,9 @@
 //!
 //! # What was shrunk
 //!
-//! Two threads a model, one parked job, one thing held, one write in
-//! flight, two queues. Every model is bounded by an explicit preemption
-//! bound, never by time.
+//! Two threads a model (three where a second queue polls), one parked job,
+//! one thing held, one write in flight, two queues. Every model is bounded
+//! by an explicit preemption bound, never by time.
 
 use std::sync::Arc as StdArc;
 use std::task::{Wake, Waker};
@@ -434,6 +437,113 @@ pub fn a_wake_that_registers_again_blindly_loses_a_landing() {
                 told.load(Ordering::SeqCst),
                 1,
                 "a queue was never told the landing"
+            );
+        },
+    );
+}
+
+/// `Job::ready` against the park: the wait a job parked for ends at any
+/// moment of the step that parks it, before the claim is given up or after.
+/// The other queue registered on the job polls meanwhile. Whenever it finds
+/// "the job may go on" in its inbox the job is free, so its claim wins and
+/// it runs the job; when its poll came too early to be told, the message is
+/// in its inbox at the end. It is never told while the job is still
+/// claimed, which would leave it with a lost claim and nobody to tell it
+/// again.
+///
+/// Bound: 2 preemptions. One job, one park, one wake, one poll of the other
+/// queue.
+pub fn a_wake_that_comes_before_the_park_tells_the_queues_with_the_job_free() {
+    explore_bounded(
+        "a_wake_that_comes_before_the_park_tells_the_queues_with_the_job_free",
+        Some(2),
+        500,
+        400,
+        |witness| {
+            let runs = Arc::new(AtomicUsize::new(0));
+            let job = parking_job(&runs);
+            let (stepper, other) = (queue(1), queue(2));
+            assert!(job.register(StdArc::clone(&stepper)));
+            assert!(job.register(StdArc::clone(&other)));
+            assert!(job.claim());
+            let waker = unpark_waker(&job, &stepper);
+            let waking = {
+                let waker = waker.clone();
+                thread::spawn(move || waker.wake())
+            };
+            let polling = {
+                let (job, other) = (StdArc::clone(&job), StdArc::clone(&other));
+                thread::spawn(move || {
+                    let told = other
+                        .take_inbox()
+                        .filter(|message| matches!(message, Message::Ready(_)))
+                        .count();
+                    if told > 0 {
+                        assert!(
+                            job.claim(),
+                            "a queue was told the job may go on while it was still claimed"
+                        );
+                        job.run();
+                    }
+                    told > 0
+                })
+            };
+            assert!(!job.step(&waker), "the body parks");
+            waking.join().expect("the wake");
+            if polling.join().expect("the other queue's poll") {
+                assert!(job.is_done());
+                assert_eq!(runs.load(Ordering::SeqCst), 1, "the job ran once");
+                witness.record();
+            } else {
+                let told = other
+                    .take_inbox()
+                    .filter(|message| matches!(message, Message::Ready(_)))
+                    .count();
+                assert!(
+                    told >= 1,
+                    "the other queue was never told the job may go on"
+                );
+                assert!(job.is_runnable(), "and the job is free for it");
+            }
+            // What the model's queues still hold names the job, which names
+            // them: taken, so that nothing outlives the execution.
+            let _ = stepper.take_inbox().count();
+            let _ = other.take_inbox().count();
+        },
+    );
+}
+
+/// Calibration for
+/// [`a_wake_that_comes_before_the_park_tells_the_queues_with_the_job_free`]:
+/// a wake that tells the other queue at once, whatever the job's state. A
+/// poll that takes the message before the park finds the job claimed.
+pub fn a_wake_that_tells_at_once_reaches_a_queue_with_the_job_claimed() {
+    explore_bounded(
+        "a_wake_that_tells_at_once_reaches_a_queue_with_the_job_claimed",
+        Some(2),
+        1,
+        0,
+        |_| {
+            let claimed = Arc::new(AtomicBool::new(true));
+            let told = Arc::new(AtomicBool::new(false));
+            let waking = {
+                let told = Arc::clone(&told);
+                // The bug: no look at the claim before telling.
+                thread::spawn(move || told.store(true, Ordering::SeqCst))
+            };
+            let polling = {
+                let (claimed, told) = (Arc::clone(&claimed), Arc::clone(&told));
+                thread::spawn(move || {
+                    told.swap(false, Ordering::SeqCst) && claimed.load(Ordering::SeqCst)
+                })
+            };
+            // The thread that stepped the job parks it.
+            claimed.store(false, Ordering::SeqCst);
+            waking.join().expect("the wake");
+            let lost = polling.join().expect("the other queue's poll");
+            assert!(
+                !lost,
+                "a queue was told the job may go on while it was still claimed"
             );
         },
     );

@@ -130,7 +130,7 @@ pub enum KeyClass {
 ///
 /// `classify` sees the key as the caller wrote it, without regolith's
 /// column-family prefix. It must be pure, deterministic and allocation-free:
-/// commit calls it while it holds the transaction and before it takes the
+/// commit calls it on the committing thread, before the commit enters the
 /// write pipeline, at most once for the start of each scan stretch and at
 /// most once for each distinct key the transaction reads, puts or merges. A
 /// key it only deletes is not classified there.
@@ -141,6 +141,63 @@ pub enum KeyClass {
 /// [`TxnOptions::early_validation`](crate::TxnOptions::early_validation) asks
 /// once more for each key it puts or merges, to leave a content-addressed one
 /// unchecked.
+///
+/// # Example
+///
+/// A classifier that tells the class from the key's first bytes, which is
+/// pure and allocates nothing. Keys under `blob/` are named by their content.
+///
+/// ```
+/// use std::sync::Arc;
+///
+/// use regolith::{
+///     IsolationLevel, KeyClass, KeyClassifier, OptimisticTransactionDb, Options, Transaction,
+///     TransactionError, TxResult, TxnOptions,
+/// };
+///
+/// struct ByPrefix;
+///
+/// impl KeyClassifier for ByPrefix {
+///     fn classify(&self, key: &[u8]) -> KeyClass {
+///         if key.starts_with(b"blob/") {
+///             KeyClass::ContentAddressed
+///         } else {
+///             KeyClass::Ordinary
+///         }
+///     }
+/// }
+///
+/// let db = OptimisticTransactionDb::open("classes", Options::memory())?
+///     .with_isolation(IsolationLevel::DefraLevel)
+///     .with_policy(Arc::new(ByPrefix));
+///
+/// // Each writer looks for the key and stores it when it is not there.
+/// let store = |txn: &Transaction, key: &[u8], value: &[u8]| -> TxResult<()> {
+///     if txn.get(key)?.is_none() {
+///         txn.put(key, value)?;
+///     }
+///     Ok(())
+/// };
+///
+/// // Two writers store one blob at once. Whoever writes the key writes
+/// // these bytes, so neither needs to win: both commit.
+/// let (one, two) = (db.begin(&TxnOptions::new()), db.begin(&TxnOptions::new()));
+/// store(&one, b"blob/9f2c", b"the same bytes")?;
+/// store(&two, b"blob/9f2c", b"the same bytes")?;
+/// one.commit()?;
+/// two.commit()?;
+///
+/// // The same race on an ordinary key has one winner: the other decided on
+/// // a key that was absent and no longer is.
+/// let (one, two) = (db.begin(&TxnOptions::new()), db.begin(&TxnOptions::new()));
+/// store(&one, b"name/ada", b"first")?;
+/// store(&two, b"name/ada", b"second")?;
+/// one.commit()?;
+/// assert!(matches!(two.commit(), Err(TransactionError::Conflict(_))));
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+///
+/// # Panics
 ///
 /// A panic in `classify` during the commit fails the commit with
 /// [`Error::CallbackPanicked`](crate::Error::CallbackPanicked) and latches the
@@ -224,7 +281,7 @@ pub(super) fn classifier_for(
 /// and an append is not validated.
 ///
 /// The listing is a sorted copy of the exempt keys, built here before the
-/// commit takes the write pipeline. The engine finds a written key in it by
+/// commit enters the write pipeline. The engine finds a written key in it by
 /// binary search, which neither hashes nor allocates, and skips the key's
 /// lookup outright, where a lookup is what validating it would cost. A commit
 /// whose classifier names no such key leaves the list empty and pays nothing.

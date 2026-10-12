@@ -10,13 +10,14 @@
 //! - the family's liveness is one atomic word that moves unborn, live, dead
 //!   and never back (`CfRegistry::publish`, `retire`: one map write each,
 //!   and ids are never reused);
-//! - the ordered step is one mutex, and inside it a write takes the next
-//!   sequence (`run_group`'s `fetch_add`);
+//! - the ordered step is one mutex here, and inside it a write takes the
+//!   next sequence (in the engine: slots decided one at a time, in ring
+//!   order);
 //! - a write checks the family in the ordered step before it takes a
-//!   sequence (`fence_group`, the first act of every group, whatever path
-//!   admitted its members);
+//!   sequence (`cf_fence`, the first act of deciding every commit, whatever
+//!   kind of slot it is);
 //! - a drop takes the tombstone's sequence in the ordered step and retires
-//!   the family before it leaves it (`drop_family_locked`);
+//!   the family before it leaves it (`drop_family`);
 //! - a create publishes the family in the ordered step after its meta
 //!   entry's sequence (`create_family`).
 //!

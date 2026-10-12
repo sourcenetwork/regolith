@@ -106,6 +106,50 @@ pub enum CompactionDecision {
 /// readers already treat as absent is unaffected:
 /// [`crate::TtlCompactionFilter`] removes only expired values, and an
 /// expired value already reads as absent.
+///
+/// # Example
+///
+/// A filter that drops rows marked as drafts. It decides from the value
+/// alone, so the same entry gets the same answer at every level.
+///
+/// ```
+/// use std::sync::Arc;
+///
+/// use regolith::{CompactionDecision, CompactionFilter, Db, Options};
+///
+/// struct DropDrafts;
+///
+/// impl CompactionFilter for DropDrafts {
+///     fn name(&self) -> &'static str {
+///         "drop-drafts"
+///     }
+///
+///     fn filter(&self, _level: usize, _key: &[u8], value: &[u8]) -> CompactionDecision {
+///         if value.starts_with(b"draft:") {
+///             CompactionDecision::Remove
+///         } else {
+///             CompactionDecision::Keep
+///         }
+///     }
+/// }
+///
+/// let options = Options::memory().compaction_filter(Some(Arc::new(DropDrafts)));
+/// let db = Db::open("rows", options)?;
+/// db.put(b"row/1", b"draft:one")?;
+/// db.put(b"row/2", b"final:two")?;
+///
+/// // The filter runs when compaction rewrites an entry, not when it is
+/// // written: until then a read still finds the draft.
+/// assert!(db.get(b"row/1")?.is_some());
+/// let before = db.snapshot();
+///
+/// db.compact_range(None, None).wait()?;
+/// assert_eq!(db.get(b"row/1")?, None);
+/// assert_eq!(db.get(b"row/2")?.as_deref(), Some(&b"final:two"[..]));
+/// // A snapshot taken before does not shield the draft from the filter.
+/// assert_eq!(before.get(b"row/1")?, None);
+/// # Ok::<(), regolith::Error>(())
+/// ```
 pub trait CompactionFilter: Send + Sync + 'static {
     /// Inspect the value of one of the caller's entries: `key` is the key
     /// as the caller wrote it. Called for each value a compaction pass
@@ -166,6 +210,64 @@ pub trait CompactionFilter: Send + Sync + 'static {
 /// column family is not part of the key: one key in two column families
 /// reaches the operator as the same bytes, so the shape of a value must
 /// follow from the key alone.
+///
+/// # Example
+///
+/// A counter: the value is a big-endian `u64`, and an operand is an amount
+/// to add. [`MergeOperator::partial_merge`] has an append-only list, and
+/// [`MergeOperator::touches`] a value with parts.
+///
+/// ```
+/// use std::sync::Arc;
+///
+/// use regolith::{Db, Error, MergeOperator, Options};
+///
+/// struct SumCounter;
+///
+/// fn number(bytes: &[u8]) -> Option<u64> {
+///     Some(u64::from_be_bytes(bytes.try_into().ok()?))
+/// }
+///
+/// impl MergeOperator for SumCounter {
+///     fn name(&self) -> &'static str {
+///         "sum-counter"
+///     }
+///
+///     // An absent key counts from zero. Bytes that are no number are
+///     // declined, never guessed at.
+///     fn full_merge(&self, _key: &[u8], base: Option<&[u8]>, operands: &[&[u8]]) -> Option<Vec<u8>> {
+///         let mut total = base.map_or(Some(0), number)?;
+///         for operand in operands {
+///             total = total.wrapping_add(number(operand)?);
+///         }
+///         Some(total.to_be_bytes().to_vec())
+///     }
+///
+///     // Wrapping addition is exactly associative, so two amounts fold into
+///     // one before any base is known.
+///     fn partial_merge(&self, _key: &[u8], left: &[u8], right: &[u8]) -> Option<Vec<u8>> {
+///         Some(number(left)?.wrapping_add(number(right)?).to_be_bytes().to_vec())
+///     }
+/// }
+///
+/// let options = Options::memory().merge_operator(Some(Arc::new(SumCounter)));
+/// let db = Db::open("counters", options)?;
+///
+/// // Each write is one operand: no read, no read-modify-write.
+/// db.merge(b"visits", &2u64.to_be_bytes())?;
+/// db.merge(b"visits", &3u64.to_be_bytes())?;
+/// assert_eq!(db.get(b"visits")?, Some(5u64.to_be_bytes().to_vec()));
+///
+/// // Compaction folds the operands away; a reader sees the same value.
+/// db.compact_range(None, None).wait()?;
+/// assert_eq!(db.get(b"visits")?, Some(5u64.to_be_bytes().to_vec()));
+///
+/// // A value the operator declines fails the read that needs it.
+/// db.put(b"visits", b"not a number")?;
+/// db.merge(b"visits", &1u64.to_be_bytes())?;
+/// assert!(matches!(db.get(b"visits"), Err(Error::MergeFailed { .. })));
+/// # Ok::<(), regolith::Error>(())
+/// ```
 pub trait MergeOperator: Send + Sync + 'static {
     /// Combine a `base` value (possibly `None` if the key didn't
     /// exist) with the ordered list of merge `operands`, returning
@@ -187,6 +289,65 @@ pub trait MergeOperator: Send + Sync + 'static {
     /// addition, for one) should not implement this; `full_merge` onto a
     /// base value still folds. The default implementation returns
     /// `None`, which leaves such runs as written.
+    ///
+    /// # Example
+    ///
+    /// An append-only list: an operand is one item behind a one-byte length,
+    /// and a value is items end to end, so two operands fold by joining them.
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    ///
+    /// use regolith::{Db, MergeOperator, Options};
+    ///
+    /// struct Append;
+    ///
+    /// fn item(bytes: &[u8]) -> Vec<u8> {
+    ///     let len = u8::try_from(bytes.len()).expect("an item of at most 255 bytes");
+    ///     [&[len][..], bytes].concat()
+    /// }
+    ///
+    /// impl MergeOperator for Append {
+    ///     fn name(&self) -> &'static str {
+    ///         "append"
+    ///     }
+    ///
+    ///     fn full_merge(&self, _key: &[u8], base: Option<&[u8]>, operands: &[&[u8]]) -> Option<Vec<u8>> {
+    ///         let mut list = base.unwrap_or_default().to_vec();
+    ///         for operand in operands {
+    ///             list.extend_from_slice(operand);
+    ///         }
+    ///         Some(list)
+    ///     }
+    ///
+    ///     fn partial_merge(&self, _key: &[u8], left: &[u8], right: &[u8]) -> Option<Vec<u8>> {
+    ///         Some([left, right].concat())
+    ///     }
+    /// }
+    ///
+    /// // The law: however a run is grouped, it reads as the unfolded run does.
+    /// let (a, b, c) = (item(b"a"), item(b"b"), item(b"c"));
+    /// let unfolded = Append.full_merge(b"list", None, &[&a, &b, &c]);
+    /// assert_eq!(unfolded.as_deref(), Some(&b"\x01a\x01b\x01c"[..]));
+    /// let ab = Append.partial_merge(b"list", &a, &b).unwrap();
+    /// let bc = Append.partial_merge(b"list", &b, &c).unwrap();
+    /// assert_eq!(Append.full_merge(b"list", None, &[&ab, &c]), unfolded);
+    /// assert_eq!(Append.full_merge(b"list", None, &[&a, &bc]), unfolded);
+    ///
+    /// let options = Options::memory().merge_operator(Some(Arc::new(Append)));
+    /// let db = Db::open("lists", options)?;
+    /// db.merge(b"list", &a)?;
+    /// // The snapshot stands between the first item and the two after it, so
+    /// // compaction cannot fold those onto it and joins the two instead.
+    /// let pinned = db.snapshot();
+    /// db.merge(b"list", &b)?;
+    /// db.merge(b"list", &c)?;
+    /// db.compact_range(None, None).wait()?;
+    ///
+    /// assert_eq!(db.get(b"list")?, unfolded);
+    /// assert_eq!(pinned.get(b"list")?, Some(a));
+    /// # Ok::<(), regolith::Error>(())
+    /// ```
     fn partial_merge(&self, key: &[u8], left: &[u8], right: &[u8]) -> Option<Vec<u8>> {
         let _ = (key, left, right);
         None
@@ -200,8 +361,8 @@ pub trait MergeOperator: Send + Sync + 'static {
     ///
     /// `key` is the key exactly as [`MergeOperator::full_merge`] receives
     /// it. Return `true` when unsure: the default, `true`, makes every
-    /// operand change every part, which is the behaviour of a read that
-    /// names no parts at all.
+    /// operand change every part, so a read by parts is validated as a read
+    /// of the whole value is.
     ///
     /// Contract: a part this says an operand leaves alone is left alone by
     /// the value [`MergeOperator::full_merge`] produces, and the answer
@@ -210,10 +371,91 @@ pub trait MergeOperator: Send + Sync + 'static {
     /// commit on a part that changed. `regolith::testing::check_touches`, behind
     /// the `testing` feature, checks the second half.
     ///
-    /// Pure and fast: a commit calls it for every operand committed to the
-    /// key since the transaction began, while it holds the write pipeline.
+    /// Pure and fast. It runs when the commit of a transaction that read the
+    /// key by parts is decided, once for each operand committed to the key
+    /// since that transaction began, newest first, down to the first that
+    /// touches a named part or to a put or delete. The thread that decides
+    /// the commit runs it, which can be another committing thread, and the
+    /// commits behind it in the pipeline are decided only after it returns.
     /// A panic here fails that commit with [`crate::Error::CallbackPanicked`]
     /// and latches the database read-only until it is reopened.
+    ///
+    /// # Example
+    ///
+    /// A value with two parts, each one byte: a stock level and a price. An
+    /// operand names one part and adds to it, and so touches that part only.
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    ///
+    /// use regolith::{
+    ///     Access, IsolationLevel, MergeOperator, OptimisticTransactionDb, Options, TransactionError,
+    ///     TxnOptions, WriteKind,
+    /// };
+    ///
+    /// const STOCK: u8 = 0;
+    /// const PRICE: u8 = 1;
+    ///
+    /// struct Fields;
+    ///
+    /// impl MergeOperator for Fields {
+    ///     fn name(&self) -> &'static str {
+    ///         "fields"
+    ///     }
+    ///
+    ///     fn full_merge(&self, _key: &[u8], base: Option<&[u8]>, operands: &[&[u8]]) -> Option<Vec<u8>> {
+    ///         let mut fields: [u8; 2] = base.map_or(Some([0; 2]), |base| base.try_into().ok())?;
+    ///         for &operand in operands {
+    ///             let &[part, delta] = operand else { return None };
+    ///             let field = fields.get_mut(usize::from(part))?;
+    ///             *field = field.wrapping_add(delta);
+    ///         }
+    ///         Some(fields.to_vec())
+    ///     }
+    ///
+    ///     // Only two operands on one part fold, into one on that part, so the
+    ///     // fold touches exactly what the two touched.
+    ///     fn partial_merge(&self, _key: &[u8], left: &[u8], right: &[u8]) -> Option<Vec<u8>> {
+    ///         let (&[part, a], &[other, b]) = (left, right) else { return None };
+    ///         (part == other).then(|| vec![part, a.wrapping_add(b)])
+    ///     }
+    ///
+    ///     // An operand touches the part it names. An empty one names none:
+    ///     // unsure, so `true`.
+    ///     fn touches(&self, _key: &[u8], operand: &[u8], parts: &[u32]) -> bool {
+    ///         operand.first().is_none_or(|part| parts.contains(&u32::from(*part)))
+    ///     }
+    /// }
+    ///
+    /// // The law, for one pair that folds.
+    /// let folded = Fields.partial_merge(b"item", &[STOCK, 1], &[STOCK, 2]).unwrap();
+    /// assert!(Fields.touches(b"item", &folded, &[u32::from(STOCK)]));
+    /// assert!(!Fields.touches(b"item", &folded, &[u32::from(PRICE)]));
+    ///
+    /// let options = Options::memory().merge_operator(Some(Arc::new(Fields)));
+    /// let db = OptimisticTransactionDb::open("items", options)?
+    ///     .with_isolation(IsolationLevel::DefraLevel);
+    /// db.db().put(b"item", &[10, 50])?;
+    ///
+    /// // A quote decides on the price alone. Stock arriving meanwhile is an
+    /// // operand on the other part, so the quote commits.
+    /// let quote = db.begin(&TxnOptions::new());
+    /// let seen = quote.get_parts(b"item", &[u32::from(PRICE)])?.expect("the item exists");
+    /// db.db().merge(b"item", &[STOCK, 5])?;
+    /// quote.put(b"quote", &seen[1..])?;
+    /// quote.commit()?;
+    ///
+    /// // A price change touches the part the next quote named: it loses.
+    /// let quote = db.begin(&TxnOptions::new());
+    /// let seen = quote.get_parts(b"item", &[u32::from(PRICE)])?.expect("the item exists");
+    /// db.db().merge(b"item", &[PRICE, 5])?;
+    /// quote.put(b"quote", &seen[1..])?;
+    /// let Err(TransactionError::Conflict(lost)) = quote.commit() else {
+    ///     panic!("the price changed under the quote");
+    /// };
+    /// assert_eq!((lost.mine(), lost.theirs()), (Access::ReadParts, WriteKind::Merge));
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     fn touches(&self, key: &[u8], operand: &[u8], parts: &[u32]) -> bool {
         let _ = (key, operand, parts);
         true

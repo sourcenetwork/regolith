@@ -261,6 +261,55 @@ pub trait EventListener: Send + Sync + 'static {
     /// newer write was, so a caller can count the reasons in its own
     /// telemetry. A [`crate::OptimisticTransactionDb::transact`] retry that
     /// conflicts again calls it again.
+    ///
+    /// # Example
+    ///
+    /// A listener that counts lost commits, apart from those that lost to a
+    /// delete: a caller usually settles those as "already gone".
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use std::sync::atomic::{AtomicU64, Ordering};
+    ///
+    /// use regolith::{
+    ///     Conflict, EventListener, OptimisticTransactionDb, Options, TransactionError, TxnOptions,
+    ///     WriteKind,
+    /// };
+    ///
+    /// #[derive(Default)]
+    /// struct Lost {
+    ///     to_a_delete: AtomicU64,
+    ///     to_a_write: AtomicU64,
+    /// }
+    ///
+    /// impl EventListener for Lost {
+    ///     // Counts and returns: a listener must not block or call the database.
+    ///     fn on_conflict(&self, conflict: &Conflict) {
+    ///         let counter = match conflict.theirs() {
+    ///             WriteKind::Delete | WriteKind::RangeDelete => &self.to_a_delete,
+    ///             _ => &self.to_a_write,
+    ///         };
+    ///         counter.fetch_add(1, Ordering::Relaxed);
+    ///     }
+    /// }
+    ///
+    /// let lost = Arc::new(Lost::default());
+    /// let options = Options::memory().listeners(vec![lost.clone()]);
+    /// let db = OptimisticTransactionDb::open("rows", options)?;
+    /// db.db().put(b"row", b"1")?;
+    ///
+    /// // The row is deleted between this transaction's read and its commit.
+    /// let txn = db.begin(&TxnOptions::new());
+    /// txn.get_for_update(b"row")?;
+    /// db.db().delete(b"row")?;
+    /// txn.put(b"row", b"2")?;
+    ///
+    /// // The commit returns the conflict, and the listener was told once.
+    /// assert!(matches!(txn.commit(), Err(TransactionError::Conflict(_))));
+    /// assert_eq!(lost.to_a_delete.load(Ordering::Relaxed), 1);
+    /// assert_eq!(lost.to_a_write.load(Ordering::Relaxed), 0);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     fn on_conflict(&self, conflict: &Conflict) {
         let _ = conflict;
     }

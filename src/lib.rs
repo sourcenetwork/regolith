@@ -24,10 +24,12 @@
 //!
 //! # Quick Start
 //!
-//! ```no_run
+//! ```
 //! use regolith::{Db, Options};
 //!
-//! let db = Db::open("/tmp/my_db", Options::default()).unwrap();
+//! // In memory, so the example runs anywhere. With `Options::default()`
+//! // the database lives in the directory named here.
+//! let db = Db::open("my_db", Options::memory()).unwrap();
 //!
 //! // Write
 //! db.put(b"hello", b"world").unwrap();
@@ -489,8 +491,8 @@ impl Db {
             RegolithEngine::open(path.as_ref(), engine_opts)?
         };
         let cfs = Arc::new(CfRegistry::new());
-        // Attached before the first write, so the commit leader fences every
-        // write against the registry from the start.
+        // Attached before the first write, so every write is fenced against
+        // the registry when it is decided, from the start.
         engine.attach_families(Arc::clone(&cfs));
         let db = Self {
             engine,
@@ -1132,7 +1134,7 @@ impl Db {
         }
     }
 
-    /// A new I/O queue for the calling thread (plan 4.10, D53).
+    /// A new I/O queue for the calling thread.
     ///
     /// Hand its [`IoQueue::id`] to the read handles this thread uses, in
     /// [`ReadMode::CacheOnly`] through [`Snapshot::with_read_mode`] or
@@ -1164,13 +1166,20 @@ impl Db {
     /// `Err`, then `None`, so a failure is never read as the end of the
     /// range.
     ///
-    /// ```no_run
+    /// ```
     /// # use regolith::{Db, Options};
-    /// # let db = Db::open("/tmp/scan_stream_doc", Options::default()).unwrap();
+    /// # let db = Db::open("users", Options::memory())?;
+    /// db.put(b"user:ada", b"1815")?;
+    /// db.put(b"user:bob", b"1970")?;
+    /// db.put(b"visit:1", b"ada")?;
+    ///
+    /// // `;` is the byte after `:`, so this is every key under `user:`.
+    /// let mut users = Vec::new();
     /// for entry in db.scan_stream(Some(b"user:"), Some(b"user;"))? {
     ///     let (key, value) = entry?;
-    ///     println!("{} is {} bytes", String::from_utf8_lossy(&key), value.len());
+    ///     users.push((key, value.len()));
     /// }
+    /// assert_eq!(users, [(b"user:ada".to_vec(), 4), (b"user:bob".to_vec(), 4)]);
     /// # Ok::<(), regolith::Error>(())
     /// ```
     pub fn scan_stream(&self, start: Option<&[u8]>, end: Option<&[u8]>) -> Result<ScanStream> {
@@ -1258,7 +1267,7 @@ impl Db {
     /// Delete all data in the database.
     ///
     /// A call that does its own I/O and waits on this thread: for the
-    /// compaction pass or job in flight, and for the commit group in
+    /// compaction pass or job in flight, and for the commits in
     /// flight, to end. Call it off a thread that must not block. On
     /// `wasm32`, whose one thread cannot wait for itself, a call made from
     /// inside a compaction or a checkpoint (a listener, a compaction filter)
@@ -1368,10 +1377,14 @@ impl Db {
     ///
     /// A drain therefore looks like this, and stops only on `Idle`:
     ///
-    /// ```no_run
+    /// ```
     /// # use regolith::{CompactionOutcome, Db, Options};
     /// # fn main() -> regolith::Result<()> {
-    /// # let db = Db::open("/tmp/db", Options::default())?;
+    /// # let db = Db::open("rows", Options::memory())?;
+    /// # for round in 0..8u8 {
+    /// #     db.put(b"row", &[round])?;
+    /// #     db.flush()?;
+    /// # }
     /// loop {
     ///     match db.compact_step()? {
     ///         CompactionOutcome::DidWork => continue,
@@ -1379,6 +1392,8 @@ impl Db {
     ///         CompactionOutcome::Idle => break,
     ///     }
     /// }
+    /// # assert_eq!(db.compact_step()?, CompactionOutcome::Idle);
+    /// # assert_eq!(db.get(b"row")?, Some(vec![7]));
     /// # Ok(())
     /// # }
     /// ```
