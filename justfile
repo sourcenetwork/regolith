@@ -845,11 +845,16 @@ tla:
     check MC_SyncOnce_Red_LoserKeepsOwn                RED ReadersAgree
     check MC_SyncOnce_Red_CancelNoReset                RED NoLostWakeup
     check MC_SyncOnce_Red_PublishNoOpen                RED NoLostWakeup
-    # Transaction callbacks (3.16), delivered on the committing thread (D53).
-    # Lean: Regolith/Callbacks.lean, exactly_once, order, attempts_isolated,
-    # delivered_once, delivered_on_queue_thread.
+    # Transaction callbacks (3.16), told on the committing thread (D53), in
+    # both forms of commit: the blocking commit `transact` calls, and
+    # commit_nowait, whose pending ticket is resolved from its commit group
+    # at delivery. Lean: Regolith/Callbacks.lean, exactly_once, order,
+    # attempts_isolated, delivered_once, delivered_on_queue_thread,
+    # resolved_after_landing, resolved_once_on_queue_thread.
     spec=TxnCallbacks
     check MC_TxnCallbacks_Green_Immediate              GREEN
+    check MC_TxnCallbacks_Green_Blocking               GREEN
+    check MC_TxnCallbacks_Green_Nowait                 GREEN
     check MC_TxnCallbacks_Green_Eventual               GREEN
     check MC_TxnCallbacks_Red_CommitBeforeDurable      RED CommitAfterDurable
     check MC_TxnCallbacks_Red_SkipCallbackWrites       RED NoLostUpdate

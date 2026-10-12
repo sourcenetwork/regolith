@@ -24,17 +24,29 @@
 \* disk when the database promises that. Each RED configuration plants one
 \* bug, and TLC must then find the broken promise.
 \*
-\* WHERE THE CODE IS SHAPED DIFFERENTLY. `transact` in the code
-\* (src/transaction/retry.rs, `run`) calls the blocking `commit`, which
-\* decides and delivers on the owner's own thread. The form whose outcome
-\* arrives later is `Transaction::commit_nowait` (src/transaction/nowait.rs):
-\* it returns a CommitTicket (src/io_queue/ticket.rs) that the owner's
-\* IoQueue delivers at its poll or its drop (src/io_queue/queue.rs). The
-\* model gives every commit the ticket form; the blocking commit is the case
-\* where the owner's thread is the delivering thread. In the code a commit
-\* is validated and logged before its ticket exists, and its result is read
-\* from the commit group at delivery (Completion::resolve_with); the model's
-\* Decide step stands for that.
+\* THE TWO FORMS OF COMMIT, both modelled as the code has them.
+\*   - The blocking commit. `transact` (src/transaction/retry.rs, `run`)
+\*     calls Transaction::commit (src/transaction.rs). The call claims the
+\*     transaction, runs the before_commit callbacks, joins the commit
+\*     pipeline and waits inside the call for its decision and, at
+\*     Immediate, for the fsync of its commit group. Then it runs the
+\*     outcome's callbacks itself, on the calling thread, and returns. There
+\*     is no ticket.
+\*   - commit_nowait. `transact_async` (`run_async`) calls
+\*     Transaction::commit_nowait (src/transaction/nowait.rs) on the
+\*     caller's queue. It runs the same way up to the pipeline's decision
+\*     and never waits for an fsync. A commit whose group owes none (a
+\*     conflict, or Eventual durability) is done: its callbacks run on the
+\*     calling thread before the call returns, and the ticket it returns is
+\*     ready. A commit whose group owes its fsync returns a pending
+\*     CommitTicket that holds a closure to read the outcome from the group
+\*     later (Completion::resolve_with, src/io_queue/completion.rs). When
+\*     the group has landed, the commit's queue is told; at that queue's
+\*     poll, or at its drop, on the thread that holds the queue, the
+\*     delivery takes the closure, decides the outcome with it, claims it
+\*     with one compare-and-swap and runs the callbacks. So such a commit is
+\*     resolved at delivery, on the committing thread, and never before its
+\*     fsync.
 \*
 \* Transaction callbacks (plan 3.16, D44): before_commit, on_commit,
 \* on_abort and the database-wide TransactionHooks, for transactions run by
@@ -67,23 +79,57 @@
 \*                             (AtMostOnce here, for the delivery paths)
 \*   delivered_on_queue_thread every delivery runs on the thread that holds
 \*                             the commit's queue (OnCommittingThread here)
-\*   no_claim_delivers_twice   the RED case DeliverNoClaim, as a
-\*                             counterexample
-\* TLC checks the concurrent machine here: two transact calls, two
-\* committers that decide and sync, the committing threads that deliver
-\* each outcome, and close, for two attempts each.
+\*   resolved_after_landing,   a pending ticket's outcome is read from its
+\*   resolved_once_on_queue_thread   commit group only once the group has
+\*                             landed, once, on the thread that holds the
+\*                             commit's queue (ResolvedAfterLanding here)
+\*   no_claim_delivers_twice,  the RED cases DeliverNoClaim and
+\*   early_resolve_is_not_durable    CommitBeforeDurable, as
+\*                             counterexamples
+\* TLC checks the concurrent machine here: two transact calls, in either
+\* form, two committers that decide and sync, the committing threads that
+\* tell each outcome, and close, for two attempts each.
+\*
+\* CHECKED ON THE REAL CODE.
+\*   tests/loom_io_queue.rs (loom, every schedule within its bound):
+\*     a_ticket_callback_runs_exactly_once        AtMostOnce at delivery
+\*     every_member_queue_gets_one_completion     a landed group tells each
+\*                                                member's own queue
+\*   tests/commit_nowait.rs:
+\*     at_eventual_a_commit_on_a_queue_is_ready_when_it_returns
+\*                                                the commit_nowait that
+\*                                                owes no fsync
+\*     at_immediate_a_commit_is_visible_only_once_its_queue_lands_it
+\*                                                ResolvedAfterLanding,
+\*                                                CommitAfterDurable
+\*     a_ticket_completes_only_at_its_own_queue_poll,
+\*     the_callbacks_run_once_in_order_on_the_delivering_thread
+\*                                                OnCommittingThread,
+\*                                                CallbacksBeforeHooks
+\*     dropping_the_queue_delivers_its_tickets_on_the_dropping_thread
+\*                                                the drop path
+\*   tests/callbacks_exactly_once.rs, every_transaction_ends_exactly_once
+\*                                                ExactlyOnce, as a property
+\*                                                test over every way a
+\*                                                transaction ends
+\*   src/transaction/commit_claim_tests.rs,
+\*     a_sweep_in_the_middle_of_the_commit_leaves_it_to_commit
+\*                                                the claim between close
+\*                                                and the owner's commit
 \*
 \* THE DESIGN (plan 3.16).
 \*   - Exactly one outcome. For every transaction, exactly one of on_commit
 \*     or on_abort runs, once per registered callback, however the outcome
 \*     arrives: a ticket, close or a drop.
 \*   - On the committing thread (D53). A committed or conflicted outcome is
-\*     delivered, and its callbacks run, only on the thread that owns the
-\*     commit's queue: at that queue's poll, or when the queue is dropped
-\*     (on the dropping thread, which then holds it). Never on a committer
-\*     that decided it or synced it. Close runs only the on_abort of
-\*     transactions still open, on the closing thread; the owner's own
-\*     rollback, drop or error runs on the owner's thread.
+\*     told, and its callbacks run, only on the committing thread: the
+\*     thread that called the commit, for a blocking commit and for a
+\*     commit_nowait that was done when it returned; the thread that owns
+\*     the commit's queue, for a pending ticket (at that queue's poll, or
+\*     when the queue is dropped, on the dropping thread, which then holds
+\*     it). Never on a committer that decided it or synced it. Close runs
+\*     only the on_abort of transactions still open, on the closing thread;
+\*     the owner's own rollback, drop or error runs on the owner's thread.
 \*   - Order. At commit, the transaction's before_commit callbacks run, then
 \*     the database hooks', then validation; a write a callback makes is
 \*     part of the commit and is validated. After the outcome, the
@@ -102,8 +148,10 @@
 \*     by its owner's commit or to "aborted" by a rollback, a drop, an
 \*     error or close. Whoever loses the CAS runs nothing: a commit that
 \*     finds the transaction aborted by close returns Closed.
-\*   - The commit's outcome word (the ticket's Completion): once the
-\*     pipeline decides it, "decided" is CAS'd once to "claimed" by the path
+\*   - The ticket's outcome word (Completion::state), for a commit_nowait
+\*     that was owed an fsync: "pending" until a delivery takes the ticket's
+\*     resolving closure, which only one path can get, and decides the
+\*     outcome; then "decided" is CAS'd once to "delivering" by the path
 \*     that delivers it, the queue's poll or the queue's drop, both on the
 \*     queue holder's thread; only the winner runs callbacks.
 \*
@@ -124,15 +172,33 @@
 \*     is the panic transition without the panic flag.
 \*   - The pipeline decides one transaction per step; group commit and the
 \*     visibility order are GroupCommit.tla's and CommitPipeline.tla's.
+\*   - Which thread runs a commit group's fsync: a pipeline thread, a
+\*     member that committed with a blocking call, or the poll of a member's
+\*     queue that claimed it as one unit. That is NonBlocking.tla's
+\*     (MC_NonBlocking_Green_Commit); here some pipeline thread syncs.
+\*   - The third delivery path, the commit's own fallback when its queue
+\*     was dropped before the ticket was registered (it lands the group and
+\*     delivers on the calling thread). It is the drop path with the caller
+\*     as the thread that holds the queue.
+\*   - The ticket's on_complete callbacks, which run after the outcome's
+\*     own on the same thread and in the same claim.
 \*
 \* CONFIGURATIONS.
-\*   MC_TxnCallbacks_Green_Immediate   two transact calls, two committers,
-\*                                     delivery by poll or drop, close, at
-\*                                     Immediate: every invariant, and
-\*                                     everything settles.
-\*   MC_TxnCallbacks_Green_Eventual    the same at Eventual.
-\*   MC_TxnCallbacks_Red_CommitBeforeDurable  on_commit runs before the
-\*                                     fsync at Immediate: CommitAfterDurable.
+\*   MC_TxnCallbacks_Green_Immediate   one blocking commit and one
+\*                                     commit_nowait, two committers, a
+\*                                     pending ticket delivered by poll or
+\*                                     drop, close, at Immediate: every
+\*                                     invariant, and everything settles.
+\*   MC_TxnCallbacks_Green_Blocking    both calls through the blocking
+\*                                     commit.
+\*   MC_TxnCallbacks_Green_Nowait      both through commit_nowait: two
+\*                                     tickets pending at once (invariants
+\*                                     only).
+\*   MC_TxnCallbacks_Green_Eventual    one of each at Eventual: no ticket
+\*                                     is ever pending.
+\*   MC_TxnCallbacks_Red_CommitBeforeDurable  an outcome is told before the
+\*                                     fsync at Immediate:
+\*                                     CommitAfterDurable.
 \*   MC_TxnCallbacks_Red_SkipCallbackWrites   validation uses the write
 \*                                     set captured before before_commit
 \*                                     ran: NoLostUpdate.
@@ -142,8 +208,9 @@
 \*   MC_TxnCallbacks_Red_DeliverNoClaim the poll and the drop deliver without
 \*                                     claiming the outcome: both run it,
 \*                                     AtMostOnce.
-\*   MC_TxnCallbacks_Red_HelperDelivers a committer delivers the outcome it
-\*                                     decided, as before D53: the callbacks
+\*   MC_TxnCallbacks_Red_HelperDelivers the thread that landed a group
+\*                                     resolves and delivers a member's
+\*                                     ticket, as before D53: the callbacks
 \*                                     run off the committing thread,
 \*                                     OnCommittingThread.
 \*   MC_TxnCallbacks_Red_CloseNoClaim  close aborts without claiming the
@@ -167,6 +234,11 @@ CONSTANTS
   \* "Immediate" (a commit is reported only after its fsync) or "Eventual" (it is reported at once):
   \* DurabilityMode (src/options.rs).
   Durability,
+  \* For each owner, the form its commit takes: "blocking" (`transact`, which calls
+  \* Transaction::commit, src/transaction.rs) or "nowait" (`transact_async`, which calls
+  \* Transaction::commit_nowait on its queue, src/transaction/nowait.rs). A map from owner to one
+  \* of the two words.
+  Form,
   \* "none" for the design, or the name of one planted bug. A RED configuration names a bug and the
   \* promise it must break.
   Mutant
@@ -175,6 +247,8 @@ CONSTANTS
 ASSUME MaxAttempts \in Nat \ {0}
 \* or one that names no known durability,
 ASSUME Durability \in {"Immediate", "Eventual"}
+\* or a form of commit that does not exist,
+ASSUME \A x \in Owners : Form[x] \in {"blocking", "nowait"}
 \* or one that names no known bug.
 ASSUME Mutant \in {"none", "CommitBeforeDurable", "SkipCallbackWrites",
                    "CallbacksSurvive", "DeliverNoClaim", "HelperDelivers",
@@ -186,6 +260,14 @@ Paths == {"poll", "drop"}
 
 \* Attempt numbers.
 Attempts == 1..MaxAttempts
+
+\* Configuration helpers, named in the MC_TxnCallbacks_*.cfg files.
+\* Every owner calls `transact`: the blocking commit.
+FormBlocking == [x \in Owners |-> "blocking"]
+\* Every owner calls `transact_async`: commit_nowait on its queue.
+FormNowait == [x \in Owners |-> "nowait"]
+\* Owner 1 calls `transact`, every other owner `transact_async`.
+FormMixed == [x \in Owners |-> IF x = 1 THEN "blocking" ELSE "nowait"]
 
 \* The value "no owner".
 NoOwner == 0
@@ -215,7 +297,9 @@ VARIABLES
   \* src/transaction/retry.rs.
   att,
   \* For each owner, where its `transact` call is: "begin", "open" (the closure runs), "before",
-  \* "hook", "submit", "waiting" (for its ticket), "abortcb", "aborthook" or "done".
+  \* "hook", "submit", "committing" (inside the commit call, until the pipeline has decided),
+  \* "outcb" and "outhook" (running the outcome's callbacks, then the hooks', on its own thread),
+  \* "waiting" (for its ticket), "abortcb", "aborthook" or "done".
   opc,
   \* For each owner, its transaction's state word: "open", "committing" or "aborted". In the code:
   \* Claim::state, one atomic byte with OPEN, COMMITTING, ABORTED (src/transaction/claim.rs).
@@ -236,16 +320,24 @@ VARIABLES
   \* src/transaction/callbacks.rs, and the on_abort list of Claim. The design holds only the current
   \* attempt's.
   reg,
-  \* For each owner, its commit's outcome word: "none", "queued" (submitted), "decided", "claimed"
-  \* (being delivered) or "resolved" (the ticket is ready). In the code: Completion::state with
-  \* PENDING, DECIDED, DELIVERING, READY (src/io_queue/completion.rs).
+  \* For each owner, its ticket's outcome word: "none" (no ticket is waited on: a blocking commit
+  \* has none), "pending" (handed out while its commit group owes an fsync), "decided",
+  \* "delivering" or "ready". In the code: Completion::state with PENDING, DECIDED, DELIVERING,
+  \* READY (src/io_queue/completion.rs).
   ps,
-  \* For each owner, what the pipeline decided: "none" yet, "commit" or "conflict"
-  \* (Completion::outcome).
+  \* For each owner, what the pipeline decided, as its commit group holds it: "none" yet, "commit"
+  \* or "conflict". A ticket's outcome (Completion::outcome) is read from here at delivery.
   verdict,
   \* For each owner, the sequence its commit got, 0 if none: what its CommitReceipt reports
   \* (src/transaction/receipt.rs). A number.
   cseq,
+  \* For each owner, where its commit is in the pipeline: "none", "queued" (submitted, not yet
+  \* validated) or "decided" (its commit group holds its outcome).
+  gs,
+  \* For each owner, whether its ticket still holds the closure that reads the outcome from the
+  \* commit group (Completion::resolve, set by resolve_with in src/transaction/nowait.rs): put
+  \* there when the ticket is handed out owing an fsync, taken once at delivery.
+  res,
   \* The pipeline, the committers and the closer.
   \* The submitted transactions that wait for the pipeline, oldest first: a sequence of owners.
   subq,
@@ -288,7 +380,9 @@ VARIABLES
   ranFor,
   \* The delivery of each owner's outcome, per path.
   \* For each owner and delivery path ("poll" or "drop"), where that path is in delivering the
-  \* owner's outcome: "idle", "callbacks" or "hooks".
+  \* owner's ticket (Completion::deliver): "idle", "decide" (it took the resolving closure),
+  \* "cas" (about to claim the decided outcome), "callbacks", "hooks", or "spent" (it has had its
+  \* one go at this ticket).
   dpc,
   \* A ghost: who ran each set of outcome callbacks.
   \* Ghost: one pair <<owner, who>> for every run of outcome callbacks, where who is "poll", "drop",
@@ -297,7 +391,7 @@ VARIABLES
 
 \* Every variable, so a step that changes none of them is a stutter.
 vars == <<seq, durable, ctr, ctrSeq, closed, att, opc, ost, snap, readv, buf,
-          vset, reg, ps, verdict, cseq, subq, cpc, ctarget, clpc, cltarget,
+          vset, reg, ps, verdict, cseq, gs, res, subq, cpc, ctarget, clpc, cltarget,
           clseen, ranC, ranA, hookC, hookA, beforeRan, hookBefore, validated,
           committed, panicked, ranFor, runBy, dpc>>
 
@@ -305,7 +399,7 @@ vars == <<seq, durable, ctr, ctrSeq, closed, att, opc, ost, snap, readv, buf,
 ghosts == <<ranC, ranA, hookC, hookA, beforeRan, hookBefore, validated,
             committed, panicked, ranFor, runBy>>
 \* The owners' attempt state.
-owner == <<att, opc, ost, snap, readv, buf, vset, reg, ps, verdict, cseq>>
+owner == <<att, opc, ost, snap, readv, buf, vset, reg, ps, verdict, cseq, gs, res>>
 \* The database words.
 db == <<seq, durable, ctr, ctrSeq, closed>>
 \* The committers' and the closer's state.
@@ -336,6 +430,20 @@ RunCallbacks(x, kind, who) ==
   \* And with the thread that ran it.
   /\ runBy' = runBy \cup {<<x, who>>}
 
+\* Which callbacks x's decided outcome owes: on_commit ("C") after a commit, on_abort ("A") after
+\* a conflict.
+KindOf(x) == IF verdict[x] = "commit" THEN "C" ELSE "A"
+
+\* The commit group of x's decided commit has landed: nothing more must reach the disk before the
+\* outcome may be told. A conflict wrote nothing; at Eventual no fsync is owed; at Immediate the
+\* log sync covers the commit.
+Landed(x) == verdict[x] = "conflict" \/ Durability = "Eventual" \/ durable >= cseq[x]
+
+\* Where a transact call goes once an outcome has been told: a conflict with attempts left runs
+\* the closure again in a fresh attempt; a commit, or a conflict on the last attempt (Exhausted),
+\* ends the call.
+AfterOutcome(x) == IF verdict[x] = "conflict" /\ att[x] < MaxAttempts THEN "begin" ELSE "done"
+
 \* Run the hooks' on_commit or on_abort for x's current attempt.
 RunHook(x, kind) ==
   \* Which outcome?
@@ -360,7 +468,7 @@ Begin(x) ==
        \* Yes: begin fails with Closed and the transact call ends.
        THEN /\ opc' = [opc EXCEPT ![x] = "done"]
             \* Nothing was registered, so nothing else of the owner changes.
-            /\ UNCHANGED <<att, ost, snap, readv, buf, vset, reg, ps, verdict, cseq>>
+            /\ UNCHANGED <<att, ost, snap, readv, buf, vset, reg, ps, verdict, cseq, gs, res, dpc>>
        \* No: this is the next attempt.
        ELSE /\ att' = [att EXCEPT ![x] = @ + 1]
             \* Its snapshot is the latest commit.
@@ -377,16 +485,22 @@ Begin(x) ==
             /\ vset' = [vset EXCEPT ![x] = {}]
             \* The transaction's state word starts "open".
             /\ ost' = [ost EXCEPT ![x] = "open"]
-            \* No commit has been submitted.
+            \* No ticket exists,
             /\ ps' = [ps EXCEPT ![x] = "none"]
+            \* so none holds a resolving closure.
+            /\ res' = [res EXCEPT ![x] = FALSE]
+            \* No commit has been submitted.
+            /\ gs' = [gs EXCEPT ![x] = "none"]
             \* Nothing is decided.
             /\ verdict' = [verdict EXCEPT ![x] = "none"]
             \* No commit sequence.
             /\ cseq' = [cseq EXCEPT ![x] = 0]
+            \* Neither delivery path has had a go at this attempt's ticket.
+            /\ dpc' = [dpc EXCEPT ![x] = [p \in Paths |-> "idle"]]
             \* The closure runs: the transaction is open.
             /\ opc' = [opc EXCEPT ![x] = "open"]
   \* The database, the pipeline, the closer and the ghosts do not change.
-  /\ UNCHANGED <<db, workers, ghosts>>
+  /\ UNCHANGED <<db, subq, cpc, ctarget, clpc, cltarget, clseen, ghosts>>
 
 \* The closure returns Ok and the owner commits: CAS the state word from
 \* "open" to "committing". If close already claimed it, the commit returns
@@ -402,7 +516,7 @@ OwnerCommit(x) ==
        \* on_abort callbacks.
        ELSE opc' = [opc EXCEPT ![x] = "done"] /\ UNCHANGED ost
   \* Nothing else changes.
-  /\ UNCHANGED <<att, snap, readv, buf, vset, reg, ps, verdict, cseq, db, workers, ghosts>>
+  /\ UNCHANGED <<att, snap, readv, buf, vset, reg, ps, verdict, cseq, gs, res, db, workers, ghosts>>
 
 \* The transaction ends without committing on its owner's side: rollback,
 \* a drop, or an Err from the closure (not retried). CAS "open" to
@@ -417,7 +531,7 @@ OwnerAbort(x) ==
        \* No: close already aborted it and runs its callbacks; the call ends.
        ELSE opc' = [opc EXCEPT ![x] = "done"] /\ UNCHANGED ost
   \* Nothing else changes.
-  /\ UNCHANGED <<att, snap, readv, buf, vset, reg, ps, verdict, cseq, db, workers, ghosts>>
+  /\ UNCHANGED <<att, snap, readv, buf, vset, reg, ps, verdict, cseq, gs, res, db, workers, ghosts>>
 
 \* The transaction's before_commit runs on the committing thread: it reads
 \* the counter at the snapshot and writes it plus one, through the
@@ -432,7 +546,7 @@ BeforeOk(x) ==
   \* The hooks' before_commit is next.
   /\ opc' = [opc EXCEPT ![x] = "hook"]
   \* Nothing else of the owner, the database or the workers changes.
-  /\ UNCHANGED <<att, ost, snap, readv, vset, reg, ps, verdict, cseq, db, workers>>
+  /\ UNCHANGED <<att, ost, snap, readv, vset, reg, ps, verdict, cseq, gs, res, db, workers>>
   \* The other ghosts do not change.
   /\ UNCHANGED <<ranC, ranA, hookC, hookA, hookBefore, validated, committed, panicked, ranFor, runBy>>
 
@@ -448,7 +562,7 @@ BeforePanic(x) ==
   \* The commit fails; the owner runs on_abort next.
   /\ opc' = [opc EXCEPT ![x] = "abortcb"]
   \* Nothing else of the owner, the database or the workers changes.
-  /\ UNCHANGED <<att, ost, snap, readv, buf, vset, reg, ps, verdict, cseq, db, workers>>
+  /\ UNCHANGED <<att, ost, snap, readv, buf, vset, reg, ps, verdict, cseq, gs, res, db, workers>>
   \* The other ghosts do not change.
   /\ UNCHANGED <<ranC, ranA, hookC, hookA, hookBefore, validated, committed, ranFor, runBy>>
 
@@ -467,12 +581,13 @@ HookBefore(x) ==
   \* Submitting is next.
   /\ opc' = [opc EXCEPT ![x] = "submit"]
   \* Nothing else of the owner, the database or the workers changes.
-  /\ UNCHANGED <<att, ost, snap, readv, buf, reg, ps, verdict, cseq, db, workers>>
+  /\ UNCHANGED <<att, ost, snap, readv, buf, reg, ps, verdict, cseq, gs, res, db, workers>>
   \* The other ghosts do not change.
   /\ UNCHANGED <<ranC, ranA, hookC, hookA, beforeRan, validated, committed, panicked, ranFor, runBy>>
 
-\* commit_nowait: submit to the pipeline, or, once close has begun, fail
-\* with Closed and go to on_abort (one atomic admission check).
+\* The commit proper, in either form: the transaction joins the commit
+\* pipeline, or, once close has begun, the commit fails with Closed and the
+\* owner runs on_abort (one atomic admission check).
 Submit(x) ==
   \* When: the callbacks that run before the commit are done.
   /\ opc[x] = "submit"
@@ -481,17 +596,102 @@ Submit(x) ==
        \* Yes: the commit fails with Closed and the owner runs on_abort next.
        THEN /\ opc' = [opc EXCEPT ![x] = "abortcb"]
             \* Nothing is submitted.
-            /\ UNCHANGED <<subq, ps>>
-       \* No: the transaction joins the back of the pipeline's queue.
+            /\ UNCHANGED <<subq, gs>>
+       \* No: the transaction joins the back of the pipeline's queue,
        ELSE /\ subq' = Append(subq, x)
-            \* Its outcome word says "queued".
-            /\ ps' = [ps EXCEPT ![x] = "queued"]
-            \* The owner waits for its ticket.
-            /\ opc' = [opc EXCEPT ![x] = "waiting"]
+            \* as a commit not yet validated.
+            /\ gs' = [gs EXCEPT ![x] = "queued"]
+            \* The owner is inside its commit call until the pipeline has decided.
+            /\ opc' = [opc EXCEPT ![x] = "committing"]
   \* Nothing else of the owner or the database changes.
-  /\ UNCHANGED <<att, ost, snap, readv, buf, vset, reg, verdict, cseq, db>>
+  /\ UNCHANGED <<att, ost, snap, readv, buf, vset, reg, ps, verdict, cseq, res, db>>
   \* Nor do the committers, the closer, the delivery paths or the ghosts.
   /\ UNCHANGED <<cpc, ctarget, clpc, cltarget, clseen, dpc, ghosts>>
+
+\* The blocking commit returns (Transaction::commit, src/transaction.rs): it
+\* waited inside the call for the pipeline's decision and, for a commit at
+\* Immediate, for the fsync of its group. Its outcome is told on the owner's
+\* own thread, next. Mutant CommitBeforeDurable: it does not wait for the
+\* fsync.
+BlockingReturns(x) ==
+  \* The owner called `transact`: its commit blocks.
+  /\ Form[x] = "blocking"
+  \* When: it is inside the commit call
+  /\ opc[x] = "committing"
+  \* and the pipeline has decided,
+  /\ gs[x] = "decided"
+  \* and the commit's group has landed (the bug: or not).
+  /\ Landed(x) \/ Mutant = "CommitBeforeDurable"
+  \* The owner runs the outcome's callbacks next, itself.
+  /\ opc' = [opc EXCEPT ![x] = "outcb"]
+  \* Nothing else changes.
+  /\ UNCHANGED <<att, ost, snap, readv, buf, vset, reg, ps, verdict, cseq, gs, res, db, workers, ghosts>>
+
+\* commit_nowait returns (src/transaction/nowait.rs). A commit whose group
+\* owes no fsync (a conflict, or Eventual durability) is done: its outcome
+\* is told on the owner's own thread before the call returns, and the ticket
+\* is ready (Committed::Done). A commit whose group owes its fsync returns a
+\* ticket that holds a closure to read the outcome from the group later
+\* (Committed::Pending, Completion::resolve_with); nothing is told yet.
+NowaitReturns(x) ==
+  \* The owner called `transact_async`: its commit does not wait.
+  /\ Form[x] = "nowait"
+  \* When: it is inside the commit call
+  /\ opc[x] = "committing"
+  \* and the pipeline has decided.
+  /\ gs[x] = "decided"
+  \* Does the group owe an fsync?
+  /\ IF verdict[x] = "conflict" \/ Durability = "Eventual"
+       \* No: the owner runs the outcome's callbacks next, itself,
+       THEN /\ opc' = [opc EXCEPT ![x] = "outcb"]
+            \* and no ticket is pending.
+            /\ UNCHANGED <<ps, res>>
+       \* Yes: the ticket is handed out pending,
+       ELSE /\ ps' = [ps EXCEPT ![x] = "pending"]
+            \* holding the closure that will read the outcome,
+            /\ res' = [res EXCEPT ![x] = TRUE]
+            \* and the owner waits for it.
+            /\ opc' = [opc EXCEPT ![x] = "waiting"]
+  \* Nothing else changes.
+  /\ UNCHANGED <<att, ost, snap, readv, buf, vset, reg, verdict, cseq, gs, db, workers, ghosts>>
+
+\* The owner's thread runs the callbacks of an outcome its commit call
+\* knows: the transaction's on_commit after a commit, its on_abort after a
+\* conflict (Transaction::finish, src/transaction/callbacks.rs).
+OwnerOutcomeCallbacks(x) ==
+  \* When: the owner has a decided outcome to tell.
+  /\ opc[x] = "outcb"
+  \* The callbacks of the outcome's kind run, recorded as run by the owner.
+  /\ RunCallbacks(x, KindOf(x), "owner")
+  \* The hooks are next.
+  /\ opc' = [opc EXCEPT ![x] = "outhook"]
+  \* Nothing else of the owner, the database or the workers changes.
+  /\ UNCHANGED <<att, ost, snap, readv, buf, vset, reg, ps, verdict, cseq, gs, res, db, workers>>
+  \* The other ghosts do not change.
+  /\ UNCHANGED <<hookC, hookA, beforeRan, hookBefore, validated, committed, panicked>>
+
+\* Then the hooks' outcome. A blocking commit has returned: the transact
+\* call goes on. A commit_nowait has returned too, with a ticket that is
+\* ready (Completion::decide, then deliver_decided, with nothing left to run).
+OwnerOutcomeHook(x) ==
+  \* When: the owner ran the outcome's callbacks.
+  /\ opc[x] = "outhook"
+  \* The hooks' outcome runs.
+  /\ RunHook(x, KindOf(x))
+  \* Which form of commit was it?
+  /\ IF Form[x] = "nowait"
+       \* commit_nowait: the ticket is ready,
+       THEN /\ ps' = [ps EXCEPT ![x] = "ready"]
+            \* and the owner awaits it, which returns at once.
+            /\ opc' = [opc EXCEPT ![x] = "waiting"]
+       \* The blocking commit: the transact call goes on, to a fresh attempt or to its end,
+       ELSE /\ opc' = [opc EXCEPT ![x] = AfterOutcome(x)]
+            \* and there is no ticket.
+            /\ UNCHANGED ps
+  \* Nothing else of the owner, the database or the workers changes.
+  /\ UNCHANGED <<att, ost, snap, readv, buf, vset, reg, verdict, cseq, gs, res, db, workers>>
+  \* The other ghosts do not change.
+  /\ UNCHANGED <<ranC, ranA, beforeRan, hookBefore, validated, committed, panicked, ranFor, runBy>>
 
 \* The owner's thread runs the transaction's on_abort callbacks.
 OwnerAbortCallbacks(x) ==
@@ -502,7 +702,7 @@ OwnerAbortCallbacks(x) ==
   \* The hooks' on_abort is next.
   /\ opc' = [opc EXCEPT ![x] = "aborthook"]
   \* Nothing else of the owner, the database or the workers changes.
-  /\ UNCHANGED <<att, ost, snap, readv, buf, vset, reg, ps, verdict, cseq, db, workers>>
+  /\ UNCHANGED <<att, ost, snap, readv, buf, vset, reg, ps, verdict, cseq, gs, res, db, workers>>
   \* The other ghosts do not change.
   /\ UNCHANGED <<hookC, hookA, beforeRan, hookBefore, validated, committed, panicked>>
 
@@ -515,48 +715,87 @@ OwnerAbortHook(x) ==
   \* The transact call ends: an abort the owner chose is not retried.
   /\ opc' = [opc EXCEPT ![x] = "done"]
   \* Nothing else of the owner, the database or the workers changes.
-  /\ UNCHANGED <<att, ost, snap, readv, buf, vset, reg, ps, verdict, cseq, db, workers>>
+  /\ UNCHANGED <<att, ost, snap, readv, buf, vset, reg, ps, verdict, cseq, gs, res, db, workers>>
   \* The other ghosts do not change.
   /\ UNCHANGED <<ranC, ranA, beforeRan, hookBefore, validated, committed, panicked, ranFor, runBy>>
 
-\* The committing thread delivers its decided outcome along path p: its
-\* queue's poll takes the "done" note, or its queue is dropped and the drop
-\* delivers what the queue held. It claims the outcome with one CAS,
-\* "decided" to "claimed". A commit at Immediate is delivered only once
-\* durable (its group landed: synced, then applied and published). Mutant
-\* CommitBeforeDurable: at once. Mutant DeliverNoClaim: without the CAS, so
-\* the other path may deliver it too.
-Deliver(x, p) ==
-  \* The transaction waits for its ticket.
+\* A pending ticket is delivered along path p, on the thread that holds the
+\* commit's queue: that queue's poll takes in the note that the commit's
+\* group has landed, or the queue is dropped and the drop delivers what it
+\* held (Completion::deliver, src/io_queue/completion.rs). The first thing
+\* a delivery does is take the closure that reads the outcome from the
+\* group; only one path can get it. Mutant CommitBeforeDurable: a path
+\* starts before the group has landed.
+DeliverBegins(x, p) ==
+  \* The owner waits for its ticket,
   /\ opc[x] = "waiting"
-  \* The pipeline decided it.
-  /\ ps[x] = "decided"
-  \* This path is not delivering already.
+  \* which is not delivered yet.
+  /\ ps[x] \in {"pending", "decided"}
+  \* This path has not had its go.
   /\ dpc[x][p] = "idle"
-  \* A conflict is told at once; a commit once its group landed.
-  /\ \/ verdict[x] = "conflict"
-     \* or the database does not wait for the fsync;
-     \/ Durability = "Eventual"
-     \* or the fsync has covered the commit;
-     \/ durable >= cseq[x]
-     \* or the planted bug CommitBeforeDurable skips the wait.
-     \/ Mutant = "CommitBeforeDurable"
-  \* The CAS: the outcome is claimed (the bug leaves it to be claimed again).
-  /\ ps' = [ps EXCEPT ![x] = IF Mutant = "DeliverNoClaim" THEN @ ELSE "claimed"]
-  \* This path runs the callbacks next.
-  /\ dpc' = [dpc EXCEPT ![x][p] = "callbacks"]
+  \* The commit's group has landed (the bug: or not).
+  /\ Landed(x) \/ Mutant = "CommitBeforeDurable"
+  \* Does the ticket still hold its resolving closure?
+  /\ IF res[x]
+       \* Yes: this path takes it,
+       THEN /\ res' = [res EXCEPT ![x] = FALSE]
+            \* and decides the outcome next.
+            /\ dpc' = [dpc EXCEPT ![x][p] = "decide"]
+       \* No: the other path took it. This one goes straight to claiming,
+       ELSE /\ dpc' = [dpc EXCEPT ![x][p] = "cas"]
+            \* with nothing taken.
+            /\ UNCHANGED res
   \* Nothing else changes.
-  /\ UNCHANGED <<db, att, opc, ost, snap, readv, buf, vset, reg, verdict, cseq>>
+  /\ UNCHANGED <<db, att, opc, ost, snap, readv, buf, vset, reg, ps, verdict, cseq, gs>>
+  \* The pipeline, the committers and the closer are untouched.
+  /\ UNCHANGED <<subq, cpc, ctarget, clpc, cltarget, clseen, ghosts>>
+
+\* The path that took the closure runs it: the outcome is read from the
+\* landed group and stored in the ticket (Completion::decide: PENDING to
+\* DECIDED). So a commit owed an fsync is resolved at delivery, on the
+\* thread that holds its queue, and never before its group has landed.
+DeliverDecides(x, p) ==
+  \* This path took the resolving closure.
+  /\ dpc[x][p] = "decide"
+  \* The ticket's outcome is decided: the group's verdict.
+  /\ ps' = [ps EXCEPT ![x] = "decided"]
+  \* Claiming it is next.
+  /\ dpc' = [dpc EXCEPT ![x][p] = "cas"]
+  \* Nothing else changes.
+  /\ UNCHANGED <<db, att, opc, ost, snap, readv, buf, vset, reg, verdict, cseq, gs, res>>
+  \* The pipeline, the committers and the closer are untouched.
+  /\ UNCHANGED <<subq, cpc, ctarget, clpc, cltarget, clseen, ghosts>>
+
+\* The path claims the decided outcome with one compare-and-swap, DECIDED
+\* to DELIVERING (Completion::deliver_decided). A path that finds the
+\* outcome not decided yet, or claimed already, does nothing. Mutant
+\* DeliverNoClaim: no compare-and-swap, so both paths go on to deliver.
+DeliverClaims(x, p) ==
+  \* This path is about to claim.
+  /\ dpc[x][p] = "cas"
+  \* Is the outcome decided and unclaimed?
+  /\ IF ps[x] = "decided"
+       \* Yes: it is claimed (the bug leaves it to be claimed again),
+       THEN /\ ps' = [ps EXCEPT ![x] = IF Mutant = "DeliverNoClaim" THEN @ ELSE "delivering"]
+            \* and this path runs the callbacks next.
+            /\ dpc' = [dpc EXCEPT ![x][p] = "callbacks"]
+       \* No: this path has had its go,
+       ELSE /\ dpc' = [dpc EXCEPT ![x][p] = "spent"]
+            \* and changed nothing.
+            /\ UNCHANGED ps
+  \* Nothing else changes.
+  /\ UNCHANGED <<db, att, opc, ost, snap, readv, buf, vset, reg, verdict, cseq, gs, res>>
   \* The pipeline, the committers and the closer are untouched.
   /\ UNCHANGED <<subq, cpc, ctarget, clpc, cltarget, clseen, ghosts>>
 
 \* The delivering path runs the transaction's callbacks of the outcome's
-\* kind, on the committing thread.
+\* kind, on the committing thread (the closure Completion::first holds,
+\* which calls Ending::finish).
 DeliverCallbacks(x, p) ==
   \* This path claimed the outcome.
   /\ dpc[x][p] = "callbacks"
   \* The callbacks run here, recorded as run by this path.
-  /\ RunCallbacks(x, IF verdict[x] = "commit" THEN "C" ELSE "A", p)
+  /\ RunCallbacks(x, KindOf(x), p)
   \* The hooks are next.
   /\ dpc' = [dpc EXCEPT ![x][p] = "hooks"]
   \* Nothing else changes.
@@ -569,36 +808,38 @@ DeliverHooks(x, p) ==
   \* This path ran the callbacks.
   /\ dpc[x][p] = "hooks"
   \* The hooks' outcome runs.
-  /\ RunHook(x, IF verdict[x] = "commit" THEN "C" ELSE "A")
+  /\ RunHook(x, KindOf(x))
   \* The ticket is ready.
-  /\ ps' = [ps EXCEPT ![x] = "resolved"]
-  \* The path is done.
-  /\ dpc' = [dpc EXCEPT ![x][p] = "idle"]
+  /\ ps' = [ps EXCEPT ![x] = "ready"]
+  \* The path has had its go.
+  /\ dpc' = [dpc EXCEPT ![x][p] = "spent"]
   \* Nothing else changes.
-  /\ UNCHANGED <<db, att, opc, ost, snap, readv, buf, vset, reg, verdict, cseq>>
+  /\ UNCHANGED <<db, att, opc, ost, snap, readv, buf, vset, reg, verdict, cseq, gs, res>>
   \* The pipeline, the committers and the closer are untouched.
   /\ UNCHANGED <<subq, cpc, ctarget, clpc, cltarget, clseen>>
   \* The other ghosts are untouched.
   /\ UNCHANGED <<ranC, ranA, beforeRan, hookBefore, validated, committed, panicked, ranFor, runBy>>
 
-\* The ticket resolves. A commit ends the transact call; a conflict re-runs
-\* the closure in a fresh attempt while attempts remain (Exhausted after).
+\* The owner's await of its ticket returns. A commit ends the transact
+\* call; a conflict re-runs the closure in a fresh attempt while attempts
+\* remain (Exhausted after).
 Resolve(x) ==
-  \* When: the owner waits for its ticket
+  \* When: the owner waits for its ticket,
   /\ opc[x] = "waiting"
-  \* and the ticket is ready.
-  /\ ps[x] = "resolved"
-  \* A conflict with attempts left starts the next attempt; a commit, or a conflict on the last
-  \* attempt (Exhausted), ends the call.
-  /\ opc' = [opc EXCEPT ![x] =
-               IF verdict[x] = "conflict" /\ att[x] < MaxAttempts THEN "begin" ELSE "done"]
+  \* the ticket is ready,
+  /\ ps[x] = "ready"
+  \* and its thread is not inside a delivery (the queue's poll and the awaiting task share it).
+  /\ \A p \in Paths : dpc[x][p] \in {"idle", "spent"}
+  \* The call goes on: to a fresh attempt, or to its end.
+  /\ opc' = [opc EXCEPT ![x] = AfterOutcome(x)]
   \* Nothing else changes.
-  /\ UNCHANGED <<att, ost, snap, readv, buf, vset, reg, ps, verdict, cseq, db, workers, ghosts>>
+  /\ UNCHANGED <<att, ost, snap, readv, buf, vset, reg, ps, verdict, cseq, gs, res, db, workers, ghosts>>
 
 ----------------------------------------------------------------------------
 \* The committers: decide and sync. They never deliver an outcome: that is
-\* the committing thread's (Deliver). Mutant HelperDelivers puts back the
-\* design before D53, where any committer completed any decided outcome.
+\* the committing thread's (BlockingReturns, NowaitReturns, DeliverBegins).
+\* Mutant HelperDelivers puts back the design before D53, where the thread
+\* that landed a group completed its members' outcomes.
 
 \* Validate the oldest submitted transaction, first-committer-wins on its
 \* validated write set, and apply it if it commits.
@@ -616,8 +857,8 @@ Decide(c) ==
      IN /\ subq' = Tail(subq)
         \* Ghost: this attempt was validated.
         /\ validated' = Set2(validated, x, att[x], TRUE)
-        \* Its outcome is decided.
-        /\ ps' = [ps EXCEPT ![x] = "decided"]
+        \* Its outcome is decided: its commit group holds it now. No ticket knows it yet.
+        /\ gs' = [gs EXCEPT ![x] = "decided"]
         \* Which way?
         /\ IF conflict
              \* A conflict: that is the verdict,
@@ -640,13 +881,17 @@ Decide(c) ==
                   \* Ghost: this attempt committed.
                   /\ committed' = Set2(committed, x, att[x], TRUE)
   \* Durability, close and the rest of the owners' state do not change.
-  /\ UNCHANGED <<durable, closed, att, opc, ost, snap, readv, buf, vset, reg>>
+  /\ UNCHANGED <<durable, closed, att, opc, ost, snap, readv, buf, vset, reg, ps, res>>
   \* Nor do the committers, the closer or the delivery paths.
   /\ UNCHANGED <<cpc, ctarget, clpc, cltarget, clseen, dpc>>
   \* Nor do the other ghosts.
   /\ UNCHANGED <<ranC, ranA, hookC, hookA, beforeRan, hookBefore, panicked, ranFor, runBy>>
 
-\* A WAL sync: everything committed so far is durable.
+\* A WAL sync: everything committed so far is durable, so every commit
+\* group written so far has landed. Which thread runs a group's fsync (a
+\* pipeline thread, a member that committed with a blocking call, or the
+\* poll of a member's queue that claimed it) is NonBlocking.tla's; here it
+\* is some pipeline thread.
 Fsync(c) ==
   \* When: the committer is idle
   /\ cpc[c] = "idle"
@@ -657,29 +902,29 @@ Fsync(c) ==
   \* Nothing else changes.
   /\ UNCHANGED <<seq, ctr, ctrSeq, closed, owner, workers, ghosts>>
 
-\* Mutant HelperDelivers only: a committer claims a decided outcome, CAS
-\* "decided" to "claimed", to complete it on its own thread.
+\* Mutant HelperDelivers only: the pipeline thread that landed a group
+\* delivers a member's ticket itself, as before D53. It takes the resolving
+\* closure, decides the outcome and claims it, to complete it on its own
+\* thread.
 Claim(c, x) ==
   \* Only the planted bug lets a committer deliver.
   /\ Mutant = "HelperDelivers"
   \* When: the committer is idle,
   /\ cpc[c] = "idle"
-  \* the outcome is decided and nobody claimed it,
-  /\ ps[x] = "decided"
-  \* and it may be told: a conflict at once,
-  /\ \/ verdict[x] = "conflict"
-     \* a commit at once when the database does not wait for the fsync,
-     \/ Durability = "Eventual"
-     \* or a commit once the fsync has covered it.
-     \/ durable >= cseq[x]
-  \* The CAS: the outcome is claimed.
-  /\ ps' = [ps EXCEPT ![x] = "claimed"]
-  \* The committer runs the callbacks next,
+  \* the ticket is pending with its resolving closure,
+  /\ ps[x] = "pending" /\ res[x]
+  \* and the commit's group has landed.
+  /\ Landed(x)
+  \* The committer takes the closure,
+  /\ res' = [res EXCEPT ![x] = FALSE]
+  \* and decides and claims the outcome.
+  /\ ps' = [ps EXCEPT ![x] = "delivering"]
+  \* It runs the callbacks next,
   /\ cpc' = [cpc EXCEPT ![c] = "callbacks"]
   \* for this owner.
   /\ ctarget' = [ctarget EXCEPT ![c] = x]
   \* Nothing else of the database or the owners changes.
-  /\ UNCHANGED <<db, att, opc, ost, snap, readv, buf, vset, reg, verdict, cseq>>
+  /\ UNCHANGED <<db, att, opc, ost, snap, readv, buf, vset, reg, verdict, cseq, gs>>
   \* Nor do the queue, the closer, the delivery paths or the ghosts.
   /\ UNCHANGED <<subq, clpc, cltarget, clseen, dpc, ghosts>>
 
@@ -688,7 +933,7 @@ CommitterCallbacks(c) ==
   \* When: the committer claimed an outcome.
   /\ cpc[c] = "callbacks"
   \* The callbacks of the outcome's kind run, recorded as run by a committer: the wrong thread.
-  /\ LET x == ctarget[c] IN RunCallbacks(x, IF verdict[x] = "commit" THEN "C" ELSE "A", "committer")
+  /\ LET x == ctarget[c] IN RunCallbacks(x, KindOf(x), "committer")
   \* The hooks are next.
   /\ cpc' = [cpc EXCEPT ![c] = "hooks"]
   \* Nothing else of the database, the owners or the workers changes.
@@ -703,15 +948,15 @@ CommitterHooks(c) ==
   \* x is the owner whose outcome it completes.
   /\ LET x == ctarget[c] IN
        \* The hooks' outcome runs.
-       /\ RunHook(x, IF verdict[x] = "commit" THEN "C" ELSE "A")
+       /\ RunHook(x, KindOf(x))
        \* The ticket is ready.
-       /\ ps' = [ps EXCEPT ![x] = "resolved"]
+       /\ ps' = [ps EXCEPT ![x] = "ready"]
   \* The committer is idle again,
   /\ cpc' = [cpc EXCEPT ![c] = "idle"]
   \* with no target.
   /\ ctarget' = [ctarget EXCEPT ![c] = NoOwner]
   \* Nothing else of the database or the owners changes.
-  /\ UNCHANGED <<db, att, opc, ost, snap, readv, buf, vset, reg, verdict, cseq>>
+  /\ UNCHANGED <<db, att, opc, ost, snap, readv, buf, vset, reg, verdict, cseq, gs, res>>
   \* Nor do the queue, the closer or the delivery paths.
   /\ UNCHANGED <<subq, clpc, cltarget, clseen, dpc>>
   \* The other ghosts do not change.
@@ -753,7 +998,7 @@ CloseAbort(x) ==
   \* for this owner.
   /\ cltarget' = x
   \* Nothing else of the database or the owners changes.
-  /\ UNCHANGED <<db, att, opc, snap, readv, buf, vset, reg, ps, verdict, cseq>>
+  /\ UNCHANGED <<db, att, opc, snap, readv, buf, vset, reg, ps, verdict, cseq, gs, res>>
   \* No delivery changes either.
   /\ UNCHANGED <<subq, cpc, ctarget, ghosts, dpc>>
 
@@ -819,8 +1064,12 @@ Init ==
   /\ vset = [x \in Owners |-> {}]
   \* No callbacks registered.
   /\ reg = [x \in Owners |-> {}]
-  \* No commit submitted.
+  \* No ticket,
   /\ ps = [x \in Owners |-> "none"]
+  \* no resolving closure,
+  /\ res = [x \in Owners |-> FALSE]
+  \* and no commit submitted.
+  /\ gs = [x \in Owners |-> "none"]
   \* Nothing decided.
   /\ verdict = [x \in Owners |-> "none"]
   \* No commit sequence.
@@ -859,14 +1108,20 @@ Init ==
   /\ runBy = {}
 
 \* An owner's step. Its closure ends one way or another, and its commit
-\* runs to an outcome, delivered on its own thread: all of these happen.
+\* runs to an outcome, told on its own thread: all of these happen.
 OwnerStep(x) ==
   \* The steps of the closure and of the commit up to its submission,
   \/ Begin(x) \/ OwnerCommit(x) \/ OwnerAbort(x) \/ BeforeOk(x) \/ BeforePanic(x)
-  \* the owner's own abort, and reading the ready ticket.
-  \/ HookBefore(x) \/ Submit(x) \/ OwnerAbortCallbacks(x) \/ OwnerAbortHook(x) \/ Resolve(x)
-  \* Delivery of the ticket, by the queue's poll or the queue's drop.
-  \/ \E p \in Paths : Deliver(x, p) \/ DeliverCallbacks(x, p) \/ DeliverHooks(x, p)
+  \* the owner's own abort,
+  \/ HookBefore(x) \/ Submit(x) \/ OwnerAbortCallbacks(x) \/ OwnerAbortHook(x)
+  \* the commit call returning, in either form, and an outcome told by the call itself,
+  \/ BlockingReturns(x) \/ NowaitReturns(x) \/ OwnerOutcomeCallbacks(x) \/ OwnerOutcomeHook(x)
+  \* reading the ready ticket,
+  \/ Resolve(x)
+  \* and delivery of a pending ticket, by the queue's poll or the queue's drop.
+  \/ \E p \in Paths : \/ DeliverBegins(x, p) \/ DeliverDecides(x, p) \/ DeliverClaims(x, p)
+                       \* (its callbacks and its hooks)
+                       \/ DeliverCallbacks(x, p) \/ DeliverHooks(x, p)
 
 \* A committer's step.
 CommitterStep(c) ==
@@ -909,16 +1164,20 @@ TypeOK ==
   /\ att \in [Owners -> 0..MaxAttempts]
   \* Each state word is one of its three values.
   /\ ost \in [Owners -> {"open", "committing", "aborted"}]
-  \* Each outcome word is one of its five values.
-  /\ ps \in [Owners -> {"none", "queued", "decided", "claimed", "resolved"}]
+  \* Each ticket's outcome word is one of its five values.
+  /\ ps \in [Owners -> {"none", "pending", "decided", "delivering", "ready"}]
+  \* Each commit is nowhere in the pipeline, queued, or decided.
+  /\ gs \in [Owners -> {"none", "queued", "decided"}]
+  \* A ticket holds its resolving closure or it does not.
+  /\ res \in [Owners -> BOOLEAN]
   \* Each verdict is one of its three values.
   /\ verdict \in [Owners -> {"none", "commit", "conflict"}]
   \* Each committer is idle or completing an outcome.
   /\ cpc \in [Committers -> {"idle", "callbacks", "hooks"}]
   \* The closer is in one of its five places.
   /\ clpc \in {"idle", "closing", "clcb", "clhook", "closed"}
-  \* Each delivery path is idle, or running callbacks, or the hooks.
-  /\ dpc \in [Owners -> [Paths -> {"idle", "callbacks", "hooks"}]]
+  \* Each delivery path is at one of its six places.
+  /\ dpc \in [Owners -> [Paths -> {"idle", "decide", "cas", "callbacks", "hooks", "spent"}]]
 
 \* AT MOST ONCE. No attempt's callbacks run twice or both ways, and the
 \* hooks' outcome runs at most once per attempt. Lean: exactly_once.
@@ -942,7 +1201,7 @@ AllSettled ==
   \* Every committer is idle.
   /\ \A c \in Committers : cpc[c] = "idle"
   \* No delivery is under way.
-  /\ \A x \in Owners, p \in Paths : dpc[x][p] = "idle"
+  /\ \A x \in Owners, p \in Paths : dpc[x][p] \in {"idle", "spent"}
   \* close was never called, or is done.
   /\ clpc \in {"idle", "closed"}
   \* Nothing waits in the pipeline.
@@ -1016,7 +1275,8 @@ AttemptIsolation == \A r \in ranFor : r[2] = r[3]
 
 \* ON THE COMMITTING THREAD (D53). Every outcome callback ran on the thread
 \* that holds the commit's queue (its poll, or its drop), on the owner's
-\* own thread for an abort it chose, or on the closing thread for a
+\* own thread (a blocking commit, a commit_nowait that was done when it
+\* returned, or an abort the owner chose), or on the closing thread for a
 \* transaction close aborted; never on a committer. Example ruled out: the
 \* leader that synced a group running a member's on_commit on its own
 \* thread while the member's thread is busy. Lean: Callbacks.lean,
@@ -1033,6 +1293,19 @@ CommitAfterDurable ==
   Durability = "Immediate" =>
     \* an owner whose current attempt's on_commit ran has a commit that the log sync already covers.
     \A x \in Owners : att[x] > 0 /\ ranC[x][att[x]] > 0 => durable >= cseq[x]
+
+\* RESOLVED AT DELIVERY, AFTER LANDING. A ticket's outcome is decided only
+\* from a commit group that holds it and has landed: a commit owed an fsync
+\* is not even known to its ticket before the fsync.
+\* Example ruled out: the ticket of a commit at Immediate is decided when the
+\* commit is written; a caller that blocks on the ticket's decision sees
+\* "committed", the machine loses power before the fsync, and the commit is
+\* gone.
+ResolvedAfterLanding ==
+  \* For every owner whose ticket has an outcome:
+  \A x \in Owners : ps[x] \in {"decided", "delivering", "ready"} =>
+    \* the pipeline decided it, and its group has landed.
+    gs[x] = "decided" /\ Landed(x)
 
 \* A PANIC IN BEFORE_COMMIT ABORTS. The attempt never commits and never runs
 \* on_commit. Lean: panic_aborts.
