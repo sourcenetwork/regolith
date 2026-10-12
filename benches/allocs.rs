@@ -32,7 +32,7 @@ use std::hint::black_box;
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use regolith::{Db, Options, WriteBatch};
+use regolith::{Db, DurabilityMode, OptimisticTransactionDb, Options, TxnOptions, WriteBatch};
 use tempfile::TempDir;
 
 /// Process-wide counting gate. Setup and teardown run with this off.
@@ -596,6 +596,87 @@ fn rotation_disclosure() {
     println!("  times, so they exclude this cost.");
 }
 
+/// The commit paths the gated rows do not read.
+///
+/// The gated `put` rows commit at the default durability, where no commit
+/// waits for a sync. These are the same single write with the sync, and a
+/// transaction of one key committed both ways: what the commit pipeline
+/// costs a caller beyond the copies of the key and the value.
+fn commit_disclosure() {
+    let value = vec![b'v'; VALUE_LEN];
+    let keys: Vec<String> = (0..OPS).map(key_at).collect();
+    println!("\nDisclosure: commit paths outside the gated rows (prebuilt keys)");
+    println!("{:<44} {:>9} {:>11}", "path", "allocs/op", "bytes/op");
+    for (name, durability) in [
+        ("put, single, Eventual", DurabilityMode::Eventual),
+        ("put, single, Immediate", DurabilityMode::Immediate),
+    ] {
+        let dir = TempDir::new().expect("tempdir");
+        let db = Db::open(dir.path(), options().durability(durability)).expect("open");
+        // The first write pays for what a thread keeps between commits.
+        db.put(b"warm", &value).expect("put");
+        let (_, counts) = measure(|| {
+            for k in &keys {
+                db.put(k.as_bytes(), &value).expect("put");
+            }
+        });
+        let (allocs, bytes) = counts.per_op(OPS as u64);
+        println!("{name:<44} {allocs:>9.4} {bytes:>11.1}");
+    }
+    for (name, durability) in [
+        ("transaction of one key, Eventual", DurabilityMode::Eventual),
+        (
+            "transaction of one key, Immediate",
+            DurabilityMode::Immediate,
+        ),
+    ] {
+        let dir = TempDir::new().expect("tempdir");
+        let db = OptimisticTransactionDb::open(dir.path(), options().durability(durability))
+            .expect("open");
+        let txn = TxnOptions::new();
+        let warm = db.begin(&txn);
+        warm.put(b"warm", &value).expect("put");
+        warm.commit().expect("commit");
+        let (_, counts) = measure(|| {
+            for k in &keys {
+                let tx = db.begin(&txn);
+                tx.put(k.as_bytes(), &value).expect("put");
+                tx.commit().expect("commit");
+            }
+        });
+        let (allocs, bytes) = counts.per_op(OPS as u64);
+        println!("{name:<44} {allocs:>9.4} {bytes:>11.1}");
+    }
+    for (name, durability) in [
+        (
+            "commit_nowait of one key, Eventual",
+            DurabilityMode::Eventual,
+        ),
+        (
+            "commit_nowait of one key, Immediate",
+            DurabilityMode::Immediate,
+        ),
+    ] {
+        let dir = TempDir::new().expect("tempdir");
+        let db = OptimisticTransactionDb::open(dir.path(), options().durability(durability))
+            .expect("open");
+        let mut queue = db.db().io_queue();
+        let txn = TxnOptions::new().io_queue(queue.id());
+        let warm = db.begin(&txn);
+        warm.put(b"warm", &value).expect("put");
+        queue.block_on(warm.commit_nowait()).expect("commit");
+        let (_, counts) = measure(|| {
+            for k in &keys {
+                let tx = db.begin(&txn);
+                tx.put(k.as_bytes(), &value).expect("put");
+                queue.block_on(tx.commit_nowait()).expect("commit");
+            }
+        });
+        let (allocs, bytes) = counts.per_op(OPS as u64);
+        println!("{name:<44} {allocs:>9.4} {bytes:>11.1}");
+    }
+}
+
 fn main() -> ExitCode {
     let mut rows = get_rows();
     rows.push(put_single());
@@ -647,6 +728,7 @@ fn main() -> ExitCode {
     write_path_breakdown();
     iterator_disclosure();
     rotation_disclosure();
+    commit_disclosure();
 
     emit_family(&rows);
 
