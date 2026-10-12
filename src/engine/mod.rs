@@ -1085,8 +1085,17 @@ impl RegolithEngine {
     /// Keep the first reason: it is the one that explains the rest. One
     /// compare-and-swap publishes it, and a later reason finds the cell
     /// full and is dropped.
+    ///
+    /// Every path that latches the engine comes through here, and a latched
+    /// engine relieves no stall: each later write fails before it does any
+    /// of the work that would. So the unit stopped writers wait on is landed
+    /// (E35), and each of them, run again, is told the latch
+    /// ([`Self::admit_write`]). The reason is published before the unit is
+    /// taken: a writer that registers after the take reads it
+    /// ([`Self::stall_wait`]), so none is missed.
     fn latch(&self, latch: WriteLatch) {
         let _ = self.write_latch.set(latch);
+        self.stall_signal.land();
     }
 
     /// Whether a failure latched the engine against writes. One load.
@@ -2106,6 +2115,12 @@ impl RegolithEngine {
         if self.is_closed() {
             return Err(crate::Error::Closed);
         }
+        // A latched engine takes no write and relieves no stall, so the
+        // answer is the latch: what the write is told once it is admitted,
+        // told here instead of a wait that would not end (E35).
+        if self.is_latched() {
+            return Err(self.latched_error().into());
+        }
         match self.stall_state() {
             None => {
                 // Stall cleared: update the cache so subsequent writers take
@@ -2159,9 +2174,28 @@ impl RegolithEngine {
                 Some(queue) => self.leave_stall_step(queue),
             }
         }
-        Err(crate::Error::WouldBlock(crate::WouldBlock::Stall(
-            self.stall_signal.wait(self.io(), queue, reason, None),
-        )))
+        Err(self.stall_wait(queue, reason, None))
+    }
+
+    /// What a stopped write returns: the wait for the stall `reason` to
+    /// clear, or the latch when the engine latched meanwhile (E35). `queue`
+    /// and `seen` are [`StallSignal::wait`]'s.
+    fn stall_wait(
+        &self,
+        queue: Option<Arc<io::shared::QueueShared>>,
+        reason: &'static str,
+        seen: Option<usize>,
+    ) -> crate::Error {
+        let wait = self.stall_signal.wait(self.io(), queue, reason, seen);
+        // Read only now that the wait is recorded. A latch publishes its
+        // reason before it lands the unit, so either it found this wait
+        // there or the reason is read here; the unit is landed again for the
+        // writers that registered on it beside this one.
+        if self.is_latched() {
+            self.stall_signal.land();
+            return self.latched_error().into();
+        }
+        crate::Error::WouldBlock(crate::WouldBlock::Stall(wait))
     }
 
     /// Relieve a stop on this thread, for a writer with no queue on a
@@ -2194,9 +2228,7 @@ impl RegolithEngine {
                 // thread's work is done and looks again, as any stopped write
                 // does (`StallSignal`, relief handed back).
                 CompactionOutcome::Contended => {
-                    break Err(crate::Error::WouldBlock(crate::WouldBlock::Stall(
-                        self.stall_signal.wait(self.io(), None, reason, Some(seen)),
-                    )));
+                    break Err(self.stall_wait(None, reason, Some(seen)));
                 }
                 // Idle is ambiguous under concurrency: "nothing to compact
                 // right now" is what a wedged engine looks like and also what
@@ -2420,13 +2452,27 @@ impl RegolithEngine {
         // reclaimer at once rather than when this group is done (see
         // `read_view::quiesce`), and no view is held across a wait.
         drop(view);
+        let rotated = self.rotate_full();
+        // Whatever the rotation came to (E35). A flush took a memtable out
+        // and put a table in, a seal put a memtable in, and a rotation that
+        // fails part way leaves either one done, so the thresholds are
+        // classified again on every way out, once the rotation holds no
+        // flush exclusion: a stopped writer its flush held off looks again
+        // (`StallSignal`, relief handed back).
+        self.refresh_stall_level();
+        rotated?;
+        Ok(self.view.load())
+    }
+
+    /// [`Self::rotate_if_full`] once the active memtable is full. Its one
+    /// caller classifies the stall thresholds again whatever this returns.
+    fn rotate_full(&self) -> std::io::Result<()> {
         // A rotation leaves at most `max_write_buffer_number` memtables. One
         // that may leave none but the fresh active one flushes what it seals
         // here, as every rotation did before flushes left the commit path.
         let room = self.options.max_write_buffer_number.checked_sub(1);
         if room == Some(0) {
-            self.rotate_memtable()?;
-            return Ok(self.view.load());
+            return self.rotate_memtable();
         }
         // Normally the flushes behind it are done and nothing is written
         // here. When they are not, the oldest frozen memtables are written
@@ -2434,17 +2480,12 @@ impl RegolithEngine {
         // only when the background has fallen a whole memtable behind.
         if let Some(room) = room {
             while self.view.load().frozen.len() >= room {
-                // The exclusion is released before the level is refreshed.
+                // The exclusion is released before the caller refreshes the
+                // level.
                 let flushed = self
                     .flusher
                     .flushing()
                     .and_then(|flushing| self.flush_oldest_frozen(&flushing));
-                // A failed flush too, once its exclusion is released: a
-                // stopped writer it held off looks again (`StallSignal`,
-                // relief handed back).
-                if flushed.is_err() {
-                    self.refresh_stall_level();
-                }
                 if !flushed? {
                     break;
                 }
@@ -2454,8 +2495,7 @@ impl RegolithEngine {
         // by the writer once it leaves the pipeline.
         self.seal_active()?;
         self.flush_sealed_later();
-        self.refresh_stall_level();
-        Ok(self.view.load())
+        Ok(())
     }
 
     /// Seal the active memtable and flush it, and every frozen one before
