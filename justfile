@@ -1328,7 +1328,7 @@ wasm-native records="5000" sustained="20000":
 
 # The OPFS contract against a real browser. `wasm-pack test` cannot
 # drive these: it appends `--tests`, which builds every target in
-# `tests/`, and all but the three `wasm_opfs*` files are native-only.
+# `tests/`, and all but the four `wasm_opfs*` files are native-only.
 # The runner is named per target instead, so only the named test
 # binaries are built.
 #
@@ -1357,7 +1357,7 @@ wasm-browser:
     # the whole driver, so nine passing tests report as one failure with
     # no attribution.
     export WASM_BINDGEN_TEST_TIMEOUT=180
-    for suite in wasm_opfs wasm_opfs_main wasm_opfs_memory; do
+    for suite in wasm_opfs wasm_opfs_main wasm_opfs_memory wasm_opfs_transactions; do
         echo "== $suite =="
         cargo test --target wasm32-unknown-unknown --test "$suite"
     done
