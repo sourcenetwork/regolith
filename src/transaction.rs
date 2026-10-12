@@ -155,6 +155,8 @@ mod cursor;
 mod early;
 mod exclusive;
 mod handoff;
+#[cfg(loom)]
+pub mod lock_loom;
 mod lock_table;
 mod locking;
 mod nowait;

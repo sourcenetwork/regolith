@@ -157,6 +157,7 @@ pub mod loom_exports {
     //! them. It does not exist in an ordinary build.
 
     pub use crate::engine::loom_model::{arena, handoff, io_queue, jobs, skiplist, slice, version};
+    pub use crate::transaction::lock_loom as locks;
 }
 
 #[cfg(feature = "fuzzing")]

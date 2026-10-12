@@ -84,8 +84,21 @@ impl KeyLock {
         }
     }
 
+    /// A lock outside any table, used once by the model that makes it.
+    #[cfg(loom)]
+    pub(super) fn for_model() -> Self {
+        Self::new()
+    }
+
+    /// Give back a use and retire the entry if it was the last, as
+    /// [`LockTable::unpin`] does around the map's removal.
+    #[cfg(loom)]
+    pub(super) fn unpin_and_retire(&self) -> bool {
+        self.uses.fetch_sub(1, Ordering::AcqRel) == 1 && self.retire()
+    }
+
     /// Take a use, unless the entry left the table.
-    fn pin(&self) -> bool {
+    pub(super) fn pin(&self) -> bool {
         let mut uses = self.uses.load(Ordering::Acquire);
         loop {
             if uses == RETIRED {

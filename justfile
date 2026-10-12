@@ -298,7 +298,14 @@ loom-sync-deep model="":
 loom-io:
     RUSTFLAGS="--cfg loom" cargo test --release --test loom_io_queue
 
-loom-all: loom loom-debug loom-sync loom-io
+# Loom models for the pessimistic lock table (plan 4.6, 4.10): one holder
+# per key, the bypass bound, a wait delivered to its own queue, the table's
+# use count, and close meeting a wait being queued, with five calibrations
+# that must fail. Release only; the ten run in under ten seconds.
+loom-locks:
+    RUSTFLAGS="--cfg loom" cargo test --release --test loom_locks
+
+loom-all: loom loom-debug loom-sync loom-io loom-locks
 
 # The read-view chaos workload at full size: 6 instances x 2 rounds x 400
 # versions. Measured at over 20 minutes wall and 4h of CPU unoptimized,
