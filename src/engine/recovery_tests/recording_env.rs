@@ -117,10 +117,6 @@ impl LogFile for RecordingLog {
     fn set_len(&self, len: u64) -> io::Result<()> {
         self.inner.set_len(len)
     }
-
-    fn len(&self) -> io::Result<u64> {
-        self.inner.len()
-    }
 }
 
 fn is_wal(path: &Path) -> bool {

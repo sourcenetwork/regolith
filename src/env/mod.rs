@@ -478,14 +478,6 @@ pub trait LogFile: Send + Sync {
 
     /// Cut the file to exactly `len` bytes.
     fn set_len(&self, len: u64) -> io::Result<()>;
-
-    /// Length of the file in bytes, counting only what has reached the host.
-    fn len(&self) -> io::Result<u64>;
-
-    /// Whether the file holds no bytes.
-    fn is_empty(&self) -> io::Result<bool> {
-        Ok(self.len()? == 0)
-    }
 }
 
 /// A held directory lock. The lock is released when this is dropped.

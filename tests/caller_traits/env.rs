@@ -165,16 +165,6 @@ impl LogFile for Log {
         self.1.note("LogFile::set_len");
         self.0.set_len(len)
     }
-
-    fn len(&self) -> io::Result<u64> {
-        self.1.note("LogFile::len");
-        self.0.len()
-    }
-
-    fn is_empty(&self) -> io::Result<bool> {
-        self.1.note("LogFile::is_empty");
-        self.0.is_empty()
-    }
 }
 
 /// The directory lock: the trait has no method, so what is recorded is that
@@ -387,7 +377,7 @@ impl Env for DefaultLog<'_> {
 
 /// Every method of the five traits, and the drop of the lock, which is all
 /// a `FileLock` does.
-const EVERY_METHOD: [&str; 39] = [
+const EVERY_METHOD: [&str; 37] = [
     "Env::create_dir_all",
     "Env::read_dir",
     "Env::open_read",
@@ -423,22 +413,13 @@ const EVERY_METHOD: [&str; 39] = [
     "LogFile::write_all_at",
     "LogFile::sync_data",
     "LogFile::set_len",
-    "LogFile::len",
-    "LogFile::is_empty",
     "FileLock dropped",
     "JoinHandle::join",
 ];
 
-/// The methods no part of regolith calls: `Env::write` and the three
-/// `is_empty` are conveniences the traits give a default body, and
-/// `LogFile::len` is one an implementor has to write.
-const NO_CALLER: [&str; 5] = [
-    "Env::write",
-    "ReadFile::is_empty",
-    "WriteFile::is_empty",
-    "LogFile::is_empty",
-    "LogFile::len",
-];
+/// The methods no part of regolith calls. All three are conveniences the
+/// traits give a default body, so an implementor writes none of them.
+const NO_CALLER: [&str; 3] = ["Env::write", "ReadFile::is_empty", "WriteFile::is_empty"];
 
 fn key(i: usize) -> Vec<u8> {
     format!("key-{i:03}").into_bytes()
