@@ -576,6 +576,9 @@ mod early_tests;
 mod limit_tests;
 
 #[cfg(test)]
+mod landing_tests;
+
+#[cfg(test)]
 mod pipeline_order_tests;
 
 #[cfg(test)]
