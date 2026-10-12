@@ -11,9 +11,11 @@
 //! [`Db::io_queue`](crate::Db::io_queue), and polls it when it has nothing
 //! else to run:
 //!
-//! ```no_run
+//! ```
 //! # use regolith::{Db, Error, IoBudget, Options, ReadMode, WouldBlock};
-//! # let db = Db::open("/tmp/io_queue_doc", Options::default())?;
+//! # let db = Db::open("rows", Options::memory())?;
+//! # db.put(b"key", b"value")?;
+//! # db.flush()?;
 //! let mut queue = db.io_queue();
 //! let snapshot = db.snapshot().with_read_mode(ReadMode::CacheOnly(queue.id()));
 //! let value = loop {
@@ -25,6 +27,7 @@
 //!         other => break other?,
 //!     }
 //! };
+//! # assert_eq!(value.as_deref(), Some(&b"value"[..]));
 //! # Ok::<(), regolith::Error>(())
 //! ```
 //!

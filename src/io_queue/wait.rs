@@ -360,10 +360,11 @@ impl Future for LockWait {
 /// on a thread with no queue relieves it inside the write itself, and
 /// otherwise this waits until another thread compacts.
 ///
-/// ```no_run
+/// ```
 /// # use regolith::{Db, Options, through_stalls};
-/// # let db = Db::open("/tmp/through_stalls_doc", Options::default())?;
+/// # let db = Db::open("rows", Options::memory())?;
 /// through_stalls(|| db.put(b"key", b"value"))?;
+/// # assert_eq!(db.get(b"key")?.as_deref(), Some(&b"value"[..]));
 /// # Ok::<(), regolith::Error>(())
 /// ```
 #[cfg(not(target_arch = "wasm32"))]

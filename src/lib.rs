@@ -24,10 +24,12 @@
 //!
 //! # Quick Start
 //!
-//! ```no_run
+//! ```
 //! use regolith::{Db, Options};
 //!
-//! let db = Db::open("/tmp/my_db", Options::default()).unwrap();
+//! // In memory, so the example runs anywhere. With `Options::default()`
+//! // the database lives in the directory named here.
+//! let db = Db::open("my_db", Options::memory()).unwrap();
 //!
 //! // Write
 //! db.put(b"hello", b"world").unwrap();
@@ -1156,13 +1158,20 @@ impl Db {
     /// `Err`, then `None`, so a failure is never read as the end of the
     /// range.
     ///
-    /// ```no_run
+    /// ```
     /// # use regolith::{Db, Options};
-    /// # let db = Db::open("/tmp/scan_stream_doc", Options::default()).unwrap();
+    /// # let db = Db::open("users", Options::memory())?;
+    /// db.put(b"user:ada", b"1815")?;
+    /// db.put(b"user:bob", b"1970")?;
+    /// db.put(b"visit:1", b"ada")?;
+    ///
+    /// // `;` is the byte after `:`, so this is every key under `user:`.
+    /// let mut users = Vec::new();
     /// for entry in db.scan_stream(Some(b"user:"), Some(b"user;"))? {
     ///     let (key, value) = entry?;
-    ///     println!("{} is {} bytes", String::from_utf8_lossy(&key), value.len());
+    ///     users.push((key, value.len()));
     /// }
+    /// assert_eq!(users, [(b"user:ada".to_vec(), 4), (b"user:bob".to_vec(), 4)]);
     /// # Ok::<(), regolith::Error>(())
     /// ```
     pub fn scan_stream(&self, start: Option<&[u8]>, end: Option<&[u8]>) -> Result<ScanStream> {
@@ -1360,10 +1369,14 @@ impl Db {
     ///
     /// A drain therefore looks like this, and stops only on `Idle`:
     ///
-    /// ```no_run
+    /// ```
     /// # use regolith::{CompactionOutcome, Db, Options};
     /// # fn main() -> regolith::Result<()> {
-    /// # let db = Db::open("/tmp/db", Options::default())?;
+    /// # let db = Db::open("rows", Options::memory())?;
+    /// # for round in 0..8u8 {
+    /// #     db.put(b"row", &[round])?;
+    /// #     db.flush()?;
+    /// # }
     /// loop {
     ///     match db.compact_step()? {
     ///         CompactionOutcome::DidWork => continue,
@@ -1371,6 +1384,8 @@ impl Db {
     ///         CompactionOutcome::Idle => break,
     ///     }
     /// }
+    /// # assert_eq!(db.compact_step()?, CompactionOutcome::Idle);
+    /// # assert_eq!(db.get(b"row")?, Some(vec![7]));
     /// # Ok(())
     /// # }
     /// ```

@@ -12,11 +12,11 @@
 //!
 //! # Usage
 //!
-//! ```no_run
+//! ```
 //! use regolith::{Db, Options, PerfContext, PerfLevel};
 //!
 //! # fn main() -> regolith::Result<()> {
-//! let db = Db::open("/tmp/regolith_perf", Options::default())?;
+//! let db = Db::open("rows", Options::memory())?;
 //!
 //! PerfContext::set_level(PerfLevel::EnableTime);
 //! PerfContext::reset();
@@ -24,6 +24,7 @@
 //! let _ = db.get(b"some-key")?;
 //!
 //! let snap = PerfContext::capture();
+//! assert_eq!(snap.get_count, 1);
 //! println!("get spent {} ns in memtable", snap.get_from_memtable_time_nanos);
 //! println!("get spent {} ns in SSTables",  snap.get_from_output_files_time_nanos);
 //! # Ok(())
