@@ -535,6 +535,14 @@ tla:
     check MC_DefraLevel_Green_ValidatedScan            GREEN
     check MC_DefraLevel_Red_PlainScanDecides           RED INV_ScanDecisionsCurrent
     check MC_DefraLevel_Red_ReasonNewestWrite          RED INV_ReasonsExact
+    # The exempt reads a caller must not decide on: a scan inside a
+    # commutative prefix and a read by no parts. Each GREEN uses the
+    # exemption as declared; each RED decides on it and loses.
+    check MC_DefraLevel_Green_CommutativeScan          GREEN
+    check MC_DefraLevel_Red_DecideOnCommutativeScan    RED INV_SeatExclusive
+    check MC_DefraLevel_Green_ClaimUndeclared          GREEN
+    check MC_DefraLevel_Green_NoParts                  GREEN
+    check MC_DefraLevel_Red_DecideOnNoParts            RED INV_PartsCurrent
     # E1. Lean: Regolith/LsmOrder.lean, compact_range_reads_newest.
     spec=LsmOrder
     # E31, a flush's table and its memtable's retirement are one publication.
