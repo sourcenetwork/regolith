@@ -706,12 +706,19 @@ tla:
     check MC_StripeCompaction_Red_IgnoreStripes        RED SnapshotReadsKept
     # E27: a pass retires a range tombstone below its range and every
     # snapshot. Green_Retires is the witness that the fix retires at all.
+    # The Rewrite rows check a pass over one run alone, which a pass picked
+    # for its deletions (D14) runs on a bottom-level table and on the only
+    # run of a universal pool.
     # Lean: Regolith/TombstoneRetirement.lean, retire_keeps_reads.
     spec=TombstoneRetirement
     check MC_TombstoneRetirement_Green                 GREEN
     check MC_TombstoneRetirement_Green_Retires         RED NothingRetired
     check MC_TombstoneRetirement_Red_IgnoreSnapshots   RED SnapshotReadsKept
     check MC_TombstoneRetirement_Red_IgnoreDeeper      RED SnapshotReadsKept
+    check MC_TombstoneRetirement_Green_Rewrite         GREEN
+    check MC_TombstoneRetirement_Green_RewriteRetires  RED NothingRetired
+    check MC_TombstoneRetirement_Red_RewriteIgnoreSnapshots RED SnapshotReadsKept
+    check MC_TombstoneRetirement_Red_RewriteIgnoreDeeper RED SnapshotReadsKept
     # 4.6, D54: the snapshot registry on per-thread slots with counted
     # entries, moved handles, copies and shared slots. Lean:
     # Regolith/SnapshotRegistry.lean, scan_respects_live,
