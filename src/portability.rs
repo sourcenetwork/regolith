@@ -72,7 +72,7 @@
 //!
 //! ## Locks, specifically
 //!
-//! Every blocking `Mutex` and `RwLock` left in the engine comes from
+//! Every blocking `Mutex` left in the engine comes from
 //! [`crate::sync::internal`], which is `std::sync` on a normal build and
 //! `loom::sync` under `--cfg loom`. That is one seam rather than sixty
 //! call sites, so the remaining work for tier B is to add a third arm
@@ -82,10 +82,9 @@
 //! latch and the directory registry hold no such lock: they are atomics and
 //! the lock-free [`crate::sync`] primitives.
 //!
-//! The `Condvar` half is more subtle than the `Mutex` half: on a
-//! single-threaded target there is no other thread to wake, so a
-//! blocking wait has to be replaced by the caller doing the work itself
-//! rather than by a different condvar. No condvar wait is left today. The
+//! Waiting is more subtle than locking: on a single-threaded target there
+//! is no other thread to wake, so a blocking wait has to be replaced by the
+//! caller doing the work itself. No condvar wait is left today. The
 //! rate limiter sleeps in slices until its bytes are due, a commit follower
 //! parks on its slot, a stalled writer parks on a kovan signal, a wait for
 //! snapshots to drain parks on a `regolith::sync::Notify` its releases

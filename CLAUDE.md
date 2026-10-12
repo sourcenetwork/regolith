@@ -101,8 +101,8 @@ src/
 │   ├── contend.rs      # The acquire every lock-like primitive shares: barging with bounded bypass (D49)
 │   ├── owned_lock.rs   # A lock whose holder is named in its state word: the pessimistic key lock
 │   ├── waiter.rs       # Waiter nodes, their free list, the wake list
-│   └── internal.rs     # The engine's private std/loom atomics, Mutex, RwLock and Condvar, and how its
-│                       # threads wait on a regolith::sync primitive (block_on, wait_here)
+│   └── internal.rs     # The engine's private std/loom atomics and Mutex, and how its threads wait on a
+│                       # regolith::sync primitive (block_on, wait_here), releasing held-back views first
 ├── txn_buffer.rs       # Concurrent write and read-set buffer of one transaction
 ├── env/                # Env trait and backends: StdEnv (positional reads), MemEnv, WASI, OPFS; db_lock.rs
 │   ├── mem_file.rs     # Lock-free in-memory file behind MemEnv and the OPFS mirror
