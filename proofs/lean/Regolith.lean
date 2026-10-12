@@ -134,3 +134,7 @@ import Regolith.StallRelief
 -- thread the call returns the count of pins held without waiting. Backs
 -- `proofs/tla/SnapshotWait.tla`.
 import Regolith.SnapshotWait
+-- E16: with no worker, a write runs exactly the one step of background work
+-- it found owed, and L0 never passes its compaction trigger (its stop
+-- trigger when every write seals). Backs `proofs/tla/OwedStep.tla`.
+import Regolith.OwedStep

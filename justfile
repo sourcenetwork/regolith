@@ -713,6 +713,15 @@ tla shard="1" shards="1":
     check MC_StallRelief_Red_NoRelief                  RED NoStrandedWait
     check MC_StallRelief_Red_NoHandBack                RED NoStrandedWait
     check MC_StallRelief_Red_NoRecheck                 RED NoStrandedWait
+    # E16: with no worker, a write that owes a step of background work runs
+    # exactly one, and L0 stays at its compaction trigger (at the stop
+    # trigger when every write seals). Lean: Regolith/OwedStep.lean,
+    # write_one_step, l0_bounded, l0_bounded_by_stop.
+    spec=OwedStep
+    check MC_OwedStep_Green                            GREEN
+    check MC_OwedStep_Green_TinyMemtable               GREEN
+    check MC_OwedStep_Red_FlushOwesNothing             RED L0Bounded
+    check MC_OwedStep_Red_StepUntilIdle                RED OneStepPerWrite
     # regolith::sync's locks after D49: barging with bounded bypass, for
     # Mutex, Semaphore and ReentrantMutex. Lean: Regolith/Sync.lean,
     # mutual_exclusion, bounded_bypass, owed_exclusive.
