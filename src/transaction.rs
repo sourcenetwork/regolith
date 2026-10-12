@@ -207,11 +207,12 @@ pub enum TransactionError {
     /// needed a block the cache does not hold: poll the queue the wait
     /// names, then run the call again (see [`TxnOptions::read_mode`]); a
     /// cursor or stream carries on where it stopped, and the read is not a
-    /// reason to roll back. A commit met a write stall
-    /// ([`crate::WouldBlock::Stall`]), or a
-    /// [`Transaction::commit_nowait`] would have read the device to run its
-    /// `before_commit` callbacks: the transaction applied nothing and ended
-    /// with its `on_abort` callbacks; run it again once the wait is ready.
+    /// reason to roll back. A [`Transaction::commit_nowait`] would have read
+    /// the device to run its `before_commit` callbacks or to validate: the
+    /// transaction applied nothing and ended with its `on_abort` callbacks;
+    /// run it again once the wait is ready. A commit is never ended by a
+    /// write stall ([`crate::WouldBlock::Stall`]): it waits the stall out
+    /// (see [`Transaction::commit`]).
     #[error("{0}")]
     WouldBlock(crate::WouldBlock),
     /// A key in the transaction's validation set was written by
@@ -1414,23 +1415,35 @@ impl Transaction {
     /// and value sizes are validated first, along with the size of the
     /// record the commit will log (at most 1 GiB), so an oversized commit
     /// is rejected first, then the write-stall admission runs, before the
-    /// conflict check and before any commit lock is taken. A commit never
-    /// waits on a stall. Under a stop trigger it applies nothing and
-    /// returns [`TransactionError::WouldBlock`] with a
-    /// [`crate::WouldBlock::Stall`] wait, and the transaction ends with its
-    /// `on_abort` callbacks; run it again once the wait is ready
-    /// ([`OptimisticTransactionDb::transact`] does both). A slowdown
-    /// trigger delays nothing. With no compaction worker and
-    /// [`crate::Options::inline_compaction`] on, a commit from a thread with
-    /// no [`crate::IoQueue`] relieves a stop inline instead, and that time
-    /// is charged to [`crate::Ticker::WriteStallMicros`]. A stall the
-    /// engine cannot relieve surfaces as [`TransactionError::Engine`]
-    /// carrying the same [`crate::Error::Busy`] reason a plain write
-    /// reports. A commit too large to log fails with
+    /// commit takes its place in the pipeline.
+    ///
+    /// A commit is never lost to a write stall. A plain write a stop
+    /// trigger holds returns the stall's wait, because its caller still has
+    /// the data; a transaction cannot be committed a second time, so its
+    /// commit waits the stop out instead, on this thread, and then commits.
+    /// With a compaction worker it sleeps until the worker's flushes and
+    /// compactions relieve the stop. With none it runs the steps that
+    /// relieve the stop itself, as many as the stop needs and no more,
+    /// whether or not this thread has a [`crate::IoQueue`] and whatever
+    /// [`crate::Options::inline_compaction`] says, since nobody else is
+    /// certain to; commit with [`Transaction::commit_nowait`] to keep the
+    /// thread free. A step another thread's work is in the way of waits for
+    /// that work, so a thread whose own queue holds a
+    /// [`crate::JobTicket`]'s job still pending polls the queue first, as
+    /// [`crate::JobTicket::wait`] says: only its poll runs that job. The
+    /// time it is held either way is counted in
+    /// [`crate::Ticker::WriteStallMicros`]. A slowdown trigger delays
+    /// nothing. A commit whose early check already found its conflict
+    /// returns it without waiting. A commit that waits is told what a write
+    /// arriving then is told when the stop will not clear: the database
+    /// closed, the engine latched, the work that relieves the stop keeps
+    /// failing, or no step relieves it ([`TransactionError::Engine`] with
+    /// the same [`crate::Error`] a plain write reports, [`crate::Error::Busy`]
+    /// for the last). A commit too large to log fails with
     /// [`TransactionError::Engine`] of [`crate::Error::InvalidArgument`] and
     /// applies nothing; split it into smaller transactions. A commit with no
-    /// buffered writes skips the stall admission: it validates its read set
-    /// and returns. That validation
+    /// buffered writes takes no capacity and no stall holds it: it validates
+    /// its read set and returns. That validation
     /// still takes its turn in the write pipeline, behind the commits ahead
     /// of it. An optimistic transaction at
     /// [`IsolationLevel::DefraLevel`] that writes nothing is the exception: it
@@ -2635,45 +2648,65 @@ mod tests {
     }
 
     /// Drive `plain` to the stop, then check that a commit through `begin`
-    /// meets it as a plain write does when, and only when, it carries a
-    /// write: it applies nothing and returns the stall's wait, which the
-    /// clearing compaction completes.
-    fn probe_stop(plain: &Db, begin: impl Fn() -> Transaction) {
+    /// waits the stop out when, and only when, it carries a write: while the
+    /// stop holds it is on the stall's unit with nothing of it stored, and
+    /// once another thread's compaction relieved the stop it returns with
+    /// the commit. A plain write the same stop holds is handed the wait.
+    fn probe_stop(plain: &Db, begin: impl Fn() -> Transaction + Sync) {
         cross_stop(plain);
 
         let tx = begin();
         tx.get(b"k0000").unwrap();
         tx.commit()
             .expect("a read-only commit takes no capacity, so a stall does not stop it");
-
-        let tx = begin();
-        tx.put(b"txn", b"v").unwrap();
-        let stall = match tx.commit() {
-            Err(TransactionError::WouldBlock(crate::WouldBlock::Stall(stall))) => stall,
-            other => panic!("a writing commit under a stop returns its wait, got {other:?}"),
-        };
-        assert_eq!(plain.get(b"txn").unwrap(), None, "it applied nothing");
-        plain.compact_range(None, None).wait().unwrap();
         assert!(
-            stall.is_ready(),
-            "the clearing compaction completed the wait"
+            !plain.engine.stall_signal().has_unit(),
+            "nothing waits on the stall yet"
         );
 
-        let tx = begin();
-        tx.put(b"txn", b"v").unwrap();
-        tx.commit().unwrap();
+        std::thread::scope(|scope| {
+            let committer = scope.spawn(|| {
+                let tx = begin();
+                tx.put(b"txn", b"v").unwrap();
+                tx.commit()
+            });
+            // The commit waits once the stall has its unit: only a writer the
+            // stop holds installs one.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            while !plain.engine.stall_signal().has_unit() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the commit never met the stop"
+                );
+                std::thread::yield_now();
+            }
+            assert!(!committer.is_finished(), "the commit waits the stop out");
+            assert_eq!(plain.get(b"txn").unwrap(), None, "it applied nothing yet");
+            assert!(
+                matches!(
+                    plain.put(b"plain", b"v"),
+                    Err(Error::WouldBlock(crate::WouldBlock::Stall(_)))
+                ),
+                "a plain write is still handed the stall's wait"
+            );
+            plain.compact_range(None, None).wait().unwrap();
+            committer
+                .join()
+                .unwrap()
+                .expect("the commit goes through once the stop is relieved");
+        });
         assert_eq!(plain.get(b"txn").unwrap(), Some(b"v".to_vec()));
     }
 
     #[test]
-    fn optimistic_commit_meets_the_stop_like_a_plain_write() {
+    fn optimistic_commit_waits_a_stop_out() {
         let dir = TempDir::new().unwrap();
         let db = OptimisticTransactionDb::open(dir.path(), stop_opts()).unwrap();
         probe_stop(db.db(), || db.begin(&TxnOptions::new()));
     }
 
     #[test]
-    fn pessimistic_commit_meets_the_stop_like_a_plain_write() {
+    fn pessimistic_commit_waits_a_stop_out() {
         let dir = TempDir::new().unwrap();
         let db = TransactionDb::open(dir.path(), stop_opts()).unwrap();
         probe_stop(db.db(), || db.begin(&TxnOptions::new()));

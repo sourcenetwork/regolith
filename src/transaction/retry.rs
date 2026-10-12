@@ -98,10 +98,8 @@ fn run<T, E>(
                 }
                 previous = Some(conflict);
             }
-            // A blocking call waits out a stall on its own thread, then runs
-            // the attempt again, uncounted, with the same previous conflict.
-            #[cfg(not(target_arch = "wasm32"))]
-            Err(TransactionError::WouldBlock(WouldBlock::Stall(stall))) => stall.wait(),
+            // A write stall is no outcome of its own: the commit waited it
+            // out, so the attempt that ran is the one that committed.
             Err(other) => return Err(TransactError::Engine(other)),
         }
     }
@@ -140,9 +138,11 @@ async fn wait_out(would_block: WouldBlock) {
 /// [`run`] for an attempt that never blocks: it reads through a `CacheOnly`
 /// handle on `queue`, runs its `before_commit` callbacks with
 /// [`Transaction::prepare`], waiting out any miss, and commits through
-/// [`Transaction::commit_nowait`]. A commit refused because writes are
-/// stalled waits for the stall and runs the attempt again, uncounted, with
-/// the same `previous` conflict.
+/// [`Transaction::commit_nowait`]. A write stall does not end the attempt:
+/// its commit stays pending and the ticket completes once the stop is
+/// relieved. A commit whose validation needed a block the cache does not
+/// hold waits for that read and runs the attempt again, uncounted, with the
+/// same `previous` conflict.
 async fn run_async<T, E>(
     policy: &RetryPolicy,
     begin: impl Fn(&TxnOptions) -> Transaction,

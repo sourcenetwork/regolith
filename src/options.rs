@@ -498,7 +498,9 @@ pub struct Options {
     pub(crate) fifo_compaction_options: FifoCompactionOptions,
     pub(crate) universal_compaction_options: UniversalCompactionOptions,
     pub(crate) max_background_compactions: usize,
-    pub(crate) inline_compaction: bool,
+    /// `None` until [`Options::inline_compaction`] is called: resolved by
+    /// [`Options::inline_compaction_resolved`].
+    pub(crate) inline_compaction: Option<bool>,
     pub(crate) max_subcompactions: usize,
     pub(crate) evict_compaction_data_from_page_cache: bool,
     pub(crate) partitioned_index: bool,
@@ -548,7 +550,7 @@ impl Default for Options {
             universal_compaction_options: UniversalCompactionOptions::default(),
             evict_compaction_data_from_page_cache: false,
             max_background_compactions: DEFAULT_MAX_BACKGROUND_COMPACTIONS,
-            inline_compaction: false,
+            inline_compaction: None,
             max_subcompactions: 1,
             partitioned_index: false,
             cache_index_and_filter_blocks: false,
@@ -632,7 +634,7 @@ impl std::fmt::Debug for Options {
                 "max_background_compactions",
                 &self.max_background_compactions,
             )
-            .field("inline_compaction", &self.inline_compaction)
+            .field("inline_compaction", &self.inline_compaction_resolved())
             .field("max_subcompactions", &self.max_subcompactions)
             .field("partitioned_index", &self.partitioned_index)
             .field(
@@ -649,6 +651,14 @@ impl std::fmt::Debug for Options {
 }
 
 impl Options {
+    /// [`Options::inline_compaction`] as the engine takes it: what was set,
+    /// or, when nothing was, on for a database with no compaction worker and
+    /// off for one that has a worker.
+    pub(crate) fn inline_compaction_resolved(&self) -> bool {
+        self.inline_compaction
+            .unwrap_or(self.max_background_compactions == 0)
+    }
+
     /// Tuning for a device or module whose whole working set has to
     /// fit in roughly 1-4 MiB: a Linux-class embedded board (Cortex-A,
     /// or an ESP32-S3 under esp-idf), or a wasm module, where every
@@ -804,7 +814,7 @@ impl Options {
             hard_pending_compaction_bytes_limit: 16 * 1024 * 1024,
             max_write_buffer_number: 2,
             max_background_compactions: 0,
-            inline_compaction: true,
+            inline_compaction: Some(true),
             evict_compaction_data_from_page_cache: true,
             metadata_block_size: 1024,
             max_key_size: 16 * 1024,
@@ -941,7 +951,7 @@ impl Options {
             hard_pending_compaction_bytes_limit: 128 * 1024 * 1024,
             max_write_buffer_number: 2,
             max_background_compactions: 0,
-            inline_compaction: true,
+            inline_compaction: Some(true),
             evict_compaction_data_from_page_cache: false,
             metadata_block_size: 1024,
             max_key_size: 16 * 1024,
@@ -1163,7 +1173,7 @@ impl Options {
             universal_compaction_options: self.universal_compaction_options,
             evict_compaction_data_from_page_cache: self.evict_compaction_data_from_page_cache,
             max_background_compactions: self.max_background_compactions,
-            inline_compaction: self.inline_compaction,
+            inline_compaction: self.inline_compaction_resolved(),
             partitioned_index: self.partitioned_index,
             cache_index_and_filter_blocks: self.cache_index_and_filter_blocks,
             metadata_block_size: self.metadata_block_size,

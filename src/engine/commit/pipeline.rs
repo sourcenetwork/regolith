@@ -81,8 +81,8 @@ use super::super::wal::check_write_len;
 use super::super::wal_frame::KIND_GROUP;
 use super::append::AppendOrder;
 use super::descriptor::{
-    APPLIED, APPLYING, After, DECIDING, Decision, Descriptor, FAILED, INSTALLED, Verdict as Fate,
-    WRITING, WRITTEN, Work, is_immediate,
+    ADMITTED, APPLIED, APPLYING, After, DECIDING, Decision, Descriptor, FAILED, INSTALLED,
+    Verdict as Fate, WRITING, WRITTEN, Work, is_immediate,
 };
 use super::hook;
 use super::park::Help;
@@ -792,13 +792,30 @@ impl RegolithEngine {
 
     /// Take a slot for a `commit_nowait` commit, if it has none yet, and
     /// drive it as far as it goes without waiting: `Err` is the unit in its
-    /// way.
+    /// way. Before it takes its slot a commit that writes passes the
+    /// write-stall admission: a stop is a unit in its way like any other
+    /// (the stall's, which lands when the stop is relieved), and what says
+    /// the stop will not clear refuses the commit, which is then over
+    /// (`Ok`, with [`Descriptor::is_refused`]) and is not brought here
+    /// again.
     pub(super) fn advance_nowait(
         &self,
         pipe: &Pipeline,
         desc: &RingArc<Descriptor>,
     ) -> Result<(), Arc<Job>> {
         if !desc.is(INSTALLED) {
+            if !desc.is(ADMITTED) {
+                match self.admit_commit_nowait() {
+                    Ok(None) => {
+                        desc.mark(ADMITTED);
+                    }
+                    Ok(Some(stall)) => return Err(stall),
+                    Err(told) => {
+                        desc.refuse(told.into_io_error());
+                        return Ok(());
+                    }
+                }
+            }
             self.try_enter(pipe, desc, Help::Leave)?;
         }
         self.drive_nowait(pipe, desc.index(), desc)

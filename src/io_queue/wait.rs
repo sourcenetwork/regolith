@@ -29,7 +29,7 @@ pub enum WouldBlock {
     /// waiting to be flushed, or too much data waiting to be compacted. The
     /// write applied nothing. Wait for the stall to clear, then run the write
     /// again.
-    #[error("writes are stalled behind background work ({}); wait for the stall to clear and run the write again", .0.reason())]
+    #[error("{}", .0.describe())]
     Stall(StallWait),
     /// A pessimistic transaction's
     /// [`try_get_for_update`](crate::Transaction::try_get_for_update) found
@@ -200,9 +200,11 @@ impl Future for IoWait {
 ///
 /// On a database with no compaction worker, nothing clears a stall unless a
 /// caller compacts: with [`Options::inline_compaction`](crate::Options::inline_compaction)
-/// on, the stopped write also leaves the step that clears it on its thread's
-/// queue (or runs it inline when the thread has none); otherwise call
-/// [`Db::compact_step`](crate::Db::compact_step) or [`Db::flush`](crate::Db::flush).
+/// on, as it is there unless it was turned off, the stopped write also
+/// leaves the step that clears it on its thread's queue (or runs it inline
+/// when the thread has none); with it turned off, call
+/// [`Db::compact_step`](crate::Db::compact_step) or [`Db::flush`](crate::Db::flush),
+/// which this wait's message says too.
 ///
 /// It is a [`Future`] with output `()`. Clones wait on the same stall.
 /// Dropping a wait cancels nothing.
@@ -215,6 +217,13 @@ pub struct StallWait {
     stall: Arc<Job>,
     queue: Option<QueueId>,
     reason: &'static str,
+    /// Nothing relieves the stall but the caller: no compaction worker, and
+    /// inline compaction turned off.
+    self_driven: bool,
+    /// Where the time a thread is blocked in [`StallWait::wait`] is counted.
+    /// Read only by the blocking wait, which `wasm32` lacks.
+    #[cfg_attr(target_arch = "wasm32", expect(dead_code))]
+    counted: Option<Arc<crate::Statistics>>,
 }
 
 impl StallWait {
@@ -229,6 +238,40 @@ impl StallWait {
             stall,
             queue,
             reason,
+            self_driven: false,
+            counted: None,
+        }
+    }
+
+    /// Say whether nothing relieves this stall but the caller, which the
+    /// wait's message then says how to do.
+    pub(crate) fn left_to_the_caller(mut self, self_driven: bool) -> Self {
+        self.self_driven = self_driven;
+        self
+    }
+
+    /// Count the time a thread is blocked in [`StallWait::wait`] in `stats`
+    /// ([`Ticker::WriteStallMicros`](crate::Ticker::WriteStallMicros)).
+    pub(crate) fn counted_in(mut self, stats: Option<Arc<crate::Statistics>>) -> Self {
+        self.counted = stats;
+        self
+    }
+
+    /// What a write this stall stopped is told: what holds it, and what to
+    /// do.
+    pub(crate) fn describe(&self) -> String {
+        let reason = self.reason;
+        if self.self_driven {
+            format!(
+                "writes are stalled behind background work ({reason}) that this database \
+                 leaves to its caller; call compact_step until the stall clears, or turn \
+                 inline_compaction on, then run the write again"
+            )
+        } else {
+            format!(
+                "writes are stalled behind background work ({reason}); wait for the stall to \
+                 clear and run the write again"
+            )
         }
     }
 
@@ -254,9 +297,17 @@ impl StallWait {
     /// only at that queue's poll.
     ///
     /// Not on `wasm32`, whose one thread would wait for work only it can do.
+    ///
+    /// The time spent blocked here is counted in
+    /// [`Ticker::WriteStallMicros`](crate::Ticker::WriteStallMicros).
     #[cfg(not(target_arch = "wasm32"))]
     pub fn wait(&self) {
+        let blocked = std::time::Instant::now();
         self.stall.wait_landed();
+        if let Some(stats) = &self.counted {
+            let micros = u64::try_from(blocked.elapsed().as_micros()).unwrap_or(u64::MAX);
+            stats.add(crate::Ticker::WriteStallMicros, micros);
+        }
     }
 }
 

@@ -94,16 +94,12 @@ fn acker(spec: &ChildSpec) -> std::fs::File {
         .unwrap()
 }
 
-/// Run `attempt`, a transaction built and committed, until no write stall
-/// stops its commit: a stopped commit applied nothing, so the attempt is
-/// built again once the stall cleared. Any other failure fails the child.
-fn commit_through_stalls(mut attempt: impl FnMut() -> TxResult<CommitReceipt>) {
-    loop {
-        match attempt() {
-            Ok(_) => return,
-            Err(TransactionError::WouldBlock(regolith::WouldBlock::Stall(stall))) => stall.wait(),
-            Err(other) => panic!("child: commit: {other}"),
-        }
+/// Run `attempt`, a transaction built and committed. A write stall does not
+/// end its commit, which waits the stall out, so the attempt is made once;
+/// any failure fails the child.
+fn commit_through_stalls(attempt: impl FnOnce() -> TxResult<CommitReceipt>) {
+    if let Err(other) = attempt() {
+        panic!("child: commit: {other}");
     }
 }
 

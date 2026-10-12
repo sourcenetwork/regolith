@@ -431,7 +431,9 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// [`Error::WouldBlock`] with a [`WouldBlock::Stall`] wait, completed on the
 /// writer's own [`IoQueue`] once background work clears the stall; run the
 /// write again then, or wrap it in [`through_stalls`] to wait on this
-/// thread. A slowdown threshold delays nothing.
+/// thread. A slowdown threshold delays nothing. A transaction's commit is
+/// the exception, since it cannot be run again: it waits the stall out
+/// ([`Transaction::commit`], [`Transaction::commit_nowait`]).
 pub struct Db {
     engine: Arc<RegolithEngine>,
     durability: engine::DurabilityMode,

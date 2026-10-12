@@ -17,6 +17,9 @@ pub(crate) enum Stage {
     Sync,
     /// Before a slot is published.
     Publish,
+    /// A `commit_nowait` commit found writes stopped and is about to take
+    /// the stall's unit.
+    Stall,
 }
 
 #[cfg(test)]

@@ -41,8 +41,9 @@ use crate::{CommitReceipt, CommitTicket, Error};
 enum Committed {
     /// The outcome is known now.
     Done(TxResult<CommitReceipt>),
-    /// Decided and written, not yet published: it waits for its fsync. The
-    /// outcome is in `pending` once it is delivered on `queue`.
+    /// Not published yet: it waits for a write stall to clear before it
+    /// takes its slot, or, decided and written, for its fsync. The outcome
+    /// is in `pending` once it is delivered on `queue`.
     Pending {
         pending: PendingCommit,
         queue: Arc<QueueShared>,
@@ -66,6 +67,17 @@ impl Transaction {
     /// it wait for anything else under way, a memtable rotation or a full
     /// commit ring: the commit is left on its queue behind that and goes on
     /// at the poll that finds it done.
+    ///
+    /// A write stall does not end the commit either. A commit that meets a
+    /// stop trigger has not taken its place in the pipeline yet: it is left
+    /// on its queue behind the stall, nothing of it is stored, and at the
+    /// poll that finds the stop relieved it goes on and commits, so its
+    /// ticket completes then. On a database with no worker and
+    /// [`crate::Options::inline_compaction`] on, the queue's polls run the
+    /// steps that relieve the stop too. A commit waiting there is told what
+    /// a write arriving then is told when the stop will not clear (the
+    /// database closed, the engine latched, the relief keeps failing), as
+    /// its outcome.
     ///
     /// - **The queue.** The one [`TxnOptions::io_queue`](super::TxnOptions::io_queue)
     ///   names, else the one this transaction's

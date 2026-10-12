@@ -16,6 +16,12 @@
 //! step and the flush exclusion for the length of its body: a poll that
 //! needs either parks until the body ends, and a blocking call waits for it.
 //!
+//! The calls that block on another thread by their contract, and so are
+//! never steps of a job: a blocking write or commit (for the round, a unit
+//! or the step, as above, and a commit for a write stall to clear), `close`
+//! (for the commits and the background work in flight), and
+//! `wait_for_snapshots` (for the last snapshot to be released).
+//!
 //! An optimistic transaction's commit is a slot like any write (E10). It is
 //! decided in ring order against the view, which by then holds every commit
 //! decided before it (`GroupCommit.tla`, `group_eq_serial` in
@@ -147,12 +153,14 @@ pub(crate) struct TxnCommit {
     pub(crate) read_queue: Option<crate::QueueId>,
 }
 
-/// A commit admitted to the pipeline, or decided before it.
+/// A commit checked and ready for the pipeline, or decided before it.
 enum Requested {
     /// The early check found a conflict: nothing is queued.
     Decided(CommitOutcome),
-    /// The request the pipeline decides.
-    Queued(WriteRequest),
+    /// The request the pipeline decides, and whether it carries a write: a
+    /// commit that does passes the write-stall admission before it takes a
+    /// slot.
+    Queued { request: WriteRequest, writes: bool },
 }
 
 /// What `commit_nowait` learns from the pipeline.
@@ -332,25 +340,37 @@ impl RegolithEngine {
         };
         match self.request_commit(txn)? {
             Requested::Decided(outcome) => Ok(outcome),
-            Requested::Queued(request) => self.conclude(self.submit_settled(request)?),
+            Requested::Queued { request, writes } => {
+                // A blocking commit waits a stop out here, before it takes a
+                // slot: the transaction cannot be committed again, so it is
+                // not handed the stall's wait as a plain write is.
+                if writes {
+                    self.admit_commit().map_err(crate::Error::into_io_error)?;
+                }
+                self.conclude(self.submit_settled(request)?)
+            }
         }
     }
 
     /// [`Self::commit_optimistic`] for `commit_nowait`: returns once the
     /// commit is decided and written, or at the first unit in its way. When
-    /// it is not published yet (it waits for its sync, for a unit ahead of
-    /// it, or for room in a full ring), [`NowaitCommit::Pending`] holds it;
-    /// [`Self::await_commit`] then leaves it on the committer's queue. The
-    /// caller never waits here, and with `txn.read_queue` set never reads
-    /// the device.
+    /// it is not published yet (it waits for a write stall to clear, for its
+    /// sync, for a unit ahead of it, or for room in a full ring),
+    /// [`NowaitCommit::Pending`] holds it; [`Self::await_commit`] then
+    /// leaves it on the committer's queue. The caller never waits here, and
+    /// with `txn.read_queue` set never reads the device.
     pub(crate) fn commit_optimistic_nowait(&self, txn: TxnCommit) -> io::Result<NowaitCommit> {
         let _scope = txn.read_queue.map(super::io::scope::cache_only);
-        let request = match self.request_commit(txn)? {
+        let (request, writes) = match self.request_commit(txn)? {
             Requested::Decided(outcome) => return Ok(NowaitCommit::Done(outcome)),
-            Requested::Queued(request) => request,
+            Requested::Queued { request, writes } => (request, writes),
         };
         let pipe = self.pipe()?;
         let desc = spare::descriptor(Work::Request(request));
+        if !writes {
+            // It takes no capacity, so no stall holds it.
+            desc.mark(descriptor::ADMITTED);
+        }
         let published = self.advance_nowait(pipe, &desc).is_ok();
         self.run_owed_step();
         if published {
@@ -376,9 +396,12 @@ impl RegolithEngine {
         self.resume_nowait(&pending.desc, queue, &told);
     }
 
-    /// Admit a commit (sizes, the write stall, the early check) and turn it
+    /// Check a commit (the handle, the sizes, the early check) and turn it
     /// into the request the pipeline decides, or into the outcome the early
-    /// check already decided.
+    /// check already decided. The write-stall admission comes after, in the
+    /// caller: [`RegolithEngine::admit_commit`] for a commit that blocks,
+    /// [`RegolithEngine::admit_commit_nowait`] when a `commit_nowait` commit
+    /// is about to take its slot.
     fn request_commit(&self, txn: TxnCommit) -> io::Result<Requested> {
         let TxnCommit {
             checks,
@@ -398,20 +421,18 @@ impl RegolithEngine {
             self.validate_append_sizes(&ops, &appends)?;
         }
 
-        // The write-stall admission a plain write pays with
-        // `WriteOptions::default()`, in the same order: closed/WAL-failed/
-        // read-only above, then size validation above, then the wait, and
-        // only then the commit pipeline below. Never inside it: a
-        // `CompactInline` wait runs a compaction pass on this thread, and
-        // that pass must not run in the pipeline's ordered step. A commit
-        // that writes nothing (`ops` empty, e.g. a `get_for_update` with no
-        // write) takes no capacity and skips the wait, though its conflict
-        // check still takes a slot like any other commit. An append is a
-        // write.
-        if !ops.is_empty() || !appends.is_empty() {
-            self.admit_write(false)
-                .map_err(crate::Error::into_io_error)?;
-        }
+        // A commit that writes passes the write-stall admission, in the
+        // order a plain write does: closed/WAL-failed/read-only above, then
+        // size validation above, then the stall, and only then the commit
+        // pipeline. Never inside it: relieving a stop runs a compaction pass
+        // on this thread, and that pass must not run in the pipeline's
+        // ordered step. A commit that writes nothing (`ops` empty, e.g. a
+        // `get_for_update` with no write) takes no capacity and is not held,
+        // though its conflict check still takes a slot like any other
+        // commit. An append is a write. The early check below comes first: a
+        // conflict that is already certain needs no capacity, and returns
+        // without waiting for a stall.
+        let writes = !ops.is_empty() || !appends.is_empty();
 
         // Checked up to the horizon here, on this thread and before the
         // commit takes a slot; deciding the slot checks only what landed
@@ -422,15 +443,18 @@ impl RegolithEngine {
             }
             EarlyVerdict::Marks(early) => early,
         };
-        Ok(Requested::Queued(WriteRequest::Txn(TxnRequest {
-            checks,
-            ops,
-            appends,
-            durability,
-            perf: crate::PerfContext::level(),
-            early,
-            read_queue,
-        })))
+        Ok(Requested::Queued {
+            request: WriteRequest::Txn(TxnRequest {
+                checks,
+                ops,
+                appends,
+                durability,
+                perf: crate::PerfContext::level(),
+                early,
+                read_queue,
+            }),
+            writes,
+        })
     }
 
     /// What a transaction's commit learns from its landed group, as the

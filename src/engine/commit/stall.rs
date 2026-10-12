@@ -56,6 +56,8 @@ pub(crate) struct StallSignal {
     /// Stopped writers relieve the stop themselves: no worker, inline
     /// compaction on.
     writers_relieve: bool,
+    /// The caller relieves a stop: no worker, inline compaction turned off.
+    callers_relieve: bool,
     /// Pieces of progress so far, counted before each re-classification.
     progress: AtomicUsize,
 }
@@ -68,6 +70,7 @@ impl StallSignal {
     ) -> Self {
         Self {
             writers_relieve: options.max_background_compactions == 0 && options.inline_compaction,
+            callers_relieve: options.max_background_compactions == 0 && !options.inline_compaction,
             view,
             options,
             level,
@@ -166,16 +169,28 @@ impl StallSignal {
         // that came before the registration is not missed; and the progress
         // read again, so a landing between the contended step and the
         // registration is not missed either.
-        if self.classify().is_none_or(|(_, stopped)| !stopped) {
-            self.refresh();
-        } else if seen.is_some_and(|seen| seen != self.progress()) {
+        if !self.look_again() && seen.is_some_and(|seen| seen != self.progress()) {
             self.land();
         }
-        StallWait::new(slot, job, id, reason)
+        StallWait::new(slot, job, id, reason).left_to_the_caller(self.callers_relieve)
+    }
+
+    /// Classify the stall again, for a writer that has just got or
+    /// installed the unit: when writes are no longer stopped the unit is
+    /// landed here (`true`), since the clearer may have looked before the
+    /// unit was there (module docs, "No lost wakeup").
+    pub(crate) fn look_again(&self) -> bool {
+        let cleared = self.classify().is_none_or(|(_, stopped)| !stopped);
+        if cleared {
+            self.refresh();
+        }
+        cleared
     }
 
     /// The unit for the stall now, installed by the first writer to stop.
-    fn unit(&self) -> Arc<Job> {
+    /// Whoever takes it looks at the stall again afterwards
+    /// ([`Self::look_again`]).
+    pub(crate) fn unit(&self) -> Arc<Job> {
         loop {
             let current = self.current.load();
             if let Some(job) = current.as_ref()
@@ -192,6 +207,16 @@ impl StallSignal {
                 return fresh;
             }
         }
+    }
+
+    /// Test-only: whether a thread sleeps on the stall's unit, as a commit
+    /// that waits the stall out does.
+    #[cfg(test)]
+    pub(crate) fn has_sleeper(&self) -> bool {
+        self.current
+            .load()
+            .as_ref()
+            .is_some_and(|job| job.has_sleeper())
     }
 
     /// Test-only: whether a unit is installed and has not landed, as it is
@@ -463,3 +488,7 @@ mod latch_tests;
 #[cfg(all(test, not(loom)))]
 #[path = "stall_rollback_tests.rs"]
 mod rollback_tests;
+
+#[cfg(all(test, not(loom)))]
+#[path = "stall_commit_tests.rs"]
+mod commit_tests;
