@@ -63,7 +63,7 @@ impl JobBody for TurnCheck {
 }
 
 /// What the rotation check does about the active memtable.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum Rotation {
     /// It holds this many bytes, below `write_buffer_size`: the count is
     /// corrected and nothing is sealed.
@@ -158,6 +158,18 @@ impl RegolithEngine {
             state,
         };
         let refused = self.rotate(&mut ord, rotation).err();
+        // What a poll took for the check is given back first, so the level
+        // is classified with no flush exclusion held.
+        let _ = kept.release();
+        if !matches!(rotation, Rotation::NotDue(_)) {
+            // Whatever the rotation came to (E35). A flush took a memtable
+            // out and put a table in, a seal put a memtable in, and a
+            // rotation that fails part way leaves either one done, so the
+            // thresholds are classified again on every way out: a stopped
+            // writer its flush held off looks again (`StallSignal`, relief
+            // handed back).
+            self.refresh_stall_level();
+        }
         if let Some(err) = &refused
             && let Some(callback) = crate::Error::callback_panic_of(err)
         {
@@ -174,7 +186,6 @@ impl RegolithEngine {
             }
         }
         desc.turn.get_or_set(Turned { refused });
-        self.unkeep(kept);
         drop(held);
         true
     }
@@ -203,7 +214,8 @@ impl RegolithEngine {
 
     /// Carry `rotation` out in the ordered step, before the write whose
     /// turn this is takes a sequence: a failure is the write's, and means
-    /// it did not land.
+    /// it did not land. Its one caller classifies the stall thresholds
+    /// again whatever this returns.
     ///
     /// A memtable below the size only has its counted bytes corrected to
     /// what it holds: the count is an upper bound.
@@ -215,11 +227,7 @@ impl RegolithEngine {
             }
             Rotation::FlushSealed => {
                 let sealed = ord.seal(true)?;
-                let flushed = self.flush_until_retired(&sealed);
-                // Even when the flush failed: the memtable it left frozen
-                // counts toward the stall thresholds.
-                self.refresh_stall_level();
-                return flushed;
+                return self.flush_until_retired(&sealed);
             }
             Rotation::Seal => {}
             Rotation::FlushFirst { room } => self.flush_down_to(room)?,
@@ -228,25 +236,18 @@ impl RegolithEngine {
         // or by a writer once it leaves the pipeline.
         ord.seal(true)?;
         self.flush_sealed_later();
-        self.refresh_stall_level();
         Ok(())
     }
 
     /// Flush the oldest frozen memtables, here, until fewer than `room`
-    /// are left.
+    /// are left. Each flush gives its exclusion up before the next, and
+    /// all of them before the caller classifies the stall thresholds.
     fn flush_down_to(&self, room: usize) -> io::Result<()> {
         while self.view.load().frozen.len() >= room {
-            // The exclusion is released before the level is refreshed.
             let flushed = self
                 .flusher
                 .flushing()
                 .and_then(|flushing| self.flush_oldest_frozen(&flushing));
-            // A failed flush too, once its exclusion is released: a
-            // stopped writer it held off looks again (`StallSignal`,
-            // relief handed back).
-            if flushed.is_err() {
-                self.refresh_stall_level();
-            }
             if !flushed? {
                 break;
             }

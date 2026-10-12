@@ -56,6 +56,8 @@ mod wal_close_tests;
 pub(crate) mod wal_frame;
 mod wal_gate;
 pub(crate) mod wal_log;
+#[cfg(test)]
+mod wal_order_tests;
 pub(crate) mod wal_replay;
 #[cfg(test)]
 mod wal_rotation_tests;
@@ -1096,8 +1098,17 @@ impl RegolithEngine {
     /// Keep the first reason: it is the one that explains the rest. One
     /// compare-and-swap publishes it, and a later reason finds the cell
     /// full and is dropped.
+    ///
+    /// Every path that latches the engine comes through here, and a latched
+    /// engine relieves no stall: each later write fails before it does any
+    /// of the work that would. So the unit stopped writers wait on is landed
+    /// (E35), and each of them, run again, is told the latch
+    /// ([`Self::admit_write`]). The reason is published before the unit is
+    /// taken: a writer that registers after the take reads it
+    /// ([`Self::stall_wait`]), so none is missed.
     fn latch(&self, latch: WriteLatch) {
         let _ = self.write_latch.set(latch);
+        self.stall_signal.land();
     }
 
     /// Whether a failure latched the engine against writes. One load.
@@ -2097,6 +2108,12 @@ impl RegolithEngine {
         if self.is_closed() {
             return Err(crate::Error::Closed);
         }
+        // A latched engine takes no write and relieves no stall, so the
+        // answer is the latch: what the write is told once it is admitted,
+        // told here instead of a wait that would not end (E35).
+        if self.is_latched() {
+            return Err(self.latched_error().into());
+        }
         match self.stall_state() {
             None => {
                 // Stall cleared: update the cache so subsequent writers take
@@ -2150,9 +2167,28 @@ impl RegolithEngine {
                 Some(queue) => self.leave_stall_step(queue),
             }
         }
-        Err(crate::Error::WouldBlock(crate::WouldBlock::Stall(
-            self.stall_signal.wait(self.io(), queue, reason, None),
-        )))
+        Err(self.stall_wait(queue, reason, None))
+    }
+
+    /// What a stopped write returns: the wait for the stall `reason` to
+    /// clear, or the latch when the engine latched meanwhile (E35). `queue`
+    /// and `seen` are [`StallSignal::wait`]'s.
+    fn stall_wait(
+        &self,
+        queue: Option<Arc<io::shared::QueueShared>>,
+        reason: &'static str,
+        seen: Option<usize>,
+    ) -> crate::Error {
+        let wait = self.stall_signal.wait(self.io(), queue, reason, seen);
+        // Read only now that the wait is recorded. A latch publishes its
+        // reason before it lands the unit, so either it found this wait
+        // there or the reason is read here; the unit is landed again for the
+        // writers that registered on it beside this one.
+        if self.is_latched() {
+            self.stall_signal.land();
+            return self.latched_error().into();
+        }
+        crate::Error::WouldBlock(crate::WouldBlock::Stall(wait))
     }
 
     /// Relieve a stop on this thread, for a writer with no queue on a
@@ -2185,9 +2221,7 @@ impl RegolithEngine {
                 // thread's work is done and looks again, as any stopped write
                 // does (`StallSignal`, relief handed back).
                 CompactionOutcome::Contended => {
-                    break Err(crate::Error::WouldBlock(crate::WouldBlock::Stall(
-                        self.stall_signal.wait(self.io(), None, reason, Some(seen)),
-                    )));
+                    break Err(self.stall_wait(None, reason, Some(seen)));
                 }
                 // Idle is ambiguous under concurrency: "nothing to compact
                 // right now" is what a wedged engine looks like and also what

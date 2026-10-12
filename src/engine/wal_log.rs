@@ -380,12 +380,21 @@ impl Log {
                 std::thread::yield_now();
             }
         }
-        let cut = self.file.set_len(offset);
+        let cut = self.cut(offset);
         let cause = self.failure.take();
         if cut.is_ok() {
             self.poisoned.store(false, Ordering::Release);
         }
         (cause, cut)
+    }
+
+    /// Cut the file back to `offset`.
+    fn cut(&self, offset: u64) -> io::Result<()> {
+        #[cfg(test)]
+        if super::wal::fault::should_fail_cut(&self.path) {
+            return Err(io::Error::other("injected WAL cut failure"));
+        }
+        self.file.set_len(offset)
     }
 
     /// The first step of a rollback to `epoch` by a job that may not wait:
@@ -422,7 +431,7 @@ impl Log {
     /// is a helper's copy of an earlier record, wholly below the cut.
     pub(crate) fn cut_own(&self, offset: u64) -> io::Result<()> {
         debug_assert!(offset >= self.stamp_len && offset >= self.durable());
-        self.file.set_len(offset)
+        self.cut(offset)
     }
 
     /// Close the log cleanly, whose records end at `end`: sync every record,

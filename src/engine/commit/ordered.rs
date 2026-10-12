@@ -176,10 +176,10 @@ impl Ordered<'_> {
         let engine = self.engine;
         let fresh = Arc::new(MemTable::new(&engine.memtable_config)?);
         let new_wal_id = engine.versions.take_file_id()?;
-        // Recovery takes the newest log by file name and tolerates a torn
-        // tail only there, so a log has to be complete on disk before any
-        // newer file exists, an empty one included: sync it, then create the
-        // next one.
+        // Recovery takes the newest log by the id in its file name
+        // (`wal_scan::live`) and tolerates a torn tail only there, so a log
+        // has to be complete on disk before any newer file exists, an empty
+        // one included: sync it, then create the next one.
         self.sync_log()?;
         let log = Arc::new(Log::create_in(
             &engine.env,
@@ -420,7 +420,7 @@ impl RegolithEngine {
     /// Give back what a poll took for a unit's body. A stopped writer that
     /// found the flush exclusion held looks again once it is released, as
     /// after every flush (`StallSignal`, relief handed back).
-    pub(super) fn unkeep(&self, kept: super::park::Kept<'_>) {
+    fn unkeep(&self, kept: super::park::Kept<'_>) {
         if kept.release() {
             self.refresh_stall_level();
         }

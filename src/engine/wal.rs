@@ -640,6 +640,37 @@ pub(crate) mod fault {
         armed.retain(|a| a.dir != dir && Some(&a.dir) != real.as_ref());
     }
 
+    /// Every directory under which cutting a log back fails.
+    static CUTS: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+    /// Make every cut of a positional log under `dir` back to an earlier
+    /// length fail until disarmed: what a rollback meets when the device
+    /// refuses the truncation, after which the log's tail is unknown. The
+    /// path is armed as given and resolved, as for a sync.
+    pub(crate) fn arm_cut_failure(dir: &Path) {
+        let mut cuts = CUTS.lock();
+        cuts.push(dir.to_path_buf());
+        if let Some(real) = resolved(dir)
+            && real != dir
+        {
+            cuts.push(real);
+        }
+    }
+
+    /// Stop failing cuts under `dir`.
+    pub(crate) fn disarm_cut_failure(dir: &Path) {
+        let real = resolved(dir);
+        CUTS.lock()
+            .retain(|armed| armed != dir && Some(armed) != real.as_ref());
+    }
+
+    pub(crate) fn should_fail_cut(path: &Path) -> bool {
+        let real = path.parent().and_then(resolved);
+        CUTS.lock().iter().any(|dir| {
+            path.starts_with(dir) || real.as_ref().is_some_and(|real| real.starts_with(dir))
+        })
+    }
+
     pub(crate) fn should_fail_sync(path: &Path) -> bool {
         let mut armed = ARMED.lock();
         // The log itself may not exist yet, so the resolved form is

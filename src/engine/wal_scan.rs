@@ -43,6 +43,15 @@ pub(super) fn walk<'a>(
 /// and never the directory. A live log is one whose writes no table holds
 /// yet, and replay reads each one whole, so their paths cost nothing beside
 /// the replay itself.
+///
+/// The order is the id in each name read as a number. The names are padded
+/// to six digits, so as text `wal_1000000.log` sorts before
+/// `wal_999999.log`; recovery judges the last log of this list as the one a
+/// crash may have torn, so the text order would refuse a power cut in log
+/// 1,000,000 as damage and accept damage in log 999,999 as a torn tail.
+/// Recovery takes its logs from here and nowhere else, so no caller orders
+/// the names itself. A name with no id sorts before every numbered log, by
+/// name.
 pub(super) fn live(env: &dyn Env, dir: &Path, min_wal_id: u64) -> io::Result<Vec<PathBuf>> {
     let mut live = Vec::new();
     for log in walk(env, dir)? {
@@ -51,7 +60,7 @@ pub(super) fn live(env: &dyn Env, dir: &Path, min_wal_id: u64) -> io::Result<Vec
             live.push(log);
         }
     }
-    live.sort();
+    live.sort_by(|a, b| (super::wal_file_id(a), a).cmp(&(super::wal_file_id(b), b)));
     Ok(live)
 }
 
