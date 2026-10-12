@@ -165,8 +165,9 @@ fn readers_see_a_growing_prefix_of_whole_appends_while_a_writer_appends() {
 /// of them is in the log afterwards, whole.
 #[test]
 fn concurrent_appenders_lose_nothing() {
-    const THREADS: u64 = 8;
-    const EACH: u64 = 500;
+    // Sized for the interpreter as the appends beside readers above are.
+    const THREADS: u64 = if cfg!(miri) { 4 } else { 8 };
+    const EACH: u64 = if cfg!(miri) { 12 } else { 500 };
     let log = TombstoneLog::new();
     std::thread::scope(|scope| {
         for t in 0..THREADS {
@@ -196,7 +197,7 @@ fn concurrent_appenders_lose_nothing() {
 /// answers as if it had been appended once.
 #[test]
 fn the_same_tombstones_appended_by_two_threads_are_listed_once() {
-    const ROUNDS: u64 = 200;
+    const ROUNDS: u64 = if cfg!(miri) { 3 } else { 200 };
     for round in 0..ROUNDS {
         let log = TombstoneLog::new();
         log.push(tomb(b"a", b"c", 1));

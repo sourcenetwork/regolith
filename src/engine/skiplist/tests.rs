@@ -108,8 +108,11 @@ fn an_internal_key_inserted_twice_is_held_once() {
 #[test]
 fn concurrent_inserters_hold_every_key_once() {
     const PAIRS: u64 = 4;
-    const KEYS: u64 = 400;
-    for round in 0..8 {
+    // Interpreted, an insert costs thousands of times what it does native;
+    // a dozen keys a thread still race every pair on every level.
+    const KEYS: u64 = if cfg!(miri) { 12 } else { 400 };
+    const ROUNDS: u64 = if cfg!(miri) { 1 } else { 8 };
+    for round in 0..ROUNDS {
         let list = list(8 * 1024 * 1024);
         std::thread::scope(|scope| {
             for thread in 0..2 * PAIRS {
