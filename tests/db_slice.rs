@@ -24,8 +24,8 @@ fn get_slice_agrees_with_get_across_every_source() {
     // Enough keys to spill past the 4 KiB write buffer, so the reads
     // below hit the memtable, frozen memtables and SSTables alike.
     fill_sequential(&db, 500);
-    db.put(b"in_memtable", b"fresh").unwrap();
-    db.delete(b"key_000010").unwrap();
+    regolith::through_stalls(|| db.put(b"in_memtable", b"fresh")).unwrap();
+    regolith::through_stalls(|| db.delete(b"key_000010")).unwrap();
 
     for i in 0..500 {
         let key = format!("key_{i:06}");
@@ -47,7 +47,7 @@ fn get_slice_agrees_with_get_across_every_source() {
 fn get_slice_reads_an_empty_value() {
     let dir = TempDir::new().unwrap();
     let db = open(&dir);
-    db.put(b"empty", b"").unwrap();
+    regolith::through_stalls(|| db.put(b"empty", b"")).unwrap();
     let slice = db.get_slice(b"empty").unwrap().expect("present");
     assert!(slice.is_empty());
     assert_eq!(slice.len(), 0);
@@ -60,8 +60,8 @@ fn get_slice_cf_is_scoped_to_its_column_family() {
     let db = open(&dir);
     let cf = db.create_column_family("other").unwrap();
 
-    db.put(b"k", b"default_value").unwrap();
-    db.put_cf(&cf, b"k", b"cf_value").unwrap();
+    regolith::through_stalls(|| db.put(b"k", b"default_value")).unwrap();
+    regolith::through_stalls(|| db.put_cf(&cf, b"k", b"cf_value")).unwrap();
 
     assert_eq!(db.get_slice(b"k").unwrap().unwrap(), *b"default_value");
     assert_eq!(db.get_slice_cf(&cf, b"k").unwrap().unwrap(), *b"cf_value");
@@ -73,12 +73,12 @@ fn snapshot_get_slice_sees_the_snapshot_view() {
     let dir = TempDir::new().unwrap();
     let db = open(&dir);
     let cf = db.create_column_family("cf").unwrap();
-    db.put(b"k", b"v1").unwrap();
-    db.put_cf(&cf, b"k", b"cf1").unwrap();
+    regolith::through_stalls(|| db.put(b"k", b"v1")).unwrap();
+    regolith::through_stalls(|| db.put_cf(&cf, b"k", b"cf1")).unwrap();
 
     let snap = db.snapshot();
-    db.put(b"k", b"v2").unwrap();
-    db.put_cf(&cf, b"k", b"cf2").unwrap();
+    regolith::through_stalls(|| db.put(b"k", b"v2")).unwrap();
+    regolith::through_stalls(|| db.put_cf(&cf, b"k", b"cf2")).unwrap();
 
     assert_eq!(snap.get_slice(b"k").unwrap().unwrap(), *b"v1");
     assert_eq!(snap.get_slice_cf(&cf, b"k").unwrap().unwrap(), *b"cf1");
@@ -89,7 +89,7 @@ fn snapshot_get_slice_sees_the_snapshot_view() {
 fn a_slice_outlives_the_flush_of_the_memtable_it_came_from() {
     let dir = TempDir::new().unwrap();
     let db = open(&dir);
-    db.put(b"pinned", b"survives the flush").unwrap();
+    regolith::through_stalls(|| db.put(b"pinned", b"survives the flush")).unwrap();
 
     let slice = db.get_slice(b"pinned").unwrap().expect("present");
     // Push the memtable it came from out of memory and onto disk.
@@ -117,7 +117,7 @@ fn a_slice_outlives_the_database_handle() {
     let dir = TempDir::new().unwrap();
     let slice = {
         let db = open(&dir);
-        db.put(b"k", b"outlives close").unwrap();
+        regolith::through_stalls(|| db.put(b"k", b"outlives close")).unwrap();
         let slice = db.get_slice(b"k").unwrap().expect("present");
         db.close().unwrap();
         slice
@@ -133,7 +133,7 @@ fn a_slice_outlives_the_database_handle() {
 fn slice_traits_cover_the_documented_surface() {
     let dir = TempDir::new().unwrap();
     let db = open(&dir);
-    db.put(b"k", b"abc").unwrap();
+    regolith::through_stalls(|| db.put(b"k", b"abc")).unwrap();
     let slice = db.get_slice(b"k").unwrap().expect("present");
 
     // Deref / AsRef.
@@ -173,10 +173,12 @@ fn a_tailing_iterator_hands_out_values_that_outlive_its_cursor() {
     let dir = TempDir::new().expect("tempdir");
     let db = Db::open(dir.path(), Options::default()).expect("open");
     for i in 0..64u32 {
-        db.put(
-            format!("t{i:04}").as_bytes(),
-            format!("value-{i}").as_bytes(),
-        )
+        regolith::through_stalls(|| {
+            db.put(
+                format!("t{i:04}").as_bytes(),
+                format!("value-{i}").as_bytes(),
+            )
+        })
         .expect("put");
     }
 
@@ -191,8 +193,7 @@ fn a_tailing_iterator_hands_out_values_that_outlive_its_cursor() {
     assert_eq!(&*first, b"value-0");
     iter.next();
     for i in 64..128u32 {
-        db.put(format!("t{i:04}").as_bytes(), b"later")
-            .expect("put");
+        regolith::through_stalls(|| db.put(format!("t{i:04}").as_bytes(), b"later")).expect("put");
     }
     while iter.valid() {
         iter.next();
@@ -214,10 +215,12 @@ fn every_iterator_value_slice_agrees_with_its_borrowed_value() {
     // Half in SSTables, half still in the memtable, so both owner
     // variants are exercised in one walk.
     for i in 400..600usize {
-        db.put(
-            format!("key_{i:06}").as_bytes(),
-            format!("val_{i:06}").as_bytes(),
-        )
+        regolith::through_stalls(|| {
+            db.put(
+                format!("key_{i:06}").as_bytes(),
+                format!("val_{i:06}").as_bytes(),
+            )
+        })
         .expect("put");
     }
 
@@ -253,7 +256,7 @@ fn every_iterator_value_slice_agrees_with_its_borrowed_value() {
 fn try_subslice_narrows_a_read_value() {
     let dir = TempDir::new().unwrap();
     let db = open(&dir);
-    db.put(b"k", b"header:payload").unwrap();
+    regolith::through_stalls(|| db.put(b"k", b"header:payload")).unwrap();
     let slice = db.get_slice(b"k").unwrap().expect("present");
 
     assert_eq!(slice.try_subslice(7..14).unwrap(), *b"payload");
@@ -283,8 +286,8 @@ fn merge_operator_reads_route_through_get_slice() {
     let dir = TempDir::new().unwrap();
     let opts = Options::default().merge_operator(Some(std::sync::Arc::new(AppendMerge)));
     let db = Db::open(dir.path(), opts).unwrap();
-    db.put(b"k", b"base").unwrap();
-    db.merge(b"k", b"+1").unwrap();
+    regolith::through_stalls(|| db.put(b"k", b"base")).unwrap();
+    regolith::through_stalls(|| db.merge(b"k", b"+1")).unwrap();
 
     assert_eq!(
         owned(db.get_slice(b"k").unwrap()),
@@ -316,7 +319,7 @@ proptest! {
                 batch.put(key, value);
             }
         }
-        db.write(batch).unwrap();
+        regolith::through_stalls(|| db.write(batch.clone())).unwrap();
 
         for (key, _, _) in &writes {
             let via_get = db.get(key).unwrap();

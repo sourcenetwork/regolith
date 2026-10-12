@@ -15,7 +15,7 @@ pub(super) fn populate(db: &Db, prefix: &str, n: usize) {
         let k = format!("{}_{:05}", prefix, i);
         let mut v = filler.clone();
         v.extend_from_slice(k.as_bytes());
-        db.put(k.as_bytes(), &v).unwrap();
+        crate::through_stalls(|| db.put(k.as_bytes(), &v)).unwrap();
     }
 }
 

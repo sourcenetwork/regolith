@@ -106,6 +106,11 @@ fn pairs_child(spec: &ChildSpec) {
                         match tx.commit() {
                             Ok(_) => break,
                             Err(TransactionError::Conflict(_)) => continue,
+                            // A stall applied nothing: wait it out, then
+                            // the attempt again.
+                            Err(TransactionError::WouldBlock(regolith::WouldBlock::Stall(
+                                stall,
+                            ))) => stall.wait(),
                             Err(other) => panic!("child: commit: {other}"),
                         }
                     }

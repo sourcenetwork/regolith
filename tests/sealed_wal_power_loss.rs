@@ -40,7 +40,9 @@ fn workload(spec: &ChildSpec) {
             ..WriteOptions::default()
         };
         match &op.value {
-            OpValue::Put(value) => db.put_opt(&opts, &op.key, value).expect("child: put"),
+            OpValue::Put(value) => {
+                regolith::through_stalls(|| db.put_opt(&opts, &op.key, value)).expect("child: put")
+            }
             OpValue::Delete => unreachable!("the spec disables deletes"),
         }
     }

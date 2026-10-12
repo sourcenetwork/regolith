@@ -94,7 +94,7 @@ fn frozen(db: &Db) -> u64 {
 fn write_until_sealed(db: &Db, stats: &Statistics) {
     let flushes = stats.get_ticker(Ticker::FlushCount);
     for i in 0..64u32 {
-        db.put(format!("k{i:04}").as_bytes(), &[7u8; 1024]).unwrap();
+        regolith::through_stalls(|| db.put(format!("k{i:04}").as_bytes(), &[7u8; 1024])).unwrap();
         if frozen(db) > 0 || stats.get_ticker(Ticker::FlushCount) > flushes {
             return;
         }
@@ -113,7 +113,7 @@ fn an_owed_flush_runs_at_the_writers_poll() {
     write_until_sealed(&db, &stats);
     // The write that sealed returned; any write after it only queues the
     // owed step again, never runs it.
-    db.put(b"after", b"v").unwrap();
+    regolith::through_stalls(|| db.put(b"after", b"v")).unwrap();
     assert!(frozen(&db) > 0, "the owed flush waits for the poll");
     assert_eq!(stats.get_ticker(Ticker::FlushCount), 0);
     queue.poll(IoBudget::ALL);
@@ -129,7 +129,7 @@ fn an_owed_flush_runs_inline_with_no_queue() {
     let stats = Arc::new(Statistics::new());
     let db = Db::open(dir.path(), no_worker(&stats)).unwrap();
     write_until_sealed(&db, &stats);
-    db.put(b"after", b"v").unwrap();
+    regolith::through_stalls(|| db.put(b"after", b"v")).unwrap();
     assert_eq!(frozen(&db), 0, "the write after the seal flushed inline");
     assert_eq!(stats.get_ticker(Ticker::FlushCount), 1);
 }
@@ -143,7 +143,7 @@ fn an_owed_step_lands_on_the_starting_threads_queue_only() {
     let db = Db::open(dir.path(), no_worker(&stats)).unwrap();
     let mut mine = db.io_queue();
     write_until_sealed(&db, &stats);
-    db.put(b"after", b"v").unwrap();
+    regolith::through_stalls(|| db.put(b"after", b"v")).unwrap();
     std::thread::scope(|scope| {
         scope.spawn(|| {
             let mut theirs = db.io_queue();
@@ -164,10 +164,10 @@ fn a_dropped_queue_leaves_the_step_owed() {
     let db = Db::open(dir.path(), no_worker(&stats)).unwrap();
     let queue = db.io_queue();
     write_until_sealed(&db, &stats);
-    db.put(b"after", b"v").unwrap();
+    regolith::through_stalls(|| db.put(b"after", b"v")).unwrap();
     assert!(frozen(&db) > 0);
     drop(queue);
-    db.put(b"next", b"v").unwrap();
+    regolith::through_stalls(|| db.put(b"next", b"v")).unwrap();
     assert_eq!(frozen(&db), 0, "the next write took the owed flush inline");
 }
 
@@ -186,11 +186,11 @@ fn the_disk_check_runs_at_the_first_writers_poll_with_no_worker() {
     .unwrap();
     assert_eq!(env.checks.load(Ordering::SeqCst), 0, "not on the open path");
     let mut queue = db.io_queue();
-    db.put(b"k", b"v").unwrap();
+    regolith::through_stalls(|| db.put(b"k", b"v")).unwrap();
     assert_eq!(env.checks.load(Ordering::SeqCst), 0, "not inside the write");
     queue.poll(IoBudget::ALL);
     assert_eq!(env.checks.load(Ordering::SeqCst), 1);
-    db.put(b"k2", b"v").unwrap();
+    regolith::through_stalls(|| db.put(b"k2", b"v")).unwrap();
     queue.poll(IoBudget::ALL);
     assert_eq!(env.checks.load(Ordering::SeqCst), 1, "once");
 }

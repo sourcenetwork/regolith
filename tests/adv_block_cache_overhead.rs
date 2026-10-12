@@ -194,7 +194,10 @@ fn a_cached_entry_costs_no_more_heap_than_it_is_charged() {
         );
         let line = stdout
             .lines()
-            .find(|l| l.starts_with("ADVRESULT"))
+            // On one CPU the harness runs the child test on its main
+            // thread and prints "test <name> ... " first, so the result
+            // does not start its line.
+            .find(|l| l.contains("ADVRESULT"))
             .unwrap_or_else(|| panic!("no result from child:\n{stdout}"))
             .to_string();
         println!("{line}");

@@ -40,7 +40,7 @@ fn seeded(partitioned: bool) -> TempDir {
     let dir = TempDir::new().unwrap();
     let db = Db::open(dir.path(), base(partitioned)).unwrap();
     for i in 0..KEYS {
-        db.put(&key_for(i), &value_for(i)).unwrap();
+        regolith::through_stalls(|| db.put(&key_for(i), &value_for(i))).unwrap();
     }
     db.compact_range(None, None).wait().unwrap();
     db.close().unwrap();
