@@ -37,7 +37,8 @@ jobs:
   # only exists in a debug build.
   loom:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # Measured at 18 to 19 minutes for every recipe of `just loom-all`.
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
