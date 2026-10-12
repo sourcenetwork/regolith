@@ -953,8 +953,8 @@ impl RegolithEngine {
 
     pub(crate) fn ensure_writable(&self) -> std::io::Result<()> {
         self.ensure_open()?;
-        if self.write_latched.load(Ordering::Acquire) {
-            return Err(self.latched_error());
+        if let Some(latched) = self.latched() {
+            return Err(latched);
         }
         if self.is_read_only() {
             Err(Self::read_only_error())
@@ -982,6 +982,18 @@ impl RegolithEngine {
     fn latch(&self, latch: WriteLatch) {
         self.write_latch.lock().get_or_insert(latch);
         self.write_latched.store(true, Ordering::Release);
+        // A writer a stall stopped is waiting for the stop to clear, and no
+        // write will be taken when it does: wake it to read the latch now
+        // (`wait_for_write_capacity_slow`).
+        self.stall_signal.notify_all();
+    }
+
+    /// The latch, if the engine is latched: what every write on it is told
+    /// from then on.
+    fn latched(&self) -> Option<std::io::Error> {
+        self.write_latched
+            .load(Ordering::Acquire)
+            .then(|| self.latched_error())
     }
 
     fn latched_error(&self) -> std::io::Error {
@@ -2121,6 +2133,12 @@ impl RegolithEngine {
         loop {
             if self.is_closed() {
                 return Err(crate::Error::Closed);
+            }
+            // Read on every wake: a latched engine takes no write, so a
+            // writer that waited for the stop to clear would wait for
+            // nothing, and for ever where the worker cannot clear it.
+            if let Some(latched) = self.latched() {
+                return Err(latched.into());
             }
             match self.stall_state() {
                 None => {
