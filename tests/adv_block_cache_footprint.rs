@@ -136,7 +136,9 @@ fn empty_db_footprint_is_flat_in_shard_count() {
         );
         let line = stdout
             .lines()
-            .find(|l| l.starts_with("ADVRESULT"))
+            // Anywhere in the line: with one test thread libtest prints
+            // "test <name> ... " in front of what the child prints.
+            .find_map(|l| l.find("ADVRESULT").map(|at| &l[at..]))
             .unwrap_or_else(|| panic!("child at shard_bits {bits} printed no result:\n{stdout}"))
             .to_string();
         let field = |name: &str| -> i64 {
