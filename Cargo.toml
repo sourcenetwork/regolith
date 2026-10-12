@@ -203,6 +203,10 @@ name = "wal_replay"
 harness = false
 
 [[bench]]
+name = "open_recovery"
+harness = false
+
+[[bench]]
 name = "soak"
 harness = false
 

@@ -277,6 +277,8 @@ fn residual_damage_in_the_last_synced_group_is_reported_never_silent() {
         let out = crash(spec, Trigger::wal_write(nth), TearMode::Truncate);
         let wal = fault::newest_wal(&db);
         let pristine = std::fs::read(&wal).unwrap();
+        let manifest = db.join("MANIFEST");
+        let pristine_manifest = std::fs::read(&manifest).unwrap();
         let bounds = wal_format::record_bounds(&pristine);
         assert!(bounds.len() >= 3, "write {nth}: needs two whole groups");
         let last = bounds[bounds.len() - 2];
@@ -300,11 +302,13 @@ fn residual_damage_in_the_last_synced_group_is_reported_never_silent() {
         assert_eq!(taken[0].offset, last as u64);
         assert_eq!(stats.get_ticker(Ticker::WalTailDiscarded), 1);
 
-        // Reopening dropped and truncated it; plant the rot one group
-        // earlier in the pristine log instead.
+        // Reopening dropped and truncated it, and recorded the log as
+        // retired in the manifest; plant the rot one group earlier in the
+        // pristine log, beside the pristine manifest, instead.
         let mut rotted = pristine.clone();
         rotted[before + wal_format::HEADER_LEN + 2] ^= 0x10;
         std::fs::write(&wal, &rotted).unwrap();
+        std::fs::write(&manifest, &pristine_manifest).unwrap();
         for extra in fault::find_wals(&db) {
             if extra != wal {
                 std::fs::remove_file(extra).unwrap();
