@@ -139,7 +139,7 @@ impl RawRwLock {
         self.transition(|state| {
             let next = (state & !WRITER) + ONE_READER;
             if state & QUEUED != 0 {
-                Step::Drain(next | WAKE_FRONT)
+                Step::Wake(next | WAKE_FRONT)
             } else {
                 Step::Set(next)
             }
