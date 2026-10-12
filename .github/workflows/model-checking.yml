@@ -159,7 +159,15 @@ jobs:
         with:
           components: miri
       - uses: Swatinem/rust-cache@v2
-      - run: "cargo miri test --lib -- --test-threads=1 engine::arena:: engine::skiplist:: engine::memtable:: engine::block:: slice::tests:: sync::"
+      # Stopped ten minutes under the job's limit, so a run that does not
+      # finish fails with a message rather than as a cancelled job. Measured
+      # at 49 minutes for 189 tests on a workstation at load 60 to 380.
+      - run: |
+          timeout 110m cargo miri test --lib -- --test-threads=1 engine::arena:: engine::skiplist:: engine::memtable:: engine::block:: slice::tests:: sync:: || {
+            code=$?
+            [ "$code" -ne 124 ] || echo "::error::miri did not finish within 110 minutes and was stopped"
+            exit "$code"
+          }
 
   # Long-running stress, soak, and fault-injection tests. Gated behind
   # `#[ignore]` in the main crate so `cargo test` stays fast for PRs;
