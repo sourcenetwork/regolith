@@ -17,6 +17,12 @@
 //!   outcome is resolved, and the transaction's callbacks run, at the poll
 //!   that delivers it, on the queue's thread.
 //!
+//! A pessimistic commit's key locks are released when its group lands, by
+//! the thread that lands it: the commit is applied and visible by then (and
+//! durable at `Immediate`), so the next holder reads it, and no transaction
+//! waits for this one's owner to poll its queue (`LockTable.tla`,
+//! `IsolationAtLanding`).
+//!
 //! Exactly one outcome per transaction, whichever way it ends: the commit
 //! claim is won here as `commit` wins it, and the callbacks of the outcome
 //! run once, at return for a ticket ready then, else at delivery, through the
@@ -24,7 +30,7 @@
 
 use std::sync::Arc;
 
-use super::{LockManager, Transaction, TransactionError, TxMode, TxResult, receipt_of};
+use super::{Transaction, TransactionError, TxResult, receipt_of};
 use crate::engine::io::job::Delivery;
 use crate::engine::io::shared::QueueShared;
 use crate::engine::{GroupSync, NowaitCommit, RegolithEngine, Settled, conclude_settled};
@@ -42,23 +48,6 @@ enum Committed {
         queue: Arc<QueueShared>,
         scan_runs_dropped: u64,
     },
-}
-
-/// The key locks a pessimistic commit holds until its outcome is delivered:
-/// released then, so no transaction that takes one of them can read past a
-/// commit that is written but not yet visible.
-struct HeldLocks {
-    manager: Arc<LockManager>,
-    tx_id: u64,
-    keys: Vec<Vec<u8>>,
-}
-
-impl HeldLocks {
-    fn release(self) {
-        for key in self.keys {
-            self.manager.release(&key, self.tx_id);
-        }
-    }
 }
 
 impl Transaction {
@@ -101,8 +90,11 @@ impl Transaction {
     ///   does.
     /// - **Locks and the snapshot.** The snapshot is released when this
     ///   returns. A pessimistic transaction's key locks are held until the
-    ///   outcome is delivered, so no transaction that takes one reads past a
-    ///   commit written but not yet visible.
+    ///   commit lands (applied and visible, and durable at `Immediate`), so
+    ///   no transaction that takes one reads past a commit written but not
+    ///   yet visible. They are released by the thread that lands the group,
+    ///   whether or not this transaction's queue was polled since: another
+    ///   transaction never waits for this one's outcome to be delivered.
     ///
     /// Dropping the ticket never cancels the commit. Dropping the queue
     /// delivers its tickets on the dropping thread (see
@@ -139,7 +131,7 @@ impl Transaction {
                 queue,
                 scan_runs_dropped,
             } => {
-                let locks = self.take_locks();
+                let locks = self.take_landing_locks();
                 self.release_resources();
                 let ending = self.ending();
                 let stats = engine.statistics_arc();
@@ -157,9 +149,6 @@ impl Transaction {
                 }));
                 let report = Arc::downgrade(&engine);
                 completion.first(Box::new(move |result| {
-                    if let Some(locks) = locks {
-                        locks.release();
-                    }
                     if let Err(TransactionError::Conflict(conflict)) = result
                         && let Some(engine) = report.upgrade()
                     {
@@ -167,6 +156,13 @@ impl Transaction {
                     }
                     ending.finish(true, result);
                 }));
+                // Told by whichever thread lands the group, on that thread;
+                // a group that landed already refuses, and they go now.
+                if let Some(locks) = locks
+                    && !group.job().listen(Arc::clone(&locks) as Arc<dyn Delivery>)
+                {
+                    locks.release();
+                }
                 let waiter: Arc<dyn Delivery> = Arc::clone(&completion) as Arc<dyn Delivery>;
                 if !engine
                     .io()
@@ -235,24 +231,5 @@ impl Transaction {
             },
             Err(err) => Committed::Done(receipt(Err(err))),
         }
-    }
-
-    /// The key locks a pessimistic transaction holds, taken out of it.
-    fn take_locks(&mut self) -> Option<HeldLocks> {
-        let TxMode::Pessimistic { tx_id } = self.mode else {
-            return None;
-        };
-        let manager = Arc::clone(self.lock_manager.as_ref()?);
-        let keys: Vec<Vec<u8>> = self
-            .held_locks
-            .drain()
-            .into_iter()
-            .map(|(k, ())| k)
-            .collect();
-        Some(HeldLocks {
-            manager,
-            tx_id,
-            keys,
-        })
     }
 }

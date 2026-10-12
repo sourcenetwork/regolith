@@ -23,10 +23,26 @@
 //! stands for lands it, through [`Job::release`]. That is the stall: its
 //! readiness is the stall clearing, which a flush or a compaction makes
 //! happen elsewhere.
+//!
+//! # Parking
+//!
+//! A queue's poll never waits for another thread, so it runs a job through
+//! [`JobBody::step`]. A job whose next step needs something another thread
+//! holds (a foreground job needs the compaction gate) does not wait for it:
+//! it registers the waker its step was given where the wait ends and hands
+//! itself back ([`Step::Parked`]). The job gives its claim back and stays on
+//! its queue, not runnable. When what it waits for may be free, the waker
+//! pushes [`Message::Ready`] to the queue, which wakes an idle owner once,
+//! and the owner's next poll claims the job and steps it again. The message
+//! sits in the inbox until the owner takes it, so a wake that comes before
+//! the job finished parking is not lost. A parked job is still found and
+//! settled by close, by its queue's drop, and by a blocking
+//! [`JobTicket::wait`](crate::JobTicket::wait), each through a claim.
 
 #![allow(unsafe_code)]
 
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
+use std::task::{Wake, Waker};
 use std::thread::{self, Thread};
 
 use super::flight::Flight;
@@ -34,10 +50,30 @@ use super::shared::{Message, QueueShared};
 use super::stack::{SHUT, Stack};
 use crate::sync::internal::UnsafeCell;
 
+/// What one step of a job did.
+pub(crate) enum Step {
+    /// The job ran to its end.
+    Done,
+    /// The job cannot go on without waiting for another thread. It hands
+    /// itself back, having registered the step's waker to be woken once it
+    /// may go on.
+    Parked(Box<dyn JobBody>),
+}
+
 /// The work a job does.
 pub(crate) trait JobBody: Send {
-    /// Do the work, on the thread that claimed the job.
+    /// Do the work, on the thread that claimed the job, waiting on this
+    /// thread for whatever it needs: a worker's way, and a blocking
+    /// caller's.
     fn run(self: Box<Self>);
+    /// Do as much of the work as needs no wait for another thread: a
+    /// queue's poll's way. A body that would wait registers `waker` where
+    /// its wait ends and parks instead. A body that never waits for another
+    /// thread keeps this default, which runs it.
+    fn step(self: Box<Self>, _waker: &Waker) -> Step {
+        self.run();
+        Step::Done
+    }
     /// Settle the job without running it, when the database closes or the
     /// queue that would have run it is dropped. A job whose work cannot be
     /// left undone (a commit group's fsync) runs it here instead.
@@ -143,6 +179,38 @@ impl Job {
         self.land();
     }
 
+    /// [`run`](Self::run) for a queue's poll, after this caller's claim won:
+    /// step the body, never waiting for another thread. `true` when the job
+    /// ran to its end and landed. `false` when it parked: the body is back
+    /// in the job and the claim given up, and `waker` is woken once the job
+    /// may go on. A panic in the body lands the job, as in `run`.
+    pub(crate) fn step(self: &Arc<Self>, waker: &Waker) -> bool {
+        struct Unwind<'a>(Option<&'a Arc<Job>>);
+        impl Drop for Unwind<'_> {
+            fn drop(&mut self) {
+                if let Some(job) = self.0.take() {
+                    job.land();
+                }
+            }
+        }
+        let mut unwind = Unwind(Some(self));
+        // SAFETY: the claim gave this thread the body.
+        let step = self
+            .body
+            .with_mut(|body| unsafe { (*body).take() })
+            .map(|body| body.step(waker));
+        unwind.0 = None;
+        if let Some(Step::Parked(body)) = step {
+            // SAFETY: still under the claim, which `park` gives up only
+            // after the body is back.
+            self.body.with_mut(|slot| unsafe { *slot = Some(body) });
+            self.flight.park();
+            return false;
+        }
+        self.land();
+        true
+    }
+
     /// Settle a job nobody is running without running it (its body says how)
     /// and land it. `false` when another thread had already claimed it; that
     /// thread lands it.
@@ -205,10 +273,159 @@ impl Job {
     }
 }
 
+/// Wakes a parked job: pushes it back to the queue that steps it, which
+/// wakes that queue's owner when it is idle.
+struct Unpark {
+    /// Weak, since the job's body holds this waker while it is parked.
+    job: Weak<Job>,
+    queue: Weak<QueueShared>,
+    /// Each step gets its own waker and one push brings the next step, so a
+    /// waker pushes once: what a parked job leaves in an inbox nobody takes
+    /// is one message, however often it is woken.
+    fired: crate::portability::AtomicBool,
+}
+
+impl Wake for Unpark {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        if self.fired.swap(true, crate::portability::Ordering::AcqRel) {
+            return;
+        }
+        if let (Some(job), Some(queue)) = (self.job.upgrade(), self.queue.upgrade()) {
+            // A queue dropped meanwhile settled the job in its drop.
+            let _ = queue.deliver(Message::Ready(job));
+        }
+    }
+}
+
+/// The waker `queue`'s poll steps `job` with.
+pub(crate) fn unpark_waker(job: &Arc<Job>, queue: &Arc<QueueShared>) -> Waker {
+    Waker::from(Arc::new(Unpark {
+        job: Arc::downgrade(job),
+        queue: Arc::downgrade(queue),
+        fired: crate::portability::AtomicBool::new(false),
+    }))
+}
+
 #[cfg(all(test, not(loom)))]
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Parks until `open` is set, counting its steps; then runs.
+    struct Gated {
+        open: Arc<std::sync::atomic::AtomicBool>,
+        steps: Arc<AtomicUsize>,
+        runs: Arc<AtomicUsize>,
+        releases: Arc<AtomicUsize>,
+    }
+
+    impl JobBody for Gated {
+        fn run(self: Box<Self>) {
+            self.runs.fetch_add(1, Ordering::SeqCst);
+        }
+        fn step(self: Box<Self>, _waker: &Waker) -> Step {
+            self.steps.fetch_add(1, Ordering::SeqCst);
+            if self.open.load(Ordering::SeqCst) {
+                self.run();
+                Step::Done
+            } else {
+                Step::Parked(self)
+            }
+        }
+        fn release(self: Box<Self>) {
+            self.releases.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    type GatedParts = (
+        Arc<Job>,
+        Arc<std::sync::atomic::AtomicBool>,
+        Arc<AtomicUsize>,
+        Arc<AtomicUsize>,
+        Arc<AtomicUsize>,
+    );
+
+    fn gated() -> GatedParts {
+        let open = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (steps, runs, releases) = (
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicUsize::new(0)),
+        );
+        let job = Job::new(Box::new(Gated {
+            open: Arc::clone(&open),
+            steps: Arc::clone(&steps),
+            runs: Arc::clone(&runs),
+            releases: Arc::clone(&releases),
+        }));
+        (job, open, steps, runs, releases)
+    }
+
+    #[test]
+    fn a_parked_job_gives_its_claim_back_and_runs_once_when_stepped_again() {
+        let (job, open, steps, runs, _) = gated();
+        assert!(job.claim());
+        assert!(!job.step(Waker::noop()), "it parks");
+        assert!(!job.is_done());
+        assert!(job.is_runnable(), "the claim is free again");
+        assert!(job.claim());
+        assert!(!job.step(Waker::noop()), "still gated");
+        open.store(true, Ordering::SeqCst);
+        assert!(job.claim());
+        assert!(job.step(Waker::noop()), "it runs and lands");
+        assert!(job.is_done());
+        assert!(!job.claim(), "a landed job is not claimed again");
+        assert_eq!(steps.load(Ordering::SeqCst), 3);
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn a_parked_job_is_settled_by_a_release_or_run_by_a_blocking_claim() {
+        let (job, _, _, runs, releases) = gated();
+        assert!(job.claim());
+        assert!(!job.step(Waker::noop()));
+        assert!(job.release(), "close settles a parked job");
+        assert_eq!(
+            (runs.load(Ordering::SeqCst), releases.load(Ordering::SeqCst)),
+            (0, 1)
+        );
+
+        let (job, _, _, runs, releases) = gated();
+        assert!(job.claim());
+        assert!(!job.step(Waker::noop()));
+        assert!(job.claim(), "a blocking caller claims it");
+        job.run();
+        assert!(job.is_done());
+        assert_eq!(
+            (runs.load(Ordering::SeqCst), releases.load(Ordering::SeqCst)),
+            (1, 0)
+        );
+    }
+
+    #[test]
+    fn the_unpark_waker_pushes_the_job_back_to_its_queue() {
+        let (job, _, _, _, _) = gated();
+        let queue = Arc::new(QueueShared::new(super::super::shared::test_id(), 1));
+        let waker = unpark_waker(&job, &queue);
+        waker.wake_by_ref();
+        let pushed: Vec<_> = queue.take_inbox().collect();
+        assert!(
+            matches!(&pushed[..], [Message::Ready(ready)] if Arc::ptr_eq(ready, &job)),
+            "one Ready naming the job"
+        );
+        // One push per waker, however often it is woken.
+        waker.wake_by_ref();
+        assert_eq!(queue.take_inbox().count(), 0);
+        // A job that is gone is woken to no effect.
+        let fresh = unpark_waker(&job, &queue);
+        drop((pushed, job));
+        fresh.wake_by_ref();
+        assert_eq!(queue.take_inbox().count(), 0);
+    }
 
     struct Count(Arc<AtomicUsize>, Arc<AtomicUsize>);
 

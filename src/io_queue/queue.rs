@@ -199,9 +199,10 @@ impl IoQueue {
                         continue;
                     }
                     // A passive job, or one another thread claimed, lands
-                    // without this thread; its completion comes here.
-                    if job.claim() {
-                        self.cache.io().run_job(&job);
+                    // without this thread; its completion comes here. One
+                    // that parks is left out of `order` until its waker
+                    // pushes it back, so the poll never waits for it.
+                    if job.claim() && self.cache.io().step_job(&job, &self.shared) {
                         ran += 1;
                     }
                 }
@@ -235,7 +236,9 @@ impl IoQueue {
         use std::task::{Context, Poll};
 
         let mut future = std::pin::pin!(future);
-        let waker = Waker::from(Arc::new(Unpark(std::thread::current())));
+        let waker = Waker::from(Arc::new(crate::sync::internal::Unpark(
+            std::thread::current(),
+        )));
         let mut cx = Context::from_waker(&waker);
         loop {
             if let Poll::Ready(output) = future.as_mut().poll(&mut cx) {
@@ -310,6 +313,13 @@ impl IoQueue {
                 Message::Deliver(waiter) => {
                     waiter.deliver();
                     *completed += 1;
+                }
+                Message::Ready(job) => {
+                    // Settled meanwhile (closed, or run by a blocking
+                    // caller): its `JobDone` took it out of `jobs`.
+                    if self.jobs.contains_key(&job_address(&job)) {
+                        self.order.push_back(Pending::Job(job));
+                    }
                 }
             }
         }
@@ -437,7 +447,7 @@ impl Drop for IoQueue {
                 Message::Room(slot) => slot.complete(),
                 // Its unit or job is in `waiting` or `jobs`, and is handled
                 // there.
-                Message::Done(_) | Message::JobDone(_) => {}
+                Message::Done(_) | Message::JobDone(_) | Message::Ready(_) => {}
                 Message::Job { job, waiter } => {
                     let wait = self
                         .jobs
@@ -485,21 +495,6 @@ fn settle_on_drop(runtime: &IoRuntime, job: &Arc<Job>) {
         return;
     }
     job.wait_landed();
-}
-
-/// Wakes a thread parked in [`IoQueue::block_on`].
-#[cfg(not(target_arch = "wasm32"))]
-struct Unpark(std::thread::Thread);
-
-#[cfg(not(target_arch = "wasm32"))]
-impl std::task::Wake for Unpark {
-    fn wake(self: Arc<Self>) {
-        self.0.unpark();
-    }
-
-    fn wake_by_ref(self: &Arc<Self>) {
-        self.0.unpark();
-    }
 }
 
 impl std::fmt::Debug for IoQueue {

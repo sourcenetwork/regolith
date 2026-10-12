@@ -242,7 +242,7 @@ fn an_ingest_installed_after_the_drop_is_refused() {
         // The ingest takes the compaction gate once its table is staged and
         // validated, then waits here for the pipeline.
         let deadline = Instant::now() + Duration::from_secs(30);
-        while engine.compaction_lock.try_read().is_some() {
+        while engine.compaction_gate().try_shared().is_some() {
             assert!(
                 Instant::now() < deadline,
                 "the ingest never finished staging"

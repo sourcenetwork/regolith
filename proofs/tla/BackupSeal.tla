@@ -153,15 +153,20 @@
 \* CONFIGURATIONS.
 \*   MC_BackupSeal_Green                   every invariant holds: one
 \*                                         table, two backups, two restores,
-\*                                         deletes and purges
+\*                                         deletes and purges, no attacker
+\*   MC_BackupSeal_Green_Attack            every invariant holds: one
+\*                                         table, two backups, a restore
+\*                                         under the attacker, no delete
 \*   MC_BackupSeal_Green_Stream            every invariant holds with one
 \*                                         table, three backups and a batch
 \*                                         boundary after every entry of the
-\*                                         walk of meta/
-\*   MC_BackupSeal_Green_Sweep             every invariant holds with two
-\*                                         tables, two backups and a batch
-\*                                         boundary after every pool file of
-\*                                         the sweep
+\*                                         walk of meta/, no attacker
+\*   MC_BackupSeal_Green_Sweep             every invariant holds with one
+\*                                         table, two backups, the attacker
+\*                                         and a batch boundary after every
+\*                                         pool file of the sweep
+\*   MC_BackupSeal_Green_SweepTwoTables    the same sweep with two tables
+\*                                         and no attacker
 \*   MC_BackupSeal_Red_<defect>            the promise named above fails
 \*
 \* The Lean proof Regolith/BackupSeal.lean proves the rules for every number
@@ -926,6 +931,20 @@ Next ==
 
 \* Start at Init, then take steps or stutter.
 Spec == Init /\ [][Next]_vars
+
+----------------------------------------------------------------------------
+\* Limits a configuration may put on a run to keep it small (TLC's
+\* CONSTRAINT: a state that breaks one is checked, and the run goes no
+\* further from it). Each leaves out one kind of step, so a run can look at
+\* the others in every order without also multiplying by that kind. Every
+\* pair of kinds still meets in some GREEN run.
+
+\* No delete and no purge: no collection is ever in flight.
+NoCollection == gc.phase = "idle"
+
+\* Nothing changes behind the engine's back: no edited listing, no swapped
+\* files, no metadata that stops reading.
+NoAttack == adv = 0
 
 ----------------------------------------------------------------------------
 \* Invariants.

@@ -84,7 +84,8 @@
 \* CONFIGURATIONS.
 \*   MC_SyncNotify_Green              task 3 notifies (notify_one and two
 \*                                    notify_waiters), tasks 1 and 2 wait and
-\*                                    cancel: every invariant, and a notified
+\*                                    cancel: every safety invariant.
+\*   MC_SyncNotify_Green_Live         the same with one waiter: a notified
 \*                                    waiter completes.
 \*   MC_SyncNotify_Red_WakeBeforeHandoff  wake, then hand: NoLostWakeup.
 \*   MC_SyncNotify_Red_CancelNoPassOn a dropped waiter keeps the notification

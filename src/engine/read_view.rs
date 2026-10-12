@@ -350,6 +350,14 @@ pub(crate) fn quiesce() {
 /// installed. That is what keeps a reader's view of the SSTables from
 /// lagging behind a background compaction.
 pub(crate) struct VersionStore {
+    // Kept a blocking mutex on purpose (plan 4.6, the version row). What it
+    // serializes is the append of an edit to the one manifest log, with its
+    // fsync, and the version that edit produces: file I/O that cannot be
+    // retried like a compare-and-swap, and that has to land in the log in
+    // the order the versions are published. Its holders are the installs
+    // of flushes, compactions and ingests, and a rotation, which takes it
+    // under the commit pipeline for its file id, so replacing it belongs
+    // with the commit pipeline's own locks (plan 4.7).
     inner: Mutex<VersionSet>,
     /// Attached after construction: the view needs a memtable, and the
     /// version set is built before one exists. Empty only between

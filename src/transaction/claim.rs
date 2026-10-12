@@ -19,11 +19,12 @@
 //! after the winner took the list stays in it, and the owner takes it at the
 //! end of the transaction.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use super::TransactionHooks;
 use super::callbacks::{AbortReason, OnAbort, survive_after};
 use super::handoff::Handoff;
+use super::lock_table::LockOwner;
 use crate::engine::RegolithEngine;
 use crate::portability::{AtomicU8, Ordering};
 
@@ -36,6 +37,9 @@ pub(crate) struct Claim {
     pub(crate) id: u64,
     state: AtomicU8,
     on_abort: Handoff<OnAbort>,
+    /// The name a pessimistic transaction's key locks carry, once it has
+    /// one: `close` releases the locks of the transactions it aborts.
+    lock_owner: OnceLock<Arc<LockOwner>>,
 }
 
 impl Claim {
@@ -51,11 +55,22 @@ impl Claim {
             id: engine.open_transactions().next_id(),
             state: AtomicU8::new(if committing { COMMITTING } else { OPEN }),
             on_abort: Handoff::default(),
+            lock_owner: OnceLock::new(),
         });
         if !committing && !engine.is_closed() {
             engine.open_transactions().insert(Arc::clone(&claim));
         }
         claim
+    }
+
+    /// Record the name the transaction's key locks carry.
+    pub(super) fn hold_locks_of(&self, owner: Arc<LockOwner>) {
+        let _ = self.lock_owner.set(owner);
+    }
+
+    /// The name the transaction's key locks carry, if it took any.
+    pub(crate) fn lock_owner(&self) -> Option<&Arc<LockOwner>> {
+        self.lock_owner.get()
     }
 
     fn win(&self, to: u8) -> bool {
@@ -119,14 +134,16 @@ impl Claim {
     }
 
     /// `close` ends the transaction if it is still open, on the closing
-    /// thread.
-    pub(crate) fn abort_for_close(&self, engine: &RegolithEngine) {
-        if self.abort() {
+    /// thread. `true` when this call ended it.
+    pub(crate) fn abort_for_close(&self, engine: &RegolithEngine) -> bool {
+        let won = self.abort();
+        if won {
             self.run_abort(
                 Some(engine),
                 engine.transaction_hooks(),
                 &AbortReason::Closed,
             );
         }
+        won
     }
 }

@@ -94,12 +94,13 @@
 \*     invariants below quantify over the horizon itself.
 \*
 \* CONFIGURATIONS.
-\*   MC_CommitPipeline_Green                    Mutant = "none", one stop
+\*   MC_CommitPipeline_Green                    Mutant = "none", no stop
 \*     Every invariant holds, for two committers and an ingest.
 \*   MC_CommitPipeline_Green_Live               two committers, one stop
-\*   MC_CommitPipeline_Green_LiveIngest         a committer and an ingest,
-\*     one stop
-\*   MC_CommitPipeline_Green_LiveNoStop         all three threads, no stop
+\*   MC_CommitPipeline_Green_LiveIngest         committer 2 and the ingest,
+\*     which share a key, one stop
+\*   MC_CommitPipeline_Green_LiveApart          committer 1 and the ingest,
+\*     which share none, one stop
 \*     Every invariant, LockFree and EveryLiveCommitCompletes hold in each.
 \*   MC_CommitPipeline_Red_OutOfOrder           visible is a fetch_max over
 \*     any applied slot. ReadersSeePrefix fails.

@@ -284,7 +284,7 @@ loom-debug:
     RUSTFLAGS="--cfg loom" timeout 10m cargo test --test loom_memtable
 
 # Loom models for `regolith::sync`: every primitive's wait protocol,
-# with two calibrations that must fail. Release only: the larger models
+# with three calibrations that must fail. Release only: the larger models
 # explore 0.1 to 0.4 million interleavings each (about four minutes in
 # all), which a debug build multiplies several times over.
 loom-sync:
@@ -343,7 +343,23 @@ loom-tables:
     RUSTFLAGS="--cfg loom" cargo test --release --test loom_tables --no-run
     RUSTFLAGS="--cfg loom" timeout 10m cargo test --release --test loom_tables
 
-loom-all: loom loom-debug loom-sync loom-io loom-snapshots loom-view loom-cache loom-tombstones loom-tables
+# Loom models for the pessimistic lock table (plan 4.6, 4.10): one holder
+# per key, the bypass bound, a wait delivered to its own queue, the table's
+# use count, and close meeting a wait being queued, with five calibrations
+# that must fail. Release only; the ten run in under ten seconds.
+loom-locks:
+    RUSTFLAGS="--cfg loom" cargo test --release --test loom_locks --no-run
+    RUSTFLAGS="--cfg loom" timeout 10m cargo test --release --test loom_locks
+
+# Loom models for the compaction gate (E28) and for a job that parks on its
+# queue instead of waiting for the gate, with three calibrations that must
+# fail: a job that skips the gate, the old writer-preferring gate, and a
+# parked job with no way back to its queue. Release only, like `loom-sync`.
+loom-gate:
+    RUSTFLAGS="--cfg loom" cargo test --release --test loom_gate --no-run
+    RUSTFLAGS="--cfg loom" timeout 10m cargo test --release --test loom_gate
+
+loom-all: loom loom-debug loom-sync loom-io loom-snapshots loom-view loom-cache loom-tombstones loom-tables loom-locks loom-gate
 
 # The read-view chaos workload at full size: 6 instances x 2 rounds x 400
 # versions. Measured at over 20 minutes wall and 4h of CPU unoptimized,
@@ -453,6 +469,7 @@ tla:
         if [ "$verdict" != "$expect" ]; then touch "$results/$n.fail"; fi
     }
     check MC_RepeatableRead_Green                      GREEN
+    check MC_RepeatableRead_Green_Live                 GREEN
     check MC_RepeatableRead_Red_Serializable           RED INV_AppendsCommit
     check MC_RepeatableRead_Red_SnapshotIsolation      RED INV_NoStaleDefinition
     check MC_RepeatableRead_Red_ReadCommitted          RED INV_NoStaleDefinition
@@ -479,6 +496,7 @@ tla:
     check MC_DefraLevel_Red_PresenceReadFull           RED INV_LinksCommit
     check MC_DefraLevel_Red_PresenceUnchecked          RED INV_HoldsCurrent
     check MC_DefraLevel_Green_Parts                    GREEN
+    check MC_DefraLevel_Green_Parts_Rewriter           GREEN
     check MC_DefraLevel_Red_PartsIgnorePut             RED INV_PartsCurrent
     check MC_DefraLevel_Red_PartsIgnoreTouch           RED INV_PartsCurrent
     check MC_DefraLevel_Red_PartsNoAbsentFallback      RED INV_PartsCurrent
@@ -502,6 +520,10 @@ tla:
     check MC_DefraLevel_Red_ReasonNewestWrite          RED INV_ReasonsExact
     # E1. Lean: Regolith/LsmOrder.lean, compact_range_reads_newest.
     spec=LsmOrder
+    # E31, a flush's table and its memtable's retirement are one publication.
+    # Lean: Regolith/LsmOrder.lean, flush_keeps_sources_disjoint,
+    # split_install_holds_a_memtable_twice.
+    check MC_LsmOrder_Red_SplitRetire                  RED NoDoubleSource
     check MC_LsmOrder_Green                            GREEN
     check MC_LsmOrder_Red_Intersect                    RED ReadNewest
     # Flush order, ingest placement, overlap demotion (E14, D13), binary
@@ -631,8 +653,10 @@ tla:
     # list_pages_all.
     spec=BackupSeal
     check MC_BackupSeal_Green                          GREEN
+    check MC_BackupSeal_Green_Attack                   GREEN
     check MC_BackupSeal_Green_Stream                   GREEN
     check MC_BackupSeal_Green_Sweep                    GREEN
+    check MC_BackupSeal_Green_SweepTwoTables           GREEN
     check MC_BackupSeal_Red_StreamSkips                RED ListedRestores
     check MC_BackupSeal_Red_SweepSkips                 RED SweepRemovesEveryUnlisted
     check MC_BackupSeal_Red_PlainMeta                  RED SealedMetadata
@@ -671,6 +695,7 @@ tla:
     # clone_respects_live, pins_exact.
     spec=SnapshotRegistry
     check MC_SnapshotRegistry_Green                    GREEN
+    check MC_SnapshotRegistry_Green_ThreeHandles       GREEN
     check MC_SnapshotRegistry_Red_NoConfirm            RED MinBelowLive
     check MC_SnapshotRegistry_Red_ScanThenSample       RED MinBelowLive
     check MC_SnapshotRegistry_Red_ReleaseHere          RED LiveCovered
@@ -696,6 +721,8 @@ tla:
     # E10, group commit. Lean: Regolith/GroupCommit.lean, group_eq_serial.
     spec=GroupCommit
     check MC_GroupCommit_Green                         GREEN
+    check MC_GroupCommit_Green_Live                    GREEN
+    check MC_GroupCommit_Green_LivePlain               GREEN
     check MC_GroupCommit_Green_ReadOnly                GREEN
     check MC_GroupCommit_Red_ViewOnly                  RED SerialEquivalent
     check MC_GroupCommit_Red_TrustEarly                RED SerialEquivalent
@@ -706,6 +733,7 @@ tla:
     # Green_Nowait_Owes is the witness that the GREEN run leaves groups owed.
     # Lean: Regolith/IoQueue.lean, group_sync_once, group_visible_after_sync.
     check MC_GroupCommit_Green_Nowait                  GREEN
+    check MC_GroupCommit_Green_NowaitLive              GREEN
     check MC_GroupCommit_Green_Nowait_Owes             RED NothingOwed
     check MC_GroupCommit_Red_DoubleClaim               RED SingleSync
     # 4.7, the lock-free commit pipeline. Lean: Regolith/Pipeline.lean,
@@ -714,7 +742,7 @@ tla:
     check MC_CommitPipeline_Green                      GREEN
     check MC_CommitPipeline_Green_Live                 GREEN
     check MC_CommitPipeline_Green_LiveIngest           GREEN
-    check MC_CommitPipeline_Green_LiveNoStop           GREEN
+    check MC_CommitPipeline_Green_LiveApart            GREEN
     check MC_CommitPipeline_Red_OutOfOrder             RED ReadersSeePrefix
     check MC_CommitPipeline_Red_AbortHole              RED NoHole
     check MC_CommitPipeline_Red_NoHelping              RED NoLiveThreadBlocked
@@ -722,12 +750,16 @@ tla:
     check MC_CommitPipeline_Red_ValidatePublished      RED NoLostUpdate
     # R13 and D53, non-blocking reads on per-thread I/O queues: single-flight
     # units claimed by one CAS, completions only on the asking queue, idle
-    # wakeups. Lean: Regolith/IoQueue.lean, claim_once, told_exactly_once,
-    # no_lost_idle_wakeup, busy_never_woken, single_thread_finishes.
+    # wakeups. Lean: Regolith/IoQueue.lean, claim_once, told_at_most_once,
+    # every_waiter_told, no_lost_idle_wakeup, busy_never_woken,
+    # single_thread_finishes.
     spec=NonBlocking
     check MC_NonBlocking_Green_Pool                    GREEN
+    check MC_NonBlocking_Green_PoolLive                GREEN
     check MC_NonBlocking_Green_Jobs                    GREEN
+    check MC_NonBlocking_Green_JobsLive                GREEN
     check MC_NonBlocking_Green_Single                  GREEN
+    check MC_NonBlocking_Green_SingleLive              GREEN
     check MC_NonBlocking_Red_WrongQueue                RED OwnQueue
     check MC_NonBlocking_Red_LostIdleWakeup            RED NoLostIdleWakeup
     check MC_NonBlocking_Red_DoubleRun                 RED SingleRun
@@ -770,7 +802,9 @@ tla:
     # mutual_exclusion, bounded_bypass, owed_exclusive.
     spec=Sync
     check MC_Sync_Green_Mutex                          GREEN
+    check MC_Sync_Green_MutexLive                      GREEN
     check MC_Sync_Green_Semaphore                      GREEN
+    check MC_Sync_Green_SemaphoreLive                  GREEN
     check MC_Sync_Green_Reentrant                      GREEN
     check MC_Sync_Green_ReentrantLive                  GREEN
     check MC_Sync_Red_UnboundedBarging                 RED BoundedBypass
@@ -784,6 +818,7 @@ tla:
     # Regolith/SyncFifo.lean, fifo_served, no_stranded_waiter.
     spec=SyncNotify
     check MC_SyncNotify_Green                          GREEN
+    check MC_SyncNotify_Green_Live                     GREEN
     check MC_SyncNotify_Red_WakeBeforeHandoff          RED NoLostWakeup
     check MC_SyncNotify_Red_CancelNoPassOn             RED CancelPassesOn
     check MC_SyncNotify_Red_NoRecheck                  RED NoLostWakeup
@@ -800,6 +835,25 @@ tla:
     check MC_SyncRwLock_Red_AnyReaderUpgrade           RED NoUpgradeDeadlock
     check MC_SyncRwLock_Red_UpgradeNoHoldBack          RED UpgradeHoldsBack
     check MC_SyncRwLock_Red_OwnerUnaware               RED NoSelfDeadlock
+    # The compaction gate (4.6, E28): a pass shares it, a job holds it
+    # alone, no waiter is passed over more than Bound times either way, the
+    # worker takes turns between jobs and passes, and a job parked on its
+    # queue is always woken. The old gate's rule is Red_OldGate. Lean:
+    # Regolith/CompactionGate.lean, mutual_exclusion, bounded_bypass,
+    # owed_only_gets_nearer, worker_takes_turns, parked_job_keeps_its_wake.
+    spec=CompactionGate
+    check MC_CompactionGate_Green                      GREEN
+    check MC_CompactionGate_Green_All                  GREEN
+    check MC_CompactionGate_Green_Queue                GREEN
+    check MC_CompactionGate_Green_Passes               GREEN
+    check MC_CompactionGate_Green_Live                 GREEN
+    check MC_CompactionGate_Green_LiveServed           GREEN
+    check MC_CompactionGate_Red_OldGate                RED BoundedBypass
+    check MC_CompactionGate_Red_NoHandoff              RED BoundedBypass
+    check MC_CompactionGate_Red_DrainJobs              RED WorkerTakesTurns
+    check MC_CompactionGate_Red_WakeDropped            RED NoLostWake
+    check MC_CompactionGate_Red_StaleWaker             RED NoLostWake
+    check MC_CompactionGate_Red_SkipGate               RED MutualExclusion
     # regolith::sync::Event, Latch and Barrier.
     spec=SyncLatch
     check MC_SyncLatch_Green_Event                     GREEN
@@ -891,6 +945,32 @@ tla:
     check MC_EnvFiles_Red_SharedCursor                 RED ReadsOwnBytes
     check MC_EnvFiles_Red_NoFreeze                     RED CurrentHoldsFinished
     check MC_EnvFiles_Red_StaleFrozen                  RED CurrentHoldsFinished
+    # The pessimistic lock table (plan 4.6, 4.10): one holder per key, no
+    # lost wake-up, bounded bypass, a wait delivered to its own queue, and a
+    # lock released when its commit lands. Lean: Regolith/LockTable.lean,
+    # mutual_exclusion, retired_unused, no_stranded_front, handed_is_told,
+    # bounded_bypass, note_on_own_queue, ready_by_own_queue,
+    # isolation_at_landing.
+    spec=LockTable
+    check MC_LockTable_Green_Try                       GREEN
+    check MC_LockTable_Green_Bound2                    GREEN
+    check MC_LockTable_Green_Blocking                  GREEN
+    check MC_LockTable_Green_Nowait                    GREEN
+    check MC_LockTable_Green_Cancel                    GREEN
+    check MC_LockTable_Green_Table                     GREEN
+    check MC_LockTable_Green_Mixed                     GREEN
+    check MC_LockTable_Green_MixedLive                 GREEN
+    check MC_LockTable_Green_Four                      GREEN
+    check MC_LockTable_Red_RetireNoCas                 RED MutualExclusion
+    check MC_LockTable_Red_NoRecheck                   RED NoStrandedFront
+    check MC_LockTable_Red_ReleaseNoWake               RED NoStrandedFront
+    check MC_LockTable_Red_CancelNoPassOn              RED NoStrandedFront
+    check MC_LockTable_Red_NoteAfterPoll               RED WokenIsTold
+    check MC_LockTable_Red_UnboundedBarging            RED BoundedBypass
+    check MC_LockTable_Red_WrongQueue                  RED OwnQueue
+    check MC_LockTable_Red_CompleteOnWaker             RED OwnQueue
+    check MC_LockTable_Red_ReleaseAtWrite              RED IsolationAtLanding
+    check MC_LockTable_Red_ReleaseAtDelivery           RED HeldOnlyWhileNeeded
     wait
     rm -rf ./*_TTrace_*.tla ./*_TTrace_*.bin
     cat "$results"/*.out

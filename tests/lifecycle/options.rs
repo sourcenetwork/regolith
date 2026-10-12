@@ -187,6 +187,10 @@ fn reopening_that_toggles_the_partitioned_index_reads_both_layouts() {
         assert_range_present(&db, 0, 400, label);
 
         write_range(&db, 400, 1200);
+        // The worker writes sealed memtables out off the commit path, so a
+        // table may still be under way here: a file with no footer yet. An
+        // explicit flush returns once every table is whole and installed.
+        db.flush().unwrap();
         let versions = sst_format_versions(dir.path());
         assert!(
             versions.len() > 1 && versions.contains(&new_version),
