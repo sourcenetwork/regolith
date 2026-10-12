@@ -95,7 +95,12 @@
 \*
 \* CONFIGURATIONS.
 \*   MC_CommitPipeline_Green                    Mutant = "none", one stop
-\*     Every invariant, LockFree and EveryLiveCommitCompletes hold.
+\*     Every invariant holds, for two committers and an ingest.
+\*   MC_CommitPipeline_Green_Live               two committers, one stop
+\*   MC_CommitPipeline_Green_LiveIngest         a committer and an ingest,
+\*     one stop
+\*   MC_CommitPipeline_Green_LiveNoStop         all three threads, no stop
+\*     Every invariant, LockFree and EveryLiveCommitCompletes hold in each.
 \*   MC_CommitPipeline_Red_OutOfOrder           visible is a fetch_max over
 \*     any applied slot. ReadersSeePrefix fails.
 \*   MC_CommitPipeline_Red_AbortHole            an aborted slot takes a
@@ -396,9 +401,9 @@ Next == LiveNext \/ \E a \in Actors : Stop(a)
 \* turn of its own: that is lock-freedom's scheduler, which may starve any
 \* one thread. No step here spins or waits, so every behaviour is finite
 \* and ends where no live step is possible; per-thread fairness adds
-\* nothing (MC_CommitPipeline_Green with WF_vars(LiveStep(a)) for each
-\* thread gives the same verdict over the same states, at about twice the
-\* time).
+\* nothing (three threads and one stop with WF_vars(LiveStep(a)) for each
+\* thread gave the same verdict over the same 130,140 states, at about
+\* twice the time).
 Spec == Init /\ [][Next]_vars /\ WF_vars(LiveNext)
 
 ----------------------------------------------------------------------------
