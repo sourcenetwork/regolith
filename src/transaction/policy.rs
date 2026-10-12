@@ -146,7 +146,11 @@ pub enum KeyClass {
 /// [`Error::CallbackPanicked`](crate::Error::CallbackPanicked) and latches the
 /// database read-only until it is reopened. A panic in one of the calls before
 /// the commit unwinds into that call and fails only it.
-pub trait KeyClassifier: Send + Sync {
+///
+/// A classifier is `Send + Sync + 'static`: the database holds it for its
+/// whole life and every transaction it begins shares it, on whatever thread
+/// the transaction reads or commits.
+pub trait KeyClassifier: Send + Sync + 'static {
     /// The class `key` belongs to.
     fn classify(&self, key: &[u8]) -> KeyClass;
 }

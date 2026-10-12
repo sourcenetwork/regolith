@@ -11,16 +11,60 @@
 #![cfg(not(target_arch = "wasm32"))]
 
 use regolith::{
-    AbortReason, CfIter, CommitInfo, CommitReceipt, Conflict, Db, DbSlice, DbWithTtl, Entries,
-    Error, IoBudget, IoProgress, IoQueue, IoUnit, IoWait, Iter, OptimisticTransactionDb,
+    AbortReason, CfIter, CommitInfo, CommitReceipt, CompactionFilter, Conflict, Db, DbSlice,
+    DbWithTtl, Entries, Env, Error, EventListener, IoBudget, IoProgress, IoQueue, IoUnit, IoWait,
+    Iter, KeyClassifier, KeyProvider, LogLayout, MergeOperator, OptimisticTransactionDb,
     OwnedSnapshotIter, Page, QueueId, ReadMode, RetryPolicy, ScanCheck, ScanStream, Snapshot,
-    TailingIter, TransactError, Transaction, TransactionDb, TransactionError, TxnCursor,
-    TxnScanStream, WouldBlock,
+    TailingIter, TransactError, Transaction, TransactionDb, TransactionError, TransactionHooks,
+    TxnCursor, TxnScanStream, WouldBlock,
 };
 
 const fn assert_send<T: Send>() {}
 
 const fn assert_send_sync<T: Send + Sync>() {}
+
+const fn assert_send_sync_static<T: ?Sized + Send + Sync + 'static>() {}
+
+/// One function per trait, generic over that trait alone, so it compiles only
+/// while the trait itself requires `Send + Sync + 'static` of everything that
+/// implements it. An implementation then never states the bounds, and the
+/// database can hold it in an `Arc` and call it from any thread.
+macro_rules! requires_send_sync_static {
+    ($($check:ident: $bound:path),* $(,)?) => {
+        $(const fn $check<T: ?Sized + $bound>() {
+            assert_send_sync_static::<T>();
+        })*
+    };
+}
+
+requires_send_sync_static! {
+    key_classifier: KeyClassifier,
+    merge_operator: MergeOperator,
+    log_layout: LogLayout,
+    transaction_hooks: TransactionHooks,
+    event_listener: EventListener,
+    key_provider: KeyProvider,
+    compaction_filter: CompactionFilter,
+}
+
+/// An environment is shared across threads. It is not required to be
+/// `'static`: the database holds it as an `Arc<dyn Env>`, which is.
+const fn env<T: ?Sized + Env>() {
+    const fn shared<T: ?Sized + Send + Sync>() {}
+    shared::<T>();
+}
+
+#[test]
+fn the_traits_a_caller_implements_are_send_sync_and_static() {
+    key_classifier::<dyn KeyClassifier>();
+    merge_operator::<dyn MergeOperator>();
+    log_layout::<dyn LogLayout>();
+    transaction_hooks::<dyn TransactionHooks>();
+    event_listener::<dyn EventListener>();
+    key_provider::<dyn KeyProvider>();
+    compaction_filter::<dyn CompactionFilter>();
+    env::<dyn Env>();
+}
 
 #[test]
 fn handles_are_send_and_sync() {
