@@ -78,17 +78,78 @@ fn seeks_bracket_the_list() {
 }
 
 #[test]
-fn duplicate_internal_key_finds_the_first() {
-    // WAL replay can re-present the same (key, seq) if a rewrite was
-    // interrupted. Both nodes are stored; a reader finds the first.
+fn an_internal_key_inserted_twice_is_held_once() {
+    // S2: two threads applying one commit, or WAL replay re-presenting a
+    // (key, seq) an interrupted rewrite left twice, insert the same entry.
+    // The list holds one node for it, the one that got there first.
     let list = list(64 * 1024);
     assert!(list.insert(b"k", 7, VALUE_TYPE_VALUE, b"first"));
+    let used = list.arena().used_bytes();
     assert!(list.insert(b"k", 7, VALUE_TYPE_VALUE, b"second"));
-    assert_eq!(list.len(), 2);
+    assert_eq!(list.len(), 1);
+    assert_eq!(
+        list.arena().used_bytes(),
+        used,
+        "a duplicate found before the node is built costs no arena bytes"
+    );
     let probe = encode_internal_key(b"k", 7, VALUE_TYPE_DELETION);
-    let found = list.seek_ge(&probe).expect("present");
-    assert!(found.value() == b"first" || found.value() == b"second");
-    assert_eq!(collect(&list).len(), 2);
+    assert_eq!(list.seek_ge(&probe).expect("present").value(), b"first");
+    assert_eq!(collect(&list).len(), 1);
+    // Another sequence, or another type at the same sequence, is another key.
+    assert!(list.insert(b"k", 8, VALUE_TYPE_VALUE, b"newer"));
+    assert!(list.insert(b"k", 7, VALUE_TYPE_DELETION, b""));
+    assert_eq!(list.len(), 3);
+    list.assert_towers_consistent();
+}
+
+/// S2: threads insert disjoint keys and, two by two, the very same run of
+/// keys, all at once. Afterwards the list holds every key exactly once, in
+/// order, with consistent towers.
+#[test]
+fn concurrent_inserters_hold_every_key_once() {
+    const PAIRS: u64 = 4;
+    const KEYS: u64 = 400;
+    for round in 0..8 {
+        let list = list(8 * 1024 * 1024);
+        std::thread::scope(|scope| {
+            for thread in 0..2 * PAIRS {
+                let list = &list;
+                // Threads `2p` and `2p + 1` insert the same entries.
+                let pair = thread / 2;
+                scope.spawn(move || {
+                    let mut hint = list.insert_hint();
+                    for i in 0..KEYS {
+                        let key = format!("k{:05}", i * PAIRS + pair);
+                        let seq = i * PAIRS + pair + 1;
+                        if (thread + i) % 3 == 0 {
+                            assert!(list.insert(key.as_bytes(), seq, VALUE_TYPE_VALUE, b"v"));
+                        } else {
+                            assert!(list.insert_with_hint(
+                                &mut hint,
+                                key.as_bytes(),
+                                seq,
+                                VALUE_TYPE_VALUE,
+                                b"v"
+                            ));
+                        }
+                    }
+                });
+            }
+        });
+        let got = collect(&list);
+        assert_eq!(got.len() as u64, PAIRS * KEYS, "round {round}");
+        assert_eq!(list.len() as u64, PAIRS * KEYS, "round {round}");
+        for (n, (key, value)) in got.iter().enumerate() {
+            let want = encode_internal_key(
+                format!("k{n:05}").as_bytes(),
+                n as u64 + 1,
+                VALUE_TYPE_VALUE,
+            );
+            assert_eq!(key, &want, "round {round}, entry {n}");
+            assert_eq!(value, b"v");
+        }
+        list.assert_towers_consistent();
+    }
 }
 
 #[test]
@@ -350,20 +411,24 @@ fn a_hint_from_another_list_restarts_from_that_lists_head() {
 }
 
 #[test]
-fn hinted_inserts_place_duplicates_first_like_plain_inserts() {
+fn a_hinted_insert_of_a_key_already_held_links_nothing_like_a_plain_insert() {
     let list = list(1024 * 1024);
     let mut hint = list.insert_hint();
     assert!(list.insert_with_hint(&mut hint, b"dup", 5, VALUE_TYPE_VALUE, b"first"));
     assert!(list.insert_with_hint(&mut hint, b"dup", 5, VALUE_TYPE_VALUE, b"second"));
+    // The hint still works for the keys after the duplicate.
+    assert!(list.insert_with_hint(&mut hint, b"dup", 4, VALUE_TYPE_VALUE, b"older"));
+    assert!(list.insert_with_hint(&mut hint, b"e", 6, VALUE_TYPE_VALUE, b"next"));
 
-    assert_eq!(collect(&list).len(), 2);
+    assert_eq!(collect(&list).len(), 3);
     let probe = encode_internal_key(b"dup", 5, VALUE_TYPE_VALUE);
     let found = list.seek_ge(&probe).expect("present");
     assert_eq!(
         found.value(),
-        b"second",
-        "the second-inserted duplicate must sort first, matching plain-insert placement"
+        b"first",
+        "the entry that got there first stays"
     );
+    list.assert_towers_consistent();
 }
 
 proptest! {
@@ -378,24 +443,18 @@ proptest! {
         let mut model: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
         for (key, seq, value) in &entries {
             prop_assert!(list.insert(key, *seq, VALUE_TYPE_VALUE, value));
-            model.push((encode_internal_key(key, *seq, VALUE_TYPE_VALUE), value.clone()));
+            let internal = encode_internal_key(key, *seq, VALUE_TYPE_VALUE);
+            // S2: an internal key the list already holds keeps the value it
+            // was first inserted with.
+            if !model.iter().any(|(held, _)| held == &internal) {
+                model.push((internal, value.clone()));
+            }
         }
         model.sort_by(|a, b| compare_internal_keys(&a.0, &b.0));
 
         let got = collect(&list);
-        prop_assert_eq!(got.len(), model.len());
-        // Key order is total; two entries sharing an internal key
-        // (same user key and seq) may sit in either order, which is
-        // the documented duplicate behaviour, so compare the keys in
-        // order and the pairs as a multiset.
-        for (got, want) in got.iter().zip(model.iter()) {
-            prop_assert_eq!(&got.0, &want.0);
-        }
-        let mut got_pairs = got.clone();
-        let mut want_pairs = model.clone();
-        got_pairs.sort();
-        want_pairs.sort();
-        prop_assert_eq!(got_pairs, want_pairs);
+        prop_assert_eq!(&got, &model);
+        prop_assert_eq!(list.len(), model.len());
 
         // Every stored key is findable by an exact seek.
         for (key, _) in &model {

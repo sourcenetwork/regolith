@@ -30,12 +30,10 @@
 //! snapshot that pins every referenced SSTable against a concurrent
 //! unlink for as long as the caller holds it.
 //!
-//! [`UnsafeCell`] and [`SingleWriterGuard`] live here for the same reason
-//! as everything else: a `std::cell::UnsafeCell` is invisible to loom, so
-//! state that is mutated without a lock (the arena's chunk list, A8 in
-//! `engine::arena`) goes through the wrapper here instead, and the debug
-//! guard that catches a broken single-writer contract is shared by the
-//! arena and the skip list rather than duplicated between them.
+//! [`UnsafeCell`] lives here for the same reason as everything else: a
+//! `std::cell::UnsafeCell` is invisible to loom, so state that is handed
+//! from one thread to another without a lock (a range tombstone's slot, T2
+//! in `engine::memtable::tombstones`) goes through the wrapper here instead.
 
 #[cfg(loom)]
 pub(crate) use loom::sync::Arc;
@@ -46,11 +44,6 @@ pub(crate) use std::sync::Arc;
 pub(crate) use loom::sync::atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering, fence};
 #[cfg(not(loom))]
 pub(crate) use std::sync::atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering, fence};
-
-#[cfg(all(loom, debug_assertions))]
-pub(crate) use loom::sync::atomic::AtomicBool;
-#[cfg(all(not(loom), debug_assertions))]
-pub(crate) use std::sync::atomic::AtomicBool;
 
 #[cfg(loom)]
 use loom::sync as imp;
@@ -120,7 +113,8 @@ impl<T: std::fmt::Debug> std::fmt::Debug for Mutex<T> {
 }
 
 /// Interior mutability for state that exactly one thread touches at a
-/// time (the arena's chunk list, invariant A8 in `engine::arena`).
+/// time (a range tombstone's slot before it is marked ready, invariant T2
+/// in `engine::memtable::tombstones`).
 ///
 /// Under loom the cell is instrumented and an access that is not ordered
 /// before or after every other access fails the model; in a normal build
@@ -138,10 +132,6 @@ impl<T> UnsafeCell<T> {
 
     /// Run `f` on a shared pointer to the contents.
     ///
-    /// Only test-only readers (`Arena::chunk_count`, `chunk_sizes`) use
-    /// this today; production code only ever needs exclusive access, so
-    /// a non-test, non-loom build sees it as dead code.
-    #[allow(dead_code)]
     pub(crate) fn with<R>(&self, f: impl FnOnce(*const T) -> R) -> R {
         f(self.0.get())
     }
@@ -154,34 +144,6 @@ impl<T> UnsafeCell<T> {
 
 #[cfg(loom)]
 pub(crate) use loom::cell::UnsafeCell;
-
-/// Debug-only detector for a "exactly one thread at a time" contract.
-///
-/// `enter` flips the flag and asserts it was clear; dropping the guard
-/// clears it. Acquire on entry and Release on exit order the guarded
-/// section against the previous holder's, so a violation is always seen
-/// as one rather than as a torn flag. Compiled out of release builds:
-/// the contract is the caller's to keep, this only catches a breach.
-#[cfg(debug_assertions)]
-pub(crate) struct SingleWriterGuard<'a>(&'a AtomicBool);
-
-#[cfg(debug_assertions)]
-impl<'a> SingleWriterGuard<'a> {
-    /// Enter the guarded section; `contract` names the invariant in the
-    /// assertion message when it is broken.
-    pub(crate) fn enter(flag: &'a AtomicBool, contract: &'static str) -> Self {
-        let busy = flag.swap(true, Ordering::Acquire);
-        debug_assert!(!busy, "{contract}");
-        Self(flag)
-    }
-}
-
-#[cfg(debug_assertions)]
-impl Drop for SingleWriterGuard<'_> {
-    fn drop(&mut self) {
-        self.0.store(false, Ordering::Release);
-    }
-}
 
 /// A reader-writer lock that hands back its guard rather than a
 /// `LockResult`.
@@ -378,15 +340,6 @@ impl Drop for OwnedGateWriteGuard {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize as StdAtomicUsize, Ordering as StdOrdering};
-
-    #[cfg(debug_assertions)]
-    #[test]
-    #[should_panic(expected = "nested")]
-    fn a_nested_entry_trips_the_single_writer_guard() {
-        let flag = AtomicBool::new(false);
-        let _outer = SingleWriterGuard::enter(&flag, "nested entry is not allowed");
-        let _inner = SingleWriterGuard::enter(&flag, "nested entry is not allowed");
-    }
 
     #[test]
     #[allow(unsafe_code)]
