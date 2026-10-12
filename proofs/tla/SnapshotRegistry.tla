@@ -32,11 +32,13 @@
 \* handed back and reused), so every entry change is one atomic step.
 \*
 \* WHAT IS CHECKED, for every interleaving of three handles on two threads
-\* over two slots of two entries, with a commit (MaxSeq 1 in the configs)
-\* and a compaction that runs again and again. The green setting was also
-\* checked once with MaxSeq 2 on 16 TLC workers (2026-10-09: 14,454,602
-\* distinct states, no error), which takes too long for `just tla`'s one
-\* worker; every RED below also fails at MaxSeq 2.
+\* over two slots of one entry, with a commit (MaxSeq 1 in the configs)
+\* and a compaction that runs again and again. One entry per slot keeps
+\* each configuration inside a minute on one TLC worker; with two entries
+\* per slot the green setting was 1,262,916 distinct states (no error), and
+\* with MaxSeq 2 as well it was checked once on 16 TLC workers (2026-10-09:
+\* 14,454,602 distinct states, no error). Every RED below also fails at
+\* those sizes.
 \*   MinBelowLive     the minimum the compaction uses is at most every live
 \*                    snapshot;
 \*   LiveCovered      every live snapshot is in the list or at or above the
