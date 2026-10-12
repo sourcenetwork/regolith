@@ -115,7 +115,10 @@
 \* CONFIGURATIONS.
 \*   MC_BackupSeal_Green                   every invariant holds: one
 \*                                         table, two backups, two restores
-\*                                         and deletes
+\*                                         and deletes, no attacker
+\*   MC_BackupSeal_Green_Attack            every invariant holds: one
+\*                                         table, two backups, one restore
+\*                                         and deletes under the attacker
 \*   MC_BackupSeal_Red_<defect>            the promise named above fails
 
 \* Naturals for counting backups and restores; FiniteSets for counting how
@@ -678,6 +681,16 @@ Next ==
 
 \* Start at Init, then take steps or stutter.
 Spec == Init /\ [][Next]_vars
+
+----------------------------------------------------------------------------
+\* A limit a configuration may put on a run to keep it small (TLC's
+\* CONSTRAINT: a state that breaks it is checked, and the run goes no
+\* further from it). It leaves out one kind of step, so a run can look at
+\* the others in every order without also multiplying by that kind.
+
+\* Nothing changes behind the engine's back: no edited listing, no swapped
+\* files, no metadata that stops reading.
+NoAttack == adv = 0
 
 ----------------------------------------------------------------------------
 \* Invariants.
