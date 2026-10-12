@@ -515,17 +515,28 @@ fn pins_hold_and_the_budget_holds_under_readers_and_inserters() {
         // Each key of file 1 has one inserter, which re-inserts it only
         // after the hand took it: a re-insert over a live entry is an
         // explicit replacement, which does not wait for readers.
+        //
+        // An inserter churns 20,000 times, and on until a reader has
+        // re-checked a block it held: left to the scheduler, inserters on
+        // one core can finish before a reader thread has held nine blocks.
         let inserters: Vec<_> = (0..3u64)
             .map(|t| {
-                let cache = Arc::clone(&cache);
+                let (cache, checks) = (Arc::clone(&cache), Arc::clone(&pinned_checks));
                 scope.spawn(move || {
-                    for i in 0..20_000u64 {
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+                    let mut i = 0u64;
+                    while i < 20_000 || checks.load(Ordering::Relaxed) == 0 {
+                        assert!(
+                            i < 20_000 || std::time::Instant::now() < deadline,
+                            "no reader ever re-checked a block it held"
+                        );
                         let key = (i * 3 + t) % KEYS;
                         if key % 3 == t && cache.get(1, key * 4096).is_none() {
                             cache.insert(1, key * 4096, dummy_block(2048));
                         }
                         cache.insert(2, (i * 3 + t) * 4096, dummy_block(2048));
                         assert!(cache.usage() <= cache.capacity());
+                        i += 1;
                     }
                 })
             })
