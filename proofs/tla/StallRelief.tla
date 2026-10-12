@@ -264,12 +264,15 @@ Init ==
   /\ wpc = [w \in Writers |-> "write"]
   \* Nothing counted, nothing read.
   /\ progress = 0
+  \* No writer has read the count.
   /\ seen = [w \in Writers |-> 0]
-  \* The engine takes writes, and no latch is under way.
+  \* The engine takes writes: it has not latched.
   /\ latched = FALSE
+  \* No latch is under way: none has its landing owed.
   /\ landing = FALSE
-  \* The relief works, and no failure is being told.
+  \* The relief works: no failure is recorded.
   /\ failing = FALSE
+  \* No failure is being told: none has its landing owed.
   /\ telling = FALSE
 
 \* What a step may leave: the stop on or off, while the budget for leaving
@@ -289,9 +292,11 @@ Land(f) == [x \in Writers |-> IF f[x] = "waiting" THEN "write" ELSE f[x]]
 JobStart ==
   \* Not started, and the gate is free.
   /\ job = "idle"
+  \* (The gate is free.)
   /\ gate = "free"
   \* It holds the gate for its whole run.
   /\ gate' = "job"
+  \* The job is at work, holding the gate.
   /\ job' = "holding"
   \* Nothing else changes.
   /\ UNCHANGED <<stopped, wpc, progress, seen, latch, relief>>
@@ -315,16 +320,19 @@ JobEnd ==
 JobRelieve ==
   \* It released the gate and has not relieved yet.
   /\ job = "relieving"
+  \* Is the gate free?
   /\ IF gate = "free"
      \* Steps, then the count and the landing.
      THEN /\ stopped' \in Outcomes
+          \* The progress is counted.
           /\ progress' = progress + 1
+          \* The progress lands: waiters are let go.
           /\ wpc' = Land(wpc)
      \* Left to the writer holding the gate.
      ELSE UNCHANGED <<stopped, progress, wpc>>
   \* The job is finished.
   /\ job' = "done"
-  \* The gate, what writers read and the latch are as they were.
+  \* The gate, what writers read, the latch and the relief's record are as they were.
   /\ UNCHANGED <<gate, seen, latch, relief>>
 
 \* Writer w writes. On a latched engine it is told the latch and returns.
@@ -337,38 +345,57 @@ JobRelieve ==
 WriterTry(w) ==
   \* The writer is about to write.
   /\ wpc[w] = "write"
+  \* Has the engine latched?
   /\ IF latched
      \* Told the latch (admit_write, or the write itself): it returns.
      THEN /\ wpc' = [wpc EXCEPT ![w] = "done"]
+          \* The stop, the gate and what the writer read are unchanged.
           /\ UNCHANGED <<stopped, gate, seen>>
+     \* Not latched. Is the stop off?
      ELSE IF ~stopped
-          THEN \* Written; the stop may come on; one step owed.
+          \* The stop is off: the write is let in, one of two ways.
+          THEN
+               \* Written; the stop may come on; one step owed.
                \/ /\ stopped' \in BOOLEAN
+                  \* The writer owes one step.
                   /\ wpc' = [wpc EXCEPT ![w] = "owing"]
+                  \* The gate and what the writer read are unchanged.
                   /\ UNCHANGED <<gate, seen>>
                \* Or let in, and the memtable cap is reached: its rotation
                \* takes the free gate to flush (rotate_if_full). The stop
                \* may come on meanwhile.
                \/ /\ Failures
+                  \* The gate is free,
                   /\ gate = "free"
+                  \* and the rotation's flush takes it.
                   /\ gate' = w
+                  \* The stop may come on meanwhile.
                   /\ stopped' \in BOOLEAN
+                  \* The writer is rotating, flushing under the gate.
                   /\ wpc' = [wpc EXCEPT ![w] = "rotating"]
+                  \* What the writer read is unchanged.
                   /\ UNCHANGED seen
+          \* The stop is on. Is the relief's failure recorded?
           ELSE IF failing
                \* Stopped, and the relief's failure is recorded: told that
                \* failure (RegolithEngine::stopped), and it returns.
                THEN /\ wpc' = [wpc EXCEPT ![w] = "done"]
+                    \* The stop, the gate and what the writer read are unchanged.
                     /\ UNCHANGED <<stopped, gate, seen>>
+               \* The relief works. Is the gate free?
                ELSE IF gate = "free"
                     \* Stopped, gate free: its step takes the gate.
                     THEN /\ gate' = w
+                         \* The writer runs a relieving step.
                          /\ wpc' = [wpc EXCEPT ![w] = "relieving"]
+                         \* The stop and what the writer read are unchanged.
                          /\ UNCHANGED <<stopped, seen>>
-                    \* Stopped, gate held: it read the count before its
-                    \* step, and the step is contended.
+                    \* Stopped, gate held: it read the count before its step, and
+                    \* the step is contended.
                     ELSE /\ seen' = [seen EXCEPT ![w] = progress]
+                         \* The writer is contended.
                          /\ wpc' = [wpc EXCEPT ![w] = "contended"]
+                         \* The stop and the gate are unchanged.
                          /\ UNCHANGED <<stopped, gate>>
   \* Nothing else changes.
   /\ UNCHANGED <<job, progress, latch, relief>>
@@ -384,26 +411,36 @@ WriterTry(w) ==
 WriterRegister(w) ==
   \* The writer was contended.
   /\ wpc[w] = "contended"
+  \* Has the engine latched? (The bug NoLatchRecheck does not look.)
   /\ IF latched /\ Mode # "NoLatchRecheck"
      \* Latched: landed for whoever else is on the unit, and w returns
      \* the latch.
      THEN /\ wpc' = [Land(wpc) EXCEPT ![w] = "done"]
+          \* The count does not change.
           /\ UNCHANGED progress
+     \* Not latched. Is the stop off now?
      ELSE IF ~stopped
           \* Cleared: counted, landed, and w writes again.
           THEN /\ progress' = progress + 1
+               \* The progress lands, and w writes again.
                /\ wpc' = [Land(wpc) EXCEPT ![w] = "write"]
+          \* Still stopped. Is the relief's failure recorded? (The bug NoFailRecheck does not look.)
           ELSE IF failing /\ Mode # "NoFailRecheck"
                \* The relief is failing: landed for whoever else is on
                \* the unit, and w returns the failure.
                THEN /\ wpc' = [Land(wpc) EXCEPT ![w] = "done"]
+                    \* The count does not change.
                     /\ UNCHANGED progress
+               \* The relief works. Did the count move since w read it? (The bug NoRecheck does
+               \* not look.)
                ELSE IF Mode # "NoRecheck" /\ seen[w] # progress
                     \* Progress it missed: landed, and w writes again.
                     THEN /\ wpc' = [Land(wpc) EXCEPT ![w] = "write"]
+                         \* The count does not change.
                          /\ UNCHANGED progress
                     \* Nothing missed: it waits.
                     ELSE /\ wpc' = [wpc EXCEPT ![w] = "waiting"]
+                         \* The count does not change.
                          /\ UNCHANGED progress
   \* Nothing else changes.
   /\ UNCHANGED <<stopped, gate, job, seen, latch, relief>>
@@ -413,8 +450,11 @@ WriterRegister(w) ==
 WriterStepEnd(w) ==
   \* The writer is relieving and holds the gate.
   /\ wpc[w] = "relieving"
+  \* The step may or may not clear the stop.
   /\ stopped' \in Outcomes
+  \* The gate is free again.
   /\ gate' = "free"
+  \* The writer counts its progress next.
   /\ wpc' = [wpc EXCEPT ![w] = "relRefresh"]
   \* Nothing else changes.
   /\ UNCHANGED <<job, progress, seen, latch, relief>>
@@ -425,8 +465,11 @@ WriterStepEnd(w) ==
 WriterRefresh(w) ==
   \* The writer released the gate after its relieving step.
   /\ wpc[w] = "relRefresh"
+  \* The progress is counted.
   /\ progress' = progress + 1
+  \* The writer goes on to write again; if the stop is still on it may return instead.
   /\ \E next \in (IF stopped THEN {"write", "done"} ELSE {"write"}) :
+       \* When the progress lands, waiters are let go.
        wpc' = [(IF Lands(stopped) THEN Land(wpc) ELSE wpc) EXCEPT ![w] = next]
   \* Nothing else changes.
   /\ UNCHANGED <<stopped, gate, job, seen, latch, relief>>
@@ -437,12 +480,15 @@ WriterRefresh(w) ==
 OwedTry(w) ==
   \* The writer's write went in and left a step owing.
   /\ wpc[w] = "owing"
+  \* Has the engine not latched, and is the gate free?
   /\ IF ~latched /\ gate = "free"
      \* The step takes the gate.
      THEN /\ gate' = w
+          \* The writer runs its owed step.
           /\ wpc' = [wpc EXCEPT ![w] = "owedStep"]
      \* Contended, or latched: the writer returns.
      ELSE /\ wpc' = [wpc EXCEPT ![w] = "done"]
+          \* The gate is unchanged.
           /\ UNCHANGED gate
   \* Nothing else changes.
   /\ UNCHANGED <<stopped, job, progress, seen, latch, relief>>
@@ -452,8 +498,11 @@ OwedTry(w) ==
 OwedStepEnd(w) ==
   \* The owed step holds the gate.
   /\ wpc[w] = "owedStep"
+  \* The step may or may not clear the stop.
   /\ stopped' \in Outcomes
+  \* The gate is free again.
   /\ gate' = "free"
+  \* The writer counts its progress next.
   /\ wpc' = [wpc EXCEPT ![w] = "owedRefresh"]
   \* Nothing else changes.
   /\ UNCHANGED <<job, progress, seen, latch, relief>>
@@ -463,7 +512,9 @@ OwedStepEnd(w) ==
 OwedRefresh(w) ==
   \* The owed step released the gate.
   /\ wpc[w] = "owedRefresh"
+  \* The progress is counted.
   /\ progress' = progress + 1
+  \* The writer returns; when the progress lands, waiters are let go.
   /\ wpc' = [(IF Lands(stopped) THEN Land(wpc) ELSE wpc) EXCEPT ![w] = "done"]
   \* Nothing else changes.
   /\ UNCHANGED <<stopped, gate, job, seen, latch, relief>>
@@ -473,8 +524,11 @@ OwedRefresh(w) ==
 RotateEnd(w) ==
   \* The rotation holds the gate.
   /\ wpc[w] = "rotating"
+  \* The flush may or may not clear the stop.
   /\ stopped' \in Outcomes
+  \* The gate is free again.
   /\ gate' = "free"
+  \* The seal is next: the rotation is about to leave.
   /\ wpc' = [wpc EXCEPT ![w] = "rotLeave"]
   \* Nothing else changes.
   /\ UNCHANGED <<job, progress, seen, latch, relief>>
@@ -487,16 +541,23 @@ RotateEnd(w) ==
 RotateLeave(w) ==
   \* The rotation's flush is done and the gate released.
   /\ wpc[w] = "rotLeave"
-  /\ \/ \* Sealed: counted, landed, and the write is in.
+  \* The seal goes one of two ways.
+  /\ \/
+        \* Sealed: the progress is counted,
         /\ progress' = progress + 1
+        \* it lands the unit as Lands says, and the write is in, with a step owing.
         /\ wpc' = [(IF Lands(stopped) THEN Land(wpc) ELSE wpc) EXCEPT ![w] = "owing"]
-     \/ \* The seal failed.
+     \* Or the seal failed.
+     \/
+        \* Does the rotation count its progress on the way out? (The bug NoRotateRefresh does not.)
         IF Mode # "NoRotateRefresh"
         \* Counted and landed on the way out, and w returns the error.
         THEN /\ progress' = progress + 1
+             \* The progress lands the unit as Lands says, and w returns the error.
              /\ wpc' = [(IF Lands(stopped) THEN Land(wpc) ELSE wpc) EXCEPT ![w] = "done"]
         \* The bug: w returns the error, and nothing is counted.
         ELSE /\ wpc' = [wpc EXCEPT ![w] = "done"]
+             \* The count does not change.
              /\ UNCHANGED progress
   \* Nothing else changes.
   /\ UNCHANGED <<stopped, gate, job, seen, latch, relief>>
@@ -505,11 +566,13 @@ RotateLeave(w) ==
 \* stored, and every write is told the latch from now on. Any thread, at any
 \* moment, once.
 LatchFlag ==
-  \* Only in a run that follows failures, and only once.
+  \* Only in a run that follows failures,
   /\ Failures
+  \* and only once.
   /\ ~latched
-  \* The flag is stored; the landing is owed.
+  \* The flag is stored,
   /\ latched' = TRUE
+  \* and the landing is owed.
   /\ landing' = TRUE
   \* Nothing else changes.
   /\ UNCHANGED <<stopped, gate, job, wpc, progress, seen, relief>>
@@ -531,11 +594,13 @@ LatchLand ==
 \* failure is stored, and a stopped write is told it from now on. Any
 \* thread, at any moment the relief is not already failing.
 FailFlag ==
-  \* Only in a run that follows a failing relief, and only while it works.
+  \* Only in a run that follows a failing relief,
   /\ ReliefFails
+  \* and only while the relief works.
   /\ ~failing
-  \* The failure is stored; the landing is owed.
+  \* The failure is stored,
   /\ failing' = TRUE
+  \* and the landing is owed.
   /\ telling' = TRUE
   \* Nothing else changes.
   /\ UNCHANGED <<stopped, gate, job, wpc, progress, seen, latch>>
@@ -574,8 +639,11 @@ Next ==
   \/ FailFlag \/ FailLand \/ ReliefRecovers
   \* A writer writes, registers, steps, rotates or counts.
   \/ \E w \in Writers :
+       \* A writer tries to write, registers as a waiter, ends its relieving step or counts it;
        \/ WriterTry(w) \/ WriterRegister(w) \/ WriterStepEnd(w) \/ WriterRefresh(w)
+       \* or it takes, ends or counts the step it owed;
        \/ OwedTry(w) \/ OwedStepEnd(w) \/ OwedRefresh(w)
+       \* or its rotation ends its flush, or leaves.
        \/ RotateEnd(w) \/ RotateLeave(w)
 
 \* Every behaviour: start in Init, then take Next steps or stutter.
@@ -597,12 +665,15 @@ TypeOK ==
                           "waiting", "done"}]
   \* The count is a number, and so is what each writer read.
   /\ progress \in Nat
+  \* (What each writer read is a number.)
   /\ seen \in [Writers -> Nat]
-  \* The latch and its owed landing are each a yes or a no.
+  \* The latch is a yes or a no,
   /\ latched \in BOOLEAN
+  \* and so is its owed landing.
   /\ landing \in BOOLEAN
-  \* So are the relief's recorded failure and its owed landing.
+  \* The relief's recorded failure is a yes or a no,
   /\ failing \in BOOLEAN
+  \* and so is its owed landing.
   /\ telling \in BOOLEAN
 
 \* THE RULE. Once every writer has finished or waits on the stall, the job
