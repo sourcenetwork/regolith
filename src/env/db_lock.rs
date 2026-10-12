@@ -435,7 +435,9 @@ mod tests {
             for t in 0..6 {
                 let (registry, inside) = (&registry, &inside);
                 scope.spawn(move || {
-                    for round in 0..2_000 {
+                    // Fewer rounds under miri, which runs each a hundred times
+                    // slower.
+                    for round in 0..if cfg!(miri) { 40 } else { 2_000 } {
                         let exclusive = (t + round) % 3 == 0;
                         let Ok(lock) = registry.acquire(dir, exclusive) else {
                             continue;
@@ -471,7 +473,7 @@ mod tests {
             for t in 0..4 {
                 let registry = &registry;
                 scope.spawn(move || {
-                    for round in 0..500 {
+                    for round in 0..if cfg!(miri) { 20 } else { 500 } {
                         let dir = PathBuf::from(format!("/registry/{t}/{round}"));
                         let writer = registry.acquire(&dir, true).unwrap();
                         assert!(registry.acquire(&dir, false).is_err());

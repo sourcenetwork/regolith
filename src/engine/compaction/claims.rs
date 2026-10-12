@@ -250,7 +250,9 @@ mod tests {
             for t in 0..4usize {
                 let (tables, holders, claims) = (&tables, &holders, &claims);
                 scope.spawn(move || {
-                    for round in 0..2_000usize {
+                    // Fewer rounds under miri, which runs each a hundred times
+                    // slower.
+                    for round in 0..if cfg!(miri) { 40 } else { 2_000usize } {
                         let start = (t + round) % tables.len();
                         let set: Vec<usize> = (0..3)
                             .map(|i| (start + i * (t + 1)) % tables.len())

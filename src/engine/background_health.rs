@@ -234,7 +234,8 @@ mod tests {
     #[test]
     fn concurrent_records_never_tear_and_every_failure_is_counted() {
         const THREADS: u64 = 4;
-        const ROUNDS: u64 = 2_000;
+        // Fewer rounds under miri, which runs each a hundred times slower.
+        const ROUNDS: u64 = if cfg!(miri) { 40 } else { 2_000 };
         let health = BackgroundHealth::default();
         std::thread::scope(|scope| {
             for t in 0..THREADS {

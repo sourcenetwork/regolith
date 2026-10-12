@@ -98,6 +98,14 @@ impl CompactionGate {
 /// A pending wait for sole hold of the gate. It keeps its place among the
 /// waiters and the bypasses it counted for as long as it lives; dropping it
 /// withdraws the wait, and passes on a handoff made to it meanwhile.
+///
+/// Once it was passed over [`MAX_BYPASS`](crate::sync::MAX_BYPASS) times the
+/// gate is handed to it at the next release, whether or not anything polls
+/// it then (D49). A job parked on a queue therefore holds the gate from
+/// that handoff until its owner's next poll runs it: the handoff wakes an
+/// idle owner, and an owner that drops the queue or closes the database
+/// gives the gate back, but one that keeps the queue and stops polling
+/// keeps every other user of the gate waiting.
 pub(crate) struct Admission(WriteOwned<()>);
 
 impl Admission {
@@ -123,7 +131,7 @@ mod tests {
 
     /// How long a stream runs at most before a test gives up on the waiter
     /// it keeps out: far past the few scheduling rounds the waiter needs.
-    const STREAM_DEADLINE: Duration = Duration::from_secs(30);
+    const STREAM_DEADLINE: Duration = Duration::from_secs(if cfg!(miri) { 300 } else { 30 });
 
     /// An admission polled by hand.
     fn admission(gate: &CompactionGate) -> Polled<impl std::future::Future<Output = Exclusive>> {
@@ -227,6 +235,9 @@ mod tests {
     /// go, until the waiter on the other side got in or the deadline passed.
     fn stream_lets_the_waiter_in(stream: Side) {
         const THREADS: usize = 3;
+        // How many holds the stream makes before the waiter arrives: fewer
+        // under miri, which runs each a hundred times slower.
+        const UNDER_WAY: usize = if cfg!(miri) { 4 } else { 64 } * THREADS;
         let gate = CompactionGate::new();
         let taken = AtomicUsize::new(0);
         let waiter_in = AtomicBool::new(false);
@@ -256,7 +267,7 @@ mod tests {
                 });
             }
             // Wait until the stream is under way, by the deadline.
-            while taken.load(Ordering::SeqCst) < 64 * THREADS && Instant::now() < deadline {
+            while taken.load(Ordering::SeqCst) < UNDER_WAY && Instant::now() < deadline {
                 std::hint::spin_loop();
             }
             match stream {
@@ -267,7 +278,7 @@ mod tests {
             waiter_in.store(true, Ordering::SeqCst);
         });
         assert!(
-            taken.load(Ordering::SeqCst) >= 64 * THREADS,
+            taken.load(Ordering::SeqCst) >= UNDER_WAY,
             "the stream never got under way"
         );
         assert!(

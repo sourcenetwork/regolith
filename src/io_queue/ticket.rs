@@ -163,7 +163,11 @@ impl JobTicket {
     /// A job left on this thread's [`IoQueue`](crate::IoQueue) that no poll
     /// has run to its end yet is run here, on this thread, as a blocking
     /// call does its own I/O, waiting here for the compaction gate if a pass
-    /// or another job holds it; one a worker or a poll runs is waited for. The ticket's
+    /// or another job holds it; one a worker or a poll runs is waited for.
+    ///
+    /// A thread whose queue holds an older job still pending polls the queue
+    /// rather than waiting here: that older job may be the one the gate was
+    /// handed to, and only this thread's poll runs it. The ticket's
     /// delivery is unchanged: on a ticket completed on a queue, the
     /// `on_complete` callbacks still run at that queue's poll.
     pub fn wait(self) -> Result<(), Error> {
