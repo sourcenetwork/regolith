@@ -13,6 +13,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 #[cfg(unix)]
 use super::DiskSpace;
+#[cfg(any(unix, windows, target_os = "wasi"))]
+use super::LogFile;
 use super::db_lock;
 use super::{
     Capabilities, DirEntry, Env, FileLock, FileMeta, JoinHandle, ReadDir, ReadFile, WriteFile,
@@ -93,6 +95,18 @@ impl Env for StdEnv {
                 .open(path)?,
         };
         Ok(Box::new(StdWriteFile { file }))
+    }
+
+    /// A log written with positional writes: no cursor, no lock, and no
+    /// `O_APPEND`, under which Linux ignores the offset of a `pwrite`.
+    #[cfg(any(unix, windows, target_os = "wasi"))]
+    fn open_log(&self, path: &Path, mode: WriteMode) -> io::Result<Box<dyn LogFile>> {
+        let file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(mode == WriteMode::Truncate)
+            .open(path)?;
+        Ok(Box::new(StdLogFile { file }))
     }
 
     fn metadata(&self, path: &Path) -> io::Result<FileMeta> {
@@ -353,6 +367,65 @@ impl WriteFile for StdWriteFile {
         // write lands past the new end and leaves a hole behind it.
         self.file.seek(SeekFrom::Start(len))?;
         Ok(())
+    }
+
+    fn len(&self) -> io::Result<u64> {
+        Ok(self.file.metadata()?.len())
+    }
+}
+
+/// A `std::fs::File` written positionally: the log behind
+/// [`StdEnv::open_log`].
+///
+/// Every write names its own offset, so any number of threads write one
+/// handle at once and none of them waits for another: `pwrite` on Unix and
+/// WASI, `seek_write` on Windows (which moves a cursor nothing here reads).
+#[cfg(any(unix, windows, target_os = "wasi"))]
+#[derive(Debug)]
+struct StdLogFile {
+    file: File,
+}
+
+#[cfg(any(unix, windows, target_os = "wasi"))]
+impl LogFile for StdLogFile {
+    // Through `std`, which calls the C library's `pwrite`: the fault shim
+    // the power-loss tests preload sees every log write.
+    #[cfg(unix)]
+    fn write_all_at(&self, offset: u64, buf: &[u8]) -> io::Result<()> {
+        std::os::unix::fs::FileExt::write_all_at(&self.file, buf, offset)
+    }
+
+    #[cfg(not(unix))]
+    fn write_all_at(&self, mut offset: u64, mut buf: &[u8]) -> io::Result<()> {
+        while !buf.is_empty() {
+            #[cfg(windows)]
+            let wrote = std::os::windows::fs::FileExt::seek_write(&self.file, buf, offset);
+            #[cfg(target_os = "wasi")]
+            let wrote = rustix::io::pwrite(&self.file, buf, offset).map_err(io::Error::from);
+            match wrote {
+                Ok(0) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "a positional write made no progress",
+                    ));
+                }
+                Ok(n) => {
+                    buf = &buf[n..];
+                    offset += n as u64;
+                }
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    }
+
+    fn sync_data(&self) -> io::Result<()> {
+        self.file.sync_data()
+    }
+
+    fn set_len(&self, len: u64) -> io::Result<()> {
+        self.file.set_len(len)
     }
 
     fn len(&self) -> io::Result<u64> {
@@ -675,5 +748,71 @@ mod tests {
     fn drop_page_cache_on_a_missing_path_is_silent() {
         let dir = TempDir::new().unwrap();
         std_env().drop_page_cache(&dir.path().join("never_existed"));
+    }
+}
+
+#[cfg(test)]
+mod log_tests {
+    use crate::env::{WriteMode, std_env};
+    use tempfile::TempDir;
+
+    #[test]
+    fn positional_writes_land_at_their_offsets_in_any_order() {
+        let dir = TempDir::new().unwrap();
+        let env = std_env();
+        let path = dir.path().join("log");
+        let log = env.open_log(&path, WriteMode::Truncate).unwrap();
+        log.write_all_at(8, b"89ab").unwrap();
+        log.write_all_at(0, b"0123").unwrap();
+        log.write_all_at(4, b"4567").unwrap();
+        // The same bytes again: the contract every helper relies on.
+        log.write_all_at(4, b"4567").unwrap();
+        log.sync_data().unwrap();
+        assert_eq!(log.len().unwrap(), 12);
+        assert_eq!(env.read(&path).unwrap(), b"0123456789ab");
+    }
+
+    #[test]
+    fn a_log_opened_for_update_keeps_its_bytes_and_is_cut_by_set_len() {
+        let dir = TempDir::new().unwrap();
+        let env = std_env();
+        let path = dir.path().join("log");
+        env.write(&path, b"stamp+tail").unwrap();
+        let log = env.open_log(&path, WriteMode::Update).unwrap();
+        assert_eq!(log.len().unwrap(), 10);
+        log.set_len(5).unwrap();
+        log.write_all_at(5, b"=next").unwrap();
+        assert_eq!(env.read(&path).unwrap(), b"stamp=next");
+    }
+
+    /// Many threads write disjoint records of one log at once, each record
+    /// twice: nothing is lost and nothing lands in another record's range.
+    #[test]
+    fn concurrent_positional_writes_do_not_disturb_each_other() {
+        const THREADS: usize = 8;
+        const RECORDS: usize = 200;
+        const LEN: usize = 37;
+        let dir = TempDir::new().unwrap();
+        let env = std_env();
+        let path = dir.path().join("log");
+        let log: std::sync::Arc<dyn crate::env::LogFile> =
+            std::sync::Arc::from(env.open_log(&path, WriteMode::Truncate).unwrap());
+        std::thread::scope(|scope| {
+            for t in 0..THREADS {
+                let log = std::sync::Arc::clone(&log);
+                scope.spawn(move || {
+                    for r in (0..RECORDS).filter(|r| r % THREADS == t) {
+                        let bytes = vec![(r % 251) as u8; LEN];
+                        log.write_all_at((r * LEN) as u64, &bytes).unwrap();
+                        log.write_all_at((r * LEN) as u64, &bytes).unwrap();
+                    }
+                });
+            }
+        });
+        let got = env.read(&path).unwrap();
+        assert_eq!(got.len(), RECORDS * LEN);
+        for (r, chunk) in got.chunks(LEN).enumerate() {
+            assert!(chunk.iter().all(|b| *b == (r % 251) as u8), "record {r}");
+        }
     }
 }

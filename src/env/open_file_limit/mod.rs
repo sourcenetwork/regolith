@@ -476,6 +476,9 @@ impl Env for OpenFileLimit {
     fn open_write(&self, path: &Path, mode: WriteMode) -> io::Result<Box<dyn WriteFile>> {
         self.shared.inner.open_write(path, mode)
     }
+    fn open_log(&self, path: &Path, mode: WriteMode) -> io::Result<Box<dyn super::LogFile>> {
+        self.shared.inner.open_log(path, mode)
+    }
     fn metadata(&self, path: &Path) -> io::Result<FileMeta> {
         self.shared.inner.metadata(path)
     }

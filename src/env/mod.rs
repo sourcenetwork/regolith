@@ -48,6 +48,7 @@ pub mod opfs;
 // Pure, so it is unit-tested on the host as well as built for OPFS.
 #[cfg(any(test, all(target_arch = "wasm32", target_os = "unknown")))]
 mod persist_order;
+mod serial_log;
 mod std_env;
 #[cfg(test)]
 pub(crate) mod walk_fault;
@@ -150,6 +151,23 @@ pub trait Env: Send + Sync + std::fmt::Debug {
 
     /// Open `path` for writing, creating it if it does not exist.
     fn open_write(&self, path: &Path, mode: WriteMode) -> io::Result<Box<dyn WriteFile>>;
+
+    /// Open `path` as a write-ahead log written at explicit offsets,
+    /// creating it if it does not exist.
+    ///
+    /// [`WriteMode::Truncate`] starts an empty log. Any other mode keeps
+    /// what the file holds, so writes continue above it.
+    ///
+    /// The default opens the file with [`Env::open_write`] and puts the
+    /// writes in offset order behind a lock, holding a write that arrives
+    /// ahead of a gap until the gap is filled. That is always correct, and
+    /// it keeps an environment that wraps `open_write` (to count, to fail
+    /// or to record writes) seeing every byte of the log. An environment
+    /// that can write at an offset natively should override this: then no
+    /// committing thread waits for another to write. [`StdEnv`] does.
+    fn open_log(&self, path: &Path, mode: WriteMode) -> io::Result<Box<dyn LogFile>> {
+        Ok(Box::new(serial_log::SerialLog::open(self, path, mode)?))
+    }
 
     /// Size and kind of the entry at `path`.
     fn metadata(&self, path: &Path) -> io::Result<FileMeta>;
@@ -374,6 +392,60 @@ pub trait WriteFile: Send {
 
     /// Length of the file in bytes, counting only what has reached
     /// the host.
+    fn len(&self) -> io::Result<u64>;
+
+    /// Whether the file holds no bytes.
+    fn is_empty(&self) -> io::Result<bool> {
+        Ok(self.len()? == 0)
+    }
+}
+
+/// A write-ahead log file, written at explicit offsets by any number of
+/// threads at once. Opened by [`Env::open_log`].
+///
+/// regolith's commit pipeline gives every commit its byte range in the log
+/// before anything is written, and then lets whichever thread gets there
+/// first write that range. So unlike a [`WriteFile`], this handle has no
+/// cursor and every method takes `&self`.
+///
+/// # Contract
+///
+/// - **Idempotent writes.** Two calls that name the same offset always carry
+///   the same bytes, and may run at the same time. An implementation may
+///   perform both or only one; the range must end up holding those bytes.
+/// - **Out of order.** A write may land above a range nothing has written
+///   yet. That gap is filled by a later write before any
+///   [`sync_data`](LogFile::sync_data) is expected to cover the bytes above
+///   it: a sync makes durable every byte below the lowest offset never
+///   written, the contiguous written prefix, and may cover more.
+/// - **No write returns before its bytes are held.** Once
+///   [`write_all_at`](LogFile::write_all_at) returns `Ok`, a sync that covers
+///   the range makes it durable, and a reader opened on the path sees the
+///   bytes once every lower offset is written too.
+/// - **Truncation.** [`set_len`](LogFile::set_len) is called only while no
+///   write is in flight, and only to cut the file back to an offset where a
+///   write began.
+///
+/// # Misuse
+///
+/// Two writes of different bytes to one offset, or a `set_len` racing a
+/// write, leave the range holding either write or a mixture; replay then
+/// reads the range as a torn tail.
+pub trait LogFile: Send + Sync {
+    /// Write every byte of `buf` at `offset`, extending the file as needed.
+    fn write_all_at(&self, offset: u64, buf: &[u8]) -> io::Result<()>;
+
+    /// Make the contiguous written prefix durable, data only (`fdatasync`),
+    /// as [`WriteFile::sync_data`] does.
+    ///
+    /// An environment whose [`Capabilities::durable_sync`] is `false` may
+    /// return `Ok(())` without providing durability.
+    fn sync_data(&self) -> io::Result<()>;
+
+    /// Cut the file to exactly `len` bytes.
+    fn set_len(&self, len: u64) -> io::Result<()>;
+
+    /// Length of the file in bytes, counting only what has reached the host.
     fn len(&self) -> io::Result<u64>;
 
     /// Whether the file holds no bytes.
