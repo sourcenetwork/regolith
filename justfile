@@ -553,10 +553,15 @@ tla:
     check MC_LsmOrder_Green_Demote                     GREEN
     check MC_LsmOrder_Red_DemoteLevelOnly              RED ReadNewest
     check MC_LsmOrder_Red_NoDemotion                   RED ReadNewest
-    # A demoted table's range tombstone, read before any point (E14).
+    # E14, the range deletes of the tables an open moves out of overlapping
+    # levels: copied into the recovered memtable, and logged before the
+    # manifest records the move. Lean: Regolith/RangeDelete.lean,
+    # hoisted_delete_reads_by_sequence.
     spec=LegacyRangeRead
     check MC_LegacyRangeRead_Green                     GREEN
-    check MC_LegacyRangeRead_Red_NoPreScan             RED ReadNewest
+    check MC_LegacyRangeRead_Red_NoHoist               RED ReadNewest
+    check MC_LegacyRangeRead_Red_PreScanOnly           RED ReadNewest
+    check MC_LegacyRangeRead_Red_MoveBeforeLog         RED ReadNewest
     # E6. Lean: Regolith/BatchView.lean, batch_one_view_newest.
     spec=BatchRead
     check MC_BatchRead_Green                           GREEN
