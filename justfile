@@ -269,28 +269,38 @@ stress secs="600":
 # Seven of the models are `should_panic` calibrations that deliberately
 # get the ordering wrong; they are what make the passes mean anything.
 
+# Loom is bounded. Every recipe below builds its models first and then runs
+# them under a hard limit of 10 minutes (15 for the nightly twins): a run
+# that hits it fails. A model is sized to finish in under a minute and a
+# recipe in under five, by its scenario and by an explicit preemption bound
+# in its builder, never by `LOOM_MAX_DURATION`, which stops the search and
+# lets the test pass. A model that is shrunk says so in its comment.
 loom:
-    RUSTFLAGS="--cfg loom" cargo test --release --test loom_memtable
+    RUSTFLAGS="--cfg loom" cargo test --release --test loom_memtable --no-run
+    RUSTFLAGS="--cfg loom" timeout 10m cargo test --release --test loom_memtable
 
 loom-debug:
-    RUSTFLAGS="--cfg loom" cargo test --test loom_memtable
+    RUSTFLAGS="--cfg loom" cargo test --test loom_memtable --no-run
+    RUSTFLAGS="--cfg loom" timeout 10m cargo test --test loom_memtable
 
 # Loom models for `regolith::sync`: every primitive's wait protocol,
 # with two calibrations that must fail. Release only: the larger models
-# explore 0.1 to 3 million interleavings each (about eight minutes in
+# explore 0.1 to 0.4 million interleavings each (about four minutes in
 # all), which a debug build multiplies several times over.
 loom-sync:
-    RUSTFLAGS="--cfg loom" cargo test --release --test loom_sync
+    RUSTFLAGS="--cfg loom" cargo test --release --test loom_sync --no-run
+    RUSTFLAGS="--cfg loom" timeout 10m cargo test --release --test loom_sync
 
 # The five sync models whose three threads all contend for one lock or
 # semaphore, at preemption bound 2 instead of the bound 1 `loom-sync`
-# runs them at: their `#[ignore]`d twins, or the one `model` names.
-# Four of them take 43 to 79 minutes each on a workstation; the fifth, the
-# upgradable read, runs a smaller scenario at bound 2 and takes 10 s (its
-# full one never finished). So the nightly CI run carries them, one job
-# per model, not the per-change one.
+# runs them at: their `#[ignore]`d twins, or the one `model` names. Each
+# twin runs a smaller scenario of its own, because the shared one does not
+# finish at bound 2 in any useful time (43 to 79 minutes a model, and never
+# for the upgradable read). They take 2 s to 6 minutes each, so the nightly
+# CI run carries them, one job per model.
 loom-sync-deep model="":
-    RUSTFLAGS="--cfg loom" cargo test --release --test loom_sync -- --ignored {{model}}
+    RUSTFLAGS="--cfg loom" cargo test --release --test loom_sync --no-run
+    RUSTFLAGS="--cfg loom" timeout 15m cargo test --release --test loom_sync -- --ignored {{model}}
 
 # Loom models for the per-thread I/O queues (D53): the unit claim, the
 # completion pushed to every waiting queue, the idle waker, and a read's
@@ -340,30 +350,49 @@ chaos instances="4" rounds="2" versions="120" min_rounds="20":
 # Each row prints the distinct states TLC explored and its wall time.
 # TLC is fetched on first use, pinned by checksum in `proofs/tla/tools/tlc`.
 #
-# `just tla` runs every row. `just tla N M` runs the rows of shard N of M:
-# the rows are dealt out in turn, so M runs side by side (CI's matrix) cover
-# every row once, and no shard holds two neighbouring heavy rows.
+# The suite is bounded. Every row runs on ONE TLC worker under a hard limit
+# of 120 seconds: a row that hits it is reported as TIMED OUT and fails the
+# recipe, it never passes. A configuration is sized to finish in under 60
+# seconds on one worker; one that does not is shrunk (its `.cfg` says what
+# was shrunk and what the smaller instance still covers), because the Lean
+# proof covers every size and TLC only has to show a small instance's
+# interleavings. Time a new row before adding it.
 #
-# A GREEN row explores its whole state space, in whatever order, so TLC
-# gets every core for it. A RED row stops at the first broken invariant it
-# meets, and with one worker that is always the shallowest one, the same on
-# every run; RED rows are short anyway.
-# Check every TLA+ row, or shard N of M of them (`just tla N M`).
-tla shard="1" shards="1":
+# As many rows run side by side as the machine has cores, each in a JVM
+# sized for its one worker, and their lines are printed in the order below
+# once all are done. With one worker a RED row stops at the shallowest
+# broken invariant, the same on every run.
+# Check every TLA+ row.
+tla:
     #!/usr/bin/env bash
     set -uo pipefail
     cd proofs/tla
-    fail=0
+    # Fetched once, before the rows run side by side.
+    ./tools/tlc --fetch-only >/dev/null || exit 1
+    results=$(mktemp -d)
+    trap 'rm -rf "$results"' EXIT
+    # The cores this run may use (`nproc` counts those it is confined to).
+    side=$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN)
     row=0
     # The module the next rows check; each block below sets it.
     spec=RepeatableRead
+    # One row, started in the background: its line goes to a file named by
+    # its number, and a `.fail` file beside it marks a wrong verdict.
     check() {
-        local cfg="$1" expect="$2" inv="${3:-}" out broke verdict states took workers
         row=$((row + 1))
-        if [ $(( (row - 1) % {{shards}} + 1 )) -ne {{shard}} ]; then return; fi
-        workers=1
-        if [ "$expect" = GREEN ]; then workers=auto; fi
-        out=$(./tools/tlc -workers "$workers" -metadir "states/$cfg" -config "$cfg.cfg" "$spec.tla" 2>&1)
+        while [ "$(jobs -rp | wc -l)" -ge "$side" ]; do wait -n; done
+        run_row "$(printf '%04d' "$row")" "$spec" "$@" > "$results/$(printf '%04d' "$row").out" 2>&1 &
+    }
+    run_row() {
+        local n="$1" spec="$2" cfg="$3" expect="$4" inv="${5:-}" out code broke verdict states took
+        # A serial collector and two compiler threads: what one worker on
+        # one core uses. A temporary directory of its own, because TLC
+        # unpacks its standard modules into it and two rows must not share
+        # the files; the row's states go there too.
+        mkdir -p "$results/tmp.$n"
+        out=$(TLC_JVM_FLAGS="-XX:+UseSerialGC -XX:CICompilerCount=2 -Djava.io.tmpdir=$results/tmp.$n" \
+              timeout 120 ./tools/tlc -workers 1 -metadir "$results/tmp.$n/states" -config "$cfg.cfg" "$spec.tla" 2>&1)
+        code=$?
         # TLC words a broken invariant two ways: "is violated." when the search reaches a bad
         # state, and "is violated by the initial state:" when the very first state is already
         # bad. Both name the invariant, and both count.
@@ -371,7 +400,11 @@ tla shard="1" shards="1":
                        -e 's/^Error: Invariant \(.*\) is violated by the initial state:$/\1/p' <<<"$out" | head -1)
         states=$(sed -n 's/^.* states generated, \([0-9,]*\) distinct states found.*$/\1/p' <<<"$out" | tail -1)
         took=$(sed -n 's/^Finished in \(.*\) at (.*$/\1/p' <<<"$out" | tail -1)
-        if grep -q "No error has been found" <<<"$out"; then
+        if [ "$code" -eq 124 ]; then
+            # The hard limit: a failure, whatever the row was meant to show.
+            verdict="TIMED OUT"
+            took="over 120s"
+        elif grep -q "No error has been found" <<<"$out"; then
             verdict=GREEN
         elif [ -n "$broke" ] && [ "$broke" = "$inv" ]; then
             verdict=RED
@@ -381,9 +414,9 @@ tla shard="1" shards="1":
             verdict=BROKEN
             echo "$out" | tail -20
         fi
-        printf '  %-48s %-6s %9s states %8s  (expected %s)\n' \
+        printf '  %-48s %-9s %9s states %9s  (expected %s)\n' \
             "$cfg" "$verdict" "${states:-?}" "${took:-?}" "$expect${inv:+ on $inv}"
-        if [ "$verdict" != "$expect" ]; then fail=1; fi
+        if [ "$verdict" != "$expect" ]; then touch "$results/$n.fail"; fi
     }
     check MC_RepeatableRead_Green                      GREEN
     check MC_RepeatableRead_Red_Serializable           RED INV_AppendsCommit
@@ -391,6 +424,7 @@ tla shard="1" shards="1":
     check MC_RepeatableRead_Red_ReadCommitted          RED INV_NoStaleDefinition
     check MC_DefraLevel_Green_Heads                    GREEN
     check MC_DefraLevel_Green_Counters                 GREEN
+    check MC_DefraLevel_Green_Counters_Clear           GREEN
     check MC_DefraLevel_Green_Migrations               GREEN
     check MC_DefraLevel_Red_RepeatableRead_Merges      RED INV_DuplicateMergesCommit
     check MC_DefraLevel_Red_NoPolicy                   RED INV_DuplicateMergesCommit
@@ -560,6 +594,9 @@ tla shard="1" shards="1":
     # seqs_dense and reader_sees_published.
     spec=CommitPipeline
     check MC_CommitPipeline_Green                      GREEN
+    check MC_CommitPipeline_Green_Live                 GREEN
+    check MC_CommitPipeline_Green_LiveIngest           GREEN
+    check MC_CommitPipeline_Green_LiveNoStop           GREEN
     check MC_CommitPipeline_Red_OutOfOrder             RED ReadersSeePrefix
     check MC_CommitPipeline_Red_AbortHole              RED NoHole
     check MC_CommitPipeline_Red_NoHelping              RED NoLiveThreadBlocked
@@ -637,9 +674,12 @@ tla shard="1" shards="1":
     check MC_TxnCallbacks_Red_CallbacksSurvive         RED AttemptIsolation
     check MC_TxnCallbacks_Red_HelperNoClaim            RED AtMostOnce
     check MC_TxnCallbacks_Red_CloseNoClaim             RED AtMostOnce
-    rm -rf states ./*_TTrace_*.tla ./*_TTrace_*.bin
-    echo "  shard {{shard}} of {{shards}}: $row rows in all"
-    exit $fail
+    wait
+    rm -rf ./*_TTrace_*.tla ./*_TTrace_*.bin
+    cat "$results"/*.out
+    failed=$(find "$results" -name '*.fail' | wc -l)
+    echo "  $row rows, $failed with the wrong verdict"
+    [ "$failed" -eq 0 ]
 
 # `proofs/lean` is a Lake project named Regolith, plain Lean 4 core with no
 # dependencies, so it builds offline. Each module proves for every size what
