@@ -1694,6 +1694,10 @@ impl Db {
     /// handle fail with [`Error::Closed`]. Calling `close` more than
     /// once is allowed.
     ///
+    /// Close does not give the directory back: it stays locked, and opening
+    /// it again fails, until this handle and every snapshot, iterator and
+    /// transaction made from it have been dropped.
+    ///
     /// Close syncs the write-ahead log and ends it with a record saying it
     /// is complete, so every write survives a power cut after `close`
     /// returns, under either durability mode. A close whose sync fails
