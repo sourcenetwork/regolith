@@ -87,4 +87,8 @@ else
   exit 1
 fi
 
-exec "$JAVA" -XX:+UseParallelGC -cp "$JAR" tlc2.TLC "$@"
+# The JVM flags: TLC's own advice for a run that takes every core, unless
+# the caller sizes the JVM itself (TLC_JVM_FLAGS; `just tla` gives each of
+# its one-worker runs a serial collector).
+# shellcheck disable=SC2086
+exec "$JAVA" ${TLC_JVM_FLAGS:--XX:+UseParallelGC} -cp "$JAR" tlc2.TLC "$@"
