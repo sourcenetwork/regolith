@@ -182,6 +182,10 @@
 \*     as the thread that holds the queue.
 \*   - The ticket's on_complete callbacks, which run after the outcome's
 \*     own on the same thread and in the same claim.
+\*   - A pessimistic transaction's key locks. A commit_nowait releases them
+\*     when its group lands, on the thread that lands it, and close releases
+\*     those of the transactions it aborts. That is LockTable.tla's
+\*     (IsolationAtLanding); no callback runs there.
 \*
 \* CONFIGURATIONS.
 \*   MC_TxnCallbacks_Green_Immediate   one blocking commit and one

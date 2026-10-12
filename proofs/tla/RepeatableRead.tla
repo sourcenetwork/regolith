@@ -299,11 +299,23 @@ NoExtras == [r \in RoleNames |-> {}]
 ContentAddressedWorkload ==
   \* Transaction 20 collects; 21 and 22 link; 23 holds.
   [NoExtras EXCEPT !["Collectors"] = {20}, !["Linkers"] = {21, 22}, !["Holders"] = {23}]
-\* Projected reads: a part reader, a rewriter, two part writers.
+\* Projected reads: a part reader, a rewriter, two part writers. The REDs
+\* run this whole workload; the two GREEN runs each take half of it.
 PartsWorkload ==
   \* Transaction 30 reads by parts, 31 rewrites, 32 and 33 write the part key.
   [NoExtras EXCEPT !["PartReaders"] = {30}, !["PartRewriters"] = {31},
                    !["PartWriters"] = {32, 33}]
+\* The part reader beside two part writers, without the rewriter
+\* (MC_DefraLevel_Green_Parts).
+PartsWritersWorkload ==
+  \* Transaction 30 reads by parts; 32 and 33 write the part key. Nobody rewrites.
+  [NoExtras EXCEPT !["PartReaders"] = {30}, !["PartWriters"] = {32, 33}]
+\* The part reader beside the rewriter and one part writer
+\* (MC_DefraLevel_Green_Parts_Rewriter).
+PartsRewriterWorkload ==
+  \* Transaction 30 reads by parts, 31 rewrites, and only 32 writes the part key.
+  [NoExtras EXCEPT !["PartReaders"] = {30}, !["PartRewriters"] = {31},
+                   !["PartWriters"] = {32}]
 \* Value-validated reads: a reader and two version writers.
 ValueWorkload ==
   \* Transaction 40 reads the version key; 41 and 42 rewrite it.

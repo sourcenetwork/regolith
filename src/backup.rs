@@ -195,12 +195,12 @@ impl BackupEngine {
             .map_err(Error::from)?;
 
         // Take the snapshot in a limited scope so its held
-        // compaction lock is released before we touch the backup
+        // compaction gate is released before we touch the backup
         // metadata directory. `checkpoint_capture` holds the
-        // engine's compaction lock, which pins the captured file
+        // engine's compaction gate, which pins the captured file
         // set against concurrent unlink while we hash + copy.
         let (files, next_file_id, last_seq) = {
-            let snapshot = db.engine().checkpoint_capture().map_err(Error::from)?;
+            let snapshot = db.engine().checkpoint_capture_here().map_err(Error::from)?;
 
             let mut files = Vec::new();
             for (level_idx, level) in snapshot.version.levels.iter().enumerate() {
@@ -231,7 +231,7 @@ impl BackupEngine {
                 snapshot.version.next_file_id,
                 snapshot.version.last_seq,
             )
-            // snapshot drops here, releasing the compaction lock.
+            // snapshot drops here, releasing the compaction gate.
         };
 
         let manifest = BackupManifest {

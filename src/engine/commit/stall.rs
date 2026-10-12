@@ -292,7 +292,7 @@ mod tests {
         let (_dir, engine) = stopped_engine_where_writers_relieve();
         // A job holds the compaction gate: the stopped write's own step is
         // contended, and the write waits for the job's thread.
-        let gate = engine.compaction_lock.write();
+        let gate = engine.compaction_gate().exclusive().unwrap();
         let Err(Error::WouldBlock(WouldBlock::Stall(wait))) = engine.admit_write(false) else {
             panic!("a contended relief returns a wait");
         };
@@ -301,7 +301,7 @@ mod tests {
         // That thread runs one step, which leaves the stop on, and relieves
         // no further: an owed step after its commit, or a job that ended.
         assert!(matches!(
-            engine.run_one_background_step(false).unwrap(),
+            engine.run_one_background_step().unwrap(),
             CompactionOutcome::Idle
         ));
         assert!(matches!(engine.stall_signal().classify(), Some((_, true))));

@@ -89,10 +89,18 @@ instruction.
 6. `no_stranded_head` and `handed_woken`: while the lock is free, the head
    waiter has been woken; a request handed the lock has been woken.
    TLA+: `NoLostWakeup`.
-7. The RED cases, as counterexamples: `unbounded_barging_breaks_bound` (a
-   waiter that never raises the owed flag loses more than `B` races with
-   barging still open) and `release_without_wake_strands` (a release that
-   wakes nobody leaves the head asleep beside a free lock).
+7. The RED cases, as counterexamples: `unbounded_barging_breaks_bound` and
+   `unbounded_barging_leaves_barging_open` (a waiter that never raises the
+   owed flag loses more than `B` races, with barging still open) and
+   `release_without_wake_strands` (a release that wakes nobody leaves the
+   head asleep beside a free lock).
+
+`Regolith/LockTable.lean` builds the pessimistic lock table on this
+machine: it uses `M`, `init`, `Step`, `Steps`, the four laws
+`mutual_exclusion`, `bounded_bypass`, `no_stranded_head` and
+`handed_woken`, the helper `eq_single_of_mem`, and the RED relation
+`StepsNoHand` with `unbounded_barging_breaks_bound`. Those keep their names
+and their statements here.
 
 How to read the Lean: `def` defines a function or a property, `theorem`
 states a fact and its proof follows `:= by`. Lines starting with `--` are
@@ -318,6 +326,20 @@ structure Inv (B : Nat) (s : M) : Prop where
   queue_fresh : ∀ x ∈ s.queue, x ∉ s.owners ∧ x ∉ s.handed
 
 /-! ## Helper facts about lists -/
+
+/-- A list of length one that holds `x` is `[x]`. (`Regolith/LockTable.lean`
+uses it: the one holder of a key is the pending committer.) -/
+theorem eq_single_of_mem {l : List Nat} {x : Nat}
+    -- `l` has one element ...
+    (hl : l.length = 1)
+    -- ... and `x` is in it.
+    (hx : x ∈ l) :
+    -- The statement: l is the one-element list [x].
+    l = [x] := by
+  -- Look at l, knowing its length is 1.
+  match l, hl with
+  -- It is [a] for some a; x is in it, so x is a; replace.
+  | [a], _ => simp only [List.mem_singleton] at hx; rw [hx]
 
 /-- `x` is in "`l` without `r`" exactly when it is in `l` and is not `r`. -/
 theorem mem_without {l : List Nat} {r x : Nat} :
@@ -1536,53 +1558,54 @@ theorem handed_woken {B : Nat}
 /-! ## The RED cases -/
 
 /-- The unbounded-barging design: a waiter never makes the try that raises
-the owed flag. Every retry is a plain try, and a loss just counts.
-TLA+: the mutant `UnboundedBarging`. -/
-inductive StepNoOwe : M → M → Prop
+the owed flag. Every retry is a plain try, and a loss just counts. With the
+flag never up, no release ever hands the lock over: a lock that never hands
+off. TLA+: the mutant `UnboundedBarging`. (`Regolith/LockTable.lean` names
+this relation for its own RED case.) -/
+inductive StepNoHand : M → M → Prop
   /-- As `Step.fast`. -/
   | fast (s : M) (r : Nat)
       -- `r` is fresh, the lock free, nothing owed.
       (hr : r ∉ s.enq) (hf : s.free = true) (ho : s.owed = none) :
       -- After the step: the lock is held, r is an owner, and r has entered.
-      StepNoOwe s { s with free := false, owners := r :: s.owners, enq := s.enq ++ [r] }
+      StepNoHand s { s with free := false, owners := r :: s.owners, enq := s.enq ++ [r] }
   /-- As `Step.enqueue`. -/
   | enqueue (s : M) (r : Nat)
       -- `r` is fresh, and the fast path is shut.
       (hr : r ∉ s.enq) (hc : s.free = false ∨ s.owed ≠ none) :
       -- After the step: r is at the tail of the queue, has entered,
-      StepNoOwe s { s with queue := s.queue ++ [r], enq := s.enq ++ [r],
-                           -- and has a count of 0.
-                           bypass := upd s.bypass r 0 }
+      StepNoHand s { s with queue := s.queue ++ [r], enq := s.enq ++ [r],
+                            -- and has a count of 0.
+                            bypass := upd s.bypass r 0 }
   /-- As `Step.release`. -/
   | release (s : M) (r : Nat)
       -- `r` holds the lock.
       (hr : r ∈ s.owners) :
       -- After the step: r is no longer an owner, and the release rule ran.
-      StepNoOwe s (relFrom { s with owners := s.owners.erase r })
+      StepNoHand s (relFrom { s with owners := s.owners.erase r })
   /-- The defect: a loss counts, whatever the count, and never raises the
   owed flag. -/
   | pollLose (s : M) (h : Nat)
       -- `h` was woken, not handed, the lock is taken, and nothing is owed.
       (hw : h ∈ s.woken) (hh : h ∉ s.handed) (hf : s.free = false) (ho : s.owed = none) :
       -- After the step: h's count is one more, and h is no longer "woken".
-      StepNoOwe s { s with bypass := upd s.bypass h (s.bypass h + 1), woken := without s.woken h }
+      StepNoHand s { s with bypass := upd s.bypass h (s.bypass h + 1), woken := without s.woken h }
 
-/-- Any number of `StepNoOwe` steps. -/
-inductive StepsNoOwe : M → M → Prop
+/-- Any number of `StepNoHand` steps. -/
+inductive StepsNoHand : M → M → Prop
   /-- No step at all. -/
-  | refl (s : M) : StepsNoOwe s s
+  | refl (s : M) : StepsNoHand s s
   /-- Some steps, then one more. -/
-  | tail {s t u : M} : StepsNoOwe s t → StepNoOwe t u → StepsNoOwe s u
+  | tail {s t u : M} : StepsNoHand s t → StepNoHand t u → StepsNoHand s u
 
-/-- **`unbounded_barging_breaks_bound`.** With bound 1 and no owed flag,
-request 2 waits, is woken, and loses to barging request 3 (the design
-would raise the flag here); at release it is woken again and loses to
-barging request 4. It has lost 2 races, more than the bound, with barging
-still open: the laws of `bounded_bypass` and `at_bound_owed` fail. -/
-theorem unbounded_barging_breaks_bound :
+/-- The run both RED theorems below use: with bound 1 and no owed flag,
+request 2 waits, is woken, and loses to barging request 3 (the design would
+raise the flag here); at release it is woken again and loses to barging
+request 4. -/
+theorem barging_run :
     -- The statement: some state the defective steps reach has request 2 still waiting with a count
     -- of 2 and nothing owed.
-    ∃ s, StepsNoOwe init s ∧ 2 ∈ s.queue ∧ s.bypass 2 = 2 ∧ s.owed = none := by
+    ∃ s, StepsNoHand init s ∧ 2 ∈ s.queue ∧ s.bypass 2 = 2 ∧ s.owed = none := by
   -- The run, written from the inside out: eight steps from the start, then the three facts about
   -- the final state, each computed.
   refine ⟨_, .tail (.tail (.tail (.tail (.tail (.tail (.tail (.tail (.refl init)
@@ -1599,6 +1622,29 @@ theorem unbounded_barging_breaks_bound :
     -- Request 4 barges in; request 2 loses again.
     (.fast _ 4 (by decide) rfl rfl))
     (.pollLose _ 2 (by decide) (by decide) rfl rfl), by decide, by decide, by decide⟩
+
+/-- **`unbounded_barging_breaks_bound`.** With bound 1 and a lock that
+never hands off, request 2 has lost 2 races, more than the bound: the law
+of `bounded_bypass` fails. -/
+theorem unbounded_barging_breaks_bound :
+    -- The statement: some state the defective steps reach has request 2 still waiting with a count
+    -- of 2.
+    ∃ s, StepsNoHand init s ∧ 2 ∈ s.queue ∧ s.bypass 2 = 2 := by
+  -- The run above ends in such a state.
+  obtain ⟨s, hs, hq, hb, -⟩ := barging_run
+  -- Its first three facts are the claim.
+  exact ⟨s, hs, hq, hb⟩
+
+/-- **`unbounded_barging_leaves_barging_open`.** In that same state nothing
+is owed, so the next caller may barge again: the law of `at_bound_owed`
+fails too. -/
+theorem unbounded_barging_leaves_barging_open :
+    -- The statement: request 2 waits with a count of 2, past the bound of 1, and nothing is owed.
+    ∃ s, StepsNoHand init s ∧ 2 ∈ s.queue ∧ 1 < s.bypass 2 ∧ s.owed = none := by
+  -- The run above ends in such a state.
+  obtain ⟨s, hs, hq, hb, ho⟩ := barging_run
+  -- A count of 2 is past 1.
+  exact ⟨s, hs, hq, by omega, ho⟩
 
 /-- The release-without-wake design: a release with waiters frees the lock
 and wakes nobody. TLA+: the mutant `ReleaseNoWake`. -/

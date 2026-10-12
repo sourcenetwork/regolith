@@ -99,10 +99,14 @@
 \*                                                    (it counts the
 \*                                                    passes of the
 \*                                                    waiter's own drain)
-\*   a_drain_that_found_nobody_queued_ends_while_another_thread_releases
-\*                                                    DrainBounded
-\* Each of the last two has a calibration that writes the one step the old
-\* way and must fail.
+\* The last one has a calibration that writes the nudge marker the old way
+\* and must fail.
+\*
+\* DrainBounded is checked on the real code by two unit tests of
+\* src/sync/contend.rs, which race a release against a drain at a chosen
+\* instant, not by a loom model:
+\*   a_drain_that_found_nobody_queued_does_not_pass_again_for_releases
+\*   a_release_during_a_pass_that_found_a_waiter_reaches_it
 \*
 \* THE CODE MODELLED, one step here per atomic instruction there (the few
 \* reads that share a step are listed under WHAT THE MODEL LEAVES OUT).

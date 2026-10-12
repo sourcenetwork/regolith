@@ -109,8 +109,9 @@ fn run<T, E>(
 
 /// Run `call` until it stops asking to wait: on
 /// [`TransactionError::WouldBlock`], await what the error carries (a read's
-/// [`IoWait`](crate::IoWait), a stall's [`StallWait`](crate::StallWait)) and
-/// call it again; any other outcome is returned.
+/// [`IoWait`](crate::IoWait), a stall's [`StallWait`](crate::StallWait), a
+/// key lock's [`LockWait`](crate::LockWait)) and call it again; any other
+/// outcome is returned.
 ///
 /// Inside [`OptimisticTransactionDb::transact_async`] a read that may miss
 /// the cache is written `ready(|| txn.get_slice(key)).await`: the attempt
@@ -132,6 +133,7 @@ async fn wait_out(would_block: WouldBlock) {
     match would_block {
         WouldBlock::Io(wait) => wait.await,
         WouldBlock::Stall(wait) => wait.await,
+        WouldBlock::Locked(wait) => wait.await,
     }
 }
 

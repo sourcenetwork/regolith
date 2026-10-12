@@ -9,6 +9,7 @@ use core::marker::PhantomData;
 use core::ops::{Deref, DerefMut};
 use core::pin::Pin;
 use core::task::{Context, Poll};
+use std::sync::Arc;
 
 use super::raw_rwlock::{READ, RawRwLock, RwWait, UPGRADABLE_READ, UpgradeWait, WRITE};
 
@@ -109,6 +110,16 @@ impl<T: ?Sized> RwLock<T> {
         }
     }
 
+    /// Waits to hold the lock alone, with a guard that keeps the lock alive
+    /// itself, so the future and the guard can outlive the borrow that made
+    /// them: a wait kept across calls, or a guard returned to a caller.
+    pub fn write_owned(self: &Arc<Self>) -> WriteOwned<T> {
+        WriteOwned {
+            lock: Arc::clone(self),
+            wait: RwWait::new(),
+        }
+    }
+
     /// Waits for the upgradable read. It makes the progress
     /// [`read`](Self::read) does.
     pub fn upgradable_read(&self) -> UpgradableRead<'_, T> {
@@ -200,6 +211,53 @@ impl<T: ?Sized> Drop for RwLockWriteGuard<'_, T> {
 }
 
 impl<T: ?Sized + fmt::Debug> fmt::Debug for RwLockWriteGuard<'_, T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&**self, f)
+    }
+}
+
+/// Exclusive access to a [`RwLock`]'s value through an [`Arc`] the guard
+/// holds; releases on drop. Made by [`RwLock::write_owned`].
+#[must_use = "dropping the guard releases the lock at once"]
+pub struct OwnedRwLockWriteGuard<T: ?Sized> {
+    lock: Arc<RwLock<T>>,
+    // `Sync` only when `T: Sync`, since `&OwnedRwLockWriteGuard` reaches `&T`.
+    _value: PhantomData<core::cell::UnsafeCell<T>>,
+}
+
+// SAFETY: sharing the guard shares `&T`, which needs `T: Sync`.
+unsafe impl<T: ?Sized + Send + Sync> Sync for OwnedRwLockWriteGuard<T> {}
+
+impl<T: ?Sized> OwnedRwLockWriteGuard<T> {
+    /// The lock this guard holds.
+    pub fn lock(&self) -> &Arc<RwLock<T>> {
+        &self.lock
+    }
+}
+
+impl<T: ?Sized> Deref for OwnedRwLockWriteGuard<T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        // SAFETY: the write excludes every other guard.
+        unsafe { &*self.lock.value.get() }
+    }
+}
+
+impl<T: ?Sized> DerefMut for OwnedRwLockWriteGuard<T> {
+    fn deref_mut(&mut self) -> &mut T {
+        // SAFETY: as in `deref`, and `&mut self` makes this borrow unique.
+        unsafe { &mut *self.lock.value.get() }
+    }
+}
+
+impl<T: ?Sized> Drop for OwnedRwLockWriteGuard<T> {
+    fn drop(&mut self) {
+        self.lock.raw.write_unlock();
+    }
+}
+
+impl<T: ?Sized + fmt::Debug> fmt::Debug for OwnedRwLockWriteGuard<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Debug::fmt(&**self, f)
     }
@@ -330,6 +388,41 @@ impl<T: ?Sized> Drop for Write<'_, T> {
 impl<T: ?Sized> fmt::Debug for Write<'_, T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Write").finish_non_exhaustive()
+    }
+}
+
+/// The future [`RwLock::write_owned`] returns. It keeps its place in the
+/// queue, and the bypasses it counted, for as long as it lives; dropping it
+/// withdraws the wait and passes on a handoff made to it meanwhile.
+#[must_use = "futures do nothing unless polled"]
+pub struct WriteOwned<T: ?Sized> {
+    lock: Arc<RwLock<T>>,
+    wait: RwWait,
+}
+
+impl<T: ?Sized> Future for WriteOwned<T> {
+    type Output = OwnedRwLockWriteGuard<T>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<OwnedRwLockWriteGuard<T>> {
+        let this = self.get_mut();
+        this.wait
+            .poll(&this.lock.raw, WRITE, cx.waker())
+            .map(|()| OwnedRwLockWriteGuard {
+                lock: Arc::clone(&this.lock),
+                _value: PhantomData,
+            })
+    }
+}
+
+impl<T: ?Sized> Drop for WriteOwned<T> {
+    fn drop(&mut self) {
+        self.wait.cancel(&self.lock.raw, WRITE);
+    }
+}
+
+impl<T: ?Sized> fmt::Debug for WriteOwned<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("WriteOwned").finish_non_exhaustive()
     }
 }
 
@@ -471,6 +564,52 @@ mod tests {
         assert_eq!((r1.wakes(), r2.wakes()), (1, 1));
         let (a, b) = (r1.ready(), r2.ready());
         drop((a, b));
+    }
+
+    #[test]
+    fn an_owned_write_outlives_the_borrow_and_keeps_its_place() {
+        let lock = Arc::new(RwLock::new(0));
+        let mut inside = lock.try_read().expect("free");
+        // Made from a borrow that ends at once: the future owns the lock.
+        let mut writer = Polled::new(Arc::clone(&lock).write_owned());
+        writer.pending();
+        for _ in 0..MAX_BYPASS {
+            let next = lock.try_read().expect("a read barges past the writer");
+            drop(inside);
+            inside = next;
+            writer.pending();
+        }
+        assert!(
+            lock.try_read().is_none(),
+            "the owned writer counted its bypasses like a borrowed one"
+        );
+        drop(inside);
+        let mut guard = writer.ready();
+        *guard += 1;
+        assert!(lock.try_read().is_none(), "the guard holds the write");
+        drop(guard);
+        assert_eq!(*lock.try_read().expect("released"), 1);
+    }
+
+    #[test]
+    fn a_dropped_owned_write_passes_a_handoff_on() {
+        let lock = Arc::new(RwLock::new(()));
+        let mut inside = lock.try_read().expect("free");
+        let mut writer = Polled::new(lock.write_owned());
+        writer.pending();
+        for _ in 0..MAX_BYPASS {
+            let next = lock.try_read().expect("barge");
+            drop(inside);
+            inside = next;
+            writer.pending();
+        }
+        let mut reader = Polled::new(lock.read());
+        reader.pending();
+        drop(inside);
+        drop(writer);
+        assert_eq!(reader.wakes(), 1, "the dropped handoff reached the reader");
+        drop(reader.ready());
+        assert!(lock.try_write().is_some());
     }
 
     #[test]

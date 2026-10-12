@@ -33,6 +33,7 @@ fn handles_are_send_and_sync() {
     assert_send_sync::<DbWithTtl>();
     assert_send_sync::<Error>();
     assert_send_sync::<TransactionError>();
+    assert_send_sync::<regolith::LockWait>();
     assert_send_sync::<Conflict>();
     assert_send_sync::<CommitReceipt>();
     assert_send_sync::<CommitInfo>();

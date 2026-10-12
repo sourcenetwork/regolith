@@ -35,11 +35,9 @@
 //!
 //! - **A drain that ends**: a waiter that serves the queue itself while the
 //!   holder lets go and barges back runs a bounded number of passes and is
-//!   served; and a thread that holds the drain role over an empty queue
-//!   runs one pass, whatever another thread releases. Those models count
-//!   passes, which the public API cannot see, so they live in
-//!   `src/sync/loom_model.rs`, each with a calibration that writes its step
-//!   the wrong way and must fail.
+//!   served. That model counts passes, which the public API cannot see, so
+//!   it lives in `src/sync/loom_model.rs`, with a calibration that writes
+//!   the nudge marker the wrong way and must fail.
 //!
 //! The waiter-node free list is a pass-through to the allocator under loom
 //! (see `Pool`), so node recycling itself is covered by miri and the unit
@@ -906,17 +904,6 @@ fn a_waiter_serving_the_queue_is_served_while_the_holder_barges() {
 #[should_panic(expected = "the drain ran")]
 fn calibration_a_marker_lowered_on_a_pending_nudge_keeps_the_drain_passing() {
     regolith::loom_exports::sync::calibration_a_marker_lowered_on_a_pending_nudge_keeps_the_drain_passing();
-}
-
-#[test]
-fn a_drain_that_found_nobody_queued_ends_while_another_thread_releases() {
-    regolith::loom_exports::sync::a_drain_that_found_nobody_queued_ends_while_another_thread_releases();
-}
-
-#[test]
-#[should_panic(expected = "over a queue with nobody in it")]
-fn calibration_a_release_that_dirties_keeps_an_empty_drain_passing() {
-    regolith::loom_exports::sync::calibration_a_release_that_dirties_keeps_an_empty_drain_passing();
 }
 
 #[test]

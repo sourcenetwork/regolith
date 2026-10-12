@@ -194,10 +194,9 @@ fn a_cached_entry_costs_no_more_heap_than_it_is_charged() {
         );
         let line = stdout
             .lines()
-            // On one CPU the harness runs the child test on its main
-            // thread and prints "test <name> ... " first, so the result
-            // does not start its line.
-            .find(|l| l.contains("ADVRESULT"))
+            // Anywhere in the line: with one test thread libtest prints
+            // "test <name> ... " in front of what the child prints.
+            .find_map(|l| l.find("ADVRESULT").map(|at| &l[at..]))
             .unwrap_or_else(|| panic!("no result from child:\n{stdout}"))
             .to_string();
         println!("{line}");

@@ -48,7 +48,9 @@
 \* bounded bypass between readers and writers), D50 (the upgradable read)
 \* and E33 (who takes the write for an upgrade). The code this matches is
 \* src/sync/raw_rwlock.rs as fixed for E33 (commit 7bec2a7 on
-\* e33/phase-5-mechanisms).
+\* e33/phase-5-mechanisms). This tree gets that commit by merge: until it
+\* does, its raw_rwlock.rs still has the step MC_SyncRwLock_Red_PassTakesWrite
+\* plants.
 \*
 \* PROVED FOR EVERY SIZE in Lean, proofs/lean/Regolith/Sync.lean: the
 \* barging lock's laws (mutual_exclusion, bounded_bypass, owed_at_bound,
@@ -80,7 +82,8 @@
 \*     a_pass_between_a_dropped_upgrades_withdraw_and_its_release_frees_nothing_twice
 \*                                                    GuardsCounted (E33)
 \* The E33 loom model, its calibration and the two unit tests come with the
-\* fix itself (commits 7bec2a7 and 6026420 on e33/phase-5-mechanisms).
+\* fix itself (commits 7bec2a7 and 6026420 on e33/phase-5-mechanisms), by
+\* the same merge.
 \*
 \* THE CODE MODELLED.
 \*   - The state word (WaitQueue::state) holds, above the queue's six flag
@@ -92,7 +95,9 @@
 \*     under way; a write while nobody is in; an upgradable read while no
 \*     writer and no other upgradable read is in (raw_rwlock::admits). When
 \*     it fails the caller pushes a node, raises QUEUED and looks at its
-\*     node once more before sleeping.
+\*     node once more before sleeping. RwLock::write_owned is the same wait
+\*     as write(), in a future and a guard that keep the lock alive
+\*     themselves: a task whose role is "write" stands for both.
 \*   - A nudged waiter takes back the NUDGE_OUT marker and tries again. A
 \*     failed try counts one bypass in the waiting future (Contend::bypass).
 \*     The try that would be its Bound-th counted loss is
