@@ -9,7 +9,10 @@
 //!
 //! Every flush takes the `flushing` exclusion and the oldest frozen memtable,
 //! so frozen memtables install in L0 in the order they were sealed, whichever
-//! thread flushes (`LsmOrder.tla`, RED FlushAnyOrder).
+//! thread flushes (`LsmOrder.tla`, RED FlushAnyOrder). A flush installs its
+//! table and retires its memtable in one publication of the read view, so no
+//! view holds a memtable and its table at once (`LsmOrder.tla`,
+//! `NoDoubleSource`, RED SplitRetire).
 
 use std::path::PathBuf;
 use std::sync::Arc;
