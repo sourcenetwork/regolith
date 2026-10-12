@@ -56,6 +56,25 @@ fn options_hand_back_the_key_bound_and_the_inline_compaction_switch() {
     assert!(preset.get_inline_compaction());
 }
 
+/// The inline-compaction getter reads the switch as the database takes it.
+/// Left unset, that follows whether the database has a compaction worker.
+#[test]
+fn the_inline_compaction_getter_reads_what_the_database_takes() {
+    // A default database has a worker: off.
+    assert_eq!(Options::default().get_max_background_compactions(), 1);
+    assert!(!Options::default().get_inline_compaction());
+    // No worker and nothing said: on.
+    let no_worker = || Options::default().max_background_compactions(0);
+    assert!(no_worker().get_inline_compaction());
+    // Said explicitly, it is what was said.
+    assert!(!no_worker().inline_compaction(false).get_inline_compaction());
+    assert!(
+        Options::default()
+            .inline_compaction(true)
+            .get_inline_compaction()
+    );
+}
+
 #[test]
 fn options_hand_back_the_listeners_in_the_order_they_were_set() {
     assert!(Options::default().get_listeners().is_empty());

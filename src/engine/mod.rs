@@ -42,6 +42,7 @@ mod park_support;
 pub(crate) mod pending_outputs;
 #[cfg(all(test, not(loom)))]
 mod poll_park_tests;
+pub(crate) mod prefix_call;
 pub(crate) mod range_tombstone;
 pub(crate) mod read_horizon;
 mod read_rule;
@@ -2155,6 +2156,20 @@ impl RegolithEngine {
     #[cold]
     #[inline(never)]
     fn admit_write_slow(&self, no_slowdown: bool) -> Result<(), crate::Error> {
+        match self.stall_admission(no_slowdown)? {
+            None => Ok(()),
+            Some(reason) => self.stopped(reason),
+        }
+    }
+
+    /// What the stall thresholds say to a write that arrives now: `None`
+    /// when it goes on, `Some` with the reason when a stop holds it. Every
+    /// writer is classified here, whatever it then does about a stop: a
+    /// plain write takes the stall's wait ([`Self::stopped`]), a commit
+    /// that blocks waits the stop out ([`Self::admit_commit`]), a
+    /// `commit_nowait` commit is left behind the stall's unit
+    /// ([`Self::admit_commit_nowait`]).
+    fn stall_admission(&self, no_slowdown: bool) -> Result<Option<&'static str>, crate::Error> {
         if self.is_closed() {
             return Err(crate::Error::Closed);
         }
@@ -2170,7 +2185,7 @@ impl RegolithEngine {
                 // the fast path.
                 self.cached_stall_level.store(0, Ordering::Release);
                 self.stall_steps_idle.store(0, Ordering::Release);
-                Ok(())
+                Ok(None)
             }
             Some((reason, false)) => {
                 if no_slowdown {
@@ -2183,34 +2198,131 @@ impl RegolithEngine {
                 if !self.has_worker && self.inline_compaction {
                     self.owe(background_step::OWED_STEP);
                 }
-                Ok(())
+                Ok(None)
             }
             Some((reason, true)) => {
                 if no_slowdown {
                     return Err(crate::Error::Busy(reason));
                 }
-                self.stopped(reason)
+                Ok(Some(reason))
             }
         }
+    }
+
+    /// What says a stop for `reason` will not clear, so that nothing waits
+    /// for it: the work that relieves it keeps failing (E36), or, where
+    /// stopped writers relieve the stop themselves, their steps found
+    /// nothing to do too many times in a row.
+    fn stop_holds_for_good(&self, reason: &'static str) -> Result<(), crate::Error> {
+        if let Some(failure) = self.failing_relief(reason) {
+            return Err(failure);
+        }
+        if self.writers_relieve()
+            && self.stall_steps_idle.load(Ordering::Acquire) > Self::MAX_IDLE_PASSES
+        {
+            return Err(crate::Error::Busy(reason));
+        }
+        Ok(())
+    }
+
+    /// Stopped writers relieve the stop themselves: no worker, and inline
+    /// compaction on.
+    fn writers_relieve(&self) -> bool {
+        !self.has_worker && self.inline_compaction
     }
 
     /// A write a stop threshold stopped: the wait for the stop to clear, or
     /// the error that says waiting would not end.
     fn stopped(&self, reason: &'static str) -> Result<(), crate::Error> {
-        if let Some(failure) = self.failing_relief(reason) {
-            return Err(failure);
-        }
+        self.stop_holds_for_good(reason)?;
         let queue = self.io().current_queue();
-        if !self.has_worker && self.inline_compaction {
-            if self.stall_steps_idle.load(Ordering::Acquire) > Self::MAX_IDLE_PASSES {
-                return Err(crate::Error::Busy(reason));
-            }
+        if self.writers_relieve() {
             match &queue {
-                None => return self.relieve_inline(),
+                None => return self.relieve_inline(Self::MAX_INLINE_PASSES),
                 Some(queue) => self.leave_stall_step(queue),
             }
         }
         Err(self.stall_wait(queue, reason, None))
+    }
+
+    /// The write-stall admission of a commit that waits: a blocking
+    /// `commit`, and a `commit_nowait` commit whose queue is gone. A
+    /// transaction cannot be committed a second time, so its commit is never
+    /// handed the stall's wait: this returns once no stop holds, having
+    /// waited the stop out on this thread, or with what says the stop will
+    /// not clear (the database closed, the engine latched, the relief keeps
+    /// failing, no step relieves it). A waiting commit is told those as a
+    /// write that arrives then is (E35, E36): whatever records them lands
+    /// the stall's unit, and the commit, woken, is classified again.
+    ///
+    /// With a worker the commit sleeps until the stall's unit lands. With
+    /// none it runs the steps that relieve the stop here, as many as the
+    /// stop needs and no more, queue or no queue and whatever
+    /// [`crate::Options::inline_compaction`] says: it chose to wait, it
+    /// cannot be made again, and with no worker nobody else is certain to
+    /// compact (on a target with one thread nobody can). The option still
+    /// governs plain writes, whose caller holds the data.
+    pub(crate) fn admit_commit(&self) -> Result<(), crate::Error> {
+        if !self.is_closed() && self.cached_stall_level.load(Ordering::Acquire) == 0 {
+            return Ok(());
+        }
+        while let Some(reason) = self.stall_admission(false)? {
+            self.stop_holds_for_good(reason)?;
+            let stopped = if !self.has_worker {
+                // No bound on the passes: each makes progress, and a stop no
+                // pass relieves ends this with `Busy`.
+                match self.relieve_inline(usize::MAX) {
+                    Ok(()) => continue,
+                    Err(stopped) => stopped,
+                }
+            } else {
+                self.stall_wait(None, reason, None)
+            };
+            match stopped {
+                // The step found another thread's work in its way (a pass,
+                // a flush, a job that holds the gate): the commit waits for
+                // that work. A target with one thread has no such work, and
+                // no wait to make.
+                #[cfg(not(target_arch = "wasm32"))]
+                crate::Error::WouldBlock(crate::WouldBlock::Stall(wait)) => wait.wait(),
+                told => return Err(told),
+            }
+        }
+        Ok(())
+    }
+
+    /// The write-stall admission of a `commit_nowait` commit on its queue's
+    /// thread: `None` when it goes on, and under a stop the stall's unit,
+    /// which the commit is left behind on that queue; the queue's owner
+    /// drives the commit again when the unit lands (`commit::resume`), so
+    /// the commit is classified again then and its ticket completes once
+    /// the stop is relieved. Where stopped writers relieve the stop
+    /// themselves, the step that does is left on the queue too. An error is
+    /// what says the stop will not clear, as for [`Self::admit_commit`].
+    pub(crate) fn admit_commit_nowait(&self) -> Result<Option<Arc<io::job::Job>>, crate::Error> {
+        if !self.is_closed() && self.cached_stall_level.load(Ordering::Acquire) == 0 {
+            return Ok(None);
+        }
+        let Some(reason) = self.stall_admission(false)? else {
+            return Ok(None);
+        };
+        self.stop_holds_for_good(reason)?;
+        if self.writers_relieve()
+            && let Some(queue) = self.io().current_queue()
+        {
+            self.leave_stall_step(&queue);
+        }
+        commit::hook::at(commit::hook::Stage::Stall);
+        let unit = self.stall_signal.unit();
+        // Looked at again only now that the unit is there for a clearer to
+        // land, as a wait is ([`StallSignal::wait`]): a stop that cleared,
+        // an engine that latched or a relief that failed since the
+        // classification above landed nothing of this commit's, so it is
+        // landed here. The commit, left behind a unit that has landed, is
+        // driven again at its queue's next poll.
+        self.stall_signal.look_again();
+        let _ = self.stop_will_not_clear();
+        Ok(Some(unit))
     }
 
     /// The failure a write stopped for `reason` is told while the work that
@@ -2240,14 +2352,27 @@ impl RegolithEngine {
         reason: &'static str,
         seen: Option<usize>,
     ) -> crate::Error {
-        let wait = self.stall_signal.wait(self.io(), queue, reason, seen);
+        let wait = self
+            .stall_signal
+            .wait(self.io(), queue, reason, seen)
+            .counted_in(self.statistics_arc());
+        match self.stop_will_not_clear() {
+            Some(told) => told,
+            None => crate::Error::WouldBlock(crate::WouldBlock::Stall(wait)),
+        }
+    }
+
+    /// Read once a wait, or a commit, is recorded on the stall's unit: what
+    /// says the stop it waits for will not clear, with the unit landed for
+    /// everyone recorded on it beside this one.
+    fn stop_will_not_clear(&self) -> Option<crate::Error> {
         // Read only now that the wait is recorded. A latch publishes its
         // reason before it lands the unit, so either it found this wait
         // there or the reason is read here; the unit is landed again for the
         // writers that registered on it beside this one.
         if self.is_latched() {
             self.stall_signal.land();
-            return self.latched_error().into();
+            return Some(self.latched_error().into());
         }
         // The same for a relief that failed: the failure is stored before
         // the unit is landed (`BackgroundHealth::record_failure`). Read as
@@ -2258,18 +2383,20 @@ impl RegolithEngine {
             && let Some(failure) = self.failing_relief(reason)
         {
             self.stall_signal.land();
-            return failure;
+            return Some(failure);
         }
-        crate::Error::WouldBlock(crate::WouldBlock::Stall(wait))
+        None
     }
 
-    /// Relieve a stop on this thread, for a writer with no queue on a
-    /// database with no worker and inline compaction on: bounded steps until
-    /// the stop clears, then the write goes on. A step another thread holds
-    /// the inputs of hands the writer a wait instead; a stop no step relieves
-    /// fails the write with [`crate::Error::Busy`]. The time spent is charged
-    /// to [`crate::Ticker::WriteStallMicros`].
-    fn relieve_inline(&self) -> Result<(), crate::Error> {
+    /// Relieve a stop on this thread, on a database with no worker and
+    /// inline compaction on: steps until the stop clears, then the write
+    /// goes on. A plain write from a thread with no queue runs at most
+    /// `max_passes` of them (E16) and fails with [`crate::Error::Busy`]
+    /// past that; a commit that waits runs as many as it takes. A step
+    /// another thread holds the inputs of hands the writer a wait instead; a
+    /// stop no step relieves fails the write with [`crate::Error::Busy`].
+    /// The time spent is charged to [`crate::Ticker::WriteStallMicros`].
+    fn relieve_inline(&self, max_passes: usize) -> Result<(), crate::Error> {
         let start = self.env.now_micros();
         let mut passes = 0usize;
         let mut idle = 0usize;
@@ -2289,7 +2416,7 @@ impl RegolithEngine {
                 CompactionOutcome::DidWork => {
                     idle = 0;
                     passes += 1;
-                    if passes > Self::MAX_INLINE_PASSES {
+                    if passes > max_passes {
                         break Err(crate::Error::Busy(reason));
                     }
                 }

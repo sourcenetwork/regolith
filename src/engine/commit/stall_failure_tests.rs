@@ -37,7 +37,7 @@ use crate::{
 pub(super) const DEADLINE: Duration = Duration::from_secs(60);
 
 /// One 1 KiB put, applied below the stall admission as an admitted write is.
-fn fill(engine: &RegolithEngine, key: &[u8]) -> std::io::Result<u64> {
+pub(super) fn fill(engine: &RegolithEngine, key: &[u8]) -> std::io::Result<u64> {
     let ops = vec![WriteBatchOp::Put {
         key: prefix_key(DEFAULT_CF_ID, key),
         value: vec![7u8; 1024],
@@ -434,7 +434,7 @@ fn a_wait_registered_after_the_latch_is_told_the_latch_and_leaves_no_unit() {
 /// a limiter that panics fails the background job that asked
 /// (`rate_limiter::throttle_background`). The engine asks it on a worker
 /// only, so a flush on the test's own thread goes through.
-struct HeldRelief {
+pub(super) struct HeldRelief {
     armed: AtomicBool,
     failing: AtomicBool,
     entered: Mutex<mpsc::Sender<()>>,
@@ -465,7 +465,7 @@ impl RateLimiter for HeldRelief {
 
 /// A relief holder, the channel that says the worker entered it, and the
 /// one that lets the worker go.
-fn held_relief() -> (Arc<HeldRelief>, mpsc::Receiver<()>, mpsc::Sender<()>) {
+pub(super) fn held_relief() -> (Arc<HeldRelief>, mpsc::Receiver<()>, mpsc::Sender<()>) {
     let (entered, when_entered) = mpsc::channel();
     let (release, when_released) = mpsc::channel();
     let held = Arc::new(HeldRelief {
@@ -480,7 +480,7 @@ fn held_relief() -> (Arc<HeldRelief>, mpsc::Receiver<()>, mpsc::Sender<()>) {
 impl HeldRelief {
     /// Hold the worker's next background job, and fail it and every one
     /// after it.
-    fn hold_and_fail(&self) {
+    pub(super) fn hold_and_fail(&self) {
         self.failing.store(true, Ordering::Release);
         self.armed.store(true, Ordering::Release);
     }
@@ -536,7 +536,11 @@ fn stopped_with_the_compaction_held(
 /// Let the held job go, and return once the worker has recorded its failure
 /// and re-classified the stall after it: everything the failure does to the
 /// stall's unit is done by then.
-fn fail_the_held_relief(engine: &RegolithEngine, release: &mpsc::Sender<()>, relief: Job) {
+pub(super) fn fail_the_held_relief(
+    engine: &RegolithEngine,
+    release: &mpsc::Sender<()>,
+    relief: Job,
+) {
     let before = engine.stall_signal().progress();
     release.send(()).unwrap();
     let deadline = Instant::now() + DEADLINE;

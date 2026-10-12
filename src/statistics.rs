@@ -88,7 +88,9 @@ pub enum Ticker {
     /// populated the cache).
     BlockCacheAdd = 9,
     /// Bloom-filter "useful" hits - the filter correctly
-    /// answered "not present" and spared a block read.
+    /// answered "not present" and spared a block read. Counts a point
+    /// lookup a table's key filter ruled out, and a table a prefix seek's
+    /// prefix filter ruled out.
     BloomFilterUseful = 10,
     /// Bloom-filter "full positive" hits - the filter said
     /// "maybe", and the key was actually present in the block.
@@ -111,12 +113,13 @@ pub enum Ticker {
     IterSeekCount = 19,
     /// Number of `Iter::next` calls that produced a key.
     IterNextCount = 20,
-    /// Microseconds writers spent relieving a write stall inline before the
-    /// write went on: plain writes and transactional commits that carry
-    /// writes alike, on a database with no compaction worker and
-    /// [`crate::Options::inline_compaction`] on. No write waits on a stall,
-    /// so nothing else is counted; relief that ends in a busy or closed
-    /// error is not counted either.
+    /// Microseconds threads spent held by a write stall: relieving it
+    /// inline, or blocked until it cleared (a commit that waits a stop out,
+    /// [`crate::StallWait::wait`]).
+    ///
+    /// A wait that is polled or awaited on a queue holds no thread and is
+    /// not counted, nor is inline relief that ends in a busy or closed
+    /// error.
     WriteStallMicros = 21,
     /// Number of snapshots registered via `Db::snapshot`.
     SnapshotsRegistered = 22,

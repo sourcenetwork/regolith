@@ -155,11 +155,6 @@ fn commit_txn(
     match outcome {
         Ok(_) => true,
         Err(TransactionError::Conflict(_)) => false,
-        // A stall applied nothing: wait it out, then commit again.
-        Err(TransactionError::WouldBlock(regolith::WouldBlock::Stall(stall))) => {
-            stall.wait();
-            false
-        }
         Err(other) => panic!("child: commit: {other}"),
     }
 }

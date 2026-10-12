@@ -310,6 +310,10 @@ pub(super) const APPLYING: u64 = 1 << 5;
 /// The descriptor is in the ring: its index is the slot it holds. Set by
 /// its owner, which is the only thread that reads it.
 pub(super) const INSTALLED: u64 = 1 << 6;
+/// A `commit_nowait` commit has the write-stall admission behind it, or
+/// needs none because it writes nothing: it may take a slot. Set by its
+/// owner, which is the only thread that reads it.
+pub(super) const ADMITTED: u64 = 1 << 7;
 
 /// One slot's descriptor. See the module docs.
 pub(crate) struct Descriptor {
@@ -360,6 +364,21 @@ impl Descriptor {
     /// landed: the caller tells `waiter` itself.
     pub(super) fn listen(&self, waiter: Arc<dyn Delivery>) -> bool {
         self.landing.push(waiter, SHUT).is_ok()
+    }
+
+    /// Refuse a commit that has not taken a slot, with `err`: its owner
+    /// learns `err` as it learns a discarded slot's failure, and whoever
+    /// listens for its landing is told now. Called by its owner.
+    pub(super) fn refuse(&self, err: io::Error) {
+        self.failure.put(err);
+        self.mark(FAILED);
+        self.land();
+    }
+
+    /// Whether the commit was refused before it took a slot
+    /// ([`Self::refuse`]).
+    pub(super) fn is_refused(&self) -> bool {
+        self.is(FAILED) && !self.is(INSTALLED)
     }
 
     /// Tell everyone listening that the slot landed. Every thread that

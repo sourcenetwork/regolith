@@ -48,9 +48,6 @@ where
             Err(TransactionError::Busy(_)) | Err(TransactionError::Conflict { .. }) => {
                 std::thread::yield_now();
             }
-            // A stall stopped the commit and applied nothing: wait it out
-            // and run the attempt again.
-            Err(TransactionError::WouldBlock(regolith::WouldBlock::Stall(stall))) => stall.wait(),
             Err(e) => panic!("unexpected transaction error in {what}: {e}"),
         }
     }
