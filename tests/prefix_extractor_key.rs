@@ -60,14 +60,21 @@ impl PrefixExtractor for Recording {
     }
 }
 
-/// An in-memory database with `extractor` and its statistics: no compaction
-/// worker, and a compaction due once level 0 holds `trigger` tables.
-fn open(extractor: Arc<dyn PrefixExtractor>, trigger: usize) -> (Db, Arc<Statistics>) {
+/// Options for an in-memory database with `extractor`, and the statistics it
+/// reports to: no compaction worker, and a compaction due once level 0 holds
+/// `trigger` tables.
+fn options(extractor: Arc<dyn PrefixExtractor>, trigger: usize) -> (Options, Arc<Statistics>) {
     let stats = Arc::new(Statistics::new());
     let options = Options::memory()
         .l0_compaction_trigger(trigger)
         .prefix_extractor(Some(extractor))
         .statistics(Some(Arc::clone(&stats)));
+    (options, stats)
+}
+
+/// A database on [`options`].
+fn open(extractor: Arc<dyn PrefixExtractor>, trigger: usize) -> (Db, Arc<Statistics>) {
+    let (options, stats) = options(extractor, trigger);
     (Db::open("prefix-extractor-key", options).unwrap(), stats)
 }
 
@@ -197,4 +204,58 @@ fn two_families_do_not_share_a_prefix() {
         seek_counting(&db, &stats, Some(&named), b"bbbb"),
         (keys(&[b"bbbb:1"]), 0)
     );
+}
+
+/// A table that compaction moved below level 0 is ruled out by its prefix
+/// filter as one in level 0 is, and a seek past the last table of a level
+/// reads none of them.
+#[test]
+fn a_table_below_level_zero_is_ruled_out_by_its_prefix_filter() {
+    let (db, stats) = open(Arc::new(FixedLengthPrefix(4)), 2);
+    db.put(b"aaaa:1", b"v").unwrap();
+    db.put(b"cccc:1", b"v").unwrap();
+    db.flush().unwrap();
+    db.put(b"bbbb:1", b"v").unwrap();
+    db.flush().unwrap();
+    assert_eq!(db.compact_step().unwrap(), CompactionOutcome::DidWork);
+    assert_eq!(db.get_int_property("regolith.num-files-at-level0"), Some(0));
+    let seek = |prefix: &[u8]| seek_counting(&db, &stats, None, prefix);
+
+    assert_eq!(
+        seek(b"abab"),
+        (keys(&[]), 1),
+        "between the table's keys, and not one of its prefixes"
+    );
+    assert_eq!(seek(b"bbbb"), (keys(&[b"bbbb:1"]), 0));
+    assert_eq!(seek(b"cccc"), (keys(&[b"cccc:1"]), 0));
+    // Past the table's last key there is no table to ask.
+    assert_eq!(seek(b"dddd"), (keys(&[]), 0));
+}
+
+/// In a level of many tables a prefix seek asks only the tables its prefix
+/// can be in: one that starts past the prefix ends the search, so the tables
+/// after it are neither asked nor read.
+#[test]
+fn a_prefix_seek_asks_only_the_tables_its_prefix_can_be_in() {
+    let (options, stats) = options(Arc::new(FixedLengthPrefix(4)), 2);
+    // A table for each key, once compaction has written them.
+    let db = Db::open("prefix-extractor-key", options.target_file_size(1)).unwrap();
+    for key in [&b"aaaa:1"[..], b"cccc:1", b"eeee:1"] {
+        db.put(key, b"v").unwrap();
+    }
+    db.flush().unwrap();
+    db.put(b"cccc:2", b"v").unwrap();
+    db.flush().unwrap();
+    assert_eq!(db.compact_step().unwrap(), CompactionOutcome::DidWork);
+    assert_eq!(db.get_int_property("regolith.num-files-at-level0"), Some(0));
+    assert_eq!(db.get_int_property("regolith.num-files-at-level1"), Some(4));
+    let seek = |prefix: &[u8]| seek_counting(&db, &stats, None, prefix);
+
+    // The first table at or after the prefix starts past it: none is asked.
+    assert_eq!(seek(b"bbbb"), (keys(&[]), 0));
+    assert_eq!(seek(b"dddd"), (keys(&[]), 0));
+    // Two tables hold the prefix, and the one after them is not ruled out
+    // by a filter: the seek's bound ends the scan before it.
+    assert_eq!(seek(b"cccc"), (keys(&[b"cccc:1", b"cccc:2"]), 0));
+    assert_eq!(seek(b"eeee"), (keys(&[b"eeee:1"]), 0));
 }

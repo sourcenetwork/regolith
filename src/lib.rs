@@ -1338,15 +1338,17 @@ impl Db {
         }
     }
 
-    /// Rotate the active memtable and write it to a level-0 SSTable,
-    /// on this thread, before returning.
+    /// Rotate the active memtable and see it written to a level-0
+    /// SSTable before returning.
     ///
     /// A no-op when the active memtable holds no entries and no range
     /// tombstones. This is the same flush a full memtable triggers on
     /// the write path, made explicit so a caller can decide when to
-    /// pay for it. Memtable flushes are written by the calling thread
-    /// in every mode, so this behaves identically with and without
-    /// background compaction workers.
+    /// pay for it. This thread writes the table, unless a compaction
+    /// worker gets to the sealed memtable first: the worker then writes
+    /// it, paced by [`Options::rate_limiter`] like the rest of its work,
+    /// and this call returns once the table is in level 0. With no
+    /// worker it is always this thread.
     ///
     /// Flushing does not compact: the new file lands in L0 and stays
     /// there until a compaction job merges it. See [`Db::compact_step`]
@@ -3307,6 +3309,9 @@ mod write_limit_tests;
 
 #[cfg(all(test, not(target_family = "wasm")))]
 mod cf_race_tests;
+
+#[cfg(all(test, not(target_family = "wasm")))]
+mod prefix_form_tests;
 
 #[cfg(test)]
 mod tests {

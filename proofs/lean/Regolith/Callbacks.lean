@@ -80,8 +80,8 @@ What is proved, in plain words:
    holds the commit's queue, never on a committer that synced it (D53, the
    committing thread).
 9. `resolved_after_landing` and `resolved_once_on_queue_thread`: a commit
-   that was owed an fsync has its outcome read from its commit group only
-   once the group has landed, once, by a deliverer on the thread that holds
+   that was owed an fsync has its outcome read from its commit's slot only
+   once the commit has landed, once, by a deliverer on the thread that holds
    the commit's queue; `early_resolve_is_not_durable` is the RED case.
 
 How to read the Lean: `def` defines a function or a property, `theorem`
@@ -2154,18 +2154,18 @@ Above, an attempt's outcome runs its callbacks once. Here is who runs them
 and how often, in the two forms a commit takes in the code.
 
 `transact` calls the blocking `Transaction::commit`
-(`src/transaction.rs`): the call waits for its commit group to be decided
+(`src/transaction.rs`): the call waits for its commit to be decided
 and, at Immediate durability, synced, and then runs the outcome's callbacks
 itself, on the calling thread. One thread, one outcome, nothing to race:
 that is the sequential machine above.
 
 `transact_async` calls `Transaction::commit_nowait`
-(`src/transaction/nowait.rs`). A commit whose group owes no fsync is done
+(`src/transaction/nowait.rs`). A commit that is owed no fsync is done
 when the call returns, and is told by the calling thread in the same way.
-A commit whose group owes its fsync returns a `CommitTicket` instead. The
+A commit that is owed its fsync returns a `CommitTicket` instead. The
 ticket's `Completion` (`src/io_queue/completion.rs`) starts *pending* and
-holds a closure that reads the outcome from the commit group. Once the
-group has landed (its fsync is done), a deliverer on the thread that holds
+holds a closure that reads the outcome from the commit's slot. Once the
+commit has landed (its fsync is done), a deliverer on the thread that holds
 the commit's queue takes that closure, which only one can get, and decides
 the outcome with it. Then the outcome is *delivered*: one compare-and-swap
 from "decided" to "delivering" lets one deliverer in, and only that one
@@ -2173,12 +2173,12 @@ runs the callbacks. Every deliverer runs on the thread that holds the
 commit's queue at that moment: the queue's poll, the queue's drop (the
 queue may have moved to another thread, which then holds it), or the
 commit's own fallback when its queue went away before the ticket was
-registered. A committer that synced the group is never a deliverer, and
+registered. A thread that ran the fsync is never a deliverer for that, and
 never decides a ticket.
 
 Tiny example. Thread A commits with `commit_nowait`; thread B's poll lands
-A's group. B only puts a note in A's inbox. A's next poll takes the closure,
-reads the outcome from the group, claims it and runs A's `on_commit` on A.
+A's commit. B only puts a note in A's inbox. A's next poll takes the closure,
+reads the outcome from the commit's slot, claims it and runs A's `on_commit` on A.
 If A drops its queue at the same moment, the drop and the poll race for the
 closure and for the claim; one wins each, and `on_commit` runs once. -/
 
@@ -2196,7 +2196,7 @@ inductive Runner where
 inductive DState where
   /-- Not decided yet. -/
   | pending
-  /-- Decided, read from the landed commit group; not delivered. -/
+  /-- Decided, read from the landed commit's slot; not delivered. -/
   | decided
   /-- One deliverer won the claim and is running the callbacks. -/
   | delivering
@@ -2205,7 +2205,7 @@ inductive DState where
   -- Two states can be compared for equality.
   deriving DecidableEq
 
-/-- The ticket of one commit whose group owed its fsync. -/
+/-- The ticket of one commit that was owed its fsync. -/
 structure Ticket where
   /-- The thread holding the commit's queue now. -/
   holder : Nat
@@ -2213,21 +2213,21 @@ structure Ticket where
   st : DState
   /-- Ghost: every run of the outcome callbacks, by who ran it. -/
   ran : List Runner
-  /-- The commit's group has landed: its fsync is done. -/
+  /-- The commit has landed: its fsync is done. -/
   landed : Bool
   /-- The ticket still holds the closure that reads the outcome from the
-  group (`Completion::resolve`). -/
+  commit's slot (`Completion::resolve`). -/
   resolver : Bool
   /-- Ghost: every decision of the outcome, by who made it. -/
   decider : List Runner
 
-/-- A fresh ticket, its queue on thread `t`: pending, its group not landed,
+/-- A fresh ticket, its queue on thread `t`: pending, its commit not landed,
 its closure in place, nothing decided and nothing run. -/
 def fresh (t : Nat) : Ticket := ⟨t, .pending, [], false, true, []⟩
 
 /-- The steps of one ticket, one atomic step each. -/
 inductive DStep : Ticket → Ticket → Prop
-  /-- The commit's group lands: some thread finished its fsync. That thread
+  /-- The commit lands: some thread finished its fsync. That thread
   touches nothing of the ticket. -/
   | land (k : Ticket) :
       -- The state after the step:
@@ -2240,7 +2240,7 @@ inductive DStep : Ticket → Ticket → Prop
   /-- A deliverer on the holding thread takes the closure and decides the
   outcome with it (`Completion::deliver`: `resolve.take`, then `decide`). -/
   | resolve (k : Ticket)
-      -- The group has landed: only then is the queue told, and a delivery begins.
+      -- The commit has landed: only then is the queue told, and a delivery begins.
       (hl : k.landed = true)
       -- The closure is still there: nobody took it.
       (hr : k.resolver = true)
@@ -2280,7 +2280,7 @@ structure DInv (k : Ticket) : Prop where
   after : k.st = .delivering ∨ k.st = .ready → k.ran.length = 1
   /-- Every run was by a thread holding the queue. -/
   holder : ∀ r ∈ k.ran, ∃ t, r = .holder t
-  /-- An outcome that is decided was read from a group that had landed. -/
+  /-- An outcome that is decided was read from a commit that had landed. -/
   landed_first : k.st ≠ .pending → k.landed = true
   /-- While the closure is in the ticket the outcome is pending and nobody
   has decided it. -/
@@ -2308,7 +2308,7 @@ theorem dstep_inv {k k' : Ticket}
   cases h with
   -- Landing changes only "landed", to true: every fact still holds.
   | land =>
-    -- Six facts are untouched; "decided means landed" holds because the group has landed now.
+    -- Six facts are untouched; "decided means landed" holds because the commit has landed now.
     exact ⟨hi.before, hi.after, hi.holder, fun _ => rfl, hi.unresolved, hi.resolved,
       hi.decider_holder⟩
   -- Moving the queue changes only who holds it.
@@ -2362,7 +2362,7 @@ theorem dstep_inv {k k' : Ticket}
       simp [hr] at hm
       -- It is `.holder` of the thread that held the queue.
       exact ⟨k.holder, hm⟩
-    -- The group had landed when the outcome was decided.
+    -- The commit had landed when the outcome was decided.
     · exact hi.landed_first (by rw [hd]; exact fun h => by cases h)
     -- The closure is gone, so "the closure is in the ticket" is false.
     · rw [hres] at h; cases h
@@ -2383,7 +2383,7 @@ theorem dstep_inv {k k' : Ticket}
       hi.decider_holder⟩
     -- Ready is neither pending nor decided.
     · rcases h with h | h <;> cases h
-    -- The group had landed when the outcome was decided.
+    -- The commit had landed when the outcome was decided.
     · exact hi.landed_first (by rw [hd]; exact fun h => by cases h)
     -- The closure is gone, so "the closure is in the ticket" is false.
     · rw [hres] at h; cases h
@@ -2431,7 +2431,7 @@ theorem delivered_once {t : Nat} {k : Ticket}
 /-- **Every delivery runs on the thread that holds the commit's queue**,
 never on a committer. TLA+: `OnCommittingThread`, with
 `MC_TxnCallbacks_Red_HelperDelivers` as the RED. Rules out: thread B, which
-landed A's group, running A's `on_commit` on B. -/
+landed A's commit, running A's `on_commit` on B. -/
 theorem delivered_on_queue_thread {t : Nat} {k : Ticket}
     -- `k` is reachable from a fresh ticket.
     (h : DSteps (fresh t) k)
@@ -2442,9 +2442,9 @@ theorem delivered_on_queue_thread {t : Nat} {k : Ticket}
   -- One field of the invariant.
   (dsteps_inv h (dinv_init t)).holder r hr
 
-/-- **A commit owed an fsync is resolved only after its group has landed.**
+/-- **A commit owed an fsync is resolved only after it has landed.**
 A ticket whose outcome is decided, being delivered or ready belongs to a
-group whose fsync is done. TLA+: `ResolvedAfterLanding`. Rules out: a
+commit whose fsync is done. TLA+: `ResolvedAfterLanding`. Rules out: a
 caller that blocks on the ticket's decision is told "committed", and the
 machine loses power before the fsync. -/
 theorem resolved_after_landing {t : Nat} {k : Ticket}
@@ -2459,7 +2459,7 @@ theorem resolved_after_landing {t : Nat} {k : Ticket}
 
 /-- **The outcome is decided at most once, on the thread that holds the
 commit's queue.** Only the deliverer that got the closure decides, and it
-runs on the queue's thread; the thread that landed the group decides
+runs on the queue's thread; the thread that landed the commit decides
 nothing. TLA+: the steps `DeliverBegins` and `DeliverDecides`, with
 `MC_TxnCallbacks_Red_HelperDelivers` as the RED. -/
 theorem resolved_once_on_queue_thread {t : Nat} {k : Ticket}
@@ -2499,18 +2499,18 @@ theorem no_claim_delivers_twice :
   -- Two runs, one per broken delivery.
   rfl
 
-/-! ### RED: resolving before the group has landed
+/-! ### RED: resolving before the commit has landed
 
-The bug: a delivery begins before the commit's group is synced, so the
+The bug: a delivery begins before the commit is synced, so the
 closure reads an outcome that is not durable yet. -/
 
-/-- The broken resolve: it does not ask whether the group has landed. -/
+/-- The broken resolve: it does not ask whether the commit has landed. -/
 def resolveEarly (k : Ticket) : Ticket :=
   -- The closure is taken and the outcome decided, whatever "landed" says.
   { k with resolver := false, st := .decided, decider := .holder k.holder :: k.decider }
 
 /-- **RED: without the wait an outcome is decided before its fsync.** A
-fresh ticket, resolved at once, is decided while its group has not landed.
+fresh ticket, resolved at once, is decided while its commit has not landed.
 TLA+: `MC_TxnCallbacks_Red_CommitBeforeDurable` breaks `ResolvedAfterLanding`
 and then `CommitAfterDurable`. -/
 theorem early_resolve_is_not_durable :

@@ -2,8 +2,7 @@
 # Pipeline: the lock-free commit pipeline, for every number of slots
 
 This file backs the TLA+ model `proofs/tla/CommitPipeline.tla` and the code
-in `src/engine/commit`. The sequence numbering it proves is also the one
-`proofs/tla/GroupCommit.tla` checks as `SeqFollowsDecisionOrder`.
+in `src/engine/commit`.
 
 The pipeline keeps commits in a ring of slots. Think of a bakery with a
 ticket machine: every commit pulls a numbered ticket, orders are handled
@@ -44,14 +43,15 @@ Who may take which step, and that a stopped thread holds nobody up, is
 `Regolith/PipelineHelping.lean`. What stays in TLA+: that the
 interleavings of several threads keep finishing slots (the liveness half),
 the compare-and-swaps, the freeze of the frontiers during a rollback and
-the epochs that mark a stale verdict. The validation the decide stage runs
-is `Regolith/GroupCommit.lean`.
+the epochs that mark a stale verdict. The check a slot runs when it is
+decided is `Regolith/PipelineCheck.lean`.
 
 How to read the Lean: `def` defines a function or a property, `theorem`
 states a fact and its proof follows `:= by`. Lines starting with `--` are
 comments. Inside a proof, each step is commented with what it establishes.
 -/
 
+-- Everything below is named Regolith.Pipeline.<name>.
 namespace Regolith.Pipeline
 
 /-! ## The objects -/
@@ -78,6 +78,7 @@ inductive Dec where
   | void
   /-- A rollback threw the slot out: whatever it took was handed back. -/
   | failed
+  -- Two such values can be compared for equality.
   deriving DecidableEq
 
 /-- Whether a verdict takes a sequence. -/
@@ -104,6 +105,7 @@ structure Slot where
   /-- Its durability allows publication: it is durable, or it did not ask
   for Immediate (meaningful for a commit). -/
   durableOk : Bool
+  -- Two such values can be compared for equality.
   deriving DecidableEq
 
 /-! ## Deciding in ring order -/
@@ -133,28 +135,34 @@ slots that take none skipped, are exactly `s+1, s+2, ..., s+n` for the `n`
 takers: consecutive, from the base, with no gap where an abort, a void
 slot or a discarded slot sits. -/
 theorem seqs_dense (s : Nat) (l : List Slot) :
+    -- The claim itself; its proof follows.
     (seqs s l).filterMap id = List.range' (s + 1) (taken l) := by
   -- By induction on the slots, for every base `s`.
   induction l generalizing s with
+  -- Case: the empty list.
   | nil =>
     -- No slot: no sequence, and an empty range.
     simp [seqs, taken]
+  -- Case: a first element and then the rest, the claim known for the rest (ih).
   | cons sl rest ih =>
     -- Does the first slot take a sequence?
     by_cases h : takes sl.dec = true
-    · -- It takes `s + 1`; the rest take `s+2, ...` by induction.
+    -- It takes `s + 1`; the rest take `s+2, ...` by induction.
+    ·
       -- `range' (s+1) (n+1)` is `s+1` followed by `range' (s+2) n`.
       simp [seqs, taken, h, ih (s + 1), List.range'_succ]
-    · -- It takes nothing: the rest give the whole answer.
-      simp [seqs, taken, h, ih s]
+    -- It takes nothing: the rest give the whole answer.
+    · simp [seqs, taken, h, ih s]
 
 /-- A range of consecutive naturals is strictly increasing. -/
 theorem range'_strictly_increasing (a n : Nat) : (List.range' a n).Pairwise (· < ·) := by
   -- By induction on the length, for every start `a`.
   induction n generalizing a with
+  -- Case: zero.
   | zero =>
     -- The empty range is trivially increasing.
     simp
+  -- Case: one more, the claim known for the number before (ih).
   | succ n ih =>
     -- `a` comes first, and every later element is at least `a + 1`.
     rw [List.range'_succ, List.pairwise_cons]
@@ -170,6 +178,7 @@ theorem range'_strictly_increasing (a n : Nat) : (List.range' a n).Pairwise (· 
 /-- **Sequence order is ring order.** Read in ring order, the sequences the
 slots take strictly increase. -/
 theorem seqs_strictly_increasing (s : Nat) (l : List Slot) :
+    -- The claim itself; its proof follows.
     ((seqs s l).filterMap id).Pairwise (· < ·) := by
   -- They are a range of consecutive naturals.
   rw [seqs_dense]
@@ -179,16 +188,21 @@ theorem seqs_strictly_increasing (s : Nat) (l : List Slot) :
 /-- Deciding a prefix of the ring gives the prefix of the decisions: a
 slot's sequence depends only on the slots before it. -/
 theorem seqs_take (s n : Nat) (l : List Slot) :
+    -- The claim itself; its proof follows.
     seqs s (l.take n) = (seqs s l).take n := by
   -- By induction on the slots, for every base and every prefix length.
   induction l generalizing s n with
+  -- Case: the empty list.
   | nil =>
     -- No slot: both sides are empty.
     simp [seqs]
+  -- Case: a first element and then the rest, the claim known for the rest (ih).
   | cons sl rest ih =>
     -- A prefix of length zero is empty on both sides.
     cases n with
+    -- Case: zero.
     | zero => simp [seqs]
+    -- Case: one more, the claim known for the number before (ih).
     | succ n =>
       -- Otherwise the first slot is decided the same way on both sides,
       -- taker or not, and the rest follow by induction.
@@ -199,9 +213,11 @@ takers of both. -/
 theorem taken_append (a b : List Slot) : taken (a ++ b) = taken a + taken b := by
   -- By induction on the first list.
   induction a with
+  -- Case: the empty list.
   | nil =>
     -- Nothing in front: the count is the second list's.
     simp [taken]
+  -- Case: a first element and then the rest, the claim known for the rest (ih).
   | cons sl rest ih =>
     -- The first slot counts the same on both sides, taker or not.
     by_cases h : takes sl.dec = true <;> simp [taken, h, ih] <;> omega
@@ -209,21 +225,24 @@ theorem taken_append (a b : List Slot) : taken (a ++ b) = taken a + taken b := b
 /-- The slots after a list are numbered from where the list left off: the
 base plus the list's takers. -/
 theorem seqs_append (s : Nat) (a b : List Slot) :
+    -- The claim itself; its proof follows.
     seqs s (a ++ b) = seqs s a ++ seqs (s + taken a) b := by
   -- By induction on the first list, for every base.
   induction a generalizing s with
+  -- Case: the empty list.
   | nil =>
     -- Nothing in front: the second list is numbered from `s`.
     simp [seqs, taken]
+  -- Case: a first element and then the rest, the claim known for the rest (ih).
   | cons sl rest ih =>
     -- Does the first slot take a sequence?
     by_cases h : takes sl.dec = true
-    · -- It takes `s + 1`, so the rest start one later: the same total.
-      have hb : s + 1 + taken rest = s + (taken rest + 1) := by omega
+    -- It takes `s + 1`, so the rest start one later: the same total.
+    · have hb : s + 1 + taken rest = s + (taken rest + 1) := by omega
       -- Unfold both sides and use the induction step from base `s + 1`.
       simp [seqs, taken, h, ih (s + 1), hb]
-    · -- It takes nothing: the rest start from `s` on both sides.
-      simp [seqs, taken, h, ih s]
+    -- It takes nothing: the rest start from `s` on both sides.
+    · simp [seqs, taken, h, ih s]
 
 /-! ## Publishing the longest publishable prefix -/
 
@@ -232,6 +251,7 @@ written and, when it asked, durable; every other slot has nothing to wait
 for. Its versions are in the memtable already: that happened before the
 next slot was decided (P2). -/
 def publishable (sl : Slot) : Bool :=
+  -- One case for each shape it can have.
   match sl.dec with
   -- A commit: written, and durable enough.
   | .commit => sl.written && sl.durableOk
@@ -260,6 +280,7 @@ def horizon (s : Nat) (l : List Slot) : Nat := s + taken (l.take (frontier l))
 publishable prefix publishes, in ring order, exactly the sequences
 `s+1, ..., horizon`: each publication is the next sequence. -/
 theorem publication_order (s : Nat) (l : List Slot) :
+    -- The claim itself; its proof follows.
     (seqs s (l.take (frontier l))).filterMap id = List.range' (s + 1) (horizon s l - s) := by
   -- The published prefix is a list of slots like any other, so its
   -- sequences are dense.
@@ -293,18 +314,20 @@ theorem seen_at_or_below_base {t v : Nat} (l : List Slot)
     (hv : v ≤ t) : seen t v l = [] := by
   -- By induction on the slots, for every base at or above `v`.
   induction l generalizing t with
+  -- Case: the empty list.
   | nil =>
     -- No slot, nothing seen.
     simp [seen]
+  -- Case: a first element and then the rest, the claim known for the rest (ih).
   | cons sl rest ih =>
     -- Does the first slot take a sequence?
     by_cases h : takes sl.dec = true
-    · -- `t + 1` is above `v`...
-      have h1 : ¬ (t + 1 ≤ v) := by omega
+    -- `t + 1` is above `v`...
+    · have h1 : ¬ (t + 1 ≤ v) := by omega
       -- ...and so is every later sequence, by induction from base `t + 1`.
       simp [seen, h, h1, ih (Nat.le_succ_of_le hv)]
-    · -- It holds no version; the rest show nothing by induction.
-      simp [seen, h, ih hv]
+    -- It holds no version; the rest show nothing by induction.
+    · simp [seen, h, ih hv]
 
 /-- P2 as a property of the slots the decided frontier has passed: every
 one that takes a sequence is applied. -/
@@ -315,21 +338,24 @@ horizon sees the consecutive sequences of the published takers. -/
 theorem seen_horizon (s : Nat) (l : List Slot)
     -- Every slot was applied before the decided frontier passed it.
     (hP2 : AllApplied l) :
+    -- The claim itself; its proof follows.
     seen s (horizon s l) l = List.range' (s + 1) (taken (l.take (frontier l))) := by
   -- By induction on the slots, for every base `s`.
   induction l generalizing s with
+  -- Case: the empty list.
   | nil =>
     -- No slot: nothing seen, an empty range.
     simp [seen, frontier, taken]
+  -- Case: a first element and then the rest, the claim known for the rest (ih).
   | cons sl rest ih =>
     -- P2 holds for the rest of the slots too.
     have hrest : AllApplied rest := fun x hx => hP2 x (List.mem_cons_of_mem _ hx)
     -- Is the first slot published?
     by_cases hp : publishable sl = true
-    · -- It is. Does it take a sequence?
-      by_cases ht : takes sl.dec = true
-      · -- By P2 it is applied.
-        have ha : sl.applied = true := hP2 sl (List.mem_cons_self) ht
+    -- It is. Does it take a sequence?
+    · by_cases ht : takes sl.dec = true
+      -- By P2 it is applied.
+      · have ha : sl.applied = true := hP2 sl (List.mem_cons_self) ht
         -- It takes `s + 1`, and the horizon is the rest's horizon from
         -- base `s + 1`.
         have hh : horizon s (sl :: rest) = horizon (s + 1) rest := by
@@ -341,32 +367,36 @@ theorem seen_horizon (s : Nat) (l : List Slot)
         rw [hh]
         -- `s + 1` is at or below it.
         have hle : s + 1 ≤ horizon (s + 1) rest := by
+          -- A horizon is its base plus a count of takers.
           simp [horizon]
         -- The reader sees `s + 1`, then what the rest shows by induction.
         simp [seen, ht, ha, hle, ih (s + 1) hrest, frontier, taken, hp, List.range'_succ]
-      · -- It takes nothing: the horizon is the rest's, from the same base.
-        have hh : horizon s (sl :: rest) = horizon s rest := by
+      -- It takes nothing: the horizon is the rest's, from the same base.
+      · have hh : horizon s (sl :: rest) = horizon s rest := by
+          -- Unfold both horizons: the first slot adds no taker.
           simp [horizon, frontier, taken, hp, ht]
         -- Read at that horizon.
         rw [hh]
         -- It shows nothing itself; the rest shows the answer by induction.
         simp [seen, ht, ih s hrest, frontier, taken, hp]
-    · -- It is not published, so the frontier is 0...
-      have hf : frontier (sl :: rest) = 0 := by
+    -- It is not published, so the frontier is 0...
+    · have hf : frontier (sl :: rest) = 0 := by
+        -- The first slot stops the frontier.
         simp [frontier, hp]
       -- ...and the horizon is the base.
       have hh : horizon s (sl :: rest) = s := by
+        -- An empty prefix holds no taker.
         simp [horizon, hf, taken]
       -- Read at the base, with nothing published.
       rw [hh, hf]
       -- Does the unpublished slot take a sequence?
       by_cases ht : takes sl.dec = true
-      · -- Its sequence `s + 1` is above the base...
-        have h1 : ¬ (s + 1 ≤ s) := by omega
+      -- Its sequence `s + 1` is above the base...
+      · have h1 : ¬ (s + 1 ≤ s) := by omega
         -- ...so the reader sees neither it nor anything after it.
         simp [seen, ht, h1, seen_at_or_below_base rest (Nat.le_succ s), taken]
-      · -- It holds no version, and nothing after it is at or below the base.
-        simp [seen, ht, seen_at_or_below_base rest (Nat.le_refl s), taken]
+      -- It holds no version, and nothing after it is at or below the base.
+      · simp [seen, ht, seen_at_or_below_base rest (Nat.le_refl s), taken]
 
 /-- **A reader at the published horizon sees exactly the takers below the
 frontier.** What it sees is the list of sequences the published prefix
@@ -375,14 +405,15 @@ and nothing from a later slot, even one already applied. -/
 theorem reader_sees_published (s : Nat) (l : List Slot)
     -- Every slot was applied before the decided frontier passed it.
     (hP2 : AllApplied l) :
+    -- The claim itself; its proof follows.
     seen s (horizon s l) l = (seqs s (l.take (frontier l))).filterMap id ∧
       seen s (horizon s l) l = List.range' (s + 1) (horizon s l - s) := by
   -- Both sides are the same consecutive range.
   refine ⟨?_, ?_⟩
-  · -- What is seen is that range, and so are the prefix's sequences.
-    rw [seen_horizon s l hP2, seqs_dense]
-  · -- What is seen is that range...
-    rw [seen_horizon s l hP2]
+  -- What is seen is that range, and so are the prefix's sequences.
+  · rw [seen_horizon s l hP2, seqs_dense]
+  -- What is seen is that range...
+  · rw [seen_horizon s l hP2]
     -- ...whose length is the horizon minus the base.
     simp [horizon]
 
@@ -394,15 +425,18 @@ def fail (sl : Slot) : Slot := { sl with dec := .failed }
 /-- What a rollback leaves of the slots decided and not yet published: the
 longest publishable prefix as it is, and every slot after it thrown out. -/
 def rollback (l : List Slot) : List Slot :=
+  -- The prefix as it is, then every slot after it failed.
   l.take (frontier l) ++ (l.drop (frontier l)).map fail
 
 /-- Slots that were thrown out take nothing. -/
 theorem taken_map_fail (l : List Slot) : taken (l.map fail) = 0 := by
   -- By induction on the slots.
   induction l with
+  -- Case: the empty list.
   | nil =>
     -- No slot, none taken.
     simp [taken]
+  -- Case: a first element and then the rest, the claim known for the rest (ih).
   | cons sl rest ih =>
     -- A discarded slot is no taker, and the rest take none by induction.
     simp [taken, fail, takes, ih]
@@ -410,12 +444,15 @@ theorem taken_map_fail (l : List Slot) : taken (l.map fail) = 0 := by
 /-- Slots that were thrown out hold no sequence, and leave the base where
 it was. -/
 theorem seqs_map_fail (s : Nat) (l : List Slot) :
+    -- The claim itself; its proof follows.
     seqs s (l.map fail) = l.map (fun _ => none) := by
   -- By induction on the slots.
   induction l with
+  -- Case: the empty list.
   | nil =>
     -- No slot, no sequence.
     simp [seqs]
+  -- Case: a first element and then the rest, the claim known for the rest (ih).
   | cons sl rest ih =>
     -- A discarded slot holds `none`, and the rest follow by induction.
     simp [seqs, fail, takes, ih]
@@ -426,6 +463,7 @@ the kept slots keep their sequences, the discarded ones hold none, and the
 later ones are numbered from the base plus the kept takers. The sequences
 the discarded slots held are handed out again. -/
 theorem seqs_after_rollback (s : Nat) (kept dropped more : List Slot) :
+    -- The claim itself; its proof follows.
     seqs s (kept ++ dropped.map fail ++ more) =
       seqs s kept ++ dropped.map (fun _ => none) ++ seqs (s + taken kept) more := by
   -- Number the three parts one after another.
@@ -438,6 +476,7 @@ been decided** (`NoHole` across a rollback). The sequences in use are the
 ones the kept slots and the later slots would hold with the discarded
 slots absent: consecutive from the base, with no gap and none used twice. -/
 theorem rollback_as_if_never_decided (s : Nat) (kept dropped more : List Slot) :
+    -- The claim itself; its proof follows.
     (seqs s (kept ++ dropped.map fail ++ more)).filterMap id =
       (seqs s (kept ++ more)).filterMap id := by
   -- Both sides are consecutive ranges from the base...
@@ -448,19 +487,22 @@ theorem rollback_as_if_never_decided (s : Nat) (kept dropped more : List Slot) :
 /-- A publishable prefix is published whole: the frontier of the slots the
 frontier passed is all of them. -/
 theorem frontier_take (l : List Slot) :
+    -- The claim itself; its proof follows.
     frontier (l.take (frontier l)) = (l.take (frontier l)).length := by
   -- By induction on the slots.
   induction l with
+  -- Case: the empty list.
   | nil =>
     -- No slot: zero on both sides.
     simp [frontier]
+  -- Case: a first element and then the rest, the claim known for the rest (ih).
   | cons sl rest ih =>
     -- Is the first slot publishable?
     by_cases hp : publishable sl = true
-    · -- It is: it is in the prefix, and the rest follows by induction.
-      simp [frontier, hp, ih]
-    · -- It is not: the prefix is empty.
-      simp [frontier, hp]
+    -- It is: it is in the prefix, and the rest follows by induction.
+    · simp [frontier, hp, ih]
+    -- It is not: the prefix is empty.
+    · simp [frontier, hp]
 
 /-- The frontier of a list that begins with a wholly publishable part runs
 through that part and on into what follows. -/
@@ -469,30 +511,34 @@ theorem frontier_append (a b : List Slot)
     (ha : frontier a = a.length) : frontier (a ++ b) = a.length + frontier b := by
   -- By induction on the first part.
   induction a with
+  -- Case: the empty list.
   | nil =>
     -- Nothing in front: the frontier is the second part's.
     simp
+  -- Case: a first element and then the rest, the claim known for the rest (ih).
   | cons sl rest ih =>
     -- Is the first slot publishable?
     by_cases hp : publishable sl = true
-    · -- It is, so the rest of the first part is wholly publishable too.
-      have hrest : frontier rest = rest.length := by
+    -- It is, so the rest of the first part is wholly publishable too.
+    · have hrest : frontier rest = rest.length := by
         -- Read it off the hypothesis for the whole part.
         simpa [frontier, hp] using ha
       -- Pass the first slot, then use the induction step.
       simp [frontier, hp, ih hrest]
       -- Plain arithmetic on the lengths.
       omega
-    · -- It is not: the hypothesis would say `0 = length + 1`.
-      simp [frontier, hp] at ha
+    -- It is not: the hypothesis would say `0 = length + 1`.
+    · simp [frontier, hp] at ha
 
 /-- Discarded slots are all publishable: each owner only has to be told. -/
 theorem frontier_map_fail (l : List Slot) : frontier (l.map fail) = l.length := by
   -- By induction on the slots.
   induction l with
+  -- Case: the empty list.
   | nil =>
     -- No slot: zero on both sides.
     simp [frontier]
+  -- Case: a first element and then the rest, the claim known for the rest (ih).
   | cons sl rest ih =>
     -- A discarded slot is publishable, and the rest follow by induction.
     simp [frontier, fail, publishable, ih]
@@ -500,6 +546,7 @@ theorem frontier_map_fail (l : List Slot) : frontier (l.map fail) = l.length := 
 /-- **A rollback touches nothing published** (G2). The slots the frontier
 could pass before the rollback are the same slots after it. -/
 theorem rollback_keeps_published (l : List Slot) :
+    -- The claim itself; its proof follows.
     (rollback l).take (frontier l) = l.take (frontier l) := by
   -- The frontier is no longer than the list.
   have hlen : (l.take (frontier l)).length = frontier l := by
@@ -507,7 +554,9 @@ theorem rollback_keeps_published (l : List Slot) :
     have hle : frontier l ≤ l.length := by
       -- By induction on the slots.
       induction l with
+      -- Case: the empty list.
       | nil => simp [frontier]
+      -- Case: a first element and then the rest, the claim known for the rest (ih).
       | cons sl rest ih =>
         -- A publishable first slot adds one to both; any other gives zero.
         by_cases hp : publishable sl = true <;> simp [frontier, hp] <;> omega
@@ -521,6 +570,7 @@ publishable afterwards: the published prefix as before, and the discarded
 slots because they hold nothing. So both frontiers can jump past them all
 and every owner learns its fate. -/
 theorem rollback_finishes_everything (l : List Slot) :
+    -- The claim itself; its proof follows.
     frontier (rollback l) = l.length := by
   -- The kept part is wholly publishable, the discarded part too.
   rw [rollback, frontier_append _ _ (frontier_take l), frontier_map_fail]
@@ -533,6 +583,7 @@ theorem rollback_finishes_everything (l : List Slot) :
 horizon after it is the horizon before it: the discarded slots take
 nothing, so passing them raises nothing. -/
 theorem rollback_keeps_horizon (s : Nat) (l : List Slot) :
+    -- The claim itself; its proof follows.
     horizon s (rollback l) = horizon s l := by
   -- After the rollback the frontier passes every slot.
   have hf : frontier (rollback l) = l.length := rollback_finishes_everything l
@@ -562,6 +613,7 @@ theorem rollback_keeps_horizon (s : Nat) (l : List Slot) :
 /-- Whether a slot has nothing left to do with the log: a commit once its
 record is written, every other slot at once (it writes no record). -/
 def walDone (sl : Slot) : Bool :=
+  -- One case for each shape it can have.
   match sl.dec with
   -- A commit is done once its record is in the log.
   | .commit => sl.written
@@ -606,61 +658,68 @@ theorem unwritten_at_or_below_base {t v : Nat} (l : List Slot)
     (hv : v ≤ t) : unwrittenUpTo t v l = [] := by
   -- By induction on the slots, for every base at or above `v`.
   induction l generalizing t with
+  -- Case: the empty list.
   | nil =>
     -- No slot, nothing covered.
     simp [unwrittenUpTo]
+  -- Case: a first element and then the rest, the claim known for the rest (ih).
   | cons sl rest ih =>
     -- Does the first slot take a sequence?
     by_cases h : takes sl.dec = true
-    · -- `t + 1` is above the mark...
-      have h1 : ¬ (t + 1 ≤ v) := by omega
+    -- `t + 1` is above the mark...
+    · have h1 : ¬ (t + 1 ≤ v) := by omega
       -- ...and so is every later sequence, by induction from `t + 1`.
       simp [unwrittenUpTo, h, h1, ih (Nat.le_succ_of_le hv)]
-    · -- It takes none; the rest are above the mark by induction.
-      simp [unwrittenUpTo, h, ih hv]
+    -- It takes none; the rest are above the mark by induction.
+    · simp [unwrittenUpTo, h, ih hv]
 
 /-- **What a sync vouches for is written** (`DurableImpliesWritten`). A
 durable mark at the end of the written prefix covers no commit whose
 record is missing from the log: every sequence at or below it belongs to a
 slot inside that prefix. -/
 theorem sync_covers_only_written (s : Nat) (l : List Slot) :
+    -- The claim itself; its proof follows.
     unwrittenUpTo s (syncTarget s l) l = [] := by
   -- By induction on the slots, for every base `s`.
   induction l generalizing s with
+  -- Case: the empty list.
   | nil =>
     -- No slot, nothing covered.
     simp [unwrittenUpTo]
+  -- Case: a first element and then the rest, the claim known for the rest (ih).
   | cons sl rest ih =>
     -- Is the first slot done with the log?
     by_cases hw : walDone sl = true
-    · -- It is. Does it take a sequence?
-      by_cases ht : takes sl.dec = true
-      · -- The mark is the rest's mark from base `s + 1`.
-        have hh : syncTarget s (sl :: rest) = syncTarget (s + 1) rest := by
+    -- It is. Does it take a sequence?
+    · by_cases ht : takes sl.dec = true
+      -- The mark is the rest's mark from base `s + 1`.
+      · have hh : syncTarget s (sl :: rest) = syncTarget (s + 1) rest := by
           -- Unfold both marks; the counts differ by the one taker.
           simp [syncTarget, writtenTo, taken, hw, ht]
           -- Plain arithmetic.
           omega
         -- The slot itself is written, and the rest by induction.
         simp [unwrittenUpTo, ht, hw, hh, ih (s + 1)]
-      · -- It takes none: the mark is the rest's, from the same base.
-        have hh : syncTarget s (sl :: rest) = syncTarget s rest := by
+      -- It takes none: the mark is the rest's, from the same base.
+      · have hh : syncTarget s (sl :: rest) = syncTarget s rest := by
+          -- Unfold both marks: the first slot adds no sequence.
           simp [syncTarget, writtenTo, taken, hw, ht]
         -- The slot holds no sequence, and the rest follow by induction.
         simp [unwrittenUpTo, ht, hh, ih s]
-    · -- It is not: the written prefix is empty and the mark is the base.
-      have hh : syncTarget s (sl :: rest) = s := by
+    -- It is not: the written prefix is empty and the mark is the base.
+    · have hh : syncTarget s (sl :: rest) = s := by
+        -- The written prefix stops at the first slot.
         simp [syncTarget, writtenTo, hw, taken]
       -- Read at the base.
       rw [hh]
       -- Does the unwritten slot take a sequence?
       by_cases ht : takes sl.dec = true
-      · -- Its sequence `s + 1` is above the mark...
-        have h1 : ¬ (s + 1 ≤ s) := by omega
+      -- Its sequence `s + 1` is above the mark...
+      · have h1 : ¬ (s + 1 ≤ s) := by omega
         -- ...so the mark covers neither it nor anything after it.
         simp [unwrittenUpTo, ht, h1, unwritten_at_or_below_base rest (Nat.le_succ s)]
-      · -- It takes none, and nothing after it is at or below the base.
-        simp [unwrittenUpTo, ht, unwritten_at_or_below_base rest (Nat.le_refl s)]
+      -- It takes none, and nothing after it is at or below the base.
+      · simp [unwrittenUpTo, ht, unwritten_at_or_below_base rest (Nat.le_refl s)]
 
 /-! ## The RED cases -/
 
@@ -680,12 +739,14 @@ def takenSeqsAbortTakes : Nat → List Slot → List Nat
 
 /-- A commit, an abort, a commit, all applied, written and durable. -/
 def commitAbortCommit : List Slot :=
+  -- The three slots, in ring order.
   [⟨.commit, true, true, true⟩, ⟨.abort, true, true, true⟩, ⟨.commit, true, true, true⟩]
 
 /-- **`abort_with_seq_leaves_hole`.** With aborts taking sequences, the two
 commits of `commitAbortCommit` hold 1 and 3: sequence 2 is a hole, where
 the fixed pipeline gives them 1 and 2. -/
 theorem abort_with_seq_leaves_hole :
+    -- The claim itself; its proof follows.
     takenSeqsAbortTakes 0 commitAbortCommit = [1, 3] ∧
       (seqs 0 commitAbortCommit).filterMap id = [1, 2] ∧
       takenSeqsAbortTakes 0 commitAbortCommit ≠ List.range' 1 (taken commitAbortCommit) := by
@@ -702,6 +763,7 @@ published and the horizon stays at 0. A `fetch_max` horizon raised to 2 by
 the second slot's thread shows a reader sequence 1 as well, a commit that
 is not durable and that the frontier has not passed. -/
 theorem fetch_max_shows_unpublished :
+    -- The claim itself; its proof follows.
     seqs 0 laterReady = [some 1, some 2] ∧ frontier laterReady = 0 ∧
       horizon 0 laterReady = 0 ∧ seen 0 0 laterReady = [] ∧
       seen 0 2 laterReady = [1, 2] := by
@@ -717,6 +779,7 @@ def passedUnapplied : List Slot := [⟨.commit, false, true, true⟩]
 reader at the horizon does not find it: its owner cannot read its own
 write. With the slot applied the reader sees it. -/
 theorem publish_before_apply_hides_commit :
+    -- The claim itself; its proof follows.
     frontier passedUnapplied = 1 ∧ horizon 0 passedUnapplied = 1 ∧
       seen 0 1 passedUnapplied = [] ∧
       seen 0 1 [⟨.commit, true, true, true⟩] = [1] := by
@@ -725,6 +788,7 @@ theorem publish_before_apply_hides_commit :
 
 /-- Three commits: the first and third written, the second not. -/
 def gapInLog : List Slot :=
+  -- The three slots, in ring order.
   [⟨.commit, true, true, true⟩, ⟨.commit, true, false, true⟩, ⟨.commit, true, true, true⟩]
 
 /-- **`sync_past_gap_covers_unwritten`.** The written prefix of `gapInLog`
@@ -732,10 +796,12 @@ ends after the first record, so the sync vouches for sequence 1 and covers
 nothing unwritten. A sync that vouched for the last written sequence, 3,
 would cover sequence 2, whose record is not in the log. -/
 theorem sync_past_gap_covers_unwritten :
+    -- The claim itself; its proof follows.
     writtenTo gapInLog = 1 ∧ syncTarget 0 gapInLog = 1 ∧
       unwrittenUpTo 0 (syncTarget 0 gapInLog) gapInLog = [] ∧
       unwrittenUpTo 0 3 gapInLog = [2] := by
   -- Three slots: compute each side.
   decide
 
+-- The end of this file's names.
 end Regolith.Pipeline

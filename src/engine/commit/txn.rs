@@ -5,12 +5,12 @@
 //! thread reaches it: the commit is validated against the view, which by
 //! then holds the writes of every slot decided before it, and only a commit
 //! that passes takes sequences, positions for its appends, and a record.
-//! This is `NoLostUpdate` and `AbortsHaveCause` in `CommitPipeline.tla`:
-//! each commit gets the verdict committing them one at a time, in ring
-//! order, would give it. A commit validated against a view that lacked an
-//! earlier slot's writes would commit over its write of the same key (RED
-//! ValidatePublished), which is why a slot is applied before the next is
-//! decided (`pipeline.rs`, P2).
+//! This is `NoLostUpdate` in `CommitPipeline.tla` and `later_slot_aborts` in
+//! `PipelineCheck.lean`: each commit gets the verdict committing them one at
+//! a time, in ring order, gives it. A commit validated against a view that
+//! lacked an earlier slot's writes would commit over its write of the same
+//! key (RED ValidatePublished), which is why a slot is applied before the
+//! next is decided (`pipeline.rs`, P2).
 //!
 //! The check of one commit is the check a transaction committing alone
 //! always ran: [`RegolithEngine::validate`] runs it against whatever view it

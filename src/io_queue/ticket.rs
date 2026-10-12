@@ -206,22 +206,28 @@ impl JobTicket {
     /// blocking caller's way to use the ticket.
     ///
     /// A job left on this thread's [`IoQueue`](crate::IoQueue) that no poll
-    /// has run to its end yet is run here, on this thread, as a blocking
-    /// call does its own I/O, waiting here for the compaction gate if a pass
-    /// or another job holds it; one a worker or a poll runs is waited for.
+    /// has run to its end yet is brought to its end here, on this thread,
+    /// together with the other jobs the queue holds: each is stepped as the
+    /// queue's poll steps it, and the thread sleeps while another thread
+    /// holds what they need (a compaction pass under the gate, a flush). An
+    /// older job of the same queue that holds the gate, or was handed it,
+    /// is therefore run here too, in the gate's order. A block read pending
+    /// on the queue is not run here; it holds nothing a job waits for.
     ///
-    /// A thread whose queue holds an older job still pending polls the queue
-    /// rather than waiting here: that older job may be the one the gate was
-    /// handed to, and only this thread's poll runs it. The ticket's
-    /// delivery is unchanged: on a ticket completed on a queue, the
-    /// `on_complete` callbacks still run at that queue's poll.
+    /// A job on another thread's queue that nobody is running is run here
+    /// to its end, waiting on this thread for whatever it needs; one a
+    /// worker or a poll runs is waited for. The ticket's delivery is
+    /// unchanged: on a ticket completed on a queue, the `on_complete`
+    /// callbacks still run at that queue's poll.
     pub fn wait(self) -> Result<(), Error> {
-        if let Some(job) = &self.job
-            && job.claim()
-        {
+        if let Some(job) = &self.job {
             match self.completion.report().upgrade() {
-                Some(engine) => engine.io().run_job(job),
-                None => job.run(),
+                // One of this thread's own queue's jobs: stepped with the
+                // rest of them until it lands.
+                Some(engine) if engine.io().is_own(job) => engine.io().wait_landed(job),
+                Some(engine) if job.claim() => engine.io().run_job(job),
+                None if job.claim() => job.run(),
+                _ => {}
             }
         }
         match self.completion.wait_decided() {

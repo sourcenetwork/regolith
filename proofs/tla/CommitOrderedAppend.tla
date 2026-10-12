@@ -29,11 +29,12 @@
 \* a reader whose cursor moves past an entry it never saw; the same message
 \* appended twice although it carried a "once key".
 \*
-\* What this model shows: over every interleaving of a few writers, commit
-\* groups, refused commits, write-ahead-log errors and reads, none of those
-\* happens. It supersedes defradb.rs #1911 (its five invariants and four REDs
-\* are ported here under generic names) and adds density, at-most-once keys,
-\* numbering at commit, group commit, aborts, a failed group, the Phase 7
+\* What this model shows: over every interleaving of a few writers, groups
+\* of commits, refused commits, write-ahead-log errors and reads, none of
+\* those happens. It carries the five invariants and four REDs of an
+\* earlier model of the same log under generic names, and adds density,
+\* at-most-once keys, numbering at commit, commits decided before the ones
+\* ahead of them are published, aborts, a failed group, the Phase 7
 \* pipeline and the transaction's own view. Crashes per durability mode are
 \* in CommitOrderedAppendCrash.tla.
 \*
@@ -60,15 +61,21 @@
 \*     transaction as a PendingAppend (src/transaction/append.rs). Nothing is
 \*     read or validated for it, and the transaction never sees its own
 \*     appends: their positions do not exist until commit.
-\*   The ordered step         the group-commit leader, holding the pipeline
-\*     mutex (RegolithEngine::lock_pipeline, src/engine/commit/mod.rs), takes
-\*     the queued commits in group order. For each member it first validates
-\*     the member's reads (RegolithEngine::validate,
-\*     src/engine/commit/txn.rs); only a member that passes gets a sequence
-\*     and positions (AppendOrder::number, src/engine/commit/append.rs). The
-\*     head and the once keys are read from the view plus the earlier
-\*     members of the same group: nothing is cached, so a group that fails
-\*     leaves no trace.
+\*   The ordered step         every commit takes a slot of the commit ring,
+\*     and the slots are decided in ring order by whichever thread reaches
+\*     them (RegolithEngine::decide_work, src/engine/commit/pipeline.rs).
+\*     Deciding a commit first validates its reads
+\*     (RegolithEngine::validate, src/engine/commit/txn.rs); only a commit
+\*     that passes gets a sequence and positions (AppendOrder::number,
+\*     src/engine/commit/append.rs). The head and the once keys are read
+\*     from the view, which holds every commit decided before this one (a
+\*     slot is in the memtable before the next is decided): nothing is
+\*     cached, so commits a failure discards leave no trace.
+\*     A GROUP, in this model, is a run of commits decided one after
+\*     another in one step, before any of them is written and published:
+\*     neighbouring slots of the ring. Each member reads what the earlier
+\*     members left, as each slot reads what the earlier slots left. The
+\*     engine has no leader and forms no group; the word is the model's.
 \*   Positions                the next position is head + 1. An append whose
 \*     once key already holds a position appends nothing. Each assigned
 \*     append writes entry_key(p) = entry, once_key = p and head_key = p in
@@ -84,18 +91,18 @@
 \*     CommitPipeline.tla.)
 \*
 \* THE REJECTED DESIGNS AND MISUSES. Each is a RED configuration.
-\*   Mode = "Counter"          (#1911 Counter) the head key is read and
+\*   Mode = "Counter"          the head key is read and
 \*     bumped inside the transaction, as an ordinary validated write. Two
 \*     appenders that touch nothing else in common conflict on it.
-\*   Mode = "Detached"         (#1911 Detached, DetachedOrder; defradb.rs
-\*     #1897) the transaction writes an unnumbered pending row; a second,
+\*   Mode = "Detached"         the transaction writes an unnumbered
+\*     pending row; a second,
 \*     separate commit later numbers every pending row in begin order. A
 \*     second durable commit per write, positions out of commit order, and
 \*     an append committed without its number.
 \*   Mode = "Stamp"            (regolith #216, #218; plan D1) the position
 \*     is the commit's sequence number. Every commit takes a sequence, so a
 \*     commit that does not append leaves a hole in the log.
-\*   Mutant = "LatestBound"    (#1911 StampLatest) the reader bounds itself
+\*   Mutant = "LatestBound"    the reader bounds itself
 \*     by the latest assigned position instead of the head in its snapshot,
 \*     moving its cursor past rows that are decided but not yet visible.
 \*   Mutant = "ViewOnlyHead"   a group member reads the head from the view
@@ -128,7 +135,7 @@
 \*     first, and readers see only published state.
 \*   - Stamps (Mode = "Stamp") take one sequence per commit; that red uses
 \*     writers that append at most once and no once keys, which is the shape
-\*     #1911 checked.
+\*     the earlier model checked.
 \*
 \* WHAT THE MODEL LEAVES OUT, and why that loses nothing.
 \*   - One log. Logs have disjoint head, entry and once keys, so two logs
@@ -191,11 +198,12 @@ CONSTANTS
   \* The writers whose commit may be refused because of some other key they read (their validation
   \* may fail).
   MayAbort,
-  \* The largest number of commits the leader takes into one commit group (MAX_GROUP_MEMBERS in
-  \* src/engine/commit/mod.rs is the engine's bound).
+  \* The largest number of commits decided in one step, one after another: a group. The engine
+  \* decides one slot at a time and has no such bound; the bound keeps the model small.
   GroupSize,
-  \* How many decided groups may be waiting to be written at once: 1 is the pipeline mutex of
-  \* src/engine/commit/mod.rs, 2 is the lock-free pipeline of plan 4.7.
+  \* How many decided groups may be waiting to be written and published at once. In the engine
+  \* any number of decided slots may wait (the commit ring, src/engine/commit/ring.rs); 1 and 2
+  \* are the two depths checked here.
   Depth,
   \* The largest number of write-ahead-log errors the model injects.
   MaxWalErrors,
@@ -233,7 +241,7 @@ ASSUME \A A, B \in {Singles, SharedOnce, Doubles, RepeatOnce, Silent} :
          \* (two different shapes share no writer)
          A # B => A \cap B = {}
 \* Only writers can abort; a group holds at least one member; the pipeline
-\* is today's mutex or two deep; the mode and mutant are ones named above.
+\* is one or two groups deep; the mode and mutant are ones named above.
 \* Only a writer can be one that may abort.
 ASSUME MayAbort \subseteq Writers
 \* A group has at least one member, the pipeline is one or two deep, and the error budget is a
@@ -246,7 +254,8 @@ ASSUME Mutant \in {"none", "LatestBound", "ViewOnlyHead", "OnceFromView",
                    "AssignBeforeValidation", "HeadCache", "PublishedView"}
 \* A mutant is a misuse of the design, so it runs on the design.
 ASSUME Mutant # "none" => Mode = "Append"
-\* The rejected designs ran under a commit mutex, with #1911's writer shapes:
+\* The rejected designs ran one commit at a time, with the earlier model's
+\* writer shapes:
 \* stamps on writers appending at most once, no once keys where the design
 \* had none.
 ASSUME Mode # "Append" => Depth = 1
@@ -264,9 +273,9 @@ VARIABLES
   \* thing: its head key is never part of a read set.
   snapHead,
   \* Detached design only: the order in which the transactions began.
-  shortId,
+  beginNo,
   \* Detached design only: the next begin-order number to hand out.
-  nextShort,
+  nextBeginNo,
   \* The sequence number each writer's commit took (the engine's commit sequence).
   cseq,
   \* The log as readers see it: one record [pos, w, i, once] per stored entry, meaning "append i of
@@ -283,8 +292,8 @@ VARIABLES
   \* src/engine/read_horizon.rs).
   vseq,
   \* The groups already decided (validated and numbered) but not yet written and published, oldest
-  \* first. In the engine this is the group the leader is writing (AppendOrder holds its running
-  \* head, src/engine/commit/append.rs).
+  \* first. In the engine these are the slots decided and not yet published (an AppendOrder holds
+  \* one commit's running head, src/engine/commit/append.rs).
   inflight,
   \* Detached design only: the committed appends <<w, i>> that have no number yet.
   pending,
@@ -305,7 +314,7 @@ VARIABLES
   readFailed
 
 \* The variables the transactions own.
-txnVars == <<phase, snapHead, shortId, nextShort, cseq>>
+txnVars == <<phase, snapHead, beginNo, nextBeginNo, cseq>>
 \* The variables the engine owns.
 engineVars == <<rows, onceAt, head, vseq, inflight, pending, cache, walErrors, commits, writes>>
 \* The variables the reader owns.
@@ -455,7 +464,7 @@ GroupStart ==
    \* no rows, no pending appends, no members, no aborts, and the sequences as recorded so far.
    rows |-> {}, pend |-> {}, members |-> <<>>, aborted |-> {}, cseq |-> cseq]
 
-\* The groups the leader may form from the writers in S: one to GroupSize
+\* The groups that may be decided from the writers in S: one to GroupSize
 \* distinct writers, in any order.
 Groups(S) ==
   \* For each size n from 1 to GroupSize: every list of n different writers of S.
@@ -472,9 +481,9 @@ Init ==
   \* No snapshot head was read (Counter).
   /\ snapHead   = [w \in Writers |-> 0]
   \* No begin order was handed out (Detached).
-  /\ shortId    = [w \in Writers |-> 0]
+  /\ beginNo    = [w \in Writers |-> 0]
   \* The next begin-order number is 1.
-  /\ nextShort  = 1
+  /\ nextBeginNo = 1
   \* No commit took a sequence.
   /\ cseq       = [w \in Writers |-> 0]
   \* The log holds no row.
@@ -506,7 +515,7 @@ Init ==
 
 \* Writer w begins: its snapshot is the published view. Counter records the
 \* head it reads there; Detached hands it the next begin-order number
-\* (#1897's short ID). Its appends are queued while it is open.
+\* (beginNo). Its appends are queued while it is open.
 Begin(w) ==
   \* The writer has not begun.
   /\ phase[w] = "idle"
@@ -515,9 +524,9 @@ Begin(w) ==
   \* Under the Counter design it reads the head in its snapshot.
   /\ snapHead'  = IF Mode = "Counter" THEN [snapHead EXCEPT ![w] = head] ELSE snapHead
   \* Under the Detached design it gets the next begin-order number,
-  /\ shortId'   = IF Mode = "Detached" THEN [shortId EXCEPT ![w] = nextShort] ELSE shortId
+  /\ beginNo'   = IF Mode = "Detached" THEN [beginNo EXCEPT ![w] = nextBeginNo] ELSE beginNo
   \* and that number moves up.
-  /\ nextShort' = IF Mode = "Detached" THEN nextShort + 1 ELSE nextShort
+  /\ nextBeginNo' = IF Mode = "Detached" THEN nextBeginNo + 1 ELSE nextBeginNo
   \* It has no commit sequence yet.
   /\ UNCHANGED <<cseq>>
   \* The engine's state does not change.
@@ -568,7 +577,7 @@ Decide(g, F) ==
         \* The HeadCache mutant moves its cache now, before anything is written.
         /\ cache' = IF Mutant = "HeadCache" THEN st.head ELSE cache
   \* Snapshot heads and begin orders do not change.
-  /\ UNCHANGED <<snapHead, shortId, nextShort>>
+  /\ UNCHANGED <<snapHead, beginNo, nextBeginNo>>
   \* Nothing is published yet: the store, the counters and the error count stay.
   /\ UNCHANGED <<rows, onceAt, head, vseq, pending, walErrors, commits, writes>>
   \* The reader's state does not change.
@@ -601,7 +610,7 @@ Publish ==
         \* It leaves the pipeline.
         /\ inflight' = Tail(inflight)
   \* Snapshot heads, begin orders and sequences do not change.
-  /\ UNCHANGED <<snapHead, shortId, nextShort, cseq>>
+  /\ UNCHANGED <<snapHead, beginNo, nextBeginNo, cseq>>
   \* The cache and the error count do not change.
   /\ UNCHANGED <<cache, walErrors>>
   \* The reader's state does not change.
@@ -626,7 +635,7 @@ WalError ==
   \* One more error was injected.
   /\ walErrors' = walErrors + 1
   \* Snapshot heads, begin orders and sequences do not change.
-  /\ UNCHANGED <<snapHead, shortId, nextShort, cseq>>
+  /\ UNCHANGED <<snapHead, beginNo, nextBeginNo, cseq>>
   \* The store and the counters do not change; the HeadCache mutant's cache keeps its advance.
   /\ UNCHANGED <<rows, onceAt, head, vseq, pending, cache, commits, writes>>
   \* The reader's state does not change.
@@ -634,17 +643,17 @@ WalError ==
 
 \* Detached only: the place of pending append e = <<w, i>> when the pending
 \* appends are sorted by their writer's begin order, then append order;
-\* 1 for the first. Begin order is #1897's short-ID order.
+\* 1 for the first. Begin order is the order of the numbers handed out at
+\* begin.
 Rank(e) ==
   \* Count the pending appends that sort at or before e: those of a writer that began earlier,
-  Cardinality({x \in pending : \/ shortId[x[1]] < shortId[e[1]]
+  Cardinality({x \in pending : \/ beginNo[x[1]] < beginNo[e[1]]
                                \* and those of the same writer made no later than e.
                                \/ x[1] = e[1] /\ x[2] <= e[2]})
 
-\* Detached only: #1897's second commit. It numbers every pending append
+\* Detached only: the second commit. It numbers every pending append
 \* after the head by its rank, and writes the new head. It is a durable
-\* commit of its own, under the commit mutex, so it waits for nothing in
-\* flight.
+\* commit of its own, with nothing else in flight, so it waits for nothing.
 Sequence ==
   \* Only the Detached design has this step.
   /\ Mode = "Detached"
@@ -711,12 +720,12 @@ Read ==
   \* The engine's state does not change.
   /\ UNCHANGED engineVars
 
-\* Every step the system can take. The leader forms a group from open
-\* writers and picks which of them fail validation on another key.
+\* Every step the system can take. A group is formed from open writers,
+\* and which of them fail validation on another key is picked.
 Next ==
   \* A writer begins.
   \/ \E w \in Writers : Begin(w)
-  \* The leader forms a group g from the open writers,
+  \* A group g is formed from the open writers,
   \/ \E g \in Groups({w \in Writers : phase[w] = "open"}) :
        \* picks which members F fail validation on another key, and decides the group.
        \E F \in SUBSET (MayAbort \cap Range(g)) : Decide(g, F)
@@ -733,7 +742,7 @@ Next ==
 Spec == Init /\ [][Next]_vars
 
 ----------------------------------------------------------------------------
-\* Invariants. The first five are #1911's.
+\* Invariants. The first five are the earlier model's.
 
 \* Every variable holds what its comment says.
 TypeOK ==
@@ -742,7 +751,7 @@ TypeOK ==
   \* Every snapshot head is a number.
   /\ snapHead \in [Writers -> Nat]
   \* Every begin order is a number.
-  /\ shortId \in [Writers -> Nat]
+  /\ beginNo \in [Writers -> Nat]
   \* Every commit sequence is a number.
   /\ cseq \in [Writers -> Nat]
   \* Every row has a position from 1 up, a writer, and one of that writer's append indexes.
@@ -834,7 +843,7 @@ Numbered(w, i) ==
   \/ Appends(w)[i] # NoOnce /\ onceAt[Appends(w)[i]] # 0
 
 \* Every append of a committed transaction has its position the moment the
-\* commit returns. This replaces #1911's unchecked liveness ("eventually
+\* commit returns. This replaces the earlier model's unchecked liveness ("eventually
 \* numbered") with a safety property. (In Lean, by construction, as for
 \* INV_OneCommitPerWrite.)
 INV_NumberedAtCommit ==

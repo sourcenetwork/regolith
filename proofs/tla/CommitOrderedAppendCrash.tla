@@ -45,9 +45,10 @@
 \*
 \* THE DESIGN (plan 3.6 "Durability", 4.2 and 4.7), and the code.
 \*   Each commit's record (its rows, once keys and head) is one WAL record,
-\*   written in commit order (RegolithEngine::log_group,
-\*   src/engine/commit/mod.rs). A sync makes every written record durable
-\*   (sync_group, same file).
+\*   at its place in commit order (Log::write_record,
+\*   src/engine/wal_log.rs; a sync vouches only for the records with none
+\*   missing before them, so "written" here is that prefix). A sync makes
+\*   every written record durable (a sync round, src/engine/commit/round.rs).
 \*   Publication makes the next record visible; under Immediate durability
 \*   only once it is durable, so the visible prefix never passes the durable
 \*   one. A power cut keeps a gap-free prefix of the records that holds every

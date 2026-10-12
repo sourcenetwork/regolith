@@ -137,12 +137,11 @@ impl LevelIter {
         }
     }
 
-    /// Like [`seek`], but additionally consults the underlying
-    /// SSTable's prefix bloom filter (when present) and leaves the
-    /// level iterator empty if the file cannot contain any key with
-    /// the prefix `probe` is for. A table ruled out this way is counted
-    /// as a useful bloom check. Memtable levels always perform a normal
-    /// seek.
+    /// Like [`seek`], but additionally consults the prefix bloom filter
+    /// (when present) of each SSTable the seek would read, and leaves the
+    /// level iterator empty if no table of it can contain a key with the
+    /// prefix `probe` is for. A table ruled out this way is counted as a
+    /// useful bloom check. Memtable levels always perform a normal seek.
     fn seek_with_prefix_skip(
         &mut self,
         target: &[u8],
@@ -161,7 +160,7 @@ impl LevelIter {
                 }
                 it.seek(target)
             }
-            Self::LevelConcat(it) => it.seek(target),
+            Self::LevelConcat(it) => it.seek_with_prefix_skip(target, probe),
         }
     }
 
@@ -877,14 +876,48 @@ impl LevelConcatIter {
     }
 
     fn seek(&mut self, target: &[u8]) -> io::Result<()> {
-        if self.files.is_empty() {
-            self.current = None;
-            return Ok(());
-        }
         let uk = user_key_of(target);
         let idx = self
             .files
             .partition_point(|f| f.meta.largest_key.as_slice() < uk);
+        self.seek_from(idx, target)
+    }
+
+    /// [`seek`](Self::seek) for a prefix seek, whose `target` is the
+    /// smallest key of the prefix: a table whose prefix bloom rules the
+    /// prefix out is passed over unread, and counted as a useful bloom
+    /// check.
+    ///
+    /// The walk is bounded by the tables the prefix can be in. A level's
+    /// tables are in key order, so it ends at the first one that can hold
+    /// the prefix, and at the first one that starts past it, after which no
+    /// table holds it and the level is left empty.
+    fn seek_with_prefix_skip(
+        &mut self,
+        target: &[u8],
+        probe: &mut PrefixProbe<'_>,
+    ) -> io::Result<()> {
+        let prefix = user_key_of(target);
+        let mut idx = self
+            .files
+            .partition_point(|f| f.meta.largest_key.as_slice() < prefix);
+        while let Some(file) = self.files.get(idx) {
+            let smallest = file.meta.smallest_key.as_slice();
+            if smallest > prefix && !smallest.starts_with(prefix) {
+                idx = self.files.len();
+            } else if file.reader.may_have_prefix(probe, &self.cache)? {
+                break;
+            } else {
+                self.cache.record_bloom_useful();
+                idx += 1;
+            }
+        }
+        self.seek_from(idx, target)
+    }
+
+    /// Position at the first entry at or after `target` in the tables from
+    /// `idx` on.
+    fn seek_from(&mut self, idx: usize, target: &[u8]) -> io::Result<()> {
         if idx >= self.files.len() {
             self.current = None;
             return Ok(());
