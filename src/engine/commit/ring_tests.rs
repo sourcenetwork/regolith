@@ -246,7 +246,12 @@ fn a_void_slot_does_not_keep_its_cell() {
 #[test]
 fn installs_voids_and_loads_race_without_losing_or_leaking_a_descriptor() {
     const THREADS: u64 = 4;
+    // Interpreted, each round costs thousands of times what it does
+    // native; fifty rounds a thread still race every step of the cell.
+    #[cfg(not(miri))]
     const EACH: u64 = 2_000;
+    #[cfg(miri)]
+    const EACH: u64 = 50;
     let dropped = drops();
     let installed = std::sync::Arc::new(StdAtomicUsize::new(0));
     let made = std::sync::Arc::new(StdAtomicUsize::new(0));
@@ -417,7 +422,11 @@ fn a_replaced_value_waits_for_a_load_under_way() {
 #[test]
 fn loads_and_replacements_race_without_a_lost_or_double_drop() {
     const THREADS: u64 = 4;
+    // Sized for the interpreter as the ring's race above is.
+    #[cfg(not(miri))]
     const EACH: u64 = 5_000;
+    #[cfg(miri)]
+    const EACH: u64 = 100;
     let dropped = drops();
     let slot = ArcSlot::new(tip(0, &dropped));
     let made = std::sync::Arc::new(StdAtomicUsize::new(1));

@@ -60,7 +60,12 @@ fn file_ids_are_taken_once_each_and_recorded() {
 #[test]
 fn concurrent_sections_run_alone_and_none_is_lost() {
     const THREADS: u64 = 8;
+    // Each section appends to the manifest; interpreted, a handful a
+    // thread still overlaps every push with a sweep.
+    #[cfg(not(miri))]
     const EACH: u64 = 50;
+    #[cfg(miri)]
+    const EACH: u64 = 4;
     let (_dir, store) = store();
     let cell = with_view(&store);
     let first = store.current().next_file_id;
