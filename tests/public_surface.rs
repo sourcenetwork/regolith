@@ -7,12 +7,37 @@
 
 use std::sync::Arc;
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 use regolith::{Db, IsolationLevel, OptimisticTransactionDb, Options, Statistics, Ticker};
-use regolith::{EventListener, TransactionDb, TxnOptions};
+use regolith::{EventListener, FlushJobInfo, TransactionDb, TxnOptions};
 
 struct Quiet;
 
 impl EventListener for Quiet {}
+
+/// Counts the flushes it is told of.
+#[derive(Default)]
+struct Flushes(AtomicUsize);
+
+impl EventListener for Flushes {
+    fn on_flush_completed(&self, _info: &FlushJobInfo) {
+        self.0.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// A caller handed options that already carry a listener adds its own without
+/// reading the list back, and the database tells both.
+#[test]
+fn a_listener_added_to_options_is_told_beside_the_ones_already_there() {
+    let (theirs, mine) = (Arc::new(Flushes::default()), Arc::new(Flushes::default()));
+    let given = Options::memory().listeners(vec![theirs.clone()]);
+    let db = Db::open("surface-add-listener", given.add_listener(mine.clone())).unwrap();
+    db.put(b"k", b"v").unwrap();
+    db.flush().unwrap();
+    assert_eq!(theirs.0.load(Ordering::Relaxed), 1);
+    assert_eq!(mine.0.load(Ordering::Relaxed), 1);
+}
 
 #[test]
 fn options_hand_back_the_key_bound_and_the_inline_compaction_switch() {

@@ -202,9 +202,22 @@ impl Options {
     /// is synchronous on the firing thread - listeners **must not
     /// block or re-enter the database**. See
     /// [`crate::EventListener`] for the full contract.
+    ///
+    /// Replaces every listener set before. To keep them, use
+    /// [`Options::add_listener`].
     #[must_use]
     pub fn listeners(mut self, listeners: Vec<Arc<dyn crate::EventListener>>) -> Self {
         self.listeners = listeners;
+        self
+    }
+
+    /// Add one event listener after the ones already set, keeping them:
+    /// for a caller handed an [`Options`] that may carry listeners of its
+    /// own. Listeners are told of an event in the order they were set and
+    /// added. [`Options::listeners`] replaces the list instead.
+    #[must_use]
+    pub fn add_listener(mut self, listener: Arc<dyn crate::EventListener>) -> Self {
+        self.listeners.push(listener);
         self
     }
 
