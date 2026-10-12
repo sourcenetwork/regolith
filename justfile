@@ -853,8 +853,19 @@ lean:
     fi
     lake env lean Audit.lean
 
-# Every formal check: the TLA+ models and the Lean proofs.
-proofs: tla lean
+# Every line of a TLA+ model, a TLC configuration and a Lean proof carries a
+# plain-words comment directly above it, written for a reader who knows
+# neither the language nor the code; `proofs/check-comments.sh` states the
+# rule and fails on any line without one. The commit-pipeline models
+# (CommitPipeline, GroupCommit, NonBlocking, and Pipeline.lean and
+# IoQueue.lean) are left out: they are being rewritten on the commit-pipeline
+# branch, and they join this check by deleting the `--except` below.
+# Fail when a proof line has no comment above it.
+proofs-comments:
+    proofs/check-comments.sh --except '/(MC_)?(CommitPipeline|GroupCommit|NonBlocking)[_.]|/(Pipeline|IoQueue|GroupCommit)\.lean$'
+
+# Every formal check: the TLA+ models, the Lean proofs, and their comments.
+proofs: tla lean proofs-comments
 
 # ---------- consistency ----------
 
