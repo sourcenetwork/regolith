@@ -93,15 +93,20 @@ impl Opened {
     }
 }
 
+/// Keys the life of a database writes, twice over.
+const KEYS: u32 = 64;
+
 /// Everything a caller does to a database in its life, on the calling thread.
 fn use_it(opened: &Opened) {
     let db = opened.db();
+    // Few writes, since one row syncs every one of them; enough bytes to
+    // overflow the smallest write buffer of the rows.
     let value = vec![7u8; 256];
-    for i in 0..400u32 {
+    for i in 0..KEYS {
         regolith::through_stalls(|| db.put(format!("key/{i:05}").as_bytes(), &value)).unwrap();
     }
     db.flush().unwrap();
-    for i in 0..400u32 {
+    for i in 0..KEYS {
         regolith::through_stalls(|| db.put(format!("key/{i:05}").as_bytes(), b"again")).unwrap();
     }
     db.flush().unwrap();
@@ -112,7 +117,10 @@ fn use_it(opened: &Opened) {
         snapshot.get(b"key/00007").unwrap().as_deref(),
         Some(&b"again"[..])
     );
-    assert_eq!(db.scan(Some(b"key/"), Some(b"key0")).unwrap().len(), 400);
+    assert_eq!(
+        db.scan(Some(b"key/"), Some(b"key0")).unwrap().len(),
+        KEYS as usize
+    );
     drop(snapshot);
 
     assert_eq!(db.allocate(b"ids", 3).unwrap(), 1..4);
