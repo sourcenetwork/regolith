@@ -801,7 +801,7 @@ wasm-native records="5000" sustained="20000":
     set -euo pipefail
     for profile in embedded wasm; do
         echo "== profile $profile =="
-        cargo run --release -p regolith-wasm-probe -- \
+        cargo run --release -p regolith-wasm-probe --bin regolith-wasm-probe -- \
             --profile "$profile" --records {{records}} --sustained {{sustained}} \
             --probe-host --report-memory
     done
