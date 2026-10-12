@@ -78,6 +78,7 @@ mod perf_context;
 mod portability;
 mod rate_limiter;
 mod slice;
+mod snapshot_wait;
 mod sst_file_writer;
 mod statistics;
 mod stream_writer;
@@ -122,6 +123,7 @@ pub use options::{
 pub use perf_context::{PerfContext, PerfContextSnapshot, PerfLevel};
 pub use rate_limiter::{Priority, RateLimiter, TokenBucketRateLimiter};
 pub use slice::DbSlice;
+pub use snapshot_wait::SnapshotWait;
 pub use sst_file_writer::{IngestOptions, SstFileMeta, SstFileWriter};
 pub use statistics::{Histogram, HistogramSnapshot, Statistics, Ticker};
 pub use stream_writer::{StreamOptions, StreamingWriter};
@@ -1711,17 +1713,18 @@ impl Db {
         self.engine.close().map_err(Error::from)
     }
 
-    /// Block until no [`Snapshot`] and no snapshot-backed iterator is
-    /// live, returning how many pins were still outstanding when
-    /// `timeout` elapsed. `0` means the wait succeeded.
+    /// How many [`Snapshot`]s and snapshot-backed iterators are live, and a
+    /// wait for the last of them to be released. The call itself never
+    /// waits: it returns a [`SnapshotWait`] at once.
     ///
     /// A snapshot pins the SSTables it can see, so closing a database
     /// while one is outstanding leaves those files on disk and their
     /// readers open. An embedder that wants a clean shutdown has to wait
-    /// for its readers to finish, and this is that wait: it blocks on
-    /// the release itself rather than polling a counter, so it costs
-    /// nothing while it waits and adds no latency once the last reader
-    /// is done.
+    /// for its readers to finish, and the handle is that wait: ask it
+    /// ([`SnapshotWait::pinned`]), await it from a task, or block on it by
+    /// name ([`SnapshotWait::wait`]). Either wait is for the release
+    /// itself rather than a polled counter, so it costs nothing while it
+    /// waits and adds no latency once the last reader is done.
     ///
     /// Counts pins, not handles. An iterator taken from a snapshot pins
     /// it again for as long as the iterator lives, so a `Snapshot` that
@@ -1729,17 +1732,10 @@ impl Db {
     /// exactly the case an embedder tracking its own transaction objects
     /// would miss.
     ///
-    /// Returns a count rather than an error because whether outstanding
-    /// readers are a failure is the caller's decision: [`Db::close`]
-    /// does not require this wait, and a database closed with snapshots
-    /// live is consistent, just not tidy.
-    ///
-    /// The timeout is measured on the clock of [`Options::env`]. Where the
-    /// env has no clock the wait is one wait of `timeout`, ended early by
-    /// the last release. On a target with a single thread (wasm without
-    /// the `atomics` feature) nothing can release a pin while this call
-    /// waits, so it returns the count at once without waiting: release the
-    /// snapshots first, then call it.
+    /// The handle reports a count rather than an error because whether
+    /// outstanding readers are a failure is the caller's decision:
+    /// [`Db::close`] does not require this wait, and a database closed with
+    /// snapshots live is consistent, just not tidy.
     ///
     /// ```
     /// # use std::time::Duration;
@@ -1750,16 +1746,19 @@ impl Db {
     /// db.put(b"k", b"v")?;
     ///
     /// let snapshot = db.snapshot();
-    /// assert_eq!(db.wait_for_snapshots(Duration::from_millis(50)), 1);
+    /// let readers = db.wait_for_snapshots();
+    /// assert_eq!(readers.pinned(), 1);
+    /// assert_eq!(readers.wait(Duration::from_millis(50)), 1);
     ///
     /// drop(snapshot);
-    /// assert_eq!(db.wait_for_snapshots(Duration::from_secs(5)), 0);
+    /// assert!(readers.is_ready());
+    /// assert_eq!(readers.wait(Duration::from_secs(5)), 0);
     /// db.close()?;
     /// # Ok(())
     /// # }
     /// ```
-    pub fn wait_for_snapshots(&self, timeout: std::time::Duration) -> u64 {
-        self.engine.wait_for_snapshots(timeout)
+    pub fn wait_for_snapshots(&self) -> SnapshotWait {
+        SnapshotWait::new(Arc::clone(&self.engine))
     }
 
     /// Test-only: number of SSTable files at `level`.

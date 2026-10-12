@@ -1311,6 +1311,11 @@ impl RegolithEngine {
         self.snapshot_registry.wait_until_drained(timeout)
     }
 
+    /// The same wait for a task: over once no snapshot is pinned.
+    pub(crate) fn snapshots_drained(&self) -> impl Future<Output = ()> + '_ {
+        self.snapshot_registry.until_drained()
+    }
+
     /// Construct a streaming iterator over the latest published read
     /// horizon. The view is loaded before the horizon is sampled, for
     /// the reason spelled out on [`Self::get_latest`].

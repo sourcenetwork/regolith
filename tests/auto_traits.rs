@@ -20,8 +20,9 @@ use regolith::{
     DbSlice, DbWithTtl, Entries, Env, Error, EventListener, IoBudget, IoProgress, IoQueue, IoUnit,
     IoWait, Iter, JobTicket, KeyClassifier, KeyProvider, LockWait, LogLayout, MergeOperator,
     OptimisticTransactionDb, OwnedSnapshotIter, Page, QueueId, ReadMode, RetryPolicy, ScanCheck,
-    ScanStream, Snapshot, StallWait, TailingIter, TransactError, Transaction, TransactionDb,
-    TransactionError, TransactionHooks, TxResult, TxnCursor, TxnScanStream, WouldBlock,
+    ScanStream, Snapshot, SnapshotWait, StallWait, TailingIter, TransactError, Transaction,
+    TransactionDb, TransactionError, TransactionHooks, TxResult, TxnCursor, TxnScanStream,
+    WouldBlock,
 };
 
 const fn assert_send<T: Send>() {}
@@ -127,6 +128,7 @@ fn tickets_and_waits_are_send_and_sync() {
     assert_send_sync::<StallWait>();
     assert_send_sync::<LockWait>();
     assert_send_sync::<IoWait>();
+    assert_send_sync::<SnapshotWait>();
 }
 
 const fn assert_unpin_future<F: Future<Output = Out> + Unpin, Out>() {}
@@ -140,6 +142,7 @@ fn tickets_and_waits_are_unpin_futures() {
     assert_unpin_future::<IoWait, ()>();
     assert_unpin_future::<StallWait, ()>();
     assert_unpin_future::<LockWait, ()>();
+    assert_unpin_future::<SnapshotWait, ()>();
 }
 
 /// The futures of the `regolith::sync` waits: a task that holds one across an
