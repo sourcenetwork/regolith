@@ -66,8 +66,9 @@
 \* CONFIGURATIONS.
 \*   MC_NonBlocking_Green_Pool        Mode = "pool": two commits (one with a
 \*     callback), two reads of one block, one self-started unit, two I/O
-\*     threads on io_pending. Every invariant and the liveness properties
-\*     hold.
+\*     threads on io_pending. Every invariant holds.
+\*   MC_NonBlocking_Green_PoolLive    the same with one commit: every
+\*     invariant and the liveness properties hold.
 \*   MC_NonBlocking_Green_Single      Mode = "single": one thread does it
 \*     all, polling I/O when idle. Every invariant and the liveness
 \*     properties hold.
