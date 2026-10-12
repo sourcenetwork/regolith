@@ -35,6 +35,7 @@
 //! The column-family fence on each group-commit path, the group left owing
 //! its fsync included, is tested where the fence is, in
 //! `engine::commit::families`.
+#![cfg(not(target_arch = "wasm32"))]
 
 mod common;
 

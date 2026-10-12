@@ -15,6 +15,7 @@
 //! measurement would let the harness run them side by side and mix their
 //! allocations, so every measurement is a step of one test. This counts
 //! bytes, it does not time anything: no benchmark.
+#![cfg(not(target_arch = "wasm32"))]
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::io;

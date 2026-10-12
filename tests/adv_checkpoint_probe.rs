@@ -14,6 +14,7 @@
 //! The capture now drains active *and* frozen under `write_lock`, so a
 //! write acknowledged before the call is in a memtable when the lock is
 //! taken and in an SSTable when it is released.
+#![cfg(not(target_arch = "wasm32"))]
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};

@@ -15,6 +15,7 @@
 //! The invariant asserted throughout is the one the bug report names: a
 //! key that is only ever overwritten, never deleted, must never read back
 //! as absent, and a repeated read of it must never travel backwards.
+#![cfg(not(target_arch = "wasm32"))]
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};

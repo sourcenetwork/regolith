@@ -12,6 +12,7 @@
 //!    writer's write is decided and waits behind it, which needs the
 //!    engine's internals: it lives beside them, in
 //!    `src/engine/commit/overlap_tests.rs`, and still writes through `Db`.
+#![cfg(not(target_arch = "wasm32"))]
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};

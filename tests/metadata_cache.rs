@@ -5,6 +5,7 @@
 //! `block_cache_size` collapses to the pinned top-level index of each
 //! partitioned file (and to nothing at all for a flat file), and reads
 //! keep answering identically either way.
+#![cfg(not(target_arch = "wasm32"))]
 
 mod common;
 

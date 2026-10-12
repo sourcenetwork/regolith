@@ -1,6 +1,7 @@
 //! Adversarial probes on the surfaces that sit above the rewritten write
 //! and read paths: column families, checkpoints, backups, the tailing
 //! iterator, and the `DbSlice` trait contract.
+#![cfg(not(target_arch = "wasm32"))]
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;

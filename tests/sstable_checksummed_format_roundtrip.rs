@@ -6,6 +6,7 @@
 //! A format change that only survives inside the writing process is not
 //! a format change; these are the paths where a table is written by one
 //! handle and read by another.
+#![cfg(not(target_arch = "wasm32"))]
 
 use std::fs;
 use std::path::Path;

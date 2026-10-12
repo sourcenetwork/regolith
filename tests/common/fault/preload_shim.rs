@@ -40,6 +40,17 @@
 //! which is what lets a reconstruction tell a foreground write from a
 //! background flush or compaction write.
 //!
+//! Every record is [`RECORD`] bytes: the path is followed by NUL, which no
+//! path holds, up to the line end. The length divides a page, so in a file
+//! that holds nothing but whole records no record lies across two pages.
+//! That is what keeps a record whole when the process is killed. The kernel
+//! copies a write a page at a time and gives up between two pages once the
+//! kill is pending, so a record across a page boundary could be left cut at
+//! the boundary by a thread that was inside its write when another thread
+//! killed the process; and since the kill reaches the threads one after the
+//! other, a thread it had not reached yet could still append a whole record
+//! behind the cut one.
+//!
 //! # Environment
 //!
 //! * `REGOLITH_FAULT_JOURNAL`   path of the journal. Unset = the shim is inert.
@@ -83,6 +94,9 @@ const SEEK_END: c_int = 2;
 const SIGKILL: c_int = 9;
 
 const MAX_FD: usize = 4096;
+/// The length of every journal record, line end included. It divides a
+/// page; see the journal format above.
+const RECORD: usize = 512;
 const TAG_UNTRACKED: u8 = 0;
 const TAG_TRACKED: u8 = 1;
 const TAG_DIE_MATCH: u8 = 2;
@@ -243,14 +257,14 @@ unsafe fn journal_fd() -> c_int {
 }
 
 struct Rec {
-    buf: [u8; 512],
+    buf: [u8; RECORD],
     len: usize,
 }
 
 impl Rec {
     fn new() -> Rec {
         Rec {
-            buf: [0u8; 512],
+            buf: [0u8; RECORD],
             len: 0,
         }
     }
@@ -291,7 +305,8 @@ impl Rec {
 }
 
 /// Emit one journal record. Records are `O_APPEND` single-write appends so
-/// a concurrent thread cannot interleave a partial line.
+/// a concurrent thread cannot interleave a partial line, and each is
+/// [`RECORD`] bytes so a kill cannot cut one.
 unsafe fn emit(kind: u8, fd: c_int, a: i64, b: i64, ret: i64, path: &[u8]) {
     let jfd = journal_fd();
     if jfd < 0 {
@@ -319,7 +334,9 @@ unsafe fn emit(kind: u8, fd: c_int, a: i64, b: i64, ret: i64, path: &[u8]) {
         path
     };
     r.raw(p);
-    r.raw(b"\n");
+    // The buffer is NUL from here to its last byte, the line end.
+    r.buf[RECORD - 1] = b'\n';
+    r.len = RECORD;
     let w = real!(w, WriteFn, "write");
     let mut off = 0usize;
     while off < r.len {
