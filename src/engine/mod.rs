@@ -1248,6 +1248,12 @@ impl RegolithEngine {
         self.options.statistics.clone()
     }
 
+    /// The statistics `Arc` exactly as the caller configured it, for
+    /// [`crate::Db::statistics`] to hand back.
+    pub(crate) fn statistics_shared(&self) -> Option<&Arc<crate::statistics::Statistics>> {
+        self.options.statistics.as_ref()
+    }
+
     /// The table of units and jobs in flight, and the registry of open
     /// queues, for this database.
     pub(crate) fn io(&self) -> &io::IoRuntime {

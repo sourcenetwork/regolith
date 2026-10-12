@@ -6,7 +6,8 @@
 //! caller then polls the `Statistics` object (via
 //! [`Statistics::get_ticker`], [`Statistics::get_histogram_snapshot`],
 //! or [`Statistics::to_string`]) to export the values to their
-//! monitoring stack of choice.
+//! monitoring stack of choice. A caller that kept only the database
+//! reads the same object back with [`crate::Db::statistics`].
 //!
 //! # Metric names
 //!

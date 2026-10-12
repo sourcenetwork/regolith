@@ -1408,6 +1408,31 @@ impl Db {
         }
     }
 
+    /// The statistics this database was opened with
+    /// ([`Options::statistics`]), or `None` when it was opened with none.
+    ///
+    /// It is the object the caller configured, not a copy: every handle on
+    /// this database adds to it, a ticker read through it is the total they
+    /// all added, and [`Statistics::reset`] through it zeroes it for all of
+    /// them. Clone the `Arc` to keep it past the database handle. A database
+    /// opened without statistics never makes one, so this stays `None` for
+    /// its whole life. What a read sees while updates run is stated on
+    /// [`Statistics`].
+    ///
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use regolith::{Db, Options, Statistics, Ticker};
+    /// let options = Options::memory().statistics(Some(Arc::new(Statistics::new())));
+    /// let db = Db::open("statistics-doc", options)?;
+    /// db.put(b"k", b"v")?;
+    /// let stats = db.statistics().expect("opened with statistics");
+    /// assert_eq!(stats.get_ticker(Ticker::KeysWritten), 1);
+    /// # Ok::<(), regolith::Error>(())
+    /// ```
+    pub fn statistics(&self) -> Option<&Arc<Statistics>> {
+        self.engine.statistics_shared()
+    }
+
     /// What the environment this database was opened on can
     /// actually do.
     ///
