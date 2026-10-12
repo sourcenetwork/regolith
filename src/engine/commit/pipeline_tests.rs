@@ -767,6 +767,34 @@ fn a_writer_that_commits_is_immediately_visible_to_another_thread() {
     assert_eq!(checked, 2_000);
 }
 
+/// P3 with helpers: several writers publish each other's slots, and a
+/// writer returns as soon as it sees its own published, whoever passed the
+/// frontier. The read horizon is at its sequence by then, so it reads its
+/// own write.
+#[test]
+fn a_commit_published_by_another_thread_reads_its_own_write_when_it_returns() {
+    let dir = TempDir::new().unwrap();
+    let engine = open_engine(&dir);
+    thread::scope(|scope| {
+        for w in 0..4 {
+            let engine = &engine;
+            scope.spawn(move || {
+                for i in 0..2_000 {
+                    let name = format!("w{w}k{i:05}");
+                    let seq = engine
+                        .submit(eventual_put(name.as_bytes(), b"v"))
+                        .expect("the write commits");
+                    let horizon = engine.snapshot_seq();
+                    assert!(
+                        horizon >= seq,
+                        "{name} returned at sequence {seq} with the horizon at {horizon}"
+                    );
+                }
+            });
+        }
+    });
+}
+
 #[test]
 fn writers_make_progress_with_more_threads_than_ring_slots() {
     let dir = TempDir::new().unwrap();

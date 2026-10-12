@@ -43,6 +43,30 @@ fn more_abandoned_reservations_than_the_ring_holds_do_not_wedge_it() {
     );
 }
 
+/// A lap of reservations voided by their owners before either frontier
+/// reached them, as an owner that finds its cell busy voids its own. The
+/// next lap's commit takes one of their cells, and the frontiers, reaching
+/// an index whose cell has moved on, pass it (R6).
+#[test]
+fn a_void_slot_whose_cell_took_the_next_lap_is_passed_by_both_frontiers() {
+    let dir = TempDir::new().unwrap();
+    let engine = open_engine(&dir);
+    let ring = &engine.pipe().unwrap().ring;
+    let first = ring.reserve();
+    for _ in 1..ring.capacity() {
+        ring.reserve();
+    }
+    for index in first..first + ring.capacity() {
+        assert!(ring.void(index), "a reserved slot is voided");
+    }
+    assert_eq!(ring.decided(), first - 1, "no frontier has moved");
+    let seq = engine
+        .submit(durable_put(b"later", b"value"))
+        .expect("a commit whose cell held a void slot commits");
+    assert_eq!(seq, 1);
+    assert!(engine.pipeline_is_idle());
+}
+
 /// A failure found with the ring full. No cell is free, so the rollback
 /// cannot wait for a slot of its own: it runs outside the ring, fails every
 /// unpublished commit, and the commit that found the ring full goes on.
