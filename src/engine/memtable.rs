@@ -23,6 +23,10 @@ use super::skiplist::{ArenaSkipList, InsertHint, NodeRef};
 use crate::DbSlice;
 use crate::sync::internal::Arc;
 use tombstones::TombstoneLog;
+/// Test seam: what this thread's appends of range tombstones have cost
+/// since the last call, as (indexes built, slots looked at for a duplicate).
+#[cfg(all(test, not(loom)))]
+pub(crate) use tombstones::work_since_last_call as range_tombstone_work;
 
 mod key_walk;
 mod tombstones;
@@ -242,6 +246,15 @@ impl MemTable {
     pub(crate) fn delete_range(&self, start: &[u8], end: &[u8], seq: u64) {
         self.range_tombstones
             .push(RangeTombstone::new(start.to_vec(), end.to_vec(), seq));
+    }
+
+    /// Record every tombstone of `batch`: what [`Self::delete_range`] does
+    /// for each, at a cost linear in the batch, where one call a tombstone
+    /// is quadratic for tombstones that share a sequence
+    /// (`TombstoneLog::extend`). Recovery uses it, for the range tombstones a
+    /// log holds and for the ones an open copies out of the tables it moved.
+    pub(crate) fn delete_ranges(&self, batch: Vec<RangeTombstone>) {
+        self.range_tombstones.extend(batch);
     }
 
     /// Whether this memtable holds any range tombstone. One acquire load.

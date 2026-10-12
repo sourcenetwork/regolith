@@ -20,6 +20,7 @@ use super::legacy_overlap_tests::{ids, manifest, options, record_move};
 use super::*;
 use crate::column_family::{DEFAULT_CF_ID, prefix_key};
 use crate::engine::internal_key::{VALUE_TYPE_MERGE, VALUE_TYPE_VALUE, encode_internal_key};
+use crate::engine::memtable::range_tombstone_work;
 use crate::engine::range_tombstone::{RangeTombstone, max_covering_seq};
 use crate::engine::seal::test_keys::{TestKeys, keyring};
 use crate::engine::sstable::SsTableWriter;
@@ -724,6 +725,193 @@ fn a_manifest_first_opened_with_a_keyring_is_sealed_by_the_edit_that_records_the
         crate::Error::from(open(None).map(|_| ()).unwrap_err()),
         crate::Error::KeyProviderRequired
     ));
+}
+
+/// Range tombstones the ingested table of [`many_range_deletes`] holds.
+const MANY: usize = 4_096;
+
+/// Level 1 overlaps, and its ingested table carries [`MANY`] range
+/// tombstones at its one sequence, 20, no two touching:
+/// `[d00000a, d00000m)`, `[d00001a, d00001m)`, and so on. The older table
+/// beside it holds `d00007c` and `d04000c`, which two of them cover, and
+/// `d00007p`, which none does.
+fn many_range_deletes() -> TempDir {
+    let (dir, sst_dir) = empty_db();
+    let old = table_of(
+        &sst_dir,
+        8,
+        &[
+            (b"d00007c", 10, VALUE_TYPE_VALUE, b"old"),
+            (b"d00007p", 10, VALUE_TYPE_VALUE, b"kept"),
+            (b"d04000c", 10, VALUE_TYPE_VALUE, b"old"),
+            (b"x", 10, VALUE_TYPE_VALUE, b"x"),
+        ],
+        &[],
+    );
+    let ranges: Vec<(Vec<u8>, Vec<u8>)> = (0..MANY)
+        .map(|i| {
+            (
+                format!("d{i:05}a").into_bytes(),
+                format!("d{i:05}m").into_bytes(),
+            )
+        })
+        .collect();
+    let tombstones: Vec<Tombstone<'_>> = ranges
+        .iter()
+        .map(|(start, end)| (start.as_slice(), end.as_slice(), 20))
+        .collect();
+    let ingest = table_of(
+        &sst_dir,
+        3,
+        &[(b"z", 20, VALUE_TYPE_VALUE, b"ingested")],
+        &tombstones,
+    );
+    manifest(
+        dir.path(),
+        &[
+            add(1, old),
+            add(1, ingest),
+            ManifestRecord::SetNextFileId(101),
+            ManifestRecord::SetLastSeq(20),
+            ManifestRecord::SetMinWalId(5),
+        ],
+    );
+    dir
+}
+
+/// What every open of [`many_range_deletes`] must read.
+fn assert_many_reads(db: &Db, when: &str) {
+    assert_eq!(get(db, b"d00007c"), None, "{when}");
+    assert_eq!(get(db, b"d04000c"), None, "{when}");
+    assert_eq!(get(db, b"d00007p").as_deref(), Some(&b"kept"[..]), "{when}");
+    assert_eq!(get(db, b"x").as_deref(), Some(&b"x"[..]), "{when}");
+    assert_eq!(
+        get_at(db, b"d00007c", 19).as_deref(),
+        Some(&b"old"[..]),
+        "{when}"
+    );
+}
+
+/// The copy is one batch, whatever its size: the open that moves the
+/// tables builds one index over the range tombstones it copies and walks
+/// the memtable for no duplicate, and so does the open after it, which
+/// finds them in the log. Counted, not timed: one tombstone at a time,
+/// [`MANY`] of them at one sequence build an index every sixteen and walk
+/// the whole log for each, about eight million slot reads.
+#[test]
+fn an_open_copies_thousands_of_range_deletes_as_one_batch_and_the_next_replays_them_as_one() {
+    let dir = many_range_deletes();
+    range_tombstone_work();
+    let db = Db::open(dir.path(), options()).unwrap();
+    assert_eq!(
+        range_tombstone_work(),
+        (1, 0),
+        "(indexes built, slots walked for a duplicate) by the open that copies"
+    );
+    assert_eq!(
+        db.engine()
+            .view
+            .load()
+            .active
+            .clone_range_tombstones()
+            .len(),
+        MANY
+    );
+    assert_many_reads(&db, "the open that copies");
+    // Copied while it is open, before anything is flushed: the log the
+    // open wrote holds every one of them.
+    let copy = copy_of(dir.path());
+    drop(db);
+
+    range_tombstone_work();
+    let db = Db::open(copy.path(), options()).unwrap();
+    assert_eq!(
+        range_tombstone_work(),
+        (1, 0),
+        "(indexes built, slots walked for a duplicate) by the open that replays"
+    );
+    assert_eq!(
+        db.get_int_property("regolith.manifest.tables_demoted"),
+        Some(0)
+    );
+    assert_eq!(
+        db.engine()
+            .view
+            .load()
+            .active
+            .clone_range_tombstones()
+            .len(),
+        MANY
+    );
+    assert_many_reads(&db, "the open that replays");
+}
+
+/// An open cut off before its move was recorded leaves a log that already
+/// holds the copy. The next open replays it and copies again: each
+/// tombstone is in the memtable once, by one look at what it holds.
+#[test]
+fn a_copy_the_log_already_brought_is_not_made_twice() {
+    let dir = many_range_deletes();
+    let sst_dir = dir.path().join("sst");
+    let tombstones = |vs: &mut VersionSet| vs.take_demotion().unwrap().range_deletes;
+    let mut vs = VersionSet::open(dir.path(), &sst_dir).unwrap();
+    let copied = tombstones(&mut vs);
+    assert_eq!(copied.len(), MANY);
+    drop(vs);
+
+    let memtable =
+        crate::engine::memtable::MemTable::new(&crate::engine::memtable::MemTableConfig::new(
+            crate::options::ArenaProfile::SERVER,
+            1 << 20,
+            2,
+        ))
+        .unwrap();
+    // What the replay of that log brings, then the copy of the same open.
+    memtable.delete_ranges(copied.clone());
+    let once = memtable.approximate_size();
+    range_tombstone_work();
+    memtable.delete_ranges(copied);
+    assert_eq!(range_tombstone_work(), (0, 0));
+    assert_eq!(memtable.approximate_size(), once);
+    assert_eq!(memtable.clone_range_tombstones().len(), MANY);
+}
+
+/// What bounds the copy: its bytes count toward the memtable's size, so
+/// a memtable the copy filled past the write buffer is sealed by the first
+/// write, and flushed like any other. Every read stays what it was.
+#[test]
+fn the_copy_counts_toward_the_memtable_and_the_first_write_past_the_buffer_seals_it() {
+    let dir = many_range_deletes();
+    let small = options().write_buffer_size(64 * 1024);
+    let db = Db::open(dir.path(), small).unwrap();
+    let copied = db.engine().active_memtable_size();
+    assert!(
+        copied > 64 * 1024,
+        "the copy of {MANY} range tombstones counts {copied} bytes"
+    );
+    assert!(db.engine().view.load().active.has_range_tombstones());
+    assert_many_reads(&db, "before a write");
+
+    crate::through_stalls(|| db.put(b"new", b"write")).unwrap();
+    assert!(
+        !db.engine().view.load().active.has_range_tombstones(),
+        "the first write did not seal the memtable the copy had filled"
+    );
+    assert!(db.engine().active_memtable_size() < 64 * 1024);
+    assert_many_reads(&db, "after the write that sealed it");
+    assert_eq!(get(&db, b"new").as_deref(), Some(&b"write"[..]));
+
+    db.flush().unwrap();
+    assert!(db.engine().view.load().frozen.is_empty());
+    assert_many_reads(&db, "after the flush");
+    db.close().unwrap();
+    drop(db);
+    let db = Db::open(dir.path(), options()).unwrap();
+    assert_many_reads(&db, "after a reopen");
+    assert!(
+        !db.engine().view.load().active.has_range_tombstones(),
+        "flushed, so no later open replays the copy"
+    );
 }
 
 fn tombstone(start: &[u8], end: &[u8], seq: u64) -> RangeTombstone {

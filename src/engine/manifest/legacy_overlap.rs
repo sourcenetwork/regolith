@@ -132,7 +132,7 @@ impl Repair {
 /// A compaction clips a tombstone to each table it writes, so one
 /// `delete_range` can reach here as a piece per table. Joined, the pieces
 /// delete exactly what they deleted apart: the same keys, at the same
-/// sequence. Oldest first is the order a memtable takes them cheapest in.
+/// sequence.
 pub(super) fn coalesced(mut tombstones: Vec<RangeTombstone>) -> Vec<RangeTombstone> {
     sort_dedup_tombstones(&mut tombstones);
     // Stable, so each sequence keeps its ranges in start order.

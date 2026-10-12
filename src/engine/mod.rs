@@ -688,7 +688,7 @@ impl RegolithEngine {
         }
         // Into the memtable the new log is written from just below, so
         // they are durable there before the edit that records the move.
-        let latest_seq = hoist_range_deletes(demotion.as_ref(), &memtable, latest_seq);
+        let (moved, latest_seq) = hoist_range_deletes(demotion, &memtable, latest_seq);
 
         let wal_id = next_wal_id(version.next_file_id, &wal_files);
         let wal_path = wal_dir.join(wal_filename(wal_id));
@@ -723,11 +723,10 @@ impl RegolithEngine {
                 VersionEdit::SetMinWalId(wal_id),
             ])
         })?;
-        let tables_demoted_at_open = demotion.as_ref().map_or(0, |demotion| demotion.tables);
-        if let Some(demotion) = &demotion {
-            report_demoted_tables(&options, &manifest_path, demotion, false);
+        let tables_demoted_at_open = moved.map_or(0, |moved| moved.tables);
+        if let Some(moved) = moved {
+            report_demoted_tables(&options, &manifest_path, moved, false);
         }
-        drop(demotion);
         let removed =
             log_retirement::remove_below(&*env, &wal_dir, wal_id, options.statistics.as_deref());
         let retired_logs = RetiredLogs::new(wal_dir.clone(), !removed);
@@ -908,10 +907,6 @@ impl RegolithEngine {
         // the manifest keeps them, and every open moves them again until a
         // read-write one records the move.
         let demotion = version_set.take_demotion();
-        if let Some(demotion) = &demotion {
-            report_demoted_tables(&options, version_set.manifest_path(), demotion, true);
-        }
-        let tables_demoted_at_open = demotion.as_ref().map_or(0, |demotion| demotion.tables);
         let version = version_set.current();
         let latest_seq = version.last_seq;
 
@@ -930,8 +925,11 @@ impl RegolithEngine {
         if let Some((path, tail)) = discarded {
             report_discarded_tail(&options, &path, tail, latest_seq);
         }
-        let latest_seq = hoist_range_deletes(demotion.as_ref(), &memtable, latest_seq);
-        drop(demotion);
+        let (moved, latest_seq) = hoist_range_deletes(demotion, &memtable, latest_seq);
+        let tables_demoted_at_open = moved.map_or(0, |moved| moved.tables);
+        if let Some(moved) = moved {
+            report_demoted_tables(&options, version_set.manifest_path(), moved, true);
+        }
 
         let cache = Arc::new(
             BlockCache::with_config(
