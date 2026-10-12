@@ -8659,7 +8659,12 @@ mod tests {
     }
 
     /// Wait, with a deadline and a bounded backoff, until the background
-    /// has written L0 up to `files` tables.
+    /// has written L0 up to `files` tables, a count at which the caller's
+    /// options stall writes, and a write meets that stall.
+    ///
+    /// The table count alone runs ahead of the stall: a flush publishes its
+    /// table first and refreshes the level writers check after it, so a
+    /// write between the two is still admitted.
     pub(crate) fn wait_for_l0_files(db: &Db, files: u64) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
         let mut pause = std::time::Duration::from_millis(1);
@@ -8667,10 +8672,11 @@ mod tests {
             .get_int_property("regolith.num-files-at-level0")
             .unwrap_or(0)
             < files
+            || db.engine.admit_write(true).is_ok()
         {
             assert!(
                 std::time::Instant::now() < deadline,
-                "the background never wrote L0 up to {files} tables"
+                "the background never wrote L0 up to {files} tables and stalled writes"
             );
             std::thread::sleep(pause);
             pause = (pause * 2).min(std::time::Duration::from_millis(50));
@@ -8766,8 +8772,6 @@ mod tests {
     #[test]
     fn a_stopped_write_returns_a_wait_the_clearing_compaction_completes() {
         use std::sync::Arc;
-        use std::thread;
-        use std::time::{Duration, Instant};
 
         // Stop writes entirely once L0 hits 2 files.
         let opts = Options::default()
@@ -8795,14 +8799,7 @@ mod tests {
                 break;
             }
         }
-        let deadline = Instant::now() + Duration::from_secs(60);
-        let mut pause = Duration::from_millis(1);
-        while l0() < 2 && Instant::now() < deadline {
-            thread::sleep(pause);
-            pause = (pause * 2).min(Duration::from_millis(50));
-        }
-        let l0 = l0();
-        assert!(l0 >= 2, "precondition: need L0 >= 2, got {l0}");
+        wait_for_l0_files(&db, 2);
 
         let stall = match db.put(b"stopkey", b"stopval") {
             Err(Error::WouldBlock(WouldBlock::Stall(stall))) => stall,
