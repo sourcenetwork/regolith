@@ -44,6 +44,12 @@
 //!   owner registered it as about to idle does so, once.
 //! - **No thread is added.** Each thread does its own I/O when it polls; the
 //!   blocking calls read inline as before.
+//! - **A timed wait is ended by its queue's poll and by nothing else.** The
+//!   pause a `transact_async` attempt takes before a re-run, when its policy
+//!   asks for one, is over at the first poll that finds the database's clock
+//!   at its due time. No thread sleeps for it and none is woken for it: each
+//!   poll says how long until the earliest one ([`IoProgress::wake_in`]), and
+//!   an owner that idles polls again by then.
 //! - **A poll never waits on another thread.** It reads the device for the
 //!   units it runs, and nothing else. Under
 //!   [`Options::max_open_files`](crate::Options::max_open_files) a unit that
@@ -61,6 +67,7 @@
 pub(crate) mod completion;
 mod queue;
 mod ticket;
+mod timers;
 pub(crate) mod wait;
 
 pub use queue::IoQueue;
@@ -168,13 +175,27 @@ impl IoBudget {
 pub struct IoProgress {
     /// Reads this queue waited on that finished during the poll, each counted
     /// once however many of the queue's reads waited on it, whichever thread
-    /// ran it.
+    /// ran it; and the timed waits the poll found due.
     pub completed: usize,
     /// The queue still waits on reads. Poll again, or register
     /// [`IoQueue::idle_waker`] and idle: a completion from another thread
     /// wakes the owner, and a read only this thread can run wakes it at once.
     pub more_pending: bool,
+    /// How long until the earliest timed wait on this queue is due, by the
+    /// clock of the database's [`Env`](crate::Env); `None` when it holds
+    /// none. A timed wait is the pause a
+    /// [`transact_async`](crate::OptimisticTransactionDb::transact_async)
+    /// attempt takes before a re-run when its
+    /// [`RetryPolicy`](crate::RetryPolicy) asks for one.
+    ///
+    /// Nothing wakes an idle owner for it: only a poll completes a timed
+    /// wait. An owner that idles must poll again within this long. A wait
+    /// recorded while the owner idles wakes it, once, so the poll after
+    /// that reports it.
+    pub wake_in: Option<std::time::Duration>,
 }
 
 #[cfg(test)]
 mod tests;
+#[cfg(all(test, not(loom)))]
+mod timer_tests;

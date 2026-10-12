@@ -1254,6 +1254,7 @@ impl RegolithEngine {
         crate::IoQueue::open(
             Arc::clone(&self.cache),
             self.options.block_size.saturating_mul(IO_QUEUE_BLOCKS),
+            Arc::clone(&self.env),
         )
     }
 

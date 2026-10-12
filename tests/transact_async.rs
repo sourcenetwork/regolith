@@ -243,3 +243,259 @@ fn the_future_outlives_the_policy_it_was_made_from() {
         Some(b"pessimistic".to_vec())
     );
 }
+
+/// A task's waker that says whether it was woken since it was last asked.
+#[derive(Default)]
+struct Woken(std::sync::atomic::AtomicBool);
+
+impl std::task::Wake for Woken {
+    fn wake(self: Arc<Self>) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
+impl Woken {
+    fn take(&self) -> bool {
+        self.0.swap(false, Ordering::SeqCst)
+    }
+}
+
+/// Poll `attempt`, and its queue between polls, for as long as either makes
+/// progress. `Pending` means the attempt waits on something no poll of the
+/// queue completes yet. Nothing here blocks or reads a clock.
+fn drive<F: Future>(
+    mut attempt: std::pin::Pin<&mut F>,
+    queue: &mut regolith::IoQueue,
+    woken: &Arc<Woken>,
+) -> std::task::Poll<F::Output> {
+    let waker = std::task::Waker::from(Arc::clone(woken));
+    let mut cx = std::task::Context::from_waker(&waker);
+    loop {
+        if let std::task::Poll::Ready(output) = attempt.as_mut().poll(&mut cx) {
+            return std::task::Poll::Ready(output);
+        }
+        let progress = queue.poll(regolith::IoBudget::ALL);
+        if progress.completed == 0 && !woken.take() {
+            return std::task::Poll::Pending;
+        }
+    }
+}
+
+/// An in-memory database on a clock only the test moves, with its queue.
+fn on_a_stopped_clock(name: &str) -> (regolith::MemEnv, OptimisticTransactionDb) {
+    let env = regolith::MemEnv::new();
+    let shared: Arc<dyn regolith::Env> = Arc::new(env.clone());
+    let db = OptimisticTransactionDb::open(name, Options::memory().env(shared)).unwrap();
+    (env, db)
+}
+
+/// The wait a backoff takes between attempts blocks nothing: it is a wait
+/// the queue completes, at the first poll that finds the environment's clock
+/// past the delay, and at no poll before. Until then every poll says how long
+/// the owner may idle.
+#[test]
+fn a_backoff_between_attempts_is_a_wait_the_queue_completes() {
+    use std::task::Poll;
+    use std::time::Duration;
+
+    let (env, db) = on_a_stopped_clock("transact-async-backoff");
+    let mut queue = db.db().io_queue();
+    let woken = Arc::new(Woken::default());
+    let runs = AtomicUsize::new(0);
+    let policy = RetryPolicy::new(4).backoff(Duration::from_millis(10), Duration::from_millis(15));
+    let mut attempt = std::pin::pin!(db.transact_async(queue.id(), &policy, async |txn, _| {
+        let run = runs.fetch_add(1, Ordering::SeqCst);
+        if run < 2 {
+            // A rival writes the key first: this attempt loses.
+            db.db().put(b"k", format!("rival-{run}").as_bytes())?;
+        }
+        txn.put(b"k", b"mine")?;
+        Ok::<_, regolith::TransactionError>(run)
+    }));
+
+    // The first attempt lost. The attempt now waits out the first delay, and
+    // no number of polls ends that while the clock stands still.
+    assert!(drive(attempt.as_mut(), &mut queue, &woken).is_pending());
+    assert_eq!(runs.load(Ordering::SeqCst), 1);
+    for _ in 0..3 {
+        let progress = queue.poll(regolith::IoBudget::ALL);
+        assert_eq!(progress.completed, 0);
+        assert!(progress.more_pending);
+        assert_eq!(progress.wake_in, Some(Duration::from_millis(10)));
+        assert!(drive(attempt.as_mut(), &mut queue, &woken).is_pending());
+    }
+    assert_eq!(runs.load(Ordering::SeqCst), 1);
+
+    // One microsecond short of the delay: still waiting, and told how long.
+    env.advance_micros(9_999);
+    let progress = queue.poll(regolith::IoBudget::ALL);
+    assert_eq!(
+        (progress.completed, progress.wake_in),
+        (0, Some(Duration::from_micros(1)))
+    );
+    assert!(!woken.take(), "a wait that is not over wakes no task");
+
+    // At the delay the poll completes the wait and wakes the task, which
+    // runs again, loses again, and waits out twice the delay, held to the
+    // policy's bound: 15 ms, not 20.
+    env.advance_micros(1);
+    let progress = queue.poll(regolith::IoBudget::ALL);
+    assert_eq!((progress.completed, progress.wake_in), (1, None));
+    assert!(
+        woken.take(),
+        "the poll that completed the wait woke its task"
+    );
+    assert!(drive(attempt.as_mut(), &mut queue, &woken).is_pending());
+    assert_eq!(runs.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        queue.poll(regolith::IoBudget::ALL).wake_in,
+        Some(Duration::from_millis(15))
+    );
+
+    // Past the second delay the third run finds no rival and commits.
+    env.advance_micros(15_000);
+    match drive(attempt.as_mut(), &mut queue, &woken) {
+        Poll::Ready(outcome) => assert_eq!(outcome.unwrap().0, 2),
+        Poll::Pending => panic!("the wait was over and the attempt did not go on"),
+    }
+    assert_eq!(runs.load(Ordering::SeqCst), 3);
+    assert_eq!(db.db().get(b"k").unwrap(), Some(b"mine".to_vec()));
+    let idle = queue.poll(regolith::IoBudget::ALL);
+    assert_eq!((idle.more_pending, idle.wake_in), (false, None));
+}
+
+/// Without a backoff a re-run waits for nothing: the attempt runs to its end
+/// with the clock standing still. And once the policy is spent the last
+/// conflict comes back at once, with no wait after it.
+#[test]
+fn without_a_backoff_and_after_the_last_attempt_nothing_waits() {
+    use std::task::Poll;
+    use std::time::Duration;
+
+    let (env, db) = on_a_stopped_clock("transact-async-no-wait");
+    let mut queue = db.db().io_queue();
+    let woken = Arc::new(Woken::default());
+    let losing = async |txn: &mut regolith::Transaction, _: Option<&regolith::Conflict>| {
+        db.db().put(b"k", b"rival")?;
+        txn.put(b"k", b"mine")?;
+        Ok::<_, regolith::TransactionError>(())
+    };
+
+    let plain = RetryPolicy::new(3);
+    let attempt = std::pin::pin!(db.transact_async(queue.id(), &plain, losing));
+    assert!(matches!(
+        drive(attempt, &mut queue, &woken),
+        Poll::Ready(Err(TransactError::Exhausted(_)))
+    ));
+
+    // Two attempts, one wait between them, none after the second.
+    let policy = RetryPolicy::new(2).backoff(Duration::from_millis(1), Duration::from_millis(1));
+    let mut attempt = std::pin::pin!(db.transact_async(queue.id(), &policy, losing));
+    assert!(drive(attempt.as_mut(), &mut queue, &woken).is_pending());
+    env.advance_micros(1_000);
+    assert!(matches!(
+        drive(attempt.as_mut(), &mut queue, &woken),
+        Poll::Ready(Err(TransactError::Exhausted(_)))
+    ));
+    assert_eq!(queue.poll(regolith::IoBudget::ALL).wake_in, None);
+}
+
+/// A policy whose one re-run comes an hour after the first attempt.
+fn an_hour() -> RetryPolicy {
+    let hour = std::time::Duration::from_secs(3_600);
+    RetryPolicy::new(2).backoff(hour, hour)
+}
+
+/// Where the environment has no clock a delay cannot be measured, so the
+/// wait is over at the queue's next poll.
+#[test]
+fn where_the_environment_has_no_clock_the_wait_is_over_at_the_next_poll() {
+    let (env, db) = on_a_stopped_clock("transact-async-no-clock");
+    env.set_clocks(None, None);
+    let mut queue = db.db().io_queue();
+    let woken = Arc::new(Woken::default());
+    let runs = AtomicUsize::new(0);
+    let attempt = std::pin::pin!(db.transact_async(queue.id(), &an_hour(), async |txn, _| {
+        if runs.fetch_add(1, Ordering::SeqCst) == 0 {
+            db.db().put(b"k", b"rival")?;
+        }
+        txn.put(b"k", b"mine")?;
+        Ok::<_, regolith::TransactionError>(())
+    }));
+    assert!(matches!(
+        drive(attempt, &mut queue, &woken),
+        std::task::Poll::Ready(Ok(_))
+    ));
+    assert_eq!(runs.load(Ordering::SeqCst), 2);
+}
+
+/// A queue dropped while an attempt waits on it completes the wait, since
+/// nothing else would: the task is woken and goes on, instead of waiting for
+/// a poll that can no longer come.
+#[test]
+fn a_queue_dropped_under_a_waiting_attempt_ends_the_wait() {
+    let (_env, db) = on_a_stopped_clock("transact-async-dropped-queue");
+    let mut queue = db.db().io_queue();
+    let woken = Arc::new(Woken::default());
+    let runs = AtomicUsize::new(0);
+    let mut attempt = std::pin::pin!(db.transact_async(queue.id(), &an_hour(), async |txn, _| {
+        if runs.fetch_add(1, Ordering::SeqCst) == 0 {
+            db.db().put(b"k", b"rival")?;
+        }
+        txn.put(b"k", b"mine")?;
+        Ok::<_, regolith::TransactionError>(())
+    }));
+    assert!(drive(attempt.as_mut(), &mut queue, &woken).is_pending());
+    assert_eq!(runs.load(Ordering::SeqCst), 1);
+
+    drop(queue);
+    assert!(
+        woken.take(),
+        "the drop completed the wait and woke its task"
+    );
+    let waker = std::task::Waker::from(Arc::clone(&woken));
+    let mut cx = std::task::Context::from_waker(&waker);
+    assert!(
+        attempt.as_mut().poll(&mut cx).is_ready(),
+        "the attempt went on without the queue"
+    );
+    assert_eq!(runs.load(Ordering::SeqCst), 2);
+}
+
+/// On a real clock, on a thread with nothing else to run: `block_on` idles
+/// through the wait and no longer, and the re-run starts no sooner than the
+/// policy's delay after the attempt that lost.
+#[test]
+fn block_on_idles_through_a_backoff_and_runs_the_attempt_again() {
+    let dir = TempDir::new().unwrap();
+    let options = Options::default();
+    let clock = Arc::clone(options.get_env());
+    let db = OptimisticTransactionDb::open(dir.path(), options).unwrap();
+    let mut queue = db.db().io_queue();
+    let starts = std::sync::Mutex::new(Vec::new());
+    let delay = std::time::Duration::from_millis(3);
+    let policy = RetryPolicy::new(3).backoff(delay, delay);
+    queue
+        .block_on(db.transact_async(queue.id(), &policy, async |txn, _| {
+            let run = {
+                let mut starts = starts.lock().unwrap();
+                starts.push(clock.now_micros().unwrap());
+                starts.len()
+            };
+            if run < 3 {
+                db.db().put(b"k", format!("rival-{run}").as_bytes())?;
+            }
+            txn.put(b"k", b"mine")?;
+            Ok::<_, regolith::TransactionError>(())
+        }))
+        .unwrap();
+    let starts = starts.into_inner().unwrap();
+    assert_eq!(starts.len(), 3);
+    for pair in starts.windows(2) {
+        assert!(
+            pair[1] - pair[0] >= 3_000,
+            "a re-run came {} µs on",
+            pair[1] - pair[0]
+        );
+    }
+}
