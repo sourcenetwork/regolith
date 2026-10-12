@@ -29,11 +29,12 @@
 \* a reader whose cursor moves past an entry it never saw; the same message
 \* appended twice although it carried a "once key".
 \*
-\* What this model shows: over every interleaving of a few writers, commit
-\* groups, refused commits, write-ahead-log errors and reads, none of those
-\* happens. It supersedes defradb.rs #1911 (its five invariants and four REDs
-\* are ported here under generic names) and adds density, at-most-once keys,
-\* numbering at commit, group commit, aborts, a failed group, the Phase 7
+\* What this model shows: over every interleaving of a few writers, groups
+\* of commits, refused commits, write-ahead-log errors and reads, none of
+\* those happens. It supersedes defradb.rs #1911 (its five invariants and
+\* four REDs are ported here under generic names) and adds density,
+\* at-most-once keys, numbering at commit, commits decided before the ones
+\* ahead of them are published, aborts, a failed group, the Phase 7
 \* pipeline and the transaction's own view. Crashes per durability mode are
 \* in CommitOrderedAppendCrash.tla.
 \*
@@ -60,15 +61,21 @@
 \*     transaction as a PendingAppend (src/transaction/append.rs). Nothing is
 \*     read or validated for it, and the transaction never sees its own
 \*     appends: their positions do not exist until commit.
-\*   The ordered step         the group-commit leader, holding the pipeline
-\*     mutex (RegolithEngine::lock_pipeline, src/engine/commit/mod.rs), takes
-\*     the queued commits in group order. For each member it first validates
-\*     the member's reads (RegolithEngine::validate,
-\*     src/engine/commit/txn.rs); only a member that passes gets a sequence
-\*     and positions (AppendOrder::number, src/engine/commit/append.rs). The
-\*     head and the once keys are read from the view plus the earlier
-\*     members of the same group: nothing is cached, so a group that fails
-\*     leaves no trace.
+\*   The ordered step         every commit takes a slot of the commit ring,
+\*     and the slots are decided in ring order by whichever thread reaches
+\*     them (RegolithEngine::decide_work, src/engine/commit/pipeline.rs).
+\*     Deciding a commit first validates its reads
+\*     (RegolithEngine::validate, src/engine/commit/txn.rs); only a commit
+\*     that passes gets a sequence and positions (AppendOrder::number,
+\*     src/engine/commit/append.rs). The head and the once keys are read
+\*     from the view, which holds every commit decided before this one (a
+\*     slot is in the memtable before the next is decided): nothing is
+\*     cached, so commits a failure discards leave no trace.
+\*     A GROUP, in this model, is a run of commits decided one after
+\*     another in one step, before any of them is written and published:
+\*     neighbouring slots of the ring. Each member reads what the earlier
+\*     members left, as each slot reads what the earlier slots left. The
+\*     engine has no leader and forms no group; the word is the model's.
 \*   Positions                the next position is head + 1. An append whose
 \*     once key already holds a position appends nothing. Each assigned
 \*     append writes entry_key(p) = entry, once_key = p and head_key = p in
@@ -191,11 +198,12 @@ CONSTANTS
   \* The writers whose commit may be refused because of some other key they read (their validation
   \* may fail).
   MayAbort,
-  \* The largest number of commits the leader takes into one commit group (MAX_GROUP_MEMBERS in
-  \* src/engine/commit/mod.rs is the engine's bound).
+  \* The largest number of commits decided in one step, one after another: a group. The engine
+  \* decides one slot at a time and has no such bound; the bound keeps the model small.
   GroupSize,
-  \* How many decided groups may be waiting to be written at once: 1 is the pipeline mutex of
-  \* src/engine/commit/mod.rs, 2 is the lock-free pipeline of plan 4.7.
+  \* How many decided groups may be waiting to be written and published at once. In the engine
+  \* any number of decided slots may wait (the commit ring, src/engine/commit/ring.rs); 1 and 2
+  \* are the two depths checked here.
   Depth,
   \* The largest number of write-ahead-log errors the model injects.
   MaxWalErrors,
@@ -233,7 +241,7 @@ ASSUME \A A, B \in {Singles, SharedOnce, Doubles, RepeatOnce, Silent} :
          \* (two different shapes share no writer)
          A # B => A \cap B = {}
 \* Only writers can abort; a group holds at least one member; the pipeline
-\* is today's mutex or two deep; the mode and mutant are ones named above.
+\* is one or two groups deep; the mode and mutant are ones named above.
 \* Only a writer can be one that may abort.
 ASSUME MayAbort \subseteq Writers
 \* A group has at least one member, the pipeline is one or two deep, and the error budget is a
@@ -246,7 +254,7 @@ ASSUME Mutant \in {"none", "LatestBound", "ViewOnlyHead", "OnceFromView",
                    "AssignBeforeValidation", "HeadCache", "PublishedView"}
 \* A mutant is a misuse of the design, so it runs on the design.
 ASSUME Mutant # "none" => Mode = "Append"
-\* The rejected designs ran under a commit mutex, with #1911's writer shapes:
+\* The rejected designs ran one commit at a time, with #1911's writer shapes:
 \* stamps on writers appending at most once, no once keys where the design
 \* had none.
 ASSUME Mode # "Append" => Depth = 1
@@ -283,8 +291,8 @@ VARIABLES
   \* src/engine/read_horizon.rs).
   vseq,
   \* The groups already decided (validated and numbered) but not yet written and published, oldest
-  \* first. In the engine this is the group the leader is writing (AppendOrder holds its running
-  \* head, src/engine/commit/append.rs).
+  \* first. In the engine these are the slots decided and not yet published (an AppendOrder holds
+  \* one commit's running head, src/engine/commit/append.rs).
   inflight,
   \* Detached design only: the committed appends <<w, i>> that have no number yet.
   pending,
@@ -455,7 +463,7 @@ GroupStart ==
    \* no rows, no pending appends, no members, no aborts, and the sequences as recorded so far.
    rows |-> {}, pend |-> {}, members |-> <<>>, aborted |-> {}, cseq |-> cseq]
 
-\* The groups the leader may form from the writers in S: one to GroupSize
+\* The groups that may be decided from the writers in S: one to GroupSize
 \* distinct writers, in any order.
 Groups(S) ==
   \* For each size n from 1 to GroupSize: every list of n different writers of S.
@@ -643,8 +651,7 @@ Rank(e) ==
 
 \* Detached only: #1897's second commit. It numbers every pending append
 \* after the head by its rank, and writes the new head. It is a durable
-\* commit of its own, under the commit mutex, so it waits for nothing in
-\* flight.
+\* commit of its own, with nothing else in flight, so it waits for nothing.
 Sequence ==
   \* Only the Detached design has this step.
   /\ Mode = "Detached"
@@ -711,12 +718,12 @@ Read ==
   \* The engine's state does not change.
   /\ UNCHANGED engineVars
 
-\* Every step the system can take. The leader forms a group from open
-\* writers and picks which of them fail validation on another key.
+\* Every step the system can take. A group is formed from open writers,
+\* and which of them fail validation on another key is picked.
 Next ==
   \* A writer begins.
   \/ \E w \in Writers : Begin(w)
-  \* The leader forms a group g from the open writers,
+  \* A group g is formed from the open writers,
   \/ \E g \in Groups({w \in Writers : phase[w] = "open"}) :
        \* picks which members F fail validation on another key, and decides the group.
        \E F \in SUBSET (MayAbort \cap Range(g)) : Decide(g, F)

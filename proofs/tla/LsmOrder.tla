@@ -90,10 +90,12 @@
 \*     overlap (Version::find_overlap, "manifest lists tables ... with
 \*     overlapping key ranges"). The demotion below (Legacy = "Demote") is
 \*     the plan's answer (E14, D13), modelled here ahead of the code.
-\*   rotate_if_full, seal_active      src/engine/mod.rs (Freeze here)
-\*     A writer whose commit group fills the active memtable seals it under
-\*     the pipeline mutex: it becomes the newest frozen memtable and a fresh
-\*     one takes the writes. The flush is not done there (E9). A rotation
+\*   rotate, Ordered::seal            src/engine/commit/turn.rs, ordered.rs
+\*                                    (Freeze here)
+\*     A write whose turn comes with the active memtable full has the
+\*     rotation run first, as an ordered unit of the commit ring: the
+\*     memtable becomes the newest frozen one and a fresh one takes the
+\*     writes. The flush is not done there (E9). A rotation
 \*     that would leave more than max_write_buffer_number memtables first
 \*     writes the oldest frozen one out itself: that is the bound MaxImm.
 \*   Flusher::flush_oldest            src/engine/flush.rs (FlushInstall)
@@ -519,9 +521,10 @@ Flush ==
   \* Nothing else changes.
   /\ UNCHANGED <<seq, imm, lv, opened, owed>>
 
-\* Rotation freezes the memtable (seal_active, under the pipeline mutex): it
-\* becomes the newest frozen memtable, still read before L0, and a new,
-\* empty memtable takes the writes. Nothing is flushed here (E9).
+\* Rotation freezes the memtable (Ordered::seal, in an ordered unit of the
+\* commit ring): it becomes the newest frozen memtable, still read before
+\* L0, and a new, empty memtable takes the writes. Nothing is flushed here
+\* (E9).
 Freeze ==
   \* This configuration keeps frozen memtables.
   /\ MaxImm > 0
@@ -542,8 +545,8 @@ Freeze ==
 \* whichever flush finished first.
 \*
 \* The table and the retirement are ONE publication in the real code
-\* (`versions.apply` then `retire_with_version` under the version-set
-\* mutex, published together by VersionGuard::drop). Example: memtable
+\* (`versions.apply` then `retire_with_version` in one section of the
+\* version store's step, published together by VersionGuard::drop). Example: memtable
 \* {<<1, 1>>} is frozen; after this step L0 holds the file {<<1, 1>>} and
 \* the frozen list is empty, and no state in between exists for a reader to
 \* load. The E31 bug ("Split") publishes the table here and leaves the

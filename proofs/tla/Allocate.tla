@@ -48,8 +48,9 @@
 \* callers, their commits and aborts, syncs and a power cut.
 \*
 \* THE DESIGN (plan 3.7), and the code that implements it.
-\*   Db::allocate     runs in the ordered step (RegolithEngine::allocate,
-\*     src/engine/commit/allocate.rs, under the pipeline mutex): it reads the
+\*   Db::allocate     runs in the ordered step (RegolithEngine::allocate
+\*     and decide_allocation, src/engine/commit/allocate.rs: it takes a slot
+\*     of the commit ring like a write, decided in ring order): it reads the
 \*     counter key from the decided prefix (the log), reserves
 \*     [c + 1, c + n], and writes an allocation record with the new counter
 \*     to the WAL (a put of the counter key, with durability Eventual). It
@@ -86,9 +87,9 @@
 \*   - "A committed use implies its allocation is durable" is checked on
 \*     the durable prefix: every use in a durable commit record is covered
 \*     by a durable allocation record (INV_UseDurable).
-\*   - The ordered step is sequential (the commit mutex or the decide stage
-\*     of 4.7), so each allocation is one step; group commit adds nothing a
-\*     sequential order of records does not have.
+\*   - The ordered step is sequential (slots are decided one at a time, in
+\*     ring order), so each allocation is one step; commits that share a
+\*     sync add nothing a sequential order of records does not have.
 \*   - A lazily logged allocation (LogAfterUse) is logged in the order it
 \*     was handed out, so only the use-before-allocation order is wrong.
 \*

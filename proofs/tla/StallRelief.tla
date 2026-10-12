@@ -68,7 +68,8 @@
 \* Tiny example 5, the rotation that fails. Writer 1's write was let in with
 \* no stop, and finds the active memtable full and the memtable cap reached:
 \* it flushes the oldest frozen memtable itself, holding the gate, before it
-\* seals the active one (rotate_if_full). Meanwhile the stop comes on;
+\* seals the active one (the rotation of a write's turn,
+\* RegolithEngine::rotate, src/engine/commit/turn.rs). Meanwhile the stop comes on;
 \* writer 2 finds the gate held and waits. Writer 1's flush ends, with the
 \* stop still on. Then its seal fails (the next log cannot be created, or
 \* the old one cannot be synced), and writer 1 returns the error. The flush
@@ -362,7 +363,7 @@ WriterTry(w) ==
                   \* The gate and what the writer read are unchanged.
                   /\ UNCHANGED <<gate, seen>>
                \* Or let in, and the memtable cap is reached: its rotation
-               \* takes the free gate to flush (rotate_if_full). The stop
+               \* takes the free gate to flush (RegolithEngine::rotate). The stop
                \* may come on meanwhile.
                \/ /\ Failures
                   \* The gate is free,
@@ -533,7 +534,7 @@ RotateEnd(w) ==
   \* Nothing else changes.
   /\ UNCHANGED <<job, progress, seen, latch, relief>>
 
-\* Writer w's rotation leaves (rotate_if_full). The seal goes through: the
+\* Writer w's rotation leaves (RegolithEngine::rotate). The seal goes through: the
 \* progress is counted, lands the unit as Lands says, and the write goes in
 \* and leaves a step owing. Or the seal fails: the real code counts the
 \* progress all the same, and the writer returns its error; bug

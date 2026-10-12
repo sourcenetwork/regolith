@@ -25,9 +25,9 @@ lands, at sequence 1, below the snapshot. The same reader, through the same
 snapshot, now finds the key. A snapshot that changes is not a snapshot.
 
 The rule: the horizon never passes a sequence whose data is not installed
-yet (a "pending slot"). The engine keeps it by holding one mutex from an
-ingest's draw to its publication, the same mutex a commit draws and
-publishes under. What is proved here: with the rule, a snapshot reads every
+yet (a "pending slot"). The engine keeps it by publishing in the order of
+the commit ring, of which an ingest's install is one slot from the moment it
+takes its sequence to its publication. What is proved here: with the rule, a snapshot reads every
 key the same for ever; without it, the example above happens.
 
 What is proved, in plain words:

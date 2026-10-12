@@ -29,19 +29,20 @@
 \*     calls Transaction::commit (src/transaction.rs). The call claims the
 \*     transaction, runs the before_commit callbacks, joins the commit
 \*     pipeline and waits inside the call for its decision and, at
-\*     Immediate, for the fsync of its commit group. Then it runs the
+\*     Immediate, for the fsync that covers its commit. Then it runs the
 \*     outcome's callbacks itself, on the calling thread, and returns. There
 \*     is no ticket.
 \*   - commit_nowait. `transact_async` (`run_async`) calls
 \*     Transaction::commit_nowait (src/transaction/nowait.rs) on the
 \*     caller's queue. It runs the same way up to the pipeline's decision
-\*     and never waits for an fsync. A commit whose group owes none (a
+\*     and never waits for an fsync. A commit that is owed none (a
 \*     conflict, or Eventual durability) is done: its callbacks run on the
 \*     calling thread before the call returns, and the ticket it returns is
-\*     ready. A commit whose group owes its fsync returns a pending
-\*     CommitTicket that holds a closure to read the outcome from the group
-\*     later (Completion::resolve_with, src/io_queue/completion.rs). When
-\*     the group has landed, the commit's queue is told; at that queue's
+\*     ready. A commit that is owed its fsync returns a pending
+\*     CommitTicket that holds a closure to read the outcome from the
+\*     commit's slot of the commit ring later (Completion::resolve_with,
+\*     src/io_queue/completion.rs). When the commit has landed (it is
+\*     published, or a failed sync discarded it), its queue is told; at that queue's
 \*     poll, or at its drop, on the thread that holds the queue, the
 \*     delivery takes the closure, decides the outcome with it, claims it
 \*     with one compare-and-swap and runs the callbacks. So such a commit is
@@ -80,7 +81,7 @@
 \*   delivered_on_queue_thread every delivery runs on the thread that holds
 \*                             the commit's queue (OnCommittingThread here)
 \*   resolved_after_landing,   a pending ticket's outcome is read from its
-\*   resolved_once_on_queue_thread   commit group only once the group has
+\*   resolved_once_on_queue_thread   commit's slot only once the commit has
 \*                             landed, once, on the thread that holds the
 \*                             commit's queue (ResolvedAfterLanding here)
 \*   no_claim_delivers_twice,  the RED cases DeliverNoClaim and
@@ -93,8 +94,8 @@
 \* CHECKED ON THE REAL CODE.
 \*   tests/loom_io_queue.rs (loom, every schedule within its bound):
 \*     a_ticket_callback_runs_exactly_once        AtMostOnce at delivery
-\*     every_member_queue_gets_one_completion     a landed group tells each
-\*                                                member's own queue
+\*     every_member_queue_gets_one_completion     a landed commit tells its
+\*                                                own queue, once
 \*   tests/commit_nowait.rs:
 \*     at_eventual_a_commit_on_a_queue_is_ready_when_it_returns
 \*                                                the commit_nowait that
@@ -170,20 +171,21 @@
 \*   - Rollback, drop and an Err from the closure are one transition (the
 \*     owner claims "aborted" and runs on_abort); an Err from before_commit
 \*     is the panic transition without the panic flag.
-\*   - The pipeline decides one transaction per step; group commit and the
-\*     visibility order are GroupCommit.tla's and CommitPipeline.tla's.
-\*   - Which thread runs a commit group's fsync: a pipeline thread, a
-\*     member that committed with a blocking call, or the poll of a member's
-\*     queue that claimed it as one unit. That is NonBlocking.tla's
-\*     (MC_NonBlocking_Green_Commit); here some pipeline thread syncs.
+\*   - The pipeline decides one transaction per step; the order commits
+\*     are decided, synced and published in is CommitPipeline.tla's.
+\*   - Which thread runs the fsync a commit is owed (a sync round): a thread
+\*     that commits with a blocking call, or the poll of a queue a
+\*     commit_nowait left the round on, which claimed it as one unit. That
+\*     is NonBlocking.tla's (MC_NonBlocking_Green_Commit); here some
+\*     pipeline thread syncs.
 \*   - The third delivery path, the commit's own fallback when its queue
-\*     was dropped before the ticket was registered (it lands the group and
-\*     delivers on the calling thread). It is the drop path with the caller
+\*     was dropped before the ticket was registered (it brings the commit
+\*     through and delivers on the calling thread). It is the drop path with the caller
 \*     as the thread that holds the queue.
 \*   - The ticket's on_complete callbacks, which run after the outcome's
 \*     own on the same thread and in the same claim.
 \*   - A pessimistic transaction's key locks. A commit_nowait releases them
-\*     when its group lands, on the thread that lands it, and close releases
+\*     when the commit lands, on the thread that lands it, and close releases
 \*     those of the transactions it aborts. That is LockTable.tla's
 \*     (IsolationAtLanding); no callback runs there.
 \*
@@ -212,8 +214,8 @@
 \*   MC_TxnCallbacks_Red_DeliverNoClaim the poll and the drop deliver without
 \*                                     claiming the outcome: both run it,
 \*                                     AtMostOnce.
-\*   MC_TxnCallbacks_Red_HelperDelivers the thread that landed a group
-\*                                     resolves and delivers a member's
+\*   MC_TxnCallbacks_Red_HelperDelivers the thread that landed a commit
+\*                                     resolves and delivers its
 \*                                     ticket, as before D53: the callbacks
 \*                                     run off the committing thread,
 \*                                     OnCommittingThread.
@@ -325,21 +327,21 @@ VARIABLES
   \* attempt's.
   reg,
   \* For each owner, its ticket's outcome word: "none" (no ticket is waited on: a blocking commit
-  \* has none), "pending" (handed out while its commit group owes an fsync), "decided",
+  \* has none), "pending" (handed out while its commit is owed an fsync), "decided",
   \* "delivering" or "ready". In the code: Completion::state with PENDING, DECIDED, DELIVERING,
   \* READY (src/io_queue/completion.rs).
   ps,
-  \* For each owner, what the pipeline decided, as its commit group holds it: "none" yet, "commit"
+  \* For each owner, what the pipeline decided, as its commit's slot holds it: "none" yet, "commit"
   \* or "conflict". A ticket's outcome (Completion::outcome) is read from here at delivery.
   verdict,
   \* For each owner, the sequence its commit got, 0 if none: what its CommitReceipt reports
   \* (src/transaction/receipt.rs). A number.
   cseq,
   \* For each owner, where its commit is in the pipeline: "none", "queued" (submitted, not yet
-  \* validated) or "decided" (its commit group holds its outcome).
+  \* validated) or "decided" (its commit's slot holds its outcome).
   gs,
   \* For each owner, whether its ticket still holds the closure that reads the outcome from the
-  \* commit group (Completion::resolve, set by resolve_with in src/transaction/nowait.rs): put
+  \* commit's slot (Completion::resolve, set by resolve_with in src/transaction/nowait.rs): put
   \* there when the ticket is handed out owing an fsync, taken once at delivery.
   res,
   \* The pipeline, the committers and the closer.
@@ -438,7 +440,7 @@ RunCallbacks(x, kind, who) ==
 \* a conflict.
 KindOf(x) == IF verdict[x] = "commit" THEN "C" ELSE "A"
 
-\* The commit group of x's decided commit has landed: nothing more must reach the disk before the
+\* x's decided commit has landed: nothing more must reach the disk before the
 \* outcome may be told. A conflict wrote nothing; at Eventual no fsync is owed; at Immediate the
 \* log sync covers the commit.
 Landed(x) == verdict[x] = "conflict" \/ Durability = "Eventual" \/ durable >= cseq[x]
@@ -614,7 +616,7 @@ Submit(x) ==
 
 \* The blocking commit returns (Transaction::commit, src/transaction.rs): it
 \* waited inside the call for the pipeline's decision and, for a commit at
-\* Immediate, for the fsync of its group. Its outcome is told on the owner's
+\* Immediate, for the fsync that covers it. Its outcome is told on the owner's
 \* own thread, next. Mutant CommitBeforeDurable: it does not wait for the
 \* fsync.
 BlockingReturns(x) ==
@@ -624,18 +626,18 @@ BlockingReturns(x) ==
   /\ opc[x] = "committing"
   \* and the pipeline has decided,
   /\ gs[x] = "decided"
-  \* and the commit's group has landed (the bug: or not).
+  \* and the commit has landed (the bug: or not).
   /\ Landed(x) \/ Mutant = "CommitBeforeDurable"
   \* The owner runs the outcome's callbacks next, itself.
   /\ opc' = [opc EXCEPT ![x] = "outcb"]
   \* Nothing else changes.
   /\ UNCHANGED <<att, ost, snap, readv, buf, vset, reg, ps, verdict, cseq, gs, res, db, workers, ghosts>>
 
-\* commit_nowait returns (src/transaction/nowait.rs). A commit whose group
-\* owes no fsync (a conflict, or Eventual durability) is done: its outcome
+\* commit_nowait returns (src/transaction/nowait.rs). A commit that is
+\* owed no fsync (a conflict, or Eventual durability) is done: its outcome
 \* is told on the owner's own thread before the call returns, and the ticket
-\* is ready (Committed::Done). A commit whose group owes its fsync returns a
-\* ticket that holds a closure to read the outcome from the group later
+\* is ready (Committed::Done). A commit that is owed its fsync returns a
+\* ticket that holds a closure to read the outcome from its slot later
 \* (Committed::Pending, Completion::resolve_with); nothing is told yet.
 NowaitReturns(x) ==
   \* The owner called `transact_async`: its commit does not wait.
@@ -644,7 +646,7 @@ NowaitReturns(x) ==
   /\ opc[x] = "committing"
   \* and the pipeline has decided.
   /\ gs[x] = "decided"
-  \* Does the group owe an fsync?
+  \* Is the commit owed an fsync?
   /\ IF verdict[x] = "conflict" \/ Durability = "Eventual"
        \* No: the owner runs the outcome's callbacks next, itself,
        THEN /\ opc' = [opc EXCEPT ![x] = "outcb"]
@@ -724,12 +726,12 @@ OwnerAbortHook(x) ==
   /\ UNCHANGED <<ranC, ranA, beforeRan, hookBefore, validated, committed, panicked, ranFor, runBy>>
 
 \* A pending ticket is delivered along path p, on the thread that holds the
-\* commit's queue: that queue's poll takes in the note that the commit's
-\* group has landed, or the queue is dropped and the drop delivers what it
+\* commit's queue: that queue's poll takes in the note that the commit
+\* has landed, or the queue is dropped and the drop delivers what it
 \* held (Completion::deliver, src/io_queue/completion.rs). The first thing
 \* a delivery does is take the closure that reads the outcome from the
-\* group; only one path can get it. Mutant CommitBeforeDurable: a path
-\* starts before the group has landed.
+\* commit's slot; only one path can get it. Mutant CommitBeforeDurable: a
+\* path starts before the commit has landed.
 DeliverBegins(x, p) ==
   \* The owner waits for its ticket,
   /\ opc[x] = "waiting"
@@ -737,7 +739,7 @@ DeliverBegins(x, p) ==
   /\ ps[x] \in {"pending", "decided"}
   \* This path has not had its go.
   /\ dpc[x][p] = "idle"
-  \* The commit's group has landed (the bug: or not).
+  \* The commit has landed (the bug: or not).
   /\ Landed(x) \/ Mutant = "CommitBeforeDurable"
   \* Does the ticket still hold its resolving closure?
   /\ IF res[x]
@@ -755,13 +757,13 @@ DeliverBegins(x, p) ==
   /\ UNCHANGED <<subq, cpc, ctarget, clpc, cltarget, clseen, ghosts>>
 
 \* The path that took the closure runs it: the outcome is read from the
-\* landed group and stored in the ticket (Completion::decide: PENDING to
-\* DECIDED). So a commit owed an fsync is resolved at delivery, on the
-\* thread that holds its queue, and never before its group has landed.
+\* landed commit's slot and stored in the ticket (Completion::decide:
+\* PENDING to DECIDED). So a commit owed an fsync is resolved at delivery,
+\* on the thread that holds its queue, and never before it has landed.
 DeliverDecides(x, p) ==
   \* This path took the resolving closure.
   /\ dpc[x][p] = "decide"
-  \* The ticket's outcome is decided: the group's verdict.
+  \* The ticket's outcome is decided: the verdict its slot holds.
   /\ ps' = [ps EXCEPT ![x] = "decided"]
   \* Claiming it is next.
   /\ dpc' = [dpc EXCEPT ![x][p] = "cas"]
@@ -843,7 +845,7 @@ Resolve(x) ==
 \* The committers: decide and sync. They never deliver an outcome: that is
 \* the committing thread's (BlockingReturns, NowaitReturns, DeliverBegins).
 \* Mutant HelperDelivers puts back the design before D53, where the thread
-\* that landed a group completed its members' outcomes.
+\* that landed commits completed their outcomes.
 
 \* Validate the oldest submitted transaction, first-committer-wins on its
 \* validated write set, and apply it if it commits.
@@ -861,7 +863,7 @@ Decide(c) ==
      IN /\ subq' = Tail(subq)
         \* Ghost: this attempt was validated.
         /\ validated' = Set2(validated, x, att[x], TRUE)
-        \* Its outcome is decided: its commit group holds it now. No ticket knows it yet.
+        \* Its outcome is decided: its commit's slot holds it now. No ticket knows it yet.
         /\ gs' = [gs EXCEPT ![x] = "decided"]
         \* Which way?
         /\ IF conflict
@@ -892,9 +894,9 @@ Decide(c) ==
   /\ UNCHANGED <<ranC, ranA, hookC, hookA, beforeRan, hookBefore, panicked, ranFor, runBy>>
 
 \* A WAL sync: everything committed so far is durable, so every commit
-\* group written so far has landed. Which thread runs a group's fsync (a
-\* pipeline thread, a member that committed with a blocking call, or the
-\* poll of a member's queue that claimed it) is NonBlocking.tla's; here it
+\* written so far has landed. Which thread runs the fsync (a thread that
+\* commits with a blocking call, or the poll of a queue a commit_nowait
+\* left the sync round on, which claimed it) is NonBlocking.tla's; here it
 \* is some pipeline thread.
 Fsync(c) ==
   \* When: the committer is idle
@@ -906,8 +908,8 @@ Fsync(c) ==
   \* Nothing else changes.
   /\ UNCHANGED <<seq, ctr, ctrSeq, closed, owner, workers, ghosts>>
 
-\* Mutant HelperDelivers only: the pipeline thread that landed a group
-\* delivers a member's ticket itself, as before D53. It takes the resolving
+\* Mutant HelperDelivers only: the pipeline thread that landed a commit
+\* delivers its ticket itself, as before D53. It takes the resolving
 \* closure, decides the outcome and claims it, to complete it on its own
 \* thread.
 Claim(c, x) ==
@@ -917,7 +919,7 @@ Claim(c, x) ==
   /\ cpc[c] = "idle"
   \* the ticket is pending with its resolving closure,
   /\ ps[x] = "pending" /\ res[x]
-  \* and the commit's group has landed.
+  \* and the commit has landed.
   /\ Landed(x)
   \* The committer takes the closure,
   /\ res' = [res EXCEPT ![x] = FALSE]
@@ -1282,8 +1284,8 @@ AttemptIsolation == \A r \in ranFor : r[2] = r[3]
 \* own thread (a blocking commit, a commit_nowait that was done when it
 \* returned, or an abort the owner chose), or on the closing thread for a
 \* transaction close aborted; never on a committer. Example ruled out: the
-\* leader that synced a group running a member's on_commit on its own
-\* thread while the member's thread is busy. Lean: Callbacks.lean,
+\* thread that ran a sync running another commit's on_commit on its own
+\* thread while that commit's thread is busy. Lean: Callbacks.lean,
 \* delivered_on_queue_thread.
 OnCommittingThread == \A r \in runBy : r[2] # "committer"
 
@@ -1299,8 +1301,8 @@ CommitAfterDurable ==
     \A x \in Owners : att[x] > 0 /\ ranC[x][att[x]] > 0 => durable >= cseq[x]
 
 \* RESOLVED AT DELIVERY, AFTER LANDING. A ticket's outcome is decided only
-\* from a commit group that holds it and has landed: a commit owed an fsync
-\* is not even known to its ticket before the fsync.
+\* from a slot that holds it, of a commit that has landed: a commit owed an
+\* fsync is not even known to its ticket before the fsync.
 \* Example ruled out: the ticket of a commit at Immediate is decided when the
 \* commit is written; a caller that blocks on the ticket's decision sees
 \* "committed", the machine loses power before the fsync, and the commit is
@@ -1308,7 +1310,7 @@ CommitAfterDurable ==
 ResolvedAfterLanding ==
   \* For every owner whose ticket has an outcome:
   \A x \in Owners : ps[x] \in {"decided", "delivering", "ready"} =>
-    \* the pipeline decided it, and its group has landed.
+    \* the pipeline decided it, and the commit has landed.
     gs[x] = "decided" /\ Landed(x)
 
 \* A PANIC IN BEFORE_COMMIT ABORTS. The attempt never commits and never runs

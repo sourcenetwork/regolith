@@ -567,10 +567,12 @@ RbFinish(a) ==
       hi   == IF pub > last THEN pub ELSE last
       \* How far the orders can be finished as they are.
       upto == CHOOSE p \in pub..hi :
+                \* Every order up to p may be finished, and the next may not.
                 (\A j \in (pub + 1)..p : Publishable(j)) /\ (p = hi \/ ~Publishable(p + 1))
       \* The orders to throw out: every order past that point (mutant
       \* RollbackForgets throws none out).
       out  == IF Mutant = "RollbackForgets" THEN {}
+              \* The real code: every order in the ring past that point.
               ELSE {j \in (upto + 1)..last : cell[j] = "ready"}
       \* Is the memtable replaced? Always (mutant KeepMemtable: only when
       \* an order being thrown out had written to it).
@@ -667,7 +669,9 @@ PubFrontier(a) ==
      /\ visible' = IF ~SmallSteps /\ Takes(p) /\ sq[p] > visible THEN sq[p] ELSE visible
      \* Its owner, if it is waiting on this very order, is told.
      /\ pc' = IF o # 0 /\ pc[o] = "ready" /\ mine[o] = p /\ Live(o)
+                \* It learns "done", or "failed" for an order thrown out.
                 THEN [pc EXCEPT ![o] = ToldAs(failed[p])]
+                \* Nobody is waiting on it here: no thread is told.
                 ELSE pc
      \* Nothing else changes.
      /\ UNCHANGED <<ringVars, decVars, ap, wr, failed, dto, tipVars, epochVars, durable,

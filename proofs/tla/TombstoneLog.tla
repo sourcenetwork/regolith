@@ -381,6 +381,7 @@ TypeOK ==
 OneSlotEach ==
   \* Take two different threads that each hold a position.
   \A a, b \in Appliers :
+    \* Two threads, each between taking its position and finishing its write.
     a # b /\ astate[a] \in {"took", "half"} /\ astate[b] \in {"took", "half"}
       \* Their positions differ.
       => apos[a] # apos[b]
