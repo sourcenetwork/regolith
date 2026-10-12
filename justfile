@@ -469,7 +469,7 @@ tla:
         if [ "$verdict" != "$expect" ]; then touch "$results/$n.fail"; fi
     }
     check MC_RepeatableRead_Green                      GREEN
-    check MC_RepeatableRead_Green_Live               GREEN
+    check MC_RepeatableRead_Green_Live                 GREEN
     check MC_RepeatableRead_Red_Serializable           RED INV_AppendsCommit
     check MC_RepeatableRead_Red_SnapshotIsolation      RED INV_NoStaleDefinition
     check MC_RepeatableRead_Red_ReadCommitted          RED INV_NoStaleDefinition
@@ -496,7 +496,7 @@ tla:
     check MC_DefraLevel_Red_PresenceReadFull           RED INV_LinksCommit
     check MC_DefraLevel_Red_PresenceUnchecked          RED INV_HoldsCurrent
     check MC_DefraLevel_Green_Parts                    GREEN
-    check MC_DefraLevel_Green_Parts_Rewriter         GREEN
+    check MC_DefraLevel_Green_Parts_Rewriter           GREEN
     check MC_DefraLevel_Red_PartsIgnorePut             RED INV_PartsCurrent
     check MC_DefraLevel_Red_PartsIgnoreTouch           RED INV_PartsCurrent
     check MC_DefraLevel_Red_PartsNoAbsentFallback      RED INV_PartsCurrent
@@ -725,7 +725,7 @@ tla:
     check MC_CommitPipeline_Green                      GREEN
     check MC_CommitPipeline_Green_Live                 GREEN
     check MC_CommitPipeline_Green_LiveIngest           GREEN
-    check MC_CommitPipeline_Green_LiveApart          GREEN
+    check MC_CommitPipeline_Green_LiveApart            GREEN
     check MC_CommitPipeline_Red_OutOfOrder             RED ReadersSeePrefix
     check MC_CommitPipeline_Red_AbortHole              RED NoHole
     check MC_CommitPipeline_Red_NoHelping              RED NoLiveThreadBlocked
@@ -772,9 +772,9 @@ tla:
     # mutual_exclusion, bounded_bypass, owed_exclusive.
     spec=Sync
     check MC_Sync_Green_Mutex                          GREEN
-    check MC_Sync_Green_MutexLive                    GREEN
+    check MC_Sync_Green_MutexLive                      GREEN
     check MC_Sync_Green_Semaphore                      GREEN
-    check MC_Sync_Green_SemaphoreLive                GREEN
+    check MC_Sync_Green_SemaphoreLive                  GREEN
     check MC_Sync_Green_Reentrant                      GREEN
     check MC_Sync_Green_ReentrantLive                  GREEN
     check MC_Sync_Red_UnboundedBarging                 RED BoundedBypass
@@ -788,7 +788,7 @@ tla:
     # Regolith/SyncFifo.lean, fifo_served, no_stranded_waiter.
     spec=SyncNotify
     check MC_SyncNotify_Green                          GREEN
-    check MC_SyncNotify_Green_Live                   GREEN
+    check MC_SyncNotify_Green_Live                     GREEN
     check MC_SyncNotify_Red_WakeBeforeHandoff          RED NoLostWakeup
     check MC_SyncNotify_Red_CancelNoPassOn             RED CancelPassesOn
     check MC_SyncNotify_Red_NoRecheck                  RED NoLostWakeup
@@ -928,6 +928,7 @@ tla:
     check MC_LockTable_Green_Cancel                    GREEN
     check MC_LockTable_Green_Table                     GREEN
     check MC_LockTable_Green_Mixed                     GREEN
+    check MC_LockTable_Green_MixedLive                 GREEN
     check MC_LockTable_Green_Four                      GREEN
     check MC_LockTable_Red_RetireNoCas                 RED MutualExclusion
     check MC_LockTable_Red_NoRecheck                   RED NoStrandedFront
