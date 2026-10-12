@@ -38,8 +38,8 @@ handoff in `proofs/tla`:
 * `SyncNotify.tla`, invariants `FifoHandoff`, `NoLostWakeup` and
   `CancelPassesOn` (configurations `MC_SyncNotify_*`): Notify hands a
   notification to its oldest waiter before waking it;
-* the waiter lists of `SyncLatch.tla` and `SyncOnce.tla`, which use the same
-  registration and re-check.
+* the waiter list of `SyncLatch.tla`, which uses the same registration and
+  re-check.
 
 Before D49 this file backed the locks too. D49 replaced FIFO handoff by
 barging with a bypass bound for the lock-like primitives; their proofs are

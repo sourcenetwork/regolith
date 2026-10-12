@@ -55,13 +55,12 @@ import Regolith.Validation
 import Regolith.Relaxations
 -- regolith::sync's locks after D49: barging with a bypass bound gives
 -- mutual exclusion, at most BOUND lost races per waiter, an exclusive owed
--- handoff and no stranded head. Backs `proofs/tla/Sync.tla` and the write
--- side of `SyncRwLock.tla`.
+-- handoff and no stranded head. Backs `proofs/tla/Sync.tla`, the write
+-- side of `SyncRwLock.tla` and the turn semaphore of `SyncOnce.tla`.
 import Regolith.Sync
 -- regolith::sync::Notify: the FIFO waiter queue with handoff before wake
 -- gives FIFO service and no lost wakeup, cancellation included. Backs
--- `proofs/tla/SyncNotify.tla` and the waiter lists of `SyncLatch.tla` and
--- `SyncOnce.tla`.
+-- `proofs/tla/SyncNotify.tla` and the waiter list of `SyncLatch.tla`.
 import Regolith.SyncFifo
 -- 3.16: every transaction callback runs exactly once, of its attempt's
 -- outcome, in the stated order, and attempts are isolated. Backs

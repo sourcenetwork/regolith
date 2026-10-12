@@ -807,13 +807,15 @@ tla:
     check MC_SyncLatch_Green_Barrier                   GREEN
     check MC_SyncLatch_Red_NoRecheck                   RED NoLostWakeup
     check MC_SyncLatch_Red_CountCheck                  RED NoLostWakeup
-    # regolith::sync::OnceCell and Lazy: exactly one value is published.
+    # regolith::sync::OnceCell and Lazy: one pointer published by one
+    # compare-and-swap, and a one-permit semaphore for the initializers'
+    # turns, which a publisher opens wide.
     spec=SyncOnce
     check MC_SyncOnce_Green                            GREEN
-    check MC_SyncOnce_Red_CancelNoReset                RED NoLostWakeup
     check MC_SyncOnce_Red_PlainStore                   RED PublishedOnce
-    check MC_SyncOnce_Red_NoRecheck                    RED NoLostWakeup
-    check MC_SyncOnce_Red_ReparkStale                  RED NoLostWakeup
+    check MC_SyncOnce_Red_LoserKeepsOwn                RED ReadersAgree
+    check MC_SyncOnce_Red_CancelNoReset                RED NoLostWakeup
+    check MC_SyncOnce_Red_PublishNoOpen                RED NoLostWakeup
     # Transaction callbacks (3.16), delivered on the committing thread (D53).
     # Lean: Regolith/Callbacks.lean, exactly_once, order, attempts_isolated,
     # delivered_once, delivered_on_queue_thread.
