@@ -18,6 +18,12 @@
 
 /// The `#[path]` attributes are what keep `tests/caller_traits/` from being
 /// picked up as test binaries of their own.
+#[path = "caller_traits/key_classifier.rs"]
+mod key_classifier;
+#[path = "caller_traits/log_layout.rs"]
+mod log_layout;
+#[path = "caller_traits/names.rs"]
+mod names;
 #[path = "caller_traits/rate_limiter.rs"]
 mod rate_limiter;
 #[path = "caller_traits/ttl_filter.rs"]
