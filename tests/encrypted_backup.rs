@@ -263,7 +263,7 @@ fn a_backup_taken_across_a_key_rotation_restores_under_the_keys_it_names() {
     fill(&db, 420, 800);
     // Metadata under key 2, tables under both.
     let across = engine.create_backup(&db).unwrap();
-    db.compact_range(None, None).unwrap();
+    db.compact_range(None, None).wait().unwrap();
     // Everything under key 2.
     let after = engine.create_backup(&db).unwrap();
     drop(db);
@@ -313,9 +313,13 @@ fn listing_deleting_and_purging_need_no_key_and_keep_what_sealed_backups_share()
     let second = engine.create_backup(&db).unwrap();
     drop(db);
 
-    // An engine that holds no key, as every engine does.
+    // An engine that holds no key, as every engine does: every sealed
+    // backup lists, and reads.
     let mut engine = BackupEngine::open(backups.path()).unwrap();
-    let infos = engine.list_backups();
+    let infos: Vec<_> = engine
+        .list_backups()
+        .map(|entry| entry.unwrap().unwrap())
+        .collect();
     assert_eq!(
         infos.iter().map(|i| i.id).collect::<Vec<_>>(),
         vec![first, second]
@@ -333,7 +337,7 @@ fn listing_deleting_and_purging_need_no_key_and_keep_what_sealed_backups_share()
     check(&Db::open(&target, options(&keys)).unwrap(), 0, 600);
 
     engine.purge_old_backups(0).unwrap();
-    assert!(engine.list_backups().is_empty());
+    assert_eq!(engine.list_backups().count(), 0);
     assert_eq!(shared_count(backups.path()), 0);
 }
 
@@ -361,6 +365,13 @@ fn a_backup_that_cannot_be_read_stops_a_delete_from_removing_shared_files() {
         shared_before,
         "a shared file the unreadable backup lists was removed"
     );
+    // The first is gone, and the second is listed with its reason, not
+    // left out.
+    let listed: Vec<_> = engine
+        .list_backups()
+        .map(|entry| entry.unwrap().map(|info| info.id).map_err(|bad| bad.id))
+        .collect();
+    assert_eq!(listed, [Err(second)]);
 }
 
 #[test]

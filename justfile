@@ -564,11 +564,21 @@ tla:
     check MC_ManifestSeal_Red_TagOnlyStop              RED OnlyTornEnds
     check MC_ManifestSeal_Red_TagOnlyRefuse            RED RecoveryOpens
     # 4.12, D57: a backup of an encrypted database seals its metadata, and a
-    # restore checks every key before its first write. Lean:
+    # restore checks every key before its first write; the listing names
+    # every backup, a page of ids at a time, and a delete or purge sweeps
+    # the pool a batch at a time, reading each listing as its walk of meta/
+    # reaches it, and removes every unlisted table and no listed one. Lean:
     # Regolith/BackupSeal.lean, entitled_restore_is_faithful,
-    # refusal_writes_nothing, collect_keeps_listed, last_write_holds_all.
+    # refusal_writes_nothing, collect_keeps_listed, last_write_holds_all,
+    # listing_names_every_backup, purge_keeps_the_newest, collect_stream_eq,
+    # stream_holds_one_batch, sweep_eq, sweep_removes_every_unlisted,
+    # list_pages_all.
     spec=BackupSeal
     check MC_BackupSeal_Green                          GREEN
+    check MC_BackupSeal_Green_Stream                   GREEN
+    check MC_BackupSeal_Green_Sweep                    GREEN
+    check MC_BackupSeal_Red_StreamSkips                RED ListedRestores
+    check MC_BackupSeal_Red_SweepSkips                 RED SweepRemovesEveryUnlisted
     check MC_BackupSeal_Red_PlainMeta                  RED SealedMetadata
     check MC_BackupSeal_Red_PlainRestore               RED SealedMetadata
     check MC_BackupSeal_Red_OpenUnderCurrent           RED RightKeysRestore
@@ -578,7 +588,10 @@ tla:
     check MC_BackupSeal_Red_OverDatabase               RED FaithfulRestore
     check MC_BackupSeal_Red_CheckAfterCopy             RED RefusalWritesNothing
     check MC_BackupSeal_Red_GcSkipsSealed              RED ListedRestores
+    check MC_BackupSeal_Red_GcSkipsUnreadable          RED ListedRestores
     check MC_BackupSeal_Red_MetaFirst                  RED ListedRestores
+    check MC_BackupSeal_Red_ListSkipsUnreadable        RED ListingNamesEvery
+    check MC_BackupSeal_Red_ListNeedsKey               RED ListingNamesEvery
     # 4.8, E5: compaction per snapshot stripe. Lean: Regolith/Stripes.lean,
     # reduce_reads.
     spec=StripeCompaction
@@ -623,6 +636,12 @@ tla:
     check MC_GroupCommit_Red_PublishBeforeSync         RED DurableBeforeVisible
     # E21, the bounded leader: one group per turn, then hand off.
     check MC_GroupCommit_Red_DrainAll                  RED BoundedTurn
+    # D53, the group fsync as a claimable job for commit_nowait members.
+    # Green_Nowait_Owes is the witness that the GREEN run leaves groups owed.
+    # Lean: Regolith/IoQueue.lean, group_sync_once, group_visible_after_sync.
+    check MC_GroupCommit_Green_Nowait                  GREEN
+    check MC_GroupCommit_Green_Nowait_Owes             RED NothingOwed
+    check MC_GroupCommit_Red_DoubleClaim               RED SingleSync
     # 4.7, the lock-free commit pipeline. Lean: Regolith/Pipeline.lean,
     # seqs_dense and reader_sees_published.
     spec=CommitPipeline
@@ -645,6 +664,29 @@ tla:
     check MC_NonBlocking_Red_DoubleRun                 RED SingleRun
     check MC_NonBlocking_Red_SelfIoNowhere             RED NoOrphanUnit
     check MC_NonBlocking_Red_BusyWoken                 RED BusyNeverWoken
+    # D53, the commit side's units: a group's fsync claimed by one member's
+    # poll and told to every member's own queue, and a stall's passive unit
+    # landed by its clearer or by a writer's second look. Lean:
+    # Regolith/IoQueue.lean, group_sync_once, group_visible_after_sync,
+    # ticket_ready_only_at_own_poll, stall_lands_when_clear.
+    check MC_NonBlocking_Green_Commit                  GREEN
+    check MC_NonBlocking_Green_Stall                   GREEN
+    check MC_NonBlocking_Red_DoubleSync                RED SingleRun
+    check MC_NonBlocking_Red_PublishAtWrite            RED VisibleAfterSync
+    check MC_NonBlocking_Red_DeliverOnLander           RED DeliveredOnOwnPoll
+    check MC_NonBlocking_Red_NoRecheck                 RED StallLandsWhenClear
+    # Phase 7 integration: with no worker and inline compaction on, no
+    # stopped writer waits on a relief nobody runs. Every piece of progress
+    # lands the stall's unit (relief handed back), a contended writer reads
+    # the progress count again once registered, and a foreground job that
+    # held the gate relieves the stop. Lean: Regolith/StallRelief.lean,
+    # no_stranded_wait, no_relief_strands_a_waiter,
+    # no_hand_back_strands_a_waiter, no_recheck_strands_a_waiter.
+    spec=StallRelief
+    check MC_StallRelief_Green                         GREEN
+    check MC_StallRelief_Red_NoRelief                  RED NoStrandedWait
+    check MC_StallRelief_Red_NoHandBack                RED NoStrandedWait
+    check MC_StallRelief_Red_NoRecheck                 RED NoStrandedWait
     # regolith::sync's locks after D49: barging with bounded bypass, for
     # Mutex, Semaphore and ReentrantMutex. Lean: Regolith/Sync.lean,
     # mutual_exclusion, bounded_bypass, owed_exclusive.
@@ -694,15 +736,17 @@ tla:
     check MC_SyncOnce_Red_PlainStore                   RED PublishedOnce
     check MC_SyncOnce_Red_NoRecheck                    RED NoLostWakeup
     check MC_SyncOnce_Red_ReparkStale                  RED NoLostWakeup
-    # Transaction callbacks (3.16). Lean: Regolith/Callbacks.lean,
-    # exactly_once, order, attempts_isolated.
+    # Transaction callbacks (3.16), delivered on the committing thread (D53).
+    # Lean: Regolith/Callbacks.lean, exactly_once, order, attempts_isolated,
+    # delivered_once, delivered_on_queue_thread.
     spec=TxnCallbacks
     check MC_TxnCallbacks_Green_Immediate              GREEN
     check MC_TxnCallbacks_Green_Eventual               GREEN
     check MC_TxnCallbacks_Red_CommitBeforeDurable      RED CommitAfterDurable
     check MC_TxnCallbacks_Red_SkipCallbackWrites       RED NoLostUpdate
     check MC_TxnCallbacks_Red_CallbacksSurvive         RED AttemptIsolation
-    check MC_TxnCallbacks_Red_HelperNoClaim            RED AtMostOnce
+    check MC_TxnCallbacks_Red_DeliverNoClaim           RED AtMostOnce
+    check MC_TxnCallbacks_Red_HelperDelivers           RED OnCommittingThread
     check MC_TxnCallbacks_Red_CloseNoClaim             RED AtMostOnce
     # 4.6, Phase 7b: the wait-free read view (D54). Lean:
     # Regolith/ReadView.lean, reachable_safe and cas_chain.
@@ -713,10 +757,14 @@ tla:
     check MC_ReadView_Red_PlainStore                   RED ChainOfPublications
     # Phase 7 integration: the read view's publishers as group commit and the
     # flush off the commit path left them, every one by compare-and-swap.
+    # A flush installs its table and retires its memtable in one publication.
     # Lean: Regolith/ReadViewPublishers.lean, no_lost_memtable,
-    # retired_stay_gone, plain_retire_loses_a_seal, plain_version_loses_a_seal.
+    # retired_stay_gone, flush_keeps_sources_disjoint,
+    # split_install_holds_a_memtable_twice, plain_retire_loses_a_seal,
+    # plain_version_loses_a_seal.
     spec=ReadViewPublishers
     check MC_ReadViewPublishers_Green                  GREEN
+    check MC_ReadViewPublishers_Red_SplitRetire        RED NoDoubleSource
     check MC_ReadViewPublishers_Red_PlainRetire        RED NoLostMemtable
     check MC_ReadViewPublishers_Red_PlainVersion       RED NoLostMemtable
     # 4.6, Phase 7b: the lock-free CLOCK block cache. Lean:

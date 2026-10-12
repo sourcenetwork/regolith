@@ -46,7 +46,7 @@ fn a_snapshot_read_after_many_publications_still_sees_its_own_instant() {
                     db.put(&key(i), format!("stamp{v:04}").as_bytes())
                         .expect("put");
                 }
-                db.compact_range(None, None).expect("compact");
+                db.compact_range(None, None).wait().expect("compact");
                 v += 1;
             }
         })
@@ -89,7 +89,7 @@ fn an_iterator_outlives_the_compaction_that_unlinks_its_files() {
     for i in 0..KEYS {
         db.put(&key(i), b"v0").expect("seed");
     }
-    db.compact_range(None, None).expect("compact");
+    db.compact_range(None, None).wait().expect("compact");
 
     let mut iter = db.iter();
     iter.seek_to_first();
@@ -104,7 +104,7 @@ fn an_iterator_outlives_the_compaction_that_unlinks_its_files() {
         for i in 0..KEYS {
             db.put(&key(i), format!("v{v}").as_bytes()).expect("put");
         }
-        db.compact_range(None, None).expect("compact");
+        db.compact_range(None, None).wait().expect("compact");
     }
 
     while iter.valid() {

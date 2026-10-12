@@ -30,12 +30,13 @@ pub fn open(dir: &TempDir) -> Db {
 }
 
 /// Put `count` sequential keys `key_000000..key_{count-1:06}` with
-/// value `val_{i:06}`. Predictable filler for write-path tests.
+/// value `val_{i:06}`. Predictable filler for write-path tests; a write a
+/// stall stops waits for the stall to clear, as a blocking caller does.
 pub fn fill_sequential(db: &Db, count: usize) {
     for i in 0..count {
         let k = format!("key_{:06}", i);
         let v = format!("val_{:06}", i);
-        db.put(k.as_bytes(), v.as_bytes()).unwrap();
+        regolith::through_stalls(|| db.put(k.as_bytes(), v.as_bytes())).unwrap();
     }
 }
 
@@ -78,7 +79,7 @@ fn count_with_extension(dir: &Path, ext: &str) -> usize {
 /// Force a full flush + compaction by calling `compact_range(None, None)`.
 /// Blocks until the compaction scheduler reports completion.
 pub fn force_compaction(db: &Db) {
-    db.compact_range(None, None).unwrap();
+    db.compact_range(None, None).wait().unwrap();
 }
 
 /// Fault injection: subprocess crash harness, power-loss simulation,

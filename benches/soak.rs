@@ -14,7 +14,7 @@ mod common;
 use std::hint::black_box;
 use std::time::Instant;
 
-use regolith::{Options, Snapshot};
+use regolith::{Options, Snapshot, through_stalls};
 
 const KEYSPACE: u64 = 400_000;
 const VALUE_BYTES: usize = 4096;
@@ -127,7 +127,7 @@ fn main() {
         match rng.next() % 100 {
             r if r < P_WRITE => {
                 value[..8].copy_from_slice(&rng.next().to_le_bytes());
-                db.put(&k, &value)
+                through_stalls(|| db.put(&k, &value))
                     .unwrap_or_else(|e| panic!("put at op {ops}: {e}"));
                 writes += 1;
             }
@@ -150,7 +150,7 @@ fn main() {
                 black_box(bytes);
             }
             r if r < P_DELETE => {
-                db.delete(&k)
+                through_stalls(|| db.delete(&k))
                     .unwrap_or_else(|e| panic!("delete at op {ops}: {e}"));
             }
             _ => {

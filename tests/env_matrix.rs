@@ -100,7 +100,7 @@ fn full_lifecycle_runs_entirely_in_memory() {
     );
 
     // compact
-    db.compact_range(None, None).unwrap();
+    db.compact_range(None, None).wait().unwrap();
     assert_eq!(
         db.get(b"k000042").unwrap().as_deref(),
         Some(&[b'v'; 64][..])
@@ -176,6 +176,7 @@ fn a_checkpoint_copies_bytes_when_the_environment_has_no_hard_links() {
     regolith::Checkpoint::new(&db)
         .unwrap()
         .create("/checkpoint")
+        .wait()
         .expect("checkpoint must fall back to copying without hard links");
     db.close().unwrap();
     drop(db);

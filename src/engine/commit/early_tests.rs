@@ -258,6 +258,7 @@ fn split_commit(
         durability: DurabilityMode::Eventual,
         perf: crate::PerfLevel::Disable,
         early,
+        nowait: false,
     });
     let mut pipe = engine.pipeline.lock();
     let settled = engine
@@ -280,6 +281,7 @@ fn split_commit(
             latest: conflict.latest_seq(),
         },
         Ok(Settled::Write(_)) => panic!("a transaction settled as a plain write"),
+        Ok(Settled::Pending { .. }) => panic!("a blocking commit was left pending"),
         Err(e) => Outcome::Refused(e),
     };
     (outcome, false)

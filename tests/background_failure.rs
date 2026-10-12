@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use regolith::env::{
-    Capabilities, DirEntry, Env, FileLock, FileMeta, JoinHandle, ReadFile, StdEnv, WriteFile,
+    Capabilities, Env, FileLock, FileMeta, JoinHandle, ReadDir, ReadFile, StdEnv, WriteFile,
     WriteMode,
 };
 use regolith::{Db, Options};
@@ -84,7 +84,7 @@ impl Env for SstBudgetEnv {
     fn create_dir_all(&self, path: &Path) -> io::Result<()> {
         self.inner.create_dir_all(path)
     }
-    fn read_dir(&self, path: &Path) -> io::Result<Vec<DirEntry>> {
+    fn read_dir(&self, path: &Path) -> io::Result<ReadDir<'_>> {
         self.inner.read_dir(path)
     }
     fn open_read(&self, path: &Path) -> io::Result<Box<dyn ReadFile>> {
@@ -134,9 +134,6 @@ impl Env for SstBudgetEnv {
     ) -> io::Result<Box<dyn JoinHandle>> {
         self.inner.spawn(name, body)
     }
-    fn sleep(&self, dur: Duration) {
-        self.inner.sleep(dur)
-    }
 }
 
 fn sst_files(dir: &Path) -> Vec<PathBuf> {
@@ -175,7 +172,7 @@ fn a_compaction_that_fails_midway_leaves_no_outputs_behind() {
     // Room for one output, so the failure lands after a finished file.
     env.allow_ssts(1);
     for _ in 0..5 {
-        assert!(db.compact_range(None, None).is_err());
+        assert!(db.compact_range(None, None).wait().is_err());
         assert_eq!(
             sst_files(dir.path()),
             live_before,
@@ -184,7 +181,7 @@ fn a_compaction_that_fails_midway_leaves_no_outputs_behind() {
     }
 
     env.allow_ssts(UNLIMITED);
-    db.compact_range(None, None).unwrap();
+    db.compact_range(None, None).wait().unwrap();
     for i in 0..8_000u32 {
         assert!(db.get(&key(i)).unwrap().is_some(), "key {i} lost");
     }

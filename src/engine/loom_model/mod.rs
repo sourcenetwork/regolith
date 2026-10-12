@@ -83,6 +83,7 @@ pub mod arena;
 pub mod families;
 pub mod handoff;
 pub mod io_queue;
+pub mod jobs;
 pub mod skiplist;
 pub mod slice;
 pub mod snapshots;

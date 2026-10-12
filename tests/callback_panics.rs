@@ -275,11 +275,47 @@ impl RateLimiter for PanicsOnRequest {
     }
 }
 
+/// The rate limiter throttles the background alone (plan 4.10): a limiter
+/// that panics never reaches a caller's call, so the rotations writes run
+/// flush unthrottled and every write lands. On the worker its panic fails the
+/// flush it ran in, which is reported and retried as any failing flush is,
+/// and latches nothing.
 #[test]
-fn a_panicking_rate_limiter_in_the_rotation_a_write_runs_latches_the_database() {
+fn a_panicking_rate_limiter_fails_only_the_background_flush() {
     let dir = tempfile::tempdir().unwrap();
-    let options = tiny().rate_limiter(Some(Arc::new(PanicsOnRequest)));
-    assert_the_rotating_write_latches(dir.path(), options, "RateLimiter");
+    let db = Db::open(
+        dir.path(),
+        tiny().rate_limiter(Some(Arc::new(PanicsOnRequest))),
+    )
+    .unwrap();
+    // Fewer writes than it takes the rotations' own flushes to bring L0 to
+    // its stop trigger: with every background flush and compaction failing,
+    // nothing else would bring it back down.
+    for i in 0..200 {
+        db.put(&key(i), &[7u8; 512])
+            .expect("a caller's write never meets the limiter");
+    }
+    for i in 0..200 {
+        assert!(db.get(&key(i)).unwrap().is_some(), "write {i} was lost");
+    }
+    // The last sealed memtable is the worker's to flush, and its flush meets
+    // the limiter's panic.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let mut pause = std::time::Duration::from_millis(1);
+    while db
+        .get_int_property("regolith.background-errors")
+        .unwrap_or(0)
+        == 0
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the worker's flush never met the limiter"
+        );
+        std::thread::sleep(pause);
+        pause = (pause * 2).min(std::time::Duration::from_millis(50));
+    }
+    db.put(b"later", b"v")
+        .expect("a panic on the worker latches nothing");
 }
 
 struct PanicsOnExtract;

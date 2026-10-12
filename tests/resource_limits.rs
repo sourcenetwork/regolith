@@ -214,7 +214,7 @@ fn a_zero_length_key_and_a_zero_length_value_survive_flush_and_compaction() {
     assert_eq!(db.get(b"").unwrap(), Some(Vec::new()));
     assert_eq!(db.get(b"absent").unwrap(), None);
 
-    db.compact_range(None, None).unwrap();
+    db.compact_range(None, None).wait().unwrap();
     assert_eq!(db.get(b"").unwrap(), Some(Vec::new()));
     assert_eq!(db.get(b"a").unwrap(), Some(Vec::new()));
 
@@ -233,7 +233,7 @@ fn a_zero_length_key_and_a_zero_length_value_survive_flush_and_compaction() {
     assert_eq!(db.get(b"b").unwrap(), Some(b"nonempty".to_vec()));
 
     db.delete(b"").unwrap();
-    db.compact_range(None, None).unwrap();
+    db.compact_range(None, None).wait().unwrap();
     assert_eq!(
         db.get(b"").unwrap(),
         None,
@@ -310,7 +310,7 @@ fn delete_range_covers_exactly_zero_one_and_all_keys() {
     let db = fresh(&dir);
     db.delete_range(b"m", b"z").unwrap();
     assert_eq!(scan_in_order(&db).len(), 5);
-    db.compact_range(None, None).unwrap();
+    db.compact_range(None, None).wait().unwrap();
     assert_eq!(scan_in_order(&db).len(), 5, "an empty range deleted data");
 
     // One key: the half-open range [c, d) holds exactly "c".
@@ -324,7 +324,7 @@ fn delete_range_covers_exactly_zero_one_and_all_keys() {
         after.contains_key(b"d".as_slice()),
         "the exclusive upper bound must survive"
     );
-    db.compact_range(None, None).unwrap();
+    db.compact_range(None, None).wait().unwrap();
     assert_eq!(scan_in_order(&db), after);
 
     // All keys: an unbounded-below range up past the last key.
@@ -332,7 +332,7 @@ fn delete_range_covers_exactly_zero_one_and_all_keys() {
     let db = fresh(&dir);
     db.delete_range(b"", b"\xff").unwrap();
     assert!(scan_in_order(&db).is_empty());
-    db.compact_range(None, None).unwrap();
+    db.compact_range(None, None).wait().unwrap();
     assert!(scan_in_order(&db).is_empty());
     db.close().unwrap();
     drop(db);
@@ -418,13 +418,16 @@ fn the_key_size_limit_is_exact_on_the_point_and_batch_paths() {
     assert_eq!(db.get(&at_limit).unwrap(), Some(b"v".to_vec()));
     db.delete(&at_limit).unwrap();
     db.put(&at_limit, b"v").unwrap();
-    db.compact_range(Some(&at_limit), None).unwrap();
+    db.compact_range(Some(&at_limit), None).wait().unwrap();
 
     expect_invalid_argument(db.put(&over_limit, b"v"), "max_key_size");
     expect_invalid_argument(db.delete(&over_limit), "max_key_size");
     expect_invalid_argument(db.delete_range(&over_limit, b"\xff"), "max_key_size");
     expect_invalid_argument(db.delete_range(b"", &over_limit), "max_key_size");
-    expect_invalid_argument(db.compact_range(Some(&over_limit), None), "max_key_size");
+    expect_invalid_argument(
+        db.compact_range(Some(&over_limit), None).wait(),
+        "max_key_size",
+    );
 
     let mut batch = WriteBatch::new();
     batch.put(&at_limit, b"batched");
@@ -494,7 +497,7 @@ fn the_default_size_maxima_round_trip_at_exactly_the_limit() {
         assert_eq!(db.get(b"biggest").unwrap().as_ref(), Some(&value));
         assert_eq!(db.get(&key).unwrap(), Some(b"long key".to_vec()));
 
-        db.compact_range(None, None).unwrap();
+        db.compact_range(None, None).wait().unwrap();
         assert_eq!(db.get(b"biggest").unwrap().as_ref(), Some(&value));
         assert_eq!(db.get(&key).unwrap(), Some(b"long key".to_vec()));
         db.close().unwrap();
@@ -530,7 +533,7 @@ fn one_key_overwritten_100_000_times_collapses_to_a_single_version() {
         let last = format!("v{:07}", WRITES - 1).into_bytes();
         assert_eq!(db.get(b"hot").unwrap(), Some(last.clone()));
 
-        db.compact_range(None, None).unwrap();
+        db.compact_range(None, None).wait().unwrap();
 
         let live = scan_in_order(&db);
         assert_eq!(live.len(), 1, "compaction kept more than the live version");
@@ -598,7 +601,7 @@ fn one_hundred_thousand_distinct_keys_scan_in_order() {
         iter.status().unwrap();
         assert_eq!(seen, KEYS, "the scan lost or invented keys");
 
-        db.compact_range(None, None).unwrap();
+        db.compact_range(None, None).wait().unwrap();
         assert_eq!(scan_in_order(&db).len(), KEYS);
     });
 }
@@ -730,7 +733,7 @@ fn megabyte_keys_mixed_with_short_keys_survive_prefix_compression() {
         };
 
         verify(&db, "in memory");
-        db.compact_range(None, None).unwrap();
+        db.compact_range(None, None).wait().unwrap();
         verify(&db, "after compaction");
         db.close().unwrap();
         drop(db);

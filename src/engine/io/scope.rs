@@ -61,6 +61,15 @@ pub(crate) fn cache_only(id: QueueId) -> Scope {
     }
 }
 
+/// Let this thread read the device until the scope drops: a job run by
+/// `IoQueue::poll`, whoever calls it. A job never parks, so a reopen inside
+/// it is a `Blocking` one.
+pub(crate) fn blocking() -> Scope {
+    Scope {
+        previous: QUEUE.with(|queue| queue.replace(0)),
+    }
+}
+
 /// The queue this thread's misses go to, or `None` when it may read the
 /// device. The seam calls this only after the block cache missed.
 pub(crate) fn current() -> Option<QueueId> {

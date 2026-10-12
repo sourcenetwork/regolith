@@ -105,6 +105,7 @@ fn a_log_a_flush_left_behind_is_not_replayed_above_an_ingested_table() {
         writer.put(b"k", b"new").unwrap();
         writer.finish().unwrap();
         db.ingest_external_files(&[source], IngestOptions::default())
+            .wait()
             .unwrap();
         assert_eq!(db.get(b"k").unwrap().as_deref(), Some(&b"new"[..]));
         db.close().unwrap();

@@ -199,13 +199,15 @@ pub struct WriteOptions {
     /// Reserved for future use by a cooperative write-lock priority
     /// queue. Currently accepted but ignored.
     pub low_pri: bool,
-    /// Fail the write instead of waiting when the engine is stalling.
+    /// Fail the write under any write stall, a slowdown included.
     ///
-    /// A write that would otherwise block on L0 or memtable pressure
-    /// returns [`crate::Error::Busy`] straight away, carrying the reason
-    /// it would have waited for. When the engine is not stalling this has
-    /// no effect. A transactional commit takes no write options and
-    /// always waits.
+    /// No write waits on a stall: without this flag a write under a stop
+    /// returns [`crate::Error::WouldBlock`] with a [`crate::StallWait`], and a
+    /// write under a slowdown goes ahead. With it, a write under either
+    /// returns [`crate::Error::Busy`] straight away, carrying the reason,
+    /// and leaves no wait behind. When the engine is not stalling this has
+    /// no effect. A transactional commit takes no write options and is
+    /// admitted as a write without this flag.
     pub no_slowdown: bool,
 }
 
@@ -496,6 +498,7 @@ pub struct Options {
     pub(crate) fifo_compaction_options: FifoCompactionOptions,
     pub(crate) universal_compaction_options: UniversalCompactionOptions,
     pub(crate) max_background_compactions: usize,
+    pub(crate) inline_compaction: bool,
     pub(crate) max_subcompactions: usize,
     pub(crate) evict_compaction_data_from_page_cache: bool,
     pub(crate) partitioned_index: bool,
@@ -545,6 +548,7 @@ impl Default for Options {
             universal_compaction_options: UniversalCompactionOptions::default(),
             evict_compaction_data_from_page_cache: false,
             max_background_compactions: DEFAULT_MAX_BACKGROUND_COMPACTIONS,
+            inline_compaction: false,
             max_subcompactions: 1,
             partitioned_index: false,
             cache_index_and_filter_blocks: false,
@@ -628,6 +632,7 @@ impl std::fmt::Debug for Options {
                 "max_background_compactions",
                 &self.max_background_compactions,
             )
+            .field("inline_compaction", &self.inline_compaction)
             .field("max_subcompactions", &self.max_subcompactions)
             .field("partitioned_index", &self.partitioned_index)
             .field(
@@ -721,6 +726,10 @@ impl Options {
     /// - [`Options::max_background_compactions`] `0`: compaction runs
     ///   on the calling thread. Required on a single-threaded host;
     ///   on a board with a spare core, set this to `1`.
+    /// - [`Options::inline_compaction`] `true`: with no worker, a write
+    ///   a stall stops leaves the step that relieves it on its thread's
+    ///   queue, or runs it inline with no queue, so a stall clears without
+    ///   a caller compacting by hand.
     /// - [`Options::evict_compaction_data_from_page_cache`] `true`: on
     ///   a device whose page cache is a few MiB, compaction streaming
     ///   through it would evict every hot foreground page. The hint is
@@ -795,6 +804,7 @@ impl Options {
             hard_pending_compaction_bytes_limit: 16 * 1024 * 1024,
             max_write_buffer_number: 2,
             max_background_compactions: 0,
+            inline_compaction: true,
             evict_compaction_data_from_page_cache: true,
             metadata_block_size: 1024,
             max_key_size: 16 * 1024,
@@ -931,6 +941,7 @@ impl Options {
             hard_pending_compaction_bytes_limit: 128 * 1024 * 1024,
             max_write_buffer_number: 2,
             max_background_compactions: 0,
+            inline_compaction: true,
             evict_compaction_data_from_page_cache: false,
             metadata_block_size: 1024,
             max_key_size: 16 * 1024,
@@ -1152,6 +1163,7 @@ impl Options {
             universal_compaction_options: self.universal_compaction_options,
             evict_compaction_data_from_page_cache: self.evict_compaction_data_from_page_cache,
             max_background_compactions: self.max_background_compactions,
+            inline_compaction: self.inline_compaction,
             partitioned_index: self.partitioned_index,
             cache_index_and_filter_blocks: self.cache_index_and_filter_blocks,
             metadata_block_size: self.metadata_block_size,

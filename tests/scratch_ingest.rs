@@ -30,6 +30,7 @@ fn no_writers_at_all() {
                 ..IngestOptions::default()
             },
         )
+        .wait()
         .unwrap();
         let missing: Vec<usize> = (0..64)
             .filter(|i| {
@@ -77,6 +78,7 @@ fn one_plain_write_between_ingests() {
                 ..IngestOptions::default()
             },
         )
+        .wait()
         .unwrap();
         for i in 0..64 {
             let k = format!("ing_{batch:04}_{i:03}");
@@ -109,6 +111,7 @@ fn cold_cache_per_ingest() {
                 ..IngestOptions::default()
             },
         )
+        .wait()
         .unwrap();
         db.close().unwrap();
     }

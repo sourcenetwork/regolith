@@ -186,7 +186,7 @@ fn build_fixture(db_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
         value[..8].copy_from_slice(&i.to_le_bytes());
         db.put(&key(i), &value)?;
     }
-    db.compact_range(None, None)?;
+    db.compact_range(None, None).wait()?;
 
     // Now lay fresh, overlapping L0 files on top of the compacted
     // base, so a point read has to consult L0 before reaching down.
@@ -297,7 +297,7 @@ fn run_probes(db_dir: &Path) -> Result<Vec<Probe>, String> {
     ));
 
     out.push(measure("compaction merge (compact_range)", false, || {
-        let _ = std::hint::black_box(db.compact_range(None, None));
+        let _ = std::hint::black_box(db.compact_range(None, None).wait());
     }));
 
     let _ = db.close();

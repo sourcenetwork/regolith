@@ -103,12 +103,23 @@ struct Bounded {
 
 impl Charge for Bounded {
     fn reserve(&self, bytes: u64) -> io::Result<()> {
-        self.held
-            .fetch_update(StdOrdering::AcqRel, StdOrdering::Acquire, |held| {
-                (held + bytes <= self.max).then_some(held + bytes)
-            })
-            .map(|_| ())
-            .map_err(|_| io::Error::other("over the bound"))
+        // A compare-and-swap loop, which every toolchain from the MSRV to
+        // the newest stable spells the same way.
+        let mut held = self.held.load(StdOrdering::Acquire);
+        loop {
+            if held + bytes > self.max {
+                return Err(io::Error::other("over the bound"));
+            }
+            match self.held.compare_exchange_weak(
+                held,
+                held + bytes,
+                StdOrdering::AcqRel,
+                StdOrdering::Acquire,
+            ) {
+                Ok(_) => return Ok(()),
+                Err(now) => held = now,
+            }
+        }
     }
 
     fn release(&self, bytes: u64) {

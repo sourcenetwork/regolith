@@ -119,12 +119,34 @@ fn sst_id_of(path: &Path) -> u64 {
 /// Every live file must exist on disk. A version that names a file the
 /// crash never finished writing, or one a compaction already unlinked, is
 /// a dangling reference and the next read of that key range fails.
+///
+/// The recovered database has a compaction worker, which may install a new
+/// version while the directory is listed: a file it adds after the listing,
+/// or one it removes after the live set was read, is no dangling reference.
+/// So the live set is read before and after the listing, and only a listing
+/// the version did not change across is judged: a file is removed only once
+/// no version names it, so every file of a version live throughout the
+/// listing is in it.
 fn assert_no_dangling_files(db: &Db, db_dir: &Path, tag: &str) {
-    let on_disk: BTreeSet<u64> = fault::find_ssts(db_dir)
-        .iter()
-        .map(|p| sst_id_of(p))
-        .collect();
-    for id in live_file_ids(db) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let mut backoff = std::time::Duration::from_millis(1);
+    let (live, on_disk) = loop {
+        let before = live_file_ids(db);
+        let on_disk: BTreeSet<u64> = fault::find_ssts(db_dir)
+            .iter()
+            .map(|p| sst_id_of(p))
+            .collect();
+        if live_file_ids(db) == before {
+            break (before, on_disk);
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{tag}: the version kept changing while the table directory was listed",
+        );
+        std::thread::sleep(backoff);
+        backoff = (backoff * 2).min(std::time::Duration::from_millis(50));
+    };
+    for id in live {
         assert!(
             on_disk.contains(&id),
             "{tag}: the recovered version claims file {id:06}.sst is live but it is not on disk \
@@ -192,6 +214,7 @@ fn assert_functional(db: &Db, tag: &str) {
     drop(it);
 
     db.compact_range(None, None)
+        .wait()
         .unwrap_or_else(|e| panic!("{tag}: compaction on a recovered database failed: {e}"));
     assert_eq!(
         db.get(probe).unwrap(),
@@ -952,7 +975,7 @@ fn twenty_four_crash_and_reopen_cycles_accumulate_data_monotonically() {
         assert_no_dangling_files(&recovered, &db, &tag);
         assert_functional(&recovered, &tag);
         if cycle % 4 == 3 {
-            recovered.compact_range(None, None).unwrap();
+            recovered.compact_range(None, None).wait().unwrap();
             let after = fault::assert_valid_prefix(&recovered, &cumulative);
             assert_eq!(
                 after.k, report.k,

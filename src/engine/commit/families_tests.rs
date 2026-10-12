@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
 use super::super::super::{DurabilityMode, RegolithEngine, ValidationSet};
-use super::super::{Settled, WriteRequest};
+use super::super::{NowaitCommit, Settled, TxnCommit, WriteRequest};
 use crate::column_family::{ColumnFamilyHandle, DEFAULT_CF_ID, cf_lower_bound, cf_upper_bound};
 use crate::{Db, Error, IngestOptions, Options, SstFileWriter, WriteBatchOp, prefix_key};
 
@@ -237,6 +237,7 @@ fn an_ingest_installed_after_the_drop_is_refused() {
     std::thread::scope(|scope| {
         let ingest = scope.spawn(|| {
             db.ingest_external_files(std::slice::from_ref(&source), IngestOptions::default())
+                .wait()
         });
         // The ingest takes the compaction gate once its table is staged and
         // validated, then waits here for the pipeline.
@@ -266,4 +267,125 @@ fn an_ingest_installed_after_the_drop_is_refused() {
         tables_before,
         "the refused table was installed"
     );
+}
+
+/// A transaction committed with `commit_nowait` that writes `key` in family
+/// `id` at `Immediate` durability: its group needs an fsync and carries a
+/// nowait member, so the group is written and left owing its landing.
+fn nowait_txn(engine: &RegolithEngine, id: u32, key: &[u8]) -> io::Result<NowaitCommit> {
+    let mut points = BTreeMap::new();
+    points.insert(prefix_key(id, key), Some(b"v".to_vec()));
+    engine.commit_optimistic_nowait(TxnCommit {
+        checks: ValidationSet {
+            reads: Vec::new(),
+            writes_at: Some(engine.visible_seq.visible()),
+            blind_merges_commute: false,
+            exempt: Vec::new(),
+            ranges: Vec::new(),
+        },
+        point_ops: points,
+        range_deletes: Vec::new(),
+        merges: Vec::new(),
+        appends: Vec::new(),
+        durability: DurabilityMode::Immediate,
+    })
+}
+
+/// A group left owing its fsync (the commit side's deferred group): a nowait
+/// transaction to a live family and, admitted after the drop, a plain write
+/// to the dropped family, in one group. The fence runs before the group is
+/// written, so the plain write takes no sequence and is settled refused from
+/// its verdict when the owed group lands (here, by the plain writer itself,
+/// as a blocking member lands an owed group); the nowait member lands.
+#[test]
+fn a_member_fenced_in_an_owed_group_is_refused_when_the_group_lands() {
+    let (_dir, db, cf) = open();
+    let engine = &db.engine;
+    let id = cf.id();
+    let mut pipe = engine.pipeline.lock();
+    std::thread::scope(|scope| {
+        let nowait = scope.spawn(|| nowait_txn(engine, DEFAULT_CF_ID, b"nowait"));
+        await_queued(engine);
+        // The nowait ticket heads the next group; the plain write queues
+        // behind it.
+        engine.hand_off(&mut pipe);
+        let late =
+            scope.spawn(|| engine.apply_batch(put(id, b"late"), DurabilityMode::Eventual, false));
+        await_queued(engine);
+        drop_under(engine, &mut pipe, &cf);
+        let before = engine.latest_seq.load(Ordering::Acquire);
+        engine.lead_one(&mut pipe);
+        assert!(
+            pipe.pending.is_some(),
+            "setup: the group was left owing its fsync"
+        );
+        assert_eq!(
+            engine.latest_seq.load(Ordering::Acquire),
+            before + 1,
+            "the fenced member took a sequence in the owed group"
+        );
+        drop(pipe);
+        assert_refused(late.join().unwrap(), "owed group");
+        match nowait.join().unwrap().unwrap() {
+            NowaitCommit::Pending { group, member } => {
+                let settled = group.settle(engine, member).unwrap();
+                assert!(
+                    matches!(settled, Settled::Committed { seq: Some(_), .. }),
+                    "the live member of the owed group did not land: {settled:?}"
+                );
+            }
+            NowaitCommit::Done(outcome) => {
+                panic!("setup: the nowait member's group was not left owing: {outcome:?}")
+            }
+        }
+    });
+    assert_eq!(in_family(engine, id), 0);
+    assert_eq!(
+        engine
+            .get(&prefix_key(DEFAULT_CF_ID, b"nowait"), u64::MAX)
+            .unwrap(),
+        Some(b"v".to_vec())
+    );
+}
+
+/// A group left owing its landing that wrote to a family is landed before
+/// the family's drop runs its own group: create and drop take the pipeline
+/// as every administrative caller does (`lock_pipeline`), and their group of
+/// one lands what the last leader left owing first (`lead_alone`). So the
+/// owed write is applied and published below the tombstone, before the
+/// drop's group publishes past it.
+#[test]
+fn a_drop_lands_the_group_left_owing_before_it_runs() {
+    let (_dir, db, cf) = open();
+    let engine = &db.engine;
+    let id = cf.id();
+    let (group, member) = match nowait_txn(engine, id, b"owed").unwrap() {
+        NowaitCommit::Pending { group, member } => (group, member),
+        NowaitCommit::Done(outcome) => {
+            panic!("setup: the nowait commit's group was not left owing: {outcome:?}")
+        }
+    };
+    assert!(
+        !group.is_landed(),
+        "setup: nothing landed the owed group yet"
+    );
+    let owed_seq = engine.latest_seq.load(Ordering::Acquire);
+    db.drop_column_family(cf).unwrap();
+    assert!(
+        group.is_landed(),
+        "the drop ran with a group left owing ahead of it"
+    );
+    let settled = group
+        .take(member)
+        .expect("the owed group settled its member");
+    assert!(
+        matches!(settled, Ok(Settled::Committed { seq: Some(seq), .. }) if seq == owed_seq),
+        "the owed member did not land at its own sequence: {settled:?}"
+    );
+    // Visible at its own sequence, below the tombstone, and deleted above it.
+    assert_eq!(
+        engine.get(&prefix_key(id, b"owed"), owed_seq).unwrap(),
+        Some(b"v".to_vec())
+    );
+    assert_eq!(in_family(engine, id), 0);
 }

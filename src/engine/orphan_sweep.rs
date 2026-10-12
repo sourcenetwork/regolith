@@ -18,6 +18,10 @@
 //! so no other writer can be creating one of these files. Removing them
 //! is idempotent: a crash part way through leaves a directory the next
 //! open sweeps the same way.
+//!
+//! The directory is walked one entry at a time and each orphan is removed
+//! as the walk reaches it, so the sweep holds the version's live ids,
+//! which the open holds anyway, and one entry, never the directory.
 
 use std::collections::HashSet;
 use std::io;
@@ -48,6 +52,7 @@ pub(crate) fn sweep_unreferenced_tables(
         return Ok(report);
     }
     for entry in env.read_dir(sst_dir)? {
+        let entry = entry?;
         // A table renamed aside on removal while a handle read it (see
         // `env::open_file_limit`): its handles died with the process.
         let removed = crate::env::is_removed_table(&entry.path);

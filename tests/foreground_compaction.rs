@@ -2,10 +2,10 @@
 //!
 //! Every test here runs a database with no background worker, which is
 //! the only mode a single-threaded host such as `wasm32-wasip1` can
-//! open in. The invariant under test throughout is that a writer never
-//! blocks on a signal that nobody will send: it either does the
-//! compaction work on its own thread or returns
-//! [`regolith::Error::Busy`].
+//! open in, with inline compaction on and no I/O queue. The invariant
+//! under test throughout is that a writer never blocks on a signal that
+//! nobody will send: it either does the compaction work on its own thread
+//! or returns [`regolith::Error::Busy`].
 
 // Native-only. wasm-pack builds every test target for wasm32, and these use
 // threads, the filesystem or proptest, none of which exist there. The browser
@@ -34,6 +34,7 @@ fn foreground_options() -> Options {
         .level0_slowdown_writes_trigger(4)
         .level0_stop_writes_trigger(8)
         .max_background_compactions(0)
+        .inline_compaction(true)
 }
 
 fn value(i: usize) -> Vec<u8> {
@@ -391,7 +392,7 @@ fn full_lifecycle_with_zero_workers() {
     drop(snapshot);
 
     db.flush().unwrap();
-    db.compact_range(None, None).unwrap();
+    db.compact_range(None, None).wait().unwrap();
     while db.compact_step().unwrap() == CompactionOutcome::DidWork {}
 
     db.close().unwrap();

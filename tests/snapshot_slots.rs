@@ -94,7 +94,7 @@ fn a_moved_snapshot_keeps_its_version_through_compaction() {
     .unwrap();
     db.put(b"k", b"new").unwrap();
     db.flush().unwrap();
-    db.compact_range(None, None).unwrap();
+    db.compact_range(None, None).wait().unwrap();
     let seen = thread::spawn(move || {
         let value = snapshot.get(b"k").unwrap();
         drop(snapshot);

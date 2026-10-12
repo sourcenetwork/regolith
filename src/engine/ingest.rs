@@ -412,7 +412,7 @@ impl RegolithEngine {
             self.l0_holders(&self.published_version(), lo, hi)?
         };
 
-        let _pipeline = self.pipeline.lock();
+        let _pipeline = self.lock_pipeline();
         // The ordered step: a family the table writes into that a drop
         // retired since the table was validated refuses the install, before
         // it takes a sequence.

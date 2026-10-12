@@ -50,7 +50,9 @@ fn fill(db: &Db, keys: u64) {
         }
         db.write(batch).expect("fill write");
     }
-    db.compact_range(None, None).expect("fill compaction");
+    db.compact_range(None, None)
+        .wait()
+        .expect("fill compaction");
 }
 
 /// Reads per second of `threads` threads each running `read` `per_thread`

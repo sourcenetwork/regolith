@@ -42,7 +42,7 @@ impl Env for Hooked {
     fn create_dir_all(&self, path: &Path) -> io::Result<()> {
         self.inner.create_dir_all(path)
     }
-    fn read_dir(&self, path: &Path) -> io::Result<Vec<DirEntry>> {
+    fn read_dir(&self, path: &Path) -> io::Result<ReadDir<'_>> {
         self.inner.read_dir(path)
     }
     fn metadata(&self, path: &Path) -> io::Result<FileMeta> {
@@ -78,9 +78,6 @@ impl Env for Hooked {
         body: Box<dyn FnOnce() + Send + 'static>,
     ) -> io::Result<Box<dyn JoinHandle>> {
         self.inner.spawn(name, body)
-    }
-    fn sleep(&self, dur: Duration) {
-        self.inner.sleep(dur)
     }
 }
 

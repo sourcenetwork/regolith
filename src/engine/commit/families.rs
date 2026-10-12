@@ -155,7 +155,7 @@ impl RegolithEngine {
         let families = self.families()?;
         self.ensure_writable()?;
         let created = {
-            let mut pipe = self.pipeline.lock();
+            let mut pipe = self.lock_pipeline();
             if let Some(existing) = families.get(name) {
                 return Ok(existing);
             }
@@ -201,7 +201,7 @@ impl RegolithEngine {
         let families = self.families()?;
         self.ensure_writable()?;
         let dropped = {
-            let mut pipe = self.pipeline.lock();
+            let mut pipe = self.lock_pipeline();
             let dropped = self.drop_family_locked(&mut pipe, families, cf, durability);
             self.hand_off(&mut pipe);
             dropped
@@ -246,8 +246,11 @@ impl RegolithEngine {
 
     /// Commit `request` as a group of its own and return its outcome. The
     /// caller holds the pipeline and hands it on after acting on the outcome
-    /// inside the ordered step.
+    /// inside the ordered step. A group the previous leader left owing its
+    /// landing lands first, as `lead_with` lands it, so this group's
+    /// sequences and its publication come after that one's.
     fn lead_alone(&self, pipe: &mut Pipeline, request: WriteRequest) -> io::Result<Settled> {
+        self.land_pending(pipe);
         release_stranded(&mut pipe.group);
         pipe.group.push(GroupTicket::new(None, request));
         let view = self.view.load();

@@ -135,8 +135,8 @@ fn run(
         .collect();
     for k in &keys {
         match &cf {
-            Some(h) => db.put_cf(h, k, &value_of(0)).expect("seed"),
-            None => db.put(k, &value_of(0)).expect("seed"),
+            Some(h) => regolith::through_stalls(|| db.put_cf(h, k, &value_of(0))).expect("seed"),
+            None => regolith::through_stalls(|| db.put(k, &value_of(0))).expect("seed"),
         }
     }
 
@@ -159,8 +159,12 @@ fn run(
             for v in 1..=versions {
                 for i in 0..keys_per_writer {
                     match &cf {
-                        Some(h) => db.put_cf(h, &key_of(w, i), &value_of(v)).expect("put_cf"),
-                        None => db.put(&key_of(w, i), &value_of(v)).expect("put"),
+                        Some(h) => {
+                            regolith::through_stalls(|| db.put_cf(h, &key_of(w, i), &value_of(v)))
+                                .expect("put_cf")
+                        }
+                        None => regolith::through_stalls(|| db.put(&key_of(w, i), &value_of(v)))
+                            .expect("put"),
                     }
                 }
             }
@@ -179,7 +183,7 @@ fn run(
             gate.wait();
             let mut n = 0u64;
             loop {
-                db.compact_range(None, None).expect("compact_range");
+                db.compact_range(None, None).wait().expect("compact_range");
                 n += 1;
                 if n >= 3 && live.load(Ordering::Acquire) == 0 && stop.load(Ordering::Acquire) {
                     break;

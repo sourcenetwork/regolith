@@ -146,7 +146,7 @@ fn check(set_name: &str, keys: &[Vec<u8>], state: State, surface: Surface) -> Ve
                 .expect("put");
             db.delete(b"\x7f_flush_trigger").expect("delete");
         }
-        State::Compacted => db.compact_range(None, None).expect("compact"),
+        State::Compacted => db.compact_range(None, None).wait().expect("compact"),
     }
 
     let snap = db.snapshot();
@@ -289,7 +289,7 @@ fn seek_for_prev_matches_the_oracle_at_every_adversarial_probe() {
         for (k, v) in &want {
             db.put(k, v).expect("put");
         }
-        db.compact_range(None, None).expect("compact");
+        db.compact_range(None, None).wait().expect("compact");
 
         let mut targets: Vec<Vec<u8>> = want.keys().cloned().collect();
         for k in want.keys() {

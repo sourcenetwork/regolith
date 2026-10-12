@@ -21,7 +21,8 @@
 
 use std::sync::Arc;
 
-use super::callbacks::{AbortReason, OnAbort, survive};
+use super::TransactionHooks;
+use super::callbacks::{AbortReason, OnAbort, survive_after};
 use super::handoff::Handoff;
 use crate::engine::RegolithEngine;
 use crate::portability::{AtomicU8, Ordering};
@@ -92,19 +93,26 @@ impl Claim {
     }
 
     /// Run the `on_abort` callbacks still registered, oldest first, each at
-    /// most once: this call took them, so no other thread has them.
-    pub(super) fn run_callbacks(&self, engine: &RegolithEngine, reason: &AbortReason<'_>) {
+    /// most once: this call took them, so no other thread has them. A panic
+    /// is reported to `report`'s listeners.
+    pub(super) fn run_callbacks(&self, report: Option<&RegolithEngine>, reason: &AbortReason<'_>) {
         for f in self.on_abort.take() {
-            survive(engine, "on_abort", || f(reason));
+            survive_after(report, "on_abort", || f(reason));
         }
     }
 
     /// What an abort owes: the transaction's `on_abort` callbacks, then the
-    /// database hook's. The one function the owner and `close` both call.
-    pub(super) fn run_abort(&self, engine: &RegolithEngine, reason: &AbortReason<'_>) {
-        self.run_callbacks(engine, reason);
-        if let Some(hooks) = engine.transaction_hooks() {
-            survive(engine, "TransactionHooks::on_abort", || {
+    /// database hook's. The one function the owner, a ticket's delivery and
+    /// `close` all call.
+    pub(super) fn run_abort(
+        &self,
+        report: Option<&RegolithEngine>,
+        hooks: Option<&std::sync::Arc<dyn TransactionHooks>>,
+        reason: &AbortReason<'_>,
+    ) {
+        self.run_callbacks(report, reason);
+        if let Some(hooks) = hooks {
+            survive_after(report, "TransactionHooks::on_abort", || {
                 hooks.on_abort(reason)
             });
         }
@@ -114,7 +122,11 @@ impl Claim {
     /// thread.
     pub(crate) fn abort_for_close(&self, engine: &RegolithEngine) {
         if self.abort() {
-            self.run_abort(engine, &AbortReason::Closed);
+            self.run_abort(
+                Some(engine),
+                engine.transaction_hooks(),
+                &AbortReason::Closed,
+            );
         }
     }
 }

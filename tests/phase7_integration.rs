@@ -24,8 +24,17 @@
 //!   the last reader unlinks it, no second open can sweep under a live
 //!   reader, and an open sweeps one a crash left.
 //!
-//! The column-family fence on each group-commit path is tested where the
-//! fence is, in `engine::commit::families`.
+//! - **The commit side** (#276 x Phase 7). Commits through `commit_nowait`
+//!   on each writer's own queue, with the flushes and steps they owe run as
+//!   jobs on that queue, publish the read view like every other publisher;
+//!   a `transact_async` attempt that suspends on a miss and re-runs on a
+//!   conflict holds one snapshot pin per attempt and releases each once; a
+//!   checkpoint run as a job, on the worker or on the caller's queue, under a
+//!   hard open-file bound copies only what the version names.
+//!
+//! The column-family fence on each group-commit path, the group left owing
+//! its fsync included, is tested where the fence is, in
+//! `engine::commit::families`.
 
 mod common;
 
@@ -36,8 +45,9 @@ use std::time::{Duration, Instant};
 
 use common::keys::Keys;
 use regolith::{
-    BackupEngine, Checkpoint, Db, DbSlice, Error, IngestOptions, IoBudget, IoQueue, Options,
-    ReadMode, SstFileWriter, Statistics, Ticker,
+    BackupEngine, Checkpoint, Db, DbSlice, DurabilityMode, Error, IngestOptions, IoBudget, IoQueue,
+    OptimisticTransactionDb, Options, ReadMode, RetryPolicy, SstFileWriter, Statistics, Ticker,
+    TransactionError, TxnOptions, ready, through_stalls,
 };
 use tempfile::TempDir;
 
@@ -125,7 +135,7 @@ fn publishers_racing_readers(options: Options, ingest_dir: &Path) {
                         for k in 0..KEYS {
                             let mut value = v.to_be_bytes().to_vec();
                             value.resize(512, b'f');
-                            db.put(&key(w, k), &value).unwrap();
+                            through_stalls(|| db.put(&key(w, k), &value)).unwrap();
                         }
                     }
                 })
@@ -142,6 +152,7 @@ fn publishers_racing_readers(options: Options, ingest_dir: &Path) {
                 }
                 writer.finish().unwrap();
                 db.ingest_external_files(&[source], IngestOptions::default())
+                    .wait()
                     .unwrap();
             }
         });
@@ -168,17 +179,22 @@ fn publishers_racing_readers(options: Options, ingest_dir: &Path) {
                 })
             })
             .collect();
-        for writer in writers {
-            writer.join().unwrap();
-        }
-        ingest.join().unwrap();
+        // Every writer's and the ingest's outcome first, then the readers
+        // are stopped, so a writer that fails is reported rather than
+        // leaving the readers spinning.
+        let wrote: Vec<_> = writers.into_iter().map(|w| w.join()).collect();
+        let ingested = ingest.join();
         done.store(true, Ordering::Release);
         for reader in readers {
             reader.join().unwrap();
         }
+        for outcome in wrote {
+            outcome.unwrap();
+        }
+        ingested.unwrap();
     });
     assert!(reads.load(Ordering::Relaxed) > 0);
-    db.compact_range(None, None).unwrap();
+    db.compact_range(None, None).wait().unwrap();
     for w in 0..WRITERS {
         for k in 0..KEYS {
             let value = db.get(&key(w, k)).unwrap().expect("a write was lost");
@@ -212,7 +228,8 @@ fn every_view_publisher_racing_readers_loses_no_write_with_a_worker() {
 }
 
 /// With no worker, every flush and compaction is a step a writer runs after
-/// its commit, or inside a stall: those publish the read view too.
+/// its commit, or the compaction a stopped writer runs to relieve the stall
+/// (inline compaction): those publish the read view too.
 #[test]
 fn every_view_publisher_racing_readers_loses_no_write_without_a_worker() {
     let ingest_dir = TempDir::new().unwrap();
@@ -220,6 +237,7 @@ fn every_view_publisher_racing_readers_loses_no_write_without_a_worker() {
         Options::default()
             .write_buffer_size(4 * 1024)
             .max_background_compactions(0)
+            .inline_compaction(true)
             .level0_slowdown_writes_trigger(2)
             .l0_compaction_trigger(3),
         ingest_dir.path(),
@@ -251,7 +269,7 @@ fn snapshots_moved_across_threads_keep_their_versions_through_compaction() {
                 for k in 0..20u64 {
                     let mut value = v.to_be_bytes().to_vec();
                     value.resize(256, b'f');
-                    db.put(&numbered(k), &value).unwrap();
+                    through_stalls(|| db.put(&numbered(k), &value)).unwrap();
                 }
                 send.send((v, db.snapshot())).unwrap();
                 if v % 5 == 4 {
@@ -265,7 +283,7 @@ fn snapshots_moved_across_threads_keep_their_versions_through_compaction() {
             while let Ok((v, snapshot)) = receive.recv() {
                 held.push((v, snapshot));
                 if held.len() % 7 == 0 {
-                    db.compact_range(None, None).unwrap();
+                    db.compact_range(None, None).wait().unwrap();
                 }
                 for (v, snapshot) in &held {
                     let value = snapshot.get(&numbered(*v % 20)).unwrap().unwrap();
@@ -292,7 +310,7 @@ fn snapshots_moved_across_threads_keep_their_versions_through_compaction() {
         assert_eq!(waiter.join().unwrap(), 0, "the wait missed a release");
     });
     assert_eq!(db.get_int_property("regolith.num-snapshots"), Some(0));
-    db.compact_range(None, None).unwrap();
+    db.compact_range(None, None).wait().unwrap();
     for k in 0..20u64 {
         let value = db.get(&numbered(k)).unwrap().unwrap();
         assert_eq!(
@@ -325,10 +343,10 @@ fn a_cache_full_of_held_sealed_blocks_refuses_counts_and_queued_reads_still_land
     {
         let db = Db::open(dir.path(), small_sealed_cache(&stats)).unwrap();
         for i in 0..4_000u64 {
-            db.put(&numbered(i), &[b'v'; 200]).unwrap();
+            through_stalls(|| db.put(&numbered(i), &[b'v'; 200])).unwrap();
         }
         db.flush().unwrap();
-        db.compact_range(None, None).unwrap();
+        db.compact_range(None, None).wait().unwrap();
         db.close().unwrap();
     }
     let db = Db::open(dir.path(), small_sealed_cache(&stats)).unwrap();
@@ -391,10 +409,10 @@ fn close_completes_queued_reads_of_sealed_blocks_the_cache_cannot_keep() {
     {
         let db = Db::open(dir.path(), small_sealed_cache(&stats)).unwrap();
         for i in 0..4_000u64 {
-            db.put(&numbered(i), &[b'v'; 200]).unwrap();
+            through_stalls(|| db.put(&numbered(i), &[b'v'; 200])).unwrap();
         }
         db.flush().unwrap();
-        db.compact_range(None, None).unwrap();
+        db.compact_range(None, None).wait().unwrap();
         db.close().unwrap();
     }
     let db = Db::open(dir.path(), small_sealed_cache(&stats)).unwrap();
@@ -465,6 +483,7 @@ fn a_hard_open_file_limit_reads_sealed_tables_and_an_ingest_at_its_sequence() {
         }
         writer.finish().unwrap();
         db.ingest_external_files(std::slice::from_ref(&source), IngestOptions::default())
+            .wait()
             .unwrap();
         db.close().unwrap();
     }
@@ -544,7 +563,7 @@ fn backups_and_checkpoints_never_copy_a_table_renamed_aside() {
     for i in 0..200 {
         db.put(&numbered(i), b"after").unwrap();
     }
-    db.compact_range(None, None).unwrap();
+    db.compact_range(None, None).wait().unwrap();
     // The four the iterator holds; the table the compaction flushed first is
     // held only by views the reclaimer has yet to free, and may go any time.
     let aside: Vec<PathBuf> = table_dir_files(&dir, REMOVED)
@@ -563,7 +582,11 @@ fn backups_and_checkpoints_never_copy_a_table_renamed_aside() {
     );
 
     let checkpoint = root.path().join("checkpoint");
-    Checkpoint::new(&db).unwrap().create(&checkpoint).unwrap();
+    Checkpoint::new(&db)
+        .unwrap()
+        .create(&checkpoint)
+        .wait()
+        .unwrap();
     let backups = root.path().join("backups");
     let mut engine = BackupEngine::open(&backups).unwrap();
     let id = engine.create_backup(&db).unwrap();
@@ -621,4 +644,325 @@ fn backups_and_checkpoints_never_copy_a_table_renamed_aside() {
     let db = Db::open(&dir, options()).unwrap();
     assert!(!left.exists(), "the open left a table renamed aside");
     assert_eq!(db.get(&numbered(0)).unwrap(), Some(b"after".to_vec()));
+}
+
+// The commit side --------------------------------------------------------------
+
+/// Writers commit through `commit_nowait` on queues of their own at
+/// `Immediate` durability, with no worker: their groups are left owing their
+/// fsync and land at a poll, and the flushes and compaction steps their
+/// writes owe run as jobs on their queues. Readers on other threads never see
+/// a key go back, and every write lands.
+#[test]
+fn nowait_commits_and_owed_steps_on_queues_lose_no_write_under_readers() {
+    const WRITERS: u64 = 3;
+    const KEYS: u64 = 20;
+    const VERSIONS: u64 = 15;
+    let dir = TempDir::new().unwrap();
+    let db = OptimisticTransactionDb::open(
+        dir.path(),
+        Options::default()
+            .write_buffer_size(4 * 1024)
+            .max_background_compactions(0)
+            .inline_compaction(true)
+            .durability(DurabilityMode::Immediate),
+    )
+    .unwrap();
+    let key = |w: u64, k: u64| format!("w{w}/{k:03}").into_bytes();
+    let done = AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        let writers: Vec<_> = (0..WRITERS)
+            .map(|w| {
+                let db = &db;
+                scope.spawn(move || {
+                    // Made on this thread, so the I/O its writes owe is left
+                    // here and run at its polls.
+                    let mut queue = db.db().io_queue();
+                    for v in 1..=VERSIONS {
+                        for k in 0..KEYS {
+                            let mut value = v.to_be_bytes().to_vec();
+                            value.resize(256, b'n');
+                            loop {
+                                let txn = db.begin(&TxnOptions::new().io_queue(queue.id()));
+                                txn.put(&key(w, k), &value).unwrap();
+                                match queue.block_on(txn.commit_nowait()) {
+                                    Ok(_) => break,
+                                    Err(TransactionError::WouldBlock(stall)) => {
+                                        let _ = stall;
+                                        queue.poll(IoBudget::ALL);
+                                    }
+                                    Err(other) => panic!("a nowait commit failed: {other}"),
+                                }
+                            }
+                        }
+                    }
+                })
+            })
+            .collect();
+        let readers: Vec<_> = (0..2u64)
+            .map(|r| {
+                let (db, done) = (&db, &done);
+                scope.spawn(move || {
+                    let mut seen = vec![0u64; (WRITERS * KEYS) as usize];
+                    let mut i = r;
+                    while !done.load(Ordering::Acquire) {
+                        let (w, k) = (i % WRITERS, (i / WRITERS) % KEYS);
+                        if let Some(value) = db.db().get(&key(w, k)).unwrap() {
+                            let version = u64::from_be_bytes(value[..8].try_into().unwrap());
+                            let slot = &mut seen[(w * KEYS + k) as usize];
+                            assert!(version >= *slot, "a read of w{w}/{k:03} went back");
+                            *slot = version;
+                        }
+                        i = i.wrapping_add(5);
+                    }
+                })
+            })
+            .collect();
+        let wrote: Vec<_> = writers.into_iter().map(|w| w.join()).collect();
+        done.store(true, Ordering::Release);
+        for reader in readers {
+            reader.join().unwrap();
+        }
+        for outcome in wrote {
+            outcome.unwrap();
+        }
+    });
+    for w in 0..WRITERS {
+        for k in 0..KEYS {
+            let value = db.db().get(&key(w, k)).unwrap().expect("a write was lost");
+            assert_eq!(u64::from_be_bytes(value[..8].try_into().unwrap()), VERSIONS);
+        }
+    }
+}
+
+/// A `transact_async` attempt suspends on cache misses and resumes at the
+/// queue's polls; the first attempt then loses a race and the closure runs
+/// again. While suspended, exactly the running attempt's snapshot is pinned;
+/// once the future resolves, every attempt's pin was released exactly once.
+#[test]
+fn transact_async_attempts_pin_one_snapshot_each_and_release_it_once() {
+    let dir = TempDir::new().unwrap();
+    let stats = Arc::new(Statistics::new());
+    let options = || {
+        Options::default()
+            .block_size(256)
+            .statistics(Some(Arc::clone(&stats)))
+    };
+    {
+        let db = Db::open(dir.path(), options()).unwrap();
+        for i in 0..2_000u64 {
+            db.put(&numbered(i), b"cold").unwrap();
+        }
+        db.flush().unwrap();
+        db.close().unwrap();
+    }
+    // Reopened, so the reads below miss the cache and suspend.
+    let db = OptimisticTransactionDb::open(dir.path(), options()).unwrap();
+    let mut queue = db.db().io_queue();
+    let registered = || stats.get_ticker(Ticker::SnapshotsRegistered);
+    let released = || stats.get_ticker(Ticker::SnapshotsReleased);
+    let (reg0, rel0) = (registered(), released());
+    let attempts = std::cell::Cell::new(0u64);
+    let policy = RetryPolicy::new(4);
+    let future = db.transact_async(
+        queue.id(),
+        &policy,
+        async |txn: &mut regolith::Transaction, previous: Option<&regolith::Conflict>| {
+            attempts.set(attempts.get() + 1);
+            let first = ready(|| txn.get_slice(&numbered(10))).await?;
+            let second = ready(|| txn.get_slice(&numbered(1_900))).await?;
+            assert!(first.is_some() && second.is_some());
+            if previous.is_none() {
+                // Another writer changes what the attempt read: it conflicts.
+                db.db().put(&numbered(10), b"raced").unwrap();
+            }
+            txn.put(&numbered(10), b"mine")?;
+            Ok::<_, TransactionError>(())
+        },
+    );
+    let mut future = std::pin::pin!(future);
+    let waker = std::task::Waker::noop();
+    let mut cx = std::task::Context::from_waker(waker);
+    let mut suspensions = 0;
+    let outcome = loop {
+        match future.as_mut().poll(&mut cx) {
+            std::task::Poll::Ready(outcome) => break outcome,
+            std::task::Poll::Pending => {
+                suspensions += 1;
+                assert_eq!(
+                    db.db().get_int_property("regolith.num-snapshots"),
+                    Some(1),
+                    "a suspended attempt pins its own snapshot and no other"
+                );
+                queue.poll(IoBudget::ALL);
+                assert!(suspensions < 10_000, "the attempt never finished");
+            }
+        }
+    };
+    outcome.expect("the transaction committed on its second attempt");
+    assert!(suspensions > 0, "setup: the attempt suspended on a miss");
+    assert_eq!(attempts.get(), 2, "setup: the first attempt lost the race");
+    assert_eq!(registered() - reg0, 2, "one pin per attempt");
+    assert_eq!(released() - rel0, 2, "every attempt's pin released once");
+    assert_eq!(db.db().get_int_property("regolith.num-snapshots"), Some(0));
+    assert_eq!(db.db().get(&numbered(10)).unwrap(), Some(b"mine".to_vec()));
+}
+
+/// A checkpoint run as a job (on the compaction worker, or with no worker on
+/// the caller's queue), while a held iterator keeps tables a compaction
+/// renamed aside under a hard open-file bound: the checkpoint copies only the
+/// tables the version names, and opens with every key.
+fn checkpoint_job_under_an_open_file_bound(workers: usize) {
+    let root = TempDir::new().unwrap();
+    let dir = root.path().join("db");
+    let options = || {
+        Options::default()
+            .max_open_files(3)
+            .block_cache_size(0)
+            .max_background_compactions(workers)
+            .l0_compaction_trigger(64)
+    };
+    let db = Db::open(&dir, options()).unwrap();
+    let mut queue = db.io_queue();
+    for table in 0..4u64 {
+        for k in 0..50 {
+            db.put(&numbered(table * 50 + k), b"before").unwrap();
+        }
+        db.flush().unwrap();
+    }
+    let mut held = db.iter();
+    held.seek_to_first();
+    for i in 0..200 {
+        db.put(&numbered(i), b"after").unwrap();
+    }
+    db.compact_range(None, None).wait().unwrap();
+    assert!(
+        !table_dir_files(&dir, REMOVED).is_empty(),
+        "setup: the compaction renamed the tables the iterator holds aside"
+    );
+    let checkpoint = root.path().join("checkpoint");
+    let ticket = Checkpoint::new(&db).unwrap().create(&checkpoint);
+    // With no worker the job waits on this thread's queue for its poll.
+    queue.block_on(ticket).unwrap();
+    let names = all_names(&checkpoint);
+    assert!(
+        !names.iter().any(|n| n.contains(REMOVED)),
+        "a table renamed aside was copied: {names:?}"
+    );
+    let opened = Db::open(&checkpoint, options()).unwrap();
+    for i in 0..200 {
+        assert_eq!(opened.get(&numbered(i)).unwrap(), Some(b"after".to_vec()));
+    }
+    let mut read = 0;
+    while held.valid() {
+        assert_eq!(held.value(), Some(&b"before"[..]));
+        read += 1;
+        held.next();
+    }
+    held.status().unwrap();
+    assert_eq!(read, 200);
+}
+
+#[test]
+fn a_checkpoint_job_on_the_worker_under_an_open_file_bound_copies_only_live_tables() {
+    checkpoint_job_under_an_open_file_bound(1);
+}
+
+#[test]
+fn a_checkpoint_job_on_the_callers_queue_under_an_open_file_bound_copies_only_live_tables() {
+    checkpoint_job_under_an_open_file_bound(0);
+}
+
+/// Holds a compaction at its start until told to go on, and says when one
+/// began.
+struct HoldCompaction {
+    held: AtomicBool,
+    began: std::sync::mpsc::SyncSender<()>,
+    go_on: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+}
+
+impl regolith::EventListener for HoldCompaction {
+    fn on_compaction_begin(&self, _: &regolith::CompactionJobInfo) {
+        // Only the first compaction is held.
+        if !self.held.swap(true, Ordering::AcqRel) && self.began.try_send(()).is_ok() {
+            // Bounded: a test that never says go on fails on its own wait.
+            let _ = self
+                .go_on
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(30));
+        }
+    }
+}
+
+/// A database dropped while its compaction worker is inside a job the caller
+/// did not wait for. The worker holds the engine until the job ends, so the
+/// engine is torn down on the worker's own thread: that must stop the other
+/// workers, join no thread with itself, and release the directory, which
+/// then opens again with every write.
+#[test]
+fn a_database_dropped_under_a_running_job_releases_its_directory_and_reopens() {
+    // A panic on one of the database's own threads, which no join reports.
+    static WORKER_PANICKED: AtomicBool = AtomicBool::new(false);
+    let earlier = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        if std::thread::current()
+            .name()
+            .is_some_and(|name| name.starts_with("regolith-"))
+        {
+            WORKER_PANICKED.store(true, Ordering::Release);
+        }
+        earlier(info);
+    }));
+
+    let dir = TempDir::new().unwrap();
+    let (began_tx, began) = std::sync::mpsc::sync_channel(1);
+    let (go_on, go_on_rx) = std::sync::mpsc::channel();
+    let hold = Arc::new(HoldCompaction {
+        held: AtomicBool::new(false),
+        began: began_tx,
+        go_on: std::sync::Mutex::new(go_on_rx),
+    });
+    // No pass starts by itself: the only compaction is the job's.
+    let options = || {
+        Options::default()
+            .write_buffer_size(64 << 20)
+            .max_background_compactions(2)
+            .l0_compaction_trigger(1_000)
+            .level0_slowdown_writes_trigger(0)
+            .level0_stop_writes_trigger(0)
+    };
+    let db = Db::open(
+        dir.path(),
+        options().listeners(vec![hold as Arc<dyn regolith::EventListener>]),
+    )
+    .unwrap();
+    for i in 0..400u64 {
+        db.put(&numbered(i), &[7u8; 256]).unwrap();
+        // Several level 0 tables, so the job has a compaction to run.
+        if i % 100 == 99 {
+            db.flush().unwrap();
+        }
+    }
+    // The ticket is dropped: the job runs on, on a worker.
+    drop(db.compact_range(None, None));
+    began
+        .recv_timeout(Duration::from_secs(30))
+        .expect("the compaction began");
+    drop(db);
+    go_on.send(()).unwrap();
+
+    let mut reopened = None;
+    wait_until("the dropped database to release its directory", || {
+        reopened = Db::open(dir.path(), options()).ok();
+        reopened.is_some()
+    });
+    let db = reopened.unwrap();
+    assert!(
+        !WORKER_PANICKED.load(Ordering::Acquire),
+        "a worker panicked tearing the database down"
+    );
+    for i in 0..400u64 {
+        assert!(db.get(&numbered(i)).unwrap().is_some(), "key {i}");
+    }
 }

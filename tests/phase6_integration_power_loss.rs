@@ -91,11 +91,13 @@ impl FlushPath {
             FlushPath::Worker => options.max_background_compactions(1),
             FlushPath::AfterCommit => options.max_background_compactions(0),
             // One table at L0 slows every write down, and a slowed write with
-            // no worker first runs one bounded step. The compaction trigger is
-            // out of reach and the stop trigger off, so the steps between
-            // flushes find nothing to do.
+            // no worker and inline compaction on owes one bounded step, run
+            // once its commit returned. The compaction trigger is out of reach
+            // and the stop trigger off, so the steps between flushes find
+            // nothing to do.
             FlushPath::StallStep => options
                 .max_background_compactions(0)
+                .inline_compaction(true)
                 .level0_slowdown_writes_trigger(1)
                 .level0_stop_writes_trigger(0)
                 .l0_compaction_trigger(1000),
