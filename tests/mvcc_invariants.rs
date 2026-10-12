@@ -359,14 +359,16 @@ fn delete_then_compact_then_reopen_keeps_every_surviving_version() {
 
     let (before_scan, before_iter) = {
         let (db, stats) = open_instrumented(dir.path(), 16 * 1024);
+        // Through stalls: on a host with few cores the compaction worker
+        // falls behind these writes, and a stopped write waits for it.
         for i in 0..total {
-            db.put(&key_at(i), &stamped_value(1)).unwrap();
+            regolith::through_stalls(|| db.put(&key_at(i), &stamped_value(1))).unwrap();
         }
         for i in (1..total).step_by(3) {
-            db.put(&key_at(i), &stamped_value(2)).unwrap();
+            regolith::through_stalls(|| db.put(&key_at(i), &stamped_value(2))).unwrap();
         }
         for i in (2..total).step_by(3) {
-            db.delete(&key_at(i)).unwrap();
+            regolith::through_stalls(|| db.delete(&key_at(i))).unwrap();
         }
         db.compact_range(None, None).wait().unwrap();
 
