@@ -46,7 +46,9 @@ pub(crate) mod snapshot_registry;
 pub(crate) mod source_walk;
 pub(crate) mod sstable;
 mod stall_state;
+mod step;
 pub(crate) mod take;
+pub(crate) mod version_store;
 pub(crate) mod wal;
 #[cfg(test)]
 mod wal_close_tests;
@@ -82,7 +84,7 @@ const STOP_TOO_MANY_MEMTABLES: &str = "stop: too many memtables";
 use log_retirement::RetiredLogs;
 use read_horizon::ReadHorizon;
 pub(crate) use read_rule::ReadRule;
-use read_view::{ReadView, ReadViewCell, VersionStore};
+use read_view::{ReadView, ReadViewCell};
 use recovery::{
     replay_logs, report_discarded_tail, report_dropped_manifest_tail,
     rewrite_recovered_memtable_to_wal,
@@ -91,6 +93,7 @@ use skiplist::InsertHint;
 pub(crate) use snapshot_registry::SnapshotPin;
 use snapshot_registry::SnapshotRegistry;
 use source_walk::Source;
+use version_store::VersionStore;
 
 use crate::env::{Capabilities, Env, FileLock};
 use crate::{Access, Conflict, DbSlice, WriteBatchOp, WriteKind, event_listener};
@@ -692,7 +695,7 @@ impl RegolithEngine {
         let view = Arc::new(ReadViewCell::new(ReadView {
             active: Arc::clone(&memtable),
             frozen: Vec::new(),
-            version: versions.lock().current(),
+            version: versions.current(),
         }));
         versions.attach_view(Arc::clone(&view));
 
@@ -700,10 +703,12 @@ impl RegolithEngine {
         // retired with the logs flushes left behind. Recorded unsynced: if
         // the record is lost, the replayed logs are replayed again beside
         // the new one, which repeats their writes and nothing older.
-        versions.lock().apply(&[
-            VersionEdit::SetNextFileId(wal_id + 1),
-            VersionEdit::SetMinWalId(wal_id),
-        ])?;
+        versions.run(|versions| {
+            versions.apply(&[
+                VersionEdit::SetNextFileId(wal_id + 1),
+                VersionEdit::SetMinWalId(wal_id),
+            ])
+        })?;
         let removed =
             log_retirement::remove_below(&*env, &wal_dir, wal_id, options.statistics.as_deref());
         let retired_logs = RetiredLogs::new(wal_dir.clone(), !removed);
@@ -911,7 +916,7 @@ impl RegolithEngine {
         let view = Arc::new(ReadViewCell::new(ReadView {
             active: Arc::clone(&memtable),
             frozen: Vec::new(),
-            version: versions.lock().current(),
+            version: versions.current(),
         }));
         versions.attach_view(Arc::clone(&view));
         let compaction_lock = Arc::new(Gate::new());
@@ -1928,11 +1933,9 @@ impl RegolithEngine {
 
     /// The version the last applied edit published.
     ///
-    /// Cheaper than `versions.lock().current()` - one shared lock
-    /// acquisition instead of the version set's exclusive one - and it
-    /// is the same version, because every [`VersionStore`] guard
-    /// publishes what its critical section installed before it
-    /// releases the mutex.
+    /// One load of the published view. It is the version the version set
+    /// holds, because every section of the [`VersionStore`] publishes what
+    /// it installed before it ends.
     fn published_version(&self) -> Arc<manifest::Version> {
         Arc::clone(&self.view.load().version)
     }
@@ -2537,10 +2540,13 @@ impl RegolithEngine {
                 &compaction_opts,
                 &self.snapshot_registry,
             )?;
-            let mut versions = self.versions.lock();
-            if versions.has_stale_seals() {
-                versions.compact_manifest()?;
-            }
+            self.versions.run(|versions| {
+                if versions.has_stale_seals() {
+                    versions.compact_manifest()
+                } else {
+                    Ok(())
+                }
+            })?;
         }
         // The passes emptied L0 toward the bottom: writers a stop stopped are
         // told once it no longer holds.
@@ -2592,23 +2598,21 @@ impl RegolithEngine {
         let compaction_guard = Gate::write_owned(&self.compaction_lock);
         self.ensure_writable()?;
 
-        let version;
-        let manifest_bytes;
-        {
-            let mut versions = self.versions.lock();
+        let (version, manifest_bytes) = self.versions.run(|versions| -> std::io::Result<_> {
             // Rewritten first, so what is captured is the canonical form
             // of exactly this version rather than a log of every edit
             // that ever reached it.
             versions.compact_manifest()?;
-            version = versions.current();
-            // Read here, under the same lock that produced `version`, so
-            // the two cannot disagree. A concurrent flush takes this lock
-            // but not the compaction lock held above, so it is free to
-            // append `AddFile` records naming files this checkpoint will
-            // not copy, and a rewrite can replace the file entirely.
+            let version = versions.current();
+            // Read here, in the same section that produced `version`, so
+            // the two cannot disagree. A concurrent flush runs its own
+            // section but does not take the compaction lock held above, so
+            // it is free to append `AddFile` records naming files this
+            // checkpoint will not copy, and a rewrite can replace the file
+            // entirely.
             let path = versions.manifest_path().to_path_buf();
-            manifest_bytes = self.env.read(&path)?;
-        }
+            Ok((version, self.env.read(&path)?))
+        })?;
 
         Ok(CheckpointSnapshot {
             version,
@@ -2661,7 +2665,7 @@ impl RegolithEngine {
     //
     // These return raw values consumed by `Db::get_property` /
     // `Db::get_int_property`. Every method is cheap - no block
-    // reads, no locks held beyond a short `versions.lock()` or
+    // reads, no locks held beyond one load of the current version or
     // memtable read.
 
     /// Number of SSTable files at a specific level. Returns 0 for
@@ -2789,7 +2793,7 @@ impl RegolithEngine {
     ///
     /// [`Options::cache_index_and_filter_blocks`]: crate::Options::cache_index_and_filter_blocks
     pub(crate) fn pinned_metadata_bytes(&self) -> usize {
-        let version = self.versions.lock().current();
+        let version = self.versions.current();
         version
             .levels
             .iter()
@@ -2859,19 +2863,19 @@ impl RegolithEngine {
         self.view
             .update_memtables(|_, _| (Arc::clone(&fresh), Vec::new(), ()));
 
-        let (old_version, wal_id, wal_path, new_log) = {
-            let mut versions = self.versions.lock();
-            let old_version = versions.current();
-            let id = old_version.next_file_id;
-            let wal_path = self.wal_dir.join(wal_filename(id));
-            let new_log =
-                wal_log::Log::create_in(&self.env, &wal_path, self.options.keyring.as_deref())?;
-            versions.apply(&[VersionEdit::Reset {
-                next_file_id: id + 1,
-                min_wal_id: id,
-            }])?;
-            (old_version, id, wal_path, new_log)
-        };
+        let (old_version, wal_id, wal_path, new_log) =
+            self.versions.run(|versions| -> std::io::Result<_> {
+                let old_version = versions.current();
+                let id = old_version.next_file_id;
+                let wal_path = self.wal_dir.join(wal_filename(id));
+                let new_log =
+                    wal_log::Log::create_in(&self.env, &wal_path, self.options.keyring.as_deref())?;
+                versions.apply(&[VersionEdit::Reset {
+                    next_file_id: id + 1,
+                    min_wal_id: id,
+                }])?;
+                Ok((old_version, id, wal_path, new_log))
+            })?;
 
         self.cache.clear();
         // The sequence goes on from where it was: a commit published before
@@ -2880,9 +2884,11 @@ impl RegolithEngine {
         ord.replace(fresh, Arc::new(new_log));
         self.wal_id.store(wal_id, Ordering::Release);
 
-        self.versions.lock().compact_manifest().map_err(|e| {
-            std::io::Error::new(e.kind(), format!("drop_all rewriting manifest: {e}"))
-        })?;
+        self.versions
+            .run(|versions| versions.compact_manifest())
+            .map_err(|e| {
+                std::io::Error::new(e.kind(), format!("drop_all rewriting manifest: {e}"))
+            })?;
 
         remove_obsolete_sst_files(&*self.env, &self.sst_dir, &old_version).map_err(|e| {
             std::io::Error::new(e.kind(), format!("drop_all removing sstables: {e}"))
@@ -3069,7 +3075,7 @@ impl RegolithEngine {
     /// Rewrite the manifest now, the way growth does on its own.
     #[cfg(test)]
     pub(crate) fn force_manifest_rewrite(&self) -> std::io::Result<()> {
-        self.versions.lock().compact_manifest()
+        self.versions.run(|versions| versions.compact_manifest())
     }
 
     /// Test-only: how many sealed memtables wait for a flush.
@@ -3146,7 +3152,7 @@ pub(crate) struct CheckpointSnapshot {
     /// the same lock.
     ///
     /// The bytes are held rather than a path and a length. A concurrent
-    /// flush takes `versions.lock()` but not the compaction lock this
+    /// flush runs a section of the version store but not the compaction lock this
     /// snapshot holds, so it can append `AddFile` records naming files
     /// this checkpoint will not copy, and a manifest rewrite can replace
     /// the file wholesale. Re-reading the path later would then pick up

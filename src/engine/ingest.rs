@@ -208,12 +208,7 @@ impl RegolithEngine {
             }
             io::Error::new(e.kind(), format!("ingest: {}: {e}", source.display()))
         };
-        let file_id = {
-            let mut versions = self.versions.lock();
-            let id = versions.current().next_file_id;
-            versions.apply(&[VersionEdit::SetNextFileId(id + 1)])?;
-            id
-        };
+        let file_id = self.versions.take_file_id()?;
         let path = self.sst_dir.join(sst_filename(file_id));
         let mut pending = PendingOutputs::new(Arc::clone(&self.env));
         pending.track(path.clone());
@@ -483,10 +478,12 @@ impl RegolithEngine {
             Arc::new(reader),
         );
         pending.offered_to_manifest();
-        self.versions.lock().apply(&[
-            VersionEdit::AddFile { level, file },
-            VersionEdit::SetLastSeq(seq),
-        ])?;
+        self.versions.run(|versions| {
+            versions.apply(&[
+                VersionEdit::AddFile { level, file },
+                VersionEdit::SetLastSeq(seq),
+            ])
+        })?;
         self.visible_seq.publish(seq);
 
         Ok(IngestedTable {

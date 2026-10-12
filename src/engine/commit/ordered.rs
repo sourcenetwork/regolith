@@ -65,7 +65,6 @@ use super::super::internal_key::{
     VALUE_TYPE_DELETION, VALUE_TYPE_MERGE, VALUE_TYPE_VALUE, decode_internal_key,
 };
 use super::super::io::job::{Job, JobBody};
-use super::super::manifest::VersionEdit;
 use super::super::take::Take;
 use super::super::wal::{check_write_len, encode_ops_record, ops_record_len, wal_filename};
 use super::super::wal_frame::KIND_GROUP;
@@ -190,13 +189,7 @@ impl Ordered<'_> {
         // that fails leaves the view as it was.
         let engine = self.engine;
         let fresh = Arc::new(MemTable::new(&engine.memtable_config)?);
-        let new_wal_id = {
-            let mut versions = engine.versions.lock();
-            let version = versions.current();
-            let id = version.next_file_id;
-            versions.apply(&[VersionEdit::SetNextFileId(id + 1)])?;
-            id
-        };
+        let new_wal_id = engine.versions.take_file_id()?;
         // Recovery takes the newest log by file name and tolerates a torn
         // tail only there, so a log has to be complete on disk before any
         // newer file exists, an empty one included: sync it, then create the

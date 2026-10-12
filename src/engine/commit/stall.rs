@@ -79,13 +79,13 @@ impl StallSignal {
     /// A signal over an empty view of `versions`, for a test that starts
     /// workers on their own.
     #[cfg(test)]
-    pub(crate) fn for_tests(versions: &super::super::read_view::VersionStore) -> Self {
+    pub(crate) fn for_tests(versions: &super::super::version_store::VersionStore) -> Self {
         use super::super::memtable::{MemTable, MemTableConfig};
         use super::super::read_view::ReadView;
         let view = Arc::new(ReadViewCell::new(ReadView {
             active: Arc::new(MemTable::new(&MemTableConfig::default()).expect("memtable")),
             frozen: Vec::new(),
-            version: versions.lock().current(),
+            version: versions.current(),
         }));
         Self::new(view, EngineOptions::default(), Arc::new(AtomicU8::new(0)))
     }

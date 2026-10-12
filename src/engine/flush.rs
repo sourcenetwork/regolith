@@ -21,8 +21,9 @@ use super::log_retirement::{self, RetiredLogs};
 use super::manifest::VersionEdit;
 use super::memtable::MemTable;
 use super::pending_outputs::PendingOutputs;
-use super::read_view::{ReadViewCell, VersionStore};
+use super::read_view::ReadViewCell;
 use super::sstable::{LiveSst, SsTableMeta, SsTableReader, SsTableWriter, sst_filename};
+use super::version_store::VersionStore;
 use super::{EngineOptions, event_listener};
 use crate::env::Env;
 use crate::sync::internal::{Mutex, MutexGuard};
@@ -198,13 +199,7 @@ impl Flusher {
             return Ok(true);
         }
 
-        let file_id = {
-            let mut versions = self.versions.lock();
-            let version = versions.current();
-            let id = version.next_file_id;
-            versions.apply(&[VersionEdit::SetNextFileId(id + 1)])?;
-            id
-        };
+        let file_id = self.versions.take_file_id()?;
 
         let sst_path = self.sst_dir.join(sst_filename(file_id));
         // Until the edit below is offered to the manifest, nothing else
@@ -301,15 +296,15 @@ impl Flusher {
         // when the table is durable (E30).
         edits.extend(log_retirement::min_wal_id_after(&memtable).map(VersionEdit::SetMinWalId));
         pending.offered_to_manifest();
-        {
-            let mut versions = self.versions.lock();
+        self.versions.run(|versions| -> std::io::Result<()> {
             versions.apply(&edits)?;
             // Retired in the publication of the version holding its table,
             // not after it: until that version is published the flushed data
             // lives in this memtable alone, and a view holding both would
             // apply the memtable's merge operands twice.
             versions.retire_with_version(&memtable);
-        }
+            Ok(())
+        })?;
         #[cfg(test)]
         if let Some(hook) = AFTER_FLUSH_INSTALL.with(|slot| slot.borrow_mut().take()) {
             hook();
@@ -336,7 +331,7 @@ impl Flusher {
                 // Version was just applied; pull the newly-added
                 // file's metadata back out so listeners see the
                 // exact bounds the engine committed.
-                let ver = self.versions.lock().current();
+                let ver = self.versions.current();
                 if let Some(added) = ver.levels[0].iter().find(|f| f.meta.file_id == file_id) {
                     (
                         added.meta.smallest_key.clone(),

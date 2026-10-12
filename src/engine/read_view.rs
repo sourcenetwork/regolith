@@ -34,19 +34,20 @@
 //!   lost. Publishers never exclude each other: one that loses the swap
 //!   rebuilds on whatever won. That is what replaced the publish mutex.
 //!   Every publisher goes through it, since [`ReadViewCell::publish`] is the
-//!   only writer of the cell: a rotation (under the pipeline mutex), a
+//!   only writer of the cell: a rotation (in the commit pipeline's ordered step), a
 //!   flush on each flush path (the worker's, a writer's after its commit, a
 //!   stall step's), a compaction, an ingest and `drop_all`. A flush installs
 //!   its table and retires its memtable in one publication
-//!   ([`VersionGuard::retire_with_version`]), so no view holds a memtable
+//!   ([`VersionGuard::retire_with_version`](super::version_store::VersionGuard::retire_with_version)), so no view holds a memtable
 //!   and its table at once. `proofs/tla/ReadViewPublishers.tla` checks that
 //!   racing, they lose no memtable and no table, and hold none twice.
 //! * **A load never returns a view older than one already published
 //!   before the load began.** The swap is a release, the load an
 //!   acquire of the same word, so a publication that happened before a
 //!   load is what that load (or something newer) reads.
-//! * Lock order: the [`VersionStore`] mutex is the only lock left here,
-//!   and no reader takes it.
+//! * No lock is left here: the version half of a view is installed by the
+//!   one step of [`VersionStore`](super::version_store::VersionStore),
+//!   which no reader takes.
 //!
 //! # What the deferred drop costs, and where it is paid
 //!
@@ -75,7 +76,8 @@
 //! # Why the version half is published by the store, not by callers
 //!
 //! Every version change goes through [`VersionSet::apply`], which is
-//! only reachable through a [`VersionGuard`]. The guard compares the
+//! only reachable through a
+//! [`VersionGuard`](super::version_store::VersionGuard). The guard compares the
 //! version it entered with against the one it leaves with and publishes
 //! the difference, so a foreground flush, an ingest, a `drop_all` and a
 //! background compaction all refresh the view without any of them
@@ -83,14 +85,12 @@
 
 use std::cell::Cell;
 use std::mem::ManuallyDrop;
-use std::ops::{Deref, DerefMut};
-use std::sync::{Arc, OnceLock};
+use std::ops::Deref;
+use std::sync::Arc;
 
 use kovan::{Atom, AtomGuard};
 
-use crate::sync::internal::{Mutex, MutexGuard};
-
-use super::manifest::{Version, VersionSet};
+use super::manifest::Version;
 use super::memtable::MemTable;
 
 /// The set of sources one read resolves against, plus nothing else.
@@ -291,8 +291,10 @@ impl ReadViewCell {
 
     /// Replace the version half of the view, and, when `retired` names a
     /// memtable, drop it from the frozen list in the same publication.
-    /// Called by [`VersionGuard::drop`] and by nothing else.
-    fn publish_version(&self, version: Arc<Version>, retired: Option<&Arc<MemTable>>) {
+    /// Called by the drop of a
+    /// [`VersionGuard`](super::version_store::VersionGuard) and by nothing
+    /// else.
+    pub(super) fn publish_version(&self, version: Arc<Version>, retired: Option<&Arc<MemTable>>) {
         self.publish(|current| {
             let frozen = match retired {
                 Some(flushed) => current
@@ -343,112 +345,6 @@ pub(crate) fn quiesce() {
     });
 }
 
-/// The [`VersionSet`] plus the read view its edits publish into.
-///
-/// Every caller reaches the version set through [`Self::lock`], and the
-/// guard that returns publishes any version the critical section
-/// installed. That is what keeps a reader's view of the SSTables from
-/// lagging behind a background compaction.
-pub(crate) struct VersionStore {
-    inner: Mutex<VersionSet>,
-    /// Attached after construction: the view needs a memtable, and the
-    /// version set is built before one exists. Empty only between
-    /// [`Self::new`] and [`Self::attach_view`], a window with no
-    /// concurrent readers.
-    view: OnceLock<Arc<ReadViewCell>>,
-}
-
-impl VersionStore {
-    pub(crate) fn new(versions: VersionSet) -> Self {
-        Self {
-            inner: Mutex::new(versions),
-            view: OnceLock::new(),
-        }
-    }
-
-    /// Attach the read-view cell this store publishes into. Called once,
-    /// during engine open, before the engine is handed out.
-    pub(crate) fn attach_view(&self, cell: Arc<ReadViewCell>) {
-        let _ = self.view.set(cell);
-    }
-
-    /// Lock the version set. The returned guard derefs to
-    /// [`VersionSet`] and publishes the resulting version on drop when
-    /// the critical section changed it.
-    pub(crate) fn lock(&self) -> VersionGuard<'_> {
-        let guard = self.inner.lock();
-        let entry_version = guard.current();
-        VersionGuard {
-            entry_version,
-            guard,
-            view: self.view.get(),
-            retire: None,
-        }
-    }
-}
-
-/// Exclusive access to the [`VersionSet`], publishing on release.
-pub(crate) struct VersionGuard<'a> {
-    guard: MutexGuard<'a, VersionSet>,
-    view: Option<&'a Arc<ReadViewCell>>,
-    entry_version: Arc<Version>,
-    /// A frozen memtable to retire in the publication of the version this
-    /// guard installs (see [`Self::retire_with_version`]).
-    retire: Option<Arc<MemTable>>,
-}
-
-impl VersionGuard<'_> {
-    /// Retire `flushed` from the frozen list in the same publication as the
-    /// version this critical section installed, the one holding `flushed`'s
-    /// table.
-    ///
-    /// A flush that published its table and then, in a second publication,
-    /// retired its memtable would leave a window in which a view holds both:
-    /// every entry of the memtable twice, once in the memtable and once in
-    /// the table, at the same sequence. A read collects a key's merge
-    /// operands from every source, so it would apply each of them twice.
-    /// One publication makes the sources of every view disjoint.
-    pub(crate) fn retire_with_version(&mut self, flushed: &Arc<MemTable>) {
-        self.retire = Some(Arc::clone(flushed));
-    }
-}
-
-impl Deref for VersionGuard<'_> {
-    type Target = VersionSet;
-
-    fn deref(&self) -> &VersionSet {
-        &self.guard
-    }
-}
-
-impl DerefMut for VersionGuard<'_> {
-    fn deref_mut(&mut self) -> &mut VersionSet {
-        &mut self.guard
-    }
-}
-
-impl Drop for VersionGuard<'_> {
-    fn drop(&mut self) {
-        let Some(view) = self.view else {
-            return;
-        };
-        let current = self.guard.current();
-        let retire = self.retire.take();
-        if Arc::ptr_eq(&current, &self.entry_version) {
-            // No version to publish: a retire asked for without one still
-            // happens, on its own.
-            if let Some(flushed) = retire {
-                view.retire_memtable(&flushed);
-            }
-            return;
-        }
-        // Published while the version-set mutex is still held (this
-        // runs before the guard field drops), so publications land in
-        // the same order the edits did.
-        view.publish_version(current, retire.as_ref());
-    }
-}
-
 /// Release what this thread's reservation is holding back before the
 /// thread waits for work.
 ///
@@ -464,7 +360,8 @@ pub(crate) fn idle() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::manifest::VersionEdit;
+    use crate::engine::manifest::{VersionEdit, VersionSet};
+    use crate::engine::version_store::VersionStore;
 
     /// A memtable arena sized for the unit tests here: small enough to
     /// stay cheap, large enough that nothing in these tests rotates.
@@ -485,7 +382,7 @@ mod tests {
         let cell = Arc::new(ReadViewCell::new(ReadView {
             active: Arc::new(MemTable::new(&test_memtable_config()).unwrap()),
             frozen: Vec::new(),
-            version: store.lock().current(),
+            version: store.current(),
         }));
         store.attach_view(Arc::clone(&cell));
         (dir, store, cell)
@@ -641,8 +538,7 @@ mod tests {
         let before = cell.load();
 
         store
-            .lock()
-            .apply(&[VersionEdit::SetNextFileId(7)])
+            .run(|versions| versions.apply(&[VersionEdit::SetNextFileId(7)]))
             .unwrap();
 
         let after = cell.load();
@@ -656,10 +552,9 @@ mod tests {
         let (_dir, store, cell) = store_with_view();
         let before = cell.load();
 
-        {
-            let guard = store.lock();
-            let _ = guard.current();
-        }
+        store.run(|versions| {
+            let _ = versions.current();
+        });
 
         assert!(
             std::ptr::eq::<ReadView>(&*before, &*cell.load()),
