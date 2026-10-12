@@ -113,7 +113,9 @@
 \*     `reads`, stands for all three.
 \*
 \* CONFIGURATIONS.
-\*   MC_BackupSeal_Green                   every invariant holds
+\*   MC_BackupSeal_Green                   every invariant holds: one
+\*                                         table, two backups, two restores
+\*                                         and deletes
 \*   MC_BackupSeal_Red_<defect>            the promise named above fails
 
 \* Naturals for counting backups and restores; FiniteSets for counting how
@@ -125,6 +127,10 @@ CONSTANTS
   MaxBackups,
   \* How many restores the model may start in one behaviour: bounds it.
   MaxRestores,
+  \* How many table slots the database has. Two lets a backup or a restore
+  \* copy its tables one at a time, so a power cut can fall between them;
+  \* one keeps a run with many backups or restores small.
+  Slots,
   \* "none" for the engine, or one defect named above.
   Mutant
 
@@ -132,6 +138,8 @@ CONSTANTS
 ASSUME MaxBackups \in Nat \ {0}
 \* At least one restore, or nothing is restored.
 ASSUME MaxRestores \in Nat \ {0}
+\* One table slot or two: enough for every rule here.
+ASSUME Slots \in {1, 2}
 \* Only the engine and the defects above.
 ASSUME Mutant \in {"none", "PlainMeta", "PlainRestore", "OpenUnderCurrent",
                    "ListingUnbound", "IdUnbound", "ManifestFirst", "OverDatabase",
@@ -140,8 +148,8 @@ ASSUME Mutant \in {"none", "PlainMeta", "PlainRestore", "OpenUnderCurrent",
 
 \* The two key ids the database rotates between (KeyId).
 Keys == {1, 2}
-\* Two table slots: a table's place in the database (its file id).
-Tables == {1, 2}
+\* The table slots: a table's place in the database (its file id).
+Tables == 1..Slots
 \* Two backup ids, the numbers in meta/000001.backup and meta/000002.backup.
 Ids == {1, 2}
 \* A slot that holds no table.
