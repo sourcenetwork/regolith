@@ -193,6 +193,16 @@ impl StallSignal {
             }
         }
     }
+
+    /// Test-only: whether a unit is installed and has not landed, as it is
+    /// from the first write a stall stops until the landing.
+    #[cfg(test)]
+    pub(crate) fn has_unit(&self) -> bool {
+        self.current
+            .load()
+            .as_ref()
+            .is_some_and(|job| !job.is_done())
+    }
 }
 
 #[cfg(all(test, not(loom)))]
@@ -215,7 +225,9 @@ mod tests {
     }
 
     /// No worker, one L0 table at the stop.
-    fn stopped_engine_with(options: EngineOptions) -> (tempfile::TempDir, Arc<RegolithEngine>) {
+    pub(super) fn stopped_engine_with(
+        options: EngineOptions,
+    ) -> (tempfile::TempDir, Arc<RegolithEngine>) {
         let dir = tempfile::TempDir::new().unwrap();
         let engine = RegolithEngine::open(
             dir.path(),
@@ -361,10 +373,10 @@ mod tests {
     }
 
     /// Holds the flush that calls it, once armed, until it is let go.
-    struct HeldFlush {
-        armed: AtomicBool,
-        entered: Mutex<mpsc::Sender<()>>,
-        release: Mutex<mpsc::Receiver<()>>,
+    pub(super) struct HeldFlush {
+        pub(super) armed: AtomicBool,
+        pub(super) entered: Mutex<mpsc::Sender<()>>,
+        pub(super) release: Mutex<mpsc::Receiver<()>>,
     }
 
     impl PrefixExtractor for HeldFlush {
@@ -437,3 +449,7 @@ mod tests {
         assert!(wait.is_ready(), "handed back: the writer looks again");
     }
 }
+
+#[cfg(all(test, not(loom)))]
+#[path = "stall_failure_tests.rs"]
+mod failure_tests;
