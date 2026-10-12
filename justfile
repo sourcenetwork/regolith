@@ -259,15 +259,11 @@ stress secs="600":
 # baseline; they are the wall time `cargo test`'s own summary line
 # reported for the test binary, excluding compilation.
 #
-# The debug run carries one extra calibration: the skip list's
-# single-writer guard (S2) is a `debug_assert`, so the model proving it
-# fires is compiled out of a release build. The arena's single-writer
-# guard (A8) is debug-only the same way, but its own calibration runs in
-# both profiles with a different expected panic message per profile (a
-# debug build trips the guard, a release build trips loom's tracked
-# cell), so it does not add to the debug-only gap the way S2's does.
-# Seven of the models are `should_panic` calibrations that deliberately
-# get the ordering wrong; they are what make the passes mean anything.
+# Both profiles run the same nineteen models: the memtable takes writes
+# from any thread, so there is no single-writer guard left for a debug
+# build to trip. Seven of the models are `should_panic` calibrations that
+# deliberately get the ordering wrong; they are what make the passes mean
+# anything.
 
 loom:
     RUSTFLAGS="--cfg loom" cargo test --release --test loom_memtable
@@ -325,7 +321,18 @@ loom-tombstones:
 loom-tables:
     RUSTFLAGS="--cfg loom" cargo test --release --test loom_tables
 
-loom-all: loom loom-debug loom-sync loom-io loom-snapshots loom-view loom-cache loom-tombstones loom-tables
+# Loom models for the lock-free commit pipeline (plan 4.7) and the version
+# store's step: reserve and void, a cell's next lap, the pin, deciding with
+# helping, the watermark claim, publication, a rollback meeting a decision
+# under way, and the step's sections, with eight calibrations that must
+# fail. Seventeen models, each bounded by a ring of two cells, two or three
+# threads and an explicit preemption bound; measured at 1.0s in all, the
+# largest at 4,214 interleavings. The limit is a hard one: a run that
+# reaches it has failed.
+loom-pipeline:
+    RUSTFLAGS="--cfg loom" timeout 300 cargo test --release --test loom_pipeline
+
+loom-all: loom loom-debug loom-sync loom-io loom-snapshots loom-view loom-cache loom-tombstones loom-tables loom-pipeline
 
 # The read-view chaos workload at full size: 6 instances x 2 rounds x 400
 # versions. Measured at over 20 minutes wall and 4h of CPU unoptimized,

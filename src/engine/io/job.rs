@@ -30,6 +30,12 @@
 #![allow(unsafe_code)]
 
 use std::sync::Arc;
+
+// A blocked thread parks, and loom has to see the park to check that the
+// landing wakes it.
+#[cfg(loom)]
+use loom::thread::{self, Thread};
+#[cfg(not(loom))]
 use std::thread::{self, Thread};
 
 use super::flight::Flight;

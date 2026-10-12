@@ -7,8 +7,9 @@
 //! RUSTFLAGS="--cfg loom" cargo test --release --test loom_range_tombstones
 //! ```
 //!
-//! Without `--cfg loom` the file compiles away. The calibration plants the
-//! defect the log's prefix publication rules out and must fail.
+//! Without `--cfg loom` the file compiles away. Each calibration plants a
+//! defect the log rules out and must fail: a length published before its
+//! tombstone, and a position taken by a load and a store.
 
 #![cfg(loom)]
 
@@ -28,4 +29,20 @@ fn a_published_range_delete_is_seen_by_every_later_read() {
 #[should_panic]
 fn a_length_published_before_its_tombstone_is_caught() {
     tombstones::a_length_published_before_its_tombstone_is_caught();
+}
+
+#[test]
+fn two_appends_at_once_are_both_listed() {
+    tombstones::two_appends_at_once_are_both_listed();
+}
+
+#[test]
+fn one_tombstone_appended_twice_is_listed_once() {
+    tombstones::one_tombstone_appended_twice_is_listed_once();
+}
+
+#[test]
+#[should_panic(expected = "two appends were handed one position")]
+fn a_position_taken_by_a_load_and_a_store_is_handed_out_twice() {
+    tombstones::a_position_taken_by_a_load_and_a_store_is_handed_out_twice();
 }

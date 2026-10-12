@@ -61,6 +61,8 @@ mod descriptor;
 mod early;
 mod families;
 pub(crate) mod hook;
+#[cfg(loom)]
+pub mod loom_model;
 mod ordered;
 mod pipeline;
 mod range_rule;

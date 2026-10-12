@@ -23,12 +23,13 @@
 //! - that a reader pinning one version walks a whole snapshot across a
 //!   concurrent compaction, and that a flush and a compaction
 //!   publishing at once cannot lose one another's edits;
-//! - that the arena's chunk list, a `crate::sync::internal::UnsafeCell` rather than
-//!   a lock (invariant A8 in `engine::arena`), sees no access that is
-//!   not ordered before or after every other access to it: every model
-//!   that allocates now runs its allocations through the tracked cell,
-//!   so a broken A8 contract fails the model the same way a broken S1
-//!   would.
+//! - that two threads allocating from one arena at once are handed ranges
+//!   of their own (invariant A8 in `engine::arena`), two threads inserting
+//!   into one skip list at once both land, and one entry inserted twice is
+//!   held once (S2 in `engine::skiplist`): the memtable takes writes from
+//!   any thread, as the commit pipeline needs;
+//! - that the sections of a step never overlap and none is left behind
+//!   (`engine::step`).
 //!
 //! The version models in [`version`] are protocol models and say so:
 //! the production `VersionSet` writes a manifest record and opens an
@@ -64,14 +65,9 @@
 //! retires the frozen memtable before it installs the table, a relaxed
 //! read horizon, a compaction that publishes its removals and its
 //! addition as two versions, two version swaps with nothing serializing
-//! them, two arena allocations with nothing serializing them - and the
-//! pair is only meaningful if the wrong one fails. They are run as
-//! `#[should_panic]` tests in `tests/loom_memtable.rs`. [`arena`]'s
-//! calibration is two expectations gated on one test by
-//! `debug_assertions`, because the arena's single-writer guard is itself
-//! debug-only: a debug build proves the guard trips, a release build
-//! proves the tracked cell catches the same race once the guard is
-//! compiled out.
+//! them, an arena cursor and a list link moved by a load and a store -
+//! and the pair is only meaningful if the wrong one fails. They are run
+//! as `#[should_panic]` tests in `tests/loom_memtable.rs`.
 //!
 //! A calibration stops at the first schedule that trips its assertion,
 //! so [`explore`]'s floors never execute for one: the panic unwinds past
@@ -87,6 +83,7 @@ pub mod jobs;
 pub mod skiplist;
 pub mod slice;
 pub mod snapshots;
+pub mod step;
 pub mod tombstones;
 pub mod version;
 
@@ -187,7 +184,7 @@ pub(crate) fn explore(
 /// Models with three threads that each make several atomic accesses need
 /// one: unbounded, their search runs for hours without reaching a new kind
 /// of interleaving.
-fn explore_bounded(
+pub(crate) fn explore_bounded(
     name: &'static str,
     preemptions: Option<usize>,
     min_interleavings: usize,

@@ -159,8 +159,10 @@ pub mod loom_exports {
     //! check, and this module is the seam that lets the test target call
     //! them. It does not exist in an ordinary build.
 
+    pub use crate::engine::commit::loom_model as pipeline;
     pub use crate::engine::loom_model::{
-        arena, families, handoff, io_queue, jobs, skiplist, slice, snapshots, tombstones, version,
+        arena, families, handoff, io_queue, jobs, skiplist, slice, snapshots, step, tombstones,
+        version,
     };
     pub use crate::env::open_file_limit::loom_model as open_files;
 }
