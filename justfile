@@ -593,6 +593,7 @@ tla:
     # E10, group commit. Lean: Regolith/GroupCommit.lean, group_eq_serial.
     spec=GroupCommit
     check MC_GroupCommit_Green                         GREEN
+    check MC_GroupCommit_Green_Live                    GREEN
     check MC_GroupCommit_Red_ViewOnly                  RED SerialEquivalent
     check MC_GroupCommit_Red_PublishBeforeSync         RED DurableBeforeVisible
     # 4.7, the lock-free commit pipeline. Lean: Regolith/Pipeline.lean,
