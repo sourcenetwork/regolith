@@ -1,5 +1,5 @@
 //! Validation outside the pipeline (`early_check_split` in
-//! `GroupCommit.lean`): checking a commit up to a horizon `h` before it
+//! `PipelineCheck.lean`): checking a commit up to a horizon `h` before it
 //! takes a slot, and only above `h` when its slot is decided, decides as one
 //! check of every version does.
 

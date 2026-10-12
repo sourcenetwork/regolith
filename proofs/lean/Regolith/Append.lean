@@ -54,10 +54,11 @@ What is proved, in plain words:
 7. `view_only_head_duplicates`, `assign_before_validation_leaves_hole` and
    `stamps_leave_hole`: three REDs as concrete counterexamples.
 
-Group commit needs no separate statement. A group's members are decided
-one after another, each reading the head and the once keys the earlier
-members left, which is exactly folding the ordered step over them; the
-first counterexample shows what goes wrong when a member does not.
+Commits decided before the ones ahead of them are published need no
+separate statement. Slots are decided one after another, each reading the
+head and the once keys the earlier ones left, which is exactly folding the
+ordered step over them; the first counterexample shows what goes wrong when
+one does not.
 
 How to read the Lean: `def` defines a function or a property, `theorem`
 states a fact and its proof follows `:= by`. Lines starting with `--` are
@@ -101,8 +102,8 @@ def init : Log := ⟨0, 0, []⟩
 
 /-- `fresh rows o`: an append passing once key `o` gets a row. It does when
 it passes no once key, or when no row carries that key yet. The rows
-include those of earlier members of the same group and earlier appends of
-the same transaction, because they were assigned first. -/
+include those of commits decided earlier and not yet published, and earlier
+appends of the same transaction, because they were assigned first. -/
 def fresh (rows : List Row) : Option Nat → Bool
   -- No once key: always a new row.
   | none => true

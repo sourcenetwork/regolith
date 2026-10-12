@@ -40,9 +40,6 @@ import Regolith.ShardedStats
 -- WalRecovery.lean also holds format 2 replay (4.2), backing
 -- `proofs/tla/WalRecovery.tla`; LsmOrder.lean also holds flush order,
 -- ingest placement, overlap demotion (E14) and binary search.
--- E10: a group commit decides every member as committing them one at a
--- time would. Backs `proofs/tla/GroupCommit.tla`.
-import Regolith.GroupCommit
 -- 4.7: deciding in ring order gives dense sequences in ring order, a
 -- reader at the published horizon sees exactly the published commits, a
 -- rollback leaves the sequences as if the discarded slots had never been
@@ -53,6 +50,23 @@ import Regolith.Pipeline
 -- alone finishes every slot up to its own, wherever the others stopped.
 -- Backs `proofs/tla/CommitPipeline.tla`.
 import Regolith.PipelineHelping
+-- E10, 4.7: the check a slot runs when it is decided. A write that landed
+-- is in the store every later slot is checked against, so no update is
+-- lost; an abort has a cause; and the check split at a horizon decides as
+-- one check. Backs `proofs/tla/CommitPipeline.tla`.
+import Regolith.PipelineCheck
+-- 4.7: a commit's landing listeners. Whoever waits for a commit to land is
+-- told at most once, and a closed list holds nobody. Backs
+-- `proofs/tla/Landing.tla`.
+import Regolith.Landing
+-- 4.10: a queue's poll never waits for another thread. A job that parks for
+-- something another thread holds leaves a note and looks again, so it is
+-- told when that thing is given up. Backs `proofs/tla/Parking.tla`.
+import Regolith.Parking
+-- 4.6: the version store's step. One thread at a time runs the sections
+-- handed over, in the order handed over, and none is left behind. Backs
+-- `proofs/tla/VersionStep.tla`.
+import Regolith.VersionStep
 -- Plan 3.3: an exact partial_merge folds to full_merge in any grouping, and
 -- the touches law. Backs `proofs/tla/RepeatableRead.tla`.
 import Regolith.MergeOperator

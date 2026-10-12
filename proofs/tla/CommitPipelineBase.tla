@@ -70,7 +70,7 @@ ASSUME Mutant \in {"none", "OutOfOrder", "AbortHole", "NoHelping", "SyncPastGap"
                    "ValidatePublished", "VoidNotCas", "TwoSyncs", "FrontierFirst",
                    "UnitNoDrain", "SettleAnyEpoch", "KeepMemtable", "NoEpochGate",
                    "PassBeforeApply", "RollbackForgets", "NoFreeze", "StopHoldsClaim",
-                   "TrustEarly", "PublishBeforeSync", "DecideAnyOrder"}
+                   "TrustEarly", "PublishBeforeSync", "DecideAnyOrder", "WorkBeyond"}
 
 \* The ticket numbers of the run.
 Slots == 1..MaxSlots
@@ -227,6 +227,7 @@ Covered == IF tipIdx > dto THEN tipIdx ELSE dto
 \* How far the log is written with no gap: the largest w such that every
 \* order up to w is done with the log. A sync makes that prefix safe.
 WrittenTo ==
+  \* The one w with every order up to it written and the next one not.
   CHOOSE w \in 0..Covered : (\A j \in 1..w : WalDone(j)) /\ (w = Covered \/ ~WalDone(w + 1))
 
 \* The last sequence held by an order up to ticket p that still counts.
@@ -235,8 +236,11 @@ SeqUpTo(p) == Max({0} \cup {sq[j] : j \in {k \in 1..p : Takes(k)}})
 \* What a sync may promise: the last sequence in the gap-free prefix.
 \* Mutant SyncPastGap promises the last sequence written anywhere.
 SyncTarget ==
+  \* Which promise is made?
   IF Mutant = "SyncPastGap"
+    \* The mutant's: the last sequence of any written commit, gaps or not.
     THEN Max({0} \cup {sq[j] : j \in {i \in 1..Covered : Takes(i) /\ dec[i] = "commit" /\ wr[i]}})
+    \* The real one: the last sequence of the written prefix.
     ELSE SeqUpTo(WrittenTo)
 
 \* Order i may be marked finished: it has nothing to show (thrown away,
@@ -271,12 +275,14 @@ Helping(a) == Live(a) /\ pc[a] = "ready"
 Parked(a) == claimant # 0 /\ claimant # a /\ mine[a] > dto
 
 \* Thread a may work on ticket i: any ticket up to its own, never beyond
-\* (a thread does no work it does not need). Mutant NoHelping: its own only.
+\* (a thread does no work it does not need: E21). Mutant NoHelping: its own
+\* only. Mutant WorkBeyond: any ticket at all, so a thread goes on with the
+\* orders behind its own for as long as its own is not finished.
 MayWork(a, i) ==
   \* It is helping and not waiting for a claimed unit...
   /\ Helping(a) /\ ~Parked(a)
   \* ...and the ticket is its own or an earlier one.
-  /\ IF Mutant = "NoHelping" THEN mine[a] = i ELSE i <= mine[a]
+  /\ IF Mutant = "NoHelping" THEN mine[a] = i ELSE (i <= mine[a] \/ Mutant = "WorkBeyond")
 
 \* A rollback can still happen: the log may still fail, or a failure is
 \* being dealt with.
@@ -326,6 +332,7 @@ EarlyConflict(a) ==
 \* Thread a is a transaction that read a key some other thread writes: the
 \* only kind of thread whose snapshot is ever looked at.
 Contends(a) ==
+  \* A transaction, and another thread writes a key it read.
   a \in Committers \ Plain /\ \E b \in Actors \ {a} : Reads[a] \cap Writes[b] # {}
 
 \* The ticket a thread decides: the next in line (mutant DecideAnyOrder:

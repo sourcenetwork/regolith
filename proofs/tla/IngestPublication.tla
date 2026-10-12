@@ -43,12 +43,13 @@
 \* commits, one ingest and two readers.
 \*
 \* THE ENGINE.
-\*   RegolithEngine::install            src/engine/ingest.rs
-\*     Under the commit pipeline's mutex, draws the sequence from
-\*     `latest_seq`, installs the table in the version with a manifest edit
-\*     recording that every entry of it reads at that sequence (D48), and
-\*     only then publishes the sequence on the read horizon. A commit draws
-\*     and publishes under the same mutex, so none publishes in between.
+\*   RegolithEngine::install_ordered    src/engine/ingest.rs
+\*     In an ordered unit of the commit ring, takes the next sequence
+\*     (`Ordered::take_seq`), installs the table in the version with a
+\*     manifest edit recording that every entry of it reads at that sequence
+\*     (D48), and only then publishes the sequence on the read horizon. A
+\*     unit runs with every earlier commit published and no later one
+\*     decided, so no commit takes a sequence or publishes in between.
 \*   ReadHorizon::publish               src/engine/read_horizon.rs
 \*     A `fetch_max`: the horizon only rises. A commit that drew a later
 \*     sequence publishes it as soon as its own data is applied.
@@ -70,9 +71,10 @@
 \* THE FIX. The ingest's sequence is a pending slot from the moment it is
 \* drawn until its table is installed, and the visible sequence never passes
 \* a pending slot: a publication waits until no pending slot is at or below
-\* the sequence it publishes. In the engine the wait is the pipeline mutex
-\* (THE ENGINE above): the ingest holds it from the draw to its own
-\* publication.
+\* the sequence it publishes. In the engine the wait is the ring's order
+\* (THE ENGINE above): commits are published in ring order, and the
+\* ingest's unit is one slot of the ring, from the moment it takes its
+\* sequence to its own publication.
 \*
 \* WHAT THE MODEL LEAVES OUT, and why that loses nothing. A read returns the
 \* newest installed version at or below the snapshot. Over an ordered LSM
@@ -124,11 +126,11 @@ KeysOf(w) == IF w = Ingest THEN IngestKeys ELSE {CommitKey}
 \* The state: everything that changes from one step to the next. Each line says what the variable
 \* stands for in the real program.
 VARIABLES
-  \* The last sequence number the shared counter handed out (RegolithEngine::latest_seq,
-  \* src/engine/mod.rs).
+  \* The last sequence number handed out (the pipeline's state, After::next_seq,
+  \* src/engine/commit/descriptor.rs).
   next,
   \* The "pending slots": sequence numbers that were handed out but whose data is not installed yet.
-  \* Model bookkeeping: in the engine a slot is pending while its writer holds the pipeline mutex.
+  \* Model bookkeeping: in the engine a slot is pending while the unit that took it runs.
   pending,
   \* The versions readers can find, as pairs <<key, sequence>>: what the memtables and tables hold.
   installed,
