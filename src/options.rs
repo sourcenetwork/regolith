@@ -534,6 +534,23 @@ impl WriteOptions {
 /// Point lookups are unaffected - they always consult the user-key
 /// bloom filter and do not call the extractor.
 ///
+/// # The key
+///
+/// `extract` is handed the key as the caller wrote it, and
+/// `extract_query` the prefix as the caller passed it to `seek_prefix`,
+/// with nothing in front of them, in every column family. The entries the
+/// database keeps for itself are not shown to the extractor. The filter
+/// still answers for one column family at a time: a prefix one family
+/// holds does not make a table look as if another family held it.
+///
+/// One case differs. A table written by a release that handed the
+/// extractor the database's own form of the key (the caller's key behind
+/// a 4-byte column-family id) is filtered the way it was built, so
+/// nothing it holds is skipped: a prefix seek that meets such a table
+/// also calls `extract_query` with the caller's prefix behind those 4
+/// bytes. Every table written since holds the caller's form, and a
+/// compaction rewrites the old ones into it.
+///
 /// A panic in this trait's code while a commit's memtable rotation runs it
 /// fails that commit with [`crate::Error::CallbackPanicked`] and latches the
 /// database read-only until it is reopened.
@@ -541,15 +558,17 @@ pub trait PrefixExtractor: Send + Sync + 'static {
     /// Return the portion of `key` that the prefix bloom should index,
     /// or `None` if `key` cannot produce a prefix (e.g., it's shorter
     /// than a fixed-length extractor's width). Keys that return `None`
-    /// are simply absent from the prefix bloom.
+    /// are simply absent from the prefix bloom. `key` is the key as the
+    /// caller wrote it.
     fn extract<'a>(&self, key: &'a [u8]) -> Option<&'a [u8]>;
 
     /// Return the bloom key that is safe to probe for a caller's
-    /// prefix-bounded scan. The default implementation only permits
-    /// exact extracted-prefix queries, preserving correctness for
-    /// custom extractors whose output may depend on more than a fixed
-    /// byte width. Extractors with stronger prefix-stability guarantees
-    /// can override this to enable broader SSTable skipping.
+    /// prefix-bounded scan, or `None` to rule no table out. `prefix` is
+    /// the prefix as the caller passed it. The default implementation
+    /// only permits exact extracted-prefix queries, preserving
+    /// correctness for custom extractors whose output may depend on more
+    /// than a fixed byte width. Extractors with stronger prefix-stability
+    /// guarantees can override this to enable broader SSTable skipping.
     fn extract_query<'a>(&self, prefix: &'a [u8]) -> Option<&'a [u8]> {
         let extracted = self.extract(prefix)?;
         (extracted == prefix).then_some(extracted)
@@ -560,8 +579,8 @@ pub trait PrefixExtractor: Send + Sync + 'static {
     fn name(&self) -> &'static str;
 }
 
-/// A [`PrefixExtractor`] that takes the first `N` bytes of every key.
-/// Keys shorter than `N` contribute no prefix.
+/// A [`PrefixExtractor`] that takes the first `N` bytes of every key, as
+/// the caller wrote it. Keys shorter than `N` contribute no prefix.
 #[derive(Debug, Clone, Copy)]
 pub struct FixedLengthPrefix(pub usize);
 
@@ -785,7 +804,9 @@ pub struct Options {
     pub(crate) fifo_compaction_options: FifoCompactionOptions,
     pub(crate) universal_compaction_options: UniversalCompactionOptions,
     pub(crate) max_background_compactions: usize,
-    pub(crate) inline_compaction: bool,
+    /// `None` until [`Options::inline_compaction`] is called: resolved by
+    /// [`Options::inline_compaction_resolved`].
+    pub(crate) inline_compaction: Option<bool>,
     pub(crate) max_subcompactions: usize,
     pub(crate) evict_compaction_data_from_page_cache: bool,
     pub(crate) partitioned_index: bool,
@@ -835,7 +856,7 @@ impl Default for Options {
             universal_compaction_options: UniversalCompactionOptions::default(),
             evict_compaction_data_from_page_cache: false,
             max_background_compactions: DEFAULT_MAX_BACKGROUND_COMPACTIONS,
-            inline_compaction: false,
+            inline_compaction: None,
             max_subcompactions: 1,
             partitioned_index: false,
             cache_index_and_filter_blocks: false,
@@ -919,7 +940,7 @@ impl std::fmt::Debug for Options {
                 "max_background_compactions",
                 &self.max_background_compactions,
             )
-            .field("inline_compaction", &self.inline_compaction)
+            .field("inline_compaction", &self.inline_compaction_resolved())
             .field("max_subcompactions", &self.max_subcompactions)
             .field("partitioned_index", &self.partitioned_index)
             .field(
@@ -936,6 +957,14 @@ impl std::fmt::Debug for Options {
 }
 
 impl Options {
+    /// [`Options::inline_compaction`] as the engine takes it: what was set,
+    /// or, when nothing was, on for a database with no compaction worker and
+    /// off for one that has a worker.
+    pub(crate) fn inline_compaction_resolved(&self) -> bool {
+        self.inline_compaction
+            .unwrap_or(self.max_background_compactions == 0)
+    }
+
     /// Tuning for a device or module whose whole working set has to
     /// fit in roughly 1-4 MiB: a Linux-class embedded board (Cortex-A,
     /// or an ESP32-S3 under esp-idf), or a wasm module, where every
@@ -1091,7 +1120,7 @@ impl Options {
             hard_pending_compaction_bytes_limit: 16 * 1024 * 1024,
             max_write_buffer_number: 2,
             max_background_compactions: 0,
-            inline_compaction: true,
+            inline_compaction: Some(true),
             evict_compaction_data_from_page_cache: true,
             metadata_block_size: 1024,
             max_key_size: 16 * 1024,
@@ -1228,7 +1257,7 @@ impl Options {
             hard_pending_compaction_bytes_limit: 128 * 1024 * 1024,
             max_write_buffer_number: 2,
             max_background_compactions: 0,
-            inline_compaction: true,
+            inline_compaction: Some(true),
             evict_compaction_data_from_page_cache: false,
             metadata_block_size: 1024,
             max_key_size: 16 * 1024,
@@ -1450,7 +1479,7 @@ impl Options {
             universal_compaction_options: self.universal_compaction_options,
             evict_compaction_data_from_page_cache: self.evict_compaction_data_from_page_cache,
             max_background_compactions: self.max_background_compactions,
-            inline_compaction: self.inline_compaction,
+            inline_compaction: self.inline_compaction_resolved(),
             partitioned_index: self.partitioned_index,
             cache_index_and_filter_blocks: self.cache_index_and_filter_blocks,
             metadata_block_size: self.metadata_block_size,

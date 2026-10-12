@@ -62,7 +62,6 @@ copy_getters! {
     get_fifo_compaction_options => fifo_compaction_options: FifoCompactionOptions,
     get_universal_compaction_options => universal_compaction_options: UniversalCompactionOptions,
     get_max_background_compactions => max_background_compactions: usize,
-    get_inline_compaction => inline_compaction: bool,
     get_max_subcompactions => max_subcompactions: usize,
     get_evict_compaction_data_from_page_cache => evict_compaction_data_from_page_cache: bool,
     get_partitioned_index => partitioned_index: bool,
@@ -86,6 +85,15 @@ shared_getters! {
 }
 
 impl Options {
+    /// The value of [`Options::inline_compaction`] as the database takes
+    /// it: what was set, or, when nothing was, on for a database with no
+    /// compaction worker ([`Options::max_background_compactions`] `0`) and
+    /// off for one that has a worker.
+    #[must_use]
+    pub fn get_inline_compaction(&self) -> bool {
+        self.inline_compaction_resolved()
+    }
+
     /// The value of [`Options::compression_per_level`]: the compression of
     /// each level, shallowest first, or `None` when every level uses
     /// [`Options::compression`].
@@ -253,7 +261,10 @@ mod tests {
             } => |o| o.get_universal_compaction_options().size_ratio == 5,
             max_background_compactions: |o| o.max_background_compactions(4)
                 => |o| o.get_max_background_compactions() == 4,
-            inline_compaction: |o| o.inline_compaction(true) => |o| o.get_inline_compaction(),
+            // The default follows the target's worker count, so the row
+            // sets the other answer, whichever that is.
+            inline_compaction: |o| o.inline_compaction(DEFAULT_MAX_BACKGROUND_COMPACTIONS > 0)
+                => |o| o.get_inline_compaction() == (DEFAULT_MAX_BACKGROUND_COMPACTIONS > 0),
             max_subcompactions: |o| o.max_subcompactions(2)
                 => |o| o.get_max_subcompactions() == 2,
             evict_compaction_data_from_page_cache: |o| o.evict_compaction_data_from_page_cache(true)
@@ -272,6 +283,24 @@ mod tests {
                 => |o| !o.get_env().capabilities().threads,
             max_open_files: |o| o.max_open_files(64) => |o| o.get_max_open_files() == 64,
         }
+    }
+
+    /// The inline-compaction getter reads the switch as the database takes
+    /// it: left unset it follows the worker count, and said explicitly it is
+    /// what was said.
+    #[test]
+    fn the_inline_compaction_getter_reads_what_the_database_takes() {
+        let workers = |n| Options::default().max_background_compactions(n);
+        assert!(workers(0).get_inline_compaction(), "no worker, unset");
+        assert!(!workers(1).get_inline_compaction(), "a worker, unset");
+        for n in [0, 1] {
+            assert!(!workers(n).inline_compaction(false).get_inline_compaction());
+            assert!(workers(n).inline_compaction(true).get_inline_compaction());
+        }
+        assert_eq!(
+            Options::default().get_inline_compaction(),
+            DEFAULT_MAX_BACKGROUND_COMPACTIONS == 0
+        );
     }
 
     /// A listener is added after the ones already set, and the getter hands

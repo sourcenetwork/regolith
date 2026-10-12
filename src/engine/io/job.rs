@@ -172,6 +172,12 @@ impl Job {
         self.passive
     }
 
+    /// Test-only: whether a thread is blocked on the job, or about to be.
+    #[cfg(test)]
+    pub(crate) fn has_sleeper(&self) -> bool {
+        !self.sleepers.is_empty()
+    }
+
     /// A waiting queue's owner may claim and run it now.
     pub(crate) fn is_runnable(&self) -> bool {
         !self.passive && self.flight.is_free()
