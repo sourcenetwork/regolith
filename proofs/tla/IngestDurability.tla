@@ -1,4 +1,19 @@
 ---- MODULE IngestDurability ----
+\* THE STORY, for a reader who has never seen the code.
+\* A database promises that after a power cut it comes back with "everything
+\* up to some point": if a later write survived, every earlier one did too.
+\* Ordinary writes become safe by being appended to a log file that is synced
+\* to disk now and then. An "ingest" (src/engine/ingest.rs) is a write that
+\* adds a whole ready-made table file, and it becomes safe another way: by a
+\* synced record in the manifest, the file that lists the tables.
+\*
+\* Tiny example of what can go wrong. Commit c1 is appended to the log; the
+\* log is not synced yet. The ingest then makes its manifest record durable.
+\* The power fails. After restart the ingest is there but c1, which came
+\* before it, is gone: a hole in the history. The model shows that syncing
+\* the log first, under the same mutex, makes that impossible, and the RED
+\* configuration shows the hole when the sync is left out.
+\*
 \* D48: what a power cut leaves of an ingest that is not rewritten.
 \*
 \* Under `Eventual` durability a power cut must leave a gap-free prefix of
@@ -50,28 +65,48 @@
 \*   MC_IngestDurability_Green            Mutant = "none"
 \*   MC_IngestDurability_Red_NoLogSync    GapFreePrefix fails.
 
+\* Borrow the standard definitions of numbers, sequences (ordered lists) and finite sets.
 EXTENDS Naturals, Sequences, FiniteSets
 
+\* The knobs of a run. Each configuration file (MC_IngestDurability_*.cfg) gives them values.
 CONSTANTS
-  Commits,  \* commit ids, strings; each commits once
-  Mutant    \* "none" or "NoLogSync"
+  \* The ordinary commits of the run: a set of names. Each commits once. In the code: writes that go
+  \* through the commit pipeline (src/engine/commit/mod.rs).
+  Commits,
+  \* "none" for the design, or "NoLogSync", the planted bug: the ingest does not sync the log before
+  \* its manifest record.
+  Mutant
 
 \* The ingest's id.
 Ingest == "ingest"
 
+\* The ingest's name is not also the name of a commit.
 ASSUME Ingest \notin Commits
+\* TLC refuses a configuration that names no known bug.
 ASSUME Mutant \in {"none", "NoLogSync"}
 
 \* Everyone who commits.
 Writers == Commits \cup {Ingest}
 
+\* The state: everything that changes from one step to the next. Each line says what the variable
+\* stands for in the real program.
 VARIABLES
-  order,     \* the writers that committed, in commit order (a sequence)
-  logged,    \* the commits whose record is in the log, synced or not
-  synced,    \* the commits whose record the log has synced
-  installed, \* whether the ingest's manifest record is durable
-  holding    \* whether the ingest is between its log sync and its record,
-             \* holding the pipeline mutex
+  \* The writers that committed, in commit order: a sequence. In the code this is the order in which
+  \* sequence numbers are drawn under the pipeline mutex (RegolithEngine::lock_pipeline,
+  \* src/engine/commit/mod.rs).
+  order,
+  \* The commits whose record is in the write-ahead log file, synced or not (Wal::append_group,
+  \* src/engine/wal.rs): a set.
+  logged,
+  \* The commits whose log record has been synced to disk, so that it survives a power cut
+  \* (Wal::sync_data, src/engine/wal.rs): a set.
+  synced,
+  \* TRUE once the manifest edit that installs the ingest's table is on disk
+  \* (RegolithEngine::install, src/engine/ingest.rs).
+  installed,
+  \* TRUE while the ingest is between its log sync and its manifest record, holding the pipeline
+  \* mutex.
+  holding
 
 \* Every variable, so a step that changes none of them is a stutter.
 vars == <<order, logged, synced, installed, holding>>
@@ -81,52 +116,80 @@ Committed == {order[i] : i \in 1..Len(order)}
 
 \* The start: nothing committed, logged, synced or installed.
 Init ==
+  \* No writer has committed.
   /\ order     = <<>>
+  \* The log holds nothing.
   /\ logged    = {}
+  \* Nothing is synced.
   /\ synced    = {}
+  \* The ingest's table is not installed.
   /\ installed = FALSE
+  \* Nobody holds the mutex.
   /\ holding   = FALSE
 
 \* Commit c takes the mutex, appends its record to the log, unsynced
 \* under `Eventual`, and is next in commit order. It waits while the ingest
 \* holds the mutex.
 Commit(c) ==
+  \* When: c has not committed yet
   /\ c \notin Committed
+  \* and the ingest does not hold the mutex.
   /\ ~holding
+  \* c is next in commit order.
   /\ order'  = Append(order, c)
+  \* Its record is in the log, not yet synced.
   /\ logged' = logged \cup {c}
+  \* Nothing else changes.
   /\ UNCHANGED <<synced, installed, holding>>
 
 \* The log is synced: a rotation, or a group with an `Immediate` member.
 \* Every logged record becomes durable.
 SyncLog ==
+  \* When: the ingest does not hold the mutex.
   /\ ~holding
+  \* Every record in the log is now on disk.
   /\ synced' = logged
+  \* Nothing else changes.
   /\ UNCHANGED <<order, logged, installed, holding>>
 
 \* The ingest takes the mutex and, in the fix, syncs the log. The mutant
 \* skips the sync.
 IngestSync ==
+  \* When: the ingest has not committed
   /\ Ingest \notin Committed
+  \* and does not hold the mutex already.
   /\ ~holding
+  \* It takes the mutex.
   /\ holding' = TRUE
+  \* The design syncs the log here (sync_active_wal), so every record in it is on disk; the bug
+  \* skips that.
   /\ synced'  = IF Mutant = "NoLogSync" THEN synced ELSE logged
+  \* Nothing else changes.
   /\ UNCHANGED <<order, logged, installed>>
 
 \* Still under the mutex, the ingest draws its place in commit order and
 \* its synced manifest edit makes it durable; then it releases the mutex.
 IngestInstall ==
+  \* When: the ingest holds the mutex.
   /\ holding
+  \* The ingest is next in commit order.
   /\ order'     = Append(order, Ingest)
+  \* Its manifest record is on disk.
   /\ installed' = TRUE
+  \* It releases the mutex.
   /\ holding'   = FALSE
+  \* The log is untouched.
   /\ UNCHANGED <<logged, synced>>
 
 \* Every step the system can take.
 Next ==
+  \* A commit commits,
   \/ \E c \in Commits : Commit(c)
+  \* or the log is synced,
   \/ SyncLog
+  \* or the ingest takes the mutex and syncs the log,
   \/ IngestSync
+  \* or the ingest installs its table.
   \/ IngestInstall
 
 \* Every behaviour: start in Init, then take Next steps or stutter.
@@ -137,10 +200,15 @@ Spec == Init /\ [][Next]_vars
 
 \* Every variable holds what its comment says.
 TypeOK ==
+  \* The order is a sequence of writers.
   /\ order \in Seq(Writers)
+  \* Only commits have log records.
   /\ logged \subseteq Commits
+  \* Only a logged record can be synced.
   /\ synced \subseteq logged
+  \* A yes or a no.
   /\ installed \in BOOLEAN
+  \* A yes or a no.
   /\ holding \in BOOLEAN
 
 \* What a power cut now leaves: the synced commits, and the ingest once its
@@ -149,7 +217,11 @@ Recovered == synced \cup (IF installed THEN {Ingest} ELSE {})
 
 \* THE HEADLINE. A power cut in any state recovers the first n writers of
 \* commit order, for some n: no writer survives while one before it is lost.
+\* Example ruled out: the order is c1, ingest, and a power cut leaves the
+\* ingest but not c1. The program needs this because a reader after restart
+\* would see the ingest's keys without a write the ingest was ordered after.
 GapFreePrefix ==
+  \* For some n, what a power cut leaves is exactly the first n writers of the order.
   \E n \in 0..Len(order) : Recovered = {order[i] : i \in 1..n}
 
 ====
