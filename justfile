@@ -710,6 +710,8 @@ tla:
     # E10, group commit. Lean: Regolith/GroupCommit.lean, group_eq_serial.
     spec=GroupCommit
     check MC_GroupCommit_Green                         GREEN
+    check MC_GroupCommit_Green_Live                    GREEN
+    check MC_GroupCommit_Green_LivePlain               GREEN
     check MC_GroupCommit_Green_ReadOnly                GREEN
     check MC_GroupCommit_Red_ViewOnly                  RED SerialEquivalent
     check MC_GroupCommit_Red_TrustEarly                RED SerialEquivalent
@@ -720,6 +722,7 @@ tla:
     # Green_Nowait_Owes is the witness that the GREEN run leaves groups owed.
     # Lean: Regolith/IoQueue.lean, group_sync_once, group_visible_after_sync.
     check MC_GroupCommit_Green_Nowait                  GREEN
+    check MC_GroupCommit_Green_NowaitLive              GREEN
     check MC_GroupCommit_Green_Nowait_Owes             RED NothingOwed
     check MC_GroupCommit_Red_DoubleClaim               RED SingleSync
     # 4.7, the lock-free commit pipeline. Lean: Regolith/Pipeline.lean,
