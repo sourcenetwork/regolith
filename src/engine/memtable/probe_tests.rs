@@ -50,7 +50,10 @@ fn a_tombstone_free_memtable_answers_from_the_gate_alone() {
 #[test]
 fn a_read_sees_every_range_delete_published_before_it_while_appends_continue() {
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as StdOrdering};
-    const APPENDS: u64 = 3_000;
+    // Sized for the interpreter under miri: each lookup walks the tombstones
+    // appended so far, so the cost is quadratic in this, and 3000 does not
+    // finish there in an hour. The race it checks is the same at 40.
+    const APPENDS: u64 = if cfg!(miri) { 40 } else { 3_000 };
     let mt = memtable();
     let published = AtomicU64::new(0);
     let done = AtomicBool::new(false);
