@@ -299,11 +299,14 @@ impl RegolithEngine {
         })
     }
 
-    /// A job's part holding the gate, which it releases when this returns. A
-    /// panic in code the job runs for the caller (a compaction filter, a
-    /// merge operator, a listener) fails the job alone.
+    /// A job's part holding the gate, which it releases before this returns.
+    /// A panic in code the job runs for the caller (a compaction filter, a
+    /// merge operator, a listener) fails the job alone. Once the gate is
+    /// free again, the stop it kept writers from relieving is relieved
+    /// here ([`Self::relieve_after_gate`]).
     fn under_gate(&self, gated: Gated, gate: Exclusive) -> Result<(), Error> {
-        contained(|| match gated {
+        // The closure owns the gate, so it is released when this returns.
+        let result = contained(move || match gated {
             Gated::CompactRange { lower, upper } => self
                 .compact_range(&gate, Some(&lower), Some(&upper))
                 .map_err(Error::from),
@@ -311,9 +314,68 @@ impl RegolithEngine {
                 .ingest_install(&gate, staged, &options)
                 .map_err(Error::from),
             Gated::Checkpoint { target } => crate::checkpoint::capture_into(self, gate, &target),
-        })
+        });
+        self.relieve_after_gate();
+        result
+    }
+
+    /// Relieve a stop that a sole hold of the compaction gate, or a wait
+    /// owed it, kept writers from relieving. Called once that hold or wait
+    /// is over.
+    ///
+    /// On a database with no worker and inline compaction on, a stopped
+    /// writer relieves the stop with compaction steps on its own thread. A
+    /// step that finds the gate held alone, or owed to a waiter, is
+    /// contended, and the writer waits for the thread in its way to relieve
+    /// the stop. A foreground job holds the gate for its gated part, a job
+    /// parked on a queue is owed it from the handoff to its owner's next
+    /// poll, and an ingest or a checkpoint only adds L0 tables, so here that
+    /// thread is this one: once the gate is released it runs the same
+    /// bounded steps a stopped writer would. A stop that stays (nothing left
+    /// to compact, the bound reached, a step failing) lands the waiters'
+    /// unit anyway, as every piece of progress does here (`StallSignal`,
+    /// relief handed back), so each writer looks again and relieves it or
+    /// reports why it cannot, instead of waiting for a relief nobody is
+    /// running. A step contended by another thread's work leaves the stop
+    /// to that thread, which hands it back the same way.
+    /// `proofs/tla/StallRelief.tla` checks that no stopped writer is left
+    /// waiting once nobody is relieving.
+    pub(super) fn relieve_after_gate(&self) {
+        if self.has_worker || !self.inline_compaction {
+            return;
+        }
+        let mut passes = 0usize;
+        let mut idle = 0usize;
+        while matches!(self.stall_state(), Some((_, true))) {
+            match self.run_one_background_step() {
+                Ok(super::compaction::CompactionOutcome::DidWork) => {
+                    idle = 0;
+                    passes += 1;
+                    if passes > Self::MAX_INLINE_PASSES {
+                        break;
+                    }
+                }
+                Ok(super::compaction::CompactionOutcome::Idle) => {
+                    idle += 1;
+                    if idle > Self::MAX_IDLE_PASSES {
+                        break;
+                    }
+                }
+                Ok(super::compaction::CompactionOutcome::Contended) => return,
+                Err(err) => {
+                    tracing::debug!(error = %err, "a step relieving a stop after a job failed");
+                    break;
+                }
+            }
+        }
+        // Lands the unit, the stop cleared or not.
+        self.refresh_stall_level();
     }
 }
+
+#[cfg(test)]
+#[path = "foreground_tests.rs"]
+mod tests;
 
 /// Run one part of a job, turning a panic in it into the job's failure.
 fn contained<T>(part: impl FnOnce() -> Result<T, Error>) -> Result<T, Error> {

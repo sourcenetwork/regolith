@@ -340,6 +340,14 @@ struct StdJoinHandle(std::thread::JoinHandle<()>);
 
 impl JoinHandle for StdJoinHandle {
     fn join(self: Box<Self>) {
+        // A worker asked to join itself is the one tearing the database
+        // down: it held the last reference, inside a job whose caller
+        // dropped its handle without waiting. It cannot wait for its own
+        // exit, which follows as soon as it returns to its loop and finds
+        // the shutdown it just signalled; the handle is let go instead.
+        if self.0.thread().id() == std::thread::current().id() {
+            return;
+        }
         // A worker that panicked is joined like any other: the panic
         // has already been reported on its own thread, and shutdown
         // must not turn it into a second one here.

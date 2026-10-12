@@ -159,6 +159,7 @@ pub mod loom_exports {
     pub use crate::engine::loom_model::{
         arena, gate, handoff, io_queue, jobs, skiplist, slice, version,
     };
+    pub use crate::sync::loom_model as sync;
 }
 
 #[cfg(feature = "fuzzing")]

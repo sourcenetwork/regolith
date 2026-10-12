@@ -18,6 +18,18 @@
 //!   cleared in between, the writer lands the job itself. A clearer stores
 //!   the level before it takes the job. So either the clearer finds the
 //!   writer's job, or the writer sees the cleared stall.
+//! - **Relief handed back.** On a database with no worker and inline
+//!   compaction on, stopped writers relieve the stop themselves, and one
+//!   whose step finds another thread's flush or job in the way waits for
+//!   that thread instead. That thread may stop relieving with the stop
+//!   still on: a write that ran its one owed step and returned, a job that
+//!   ended, a relief that gave up. So there every piece of progress lands
+//!   the job, stop or no stop, and each waiter looks again and relieves the
+//!   stop itself or is contended anew. A waiter that saw the contention
+//!   before such a landing and registered after it would miss it: progress
+//!   is counted before the level is stored, the writer reads the count
+//!   before its step and again once registered, and lands its own job when
+//!   the count moved (`StallRelief.tla`, RED NoRecheck).
 //! - **No thread waits.** Nothing here parks or sleeps; the slowdown delay
 //!   and the timed wait a stopped writer used to park on are gone.
 
@@ -31,7 +43,7 @@ use super::super::io::shared::{QueueShared, WaitSlot};
 use super::super::read_view::ReadViewCell;
 use super::super::{EngineOptions, stall_state};
 use crate::StallWait;
-use crate::portability::{AtomicU8, Ordering};
+use crate::portability::{AtomicU8, AtomicUsize, Ordering};
 
 /// The stall writers are stopped on now, if any, and the level writers cache.
 pub(crate) struct StallSignal {
@@ -41,6 +53,11 @@ pub(crate) struct StallSignal {
     level: Arc<AtomicU8>,
     /// The unit writers stopped since the stall began wait on.
     current: Atom<Option<Arc<Job>>>,
+    /// Stopped writers relieve the stop themselves: no worker, inline
+    /// compaction on.
+    writers_relieve: bool,
+    /// Pieces of progress so far, counted before each re-classification.
+    progress: AtomicUsize,
 }
 
 impl StallSignal {
@@ -50,10 +67,12 @@ impl StallSignal {
         level: Arc<AtomicU8>,
     ) -> Self {
         Self {
+            writers_relieve: options.max_background_compactions == 0 && options.inline_compaction,
             view,
             options,
             level,
             current: Atom::new(None),
+            progress: AtomicUsize::new(0),
         }
     }
 
@@ -79,9 +98,15 @@ impl StallSignal {
 
     /// Re-classify after work that can change the thresholds' inputs (a
     /// rotation, a flush, a compaction pass, an ingest), store the level
-    /// writers cache, and, once writes are no longer stopped, land the unit
-    /// stopped writers wait on.
+    /// writers cache, and land the unit stopped writers wait on once writes
+    /// are no longer stopped, or, where stopped writers relieve the stop
+    /// themselves, whatever the stop (module docs). Called once the work
+    /// released the flush or compaction exclusion it held.
     pub(crate) fn refresh(&self) {
+        // Counted before the level is stored and the unit taken: a writer
+        // contended before this and registered after the take sees the count
+        // moved (module docs).
+        self.progress.fetch_add(1, Ordering::SeqCst);
         let level = match self.classify() {
             None => 0,
             Some((_, false)) => 1,
@@ -90,9 +115,15 @@ impl StallSignal {
         // Stored before the unit is taken: a writer that registered after the
         // take sees this level when it classifies again (module docs).
         self.level.store(level, Ordering::Release);
-        if level < 2 {
+        if level < 2 || self.writers_relieve {
             self.land();
         }
+    }
+
+    /// The pieces of progress so far, read by a writer before a relief step
+    /// that may find another thread's work in the way.
+    pub(crate) fn progress(&self) -> usize {
+        self.progress.load(Ordering::SeqCst)
     }
 
     /// Land the unit stopped writers wait on now, whatever the stall: close,
@@ -106,12 +137,15 @@ impl StallSignal {
     /// A wait for the stall `reason` to clear, for a write that stopped on
     /// it. Recorded on `queue` when the writer's thread has one, so it is
     /// completed at that queue's poll; else completed directly by whoever
-    /// clears the stall.
+    /// clears the stall. `seen` is the [`Self::progress`] a writer whose
+    /// relief step was contended read before the step: progress since then
+    /// completes the wait at once, so the writer looks again.
     pub(crate) fn wait(
         &self,
         io: &IoRuntime,
         queue: Option<Arc<QueueShared>>,
         reason: &'static str,
+        seen: Option<usize>,
     ) -> StallWait {
         let job = self.unit();
         let slot = Arc::new(WaitSlot::new());
@@ -129,9 +163,13 @@ impl StallSignal {
             slot.complete();
         }
         // Classified again only now that the wait is recorded, so a clearer
-        // that came before the registration is not missed.
+        // that came before the registration is not missed; and the progress
+        // read again, so a landing between the contended step and the
+        // registration is not missed either.
         if self.classify().is_none_or(|(_, stopped)| !stopped) {
             self.refresh();
+        } else if seen.is_some_and(|seen| seen != self.progress()) {
+            self.land();
         }
         StallWait::new(slot, job, id, reason)
     }
@@ -161,33 +199,52 @@ impl StallSignal {
 mod tests {
     use super::*;
     use crate::column_family::{DEFAULT_CF_ID, prefix_key};
+    use crate::engine::compaction::CompactionOutcome;
     use crate::engine::{DurabilityMode, RegolithEngine};
-    use crate::{IoBudget, WriteBatchOp};
+    use crate::{Error, IoBudget, WouldBlock, WriteBatchOp};
 
-    fn stopped_engine() -> (tempfile::TempDir, Arc<RegolithEngine>) {
+    fn put(key: &[u8]) -> Vec<WriteBatchOp> {
+        vec![WriteBatchOp::Put {
+            key: prefix_key(DEFAULT_CF_ID, key),
+            value: b"v".to_vec(),
+        }]
+    }
+
+    /// No worker, one L0 table at the stop.
+    fn stopped_engine_with(options: EngineOptions) -> (tempfile::TempDir, Arc<RegolithEngine>) {
         let dir = tempfile::TempDir::new().unwrap();
         let engine = RegolithEngine::open(
             dir.path(),
             EngineOptions {
                 max_background_compactions: 0,
                 level0_stop_writes_trigger: 1,
-                l0_compaction_trigger: 1,
-                ..EngineOptions::default()
+                ..options
             },
         )
         .unwrap();
         engine
-            .apply_batch(
-                vec![WriteBatchOp::Put {
-                    key: prefix_key(DEFAULT_CF_ID, b"k"),
-                    value: b"v".to_vec(),
-                }],
-                DurabilityMode::Eventual,
-                false,
-            )
+            .apply_batch(put(b"k"), DurabilityMode::Eventual, false)
             .unwrap();
         engine.flush_active_memtable().unwrap();
         (dir, engine)
+    }
+
+    /// Stopped writers wait for a compaction someone else runs.
+    fn stopped_engine() -> (tempfile::TempDir, Arc<RegolithEngine>) {
+        stopped_engine_with(EngineOptions {
+            l0_compaction_trigger: 1,
+            ..EngineOptions::default()
+        })
+    }
+
+    /// Stopped writers relieve the stop themselves, and no step can: level 0
+    /// is below its compaction trigger.
+    fn stopped_engine_where_writers_relieve() -> (tempfile::TempDir, Arc<RegolithEngine>) {
+        stopped_engine_with(EngineOptions {
+            inline_compaction: true,
+            l0_compaction_trigger: 100,
+            ..EngineOptions::default()
+        })
     }
 
     #[test]
@@ -195,9 +252,9 @@ mod tests {
         let (_dir, engine) = stopped_engine();
         let signal = engine.stall_signal();
         assert!(matches!(signal.classify(), Some((_, true))));
-        let wait = signal.wait(engine.io(), None, "stop");
+        let wait = signal.wait(engine.io(), None, "stop", None);
         assert!(!wait.is_ready());
-        let again = signal.wait(engine.io(), None, "stop");
+        let again = signal.wait(engine.io(), None, "stop", None);
         assert!(!again.is_ready());
         engine.run_one_compaction_pass().unwrap();
         assert!(
@@ -213,7 +270,7 @@ mod tests {
         let signal = engine.stall_signal();
         let mut queue = engine.io_queue();
         let shared = engine.io().queue(queue.id());
-        let wait = signal.wait(engine.io(), shared, "stop");
+        let wait = signal.wait(engine.io(), shared, "stop", None);
         queue.poll(IoBudget::ALL);
         assert!(!wait.is_ready());
         engine.run_one_compaction_pass().unwrap();
@@ -226,7 +283,76 @@ mod tests {
     fn a_wait_for_a_stall_that_already_cleared_is_ready_at_once() {
         let (_dir, engine) = stopped_engine();
         engine.run_one_compaction_pass().unwrap();
-        let wait = engine.stall_signal().wait(engine.io(), None, "stop");
+        let wait = engine.stall_signal().wait(engine.io(), None, "stop", None);
         assert!(wait.is_ready());
+    }
+
+    #[test]
+    fn a_step_that_leaves_the_stop_hands_it_back_to_the_writer_it_held_off() {
+        let (_dir, engine) = stopped_engine_where_writers_relieve();
+        // A job holds the compaction gate: the stopped write's own step is
+        // contended, and the write waits for the job's thread.
+        let gate = engine.compaction_gate().exclusive().unwrap();
+        let Err(Error::WouldBlock(WouldBlock::Stall(wait))) = engine.admit_write(false) else {
+            panic!("a contended relief returns a wait");
+        };
+        assert!(!wait.is_ready());
+        drop(gate);
+        // That thread runs one step, which leaves the stop on, and relieves
+        // no further: an owed step after its commit, or a job that ended.
+        assert!(matches!(
+            engine.run_one_background_step().unwrap(),
+            CompactionOutcome::Idle
+        ));
+        assert!(matches!(engine.stall_signal().classify(), Some((_, true))));
+        assert!(wait.is_ready(), "handed back: the writer looks again");
+        // Looking again, the writer finds no step that relieves the stop and
+        // says so, instead of waiting for ever.
+        assert!(matches!(engine.admit_write(false), Err(Error::Busy(_))));
+    }
+
+    #[test]
+    fn progress_between_a_contended_step_and_its_wait_completes_the_wait() {
+        let (_dir, engine) = stopped_engine();
+        let signal = engine.stall_signal();
+        let early = signal.wait(engine.io(), None, "stop", None);
+        // The writer read the progress, and its step was contended.
+        let seen = signal.progress();
+        // The holder's work ends with the stop on; with a worker relieving,
+        // nothing lands.
+        signal.refresh();
+        assert!(!early.is_ready());
+        assert!(
+            !signal
+                .wait(engine.io(), None, "stop", Some(signal.progress()))
+                .is_ready()
+        );
+        // The writer registers only now: it sees the progress it missed.
+        assert!(
+            signal
+                .wait(engine.io(), None, "stop", Some(seen))
+                .is_ready()
+        );
+    }
+
+    #[test]
+    fn a_stall_step_dropped_unrun_hands_the_stop_back() {
+        let (_dir, engine) = stopped_engine_where_writers_relieve();
+        // Writer A's stop left the relieving step on A's queue.
+        let queue_a = engine.io_queue();
+        let shared_a = engine.io().queue(queue_a.id()).unwrap();
+        engine.leave_stall_step(&shared_a);
+        // Writer B found it there and waits.
+        let mut queue_b = engine.io_queue();
+        let shared_b = engine.io().queue(queue_b.id());
+        let wait = engine
+            .stall_signal()
+            .wait(engine.io(), shared_b, "stop", None);
+        queue_b.poll(IoBudget::ALL);
+        assert!(!wait.is_ready());
+        // A's queue goes away before A polled it.
+        drop(queue_a);
+        queue_b.poll(IoBudget::ALL);
+        assert!(wait.is_ready(), "B looks again and leaves its own step");
     }
 }

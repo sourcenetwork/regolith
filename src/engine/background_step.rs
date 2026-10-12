@@ -258,10 +258,12 @@ impl JobBody for StallStep {
         }
     }
 
-    /// Left undone: the next stopped write leaves another.
+    /// Left undone: the writers it was left for look again, and the next
+    /// one stopped leaves another (`StallSignal`, relief handed back).
     fn release(self: Box<Self>) {
         if let Some(engine) = self.engine.upgrade() {
             engine.stall_step_queued.store(false, Ordering::Release);
+            engine.stall_signal.land();
         }
     }
 }

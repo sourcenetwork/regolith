@@ -94,3 +94,8 @@ import Regolith.CompactionGate
 -- tag covers and writes a sealed MANIFEST last. Backs
 -- `proofs/tla/BackupSeal.tla`.
 import Regolith.BackupSeal
+-- Phase 7 integration: a foreground job that held the compaction gate,
+-- with no worker and inline compaction on, relieves the stop it kept
+-- stopped writers from relieving, so no writer waits on a stall nobody will
+-- land. Backs `proofs/tla/StallRelief.tla`.
+import Regolith.StallRelief
