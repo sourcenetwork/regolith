@@ -69,9 +69,9 @@
 \*   MC_SyncRwLock_Green_Reentrant   ReentrantRwLock, tasks 1 and 2 of one
 \*                                   owner nesting up to two guards: every
 \*                                   safety invariant.
-\*   MC_SyncRwLock_Green_ReentrantLive  the same with one guard per task:
-\*                                   if no owner holds forever, every waiter
-\*                                   is served.
+\*   MC_SyncRwLock_Green_ReentrantLive  one task of each owner, one guard
+\*                                   each: if no owner holds forever, every
+\*                                   waiter is served.
 \*   MC_SyncRwLock_Red_UnboundedBarging  the owed bit is never set: readers
 \*                                   keep barging past a writer head:
 \*                                   BoundedBypass.
