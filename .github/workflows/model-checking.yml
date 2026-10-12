@@ -53,6 +53,12 @@ jobs:
   # view per batch read, ingest publication and WAL rotation. The green
   # and the red configurations both run: a red one going green would mean
   # the model stopped telling the fix from the defect.
+  #
+  # Every row runs in one job. The suite is bounded by its configurations,
+  # not by more runners: each row is sized to finish in under a minute on one
+  # TLC worker and is stopped, as a failure, at two (`just tla`), and the
+  # recipe runs as many rows side by side as the runner has cores. The whole
+  # suite is meant to take under 10 minutes on four cores, so the job has 15.
   tla:
     runs-on: ubuntu-latest
     timeout-minutes: 15
