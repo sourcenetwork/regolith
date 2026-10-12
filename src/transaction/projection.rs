@@ -145,6 +145,19 @@ impl Transaction {
     /// the parts scheme the operator's `touches` understands should not be
     /// read this way.
     ///
+    /// # After compaction
+    ///
+    /// The check can refuse a read it would have passed, never the reverse.
+    /// When a put and the operands committed after it are all newer than the
+    /// read and no snapshot lies between them, compaction folds them into one
+    /// put, which no longer says which parts those operands touched. From
+    /// then on the read is validated against the folded put as against any
+    /// put: it stands only if the folded value is exactly the bytes it read.
+    /// So a read that stood before the fold, because the put left the bytes
+    /// it read and the later operands touched other parts, is refused after
+    /// it. Operands with no put among them keep their answer when they are
+    /// folded, by the contract of `touches`.
+    ///
     /// # Example
     ///
     /// `Fields` is the operator of the [`crate::MergeOperator::touches`]

@@ -625,12 +625,83 @@ pub enum ScanDirection {
 /// on: the commit cost is one check per scanned key, and a large scan
 /// stalls every writer for that long. Below this level a scan records one
 /// entry per stretch of keys it walked, not one per key.
+///
+/// # A write-free reader needs writers that validate their reads
+///
+/// At [`IsolationLevel::DefraLevel`] an optimistic transaction that writes
+/// nothing validates none of its plain reads: it read one snapshot, so what
+/// it saw is a state the database was in. That state lies on a serial order
+/// of the committed transactions only when every transaction that writes
+/// to the database validates the reads its writes depend on: its point
+/// reads at `RepeatableRead`, `Serializable` and `DefraLevel`, and a scan
+/// it decides on through [`ScanCheck::Range`]. A writer at
+/// [`IsolationLevel::SnapshotIsolation`], the default, or at
+/// `ReadCommitted`, commits on reads nobody checked, and a reader can then
+/// see a state no serial order passes through, whatever level the reader
+/// runs at. Give the writers a validating level when a write-free reader's
+/// result must be one a serial order could have produced.
+///
+/// Two balances, and a rule that a withdrawal which leaves their total
+/// below zero costs one more:
+///
+/// ```
+/// use regolith::{IsolationLevel, OptimisticTransactionDb, Options, TxnOptions};
+///
+/// fn balance(bytes: Option<Vec<u8>>) -> i64 {
+///     bytes.map_or(0, |bytes| i64::from_be_bytes(bytes.try_into().expect("eight bytes")))
+/// }
+///
+/// // What a report that writes nothing saw, and the `x` the database ends
+/// // with, when the two writers run at `writers`.
+/// let run = |writers: IsolationLevel| -> Result<((i64, i64), i64), Box<dyn std::error::Error>> {
+///     let db = OptimisticTransactionDb::open("balances", Options::memory())?;
+///     let writer = TxnOptions::new().isolation(writers);
+///
+///     // The withdrawal reads both balances: a total of 0.
+///     let withdrawal = db.begin(&writer);
+///     let (x, y) = (balance(withdrawal.get(b"x")?), balance(withdrawal.get(b"y")?));
+///
+///     // A deposit of 20 into `y` commits.
+///     let deposit = db.begin(&writer);
+///     let before = balance(deposit.get(b"y")?);
+///     deposit.put(b"y", &(before + 20).to_be_bytes())?;
+///     deposit.commit()?;
+///
+///     // The report reads both balances and writes nothing.
+///     let report = db.begin(&TxnOptions::new().isolation(IsolationLevel::DefraLevel));
+///     let seen = (balance(report.get(b"x")?), balance(report.get(b"y")?));
+///     report.commit()?;
+///
+///     // The withdrawal takes 10 from `x`, and 1 more for the total it read.
+///     let penalty = i64::from(x + y - 10 < 0);
+///     withdrawal.put(b"x", &(x - 10 - penalty).to_be_bytes())?;
+///     // It may lose its commit; either way, look at what is left.
+///     let _ = withdrawal.commit();
+///     Ok((seen, balance(db.db().get(b"x")?)))
+/// };
+///
+/// // Snapshot isolation lets the withdrawal commit on the total it read.
+/// // The report saw the deposit and no withdrawal, so the withdrawal comes
+/// // after both, yet it was charged as if no deposit had been made: no
+/// // order of the three produces what the report read.
+/// assert_eq!(run(IsolationLevel::SnapshotIsolation)?, ((0, 20), -11));
+///
+/// // A writer that validates its reads loses instead, because the `y` it
+/// // read changed. The report read the state after the deposit alone.
+/// assert_eq!(run(IsolationLevel::RepeatableRead)?, ((0, 20), 0));
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum IsolationLevel {
     /// Validate nothing beyond what the transaction wrote.
     ReadCommitted,
     /// Validate writes and keys read through
     /// [`Transaction::get_for_update`]. regolith's default.
+    ///
+    /// A transaction that writes at this level commits on plain reads nobody
+    /// validated. That weakens every reader beside it, a write-free reader
+    /// at [`IsolationLevel::DefraLevel`] included: see "A write-free reader
+    /// needs writers that validate their reads" on this type.
     #[default]
     SnapshotIsolation,
     /// Validate every key a point read returned; record a scan per
@@ -685,13 +756,17 @@ pub enum IsolationLevel {
     ///   value its decision used; it is refused only by a newer write that
     ///   changes one of them (see [`crate::MergeOperator::touches`]).
     /// - Write-free transactions. A transaction that writes nothing
-    ///   validates no plain read and never conflicts: it read one snapshot,
-    ///   and nothing it did can have moved. It checks only the reads it
-    ///   made through [`Transaction::get_for_update`], against the newest
-    ///   published state, and takes no part in the commit pipeline, so it
-    ///   commits while a writer holds the pipeline. A pessimistic transaction
-    ///   at this level is not write-free, since its `get_for_update` reads
-    ///   can see two points in time.
+    ///   validates no plain read: it read one snapshot, and nothing it did
+    ///   can have moved. It checks only the reads it made through
+    ///   [`Transaction::get_for_update`], against the newest published
+    ///   state, and takes no part in the commit pipeline, so its commit
+    ///   waits for no writer. What it read lies on a serial order of the
+    ///   commits only while every writer on the database validates its own
+    ///   reads: a writer at `SnapshotIsolation` or `ReadCommitted` beside it
+    ///   breaks that (see "A write-free reader needs writers that validate
+    ///   their reads" on this type). A pessimistic transaction at this level
+    ///   is not write-free, since its `get_for_update` reads can see two
+    ///   points in time.
     ///
     /// A scan checked with [`ScanCheck::Range`] is stricter than any of
     /// these: any write inside the range it covered since the snapshot
@@ -1682,7 +1757,11 @@ impl Transaction {
     /// of it. An optimistic transaction at
     /// [`IsolationLevel::DefraLevel`] that writes nothing is the exception: it
     /// takes no part in the pipeline and validates only its
-    /// [`Transaction::get_for_update`] reads.
+    /// [`Transaction::get_for_update`] reads. Its plain reads are one
+    /// snapshot, which lies on a serial order of the commits only while every
+    /// writer on the database validates its own reads: a writer at
+    /// [`IsolationLevel::SnapshotIsolation`], the default, breaks that (see
+    /// [`IsolationLevel`]).
     ///
     /// Concurrent commits go through one pipeline with each other and with
     /// plain writes, with no lock: each is decided in the order it entered,

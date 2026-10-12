@@ -122,6 +122,11 @@ pub(crate) const PLATFORM_THREADS: bool =
 /// Paths are whatever the host understands. regolith only ever joins
 /// names onto the database directory it was given, so a backend with
 /// a flat namespace is free to treat the whole path as an opaque key.
+///
+/// One default is worth replacing in an environment of your own:
+/// [`Env::open_log`]. It is correct on any environment, and gets there by
+/// putting every write of the write-ahead log behind one lock; the method
+/// says what that costs.
 pub trait Env: Send + Sync + std::fmt::Debug {
     /// Create `path` and every missing parent. Succeeds when the
     /// directory already exists.
@@ -165,6 +170,19 @@ pub trait Env: Send + Sync + std::fmt::Debug {
     /// lock, holding a write that arrives ahead of a gap until the gap is
     /// filled. That is always correct, and it is the one place a committing
     /// thread waits for another to write.
+    ///
+    /// What the default costs: one operating-system lock covers the file.
+    /// The log writes of concurrent commits run one at a time, and a sync of
+    /// the log holds the lock for as long as the device takes, so no commit
+    /// writes its record while a sync is in flight. A write that arrives
+    /// ahead of a gap is copied and kept in memory until the gap is filled,
+    /// which is bounded by the commits in flight. A thread that finds the
+    /// lock taken blocks, inside [`IoQueue::poll`](crate::IoQueue::poll) or
+    /// [`commit_nowait`](crate::Transaction::commit_nowait) as anywhere
+    /// else, so those calls lose their promise never to wait on another
+    /// thread. An environment that takes commits from more than one thread,
+    /// or whose callers must never block, should override this method; one
+    /// that a single thread drives loses nothing by keeping the default.
     ///
     /// No environment of this crate uses the default. Every one a database
     /// runs on has a log no write of which waits for another: [`StdEnv`]
