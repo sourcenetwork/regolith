@@ -58,7 +58,7 @@ fn write_until_sealed(engine: &RegolithEngine, prefix: &str) -> usize {
 fn a_rotating_write_returns_without_flushing() {
     let dir = TempDir::new().unwrap();
     let engine = RegolithEngine::open(dir.path(), tiny(1)).unwrap();
-    let flushing = engine.flusher.flushing.lock();
+    let flushing = engine.flusher.flushing().unwrap();
     let (done, returned) = mpsc::channel();
     std::thread::scope(|scope| {
         scope.spawn(|| {
@@ -165,7 +165,7 @@ fn frozen_memtables_install_in_l0_oldest_first_whoever_flushes() {
     .unwrap();
     const ROUNDS: u8 = 6;
     {
-        let _held = engine.flusher.flushing.lock();
+        let _held = engine.flusher.flushing().unwrap();
         // Each round seals a memtable holding `k = round`.
         for round in 0..ROUNDS {
             put(&engine, b"k", &[round]).unwrap();
@@ -214,7 +214,7 @@ fn a_rotation_never_leaves_more_memtables_than_the_cap() {
     let dir = TempDir::new().unwrap();
     // The default cap of two: the active memtable and one frozen.
     let engine = RegolithEngine::open(dir.path(), tiny(1)).unwrap();
-    let held = engine.flusher.flushing.lock();
+    let held = engine.flusher.flushing().unwrap();
     write_until_sealed(&engine, "first");
     assert_eq!(engine.view.load().frozen.len(), 1);
     let (done, returned) = mpsc::channel();
@@ -298,7 +298,7 @@ fn a_worker_waiting_on_the_flush_exclusion_holds_back_no_retired_view() {
             .update_memtables(|_, frozen| (Arc::clone(&doomed), frozen.to_vec(), ()));
         probe
     };
-    let held = engine.flusher.flushing.lock();
+    let held = engine.flusher.flushing().unwrap();
     let (waiting_tx, waiting) = mpsc::channel();
     std::thread::scope(|scope| {
         let worker = scope.spawn(|| {

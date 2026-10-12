@@ -1,5 +1,5 @@
 //! Test-only helpers: a future polled by hand under a waker that counts
-//! its wakes, and a thread-parking `block_on` for multi-threaded tests.
+//! its wakes, and the thread-parking `block_on` for multi-threaded tests.
 
 use core::future::Future;
 use core::pin::Pin;
@@ -67,27 +67,5 @@ impl<F: Future> Polled<F> {
     }
 }
 
-struct Unpark(std::thread::Thread);
-
-impl Wake for Unpark {
-    fn wake(self: Arc<Self>) {
-        self.0.unpark();
-    }
-
-    fn wake_by_ref(self: &Arc<Self>) {
-        self.0.unpark();
-    }
-}
-
 /// Drives `future` to completion on this thread, parking between polls.
-pub(crate) fn block_on<F: Future>(future: F) -> F::Output {
-    let waker = Waker::from(Arc::new(Unpark(std::thread::current())));
-    let mut cx = Context::from_waker(&waker);
-    let mut future = core::pin::pin!(future);
-    loop {
-        if let Poll::Ready(output) = future.as_mut().poll(&mut cx) {
-            return output;
-        }
-        std::thread::park();
-    }
-}
+pub(crate) use super::internal::block_on;

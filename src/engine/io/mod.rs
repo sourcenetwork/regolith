@@ -41,6 +41,10 @@
 //!   queue waiting on one has its completion (`NonBlocking.tla`, Release;
 //!   the loom model `no_unit_outlives_close`).
 //!
+//! - **A poll waits for no other thread.** A job that needs something
+//!   another thread holds parks on its queue instead of waiting, and is
+//!   stepped again once it may go on (`job.rs`, Parking).
+//!
 //! - **Jobs.** I/O that is not a block read is a *job* (`job.rs`) on the
 //!   queue of the thread that asked for it. A job a queue owns alone (the
 //!   step a write left owing, a foreground job with no worker) is listed in
@@ -293,6 +297,28 @@ impl IoRuntime {
         let _device = scope::blocking();
         job.run();
         self.forget_job(job);
+    }
+
+    /// Step a job `queue`'s owner claimed at its poll: run it as far as it
+    /// goes without waiting for another thread. `true` when it ran to its
+    /// end, and is dropped from the job table. `false` when it parked, to be
+    /// stepped again once it is pushed back to `queue` (`job.rs`).
+    ///
+    /// The step is counted through the close gate as a miss is: close's
+    /// sweep skips a job that is claimed, so a job that parks while close
+    /// sweeps, or after close began, is settled here instead of left parked
+    /// on a closed database.
+    pub(crate) fn step_job(&self, job: &Arc<Job>, queue: &Arc<QueueShared>) -> bool {
+        let _device = scope::blocking();
+        let counted = self.gate.enter();
+        let landed = job.step(&job::unpark_waker(job, queue));
+        let closing = !counted || self.gate.leave();
+        if landed {
+            self.forget_job(job);
+        } else if closing {
+            self.release_job(job);
+        }
+        landed
     }
 
     /// Settle `job` without running it, unless another thread claimed it,

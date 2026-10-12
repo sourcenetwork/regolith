@@ -101,7 +101,8 @@ src/
 │   ├── contend.rs      # The acquire every lock-like primitive shares: barging with bounded bypass (D49)
 │   ├── owned_lock.rs   # A lock whose holder is named in its state word: the pessimistic key lock
 │   ├── waiter.rs       # Waiter nodes, their free list, the wake list
-│   └── internal.rs     # The engine's private std/loom atomics, Mutex, RwLock, Condvar and Gate
+│   └── internal.rs     # The engine's private std/loom atomics, Mutex, RwLock and Condvar, and how its
+│                       # threads wait on a regolith::sync primitive (block_on, wait_here)
 ├── txn_buffer.rs       # Concurrent write and read-set buffer of one transaction
 ├── env/                # Env trait and backends: StdEnv (positional reads), MemEnv, WASI, OPFS; db_lock.rs
 │   ├── mem_file.rs     # Lock-free in-memory file behind MemEnv and the OPFS mirror
@@ -116,10 +117,13 @@ src/
     │                   # the column-family fence in the ordered step (families.rs)
     ├── flush.rs        # Writing a frozen memtable to L0, shared with the compaction workers
     ├── background_step.rs # Flushes off the commit path; owed work run as a job on the writer's queue
-    ├── foreground.rs   # compact_range, ingest, checkpoint run as jobs behind a JobTicket
+    ├── foreground.rs   # compact_range, ingest, checkpoint run as jobs behind a JobTicket; a job on a
+    │                   # queue parks instead of waiting for the compaction gate
+    ├── compaction_gate.rs # The compaction gate: passes share it, jobs hold it alone, fair both ways (E28)
     ├── stall_state.rs  # Write-stall thresholds and the level writers cache
     ├── compaction.rs   # Level/FIFO/universal compaction planning and worker loop
-    ├── compaction/     # Per-snapshot-stripe folding of versions and merge chains
+    ├── compaction/     # Per-snapshot-stripe folding of versions and merge chains; claims.rs (the tables
+    │                   # passes are working on, claimed with atomics)
     ├── manifest.rs     # VersionSet, VersionEdit log, level tracking
     ├── manifest/       # Sealed manifests (sealed.rs), the judge of a torn tail (tail.rs, E29), tests
     ├── log_retirement.rs # Retiring flushed logs: min_wal_id in the table's batch, failed removals
@@ -151,7 +155,7 @@ src/
     ├── index_block.rs  # Decoded SSTable index blocks
     ├── internal_key.rs # MVCC internal key encoding
     ├── io/             # Per-thread queues: unit and job tables, the close gate (mod.rs), single-flight
-    │                   # read units (unit.rs) and jobs (job.rs) over one claim (flight.rs), per-queue
+    │                   # read units (unit.rs) and jobs (job.rs, with parking) over one claim (flight.rs), per-queue
     │                   # inbox and landings (shared.rs), thread binding (bind.rs), the mode scope
     │                   # (scope.rs), stack.rs, atomic_waker.rs
     ├── loom_model/     # Loom models of the engine's lock-free protocols (--cfg loom)

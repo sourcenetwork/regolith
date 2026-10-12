@@ -351,7 +351,15 @@ loom-locks:
     RUSTFLAGS="--cfg loom" cargo test --release --test loom_locks --no-run
     RUSTFLAGS="--cfg loom" timeout 10m cargo test --release --test loom_locks
 
-loom-all: loom loom-debug loom-sync loom-io loom-snapshots loom-view loom-cache loom-tombstones loom-tables loom-locks
+# Loom models for the compaction gate (E28) and for a job that parks on its
+# queue instead of waiting for the gate, with three calibrations that must
+# fail: a job that skips the gate, the old writer-preferring gate, and a
+# parked job with no way back to its queue. Release only, like `loom-sync`.
+loom-gate:
+    RUSTFLAGS="--cfg loom" cargo test --release --test loom_gate --no-run
+    RUSTFLAGS="--cfg loom" timeout 10m cargo test --release --test loom_gate
+
+loom-all: loom loom-debug loom-sync loom-io loom-snapshots loom-view loom-cache loom-tombstones loom-tables loom-locks loom-gate
 
 # The read-view chaos workload at full size: 6 instances x 2 rounds x 400
 # versions. Measured at over 20 minutes wall and 4h of CPU unoptimized,
@@ -792,6 +800,24 @@ tla:
     check MC_SyncRwLock_Red_AnyReaderUpgrade           RED NoUpgradeDeadlock
     check MC_SyncRwLock_Red_UpgradeNoHoldBack          RED UpgradeHoldsBack
     check MC_SyncRwLock_Red_OwnerUnaware               RED NoSelfDeadlock
+    # The compaction gate (4.6, E28): a pass shares it, a job holds it
+    # alone, no waiter is passed over more than Bound times either way, the
+    # worker takes turns between jobs and passes, and a job parked on its
+    # queue is always woken. The old gate's rule is Red_OldGate. Lean:
+    # Regolith/CompactionGate.lean, mutual_exclusion, bounded_bypass,
+    # owed_only_gets_nearer, worker_takes_turns, parked_job_keeps_its_wake.
+    spec=CompactionGate
+    check MC_CompactionGate_Green                      GREEN
+    check MC_CompactionGate_Green_All                  GREEN
+    check MC_CompactionGate_Green_Queue                GREEN
+    check MC_CompactionGate_Green_Passes               GREEN
+    check MC_CompactionGate_Green_Live                 GREEN
+    check MC_CompactionGate_Red_OldGate                RED BoundedBypass
+    check MC_CompactionGate_Red_NoHandoff              RED BoundedBypass
+    check MC_CompactionGate_Red_DrainJobs              RED WorkerTakesTurns
+    check MC_CompactionGate_Red_WakeDropped            RED NoLostWake
+    check MC_CompactionGate_Red_StaleWaker             RED NoLostWake
+    check MC_CompactionGate_Red_SkipGate               RED MutualExclusion
     # regolith::sync::Event, Latch and Barrier.
     spec=SyncLatch
     check MC_SyncLatch_Green_Event                     GREEN
