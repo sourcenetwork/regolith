@@ -5,6 +5,8 @@ mod background_step;
 mod background_step_tests;
 pub(crate) mod block;
 pub(crate) mod block_cache;
+#[cfg(all(test, not(loom)))]
+mod blocked_call_tests;
 pub(crate) mod bloom;
 pub(crate) mod callback;
 pub(crate) mod checksum;
@@ -2330,7 +2332,7 @@ impl RegolithEngine {
         let wait = self
             .stall_signal
             .wait(self.io(), queue, reason, seen)
-            .counted_in(self.statistics_arc());
+            .on(self.me.clone());
         match self.stop_will_not_clear() {
             Some(told) => told,
             None => crate::Error::WouldBlock(crate::WouldBlock::Stall(wait)),
