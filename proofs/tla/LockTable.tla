@@ -90,6 +90,10 @@
 \*   Green_Nowait    commits land later; locks go at the landing.
 \*   Green_Cancel    waiters may give up at any time.
 \*   Green_Table     two entry names, so a retired entry is told apart.
+\*   Green_Mixed     a sleeper, a commit_nowait and a give-up at once:
+\*                   every invariant, five lock calls.
+\*   Green_MixedLive the same with four lock calls: everybody is served.
+\*   Green_Four      four transactions, three in line: every invariant.
 \*   Red_RetireNoCas, Red_NoRecheck, Red_ReleaseNoWake, Red_NoteAfterPoll,
 \*   Red_CancelNoPassOn, Red_UnboundedBarging, Red_WrongQueue,
 \*   Red_CompleteOnWaker, Red_ReleaseAtWrite, Red_ReleaseAtDelivery: one

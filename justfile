@@ -768,6 +768,7 @@ tla:
     check MC_LockTable_Green_Cancel                    GREEN
     check MC_LockTable_Green_Table                     GREEN
     check MC_LockTable_Green_Mixed                     GREEN
+    check MC_LockTable_Green_MixedLive                 GREEN
     check MC_LockTable_Green_Four                      GREEN
     check MC_LockTable_Red_RetireNoCas                 RED MutualExclusion
     check MC_LockTable_Red_NoRecheck                   RED NoStrandedFront
