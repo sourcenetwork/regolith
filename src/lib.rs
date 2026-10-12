@@ -164,6 +164,7 @@ pub mod loom_exports {
         version,
     };
     pub use crate::env::open_file_limit::loom_model as open_files;
+    pub use crate::sync::loom_model as sync;
     pub use crate::transaction::lock_loom as locks;
 }
 
