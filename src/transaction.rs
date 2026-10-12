@@ -1259,7 +1259,9 @@ impl Transaction {
     }
 
     /// Buffer a put. For pessimistic transactions, acquires an
-    /// exclusive lock on the key if not already held.
+    /// exclusive lock on the key if not already held, waiting for a lock
+    /// another transaction holds as [`Transaction::get_for_update`] does: up
+    /// to the lock timeout, then [`TransactionError::Busy`].
     ///
     /// A put of a constant claims nothing: if the key holds exactly these
     /// bytes at commit, the write does not conflict. Read the key with
@@ -1275,7 +1277,9 @@ impl Transaction {
     }
 
     /// Buffer a delete. For pessimistic transactions, acquires an
-    /// exclusive lock on the key if not already held.
+    /// exclusive lock on the key if not already held, waiting for a lock
+    /// another transaction holds as [`Transaction::get_for_update`] does: up
+    /// to the lock timeout, then [`TransactionError::Busy`].
     pub fn delete(&self, key: &[u8]) -> TxResult<()> {
         self.refuse_log_key(key)?;
         let prefixed = prefix_key(DEFAULT_CF_ID, key);
@@ -1311,7 +1315,11 @@ impl Transaction {
 
     /// Buffer a merge operand. Merges are conflict-checked at the key
     /// level, so two optimistic transactions that run concurrently cannot
-    /// both commit a merge to the same key.
+    /// both commit a merge to the same key. For pessimistic transactions,
+    /// acquires an exclusive lock on the key if not already held, waiting
+    /// for a lock another transaction holds as
+    /// [`Transaction::get_for_update`] does: up to the lock timeout, then
+    /// [`TransactionError::Busy`].
     ///
     /// Refused with [`TransactionError::Engine`] carrying
     /// [`Error::NoMergeOperator`], buffering nothing, when the database has
