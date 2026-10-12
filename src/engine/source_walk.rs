@@ -202,13 +202,13 @@ mod tests {
     fn the_walk_visits_memtables_before_tables_newest_first_and_stops_at_the_first_break() {
         let dir = TempDir::new().unwrap();
         let db = open(&dir);
-        db.put(b"a", b"1").unwrap();
+        crate::through_stalls(|| db.put(b"a", b"1")).unwrap();
         db.flush().unwrap();
-        db.put(b"b", b"2").unwrap();
+        crate::through_stalls(|| db.put(b"b", b"2")).unwrap();
         db.flush().unwrap();
-        db.put(b"c", b"3").unwrap();
+        crate::through_stalls(|| db.put(b"c", b"3")).unwrap();
         freeze_active(&db);
-        db.put(b"d", b"4").unwrap();
+        crate::through_stalls(|| db.put(b"d", b"4")).unwrap();
         let view = db.engine().view.load();
 
         // Every L0 table is visited, whatever its key range.
@@ -243,9 +243,9 @@ mod tests {
     fn an_exhausted_walk_continues_with_the_newest_covering_tombstone_sequence() {
         let dir = TempDir::new().unwrap();
         let db = open(&dir);
-        db.put(b"k", b"v").unwrap();
+        crate::through_stalls(|| db.put(b"k", b"v")).unwrap();
         db.flush().unwrap();
-        db.delete_range(b"a", b"m").unwrap();
+        crate::through_stalls(|| db.delete_range(b"a", b"m")).unwrap();
         let first = db.latest_sequence();
         {
             let view = db.engine().view.load();
@@ -256,7 +256,7 @@ mod tests {
 
         // The first tombstone moves into a table; a newer one covers `k` too.
         db.flush().unwrap();
-        db.delete_range(b"b", b"z").unwrap();
+        crate::through_stalls(|| db.delete_range(b"b", b"z")).unwrap();
         let second = db.latest_sequence();
         let view = db.engine().view.load();
         assert_eq!(walk_all(&view, b"k", u64::MAX).1, second);
@@ -272,9 +272,9 @@ mod tests {
     fn a_tombstone_in_a_newer_source_reaches_the_visit_of_an_older_table() {
         let dir = TempDir::new().unwrap();
         let db = open(&dir);
-        db.put(b"k", b"v").unwrap();
+        crate::through_stalls(|| db.put(b"k", b"v")).unwrap();
         db.flush().unwrap();
-        db.delete_range(b"a", b"z").unwrap();
+        crate::through_stalls(|| db.delete_range(b"a", b"z")).unwrap();
         let tombstone = db.latest_sequence();
         db.flush().unwrap();
         let view = db.engine().view.load();
@@ -289,10 +289,10 @@ mod tests {
     fn a_tombstone_in_an_older_source_does_not_reach_the_visit_of_a_newer_one() {
         let dir = TempDir::new().unwrap();
         let db = open(&dir);
-        db.delete_range(b"a", b"z").unwrap();
+        crate::through_stalls(|| db.delete_range(b"a", b"z")).unwrap();
         let tombstone = db.latest_sequence();
         db.flush().unwrap();
-        db.put(b"k", b"v").unwrap();
+        crate::through_stalls(|| db.put(b"k", b"v")).unwrap();
         db.flush().unwrap();
         let view = db.engine().view.load();
 

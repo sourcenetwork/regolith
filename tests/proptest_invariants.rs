@@ -59,7 +59,7 @@ proptest! {
         // Build the expected state: last-write-wins per key.
         let mut expected: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
         for (k, v) in &entries {
-            db.put(k, v).unwrap();
+            regolith::through_stalls(|| db.put(k, v)).unwrap();
             expected.insert(k.clone(), v.clone());
         }
 
@@ -94,7 +94,7 @@ proptest! {
         // Phase 1 - write "before" entries.
         let mut expected: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
         for (k, v) in &before {
-            db.put(k, v).unwrap();
+            regolith::through_stalls(|| db.put(k, v)).unwrap();
             expected.insert(k.clone(), v.clone());
         }
 
@@ -102,7 +102,7 @@ proptest! {
 
         // Phase 2 - write "after" entries (invisible to snap).
         for (k, v) in &after {
-            db.put(k, v).unwrap();
+            regolith::through_stalls(|| db.put(k, v)).unwrap();
         }
 
         // Snapshot reads must match "before" state exactly.
@@ -137,7 +137,7 @@ proptest! {
 
         let mut expected: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
         for (k, v) in &entries {
-            db.put(k, v).unwrap();
+            regolith::through_stalls(|| db.put(k, v)).unwrap();
             expected.insert(k.clone(), v.clone());
         }
 
@@ -168,7 +168,7 @@ proptest! {
 
         let mut expected: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
         for (k, v) in &entries {
-            db.put(k, v).unwrap();
+            regolith::through_stalls(|| db.put(k, v)).unwrap();
             expected.insert(k.clone(), v.clone());
         }
 
@@ -177,7 +177,7 @@ proptest! {
         for &idx in &delete_indices {
             if keys_vec.is_empty() { break; }
             let k = &keys_vec[idx % keys_vec.len()];
-            db.delete(k).unwrap();
+            regolith::through_stalls(|| db.delete(k)).unwrap();
             deleted.insert(k.clone());
         }
         for k in &deleted {
@@ -223,7 +223,7 @@ proptest! {
                 batch.put(k, v);
                 expected.insert(k.clone(), v.clone());
             }
-            db.write(batch).unwrap();
+            regolith::through_stalls(|| db.write(batch.clone())).unwrap();
         }
 
         for (k, v) in &expected {
@@ -246,7 +246,7 @@ proptest! {
         let dir = TempDir::new().unwrap();
         let db = open(&dir);
         for (k, v) in &entries {
-            db.put(k, v).unwrap();
+            regolith::through_stalls(|| db.put(k, v)).unwrap();
         }
         let scanned = db.scan(None, None).unwrap();
         let mut iter_pairs = Vec::new();
@@ -273,7 +273,7 @@ proptest! {
         let before = {
             let db = open(&dir);
             for (k, v) in &entries {
-                db.put(k, v).unwrap();
+                regolith::through_stalls(|| db.put(k, v)).unwrap();
             }
             db.scan(None, None).unwrap()
         };
@@ -299,7 +299,7 @@ proptest! {
             let db = open(&dir);
             let mut recorded: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
             for (k, v) in &entries {
-                db.put(k, v).unwrap();
+                regolith::through_stalls(|| db.put(k, v)).unwrap();
                 recorded.insert(k.clone(), v.clone());
             }
             let keys: Vec<Vec<u8>> = recorded.keys().cloned().collect();
@@ -307,7 +307,7 @@ proptest! {
             for idx in &delete_picks {
                 if keys.is_empty() { break; }
                 let k = &keys[idx % keys.len()];
-                db.delete(k).unwrap();
+                regolith::through_stalls(|| db.delete(k)).unwrap();
                 deleted.push(k.clone());
             }
             db.compact_range(None, None).wait().unwrap();
@@ -338,7 +338,7 @@ proptest! {
         let db = open(&dir);
         let mut expected: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
         for (k, v) in &entries {
-            db.put(k, v).unwrap();
+            regolith::through_stalls(|| db.put(k, v)).unwrap();
             expected.insert(k.clone(), v.clone());
         }
         let (mut lo, mut hi) = bounds;
@@ -376,8 +376,8 @@ proptest! {
         let a = db.create_column_family("a").unwrap();
         let b = db.create_column_family("b").unwrap();
         let gone = db.create_column_family("gone").unwrap();
-        db.put_cf(&a, b"sentinel", b"a-sentinel").unwrap();
-        db.put_cf(&b, b"sentinel", b"b-sentinel").unwrap();
+        regolith::through_stalls(|| db.put_cf(&a, b"sentinel", b"a-sentinel")).unwrap();
+        regolith::through_stalls(|| db.put_cf(&b, b"sentinel", b"b-sentinel")).unwrap();
         db.drop_column_family(gone.clone()).unwrap();
 
         let has_dropped = ops.iter().any(|(slot, _, _)| *slot == 3);
@@ -418,7 +418,7 @@ proptest! {
             }
         }
 
-        let result = db.write(batch);
+        let result = regolith::through_stalls(|| db.write(batch.clone()));
 
         if has_dropped {
             prop_assert!(matches!(result, Err(Error::InvalidColumnFamily(_))));

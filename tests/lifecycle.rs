@@ -60,7 +60,7 @@ fn value(i: usize) -> Vec<u8> {
 
 fn write_range(db: &Db, from: usize, to: usize) {
     for i in from..to {
-        db.put(&key(i), &value(i)).unwrap();
+        regolith::through_stalls(|| db.put(&key(i), &value(i))).unwrap();
     }
 }
 

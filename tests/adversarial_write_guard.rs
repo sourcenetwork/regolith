@@ -38,7 +38,7 @@ fn every_no_work_write_is_refused_by_a_read_only_handle() {
     let dir = TempDir::new().expect("tempdir");
     let db = Db::open(dir.path(), opts()).expect("open");
     for i in 0..20u32 {
-        db.put(&i.to_be_bytes(), b"v").expect("put");
+        regolith::through_stalls(|| db.put(&i.to_be_bytes(), b"v")).expect("put");
     }
     db.close().expect("close");
     drop(db);
@@ -91,7 +91,7 @@ fn every_no_work_write_is_refused_by_a_read_only_handle() {
 fn every_no_work_write_is_refused_by_a_closed_handle() {
     let dir = TempDir::new().expect("tempdir");
     let db = Db::open(dir.path(), opts()).expect("open");
-    db.put(b"k", b"v").expect("put");
+    regolith::through_stalls(|| db.put(b"k", b"v")).expect("put");
     let cf = db.default_cf();
     db.close().expect("close");
 
@@ -117,7 +117,7 @@ fn every_no_work_write_is_refused_by_a_closed_handle() {
     // A closed read-only handle must report Closed, not ReadOnly.
     let dir2 = TempDir::new().expect("tempdir");
     let seed = Db::open(dir2.path(), opts()).expect("open");
-    seed.put(b"k", b"v").expect("put");
+    regolith::through_stalls(|| seed.put(b"k", b"v")).expect("put");
     seed.close().expect("close");
     drop(seed);
     let ro = Db::open_read_only(dir2.path(), opts()).expect("open_read_only");

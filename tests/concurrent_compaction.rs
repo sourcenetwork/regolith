@@ -43,10 +43,11 @@ fn write_dense_keys(db: &Db, count: u64) {
     for i in 0..count {
         batch.put(&i.to_be_bytes(), &value);
         if batch.buffered_bytes() >= 128 * 1024 {
-            db.write(std::mem::take(&mut batch)).unwrap();
+            let full = std::mem::take(&mut batch);
+            regolith::through_stalls(|| db.write(full.clone())).unwrap();
         }
     }
-    db.write(batch).unwrap();
+    regolith::through_stalls(|| db.write(batch.clone())).unwrap();
 }
 
 /// Read the whole database back and hold the reader's own invariant to it.

@@ -1318,10 +1318,12 @@ mod tests {
         )
         .unwrap();
         for i in 0..500u32 {
-            db.put(
-                format!("key{i:04}").as_bytes(),
-                format!("value{i}").as_bytes(),
-            )
+            crate::through_stalls(|| {
+                db.put(
+                    format!("key{i:04}").as_bytes(),
+                    format!("value{i}").as_bytes(),
+                )
+            })
             .unwrap();
         }
         // Small write buffer forces flushes, so most of these reads

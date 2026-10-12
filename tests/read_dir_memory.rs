@@ -138,8 +138,7 @@ fn options(env: &Arc<dyn Env>) -> Options {
 
 fn put_some(db: &Db) {
     for i in 0..100 {
-        db.put(format!("key_{i:06}").as_bytes(), &[7u8; 64])
-            .unwrap();
+        regolith::through_stalls(|| db.put(format!("key_{i:06}").as_bytes(), &[7u8; 64])).unwrap();
     }
 }
 

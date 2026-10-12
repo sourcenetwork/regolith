@@ -94,6 +94,19 @@ fn acker(spec: &ChildSpec) -> std::fs::File {
         .unwrap()
 }
 
+/// Run `attempt`, a transaction built and committed, until no write stall
+/// stops its commit: a stopped commit applied nothing, so the attempt is
+/// built again once the stall cleared. Any other failure fails the child.
+fn commit_through_stalls(mut attempt: impl FnMut() -> TxResult<CommitReceipt>) {
+    loop {
+        match attempt() {
+            Ok(_) => return,
+            Err(TransactionError::WouldBlock(regolith::WouldBlock::Stall(stall))) => stall.wait(),
+            Err(other) => panic!("child: commit: {other}"),
+        }
+    }
+}
+
 fn append_child(spec: &ChildSpec) {
     let db = Arc::new(open(&spec.db_path, spec.durability));
     let log: Arc<dyn LogLayout> = Arc::new(Journal);
@@ -104,14 +117,16 @@ fn append_child(spec: &ChildSpec) {
             let commits = spec.ops;
             std::thread::spawn(move || {
                 for i in 0..commits {
-                    let tx = db.begin(&TxnOptions::new());
-                    tx.append(
-                        &log,
-                        format!("t{t}-{i}").as_bytes(),
-                        Some(format!("once/{t}-{i}").as_bytes()),
-                    )
-                    .unwrap();
-                    tx.commit().expect("child: commit");
+                    commit_through_stalls(|| {
+                        let tx = db.begin(&TxnOptions::new());
+                        tx.append(
+                            &log,
+                            format!("t{t}-{i}").as_bytes(),
+                            Some(format!("once/{t}-{i}").as_bytes()),
+                        )
+                        .unwrap();
+                        tx.commit()
+                    });
                     acks.write_all(format!("{t} {i}\n").as_bytes()).unwrap();
                 }
             })
@@ -132,16 +147,22 @@ fn allocate_child(spec: &ChildSpec) {
             std::thread::spawn(move || {
                 for round in 0..rounds {
                     let range = db.allocate(b"ids", 3).unwrap();
-                    let tx = db.begin(&TxnOptions::new());
-                    for v in range.clone() {
-                        tx.put(format!("use/{v:020}/{t}").as_bytes(), b"").unwrap();
-                    }
                     // Every fifth round aborts after allocating: a gap.
                     if round % 5 == 4 {
+                        let tx = db.begin(&TxnOptions::new());
+                        for v in range.clone() {
+                            tx.put(format!("use/{v:020}/{t}").as_bytes(), b"").unwrap();
+                        }
                         tx.rollback();
                         continue;
                     }
-                    tx.commit().expect("child: commit");
+                    commit_through_stalls(|| {
+                        let tx = db.begin(&TxnOptions::new());
+                        for v in range.clone() {
+                            tx.put(format!("use/{v:020}/{t}").as_bytes(), b"").unwrap();
+                        }
+                        tx.commit()
+                    });
                     let line: String = range.map(|v| format!("{v}\n")).collect();
                     acks.write_all(line.as_bytes()).unwrap();
                 }

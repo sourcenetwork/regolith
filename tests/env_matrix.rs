@@ -43,26 +43,26 @@ fn full_lifecycle_runs_entirely_in_memory() {
     let db = open_mem(&env, "/db");
 
     // put / get
-    db.put(b"alpha", b"one").unwrap();
-    db.put(b"bravo", b"two").unwrap();
-    db.put(b"charlie", b"three").unwrap();
+    regolith::through_stalls(|| db.put(b"alpha", b"one")).unwrap();
+    regolith::through_stalls(|| db.put(b"bravo", b"two")).unwrap();
+    regolith::through_stalls(|| db.put(b"charlie", b"three")).unwrap();
     assert_eq!(db.get(b"bravo").unwrap().as_deref(), Some(&b"two"[..]));
 
     // delete
-    db.delete(b"bravo").unwrap();
+    regolith::through_stalls(|| db.delete(b"bravo")).unwrap();
     assert_eq!(db.get(b"bravo").unwrap(), None);
 
     // batch
     let mut batch = WriteBatch::new();
     batch.put(b"delta", b"four");
     batch.delete(b"alpha");
-    db.write(batch).unwrap();
+    regolith::through_stalls(|| db.write(batch.clone())).unwrap();
     assert_eq!(db.get(b"alpha").unwrap(), None);
     assert_eq!(db.get(b"delta").unwrap().as_deref(), Some(&b"four"[..]));
 
     // snapshot isolation
     let snap = db.snapshot();
-    db.put(b"charlie", b"rewritten").unwrap();
+    regolith::through_stalls(|| db.put(b"charlie", b"rewritten")).unwrap();
     assert_eq!(
         snap.get(b"charlie").unwrap().as_deref(),
         Some(&b"three"[..])
@@ -92,7 +92,7 @@ fn full_lifecycle_runs_entirely_in_memory() {
     // enough volume to cross a flush boundary and produce real
     // SSTables, all of them living in the MemEnv map
     for i in 0..2_000u32 {
-        db.put(format!("k{i:06}").as_bytes(), &[b'v'; 64]).unwrap();
+        regolith::through_stalls(|| db.put(format!("k{i:06}").as_bytes(), &[b'v'; 64])).unwrap();
     }
     assert_eq!(
         db.get(b"k001999").unwrap().as_deref(),
@@ -130,7 +130,7 @@ fn nothing_from_a_mem_env_database_reaches_the_real_filesystem() {
     let env = MemEnv::new();
     let db = open_mem(&env, "/no-such-place/db");
     for i in 0..500u32 {
-        db.put(format!("k{i:04}").as_bytes(), b"v").unwrap();
+        regolith::through_stalls(|| db.put(format!("k{i:04}").as_bytes(), b"v")).unwrap();
     }
     db.close().unwrap();
 
@@ -169,7 +169,7 @@ fn a_checkpoint_copies_bytes_when_the_environment_has_no_hard_links() {
     let env = MemEnv::new();
     let db = open_mem(&env, "/db");
     for i in 0..500u32 {
-        db.put(format!("k{i:04}").as_bytes(), b"value").unwrap();
+        regolith::through_stalls(|| db.put(format!("k{i:04}").as_bytes(), b"value")).unwrap();
     }
     db.flush().unwrap();
 
@@ -206,7 +206,7 @@ fn a_backup_is_refused_when_the_environment_has_no_wall_clock() {
     let env = MemEnv::new();
     env.set_clocks(Some(0), None);
     let db = open_mem(&env, "/db");
-    db.put(b"k", b"v").unwrap();
+    regolith::through_stalls(|| db.put(b"k", b"v")).unwrap();
     db.flush().unwrap();
 
     let mut backups =

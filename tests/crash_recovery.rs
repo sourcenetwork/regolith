@@ -168,14 +168,14 @@ fn assert_functional(db: &Db, tag: &str) {
     let probe: &[u8] = b"zzz_probe_point";
     let batched: &[u8] = b"zzz_probe_batch";
 
-    db.put(probe, b"v1")
+    regolith::through_stalls(|| db.put(probe, b"v1"))
         .unwrap_or_else(|e| panic!("{tag}: put on a recovered database failed: {e}"));
     assert_eq!(
         db.get(probe).unwrap(),
         Some(b"v1".to_vec()),
         "{tag}: a value written after recovery could not be read back",
     );
-    db.put(probe, b"v2").unwrap();
+    regolith::through_stalls(|| db.put(probe, b"v2")).unwrap();
     assert_eq!(
         db.get(probe).unwrap(),
         Some(b"v2".to_vec()),
@@ -184,7 +184,7 @@ fn assert_functional(db: &Db, tag: &str) {
 
     let mut batch = WriteBatch::new();
     batch.put(batched, b"b1");
-    db.write(batch)
+    regolith::through_stalls(|| db.write(batch.clone()))
         .unwrap_or_else(|e| panic!("{tag}: WriteBatch on a recovered database failed: {e}"));
     assert_eq!(
         db.get(batched).unwrap(),
@@ -222,8 +222,8 @@ fn assert_functional(db: &Db, tag: &str) {
         "{tag}: compacting a recovered database lost a live value",
     );
 
-    db.delete(probe).unwrap();
-    db.delete(batched).unwrap();
+    regolith::through_stalls(|| db.delete(probe)).unwrap();
+    regolith::through_stalls(|| db.delete(batched)).unwrap();
     assert_eq!(
         db.get(probe).unwrap(),
         None,
@@ -897,7 +897,7 @@ fn cycle_workload(spec: &ChildSpec) {
         .open(&spec.ack_path)
         .expect("child: open ack file");
     for (i, (key, value)) in cycle_entries(spec).into_iter().enumerate() {
-        db.put(&key, &value).expect("child: put");
+        regolith::through_stalls(|| db.put(&key, &value)).expect("child: put");
         // Unbuffered, so a SIGKILL a microsecond later cannot lose the
         // record of what the caller was told.
         acks.write_all(format!("{i}\n").as_bytes())

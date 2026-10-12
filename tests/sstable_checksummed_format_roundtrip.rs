@@ -32,9 +32,9 @@ fn opts(partitioned: bool) -> Options {
 
 fn fill(db: &Db) {
     for i in 0..N {
-        db.put(&key(i), &value(i)).expect("put");
+        regolith::through_stalls(|| db.put(&key(i), &value(i))).expect("put");
     }
-    db.delete_range(b"k_0000100", b"k_0000150").expect("range");
+    regolith::through_stalls(|| db.delete_range(b"k_0000100", b"k_0000150")).expect("range");
 }
 
 fn check(db: &Db, what: &str) {
