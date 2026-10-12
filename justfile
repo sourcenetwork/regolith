@@ -637,6 +637,16 @@ tla shard="1" shards="1":
     check MC_SnapshotRegistry_Red_CloneFresh           RED LiveCovered
     check MC_SnapshotRegistry_Red_PlainClaim           RED MinBelowLive
     check MC_SnapshotRegistry_Red_JoinNoRecheck        RED LiveEntryExact
+    # E15: waiting for the last snapshot. With threads, the release that
+    # drains the last pin wakes the waiter; on a target with one thread the
+    # call reports what is still pinned and never waits. Lean:
+    # Regolith/SnapshotWait.lean, no_lost_wake, one_thread_never_waits.
+    spec=SnapshotWait
+    check MC_SnapshotWait_Green                        GREEN
+    check MC_SnapshotWait_Green_NoThreads              GREEN
+    check MC_SnapshotWait_Red_WaitAnyway               RED NeverWaitsAlone
+    check MC_SnapshotWait_Red_FutureAfterWatch         RED NoLostWake
+    check MC_SnapshotWait_Red_ReadThenMark             RED NoLostWake
     # 4.6, D54: per-thread statistics shards. Lean: Regolith/ShardedStats.lean,
     # total_after_adds, read_between, reads_monotone.
     spec=ShardedStats

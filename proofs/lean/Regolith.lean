@@ -129,3 +129,8 @@ import Regolith.EnvFiles
 -- stopped writers from relieving, so no writer waits on a stall nobody will
 -- land. Backs `proofs/tla/StallRelief.tla`.
 import Regolith.StallRelief
+-- E15: waiting for the last snapshot. A sleeping waiter always has a pin
+-- still held or a release on its way to wake it, and on a target with one
+-- thread the call returns the count of pins held without waiting. Backs
+-- `proofs/tla/SnapshotWait.tla`.
+import Regolith.SnapshotWait
