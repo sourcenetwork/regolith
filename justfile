@@ -810,17 +810,25 @@ tla:
     check MC_SyncNotify_Red_NoRecheck                  RED NoLostWakeup
     check MC_SyncNotify_Red_NoGenCheck                 RED NoLostWakeup
     # regolith::sync::RwLock and ReentrantRwLock after D49, with D50's
-    # upgradable read.
+    # upgradable read, one step of src/sync/raw_rwlock.rs at a time on the
+    # queue of Sync.tla. Lean: Regolith/Sync.lean for the exclusive side.
     spec=SyncRwLock
     check MC_SyncRwLock_Green_Plain                    GREEN
     check MC_SyncRwLock_Green_WriterLive               GREEN
     check MC_SyncRwLock_Green_ReaderLive               GREEN
+    check MC_SyncRwLock_Green_Upgrade                  GREEN
+    check MC_SyncRwLock_Green_UpgradeLive              GREEN
     check MC_SyncRwLock_Green_Reentrant                GREEN
     check MC_SyncRwLock_Green_ReentrantLive            GREEN
     check MC_SyncRwLock_Red_UnboundedBarging           RED BoundedBypass
     check MC_SyncRwLock_Red_AnyReaderUpgrade           RED NoUpgradeDeadlock
     check MC_SyncRwLock_Red_UpgradeNoHoldBack          RED UpgradeHoldsBack
     check MC_SyncRwLock_Red_OwnerUnaware               RED NoSelfDeadlock
+    # E33: a dropped upgrade while the reader leaves and the next task takes
+    # the upgradable read. The RED is the step the fix removed: the pass
+    # reads UPGRADING and takes the write for the node in its slot.
+    check MC_SyncRwLock_Green_UpgradeDropped           GREEN
+    check MC_SyncRwLock_Red_PassTakesWrite             RED GuardsCounted
     # regolith::sync::Event, Latch and Barrier.
     spec=SyncLatch
     check MC_SyncLatch_Green_Event                     GREEN
