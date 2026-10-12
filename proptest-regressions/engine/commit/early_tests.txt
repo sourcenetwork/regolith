@@ -5,3 +5,4 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc c42ef9dc752aef43853aa8a0e3b33a3719635f99c442b02fa53562817c40dd0c # shrinks to before = [], until_horizon = [], after_horizon = [Merge(2, 0), Flush], shape = Shape { reads: [], scan: None, writes: [(2, Put(0, 0))], blind: false, exempt: None }
+cc af26752b58a39ff4103b556639733c2c27f9a47c78377ca453537c519d80953f # shrinks to before = [], until_horizon = [Put(1, 0)], after_horizon = [Put(2, 1)], shape = Shape { reads: [], scan: None, writes: [(1, Merge(0, 0)), (2, Put(0, 0))], blind: true, exempt: Some(2) }

@@ -24,9 +24,15 @@
 //!   version, and a blind merge with any newer replacement, so the
 //!   transaction aborts at once, without taking a slot (the model's early
 //!   abort).
-//!   It aborts only when every item before it is clean, so the conflict it
-//!   names is the first one in the commit's order, as a check of every item
-//!   would name it.
+//!   It aborts only when every item before it is settled for good: clean,
+//!   and not a put to a content-addressed key. A clean item something lands
+//!   on above `h` can only become a conflict itself, which changes the key
+//!   the abort names and nothing else. A put to a content-addressed key is
+//!   different: a write above `h` that leaves the key other bytes makes the
+//!   full check refuse the commit there, a different outcome, and it meets
+//!   that item first. So a conflict behind such a put is left to the full
+//!   check, and the reason a commit is given is the one a check of every
+//!   version gives, whether or not the check at the horizon settled it.
 //!   Every version at or below `h` is of a published commit: the abort
 //!   sorts after a commit the transaction did not see.
 //! - Identical-write elision, value reads and content-addressed puts can be
@@ -90,8 +96,10 @@ pub(crate) enum EarlyVerdict {
 struct Marker {
     marks: Vec<Mark>,
     total: usize,
-    /// An item before the current one is dirty, so a conflict found now may
-    /// not be the first in the commit's order and is left to the full check.
+    /// An item before the current one is not settled for good: it is dirty,
+    /// or a put to a content-addressed key, which a write above the horizon
+    /// can still turn into a refusal. A conflict found now may then not be
+    /// what a check of every version reports, and is left to the full check.
     dirty_before: bool,
 }
 
@@ -217,10 +225,13 @@ impl RegolithEngine {
                     .is_ok()
                 {
                     // Only an exempt put is ever looked up, for its contract.
-                    if matches!(op, WriteBatchOp::Put { .. })
-                        && self.landed_above_horizon(key, observed_seq, &view, false)?
-                    {
-                        marker.set(at, Mark::Dirty);
+                    if matches!(op, WriteBatchOp::Put { .. }) {
+                        if self.landed_above_horizon(key, observed_seq, &view, false)? {
+                            marker.set(at, Mark::Dirty);
+                        }
+                        // Clean now, and still not settled: the contract
+                        // is checked against what lands above the horizon.
+                        marker.dirty_before = true;
                     }
                     continue;
                 }
