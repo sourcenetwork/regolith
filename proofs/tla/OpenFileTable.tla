@@ -204,8 +204,11 @@ Init ==
 \* A slot a claim may take: empty, or open with nobody reading it. The bug
 \* IgnoreReaders also takes an open slot that has readers.
 Claimable(s) ==
+  \* An empty slot;
   \/ phase[s] = "empty"
+  \* or an open slot
   \/ /\ phase[s] = "open"
+     \* that nobody reads (the bug IgnoreReaders does not ask).
      /\ (holders[s] = {} \/ Mutant = "IgnoreReaders")
 
 \* Thread t looks at slot s and finds its own table there, open: it
@@ -214,9 +217,11 @@ Claimable(s) ==
 Look(t, s) ==
   \* The thread is starting a read and has reads left.
   /\ pc[t] = "start"
+  \* (It has reads left.)
   /\ left[t] > 0
   \* The slot is open and holds the table this thread wants.
   /\ phase[s] = "open"
+  \* (It holds the table this thread wants.)
   /\ owner[s] = Want[t]
   \* It remembers the word: the phase and how many readers.
   /\ seen' = [seen EXCEPT ![t] = [phase |-> phase[s], count |-> Cardinality(holders[s])]]
@@ -233,6 +238,7 @@ Look(t, s) ==
 Miss(t) ==
   \* The thread is starting a read and has reads left.
   /\ pc[t] = "start"
+  \* (It has reads left.)
   /\ left[t] > 0
   \* It goes to claim a slot.
   /\ pc' = [pc EXCEPT ![t] = "claim"]
@@ -245,17 +251,23 @@ Miss(t) ==
 Cas(t) ==
   \* The thread is at its CAS, on its slot s.
   /\ pc[t] = "cas"
+  \* s is the slot the thread is at.
   /\ LET s == at[t] IN
        \* The word now equals the word it saw ...
        IF /\ phase[s] = seen[t].phase
+          \* and the count of readers equals the count it saw ...
           /\ Cardinality(holders[s]) = seen[t].count
        \* ... so the CAS wins: the thread counts as a reader, then rechecks.
        THEN /\ holders' = [holders EXCEPT ![s] = holders[s] \cup {t}]
+            \* It rechecks next.
             /\ pc' = [pc EXCEPT ![t] = "recheck"]
+            \* It stays at its slot.
             /\ UNCHANGED at
        \* ... otherwise the CAS fails and the thread starts over.
        ELSE /\ pc' = [pc EXCEPT ![t] = "start"]
+            \* It is at no slot.
             /\ at' = [at EXCEPT ![t] = None]
+            \* The readers do not change.
             /\ UNCHANGED holders
   \* Nothing else changes.
   /\ UNCHANGED <<phase, owner, desc, alive, fileOf, next, seen, using, got, left>>
@@ -266,18 +278,24 @@ Cas(t) ==
 Recheck(t) ==
   \* The thread won its CAS on slot s.
   /\ pc[t] = "recheck"
+  \* s is the slot the thread is at.
   /\ LET s == at[t] IN
        \* The slot still holds its table (or the bug does not look) ...
        IF owner[s] = Want[t] \/ Mutant = "NoOwnerRecheck"
        \* ... so it reads through the slot's open file.
        THEN /\ using' = [using EXCEPT ![t] = desc[s]]
+            \* It reads next.
             /\ pc' = [pc EXCEPT ![t] = "read"]
+            \* It stays a reader of its slot.
             /\ UNCHANGED <<holders, at>>
        \* ... otherwise the slot was reloaded with another table: it stops
        \* counting as a reader and starts over.
        ELSE /\ holders' = [holders EXCEPT ![s] = holders[s] \ {t}]
+            \* It is at no slot.
             /\ at' = [at EXCEPT ![t] = None]
+            \* It starts over.
             /\ pc' = [pc EXCEPT ![t] = "start"]
+            \* It reads through nothing.
             /\ UNCHANGED using
   \* Nothing else changes.
   /\ UNCHANGED <<phase, owner, desc, alive, fileOf, next, seen, got, left>>
@@ -317,7 +335,9 @@ ClaimOutside(t) ==
   /\ next' = next + 1
   \* It reads through it, at no slot.
   /\ using' = [using EXCEPT ![t] = next]
+  \* It is at no slot.
   /\ at' = [at EXCEPT ![t] = None]
+  \* It reads next.
   /\ pc' = [pc EXCEPT ![t] = "read"]
   \* Nothing else changes.
   /\ UNCHANGED <<phase, holders, owner, desc, seen, got, left>>
@@ -327,6 +347,7 @@ ClaimOutside(t) ==
 Close(t) ==
   \* The thread claimed slot s.
   /\ pc[t] = "close"
+  \* s is the slot the thread claimed.
   /\ LET s == at[t] IN
        \* The old file is closed (if there was one).
        /\ alive' = alive \ {desc[s]}
@@ -344,6 +365,7 @@ Open(t) ==
   /\ pc[t] = "open"
   \* There is an opening number left.
   /\ next <= MaxDesc
+  \* s is the slot the thread claimed.
   /\ LET s == at[t] IN
        \* Its table is now open ...
        /\ alive' = alive \cup {next}
@@ -355,6 +377,7 @@ Open(t) ==
        /\ owner' = [owner EXCEPT ![s] = Want[t]]
        \* ... and which is open, with this thread as a reader.
        /\ phase' = [phase EXCEPT ![s] = "open"]
+       \* (This thread is one of its readers.)
        /\ holders' = [holders EXCEPT ![s] = holders[s] \cup {t}]
   \* The thread reads through the new opening.
   /\ using' = [using EXCEPT ![t] = next]
@@ -383,15 +406,19 @@ Leave(t) ==
   /\ pc[t] = "leave"
   \* If it read through a slot, it leaves the slot's readers ...
   /\ IF at[t] # None
+     \* It is no longer one of that slot's readers.
      THEN /\ holders' = [holders EXCEPT ![at[t]] = holders[at[t]] \ {t}]
+          \* No file is closed.
           /\ UNCHANGED alive
      \* ... otherwise it closes its outside file.
      ELSE /\ alive' = alive \ {using[t]}
+          \* The slots' readers do not change.
           /\ UNCHANGED holders
   \* One read fewer to do.
   /\ left' = [left EXCEPT ![t] = left[t] - 1]
   \* It is no longer at a slot or reading.
   /\ at' = [at EXCEPT ![t] = None]
+  \* (It reads through nothing.)
   /\ using' = [using EXCEPT ![t] = None]
   \* It starts its next read, or is done.
   /\ pc' = [pc EXCEPT ![t] = IF left[t] = 1 THEN "done" ELSE "start"]
@@ -402,15 +429,25 @@ Leave(t) ==
 Next ==
   \* Some thread takes one of its steps.
   \E t \in Threads :
+    \* It looks at a slot and finds its table there;
     \/ \E s \in Slots : Look(t, s)
+    \* or it finds its table in no slot;
     \/ Miss(t)
+    \* or it tries its compare-and-swap;
     \/ Cas(t)
+    \* or it rechecks the slot it joined;
     \/ Recheck(t)
+    \* or it claims a slot for its table;
     \/ \E s \in Slots : Claim(t, s)
+    \* or, with no slot to claim, it opens the file outside the table;
     \/ ClaimOutside(t)
+    \* or it closes the file of the slot it claimed;
     \/ Close(t)
+    \* or it opens its table's file in that slot;
     \/ Open(t)
+    \* or it reads;
     \/ Read(t)
+    \* or it leaves.
     \/ Leave(t)
 
 \* The behaviours: start in Init, take Next steps.

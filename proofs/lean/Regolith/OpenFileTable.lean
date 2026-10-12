@@ -84,9 +84,11 @@ def countOpen (desc : Nat → Nat) : Nat → Nat
 theorem countOpen_le (desc : Nat → Nat) (n : Nat) : countOpen desc n ≤ n := by
   -- By the number of slots.
   induction n with
+  -- Case: no slot.
   | zero =>
     -- No slot: zero files.
     simp [countOpen]
+  -- Case: one more slot, with the claim for n (ih) known.
   | succ n ih =>
     -- One more slot adds at most one file.
     simp only [countOpen]
@@ -100,9 +102,11 @@ theorem countOpen_set_out (desc : Nat → Nat) (i v n : Nat) (h : n ≤ i) :
     countOpen (set desc i v) n = countOpen desc n := by
   -- By the number of slots counted.
   induction n with
+  -- Case: no slot.
   | zero =>
     -- Nothing counted on either side.
     rfl
+  -- Case: one more slot, with the claim for n (ih) known.
   | succ n ih =>
     -- Slot `n` is below `i`, so `set` leaves it; the rest by induction.
     simp only [countOpen, ih (by omega), set_other _ _ _ _ (show n ≠ i by omega)]
@@ -111,24 +115,31 @@ theorem countOpen_set_out (desc : Nat → Nat) (i v n : Nat) (h : n ≤ i) :
 held and what it holds now. Stated without subtraction: the old count plus
 the new slot's contribution equals the new count plus the old slot's. -/
 theorem countOpen_set (desc : Nat → Nat) (i v n : Nat) (h : i < n) :
+    -- The statement, written without subtraction:
     countOpen (set desc i v) n + (if desc i = 0 then 0 else 1) =
       -- The claim itself; its proof follows.
       countOpen desc n + (if v = 0 then 0 else 1) := by
   -- By the number of slots counted.
   induction n with
+  -- Case: no slot.
   | zero =>
     -- No slot is below 0: impossible.
     omega
+  -- Case: one more slot, with the claim for n (ih) known.
   | succ n ih =>
     -- Is slot `n` the one that changed?
     by_cases hin : i = n
-    · -- Yes: below it nothing changed; slot `n` changed from old to new.
+    -- Yes: below it nothing changed; slot `n` changed from old to new.
+    ·
+      -- Replace n by i.
       subst hin
       -- Unfold the count by one slot.
       simp only [countOpen, set_same, countOpen_set_out desc i v i (Nat.le_refl i)]
       -- Split on the `if`.
       split <;> split <;> omega
-    · -- No: slot `n` is unchanged, and `i` is below `n`.
+    -- No: slot `n` is unchanged, and `i` is below `n`.
+    ·
+      -- i is below n.
       have hlt : i < n := by omega
       -- Unfold the count by one slot.
       simp only [countOpen, set_other _ _ _ _ (show n ≠ i by omega)]
@@ -315,8 +326,11 @@ structure Inv (cap : Nat) (want : Nat → Nat) (s : St) : Prop where
 theorem inv_init (cap : Nat) (want : Nat → Nat) : Inv cap want St.init := by
   -- No slot holds a file, so the count is 0 for any number of slots.
   have hcount : ∀ n, countOpen (fun _ => 0) n = 0 := by
+    -- Take any number of slots n; induction on it.
     intro n; induction n with
+    -- No slot: 0 by definition.
     | zero => rfl
+    -- One more slot, which holds no file: still 0.
     | succ n ih => simp [countOpen, ih]
   -- Each fact, about an empty start.
   constructor
@@ -403,7 +417,9 @@ theorem inv_join {cap : Nat} {want : Nat → Nat} {s : St} (hs : Inv cap want s)
   · intro j v hv
     -- Split on whether `v = u` holds.
     by_cases hvu : v = u
-    · -- `u`: reading (rechecking) at `i`.
+    -- `u`: reading (rechecking) at `i`.
+    ·
+      -- Replace v by u.
       subst hvu
       -- Split on whether `j = i` holds.
       by_cases hji : j = i
@@ -411,8 +427,11 @@ theorem inv_join {cap : Nat} {want : Nat → Nat} {s : St} (hs : Inv cap want s)
       · subst hji; simp [Pc.reading]
       -- Read through `set` at a key it did not change: the old value, then rewrite `hv` with the equalities given, then split on the ways `hv` can hold: none is left.
       · simp only [set_other _ _ _ _ hji] at hv; rw [hnone j] at hv; cases hv
-    · -- Another thread: it was a reader of `j` already.
+    -- Another thread: it was a reader of `j` already.
+    ·
+      -- It was counted as a reader of j before the step:
       have hold : s.holds j v = true := by
+        -- Split on whether j is the slot i.
         by_cases hji : j = i
         -- Replace one side of `hji` by the other everywhere, then read through `set`: the new value at the key it wrote, the old value elsewhere, then this is exactly what the goal asks.
         · subst hji; simp only [set_same, set_other _ _ _ _ hvu] at hv; exact hv
@@ -492,6 +511,7 @@ theorem inv_recheckOk {cap : Nat} {want : Nat → Nat} {s : St} (hs : Inv cap wa
     (u : Nat) (hpc : s.pc u = .recheck) (ho : s.owner (s.at_ u) = want u) :
     -- The claim itself; its proof follows.
     Inv cap want { s with via := set s.via u (s.desc (s.at_ u)), pc := set s.pc u .read } := by
+  -- Prove each fact of the invariant in turn.
   constructor
   -- No file changes.
   · exact hs.alive_eq
@@ -573,6 +593,7 @@ theorem inv_drop_out {cap : Nat} {want : Nat → Nat} {s : St} (hs : Inv cap wan
   -- After the step, nobody is counted anywhere they were not before.
   have hsub : ∀ j v, set s.holds (s.at_ u) (set (s.holds (s.at_ u)) u false) j v = true →
       s.holds j v = true ∧ v ≠ u := by
+    -- Take a slot j and a thread v counted there after the step.
     intro j v hv
     -- Split on whether `j = s.at_ u` holds.
     by_cases hju : j = s.at_ u
@@ -593,6 +614,7 @@ theorem inv_drop_out {cap : Nat} {want : Nat → Nat} {s : St} (hs : Inv cap wan
   -- Removing a reader keeps "no reader" true.
   have hfalse : ∀ j, (∀ v, s.holds j v = false) →
       ∀ v, set s.holds (s.at_ u) (set (s.holds (s.at_ u)) u false) j v = false := by
+    -- Take a slot j with no reader, and a thread v.
     intro j hj v
     -- Split on the two values it can have.
     cases h : set s.holds (s.at_ u) (set (s.holds (s.at_ u)) u false) j v
@@ -692,6 +714,7 @@ theorem inv_claim {cap : Nat} {want : Nat → Nat} {s : St} (hs : Inv cap want s
                           at_ := set s.at_ u i, pc := set s.pc u .claimed } := by
   -- Slot `i` has no reader.
   have hnoread : ∀ v, s.holds i v = false := by
+    -- Slot i is claimable: it is empty, or open with nobody reading.
     rcases hfree with he | ⟨_, hh⟩
     -- This is exactly what the goal asks.
     · exact (hs.empty_clean i he).2
@@ -699,6 +722,7 @@ theorem inv_claim {cap : Nat} {want : Nat → Nat} {s : St} (hs : Inv cap want s
     · exact hh
   -- Slot `i` was not claimed.
   have hnotcl : s.phase i ≠ .claimed := by
+    -- In both cases its phase is "empty" or "open", not "claimed".
     rcases hfree with he | ⟨ho, _⟩ <;> simp [*]
   -- `u` held nothing.
   have hnone := start_holds_nothing hs hpc
@@ -768,7 +792,9 @@ theorem inv_claim {cap : Nat} {want : Nat → Nat} {s : St} (hs : Inv cap want s
   · intro v hv
     -- Split on whether `v = u` holds.
     by_cases hvu : v = u
-    · -- `u`: slot `i`, claimed now; no other claimer was at `i`.
+    -- `u`: slot `i`, claimed now; no other claimer was at `i`.
+    ·
+      -- Replace v by u.
       subst hvu
       -- Read the value `set` just wrote at this key.
       simp only [set_same]
@@ -784,7 +810,9 @@ theorem inv_claim {cap : Nat} {want : Nat → Nat} {s : St} (hs : Inv cap want s
       have := (hs.owner_claim w hwo).2.1
       -- Rewrite `this` with the equalities given, then this is exactly what the goal asks.
       rw [hwi] at this; exact hnotcl this
-    · -- Another claimer: its slot is claimed, so not `i`.
+    -- Another claimer: its slot is claimed, so not `i`.
+    ·
+      -- Its entries are untouched by the step.
       simp only [set_other _ _ _ _ hvu] at hv ⊢
       -- Unpack the facts on the right and name them.
       obtain ⟨hlt, hcl, huniq⟩ := hs.owner_claim v hv
@@ -822,6 +850,7 @@ theorem inv_close {cap : Nat} {want : Nat → Nat} {s : St} (hs : Inv cap want s
   obtain ⟨hlt, hcl, huniq⟩ := hs.owner_claim u (by simp [Pc.owning, hpc])
   -- Any slot that is not claimed is not `u`'s.
   have hne : ∀ j, s.phase j ≠ .claimed → j ≠ s.at_ u := by
+    -- If j were u's slot, its phase would be "claimed".
     intro j hj h; rw [h] at hj; exact hj hcl
   -- Prove each fact of the structure in turn.
   constructor
@@ -957,6 +986,7 @@ theorem inv_open {cap : Nat} {want : Nat → Nat} {s : St} (hs : Inv cap want s)
   obtain ⟨hpos, hbelow⟩ := hs.fresh
   -- Any slot that is not claimed is not `u`'s.
   have hne : ∀ j, s.phase j ≠ .claimed → j ≠ s.at_ u := by
+    -- If j were u's slot, its phase would be "claimed".
     intro j hj h; rw [h] at hj; exact hj hcl
   -- `u`'s slot had no reader.
   have hnoread := hs.claimed_free (s.at_ u) hcl
@@ -1192,13 +1222,21 @@ theorem inv_step {cap : Nat} {want : Nat → Nat} {s t : St} (hs : Inv cap want 
     (hst : Step cap want s t) : Inv cap want t := by
   -- One lemma per kind of step.
   cases hst with
+  -- A thread joins a slot's readers.
   | join u i hpc hi hph => exact inv_join hs u i hpc hi hph
+  -- A recheck that passes.
   | recheckOk u hpc ho => exact inv_recheckOk hs u hpc ho
+  -- A recheck that fails: the thread stops counting as a reader.
   | recheckFail u hpc _ => exact inv_drop_out hs u (by simp [Pc.reading, hpc])
+  -- A claim.
   | claim u i hpc hi hfree => exact inv_claim hs u i hpc hi hfree
+  -- A close.
   | close u hpc => exact inv_close hs u hpc
+  -- An open.
   | open_ u hpc => exact inv_open hs u hpc
+  -- A read.
   | read u hpc => exact inv_read hs u hpc
+  -- A leave: the thread stops counting as a reader.
   | leave u hpc => exact inv_drop_out hs u (by simp [Pc.reading, hpc])
 
 /-- Every reachable state keeps every fact. -/
@@ -1207,7 +1245,9 @@ theorem inv_reach {cap : Nat} {want : Nat → Nat} {s : St} (h : Reach cap want 
     Inv cap want s := by
   -- By how `s` was reached: the start, or one step from a reachable state.
   induction h with
+  -- The start.
   | init => exact inv_init cap want
+  -- One more step.
   | step _ hst ih => exact inv_step ih hst
 
 /-! ## Part 4. The three rules -/
@@ -1273,7 +1313,9 @@ opens table 1, and is about to read; thread 2 claims the slot anyway and
 closes table 1's file. Thread 1 now reads through a file no open slot
 holds. -/
 theorem ignore_readers_closes_in_use :
+    -- The statement: under the bug, some reachable state has thread 1 reading through a file,
     ∃ s, IgnoreReach 1 id s ∧ (s.pc 1).through ∧
+      -- while no open slot holds that file.
       ¬ ∃ i, i < 1 ∧ s.phase i = .open_ ∧ s.desc i = s.via 1 := by
   -- Thread 1 claims the empty slot 0.
   have r1 := IgnoreReach.step IgnoreReach.init
