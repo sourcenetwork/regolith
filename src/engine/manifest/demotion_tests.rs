@@ -914,6 +914,145 @@ fn the_copy_counts_toward_the_memtable_and_the_first_write_past_the_buffer_seals
     );
 }
 
+/// Tables level 1 holds in [`a_whole_tree_past_the_stop_trigger`], one key
+/// each: with the two of level 2, more than the 36 level 0 tables at which
+/// writes stop.
+const WIDE: u64 = 41;
+
+/// The overlap in the level below a wide level 1: the open moves both
+/// levels, [`WIDE`] + 2 tables, into level 0, past the threshold at which
+/// writes stop. Level 2 holds `k` and the ingested table, whose range
+/// tombstone over `[b, t)` at sequence 45 is newer than level 1's `c` and
+/// older than level 1's `k`.
+fn a_whole_tree_past_the_stop_trigger() -> TempDir {
+    let (dir, sst_dir) = empty_db();
+    let mut records = vec![
+        add(
+            2,
+            table_of(
+                &sst_dir,
+                8,
+                &[
+                    (b"k", 2, VALUE_TYPE_VALUE, b"k-old"),
+                    (b"x", 2, VALUE_TYPE_VALUE, b"x"),
+                ],
+                &[],
+            ),
+        ),
+        add(
+            2,
+            table_of(
+                &sst_dir,
+                3,
+                &[(b"z", 45, VALUE_TYPE_VALUE, b"ingested")],
+                &[(b"b", b"t", 45)],
+            ),
+        ),
+    ];
+    for i in 0..WIDE - 2 {
+        let key = format!("a{i:03}").into_bytes();
+        records.push(add(
+            1,
+            table_of(
+                &sst_dir,
+                10 + i,
+                &[(&key, 3 + i, VALUE_TYPE_VALUE, b"wide")],
+                &[],
+            ),
+        ));
+    }
+    records.push(add(
+        1,
+        table_of(&sst_dir, 90, &[(b"c", 10, VALUE_TYPE_VALUE, b"c-old")], &[]),
+    ));
+    records.push(add(
+        1,
+        table_of(&sst_dir, 91, &[(b"k", 60, VALUE_TYPE_VALUE, b"k-new")], &[]),
+    ));
+    records.extend([
+        ManifestRecord::SetNextFileId(101),
+        ManifestRecord::SetLastSeq(60),
+        ManifestRecord::SetMinWalId(5),
+    ]);
+    manifest(dir.path(), &records);
+    dir
+}
+
+/// What every read of [`a_whole_tree_past_the_stop_trigger`] must return.
+fn assert_wide_reads(db: &Db, when: &str) {
+    assert_eq!(
+        get(db, b"c"),
+        None,
+        "{when}: the tombstone at 45 over c at 10"
+    );
+    assert_eq!(get(db, b"k").as_deref(), Some(&b"k-new"[..]), "{when}");
+    assert_eq!(get(db, b"a000").as_deref(), Some(&b"wide"[..]), "{when}");
+    assert_eq!(get(db, b"a038").as_deref(), Some(&b"wide"[..]), "{when}");
+    assert_eq!(get(db, b"z").as_deref(), Some(&b"ingested"[..]), "{when}");
+    let scanned = db.scan(None, None).unwrap();
+    assert_eq!(scanned.len() as u64, WIDE - 2 + 3, "{when}: scan");
+    assert!(scanned.iter().all(|(key, _)| key != b"c"), "{when}: scan");
+}
+
+/// A database the open moved whole into level 0, past the threshold at
+/// which writes stop, takes a write with no worker and nothing said about
+/// inline compaction: the write relieves the stop on its own thread, by
+/// the compaction that takes level 0 down, and returns. Every read is the
+/// same before and after.
+#[test]
+fn a_tree_moved_whole_into_level_0_takes_a_write_that_relieves_the_stop_itself() {
+    let dir = a_whole_tree_past_the_stop_trigger();
+    let db = Db::open(dir.path(), options()).unwrap();
+    assert_eq!(
+        db.get_int_property("regolith.manifest.tables_demoted"),
+        Some(WIDE + 2)
+    );
+    assert_eq!(files_per_level(&db)[0], WIDE + 2);
+    assert_wide_reads(&db, "before a write");
+
+    // Not through `through_stalls`: with no worker the put itself clears
+    // the stop, and returns the write, not a wait.
+    db.put(b"w", b"written")
+        .expect("the write relieves the stop");
+    assert!(
+        files_per_level(&db)[0] < 36,
+        "the write left level 0 past the stop: {:?}",
+        files_per_level(&db)
+    );
+    assert_eq!(get(&db, b"w").as_deref(), Some(&b"written"[..]));
+    db.delete(b"w").unwrap();
+    assert_wide_reads(&db, "after the write that relieved the stop");
+    db.close().unwrap();
+    drop(db);
+    let db = Db::open(dir.path(), options()).unwrap();
+    assert_wide_reads(&db, "after a reopen");
+}
+
+/// The same database with a worker: a plain put may be handed the wait
+/// while the worker takes level 0 down, and a transaction's commit waits
+/// the stop out itself. Either way the write lands and every read is right.
+#[test]
+fn a_tree_moved_whole_into_level_0_takes_writes_while_a_worker_relieves_the_stop() {
+    let dir = a_whole_tree_past_the_stop_trigger();
+    let txn_db =
+        crate::OptimisticTransactionDb::open(dir.path(), options().max_background_compactions(1))
+            .unwrap();
+    let db = txn_db.db();
+    assert_eq!(
+        db.get_int_property("regolith.manifest.tables_demoted"),
+        Some(WIDE + 2)
+    );
+    crate::through_stalls(|| db.put(b"w", b"written")).unwrap();
+    let txn = txn_db.begin(&crate::TxnOptions::new());
+    txn.put(b"t", b"committed").unwrap();
+    txn.commit().expect("a commit waits a stop out");
+    assert_eq!(get(db, b"w").as_deref(), Some(&b"written"[..]));
+    assert_eq!(get(db, b"t").as_deref(), Some(&b"committed"[..]));
+    crate::through_stalls(|| db.delete(b"w")).unwrap();
+    crate::through_stalls(|| db.delete(b"t")).unwrap();
+    assert_wide_reads(db, "with a worker");
+}
+
 fn tombstone(start: &[u8], end: &[u8], seq: u64) -> RangeTombstone {
     RangeTombstone::new(start.to_vec(), end.to_vec(), seq)
 }
