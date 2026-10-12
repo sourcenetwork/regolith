@@ -129,13 +129,18 @@ pub(super) fn hoist_range_deletes(
 }
 
 /// Tell the operator that the open moved `demotion`'s tables out of
-/// levels an earlier release left overlapping, in one warn line.
-/// `manifest` is the file that lists them.
+/// levels an earlier release left overlapping: one warn line and the
+/// `ManifestTablesDemoted` ticker. `manifest` is the file that lists them.
 ///
 /// A read-write open calls this once the move is recorded, so a later
 /// open has nothing to move and reports nothing. A read-only open moves
 /// them in its own view, every time.
-pub(super) fn report_demoted_tables(manifest: &Path, demotion: &Demotion, read_only: bool) {
+pub(super) fn report_demoted_tables(
+    options: &super::EngineOptions,
+    manifest: &Path,
+    demotion: &Demotion,
+    read_only: bool,
+) {
     let message = if read_only {
         "moved tables an earlier release left with overlapping key ranges to level 0 \
          for this read-only open: open the database for writing once to keep the move"
@@ -151,6 +156,9 @@ pub(super) fn report_demoted_tables(manifest: &Path, demotion: &Demotion, read_o
         read_only,
         "{message}"
     );
+    if let Some(stats) = options.statistics.as_ref() {
+        stats.add(Ticker::ManifestTablesDemoted, demotion.tables);
+    }
 }
 
 pub(super) fn rewrite_recovered_memtable_to_wal(

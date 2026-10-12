@@ -163,7 +163,7 @@ fn a_database_open_that_cannot_record_the_move_fails_and_the_next_one_reads_the_
 
         let db = crate::Db::open(dir.path(), options()).unwrap();
         assert_eq!(
-            db.get_int_property("regolith.recovery.tables_demoted"),
+            db.get_int_property("regolith.manifest.tables_demoted"),
             Some(moved_again),
             "{failure:?}"
         );

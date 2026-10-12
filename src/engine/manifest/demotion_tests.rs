@@ -196,7 +196,7 @@ fn an_overlapping_level_1_opens_with_its_tables_in_level_0_and_reads_the_newest_
     let db = Db::open(dir.path(), options()).expect("an overlapping level 1 opens");
     assert_eq!(files_per_level(&db), [3, 0, 1, 0, 0, 0, 0]);
     assert_eq!(
-        db.get_int_property("regolith.recovery.tables_demoted"),
+        db.get_int_property("regolith.manifest.tables_demoted"),
         Some(2)
     );
     let expected: [(&[u8], Option<&[u8]>); 4] = [
@@ -217,7 +217,7 @@ fn an_overlapping_level_1_opens_with_its_tables_in_level_0_and_reads_the_newest_
 
     let db = Db::open(dir.path(), options()).unwrap();
     assert_eq!(
-        db.get_int_property("regolith.recovery.tables_demoted"),
+        db.get_int_property("regolith.manifest.tables_demoted"),
         Some(0)
     );
     assert_reads(&db, "after a reopen", &expected);
@@ -357,7 +357,7 @@ fn an_overlapping_level_3_moves_levels_1_to_3_and_leaves_level_4() {
     let db = Db::open(dir.path(), merging()).unwrap();
     assert_eq!(files_per_level(&db), [5, 0, 0, 0, 1, 0, 0]);
     assert_eq!(
-        db.get_int_property("regolith.recovery.tables_demoted"),
+        db.get_int_property("regolith.manifest.tables_demoted"),
         Some(4)
     );
 }

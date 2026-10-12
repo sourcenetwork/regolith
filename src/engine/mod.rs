@@ -734,7 +734,7 @@ impl RegolithEngine {
         })?;
         let tables_demoted_at_open = demotion.as_ref().map_or(0, |demotion| demotion.tables);
         if let Some(demotion) = &demotion {
-            report_demoted_tables(&manifest_path, demotion, false);
+            report_demoted_tables(&options, &manifest_path, demotion, false);
         }
         drop(demotion);
         let removed =
@@ -918,7 +918,7 @@ impl RegolithEngine {
         // read-write one records the move.
         let demotion = version_set.take_demotion();
         if let Some(demotion) = &demotion {
-            report_demoted_tables(version_set.manifest_path(), demotion, true);
+            report_demoted_tables(&options, version_set.manifest_path(), demotion, true);
         }
         let tables_demoted_at_open = demotion.as_ref().map_or(0, |demotion| demotion.tables);
         let version = version_set.current();

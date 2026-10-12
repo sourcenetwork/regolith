@@ -172,7 +172,7 @@ fn read_only_open_repairs_the_view_without_modifying_the_manifest() {
     drop(vs);
     let db = Db::open_read_only(dir.path(), options()).unwrap();
     assert_eq!(
-        db.get_int_property("regolith.recovery.tables_demoted"),
+        db.get_int_property("regolith.manifest.tables_demoted"),
         Some(3)
     );
     assert_eq!(db.get(b"k").unwrap().as_deref(), Some(b"new".as_slice()));
@@ -240,7 +240,7 @@ fn repaired_reads_snapshots_and_compaction_keep_the_newest_values() {
     let (dir, _) = fixture();
     let db = Db::open(dir.path(), options()).unwrap();
     assert_eq!(
-        db.get_int_property("regolith.recovery.tables_demoted"),
+        db.get_int_property("regolith.manifest.tables_demoted"),
         Some(3)
     );
     assert_eq!(db.get(b"k").unwrap().as_deref(), Some(b"new".as_slice()));
@@ -274,7 +274,7 @@ fn repaired_reads_snapshots_and_compaction_keep_the_newest_values() {
     drop(db);
     let db = Db::open(dir.path(), options()).unwrap();
     assert_eq!(
-        db.get_int_property("regolith.recovery.tables_demoted"),
+        db.get_int_property("regolith.manifest.tables_demoted"),
         Some(0)
     );
     assert_eq!(db.get(b"k").unwrap().as_deref(), Some(b"latest".as_slice()));
@@ -362,7 +362,7 @@ fn checkpoint_and_backup_preserve_the_repaired_layout() {
     );
     assert_eq!(checked.get(b"r").unwrap(), None);
     assert_eq!(
-        checked.get_int_property("regolith.recovery.tables_demoted"),
+        checked.get_int_property("regolith.manifest.tables_demoted"),
         Some(0)
     );
     let backup_dir = TempDir::new().unwrap();
@@ -381,7 +381,7 @@ fn checkpoint_and_backup_preserve_the_repaired_layout() {
     );
     assert_eq!(restored.get(b"r").unwrap(), None);
     assert_eq!(
-        restored.get_int_property("regolith.recovery.tables_demoted"),
+        restored.get_int_property("regolith.manifest.tables_demoted"),
         Some(0)
     );
 }
