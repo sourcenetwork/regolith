@@ -68,71 +68,68 @@ cov:
 
 # ── suites CI runs as their own jobs, split by mechanism ─────
 #
-# Through nextest, for the profile's per-test bound, and with no retry:
-# `cargo test` had none, and a durability failure that passes the second
-# time is still a failure.
+# All through nextest, for the profile's per-test bound. The five that the
+# durability job runs (`test-crash`, `test-power`, `test-fault`,
+# `test-lifecycle`, `mvcc`) take no retry: a durability failure that passes
+# the second time is still a failure.
+
+# The fault-injection harness's own tests: the LD_PRELOAD shim, kill points,
+# the power-cut simulation and the prefix validator every durability suite
+# rests on. Linux only.
 
 test-fault:
     cargo nextest run --test fault_smoke --retries 0
 
-# The `#[ignore]`d fault tests: each spawns child processes and simulates a
-# power cut. Measured at well under a second each, but kept out of the
-# default run so `cargo test` stays quick.
+# The same file under the profile's retry setting. Nothing in it is
+# `#[ignore]`d, so this runs the tests `test-fault` runs.
 
 test-fault-slow:
     cargo nextest run --test fault_smoke
 
-# The `#[ignore]`d resource-exhaustion and extremes tests: six-figure key
-# counts, a 64 MiB value, megabyte keys, a six-level cascade, and a real
-# ENOSPC on a tmpfs mounted in a private user namespace. About 21 s in
-# total on a debug build. `--test-threads=1` is required, not cosmetic:
-# each test resets the kernel's peak-RSS counter to report its own memory
-# high-water mark, and a concurrent test would inflate that number.
+# Process-crash recovery: kill -9 at every point in the write path, each in
+# a child process the harness kills at a byte-exact point. Linux only.
 
 test-crash:
     cargo nextest run --test crash_recovery --retries 0
 
-# Handle lifecycle: open, close, reopen under changed Options, locking,
-# and every misuse of a closed or read-only handle. Measured at 0.4s, so
-# every test in the file also runs in the default `cargo test`; nothing
-# here is `#[ignore]`d.
+# Power loss: a child killed at a byte-exact point, then every byte it never
+# synced discarded. One test at a time with its output shown, so the
+# measured cost of the default DurabilityMode::Eventual is visible.
 
 test-power:
     cargo nextest run --test power_loss --retries 0 --no-capture -- --skip crash_child
 
-# Process-crash recovery: kill -9 at every point in the write path. Every
-# test in the file is in the default run already; this recipe just runs the
-# file on its own. Measured at 0.6s, spawning 41 child processes.
+# Corruption sweeps, the sampled ones and the exhaustive ones: truncation at
+# every byte offset and every single-bit flip of a WAL, an SSTable and a
+# MANIFEST.
 
 test-corruption-slow:
     cargo nextest run --test corruption_exhaustive
 
-# The power-loss durability tests, with output shown so the measured cost of
-# the default DurabilityMode::Eventual is visible. Every test here spawns a
-# child process, crashes it at a byte-exact point and simulates a power cut.
-# Measured at 0.6s in total, so it also runs in the default `cargo test`.
+# Durability property tests: random operation sequences checked against a
+# model after every operation, and across a kill and a power cut. Linux only.
 
 test-durability-slow:
     cargo nextest run --test proptest_durability
 
-# Every ignored test in the workspace, including the scheduled stress runs.
+# Resource exhaustion and extremes: six-figure operation counts, values and
+# keys at the size maxima, megabyte keys, a tree deep enough that a read
+# walks past L3, and a real ENOSPC on a tmpfs in a private user namespace.
+# `--test-threads 1` is required, not cosmetic: each test resets the
+# kernel's peak-RSS counter to report its own memory high-water mark, and a
+# concurrent test would inflate that number.
 
 test-extremes:
     cargo nextest run --test resource_limits --no-capture --test-threads 1
 
-# The `#[ignore]`d durability property test: 128 randomized operation
-# sequences, each run in a child process that is killed part way through
-# and then power-cut by discarding every byte it never fsynced. Measured
-# at 1.1 s. Needs the LD_PRELOAD fault shim, so it is Linux only.
+# Handle lifecycle: open, close, reopen under changed Options, locking,
+# and every misuse of a closed or read-only handle.
 
 test-lifecycle:
     cargo nextest run --test lifecycle --retries 0 -- --skip crash_child
 
-# MVCC and concurrency invariants: snapshot stability under concurrent
-# writers and compaction, WriteBatch atomicity seen by concurrent readers,
-# monotonic reads, version integrity across delete/compact/reopen, and
-# iterators pinned across compactions that unlink their files. Measured at
-# 0.5s, so every test in the fast set also runs in the default `cargo test`.
+# The whole workspace in a release build, one test at a time with its
+# output shown: what the nightly job runs. It runs no `#[ignore]`d test.
 
 test-slow:
     cargo nextest run --workspace --release --no-capture
@@ -142,22 +139,16 @@ test-slow:
 fault-shim-clean:
     rm -rf target/tmp/regolith-fault
 
-# The `#[ignore]`d exhaustive corruption sweeps: every byte offset and
-# every single-bit flip of a WAL, an SSTable and a MANIFEST. 14,265
-# trials, measured at 1.2s of wall time.
+# MVCC and concurrency invariants: snapshot stability, WriteBatch atomicity
+# seen by concurrent readers, monotonic reads, version integrity across
+# delete/compact/reopen, and iterators pinned across compactions. The fast
+# tests and their full-scale versions both run: none is `#[ignore]`d.
 
 mvcc:
     cargo nextest run --test mvcc_invariants --retries 0 -- --skip crash_child
 
-# The `#[ignore]`d full-scale MVCC soaks: 120,000 writes racing a snapshot
-# that pins every version of them, 30,000 WriteBatch generations checked by
-# four readers, 1.9M monotonic point reads, and the focused gate for the
-# user-thread `compact_range` read race. Measured at 13.8s + 9.3s + 4.5s +
-# 26s on a debug build.
-#
-# This recipe is RED today, and that is the point: the focused gate finds a
-# real read-path defect. See the doc comment on
-# `a_user_thread_compact_range_never_makes_a_read_travel_backwards`.
+# The same file, one test at a time with its output shown, under the
+# profile's retry setting.
 
 mvcc-slow:
     cargo nextest run --test mvcc_invariants --no-capture
@@ -384,10 +375,9 @@ loom-gate:
 
 loom-all: loom loom-debug loom-sync loom-io loom-snapshots loom-view loom-cache loom-tombstones loom-tables loom-locks loom-gate
 
-# The read-view chaos workload at full size: 6 instances x 2 rounds x 400
-# versions. Measured at over 20 minutes wall and 4h of CPU unoptimized,
-# which is why `cargo test` runs a smaller default and this recipe
-# carries the full one. Release, because debug is where the cost is.
+# The read-view chaos workload at a larger size than `cargo test` runs it:
+# 4 instances x 2 rounds x 120 versions by default, against 2 x 1 x 50.
+# Release, because debug is where the cost is.
 #
 # Sized to finish, not to be maximal. Cost is roughly
 # instances x rounds x versions x compaction passes, and the compaction
