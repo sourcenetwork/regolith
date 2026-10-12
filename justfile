@@ -23,7 +23,8 @@ doc:
 # whole binary. See `.config/nextest.toml`.
 #
 # nextest cannot run doc tests, so they run under a hard limit: measured at
-# 3 s (load 88 on 36 threads), times 100 for a runner that compiles them cold.
+# 12 s with TMPDIR on an nvme disk at load 310 on 36 threads (3 s on tmpfs
+# at load 88), times 25.
 
 test:
     cargo nextest run --workspace
@@ -397,10 +398,11 @@ loom-all: loom loom-debug loom-sync loom-io loom-snapshots loom-view loom-cache 
 # the overlap count is already in the thousands per instance here.
 #
 # Built first, then run under `limit`, which is a parameter because the
-# size is: the default size measured at 2 s (load 68 on 36 threads), times
-# 150 for a runner with four cores. A larger size passes its own limit.
+# size is: the default size measured at 46 s with TMPDIR on an nvme disk at
+# load 209 on 36 threads (under a second on tmpfs at load 68), times 13. A
+# larger size passes its own limit.
 
-chaos instances="4" rounds="2" versions="120" min_rounds="20" limit="5m":
+chaos instances="4" rounds="2" versions="120" min_rounds="20" limit="10m":
     cargo test --release --test read_view_chaos_workload --no-run
     REGOLITH_CHAOS_INSTANCES={{instances}} REGOLITH_CHAOS_ROUNDS={{rounds}} \
     REGOLITH_CHAOS_VERSIONS={{versions}} REGOLITH_CHAOS_MIN_ROUNDS={{min_rounds}} \
@@ -1060,7 +1062,8 @@ elle-matrix:
     fail=0
     cargo build --release --bin elle-gen
     # The harness is a workspace of its own, which the nextest profile does
-    # not reach: its 16 unit tests measured at 0.4 s (load 161), times 150.
+    # not reach: its 16 unit tests measured at 2.4 s with TMPDIR on an nvme
+    # disk at load 276 on 36 threads (0.4 s on tmpfs), times 25.
     cargo test --release --no-run || fail=1
     just bounded 1m elle-matrix cargo test --release || fail=1
     check() {
