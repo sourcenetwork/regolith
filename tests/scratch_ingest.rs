@@ -68,7 +68,7 @@ fn one_plain_write_between_ingests() {
     let db = Db::open(dir.path(), opts.clone()).unwrap();
 
     for batch in 0..5usize {
-        db.put(format!("plain{batch}").as_bytes(), b"p").unwrap();
+        regolith::through_stalls(|| db.put(format!("plain{batch}").as_bytes(), b"p")).unwrap();
         let path = staging.path().join(format!("ing_{batch}.sst"));
         build(&path, batch, &opts);
         db.ingest_external_files(

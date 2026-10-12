@@ -27,10 +27,12 @@ fn opts() -> Options {
 
 fn fill(db: &Db, n: usize) {
     for i in 0..n {
-        db.put(
-            format!("key_{i:06}").as_bytes(),
-            format!("val_{i:06}").as_bytes(),
-        )
+        regolith::through_stalls(|| {
+            db.put(
+                format!("key_{i:06}").as_bytes(),
+                format!("val_{i:06}").as_bytes(),
+            )
+        })
         .unwrap();
     }
 }
@@ -139,7 +141,7 @@ fn a_failed_open_leaves_no_stale_lock_file() {
     fs::remove_file(dir.path().join("sst")).unwrap();
     // The next open must succeed: nothing may be left holding the lock.
     let db = Db::open(dir.path(), Options::default()).unwrap();
-    db.put(b"k", b"v").unwrap();
+    regolith::through_stalls(|| db.put(b"k", b"v")).unwrap();
     assert_eq!(db.get(b"k").unwrap(), Some(b"v".to_vec()));
 }
 
@@ -304,8 +306,8 @@ fn a_wal_claiming_a_huge_record_does_not_allocate_it() {
     let dir = TempDir::new().unwrap();
     let (wal, mut bytes) = {
         let db = Db::open(dir.path(), opts().durability(DurabilityMode::Immediate)).unwrap();
-        db.put(b"k", b"v").unwrap();
-        db.put(b"k2", b"v2").unwrap();
+        regolith::through_stalls(|| db.put(b"k", b"v")).unwrap();
+        regolith::through_stalls(|| db.put(b"k2", b"v2")).unwrap();
         let wal = files_with_ext(&dir.path().join("wal"), "log")
             .pop()
             .expect("a wal file");
@@ -338,7 +340,7 @@ fn wal_single_byte_flips_do_not_panic() {
     {
         let db = Db::open(template.path(), opts()).unwrap();
         for i in 0..40 {
-            db.put(format!("k{i:03}").as_bytes(), b"value").unwrap();
+            regolith::through_stalls(|| db.put(format!("k{i:03}").as_bytes(), b"value")).unwrap();
         }
         db.close().unwrap();
     }
@@ -466,7 +468,7 @@ fn close_does_not_wait_out_a_condvar_timeout_per_worker() {
             Options::default().max_background_compactions(workers),
         )
         .unwrap();
-        db.put(b"k", b"v").unwrap();
+        regolith::through_stalls(|| db.put(b"k", b"v")).unwrap();
         let started = Instant::now();
         drop(db);
         let elapsed = started.elapsed();

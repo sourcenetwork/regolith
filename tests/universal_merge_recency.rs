@@ -40,7 +40,7 @@ fn seed(db: &Db, rounds: u64) {
         for i in 0..200u64 {
             batch.put(&(r * 1000 + i).to_be_bytes(), &filler);
         }
-        db.write(batch).unwrap();
+        regolith::through_stalls(|| db.write(batch.clone())).unwrap();
         db.flush().unwrap();
     }
 }
@@ -57,12 +57,12 @@ fn a_write_that_lands_during_a_universal_merge_is_not_overtaken() {
         let dir = tempfile::tempdir().unwrap();
         let db = Db::open(dir.path(), universal_options(4)).unwrap();
 
-        db.put(KEY, b"old").unwrap();
+        regolith::through_stalls(|| db.put(KEY, b"old")).unwrap();
         seed(&db, 6);
 
         // Newer value, then a flush to push it into its own L0 file while the
         // background workers are merging what came before.
-        db.put(KEY, b"new").unwrap();
+        regolith::through_stalls(|| db.put(KEY, b"new")).unwrap();
         db.flush().unwrap();
 
         // Give the merge time to land its output.
@@ -104,10 +104,11 @@ fn a_universal_merge_keeps_every_key_it_folded() {
     for i in 0..N {
         batch.put(&i.to_be_bytes(), &value);
         if batch.buffered_bytes() >= 16 * 1024 {
-            db.write(std::mem::take(&mut batch)).unwrap();
+            let full = std::mem::take(&mut batch);
+            regolith::through_stalls(|| db.write(full.clone())).unwrap();
         }
     }
-    db.write(batch).unwrap();
+    regolith::through_stalls(|| db.write(batch.clone())).unwrap();
     db.flush().unwrap();
     while db.compact_step().unwrap() == CompactionOutcome::DidWork {}
 

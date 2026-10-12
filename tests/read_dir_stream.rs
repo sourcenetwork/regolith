@@ -191,8 +191,7 @@ fn options(probe: &WalkProbe) -> Options {
 
 fn put_some(db: &Db, n: usize) {
     for i in 0..n {
-        db.put(format!("key_{i:06}").as_bytes(), &[7u8; 64])
-            .unwrap();
+        regolith::through_stalls(|| db.put(format!("key_{i:06}").as_bytes(), &[7u8; 64])).unwrap();
     }
 }
 

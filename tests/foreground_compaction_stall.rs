@@ -430,7 +430,7 @@ fn immediate_durability_on_a_non_durable_env_is_refused() {
             println!("refused as documented: {e:?}");
         }
         Ok(db) => {
-            db.put(b"k", b"v").unwrap();
+            regolith::through_stalls(|| db.put(b"k", b"v")).unwrap();
             db.close().unwrap();
             panic!(
                 "DurabilityMode::Immediate was accepted on an env with \
@@ -554,7 +554,7 @@ fn a_second_handle_is_refused_even_without_a_cross_process_lock() {
     first.close().unwrap();
     drop(first);
     let reopened = Db::open("/lockless", opts()).unwrap();
-    reopened.put(b"k", b"v").unwrap();
+    regolith::through_stalls(|| reopened.put(b"k", b"v")).unwrap();
     reopened.close().unwrap();
 }
 

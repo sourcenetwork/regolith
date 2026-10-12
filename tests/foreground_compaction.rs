@@ -64,7 +64,7 @@ impl EventListener for JobCounter {
 fn open_succeeds_with_zero_background_compactions() {
     let dir = tempfile::tempdir().unwrap();
     let db = Db::open(dir.path(), foreground_options()).unwrap();
-    db.put(b"k", b"v").unwrap();
+    regolith::through_stalls(|| db.put(b"k", b"v")).unwrap();
     assert_eq!(db.get(b"k").unwrap().as_deref(), Some(&b"v"[..]));
 }
 
@@ -81,7 +81,7 @@ fn zero_workers_do_not_wedge_at_the_stop_trigger() {
     // push L0 well past `level0_stop_writes_trigger`, with no
     // `compact_range` anywhere to rescue it.
     for i in 0..8_000usize {
-        db.put(format!("key{i:06}").as_bytes(), &value(i)).unwrap();
+        regolith::through_stalls(|| db.put(format!("key{i:06}").as_bytes(), &value(i))).unwrap();
     }
 
     for i in (0..8_000usize).step_by(97) {
@@ -115,7 +115,7 @@ fn inline_compaction_bounds_the_work_one_write_performs() {
     let mut worst = 0usize;
     for i in 0..4_000usize {
         let before = counter.compactions.load(Ordering::Relaxed);
-        db.put(format!("key{i:06}").as_bytes(), &value(i)).unwrap();
+        regolith::through_stalls(|| db.put(format!("key{i:06}").as_bytes(), &value(i))).unwrap();
         worst = worst.max(counter.compactions.load(Ordering::Relaxed) - before);
     }
 
@@ -225,7 +225,7 @@ fn a_full_memtable_becomes_an_l0_file_with_no_worker() {
     assert_eq!(db.get_int_property("regolith.num-files-at-level0"), Some(0));
 
     for i in 0..400usize {
-        db.put(format!("key{i:06}").as_bytes(), &value(i)).unwrap();
+        regolith::through_stalls(|| db.put(format!("key{i:06}").as_bytes(), &value(i))).unwrap();
     }
 
     assert!(
@@ -239,7 +239,7 @@ fn explicit_flush_writes_an_l0_file_and_is_idempotent() {
     let dir = tempfile::tempdir().unwrap();
     let db = Db::open(dir.path(), foreground_options().l0_compaction_trigger(64)).unwrap();
 
-    db.put(b"a", b"1").unwrap();
+    regolith::through_stalls(|| db.put(b"a", b"1")).unwrap();
     db.flush().unwrap();
     let after_first = db.get_int_property("regolith.num-files-at-level0").unwrap();
     assert_eq!(after_first, 1);
@@ -279,7 +279,7 @@ fn compact_step_reports_idle_did_work_and_contended_apart() {
     )
     .unwrap();
     for i in 0..KEYS {
-        db.put(format!("key{i:06}").as_bytes(), &value(i)).unwrap();
+        regolith::through_stalls(|| db.put(format!("key{i:06}").as_bytes(), &value(i))).unwrap();
     }
     db.flush().unwrap();
     assert!(
@@ -330,7 +330,8 @@ fn compact_step_works_with_a_background_worker_running() {
     .unwrap();
 
     for i in 0..2_000usize {
-        db.put(format!("key{i:06}").as_bytes(), &value(i)).unwrap();
+        // Through stalls: the workers may fall behind these writes.
+        regolith::through_stalls(|| db.put(format!("key{i:06}").as_bytes(), &value(i))).unwrap();
         if i % 250 == 0 {
             // Returns false when the workers got there first; either
             // answer is correct, and neither may corrupt the version.
@@ -355,12 +356,12 @@ fn full_lifecycle_with_zero_workers() {
     let db = Db::open(dir.path(), foreground_options()).unwrap();
 
     for i in 0..2_000usize {
-        db.put(format!("key{i:06}").as_bytes(), &value(i)).unwrap();
+        regolith::through_stalls(|| db.put(format!("key{i:06}").as_bytes(), &value(i))).unwrap();
     }
 
     let snapshot = db.snapshot();
 
-    db.delete(b"key000005").unwrap();
+    regolith::through_stalls(|| db.delete(b"key000005")).unwrap();
     assert_eq!(db.get(b"key000005").unwrap(), None);
     assert_eq!(
         snapshot.get(b"key000005").unwrap(),
@@ -371,7 +372,7 @@ fn full_lifecycle_with_zero_workers() {
     let mut batch = WriteBatch::new();
     batch.put(b"batched", b"yes");
     batch.delete(b"key000006");
-    db.write(batch).unwrap();
+    regolith::through_stalls(|| db.write(batch.clone())).unwrap();
     assert_eq!(db.get(b"batched").unwrap().as_deref(), Some(&b"yes"[..]));
     assert_eq!(db.get(b"key000006").unwrap(), None);
 

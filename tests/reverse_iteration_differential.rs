@@ -134,17 +134,17 @@ fn check(set_name: &str, keys: &[Vec<u8>], state: State, surface: Surface) -> Ve
     };
     for (k, v) in &want {
         match &cf {
-            Some(h) => db.put_cf(h, k, v).expect("put_cf"),
-            None => db.put(k, v).expect("put"),
+            Some(h) => regolith::through_stalls(|| db.put_cf(h, k, v)).expect("put_cf"),
+            None => regolith::through_stalls(|| db.put(k, v)).expect("put"),
         }
     }
     match state {
         State::Memtable => {}
         State::Flushed => {
             // Rotate without compacting: a big put forces a flush.
-            db.put(b"\x7f_flush_trigger", &vec![0u8; 8 * 1024])
+            regolith::through_stalls(|| db.put(b"\x7f_flush_trigger", &vec![0u8; 8 * 1024]))
                 .expect("put");
-            db.delete(b"\x7f_flush_trigger").expect("delete");
+            regolith::through_stalls(|| db.delete(b"\x7f_flush_trigger")).expect("delete");
         }
         State::Compacted => db.compact_range(None, None).wait().expect("compact"),
     }
@@ -287,7 +287,7 @@ fn seek_for_prev_matches_the_oracle_at_every_adversarial_probe() {
         let db =
             Db::open(dir.path(), Options::default().write_buffer_size(4 * 1024)).expect("open");
         for (k, v) in &want {
-            db.put(k, v).expect("put");
+            regolith::through_stalls(|| db.put(k, v)).expect("put");
         }
         db.compact_range(None, None).wait().expect("compact");
 

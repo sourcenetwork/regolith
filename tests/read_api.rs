@@ -38,9 +38,9 @@ fn has_and_get_size_agree_with_get_across_every_source() {
     // Enough keys to spill past the 4 KiB write buffer, so the reads
     // below hit the memtable, frozen memtables and SSTables alike.
     fill_sequential(&db, 500);
-    db.put(b"in_memtable", b"fresh").unwrap();
-    db.put(b"empty_value", b"").unwrap();
-    db.delete(b"key_000010").unwrap();
+    regolith::through_stalls(|| db.put(b"in_memtable", b"fresh")).unwrap();
+    regolith::through_stalls(|| db.put(b"empty_value", b"")).unwrap();
+    regolith::through_stalls(|| db.delete(b"key_000010")).unwrap();
 
     for i in 0..500 {
         let key = format!("key_{i:06}");
@@ -65,7 +65,7 @@ fn has_and_get_size_agree_with_get_across_every_source() {
 fn an_empty_value_is_present_with_length_zero() {
     let dir = TempDir::new().unwrap();
     let db = open(&dir);
-    db.put(b"empty", b"").unwrap();
+    regolith::through_stalls(|| db.put(b"empty", b"")).unwrap();
 
     assert!(db.has(b"empty").unwrap(), "an empty value still exists");
     assert_eq!(db.get_size(b"empty").unwrap(), Some(0));
@@ -81,10 +81,10 @@ fn an_empty_value_is_present_with_length_zero() {
 fn has_respects_range_tombstones() {
     let dir = TempDir::new().unwrap();
     let db = open(&dir);
-    db.put(b"aa", b"1").unwrap();
-    db.put(b"ab", b"2").unwrap();
-    db.put(b"zz", b"3").unwrap();
-    db.delete_range(b"aa", b"b").unwrap();
+    regolith::through_stalls(|| db.put(b"aa", b"1")).unwrap();
+    regolith::through_stalls(|| db.put(b"ab", b"2")).unwrap();
+    regolith::through_stalls(|| db.put(b"zz", b"3")).unwrap();
+    regolith::through_stalls(|| db.delete_range(b"aa", b"b")).unwrap();
 
     assert!(!db.has(b"aa").unwrap());
     assert!(!db.has(b"ab").unwrap());
@@ -100,10 +100,10 @@ fn has_respects_range_tombstones() {
 fn has_respects_snapshot_visibility() {
     let dir = TempDir::new().unwrap();
     let db = open(&dir);
-    db.put(b"before", b"v").unwrap();
+    regolith::through_stalls(|| db.put(b"before", b"v")).unwrap();
     let snap = db.snapshot();
-    db.put(b"after", b"v").unwrap();
-    db.delete(b"before").unwrap();
+    regolith::through_stalls(|| db.put(b"after", b"v")).unwrap();
+    regolith::through_stalls(|| db.delete(b"before")).unwrap();
 
     assert!(snap.has(b"before").unwrap(), "still live at the snapshot");
     assert_eq!(snap.get_size(b"before").unwrap(), Some(1));
@@ -120,8 +120,8 @@ fn has_and_get_size_are_scoped_to_a_column_family() {
     let db = Db::open(dir.path(), Options::default()).unwrap();
     let cf = db.create_column_family("other").unwrap();
 
-    db.put(b"shared", b"default").unwrap();
-    db.put_cf(&cf, b"cf_only", b"cf-value").unwrap();
+    regolith::through_stalls(|| db.put(b"shared", b"default")).unwrap();
+    regolith::through_stalls(|| db.put_cf(&cf, b"cf_only", b"cf-value")).unwrap();
 
     assert!(db.has(b"shared").unwrap());
     assert!(!db.has(b"cf_only").unwrap(), "CF key is not in the default");
@@ -144,9 +144,9 @@ fn has_with_a_merge_operator_reports_the_collapsed_chain() {
     let opts = Options::default().merge_operator(Some(std::sync::Arc::new(Concat)));
     let db = Db::open(dir.path(), opts).unwrap();
 
-    db.put(b"k", b"base").unwrap();
-    db.merge(b"k", b"+one").unwrap();
-    db.merge(b"k", b"+two").unwrap();
+    regolith::through_stalls(|| db.put(b"k", b"base")).unwrap();
+    regolith::through_stalls(|| db.merge(b"k", b"+one")).unwrap();
+    regolith::through_stalls(|| db.merge(b"k", b"+two")).unwrap();
 
     let merged = db.get(b"k").unwrap().expect("merged value");
     assert_eq!(merged, b"base+one+two");
@@ -194,8 +194,8 @@ fn iterator_value_slice_covers_memtable_reverse_and_merge_sources() {
     let mut batch = WriteBatch::new();
     batch.put(b"a", b"alpha");
     batch.put(b"b", b"beta");
-    db.write(batch).unwrap();
-    db.merge(b"c", b"gamma").unwrap();
+    regolith::through_stalls(|| db.write(batch.clone())).unwrap();
+    regolith::through_stalls(|| db.merge(b"c", b"gamma")).unwrap();
 
     // Forward over the memtable.
     let mut it = db.iter();
@@ -241,8 +241,8 @@ fn cf_and_owned_iterators_expose_value_slice() {
     let dir = TempDir::new().unwrap();
     let db = Db::open(dir.path(), Options::default()).unwrap();
     let cf = db.create_column_family("cf").unwrap();
-    db.put_cf(&cf, b"k", b"cf-value").unwrap();
-    db.put(b"k", b"default-value").unwrap();
+    regolith::through_stalls(|| db.put_cf(&cf, b"k", b"cf-value")).unwrap();
+    regolith::through_stalls(|| db.put(b"k", b"default-value")).unwrap();
 
     let mut it = db.iter_cf(&cf);
     it.seek_to_first();
@@ -275,8 +275,8 @@ proptest! {
         for (key_byte, value) in &ops {
             let key = [*key_byte];
             match value {
-                Some(v) => db.put(&key, v).unwrap(),
-                None => db.delete(&key).unwrap(),
+                Some(v) => regolith::through_stalls(|| db.put(&key, v)).unwrap(),
+                None => regolith::through_stalls(|| db.delete(&key)).unwrap(),
             }
         }
         if compact {
@@ -299,7 +299,7 @@ fn waiting_for_snapshots_counts_iterator_pins_not_just_snapshot_handles() {
     let dir = TempDir::new().expect("tempdir");
     let db = Db::open(dir.path(), Options::default()).expect("open");
     for i in 0..32u32 {
-        db.put(format!("k{i:04}").as_bytes(), b"v").expect("put");
+        regolith::through_stalls(|| db.put(format!("k{i:04}").as_bytes(), b"v")).expect("put");
     }
 
     assert_eq!(
@@ -339,7 +339,7 @@ fn waiting_for_snapshots_counts_iterator_pins_not_just_snapshot_handles() {
 fn waiting_for_snapshots_returns_as_soon_as_the_last_reader_finishes() {
     let dir = TempDir::new().expect("tempdir");
     let db = Arc::new(Db::open(dir.path(), Options::default()).expect("open"));
-    db.put(b"k", b"v").expect("put");
+    regolith::through_stalls(|| db.put(b"k", b"v")).expect("put");
 
     let snapshot = db.snapshot();
     let holder = {

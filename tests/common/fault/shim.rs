@@ -8,8 +8,12 @@
 //! The standalone shim needs Rust 1.99 for C-variadic function definitions.
 //!
 //! The build is content-addressed and atomic: the object is named after a
-//! hash of the source and installed with a rename, so several test
-//! binaries running in parallel cannot race each other. Each builder
+//! hash of the source and of the compiler that builds it ([`cache_key`]),
+//! and installed with a rename, so several test binaries running in
+//! parallel cannot race each other, and a run on another toolchain builds
+//! an object of its own. Keyed on the source alone, a shim one toolchain
+//! built was preloaded into another toolchain's test binary, where it
+//! fired no fault and recorded nothing until the cache was deleted. Each builder
 //! compiles from a source file of its own: when every builder wrote one
 //! shared source path, one builder's truncating write could land while
 //! another's `rustc` was reading it, and an empty source compiles into a
@@ -93,12 +97,43 @@ fn out_dir() -> PathBuf {
     }
 }
 
-fn source_hash() -> u64 {
+/// The compiler that builds the shim: `RUSTC` when cargo or the caller set
+/// it, else the `rustc` on the path, which under rustup is the toolchain
+/// this test run uses.
+fn compiler() -> String {
+    std::env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string())
+}
+
+/// What tells one compiler from another: everything `rustc -vV` prints
+/// (release, commit, host, LLVM). Asked once a process.
+pub fn compiler_identity() -> Result<String, ShimError> {
+    static IDENTITY: std::sync::OnceLock<Result<String, ShimError>> = std::sync::OnceLock::new();
+    IDENTITY
+        .get_or_init(|| {
+            let rustc = compiler();
+            let out = Command::new(&rustc)
+                .arg("-vV")
+                .output()
+                .map_err(|e| ShimError::Io(format!("asking {rustc} for its version: {e}")))?;
+            if !out.status.success() {
+                return Err(ShimError::Io(format!(
+                    "{rustc} -vV failed ({}): {}",
+                    out.status,
+                    String::from_utf8_lossy(&out.stderr)
+                )));
+            }
+            Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+        })
+        .clone()
+}
+
+/// The cached object's name: a hash of the shim's source and of the
+/// compiler that builds it. A different toolchain gets a different object,
+/// since a cdylib embeds its compiler's std.
+pub fn cache_key(compiler_identity: &str) -> u64 {
     let mut h = DefaultHasher::new();
     SOURCE.hash(&mut h);
-    // Rebuild when the toolchain changes: a cdylib built by a different
-    // rustc may embed a different std.
-    std::env::var("RUSTC").unwrap_or_default().hash(&mut h);
+    compiler_identity.hash(&mut h);
     h.finish()
 }
 
@@ -117,7 +152,7 @@ pub fn build_in(dir: &Path) -> Result<PathBuf, ShimError> {
         ));
     }
     std::fs::create_dir_all(dir).map_err(|e| ShimError::Io(e.to_string()))?;
-    let hash = source_hash();
+    let hash = cache_key(&compiler_identity()?);
     let lib = dir.join(format!("libregolith_fault_shim_{hash:016x}.so"));
     if lib.is_file() && missing_interposer(&lib)?.is_none() {
         return Ok(lib);
@@ -138,8 +173,7 @@ pub fn build_in(dir: &Path) -> Result<PathBuf, ShimError> {
     let staged = dir.join(format!("staged_{unique}.so"));
     std::fs::write(&src, SOURCE).map_err(|e| ShimError::Io(e.to_string()))?;
 
-    let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
-    let out = Command::new(rustc)
+    let out = Command::new(compiler())
         .args(["--edition", "2021"])
         .args(["--crate-type", "cdylib"])
         .args(["--crate-name", "regolith_fault_shim"])
@@ -284,7 +318,9 @@ pub fn require() -> PathBuf {
         Err(e) => panic!(
             "{e}\nPower-loss simulation needs the LD_PRELOAD shim. \
              Without it a crash test only models a process kill, which leaves unsynced \
-             bytes in the page cache and proves far less."
+             bytes in the page cache and proves far less. The shim is built by the \
+             toolchain running this test and needs Rust 1.99 or newer: on an older \
+             one, run the suite as `cargo +1.99.0 test --test <name>`."
         ),
     }
 }

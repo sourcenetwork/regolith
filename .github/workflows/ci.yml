@@ -71,8 +71,13 @@ jobs:
       - run: just test
 
 
+  # Every job below carries a `timeout-minutes` a few times its measured
+  # run time, so one that hangs is cancelled in minutes and named, where
+  # GitHub's default would hold a runner for six hours.
   clippy:
     runs-on: ubuntu-latest
+    # Measured at 35 s.
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -85,6 +90,8 @@ jobs:
 
   fmt:
     runs-on: ubuntu-latest
+    # Measured at 13 s.
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -96,6 +103,8 @@ jobs:
 
   doc:
     runs-on: ubuntu-latest
+    # Measured at 30 s.
+    timeout-minutes: 15
     env:
       RUSTDOCFLAGS: -D warnings
     steps:
@@ -108,6 +117,8 @@ jobs:
 
   alloc-budget:
     runs-on: ubuntu-latest
+    # Measured at 45 s.
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -144,6 +155,8 @@ jobs:
   # unserialized insert only runs there.
   msrv:
     runs-on: ubuntu-latest
+    # Measured at 35 s.
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.90
@@ -164,6 +177,8 @@ jobs:
 
   deny:
     runs-on: ubuntu-latest
+    # Measured at 25 s.
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: EmbarkStudios/cargo-deny-action@v2
@@ -257,12 +272,15 @@ jobs:
 
   # The five `regolith::sync` loom models whose three threads all contend
   # for one lock or semaphore, at preemption bound 2. The model-checking
-  # workflow runs them at bound 1 on every change; TIMING_PLACEHOLDER, so
-  # they run here, nightly, one job per model.
+  # workflow runs them at bound 1 on every change. At bound 2 each runs a
+  # smaller scenario of its own and takes 2 s to 6 minutes on a workstation,
+  # so they run here, nightly, one job per model. The limit is per model;
+  # the recipe stops the run itself, as a failure, at 15 minutes. A model
+  # that reaches it must be made smaller, not given more time.
   loom-sync-deep:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
-    timeout-minutes: 360
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:

@@ -290,10 +290,13 @@ proptest! {
     #![proptest_config(ProptestConfig::with_cases(256))]
 
     /// The commit checked up to a horizon taken partway through the writes
-    /// that follow its snapshot, and above it when its slot is decided, decides as the
-    /// same commit checked in full once every write has landed. When the
-    /// check at the horizon settles the commit, the outcome is the same and
-    /// only which conflicting key it names may differ.
+    /// that follow its snapshot, and above it when its slot is decided,
+    /// decides as the same commit checked in full once every write has
+    /// landed. When the check at the horizon settles the commit, the outcome
+    /// is the same and only which conflicting key it names may differ: a
+    /// conflict behind a put to a content-addressed key, which a write above
+    /// the horizon can turn into a refusal the full check meets first, is
+    /// not settled at the horizon.
     #[test]
     fn checking_up_to_a_horizon_then_above_it_decides_as_one_check(
         before in proptest::collection::vec(step(), 0..5),

@@ -28,7 +28,7 @@ fn backups(n: usize) -> (TempDir, BackupEngine, Vec<BackupId>) {
     let ids = (1..=n)
         .map(|i| {
             populate(&db, &format!("g{i}"), ROWS);
-            db.put(b"zz", &i.to_le_bytes()).unwrap();
+            crate::through_stalls(|| db.put(b"zz", &i.to_le_bytes())).unwrap();
             db.compact_range(None, None).wait().unwrap();
             engine.create_backup(&db).unwrap()
         })
