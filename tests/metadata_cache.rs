@@ -29,7 +29,7 @@ const KEYS: usize = 8_000;
 fn fill(db: &Db) {
     let value = vec![b'v'; 128];
     for i in 0..KEYS {
-        db.put(format!("key{i:08}").as_bytes(), &value).unwrap();
+        regolith::through_stalls(|| db.put(format!("key{i:08}").as_bytes(), &value)).unwrap();
     }
 }
 

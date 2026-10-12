@@ -64,7 +64,7 @@ fn build(dir: &Path, target_file_size: u64, keys: usize) -> (Db, BTreeMap<Vec<u8
     let db = Db::open(dir, options(target_file_size)).unwrap();
     let mut model = BTreeMap::new();
     for n in (0..keys).step_by(2) {
-        db.put(&key(n), &value(n, 0)).unwrap();
+        regolith::through_stalls(|| db.put(&key(n), &value(n, 0))).unwrap();
         model.insert(key(n), value(n, 0));
     }
     db.flush().unwrap();
@@ -75,22 +75,22 @@ fn build(dir: &Path, target_file_size: u64, keys: usize) -> (Db, BTreeMap<Vec<u8
     for _ in 0..3_000 {
         let n = rng.below(keys / 2) * 2;
         if rng.below(3) == 0 {
-            db.delete(&key(n)).unwrap();
+            regolith::through_stalls(|| db.delete(&key(n))).unwrap();
             model.remove(&key(n));
         } else {
-            db.put(&key(n), &value(n, 1)).unwrap();
+            regolith::through_stalls(|| db.put(&key(n), &value(n, 1))).unwrap();
             model.insert(key(n), value(n, 1));
         }
     }
     // Two whole regions deleted: nothing of them survives compaction, so the
     // tombstones stand alone in tables of their own.
     for (lo, hi) in [(6_000, 9_000), (30_000, 31_000)] {
-        db.delete_range(&key(lo), &key(hi)).unwrap();
+        regolith::through_stalls(|| db.delete_range(&key(lo), &key(hi))).unwrap();
         model.retain(|k, _| !(key(lo)..key(hi)).contains(k));
     }
     // Keys written back into one of those regions after its tombstone.
     for n in [6_100, 6_102, 8_998] {
-        db.put(&key(n), &value(n, 2)).unwrap();
+        regolith::through_stalls(|| db.put(&key(n), &value(n, 2))).unwrap();
         model.insert(key(n), value(n, 2));
     }
     db.flush().unwrap();
@@ -155,15 +155,15 @@ fn a_bottom_level_of_hundreds_of_tables_reads_exactly_as_the_data_says() {
     for _ in 0..500 {
         let n = rng.below(KEYS);
         if rng.below(4) == 0 {
-            db.delete(&key(n)).unwrap();
+            regolith::through_stalls(|| db.delete(&key(n))).unwrap();
             model.remove(&key(n));
         } else {
-            db.put(&key(n), &value(n, 3)).unwrap();
+            regolith::through_stalls(|| db.put(&key(n), &value(n, 3))).unwrap();
             model.insert(key(n), value(n, 3));
         }
     }
     db.flush().unwrap();
-    db.delete_range(&key(20_000), &key(20_500)).unwrap();
+    regolith::through_stalls(|| db.delete_range(&key(20_000), &key(20_500))).unwrap();
     model.retain(|k, _| !(key(20_000)..key(20_500)).contains(k));
     verify(&db, &model, "with newer writes above the bottom level");
 

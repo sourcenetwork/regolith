@@ -97,8 +97,8 @@ fn damage_a_later_record_proves_synced_fails_open_and_keeps_wal() {
             common::small_opts().durability(DurabilityMode::Immediate),
         )
         .unwrap();
-        db.put(b"good_1", b"1").unwrap();
-        db.put(b"good_2", b"2").unwrap();
+        regolith::through_stalls(|| db.put(b"good_1", b"1")).unwrap();
+        regolith::through_stalls(|| db.put(b"good_2", b"2")).unwrap();
     }
 
     let wal = first_wal(dir.path());
@@ -119,8 +119,8 @@ fn a_damaged_final_record_nothing_proves_synced_is_dropped_and_reported() {
     let dir = TempDir::new().unwrap();
     {
         let db = open(&dir);
-        db.put(b"good_1", b"1").unwrap();
-        db.put(b"good_2", b"2").unwrap();
+        regolith::through_stalls(|| db.put(b"good_1", b"1")).unwrap();
+        regolith::through_stalls(|| db.put(b"good_2", b"2")).unwrap();
     }
     let wal = first_wal(dir.path());
     let bytes = fs::read(&wal).unwrap();
@@ -156,8 +156,8 @@ fn wal_truncated_at_arbitrary_offset_replays_the_whole_records_before_the_cut() 
         let dir = TempDir::new().unwrap();
         {
             let db = open(&dir);
-            db.put(b"a", b"1").unwrap();
-            db.put(b"b", b"2").unwrap();
+            regolith::through_stalls(|| db.put(b"a", b"1")).unwrap();
+            regolith::through_stalls(|| db.put(b"b", b"2")).unwrap();
         }
         let wal = first_wal(dir.path());
         let wal_count = count_wal_files(dir.path());
@@ -187,8 +187,8 @@ fn wal_checksum_flip_in_final_record_of_a_closed_log_fails_open() {
     let dir = TempDir::new().unwrap();
     {
         let db = open(&dir);
-        db.put(b"first", b"v1").unwrap();
-        db.put(b"second", b"v2").unwrap();
+        regolith::through_stalls(|| db.put(b"first", b"v1")).unwrap();
+        regolith::through_stalls(|| db.put(b"second", b"v2")).unwrap();
         db.close().unwrap();
     }
     let wal = first_wal(dir.path());
@@ -215,7 +215,7 @@ fn manifest_deleted_prevents_reopen_of_nonempty_db() {
     {
         let db = open(&dir);
         for i in 0..200 {
-            db.put(format!("k_{:04}", i).as_bytes(), &[0u8; 64])
+            regolith::through_stalls(|| db.put(format!("k_{:04}", i).as_bytes(), &[0u8; 64]))
                 .unwrap();
         }
         force_compaction(&db);
@@ -245,10 +245,10 @@ fn corrupted_manifest_batch_preserves_the_earlier_flush() {
     let manifest = dir.path().join("MANIFEST");
     let second_end = {
         let db = Db::open(dir.path(), manifest_options()).unwrap();
-        db.put(b"k1", b"v1").unwrap();
+        regolith::through_stalls(|| db.put(b"k1", b"v1")).unwrap();
         db.flush().unwrap();
         let first_end = fs::metadata(&manifest).unwrap().len();
-        db.put(b"k2", b"v2").unwrap();
+        regolith::through_stalls(|| db.put(b"k2", b"v2")).unwrap();
         db.flush().unwrap();
         let second_end = fs::metadata(&manifest).unwrap().len();
         assert!(second_end > first_end);
@@ -277,9 +277,9 @@ fn corrupted_completed_compaction_refuses_missing_inputs_without_rewriting() {
     let manifest = dir.path().join("MANIFEST");
     let (inputs, compaction_end) = {
         let db = Db::open(dir.path(), manifest_options()).unwrap();
-        db.put(b"k1", b"v1").unwrap();
+        regolith::through_stalls(|| db.put(b"k1", b"v1")).unwrap();
         db.flush().unwrap();
-        db.put(b"k2", b"v2").unwrap();
+        regolith::through_stalls(|| db.put(b"k2", b"v2")).unwrap();
         db.flush().unwrap();
         let inputs: Vec<_> = fs::read_dir(dir.path().join("sst"))
             .unwrap()
@@ -319,7 +319,7 @@ fn three_flushes(dir: &Path) -> [usize; 3] {
     let db = Db::open(dir, manifest_options()).unwrap();
     let mut ends = [0; 3];
     for (i, end) in ends.iter_mut().enumerate() {
-        db.put(format!("k{i}").as_bytes(), b"v").unwrap();
+        regolith::through_stalls(|| db.put(format!("k{i}").as_bytes(), b"v")).unwrap();
         db.flush().unwrap();
         *end = fs::metadata(&manifest).unwrap().len() as usize;
     }
@@ -428,7 +428,7 @@ fn truncated_sst_file_to_below_footer_reports_error_on_open() {
     {
         let db = open(&dir);
         for i in 0..100 {
-            db.put(format!("k_{:04}", i).as_bytes(), b"v").unwrap();
+            regolith::through_stalls(|| db.put(format!("k_{:04}", i).as_bytes(), b"v")).unwrap();
         }
         force_compaction(&db);
     }
@@ -454,7 +454,7 @@ fn sst_footer_magic_byte_flip_detected_on_open() {
     {
         let db = open(&dir);
         for i in 0..50 {
-            db.put(format!("k_{:02}", i).as_bytes(), b"v").unwrap();
+            regolith::through_stalls(|| db.put(format!("k_{:02}", i).as_bytes(), b"v")).unwrap();
         }
         force_compaction(&db);
     }
@@ -480,7 +480,7 @@ fn stray_file_in_sst_dir_does_not_break_open() {
     let dir = TempDir::new().unwrap();
     {
         let db = open(&dir);
-        db.put(b"k", b"v").unwrap();
+        regolith::through_stalls(|| db.put(b"k", b"v")).unwrap();
         force_compaction(&db);
     }
     let sst_dir = dir.path().join("sst");
@@ -501,7 +501,7 @@ fn clean_close_then_reopen_has_stable_file_count() {
     {
         let db = open(&dir);
         for i in 0..300 {
-            db.put(format!("k_{:04}", i).as_bytes(), b"v").unwrap();
+            regolith::through_stalls(|| db.put(format!("k_{:04}", i).as_bytes(), b"v")).unwrap();
         }
         force_compaction(&db);
     }

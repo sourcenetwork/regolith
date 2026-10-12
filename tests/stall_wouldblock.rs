@@ -31,7 +31,7 @@ fn l0(db: &Db) -> u64 {
 /// Bring L0 to the stop with explicit flushes.
 fn stop(db: &Db) {
     for round in 0..2 {
-        db.put(format!("fill{round}").as_bytes(), b"v").unwrap();
+        regolith::through_stalls(|| db.put(format!("fill{round}").as_bytes(), b"v")).unwrap();
         db.flush().unwrap();
     }
     assert_eq!(l0(db), 2);
@@ -61,7 +61,7 @@ fn a_stopped_write_returns_its_wait_and_applies_nothing() {
         wait.is_ready() && again.is_ready(),
         "the clearing compaction told both"
     );
-    db.put(b"k", b"v").unwrap();
+    regolith::through_stalls(|| db.put(b"k", b"v")).unwrap();
 }
 
 /// A writer with a queue gets a wait recorded on it: the stall clearing on
@@ -83,7 +83,7 @@ fn a_wait_on_a_queue_is_ready_only_at_that_queues_poll() {
     assert!(!wait.is_ready(), "cleared is not delivered");
     assert_eq!(queue.poll(IoBudget::ALL).completed, 1);
     assert!(wait.is_ready());
-    db.put(b"k", b"v").unwrap();
+    regolith::through_stalls(|| db.put(b"k", b"v")).unwrap();
 }
 
 /// A blocking caller waits for the stall itself, on its own thread, through
@@ -132,7 +132,7 @@ fn with_no_worker_the_stall_step_runs_at_the_writers_poll() {
         queue.poll(IoBudget::ALL);
     }
     assert!(l0(&db) < before, "the polls ran the step");
-    db.put(b"k", b"v").unwrap();
+    regolith::through_stalls(|| db.put(b"k", b"v")).unwrap();
 }
 
 /// With no worker and inline compaction on, a stopped writer with no queue
@@ -149,7 +149,7 @@ fn with_no_worker_and_no_queue_the_writer_relieves_the_stall_inline() {
     )
     .unwrap();
     for i in 0..200u32 {
-        db.put(format!("k{i:04}").as_bytes(), &[1u8; 256]).unwrap();
+        regolith::through_stalls(|| db.put(format!("k{i:04}").as_bytes(), &[1u8; 256])).unwrap();
     }
     assert!(l0(&db) < 2);
 }
@@ -173,7 +173,7 @@ fn with_no_worker_and_inline_off_a_caller_clears_the_stall() {
     assert!(!wait.is_ready());
     db.compact_step().unwrap();
     assert!(wait.is_ready());
-    db.put(b"k", b"v").unwrap();
+    regolith::through_stalls(|| db.put(b"k", b"v")).unwrap();
 }
 
 /// A `commit_nowait` a stall stops resolves its ticket with the stall's wait

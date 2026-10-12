@@ -152,7 +152,7 @@ fn overwrite(spec: &ChildSpec, path: FlushPath) {
         .unwrap();
     if let FlushPath::StallStep = path {
         // The table that turns the slowdown on.
-        db.put(b"seed", b"v").expect("child: seed");
+        regolith::through_stalls(|| db.put(b"seed", b"v")).expect("child: seed");
         db.flush().expect("child: seed flush");
     }
     for i in 0..spec.ops {
@@ -165,7 +165,7 @@ fn overwrite(spec: &ChildSpec, path: FlushPath) {
         let mut batch = WriteBatch::new();
         batch.put(&key(i), &value(i));
         batch.put(&own_key(i), &value(i));
-        db.write(batch).expect("child: write");
+        regolith::through_stalls(|| db.write(batch.clone())).expect("child: write");
         acks.write_all(format!("{i}\n").as_bytes()).unwrap();
     }
     env.fail_tables(false);

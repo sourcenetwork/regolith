@@ -207,7 +207,7 @@ mod tests {
         let payload = vec![0u8; 512];
         for i in 0..32 {
             let key = format!("__flush_{}_{:04}", tag, i);
-            db.put(key.as_bytes(), &payload).unwrap();
+            crate::through_stalls(|| db.put(key.as_bytes(), &payload)).unwrap();
         }
     }
 
@@ -256,15 +256,15 @@ mod tests {
 
         for i in 0..200 {
             let k = format!("key_{:05}", i);
-            db.put(k.as_bytes(), k.as_bytes()).unwrap();
+            crate::through_stalls(|| db.put(k.as_bytes(), k.as_bytes())).unwrap();
         }
         force_flush(&db, "a");
         db.compact_range(None, None).wait().unwrap();
 
         // Add a few memtable-only writes after the compaction to
         // exercise the flush-before-capture path.
-        db.put(b"post_1", b"pv1").unwrap();
-        db.put(b"post_2", b"pv2").unwrap();
+        crate::through_stalls(|| db.put(b"post_1", b"pv1")).unwrap();
+        crate::through_stalls(|| db.put(b"post_2", b"pv2")).unwrap();
 
         let cp = Checkpoint::new(&db).unwrap();
         cp.create(tgt_dir.path()).wait().unwrap();
@@ -530,7 +530,7 @@ mod tests {
 
         for i in 0..50 {
             let k = format!("seed_{:03}", i);
-            db.put(k.as_bytes(), k.as_bytes()).unwrap();
+            crate::through_stalls(|| db.put(k.as_bytes(), k.as_bytes())).unwrap();
         }
 
         let stop = Arc::new(AtomicBool::new(false));
@@ -565,7 +565,7 @@ mod tests {
         let _total_writes = writer.join().unwrap();
 
         // Source survives and is still usable.
-        db.put(b"after_checkpoint", b"ok").unwrap();
+        crate::through_stalls(|| db.put(b"after_checkpoint", b"ok")).unwrap();
         assert_eq!(db.get(b"after_checkpoint").unwrap(), Some(b"ok".to_vec()));
 
         // Checkpoint opens cleanly and contains the seed data it
@@ -585,7 +585,7 @@ mod tests {
 
         for i in 0..100 {
             let k = format!("dur_{:04}", i);
-            db.put(k.as_bytes(), k.as_bytes()).unwrap();
+            crate::through_stalls(|| db.put(k.as_bytes(), k.as_bytes())).unwrap();
         }
         force_flush(&db, "x");
 

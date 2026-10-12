@@ -2641,7 +2641,7 @@ mod tests {
                 break;
             }
             let k = format!("k{i:04}");
-            plain.put(k.as_bytes(), &payload).unwrap();
+            crate::through_stalls(|| plain.put(k.as_bytes(), &payload)).unwrap();
         }
         crate::tests::wait_for_l0_files(plain, 2);
     }

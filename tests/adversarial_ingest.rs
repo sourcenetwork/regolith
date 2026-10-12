@@ -173,8 +173,10 @@ fn wal_disabled_writers_in_a_group_do_not_break_recovery() {
                 ..regolith::WriteOptions::default()
             };
             for i in 0..500usize {
-                db.put_opt(&wo, format!("d{w}_{i:04}").as_bytes(), b"v")
-                    .unwrap();
+                regolith::through_stalls(|| {
+                    db.put_opt(&wo, format!("d{w}_{i:04}").as_bytes(), b"v")
+                })
+                .unwrap();
             }
         }));
     }
