@@ -11,13 +11,8 @@
 
 use std::io;
 
-use crate::column_family::CF_PREFIX_LEN;
+use crate::column_family::callers_key;
 use crate::options::MergeOperator;
-
-/// The key the caller wrote, from the engine's key for it.
-fn callers_key(prefixed: &[u8]) -> &[u8] {
-    prefixed.get(CF_PREFIX_LEN..).unwrap_or(prefixed)
-}
 
 /// [`MergeOperator::full_merge`] for the entry the engine keys `prefixed`.
 pub(crate) fn full_merge(

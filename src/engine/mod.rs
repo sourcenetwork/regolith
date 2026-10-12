@@ -15,6 +15,7 @@ pub(crate) mod compaction_backoff;
 pub(crate) mod compaction_gate;
 pub(crate) mod disk_check;
 pub(crate) mod filter_block;
+pub(crate) mod filter_call;
 mod flush;
 mod foreground;
 pub(crate) mod index_block;

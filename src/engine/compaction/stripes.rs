@@ -19,8 +19,8 @@ use crate::engine::internal_key::{
     VALUE_TYPE_DELETION, VALUE_TYPE_MERGE, VALUE_TYPE_VALUE, decode_internal_key,
     encode_internal_key,
 };
-use crate::engine::merge_call;
 use crate::engine::range_tombstone::RangeTombstoneSet;
+use crate::engine::{filter_call, merge_call};
 use crate::options::{CompactionDecision, CompactionFilter, MergeOperator};
 
 /// An internal key and its value.
@@ -116,7 +116,7 @@ impl<'a> Stripes<'a> {
         if value_type != VALUE_TYPE_VALUE {
             return;
         }
-        match filter.filter(self.level, user_key, value) {
+        match filter_call::filter_value(filter, self.level, user_key, value) {
             CompactionDecision::Keep => {}
             CompactionDecision::Change(changed) => *value = changed,
             CompactionDecision::Remove => {

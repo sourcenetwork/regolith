@@ -61,9 +61,13 @@ pub struct FlushJobInfo {
     pub file_size: u64,
     /// Number of point entries in the flushed SSTable.
     pub num_entries: u64,
-    /// Smallest user key in the file.
+    /// Lower bound of the file in storage order. A table holds entries of
+    /// every column family, so this is not a key as the caller wrote it:
+    /// it is the 4-byte big-endian id of a column family, then the
+    /// caller's key in that family. Not a key to read back with.
     pub smallest_key: Vec<u8>,
-    /// Largest user key in the file.
+    /// Upper bound of the file in storage order, in the form of
+    /// [`FlushJobInfo::smallest_key`].
     pub largest_key: Vec<u8>,
     /// Wall-clock duration of the flush, from memtable rotation
     /// through manifest apply.

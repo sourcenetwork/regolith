@@ -73,6 +73,31 @@ pub enum CompactionDecision {
 /// They must not read from the database (would deadlock) and should
 /// avoid blocking.
 ///
+/// # What the filter is shown
+///
+/// The filter is handed the key, and the bounds of a range delete, as
+/// the caller wrote them: the bytes passed to `put` or `delete_range`,
+/// with nothing in front of them. The column family is not part of the
+/// key, so one key in two column families reaches the filter as the same
+/// bytes.
+///
+/// It is shown the caller's entries and nothing else. The database keeps
+/// entries of its own beside them (the list of column families) and
+/// writes range deletes of its own (dropping a column family deletes its
+/// whole range): the filter is never asked about either, so a filter
+/// that removes everything it is shown removes the caller's data only.
+///
+/// # How often it runs
+///
+/// The filter is asked about an entry once for each compaction pass that
+/// rewrites it. That is no fixed number: an entry no pass has rewritten
+/// yet has not been shown at all, a manual [`crate::Db::compact_range`]
+/// carries its tables down one level at a time and asks once a level,
+/// and every later pass over the entry asks again. So a decision must
+/// stand however often it is taken: asked again about a value it left,
+/// the filter must leave that value as it is. Count on being asked
+/// eventually, never on being asked once.
+///
 /// # Snapshot isolation
 ///
 /// Filters run whether or not a [`crate::Snapshot`] is live, so a filter
@@ -82,14 +107,17 @@ pub enum CompactionDecision {
 /// [`crate::TtlCompactionFilter`] removes only expired values, and an
 /// expired value already reads as absent.
 pub trait CompactionFilter: Send + Sync + 'static {
-    /// Inspect a point entry. Called once per surviving
-    /// `(user_key, value)` pair during compaction; versions no reader
-    /// can see are dropped first and never reach the filter.
+    /// Inspect the value of one of the caller's entries: `key` is the key
+    /// as the caller wrote it. Called for each value a compaction pass
+    /// keeps; versions no reader can see are dropped first and never
+    /// reach the filter. `level` is the level the pass writes.
     fn filter(&self, level: usize, key: &[u8], value: &[u8]) -> CompactionDecision;
 
-    /// Inspect a range tombstone. Default implementation keeps every
-    /// range tombstone. `CompactionDecision::Change` is treated as
-    /// `Keep` for range tombstones (there's no "value" to rewrite).
+    /// Inspect a range delete the caller made, by the bounds the caller
+    /// passed. Default implementation keeps every range delete.
+    /// `CompactionDecision::Change` is treated as `Keep` for range
+    /// deletes (there's no "value" to rewrite). Removing one brings back
+    /// every value it covered that compaction has not dropped yet.
     fn filter_range_delete(&self, level: usize, start: &[u8], end: &[u8]) -> CompactionDecision {
         let _ = (level, start, end);
         CompactionDecision::Keep

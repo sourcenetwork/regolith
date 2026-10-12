@@ -1389,7 +1389,12 @@ fn perform_compaction_to(
     if let Some(filter) = opts.compaction_filter.as_ref() {
         merged_range_tombstones.retain(|rt| {
             !matches!(
-                filter.filter_range_delete(target_level, &rt.start, &rt.end),
+                super::filter_call::filter_range_delete(
+                    filter.as_ref(),
+                    target_level,
+                    &rt.start,
+                    &rt.end
+                ),
                 crate::options::CompactionDecision::Remove
             )
         });
