@@ -1235,6 +1235,9 @@ elle-matrix:
     # get_for_update, the one read that level leaves unvalidated and
     # SnapshotIsolation validates.
     check pessimistic-rc      list-append read-committed     --isolation read-committed --threads 8 --txns 50 --keys 4 --seed 2
+    # The same level over registers: a lock that times out aborts its
+    # transaction, and a value an aborted transaction wrote must never be read.
+    check pessimistic-rc-rw   rw-register read-committed     --isolation read-committed --threads 8 --txns 50 --keys 4 --seed 3
     check pessimistic-hotkey  list-append read-committed     --isolation read-committed --threads 8 --txns 50 --keys 1 --seed 1
     # Serializable validates the whole read set, so the strongest model
     # Elle offers must hold.
@@ -1255,6 +1258,35 @@ elle-matrix:
     # key both commit, which first-committer-wins forbids.
     check defra-level         list-append strict-serializable --isolation defra-level --threads 8 --txns 60 --keys 4 --seed 16
     check defra-level-rw      rw-register strict-serializable --isolation defra-level --threads 8 --txns 60 --keys 4 --seed 17
+    # DefraLevel with a key classifier (`--shape`, README.md). In the
+    # `classified` shape every transaction also stores a content-addressed
+    # block it read as missing, adds a key to a commutative prefix it scanned
+    # and appends to a log. The classes say none of that conflicts, and none
+    # of it may loosen the point operations beside it: the strongest model
+    # must hold, and elle-gen itself fails the row when a commit left a head
+    # without its log entry.
+    check defra-classified    list-append strict-serializable --isolation defra-level --shape classified --threads 8 --txns 60 --keys 4 --seed 18
+    check defra-classified-rw rw-register strict-serializable --isolation defra-level --shape classified --threads 8 --txns 60 --keys 4 --seed 19
+    # Commit-ordered appends: a key is a log, an append is
+    # `Transaction::append` and a read is the log in one snapshot. An append
+    # is never validated at any level and positions follow commit order, so
+    # every level must hold the strongest model, the pessimistic flavour too.
+    check defra-appends       list-append strict-serializable --isolation defra-level --shape appends --threads 8 --txns 60 --keys 4 --seed 20
+    check si-appends          list-append strict-serializable --isolation snapshot-isolation --shape appends --threads 8 --txns 60 --keys 4 --seed 21
+    check pessimistic-appends list-append strict-serializable --isolation read-committed --shape appends --threads 8 --txns 60 --keys 4 --seed 22
+    # Projected reads: a key is one part of a document, an append is an
+    # operand on the part and a read is `get_parts` naming it. Two keys share
+    # a document, so a reader of one part commits beside an append to the
+    # other, and is refused by an append to its own.
+    check defra-parts         list-append strict-serializable --isolation defra-level --shape parts --threads 8 --txns 60 --keys 4 --seed 23
+    # A prefix scan: every read is one validated scan of all the keys,
+    # recorded as a read of each. Scan-then-write is the shape of write skew,
+    # which a validated scan refuses at every level. The rw-register row has
+    # keys enough that most writes create one: a key that appears under a
+    # scan, which only a validated range sees.
+    check defra-scan          list-append strict-serializable --isolation defra-level --shape scan --threads 8 --txns 60 --keys 4 --seed 24
+    check defra-scan-phantoms rw-register strict-serializable --isolation defra-level --shape scan --threads 8 --txns 60 --keys 64 --seed 25
+    check repeatable-read-scan list-append strict-serializable --isolation repeatable-read --shape scan --threads 8 --txns 60 --keys 4 --seed 26
     exit $fail
 
 # ---------- portability ----------
