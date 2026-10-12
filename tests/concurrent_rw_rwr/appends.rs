@@ -38,13 +38,13 @@ use std::time::Instant;
 
 use regolith::{
     Db, IsolationLevel, KeyClass, KeyClassifier, LogLayout, OptimisticTransactionDb,
-    TransactionError, WouldBlock,
+    TransactionError,
 };
 
 use super::support::{Findings, Rendezvous, Storage, table_lookups};
 use super::{
-    Flavour, HANDOFF, RETRY_DEADLINE, StopOnDrop, THREADS, back_off, commit_with_retry, decode,
-    each_case, encode, pessimistic, with_forced_writes,
+    Flavour, HANDOFF, StopOnDrop, THREADS, back_off, commit_with_retry, decode, each_case, encode,
+    pessimistic, with_forced_writes,
 };
 
 const ROUNDS: usize = 3;
@@ -372,29 +372,20 @@ const AUDITS: u64 = 20;
 const BURST: u64 = 32;
 
 /// Append `entry` in a transaction of its own and return the block lookups
-/// its commit made. A write stall stops a commit before it applied anything,
-/// so the append is made again once the stall has cleared; any other refusal
-/// of an append fails the test.
-fn append_through_stalls(
+/// its commit made. Nothing refuses an append, so a refusal fails the test.
+fn append_alone(
     db: &impl Flavour,
     level: IsolationLevel,
     log: &Arc<dyn LogLayout>,
     entry: &[u8],
 ) -> u64 {
-    let deadline = Instant::now() + RETRY_DEADLINE;
-    loop {
-        let tx = db.begin_at(level);
-        tx.append(log, entry, None).unwrap();
-        match table_lookups(|| tx.commit()) {
-            (Ok(_), lookups) => return lookups,
-            (Err(TransactionError::WouldBlock(WouldBlock::Stall(stall))), _) => stall.wait(),
-            (Err(e), _) => panic!("{level:?}: an append was refused: {e}"),
-        }
-        assert!(
-            Instant::now() < deadline,
-            "{level:?}: an append did not commit within {RETRY_DEADLINE:?}"
-        );
+    let tx = db.begin_at(level);
+    tx.append(log, entry, None).unwrap();
+    let (result, lookups) = table_lookups(|| tx.commit());
+    if let Err(e) = result {
+        panic!("{level:?}: an append was refused: {e}");
     }
+    lookups
 }
 
 /// One audit: a transaction reads the head, `release` lets the appenders go
@@ -460,7 +451,7 @@ fn a_snapshot_sees_a_dense_prefix(db: &impl Flavour, level: IsolationLevel, stor
                     }
                     idle = 0;
                     let entry = format!("free {t} {n}");
-                    let lookups = append_through_stalls(db, level, log, entry.as_bytes());
+                    let lookups = append_alone(db, level, log, entry.as_bytes());
                     appended.fetch_add(1, Ordering::AcqRel);
                     if lookups > 0 {
                         reached_tables.store(true, Ordering::Release);
