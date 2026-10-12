@@ -80,12 +80,6 @@ cov:
 test-fault:
     cargo nextest run --test fault_smoke --retries 0
 
-# The same file under the profile's retry setting. Nothing in it is
-# `#[ignore]`d, so this runs the tests `test-fault` runs.
-
-test-fault-slow:
-    cargo nextest run --test fault_smoke
-
 # Process-crash recovery: kill -9 at every point in the write path, each in
 # a child process the harness kills at a byte-exact point. Linux only.
 
