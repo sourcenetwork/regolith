@@ -20,6 +20,14 @@
 //! was written before the fix (a nudge that finds its waiter already nudged
 //! lowers the marker) and must fail: the drain passes once more for every
 //! release.
+//!
+//! The second model is the same defect with nobody queued: a thread takes
+//! the drain role, its pass finds the queue empty, and another thread keeps
+//! letting a permit go and taking it back. A release that finds the role
+//! taken leaves only its request to wake the front, and a drain whose pass
+//! found nobody queued drops that request, so it runs one pass. Its
+//! calibration writes the release the old way, raising the dirty bit, and
+//! must fail.
 
 use core::cell::Cell;
 use core::task::Waker;
@@ -296,6 +304,124 @@ pub fn calibration_a_marker_lowered_on_a_pending_nudge_keeps_the_drain_passing()
             assert!(
                 passes <= MOST_PASSES,
                 "the drain ran {passes} passes for the waiter that holds it"
+            );
+        },
+    );
+}
+
+/// How many times the other thread lets its permit go in the empty-queue
+/// models.
+const RELEASES: usize = 3;
+
+/// A waiter gives up, and its withdrawal takes the drain role; the pass
+/// finds nobody queued. Meanwhile the thread that holds the other permit
+/// lets it go and takes it back [`RELEASES`] times. The drain runs one
+/// pass, whatever those releases do, and no permit is lost.
+pub fn a_drain_that_found_nobody_queued_ends_while_another_thread_releases() {
+    explore(
+        "a_drain_that_found_nobody_queued_ends_while_another_thread_releases",
+        3,
+        100,
+        1,
+        |witnessed| {
+            let sem = Arc::new(RawSemaphore::new(2));
+            assert!(sem.try_acquire(1), "the other thread's permit");
+            let counted = Counted {
+                sem: &sem,
+                passes: Cell::new(0),
+                most: Cell::new(0),
+            };
+            // A request for both permits queues behind the one that is out.
+            let mut contend = Contend::new();
+            assert!(
+                contend.poll(&counted, 2, Waker::noop()).is_pending(),
+                "one permit is out"
+            );
+            let other = {
+                let sem = Arc::clone(&sem);
+                thread::spawn(move || {
+                    for _ in 0..RELEASES {
+                        sem.release(1);
+                        // Lets the drain run between two releases without
+                        // spending one of the model's few preemptions.
+                        thread::yield_now();
+                        assert!(sem.try_acquire(1), "its permit is free again");
+                    }
+                })
+            };
+            // The waiter gives up while the other thread hammers.
+            counted.take_most();
+            contend.cancel(&counted, 2);
+            let passes = counted.take_most();
+            if passes == 1 {
+                // This thread held the drain role over an empty queue.
+                witnessed.fetch_add(1, StdOrdering::Relaxed);
+            }
+            assert!(
+                passes <= 1,
+                "the drain ran {passes} passes over a queue with nobody in it"
+            );
+            other.join().expect("other");
+            sem.release(1);
+            assert_eq!(sem.available(), 2, "a permit was lost or made up");
+        },
+    );
+}
+
+/// A release written the way it was before the drain was bounded: when it
+/// finds the drain role taken, it raises the dirty bit. The thread that
+/// holds the role over an empty queue then passes once more for each
+/// release that lands before its exit.
+pub fn calibration_a_release_that_dirties_keeps_an_empty_drain_passing() {
+    const DRAINING: usize = 1;
+    const DIRTY: usize = 1 << 1;
+    const QUEUED: usize = 1 << 2;
+    explore(
+        "calibration_a_release_that_dirties_keeps_an_empty_drain_passing",
+        3,
+        0,
+        0,
+        |_witnessed| {
+            // A thread holds the drain role; the waiter that raised QUEUED
+            // is gone, so its pass will find nobody.
+            let state = Arc::new(AtomicUsize::new(DRAINING | QUEUED));
+            let other = {
+                let state = Arc::clone(&state);
+                thread::spawn(move || {
+                    for _ in 0..RELEASES {
+                        // A release that sees QUEUED up asks for a pass.
+                        // The defect: with the role taken, asking is
+                        // raising the dirty bit.
+                        if state.load(Ordering::Acquire) & QUEUED != 0 {
+                            state.fetch_or(DIRTY, Ordering::AcqRel);
+                        }
+                        thread::yield_now();
+                    }
+                })
+            };
+            let mut passes = 0;
+            loop {
+                state.fetch_and(!DIRTY, Ordering::AcqRel);
+                // The pass: nobody is queued, so QUEUED may come down.
+                passes += 1;
+                let seen = state.load(Ordering::Acquire);
+                if seen & DIRTY == 0
+                    && state
+                        .compare_exchange(
+                            seen,
+                            seen & !(DRAINING | QUEUED),
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_ok()
+                {
+                    break;
+                }
+            }
+            other.join().expect("other");
+            assert!(
+                passes <= 1,
+                "the drain ran {passes} passes over a queue with nobody in it"
             );
         },
     );
