@@ -2043,9 +2043,11 @@ impl RegolithEngine {
     /// explicit flush and a close write memtables out the same way.
     pub(crate) fn flush_active_memtable(&self) -> std::io::Result<()> {
         self.ensure_writable()?;
-        self.drain_memtables(ActiveFlush::Always)?;
+        let drained = self.drain_memtables(ActiveFlush::Always);
+        // A failed drain too: a stopped writer its flush held off looks
+        // again (`StallSignal`, relief handed back).
         self.refresh_stall_level();
-        Ok(())
+        drained
     }
 
     /// The write-stall admission every write passes before it applies
@@ -2138,7 +2140,7 @@ impl RegolithEngine {
             }
         }
         Err(crate::Error::WouldBlock(crate::WouldBlock::Stall(
-            self.stall_signal.wait(self.io(), queue, reason),
+            self.stall_signal.wait(self.io(), queue, reason, None),
         )))
     }
 
@@ -2159,6 +2161,7 @@ impl RegolithEngine {
             let Some((reason, true)) = self.stall_state() else {
                 break Ok(());
             };
+            let seen = self.stall_signal.progress();
             match self.run_one_background_step(false)? {
                 CompactionOutcome::DidWork => {
                     idle = 0;
@@ -2167,11 +2170,12 @@ impl RegolithEngine {
                         break Err(crate::Error::Busy(reason));
                     }
                 }
-                // Another thread holds the inputs: that thread relieves the
-                // stop, and the write waits for it as any stopped write does.
+                // Another thread holds the inputs: the write waits until that
+                // thread's work is done and looks again, as any stopped write
+                // does (`StallSignal`, relief handed back).
                 CompactionOutcome::Contended => {
                     break Err(crate::Error::WouldBlock(crate::WouldBlock::Stall(
-                        self.stall_signal.wait(self.io(), None, reason),
+                        self.stall_signal.wait(self.io(), None, reason, Some(seen)),
                     )));
                 }
                 // Idle is ambiguous under concurrency: "nothing to compact
@@ -2405,7 +2409,14 @@ impl RegolithEngine {
         // only when the background has fallen a whole memtable behind.
         if let Some(room) = room {
             while self.view.load().frozen.len() >= room {
-                if !self.flush_oldest_frozen(&self.flusher.flushing.lock())? {
+                let flushed = self.flush_oldest_frozen(&self.flusher.flushing.lock());
+                // A failed flush too, once its exclusion is released: a
+                // stopped writer it held off looks again (`StallSignal`,
+                // relief handed back).
+                if flushed.is_err() {
+                    self.refresh_stall_level();
+                }
+                if !flushed? {
                     break;
                 }
             }
@@ -2879,6 +2890,17 @@ impl RegolithEngine {
 
     /// Drop all data in the engine.
     pub(crate) fn drop_all(&self) -> std::io::Result<()> {
+        let dropped = self.drop_all_excluded();
+        // Once every exclusion the drop held is released, failed or not: a
+        // stopped writer it held off looks again (`StallSignal`, relief
+        // handed back). On success nothing is left for any threshold to
+        // count.
+        self.refresh_stall_level();
+        dropped
+    }
+
+    /// [`Self::drop_all`] under its exclusions.
+    fn drop_all_excluded(&self) -> std::io::Result<()> {
         self.ensure_writable()?;
         // Exclude background compaction for the whole drop, as
         // `compact_range`, `ingest_external_files` and `checkpoint_capture`
@@ -2937,9 +2959,6 @@ impl RegolithEngine {
         })?;
         remove_obsolete_wal_files(&*self.env, &self.wal_dir, &wal_path)
             .map_err(|e| std::io::Error::new(e.kind(), format!("drop_all removing wals: {e}")))?;
-
-        // Nothing is left for any threshold to count.
-        self.refresh_stall_level();
         Ok(())
     }
 

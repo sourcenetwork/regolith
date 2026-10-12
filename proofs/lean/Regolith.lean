@@ -88,6 +88,11 @@ import Regolith.ManifestSeal
 -- tag covers and writes a sealed MANIFEST last. Backs
 -- `proofs/tla/BackupSeal.tla`.
 import Regolith.BackupSeal
+-- Phase 7 integration: a foreground job that held the compaction gate,
+-- with no worker and inline compaction on, relieves the stop it kept
+-- stopped writers from relieving, so no writer waits on a stall nobody will
+-- land. Backs `proofs/tla/StallRelief.tla`.
+import Regolith.StallRelief
 
 -- 4.6, 4.10: the pessimistic lock table. One holder per key, a retired
 -- table entry has no user, a waiter the lock may serve is told through its
