@@ -720,6 +720,15 @@ tla:
     check MC_StallRelief_Red_NoLatchLand               RED NoWaitOnceLatched
     check MC_StallRelief_Red_NoLatchRecheck            RED NoWaitOnceLatched
     check MC_StallRelief_Red_NoRotateRefresh           RED NoStrandedWait
+    # E36: a write stopped while its relief's failure is recorded is told
+    # that failure, so recording one lands the stall's unit (stored first,
+    # read again by a writer once registered, while a stop still holds), and
+    # a write that was already waiting is told the same. Lean:
+    # no_wait_once_failing, no_fail_land_strands_a_waiter,
+    # no_fail_recheck_strands_a_waiter.
+    check MC_StallRelief_Green_ReliefFails             GREEN
+    check MC_StallRelief_Red_NoFailLand                RED NoWaitOnceFailing
+    check MC_StallRelief_Red_NoFailRecheck             RED NoWaitOnceFailing
     # regolith::sync's locks after D49: barging with bounded bypass, for
     # Mutex, Semaphore and ReentrantMutex. Lean: Regolith/Sync.lean,
     # mutual_exclusion, bounded_bypass, owed_exclusive.

@@ -721,7 +721,7 @@ impl RegolithEngine {
             Arc::clone(&cached_stall_level),
         ));
         let compaction_in_progress = Arc::new(Mutex::new(HashSet::new()));
-        let background_health = Arc::new(BackgroundHealth::default());
+        let background_health = Arc::new(BackgroundHealth::relieving(Arc::clone(&stall_signal)));
         // `max_background_compactions == 0` starts no worker, which is
         // how a single-threaded target opens at all. A platform that
         // cannot spawn a worker it was asked for fails the open here
@@ -908,7 +908,7 @@ impl RegolithEngine {
             Arc::clone(&cached_stall_level),
         ));
         let wal_id = next_wal_id(version.next_file_id, &wal_files);
-        let background_health = Arc::new(BackgroundHealth::default());
+        let background_health = Arc::new(BackgroundHealth::relieving(Arc::clone(&stall_signal)));
         // Never flushes: a read-only engine refuses every write before one
         // could seal a memtable.
         let flusher = Arc::new(flush::Flusher::new(
@@ -2132,15 +2132,8 @@ impl RegolithEngine {
     /// A write a stop threshold stopped: the wait for the stop to clear, or
     /// the error that says waiting would not end.
     fn stopped(&self, reason: &'static str) -> Result<(), crate::Error> {
-        // The work that relieves this stop keeps failing: a wait would not
-        // end, so the failure is the answer, OS error included.
-        let relief = if reason == STOP_TOO_MANY_MEMTABLES {
-            Job::Flush
-        } else {
-            Job::Compaction
-        };
-        if let Some(failure) = self.background_health.failing(relief) {
-            return Err(failure.to_error());
+        if let Some(failure) = self.failing_relief(reason) {
+            return Err(failure);
         }
         let queue = self.io().current_queue();
         if !self.has_worker && self.inline_compaction {
@@ -2155,9 +2148,27 @@ impl RegolithEngine {
         Err(self.stall_wait(queue, reason, None))
     }
 
+    /// The failure a write stopped for `reason` is told while the work that
+    /// relieves that stop is failing: its last attempt failed and none has
+    /// succeeded since ([`BackgroundHealth::failing`]). A wait would not end
+    /// while it does, so the failure is the answer, OS error included. The
+    /// one answer for a write that is stopped now and for one that was
+    /// already waiting ([`Self::stall_wait`]).
+    fn failing_relief(&self, reason: &'static str) -> Option<crate::Error> {
+        let relief = if reason == STOP_TOO_MANY_MEMTABLES {
+            Job::Flush
+        } else {
+            Job::Compaction
+        };
+        self.background_health
+            .failing(relief)
+            .map(|failure| failure.to_error())
+    }
+
     /// What a stopped write returns: the wait for the stall `reason` to
-    /// clear, or the latch when the engine latched meanwhile (E35). `queue`
-    /// and `seen` are [`StallSignal::wait`]'s.
+    /// clear, or what says the wait would not end: the latch when the engine
+    /// latched meanwhile (E35), the relief's failure when it failed
+    /// meanwhile (E36). `queue` and `seen` are [`StallSignal::wait`]'s.
     fn stall_wait(
         &self,
         queue: Option<Arc<io::shared::QueueShared>>,
@@ -2172,6 +2183,17 @@ impl RegolithEngine {
         if self.write_latched.load(Ordering::Acquire) {
             self.stall_signal.land();
             return self.latched_error().into();
+        }
+        // The same for a relief that failed: the failure is stored before
+        // the unit is landed (`BackgroundHealth::record_failure`). Read as
+        // a write that arrives now reads it, only while a stop still holds:
+        // one that cleared meanwhile landed the wait above, and the write,
+        // run again, goes in.
+        if let Some((reason, true)) = self.stall_state()
+            && let Some(failure) = self.failing_relief(reason)
+        {
+            self.stall_signal.land();
+            return failure;
         }
         crate::Error::WouldBlock(crate::WouldBlock::Stall(wait))
     }
