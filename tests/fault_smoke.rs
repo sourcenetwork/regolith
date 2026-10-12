@@ -23,6 +23,8 @@
 
 mod common;
 
+#[path = "fault_smoke/cut_record.rs"]
+mod cut_record;
 #[path = "fault_smoke/open_variadic.rs"]
 mod open_variadic;
 

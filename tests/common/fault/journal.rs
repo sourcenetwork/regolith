@@ -4,12 +4,32 @@
 //! `preload_shim.rs` for the format). Parsing resolves every record's file
 //! descriptor back to a path by replaying the `open`/`close` stream in
 //! sequence order, so downstream code never has to track descriptors.
+//!
+//! # A journal is whole records or it is refused
+//!
+//! Every record is [`RECORD_BYTES`] long, a length the shim chose so that a
+//! kill cannot cut one (`preload_shim.rs` says how). A journal therefore
+//! holds whole records and nothing else, and the parser holds it to that:
+//! a line of any other length, a line that is not eight fields, and bytes
+//! after the last line end each count in [`Journal::malformed`], which
+//! refuses the journal. Nothing that is left of a cut record is ever read as
+//! a record: its last number or its path may be missing digits or letters,
+//! and a write of 100 bytes would be replayed as a write of 1.
+//!
+//! An operation whose record is missing because the child died first is one
+//! that was in flight: the kernel may have finished the call, but the thread
+//! never left the shim, so the engine never saw the call return and told no
+//! caller anything that rests on it. A power cut may undo such an operation,
+//! and the reconstruction, which replays only what is recorded, does.
 
 use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+
+/// The length of every record, line end included. The shim's `RECORD`.
+pub const RECORD_BYTES: usize = 512;
 
 /// Raw `open(2)` flag bits the reconstruction cares about.
 pub const O_CREAT: i64 = 0o100;
@@ -151,13 +171,18 @@ impl Journal {
             path: String,
         }
         let mut raw: Vec<Raw> = Vec::new();
-        let mut malformed = 0usize;
-        for line in text.lines() {
-            if line.is_empty() {
-                continue;
-            }
-            let mut f = line.splitn(8, '\t');
+        // What follows the last line end is a record that was cut.
+        let (whole, cut) = match text.rfind('\n') {
+            Some(end) => text.split_at(end + 1),
+            None => ("", text),
+        };
+        let mut malformed = usize::from(!cut.is_empty());
+        for line in whole.lines() {
             let parsed = (|| {
+                if line.len() + 1 != RECORD_BYTES {
+                    return None;
+                }
+                let mut f = line.trim_end_matches('\0').split('\t');
                 let seq: u64 = f.next()?.parse().ok()?;
                 let tid: i64 = f.next()?.parse().ok()?;
                 let tag = *f.next()?.as_bytes().first()?;
@@ -165,7 +190,10 @@ impl Journal {
                 let a: i64 = f.next()?.parse().ok()?;
                 let b: i64 = f.next()?.parse().ok()?;
                 let ret: i64 = f.next()?.parse().ok()?;
-                let path = f.next().unwrap_or("").to_string();
+                let path = f.next()?.to_string();
+                if f.next().is_some() {
+                    return None;
+                }
                 Some(Raw {
                     seq,
                     tid,
