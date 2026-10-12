@@ -54,7 +54,9 @@
 //!   only the one that stepped it ([`Job::ready`]): a queue whose claim lost
 //!   while the job was being stepped dropped it from its line, and the owner
 //!   of the queue that parked it may never poll again. Whichever owner polls
-//!   next steps it.
+//!   next steps it. They are told while the job is free to be claimed: a
+//!   wait that ends while the thread that parked the job still holds its
+//!   claim tells them when that thread lets go.
 
 #![allow(unsafe_code)]
 
@@ -282,9 +284,24 @@ impl Job {
     /// A parked job may go on: tell the queue that stepped it, and every
     /// other queue registered on it. Whichever of their owners polls next
     /// claims the job and steps it.
+    ///
+    /// The wake may come before the job finished parking: the thread that
+    /// stepped it registered its waker, looked again, and has not given the
+    /// claim up yet. A queue told then would try the claim, lose, and drop
+    /// the job from its line, and nobody would tell it again. So a wake
+    /// that finds the job claimed leaves the telling to the moment its
+    /// holder lets go ([`Self::watch`], whose handshake that is): when it
+    /// parks the job the queues are told here, and when it lands it they
+    /// learn that.
     fn ready(self: &Arc<Self>, stepper: Option<&Arc<QueueShared>>) {
         if self.is_done() {
             // Run to its end since, by a blocking caller or another poll.
+            return;
+        }
+        if !self.is_runnable() && self.watch(&later_waker(self, stepper)) {
+            return;
+        }
+        if self.is_done() {
             return;
         }
         if let Some(queue) = stepper {
@@ -424,6 +441,33 @@ impl Wake for Unpark {
             job.ready(self.queue.upgrade().as_ref());
         }
     }
+}
+
+/// Tells the queues a parked job may go on, once the thread that still held
+/// its claim when the wake came has let go ([`Job::ready`]).
+struct Later {
+    job: Weak<Job>,
+    stepper: Option<Weak<QueueShared>>,
+}
+
+impl Wake for Later {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        if let Some(job) = self.job.upgrade() {
+            let stepper = self.stepper.as_ref().and_then(Weak::upgrade);
+            job.ready(stepper.as_ref());
+        }
+    }
+}
+
+fn later_waker(job: &Arc<Job>, stepper: Option<&Arc<QueueShared>>) -> Waker {
+    Waker::from(Arc::new(Later {
+        job: Arc::downgrade(job),
+        stepper: stepper.map(Arc::downgrade),
+    }))
 }
 
 /// The waker `queue`'s poll steps `job` with.

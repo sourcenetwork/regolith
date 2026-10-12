@@ -182,3 +182,14 @@ fn a_queue_off_the_list_when_the_job_lands_is_told_once() {
 fn a_wake_that_registers_again_blindly_loses_a_landing() {
     park::a_wake_that_registers_again_blindly_loses_a_landing();
 }
+
+#[test]
+fn a_wake_that_comes_before_the_park_tells_the_queues_with_the_job_free() {
+    park::a_wake_that_comes_before_the_park_tells_the_queues_with_the_job_free();
+}
+
+#[test]
+#[should_panic(expected = "a queue was told the job may go on while it was still claimed")]
+fn a_wake_that_tells_at_once_reaches_a_queue_with_the_job_claimed() {
+    park::a_wake_that_tells_at_once_reaches_a_queue_with_the_job_claimed();
+}

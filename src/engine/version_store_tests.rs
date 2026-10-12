@@ -1,24 +1,30 @@
 //! The version store's step: sections run alone and in order, by whichever
 //! thread holds the step, and a caller's borrows and panics stay its own.
 
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
-use tempfile::TempDir;
-
 use super::*;
 use crate::engine::memtable::{MemTable, MemTableConfig};
 use crate::engine::read_view::ReadView;
+use crate::engine::sstable::MetadataPolicy;
+use crate::env::{Env, MemEnv};
 
-fn store() -> (TempDir, VersionStore) {
-    let dir = tempfile::tempdir().unwrap();
-    let sst_dir = dir.path().join("sst");
-    std::fs::create_dir_all(&sst_dir).unwrap();
-    let versions = VersionSet::open(dir.path(), &sst_dir).unwrap();
-    (dir, VersionStore::new(versions))
+/// A version store whose manifest is in memory: these tests are about the
+/// step, not about the manifest's files, and miri, which they run under,
+/// does not sync a directory.
+fn store() -> VersionStore {
+    let env: Arc<dyn Env> = Arc::new(MemEnv::new());
+    let db_dir = Path::new("version-store-tests");
+    let sst_dir = db_dir.join("sst");
+    env.create_dir_all(&sst_dir).unwrap();
+    let versions =
+        VersionSet::open_with_policy(&env, db_dir, &sst_dir, MetadataPolicy::Pinned, None).unwrap();
+    VersionStore::new(versions)
 }
 
 fn with_view(store: &VersionStore) -> Arc<ReadViewCell> {
@@ -33,7 +39,7 @@ fn with_view(store: &VersionStore) -> Arc<ReadViewCell> {
 
 #[test]
 fn a_section_returns_what_it_computed_from_its_callers_stack() {
-    let (_dir, store) = store();
+    let store = store();
     let mut seen = Vec::new();
     let first = store.run(|versions| {
         // V4: the section borrows from this frame.
@@ -46,7 +52,7 @@ fn a_section_returns_what_it_computed_from_its_callers_stack() {
 
 #[test]
 fn file_ids_are_taken_once_each_and_recorded() {
-    let (_dir, store) = store();
+    let store = store();
     let first = store.take_file_id().unwrap();
     let second = store.take_file_id().unwrap();
     assert_eq!(second, first + 1);
@@ -66,7 +72,7 @@ fn concurrent_sections_run_alone_and_none_is_lost() {
     const EACH: u64 = 50;
     #[cfg(miri)]
     const EACH: u64 = 4;
-    let (_dir, store) = store();
+    let store = store();
     let cell = with_view(&store);
     let first = store.current().next_file_id;
     let inside = AtomicBool::new(false);
@@ -117,7 +123,7 @@ fn concurrent_sections_run_alone_and_none_is_lost() {
 /// holds the step is run by that thread, not by its caller.
 #[test]
 fn a_section_pushed_while_the_step_is_held_is_run_by_its_holder() {
-    let (_dir, store) = store();
+    let store = store();
     let (entered, is_inside) = mpsc::channel();
     let (leave, may_leave) = mpsc::channel::<()>();
     let ran_on = AtomicU64::new(0);
@@ -172,7 +178,7 @@ fn a_section_pushed_while_the_step_is_held_is_run_by_its_holder() {
 /// afterwards.
 #[test]
 fn a_panic_in_a_section_is_its_callers_and_frees_the_step() {
-    let (_dir, store) = store();
+    let store = store();
     let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         store.run(|_| panic!("the section panics"));
     }));
@@ -185,7 +191,7 @@ fn a_panic_in_a_section_is_its_callers_and_frees_the_step() {
 
 #[test]
 fn a_section_that_changes_no_version_publishes_nothing() {
-    let (_dir, store) = store();
+    let store = store();
     let cell = with_view(&store);
     let before = cell.load();
     store.run(|versions| {
@@ -217,7 +223,7 @@ fn counting() -> (Arc<Wakes>, std::task::Waker) {
 /// waiting, and the step is free again when the hold ends.
 #[test]
 fn a_thread_that_holds_the_step_runs_its_own_sections_without_waiting() {
-    let (_dir, store) = store();
+    let store = store();
     let hold = store
         .hold_or_park(std::task::Waker::noop())
         .expect("the step is free");
@@ -235,7 +241,7 @@ fn a_thread_that_holds_the_step_runs_its_own_sections_without_waiting() {
 /// holder's own next section.
 #[test]
 fn a_section_handed_over_under_a_hold_runs_on_the_holder_in_order() {
-    let (_dir, store) = store();
+    let store = store();
     let hold = store
         .hold_or_park(std::task::Waker::noop())
         .expect("the step is free");
@@ -265,7 +271,7 @@ fn a_section_handed_over_under_a_hold_runs_on_the_holder_in_order() {
 /// runs when the hold ends, on the holder's thread.
 #[test]
 fn a_section_handed_over_under_a_hold_runs_when_the_hold_ends() {
-    let (_dir, store) = store();
+    let store = store();
     let hold = store
         .hold_or_park(std::task::Waker::noop())
         .expect("the step is free");
@@ -290,7 +296,7 @@ fn a_section_handed_over_under_a_hold_runs_when_the_hold_ends() {
 /// woken when that thread gives the step up.
 #[test]
 fn a_job_that_finds_the_step_held_is_woken_when_it_is_given_up() {
-    let (_dir, store) = store();
+    let store = store();
     let (wakes, waker) = counting();
     let (taken, is_taken) = mpsc::channel();
     let (release, released) = mpsc::channel::<()>();
@@ -318,7 +324,7 @@ fn a_job_that_finds_the_step_held_is_woken_when_it_is_given_up() {
 /// for the step, once it gives the step up.
 #[test]
 fn a_sweep_that_ends_wakes_the_jobs_parked_for_the_step() {
-    let (_dir, store) = store();
+    let store = store();
     let (wakes, waker) = counting();
     store.run(|_| {
         assert!(store.hold_or_park(&waker).is_none(), "a section is running");
