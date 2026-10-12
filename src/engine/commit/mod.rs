@@ -24,9 +24,9 @@
 //!
 //! An optimistic transaction's commit is a slot like any write (E10). It is
 //! decided in ring order against the view, which by then holds every commit
-//! decided before it (`GroupCommit.tla`, `group_eq_serial` in
-//! `GroupCommit.lean`), and only a commit that validates takes sequences and
-//! a record. Each commit learns its own outcome.
+//! decided before it (`NoLostUpdate` in `CommitPipeline.tla`,
+//! `later_slot_aborts` in `PipelineCheck.lean`), and only a commit that
+//! validates takes sequences and a record. Each commit learns its own outcome.
 //!
 //! Commits whose records are in the log together share one sync: a sync
 //! round covers every record written when it starts, so many concurrent

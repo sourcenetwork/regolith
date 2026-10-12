@@ -42,18 +42,19 @@ asleep, the note to B wakes B up; A is awake, so nothing wakes A.
    idle in two steps loses a wakeup (`split_rest_loses_wakeup`); a poll that
    leaves the idle bit set wakes a busy owner (`stale_idle_bit_wakes_busy`);
    a job put on no queue is never run (`orphan_never_runs`).
-7. The commit side (Part 5). A group of `commit_nowait` commits leaves its
-   fsync as one job, a unit like any other, so 1 and 2 hold for it: one
-   claim, one fsync, one note per member queue. On top of that:
-   `group_sync_once`, the fsync runs at most once (TLA+ `SingleRun` on a
-   group); `group_visible_after_sync`, readers see the group only after its
-   fsync (TLA+ `VisibleAfterSync`); `ticket_ready_only_at_own_poll`, a
-   member's ticket becomes ready only at its own queue's poll (TLA+
-   `DeliveredOnOwnPoll`); `stall_lands_when_clear`, a cleared stall leaves
-   no unlanded unit behind except one a writer is about to land (TLA+
-   `StallLandsWhenClear`). RED: a lander that readies the members' tickets
-   itself (`lander_delivery_breaks_own_poll`), and a writer that does not
-   look at the stall again (`no_recheck_strands_stall`).
+7. The commit side (Part 5). The `commit_nowait` commits one sync of the
+   log covers wait on one job, the sync round, a unit like any other, so 1
+   and 2 hold for it: one claim, one fsync, one note per waiting queue. On
+   top of that: `round_sync_once`, the fsync runs at most once (TLA+
+   `SingleRun` on a round); `round_visible_after_sync`, readers see the
+   round's commits only after its fsync (TLA+ `VisibleAfterSync`);
+   `ticket_ready_only_at_own_poll`, a commit's ticket becomes ready only at
+   its own queue's poll (TLA+ `DeliveredOnOwnPoll`);
+   `stall_lands_when_clear`, a cleared stall leaves no unlanded unit behind
+   except one a writer is about to land (TLA+ `StallLandsWhenClear`). RED:
+   a runner that readies the waiting commits' tickets itself
+   (`lander_delivery_breaks_own_poll`), and a writer that does not look at
+   the stall again (`no_recheck_strands_stall`).
 
 ## How to read the Lean
 
@@ -237,40 +238,41 @@ theorem ustep_inv {s t : Units}
     -- Making a unit only changes its state from "not in use" to "free".
     refine ⟨fun x hx => ?_, hs.runs_le, hs.regd_nodup, hs.balance, hs.open_owes_none,
       hs.shut_empty, fun x hx => ?_⟩
-    · -- A unit that is not done has not run: for `u` its old state was
+    -- A unit that is not done has not run: for `u` its old state was
+    ·
       -- "not in use", which is not done either; other units are untouched.
       by_cases hxu : x = u
-      · -- It is `u`: use the old state, "not in use".
-        subst hxu
+      -- It is `u`: use the old state, "not in use".
+      · subst hxu
         -- "Not in use" is not "done", so the old fact applies.
         exact hs.runs_done x (by simp [hnone])
-      · -- Another unit: its state did not change.
-        exact hs.runs_done x (by simpa [hxu] using hx)
-    · -- The waiter list stays open until done: the same split.
-      by_cases hxu : x = u
-      · -- It is `u`: its old state was "not in use", not done.
-        subst hxu
+      -- Another unit: its state did not change.
+      · exact hs.runs_done x (by simpa [hxu] using hx)
+    -- The waiter list stays open until done: the same split.
+    · by_cases hxu : x = u
+      -- It is `u`: its old state was "not in use", not done.
+      · subst hxu
         -- So its list was open, and still is.
         exact hs.open_until_done x (by simp [hnone])
-      · -- Another unit: unchanged.
-        exact hs.open_until_done x (by simpa [hxu] using hx)
+      -- Another unit: unchanged.
+      · exact hs.open_until_done x (by simpa [hxu] using hx)
   -- The step registered a queue on a unit.
   | register q u hopen hnew =>
     -- Registering puts `q` on `u`'s waiter list and its registered list.
     refine ⟨hs.runs_done, hs.runs_le, fun x => ?_, fun x p => ?_, hs.open_owes_none,
       fun x hx => ?_, hs.open_until_done⟩
-    · -- The registered list stays free of repeats: `q` was not on it.
-      by_cases hxu : x = u
-      · -- It is `u`: `q` plus a list without `q`, itself without repeats.
-        subst hxu
+    -- The registered list stays free of repeats: `q` was not on it.
+    · by_cases hxu : x = u
+      -- It is `u`: `q` plus a list without `q`, itself without repeats.
+      · subst hxu
         -- Unfold the new list and use both facts.
         simpa [List.nodup_cons, hnew] using hs.regd_nodup x
-      · -- Another unit: unchanged.
-        simpa [hxu] using hs.regd_nodup x
-    · -- The balance: `q` gains one on the waiter list and one registered.
-      by_cases hxu : x = u
-      · -- It is `u`.
-        subst hxu
+      -- Another unit: unchanged.
+      · simpa [hxu] using hs.regd_nodup x
+    -- The balance: `q` gains one on the waiter list and one registered.
+    · by_cases hxu : x = u
+      -- It is `u`.
+      · subst hxu
         -- The old balance for `u`.
         have hb := hs.balance x p
         -- Nothing is owed on an open list.
@@ -283,16 +285,16 @@ theorem ustep_inv {s t : Units}
         simp at hb ⊢
         -- Finish with arithmetic.
         omega
-      · -- Another unit: unchanged.
-        simpa [hxu] using hs.balance x p
-    · -- A shut list is empty: `u`'s list is open, others are unchanged.
-      by_cases hxu : x = u
-      · -- It is `u`: it is open, so it cannot be shut.
-        subst hxu
+      -- Another unit: unchanged.
+      · simpa [hxu] using hs.balance x p
+    -- A shut list is empty: `u`'s list is open, others are unchanged.
+    · by_cases hxu : x = u
+      -- It is `u`: it is open, so it cannot be shut.
+      · subst hxu
         -- Open and shut at once is impossible.
         simp [hopen] at hx
-      · -- Another unit: unchanged.
-        simpa [hxu] using hs.shut_empty x hx
+      -- Another unit: unchanged.
+      · simpa [hxu] using hs.shut_empty x hx
   -- The step was a refused registration.
   | refused q u hshut =>
     -- A refused push changes nothing.
@@ -302,22 +304,22 @@ theorem ustep_inv {s t : Units}
     -- Claiming only changes `u`'s state from free to claimed.
     refine ⟨fun x hx => ?_, hs.runs_le, hs.regd_nodup, hs.balance, hs.open_owes_none,
       hs.shut_empty, fun x hx => ?_⟩
-    · -- A free unit had not run, and a claimed one has not either.
-      by_cases hxu : x = u
-      · -- It is `u`: it was free, not done.
-        subst hxu
+    -- A free unit had not run, and a claimed one has not either.
+    · by_cases hxu : x = u
+      -- It is `u`: it was free, not done.
+      · subst hxu
         -- Free is not done, so it had not run.
         exact hs.runs_done x (by simp [hfree])
-      · -- Another unit: unchanged.
-        exact hs.runs_done x (by simpa [hxu] using hx)
-    · -- Its list was open while it was free, and stays open.
-      by_cases hxu : x = u
-      · -- It is `u`: free is not done.
-        subst hxu
+      -- Another unit: unchanged.
+      · exact hs.runs_done x (by simpa [hxu] using hx)
+    -- Its list was open while it was free, and stays open.
+    · by_cases hxu : x = u
+      -- It is `u`: free is not done.
+      · subst hxu
         -- So the list was open.
         exact hs.open_until_done x (by simp [hfree])
-      · -- Another unit: unchanged.
-        exact hs.open_until_done x (by simpa [hxu] using hx)
+      -- Another unit: unchanged.
+      · exact hs.open_until_done x (by simpa [hxu] using hx)
   -- The step finished a unit.
   | finish t u hcl =>
     -- Finishing: done, one run, the list shut and taken whole as owed.
@@ -330,26 +332,26 @@ theorem ustep_inv {s t : Units}
     -- Prove each part of the invariant in turn:
     refine ⟨fun x hx => ?_, fun x => ?_, hs.regd_nodup, fun x p => ?_, fun x hx => ?_,
       fun x hx => ?_, fun x hx => ?_⟩
-    · -- Only units other than `u` can be not done; they are unchanged.
-      by_cases hxu : x = u
-      · -- It is `u`: it is done now, so this case cannot happen.
-        subst hxu
+    -- Only units other than `u` can be not done; they are unchanged.
+    · by_cases hxu : x = u
+      -- It is `u`: it is done now, so this case cannot happen.
+      · subst hxu
         -- "Done" is done.
         simp at hx
-      · -- Another unit: unchanged.
-        simpa [hxu] using hs.runs_done x (by simpa [hxu] using hx)
-    · -- At most one run: `u` goes from 0 to 1.
-      by_cases hxu : x = u
-      · -- It is `u`.
-        subst hxu
+      -- Another unit: unchanged.
+      · simpa [hxu] using hs.runs_done x (by simpa [hxu] using hx)
+    -- At most one run: `u` goes from 0 to 1.
+    · by_cases hxu : x = u
+      -- It is `u`.
+      · subst hxu
         -- 0 + 1 is at most 1.
         simp [hr0]
-      · -- Another unit: unchanged.
-        simpa [hxu] using hs.runs_le x
-    · -- The balance: the waiter list's queues move to the owed list.
-      by_cases hxu : x = u
-      · -- It is `u`.
-        subst hxu
+      -- Another unit: unchanged.
+      · simpa [hxu] using hs.runs_le x
+    -- The balance: the waiter list's queues move to the owed list.
+    · by_cases hxu : x = u
+      -- It is `u`.
+      · subst hxu
         -- The old balance, with nothing owed.
         have hb := hs.balance x p
         -- Rewrite the empty owed list away and compare.
@@ -358,32 +360,32 @@ theorem ustep_inv {s t : Units}
         simp at hb ⊢
         -- Same total.
         omega
-      · -- Another unit: unchanged.
-        simpa [hxu] using hs.balance x p
-    · -- Only open lists owe nothing; `u` is shut now.
-      by_cases hxu : x = u
-      · -- It is `u`: shut, so not open.
-        subst hxu
+      -- Another unit: unchanged.
+      · simpa [hxu] using hs.balance x p
+    -- Only open lists owe nothing; `u` is shut now.
+    · by_cases hxu : x = u
+      -- It is `u`: shut, so not open.
+      · subst hxu
         -- Shut is not open.
         simp at hx
-      · -- Another unit: unchanged.
-        simpa [hxu] using hs.open_owes_none x (by simpa [hxu] using hx)
-    · -- A shut list is empty: `u`'s was emptied.
-      by_cases hxu : x = u
-      · -- It is `u`: emptied.
-        subst hxu
+      -- Another unit: unchanged.
+      · simpa [hxu] using hs.open_owes_none x (by simpa [hxu] using hx)
+    -- A shut list is empty: `u`'s was emptied.
+    · by_cases hxu : x = u
+      -- It is `u`: emptied.
+      · subst hxu
         -- The new list is empty.
         simp
-      · -- Another unit: unchanged.
-        simpa [hxu] using hs.shut_empty x (by simpa [hxu] using hx)
-    · -- Not done means open: `u` is done, others are unchanged.
-      by_cases hxu : x = u
-      · -- It is `u`: done, so this case cannot happen.
-        subst hxu
+      -- Another unit: unchanged.
+      · simpa [hxu] using hs.shut_empty x (by simpa [hxu] using hx)
+    -- Not done means open: `u` is done, others are unchanged.
+    · by_cases hxu : x = u
+      -- It is `u`: done, so this case cannot happen.
+      · subst hxu
         -- "Done" is done.
         simp at hx
-      · -- Another unit: unchanged.
-        simpa [hxu] using hs.open_until_done x (by simpa [hxu] using hx)
+      -- Another unit: unchanged.
+      · simpa [hxu] using hs.open_until_done x (by simpa [hxu] using hx)
   -- The step released a unit.
   | release u hfree =>
     -- Releasing is finishing without a run.
@@ -394,18 +396,18 @@ theorem ustep_inv {s t : Units}
     -- Prove each part of the invariant in turn:
     refine ⟨fun x hx => ?_, hs.runs_le, hs.regd_nodup, fun x p => ?_, fun x hx => ?_,
       fun x hx => ?_, fun x hx => ?_⟩
-    · -- Units other than `u` are unchanged; `u` is done now.
-      by_cases hxu : x = u
-      · -- It is `u`: done, so this case cannot happen.
-        subst hxu
+    -- Units other than `u` are unchanged; `u` is done now.
+    · by_cases hxu : x = u
+      -- It is `u`: done, so this case cannot happen.
+      · subst hxu
         -- "Done" is done.
         simp at hx
-      · -- Another unit: unchanged.
-        exact hs.runs_done x (by simpa [hxu] using hx)
-    · -- The balance: the waiter list moves to the owed list.
-      by_cases hxu : x = u
-      · -- It is `u`.
-        subst hxu
+      -- Another unit: unchanged.
+      · exact hs.runs_done x (by simpa [hxu] using hx)
+    -- The balance: the waiter list moves to the owed list.
+    · by_cases hxu : x = u
+      -- It is `u`.
+      · subst hxu
         -- The old balance, with nothing owed.
         have hb := hs.balance x p
         -- Rewrite the empty owed list away.
@@ -414,47 +416,47 @@ theorem ustep_inv {s t : Units}
         simp at hb ⊢
         -- Same total.
         omega
-      · -- Another unit: unchanged.
-        simpa [hxu] using hs.balance x p
-    · -- `u` is shut now; others are unchanged.
-      by_cases hxu : x = u
-      · -- It is `u`: shut, so not open.
-        subst hxu
+      -- Another unit: unchanged.
+      · simpa [hxu] using hs.balance x p
+    -- `u` is shut now; others are unchanged.
+    · by_cases hxu : x = u
+      -- It is `u`: shut, so not open.
+      · subst hxu
         -- Shut is not open.
         simp at hx
-      · -- Another unit: unchanged.
-        simpa [hxu] using hs.open_owes_none x (by simpa [hxu] using hx)
-    · -- `u`'s list was emptied; others are unchanged.
-      by_cases hxu : x = u
-      · -- It is `u`: emptied.
-        subst hxu
+      -- Another unit: unchanged.
+      · simpa [hxu] using hs.open_owes_none x (by simpa [hxu] using hx)
+    -- `u`'s list was emptied; others are unchanged.
+    · by_cases hxu : x = u
+      -- It is `u`: emptied.
+      · subst hxu
         -- The new list is empty.
         simp
-      · -- Another unit: unchanged.
-        simpa [hxu] using hs.shut_empty x (by simpa [hxu] using hx)
-    · -- `u` is done; others are unchanged.
-      by_cases hxu : x = u
-      · -- It is `u`: done, so this case cannot happen.
-        subst hxu
+      -- Another unit: unchanged.
+      · simpa [hxu] using hs.shut_empty x (by simpa [hxu] using hx)
+    -- `u` is done; others are unchanged.
+    · by_cases hxu : x = u
+      -- It is `u`: done, so this case cannot happen.
+      · subst hxu
         -- "Done" is done.
         simp at hx
-      · -- Another unit: unchanged.
-        simpa [hxu] using hs.open_until_done x (by simpa [hxu] using hx)
+      -- Another unit: unchanged.
+      · simpa [hxu] using hs.open_until_done x (by simpa [hxu] using hx)
   -- The step told a queue.
   | tell q u howed =>
     -- Telling `q`: one more note given, one fewer owed.
     refine ⟨hs.runs_done, hs.runs_le, hs.regd_nodup, fun x p => ?_, fun x hx => ?_,
       hs.shut_empty, hs.open_until_done⟩
-    · -- The balance moves one from owed to given, for `(q, u)` only.
-      by_cases hxu : x = u
-      · -- It is `u`.
-        subst hxu
+    -- The balance moves one from owed to given, for `(q, u)` only.
+    · by_cases hxu : x = u
+      -- It is `u`.
+      · subst hxu
         -- The old balance.
         have hb := hs.balance x p
         -- Split on whether p = q (call that fact `hpq`).
         by_cases hpq : p = q
-        · -- It is `q`: owed loses one, given gains one.
-          subst hpq
+        -- It is `q`: owed loses one, given gains one.
+        · subst hpq
           -- Removing one `p` from a list that holds it lowers its count by one.
           have hc := List.count_erase_self (a := p) (l := s.owed x)
           -- `p` is on the owed list, so it was counted at least once.
@@ -463,7 +465,8 @@ theorem ustep_inv {s t : Units}
           simp only [set_same, List.count_cons, beq_self_eq_true, ite_true] at hc ⊢
           -- The arithmetic now closes it.
           omega
-        · -- Another queue: its counts are unchanged.
+        -- Another queue: its counts are unchanged.
+        ·
           -- Removing `q` leaves `p`'s count alone.
           have hc : ((s.owed x).erase q).count p = (s.owed x).count p :=
             -- The library fact for erasing something other than `p`.
@@ -476,24 +479,26 @@ theorem ustep_inv {s t : Units}
             Nat.add_zero] at hb ⊢
           -- Same total as before, once `hc` is used.
           omega
-      · -- Another unit: its lists are unchanged, and the new note is not
+      -- Another unit: its lists are unchanged, and the new note is not
+      ·
         -- about it.
         have hne : ((q, u) == (p, x)) = false := by simp [Ne.symm hxu]
         -- Count the new given list.
         simp only [List.count_cons, hne, set_other _ _ _ _ hxu]
         -- Same total as before.
         simpa using hs.balance x p
-    · -- Only open lists owe nothing: `u` owed `q`, so it was shut; erasing
+    -- Only open lists owe nothing: `u` owed `q`, so it was shut; erasing
+    ·
       -- keeps that.
       by_cases hxu : x = u
-      · -- It is `u`: an open list owes nothing, but `u` owed `q`.
-        subst hxu
+      -- It is `u`: an open list owes nothing, but `u` owed `q`.
+      · subst hxu
         -- So `u`'s list was not open.
         have := hs.open_owes_none x hx
         -- `q` cannot be on an empty list.
         simp [this] at howed
-      · -- Another unit: unchanged.
-        simpa [hxu] using hs.open_owes_none x hx
+      -- Another unit: unchanged.
+      · simpa [hxu] using hs.open_owes_none x hx
 
 /-- Any number of steps keep the invariant. -/
 theorem usteps_inv {s t : Units}
@@ -547,43 +552,43 @@ theorem claim_once {s t : Units}
   | make v hv =>
     -- Making `v`: `v` was not in use, so it is not `u`.
     by_cases huv : u = v
-    · -- It would be `u`, but `u` is in use: impossible.
-      subst huv
+    -- It would be `u`, but `u` is in use: impossible.
+    · subst huv
       -- `u` is "not in use" and not "not in use" at once.
       exact absurd hv hn
-    · -- Another unit: `u` is unchanged.
-      simpa [huv] using hu
+    -- Another unit: `u` is unchanged.
+    · simpa [huv] using hu
   -- The step claimed a unit.
   | claim t' v hv =>
     -- Claiming `v` needs `v` free, so it is not `u`; or it makes `u`
     -- claimed, which is not free.
     by_cases huv : u = v
-    · -- It is `u`: claimed is not free.
-      subst huv
+    -- It is `u`: claimed is not free.
+    · subst huv
       -- Claimed is not free.
       simp
-    · -- Another unit: `u` is unchanged.
-      simpa [huv] using hu
+    -- Another unit: `u` is unchanged.
+    · simpa [huv] using hu
   -- The step finished a unit.
   | finish t' v hv =>
     -- Finishing sets "done", never "free".
     by_cases huv : u = v
-    · -- It is `u`: done is not free.
-      subst huv
+    -- It is `u`: done is not free.
+    · subst huv
       -- Done is not free.
       simp
-    · -- Another unit: unchanged.
-      simpa [huv] using hu
+    -- Another unit: unchanged.
+    · simpa [huv] using hu
   -- The step released a unit.
   | release v hv =>
     -- Releasing sets "done", never "free".
     by_cases huv : u = v
-    · -- It is `u`: done is not free.
-      subst huv
+    -- It is `u`: done is not free.
+    · subst huv
       -- Done is not free.
       simp
-    · -- Another unit: unchanged.
-      simpa [huv] using hu
+    -- Another unit: unchanged.
+    · simpa [huv] using hu
   -- The other steps do not touch any state.
   | register q v ho hn' => exact hu
   -- A refused push changes nothing.
@@ -740,30 +745,30 @@ theorem own_queue {i j : Inboxes}
     intro q m hm
     -- Split on whether q = r (call that fact `hq`).
     by_cases hq : q = r
-    · -- It is `r`'s inbox: old requests are `r`'s, and so is the new one.
-      subst hq
+    -- It is `r`'s inbox: old requests are `r`'s, and so is the new one.
+    · subst hq
       -- The inbox is the old one plus the new request.
       simp only [set_same, List.mem_append, List.mem_singleton] at hm
       -- Either an old request or the new one.
       rcases hm with hm | hm
-      · -- An old one: from before.
-        exact hi q m hm
-      · -- The new one: its reader is `q`.
-        simp [hm]
-    · -- Another inbox: unchanged.
-      exact hi q m (by simpa [hq] using hm)
+      -- An old one: from before.
+      · exact hi q m hm
+      -- The new one: its reader is `q`.
+      · simp [hm]
+    -- Another inbox: unchanged.
+    · exact hi q m (by simpa [hq] using hm)
   -- The step took an inbox.
   | take q =>
     -- Taking empties `q`'s inbox.
     intro p m hm
     -- Split on whether p = q (call that fact `hp`).
     by_cases hp : p = q
-    · -- It is `q`: empty now, so there is nothing to check.
-      subst hp
+    -- It is `q`: empty now, so there is nothing to check.
+    · subst hp
       -- Nothing is in an empty list.
       simp at hm
-    · -- Another inbox: unchanged.
-      exact hi p m (by simpa [hp] using hm)
+    -- Another inbox: unchanged.
+    · exact hi p m (by simpa [hp] using hm)
 
 /-- **RED: a request sent to another queue breaks `OwnQueue`.** Reader 1's
 request lands in queue 2's inbox. TLA+: `MC_NonBlocking_Red_WrongQueue`. -/
@@ -860,34 +865,35 @@ theorem ostep_inv {o p : Owner}
   | push =>
     -- A push clears IDLE and wakes the owner if IDLE was set.
     refine ⟨fun hi => by simp at hi, fun hw => ?_, fun hs => ?_⟩
-    · -- Woken now: either it was woken before, or IDLE was set; both mean
+    -- Woken now: either it was woken before, or IDLE was set; both mean
+    ·
       -- the owner sleeps.
       cases hwo : o.woken
-      · -- Not woken before: IDLE was set, so the owner sleeps.
-        have hid : o.idle = true := by simpa [hwo] using hw
+      -- Not woken before: IDLE was set, so the owner sleeps.
+      · have hid : o.idle = true := by simpa [hwo] using hw
         -- IDLE means asleep.
         exact (ho.idle_sleeps hid).1
-      · -- Woken before: then it sleeps.
-        exact ho.woken_sleeps hwo
-    · -- A sleeping owner after a push: IDLE is clear, so it must be woken.
-      right
+      -- Woken before: then it sleeps.
+      · exact ho.woken_sleeps hwo
+    -- A sleeping owner after a push: IDLE is clear, so it must be woken.
+    · right
       -- Before the push it had IDLE set or was woken; either way it is
       -- woken now.
       rcases ho.sleeps_idle_or_woken hs with hi | hw
-      · -- IDLE was set: this push wakes it.
-        simp [hi]
-      · -- It was woken already.
-        simp [hw]
+      -- IDLE was set: this push wakes it.
+      · simp [hi]
+      -- It was woken already.
+      · simp [hw]
   -- The step put the owner to sleep.
   | rest ha he =>
     -- Going to sleep on an empty inbox; it was awake, so not woken.
     have hnw : o.woken = false := by
       -- If it were woken it would be asleep, but it is awake.
       cases hw : o.woken
-      · -- Not woken: done.
-        rfl
-      · -- Woken would mean asleep: a contradiction.
-        have := ho.woken_sleeps hw
+      -- Not woken: done.
+      · rfl
+      -- Woken would mean asleep: a contradiction.
+      · have := ho.woken_sleeps hw
         -- Awake and asleep at once.
         simp [ha] at this
     -- Asleep with IDLE set and an empty inbox, not woken.
@@ -896,8 +902,8 @@ theorem ostep_inv {o p : Owner}
   | take ha =>
     -- Taking the inbox: awake, IDLE clear, so not woken.
     refine ⟨fun hi => by simp at hi, fun hw => ?_, fun hs => by simp at hs⟩
-    · -- It was awake, so it was not woken.
-      have := ho.woken_sleeps hw
+    -- It was awake, so it was not woken.
+    · have := ho.woken_sleeps hw
       -- Awake and asleep at once.
       simp [ha] at this
   -- The step woke the owner.
@@ -905,8 +911,8 @@ theorem ostep_inv {o p : Owner}
     -- Running again after a wake: awake, not woken; IDLE was clear because
     -- the owner was woken.
     refine ⟨fun hi => ?_, fun hw' => by simp at hw', fun hs' => by simp at hs'⟩
-    · -- IDLE set would mean not woken, but it was woken.
-      have := (ho.idle_sleeps hi).2.2
+    -- IDLE set would mean not woken, but it was woken.
+    · have := (ho.idle_sleeps hi).2.2
       -- Woken and not woken at once.
       simp [hw] at this
   -- The owner woke on its own.
@@ -938,10 +944,10 @@ theorem no_lost_idle_wakeup {o : Owner}
   have hi := osteps_inv oinv_init h
   -- Asleep means IDLE set or woken; not woken, so IDLE is set.
   rcases hi.sleeps_idle_or_woken hs with hid | hwk
-  · -- IDLE set means an empty inbox.
-    exact (hi.idle_sleeps hid).2.1
-  · -- Woken contradicts "not woken".
-    simp [hw] at hwk
+  -- IDLE set means an empty inbox.
+  · exact (hi.idle_sleeps hid).2.1
+  -- Woken contradicts "not woken".
+  · simp [hw] at hwk
 
 /-- **A busy owner is never woken.** Only a sleeping owner's waker fires.
 TLA+: `BusyNeverWoken`. Rules out: a note waking A while A runs its own
@@ -1053,46 +1059,46 @@ theorem job_held {j k : Jobs}
     intro v hv
     -- Either the new unit or an old one.
     rcases List.mem_cons.1 hv with rfl | hv
-    · -- The new unit: held by `q`.
-      exact Or.inr ⟨q, by simp⟩
-    · -- An old unit: it ran, or a queue holds it.
-      rcases hj v hv with hr | ⟨p, hp⟩
-      · -- It ran: still ran.
-        exact Or.inl hr
-      · -- Held by `p`: still held, the new unit only adds to `q`'s queue.
-        refine Or.inr ⟨p, ?_⟩
+    -- The new unit: held by `q`.
+    · exact Or.inr ⟨q, by simp⟩
+    -- An old unit: it ran, or a queue holds it.
+    · rcases hj v hv with hr | ⟨p, hp⟩
+      -- It ran: still ran.
+      · exact Or.inl hr
+      -- Held by `p`: still held, the new unit only adds to `q`'s queue.
+      · refine Or.inr ⟨p, ?_⟩
         -- Split on whether p = q (call that fact `hpq`).
         by_cases hpq : p = q
-        · -- It is `q`'s queue: the old units are still there.
-          subst hpq
+        -- It is `q`'s queue: the old units are still there.
+        · subst hpq
           -- Old units stay at the front.
           simp [hp]
-        · -- Another queue: unchanged.
-          simpa [hpq] using hp
+        -- Another queue: unchanged.
+        · simpa [hpq] using hp
   -- The step was a poll.
   | poll q b =>
     -- A poll moves the oldest `b` units of `q` from held to ran.
     intro v hv
     -- What the unit was before.
     rcases hj v hv with hr | ⟨p, hp⟩
-    · -- It ran: still ran.
-      exact Or.inl (List.mem_append_left _ hr)
-    · -- Held by `p`.
-      by_cases hpq : p = q
-      · -- It is `q`'s: it is in the part that ran or the part kept.
-        subst hpq
+    -- It ran: still ran.
+    · exact Or.inl (List.mem_append_left _ hr)
+    -- Held by `p`.
+    · by_cases hpq : p = q
+      -- It is `q`'s: it is in the part that ran or the part kept.
+      · subst hpq
         -- Split `q`'s units into the first `b` and the rest.
         have hsplit := List.take_append_drop b (j.held p)
         -- `v` is in one of the two parts.
         rw [← hsplit] at hp
         -- The member is in one of the two parts; look at each.
         rcases List.mem_append.1 hp with ht | hd
-        · -- In the first `b`: it ran now.
-          exact Or.inl (List.mem_append_right _ ht)
-        · -- In the rest: still held by `p`.
-          exact Or.inr ⟨p, by simpa using hd⟩
-      · -- Another queue: unchanged.
-        exact Or.inr ⟨p, by simpa [hpq] using hp⟩
+        -- In the first `b`: it ran now.
+        · exact Or.inl (List.mem_append_right _ ht)
+        -- In the rest: still held by `p`.
+        · exact Or.inr ⟨p, by simpa using hd⟩
+      -- Another queue: unchanged.
+      · exact Or.inr ⟨p, by simpa [hpq] using hp⟩
 
 /-- `n` polls of queue `q`, each running at most `b` units. -/
 def polls (q b : Nat) : Nat → Jobs → Jobs
@@ -1149,7 +1155,8 @@ theorem single_thread_finishes (q b : Nat)
     rw [← hsplit] at hu
     -- The member is in one of the two parts; look at each.
     rcases List.mem_append.1 hu with ht | hd
-    · -- In the first `b`: it ran in the first poll, and runs stay run.
+    -- In the first `b`: it ran in the first poll, and runs stay run.
+    ·
       -- Runs only grow over the remaining polls.
       have hgrow : ∀ m (k : Jobs), ∀ v ∈ k.ran, v ∈ (polls q b m k).ran := by
         -- By induction on the polls left.
@@ -1170,8 +1177,8 @@ theorem single_thread_finishes (q b : Nat)
           exact ihm _ v (List.mem_append_left _ hv)
       -- So `u` has run at the end.
       exact hgrow n j' u (List.mem_append_right _ ht)
-    · -- In the rest: the remaining polls run it.
-      exact hrest.2 u (by simpa [j'] using hd)
+    -- In the rest: the remaining polls run it.
+    · exact hrest.2 u (by simpa [j'] using hd)
 
 /-! ### RED: a job put on no queue
 
@@ -1211,20 +1218,20 @@ theorem orphan_never_runs (u q b : Nat) :
       intro k hh hr
       -- After one poll `u` is still unheld and not run.
       apply ih
-      · -- Still unheld: the poll only shrinks `q`'s queue.
-        intro p hp
+      -- Still unheld: the poll only shrinks `q`'s queue.
+      · intro p hp
         -- Split on whether p = q (call that fact `hpq`).
         by_cases hpq : p = q
-        · -- It is `q`'s queue: what is kept was there before.
-          subst hpq
+        -- It is `q`'s queue: what is kept was there before.
+        · subst hpq
           -- Kept units come from the old list.
           simp only [set_same] at hp
           -- So `u` was held before, which it was not.
           exact hh p (List.mem_of_mem_drop hp)
-        · -- Another queue: unchanged.
-          exact hh p (by simpa [hpq] using hp)
-      · -- Still not run: what ran is the old list plus held units.
-        simp only [List.mem_append, not_or]
+        -- Another queue: unchanged.
+        · exact hh p (by simpa [hpq] using hp)
+      -- Still not run: what ran is the old list plus held units.
+      · simp only [List.mem_append, not_or]
         -- Not in the old list, and not among `q`'s held units.
         exact ⟨hr, fun ht => hh q (List.mem_of_mem_take ht)⟩
   -- Apply it to the state after the bad start.
@@ -1232,15 +1239,15 @@ theorem orphan_never_runs (u q b : Nat) :
   -- The bad start leaves `u` unheld and not run.
   exact key n (startNowhere j u) hh hr
 
-/-! ## Part 5. The commit side: a group's fsync, and a stall's unit
+/-! ## Part 5. The commit side: a sync round, and a stall's unit
 
-This part mirrors the units the commit side adds (D53). A group of commits
-made by `commit_nowait` that needs an fsync is written by its leader and
-left as one job (`GroupSync`, `src/engine/commit/deferred.rs`). That job
+This part mirrors the units the commit side adds (D53). The commits made by
+`commit_nowait` that need an fsync wait on one job, the sync round that
+covers their records (`Round`, `src/engine/commit/round.rs`). That job
 is a unit of Part 1, so Part 1 already says it is claimed by one CAS and
-that every member's queue gets one "done" note. Here we follow what the
+that every waiting queue gets one "done" note. Here we follow what the
 claimer does with it (sync, then apply and publish, then tell), and where
-each member's ticket becomes ready: at that member's own poll.
+each commit's ticket becomes ready: at its own queue's poll.
 
 Then the write stall (`StallSignal`, `src/engine/commit/stall.rs`). A write
 a stall stops waits on a *passive* unit, which no poll runs: only the
@@ -1251,114 +1258,116 @@ saves: writer A sees the stall; the clearer clears it and finds no unit to
 land; A installs a fresh unit. Without A's second look, nobody would ever
 land it, and A's write would wait forever. -/
 
-/-- One group's fsync job, how far its claimer got, and its members'
+/-- One sync round's job, how far its claimer got, and the waiting commits'
 tickets. -/
-structure Group where
-  /-- The member queues, each registered on the job. -/
-  members : List Nat
+structure Round where
+  /-- The queues of the commits that wait on the round, each registered on
+  the job. -/
+  queues : List Nat
   /-- The job's state: free, claimed by a thread, or done. -/
   st : UState
   /-- How far the claimer got: 0 claimed, 1 synced, 2 published. -/
   phase : Nat
-  /-- Ghost: how many times the group's fsync ran. -/
+  /-- Ghost: how many times the round's fsync ran. -/
   syncs : Nat
-  /-- The fsync ran: the group's records are durable. -/
+  /-- The fsync ran: the round's records are durable. -/
   synced : Bool
-  /-- The group is applied and published: readers see it. -/
+  /-- The round's commits are published: readers see them. -/
   visible : Bool
-  /-- The member queues the claimer still owes a "done" note. -/
+  /-- The waiting queues the claimer still owes a "done" note. -/
   owed : List Nat
   /-- How many "done" notes wait in each queue's inbox. -/
   inbox : Nat → Nat
-  /-- Ghost: (member queue, thread whose step made its ticket ready). -/
+  /-- Ghost: (waiting queue, thread whose step made its ticket ready). -/
   ready : List (Nat × Nat)
 
-/-- A group just written: its job free, nothing synced, told or ready. -/
-def Group.init (members : List Nat) : Group :=
-  -- Only the members are set; everything else starts empty.
-  ⟨members, .free, 0, 0, false, false, [], fun _ => 0, []⟩
+/-- A round nobody has claimed: its job free, nothing synced, told or ready. -/
+def Round.init (queues : List Nat) : Round :=
+  -- Only the waiting queues are set; everything else starts empty.
+  ⟨queues, .free, 0, 0, false, false, [], fun _ => 0, []⟩
 
-/-- The steps of one group's job, one atomic step each. -/
-inductive GStep : Group → Group → Prop
-  /-- Thread `t` claims the job with one CAS from free: a member's poll, a
-  blocking member, or the next thread to take the pipeline. -/
-  | claim (g : Group) (t : Nat)
+/-- The steps of one round's job, one atomic step each. -/
+inductive RoundStep : Round → Round → Prop
+  /-- Thread `t` claims the job with one CAS from free: the poll of a
+  waiting queue, or a thread that needs the log durable inside a blocking
+  call. -/
+  | claim (r : Round) (t : Nat)
       -- The CAS succeeds only on a free job.
-      (h : g.st = .free) :
+      (h : r.st = .free) :
       -- The state after the step:
-      GStep g { g with st := .claimed t }
-  /-- The claimer runs the group's fsync. -/
-  | sync (g : Group) (t : Nat)
+      RoundStep r { r with st := .claimed t }
+  /-- The claimer runs the round's fsync. -/
+  | sync (r : Round) (t : Nat)
       -- `t` holds the claim.
-      (h : g.st = .claimed t)
+      (h : r.st = .claimed t)
       -- It has not synced yet.
-      (hp : g.phase = 0) :
+      (hp : r.phase = 0) :
       -- The state after the step:
-      GStep g { g with phase := 1, syncs := g.syncs + 1, synced := true }
-  /-- The claimer applies the group and publishes it to readers. -/
-  | publish (g : Group) (t : Nat)
+      RoundStep r { r with phase := 1, syncs := r.syncs + 1, synced := true }
+  /-- The claimer publishes the round's commits to readers. -/
+  | publish (r : Round) (t : Nat)
       -- `t` holds the claim.
-      (h : g.st = .claimed t)
+      (h : r.st = .claimed t)
       -- It synced.
-      (hp : g.phase = 1) :
+      (hp : r.phase = 1) :
       -- The state after the step:
-      GStep g { g with phase := 2, visible := true }
-  /-- The claimer finishes: the job is done and every member queue is owed
+      RoundStep r { r with phase := 2, visible := true }
+  /-- The claimer finishes: the job is done and every waiting queue is owed
   a "done" note. -/
-  | finish (g : Group) (t : Nat)
+  | finish (r : Round) (t : Nat)
       -- `t` holds the claim.
-      (h : g.st = .claimed t)
+      (h : r.st = .claimed t)
       -- It published.
-      (hp : g.phase = 2) :
+      (hp : r.phase = 2) :
       -- The state after the step:
-      GStep g { g with st := .done, owed := g.members }
-  /-- The claimer puts the "done" note into member queue `q`'s inbox. -/
-  | tell (g : Group) (q : Nat)
+      RoundStep r { r with st := .done, owed := r.queues }
+  /-- The claimer puts the "done" note into waiting queue `q`'s inbox. -/
+  | tell (r : Round) (q : Nat)
       -- `q` is still owed its note.
-      (h : q ∈ g.owed) :
+      (h : q ∈ r.owed) :
       -- The state after the step:
-      GStep g { g with owed := g.owed.erase q, inbox := set g.inbox q (g.inbox q + 1) }
+      RoundStep r { r with owed := r.owed.erase q, inbox := set r.inbox q (r.inbox q + 1) }
   /-- Queue `q`'s owner polls, takes the note, and the ticket is ready: the
   step is `q`'s own thread's. -/
-  | deliver (g : Group) (q : Nat)
+  | deliver (r : Round) (q : Nat)
       -- A note waits in `q`'s inbox.
-      (h : 0 < g.inbox q) :
+      (h : 0 < r.inbox q) :
       -- The state after the step:
-      GStep g { g with inbox := set g.inbox q (g.inbox q - 1), ready := (q, q) :: g.ready }
+      RoundStep r { r with inbox := set r.inbox q (r.inbox q - 1), ready := (q, q) :: r.ready }
 
-/-- Any number of group steps, one after another. -/
-inductive GSteps : Group → Group → Prop
+/-- Any number of a round's steps, one after another. -/
+inductive RoundSteps : Round → Round → Prop
   /-- No step at all. -/
-  | refl (g : Group) : GSteps g g
+  | refl (r : Round) : RoundSteps r r
   /-- Some steps, then one more. -/
-  | tail {a b c : Group} : GSteps a b → GStep b c → GSteps a c
+  | tail {a b c : Round} : RoundSteps a b → RoundStep b c → RoundSteps a c
 
-/-- What holds of a group's job in every reachable state. -/
-structure GInv (g : Group) : Prop where
-  /-- The fsync ran once if the group is synced, and never otherwise. -/
-  syncs_eq : g.syncs = if g.synced then 1 else 0
+/-- What holds of a round's job in every reachable state. -/
+structure RoundInv (r : Round) : Prop where
+  /-- The fsync ran once if the round is synced, and never otherwise. -/
+  syncs_eq : r.syncs = if r.synced then 1 else 0
   /-- Synced exactly when the claimer got past its fsync. -/
-  synced_phase : g.synced = true ↔ 1 ≤ g.phase
+  synced_phase : r.synced = true ↔ 1 ≤ r.phase
   /-- A free job has nobody's progress on it. -/
-  free_phase : g.st = .free → g.phase = 0
-  /-- Readers see the group only once it is synced. -/
-  vis_synced : g.visible = true → g.synced = true
+  free_phase : r.st = .free → r.phase = 0
+  /-- Readers see the round's commits only once it is synced. -/
+  vis_synced : r.visible = true → r.synced = true
   /-- Every ready ticket was made ready by its own queue's thread. -/
-  own : ∀ p ∈ g.ready, p.1 = p.2
+  own : ∀ p ∈ r.ready, p.1 = p.2
 
-/-- A group just written satisfies the invariant. -/
-theorem ginv_init (m : List Nat) : GInv (Group.init m) := by
+/-- A round nobody has claimed satisfies the invariant. -/
+theorem round_inv_init (m : List Nat) : RoundInv (Round.init m) := by
   -- Each field holds because everything starts empty or false.
-  refine ⟨?_, ?_, ?_, ?_, ?_⟩ <;> simp [Group.init]
+  refine ⟨?_, ?_, ?_, ?_, ?_⟩ <;> simp [Round.init]
 
 /-- **One step keeps the invariant.** Each kind of step is checked in turn. -/
-theorem gstep_inv {g g' : Group}
+theorem round_step_inv {r r' : Round}
     -- The invariant holds before the step.
-    (hi : GInv g)
+    (hi : RoundInv r)
     -- One step.
-    (h : GStep g g') :
+    (h : RoundStep r r') :
     -- Then:
-    GInv g' := by
+    RoundInv r' := by
   -- Look at the step.
   cases h with
   -- A claim only changes the job's state, to claimed.
@@ -1367,50 +1376,50 @@ theorem gstep_inv {g g' : Group}
     exact ⟨hi.syncs_eq, hi.synced_phase, fun h => by simp at h, hi.vis_synced, hi.own⟩
   -- The fsync.
   | sync t hcl hp =>
-    -- Before it the group was not synced: the claimer was at phase 0.
-    have hs : g.synced = false := by
+    -- Before it the round was not synced: the claimer was at phase 0.
+    have hs : r.synced = false := by
       -- Either it was synced or not.
-      cases hsy : g.synced with
+      cases hsy : r.synced with
       -- Not synced: that is the claim.
       | false => rfl
       -- Synced would mean phase at least 1, but it is 0.
       | true => have := hi.synced_phase.1 hsy; omega
     -- So the fsync had run no times.
-    have h0 : g.syncs = 0 := by simpa [hs] using hi.syncs_eq
-    -- Now it ran once, the group is synced, at phase 1.
+    have h0 : r.syncs = 0 := by simpa [hs] using hi.syncs_eq
+    -- Now it ran once, the round is synced, at phase 1.
     refine ⟨?_, ?_, ?_, ?_, hi.own⟩
-    · -- One fsync, and synced.
-      simp [h0]
-    · -- Synced, and past phase 0.
-      simp
-    · -- The job is claimed, not free.
-      intro h
+    -- One fsync, and synced.
+    · simp [h0]
+    -- Synced, and past phase 0.
+    · simp
+    -- The job is claimed, not free.
+    · intro h
       -- The step left the job's state as it was.
-      have h' : g.st = .free := h
+      have h' : r.st = .free := h
       -- It was claimed by `t`, not free.
       rw [hcl] at h'
       -- Claimed and free are different states.
       cases h'
-    · -- Synced now.
-      intro _; rfl
+    -- Synced now.
+    · intro _; rfl
   -- The publication.
   | publish t hcl hp =>
-    -- The claimer is at phase 1, so the group is synced.
-    have hs : g.synced = true := hi.synced_phase.2 (by omega)
+    -- The claimer is at phase 1, so the round is synced.
+    have hs : r.synced = true := hi.synced_phase.2 (by omega)
     -- Visible now, still synced, at phase 2.
     refine ⟨hi.syncs_eq, ?_, ?_, ?_, hi.own⟩
-    · -- Synced, and past phase 0.
-      simp [hs]
-    · -- The job is claimed, not free.
-      intro h
+    -- Synced, and past phase 0.
+    · simp [hs]
+    -- The job is claimed, not free.
+    · intro h
       -- The step left the job's state as it was.
-      have h' : g.st = .free := h
+      have h' : r.st = .free := h
       -- It was claimed by `t`, not free.
       rw [hcl] at h'
       -- Claimed and free are different states.
       cases h'
-    · -- Visible, and synced.
-      intro _; exact hs
+    -- Visible, and synced.
+    · intro _; exact hs
   -- The finish only marks the job done and owes the notes.
   | finish t hcl hp =>
     -- A done job is not free; the rest is untouched.
@@ -1427,92 +1436,93 @@ theorem gstep_inv {g g' : Group}
     intro p hp
     -- Split the list membership.
     rcases List.mem_cons.1 hp with rfl | hp'
-    · -- The new one: queue `q`, made ready by `q`.
-      rfl
-    · -- An old one: the invariant had it.
-      exact hi.own p hp'
+    -- The new one: queue `q`, made ready by `q`.
+    · rfl
+    -- An old one: the invariant had it.
+    · exact hi.own p hp'
 
 /-- **The invariant holds after any number of steps.** -/
-theorem gsteps_inv {g g' : Group}
-    -- Steps from `g` to `g'`.
-    (h : GSteps g g')
-    -- The invariant holds at `g`.
-    (hi : GInv g) :
+theorem round_steps_inv {r r' : Round}
+    -- Steps from `r` to `r'`.
+    (h : RoundSteps r r')
+    -- The invariant holds at `r`.
+    (hi : RoundInv r) :
     -- Then:
-    GInv g' := by
+    RoundInv r' := by
   -- By induction on the steps.
   induction h with
   -- No step: the same state.
   | refl => exact hi
   -- Steps, then one more: the last step keeps it.
-  | tail _ hs ih => exact gstep_inv ih hs
+  | tail _ hs ih => exact round_step_inv ih hs
 
-/-- **A group's fsync runs at most once.** One CAS lets one claimer in, and
-only the claimer syncs. TLA+: `SingleRun` on a group
-(`MC_NonBlocking_Green_Commit`), `SingleSync` (`GroupCommit.tla`). Rules
-out: members 1 and 2 both polling and both syncing group 4. -/
-theorem group_sync_once {m : List Nat} {g : Group}
-    -- `g` is reachable from the group just written.
-    (h : GSteps (Group.init m) g) :
+/-- **A round's fsync runs at most once.** One CAS lets one claimer in, and
+only the claimer syncs. TLA+: `SingleRun` on a round
+(`MC_NonBlocking_Green_Commit`), `OneRound` (`CommitPipeline.tla`). Rules
+out: queues 1 and 2 both polling and both syncing round 4. -/
+theorem round_sync_once {m : List Nat} {r : Round}
+    -- `r` is reachable from a round nobody has claimed.
+    (h : RoundSteps (Round.init m) r) :
     -- Then:
-    g.syncs ≤ 1 := by
-  -- The invariant of `g`.
-  have hi := gsteps_inv h (ginv_init m)
+    r.syncs ≤ 1 := by
+  -- The invariant of `r`.
+  have hi := round_steps_inv h (round_inv_init m)
   -- The count is 1 or 0 by the invariant.
   rw [hi.syncs_eq]
   -- Either way it is at most 1.
   split <;> omega
 
-/-- **Readers see a group only after its fsync.** TLA+: `VisibleAfterSync`,
-`DurableBeforeVisible` (`GroupCommit.tla`). Rules out: group 4 visible
-while its fsync still waits as a job on the members' queues. -/
-theorem group_visible_after_sync {m : List Nat} {g : Group}
-    -- `g` is reachable from the group just written.
-    (h : GSteps (Group.init m) g)
-    -- The group is visible.
-    (hv : g.visible = true) :
+/-- **Readers see a round's commits only after its fsync.** TLA+:
+`VisibleAfterSync`, `DurableBeforeVisible` (`CommitPipeline.tla`). Rules
+out: the commits of round 4 visible while its fsync still waits as a job on
+the waiting queues. -/
+theorem round_visible_after_sync {m : List Nat} {r : Round}
+    -- `r` is reachable from a round nobody has claimed.
+    (h : RoundSteps (Round.init m) r)
+    -- The round's commits are visible.
+    (hv : r.visible = true) :
     -- Then:
-    g.synced = true :=
+    r.synced = true :=
   -- One field of the invariant.
-  (gsteps_inv h (ginv_init m)).vis_synced hv
+  (round_steps_inv h (round_inv_init m)).vis_synced hv
 
-/-- **A member's ticket becomes ready only at its own queue's poll.** TLA+:
-`DeliveredOnOwnPoll`. Rules out: member 2's thread landing group 4 and
-making member 1's ticket ready on thread 2, running 1's callbacks there
+/-- **A commit's ticket becomes ready only at its own queue's poll.** TLA+:
+`DeliveredOnOwnPoll`. Rules out: queue 2's thread running round 4 and
+making queue 1's ticket ready on thread 2, running 1's callbacks there
 while thread 1 is busy. -/
-theorem ticket_ready_only_at_own_poll {m : List Nat} {g : Group}
-    -- `g` is reachable from the group just written.
-    (h : GSteps (Group.init m) g)
+theorem ticket_ready_only_at_own_poll {m : List Nat} {r : Round}
+    -- `r` is reachable from a round nobody has claimed.
+    (h : RoundSteps (Round.init m) r)
     -- A ticket that is ready, and the thread whose step made it so.
-    {q t : Nat} (hr : (q, t) ∈ g.ready) :
+    {q t : Nat} (hr : (q, t) ∈ r.ready) :
     -- Then:
     t = q :=
   -- One field of the invariant, read backwards.
-  ((gsteps_inv h (ginv_init m)).own (q, t) hr).symm
+  ((round_steps_inv h (round_inv_init m)).own (q, t) hr).symm
 
-/-! ### RED: the lander readies the members' tickets itself
+/-! ### RED: the runner readies the waiting commits' tickets itself
 
-The bug: the thread that lands the group tells every member by making its
-ticket ready right there, instead of putting a note in the member's inbox
+The bug: the thread that runs the round tells every waiting queue by making
+its ticket ready right there, instead of putting a note in the queue's inbox
 for its own poll. -/
 
-/-- The bad finish: the job is done and every member's ticket is ready,
+/-- The bad finish: the job is done and every waiting queue's ticket is ready,
 made so by the landing thread `t`. -/
-def finishDelivering (g : Group) (t : Nat) : Group :=
-  -- Done, and each member marked ready by `t`.
-  { g with st := .done, ready := g.members.map (fun q => (q, t)) ++ g.ready }
+def finishDelivering (r : Round) (t : Nat) : Round :=
+  -- Done, and each waiting queue marked ready by `t`.
+  { r with st := .done, ready := r.queues.map (fun q => (q, t)) ++ r.ready }
 
-/-- **RED: a lander that readies the tickets breaks `ticket_ready_only_at_own_poll`.**
-Members 1 and 2; thread 2 lands the group and makes member 1's ticket ready
+/-- **RED: a runner that readies the tickets breaks `ticket_ready_only_at_own_poll`.**
+Queues 1 and 2 wait; thread 2 runs the round and makes queue 1's ticket ready
 on thread 2. TLA+: `MC_NonBlocking_Red_DeliverOnLander` breaks
 `DeliveredOnOwnPoll`. -/
 theorem lander_delivery_breaks_own_poll :
     -- Some ticket ends up ready by a thread that is not its own.
-    ∃ q t, (q, t) ∈ (finishDelivering (Group.init [1, 2]) 2).ready ∧ t ≠ q := by
-  -- Member 1, made ready by thread 2.
+    ∃ q t, (q, t) ∈ (finishDelivering (Round.init [1, 2]) 2).ready ∧ t ≠ q := by
+  -- Queue 1, made ready by thread 2.
   refine ⟨1, 2, ?_, by decide⟩
   -- It is on the list the bad finish builds.
-  simp [finishDelivering, Group.init]
+  simp [finishDelivering, Round.init]
 
 /-- Where a writer the stall stopped is: running, it saw the stall, or it
 registered its wait and is about to look at the stall again. -/
@@ -1687,12 +1697,12 @@ theorem no_recheck_strands_stall :
   obtain ⟨w, hw⟩ := hs rfl rfl
   -- But every writer is outside a stopped write.
   by_cases h1 : w = 1
-  · -- Writer 1 left.
-    subst h1
+  -- Writer 1 left.
+  · subst h1
     -- Its phase is none.
     simp at hw
-  · -- Any other writer never wrote.
-    simp [Stall.init, set, h1] at hw
+  -- Any other writer never wrote.
+  · simp [Stall.init, set, h1] at hw
 
 -- The end of the Regolith.IoQueue names.
 end Regolith.IoQueue
