@@ -517,6 +517,7 @@ tla:
     # clone_respects_live, pins_exact.
     spec=SnapshotRegistry
     check MC_SnapshotRegistry_Green                    GREEN
+    check MC_SnapshotRegistry_Green_ThreeHandles       GREEN
     check MC_SnapshotRegistry_Red_NoConfirm            RED MinBelowLive
     check MC_SnapshotRegistry_Red_ScanThenSample       RED MinBelowLive
     check MC_SnapshotRegistry_Red_ReleaseHere          RED LiveCovered
