@@ -73,6 +73,7 @@ mod request;
 mod resume;
 mod ring;
 mod round;
+mod spare;
 mod stall;
 mod terminator;
 mod txn;
@@ -338,11 +339,13 @@ impl RegolithEngine {
             Requested::Queued(request) => request,
         };
         let pipe = self.pipe()?;
-        let desc = RingArc::new(Descriptor::new(Work::Request(request)));
+        let desc = spare::descriptor(Work::Request(request));
         let published = self.advance_nowait(pipe, &desc).is_ok();
         self.run_owed_step();
         if published {
-            return self.conclude(Self::settled(&desc)?).map(NowaitCommit::Done);
+            let settled = Self::settled(&desc);
+            spare::keep_descriptor(desc);
+            return self.conclude(settled?).map(NowaitCommit::Done);
         }
         Ok(NowaitCommit::Pending(PendingCommit { desc }))
     }

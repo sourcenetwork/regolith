@@ -28,8 +28,8 @@ use std::ops::Range;
 
 use super::super::RegolithEngine;
 use super::descriptor::{After, Decision, Descriptor, FAILED, Verdict as Fate, Work};
+use super::spare;
 use crate::WriteBatchOp;
-use crate::sync::internal::Arc as RingArc;
 
 impl RegolithEngine {
     /// Reserves `n` values of the counter at `key` (column-family prefixed)
@@ -44,9 +44,17 @@ impl RegolithEngine {
     pub(crate) fn allocate(&self, key: Vec<u8>, n: u64) -> io::Result<Range<u64>> {
         self.ensure_writable()?;
         let pipe = self.pipe()?;
-        let desc = RingArc::new(Descriptor::new(Work::Allocate { key, n }));
+        let desc = spare::descriptor(Work::Allocate { key, n });
         let index = self.enter(pipe, &desc);
         self.drive(pipe, index, &desc);
+        let reserved = Self::reserved(&desc);
+        spare::keep_descriptor(desc);
+        reserved
+    }
+
+    /// What the reservation at slot `desc`, published or discarded, tells
+    /// its caller.
+    fn reserved(desc: &Descriptor) -> io::Result<Range<u64>> {
         if desc.is(FAILED) {
             return Err(desc.failure.take().unwrap_or_else(|| {
                 io::Error::other("the write-ahead log failed and this reservation was discarded")

@@ -57,20 +57,19 @@ impl<T> OnceArc<T> {
         Self(AtomicPtr::new(ptr::null_mut()))
     }
 
-    /// Set the cell to `value` if it is empty. `false` when another thread
-    /// set it first; `value` is then dropped.
-    pub(super) fn set(&self, value: RingArc<T>) -> bool {
+    /// Set the cell to `value` if it is empty. When another thread set it
+    /// first, `value` is handed back.
+    pub(super) fn set(&self, value: RingArc<T>) -> Result<(), RingArc<T>> {
         let raw = RingArc::into_raw(value).cast_mut();
         if self
             .0
             .compare_exchange(ptr::null_mut(), raw, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
         {
-            return true;
+            return Ok(());
         }
         // SAFETY: `raw` came from `RingArc::into_raw` above and was not stored.
-        drop(unsafe { RingArc::from_raw(raw.cast_const()) });
-        false
+        Err(unsafe { RingArc::from_raw(raw.cast_const()) })
     }
 
     /// The value, once set.
@@ -264,6 +263,10 @@ impl Linked for Decision {
     fn link(&self) -> &AtomicPtr<Self> {
         &self.link
     }
+
+    fn retired(value: RingArc<Self>) {
+        super::spare::keep_decision(value);
+    }
 }
 
 /// What the rotation check at a slot's turn left: the error the slot is
@@ -391,8 +394,15 @@ impl Descriptor {
 
     /// Install `decision` if the slot has none (D1). Either way the slot's
     /// decision is the one [`Self::decision`] returns afterwards.
-    pub(super) fn decide(&self, decision: RingArc<Decision>) -> bool {
-        self.decision.set(decision)
+    pub(super) fn decide(&self, decision: Decision) -> bool {
+        match self.decision.set(super::spare::decision(decision)) {
+            Ok(()) => true,
+            Err(lost) => {
+                // Nobody else ever saw it: its allocation serves again.
+                super::spare::keep_decision(lost);
+                false
+            }
+        }
     }
 
     /// The queue the slot's own validation reads send their misses to: set

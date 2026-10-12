@@ -531,6 +531,13 @@ pub(super) trait Linked: Sized {
     /// The next replaced value waiting to be dropped. Touched only by the
     /// slot.
     fn link(&self) -> &AtomicPtr<Self>;
+
+    /// Let go of the slot's reference to a replaced value. A kind whose
+    /// allocation a thread keeps for its next value (`spare.rs`) says so
+    /// here.
+    fn retired(value: Arc<Self>) {
+        drop(value);
+    }
 }
 
 /// One `Arc<T>` that any thread loads and that is replaced by
@@ -648,7 +655,7 @@ impl<T: Linked> ArcSlot<T> {
             let next = unsafe { (*taken).link() }.load(Ordering::SeqCst);
             // SAFETY: the slot's own reference, off every list, with no
             // load that could hold its address (see above).
-            drop(unsafe { Arc::from_raw(taken.cast_const()) });
+            T::retired(unsafe { Arc::from_raw(taken.cast_const()) });
             taken = next;
         }
     }

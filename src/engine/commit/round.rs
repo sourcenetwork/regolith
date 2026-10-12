@@ -31,6 +31,7 @@ use super::descriptor::{Decision, WRITTEN};
 use super::hook;
 use super::pipeline::Pipeline;
 use super::ring::{Linked, Loaded};
+use super::spare;
 use crate::perf_context::{PerfTimer, PerfTimerField};
 use crate::statistics::{Histogram, Ticker};
 use crate::sync::internal::{Arc as RingArc, AtomicPtr, AtomicU64, Ordering};
@@ -46,12 +47,25 @@ pub(super) struct Round {
 }
 
 impl Round {
+    /// A round nobody claimed yet. Its allocations are the ones this thread
+    /// kept from a round that is over, when it has them (`spare.rs`): a
+    /// commit that waits for its sync allocates nothing for the round.
     pub(super) fn new(engine: std::sync::Weak<RegolithEngine>) -> RingArc<Self> {
-        RingArc::new(Self {
-            job: Job::new(Box::new(SyncRound { engine })),
+        spare::round(SyncRound::boxed(engine))
+    }
+
+    /// A round whose job is `job`, before it is shared.
+    pub(super) fn fresh(job: Arc<Job>) -> Self {
+        Self {
+            job,
             held: AtomicU64::new(0),
             link: AtomicPtr::new(std::ptr::null_mut()),
-        })
+        }
+    }
+
+    /// The job of a round that is over, for its allocation.
+    pub(super) fn into_job(self) -> Arc<Job> {
+        self.job
     }
 }
 
@@ -72,6 +86,10 @@ impl Drop for HeldRound<'_> {
 impl Linked for Round {
     fn link(&self) -> &AtomicPtr<Self> {
         &self.link
+    }
+
+    fn retired(value: RingArc<Self>) {
+        spare::keep_round(value);
     }
 }
 
@@ -95,6 +113,8 @@ impl RegolithEngine {
         let round = self.current_round(pipe);
         hook::at(hook::Stage::Sync);
         self.run_or_wait(&round.job);
+        // The round is over and replaced: this may be its last reference.
+        spare::keep_round(round);
     }
 
     /// Claim the round, waiting out one another thread has under way, and
@@ -190,9 +210,31 @@ struct SyncRound {
     engine: std::sync::Weak<RegolithEngine>,
 }
 
+#[cfg(not(loom))]
+std::thread_local! {
+    /// The box of the body this thread ran last, kept for the next round it
+    /// makes (`spare.rs`, S3). It names no engine while it waits here.
+    static BODY: std::cell::Cell<Option<Box<SyncRound>>> = const { std::cell::Cell::new(None) };
+}
+
 impl SyncRound {
-    fn sync(self) {
-        let Some(engine) = self.engine.upgrade() else {
+    /// The body of a round of `engine`'s, in the box this thread kept when
+    /// it has one.
+    fn boxed(engine: std::sync::Weak<RegolithEngine>) -> Box<dyn JobBody> {
+        #[cfg(not(loom))]
+        if let Ok(Some(mut body)) = BODY.try_with(std::cell::Cell::take) {
+            body.engine = engine;
+            return body;
+        }
+        Box::new(Self { engine })
+    }
+
+    /// Run the round, keeping the body's box for the round this run makes.
+    fn sync(mut self: Box<Self>) {
+        let engine = std::mem::take(&mut self.engine);
+        #[cfg(not(loom))]
+        let _ = BODY.try_with(|kept| kept.set(Some(self)));
+        let Some(engine) = engine.upgrade() else {
             return;
         };
         let Some(pipe) = engine.pipeline.as_ref() else {
@@ -213,11 +255,11 @@ impl SyncRound {
 
 impl JobBody for SyncRound {
     fn run(self: Box<Self>) {
-        (*self).sync();
+        self.sync();
     }
 
     /// A sync commits wait on is never left undone: a release runs it too.
     fn release(self: Box<Self>) {
-        (*self).sync();
+        self.sync();
     }
 }

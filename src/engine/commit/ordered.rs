@@ -395,7 +395,7 @@ impl RegolithEngine {
         if let Some(body) = desc.body.take() {
             body(self, &mut ord);
         }
-        desc.decide(RingArc::new(Decision::new(index, Fate::Unit, ord.state)));
+        desc.decide(Decision::new(index, Fate::Unit, ord.state));
         // The state the body left is the tip before the round is let go:
         // a rollback, which needs the round, then starts from it.
         self.settle(pipe, index, &desc);

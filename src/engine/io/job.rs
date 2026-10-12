@@ -115,13 +115,19 @@ unsafe impl Sync for Job {}
 impl Job {
     /// A job that runs `body` when a waiting queue's owner claims it.
     pub(crate) fn new(body: Box<dyn JobBody>) -> Arc<Self> {
-        Arc::new(Self {
+        Arc::new(Self::fresh(body))
+    }
+
+    /// [`Self::new`] before it is shared: for a caller that has an
+    /// allocation to put it in.
+    pub(crate) fn fresh(body: Box<dyn JobBody>) -> Self {
+        Self {
             flight: Flight::new(),
             body: UnsafeCell::new(Some(body)),
             passive: false,
             direct: Stack::new(),
             sleepers: Stack::new(),
-        })
+        }
     }
 
     /// A job no poll runs, landed only by [`Job::release`].

@@ -86,6 +86,7 @@ use super::hook;
 use super::request::Ops;
 use super::ring::{ArcSlot, Installed, Loaded, Ring};
 use super::round::Round;
+use super::spare;
 use super::txn::{TxnRequest, Verdict};
 use super::{Settled, WriteRequest};
 use crate::perf_context::{PerfLevel, PerfTimer, PerfTimerField};
@@ -402,11 +403,7 @@ impl RegolithEngine {
             if job.is_done() {
                 // The unit's body ended without deciding the slot: it
                 // unwound. The pipeline goes on from where it was.
-                desc.decide(RingArc::new(Decision::new(
-                    index,
-                    Fate::Unit,
-                    prev.after.clone(),
-                )));
+                desc.decide(Decision::new(index, Fate::Unit, prev.after.clone()));
                 return Turn::Done;
             }
             if can_run && job.claim() {
@@ -445,13 +442,13 @@ impl RegolithEngine {
                 _ => Ticker::CommitConflictsOnRead,
             };
             // Counted by the thread whose decision is the slot's (D1).
-            if desc.decide(RingArc::new(decision))
+            if desc.decide(decision)
                 && let Some(s) = self.statistics()
             {
                 s.add(ticker, 1);
             }
         } else {
-            desc.decide(RingArc::new(decision));
+            desc.decide(decision);
         }
         Turn::Done
     }
@@ -650,6 +647,9 @@ impl RegolithEngine {
                 }
             }
             if pipe.tip.replace(&tip, RingArc::clone(&decision)) {
+                // The tip that was: this may be its last reference, and its
+                // allocation then serves this thread's next decision.
+                spare::keep_decision(tip);
                 break;
             }
         }
@@ -898,9 +898,11 @@ impl RegolithEngine {
     /// until the pipeline discards it, and return what was decided for it.
     pub(super) fn commit_through_pipeline(&self, request: WriteRequest) -> io::Result<Settled> {
         let pipe = self.pipe()?;
-        let desc = RingArc::new(Descriptor::new(Work::Request(request)));
+        let desc = spare::descriptor(Work::Request(request));
         let index = self.enter(pipe, &desc);
         self.drive(pipe, index, &desc);
-        Self::settled(&desc)
+        let settled = Self::settled(&desc);
+        spare::keep_descriptor(desc);
+        settled
     }
 }
