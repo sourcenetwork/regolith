@@ -223,20 +223,26 @@ Go(w) == w # None /\ pc[w] = "waiting" /\ note[w]
 NoteT(w) == IF Go(w) THEN [note EXCEPT ![w] = FALSE] ELSE note
 \* The unparked flags after waking w: a sleeper's thread is unparked.
 UnparkedT(w) == IF Go(w) /\ w \in Blocking
+                \* A sleeper that is woken: its flag goes up. Anybody else: no flag changes.
                 THEN [unparked EXCEPT ![w] = TRUE] ELSE unparked
 \* The inboxes after waking w: the note goes into w's OWN inbox. The
 \* WrongQueue bug puts it into another thread's; the CompleteOnWaker bug
 \* skips the inbox altogether.
 InboxT(w) == IF Go(w) /\ w \notin Blocking /\ Mutant # "CompleteOnWaker"
+             \* A polling waiter that is woken: w's name is added to its own inbox (in the
+             \* WrongQueue bug, to the other thread's).
              THEN [inbox EXCEPT ![IF Mutant = "WrongQueue" THEN Other(w) ELSE w]
                      = @ \cup {w}]
+             \* Nobody is woken that way: every inbox stays as it is.
              ELSE inbox
 \* The ready flags after waking w: nothing, in the real code (only w's own
 \* poll makes its wait ready). The CompleteOnWaker bug makes it ready here.
 ReadyT(w) == IF Go(w) /\ w \notin Blocking /\ Mutant = "CompleteOnWaker"
+             \* Only in the bug: w's wait is made ready by the waker. Otherwise no flag changes.
              THEN [ready EXCEPT ![w] = TRUE] ELSE ready
 \* Who made it ready: in the bug, a thread that is not w's own.
 ReadyByT(w) == IF Go(w) /\ w \notin Blocking /\ Mutant = "CompleteOnWaker"
+               \* Only in the bug: the record says a thread that is not w's own did it.
                THEN [readyBy EXCEPT ![w] = NotOwn] ELSE readyBy
 \* The nudge marks after nudging w.
 NudgedT(w) == IF w # None THEN [nudged EXCEPT ![w] = TRUE] ELSE nudged
@@ -300,17 +306,23 @@ Lookup(t) ==
   /\ pc' = [pc EXCEPT ![t] = "pinned"]
   \* Either the key has an entry ...
   /\ IF cur # None
-       THEN \* ... and the transaction refers to it,
+       \* ... and then:
+       THEN
+            \* the transaction refers to it,
             /\ pin' = [pin EXCEPT ![t] = cur]
             \* and takes one more use of it.
             /\ uses' = [uses EXCEPT ![cur] = @ + 1]
             \* The table and the lock itself do not change.
             /\ UNCHANGED <<cur, holder, fifo, owed>>
-       ELSE \* ... or it has none. The names nobody refers to are free:
+       \* ... or it has none, and a new entry is made.
+       ELSE
+            \* The names nobody refers to are free:
             LET free == {e \in Entries : \A u \in Txns : pin[u] # e}
                 \* the lowest of them is the new entry's name.
                 e == CHOOSE x \in free : \A y \in free : x <= y
-            IN  \* (There must be a free name.)
+            \* With that name:
+            IN
+                \* (there must be a free name)
                 /\ free # {}
                 \* The table now holds the new entry for the key.
                 /\ cur' = e
@@ -335,11 +347,15 @@ TryFast(t) ==
   /\ pc[t] = "pinned"
   \* If the lock is free and nobody is owed ...
   /\ IF Free(pin[t])
-       THEN \* ... its name goes into the state word,
+       \* ... the transaction takes it:
+       THEN
+            \* its name goes into the state word,
             /\ holder' = [holder EXCEPT ![pin[t]] = t]
             \* and it holds the lock.
             /\ pc' = [pc EXCEPT ![t] = "holding"]
-       ELSE \* ... otherwise the lock is as it was,
+       \* ... otherwise it does not:
+       ELSE
+            \* the lock is as it was,
             /\ UNCHANGED holder
             \* and the transaction will have to wait.
             /\ pc' = [pc EXCEPT ![t] = "busy"]
@@ -367,13 +383,17 @@ TryAgain(t) ==
   /\ pc[t] = "noted"
   \* If the lock came free meanwhile ...
   /\ IF Free(pin[t])
-       THEN \* ... the transaction takes it,
+       \* ... the transaction takes it:
+       THEN
+            \* its name goes into the state word,
             /\ holder' = [holder EXCEPT ![pin[t]] = t]
             \* its note is void (it does not wait after all),
             /\ note' = [note EXCEPT ![t] = FALSE]
             \* and it holds the lock.
             /\ pc' = [pc EXCEPT ![t] = "holding"]
-       ELSE \* ... otherwise nothing is taken,
+       \* ... otherwise it does not:
+       ELSE
+            \* nothing is taken, and its note stays,
             /\ UNCHANGED <<holder, note>>
             \* and it will join the line.
             /\ pc' = [pc EXCEPT ![t] = "enqueue"]
@@ -399,7 +419,9 @@ Enqueue(t) ==
                  /\ ~nudged[Head(q)]
               \* then it is the front; otherwise nobody.
               THEN Head(q) ELSE None
-     IN  \* t is in the line.
+     \* With the line and the waiter to tell worked out:
+     IN
+         \* t is in the line.
          /\ fifo' = [fifo EXCEPT ![pin[t]] = q]
          \* The front is marked "try again".
          /\ nudged' = NudgedT(w)
@@ -430,9 +452,12 @@ Park(t) ==
   \* Where it goes when it has to wait: back to the caller. In the
   \* NoteAfterPoll bug it still has its note to record.
   /\ LET rest == IF Mutant = "NoteAfterPoll" THEN "lateNote" ELSE "waiting"
-     IN  \* Was the lock handed to it while it joined?
+     \* With that worked out, the transaction looks at the lock.
+     IN
+         \* Was the lock handed to it while it joined?
          IF holder[pin[t]] = t
-           THEN \* Yes: it holds the lock,
+           \* Yes: it holds the lock,
+           THEN
                 \* so its call is done,
                 /\ pc' = [pc EXCEPT ![t] = "holding"]
                 \* its note is void,
@@ -441,7 +466,8 @@ Park(t) ==
                 /\ UNCHANGED <<holder, fifo, nudged>>
            \* No. Was it nudged, with the lock free?
            ELSE IF nudged[t] /\ Free(pin[t])
-             THEN \* Yes: it takes the lock,
+             \* Yes: it takes the lock,
+             THEN
                   \* writing its name into the state word,
                   /\ holder' = [holder EXCEPT ![pin[t]] = t]
                   \* leaves the line,
@@ -452,8 +478,9 @@ Park(t) ==
                   /\ note' = [note EXCEPT ![t] = FALSE]
                   \* and it holds the lock.
                   /\ pc' = [pc EXCEPT ![t] = "holding"]
-             ELSE \* Not nudged, or nudged and beaten to it: the nudge, if
-                  \* any, is used up,
+             \* No: it was not nudged, or it was nudged and beaten to the lock.
+             ELSE
+                  \* The nudge, if any, is used up,
                   /\ nudged' = [nudged EXCEPT ![t] = FALSE]
                   \* the lock and the line stay,
                   /\ UNCHANGED <<holder, fifo, note>>
@@ -525,7 +552,8 @@ PollQueued(t) ==
   /\ LET e == pin[t]
      \* Was the lock handed to it?
      IN  IF holder[e] = t
-           THEN \* Yes: it holds it,
+           \* Yes: it holds it,
+           THEN
                 \* so its call is done,
                 /\ pc' = [pc EXCEPT ![t] = "holding"]
                 \* its note is void,
@@ -534,7 +562,8 @@ PollQueued(t) ==
                 /\ UNCHANGED <<holder, fifo, owed, nudged, lost>>
            \* No. Was it nudged, with the lock free?
            ELSE IF nudged[t] /\ Free(e)
-             THEN \* Yes: it takes the lock,
+             \* Yes: it takes the lock,
+             THEN
                   \* writing its name into the state word,
                   /\ holder' = [holder EXCEPT ![e] = t]
                   \* leaves the line,
@@ -549,7 +578,8 @@ PollQueued(t) ==
                   /\ UNCHANGED <<owed, lost>>
              \* No. Was it nudged at all, with nobody owed yet?
              ELSE IF nudged[t] /\ owed[e] = None
-               THEN \* Yes: it tried and was beaten to the lock.
+               \* Yes: it tried and was beaten to the lock.
+               THEN
                     \* The nudge is used up,
                     /\ nudged' = [nudged EXCEPT ![t] = FALSE]
                     \* one more loss is counted,
@@ -565,8 +595,9 @@ PollQueued(t) ==
                     /\ UNCHANGED <<holder, fifo, note>>
                     \* The call returns.
                     /\ pc' = [pc EXCEPT ![t] = "waiting"]
-               ELSE \* Not nudged (or somebody is owed): any nudge is used
-                    \* up without a count,
+               \* No: it was not nudged, or somebody is owed.
+               ELSE
+                    \* Any nudge is used up without a count,
                     /\ nudged' = [nudged EXCEPT ![t] = FALSE]
                     \* nothing else changes,
                     /\ UNCHANGED <<holder, fifo, owed, lost, note>>
@@ -590,7 +621,8 @@ Cancel(t) ==
          q == Without(fifo[e], t)
      \* Was it handed the lock without ever taking it?
      IN  IF holder[e] = t
-           THEN \* Yes: it lets go,
+           \* Yes: it lets go,
+           THEN
                 \* its name leaves the state word,
                 /\ holder' = [holder EXCEPT ![e] = None]
                 \* and owes the line a look, like any release.
@@ -611,8 +643,9 @@ Cancel(t) ==
                 /\ UNCHANGED readyBy
            \* No. Was it the owed one, with the lock free and others waiting?
            ELSE IF owed[e] = t /\ holder[e] = None /\ q # <<>>
-             THEN \* It was owed, the lock is free and others wait: the
-                  \* handoff it was owed goes to the new front.
+             \* Yes: it was owed, the lock is free and others wait.
+             THEN
+                  \* The handoff it was owed goes to the new front.
                   /\ holder' = [holder EXCEPT ![e] = Head(q)]
                   \* The new front leaves the line with the lock.
                   /\ fifo' = [fifo EXCEPT ![e] = Tail(q)]
@@ -632,8 +665,9 @@ Cancel(t) ==
                   /\ readyBy' = ReadyByT(Head(q))
                   \* t has only its use of the entry to give back.
                   /\ pc' = [pc EXCEPT ![t] = "unpin"]
-             ELSE \* The plain case. Nobody is owed once t, if it was the
-                  \* owed one, is gone.
+             \* No: the plain case.
+             ELSE
+                  \* Nobody is owed once t, if it was the owed one, is gone.
                   LET o == IF owed[e] = t THEN None ELSE owed[e]
                       \* The waiter told to try next. Somebody is told
                       \* (not in the CancelNoPassOn bug) when
@@ -648,7 +682,9 @@ Cancel(t) ==
                               /\ ~nudged[Head(q)]
                            \* then it is the new front; otherwise nobody.
                            THEN Head(q) ELSE None
-                  IN  \* t leaves the line.
+                  \* With the owed mark and the waiter to tell worked out:
+                  IN
+                      \* t leaves the line.
                       /\ fifo' = [fifo EXCEPT ![e] = q]
                       \* The owed mark is settled.
                       /\ owed' = [owed EXCEPT ![e] = o]
@@ -702,11 +738,15 @@ Write(t) ==
   /\ undelivered' = undelivered \cup {t}
   \* In the real code the lock stays held.
   /\ IF Mutant = "ReleaseAtWrite"
-       THEN \* The bug: the name leaves the state word now,
+       \* The bug: the lock goes at the write.
+       THEN
+            \* The name leaves the state word now,
             /\ holder' = [holder EXCEPT ![pin[t]] = None]
             \* and the line is looked at.
             /\ pc' = [pc EXCEPT ![t] = "drain"]
-       ELSE \* The lock is untouched,
+       \* The real code:
+       ELSE
+            \* the lock is untouched,
             /\ UNCHANGED holder
             \* and the transaction waits for its group to land.
             /\ pc' = [pc EXCEPT ![t] = "written"]
@@ -735,11 +775,15 @@ LanderRelease(t) ==
   /\ pc[t] = "landed"
   \* In the real code the lock goes now.
   /\ IF Mutant = "ReleaseAtDelivery"
-       THEN \* The bug: the lock stays held,
+       \* The bug: the lock is kept past the landing.
+       THEN
+            \* It stays held,
             /\ UNCHANGED holder
             \* until the outcome is delivered.
             /\ pc' = [pc EXCEPT ![t] = "kept"]
-       ELSE \* The name leaves the state word,
+       \* The real code: the lock goes as the commit lands.
+       ELSE
+            \* The name leaves the state word,
             /\ holder' = [holder EXCEPT ![pin[t]] = None]
             \* and the landing thread looks at the line.
             /\ pc' = [pc EXCEPT ![t] = "drain"]
@@ -757,11 +801,15 @@ Deliver(t) ==
   /\ undelivered' = undelivered \ {t}
   \* Only in the ReleaseAtDelivery bug is the lock still held here.
   /\ IF pc[t] = "kept"
-       THEN \* The bug lets it go only now,
+       \* The bug lets it go only now:
+       THEN
+            \* the name leaves the state word,
             /\ holder' = [holder EXCEPT ![pin[t]] = None]
-            \* and looks at the line.
+            \* and the line is looked at.
             /\ pc' = [pc EXCEPT ![t] = "drain"]
-       ELSE \* In the real code there is nothing to do.
+       \* In the real code there is nothing to do.
+       ELSE
+            \* The lock and the step stay as they are.
             UNCHANGED <<holder, pc>>
   \* Nothing else changes.
   /\ UNCHANGED <<cur, uses, fifo, owed, pin, nudged, lost, note, inbox, ready,
@@ -781,7 +829,8 @@ Drain(t) ==
          q == fifo[e]
      \* Is somebody owed, with the lock free and the line not empty?
      IN  IF Mutant # "ReleaseNoWake" /\ owed[e] # None /\ holder[e] = None /\ q # <<>>
-           THEN \* Yes: a handoff.
+           \* Yes: a handoff.
+           THEN
                 \* The front's name goes into the state word,
                 /\ holder' = [holder EXCEPT ![e] = Head(q)]
                 \* it leaves the line,
@@ -800,8 +849,9 @@ Drain(t) ==
                 /\ ready' = ReadyT(Head(q))
                 \* And who made it ready.
                 /\ readyBy' = ReadyByT(Head(q))
-           ELSE \* No handoff. The waiter to nudge: somebody is nudged
-                \* (not in the ReleaseNoWake bug) when
+           \* No: no handoff, at most a nudge.
+           ELSE
+                \* The waiter to nudge: somebody is nudged (not in the ReleaseNoWake bug) when
                 LET w == IF /\ Mutant # "ReleaseNoWake"
                             \* nobody is owed,
                             /\ owed[e] = None
@@ -811,7 +861,9 @@ Drain(t) ==
                             /\ ~nudged[Head(q)]
                          \* then it is the front; otherwise nobody.
                          THEN Head(q) ELSE None
-                IN  \* The lock and the line stay as they are.
+                \* With the waiter to nudge worked out:
+                IN
+                    \* The lock and the line stay as they are.
                     /\ UNCHANGED <<holder, fifo, owed>>
                     \* The front is marked "try again",
                     /\ nudged' = NudgedT(w)
@@ -845,12 +897,15 @@ Unpin(t) ==
   /\ uses' = [uses EXCEPT ![pin[t]] = @ - 1]
   \* If it was the last one ...
   /\ IF uses[pin[t]] = 1
-       THEN \* ... the transaction tries to retire the entry next, still
-            \* holding its reference to it.
+       \* ... the entry may have to go:
+       THEN
+            \* the transaction tries to retire the entry next,
             /\ pc' = [pc EXCEPT ![t] = "retire"]
-            \* So it still refers to the entry.
+            \* still holding its reference to it.
             /\ UNCHANGED pin
-       ELSE \* ... otherwise it is finished with the entry,
+       \* ... otherwise others still use the entry:
+       ELSE
+            \* the transaction is finished with it,
             /\ pc' = [pc EXCEPT ![t] = "idle"]
             \* and refers to nothing.
             /\ pin' = [pin EXCEPT ![t] = None]
@@ -878,9 +933,13 @@ TryRetire(t) ==
   /\ pc[t] = "retire"
   \* If the entry is still unused (or in the bug, whatever its count) ...
   /\ IF uses[pin[t]] = 0 \/ Mutant = "RetireNoCas"
-       THEN \* ... the table lets go of it, if it is still the key's entry.
+       \* ... the entry is retired:
+       THEN
+            \* the table lets go of it, if it is still the key's entry.
             cur' = IF cur = pin[t] THEN None ELSE cur
-       ELSE \* ... otherwise somebody uses it, and it stays.
+       \* ... otherwise somebody uses it:
+       ELSE
+            \* it stays in the table.
             UNCHANGED cur
   \* The transaction refers to nothing now,
   /\ pin' = [pin EXCEPT ![t] = None]
@@ -1034,10 +1093,12 @@ TableSound ==
   \A e \in Entries :
     \* is it the entry the table holds for the key?
     IF e = cur
-      THEN \* Yes: its count is exactly the number of transactions
-           \* using it.
+      \* Yes: it is the entry in the table.
+      THEN
+           \* Its count is exactly the number of transactions using it.
            uses[e] = Cardinality({t \in Txns : Using(t, e)})
-      ELSE \* No: an entry out of the table
+      \* No: it is an entry out of the table, which
+      ELSE
            \* has no holder,
            /\ holder[e] = None
            \* no waiting line,
@@ -1110,8 +1171,9 @@ IsolationAtLanding ==
 \* it, every other transaction would wait until the committer's thread
 \* gets round to looking at its inbox.
 HeldOnlyWhileNeeded ==
-  \* Every transaction that holds the key is at one of these steps.
+  \* For every transaction:
   \A t \in Txns :
+    \* if it holds the key, it is at one of these steps.
     Holds(t) => pc[t] \in {"holding", "written", "landed", "parking",
                            "waiting", "renoted"}
 

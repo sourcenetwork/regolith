@@ -32,17 +32,26 @@
 //! later one, and every change made after the role is given up claims it
 //! afresh: no wakeup is lost, and no call waits on another thread.
 //!
-//! # A drain ends
+//! # What a drain costs its thread
 //!
-//! The holder of the role returns after bounded work, whatever the other
-//! threads release. With nobody queued, a release leaves no dirty bit and
-//! its request is void, so the drain does not pass again for it. With
-//! somebody queued, the pass a release asks for nudges the front waiter or
-//! finds it nudged already; either way [`NUDGE_OUT`] stays up until that
-//! waiter looks, and the releases that follow skip the drain altogether.
-//! While a handoff is owed every release asks for a pass, but nobody can
-//! barge then, so only the holders there were can release. What is left is
-//! one pass for each waiter that queues or withdraws meanwhile.
+//! The drain is lock-free, not wait-free. The holder of the role runs one
+//! pass. It runs another only if, since that pass began, a waiter queued,
+//! withdrew or claimed the handoff it is owed (each sets the dirty bit),
+//! or a release found a waiter queued (it leaves [`WAKE_FRONT`]). So a
+//! drain runs at most one pass plus one for each such operation of another
+//! thread.
+//!
+//! Releases alone never keep it at work. With nobody queued, a release
+//! leaves no dirty bit and its request is void, so the drain does not pass
+//! again for it. With somebody queued, the pass a release asks for nudges
+//! the front waiter or finds it nudged already; either way [`NUDGE_OUT`]
+//! stays up until that waiter looks, and the releases that follow skip the
+//! drain altogether. While a handoff is owed every release asks for a
+//! pass, but nobody can barge then, so only the holders there were can
+//! release.
+//!
+//! Waiters that keep queueing or withdrawing can keep it at work, one pass
+//! each: there is no cap on the passes of one call.
 //!
 //! Arrivals push onto a Treiber stack. Pushing is ABA-safe because nothing
 //! pops single nodes: a pass takes the whole stack with one swap and

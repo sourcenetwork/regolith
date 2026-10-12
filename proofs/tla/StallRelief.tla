@@ -139,6 +139,7 @@ Init ==
   /\ wpc = [w \in Writers |-> "write"]
   \* Nothing counted, nothing read.
   /\ progress = 0
+  \* No writer has read the count.
   /\ seen = [w \in Writers |-> 0]
 
 \* What a step may leave: the stop on or off, while the budget for leaving
@@ -158,9 +159,11 @@ Land(f) == [x \in Writers |-> IF f[x] = "waiting" THEN "write" ELSE f[x]]
 JobStart ==
   \* Not started, and the gate is free.
   /\ job = "idle"
+  \* (The gate is free.)
   /\ gate = "free"
   \* It holds the gate for its whole run.
   /\ gate' = "job"
+  \* The job is at work, holding the gate.
   /\ job' = "holding"
   \* Nothing else changes.
   /\ UNCHANGED <<stopped, wpc, progress, seen>>
@@ -184,10 +187,13 @@ JobEnd ==
 JobRelieve ==
   \* It released the gate and has not relieved yet.
   /\ job = "relieving"
+  \* Is the gate free?
   /\ IF gate = "free"
      \* Steps, then the count and the landing.
      THEN /\ stopped' \in Outcomes
+          \* The progress is counted.
           /\ progress' = progress + 1
+          \* The progress lands: waiters are let go.
           /\ wpc' = Land(wpc)
      \* Left to the writer holding the gate.
      ELSE UNCHANGED <<stopped, progress, wpc>>
@@ -202,20 +208,28 @@ JobRelieve ==
 WriterTry(w) ==
   \* The writer is about to write.
   /\ wpc[w] = "write"
+  \* Is the stop off?
   /\ IF ~stopped
      \* Written; the stop may come on; one step owed.
      THEN /\ stopped' \in BOOLEAN
+          \* The writer owes one step.
           /\ wpc' = [wpc EXCEPT ![w] = "owing"]
+          \* The gate and what the writer read are unchanged.
           /\ UNCHANGED <<gate, seen>>
+     \* The stop is on. Is the gate free?
      ELSE IF gate = "free"
           \* Stopped, gate free: its step takes the gate.
           THEN /\ gate' = w
+               \* The writer runs a relieving step.
                /\ wpc' = [wpc EXCEPT ![w] = "relieving"]
+               \* The stop and what the writer read are unchanged.
                /\ UNCHANGED <<stopped, seen>>
           \* Stopped, gate held: it read the count before its step, and
           \* the step is contended.
           ELSE /\ seen' = [seen EXCEPT ![w] = progress]
+               \* The writer is contended.
                /\ wpc' = [wpc EXCEPT ![w] = "contended"]
+               \* The stop and the gate are unchanged.
                /\ UNCHANGED <<stopped, gate>>
   \* Nothing else changes.
   /\ UNCHANGED <<job, progress>>
@@ -227,16 +241,21 @@ WriterTry(w) ==
 WriterRegister(w) ==
   \* The writer was contended.
   /\ wpc[w] = "contended"
+  \* Is the stop off now?
   /\ IF ~stopped
      \* Cleared: counted, landed, and w writes again.
      THEN /\ progress' = progress + 1
+          \* The progress lands, and w writes again.
           /\ wpc' = [Land(wpc) EXCEPT ![w] = "write"]
+     \* Still stopped. Did the count move since w read it? (The bug NoRecheck does not look.)
      ELSE IF Mode # "NoRecheck" /\ seen[w] # progress
           \* Progress it missed: landed, and w writes again.
           THEN /\ wpc' = [Land(wpc) EXCEPT ![w] = "write"]
+               \* The count does not change.
                /\ UNCHANGED progress
           \* Nothing missed: it waits.
           ELSE /\ wpc' = [wpc EXCEPT ![w] = "waiting"]
+               \* The count does not change.
                /\ UNCHANGED progress
   \* Nothing else changes.
   /\ UNCHANGED <<stopped, gate, job, seen>>
@@ -246,8 +265,11 @@ WriterRegister(w) ==
 WriterStepEnd(w) ==
   \* The writer is relieving and holds the gate.
   /\ wpc[w] = "relieving"
+  \* The step may or may not clear the stop.
   /\ stopped' \in Outcomes
+  \* The gate is free again.
   /\ gate' = "free"
+  \* The writer counts its progress next.
   /\ wpc' = [wpc EXCEPT ![w] = "relRefresh"]
   \* Nothing else changes.
   /\ UNCHANGED <<job, progress, seen>>
@@ -258,8 +280,11 @@ WriterStepEnd(w) ==
 WriterRefresh(w) ==
   \* The writer released the gate after its relieving step.
   /\ wpc[w] = "relRefresh"
+  \* The progress is counted.
   /\ progress' = progress + 1
+  \* The writer goes on to write again; if the stop is still on it may return instead.
   /\ \E next \in (IF stopped THEN {"write", "done"} ELSE {"write"}) :
+       \* When the progress lands, waiters are let go.
        wpc' = [(IF Lands(stopped) THEN Land(wpc) ELSE wpc) EXCEPT ![w] = next]
   \* Nothing else changes.
   /\ UNCHANGED <<stopped, gate, job, seen>>
@@ -269,12 +294,15 @@ WriterRefresh(w) ==
 OwedTry(w) ==
   \* The writer's write went in and left a step owing.
   /\ wpc[w] = "owing"
+  \* Is the gate free?
   /\ IF gate = "free"
      \* The step takes the gate.
      THEN /\ gate' = w
+          \* The writer runs its owed step.
           /\ wpc' = [wpc EXCEPT ![w] = "owedStep"]
      \* Contended: the writer returns.
      ELSE /\ wpc' = [wpc EXCEPT ![w] = "done"]
+          \* The gate is unchanged.
           /\ UNCHANGED gate
   \* Nothing else changes.
   /\ UNCHANGED <<stopped, job, progress, seen>>
@@ -284,8 +312,11 @@ OwedTry(w) ==
 OwedStepEnd(w) ==
   \* The owed step holds the gate.
   /\ wpc[w] = "owedStep"
+  \* The step may or may not clear the stop.
   /\ stopped' \in Outcomes
+  \* The gate is free again.
   /\ gate' = "free"
+  \* The writer counts its progress next.
   /\ wpc' = [wpc EXCEPT ![w] = "owedRefresh"]
   \* Nothing else changes.
   /\ UNCHANGED <<job, progress, seen>>
@@ -295,7 +326,9 @@ OwedStepEnd(w) ==
 OwedRefresh(w) ==
   \* The owed step released the gate.
   /\ wpc[w] = "owedRefresh"
+  \* The progress is counted.
   /\ progress' = progress + 1
+  \* The writer returns; when the progress lands, waiters are let go.
   /\ wpc' = [(IF Lands(stopped) THEN Land(wpc) ELSE wpc) EXCEPT ![w] = "done"]
   \* Nothing else changes.
   /\ UNCHANGED <<stopped, gate, job, seen>>
@@ -306,7 +339,9 @@ Next ==
   \/ JobStart \/ JobEnd \/ JobRelieve
   \* A writer writes, registers, steps or counts.
   \/ \E w \in Writers :
+       \* A writer tries to write, registers as a waiter, ends its relieving step or counts it;
        \/ WriterTry(w) \/ WriterRegister(w) \/ WriterStepEnd(w) \/ WriterRefresh(w)
+       \* or it takes, ends or counts the step it owed.
        \/ OwedTry(w) \/ OwedStepEnd(w) \/ OwedRefresh(w)
 
 \* Every behaviour: start in Init, then take Next steps or stutter.
@@ -326,6 +361,7 @@ TypeOK ==
                           "owedRefresh", "contended", "waiting", "done"}]
   \* The count is a number, and so is what each writer read.
   /\ progress \in Nat
+  \* (What each writer read is a number.)
   /\ seen \in [Writers -> Nat]
 
 \* THE RULE. Once every writer has finished or waits on the stall, and the

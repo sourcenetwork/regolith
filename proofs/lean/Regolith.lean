@@ -61,13 +61,12 @@ import Regolith.Validation
 import Regolith.Relaxations
 -- regolith::sync's locks after D49: barging with a bypass bound gives
 -- mutual exclusion, at most BOUND lost races per waiter, an exclusive owed
--- handoff and no stranded head. Backs `proofs/tla/Sync.tla` and the write
--- side of `SyncRwLock.tla`.
+-- handoff and no stranded head. Backs `proofs/tla/Sync.tla`, the write
+-- side of `SyncRwLock.tla` and the turn semaphore of `SyncOnce.tla`.
 import Regolith.Sync
 -- regolith::sync::Notify: the FIFO waiter queue with handoff before wake
 -- gives FIFO service and no lost wakeup, cancellation included. Backs
--- `proofs/tla/SyncNotify.tla` and the waiter lists of `SyncLatch.tla` and
--- `SyncOnce.tla`.
+-- `proofs/tla/SyncNotify.tla` and the waiter list of `SyncLatch.tla`.
 import Regolith.SyncFifo
 -- 3.16: every transaction callback runs exactly once, of its attempt's
 -- outcome, in the stated order, and attempts are isolated. Backs
@@ -128,6 +127,17 @@ import Regolith.TombstoneLog
 -- more open files than slots, never a file closed under a reader, and a
 -- read returns its own table. Backs `proofs/tla/OpenFileTable.tla`.
 import Regolith.OpenFileTable
+-- D60: a queue unit's reopen under max_open_files never waits for a slot,
+-- and a parked one is never forgotten: its message is there, or a WANTED
+-- busy slot or a wake on its way will bring it. The model and NeverWaits;
+-- the invariant proof of RetryNeverLost; the four RED counterexamples.
+-- Backs the D60 rows of `proofs/tla/OpenFileTable.tla`.
+import Regolith.OpenFileNoWait
+-- D60, second half: every step keeps the facts, so a parked unit is never lost
+-- (`retry_never_lost`).
+import Regolith.OpenFileNoWaitProof
+-- D60, the RED half: each planted bug breaks the rule it is planted against.
+import Regolith.OpenFileNoWaitRed
 -- 4.6, Phase 7c1: column families created and dropped in the ordered step.
 -- No write lands after its family's tombstone or before its birth, and a
 -- family's life only moves forward. Backs `proofs/tla/CfRegistry.tla`.
@@ -136,12 +146,25 @@ import Regolith.CfRegistry
 -- offset's bytes, and an in-memory read sees every append that finished
 -- before it began. Backs `proofs/tla/EnvFiles.tla`.
 import Regolith.EnvFiles
+-- A table renamed aside while its handles reopen it: the Env's rename adds
+-- the new name before it drops the old, and a reopen that found nothing
+-- loads the names again, so it always finds the file. Backs Part 3 of
+-- `proofs/tla/EnvFiles.tla`.
+import Regolith.EnvFilesRename
 -- Phase 7 integration: a foreground job that held the compaction gate,
 -- with no worker and inline compaction on, relieves the stop it kept
 -- stopped writers from relieving, so no writer waits on a stall nobody will
 -- land. Backs `proofs/tla/StallRelief.tla`.
 import Regolith.StallRelief
-
+-- E15: waiting for the last snapshot. A sleeping waiter always has a pin
+-- still held or a release on its way to wake it, and on a target with one
+-- thread the call returns the count of pins held without waiting. Backs
+-- `proofs/tla/SnapshotWait.tla`.
+import Regolith.SnapshotWait
+-- E16: with no worker, a write runs exactly the one step of background work
+-- it found owed, and L0 never passes its compaction trigger (its stop
+-- trigger when every write seals). Backs `proofs/tla/OwedStep.tla`.
+import Regolith.OwedStep
 -- 4.6, 4.10: the pessimistic lock table. One holder per key, a retired
 -- table entry has no user, a waiter the lock may serve is told through its
 -- own inbox and nowhere else, a waiter loses at most BOUND races, and a

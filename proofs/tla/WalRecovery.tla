@@ -1,4 +1,41 @@
 ---- MODULE WalRecovery ----
+\* ===========================================================================
+\* THE STORY
+\* ===========================================================================
+\* Before a write counts, the database notes it in the write-ahead log, one
+\* record per commit group. After a power cut it reads the log back
+\* ("replay") to rebuild what it had. Writing a record does not put it on
+\* the disk; only a "sync" does. So after a power cut the end of the log may
+\* be missing, or cut in the middle of a record, or hold garbage: a "torn
+\* tail". That is normal, and replay should just stop there.
+\*
+\* But damage can also sit in a part of the log that WAS synced (a failing
+\* disk). Stopping there would silently throw away commits the database
+\* promised to keep. Replay has to tell the two apart: "a tail that never
+\* reached the disk" (drop it and say so) from "damage in what was promised"
+\* (refuse to open).
+\*
+\* The trick (log format 2): every record carries a small stamp saying "when
+\* I was written, everything up to HERE had already been synced". After a
+\* crash, replay takes P, the largest such claim it can read from any record
+\* that survived, and O, the place of the first unusable record.
+\*
+\* Tiny example. Records 1, 2, 3 were written; a sync covered 1 and 2;
+\* record 3 carries the stamp "2 synced". The power is cut. If record 3 is
+\* torn, then O = 3 and P is at most 2: the damage is past everything
+\* proven synced, so replay drops record 3, reports it, and opens with 1 and
+\* 2. If instead record 2 comes back as garbage while record 3 survives,
+\* then O = 2 and P = 2: something proven synced is damaged, and replay
+\* refuses to open rather than lose it in silence.
+\*
+\* What this model shows: over every interleaving of appends, syncs,
+\* rotations, a clean close and crashes, and against every state a crash can
+\* leave, the database opens after any crash an honest disk can produce,
+\* opens with commits 1..n and no hole, keeps every synced commit, never
+\* quietly drops something a stamp proves synced, and never opens under a
+\* wrong encryption key. Each planted bug breaks one of these.
+\*
+\* THE RULE IN FULL.
 \* 4.2 and 4.3: crash-aware WAL recovery with format 2. Every group record
 \* carries `synced_through`, the end of what the last completed sync made
 \* durable; a clean close syncs, appends CLOSE and syncs again. Replay of
@@ -152,34 +189,62 @@
 \*   MC_WalRecovery_Red_StampNotSealed       AckedSurvive fails
 \*   MC_WalRecovery_Red_StampUnsynced        RecoveryOpens fails
 
+\* Borrow the standard TLA+ books: counting numbers, lists, and sizes of finite sets.
 EXTENDS Naturals, Sequences, FiniteSets
 
+\* The fixed inputs a configuration chooses.
 CONSTANTS
-  MaxCommits,  \* the most commits the model appends, across crashes
-  MaxFiles,    \* the most log files: earlier logs plus the newest
-  MaxCrashes,  \* how many crashes with recovery the model performs
-  Mode,        \* "Immediate" or "Eventual": DurabilityMode
-  Frame,       \* "Checksum" or "AEAD": what makes a record usable
-  Residual,    \* TRUE: crash states may damage the last synced group
-  Mutant       \* "none" (the design) or one defect, named in the header
+  \* The largest number of commits the model appends, across crashes.
+  MaxCommits,
+  \* The largest number of log files: the earlier logs plus the newest.
+  MaxFiles,
+  \* How many crashes, each followed by a recovery, the model performs.
+  MaxCrashes,
+  \* When a commit is acknowledged: "Immediate" (once a sync covers it) or "Eventual" (as soon as it
+  \* is appended). DurabilityMode, src/options.rs.
+  Mode,
+  \* What makes a record usable: "Checksum" (its checksum matches) or "AEAD" (encryption at rest:
+  \* its authentication tag verifies under the key).
+  Frame,
+  \* TRUE when crash states may also damage the last synced record (bit rot), which a correct device
+  \* never does.
+  Residual,
+  \* "none" for the engine's rule, or one planted bug, named in the header.
+  Mutant
 
+\* The three bounds are numbers, and at least one file may exist.
 ASSUME MaxCommits \in Nat /\ MaxFiles \in Nat \ {0} /\ MaxCrashes \in Nat
+\* The durability is one of the two modes.
 ASSUME Mode \in {"Immediate", "Eventual"}
+\* The frame is one of the two kinds.
 ASSUME Frame \in {"Checksum", "AEAD"}
+\* Residual is a yes or a no.
 ASSUME Residual \in BOOLEAN
+\* The mutant is "none" or one of the seven planted bugs.
 ASSUME Mutant \in {"none", "DropBelowP", "RefuseAboveP", "Format1",
                    "CloseWithoutSync", "NoTruncate", "StampNotSealed",
                    "StampUnsynced"}
 
+\* The state: everything that changes from one step to the next. Each line says what the variable
+\* stands for in the real program.
 VARIABLES
-  sealed,   \* the earlier logs, oldest first; each a sequence of records
-            \* [c, st, ok]: commit (0 for CLOSE), stamp, and whether the
-            \* bytes are usable (FALSE only for an untruncated dropped tail)
-  log,      \* the newest log: a sequence of records [c, st] as written
-  synced,   \* how many leading records of `log` a completed sync covered
-  closed,   \* whether CLOSE has been appended to `log`
-  next,     \* the last commit number appended (commits are 1, 2, ...)
-  crashes   \* how many crashes with recovery have happened
+  \* The earlier log files, oldest first. Each is a list of records [c, st, ok]: the commit number
+  \* (0 for a CLOSE record), the stamp, and whether the bytes are usable (FALSE only for a dropped
+  \* tail that was left in the file).
+  sealed,
+  \* The newest log file: the list of records [c, st] as the writer wrote them (the active Wal,
+  \* src/engine/wal.rs). `st` is the record's stamp, "synced_through": how much of the log the last
+  \* completed sync had covered when the record was written.
+  log,
+  \* How many records of the newest log, counted from its start, a completed sync has covered (the
+  \* offset Wal::sync_data last covered).
+  synced,
+  \* Whether a CLOSE record was appended to the newest log (Wal::close).
+  closed,
+  \* The last commit number appended; commits are numbered 1, 2, 3, ...
+  next,
+  \* How many crashes with recovery have happened.
+  crashes
 
 \* Every variable, so a step that changes none of them is a stutter.
 vars == <<sealed, log, synced, closed, next, crashes>>
@@ -189,6 +254,7 @@ vars == <<sealed, log, synced, closed, next, crashes>>
 
 \* The least and greatest elements of a finite, nonempty set of naturals.
 Min(S) == CHOOSE x \in S : \A y \in S : x <= y
+\* The greatest element of a finite, nonempty set of numbers.
 Max(S) == CHOOSE x \in S : \A y \in S : y <= x
 
 \* The set of elements of a sequence.
@@ -196,13 +262,18 @@ Range(s) == {s[i] : i \in 1..Len(s)}
 
 \* The commit numbers of a sequence of records, in order; CLOSE has none.
 RECURSIVE CommitsOf(_)
+\* Walk the records in order.
 CommitsOf(recs) ==
+  \* None left: nothing.
   IF recs = <<>> THEN <<>>
+  \* This record's commit number unless it is a CLOSE, followed by the rest's.
   ELSE (IF Head(recs).c = 0 THEN <<>> ELSE <<Head(recs).c>>) \o CommitsOf(Tail(recs))
 
 \* The commits of the earlier logs, oldest first.
 RECURSIVE SealedFrom(_)
+\* Walk the earlier logs from the j-th on, joining their commits.
 SealedFrom(j) == IF j > Len(sealed) THEN <<>> ELSE CommitsOf(sealed[j]) \o SealedFrom(j + 1)
+\* All of them, from the first.
 SealedCommits == SealedFrom(1)
 
 \* A gap-free prefix of commit order: commits 1, 2, ..., n.
@@ -215,7 +286,9 @@ SyncedCommits == Range(SealedCommits) \cup Range(CommitsOf(SubSeq(log, 1, synced
 \* The commits acknowledged to their callers. Immediate acknowledges a
 \* commit once a completed sync covers it; Eventual when it is appended.
 Acked ==
+  \* Under Immediate: the commits a completed sync covers.
   IF Mode = "Immediate" THEN SyncedCommits
+  \* Under Eventual: every commit appended, in the earlier logs and in the newest.
   ELSE Range(SealedCommits) \cup Range(CommitsOf(log))
 
 ----------------------------------------------------------------------------
@@ -329,14 +402,19 @@ O(cs) == IF Bad(cs) = {} THEN PLen(cs) + 1 ELSE Min(Bad(cs))
 \* usable record's stamp counts; a usable CLOSE counts the whole file. In
 \* offsets, record O starts below P exactly when O <= P here.
 P(cs) ==
+  \* The largest of: 0; the stamps of the usable records the file still holds;
   Max({0} \cup {log[i].st : i \in {j \in 1..PLen(cs) : Usable(cs, j)}}
+          \* and the positions of usable CLOSE records (a CLOSE proves everything before it synced).
           \cup {i \in 1..PLen(cs) : Usable(cs, i) /\ log[i].c = 0})
 
 \* Format 1's rule on the first damaged record: a partial record, or a
 \* zero record followed only by zeros, ends the log; anything else refuses.
 Format1Refuses(cs) ==
+  \* There is a damaged record,
   /\ Bad(cs) # {}
+  \* the first one is not a record the file simply ends inside,
   /\ cs.st[O(cs)] # "partial"
+  \* and it is not a run of zeros to the end of the file.
   /\ ~(\A j \in O(cs)..PLen(cs) : cs.st[j] = "zero")
 
 \* Replay refuses the newest log. The design refuses a stamp that fails,
@@ -348,8 +426,12 @@ RefusedNewest(cs) ==
   \/ ~NewestStampOk(cs)
   \* Then the O < P rule, or the defect that replaces it.
   \/ CASE Mutant = "DropBelowP"   -> FALSE
+       \* The bug RefuseAboveP: any damaged record refuses.
        [] Mutant = "RefuseAboveP" -> Bad(cs) # {}
+       \* The bug Format1: the old format's rule decides.
        [] Mutant = "Format1"      -> Format1Refuses(cs)
+       \* The engine: a damaged record refuses when it lies at or below what a surviving stamp
+       \* proves synced.
        [] OTHER                   -> Bad(cs) # {} /\ O(cs) <= P(cs)
 
 \* Replay refuses an earlier log: they are complete, so any unusable
@@ -378,48 +460,76 @@ Discarded(cs) == O(cs) <= PLen(cs)
 
 \* The start: no earlier log, an empty newest log whose stamp is synced.
 Init ==
+  \* No earlier log.
   /\ sealed  = <<>>
+  \* The newest log is empty.
   /\ log     = <<>>
+  \* Nothing in it is synced.
   /\ synced  = 0
+  \* No CLOSE was appended.
   /\ closed  = FALSE
+  \* No commit yet.
   /\ next    = 0
+  \* No crash yet.
   /\ crashes = 0
 
 \* A commit group appends its record, stamped with the completed sync.
 AppendRecord ==
+  \* The log is not closed.
   /\ ~closed
+  \* The model may still commit.
   /\ next < MaxCommits
+  \* A record with the next commit number, stamped with the current synced count, joins the end of
+  \* the log.
   /\ log'  = Append(log, [c |-> next + 1, st |-> synced])
+  \* One more commit was appended.
   /\ next' = next + 1
+  \* Nothing else changes.
   /\ UNCHANGED <<sealed, synced, closed, crashes>>
 
 \* A sync that began when k records were written completes: they are
 \* durable. Records appended while it ran keep the older stamp.
 Sync(k) ==
+  \* The sync covers more than was synced, and no more than was written.
   /\ synced < k /\ k <= Len(log)
+  \* Those k records are durable now.
   /\ synced' = k
+  \* Nothing else changes.
   /\ UNCHANGED <<sealed, log, closed, next, crashes>>
 
 \* Rotation (E2, WalRotation.tla): the newest log is synced, sealed, and a
 \* new log with a synced stamp takes the next record.
 Rotate ==
+  \* The log is not closed.
   /\ ~closed
+  \* It holds something.
   /\ log # <<>>
+  \* One more file may be opened.
   /\ Len(sealed) + 1 < MaxFiles
+  \* The newest log joins the earlier logs, whole and usable: the rotation synced it.
   /\ sealed' = Append(sealed, [i \in 1..Len(log) |-> [c |-> log[i].c, st |-> log[i].st, ok |-> TRUE]])
+  \* A new, empty log is the newest.
   /\ log'    = <<>>
+  \* Nothing in it is synced.
   /\ synced' = 0
+  \* Nothing else changes.
   /\ UNCHANGED <<closed, next, crashes>>
 
 \* A clean close appends CLOSE once every record is synced; a Sync then
 \* makes CLOSE durable. The mutant appends it without the first sync.
 \* Format 1 has no CLOSE.
 AppendClose ==
+  \* The log is not closed yet.
   /\ ~closed
+  \* Format 1 has no CLOSE record.
   /\ Mutant # "Format1"
+  \* Every record is synced (the planted bug CloseWithoutSync skips this).
   /\ synced = Len(log) \/ Mutant = "CloseWithoutSync"
+  \* A CLOSE record, stamped with the current synced count, joins the end of the log.
   /\ log'    = Append(log, [c |-> 0, st |-> synced])
+  \* The log is closed.
   /\ closed' = TRUE
+  \* Nothing else changes.
   /\ UNCHANGED <<sealed, synced, next, crashes>>
 
 \* A crash (or a reopen after a clean close) and a recovery that opens.
@@ -427,26 +537,45 @@ AppendClose ==
 \* a new log takes the next commit, numbered after the last recovered one.
 \* The mutant NoTruncate leaves the dropped tail in the file.
 Crash ==
+  \* One more crash is allowed.
   /\ crashes < MaxCrashes
+  \* One more file may be opened.
   /\ Len(sealed) + 1 < MaxFiles
+  \* The crash leaves the newest log in some crash state
   /\ \E cs \in CrashStates :
+       \* from which recovery opens.
        /\ ~Refused(cs)
+       \* The newest log becomes an earlier log:
        /\ sealed' = Append(sealed,
+            \* under the bug NoTruncate,
             IF Mutant = "NoTruncate"
+              \* every record the file still holds, usable or not;
               THEN [i \in 1..PLen(cs) |-> [c |-> log[i].c, st |-> log[i].st, ok |-> Usable(cs, i)]]
+              \* in the engine, only the records before the first unusable one: the rest was cut off
+              \* and the cut was synced.
               ELSE [i \in 1..(O(cs) - 1) |-> [c |-> log[i].c, st |-> log[i].st, ok |-> TRUE]])
+       \* Commits are numbered on from the last recovered one.
        /\ next' = Len(Recovered(cs))
+  \* A new, empty log is the newest.
   /\ log'     = <<>>
+  \* Nothing in it is synced.
   /\ synced'  = 0
+  \* It is not closed.
   /\ closed'  = FALSE
+  \* One more crash happened.
   /\ crashes' = crashes + 1
 
 \* Every step the system can take.
 Next ==
+  \* A commit group appends its record.
   \/ AppendRecord
+  \* A sync completes.
   \/ \E k \in 1..(MaxCommits + 1) : Sync(k)
+  \* The log is rotated.
   \/ Rotate
+  \* A clean close appends CLOSE.
   \/ AppendClose
+  \* The machine crashes and recovers.
   \/ Crash
 
 \* Every behaviour: start in Init, then take Next steps or stutter.
@@ -458,10 +587,15 @@ Spec == Init /\ [][Next]_vars
 
 \* Every variable holds what its comment says.
 TypeOK ==
+  \* Fewer earlier logs than the file bound.
   /\ Len(sealed) < MaxFiles
+  \* The synced count never exceeds what was written.
   /\ synced \in 0..Len(log)
+  \* The closed flag is a yes or a no.
   /\ closed \in BOOLEAN
+  \* The commit count stays within the bound.
   /\ next \in 0..MaxCommits
+  \* No more crashes than the budget.
   /\ crashes \in 0..MaxCrashes
 
 \* A crash the device's flush honoured, opened with the right key, never
@@ -480,30 +614,44 @@ RecoveryOpens ==
 
 \* Whatever recovery yields when it opens is commits 1..n: the Eventual
 \* promise, and true in every mode. Lean: recovers_prefix2.
+\* Rules out, for example: after a power cut the database opens holding commits 1 and 3 but not 2.
 NoGap == \A cs \in CrashStates : ~Refused(cs) => IsPrefix(Recovered(cs))
 
 \* Every commit a completed sync covered survives a crash the flush
 \* honoured. Lean: recovers_prefix2, its bound.
 KeepsSynced ==
+  \* For every crash state that opens and has no rot: every commit a sync covered is among the
+  \* recovered ones. Rules out a commit that reached the disk and is missing after the restart.
   \A cs \in CrashStates : ~Refused(cs) /\ ~cs.rot => SyncedCommits \subseteq Range(Recovered(cs))
 
 \* THE IMMEDIATE PROMISE. Every acknowledged commit survives any crash the
 \* device's flush honours. Lean: recovers_prefix2, since Immediate
 \* acknowledges exactly the commits a completed sync covered.
 AckedSurvive ==
+  \* Under Immediate:
   Mode = "Immediate" =>
+    \* for every crash state that opens and has no rot, every acknowledged commit is among the
+    \* recovered ones. Rules out, for example: a caller is told "committed", the power is cut, and
+    \* after the restart the commit is gone.
     \A cs \in CrashStates : ~Refused(cs) /\ ~cs.rot => Acked \subseteq Range(Recovered(cs))
 
 \* Replay never discards a record a surviving stamp proves synced: below P
 \* it refuses instead. Lean: replay2_keeps_proven.
 NoProvenLoss ==
+  \* For every crash state that opens:
   \A cs \in CrashStates : ~Refused(cs) =>
+    \* every commit among the first P records (those a surviving stamp proves synced) is recovered.
+    \* Rules out, for example: record 2 is damaged, a later record's stamp says "the first 3 records
+    \* were synced", and replay quietly drops records 2 and 3 as a torn tail.
     \A i \in 1..P(cs) : log[i].c # 0 => log[i].c \in Range(Recovered(cs))
 
 \* A recovery that opens without a synced commit has reported a discarded
 \* tail: residual damage is never silent. Lean: residual_is_reported.
 LossIsReported ==
+  \* For every crash state
   \A cs \in CrashStates :
+    \* that opens without some synced commit: a discarded tail was reported. Rules out a database
+    \* that lost durable data and said nothing.
     ~Refused(cs) /\ ~(SyncedCommits \subseteq Range(Recovered(cs))) => Discarded(cs)
 
 \* An open under the wrong key refuses; it never drops the log as a tail.

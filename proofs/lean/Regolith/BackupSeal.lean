@@ -164,6 +164,7 @@ def restore (hasManifest : Bool) (id : Nat) (m : Meta) (p : Option Provider) : R
 /-- **A refused restore wrote nothing.** It rules out a target left half
 written behind an error: every check runs before the first copy. -/
 theorem refusal_writes_nothing (h : Bool) (id : Nat) (m : Meta) (p : Option Provider) :
+    -- The statement: if the restore refused, its list of writes is empty.
     (restore h id m p).refused = true → (restore h id m p).writes = [] := by
   -- Open up the restore, then look at both of its branches.
   unfold restore
@@ -192,6 +193,8 @@ theorem entitled_restore_is_faithful (id k : Nat) (m : Meta) (p : Provider)
     (hcur : p.has p.cur = true)
     -- ...and every table's key.
     (ht : m.tableKeys.all p.has = true) :
+    -- The statement: the restore is not refused, and it writes one copy per table of the sealed
+    -- listing, then a MANIFEST sealed under the provider's current key.
     restore false id m (some p) =
       ⟨m.sealedListing.map Write.copy ++ [Write.manifest (some p.cur)], false⟩ := by
   -- Every check passes by the hypotheses, so the restore takes its first
@@ -202,6 +205,7 @@ theorem entitled_restore_is_faithful (id k : Nat) (m : Meta) (p : Provider)
 theorem no_provider_refuses (h : Bool) (id k : Nat) (m : Meta)
     -- The file is sealed.
     (hkey : m.key = some k) :
+    -- The statement: without a provider the restore refuses.
     (restore h id m none).refused = true := by
   -- The file does not open without a provider, so the restore refuses.
   simp [restore, opens, hkey]
@@ -212,6 +216,7 @@ theorem missing_key_refuses (h : Bool) (id k : Nat) (m : Meta) (p : Provider)
     (hkey : m.key = some k)
     -- The provider has no key k.
     (hk : p.has k = false) :
+    -- The statement: the restore refuses.
     (restore h id m (some p)).refused = true := by
   -- The file does not open, so the restore refuses.
   simp [restore, opens, hkey, hk]
@@ -222,6 +227,7 @@ theorem wrong_key_refuses (h : Bool) (id k : Nat) (m : Meta) (p : Provider)
     (hkey : m.key = some k)
     -- The provider's bytes are not the ones that sealed it.
     (hr : p.right = false) :
+    -- The statement: the restore refuses.
     (restore h id m (some p)).refused = true := by
   -- The file does not open, so the restore refuses.
   simp [restore, opens, hkey, hr]
@@ -232,6 +238,7 @@ theorem edited_listing_refuses (h : Bool) (id k : Nat) (m : Meta) (p : Option Pr
     (hkey : m.key = some k)
     -- Someone changed the listing after the tag was computed.
     (hl : m.listing ≠ m.sealedListing) :
+    -- The statement: the restore refuses, with or without a provider.
     (restore h id m p).refused = true := by
   -- With or without a provider, look at each case.
   cases p with
@@ -246,6 +253,7 @@ theorem renamed_file_refuses (h : Bool) (id k : Nat) (m : Meta) (p : Option Prov
     (hkey : m.key = some k)
     -- It was written as another backup's file.
     (hb : m.bound ≠ id) :
+    -- The statement: the restore refuses, with or without a provider.
     (restore h id m p).refused = true := by
   -- With or without a provider, look at each case.
   cases p with
@@ -259,6 +267,7 @@ written: the MANIFEST could not be sealed. -/
 theorem unprovided_current_refuses (h : Bool) (id : Nat) (m : Meta) (p : Provider)
     -- The provider does not have the key it names current.
     (hcur : p.has p.cur = false) :
+    -- The statement: the restore refuses.
     (restore h id m (some p)).refused = true := by
   -- The key check fails, so the restore refuses.
   simp [restore, keysProvided, hcur]
@@ -270,6 +279,7 @@ theorem unprovided_table_key_refuses (h : Bool) (id t : Nat) (m : Meta) (p : Pro
     (ht : t ∈ m.tableKeys)
     -- ...which the provider does not have.
     (hmiss : p.has t = false) :
+    -- The statement: the restore refuses.
     (restore h id m (some p)).refused = true := by
   -- Not every table key is provided: the one at `t` is the witness.
   have hall : m.tableKeys.all p.has = false := by
@@ -283,6 +293,7 @@ theorem unprovided_table_key_refuses (h : Bool) (id t : Nat) (m : Meta) (p : Pro
 /-- **A target that already holds a MANIFEST refuses**: restoring over a
 database would replace tables its MANIFEST names. -/
 theorem finished_target_refuses (id : Nat) (m : Meta) (p : Option Provider) :
+    -- The statement: a restore into a target that has a MANIFEST refuses.
     (restore true id m p).refused = true := by
   -- The first check fails, so the restore refuses.
   simp [restore]
@@ -290,9 +301,11 @@ theorem finished_target_refuses (id : Nat) (m : Meta) (p : Option Provider) :
 /-- **Every MANIFEST a restore writes with a provider is sealed**, under a
 key that provider has. -/
 theorem restored_manifest_is_sealed (h : Bool) (id : Nat) (m : Meta) (p : Provider)
+    -- The key the MANIFEST was sealed under, or none for a plain one.
     (w : Option Nat)
     -- The restore wrote a MANIFEST sealed under `w`.
     (hw : Write.manifest w ∈ (restore h id m (some p)).writes) :
+    -- The statement: it was sealed under the provider's current key, and the provider has that key.
     w = some p.cur ∧ p.has p.cur = true := by
   -- Open up the restore and look at its two branches.
   unfold restore at hw
@@ -352,6 +365,7 @@ theorem last_write_holds_all {α : Type} (xs : List α) (x : α)
 /-- **The restored MANIFEST follows its tables**: a power cut that kept the
 MANIFEST kept every table copy before it. -/
 theorem restore_manifest_follows_its_tables (listing : List Nat) (w : Option Nat) :
+    -- The statement: whenever the first n writes hold the MANIFEST, they hold every table copy too.
     ∀ n, Write.manifest w ∈ (listing.map Write.copy ++ [Write.manifest w]).take n →
       ∀ c ∈ listing.map Write.copy,
         c ∈ (listing.map Write.copy ++ [Write.manifest w]).take n := by
@@ -378,6 +392,7 @@ def backupWrites (objs : List Nat) : List Put :=
 /-- **A backup's metadata follows its tables**: a power cut that kept the
 metadata kept every pool copy it lists. -/
 theorem backup_metadata_follows_its_tables (objs : List Nat) :
+    -- The statement: whenever the first n writes hold the metadata, they hold every pool copy too.
     ∀ n, Put.metadata ∈ (backupWrites objs).take n →
       ∀ c ∈ objs.map Put.pool, c ∈ (backupWrites objs).take n := by
   -- The metadata is not a pool copy, so the general fact applies.
@@ -429,6 +444,7 @@ removed, because nothing can tell which ones it needs. -/
 theorem collect_stops_on_unreadable (pool : List Nat) (remaining : List (Option (List Nat)))
     -- A remaining backup's metadata does not read.
     (h : none ∈ remaining) :
+    -- The statement: the collection removes nothing.
     collect pool remaining = [] := by
   -- Not every remaining backup reads: that one is the witness.
   have hall : remaining.all Option.isSome = false := by
@@ -451,6 +467,7 @@ theorem collect_removes_every_unlisted (pool : List Nat)
     (ho : o ∈ pool)
     -- ...and no remaining listing names it.
     (hun : ∀ l, some l ∈ remaining → o ∉ l) :
+    -- The statement: the collection removes o.
     o ∈ collect pool remaining := by
   -- Every remaining backup reads, so the collection takes its first branch.
   have hread : remaining.all Option.isSome = true := by
@@ -507,9 +524,12 @@ theorem foldl_strike_none (ls : List (Option (List Nat))) : ls.foldl strike none
 /-- Striking listing after listing is one decision: stopped if one does not
 read, and otherwise the candidates no listing names. -/
 theorem foldl_strike (ls : List (Option (List Nat))) (cand : List Nat) :
+    -- The statement: striking every listing in turn, starting from the candidates, gives:
     ls.foldl strike (some cand) =
       if ls.all Option.isSome then
+        -- if every listing reads, the candidates that no listing names;
         some (cand.filter fun o => !(ls.any fun l => (l.getD []).contains o))
+      -- and if one does not read, a stopped walk.
       else none := by
   -- Peel the listings off one at a time, for every starting candidate list.
   induction ls generalizing cand with
@@ -528,6 +548,8 @@ theorem foldl_strike (ls : List (Option (List Nat))) (cand : List Nat) :
     -- It reads: strike it, then the rest by the hypothesis; two filters in
     -- a row are one filter by "and", which is "neither it nor the rest".
     | some l =>
+      -- Unfold one step of the walk and of each test, and use the hypothesis for the rest; two
+      -- filters in a row become one.
       simp only [List.foldl_cons, strike, ih, List.all_cons, Option.isSome_some,
         Bool.true_and, List.any_cons, Option.getD_some, List.filter_filter, Bool.not_or,
         Bool.and_comm]
@@ -544,6 +566,8 @@ def collectStream (batch : List Nat) (walk : List (List (Option (List Nat)))) : 
 /-- **However the walk batches and orders the listings, the streamed batch
 removes exactly what the collection with every listing in hand removes.** -/
 theorem collect_stream_eq (batch : List Nat) (walk : List (List (Option (List Nat)))) :
+    -- The statement: the streamed batch removes exactly what the collection with every listing in
+    -- hand removes.
     collectStream batch walk = collect batch walk.flatten := by
   -- Reading batch after batch is reading the listings one after another.
   have hflat : walk.foldl (fun c b => b.foldl strike c) (some batch) =
@@ -572,6 +596,8 @@ read, in any batches, what it removes is a sublist of its batch, so it
 never holds more candidates than the batch, however many backups and
 tables the repository keeps. -/
 theorem stream_holds_one_batch (batch : List Nat) (walk : List (List (Option (List Nat)))) :
+    -- The statement: what is removed is drawn, in order, from the batch, and is no longer than the
+    -- batch.
     (collectStream batch walk).Sublist batch ∧
       (collectStream batch walk).length ≤ batch.length := by
   -- What is left is a filter of the batch, or nothing.
@@ -608,6 +634,7 @@ def sweep (chunks : List (List Nat)) (remaining : List (Option (List Nat))) : Li
 /-- **Batch after batch, the sweep removes exactly what one collection of
 the whole pool removes.** -/
 theorem sweep_eq (chunks : List (List Nat)) (remaining : List (Option (List Nat))) :
+    -- The statement: the sweep removes exactly what one collection of the whole pool removes.
     sweep chunks remaining = collect chunks.flatten remaining := by
   -- One chunk at a time.
   induction chunks with
@@ -627,6 +654,7 @@ theorem sweep_eq (chunks : List (List Nat)) (remaining : List (Option (List Nat)
 /-- The sweep with each chunk collected streamed, every chunk's walk of
 `meta/` handing out the same listings in the same batches. -/
 def sweepStream (chunks : List (List Nat)) (walk : List (List (Option (List Nat)))) :
+    -- It returns the list of pool files removed.
     List Nat :=
   -- Each chunk streamed, chunk after chunk.
   chunks.flatMap fun c => collectStream c walk
@@ -634,6 +662,8 @@ def sweepStream (chunks : List (List Nat)) (walk : List (List (Option (List Nat)
 /-- **The streamed sweep removes exactly what one collection of the whole
 pool, with every listing in hand, removes.** -/
 theorem sweep_stream_eq (chunks : List (List Nat)) (walk : List (List (Option (List Nat)))) :
+    -- The statement: the streamed sweep removes exactly what one collection of the whole pool, with
+    -- every listing in hand, removes.
     sweepStream chunks walk = collect chunks.flatten walk.flatten := by
   -- Each streamed chunk is the chunk collected in one go...
   have hc : sweepStream chunks walk = sweep chunks walk.flatten := by
@@ -665,6 +695,7 @@ theorem sweep_removes_every_unlisted (chunks : List (List Nat))
     (ho : o ∈ chunks.flatten)
     -- ...and no remaining listing names it.
     (hun : ∀ l, some l ∈ remaining → o ∉ l) :
+    -- The statement: the sweep removes o.
     o ∈ sweep chunks remaining := by
   -- The sweep is one collection of the whole pool...
   rw [sweep_eq]
@@ -698,6 +729,7 @@ def listBackups (dir : List File) : List (Nat × Bool) :=
 /-- **The listing names every backup, in order, each once.** It rules out
 a list that looks whole and is not: its ids are exactly the files' ids. -/
 theorem listing_names_every_backup (dir : List File) :
+    -- The statement: the ids the listing shows are exactly the ids of the files, in the same order.
     (listBackups dir).map Prod.fst = dir.map File.id := by
   -- Mapping twice is mapping the composition, and the id of an entry is
   -- the file's id.
@@ -709,6 +741,7 @@ theorem unreadable_is_listed (dir : List File) (f : File)
     (hf : f ∈ dir)
     -- ...and its metadata does not decode.
     (h : f.listing = none) :
+    -- The statement: the listing shows the backup, marked unreadable.
     (f.id, false) ∈ listBackups dir := by
   -- Being in the listing means being some file's entry.
   simp only [listBackups, List.mem_map]
@@ -722,6 +755,7 @@ theorem readable_is_listed_sealed_or_not (dir : List File) (f : File) (l : List 
     (hf : f ∈ dir)
     -- ...and its listing decodes, whatever `f.sealed` is.
     (h : f.listing = some l) :
+    -- The statement: the listing shows the backup, marked readable.
     (f.id, true) ∈ listBackups dir := by
   -- Being in the listing means being some file's entry.
   simp only [listBackups, List.mem_map]
@@ -745,6 +779,8 @@ def purgeKept (ids : List Nat) (keep : Nat) : List Nat :=
 rest.** It keeps `keep` of them, or all when there are fewer, and every
 backup is either deleted or kept, never both. -/
 theorem purge_keeps_the_newest (ids : List Nat) (keep : Nat) :
+    -- The statement: the purge keeps `keep` backups (or all, when there are fewer), and the deleted
+    -- ones followed by the kept ones are the whole list.
     (purgeKept ids keep).length = min keep ids.length ∧
       purgeDoomed ids keep ++ purgeKept ids keep = ids := by
   -- Two halves.
@@ -799,6 +835,7 @@ def listPages (s : List Nat) (k : Nat) : Nat → Option Nat → List Nat
 /-- In a list in strictly rising order, nothing comes after the last
 element: every element is at most the last one. -/
 theorem le_last {t : List Nat} (h : t.Pairwise (· < ·)) {m : Nat} (hm : t.getLast? = some m) :
+    -- The statement: every element is at most the last one, m.
     ∀ x ∈ t, x ≤ m := by
   -- Take any element `x` of the list.
   intro x hx
@@ -822,7 +859,9 @@ theorem le_last {t : List Nat} (h : t.Pairwise (· < ·)) {m : Nat} (hm : t.getL
 /-- The page boundary loses nothing and repeats nothing: the ids above the
 last id of a page are exactly the ids after that page. -/
 theorem above_last_is_rest {s : List Nat} (hs : s.Pairwise (· < ·)) (a : Option Nat) (k : Nat)
+    -- m is the last id of the page of k ids above a.
     {m : Nat} (hm : ((s.filter (above a)).take k).getLast? = some m) :
+    -- The statement: the ids above m are the ids above a, without their first k.
     s.filter (above (some m)) = (s.filter (above a)).drop k := by
   -- Call the ids above `a` by one name, `u`.
   generalize hu : s.filter (above a) = u at hm
@@ -899,6 +938,8 @@ theorem above_last_is_rest {s : List Nat} (hs : s.Pairwise (· < ·)) (a : Optio
 order**, for every page size `k` of at least one, given fuel past the
 number of those ids. -/
 theorem list_pages {s : List Nat} (hs : s.Pairwise (· < ·)) {k : Nat} (hk : 0 < k) :
+    -- The statement: with more fuel than there are ids above a, the pages together are exactly the
+    -- ids above a.
     ∀ fuel a, (s.filter (above a)).length < fuel → listPages s k fuel a = s.filter (above a) := by
   -- By induction on the fuel.
   intro fuel
@@ -950,6 +991,8 @@ theorem list_pages {s : List Nat} (hs : s.Pairwise (· < ·)) {k : Nat} (hk : 0 
 /-- **The listing names every backup once, in id order**, whatever the
 page size. -/
 theorem list_pages_all {s : List Nat} (hs : s.Pairwise (· < ·)) {k : Nat} (hk : 0 < k) :
+    -- The statement: starting before the first id, with one more fuel than ids, the pages together
+    -- are the whole list.
     listPages s k (s.length + 1) none = s := by
   -- Before the first page every id is ahead.
   have hnone : s.filter (above none) = s := List.filter_eq_self.mpr fun _ _ => rfl
@@ -1026,6 +1069,7 @@ def restoreCheckAfterCopy (hasManifest : Bool) (id : Nat) (m : Meta) (p : Option
   if !hasManifest && opens id m p then
     -- ...then the copies are made, and only then the keys checked.
     if keysProvided m p then
+      -- Every key is there: the copies, then the MANIFEST, and no refusal.
       ⟨m.listing.map Write.copy ++ [Write.manifest (p.map Provider.cur)], false⟩
     -- A refusal after the copies.
     else ⟨m.listing.map Write.copy, true⟩
@@ -1064,7 +1108,9 @@ def opensUnbound (m : Meta) : Option Provider → Bool
 def restoreUnbound (m : Meta) (p : Option Provider) : Run :=
   -- The same checks, less the listing and the id.
   if opensUnbound m p && keysProvided m p then
+    -- The checks pass: the copies, then the MANIFEST, and no refusal.
     ⟨m.listing.map Write.copy ++ [Write.manifest (p.map Provider.cur)], false⟩
+  -- Otherwise: nothing written, refused.
   else ⟨[], true⟩
 
 /-- A provider with both keys and the right bytes, key 1 current. -/
@@ -1126,6 +1172,7 @@ def restorePlain (hasManifest : Bool) (id : Nat) (m : Meta) (p : Option Provider
   if !hasManifest && opens id m p && keysProvided m p then
     -- ...but a plain MANIFEST.
     ⟨m.listing.map Write.copy ++ [Write.manifest none], false⟩
+  -- Otherwise: nothing written, refused.
   else ⟨[], true⟩
 
 /-- **RED `PlainRestore`.** With the right key the engine seals the MANIFEST
@@ -1172,6 +1219,7 @@ theorem metadata_first_loses_a_table :
 read without a key, so it skips the sealed ones. Each remaining backup is
 (whether it is sealed, its listing). -/
 def collectSkipsSealed (pool : List Nat) (remaining : List (Bool × Option (List Nat))) :
+    -- It returns the list of pool files removed.
     List Nat :=
   -- Only plain listings count.
   collect pool ((remaining.filter fun b => !b.1).map Prod.snd)
@@ -1190,6 +1238,7 @@ theorem gc_skips_sealed_removes_a_listed_file :
 /-- The defect `GcSkipsUnreadable`: a delete passes over every remaining
 backup whose metadata does not read. -/
 def collectSkipsUnreadable (pool : List Nat) (remaining : List (Option (List Nat))) :
+    -- It returns the list of pool files removed.
     List Nat :=
   -- Only the listings that read count.
   collect pool (remaining.filter Option.isSome)
@@ -1272,6 +1321,7 @@ def metaKey (encrypted : Bool) (current : Nat) : Option Nat :=
 /-- **The metadata of an encrypted database's backup is sealed** and names
 the current key (`SealedMetadata`). -/
 theorem encrypted_backup_names_its_key (current : Nat) :
+    -- The statement: the metadata of an encrypted database's backup names the current key.
     metaKey true current = some current := by
   -- The encrypted branch.
   simp [metaKey]

@@ -40,11 +40,31 @@
 //! touch the state word only, one atomic read-modify-write each. Anything
 //! that can make a waiter runnable (a release, a new waiter, a
 //! cancellation) takes the drain role with one compare-and-swap, or, when
-//! another thread holds it, marks the state dirty and returns, so no call
-//! ever waits for another. The holder wakes what the state allows (or,
-//! while a handoff is owed, grants it in queue order), rechecks until
+//! another thread holds it, leaves a mark for the holder and returns, so
+//! no call ever waits for another. The holder wakes what the state allows
+//! (or, while a handoff is owed, grants it in queue order), rechecks until
 //! nothing changed while it worked, and calls the wakers after it has
 //! given the role up.
+//!
+//! # Progress
+//!
+//! Every operation is lock-free, not wait-free. No call waits for another
+//! thread, and some call always completes; but a call may do work on
+//! behalf of others, and how much depends on them.
+//!
+//! - Uncontended, an acquire and a release are one atomic
+//!   read-modify-write each.
+//! - A call that can make a waiter runnable (a release with waiters, a new
+//!   waiter, a cancellation) may serve the queue itself. It returns after
+//!   one pass over the queue, plus at most one more pass for each of these
+//!   that lands while it works: a waiter that queues, a waiter that
+//!   withdraws, a waiter that claims the handoff it is owed, and a release
+//!   that finds a node queued.
+//! - A release over an empty queue earns no pass; a release that finds a
+//!   node queued earns one. So releases alone never keep a thread at work.
+//!   Waiters that keep queueing or withdrawing can, one pass each: every
+//!   such pass is another thread's own operation getting done, which is
+//!   what lock-free means, and there is no cap on the passes of one call.
 //!
 //! Besides the primitives, this module re-exports kovan's lock-free
 //! channels (their non-blocking half), map, queues and [`Atom`], so one

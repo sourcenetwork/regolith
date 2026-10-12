@@ -84,7 +84,7 @@ pub fn a_unit_is_claimed_once_and_runs_once() {
                 thread::spawn(move || {
                     let won = unit.claim();
                     if won {
-                        unit.run(&cache);
+                        unit.run(&cache, || false);
                     }
                     usize::from(won)
                 })
@@ -92,7 +92,7 @@ pub fn a_unit_is_claimed_once_and_runs_once() {
             .collect();
         let mut won = usize::from(unit.claim());
         if won == 1 {
-            unit.run(&cache);
+            unit.run(&cache, || false);
         }
         for racer in racers {
             won += racer.join().expect("racer");

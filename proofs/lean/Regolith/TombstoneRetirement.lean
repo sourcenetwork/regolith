@@ -54,7 +54,8 @@ inductive Kind where
   | put
   /-- A range tombstone over the keys `lo ..= hi`. -/
   | rt
-  deriving DecidableEq -- kinds can be compared, so `decide` can tell them apart
+  -- Kinds can be compared, so `decide` can tell them apart
+  deriving DecidableEq
 
 /-- One entry of the tree. A put of key `k` has `lo = hi = k`. -/
 structure Entry where
@@ -152,14 +153,16 @@ def Before (A W B : Entries) : Entries := fun e => A e ∨ W e ∨ B e
 /-- The tree after a pass that retires by rule `R`: the window loses what is
 shadowed and what `R` retires. -/
 def After (A W B : Entries) (live : Nat → Prop) (R : Entry → Prop) : Entries :=
-  fun e => A e ∨ (W e ∧ ¬ Shadowed W live e ∧ ¬ R e) ∨ B e -- kept above, kept in the window unless dropped, kept deeper
+  -- Kept above, kept in the window unless dropped, kept deeper
+  fun e => A e ∨ (W e ∧ ¬ Shadowed W live e ∧ ¬ R e) ∨ B e
 
 /-- A retired tombstone `t` hides no surviving put of a key it covers that is
 older than it: such a put is not newer (`A` is newer than the window), not
 deeper (nothing deeper meets `t`), and not in the window (`t` shadows it
 there). The heart of the argument. -/
 theorem retired_leaves_nothing_under {A W B : Entries} {live : Nat → Prop}
-    {t e : Entry} {k : Nat} -- a tombstone t, a surviving entry e, and a key k
+    -- A tombstone t, a surviving entry e, and a key k
+    {t e : Entry} {k : Nat}
     -- Everything above the window is newer than everything in it,
     (hA : ∀ a w, A a → W w → w.seq < a.seq)
     -- `t` is retired,
@@ -177,18 +180,25 @@ theorem retired_leaves_nothing_under {A W B : Entries} {live : Nat → Prop}
   obtain ⟨hWt, hrt, hlive, hclear⟩ := hR
   -- Where does the surviving put live?
   rcases he with hAe | ⟨hWe, hns, _⟩ | hBe
-  · -- Above the window: newer than `t`, which is in the window.
+  -- Above the window: newer than `t`, which is in the window.
+  ·
+    -- Everything above the window is newer than everything in it, t included.
     have := hA e t hAe hWt
     -- But it is older than `t`: impossible.
     omega
-  · -- In the window and not shadowed. But `t` shadows it:
+  -- In the window and not shadowed. But `t` shadows it:
+  ·
+    -- It is enough to show that t shadows it, since it was said not to be shadowed.
     apply hns
     -- it is a put, `t` is in the window, covers its key, is newer, and every
     -- live snapshot is at or above `t`.
     refine ⟨hp.1, t, hWt, ?_, hlt, fun l hl _ => hlive l hl⟩
     -- `t` covers `e.lo`, which is `k`.
     rw [hp.2.1]; exact hc
-  · -- Deeper: then it meets `t`'s range, which retirement forbids.
+  -- Deeper: then it meets `t`'s range, which retirement forbids.
+  ·
+    -- The retirement condition says no deeper entry meets t's range; it is left to show that this
+    -- one does.
     apply hclear e hBe
     -- `e` holds only `k`, and `t` covers `k`.
     exact ⟨by rw [hp.2.1]; exact hc.2.2, by rw [hp.2.2]; exact hc.2.1⟩
@@ -202,7 +212,8 @@ theorem retire_keeps_reads {A W B : Entries} {live : Nat → Prop} {k s : Nat}
     (hA : ∀ a w, A a → W w → w.seq < a.seq)
     -- and `s` is a live snapshot or the head.
     (hs : live s ∨ ∀ e, Before A W B e → e.seq ≤ s) :
-    ∀ p, Wins (Before A W B) k s p ↔ Wins (After A W B live (Retired W B live)) k s p := by -- claim: the same p wins before and after
+    -- Claim: the same p wins before and after
+    ∀ p, Wins (Before A W B) k s p ↔ Wins (After A W B live (Retired W B live)) k s p := by
   -- Take any sequence `p`.
   intro p
   -- A tombstone of the window that is newer than a put at `q ≤ s` and in
@@ -214,24 +225,39 @@ theorem retire_keeps_reads {A W B : Entries} {live : Nat → Prop} {k s : Nat}
     intro q t hWt hq hstripe
     -- Split on the kind of read point.
     rcases hs with hl | hhead
-    · -- A live snapshot at or above `q`: the stripe rule bounds `t` by it.
+    -- A live snapshot at or above `q`: the stripe rule bounds `t` by it.
+    ·
+      -- The stripe rule, applied to the snapshot s, gives exactly this.
       exact hstripe s hl hq
-    · -- The head: at or above everything, `t` included.
+    -- The head: at or above everything, `t` included.
+    ·
+      -- The head is at or above every entry there was before the pass, and t is one of them.
       exact hhead t (Or.inr (Or.inl hWt))
   -- Two directions.
   constructor
-  · -- Before to after. Unpack the win before.
+  -- Before to after. Unpack the win before.
+  ·
+    -- Name the parts: the winning put e0; p is visible at s; no visible put of k is newer; no
+    -- visible tombstone hides it.
     intro ⟨⟨e0, hE0, hP0, hs0⟩, hps, hmax, hnot⟩
     -- Four clauses to show after.
     refine ⟨⟨e0, ?_, hP0, hs0⟩, hps, ?_, ?_⟩
-    · -- The winning put survives. Where was it?
+    -- The winning put survives. Where was it?
+    ·
+      -- Above the window, in it, or deeper.
       rcases hE0 with h | h | h
-      · -- Above the window: kept.
+      -- Above the window: kept.
+      ·
+        -- "Above" is the first case of "after".
         exact Or.inl h
-      · -- In the window: kept unless shadowed or retired.
+      -- In the window: kept unless shadowed or retired.
+      ·
+        -- The second case of "after"; "not shadowed" and "not retired" are left.
         refine Or.inr (Or.inl ⟨h, ?_, ?_⟩)
-        · -- Shadowed would mean a covering tombstone newer than it and
-          -- visible at `s`, which its win rules out.
+        -- Shadowed would mean a covering tombstone newer than it and visible at `s`, which its win
+        -- rules out.
+        ·
+          -- Suppose it is shadowed, by a tombstone t of the window.
           intro ⟨_, t, hWt, hc, hlt, hstripe⟩
           -- That tombstone is visible at `s`.
           have hts := visible e0.seq t hWt (by omega) hstripe
@@ -239,49 +265,78 @@ theorem retire_keeps_reads {A W B : Entries} {live : Nat → Prop} {k s : Nat}
           rw [hP0.2.1] at hc
           -- The win says no such tombstone exists.
           exact hnot t (Or.inr (Or.inl hWt)) hc ⟨by omega, hts⟩
-        · -- Retired needs a tombstone; the winner is a put.
+        -- Retired needs a tombstone; the winner is a put.
+        ·
+          -- Suppose it is retired; then its kind is "tombstone".
           intro ⟨_, hrt, _⟩
           -- `put = rt` is false.
           rw [hP0.1] at hrt
           -- Distinct constructors.
           exact absurd hrt (by decide)
-      · -- Deeper: kept.
+      -- Deeper: kept.
+      ·
+        -- "Deeper" is the third case of "after".
         exact Or.inr (Or.inr h)
-    · -- Every put after was there before, so none is newer.
+    -- Every put after was there before, so none is newer.
+    ·
+      -- Take a visible put e of k that is there after the pass.
       intro e he hP hes
       -- Turn "after" into "before".
       apply hmax e _ hP hes
       -- Each case of "after" is a case of "before".
       rcases he with h | ⟨h, _, _⟩ | h
-      · -- Above.
+      -- Above.
+      ·
+        -- The first case of "before".
         exact Or.inl h
-      · -- In the window.
+      -- In the window.
+      ·
+        -- The second case of "before".
         exact Or.inr (Or.inl h)
-      · -- Deeper.
+      -- Deeper.
+      ·
+        -- The third case of "before".
         exact Or.inr (Or.inr h)
-    · -- Every tombstone after was there before, so none hides the winner.
+    -- Every tombstone after was there before, so none hides the winner.
+    ·
+      -- Take a tombstone t that is there after the pass and covers k.
       intro t ht hc
       -- Turn "after" into "before".
       apply hnot t _ hc
       -- Each case of "after" is a case of "before".
       rcases ht with h | ⟨h, _, _⟩ | h
-      · -- Above.
+      -- Above.
+      ·
+        -- The first case of "before".
         exact Or.inl h
-      · -- In the window.
+      -- In the window.
+      ·
+        -- The second case of "before".
         exact Or.inr (Or.inl h)
-      · -- Deeper.
+      -- Deeper.
+      ·
+        -- The third case of "before".
         exact Or.inr (Or.inr h)
-  · -- After to before. Unpack the win after.
+  -- After to before. Unpack the win after.
+  ·
+    -- Name the parts: the winning put e0; p is visible at s; no visible put of k is newer; no
+    -- visible tombstone hides it.
     intro ⟨⟨e0, hE0, hP0, hs0⟩, hps, hmax, hnot⟩
     -- The winning put was there before.
     have hB0 : Before A W B e0 := by
       -- Each case of "after" is a case of "before".
       rcases hE0 with h | ⟨h, _, _⟩ | h
-      · -- Above.
+      -- Above.
+      ·
+        -- The first case of "before".
         exact Or.inl h
-      · -- In the window.
+      -- In the window.
+      ·
+        -- The second case of "before".
         exact Or.inr (Or.inl h)
-      · -- Deeper.
+      -- Deeper.
+      ·
+        -- The third case of "before".
         exact Or.inr (Or.inr h)
     -- A covering tombstone newer than the winner and visible at `s` is
     -- impossible before too: kept, the win after rules it out; dropped, it
@@ -291,25 +346,39 @@ theorem retire_keeps_reads {A W B : Entries} {live : Nat → Prop} {k s : Nat}
       intro t hBt hc hpt hts
       -- Was it kept by the pass?
       by_cases hkept : After A W B live (Retired W B live) t
-      · -- Kept: the win after says it does not hide the winner.
+      -- Kept: the win after says it does not hide the winner.
+      ·
+        -- The win after the pass, applied to this kept tombstone.
         exact hnot t hkept hc ⟨hpt, hts⟩
-      · -- Dropped: it was in the window, and shadowed or retired.
+      -- Dropped: it was in the window, and shadowed or retired.
+      ·
+        -- It was in the window:
         have hWt : W t := by
           -- Above or deeper would have kept it.
           rcases hBt with h | h | h
-          · -- Above: kept, contradiction.
+          -- Above: kept, contradiction.
+          ·
+            -- "Above" is a case of "after", yet it was not kept.
             exact absurd (Or.inl h) hkept
-          · -- In the window: that is the claim.
+          -- In the window: that is the claim.
+          ·
+            -- Exactly what is asked.
             exact h
-          · -- Deeper: kept, contradiction.
+          -- Deeper: kept, contradiction.
+          ·
+            -- "Deeper" is a case of "after", yet it was not kept.
             exact absurd (Or.inr (Or.inr h)) hkept
         -- Shadowed needs a put; `t` is a tombstone. So it was retired.
         have hret : Retired W B live t := by
           -- Ask whether it was retired.
           by_cases hr : Retired W B live t
-          · -- It was: done.
+          -- It was: done.
+          ·
+            -- Exactly what is asked.
             exact hr
-          · -- Not retired and not shadowed would have kept it.
+          -- Not retired and not shadowed would have kept it.
+          ·
+            -- Aim for a contradiction.
             exfalso
             -- Show it was kept, contradicting `hkept`.
             apply hkept
@@ -325,36 +394,55 @@ theorem retire_keeps_reads {A W B : Entries} {live : Nat → Prop} {k s : Nat}
         exact retired_leaves_nothing_under hA hret hc hE0 hP0 (by omega)
     -- Four clauses to show before.
     refine ⟨⟨e0, hB0, hP0, hs0⟩, hps, ?_, ?_⟩
-    · -- No visible put of `k` before is newer than the winner.
+    -- No visible put of `k` before is newer than the winner.
+    ·
+      -- Take a visible put e of k that was there before.
       intro e hBe hP hes
       -- Suppose it were newer.
       by_cases hle : e.seq ≤ p
-      · -- It is not: done.
+      -- It is not: done.
+      ·
+        -- Exactly what is asked.
         exact hle
-      · -- It is: was it kept?
+      -- It is: was it kept?
+      ·
+        -- Aim for a contradiction.
         exfalso
         -- Kept or dropped.
         by_cases hkept : After A W B live (Retired W B live) e
-        · -- Kept: the win after says it is no newer.
+        -- Kept: the win after says it is no newer.
+        ·
+          -- The win after the pass says e is no newer than the winner, against the assumption.
           exact hle (hmax e hkept hP hes)
-        · -- Dropped: it was in the window and shadowed (retired needs a
-          -- tombstone).
+        -- Dropped: it was in the window and shadowed (retired needs a tombstone).
+        ·
+          -- It was in the window:
           have hWe : W e := by
             -- Above or deeper would have kept it.
             rcases hBe with h | h | h
-            · -- Above: kept, contradiction.
+            -- Above: kept, contradiction.
+            ·
+              -- "Above" is a case of "after", yet it was not kept.
               exact absurd (Or.inl h) hkept
-            · -- In the window: that is the claim.
+            -- In the window: that is the claim.
+            ·
+              -- Exactly what is asked.
               exact h
-            · -- Deeper: kept, contradiction.
+            -- Deeper: kept, contradiction.
+            ·
+              -- "Deeper" is a case of "after", yet it was not kept.
               exact absurd (Or.inr (Or.inr h)) hkept
           -- Shadowed, since it was dropped and is no tombstone.
           have hsh : Shadowed W live e := by
             -- Ask whether it was shadowed.
             by_cases h : Shadowed W live e
-            · -- It was: done.
+            -- It was: done.
+            ·
+              -- Exactly what is asked.
               exact h
-            · -- Not shadowed and not retired would have kept it.
+            -- Not shadowed and not retired would have kept it.
+            ·
+              -- Aim for a contradiction.
               exfalso
               -- Show it was kept, contradicting `hkept`.
               apply hkept
@@ -375,7 +463,10 @@ theorem retire_keeps_reads {A W B : Entries} {live : Nat → Prop} {k s : Nat}
           rw [hP.2.1] at hc
           -- Such a tombstone is impossible.
           exact no_hider t (Or.inr (Or.inl hWt)) hc (by omega) hts
-    · -- No visible tombstone before hides the winner.
+    -- No visible tombstone before hides the winner.
+    ·
+      -- Take a tombstone t that was there before, covers k, is newer than the winner and is visible
+      -- at s.
       intro t hBt hc ⟨hpt, hts⟩
       -- That is `no_hider`.
       exact no_hider t hBt hc hpt hts
@@ -387,7 +478,8 @@ theorem retire_keeps_read_value {A W B : Entries} {live : Nat → Prop} {k s : N
     (hA : ∀ a w, A a → W w → w.seq < a.seq)
     -- and `s` is a live snapshot or the head.
     (hs : live s ∨ ∀ e, Before A W B e → e.seq ≤ s) :
-    ∀ v, ReadsAs (Before A W B) k s v ↔ ReadsAs (After A W B live (Retired W B live)) k s v := by -- claim: the read returns the same value before and after
+    -- Claim: the read returns the same value before and after
+    ∀ v, ReadsAs (Before A W B) k s v ↔ ReadsAs (After A W B live (Retired W B live)) k s v := by
   -- Take the value `v`.
   intro v
   -- The winners agree.
@@ -396,17 +488,29 @@ theorem retire_keeps_read_value {A W B : Entries} {live : Nat → Prop} {k s : N
   unfold ReadsAs
   -- Either `v` wins on both sides, or nothing wins on either.
   constructor
-  · -- Before to after.
+  -- Before to after.
+  ·
+    -- Either v wins before, or v is "absent" and nothing wins before.
     rintro (hw | ⟨hv, hnone⟩)
-    · -- `v` wins before, so after.
+    -- `v` wins before, so after.
+    ·
+      -- The winners agree, in the forward direction.
       exact Or.inl ((h v).1 hw)
-    · -- Nothing wins before, so nothing after.
+    -- Nothing wins before, so nothing after.
+    ·
+      -- v is "absent"; anything that won after would have won before.
       exact Or.inr ⟨hv, fun p hp => hnone p ((h p).2 hp)⟩
-  · -- After to before.
+  -- After to before.
+  ·
+    -- Either v wins after, or v is "absent" and nothing wins after.
     rintro (hw | ⟨hv, hnone⟩)
-    · -- `v` wins after, so before.
+    -- `v` wins after, so before.
+    ·
+      -- The winners agree, in the backward direction.
       exact Or.inl ((h v).2 hw)
-    · -- Nothing wins after, so nothing before.
+    -- Nothing wins after, so nothing before.
+    ·
+      -- v is "absent"; anything that won before would win after.
       exact Or.inr ⟨hv, fun p hp => hnone p ((h p).1 hp)⟩
 
 /-! ## The RED cases -/
@@ -425,7 +529,8 @@ reads the put back where it read absent. -/
 theorem ignore_snapshots_breaks_reads :
     -- Nothing above, nothing deeper.
     let A : Entries := fun _ => False
-    let B : Entries := fun _ => False -- nothing deeper
+    -- Nothing deeper either.
+    let B : Entries := fun _ => False
     -- The window: the put and the tombstone.
     let W : Entries := fun e => e = put 7 1 ∨ e = tomb 5 9 3
     -- One live snapshot, at 2.
@@ -438,56 +543,97 @@ theorem ignore_snapshots_breaks_reads :
   intro A B W live R
   -- Two claims.
   constructor
-  · -- Before: the tombstone at 3 covers 7 and is newer than the put.
+  -- Before: the tombstone at 3 covers 7 and is newer than the put.
+  ·
+    -- Suppose sequence 1 wins before; take its "no newer tombstone" clause.
     intro ⟨_, _, _, hnot⟩
     -- Apply the "no newer tombstone" clause to it.
     exact hnot (tomb 5 9 3) (Or.inr (Or.inl (Or.inr rfl)))
-      ⟨rfl, by decide, by decide⟩ ⟨by decide, by decide⟩ -- it covers 7, is newer than 1, and is visible at 3
-  · -- After: the put survives and the tombstone is gone.
+      -- It covers 7, is newer than 1, and is visible at 3
+      ⟨rfl, by decide, by decide⟩ ⟨by decide, by decide⟩
+  -- After: the put survives and the tombstone is gone.
+  ·
+    -- The winner is the put of 7 at 1, visible at 3; three parts are left: it survives, no put is
+    -- newer, no tombstone hides it.
     refine ⟨⟨put 7 1, ?_, ⟨rfl, rfl, rfl⟩, rfl⟩, by decide, ?_, ?_⟩
-    · -- The put is in the window, not shadowed, not retired.
+    -- The put is in the window, not shadowed, not retired.
+    ·
+      -- The second case of "after"; "not shadowed" and "not retired" are left.
       refine Or.inr (Or.inl ⟨Or.inl rfl, ?_, ?_⟩)
-      · -- Shadowed would need the tombstone at 3 below the snapshot at 2.
+      -- Shadowed would need the tombstone at 3 below the snapshot at 2.
+      ·
+        -- Suppose a tombstone t of the window shadows it.
         intro ⟨_, t, hWt, _, hlt, hstripe⟩
         -- The snapshot at 2 is live and at or above the put.
         have := hstripe 2 rfl (by decide)
         -- The window's members: the put itself, or the tombstone.
         rcases hWt with rfl | rfl
-        · -- The put is not newer than itself.
+        -- The put is not newer than itself.
+        ·
+          -- "1 < 1" is false.
           exact absurd hlt (by decide)
-        · -- The tombstone at 3 is not at or below 2.
+        -- The tombstone at 3 is not at or below 2.
+        ·
+          -- "3 ≤ 2" is false.
           exact absurd this (by decide)
-      · -- Retired would make the put a tombstone.
+      -- Retired would make the put a tombstone.
+      ·
+        -- Suppose the put is retired; then its kind would be "tombstone".
         intro ⟨_, hk⟩
         -- `put = rt` is false.
         exact absurd hk (by decide)
-    · -- The only put after is the put itself.
+    -- The only put after is the put itself.
+    ·
+      -- Take a put e of 7 that is there after the pass.
       intro e he hP _
       -- Find it among the survivors.
       rcases he with h | ⟨hW, _, _⟩ | h
-      · -- Nothing above.
+      -- Nothing above.
+      ·
+        -- "Above" is empty.
         exact absurd h id
-      · -- In the window: the put or the tombstone.
+      -- In the window: the put or the tombstone.
+      ·
+        -- Split on which.
         rcases hW with rfl | rfl
-        · -- The put: sequence 1, no newer.
+        -- The put: sequence 1, no newer.
+        ·
+          -- 1 ≤ 1.
           exact Nat.le_refl 1
-        · -- The tombstone is not a put of 7: its kind is `rt`.
+        -- The tombstone is not a put of 7: its kind is `rt`.
+        ·
+          -- "rt = put" is false.
           exact absurd hP.1 (by decide)
-      · -- Nothing deeper.
+      -- Nothing deeper.
+      ·
+        -- "Deeper" is empty.
         exact absurd h id
-    · -- No tombstone survives.
+    -- No tombstone survives.
+    ·
+      -- Take a tombstone t that is there after the pass and covers 7.
       intro t ht hc
       -- Find it among the survivors.
       rcases ht with h | ⟨hW, _, hR⟩ | h
-      · -- Nothing above.
+      -- Nothing above.
+      ·
+        -- "Above" is empty.
         exact absurd h id
-      · -- In the window: the put or the tombstone.
+      -- In the window: the put or the tombstone.
+      ·
+        -- Split on which.
         rcases hW with rfl | rfl
-        · -- The put covers nothing: its kind is `put`.
+        -- The put covers nothing: its kind is `put`.
+        ·
+          -- "put = rt" is false.
           exact absurd hc.1 (by decide)
-        · -- The tombstone was retired by the mutant rule.
+        -- The tombstone was retired by the mutant rule.
+        ·
+          -- It is in the window and a tombstone, so the mutant rule retired it: it cannot have
+          -- survived.
           exact absurd ⟨Or.inr rfl, rfl⟩ hR
-      · -- Nothing deeper.
+      -- Nothing deeper.
+      ·
+        -- "Deeper" is empty.
         exact absurd h id
 
 /-- **RED `IgnoreDeeper`.** Retire with the snapshots clear but a deeper run
@@ -512,40 +658,63 @@ theorem ignore_deeper_breaks_reads :
   intro A W B live R
   -- Two claims.
   constructor
-  · -- Before: the tombstone at 2 covers 7 and is newer than the put.
+  -- Before: the tombstone at 2 covers 7 and is newer than the put.
+  ·
+    -- Suppose sequence 1 wins before; take its "no newer tombstone" clause.
     intro ⟨_, _, _, hnot⟩
     -- Apply the "no newer tombstone" clause to it.
     exact hnot (tomb 5 9 2) (Or.inr (Or.inl rfl)) ⟨rfl, by decide, by decide⟩
-      ⟨by decide, by decide⟩ -- it is newer than 1 and visible at 2
-  · -- After: the deeper put survives and the tombstone is gone.
+      -- It is newer than 1 and visible at 2
+      ⟨by decide, by decide⟩
+  -- After: the deeper put survives and the tombstone is gone.
+  ·
+    -- The winner is the deeper put of 7 at 1, visible at 2; two parts are left: no put is newer, no
+    -- tombstone hides it.
     refine ⟨⟨put 7 1, Or.inr (Or.inr rfl), ⟨rfl, rfl, rfl⟩, rfl⟩, by decide, ?_, ?_⟩
-    · -- The only put after is the deeper one.
+    -- The only put after is the deeper one.
+    ·
+      -- Take a put e of 7 that is there after the pass.
       intro e he hP _
       -- Find it among the survivors.
       rcases he with h | ⟨hW, _, _⟩ | h
-      · -- Nothing above.
+      -- Nothing above.
+      ·
+        -- "Above" is empty.
         exact absurd h id
-      · -- The window holds only the tombstone, which is no put.
+      -- The window holds only the tombstone, which is no put.
+      ·
+        -- Replace e by the window's only entry, the tombstone.
         subst hW
         -- Its kind is `rt`.
         exact absurd hP.1 (by decide)
-      · -- The deeper put: sequence 1.
+      -- The deeper put: sequence 1.
+      ·
+        -- Replace e by the deeper put.
         subst h
         -- No newer than itself.
         exact Nat.le_refl 1
-    · -- No tombstone survives.
+    -- No tombstone survives.
+    ·
+      -- Take a tombstone t that is there after the pass and covers 7.
       intro t ht hc
       -- Find it among the survivors.
       rcases ht with h | ⟨hW, _, hR⟩ | h
-      · -- Nothing above.
+      -- Nothing above.
+      ·
+        -- "Above" is empty.
         exact absurd h id
-      · -- The tombstone was retired by the mutant rule.
+      -- The tombstone was retired by the mutant rule.
+      ·
+        -- Replace t by the window's tombstone.
         subst hW
         -- It is in the window, a tombstone, and no snapshot is live.
         exact absurd ⟨rfl, rfl, fun _ h => absurd h id⟩ hR
-      · -- The deeper put covers nothing.
+      -- The deeper put covers nothing.
+      ·
+        -- Replace t by the deeper put.
         subst h
         -- Its kind is `put`.
         exact absurd hc.1 (by decide)
 
+-- End of the namespace opened at the top.
 end Regolith.TombstoneRetirement
