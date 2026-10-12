@@ -847,7 +847,16 @@ impl RegolithEngine {
     }
 
     /// What slot `desc`, published or discarded, tells its owner.
-    pub(super) fn settled(desc: &Descriptor) -> io::Result<Settled> {
+    ///
+    /// The owner asks once, and every call that writes comes through here
+    /// (a put, a batch, a column family's, a transaction's commit, waited
+    /// for or not), so this is where a write is counted as written in
+    /// `stats`: once it landed, with the operations that landed. One the
+    /// pipeline refused or discarded, or that lost a conflict, is no write.
+    pub(super) fn settled(
+        stats: Option<&crate::Statistics>,
+        desc: &Descriptor,
+    ) -> io::Result<Settled> {
         if desc.is(FAILED) {
             return Err(desc.failure.take().unwrap_or_else(|| {
                 io::Error::other("the write-ahead log failed and this commit was discarded")
@@ -857,17 +866,28 @@ impl RegolithEngine {
             return Err(io::Error::other("a commit finished without a decision"));
         };
         let perf = decision.perf.map(Box::new);
+        let landed = || {
+            if let Some(stats) = stats {
+                ops_of(desc, decision).count_written(stats);
+            }
+        };
         match &decision.verdict {
-            Fate::Write => Ok(Settled::Write(decision.last_seq().unwrap_or(0))),
+            Fate::Write => {
+                landed();
+                Ok(Settled::Write(decision.last_seq().unwrap_or(0)))
+            }
             Fate::Commit {
                 merges_commuted,
                 writes_elided,
-            } => Ok(Settled::Committed {
-                seq: decision.last_seq(),
-                merges_commuted: *merges_commuted,
-                writes_elided: *writes_elided,
-                perf,
-            }),
+            } => {
+                landed();
+                Ok(Settled::Committed {
+                    seq: decision.last_seq(),
+                    merges_commuted: *merges_commuted,
+                    writes_elided: *writes_elided,
+                    perf,
+                })
+            }
             Fate::Conflict(conflict) => Ok(Settled::Conflict {
                 conflict: conflict.clone(),
                 perf,
@@ -886,7 +906,7 @@ impl RegolithEngine {
         let desc = spare::descriptor(Work::Request(request));
         let index = self.enter(pipe, &desc);
         self.drive(pipe, index, &desc);
-        let settled = Self::settled(&desc);
+        let settled = Self::settled(self.statistics(), &desc);
         spare::keep_descriptor(desc);
         settled
     }

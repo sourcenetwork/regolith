@@ -100,7 +100,7 @@ fn drive(engine: &RegolithEngine, index: u64, desc: &RingArc<Descriptor>) {
 }
 
 pub(super) fn seq_of(desc: &Descriptor) -> io::Result<u64> {
-    RegolithEngine::settled(desc).and_then(Settled::into_seq)
+    RegolithEngine::settled(None, desc).and_then(Settled::into_seq)
 }
 
 /// Run `call` on a scoped thread, stop it the first time it reaches `stage`,

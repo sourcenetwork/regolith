@@ -9,6 +9,8 @@ use super::super::wal::{
 use super::super::{DurabilityMode, MemTable, apply_batch_op_to_memtable, batch_op_wal_bytes};
 use super::txn::TxnRequest;
 use crate::WriteBatchOp;
+use crate::column_family::CF_PREFIX_LEN;
+use crate::statistics::{Histogram, Statistics, Ticker};
 
 /// The unit of work one writer hands to the commit pipeline.
 ///
@@ -141,6 +143,55 @@ impl Ops<'_> {
             Ops::Put { key, value } => (key.len() + value.len() + 8) as u64,
             Ops::Batch(ops) => ops.iter().map(batch_op_wal_bytes).sum(),
         }
+    }
+
+    /// Count the operations in `stats` as one write that landed: what the
+    /// write tickers and [`Histogram::BytesPerWrite`] report. Bytes are the
+    /// user's, as [`Ticker::BytesWritten`] documents them: the key and the
+    /// value of each put and the key of each delete, a key counted without
+    /// the column family in front of it. Operations that write nothing are
+    /// no write.
+    pub(super) fn count_written(&self, stats: &Statistics) {
+        let user = |key: &[u8]| key.len().saturating_sub(CF_PREFIX_LEN) as u64;
+        let (mut puts, mut deletes, mut range_deletes, mut merges, mut bytes) = (0, 0, 0, 0, 0u64);
+        match self {
+            Ops::None => return,
+            Ops::Put { key, value } => {
+                puts = 1;
+                bytes = user(key) + value.len() as u64;
+            }
+            Ops::Batch(ops) => {
+                if ops.is_empty() {
+                    return;
+                }
+                for op in *ops {
+                    match op {
+                        WriteBatchOp::Put { key, value } => {
+                            puts += 1;
+                            bytes += user(key) + value.len() as u64;
+                        }
+                        WriteBatchOp::Delete { key } => {
+                            deletes += 1;
+                            bytes += user(key);
+                        }
+                        WriteBatchOp::DeleteRange { .. } => range_deletes += 1,
+                        WriteBatchOp::Merge { .. } => merges += 1,
+                    }
+                }
+            }
+        }
+        for (ticker, count) in [
+            (Ticker::KeysWritten, puts),
+            (Ticker::KeysDeleted, deletes),
+            (Ticker::RangeDeletesWritten, range_deletes),
+            (Ticker::MergesWritten, merges),
+            (Ticker::BytesWritten, bytes),
+        ] {
+            if count > 0 {
+                stats.add(ticker, count);
+            }
+        }
+        stats.record(Histogram::BytesPerWrite, bytes);
     }
 
     /// Append the operations to `out` as a record's payload, the first of

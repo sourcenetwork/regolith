@@ -726,14 +726,7 @@ impl Db {
         self.ensure_writable()?;
         self.validate_write_kv_sizes(key, value)?;
         self.admit_write(opts)?;
-        let stats = self.stats();
-        let _scope = statistics::TimeScope::new(stats, Histogram::DbWrite);
-        let bytes = (key.len() + value.len()) as u64;
-        if let Some(s) = stats {
-            s.add(Ticker::KeysWritten, 1);
-            s.add(Ticker::BytesWritten, bytes);
-            s.record(Histogram::BytesPerWrite, bytes);
-        }
+        let _scope = statistics::TimeScope::new(self.stats(), Histogram::DbWrite);
         perf_context::record_write_call();
         let (dm, disable_wal) = self.resolve_write_opts(opts);
         self.engine
@@ -759,9 +752,6 @@ impl Db {
         self.ensure_writable()?;
         self.validate_key_size(key)?;
         self.admit_write(opts)?;
-        if let Some(s) = self.stats() {
-            s.add(Ticker::KeysDeleted, 1);
-        }
         let mut batch = BTreeMap::new();
         batch.insert(prefix_key(DEFAULT_CF_ID, key), None);
         let (dm, disable_wal) = self.resolve_write_opts(opts);
@@ -789,9 +779,6 @@ impl Db {
         self.engine.require_merge_operator()?;
         self.validate_write_kv_sizes(key, operand)?;
         self.admit_write(opts)?;
-        if let Some(s) = self.stats() {
-            s.add(Ticker::MergesWritten, 1);
-        }
         let (dm, disable_wal) = self.resolve_write_opts(opts);
         self.engine
             .apply_grouped_batch(
@@ -833,9 +820,6 @@ impl Db {
         self.validate_key_size(start)?;
         self.validate_key_size(end)?;
         self.admit_write(opts)?;
-        if let Some(s) = self.stats() {
-            s.add(Ticker::RangeDeletesWritten, 1);
-        }
         let (dm, disable_wal) = self.resolve_write_opts(opts);
         self.engine
             .apply_grouped_batch(
@@ -932,39 +916,7 @@ impl Db {
         self.validate_batch_sizes(&batch, disable_wal)?;
         self.admit_write(opts)?;
         perf_context::record_write_call();
-        let stats = self.stats();
-        let _scope = statistics::TimeScope::new(stats, Histogram::DbWrite);
-        if let Some(s) = stats {
-            let mut bytes: u64 = 0;
-            let mut puts: u64 = 0;
-            let mut deletes: u64 = 0;
-            let mut range_deletes: u64 = 0;
-            let mut merges: u64 = 0;
-            for op in &batch.ops {
-                match op {
-                    WriteBatchOp::Put { key, value } => {
-                        puts += 1;
-                        bytes += (key.len() + value.len()) as u64;
-                    }
-                    WriteBatchOp::Delete { key } => {
-                        deletes += 1;
-                        bytes += key.len() as u64;
-                    }
-                    WriteBatchOp::DeleteRange { .. } => {
-                        range_deletes += 1;
-                    }
-                    WriteBatchOp::Merge { .. } => {
-                        merges += 1;
-                    }
-                }
-            }
-            s.add(Ticker::KeysWritten, puts);
-            s.add(Ticker::KeysDeleted, deletes);
-            s.add(Ticker::BytesWritten, bytes);
-            s.add(Ticker::RangeDeletesWritten, range_deletes);
-            s.add(Ticker::MergesWritten, merges);
-            s.record(Histogram::BytesPerWrite, bytes);
-        }
+        let _scope = statistics::TimeScope::new(self.stats(), Histogram::DbWrite);
         self.engine
             .submit_batch(batch.ops, dm, disable_wal)
             .map_err(Error::from)

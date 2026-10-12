@@ -301,7 +301,7 @@ fn a_drop_publishes_the_commit_left_pending_before_it_runs() {
         engine.visible_seq.visible() > owed_seq,
         "the drop ran with a commit left pending ahead of it"
     );
-    let settled = pending.settled();
+    let settled = pending.settled(None);
     assert!(
         matches!(settled, Ok(Settled::Committed { seq: Some(seq), .. }) if seq == owed_seq),
         "the pending commit did not land at its own sequence: {settled:?}"

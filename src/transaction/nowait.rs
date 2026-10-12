@@ -145,7 +145,7 @@ impl Transaction {
                 let waited = Arc::clone(&pending);
                 completion.resolve_with(Box::new(move || {
                     let settled = waited
-                        .settled()
+                        .settled(stats.as_deref())
                         .and_then(|settled| conclude_settled(stats.as_deref(), settled));
                     receipt_of(stats.as_deref(), settled, snapshot_seq, scan_runs_dropped)
                 }));

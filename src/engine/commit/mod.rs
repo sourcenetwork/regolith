@@ -176,9 +176,9 @@ impl PendingCommit {
     }
 
     /// What the commit learned, once it was told it is published or
-    /// discarded.
-    pub(crate) fn settled(&self) -> io::Result<Settled> {
-        RegolithEngine::settled(&self.desc)
+    /// discarded, counted in `stats` as a write when it landed. Called once.
+    pub(crate) fn settled(&self, stats: Option<&crate::Statistics>) -> io::Result<Settled> {
+        RegolithEngine::settled(stats, &self.desc)
     }
 }
 
@@ -352,7 +352,7 @@ impl RegolithEngine {
         let published = self.advance_nowait(pipe, &desc).is_ok();
         self.run_owed_step();
         if published {
-            let settled = Self::settled(&desc);
+            let settled = Self::settled(self.statistics(), &desc);
             spare::keep_descriptor(desc);
             return self.conclude(settled?).map(NowaitCommit::Done);
         }
@@ -601,6 +601,9 @@ mod overlap_tests;
 
 #[cfg(test)]
 mod txn_overlap_tests;
+
+#[cfg(test)]
+mod written_tests;
 
 #[cfg(test)]
 mod pipeline_tests;
