@@ -16,6 +16,7 @@
 //! A fix that turned the second class into "discard and carry on" would
 //! silently lose acknowledged writes, so every case below pins the
 //! direction as well as the outcome.
+#![cfg(not(target_arch = "wasm32"))]
 
 use std::fs;
 use std::path::{Path, PathBuf};

@@ -24,6 +24,7 @@
 //!
 //! Scale comes from `REGOLITH_SCAN_ORDER_INSTANCES` / `REGOLITH_SCAN_ORDER_ROUNDS`; the
 //! defaults are the smallest shape that reproduced on a 36-core box.
+#![cfg(not(target_arch = "wasm32"))]
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Barrier, Mutex};

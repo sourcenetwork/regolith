@@ -8,6 +8,7 @@
 //! [`regolith::DbSlice`] views carried through `drop_all`, which is the one
 //! engine operation that discards every memtable and resets the read
 //! horizon underneath a live reader.
+#![cfg(not(target_arch = "wasm32"))]
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
