@@ -49,6 +49,31 @@ impl Db {
     /// Only this call writes the key. A write by anything else, a [`Db::put`]
     /// or a transaction included, can move the counter back or fill it with
     /// bytes that are no number, and regolith cannot tell.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use regolith::{Db, Error, Options};
+    ///
+    /// let db = Db::open("ids", Options::memory())?;
+    ///
+    /// // Ranges follow one another: no value comes back twice.
+    /// assert_eq!(db.allocate(b"next-id", 3)?, 1..4);
+    /// assert_eq!(db.allocate(b"next-id", 2)?, 4..6);
+    /// // Asking for nothing reserves nothing.
+    /// assert_eq!(db.allocate(b"next-id", 0)?, 6..6);
+    ///
+    /// // The key holds the last value reserved, and each key is a counter of
+    /// // its own.
+    /// assert_eq!(db.get(b"next-id")?, Some(5u64.to_be_bytes().to_vec()));
+    /// assert_eq!(db.allocate(b"other", 1)?, 1..2);
+    ///
+    /// // A key that holds something else is refused, and left as it is.
+    /// db.put(b"name", b"not a counter")?;
+    /// assert!(matches!(db.allocate(b"name", 1), Err(Error::InvalidArgument(_))));
+    /// assert_eq!(db.get(b"name")?.as_deref(), Some(&b"not a counter"[..]));
+    /// # Ok::<(), regolith::Error>(())
+    /// ```
     pub fn allocate(&self, key: &[u8], n: u64) -> Result<Range<u64>> {
         self.ensure_writable()?;
         self.validate_key_size(key)?;
