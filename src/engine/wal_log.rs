@@ -185,12 +185,6 @@ impl Log {
         })
     }
 
-    /// Create a log through the standard environment.
-    #[cfg(test)]
-    pub(crate) fn create(path: &Path) -> io::Result<Self> {
-        Self::create_in(&crate::env::std_env(), path, None)
-    }
-
     /// Get the path to this log.
     pub(crate) fn path(&self) -> &Path {
         &self.path
