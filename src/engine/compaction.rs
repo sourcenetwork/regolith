@@ -1498,6 +1498,16 @@ fn perform_compaction_to(
                 .iter()
                 .position(|f| input_ids.contains(&f.meta.file_id))
                 .unwrap_or(0);
+            // The inputs lie next to one another in L0 (E38). A table left
+            // out between them would keep a newer place than the output and
+            // hide the writes of every input newer than it.
+            debug_assert!(
+                current.levels[0][oldest..]
+                    .iter()
+                    .take(input_ids.len())
+                    .all(|f| input_ids.contains(&f.meta.file_id)),
+                "the inputs of a merge inside L0 lie next to one another"
+            );
 
             let mut rebuilt: Vec<VersionEdit> = Vec::new();
             for f in current.levels[0].iter() {
