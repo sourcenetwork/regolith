@@ -1,9 +1,32 @@
 ---- MODULE LsmOrder ----
-\* The LSM read order. A point read returns the newest version visible at
-\* its snapshot through every write, freeze and flush, L0 install,
-\* `compact_range` (E1), level compaction, external ingest, and the
-\* demotion of an overlapping level at open (E14, D13), with every level
-\* below L0 searched by binary search on its tables' key ranges.
+\* ===========================================================================
+\* THE STORY
+\* ===========================================================================
+\* The database keeps its data in layers. New writes go into a table in
+\* memory (the memtable). A full memtable is frozen and later written to a
+\* file. Those files pile up in "level 0", and background work merges them
+\* into deeper levels. Nothing is ever overwritten in place: a key that was
+\* written three times has three versions, possibly in three different
+\* layers.
+\*
+\* A read does not look everywhere and compare. It walks the layers from
+\* newest to oldest and stops at the FIRST layer that holds the key. That is
+\* only right if a newer version of a key always sits in a layer the read
+\* reaches before the layer holding an older version. Every step that moves
+\* data between layers must keep that order.
+\*
+\* Tiny example of what can go wrong. Key 7 was written at sequence 2 (now
+\* in an old level-0 file) and again at sequence 5 (now in a newer level-0
+\* file). A compaction moves only the newer file down to level 1. Level 0 is
+\* read before level 1, so the next read of key 7 finds the old file first
+\* and returns the version of sequence 2: the database went back in time.
+\*
+\* What this model shows: through every write, freeze and flush, level-0
+\* install, `compact_range` (E1), level compaction, external ingest, and the
+\* demotion of an overlapping level at open (E14, D13), a point read returns
+\* the newest version visible at its snapshot, with every level below level 0
+\* searched by binary search on its tables' key ranges. Each way of breaking
+\* the order is a RED configuration.
 \*
 \* PROVED FOR EVERY SIZE in Lean, proofs/lean/Regolith/LsmOrder.lean:
 \*   read_newest                    the read order returns the newest visible
@@ -43,15 +66,20 @@
 \*     the one table that may hold the key. The first source holding a
 \*     version of the key at or below the snapshot answers, with its newest
 \*     such version.
-\*   run_compact_range                src/engine/compaction.rs
-\*     At L0 the inputs are the files that intersect [start, end]. They and
-\*     the L1 tables their key range overlaps are merged into L1.
+\*   run_compact_range, l0_inputs     src/engine/compaction.rs
+\*     At L0 the inputs are the files that intersect [start, end] and every
+\*     older file whose keys overlap theirs, until nothing more joins (the
+\*     closure, E1). They and the L1 tables their key range overlaps are
+\*     merged into L1.
 \*   RegolithEngine::install          src/engine/ingest.rs
 \*     An external file takes a fresh sequence and is placed at a level
 \*     (`placement`), after the memtables holding a key of its range are
 \*     flushed (`flush_memtables_holding`).
 \*   manifest replay                  src/engine/manifest.rs
-\*     Today refuses a deeper level whose tables overlap (E14).
+\*     On this branch the open still refuses a deeper level whose tables
+\*     overlap (Version::find_overlap, "manifest lists tables ... with
+\*     overlapping key ranges"). The demotion below (Legacy = "Demote") is
+\*     the plan's answer (E14, D13), modelled here ahead of the code.
 \*   rotate_if_full, seal_active      src/engine/mod.rs (Freeze here)
 \*     A writer whose commit group fills the active memtable seals it under
 \*     the pipeline mutex: it becomes the newest frozen memtable and a fresh
@@ -85,7 +113,7 @@
 \*
 \* THE FIXES.
 \*   Picker = "Closure": add every older L0 file whose key range overlaps
-\*     the picked set's, until nothing changes.
+\*     the picked set's, until nothing changes (l0_inputs in the engine).
 \*   FlushOrder = "Oldest": a flush installs in memtable order; a file
 \*     written early waits for the older ones. The code gets this from the
 \*     `flushing` exclusion and from always taking the oldest frozen
@@ -133,36 +161,69 @@
 \*   MC_LsmOrder_Red_DemoteLevelOnly         ReadNewest fails
 \*   MC_LsmOrder_Red_NoDemotion              ReadNewest fails
 
+\* Borrow the standard TLA+ books: counting numbers, lists, and sizes of finite sets.
 EXTENDS Naturals, Sequences, FiniteSets
 
+\* The fixed inputs a configuration chooses.
 CONSTANTS
-  Keys,        \* the user keys: a finite set of naturals, ordered as keys are
-  MaxSeq,      \* the last sequence a write may take, which bounds the writes
-  MaxL0,       \* the most L0 files a flush or ingest lets accumulate
-  Picker,      \* "Closure" (the fix) or "Intersect" (E1)
-  MaxImm,      \* the most frozen memtables; 0 flushes the memtable directly
-  FlushOrder,  \* "Oldest" (the fix) or "Any" (the defect)
-  Levels,      \* how many levels lie below L0
-  Ingest,      \* "Off", "Placed" (the fix) or "IgnoreUpper" (the defect)
-  Legacy       \* "Off", "Demote" (the fix), "DemoteLevelOnly" or "Keep"
+  \* The user keys: a finite set of numbers, ordered the way keys are ordered.
+  Keys,
+  \* The last sequence number a write may take. It bounds how many writes a run of the model makes.
+  MaxSeq,
+  \* The largest number of L0 files a flush or an ingest lets pile up.
+  MaxL0,
+  \* How compact_range picks its L0 inputs: "Closure" (the engine's l0_inputs) or "Intersect" (the
+  \* planted bug, the picker before E1).
+  Picker,
+  \* The largest number of frozen memtables (Options::max_write_buffer_number, less the active one);
+  \* 0 means a flush writes the memtable out directly.
+  MaxImm,
+  \* Which frozen memtable a flush installs: "Oldest" (the engine) or "Any" (the planted bug).
+  FlushOrder,
+  \* How many levels lie below L0.
+  Levels,
+  \* External file ingest: "Off", "Placed" (the engine's placement) or "IgnoreUpper" (the planted
+  \* bug).
+  Ingest,
+  \* A database written by 0.1.x with an overlapping level: "Off" (none), "Demote" (the plan's fix
+  \* at open), "DemoteLevelOnly" or "Keep" (the planted bugs).
+  Legacy
 
+\* There is at least one key, and keys are numbers.
 ASSUME Keys \subseteq Nat /\ Keys # {}
+\* The bounds are numbers, and there is at least one level below L0.
 ASSUME MaxSeq \in Nat /\ MaxL0 \in Nat /\ MaxImm \in Nat /\ Levels \in Nat \ {0}
+\* The picker is one of the two.
 ASSUME Picker \in {"Closure", "Intersect"}
+\* The flush order is one of the two.
 ASSUME FlushOrder \in {"Oldest", "Any"}
+\* The ingest rule is one of the three.
 ASSUME Ingest \in {"Off", "Placed", "IgnoreUpper"}
+\* The legacy rule is one of the four.
 ASSUME Legacy \in {"Off", "Demote", "DemoteLevelOnly", "Keep"}
 
+\* The state: everything that changes from one step to the next. Each line says what the variable
+\* stands for in the real program.
 VARIABLES
-  seq,     \* the last sequence handed out; 0 before the first write
-  mem,     \* the active memtable: a set of versions <<key, sequence>>
-  imm,     \* the frozen memtables, newest first: a sequence of sets
-  l0,      \* the L0 files, newest first: a sequence of sets of versions
-  lv,      \* lv[j], j in 1..Levels: level j's tables in key order, each a
-           \* record [v |-> versions, lo |-> least key, hi |-> greatest key]
-           \* where [lo, hi] is the range the manifest records
-  opened   \* whether the open that demotes overlap has run; FALSE only
-           \* while a legacy (0.1.x) database is being built
+  \* The last sequence number handed out, 0 before the first write (the engine's commit sequence).
+  seq,
+  \* The active memtable, where new writes go: a set of versions <<key, sequence>>
+  \* (ReadView::active, a MemTable; src/engine/read_view.rs).
+  mem,
+  \* The frozen memtables, newest first: full memtables waiting to be written to a file
+  \* (ReadView::frozen).
+  imm,
+  \* The L0 files, newest first, each a set of versions. L0 files may overlap each other in keys
+  \* (Version::levels[0], src/engine/manifest.rs; the engine stores them oldest first and reads from
+  \* the back).
+  l0,
+  \* The deeper levels: lv[j] is level j's tables in key order, each a record [v |-> its versions,
+  \* lo |-> its least key, hi |-> its greatest key], where lo and hi are the range the manifest
+  \* records for the table (SsTableMeta::smallest_key and largest_key).
+  lv,
+  \* Whether the open that deals with overlapping levels has run. FALSE only while a legacy (0.1.x)
+  \* database is being built.
+  opened
 
 \* Every variable, so a step that changes none of them is a stutter.
 vars == <<seq, mem, imm, l0, lv, opened>>
@@ -187,13 +248,18 @@ RangesMeet(a, b, c, d) == a <= d /\ c <= b
 
 \* The elements of T at positions 1.. not in S, in order.
 RECURSIVE Keep(_, _, _)
+\* Walk T from position i:
 Keep(T, S, i) ==
+  \* past the end, nothing; otherwise this element unless its position is in S, followed by the
+  \* rest.
   IF i > Len(T) THEN <<>> ELSE (IF i \in S THEN <<>> ELSE <<T[i]>>) \o Keep(T, S, i + 1)
 
 \* Table t inserted into the key-ordered tables T: after every table whose
 \* range starts lower, or starts at the same key and ends lower.
 Insert(T, t) ==
+  \* i: how many tables of T sort before t.
   LET i == Cardinality({x \in 1..Len(T) : T[x].lo < t.lo \/ (T[x].lo = t.lo /\ T[x].hi < t.hi)})
+  \* Those tables, then t, then the others.
   IN SubSeq(T, 1, i) \o <<t>> \o SubSeq(T, i + 1, Len(T))
 
 \* The newest sequence a set of versions holds: its age.
@@ -201,9 +267,13 @@ AgeOf(F) == Max({v[2] : v \in F})
 
 \* Tables newest first by their newest sequence.
 RECURSIVE AgeOrder(_)
+\* Sort the tables T, newest first.
 AgeOrder(T) ==
+  \* No table: nothing.
   IF T = <<>> THEN <<>>
+  \* i: a position whose table is at least as new as every other.
   ELSE LET i == CHOOSE x \in 1..Len(T) : \A y \in 1..Len(T) : AgeOf(T[y].v) <= AgeOf(T[x].v)
+       \* That table first, then the others sorted the same way.
        IN <<T[i]>> \o AgeOrder(Keep(T, {i}, 1))
 
 \* The version sets of a sequence of tables, as L0 files.
@@ -217,16 +287,23 @@ Files(T) == [i \in 1..Len(T) |-> T[i].v]
 \* by range and not overlapping, that is the one table whose range may
 \* hold k. Lean: bsearch_eq_scan.
 RECURSIVE Bisect(_, _, _, _)
+\* Search the positions a up to, not including, b.
 Bisect(T, k, a, b) ==
+  \* One position left: that is the answer.
   IF a >= b THEN a
+  \* mid: the middle position.
   ELSE LET mid == (a + b) \div 2
+       \* The middle table ends below k: look to its right; otherwise look at it and to its left.
        IN IF T[mid].hi < k THEN Bisect(T, k, mid + 1, b) ELSE Bisect(T, k, a, mid)
 
 \* The source level j offers a read of k: the versions of the table the
 \* binary search lands on, when its range holds k; else nothing.
 Candidate(j, k) ==
+  \* T: the tables of level j.
   LET T == lv[j]
+      \* i: where the binary search lands (one past the end when every table ends below k).
       i == Bisect(T, k, 1, Len(T) + 1)
+  \* If it landed on a table whose range holds k, that table's versions; otherwise nothing.
   IN IF i <= Len(T) /\ T[i].lo <= k THEN T[i].v ELSE {}
 
 \* What a linear scan of level j offers: every table whose range holds k.
@@ -242,7 +319,9 @@ Sources(k) == <<mem>> \o imm \o l0 \o [j \in 1..Levels |-> Candidate(j, k)]
 \* answers, with its newest one. 0 means the key reads as absent
 \* (sequences start at 1).
 ReadIn(S, k, snap) ==
+  \* hits: the positions of the sources that hold a version of k the snapshot may see.
   LET hits == {i \in 1..Len(S) : Visible(S[i], k, snap) # {}}
+  \* None: the key reads as absent. Otherwise the newest visible version in the first such source.
   IN IF hits = {} THEN 0 ELSE Max(Visible(S[Min(hits)], k, snap))
 
 \* A point read of k at snapshot snap.
@@ -250,7 +329,9 @@ Read(k, snap) == ReadIn(Sources(k), k, snap)
 
 \* Every version the tree holds, whichever source holds it.
 AllVersions ==
+  \* The active memtable, every frozen memtable, every L0 file,
   mem \cup UNION {imm[i] : i \in 1..Len(imm)} \cup UNION {l0[i] : i \in 1..Len(l0)}
+      \* and every table of every level.
       \cup UNION {UNION {lv[j][t].v : t \in 1..Len(lv[j])} : j \in 1..Levels}
 
 \* What a correct read returns over the versions A: the newest version of k
@@ -274,22 +355,30 @@ Hull(P) == UNION {KeysOf(l0[i]) : i \in P}
 \* The file's key range meets the range the keys H span: the interval test
 \* min(F) <= max(H) /\ min(H) <= max(F). An empty side meets nothing.
 Overlaps(F, H) ==
+  \* The file holds a key,
   /\ KeysOf(F) # {}
+  \* the span is not empty,
   /\ H # {}
+  \* the file's least key is at or below the span's greatest,
   /\ Min(KeysOf(F)) <= Max(H)
+  \* and the span's least key is at or below the file's greatest.
   /\ Min(H) <= Max(KeysOf(F))
 
-\* run_compact_range at L0 today: every file that intersects the range.
+\* Where the picker starts (and all the picker before E1 did): every file
+\* that intersects the range.
 Initial(lo, hi) == {i \in 1..Len(l0) : Intersects(l0[i], lo, hi)}
 
 \* One closure step: add every file older than some picked file (a later
 \* position) whose key range meets the picked set's key range.
 Grow(P) ==
+  \* P, plus every file j that is older than some picked file and whose key range meets the picked
+  \* files' key range.
   P \cup {j \in 1..Len(l0) : (\E i \in P : i < j) /\ Overlaps(l0[j], Hull(P))}
 
 \* Grow to the fixpoint. Each step that changes P adds a file, so it ends
 \* within Len(l0) steps.
 RECURSIVE Close(_)
+\* Nothing more to add: done. Otherwise grow again.
 Close(P) == IF Grow(P) = P THEN P ELSE Close(Grow(P))
 
 \* The input set the configured picker chooses.
@@ -311,7 +400,9 @@ LevelMeets(j, a, b) == \E t \in 1..Len(lv[j]) : RangesMeet(lv[j][t].lo, lv[j][t]
 \* key in its range, and no table of level j meets it. The defect checks
 \* only level j itself.
 Fits(j, a, b) ==
+  \* The planted bug: only level j's own tables are checked.
   IF Ingest = "IgnoreUpper" THEN ~LevelMeets(j, a, b)
+  \* The engine: no L0 file holds a key of the range, and no table of levels 1 to j meets it.
   ELSE ~L0Holds(a, b) /\ \A i \in 1..j : ~LevelMeets(i, a, b)
 
 ----------------------------------------------------------------------------
@@ -319,22 +410,31 @@ Fits(j, a, b) ==
 
 \* The levels whose recorded ranges overlap: two tables share a key range.
 OverlapLevels ==
+  \* The levels j
   {j \in 1..Levels :
+     \* that have two different tables
      \E t, u \in 1..Len(lv[j]) :
+       \* whose recorded ranges share a key.
        t # u /\ RangesMeet(lv[j][t].lo, lv[j][t].hi, lv[j][u].lo, lv[j][u].hi)}
 
 \* The tables of the levels in D, in level order, each level's tables
 \* newest first: the files they become in L0, in read order.
 RECURSIVE Demoted(_, _)
+\* Walk the levels from j down:
 Demoted(D, j) ==
+  \* past the last level, nothing;
   IF j > Levels THEN <<>>
+  \* otherwise this level's tables newest first if the level is in D, followed by the deeper levels.
   ELSE (IF j \in D THEN Files(AgeOrder(lv[j])) ELSE <<>>) \o Demoted(D, j + 1)
 
 \* The levels the configured open demotes. The fix: every level from L1
 \* down to the deepest overlapping one. The defect: the overlapping ones.
 DemotedLevels ==
+  \* No level overlaps, or the bug "Keep": nothing moves.
   CASE OverlapLevels = {} \/ Legacy = "Keep" -> {}
+    \* The fix: every level from 1 down to the deepest overlapping one.
     [] Legacy = "Demote"                     -> 1..Max(OverlapLevels)
+    \* The bug "DemoteLevelOnly": only the overlapping levels.
     [] OTHER                                 -> OverlapLevels
 
 ----------------------------------------------------------------------------
@@ -343,135 +443,222 @@ DemotedLevels ==
 \* The start: no write yet, empty memtables, L0 and levels. A legacy
 \* configuration starts before the open.
 Init ==
+  \* No write yet.
   /\ seq    = 0
+  \* The active memtable is empty.
   /\ mem    = {}
+  \* No frozen memtable.
   /\ imm    = <<>>
+  \* No L0 file.
   /\ l0     = <<>>
+  \* Every level is empty.
   /\ lv     = [j \in 1..Levels |-> <<>>]
+  \* The database counts as opened unless a legacy database is still to be built.
   /\ opened = (Legacy = "Off")
 
 \* A put of key k: the next sequence, inserted into the memtable.
 Put(k) ==
+  \* The model may still write.
   /\ seq < MaxSeq
+  \* The write takes the next sequence.
   /\ seq' = seq + 1
+  \* Its version goes into the active memtable.
   /\ mem' = mem \cup {<<k, seq + 1>>}
+  \* Nothing else changes.
   /\ UNCHANGED <<imm, l0, lv, opened>>
 
 \* With no frozen memtables (MaxImm = 0), a flush turns the memtable into
 \* the newest L0 file, and a new, empty memtable takes the writes.
 Flush ==
+  \* Only in configurations that keep no frozen memtables.
   /\ MaxImm = 0
+  \* There is something to flush.
   /\ mem # {}
+  \* L0 has room.
   /\ Len(l0) < MaxL0
+  \* The memtable's versions become the newest L0 file.
   /\ l0'  = <<mem>> \o l0
+  \* The memtable is empty again.
   /\ mem' = {}
+  \* Nothing else changes.
   /\ UNCHANGED <<seq, imm, lv, opened>>
 
 \* Rotation freezes the memtable (seal_active, under the pipeline mutex): it
 \* becomes the newest frozen memtable, still read before L0, and a new,
 \* empty memtable takes the writes. Nothing is flushed here (E9).
 Freeze ==
-  /\ MaxImm > 0                  \* this configuration keeps frozen memtables
-  /\ mem # {}                    \* there is something to freeze
-  /\ Len(imm) < MaxImm           \* under the cap: at the cap the rotation flushes the oldest first
-  /\ imm' = <<mem>> \o imm        \* the memtable joins the front: the newest frozen one
-  /\ mem' = {}                   \* writes go to a fresh, empty memtable
-  /\ UNCHANGED <<seq, l0, lv, opened>>   \* no sequence, file or level changes
+  \* This configuration keeps frozen memtables.
+  /\ MaxImm > 0
+  \* There is something to freeze.
+  /\ mem # {}
+  \* Under the cap: at the cap the rotation flushes the oldest frozen memtable first.
+  /\ Len(imm) < MaxImm
+  \* The memtable joins the front: it is the newest frozen one.
+  /\ imm' = <<mem>> \o imm
+  \* Writes go to a fresh, empty memtable.
+  /\ mem' = {}
+  \* No sequence, file or level changes.
+  /\ UNCHANGED <<seq, l0, lv, opened>>
 
 \* A flush of frozen memtable i (Flusher::flush_oldest, by whatever thread)
 \* installs its file as the newest L0 file and drops the memtable. The fix
 \* installs only the oldest (the last in `imm`); the defect installs
 \* whichever flush finished first.
 FlushInstall(i) ==
-  /\ i \in 1..Len(imm)                  \* a frozen memtable
-  /\ FlushOrder = "Any" \/ i = Len(imm)  \* the oldest one, unless the bug is planted
-  /\ Len(l0) < MaxL0                    \* keeps the model small
-  /\ l0'  = <<imm[i]>> \o l0             \* its file is the newest L0 file
-  /\ imm' = Keep(imm, {i}, 1)            \* and it is no longer frozen
-  /\ UNCHANGED <<seq, mem, lv, opened>>  \* nothing else changes
+  \* i names a frozen memtable.
+  /\ i \in 1..Len(imm)
+  \* It is the oldest one, unless the bug is planted.
+  /\ FlushOrder = "Any" \/ i = Len(imm)
+  \* L0 has room (this keeps the model small).
+  /\ Len(l0) < MaxL0
+  \* Its file is the newest L0 file.
+  /\ l0'  = <<imm[i]>> \o l0
+  \* And it is no longer a frozen memtable.
+  /\ imm' = Keep(imm, {i}, 1)
+  \* Nothing else changes.
+  /\ UNCHANGED <<seq, mem, lv, opened>>
 
 \* compact_range(lo, hi) at L0: the picked files leave L0 and merge with
 \* the L1 tables their key range meets into one L1 table.
 CompactRange(lo, hi) ==
+  \* P: the positions of the L0 files picked.
   LET P   == Pick(lo, hi)
+      \* V: every version in them.
       V   == UNION {l0[i] : i \in P}
+      \* L1: the tables of level 1.
       L1  == lv[1]
+      \* ins: the L1 tables whose range meets the range the picked versions span.
       ins == {t \in 1..Len(L1) : RangesMeet(L1[t].lo, L1[t].hi, Min(KeysOf(V)), Max(KeysOf(V)))}
+      \* out: the one table that replaces them all: their versions together,
       out == [v  |-> V \cup UNION {L1[t].v : t \in ins},
+              \* from the least key of any of them
               lo |-> Min({Min(KeysOf(V))} \cup {L1[t].lo : t \in ins}),
+              \* to the greatest key of any of them.
               hi |-> Max({Max(KeysOf(V))} \cup {L1[t].hi : t \in ins})]
+  \* Something was picked.
   IN /\ P # {}
+     \* The picked files leave L0.
      /\ l0' = Keep(l0, P, 1)
+     \* In level 1, the met tables are replaced by the output table, put in key order.
      /\ lv' = [lv EXCEPT ![1] = Insert(Keep(L1, ins, 1), out)]
+     \* Nothing else changes.
      /\ UNCHANGED <<seq, mem, imm, opened>>
 
 \* A level compaction: table t of level j merges with the tables of level
 \* j + 1 its range meets into one table of level j + 1.
 CompactLevel(j, t) ==
+  \* There is a level below j.
   /\ j < Levels
+  \* t names a table of level j.
   /\ t \in 1..Len(lv[j])
+  \* T: that table.
   /\ LET T   == lv[j][t]
+         \* N: the tables of the next level.
          N   == lv[j + 1]
+         \* ins: the next level's tables whose range meets T's.
          ins == {u \in 1..Len(N) : RangesMeet(N[u].lo, N[u].hi, T.lo, T.hi)}
+         \* out: the one table that replaces them all: their versions together,
          out == [v  |-> T.v \cup UNION {N[u].v : u \in ins},
+                 \* from the least key of any of them
                  lo |-> Min({T.lo} \cup {N[u].lo : u \in ins}),
+                 \* to the greatest key of any of them.
                  hi |-> Max({T.hi} \cup {N[u].hi : u \in ins})]
+     \* T leaves level j, and in level j + 1 the met tables are replaced by the output table.
      IN lv' = [lv EXCEPT ![j] = Keep(lv[j], {t}, 1), ![j + 1] = Insert(Keep(N, ins, 1), out)]
+  \* Nothing else changes.
   /\ UNCHANGED <<seq, mem, imm, l0, opened>>
 
 \* An ingest of a file holding the keys ks, all at the next sequence. A
 \* memtable holding a key in its range is flushed first (D48), so here none
 \* may. The file goes to the deepest level it fits, else to the L0 front.
 IngestFile(ks) ==
+  \* Ingest is part of this configuration.
   /\ Ingest # "Off"
+  \* The database is open.
   /\ opened
+  \* The model may still take a sequence.
   /\ seq < MaxSeq
+  \* a: the file's least key.
   /\ LET a    == Min(ks)
+         \* b: the file's greatest key.
          b    == Max(ks)
+         \* F: the file as a table: every key of ks at the next sequence, with the range a to b.
          F    == [v |-> {<<k, seq + 1>> : k \in ks}, lo |-> a, hi |-> b]
+         \* fits: the levels the file may go to.
          fits == {j \in 1..Levels : Fits(j, a, b)}
+     \* No memtable holds a key of the file's range (the engine flushes such a memtable first).
      IN /\ ~MemHolds(a, b)
+        \* The file fits no level:
         /\ IF fits = {}
+             \* L0 has room,
              THEN /\ Len(l0) < MaxL0
+                  \* the file becomes the newest L0 file,
                   /\ l0' = <<F.v>> \o l0
+                  \* and the levels stay.
                   /\ UNCHANGED lv
+             \* Otherwise it goes into the deepest level it fits, in key order,
              ELSE /\ lv' = [lv EXCEPT ![Max(fits)] = Insert(@, F)]
+                  \* and L0 stays.
                   /\ UNCHANGED l0
+  \* The ingest took the next sequence.
   /\ seq' = seq + 1
+  \* Nothing else changes.
   /\ UNCHANGED <<mem, imm, opened>>
 
 \* A 0.1.x ingest (E14): a file holding key k at the next sequence, placed
 \* at level j by its point key, which nothing read before level j holds and
 \* no table of level j meets, but recorded with the wider range [a, b].
 LegacyIngest(j, k, a, b) ==
+  \* The legacy database is still being built.
   /\ ~opened
+  \* The model may still take a sequence.
   /\ seq < MaxSeq
+  \* The recorded range a to b holds the key.
   /\ a <= k /\ k <= b
+  \* No memtable and no L0 file holds the key.
   /\ ~MemHolds(k, k) /\ ~L0Holds(k, k)
+  \* No table of levels 1 to j has a range holding the key.
   /\ \A i \in 1..j : ~LevelMeets(i, k, k)
+  \* A table holding just this key, but recorded with the range a to b, joins level j.
   /\ lv'  = [lv EXCEPT ![j] = Insert(@, [v |-> {<<k, seq + 1>>}, lo |-> a, hi |-> b])]
+  \* It took the next sequence.
   /\ seq' = seq + 1
+  \* Nothing else changes.
   /\ UNCHANGED <<mem, imm, l0, opened>>
 
 \* The first open by this version: the configured demotion moves levels to
 \* the end of L0, as one version edit.
 Open ==
+  \* The database has not been opened by this version yet.
   /\ ~opened
+  \* Now it has.
   /\ opened' = TRUE
+  \* The demoted tables are added at the old end of L0, in read order.
   /\ l0'     = l0 \o Demoted(DemotedLevels, 1)
+  \* The demoted levels are empty; the others stay.
   /\ lv'     = [j \in 1..Levels |-> IF j \in DemotedLevels THEN <<>> ELSE lv[j]]
+  \* Nothing else changes.
   /\ UNCHANGED <<seq, mem, imm>>
 
 \* Every step the system can take.
 Next ==
+  \* A key is written.
   \/ \E k \in Keys : Put(k)
+  \* The memtable is flushed straight to L0.
   \/ Flush
+  \* The memtable is frozen.
   \/ Freeze
+  \* A frozen memtable's file is installed in L0.
   \/ \E i \in 1..MaxImm : FlushInstall(i)
+  \* A range is compacted out of L0.
   \/ \E lo, hi \in Keys : lo <= hi /\ CompactRange(lo, hi)
+  \* A table is compacted one level down.
   \/ \E j \in 1..Levels : \E t \in 1..Len(lv[j]) : CompactLevel(j, t)
+  \* A file holding some keys is ingested.
   \/ \E ks \in (SUBSET Keys) \ {{}} : IngestFile(ks)
+  \* A 0.1.x ingest builds a legacy level.
   \/ Legacy # "Off" /\ \E j \in 1..Levels, k, a, b \in Keys : LegacyIngest(j, k, a, b)
+  \* The database is opened.
   \/ Open
 
 \* Every behaviour: start in Init, then take Next steps or stutter.
@@ -482,15 +669,25 @@ Spec == Init /\ [][Next]_vars
 
 \* Every variable holds what its comment says.
 TypeOK ==
+  \* The sequence stays within the bound.
   /\ seq \in 0..MaxSeq
+  \* The active memtable holds versions of known keys.
   /\ mem \subseteq Keys \X (1..MaxSeq)
+  \* No more frozen memtables than the cap.
   /\ Len(imm) <= MaxImm
+  \* Each frozen memtable holds versions of known keys.
   /\ \A i \in 1..Len(imm) : imm[i] \subseteq Keys \X (1..MaxSeq)
+  \* Each L0 file holds versions of known keys.
   /\ \A i \in 1..Len(l0) : l0[i] \subseteq Keys \X (1..MaxSeq)
+  \* There are exactly Levels levels.
   /\ Len(lv) = Levels
+  \* Every table of every level
   /\ \A j \in 1..Levels : \A t \in 1..Len(lv[j]) :
+       \* holds versions of known keys,
        /\ lv[j][t].v \subseteq Keys \X (1..MaxSeq)
+       \* all inside the range recorded for it.
        /\ \A x \in lv[j][t].v : lv[j][t].lo <= x[1] /\ x[1] <= lv[j][t].hi
+  \* The open flag is a yes or a no.
   /\ opened \in BOOLEAN
 
 \* THE HEADLINE. Once open, every read, of every key, at every snapshot up
@@ -499,18 +696,30 @@ TypeOK ==
 \* (Binding A and S by membership in a one-element set makes TLC compute
 \* each once per state and key rather than once per snapshot.)
 ReadNewest ==
+  \* Once the database is open:
   opened =>
+    \* (A is every version in the tree; S is the sources a read of k consults, in order)
     \A A \in {AllVersions} : \A k \in Keys : \A S \in {Sources(k)} :
+      \* for every key and every snapshot, the read returns the newest version of that key the
+      \* snapshot may see. Rules out, for example: a key is written at sequence 2 and again at
+      \* sequence 5, yet a read returns the version of sequence 2 because the file holding it is
+      \* consulted first.
       \A snap \in 0..seq : ReadIn(S, k, snap) = NewestIn(A, k, snap)
 
 \* Once open, every level's tables are in key order and their ranges do
 \* not overlap: what the binary search needs.
 LevelsSorted ==
+  \* Once the database is open, in every level each table ends before the next one begins. Rules out
+  \* two tables of one level both covering key 7: a binary search would land on one of them and
+  \* might miss the version in the other.
   opened => \A j \in 1..Levels : \A t \in 1..(Len(lv[j]) - 1) : lv[j][t].hi < lv[j][t + 1].lo
 
 \* Once open, the binary search on each level offers exactly what a linear
 \* scan of that level does. Lean: bsearch_eq_scan, level_read_bsearch.
 BisectIsScan ==
+  \* Once the database is open, for every level and key the binary search offers exactly what
+  \* looking at every table would. Rules out a search that lands on the wrong table and reports a
+  \* key as absent.
   opened => \A j \in 1..Levels : \A k \in Keys : Candidate(j, k) = ScanCandidate(j, k)
 
 ====
