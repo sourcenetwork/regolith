@@ -1433,7 +1433,7 @@ fn perform_compaction_to(
     // Read with the inputs fixed too: the levels below the output can only
     // gain a key of these inputs' ranges through this pass.
     let version = versions.current();
-    let retirement = Retirement::new(target_level, &version, live.first().copied());
+    let retirement = Retirement::new(target_level, &version, &input_files, live.first().copied());
     let carried = retirement.carried_tombstones(&merged_range_tombstones);
 
     let CompactionOutputs {
