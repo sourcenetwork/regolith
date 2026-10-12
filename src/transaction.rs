@@ -1764,9 +1764,11 @@ impl Transaction {
     /// [`crate::Options::inline_compaction`] says, since nobody else is
     /// certain to; commit with [`Transaction::commit_nowait`] to keep the
     /// thread free. A step another thread's work is in the way of waits for
-    /// that work, so a thread whose own queue holds a
-    /// [`crate::JobTicket`]'s job still pending polls the queue first, as
-    /// [`crate::JobTicket::wait`] says: only its poll runs that job. The
+    /// that work. A job this thread's own [`crate::IoQueue`] holds (a
+    /// [`crate::JobTicket`]'s, a step a write left owing) is stepped here
+    /// meanwhile, as that queue's poll would step it, so the commit never
+    /// waits for work only its own poll runs; a block read pending on the
+    /// queue is not run here, and holds nothing the step waits for. The
     /// time it is held either way is counted in
     /// [`crate::Ticker::WriteStallMicros`]. A slowdown trigger delays
     /// nothing. A commit whose early check already found its conflict

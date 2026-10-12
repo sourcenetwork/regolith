@@ -525,6 +525,62 @@ pub(crate) fn nested_waker(job: &Arc<Job>, outer: &Waker) -> Waker {
     }))
 }
 
+/// What a thread sleeps on while it blocks for a job and steps its own
+/// queue's jobs meanwhile ([`IoRuntime::wait_landed`](super::IoRuntime::wait_landed)):
+/// stirred by the landing of the job it waits for, and by the end of the
+/// wait of a job it stepped.
+pub(crate) struct Stir {
+    thread: Thread,
+    stirred: crate::portability::AtomicBool,
+}
+
+impl Stir {
+    /// For the calling thread.
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self {
+            thread: thread::current(),
+            stirred: crate::portability::AtomicBool::new(false),
+        })
+    }
+
+    /// Park the thread this was made on until it is stirred, and take the
+    /// stir. A stir that came before the call is taken at once.
+    pub(crate) fn sleep(&self) {
+        while !self
+            .stirred
+            .swap(false, crate::portability::Ordering::AcqRel)
+        {
+            super::scope::waits("a job this call blocks for");
+            // A stir sets the flag before it unparks, and an unpark that
+            // raced ahead of this park is kept by the thread, so the park
+            // returns and the flag is read again.
+            thread::park();
+        }
+    }
+
+    fn stir(&self) {
+        self.stirred
+            .store(true, crate::portability::Ordering::Release);
+        self.thread.unpark();
+    }
+}
+
+impl Wake for Stir {
+    fn wake(self: Arc<Self>) {
+        self.stir();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.stir();
+    }
+}
+
+impl Delivery for Stir {
+    fn deliver(&self) {
+        self.stir();
+    }
+}
+
 #[cfg(all(test, not(loom)))]
 #[path = "job_park_tests.rs"]
 mod park_tests;

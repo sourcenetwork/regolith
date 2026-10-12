@@ -46,7 +46,7 @@ fn external_table(dir: &Path, name: &str, key: &[u8]) -> std::path::PathBuf {
 /// Poll `queue` while what `ticket`'s job needs next is held by another
 /// thread: the poll returns, the job is still owed, and the owner, idle, is
 /// not woken. Returns the idle owner's wakes.
-fn poll_parks(queue: &mut IoQueue, ticket: &JobTicket) -> Arc<Wakes> {
+pub(super) fn poll_parks(queue: &mut IoQueue, ticket: &JobTicket) -> Arc<Wakes> {
     let progress = queue.poll(IoBudget::ALL);
     assert_eq!(progress.completed, 0, "the job ended without what it needs");
     assert!(progress.more_pending, "the job is still owed");
@@ -87,7 +87,7 @@ fn poll_until_ready(queue: &mut IoQueue, ticket: &JobTicket) {
 
 /// The version store's step, kept as a thread in the middle of a section
 /// keeps it.
-fn the_step<'a>(db: &'a Db) -> impl FnOnce() -> super::step::Hold<'a> + Send + 'a {
+pub(super) fn the_step<'a>(db: &'a Db) -> impl FnOnce() -> super::step::Hold<'a> + Send + 'a {
     || {
         db.engine()
             .versions
