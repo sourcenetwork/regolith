@@ -453,3 +453,7 @@ mod tests {
 #[cfg(all(test, not(loom)))]
 #[path = "stall_failure_tests.rs"]
 mod failure_tests;
+
+#[cfg(all(test, not(loom)))]
+#[path = "stall_latch_tests.rs"]
+mod latch_tests;
