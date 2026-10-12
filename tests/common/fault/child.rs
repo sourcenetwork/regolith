@@ -583,6 +583,24 @@ impl CrashRun {
             );
         }
 
+        let recorded = Journal::read(&journal).expect("crash run: read journal");
+        // A shim that loaded and saw no call is as blind as one that never
+        // loaded: every workload opens files under the root it watches, so
+        // an empty journal means the child's I/O did not go through the
+        // calls the shim interposes (a toolchain whose std reaches the
+        // kernel another way). A power cut simulated from it would discard
+        // nothing, and the run would pass having shown nothing.
+        if shim_lib.is_some() && self.record_io {
+            assert!(
+                !recorded.records.is_empty(),
+                "the fault shim loaded into the child but recorded none of its I/O, so no \
+                 fault could fire and no power cut can be simulated from this run. The \
+                 test binary's std does not go through the libc calls the shim \
+                 interposes; build the suite with the toolchain CI uses.\nchild stderr:\n{}",
+                std::fs::read_to_string(&stderr_path).unwrap_or_default(),
+            );
+        }
+
         #[cfg(unix)]
         let signal = {
             use std::os::unix::process::ExitStatusExt;
@@ -596,7 +614,7 @@ impl CrashRun {
             signal,
             stdout: std::fs::read_to_string(&stdout_path).unwrap_or_default(),
             stderr: std::fs::read_to_string(&stderr_path).unwrap_or_default(),
-            journal: Journal::read(&journal).expect("crash run: read journal"),
+            journal: recorded,
             acked: read_acks(&spec.ack_path),
             history: spec.history(),
             trigger: self.trigger,
