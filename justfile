@@ -690,6 +690,31 @@ tla:
     check MC_TxnCallbacks_Red_DeliverNoClaim           RED AtMostOnce
     check MC_TxnCallbacks_Red_HelperDelivers           RED OnCommittingThread
     check MC_TxnCallbacks_Red_CloseNoClaim             RED AtMostOnce
+    # The pessimistic lock table (plan 4.6, 4.10): one holder per key, no
+    # lost wake-up, bounded bypass, a wait delivered to its own queue, and a
+    # lock released when its commit lands. Lean: Regolith/LockTable.lean,
+    # mutual_exclusion, retired_unused, no_stranded_front, handed_is_told,
+    # bounded_bypass, note_on_own_queue, ready_by_own_queue,
+    # isolation_at_landing.
+    spec=LockTable
+    check MC_LockTable_Green_Try                       GREEN
+    check MC_LockTable_Green_Bound2                    GREEN
+    check MC_LockTable_Green_Blocking                  GREEN
+    check MC_LockTable_Green_Nowait                    GREEN
+    check MC_LockTable_Green_Cancel                    GREEN
+    check MC_LockTable_Green_Table                     GREEN
+    check MC_LockTable_Green_Mixed                     GREEN
+    check MC_LockTable_Green_Four                      GREEN
+    check MC_LockTable_Red_RetireNoCas                 RED MutualExclusion
+    check MC_LockTable_Red_NoRecheck                   RED NoStrandedFront
+    check MC_LockTable_Red_ReleaseNoWake               RED NoStrandedFront
+    check MC_LockTable_Red_CancelNoPassOn              RED NoStrandedFront
+    check MC_LockTable_Red_NoteAfterPoll               RED WokenIsTold
+    check MC_LockTable_Red_UnboundedBarging            RED BoundedBypass
+    check MC_LockTable_Red_WrongQueue                  RED OwnQueue
+    check MC_LockTable_Red_CompleteOnWaker             RED OwnQueue
+    check MC_LockTable_Red_ReleaseAtWrite              RED IsolationAtLanding
+    check MC_LockTable_Red_ReleaseAtDelivery           RED HeldOnlyWhileNeeded
     rm -rf states ./*_TTrace_*.tla ./*_TTrace_*.bin
     exit $fail
 
