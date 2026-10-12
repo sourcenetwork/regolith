@@ -588,7 +588,7 @@ tla:
     check MC_WalRotation_Green                         GREEN
     check MC_WalRotation_Red_NoSync                    RED RecoversPrefix
     check MC_WalRotation_Red_NoSync_Gap                RED NoGap
-    # Plan 3.6, commit-ordered append (supersedes defradb.rs #1911). Each
+    # Plan 3.6, commit-ordered append. Each
     # Teeth row is GREEN: its mutant breaks nothing but its RED's invariant.
     # Lean: Regolith/Append.lean, dense_from_one, unique_positions,
     # at_most_once, commit_order, snapshot_sees_prefix.
@@ -932,6 +932,14 @@ tla:
     check MC_StallRelief_Green_ReliefFails             GREEN
     check MC_StallRelief_Red_NoFailLand                RED NoWaitOnceFailing
     check MC_StallRelief_Red_NoFailRecheck             RED NoWaitOnceFailing
+    # A commit is never lost to a stall: however its call ends, its write
+    # went in or it was told a failure. It is not handed the wait a plain
+    # write is, and it does not give up while its steps make progress.
+    # Checked by TLC and the tests; the Lean statement is still owed.
+    check MC_StallRelief_Green_Commit                  GREEN
+    check MC_StallRelief_Green_Commit_Failures         GREEN
+    check MC_StallRelief_Red_CommitTakesWait           RED NoLostCommit
+    check MC_StallRelief_Red_CommitGivesUp             RED NoLostCommit
     # E16: with no worker, a write that owes a step of background work runs
     # exactly one, and L0 stays at its compaction trigger (at the stop
     # trigger when every write seals). Lean: Regolith/OwedStep.lean,
