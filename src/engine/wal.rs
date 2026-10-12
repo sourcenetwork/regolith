@@ -488,7 +488,7 @@ impl Wal {
 /// the other differ. The clock and the path are mixed in for a platform
 /// whose `RandomState` has no randomness to draw on, where they still
 /// separate one database's logs and one session from the next.
-fn fresh_nonce(env: &dyn Env, path: &Path) -> u64 {
+pub(super) fn fresh_nonce(env: &dyn Env, path: &Path) -> u64 {
     use std::hash::BuildHasher;
     std::collections::hash_map::RandomState::new().hash_one((env.now_micros(), path))
 }
@@ -604,7 +604,7 @@ pub(crate) mod fault {
         armed.retain(|a| a.dir != dir && Some(&a.dir) != real.as_ref());
     }
 
-    pub(super) fn should_fail_sync(path: &Path) -> bool {
+    pub(crate) fn should_fail_sync(path: &Path) -> bool {
         let mut armed = ARMED.lock();
         // The log itself may not exist yet, so the resolved form is
         // taken from its directory.

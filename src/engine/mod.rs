@@ -46,10 +46,12 @@ pub(crate) mod snapshot_registry;
 pub(crate) mod source_walk;
 pub(crate) mod sstable;
 mod stall_state;
+pub(crate) mod take;
 pub(crate) mod wal;
 #[cfg(test)]
 mod wal_close_tests;
 pub(crate) mod wal_frame;
+pub(crate) mod wal_log;
 pub(crate) mod wal_replay;
 #[cfg(test)]
 mod wal_rotation_tests;
