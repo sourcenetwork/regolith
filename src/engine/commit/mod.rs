@@ -12,7 +12,9 @@
 //! store's step claimed by another thread waits for that thread, so one
 //! descheduled for good while it holds such a claim holds up the blocking
 //! commits behind it. A queue's poll never waits for another thread: the
-//! job it steps parks instead (`park.rs`).
+//! job it steps parks instead (`park.rs`). A unit holds the version store's
+//! step and the flush exclusion for the length of its body: a poll that
+//! needs either parks until the body ends, and a blocking call waits for it.
 //!
 //! An optimistic transaction's commit is a slot like any write (E10). It is
 //! decided in ring order against the view, which by then holds every commit
@@ -92,8 +94,8 @@ pub(crate) use append::PendingAppend;
 pub(crate) use descriptor::After;
 use descriptor::{Descriptor, Work};
 use early::EarlyVerdict;
-pub(crate) use ordered::Ordered;
-pub(crate) use park::Needs;
+pub(crate) use ordered::{Ordered, OrderedTicket};
+pub(crate) use park::{Help, Needs};
 pub(crate) use pipeline::Pipeline;
 use replaced::Replaced;
 pub(crate) use request::WriteRequest;

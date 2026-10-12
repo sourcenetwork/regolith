@@ -36,6 +36,21 @@
 //! its body may wait for ([`Needs`]), the poll takes exactly that, or parks,
 //! and the body then finds it held by its own thread.
 //!
+//! A job that is no unit takes them the same way ([`RegolithEngine::keep`])
+//! before each stretch of its work that flushes or changes the version set:
+//! an owed background step, a stall's relief, and the parts of a foreground
+//! job between its units (a drain's flushes, `compact_range`'s passes, an
+//! ingest's file ids, a checkpoint's capture). A foreground job enters each
+//! of its ordered units as any call does ([`Help`]), so a poll that runs it
+//! parks at the unit's entry too (`engine::foreground`, "Where a poll
+//! parks").
+//!
+//! # What still waits, and for whom
+//!
+//! A unit holds the version store's step and the flush exclusion for the
+//! length of its body: a poll that needs either parks until the body ends,
+//! and a blocking call waits for it.
+//!
 //! # Invariants
 //!
 //! - **K1, a parked job holds nothing.** Before it parks it lands the round
@@ -44,13 +59,18 @@
 //! - **K2, a parked job is woken.** Every registration is followed by a
 //!   second look at what it waits for, with a fence between that the side
 //!   ending the wait matches, so one of the two sees the other.
-//! - **K3, a unit's body never waits in a poll.** What it said it needs is
-//!   held by its thread for the length of the body. A body that waits for
-//!   something it did not say fails a build with debug assertions
-//!   (`io::scope::waits`).
+//! - **K3, nothing a poll steps waits for another thread.** What a unit's
+//!   body said it needs is held by its thread for the length of the body,
+//!   and a job that is no unit keeps what a stretch of its work needs. Every
+//!   blocking wait of the engine notes itself (`io::scope::waits`: the
+//!   round, a unit, a commit that blocks, the version store's step, the
+//!   flush exclusion, the compaction gate, a log's writes in flight), and a
+//!   poll that reaches one fails a build with debug assertions.
 //! - **K4, whoever waits on a parked job can run it.** A thread blocked on
 //!   the job is woken when it parks and claims it; every queue registered
-//!   on it is told when its wait ends (`job.rs`).
+//!   on it is told when its wait ends, and never before the thread that
+//!   parked it has let go of it, so a queue that is told finds it free to
+//!   claim (`job.rs`).
 
 use std::sync::Arc;
 use std::task::Waker;
@@ -58,12 +78,13 @@ use std::task::Waker;
 use super::super::RegolithEngine;
 use super::super::flush::Flushing;
 use super::super::io::job::{self, Job};
+use super::super::io::scope;
 use super::super::step::Hold;
 
 /// What a call does about work in its way that another thread has, or that
 /// nobody has yet. See the module docs.
 #[derive(Clone, Copy)]
-pub(super) enum Help<'a> {
+pub(crate) enum Help<'a> {
     /// A blocking call: runs what nobody has, waits for what another thread
     /// runs.
     Wait,
@@ -112,7 +133,7 @@ impl Needs {
 
 /// What a queue's poll took for a unit's body before running it (K3).
 /// Empty for a blocking caller, whose body waits for what it needs.
-pub(super) struct Kept<'a> {
+pub(crate) struct Kept<'a> {
     flushing: Option<Flushing<'a>>,
     versions: Option<Hold<'a>>,
 }
@@ -121,7 +142,7 @@ impl Kept<'_> {
     /// Give everything back. `true` when the flush exclusion was among it:
     /// the caller then refreshes the stall level, as every flush does once
     /// its exclusion is released.
-    pub(super) fn release(self) -> bool {
+    pub(crate) fn release(self) -> bool {
         let flushed = self.flushing.is_some();
         drop(self.versions);
         drop(self.flushing);
@@ -166,6 +187,7 @@ impl RegolithEngine {
     /// device I/O under way, and ends early when that thread parks the job,
     /// which this call then claims (K4).
     pub(super) fn run_or_wait(&self, job: &Arc<Job>) {
+        scope::waits("a round or a unit in the way of a call that blocks");
         loop {
             if job.claim() {
                 self.io().run_job(job);
@@ -180,7 +202,11 @@ impl RegolithEngine {
     /// Take what a unit's body needs before it begins (K3). `None` parks
     /// the unit: what could not be taken wakes `help`'s waker when it is
     /// free, and what was taken first is given back.
-    pub(super) fn keep(&self, needs: Needs, help: Help<'_>) -> Option<Kept<'_>> {
+    ///
+    /// Also what a job that is no unit does before a stretch of work that
+    /// flushes or changes the version set, when a queue's poll runs it: a
+    /// background step, a drain, a foreground job's part.
+    pub(crate) fn keep(&self, needs: Needs, help: Help<'_>) -> Option<Kept<'_>> {
         let Help::Park(waker) = help else {
             // A blocking caller's body waits for what it needs.
             return Some(Kept {
@@ -197,5 +223,14 @@ impl RegolithEngine {
             false => None,
         };
         Some(Kept { flushing, versions })
+    }
+
+    /// Give back what [`Self::keep`] took. A stopped writer that found the
+    /// flush exclusion held looks again once it is released, as after every
+    /// flush (`StallSignal`, relief handed back).
+    pub(crate) fn unkeep(&self, kept: Kept<'_>) {
+        if kept.release() {
+            self.refresh_stall_level();
+        }
     }
 }

@@ -10,41 +10,21 @@
 //! never return, since what it would wait for is released only after it.
 
 use std::io;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, mpsc};
-use std::task::{Wake, Waker};
+use std::task::Waker;
 use std::thread;
-use std::time::Duration;
 
 use tempfile::TempDir;
 
 use super::super::io::job::Job;
+use super::super::park_support::{counting, while_another_thread_holds};
 use super::super::{EngineOptions, RegolithEngine};
 use super::descriptor::Work;
 use super::ordered::Ordered;
 use super::park::{Help, Needs};
 use super::pipeline_tests::{durable_put, eventual_put, install, key, open_engine, seq_of};
 use crate::{IoBudget, OptimisticTransactionDb, Options, TxnOptions};
-
-/// Counts its wakes.
-struct Wakes(AtomicUsize);
-
-impl Wakes {
-    fn count(&self) -> usize {
-        self.0.load(Ordering::SeqCst)
-    }
-}
-
-impl Wake for Wakes {
-    fn wake(self: Arc<Self>) {
-        self.0.fetch_add(1, Ordering::SeqCst);
-    }
-}
-
-fn counting() -> (Arc<Wakes>, Waker) {
-    let wakes = Arc::new(Wakes(AtomicUsize::new(0)));
-    (Arc::clone(&wakes), Waker::from(Arc::clone(&wakes)))
-}
 
 /// Step `job` as a queue's poll does once its claim won. `false` when the
 /// job parked.
@@ -74,35 +54,6 @@ fn counted_unit(engine: &RegolithEngine, needs: Needs, ran: &Arc<AtomicUsize>) -
     let ran = Arc::clone(ran);
     unit(engine, needs, move |_, _| {
         ran.fetch_add(1, Ordering::SeqCst);
-    })
-}
-
-/// Have another thread take what `take` takes and keep it while `held` runs
-/// on this thread; then let it go, wait for that thread, and run `released`
-/// with what `held` returned.
-fn while_another_thread_holds<G, T, R>(
-    take: impl FnOnce() -> G + Send,
-    held: impl FnOnce() -> T,
-    released: impl FnOnce(T) -> R,
-) -> R {
-    let (taken, is_taken) = mpsc::channel();
-    let (release, released_now) = mpsc::channel::<()>();
-    thread::scope(|scope| {
-        let holder = scope.spawn(move || {
-            let guard = take();
-            taken.send(()).unwrap();
-            // Until told, or until the test thread dropped its end: a
-            // failed assertion there must not leave this thread holding.
-            let _ = released_now.recv();
-            drop(guard);
-        });
-        is_taken
-            .recv_timeout(Duration::from_secs(30))
-            .expect("the other thread never took it");
-        let out = held();
-        drop(release);
-        holder.join().unwrap();
-        released(out)
     })
 }
 
@@ -440,11 +391,13 @@ fn a_thread_blocked_on_a_unit_runs_it_once_the_poll_that_had_it_parks() {
     seq_of(&first).unwrap();
 }
 
-/// K3's check: a body that waits for something its unit did not say fails
-/// the poll that ran it, in a build with debug assertions, naming the wait.
+/// K3's check: a body that takes something its unit did not say fails the
+/// poll that ran it, in a build with debug assertions, naming the path.
+/// Nobody holds the step here, so nothing waits this time: the check is on
+/// the path, and does not need a race to be lost while the test runs.
 #[cfg(debug_assertions)]
 #[test]
-fn a_body_that_waits_for_what_its_unit_did_not_say_fails_the_poll() {
+fn a_body_that_takes_what_its_unit_did_not_say_fails_the_poll() {
     let dir = TempDir::new().unwrap();
     let engine = open_engine(&dir);
     // The body takes a file id, which is a section of the version store's
@@ -452,44 +405,31 @@ fn a_body_that_waits_for_what_its_unit_did_not_say_fails_the_poll() {
     let (_, job) = unit(&engine, Needs::NONE, |engine, _| {
         engine.versions.take_file_id().expect("a file id");
     });
-    let (taken, is_taken) = mpsc::channel();
-    let failed = thread::scope(|scope| {
-        let holder = scope.spawn(|| {
-            let hold = engine
-                .versions
-                .hold_or_park(Waker::noop())
-                .expect("the step is free");
-            taken.send(()).unwrap();
-            // The body's section queues behind this hold, and its thread
-            // waits: the wait the unit should have parked for.
-            let deadline = std::time::Instant::now() + Duration::from_secs(30);
-            let mut pause = Duration::from_micros(50);
-            while !engine.versions.has_waiting() {
-                assert!(
-                    std::time::Instant::now() < deadline,
-                    "the body never asked for the step"
-                );
-                thread::sleep(pause);
-                pause = (pause * 2).min(Duration::from_millis(10));
-            }
-            drop(hold);
-        });
-        is_taken.recv_timeout(Duration::from_secs(30)).unwrap();
-        let (_, waker) = counting();
-        let failed =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| poll_step(&job, &waker)));
-        holder.join().unwrap();
-        failed
-    });
-    let panic = failed.expect_err("a poll that waited for another thread passed");
+    let (_, waker) = counting();
+    let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| poll_step(&job, &waker)));
+    let panic = failed.expect_err("a poll that took a path that waits for another thread passed");
     let message = panic
         .downcast_ref::<String>()
         .expect("the check panics with a message");
     assert!(
-        message.contains("a queue's poll waited for another thread"),
+        message.contains("a queue's poll took a path that waits for another thread"),
         "{message}"
     );
+    assert!(message.contains("the version store's step"), "{message}");
     assert!(job.is_done(), "the unit's job landed all the same");
+}
+
+/// The same body in a unit that says what it takes passes: the poll held the
+/// step for it.
+#[test]
+fn a_body_that_takes_what_its_unit_said_passes_the_poll() {
+    let dir = TempDir::new().unwrap();
+    let engine = open_engine(&dir);
+    let (_, job) = unit(&engine, Needs::VERSIONS, |engine, _| {
+        engine.versions.take_file_id().expect("a file id");
+    });
+    let (_, waker) = counting();
+    assert!(poll_step(&job, &waker), "the unit ran to its end");
 }
 
 /// The whole path through the public API. A `commit_nowait` commit whose

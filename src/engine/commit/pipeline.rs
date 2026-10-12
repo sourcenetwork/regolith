@@ -829,6 +829,7 @@ impl RegolithEngine {
     /// slot before its own, runs the units in its way, and waits only for
     /// device I/O another thread has under way.
     pub(super) fn drive(&self, pipe: &Pipeline, index: u64, desc: &RingArc<Descriptor>) {
+        super::super::io::scope::waits("a commit that blocks until it is published");
         loop {
             if let Turn::Blocked(job) = self.help_decide(pipe, index, Help::Wait) {
                 self.run_or_wait(&job);

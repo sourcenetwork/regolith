@@ -68,7 +68,6 @@ impl JobBody for DecideSlot {
 
     /// On a queue's poll: parks instead of waiting for another thread.
     fn step(self: Box<Self>, waker: &Waker) -> Step {
-        let _no_wait = scope::no_wait();
         if self.decide(Help::Park(waker)) {
             Step::Done
         } else {

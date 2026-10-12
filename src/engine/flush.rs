@@ -162,10 +162,10 @@ impl Flusher {
         if let Some(held) = self.held_here() {
             return Ok(held);
         }
+        scope::waits("the flush exclusion, taken without holding it");
         if let Some(guard) = self.flushing.try_lock() {
             return Ok(self.held(guard, false));
         }
-        scope::waits("a flush in flight");
         Ok(self.held(wait_here(self.flushing.lock())?, false))
     }
 
