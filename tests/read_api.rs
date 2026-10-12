@@ -1,5 +1,6 @@
 //! Public-API coverage for the reads that answer without handing back
 //! a copy: `has`, `get_size`, and the iterator's `value_slice`.
+#![cfg(not(target_arch = "wasm32"))]
 
 use proptest::prelude::*;
 use regolith::{Db, MergeOperator, Options, WriteBatch};

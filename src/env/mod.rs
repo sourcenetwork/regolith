@@ -287,23 +287,7 @@ pub trait Env: Send + Sync + std::fmt::Debug {
     /// reports [`std::io::ErrorKind::OutOfMemory`] instead of
     /// aborting the process.
     fn read(&self, path: &Path) -> io::Result<Vec<u8>> {
-        let file = self.open_read(path)?;
-        let len = usize::try_from(file.len()?).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("{} is too large to address", path.display()),
-            )
-        })?;
-        let mut buf = Vec::new();
-        buf.try_reserve_exact(len).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::OutOfMemory,
-                format!("cannot allocate {len} bytes to read {}", path.display()),
-            )
-        })?;
-        buf.resize(len, 0);
-        file.read_exact_at(0, &mut buf)?;
-        Ok(buf)
+        read_whole(&*self.open_read(path)?, path)
     }
 
     /// Replace the whole contents of `path`, creating it if needed.
@@ -325,6 +309,27 @@ pub trait Env: Send + Sync + std::fmt::Debug {
     fn drop_page_cache(&self, path: &Path) {
         let _ = path;
     }
+}
+
+/// Every byte of `file`, which was opened at `path`: the body of
+/// [`Env::read`], for an environment that reads through a handle of its own.
+pub(crate) fn read_whole(file: &dyn ReadFile, path: &Path) -> io::Result<Vec<u8>> {
+    let len = usize::try_from(file.len()?).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{} is too large to address", path.display()),
+        )
+    })?;
+    let mut buf = Vec::new();
+    buf.try_reserve_exact(len).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::OutOfMemory,
+            format!("cannot allocate {len} bytes to read {}", path.display()),
+        )
+    })?;
+    buf.resize(len, 0);
+    file.read_exact_at(0, &mut buf)?;
+    Ok(buf)
 }
 
 /// A file opened for reading.
@@ -473,14 +478,6 @@ pub trait LogFile: Send + Sync {
 
     /// Cut the file to exactly `len` bytes.
     fn set_len(&self, len: u64) -> io::Result<()>;
-
-    /// Length of the file in bytes, counting only what has reached the host.
-    fn len(&self) -> io::Result<u64>;
-
-    /// Whether the file holds no bytes.
-    fn is_empty(&self) -> io::Result<bool> {
-        Ok(self.len()? == 0)
-    }
 }
 
 /// A held directory lock. The lock is released when this is dropped.

@@ -168,7 +168,7 @@ impl BackgroundHealth {
     /// writers waiting on the stall (module docs): from now until the job
     /// next succeeds, a write stopped behind it is told this failure.
     pub(crate) fn record_failure(&self, job: Job, err: &io::Error) -> Hazard {
-        self.errors.fetch_add(1, Ordering::Relaxed);
+        self.count_failure();
         let hazard = Hazard::of(err);
         self.slot(job).store(Some(Failure {
             job,
@@ -183,6 +183,13 @@ impl BackgroundHealth {
             stall.land();
         }
         hazard
+    }
+
+    /// Count a failed attempt without recording it as the failure a stopped
+    /// writer is told: a compaction pass a caller's thread ran
+    /// (`RegolithEngine::compaction_failed`).
+    pub(crate) fn count_failure(&self) {
+        self.errors.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Clear the failure this success follows. One load while the job is

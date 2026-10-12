@@ -166,12 +166,6 @@ impl LogFile for MemLog {
         }
         Ok(())
     }
-
-    /// The contiguous written prefix: a held write has not reached the
-    /// file.
-    fn len(&self) -> io::Result<u64> {
-        Ok(self.data.len())
-    }
 }
 
 #[cfg(test)]

@@ -262,16 +262,6 @@ impl RateLimiter for PanicsOnRequest {
     fn request(&self, _: u64, _: Priority) {
         panic!("injected limiter panic");
     }
-
-    fn set_bytes_per_second(&self, _: u64) {}
-
-    fn get_bytes_per_second(&self) -> u64 {
-        0
-    }
-
-    fn get_total_bytes_through(&self, _: Priority) -> u64 {
-        0
-    }
 }
 
 /// The rate limiter throttles the background alone (plan 4.10): a limiter

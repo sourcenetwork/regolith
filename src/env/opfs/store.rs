@@ -210,10 +210,6 @@ impl LogFile for PoolLog {
     fn set_len(&self, len: u64) -> io::Result<()> {
         self.pool.set_len(self.slot, self.generation, len)
     }
-
-    fn len(&self) -> io::Result<u64> {
-        self.pool.file_len(self.slot, self.generation)
-    }
 }
 
 // ---------------------------------------------------------------------
@@ -377,9 +373,5 @@ impl LogFile for MirrorLog {
 
     fn set_len(&self, len: u64) -> io::Result<()> {
         self.fs.set_len(&self.path, len)
-    }
-
-    fn len(&self) -> io::Result<u64> {
-        self.fs.file_len(&self.path)
     }
 }

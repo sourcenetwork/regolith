@@ -14,6 +14,20 @@
 //!    `put b2 = y`, `delete k020`, `merge m 1`, `merge m 2`, and
 //!    `put a00003 = overwritten`; then the process exited without closing,
 //!    so every write of step 2 is only in the format 1 log.
+//!
+//! `tests/fixtures/v0_1_9_prefix` was written by the same release with a
+//! `FixedLengthPrefix(8)` extractor, `Immediate` durability and no
+//! compaction, as three level-0 tables, and then closed:
+//!
+//! 1. `put tenA0001:a = 1`, `tenA0001:b = 2`, `tenA0002:a = 3`, and in a
+//!    column family `named`, `tenB0001:a = 4`; `flush`;
+//! 2. `put tenC0007:a = 5`, `tenC0007:b = 6`, and in `named`,
+//!    `tenB0002:a = 7`, `tenA0001:n = 8`; `flush`;
+//! 3. `put tenA0003:a = 9`, and in `named`, `tenD0001:a = 10`; `flush`.
+//!
+//! 0.1.9 handed the extractor the key behind its 4-byte column-family id,
+//! so each of those tables' prefix filters holds, for every key, the id and
+//! the first four bytes of the key the caller wrote.
 
 // Native-only, like every test that touches the filesystem.
 #![cfg(not(target_arch = "wasm32"))]
@@ -26,7 +40,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use common::wal_format::{self, TailReports};
-use regolith::{Db, EventListener, MergeOperator, Options, WriteBatch};
+use regolith::{
+    ColumnFamilyHandle, CompactionOutcome, Db, EventListener, FixedLengthPrefix, MergeOperator,
+    Options, Statistics, Ticker, WriteBatch,
+};
 use tempfile::TempDir;
 
 struct Concat;
@@ -212,4 +229,99 @@ fn a_torn_0_1_9_log_replays_its_whole_records_and_reports_the_tail() {
         taken[0].offset + taken[0].discarded_bytes,
         bytes.len() as u64 - 3
     );
+}
+
+/// The rows from where `iter` stands to where it stops.
+fn rows(mut iter: regolith::CfIter<'_>) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let mut rows = Vec::new();
+    while iter.valid() {
+        rows.push((iter.key().unwrap().to_vec(), iter.value().unwrap().to_vec()));
+        iter.next();
+    }
+    iter.status().unwrap();
+    rows
+}
+
+/// How many rows a prefix seek in `family` (`None` for the default one)
+/// yields, and how many tables its prefix filter ruled out. The seek must
+/// yield what a full scan of the family has under the prefix.
+fn prefix_seek(
+    db: &Db,
+    stats: &Statistics,
+    family: Option<&ColumnFamilyHandle>,
+    prefix: &[u8],
+) -> (usize, u64) {
+    let iter = || family.map_or_else(|| db.iter(), |cf| db.iter_cf(cf));
+    let before = stats.get_ticker(Ticker::BloomFilterUseful);
+    let mut seek = iter();
+    seek.seek_prefix(prefix);
+    let found = rows(seek);
+    let ruled_out = stats.get_ticker(Ticker::BloomFilterUseful) - before;
+
+    let mut scan = iter();
+    scan.seek_to_first();
+    let mut expected = rows(scan);
+    expected.retain(|(key, _)| key.starts_with(prefix));
+    assert_eq!(found, expected, "a prefix seek and a full scan disagree");
+    (found.len(), ruled_out)
+}
+
+/// A database 0.1.9 wrote with a prefix extractor keeps filtering its prefix
+/// seeks the way its tables were built, and finds every row; once a
+/// compaction has rewritten the tables, the filter is on the key the caller
+/// wrote.
+#[test]
+fn a_0_1_9_database_with_a_prefix_extractor_keeps_filtering_its_prefix_seeks() {
+    let tmp = TempDir::new().unwrap();
+    let db_dir = tmp.path().join("db");
+    copy_tree(&fixture_dir().with_file_name("v0_1_9_prefix"), &db_dir);
+    let stats = Arc::new(Statistics::new());
+    let db = Db::open(
+        &db_dir,
+        Options::default()
+            .prefix_extractor(Some(Arc::new(FixedLengthPrefix(8))))
+            .statistics(Some(stats.clone()))
+            .l0_compaction_trigger(2)
+            // Nothing compacts until the test says so.
+            .max_background_compactions(0)
+            .inline_compaction(false),
+    )
+    .expect("a 0.1.9 database with a prefix extractor opens");
+    let named = db.column_family("named").expect("the family 0.1.9 created");
+    let seek = |family: Option<&ColumnFamilyHandle>, prefix: &[u8]| {
+        prefix_seek(&db, &stats, family, prefix)
+    };
+    assert_eq!(db.get_int_property("regolith.num-files-at-level0"), Some(3));
+
+    // Each table's filter holds the family id and four bytes of the key, so
+    // a seek for `tenA0009` in the default family rules out only the one
+    // table that has no `tenA` there, and finds nothing in the other two.
+    assert_eq!(seek(None, b"tenA0009"), (0, 1));
+    assert_eq!(seek(None, b"tenA0001"), (2, 1));
+    assert_eq!(seek(None, b"tenC0007:"), (2, 2));
+    assert_eq!(seek(None, b"tenZ0001"), (0, 3));
+    assert_eq!(seek(Some(&named), b"tenA0001"), (1, 2));
+    assert_eq!(seek(Some(&named), b"tenB0002"), (1, 1));
+    // A prefix of fewer than four of the caller's bytes is not filtered.
+    assert_eq!(seek(None, b"ten"), (6, 0));
+    assert_eq!(seek(Some(&named), b""), (4, 0));
+
+    // A table written now is filtered on the key the caller wrote, next to
+    // the three that are not.
+    db.put(b"tenA0009:z", b"11").unwrap();
+    db.flush().unwrap();
+    assert_eq!(seek(None, b"tenA0009"), (1, 1));
+    assert_eq!(seek(None, b"tenA0008"), (0, 2));
+
+    // The compaction rewrites the four overlapping tables into one, and the
+    // filter then tells `tenA0008` from `tenA0009`.
+    assert_eq!(db.compact_step().unwrap(), CompactionOutcome::DidWork);
+    assert_eq!(db.get_int_property("regolith.num-files-at-level0"), Some(0));
+    assert_eq!(seek(None, b"tenA0008"), (0, 1));
+    assert_eq!(seek(None, b"tenA0009"), (1, 0));
+    assert_eq!(seek(None, b"tenA0001"), (2, 0));
+    assert_eq!(seek(Some(&named), b"tenA0001"), (1, 0));
+    assert_eq!(seek(Some(&named), b"tenA0002"), (0, 1));
+    assert_eq!(seek(None, b"ten"), (7, 0));
+    db.close().unwrap();
 }

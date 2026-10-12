@@ -41,6 +41,7 @@
 //! degenerate-input tests. Everything that writes six figures of
 //! operations, a 64 MiB value, or fills a filesystem is sized
 //! with its measured runtime stated at the test.
+#![cfg(not(target_arch = "wasm32"))]
 
 use std::collections::BTreeMap;
 use std::fs;

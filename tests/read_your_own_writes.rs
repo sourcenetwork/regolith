@@ -12,6 +12,7 @@
 //! Read-your-own-writes is the other half: a thread that writes a key
 //! and immediately reads it back must see at least what it just wrote,
 //! whatever rotation or flush lands between the two calls.
+#![cfg(not(target_arch = "wasm32"))]
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Barrier, Mutex};

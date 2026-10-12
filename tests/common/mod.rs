@@ -143,3 +143,8 @@ pub mod device_env;
 /// An `Env` that refuses chosen log removals and, while armed, table
 /// creations: what the flush retirement tests pin.
 pub mod faulty_env;
+
+/// An `Env` that records the threads a database starts and every write and
+/// sync of its log, and can hold a sync at the device: what the thread
+/// budget and the allocation tests pin.
+pub mod watched_env;

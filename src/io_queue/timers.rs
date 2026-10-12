@@ -9,6 +9,11 @@
 //!
 //! Held by the queue's owner alone. A wait is recorded through the queue's
 //! inbox, like every other request, so it may be asked for on any thread.
+//!
+//! `proofs/tla/NonBlocking.tla` checks these rules with the rest of the
+//! queue (`TimerNotEarly`, `TimerOnOwnQueue`, `DroppedHoldsNothing`, and
+//! `AllDone` for an owner that polls again in time), and
+//! `proofs/lean/Regolith/IoQueue.lean` proves them for any clock (Part 6).
 
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;

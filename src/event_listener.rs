@@ -122,10 +122,11 @@ pub struct TableFileCreationInfo {
     pub num_entries: u64,
 }
 
-/// Information about an SSTable file that was just unlinked from
-/// disk. Fires after compaction has committed the version edit
-/// that removed the file from the live set and the physical
-/// `unlink(2)` has succeeded.
+/// Information about an SSTable file a compaction just removed. Fires
+/// after the compaction has committed the version edit that took the file
+/// out of the live set and has removed the file's name. The removal is
+/// best effort: one that fails is logged and left for the next open to
+/// sweep, and the listener is told all the same.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct TableFileDeletionInfo {
@@ -233,9 +234,9 @@ pub trait EventListener: Send + Sync + 'static {
         let _ = info;
     }
 
-    /// Called after an SSTable file has been physically unlinked
-    /// from disk (after the manifest edit that removed it from
-    /// the live set has been applied).
+    /// Called after a compaction took an SSTable file out of the live
+    /// set (the manifest edit is applied) and removed the file's name;
+    /// see [`TableFileDeletionInfo`] for a removal that fails.
     fn on_table_file_deleted(&self, info: &TableFileDeletionInfo) {
         let _ = info;
     }

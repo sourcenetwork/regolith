@@ -2,10 +2,11 @@
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::task::{Context, Poll};
 
 use super::QueueId;
+use crate::engine::RegolithEngine;
 use crate::engine::io::atomic_waker::AtomicWaker;
 use crate::engine::io::job::Job;
 use crate::engine::io::shared::{QueueShared, WaitSlot};
@@ -220,11 +221,12 @@ pub struct StallWait {
     /// Nothing relieves the stall but the caller: no compaction worker, and
     /// inline compaction turned off.
     self_driven: bool,
-    /// Where the time a thread is blocked in [`StallWait::wait`] is counted.
-    /// Read only by the blocking wait, which `wasm32` lacks: there it is set
-    /// and never read. The compiler raises no dead-code lint for it there,
-    /// so it carries no expectation of one, unlike `stall`.
-    counted: Option<Arc<crate::Statistics>>,
+    /// The database, for the blocking wait: it steps the calling thread's
+    /// own jobs through it, and counts the time blocked in its statistics.
+    /// Read only by that wait, which `wasm32` lacks: there it is set and
+    /// never read. The compiler raises no dead-code lint for it there, so
+    /// it carries no expectation of one, unlike `stall`.
+    engine: Weak<RegolithEngine>,
 }
 
 impl StallWait {
@@ -240,7 +242,7 @@ impl StallWait {
             queue,
             reason,
             self_driven: false,
-            counted: None,
+            engine: Weak::new(),
         }
     }
 
@@ -251,10 +253,9 @@ impl StallWait {
         self
     }
 
-    /// Count the time a thread is blocked in [`StallWait::wait`] in `stats`
-    /// ([`Ticker::WriteStallMicros`](crate::Ticker::WriteStallMicros)).
-    pub(crate) fn counted_in(mut self, stats: Option<Arc<crate::Statistics>>) -> Self {
-        self.counted = stats;
+    /// Name the database the stall is on, for [`StallWait::wait`].
+    pub(crate) fn on(mut self, engine: Weak<RegolithEngine>) -> Self {
+        self.engine = engine;
         self
     }
 
@@ -297,6 +298,14 @@ impl StallWait {
     /// wait was recorded on a queue; a wait on a queue still becomes ready
     /// only at that queue's poll.
     ///
+    /// On a thread that owns an [`IoQueue`](crate::IoQueue), the jobs that
+    /// queue holds are stepped here while the thread waits, as its poll
+    /// would step them: the step that relieves the stall, or a
+    /// [`JobTicket`](crate::JobTicket)'s job that holds what that step
+    /// needs, may be among them, and nothing else would run it. A block
+    /// read pending on the queue is not run here; it holds nothing a stall
+    /// waits for.
+    ///
     /// Not on `wasm32`, whose one thread would wait for work only it can do.
     ///
     /// The time spent blocked here is counted in
@@ -304,8 +313,14 @@ impl StallWait {
     #[cfg(not(target_arch = "wasm32"))]
     pub fn wait(&self) {
         let blocked = std::time::Instant::now();
-        self.stall.wait_landed();
-        if let Some(stats) = &self.counted {
+        let engine = self.engine.upgrade();
+        match &engine {
+            Some(engine) => engine.io().wait_landed(&self.stall),
+            // Every handle on the database is gone: there is no queue of it
+            // to step, and the wait is for the stall alone.
+            None => self.stall.wait_landed(),
+        }
+        if let Some(stats) = engine.as_ref().and_then(|engine| engine.statistics()) {
             let micros = u64::try_from(blocked.elapsed().as_micros()).unwrap_or(u64::MAX);
             stats.add(crate::Ticker::WriteStallMicros, micros);
         }

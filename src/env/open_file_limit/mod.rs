@@ -35,6 +35,8 @@
 //! other unreferenced tables (`engine::orphan_sweep`). A rename of a table
 //! with live handles moves those handles to the new name the same way.
 
+#[cfg(test)]
+mod forward_tests;
 #[cfg(loom)]
 pub mod loom_model;
 #[cfg(test)]
@@ -555,5 +557,27 @@ impl Env for OpenFileLimit {
     }
     fn drop_page_cache(&self, path: &Path) {
         self.shared.inner.drop_page_cache(path)
+    }
+    // The methods `Env` gives a default body go to the environment too, so
+    // what it wrote for one of them is what runs.
+    fn disk_space(&self, path: &Path) -> io::Result<Option<super::DiskSpace>> {
+        self.shared.inner.disk_space(path)
+    }
+    fn exists(&self, path: &Path) -> bool {
+        self.shared.inner.exists(path)
+    }
+    fn is_dir(&self, path: &Path) -> bool {
+        self.shared.inner.is_dir(path)
+    }
+    fn read(&self, path: &Path) -> io::Result<Vec<u8>> {
+        if is_table(path) {
+            // Through this environment's own handle, so the read counts
+            // against the bound like any other read of a table.
+            return super::read_whole(&*self.open_read(path)?, path);
+        }
+        self.shared.inner.read(path)
+    }
+    fn write(&self, path: &Path, data: &[u8]) -> io::Result<()> {
+        self.shared.inner.write(path, data)
     }
 }

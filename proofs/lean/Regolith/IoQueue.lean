@@ -55,6 +55,18 @@ asleep, the note to B wakes B up; A is awake, so nothing wakes A.
    a runner that readies the waiting commits' tickets itself
    (`lander_delivery_breaks_own_poll`), and a writer that does not look at
    the stall again (`no_recheck_strands_stall`).
+8. Timed waits (Part 6), the wait a retry backs off on. Nobody is woken for
+   one: the owner's poll completes it when the clock reaches its due time.
+   `timed_wait_completed_once`, it is completed at most once;
+   `timed_wait_completed_by_owner`, only by a step of its queue's owner
+   (TLA+ `TimerOnOwnQueue`); `timed_wait_not_before_due`, a poll never
+   completes it before its due time (TLA+ `TimerNotEarly`);
+   `dropped_queue_holds_no_wait`, a dropped queue leaves none pending (TLA+
+   `DroppedHoldsNothing`); `poll_after_wake_in_completes`, an owner that
+   polls again within what its poll reported completes it (TLA+ `AllDone`
+   with a timed wait). RED: a poll that does not look at the clock
+   (`early_fire_breaks_due`), and an owner that never polls again
+   (`idle_owner_never_completes`).
 
 ## How to read the Lean
 
@@ -1703,6 +1715,550 @@ theorem no_recheck_strands_stall :
     simp at hw
   -- Any other writer never wrote.
   · simp [Stall.init, set, h1] at hw
+
+/-! ## Part 6. Timed waits: once, by the owner's poll, not before the due time
+
+This part mirrors the timed waits of a queue: `Timers` in
+`src/io_queue/timers.rs`, `IoRuntime::timer` in `src/engine/io/mod.rs`, and
+the end of `IoQueue::poll` and the drop of a queue in
+`src/io_queue/queue.rs`. TLA+ checks the same rules together with the rest
+of the queue (`TimerNotEarly`, `TimerOnOwnQueue`, `DroppedHoldsNothing`, and
+`AllDone` for a wait that must finish).
+
+The story. A transaction that lost its commit may wait a little before it
+runs again. A thread that must never block cannot sleep, so it asks its
+queue for a *timed wait*: "ready when the clock reads 100". Nobody is woken
+for it and nothing sleeps for it. The owner's poll looks at the clock, and
+the first poll that finds 100 or later marks the wait ready. Each poll also
+says how long the owner may idle until the next wait is due, and an owner
+that polls again by then completes it.
+
+Tiny example. At time 40 thread A asks for a wait due at 100. A's poll at
+time 60 leaves it alone and says "idle at most 40". A's poll at time 100
+completes it. If A drops its queue at time 70 instead, the wait is completed
+then: nothing else ever would. -/
+
+/-- Where one timed wait is. -/
+inductive WState where
+  /-- Nobody has asked for it. -/
+  | unasked
+  /-- Asked for: its note is in the queue's inbox. -/
+  | noted
+  /-- The owner's poll took the note in and holds the wait. -/
+  | held
+  /-- Completed: the task that waits on it may run again. -/
+  | over
+  -- Two states can be compared for equality.
+  deriving DecidableEq
+
+/-- Whether a wait is asked for and not completed yet. -/
+def WState.pending : WState → Bool
+  -- A note in the inbox is pending.
+  | .noted => true
+  -- So is a wait the owner holds.
+  | .held => true
+  -- One nobody asked for is not.
+  | .unasked => false
+  -- Nor is one that is over.
+  | .over => false
+
+/-- A pending wait is not over. -/
+theorem pending_not_over {w : WState}
+    -- The wait is pending.
+    (h : w.pending = true) :
+    -- Then:
+    w ≠ .over := by
+  -- Look at where the wait is: "over" is not pending.
+  cases w <;> simp [WState.pending] at h ⊢
+
+/-- One queue's timed waits at one moment. A wait is named by a natural
+number, and so is a thread. -/
+structure Timed where
+  /-- What the queue's clock reads. -/
+  now : Nat
+  /-- Where each wait is. -/
+  st : Nat → WState
+  /-- Each wait's due time, fixed when it is asked for. -/
+  due : Nat → Nat
+  /-- Whether the queue was dropped. -/
+  gone : Bool
+  /-- Ghost: how many times each wait was completed. -/
+  fires : Nat → Nat
+  /-- Ghost: the thread whose step completed each wait. -/
+  who : Nat → Nat
+  /-- Ghost: what the clock read when each wait was completed. -/
+  seen : Nat → Nat
+  /-- Ghost: whether the wait was completed by the drop of its queue. -/
+  byDrop : Nat → Bool
+
+/-- The start: time zero, nothing asked for, the queue open. -/
+def Timed.init : Timed :=
+  -- Every field starts empty.
+  ⟨0, fun _ => .unasked, fun _ => 0, false, fun _ => 0, fun _ => 0, fun _ => 0, fun _ => false⟩
+
+/-- The steps of the timed waits of a queue that thread `owner` owns, one
+atomic step each, as the code takes them. -/
+inductive TStep (owner : Nat) : Timed → Timed → Prop
+  /-- Some thread asks for wait `w`, due at time `d`: a note goes to the
+  queue's inbox (`IoRuntime::timer`). -/
+  | ask (s : Timed) (w d : Nat)
+      -- Nobody asked for `w` before.
+      (hnew : s.st w = .unasked)
+      -- The queue is open (a dropped one hands the wait back ready).
+      (hopen : s.gone = false) :
+      -- The state after the step:
+      TStep owner s { s with st := set s.st w .noted, due := set s.due w d }
+  /-- The owner's poll takes the note for `w` out of the inbox and holds the
+  wait (`Timers::record`). -/
+  | record (s : Timed) (w : Nat)
+      -- The note is in the inbox.
+      (hn : s.st w = .noted) :
+      -- The state after the step:
+      TStep owner s { s with st := set s.st w .held }
+  /-- Time passes. -/
+  | tick (s : Timed) :
+      -- The state after the step:
+      TStep owner s { s with now := s.now + 1 }
+  /-- The owner's poll finds `w` due and completes it (`Timers::fire`). -/
+  | fire (s : Timed) (w : Nat)
+      -- The owner holds the wait.
+      (hh : s.st w = .held)
+      -- The clock reads its due time or later.
+      (hdue : s.due w ≤ s.now) :
+      -- The state after the step:
+      TStep owner s { s with st := set s.st w .over,
+                             fires := set s.fires w (s.fires w + 1),
+                             who := set s.who w owner,
+                             seen := set s.seen w s.now }
+  /-- The owner drops the queue: every wait asked for and not completed is
+  completed now (`Timers::complete_all`, and the notes still in the inbox). -/
+  | drop (s : Timed)
+      -- The queue was open.
+      (hopen : s.gone = false) :
+      -- The state after the step:
+      TStep owner s { s with
+        gone := true,
+        st := fun w => if (s.st w).pending then .over else s.st w,
+        fires := fun w => if (s.st w).pending then s.fires w + 1 else s.fires w,
+        who := fun w => if (s.st w).pending then owner else s.who w,
+        seen := fun w => if (s.st w).pending then s.now else s.seen w,
+        byDrop := fun w => if (s.st w).pending then true else s.byDrop w }
+
+/-- Any number of steps, one after another. -/
+inductive TSteps (owner : Nat) : Timed → Timed → Prop
+  /-- No step at all. -/
+  | refl (s : Timed) : TSteps owner s s
+  /-- Some steps, then one more. -/
+  | tail {a b c : Timed} : TSteps owner a b → TStep owner b c → TSteps owner a c
+
+/-- What holds of every timed wait in every reachable state. -/
+structure TInv (owner : Nat) (s : Timed) : Prop where
+  /-- A wait that is not over was never completed. -/
+  fires_pending : ∀ w, s.st w ≠ .over → s.fires w = 0
+  /-- No wait was completed more than once. -/
+  fires_le : ∀ w, s.fires w ≤ 1
+  /-- A completed wait was completed by a step of the owner. -/
+  by_owner : ∀ w, s.st w = .over → s.who w = owner
+  /-- A wait a poll completed was due when that poll read the clock. -/
+  not_early : ∀ w, s.st w = .over → s.byDrop w = false → s.due w ≤ s.seen w
+  /-- A dropped queue holds no wait that is still pending. -/
+  gone_empty : s.gone = true → ∀ w, (s.st w).pending = false
+
+/-- The start satisfies the invariant. -/
+theorem tinv_init (owner : Nat) : TInv owner Timed.init := by
+  -- Each field holds because nothing is asked for and the queue is open.
+  refine ⟨?_, ?_, ?_, ?_, ?_⟩ <;> intros <;> simp_all [Timed.init]
+
+/-- **One step keeps the invariant.** Each kind of step is checked in turn. -/
+theorem tstep_inv {owner : Nat} {s t : Timed}
+    -- The invariant holds before the step.
+    (hs : TInv owner s)
+    -- One step from `s` to `t`.
+    (h : TStep owner s t) :
+    -- Then:
+    TInv owner t := by
+  -- Look at which kind of step it was.
+  cases h with
+  -- A wait was asked for.
+  | ask w d hnew hopen =>
+    -- Asking only moves `w` from "not asked" to "noted" and fixes its due time.
+    refine ⟨fun x hx => ?_, hs.fires_le, fun x hx => ?_, fun x hx hd => ?_, fun hg => ?_⟩
+    -- Not completed: `w` was not over before either; others are unchanged.
+    · by_cases hxw : x = w
+      -- It is `w`: it was not asked for, so it was not over.
+      · subst hxw
+        -- "Not asked for" is not "over", so the old fact applies.
+        exact hs.fires_pending x (by simp [hnew])
+      -- Another wait: unchanged.
+      · exact hs.fires_pending x (by simpa [hxw] using hx)
+    -- Completed by the owner: `w` is noted, not over, so `x` is another wait.
+    · by_cases hxw : x = w
+      -- It is `w`: noted is not over.
+      · subst hxw
+        -- So the assumption cannot hold.
+        simp at hx
+      -- Another wait: unchanged.
+      · exact hs.by_owner x (by simpa [hxw] using hx)
+    -- Not early: the same split.
+    · by_cases hxw : x = w
+      -- It is `w`: noted is not over.
+      · subst hxw
+        -- So the assumption cannot hold.
+        simp at hx
+      -- Another wait: its state and its due time are unchanged.
+      · simpa [hxw] using hs.not_early x (by simpa [hxw] using hx) hd
+    -- The queue is open, so it is not a dropped one.
+    · simp [hopen] at hg
+  -- The owner took a note in.
+  | record w hn =>
+    -- Recording only moves `w` from "noted" to "held".
+    refine ⟨fun x hx => ?_, hs.fires_le, fun x hx => ?_, fun x hx hd => ?_, fun hg => ?_⟩
+    -- Not completed: `w` was noted, not over; others are unchanged.
+    · by_cases hxw : x = w
+      -- It is `w`: it was noted.
+      · subst hxw
+        -- "Noted" is not "over", so the old fact applies.
+        exact hs.fires_pending x (by simp [hn])
+      -- Another wait: unchanged.
+      · exact hs.fires_pending x (by simpa [hxw] using hx)
+    -- Completed by the owner: `w` is held, not over.
+    · by_cases hxw : x = w
+      -- It is `w`: held is not over.
+      · subst hxw
+        -- So the assumption cannot hold.
+        simp at hx
+      -- Another wait: unchanged.
+      · exact hs.by_owner x (by simpa [hxw] using hx)
+    -- Not early: the same split.
+    · by_cases hxw : x = w
+      -- It is `w`: held is not over.
+      · subst hxw
+        -- So the assumption cannot hold.
+        simp at hx
+      -- Another wait: unchanged.
+      · exact hs.not_early x (by simpa [hxw] using hx) hd
+    -- A dropped queue held no pending wait, but `w` was noted: impossible.
+    · have hp := hs.gone_empty hg w
+      -- "Noted" is pending, which contradicts that.
+      simp [hn, WState.pending] at hp
+  -- Time passed.
+  | tick =>
+    -- No fact of the invariant mentions the clock.
+    exact ⟨hs.fires_pending, hs.fires_le, hs.by_owner, hs.not_early, hs.gone_empty⟩
+  -- The owner's poll completed a wait.
+  | fire w hh hdue =>
+    -- Before, `w` was held: not over, so never completed.
+    have h0 : s.fires w = 0 := hs.fires_pending w (by simp [hh])
+    -- Firing makes `w` over, counts it once, and records who and when.
+    refine ⟨fun x hx => ?_, fun x => ?_, fun x hx => ?_, fun x hx hd => ?_, fun hg => ?_⟩
+    -- Not completed: `w` is over now, so `x` is another wait.
+    · by_cases hxw : x = w
+      -- It is `w`: it is over.
+      · subst hxw
+        -- So the assumption cannot hold.
+        simp at hx
+      -- Another wait: its state and its count are unchanged.
+      · simpa [hxw] using hs.fires_pending x (by simpa [hxw] using hx)
+    -- At most once: `w` goes from zero to one.
+    · by_cases hxw : x = w
+      -- It is `w`: zero plus one.
+      · subst hxw
+        -- The count was zero.
+        simp [h0]
+      -- Another wait: unchanged.
+      · simpa [hxw] using hs.fires_le x
+    -- By the owner: this step is the owner's.
+    · by_cases hxw : x = w
+      -- It is `w`: the step recorded the owner.
+      · subst hxw
+        -- Read the new value.
+        simp
+      -- Another wait: unchanged.
+      · simpa [hxw] using hs.by_owner x (by simpa [hxw] using hx)
+    -- Not early: the poll saw the clock at the due time or later.
+    · by_cases hxw : x = w
+      -- It is `w`: the clock it saw is the clock now.
+      · subst hxw
+        -- And the step needed the wait to be due.
+        simpa using hdue
+      -- Another wait: unchanged.
+      · simpa [hxw] using hs.not_early x (by simpa [hxw] using hx) hd
+    -- A dropped queue held no pending wait, but `w` was held: impossible.
+    · have hp := hs.gone_empty hg w
+      -- "Held" is pending, which contradicts that.
+      simp [hh, WState.pending] at hp
+  -- The owner dropped the queue.
+  | drop hopen =>
+    -- Every pending wait is over now, counted once, by the owner, by the drop.
+    refine ⟨fun x hx => ?_, fun x => ?_, fun x hx => ?_, fun x hx hd => ?_, fun _ x => ?_⟩
+    -- Not completed: such a wait was not pending, so the drop left it alone.
+    · by_cases hp : (s.st x).pending = true
+      -- It was pending: then it is over now.
+      · simp [hp] at hx
+      -- It was not pending: its state and its count are unchanged.
+      · simp only [hp] at hx ⊢
+        -- The old fact applies.
+        simpa using hs.fires_pending x (by simpa using hx)
+    -- At most once: a pending wait had count zero.
+    · by_cases hp : (s.st x).pending = true
+      -- It was pending: zero plus one.
+      · simp [hp, hs.fires_pending x (pending_not_over hp)]
+      -- It was not pending: unchanged.
+      · simpa [hp] using hs.fires_le x
+    -- By the owner: the drop is the owner's step.
+    · by_cases hp : (s.st x).pending = true
+      -- It was pending: the drop recorded the owner.
+      · simp [hp]
+      -- It was not pending: it was over before, by the owner.
+      · simp only [hp] at hx ⊢
+        -- The old fact applies.
+        simpa using hs.by_owner x (by simpa using hx)
+    -- Not early: a wait the drop completed is marked so.
+    · by_cases hp : (s.st x).pending = true
+      -- It was pending: then the drop marked it, against the assumption.
+      · simp [hp] at hd
+      -- It was not pending: unchanged.
+      · simp only [hp] at hx hd ⊢
+        -- The old fact applies.
+        simpa using hs.not_early x (by simpa using hx) (by simpa using hd)
+    -- Nothing is pending after the drop: say what `x`'s new state is.
+    · show (if (s.st x).pending then WState.over else s.st x).pending = false
+      -- Was it pending before?
+      by_cases hp : (s.st x).pending = true
+      -- It was: put that into the test of the new state,
+      · rw [hp]
+        -- which picks "over", and "over" is not pending.
+        rfl
+      -- It was not: say so as an equation,
+      · have hf : (s.st x).pending = false := by simpa using hp
+        -- put it into the test of the new state,
+        rw [hf]
+        -- which picks the old state, still not pending.
+        exact hf
+
+/-- The invariant holds in every reachable state. -/
+theorem timed_inv {owner : Nat} {s : Timed}
+    -- `s` is reachable from the start.
+    (h : TSteps owner Timed.init s) :
+    -- Then:
+    TInv owner s := by
+  -- By induction on the steps.
+  induction h with
+  -- No step: the start.
+  | refl => exact tinv_init owner
+  -- Steps, then one more: one step keeps it.
+  | tail _ hstep ih => exact tstep_inv ih hstep
+
+/-- **A timed wait is completed at most once.** TLA+: a wait's slot goes
+from pending to ready once. Rules out: a wait fired by one poll and fired
+again by the next, waking its task twice. -/
+theorem timed_wait_completed_once {owner : Nat} {s : Timed}
+    -- `s` is reachable from the start.
+    (h : TSteps owner Timed.init s)
+    -- Any wait.
+    (w : Nat) :
+    -- Then:
+    s.fires w ≤ 1 :=
+  -- This is one fact of the invariant.
+  (timed_inv h).fires_le w
+
+/-- **A timed wait is completed only by a step of its queue's owner.**
+TLA+: `TimerOnOwnQueue`, with `DeliveredOnOwnPoll`. Rules out: thread B
+making A's wait ready, running A's retry on B's thread. -/
+theorem timed_wait_completed_by_owner {owner : Nat} {s : Timed}
+    -- `s` is reachable from the start.
+    (h : TSteps owner Timed.init s)
+    -- Any wait
+    (w : Nat)
+    -- that is completed.
+    (hover : s.st w = .over) :
+    -- Then:
+    s.who w = owner :=
+  -- This is one fact of the invariant.
+  (timed_inv h).by_owner w hover
+
+/-- **A poll never completes a timed wait before its due time.** TLA+:
+`TimerNotEarly`. Rules out: a retry that asked to wait until 100 running
+again at 60. -/
+theorem timed_wait_not_before_due {owner : Nat} {s : Timed}
+    -- `s` is reachable from the start.
+    (h : TSteps owner Timed.init s)
+    -- Any wait
+    (w : Nat)
+    -- that is completed,
+    (hover : s.st w = .over)
+    -- and not by the drop of its queue.
+    (hpoll : s.byDrop w = false) :
+    -- Then:
+    s.due w ≤ s.seen w :=
+  -- This is one fact of the invariant.
+  (timed_inv h).not_early w hover hpoll
+
+/-- **A dropped queue leaves no timed wait pending.** TLA+:
+`DroppedHoldsNothing`. Rules out: a task waiting for ever on a wait whose
+queue is gone, which no poll will ever look at. -/
+theorem dropped_queue_holds_no_wait {owner : Nat} {s : Timed}
+    -- `s` is reachable from the start.
+    (h : TSteps owner Timed.init s)
+    -- The queue was dropped.
+    (hgone : s.gone = true)
+    -- Any wait.
+    (w : Nat) :
+    -- Then:
+    (s.st w).pending = false :=
+  -- This is one fact of the invariant.
+  (timed_inv h).gone_empty hgone w
+
+/-- How long the owner may idle before wait `w` is due: what a poll reports
+(`Timers::wake_in`, `IoProgress::wake_in`). -/
+def wakeIn (s : Timed) (w : Nat) : Nat :=
+  -- The time left until the due time, zero when it is due already.
+  s.due w - s.now
+
+/-- The clock can move on by any amount. -/
+theorem ticks (owner : Nat) (s : Timed) (n : Nat) :
+    -- Then:
+    TSteps owner s { s with now := s.now + n } := by
+  -- By induction on the amount.
+  induction n with
+  -- By nothing: no step.
+  | zero => exact .refl s
+  -- By one more: one more tick.
+  | succ n ih => exact .tail ih (.tick _)
+
+/-- **An owner that polls again within what its poll reported completes the
+wait.** TLA+: `AllDone` in `MC_NonBlocking_Green_TimerLive`. Whatever the
+clock reads when the owner holds wait `w`, after the time `wakeIn` says has
+passed, the poll finds `w` due and completes it, on the owner's thread. -/
+theorem poll_after_wake_in_completes (owner : Nat) (s : Timed) (w : Nat)
+    -- The owner holds the wait.
+    (hh : s.st w = .held) :
+    -- Then:
+    ∃ t, TSteps owner s t ∧ t.st w = .over ∧ t.who w = owner := by
+  -- The state once the reported time has passed.
+  let later : Timed := { s with now := s.now + wakeIn s w }
+  -- By then the wait is due.
+  have hdue : later.due w ≤ later.now := by
+    -- Unfold the names; the rest is arithmetic.
+    simp only [later, wakeIn]
+    -- The due time is at most now plus what was left of it.
+    omega
+  -- The clock moves on, then the poll fires the wait.
+  refine ⟨_, .tail (ticks owner s (wakeIn s w)) (.fire later w hh hdue), ?_, ?_⟩
+  -- The wait is over.
+  · simp
+  -- And the owner's step did it.
+  · simp
+
+/-! ### RED: a poll that does not look at the clock
+
+The bug: the poll completes every wait it holds, due or not. -/
+
+/-- The broken steps: asking, recording, and a fire with no due check. -/
+inductive EarlyStep (owner : Nat) : Timed → Timed → Prop
+  /-- Some thread asks for wait `w`, due at time `d`. -/
+  | ask (s : Timed) (w d : Nat)
+      -- Nobody asked for `w` before.
+      (hnew : s.st w = .unasked) :
+      -- The state after the step:
+      EarlyStep owner s { s with st := set s.st w .noted, due := set s.due w d }
+  /-- The owner's poll takes the note for `w` in. -/
+  | record (s : Timed) (w : Nat)
+      -- The note is in the inbox.
+      (hn : s.st w = .noted) :
+      -- The state after the step:
+      EarlyStep owner s { s with st := set s.st w .held }
+  /-- The bug: the poll completes `w` whatever the clock reads. -/
+  | fireEarly (s : Timed) (w : Nat)
+      -- The owner holds the wait.
+      (hh : s.st w = .held) :
+      -- The state after the step:
+      EarlyStep owner s { s with st := set s.st w .over,
+                                 fires := set s.fires w (s.fires w + 1),
+                                 who := set s.who w owner,
+                                 seen := set s.seen w s.now }
+
+/-- Any number of broken steps. -/
+inductive EarlySteps (owner : Nat) : Timed → Timed → Prop
+  /-- No step at all. -/
+  | refl (s : Timed) : EarlySteps owner s s
+  /-- Some steps, then one more. -/
+  | tail {a b c : Timed} : EarlySteps owner a b → EarlyStep owner b c → EarlySteps owner a c
+
+/-- **RED: without the due check a wait is completed early.** Wait 1 is
+asked for at time 0, due at 100; the poll takes it in and completes it at
+once, at time 0. TLA+: `MC_NonBlocking_Red_EarlyFire` breaks
+`TimerNotEarly`. -/
+theorem early_fire_breaks_due :
+    -- Some reachable state has a wait a poll completed before its due time.
+    ∃ s, EarlySteps 0 Timed.init s ∧ s.st 1 = .over ∧ s.byDrop 1 = false
+      ∧ ¬ s.due 1 ≤ s.seen 1 := by
+  -- The three steps: ask for wait 1 due at 100, record it, fire it.
+  refine ⟨_, .tail (.tail (.tail (.refl _) (.ask _ 1 100 rfl)) (.record _ 1 (by simp)))
+    (.fireEarly _ 1 (by simp)), ?_, ?_, ?_⟩
+  -- The wait is over.
+  · simp
+  -- No drop completed it.
+  · simp [Timed.init]
+  -- It was due at 100 and the poll read the clock at 0.
+  · simp [Timed.init]
+
+/-! ### RED: an owner that idles past the due time
+
+The bug is the owner's: it holds a wait and never polls again. Waits are
+still asked for and time still passes. -/
+
+/-- The steps left when the owner never polls: asking, and time passing. -/
+inductive IdleStep : Timed → Timed → Prop
+  /-- Some thread asks for wait `w`, due at time `d`. -/
+  | ask (s : Timed) (w d : Nat)
+      -- Nobody asked for `w` before.
+      (hnew : s.st w = .unasked) :
+      -- The state after the step:
+      IdleStep s { s with st := set s.st w .noted, due := set s.due w d }
+  /-- Time passes. -/
+  | tick (s : Timed) :
+      -- The state after the step:
+      IdleStep s { s with now := s.now + 1 }
+
+/-- Any number of steps without a poll. -/
+inductive IdleSteps : Timed → Timed → Prop
+  /-- No step at all. -/
+  | refl (s : Timed) : IdleSteps s s
+  /-- Some steps, then one more. -/
+  | tail {a b c : Timed} : IdleSteps a b → IdleStep b c → IdleSteps a c
+
+/-- **RED: with no poll a wait is never completed, however late it gets.**
+Nobody is woken for a timed wait, so an owner that ignores what its poll
+reported and idles for ever leaves it pending. TLA+:
+`MC_NonBlocking_Red_IdlePastDue` breaks `AllDone`. -/
+theorem idle_owner_never_completes {s t : Timed} {w : Nat}
+    -- The wait is not completed.
+    (hw : s.st w ≠ .over)
+    -- Any number of steps without a poll.
+    (h : IdleSteps s t) :
+    -- Then:
+    t.st w ≠ .over := by
+  -- By induction on the steps.
+  induction h with
+  -- No step: as assumed.
+  | refl => exact hw
+  -- Steps, then one more.
+  | tail _ hstep ih =>
+    -- Look at the last step.
+    cases hstep with
+    -- A wait was asked for: it is noted, and no other wait changed.
+    | ask x d hnew =>
+      -- Is it the wait we follow?
+      by_cases hxw : w = x
+      -- It is: noted is not over.
+      · subst hxw
+        -- Read the new state.
+        simp
+      -- Another wait: ours is unchanged.
+      · simpa [hxw] using ih
+    -- Time passed: no wait changed.
+    | tick => exact ih
 
 -- The end of the Regolith.IoQueue names.
 end Regolith.IoQueue

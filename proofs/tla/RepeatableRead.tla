@@ -195,6 +195,24 @@
 \*              of grants.
 \*     Revoker  deletes the grant there; Granter puts a new one (a phantom).
 \*     INV_ScanDecisionsCurrent  no checker commits over a changed range.
+\*   RosterWorkload, ClaimWorkload [3.1 exempt reads, 3.2]
+\*     Joiners   scan the roster, a commutative prefix, and each adds a key
+\*               of its own and rewrites the seat with the bytes every joiner
+\*               writes: the use the prefix is declared for.
+\*     Claimers  misuse: scan the roster and, when the scan showed the seat
+\*               free, take it and record "the seat is mine". An exclusive
+\*               outcome decided on a scan inside a commutative prefix.
+\*     INV_JoinsCommit   no joiner is refused.
+\*     INV_RosterIsUnion the roster holds exactly the keys of the joiners
+\*                       that committed: concurrent writers leave the union.
+\*     INV_SeatExclusive at most one claimer's record says the seat is its.
+\*   PeekWorkload, NoPartDecisionWorkload [3.1 exempt reads, 3.4]
+\*     Peekers         get_parts(part key, {}), naming no part, and decide on
+\*                     nothing they read, beside the part writers.
+\*     NoPartDeciders  misuse: get_parts(part key, {}), then decide on part 1.
+\*     INV_PeeksCommit  no peeker is refused, whatever is written under it.
+\*     INV_PartsCurrent also covers a no-part decider: its decision went
+\*                      stale when the key's existence or part 1 changed.
 \*   Every GREEN, the first workloads' included:
 \*     INV_ReasonsExact  every abort's reason names a key, what the
 \*                       transaction did with it, and a write newer than
@@ -255,9 +273,28 @@
 \*                              one that decided.  INV_ReasonsExact RED.
 \*   PlainScanDecides           a checker decides on a plain scan.
 \*                              INV_ScanDecisionsCurrent RED.
-\* Two REDs are misuse, not mutants: Red_DecideOnLogRead (a decision on a
-\* Log read, INV_LogDecisionsCurrent) and Red_Parts_RepeatableRead (get_parts
-\* at RepeatableRead is a get, INV_PartsRelaxed).
+\* Four REDs are misuse, not mutants: the engine runs its real rule in them
+\* and the caller decides on a read the contract exempts [3.1].
+\*   Red_DecideOnLogRead          a decision on a Log read.
+\*                                INV_LogDecisionsCurrent RED.
+\*   Red_DecideOnCommutativeScan  an exclusive outcome decided on a scan
+\*                                inside a commutative prefix: two claimers
+\*                                both take the one seat. INV_SeatExclusive
+\*                                RED. Green_CommutativeScan is the same
+\*                                prefix used as declared, and
+\*                                Green_ClaimUndeclared the same claimers
+\*                                with the prefix not declared, where the
+\*                                seat each writes inside its recorded
+\*                                stretch is validated as read and the
+\*                                second claimer is refused: that check is
+\*                                what the declaration gives up.
+\*   Red_DecideOnNoParts          a decision on part 1 after
+\*                                get_parts(key, {}). INV_PartsCurrent RED.
+\*                                Green_NoParts is the same read deciding on
+\*                                nothing, and Green_Parts the same decision
+\*                                with part 1 named.
+\* A fifth RED, Red_Parts_RepeatableRead, runs the real rule at another
+\* level: get_parts at RepeatableRead is a get (INV_PartsRelaxed).
 \*
 \* LEAN, for every size (proofs/lean/Regolith):
 \*   Validation.lean     ordinary_serial, value_serial, contentAddressed_serial,
@@ -275,7 +312,9 @@
 \*                       appends_keep_dense (INV_LogDense),
 \*                       writeFree_at_snapshot (INV_WriteFreeConsistent); the
 \*                       REDs exempt_decision_breaks_serial
-\*                       (Red_DecideOnLogRead, Red_PartsNamesOther) and
+\*                       (Red_DecideOnLogRead, Red_PartsNamesOther,
+\*                       Red_DecideOnCommutativeScan, Red_DecideOnNoParts:
+\*                       each decides on a read its class exempts) and
 \*                       promoted_read_skew (Red_WriteFreePessimistic).
 \*   MergeOperator.lean  fold_eq_grouping, fold_eq_any_grouping and
 \*                       steps_preserve_fold (an exact partial_merge folds to
@@ -344,6 +383,22 @@ OwnWritesWorkload ==
 ScanWorkload ==
   \* Transaction 90 checks the grants, 91 revokes one, 92 grants a new one.
   [NoExtras EXCEPT !["Checkers"] = {90}, !["Revokers"] = {91}, !["Granters"] = {92}]
+\* A scan inside a commutative prefix, used as declared: three joiners.
+RosterWorkload ==
+  \* Transactions 100, 101 and 102 each scan the roster and add a key of their own.
+  [NoExtras EXCEPT !["Joiners"] = {100, 101, 102}]
+\* The same scan misused: two claimers of the one seat.
+ClaimWorkload ==
+  \* Transactions 110 and 111 each scan the roster and take the seat when it looked free.
+  [NoExtras EXCEPT !["Claimers"] = {110, 111}]
+\* A read by no parts, used as declared: a peeker beside two part writers.
+PeekWorkload ==
+  \* Transaction 34 reads the part key by no parts; 32 and 33 write the part key.
+  [NoExtras EXCEPT !["Peekers"] = {34}, !["PartWriters"] = {32, 33}]
+\* The same read misused: a decider on part 1 beside one part writer.
+NoPartDecisionWorkload ==
+  \* Transaction 35 reads the part key by no parts and decides on part 1; 32 writes the part key.
+  [NoExtras EXCEPT !["NoPartDeciders"] = {35}, !["PartWriters"] = {32}]
 
 \* The head set a scan of S derives: a stored head key no stored marker
 \* names as a parent.
@@ -796,6 +851,53 @@ BeginGranter(g) ==
   \* Nothing built from a value, no operations chosen.
   /\ UNCHANGED <<seen, ops>>
 
+\* A scan of the roster, then a key of its own and the seat, both inside the
+\* stretch the scan walked. Every joiner writes the seat with the same
+\* bytes and decides nothing on what it scanned: unique keys and identical
+\* rewrites, the two writes a commutative prefix is declared for [3.2].
+BeginJoiner(j) ==
+  \* roster: what a scan of the whole roster yields. The first and the last key are always there.
+  LET roster == Yield(Stored, RosterRange, RosterRange)
+  \* It records the scan's stretch and will put its own key and the seat, each holding 1.
+  IN /\ Do(j, ScanReads(roster), Stretch(roster), {MemberKey(j), SeatKey}, {},
+           (MemberKey(j) :> 1) @@ (SeatKey :> 1))
+     \* Nothing built from a value, no operations chosen.
+     /\ UNCHANGED <<seen, ops>>
+
+\* The misuse: the same scan, and the seat taken only when the scan showed it
+\* free, with "the seat is mine" written to its output key outside the
+\* prefix. The seat is written with the bytes any claimer writes. A claimer
+\* that finds the seat taken writes nothing.
+BeginClaimer(c) ==
+  \* roster: what a scan of the whole roster yields.
+  LET roster == Yield(Stored, RosterRange, RosterRange)
+      \* free: the scan did not yield the seat.
+      free   == SeatKey \notin roster
+  \* It records the scan's stretch. When the seat looked free it will put the seat and its own
+  \* record, each holding 1; otherwise it writes nothing.
+  IN /\ Do(c, ScanReads(roster), Stretch(roster),
+           IF free THEN {SeatKey, OutKey(c)} ELSE {}, {},
+           IF free THEN (SeatKey :> 1) @@ (OutKey(c) :> 1) ELSE NoIntent)
+     \* Nothing built from a value, no operations chosen.
+     /\ UNCHANGED <<seen, ops>>
+
+\* get_parts(part key, {}) is recorded by role (PartRead): it names no part,
+\* so the commit validates nothing of it. The peeker writes a fixed mark to
+\* its output key: nothing it read went into what it wrote.
+BeginPeeker(p) ==
+  \* It will write 1 to its output key, whatever the part key held.
+  /\ Do(p, {}, {}, {OutKey(p)}, {}, OutKey(p) :> 1)
+  \* Nothing built from a value, no operations chosen.
+  /\ UNCHANGED <<seen, ops>>
+
+\* The misuse: the same read by no parts, and part 1 as read written to its
+\* output key. Its decision uses what the read exempted.
+BeginNoPartDecider(d) ==
+  \* It will write part 1 of the part key, as it read it, to its output key.
+  /\ Do(d, {}, {}, {OutKey(d)}, {}, OutKey(d) :> Part(store[PartKey], 1))
+  \* Nothing built from a value, no operations chosen.
+  /\ UNCHANGED <<seen, ops>>
+
 \* Transaction t begins: it takes its snapshot and records what its role
 \* reads and writes.
 Begin(t) ==
@@ -863,6 +965,14 @@ Begin(t) ==
        [] t \in Revokers       -> BeginRevoker(t)
        \* a granter:
        [] t \in Granters       -> BeginGranter(t)
+       \* a joiner:
+       [] t \in Joiners        -> BeginJoiner(t)
+       \* a claimer:
+       [] t \in Claimers       -> BeginClaimer(t)
+       \* a peeker:
+       [] t \in Peekers        -> BeginPeeker(t)
+       \* a no-part decider:
+       [] t \in NoPartDeciders -> BeginNoPartDecider(t)
   \* A begin commits nothing: the store, the history and the bookkeeping stay as they were.
   /\ UNCHANGED <<clock, store, hist, forUpdate, flags, parents, stale, dupRefused,
                  wrongReceipt, needlessRefusal, cbase, cepoch, cinc>>
@@ -1007,6 +1117,11 @@ CommitFlags(t) ==
   \* A part reader whose decision inputs (does the key exist, what is part 1) changed since its
   \* snapshot.
   \cup (IF t \in PartReaders
+           /\ PartDecision(store[PartKey]) # PartDecision(ValueAt(PartKey, snap[t]))
+        THEN {"PartsStale"} ELSE {})
+  \* A no-part decider whose decision inputs (does the key exist, what is part 1) changed since its
+  \* snapshot: it decided on a read it had named no part of.
+  \cup (IF t \in NoPartDeciders
            /\ PartDecision(store[PartKey]) # PartDecision(ValueAt(PartKey, snap[t]))
         THEN {"PartsStale"} ELSE {})
   \* A part rewriter whose key changed since its snapshot.
@@ -1345,6 +1460,32 @@ INV_ReadYourOwnWrites == "OwnMismatch" \notin flags
 \* Rules out, for example: a checker counts one grant, the grant is revoked (or a second one
 \* appears), and the checker's decision still commits.
 INV_ScanDecisionsCurrent == "ScanStale" \notin flags
+
+\* A scan inside a commutative prefix records nothing, so a joiner's own key
+\* and its rewrite of the seat are blind writes: no joiner is refused.
+\* Rules out, for example: two joiners add themselves at once and one is refused over the seat,
+\* which both wrote with the same bytes.
+INV_JoinsCommit == \A j \in Joiners : phase[j] # "aborted"
+
+\* Concurrent writers inside the prefix leave the union [3.1]: the roster
+\* holds the key of every joiner that committed, and of no other.
+INV_RosterIsUnion ==
+  \* For every joiner: its key is stored exactly when it committed. Rules out a committed joiner
+  \* whose key another joiner's commit wiped, and a key left by a joiner that was refused.
+  \A j \in Joiners : (store[MemberKey(j)] # Absent) <=> phase[j] = "committed"
+
+\* At most one claimer's record says the seat is its. A scan inside a
+\* commutative prefix is exempt, so a caller must not decide an exclusive
+\* outcome on it [3.1, 3.2]: with the prefix declared this fails by design.
+\* Shows, for example: two claimers scan the roster, both see the seat free, both put the seat with
+\* the same bytes and both commit, each believing the one seat is its own.
+INV_SeatExclusive == Cardinality({c \in Claimers : store[OutKey(c)] # Absent}) <= 1
+
+\* A read by no parts is never validated, so no peeker is refused, whatever
+\* is written to the key it read.
+\* Rules out, for example: a peeker looks at the part key, somebody deletes the key, and the peeker
+\* is refused although it decided on nothing it saw.
+INV_PeeksCommit == \A p \in Peekers : phase[p] # "aborted"
 
 \* [3.14] Every abort's reason names a key the transaction did what `mine`
 \* says with, and a committed write of that key newer than the anchor, with

@@ -41,6 +41,7 @@
 //! The full-scale tests are larger versions of the same
 //! properties; see each one's doc comment for its measured runtime.
 //! `just mvcc` runs the fast set, `just mvcc-slow` the full-scale set.
+#![cfg(not(target_arch = "wasm32"))]
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Barrier};

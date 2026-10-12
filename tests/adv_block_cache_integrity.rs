@@ -6,6 +6,7 @@
 //! file that is being evicted. If the cache ever returned a block under
 //! the wrong key, or dropped one it still owed, the values read here
 //! would not match what was written.
+#![cfg(not(target_arch = "wasm32"))]
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Barrier};

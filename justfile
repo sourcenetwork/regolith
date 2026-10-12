@@ -550,6 +550,14 @@ tla:
     check MC_DefraLevel_Green_ValidatedScan            GREEN
     check MC_DefraLevel_Red_PlainScanDecides           RED INV_ScanDecisionsCurrent
     check MC_DefraLevel_Red_ReasonNewestWrite          RED INV_ReasonsExact
+    # The exempt reads a caller must not decide on: a scan inside a
+    # commutative prefix and a read by no parts. Each GREEN uses the
+    # exemption as declared; each RED decides on it and loses.
+    check MC_DefraLevel_Green_CommutativeScan          GREEN
+    check MC_DefraLevel_Red_DecideOnCommutativeScan    RED INV_SeatExclusive
+    check MC_DefraLevel_Green_ClaimUndeclared          GREEN
+    check MC_DefraLevel_Green_NoParts                  GREEN
+    check MC_DefraLevel_Red_DecideOnNoParts            RED INV_PartsCurrent
     # E1. Lean: Regolith/LsmOrder.lean, compact_range_reads_newest.
     spec=LsmOrder
     # E31, a flush's table and its memtable's retirement are one publication.
@@ -910,6 +918,18 @@ tla:
     check MC_NonBlocking_Red_PublishAtWrite            RED VisibleAfterSync
     check MC_NonBlocking_Red_DeliverOnLander           RED DeliveredOnOwnPoll
     check MC_NonBlocking_Red_NoRecheck                 RED StallLandsWhenClear
+    # D53, timed waits (the wait a retry backs off on): completed only by
+    # the poll of the queue that was asked, not before the due time, by an
+    # owner that polls again within what its poll reported, and by the drop
+    # of the queue. Lean: Regolith/IoQueue.lean, timed_wait_completed_once,
+    # timed_wait_completed_by_owner, timed_wait_not_before_due,
+    # dropped_queue_holds_no_wait, poll_after_wake_in_completes.
+    check MC_NonBlocking_Green_Timer                   GREEN
+    check MC_NonBlocking_Green_TimerLive               GREEN
+    check MC_NonBlocking_Red_IdlePastDue               RED AllDone
+    check MC_NonBlocking_Red_EarlyFire                 RED TimerNotEarly
+    check MC_NonBlocking_Red_DropForgets               RED DroppedHoldsNothing
+    check MC_NonBlocking_Red_TimerWrongQueue           RED TimerOnOwnQueue
     # Phase 7 integration: with no worker and inline compaction on, no
     # stopped writer waits on a relief nobody runs. Every piece of progress
     # lands the stall's unit (relief handed back), a contended writer reads
@@ -1307,6 +1327,9 @@ elle-matrix:
     # get_for_update, the one read that level leaves unvalidated and
     # SnapshotIsolation validates.
     check pessimistic-rc      list-append read-committed     --isolation read-committed --threads 8 --txns 50 --keys 4 --seed 2
+    # The same level over registers: a lock that times out aborts its
+    # transaction, and a value an aborted transaction wrote must never be read.
+    check pessimistic-rc-rw   rw-register read-committed     --isolation read-committed --threads 8 --txns 50 --keys 4 --seed 3
     check pessimistic-hotkey  list-append read-committed     --isolation read-committed --threads 8 --txns 50 --keys 1 --seed 1
     # Serializable validates the whole read set, so the strongest model
     # Elle offers must hold.
@@ -1327,6 +1350,35 @@ elle-matrix:
     # key both commit, which first-committer-wins forbids.
     check defra-level         list-append strict-serializable --isolation defra-level --threads 8 --txns 60 --keys 4 --seed 16
     check defra-level-rw      rw-register strict-serializable --isolation defra-level --threads 8 --txns 60 --keys 4 --seed 17
+    # DefraLevel with a key classifier (`--shape`, README.md). In the
+    # `classified` shape every transaction also stores a content-addressed
+    # block it read as missing, adds a key to a commutative prefix it scanned
+    # and appends to a log. The classes say none of that conflicts, and none
+    # of it may loosen the point operations beside it: the strongest model
+    # must hold, and elle-gen itself fails the row when a commit left a head
+    # without its log entry.
+    check defra-classified    list-append strict-serializable --isolation defra-level --shape classified --threads 8 --txns 60 --keys 4 --seed 18
+    check defra-classified-rw rw-register strict-serializable --isolation defra-level --shape classified --threads 8 --txns 60 --keys 4 --seed 19
+    # Commit-ordered appends: a key is a log, an append is
+    # `Transaction::append` and a read is the log in one snapshot. An append
+    # is never validated at any level and positions follow commit order, so
+    # every level must hold the strongest model, the pessimistic flavour too.
+    check defra-appends       list-append strict-serializable --isolation defra-level --shape appends --threads 8 --txns 60 --keys 4 --seed 20
+    check si-appends          list-append strict-serializable --isolation snapshot-isolation --shape appends --threads 8 --txns 60 --keys 4 --seed 21
+    check pessimistic-appends list-append strict-serializable --isolation read-committed --shape appends --threads 8 --txns 60 --keys 4 --seed 22
+    # Projected reads: a key is one part of a document, an append is an
+    # operand on the part and a read is `get_parts` naming it. Two keys share
+    # a document, so a reader of one part commits beside an append to the
+    # other, and is refused by an append to its own.
+    check defra-parts         list-append strict-serializable --isolation defra-level --shape parts --threads 8 --txns 60 --keys 4 --seed 23
+    # A prefix scan: every read is one validated scan of all the keys,
+    # recorded as a read of each. Scan-then-write is the shape of write skew,
+    # which a validated scan refuses at every level. The rw-register row has
+    # keys enough that most writes create one: a key that appears under a
+    # scan, which only a validated range sees.
+    check defra-scan          list-append strict-serializable --isolation defra-level --shape scan --threads 8 --txns 60 --keys 4 --seed 24
+    check defra-scan-phantoms rw-register strict-serializable --isolation defra-level --shape scan --threads 8 --txns 60 --keys 64 --seed 25
+    check repeatable-read-scan list-append strict-serializable --isolation repeatable-read --shape scan --threads 8 --txns 60 --keys 4 --seed 26
     exit $fail
 
 # ---------- portability ----------
@@ -1368,7 +1420,7 @@ wasm-native records="5000" sustained="20000":
 
 # The OPFS contract against a real browser. `wasm-pack test` cannot
 # drive these: it appends `--tests`, which builds every target in
-# `tests/`, and all but the three `wasm_opfs*` files are native-only.
+# `tests/`, and all but the four `wasm_opfs*` files are native-only.
 # The runner is named per target instead, so only the named test
 # binaries are built.
 #
@@ -1397,7 +1449,7 @@ wasm-browser:
     # the whole driver, so nine passing tests report as one failure with
     # no attribution.
     export WASM_BINDGEN_TEST_TIMEOUT=180
-    for suite in wasm_opfs wasm_opfs_main wasm_opfs_memory; do
+    for suite in wasm_opfs wasm_opfs_main wasm_opfs_memory wasm_opfs_transactions; do
         echo "== $suite =="
         cargo test --target wasm32-unknown-unknown --test "$suite"
     done
