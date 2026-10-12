@@ -37,7 +37,8 @@ jobs:
   # only exists in a debug build.
   loom:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # Measured at 18 to 19 minutes for every recipe of `just loom-all`.
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -52,9 +53,19 @@ jobs:
   # view per batch read, ingest publication and WAL rotation. The green
   # and the red configurations both run: a red one going green would mean
   # the model stopped telling the fix from the defect.
+  #
+  # Every row runs, dealt out over six jobs side by side (`just tla N 6`
+  # takes each sixth row, starting at the Nth): checked one after another
+  # with one TLC worker the suite takes 41 minutes on a workstation. A GREEN
+  # row gets every core of its runner. Measured on four cores, the six
+  # shards take 2.5 to 9 minutes each, so each has 30.
   tla:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4, 5, 6]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-java@v4
@@ -62,8 +73,8 @@ jobs:
           distribution: temurin
           java-version: '21'
       - uses: extractions/setup-just@v2
-      - name: TLA+ models, every green and red configuration
-        run: just tla
+      - name: TLA+ models, every green and red configuration of this shard
+        run: just tla ${{ matrix.shard }} 6
 
   # The Lean proofs beside the TLA+ models: each module proves for every
   # size what a model checks for a few. Plain Lean 4 core, no dependencies.
@@ -110,15 +121,21 @@ jobs:
   # chunk layout and bump arithmetic, the skip list's node layout and
   # publication, the memtable's arena-backed slices, the block decoder,
   # and `regolith::sync`'s waiter nodes, lists and pools. Interpreted
-  # execution is orders of magnitude slower than native, so this runs
-  # on the nightly schedule rather than per pull request. Two things are scaled down under `cfg(miri)` in the tests
+  # execution is orders of magnitude slower than native, so the tests
+  # that would not finish are scaled down under `cfg(miri)` in the tests
   # themselves, with every assertion left intact: the two spinning-reader
   # stress tests are `#[ignore]`d in favour of an interpreter-sized
-  # equivalent, and the arena's multi-megabyte fills use a smaller
-  # budget.
+  # equivalent, the arena's multi-megabyte fills use a smaller budget,
+  # the `regolith::sync` loops run tens of rounds, not thousands, and the
+  # range-tombstone tests append 40 and 100 tombstones under their
+  # readers, not thousands, and probe every seventh key after an append.
+  #
+  # Measured at 20 minutes on a workstation for the 178 tests. The limit
+  # is six times that: a runner interprets on slower cores. A run that
+  # passes it means a test was added at native size; size it as above.
   miri:
     runs-on: ubuntu-latest
-    timeout-minutes: 240
+    timeout-minutes: 120
     env:
       # Kovan's flag set, run the way kovan's own CI runs it, because
       # `kovan-queue` backs the arena's chunk pool. Each flag is there

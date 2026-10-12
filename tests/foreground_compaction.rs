@@ -330,7 +330,8 @@ fn compact_step_works_with_a_background_worker_running() {
     .unwrap();
 
     for i in 0..2_000usize {
-        db.put(format!("key{i:06}").as_bytes(), &value(i)).unwrap();
+        // Through stalls: the workers may fall behind these writes.
+        regolith::through_stalls(|| db.put(format!("key{i:06}").as_bytes(), &value(i))).unwrap();
         if i % 250 == 0 {
             // Returns false when the workers got there first; either
             // answer is correct, and neither may corrupt the version.

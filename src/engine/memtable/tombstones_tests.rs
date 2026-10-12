@@ -56,7 +56,9 @@ fn a_rebuild_keeps_every_answer_the_tail_gave() {
         let end = format!("k{:03}", (i * 7) % 50 + 1 + i % 9).into_bytes();
         log.push(tomb(&start, &end, i + 1));
         all.push((start, end, i + 1));
-        for probe in 0..60u64 {
+        // Under miri every seventh key: all sixty after each append take ten
+        // minutes in the interpreter, and the rebuilds they cross are the same.
+        for probe in (0..60u64).step_by(if cfg!(miri) { 7 } else { 1 }) {
             let key = format!("k{probe:03}").into_bytes();
             for snapshot in [0, i / 2 + 1, u64::MAX] {
                 assert_eq!(
@@ -104,7 +106,9 @@ fn the_listing_is_sorted_and_deduplicated_as_before() {
 /// read never sees fewer.
 #[test]
 fn readers_see_a_growing_prefix_of_whole_appends_while_a_writer_appends() {
-    const APPENDS: u64 = 4_000;
+    // Sized for the interpreter under miri: 100 appends still cross three
+    // segment boundaries and six rebuilds of the index under four readers.
+    const APPENDS: u64 = if cfg!(miri) { 100 } else { 4_000 };
     let log = Arc::new(TombstoneLog::new());
     let done = Arc::new(AtomicBool::new(false));
     let checked = Arc::new(AtomicU64::new(0));
