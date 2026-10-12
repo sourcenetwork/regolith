@@ -31,7 +31,10 @@
 //! - **Reentrancy depth**: an owner nests and unwinds while another owner
 //!   waits.
 //! - **The upgradable read**: it shares with readers, upgrades while they
-//!   come and go, and excludes writers.
+//!   come and go, and excludes writers. A dropped upgrade never lets a
+//!   writer in beside the next holder of the upgradable read; a calibration
+//!   rebuilds the pass that took the write for a dropped upgrade's node and
+//!   must fail.
 //!
 //! - **A drain that ends**: a waiter that serves the queue itself while the
 //!   holder lets go and barges back runs a bounded number of passes and is
@@ -41,7 +44,7 @@
 //!
 //! The waiter-node free list is a pass-through to the allocator under loom
 //! (see `Pool`), so node recycling itself is covered by miri and the unit
-//! tests rather than here. Two calibration models deliberately expect
+//! tests rather than here. The calibration models deliberately expect
 //! something the protocol does not guarantee and must fail; without them
 //! a search that never reached the bad interleaving would pass for the
 //! same reason a broken one does.
@@ -904,6 +907,145 @@ fn a_waiter_serving_the_queue_is_served_while_the_holder_barges() {
 #[should_panic(expected = "the drain ran")]
 fn calibration_a_marker_lowered_on_a_pending_nudge_keeps_the_drain_passing() {
     regolith::loom_exports::sync::calibration_a_marker_lowered_on_a_pending_nudge_keeps_the_drain_passing();
+}
+
+/// E33. An upgrade waits for a reader and is dropped. While its drop is
+/// under way the reader leaves, which runs a drain pass, and a second task
+/// takes the upgradable read; then the first task tries to write. The
+/// upgradable read is its holder's own until that holder lets it go:
+/// neither the dropped upgrade nor the pass may spend the bits the second
+/// task raised, so no writer is ever inside while the second task holds it.
+#[test]
+fn a_dropped_upgrade_never_lets_a_writer_in_beside_the_next_upgradable_read() {
+    explore(
+        "a_dropped_upgrade_never_lets_a_writer_in_beside_the_next_upgradable_read",
+        3,
+        100,
+        || {
+            let lock = Arc::new(RwLock::new(()));
+            let upgradable = lock.try_upgradable_read().expect("free");
+            let inside = Arc::new(AtomicBool::new(false));
+            let held = Arc::new(AtomicBool::new(false));
+            let second = {
+                let (lock, inside, held) =
+                    (Arc::clone(&lock), Arc::clone(&inside), Arc::clone(&held));
+                thread::spawn(move || {
+                    let shared = lock.try_read().expect("readers share with it");
+                    inside.store(true, Ordering::Release);
+                    // Lets the upgrade begin, and its drop, while the reader
+                    // is inside, without spending a preemption.
+                    thread::yield_now();
+                    // The reader leaves: the upgrade may be waiting for it.
+                    drop(shared);
+                    if let Some(next) = lock.try_upgradable_read() {
+                        held.store(true, Ordering::Release);
+                        // The same, while this task holds it.
+                        thread::yield_now();
+                        held.store(false, Ordering::Release);
+                        drop(next);
+                    }
+                })
+            };
+            wait_for(&inside);
+            poll_once_then_drop(upgradable.upgrade());
+            if let Some(alone) = lock.try_write() {
+                assert!(
+                    !held.load(Ordering::Acquire),
+                    "a writer got in while the upgradable read was held"
+                );
+                drop(alone);
+            }
+            second.join().expect("second");
+            assert!(lock.try_write().is_some(), "nothing was left held");
+        },
+    );
+}
+
+/// The step E33 removed, rebuilt out of plain loom atomics: a drain pass
+/// that reads the upgrading bit to decide whether the upgrade in its slot
+/// was dropped, and takes the write for it when no reader is inside. The
+/// bit it reads may be the next holder's, and the write it takes and puts
+/// back spends the upgradable read whoever holds it, so a writer gets in
+/// beside that holder.
+#[test]
+#[should_panic(expected = "a writer got in while the upgradable read was held")]
+fn calibration_a_pass_that_takes_the_write_for_a_dropped_upgrade_lets_a_writer_in() {
+    const WRITER: usize = 1;
+    const UPGRADABLE: usize = 1 << 1;
+    const UPGRADING: usize = 1 << 2;
+    const ONE_READER: usize = 1 << 3;
+    explore(
+        "calibration_a_pass_that_takes_the_write_for_a_dropped_upgrade_lets_a_writer_in",
+        3,
+        1,
+        || {
+            // The first task holds the upgradable read, its upgrade waits
+            // for one reader, and its node is in the pass's slot.
+            let state = Arc::new(AtomicUsize::new(UPGRADABLE | UPGRADING | ONE_READER));
+            let withdrawn = Arc::new(AtomicBool::new(false));
+            let held = Arc::new(AtomicBool::new(false));
+            let second = {
+                let (state, withdrawn, held) = (
+                    Arc::clone(&state),
+                    Arc::clone(&withdrawn),
+                    Arc::clone(&held),
+                );
+                thread::spawn(move || {
+                    // The reader leaves and runs the pass, the old way.
+                    state.fetch_sub(ONE_READER, Ordering::AcqRel);
+                    let seen = state.load(Ordering::Acquire);
+                    if seen & UPGRADING != 0
+                        && seen >> 3 == 0
+                        && state
+                            .compare_exchange(
+                                seen,
+                                (seen & !(UPGRADABLE | UPGRADING)) | WRITER,
+                                Ordering::AcqRel,
+                                Ordering::Acquire,
+                            )
+                            .is_ok()
+                        && withdrawn.load(Ordering::Acquire)
+                    {
+                        // The node withdrew: the write taken for it goes back.
+                        state.fetch_and(!WRITER, Ordering::AcqRel);
+                    }
+                    // Then it takes the upgradable read if it is free.
+                    let free = state.load(Ordering::Acquire);
+                    if free & (WRITER | UPGRADABLE) == 0
+                        && state
+                            .compare_exchange(
+                                free,
+                                free | UPGRADABLE,
+                                Ordering::AcqRel,
+                                Ordering::Acquire,
+                            )
+                            .is_ok()
+                    {
+                        held.store(true, Ordering::Release);
+                        thread::yield_now();
+                        held.store(false, Ordering::Release);
+                        state.fetch_and(!UPGRADABLE, Ordering::AcqRel);
+                    }
+                })
+            };
+            // The first task drops its upgrade: its node withdraws, then it
+            // lets the upgradable read go.
+            withdrawn.store(true, Ordering::Release);
+            state.fetch_and(!(UPGRADABLE | UPGRADING), Ordering::AcqRel);
+            // Then it tries to write.
+            if state
+                .compare_exchange(0, WRITER, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                assert!(
+                    !held.load(Ordering::Acquire),
+                    "a writer got in while the upgradable read was held"
+                );
+                state.fetch_and(!WRITER, Ordering::AcqRel);
+            }
+            second.join().expect("second");
+        },
+    );
 }
 
 #[test]

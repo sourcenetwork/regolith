@@ -17,7 +17,11 @@
 //!   readers and excludes writers and other upgradable reads. Its upgrade
 //!   sets the upgrading bit, which holds new readers back, and becomes the
 //!   write once the readers inside have left. Since only one upgrader can
-//!   exist, an upgrade never deadlocks on another.
+//!   exist, an upgrade never deadlocks on another. The upgradable bit and
+//!   the upgrading bit are their holder's own from the moment it raises
+//!   them until it takes the write or lets them go: a drain pass never
+//!   changes them, it only tells the waiting upgrade that the readers have
+//!   left.
 
 #![allow(unsafe_code)]
 
@@ -175,35 +179,37 @@ impl RawRwLock {
         }
     }
 
-    /// Hands the write to the waiting upgrade once the readers have left.
-    /// False when it is still waiting.
+    /// Makes the held upgradable read the write, once a pass has told the
+    /// upgrade that the readers have left. The caller still holds the
+    /// upgradable read with its upgrade begun, which kept every reader and
+    /// writer out since then: those two bits are up and the writer bit is
+    /// down, so one flip of the three is the write.
+    fn finish_upgrade(&self) {
+        let before = self
+            .queue
+            .state
+            .fetch_xor(UPGRADABLE | UPGRADING | WRITER, Ordering::AcqRel);
+        debug_assert!(
+            before & (UPGRADABLE | UPGRADING | WRITER) == UPGRADABLE | UPGRADING
+                && readers(before) == 0,
+            "an upgrade was granted on a lock its holder does not hold alone"
+        );
+    }
+
+    /// Tells the waiting upgrade that the readers have left, by granting
+    /// its node. False while it still waits.
+    ///
+    /// The pass changes nothing in the state word for it. The upgradable
+    /// read and the upgrading bit stay the upgrader's own until its poll
+    /// takes the write ([`RawRwLock::finish_upgrade`]) or its drop lets them
+    /// go, so no pass can spend bits that a later holder has raised.
     fn grant_upgrade(&self, node: NonNull<Waiter>, woken: &mut WakeList<'_>) -> bool {
-        let mut state = self.queue.state.load(Ordering::Acquire);
-        loop {
-            // The upgrading bit is gone when the upgrade was dropped: the
-            // drop releases the upgradable read itself.
-            if state & UPGRADING == 0 {
-                release_queued(node, &self.queue);
-                return true;
-            }
-            if readers(state) != 0 {
-                return false;
-            }
-            match self.queue.state.compare_exchange_weak(
-                state,
-                (state & !(UPGRADABLE | UPGRADING)) | WRITER,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => break,
-                Err(actual) => state = actual,
-            }
+        let state = self.queue.state.load(Ordering::Acquire);
+        if state & UPGRADING == 0 || readers(state) != 0 {
+            return false;
         }
-        if !woken.grant(node) {
-            // Dropped after the write was taken for it: the drop found
-            // nothing left to release, so release it here.
-            self.queue.state.fetch_and(!WRITER, Ordering::AcqRel);
-        }
+        // A node withdrawn meanwhile takes no grant, and leaves the slot too.
+        woken.grant(node);
         true
     }
 }
@@ -228,6 +234,15 @@ impl Policy for RawRwLock {
         // SAFETY: only the drain role's holder runs a pass.
         self.waiting.with_mut(|waiting| unsafe {
             let waiting = &mut *waiting;
+            // A dropped upgrade's node goes first: the upgradable read is
+            // free once its holder dropped the upgrade, so the next upgrade's
+            // node may be among these arrivals, and the slot is its place.
+            if let Some(node) = waiting.upgrade
+                && node.as_ref().is_cancelled()
+            {
+                release_queued(node, queue);
+                waiting.upgrade = None;
+            }
             for node in arrivals {
                 if node.as_ref().is_cancelled() {
                     release_queued(node, queue);
@@ -369,36 +384,189 @@ impl UpgradeWait {
     /// Ready once the caller, which holds the upgradable read, holds the
     /// write instead.
     pub(super) fn poll(&mut self, lock: &RawRwLock, waker: &Waker) -> Poll<()> {
-        if self.wait.is_queued() {
-            return match self.wait.park(&lock.queue, Some(waker)) {
-                Park::Granted(_) => Poll::Ready(()),
-                Park::Nudged | Park::Pending => Poll::Pending,
-            };
-        }
-        if !self.started {
-            self.started = true;
-            lock.queue.state.fetch_or(UPGRADING, Ordering::AcqRel);
-        }
-        if lock.try_upgrade() {
-            return Poll::Ready(());
-        }
-        lock.enqueue(&mut self.wait, UPGRADE, waker);
-        match self.wait.park(&lock.queue, None) {
-            Park::Granted(_) => Poll::Ready(()),
+        let park = if self.wait.is_queued() {
+            self.wait.park(&lock.queue, Some(waker))
+        } else {
+            if !self.started {
+                self.started = true;
+                lock.queue.state.fetch_or(UPGRADING, Ordering::AcqRel);
+            }
+            if lock.try_upgrade() {
+                return Poll::Ready(());
+            }
+            lock.enqueue(&mut self.wait, UPGRADE, waker);
+            self.wait.park(&lock.queue, None)
+        };
+        match park {
+            // A pass saw the last reader gone: the write is this caller's
+            // to take, and nobody else's meanwhile.
+            Park::Granted(_) => {
+                lock.finish_upgrade();
+                Poll::Ready(())
+            }
             Park::Nudged | Park::Pending => Poll::Pending,
         }
     }
 
     /// Gives up an upgrade that has not completed, with the upgradable
-    /// read the caller held; a write granted meanwhile is released.
+    /// read the caller held. Whatever a pass told its node, the upgradable
+    /// read is the caller's until this lets it go, exactly once.
     pub(super) fn cancel(&mut self, lock: &RawRwLock) {
-        match self.wait.cancel(&lock.queue) {
-            Cancel::Granted(_) => lock.write_unlock(),
-            Cancel::Withdrawn(_) => {
-                lock.upgradable_unlock();
-                lock.withdrawn(false);
-            }
-            Cancel::Idle => lock.upgradable_unlock(),
+        let outcome = self.wait.cancel(&lock.queue);
+        lock.upgradable_unlock();
+        if let Cancel::Withdrawn(_) = outcome {
+            lock.withdrawn(false);
         }
+    }
+}
+
+#[cfg(all(test, not(loom)))]
+mod tests {
+    use core::cell::{Cell, RefCell};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering as StdOrdering};
+    use std::task::Wake;
+
+    use super::*;
+
+    /// A lock raced by other threads as each pass of a drain begins (each
+    /// is told the pass's number, from 1).
+    struct Raced<'a> {
+        lock: &'a RawRwLock,
+        passes: Cell<u32>,
+        pass_begins: Box<dyn Fn(u32) + 'a>,
+    }
+
+    impl Policy for Raced<'_> {
+        fn queue(&self) -> &WaitQueue {
+            self.lock.queue()
+        }
+
+        fn pass(&self, arrivals: Arrivals, woken: &mut WakeList<'_>, wake_front: bool) -> usize {
+            let pass = self.passes.get() + 1;
+            self.passes.set(pass);
+            (self.pass_begins)(pass);
+            self.lock.pass(arrivals, woken, wake_front)
+        }
+    }
+
+    impl Lock for Raced<'_> {
+        fn admit(&self, state: usize, kind: usize) -> Option<usize> {
+            self.lock.admit(state, kind)
+        }
+
+        fn give_back(&self, kind: usize) {
+            self.lock.give_back(kind);
+        }
+    }
+
+    /// An upgrade waits for a reader, with its node already sorted by a
+    /// pass. While another thread holds the drain role, that upgrade is
+    /// dropped, a second task takes the upgradable read and starts its own
+    /// upgrade, and the reader leaves. The second upgrade holds the
+    /// upgradable read the whole time, so it must become the write, and no
+    /// writer may get in before it.
+    #[test]
+    fn an_upgrade_dropped_while_another_thread_drains_does_not_cost_the_next_upgrade() {
+        let lock = RawRwLock::new();
+        let waker = Waker::noop();
+        assert!(lock.try_kind(READ), "a reader is inside");
+        assert!(lock.try_kind(UPGRADABLE_READ), "the first upgradable read");
+        let first = RefCell::new(UpgradeWait::new());
+        assert!(
+            first.borrow_mut().poll(&lock, waker).is_pending(),
+            "the first upgrade waits for the reader"
+        );
+        let second = RefCell::new(UpgradeWait::new());
+        let raced = Raced {
+            lock: &lock,
+            passes: Cell::new(0),
+            pass_begins: Box::new(|pass| {
+                if pass == 1 {
+                    first.borrow_mut().cancel(&lock);
+                    assert!(lock.try_kind(UPGRADABLE_READ), "the second upgradable read");
+                    assert!(
+                        second.borrow_mut().poll(&lock, waker).is_pending(),
+                        "the second upgrade waits for the reader"
+                    );
+                    lock.read_unlock();
+                }
+            }),
+        };
+        // A writer queues, and its poll takes the drain role.
+        let mut writer = Contend::new();
+        let wrote = writer.poll(&raced, WRITE, waker);
+        assert!(
+            wrote.is_pending(),
+            "a writer got in while the upgradable read was held"
+        );
+        assert!(
+            second.borrow_mut().poll(&lock, waker).is_ready(),
+            "the upgrade never became the write"
+        );
+        writer.cancel(&raced, WRITE);
+        lock.write_unlock();
+    }
+
+    /// A waker that, when the last copy of it is dropped, does what another
+    /// thread could do at that instant: the reader leaves the lock, and a
+    /// second task tries to take the upgradable read.
+    struct RaceAtDrop {
+        lock: Arc<RawRwLock>,
+        second_took_it: Arc<AtomicBool>,
+    }
+
+    impl Wake for RaceAtDrop {
+        fn wake(self: Arc<Self>) {
+            // Nobody polls the future again. The race runs when the last
+            // copy goes, which may be this one.
+            drop(self);
+        }
+    }
+
+    impl Drop for RaceAtDrop {
+        fn drop(&mut self) {
+            self.lock.read_unlock();
+            let took = self.lock.try_kind(UPGRADABLE_READ);
+            self.second_took_it.store(took, StdOrdering::Relaxed);
+        }
+    }
+
+    /// An upgrade waits for a reader and is dropped. Its drop withdraws its
+    /// node and then lets the upgradable read go; the node's waker is
+    /// dropped in between, and there the reader leaves (which runs a pass)
+    /// and a second task tries to take the upgradable read. Whoever holds
+    /// the upgradable read afterwards, no writer may enter beside it.
+    #[test]
+    fn a_pass_between_a_dropped_upgrades_withdraw_and_its_release_frees_nothing_twice() {
+        let lock = Arc::new(RawRwLock::new());
+        assert!(lock.try_kind(READ), "a reader is inside");
+        assert!(lock.try_kind(UPGRADABLE_READ), "the first upgradable read");
+        let second_took_it = Arc::new(AtomicBool::new(false));
+        let waker = Waker::from(Arc::new(RaceAtDrop {
+            lock: Arc::clone(&lock),
+            second_took_it: Arc::clone(&second_took_it),
+        }));
+        let mut first = UpgradeWait::new();
+        assert!(
+            first.poll(&lock, &waker).is_pending(),
+            "the first upgrade waits for the reader"
+        );
+        // The node holds the only other copy of the waker, so dropping the
+        // upgrade drops it between the withdraw and the release.
+        drop(waker);
+        first.cancel(&lock);
+        if !second_took_it.load(StdOrdering::Relaxed) {
+            assert!(
+                lock.try_kind(UPGRADABLE_READ),
+                "the upgradable read is free once its holder let it go"
+            );
+        }
+        assert!(
+            !lock.try_kind(WRITE),
+            "a writer got in while the upgradable read was held"
+        );
+        lock.upgradable_unlock();
+        assert!(lock.try_kind(WRITE), "the lock is free at the end");
     }
 }

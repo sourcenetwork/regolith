@@ -47,10 +47,8 @@
 \* The locks covered: RwLock and ReentrantRwLock after D49 (barging with
 \* bounded bypass between readers and writers), D50 (the upgradable read)
 \* and E33 (who takes the write for an upgrade). The code this matches is
-\* src/sync/raw_rwlock.rs as fixed for E33 (commit 7bec2a7 on
-\* e33/phase-5-mechanisms). This tree gets that commit by merge: until it
-\* does, its raw_rwlock.rs still has the step MC_SyncRwLock_Red_PassTakesWrite
-\* plants.
+\* src/sync/raw_rwlock.rs as fixed for E33 (commit 7bec2a7, which this tree
+\* has by merge).
 \*
 \* PROVED FOR EVERY SIZE in Lean, proofs/lean/Regolith/Sync.lean: the
 \* barging lock's laws (mutual_exclusion, bounded_bypass, owed_at_bound,
@@ -81,9 +79,9 @@
 \*     an_upgrade_dropped_while_another_thread_drains_does_not_cost_the_next_upgrade
 \*     a_pass_between_a_dropped_upgrades_withdraw_and_its_release_frees_nothing_twice
 \*                                                    GuardsCounted (E33)
-\* The E33 loom model, its calibration and the two unit tests come with the
-\* fix itself (commits 7bec2a7 and 6026420 on e33/phase-5-mechanisms), by
-\* the same merge.
+\* The E33 loom model has a calibration,
+\* calibration_a_pass_that_takes_the_write_for_a_dropped_upgrade_lets_a_writer_in,
+\* that rebuilds the old step out of plain atomics and must fail.
 \*
 \* THE CODE MODELLED.
 \*   - The state word (WaitQueue::state) holds, above the queue's six flag
