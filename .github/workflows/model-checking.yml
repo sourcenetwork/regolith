@@ -53,9 +53,19 @@ jobs:
   # view per batch read, ingest publication and WAL rotation. The green
   # and the red configurations both run: a red one going green would mean
   # the model stopped telling the fix from the defect.
+  #
+  # Every row runs, dealt out over six jobs side by side (`just tla N 6`
+  # takes each sixth row, starting at the Nth): checked one after another
+  # with one TLC worker the suite takes 41 minutes on a workstation. A GREEN
+  # row gets every core of its runner. Measured on four cores, the six
+  # shards take 2.5 to 9 minutes each, so each has 30.
   tla:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4, 5, 6]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-java@v4
@@ -63,8 +73,8 @@ jobs:
           distribution: temurin
           java-version: '21'
       - uses: extractions/setup-just@v2
-      - name: TLA+ models, every green and red configuration
-        run: just tla
+      - name: TLA+ models, every green and red configuration of this shard
+        run: just tla ${{ matrix.shard }} 6
 
   # The Lean proofs beside the TLA+ models: each module proves for every
   # size what a model checks for a few. Plain Lean 4 core, no dependencies.
