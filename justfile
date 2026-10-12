@@ -381,7 +381,8 @@ tla:
     ./tools/tlc --fetch-only >/dev/null || exit 1
     results=$(mktemp -d)
     trap 'rm -rf "$results"' EXIT
-    side=$(getconf _NPROCESSORS_ONLN)
+    # The cores this run may use (`nproc` counts those it is confined to).
+    side=$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN)
     row=0
     # The module the next rows check; each block below sets it.
     spec=RepeatableRead
@@ -433,6 +434,7 @@ tla:
     check MC_RepeatableRead_Red_ReadCommitted          RED INV_NoStaleDefinition
     check MC_DefraLevel_Green_Heads                    GREEN
     check MC_DefraLevel_Green_Counters                 GREEN
+    check MC_DefraLevel_Green_Counters_Clear           GREEN
     check MC_DefraLevel_Green_Migrations               GREEN
     check MC_DefraLevel_Red_RepeatableRead_Merges      RED INV_DuplicateMergesCommit
     check MC_DefraLevel_Red_NoPolicy                   RED INV_DuplicateMergesCommit
@@ -654,6 +656,9 @@ tla:
     # seqs_dense and reader_sees_published.
     spec=CommitPipeline
     check MC_CommitPipeline_Green                      GREEN
+    check MC_CommitPipeline_Green_Live                 GREEN
+    check MC_CommitPipeline_Green_LiveIngest           GREEN
+    check MC_CommitPipeline_Green_LiveNoStop           GREEN
     check MC_CommitPipeline_Red_OutOfOrder             RED ReadersSeePrefix
     check MC_CommitPipeline_Red_AbortHole              RED NoHole
     check MC_CommitPipeline_Red_NoHelping              RED NoLiveThreadBlocked
