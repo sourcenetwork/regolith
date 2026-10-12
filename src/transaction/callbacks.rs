@@ -261,8 +261,16 @@ impl Transaction {
     /// claim made once the commit began starts as committing, so a sweep by
     /// `close` finds nothing to abort.
     fn claim(&mut self) -> &Arc<Claim> {
-        self.claim
-            .get_or_insert_with(|| Claim::track(&self.engine, self.committing))
+        let (engine, committing, owner) = (&self.engine, self.committing, &self.lock_owner);
+        self.claim.get_or_insert_with(|| {
+            let claim = Claim::track(engine, committing);
+            // The locks taken before the claim existed are `close`'s to
+            // release too.
+            if let Some(owner) = owner.get() {
+                claim.hold_locks_of(Arc::clone(owner));
+            }
+            claim
+        })
     }
 
     /// Run `f` at commit, before validation, on the committing thread.

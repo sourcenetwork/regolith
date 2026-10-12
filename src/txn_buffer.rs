@@ -329,6 +329,15 @@ where
         self.newest(key).map(|node| node.value.clone())
     }
 
+    /// Whether anything is buffered for `key`, cloning nothing.
+    pub(crate) fn contains_key<Q>(&self, key: &Q) -> bool
+    where
+        K: core::borrow::Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        self.newest(key).is_some()
+    }
+
     /// Build the index now if it does not exist yet, regardless of
     /// [`Self::spill_at`].
     ///

@@ -3042,8 +3042,9 @@ impl RegolithEngine {
             }
             Err(err) => {
                 // Reads through queues work again on the database the failed
-                // close left open.
+                // close left open, and lock waits queue again.
                 self.cache.reopen_io();
+                self.open_transactions.reopen_locks();
                 self.close_state.store(CLOSE_STATE_OPEN, Ordering::Release);
                 self.refresh_stall_level();
                 Err(err)

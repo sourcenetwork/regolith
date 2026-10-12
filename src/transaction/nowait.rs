@@ -24,7 +24,7 @@
 
 use std::sync::Arc;
 
-use super::{LockManager, Transaction, TransactionError, TxMode, TxResult, receipt_of};
+use super::{Transaction, TransactionError, TxResult, receipt_of};
 use crate::engine::io::job::Delivery;
 use crate::engine::io::shared::QueueShared;
 use crate::engine::{GroupSync, NowaitCommit, RegolithEngine, Settled, conclude_settled};
@@ -42,23 +42,6 @@ enum Committed {
         queue: Arc<QueueShared>,
         scan_runs_dropped: u64,
     },
-}
-
-/// The key locks a pessimistic commit holds until its outcome is delivered:
-/// released then, so no transaction that takes one of them can read past a
-/// commit that is written but not yet visible.
-struct HeldLocks {
-    manager: Arc<LockManager>,
-    tx_id: u64,
-    keys: Vec<Vec<u8>>,
-}
-
-impl HeldLocks {
-    fn release(self) {
-        for key in self.keys {
-            self.manager.release(&key, self.tx_id);
-        }
-    }
 }
 
 impl Transaction {
@@ -139,7 +122,7 @@ impl Transaction {
                 queue,
                 scan_runs_dropped,
             } => {
-                let locks = self.take_locks();
+                let locks = self.take_landing_locks();
                 self.release_resources();
                 let ending = self.ending();
                 let stats = engine.statistics_arc();
@@ -235,24 +218,5 @@ impl Transaction {
             },
             Err(err) => Committed::Done(receipt(Err(err))),
         }
-    }
-
-    /// The key locks a pessimistic transaction holds, taken out of it.
-    fn take_locks(&mut self) -> Option<HeldLocks> {
-        let TxMode::Pessimistic { tx_id } = self.mode else {
-            return None;
-        };
-        let manager = Arc::clone(self.lock_manager.as_ref()?);
-        let keys: Vec<Vec<u8>> = self
-            .held_locks
-            .drain()
-            .into_iter()
-            .map(|(k, ())| k)
-            .collect();
-        Some(HeldLocks {
-            manager,
-            tx_id,
-            keys,
-        })
     }
 }
