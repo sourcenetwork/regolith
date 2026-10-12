@@ -347,16 +347,31 @@ chaos instances="4" rounds="2" versions="120" min_rounds="20":
 # `WalRotation.tla` (E2, a rotation syncs the sealed log first).
 # Each row prints the distinct states TLC explored and its wall time.
 # TLC is fetched on first use, pinned by checksum in `proofs/tla/tools/tlc`.
-tla:
+#
+# `just tla` runs every row. `just tla N M` runs the rows of shard N of M:
+# the rows are dealt out in turn, so M runs side by side (CI's matrix) cover
+# every row once, and no shard holds two neighbouring heavy rows.
+#
+# A GREEN row explores its whole state space, in whatever order, so TLC
+# gets every core for it. A RED row stops at the first broken invariant it
+# meets, and with one worker that is always the shallowest one, the same on
+# every run; RED rows are short anyway.
+# Check every TLA+ row, or shard N of M of them (`just tla N M`).
+tla shard="1" shards="1":
     #!/usr/bin/env bash
     set -uo pipefail
     cd proofs/tla
     fail=0
+    row=0
     # The module the next rows check; each block below sets it.
     spec=RepeatableRead
     check() {
-        local cfg="$1" expect="$2" inv="${3:-}" out broke verdict states took
-        out=$(./tools/tlc -metadir "states/$cfg" -config "$cfg.cfg" "$spec.tla" 2>&1)
+        local cfg="$1" expect="$2" inv="${3:-}" out broke verdict states took workers
+        row=$((row + 1))
+        if [ $(( (row - 1) % {{shards}} + 1 )) -ne {{shard}} ]; then return; fi
+        workers=1
+        if [ "$expect" = GREEN ]; then workers=auto; fi
+        out=$(./tools/tlc -workers "$workers" -metadir "states/$cfg" -config "$cfg.cfg" "$spec.tla" 2>&1)
         # TLC words a broken invariant two ways: "is violated." when the search reaches a bad
         # state, and "is violated by the initial state:" when the very first state is already
         # bad. Both name the invariant, and both count.
@@ -721,6 +736,7 @@ tla:
     check MC_LockTable_Red_ReleaseAtWrite              RED IsolationAtLanding
     check MC_LockTable_Red_ReleaseAtDelivery           RED HeldOnlyWhileNeeded
     rm -rf states ./*_TTrace_*.tla ./*_TTrace_*.bin
+    echo "  shard {{shard}} of {{shards}}: $row rows in all"
     exit $fail
 
 # `proofs/lean` is a Lake project named Regolith, plain Lean 4 core with no
