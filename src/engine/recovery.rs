@@ -1,12 +1,14 @@
 //! Recovery from the write-ahead logs at open: replay them into a
-//! memtable, deal with the newest log's discarded tail, and rewrite what
-//! was recovered into a fresh log.
+//! memtable, deal with the newest log's discarded tail, give the tables an
+//! open moved out of overlapping levels their range tombstones back in
+//! front, and rewrite what was recovered into a fresh log.
 
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use super::internal_key;
+use super::manifest::Demotion;
 use super::memtable::MemTable;
 use super::seal::Keyring;
 use super::wal::{self, TailVerdict, Wal};
@@ -101,6 +103,54 @@ pub(super) fn report_dropped_manifest_tail(
         stats.add(Ticker::ManifestTailDiscarded, 1);
         stats.add(Ticker::ManifestTailDiscardedBytes, tail.bytes);
     }
+}
+
+/// Put the range tombstones of the tables the open moved out of
+/// overlapping levels into `memtable`, and return the largest sequence
+/// recovered, at least `latest_seq`. Does nothing when the open moved none.
+///
+/// A moved table can hold a range tombstone newer than a key it covers in
+/// a source read before it (`manifest/legacy_overlap.rs`), and a read stops
+/// at the first source holding the key. The recovered memtable is the
+/// newest source, so from it each tombstone is in front of every key it
+/// covers, wherever a later flush or compaction takes its table. The log
+/// the open writes from this memtable keeps it there across a restart.
+/// Adding one a log already replayed changes nothing.
+pub(super) fn hoist_range_deletes(
+    demotion: Option<&Demotion>,
+    memtable: &MemTable,
+    latest_seq: u64,
+) -> u64 {
+    let tombstones = demotion.map_or(&[][..], |demotion| &demotion.range_deletes);
+    tombstones.iter().fold(latest_seq, |latest, tombstone| {
+        memtable.delete_range(&tombstone.start, &tombstone.end, tombstone.seq);
+        latest.max(tombstone.seq)
+    })
+}
+
+/// Tell the operator that the open moved `demotion`'s tables out of
+/// levels an earlier release left overlapping, in one warn line.
+/// `manifest` is the file that lists them.
+///
+/// A read-write open calls this once the move is recorded, so a later
+/// open has nothing to move and reports nothing. A read-only open moves
+/// them in its own view, every time.
+pub(super) fn report_demoted_tables(manifest: &Path, demotion: &Demotion, read_only: bool) {
+    let message = if read_only {
+        "moved tables an earlier release left with overlapping key ranges to level 0 \
+         for this read-only open: open the database for writing once to keep the move"
+    } else {
+        "moved tables an earlier release left with overlapping key ranges to level 0: \
+         no data was lost and no action is needed"
+    };
+    tracing::warn!(
+        path = %manifest.display(),
+        tables = demotion.tables,
+        deepest_level = demotion.deepest_level,
+        range_deletes = demotion.range_deletes.len(),
+        read_only,
+        "{message}"
+    );
 }
 
 pub(super) fn rewrite_recovered_memtable_to_wal(

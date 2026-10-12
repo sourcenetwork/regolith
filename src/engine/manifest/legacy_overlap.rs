@@ -4,10 +4,39 @@
 //! order within each demoted level, and keep shallower levels newer than
 //! deeper ones. Key-sorting first would lose the age of an ingested table
 //! whose range tombstone widened its recorded range.
+//!
+//! Moving the tables is half of it. The ingest that left the overlap gave
+//! its table one fresh sequence and put it in the bottom level, so a range
+//! tombstone of that table can be newer than a key it covers in a table
+//! above it, in L0, or in a log not flushed yet. Every other step of the
+//! engine relies on the opposite: a read stops at the first source holding
+//! the key, and a compaction retires a tombstone once nothing below it
+//! holds what it covers (`compaction::retire`). So the open also hands the
+//! range tombstones of every table it moved to the engine
+//! ([`Demotion::range_deletes`]), which puts them in the memtable it
+//! recovers, the newest source of all. From there they are in front of
+//! every key they cover, as a `delete_range` written today is.
+//!
+//! The move reaches the manifest with the open's first edit
+//! ([`VersionSet::apply`]), not before: the engine writes that edit once the
+//! log holding those tombstones is durable. A power cut in between leaves
+//! the old layout, which the next open moves again.
 
 use std::collections::BTreeSet;
 
+use super::super::range_tombstone::{RangeTombstone, sort_dedup_tombstones};
 use super::*;
+
+/// What an open moved to L0, for the engine to finish and report.
+pub(crate) struct Demotion {
+    /// Tables moved out of the levels below L0.
+    pub(crate) tables: u64,
+    /// The deepest level that held overlapping tables.
+    pub(crate) deepest_level: usize,
+    /// Every range tombstone of a moved table, each range once per
+    /// sequence, oldest sequence first.
+    pub(crate) range_deletes: Vec<RangeTombstone>,
+}
 
 #[derive(Default)]
 pub(super) struct Repair {
@@ -44,7 +73,8 @@ impl Repair {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         format!(
-                            "manifest lists table {} more than once while repairing overlapping levels",
+                            "manifest lists table {} more than once below level 0, which no \
+                             release writes: the file is damaged",
                             meta.file_id
                         ),
                     ));
@@ -74,34 +104,51 @@ impl Repair {
         })
     }
 
-    /// All removals and re-additions share one synced frame. A crash
-    /// leaves either the old layout (repairable again) or the new one.
-    pub(super) fn persist(
-        &self,
-        writer: &mut BufferedWriter,
-        offset: u64,
-        sealing: Option<&ManifestSeal>,
-    ) -> io::Result<(u64, Option<KeyId>)> {
+    /// What this repair moved, given the L0 it left behind: the moved
+    /// tables are the oldest of `l0`, in front of the ones L0 already held.
+    /// `None` when nothing overlapped.
+    pub(super) fn demotion(&self, l0: &[Arc<LiveSst>]) -> Option<Demotion> {
         if self.records.is_empty() {
-            return Ok((0, None));
+            return None;
         }
-        let (bytes, sealed_under) = VersionSet::encode_records(&self.records, offset, sealing)?;
-        writer.write_all(&bytes)?;
-        writer.sync_all()?;
-        Ok((bytes.len() as u64, sealed_under))
+        let moved = l0.iter().take(self.tables as usize);
+        let range_deletes = coalesced(
+            moved
+                .flat_map(|file| file.reader.range_tombstones())
+                .cloned()
+                .collect(),
+        );
+        Some(Demotion {
+            tables: self.tables,
+            deepest_level: self.deepest_level,
+            range_deletes,
+        })
     }
+}
 
-    pub(super) fn report(&self, manifest: &Path, read_only: bool) {
-        if self.tables > 0 {
-            tracing::warn!(
-                path = %manifest.display(),
-                deepest_level = self.deepest_level,
-                tables_demoted = self.tables,
-                read_only,
-                "demoted overlapping legacy levels to L0"
-            );
+/// `tombstones` with every run of ranges that share a sequence and touch
+/// or overlap joined into one, oldest sequence first.
+///
+/// A compaction clips a tombstone to each table it writes, so one
+/// `delete_range` can reach here as a piece per table. Joined, the pieces
+/// delete exactly what they deleted apart: the same keys, at the same
+/// sequence. Oldest first is the order a memtable takes them cheapest in.
+pub(super) fn coalesced(mut tombstones: Vec<RangeTombstone>) -> Vec<RangeTombstone> {
+    sort_dedup_tombstones(&mut tombstones);
+    // Stable, so each sequence keeps its ranges in start order.
+    tombstones.sort_by_key(|tombstone| tombstone.seq);
+    let mut joined: Vec<RangeTombstone> = Vec::with_capacity(tombstones.len());
+    for tombstone in tombstones {
+        match joined.last_mut() {
+            Some(last) if last.seq == tombstone.seq && tombstone.start <= last.end => {
+                if tombstone.end > last.end {
+                    last.end = tombstone.end;
+                }
+            }
+            _ => joined.push(tombstone),
         }
     }
+    joined
 }
 
 /// Check key order without changing the installation order needed by a

@@ -315,9 +315,11 @@ fn legacy_overlap_is_repaired_but_duplicate_deep_table_references_are_refused() 
     };
 
     write_manifest(dir.path(), &[add(1, &wide), add(1, &inside)]);
-    let vs = VersionSet::open(dir.path(), &sst_dir).unwrap();
+    let mut vs = VersionSet::open(dir.path(), &sst_dir).unwrap();
     assert_eq!(ids(&vs.current().levels[0]), [1, 2]);
     assert!(vs.current().levels[1].is_empty());
+    let moved = vs.take_demotion().expect("the open moved the level");
+    assert_eq!((moved.tables, moved.deepest_level), (2, 1));
     drop(vs);
 
     // A duplicate reference is not a legacy range-widening defect.
