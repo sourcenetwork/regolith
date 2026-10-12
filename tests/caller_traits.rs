@@ -20,6 +20,8 @@
 /// picked up as test binaries of their own.
 #[path = "caller_traits/key_classifier.rs"]
 mod key_classifier;
+#[path = "caller_traits/key_provider.rs"]
+mod key_provider;
 #[path = "caller_traits/log_layout.rs"]
 mod log_layout;
 #[path = "caller_traits/names.rs"]
