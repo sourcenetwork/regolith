@@ -71,6 +71,13 @@
 \*   MC_NonBlocking_Green_Jobs       two threads miss one block while a
 \*                                   call on one of them starts a job.
 \*   MC_NonBlocking_Green_Single     one thread does everything (wasm).
+\*   Those three check every invariant. That everything finishes (AllDone)
+\*   is checked by three smaller runs, since the property costs three times
+\*   the invariants at full size:
+\*   MC_NonBlocking_Green_PoolLive   two threads miss one block.
+\*   MC_NonBlocking_Green_JobsLive   one thread misses a block, the other
+\*                                   starts a job.
+\*   MC_NonBlocking_Green_SingleLive one thread, one block and a job.
 \*   (Both pool setups at once, two blocks and a job, also passes: 2,283,135
 \*   distinct states, about three minutes on eight workers; too slow for
 \*   the recipe's single worker, so the recipe checks the two halves.)
@@ -879,6 +886,11 @@ JobOfNone == [j \in {} |-> 1]
 WantJobs == [t \in {1, 2} |-> {1}]
 \* Job 3 belongs to thread 2.
 JobOfJobs == [j \in {3} |-> 2]
+\* Two threads: thread 1 reads block 1, thread 2 reads nothing (it starts a
+\* job in the run that uses this).
+WantOne == [t \in {1, 2} |-> IF t = 1 THEN {1} ELSE {}]
+\* One thread reads block 1 alone.
+WantSingleOne == [t \in {1} |-> {1}]
 \* One thread reads both blocks and starts the job itself.
 WantSingle == [t \in {1} |-> {1, 2}]
 \* Job 3 belongs to the one thread.

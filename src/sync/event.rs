@@ -9,11 +9,10 @@ use core::task::{Context, Poll};
 
 use super::internal::{Ordering, UnsafeCell};
 use super::list::List;
-use super::queue::{Arrivals, FIRST_BIT, Policy, Step, WaitQueue};
+use super::queue::{Arrivals, FIRST_BIT, Policy, QUEUED, Step, WaitQueue};
 use super::waiter::{Cancel, Wait, WakeList};
 
-const QUEUED: usize = 1 << FIRST_BIT;
-const SET: usize = 1 << (FIRST_BIT + 1);
+const SET: usize = 1 << FIRST_BIT;
 
 /// An event that is set once and stays set.
 ///
@@ -93,8 +92,8 @@ impl Policy for Event {
         &self.queue
     }
 
-    fn pass(&self, arrivals: Arrivals, woken: &mut WakeList<'_>) -> usize {
-        let pool = self.queue.pool();
+    fn pass(&self, arrivals: Arrivals, woken: &mut WakeList<'_>, _wake_front: bool) -> usize {
+        let pool = &self.queue;
         let set = self.is_set();
         // SAFETY: only the drain role's holder runs a pass.
         self.waiting.with_mut(|waiting| unsafe {
@@ -116,7 +115,7 @@ impl Policy for Event {
 
 impl Drop for Event {
     fn drop(&mut self) {
-        let pool = self.queue.pool();
+        let pool = &self.queue;
         // SAFETY: `&mut self` rules out a concurrent pass.
         self.waiting
             .with_mut(|waiting| unsafe { (*waiting).clear(pool) });
@@ -156,15 +155,15 @@ impl Future for EventWait<'_> {
         if event.is_set() {
             return Poll::Ready(());
         }
-        event.enqueue(&mut this.wait, 0, cx.waker(), QUEUED);
+        event.enqueue(&mut this.wait, 0, cx.waker());
         this.wait.poll(&event.queue, None).map(drop)
     }
 }
 
 impl Drop for EventWait<'_> {
     fn drop(&mut self) {
-        if let Cancel::Withdrawn = self.wait.cancel(&self.event.queue) {
-            self.event.withdrawn();
+        if let Cancel::Withdrawn(_) = self.wait.cancel(&self.event.queue) {
+            self.event.withdrawn(false);
         }
     }
 }

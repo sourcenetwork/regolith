@@ -284,12 +284,23 @@ loom-debug:
     RUSTFLAGS="--cfg loom" timeout 10m cargo test --test loom_memtable
 
 # Loom models for `regolith::sync`: every primitive's wait protocol,
-# with two calibrations that must fail. Release only: the three-thread
-# models explore 0.2 to 0.5 million interleavings each, which a debug
-# build multiplies several times over.
+# with three calibrations that must fail. Release only: the larger models
+# explore 0.1 to 0.4 million interleavings each (about four minutes in
+# all), which a debug build multiplies several times over.
 loom-sync:
     RUSTFLAGS="--cfg loom" cargo test --release --test loom_sync --no-run
     RUSTFLAGS="--cfg loom" timeout 10m cargo test --release --test loom_sync
+
+# The five sync models whose three threads all contend for one lock or
+# semaphore, at preemption bound 2 instead of the bound 1 `loom-sync`
+# runs them at: their `#[ignore]`d twins, or the one `model` names. Each
+# twin runs a smaller scenario of its own, because the shared one does not
+# finish at bound 2 in any useful time (43 to 79 minutes a model, and never
+# for the upgradable read). They take 2 s to 6 minutes each, so the nightly
+# CI run carries them, one job per model.
+loom-sync-deep model="":
+    RUSTFLAGS="--cfg loom" cargo test --release --test loom_sync --no-run
+    RUSTFLAGS="--cfg loom" timeout 15m cargo test --release --test loom_sync -- --ignored {{model}}
 
 # Loom models for the per-thread I/O queues (D53): the unit claim, the
 # completion pushed to every waiting queue, the idle waker, and a read's
@@ -477,6 +488,10 @@ tla:
     check MC_DefraLevel_Red_ReasonNewestWrite          RED INV_ReasonsExact
     # E1. Lean: Regolith/LsmOrder.lean, compact_range_reads_newest.
     spec=LsmOrder
+    # E31, a flush's table and its memtable's retirement are one publication.
+    # Lean: Regolith/LsmOrder.lean, flush_keeps_sources_disjoint,
+    # split_install_holds_a_memtable_twice.
+    check MC_LsmOrder_Red_SplitRetire                  RED NoDoubleSource
     check MC_LsmOrder_Green                            GREEN
     check MC_LsmOrder_Red_Intersect                    RED ReadNewest
     # Flush order, ingest placement, overlap demotion (E14, D13), binary
@@ -610,12 +625,16 @@ tla:
     check MC_CommitPipeline_Red_ValidatePublished      RED NoLostUpdate
     # R13 and D53, non-blocking reads on per-thread I/O queues: single-flight
     # units claimed by one CAS, completions only on the asking queue, idle
-    # wakeups. Lean: Regolith/IoQueue.lean, claim_once, told_exactly_once,
-    # no_lost_idle_wakeup, busy_never_woken, single_thread_finishes.
+    # wakeups. Lean: Regolith/IoQueue.lean, claim_once, told_at_most_once,
+    # every_waiter_told, no_lost_idle_wakeup, busy_never_woken,
+    # single_thread_finishes.
     spec=NonBlocking
     check MC_NonBlocking_Green_Pool                    GREEN
+    check MC_NonBlocking_Green_PoolLive                GREEN
     check MC_NonBlocking_Green_Jobs                    GREEN
+    check MC_NonBlocking_Green_JobsLive                GREEN
     check MC_NonBlocking_Green_Single                  GREEN
+    check MC_NonBlocking_Green_SingleLive              GREEN
     check MC_NonBlocking_Red_WrongQueue                RED OwnQueue
     check MC_NonBlocking_Red_LostIdleWakeup            RED NoLostIdleWakeup
     check MC_NonBlocking_Red_DoubleRun                 RED SingleRun

@@ -33,6 +33,10 @@
 //!   which each is a function of its predecessor and no publication is
 //!   lost. Publishers never exclude each other: one that loses the swap
 //!   rebuilds on whatever won. That is what replaced the publish mutex.
+//!   A flush installs its table and retires its memtable in one
+//!   publication ([`VersionGuard::retire_with_version`]), so no view holds
+//!   a memtable and its table at once: a view holding both would hand a
+//!   read every entry of that memtable twice.
 //! * **A load never returns a view older than one already published
 //!   before the load began.** The swap is a release, the load an
 //!   acquire of the same word, so a publication that happened before a
@@ -281,13 +285,23 @@ impl ReadViewCell {
         });
     }
 
-    /// Replace the version half of the view. Called by
-    /// [`VersionGuard::drop`] and by nothing else.
-    fn publish_version(&self, version: Arc<Version>) {
+    /// Replace the version half of the view, and, when `retired` names a
+    /// memtable, drop it from the frozen list in the same publication.
+    /// Called by [`VersionGuard::drop`] and by nothing else.
+    fn publish_version(&self, version: Arc<Version>, retired: Option<&Arc<MemTable>>) {
         self.publish(|current| {
+            let frozen = match retired {
+                Some(flushed) => current
+                    .frozen
+                    .iter()
+                    .filter(|mt| !Arc::ptr_eq(mt, flushed))
+                    .cloned()
+                    .collect(),
+                None => current.frozen.clone(),
+            };
             let next = ReadView {
                 active: Arc::clone(&current.active),
-                frozen: current.frozen.clone(),
+                frozen,
                 version: Arc::clone(&version),
             };
             (next, ())
@@ -364,6 +378,7 @@ impl VersionStore {
             entry_version,
             guard,
             view: self.view.get(),
+            retire: None,
         }
     }
 }
@@ -373,6 +388,25 @@ pub(crate) struct VersionGuard<'a> {
     guard: MutexGuard<'a, VersionSet>,
     view: Option<&'a Arc<ReadViewCell>>,
     entry_version: Arc<Version>,
+    /// A frozen memtable to retire in the publication of the version this
+    /// guard installs (see [`Self::retire_with_version`]).
+    retire: Option<Arc<MemTable>>,
+}
+
+impl VersionGuard<'_> {
+    /// Retire `flushed` from the frozen list in the same publication as the
+    /// version this critical section installed, the one holding `flushed`'s
+    /// table.
+    ///
+    /// A flush that published its table and then, in a second publication,
+    /// retired its memtable would leave a window in which a view holds both:
+    /// every entry of the memtable twice, once in the memtable and once in
+    /// the table, at the same sequence. A read collects a key's merge
+    /// operands from every source, so it would apply each of them twice.
+    /// One publication makes the sources of every view disjoint.
+    pub(crate) fn retire_with_version(&mut self, flushed: &Arc<MemTable>) {
+        self.retire = Some(Arc::clone(flushed));
+    }
 }
 
 impl Deref for VersionGuard<'_> {
@@ -395,13 +429,19 @@ impl Drop for VersionGuard<'_> {
             return;
         };
         let current = self.guard.current();
+        let retire = self.retire.take();
         if Arc::ptr_eq(&current, &self.entry_version) {
+            // No version to publish: a retire asked for without one still
+            // happens, on its own.
+            if let Some(flushed) = retire {
+                view.retire_memtable(&flushed);
+            }
             return;
         }
         // Published while the version-set mutex is still held (this
         // runs before the guard field drops), so publications land in
         // the same order the edits did.
-        view.publish_version(current);
+        view.publish_version(current, retire.as_ref());
     }
 }
 
