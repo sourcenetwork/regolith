@@ -29,7 +29,9 @@
 //!   held once (S2 in `engine::skiplist`): the memtable takes writes from
 //!   any thread, as the commit pipeline needs;
 //! - that the sections of a step never overlap and none is left behind
-//!   (`engine::step`).
+//!   (`engine::step`);
+//! - that a job a queue's poll parks instead of waiting is woken, and that
+//!   nobody who waited on it is left behind (`engine::commit::park`).
 //!
 //! The version models in [`version`] are protocol models and say so:
 //! the production `VersionSet` writes a manifest record and opens an
@@ -81,6 +83,7 @@ pub mod gate;
 pub mod handoff;
 pub mod io_queue;
 pub mod jobs;
+pub mod park;
 pub mod skiplist;
 pub mod slice;
 pub mod snapshots;

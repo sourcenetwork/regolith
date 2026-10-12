@@ -161,7 +161,7 @@ pub mod loom_exports {
 
     pub use crate::engine::commit::loom_model as pipeline;
     pub use crate::engine::loom_model::{
-        arena, families, gate, handoff, io_queue, jobs, skiplist, slice, snapshots, step,
+        arena, families, gate, handoff, io_queue, jobs, park, skiplist, slice, snapshots, step,
         tombstones, version,
     };
     pub use crate::env::open_file_limit::loom_model as open_files;

@@ -5,9 +5,9 @@
 //! RUSTFLAGS="--cfg loom" cargo test --release --test loom_pipeline
 //! ```
 //!
-//! The models live in `src/engine/commit/loom_model.rs` and
-//! `src/engine/loom_model/step.rs`, next to the crate-private types they
-//! drive. What each proves:
+//! The models live in `src/engine/commit/loom_model.rs`,
+//! `src/engine/loom_model/step.rs` and `src/engine/loom_model/park.rs`,
+//! next to the crate-private types they drive. What each proves:
 //!
 //! - **Reserve and void**: an owner installs the index it reserved while a
 //!   helper voids it; exactly one wins, and the descriptor is dropped once.
@@ -27,6 +27,11 @@
 //!   from the discarded state never becomes the pipeline's state.
 //! - **The version step**: two sections handed over at once never overlap,
 //!   both run, and a caller parked on its section is woken.
+//! - **Parking** (a queue's poll never waits for another thread): a thread
+//!   blocked on a job its holder parks runs it; a job parked for the step
+//!   is woken when the step is given up; a rollback parked for a write in
+//!   flight cuts the log only after the write left; and a queue the wake of
+//!   a parked job had off the list when the job landed is told once.
 //!
 //! Every model is bounded by a small scenario (a ring of two cells, two
 //! threads or two and a reader) and an explicit preemption bound given in
@@ -37,7 +42,7 @@
 
 #![cfg(loom)]
 
-use regolith::loom_exports::{pipeline, step};
+use regolith::loom_exports::{park, pipeline, step};
 
 #[test]
 fn an_index_is_installed_or_voided_never_both() {
@@ -132,4 +137,48 @@ fn sections_never_overlap_and_none_is_left_behind() {
 #[should_panic(expected = "a section was left on the list with nobody to run it")]
 fn a_step_given_up_without_looking_leaves_a_section_behind() {
     step::a_step_given_up_without_looking_leaves_a_section_behind();
+}
+
+#[test]
+fn a_job_its_holder_parks_is_run_by_the_thread_that_waited() {
+    park::a_job_its_holder_parks_is_run_by_the_thread_that_waited();
+}
+
+#[test]
+#[should_panic(expected = "a thread slept on a parked job with nobody left to wake it")]
+fn a_waiter_that_does_not_look_again_sleeps_on_a_parked_job() {
+    park::a_waiter_that_does_not_look_again_sleeps_on_a_parked_job();
+}
+
+#[test]
+fn a_job_parked_for_the_step_is_woken_when_it_is_given_up() {
+    park::a_job_parked_for_the_step_is_woken_when_it_is_given_up();
+}
+
+#[test]
+#[should_panic(expected = "a job parked for the step and was not woken when it was given up")]
+fn a_job_that_parks_without_a_second_try_sleeps_on_a_free_step() {
+    park::a_job_that_parks_without_a_second_try_sleeps_on_a_free_step();
+}
+
+#[test]
+fn a_rollback_parked_for_a_write_in_flight_cuts_after_it_left() {
+    park::a_rollback_parked_for_a_write_in_flight_cuts_after_it_left();
+}
+
+#[test]
+#[should_panic(expected = "a write of a discarded commit landed after the cut")]
+fn a_write_counted_in_after_its_epoch_check_lands_after_the_cut() {
+    park::a_write_counted_in_after_its_epoch_check_lands_after_the_cut();
+}
+
+#[test]
+fn a_queue_off_the_list_when_the_job_lands_is_told_once() {
+    park::a_queue_off_the_list_when_the_job_lands_is_told_once();
+}
+
+#[test]
+#[should_panic(expected = "a queue was never told the landing")]
+fn a_wake_that_registers_again_blindly_loses_a_landing() {
+    park::a_wake_that_registers_again_blindly_loses_a_landing();
 }

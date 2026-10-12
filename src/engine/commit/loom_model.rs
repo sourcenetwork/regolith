@@ -532,7 +532,8 @@ fn help(ring: &Ring<Slot>, tip: &ArcSlot<Mark>, upto: u64, how: Settle) {
                 if slot.decision.get().is_none() {
                     let prev = tip.load();
                     if ring.is_next_to_decide(index) {
-                        slot.decision.set(Mark::new(
+                        // A decision that lost the install is dropped (D1).
+                        let _ = slot.decision.set(Mark::new(
                             index,
                             prev.next,
                             prev.next + slot.ops,

@@ -69,7 +69,9 @@ impl Round {
         }
     }
 
-    /// The job of a round that is over, for its allocation.
+    /// The job of a round that is over, for its allocation. A loom build
+    /// keeps none (`spare.rs`).
+    #[cfg(not(loom))]
     pub(super) fn into_job(self) -> Arc<Job> {
         self.job
     }
