@@ -5,18 +5,23 @@
 //! up in the caller's build, not here. Each assertion below is a bound on a
 //! `const fn`, so losing a bound fails to compile this file instead of passing
 //! quietly.
+//!
+//! Three handles must stay the other way: the futures of the reentrant locks
+//! are neither `Send` nor `Sync`, and gaining either fails to compile this
+//! file too. The locks, guards and channels of `regolith::sync` are asserted
+//! beside their definitions, in `src/sync/mod.rs`.
 
 // Native-only. wasm-pack builds every test target for wasm32, and the browser
 // suite lives in tests/wasm_opfs*.rs.
 #![cfg(not(target_arch = "wasm32"))]
 
 use regolith::{
-    AbortReason, CfIter, CommitInfo, CommitReceipt, CompactionFilter, Conflict, Db, DbSlice,
-    DbWithTtl, Entries, Env, Error, EventListener, IoBudget, IoProgress, IoQueue, IoUnit, IoWait,
-    Iter, KeyClassifier, KeyProvider, LogLayout, MergeOperator, OptimisticTransactionDb,
-    OwnedSnapshotIter, Page, QueueId, ReadMode, RetryPolicy, ScanCheck, ScanStream, Snapshot,
-    TailingIter, TransactError, Transaction, TransactionDb, TransactionError, TransactionHooks,
-    TxnCursor, TxnScanStream, WouldBlock,
+    AbortReason, CfIter, CommitInfo, CommitReceipt, CommitTicket, CompactionFilter, Conflict, Db,
+    DbSlice, DbWithTtl, Entries, Env, Error, EventListener, IoBudget, IoProgress, IoQueue, IoUnit,
+    IoWait, Iter, JobTicket, KeyClassifier, KeyProvider, LockWait, LogLayout, MergeOperator,
+    OptimisticTransactionDb, OwnedSnapshotIter, Page, QueueId, ReadMode, RetryPolicy, ScanCheck,
+    ScanStream, Snapshot, StallWait, TailingIter, TransactError, Transaction, TransactionDb,
+    TransactionError, TransactionHooks, TxResult, TxnCursor, TxnScanStream, WouldBlock,
 };
 
 const fn assert_send<T: Send>() {}
@@ -77,7 +82,6 @@ fn handles_are_send_and_sync() {
     assert_send_sync::<DbWithTtl>();
     assert_send_sync::<Error>();
     assert_send_sync::<TransactionError>();
-    assert_send_sync::<regolith::LockWait>();
     assert_send_sync::<Conflict>();
     assert_send_sync::<CommitReceipt>();
     assert_send_sync::<CommitInfo>();
@@ -86,7 +90,6 @@ fn handles_are_send_and_sync() {
     assert_send_sync::<ScanCheck>();
     assert_send_sync::<Page>();
     assert_send_sync::<TransactError<Error>>();
-    assert_send_sync::<IoWait>();
     assert_send_sync::<WouldBlock>();
     assert_send_sync::<ReadMode>();
     assert_send_sync::<QueueId>();
@@ -113,4 +116,86 @@ fn iterators_are_send() {
     assert_send::<Entries<OwnedSnapshotIter>>();
     assert_send::<TxnScanStream<'static>>();
     assert_send::<TxnCursor>();
+}
+
+/// A ticket's callbacks may be registered from any thread, and a ticket or a
+/// wait can be awaited on another: `Send + Sync`.
+#[test]
+fn tickets_and_waits_are_send_and_sync() {
+    assert_send_sync::<CommitTicket>();
+    assert_send_sync::<JobTicket>();
+    assert_send_sync::<StallWait>();
+    assert_send_sync::<LockWait>();
+    assert_send_sync::<IoWait>();
+}
+
+const fn assert_unpin_future<F: Future<Output = Out> + Unpin, Out>() {}
+
+/// Each is a future with the output stated here, and `Unpin`, so a caller
+/// polls it in place, in a struct field or a `select`, without pinning it.
+#[test]
+fn tickets_and_waits_are_unpin_futures() {
+    assert_unpin_future::<CommitTicket, TxResult<CommitReceipt>>();
+    assert_unpin_future::<JobTicket, Result<(), Error>>();
+    assert_unpin_future::<IoWait, ()>();
+    assert_unpin_future::<StallWait, ()>();
+    assert_unpin_future::<LockWait, ()>();
+}
+
+/// The futures of the `regolith::sync` waits: a task that holds one across an
+/// await can move between threads.
+#[test]
+fn the_sync_wait_futures_are_send_and_sync() {
+    use regolith::sync::{
+        Acquire, AcquireOwned, BarrierWait, EventWait, LatchWait, Lock, LockOwned, Notified, Read,
+        UpgradableRead, Upgrade, Write, WriteOwned,
+    };
+    assert_send_sync::<Lock<'static, u8>>();
+    assert_send_sync::<LockOwned<u8>>();
+    assert_send_sync::<Read<'static, u8>>();
+    assert_send_sync::<Write<'static, u8>>();
+    assert_send_sync::<WriteOwned<u8>>();
+    assert_send_sync::<UpgradableRead<'static, u8>>();
+    assert_send_sync::<Upgrade<'static, u8>>();
+    assert_send_sync::<Acquire<'static>>();
+    assert_send_sync::<AcquireOwned>();
+    assert_send_sync::<Notified<'static>>();
+    assert_send_sync::<EventWait<'static>>();
+    assert_send_sync::<LatchWait<'static>>();
+    assert_send_sync::<BarrierWait<'static>>();
+}
+
+/// Compiles only while each type is neither `Send` nor `Sync`. `OnlyOne` is
+/// implemented once for every type, once more for every `Send` type and once
+/// more for every `Sync` type, so asking for it without saying which is
+/// ambiguous, a compile error, for a type that is either.
+macro_rules! assert_neither_send_nor_sync {
+    ($($handle:ty),* $(,)?) => {$({
+        trait OnlyOne<Which> {
+            fn check() {}
+        }
+        struct IsSend;
+        struct IsSync;
+        impl<T: ?Sized> OnlyOne<()> for T {}
+        impl<T: ?Sized + Send> OnlyOne<IsSend> for T {}
+        impl<T: ?Sized + Sync> OnlyOne<IsSync> for T {}
+        let _ = <$handle as OnlyOne<_>>::check;
+    })*};
+}
+
+/// The three futures of the reentrant locks borrow the `Owner` they were
+/// taken with, and an `Owner` is never shared between threads. So each stays
+/// with its owner: neither `Send` nor `Sync`. Were one to become either, two
+/// threads could hold guards of one owner, and so `&T` to a `T` that is not
+/// `Sync`.
+#[test]
+fn the_reentrant_lock_futures_stay_with_their_owner() {
+    use regolith::sync::{Owner, ReentrantMutexLock, ReentrantRead, ReentrantWrite};
+    assert_neither_send_nor_sync!(
+        ReentrantMutexLock<'static, u8>,
+        ReentrantRead<'static, u8>,
+        ReentrantWrite<'static, u8>,
+    );
+    // The owner itself moves with its task.
+    assert_send::<Owner>();
 }

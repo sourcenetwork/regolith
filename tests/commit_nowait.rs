@@ -525,13 +525,3 @@ fn a_pessimistic_nowait_commit_holds_its_locks_until_it_lands() {
     assert_eq!(queue.poll(IoBudget::ALL).completed, 1);
     assert!(ticket.is_ready());
 }
-
-/// The ticket is `Send + Sync`: its callbacks may be registered from any
-/// thread, and it can be awaited on another.
-#[test]
-fn the_ticket_is_send_and_sync() {
-    fn shared<T: Send + Sync>() {}
-    shared::<regolith::CommitTicket>();
-    shared::<regolith::JobTicket>();
-    shared::<regolith::StallWait>();
-}
