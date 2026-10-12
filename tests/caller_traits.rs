@@ -18,6 +18,14 @@
 
 /// The `#[path]` attributes are what keep `tests/caller_traits/` from being
 /// picked up as test binaries of their own.
+#[path = "caller_traits/env.rs"]
+mod env;
+#[path = "caller_traits/event_listener.rs"]
+mod event_listener;
+/// An environment that refuses to create tables while told to, for the
+/// listener's failed flush.
+#[path = "common/faulty_env.rs"]
+mod faulty_env;
 #[path = "caller_traits/key_classifier.rs"]
 mod key_classifier;
 #[path = "caller_traits/key_provider.rs"]
