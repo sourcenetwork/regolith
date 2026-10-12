@@ -38,6 +38,15 @@ may have to flush at the memtable cap, under the gate, before it seals: its
 flush changes what the stop counts, so it counts its progress on every way
 out, whether its seal went through or failed.
 
+One more (E36). The work that relieves a stop, a flush or a compaction, can
+fail, and its failure stays recorded until that work next succeeds. A write
+stopped while it is recorded is not handed a wait: it is told the failure.
+A writer that was stopped a moment earlier and waits on the unit would wait
+on, so recording a failure lands the unit, and the writer, writing again,
+is told what a fresh write is told. The failure is stored before the unit
+is landed, and a writer reads it again once registered, while the stop
+holds. When the relief recovers, a stopped writer waits as before.
+
 ## What is proved, in plain words
 
 1. `no_stranded_wait`: in every state the real code reaches, once every
@@ -46,7 +55,13 @@ out, whether its seal went through or failed.
 2. `no_wait_once_latched`: in every state the real code reaches, once the
    engine latched and its landing is done, nobody waits (TLA+
    `NoWaitOnceLatched`).
-3. The RED cases, each a run of the buggy steps that ends with a writer
+3. `no_wait_once_failing`: in every state the real code reaches, while the
+   relief's failure is recorded and its landing is done, nobody waits (TLA+
+   `NoWaitOnceFailing`). Its two RED runs end with a writer waiting while
+   the failure is recorded: `no_fail_land_strands_a_waiter` (recording a
+   failure lands nothing) and `no_fail_recheck_strands_a_waiter` (a writer
+   registers without reading the recorded failure again).
+4. The RED cases, each a run of the buggy steps that ends with a writer
    waiting and nobody left to land its unit:
    `no_relief_strands_a_waiter` (the job ends with no relief),
    `no_hand_back_strands_a_waiter` (progress lands the unit only when the
@@ -70,7 +85,10 @@ stop, is the one a write owed, or is a rotation's flush.
 
 On a latched engine the model has every write told the latch. Here a
 writer may be told and finish (`told`, `owedLatched`), or go on as if
-nothing had latched; only its registering is held to the latch's flag.
+nothing had latched; only its registering is held to the latch's flag. The
+same for a relief that is failing: a stopped writer may be told the failure
+and finish (`toldFailing`), or take its step or be contended as if the
+relief worked; only its registering is held to the recorded failure.
 Every run of the model is a run of these steps, so what is proved of these
 holds for the model.
 
@@ -103,6 +121,10 @@ inductive Mode where
   | noLatchRecheck
   /-- Bug: a rotation whose seal fails counts no progress. -/
   | noRotateRefresh
+  /-- Bug: recording the relief's failure lands nothing. -/
+  | noFailLand
+  /-- Bug: a writer registers without reading the recorded failure again. -/
+  | noFailRecheck
   -- Two modes can be compared for equality.
   deriving DecidableEq
 
@@ -157,14 +179,18 @@ structure State where
   latched : Bool
   /-- Whether a latch stored its flag and has yet to land the unit. -/
   landing : Bool
+  /-- Whether the relief's failure is recorded: a stopped write is told it. -/
+  failing : Bool
+  /-- Whether a failure was recorded and has yet to land the unit. -/
+  telling : Bool
   -- Two states can be compared for equality.
   deriving DecidableEq
 
 /-- The start with `n` writers, stopped or not: the gate free, the job not
-started, every writer about to write, nothing latched. -/
+started, every writer about to write, nothing latched, the relief working. -/
 def start (n : Nat) (b : Bool) : State :=
-  -- Only `writing` counts anyone, and the engine takes writes.
-  ⟨b, .free, .idle, n, 0, 0, 0, 0, 0, 0, false, false⟩
+  -- Only `writing` counts anyone, the engine takes writes, the relief works.
+  ⟨b, .free, .idle, n, 0, 0, 0, 0, 0, 0, false, false, false, false⟩
 
 /-- The unit lands: every waiter is about to write again. -/
 def land (s : State) : State :=
@@ -263,8 +289,11 @@ inductive Step (m : Mode) : State → State → Prop
                 else land { s with stale := s.stale - 1, writing := s.writing + 1 })
   /-- A fresh contended writer registers with the stop on: it waits. Only
   on an engine that has not latched (`hl`); bug `noLatchRecheck` does not
-  look. -/
+  look. And only while the relief's failure is not recorded (`hf`); bug
+  `noFailRecheck` does not look. -/
   | registerFresh (s : State) (hl : s.latched = false ∨ m = .noLatchRecheck)
+      -- The relief's failure is not recorded, or the mode is the bug's, which does not look.
+      (hf : s.failing = false ∨ m = .noFailRecheck)
       -- A fresh contended writer is there, and the stop is on.
       (h1 : 0 < s.fresh) (h2 : s.stopped = true) :
       -- One more waiter.
@@ -322,6 +351,44 @@ inductive Step (m : Mode) : State → State → Prop
       -- The landing is done; the waiters wake, or, for the bug, stay.
       Step m s (if m = .noLatchLand then { s with landing := false }
                 else land { s with landing := false })
+  /-- The relief fails, first half: its failure is stored. Only while it is
+  not already recorded. -/
+  | failFlag (s : State) (h : s.failing = false) :
+      -- Recorded, and the landing is owed.
+      Step m s { s with failing := true, telling := true }
+  /-- The relief fails, second half: the unit is landed; bug `noFailLand`
+  lands nothing. -/
+  | failLand (s : State) (h : s.telling = true) :
+      -- The landing is done; the waiters wake, or, for the bug, stay.
+      Step m s (if m = .noFailLand then { s with telling := false }
+                else land { s with telling := false })
+  /-- The relief succeeds again: the record is cleared. A landing still
+  owed stays owed. -/
+  | recover (s : State) (h : s.failing = true) :
+      -- No longer recorded.
+      Step m s { s with failing := false }
+  /-- A writer about to write is stopped while the relief's failure is
+  recorded: it is told the failure and returns. -/
+  | toldFailing (s : State) (h1 : 0 < s.writing) (h2 : s.stopped = true)
+      -- The relief's failure is recorded.
+      (h3 : s.failing = true) :
+      -- It is finished.
+      Step m s { s with writing := s.writing - 1 }
+  /-- A fresh contended writer registers with the stop on and reads the
+  recorded failure: it lands the unit and is told the failure. Not in bug
+  `noFailRecheck`. -/
+  | registerFailingFresh (s : State) (h0 : m ≠ .noFailRecheck) (h1 : 0 < s.fresh)
+      -- The stop is on, and the relief's failure is recorded.
+      (h2 : s.stopped = true) (h3 : s.failing = true) :
+      -- Landed, and the writer is finished.
+      Step m s (land { s with fresh := s.fresh - 1 })
+  /-- A stale contended writer registers with the stop on and reads the
+  recorded failure: the same. -/
+  | registerFailingStale (s : State) (h0 : m ≠ .noFailRecheck) (h1 : 0 < s.stale)
+      -- The stop is on, and the relief's failure is recorded.
+      (h2 : s.stopped = true) (h3 : s.failing = true) :
+      -- Landed, and the writer is finished.
+      Step m s (land { s with stale := s.stale - 1 })
 
 /-- The states the steps of mode `m` reach from a start. -/
 inductive Reach (m : Mode) : State → Prop
@@ -564,7 +631,7 @@ theorem inv_step {s t : State} (hs : Inv s) (hst : Step .green s t) : Inv t := b
     -- A fresh writer still waits on whoever it did.
     · intro h'; simp only [land, reduceCtorEq, ↓reduceIte] at h' ⊢; exact hfresh h'
   -- Case: a contended writer that missed no progress registers with the stop on, and waits.
-  | registerFresh hl h1 h2 =>
+  | registerFresh hl hf h1 h2 =>
     -- It missed no progress, so someone is on the way.
     have hp : Pending s := hfresh h1
     -- Each fact: one more waiter, everything else as it was.
@@ -665,6 +732,63 @@ theorem inv_step {s t : State} (hs : Inv s) (hst : Step .green s t) : Inv t := b
     · intro h'; simp [land] at h'
     -- A fresh writer still waits on whoever it did.
     · intro h'; simp only [land, reduceCtorEq, ↓reduceIte] at h' ⊢; exact hfresh h'
+  -- Case: the relief fails, first half: its failure is stored.
+  | failFlag h =>
+    -- Only the failure's two flags change: the facts stay.
+    exact ⟨⟨hw1, hw2⟩, hj, hwait, hfresh⟩
+  -- Case: the relief fails, second half: the unit is landed.
+  | failLand h =>
+    -- Each fact: the real code lands the unit; the fresh are as they were.
+    refine ⟨⟨?_, ?_⟩, ?_, ?_, ?_⟩
+    -- The gate and the holders are as they were.
+    · simp [land, hw1]
+    -- At most one.
+    · simp only [land, reduceCtorEq, ↓reduceIte]; omega
+    -- The gate and the job are as they were.
+    · simp [land, hj]
+    -- Nobody waits.
+    · intro h'; simp [land] at h'
+    -- A fresh writer still waits on whoever it did.
+    · intro h'; simp only [land, reduceCtorEq, ↓reduceIte] at h' ⊢; exact hfresh h'
+  -- Case: the relief succeeds again, and the record is cleared.
+  | recover h =>
+    -- Only the failure's record changes: the facts stay.
+    exact ⟨⟨hw1, hw2⟩, hj, hwait, hfresh⟩
+  -- Case: a stopped writer about to write is told the recorded failure and returns.
+  | toldFailing h1 h2 h3 =>
+    -- Only the count of writers about to write changes: the facts stay.
+    exact ⟨⟨hw1, hw2⟩, hj, hwait, hfresh⟩
+  -- Case: a contended writer that missed no progress registers and reads the recorded failure.
+  | registerFailingFresh h0 h1 h2 h3 =>
+    -- It missed no progress, so someone is on the way.
+    have hp : Pending s := hfresh h1
+    -- Each fact: the unit landed, everything else as it was.
+    refine ⟨⟨?_, ?_⟩, ?_, ?_, ?_⟩
+    -- The gate and the holders are as they were.
+    · simp [land, hw1]
+    -- At most one.
+    · simp only [land]; omega
+    -- The gate and the job are as they were.
+    · simp [land, hj]
+    -- Nobody waits.
+    · intro h'; simp [land] at h'
+    -- The remaining fresh writers wait on that someone.
+    · intro _; exact hp
+  -- Case: a contended writer that missed some progress registers and reads the recorded
+  -- failure.
+  | registerFailingStale h0 h1 h2 h3 =>
+    -- Each fact: the unit landed, the fresh are as they were.
+    refine ⟨⟨?_, ?_⟩, ?_, ?_, ?_⟩
+    -- The gate and the holders are as they were.
+    · simp [land, hw1]
+    -- At most one.
+    · simp only [land]; omega
+    -- The gate and the job are as they were.
+    · simp [land, hj]
+    -- Nobody waits.
+    · intro h'; simp [land] at h'
+    -- A fresh writer still waits on whoever it did.
+    · intro h'; exact hfresh h'
 
 /-- Every state the real code reaches has the facts. -/
 theorem inv_reach {s : State} (h : Reach .green s) : Inv s := by
@@ -756,7 +880,7 @@ theorem settled_step {s t : State} (hs : Settled s) (hst : Step .green s t) :
   -- A stale registration lands the unit in the real code.
   | registerStale h1 h2 => intro _ _; simp [land]
   -- A fresh registration adds a waiter, and only on an engine not latched.
-  | registerFresh hl h1 h2 =>
+  | registerFresh hl hf h1 h2 =>
     -- Suppose the engine is latched after the step: it was before it.
     intro hlatched _
     -- The step's condition says it was not, or the mode is the bug's.
@@ -783,6 +907,18 @@ theorem settled_step {s t : State} (hs : Settled s) (hst : Step .green s t) :
   | latchFlag h => intro _ hlanding; cases hlanding
   -- The landing: the unit is emptied.
   | latchLand h => intro _ _; simp [land]
+  -- The relief's failure is recorded or cleared: no waiter is added.
+  | failFlag h => exact hs
+  -- The record cleared: the same.
+  | recover h => exact hs
+  -- The failure's landing empties the unit.
+  | failLand h => intro _ _; simp [land]
+  -- A writer told the failure: no waiter is added.
+  | toldFailing h1 h2 h3 => exact hs
+  -- A registration that reads the recorded failure lands the unit.
+  | registerFailingFresh h0 h1 h2 h3 => intro _ _; simp [land]
+  -- The same for a stale one.
+  | registerFailingStale h0 h1 h2 h3 => intro _ _; simp [land]
 
 /-- Every state the real code reaches has the latch's fact. -/
 theorem settled_reach {s : State} (h : Reach .green s) : Settled s := by
@@ -803,6 +939,156 @@ theorem no_wait_once_latched {s : State} (h : Reach .green s) (hl : s.latched = 
   -- The latch's fact of the reachable state, applied.
   settled_reach h hl hd
 
+/-- The failing relief's fact: while the relief's failure is recorded and
+its landing is done, nobody waits. -/
+def Told (s : State) : Prop :=
+  -- Recorded, the landing done: no waiter.
+  s.failing = true → s.telling = false → s.waiting = 0
+
+/-- Every start has the failing relief's fact: nothing is recorded. -/
+theorem told_start (n : Nat) (b : Bool) : Told (start n b) := by
+  -- The start records no failure, so there is nothing to show.
+  intro h; simp [start] at h
+
+/-- Every step of the real code keeps the failing relief's fact. The only
+step that adds a waiter is a fresh registration, which the real code makes
+while no failure is recorded; the failure's own landing empties the unit;
+and a recovery clears the record, after which the fact asks nothing. -/
+theorem told_step {s t : State} (hs : Told s) (hst : Step .green s t) : Told t := by
+  -- One case per kind of step.
+  cases hst with
+  -- The job's steps leave the record and the waiters alone.
+  | jobStart h1 h2 => exact hs
+  -- The job's end: the same.
+  | jobEnd h => exact hs
+  -- The job's relief lands the unit: nobody waits.
+  | jobRelieveFree b h1 h2 => intro _ _; simp [land, count]
+  -- The job's relief left to a writer: no waiter is added.
+  | jobRelieveHeld h1 h2 => exact hs
+  -- A write, a relieving step, a contended step: no waiter is added.
+  | write b h1 h2 => exact hs
+  -- A relieving step's start: the same.
+  | relieve h1 h2 h3 => exact hs
+  -- A contended step: the writer is not on the unit yet, so the same.
+  | contend h1 h2 h3 => exact hs
+  -- The owed step's start: no waiter is added.
+  | owedTake h1 h2 => exact hs
+  -- The owed step contended: the writer returns, and no waiter is added.
+  | owedContended h1 h2 => exact hs
+  -- A step's end: no waiter is added.
+  | stepEnd b h => exact hs
+  -- A piece of progress lands the unit: nobody waits.
+  | refresh back hb h => intro _ _; simp [progress, lands, land, count]
+  -- A registration that finds the stop cleared lands the unit.
+  | clearedFresh h1 h2 => intro _ _; simp [land, count]
+  -- The same for a stale one.
+  | clearedStale h1 h2 => intro _ _; simp [land, count]
+  -- A stale registration lands the unit in the real code.
+  | registerStale h1 h2 => intro _ _; simp [land]
+  -- A fresh registration adds a waiter, and only while nothing is recorded.
+  | registerFresh hl hf h1 h2 =>
+    -- Suppose the failure is recorded after the step: it was before it.
+    intro hfailing _
+    -- The step's condition says it was not, or the mode is the bug's.
+    rcases hf with hf | hf
+    -- Not recorded and recorded: impossible.
+    · rw [hf] at hfailing; cases hfailing
+    -- The real code is not the bug.
+    · cases hf
+  -- A registration on a latched engine lands the unit.
+  | registerLatchedFresh h0 h1 h2 => intro _ _; simp [land]
+  -- The same for a stale one.
+  | registerLatchedStale h0 h1 h2 => intro _ _; simp [land]
+  -- A writer told the latch, an owed step that fails: no waiter is added.
+  | told h1 h2 => exact hs
+  -- An owed step that fails on a latched engine: no waiter is added.
+  | owedLatched h1 h2 => exact hs
+  -- A rotation's start: no waiter is added.
+  | rotate b h1 h2 h3 => exact hs
+  -- A rotation's progress lands the unit.
+  | rotated h => intro _ _; simp [progress, lands, land, count]
+  -- Not a step of the real code.
+  | rotateFailUncounted h0 h => exact absurd h0 (by decide)
+  -- The latch's flag: the record and the waiters are as they were.
+  | latchFlag h => exact hs
+  -- The latch's landing empties the unit.
+  | latchLand h => intro _ _; simp [land]
+  -- The failure is stored and the landing owed: nothing to show yet.
+  | failFlag h => intro _ htelling; cases htelling
+  -- The landing: the unit is emptied.
+  | failLand h => intro _ _; simp [land]
+  -- The record is cleared: the fact asks nothing.
+  | recover h => intro hfailing _; cases hfailing
+  -- A writer told the failure: no waiter is added.
+  | toldFailing h1 h2 h3 => exact hs
+  -- A registration that reads the recorded failure lands the unit.
+  | registerFailingFresh h0 h1 h2 h3 => intro _ _; simp [land]
+  -- The same for a stale one.
+  | registerFailingStale h0 h1 h2 h3 => intro _ _; simp [land]
+
+/-- Every state the real code reaches has the failing relief's fact. -/
+theorem told_reach {s : State} (h : Reach .green s) : Told s := by
+  -- By how `s` was reached.
+  induction h with
+  -- A start has it.
+  | start n b => exact told_start n b
+  -- A step keeps it.
+  | step _ hst ih => exact told_step ih hst
+
+/-- **`no_wait_once_failing`.** In every state the real code reaches, while
+the relief's failure is recorded and its landing is done, nobody waits: a
+write that arrives then is told the failure, so one that was already
+waiting has been told it too. -/
+theorem no_wait_once_failing {s : State} (h : Reach .green s) (hf : s.failing = true)
+    -- Its landing is done. The statement: no writer is waiting.
+    (hd : s.telling = false) : s.waiting = 0 :=
+  -- The failing relief's fact of the reachable state, applied.
+  told_reach h hf hd
+
+/-- **`no_fail_land_strands_a_waiter`.** Bug `noFailLand`: the stop is on;
+writer 1's relieving step takes the gate; writer 2 finds it held and waits;
+the relief fails, its failure is recorded, and nothing is landed. Writer 2
+waits while a fresh write would be told the failure. -/
+theorem no_fail_land_strands_a_waiter :
+    -- Some state the buggy steps reach has the failure recorded, its landing done, and a waiter.
+    ∃ s, Reach .noFailLand s ∧ s.failing = true ∧ s.telling = false ∧ s.waiting = 1 := by
+  -- The run, step by step from two writers and the stop on.
+  have h0 := Reach.start (m := .noFailLand) 2 true
+  -- Writer 1's step takes the gate.
+  have h1 := Reach.step h0 (Step.relieve _ (by decide) rfl rfl)
+  -- Writer 2 is stopped and contended.
+  have h2 := Reach.step h1 (Step.contend _ (by decide) rfl (by decide))
+  -- It registers, with nothing latched and nothing recorded, and waits.
+  have h3 := Reach.step h2 (Step.registerFresh _ (Or.inl rfl) (Or.inl rfl) (by decide) rfl)
+  -- The relief fails: its failure is recorded.
+  have h4 := Reach.step h3 (Step.failFlag _ rfl)
+  -- Its landing lands nothing.
+  have h5 := Reach.step h4 (Step.failLand _ rfl)
+  -- That last state has the failure recorded, with a waiter.
+  exact ⟨_, h5, rfl, rfl, rfl⟩
+
+/-- **`no_fail_recheck_strands_a_waiter`.** Bug `noFailRecheck`: the stop
+is on; writer 1's relieving step holds the gate; writer 2 finds it held; the
+relief fails, record and landing, with writer 2 not on the unit yet; writer
+2 registers without reading the record, and waits. -/
+theorem no_fail_recheck_strands_a_waiter :
+    -- Some state the buggy steps reach has the failure recorded, its landing done, and a waiter.
+    ∃ s, Reach .noFailRecheck s ∧ s.failing = true ∧ s.telling = false ∧ s.waiting = 1 := by
+  -- The run, step by step from two writers and the stop on.
+  have h0 := Reach.start (m := .noFailRecheck) 2 true
+  -- Writer 1's step takes the gate.
+  have h1 := Reach.step h0 (Step.relieve _ (by decide) rfl rfl)
+  -- Writer 2 is stopped and contended.
+  have h2 := Reach.step h1 (Step.contend _ (by decide) rfl (by decide))
+  -- The relief fails: its failure is recorded.
+  have h3 := Reach.step h2 (Step.failFlag _ rfl)
+  -- Its landing finds nobody on the unit.
+  have h4 := Reach.step h3 (Step.failLand _ rfl)
+  -- Writer 2 registers without reading the record, and waits.
+  have h5 := Reach.step h4 (Step.registerFresh _ (Or.inl rfl) (Or.inr rfl) (by decide) rfl)
+  -- That last state has the failure recorded, with a waiter.
+  exact ⟨_, h5, rfl, rfl, rfl⟩
+
 /-- **`no_latch_land_strands_a_waiter`.** Bug `noLatchLand`: the stop is
 on; writer 1's relieving step takes the gate; writer 2 finds it held and
 waits; the engine latches and lands nothing. Writer 2 waits on a latched
@@ -817,7 +1103,7 @@ theorem no_latch_land_strands_a_waiter :
   -- Writer 2 is stopped and contended.
   have h2 := Reach.step h1 (Step.contend _ (by decide) rfl (by decide))
   -- It registers, on an engine not latched, and waits.
-  have h3 := Reach.step h2 (Step.registerFresh _ (Or.inl rfl) (by decide) rfl)
+  have h3 := Reach.step h2 (Step.registerFresh _ (Or.inl rfl) (Or.inl rfl) (by decide) rfl)
   -- The engine latches: its flag is stored.
   have h4 := Reach.step h3 (Step.latchFlag _ rfl)
   -- Its landing lands nothing.
@@ -844,7 +1130,7 @@ theorem no_latch_recheck_strands_a_waiter :
   -- Its landing finds nobody on the unit.
   have h4 := Reach.step h3 (Step.latchLand _ rfl)
   -- Writer 2 registers without reading the flag, and waits.
-  have h5 := Reach.step h4 (Step.registerFresh _ (Or.inr rfl) (by decide) rfl)
+  have h5 := Reach.step h4 (Step.registerFresh _ (Or.inr rfl) (Or.inl rfl) (by decide) rfl)
   -- That last state is latched, with a waiter.
   exact ⟨_, h5, rfl, rfl, rfl⟩
 
@@ -863,7 +1149,7 @@ theorem no_rotate_refresh_strands_a_waiter :
   -- Writer 2 is stopped and contended.
   have h2 := Reach.step h1 (Step.contend _ (by decide) rfl (by decide))
   -- It registers and waits.
-  have h3 := Reach.step h2 (Step.registerFresh _ (Or.inl rfl) (by decide) rfl)
+  have h3 := Reach.step h2 (Step.registerFresh _ (Or.inl rfl) (Or.inl rfl) (by decide) rfl)
   -- Writer 1's flush ends with the stop still on.
   have h4 := Reach.step h3 (Step.stepEnd _ true (by decide))
   -- Its seal fails, and it returns with nothing counted.
@@ -884,7 +1170,7 @@ theorem no_relief_strands_a_waiter :
   -- The writer is stopped and contended.
   have h2 := Reach.step h1 (Step.contend _ (by decide) rfl (by decide))
   -- It registers and waits.
-  have h3 := Reach.step h2 (Step.registerFresh _ (Or.inl rfl) (by decide) rfl)
+  have h3 := Reach.step h2 (Step.registerFresh _ (Or.inl rfl) (Or.inl rfl) (by decide) rfl)
   -- The job ends, with no relief.
   have h4 := Reach.step h3 (Step.jobEnd _ rfl)
   -- That last state has only a waiter.
@@ -904,7 +1190,7 @@ theorem no_hand_back_strands_a_waiter :
   -- Writer 2 is stopped and contended.
   have h2 := Reach.step h1 (Step.contend _ (by decide) rfl (by decide))
   -- It registers and waits.
-  have h3 := Reach.step h2 (Step.registerFresh _ (Or.inl rfl) (by decide) rfl)
+  have h3 := Reach.step h2 (Step.registerFresh _ (Or.inl rfl) (Or.inl rfl) (by decide) rfl)
   -- Writer 1's step ends with the stop still on.
   have h4 := Reach.step h3 (Step.stepEnd _ true (by decide))
   -- Writer 1 counts its progress, which lands nothing, and gives up.
