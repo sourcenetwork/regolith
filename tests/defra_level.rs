@@ -13,6 +13,8 @@ use std::sync::Arc;
 use regolith::prelude::*;
 use regolith::{PerfContext, PerfLevel, TransactionError, TxnOptions, WouldBlock};
 
+mod common;
+
 /// Sums big-endian i64 deltas.
 struct CounterMerge;
 
@@ -130,7 +132,7 @@ fn concurrent_blind_merges_commit_where_repeatable_read_aborts() {
             }
             let second = second.commit();
             assert_eq!(
-                second.is_ok(),
+                common::committed(&second),
                 both_commit,
                 "{level:?} flush={flush}: {second:?}"
             );
@@ -268,7 +270,11 @@ fn an_identical_write_inside_a_scanned_commutative_prefix_commits() {
         supersede(&second, b"h/", b"h0");
         first.commit().unwrap();
         let second = second.commit();
-        assert_eq!(second.is_ok(), both_commit, "{level:?}: {second:?}");
+        assert_eq!(
+            common::committed(&second),
+            both_commit,
+            "{level:?}: {second:?}"
+        );
     }
 }
 
