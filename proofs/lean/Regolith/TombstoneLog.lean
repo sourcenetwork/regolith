@@ -33,6 +33,7 @@ least 1 and finds slot 0 written.
    (`horizon_first_breaks`).
 -/
 
+-- Everything below is named Regolith.TombstoneLog.<name>.
 namespace Regolith.TombstoneLog
 
 /-- Where the writer is inside one append, in the real order. -/
@@ -43,6 +44,7 @@ inductive Phase where
   | publish
   /-- Next: publish the horizon (the commit becomes visible). -/
   | commit
+  -- Lean may decide whether two phases are equal.
   deriving DecidableEq
 
 /-- The writer's state. -/
@@ -63,13 +65,17 @@ def start : Writer := ⟨fun _ => false, 0, 0, .write⟩
 inductive Step : Writer → Writer → Prop where
   /-- Write the tombstone into the next slot, `len`. -/
   | write (w : Writer) (h : w.phase = .write) :
+      -- After the step: slot `len` is written (every other slot is as before),
       Step w { w with written := fun i => if i = w.len then true else w.written i,
+                      -- and the next step is the publish.
                       phase := .publish }
   /-- Publish the length: the slot just written joins the prefix. -/
   | publish (w : Writer) (h : w.phase = .publish) :
+      -- After the step: the length is one more, and the next step is the commit.
       Step w { w with len := w.len + 1, phase := .commit }
   /-- Publish the horizon: the commit is visible, the append is done. -/
   | commit (w : Writer) (h : w.phase = .commit) :
+      -- After the step: the horizon is the length, and the writer is ready for the next append.
       Step w { w with horizon := w.len, phase := .write }
 
 /-- The writer states reachable from the start. -/
@@ -97,6 +103,7 @@ theorem inv_start : Inv start := by
 theorem inv_step {w v : Writer} (hi : Inv w) (hs : Step w v) : Inv v := by
   -- One case per step.
   cases hs with
+  -- Case: the write step.
   | write h =>
     -- Prove the three fields after the write.
     constructor
@@ -104,10 +111,15 @@ theorem inv_step {w v : Writer} (hi : Inv w) (hs : Step w v) : Inv v := by
     · intro i hi'
       -- Read the new state's fields as the old state's.
       dsimp only at hi' ⊢
+      -- Split on whether slot i is the slot just written.
       by_cases hil : i = w.len
-      · -- `i = len` is not below `len`: impossible.
+      -- `i = len` is not below `len`: impossible.
+      ·
+        -- Arithmetic: i is below `len` and equal to it.
         omega
-      · -- Another slot keeps its old bit, written because it is below.
+      -- Another slot keeps its old bit, written because it is below.
+      ·
+        -- Its bit did not change, and the old invariant says it was written.
         simp [hil]; exact hi.prefix_written i hi'
     -- The slot that will join next is `len`, just written.
     · intro _
@@ -115,6 +127,7 @@ theorem inv_step {w v : Writer} (hi : Inv w) (hs : Step w v) : Inv v := by
       simp
     -- Neither the length nor the horizon moved.
     · exact hi.horizon_le
+  -- Case: the publish step.
   | publish h =>
     -- Prove the three fields after the publish.
     constructor
@@ -122,16 +135,23 @@ theorem inv_step {w v : Writer} (hi : Inv w) (hs : Step w v) : Inv v := by
     · intro i hi'
       -- Read the new state's fields as the old state's.
       dsimp only at hi' ⊢
+      -- Split on whether slot i is the slot that just joined the prefix.
       by_cases hil : i = w.len
-      · -- Slot `len`: written before the publish (the write came first).
+      -- Slot `len`: written before the publish (the write came first).
+      ·
+        -- Replace i by `len`; during a publish step that slot is written, by the old invariant.
         subst hil; exact hi.next_written h
-      · -- A slot below the old length: written already.
+      -- A slot below the old length: written already.
+      ·
+        -- The old invariant, for a slot below the old length.
         exact hi.prefix_written i (by omega)
     -- The next step is a commit, not a publish: nothing to show.
     · intro hp
+      -- "commit = publish" is false, so the assumption cannot hold.
       simp at hp
     -- The length grew; the horizon did not.
     · dsimp only; have := hi.horizon_le; omega
+  -- Case: the commit step.
   | commit h =>
     -- Prove the three fields after the commit.
     constructor
@@ -139,6 +159,7 @@ theorem inv_step {w v : Writer} (hi : Inv w) (hs : Step w v) : Inv v := by
     · exact hi.prefix_written
     -- The next step is a write, not a publish: nothing to show.
     · intro hp
+      -- "write = publish" is false, so the assumption cannot hold.
       simp at hp
     -- The horizon catches up with the length, no further.
     · dsimp only; omega
@@ -146,13 +167,18 @@ theorem inv_step {w v : Writer} (hi : Inv w) (hs : Step w v) : Inv v := by
 /-- **The writer's half, for every reachable state.** Every slot below the
 published length is written, and the horizon never passes the length. -/
 theorem writer_inv_reachable {w : Writer} (h : Reachable w) :
+    -- The statement: every slot below the published length is written, and the horizon is at most
+    -- the length.
     (∀ i, i < w.len → w.written i = true) ∧ w.horizon ≤ w.len := by
   -- Induction on how the state was reached ...
   have hi : Inv w := by
+    -- Go through the steps that reached the state, one at a time.
     induction h with
+    -- No step: the start.
     | start =>
       -- The start satisfies it.
       exact inv_start
+    -- The steps so far, then one more.
     | step _ hs ih =>
       -- One more step keeps it.
       exact inv_step ih hs
@@ -186,6 +212,7 @@ structure History where
 /-- **`PrefixWhole`.** A reader that read the length at `t0` and slot `i`
 below it at a later moment `t1` finds the slot written. -/
 theorem prefix_whole (h : History) {t0 t1 i : Nat} (hlen : i < h.L t0) (hlater : t0 ≤ t1) :
+    -- The statement: at the later moment the slot is written.
     h.W t1 i = true := by
   -- Written by `t0`, since it was in the prefix then, and still written.
   exact h.written_stays t0 t1 i hlater (h.prefix_written t0 i hlen)
@@ -194,6 +221,7 @@ theorem prefix_whole (h : History) {t0 t1 i : Nat} (hlen : i < h.L t0) (hlater :
 the length at a later moment `t1` read a length at least the horizon it
 sampled: it reads every tombstone its snapshot includes. -/
 theorem published_seen (h : History) {t0 t1 : Nat} (hlater : t0 ≤ t1) :
+    -- The statement: the length read later is at least the horizon sampled earlier.
     h.H t0 ≤ h.L t1 := by
   -- The horizon was within the length at `t0`, and the length only rose.
   exact Nat.le_trans (h.horizon_le t0) (h.len_rises t0 t1 hlater)
@@ -204,7 +232,9 @@ theorem published_seen (h : History) {t0 t1 : Nat} (hlater : t0 ≤ t1) :
 state with length 1 and slot 0 unwritten: a reader reading slot 0 then sees
 an append before its contents. -/
 theorem len_first_breaks :
+    -- w is the state the bug reaches from the start: the length is 1 and nothing is written.
     let w : Writer := { start with len := 1 }
+    -- The statement: slot 0 is below the length, yet not written.
     0 < w.len ∧ w.written 0 = false := by
   -- Evaluate.
   decide
@@ -213,9 +243,13 @@ theorem len_first_breaks :
 state with horizon 1 and length 0: a reader that samples horizon 1 and then
 reads the length reads 0, missing the tombstone its snapshot includes. -/
 theorem horizon_first_breaks :
+    -- w is the state the bug reaches from the start: slot 0 is written and the horizon is 1, but
+    -- the length is still 0.
     let w : Writer := { start with written := fun i => i = 0, horizon := 1 }
+    -- The statement: the length is below the horizon.
     w.len < w.horizon := by
   -- Evaluate.
   decide
 
+-- End of the namespace opened at the top.
 end Regolith.TombstoneLog
