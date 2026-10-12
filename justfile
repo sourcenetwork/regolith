@@ -390,6 +390,7 @@ tla:
     check MC_RepeatableRead_Red_ReadCommitted          RED INV_NoStaleDefinition
     check MC_DefraLevel_Green_Heads                    GREEN
     check MC_DefraLevel_Green_Counters                 GREEN
+    check MC_DefraLevel_Green_Counters_Clear           GREEN
     check MC_DefraLevel_Green_Migrations               GREEN
     check MC_DefraLevel_Red_RepeatableRead_Merges      RED INV_DuplicateMergesCommit
     check MC_DefraLevel_Red_NoPolicy                   RED INV_DuplicateMergesCommit
