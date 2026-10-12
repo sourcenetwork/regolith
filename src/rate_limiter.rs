@@ -39,10 +39,14 @@ pub enum Priority {
 
 /// A byte-denominated rate limiter.
 ///
-/// Implementations throttle callers of [`RateLimiter::request`] to at
-/// most `get_bytes_per_second()` bytes over time. Requests block until
-/// quota is available; shutdown (on drop or via an implementation-
-/// specific `stop()` call) must release every blocked request.
+/// Implementations throttle callers of [`RateLimiter::request`] to the
+/// rate they were built for. Requests block until quota is available;
+/// shutdown (on drop or via an implementation-specific `stop()` call) must
+/// release every blocked request.
+///
+/// The trait is the one call regolith makes. How a limiter is tuned and
+/// what it reports are its own: [`TokenBucketRateLimiter`] has methods for
+/// both, on the type.
 ///
 /// regolith calls it only on its compaction worker threads, never on a
 /// caller's thread, so a blocking `request` never blocks a caller.
@@ -53,17 +57,11 @@ pub enum Priority {
 pub trait RateLimiter: Send + Sync + 'static {
     /// Request `bytes` worth of I/O quota. Blocks until the request is
     /// served or the limiter is shut down.
+    ///
+    /// regolith asks once for each table a flush or a compaction wrote on
+    /// a worker, with the table's size on disk, before the table is
+    /// installed, and always at [`Priority::Low`].
     fn request(&self, bytes: u64, pri: Priority);
-
-    /// Update the refill rate. Takes effect for the requests after it.
-    fn set_bytes_per_second(&self, bytes_per_second: u64);
-
-    /// Return the currently configured refill rate in bytes/sec.
-    fn get_bytes_per_second(&self) -> u64;
-
-    /// Total bytes successfully served at `pri` since construction.
-    /// Excludes in-flight requests.
-    fn get_total_bytes_through(&self, pri: Priority) -> u64;
 }
 
 thread_local! {
@@ -231,6 +229,47 @@ impl TokenBucketRateLimiter {
             Priority::Low => self.total_low.fetch_add(bytes, Ordering::Relaxed),
         };
     }
+
+    /// Change the refill rate, for the requests after this call. The bytes
+    /// still owed are carried over at the new rate, so the change takes
+    /// effect cleanly from now.
+    pub fn set_bytes_per_second(&self, bytes_per_second: u64) {
+        let old = self.rate.swap(bytes_per_second, Ordering::AcqRel);
+        let (Some(now), true) = (
+            crate::env::platform_nanos(),
+            old > 0 && bytes_per_second > 0,
+        ) else {
+            return;
+        };
+        let mut current = self.paid_until.load(Ordering::Acquire);
+        loop {
+            let owed = bytes_for(current.saturating_sub(now), old);
+            let next = now.saturating_add(nanos_for(owed, bytes_per_second));
+            match self.paid_until.compare_exchange_weak(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return,
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
+    /// The refill rate, in bytes per second.
+    pub fn get_bytes_per_second(&self) -> u64 {
+        self.rate.load(Ordering::Acquire)
+    }
+
+    /// Total bytes served at `pri` since construction. Excludes requests
+    /// still waiting.
+    pub fn get_total_bytes_through(&self, pri: Priority) -> u64 {
+        match pri {
+            Priority::High => self.total_high.load(Ordering::Relaxed),
+            Priority::Low => self.total_low.load(Ordering::Relaxed),
+        }
+    }
 }
 
 impl Drop for TokenBucketRateLimiter {
@@ -257,43 +296,6 @@ impl RateLimiter for TokenBucketRateLimiter {
         let ready_at = self.reserve(bytes, rate, now);
         if pri == Priority::High || self.wait_until(ready_at) {
             self.count(bytes, pri);
-        }
-    }
-
-    /// Change the rate. The bytes still owed are carried over at the new
-    /// rate, so the change takes effect cleanly from now.
-    fn set_bytes_per_second(&self, bytes_per_second: u64) {
-        let old = self.rate.swap(bytes_per_second, Ordering::AcqRel);
-        let (Some(now), true) = (
-            crate::env::platform_nanos(),
-            old > 0 && bytes_per_second > 0,
-        ) else {
-            return;
-        };
-        let mut current = self.paid_until.load(Ordering::Acquire);
-        loop {
-            let owed = bytes_for(current.saturating_sub(now), old);
-            let next = now.saturating_add(nanos_for(owed, bytes_per_second));
-            match self.paid_until.compare_exchange_weak(
-                current,
-                next,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => return,
-                Err(actual) => current = actual,
-            }
-        }
-    }
-
-    fn get_bytes_per_second(&self) -> u64 {
-        self.rate.load(Ordering::Acquire)
-    }
-
-    fn get_total_bytes_through(&self, pri: Priority) -> u64 {
-        match pri {
-            Priority::High => self.total_high.load(Ordering::Relaxed),
-            Priority::Low => self.total_low.load(Ordering::Relaxed),
         }
     }
 }
@@ -471,13 +473,6 @@ mod tests {
         fn request(&self, bytes: u64, _: Priority) {
             self.0.fetch_add(bytes, Ordering::SeqCst);
         }
-        fn set_bytes_per_second(&self, _: u64) {}
-        fn get_bytes_per_second(&self) -> u64 {
-            0
-        }
-        fn get_total_bytes_through(&self, _: Priority) -> u64 {
-            self.0.load(Ordering::SeqCst)
-        }
     }
 
     /// The engine throttles a worker thread only: a caller's thread never
@@ -506,13 +501,6 @@ mod tests {
         impl RateLimiter for Panics {
             fn request(&self, _: u64, _: Priority) {
                 panic!("limiter panics");
-            }
-            fn set_bytes_per_second(&self, _: u64) {}
-            fn get_bytes_per_second(&self) -> u64 {
-                0
-            }
-            fn get_total_bytes_through(&self, _: Priority) -> u64 {
-                0
             }
         }
         let limiter: Arc<dyn RateLimiter> = Arc::new(Panics);

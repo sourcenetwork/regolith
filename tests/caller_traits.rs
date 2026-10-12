@@ -1,0 +1,22 @@
+//! Every method of every trait a caller implements is called by regolith,
+//! with the caller's own data.
+//!
+//! One module per trait: an implementation that records every call, a small
+//! workload that reaches each method, and an assertion per method on what it
+//! was handed.
+//!
+//! The traits whose every call already has such a test are covered where
+//! their keys are: `MergeOperator` in `tests/merge_operator_key.rs`,
+//! `CompactionFilter` in `tests/compaction_filter_key.rs`, `PrefixExtractor`
+//! in `tests/prefix_extractor_key.rs`, and `TransactionHooks` with a
+//! transaction's own callbacks in `tests/transaction_callbacks.rs`. Their
+//! `name` methods are asked here.
+
+// Native-only. wasm-pack builds every test target for wasm32, and the browser
+// suite lives in tests/wasm_opfs*.rs.
+#![cfg(not(target_arch = "wasm32"))]
+
+/// The `#[path]` attributes are what keep `tests/caller_traits/` from being
+/// picked up as test binaries of their own.
+#[path = "caller_traits/rate_limiter.rs"]
+mod rate_limiter;
