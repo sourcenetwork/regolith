@@ -47,23 +47,45 @@ fn a_tombstone_free_memtable_answers_from_the_gate_alone() {
 /// with a release store after each append, the way the commit leader
 /// publishes the read horizon after applying; a reader that acquires `p`
 /// must find tombstone `p`.
+///
+/// The writer holds its second append back until every reader has looked the
+/// first one up, so every reader runs beside the appends on any number of
+/// cores: left to the scheduler, a writer on one core can finish all its
+/// appends before a reader thread runs once.
 #[test]
 fn a_read_sees_every_range_delete_published_before_it_while_appends_continue() {
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as StdOrdering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering as StdOrdering};
     // Sized for the interpreter under miri: each lookup walks the tombstones
     // appended so far, so the cost is quadratic in this, and 3000 does not
     // finish there in an hour. The race it checks is the same at 40.
     const APPENDS: u64 = if cfg!(miri) { 40 } else { 3_000 };
+    const READERS: usize = 4;
+
+    /// Tells the writer a reader failed, so it stops waiting for that reader
+    /// and the failure is reported instead of a wait that never ends.
+    struct FailedReader<'a>(&'a AtomicBool);
+    impl Drop for FailedReader<'_> {
+        fn drop(&mut self) {
+            if std::thread::panicking() {
+                self.0.store(true, StdOrdering::Release);
+            }
+        }
+    }
+
     let mt = memtable();
     let published = AtomicU64::new(0);
     let done = AtomicBool::new(false);
+    let looked_up = AtomicUsize::new(0);
+    let reader_failed = AtomicBool::new(false);
     std::thread::scope(|scope| {
-        for _ in 0..4 {
+        for _ in 0..READERS {
             scope.spawn(|| {
+                let _failed = FailedReader(&reader_failed);
                 let mut lookups = 0u64;
                 while !done.load(StdOrdering::Acquire) {
                     let p = published.load(StdOrdering::Acquire);
                     if p == 0 {
+                        std::thread::yield_now();
                         continue;
                     }
                     let key = format!("k{p:06}").into_bytes();
@@ -73,6 +95,9 @@ fn a_read_sees_every_range_delete_published_before_it_while_appends_continue() {
                         "a range delete published before this read was not seen"
                     );
                     lookups += 1;
+                    if lookups == 1 {
+                        looked_up.fetch_add(1, StdOrdering::Release);
+                    }
                 }
                 assert!(lookups > 0, "a reader never ran a lookup");
             });
@@ -82,6 +107,13 @@ fn a_read_sees_every_range_delete_published_before_it_while_appends_continue() {
             let end = format!("k{seq:06}\x00").into_bytes();
             mt.delete_range(&start, &end, seq);
             published.store(seq, StdOrdering::Release);
+            if seq == 1 {
+                while looked_up.load(StdOrdering::Acquire) < READERS
+                    && !reader_failed.load(StdOrdering::Acquire)
+                {
+                    std::thread::yield_now();
+                }
+            }
         }
         done.store(true, StdOrdering::Release);
     });
