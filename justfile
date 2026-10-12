@@ -59,9 +59,10 @@ cov-summary:
     # heavier soaks into timeouts that say nothing about the code.
     cargo llvm-cov nextest --summary-only --workspace --profile ci --ignore-filename-regex '(^|/)tools/'
 
-# The browsable HTML report, for reading locally.
+# The browsable HTML report, for reading locally. Through nextest and its
+# `ci` profile, for the reasons `cov-summary` gives.
 cov:
-    cargo llvm-cov --workspace --html --ignore-filename-regex '(^|/)tools/'
+    cargo llvm-cov nextest --html --workspace --profile ci --ignore-filename-regex '(^|/)tools/'
     @echo "report: target/llvm-cov/html/index.html"
 
 # ── suites CI runs as their own jobs, split by mechanism ─────
