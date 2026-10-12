@@ -1,0 +1,302 @@
+//! Loom models that need the crate-private half of `regolith::sync`.
+//!
+//! `tests/loom_sync.rs` drives the primitives through their public API,
+//! which cannot see how often a drain passes. The model here wraps the
+//! semaphore's [`Policy`] to count the passes of the drain one waiter runs,
+//! so it lives inside the crate and `tests/loom_sync.rs` calls it through
+//! `regolith::loom_exports`.
+//!
+//! What it checks (defect E32): a waiter that queues takes the drain role
+//! in the same poll when nobody holds it. While it serves the queue, the
+//! holder lets go and another caller keeps taking the permit and giving it
+//! back. Every release that finds no nudge on its way asks for another
+//! pass, so the waiter's drain must not be left without one: once the
+//! waiter's own node is nudged, the marker of that nudge stays up until the
+//! waiter looks, releases stop asking for passes, the drain ends, and the
+//! waiter retries. The model asserts that no drain the waiter runs takes
+//! more than [`MOST_PASSES`] passes and that the waiter is served.
+//!
+//! The calibration rebuilds the marker out of plain loom atomics the way it
+//! was written before the fix (a nudge that finds its waiter already nudged
+//! lowers the marker) and must fail: the drain passes once more for every
+//! release.
+
+use core::cell::Cell;
+use core::task::Waker;
+use std::sync::Arc as StdArc;
+use std::sync::atomic::{AtomicUsize as StdAtomicUsize, Ordering as StdOrdering};
+
+use loom::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use loom::sync::{Arc, Notify};
+use loom::thread;
+
+use super::contend::{self, Contend, Lock};
+use super::queue::{Arrivals, Policy, QUEUED, Step, WaitQueue};
+use super::raw_semaphore::RawSemaphore;
+use super::waiter::{Wait, WakeList};
+
+/// The most passes one drain of the waiter may run in these models: the
+/// pass it starts with, one more for the releases that found no nudge out
+/// before its node was nudged, and one more for a release that had put its
+/// permit back before the marker went up and asked for its pass after.
+const MOST_PASSES: usize = 3;
+
+/// How many times the other thread takes the permit back and lets it go:
+/// with its first release, one release more than [`MOST_PASSES`] allows a
+/// drain to answer with a pass of its own.
+const BARGES: usize = 2;
+
+/// Runs `model` under loom with at most `preemptions` preemptions per
+/// schedule (`LOOM_MAX_PREEMPTIONS` overrides it), prints how large the
+/// search was, and fails it if the search was implausibly small or never
+/// reached the state the model is about (`witnessed`).
+fn explore(
+    name: &'static str,
+    preemptions: usize,
+    min_interleavings: usize,
+    min_witnessed: usize,
+    model: impl Fn(&StdAtomicUsize) + Sync + Send + 'static,
+) {
+    let runs = StdArc::new(StdAtomicUsize::new(0));
+    let witnessed = StdArc::new(StdAtomicUsize::new(0));
+    let counted = {
+        let (runs, witnessed) = (StdArc::clone(&runs), StdArc::clone(&witnessed));
+        move || {
+            model(&witnessed);
+            runs.fetch_add(1, StdOrdering::Relaxed);
+        }
+    };
+    let mut builder = loom::model::Builder::new();
+    builder.preemption_bound = builder.preemption_bound.or(Some(preemptions));
+    builder.check(counted);
+    let explored = runs.load(StdOrdering::Relaxed);
+    let reached = witnessed.load(StdOrdering::Relaxed);
+    println!("loom model {name}: {explored} interleavings explored, {reached} witnessed");
+    assert!(
+        explored >= min_interleavings,
+        "{name} explored only {explored} interleavings, below the {min_interleavings} floor"
+    );
+    assert!(
+        reached >= min_witnessed,
+        "{name} reached its interesting state {reached} times, below the {min_witnessed} floor"
+    );
+}
+
+/// The semaphore, with the passes of each drain this thread runs counted.
+///
+/// A poll can run several drains, one for each state change it has to
+/// publish: queueing, the attempt that raises the owed bit, leaving the
+/// queue. Each of those begins at a call this wrapper sees, so it starts a
+/// new count there and keeps the largest.
+struct Counted<'a> {
+    sem: &'a RawSemaphore,
+    passes: Cell<usize>,
+    most: Cell<usize>,
+}
+
+impl Counted<'_> {
+    /// What came before belongs to another drain: close its count.
+    fn next_drain(&self) {
+        self.most.set(self.most.get().max(self.passes.get()));
+        self.passes.set(0);
+    }
+
+    /// The most passes any one drain ran since the last call.
+    fn take_most(&self) -> usize {
+        self.next_drain();
+        self.most.replace(0)
+    }
+}
+
+impl Policy for Counted<'_> {
+    fn queue(&self) -> &WaitQueue {
+        self.sem.queue()
+    }
+
+    fn pass(&self, arrivals: Arrivals, woken: &mut WakeList<'_>, wake_front: bool) -> usize {
+        self.passes.set(self.passes.get() + 1);
+        self.sem.pass(arrivals, woken, wake_front)
+    }
+
+    /// As the provided method, with the drain it may run counted on its
+    /// own.
+    fn enqueue(&self, wait: &mut Wait, payload: usize, waker: &Waker) {
+        wait.enqueue(self.queue(), payload, waker);
+        self.next_drain();
+        self.transition(|state| Step::Drain(state | QUEUED));
+        self.next_drain();
+    }
+}
+
+impl Lock for Counted<'_> {
+    fn admit(&self, state: usize, need: usize) -> Option<usize> {
+        self.sem.admit(state, need)
+    }
+
+    fn give_back(&self, need: usize) {
+        self.sem.give_back(need);
+    }
+
+    /// As the provided method; what follows a successful attempt is the
+    /// drain of leaving the queue, counted on its own.
+    fn try_take(&self, need: usize) -> Result<(), usize> {
+        self.next_drain();
+        contend::take(self, need, false)
+    }
+
+    /// As the provided method, with the drain it may run counted on its
+    /// own.
+    fn take_or_owe(&self, wait: &Wait, need: usize) -> Result<(), usize> {
+        self.next_drain();
+        let attempt = self.owe_or_take(wait, |state| self.admit(state, need));
+        self.next_drain();
+        attempt
+    }
+}
+
+/// Wakes the loom thread parked on it.
+struct Unpark(Notify);
+
+impl std::task::Wake for Unpark {
+    fn wake(self: StdArc<Self>) {
+        self.0.notify();
+    }
+
+    fn wake_by_ref(self: &StdArc<Self>) {
+        self.0.notify();
+    }
+}
+
+/// A waiter queues behind a holder and, when nobody holds the drain role,
+/// serves the queue itself. The holder lets go, and takes the permit back
+/// and lets it go [`BARGES`] more times. No drain of the waiter runs more
+/// than [`MOST_PASSES`] passes, the waiter gets the permit, and no permit
+/// is lost.
+pub fn a_waiter_serving_the_queue_is_served_while_the_holder_barges() {
+    explore(
+        "a_waiter_serving_the_queue_is_served_while_the_holder_barges",
+        3,
+        100,
+        1,
+        |witnessed| {
+            let sem = Arc::new(RawSemaphore::new(1));
+            assert!(sem.try_acquire(1), "free at the start");
+            let holder = {
+                let sem = Arc::clone(&sem);
+                thread::spawn(move || {
+                    sem.release(1);
+                    for _ in 0..BARGES {
+                        // Lets the waiter run between two releases without
+                        // spending one of the model's few preemptions, so
+                        // each release can land in a pass of its own.
+                        thread::yield_now();
+                        if sem.try_acquire(1) {
+                            sem.release(1);
+                        }
+                    }
+                })
+            };
+            let counted = Counted {
+                sem: &sem,
+                passes: Cell::new(0),
+                most: Cell::new(0),
+            };
+            let park = StdArc::new(Unpark(Notify::new()));
+            let waker = Waker::from(StdArc::clone(&park));
+            let mut contend = Contend::new();
+            loop {
+                let polled = contend.poll(&counted, 1, &waker);
+                let passes = counted.take_most();
+                if passes > 1 {
+                    // A release asked for a pass while a drain worked.
+                    witnessed.fetch_add(1, StdOrdering::Relaxed);
+                }
+                assert!(
+                    passes <= MOST_PASSES,
+                    "the drain ran {passes} passes for the waiter that holds it"
+                );
+                if polled.is_ready() {
+                    break;
+                }
+                park.0.wait();
+            }
+            holder.join().expect("holder");
+            sem.release(1);
+            assert_eq!(sem.available(), 1, "a permit was lost or made up");
+        },
+    );
+}
+
+/// The marker of an outstanding nudge, written the way it was before E32
+/// was fixed: a pass that nudges a waiter already nudged lowers the marker
+/// again. Every release after that finds the marker down and asks for a
+/// pass, so the waiter that holds the drain role passes once more for
+/// each: more than [`MOST_PASSES`] times.
+pub fn calibration_a_marker_lowered_on_a_pending_nudge_keeps_the_drain_passing() {
+    const DRAINING: usize = 1;
+    const DIRTY: usize = 1 << 1;
+    const NUDGE_OUT: usize = 1 << 2;
+    const FREE: usize = 1 << 3;
+    explore(
+        "calibration_a_marker_lowered_on_a_pending_nudge_keeps_the_drain_passing",
+        3,
+        0,
+        0,
+        |_witnessed| {
+            // The waiter has queued and holds the drain role; the other
+            // thread holds the lock.
+            let state = Arc::new(AtomicUsize::new(DRAINING));
+            // The waiter's own node: whether it carries a nudge.
+            let nudged = Arc::new(AtomicBool::new(false));
+            let holder = {
+                let state = Arc::clone(&state);
+                thread::spawn(move || {
+                    for _ in 0..=BARGES {
+                        // A release: the permit goes back, and unless a
+                        // nudge is out it asks for a pass. The role is
+                        // taken, so asking is raising the dirty bit.
+                        let before = state.fetch_or(FREE, Ordering::AcqRel);
+                        if before & NUDGE_OUT == 0 {
+                            state.fetch_or(DIRTY, Ordering::AcqRel);
+                        }
+                        // The permit is taken straight back.
+                        state.fetch_and(!FREE, Ordering::AcqRel);
+                        thread::yield_now();
+                    }
+                })
+            };
+            let mut passes = 0;
+            loop {
+                state.fetch_and(!DIRTY, Ordering::AcqRel);
+                passes += 1;
+                // The pass nudges the front waiter, which is this thread's
+                // own node: marker up first, then the node.
+                state.fetch_or(NUDGE_OUT, Ordering::AcqRel);
+                let already = nudged.swap(true, Ordering::AcqRel);
+                if already {
+                    // The defect: the nudge found its waiter nudged already
+                    // and is taken for "no nudge is out".
+                    state.fetch_and(!NUDGE_OUT, Ordering::AcqRel);
+                }
+                let seen = state.load(Ordering::Acquire);
+                if seen & DIRTY == 0
+                    && state
+                        .compare_exchange(
+                            seen,
+                            seen & !DRAINING,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_ok()
+                {
+                    break;
+                }
+            }
+            holder.join().expect("holder");
+            assert!(
+                passes <= MOST_PASSES,
+                "the drain ran {passes} passes for the waiter that holds it"
+            );
+        },
+    );
+}

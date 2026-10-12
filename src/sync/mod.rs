@@ -73,6 +73,9 @@ pub(crate) mod internal;
 mod latch;
 mod lazy;
 mod list;
+#[cfg(loom)]
+#[doc(hidden)]
+pub mod loom_model;
 mod mutex;
 mod notify;
 mod once_cell;

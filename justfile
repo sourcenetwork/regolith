@@ -284,7 +284,7 @@ loom-debug:
     RUSTFLAGS="--cfg loom" timeout 10m cargo test --test loom_memtable
 
 # Loom models for `regolith::sync`: every primitive's wait protocol,
-# with two calibrations that must fail. Release only: the larger models
+# with three calibrations that must fail. Release only: the larger models
 # explore 0.1 to 0.4 million interleavings each (about four minutes in
 # all), which a debug build multiplies several times over.
 loom-sync:
@@ -480,16 +480,17 @@ tla:
     check MC_DefraLevel_Red_ReasonNewestWrite          RED INV_ReasonsExact
     # E1. Lean: Regolith/LsmOrder.lean, compact_range_reads_newest.
     spec=LsmOrder
+    # E31, a flush's table and its memtable's retirement are one publication.
+    # Lean: Regolith/LsmOrder.lean, flush_keeps_sources_disjoint,
+    # split_install_holds_a_memtable_twice.
+    check MC_LsmOrder_Red_SplitRetire                  RED NoDoubleSource
     check MC_LsmOrder_Green                            GREEN
     check MC_LsmOrder_Red_Intersect                    RED ReadNewest
-    # Flush order, a flush's one publication of its table and its memtable's
-    # retirement (E31), ingest placement, overlap demotion (E14, D13), binary
+    # Flush order, ingest placement, overlap demotion (E14, D13), binary
     # search. Lean: Regolith/LsmOrder.lean, install_oldest_same_order,
-    # flush_keeps_sources_disjoint, split_install_holds_a_memtable_twice,
     # ingest_ordered, demote_reads_newest, level_read_bsearch.
     check MC_LsmOrder_Green_Flush                      GREEN
     check MC_LsmOrder_Red_FlushAnyOrder                RED ReadNewest
-    check MC_LsmOrder_Red_SplitRetire                  RED NoDoubleSource
     check MC_LsmOrder_Green_Ingest                     GREEN
     check MC_LsmOrder_Red_IngestIgnoresUpper           RED ReadNewest
     check MC_LsmOrder_Green_Demote                     GREEN
@@ -671,8 +672,9 @@ tla:
     check MC_CommitPipeline_Red_ValidatePublished      RED NoLostUpdate
     # R13 and D53, non-blocking reads on per-thread I/O queues: single-flight
     # units claimed by one CAS, completions only on the asking queue, idle
-    # wakeups. Lean: Regolith/IoQueue.lean, claim_once, told_exactly_once,
-    # no_lost_idle_wakeup, busy_never_woken, single_thread_finishes.
+    # wakeups. Lean: Regolith/IoQueue.lean, claim_once, told_at_most_once,
+    # every_waiter_told, no_lost_idle_wakeup, busy_never_woken,
+    # single_thread_finishes.
     spec=NonBlocking
     check MC_NonBlocking_Green_Pool                    GREEN
     check MC_NonBlocking_Green_PoolLive                GREEN
