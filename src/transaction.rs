@@ -2493,7 +2493,14 @@ mod tests {
     /// write.
     fn probe_slowdown_ticker(plain: &Db, stats: &Statistics, begin: impl Fn() -> Transaction) {
         let payload = vec![0xCDu8; 600];
-        for i in 0..128 {
+        for i in 0..64 {
+            let k = format!("k{i:04}");
+            plain.put(k.as_bytes(), &payload).unwrap();
+        }
+        // The worker writes the sealed memtables out off the commit path;
+        // the writes after that pay the slowdown.
+        crate::tests::wait_for_l0_files(plain, 2);
+        for i in 64..128 {
             let k = format!("k{i:04}");
             plain.put(k.as_bytes(), &payload).unwrap();
         }
@@ -2567,7 +2574,14 @@ mod tests {
         let db = OptimisticTransactionDb::open(dir.path(), slowdown_opts(&stats)).unwrap();
 
         let payload = vec![0xCDu8; 600];
-        for i in 0..128 {
+        for i in 0..64 {
+            let k = format!("k{i:04}");
+            db.db().put(k.as_bytes(), &payload).unwrap();
+        }
+        // The worker writes the sealed memtables out off the commit path;
+        // the writes after that pay the slowdown.
+        crate::tests::wait_for_l0_files(db.db(), 2);
+        for i in 64..128 {
             let k = format!("k{i:04}");
             db.db().put(k.as_bytes(), &payload).unwrap();
         }
