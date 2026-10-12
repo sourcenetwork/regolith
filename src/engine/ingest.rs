@@ -453,7 +453,10 @@ impl RegolithEngine {
         // thread reaches its slot runs it, with every earlier commit
         // published and no later one decided until the table is installed
         // and its sequence published.
-        self.ordered(move |engine, ord| engine.install_ordered(ord, table, behind, &probed))
+        // The install may flush the memtables holding a key of the table.
+        self.ordered_needing(super::commit::Needs::FLUSH, move |engine, ord| {
+            engine.install_ordered(ord, table, behind, &probed)
+        })
     }
 
     /// [`Self::install`] in the ordered step.

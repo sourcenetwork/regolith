@@ -8,6 +8,12 @@
 //! commit ahead of its own and never waits for another thread to be
 //! scheduled; a blocking call waits only for device I/O under way.
 //!
+//! A blocking call that finds a round, an ordered unit or the version
+//! store's step claimed by another thread waits for that thread, so one
+//! descheduled for good while it holds such a claim holds up the blocking
+//! commits behind it. A queue's poll never waits for another thread: the
+//! job it steps parks instead (`park.rs`).
+//!
 //! An optimistic transaction's commit is a slot like any write (E10). It is
 //! decided in ring order against the view, which by then holds every commit
 //! decided before it (`GroupCommit.tla`, `group_eq_serial` in
@@ -64,6 +70,7 @@ pub(crate) mod hook;
 #[cfg(loom)]
 pub mod loom_model;
 mod ordered;
+mod park;
 mod pipeline;
 mod range_rule;
 mod read_mode;
@@ -85,6 +92,7 @@ pub(crate) use descriptor::After;
 use descriptor::{Descriptor, Work};
 use early::EarlyVerdict;
 pub(crate) use ordered::Ordered;
+pub(crate) use park::Needs;
 pub(crate) use pipeline::Pipeline;
 use replaced::Replaced;
 pub(crate) use request::WriteRequest;
@@ -580,6 +588,9 @@ mod limit_tests;
 
 #[cfg(test)]
 mod landing_tests;
+
+#[cfg(test)]
+mod park_tests;
 
 #[cfg(test)]
 mod pipeline_order_tests;

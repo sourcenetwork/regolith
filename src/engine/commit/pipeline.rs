@@ -38,7 +38,9 @@
 //! blocking call does wait for device I/O that is under way: a sync round
 //! another thread claimed, or an ordered unit (`ordered.rs`) another thread
 //! is running. A call made through `commit_nowait` waits for neither: it
-//! leaves the unit on its queue and returns.
+//! leaves the unit on its queue and returns. The queue's poll, which then
+//! runs the unit, waits for nothing another thread has either: the unit
+//! parks (`park.rs`).
 //!
 //! # Invariants
 //!
@@ -83,6 +85,7 @@ use super::descriptor::{
     WRITING, WRITTEN, Work, is_immediate,
 };
 use super::hook;
+use super::park::Help;
 use super::request::Ops;
 use super::ring::{ArcSlot, Installed, Loaded, Ring};
 use super::round::Round;
@@ -239,23 +242,23 @@ impl RegolithEngine {
     /// whenever a helper voided the one in hand. Returns the index.
     pub(super) fn enter(&self, pipe: &Pipeline, desc: &RingArc<Descriptor>) -> u64 {
         loop {
-            match self.try_enter(pipe, desc, true) {
+            match self.try_enter(pipe, desc, Help::Wait) {
                 Ok(index) => return index,
-                // Only a call that may not run a unit hands one back.
+                // A unit this thread may not run itself: the decision of a
+                // slot that reads the device (`read_mode.rs`).
                 Err(job) => self.run_or_wait(&job),
             }
         }
     }
 
-    /// [`Self::enter`] for a call that may not wait when `can_run` is unset:
-    /// a full ring then hands back the unit in the way of making room, and
-    /// the reservation is given up. A helper voids it, and the next attempt
-    /// reserves again.
+    /// [`Self::enter`] for a call that may not wait: a full ring then hands
+    /// back the unit in the way of making room, and the reservation is given
+    /// up. A helper voids it, and the next attempt reserves again.
     pub(super) fn try_enter(
         &self,
         pipe: &Pipeline,
         desc: &RingArc<Descriptor>,
-        can_run: bool,
+        help: Help<'_>,
     ) -> Result<u64, Arc<Job>> {
         loop {
             let index = pipe.ring.reserve();
@@ -271,7 +274,7 @@ impl RegolithEngine {
                     // The ring is full: the slot one lap earlier is not
                     // published yet, and this thread has no slot of its own
                     // to wait in.
-                    Installed::Full => self.make_room(pipe, index, can_run)?,
+                    Installed::Full => self.make_room(pipe, index, help)?,
                 }
             }
         }
@@ -280,14 +283,14 @@ impl RegolithEngine {
     /// Finish the slot a full ring's cell still holds for `index`: the one a
     /// lap earlier. A blocking call brings it through like a commit of its
     /// own; one that may not wait hands back the unit in the way.
-    fn make_room(&self, pipe: &Pipeline, index: u64, can_run: bool) -> Result<(), Arc<Job>> {
+    fn make_room(&self, pipe: &Pipeline, index: u64, help: Help<'_>) -> Result<(), Arc<Job>> {
         let lap = index - pipe.ring.capacity();
         loop {
             if pipe.ring.published() >= lap {
                 return Ok(());
             }
-            if let Turn::Blocked(job) = self.help_decide(pipe, lap, can_run) {
-                if !can_run {
+            if let Turn::Blocked(job) = self.help_decide(pipe, lap, help) {
+                if !matches!(help, Help::Wait) {
                     return Err(job);
                 }
                 self.run_or_wait(&job);
@@ -295,32 +298,17 @@ impl RegolithEngine {
             }
             match self.publish_upto(pipe, lap) {
                 Progress::Published => return Ok(()),
-                Progress::NeedsSync | Progress::Failed => {
-                    if !can_run {
-                        return Err(Arc::clone(&self.current_round(pipe).job));
-                    }
-                    self.sync_round(pipe);
-                }
+                Progress::NeedsSync | Progress::Failed => self.sync_round(pipe, help)?,
                 Progress::Undecided => {}
             }
         }
     }
 
-    /// Run `job` if nobody claimed it, else wait for the thread that did:
-    /// what a blocking call does about a unit in its way. The wait is for
-    /// device I/O under way.
-    pub(super) fn run_or_wait(&self, job: &Arc<Job>) {
-        if job.claim() {
-            self.io().run_job(job);
-        } else {
-            job.wait_landed();
-        }
-    }
-
     /// Decide every slot up to and including `upto`, in ring order (P1),
-    /// voiding the ones reserved and never installed. With `can_run` unset
-    /// the call runs no unit: one in the way is handed back.
-    pub(super) fn help_decide(&self, pipe: &Pipeline, upto: u64, can_run: bool) -> Turn {
+    /// voiding the ones reserved and never installed. A round or a unit in
+    /// the way is dealt with as `help` says (`park.rs`), and handed back
+    /// when the call does not get past it.
+    pub(super) fn help_decide(&self, pipe: &Pipeline, upto: u64, help: Help<'_>) -> Turn {
         loop {
             let decided = pipe.ring.decided();
             if decided >= upto {
@@ -329,10 +317,9 @@ impl RegolithEngine {
             if pipe.ring.is_deciding_frozen() {
                 // A rollback holds the frontier. It runs in the round.
                 let round = self.current_round(pipe);
-                if !can_run {
+                if !self.pass(&round.job, help) {
                     return Turn::Blocked(Arc::clone(&round.job));
                 }
-                self.run_or_wait(&round.job);
                 continue;
             }
             let index = decided + 1;
@@ -353,11 +340,9 @@ impl RegolithEngine {
                     match self.publish_upto(pipe, index - pipe.ring.capacity()) {
                         Progress::Published | Progress::Undecided => {}
                         Progress::NeedsSync | Progress::Failed => {
-                            let round = self.current_round(pipe);
-                            if !can_run {
-                                return Turn::Blocked(Arc::clone(&round.job));
+                            if let Err(job) = self.sync_round(pipe, help) {
+                                return Turn::Blocked(job);
                             }
-                            self.run_or_wait(&round.job);
                         }
                     }
                 }
@@ -371,7 +356,7 @@ impl RegolithEngine {
                         }
                         if desc.decision().is_none() {
                             hook::at(hook::Stage::Decide);
-                            if let Turn::Blocked(job) = self.decide(pipe, index, &desc, can_run) {
+                            if let Turn::Blocked(job) = self.decide(pipe, index, &desc, help) {
                                 return Turn::Blocked(job);
                             }
                         }
@@ -389,7 +374,7 @@ impl RegolithEngine {
         pipe: &Pipeline,
         index: u64,
         desc: &RingArc<Descriptor>,
-        can_run: bool,
+        help: Help<'_>,
     ) -> Turn {
         // P1: the tip read here is the state after slot `index - 1` as long
         // as that slot is still the newest decided one, which is checked
@@ -406,8 +391,7 @@ impl RegolithEngine {
                 desc.decide(Decision::new(index, Fate::Unit, prev.after.clone()));
                 return Turn::Done;
             }
-            if can_run && job.claim() {
-                self.io().run_job(job);
+            if self.pass(job, help) {
                 return Turn::Done;
             }
             return Turn::Blocked(Arc::clone(job));
@@ -417,7 +401,7 @@ impl RegolithEngine {
         // Read after the tip: a tip the check already replaced means its
         // job was made before, so it is seen here.
         if desc.turn_job.get().is_some() || self.turn_is_due(desc, &prev.after) {
-            match self.take_turn(index, desc, can_run) {
+            match self.take_turn(index, desc, help) {
                 Ok(turned) => refused = turned.refused.as_ref().map(crate::Error::clone_io),
                 Err(job) => return Turn::Blocked(job),
             }
@@ -815,7 +799,7 @@ impl RegolithEngine {
         desc: &RingArc<Descriptor>,
     ) -> Result<(), Arc<Job>> {
         if !desc.is(INSTALLED) {
-            self.try_enter(pipe, desc, false)?;
+            self.try_enter(pipe, desc, Help::Leave)?;
         }
         self.drive_nowait(pipe, desc.index(), desc)
     }
@@ -828,15 +812,13 @@ impl RegolithEngine {
         desc: &RingArc<Descriptor>,
     ) -> Result<(), Arc<Job>> {
         loop {
-            if let Turn::Blocked(job) = self.help_decide(pipe, index, false) {
+            if let Turn::Blocked(job) = self.help_decide(pipe, index, Help::Leave) {
                 return Err(job);
             }
             self.write_slot(desc);
             match self.publish_upto(pipe, index) {
                 Progress::Published => return Ok(()),
-                Progress::NeedsSync | Progress::Failed => {
-                    return Err(Arc::clone(&self.current_round(pipe).job));
-                }
+                Progress::NeedsSync | Progress::Failed => self.sync_round(pipe, Help::Leave)?,
                 Progress::Undecided => {}
             }
         }
@@ -848,14 +830,17 @@ impl RegolithEngine {
     /// device I/O another thread has under way.
     pub(super) fn drive(&self, pipe: &Pipeline, index: u64, desc: &RingArc<Descriptor>) {
         loop {
-            if let Turn::Blocked(job) = self.help_decide(pipe, index, true) {
+            if let Turn::Blocked(job) = self.help_decide(pipe, index, Help::Wait) {
                 self.run_or_wait(&job);
                 continue;
             }
             self.write_slot(desc);
             match self.publish_upto(pipe, index) {
                 Progress::Published => return,
-                Progress::NeedsSync | Progress::Failed => self.sync_round(pipe),
+                Progress::NeedsSync | Progress::Failed => {
+                    // A blocking call gets past the round.
+                    let _ = self.sync_round(pipe, Help::Wait);
+                }
                 Progress::Undecided => {}
             }
         }

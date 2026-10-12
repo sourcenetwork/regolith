@@ -284,10 +284,13 @@ pub(super) enum Work {
     Allocate { key: Vec<u8>, n: u64 },
     /// An ordered unit (`ordered.rs`): its body runs when the slot's turn
     /// comes, on whichever thread claims the job. `index` tells the body
-    /// which slot it is, since a job knows nothing of the ring.
+    /// which slot it is, since a job knows nothing of the ring; `needs` is
+    /// what the body may wait for, which a queue's poll takes before it
+    /// begins (`park.rs`).
     Unit {
         job: Arc<Job>,
         index: Arc<crate::portability::AtomicU64>,
+        needs: super::park::Needs,
     },
 }
 

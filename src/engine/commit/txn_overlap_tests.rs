@@ -113,7 +113,7 @@ fn run_once(isolation: IsolationLevel) -> u64 {
     // Held as a thread holds it while it syncs: a commit that arrives is
     // decided, and then waits for the round, as does a transaction that
     // lost a conflict, whose answer comes in ring order.
-    let held = engine.hold_round(pipe);
+    let held = engine.hold_round(pipe, super::park::Help::Wait);
     let handles: Vec<_> = (0..THREADS)
         .map(|t| {
             let db = Arc::clone(&db);

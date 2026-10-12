@@ -71,6 +71,7 @@ pub(crate) mod atomic_waker;
 pub(crate) mod bind;
 pub(crate) mod flight;
 pub(crate) mod job;
+pub(crate) mod parked;
 pub(crate) mod scope;
 pub(crate) mod shared;
 pub(crate) mod stack;
@@ -336,6 +337,17 @@ impl IoRuntime {
             self.forget_job(job);
         } else if closing {
             self.release_job(job);
+        }
+        landed
+    }
+
+    /// [`Self::step_job`] for a job claimed inside the step of another one,
+    /// which found it in its way: stepped with the waker that step chose,
+    /// in its device scope and its count through the close gate.
+    pub(crate) fn step_within(&self, job: &Arc<Job>, waker: &std::task::Waker) -> bool {
+        let landed = job.step(waker);
+        if landed {
+            self.forget_job(job);
         }
         landed
     }

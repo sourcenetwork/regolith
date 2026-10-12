@@ -15,18 +15,26 @@
 //! - **A caller waits only for the work under way.** A caller whose push
 //!   found the step held parks until its section has run, on the thread
 //!   that holds the step, which is doing the sections queued before it.
+//! - **A caller that may not wait holds the step instead.** A job a queue's
+//!   poll steps never waits for another thread, so before it starts work
+//!   that hands sections over it takes the step for the whole of that work
+//!   ([`Step::hold_or_park`]), with the same compare-and-swap a push takes
+//!   it with, and parks when another thread has it. While it keeps the
+//!   [`Hold`], every section handed over, its own and other threads', runs
+//!   on its thread: at once when it hands one over, and when the hold ends.
 //!
 //! # Invariants
 //!
 //! - **ST1, one thread runs sections**, one section at a time: the thread
 //!   that holds the step.
-//! - **ST2, the step is held exactly while a thread runs sections.** The
-//!   list's head word carries `IDLE` when it is empty and nobody holds the
-//!   step. The push that clears `IDLE` holds the step from then on; the
-//!   holder gives it up with one compare-and-swap that succeeds only on an
-//!   empty list. So a section pushed at any moment is either taken by the
-//!   holder's next sweep or is the push that takes the step: none is left
-//!   behind with nobody to run it.
+//! - **ST2, the step is held exactly while a thread runs sections or keeps
+//!   a [`Hold`].** The list's head word carries `IDLE` when it is empty and
+//!   nobody holds the step. The push that clears `IDLE`, or the hold that
+//!   does, holds the step from then on; the holder gives it up with one
+//!   compare-and-swap that succeeds only on an empty list. So a section
+//!   pushed at any moment is either taken by the holder's next sweep or is
+//!   the push that takes the step: none is left behind with nobody to run
+//!   it.
 //! - **ST3, sections run in the order they were pushed**, each to its end
 //!   before the next begins.
 //! - **ST4, a section has finished before its caller returns.** The caller
@@ -36,15 +44,24 @@
 //! - **ST5, a panic in a section is its caller's.** It is caught on the
 //!   thread that ran the section and resumed on the thread that asked for
 //!   it, so one caller's panic never unwinds the thread serving the rest.
+//! - **ST6, a hold never waits, and nobody is left parked for one.** Taking
+//!   a hold is one compare-and-swap. A section the holder hands over runs
+//!   on the holder's thread before the call returns. A job that parked for
+//!   the step is woken by the thread that next gives the step up
+//!   (`io::parked`, PK1).
 
 #![allow(unsafe_code)]
 
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::sync::Arc;
+use std::task::Waker;
 
 use super::io::job::Job;
+use super::io::parked::Parked;
+use super::io::shared::thread_token;
 use super::io::stack::{IDLE, Rest, Stack};
 use super::take::Take;
+use crate::sync::internal::{AtomicUsize, Ordering};
 
 /// One section waiting for the step.
 struct Request {
@@ -66,6 +83,26 @@ impl Drop for Request {
 pub(crate) struct Step {
     /// The sections waiting for the step, and whether it is held (ST2).
     waiting: Stack<Request>,
+    /// The thread that keeps a [`Hold`], as its thread token; zero when no
+    /// hold is out. A thread only ever compares it with its own token.
+    holder: AtomicUsize,
+    /// The jobs that found the step held and parked, woken when the step
+    /// is next given up (ST6).
+    parked: Parked,
+}
+
+/// The step, kept by a caller that may not wait for it. See the module docs.
+/// Dropping it runs the sections queued meanwhile and gives the step up.
+#[must_use = "the step is held only while the hold is alive"]
+pub(crate) struct Hold<'a> {
+    step: &'a Step,
+}
+
+impl Drop for Hold<'_> {
+    fn drop(&mut self) {
+        self.step.holder.store(0, Ordering::Release);
+        self.step.sweep();
+    }
 }
 
 impl Step {
@@ -74,7 +111,29 @@ impl Step {
         // Nobody holds the step.
         let rested = waiting.rest_if_empty();
         debug_assert_eq!(rested, Rest::Set);
-        Self { waiting }
+        Self {
+            waiting,
+            holder: AtomicUsize::new(0),
+            parked: Parked::new(),
+        }
+    }
+
+    /// Take the step and keep it, if nobody holds it. Never waits.
+    fn try_hold(&self) -> Option<Hold<'_>> {
+        // ST2: clearing `IDLE` on the empty list takes the step, as the
+        // push that finds `IDLE` does.
+        if !self.waiting.wake_if_resting() {
+            return None;
+        }
+        self.holder.store(thread_token(), Ordering::Release);
+        Some(Hold { step: self })
+    }
+
+    /// [`Self::try_hold`] for a job a queue's poll steps: when another
+    /// thread holds the step, `waker` is woken once that thread gives it
+    /// up, and `None` tells the job to park (ST6).
+    pub(crate) fn hold_or_park(&self, waker: &Waker) -> Option<Hold<'_>> {
+        self.parked.take_or_park(waker, || self.try_hold())
     }
 
     /// Run `section` alone and after every section pushed before it, and
@@ -102,11 +161,15 @@ impl Step {
                 done: Arc::clone(&done),
             };
             // No flag refuses a push here, so `Err` cannot come back.
-            if let Ok(flags) = self.waiting.push(request, 0)
-                && flags & IDLE != 0
-            {
-                // ST2: this push took the step.
-                self.sweep();
+            if let Ok(flags) = self.waiting.push(request, 0) {
+                if flags & IDLE != 0 {
+                    // ST2: this push took the step.
+                    self.sweep();
+                } else if self.holder.load(Ordering::Acquire) == thread_token() {
+                    // This thread keeps the step (ST6): it runs what is
+                    // queued, this section last.
+                    self.drain();
+                }
             }
         }
         done.wait_landed();
@@ -118,18 +181,26 @@ impl Step {
     }
 
     /// Run every queued section, as the thread that holds the step, and
-    /// give the step up once the list is empty (ST2, ST3).
+    /// give the step up once the list is empty (ST2, ST3). The jobs that
+    /// parked for the step are woken then (ST6).
     fn sweep(&self) {
         loop {
-            for mut request in self.waiting.take(0) {
-                if let Some(body) = request.body.take() {
-                    body();
-                }
-                // Dropped here: its caller goes on.
-            }
+            self.drain();
             if self.waiting.rest_if_empty() != Rest::Busy {
-                return;
+                break;
             }
+        }
+        self.parked.released();
+    }
+
+    /// Run the sections queued now, oldest first, as the thread that holds
+    /// the step, and keep it.
+    fn drain(&self) {
+        for mut request in self.waiting.take(0) {
+            if let Some(body) = request.body.take() {
+                body();
+            }
+            // Dropped here: its caller goes on.
         }
     }
 

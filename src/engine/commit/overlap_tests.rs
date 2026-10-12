@@ -59,7 +59,7 @@ fn concurrent_durable_writers_cost_far_fewer_fsyncs_than_writes() {
     let before = pipe.ring.decided();
     // Held as a thread holds it while it syncs: a write that arrives is
     // decided and written, and then waits for the round.
-    let held = db.engine.hold_round(pipe);
+    let held = db.engine.hold_round(pipe, super::park::Help::Wait);
     let handles: Vec<_> = (0..WRITERS)
         .map(|w| {
             let db = Arc::clone(&db);

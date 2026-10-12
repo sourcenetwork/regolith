@@ -18,6 +18,15 @@
 //! stretch as one that may not wait for an open-file slot (D60): a reopen
 //! under `max_open_files` that finds every slot busy parks on the queue
 //! running the unit instead, and the run sees that it did.
+//!
+//! [`no_wait`] marks the stretch a queue's poll steps a job of the commit
+//! pipeline, which parks instead of waiting for another thread
+//! (`engine::commit::park`). Every place a thread goes to sleep or spins
+//! for another one calls [`waits`] first. A wait inside such a stretch is a
+//! defect: the job should have parked. In a build with debug assertions the
+//! stretch fails when it ends, naming what the wait was for. Not at the
+//! wait itself, which may sit where unwinding is not safe (a section handed
+//! to `engine::step` borrows from the frame that waits for it).
 
 use std::cell::{Cell, RefCell};
 use std::num::NonZeroU64;
@@ -32,6 +41,58 @@ thread_local! {
     static QUEUE: Cell<u64> = const { Cell::new(0) };
     /// The queue whose unit this thread is running, while it runs one.
     static RUNNING: RefCell<Option<Running>> = const { RefCell::new(None) };
+    /// This thread is inside a [`no_wait`] stretch.
+    static NO_WAIT: Cell<bool> = const { Cell::new(false) };
+    /// What this thread waited for inside its [`no_wait`] stretch, if it
+    /// did: the first such wait.
+    static WAITED: Cell<Option<&'static str>> = const { Cell::new(None) };
+}
+
+/// A stretch that must not wait for another thread, until it is dropped.
+#[must_use = "the stretch lasts only while the scope is alive"]
+pub(crate) struct NoWait {
+    previous: bool,
+}
+
+impl Drop for NoWait {
+    fn drop(&mut self) {
+        NO_WAIT.with(|no_wait| no_wait.set(self.previous));
+        if self.previous {
+            // The outermost stretch reports.
+            return;
+        }
+        let waited = WAITED.with(Cell::take);
+        if cfg!(debug_assertions)
+            && !std::thread::panicking()
+            && let Some(what) = waited
+        {
+            panic!("a queue's poll waited for another thread: {what}");
+        }
+    }
+}
+
+/// Mark what this thread does until the scope drops as a stretch that must
+/// not wait for another thread: a job of the commit pipeline stepped by a
+/// queue's poll.
+pub(crate) fn no_wait() -> NoWait {
+    NoWait {
+        previous: NO_WAIT.with(|no_wait| no_wait.replace(true)),
+    }
+}
+
+/// This thread is about to wait for another one, for `what`. Inside a
+/// [`no_wait`] stretch that is a defect, noted here and reported when the
+/// stretch ends. A loom model's threads share the host's thread-locals, so
+/// nothing is noted there.
+#[inline]
+pub(crate) fn waits(what: &'static str) {
+    if cfg!(all(debug_assertions, not(loom))) && NO_WAIT.with(Cell::get) {
+        WAITED.with(|waited| {
+            if waited.get().is_none() {
+                waited.set(Some(what));
+            }
+        });
+    }
 }
 
 /// A unit run in progress on this thread.

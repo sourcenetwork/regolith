@@ -33,7 +33,7 @@ use super::io::scope;
 use super::manifest::{Version, VersionEdit, VersionSet};
 use super::memtable::MemTable;
 use super::read_view::ReadViewCell;
-use super::step::Step;
+use super::step::{Hold, Step};
 use crate::sync::internal::UnsafeCell;
 
 /// The [`VersionSet`] plus the read view its edits publish into. See the
@@ -120,6 +120,15 @@ impl VersionStore {
             versions.apply(&[VersionEdit::SetNextFileId(id + 1)])?;
             Ok(id)
         })
+    }
+
+    /// Take the step for work that hands sections over and may not wait for
+    /// another thread: an ordered unit a queue's poll runs
+    /// (`engine::commit::park`). `None` when another thread holds it:
+    /// `waker` is then woken once that thread gives it up. See
+    /// [`Step::hold_or_park`].
+    pub(crate) fn hold_or_park(&self, waker: &std::task::Waker) -> Option<Hold<'_>> {
+        self.step.hold_or_park(waker)
     }
 
     /// Test-only: whether a section is waiting for the step.

@@ -19,14 +19,18 @@
 //!   becomes a unit of the slot, which the helper leaves on its queue as it
 //!   leaves a sync. A thread that may read the device decides the slot
 //!   directly and never needs the unit; the helper's poll runs it otherwise,
-//!   which is where a queue's owner does its I/O.
+//!   which is where a queue's owner does its I/O. The poll waits for no
+//!   other thread: a round or a unit in the slot's way that another thread
+//!   has parks the decision (`park.rs`).
 
 use std::sync::Arc;
+use std::task::Waker;
 
 use super::super::RegolithEngine;
-use super::super::io::job::{Job, JobBody};
+use super::super::io::job::{Job, JobBody, Step};
 use super::super::io::scope;
 use super::descriptor::{After, Decision, Descriptor, Verdict as Fate};
+use super::park::Help;
 use super::pipeline::Turn;
 use crate::io_queue::wait::is_would_block;
 
@@ -37,35 +41,59 @@ struct DecideSlot {
 }
 
 impl DecideSlot {
-    fn run(self) {
+    /// Decide every slot up to this one. Run by a poll or a blocking call,
+    /// which read the device. `false` when a poll parked on a round or a
+    /// unit in the way that another thread has.
+    fn decide(&self, help: Help<'_>) -> bool {
         let Some(engine) = self.engine.upgrade() else {
-            return;
+            return true;
         };
         let Some(pipe) = engine.pipeline.as_ref() else {
-            return;
+            return true;
         };
-        // Run by a poll or a blocking call, which read the device: every
-        // slot up to this one is decided here, and a unit in the way is run
-        // or waited for.
-        while let Turn::Blocked(job) = engine.help_decide(pipe, self.index, true) {
+        while let Turn::Blocked(job) = engine.help_decide(pipe, self.index, help) {
+            if !matches!(help, Help::Wait) {
+                return false;
+            }
             engine.run_or_wait(&job);
         }
+        true
     }
 }
 
 impl JobBody for DecideSlot {
     fn run(self: Box<Self>) {
-        (*self).run();
+        self.decide(Help::Wait);
+    }
+
+    /// On a queue's poll: parks instead of waiting for another thread.
+    fn step(self: Box<Self>, waker: &Waker) -> Step {
+        let _no_wait = scope::no_wait();
+        if self.decide(Help::Park(waker)) {
+            Step::Done
+        } else {
+            Step::Parked(self)
+        }
     }
 
     /// The pipeline cannot pass a slot nobody decided, so a release decides
     /// it too.
     fn release(self: Box<Self>) {
-        (*self).run();
+        self.decide(Help::Wait);
     }
 }
 
 impl RegolithEngine {
+    /// Test-only: the unit that decides slot `index` with the device, as a
+    /// helper that must not read it leaves it on its queue.
+    #[cfg(test)]
+    pub(super) fn decide_unit(&self, index: u64) -> Arc<Job> {
+        Job::new(Box::new(DecideSlot {
+            engine: self.me.clone(),
+            index,
+        }))
+    }
+
     /// Decide slot `index` from `base` under the read rules of the module
     /// docs. `Err` is the unit that decides it with the device, for a thread
     /// that must not read it.

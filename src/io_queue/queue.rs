@@ -524,12 +524,14 @@ impl Drop for IoQueue {
 /// for; its waiters are told now and run their call again. A job nobody runs
 /// yet is settled here by its body's release: a sync round of the log runs,
 /// an owed step is owed again, a foreground job fails. A job another thread
-/// runs is waited for, so its outcome is the one told.
+/// runs is waited for, so its outcome is the one told; one that thread parks
+/// instead is settled here like any job nobody runs.
 fn settle_on_drop(runtime: &IoRuntime, job: &Arc<Job>) {
-    if job.is_done() || job.is_passive() || runtime.release_job(job) {
-        return;
+    loop {
+        if job.is_done() || job.is_passive() || runtime.release_job(job) || job.wait_turn() {
+            return;
+        }
     }
-    job.wait_landed();
 }
 
 impl std::fmt::Debug for IoQueue {

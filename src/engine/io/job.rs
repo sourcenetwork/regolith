@@ -41,6 +41,20 @@
 //! the job finished parking is not lost. A parked job is still found and
 //! settled by close, by its queue's drop, and by a blocking
 //! [`JobTicket::wait`](crate::JobTicket::wait), each through a claim.
+//!
+//! A job several callers wait on (a unit of the commit pipeline) may be
+//! parked by one of them while the others wait for it. None of them is left
+//! waiting on a thread that is no longer running it:
+//!
+//! - **Who waited for the thread that held the claim is told when it parks.**
+//!   A thread blocked in [`Job::wait_turn`] wakes and claims the job itself.
+//!   A job that parked because this one was claimed ([`Job::watch`]) is
+//!   woken, and its next step claims this one.
+//! - **Every queue registered on the job is told when its wait ends**, not
+//!   only the one that stepped it ([`Job::ready`]): a queue whose claim lost
+//!   while the job was being stepped dropped it from its line, and the owner
+//!   of the queue that parked it may never poll again. Whichever owner polls
+//!   next steps it.
 
 #![allow(unsafe_code)]
 
@@ -57,7 +71,7 @@ use std::thread::{self, Thread};
 use super::flight::Flight;
 use super::shared::{Message, QueueShared};
 use super::stack::{SHUT, Stack};
-use crate::sync::internal::UnsafeCell;
+use crate::sync::internal::{Ordering, UnsafeCell, fence};
 
 /// What one step of a job did.
 pub(crate) enum Step {
@@ -104,8 +118,12 @@ pub(crate) struct Job {
     passive: bool,
     /// Waiters with no queue, told by the lander, closed with [`SHUT`].
     direct: Stack<Arc<dyn Delivery>>,
-    /// Threads blocked until the job lands, closed with [`SHUT`].
+    /// Threads blocked until the job lands or its holder parks it, closed
+    /// with [`SHUT`].
     sleepers: Stack<Thread>,
+    /// Wakers of jobs that parked because this one was claimed, woken when
+    /// it lands or its holder parks it, closed with [`SHUT`].
+    watchers: Stack<Waker>,
 }
 
 // SAFETY: `body` is only touched by the one thread whose claim succeeded
@@ -127,6 +145,7 @@ impl Job {
             passive: false,
             direct: Stack::new(),
             sleepers: Stack::new(),
+            watchers: Stack::new(),
         }
     }
 
@@ -138,6 +157,7 @@ impl Job {
             passive: true,
             direct: Stack::new(),
             sleepers: Stack::new(),
+            watchers: Stack::new(),
         })
     }
 
@@ -171,6 +191,22 @@ impl Job {
     /// `false` when it already landed: the caller tells `waiter` itself.
     pub(crate) fn listen(&self, waiter: Arc<dyn Delivery>) -> bool {
         self.direct.push(waiter, SHUT).is_ok()
+    }
+
+    /// Have `waker` woken when the thread that claimed the job lets it go:
+    /// when the job lands, or when that thread parks it. For a caller whose
+    /// claim just lost and which may not wait: a job a queue's poll steps.
+    /// `true` when the job is still claimed and `waker` will be woken;
+    /// `false` when it landed or was parked meanwhile, and the caller looks
+    /// again now.
+    pub(crate) fn watch(&self, waker: &Waker) -> bool {
+        if self.watchers.push(waker.clone(), SHUT).is_err() {
+            return false;
+        }
+        // With the fence in `let_go`: a holder that parked the job before
+        // this push was seen is seen here, so one of the two sides acts.
+        fence(Ordering::SeqCst);
+        !self.is_done() && !self.is_runnable()
     }
 
     /// Run the body on this thread, after this caller's claim won, and land
@@ -220,10 +256,51 @@ impl Job {
             // after the body is back.
             self.body.with_mut(|slot| unsafe { *slot = Some(body) });
             self.flight.park();
+            self.let_go();
             return false;
         }
         self.land();
         true
+    }
+
+    /// The claim was given back without a landing: whoever waited for the
+    /// thread that held it looks again, and may claim the job itself.
+    fn let_go(&self) {
+        // With the fences in `watch` and `park_until`: a waiter that did not
+        // see the job parked pushed itself before the lists are taken here.
+        fence(Ordering::SeqCst);
+        // Open takes: a thread that claimed the job since may be landing it,
+        // and its closing of these lists must stand.
+        for waker in self.watchers.take_open() {
+            waker.wake();
+        }
+        for sleeper in self.sleepers.take_open() {
+            sleeper.unpark();
+        }
+    }
+
+    /// A parked job may go on: tell the queue that stepped it, and every
+    /// other queue registered on it. Whichever of their owners polls next
+    /// claims the job and steps it.
+    fn ready(self: &Arc<Self>, stepper: Option<&Arc<QueueShared>>) {
+        if self.is_done() {
+            // Run to its end since, by a blocking caller or another poll.
+            return;
+        }
+        if let Some(queue) = stepper {
+            // A queue dropped meanwhile settled the job in its drop.
+            let _ = queue.deliver(Message::Ready(Arc::clone(self)));
+        }
+        for queue in self.flight.registered() {
+            if !stepper.is_some_and(|stepper| Arc::ptr_eq(stepper, &queue)) {
+                let _ = queue.deliver(Message::Ready(Arc::clone(self)));
+            }
+            if !self.flight.register(Arc::clone(&queue)) {
+                // The job landed while this queue was off the list, so its
+                // lander did not see the queue: it is told here.
+                let _ = queue.deliver(Message::JobDone(Arc::clone(self)));
+            }
+        }
     }
 
     /// Settle a job nobody is running without running it (its body says how)
@@ -254,19 +331,49 @@ impl Job {
         super::super::read_view::idle();
     }
 
+    /// Block this thread until the job has landed (`true`), or until the
+    /// thread that claimed it parked it (`false`): the caller, whose claim
+    /// lost before, may then claim it. What a blocking caller does about a
+    /// job another thread has, so that it never sleeps on a job nobody is
+    /// running.
+    pub(crate) fn wait_turn(&self) -> bool {
+        if self.is_done() {
+            return true;
+        }
+        // As in `wait_landed`.
+        super::super::read_view::idle();
+        let landed = self.park_until(true);
+        super::super::read_view::idle();
+        landed
+    }
+
     /// [`Self::wait_landed`]'s parking.
     fn park_until_landed(&self) {
-        while !self.is_done() {
+        self.park_until(false);
+    }
+
+    /// Park this thread until the job has landed (`true`), or, with
+    /// `or_parked`, until its holder parked it (`false`).
+    fn park_until(&self, or_parked: bool) -> bool {
+        loop {
             // A refused push means the lander already took the sleepers: the
             // job is done.
-            if self.sleepers.push(thread::current(), SHUT).is_err() {
-                return;
+            if self.is_done() || self.sleepers.push(thread::current(), SHUT).is_err() {
+                return true;
             }
+            // With the fence in `let_go`, as in `watch`.
+            fence(Ordering::SeqCst);
+            if self.is_done() {
+                return true;
+            }
+            if or_parked && self.is_runnable() {
+                return false;
+            }
+            super::scope::waits("a job another thread is running");
             // An unpark that raced ahead of this park is kept by the thread,
-            // so the park returns at once.
-            while !self.is_done() {
-                thread::park();
-            }
+            // so the park returns at once. Whoever woke this thread took its
+            // entry off the list, so it goes back on before the next park.
+            thread::park();
         }
     }
 
@@ -282,14 +389,18 @@ impl Job {
         for waiter in self.direct.take(SHUT) {
             waiter.deliver();
         }
+        for waker in self.watchers.take(SHUT) {
+            waker.wake();
+        }
         for sleeper in self.sleepers.take(SHUT) {
             sleeper.unpark();
         }
     }
 }
 
-/// Wakes a parked job: pushes it back to the queue that steps it, which
-/// wakes that queue's owner when it is idle.
+/// Wakes a parked job: pushes it back to the queue that stepped it and to
+/// every other queue registered on it, which wakes each owner that is idle
+/// ([`Job::ready`]).
 struct Unpark {
     /// Weak, since the job's body holds this waker while it is parked.
     job: Weak<Job>,
@@ -309,9 +420,8 @@ impl Wake for Unpark {
         if self.fired.swap(true, crate::portability::Ordering::AcqRel) {
             return;
         }
-        if let (Some(job), Some(queue)) = (self.job.upgrade(), self.queue.upgrade()) {
-            // A queue dropped meanwhile settled the job in its drop.
-            let _ = queue.deliver(Message::Ready(job));
+        if let Some(job) = self.job.upgrade() {
+            job.ready(self.queue.upgrade().as_ref());
         }
     }
 }
@@ -324,6 +434,46 @@ pub(crate) fn unpark_waker(job: &Arc<Job>, queue: &Arc<QueueShared>) -> Waker {
         fired: crate::portability::AtomicBool::new(false),
     }))
 }
+
+/// Wakes a job stepped inside another job's step: the queues registered on
+/// it are told it may go on, and the step it ran in is woken through
+/// `outer`, since that step parked with it.
+struct Nested {
+    job: Weak<Job>,
+    outer: Waker,
+    /// One wake brings the next step, as for [`Unpark`].
+    fired: crate::portability::AtomicBool,
+}
+
+impl Wake for Nested {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        if self.fired.swap(true, crate::portability::Ordering::AcqRel) {
+            return;
+        }
+        if let Some(job) = self.job.upgrade() {
+            job.ready(None);
+        }
+        self.outer.wake_by_ref();
+    }
+}
+
+/// The waker `job` is stepped with when the step of another job, whose
+/// waker is `outer`, claimed it on its way.
+pub(crate) fn nested_waker(job: &Arc<Job>, outer: &Waker) -> Waker {
+    Waker::from(Arc::new(Nested {
+        job: Arc::downgrade(job),
+        outer: outer.clone(),
+        fired: crate::portability::AtomicBool::new(false),
+    }))
+}
+
+#[cfg(all(test, not(loom)))]
+#[path = "job_park_tests.rs"]
+mod park_tests;
 
 #[cfg(all(test, not(loom)))]
 mod tests {

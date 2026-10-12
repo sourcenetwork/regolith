@@ -196,3 +196,133 @@ fn a_section_that_changes_no_version_publishes_nothing() {
         "a read-only section must not churn the published view",
     );
 }
+
+struct Wakes(std::sync::atomic::AtomicUsize);
+
+impl std::task::Wake for Wakes {
+    fn wake(self: Arc<Self>) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+fn counting() -> (Arc<Wakes>, std::task::Waker) {
+    let wakes = Arc::new(Wakes(std::sync::atomic::AtomicUsize::new(0)));
+    (
+        Arc::clone(&wakes),
+        std::task::Waker::from(Arc::clone(&wakes)),
+    )
+}
+
+/// ST6: a thread that keeps the step runs its own sections at once, without
+/// waiting, and the step is free again when the hold ends.
+#[test]
+fn a_thread_that_holds_the_step_runs_its_own_sections_without_waiting() {
+    let (_dir, store) = store();
+    let hold = store
+        .hold_or_park(std::task::Waker::noop())
+        .expect("the step is free");
+    let first = store.take_file_id().unwrap();
+    let second = store.take_file_id().unwrap();
+    assert_eq!(second, first + 1);
+    assert!(!store.has_waiting());
+    drop(hold);
+    let hold = store.hold_or_park(std::task::Waker::noop());
+    assert!(hold.is_some(), "the step was not given up");
+}
+
+/// ST6 and ST3: a section another thread hands over while the step is held
+/// runs on the holder's thread, in the order it was handed over: before the
+/// holder's own next section.
+#[test]
+fn a_section_handed_over_under_a_hold_runs_on_the_holder_in_order() {
+    let (_dir, store) = store();
+    let hold = store
+        .hold_or_park(std::task::Waker::noop())
+        .expect("the step is free");
+    let holder = thread::current().id();
+    thread::scope(|scope| {
+        let waiter = scope.spawn(|| {
+            store.run(|versions| (versions.current().next_file_id, thread::current().id()))
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while !store.has_waiting() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the waiter never pushed"
+            );
+            thread::yield_now();
+        }
+        // The holder's next section: the waiter's runs first, here.
+        let mine = store.take_file_id().unwrap();
+        let (seen, ran_on) = waiter.join().unwrap();
+        assert_eq!(ran_on, holder, "the section waited for its own thread");
+        assert_eq!(seen, mine, "the waiter's section ran after the holder's");
+    });
+    drop(hold);
+}
+
+/// ST6: a section handed over under a hold that hands nothing over itself
+/// runs when the hold ends, on the holder's thread.
+#[test]
+fn a_section_handed_over_under_a_hold_runs_when_the_hold_ends() {
+    let (_dir, store) = store();
+    let hold = store
+        .hold_or_park(std::task::Waker::noop())
+        .expect("the step is free");
+    let holder = thread::current().id();
+    thread::scope(|scope| {
+        let waiter = scope.spawn(|| store.run(|_| thread::current().id()));
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while !store.has_waiting() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the waiter never pushed"
+            );
+            thread::yield_now();
+        }
+        drop(hold);
+        assert_eq!(waiter.join().unwrap(), holder);
+    });
+    assert!(!store.has_waiting());
+}
+
+/// ST6: a job that finds the step held by another thread parks, and is
+/// woken when that thread gives the step up.
+#[test]
+fn a_job_that_finds_the_step_held_is_woken_when_it_is_given_up() {
+    let (_dir, store) = store();
+    let (wakes, waker) = counting();
+    let (taken, is_taken) = mpsc::channel();
+    let (release, released) = mpsc::channel::<()>();
+    thread::scope(|scope| {
+        let held = &store;
+        let holder = scope.spawn(move || {
+            let hold = held
+                .hold_or_park(std::task::Waker::noop())
+                .expect("the step is free");
+            taken.send(()).unwrap();
+            let _ = released.recv();
+            drop(hold);
+        });
+        is_taken.recv_timeout(Duration::from_secs(30)).unwrap();
+        assert!(store.hold_or_park(&waker).is_none(), "two threads held it");
+        assert_eq!(wakes.0.load(Ordering::SeqCst), 0);
+        drop(release);
+        holder.join().unwrap();
+    });
+    assert_eq!(wakes.0.load(Ordering::SeqCst), 1);
+    assert!(store.hold_or_park(&waker).is_some());
+}
+
+/// A sweep that holds the step for its sections also wakes the jobs parked
+/// for the step, once it gives the step up.
+#[test]
+fn a_sweep_that_ends_wakes_the_jobs_parked_for_the_step() {
+    let (_dir, store) = store();
+    let (wakes, waker) = counting();
+    store.run(|_| {
+        assert!(store.hold_or_park(&waker).is_none(), "a section is running");
+        assert_eq!(wakes.0.load(Ordering::SeqCst), 0);
+    });
+    assert_eq!(wakes.0.load(Ordering::SeqCst), 1);
+}

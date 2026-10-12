@@ -422,15 +422,17 @@ pub trait WriteFile: Send {
 ///   [`write_all_at`](LogFile::write_all_at) returns `Ok`, a sync that covers
 ///   the range makes it durable, and a reader opened on the path sees the
 ///   bytes once every lower offset is written too.
-/// - **Truncation.** [`set_len`](LogFile::set_len) is called only while no
-///   write is in flight, and only to cut the file back to an offset where a
-///   write began.
+/// - **Truncation.** [`set_len`](LogFile::set_len) is called only to cut the
+///   file back to an offset where a write began, and only while no write
+///   that reaches that offset or beyond is in flight. A write that lies
+///   wholly below the new length may run at the same time, and its range
+///   holds its bytes afterwards as if the cut had not happened.
 ///
 /// # Misuse
 ///
 /// Two writes of different bytes to one offset, or a `set_len` racing a
-/// write, leave the range holding either write or a mixture; replay then
-/// reads the range as a torn tail.
+/// write that reaches the new length, leave the range holding either write
+/// or a mixture; replay then reads the range as a torn tail.
 pub trait LogFile: Send + Sync {
     /// Write every byte of `buf` at `offset`, extending the file as needed.
     fn write_all_at(&self, offset: u64, buf: &[u8]) -> io::Result<()>;

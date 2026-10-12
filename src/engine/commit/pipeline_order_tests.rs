@@ -12,6 +12,7 @@ use tempfile::TempDir;
 use super::super::ValidationSet;
 use super::early::EarlyVerdict;
 use super::hook::Stage;
+use super::park::Help;
 use super::pipeline::Turn;
 use super::pipeline_tests::{
     arm_sync_failure, durable_put, eventual_put, install, key, open_engine, put_with, seq_of,
@@ -124,7 +125,7 @@ fn a_decision_computed_before_a_rollback_lands_nothing() {
             let pipe = engine.pipe().unwrap();
             let log = Arc::clone(&pipe.tip.load().after.log);
             log.poison(io::Error::other("injected log failure"));
-            engine.sync_round(pipe);
+            assert!(engine.sync_round(pipe, Help::Wait).is_ok());
             assert!(!log.is_poisoned(), "the round rolled the log back");
         },
     );
@@ -211,7 +212,7 @@ fn a_record_written_ahead_of_an_unwritten_one_is_not_recovered() {
     let (second_index, second) = install(&engine, eventual_put(b"second", b"v"));
     let pipe = engine.pipe().unwrap();
     assert!(matches!(
-        engine.help_decide(pipe, second_index, true),
+        engine.help_decide(pipe, second_index, Help::Wait),
         Turn::Done
     ));
     // Only the second commit's record is written: a hole lies before it.

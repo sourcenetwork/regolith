@@ -23,6 +23,11 @@
 //! - **A claimed unit is device I/O under way.** A blocking call that finds
 //!   it claimed waits for it, as it waits for a sync; a `commit_nowait`
 //!   commit leaves it on its queue.
+//! - **A unit a queue's poll runs waits for no other thread.** While it
+//!   drains the pipeline it parks on whatever another thread has, having
+//!   changed nothing. Its body, once begun, runs to its end, so the poll
+//!   first takes what the unit said its body may wait for ([`Needs`]), or
+//!   parks (`park.rs`).
 //!
 //! # The rotation check
 //!
@@ -60,11 +65,13 @@
 
 use std::io;
 use std::sync::Arc;
+use std::task::Waker;
 
 use super::super::internal_key::{
     VALUE_TYPE_DELETION, VALUE_TYPE_MERGE, VALUE_TYPE_VALUE, decode_internal_key,
 };
-use super::super::io::job::{Job, JobBody};
+use super::super::io::job::{Job, JobBody, Step};
+use super::super::io::scope;
 use super::super::take::Take;
 use super::super::wal::{check_write_len, encode_ops_record, ops_record_len, wal_filename};
 use super::super::wal_frame::KIND_GROUP;
@@ -75,6 +82,7 @@ use super::super::{
 use super::descriptor::{
     After, Decision, Descriptor, FAILED, Turned, Verdict as Fate, Work, is_immediate,
 };
+use super::park::{Help, Needs};
 use super::pipeline::{Pipeline, Progress, Turn};
 use super::request::batch_op_memtable_cost;
 use super::ring::Loaded;
@@ -96,22 +104,34 @@ struct Unit {
 }
 
 impl Unit {
-    fn run(self) {
-        if let Some(engine) = self.engine.upgrade() {
-            engine.run_unit(self.index.load(Ordering::Acquire));
+    /// `false` when a poll's unit parked.
+    fn go(&self, help: Help<'_>) -> bool {
+        match self.engine.upgrade() {
+            Some(engine) => engine.run_unit(self.index.load(Ordering::Acquire), help),
+            None => true,
         }
     }
 }
 
 impl JobBody for Unit {
     fn run(self: Box<Self>) {
-        (*self).run();
+        self.go(Help::Wait);
+    }
+
+    /// On a queue's poll: parks instead of waiting for another thread.
+    fn step(self: Box<Self>, waker: &Waker) -> Step {
+        let _no_wait = scope::no_wait();
+        if self.go(Help::Park(waker)) {
+            Step::Done
+        } else {
+            Step::Parked(self)
+        }
     }
 
     /// The pipeline cannot pass a unit that did not run, so a release runs
     /// it too.
     fn release(self: Box<Self>) {
-        (*self).run();
+        self.go(Help::Wait);
     }
 }
 
@@ -122,20 +142,58 @@ struct TurnCheck {
 }
 
 impl TurnCheck {
-    fn run(self) {
-        if let Some(engine) = self.engine.upgrade() {
-            engine.run_turn(self.index);
+    /// `false` when a poll's check parked.
+    fn go(&self, help: Help<'_>) -> bool {
+        match self.engine.upgrade() {
+            Some(engine) => engine.run_turn(self.index, help),
+            None => true,
         }
     }
 }
 
 impl JobBody for TurnCheck {
     fn run(self: Box<Self>) {
-        (*self).run();
+        self.go(Help::Wait);
+    }
+
+    /// On a queue's poll: parks instead of waiting for another thread.
+    fn step(self: Box<Self>, waker: &Waker) -> Step {
+        let _no_wait = scope::no_wait();
+        if self.go(Help::Park(waker)) {
+            Step::Done
+        } else {
+            Step::Parked(self)
+        }
     }
 
     fn release(self: Box<Self>) {
-        (*self).run();
+        self.go(Help::Wait);
+    }
+}
+
+/// What the rotation check does about the active memtable.
+#[derive(Clone, Copy)]
+enum Rotation {
+    /// It holds this many bytes, below `write_buffer_size`: the count is
+    /// corrected and nothing is sealed.
+    NotDue(usize),
+    /// Seal it, and leave its flush to the background.
+    Seal,
+    /// The frozen memtables are at the cap of `room`: flush the oldest
+    /// first, here, then seal.
+    FlushFirst { room: usize },
+    /// The cap is one memtable: seal it and flush it, here.
+    FlushSealed,
+}
+
+impl Rotation {
+    /// What carrying it out may wait for.
+    fn needs(self) -> Needs {
+        match self {
+            Rotation::NotDue(_) => Needs::NONE,
+            Rotation::Seal => Needs::VERSIONS,
+            Rotation::FlushFirst { .. } | Rotation::FlushSealed => Needs::FLUSH,
+        }
     }
 }
 
@@ -272,9 +330,9 @@ impl Ordered<'_> {
         if let Err(err) = logged {
             tracing::error!(error = %err, "a commit failed in the write-ahead log; discarding its record");
             // The record was placed and written by this thread alone, so
-            // there is no other writer of it to turn away: the epoch stays.
-            let (_, cut) = log.rollback_to(place.offset.max(log.durable()), self.state.epoch);
-            if let Err(cut_err) = cut {
+            // there is no other writer of it to turn away or to wait for:
+            // the epoch stays.
+            if let Err(cut_err) = log.cut_own(place.offset.max(log.durable())) {
                 engine.latch_wal_failure(&cut_err);
             }
             engine.notify_wal_error(&err)?;
@@ -330,14 +388,14 @@ impl Ordered<'_> {
 }
 
 impl RegolithEngine {
-    /// A unit descriptor whose body is `body`.
-    fn unit(&self, body: Body) -> RingArc<Descriptor> {
+    /// A unit descriptor whose body is `body` and may wait for `needs`.
+    pub(super) fn unit(&self, needs: Needs, body: Body) -> RingArc<Descriptor> {
         let index = Arc::new(AtomicU64::new(0));
         let job = Job::new(Box::new(Unit {
             engine: self.me.clone(),
             index: Arc::clone(&index),
         }));
-        let desc = Descriptor::new(Work::Unit { job, index });
+        let desc = Descriptor::new(Work::Unit { job, index, needs });
         desc.body.put(body);
         RingArc::new(desc)
     }
@@ -345,20 +403,37 @@ impl RegolithEngine {
     /// Run `body` in the ordered step and return what it returns. See the
     /// module docs: the body may run on another thread, and runs with every
     /// earlier commit published and no later one decided.
+    ///
+    /// For a body that waits for no other thread. One that changes the
+    /// version set or flushes says so through [`Self::ordered_needing`].
     pub(crate) fn ordered<T: Send + 'static>(
         &self,
+        body: impl FnOnce(&RegolithEngine, &mut Ordered<'_>) -> io::Result<T> + Send + 'static,
+    ) -> io::Result<T> {
+        self.ordered_needing(Needs::NONE, body)
+    }
+
+    /// [`Self::ordered`] for a body that may wait for `needs` on another
+    /// thread. A queue's poll that runs the unit takes them before the body
+    /// begins, so the body never waits there (`park.rs`, K3).
+    pub(crate) fn ordered_needing<T: Send + 'static>(
+        &self,
+        needs: Needs,
         body: impl FnOnce(&RegolithEngine, &mut Ordered<'_>) -> io::Result<T> + Send + 'static,
     ) -> io::Result<T> {
         let pipe = self.pipe()?;
         let result: Arc<Take<io::Result<T>>> = Arc::new(Take::empty());
         let out = Arc::clone(&result);
-        let desc = self.unit(Box::new(move |engine, ord| out.put(body(engine, ord))));
+        let desc = self.unit(
+            needs,
+            Box::new(move |engine, ord| out.put(body(engine, ord))),
+        );
         let index = self.enter(pipe, &desc);
         loop {
             if let Some(result) = result.take() {
                 return result;
             }
-            match self.help_decide(pipe, index, true) {
+            match self.help_decide(pipe, index, Help::Wait) {
                 Turn::Blocked(job) => self.run_or_wait(&job),
                 Turn::Done => {
                     // Every slot before the unit is published, and the unit
@@ -376,18 +451,28 @@ impl RegolithEngine {
     }
 
     /// Run the unit at slot `index`: drain the pipeline, run the body, and
-    /// decide the slot with the state the body left.
-    fn run_unit(&self, index: u64) {
+    /// decide the slot with the state the body left. `false` when a poll's
+    /// unit parked, before its body began.
+    fn run_unit(&self, index: u64, help: Help<'_>) -> bool {
         let Some(pipe) = self.pipeline.as_ref() else {
-            return;
+            return true;
         };
         let Loaded::Ready(desc) = pipe.ring.load(index) else {
-            return;
+            return true;
         };
         if desc.decision().is_some() {
-            return;
+            return true;
         }
-        let (_held, state) = self.drained(pipe, index);
+        let Some((held, state)) = self.drained(pipe, index, help) else {
+            return false;
+        };
+        let needs = match &desc.work {
+            Work::Unit { needs, .. } => *needs,
+            Work::Request(_) | Work::Allocate { .. } => Needs::NONE,
+        };
+        let Some(kept) = self.keep(needs, help) else {
+            return false;
+        };
         let mut ord = Ordered {
             engine: self,
             state,
@@ -399,18 +484,38 @@ impl RegolithEngine {
         // The state the body left is the tip before the round is let go:
         // a rollback, which needs the round, then starts from it.
         self.settle(pipe, index, &desc);
+        self.unkeep(kept);
+        drop(held);
+        true
+    }
+
+    /// Give back what a poll took for a unit's body. A stopped writer that
+    /// found the flush exclusion held looks again once it is released, as
+    /// after every flush (`StallSignal`, relief handed back).
+    fn unkeep(&self, kept: super::park::Kept<'_>) {
+        if kept.release() {
+            self.refresh_stall_level();
+        }
     }
 
     /// Bring every slot before `index` through to published, with the
     /// decided frontier at `index - 1`. The caller runs a unit, so it does
-    /// its own device I/O and waits for what is under way.
-    fn drain_before(&self, pipe: &Pipeline, index: u64) {
+    /// its own device I/O. What another thread has under way a blocking
+    /// caller waits for; a poll parks, and `false` says so.
+    fn drain_before(&self, pipe: &Pipeline, index: u64, help: Help<'_>) -> bool {
         loop {
             match self.publish_upto(pipe, index - 1) {
-                Progress::Published => return,
-                Progress::NeedsSync | Progress::Failed => self.sync_round(pipe),
+                Progress::Published => return true,
+                Progress::NeedsSync | Progress::Failed => {
+                    if self.sync_round(pipe, help).is_err() {
+                        return false;
+                    }
+                }
                 Progress::Undecided => {
-                    if let Turn::Blocked(job) = self.help_decide(pipe, index - 1, true) {
+                    if let Turn::Blocked(job) = self.help_decide(pipe, index - 1, help) {
+                        if !matches!(help, Help::Wait) {
+                            return false;
+                        }
                         self.run_or_wait(&job);
                     }
                 }
@@ -420,18 +525,30 @@ impl RegolithEngine {
 
     /// Drain the pipeline before slot `index` and hold the round: what a
     /// unit's body runs under. Returns the hold and the state the pipeline
-    /// is in. A log that failed is rolled back first, here.
-    fn drained<'a>(&'a self, pipe: &Pipeline, index: u64) -> (HeldRound<'a>, After) {
-        self.drain_before(pipe, index);
+    /// is in. A log that failed is rolled back first, here. `None` when a
+    /// poll parked on the way: it holds nothing then (`park.rs`, K1).
+    fn drained<'a>(
+        &'a self,
+        pipe: &Pipeline,
+        index: u64,
+        help: Help<'_>,
+    ) -> Option<(HeldRound<'a>, After)> {
+        if !self.drain_before(pipe, index, help) {
+            return None;
+        }
         // Nothing before `index` is unpublished from here on, and nothing
         // after it is decided before this unit is. Only the log can still
         // change under a unit, in a round another thread runs; the hold
         // stops that.
-        let held = self.hold_round(pipe);
-        if pipe.tip.load().after.log.is_poisoned() {
+        let held = self.hold_round(pipe, help)?;
+        let tip = pipe.tip.load();
+        if tip.after.log.is_poisoned() {
+            if !self.turned_away(&tip, help) {
+                return None;
+            }
             self.roll_back(pipe);
         }
-        (held, pipe.tip.load().after.clone())
+        Some((held, pipe.tip.load().after.clone()))
     }
 
     /// Discard every commit decided and not published (G2), and leave the
@@ -625,7 +742,7 @@ impl RegolithEngine {
         &self,
         index: u64,
         desc: &'d Descriptor,
-        can_run: bool,
+        help: Help<'_>,
     ) -> Result<&'d Turned, Arc<Job>> {
         let job = match desc.turn_job.get() {
             Some(job) => job,
@@ -634,11 +751,8 @@ impl RegolithEngine {
                 index,
             }))),
         };
-        if !job.is_done() {
-            if !(can_run && job.claim()) {
-                return Err(Arc::clone(job));
-            }
-            self.io().run_job(job);
+        if !self.pass(job, help) {
+            return Err(Arc::clone(job));
         }
         Ok(match desc.turn.get() {
             Some(turned) => turned,
@@ -652,27 +766,36 @@ impl RegolithEngine {
     }
 
     /// The rotation check at slot `index`: drain the pipeline, then rotate
-    /// if the memtable is in fact full.
-    fn run_turn(&self, index: u64) {
+    /// if the memtable is in fact full. `false` when a poll's check parked,
+    /// before it sealed or flushed anything.
+    fn run_turn(&self, index: u64, help: Help<'_>) -> bool {
         let Some(pipe) = self.pipeline.as_ref() else {
-            return;
+            return true;
         };
         let Loaded::Ready(desc) = pipe.ring.load(index) else {
-            return;
+            return true;
         };
         if desc.turn.get().is_some() || desc.decision().is_some() {
-            return;
+            return true;
         }
         // A flush the rotation runs under back-pressure calls the caller's
         // code (a prefix extractor, a listener): a panic there is caught, as
         // in every ordered step of a commit, and latches the database.
         let _commit = super::super::callback::InCommit::enter();
-        let (_held, state) = self.drained(pipe, index);
+        let Some((held, state)) = self.drained(pipe, index, help) else {
+            return false;
+        };
+        // Decided once, with the round held: the frozen list only shrinks
+        // under a unit, so what the check needs now is all it will need.
+        let rotation = self.rotation_due(&state);
+        let Some(kept) = self.keep(rotation.needs(), help) else {
+            return false;
+        };
         let mut ord = Ordered {
             engine: self,
             state,
         };
-        let refused = self.rotate_if_full(&mut ord).err();
+        let refused = self.rotate(&mut ord, rotation).err();
         if let Some(err) = &refused
             && let Some(callback) = crate::Error::callback_panic_of(err)
         {
@@ -689,59 +812,83 @@ impl RegolithEngine {
             }
         }
         desc.turn.get_or_set(Turned { refused });
+        self.unkeep(kept);
+        drop(held);
+        true
     }
 
-    /// Seal the active memtable when it has reached `write_buffer_size`,
-    /// in the ordered step, before the write whose turn this is takes a
-    /// sequence: a failure is the write's, and means it did not land.
+    /// What the rotation check does about the active memtable of `state`,
+    /// read with the round held.
+    ///
+    /// A rotation leaves at most `max_write_buffer_number` memtables. One
+    /// that may leave none but the fresh active one flushes what it seals
+    /// here, as every rotation did before flushes left the commit path.
+    /// Otherwise the flushes behind it are normally done and nothing is
+    /// written here. When they are not, the oldest frozen memtables are
+    /// written out first: memory stays within the cap, and the commit path
+    /// waits only when the background has fallen a whole memtable behind.
+    fn rotation_due(&self, state: &After) -> Rotation {
+        let used = state.memtable.approximate_size();
+        if used < self.options.write_buffer_size {
+            return Rotation::NotDue(used);
+        }
+        match self.options.max_write_buffer_number.checked_sub(1) {
+            Some(0) => Rotation::FlushSealed,
+            Some(room) if self.view.load().frozen.len() >= room => Rotation::FlushFirst { room },
+            Some(_) | None => Rotation::Seal,
+        }
+    }
+
+    /// Carry `rotation` out in the ordered step, before the write whose
+    /// turn this is takes a sequence: a failure is the write's, and means
+    /// it did not land.
     ///
     /// A memtable below the size only has its counted bytes corrected to
     /// what it holds: the count is an upper bound.
-    fn rotate_if_full(&self, ord: &mut Ordered<'_>) -> io::Result<()> {
-        let used = ord.state.memtable.approximate_size();
-        if used < self.options.write_buffer_size {
-            ord.state.mem_used = used;
-            return Ok(());
-        }
-        // A rotation leaves at most `max_write_buffer_number` memtables. One
-        // that may leave none but the fresh active one flushes what it seals
-        // here, as every rotation did before flushes left the commit path.
-        let room = self.options.max_write_buffer_number.checked_sub(1);
-        if room == Some(0) {
-            let sealed = ord.seal(true)?;
-            let flushed = self.flush_until_retired(&sealed);
-            // Even when the flush failed: the memtable it left frozen counts
-            // toward the stall thresholds.
-            self.refresh_stall_level();
-            return flushed;
-        }
-        // Normally the flushes behind it are done and nothing is written
-        // here. When they are not, the oldest frozen memtables are written
-        // out first: memory stays within the cap, and the commit path waits
-        // only when the background has fallen a whole memtable behind.
-        if let Some(room) = room {
-            while self.view.load().frozen.len() >= room {
-                // The exclusion is released before the level is refreshed.
-                let flushed = self
-                    .flusher
-                    .flushing()
-                    .and_then(|flushing| self.flush_oldest_frozen(&flushing));
-                // A failed flush too, once its exclusion is released: a
-                // stopped writer it held off looks again (`StallSignal`,
-                // relief handed back).
-                if flushed.is_err() {
-                    self.refresh_stall_level();
-                }
-                if !flushed? {
-                    break;
-                }
+    fn rotate(&self, ord: &mut Ordered<'_>, rotation: Rotation) -> io::Result<()> {
+        match rotation {
+            Rotation::NotDue(used) => {
+                ord.state.mem_used = used;
+                return Ok(());
             }
+            Rotation::FlushSealed => {
+                let sealed = ord.seal(true)?;
+                let flushed = self.flush_until_retired(&sealed);
+                // Even when the flush failed: the memtable it left frozen
+                // counts toward the stall thresholds.
+                self.refresh_stall_level();
+                return flushed;
+            }
+            Rotation::Seal => {}
+            Rotation::FlushFirst { room } => self.flush_down_to(room)?,
         }
         // Sealed here and flushed off the commit path (E9): by the worker,
         // or by a writer once it leaves the pipeline.
         ord.seal(true)?;
         self.flush_sealed_later();
         self.refresh_stall_level();
+        Ok(())
+    }
+
+    /// Flush the oldest frozen memtables, here, until fewer than `room`
+    /// are left.
+    fn flush_down_to(&self, room: usize) -> io::Result<()> {
+        while self.view.load().frozen.len() >= room {
+            // The exclusion is released before the level is refreshed.
+            let flushed = self
+                .flusher
+                .flushing()
+                .and_then(|flushing| self.flush_oldest_frozen(&flushing));
+            // A failed flush too, once its exclusion is released: a
+            // stopped writer it held off looks again (`StallSignal`,
+            // relief handed back).
+            if flushed.is_err() {
+                self.refresh_stall_level();
+            }
+            if !flushed? {
+                break;
+            }
+        }
         Ok(())
     }
 }

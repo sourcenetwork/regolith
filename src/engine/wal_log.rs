@@ -29,11 +29,13 @@
 //!   the handle could tell a later caller the bytes of a failed one were
 //!   safe.
 //! - **A rolled back range is not written by a stale writer.** Every write
-//!   passes the gate: it counts itself in, compares the epoch its `Place`
-//!   was decided in with the log's, and counts itself out. A rollback moves
-//!   the epoch on and waits for the count to reach zero before it cuts the
-//!   file, so a write of a discarded commit either finished before the cut,
-//!   which removes it, or never starts.
+//!   passes the gate (`wal_gate.rs`): it is counted in only while the log is
+//!   still in the epoch its `Place` was decided in, and counted out when it
+//!   is done. A rollback moves the epoch on and cuts the file once no write
+//!   is in flight, so a write of a discarded commit either finished before
+//!   the cut, which removes it, or never starts. A blocking caller waits
+//!   for those writes; a queue's poll parks until the last one left
+//!   ([`Log::turn_away`]).
 //! - **Nothing follows CLOSE.** [`Log::close`] is called with the pipeline
 //!   drained, and no commit is decided after it.
 
@@ -44,9 +46,10 @@ use std::sync::Arc;
 use super::seal::{Keyring, NONCE_LEN, OVERHEAD, Sealer};
 use super::take::Take;
 use super::wal_frame::{self, HEADER_LEN};
+use super::wal_gate::Gate;
 use super::wal_seal::{self, SEALED_PREFIX_LEN};
 use crate::env::{Env, LogFile, WriteMode};
-use crate::portability::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use crate::portability::{AtomicBool, AtomicU64, Ordering};
 
 /// Where one commit's record goes and what frames it: everything about the
 /// record that is not its operations, fixed when the commit is decided.
@@ -88,11 +91,10 @@ pub(crate) struct Log {
     durable: AtomicU64,
     /// The directory entry naming the file is durable.
     parent_synced: AtomicBool,
-    /// Moved on by every rollback: a write decided in an older epoch is of a
-    /// discarded commit and is not made.
-    epoch: AtomicU64,
-    /// Writes between the gate's count in and its count out.
-    writers: AtomicUsize,
+    /// The write epoch, moved on by every rollback, and the writes in
+    /// flight: a write decided in an older epoch is of a discarded commit
+    /// and is not made.
+    gate: Gate,
     /// A write or a sync of this log failed and the rollback that discards
     /// what it left has not run yet: no sync may vouch for the log meanwhile.
     poisoned: AtomicBool,
@@ -147,8 +149,7 @@ impl Log {
             stamp_len,
             durable: AtomicU64::new(if synced { stamp_len } else { 0 }),
             parent_synced: AtomicBool::new(synced),
-            epoch: AtomicU64::new(0),
-            writers: AtomicUsize::new(0),
+            gate: Gate::new(),
             poisoned: AtomicBool::new(false),
             failure: Take::empty(),
         })
@@ -178,8 +179,7 @@ impl Log {
             stamp_len,
             durable: AtomicU64::new(durable),
             parent_synced: AtomicBool::new(parent_synced),
-            epoch: AtomicU64::new(0),
-            writers: AtomicUsize::new(0),
+            gate: Gate::new(),
             poisoned: AtomicBool::new(false),
             failure: Take::empty(),
         })
@@ -229,12 +229,12 @@ impl Log {
 
     /// The log's write epoch: the one a record decided now is written in.
     pub(crate) fn epoch(&self) -> u64 {
-        self.epoch.load(Ordering::SeqCst)
+        self.gate.epoch()
     }
 
     /// Start a log nothing was written to yet in `epoch`, the pipeline's.
     pub(crate) fn start_epoch(&self, epoch: u64) {
-        self.epoch.store(epoch, Ordering::SeqCst);
+        self.gate.turn(epoch);
     }
 
     /// Fix where the record of `payload_len` bytes of operations goes, at
@@ -303,17 +303,12 @@ impl Log {
     /// offset. `Ok(false)` when the commit it belongs to was discarded by a
     /// rollback since it was decided: nothing is written.
     pub(crate) fn write_record(&self, place: &Place, record: &[u8]) -> io::Result<bool> {
-        // Counted in before the epoch is read: a rollback that moved the
-        // epoch and then saw no writer cannot have missed this one.
-        self.writers.fetch_add(1, Ordering::SeqCst);
-        let current = self.epoch.load(Ordering::SeqCst) == place.epoch;
-        let wrote = if current {
-            self.file.write_all_at(place.offset, record)
-        } else {
-            Ok(())
-        };
-        self.writers.fetch_sub(1, Ordering::SeqCst);
-        wrote.map(|()| current)
+        if !self.gate.enter(place.epoch) {
+            return Ok(false);
+        }
+        let wrote = self.file.write_all_at(place.offset, record);
+        self.gate.leave(place.epoch);
+        wrote.map(|()| true)
     }
 
     /// Make every byte below `through` durable, where `through` is the end
@@ -366,7 +361,9 @@ impl Log {
     /// Moves the write epoch on to `epoch`, which no record of this log was
     /// decided in, and waits for the writes already past the gate, so no
     /// write of a discarded commit lands after the cut (see the module
-    /// docs). The wait is for positional writes already in flight.
+    /// docs). The wait is for positional writes already in flight; a caller
+    /// that may not wait calls [`Log::turn_away`] first and comes here once
+    /// it answered `true`, when there is nothing left to wait for.
     pub(crate) fn rollback_to(
         &self,
         offset: u64,
@@ -376,9 +373,12 @@ impl Log {
             offset >= self.stamp_len && offset >= self.durable(),
             "a rollback reaches neither into the stamp nor below what a sync covered"
         );
-        self.epoch.store(epoch, Ordering::SeqCst);
-        while self.writers.load(Ordering::SeqCst) != 0 {
-            std::thread::yield_now();
+        self.gate.turn(epoch);
+        if !self.gate.is_clear() {
+            super::io::scope::waits("positional writes in flight on a log being rolled back");
+            while !self.gate.is_clear() {
+                std::thread::yield_now();
+            }
         }
         let cut = self.file.set_len(offset);
         let cause = self.failure.take();
@@ -386,6 +386,43 @@ impl Log {
             self.poisoned.store(false, Ordering::Release);
         }
         (cause, cut)
+    }
+
+    /// The first step of a rollback to `epoch` by a job that may not wait:
+    /// turn every later write of an older epoch away, and say whether the
+    /// ones already in flight have left. `false` parks the job: `waker` is
+    /// woken by the last of them to leave. Moving the epoch twice to the
+    /// same value changes nothing, so the rollback that follows, by this
+    /// job or by a blocking caller that claimed the round meanwhile, starts
+    /// over from [`Log::rollback_to`].
+    pub(crate) fn turn_away(&self, epoch: u64, waker: &std::task::Waker) -> bool {
+        self.gate.turn(epoch);
+        self.gate.clear_or_park(waker)
+    }
+
+    /// Test-only: stand in the gate as a write decided in the current
+    /// epoch does while its bytes are on their way to the host, until the
+    /// guard drops.
+    #[cfg(test)]
+    pub(crate) fn write_in_flight(&self) -> impl Drop + '_ {
+        struct InFlight<'a>(&'a Gate, u64);
+        impl Drop for InFlight<'_> {
+            fn drop(&mut self) {
+                self.0.leave(self.1);
+            }
+        }
+        let epoch = self.gate.epoch();
+        assert!(self.gate.enter(epoch));
+        InFlight(&self.gate, epoch)
+    }
+
+    /// Cut off the record at `offset`, which the calling thread alone
+    /// placed and wrote, and everything after it. No other write reaches
+    /// `offset` or beyond, so nothing is waited for: a write still in flight
+    /// is a helper's copy of an earlier record, wholly below the cut.
+    pub(crate) fn cut_own(&self, offset: u64) -> io::Result<()> {
+        debug_assert!(offset >= self.stamp_len && offset >= self.durable());
+        self.file.set_len(offset)
     }
 
     /// Close the log cleanly, whose records end at `end`: sync every record,

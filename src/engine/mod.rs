@@ -54,6 +54,7 @@ pub(crate) mod wal;
 #[cfg(test)]
 mod wal_close_tests;
 pub(crate) mod wal_frame;
+mod wal_gate;
 pub(crate) mod wal_log;
 pub(crate) mod wal_replay;
 #[cfg(test)]
@@ -2399,7 +2400,7 @@ impl RegolithEngine {
         &self,
         needed: impl Fn(&RegolithEngine, &MemTable) -> bool + Send + 'static,
     ) -> std::io::Result<()> {
-        let sealed = self.ordered(move |engine, ord| {
+        let sealed = self.ordered_needing(commit::Needs::VERSIONS, move |engine, ord| {
             if needed(engine, ord.active()) {
                 ord.seal(true).map(Some)
             } else {
@@ -2422,7 +2423,7 @@ impl RegolithEngine {
     /// a fresh WAL, in the ordered step, and return it.
     #[cfg(test)]
     pub(crate) fn seal_active(&self) -> std::io::Result<Arc<MemTable>> {
-        self.ordered(|_, ord| ord.seal(true))
+        self.ordered_needing(commit::Needs::VERSIONS, |_, ord| ord.seal(true))
     }
 
     /// Flush frozen memtables, oldest first, until `target` is no
@@ -2458,10 +2459,7 @@ impl RegolithEngine {
     /// it, then wake the compaction worker, or, with none, owe the next
     /// write a bounded step. Returns `false` when there was
     /// nothing frozen to flush. See [`Flusher::flush_oldest`].
-    fn flush_oldest_frozen(
-        &self,
-        flushing: &crate::sync::MutexGuard<'_, ()>,
-    ) -> std::io::Result<bool> {
+    fn flush_oldest_frozen(&self, flushing: &flush::Flushing<'_>) -> std::io::Result<bool> {
         let flushed = self.flusher.flush_oldest(flushing)?;
         if flushed {
             self.after_flush();
@@ -2863,7 +2861,9 @@ impl RegolithEngine {
         // does its own I/O and chose to block (plan 3.0), so it waits for
         // the gate on its own thread.
         let _gate = self.compaction_gate.exclusive()?;
-        self.ordered(|engine, ord| engine.drop_all_ordered(ord))
+        self.ordered_needing(commit::Needs::FLUSH, |engine, ord| {
+            engine.drop_all_ordered(ord)
+        })
     }
 
     /// [`Self::drop_all`] in the ordered step: every earlier commit is
@@ -3110,7 +3110,8 @@ impl RegolithEngine {
         // would never finish: `Db::checkpoint` calls this with
         // `ActiveFlush::Always`, so a checkpoint taken while anything is
         // writing would hang rather than capture.
-        let targets: Vec<Arc<MemTable>> = self.ordered(move |engine, ord| {
+        let seals = commit::Needs::VERSIONS;
+        let targets: Vec<Arc<MemTable>> = self.ordered_needing(seals, move |engine, ord| {
             let view = engine.view.load();
             let seal_active = match active {
                 ActiveFlush::WhenFull => memtable_needs_flush(&view.active),

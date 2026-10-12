@@ -24,7 +24,10 @@
 //! - **A job parks open** ([`Flight::park`]): back to `Free`, before any
 //!   of its gated work ran, so whoever is to go on with it claims it again:
 //!   its owner's queue once the job's waker says it may go on, or a blocking
-//!   caller that chose to wait for it on its own thread (`job.rs`).
+//!   caller that chose to wait for it on its own thread (`job.rs`). A job
+//!   several callers wait on tells the ones that saw it claimed when it
+//!   parks, and every queue registered on it when its wait ends, so none of
+//!   them is left waiting on the thread that parked it.
 //! - **A block read parks closed** ([`Flight::park_closed`]): to `Parked`,
 //!   which no claim takes. Every queue that registered on the read would
 //!   otherwise claim it at its next poll and find the same slots busy. It
@@ -134,6 +137,14 @@ impl Flight {
     /// caller then reads the outcome itself.
     pub(crate) fn register(&self, queue: Arc<QueueShared>) -> bool {
         self.waiters.push(queue, SHUT).is_ok()
+    }
+
+    /// Take the queues registered so far out of the list, which stays as
+    /// open or as closed as it was. The caller registers each of them again
+    /// once it has told it what it has to, and tells a queue the list then
+    /// refuses that the unit landed: the lander did not see that queue.
+    pub(crate) fn registered(&self) -> Taken<Arc<QueueShared>> {
+        self.waiters.take_open()
     }
 
     /// Publish `Done` and close the waiter list, returning every queue that

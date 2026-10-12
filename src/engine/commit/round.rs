@@ -9,7 +9,10 @@
 //!   commit that waits for durability waits on the round: a blocking call
 //!   claims it or waits for the thread that did, a `commit_nowait` commit
 //!   leaves it on its queue, whose poll claims it when nobody has. Nobody
-//!   waits for one particular thread to sync.
+//!   waits for one particular thread to sync. A poll that claimed the
+//!   round runs it without waiting for another thread: its one wait, for
+//!   the writes in flight on a log it must roll back, parks the round
+//!   instead (`park.rs`).
 //! - **A rollback** is what a round does when the log has failed
 //!   (`ordered.rs`), so no sync runs while commits are being discarded.
 //! - **A hold** is the round claimed by an ordered unit for the length of
@@ -23,12 +26,15 @@
 //! lands, so a thread woken by the landing finds a round it can claim.
 
 use std::sync::Arc;
+use std::task::Waker;
 
 use super::super::RegolithEngine;
 use super::super::callback::InCommit;
-use super::super::io::job::{Job, JobBody};
+use super::super::io::job::{Job, JobBody, Step};
+use super::super::io::scope;
 use super::descriptor::{Decision, WRITTEN};
 use super::hook;
+use super::park::Help;
 use super::pipeline::Pipeline;
 use super::ring::{Linked, Loaded};
 use super::spare;
@@ -107,31 +113,54 @@ impl RegolithEngine {
     }
 
     /// Bring the log durable through what is written now, or a failed log
-    /// rolled back: run the current round, or wait for the thread running
-    /// it.
-    pub(super) fn sync_round(&self, pipe: &Pipeline) {
+    /// rolled back: get past the current round as `help` says (`park.rs`).
+    /// `Err` is the round, for a call that did not get past it.
+    pub(super) fn sync_round(&self, pipe: &Pipeline, help: Help<'_>) -> Result<(), Arc<Job>> {
         let round = self.current_round(pipe);
-        hook::at(hook::Stage::Sync);
-        self.run_or_wait(&round.job);
+        if help.runs() {
+            hook::at(hook::Stage::Sync);
+        }
+        if !self.pass(&round.job, help) {
+            return Err(Arc::clone(&round.job));
+        }
         // The round is over and replaced: this may be its last reference.
         spare::keep_round(round);
+        Ok(())
     }
 
-    /// Claim the round, waiting out one another thread has under way, and
-    /// hold it until the returned guard drops. The holder does the log's
-    /// device step itself: no sync and no rollback of another thread runs
-    /// meanwhile. What an ordered unit's body runs under (`ordered.rs`).
-    pub(super) fn hold_round<'a>(&'a self, pipe: &Pipeline) -> HeldRound<'a> {
+    /// Claim the round and hold it until the returned guard drops. The
+    /// holder does the log's device step itself: no sync and no rollback of
+    /// another thread runs meanwhile. What an ordered unit's body runs under
+    /// (`ordered.rs`).
+    ///
+    /// A blocking call waits out a round another thread has under way and
+    /// always gets `Some`. `None` is for a call that may not wait: a poll's
+    /// waker is then woken when that thread lets the round go.
+    pub(super) fn hold_round<'a>(
+        &'a self,
+        pipe: &Pipeline,
+        help: Help<'_>,
+    ) -> Option<HeldRound<'a>> {
         loop {
             let round = self.current_round(pipe);
             if round.job.claim() {
                 round.held.store(1, Ordering::SeqCst);
-                return HeldRound {
+                return Some(HeldRound {
                     engine: self,
                     round,
-                };
+                });
             }
-            round.job.wait_landed();
+            match help {
+                Help::Wait => {
+                    round.job.wait_turn();
+                }
+                Help::Leave => return None,
+                Help::Park(waker) => {
+                    if round.job.watch(waker) {
+                        return None;
+                    }
+                }
+            }
         }
     }
 
@@ -140,10 +169,17 @@ impl RegolithEngine {
     /// durable offset over it, and publish what that made publishable. A
     /// log that failed, in this round or before it, is rolled back here
     /// (P4).
-    fn run_sync_round(&self, pipe: &Pipeline, round: &RingArc<Round>) {
+    ///
+    /// `false` when a poll's round parked: the log failed and writes of the
+    /// commits to discard are still in flight. The round is then as it was,
+    /// for the next thread that claims it.
+    fn run_sync_round(&self, pipe: &Pipeline, round: &RingArc<Round>, help: Help<'_>) -> bool {
         let tip = pipe.tip.load();
         self.sync_written(pipe, &tip);
         if tip.after.log.is_poisoned() {
+            if !self.turned_away(&tip, help) {
+                return false;
+            }
             self.roll_back(pipe);
         }
         // The next round is in place before this one lands, so a thread
@@ -152,6 +188,22 @@ impl RegolithEngine {
         // The slots this round made durable, and the ones behind them that
         // waited only for those: bounded by what was decided when it began.
         let _ = self.publish_upto(pipe, tip.index);
+        true
+    }
+
+    /// Before a rollback of the failed log `tip` names, by the thread that
+    /// holds the round: `false` when the caller is a poll and writes are
+    /// still in flight on the log, which a rollback waits out. The poll's
+    /// waker is then woken by the last of them, and the log already turns
+    /// every later write of a commit to discard away. A blocking caller
+    /// waits for them inside the rollback.
+    pub(super) fn turned_away(&self, tip: &Decision, help: Help<'_>) -> bool {
+        match help {
+            // The epoch the rollback moves the pipeline to (`ordered.rs`):
+            // only a rollback changes it, and this thread holds the round.
+            Help::Park(waker) => tip.after.log.turn_away(tip.after.epoch + 1, waker),
+            Help::Wait | Help::Leave => true,
+        }
     }
 
     /// The sync of one round: the written prefix of the log `tip` names,
@@ -230,15 +282,16 @@ impl SyncRound {
     }
 
     /// Run the round, keeping the body's box for the round this run makes.
-    fn sync(mut self: Box<Self>) {
-        let engine = std::mem::take(&mut self.engine);
+    /// `Err` hands the body back when a poll's round parked.
+    fn sync(mut self: Box<Self>, help: Help<'_>) -> Result<(), Box<dyn JobBody>> {
+        let weak = std::mem::take(&mut self.engine);
         #[cfg(not(loom))]
         let _ = BODY.try_with(|kept| kept.set(Some(self)));
-        let Some(engine) = engine.upgrade() else {
-            return;
+        let Some(engine) = weak.upgrade() else {
+            return Ok(());
         };
         let Some(pipe) = engine.pipeline.as_ref() else {
-            return;
+            return Ok(());
         };
         let _commit = InCommit::enter();
         // The round this job belongs to: the current one, since a round is
@@ -247,19 +300,31 @@ impl SyncRound {
         if round.held.load(Ordering::SeqCst) != 0 {
             // The thread that held the round did the device step itself.
             pipe.round.replace(&round, Round::new(engine.me.clone()));
-            return;
+            return Ok(());
         }
-        engine.run_sync_round(pipe, &round);
+        if engine.run_sync_round(pipe, &round, help) {
+            return Ok(());
+        }
+        Err(Self::boxed(weak))
     }
 }
 
 impl JobBody for SyncRound {
     fn run(self: Box<Self>) {
-        self.sync();
+        let _ = self.sync(Help::Wait);
+    }
+
+    /// On a queue's poll: parks instead of waiting for another thread.
+    fn step(self: Box<Self>, waker: &Waker) -> Step {
+        let _no_wait = scope::no_wait();
+        match self.sync(Help::Park(waker)) {
+            Ok(()) => Step::Done,
+            Err(body) => Step::Parked(body),
+        }
     }
 
     /// A sync commits wait on is never left undone: a release runs it too.
     fn release(self: Box<Self>) {
-        self.sync();
+        let _ = self.sync(Help::Wait);
     }
 }
