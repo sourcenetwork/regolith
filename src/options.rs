@@ -354,7 +354,7 @@ pub struct FifoCompactionOptions {
     /// Soft cap on the total bytes held by SSTables. After every
     /// flush, if the sum of file sizes exceeds this number, the
     /// background compaction thread unlinks the oldest SSTables
-    /// (smallest `file_id` first) until the cap is satisfied or
+    /// (oldest first, as L0 lists them) until the cap is satisfied or
     /// only one file remains. Must be greater than zero when FIFO
     /// compaction is selected. Default: 1 GiB.
     pub max_table_files_size: u64,

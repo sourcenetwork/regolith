@@ -922,7 +922,7 @@ fn pick_and_run_level_compaction(
 /// FIFO picker: every flush lands a new L0 file, and regolith never
 /// merges in this style. After each pass, if the total bytes held
 /// across L0 exceed `max_table_files_size`, we unlink the oldest
-/// file (smallest `file_id`) and emit a `RemoveFile` edit. We stop
+/// file (the first L0 lists) and emit a `RemoveFile` edit. We stop
 /// when the cap is satisfied or only one file remains - a single
 /// oversized file is not worth deleting because that would lose
 /// data with no successor on disk.
@@ -949,10 +949,13 @@ fn pick_and_run_fifo(
         return Ok(false);
     }
 
-    // Sort by file_id ascending - smaller id was allocated earlier,
-    // so it is the oldest file by construction.
-    let mut by_age: Vec<Arc<crate::engine::sstable::LiveSst>> = l0_files;
-    by_age.sort_by_key(|f| f.meta.file_id);
+    // Oldest first: the order L0 lists its tables in, which is the order a
+    // read follows. Not the order of their file ids (E38): an ingest draws
+    // its id when it stages its file and installs it later, at the newest
+    // place, so a table flushed in between has the larger id and the older
+    // place. Dropped by id, the ingested table would go first and the
+    // older value under it would read again.
+    let by_age: Vec<Arc<crate::engine::sstable::LiveSst>> = l0_files;
 
     let mut running_total = total;
     let mut edits: Vec<VersionEdit> = Vec::new();
@@ -2203,6 +2206,8 @@ fn delete_old_files(
     }
 }
 
+#[cfg(test)]
+mod fifo_order_tests;
 #[cfg(test)]
 mod retire_tests;
 #[cfg(test)]
