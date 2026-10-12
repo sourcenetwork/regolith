@@ -327,8 +327,10 @@ fn mixed_durability_writers_all_commit() {
         let db = Arc::clone(&db);
         handles.push(thread::spawn(move || {
             for i in 0..PER_LANE {
-                db.put_opt(&opts, format!("m{lane}_{i:04}").as_bytes(), b"v")
-                    .unwrap();
+                regolith::through_stalls(|| {
+                    db.put_opt(&opts, format!("m{lane}_{i:04}").as_bytes(), b"v")
+                })
+                .unwrap();
             }
         }));
     }

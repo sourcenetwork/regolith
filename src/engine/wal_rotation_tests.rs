@@ -47,7 +47,7 @@ fn a_write_that_fills_the_memtable_fails_when_the_sealed_log_cannot_be_synced() 
 
     let value = [b'v'; 256];
     let err = (0..1000u32)
-        .find_map(|i| db.put(&i.to_be_bytes(), &value).err())
+        .find_map(|i| crate::through_stalls(|| db.put(&i.to_be_bytes(), &value)).err())
         .expect("filling the memtable must rotate it and surface the sync failure");
     assert!(
         err.to_string().contains("injected WAL sync failure"),
@@ -67,7 +67,7 @@ fn a_write_that_fills_the_memtable_fails_when_the_sealed_log_cannot_be_synced() 
 fn a_flush_fails_when_the_log_it_seals_cannot_be_synced() {
     let dir = TempDir::new().unwrap();
     let db = small_db(&dir);
-    db.put(b"k", b"v").unwrap();
+    crate::through_stalls(|| db.put(b"k", b"v")).unwrap();
     let _fault = SyncFault::arm(&dir);
 
     let err = db.flush().unwrap_err();

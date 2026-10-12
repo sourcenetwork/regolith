@@ -40,10 +40,11 @@ fn build(dir: &std::path::Path) {
     for i in 0..KEYS {
         batch.put(&i.to_be_bytes(), &value);
         if batch.buffered_bytes() >= 64 * 1024 {
-            db.write(std::mem::take(&mut batch)).unwrap();
+            let full = std::mem::take(&mut batch);
+            regolith::through_stalls(|| db.write(full.clone())).unwrap();
         }
     }
-    db.write(batch).unwrap();
+    regolith::through_stalls(|| db.write(batch.clone())).unwrap();
     db.flush().unwrap();
     db.close().unwrap();
 }

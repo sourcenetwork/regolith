@@ -112,14 +112,14 @@ impl Fixture {
     fn fill(&mut self, db: &Db) {
         let key = format!("filler/{:06}", self.filler);
         self.filler += 1;
-        db.put(key.as_bytes(), &[b'f'; FILLER]).unwrap();
+        regolith::through_stalls(|| db.put(key.as_bytes(), &[b'f'; FILLER])).unwrap();
     }
 
     /// Put `key = value`, then have this fixture's path flush the memtable
     /// holding it. Returns once that flush has run.
     fn put_and_flush(&mut self, db: &Db, key: &[u8], value: &[u8]) {
         let flushes = self.ticker(Ticker::FlushCount);
-        db.put(key, value).unwrap();
+        regolith::through_stalls(|| db.put(key, value)).unwrap();
         match self.path {
             FlushPath::Worker => {
                 // Write until the memtable seals, then stop: a second seal
@@ -190,7 +190,7 @@ fn a_log_left_behind_is_counted_and_never_replayed(path: FlushPath) {
         let db = f.open();
         if let FlushPath::StallStep = path {
             // The table that turns the slowdown on.
-            db.put(b"seed", b"v").unwrap();
+            regolith::through_stalls(|| db.put(b"seed", b"v")).unwrap();
             db.flush().unwrap();
         }
         let leftover = active_log(f.dir.path());
@@ -250,14 +250,14 @@ fn the_stall_step_flush_retires_its_log_and_records_it_flushed() {
 fn a_restored_database_replays_no_log_its_target_held() {
     let source = TempDir::new().unwrap();
     let db = Db::open(source.path(), Options::default()).unwrap();
-    db.put(b"k", b"backed-up").unwrap();
+    regolith::through_stalls(|| db.put(b"k", b"backed-up")).unwrap();
     let backups = TempDir::new().unwrap();
     let mut engine = BackupEngine::open(backups.path()).unwrap();
     let id = engine.create_backup(&db).unwrap();
     // Writes after the backup, held only by the log the backup's flush
     // started, whose number is below the backup's next file id.
-    db.put(b"k", b"after").unwrap();
-    db.put(b"only-in-a-log", b"v").unwrap();
+    regolith::through_stalls(|| db.put(b"k", b"after")).unwrap();
+    regolith::through_stalls(|| db.put(b"only-in-a-log", b"v")).unwrap();
     let log = logs(source.path()).pop().expect("the source's active log");
     drop(db);
 
@@ -325,7 +325,7 @@ fn a_damaged_sealed_block_read_through_a_queue_is_reported_once_naming_the_table
     {
         let db = Db::open(dir.path(), sealed_options()).unwrap();
         for i in 0..400 {
-            db.put(&numbered(i), format!("value {i}").as_bytes())
+            regolith::through_stalls(|| db.put(&numbered(i), format!("value {i}").as_bytes()))
                 .unwrap();
         }
         db.flush().unwrap();
@@ -390,7 +390,7 @@ fn an_ingested_table_read_through_a_queue_on_an_encrypted_database_reads_at_its_
     {
         let db = Db::open(dir.path(), sealed_options()).unwrap();
         for i in 0..200 {
-            db.put(&numbered(i), b"old").unwrap();
+            regolith::through_stalls(|| db.put(&numbered(i), b"old")).unwrap();
         }
         db.flush().unwrap();
         let mut writer = SstFileWriter::create(&source, &Options::default()).unwrap();
@@ -454,7 +454,7 @@ fn close_while_the_worker_flushes_completes_every_queued_read() {
     {
         let db = Db::open(dir.path(), options()).unwrap();
         for i in 0..2000 {
-            db.put(&numbered(i), b"in a table").unwrap();
+            regolith::through_stalls(|| db.put(&numbered(i), b"in a table")).unwrap();
         }
         db.flush().unwrap();
         db.close().unwrap();
@@ -527,7 +527,7 @@ fn a_close_that_fails_leaves_reads_through_queues_working() {
     )
     .unwrap();
     for i in 0..400 {
-        db.put(&numbered(i), b"in a table").unwrap();
+        regolith::through_stalls(|| db.put(&numbered(i), b"in a table")).unwrap();
     }
     db.flush().unwrap();
     let mut queue = db.io_queue();
@@ -539,8 +539,10 @@ fn a_close_that_fails_leaves_reads_through_queues_working() {
         .unwrap()
         == 0
     {
-        db.put(format!("filler/{filler:06}").as_bytes(), &[b'f'; 1024])
-            .unwrap();
+        regolith::through_stalls(|| {
+            db.put(format!("filler/{filler:06}").as_bytes(), &[b'f'; 1024])
+        })
+        .unwrap();
         filler += 1;
     }
     assert!(db.close().is_err(), "the close's flush fails");

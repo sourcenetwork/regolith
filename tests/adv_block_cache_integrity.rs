@@ -44,7 +44,7 @@ fn readers_never_see_a_wrong_block_while_compaction_evicts_files() {
     );
 
     for i in 0..KEYS {
-        db.put(&key(i), &value(i)).unwrap();
+        regolith::through_stalls(|| db.put(&key(i), &value(i))).unwrap();
     }
     db.compact_range(None, None).wait().unwrap();
 
@@ -79,7 +79,7 @@ fn readers_never_see_a_wrong_block_while_compaction_evicts_files() {
     // `evict_file` under the readers.
     for round in 0..6u32 {
         for i in (round..KEYS).step_by(97) {
-            db.put(&key(i), &value(i)).unwrap();
+            regolith::through_stalls(|| db.put(&key(i), &value(i))).unwrap();
         }
         db.compact_range(None, None).wait().unwrap();
     }
@@ -125,7 +125,7 @@ fn a_disabled_cache_serves_the_same_storm() {
         .unwrap(),
     );
     for i in 0..KEYS {
-        db.put(&key(i), &value(i)).unwrap();
+        regolith::through_stalls(|| db.put(&key(i), &value(i))).unwrap();
     }
     db.compact_range(None, None).wait().unwrap();
 
@@ -146,7 +146,7 @@ fn a_disabled_cache_serves_the_same_storm() {
         .collect();
     for _ in 0..3 {
         for i in (0..KEYS).step_by(211) {
-            db.put(&key(i), &value(i)).unwrap();
+            regolith::through_stalls(|| db.put(&key(i), &value(i))).unwrap();
         }
         db.compact_range(None, None).wait().unwrap();
     }

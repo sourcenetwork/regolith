@@ -162,7 +162,8 @@ fn a_compaction_that_fails_midway_leaves_no_outputs_behind() {
 
     for batch in 0..4u32 {
         for i in 0..2_000u32 {
-            db.put(&key(batch * 2_000 + i), &[batch as u8; 64]).unwrap();
+            regolith::through_stalls(|| db.put(&key(batch * 2_000 + i), &[batch as u8; 64]))
+                .unwrap();
         }
         db.flush().unwrap();
     }
@@ -200,7 +201,7 @@ fn a_failing_background_worker_backs_off_and_counts_its_failures() {
     let db = Db::open(dir.path(), opts(1_000)).unwrap();
     for batch in 0..6u32 {
         for i in 0..500u32 {
-            db.put(&key(batch * 500 + i), &[batch as u8; 64]).unwrap();
+            regolith::through_stalls(|| db.put(&key(batch * 500 + i), &[batch as u8; 64])).unwrap();
         }
         db.flush().unwrap();
     }
@@ -237,11 +238,11 @@ fn a_flush_that_fails_after_writing_its_table_leaves_no_file_behind() {
         .max_background_compactions(0);
     let db = Db::open(dir.path(), opts).unwrap();
     for i in 0..1_000u32 {
-        db.put(&key(i), &[7u8; 64]).unwrap();
+        regolith::through_stalls(|| db.put(&key(i), &[7u8; 64])).unwrap();
     }
     db.flush().unwrap();
     for i in 1_000..2_000u32 {
-        db.put(&key(i), &[8u8; 64]).unwrap();
+        regolith::through_stalls(|| db.put(&key(i), &[8u8; 64])).unwrap();
     }
     let live_before = sst_files(dir.path());
 
@@ -296,7 +297,7 @@ fn a_writer_stopped_behind_failing_compaction_gets_the_failure_instead_of_waitin
     let db = Db::open(dir.path(), opts(1_000)).unwrap();
     for batch in 0..4u32 {
         for i in 0..200u32 {
-            db.put(&key(batch * 200 + i), b"value").unwrap();
+            regolith::through_stalls(|| db.put(&key(batch * 200 + i), b"value")).unwrap();
         }
         db.flush().unwrap();
     }
@@ -378,4 +379,36 @@ fn a_writer_stopped_behind_failing_flushes_retries_them_and_recovers() {
     });
     db.flush().unwrap();
     assert!(db.get(b"recovered").unwrap().is_some());
+}
+
+/// A blocking writer waits out a stop through `through_stalls`. When the
+/// flushes behind it fail, the writer returns the failure: from the flush
+/// it ran itself on the commit path, or as the background's. It does not
+/// wait for a flush that keeps failing.
+#[test]
+fn a_writer_waiting_out_a_stop_is_told_when_the_flush_behind_it_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = Arc::new(SstBudgetEnv::new());
+    let db = Arc::new(
+        Db::open(
+            dir.path(),
+            Options::default()
+                .env(Arc::clone(&env) as Arc<dyn Env>)
+                .write_buffer_size(16 * 1024)
+                .max_write_buffer_number(2),
+        )
+        .unwrap(),
+    );
+
+    env.allow_ssts(0);
+    let writer = Arc::clone(&db);
+    let failure = within(Duration::from_secs(30), move || {
+        (0..100_000u32)
+            .find_map(|i| regolith::through_stalls(|| writer.put(&key(i), &[1u8; 256])).err())
+    });
+    match failure {
+        Some(regolith::Error::BackgroundFailed { job, .. }) => assert_eq!(job, "flush"),
+        Some(regolith::Error::Io(_)) => {}
+        other => panic!("expected the failing flush, got {other:?}"),
+    }
 }

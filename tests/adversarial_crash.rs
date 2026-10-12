@@ -71,10 +71,11 @@ fn child(mode: &str, dir: &Path) -> ! {
                     for slot in 0..BATCH_OPS {
                         batch.put(&key(w, i * BATCH_OPS + slot), b"v");
                     }
-                    if db.write_opt(&wopts, batch).is_err() {
+                    if regolith::through_stalls(|| db.write_opt(&wopts, batch.clone())).is_err() {
                         return;
                     }
-                } else if db.put_opt(&wopts, &key(w, i), b"v").is_err() {
+                } else if regolith::through_stalls(|| db.put_opt(&wopts, &key(w, i), b"v")).is_err()
+                {
                     return;
                 }
                 i += 1;
