@@ -51,6 +51,8 @@ pub(crate) mod wal;
 #[cfg(test)]
 mod wal_close_tests;
 pub(crate) mod wal_frame;
+#[cfg(test)]
+mod wal_order_tests;
 pub(crate) mod wal_replay;
 #[cfg(test)]
 mod wal_rotation_tests;
@@ -1139,10 +1141,11 @@ impl RegolithEngine {
     /// Install a new log, named `new_wal_id`, as the active one and hand back
     /// the log it seals.
     ///
-    /// Recovery takes the newest log by file name and tolerates a torn tail
-    /// only there, so a log has to be complete on disk before any newer file
-    /// exists, an empty one included, and `Eventual` durability never syncs a
-    /// log on its own. Hence the order, all under the `active_wal` lock so no
+    /// Recovery takes the newest log by the id in its file name
+    /// (`wal_scan::live`) and tolerates a torn tail only there, so a log has
+    /// to be complete on disk before any newer file exists, an empty one
+    /// included, and `Eventual` durability never syncs a log on its own.
+    /// Hence the order, all under the `active_wal` lock so no
     /// commit appends to the old log in between: sync it, create the new
     /// file, swap. A failed sync latches the log as unknown, since its tail
     /// can no longer be vouched for and a retried sync may report success for
