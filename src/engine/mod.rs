@@ -32,6 +32,7 @@ pub(crate) mod lookup_key;
 pub mod loom_model;
 pub(crate) mod manifest;
 pub(crate) mod memtable;
+pub(crate) mod merge_call;
 pub(crate) mod open_transactions;
 pub(crate) mod orphan_sweep;
 pub(crate) mod pending_outputs;
@@ -161,23 +162,6 @@ fn grouped_batch_ops(
         ops.push(WriteBatchOp::Merge { key, operand });
     }
     ops
-}
-
-/// Fold `operands`, oldest first, onto `base` with `op`. A read of the
-/// database and a transaction's read of its own merges both go through here,
-/// so both fail the same way when the operator declines.
-pub(crate) fn apply_merge(
-    op: &dyn crate::options::MergeOperator,
-    key: &[u8],
-    base: Option<&[u8]>,
-    operands: &[&[u8]],
-) -> std::io::Result<Vec<u8>> {
-    op.full_merge(key, base, operands).ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("merge operator {} failed for key", op.name()),
-        )
-    })
 }
 
 /// A key a commit validates because the transaction read it: the key and
@@ -1783,7 +1767,7 @@ impl RegolithEngine {
             });
         }
 
-        apply_merge(merge_op.as_ref(), key, base_slice, &operands_owned)
+        merge_call::apply_merge(merge_op.as_ref(), key, base_slice, &operands_owned)
             .map(|merged| Some(DbSlice::from_vec(merged)))
     }
 

@@ -124,10 +124,27 @@ pub trait CompactionFilter: Send + Sync + 'static {
 /// first: `operands[0]` was written before `operands[1]`, which was
 /// written before `operands[2]`, etc. The base value (if any) was
 /// written before every operand.
+///
+/// # The key
+///
+/// Every method is handed the key as the caller wrote it: the bytes
+/// passed to `merge`, with nothing in front of them. That holds for
+/// every call the database makes: a point read, a scan, a transaction's
+/// read of its own merges, a commit's checks, and compaction. It is the
+/// key [`crate::KeyClassifier`] and [`crate::Conflict::key`] see.
+///
+/// A database has one operator, so a caller whose values have several
+/// shapes dispatches on the key inside it, by a prefix of its own. The
+/// column family is not part of the key: one key in two column families
+/// reaches the operator as the same bytes, so the shape of a value must
+/// follow from the key alone.
 pub trait MergeOperator: Send + Sync + 'static {
     /// Combine a `base` value (possibly `None` if the key didn't
     /// exist) with the ordered list of merge `operands`, returning
     /// the final value. Returning `None` signals merge failure.
+    ///
+    /// `key` is the key as the caller wrote it (see the trait's notes on
+    /// the key).
     fn full_merge(&self, key: &[u8], base: Option<&[u8]>, operands: &[&[u8]]) -> Option<Vec<u8>>;
 
     /// Optionally fold two adjacent operands `left` (older) and
