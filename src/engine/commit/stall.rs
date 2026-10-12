@@ -123,3 +123,7 @@ mod tests {
         assert!(signal.waiters.pop().is_none());
     }
 }
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+#[path = "stall_failure_tests.rs"]
+mod failure_tests;
