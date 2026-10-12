@@ -269,28 +269,38 @@ stress secs="600":
 # Seven of the models are `should_panic` calibrations that deliberately
 # get the ordering wrong; they are what make the passes mean anything.
 
+# Loom is bounded. Every recipe below builds its models first and then runs
+# them under a hard limit of 10 minutes (15 for the nightly twins): a run
+# that hits it fails. A model is sized to finish in under a minute and a
+# recipe in under five, by its scenario and by an explicit preemption bound
+# in its builder, never by `LOOM_MAX_DURATION`, which stops the search and
+# lets the test pass. A model that is shrunk says so in its comment.
 loom:
-    RUSTFLAGS="--cfg loom" cargo test --release --test loom_memtable
+    RUSTFLAGS="--cfg loom" cargo test --release --test loom_memtable --no-run
+    RUSTFLAGS="--cfg loom" timeout 10m cargo test --release --test loom_memtable
 
 loom-debug:
-    RUSTFLAGS="--cfg loom" cargo test --test loom_memtable
+    RUSTFLAGS="--cfg loom" cargo test --test loom_memtable --no-run
+    RUSTFLAGS="--cfg loom" timeout 10m cargo test --test loom_memtable
 
 # Loom models for `regolith::sync`: every primitive's wait protocol,
 # with two calibrations that must fail. Release only: the larger models
-# explore 0.1 to 3 million interleavings each (about eight minutes in
+# explore 0.1 to 0.4 million interleavings each (about four minutes in
 # all), which a debug build multiplies several times over.
 loom-sync:
-    RUSTFLAGS="--cfg loom" cargo test --release --test loom_sync
+    RUSTFLAGS="--cfg loom" cargo test --release --test loom_sync --no-run
+    RUSTFLAGS="--cfg loom" timeout 10m cargo test --release --test loom_sync
 
 # The five sync models whose three threads all contend for one lock or
 # semaphore, at preemption bound 2 instead of the bound 1 `loom-sync`
-# runs them at: their `#[ignore]`d twins, or the one `model` names.
-# Four of them take 43 to 79 minutes each on a workstation; the fifth, the
-# upgradable read, runs a smaller scenario at bound 2 and takes 10 s (its
-# full one never finished). So the nightly CI run carries them, one job
-# per model, not the per-change one.
+# runs them at: their `#[ignore]`d twins, or the one `model` names. Each
+# twin runs a smaller scenario of its own, because the shared one does not
+# finish at bound 2 in any useful time (43 to 79 minutes a model, and never
+# for the upgradable read). They take 2 s to 6 minutes each, so the nightly
+# CI run carries them, one job per model.
 loom-sync-deep model="":
-    RUSTFLAGS="--cfg loom" cargo test --release --test loom_sync -- --ignored {{model}}
+    RUSTFLAGS="--cfg loom" cargo test --release --test loom_sync --no-run
+    RUSTFLAGS="--cfg loom" timeout 15m cargo test --release --test loom_sync -- --ignored {{model}}
 
 loom-all: loom loom-debug loom-sync
 
