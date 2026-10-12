@@ -471,4 +471,90 @@ mod tests {
         );
         assert!(!sem.try_acquire(1), "the waiter holds it");
     }
+
+    /// A thread that holds the drain role with nobody queued returns after
+    /// its pass, however many releases other threads make meanwhile: a
+    /// release that finds the role taken leaves only its request to wake
+    /// the front, and with no front that request is dropped.
+    #[test]
+    fn a_drain_that_found_nobody_queued_does_not_pass_again_for_releases() {
+        let sem = RawSemaphore::new(2);
+        let hammering = Cell::new(false);
+        let rounds = 4 * MAX_BYPASS;
+        let raced = Raced::new(
+            &sem,
+            |_| {},
+            |pass| {
+                if hammering.get() && pass <= rounds {
+                    // Another holder lets its permit go and takes it back,
+                    // before the drain can give its role up.
+                    sem.release(1);
+                    assert!(sem.try_acquire(1), "the permit is free again");
+                }
+            },
+        );
+        assert!(sem.try_acquire(1), "the other holder's permit");
+        let mut contend = Contend::new();
+        let mut waiter = Polled::new(core::future::poll_fn(|cx| {
+            contend.poll(&raced, 2, cx.waker())
+        }));
+        waiter.pending();
+        drop(waiter);
+        // The waiter gives up. Its withdrawal takes the drain role, and the
+        // pass finds nobody queued while the other holder hammers.
+        let before = raced.passes.get();
+        hammering.set(true);
+        contend.cancel(&raced, 2);
+        hammering.set(false);
+        assert_eq!(
+            raced.passes.get() - before,
+            1,
+            "the drain passed again for releases that had nobody to wake"
+        );
+        // Nothing is left behind: a waiter that queues now is not nudged for
+        // a release that came before it, so it counts nothing. And the next
+        // release reaches it.
+        let mut next = Contend::new();
+        let mut waiter = Polled::new(core::future::poll_fn(|cx| next.poll(&raced, 2, cx.waker())));
+        waiter.pending();
+        sem.release(1);
+        assert_eq!(waiter.wakes(), 1, "the release nudges the waiter");
+        assert!(waiter.poll().is_ready(), "both permits are its");
+        drop(waiter);
+        assert_eq!(
+            next.bypass, 0,
+            "it retried on a request from before it queued"
+        );
+        sem.release(2);
+        assert_eq!(sem.available(), 2, "a permit was lost or made up");
+    }
+
+    /// A release that comes while a pass runs must still reach the waiter
+    /// that pass found, though it leaves no dirty bit: the drain passes
+    /// again for its request.
+    #[test]
+    fn a_release_during_a_pass_that_found_a_waiter_reaches_it() {
+        let sem = RawSemaphore::new(1);
+        let raced = Raced::new(
+            &sem,
+            |_| {},
+            |pass| {
+                if pass == 1 {
+                    sem.release(1);
+                }
+            },
+        );
+        assert!(sem.try_acquire(1));
+        let mut contend = Contend::new();
+        let mut waiter = Polled::new(core::future::poll_fn(|cx| {
+            contend.poll(&raced, 1, cx.waker())
+        }));
+        // The waiter queues and serves the queue; the holder lets go right
+        // after its first pass read that nothing was free.
+        assert!(
+            waiter.poll().is_ready(),
+            "a release that found the drain role taken was lost"
+        );
+        assert!(!sem.try_acquire(1), "the waiter holds it");
+    }
 }
