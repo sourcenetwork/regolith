@@ -554,6 +554,11 @@ tla:
     check MC_LsmOrder_Green_Demote                     GREEN
     check MC_LsmOrder_Red_DemoteLevelOnly              RED ReadNewest
     check MC_LsmOrder_Red_NoDemotion                   RED ReadNewest
+    # E38: a universal merge takes L0 files that lie next to one another.
+    # Lean: Regolith/LsmOrder.lean, merge_window_reads_newest,
+    # merge_gapped_breaks_reads.
+    check MC_LsmOrder_Green_L0Merge                    GREEN
+    check MC_LsmOrder_Red_L0MergeGap                   RED ReadNewest
     # E6. Lean: Regolith/BatchView.lean, batch_one_view_newest.
     spec=BatchRead
     check MC_BatchRead_Green                           GREEN

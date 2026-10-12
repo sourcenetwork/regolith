@@ -22,11 +22,12 @@
 \* and returns the version of sequence 2: the database went back in time.
 \*
 \* What this model shows: through every write, freeze and flush, level-0
-\* install, `compact_range` (E1), level compaction, external ingest, and the
-\* demotion of an overlapping level at open (E14, D13), a point read returns
-\* the newest version visible at its snapshot, with every level below level 0
-\* searched by binary search on its tables' key ranges. Each way of breaking
-\* the order is a RED configuration.
+\* install, `compact_range` (E1), level compaction, a universal merge inside
+\* level 0 (E38), external ingest, and the demotion of an overlapping level
+\* at open (E14, D13), a point read returns the newest version visible at
+\* its snapshot, with every level below level 0 searched by binary search on
+\* its tables' key ranges. Each way of breaking the order is a RED
+\* configuration.
 \*
 \* PROVED FOR EVERY SIZE in Lean, proofs/lean/Regolith/LsmOrder.lean:
 \*   read_newest                    the read order returns the newest visible
@@ -66,6 +67,11 @@
 \*                                  binary search over a sorted level whose
 \*                                  tables do not overlap finds the table a
 \*                                  linear scan finds
+\*   merge_window_ordered, merge_window_reads_newest
+\*                                  merging sources that lie next to one
+\*                                  another, in place, keeps the read order
+\*                                  and every read
+\*   merge_gapped_breaks_reads      the RED L0MergeGap case
 \* TLC checks the same invariants here over every interleaving of those
 \* steps, for a few keys and versions.
 \*
@@ -81,6 +87,13 @@
 \*     older file whose keys overlap theirs, until nothing more joins (the
 \*     closure, E1). They and the L1 tables their key range overlaps are
 \*     merged into L1.
+\*   pick_and_run_universal,          src/engine/compaction.rs
+\*   perform_compaction_to (L0 to L0)
+\*     Under universal compaction a merge takes the newest L0 files, in the
+\*     order L0 lists them, writes them as one file, and puts that file in
+\*     the place of the oldest of them; a file flushed while the merge ran
+\*     stays newer. So the files merged lie next to one another in L0
+\*     (MergeL0 here).
 \*   RegolithEngine::install          src/engine/ingest.rs
 \*     An external file takes a fresh sequence and is placed at a level
 \*     (`placement`), after the memtables holding a key of its range are
@@ -129,6 +142,14 @@
 \*     to L0, in front of the levels above it, which hold newer versions.
 \*   Legacy = "Keep". The overlapping level stays, and binary search over
 \*     ranges that overlap lands on a table that does not hold the key.
+\*   L0Merge = "Gapped" (E38). A universal merge takes L0 files that do not
+\*     lie next to one another and leaves one between them out. The merged
+\*     file takes the place of the oldest file merged, below the file left
+\*     out, which is older than the newest file merged: a key both hold
+\*     reads as the older version. The engine did this when it took the
+\*     order of file ids for the order of L0: a merge's output draws its id
+\*     when it starts writing and takes its oldest input's place, so a file
+\*     flushed while the merge ran has the smaller id and the newer place.
 \*
 \* THE FIXES.
 \*   Picker = "Closure": add every older L0 file whose key range overlaps
@@ -147,6 +168,8 @@
 \*   Legacy = "Demote": at open, if levels overlap, take the deepest such
 \*     level d and move every table of levels 1..d to the end of L0: level
 \*     by level, each level's tables newest first by sequence.
+\*   L0Merge = "Window": a universal merge takes files that lie next to one
+\*     another in L0, in the order L0 lists them and not by file id.
 \*
 \* DESIGN CHOICE where the plan leaves room (recorded in the report). Plan
 \* 4.3 says the overlapping level's tables move to L0. Moved alone they sit
@@ -183,6 +206,8 @@
 \*   MC_LsmOrder_Green_Demote                legacy overlap, demoted at open
 \*   MC_LsmOrder_Red_DemoteLevelOnly         ReadNewest fails
 \*   MC_LsmOrder_Red_NoDemotion              ReadNewest fails
+\*   MC_LsmOrder_Green_L0Merge               universal merges of neighbours
+\*   MC_LsmOrder_Red_L0MergeGap              ReadNewest fails (E38)
 
 \* Borrow the standard TLA+ books: counting numbers, lists, and sizes of finite sets.
 EXTENDS Naturals, Sequences, FiniteSets
@@ -213,7 +238,11 @@ CONSTANTS
   Ingest,
   \* A database written by 0.1.x with an overlapping level: "Off" (none), "Demote" (the plan's fix
   \* at open), "DemoteLevelOnly" or "Keep" (the planted bugs).
-  Legacy
+  Legacy,
+  \* A universal merge of L0 files into one L0 file: "Off" (none), "Window" (the engine: the files
+  \* merged lie next to one another in L0) or "Gapped" (the planted bug, E38: a file between them may
+  \* be left out).
+  L0Merge
 
 \* There is at least one key, and keys are numbers.
 ASSUME Keys \subseteq Nat /\ Keys # {}
@@ -229,6 +258,8 @@ ASSUME FlushPublish \in {"Together", "Split"}
 ASSUME Ingest \in {"Off", "Placed", "IgnoreUpper"}
 \* The legacy rule is one of the four.
 ASSUME Legacy \in {"Off", "Demote", "DemoteLevelOnly", "Keep"}
+\* The universal merge rule is one of the three.
+ASSUME L0Merge \in {"Off", "Window", "Gapped"}
 
 \* The state: everything that changes from one step to the next. Each line says what the variable
 \* stands for in the real program.
@@ -640,6 +671,30 @@ CompactLevel(j, t) ==
   \* Nothing else changes.
   /\ UNCHANGED <<seq, mem, imm, l0, opened, owed>>
 
+\* A universal merge: the L0 files at the positions P (1 is the newest)
+\* become one file, which takes the place of the oldest of them. A file
+\* flushed while the real merge ran is a newer file here, in front of every
+\* position of P, so the merge is one step.
+MergeL0(P) ==
+  \* Universal merges are part of this configuration.
+  /\ L0Merge # "Off"
+  \* The database is open.
+  /\ opened
+  \* P names L0 files,
+  /\ P \subseteq 1..Len(l0)
+  \* at least two of them.
+  /\ Cardinality(P) >= 2
+  \* The engine merges files that lie next to one another: every position from the newest picked
+  \* to the oldest picked is picked. The planted bug does not ask for that.
+  /\ L0Merge = "Window" => \A i \in Min(P)..Max(P) : i \in P
+  \* The files in front of the oldest picked one that were not picked stay in front, in order; then
+  \* comes the merged file, holding every version of the picked ones; then the older files.
+  /\ l0' = Keep(SubSeq(l0, 1, Max(P)), P, 1)
+            \o <<UNION {l0[i] : i \in P}>>
+            \o SubSeq(l0, Max(P) + 1, Len(l0))
+  \* Nothing else changes.
+  /\ UNCHANGED <<seq, mem, imm, lv, opened, owed>>
+
 \* An ingest of a file holding the keys ks, all at the next sequence. A
 \* memtable holding a key in its range is flushed first (D48), so here none
 \* may. The file goes to the deepest level it fits, else to the L0 front.
@@ -728,6 +783,8 @@ Next ==
   \/ \E lo, hi \in Keys : lo <= hi /\ CompactRange(lo, hi)
   \* A table is compacted one level down.
   \/ \E j \in 1..Levels : \E t \in 1..Len(lv[j]) : CompactLevel(j, t)
+  \* Some L0 files are merged into one L0 file.
+  \/ \E P \in SUBSET (1..MaxL0) : MergeL0(P)
   \* A file holding some keys is ingested.
   \/ \E ks \in (SUBSET Keys) \ {{}} : IngestFile(ks)
   \* A 0.1.x ingest builds a legacy level.
