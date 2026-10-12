@@ -33,6 +33,12 @@
 //! - **The upgradable read**: it shares with readers, upgrades while they
 //!   come and go, and excludes writers.
 //!
+//! - **A drain that ends**: a waiter that serves the queue itself while the
+//!   holder lets go and barges back runs a bounded number of passes and is
+//!   served. That model counts passes, which the public API cannot see, so
+//!   it lives in `src/sync/loom_model.rs`, with a calibration that writes
+//!   the nudge marker the wrong way and must fail.
+//!
 //! The waiter-node free list is a pass-through to the allocator under loom
 //! (see `Pool`), so node recycling itself is covered by miri and the unit
 //! tests rather than here. Two calibration models deliberately expect
@@ -61,7 +67,8 @@ use regolith::sync::{
 /// schedule (`LOOM_MAX_PREEMPTIONS` overrides it) and fails it if the
 /// search was implausibly small. Two-thread models take three
 /// preemptions and three-thread models two, except the ones
-/// `contended!` declares.
+/// `contended!` declares and the ones whose comment says they were
+/// shrunk: every model is sized to finish in under a minute.
 fn explore(
     name: &str,
     preemptions: usize,
@@ -89,15 +96,13 @@ fn explore(
 
 /// A model whose three threads all contend for one lock or semaphore.
 /// The normal run explores it at preemption bound 1; an `#[ignore]`d twin
-/// explores it at bound 2, which takes 43 to 79 minutes a model, so it runs
-/// nightly (`just loom-sync-deep`). A twin may name a smaller scenario of
-/// its own where the shared one does not finish at bound 2.
+/// explores a smaller scenario of its own at bound 2, nightly
+/// (`just loom-sync-deep`). The shared scenario does not finish at bound 2
+/// in any useful time (43 to 79 minutes a model, and 33 hours unfinished
+/// for the upgradable read), so each twin keeps one thread from parking or
+/// fixes the order two waiters arrive in, and finishes in under 10
+/// minutes.
 macro_rules! contended {
-    ($name:ident, $deep:ident, $min:literal, $model:expr) => {
-        contended!($name, $deep, $min, $model, $model);
-    };
-    // With a model of its own for the twin, where the shared one does not
-    // finish at bound 2.
     ($name:ident, $deep:ident, $min:literal, $model:expr, $deep_model:expr) => {
         #[test]
         fn $name() {
@@ -105,7 +110,7 @@ macro_rules! contended {
         }
 
         #[test]
-        #[ignore = "preemption bound 2 takes up to 79 minutes a model: run nightly by `just loom-sync-deep`"]
+        #[ignore = "preemption bound 2 is the nightly run: `just loom-sync-deep`"]
         fn $deep() {
             explore(stringify!($deep), 2, $min, $deep_model);
         }
@@ -200,19 +205,50 @@ contended!(
     mutex_excludes_and_loses_no_wakeup,
     mutex_excludes_and_loses_no_wakeup_at_bound_2,
     10,
+    // SHRUNK: the main thread holds the lock from the start, where all three
+    // threads used to race for it (462 thousand interleavings, 58 s). Two
+    // threads still wait for one lock and each must be woken: the release
+    // hands it to one, whose release hands it to the other, and a barging
+    // waiter may take it between the two. What is left out is a third
+    // thread parking: the holder never waits.
     || {
         let mutex = Arc::new(Mutex::new(UnsafeCell::new(0usize)));
+        let held = mutex.try_lock().expect("free");
         let others: Vec<_> = (0..2)
             .map(|_| {
                 let mutex = Arc::clone(&mutex);
                 thread::spawn(move || bump(&block_on(mutex.lock())))
             })
             .collect();
-        bump(&block_on(mutex.lock()));
+        bump(&held);
+        drop(held);
         for other in others {
             other.join().expect("locker");
         }
         assert_eq!(read(&mutex.try_lock().expect("free at the end")), 3);
+    },
+    // The bound-2 twin: one thread waits and one only tries (`try_lock`), so
+    // a single thread parks. What races at bound 2 is the release against the
+    // waiter's arrival and against a caller barging in ahead of it.
+    || {
+        let mutex = Arc::new(Mutex::new(UnsafeCell::new(0usize)));
+        let held = mutex.try_lock().expect("free");
+        let waiter = {
+            let mutex = Arc::clone(&mutex);
+            thread::spawn(move || bump(&block_on(mutex.lock())))
+        };
+        let barger = {
+            let mutex = Arc::clone(&mutex);
+            thread::spawn(move || mutex.try_lock().map(|guard| bump(&guard)).is_some())
+        };
+        bump(&held);
+        drop(held);
+        waiter.join().expect("waiter");
+        let barged = barger.join().expect("barger");
+        assert_eq!(
+            read(&mutex.try_lock().expect("free at the end")),
+            2 + usize::from(barged)
+        );
     }
 );
 
@@ -268,6 +304,29 @@ contended!(
         canceller.join().expect("canceller");
         waiter.join().expect("waiter");
         assert_eq!(read(&mutex.try_lock().expect("the lock was not leaked")), 1);
+    },
+    // The bound-2 twin: the canceller is queued before the waiter exists, so
+    // the order of the two arrivals is fixed and only the cancellation races
+    // the waiter's arrival and the release. That is the case the model is
+    // for: a handoff given to a waiter that is going away must reach the one
+    // behind it.
+    || {
+        let mutex = Arc::new(Mutex::new(UnsafeCell::new(0usize)));
+        let held = mutex.try_lock().expect("free");
+        let queued = Arc::new(AtomicBool::new(false));
+        let canceller = {
+            let (mutex, flag) = (Arc::clone(&mutex), Arc::clone(&queued));
+            thread::spawn(move || poll_once_then_drop(flag_when_queued(mutex.lock(), &flag)))
+        };
+        wait_for(&queued);
+        let waiter = {
+            let mutex = Arc::clone(&mutex);
+            thread::spawn(move || bump(&block_on(mutex.lock())))
+        };
+        drop(held);
+        canceller.join().expect("canceller");
+        waiter.join().expect("waiter");
+        assert_eq!(read(&mutex.try_lock().expect("the lock was not leaked")), 1);
     }
 );
 
@@ -296,6 +355,38 @@ contended!(
             taker.join().expect("taker");
         }
         assert_eq!(sem.available_permits(), 2);
+    },
+    // The bound-2 twin: the request for one permit only tries
+    // (`try_acquire`), so a single thread parks. What races at bound 2 is
+    // the release against the large request's arrival and against the small
+    // caller taking a permit ahead of it.
+    || {
+        let sem = Arc::new(Semaphore::new(2));
+        let out = Arc::new(AtomicUsize::new(0));
+        let held = sem.try_acquire(2).expect("free");
+        let big = {
+            let (sem, out) = (Arc::clone(&sem), Arc::clone(&out));
+            thread::spawn(move || {
+                let permit = block_on(sem.acquire(2));
+                assert!(out.fetch_add(2, Ordering::SeqCst) + 2 <= 2, "overdrawn");
+                out.fetch_sub(2, Ordering::SeqCst);
+                drop(permit);
+            })
+        };
+        let small = {
+            let (sem, out) = (Arc::clone(&sem), Arc::clone(&out));
+            thread::spawn(move || {
+                if let Some(permit) = sem.try_acquire(1) {
+                    assert!(out.fetch_add(1, Ordering::SeqCst) + 1 <= 2, "overdrawn");
+                    out.fetch_sub(1, Ordering::SeqCst);
+                    drop(permit);
+                }
+            })
+        };
+        drop(held);
+        big.join().expect("big");
+        small.join().expect("small");
+        assert_eq!(sem.available_permits(), 2);
     }
 );
 
@@ -303,7 +394,12 @@ contended!(
 fn a_large_request_behind_small_callers_is_owed_its_permits() {
     explore(
         "a_large_request_behind_small_callers_is_owed_its_permits",
-        3,
+        // SHRUNK: two preemptions where there were three (4.7 million
+        // interleavings, over 5 minutes; now about 200 thousand). The
+        // scenario is unchanged: the large request still meets a small
+        // caller barging past it more often than the bound allows, and two
+        // preemptions still split the release, the barge and the handoff.
+        2,
         5,
         || {
             let sem = Arc::new(Semaphore::new(2));
@@ -408,7 +504,11 @@ fn a_dropped_upgrade_racing_the_last_reader_leaves_nothing_held() {
 fn a_rwlock_writer_and_readers_exclude_each_other() {
     explore(
         "a_rwlock_writer_and_readers_exclude_each_other",
-        2,
+        // SHRUNK: one preemption where there were two (2.5 million
+        // interleavings, 4 minutes; now about 96 thousand), as the other
+        // models whose three threads all wait for one lock run. The scenario
+        // is unchanged: a writer and two readers, any of them first.
+        1,
         10,
         || {
             let lock = Arc::new(RwLock::new(UnsafeCell::new(0usize)));
@@ -519,7 +619,11 @@ fn notify_waiters_reaches_a_registered_waiter() {
 
 #[test]
 fn a_dropped_notified_passes_its_notify_one_on() {
-    explore("a_dropped_notified_passes_its_notify_one_on", 2, 5, || {
+    // SHRUNK: one preemption where there were two (1.2 million interleavings,
+    // 105 s; now about 62 thousand), as the other three-thread models run.
+    // The scenario is unchanged: the notification still reaches a waiter
+    // whether the cancelled future took it, dropped it, or never saw it.
+    explore("a_dropped_notified_passes_its_notify_one_on", 1, 5, || {
         let notify = Arc::new(Notify::new());
         // Returns true when its one poll completed, which consumes the
         // notification legitimately rather than dropping it.
@@ -617,6 +721,28 @@ contended!(
             let lock = Arc::clone(&lock);
             thread::spawn(move || poll_once_then_drop(lock.write()))
         };
+        let writer = {
+            let lock = Arc::clone(&lock);
+            thread::spawn(move || bump(&block_on(lock.write())))
+        };
+        drop(held);
+        canceller.join().expect("canceller");
+        writer.join().expect("writer");
+        assert_eq!(read(&lock.try_write().expect("the lock was not leaked")), 1);
+    },
+    // The bound-2 twin: the cancelled writer is queued before the other
+    // writer exists, so the order of the two arrivals is fixed and only the
+    // cancellation races the second writer's arrival and the last reader's
+    // release.
+    || {
+        let lock = Arc::new(RwLock::new(UnsafeCell::new(0usize)));
+        let held = lock.try_read().expect("free");
+        let queued = Arc::new(AtomicBool::new(false));
+        let canceller = {
+            let (lock, flag) = (Arc::clone(&lock), Arc::clone(&queued));
+            thread::spawn(move || poll_once_then_drop(flag_when_queued(lock.write(), &flag)))
+        };
+        wait_for(&queued);
         let writer = {
             let lock = Arc::clone(&lock);
             thread::spawn(move || bump(&block_on(lock.write())))
@@ -767,6 +893,17 @@ fn a_cancelled_event_wait_racing_the_set_strands_nobody() {
             waiter.join().expect("waiter");
         },
     );
+}
+
+#[test]
+fn a_waiter_serving_the_queue_is_served_while_the_holder_barges() {
+    regolith::loom_exports::sync::a_waiter_serving_the_queue_is_served_while_the_holder_barges();
+}
+
+#[test]
+#[should_panic(expected = "the drain ran")]
+fn calibration_a_marker_lowered_on_a_pending_nudge_keeps_the_drain_passing() {
+    regolith::loom_exports::sync::calibration_a_marker_lowered_on_a_pending_nudge_keeps_the_drain_passing();
 }
 
 #[test]

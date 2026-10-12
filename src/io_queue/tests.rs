@@ -103,7 +103,7 @@ fn a_job_a_queue_owns_is_listed_until_it_lands() {
     let runtime = queue.runtime();
     let mut seen = false;
     for i in 0..64u32 {
-        db.put(&key(i), &[7u8; 512]).unwrap();
+        crate::through_stalls(|| db.put(&key(i), &[7u8; 512])).unwrap();
         seen |= runtime.jobs_in_flight() == 1;
     }
     assert!(

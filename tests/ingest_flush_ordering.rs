@@ -101,7 +101,7 @@ fn frozen_bytes_once_flushed(db: &Db) -> u64 {
 /// it already held.
 fn write_past_one_rotation(db: &Db, prefix: &str) -> regolith::Result<()> {
     for i in 0..8 {
-        db.put(format!("{prefix}{i}").as_bytes(), &[0u8; 1024])?;
+        regolith::through_stalls(|| db.put(format!("{prefix}{i}").as_bytes(), &[0u8; 1024]))?;
     }
     Ok(())
 }
@@ -245,7 +245,7 @@ fn an_ingest_waits_for_a_flush_of_a_memtable_sealed_before_it() {
     let opts = Options::default().env(env.clone());
     let db = Arc::new(Db::open(dir.path(), opts.clone()).unwrap());
 
-    db.put(b"k", b"old").unwrap();
+    regolith::through_stalls(|| db.put(b"k", b"old")).unwrap();
 
     let a = {
         let db = Arc::clone(&db);
@@ -282,7 +282,7 @@ fn an_ingest_waits_for_a_flush_of_a_memtable_sealed_before_it() {
     // reopened counter restarted below the ingested sequence.
     let mut batch = WriteBatch::new();
     batch.put(b"z", b"v");
-    let seq = db.write_sequenced(batch).unwrap();
+    let seq = regolith::through_stalls(|| db.write_sequenced(batch.clone())).unwrap();
     assert!(
         seq > before,
         "reopened sequence {seq} did not exceed {before}"
@@ -308,7 +308,7 @@ fn a_write_issued_during_an_ingest_lands_above_the_ingested_file() {
     let opts = Options::default().env(env.clone());
     let db = Arc::new(Db::open(dir.path(), opts.clone()).unwrap());
 
-    db.put(b"k", b"old").unwrap();
+    regolith::through_stalls(|| db.put(b"k", b"old")).unwrap();
 
     let ingest_path = build_ingest_file(staging.path(), &opts, b"k", b"new");
     let b = {
@@ -321,7 +321,7 @@ fn a_write_issued_during_an_ingest_lands_above_the_ingested_file() {
 
     let put = {
         let db = Arc::clone(&db);
-        std::thread::spawn(move || db.put(b"k", b"v2"))
+        std::thread::spawn(move || regolith::through_stalls(|| db.put(b"k", b"v2")))
     };
     let a = {
         let db = Arc::clone(&db);
@@ -349,7 +349,7 @@ fn a_write_issued_during_an_ingest_lands_above_the_ingested_file() {
     // higher one, so the reopened counter restarted below `before`.
     let mut batch = WriteBatch::new();
     batch.put(b"z", b"v");
-    let seq = db.write_sequenced(batch).unwrap();
+    let seq = regolith::through_stalls(|| db.write_sequenced(batch.clone())).unwrap();
     assert!(
         seq > before,
         "reopened sequence {seq} did not exceed {before}"
@@ -379,7 +379,7 @@ fn an_ingest_drains_a_memtable_left_frozen_by_a_failed_flush() {
     let opts = Options::default().env(NthSstOpen::new(dir.path(), 0, 1));
     let db = Db::open(dir.path(), opts.clone()).unwrap();
 
-    db.put(b"k", b"old").unwrap();
+    regolith::through_stalls(|| db.put(b"k", b"old")).unwrap();
     assert!(
         db.flush().is_err(),
         "the injected table open failure must fail the flush"
@@ -405,7 +405,7 @@ fn an_ingest_drains_a_memtable_left_frozen_by_a_failed_flush() {
     // restart below `before`.
     let mut batch = WriteBatch::new();
     batch.put(b"z", b"v");
-    let seq = db.write_sequenced(batch).unwrap();
+    let seq = regolith::through_stalls(|| db.write_sequenced(batch.clone())).unwrap();
     assert!(
         seq > before,
         "reopened sequence {seq} did not exceed {before}"
@@ -431,7 +431,7 @@ fn a_write_that_fills_the_memtable_during_an_ingest_copy_commits_below_it() {
         .write_buffer_size(4 * 1024);
     let db = Arc::new(Db::open(dir.path(), opts.clone()).unwrap());
 
-    db.put(b"k", b"old").unwrap();
+    regolith::through_stalls(|| db.put(b"k", b"old")).unwrap();
     db.flush().unwrap();
 
     let ingest_path = build_ingest_file(staging.path(), &opts, b"k", b"new");
@@ -448,7 +448,7 @@ fn a_write_that_fills_the_memtable_during_an_ingest_copy_commits_below_it() {
     let writer = {
         let db = Arc::clone(&db);
         std::thread::spawn(move || {
-            db.put(b"k", b"v2")?;
+            regolith::through_stalls(|| db.put(b"k", b"v2"))?;
             write_past_one_rotation(&db, "f")
         })
     };
@@ -474,7 +474,7 @@ fn a_write_that_fills_the_memtable_during_an_ingest_copy_commits_below_it() {
     let db = Db::open(dir.path(), opts.env(NthSstOpen::new(dir.path(), 0, 0))).unwrap();
     let mut batch = WriteBatch::new();
     batch.put(b"z", b"v");
-    let seq = db.write_sequenced(batch).unwrap();
+    let seq = regolith::through_stalls(|| db.write_sequenced(batch.clone())).unwrap();
     assert!(
         seq > before,
         "reopened sequence {seq} did not exceed {before}"
@@ -509,7 +509,7 @@ fn writes_issued_during_an_ingest_that_fails_commit_once_it_gives_up() {
     let writer = {
         let db = Arc::clone(&db);
         std::thread::spawn(move || {
-            db.put(b"k", b"v2")?;
+            regolith::through_stalls(|| db.put(b"k", b"v2"))?;
             write_past_one_rotation(&db, "f")
         })
     };

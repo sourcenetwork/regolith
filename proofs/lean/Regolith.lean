@@ -88,6 +88,12 @@ import Regolith.IoQueue
 -- Backs `proofs/tla/ManifestSeal.tla`. (The sealed log stamp is in
 -- WalRecovery.lean.)
 import Regolith.ManifestSeal
+-- 4.6, E28: the compaction gate. A job is never inside with a pass or with
+-- another job, no waiter is passed over more than BOUND times (so jobs
+-- cannot starve the worker's pass, nor passes a job), the worker runs a
+-- pass between any two jobs, and a job parked on a queue always keeps a
+-- way to be woken. Backs `proofs/tla/CompactionGate.tla`.
+import Regolith.CompactionGate
 -- 4.12, D57: a backup of an encrypted database seals its metadata; a
 -- restore checks every key before its first write, copies exactly what the
 -- tag covers and writes a sealed MANIFEST last. Backs
@@ -142,3 +148,10 @@ import Regolith.EnvFilesRename
 -- stopped writers from relieving, so no writer waits on a stall nobody will
 -- land. Backs `proofs/tla/StallRelief.tla`.
 import Regolith.StallRelief
+
+-- 4.6, 4.10: the pessimistic lock table. One holder per key, a retired
+-- table entry has no user, a waiter the lock may serve is told through its
+-- own inbox and nowhere else, a waiter loses at most BOUND races, and a
+-- commit keeps its lock until it is visible. Backs
+-- `proofs/tla/LockTable.tla`.
+import Regolith.LockTable

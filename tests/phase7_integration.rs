@@ -470,8 +470,10 @@ fn a_hard_open_file_limit_reads_sealed_tables_and_an_ingest_at_its_sequence() {
         let db = Db::open(dir.path(), options()).unwrap();
         for table in 0..8u64 {
             for k in 0..50 {
-                db.put(&numbered(table * 50 + k), format!("t{table}").as_bytes())
-                    .unwrap();
+                regolith::through_stalls(|| {
+                    db.put(&numbered(table * 50 + k), format!("t{table}").as_bytes())
+                })
+                .unwrap();
             }
             db.flush().unwrap();
         }
@@ -546,7 +548,7 @@ fn backups_and_checkpoints_never_copy_a_table_renamed_aside() {
     let db = Db::open(&dir, options()).unwrap();
     for table in 0..4u64 {
         for k in 0..50 {
-            db.put(&numbered(table * 50 + k), b"before").unwrap();
+            regolith::through_stalls(|| db.put(&numbered(table * 50 + k), b"before")).unwrap();
         }
         db.flush().unwrap();
     }
@@ -561,7 +563,7 @@ fn backups_and_checkpoints_never_copy_a_table_renamed_aside() {
         .collect();
     assert_eq!(tables.len(), 4);
     for i in 0..200 {
-        db.put(&numbered(i), b"after").unwrap();
+        regolith::through_stalls(|| db.put(&numbered(i), b"after")).unwrap();
     }
     db.compact_range(None, None).wait().unwrap();
     // The four the iterator holds; the table the compaction flushed first is
@@ -751,7 +753,7 @@ fn transact_async_attempts_pin_one_snapshot_each_and_release_it_once() {
     {
         let db = Db::open(dir.path(), options()).unwrap();
         for i in 0..2_000u64 {
-            db.put(&numbered(i), b"cold").unwrap();
+            regolith::through_stalls(|| db.put(&numbered(i), b"cold")).unwrap();
         }
         db.flush().unwrap();
         db.close().unwrap();
@@ -774,7 +776,7 @@ fn transact_async_attempts_pin_one_snapshot_each_and_release_it_once() {
             assert!(first.is_some() && second.is_some());
             if previous.is_none() {
                 // Another writer changes what the attempt read: it conflicts.
-                db.db().put(&numbered(10), b"raced").unwrap();
+                regolith::through_stalls(|| db.db().put(&numbered(10), b"raced")).unwrap();
             }
             txn.put(&numbered(10), b"mine")?;
             Ok::<_, TransactionError>(())
@@ -826,14 +828,14 @@ fn checkpoint_job_under_an_open_file_bound(workers: usize) {
     let mut queue = db.io_queue();
     for table in 0..4u64 {
         for k in 0..50 {
-            db.put(&numbered(table * 50 + k), b"before").unwrap();
+            regolith::through_stalls(|| db.put(&numbered(table * 50 + k), b"before")).unwrap();
         }
         db.flush().unwrap();
     }
     let mut held = db.iter();
     held.seek_to_first();
     for i in 0..200 {
-        db.put(&numbered(i), b"after").unwrap();
+        regolith::through_stalls(|| db.put(&numbered(i), b"after")).unwrap();
     }
     db.compact_range(None, None).wait().unwrap();
     assert!(
@@ -938,7 +940,7 @@ fn a_database_dropped_under_a_running_job_releases_its_directory_and_reopens() {
     )
     .unwrap();
     for i in 0..400u64 {
-        db.put(&numbered(i), &[7u8; 256]).unwrap();
+        regolith::through_stalls(|| db.put(&numbered(i), &[7u8; 256])).unwrap();
         // Several level 0 tables, so the job has a compaction to run.
         if i % 100 == 99 {
             db.flush().unwrap();

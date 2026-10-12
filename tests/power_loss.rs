@@ -569,7 +569,7 @@ fn a_power_cut_during_a_compaction_keeps_every_write_it_was_merging() {
         for i in 0..KEYS {
             let key = format!("key_{:06}", (i * STRIDE) % KEYS).into_bytes();
             let value = fault::garbage(i as u64, 128);
-            d.put(&key, &value).expect("fill put");
+            regolith::through_stalls(|| d.put(&key, &value)).expect("fill put");
             history.put(key, value);
         }
         d.close().expect("close after fill");

@@ -31,12 +31,16 @@
 \* Several threads may share a slot (more threads than slots, or a number
 \* handed back and reused), so every entry change is one atomic step.
 \*
-\* WHAT IS CHECKED, for every interleaving of three handles on two threads
-\* over two slots of two entries, with a commit (MaxSeq 1 in the configs)
-\* and a compaction that runs again and again. The green setting was also
-\* checked once with MaxSeq 2 on 16 TLC workers (2026-10-09: 14,454,602
-\* distinct states, no error), which takes too long for `just tla`'s one
-\* worker; every RED below also fails at MaxSeq 2.
+\* WHAT IS CHECKED, for every interleaving of two handles on two threads
+\* (MC_SnapshotRegistry_Green) and of three handles on one thread
+\* (MC_SnapshotRegistry_Green_ThreeHandles) over two slots of one entry,
+\* with a commit (MaxSeq 1 in the configs) and a compaction that runs again
+\* and again. That keeps each configuration to a few seconds on one TLC
+\* worker; with three handles on two threads and two entries
+\* per slot the green setting was 1,262,916 distinct states (no error), and
+\* with MaxSeq 2 as well it was checked once on 16 TLC workers (2026-10-09:
+\* 14,454,602 distinct states, no error). Every RED below also fails at
+\* those sizes.
 \*   MinBelowLive     the minimum the compaction uses is at most every live
 \*                    snapshot;
 \*   LiveCovered      every live snapshot is in the list or at or above the

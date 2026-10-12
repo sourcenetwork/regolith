@@ -170,7 +170,7 @@ impl Unit {
     /// [`release`](Self::release). The flight's `Release` store hands the
     /// work put back to whoever claims it next.
     pub(crate) fn park(&self) {
-        self.flight.park();
+        self.flight.park_closed();
     }
 
     /// Make a parked unit claimable again, after a slot freed. `true` for

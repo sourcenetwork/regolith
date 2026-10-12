@@ -7,11 +7,13 @@
 //! 2. Every writer that returns `Ok` really did commit, and every writer in
 //!    a group that failed learns it did not.
 //! 3. N concurrent durable writers cost far fewer than N fsyncs, which is
-//!    the whole point of the change and is the one thing here that is
-//!    deterministic enough to assert on.
+//!    the whole point of the change. Threads started together overlap only
+//!    by luck, so that test holds the commit pipeline until every writer is
+//!    queued, which needs the engine's internals: it lives beside them, in
+//!    `src/engine/commit/overlap_tests.rs`, and still writes through `Db`.
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -22,82 +24,6 @@ fn durable_opts(stats: Option<Arc<Statistics>>) -> Options {
     Options::default()
         .durability(DurabilityMode::Immediate)
         .statistics(stats)
-}
-
-#[test]
-fn concurrent_durable_writers_cost_far_fewer_fsyncs_than_writes() {
-    // The deterministic proof that group commit works. Throughput on this
-    // host is not characterisable, but a counter is.
-    const WRITERS: usize = 8;
-    const PER_WRITER: usize = 250;
-    // Group commit amortises an fsync across writers that are inside the
-    // commit path at the same time. A barrier gets them to start
-    // together but cannot keep them overlapping, so on a loaded host
-    // every write can legitimately form its own group and the ratio does
-    // not appear. That is a scheduling outcome, not a defect, and one
-    // attempt at it is a coin flip: this test failed under full-suite
-    // load while passing on its own.
-    //
-    // So the workload runs until amortisation is observed. If group
-    // commit works, a round where eight threads hammer produces a
-    // multi-writer group almost immediately; if none of the attempts
-    // ever does, the mechanism is broken and that is worth failing on.
-    const ATTEMPTS: usize = 5;
-
-    let mut observed = None;
-    for attempt in 1..=ATTEMPTS {
-        let dir = TempDir::new().unwrap();
-        let stats = Arc::new(Statistics::new());
-        let db = Arc::new(Db::open(dir.path(), durable_opts(Some(Arc::clone(&stats)))).unwrap());
-
-        let gate = Arc::new(Barrier::new(WRITERS));
-        let mut handles = Vec::with_capacity(WRITERS);
-        for w in 0..WRITERS {
-            let (db, gate) = (Arc::clone(&db), Arc::clone(&gate));
-            handles.push(thread::spawn(move || {
-                gate.wait();
-                for i in 0..PER_WRITER {
-                    regolith::through_stalls(|| {
-                        db.put(format!("w{w}k{i:05}").as_bytes(), b"value")
-                    })
-                    .unwrap();
-                }
-            }));
-        }
-        for handle in handles {
-            handle.join().unwrap();
-        }
-
-        let writes = (WRITERS * PER_WRITER) as u64;
-        let syncs = stats.get_ticker(Ticker::WalSyncCount);
-        assert!(syncs >= 1, "durable writes must reach stable storage");
-
-        // Every write that returned Ok must be readable, on every
-        // attempt, whether or not this one amortised.
-        for w in 0..WRITERS {
-            for i in 0..PER_WRITER {
-                let key = format!("w{w}k{i:05}");
-                assert_eq!(
-                    db.get(key.as_bytes()).unwrap(),
-                    Some(b"value".to_vec()),
-                    "every write that returned Ok must be readable"
-                );
-            }
-        }
-
-        if syncs < writes {
-            observed = Some((attempt, syncs, writes));
-            break;
-        }
-    }
-
-    let (attempt, syncs, writes) = observed.unwrap_or_else(|| {
-        panic!(
-            "group commit never amortised an fsync across {WRITERS} concurrent writers in \
-             {ATTEMPTS} attempts of {PER_WRITER} writes each: every write formed its own group"
-        )
-    });
-    println!("group commit: {syncs} syncs for {writes} durable writes, on attempt {attempt}");
 }
 
 #[test]
@@ -327,8 +253,10 @@ fn mixed_durability_writers_all_commit() {
         let db = Arc::clone(&db);
         handles.push(thread::spawn(move || {
             for i in 0..PER_LANE {
-                db.put_opt(&opts, format!("m{lane}_{i:04}").as_bytes(), b"v")
-                    .unwrap();
+                regolith::through_stalls(|| {
+                    db.put_opt(&opts, format!("m{lane}_{i:04}").as_bytes(), b"v")
+                })
+                .unwrap();
             }
         }));
     }

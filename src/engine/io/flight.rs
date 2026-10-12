@@ -5,9 +5,10 @@
 //!
 //! ```text
 //! Free --claim (one CAS)--> Claimed --land--> Done
-//!   ^                        |
-//!   |                        +--park (a block read whose reopen found no
-//!   +--unpark (one CAS)-- Parked      open-file slot, D60)
+//!   ^   ^                      |  |
+//!   |   +--------- park -------+  +--park_closed (a block read whose
+//!   |                                 reopen found no open-file slot, D60)
+//!   +--unpark (one CAS)-- Parked <----+
 //! ```
 //!
 //! The claim is the only way to `Claimed`, so the work runs on one thread
@@ -17,10 +18,21 @@
 //! reads the outcome itself. So every queue that registered is handed to the
 //! lander exactly once, and none is lost.
 //!
-//! Only a block read parks: its holder gives the claim up without landing,
-//! and the unit is neither run nor landed until it is unparked (a slot
-//! freed) or released (close, a dropped queue). A parked flight is still in
-//! flight, so queues go on registering on it. A job never parks.
+//! A claim holder that cannot go on without waiting for another thread
+//! gives the claim up without landing, in one of two ways:
+//!
+//! - **A job parks open** ([`Flight::park`]): back to `Free`, before any
+//!   of its gated work ran, so whoever is to go on with it claims it again:
+//!   its owner's queue once the job's waker says it may go on, or a blocking
+//!   caller that chose to wait for it on its own thread (`job.rs`).
+//! - **A block read parks closed** ([`Flight::park_closed`]): to `Parked`,
+//!   which no claim takes. Every queue that registered on the read would
+//!   otherwise claim it at its next poll and find the same slots busy. It
+//!   is neither run nor landed until it is unparked (a slot freed) or
+//!   released (close, a dropped queue).
+//!
+//! Either way the unit is still in flight, so queues go on registering on
+//! it, and a parked unit ran nothing, so the work still runs at most once.
 
 use std::sync::Arc;
 
@@ -71,6 +83,15 @@ impl Flight {
             .is_ok()
     }
 
+    /// Hand the claim back without landing: the unit goes on later, under a
+    /// new claim. Only by the claim holder, after it put back whatever it
+    /// took from the unit: the `Release` store orders that before the next
+    /// claim's `Acquire`.
+    pub(crate) fn park(&self) {
+        debug_assert_eq!(self.state.load(Ordering::Relaxed), CLAIMED);
+        self.state.store(FREE, Ordering::Release);
+    }
+
     /// Take the unit to close it without running it, whether nobody has
     /// claimed it or its holder parked it. `false` when a thread holds it
     /// claimed or it has landed.
@@ -90,12 +111,12 @@ impl Flight {
         }
     }
 
-    /// Give the claim up without landing: the unit is neither run nor
-    /// landed until [`unpark`](Self::unpark) or
+    /// Give the claim up without landing and close the unit to claims: it
+    /// is neither run nor landed until [`unpark`](Self::unpark) or
     /// [`claim_to_release`](Self::claim_to_release). Only the claim holder
     /// writes a claimed unit's state, so a store suffices; `Release` hands
     /// what the holder left behind to whoever claims it next.
-    pub(crate) fn park(&self) {
+    pub(crate) fn park_closed(&self) {
         debug_assert_eq!(self.state.load(Ordering::Relaxed), CLAIMED);
         self.state.store(PARKED, Ordering::Release);
     }

@@ -90,6 +90,44 @@ fn a_latched_database_closes_without_appending_close() {
     assert_eq!(db.get(b"a").unwrap(), Some(b"1".to_vec()));
 }
 
+/// The first reason latched is the one every later write reports: it is the
+/// one that explains the rest. Latches racing from many threads keep one
+/// reason, the same for every reader, and the latch never opens again.
+#[test]
+fn the_first_latched_reason_is_the_one_kept() {
+    let dir = TempDir::new().unwrap();
+    let db = Db::open(dir.path(), Options::default()).unwrap();
+    assert!(!db.engine().is_latched());
+    db.engine()
+        .latch_wal_failure(&std::io::Error::other("the first failure"));
+    db.engine().latch_callback_panic("a later panic");
+    db.engine()
+        .latch_wal_failure(&std::io::Error::other("a later failure"));
+    assert!(db.engine().is_latched());
+    let refused = db.put(b"k", b"v").unwrap_err().to_string();
+    assert!(
+        refused.contains("the first failure"),
+        "a later reason replaced the first: {refused}"
+    );
+
+    let dir = TempDir::new().unwrap();
+    let db = Db::open(dir.path(), Options::default()).unwrap();
+    std::thread::scope(|scope| {
+        for t in 0..8 {
+            let db = &db;
+            scope.spawn(move || {
+                db.engine()
+                    .latch_wal_failure(&std::io::Error::other(format!("failure {t}")));
+            });
+        }
+    });
+    let kept = db.put(b"k", b"v").unwrap_err().to_string();
+    assert!(kept.contains("failure "), "no reason was kept: {kept}");
+    for _ in 0..8 {
+        assert_eq!(db.put(b"k", b"v").unwrap_err().to_string(), kept);
+    }
+}
+
 /// A close whose sync fails leaves the log without CLOSE, says why, and
 /// latches the database, since what reached the device is unknown.
 #[test]

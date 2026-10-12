@@ -269,28 +269,38 @@ stress secs="600":
 # Seven of the models are `should_panic` calibrations that deliberately
 # get the ordering wrong; they are what make the passes mean anything.
 
+# Loom is bounded. Every recipe below builds its models first and then runs
+# them under a hard limit of 10 minutes (15 for the nightly twins): a run
+# that hits it fails. A model is sized to finish in under a minute and a
+# recipe in under five, by its scenario and by an explicit preemption bound
+# in its builder, never by `LOOM_MAX_DURATION`, which stops the search and
+# lets the test pass. A model that is shrunk says so in its comment.
 loom:
-    RUSTFLAGS="--cfg loom" cargo test --release --test loom_memtable
+    RUSTFLAGS="--cfg loom" cargo test --release --test loom_memtable --no-run
+    RUSTFLAGS="--cfg loom" timeout 10m cargo test --release --test loom_memtable
 
 loom-debug:
-    RUSTFLAGS="--cfg loom" cargo test --test loom_memtable
+    RUSTFLAGS="--cfg loom" cargo test --test loom_memtable --no-run
+    RUSTFLAGS="--cfg loom" timeout 10m cargo test --test loom_memtable
 
 # Loom models for `regolith::sync`: every primitive's wait protocol,
-# with two calibrations that must fail. Release only: the larger models
-# explore 0.1 to 3 million interleavings each (about eight minutes in
+# with three calibrations that must fail. Release only: the larger models
+# explore 0.1 to 0.4 million interleavings each (about four minutes in
 # all), which a debug build multiplies several times over.
 loom-sync:
-    RUSTFLAGS="--cfg loom" cargo test --release --test loom_sync
+    RUSTFLAGS="--cfg loom" cargo test --release --test loom_sync --no-run
+    RUSTFLAGS="--cfg loom" timeout 10m cargo test --release --test loom_sync
 
 # The five sync models whose three threads all contend for one lock or
 # semaphore, at preemption bound 2 instead of the bound 1 `loom-sync`
-# runs them at: their `#[ignore]`d twins, or the one `model` names.
-# Four of them take 43 to 79 minutes each on a workstation; the fifth, the
-# upgradable read, runs a smaller scenario at bound 2 and takes 10 s (its
-# full one never finished). So the nightly CI run carries them, one job
-# per model, not the per-change one.
+# runs them at: their `#[ignore]`d twins, or the one `model` names. Each
+# twin runs a smaller scenario of its own, because the shared one does not
+# finish at bound 2 in any useful time (43 to 79 minutes a model, and never
+# for the upgradable read). They take 2 s to 6 minutes each, so the nightly
+# CI run carries them, one job per model.
 loom-sync-deep model="":
-    RUSTFLAGS="--cfg loom" cargo test --release --test loom_sync -- --ignored {{model}}
+    RUSTFLAGS="--cfg loom" cargo test --release --test loom_sync --no-run
+    RUSTFLAGS="--cfg loom" timeout 15m cargo test --release --test loom_sync -- --ignored {{model}}
 
 # Loom models for the per-thread I/O queues (D53): the unit claim, the
 # completion pushed to every waiting queue, the idle waker, a read's wait,
@@ -298,13 +308,15 @@ loom-sync-deep model="":
 # fail. Release only, like
 # `loom-sync`: the wait model explores close to 0.8 million interleavings.
 loom-io:
-    RUSTFLAGS="--cfg loom" cargo test --release --test loom_io_queue
+    RUSTFLAGS="--cfg loom" cargo test --release --test loom_io_queue --no-run
+    RUSTFLAGS="--cfg loom" timeout 10m cargo test --release --test loom_io_queue
 
 # Loom models for the snapshot registry's per-thread slots: the slot and
 # thread-number claims, a moved pin's release, announce-sample-confirm and
 # the drain wake, with four calibrations that must fail. Release only.
 loom-snapshots:
-    RUSTFLAGS="--cfg loom" cargo test --release --test loom_snapshots
+    RUSTFLAGS="--cfg loom" cargo test --release --test loom_snapshots --no-run
+    RUSTFLAGS="--cfg loom" timeout 10m cargo test --release --test loom_snapshots
 
 # Loom models for the per-core read path (Phase 7b): the read view's
 # compare-and-swap publication, its reclamation and its freshness; the
@@ -312,13 +324,16 @@ loom-snapshots:
 # tombstone log's prefix publication, run against the real log. Each has
 # a calibration that must fail.
 loom-view:
-    RUSTFLAGS="--cfg loom" cargo test --release --test loom_read_view
+    RUSTFLAGS="--cfg loom" cargo test --release --test loom_read_view --no-run
+    RUSTFLAGS="--cfg loom" timeout 10m cargo test --release --test loom_read_view
 
 loom-cache:
-    RUSTFLAGS="--cfg loom" cargo test --release --test loom_block_cache
+    RUSTFLAGS="--cfg loom" cargo test --release --test loom_block_cache --no-run
+    RUSTFLAGS="--cfg loom" timeout 10m cargo test --release --test loom_block_cache
 
 loom-tombstones:
-    RUSTFLAGS="--cfg loom" cargo test --release --test loom_range_tombstones
+    RUSTFLAGS="--cfg loom" cargo test --release --test loom_range_tombstones --no-run
+    RUSTFLAGS="--cfg loom" timeout 10m cargo test --release --test loom_range_tombstones
 
 # Loom models for the open-file slot table (acquire, evict, release, drain,
 # and D60's park of a reopen that may not wait and the wake of a freed slot)
@@ -326,9 +341,26 @@ loom-tombstones:
 # ordered step), with five calibrations that must fail. Release, like
 # `loom-io`.
 loom-tables:
-    RUSTFLAGS="--cfg loom" cargo test --release --test loom_tables
+    RUSTFLAGS="--cfg loom" cargo test --release --test loom_tables --no-run
+    RUSTFLAGS="--cfg loom" timeout 10m cargo test --release --test loom_tables
 
-loom-all: loom loom-debug loom-sync loom-io loom-snapshots loom-view loom-cache loom-tombstones loom-tables
+# Loom models for the pessimistic lock table (plan 4.6, 4.10): one holder
+# per key, the bypass bound, a wait delivered to its own queue, the table's
+# use count, and close meeting a wait being queued, with five calibrations
+# that must fail. Release only; the ten run in under ten seconds.
+loom-locks:
+    RUSTFLAGS="--cfg loom" cargo test --release --test loom_locks --no-run
+    RUSTFLAGS="--cfg loom" timeout 10m cargo test --release --test loom_locks
+
+# Loom models for the compaction gate (E28) and for a job that parks on its
+# queue instead of waiting for the gate, with three calibrations that must
+# fail: a job that skips the gate, the old writer-preferring gate, and a
+# parked job with no way back to its queue. Release only, like `loom-sync`.
+loom-gate:
+    RUSTFLAGS="--cfg loom" cargo test --release --test loom_gate --no-run
+    RUSTFLAGS="--cfg loom" timeout 10m cargo test --release --test loom_gate
+
+loom-all: loom loom-debug loom-sync loom-io loom-snapshots loom-view loom-cache loom-tombstones loom-tables loom-locks loom-gate
 
 # The read-view chaos workload at full size: 6 instances x 2 rounds x 400
 # versions. Measured at over 20 minutes wall and 4h of CPU unoptimized,
@@ -369,30 +401,49 @@ chaos instances="4" rounds="2" versions="120" min_rounds="20":
 # Each row prints the distinct states TLC explored and its wall time.
 # TLC is fetched on first use, pinned by checksum in `proofs/tla/tools/tlc`.
 #
-# `just tla` runs every row. `just tla N M` runs the rows of shard N of M:
-# the rows are dealt out in turn, so M runs side by side (CI's matrix) cover
-# every row once, and no shard holds two neighbouring heavy rows.
+# The suite is bounded. Every row runs on ONE TLC worker under a hard limit
+# of 120 seconds: a row that hits it is reported as TIMED OUT and fails the
+# recipe, it never passes. A configuration is sized to finish in under 60
+# seconds on one worker; one that does not is shrunk (its `.cfg` says what
+# was shrunk and what the smaller instance still covers), because the Lean
+# proof covers every size and TLC only has to show a small instance's
+# interleavings. Time a new row before adding it.
 #
-# A GREEN row explores its whole state space, in whatever order, so TLC
-# gets every core for it. A RED row stops at the first broken invariant it
-# meets, and with one worker that is always the shallowest one, the same on
-# every run; RED rows are short anyway.
-# Check every TLA+ row, or shard N of M of them (`just tla N M`).
-tla shard="1" shards="1":
+# As many rows run side by side as the machine has cores, each in a JVM
+# sized for its one worker, and their lines are printed in the order below
+# once all are done. With one worker a RED row stops at the shallowest
+# broken invariant, the same on every run.
+# Check every TLA+ row.
+tla:
     #!/usr/bin/env bash
     set -uo pipefail
     cd proofs/tla
-    fail=0
+    # Fetched once, before the rows run side by side.
+    ./tools/tlc --fetch-only >/dev/null || exit 1
+    results=$(mktemp -d)
+    trap 'rm -rf "$results"' EXIT
+    # The cores this run may use (`nproc` counts those it is confined to).
+    side=$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN)
     row=0
     # The module the next rows check; each block below sets it.
     spec=RepeatableRead
+    # One row, started in the background: its line goes to a file named by
+    # its number, and a `.fail` file beside it marks a wrong verdict.
     check() {
-        local cfg="$1" expect="$2" inv="${3:-}" out broke verdict states took workers
         row=$((row + 1))
-        if [ $(( (row - 1) % {{shards}} + 1 )) -ne {{shard}} ]; then return; fi
-        workers=1
-        if [ "$expect" = GREEN ]; then workers=auto; fi
-        out=$(./tools/tlc -workers "$workers" -metadir "states/$cfg" -config "$cfg.cfg" "$spec.tla" 2>&1)
+        while [ "$(jobs -rp | wc -l)" -ge "$side" ]; do wait -n; done
+        run_row "$(printf '%04d' "$row")" "$spec" "$@" > "$results/$(printf '%04d' "$row").out" 2>&1 &
+    }
+    run_row() {
+        local n="$1" spec="$2" cfg="$3" expect="$4" inv="${5:-}" out code broke verdict states took
+        # A serial collector and two compiler threads: what one worker on
+        # one core uses. A temporary directory of its own, because TLC
+        # unpacks its standard modules into it and two rows must not share
+        # the files; the row's states go there too.
+        mkdir -p "$results/tmp.$n"
+        out=$(TLC_JVM_FLAGS="-XX:+UseSerialGC -XX:CICompilerCount=2 -Djava.io.tmpdir=$results/tmp.$n" \
+              timeout 120 ./tools/tlc -workers 1 -metadir "$results/tmp.$n/states" -config "$cfg.cfg" "$spec.tla" 2>&1)
+        code=$?
         # TLC words a broken invariant two ways: "is violated." when the search reaches a bad
         # state, and "is violated by the initial state:" when the very first state is already
         # bad. Both name the invariant, and both count.
@@ -400,7 +451,11 @@ tla shard="1" shards="1":
                        -e 's/^Error: Invariant \(.*\) is violated by the initial state:$/\1/p' <<<"$out" | head -1)
         states=$(sed -n 's/^.* states generated, \([0-9,]*\) distinct states found.*$/\1/p' <<<"$out" | tail -1)
         took=$(sed -n 's/^Finished in \(.*\) at (.*$/\1/p' <<<"$out" | tail -1)
-        if grep -q "No error has been found" <<<"$out"; then
+        if [ "$code" -eq 124 ]; then
+            # The hard limit: a failure, whatever the row was meant to show.
+            verdict="TIMED OUT"
+            took="over 120s"
+        elif grep -q "No error has been found" <<<"$out"; then
             verdict=GREEN
         elif [ -n "$broke" ] && [ "$broke" = "$inv" ]; then
             verdict=RED
@@ -410,16 +465,18 @@ tla shard="1" shards="1":
             verdict=BROKEN
             echo "$out" | tail -20
         fi
-        printf '  %-48s %-6s %9s states %8s  (expected %s)\n' \
+        printf '  %-48s %-9s %9s states %9s  (expected %s)\n' \
             "$cfg" "$verdict" "${states:-?}" "${took:-?}" "$expect${inv:+ on $inv}"
-        if [ "$verdict" != "$expect" ]; then fail=1; fi
+        if [ "$verdict" != "$expect" ]; then touch "$results/$n.fail"; fi
     }
     check MC_RepeatableRead_Green                      GREEN
+    check MC_RepeatableRead_Green_Live                 GREEN
     check MC_RepeatableRead_Red_Serializable           RED INV_AppendsCommit
     check MC_RepeatableRead_Red_SnapshotIsolation      RED INV_NoStaleDefinition
     check MC_RepeatableRead_Red_ReadCommitted          RED INV_NoStaleDefinition
     check MC_DefraLevel_Green_Heads                    GREEN
     check MC_DefraLevel_Green_Counters                 GREEN
+    check MC_DefraLevel_Green_Counters_Clear           GREEN
     check MC_DefraLevel_Green_Migrations               GREEN
     check MC_DefraLevel_Red_RepeatableRead_Merges      RED INV_DuplicateMergesCommit
     check MC_DefraLevel_Red_NoPolicy                   RED INV_DuplicateMergesCommit
@@ -440,6 +497,7 @@ tla shard="1" shards="1":
     check MC_DefraLevel_Red_PresenceReadFull           RED INV_LinksCommit
     check MC_DefraLevel_Red_PresenceUnchecked          RED INV_HoldsCurrent
     check MC_DefraLevel_Green_Parts                    GREEN
+    check MC_DefraLevel_Green_Parts_Rewriter           GREEN
     check MC_DefraLevel_Red_PartsIgnorePut             RED INV_PartsCurrent
     check MC_DefraLevel_Red_PartsIgnoreTouch           RED INV_PartsCurrent
     check MC_DefraLevel_Red_PartsNoAbsentFallback      RED INV_PartsCurrent
@@ -463,6 +521,10 @@ tla shard="1" shards="1":
     check MC_DefraLevel_Red_ReasonNewestWrite          RED INV_ReasonsExact
     # E1. Lean: Regolith/LsmOrder.lean, compact_range_reads_newest.
     spec=LsmOrder
+    # E31, a flush's table and its memtable's retirement are one publication.
+    # Lean: Regolith/LsmOrder.lean, flush_keeps_sources_disjoint,
+    # split_install_holds_a_memtable_twice.
+    check MC_LsmOrder_Red_SplitRetire                  RED NoDoubleSource
     check MC_LsmOrder_Green                            GREEN
     check MC_LsmOrder_Red_Intersect                    RED ReadNewest
     # Flush order, ingest placement, overlap demotion (E14, D13), binary
@@ -592,8 +654,10 @@ tla shard="1" shards="1":
     # list_pages_all.
     spec=BackupSeal
     check MC_BackupSeal_Green                          GREEN
+    check MC_BackupSeal_Green_Attack                   GREEN
     check MC_BackupSeal_Green_Stream                   GREEN
     check MC_BackupSeal_Green_Sweep                    GREEN
+    check MC_BackupSeal_Green_SweepTwoTables           GREEN
     check MC_BackupSeal_Red_StreamSkips                RED ListedRestores
     check MC_BackupSeal_Red_SweepSkips                 RED SweepRemovesEveryUnlisted
     check MC_BackupSeal_Red_PlainMeta                  RED SealedMetadata
@@ -632,6 +696,7 @@ tla shard="1" shards="1":
     # clone_respects_live, pins_exact.
     spec=SnapshotRegistry
     check MC_SnapshotRegistry_Green                    GREEN
+    check MC_SnapshotRegistry_Green_ThreeHandles       GREEN
     check MC_SnapshotRegistry_Red_NoConfirm            RED MinBelowLive
     check MC_SnapshotRegistry_Red_ScanThenSample       RED MinBelowLive
     check MC_SnapshotRegistry_Red_ReleaseHere          RED LiveCovered
@@ -647,6 +712,8 @@ tla shard="1" shards="1":
     # E10, group commit. Lean: Regolith/GroupCommit.lean, group_eq_serial.
     spec=GroupCommit
     check MC_GroupCommit_Green                         GREEN
+    check MC_GroupCommit_Green_Live                    GREEN
+    check MC_GroupCommit_Green_LivePlain               GREEN
     check MC_GroupCommit_Green_ReadOnly                GREEN
     check MC_GroupCommit_Red_ViewOnly                  RED SerialEquivalent
     check MC_GroupCommit_Red_TrustEarly                RED SerialEquivalent
@@ -657,12 +724,16 @@ tla shard="1" shards="1":
     # Green_Nowait_Owes is the witness that the GREEN run leaves groups owed.
     # Lean: Regolith/IoQueue.lean, group_sync_once, group_visible_after_sync.
     check MC_GroupCommit_Green_Nowait                  GREEN
+    check MC_GroupCommit_Green_NowaitLive              GREEN
     check MC_GroupCommit_Green_Nowait_Owes             RED NothingOwed
     check MC_GroupCommit_Red_DoubleClaim               RED SingleSync
     # 4.7, the lock-free commit pipeline. Lean: Regolith/Pipeline.lean,
     # seqs_dense and reader_sees_published.
     spec=CommitPipeline
     check MC_CommitPipeline_Green                      GREEN
+    check MC_CommitPipeline_Green_Live                 GREEN
+    check MC_CommitPipeline_Green_LiveIngest           GREEN
+    check MC_CommitPipeline_Green_LiveApart            GREEN
     check MC_CommitPipeline_Red_OutOfOrder             RED ReadersSeePrefix
     check MC_CommitPipeline_Red_AbortHole              RED NoHole
     check MC_CommitPipeline_Red_NoHelping              RED NoLiveThreadBlocked
@@ -670,12 +741,16 @@ tla shard="1" shards="1":
     check MC_CommitPipeline_Red_ValidatePublished      RED NoLostUpdate
     # R13 and D53, non-blocking reads on per-thread I/O queues: single-flight
     # units claimed by one CAS, completions only on the asking queue, idle
-    # wakeups. Lean: Regolith/IoQueue.lean, claim_once, told_exactly_once,
-    # no_lost_idle_wakeup, busy_never_woken, single_thread_finishes.
+    # wakeups. Lean: Regolith/IoQueue.lean, claim_once, told_at_most_once,
+    # every_waiter_told, no_lost_idle_wakeup, busy_never_woken,
+    # single_thread_finishes.
     spec=NonBlocking
     check MC_NonBlocking_Green_Pool                    GREEN
+    check MC_NonBlocking_Green_PoolLive                GREEN
     check MC_NonBlocking_Green_Jobs                    GREEN
+    check MC_NonBlocking_Green_JobsLive                GREEN
     check MC_NonBlocking_Green_Single                  GREEN
+    check MC_NonBlocking_Green_SingleLive              GREEN
     check MC_NonBlocking_Red_WrongQueue                RED OwnQueue
     check MC_NonBlocking_Red_LostIdleWakeup            RED NoLostIdleWakeup
     check MC_NonBlocking_Red_DoubleRun                 RED SingleRun
@@ -709,7 +784,9 @@ tla shard="1" shards="1":
     # mutual_exclusion, bounded_bypass, owed_exclusive.
     spec=Sync
     check MC_Sync_Green_Mutex                          GREEN
+    check MC_Sync_Green_MutexLive                      GREEN
     check MC_Sync_Green_Semaphore                      GREEN
+    check MC_Sync_Green_SemaphoreLive                  GREEN
     check MC_Sync_Green_Reentrant                      GREEN
     check MC_Sync_Green_ReentrantLive                  GREEN
     check MC_Sync_Red_UnboundedBarging                 RED BoundedBypass
@@ -723,6 +800,7 @@ tla shard="1" shards="1":
     # Regolith/SyncFifo.lean, fifo_served, no_stranded_waiter.
     spec=SyncNotify
     check MC_SyncNotify_Green                          GREEN
+    check MC_SyncNotify_Green_Live                     GREEN
     check MC_SyncNotify_Red_WakeBeforeHandoff          RED NoLostWakeup
     check MC_SyncNotify_Red_CancelNoPassOn             RED CancelPassesOn
     check MC_SyncNotify_Red_NoRecheck                  RED NoLostWakeup
@@ -739,6 +817,25 @@ tla shard="1" shards="1":
     check MC_SyncRwLock_Red_AnyReaderUpgrade           RED NoUpgradeDeadlock
     check MC_SyncRwLock_Red_UpgradeNoHoldBack          RED UpgradeHoldsBack
     check MC_SyncRwLock_Red_OwnerUnaware               RED NoSelfDeadlock
+    # The compaction gate (4.6, E28): a pass shares it, a job holds it
+    # alone, no waiter is passed over more than Bound times either way, the
+    # worker takes turns between jobs and passes, and a job parked on its
+    # queue is always woken. The old gate's rule is Red_OldGate. Lean:
+    # Regolith/CompactionGate.lean, mutual_exclusion, bounded_bypass,
+    # owed_only_gets_nearer, worker_takes_turns, parked_job_keeps_its_wake.
+    spec=CompactionGate
+    check MC_CompactionGate_Green                      GREEN
+    check MC_CompactionGate_Green_All                  GREEN
+    check MC_CompactionGate_Green_Queue                GREEN
+    check MC_CompactionGate_Green_Passes               GREEN
+    check MC_CompactionGate_Green_Live                 GREEN
+    check MC_CompactionGate_Green_LiveServed           GREEN
+    check MC_CompactionGate_Red_OldGate                RED BoundedBypass
+    check MC_CompactionGate_Red_NoHandoff              RED BoundedBypass
+    check MC_CompactionGate_Red_DrainJobs              RED WorkerTakesTurns
+    check MC_CompactionGate_Red_WakeDropped            RED NoLostWake
+    check MC_CompactionGate_Red_StaleWaker             RED NoLostWake
+    check MC_CompactionGate_Red_SkipGate               RED MutualExclusion
     # regolith::sync::Event, Latch and Barrier.
     spec=SyncLatch
     check MC_SyncLatch_Green_Event                     GREEN
@@ -847,9 +944,38 @@ tla shard="1" shards="1":
     check MC_EnvFiles_Green_Rename                     GREEN
     check MC_EnvFiles_Red_RemoveFirst                  RED OpenFindsFile
     check MC_EnvFiles_Red_NoReload                     RED OpenFindsFile
-    rm -rf states ./*_TTrace_*.tla ./*_TTrace_*.bin
-    echo "  shard {{shard}} of {{shards}}: $row rows in all"
-    exit $fail
+    # The pessimistic lock table (plan 4.6, 4.10): one holder per key, no
+    # lost wake-up, bounded bypass, a wait delivered to its own queue, and a
+    # lock released when its commit lands. Lean: Regolith/LockTable.lean,
+    # mutual_exclusion, retired_unused, no_stranded_front, handed_is_told,
+    # bounded_bypass, note_on_own_queue, ready_by_own_queue,
+    # isolation_at_landing.
+    spec=LockTable
+    check MC_LockTable_Green_Try                       GREEN
+    check MC_LockTable_Green_Bound2                    GREEN
+    check MC_LockTable_Green_Blocking                  GREEN
+    check MC_LockTable_Green_Nowait                    GREEN
+    check MC_LockTable_Green_Cancel                    GREEN
+    check MC_LockTable_Green_Table                     GREEN
+    check MC_LockTable_Green_Mixed                     GREEN
+    check MC_LockTable_Green_MixedLive                 GREEN
+    check MC_LockTable_Green_Four                      GREEN
+    check MC_LockTable_Red_RetireNoCas                 RED MutualExclusion
+    check MC_LockTable_Red_NoRecheck                   RED NoStrandedFront
+    check MC_LockTable_Red_ReleaseNoWake               RED NoStrandedFront
+    check MC_LockTable_Red_CancelNoPassOn              RED NoStrandedFront
+    check MC_LockTable_Red_NoteAfterPoll               RED WokenIsTold
+    check MC_LockTable_Red_UnboundedBarging            RED BoundedBypass
+    check MC_LockTable_Red_WrongQueue                  RED OwnQueue
+    check MC_LockTable_Red_CompleteOnWaker             RED OwnQueue
+    check MC_LockTable_Red_ReleaseAtWrite              RED IsolationAtLanding
+    check MC_LockTable_Red_ReleaseAtDelivery           RED HeldOnlyWhileNeeded
+    wait
+    rm -rf ./*_TTrace_*.tla ./*_TTrace_*.bin
+    cat "$results"/*.out
+    failed=$(find "$results" -name '*.fail' | wc -l)
+    echo "  $row rows, $failed with the wrong verdict"
+    [ "$failed" -eq 0 ]
 
 # `proofs/lean` is a Lake project named Regolith, plain Lean 4 core with no
 # dependencies, so it builds offline. Each module proves for every size what

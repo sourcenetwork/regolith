@@ -31,6 +31,12 @@ pub enum WouldBlock {
     /// again.
     #[error("writes are stalled behind background work ({}); wait for the stall to clear and run the write again", .0.reason())]
     Stall(StallWait),
+    /// A pessimistic transaction's
+    /// [`try_get_for_update`](crate::Transaction::try_get_for_update) found
+    /// the key locked by another transaction. The call took nothing; wait
+    /// for the lock, then run the call again.
+    #[error("the key is locked by another transaction; wait for the lock and run the call again")]
+    Locked(LockWait),
 }
 
 /// Names the device read an [`IoWait`] waits on. Two waits name the same
@@ -265,6 +271,76 @@ impl std::fmt::Debug for StallWait {
 }
 
 impl Future for StallWait {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        self.get_mut().listen.poll(cx)
+    }
+}
+
+/// A wait for a key lock another transaction holds, handed back by
+/// [`Transaction::try_get_for_update`](crate::Transaction::try_get_for_update)
+/// ([`WouldBlock::Locked`]).
+///
+/// It becomes ready when the lock may be the waiting transaction's: the
+/// holder released it, or it was handed to this transaction because others
+/// took it past this one too many times. Ready says only that: the call run
+/// again takes the lock, finds it handed over, or, when another transaction
+/// took it first, returns a new wait. The transaction keeps its place among
+/// the key's waiters across those runs, and a transaction passed over a
+/// bounded number of times ([`MAX_BYPASS`](crate::sync::MAX_BYPASS)) is
+/// handed the lock, so no waiter starves.
+///
+/// A transaction with an [`IoQueue`](crate::IoQueue)
+/// ([`TxnOptions::io_queue`](crate::TxnOptions::io_queue), or the queue its
+/// [`ReadMode::CacheOnly`](crate::ReadMode::CacheOnly) names) records the
+/// wait on that queue: it becomes ready only at that queue's
+/// [`poll`](crate::IoQueue::poll), on its owner's thread, which an idle
+/// owner is woken for once and a busy one never is. A transaction with no
+/// queue is completed directly, on the thread that released the lock. A wait
+/// whose queue was dropped meanwhile is completed directly too. When the
+/// database closes, every wait becomes ready, and the call run again fails
+/// with [`Error::Closed`](crate::Error::Closed).
+///
+/// It is a [`Future`] with output `()`. Clones wait on the same lock.
+/// Dropping a wait cancels nothing: the transaction keeps its place until it
+/// runs the call again or ends.
+#[derive(Clone)]
+pub struct LockWait {
+    listen: Listen,
+    queue: Option<QueueId>,
+}
+
+impl LockWait {
+    pub(crate) fn new(slot: Arc<WaitSlot>, queue: Option<QueueId>) -> Self {
+        Self {
+            listen: Listen::new(slot),
+            queue,
+        }
+    }
+
+    /// The queue this wait was recorded on, whose poll makes it ready; `None`
+    /// for a transaction with no queue.
+    pub fn queue(&self) -> Option<QueueId> {
+        self.queue
+    }
+
+    /// Whether the lock may be free now. Never waits.
+    pub fn is_ready(&self) -> bool {
+        self.listen.is_ready()
+    }
+}
+
+impl std::fmt::Debug for LockWait {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LockWait")
+            .field("queue", &self.queue)
+            .field("ready", &self.is_ready())
+            .finish()
+    }
+}
+
+impl Future for LockWait {
     type Output = ();
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {

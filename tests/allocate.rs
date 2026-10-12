@@ -84,7 +84,7 @@ fn a_counter_that_is_not_eight_bytes_is_refused_and_left_alone() {
     let dir = TempDir::new().unwrap();
     let db = Db::open(dir.path(), Options::default()).unwrap();
     for bad in [&b""[..], b"1234567", b"123456789"] {
-        db.put(b"ids", bad).unwrap();
+        regolith::through_stalls(|| db.put(b"ids", bad)).unwrap();
         for n in [0, 1] {
             let err = db.allocate(b"ids", n).unwrap_err();
             assert!(matches!(err, Error::InvalidArgument(_)), "{err:?}");
@@ -101,7 +101,7 @@ fn a_counter_that_is_not_eight_bytes_is_refused_and_left_alone() {
 fn the_counter_stops_below_the_largest_value_and_reserves_nothing_past_it() {
     let dir = TempDir::new().unwrap();
     let db = Db::open(dir.path(), Options::default()).unwrap();
-    db.put(b"ids", &(u64::MAX - 3).to_be_bytes()).unwrap();
+    regolith::through_stalls(|| db.put(b"ids", &(u64::MAX - 3).to_be_bytes())).unwrap();
     assert_eq!(db.allocate(b"ids", 2).unwrap(), u64::MAX - 2..u64::MAX);
     assert_eq!(counter(&db, b"ids"), Some(u64::MAX - 1));
     for n in [1, 2, u64::MAX] {

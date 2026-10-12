@@ -70,7 +70,7 @@ fn a_checkpoint_drain_racing_a_rotation_never_loses_an_acknowledged_write() {
         let db = Arc::clone(&db);
         handles.push(thread::spawn(move || {
             for i in 0..KEYS_PER_WRITER {
-                db.put(&key_of(w, i), &value_of(w, i)).expect("put");
+                regolith::through_stalls(|| db.put(&key_of(w, i), &value_of(w, i))).expect("put");
             }
         }));
     }

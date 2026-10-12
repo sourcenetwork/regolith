@@ -47,6 +47,9 @@ pub(crate) enum Message {
     },
     /// `job` landed; one per job this queue registered on.
     JobDone(Arc<Job>),
+    /// `job`, which parked on this queue, may go on: the owner steps it
+    /// again at its next poll.
+    Ready(Arc<Job>),
     /// A completion decided on another thread, to be told on this one: a
     /// foreground job a worker ran for a caller on this queue.
     Deliver(Arc<dyn Delivery>),

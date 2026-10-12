@@ -11,9 +11,10 @@
 //! ordering rests on fences alone: the models check the code as built.
 //!
 //! Every model runs at a preemption bound of three (`LOOM_MAX_PREEMPTIONS`
-//! overrides it): the largest, three pinning threads in one slot, explores
-//! about 0.7 million schedules there in under a minute of release build;
-//! unbounded, the three-thread searches run for hours without reaching a new
+//! overrides it), except the largest, three pinning threads in one slot,
+//! which takes two: at three it explores about 0.7 million schedules in over
+//! a minute of release build, at two about 0.1 million in ten seconds.
+//! Unbounded, the three-thread searches run for hours without reaching a new
 //! kind of interleaving.
 //!
 //! Four calibrations must fail: a registration that skips its confirm, a
@@ -90,7 +91,12 @@ fn entries(r: &SnapshotRegistry, slot: usize) -> Vec<(u64, u64)> {
 pub fn concurrent_pins_in_one_slot_keep_their_own_counts() {
     explore_bounded(
         "concurrent_pins_in_one_slot_keep_their_own_counts",
-        Some(3),
+        // SHRUNK: two preemptions where the other models take three (700
+        // thousand interleavings, 78 s; now about 100 thousand). The
+        // scenario is unchanged: three threads pin in one slot at once, two
+        // at the same sequence, and the witness (a join that raced a claim)
+        // is still reached.
+        Some(2),
         16,
         1,
         |witness| {

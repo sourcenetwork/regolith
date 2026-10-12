@@ -87,8 +87,11 @@ enum Touch {
     /// It set its bit without the waker: the future is registering, its
     /// waker was already taken, or a take is under way.
     Marked,
-    /// It did nothing: the node left the waiting phase, or a nudge is
-    /// already pending.
+    /// It did nothing, because the node still waits and already carries
+    /// the bit: an earlier nudge is on its way and the future has not
+    /// looked yet.
+    Pending,
+    /// It did nothing: the node left the waiting phase.
     Skipped,
 }
 
@@ -175,12 +178,16 @@ impl Waiter {
     }
 
     /// Sets `bit` on a waiting node, claiming its waker if it can. `once`
-    /// skips a node that already carries `bit`.
+    /// leaves a node that already carries `bit` alone and reports it as
+    /// [`Touch::Pending`].
     fn touch(&self, bit: usize, once: bool) -> Touch {
         let mut state = self.state.load(Ordering::Acquire);
         loop {
-            if state & PHASE != WAITING || (once && state & bit != 0) {
+            if state & PHASE != WAITING {
                 return Touch::Skipped;
+            }
+            if once && state & bit != 0 {
+                return Touch::Pending;
             }
             let take = claimable(state);
             let next = if take {
@@ -537,7 +544,12 @@ impl<'a> WakeList<'a> {
     }
 
     /// Nudges `node`, which stays on its waiting list: it is woken to try
-    /// again. Returns whether a nudge is now on its way to it.
+    /// again. Returns whether a nudge is on its way to it, this one or an
+    /// earlier one its future has not looked at yet. An earlier one counts:
+    /// a caller that took it for "no nudge" would lower the marker of a
+    /// nudge that is still out, and every release would then ask for a pass
+    /// until that waiter polls, which a waiter that holds the drain role
+    /// itself cannot do while those passes keep coming.
     pub(super) fn nudge(&mut self, node: NonNull<Waiter>) -> bool {
         // SAFETY: the caller's list holds the queue's reference.
         match unsafe { node.as_ref() }.touch(NUDGED, true) {
@@ -545,7 +557,7 @@ impl<'a> WakeList<'a> {
                 self.push(node);
                 true
             }
-            Touch::Marked => true,
+            Touch::Marked | Touch::Pending => true,
             Touch::Skipped => false,
         }
     }

@@ -67,7 +67,7 @@ pub use queue::IoQueue;
 pub use ticket::{CommitTicket, JobTicket};
 #[cfg(not(target_arch = "wasm32"))]
 pub use wait::through_stalls;
-pub use wait::{IoUnit, IoWait, StallWait, WouldBlock};
+pub use wait::{IoUnit, IoWait, LockWait, StallWait, WouldBlock};
 
 use std::num::NonZeroU64;
 

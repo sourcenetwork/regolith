@@ -93,8 +93,8 @@ fn db_options(spec: &ChildSpec) -> Options {
 
 fn apply(db: &Db, op: &WriteOp) {
     match &op.value {
-        OpValue::Put(v) => db.put(&op.key, v).expect("child: put"),
-        OpValue::Delete => db.delete(&op.key).expect("child: delete"),
+        OpValue::Put(v) => regolith::through_stalls(|| db.put(&op.key, v)).expect("child: put"),
+        OpValue::Delete => regolith::through_stalls(|| db.delete(&op.key)).expect("child: delete"),
     }
 }
 

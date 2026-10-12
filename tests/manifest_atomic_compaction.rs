@@ -190,7 +190,7 @@ fn capture_compaction(style: CompactionStyle, expected: &[(Vec<u8>, Vec<u8>)]) -
         let db = Db::open(DB_PATH, options(env.clone(), style)).unwrap();
         for entries in expected.chunks(KEYS_PER_FILE) {
             for (key, value) in entries {
-                db.put(key, value).unwrap();
+                regolith::through_stalls(|| db.put(key, value)).unwrap();
             }
             db.flush().unwrap();
         }
@@ -306,7 +306,7 @@ fn check_recovery(
     );
 
     // Recovery must trim the incomplete batch before later metadata appends.
-    db.put(b"after-recovery", b"survives").unwrap();
+    regolith::through_stalls(|| db.put(b"after-recovery", b"survives")).unwrap();
     db.flush().unwrap();
     db.close().unwrap();
     drop(db);

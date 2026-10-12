@@ -74,18 +74,18 @@ fn build(partitioned: bool) -> Fixture {
     for i in 0..400usize {
         let k = format!("k{i:05}").into_bytes();
         let v = format!("v{i:05}_{}", "p".repeat(i % 23)).into_bytes();
-        db.put(&k, &v).expect("put");
+        regolith::through_stalls(|| db.put(&k, &v)).expect("put");
         truth.insert(k, v);
     }
     // A range delete, so the table carries a range-tombstone block.
-    db.delete_range(b"k00100", b"k00140").expect("delete_range");
+    regolith::through_stalls(|| db.delete_range(b"k00100", b"k00140")).expect("delete_range");
     truth.retain(|k, _| {
         !(k.as_slice() >= b"k00100".as_slice() && k.as_slice() < b"k00140".as_slice())
     });
     for i in 400..430usize {
         let k = format!("k{i:05}").into_bytes();
         let v = format!("v{i:05}").into_bytes();
-        db.put(&k, &v).expect("put");
+        regolith::through_stalls(|| db.put(&k, &v)).expect("put");
         truth.insert(k, v);
     }
     db.compact_range(None, None).wait().expect("compact_range");

@@ -267,8 +267,10 @@ fn every_acknowledged_durable_write_survives_a_reopen() {
                     ..WriteOptions::default()
                 };
                 for i in 0..per_writer {
-                    db.put_opt(&wo, format!("d{w:02}_{i:05}").as_bytes(), b"durable")
-                        .unwrap();
+                    regolith::through_stalls(|| {
+                        db.put_opt(&wo, format!("d{w:02}_{i:05}").as_bytes(), b"durable")
+                    })
+                    .unwrap();
                 }
             }));
         }
