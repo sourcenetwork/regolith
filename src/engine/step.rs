@@ -204,6 +204,12 @@ impl Step {
         }
     }
 
+    /// Whether this thread keeps a [`Hold`]: a section it hands over then
+    /// runs before the call returns, and waits for nobody (ST6).
+    pub(crate) fn held_here(&self) -> bool {
+        self.holder.load(Ordering::Acquire) == thread_token()
+    }
+
     /// Test-only: whether a section is waiting on the list.
     #[cfg(test)]
     pub(crate) fn has_waiting(&self) -> bool {

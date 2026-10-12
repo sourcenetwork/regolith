@@ -115,18 +115,23 @@
 //! a value unique to the writer, such as its own id: the later committer's
 //! bytes then differ from the committed ones and it conflicts.
 //!
-//! # Out of scope (follow-ups)
+//! # Limits
 //!
-//! - Phantom detection. A transactional scan records the stretches of keys
-//!   it walked, but only to anchor keys the commit validates anyway: a key
-//!   another transaction inserts into a scanned range after the snapshot (a
-//!   phantom) is detected only when this transaction also writes it or
-//!   validates it as a point read at its level.
-//! - Transactional range deletes. [`Transaction::delete_range`] rejects
-//!   non-empty ranges until range conflict tracking or range locks land.
-//! - Wait-for graph deadlock detection (the pessimistic flavor ships
-//!   with timeout-based detection only).
-//! - Column-family-aware transactions (depends on CFs landing).
+//! - A plain scan does not detect phantoms. It records the stretches of keys
+//!   it walked only to anchor keys the commit validates anyway, so a key
+//!   another transaction inserts into the range after the snapshot is
+//!   detected only when this transaction also writes it or validates it as a
+//!   point read at its level. A scan whose result decides something is a
+//!   [`Transaction::cursor`] with [`ScanCheck::Range`]: any write inside the
+//!   range it covered since the snapshot is a conflict, at every level.
+//! - [`Transaction::delete_range`] refuses a non-empty range: a range delete
+//!   takes no part in conflict detection or in key locking.
+//! - A deadlock between pessimistic transactions is found by the lock
+//!   timeout ([`TransactionError::Busy`]) and not sooner: no wait-for graph
+//!   is kept.
+//! - A transaction reads and writes the default column family only. The
+//!   other families are reached through [`Db`]'s `*_cf` methods, outside any
+//!   transaction.
 
 use crate::portability::{AtomicBool, AtomicU64, Ordering};
 use kovan_queue::seg_queue::SegQueue;
@@ -613,24 +618,102 @@ pub enum ScanDirection {
 /// did not exist to be yielded, inserted into the range by a concurrent
 /// transaction - aborts the transaction only if it also writes that key or
 /// point-reads it. A transaction whose correctness depends on the absence
-/// of keys in a range must not rely on this level for it.
+/// of keys in a range must not rely on this level for it: it scans the
+/// range through [`Transaction::cursor`] with [`ScanCheck::Range`], which
+/// validates the range itself, at this level and every other.
 /// [`Transaction::delete_range`] stays rejected.
 ///
 /// # What a scan costs at Serializable
 ///
 /// A transactional scan at [`IsolationLevel::Serializable`] adds one
 /// read-set entry per key it yields, held until the transaction resolves,
-/// and the commit checks each of them while holding the write pipeline
-/// that every writer of the database, [`crate::Db::put`] included, waits
-/// on: the commit cost is one check per scanned key, and a large scan
-/// stalls every writer for that long. Below this level a scan records one
-/// entry per stretch of keys it walked, not one per key.
+/// and the commit checks them in two passes. The first runs on the
+/// committing thread before the commit enters the pipeline, against
+/// everything committed by then, and holds up nobody. The second runs when
+/// the commit's turn in the pipeline comes, for what was committed in
+/// between: one lookup of each key's newest version, in the memtables alone
+/// unless a flush or an ingest landed since the first pass. The commits and
+/// plain writes behind it in the pipeline, [`crate::Db::put`] included, are
+/// decided only after that second pass, so a large scan delays every writer
+/// by one lookup per scanned key. Below this level a scan records one entry
+/// per stretch of keys it walked, not one per key.
+///
+/// # A write-free reader needs writers that validate their reads
+///
+/// At [`IsolationLevel::DefraLevel`] an optimistic transaction that writes
+/// nothing validates none of its plain reads: it read one snapshot, so what
+/// it saw is a state the database was in. That state lies on a serial order
+/// of the committed transactions only when every transaction that writes
+/// to the database validates the reads its writes depend on: its point
+/// reads at `RepeatableRead`, `Serializable` and `DefraLevel`, and a scan
+/// it decides on through [`ScanCheck::Range`]. A writer at
+/// [`IsolationLevel::SnapshotIsolation`], the default, or at
+/// `ReadCommitted`, commits on reads nobody checked, and a reader can then
+/// see a state no serial order passes through, whatever level the reader
+/// runs at. Give the writers a validating level when a write-free reader's
+/// result must be one a serial order could have produced.
+///
+/// Two balances, and a rule that a withdrawal which leaves their total
+/// below zero costs one more:
+///
+/// ```
+/// use regolith::{IsolationLevel, OptimisticTransactionDb, Options, TxnOptions};
+///
+/// fn balance(bytes: Option<Vec<u8>>) -> i64 {
+///     bytes.map_or(0, |bytes| i64::from_be_bytes(bytes.try_into().expect("eight bytes")))
+/// }
+///
+/// // What a report that writes nothing saw, and the `x` the database ends
+/// // with, when the two writers run at `writers`.
+/// let run = |writers: IsolationLevel| -> Result<((i64, i64), i64), Box<dyn std::error::Error>> {
+///     let db = OptimisticTransactionDb::open("balances", Options::memory())?;
+///     let writer = TxnOptions::new().isolation(writers);
+///
+///     // The withdrawal reads both balances: a total of 0.
+///     let withdrawal = db.begin(&writer);
+///     let (x, y) = (balance(withdrawal.get(b"x")?), balance(withdrawal.get(b"y")?));
+///
+///     // A deposit of 20 into `y` commits.
+///     let deposit = db.begin(&writer);
+///     let before = balance(deposit.get(b"y")?);
+///     deposit.put(b"y", &(before + 20).to_be_bytes())?;
+///     deposit.commit()?;
+///
+///     // The report reads both balances and writes nothing.
+///     let report = db.begin(&TxnOptions::new().isolation(IsolationLevel::DefraLevel));
+///     let seen = (balance(report.get(b"x")?), balance(report.get(b"y")?));
+///     report.commit()?;
+///
+///     // The withdrawal takes 10 from `x`, and 1 more for the total it read.
+///     let penalty = i64::from(x + y - 10 < 0);
+///     withdrawal.put(b"x", &(x - 10 - penalty).to_be_bytes())?;
+///     // It may lose its commit; either way, look at what is left.
+///     let _ = withdrawal.commit();
+///     Ok((seen, balance(db.db().get(b"x")?)))
+/// };
+///
+/// // Snapshot isolation lets the withdrawal commit on the total it read.
+/// // The report saw the deposit and no withdrawal, so the withdrawal comes
+/// // after both, yet it was charged as if no deposit had been made: no
+/// // order of the three produces what the report read.
+/// assert_eq!(run(IsolationLevel::SnapshotIsolation)?, ((0, 20), -11));
+///
+/// // A writer that validates its reads loses instead, because the `y` it
+/// // read changed. The report read the state after the deposit alone.
+/// assert_eq!(run(IsolationLevel::RepeatableRead)?, ((0, 20), 0));
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum IsolationLevel {
     /// Validate nothing beyond what the transaction wrote.
     ReadCommitted,
     /// Validate writes and keys read through
     /// [`Transaction::get_for_update`]. regolith's default.
+    ///
+    /// A transaction that writes at this level commits on plain reads nobody
+    /// validated. That weakens every reader beside it, a write-free reader
+    /// at [`IsolationLevel::DefraLevel`] included: see "A write-free reader
+    /// needs writers that validate their reads" on this type.
     #[default]
     SnapshotIsolation,
     /// Validate every key a point read returned; record a scan per
@@ -685,13 +768,17 @@ pub enum IsolationLevel {
     ///   value its decision used; it is refused only by a newer write that
     ///   changes one of them (see [`crate::MergeOperator::touches`]).
     /// - Write-free transactions. A transaction that writes nothing
-    ///   validates no plain read and never conflicts: it read one snapshot,
-    ///   and nothing it did can have moved. It checks only the reads it
-    ///   made through [`Transaction::get_for_update`], against the newest
-    ///   published state, and takes no part in the commit pipeline, so it
-    ///   commits while a writer holds the pipeline. A pessimistic transaction
-    ///   at this level is not write-free, since its `get_for_update` reads
-    ///   can see two points in time.
+    ///   validates no plain read: it read one snapshot, and nothing it did
+    ///   can have moved. It checks only the reads it made through
+    ///   [`Transaction::get_for_update`], against the newest published
+    ///   state, and takes no part in the commit pipeline, so its commit
+    ///   waits for no writer. What it read lies on a serial order of the
+    ///   commits only while every writer on the database validates its own
+    ///   reads: a writer at `SnapshotIsolation` or `ReadCommitted` beside it
+    ///   breaks that (see "A write-free reader needs writers that validate
+    ///   their reads" on this type). A pessimistic transaction at this level
+    ///   is not write-free, since its `get_for_update` reads can see two
+    ///   points in time.
     ///
     /// A scan checked with [`ScanCheck::Range`] is stricter than any of
     /// these: any write inside the range it covered since the snapshot
@@ -762,6 +849,33 @@ enum TxMode {
 /// discarded and any held locks are released. Its `on_abort`
 /// callbacks see [`AbortReason::Dropped`] rather than
 /// [`AbortReason::Rollback`].
+///
+/// # Example
+///
+/// ```
+/// use regolith::{OptimisticTransactionDb, Options, TxnOptions};
+///
+/// let db = OptimisticTransactionDb::open("accounts", Options::memory())?;
+/// db.db().put(b"balance", b"100")?;
+///
+/// // A transaction reads its snapshot, with its own writes on top.
+/// let txn = db.begin(&TxnOptions::new());
+/// assert_eq!(txn.get(b"balance")?.as_deref(), Some(&b"100"[..]));
+/// txn.put(b"balance", b"90")?;
+/// assert_eq!(txn.get(b"balance")?.as_deref(), Some(&b"90"[..]));
+///
+/// // Nobody else sees a write before the commit, and everybody after.
+/// assert_eq!(db.db().get(b"balance")?.as_deref(), Some(&b"100"[..]));
+/// txn.commit()?;
+/// assert_eq!(db.db().get(b"balance")?.as_deref(), Some(&b"90"[..]));
+///
+/// // Dropping a transaction rolls it back.
+/// let abandoned = db.begin(&TxnOptions::new());
+/// abandoned.put(b"balance", b"0")?;
+/// drop(abandoned);
+/// assert_eq!(db.db().get(b"balance")?.as_deref(), Some(&b"90"[..]));
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
 pub struct Transaction {
     engine: Arc<RegolithEngine>,
     /// What the commit-time validation covers. See [`IsolationLevel`].
@@ -1017,6 +1131,31 @@ impl Transaction {
     /// never written is not validated: use
     /// [`Transaction::get_for_update`] when a read must participate
     /// in conflict detection on its own.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use regolith::{Access, OptimisticTransactionDb, Options, TransactionError, TxnOptions};
+    ///
+    /// let db = OptimisticTransactionDb::open("counter", Options::memory())?;
+    /// db.db().put(b"n", b"5")?;
+    ///
+    /// let txn = db.begin(&TxnOptions::new());
+    /// assert_eq!(txn.get(b"n")?.as_deref(), Some(&b"5"[..]));
+    ///
+    /// // Another writer commits. The snapshot does not move.
+    /// db.db().put(b"n", b"6")?;
+    /// assert_eq!(txn.get(b"n")?.as_deref(), Some(&b"5"[..]));
+    ///
+    /// // Writing a key after reading it is a read-modify-write: the commit is
+    /// // refused, not applied over the update the read did not see.
+    /// txn.put(b"n", b"6")?;
+    /// let Err(TransactionError::Conflict(lost)) = txn.commit() else {
+    ///     panic!("the key changed after it was read");
+    /// };
+    /// assert_eq!(lost.mine(), Access::Read);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     pub fn get(&self, key: &[u8]) -> TxResult<Option<Vec<u8>>> {
         let _scope = self.read_scope();
         let prefixed = prefix_key(DEFAULT_CF_ID, key);
@@ -1035,6 +1174,25 @@ impl Transaction {
     /// holds. A value the transaction wrote itself, or that its merge
     /// operands build, is copied out of the write buffer first, since the
     /// buffer cannot lend it.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use regolith::{OptimisticTransactionDb, Options, TxnOptions};
+    ///
+    /// let db = OptimisticTransactionDb::open("rows", Options::memory())?;
+    /// db.db().put(b"row", b"a long value")?;
+    ///
+    /// let txn = db.begin(&TxnOptions::new());
+    /// let value = txn.get_slice(b"row")?.expect("the row exists");
+    /// txn.rollback();
+    ///
+    /// // The slice keeps the bytes alive on its own, past the transaction
+    /// // and past a later write of the key.
+    /// db.db().put(b"row", b"replaced")?;
+    /// assert_eq!(&value[..6], b"a long");
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     pub fn get_slice(&self, key: &[u8]) -> TxResult<Option<DbSlice>> {
         let _scope = self.read_scope();
         let prefixed = prefix_key(DEFAULT_CF_ID, key);
@@ -1115,8 +1273,9 @@ impl Transaction {
     /// (and the transaction's own writes inside the range), not with the size
     /// of the range. At `Serializable` it also records every yielded key as a
     /// read, exactly as [`Transaction::get`] does: that grows by one entry per
-    /// distinct key yielded, and the commit checks each one while holding the
-    /// write pipeline, so every writer waits one check per scanned key.
+    /// distinct key yielded, and the commit checks each one, the second time
+    /// while the writes behind it in the pipeline wait to be decided (see
+    /// "What a scan costs at Serializable" on [`IsolationLevel`]).
     ///
     /// At every level, a key inside a stretch the scan walked that the
     /// transaction then writes is validated as a read from the begin
@@ -1144,7 +1303,8 @@ impl Transaction {
     /// direction.
     ///
     /// This is [`Transaction::cursor`] with [`ScanCheck::Stretch`], one entry
-    /// at a time.
+    /// at a time. A scan whose result decides something takes a cursor with
+    /// [`ScanCheck::Range`], which validates the range.
     pub fn scan_stream(&self, start: Option<&[u8]>, end: Option<&[u8]>) -> TxnScanStream<'_> {
         self.scan_stream_in(start, end, ScanDirection::Forward)
     }
@@ -1199,6 +1359,37 @@ impl Transaction {
     /// transaction holds fails with `Busy` at once. A database closed while
     /// the call waits ends it with [`Error::Closed`].
     /// [`Transaction::try_get_for_update`] is the form that never waits.
+    ///
+    /// # Example
+    ///
+    /// Two optimistic transactions try to take one seat:
+    ///
+    /// ```
+    /// use regolith::{Access, OptimisticTransactionDb, Options, TransactionError, TxnOptions};
+    ///
+    /// let db = OptimisticTransactionDb::open("seats", Options::memory())?;
+    ///
+    /// // Each finds the seat free and marks it. The read is the claim.
+    /// let (one, two) = (db.begin(&TxnOptions::new()), db.begin(&TxnOptions::new()));
+    /// for txn in [&one, &two] {
+    ///     assert_eq!(txn.get_for_update(b"seat/12")?, None);
+    ///     txn.put(b"seat/12", b"taken")?;
+    /// }
+    /// one.commit()?;
+    /// let Err(TransactionError::Conflict(lost)) = two.commit() else {
+    ///     panic!("the seat has one taker");
+    /// };
+    /// assert_eq!(lost.mine(), Access::ReadForUpdate);
+    ///
+    /// // Without the read, the same puts both commit: writing the bytes a
+    /// // key already holds claims nothing.
+    /// let (one, two) = (db.begin(&TxnOptions::new()), db.begin(&TxnOptions::new()));
+    /// one.put(b"seat/13", b"taken")?;
+    /// two.put(b"seat/13", b"taken")?;
+    /// one.commit()?;
+    /// two.commit()?;
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     pub fn get_for_update(&self, key: &[u8]) -> TxResult<Option<Vec<u8>>> {
         let _scope = self.read_scope();
         let prefixed = prefix_key(DEFAULT_CF_ID, key);
@@ -1265,6 +1456,35 @@ impl Transaction {
     /// bytes at commit, the write does not conflict. Read the key with
     /// [`Transaction::get_for_update`] first, or write a value unique to
     /// the writer, to make a claim (see the module documentation).
+    ///
+    /// # Example
+    ///
+    /// Two optimistic transactions put different values under one key: the
+    /// first to commit wins.
+    ///
+    /// ```
+    /// use regolith::{
+    ///     Access, OptimisticTransactionDb, Options, TransactionError, TxnOptions, WriteKind,
+    /// };
+    ///
+    /// let db = OptimisticTransactionDb::open("owners", Options::memory())?;
+    /// let (one, two) = (db.begin(&TxnOptions::new()), db.begin(&TxnOptions::new()));
+    /// one.put(b"owner", b"one")?;
+    /// two.put(b"owner", b"two")?;
+    /// two.put(b"elsewhere", b"two")?;
+    ///
+    /// one.commit()?;
+    /// let Err(TransactionError::Conflict(lost)) = two.commit() else {
+    ///     panic!("one key, two different values");
+    /// };
+    /// assert_eq!(lost.key(), b"owner");
+    /// assert_eq!((lost.mine(), lost.theirs()), (Access::Put, WriteKind::Put));
+    ///
+    /// // The loser applied none of its writes.
+    /// assert_eq!(db.db().get(b"owner")?.as_deref(), Some(&b"one"[..]));
+    /// assert_eq!(db.db().get(b"elsewhere")?, None);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     pub fn put(&self, key: &[u8], value: &[u8]) -> TxResult<()> {
         self.refuse_log_key(key)?;
         let prefixed = prefix_key(DEFAULT_CF_ID, key);
@@ -1276,6 +1496,34 @@ impl Transaction {
 
     /// Buffer a delete. For pessimistic transactions, acquires an
     /// exclusive lock on the key if not already held.
+    ///
+    /// In an optimistic transaction, a delete of a key it did not read
+    /// conflicts with a newer commit to the key unless that commit left the
+    /// key absent: deleting what is already gone is not a conflict.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use regolith::{OptimisticTransactionDb, Options, TxnOptions};
+    ///
+    /// let db = OptimisticTransactionDb::open("rows", Options::memory())?;
+    /// db.db().put(b"row", b"1")?;
+    ///
+    /// // Two transactions delete the row without reading it.
+    /// let (one, two) = (db.begin(&TxnOptions::new()), db.begin(&TxnOptions::new()));
+    /// one.delete(b"row")?;
+    /// two.delete(b"row")?;
+    ///
+    /// // A transaction reads its own delete; nobody else does yet.
+    /// assert_eq!(one.get(b"row")?, None);
+    /// assert!(db.db().get(b"row")?.is_some());
+    ///
+    /// // Both commit: the second leaves the key as the first left it.
+    /// one.commit()?;
+    /// two.commit()?;
+    /// assert_eq!(db.db().get(b"row")?, None);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     pub fn delete(&self, key: &[u8]) -> TxResult<()> {
         self.refuse_log_key(key)?;
         let prefixed = prefix_key(DEFAULT_CF_ID, key);
@@ -1329,6 +1577,64 @@ impl Transaction {
     /// the operand applies to the transaction's own put or delete of the key
     /// when it made one earlier, and a put or a delete made after the operand
     /// replaces the key outright, so the operand has no effect.
+    ///
+    /// # Example
+    ///
+    /// A counter two transactions add to at once. `SumCounter` is the
+    /// operator of the [`crate::MergeOperator`] example: it adds big-endian
+    /// `u64` operands.
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    ///
+    /// use regolith::{
+    ///     Error, IsolationLevel, OptimisticTransactionDb, Options, TransactionError, TxnOptions,
+    /// };
+    /// # use regolith::MergeOperator;
+    /// # struct SumCounter;
+    /// # fn number(bytes: &[u8]) -> Option<u64> {
+    /// #     Some(u64::from_be_bytes(bytes.try_into().ok()?))
+    /// # }
+    /// # impl MergeOperator for SumCounter {
+    /// #     fn name(&self) -> &'static str {
+    /// #         "sum-counter"
+    /// #     }
+    /// #     fn full_merge(&self, _key: &[u8], base: Option<&[u8]>, operands: &[&[u8]]) -> Option<Vec<u8>> {
+    /// #         let mut total = base.map_or(Some(0), number)?;
+    /// #         for operand in operands {
+    /// #             total = total.wrapping_add(number(operand)?);
+    /// #         }
+    /// #         Some(total.to_be_bytes().to_vec())
+    /// #     }
+    /// # }
+    ///
+    /// let options = Options::memory().merge_operator(Some(Arc::new(SumCounter)));
+    /// let db = OptimisticTransactionDb::open("counters", options)?;
+    /// let one = 1u64.to_be_bytes();
+    ///
+    /// // At DefraLevel a merge into a key the transaction did not read is
+    /// // blind: both commit, and both operands apply.
+    /// let blind = TxnOptions::new().isolation(IsolationLevel::DefraLevel);
+    /// let (a, b) = (db.begin(&blind), db.begin(&blind));
+    /// a.merge(b"hits", &one)?;
+    /// b.merge(b"hits", &one)?;
+    /// a.commit()?;
+    /// b.commit()?;
+    /// assert_eq!(db.db().get(b"hits")?, Some(2u64.to_be_bytes().to_vec()));
+    ///
+    /// // At the default level the same race has one winner.
+    /// let (a, b) = (db.begin(&TxnOptions::new()), db.begin(&TxnOptions::new()));
+    /// a.merge(b"hits", &one)?;
+    /// b.merge(b"hits", &one)?;
+    /// a.commit()?;
+    /// assert!(matches!(b.commit(), Err(TransactionError::Conflict(_))));
+    ///
+    /// // A database with no operator refuses the merge when it is made.
+    /// let plain = OptimisticTransactionDb::open("plain", Options::memory())?;
+    /// let refused = plain.begin(&TxnOptions::new()).merge(b"hits", &one);
+    /// assert!(matches!(refused, Err(TransactionError::Engine(Error::NoMergeOperator))));
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     pub fn merge(&self, key: &[u8], operand: &[u8]) -> TxResult<()> {
         self.refuse_log_key(key)?;
         self.engine.require_merge_operator()?;
@@ -1347,6 +1653,36 @@ impl Transaction {
     /// O(1): the savepoint is the number of entries the write buffer holds,
     /// and nothing is copied. Savepoints nest; each rollback or release takes
     /// the most recently set one that is still open.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use regolith::{OptimisticTransactionDb, Options, TransactionError, TxnOptions};
+    ///
+    /// let db = OptimisticTransactionDb::open("rows", Options::memory())?;
+    /// let mut txn = db.begin(&TxnOptions::new());
+    /// txn.put(b"a", b"kept")?;
+    ///
+    /// // Rolling back takes the writes made since the savepoint, no others.
+    /// txn.set_savepoint();
+    /// txn.put(b"a", b"undone")?;
+    /// txn.put(b"b", b"undone")?;
+    /// txn.rollback_to_savepoint()?;
+    /// assert_eq!(txn.get(b"a")?.as_deref(), Some(&b"kept"[..]));
+    /// assert_eq!(txn.get(b"b")?, None);
+    ///
+    /// // Releasing forgets the savepoint and keeps the writes.
+    /// txn.set_savepoint();
+    /// txn.put(b"c", b"kept")?;
+    /// txn.release_savepoint()?;
+    /// assert!(matches!(txn.rollback_to_savepoint(), Err(TransactionError::NoSavepoint)));
+    ///
+    /// txn.commit()?;
+    /// assert_eq!(db.db().get(b"a")?.as_deref(), Some(&b"kept"[..]));
+    /// assert_eq!(db.db().get(b"b")?, None);
+    /// assert_eq!(db.db().get(b"c")?.as_deref(), Some(&b"kept"[..]));
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     pub fn set_savepoint(&mut self) {
         // `&mut self` is what makes this coherent: a savepoint over a
         // buffer another thread is still writing would capture a torn
@@ -1414,7 +1750,7 @@ impl Transaction {
     /// and value sizes are validated first, along with the size of the
     /// record the commit will log (at most 1 GiB), so an oversized commit
     /// is rejected first, then the write-stall admission runs, before the
-    /// conflict check and before any commit lock is taken. A commit never
+    /// conflict check and before the commit enters the pipeline. A commit never
     /// waits on a stall. Under a stop trigger it applies nothing and
     /// returns [`TransactionError::WouldBlock`] with a
     /// [`crate::WouldBlock::Stall`] wait, and the transaction ends with its
@@ -1435,7 +1771,11 @@ impl Transaction {
     /// of it. An optimistic transaction at
     /// [`IsolationLevel::DefraLevel`] that writes nothing is the exception: it
     /// takes no part in the pipeline and validates only its
-    /// [`Transaction::get_for_update`] reads.
+    /// [`Transaction::get_for_update`] reads. Its plain reads are one
+    /// snapshot, which lies on a serial order of the commits only while every
+    /// writer on the database validates its own reads: a writer at
+    /// [`IsolationLevel::SnapshotIsolation`], the default, breaks that (see
+    /// [`IsolationLevel`]).
     ///
     /// Concurrent commits go through one pipeline with each other and with
     /// plain writes, with no lock: each is decided in the order it entered,
@@ -1466,6 +1806,41 @@ impl Transaction {
     /// callbacks run on this thread if it committed, and its `on_abort`
     /// callbacks if it did not, and then the database's hook for the same
     /// outcome.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use regolith::{OptimisticTransactionDb, Options, TransactionError, TxnOptions};
+    ///
+    /// let db = OptimisticTransactionDb::open("rows", Options::memory())?;
+    /// let write = |key: &[u8]| {
+    ///     let txn = db.begin(&TxnOptions::new());
+    ///     txn.put(key, b"1")?;
+    ///     txn.commit()
+    /// };
+    ///
+    /// // Receipts order commits: a later commit has a higher sequence.
+    /// let (first, second) = (write(b"a")?, write(b"b")?);
+    /// assert!(first.seq() < second.seq());
+    ///
+    /// // A commit with no writes reports the sequence of its snapshot.
+    /// let reader = db.begin(&TxnOptions::new());
+    /// reader.get(b"a")?;
+    /// assert_eq!(reader.commit()?.seq(), second.seq());
+    ///
+    /// // A lost race is an error value. It names the key and the reason,
+    /// // and its message never prints the key's bytes.
+    /// let late = db.begin(&TxnOptions::new());
+    /// late.put(b"user/zoe", b"2")?;
+    /// db.db().put(b"user/zoe", b"3")?;
+    /// let Err(TransactionError::Conflict(lost)) = late.commit() else {
+    ///     panic!("another write of the key committed first");
+    /// };
+    /// assert_eq!(lost.key(), b"user/zoe");
+    /// assert!(lost.observed_seq() < lost.latest_seq());
+    /// assert!(!lost.to_string().contains("zoe"));
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     pub fn commit(mut self) -> TxResult<CommitReceipt> {
         // `close` may have aborted the transaction since it began: the commit
         // is then refused, and `close` ran the abort callbacks.
@@ -1772,7 +2147,7 @@ impl Transaction {
     ///
     /// The pessimistic horizon is sampled with the lock held: a
     /// committing writer's commit is visible before its lock is released
-    /// (at once for `commit`, when its group lands for `commit_nowait`), and
+    /// (at once for `commit`, when the commit lands for `commit_nowait`), and
     /// the lock's state word is the release/acquire edge between them, so
     /// nothing newer can hide behind it.
     /// Under a lock this transaction already holds nothing can have
@@ -1942,6 +2317,9 @@ fn receipt_of(
             conflict.strip_cf_prefix();
             if let Some(s) = stats {
                 s.add(crate::Ticker::CommitConflicts, 1);
+                if conflict.theirs().is_deletion() {
+                    s.add(crate::Ticker::CommitConflictsAfterDelete, 1);
+                }
             }
             Err(TransactionError::Conflict(conflict))
         }

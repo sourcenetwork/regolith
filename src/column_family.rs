@@ -66,10 +66,10 @@
 //!
 //! ## Creating and dropping against concurrent writes
 //!
-//! A create or a drop commits as a write group of its own, and the
-//! registry changes inside that same ordered step, right after the
-//! group is durable and applied. Every write checks the families it
-//! touches in the ordered step too, before it takes a sequence. So a
+//! A create or a drop commits as an ordered unit of its own, and the
+//! registry changes inside that same unit, right after its commit is
+//! durable and applied. Every write checks the families it touches when it
+//! is decided, in ring order too, before it takes a sequence. So a
 //! write racing a drop either takes a sequence below the drop's range
 //! tombstone, which then deletes it, or is refused with
 //! [`crate::Error::InvalidColumnFamily`]: it never lands in a family
@@ -157,6 +157,24 @@ pub(crate) fn prefix_key(cf_id: u32, key: &[u8]) -> Vec<u8> {
     out.extend_from_slice(&cf_id.to_be_bytes());
     out.extend_from_slice(key);
     out
+}
+
+/// The key the caller wrote, from the engine's key for it: what
+/// [`prefix_key`] put the family id in front of. Every hook the caller
+/// implements is handed this, never the engine's key.
+///
+/// A key too short to carry an id is handed back whole. The database never
+/// stores one; the engine's own unit tests do.
+pub(crate) fn callers_key(prefixed: &[u8]) -> &[u8] {
+    prefixed.get(CF_PREFIX_LEN..).unwrap_or(prefixed)
+}
+
+/// The id of the column family the engine's key `prefixed` belongs to, when
+/// it carries one.
+pub(crate) fn family_of(prefixed: &[u8]) -> Option<u32> {
+    prefixed
+        .first_chunk::<CF_PREFIX_LEN>()
+        .map(|id| u32::from_be_bytes(*id))
 }
 
 /// Shortest byte string strictly greater than every key prefixed
@@ -250,8 +268,8 @@ const REGISTRY_BUCKETS: usize = 64;
 /// - **Births and deaths are ordered with the writes.** The engine publishes
 ///   and retires a family only inside its ordered commit step, right after
 ///   the write that persists the change, and every write checks the families
-///   it touches in that same step, when the group it is in runs
-///   (`RegolithEngine::create_family`, `drop_family`, `fence_group`). So a
+///   it touches in ring order too, when it is decided
+///   (`RegolithEngine::create_family`, `drop_family`, `cf_fence`). So a
 ///   write either commits before a drop,
 ///   and the drop's range tombstone deletes it, or is refused because the
 ///   family is gone; it never lands after the tombstone.

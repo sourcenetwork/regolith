@@ -6,13 +6,16 @@ use std::collections::{HashMap, VecDeque};
 use std::marker::PhantomData;
 use std::sync::Arc;
 use std::task::Waker;
+use std::time::Duration;
 
+use super::timers::Timers;
 use super::{IoBudget, IoProgress, QueueId};
 use crate::engine::block_cache::BlockCache;
 use crate::engine::io::IoRuntime;
 use crate::engine::io::job::{Delivery, Job};
 use crate::engine::io::shared::{Landing, Message, QueueShared, WaitSlot};
 use crate::engine::io::unit::{Outcome, Ran, Unit, UnitKey};
+use crate::env::Env;
 
 /// Queue ids are unique in the process, so a handle that names a queue of
 /// another database is caught instead of read through a stranger's queue.
@@ -20,8 +23,10 @@ static NEXT_QUEUE: AtomicU64 = AtomicU64::new(1);
 
 /// One thread's pending I/O: the blocks its `CacheOnly` handles missed, the
 /// fsyncs its [`commit_nowait`](crate::Transaction::commit_nowait) commits
-/// owe, the stalls its writes wait out, and the background work its calls
-/// left owing with no worker. Made by [`Db::io_queue`](crate::Db::io_queue).
+/// owe, the stalls its writes wait out, the background work its calls
+/// left owing with no worker, and the timed waits of its
+/// [`transact_async`](crate::OptimisticTransactionDb::transact_async)
+/// attempts. Made by [`Db::io_queue`](crate::Db::io_queue).
 ///
 /// The thread that holds the queue polls it, and only that thread: it is
 /// `Send`, so it can move to the thread that will own it, but not `Sync`, so
@@ -37,6 +42,12 @@ static NEXT_QUEUE: AtomicU64 = AtomicU64::new(1);
 /// [`StallWait`](crate::StallWait), a job's [`JobTicket`](crate::JobTicket).
 /// A thread with nothing to run registers [`idle_waker`](Self::idle_waker)
 /// and idles; the next completion pushed to it wakes it, once.
+///
+/// A timed wait is the one thing no other thread completes: it is over at
+/// the first poll that finds the database's clock at its due time. Each
+/// poll says how long until the earliest one
+/// ([`IoProgress::wake_in`](crate::IoProgress::wake_in)), and an owner that
+/// idles polls again by then. A queue that holds none reads no clock.
 ///
 /// The queue is its thread's for the I/O regolith starts itself on that
 /// thread's calls: made on a thread, or polled on one, it takes that
@@ -86,6 +97,11 @@ pub struct IoQueue {
     /// What landed for this queue, oldest first, with what each costs.
     landed: VecDeque<(UnitKey, usize)>,
     landed_bytes: usize,
+    /// The timed waits recorded on this queue and not yet due.
+    timers: Timers,
+    /// The database's environment, whose clock the timed waits are measured
+    /// on. Read only while a timed wait is pending.
+    env: Arc<dyn Env>,
     /// `Send` but not `Sync`: only the holder polls.
     _owner: PhantomData<Cell<()>>,
 }
@@ -122,8 +138,8 @@ fn job_address(job: &Arc<Job>) -> usize {
 
 impl IoQueue {
     /// A new queue on the database `cache` belongs to, owing at most `bound`
-    /// bytes of reads.
-    pub(crate) fn open(cache: Arc<BlockCache>, bound: usize) -> Self {
+    /// bytes of reads, with its timed waits measured on `env`'s clock.
+    pub(crate) fn open(cache: Arc<BlockCache>, bound: usize, env: Arc<dyn Env>) -> Self {
         let raw = NEXT_QUEUE.fetch_add(1, Ordering::Relaxed);
         // Starts at one and cannot wrap in a process's lifetime.
         let id = QueueId::new(std::num::NonZeroU64::new(raw).unwrap_or(std::num::NonZeroU64::MIN));
@@ -140,6 +156,8 @@ impl IoQueue {
             room: Vec::new(),
             landed: VecDeque::new(),
             landed_bytes: 0,
+            timers: Timers::default(),
+            env,
             _owner: PhantomData,
         }
     }
@@ -172,12 +190,48 @@ impl IoQueue {
     /// [`Options::max_open_files`](crate::Options::max_open_files), a read
     /// that must reopen its table and finds every descriptor in use by reads
     /// running on other threads is not run: it stays pending, and the poll
-    /// goes on (D60). The read that next frees a descriptor tells this queue,
+    /// goes on. The read that next frees a descriptor tells this queue,
     /// waking its owner if it idles, and the poll after that runs it again.
+    ///
+    /// A timed wait recorded here is completed by the first poll that finds
+    /// the database's clock at its due time, whatever the budget, and the
+    /// poll reports how long until the next one
+    /// ([`IoProgress::wake_in`](crate::IoProgress::wake_in)).
     ///
     /// Only the thread holding the queue calls this; it is the only place a
     /// wait recorded here is completed. A poll also makes this the calling
     /// thread's queue for the I/O regolith starts itself (see the type docs).
+    ///
+    /// # Example
+    ///
+    /// A read that must not touch the device, and the poll that does its I/O:
+    ///
+    /// ```
+    /// use regolith::{Db, Error, IoBudget, IoProgress, Options, ReadMode, WouldBlock};
+    ///
+    /// let db = Db::open("rows", Options::memory())?;
+    /// db.put(b"row", b"1")?;
+    /// // Flushed to a table whose blocks the cache has not read yet.
+    /// db.flush()?;
+    ///
+    /// let mut queue = db.io_queue();
+    /// let snapshot = db.snapshot().with_read_mode(ReadMode::CacheOnly(queue.id()));
+    ///
+    /// // The read returns at once, and the block it needs is owed to the queue.
+    /// let missed = snapshot.get(b"row");
+    /// assert!(matches!(missed, Err(Error::WouldBlock(WouldBlock::Io(_)))));
+    /// assert!(queue.pending_bytes() > 0);
+    ///
+    /// // The poll reads the block, on this thread.
+    /// let progress = queue.poll(IoBudget::ALL);
+    /// assert_eq!((progress.completed, progress.more_pending), (1, false));
+    ///
+    /// // The same read, run again, finds the block.
+    /// assert_eq!(snapshot.get(b"row")?.as_deref(), Some(&b"1"[..]));
+    /// // A queue that owes nothing has nothing to do.
+    /// assert_eq!(queue.poll(IoBudget::ALL), IoProgress::default());
+    /// # Ok::<(), regolith::Error>(())
+    /// ```
     pub fn poll(&mut self, budget: IoBudget) -> IoProgress {
         // The owner is running: a push from now on must not wake it.
         let _ = self.shared.wake_up();
@@ -230,10 +284,24 @@ impl IoQueue {
             self.take_inbox(&mut completed);
         }
         self.make_room();
+        let wake_in = self.fire_timers(&mut completed);
         IoProgress {
             completed,
             more_pending: self.owes(),
+            wake_in,
         }
+    }
+
+    /// Complete the timed waits that are due, counting them in `completed`,
+    /// and say how long until the next one is. Reads the clock only when a
+    /// timed wait is pending.
+    fn fire_timers(&mut self, completed: &mut usize) -> Option<Duration> {
+        if self.timers.is_empty() {
+            return None;
+        }
+        let now = self.env.now_micros();
+        *completed += self.timers.fire(now);
+        self.timers.wake_in(now)
     }
 
     /// Run `future` to completion on this thread, polling this queue whenever
@@ -244,7 +312,8 @@ impl IoQueue {
     /// ticket, or a [`transact_async`](crate::OptimisticTransactionDb::transact_async)
     /// attempt whose completions are delivered to this queue finishes here.
     /// A future that waits on something no thread will ever complete (a wait
-    /// recorded on another queue nobody polls) never returns.
+    /// recorded on another queue nobody polls) never returns. While a timed
+    /// wait is pending the thread idles no longer than until it is due.
     ///
     /// Not on `wasm32`, which has no thread to park: there the owner polls
     /// the queue from its own event loop when it has nothing else to run.
@@ -261,7 +330,8 @@ impl IoQueue {
             if let Poll::Ready(output) = future.as_mut().poll(&mut cx) {
                 return output;
             }
-            if self.poll(IoBudget::ALL).completed > 0 {
+            let progress = self.poll(IoBudget::ALL);
+            if progress.completed > 0 {
                 continue;
             }
             // Wakes at once when this queue already has work, so the park
@@ -272,9 +342,16 @@ impl IoQueue {
                 return output;
             }
             // Parked until another thread's completion: release what this
-            // thread's reads hold back first (`read_view::idle`).
+            // thread's reads hold back first (`read_view::idle`). A timed
+            // wait is completed by this thread's own poll and by nothing
+            // else, so with one pending the park ends when it is due; a wait
+            // recorded since the poll above woke the waker, so the park
+            // returns at once and the next poll reports it.
             crate::engine::read_view::idle();
-            std::thread::park();
+            match progress.wake_in {
+                Some(due_in) => std::thread::park_timeout(due_in),
+                None => std::thread::park(),
+            }
         }
     }
 
@@ -283,6 +360,7 @@ impl IoQueue {
         !self.waiting.is_empty()
             || !self.jobs.is_empty()
             || !self.room.is_empty()
+            || !self.timers.is_empty()
             || !self.shared.inbox_is_empty()
     }
 
@@ -291,15 +369,21 @@ impl IoQueue {
     /// never woken; it sees its completions at its next [`poll`](Self::poll),
     /// which also cancels the registration.
     ///
-    /// When something is already waiting to be taken in, or a read only this
-    /// thread can run is pending, `waker` is woken at once: the owner has work
-    /// and should poll rather than idle.
+    /// When something is already waiting to be taken in, a read only this
+    /// thread can run is pending, or a timed wait is due, `waker` is woken at
+    /// once: the owner has work and should poll rather than idle.
+    ///
+    /// A timed wait that is not due yet wakes nobody when it comes due: an
+    /// owner that idles with one pending polls again within
+    /// [`IoProgress::wake_in`](crate::IoProgress::wake_in) of its last poll.
     pub fn idle_waker(&self, waker: &Waker) {
         let runnable = self.order.iter().any(|pending| match pending {
             Pending::Read(unit) => unit.is_free() && self.waiting.contains_key(&address(unit)),
             Pending::Job(job) => job.is_runnable() && self.jobs.contains_key(&job_address(job)),
         });
-        if runnable {
+        let due = !self.timers.is_empty()
+            && self.timers.wake_in(self.env.now_micros()) == Some(Duration::ZERO);
+        if runnable || due {
             waker.wake_by_ref();
             return;
         }
@@ -332,6 +416,7 @@ impl IoQueue {
                     *completed += 1;
                 }
                 Message::SlotFreed => self.unpark(),
+                Message::Timer { due, slot } => self.timers.record(due, slot),
                 Message::Ready(job) => {
                     // Settled meanwhile (closed, or run by a blocking
                     // caller): its `JobDone` took it out of `jobs`.
@@ -478,7 +563,7 @@ impl Drop for IoQueue {
                         runtime.release(&unit);
                     }
                 }
-                Message::Room(slot) => slot.complete(),
+                Message::Room(slot) | Message::Timer { slot, .. } => slot.complete(),
                 // Its unit or job is in `waiting` or `jobs`, and is handled
                 // there; so is every unit this queue parked.
                 Message::Done(_) | Message::JobDone(_) | Message::Ready(_) | Message::SlotFreed => {
@@ -513,6 +598,7 @@ impl Drop for IoQueue {
         for slot in self.room.drain(..) {
             slot.complete();
         }
+        self.timers.complete_all();
         for (key, _) in self.landed.drain(..) {
             self.shared.forget(&key);
         }
@@ -540,6 +626,7 @@ impl std::fmt::Debug for IoQueue {
             .field("id", &self.id())
             .field("waiting", &self.waiting.len())
             .field("jobs", &self.jobs.len())
+            .field("timed_waits", &self.timers.len())
             .field("pending_bytes", &self.shared.pending())
             .finish_non_exhaustive()
     }

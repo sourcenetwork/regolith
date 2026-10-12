@@ -63,7 +63,6 @@ use super::super::internal_key::{
     VALUE_TYPE_DELETION, VALUE_TYPE_MERGE, VALUE_TYPE_VALUE, decode_internal_key,
 };
 use super::super::io::job::{Job, JobBody, Step};
-use super::super::io::scope;
 use super::super::take::Take;
 use super::super::wal::{check_write_len, encode_ops_record, ops_record_len, wal_filename};
 use super::super::wal_frame::KIND_GROUP;
@@ -71,7 +70,9 @@ use super::super::wal_log::Log;
 use super::super::{
     DurabilityMode, MemTable, RegolithEngine, apply_batch_op_to_memtable, batch_op_wal_bytes,
 };
-use super::descriptor::{After, Decision, Descriptor, FAILED, Verdict as Fate, Work, is_immediate};
+use super::descriptor::{
+    After, Decision, Descriptor, FAILED, INSTALLED, Verdict as Fate, Work, is_immediate,
+};
 use super::park::{Help, Needs};
 use super::pipeline::{Pipeline, Progress, Turn};
 use super::request::batch_op_memtable_cost;
@@ -110,7 +111,6 @@ impl JobBody for Unit {
 
     /// On a queue's poll: parks instead of waiting for another thread.
     fn step(self: Box<Self>, waker: &Waker) -> Step {
-        let _no_wait = scope::no_wait();
         if self.go(Help::Park(waker)) {
             Step::Done
         } else {
@@ -123,6 +123,28 @@ impl JobBody for Unit {
     fn release(self: Box<Self>) {
         self.go(Help::Wait);
     }
+}
+
+/// An ordered unit whose caller has not been given its result yet. See
+/// [`RegolithEngine::ordered_unit`].
+pub(crate) struct OrderedTicket<T> {
+    /// The unit: its job, and its body until a thread runs it.
+    desc: RingArc<Descriptor>,
+    /// What the body returned, put there by the thread that ran it.
+    result: Arc<Take<io::Result<T>>>,
+}
+
+impl<T> OrderedTicket<T> {
+    /// Whether the unit is in the ring: some thread will run its body,
+    /// whatever becomes of this ticket.
+    pub(crate) fn entered(&self) -> bool {
+        self.desc.is(INSTALLED)
+    }
+}
+
+/// A unit's body that ended without a result: it unwound.
+fn unfinished() -> io::Error {
+    io::Error::other("an ordered step of the commit pipeline did not finish")
 }
 
 /// The pipeline, held still, as a unit's body sees it. See the module docs.
@@ -349,30 +371,76 @@ impl RegolithEngine {
         needs: Needs,
         body: impl FnOnce(&RegolithEngine, &mut Ordered<'_>) -> io::Result<T> + Send + 'static,
     ) -> io::Result<T> {
-        let pipe = self.pipe()?;
+        let ticket = self.ordered_unit(needs, body);
+        // A call that waits always sees its unit through.
+        self.ordered_advance(&ticket, Help::Wait)
+            .unwrap_or_else(|| Err(unfinished()))
+    }
+
+    /// Make an ordered unit of `body` without entering the ring: the ticket
+    /// [`Self::ordered_advance`] sees through. For a caller that may not
+    /// wait at the unit's entry, a job a queue's poll runs, which keeps the
+    /// ticket while it is parked. [`Self::ordered_needing`] is the two in
+    /// one for a caller that waits.
+    pub(crate) fn ordered_unit<T: Send + 'static>(
+        &self,
+        needs: Needs,
+        body: impl FnOnce(&RegolithEngine, &mut Ordered<'_>) -> io::Result<T> + Send + 'static,
+    ) -> OrderedTicket<T> {
         let result: Arc<Take<io::Result<T>>> = Arc::new(Take::empty());
         let out = Arc::clone(&result);
         let desc = self.unit(
             needs,
             Box::new(move |engine, ord| out.put(body(engine, ord))),
         );
-        let index = self.enter(pipe, &desc);
-        loop {
-            if let Some(result) = result.take() {
-                return result;
+        OrderedTicket { desc, result }
+    }
+
+    /// See `ticket`'s unit through: enter the ring if it has not, bring
+    /// every slot before it to published, run it (or find it run by the
+    /// thread that reached it first), and return what its body returned.
+    /// `None` when the call did not get there: a queue's poll parked, with
+    /// its waker registered where the wait ends (`park.rs`), and calls this
+    /// again when it is woken. Until the unit is in the ring a parked call
+    /// has left nothing behind; once it is, whichever thread reaches its
+    /// slot runs it.
+    pub(crate) fn ordered_advance<T>(
+        &self,
+        ticket: &OrderedTicket<T>,
+        help: Help<'_>,
+    ) -> Option<io::Result<T>> {
+        let pipe = match self.pipe() {
+            Ok(pipe) => pipe,
+            Err(err) => return Some(Err(err)),
+        };
+        if !ticket.desc.is(INSTALLED) {
+            match help {
+                Help::Wait => {
+                    self.enter(pipe, &ticket.desc);
+                }
+                // A full ring, and the slot in the way of making room is
+                // another thread's: the reservation was given up.
+                Help::Leave | Help::Park(_) => {
+                    self.try_enter(pipe, &ticket.desc, help).ok()?;
+                }
             }
-            match self.help_decide(pipe, index, Help::Wait) {
-                Turn::Blocked(job) => self.run_or_wait(&job),
+        }
+        let index = ticket.desc.index();
+        loop {
+            if let Some(result) = ticket.result.take() {
+                return Some(result);
+            }
+            match self.help_decide(pipe, index, help) {
+                Turn::Blocked(job) => match help {
+                    Help::Wait => self.run_or_wait(&job),
+                    Help::Leave | Help::Park(_) => return None,
+                },
                 Turn::Done => {
                     // Every slot before the unit is published, and the unit
                     // takes nothing: the frontier passes it here, so the
                     // unit leaves nothing in the ring.
                     let _ = self.publish_upto(pipe, index);
-                    return result.take().unwrap_or_else(|| {
-                        Err(io::Error::other(
-                            "an ordered step of the commit pipeline did not finish",
-                        ))
-                    });
+                    return Some(ticket.result.take().unwrap_or_else(|| Err(unfinished())));
                 }
             }
         }
@@ -415,15 +483,6 @@ impl RegolithEngine {
         self.unkeep(kept);
         drop(held);
         true
-    }
-
-    /// Give back what a poll took for a unit's body. A stopped writer that
-    /// found the flush exclusion held looks again once it is released, as
-    /// after every flush (`StallSignal`, relief handed back).
-    fn unkeep(&self, kept: super::park::Kept<'_>) {
-        if kept.release() {
-            self.refresh_stall_level();
-        }
     }
 
     /// Bring every slot before `index` through to published, with the

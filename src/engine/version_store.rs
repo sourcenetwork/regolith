@@ -92,6 +92,11 @@ impl VersionStore {
         &self,
         section: impl FnOnce(&mut VersionGuard<'_>) -> T + Send,
     ) -> T {
+        if !self.step.held_here() {
+            // Another thread may hold the step, and this call then waits
+            // for its section to be run there.
+            scope::waits("the version store's step, handed a section without holding it");
+        }
         self.step.run(|| {
             // A section reads the device, whatever read mode the thread
             // that happens to run it is in.
@@ -115,9 +120,17 @@ impl VersionStore {
     /// out, so no two files of the database ever share one: a table a
     /// flush, a compaction or an ingest is about to write, or the next log.
     pub(crate) fn take_file_id(&self) -> io::Result<u64> {
+        self.take_file_ids(1)
+    }
+
+    /// Take `count` consecutive file ids in one section, and so with one
+    /// manifest record: the first of them is returned. For a caller that
+    /// knows how many files it is about to write and may not come back to
+    /// the step for each: an ingest staging its files.
+    pub(crate) fn take_file_ids(&self, count: u64) -> io::Result<u64> {
         self.run(|versions| {
             let id = versions.current().next_file_id;
-            versions.apply(&[VersionEdit::SetNextFileId(id + 1)])?;
+            versions.apply(&[VersionEdit::SetNextFileId(id + count)])?;
             Ok(id)
         })
     }

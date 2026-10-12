@@ -6,7 +6,8 @@
 //! caller then polls the `Statistics` object (via
 //! [`Statistics::get_ticker`], [`Statistics::get_histogram_snapshot`],
 //! or [`Statistics::to_string`]) to export the values to their
-//! monitoring stack of choice.
+//! monitoring stack of choice. A caller that kept only the database
+//! reads the same object back with [`crate::Db::statistics`].
 //!
 //! # Metric names
 //!
@@ -177,9 +178,17 @@ pub enum Ticker {
     /// block still uses it, uncached. A steady count means the cache is too
     /// small for the blocks readers hold at once.
     BlockCacheAddRefusedHeld = 36,
+    /// The subset of [`Ticker::CommitConflicts`] where the newer write
+    /// that decided the race was a delete or a range delete: a key the
+    /// transaction read or wrote was removed after its snapshot. It says
+    /// what the newer write was, where [`Ticker::CommitConflictsOnRead`]
+    /// and [`Ticker::CommitConflictsOnWrite`] say what the transaction
+    /// did with the key, so one conflict can count here and there. A
+    /// key deleted and then put again counts as a conflict with the put.
+    CommitConflictsAfterDelete = 37,
 }
 
-const NUM_TICKERS: usize = 37;
+const NUM_TICKERS: usize = 38;
 
 impl Ticker {
     /// Every defined ticker, in discriminant order. Adding a variant
@@ -222,6 +231,7 @@ impl Ticker {
         Ticker::ManifestTailDiscarded,
         Ticker::ManifestTailDiscardedBytes,
         Ticker::BlockCacheAddRefusedHeld,
+        Ticker::CommitConflictsAfterDelete,
     ];
 
     /// Stable string name for exporting to monitoring systems.
@@ -264,6 +274,7 @@ impl Ticker {
             Ticker::ManifestTailDiscarded => "regolith.manifest.tail_discarded",
             Ticker::ManifestTailDiscardedBytes => "regolith.manifest.tail_discarded_bytes",
             Ticker::BlockCacheAddRefusedHeld => "regolith.block_cache.add_refused_held",
+            Ticker::CommitConflictsAfterDelete => "regolith.commit.conflicts_after_delete",
         }
     }
 }

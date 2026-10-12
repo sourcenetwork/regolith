@@ -372,18 +372,23 @@ fn a_write_issued_during_an_ingest_lands_above_the_ingested_file() {
 /// own file, or the older value, still in the frozen list, answers the
 /// read.
 ///
-/// Deterministic: it runs on one thread. `Db::open` opens no SST, so
-/// the first SST open is M1's flush, which fails. The ingest copies its
-/// file (the second open), then retries that flush (the third) before it
-/// allocates: M1 lands at L0, the ingest overlaps it and lands above it,
-/// and the read returns "new". Without the flush the ingest lands at the
-/// deepest level while M1 stays frozen, and the read returns "old" from
-/// the frozen list.
+/// Deterministic: it runs on one thread, on a database with no worker.
+/// (With one, the worker's first round, the one that runs the disk check
+/// of the open, may reach the sealed memtable before this thread's flush
+/// does and take the injected failure in its place, and the flush here
+/// then goes through.) `Db::open` opens no SST, so the first SST open is
+/// M1's flush, which fails. The ingest copies its file (the second open),
+/// then retries that flush (the third) before it allocates: M1 lands at
+/// L0, the ingest overlaps it and lands above it, and the read returns
+/// "new". Without the flush the ingest lands at the deepest level while M1
+/// stays frozen, and the read returns "old" from the frozen list.
 #[test]
 fn an_ingest_drains_a_memtable_left_frozen_by_a_failed_flush() {
     let dir = TempDir::new().unwrap();
     let staging = TempDir::new().unwrap();
-    let opts = Options::default().env(NthSstOpen::new(dir.path(), 0, 1));
+    let opts = Options::default()
+        .max_background_compactions(0)
+        .env(NthSstOpen::new(dir.path(), 0, 1));
     let db = Db::open(dir.path(), opts.clone()).unwrap();
 
     regolith::through_stalls(|| db.put(b"k", b"old")).unwrap();

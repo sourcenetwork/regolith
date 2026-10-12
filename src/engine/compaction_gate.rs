@@ -73,6 +73,7 @@ impl CompactionGate {
     /// A pass's share, waited for on this thread: a compaction worker's.
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn shared(&self) -> Shared<'_> {
+        super::io::scope::waits("a share of the compaction gate");
         crate::sync::internal::block_on(self.0.read())
     }
 
@@ -117,6 +118,7 @@ impl Admission {
 
     /// The hold, waited for on this thread. See [`CompactionGate::exclusive`].
     pub(crate) fn wait(self) -> io::Result<Exclusive> {
+        super::io::scope::waits("sole hold of the compaction gate");
         wait_here(self.0)
     }
 }
