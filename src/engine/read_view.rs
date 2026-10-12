@@ -413,6 +413,9 @@ impl Drop for VersionGuard<'_> {
 /// view retired before that load, and with it memtables and table
 /// descriptors. regolith's compaction thread calls this before each wait;
 /// a thread regolith does not own releases at its next read.
+// wasm32 builds no compaction thread, so a build for it may call this
+// from nowhere.
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 pub(crate) fn idle() {
     kovan::flush();
 }
