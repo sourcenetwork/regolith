@@ -135,13 +135,19 @@ pub use transaction::{
 
 /// The transactional API and the traits a caller implements, in one import:
 /// `use regolith::prelude::*;`.
+///
+/// Every trait a caller implements is here ([`KeyClassifier`],
+/// [`MergeOperator`], [`LogLayout`], [`TransactionHooks`], [`EventListener`],
+/// [`KeyProvider`], [`CompactionFilter`], [`Env`]), with the types its
+/// required methods name. The file traits an [`Env`] hands out stay in
+/// [`crate::env`].
 pub mod prelude {
     pub use crate::{
-        AbortReason, CommitInfo, CommitReceipt, CommitTicket, Conflict, Db, IoBudget, IoQueue,
-        IsolationLevel, JobTicket, KeyClass, KeyClassifier, KeyId, KeyMaterial, KeyProvider,
-        LockWait, LogLayout, MergeOperator, OptimisticTransactionDb, Options, QueueId, ReadMode,
-        RetryPolicy, StallWait, TransactError, Transaction, TransactionError, TransactionHooks,
-        TxResult, TxnOptions, WouldBlock,
+        AbortReason, CommitInfo, CommitReceipt, CommitTicket, CompactionDecision, CompactionFilter,
+        Conflict, Db, Env, EventListener, IoBudget, IoQueue, IsolationLevel, JobTicket, KeyClass,
+        KeyClassifier, KeyId, KeyMaterial, KeyProvider, LockWait, LogLayout, MergeOperator,
+        OptimisticTransactionDb, Options, QueueId, ReadMode, RetryPolicy, StallWait, TransactError,
+        Transaction, TransactionError, TransactionHooks, TxResult, TxnOptions, WouldBlock,
     };
 }
 pub use ttl::{DbWithTtl, TtlCompactionFilter, strip_timestamp};

@@ -96,3 +96,82 @@ fn both_transaction_databases_reach_their_statistics() {
     let stats = pessimistic.db().statistics().unwrap();
     assert_eq!(stats.get_ticker(Ticker::CommitCount), 1);
 }
+
+/// Everything here comes from `regolith::prelude` and nothing else: this
+/// module sees none of the imports above.
+mod from_the_prelude_alone {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use regolith::prelude::*;
+
+    /// Counts the conflicts it hears about.
+    #[derive(Default)]
+    struct Conflicts(AtomicUsize);
+
+    impl EventListener for Conflicts {
+        fn on_conflict(&self, _conflict: &Conflict) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Removes every value that starts with `x`.
+    struct DropX;
+
+    impl CompactionFilter for DropX {
+        fn filter(&self, _level: usize, _key: &[u8], value: &[u8]) -> CompactionDecision {
+            if value.starts_with(b"x") {
+                CompactionDecision::Remove
+            } else {
+                CompactionDecision::Keep
+            }
+        }
+
+        fn name(&self) -> &'static str {
+            "drop-x"
+        }
+    }
+
+    /// Every trait a caller implements is named by the prelude.
+    #[test]
+    fn the_prelude_names_every_trait_a_caller_implements() {
+        fn named<T: ?Sized>() {}
+        named::<dyn KeyClassifier>();
+        named::<dyn MergeOperator>();
+        named::<dyn LogLayout>();
+        named::<dyn TransactionHooks>();
+        named::<dyn EventListener>();
+        named::<dyn KeyProvider>();
+        named::<dyn CompactionFilter>();
+        named::<dyn Env>();
+    }
+
+    /// A listener, a compaction filter and an environment, written and
+    /// installed with the prelude alone, are the ones the database runs.
+    #[test]
+    fn a_listener_a_filter_and_an_environment_work_from_the_prelude_alone() {
+        let heard = Arc::new(Conflicts::default());
+        let listener: Arc<dyn EventListener> = heard.clone();
+        let filter: Arc<dyn CompactionFilter> = Arc::new(DropX);
+        let env: Arc<dyn Env> = Arc::clone(Options::memory().get_env());
+        let options = Options::memory()
+            .env(env)
+            .listeners(vec![listener])
+            .compaction_filter(Some(filter));
+        let db = OptimisticTransactionDb::open("surface-prelude", options).unwrap();
+
+        db.db().put(b"gone", b"x-rated").unwrap();
+        db.db().put(b"kept", b"plain").unwrap();
+        db.db().flush().unwrap();
+        db.db().compact_range(None, None).wait().unwrap();
+        assert_eq!(db.db().get(b"gone").unwrap(), None);
+        assert_eq!(db.db().get(b"kept").unwrap(), Some(b"plain".to_vec()));
+
+        let txn = db.begin(&TxnOptions::new().isolation(IsolationLevel::RepeatableRead));
+        txn.get(b"kept").unwrap();
+        db.db().put(b"kept", b"changed").unwrap();
+        txn.put(b"other", b"v").unwrap();
+        assert!(matches!(txn.commit(), Err(TransactionError::Conflict(_))));
+        assert_eq!(heard.0.load(Ordering::Relaxed), 1);
+    }
+}
