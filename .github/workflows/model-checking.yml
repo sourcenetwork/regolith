@@ -70,6 +70,12 @@ jobs:
           distribution: temurin
           java-version: '21'
       - uses: extractions/setup-just@v2
+      # Every line of a model, a configuration and a Lean proof carries a
+      # plain-words comment above it, with no file left out. A shell script
+      # with nothing to install; it runs first because it takes a second and
+      # one uncommented line fails the job.
+      - name: Every proof line carries a comment
+        run: just proofs-comments
       - name: TLA+ models, every green and red configuration
         run: just tla
 

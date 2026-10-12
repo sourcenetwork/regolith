@@ -221,8 +221,9 @@ pub struct StallWait {
     /// inline compaction turned off.
     self_driven: bool,
     /// Where the time a thread is blocked in [`StallWait::wait`] is counted.
-    /// Read only by the blocking wait, which `wasm32` lacks.
-    #[cfg_attr(target_arch = "wasm32", expect(dead_code))]
+    /// Read only by the blocking wait, which `wasm32` lacks: there it is set
+    /// and never read. The compiler raises no dead-code lint for it there,
+    /// so it carries no expectation of one, unlike `stall`.
     counted: Option<Arc<crate::Statistics>>,
 }
 

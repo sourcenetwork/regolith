@@ -11,10 +11,6 @@
 *~
 .DS_Store
 
-# Generated
-defra.h
-crates/ffi/defra.h
-
 # Test artifacts
 *.profraw
 *.profdata

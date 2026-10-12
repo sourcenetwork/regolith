@@ -1,5 +1,5 @@
 //! Validation ahead of the pipeline (plan 4.4, `early_check_split` in
-//! `GroupCommit.lean`).
+//! `PipelineCheck.lean`).
 //!
 //! Before a transaction takes a slot of the commit ring it samples the read
 //! horizon `h` and checks every item of its commit (each read, each

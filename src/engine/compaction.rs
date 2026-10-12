@@ -745,12 +745,15 @@ fn pick_and_run_universal(
         return Ok(false);
     }
 
-    // Sort newest-first. Age is approximated by `file_id`: every
-    // fresh flush / merge output gets a strictly larger id than
-    // any previous one (handed out monotonically by the version
-    // set), so largest = newest.
-    let mut by_age: Vec<Arc<LiveSst>> = l0_files;
-    by_age.sort_by_key(|f| std::cmp::Reverse(f.meta.file_id));
+    // Newest first. L0 lists its tables by age, oldest first, and that is
+    // the order a read follows, so it is the order here. A file id is not
+    // an age: a merge's output draws its id when it starts writing and takes
+    // the place of its oldest input, so a run flushed while the merge ran
+    // has the smaller id and the newer place. Ordered by id, the size rule
+    // could merge the runs on either side of such a run and leave it out,
+    // and the output, placed below it, would hide a newer write under an
+    // older one.
+    let by_age: Vec<Arc<LiveSst>> = l0_files.into_iter().rev().collect();
 
     // Rule 1 - size ratio merge. Accumulate newest files into a
     // candidate group; keep adding until the group's total size
@@ -817,9 +820,9 @@ fn pick_and_run_universal(
 }
 
 /// Merge every file in `inputs` into a single new L0 file. Input
-/// files are removed from the version; the new file gets a fresh
-/// id (so it sorts as the newest L0 file under the picker's
-/// age-by-file_id ordering).
+/// files are removed from the version; the new file gets a fresh id
+/// and takes the place of its oldest input, so its age in L0 is that
+/// input's, whatever its id.
 ///
 /// The output is deliberately **one** file regardless of
 /// [`CompactionOptions::target_file_size`]. Under this style each L0
@@ -2207,6 +2210,8 @@ fn delete_old_files(
 
 #[cfg(test)]
 mod retire_tests;
+#[cfg(test)]
+mod universal_order_tests;
 
 #[cfg(test)]
 mod tests {

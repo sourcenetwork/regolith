@@ -82,6 +82,12 @@
 \*     here a writer may take either path at any time, which covers it.
 \*   - Memory ordering: the CAS steps are atomic here; the code's Acquire
 \*     and Release make them so.
+\*   - An append at one length only (MemFile::append_at, which the
+\*     in-memory positional log of src/env/mem_log.rs is built on): the
+\*     append modelled here with one more condition, that the file is as
+\*     long as the caller says, read from the same state word the append
+\*     then moves. An append the condition turns away changes nothing, so
+\*     it is a step that is not taken.
 \*
 \* CONFIGURATIONS (each GREEN must pass, each RED must break the one
 \* invariant it names):
