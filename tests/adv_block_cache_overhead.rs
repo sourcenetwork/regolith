@@ -198,7 +198,9 @@ fn a_cached_entry_costs_no_more_heap_than_it_is_charged() {
         );
         let line = stdout
             .lines()
-            .find(|l| l.starts_with("ADVRESULT"))
+            // Anywhere in the line: with one test thread libtest prints
+            // "test <name> ... " in front of what the child prints.
+            .find_map(|l| l.find("ADVRESULT").map(|at| &l[at..]))
             .unwrap_or_else(|| panic!("no result from child:\n{stdout}"))
             .to_string();
         println!("{line}");
