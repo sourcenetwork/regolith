@@ -608,8 +608,9 @@ tla:
     check MC_CommitPipeline_Red_ValidatePublished      RED NoLostUpdate
     # R13 and D53, non-blocking reads on per-thread I/O queues: single-flight
     # units claimed by one CAS, completions only on the asking queue, idle
-    # wakeups. Lean: Regolith/IoQueue.lean, claim_once, told_exactly_once,
-    # no_lost_idle_wakeup, busy_never_woken, single_thread_finishes.
+    # wakeups. Lean: Regolith/IoQueue.lean, claim_once, told_at_most_once,
+    # every_waiter_told, no_lost_idle_wakeup, busy_never_woken,
+    # single_thread_finishes.
     spec=NonBlocking
     check MC_NonBlocking_Green_Pool                    GREEN
     check MC_NonBlocking_Green_PoolLive                GREEN
