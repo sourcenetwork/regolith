@@ -149,6 +149,7 @@ pub mod loom_exports {
     //! them. It does not exist in an ordinary build.
 
     pub use crate::engine::loom_model::{arena, handoff, io_queue, skiplist, slice, version};
+    pub use crate::sync::loom_model as sync;
 }
 
 #[cfg(feature = "fuzzing")]
