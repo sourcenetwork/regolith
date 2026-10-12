@@ -1,5 +1,5 @@
 //! What a caller reads back from the handles it holds: the statistics a
-//! database was opened with.
+//! database was opened with, and the options it set.
 
 // Native-only. wasm-pack builds every test target for wasm32, and the browser
 // suite lives in tests/wasm_opfs*.rs.
@@ -8,7 +8,49 @@
 use std::sync::Arc;
 
 use regolith::{Db, IsolationLevel, OptimisticTransactionDb, Options, Statistics, Ticker};
-use regolith::{TransactionDb, TxnOptions};
+use regolith::{EventListener, TransactionDb, TxnOptions};
+
+struct Quiet;
+
+impl EventListener for Quiet {}
+
+#[test]
+fn options_hand_back_the_key_bound_and_the_inline_compaction_switch() {
+    let defaults = Options::default();
+    assert_eq!(defaults.get_max_key_size(), regolith::DEFAULT_MAX_KEY_SIZE);
+    assert!(!defaults.get_inline_compaction());
+
+    let set = Options::default().max_key_size(512).inline_compaction(true);
+    assert_eq!(set.get_max_key_size(), 512);
+    assert!(set.get_inline_compaction());
+
+    // A preset's choices are read the same way, so a caller that copies some
+    // of a preset onto its own options can copy these two as well.
+    let preset = Options::memory();
+    assert_eq!(preset.get_max_key_size(), 16 * 1024);
+    assert!(preset.get_inline_compaction());
+}
+
+#[test]
+fn options_hand_back_the_listeners_in_the_order_they_were_set() {
+    assert!(Options::default().get_listeners().is_empty());
+
+    let first: Arc<dyn EventListener> = Arc::new(Quiet);
+    let options = Options::default().listeners(vec![Arc::clone(&first)]);
+    assert_eq!(options.get_listeners().len(), 1);
+    assert!(Arc::ptr_eq(&options.get_listeners()[0], &first));
+
+    // The builder replaces the list, so adding one listener to the ones
+    // already set is: read them, add, set.
+    let second: Arc<dyn EventListener> = Arc::new(Quiet);
+    let mut listeners = options.get_listeners().to_vec();
+    listeners.push(Arc::clone(&second));
+    let options = options.listeners(listeners);
+    let set = options.get_listeners();
+    assert_eq!(set.len(), 2);
+    assert!(Arc::ptr_eq(&set[0], &first));
+    assert!(Arc::ptr_eq(&set[1], &second));
+}
 
 #[test]
 fn a_database_hands_back_the_statistics_it_was_opened_with() {

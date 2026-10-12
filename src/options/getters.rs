@@ -31,10 +31,21 @@ copy_getters! {
     get_durability => durability: DurabilityMode,
     get_max_write_buffer_number => max_write_buffer_number: usize,
     get_max_background_compactions => max_background_compactions: usize,
+    get_inline_compaction => inline_compaction: bool,
+    get_max_key_size => max_key_size: usize,
     get_max_value_size => max_value_size: usize,
 }
 
 impl Options {
+    /// The value of [`Options::listeners`], in the order they were set.
+    ///
+    /// The builder replaces the whole list, so adding a listener to the
+    /// ones already set is: copy this slice, push, and set the result.
+    #[must_use]
+    pub fn get_listeners(&self) -> &[Arc<dyn crate::EventListener>] {
+        &self.listeners
+    }
+
     /// The value of [`Options::merge_operator`].
     #[must_use]
     pub fn get_merge_operator(&self) -> Option<&Arc<dyn MergeOperator>> {
