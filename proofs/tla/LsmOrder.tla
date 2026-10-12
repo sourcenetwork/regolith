@@ -13,6 +13,16 @@
 \*                                  L0 leaves the read order as it was
 \*   install_newer_breaks_reads     installing a newer one first, the RED
 \*                                  FlushAnyOrder case, as a counterexample
+\*   flush_keeps_sources_disjoint   a flush that installs its table and
+\*                                  retires its memtable in one step leaves
+\*                                  no version in two sources
+\*   split_install_holds_a_memtable_twice
+\*                                  the RED SplitRetire case: the table
+\*                                  published before the memtable is retired
+\*                                  puts every version of it in two sources
+\*   split_install_reads_an_operand_twice
+\*                                  and a read that collects a key's merge
+\*                                  operands then sees each of them twice
 \*   compact_range_reads_newest     compacting the closure keeps the sources
 \*                                  ordered and changes no read
 \*   pickL0_closed, pickL0_covers   the closure picker returns a closed set
@@ -50,6 +60,12 @@
 \*     An external file takes a fresh sequence and is placed at a level.
 \*   manifest replay                  src/engine/manifest.rs
 \*     Today refuses a deeper level whose tables overlap (E14).
+\*   flush_oldest_frozen              src/engine/mod.rs (FlushInstall)
+\*     A flush writes the oldest frozen memtable out as a table, then
+\*     installs the table as the newest L0 file and retires the memtable in
+\*     ONE publication of the read view (VersionGuard::retire_with_version,
+\*     src/engine/read_view.rs), so a flush is one step here, and no reader
+\*     loads a view between the two.
 \*
 \* THE DEFECTS, one per mutant constant.
 \*   Picker = "Intersect" (E1). Picking only the L0 files that intersect the
@@ -58,6 +74,13 @@
 \*   FlushOrder = "Any". With several frozen memtables, a newer one's file
 \*     is installed in L0 before an older one is flushed. The older frozen
 \*     memtable is read before L0, so its older version answers first.
+\*   FlushPublish = "Split" (E31). The flush publishes the view holding its
+\*     table, and only then, in a second publication, the view without its
+\*     memtable. A reader that loads the view in between holds the memtable
+\*     and its table at once: every version of that memtable twice, at the
+\*     same sequence. A point read is not fooled (both copies agree), but a
+\*     read of a merged key collects the operands of every source, so it
+\*     applies each operand twice: merges "a" then "b" read back as "abab".
 \*   Ingest = "IgnoreUpper". The file is placed at the deepest level whose
 \*     own tables it does not overlap, without checking L0 and the levels
 \*     above, which may hold older versions of its keys and are read first.
@@ -71,6 +94,9 @@
 \*     the picked set's, until nothing changes.
 \*   FlushOrder = "Oldest": a flush installs in memtable order; a file
 \*     written early waits for the older ones.
+\*   FlushPublish = "Together": the table joins L0 and the memtable leaves
+\*     the frozen list in the same publication, so the sources of every view
+\*     a reader can load share no version (NoDoubleSource).
 \*   Ingest = "Placed": the deepest level L such that no L0 file holds a key
 \*     in the file's range and no table of levels 1..L overlaps it; L0 when
 \*     there is none. A memtable holding a key in the range is flushed
@@ -108,6 +134,7 @@
 \*   MC_LsmOrder_Red_Intersect               ReadNewest fails
 \*   MC_LsmOrder_Green_Flush                 frozen memtables, in order
 \*   MC_LsmOrder_Red_FlushAnyOrder           ReadNewest fails
+\*   MC_LsmOrder_Red_SplitRetire             NoDoubleSource fails (E31)
 \*   MC_LsmOrder_Green_Ingest                two levels, ingest placement
 \*   MC_LsmOrder_Red_IngestIgnoresUpper      ReadNewest fails
 \*   MC_LsmOrder_Green_Demote                legacy overlap, demoted at open
@@ -123,6 +150,8 @@ CONSTANTS
   Picker,      \* "Closure" (the fix) or "Intersect" (E1)
   MaxImm,      \* the most frozen memtables; 0 flushes the memtable directly
   FlushOrder,  \* "Oldest" (the fix) or "Any" (the defect)
+  FlushPublish,\* "Together" (the fix) or "Split" (E31): whether a flush's
+               \* table and the retirement of its memtable are one publication
   Levels,      \* how many levels lie below L0
   Ingest,      \* "Off", "Placed" (the fix) or "IgnoreUpper" (the defect)
   Legacy       \* "Off", "Demote" (the fix), "DemoteLevelOnly" or "Keep"
@@ -131,6 +160,8 @@ ASSUME Keys \subseteq Nat /\ Keys # {}
 ASSUME MaxSeq \in Nat /\ MaxL0 \in Nat /\ MaxImm \in Nat /\ Levels \in Nat \ {0}
 ASSUME Picker \in {"Closure", "Intersect"}
 ASSUME FlushOrder \in {"Oldest", "Any"}
+\* A flush publishes its table and retires its memtable together, or apart.
+ASSUME FlushPublish \in {"Together", "Split"}
 ASSUME Ingest \in {"Off", "Placed", "IgnoreUpper"}
 ASSUME Legacy \in {"Off", "Demote", "DemoteLevelOnly", "Keep"}
 
@@ -142,11 +173,17 @@ VARIABLES
   lv,      \* lv[j], j in 1..Levels: level j's tables in key order, each a
            \* record [v |-> versions, lo |-> least key, hi |-> greatest key]
            \* where [lo, hi] is the range the manifest records
-  opened   \* whether the open that demotes overlap has run; FALSE only
+  opened,  \* whether the open that demotes overlap has run; FALSE only
            \* while a legacy (0.1.x) database is being built
+  owed     \* the frozen memtable (its set of versions) whose table a split
+           \* flush has published while the memtable is still frozen; {} when
+           \* no flush is between its two publications. Always {} with
+           \* FlushPublish = "Together": the real code has no such moment.
+           \* It stands for the flush still holding the `flushing` exclusion
+           \* (flush_oldest_frozen, src/engine/mod.rs) after its table is in.
 
 \* Every variable, so a step that changes none of them is a stutter.
-vars == <<seq, mem, imm, l0, lv, opened>>
+vars == <<seq, mem, imm, l0, lv, opened, owed>>
 
 ----------------------------------------------------------------------------
 \* Helpers.
@@ -330,13 +367,15 @@ Init ==
   /\ l0     = <<>>
   /\ lv     = [j \in 1..Levels |-> <<>>]
   /\ opened = (Legacy = "Off")
+  \* No flush has started, so none is between its two publications.
+  /\ owed   = {}
 
 \* A put of key k: the next sequence, inserted into the memtable.
 Put(k) ==
   /\ seq < MaxSeq
   /\ seq' = seq + 1
   /\ mem' = mem \cup {<<k, seq + 1>>}
-  /\ UNCHANGED <<imm, l0, lv, opened>>
+  /\ UNCHANGED <<imm, l0, lv, opened, owed>>
 
 \* With no frozen memtables (MaxImm = 0), a flush turns the memtable into
 \* the newest L0 file, and a new, empty memtable takes the writes.
@@ -346,7 +385,7 @@ Flush ==
   /\ Len(l0) < MaxL0
   /\ l0'  = <<mem>> \o l0
   /\ mem' = {}
-  /\ UNCHANGED <<seq, imm, lv, opened>>
+  /\ UNCHANGED <<seq, imm, lv, opened, owed>>
 
 \* Rotation freezes the memtable: it becomes the newest frozen memtable,
 \* still read before L0, and a new, empty memtable takes the writes.
@@ -356,18 +395,48 @@ Freeze ==
   /\ Len(imm) < MaxImm
   /\ imm' = <<mem>> \o imm
   /\ mem' = {}
-  /\ UNCHANGED <<seq, l0, lv, opened>>
+  /\ UNCHANGED <<seq, l0, lv, opened, owed>>
 
 \* A flush of frozen memtable i installs its file as the newest L0 file and
 \* drops the memtable. The fix installs only the oldest (the last); the
 \* defect installs whichever flush finished first.
+\*
+\* The table and the retirement are ONE publication in the real code
+\* (`versions.apply` then `retire_with_version` under the version-set
+\* mutex, published together by VersionGuard::drop). Example: memtable
+\* {<<1, 1>>} is frozen; after this step L0 holds the file {<<1, 1>>} and
+\* the frozen list is empty, and no state in between exists for a reader to
+\* load. The E31 bug ("Split") publishes the table here and leaves the
+\* memtable frozen for FlushRetire below.
 FlushInstall(i) ==
-  /\ i \in 1..Len(imm)
-  /\ FlushOrder = "Any" \/ i = Len(imm)
-  /\ Len(l0) < MaxL0
-  /\ l0'  = <<imm[i]>> \o l0
-  /\ imm' = Keep(imm, {i}, 1)
-  /\ UNCHANGED <<seq, mem, lv, opened>>
+  /\ i \in 1..Len(imm)                  \* a frozen memtable
+  /\ FlushOrder = "Any" \/ i = Len(imm)  \* the oldest one, unless the bug is planted
+  /\ owed = {}                          \* the `flushing` exclusion: no other flush is half done
+  /\ Len(l0) < MaxL0                    \* keeps the model small
+  /\ l0'  = <<imm[i]>> \o l0             \* its file is the newest L0 file
+  /\ IF FlushPublish = "Together"
+       \* The real code: the memtable leaves the frozen list in the same
+       \* publication, and the flush is over.
+       THEN /\ imm'  = Keep(imm, {i}, 1)
+            /\ owed' = {}
+       \* The E31 bug: the memtable stays frozen, and the flush still owes
+       \* its retirement. Readers can load this state.
+       ELSE /\ imm'  = imm
+            /\ owed' = imm[i]
+  /\ UNCHANGED <<seq, mem, lv, opened>>  \* nothing else changes
+
+\* The E31 bug only: the second publication of a split flush. The memtable
+\* whose table FlushInstall already published leaves the frozen list now
+\* (ReadViewCell::retire_memtable called on its own). The real code never
+\* takes this step, because `owed` is never set there.
+FlushRetire ==
+  /\ owed # {}                          \* a flush published its table and still owes the retire
+  \* The frozen list without that memtable. It is found by what it holds,
+  \* as the code finds it by identity: no two memtables hold the same
+  \* versions, since every write takes a sequence of its own.
+  /\ imm'  = Keep(imm, {j \in 1..Len(imm) : imm[j] = owed}, 1)
+  /\ owed' = {}                         \* the flush is over
+  /\ UNCHANGED <<seq, mem, l0, lv, opened>>  \* nothing else changes
 
 \* compact_range(lo, hi) at L0: the picked files leave L0 and merge with
 \* the L1 tables their key range meets into one L1 table.
@@ -382,7 +451,7 @@ CompactRange(lo, hi) ==
   IN /\ P # {}
      /\ l0' = Keep(l0, P, 1)
      /\ lv' = [lv EXCEPT ![1] = Insert(Keep(L1, ins, 1), out)]
-     /\ UNCHANGED <<seq, mem, imm, opened>>
+     /\ UNCHANGED <<seq, mem, imm, opened, owed>>
 
 \* A level compaction: table t of level j merges with the tables of level
 \* j + 1 its range meets into one table of level j + 1.
@@ -396,7 +465,7 @@ CompactLevel(j, t) ==
                  lo |-> Min({T.lo} \cup {N[u].lo : u \in ins}),
                  hi |-> Max({T.hi} \cup {N[u].hi : u \in ins})]
      IN lv' = [lv EXCEPT ![j] = Keep(lv[j], {t}, 1), ![j + 1] = Insert(Keep(N, ins, 1), out)]
-  /\ UNCHANGED <<seq, mem, imm, l0, opened>>
+  /\ UNCHANGED <<seq, mem, imm, l0, opened, owed>>
 
 \* An ingest of a file holding the keys ks, all at the next sequence. A
 \* memtable holding a key in its range is flushed first (D48), so here none
@@ -417,7 +486,7 @@ IngestFile(ks) ==
              ELSE /\ lv' = [lv EXCEPT ![Max(fits)] = Insert(@, F)]
                   /\ UNCHANGED l0
   /\ seq' = seq + 1
-  /\ UNCHANGED <<mem, imm, opened>>
+  /\ UNCHANGED <<mem, imm, opened, owed>>
 
 \* A 0.1.x ingest (E14): a file holding key k at the next sequence, placed
 \* at level j by its point key, which nothing read before level j holds and
@@ -430,7 +499,7 @@ LegacyIngest(j, k, a, b) ==
   /\ \A i \in 1..j : ~LevelMeets(i, k, k)
   /\ lv'  = [lv EXCEPT ![j] = Insert(@, [v |-> {<<k, seq + 1>>}, lo |-> a, hi |-> b])]
   /\ seq' = seq + 1
-  /\ UNCHANGED <<mem, imm, l0, opened>>
+  /\ UNCHANGED <<mem, imm, l0, opened, owed>>
 
 \* The first open by this version: the configured demotion moves levels to
 \* the end of L0, as one version edit.
@@ -439,7 +508,7 @@ Open ==
   /\ opened' = TRUE
   /\ l0'     = l0 \o Demoted(DemotedLevels, 1)
   /\ lv'     = [j \in 1..Levels |-> IF j \in DemotedLevels THEN <<>> ELSE lv[j]]
-  /\ UNCHANGED <<seq, mem, imm>>
+  /\ UNCHANGED <<seq, mem, imm, owed>>
 
 \* Every step the system can take.
 Next ==
@@ -447,6 +516,7 @@ Next ==
   \/ Flush
   \/ Freeze
   \/ \E i \in 1..MaxImm : FlushInstall(i)
+  \/ FlushRetire
   \/ \E lo, hi \in Keys : lo <= hi /\ CompactRange(lo, hi)
   \/ \E j \in 1..Levels : \E t \in 1..Len(lv[j]) : CompactLevel(j, t)
   \/ \E ks \in (SUBSET Keys) \ {{}} : IngestFile(ks)
@@ -471,6 +541,7 @@ TypeOK ==
        /\ lv[j][t].v \subseteq Keys \X (1..MaxSeq)
        /\ \A x \in lv[j][t].v : lv[j][t].lo <= x[1] /\ x[1] <= lv[j][t].hi
   /\ opened \in BOOLEAN
+  /\ owed \subseteq Keys \X (1..MaxSeq)
 
 \* THE HEADLINE. Once open, every read, of every key, at every snapshot up
 \* to the newest sequence, returns the newest version of that key the
@@ -481,6 +552,35 @@ ReadNewest ==
   opened =>
     \A A \in {AllVersions} : \A k \in Keys : \A S \in {Sources(k)} :
       \A snap \in 0..seq : ReadIn(S, k, snap) = NewestIn(A, k, snap)
+
+\* Every table of levels j..Levels as one sequence of version sets, level
+\* by level.
+RECURSIVE LevelFiles(_)
+LevelFiles(j) == IF j > Levels THEN <<>> ELSE Files(lv[j]) \o LevelFiles(j + 1)
+
+\* Every source a reader's view holds, one after another: the active
+\* memtable, the frozen memtables, the L0 files, then every table of every
+\* level. (Sources(k) above is the same walk narrowed to the one table per
+\* level that may hold k.)
+EverySource == <<mem>> \o imm \o l0 \o LevelFiles(1)
+
+\* NO VERSION IN TWO SOURCES (E31). In every view a reader can load, no two
+\* sources hold the same version. The engine needs it because a read of a
+\* merged key gathers that key's operands from EVERY source and applies
+\* them all: a version held twice is an operand applied twice.
+\* The case it rules out: merges "a" (sequence 1) and "b" (sequence 2) sit
+\* in a frozen memtable; a split flush publishes their table; a reader
+\* loads the view before the memtable is retired, finds both operands in
+\* the memtable and both again in the table, and returns "abab" for "ab".
+\* Lean: flush_keeps_sources_disjoint, with the RED case as
+\* split_install_holds_a_memtable_twice.
+NoDoubleSource ==
+  \* Name the list of sources once per state.
+  \A S \in {EverySource} :
+    \* Any two different places in that list ...
+    \A a, b \in 1..Len(S) :
+      \* ... hold no version in common.
+      a # b => S[a] \cap S[b] = {}
 
 \* Once open, every level's tables are in key order and their ranges do
 \* not overlap: what the binary search needs.
