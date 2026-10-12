@@ -18,10 +18,9 @@ use core::task::{Context, Poll};
 
 use super::internal::{AtomicU64, Ordering, UnsafeCell};
 use super::list::List;
-use super::queue::{Arrivals, FIRST_BIT, Policy, Step, WaitQueue};
+use super::queue::{Arrivals, Policy, QUEUED, Step, WaitQueue};
 use super::waiter::{Cancel, Wait, WakeList, release_queued};
 
-const QUEUED: usize = 1 << FIRST_BIT;
 const COUNT_MASK: u64 = u32::MAX as u64;
 const ONE_GENERATION: u64 = 1 << 32;
 
@@ -125,8 +124,8 @@ impl Policy for Barrier {
         &self.queue
     }
 
-    fn pass(&self, arrivals: Arrivals, woken: &mut WakeList<'_>) -> usize {
-        let pool = self.queue.pool();
+    fn pass(&self, arrivals: Arrivals, woken: &mut WakeList<'_>, _wake_front: bool) -> usize {
+        let pool = &self.queue;
         let current = generation(self.word.load(Ordering::Acquire));
         // SAFETY: only the drain role's holder runs a pass.
         self.waiting.with_mut(|waiting| unsafe {
@@ -158,7 +157,7 @@ impl Policy for Barrier {
 
 impl Drop for Barrier {
     fn drop(&mut self) {
-        let pool = self.queue.pool();
+        let pool = &self.queue;
         // SAFETY: `&mut self` rules out a concurrent pass.
         self.waiting
             .with_mut(|waiting| unsafe { (*waiting).list.clear(pool) });
@@ -214,7 +213,7 @@ impl Future for BarrierWait<'_> {
                 }
                 Err(generation) => {
                     this.generation = Some(generation);
-                    barrier.enqueue(&mut this.wait, generation as usize, cx.waker(), QUEUED);
+                    barrier.enqueue(&mut this.wait, generation as usize, cx.waker());
                     return this
                         .wait
                         .poll(&barrier.queue, None)
@@ -231,8 +230,8 @@ impl Future for BarrierWait<'_> {
 impl Drop for BarrierWait<'_> {
     fn drop(&mut self) {
         // The arrival stays counted (see `Barrier`); only the node goes.
-        if let Cancel::Withdrawn = self.wait.cancel(&self.barrier.queue) {
-            self.barrier.withdrawn();
+        if let Cancel::Withdrawn(_) = self.wait.cancel(&self.barrier.queue) {
+            self.barrier.withdrawn(false);
         }
     }
 }

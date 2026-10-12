@@ -1,69 +1,93 @@
-//! The phase-fair core of [`RwLock`](super::RwLock), which
+//! The core of [`RwLock`](super::RwLock), which
 //! [`ReentrantRwLock`](super::ReentrantRwLock) builds on.
 //!
-//! Phase-fair means readers and writers take turns whenever both wait:
-//! when a writer leaves, every reader waiting at that moment enters
-//! together, and when that reader phase drains, the oldest waiting writer
-//! enters. A reader arriving while a writer waits waits for that writer,
-//! so neither side starves: a reader waits for at most one writer phase,
-//! and a writer for at most one reader phase per writer ahead of it.
+//! The state word holds the reader count, a writer bit, an upgradable bit
+//! and an upgrading bit above the queue's bits.
 //!
-//! The state word holds the reader count, a writer bit, which kind of
-//! phase admitted the lock last, and a queued flag per waiting kind. An
-//! upgrade (a reader of a [`ReentrantRwLock`](super::ReentrantRwLock)
-//! asking to write) queues ahead of plain writers, which could not run
-//! before it gives up its read anyway, and is granted when its own read is
-//! the only one left.
+//! - **Barging with bounded bypass, both ways.** A read enters whenever no
+//!   writer holds the lock and no upgrade is under way; a write whenever
+//!   the lock is free; either even past queued waiters, unless a handoff is
+//!   owed (see `contend`). A release nudges the waiter at the front: a
+//!   writer there is nudged on every release, so readers that keep
+//!   overlapping still make it lose and count bypasses until it is owed a
+//!   handoff, which holds every new reader back until the readers inside
+//!   have left. Readers at the front are nudged together, with an
+//!   upgradable read among them.
+//! - **One upgradable read at a time.** It shares the lock with plain
+//!   readers and excludes writers and other upgradable reads. Its upgrade
+//!   sets the upgrading bit, which holds new readers back, and becomes the
+//!   write once the readers inside have left. Since only one upgrader can
+//!   exist, an upgrade never deadlocks on another.
 
 #![allow(unsafe_code)]
 
+use core::ptr::NonNull;
 use core::task::{Poll, Waker};
 
+use super::contend::{Contend, Lock};
 use super::internal::{Ordering, UnsafeCell};
 use super::list::List;
-use super::queue::{Arrivals, FIRST_BIT, Policy, Step, WaitQueue};
-use super::waiter::{Cancel, Wait, WakeList, release_queued};
+use super::queue::{
+    Arrivals, FIRST_BIT, HANDOFF, Nudges, Policy, QUEUED, Step, WAKE_FRONT, WaitQueue, wants_drain,
+};
+use super::waiter::{Cancel, Park, Wait, Waiter, WakeList, release_queued};
 
-const QUEUED_R: usize = 1 << FIRST_BIT;
-const QUEUED_W: usize = 1 << (FIRST_BIT + 1);
-const WRITER: usize = 1 << (FIRST_BIT + 2);
-/// The phase that last admitted anyone was a reader phase.
-const LAST_READ: usize = 1 << (FIRST_BIT + 3);
-const READER_SHIFT: u32 = FIRST_BIT + 4;
+const WRITER: usize = 1 << FIRST_BIT;
+const UPGRADABLE: usize = 1 << (FIRST_BIT + 1);
+/// The upgradable read is waiting to become the write.
+const UPGRADING: usize = 1 << (FIRST_BIT + 2);
+const READER_SHIFT: u32 = FIRST_BIT + 3;
 const ONE_READER: usize = 1 << READER_SHIFT;
 const MAX_READERS: usize = usize::MAX >> READER_SHIFT;
 
 /// What a waiter asks for.
 pub(super) const READ: usize = 0;
 pub(super) const WRITE: usize = 1;
-/// A write by a reader that keeps its read until the write is granted.
-pub(super) const UPGRADE: usize = 2;
+pub(super) const UPGRADABLE_READ: usize = 2;
+/// The upgradable read's wait to become the write.
+const UPGRADE: usize = 3;
 
 fn readers(state: usize) -> usize {
     state >> READER_SHIFT
 }
 
-fn add_reader(state: usize) -> usize {
-    assert!(
-        readers(state) < MAX_READERS,
-        "too many readers hold one RwLock"
-    );
-    (state + ONE_READER) | LAST_READ
+/// Whether `kind` could enter a lock in `state`, the owed bit aside.
+fn admits(kind: usize, state: usize) -> bool {
+    match kind {
+        READ => state & (WRITER | UPGRADING) == 0,
+        WRITE => state & (WRITER | UPGRADABLE) == 0 && readers(state) == 0,
+        _ => state & (WRITER | UPGRADABLE) == 0,
+    }
+}
+
+/// `state` with `kind` entered.
+fn enter(kind: usize, state: usize) -> usize {
+    match kind {
+        READ => {
+            assert!(
+                readers(state) < MAX_READERS,
+                "too many readers hold one RwLock"
+            );
+            state + ONE_READER
+        }
+        WRITE => state | WRITER,
+        _ => state | UPGRADABLE,
+    }
 }
 
 struct Waiting {
-    readers: List,
-    writers: List,
-    upgrades: List,
+    list: List,
+    /// The upgradable read's node while its upgrade waits.
+    upgrade: Option<NonNull<Waiter>>,
 }
 
-/// The phase-fair core with no value attached.
+/// The reader-writer core with no value attached.
 pub(super) struct RawRwLock {
     queue: WaitQueue,
     waiting: UnsafeCell<Waiting>,
 }
 
-// SAFETY: the waiting lists are touched only by the drain role's holder.
+// SAFETY: the waiting list is touched only by the drain role's holder.
 unsafe impl Send for RawRwLock {}
 // SAFETY: as above.
 unsafe impl Sync for RawRwLock {}
@@ -72,99 +96,50 @@ impl RawRwLock {
     loom_const_fn! {
         pub(super) fn new() -> Self {
             Self {
-                queue: WaitQueue::new(LAST_READ),
-                waiting: UnsafeCell::new(Waiting {
-                    readers: List::new(),
-                    writers: List::new(),
-                    upgrades: List::new(),
-                }),
+                queue: WaitQueue::new(0),
+                waiting: UnsafeCell::new(Waiting { list: List::new(), upgrade: None }),
             }
         }
-    }
-
-    pub(super) fn try_read(&self) -> bool {
-        let mut state = self.queue.state.load(Ordering::Relaxed);
-        loop {
-            if state & (WRITER | QUEUED_W) != 0 {
-                return false;
-            }
-            match self.queue.state.compare_exchange_weak(
-                state,
-                add_reader(state),
-                Ordering::Acquire,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => return true,
-                Err(actual) => state = actual,
-            }
-        }
-    }
-
-    /// Takes the write side; `held` is 1 when the caller converts its own
-    /// read into the write.
-    fn try_write_holding(&self, held: usize) -> bool {
-        let mut state = self.queue.state.load(Ordering::Relaxed);
-        loop {
-            if state & (WRITER | QUEUED_W | QUEUED_R) != 0 || readers(state) != held {
-                return false;
-            }
-            let next = ((state - held * ONE_READER) | WRITER) & !LAST_READ;
-            match self.queue.state.compare_exchange_weak(
-                state,
-                next,
-                Ordering::Acquire,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => return true,
-                Err(actual) => state = actual,
-            }
-        }
-    }
-
-    pub(super) fn try_write(&self) -> bool {
-        self.try_write_holding(0)
-    }
-
-    /// Converts the caller's read into the write if it is the only one.
-    pub(super) fn try_upgrade(&self) -> bool {
-        self.try_write_holding(1)
     }
 
     pub(super) fn try_kind(&self, kind: usize) -> bool {
-        match kind {
-            READ => self.try_read(),
-            WRITE => self.try_write(),
-            _ => self.try_upgrade(),
-        }
+        self.try_take(kind).is_ok()
     }
 
-    /// Drops one read. One `fetch_sub` when nobody waits; a waiter that
-    /// queues concurrently was either flagged already, and is drained
-    /// here, or flags itself afterwards and sees the read gone.
+    /// Drops one read. One `fetch_sub` when no waiter needs telling.
     pub(super) fn read_unlock(&self) {
         let before = self.queue.state.fetch_sub(ONE_READER, Ordering::AcqRel);
-        // One reader left may be an upgrader waiting for exactly that.
-        if readers(before) <= 2 && before & (QUEUED_R | QUEUED_W) != 0 {
-            self.transition(Step::Drain);
+        let upgrade_ready = readers(before) == 1 && before & UPGRADING != 0;
+        if wants_drain(before) || upgrade_ready {
+            self.released();
         }
     }
 
-    /// Drops the write, the same way [`read_unlock`](Self::read_unlock)
-    /// drops a read.
+    /// Drops the write. One `fetch_and` when no waiter needs telling.
     pub(super) fn write_unlock(&self) {
         let before = self.queue.state.fetch_and(!WRITER, Ordering::AcqRel);
-        if before & (QUEUED_R | QUEUED_W) != 0 {
-            self.transition(Step::Drain);
+        if wants_drain(before) {
+            self.released();
         }
     }
 
-    /// Turns the held write into a read, letting the readers waiting
-    /// behind the writer phase in with it.
+    /// Drops the upgradable read, and an upgrade it had begun.
+    pub(super) fn upgradable_unlock(&self) {
+        let before = self
+            .queue
+            .state
+            .fetch_and(!(UPGRADABLE | UPGRADING), Ordering::AcqRel);
+        if wants_drain(before) || before & UPGRADING != 0 {
+            self.released();
+        }
+    }
+
+    /// Turns the held write into a read.
     pub(super) fn downgrade(&self) {
         self.transition(|state| {
             let next = (state & !WRITER) + ONE_READER;
-            if state & (QUEUED_R | QUEUED_W) != 0 {
-                Step::Drain(next)
+            if state & QUEUED != 0 {
+                Step::Drain(next | WAKE_FRONT)
             } else {
                 Step::Set(next)
             }
@@ -176,52 +151,70 @@ impl RawRwLock {
         match kind {
             READ => self.read_unlock(),
             WRITE => self.write_unlock(),
-            _ => self.downgrade(),
+            _ => self.upgradable_unlock(),
         }
     }
 
-    /// Admits every waiting reader. False when a writer got in first.
-    fn admit_readers(&self, readers: &mut List, woken: &mut WakeList<'_>) -> bool {
-        let pool = self.queue.pool();
-        while let Some(node) = readers.front(pool) {
-            let mut state = self.queue.state.load(Ordering::Acquire);
-            loop {
-                if state & WRITER != 0 {
-                    return false;
-                }
-                match self.queue.state.compare_exchange_weak(
-                    state,
-                    add_reader(state),
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                ) {
-                    Ok(_) => break,
-                    Err(actual) => state = actual,
-                }
-            }
-            readers.pop_front();
-            if !woken.grant(node) {
-                self.queue.state.fetch_sub(ONE_READER, Ordering::AcqRel);
-            }
-        }
-        true
-    }
-
-    /// Puts back a write grant whose waiter withdrew in the meantime.
-    fn undo_write_grant(&self, held: usize, last_read: usize) {
-        let mut state = self.queue.state.load(Ordering::Acquire);
+    /// Turns the held upgradable read into the write if no reader is
+    /// inside.
+    pub(super) fn try_upgrade(&self) -> bool {
+        let mut state = self.queue.state.load(Ordering::Relaxed);
         loop {
-            let next = ((state & !(WRITER | LAST_READ)) | last_read) + held * ONE_READER;
+            if readers(state) != 0 {
+                return false;
+            }
             match self.queue.state.compare_exchange_weak(
                 state,
-                next,
-                Ordering::AcqRel,
+                (state & !(UPGRADABLE | UPGRADING)) | WRITER,
                 Ordering::Acquire,
+                Ordering::Relaxed,
             ) {
-                Ok(_) => return,
+                Ok(_) => return true,
                 Err(actual) => state = actual,
             }
         }
+    }
+
+    /// Hands the write to the waiting upgrade once the readers have left.
+    /// False when it is still waiting.
+    fn grant_upgrade(&self, node: NonNull<Waiter>, woken: &mut WakeList<'_>) -> bool {
+        let mut state = self.queue.state.load(Ordering::Acquire);
+        loop {
+            // The upgrading bit is gone when the upgrade was dropped: the
+            // drop releases the upgradable read itself.
+            if state & UPGRADING == 0 {
+                release_queued(node, &self.queue);
+                return true;
+            }
+            if readers(state) != 0 {
+                return false;
+            }
+            match self.queue.state.compare_exchange_weak(
+                state,
+                (state & !(UPGRADABLE | UPGRADING)) | WRITER,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(actual) => state = actual,
+            }
+        }
+        if !woken.grant(node) {
+            // Dropped after the write was taken for it: the drop found
+            // nothing left to release, so release it here.
+            self.queue.state.fetch_and(!WRITER, Ordering::AcqRel);
+        }
+        true
+    }
+}
+
+impl Lock for RawRwLock {
+    fn admit(&self, state: usize, kind: usize) -> Option<usize> {
+        admits(kind, state).then(|| enter(kind, state))
+    }
+
+    fn give_back(&self, kind: usize) {
+        self.unlock_kind(kind);
     }
 }
 
@@ -230,120 +223,182 @@ impl Policy for RawRwLock {
         &self.queue
     }
 
-    fn pass(&self, arrivals: Arrivals, woken: &mut WakeList<'_>) -> usize {
+    fn pass(&self, arrivals: Arrivals, woken: &mut WakeList<'_>, wake_front: bool) -> usize {
         let queue = &self.queue;
-        let pool = queue.pool();
         // SAFETY: only the drain role's holder runs a pass.
         self.waiting.with_mut(|waiting| unsafe {
             let waiting = &mut *waiting;
             for node in arrivals {
-                let list = match node.as_ref().payload() {
-                    READ => &mut waiting.readers,
-                    WRITE => &mut waiting.writers,
-                    _ => &mut waiting.upgrades,
-                };
                 if node.as_ref().is_cancelled() {
-                    release_queued(node, pool);
+                    release_queued(node, queue);
+                } else if node.as_ref().payload() == UPGRADE {
+                    debug_assert!(waiting.upgrade.is_none(), "two upgrades at once");
+                    waiting.upgrade = Some(node);
                 } else {
-                    list.push_back(node);
+                    waiting.list.push_back(node);
                 }
             }
-            waiting.readers.tidy(queue);
-            waiting.writers.tidy(queue);
-            waiting.upgrades.tidy(queue);
-            loop {
-                let state = queue.state.load(Ordering::Acquire);
-                if state & WRITER != 0 {
-                    break;
-                }
-                let upgrade = waiting.upgrades.front(pool);
-                let writer = waiting.writers.front(pool);
-                let readers_turn =
-                    state & LAST_READ == 0 || (upgrade.is_none() && writer.is_none());
-                if readers_turn && waiting.readers.front(pool).is_some() {
-                    if !self.admit_readers(&mut waiting.readers, woken) {
+            waiting.list.tidy(queue);
+            if let Some(node) = waiting.upgrade
+                && self.grant_upgrade(node, woken)
+            {
+                waiting.upgrade = None;
+            }
+            let list = &mut waiting.list;
+            if queue.state.load(Ordering::Acquire) & HANDOFF != 0 {
+                while let Some(node) = list.front(queue) {
+                    let kind = node.as_ref().payload();
+                    if !self.take_for_waiter(kind) {
                         break;
                     }
-                    continue;
-                }
-                let (node, list, held) = match (upgrade, writer) {
-                    (Some(node), _) => (node, &mut waiting.upgrades, 1),
-                    (None, Some(node)) => (node, &mut waiting.writers, 0),
-                    (None, None) => break,
-                };
-                if readers(state) != held {
-                    break;
-                }
-                let next = ((state - held * ONE_READER) | WRITER) & !LAST_READ;
-                if queue
-                    .state
-                    .compare_exchange(state, next, Ordering::AcqRel, Ordering::Acquire)
-                    .is_err()
-                {
-                    continue;
-                }
-                list.pop_front();
-                if !woken.grant(node) {
-                    self.undo_write_grant(held, state & LAST_READ);
+                    list.pop_front();
+                    if !woken.grant(node) {
+                        self.undo(kind);
+                    } else if kind == WRITE {
+                        break;
+                    }
                 }
             }
-            let mut clear = 0;
-            if waiting.readers.front(pool).is_none() {
-                clear |= QUEUED_R;
+            // While nobody is owed, the queue competes: wake the front if it
+            // could enter, or after any release even if it cannot yet, so a
+            // writer that overlapping readers keep out still loses, counts
+            // the bypass, and is owed a handoff in the end. Readers and an
+            // upgradable read behind a sharing front are woken with it
+            // while they could share.
+            if !queue.hands_off()
+                && let Some(front) = list.front(queue)
+            {
+                let mut sharing = queue.state.load(Ordering::Acquire);
+                let mut nudges = Nudges::new(woken, queue);
+                for (at, node) in list.iter().enumerate() {
+                    let kind = node.as_ref().payload();
+                    let fits = admits(kind, sharing);
+                    if at == 0 && (fits || wake_front) {
+                        nudges.nudge(node);
+                    }
+                    if !fits || kind == WRITE || (at > 0 && front.as_ref().payload() == WRITE) {
+                        break;
+                    }
+                    if at > 0 {
+                        nudges.nudge(node);
+                    }
+                    sharing = enter(kind, sharing);
+                }
+                nudges.finish();
             }
-            if waiting.writers.front(pool).is_none() && waiting.upgrades.front(pool).is_none() {
-                clear |= QUEUED_W;
+            if list.front(queue).is_none() && waiting.upgrade.is_none() {
+                QUEUED
+            } else {
+                0
             }
-            clear
         })
+    }
+}
+
+impl RawRwLock {
+    /// Puts back a grant whose waiter withdrew in the meantime. The drain
+    /// pass that called this goes on to reconsider the queue.
+    fn undo(&self, kind: usize) {
+        let gone = match kind {
+            READ => ONE_READER,
+            WRITE => WRITER,
+            _ => UPGRADABLE,
+        };
+        if kind == READ {
+            self.queue.state.fetch_sub(gone, Ordering::AcqRel);
+        } else {
+            self.queue.state.fetch_and(!gone, Ordering::AcqRel);
+        }
     }
 }
 
 impl Drop for RawRwLock {
     fn drop(&mut self) {
-        let pool = self.queue.pool();
+        let queue = &self.queue;
         // SAFETY: `&mut self` rules out a concurrent pass.
         self.waiting.with_mut(|waiting| unsafe {
             let waiting = &mut *waiting;
-            waiting.readers.clear(pool);
-            waiting.writers.clear(pool);
-            waiting.upgrades.clear(pool);
+            waiting.list.clear(queue);
+            if let Some(node) = waiting.upgrade.take() {
+                release_queued(node, queue);
+            }
         });
     }
 }
 
 /// A future's wait for one side of a [`RawRwLock`].
 pub(super) struct RwWait {
-    wait: Wait,
+    contend: Contend,
 }
 
 impl RwWait {
     pub(super) const fn new() -> Self {
-        Self { wait: Wait::new() }
+        Self {
+            contend: Contend::new(),
+        }
     }
 
     pub(super) fn is_queued(&self) -> bool {
-        self.wait.is_queued()
+        self.contend.is_queued()
     }
 
     pub(super) fn poll(&mut self, lock: &RawRwLock, kind: usize, waker: &Waker) -> Poll<()> {
-        if self.wait.is_queued() {
-            return self.wait.poll(&lock.queue, Some(waker)).map(drop);
-        }
-        if lock.try_kind(kind) {
-            return Poll::Ready(());
-        }
-        let flag = if kind == READ { QUEUED_R } else { QUEUED_W };
-        lock.enqueue(&mut self.wait, kind, waker, flag);
-        self.wait.poll(&lock.queue, None).map(drop)
+        self.contend.poll(lock, kind, waker)
     }
 
     /// Withdraws a pending wait, passing on a grant made meanwhile.
     pub(super) fn cancel(&mut self, lock: &RawRwLock, kind: usize) {
+        self.contend.cancel(lock, kind);
+    }
+}
+
+/// The upgradable read's wait to become the write.
+pub(super) struct UpgradeWait {
+    wait: Wait,
+    started: bool,
+}
+
+impl UpgradeWait {
+    pub(super) const fn new() -> Self {
+        Self {
+            wait: Wait::new(),
+            started: false,
+        }
+    }
+
+    /// Ready once the caller, which holds the upgradable read, holds the
+    /// write instead.
+    pub(super) fn poll(&mut self, lock: &RawRwLock, waker: &Waker) -> Poll<()> {
+        if self.wait.is_queued() {
+            return match self.wait.park(&lock.queue, Some(waker)) {
+                Park::Granted(_) => Poll::Ready(()),
+                Park::Nudged | Park::Pending => Poll::Pending,
+            };
+        }
+        if !self.started {
+            self.started = true;
+            lock.queue.state.fetch_or(UPGRADING, Ordering::AcqRel);
+        }
+        if lock.try_upgrade() {
+            return Poll::Ready(());
+        }
+        lock.enqueue(&mut self.wait, UPGRADE, waker);
+        match self.wait.park(&lock.queue, None) {
+            Park::Granted(_) => Poll::Ready(()),
+            Park::Nudged | Park::Pending => Poll::Pending,
+        }
+    }
+
+    /// Gives up an upgrade that has not completed, with the upgradable
+    /// read the caller held; a write granted meanwhile is released.
+    pub(super) fn cancel(&mut self, lock: &RawRwLock) {
         match self.wait.cancel(&lock.queue) {
-            Cancel::Idle => {}
-            Cancel::Withdrawn => lock.withdrawn(),
-            Cancel::Granted(_) => lock.unlock_kind(kind),
+            Cancel::Granted(_) => lock.write_unlock(),
+            Cancel::Withdrawn(_) => {
+                lock.upgradable_unlock();
+                lock.withdrawn(false);
+            }
+            Cancel::Idle => lock.upgradable_unlock(),
         }
     }
 }
