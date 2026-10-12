@@ -266,18 +266,20 @@ impl Options {
         self
     }
 
-    /// Start slowing foreground writes when the number of L0
-    /// SSTables reaches this threshold. Each affected write
-    /// incurs a small fixed delay, back-pressuring callers so
-    /// background compaction can catch up. `0` disables this
+    /// The number of L0 SSTables from which writes are slowed. No write is
+    /// ever delayed. At or past this count two things change: a write
+    /// that set [`crate::WriteOptions::no_slowdown`] is refused with
+    /// [`crate::Error::Busy`], and on a database with no compaction worker
+    /// and [`Options::inline_compaction`] on, each write runs one step of
+    /// the flush or compaction that is due. `0` disables this
     /// trigger. If both L0 triggers are enabled, this must be <=
     /// [`Options::level0_stop_writes_trigger`]. Default: 20.
     ///
     /// Level-style, with the same caveat as
     /// [`Options::level0_stop_writes_trigger`]: under FIFO and
     /// universal compaction the L0 file count is not what the picker
-    /// reduces, so this delay can become permanent rather than
-    /// transient.
+    /// reduces, so the count can stay at or past this threshold for
+    /// good.
     #[must_use]
     pub fn level0_slowdown_writes_trigger(mut self, level0_slowdown_writes_trigger: usize) -> Self {
         self.level0_slowdown_writes_trigger = level0_slowdown_writes_trigger;
@@ -285,9 +287,10 @@ impl Options {
     }
 
     /// Stop foreground writes entirely when the number of L0
-    /// SSTables reaches this threshold. Writers block on a
-    /// condvar that compaction notifies once it reduces the
-    /// count below the slowdown trigger. Plain writes, column-family
+    /// SSTables reaches this threshold. A stopped write applies nothing
+    /// and returns [`crate::Error::WouldBlock`] with a
+    /// [`crate::StallWait`], which completes once compaction has brought
+    /// the count back under the threshold. Plain writes, column-family
     /// writes (including creating and dropping a column family) and
     /// transactional commits that carry writes are stopped alike.
     /// `0` disables this trigger. Default: 36.
@@ -314,9 +317,12 @@ impl Options {
         self
     }
 
-    /// Start slowing writes when total bytes in L0 (regolith's
-    /// approximation of "pending compaction bytes") reach this
-    /// limit. `0` disables this trigger. If both pending-byte
+    /// The total bytes in L0 (regolith's approximation of "pending
+    /// compaction bytes") from which writes are slowed, exactly as
+    /// [`Options::level0_slowdown_writes_trigger`] slows them: no write
+    /// is delayed, a [`crate::WriteOptions::no_slowdown`] write is
+    /// refused, and with no worker and inline compaction on each write
+    /// runs one step. `0` disables this trigger. If both pending-byte
     /// triggers are enabled, this must be <=
     /// [`Options::hard_pending_compaction_bytes_limit`].
     /// Default: 64 GB.
@@ -329,7 +335,8 @@ impl Options {
         self
     }
 
-    /// Stop writes when total bytes in L0 reach this limit. `0`
+    /// Stop writes when total bytes in L0 reach this limit, as
+    /// [`Options::level0_stop_writes_trigger`] stops them. `0`
     /// disables this trigger. Default: 256 GB.
     #[must_use]
     pub fn hard_pending_compaction_bytes_limit(
