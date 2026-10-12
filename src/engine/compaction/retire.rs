@@ -180,6 +180,7 @@ mod tests {
                 file_size: 1,
                 num_entries: 2,
                 global_seq: None,
+                deletions: None,
             },
             Arc::new(SsTableReader::open(&path, file_id).unwrap()),
         )

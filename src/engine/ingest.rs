@@ -55,7 +55,9 @@ use super::manifest::{MAX_LEVELS, Version, VersionEdit, overlapping};
 use super::memtable::MemTable;
 use super::pending_outputs::PendingOutputs;
 use super::range_tombstone::table_key_range;
-use super::sstable::{LiveSst, SsTableMeta, SsTableReader, SsTableWriter, sst_filename};
+use super::sstable::{
+    DeletionCounter, Deletions, LiveSst, SsTableMeta, SsTableReader, SsTableWriter, sst_filename,
+};
 use super::{RegolithEngine, event_listener};
 
 /// Block-cache ids for tables being validated, handed out downward from the
@@ -79,6 +81,8 @@ struct StagedTable {
     largest: Vec<u8>,
     file_size: u64,
     num_entries: u64,
+    /// The table's point deletions, counted while it was validated.
+    deletions: Deletions,
     /// The column families the table holds keys of, ascending, each once.
     /// The install fences them in the ordered step, as a write's keys are.
     families: Vec<u32>,
@@ -369,7 +373,7 @@ impl RegolithEngine {
         )
         .map_err(named)?;
         let mut families = Vec::new();
-        let (points, num_entries) = self
+        let (points, num_entries, deletions) = self
             .validate_entries(&reader, validate_user_key, &mut families)
             .map_err(named)?;
         let tombstones = reader.range_tombstones();
@@ -409,6 +413,7 @@ impl RegolithEngine {
             largest,
             file_size,
             num_entries,
+            deletions,
             families,
             pending,
         })
@@ -471,23 +476,30 @@ impl RegolithEngine {
 
     /// Stream every entry of a staged table once, holding one data block:
     /// sizes, column families, and strictly ascending user keys. Returns
-    /// the first and last user key, and the entry count.
+    /// the first and last user key, the entry count, and the table's
+    /// deletions, counted here because every entry is in hand anyway.
     #[allow(clippy::type_complexity)]
     fn validate_entries<F>(
         &self,
         reader: &SsTableReader,
         validate_user_key: &mut F,
         families: &mut Vec<u32>,
-    ) -> io::Result<(Option<(Vec<u8>, Vec<u8>)>, u64)>
+    ) -> io::Result<(Option<(Vec<u8>, Vec<u8>)>, u64, Deletions)>
     where
         F: FnMut(&[u8]) -> io::Result<()>,
     {
         let mut first: Option<Vec<u8>> = None;
         let mut last: Vec<u8> = Vec::new();
         let mut count = 0u64;
+        // Each key once and every entry at the one sequence the ingest
+        // draws, so nothing in the table hides anything else in it: the
+        // deletions are the point deletions, and their sequence is filled in
+        // at install.
+        let mut deletions = DeletionCounter::default();
         let mut entries = reader.iter_internal_stream(&self.cache)?;
         while let Some((ik, value)) = entries.next_entry()? {
-            let (user_key, _, _) = decode_internal_key(&ik);
+            let (user_key, _, value_type) = decode_internal_key(&ik);
+            deletions.see(user_key, 0, value_type, true);
             self.validate_prefixed_key_size(user_key)?;
             self.validate_value_size(&value)?;
             validate_user_key(user_key).map_err(|e| {
@@ -513,7 +525,7 @@ impl RegolithEngine {
             last.extend_from_slice(user_key);
             count += 1;
         }
-        Ok((first.map(|first| (first, last)), count))
+        Ok((first.map(|first| (first, last)), count, deletions.counted()))
     }
 
     /// The ordered unit that installs one staged table: steps 1 to 6 of the
@@ -587,6 +599,7 @@ impl RegolithEngine {
             largest,
             file_size,
             num_entries,
+            deletions,
             pending,
             ..
         } = table;
@@ -599,6 +612,11 @@ impl RegolithEngine {
                 file_size,
                 num_entries,
                 global_seq: Some(seq),
+                // Every entry reads at `seq`, the point deletions included.
+                deletions: Some(Deletions {
+                    newest_seq: if deletions.points > 0 { seq } else { 0 },
+                    ..deletions
+                }),
             },
             Arc::new(reader),
         );

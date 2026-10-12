@@ -177,9 +177,13 @@ pub enum Ticker {
     /// block still uses it, uncached. A steady count means the cache is too
     /// small for the blocks readers hold at once.
     BlockCacheAddRefusedHeld = 36,
+    /// Compaction jobs run because more than half of the entries they read
+    /// were deletions and the entries those delete. Each is also counted in
+    /// [`Ticker::CompactionCount`]. Level and universal compaction only.
+    CompactionDeletionTriggered = 37,
 }
 
-const NUM_TICKERS: usize = 37;
+const NUM_TICKERS: usize = 38;
 
 impl Ticker {
     /// Every defined ticker, in discriminant order. Adding a variant
@@ -222,6 +226,7 @@ impl Ticker {
         Ticker::ManifestTailDiscarded,
         Ticker::ManifestTailDiscardedBytes,
         Ticker::BlockCacheAddRefusedHeld,
+        Ticker::CompactionDeletionTriggered,
     ];
 
     /// Stable string name for exporting to monitoring systems.
@@ -264,6 +269,7 @@ impl Ticker {
             Ticker::ManifestTailDiscarded => "regolith.manifest.tail_discarded",
             Ticker::ManifestTailDiscardedBytes => "regolith.manifest.tail_discarded_bytes",
             Ticker::BlockCacheAddRefusedHeld => "regolith.block_cache.add_refused_held",
+            Ticker::CompactionDeletionTriggered => "regolith.compaction.deletion_triggered",
         }
     }
 }
