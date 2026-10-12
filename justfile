@@ -285,8 +285,10 @@ loom-sync:
 # The five sync models whose three threads all contend for one lock or
 # semaphore, at preemption bound 2 instead of the bound 1 `loom-sync`
 # runs them at: their `#[ignore]`d twins, or the one `model` names.
-# TIMING_PLACEHOLDER, so the nightly CI run carries them, one job per
-# model, not the per-change one.
+# Four of them take 43 to 79 minutes each on a workstation; the fifth, the
+# upgradable read, runs a smaller scenario at bound 2 and takes 10 s (its
+# full one never finished). So the nightly CI run carries them, one job
+# per model, not the per-change one.
 loom-sync-deep model="":
     RUSTFLAGS="--cfg loom" cargo test --release --test loom_sync -- --ignored {{model}}
 
