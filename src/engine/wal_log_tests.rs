@@ -188,7 +188,9 @@ fn a_closed_log_replays_whole_and_is_vouched_for_by_close() {
             vec![put(b"k", b"v", 1)]
         );
         // CLOSE proves the whole file durable: damage in it refuses the open
-        // instead of being dropped as a tail.
+        // instead of being dropped as a tail. The file is rewritten with no
+        // handle of the log left on it.
+        drop(log);
         let mut bytes = std::fs::read(&path).unwrap();
         let at = place.offset as usize + 30;
         bytes[at] ^= 0xFF;

@@ -99,6 +99,10 @@ impl Env for StdEnv {
 
     /// A log written with positional writes: no cursor, no lock, and no
     /// `O_APPEND`, under which Linux ignores the offset of a `pwrite`.
+    ///
+    /// Opened with the host's default sharing, as every other file here is:
+    /// on Windows a second handle may read the log while this one writes
+    /// it, which is how a copy of a live directory is taken.
     #[cfg(any(unix, windows, target_os = "wasi"))]
     fn open_log(&self, path: &Path, mode: WriteMode) -> io::Result<Box<dyn LogFile>> {
         let file = OpenOptions::new()

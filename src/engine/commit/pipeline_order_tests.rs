@@ -175,8 +175,15 @@ fn a_units_body_runs_holding_the_round() {
     );
 }
 
-/// Copy the database directory `from` as a power cut would leave it if
-/// every byte written so far had reached the disk.
+/// Copy the directory `from` of a database that is open, as a power cut
+/// would leave it if every byte written so far had reached the disk.
+///
+/// The lock file is left out, as every copy of a live directory in `tests/`
+/// leaves it out: it is no byte of the database, and Windows lets no other
+/// handle read it while the database holds it. Every other file is read
+/// through a second handle. The database's own handles on its log and its
+/// manifest share reads, on Windows too (`StdEnv::open_log`), so the read
+/// sees every byte written so far.
 fn copy_dir(from: &std::path::Path, to: &std::path::Path) {
     std::fs::create_dir_all(to).unwrap();
     for entry in std::fs::read_dir(from).unwrap() {
@@ -184,8 +191,8 @@ fn copy_dir(from: &std::path::Path, to: &std::path::Path) {
         let target = to.join(entry.file_name());
         if entry.file_type().unwrap().is_dir() {
             copy_dir(&entry.path(), &target);
-        } else {
-            std::fs::copy(entry.path(), target).unwrap();
+        } else if entry.file_name() != "LOCK" {
+            std::fs::write(target, std::fs::read(entry.path()).unwrap()).unwrap();
         }
     }
 }
