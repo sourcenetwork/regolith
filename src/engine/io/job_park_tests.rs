@@ -211,3 +211,61 @@ fn a_blocked_thread_still_wakes_when_the_job_lands() {
         assert!(blocked.join().unwrap(), "landed, not parked");
     });
 }
+
+/// Wakes the waker its step was given before it hands itself back: the wait
+/// it registered for ended while the step was still on its way out. Takes
+/// what the other queue's inbox holds at that moment, as that queue's poll
+/// would.
+struct WokenBeforeItParked {
+    job: std::sync::Weak<Job>,
+    other: Arc<QueueShared>,
+    told_while_claimed: Arc<AtomicUsize>,
+}
+
+impl JobBody for WokenBeforeItParked {
+    fn run(self: Box<Self>) {}
+
+    fn step(self: Box<Self>, waker: &Waker) -> Step {
+        waker.wake_by_ref();
+        let job = self
+            .job
+            .upgrade()
+            .expect("the job is alive while it is stepped");
+        let told = inbox(&self.other, &job);
+        self.told_while_claimed
+            .fetch_add(told.len(), Ordering::SeqCst);
+        Step::Parked(self)
+    }
+
+    fn release(self: Box<Self>) {}
+}
+
+/// A wait that ends before the job finished parking: the queues are not
+/// told while the thread that stepped it still holds the claim, since one
+/// told then would try the claim, lose, and drop the job from its line.
+/// They are told when the claim is given up, with the job free.
+#[test]
+fn a_wake_that_comes_before_the_park_tells_the_queues_once_the_claim_is_given_up() {
+    let (stepper, other) = (queue(), queue());
+    let told_while_claimed = Arc::new(AtomicUsize::new(0));
+    let job = Arc::new_cyclic(|job| {
+        Job::fresh(Box::new(WokenBeforeItParked {
+            job: job.clone(),
+            other: Arc::clone(&other),
+            told_while_claimed: Arc::clone(&told_while_claimed),
+        }))
+    });
+    assert!(job.register(Arc::clone(&stepper)));
+    assert!(job.register(Arc::clone(&other)));
+    assert!(job.claim());
+    assert!(!job.step(&unpark_waker(&job, &stepper)));
+    assert_eq!(
+        told_while_claimed.load(Ordering::SeqCst),
+        0,
+        "a queue was told the job may go on while it was still claimed"
+    );
+    assert!(job.is_runnable());
+    assert_eq!(inbox(&stepper, &job), "R");
+    assert_eq!(inbox(&other, &job), "R", "told when the claim was given up");
+    assert!(job.claim(), "and the queue told then gets the claim");
+}
