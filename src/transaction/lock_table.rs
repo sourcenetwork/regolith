@@ -432,9 +432,9 @@ impl Note {
     }
 }
 
-/// The key locks a pessimistic commit holds until its outcome is delivered:
-/// released then, so no transaction that takes one of them can read past a
-/// commit that is written but not yet visible.
+/// The key locks a pessimistic commit holds while its group lands, released
+/// by the thread that lands it: once the commit is applied and visible (and
+/// durable at `Immediate`), whether or not its outcome was delivered.
 pub(super) struct LandingLocks {
     table: Arc<LockTable>,
     owner: Arc<LockOwner>,
@@ -466,6 +466,12 @@ impl LandingLocks {
             key_lock.lock.unlock(owner);
             self.table.unpin(key, key_lock);
         }
+    }
+}
+
+impl Delivery for LandingLocks {
+    fn deliver(&self) {
+        self.release();
     }
 }
 
