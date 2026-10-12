@@ -105,6 +105,36 @@ impl Transaction {
     /// Dropping the ticket never cancels the commit. Dropping the queue
     /// delivers its tickets on the dropping thread (see
     /// [`IoQueue`](crate::IoQueue)).
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use regolith::{OptimisticTransactionDb, Options, TransactionError, TxnOptions};
+    ///
+    /// let db = OptimisticTransactionDb::open("rows", Options::memory())?;
+    /// // This thread's queue: the outcomes of its commits are delivered here.
+    /// let mut queue = db.db().io_queue();
+    /// let on_queue = TxnOptions::new().io_queue(queue.id());
+    ///
+    /// let txn = db.begin(&on_queue);
+    /// txn.put(b"row", b"1")?;
+    /// let ticket = txn.commit_nowait();
+    /// // The commit is decided and written, and the call did not wait for a
+    /// // sync. `block_on` polls the queue until the ticket completes. (An
+    /// // in-memory database has no sync to wait for, so here it already has.)
+    /// let receipt = queue.block_on(ticket)?;
+    /// assert!(receipt.seq() > 0);
+    /// assert_eq!(db.db().get(b"row")?.as_deref(), Some(&b"1"[..]));
+    ///
+    /// // A lost race comes through the ticket too, never out of the call.
+    /// let (one, two) = (db.begin(&on_queue), db.begin(&on_queue));
+    /// one.put(b"row", b"one")?;
+    /// two.put(b"row", b"two")?;
+    /// let (one, two) = (one.commit_nowait(), two.commit_nowait());
+    /// assert!(queue.block_on(one).is_ok());
+    /// assert!(matches!(queue.block_on(two), Err(TransactionError::Conflict(_))));
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     pub fn commit_nowait(mut self) -> CommitTicket {
         let engine = Arc::clone(&self.engine);
         let completion = CommitTicket::completion(Arc::downgrade(&engine));

@@ -144,6 +144,72 @@ impl Transaction {
     /// under it, and regolith cannot see that. A key that does not hold
     /// the parts scheme the operator's `touches` understands should not be
     /// read this way.
+    ///
+    /// # Example
+    ///
+    /// `Fields` is the operator of the [`crate::MergeOperator::touches`]
+    /// example: a value is a stock level and a price, one byte each, and an
+    /// operand adds to one of them.
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    ///
+    /// use regolith::{
+    ///     IsolationLevel, OptimisticTransactionDb, Options, TransactionError, TxnOptions,
+    /// };
+    /// # use regolith::MergeOperator;
+    /// # const STOCK: u8 = 0;
+    /// # const PRICE: u8 = 1;
+    /// # struct Fields;
+    /// # impl MergeOperator for Fields {
+    /// #     fn name(&self) -> &'static str {
+    /// #         "fields"
+    /// #     }
+    /// #     fn full_merge(&self, _key: &[u8], base: Option<&[u8]>, operands: &[&[u8]]) -> Option<Vec<u8>> {
+    /// #         let mut fields: [u8; 2] = base.map_or(Some([0; 2]), |base| base.try_into().ok())?;
+    /// #         for &operand in operands {
+    /// #             let &[part, delta] = operand else { return None };
+    /// #             let field = fields.get_mut(usize::from(part))?;
+    /// #             *field = field.wrapping_add(delta);
+    /// #         }
+    /// #         Some(fields.to_vec())
+    /// #     }
+    /// #     fn touches(&self, _key: &[u8], operand: &[u8], parts: &[u32]) -> bool {
+    /// #         operand.first().is_none_or(|part| parts.contains(&u32::from(*part)))
+    /// #     }
+    /// # }
+    ///
+    /// let options = Options::memory().merge_operator(Some(Arc::new(Fields)));
+    /// let db = OptimisticTransactionDb::open("items", options)?
+    ///     .with_isolation(IsolationLevel::DefraLevel);
+    /// db.db().put(b"item", &[10, 50])?;
+    /// let price = [u32::from(PRICE)];
+    ///
+    /// // The whole value comes back, and the decision rests on the price:
+    /// // stock that arrives before the commit is no conflict.
+    /// let txn = db.begin(&TxnOptions::new());
+    /// let item = txn.get_parts(b"item", &price)?.expect("the item exists");
+    /// assert_eq!(item, [10, 50]);
+    /// db.db().merge(b"item", &[STOCK, 5])?;
+    /// txn.put(b"quote", &item[1..])?;
+    /// txn.commit()?;
+    ///
+    /// // A read that found nothing decided on the key's absence, which any
+    /// // write of the key ends.
+    /// let txn = db.begin(&TxnOptions::new());
+    /// assert!(txn.get_parts(b"new-item", &price)?.is_none());
+    /// db.db().merge(b"new-item", &[STOCK, 1])?;
+    /// txn.put(b"quote", b"none")?;
+    /// assert!(matches!(txn.commit(), Err(TransactionError::Conflict(_))));
+    ///
+    /// // Naming no parts reads the value and validates nothing.
+    /// let txn = db.begin(&TxnOptions::new());
+    /// txn.get_parts(b"item", &[])?;
+    /// db.db().merge(b"item", &[PRICE, 5])?;
+    /// txn.put(b"note", b"seen")?;
+    /// txn.commit()?;
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     pub fn get_parts(&self, key: &[u8], parts: &[u32]) -> TxResult<Option<DbSlice>> {
         let _scope = self.read_scope();
         if !self.projects() {

@@ -212,6 +212,55 @@ impl Transaction {
     /// the order changes. Reverse starts at the highest key below `end` and
     /// walks down to `start` inclusive, both sides of the merge reversed
     /// together.
+    ///
+    /// # Example
+    ///
+    /// A transaction counts the rows of a range and stores the count. With
+    /// [`ScanCheck::Range`] the count is a validated read of the whole
+    /// range, so a row that appears in it before the commit is a conflict.
+    ///
+    /// ```
+    /// use regolith::{
+    ///     Access, OptimisticTransactionDb, Options, ScanCheck, ScanDirection, TransactionError,
+    ///     TxnOptions,
+    /// };
+    ///
+    /// let db = OptimisticTransactionDb::open("seats", Options::memory())?;
+    /// db.db().put(b"seat/1", b"taken")?;
+    /// let (first, end) = (Some(&b"seat/"[..]), Some(&b"seat0"[..]));
+    ///
+    /// let txn = db.begin(&TxnOptions::new());
+    /// let mut cursor = txn.cursor(first, end, ScanDirection::Forward, ScanCheck::Range);
+    /// let mut taken = 0;
+    /// loop {
+    ///     // A page holds the entries that fit its byte budget, one at least.
+    ///     let page = cursor.next_page(&txn, 64 * 1024)?;
+    ///     taken += page.entries.len();
+    ///     if page.done {
+    ///         break;
+    ///     }
+    /// }
+    /// assert_eq!(taken, 1);
+    ///
+    /// // Another writer takes a seat inside the counted range.
+    /// db.db().put(b"seat/2", b"taken")?;
+    ///
+    /// txn.put(b"seats-taken", b"1")?;
+    /// let Err(TransactionError::Conflict(lost)) = txn.commit() else {
+    ///     panic!("a seat appeared in the counted range");
+    /// };
+    /// assert_eq!(lost.mine(), Access::ScannedRange);
+    /// assert_eq!(lost.key(), b"seat/2");
+    ///
+    /// // The same steps through a plain scan commit a count that is stale.
+    /// let txn = db.begin(&TxnOptions::new());
+    /// let taken = txn.scan_stream(first, end).count();
+    /// db.db().put(b"seat/3", b"taken")?;
+    /// txn.put(b"seats-taken", b"2")?;
+    /// txn.commit()?;
+    /// assert_eq!(taken, 2);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     pub fn cursor(
         &self,
         start: Option<&[u8]>,

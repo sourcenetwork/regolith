@@ -208,6 +208,41 @@ impl OptimisticTransactionDb {
     /// policy, and it gets the same previous conflict. An error from `f` ends
     /// the attempt with [`TransactError::Closure`] and is not retried; any
     /// failure but a conflict ends it with [`TransactError::Engine`].
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use regolith::{OptimisticTransactionDb, Options, RetryPolicy, TransactionError, ready};
+    ///
+    /// let db = OptimisticTransactionDb::open("counter", Options::memory())?;
+    /// db.db().put(b"n", &41u64.to_be_bytes())?;
+    /// // Flushed to a table the block cache has not read: the read below
+    /// // misses the cache once.
+    /// db.db().flush()?;
+    ///
+    /// let mut queue = db.db().io_queue();
+    /// let policy = RetryPolicy::default();
+    /// let mut misses = 0;
+    /// let attempt = db.transact_async(queue.id(), &policy, async |txn, _lost| {
+    ///     // `ready` waits out a miss and runs the read again, so the attempt
+    ///     // is suspended, not ended.
+    ///     let read = ready(|| {
+    ///         let read = txn.get_for_update(b"n");
+    ///         misses += usize::from(matches!(read, Err(TransactionError::WouldBlock(_))));
+    ///         read
+    ///     });
+    ///     let n = read.await?.map_or(0, |n| u64::from_be_bytes(n.try_into().expect("eight bytes")));
+    ///     txn.put(b"n", &(n + 1).to_be_bytes())?;
+    ///     Ok::<_, TransactionError>(n + 1)
+    /// });
+    ///
+    /// // No runtime: this thread polls the future, and its own queue whenever
+    /// // the future waits.
+    /// let (n, _receipt) = queue.block_on(attempt)?;
+    /// assert_eq!((n, misses), (42, 1));
+    /// assert_eq!(db.db().get(b"n")?, Some(42u64.to_be_bytes().to_vec()));
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     pub fn transact_async<T, E>(
         &self,
         queue: QueueId,
@@ -239,6 +274,43 @@ impl OptimisticTransactionDb {
     ///
     /// `f` may run more than once. Work with effects outside the transaction
     /// belongs before the call, or must be idempotent.
+    ///
+    /// # Example
+    ///
+    /// A counter another writer gets to first:
+    ///
+    /// ```
+    /// use regolith::{
+    ///     OptimisticTransactionDb, Options, RetryPolicy, TransactError, TransactionError,
+    /// };
+    ///
+    /// let db = OptimisticTransactionDb::open("counter", Options::memory())?;
+    /// let number = |held: Option<Vec<u8>>| {
+    ///     held.map_or(0, |n| u64::from_be_bytes(n.try_into().expect("eight bytes")))
+    /// };
+    ///
+    /// let mut runs = 0;
+    /// let (seen, _receipt) = db.transact(&RetryPolicy::new(3), |txn, lost| {
+    ///     runs += 1;
+    ///     let n = number(txn.get_for_update(b"n")?);
+    ///     if lost.is_none() {
+    ///         // On the first run only, another writer commits in between.
+    ///         db.db().put(b"n", &10u64.to_be_bytes())?;
+    ///     }
+    ///     txn.put(b"n", &(n + 1).to_be_bytes())?;
+    ///     Ok::<_, TransactionError>(n)
+    /// })?;
+    ///
+    /// // The first run lost its commit. The second began after the winner,
+    /// // read its value and committed on top of it.
+    /// assert_eq!((runs, seen), (2, 10));
+    /// assert_eq!(number(db.db().get(b"n")?), 11);
+    ///
+    /// // An error from the closure ends the call and is not retried.
+    /// let refused = db.transact(&RetryPolicy::default(), |_txn, _lost| Err::<(), _>("not today"));
+    /// assert!(matches!(refused, Err(TransactError::Closure("not today"))));
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     pub fn transact<T, E>(
         &self,
         policy: &RetryPolicy,
