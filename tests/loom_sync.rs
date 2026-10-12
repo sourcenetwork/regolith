@@ -33,6 +33,12 @@
 //! - **The upgradable read**: it shares with readers, upgrades while they
 //!   come and go, and excludes writers.
 //!
+//! - **A drain that ends**: a waiter that serves the queue itself while the
+//!   holder lets go and barges back runs a bounded number of passes and is
+//!   served. That model counts passes, which the public API cannot see, so
+//!   it lives in `src/sync/loom_model.rs`, with a calibration that writes
+//!   the nudge marker the wrong way and must fail.
+//!
 //! The waiter-node free list is a pass-through to the allocator under loom
 //! (see `Pool`), so node recycling itself is covered by miri and the unit
 //! tests rather than here. Two calibration models deliberately expect
@@ -887,6 +893,17 @@ fn a_cancelled_event_wait_racing_the_set_strands_nobody() {
             waiter.join().expect("waiter");
         },
     );
+}
+
+#[test]
+fn a_waiter_serving_the_queue_is_served_while_the_holder_barges() {
+    regolith::loom_exports::sync::a_waiter_serving_the_queue_is_served_while_the_holder_barges();
+}
+
+#[test]
+#[should_panic(expected = "the drain ran")]
+fn calibration_a_marker_lowered_on_a_pending_nudge_keeps_the_drain_passing() {
+    regolith::loom_exports::sync::calibration_a_marker_lowered_on_a_pending_nudge_keeps_the_drain_passing();
 }
 
 #[test]

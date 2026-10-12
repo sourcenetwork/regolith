@@ -37,7 +37,9 @@
 //! release with waiters *nudges* the oldest ones it could serve: they stay
 //! queued, are woken, and compete again when polled. [`NUDGE_OUT`] marks a
 //! nudge whose waiter has not polled yet; releases skip the drain pass
-//! while it is set, since a wake is already on its way.
+//! while it is set, since a wake is already on its way. So a drain runs at
+//! most one more pass for each release that found the marker down, and none
+//! for the releases that come while a nudge is out.
 //!
 //! A nudged waiter that loses again counts one bypass. The attempt that
 //! would be its [`MAX_BYPASS`](super::MAX_BYPASS)th loss marks it owed
@@ -82,8 +84,15 @@ pub(super) fn wants_drain(prev: usize) -> bool {
 
 /// The nudges of one pass. It raises [`NUDGE_OUT`] before the first nudge
 /// leaves, so a waiter that polls at once still finds the marker to take
-/// back, and lowers it again if every nudge found its waiter gone or
-/// already nudged.
+/// back, and lowers it again only if every nudge found its waiter gone.
+///
+/// A waiter that still carries an earlier nudge keeps the marker up. Were
+/// it lowered then, every release would ask for a pass until that waiter
+/// polls; and when that waiter is the thread running these passes (it
+/// queued and took the drain role in the same poll), it cannot poll while
+/// they keep coming, so it would be passed over for as long as releases
+/// arrived. With the marker up those releases stay one read-modify-write,
+/// the drain ends, and the waiter retries.
 pub(super) struct Nudges<'p, 'a> {
     woken: &'p mut WakeList<'a>,
     queue: &'p WaitQueue,
