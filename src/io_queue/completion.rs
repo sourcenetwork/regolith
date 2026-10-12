@@ -9,9 +9,10 @@
 //! ```
 //!
 //! - **Decide** stores the outcome. Whoever learns it does this, on any
-//!   thread: a worker that ran a foreground job, or, for a commit whose group
+//!   thread: a worker that ran a foreground job, or, for a commit that
 //!   was still owed its fsync, the delivering thread itself, which resolves
-//!   the outcome from the group the moment it is told the group landed.
+//!   the outcome from the commit's slot the moment it is told the commit
+//!   landed.
 //! - **Deliver** is the one step that makes the outcome visible to the
 //!   ticket's holder. It runs on the thread that owns the ticket's queue, at
 //!   the `poll` that takes the completion in (or on the deciding thread, for

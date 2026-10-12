@@ -1772,7 +1772,7 @@ impl Transaction {
     ///
     /// The pessimistic horizon is sampled with the lock held: a
     /// committing writer's commit is visible before its lock is released
-    /// (at once for `commit`, when its group lands for `commit_nowait`), and
+    /// (at once for `commit`, when the commit lands for `commit_nowait`), and
     /// the lock's state word is the release/acquire edge between them, so
     /// nothing newer can hide behind it.
     /// Under a lock this transaction already holds nothing can have

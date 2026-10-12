@@ -18,7 +18,7 @@
 //!   is resolved, and the transaction's callbacks run, at the poll that
 //!   delivers it, on the queue's thread.
 //!
-//! A pessimistic commit's key locks are released when its group lands, by
+//! A pessimistic commit's key locks are released when the commit lands, by
 //! the thread that lands it: the commit is applied and visible by then (and
 //! durable at `Immediate`), so the next holder reads it, and no transaction
 //! waits for this one's owner to poll its queue (`LockTable.tla`,
@@ -98,7 +98,7 @@ impl Transaction {
     ///   returns. A pessimistic transaction's key locks are held until the
     ///   commit lands (applied and visible, and durable at `Immediate`), so
     ///   no transaction that takes one reads past a commit written but not
-    ///   yet visible. They are released by the thread that lands the group,
+    ///   yet visible. They are released by the thread that lands the commit,
     ///   whether or not this transaction's queue was polled since: another
     ///   transaction never waits for this one's outcome to be delivered.
     ///

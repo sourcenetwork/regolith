@@ -1,15 +1,16 @@
-//! Group-commit behaviour through the public API.
+//! Commits that share a sync of the log, through the public API.
 //!
 //! The three properties these tests defend, in priority order:
 //!
-//! 1. A snapshot never observes a torn batch. The read horizon moves only
-//!    after a whole group is durable and applied.
-//! 2. Every writer that returns `Ok` really did commit, and every writer in
-//!    a group that failed learns it did not.
-//! 3. N concurrent durable writers cost far fewer than N fsyncs, which is
-//!    the whole point of the change. Threads started together overlap only
-//!    by luck, so that test holds the commit pipeline until every writer is
-//!    queued, which needs the engine's internals: it lives beside them, in
+//! 1. A snapshot never observes a torn batch. The read horizon passes a
+//!    commit only once the whole of it is durable and applied.
+//! 2. Every writer that returns `Ok` really did commit, and every writer
+//!    whose commit a failed sync discarded learns it did not.
+//! 3. N concurrent durable writers cost far fewer than N fsyncs: one sync
+//!    covers every record written when it starts. Threads started together
+//!    overlap only by luck, so that test holds the sync round until every
+//!    writer's write is decided and waits behind it, which needs the
+//!    engine's internals: it lives beside them, in
 //!    `src/engine/commit/overlap_tests.rs`, and still writes through `Db`.
 
 use std::sync::Arc;
@@ -42,8 +43,8 @@ fn a_serial_durable_writer_still_syncs_once_per_write() {
 
 #[test]
 fn a_snapshot_never_observes_a_torn_batch() {
-    // The invariant the engine already guaranteed and group commit must
-    // not break: a batch is all-or-nothing to every reader.
+    // A batch is all-or-nothing to every reader, however many commits
+    // share its sync.
     const BATCH: usize = 32;
     const ROUNDS: usize = 400;
 
@@ -189,7 +190,7 @@ fn every_committed_write_survives_a_reopen() {
 #[test]
 fn every_synced_write_replays_from_the_wal_without_a_close() {
     // No `close()` and a write buffer large enough that nothing flushes,
-    // so recovery has to come out of the grouped WAL records alone.
+    // so recovery has to come out of the WAL records alone.
     const WRITERS: usize = 4;
     const PER_WRITER: usize = 200;
 
@@ -276,8 +277,9 @@ fn mixed_durability_writers_all_commit() {
 
 #[test]
 fn administrative_operations_still_exclude_writers() {
-    // `compact_range` and `close` take the same pipeline mutex the commit
-    // leader does, so they cannot interleave with a group.
+    // `compact_range` and `close` run their steps as ordered units of the
+    // commit ring, in ring order with the writes, so they cannot interleave
+    // with a commit.
     let dir = TempDir::new().unwrap();
     let db =
         Arc::new(Db::open(dir.path(), Options::default().write_buffer_size(8 * 1024)).unwrap());
@@ -334,7 +336,7 @@ fn a_batch_of_many_operations_gets_one_sync() {
     assert_eq!(
         stats.get_ticker(Ticker::WalSyncCount),
         1,
-        "a 256-operation batch is one group and therefore one fdatasync"
+        "a 256-operation batch is one commit and therefore one fdatasync"
     );
     for i in 0..256 {
         assert_eq!(

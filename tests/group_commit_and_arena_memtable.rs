@@ -1,4 +1,5 @@
-//! Harder adversarial probes on group commit and the arena memtable.
+//! Harder adversarial probes on commits that share a sync and on the arena
+//! memtable.
 //!
 //! These go past `tests/adversarial_mvcc.rs` in three directions the
 //! existing probes do not cover: snapshots that are *held* across
@@ -31,7 +32,7 @@ fn batch_key(writer: usize, round: usize, k: usize) -> Vec<u8> {
 
 /// A snapshot taken once and read for the whole run. Every read surface
 /// must agree with every other on it, and none may ever see a prefix of
-/// a batch, no matter how many groups, flushes and compactions land
+/// a batch, no matter how many commits, flushes and compactions land
 /// after the snapshot was captured.
 #[test]
 fn one_long_lived_snapshot_agrees_with_itself_across_every_read_surface() {

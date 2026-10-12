@@ -163,8 +163,8 @@ impl Error {
             Self::InvalidArgument(message) => {
                 std::io::Error::new(std::io::ErrorKind::InvalidInput, message)
             }
-            // Carried typed, so a write the commit leader refuses for a
-            // dropped family reaches the caller as this variant.
+            // Carried typed, so a write refused for a dropped family when
+            // it is decided reaches the caller as this variant.
             typed @ Self::InvalidColumnFamily(_) => {
                 std::io::Error::new(std::io::ErrorKind::InvalidInput, typed)
             }
