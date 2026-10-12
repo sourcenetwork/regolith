@@ -40,7 +40,8 @@
 //!
 //! The full-scale tests are larger versions of the same
 //! properties; see each one's doc comment for its measured runtime.
-//! `just mvcc` runs the fast set, `just mvcc-slow` the full-scale set.
+//! Every test here is in the default run. `just mvcc` runs the file on
+//! its own, and `just mvcc-slow` one test at a time with its output shown.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Barrier};
@@ -108,8 +109,7 @@ fn a_snapshots_view_is_byte_identical_for_its_whole_life() {
 /// shape the original probe ran at: 2000 keys, 6 writer threads and
 /// 120000 writes racing a snapshot that pins every version of them.
 ///
-/// Kept out of the
-/// default run so `cargo test` stays fast; `just mvcc-slow` runs it.
+/// `just mvcc-slow` shows the counts it prints.
 #[test]
 fn snapshot_stability_at_full_scale() {
     let counts = run_snapshot_stability(&StabilityScale {
@@ -162,8 +162,7 @@ fn a_reader_never_observes_a_write_batch_half_applied() {
 /// Full-scale version of
 /// [`a_reader_never_observes_a_write_batch_half_applied`].
 ///
-/// Run with
-/// `just mvcc-slow`.
+/// `just mvcc-slow` shows the counts it prints.
 #[test]
 fn batch_atomicity_at_full_scale() {
     let (checks, generations) = run_batch_atomicity(&AtomicityScale {
@@ -231,8 +230,7 @@ fn a_repeated_read_of_one_key_never_travels_backwards() {
 /// for the mechanism. Measured clean 3 of 3 runs after, at about 1M
 /// reads across 192k writes per run.
 ///
-/// Run with
-/// `just mvcc-slow`.
+/// `just mvcc-slow` shows the counts it prints.
 #[test]
 fn monotonic_reads_at_full_scale() {
     let outcome = run_monotonic_reads(&MonotonicScale {

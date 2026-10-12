@@ -168,8 +168,3 @@ jobs:
             [ "$code" -ne 124 ] || echo "::error::miri did not finish within 110 minutes and was stopped"
             exit "$code"
           }
-
-  # Long-running stress, soak, and fault-injection tests. Gated behind
-  # `#[ignore]` in the main crate so `cargo test` stays fast for PRs;
-  # this job unlocks them via `--ignored`. Runs on the nightly schedule,
-  # manual dispatch, or direct pushes to `main`, never on PRs.
