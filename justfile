@@ -432,6 +432,12 @@ tla:
         # bad. Both name the invariant, and both count.
         broke=$(sed -n -e 's/^Error: Invariant \(.*\) is violated\.$/\1/p' \
                        -e 's/^Error: Invariant \(.*\) is violated by the initial state:$/\1/p' <<<"$out" | head -1)
+        # A broken promise about whole runs (a PROPERTY) is reported without its name. A row that
+        # plants a bug against one names exactly one PROPERTY in its configuration, so that is the
+        # one that broke.
+        if [ -z "$broke" ] && grep -q '^Error: Temporal properties were violated\.$' <<<"$out"; then
+            broke=$(sed -n 's/^PROPERTY \(.*\)$/\1/p' "$cfg.cfg" | head -1)
+        fi
         states=$(sed -n 's/^.* states generated, \([0-9,]*\) distinct states found.*$/\1/p' <<<"$out" | tail -1)
         took=$(sed -n 's/^Finished in \(.*\) at (.*$/\1/p' <<<"$out" | tail -1)
         if [ "$code" -eq 124 ]; then
@@ -766,11 +772,17 @@ tla:
     check MC_OwedStep_Red_FlushOwesNothing             RED L0Bounded
     check MC_OwedStep_Red_StepUntilIdle                RED OneStepPerWrite
     # regolith::sync's locks after D49: barging with bounded bypass, for
-    # Mutex, Semaphore and ReentrantMutex. Lean: Regolith/Sync.lean,
-    # mutual_exclusion, bounded_bypass, owed_exclusive.
+    # Mutex, Semaphore and ReentrantMutex, one step per atomic instruction
+    # of src/sync. Lean: Regolith/Sync.lean, mutual_exclusion,
+    # bounded_bypass, owed_at_bound, owed_exclusive.
     spec=Sync
     check MC_Sync_Green_Mutex                          GREEN
+    check MC_Sync_Green_MutexBarger                    GREEN
+    check MC_Sync_Green_MutexBoth                      GREEN
+    check MC_Sync_Green_MutexLive                      GREEN
     check MC_Sync_Green_Semaphore                      GREEN
+    check MC_Sync_Green_BigRequest                     GREEN
+    check MC_Sync_Green_SemaphoreLive                  GREEN
     check MC_Sync_Green_Reentrant                      GREEN
     check MC_Sync_Green_ReentrantLive                  GREEN
     check MC_Sync_Red_UnboundedBarging                 RED BoundedBypass
@@ -778,8 +790,17 @@ tla:
     check MC_Sync_Red_LoseQueuePosition                RED BoundedBypass
     check MC_Sync_Red_CancelNoPassOn                   RED CancelPassesOn
     check MC_Sync_Red_NoRecheck                        RED NoLostWakeup
+    check MC_Sync_Red_NoDirty                          RED NoLostWakeup
+    check MC_Sync_Red_LowerPendingMarker               RED EveryWaiterServed
     check MC_Sync_Red_IgnoreOwed                       RED HandoffExclusive
     check MC_Sync_Red_NoDepth                          RED ReentrancyDepth
+    # E32, what a drain costs its thread: one pass, and one more for each
+    # waiter operation, or release with a node queued, that lands on it.
+    # Green_PassesGrow is the witness that the passes do grow with those
+    # (lock-free, not wait-free): FewPasses is no promise and must fail.
+    check MC_Sync_Red_ReleaseDirties                   RED DrainBounded
+    check MC_Sync_Red_ExitIgnoresRequest               RED NoLostWakeup
+    check MC_Sync_Green_PassesGrow                     RED FewPasses
     # regolith::sync::Notify, which keeps FIFO handoff. Lean:
     # Regolith/SyncFifo.lean, fifo_served, no_stranded_waiter.
     spec=SyncNotify
