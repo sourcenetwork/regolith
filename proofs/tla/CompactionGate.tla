@@ -750,7 +750,8 @@ InsideMatches ==
     /\ (t \in shared \cup alone => pc[t] = "in" \/ (pc[t] = "queued" /\ handed[t]))
 
 ----------------------------------------------------------------------------
-\* WHAT MUST HAPPEN IN THE END (checked by Green_Live, under Fairness).
+\* WHAT MUST HAPPEN IN THE END (checked by Green_Live and Green_LiveServed,
+\* under Fairness).
 
 \* E28 as a promise about the future: every worker's pass gets its turn
 \* again and again, however the jobs keep coming.
