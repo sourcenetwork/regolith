@@ -483,8 +483,8 @@ impl Db {
             RegolithEngine::open(path.as_ref(), engine_opts)?
         };
         let cfs = Arc::new(CfRegistry::new());
-        // Attached before the first write, so the commit leader fences every
-        // write against the registry from the start.
+        // Attached before the first write, so every write is fenced against
+        // the registry when it is decided, from the start.
         engine.attach_families(Arc::clone(&cfs));
         let db = Self {
             engine,
@@ -1259,7 +1259,7 @@ impl Db {
     /// Delete all data in the database.
     ///
     /// A call that does its own I/O and waits on this thread: for the
-    /// compaction pass or job in flight, and for the commit group in
+    /// compaction pass or job in flight, and for the commits in
     /// flight, to end. Call it off a thread that must not block. On
     /// `wasm32`, whose one thread cannot wait for itself, a call made from
     /// inside a compaction or a checkpoint (a listener, a compaction filter)

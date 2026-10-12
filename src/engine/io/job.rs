@@ -248,10 +248,14 @@ impl Job {
         }
         let mut unwind = Unwind(Some(self));
         // SAFETY: the claim gave this thread the body.
-        let step = self
-            .body
-            .with_mut(|body| unsafe { (*body).take() })
-            .map(|body| body.step(waker));
+        let body = self.body.with_mut(|body| unsafe { (*body).take() });
+        let step = {
+            // Every step of every job passes here: nothing in it may wait
+            // for another thread, and a path that does fails a build with
+            // debug assertions when the step ends.
+            let _no_wait = super::scope::no_wait();
+            body.map(|body| body.step(waker))
+        };
         unwind.0 = None;
         if let Some(Step::Parked(body)) = step {
             // SAFETY: still under the claim, which `park` gives up only
