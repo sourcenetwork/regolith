@@ -83,6 +83,8 @@
 \*
 \* CONFIGURATIONS.
 \*   MC_GroupCommit_Green                  Mutant = "none", Faults = TRUE
+\*   MC_GroupCommit_Green_Live             the same with three transactions:
+\*     AllTicketsComplete holds too.
 \*     Every invariant and AllTicketsComplete hold.
 \*   MC_GroupCommit_Red_ViewOnly           Mutant = "ViewOnly"
 \*     SerialEquivalent fails: a member validated against the view alone
