@@ -901,6 +901,18 @@ tla:
     check MC_NonBlocking_Red_PublishAtWrite            RED VisibleAfterSync
     check MC_NonBlocking_Red_DeliverOnLander           RED DeliveredOnOwnPoll
     check MC_NonBlocking_Red_NoRecheck                 RED StallLandsWhenClear
+    # D53, timed waits (the wait a retry backs off on): completed only by
+    # the poll of the queue that was asked, not before the due time, by an
+    # owner that polls again within what its poll reported, and by the drop
+    # of the queue. Lean: Regolith/IoQueue.lean, timed_wait_completed_once,
+    # timed_wait_completed_by_owner, timed_wait_not_before_due,
+    # dropped_queue_holds_no_wait, poll_after_wake_in_completes.
+    check MC_NonBlocking_Green_Timer                   GREEN
+    check MC_NonBlocking_Green_TimerLive               GREEN
+    check MC_NonBlocking_Red_IdlePastDue               RED AllDone
+    check MC_NonBlocking_Red_EarlyFire                 RED TimerNotEarly
+    check MC_NonBlocking_Red_DropForgets               RED DroppedHoldsNothing
+    check MC_NonBlocking_Red_TimerWrongQueue           RED TimerOnOwnQueue
     # Phase 7 integration: with no worker and inline compaction on, no
     # stopped writer waits on a relief nobody runs. Every piece of progress
     # lands the stall's unit (relief handed back), a contended writer reads
