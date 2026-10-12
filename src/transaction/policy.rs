@@ -142,6 +142,63 @@ pub enum KeyClass {
 /// once more for each key it puts or merges, to leave a content-addressed one
 /// unchecked.
 ///
+/// # Example
+///
+/// A classifier that tells the class from the key's first bytes, which is
+/// pure and allocates nothing. Keys under `blob/` are named by their content.
+///
+/// ```
+/// use std::sync::Arc;
+///
+/// use regolith::{
+///     IsolationLevel, KeyClass, KeyClassifier, OptimisticTransactionDb, Options, Transaction,
+///     TransactionError, TxResult, TxnOptions,
+/// };
+///
+/// struct ByPrefix;
+///
+/// impl KeyClassifier for ByPrefix {
+///     fn classify(&self, key: &[u8]) -> KeyClass {
+///         if key.starts_with(b"blob/") {
+///             KeyClass::ContentAddressed
+///         } else {
+///             KeyClass::Ordinary
+///         }
+///     }
+/// }
+///
+/// let db = OptimisticTransactionDb::open("classes", Options::memory())?
+///     .with_isolation(IsolationLevel::DefraLevel)
+///     .with_policy(Arc::new(ByPrefix));
+///
+/// // Each writer looks for the key and stores it when it is not there.
+/// let store = |txn: &Transaction, key: &[u8], value: &[u8]| -> TxResult<()> {
+///     if txn.get(key)?.is_none() {
+///         txn.put(key, value)?;
+///     }
+///     Ok(())
+/// };
+///
+/// // Two writers store one blob at once. Whoever writes the key writes
+/// // these bytes, so neither needs to win: both commit.
+/// let (one, two) = (db.begin(&TxnOptions::new()), db.begin(&TxnOptions::new()));
+/// store(&one, b"blob/9f2c", b"the same bytes")?;
+/// store(&two, b"blob/9f2c", b"the same bytes")?;
+/// one.commit()?;
+/// two.commit()?;
+///
+/// // The same race on an ordinary key has one winner: the other decided on
+/// // a key that was absent and no longer is.
+/// let (one, two) = (db.begin(&TxnOptions::new()), db.begin(&TxnOptions::new()));
+/// store(&one, b"name/ada", b"first")?;
+/// store(&two, b"name/ada", b"second")?;
+/// one.commit()?;
+/// assert!(matches!(two.commit(), Err(TransactionError::Conflict(_))));
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+///
+/// # Panics
+///
 /// A panic in `classify` during the commit fails the commit with
 /// [`Error::CallbackPanicked`](crate::Error::CallbackPanicked) and latches the
 /// database read-only until it is reopened. A panic in one of the calls before

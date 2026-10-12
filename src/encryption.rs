@@ -168,6 +168,57 @@ impl fmt::Debug for KeyMaterial {
 /// Regolith asks for each key id once and keeps what it derives from the
 /// key until the database drops; [`KeyProvider::current`] is asked each
 /// time a file is created and each time a manifest batch is written.
+///
+/// # Example
+///
+/// A provider that holds its keys in memory, the newest one current. A real
+/// one loads them from a key store before the database opens.
+///
+/// ```
+/// use std::sync::Arc;
+///
+/// use regolith::{Db, Error, KeyId, KeyMaterial, KeyProvider, MemEnv, Options};
+///
+/// struct Keys(Vec<(KeyId, [u8; 32])>);
+///
+/// impl KeyProvider for Keys {
+///     fn current(&self) -> KeyId {
+///         self.0.last().map_or(KeyId(0), |(newest, _)| *newest)
+///     }
+///
+///     fn key(&self, id: KeyId) -> Option<KeyMaterial> {
+///         let (_, bytes) = self.0.iter().find(|(held, _)| *held == id)?;
+///         Some(KeyMaterial::new(*bytes))
+///     }
+/// }
+///
+/// // One in-memory filesystem, so the database can be opened again.
+/// let env = Arc::new(MemEnv::new());
+/// let open = |keys: Option<Keys>| {
+///     let options = Options::memory().env(env.clone());
+///     Db::open("sealed", match keys {
+///         Some(keys) => options.key_provider(Arc::new(keys)),
+///         None => options,
+///     })
+/// };
+///
+/// let db = open(Some(Keys(vec![(KeyId(1), [7; 32])])))?;
+/// db.put(b"k", b"sealed under key 1")?;
+/// db.close()?;
+/// // A closed handle still holds the directory until it drops.
+/// drop(db);
+///
+/// // Without a provider, or without the key its files name, the open is
+/// // refused; the database never reads as empty.
+/// assert!(matches!(open(None), Err(Error::KeyProviderRequired)));
+/// let other = Keys(vec![(KeyId(2), [9; 32])]);
+/// assert!(matches!(open(Some(other)), Err(Error::UnknownKey { id: KeyId(1) })));
+///
+/// // Rotation: key 2 becomes current, and key 1 stays for what it sealed.
+/// let db = open(Some(Keys(vec![(KeyId(1), [7; 32]), (KeyId(2), [9; 32])])))?;
+/// assert_eq!(db.get(b"k")?.as_deref(), Some(&b"sealed under key 1"[..]));
+/// # Ok::<(), regolith::Error>(())
+/// ```
 pub trait KeyProvider: Send + Sync + 'static {
     /// The key new files are sealed under. [`KeyProvider::key`] must
     /// provide it: a current key the provider cannot provide refuses the
