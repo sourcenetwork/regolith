@@ -44,6 +44,7 @@
 \* Natural numbers and sequences of them are all this needs.
 EXTENDS Naturals
 
+\* The knobs of a run. Each configuration file (MC_ShardedStats_*.cfg) gives them values.
 CONSTANTS
   \* The threads that add, as model values.
   Threads,
@@ -69,6 +70,8 @@ ASSUME ReadMode \in {"AllShards", "OwnShard"}
 \* The shards, numbered from 1.
 Shards == 1..NShards
 
+\* The state: everything that changes from one step to the next. Each line says what the variable
+\* stands for in the real program.
 VARIABLES
   \* Each shard's value: one `AtomicU64` per shard for this ticker.
   shard,
@@ -266,6 +269,7 @@ TypeOK ==
 \* is half-way, the shards sum to the adds made. It rules out a lost add.
 \* Lean: total_after_adds.
 QuiescentExact ==
+  \* Once every thread has made all its adds and is idle, the shards sum to the number of adds made.
   (\A t \in Threads : done[t] = MaxAdds /\ pc[t] = "idle") => SumShards = total
 
 \* A read reports a total between the true total when it began and when it
