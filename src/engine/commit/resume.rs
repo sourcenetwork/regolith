@@ -8,7 +8,7 @@ use super::super::RegolithEngine;
 use super::super::io::job::Delivery;
 use super::super::io::scope;
 use super::super::io::shared::QueueShared;
-use super::descriptor::{Descriptor, INSTALLED};
+use super::descriptor::{ADMITTED, Descriptor, INSTALLED};
 use crate::sync::internal::Arc as RingArc;
 
 /// What a `commit_nowait` commit left on its queue, behind the unit it waits
@@ -34,13 +34,13 @@ impl Delivery for Nudge {
 }
 
 impl RegolithEngine {
-    /// Drive a `commit_nowait` commit and, once it is published or
-    /// discarded, tell `told`, on this thread. While a unit is still in its
-    /// way, or in the way of its taking a slot of a full ring, the commit is
-    /// left on `queue` behind that unit instead, and this returns:
-    /// the queue's owner comes back here when the unit lands. A queue that is
-    /// gone cannot be polled again, so the commit is then brought through
-    /// here, as a blocking one is.
+    /// Drive a `commit_nowait` commit and, once it is published, discarded
+    /// or refused, tell `told`, on this thread. While a unit is still in its
+    /// way, or in the way of its taking a slot (a write stall, a full ring),
+    /// the commit is left on `queue` behind that unit instead, and this
+    /// returns: the queue's owner comes back here when the unit lands. A
+    /// queue that is gone cannot be polled again, so the commit is then
+    /// brought through here, as a blocking one is.
     ///
     /// Called on the queue owner's thread: by `commit_nowait` itself, and by
     /// the queue's poll through [`Nudge`]. Exactly one call tells `told`.
@@ -58,7 +58,7 @@ impl RegolithEngine {
         // this thread, here as in the call that made it.
         let _scope = desc.read_queue().map(scope::cache_only);
         loop {
-            if desc.is(INSTALLED) && pipe.ring.published() >= desc.index() {
+            if desc.is_refused() || (desc.is(INSTALLED) && pipe.ring.published() >= desc.index()) {
                 told.deliver();
                 return;
             }
@@ -77,6 +77,19 @@ impl RegolithEngine {
             let index = if desc.is(INSTALLED) {
                 desc.index()
             } else {
+                // As a blocking commit: a stop is waited out before the slot
+                // is taken.
+                if !desc.is(ADMITTED) {
+                    match self.admit_commit() {
+                        Ok(()) => {
+                            desc.mark(ADMITTED);
+                        }
+                        Err(refused) => {
+                            desc.refuse(refused.into_io_error());
+                            continue;
+                        }
+                    }
+                }
                 self.enter(pipe, desc)
             };
             self.drive(pipe, index, desc);

@@ -155,10 +155,6 @@ impl LogFile for SerialLog {
         inner.held.clear();
         Ok(())
     }
-
-    fn len(&self) -> io::Result<u64> {
-        Ok(self.inner()?.end)
-    }
 }
 
 #[cfg(test)]
@@ -182,11 +178,13 @@ mod tests {
         let env = env();
         let log = open(&env, WriteMode::Truncate);
         log.write_all_at(4, b"5678").unwrap();
-        assert_eq!(log.len().unwrap(), 0, "a held write is not in the file");
-        assert_eq!(env.read(Path::new("/db/log")).unwrap(), b"");
+        assert_eq!(
+            env.read(Path::new("/db/log")).unwrap(),
+            b"",
+            "a held write is not in the file"
+        );
         log.write_all_at(0, b"1234").unwrap();
         assert_eq!(env.read(Path::new("/db/log")).unwrap(), b"12345678");
-        assert_eq!(log.len().unwrap(), 8);
     }
 
     #[test]
@@ -221,7 +219,6 @@ mod tests {
             .write_all_at(0, b"stamp")
             .unwrap();
         let log = open(&env, WriteMode::Update);
-        assert_eq!(log.len().unwrap(), 5);
         log.write_all_at(5, b"record").unwrap();
         assert_eq!(env.read(Path::new("/db/log")).unwrap(), b"stamprecord");
     }
@@ -267,7 +264,6 @@ mod tests {
             });
             log.sync_data().unwrap();
             let want: Vec<u8> = records.iter().flat_map(|(_, b)| b.clone()).collect();
-            assert_eq!(log.len().unwrap(), want.len() as u64, "round {round}");
             assert_eq!(
                 env.read(Path::new("/db/log")).unwrap(),
                 want,

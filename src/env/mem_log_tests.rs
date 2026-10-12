@@ -33,12 +33,10 @@ fn a_write_ahead_of_a_gap_reaches_the_file_once_the_gap_is_filled() {
     let env = env();
     let log = open(&env, WriteMode::Truncate);
     log.write_all_at(4, b"5678").unwrap();
-    assert_eq!(log.len().unwrap(), 0, "a held write is not in the file");
-    assert_eq!(contents(&env), b"");
+    assert_eq!(contents(&env), b"", "a held write is not in the file");
     log.write_all_at(8, b"9abc").unwrap();
     log.write_all_at(0, b"1234").unwrap();
     assert_eq!(contents(&env), b"123456789abc", "ML1 and ML2");
-    assert_eq!(log.len().unwrap(), 12);
 }
 
 #[test]
@@ -90,12 +88,12 @@ fn reopening_for_update_continues_above_what_the_file_holds() {
         .write_all_at(0, b"stamp")
         .unwrap();
     let log = open(&env, WriteMode::Update);
-    assert_eq!(log.len().unwrap(), 5);
+    assert_eq!(contents(&env), b"stamp");
     log.write_all_at(5, b"record").unwrap();
     assert_eq!(contents(&env), b"stamprecord");
     // A log started over is empty.
     let log = open(&env, WriteMode::Truncate);
-    assert_eq!(log.len().unwrap(), 0);
+    assert_eq!(contents(&env), b"");
     log.write_all_at(0, b"new").unwrap();
     assert_eq!(contents(&env), b"new");
 }
@@ -122,7 +120,6 @@ fn two_writes_of_one_record_at_once_do_not_wait_for_each_other() {
     });
     log.write_all_at(5, b"record").unwrap();
     assert_eq!(contents(&env), b"stamprecord", "the record is there once");
-    assert_eq!(log.len().unwrap(), 11);
 }
 
 /// ML2, the holder's side: the gap closes after a write found it open and
@@ -138,7 +135,6 @@ fn a_gap_that_closes_while_a_write_is_being_held_leaves_nothing_behind() {
     before_hold(move || below.write_all_at(0, b"1234").unwrap());
     log.write_all_at(4, b"5678").unwrap();
     assert_eq!(contents(&env), b"12345678cccc");
-    assert_eq!(log.len().unwrap(), 12);
 }
 
 /// ML5: a write is about to be held when another thread writes the gap
@@ -207,7 +203,6 @@ fn concurrent_writes_in_any_order_end_up_in_offset_order() {
         }
     });
     let expected: Vec<u8> = (0..RECORDS).flat_map(record).collect();
-    assert_eq!(log.len().unwrap(), expected.len() as u64);
     assert!(
         contents(&env) == expected,
         "a record is missing or misplaced"
@@ -251,6 +246,5 @@ proptest! {
             written[i] = true;
         }
         prop_assert_eq!(contents(&env), prefix(&written));
-        prop_assert_eq!(log.len().unwrap(), at);
     }
 }

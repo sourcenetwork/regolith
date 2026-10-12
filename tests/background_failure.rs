@@ -8,6 +8,7 @@
 //! stopped behind failing work must get that failure back rather than
 //! wait forever, one that was already waiting when the work failed
 //! included, and writes must resume once the fault clears.
+#![cfg(not(target_arch = "wasm32"))]
 
 use std::io;
 use std::path::{Path, PathBuf};

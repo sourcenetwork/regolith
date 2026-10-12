@@ -468,7 +468,8 @@ proptest! {
     #![proptest_config(ProptestConfig::with_cases(48))]
 
     /// Commits made by several threads at once decide exactly as the same
-    /// commits run one at a time, in sequence order (`group_eq_serial`):
+    /// commits run one at a time, in sequence order (the order
+    /// `PipelineCheck.lean` decides slots in):
     /// - the sequences taken tile a range with no hole and no overlap;
     /// - a transaction committed only if no commit wrote one of its keys
     ///   between its snapshot and its own sequence, and lost only if one

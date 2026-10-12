@@ -15,6 +15,7 @@
 //! stack once any unfinished thread stops advancing, so a deadlock, or a
 //! livelock where some threads spin while one waits forever, surfaces as
 //! a failure instead of a harness timeout.
+#![cfg(not(target_arch = "wasm32"))]
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Barrier, Mutex};

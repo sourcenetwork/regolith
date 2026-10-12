@@ -624,16 +624,9 @@ fn compaction_loop(
                         // Surface the failure to any registered
                         // listeners so metrics pipelines and
                         // debuggers notice it - the scheduler
-                        // itself keeps running.
-                        if !opts.listeners.is_empty() {
-                            let err = crate::Error::from(crate::Error::clone_io(&e));
-                            crate::event_listener::dispatch(&opts.listeners, |l| {
-                                l.on_background_error(
-                                    crate::event_listener::BackgroundErrorReason::Compaction,
-                                    &err,
-                                )
-                            });
-                        }
+                        // itself keeps running. A listener's panic is
+                        // logged where it was caught.
+                        let _told = tell_failure(&opts.listeners, &e);
                         false
                     }
                 }
@@ -725,7 +718,7 @@ pub(crate) fn pick_and_run_compaction(
     if opts.compaction_style == crate::options::CompactionStyle::Fifo {
         // FIFO never merges tables, so no deletion is ever compacted away
         // and nothing is counted for it.
-        return Ok(outcome(run_fifo_pass(versions, sst_dir, opts)?));
+        return Ok(outcome(run_fifo_pass(versions, sst_dir, cache, opts)?));
     }
     let pressed = deletion::stall_near(&versions.current(), opts);
     let ran = if pool.is_some() {
@@ -967,9 +960,30 @@ fn perform_universal_merge(
 pub(crate) fn run_fifo_pass(
     versions: &Arc<VersionStore>,
     sst_dir: &Path,
+    cache: &BlockCache,
     opts: &CompactionOptions,
 ) -> std::io::Result<bool> {
-    pick_and_run_fifo(versions, sst_dir, opts)
+    pick_and_run_fifo(versions, sst_dir, cache, opts)
+}
+
+/// Tell `listeners` a compaction pass failed with `err`: the one place a
+/// failing pass is told, whether it ran on a worker or on a caller's
+/// thread. A listener's panic comes back as an error where a background
+/// step contains it (`engine::callback`), already logged there.
+pub(crate) fn tell_failure(
+    listeners: &[Arc<dyn crate::event_listener::EventListener>],
+    err: &std::io::Error,
+) -> Result<(), crate::Error> {
+    if listeners.is_empty() {
+        return Ok(());
+    }
+    let err = crate::Error::from(crate::Error::clone_io(err));
+    crate::event_listener::dispatch_contained(listeners, |l| {
+        l.on_background_error(
+            crate::event_listener::BackgroundErrorReason::Compaction,
+            &err,
+        )
+    })
 }
 
 /// Force-merge every L0 file into a single run. Called by the
@@ -1030,6 +1044,7 @@ fn pick_and_run_level_compaction(
 fn pick_and_run_fifo(
     versions: &Arc<VersionStore>,
     sst_dir: &Path,
+    cache: &BlockCache,
     opts: &CompactionOptions,
 ) -> std::io::Result<bool> {
     let limit = opts.fifo_compaction_options.max_table_files_size;
@@ -1060,7 +1075,7 @@ fn pick_and_run_fifo(
 
     let mut running_total = total;
     let mut edits: Vec<VersionEdit> = Vec::new();
-    let mut removed_paths: Vec<std::path::PathBuf> = Vec::new();
+    let mut removed: Vec<Arc<crate::engine::sstable::LiveSst>> = Vec::new();
     for file in &by_age {
         // Always keep at least one file alive - dropping the only
         // remaining file would delete every byte of user data the
@@ -1075,7 +1090,7 @@ fn pick_and_run_fifo(
             level: 0,
             file_id: file.meta.file_id,
         });
-        removed_paths.push(sst_dir.join(sst_filename(file.meta.file_id)));
+        removed.push(Arc::clone(file));
         running_total = running_total.saturating_sub(file.meta.file_size);
     }
 
@@ -1085,14 +1100,13 @@ fn pick_and_run_fifo(
 
     versions.run(|versions| versions.apply(&edits))?;
 
-    // Best-effort unlink. The `LiveSst` reader Arcs in older
-    // versions (held by long-running snapshots / iterators) keep
-    // file descriptors open, so the kernel preserves the inode
-    // until those readers drop. A failure here doesn't corrupt the
-    // database - the manifest already reflects the removal.
-    for path in &removed_paths {
-        let _ = opts.env.remove_file(path);
-    }
+    // Best-effort unlink, as after a merge. The `LiveSst` reader Arcs in
+    // older versions (held by long-running snapshots / iterators) keep
+    // file descriptors open, so the kernel preserves the inode until those
+    // readers drop. A failure here doesn't corrupt the database - the
+    // manifest already reflects the removal.
+    delete_old_files(&*opts.env, sst_dir, &removed, cache);
+    tell_deleted(&opts.listeners, sst_dir, &removed);
 
     if let Some(s) = &opts.statistics {
         s.add(
@@ -1496,7 +1510,12 @@ fn perform_compaction_to(
     if let Some(filter) = opts.compaction_filter.as_ref() {
         merged_range_tombstones.retain(|rt| {
             !matches!(
-                filter.filter_range_delete(target_level, &rt.start, &rt.end),
+                super::filter_call::filter_range_delete(
+                    filter.as_ref(),
+                    target_level,
+                    &rt.start,
+                    &rt.end
+                ),
                 crate::options::CompactionDecision::Remove
             )
         });
@@ -1650,7 +1669,12 @@ fn perform_compaction_to(
     // Unlink the old SSTable paths. Their file descriptors stay alive
     // through any `Arc<LiveSst>` still held by older versions or by
     // iterators, so the data remains readable until those Arcs drop.
-    delete_old_files(&*opts.env, sst_dir, &input_files, &overlap_files, cache);
+    delete_old_files(
+        &*opts.env,
+        sst_dir,
+        input_files.iter().chain(&overlap_files),
+        cache,
+    );
 
     // Publish compaction statistics. Bytes-in is the sum of
     // every input file's on-disk size; bytes-out is the sum of
@@ -1688,13 +1712,11 @@ fn perform_compaction_to(
             };
             crate::event_listener::dispatch(&opts.listeners, |l| l.on_table_file_created(&info));
         }
-        for f in input_files.iter().chain(overlap_files.iter()) {
-            let info = crate::event_listener::TableFileDeletionInfo {
-                file_id: f.meta.file_id,
-                file_path: sst_dir.join(sst_filename(f.meta.file_id)),
-            };
-            crate::event_listener::dispatch(&opts.listeners, |l| l.on_table_file_deleted(&info));
-        }
+        tell_deleted(
+            &opts.listeners,
+            sst_dir,
+            input_files.iter().chain(&overlap_files),
+        );
         let job_info = crate::event_listener::CompactionJobInfo {
             input_level: level,
             output_level: target_level,
@@ -2307,14 +2329,35 @@ fn find_overlapping(files: &[Arc<LiveSst>], min_key: &[u8], max_key: &[u8]) -> V
     overlapping(files, min_key, max_key).to_vec()
 }
 
-fn delete_old_files(
+/// Tell `listeners` each of `files` was removed, once its version edit is
+/// applied and its name unlinked: the one place a compaction says so, after
+/// a merge and after a FIFO pass alike.
+fn tell_deleted<'a>(
+    listeners: &[Arc<dyn crate::event_listener::EventListener>],
+    sst_dir: &Path,
+    files: impl IntoIterator<Item = &'a Arc<LiveSst>>,
+) {
+    if listeners.is_empty() {
+        return;
+    }
+    for file in files {
+        let info = crate::event_listener::TableFileDeletionInfo {
+            file_id: file.meta.file_id,
+            file_path: sst_dir.join(sst_filename(file.meta.file_id)),
+        };
+        crate::event_listener::dispatch(listeners, |l| l.on_table_file_deleted(&info));
+    }
+}
+
+/// Evict each of `files` from the block cache and unlink it, best effort:
+/// a failure is logged and left for the next open's sweep.
+fn delete_old_files<'a>(
     env: &dyn Env,
     sst_dir: &Path,
-    input_files: &[Arc<LiveSst>],
-    overlap_files: &[Arc<LiveSst>],
+    files: impl IntoIterator<Item = &'a Arc<LiveSst>>,
     cache: &BlockCache,
 ) {
-    for file in input_files.iter().chain(overlap_files.iter()) {
+    for file in files {
         let path = sst_dir.join(sst_filename(file.meta.file_id));
         cache.evict_file(file.meta.file_id);
         if let Err(e) = remove_sst_in(env, &path) {

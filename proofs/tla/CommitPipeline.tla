@@ -34,11 +34,25 @@
 \*   held_round_blocks
 \*       the stated limit: a thread that stops holding the round stops the
 \*       commits that wait for the sync (RED StopHoldsClaim).
-\* And in Regolith/GroupCommit.lean, group_eq_serial and early_check_split:
-\* validating slot i against a view that holds every slot decided before it
-\* equals validating it against every earlier commit, and checking up to a
-\* horizon on the committer's own thread and above it when the slot is
-\* decided equals one check (NoLostUpdate, AbortsHaveCause).
+\* And in Regolith/PipelineCheck.lean, the check a slot runs when it is
+\* decided:
+\*   landed_write_is_seen, no_lost_update, later_slot_aborts
+\*       a write that landed is in the store every later slot is checked
+\*       against, since a slot is in the memtable before the next is
+\*       decided; so a later transaction that touched its key from an older
+\*       snapshot aborts, whatever slots stand between them (NoLostUpdate).
+\*   abort_has_cause
+\*       a slot aborts only when it is a transaction and the store holds a
+\*       newer version of a key it touched (AbortsHaveCause).
+\*   conflict_stays
+\*       a conflict found among some versions is still one when more land,
+\*       which is why an early conflict aborts at once (EarlyAbort).
+\*   early_check_split, early_check_cover
+\*       checking up to a horizon on the committer's own thread and above
+\*       it when the slot is decided equals one check (NoLostUpdate,
+\*       AbortsHaveCause).
+\*   published_only_loses_an_update
+\*       RED ValidatePublished as a concrete counterexample.
 \* The other half of lock-freedom, that the interleavings of several
 \* threads keep finishing slots (LockFree, EveryLiveCommitCompletes), is
 \* checked here by TLC, on small instances.
@@ -138,6 +152,67 @@
 \*
 \* CONFIGURATIONS are listed with what each shows in the .cfg files.
 \*
+\* WHAT BECAME OF GroupCommit.tla. The pipeline replaced group commit (one
+\* leader that held a mutex, took the waiting commits as a group, and handed
+\* the mutex on). That model is retired with the code it described. Every
+\* rule it checked is carried by a rule here, or in the model named, and
+\* every RED row it had has a RED row that plants the same mistake in the
+\* pipeline:
+\*
+\*   SerialEquivalent           -> NoLostUpdate and AbortsHaveCause.
+\*     RED ViewOnly             -> Red_ValidatePublished (a slot checked
+\*                                 against a view that lacks an earlier
+\*                                 slot's writes), Red_PassBeforeApply_LostUpdate
+\*     RED TrustEarly           -> Red_TrustEarly
+\*   SeqFollowsDecisionOrder    -> SeqInRingOrder; Red_DecideAnyOrder_Order
+\*   StoreHoldsCommits          -> AppliedBeforePassed and MemtableOnlyLive;
+\*                                 Red_PassBeforeApply, Red_KeepMemtable
+\*   VisibleIsApplied           -> ReadersSeePrefix; Red_OutOfOrder
+\*   DurableBeforeVisible       -> DurableBeforeVisible, the same rule.
+\*     RED PublishBeforeSync    -> Red_PublishBeforeSync
+\*   TicketsCompleteOnce        -> OwnerSeesItsFate and NoFalseAck;
+\*                                 Red_VoidNotCas, Red_RollbackForgets_Ack.
+\*                                 For a commit made by commit_nowait:
+\*                                 Landing.tla, ToldAtMostOnce;
+\*                                 MC_Landing_Red_ReadThenClear
+\*   TicketMeansVisible         -> PublishedIsVisible and NoFalseAck;
+\*                                 Red_FrontierFirst
+\*   BoundedTurn (E21)          -> WorksUpToItsOwn.
+\*     RED DrainAll             -> Red_WorkBeyond
+\*   NoStuckTicket              -> NoLiveThreadBlocked; Red_NoHelping,
+\*                                 Red_StopHoldsClaim
+\*   SingleSync                 -> OneRound and DurableWithinDecided.
+\*     RED DoubleClaim          -> Red_TwoSyncs, Red_TwoSyncs_Durable; for
+\*                                 the claim of a job, NonBlocking.tla,
+\*                                 SingleRun, MC_NonBlocking_Red_DoubleSync
+\*   OwedBlocksNextGroup        -> no longer a rule: commits behind a sync
+\*                                 that is owed are decided and written
+\*                                 meanwhile. What it protected, that nothing
+\*                                 is published past a commit still waiting
+\*                                 for its sync, is ReadersSeePrefix and
+\*                                 DurableBeforeVisible
+\*   AllTicketsComplete         -> LockFree and EveryLiveCommitCompletes, in
+\*                                 every row whose name has Live in it and
+\*                                 in the Rollback, Rotation, Early,
+\*                                 ReadOnly and Plain rows
+\*   NothingOwed (the witness   -> Parking.tla, NeverParked;
+\*     Green_Nowait_Owes)          MC_Parking_Green_Parks
+\*
+\*   Green                      -> MC_CommitPipeline_Green
+\*   Green_Live                 -> MC_CommitPipeline_Green_Live, and
+\*                                 Green_Rollback for a group that fails
+\*   Green_LivePlain            -> MC_CommitPipeline_Green_Plain
+\*   Green_ReadOnly             -> MC_CommitPipeline_Green_ReadOnly
+\*   Green_Nowait, _NowaitLive  -> MC_NonBlocking_Green_Commit (the queue
+\*                                 and the delivery), MC_Parking_Green (a
+\*                                 poll that cannot go on) and
+\*                                 MC_Landing_Green (who is told)
+\*
+\* The group's own device, checking a member against the view plus the keys
+\* of the members accepted before it, is gone with the group: a slot is in
+\* the memtable before the next one is decided (AppliedBeforePassed), so the
+\* check reads the memtable itself.
+\*
 \* THE MODEL IS IN THREE MODULES, each small enough to read in one go:
 \*   CommitPipelineBase.tla   what a configuration chooses, the state, and
 \*                            the small questions the steps ask;
@@ -183,6 +258,7 @@ TypeOK ==
 \* R1, one fate per ticket: an owner who believes its order is in the ring
 \* is right. Fails under VoidNotCas.
 OwnerSeesItsFate ==
+  \* Every thread that takes its order to be in the ring finds it there.
   \A a \in Actors : pc[a] \in {"ready", "done", "failed"} => cell[mine[a]] = "ready"
 
 \* One thread at a time on the log's device step.
@@ -210,11 +286,13 @@ NoHole ==
 
 \* Sequence order is ticket order.
 SeqInRingOrder ==
+  \* Of two orders that count, the earlier ticket holds the smaller sequence.
   \A i, j \in 1..tipIdx : i < j /\ Takes(i) /\ Takes(j) => sq[i] < sq[j]
 
 \* P2: an order the line has moved past that landed is in the memtable, so
 \* the order after it was checked against it. Fails under PassBeforeApply.
 AppliedBeforePassed ==
+  \* Every order behind the frontier that landed and counts is in the memtable.
   \A i \in 1..dto : (Brings(i) \/ dec[i] = "unit") /\ ~failed[i] => InMem(i)
 
 \* Outside a rollback, the memtable readers are shown holds no order that
@@ -237,6 +315,7 @@ PublishedIsVisible == \A i \in 1..pub : Takes(i) => sq[i] <= visible
 \* horizon covers is in the memtable, is the next order to finish at most,
 \* and was allowed to be finished. Fails under OutOfOrder.
 ReadersSeePrefix ==
+  \* For every order that counts and that the horizon covers:
   \A i \in 1..tipIdx : Takes(i) /\ sq[i] <= visible =>
     \* Its writes are there to be read.
     /\ InMem(i)
@@ -248,6 +327,7 @@ ReadersSeePrefix ==
 \* What the durable mark covers is written. Fails under SyncPastGap,
 \* TwoSyncs and UnitNoDrain.
 DurableImpliesWritten ==
+  \* Every commit the durable mark covers has its record written.
   \A i \in 1..tipIdx : Takes(i) /\ dec[i] = "commit" /\ sq[i] <= durable => wr[i]
 
 \* The durable mark never passes the last sequence handed out: a rollback
@@ -256,7 +336,9 @@ DurableWithinDecided == durable <= tipNext
 
 \* At Immediate, visible only once durable.
 DurableBeforeVisible ==
+  \* For every order the tip covers:
   \A i \in 1..tipIdx :
+    \* a commit that asked to wait for the disk and is visible is durable.
     Takes(i) /\ dec[i] = "commit" /\ owner[i] \in Immediate /\ sq[i] <= visible => sq[i] <= durable
 
 \* No lost update: a transaction that commits read no key an earlier
@@ -264,6 +346,7 @@ DurableBeforeVisible ==
 \* read and write one key from the same snapshot, at most one commits.
 \* Fails under ValidatePublished, PassBeforeApply and TrustEarly.
 NoLostUpdate ==
+  \* For every two orders the tip covers:
   \A i, j \in 1..tipIdx :
     \* Two orders in ticket order...
     /\ i < j
@@ -303,12 +386,14 @@ AbortsHaveCause ==
 \* is current, so a rotation never leaves a record to be written in a log
 \* it sealed. Fails under UnitNoDrain.
 InFlightInCurrentLog ==
+  \* Every unfinished commit that counts belongs to the log that is current.
   \A i \in 1..tipIdx : i > pub /\ Brings(i) /\ ~failed[i] => logOf[i] = gen
 
 \* G2: nobody is told "done" for an order that was thrown out, nobody is
 \* told "failed" for one that landed, and a commit told "done" has its
 \* record in the log.
 NoFalseAck ==
+  \* For every thread, what it was told is true:
   \A a \in Actors :
     \* "done" means the order counts...
     /\ (pc[a] = "done" => ~failed[mine[a]])
@@ -317,20 +402,33 @@ NoFalseAck ==
     \* "failed" means it was thrown out.
     /\ (pc[a] = "failed" => failed[mine[a]])
 
+\* E21, bounded work: a thread works out a verdict only for orders up to
+\* its own, so no caller does the work of an unbounded line of others. Rules
+\* out: thread 1's order is decided and waits for its sync; meanwhile thread
+\* 1 goes on deciding the orders that keep arriving behind it, and its call
+\* returns only when nobody commits any more. Fails under WorkBeyond. Lean:
+\* helping_is_bounded (Regolith/PipelineHelping.lean).
+WorksUpToItsOwn ==
+  \* A thread's note names a ticket at or before its own.
+  \A a \in Actors : seen[a] # NoNote => seen[a][1] <= mine[a]
+
 \* A note is only ever for an order with no verdict: the others were used
 \* up when the verdict was written.
 NotesAreForUndecided ==
+  \* The ticket a note names has no verdict.
   \A a \in Actors : seen[a] # NoNote => dec[seen[a][1]] = "none"
 
 \* No live thread is ever stuck: when no live thread can take a step,
 \* every live thread's call has returned. Fails under NoHelping and
 \* StopHoldsClaim.
 NoLiveThreadBlocked ==
+  \* With no step left for any live thread, each of them has its answer.
   (~ENABLED LiveNext) => \A a \in Actors \ stopped : pc[a] \in {"done", "failed", "aborted"}
 
 \* The run's ticket bound never stops a live thread, so nothing above is an
 \* artefact of the bound.
 BoundNeverBinds ==
+  \* A live thread that still has to pull a ticket finds one left.
   \A a \in Actors \ stopped : pc[a] \in {"idle", "open", "begun"} => tail < MaxSlots
 
 ----------------------------------------------------------------------------
@@ -377,6 +475,7 @@ LockFree == []<><<FrontierMoves>>_vars \/ <>[](~LivePending)
 \* A stopped thread blocks nobody: eventually every thread's call has
 \* returned, except the threads that walked away.
 EveryLiveCommitCompletes ==
+  \* At some point every thread has its answer, or walked away.
   <>(\A a \in Actors : pc[a] \in {"done", "failed", "aborted"} \/ a \in stopped)
 
 ----------------------------------------------------------------------------

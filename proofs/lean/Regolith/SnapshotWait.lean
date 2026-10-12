@@ -10,8 +10,9 @@ proves the laws for any number of pins, releases and calls.
 
 A reader of the database can take a "snapshot": a promise that it keeps
 seeing the data as it was at one moment. Each live snapshot holds a "pin".
-`Db::wait_for_snapshots` waits until no pin is held and reports how many
-still are when its timeout runs out
+`Db::wait_for_snapshots` hands back a `SnapshotWait` at once; that handle's
+`wait` waits until no pin is held and reports how many still are when its
+timeout runs out
 (`SnapshotRegistry::wait_until_drained`, `src/engine/snapshot_registry.rs`).
 
 There is no lock. The waiter and a release talk through three things:

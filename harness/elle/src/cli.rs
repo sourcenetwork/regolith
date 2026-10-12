@@ -22,11 +22,11 @@ impl Model {
 /// `read-committed` runs the pessimistic flavour, opened at regolith's
 /// `ReadCommitted` level so the level the harness claims is the one the
 /// engine runs; the other four run the optimistic flavour at the regolith
-/// level of the same name. `defra-level` has no key classifier here: the
-/// workloads are point operations, so it validates point reads exactly as
-/// `repeatable-read` does, and it differs only in appending to a list by
-/// blind merge. Each is checked against the Elle model it claims; README.md
-/// carries the table.
+/// level of the same name. `defra-level` has no key classifier in the `point`
+/// shape: there the workloads are point operations, so it validates point
+/// reads exactly as `repeatable-read` does, and it differs only in appending
+/// to a list by blind merge. The other shapes install one ([`Shape`]). Each
+/// is checked against the Elle model it claims; README.md carries the table.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Isolation {
     ReadCommitted,
@@ -44,6 +44,53 @@ impl Isolation {
             Isolation::RepeatableRead => "repeatable-read",
             Isolation::Serializable => "serializable",
             Isolation::DefraLevel => "defra-level",
+        }
+    }
+}
+
+/// What the transactions of a run do beside or in place of the point
+/// operations: the `DefraLevel` mechanisms the Elle models can record.
+///
+/// Every shape but `point` installs a key classifier when it runs at
+/// `defra-level`. README.md says what each records and why its history must
+/// hold the model it is checked against.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Shape {
+    /// Point reads and writes only, with no classifier: the workload every
+    /// level runs.
+    Point,
+    /// The point workload under a classifier, with every transaction also
+    /// storing a content-addressed block, adding a key of its own to a
+    /// commutative prefix it scans, and appending to a log.
+    Classified,
+    /// `list-append` where a key is a commit-ordered log: an append is
+    /// `Transaction::append`, and a read is the log read in one snapshot.
+    /// A transaction appends or reads, never both.
+    Appends,
+    /// `list-append` where a key is one part of a document: an append is an
+    /// operand on the part, and a read is `get_parts` naming it.
+    Parts,
+    /// Every read is one validated scan of the whole key prefix, recorded
+    /// as a read of every key.
+    Scan,
+}
+
+impl Shape {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Shape::Point => "point",
+            Shape::Classified => "classified",
+            Shape::Appends => "appends",
+            Shape::Parts => "parts",
+            Shape::Scan => "scan",
+        }
+    }
+
+    /// The one model a shape records, when it can record only one.
+    pub fn model(self) -> Option<Model> {
+        match self {
+            Shape::Appends | Shape::Parts => Some(Model::ListAppend),
+            Shape::Point | Shape::Classified | Shape::Scan => None,
         }
     }
 }
@@ -69,6 +116,7 @@ pub enum WorkerRole {
 pub struct Config {
     pub model: Model,
     pub isolation: Isolation,
+    pub shape: Shape,
     pub faults: Vec<Fault>,
     pub dir: PathBuf,
     pub out: PathBuf,
@@ -89,6 +137,7 @@ impl Default for Config {
         Self {
             model: Model::ListAppend,
             isolation: Isolation::ReadCommitted,
+            shape: Shape::Point,
             faults: Vec::new(),
             dir: PathBuf::from("db"),
             out: PathBuf::from("history.json"),
@@ -115,6 +164,8 @@ Options:
   --model <list-append|rw-register>   Workload model (default: list-append)
   --isolation <read-committed|snapshot-isolation|repeatable-read|serializable|defra-level>
                                       Requested isolation (default: read-committed)
+  --shape <point|classified|appends|parts|scan>
+                                      What the transactions do (default: point)
   --faults <kill,torn-write,truncate-wal|all>
                                       Fault injection (default: none)
   --dir <path>                        Database directory (default: db)
@@ -153,6 +204,16 @@ pub fn parse<I: Iterator<Item = String>>(mut args: I) -> Result<Config, String> 
                     other => return Err(format!("unknown isolation level {}", other)),
                 }
             }
+            "--shape" => {
+                cfg.shape = match value()?.as_str() {
+                    "point" => Shape::Point,
+                    "classified" => Shape::Classified,
+                    "appends" => Shape::Appends,
+                    "parts" => Shape::Parts,
+                    "scan" => Shape::Scan,
+                    other => return Err(format!("unknown shape {}", other)),
+                }
+            }
             "--faults" => cfg.faults = parse_faults(&value()?)?,
             "--dir" => cfg.dir = PathBuf::from(value()?),
             "--out" => cfg.out = PathBuf::from(value()?),
@@ -182,6 +243,22 @@ pub fn parse<I: Iterator<Item = String>>(mut args: I) -> Result<Config, String> 
     }
     if cfg.threads < 1 {
         return Err("--threads must be at least 1".to_string());
+    }
+    if cfg.shape == Shape::Classified && cfg.isolation != Isolation::DefraLevel {
+        return Err(
+            "--shape classified needs --isolation defra-level: only that level has a classifier"
+                .to_string(),
+        );
+    }
+    if let Some(model) = cfg.shape.model()
+        && model != cfg.model
+    {
+        return Err(format!(
+            "--shape {} records a {} history; pass --model {}",
+            cfg.shape.as_str(),
+            model.as_str(),
+            model.as_str()
+        ));
     }
     Ok(cfg)
 }

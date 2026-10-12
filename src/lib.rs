@@ -24,10 +24,12 @@
 //!
 //! # Quick Start
 //!
-//! ```no_run
+//! ```
 //! use regolith::{Db, Options};
 //!
-//! let db = Db::open("/tmp/my_db", Options::default()).unwrap();
+//! // In memory, so the example runs anywhere. With `Options::default()`
+//! // the database lives in the directory named here.
+//! let db = Db::open("my_db", Options::memory()).unwrap();
 //!
 //! // Write
 //! db.put(b"hello", b"world").unwrap();
@@ -78,6 +80,7 @@ mod perf_context;
 mod portability;
 mod rate_limiter;
 mod slice;
+mod snapshot_wait;
 mod sst_file_writer;
 mod statistics;
 mod stream_writer;
@@ -122,6 +125,7 @@ pub use options::{
 pub use perf_context::{PerfContext, PerfContextSnapshot, PerfLevel};
 pub use rate_limiter::{Priority, RateLimiter, TokenBucketRateLimiter};
 pub use slice::DbSlice;
+pub use snapshot_wait::SnapshotWait;
 pub use sst_file_writer::{IngestOptions, SstFileMeta, SstFileWriter};
 pub use statistics::{Histogram, HistogramSnapshot, Statistics, Ticker};
 pub use stream_writer::{StreamOptions, StreamingWriter};
@@ -135,13 +139,19 @@ pub use transaction::{
 
 /// The transactional API and the traits a caller implements, in one import:
 /// `use regolith::prelude::*;`.
+///
+/// Every trait a caller implements is here ([`KeyClassifier`],
+/// [`MergeOperator`], [`LogLayout`], [`TransactionHooks`], [`EventListener`],
+/// [`KeyProvider`], [`CompactionFilter`], [`Env`]), with the types its
+/// required methods name. The file traits an [`Env`] hands out stay in
+/// [`crate::env`].
 pub mod prelude {
     pub use crate::{
-        AbortReason, CommitInfo, CommitReceipt, CommitTicket, Conflict, Db, IoBudget, IoQueue,
-        IsolationLevel, JobTicket, KeyClass, KeyClassifier, KeyId, KeyMaterial, KeyProvider,
-        LockWait, LogLayout, MergeOperator, OptimisticTransactionDb, Options, QueueId, ReadMode,
-        RetryPolicy, StallWait, TransactError, Transaction, TransactionError, TransactionHooks,
-        TxResult, TxnOptions, WouldBlock,
+        AbortReason, CommitInfo, CommitReceipt, CommitTicket, CompactionDecision, CompactionFilter,
+        Conflict, Db, Env, EventListener, IoBudget, IoQueue, IsolationLevel, JobTicket, KeyClass,
+        KeyClassifier, KeyId, KeyMaterial, KeyProvider, LockWait, LogLayout, MergeOperator,
+        OptimisticTransactionDb, Options, QueueId, ReadMode, RetryPolicy, StallWait, TransactError,
+        Transaction, TransactionError, TransactionHooks, TxResult, TxnOptions, WouldBlock,
     };
 }
 pub use ttl::{DbWithTtl, TtlCompactionFilter, strip_timestamp};
@@ -431,7 +441,9 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// [`Error::WouldBlock`] with a [`WouldBlock::Stall`] wait, completed on the
 /// writer's own [`IoQueue`] once background work clears the stall; run the
 /// write again then, or wrap it in [`through_stalls`] to wait on this
-/// thread. A slowdown threshold delays nothing.
+/// thread. A slowdown threshold delays nothing. A transaction's commit is
+/// the exception, since it cannot be run again: it waits the stall out
+/// ([`Transaction::commit`], [`Transaction::commit_nowait`]).
 pub struct Db {
     engine: Arc<RegolithEngine>,
     durability: engine::DurabilityMode,
@@ -1130,7 +1142,7 @@ impl Db {
         }
     }
 
-    /// A new I/O queue for the calling thread (plan 4.10, D53).
+    /// A new I/O queue for the calling thread.
     ///
     /// Hand its [`IoQueue::id`] to the read handles this thread uses, in
     /// [`ReadMode::CacheOnly`] through [`Snapshot::with_read_mode`] or
@@ -1162,13 +1174,20 @@ impl Db {
     /// `Err`, then `None`, so a failure is never read as the end of the
     /// range.
     ///
-    /// ```no_run
+    /// ```
     /// # use regolith::{Db, Options};
-    /// # let db = Db::open("/tmp/scan_stream_doc", Options::default()).unwrap();
+    /// # let db = Db::open("users", Options::memory())?;
+    /// db.put(b"user:ada", b"1815")?;
+    /// db.put(b"user:bob", b"1970")?;
+    /// db.put(b"visit:1", b"ada")?;
+    ///
+    /// // `;` is the byte after `:`, so this is every key under `user:`.
+    /// let mut users = Vec::new();
     /// for entry in db.scan_stream(Some(b"user:"), Some(b"user;"))? {
     ///     let (key, value) = entry?;
-    ///     println!("{} is {} bytes", String::from_utf8_lossy(&key), value.len());
+    ///     users.push((key, value.len()));
     /// }
+    /// assert_eq!(users, [(b"user:ada".to_vec(), 4), (b"user:bob".to_vec(), 4)]);
     /// # Ok::<(), regolith::Error>(())
     /// ```
     pub fn scan_stream(&self, start: Option<&[u8]>, end: Option<&[u8]>) -> Result<ScanStream> {
@@ -1325,15 +1344,17 @@ impl Db {
         }
     }
 
-    /// Rotate the active memtable and write it to a level-0 SSTable,
-    /// on this thread, before returning.
+    /// Rotate the active memtable and see it written to a level-0
+    /// SSTable before returning.
     ///
     /// A no-op when the active memtable holds no entries and no range
     /// tombstones. This is the same flush a full memtable triggers on
     /// the write path, made explicit so a caller can decide when to
-    /// pay for it. Memtable flushes are written by the calling thread
-    /// in every mode, so this behaves identically with and without
-    /// background compaction workers.
+    /// pay for it. This thread writes the table, unless a compaction
+    /// worker gets to the sealed memtable first: the worker then writes
+    /// it, paced by [`Options::rate_limiter`] like the rest of its work,
+    /// and this call returns once the table is in level 0. With no
+    /// worker it is always this thread.
     ///
     /// Flushing does not compact: the new file lands in L0 and stays
     /// there until a compaction job merges it. See [`Db::compact_step`]
@@ -1367,10 +1388,14 @@ impl Db {
     ///
     /// A drain therefore looks like this, and stops only on `Idle`:
     ///
-    /// ```no_run
+    /// ```
     /// # use regolith::{CompactionOutcome, Db, Options};
     /// # fn main() -> regolith::Result<()> {
-    /// # let db = Db::open("/tmp/db", Options::default())?;
+    /// # let db = Db::open("rows", Options::memory())?;
+    /// # for round in 0..8u8 {
+    /// #     db.put(b"row", &[round])?;
+    /// #     db.flush()?;
+    /// # }
     /// loop {
     ///     match db.compact_step()? {
     ///         CompactionOutcome::DidWork => continue,
@@ -1378,6 +1403,8 @@ impl Db {
     ///         CompactionOutcome::Idle => break,
     ///     }
     /// }
+    /// # assert_eq!(db.compact_step()?, CompactionOutcome::Idle);
+    /// # assert_eq!(db.get(b"row")?, Some(vec![7]));
     /// # Ok(())
     /// # }
     /// ```
@@ -1414,6 +1441,31 @@ impl Db {
                 self.get_int_property(name).map(|v| v.to_string())
             }
         }
+    }
+
+    /// The statistics this database was opened with
+    /// ([`Options::statistics`]), or `None` when it was opened with none.
+    ///
+    /// It is the object the caller configured, not a copy: every handle on
+    /// this database adds to it, a ticker read through it is the total they
+    /// all added, and [`Statistics::reset`] through it zeroes it for all of
+    /// them. Clone the `Arc` to keep it past the database handle. A database
+    /// opened without statistics never makes one, so this stays `None` for
+    /// its whole life. What a read sees while updates run is stated on
+    /// [`Statistics`].
+    ///
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use regolith::{Db, Options, Statistics, Ticker};
+    /// let options = Options::memory().statistics(Some(Arc::new(Statistics::new())));
+    /// let db = Db::open("statistics-doc", options)?;
+    /// db.put(b"k", b"v")?;
+    /// let stats = db.statistics().expect("opened with statistics");
+    /// assert_eq!(stats.get_ticker(Ticker::KeysWritten), 1);
+    /// # Ok::<(), regolith::Error>(())
+    /// ```
+    pub fn statistics(&self) -> Option<&Arc<Statistics>> {
+        self.engine.statistics_shared()
     }
 
     /// What the environment this database was opened on can
@@ -1677,6 +1729,10 @@ impl Db {
     /// handle fail with [`Error::Closed`]. Calling `close` more than
     /// once is allowed.
     ///
+    /// Close does not give the directory back: it stays locked, and opening
+    /// it again fails, until this handle and every snapshot, iterator and
+    /// transaction made from it have been dropped.
+    ///
     /// Close syncs the write-ahead log and ends it with a record saying it
     /// is complete, so every write survives a power cut after `close`
     /// returns, under either durability mode. A close whose sync fails
@@ -1696,17 +1752,18 @@ impl Db {
         self.engine.close().map_err(Error::from)
     }
 
-    /// Block until no [`Snapshot`] and no snapshot-backed iterator is
-    /// live, returning how many pins were still outstanding when
-    /// `timeout` elapsed. `0` means the wait succeeded.
+    /// How many [`Snapshot`]s and snapshot-backed iterators are live, and a
+    /// wait for the last of them to be released. The call itself never
+    /// waits: it returns a [`SnapshotWait`] at once.
     ///
     /// A snapshot pins the SSTables it can see, so closing a database
     /// while one is outstanding leaves those files on disk and their
     /// readers open. An embedder that wants a clean shutdown has to wait
-    /// for its readers to finish, and this is that wait: it blocks on
-    /// the release itself rather than polling a counter, so it costs
-    /// nothing while it waits and adds no latency once the last reader
-    /// is done.
+    /// for its readers to finish, and the handle is that wait: ask it
+    /// ([`SnapshotWait::pinned`]), await it from a task, or block on it by
+    /// name ([`SnapshotWait::wait`]). Either wait is for the release
+    /// itself rather than a polled counter, so it costs nothing while it
+    /// waits and adds no latency once the last reader is done.
     ///
     /// Counts pins, not handles. An iterator taken from a snapshot pins
     /// it again for as long as the iterator lives, so a `Snapshot` that
@@ -1714,17 +1771,10 @@ impl Db {
     /// exactly the case an embedder tracking its own transaction objects
     /// would miss.
     ///
-    /// Returns a count rather than an error because whether outstanding
-    /// readers are a failure is the caller's decision: [`Db::close`]
-    /// does not require this wait, and a database closed with snapshots
-    /// live is consistent, just not tidy.
-    ///
-    /// The timeout is measured on the clock of [`Options::env`]. Where the
-    /// env has no clock the wait is one wait of `timeout`, ended early by
-    /// the last release. On a target with a single thread (wasm without
-    /// the `atomics` feature) nothing can release a pin while this call
-    /// waits, so it returns the count at once without waiting: release the
-    /// snapshots first, then call it.
+    /// The handle reports a count rather than an error because whether
+    /// outstanding readers are a failure is the caller's decision:
+    /// [`Db::close`] does not require this wait, and a database closed with
+    /// snapshots live is consistent, just not tidy.
     ///
     /// ```
     /// # use std::time::Duration;
@@ -1735,16 +1785,19 @@ impl Db {
     /// db.put(b"k", b"v")?;
     ///
     /// let snapshot = db.snapshot();
-    /// assert_eq!(db.wait_for_snapshots(Duration::from_millis(50)), 1);
+    /// let readers = db.wait_for_snapshots();
+    /// assert_eq!(readers.pinned(), 1);
+    /// assert_eq!(readers.wait(Duration::from_millis(50)), 1);
     ///
     /// drop(snapshot);
-    /// assert_eq!(db.wait_for_snapshots(Duration::from_secs(5)), 0);
+    /// assert!(readers.is_ready());
+    /// assert_eq!(readers.wait(Duration::from_secs(5)), 0);
     /// db.close()?;
     /// # Ok(())
     /// # }
     /// ```
-    pub fn wait_for_snapshots(&self, timeout: std::time::Duration) -> u64 {
-        self.engine.wait_for_snapshots(timeout)
+    pub fn wait_for_snapshots(&self) -> SnapshotWait {
+        SnapshotWait::new(Arc::clone(&self.engine))
     }
 
     /// Test-only: number of SSTable files at `level`.
@@ -3272,6 +3325,9 @@ mod write_limit_tests;
 
 #[cfg(all(test, not(target_family = "wasm")))]
 mod cf_race_tests;
+
+#[cfg(all(test, not(target_family = "wasm")))]
+mod prefix_form_tests;
 
 #[cfg(test)]
 mod tests {

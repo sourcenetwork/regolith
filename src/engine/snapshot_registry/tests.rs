@@ -476,3 +476,91 @@ fn with_no_clock_the_wait_is_one_wait_of_the_timeout() {
     assert_eq!(r.wait_until_drained(Duration::from_secs(60)), 0);
     releaser.join().unwrap();
 }
+
+/// Counts the times it is woken.
+#[derive(Default)]
+struct Wakes(std::sync::atomic::AtomicUsize);
+
+impl std::task::Wake for Wakes {
+    fn wake(self: Arc<Self>) {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+impl Wakes {
+    fn count(&self) -> usize {
+        self.0.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+/// The awaited wait runs the same rounds: it counts itself in, is woken by
+/// the release of an entry it saw taken, looks again, and is over only when
+/// nothing is pinned.
+#[test]
+fn an_awaited_wait_is_woken_by_each_release_and_ends_with_the_last() {
+    use std::future::Future;
+    use std::task::{Context, Poll, Waker};
+
+    let r = SnapshotRegistry::new();
+    let wakes = Arc::new(Wakes::default());
+    let waker = Waker::from(Arc::clone(&wakes));
+    let mut cx = Context::from_waker(&waker);
+    let first = pin_at(&r, 3);
+    let second = pin_at(&r, 4);
+
+    let mut wait = std::pin::pin!(r.until_drained());
+    assert_eq!(r.waiting(), 0, "nothing is counted before the first poll");
+    assert_eq!(wait.as_mut().poll(&mut cx), Poll::Pending);
+    assert_eq!(r.waiting(), 1);
+
+    r.release(first);
+    assert_eq!((r.wakes_issued(), wakes.count()), (1, 1));
+    assert_eq!(
+        wait.as_mut().poll(&mut cx),
+        Poll::Pending,
+        "one pin is still held"
+    );
+
+    r.release(second);
+    assert_eq!((r.wakes_issued(), wakes.count()), (2, 2));
+    assert_eq!(wait.as_mut().poll(&mut cx), Poll::Ready(()));
+    assert_eq!(r.waiting(), 0, "a finished wait is counted out");
+}
+
+/// Dropping a pending wait counts it out and withdraws its notification:
+/// the release after it issues no wake and wakes no task.
+#[test]
+fn a_dropped_awaited_wait_leaves_no_count_and_is_not_woken() {
+    use std::future::Future;
+    use std::task::{Context, Poll, Waker};
+
+    let r = SnapshotRegistry::new();
+    let wakes = Arc::new(Wakes::default());
+    let waker = Waker::from(Arc::clone(&wakes));
+    let mut cx = Context::from_waker(&waker);
+    let pin = pin_at(&r, 3);
+    {
+        let mut wait = std::pin::pin!(r.until_drained());
+        assert_eq!(wait.as_mut().poll(&mut cx), Poll::Pending);
+        assert_eq!(r.waiting(), 1);
+    }
+    assert_eq!(r.waiting(), 0);
+    r.release(pin);
+    assert_eq!((r.wakes_issued(), wakes.count()), (0, 0));
+}
+
+/// With nothing pinned the awaited wait is over at its first poll.
+#[test]
+fn an_awaited_wait_with_nothing_pinned_is_ready_at_once() {
+    use std::future::Future;
+    use std::task::{Context, Poll, Waker};
+
+    let r = SnapshotRegistry::new();
+    let waker = Waker::from(Arc::new(Wakes::default()));
+    let mut wait = std::pin::pin!(r.until_drained());
+    assert_eq!(
+        wait.as_mut().poll(&mut Context::from_waker(&waker)),
+        Poll::Ready(())
+    );
+    assert_eq!(r.waiting(), 0);
+}

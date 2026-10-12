@@ -10,6 +10,7 @@
 //! The oracle in every case is the forward scan, sorted. A backward walk
 //! that disagrees with it has either skipped a key or invented one, and
 //! the failure message prints both sequences.
+#![cfg(not(target_arch = "wasm32"))]
 
 use std::collections::BTreeSet;
 

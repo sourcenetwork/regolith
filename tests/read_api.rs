@@ -1,5 +1,6 @@
 //! Public-API coverage for the reads that answer without handing back
 //! a copy: `has`, `get_size`, and the iterator's `value_slice`.
+#![cfg(not(target_arch = "wasm32"))]
 
 use proptest::prelude::*;
 use regolith::{Db, MergeOperator, Options, WriteBatch};
@@ -303,14 +304,14 @@ fn waiting_for_snapshots_counts_iterator_pins_not_just_snapshot_handles() {
     }
 
     assert_eq!(
-        db.wait_for_snapshots(Duration::from_secs(5)),
+        db.wait_for_snapshots().wait(Duration::from_secs(5)),
         0,
         "a database with no readers must not wait at all",
     );
 
     let snapshot = db.snapshot();
     assert_eq!(
-        db.wait_for_snapshots(Duration::from_millis(50)),
+        db.wait_for_snapshots().wait(Duration::from_millis(50)),
         1,
         "a live snapshot must be counted",
     );
@@ -319,18 +320,146 @@ fn waiting_for_snapshots_counts_iterator_pins_not_just_snapshot_handles() {
     // handle is not enough.
     let iter = snapshot.into_owned_iter();
     assert_eq!(
-        db.wait_for_snapshots(Duration::from_millis(50)),
+        db.wait_for_snapshots().wait(Duration::from_millis(50)),
         1,
         "an iterator outliving its snapshot handle must keep the pin",
     );
 
     drop(iter);
     assert_eq!(
-        db.wait_for_snapshots(Duration::from_secs(5)),
+        db.wait_for_snapshots().wait(Duration::from_secs(5)),
         0,
         "every pin was released, so the wait must return immediately",
     );
     db.close().expect("close");
+}
+
+/// Asking about the snapshots never waits: the call returns with the pins
+/// live now while this very thread still holds one, which a call that waited
+/// for the release could never do. The handle it returns reports the count
+/// again each time it is asked.
+#[test]
+fn asking_about_snapshots_returns_at_once_with_what_is_pinned() {
+    let db = Db::open("snapshots-status", Options::memory()).expect("open");
+    let status = db.wait_for_snapshots();
+    assert_eq!(status.pinned(), 0);
+    assert!(status.is_ready());
+
+    let snapshot = db.snapshot();
+    let iter = snapshot.owned_iter();
+    let held = db.wait_for_snapshots();
+    assert_eq!(held.pinned(), 2, "the handle and its iterator each pin");
+    assert!(!held.is_ready());
+    assert_eq!(status.pinned(), 2, "a handle reports what is pinned now");
+
+    drop(snapshot);
+    assert_eq!(held.pinned(), 1);
+    assert!(!held.is_ready());
+    drop(iter);
+    assert_eq!(held.pinned(), 0);
+    assert!(held.is_ready());
+}
+
+/// Counts the times it is woken.
+#[derive(Default)]
+struct Wakes(std::sync::atomic::AtomicUsize);
+
+impl std::task::Wake for Wakes {
+    fn wake(self: Arc<Self>) {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Polled as a future, the wait is pending while a snapshot is pinned and
+/// wakes its task when the last pin is released, with nothing blocking and
+/// no timer: the release itself wakes it.
+#[test]
+fn the_wait_is_a_future_that_the_last_release_wakes() {
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::atomic::Ordering;
+    use std::task::{Context, Poll, Waker};
+
+    let db = Db::open("snapshots-future", Options::memory()).expect("open");
+    let wakes = Arc::new(Wakes::default());
+    let waker = Waker::from(Arc::clone(&wakes));
+    let mut cx = Context::from_waker(&waker);
+
+    // Nothing pinned: ready at the first poll.
+    let mut idle = db.wait_for_snapshots();
+    assert_eq!(Pin::new(&mut idle).poll(&mut cx), Poll::Ready(()));
+
+    let first = db.snapshot();
+    let second = db.snapshot();
+    let mut wait = db.wait_for_snapshots();
+    assert_eq!(Pin::new(&mut wait).poll(&mut cx), Poll::Pending);
+    assert_eq!(wakes.0.load(Ordering::SeqCst), 0);
+
+    // One pin left: whether or not the release woke the task, the wait is
+    // still pending when polled.
+    drop(first);
+    assert_eq!(Pin::new(&mut wait).poll(&mut cx), Poll::Pending);
+    let before = wakes.0.load(Ordering::SeqCst);
+
+    drop(second);
+    assert!(
+        wakes.0.load(Ordering::SeqCst) > before,
+        "the release of the last pin must wake the waiting task"
+    );
+    assert_eq!(Pin::new(&mut wait).poll(&mut cx), Poll::Ready(()));
+
+    // Ready said nothing was pinned then. A wait polled again starts over.
+    let third = db.snapshot();
+    assert_eq!(Pin::new(&mut wait).poll(&mut cx), Poll::Pending);
+    drop(third);
+    assert_eq!(Pin::new(&mut wait).poll(&mut cx), Poll::Ready(()));
+}
+
+/// A task that awaits the wait on one thread is resumed by a release on
+/// another, in whichever order the two happen.
+#[test]
+fn a_release_on_another_thread_resumes_the_awaiting_task() {
+    let db = Db::open("snapshots-await", Options::memory()).expect("open");
+    for _ in 0..200 {
+        let snapshot = db.snapshot();
+        std::thread::scope(|scope| {
+            let waiter = scope.spawn(|| {
+                let mut queue = db.io_queue();
+                queue.block_on(db.wait_for_snapshots());
+            });
+            drop(snapshot);
+            waiter.join().expect("the awaiting task finished");
+        });
+        assert_eq!(db.wait_for_snapshots().pinned(), 0);
+    }
+}
+
+/// A wait dropped while pending leaves nothing behind: later releases and
+/// later waits behave as if it had never been polled.
+#[test]
+fn a_wait_dropped_while_pending_is_withdrawn() {
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::atomic::Ordering;
+    use std::task::{Context, Poll, Waker};
+
+    let db = Db::open("snapshots-dropped-wait", Options::memory()).expect("open");
+    let wakes = Arc::new(Wakes::default());
+    let waker = Waker::from(Arc::clone(&wakes));
+    let mut cx = Context::from_waker(&waker);
+
+    let snapshot = db.snapshot();
+    let mut abandoned = db.wait_for_snapshots();
+    assert_eq!(Pin::new(&mut abandoned).poll(&mut cx), Poll::Pending);
+    drop(abandoned);
+    drop(snapshot);
+    assert_eq!(
+        wakes.0.load(Ordering::SeqCst),
+        0,
+        "a withdrawn wait is not woken"
+    );
+    let mut fresh = db.wait_for_snapshots();
+    assert_eq!(Pin::new(&mut fresh).poll(&mut cx), Poll::Ready(()));
 }
 
 /// The wait must return as soon as the last reader finishes rather than
@@ -353,7 +482,7 @@ fn waiting_for_snapshots_returns_as_soon_as_the_last_reader_finishes() {
     };
 
     let started = std::time::Instant::now();
-    let outstanding = db.wait_for_snapshots(Duration::from_secs(30));
+    let outstanding = db.wait_for_snapshots().wait(Duration::from_secs(30));
     let waited = started.elapsed();
     holder.join().expect("holder");
 

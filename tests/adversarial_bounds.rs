@@ -6,6 +6,7 @@
 //! staged group and rotates once per group, so this file measures what
 //! the active memtable actually reaches rather than assuming the bound
 //! holds.
+#![cfg(not(target_arch = "wasm32"))]
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};

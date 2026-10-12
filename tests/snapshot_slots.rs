@@ -75,7 +75,8 @@ fn snapshots_dropped_on_other_threads_are_released_exactly() {
         worker.join().unwrap();
     }
     assert_eq!(live_snapshots(&db), 0);
-    assert_eq!(db.wait_for_snapshots(std::time::Duration::from_secs(5)), 0);
+    let readers = db.wait_for_snapshots();
+    assert_eq!(readers.wait(std::time::Duration::from_secs(5)), 0);
 }
 
 /// A snapshot taken on one thread, moved to another, keeps its version

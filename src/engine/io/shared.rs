@@ -56,6 +56,9 @@ pub(crate) enum Message {
     /// An open-file slot freed that a unit this queue parked was waiting
     /// for (D60): run the queue's parked units again.
     SlotFreed,
+    /// A timed wait on this queue: `slot` is ready at the owner's first
+    /// poll that finds the queue's clock at `due` microseconds or later.
+    Timer { due: u64, slot: Arc<WaitSlot> },
 }
 
 /// What a finished unit left for the reads of one queue.

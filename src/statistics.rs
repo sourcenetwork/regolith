@@ -6,7 +6,8 @@
 //! caller then polls the `Statistics` object (via
 //! [`Statistics::get_ticker`], [`Statistics::get_histogram_snapshot`],
 //! or [`Statistics::to_string`]) to export the values to their
-//! monitoring stack of choice.
+//! monitoring stack of choice. A caller that kept only the database
+//! reads the same object back with [`crate::Db::statistics`].
 //!
 //! # Metric names
 //!
@@ -87,7 +88,9 @@ pub enum Ticker {
     /// populated the cache).
     BlockCacheAdd = 9,
     /// Bloom-filter "useful" hits - the filter correctly
-    /// answered "not present" and spared a block read.
+    /// answered "not present" and spared a block read. Counts a point
+    /// lookup a table's key filter ruled out, and a table a prefix seek's
+    /// prefix filter ruled out.
     BloomFilterUseful = 10,
     /// Bloom-filter "full positive" hits - the filter said
     /// "maybe", and the key was actually present in the block.
@@ -110,12 +113,13 @@ pub enum Ticker {
     IterSeekCount = 19,
     /// Number of `Iter::next` calls that produced a key.
     IterNextCount = 20,
-    /// Microseconds writers spent relieving a write stall inline before the
-    /// write went on: plain writes and transactional commits that carry
-    /// writes alike, on a database with no compaction worker and
-    /// [`crate::Options::inline_compaction`] on. No write waits on a stall,
-    /// so nothing else is counted; relief that ends in a busy or closed
-    /// error is not counted either.
+    /// Microseconds threads spent held by a write stall: relieving it
+    /// inline, or blocked until it cleared (a commit that waits a stop out,
+    /// [`crate::StallWait::wait`]).
+    ///
+    /// A wait that is polled or awaited on a queue holds no thread and is
+    /// not counted, nor is inline relief that ends in a busy or closed
+    /// error.
     WriteStallMicros = 21,
     /// Number of snapshots registered via `Db::snapshot`.
     SnapshotsRegistered = 22,
@@ -177,13 +181,21 @@ pub enum Ticker {
     /// block still uses it, uncached. A steady count means the cache is too
     /// small for the blocks readers hold at once.
     BlockCacheAddRefusedHeld = 36,
+    /// The subset of [`Ticker::CommitConflicts`] where the newer write
+    /// that decided the race was a delete or a range delete: a key the
+    /// transaction read or wrote was removed after its snapshot. It says
+    /// what the newer write was, where [`Ticker::CommitConflictsOnRead`]
+    /// and [`Ticker::CommitConflictsOnWrite`] say what the transaction
+    /// did with the key, so one conflict can count here and there. A
+    /// key deleted and then put again counts as a conflict with the put.
+    CommitConflictsAfterDelete = 37,
     /// Compaction jobs run because more than half of the entries they read
     /// were deletions and the entries those delete. Each is also counted in
     /// [`Ticker::CompactionCount`]. Level and universal compaction only.
-    CompactionDeletionTriggered = 37,
+    CompactionDeletionTriggered = 38,
 }
 
-const NUM_TICKERS: usize = 38;
+const NUM_TICKERS: usize = 39;
 
 impl Ticker {
     /// Every defined ticker, in discriminant order. Adding a variant
@@ -226,6 +238,7 @@ impl Ticker {
         Ticker::ManifestTailDiscarded,
         Ticker::ManifestTailDiscardedBytes,
         Ticker::BlockCacheAddRefusedHeld,
+        Ticker::CommitConflictsAfterDelete,
         Ticker::CompactionDeletionTriggered,
     ];
 
@@ -269,6 +282,7 @@ impl Ticker {
             Ticker::ManifestTailDiscarded => "regolith.manifest.tail_discarded",
             Ticker::ManifestTailDiscardedBytes => "regolith.manifest.tail_discarded_bytes",
             Ticker::BlockCacheAddRefusedHeld => "regolith.block_cache.add_refused_held",
+            Ticker::CommitConflictsAfterDelete => "regolith.commit.conflicts_after_delete",
             Ticker::CompactionDeletionTriggered => "regolith.compaction.deletion_triggered",
         }
     }

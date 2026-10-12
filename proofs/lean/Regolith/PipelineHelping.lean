@@ -53,6 +53,7 @@ states a fact and its proof follows `:= by`. Lines starting with `--` are
 comments. Inside a proof, each step is commented with what it establishes.
 -/
 
+-- Everything below is named Regolith.PipelineHelping.<name>.
 namespace Regolith.PipelineHelping
 
 /-! ## The stages of a slot, and the steps between them -/
@@ -69,6 +70,7 @@ inductive Kind where
   | abort
   /-- An ordered unit: an ingest's install, a rotation, a close. -/
   | unit
+  -- Two such values can be compared for equality.
   deriving DecidableEq
 
 /-- How far a slot has come, in the order the stages are passed. -/
@@ -93,6 +95,7 @@ inductive Stage where
   | shown
   /-- The published frontier passed it: its owner's call returns. -/
   | finished
+  -- Two such values can be compared for equality.
   deriving DecidableEq
 
 /-- The stages as numbers, so that "further on" is "greater". -/
@@ -140,6 +143,7 @@ inductive Step where
   | passFrontier
   /-- Claim and run an ordered unit. -/
   | runUnit
+  -- Two such values can be compared for equality.
   deriving DecidableEq
 
 /-- One slot: what it holds and how far it has come. -/
@@ -148,6 +152,7 @@ structure Cell where
   kind : Kind
   /-- How far it has come. -/
   stage : Stage
+  -- Two such values can be compared for equality.
   deriving DecidableEq
 
 /-- The next step of a slot and the stage it leads to, or `none` when the
@@ -312,21 +317,22 @@ taken: every ordering rule is met, because every rule looks back only. -/
 theorem first_unfinished_can_step (before : List Cell) (step : Step)
     -- Every slot before this one is finished.
     (hbefore : ∀ b ∈ before, b.stage = .finished) :
+    -- The claim itself; its proof follows.
     Enabled true before step := by
   -- The three rules, one by one.
   refine ⟨?_, ?_, ?_⟩
-  · -- Settled: a finished slot is past settled.
-    intro _ b hb
+  -- Settled: a finished slot is past settled.
+  · intro _ b hb
     -- It is finished...
     rw [hbefore b hb]
     -- ...and finished ranks above settled.
     decide
-  · -- Finished: take any earlier slot.
-    intro _ b hb
+  -- Finished: take any earlier slot.
+  · intro _ b hb
     -- That it is finished is the hypothesis itself.
     exact hbefore b hb
-  · -- The round: whatever the step needs...
-    intro _
+  -- The round: whatever the step needs...
+  · intro _
     -- ...the round is free.
     rfl
 
@@ -338,14 +344,17 @@ theorem unfinished_has_next (c : Cell)
     (hun : c.stage ≠ .finished) : ∃ step st, next c = some (step, st) := by
   -- Well formed means finished, or with a next step.
   cases hwf with
+  -- Case: the left alternative holds.
   | inl hfin =>
     -- Finished is ruled out.
     exact absurd hfin hun
+  -- Case: the right alternative holds.
   | inr hsome =>
     -- A next step exists: look at what `next` gives.
     match hn : next c with
     -- A step and a stage: those are the ones asked for.
     | some (step, st) => exact ⟨step, st, rfl⟩
+    -- Case: there is none.
     | none =>
       -- No next step contradicts the hypothesis.
       simp [hn] at hsome
@@ -356,11 +365,13 @@ is still well formed. -/
 theorem step_advances (c : Cell) (step : Step) (st : Stage)
     -- `step` is the slot's next step, and leads to stage `st`.
     (hn : next c = some (step, st)) :
+    -- The claim itself; its proof follows.
     rank c.stage < rank st ∧ todo ⟨c.kind, st⟩ + 1 = todo c ∧ WellFormed ⟨c.kind, st⟩ := by
   -- Name the slot's kind and stage.
   obtain ⟨k, s0⟩ := c
   -- Go through every kind and stage: each case is read off the tables.
   cases k <;> cases s0 <;> simp [next] at hn <;> obtain ⟨rfl, rfl⟩ := hn <;>
+    -- (Each case then holds by reading the tables.)
     simp [rank, todo, WellFormed, next]
 
 /-- **No step goes back.** Whatever thread takes whatever step on whatever
@@ -385,17 +396,21 @@ theorem finished_of_todo_zero (c : Cell)
     (hz : todo c = 0) : c.stage = .finished := by
   -- Well formed means finished, or with a next step.
   cases hwf with
+  -- Case: the left alternative holds.
   | inl hfin =>
     -- Finished: nothing to show.
     exact hfin
+  -- Case: the right alternative holds.
   | inr hsome =>
     -- With a next step the slot needs at least one step: name the step.
     match hn : next c with
+    -- Case: there is one.
     | some (step, st) =>
       -- Then `todo c` is one more than something...
       have := (step_advances c step st hn).2.1
       -- ...so it is not zero.
       omega
+    -- Case: there is none.
     | none =>
       -- No next step contradicts the hypothesis.
       simp [hn] at hsome
@@ -433,15 +448,18 @@ theorem helper_step_makes_progress (l : List Cell)
     (hwf : ∀ c ∈ l, WellFormed c)
     -- Some step is still needed.
     (hpos : 0 < total l) :
+    -- The claim itself; its proof follows.
     total (helperStep l) + 1 = total l ∧ (∀ c ∈ helperStep l, WellFormed c) ∧
       ∃ before c after step st, l = before ++ c :: after ∧
         (∀ b ∈ before, b.stage = .finished) ∧ next c = some (step, st) ∧
         Enabled true before step := by
   -- By induction on the slots.
   induction l with
+  -- Case: the empty list.
   | nil =>
     -- No slot needs no step: the hypothesis is false.
     simp [total] at hpos
+  -- Case: a first element and then the rest, the claim known for the rest (ih).
   | cons c rest ih =>
     -- The first slot is well formed...
     have hc : WellFormed c := hwf c (List.mem_cons_self)
@@ -449,8 +467,8 @@ theorem helper_step_makes_progress (l : List Cell)
     have hrest : ∀ x ∈ rest, WellFormed x := fun x hx => hwf x (List.mem_cons_of_mem _ hx)
     -- Is the first slot finished?
     by_cases hfin : c.stage = .finished
-    · -- It is, so it needs nothing: the work left is in the rest.
-      have hz : todo c = 0 := by
+    -- It is, so it needs nothing: the work left is in the rest.
+    · have hz : todo c = 0 := by
         -- Name its kind; its stage is `finished`.
         obtain ⟨k, s0⟩ := c
         -- Read the hypothesis as a fact about that stage...
@@ -467,10 +485,10 @@ theorem helper_step_makes_progress (l : List Cell)
       obtain ⟨ht, hw, before, c', after, step, st, hl, hb, hn, he⟩ := ih hrest hpos'
       -- Put the finished slot back in front of each part.
       refine ⟨?_, ?_, c :: before, c', after, step, st, ?_, ?_, hn, ?_⟩
-      · -- The count: the first slot adds nothing on either side.
-        simp [helperStep, hfin, total, hz, ht]
-      · -- Well formed: the first slot is unchanged, the rest by induction.
-        intro x hx
+      -- The count: the first slot adds nothing on either side.
+      · simp [helperStep, hfin, total, hz, ht]
+      -- Well formed: the first slot is unchanged, the rest by induction.
+      · intro x hx
         -- `x` is the first slot or one of the stepped rest.
         simp [helperStep, hfin] at hx
         -- Either way it is well formed.
@@ -479,10 +497,10 @@ theorem helper_step_makes_progress (l : List Cell)
         | inl h => exact h ▸ hc
         -- One of the rest: by induction.
         | inr h => exact hw x h
-      · -- The list splits at the same slot, one place later.
-        simp [hl]
-      · -- Every slot before it is finished: the first one, and the others.
-        intro b hb'
+      -- The list splits at the same slot, one place later.
+      · simp [hl]
+      -- Every slot before it is finished: the first one, and the others.
+      · intro b hb'
         -- `b` is the first slot or one of `before`.
         simp at hb'
         -- Look at which.
@@ -491,8 +509,8 @@ theorem helper_step_makes_progress (l : List Cell)
         | inl h => exact h ▸ hfin
         -- One of `before` is finished by induction.
         | inr h => exact hb b h
-      · -- The step is enabled: every slot before it is finished.
-        exact first_unfinished_can_step (c :: before) step (by
+      -- The step is enabled: every slot before it is finished.
+      · exact first_unfinished_can_step (c :: before) step (by
           -- Take any slot before it.
           intro b hb'
           -- It is the first slot or one of `before`.
@@ -503,18 +521,18 @@ theorem helper_step_makes_progress (l : List Cell)
           | inl h => exact h ▸ hfin
           -- One of `before` is finished by induction.
           | inr h => exact hb b h)
-    · -- It is not: it is the first unfinished slot, and has a next step.
-      obtain ⟨step, st, hn⟩ := unfinished_has_next c hc hfin
+    -- It is not: it is the first unfinished slot, and has a next step.
+    · obtain ⟨step, st, hn⟩ := unfinished_has_next c hc hfin
       -- That step moves it one stage on.
       obtain ⟨_, htodo, hwf'⟩ := step_advances c step st hn
       -- Nothing stands before it.
       refine ⟨?_, ?_, [], c, rest, step, st, rfl, ?_, hn, ?_⟩
-      · -- The count: unfold the helper's step and the totals.
-        simp [helperStep, hfin, hn, total]
+      -- The count: unfold the helper's step and the totals.
+      · simp [helperStep, hfin, hn, total]
         -- This slot needs one step fewer, the rest the same.
         omega
-      · -- Well formed: take any slot after the step.
-        intro x hx
+      -- Well formed: take any slot after the step.
+      · intro x hx
         -- `x` is the stepped slot or one of the rest.
         simp [helperStep, hfin, hn] at hx
         -- Look at which.
@@ -523,12 +541,12 @@ theorem helper_step_makes_progress (l : List Cell)
         | inl h => exact h ▸ hwf'
         -- One of the rest: as before.
         | inr h => exact hrest x h
-      · -- No slot is before it: suppose there were one.
-        intro b hb
+      -- No slot is before it: suppose there were one.
+      · intro b hb
         -- The empty list has no member.
         simp at hb
-      · -- The step is enabled: there is nothing before it to wait for.
-        exact first_unfinished_can_step [] step (by
+      -- The step is enabled: there is nothing before it to wait for.
+      · exact first_unfinished_can_step [] step (by
           -- Suppose there were a slot before it.
           intro b hb
           -- The empty list has no member.
@@ -549,11 +567,13 @@ theorem all_finished_of_total_zero (l : List Cell)
     (hz : total l = 0) : ∀ c ∈ l, c.stage = .finished := by
   -- By induction on the slots.
   induction l with
+  -- Case: the empty list.
   | nil =>
     -- No slot: suppose there were one.
     intro c hc
     -- The empty list has no member.
     simp at hc
+  -- Case: a first element and then the rest, the claim known for the rest (ih).
   | cons c rest ih =>
     -- The first slot needs nothing...
     have h1 : todo c = 0 := by
@@ -573,9 +593,11 @@ theorem all_finished_of_total_zero (l : List Cell)
     simp at hx
     -- Look at which.
     cases hx with
+    -- Case: the left alternative holds.
     | inl h =>
       -- The first: well formed and needing nothing, so finished.
       exact h ▸ finished_of_todo_zero c (hwf c (List.mem_cons_self)) h1
+    -- Case: the right alternative holds.
     | inr h =>
       -- One of the rest: by induction.
       exact ih (fun y hy => hwf y (List.mem_cons_of_mem _ hy)) h2 x h
@@ -591,10 +613,13 @@ theorem helper_alone_finishes (l : List Cell)
     (hwf : ∀ c ∈ l, WellFormed c) : ∀ c ∈ run (total l) l, c.stage = .finished := by
   -- By induction on the number of steps needed, for every list of slots.
   generalize hn : total l = n
+  -- Induct on that number, for every list of slots.
   induction n generalizing l with
+  -- Case: zero.
   | zero =>
     -- No step needed: every slot is finished already.
     exact all_finished_of_total_zero l hwf hn
+  -- Case: one more, the claim known for the number before (ih).
   | succ n ih =>
     -- Work is left...
     have hpos : 0 < total l := by omega
@@ -616,9 +641,11 @@ no thread serves an unbounded queue of others. -/
 theorem helping_is_bounded (l : List Cell) : total l ≤ 8 * l.length := by
   -- By induction on the slots.
   induction l with
+  -- Case: the empty list.
   | nil =>
     -- No slot, no step.
     simp [total]
+  -- Case: a first element and then the rest, the claim known for the rest (ih).
   | cons c rest ih =>
     -- The first slot needs at most eight.
     have := todo_le c
@@ -640,4 +667,5 @@ theorem held_round_blocks (before : List Cell) : ¬ Enabled false before .sync :
   -- `false = true` is absurd.
   exact Bool.noConfusion this
 
+-- The end of this file's names.
 end Regolith.PipelineHelping

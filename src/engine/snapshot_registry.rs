@@ -84,7 +84,8 @@
 //! waiter marks each chunk watched in the same read-modify-write that reads
 //! its taken bits, and a release that frees an entry learns of the mark in
 //! the read-modify-write that clears the entry's bit, then wakes the
-//! waiters through a [`Notify`].
+//! waiters through a [`Notify`]. [`SnapshotRegistry::until_drained`] is the
+//! same wait for a task: it awaits the notification instead of parking.
 
 mod chain;
 #[cfg(all(test, not(loom)))]
@@ -109,7 +110,8 @@ use crate::sync::{Notified, Notify};
 pub(crate) struct SnapshotRegistry {
     /// One per thread number; the length is a power of two.
     slots: Box<[CachePadded<Slot>]>,
-    /// Threads inside [`Self::wait_until_drained`]. A release that frees an
+    /// Waits in progress: threads inside [`Self::wait_until_drained`] and
+    /// tasks awaiting [`Self::until_drained`]. A release that frees an
     /// entry in a watched chunk wakes the waiters only when this is nonzero.
     watchers: AtomicUsize,
     /// Woken when an entry in a watched chunk goes free.
@@ -432,20 +434,45 @@ impl SnapshotRegistry {
         &self,
         mut park: impl FnMut(std::pin::Pin<&mut Notified<'_>>, u64) -> ControlFlow<u64>,
     ) -> u64 {
-        self.watchers.fetch_add(1, Ordering::AcqRel);
-        let outstanding = loop {
-            // Created before the watch: see above.
-            let mut notified = std::pin::pin!(self.drained.notified());
-            let (taken, pins) = self.watch();
+        let _watching = Watching::enter(&self.watchers);
+        loop {
+            let (notified, taken, pins) = self.round();
             if !taken {
                 break 0;
             }
+            let mut notified = std::pin::pin!(notified);
             if let ControlFlow::Break(pins) = park(notified.as_mut(), pins) {
                 break pins;
             }
-        };
-        self.watchers.fetch_sub(1, Ordering::AcqRel);
-        outstanding
+        }
+    }
+
+    /// The same rounds as [`Self::wait_drained`], with the waiting left to
+    /// the task that awaits this: over once no snapshot is pinned.
+    ///
+    /// Nothing blocks and no clock is read. The release that frees the last
+    /// entry a round saw taken wakes the task, on the releasing thread.
+    /// Dropping the wait half way counts the waiter out and withdraws its
+    /// notification, so a release after that wakes nobody for it.
+    pub(crate) async fn until_drained(&self) {
+        let _watching = Watching::enter(&self.watchers);
+        loop {
+            let (notified, taken, _) = self.round();
+            if !taken {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    /// One round of the drain wait: the notification, then whether any entry
+    /// is taken and the pins outstanding. The notification is created before
+    /// the chunks are marked and read, which is what makes a release that
+    /// lands in between show in it (`MC_SnapshotWait_Red_FutureAfterWatch`).
+    fn round(&self) -> (Notified<'_>, bool, u64) {
+        let notified = self.drained.notified();
+        let (taken, pins) = self.watch();
+        (notified, taken, pins)
     }
 
     /// Marks every chunk watched and reads it: whether any entry is taken,
@@ -498,6 +525,24 @@ impl SnapshotRegistry {
     #[cfg(test)]
     pub(crate) fn wakes_issued(&self) -> usize {
         self.wakes.load(Ordering::Relaxed)
+    }
+}
+
+/// One waiter counted in [`SnapshotRegistry::watchers`] for as long as this
+/// lives, so a wait that ends early, by a timeout, a drop or a panic, is
+/// counted out like one that ran to its end.
+struct Watching<'a>(&'a AtomicUsize);
+
+impl<'a> Watching<'a> {
+    fn enter(watchers: &'a AtomicUsize) -> Self {
+        watchers.fetch_add(1, Ordering::AcqRel);
+        Self(watchers)
+    }
+}
+
+impl Drop for Watching<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
     }
 }
 

@@ -41,8 +41,9 @@ use crate::{CommitReceipt, CommitTicket, Error};
 enum Committed {
     /// The outcome is known now.
     Done(TxResult<CommitReceipt>),
-    /// Decided and written, not yet published: it waits for its fsync. The
-    /// outcome is in `pending` once it is delivered on `queue`.
+    /// Not published yet: it waits for a write stall to clear before it
+    /// takes its slot, or, decided and written, for its fsync. The outcome
+    /// is in `pending` once it is delivered on `queue`.
     Pending {
         pending: PendingCommit,
         queue: Arc<QueueShared>,
@@ -66,6 +67,17 @@ impl Transaction {
     /// it wait for anything else under way, a memtable rotation or a full
     /// commit ring: the commit is left on its queue behind that and goes on
     /// at the poll that finds it done.
+    ///
+    /// A write stall does not end the commit either. A commit that meets a
+    /// stop trigger has not taken its place in the pipeline yet: it is left
+    /// on its queue behind the stall, nothing of it is stored, and at the
+    /// poll that finds the stop relieved it goes on and commits, so its
+    /// ticket completes then. On a database with no worker and
+    /// [`crate::Options::inline_compaction`] on, the queue's polls run the
+    /// steps that relieve the stop too. A commit waiting there is told what
+    /// a write arriving then is told when the stop will not clear (the
+    /// database closed, the engine latched, the relief keeps failing), as
+    /// its outcome.
     ///
     /// - **The queue.** The one [`TxnOptions::io_queue`](super::TxnOptions::io_queue)
     ///   names, else the one this transaction's
@@ -105,6 +117,36 @@ impl Transaction {
     /// Dropping the ticket never cancels the commit. Dropping the queue
     /// delivers its tickets on the dropping thread (see
     /// [`IoQueue`](crate::IoQueue)).
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use regolith::{OptimisticTransactionDb, Options, TransactionError, TxnOptions};
+    ///
+    /// let db = OptimisticTransactionDb::open("rows", Options::memory())?;
+    /// // This thread's queue: the outcomes of its commits are delivered here.
+    /// let mut queue = db.db().io_queue();
+    /// let on_queue = TxnOptions::new().io_queue(queue.id());
+    ///
+    /// let txn = db.begin(&on_queue);
+    /// txn.put(b"row", b"1")?;
+    /// let ticket = txn.commit_nowait();
+    /// // The commit is decided and written, and the call did not wait for a
+    /// // sync. `block_on` polls the queue until the ticket completes. (An
+    /// // in-memory database has no sync to wait for, so here it already has.)
+    /// let receipt = queue.block_on(ticket)?;
+    /// assert!(receipt.seq() > 0);
+    /// assert_eq!(db.db().get(b"row")?.as_deref(), Some(&b"1"[..]));
+    ///
+    /// // A lost race comes through the ticket too, never out of the call.
+    /// let (one, two) = (db.begin(&on_queue), db.begin(&on_queue));
+    /// one.put(b"row", b"one")?;
+    /// two.put(b"row", b"two")?;
+    /// let (one, two) = (one.commit_nowait(), two.commit_nowait());
+    /// assert!(queue.block_on(one).is_ok());
+    /// assert!(matches!(queue.block_on(two), Err(TransactionError::Conflict(_))));
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     pub fn commit_nowait(mut self) -> CommitTicket {
         let engine = Arc::clone(&self.engine);
         let completion = CommitTicket::completion(Arc::downgrade(&engine));

@@ -132,6 +132,69 @@ impl CommitInfo {
 /// [`crate::Db::close`] can run `on_abort` for the ones still open: that costs
 /// one small allocation per transaction, and nothing for a database without
 /// hooks.
+///
+/// # Example
+///
+/// Hooks that refuse every commit while a `frozen` key is set, and count how
+/// each transaction ended.
+///
+/// ```
+/// use std::sync::Arc;
+/// use std::sync::atomic::{AtomicU64, Ordering};
+///
+/// use regolith::{
+///     AbortReason, CommitInfo, Error, OptimisticTransactionDb, Options, Transaction,
+///     TransactionError, TransactionHooks, TxResult, TxnOptions,
+/// };
+///
+/// #[derive(Default)]
+/// struct Gate {
+///     commits: AtomicU64,
+///     aborts: AtomicU64,
+/// }
+///
+/// impl TransactionHooks for Gate {
+///     // Reads through the transaction, so at its snapshot.
+///     fn before_commit(&self, txn: &mut Transaction) -> TxResult<()> {
+///         match txn.get(b"frozen")? {
+///             Some(_) => Err(Error::InvalidArgument("the database is frozen".into()).into()),
+///             None => Ok(()),
+///         }
+///     }
+///
+///     fn on_commit(&self, _info: &CommitInfo) {
+///         self.commits.fetch_add(1, Ordering::Relaxed);
+///     }
+///
+///     fn on_abort(&self, _reason: &AbortReason<'_>) {
+///         self.aborts.fetch_add(1, Ordering::Relaxed);
+///     }
+/// }
+///
+/// let gate = Arc::new(Gate::default());
+/// let options = Options::memory().transaction_hooks(gate.clone());
+/// let db = OptimisticTransactionDb::open("gated", options)?;
+///
+/// let txn = db.begin(&TxnOptions::new());
+/// txn.put(b"row", b"1")?;
+/// txn.commit()?;
+/// assert_eq!(gate.commits.load(Ordering::Relaxed), 1);
+///
+/// // An error from `before_commit` fails the commit with that error, and
+/// // the transaction counts as aborted: exactly one outcome each.
+/// db.db().put(b"frozen", b"")?;
+/// let txn = db.begin(&TxnOptions::new());
+/// txn.put(b"row", b"2")?;
+/// let refused = txn.commit().unwrap_err();
+/// assert!(matches!(refused, TransactionError::Engine(Error::InvalidArgument(_))));
+/// assert_eq!(db.db().get(b"row")?.as_deref(), Some(&b"1"[..]));
+///
+/// // A rollback is an abort too.
+/// db.begin(&TxnOptions::new()).rollback();
+/// assert_eq!(gate.commits.load(Ordering::Relaxed), 1);
+/// assert_eq!(gate.aborts.load(Ordering::Relaxed), 2);
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
 pub trait TransactionHooks: Send + Sync + 'static {
     /// Runs once per commit, after the transaction's own `before_commit`
     /// callbacks and before validation, on the committing thread. It may read
