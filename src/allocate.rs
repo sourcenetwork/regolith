@@ -27,11 +27,16 @@ impl Db {
     ///   keeps the reservation, and the counter recovers at or above every
     ///   value in use: after a crash no value that a surviving commit used is
     ///   returned again.
-    /// - **No wait for the device.** The reservation does not sync the log. It
-    ///   becomes durable with the next sync, at the latest with the first
-    ///   commit that uses one of its values. A value that was only handed to
-    ///   the outside world, and not used by a committed write, can be returned
-    ///   again after a crash.
+    /// - **No sync of its own.** The reservation writes its record to the log
+    ///   on this thread and asks for no sync. It becomes durable with the next
+    ///   sync, at the latest with the first commit that uses one of its
+    ///   values. The call waits for the device in one case: a commit ahead of
+    ///   it in the pipeline asked for
+    ///   [`DurabilityMode::Immediate`](crate::DurabilityMode::Immediate) and
+    ///   is not durable yet. The reservation is handed out only once that
+    ///   commit is published, so this thread runs that sync or waits for it.
+    ///   A value that was only handed to the outside world, and not used by a
+    ///   committed write, can be returned again after a crash.
     /// - **Not stalled.** It does not wait while writes are stalled.
     /// - **Gaps.** Values reserved by code that never commits a use, such as
     ///   a transaction that aborts, are skipped for good.

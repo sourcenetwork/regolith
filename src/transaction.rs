@@ -115,18 +115,23 @@
 //! a value unique to the writer, such as its own id: the later committer's
 //! bytes then differ from the committed ones and it conflicts.
 //!
-//! # Out of scope (follow-ups)
+//! # Limits
 //!
-//! - Phantom detection. A transactional scan records the stretches of keys
-//!   it walked, but only to anchor keys the commit validates anyway: a key
-//!   another transaction inserts into a scanned range after the snapshot (a
-//!   phantom) is detected only when this transaction also writes it or
-//!   validates it as a point read at its level.
-//! - Transactional range deletes. [`Transaction::delete_range`] rejects
-//!   non-empty ranges until range conflict tracking or range locks land.
-//! - Wait-for graph deadlock detection (the pessimistic flavor ships
-//!   with timeout-based detection only).
-//! - Column-family-aware transactions (depends on CFs landing).
+//! - A plain scan does not detect phantoms. It records the stretches of keys
+//!   it walked only to anchor keys the commit validates anyway, so a key
+//!   another transaction inserts into the range after the snapshot is
+//!   detected only when this transaction also writes it or validates it as a
+//!   point read at its level. A scan whose result decides something is a
+//!   [`Transaction::cursor`] with [`ScanCheck::Range`]: any write inside the
+//!   range it covered since the snapshot is a conflict, at every level.
+//! - [`Transaction::delete_range`] refuses a non-empty range: a range delete
+//!   takes no part in conflict detection or in key locking.
+//! - A deadlock between pessimistic transactions is found by the lock
+//!   timeout ([`TransactionError::Busy`]) and not sooner: no wait-for graph
+//!   is kept.
+//! - A transaction reads and writes the default column family only. The
+//!   other families are reached through [`Db`]'s `*_cf` methods, outside any
+//!   transaction.
 
 use crate::portability::{AtomicBool, AtomicU64, Ordering};
 use kovan_queue::seg_queue::SegQueue;
@@ -613,18 +618,25 @@ pub enum ScanDirection {
 /// did not exist to be yielded, inserted into the range by a concurrent
 /// transaction - aborts the transaction only if it also writes that key or
 /// point-reads it. A transaction whose correctness depends on the absence
-/// of keys in a range must not rely on this level for it.
+/// of keys in a range must not rely on this level for it: it scans the
+/// range through [`Transaction::cursor`] with [`ScanCheck::Range`], which
+/// validates the range itself, at this level and every other.
 /// [`Transaction::delete_range`] stays rejected.
 ///
 /// # What a scan costs at Serializable
 ///
 /// A transactional scan at [`IsolationLevel::Serializable`] adds one
 /// read-set entry per key it yields, held until the transaction resolves,
-/// and the commit checks each of them while holding the write pipeline
-/// that every writer of the database, [`crate::Db::put`] included, waits
-/// on: the commit cost is one check per scanned key, and a large scan
-/// stalls every writer for that long. Below this level a scan records one
-/// entry per stretch of keys it walked, not one per key.
+/// and the commit checks them in two passes. The first runs on the
+/// committing thread before the commit enters the pipeline, against
+/// everything committed by then, and holds up nobody. The second runs when
+/// the commit's turn in the pipeline comes, for what was committed in
+/// between: one lookup of each key's newest version, in the memtables alone
+/// unless a flush or an ingest landed since the first pass. The commits and
+/// plain writes behind it in the pipeline, [`crate::Db::put`] included, are
+/// decided only after that second pass, so a large scan delays every writer
+/// by one lookup per scanned key. Below this level a scan records one entry
+/// per stretch of keys it walked, not one per key.
 ///
 /// # A write-free reader needs writers that validate their reads
 ///
@@ -1261,8 +1273,9 @@ impl Transaction {
     /// (and the transaction's own writes inside the range), not with the size
     /// of the range. At `Serializable` it also records every yielded key as a
     /// read, exactly as [`Transaction::get`] does: that grows by one entry per
-    /// distinct key yielded, and the commit checks each one while holding the
-    /// write pipeline, so every writer waits one check per scanned key.
+    /// distinct key yielded, and the commit checks each one, the second time
+    /// while the writes behind it in the pipeline wait to be decided (see
+    /// "What a scan costs at Serializable" on [`IsolationLevel`]).
     ///
     /// At every level, a key inside a stretch the scan walked that the
     /// transaction then writes is validated as a read from the begin
@@ -1290,7 +1303,8 @@ impl Transaction {
     /// direction.
     ///
     /// This is [`Transaction::cursor`] with [`ScanCheck::Stretch`], one entry
-    /// at a time.
+    /// at a time. A scan whose result decides something takes a cursor with
+    /// [`ScanCheck::Range`], which validates the range.
     pub fn scan_stream(&self, start: Option<&[u8]>, end: Option<&[u8]>) -> TxnScanStream<'_> {
         self.scan_stream_in(start, end, ScanDirection::Forward)
     }
@@ -1736,7 +1750,7 @@ impl Transaction {
     /// and value sizes are validated first, along with the size of the
     /// record the commit will log (at most 1 GiB), so an oversized commit
     /// is rejected first, then the write-stall admission runs, before the
-    /// conflict check and before any commit lock is taken. A commit never
+    /// conflict check and before the commit enters the pipeline. A commit never
     /// waits on a stall. Under a stop trigger it applies nothing and
     /// returns [`TransactionError::WouldBlock`] with a
     /// [`crate::WouldBlock::Stall`] wait, and the transaction ends with its

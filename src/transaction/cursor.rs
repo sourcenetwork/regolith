@@ -41,7 +41,7 @@ const CF_PREFIX_LEN: usize = 4;
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ScanCheck {
-    /// Today's scan: each unbroken stretch of snapshot keys it yields is
+    /// The plain scan: each unbroken stretch of snapshot keys it yields is
     /// recorded, and a key the transaction later writes inside a stretch is
     /// validated as a read from the begin snapshot, so it is never taken for
     /// a blind write. The keys it yielded and the range itself are not
@@ -71,9 +71,16 @@ pub enum ScanCheck {
     /// A write-free optimistic transaction at DefraLevel validates nothing,
     /// this included: its snapshot is consistent on its own.
     ///
-    /// The check reads every block of the range at commit, while the commit
-    /// holds the write pipeline, so a range that is large against the writes
-    /// since the snapshot makes every writer wait for it.
+    /// When anything at all was committed since the snapshot, the commit
+    /// reads every block of the range once more, so a range that is large
+    /// against the writes since the snapshot costs about a second scan of
+    /// it. That walk runs on the committing thread before the commit enters
+    /// the pipeline and holds up no other writer. When the commit's turn in
+    /// the pipeline comes, it searches only the memtables for what landed in
+    /// the range in between. It reads the tables of the range again, with
+    /// the writes behind it in the pipeline waiting, only when a flush or an
+    /// ingest landed since the first walk, or when that walk found a write
+    /// while an earlier check of the same commit was still open.
     Range,
 }
 

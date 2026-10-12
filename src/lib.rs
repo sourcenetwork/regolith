@@ -1126,7 +1126,7 @@ impl Db {
         }
     }
 
-    /// A new I/O queue for the calling thread (plan 4.10, D53).
+    /// A new I/O queue for the calling thread.
     ///
     /// Hand its [`IoQueue::id`] to the read handles this thread uses, in
     /// [`ReadMode::CacheOnly`] through [`Snapshot::with_read_mode`] or

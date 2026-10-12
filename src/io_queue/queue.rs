@@ -172,7 +172,7 @@ impl IoQueue {
     /// [`Options::max_open_files`](crate::Options::max_open_files), a read
     /// that must reopen its table and finds every descriptor in use by reads
     /// running on other threads is not run: it stays pending, and the poll
-    /// goes on (D60). The read that next frees a descriptor tells this queue,
+    /// goes on. The read that next frees a descriptor tells this queue,
     /// waking its owner if it idles, and the poll after that runs it again.
     ///
     /// Only the thread holding the queue calls this; it is the only place a

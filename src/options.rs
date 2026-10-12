@@ -316,8 +316,8 @@ pub trait MergeOperator: Send + Sync + 'static {
     ///
     /// `key` is the key exactly as [`MergeOperator::full_merge`] receives
     /// it. Return `true` when unsure: the default, `true`, makes every
-    /// operand change every part, which is the behaviour of a read that
-    /// names no parts at all.
+    /// operand change every part, so a read by parts is validated as a read
+    /// of the whole value is.
     ///
     /// Contract: a part this says an operand leaves alone is left alone by
     /// the value [`MergeOperator::full_merge`] produces, and the answer
@@ -326,8 +326,12 @@ pub trait MergeOperator: Send + Sync + 'static {
     /// commit on a part that changed. `regolith::testing::check_touches`, behind
     /// the `testing` feature, checks the second half.
     ///
-    /// Pure and fast: a commit calls it for every operand committed to the
-    /// key since the transaction began, while it holds the write pipeline.
+    /// Pure and fast. It runs when the commit of a transaction that read the
+    /// key by parts is decided, once for each operand committed to the key
+    /// since that transaction began, newest first, down to the first that
+    /// touches a named part or to a put or delete. The thread that decides
+    /// the commit runs it, which can be another committing thread, and the
+    /// commits behind it in the pipeline are decided only after it returns.
     /// A panic here fails that commit with [`crate::Error::CallbackPanicked`]
     /// and latches the database read-only until it is reopened.
     ///

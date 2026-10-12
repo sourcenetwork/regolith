@@ -130,7 +130,7 @@ pub enum KeyClass {
 ///
 /// `classify` sees the key as the caller wrote it, without regolith's
 /// column-family prefix. It must be pure, deterministic and allocation-free:
-/// commit calls it while it holds the transaction and before it takes the
+/// commit calls it on the committing thread, before the commit enters the
 /// write pipeline, at most once for the start of each scan stretch and at
 /// most once for each distinct key the transaction reads, puts or merges. A
 /// key it only deletes is not classified there.
@@ -277,7 +277,7 @@ pub(super) fn classifier_for(
 /// and an append is not validated.
 ///
 /// The listing is a sorted copy of the exempt keys, built here before the
-/// commit takes the write pipeline. The engine finds a written key in it by
+/// commit enters the write pipeline. The engine finds a written key in it by
 /// binary search, which neither hashes nor allocates, and skips the key's
 /// lookup outright, where a lookup is what validating it would cost. A commit
 /// whose classifier names no such key leaves the list empty and pays nothing.
