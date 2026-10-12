@@ -34,7 +34,7 @@ use crate::{
 };
 
 /// How long a test waits for another thread before it calls the wait a hang.
-const DEADLINE: Duration = Duration::from_secs(60);
+pub(super) const DEADLINE: Duration = Duration::from_secs(60);
 
 /// One 1 KiB put, applied below the stall admission as an admitted write is.
 fn fill(engine: &RegolithEngine, key: &[u8]) -> std::io::Result<u64> {
@@ -59,7 +59,7 @@ fn held_flush() -> (Arc<HeldFlush>, mpsc::Receiver<()>, mpsc::Sender<()>) {
 }
 
 /// The wait of a write the stall stops now.
-fn stopped_write(engine: &RegolithEngine) -> StallWait {
+pub(super) fn stopped_write(engine: &RegolithEngine) -> StallWait {
     match engine.admit_write(false) {
         Err(Error::WouldBlock(WouldBlock::Stall(wait))) => wait,
         other => panic!("the write was not stopped: {other:?}"),
@@ -67,7 +67,7 @@ fn stopped_write(engine: &RegolithEngine) -> StallWait {
 }
 
 /// What a fresh write is told on this engine now.
-fn fresh_write_error(engine: &RegolithEngine) -> String {
+pub(super) fn fresh_write_error(engine: &RegolithEngine) -> String {
     Error::from(fill(engine, b"fresh").expect_err("the engine takes no write")).to_string()
 }
 
@@ -119,7 +119,7 @@ fn stopped_engine_with_a_worker() -> (tempfile::TempDir, Arc<RegolithEngine>) {
 }
 
 /// Latch the engine as a flush whose log cannot be synced does.
-fn latch_through_a_flush(dir: &tempfile::TempDir, engine: &RegolithEngine) -> SyncFault {
+pub(super) fn latch_through_a_flush(dir: &tempfile::TempDir, engine: &RegolithEngine) -> SyncFault {
     fill(engine, b"unflushed").unwrap();
     let fault = SyncFault::arm(dir);
     let err = engine

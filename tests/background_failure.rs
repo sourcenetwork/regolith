@@ -6,12 +6,13 @@
 //! filled. A background worker must also back off between failed passes
 //! and report them through `regolith.background-errors`. A writer
 //! stopped behind failing work must get that failure back rather than
-//! wait forever, and writes must resume once the fault clears.
+//! wait forever, one that was already waiting when the work failed
+//! included, and writes must resume once the fault clears.
 
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 
 use regolith::env::{
@@ -29,9 +30,15 @@ struct SstBudgetEnv {
     remaining: AtomicUsize,
     refused: AtomicUsize,
     deny_sst_reads: AtomicBool,
+    /// Set by [`Self::hold_next_sst`]: where the next table creation says it
+    /// arrived, and what it waits on before it is answered.
+    hold: Mutex<Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>>,
 }
 
 const UNLIMITED: usize = usize::MAX;
+
+/// How long a test waits for another thread before it calls the wait a hang.
+const DEADLINE: Duration = Duration::from_secs(60);
 
 impl SstBudgetEnv {
     fn new() -> Self {
@@ -40,11 +47,21 @@ impl SstBudgetEnv {
             remaining: AtomicUsize::new(UNLIMITED),
             refused: AtomicUsize::new(0),
             deny_sst_reads: AtomicBool::new(false),
+            hold: Mutex::new(None),
         }
     }
 
     fn allow_ssts(&self, budget: usize) {
         self.remaining.store(budget, Ordering::SeqCst);
+    }
+
+    /// Hold the next table creation before it is answered: the channel that
+    /// says it arrived, and the one that lets it go.
+    fn hold_next_sst(&self) -> (mpsc::Receiver<()>, mpsc::Sender<()>) {
+        let (arrived, when_arrived) = mpsc::channel();
+        let (let_go, when_let_go) = mpsc::channel();
+        *self.hold.lock().unwrap() = Some((arrived, when_let_go));
+        (when_arrived, let_go)
     }
 
     fn take_sst(&self) -> bool {
@@ -94,9 +111,16 @@ impl Env for SstBudgetEnv {
         self.inner.open_read(path)
     }
     fn open_write(&self, path: &Path, mode: WriteMode) -> io::Result<Box<dyn WriteFile>> {
-        if is_sst(path) && !self.take_sst() {
-            self.refused.fetch_add(1, Ordering::SeqCst);
-            return Err(emfile());
+        if is_sst(path) {
+            let held = self.hold.lock().unwrap().take();
+            if let Some((arrived, when_let_go)) = held {
+                let _ = arrived.send(());
+                let _ = when_let_go.recv_timeout(DEADLINE);
+            }
+            if !self.take_sst() {
+                self.refused.fetch_add(1, Ordering::SeqCst);
+                return Err(emfile());
+            }
         }
         self.inner.open_write(path, mode)
     }
@@ -336,6 +360,89 @@ fn a_writer_stopped_behind_failing_compaction_gets_the_failure_instead_of_waitin
     for i in 0..800u32 {
         assert!(db.get(&key(i)).unwrap().is_some(), "key {i} lost");
     }
+}
+
+/// A writer already waiting when the compaction behind its stop fails is
+/// told then, and gets the failure a writer that arrives next gets. The
+/// compaction is the worker's own and fails in the environment: it is held at
+/// the table it is about to create until the writer waits, and that creation
+/// is refused.
+#[test]
+fn a_writer_already_waiting_is_told_when_the_compaction_behind_its_stop_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = Arc::new(SstBudgetEnv::new());
+    let opts = |l0_compaction_trigger| {
+        Options::default()
+            .env(Arc::clone(&env) as Arc<dyn Env>)
+            .l0_compaction_trigger(l0_compaction_trigger)
+            .level0_slowdown_writes_trigger(0)
+            .level0_stop_writes_trigger(4)
+    };
+
+    let db = Db::open(dir.path(), opts(1_000)).unwrap();
+    for batch in 0..4u32 {
+        for i in 0..200u32 {
+            regolith::through_stalls(|| db.put(&key(batch * 200 + i), b"value")).unwrap();
+        }
+        db.flush().unwrap();
+    }
+    db.close().unwrap();
+    drop(db);
+
+    // Reopened at the stop, with a worker whose only work is the compaction
+    // that would relieve it.
+    let (when_held, let_go) = env.hold_next_sst();
+    env.allow_ssts(0);
+    let db = Db::open(dir.path(), opts(2)).unwrap();
+    when_held
+        .recv_timeout(DEADLINE)
+        .expect("the worker never started the compaction");
+    assert_eq!(
+        db.get_int_property("regolith.background-errors").unwrap(),
+        0,
+        "setup: nothing has failed yet"
+    );
+
+    let wait = match db.put(b"stopped", b"v") {
+        Err(regolith::Error::WouldBlock(regolith::WouldBlock::Stall(wait))) => wait,
+        other => panic!("the write was not stopped: {other:?}"),
+    };
+    assert!(!wait.is_ready());
+
+    let (told, when_told) = mpsc::channel();
+    std::thread::scope(|scope| {
+        // What `through_stalls` does with the wait the write was handed.
+        scope.spawn(|| {
+            wait.wait();
+            let outcome = regolith::through_stalls(|| db.put(b"stopped", b"v"));
+            told.send(outcome).unwrap();
+        });
+        let_go.send(()).unwrap();
+        let outcome = when_told.recv_timeout(DEADLINE);
+        if outcome.is_err() {
+            // Closing completes every wait, so the thread ends and this
+            // test fails instead of hanging with it.
+            let _ = db.close();
+        }
+        let told = outcome
+            .expect("the writer was still waiting after the compaction behind its stop failed")
+            .expect_err("the stop is on and its relief is failing");
+        match &told {
+            regolith::Error::BackgroundFailed { job, source, .. } => {
+                assert_eq!(*job, "compaction");
+                #[cfg(unix)]
+                assert_eq!(source.raw_os_error(), Some(24), "the cause must survive");
+                #[cfg(not(unix))]
+                let _ = source;
+            }
+            other => panic!("expected BackgroundFailed, got {other:?}"),
+        }
+        assert_eq!(
+            told.to_string(),
+            db.put(b"fresh", b"v").unwrap_err().to_string()
+        );
+    });
+    assert!(env.refused.load(Ordering::SeqCst) >= 1);
 }
 
 #[test]
