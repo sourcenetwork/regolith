@@ -13,11 +13,21 @@
 //! recording and reading never wait on each other: a healthy job's success
 //! is one load, a failure is one swap, and a stalled writer reads the
 //! failure whole, never half of one and half of the next.
+//!
+//! A writer that is stopped while the failure is recorded is told it at
+//! once (`RegolithEngine::stopped`). One that was already waiting on the
+//! stall's unit is told the same, at the same moment: recording a failure
+//! lands the unit (E36), and the writer, run again, finds the failure
+//! here. A failure is stored before the unit is taken, and a writer reads
+//! it again once its wait is registered (`RegolithEngine::stall_wait`), so
+//! none registers too late to be told.
 
 use std::io;
+use std::sync::Arc;
 
 use kovan::Atom;
 
+use super::commit::StallSignal;
 use crate::portability::{AtomicU64, Ordering};
 
 /// The background jobs a stalled writer can be waiting on.
@@ -117,11 +127,14 @@ impl Failure {
     }
 }
 
-#[derive(Debug)]
 pub(crate) struct BackgroundHealth {
     errors: AtomicU64,
     flush: Atom<Option<Failure>>,
     compaction: Atom<Option<Failure>>,
+    /// The stall whose stops these jobs relieve: a failure recorded here
+    /// lands its unit. `None` where no writer waits on the jobs, as in a
+    /// test that runs workers on their own.
+    stall: Option<Arc<StallSignal>>,
 }
 
 impl Default for BackgroundHealth {
@@ -130,11 +143,20 @@ impl Default for BackgroundHealth {
             errors: AtomicU64::new(0),
             flush: Atom::new(None),
             compaction: Atom::new(None),
+            stall: None,
         }
     }
 }
 
 impl BackgroundHealth {
+    /// The health of the jobs that relieve `stall`'s stops.
+    pub(crate) fn relieving(stall: Arc<StallSignal>) -> Self {
+        Self {
+            stall: Some(stall),
+            ..Self::default()
+        }
+    }
+
     fn slot(&self, job: Job) -> &Atom<Option<Failure>> {
         match job {
             Job::Flush => &self.flush,
@@ -142,6 +164,9 @@ impl BackgroundHealth {
         }
     }
 
+    /// Record that an attempt of `job` failed with `err`, and tell the
+    /// writers waiting on the stall (module docs): from now until the job
+    /// next succeeds, a write stopped behind it is told this failure.
     pub(crate) fn record_failure(&self, job: Job, err: &io::Error) -> Hazard {
         self.errors.fetch_add(1, Ordering::Relaxed);
         let hazard = Hazard::of(err);
@@ -152,6 +177,11 @@ impl BackgroundHealth {
             raw_os_error: err.raw_os_error(),
             message: err.to_string(),
         }));
+        // Stored above, landed here: a writer that registers after this
+        // take reads the failure itself.
+        if let Some(stall) = &self.stall {
+            stall.land();
+        }
         hazard
     }
 
