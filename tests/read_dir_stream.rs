@@ -12,6 +12,7 @@
 //! directory first carries every entry it acts on; one that keeps a bounded
 //! subset (the live logs recovery sorts, a page of backup ids) carries at
 //! most that subset. The probe counts, it does not time: no benchmark.
+#![cfg(not(target_arch = "wasm32"))]
 
 use std::collections::{HashMap, HashSet};
 use std::io;

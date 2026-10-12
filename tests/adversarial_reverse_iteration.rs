@@ -16,6 +16,7 @@
 //! forward walk visits in exactly the mirrored order, and
 //! `seek_for_prev` on every key and on every key extended by one byte
 //! lands where a sorted set says it should.
+#![cfg(not(target_arch = "wasm32"))]
 
 use regolith::{Db, Options};
 use tempfile::TempDir;

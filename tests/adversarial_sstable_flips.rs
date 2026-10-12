@@ -17,6 +17,7 @@
 //! Every region a regolith table carries is checksummed, so a flip in
 //! the metadata tail must be refused or read back correctly, never
 //! served as data.
+#![cfg(not(target_arch = "wasm32"))]
 
 use std::collections::BTreeMap;
 use std::fs;

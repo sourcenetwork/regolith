@@ -12,6 +12,7 @@
 //!
 //! Scale is read from `REGOLITH_ADV_ROUNDS` (default 1) so the same gate
 //! can be cranked up for a soak without editing it.
+#![cfg(not(target_arch = "wasm32"))]
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Barrier, Mutex};

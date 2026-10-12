@@ -16,7 +16,9 @@
 //!   queue, and the queue's owner is woken once it may go on;
 //! - **inline**, with neither: the call runs it before it returns, as the
 //!   blocking calls do their own I/O, and waits for the gate on its own
-//!   thread, as [`JobTicket::wait`] does for a job it runs itself.
+//!   thread, as [`JobTicket::wait`] does for a job of another queue that it
+//!   runs itself. (A job of the waiting thread's own queue is stepped by
+//!   that wait, with the queue's other jobs, as its poll steps them.)
 //!
 //! A job has two parts. What needs no gate comes first, with the gate free
 //! for compaction: an ingest copies and validates its files, a checkpoint

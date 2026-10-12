@@ -23,6 +23,7 @@
 //!   open-file table renames a removed table aside while a reader holds it,
 //!   and passes every other file through, so a log's removal, its failure
 //!   and its retry behave on every flush path exactly as without the bound.
+#![cfg(not(target_arch = "wasm32"))]
 
 mod common;
 

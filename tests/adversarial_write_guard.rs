@@ -7,6 +7,7 @@
 //! These tests sweep the entry points rather than the three the original
 //! gate names, and pair each no-work call with a loaded control so a
 //! rejection that happens for the wrong reason is visible.
+#![cfg(not(target_arch = "wasm32"))]
 
 use regolith::{Db, Error, Options, WriteBatch, WriteOptions};
 use tempfile::TempDir;

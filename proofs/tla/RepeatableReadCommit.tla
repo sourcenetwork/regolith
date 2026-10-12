@@ -191,7 +191,8 @@ RoleNames == {"Collectors", "Linkers", "Holders",
               "ReadOnlys", "Promoters", "SkewWriters",
               "LogAppenders", "LogReaders", "LogDeciders",
               "TallyMergers", "OwnWriters",
-              "Checkers", "Revokers", "Granters"}
+              "Checkers", "Revokers", "Granters",
+              "Joiners", "Claimers", "Peekers", "NoPartDeciders"}
 \* A configuration must give every role a set of transaction ids, possibly an empty one.
 ASSUME Extras \in [RoleNames -> SUBSET Nat]
 \* Two roles never share a transaction.
@@ -239,11 +240,23 @@ Checkers       == Extras["Checkers"]
 Revokers       == Extras["Revokers"]
 \* Granters: each puts a new key into that range.
 Granters       == Extras["Granters"]
+\* Joiners: each scans the roster, a commutative prefix, and adds a key of its own to it. It decides
+\* nothing on what the scan returned: the use the prefix is declared for.
+Joiners        == Extras["Joiners"]
+\* Claimers: the misuse case. Each scans the roster and takes the one seat when the scan showed it
+\* free: an exclusive outcome decided on a scan.
+Claimers       == Extras["Claimers"]
+\* Peekers: each calls get_parts(part key, {}), naming no part, and decides on nothing it read.
+Peekers        == Extras["Peekers"]
+\* No-part deciders: the misuse case. Each calls get_parts(part key, {}) and still decides on part 1.
+NoPartDeciders == Extras["NoPartDeciders"]
 
 \* Every transaction of the later workloads.
 NewTxns == UNION {Extras[r] : r \in RoleNames}
+\* The transactions that read the part key with get_parts and name no part.
+NoPartTxns == Peekers \cup NoPartDeciders
 \* The transactions that read the part key with get_parts.
-PartTxns == PartReaders \cup PartRewriters
+PartTxns == PartReaders \cup PartRewriters \cup NoPartTxns
 
 \* Every transaction that writes the counter.
 CounterTxns == Incrementers \cup ReadMergers \cup Rebasers \cup Resetters \cup Clearers
@@ -334,8 +347,10 @@ OwnRange     == 14
 AclRange     == 15
 \* Range 16: one output key per deciding transaction, where it writes its decision down.
 OutRange     == 16
-\* Only the head, marker and tally ranges may be declared commutative here.
-ASSUME CommutativeRanges \subseteq {HeadRange, MarkerRange, TallyRange}
+\* Range 17: the roster, a set transactions add their own keys to, with one seat in it.
+RosterRange  == 17
+\* Only the head, marker, tally and roster ranges may be declared commutative here.
+ASSUME CommutativeRanges \subseteq {HeadRange, MarkerRange, TallyRange, RosterRange}
 \* A key has one class.
 \* Only the first six ranges may be declared content-addressed here,
 ASSUME /\ ContentAddressedRanges \subseteq {HeadRange, MarkerRange, DefRange, DocRange,
@@ -384,11 +399,23 @@ OwnKey          == <<OwnRange, 0, 0>>
 AclKey(i)       == <<AclRange, i, i>>
 \* The output key of deciding transaction t.
 OutKey(t)       == <<OutRange, t, t>>
+\* The first key of the roster, stored from the start: a scan of the roster always yields it.
+RosterLow       == <<RosterRange, 0, 0>>
+\* The roster's one seat. It sorts between the first and the last key, so it lies inside the
+\* stretch any scan of the roster walks.
+SeatKey         == <<RosterRange, 1, 0>>
+\* Joiner j's own key in the roster. It too sorts between the first and the last key.
+MemberKey(j)    == <<RosterRange, 2, j>>
+\* The last key of the roster, stored from the start.
+RosterHigh      == <<RosterRange, 3, 0>>
 
 \* Positions the log can reach: one append per appending transaction.
 LogPositions == 1..Cardinality(LogAppenders \cup LogReaders)
+\* The transactions that scan the roster.
+RosterTxns == Joiners \cup Claimers
 \* The transactions that write a decision into an output key of their own.
 OutTxns == PartReaders \cup ValueReaders \cup LogReaders \cup LogDeciders \cup Checkers
+           \cup Claimers \cup NoPartTxns
 
 \* Every key any workload of this config reads or writes.
 Keys == {HeadKey(b) : b \in Blocks}
@@ -400,6 +427,8 @@ Keys == {HeadKey(b) : b \in Blocks}
               AclKey(1), AclKey(2)}
         \cup {LogEntry(p) : p \in LogPositions}
         \cup {OutKey(t) : t \in OutTxns}
+        \cup (IF RosterTxns = {} THEN {} ELSE {RosterLow, SeatKey, RosterHigh})
+        \cup {MemberKey(j) : j \in Joiners}
 
 \* Key a sorts at or before key b: by range, then p, then c.
 KeyLeq(a, b) ==
@@ -433,9 +462,9 @@ InitStore ==
   \* For every key k, pick its starting value:
   [k \in Keys |->
      \* the seed's head key, the definition, the seed's block, the version key, both skew keys, the
-     \* own key and grant 1 start at 1 (present);
+     \* own key, grant 1 and the first and last key of the roster start at 1 (present);
      IF k \in {HeadKey(Seed), DefKey, BlockKey(Seed), VersionKey, SkewA, SkewB, OwnKey,
-               AclKey(1)} THEN 1
+               AclKey(1), RosterLow, RosterHigh} THEN 1
      \* the part key starts with both parts at 1 (the value 11);
      ELSE IF k = PartKey THEN PartValue(1, 1)
      \* every other key starts absent.
@@ -753,14 +782,23 @@ Walked(t, k) == \E s \in CoveredRuns(t) : KeyLeq(s[1], k) /\ KeyLeq(k, s[2])
 
 \* The parts a projected read names: part 1, which its decision uses.
 \* MUTANT PartsNamesOther: a part reader names part 2 while deciding on
-\* part 1, the caller misuse [3.4, Precondition].
-NamedParts(t) == IF t \in PartReaders /\ Mutant = "PartsNamesOther" THEN {2} ELSE {1}
+\* part 1, the caller misuse [3.4, Precondition]. A peeker and a no-part
+\* decider name no part at all: get_parts(key, {}).
+NamedParts(t) ==
+  \* A transaction that reads by no parts names the empty set.
+  IF t \in NoPartTxns THEN {}
+  \* Under the planted misuse a part reader names part 2;
+  ELSE IF t \in PartReaders /\ Mutant = "PartsNamesOther" THEN {2}
+  \* everyone else names part 1.
+  ELSE {1}
 
 \* Plan section [3.4]: the read record of a part reader's or rewriter's get_parts.
 \* At another level, or pessimistic, get_parts is a get. At DefraLevel it is
+\* never validated with no part named, whatever it found: such a read leaves
+\* no record at all (Transaction::read_projected). With a part named it is
 \* validated in full when it found nothing (existence is part of every
 \* decision on parts) or when the transaction puts the key (a put replaces
-\* every part); never with no part named; otherwise over its parts.
+\* every part), and otherwise over its parts.
 PartRead(t) ==
   \* full: the read must be validated in whole. Either it found nothing (the planted bug
   \* PartsNoAbsentFallback forgets this),
@@ -771,10 +809,10 @@ PartRead(t) ==
   IN IF t \notin PartTxns THEN {}
      \* Without DefraLevel's optimistic rules, get_parts is a plain get: one full read.
      ELSE IF ~Classified(t) THEN {Rd(PartKey, snap[t], "Read", FullRule(t), Parts)}
+     \* No part named: the read decided nothing, so nothing is validated, found or not.
+     ELSE IF NamedParts(t) = {} THEN {}
      \* A full read, reported as a read by parts.
      ELSE IF full THEN {Rd(PartKey, snap[t], "ReadParts", FullRule(t), Parts)}
-     \* No part named: the read decided nothing, so nothing is validated.
-     ELSE IF NamedParts(t) = {} THEN {}
      \* Otherwise a projected read over the named parts.
      ELSE {Rd(PartKey, snap[t], "ReadParts", "parts", NamedParts(t))}
 

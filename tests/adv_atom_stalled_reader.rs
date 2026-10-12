@@ -3,6 +3,7 @@
 //! data it captured, with the files it needs kept alive through the
 //! `Arc<Version>` -> `Arc<LiveSst>` pin chain that the read view now
 //! sits on top of.
+#![cfg(not(target_arch = "wasm32"))]
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};

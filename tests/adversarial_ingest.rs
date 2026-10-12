@@ -4,6 +4,7 @@
 //! lock and publishes the read horizon outside it, so this drives it
 //! against a stream of ordinary writers and a reader that demands the
 //! ingested file be visible the moment `ingest_external_files` returns.
+#![cfg(not(target_arch = "wasm32"))]
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
