@@ -42,6 +42,7 @@ mod park_support;
 pub(crate) mod pending_outputs;
 #[cfg(all(test, not(loom)))]
 mod poll_park_tests;
+pub(crate) mod prefix_call;
 pub(crate) mod range_tombstone;
 pub(crate) mod read_horizon;
 mod read_rule;

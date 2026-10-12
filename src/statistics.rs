@@ -88,7 +88,9 @@ pub enum Ticker {
     /// populated the cache).
     BlockCacheAdd = 9,
     /// Bloom-filter "useful" hits - the filter correctly
-    /// answered "not present" and spared a block read.
+    /// answered "not present" and spared a block read. Counts a point
+    /// lookup a table's key filter ruled out, and a table a prefix seek's
+    /// prefix filter ruled out.
     BloomFilterUseful = 10,
     /// Bloom-filter "full positive" hits - the filter said
     /// "maybe", and the key was actually present in the block.

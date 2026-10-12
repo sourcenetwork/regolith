@@ -534,6 +534,23 @@ impl WriteOptions {
 /// Point lookups are unaffected - they always consult the user-key
 /// bloom filter and do not call the extractor.
 ///
+/// # The key
+///
+/// `extract` is handed the key as the caller wrote it, and
+/// `extract_query` the prefix as the caller passed it to `seek_prefix`,
+/// with nothing in front of them, in every column family. The entries the
+/// database keeps for itself are not shown to the extractor. The filter
+/// still answers for one column family at a time: a prefix one family
+/// holds does not make a table look as if another family held it.
+///
+/// One case differs. A table written by a release that handed the
+/// extractor the database's own form of the key (the caller's key behind
+/// a 4-byte column-family id) is filtered the way it was built, so
+/// nothing it holds is skipped: a prefix seek that meets such a table
+/// also calls `extract_query` with the caller's prefix behind those 4
+/// bytes. Every table written since holds the caller's form, and a
+/// compaction rewrites the old ones into it.
+///
 /// A panic in this trait's code while a commit's memtable rotation runs it
 /// fails that commit with [`crate::Error::CallbackPanicked`] and latches the
 /// database read-only until it is reopened.
@@ -541,15 +558,17 @@ pub trait PrefixExtractor: Send + Sync + 'static {
     /// Return the portion of `key` that the prefix bloom should index,
     /// or `None` if `key` cannot produce a prefix (e.g., it's shorter
     /// than a fixed-length extractor's width). Keys that return `None`
-    /// are simply absent from the prefix bloom.
+    /// are simply absent from the prefix bloom. `key` is the key as the
+    /// caller wrote it.
     fn extract<'a>(&self, key: &'a [u8]) -> Option<&'a [u8]>;
 
     /// Return the bloom key that is safe to probe for a caller's
-    /// prefix-bounded scan. The default implementation only permits
-    /// exact extracted-prefix queries, preserving correctness for
-    /// custom extractors whose output may depend on more than a fixed
-    /// byte width. Extractors with stronger prefix-stability guarantees
-    /// can override this to enable broader SSTable skipping.
+    /// prefix-bounded scan, or `None` to rule no table out. `prefix` is
+    /// the prefix as the caller passed it. The default implementation
+    /// only permits exact extracted-prefix queries, preserving
+    /// correctness for custom extractors whose output may depend on more
+    /// than a fixed byte width. Extractors with stronger prefix-stability
+    /// guarantees can override this to enable broader SSTable skipping.
     fn extract_query<'a>(&self, prefix: &'a [u8]) -> Option<&'a [u8]> {
         let extracted = self.extract(prefix)?;
         (extracted == prefix).then_some(extracted)
@@ -560,8 +579,8 @@ pub trait PrefixExtractor: Send + Sync + 'static {
     fn name(&self) -> &'static str;
 }
 
-/// A [`PrefixExtractor`] that takes the first `N` bytes of every key.
-/// Keys shorter than `N` contribute no prefix.
+/// A [`PrefixExtractor`] that takes the first `N` bytes of every key, as
+/// the caller wrote it. Keys shorter than `N` contribute no prefix.
 #[derive(Debug, Clone, Copy)]
 pub struct FixedLengthPrefix(pub usize);
 
