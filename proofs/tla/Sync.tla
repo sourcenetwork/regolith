@@ -112,13 +112,19 @@
 \*
 \* CONFIGURATIONS.
 \*   MC_Sync_Green_Mutex          Mutex, three tasks, Bound 2: every
-\*                                invariant, and every waiter is served.
+\*                                safety invariant.
+\*   MC_Sync_Green_MutexLive      the same with two tasks: every waiter is
+\*                                served.
 \*   MC_Sync_Green_Semaphore      two permits, task 1 asks for both, owned
-\*                                guards moving between tasks.
+\*                                guards moving between three tasks: every
+\*                                safety invariant.
+\*   MC_Sync_Green_SemaphoreLive  the same with two tasks: every waiter is
+\*                                served.
 \*   MC_Sync_Green_Reentrant      ReentrantMutex, tasks 1 and 2 of one owner,
 \*                                nesting two guards: every safety invariant.
-\*   MC_Sync_Green_ReentrantLive  the same with one guard per task: if no
-\*                                owner holds forever, every waiter is served.
+\*   MC_Sync_Green_ReentrantLive  one task of each owner, one guard each: if
+\*                                no owner holds forever, every waiter is
+\*                                served.
 \*   MC_Sync_Red_UnboundedBarging the drain never hands off: BoundedBypass.
 \*   MC_Sync_Red_ReleaseNoWake    a release frees the lock and wakes nobody:
 \*                                NoLostWakeup.
