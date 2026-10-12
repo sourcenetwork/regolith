@@ -160,6 +160,33 @@ fn a_write_that_arrives_at_a_latched_and_stopped_engine_does_not_wait() {
     assert_eq!(fresh_admission_error(&engine), latched_write_error(&engine));
 }
 
+/// The engine latches for a second reason, a panic in a caller's callback
+/// inside the commit's ordered step, and that goes through the same latch:
+/// a write waiting for the worker is told that one too, as a fresh write is.
+#[test]
+fn a_callback_panic_latch_tells_the_write_waiting_for_the_worker() {
+    let (_dir, engine) = stopped_engine_with_a_worker();
+    let stopped = stopped_write(&engine);
+    engine.latch_callback_panic("MergeOperator");
+    let told = stopped
+        .recv_timeout(DEADLINE)
+        .expect("the engine latched and the stopped write still waits")
+        .expect_err("a latched engine admits no write");
+    assert!(
+        matches!(
+            told,
+            Error::CallbackPanicked {
+                callback: "MergeOperator",
+                latched: true
+            }
+        ),
+        "{told:?}"
+    );
+    let fresh = Error::from(fill(&engine, b"fresh").expect_err("a latched engine takes no write"));
+    assert_eq!(told.to_string(), fresh.to_string());
+    assert_eq!(told.to_string(), fresh_admission_error(&engine));
+}
+
 /// Delegates to the standard `Env`, and refuses to create a table once told
 /// to.
 #[derive(Debug, Default)]
