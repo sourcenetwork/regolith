@@ -307,7 +307,8 @@ loom-sync-deep model="":
 # wait, with four calibrations that must fail. Release only, like
 # `loom-sync`: the wait model explores close to 0.8 million interleavings.
 loom-io:
-    RUSTFLAGS="--cfg loom" cargo test --release --test loom_io_queue
+    RUSTFLAGS="--cfg loom" cargo test --release --test loom_io_queue --no-run
+    RUSTFLAGS="--cfg loom" timeout 10m cargo test --release --test loom_io_queue
 
 loom-all: loom loom-debug loom-sync loom-io
 
