@@ -83,6 +83,7 @@ mod round;
 mod spare;
 mod stall;
 mod terminator;
+mod turn;
 mod txn;
 mod write_check;
 
