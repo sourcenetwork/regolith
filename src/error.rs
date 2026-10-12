@@ -219,7 +219,21 @@ impl Error {
     pub(crate) fn into_io_error(self) -> std::io::Error {
         match self {
             Self::Io(io) | Self::Corruption(io) => io,
-            Self::BackgroundFailed { source, .. } => source,
+            // Carried typed, under the failure's own kind: a commit told
+            // that the relief of its stop is failing reaches the caller as
+            // this variant, as a plain write does.
+            Self::BackgroundFailed {
+                job,
+                hazard,
+                source,
+            } => std::io::Error::new(
+                source.kind(),
+                Self::BackgroundFailed {
+                    job,
+                    hazard,
+                    source,
+                },
+            ),
             Self::InvalidArgument(message) => {
                 std::io::Error::new(std::io::ErrorKind::InvalidInput, message)
             }
@@ -270,6 +284,15 @@ fn carried(err: &std::io::Error) -> Option<Error> {
         }),
         Error::KeyProviderRequired => Some(Error::KeyProviderRequired),
         Error::UnknownKey { id } => Some(Error::UnknownKey { id: *id }),
+        Error::BackgroundFailed {
+            job,
+            hazard,
+            source,
+        } => Some(Error::BackgroundFailed {
+            job,
+            hazard,
+            source: Error::clone_io(source),
+        }),
         _ => None,
     }
 }
@@ -418,6 +441,11 @@ mod tests {
             Error::UnknownKey {
                 id: crate::KeyId(9),
             },
+            Error::BackgroundFailed {
+                job: "flush",
+                hazard: "disk full",
+                source: std::io::Error::new(std::io::ErrorKind::StorageFull, "no space"),
+            },
         ] {
             let text = typed.to_string();
             let io = typed.into_io_error();
@@ -426,6 +454,34 @@ mod tests {
             assert_eq!(back.to_string(), text);
             assert!(!matches!(back, Error::Io(_)), "{back:?} lost its variant");
         }
+    }
+
+    /// A background failure keeps its job, its class and the failure's own
+    /// kind across the I/O boundary, and its `Debug` output there and back
+    /// is its three fields.
+    #[test]
+    fn a_background_failure_crosses_an_io_error_with_its_fields() {
+        let source = || std::io::Error::new(std::io::ErrorKind::StorageFull, "no space");
+        let failed = || Error::BackgroundFailed {
+            job: "compaction",
+            hazard: "disk full",
+            source: source(),
+        };
+        let shown = format!(
+            "BackgroundFailed {{ job: \"compaction\", hazard: \"disk full\", source: {:?} }}",
+            source()
+        );
+        assert_eq!(format!("{:?}", failed()), shown);
+
+        let io = failed().into_io_error();
+        assert_eq!(io.kind(), std::io::ErrorKind::StorageFull);
+        let back = Error::from(io);
+        assert_eq!(format!("{back:?}"), shown);
+        assert!(matches!(
+            back,
+            Error::BackgroundFailed { job: "compaction", hazard: "disk full", source }
+                if source.kind() == std::io::ErrorKind::StorageFull
+        ));
     }
 
     #[test]

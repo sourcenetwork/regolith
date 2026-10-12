@@ -412,13 +412,13 @@ impl Options {
     /// Number of background threads available for compaction.
     ///
     /// `0` starts no background worker at all. Compaction then runs
-    /// on whichever thread asks for it: a writer that reaches a
-    /// write-stall threshold performs a compaction job itself before
-    /// retrying instead of parking on a condvar nobody would ever
-    /// signal. This is the only mode that works on a single-threaded
-    /// host such as `wasm32-wasip1`, where `std::thread::spawn`
-    /// reports [`std::io::ErrorKind::Unsupported`], and it is what
-    /// [`Options::embedded`] selects.
+    /// on whichever thread asks for it: unless
+    /// [`Options::inline_compaction`] was turned off, a writer that
+    /// reaches a write-stall threshold runs the compaction that relieves
+    /// it itself, since nothing else would. This is the only mode that
+    /// works on a single-threaded host such as `wasm32-wasip1`, where
+    /// `std::thread::spawn` reports [`std::io::ErrorKind::Unsupported`],
+    /// and it is what [`Options::embedded`] selects.
     ///
     /// When `> 1`, multiple non-overlapping compaction jobs can
     /// run concurrently (e.g. L1→L2 at key range `[a,m)` on one
@@ -439,9 +439,9 @@ impl Options {
     }
 
     /// With no compaction worker ([`Options::max_background_compactions`]
-    /// `0`), let a write a stall stopped run the step that relieves it.
-    /// Off by default; the [`Options::embedded`] and [`Options::wasm`]
-    /// presets turn it on.
+    /// `0`), whether a write a stall stopped runs the step that relieves it.
+    /// Left unset, it is on for a database with no worker, which could not
+    /// relieve its own stalls otherwise, and off for one that has a worker.
     ///
     /// A write stopped by a stall threshold never waits: it applies nothing
     /// and returns [`crate::Error::WouldBlock`] with a
@@ -455,13 +455,18 @@ impl Options {
     ///   no queue runs the steps inline instead, bounded, and its write goes
     ///   on once they cleared the stall. A slowed write, under a slowdown
     ///   threshold, owes one step the same way.
-    /// - **Off.** The caller clears the stall with [`crate::Db::compact_step`]
-    ///   or [`crate::Db::flush`]; the stopped writes' waits complete then.
+    /// - **Off**, said explicitly: you drive compaction. A stopped write
+    ///   returns its wait, which completes once you cleared the stall with
+    ///   [`crate::Db::compact_step`] or [`crate::Db::flush`]. A transaction's
+    ///   blocking commit is the one writer that still relieves a stop
+    ///   itself, with as many steps as the stop needs and no more, because
+    ///   it cannot be made again and has nobody to wait for; commit with
+    ///   [`crate::Transaction::commit_nowait`] to keep the thread free.
     ///
     /// Ignored when a worker runs.
     #[must_use]
     pub fn inline_compaction(mut self, inline_compaction: bool) -> Self {
-        self.inline_compaction = inline_compaction;
+        self.inline_compaction = Some(inline_compaction);
         self
     }
 

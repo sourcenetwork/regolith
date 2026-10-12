@@ -94,8 +94,10 @@ impl RetryPolicy {
     /// whose clock is moved by hand ([`MemEnv`](crate::MemEnv)) ends a wait
     /// only when it is moved.
     ///
-    /// Only a re-run after a conflict waits. A run repeated because writes
-    /// were stalled waits for the stall and nothing more.
+    /// Only a re-run after a conflict waits. A write stall causes no
+    /// re-run: the commit waits it out. An attempt `transact_async` runs
+    /// again because its commit's validation missed the block cache waits
+    /// for that read and nothing more.
     #[must_use]
     pub fn backoff(mut self, first: Duration, max: Duration) -> Self {
         self.first_backoff = first.min(max);
@@ -228,10 +230,8 @@ fn run<T, E>(
                 previous = Some(conflict);
                 pause(engine, policy.backoff_before(lost));
             }
-            // A blocking call waits out a stall on its own thread, then runs
-            // the attempt again, uncounted, with the same previous conflict.
-            #[cfg(not(target_arch = "wasm32"))]
-            Err(TransactionError::WouldBlock(WouldBlock::Stall(stall))) => stall.wait(),
+            // A write stall is no outcome of its own: the commit waited it
+            // out, so the attempt that ran is the one that committed.
             Err(other) => return Err(TransactError::Engine(other)),
         }
     }
@@ -270,10 +270,12 @@ async fn wait_out(would_block: WouldBlock) {
 /// [`run`] for an attempt that never blocks: it reads through a `CacheOnly`
 /// handle on `queue`, runs its `before_commit` callbacks with
 /// [`Transaction::prepare`], waiting out any miss, and commits through
-/// [`Transaction::commit_nowait`]. A commit refused because writes are
-/// stalled waits for the stall and runs the attempt again, uncounted, with
-/// the same `previous` conflict. The wait the policy asks for before a re-run
-/// is a wait on `queue` too.
+/// [`Transaction::commit_nowait`]. A write stall does not end the attempt:
+/// its commit stays pending and the ticket completes once the stop is
+/// relieved. A commit whose validation needed a block the cache does not
+/// hold waits for that read and runs the attempt again, uncounted, with the
+/// same `previous` conflict. The wait the policy asks for before a re-run is
+/// a wait on `queue` too.
 async fn run_async<T, E>(
     policy: RetryPolicy,
     engine: Arc<RegolithEngine>,
@@ -337,11 +339,13 @@ impl OptimisticTransactionDb {
     /// the future on that thread and poll `queue` when the future cannot
     /// progress; [`IoQueue::block_on`](crate::IoQueue::block_on) does both.
     ///
-    /// A commit refused because writes are stalled waits for the stall to
-    /// clear and runs the attempt again; that run is not counted against the
-    /// policy, and it gets the same previous conflict. An error from `f` ends
-    /// the attempt with [`TransactError::Closure`] and is not retried; any
-    /// failure but a conflict ends it with [`TransactError::Engine`].
+    /// A write stall does not end the attempt: its commit stays pending
+    /// until the stop is relieved, and `f` is not run again for it. A commit
+    /// whose validation needed a block the cache does not hold waits for
+    /// that read and runs the attempt again; that run is not counted against
+    /// the policy, and it gets the same previous conflict. An error from `f`
+    /// ends the attempt with [`TransactError::Closure`] and is not retried;
+    /// any failure but a conflict ends it with [`TransactError::Engine`].
     ///
     /// A re-run starts as soon as the future is polled again, unless the
     /// policy asks for a wait first ([`RetryPolicy::backoff`]). That wait
@@ -420,8 +424,8 @@ impl OptimisticTransactionDb {
     ///
     /// An error from `f` ends the attempt with [`TransactError::Closure`] and
     /// is not retried; its transaction is rolled back. A commit a write stall
-    /// stopped waits, on this thread, for the stall to clear, and runs the
-    /// attempt again, uncounted. A commit that fails for any other reason but
+    /// holds waits the stall out on this thread and then commits: `f` is not
+    /// run again for it. A commit that fails for any other reason but
     /// a conflict returns [`TransactError::Engine`]. When every attempt
     /// conflicts, the last conflict comes back as [`TransactError::Exhausted`].
     ///
