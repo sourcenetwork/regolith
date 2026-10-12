@@ -23,9 +23,19 @@
 \*     for the plain readers to drain, then holds write. Only one upgrader
 \*     can exist, and plain readers never wait on the lock while holding a
 \*     guard, so an upgrade never deadlocks. Plain read guards have no
-\*     upgrade method.
+\*     upgrade method. The release that sees the last plain reader leave
+\*     only wakes the upgrader; the upgrader's own poll turns its upgradable
+\*     guard into the write guard (E33: a drain pass never changes the
+\*     upgradable or the upgrading flag, so it cannot spend a flag that a
+\*     later holder raised).
 \*
 \* WHAT THE MODEL LEAVES OUT, and why that loses nothing.
+\*   - Dropping an upgrade that waits. The race E33 fixed (a dropped
+\*     upgrade's node still held by the pass while the next task takes the
+\*     upgradable read) needs the pass's slot and the drain role, which this
+\*     model takes whole; it is checked on the real code by the unit tests
+\*     of src/sync/raw_rwlock.rs and the loom model
+\*     a_dropped_upgrade_never_lets_a_writer_in_beside_the_next_upgradable_read.
 \*   - The queue mechanics. Registration with the re-check, the drain token,
 \*     the node CAS and the woken bit are Sync.tla's, checked there step by
 \*     step for the same protocol. Here a registration with its re-check, a
@@ -227,17 +237,16 @@ QueueStep(L, release) ==
                 THEN WakeIn(L, h)
                 ELSE L
 
-\* The upgrade step: an upgradable holder that waits gets write once no
-\* plain reader remains (it is woken). Mutant AnyReaderUpgrade: a plain
-\* reader waiting to upgrade gets write once it is the only reader.
+\* The upgrade step: an upgradable holder that waits is woken once no plain
+\* reader remains. The lock's words are not changed for it (E33): the
+\* upgradable guard and the upgrading flag stay its own until its poll takes
+\* the write (UpPoll), so nothing here can spend a flag that a later holder
+\* raised. Mutant AnyReaderUpgrade: a plain reader waiting to upgrade gets
+\* write once it is the only reader.
 UpgradeStep(L) ==
   IF L.upgrading /\ L.uholder # 0 /\ pc[L.uholder] = "upwait" /\ NoReaders(L)
      /\ L.wowner = NoOwner
-    THEN LET u == L.uholder IN
-         WakeIn([L EXCEPT !.up = [@ EXCEPT ![u] = 0], !.uholder = 0,
-                          !.upgrading = FALSE,
-                          !.wr = [@ EXCEPT ![u] = 1], !.wowner = Owner[u],
-                          !.wdepth = 1], u)
+    THEN IF Notified(L, L.uholder) THEN L ELSE WakeIn(L, L.uholder)
   ELSE IF Mutant = "AnyReaderUpgrade" /\ L.upgrading /\ L.wowner = NoOwner /\ L.uholder = 0
        /\ \E r \in Tasks : pc[r] = "rupwait" /\ SumOf(L.rd, Tasks) = L.rd[r]
     THEN LET r == CHOOSE x \in Tasks : pc[x] = "rupwait" /\ SumOf(L.rd, Tasks) = L.rd[x] IN
@@ -409,15 +418,27 @@ Poll(t) ==
                          node, owed, towake, ret, pc>>
   /\ UNCHANGED <<want, bargedOwed, readInUpgrade>>
 
-\* The upgrader, woken after the last plain reader left, holds write.
+\* The upgrader, woken after the last plain reader left, takes the write
+\* itself: its upgradable guard becomes the write guard and the upgrading
+\* flag clears (RawRwLock::finish_upgrade). Until this step the two flags
+\* kept every reader and writer out. (Under the mutant, a plain reader that
+\* was given write just goes on.)
 UpPoll(t) ==
   /\ pc[t] \in {"upwait", "rupwait"}
   /\ woken[t]
-  /\ wr[t] > 0
+  /\ IF pc[t] = "upwait"
+       THEN /\ up' = [up EXCEPT ![t] = 0]
+            /\ uholder' = 0
+            /\ upgrading' = FALSE
+            /\ wr' = [wr EXCEPT ![t] = 1]
+            /\ wowner' = Owner[t]
+            /\ wdepth' = 1
+       ELSE /\ wr[t] > 0
+            /\ UNCHANGED <<wr, up, wowner, wdepth, uholder, upgrading>>
   /\ woken' = [woken EXCEPT ![t] = FALSE]
   /\ pc' = [pc EXCEPT ![t] = "holding"]
-  /\ UNCHANGED <<rd, wr, up, rdepth, wowner, wdepth, uholder, upgrading, q, want, node,
-                 bypass, lost, owed, towake, ret, bargedOwed, readInUpgrade>>
+  /\ UNCHANGED <<rd, rdepth, q, want, node, bypass, lost, owed, towake, ret,
+                 bargedOwed, readInUpgrade>>
 
 \* The pending future is dropped. A waiting node leaves the queue, and the
 \* next head is woken if its request fits (a wake the dropped head had is
@@ -545,12 +566,15 @@ NoSelfDeadlock == \A t \in Tasks : node[t] = "waiting" => Guards(t) = 0
 \* A queued head left asleep though it could proceed: its request fits,
 \* nobody has woken it or decided to, and no handed waiter is still to take
 \* an owed handoff (that waiter's take clears the owed bit and wakes the
-\* head); or an upgrade left waiting with every plain reader gone.
+\* head); or an upgrade left waiting with every plain reader gone, its
+\* holder neither woken nor about to be (the write is the holder's own to
+\* take once it is told: UpPoll).
 Stranded ==
   \/ /\ q # <<>>
      /\ LET h == Head(q) IN Fits(Lock, want[h]) /\ ~Notified(Lock, h)
      /\ ~(owed /\ \E t \in Tasks : node[t] = "handed")
   \/ /\ upgrading /\ uholder # 0 /\ NoReaders(Lock) /\ wowner = NoOwner
+     /\ pc[uholder] = "upwait" /\ ~Notified(Lock, uholder)
 
 \* NO LOST WAKEUP. A parked future handed the lock has been woken or is
 \* about to be, and no head or upgrader is stranded. Lean: no_stranded_head.
