@@ -110,20 +110,29 @@
 \*     IngestPublication.tla.
 \*
 \* CONFIGURATIONS.
-\*   MC_GroupCommit_Green                  Mutant = "none": every invariant
-\*                                         and AllTicketsComplete hold.
+\*   MC_GroupCommit_Green                  Mutant = "none", four commits,
+\*                                         no failing group: every
+\*                                         invariant holds.
+\*   MC_GroupCommit_Green_Live             three transactions, a group may
+\*                                         fail: every invariant and
+\*                                         AllTicketsComplete hold.
+\*   MC_GroupCommit_Green_LivePlain        the same with a plain write.
 \*   MC_GroupCommit_Red_ViewOnly           SerialEquivalent fails.
 \*   MC_GroupCommit_Red_PublishBeforeSync  DurableBeforeVisible fails.
 \*   MC_GroupCommit_Red_DrainAll           BoundedTurn fails.
 \*   MC_GroupCommit_Red_TrustEarly         SerialEquivalent fails.
 \*   MC_GroupCommit_Green_ReadOnly         a transaction that only reads
-\*                                         shares groups; every invariant
+\*                                         shares groups, a group may fail;
+\*                                         every invariant and
+\*                                         AllTicketsComplete hold.
+\*   MC_GroupCommit_Green_Nowait           two of the four commits are made
+\*                                         by commit_nowait: their groups
+\*                                         are left owed and claimed; no
+\*                                         failing group; every invariant
+\*                                         holds.
+\*   MC_GroupCommit_Green_NowaitLive       the same on three commits, and a
+\*                                         group may fail: every invariant
 \*                                         and AllTicketsComplete hold.
-\*   MC_GroupCommit_Green_Nowait           two of the commits are made by
-\*                                         commit_nowait: their groups are
-\*                                         left owed and claimed; every
-\*                                         invariant and AllTicketsComplete
-\*                                         hold.
 \*   MC_GroupCommit_Green_Nowait_Owes      the witness: the same setup must
 \*                                         break NothingOwed, so the GREEN
 \*                                         run did go through owed groups.
