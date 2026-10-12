@@ -702,6 +702,16 @@ tla:
     check MC_StallRelief_Red_NoRelief                  RED NoStrandedWait
     check MC_StallRelief_Red_NoHandBack                RED NoStrandedWait
     check MC_StallRelief_Red_NoRecheck                 RED NoStrandedWait
+    # E35: an engine that latches clears no stop, so the latch lands the
+    # stall's unit (its flag stored first, read again by a writer once
+    # registered), and a rotation that flushed at the memtable cap counts
+    # its progress whether its seal went through or failed. Lean:
+    # no_wait_once_latched, no_latch_land_strands_a_waiter,
+    # no_latch_recheck_strands_a_waiter, no_rotate_refresh_strands_a_waiter.
+    check MC_StallRelief_Green_Failures                GREEN
+    check MC_StallRelief_Red_NoLatchLand               RED NoWaitOnceLatched
+    check MC_StallRelief_Red_NoLatchRecheck            RED NoWaitOnceLatched
+    check MC_StallRelief_Red_NoRotateRefresh           RED NoStrandedWait
     # regolith::sync's locks after D49: barging with bounded bypass, for
     # Mutex, Semaphore and ReentrantMutex. Lean: Regolith/Sync.lean,
     # mutual_exclusion, bounded_bypass, owed_exclusive.
