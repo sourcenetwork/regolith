@@ -652,8 +652,10 @@ tla:
     # list_pages_all.
     spec=BackupSeal
     check MC_BackupSeal_Green                          GREEN
+    check MC_BackupSeal_Green_Attack                   GREEN
     check MC_BackupSeal_Green_Stream                   GREEN
     check MC_BackupSeal_Green_Sweep                    GREEN
+    check MC_BackupSeal_Green_SweepTwoTables           GREEN
     check MC_BackupSeal_Red_StreamSkips                RED ListedRestores
     check MC_BackupSeal_Red_SweepSkips                 RED SweepRemovesEveryUnlisted
     check MC_BackupSeal_Red_PlainMeta                  RED SealedMetadata
@@ -692,6 +694,7 @@ tla:
     # clone_respects_live, pins_exact.
     spec=SnapshotRegistry
     check MC_SnapshotRegistry_Green                    GREEN
+    check MC_SnapshotRegistry_Green_ThreeHandles       GREEN
     check MC_SnapshotRegistry_Red_NoConfirm            RED MinBelowLive
     check MC_SnapshotRegistry_Red_ScanThenSample       RED MinBelowLive
     check MC_SnapshotRegistry_Red_ReleaseHere          RED LiveCovered
@@ -817,6 +820,7 @@ tla:
     check MC_CompactionGate_Green_Queue                GREEN
     check MC_CompactionGate_Green_Passes               GREEN
     check MC_CompactionGate_Green_Live                 GREEN
+    check MC_CompactionGate_Green_LiveServed           GREEN
     check MC_CompactionGate_Red_OldGate                RED BoundedBypass
     check MC_CompactionGate_Red_NoHandoff              RED BoundedBypass
     check MC_CompactionGate_Red_DrainJobs              RED WorkerTakesTurns
