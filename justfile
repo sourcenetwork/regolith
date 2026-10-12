@@ -21,10 +21,27 @@ doc:
 # nextest, not `cargo test`: each test gets its own process, so a
 # wedged test fails on the profile's slow-timeout instead of holding the
 # whole binary. See `.config/nextest.toml`.
+#
+# nextest cannot run doc tests, so they run under a hard limit: measured at
+# 3 s (load 88 on 36 threads), times 100 for a runner that compiles them cold.
 
 test:
     cargo nextest run --workspace
-    cargo test --workspace --doc
+    just bounded 5m test cargo test --workspace --doc
+
+# A run under a hard limit, for what nextest cannot bound (doc tests, wasm
+# targets, a workload its caller sizes): one that reaches the limit fails and
+# says which recipe hit which limit. Needs GNU `timeout` from coreutils
+# (`gtimeout` where it is installed under that name). Runs where it is
+# called from, because the Elle harness calls it from its own directory.
+[no-cd]
+[private]
+bounded limit recipe +command:
+    @t=$(command -v timeout || command -v gtimeout) && "$t" --version >/dev/null 2>&1 \
+        || { echo "error: just {{recipe}} needs GNU timeout (coreutils) to bound its run" >&2; exit 1; }; \
+    "$t" {{limit}} {{command}}; code=$?; \
+    [ "$code" -ne 124 ] || echo "error: just {{recipe}} did not finish within {{limit}} and was stopped" >&2; \
+    exit "$code"
 
 deny:
     cargo deny check
@@ -377,11 +394,16 @@ loom-all: loom loom-debug loom-sync loom-io loom-snapshots loom-view loom-cache 
 # not complete inside seven minutes, 120 completes in seconds. What the
 # workload is hunting is overlap between a compaction and a read, and
 # the overlap count is already in the thousands per instance here.
+#
+# Built first, then run under `limit`, which is a parameter because the
+# size is: the default size measured at 2 s (load 68 on 36 threads), times
+# 150 for a runner with four cores. A larger size passes its own limit.
 
-chaos instances="4" rounds="2" versions="120" min_rounds="20":
+chaos instances="4" rounds="2" versions="120" min_rounds="20" limit="5m":
+    cargo test --release --test read_view_chaos_workload --no-run
     REGOLITH_CHAOS_INSTANCES={{instances}} REGOLITH_CHAOS_ROUNDS={{rounds}} \
     REGOLITH_CHAOS_VERSIONS={{versions}} REGOLITH_CHAOS_MIN_ROUNDS={{min_rounds}} \
-        cargo test --release --test read_view_chaos_workload -- --nocapture
+        just bounded {{limit}} chaos cargo test --release --test read_view_chaos_workload -- --nocapture
 
 # TLA+ model of what commit validation covers at each isolation level,
 # checked against the Merkle-DAG CRDT workload `RepeatableRead` exists for: appends to a
@@ -1036,7 +1058,10 @@ elle-matrix:
     cd harness/elle
     fail=0
     cargo build --release --bin elle-gen
-    cargo test --release || fail=1
+    # The harness is a workspace of its own, which the nextest profile does
+    # not reach: its 16 unit tests measured at 0.4 s (load 161), times 150.
+    cargo test --release --no-run || fail=1
+    just bounded 1m elle-matrix cargo test --release || fail=1
     check() {
         local name="$1" model="$2" level="$3"; shift 3
         local built_in=pass
@@ -1154,9 +1179,13 @@ wasm-browser:
     # the whole driver, so nine passing tests report as one failure with
     # no attribution.
     export WASM_BINDGEN_TEST_TIMEOUT=180
+    # That budget covers the tests, not a driver or a browser that never
+    # starts, so each suite is built first and then run under a hard limit
+    # of twice the budget: the runner's own message comes first.
     for suite in wasm_opfs wasm_opfs_main wasm_opfs_memory; do
         echo "== $suite =="
-        cargo test --target wasm32-unknown-unknown --test "$suite"
+        cargo test --target wasm32-unknown-unknown --test "$suite" --no-run
+        just bounded 6m wasm-browser cargo test --target wasm32-unknown-unknown --test "$suite"
     done
 
 embedded:

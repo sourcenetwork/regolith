@@ -68,6 +68,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@nextest
       - uses: extractions/setup-just@v2
+      # `just test` runs the doc tests under coreutils `timeout`, which
+      # macOS does not ship.
+      - if: runner.os == 'macOS'
+        run: brew install coreutils
       - run: just test
 
 
