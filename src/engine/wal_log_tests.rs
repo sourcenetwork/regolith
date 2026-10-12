@@ -19,7 +19,9 @@ use crate::env::{Env, std_env};
 fn put_record(log: &Log, offset: u64, key: &[u8], value: &[u8], seq: u64) -> (Place, Vec<u8>) {
     let mut buf = vec![0u8; log.prefix_len()];
     encode_put_record(&mut buf, key, value, seq);
-    let place = log.place(offset, buf.len() - log.prefix_len()).unwrap();
+    let place = log
+        .place(offset, buf.len() - log.prefix_len(), log.epoch())
+        .unwrap();
     log.finish_record(KIND_GROUP, &place, &mut buf).unwrap();
     (place, buf)
 }
@@ -91,7 +93,7 @@ fn the_bytes_of_a_record_are_the_same_whoever_frames_it() {
         encode_put_record(&mut one, b"key", b"value", 9);
         let mut two = one.clone();
         let place = log
-            .place(log.stamp_len(), one.len() - log.prefix_len())
+            .place(log.stamp_len(), one.len() - log.prefix_len(), log.epoch())
             .unwrap();
         log.finish_record(KIND_GROUP, &place, &mut one).unwrap();
         log.finish_record(KIND_GROUP, &place, &mut two).unwrap();
@@ -138,7 +140,7 @@ fn a_write_decided_before_a_rollback_is_not_made_after_it() {
         log.sync_through(kept.end()).is_err(),
         "a poisoned log is not vouched for"
     );
-    let (cause, cut) = log.rollback_to(kept.end());
+    let (cause, cut) = log.rollback_to(kept.end(), log.epoch() + 1);
     cut.unwrap();
     assert!(cause.unwrap().to_string().contains("said no"));
     assert!(!log.is_poisoned());

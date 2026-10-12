@@ -154,6 +154,37 @@ impl Log {
         })
     }
 
+    /// Take over a log an appending writer began: the same file, opened to
+    /// be written by position from `offset` on. `durable` is the offset the
+    /// appending writer's last completed sync covered. What open does with
+    /// the log it rewrote the recovered writes into.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn adopt(
+        env: &Arc<dyn Env>,
+        path: &Path,
+        nonce: u64,
+        seal: Option<Sealer>,
+        stamp_len: u64,
+        durable: u64,
+        parent_synced: bool,
+    ) -> io::Result<Self> {
+        let file = env.open_log(path, WriteMode::Update)?;
+        Ok(Self {
+            file,
+            path: path.to_path_buf(),
+            env: Arc::clone(env),
+            nonce,
+            seal,
+            stamp_len,
+            durable: AtomicU64::new(durable),
+            parent_synced: AtomicBool::new(parent_synced),
+            epoch: AtomicU64::new(0),
+            writers: AtomicUsize::new(0),
+            poisoned: AtomicBool::new(false),
+            failure: Take::empty(),
+        })
+    }
+
     /// Create a log through the standard environment.
     #[cfg(test)]
     pub(crate) fn create(path: &Path) -> io::Result<Self> {
@@ -196,10 +227,23 @@ impl Log {
         (HEADER_LEN + payload_len + overhead) as u64
     }
 
+    /// The log's write epoch: the one a record decided now is written in.
+    pub(crate) fn epoch(&self) -> u64 {
+        self.epoch.load(Ordering::SeqCst)
+    }
+
+    /// Start a log nothing was written to yet in `epoch`, the pipeline's.
+    pub(crate) fn start_epoch(&self, epoch: u64) {
+        self.epoch.store(epoch, Ordering::SeqCst);
+    }
+
     /// Fix where the record of `payload_len` bytes of operations goes, at
     /// `offset`, and what frames it. Called once per commit, when it is
-    /// decided; a sealed log draws the record's nonce here.
-    pub(crate) fn place(&self, offset: u64, payload_len: usize) -> io::Result<Place> {
+    /// decided; a sealed log draws the record's nonce here. `epoch` is the
+    /// write epoch of the state the commit was decided from, not the log's
+    /// own at this instant: a commit decided from a state a rollback has
+    /// since discarded must not be written.
+    pub(crate) fn place(&self, offset: u64, payload_len: usize, epoch: u64) -> io::Result<Place> {
         let nonce = match &self.seal {
             Some(_) => super::seal::fresh_nonce()?,
             None => [0u8; NONCE_LEN],
@@ -212,7 +256,7 @@ impl Log {
             // matters to a reader of this line.
             synced_through: self.durable().min(offset),
             nonce,
-            epoch: self.epoch.load(Ordering::Acquire),
+            epoch,
         })
     }
 
@@ -275,7 +319,7 @@ impl Log {
     /// Make every byte below `through` durable, where `through` is the end
     /// of the contiguous prefix every record of which is written. The one
     /// place a commit waits for the device. The caller holds the pipeline's
-    /// sync claim, so no other sync of this log is running.
+    /// sync claim, so no other sync of this log and no rollback is running.
     ///
     /// `sync_data` (`fdatasync`), not `sync_all`, as [`super::wal::Wal`]
     /// syncs. The directory entry naming the file is synced once, on the
@@ -315,18 +359,24 @@ impl Log {
     }
 
     /// Cut the log back to `offset`, discarding every record at and after
-    /// it, and hand back what poisoned the log, if anything did. Called with
-    /// the pipeline's ordered step held, so no commit is being decided.
+    /// it, and hand back what poisoned the log, if anything did. Called by
+    /// the thread that holds the pipeline's sync claim, so no sync of this
+    /// log is running.
     ///
-    /// Moves the write epoch on and waits for the writes already past the
-    /// gate, so no write of a discarded commit lands after the cut (see the
-    /// module docs). The wait is for positional writes already in flight.
-    pub(crate) fn rollback_to(&self, offset: u64) -> (Option<io::Error>, io::Result<()>) {
+    /// Moves the write epoch on to `epoch`, which no record of this log was
+    /// decided in, and waits for the writes already past the gate, so no
+    /// write of a discarded commit lands after the cut (see the module
+    /// docs). The wait is for positional writes already in flight.
+    pub(crate) fn rollback_to(
+        &self,
+        offset: u64,
+        epoch: u64,
+    ) -> (Option<io::Error>, io::Result<()>) {
         debug_assert!(
             offset >= self.stamp_len && offset >= self.durable(),
             "a rollback reaches neither into the stamp nor below what a sync covered"
         );
-        self.epoch.fetch_add(1, Ordering::SeqCst);
+        self.epoch.store(epoch, Ordering::SeqCst);
         while self.writers.load(Ordering::SeqCst) != 0 {
             std::thread::yield_now();
         }
@@ -346,7 +396,7 @@ impl Log {
     pub(crate) fn close(&self, end: u64) -> io::Result<()> {
         self.sync_through(end)?;
         let mut record = vec![0u8; self.prefix_len()];
-        let place = self.place(end, 0)?;
+        let place = self.place(end, 0, self.epoch())?;
         self.finish_record(wal_frame::KIND_CLOSE, &place, &mut record)?;
         self.write_record(&place, &record)?;
         self.sync_through(place.end())
