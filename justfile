@@ -627,8 +627,9 @@ tla:
     # discards it writes the counter back. TLC only.
     check MC_Allocate_Green_Rollback                   GREEN
     check MC_Allocate_Red_ForgetOnRollback             RED INV_HandedOutOnce
-    # 4.2, E3: WAL format 2 replay; E46: close seals in place. Lean:
-    # Regolith/WalClose.lean and Regolith/WalRecovery.lean,
+    # 4.2, E3: WAL format 2 replay; E46: close seals in place, and a close
+    # with no record syncs once. Lean: Regolith/WalClose.lean and
+    # Regolith/WalRecovery.lean,
     # recovers_prefix2.
     spec=WalRecovery
     check MC_WalRecovery_Green_Immediate               GREEN
@@ -643,6 +644,7 @@ tla:
     check MC_WalRecovery_Red_StampNotSealed            RED AckedSurvive
     check MC_WalRecovery_Red_StampUnsynced             RED RecoveryOpens
     check MC_WalRecovery_Red_NewLogBeforeFlush         RED RecoveryOpens
+    check MC_WalRecovery_Red_UnstampedRefuses          RED RecoveryOpens
     # E29, E30: the manifest's torn end and the logs a flush retires, on a
     # sealed manifest and with flushes on several threads. Lean:
     # Regolith/ManifestRecovery.lean, crash_never_proves, replay_keeps_synced,

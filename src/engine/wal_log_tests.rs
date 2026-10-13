@@ -12,9 +12,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use proptest::prelude::*;
 use tempfile::TempDir;
 
+use super::super::recovery_tests::RecordingEnv;
 use super::super::seal::{Keyring, test_keys};
 use super::super::wal::{Wal, WalEntry, encode_put_record, fault};
-use super::super::wal_frame::KIND_GROUP;
+use super::super::wal_frame::{HEADER_LEN, KIND_GROUP};
 use super::super::wal_replay::{WalPosition, WalReplayIter};
 use super::{Log, Place};
 use crate::env::{Env, MemEnv, std_env};
@@ -250,6 +251,86 @@ fn a_closed_log_replays_whole_and_is_vouched_for_by_close() {
             assert!(replay(&home.env, &path, keyring.as_deref()).is_err());
         }
     }
+}
+
+/// A log through the recording Env, in a `wal/` directory of `dir`, and the
+/// record of what the host saw, cleared once the log exists.
+fn recorded_log(dir: &TempDir) -> (Log, Arc<RecordingEnv>, PathBuf) {
+    let wal_dir = dir.path().join("wal");
+    std::fs::create_dir_all(&wal_dir).unwrap();
+    let recording = Arc::new(RecordingEnv::default());
+    let env: Arc<dyn Env> = recording.clone();
+    let path = wal_dir.join("wal_000001.log");
+    let log = Log::create_in(&env, &path, None).unwrap();
+    *recording.events.lock().unwrap() = Default::default();
+    (log, recording, path)
+}
+
+/// A close that finds no record syncs once, after CLOSE: the one sync
+/// covers the stamp and CLOSE together (`WalRecovery.tla`, the torn stamp
+/// row), and the log replays as cleanly closed.
+// Counts the host's syncs on the file system, which miri cannot sync.
+#[cfg_attr(miri, ignore)]
+#[test]
+fn a_close_with_no_record_syncs_once_after_close() {
+    let dir = TempDir::new().unwrap();
+    let (log, recording, path) = recorded_log(&dir);
+    log.close(log.stamp_len()).unwrap();
+    assert_eq!(
+        recording.events.lock().unwrap().log,
+        vec![format!("write {HEADER_LEN}"), "sync".to_string()],
+        "CLOSE, then one sync"
+    );
+    assert_eq!(log.durable(), log.stamp_len() + HEADER_LEN as u64);
+    let env: Arc<dyn Env> = recording.clone();
+    assert!(replay(&env, &path, None).unwrap().is_empty());
+}
+
+/// RED `CloseWithoutSync`: a record no sync covered is synced before CLOSE
+/// is written, so a crash cannot keep CLOSE and lose the record.
+// Counts the host's syncs on the file system, which miri cannot sync.
+#[cfg_attr(miri, ignore)]
+#[test]
+fn a_close_after_an_unsynced_record_syncs_it_before_close() {
+    let dir = TempDir::new().unwrap();
+    let (log, recording, _) = recorded_log(&dir);
+    let (place, record) = put_record(&log, log.stamp_len(), b"k", b"v", 1);
+    log.write_record(&place, &record).unwrap();
+    log.close(place.end()).unwrap();
+    assert_eq!(
+        recording.events.lock().unwrap().log,
+        vec![
+            format!("write {}", record.len()),
+            "sync".to_string(),
+            format!("write {HEADER_LEN}"),
+            "sync".to_string()
+        ],
+        "the record synced, then CLOSE, then a sync"
+    );
+}
+
+/// A close after a sync that already covered every record skips the
+/// first sync too: nothing before CLOSE is left unsynced.
+// Counts the host's syncs on the file system, which miri cannot sync.
+#[cfg_attr(miri, ignore)]
+#[test]
+fn a_close_after_every_record_is_synced_syncs_once() {
+    let dir = TempDir::new().unwrap();
+    let (log, recording, _) = recorded_log(&dir);
+    let (place, record) = put_record(&log, log.stamp_len(), b"k", b"v", 1);
+    log.write_record(&place, &record).unwrap();
+    log.sync_through(place.end()).unwrap();
+    log.close(place.end()).unwrap();
+    assert_eq!(
+        recording.events.lock().unwrap().log,
+        vec![
+            format!("write {}", record.len()),
+            "sync".to_string(),
+            format!("write {HEADER_LEN}"),
+            "sync".to_string()
+        ],
+        "the record's own sync, then CLOSE and one sync"
+    );
 }
 
 /// One step of a writer: which record it writes.

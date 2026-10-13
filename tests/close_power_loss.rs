@@ -13,7 +13,9 @@
 //! close:
 //!
 //! - the open never refuses (`RecoveryOpens`): no newer log exists before
-//!   the flush is durable (RED `NewLogBeforeFlush`);
+//!   the flush is durable (RED `NewLogBeforeFlush`), and a torn stamp of the
+//!   next log reads as a log nothing of which was synced (RED
+//!   `UnstampedRefuses`);
 //! - what it recovers is a gap-free prefix of the writes (`NoGap`) holding
 //!   every write the sync covered, and under Immediate every acknowledged
 //!   write (`AckedSurvive`);

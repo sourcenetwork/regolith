@@ -497,8 +497,17 @@ impl Log {
     /// whole file is durable. The order is [`super::wal::Wal::close`]'s, for
     /// the reason given there (`proofs/tla/WalRecovery.tla`, RED
     /// `CloseWithoutSync`). Called with the pipeline drained.
+    ///
+    /// When no record before CLOSE is left unsynced, the first sync is
+    /// skipped and the one after CLOSE covers what is left: the stamp of a
+    /// log no sync has covered yet, the case of a close that finds the log
+    /// empty. A crash then may tear the stamp, and replay reads the log as
+    /// unstamped and drops it, which loses nothing since it held no record
+    /// (`WalRecovery.tla`, RED `UnstampedRefuses`).
     pub(crate) fn close(&self, end: u64) -> io::Result<()> {
-        self.sync_through(end)?;
+        if end > self.durable().max(self.stamp_len) {
+            self.sync_through(end)?;
+        }
         let mut record = vec![0u8; self.prefix_len()];
         let place = self.place(end, 0, self.epoch())?;
         self.finish_record(wal_frame::KIND_CLOSE, &place, &mut record)?;

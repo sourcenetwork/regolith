@@ -92,7 +92,10 @@
 \*   Sync(k)        Wal::sync_data: `synced_through` moves, once the sync
 \*                  returns, to the offset it began at.
 \*   AppendClose    Log::close (wal_log.rs): sync every record, append
-\*                  CLOSE, sync; nothing is appended after CLOSE.
+\*                  CLOSE, sync; nothing is appended after CLOSE. When no
+\*                  record is left unsynced the first sync is skipped, and
+\*                  the one sync after CLOSE also covers the stamp, which
+\*                  a crash before it may tear (TornStamp below).
 \*   Rotate         Ordered::seal (WalRotation.tla); also what a close that
 \*                  failed after sealing in place does before it takes a
 \*                  write again (Ordered::reopen_log).
@@ -107,7 +110,7 @@
 \*                  table, and the log is removed. No log file exists now.
 \*   CloseNext      Ordered::close_log after a seal in place: the next log
 \*                  is created and CLOSE appended to it; a Sync makes it
-\*                  durable.
+\*                  durable (the merged sync of AppendClose).
 \*   Crash          WalReplayIter reads P from every usable record
 \*                  (wal_frame::proof_past scans past the damage), refuses
 \*                  when O < P, and otherwise ends the log at O; recovery
@@ -201,6 +204,15 @@
 \*     crash it must survive (RED StampUnsynced).
 \*   - A group of commits is one record here, so it holds one commit; a
 \*     group of several survives or is lost whole, like one commit.
+\*   - THE TORN STAMP (TornStamp). A checksummed log's stamp is durable only
+\*     once a sync covers it. Before that a crash may tear it, and replay
+\*     reads the log as unstamped: no record of it verifies (each record's
+\*     check covers the stamp's nonce), nothing of it is kept and every byte
+\*     is reported (wal_replay.rs, unstamped). Every crash state below may
+\*     tear an unsynced checksummed stamp. It matters for the merged close:
+\*     a close that finds no record syncs only after CLOSE, so until then
+\*     the stamp is unsynced; replay must drop such a log, never refuse it
+\*     (RED UnstampedRefuses).
 \*   - SEAL IN PLACE. A close may leave its last log unsynced because the
 \*     log stays the newest file until the flush's manifest batch, durable,
 \*     says recovery skips it; the next log is created only after that
@@ -220,6 +232,7 @@
 \*   MC_WalRecovery_Red_StampNotSealed       AckedSurvive fails
 \*   MC_WalRecovery_Red_StampUnsynced        RecoveryOpens fails
 \*   MC_WalRecovery_Red_NewLogBeforeFlush    RecoveryOpens fails
+\*   MC_WalRecovery_Red_UnstampedRefuses     RecoveryOpens fails
 
 \* Borrow the standard TLA+ books: counting numbers, lists, and sizes of finite sets.
 EXTENDS Naturals, Sequences, FiniteSets
@@ -252,10 +265,10 @@ ASSUME Mode \in {"Immediate", "Eventual"}
 ASSUME Frame \in {"Checksum", "AEAD"}
 \* Residual is a yes or a no.
 ASSUME Residual \in BOOLEAN
-\* The mutant is "none" or one of the eight planted bugs.
+\* The mutant is "none" or one of the nine planted bugs.
 ASSUME Mutant \in {"none", "DropBelowP", "RefuseAboveP", "Format1",
                    "CloseWithoutSync", "NoTruncate", "StampNotSealed",
-                   "StampUnsynced", "NewLogBeforeFlush"}
+                   "StampUnsynced", "NewLogBeforeFlush", "UnstampedRefuses"}
 
 \* The state: everything that changes from one step to the next. Each line says what the variable
 \* stands for in the real program.
@@ -373,16 +386,18 @@ UnsyncedKinds ==
 \* is nothing to tear. The StampUnsynced defect writes the stamp in place
 \* and lets the first record's sync carry it, the way an unsealed log does;
 \* until that sync (synced = 0) a power cut may leave half a stamp.
-\* No log file, no stamp.
+\* A checksummed stamp is written unsynced and made durable by the log's
+\* first sync, so until then (synced = 0) a power cut may tear it too: the
+\* torn stamp row (TornStamp in the header). No log file, no stamp.
 StampTears ==
   \* With no newest log file there is no stamp to tear.
   IF ~haslog THEN {FALSE}
-  \* Only the defect, only with sealed frames, only before the first sync.
-  ELSE IF Frame = "AEAD" /\ Mutant = "StampUnsynced" /\ synced = 0
-    \* Then the stamp may come back torn or whole.
-    THEN BOOLEAN
-    \* Otherwise it always comes back whole.
-    ELSE {FALSE}
+  \* A sealed stamp: only the defect, only before the first sync.
+  ELSE IF Frame = "AEAD" THEN (IF Mutant = "StampUnsynced" /\ synced = 0 THEN BOOLEAN ELSE {FALSE})
+  \* A checksummed stamp: torn or whole until the first sync covers it.
+  ELSE IF synced = 0 THEN BOOLEAN
+  \* Covered by a sync: whole.
+  ELSE {FALSE}
 
 \* Whether a crash can garble an earlier log: only when one holds a record
 \* no sync covered, which only the NewLogBeforeFlush defect leaves.
@@ -442,8 +457,11 @@ PLen(cs) == Cardinality({i \in DOMAIN cs.st : cs.st[i] # "absent"})
 Usable(cs, i) ==
   \* The bytes are the ones the writer wrote...
   /\ cs.st[i] = "intact"
-  \* ...and, with sealed frames, the key is the one that sealed them.
+  \* ...with sealed frames, the key is the one that sealed them...
   /\ (Frame = "Checksum" \/ cs.keyOk)
+  \* ...and with checksums, the stamp survived: each record's check covers the stamp's nonce, so
+  \* past a torn stamp no record verifies.
+  /\ ~(Frame = "Checksum" /\ cs.stampTorn)
 
 \* The key half of a stamp's check: a sealed stamp's tag holds only under
 \* the key that sealed it (wal_seal::open_stamp).
@@ -455,15 +473,16 @@ StampKeyOk(cs) ==
   \* The StampNotSealed defect: a stamp nobody sealed passes under any key.
   \/ Mutant = "StampNotSealed"
 
-\* The newest log's stamp verifies: right key, and every byte there. An
-\* earlier log was synced whole before the next one existed, so only the
-\* newest log's stamp can be torn.
+\* The newest log's stamp does not refuse the open: right key, and every
+\* byte there for a sealed stamp. An earlier log was synced whole before the
+\* next one existed, so only the newest log's stamp can be torn.
 NewestStampOk(cs) ==
   \* The key half, as for every log.
   /\ StampKeyOk(cs)
-  \* And the stamp is whole: a torn sealed stamp cannot be told from one
-  \* under another key, so it refuses like a wrong key.
-  /\ ~cs.stampTorn
+  \* A torn sealed stamp cannot be told from one under another key, so it refuses like a wrong key.
+  \* A torn checksummed stamp reads as a log nothing in which was synced, which replay drops, unless
+  \* the planted bug UnstampedRefuses refuses it.
+  /\ (~cs.stampTorn \/ (Frame = "Checksum" /\ Mutant # "UnstampedRefuses"))
 
 \* The present records that are not usable.
 Bad(cs) == {i \in 1..PLen(cs) : ~Usable(cs, i)}
@@ -690,8 +709,9 @@ FlushInPlace ==
   /\ UNCHANGED <<sealed, next, crashes>>
 
 \* The end of a close that sealed in place (Ordered::close_log): the next
-\* log is created and CLOSE appended to it, unsynced; no record precedes
-\* CLOSE, as AppendClose asks. A Sync then makes CLOSE durable.
+\* log is created and CLOSE appended to it, unsynced. A Sync then makes the
+\* stamp and CLOSE durable together: the merged sync, since no record
+\* precedes CLOSE.
 CloseNext ==
   \* The in-place flush removed the log, and no next log exists yet.
   /\ ~haslog

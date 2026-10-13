@@ -39,7 +39,8 @@ fn position(ops: &[String], op: &str) -> usize {
 }
 
 /// The log the writes went to is removed unsynced, and only then is the
-/// next log created; the close's log syncs are the next log's.
+/// next log created; its stamp and CLOSE are synced together, the close's
+/// one log sync.
 #[test]
 fn close_never_syncs_the_log_it_sealed_in_place() {
     let dir = TempDir::new().unwrap();
@@ -50,21 +51,22 @@ fn close_never_syncs_the_log_it_sealed_in_place() {
     from_now(&recording);
     db.close().unwrap();
     let ops = ops(&recording);
+    let syncs = ops.iter().filter(|o| *o == "sync").count();
+    assert_eq!(syncs, 1, "one log sync, the next log's: {ops:?}");
     let removed = position(&ops, "remove wal_000001.log");
     let created = ops
         .iter()
         .position(|o| o.starts_with("create wal_"))
         .unwrap_or_else(|| panic!("no next log in {ops:?}"));
     assert!(removed < created, "the next log after the removal: {ops:?}");
-    let first_sync = position(&ops, "sync");
-    assert!(
-        created < first_sync,
-        "no log sync before the next log exists: {ops:?}"
-    );
     assert_eq!(
-        ops[created + 1],
-        format!("write {STAMP_LEN}"),
-        "the next log's stamp: {ops:?}"
+        ops[created + 1..created + 4],
+        [
+            format!("write {STAMP_LEN}"),
+            format!("write {HEADER_LEN}"),
+            "sync".to_string()
+        ],
+        "stamp, CLOSE, one sync: {ops:?}"
     );
     drop(db);
     let db = Db::open(dir.path(), Options::default()).unwrap();
@@ -74,7 +76,7 @@ fn close_never_syncs_the_log_it_sealed_in_place() {
 }
 
 /// With nothing in memory there is nothing to seal: close closes the log it
-/// has, creating and removing none.
+/// has, which holds no record, with one sync after CLOSE.
 #[test]
 fn a_close_with_nothing_in_memory_closes_the_log_it_has() {
     let dir = TempDir::new().unwrap();
@@ -89,9 +91,10 @@ fn a_close_with_nothing_in_memory_closes_the_log_it_has() {
             .any(|o| o.starts_with("create ") || o.starts_with("remove ")),
         "no log created or removed: {ops:?}"
     );
-    assert!(
-        ops.contains(&format!("write {HEADER_LEN}")),
-        "CLOSE: {ops:?}"
+    assert_eq!(
+        ops[..2],
+        [format!("write {HEADER_LEN}"), "sync".to_string()],
+        "CLOSE, then one sync: {ops:?}"
     );
 }
 

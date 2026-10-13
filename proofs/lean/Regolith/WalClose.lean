@@ -2,12 +2,13 @@
 import Regolith.WalRecovery
 
 /-!
-# WalClose: a close that seals its last log in place (E46)
+# WalClose: a close that seals its last log in place, and a close that syncs once (E46)
 
 This file backs the TLA+ model `proofs/tla/WalRecovery.tla`: its actions
 `SealInPlace`, `FlushInPlace` and `CloseNext` with the invariants
-`RecoveryOpens`, `NoGap` and `KeepsSynced`, and the RED configuration
-`MC_WalRecovery_Red_NewLogBeforeFlush`.
+`RecoveryOpens`, `NoGap` and `KeepsSynced`, and the RED configurations
+`MC_WalRecovery_Red_NewLogBeforeFlush` and
+`MC_WalRecovery_Red_UnstampedRefuses`.
 
 ## The story, for a reader who has never seen the code
 
@@ -36,6 +37,15 @@ gap-free prefix. If close created the next log first (the RED case), a
 power cut could tear commit 1 in a log that is no longer the newest, and
 recovery would refuse to open.
 
+The second part is about the last step: closing the next log. It holds
+no record, so the close writes CLOSE and syncs once, instead of syncing,
+writing CLOSE and syncing again. Until that one sync, the log's header
+(its "stamp") is not on the disk either, and a power cut may tear it.
+Recovery then reads the log as one nothing of which was synced, and keeps
+nothing of it, which loses nothing because it held nothing. A recovery
+that refused such a log (the second RED case) would refuse a power cut it
+must survive.
+
 What is proved, in plain words:
 
 1. `close_step_inv`, `close_reachable_inv`: with the seal in place, every
@@ -46,15 +56,21 @@ What is proved, in plain words:
    of commit order holding every durable commit.
 3. `new_log_first_breaks_recovery`: creating the next log before the
    flush is durable lets a power cut make recovery refuse (RED).
+4. `torn_stamp_recovers_prefix`: a log closed with one sync, whose stamp
+   a power cut may tear, still recovers a gap-free prefix that keeps every
+   synced commit; `merged_close_needs_no_sync_first` says the close may
+   skip the first sync exactly when no record precedes CLOSE.
+5. `unstamped_refuses_merged_close`: a replay that refused a torn stamp
+   would refuse a power cut after a merged close (RED).
 -/
 
 -- Everything below is named Regolith.WalClose.<name>.
 namespace Regolith.WalClose
 
--- Use the rotation part's log files, cuts and replay without the prefix.
+-- Use the rotation part's log files, cuts and replay, and format 2's log, without the prefix.
 open Regolith.WalRecovery
 
-/-! ## The seal in place -/
+/-! ## Part 1: the seal in place -/
 
 /-- The whole log while a close may be under way: what is in tables, the
 earlier log files, the newest one, and whether the close sealed it in
@@ -424,6 +440,116 @@ theorem new_log_first_breaks_recovery :
   ·
     -- The three bounds, each computed; "torn" is false, so its bound holds for lack of a case.
     exact ⟨by decide, by decide, fun h => absurd h (by decide)⟩
+
+/-! ## Part 2: the close that syncs once, and the torn stamp -/
+
+/-- Replay of the newest checksummed log after a power cut that may have
+torn its stamp. A whole stamp replays by the format 2 rule. A torn
+checksummed stamp reads as a log nothing of which was synced
+(`wal_replay.rs`, `unstamped`): nothing of it is kept, and replay opens.
+The result is how many group records are kept, or `none` for a refusal. -/
+def replayChecksum (stampWhole : Bool) (l : Log2) (ok : List Bool) : Option Nat :=
+  -- A whole stamp: the format 2 rule, with a stamp that verifies; a torn one: keep nothing.
+  if stampWhole then replay2 true l ok else some 0
+
+/-- What a power cut the device's flush honoured may do to a checksummed
+stamp: tear it only while no sync has covered it. -/
+def StampMayTear (l : Log2) (stampWhole : Bool) : Prop :=
+  -- A torn stamp means nothing in the log was synced yet.
+  stampWhole = false → l.synced = 0
+
+/-- **The merged close needs no sync first exactly when no group precedes
+CLOSE.** The close step asks that every group be synced; with no group
+that holds before any sync, so the close writes CLOSE and its one sync
+covers the stamp and CLOSE together. -/
+theorem merged_close_needs_no_sync_first (w : Wal2)
+    -- The newest log is open,
+    (hopen : w.log.closed = false)
+    -- holds no group,
+    (hnone : w.log.stamps = [])
+    -- and nothing in it is synced.
+    (hzero : w.log.synced = 0) :
+    -- The statement: the close may append CLOSE now.
+    Step2 w { w with log := { w.log with closed := true } } :=
+  -- The close step, with "every group synced" as 0 = 0.
+  Step2.close w hopen (by rw [hnone, hzero]; rfl)
+
+/-- **A torn stamp keeps the prefix.** For every state the format 2
+writer reaches (a close with one sync included), and every power cut the
+device's flush honoured, which may tear a stamp no sync covered: replay
+opens, recovery yields commits `0, ..., n - 1` for some `n`, and it keeps
+every group a completed sync covered. -/
+theorem torn_stamp_recovers_prefix {w : Wal2} {ok : List Bool} {s : Bool}
+    -- `w` is reachable by the format 2 writer.
+    (hreach : Steps2 init2 w)
+    -- The crash kept the synced prefix.
+    (hsurv : Survives2 w.log ok)
+    -- The stamp tore only if nothing was synced.
+    (htear : StampMayTear w.log s) :
+    -- The statement: replay opens, keeping some number of groups;
+    ∃ kept, replayChecksum s w.log ok = some kept ∧
+      -- recovery yields commits 0, ..., (earlier + kept) - 1;
+      recovered2 w kept = List.range (w.earlier.length + kept) ∧
+      -- and every synced group is kept.
+      min w.log.synced w.log.stamps.length ≤ kept := by
+  -- Split on whether the stamp survived.
+  cases s with
+  -- The stamp is torn.
+  | false =>
+    -- Then nothing was synced.
+    have hzero := htear rfl
+    -- The earlier logs hold commits 0, ..., e - 1 (the invariant of every reachable state).
+    obtain ⟨horder, -⟩ := reachable2_inv hreach
+    -- Replay keeps nothing of this log.
+    refine ⟨0, rfl, ?_, ?_⟩
+    -- Recovery yields just the earlier commits, a range.
+    ·
+      -- Unfold what recovery yields: the earlier commits and no more.
+      simp only [recovered2, List.range'_zero, List.append_nil, Nat.add_zero]
+      -- The earlier commits are `0, ..., e - 1`.
+      exact horder
+    -- Nothing was synced, so nothing synced is lost.
+    ·
+      -- The synced count is 0.
+      rw [hzero]
+      -- The smaller of 0 and anything is 0.
+      simp
+  -- The stamp survived: the format 2 theorem.
+  | true =>
+    -- Take what format 2 recovery promises.
+    obtain ⟨kept, hrep, hrange, hsyn, -⟩ := recovers_prefix2 hreach hsurv
+    -- The same kept count, with the same replay.
+    exact ⟨kept, by simpa [replayChecksum] using hrep, hrange, hsyn⟩
+
+/-- A replay that refuses a log whose checksummed stamp is torn: the RED
+case `UnstampedRefuses`. -/
+def replayRefusesTorn (stampWhole : Bool) (l : Log2) (ok : List Bool) : Option Nat :=
+  -- A whole stamp: the format 2 rule; a torn one: refuse.
+  if stampWhole then replay2 true l ok else none
+
+/-- **`unstamped_refuses_merged_close`.** From the start, a close with one
+sync appends CLOSE before any sync. A power cut then may tear the stamp
+and keep no record, and the defective replay refuses: a crash the
+database must survive. -/
+theorem unstamped_refuses_merged_close :
+    -- The writer reaches a log closed with no sync yet;
+    Steps2 init2 ⟨[], ⟨[], 0, true⟩⟩ ∧
+    -- the crash that keeps no record is one the device's flush allows;
+    Survives2 ⟨[], 0, true⟩ [] ∧
+    -- the stamp may tear, since nothing was synced;
+    StampMayTear ⟨[], 0, true⟩ false ∧
+    -- and the defective replay refuses.
+    replayRefusesTorn false ⟨[], 0, true⟩ [] = none := by
+  -- Four parts.
+  refine ⟨?_, ?_, fun _ => rfl, rfl⟩
+  -- One step from the start: the merged close.
+  ·
+    -- The close of the empty log, with no sync before it.
+    exact .tail (.refl _) (merged_close_needs_no_sync_first init2 rfl rfl rfl)
+  -- Nothing synced and nothing kept: both bounds are computed.
+  ·
+    -- Each bound, computed.
+    exact ⟨by decide, by decide⟩
 
 -- The end of the names that start with Regolith.WalClose.
 end Regolith.WalClose

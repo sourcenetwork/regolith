@@ -46,8 +46,9 @@ impl EventListener for Reports {
 }
 
 /// Close flushes what the memtable holds into a table and removes the log
-/// it was written to; the next log holds only CLOSE, claiming the stamp
-/// before it synced (`WalRecovery.tla`, `CloseNext`).
+/// it was written to; the next log holds only CLOSE, written before the
+/// one sync that makes the stamp and CLOSE durable together, so CLOSE
+/// claims nothing synced before it (`WalRecovery.tla`, `CloseNext`).
 #[test]
 fn close_ends_in_a_next_log_holding_only_close() {
     let dir = TempDir::new().unwrap();
@@ -66,10 +67,7 @@ fn close_ends_in_a_next_log_holding_only_close() {
     let (kind, claim, at) = last_record(&next);
     assert_eq!(kind, KIND_CLOSE);
     assert_eq!(at, STAMP_LEN as u64, "CLOSE follows the stamp");
-    assert_eq!(
-        claim, at,
-        "the sync before CLOSE covered every byte before it"
-    );
+    assert_eq!(claim, 0, "no sync came before CLOSE");
     assert_eq!(
         std::fs::metadata(&next).unwrap().len(),
         at + HEADER_LEN as u64
@@ -142,17 +140,18 @@ fn the_first_latched_reason_is_the_one_kept() {
     }
 }
 
-/// A close whose sync fails leaves the log without CLOSE, says why, and
-/// latches the database, since what reached the device is unknown.
+/// A close whose sync fails says why and latches the database, since what
+/// reached the device is unknown. The log held no record, so its one sync
+/// came after CLOSE: the log holds the stamp and at most CLOSE, which
+/// vouches for nothing but the stamp.
 #[test]
-fn a_close_whose_sync_fails_latches_and_appends_nothing() {
+fn a_close_whose_sync_fails_latches() {
     let dir = TempDir::new().unwrap();
     let db = Db::open(dir.path(), Options::default()).unwrap();
     db.put(b"a", b"1").unwrap();
     // Flushed now, so close has no memtable to seal and the sync that
-    // fails is the one before CLOSE.
+    // fails is the log's own.
     db.flush().unwrap();
-    let before = std::fs::read(log_of(&dir)).unwrap();
     {
         let _fault = SyncFault::arm(&dir);
         let err = db.close().unwrap_err();
@@ -161,7 +160,12 @@ fn a_close_whose_sync_fails_latches_and_appends_nothing() {
             "{err}"
         );
     }
-    assert_eq!(std::fs::read(log_of(&dir)).unwrap(), before);
+    let left = std::fs::read(log_of(&dir)).unwrap();
+    assert!(
+        left.len() == STAMP_LEN || left.len() == STAMP_LEN + HEADER_LEN,
+        "the log holds no record: {} bytes",
+        left.len()
+    );
     let later = db.put(b"b", b"2").unwrap_err();
     assert!(later.to_string().contains("unknown state"), "{later}");
     drop(db);
