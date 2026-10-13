@@ -13,6 +13,16 @@
 //! the seam reads the thread-local only after the block cache missed, where
 //! a device read would cost far more than the read of one word.
 //!
+//! A `CacheOnly` scope is also one call, which a miss leaves to be run
+//! again. A call that reads a block from what landed for its queue notes
+//! it ([`note_hit`]), a wait it records carries the blocks the call read so
+//! far ([`note_wait`]), and a call that ends having read landed blocks
+//! without waiting tells its queue which ([`Message::Finished`]). The queue
+//! keeps those blocks landed while the call may need them again
+//! (`io_queue::ledger`), so a call that needs more blocks at once than the
+//! queue's bound still finishes. A call that touches no landing pays one
+//! bit test when its scope ends.
+//!
 //! [`unit_run`] clears the mode for the stretch a unit run by
 //! `IoQueue::poll` reads the device, whoever calls it, and marks that
 //! stretch as one that may not wait for an open-file slot (D60): a reopen
@@ -37,13 +47,29 @@ use std::cell::{Cell, RefCell};
 use std::num::NonZeroU64;
 use std::sync::Arc;
 
-use super::shared::QueueShared;
+use super::shared::{Message, QueueShared};
+use super::unit::UnitKey;
 use crate::env::open_file_limit::slots::SlotWaiter;
 use crate::io_queue::QueueId;
 
+/// Set in `QUEUE` once the call in this thread's `CacheOnly` scope read a
+/// landed block or recorded a wait, so its end has something to tell. Queue
+/// ids count up from one and never reach it.
+const TOUCHED: u64 = 1 << 63;
+
 thread_local! {
     /// The queue misses go to on this thread right now; `0` is `Blocking`.
+    /// [`TOUCHED`] rides in the top bit.
     static QUEUE: Cell<u64> = const { Cell::new(0) };
+    /// What the `CacheOnly` call on this thread did with its queue, once
+    /// [`TOUCHED`] is set.
+    static CALL: RefCell<Call> = const {
+        RefCell::new(Call {
+            queue: None,
+            read: Vec::new(),
+            waits: false,
+        })
+    };
     /// The queue whose unit this thread is running, while it runs one.
     static RUNNING: RefCell<Option<Running>> = const { RefCell::new(None) };
     /// This thread is inside a [`no_wait`] stretch.
@@ -101,6 +127,18 @@ pub(crate) fn waits(what: &'static str) {
     }
 }
 
+/// One `CacheOnly` call's dealings with its queue.
+struct Call {
+    /// The queue it read landed blocks from.
+    queue: Option<Arc<QueueShared>>,
+    /// The landed blocks it read, in the order it read them. Kept across
+    /// calls for its allocation, and cleared when a call ends.
+    read: Vec<UnitKey>,
+    /// It recorded a wait: it will be run again, and the wait carries what
+    /// it read.
+    waits: bool,
+}
+
 /// A unit run in progress on this thread.
 struct Running {
     queue: Arc<QueueShared>,
@@ -117,8 +155,97 @@ pub(crate) struct Scope {
 
 impl Drop for Scope {
     fn drop(&mut self) {
-        QUEUE.with(|queue| queue.set(self.previous));
+        let ended = QUEUE.with(|queue| queue.replace(self.previous));
+        if ended & TOUCHED != 0 {
+            if self.previous & !TOUCHED == 0 {
+                // The outermost `CacheOnly` scope: its call is over.
+                end_call();
+            } else {
+                // A nested scope: the call around it goes on, and carries it.
+                QUEUE.with(|queue| queue.set(self.previous | TOUCHED));
+            }
+        }
     }
+}
+
+/// Mark the call in this thread's `CacheOnly` scope as one with something
+/// to tell when it ends. `false` outside such a scope.
+fn touch() -> bool {
+    QUEUE.with(|queue| {
+        let mode = queue.get();
+        if mode & !TOUCHED == 0 {
+            return false;
+        }
+        queue.set(mode | TOUCHED);
+        true
+    })
+}
+
+/// The call in this thread's `CacheOnly` scope read `key` from what landed
+/// for `queue`.
+pub(crate) fn note_hit(queue: &Arc<QueueShared>, key: UnitKey) {
+    if !touch() {
+        return;
+    }
+    CALL.with(|call| {
+        let mut call = call.borrow_mut();
+        if call.queue.is_none() {
+            call.queue = Some(Arc::clone(queue));
+        }
+        // A block read twice in a row (an index walked per entry) is noted
+        // once; `held` drops the other repeats.
+        if call.read.last() != Some(&key) {
+            call.read.push(key);
+        }
+    });
+}
+
+/// The call in this thread's `CacheOnly` scope records a wait, and will be
+/// run again: the landed blocks it read so far, sorted, which the wait
+/// carries so its queue keeps them until then. Empty outside such a scope.
+pub(crate) fn note_wait() -> Box<[UnitKey]> {
+    if !touch() {
+        return Box::default();
+    }
+    CALL.with(|call| {
+        let mut call = call.borrow_mut();
+        call.waits = true;
+        held(&call.read)
+    })
+}
+
+/// `read`, sorted and without repeats.
+fn held(read: &[UnitKey]) -> Box<[UnitKey]> {
+    if read.is_empty() {
+        return Box::default();
+    }
+    let mut held = read.to_vec();
+    held.sort_unstable();
+    held.dedup();
+    held.into_boxed_slice()
+}
+
+/// The end of a `CacheOnly` call that read a landed block or recorded a
+/// wait. One that read landed blocks and finished without a wait tells its
+/// queue which, so the queue lets go of what it kept for the call.
+#[cold]
+#[inline(never)]
+fn end_call() {
+    CALL.with(|call| {
+        let mut call = call.borrow_mut();
+        let queue = call.queue.take();
+        let waits = std::mem::take(&mut call.waits);
+        // Only when the queue keeps a wait the call may have been: one
+        // that keeps nothing has nothing to let go.
+        if !waits
+            && let Some(queue) = queue
+            && queue.keeps()
+        {
+            // A queue dropped since refuses it, and keeps nothing.
+            let _ = queue.deliver(Message::Finished(held(&call.read)));
+        }
+        call.read.clear();
+    });
 }
 
 /// Send this thread's device misses to queue `id` until the scope drops.
@@ -140,7 +267,7 @@ pub(crate) fn blocking() -> Scope {
 /// The queue this thread's misses go to, or `None` when it may read the
 /// device. The seam calls this only after the block cache missed.
 pub(crate) fn current() -> Option<QueueId> {
-    NonZeroU64::new(QUEUE.with(Cell::get)).map(QueueId::new)
+    NonZeroU64::new(QUEUE.with(Cell::get) & !TOUCHED).map(QueueId::new)
 }
 
 /// The run of one unit on this thread, from [`unit_run`]: the device may be
@@ -239,6 +366,91 @@ mod tests {
         assert!(caught.is_err());
         assert_eq!(current(), None);
         assert!(reopen_waiter().is_none());
+    }
+
+    fn unit_key(offset: u64) -> UnitKey {
+        UnitKey {
+            file_id: 1,
+            offset,
+            guard: None,
+        }
+    }
+
+    /// What `queue`'s inbox says the calls that ended told it.
+    fn finished(queue: &QueueShared) -> Vec<Vec<UnitKey>> {
+        queue
+            .take_inbox()
+            .filter_map(|message| match message {
+                Message::Finished(read) => Some(read.into_vec()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_call_carries_what_it_read_into_its_wait_and_no_further() {
+        let q = queue();
+        let (a, b) = (unit_key(0), unit_key(9));
+        // Outside a `CacheOnly` scope nothing is noted.
+        note_hit(&q, a);
+        {
+            let _scope = cache_only(id(4));
+            note_hit(&q, b);
+            note_hit(&q, a);
+            note_hit(&q, a);
+            // Sorted, once each, and only this call's.
+            assert_eq!(&*note_wait(), &[a, b]);
+        }
+        {
+            let _scope = cache_only(id(4));
+            assert!(note_wait().is_empty(), "a call starts with nothing read");
+        }
+        assert_eq!(current(), None);
+    }
+
+    #[test]
+    fn a_call_that_finishes_tells_its_queue_only_when_it_keeps_a_wait() {
+        let q = queue();
+        let a = unit_key(0);
+        {
+            let _scope = cache_only(id(4));
+            note_hit(&q, a);
+        }
+        assert!(finished(&q).is_empty(), "nothing kept, nothing told");
+        q.set_kept(1);
+        {
+            let _scope = cache_only(id(4));
+            note_hit(&q, a);
+        }
+        assert_eq!(finished(&q), vec![vec![a]]);
+        {
+            let _scope = cache_only(id(4));
+            note_hit(&q, a);
+            let _ = note_wait();
+        }
+        assert!(finished(&q).is_empty(), "a call that waits will run again");
+    }
+
+    #[test]
+    fn a_nested_scope_hands_what_it_did_to_the_call_around_it() {
+        let q = queue();
+        q.set_kept(1);
+        let (a, b) = (unit_key(0), unit_key(9));
+        {
+            let _outer = cache_only(id(4));
+            {
+                let _device = blocking();
+                // A unit run inside the call reads the device: nothing noted.
+                note_hit(&q, b);
+            }
+            {
+                let _inner = cache_only(id(4));
+                note_hit(&q, a);
+            }
+            assert!(finished(&q).is_empty(), "the call is not over");
+            assert_eq!(current(), Some(id(4)));
+        }
+        assert_eq!(finished(&q), vec![vec![a]]);
     }
 
     #[test]

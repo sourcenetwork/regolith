@@ -962,6 +962,15 @@ tla:
     check MC_NonBlocking_Red_EarlyFire                 RED TimerNotEarly
     check MC_NonBlocking_Red_DropForgets               RED DroppedHoldsNothing
     check MC_NonBlocking_Red_TimerWrongQueue           RED TimerOnOwnQueue
+    # D53, what a read run again finds: a landing that a call still needs is
+    # held past the queue's byte bound until the call runs again, so a call
+    # needing more blocks at once than the bound finishes, and the eviction
+    # that held nothing never let it.
+    spec=LandingHold
+    check MC_LandingHold_Green                         GREEN
+    check MC_LandingHold_Green_Three                   GREEN
+    check MC_LandingHold_Red_Fifo                      RED EveryCallFinishes
+    check MC_LandingHold_Red_NoHolds                   RED RunsKeepProgress
     # Phase 7 integration: with no worker and inline compaction on, no
     # stopped writer waits on a relief nobody runs. Every piece of progress
     # lands the stall's unit (relief handed back), a contended writer reads
