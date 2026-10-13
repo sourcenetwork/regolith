@@ -372,7 +372,9 @@ impl BackupEngine {
     /// crash copied and never listed.
     ///
     /// The deletion is durable before any shared file is removed, so a
-    /// power cut never leaves a backup that lists a removed file.
+    /// power cut never leaves a backup that lists a removed file. That holds
+    /// for a call run again after one that failed to make its deletion
+    /// durable, too: every collection syncs `meta/` first.
     ///
     /// The collection sweeps `shared/` a batch of tables at a time and, for
     /// each batch, reads every remaining listing one at a time: it holds one
@@ -420,32 +422,22 @@ impl BackupEngine {
         self.collect_shared()
     }
 
-    /// Remove the metadata of every backup in `ids`, oldest first, then sync
-    /// `meta/` once, before any shared file is removed: a removal undone by
-    /// a power cut must not bring back a backup listing a shared file that
-    /// is gone. A walk that breaks stops the removals there; the ones made
-    /// are synced all the same, and the error returned.
+    /// Remove the metadata of every backup in `ids`, oldest first. A walk
+    /// that breaks stops the removals there, and the error is returned.
+    ///
+    /// Nothing is synced here: the collection that follows syncs `meta/`
+    /// before it removes any shared file ([`BackupEngine::collect_shared`]),
+    /// which makes these removals durable, and any an earlier call made
+    /// whose own sync failed.
     fn remove_backups(&self, ids: impl IntoIterator<Item = io::Result<BackupId>>) -> Result<()> {
-        let mut removed = false;
-        let mut stopped = Ok(());
         for id in ids {
-            let removal = id.and_then(|id| match self.env.remove_file(&self.meta_path(id)) {
-                Ok(()) => {
-                    removed = true;
-                    Ok(())
-                }
-                Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
-                Err(e) => Err(e),
-            });
-            if let Err(e) = removal {
-                stopped = Err(Error::from(e));
-                break;
+            match self.env.remove_file(&self.meta_path(id?)) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(Error::from(e)),
             }
         }
-        if removed {
-            self.env.sync_dir(&self.meta_dir).map_err(Error::from)?;
-        }
-        stopped
+        Ok(())
     }
 
     /// Call `f` with the id of every backup in `meta/`, in the order one
@@ -670,3 +662,6 @@ mod tests;
 
 #[cfg(test)]
 mod unreadable_tests;
+
+#[cfg(test)]
+mod sync_fault_tests;

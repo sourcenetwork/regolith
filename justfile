@@ -734,6 +734,7 @@ tla:
     check MC_BackupSeal_Red_CheckAfterCopy             RED RefusalWritesNothing
     check MC_BackupSeal_Red_GcSkipsSealed              RED ListedRestores
     check MC_BackupSeal_Red_GcSkipsUnreadable          RED ListedRestores
+    check MC_BackupSeal_Red_SyncOnlyRemoved            RED ListedRestores
     check MC_BackupSeal_Red_MetaFirst                  RED ListedRestores
     check MC_BackupSeal_Red_ListSkipsUnreadable        RED ListingNamesEvery
     check MC_BackupSeal_Red_ListNeedsKey               RED ListingNamesEvery
