@@ -28,13 +28,11 @@
 
 mod common;
 
-use std::fs::OpenOptions;
-use std::io::Write;
 use std::path::Path;
 use std::time::Duration;
 
 use common::fault::{
-    self, ChildOutcome, ChildSpec, CrashRun, CutPoint, DieKind, OpKind, OpValue, Phase,
+    self, Acks, ChildOutcome, ChildSpec, CrashRun, CutPoint, DieKind, OpKind, OpValue, Phase,
     PowerLossOptions, Recovery, TearMode, Trigger,
 };
 use regolith::{Db, DurabilityMode, WriteBatch};
@@ -59,11 +57,7 @@ fn crash_child() {
 /// returns; then a clean close.
 fn close_after_a_sync(spec: &ChildSpec) {
     let db = Db::open(&spec.db_path, spec.options()).expect("child: open");
-    let mut acks = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&spec.ack_path)
-        .expect("child: ack file");
+    let mut acks = Acks::open(&spec.ack_path);
     for (i, op) in spec.history().ops().iter().enumerate() {
         let mut batch = WriteBatch::new();
         match &op.value {
@@ -77,8 +71,7 @@ fn close_after_a_sync(spec: &ChildSpec) {
         };
         regolith::through_stalls(|| db.write_with_durability(batch.clone(), durability))
             .expect("child: write");
-        acks.write_all(format!("{i}\n").as_bytes())
-            .expect("child: ack");
+        acks.ack([i as u64]);
     }
     db.close().expect("child: close");
 }
@@ -160,7 +153,7 @@ fn check(out: &ChildOutcome, db: &Path, tear: TearMode, drop_creates: bool) -> O
                 return Some(format!("lost a synced write: {e}"));
             }
             if out.spec.durability == DurabilityMode::Immediate
-                && let Err(e) = report.covers_acked(&out.acked)
+                && let Err(e) = report.covers_acked(&out.acked())
             {
                 return Some(format!("lost an acknowledged write: {e}"));
             }
