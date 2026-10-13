@@ -1366,9 +1366,12 @@ DropQueue(t) ==
 \* Close marks the gate (CloseGate::close), then sweeps the table. A miss
 \* already counted in when the mark lands releases its own unit when it
 \* counts itself out (CloseGate::leave), so Release below stands for the
-\* sweep and for that miss alike, and no unit outlives close. The loom model
-\* no_unit_outlives_close checks the gate itself, with a calibration that
-\* checks for close only when the miss starts and leaves a unit behind.
+\* sweep and for that miss alike. Close does not wait for that miss: the
+\* promise is that once close has returned and the miss has ended, no unit
+\* is left in the table. The loom model no_unit_outlives_close checks the
+\* gate itself at that boundary, witnesses that close can return with the
+\* unit still in the table, and has a calibration that checks for close
+\* only when the miss starts and leaves a unit behind.
 
 \* The database closes. Reads run after this answer Closed.
 Close ==

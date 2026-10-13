@@ -37,9 +37,12 @@
 //!   that starts after the mark answers `Closed`, one under way when the mark
 //!   lands releases its own unit when it ends, and one that ended before it
 //!   inserted its unit where close's sweep, which comes after the mark,
-//!   finds it. So once close returns, no unit is left in the table, and every
+//!   finds it. So once close has returned and every miss under way when it
+//!   marked the gate has ended, no unit is left in the table, and every
 //!   queue waiting on one has its completion (`NonBlocking.tla`, Release;
-//!   the loom model `no_unit_outlives_close`).
+//!   the loom model `no_unit_outlives_close`). Close does not wait for
+//!   those misses: at the instant it returns, one of them may still hold its
+//!   unit in the table, and releases it when it ends.
 //! - **A unit never waits for an open-file slot** (D60). Its reopen under
 //!   `max_open_files` sweeps the slot table once; finding every slot in use
 //!   by running reads, it parks the unit on the queue running it and the
