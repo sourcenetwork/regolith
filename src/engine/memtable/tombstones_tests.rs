@@ -381,6 +381,65 @@ fn a_batch_appends_only_what_the_log_does_not_hold() {
     assert_eq!(log.len(), len + 2);
 }
 
+/// T4: an append that claims its position after a rebuild found every
+/// position below its bound ready is left out of the view the rebuild
+/// publishes, so once it finishes every query finds it. The view covering
+/// it as an empty placeholder would hide it: a lookup stops at the old
+/// ends, and the scan past the view starts above it.
+#[test]
+fn a_position_claimed_while_a_rebuild_scans_is_not_indexed() {
+    let log = Arc::new(TombstoneLog::new());
+    for seq in 1..REBUILD as u64 {
+        log.push(tomb(b"b", b"m", seq));
+    }
+    // A second helper claims the next position right after the rebuild the
+    // REBUILD-th append starts has found every position below its bound
+    // ready, and pauses before it writes the slot.
+    let helper = Arc::clone(&log);
+    after_next_ready_scan(move || {
+        let claimed = helper.claimed.fetch_add(1, Ordering::AcqRel);
+        assert_eq!(
+            claimed, REBUILD,
+            "setup: the claim lands right past the scan"
+        );
+    });
+    log.push(tomb(b"b", b"m", REBUILD as u64));
+    assert_eq!(
+        log.len(),
+        REBUILD + 1,
+        "setup: the helper claimed during the rebuild"
+    );
+    assert!(
+        log.index.load().is_some(),
+        "setup: the append rebuilt the index"
+    );
+    // The helper resumes and finishes its range delete.
+    let newest = REBUILD as u64 + 1;
+    // SAFETY: the helper's claim above handed it position REBUILD, and only
+    // this call fills it.
+    unsafe { log.fill(REBUILD, tomb(b"a", b"zz", newest)) };
+    assert_eq!(
+        log.covering_seq(b"y", u64::MAX),
+        newest,
+        "the delete of y was hidden"
+    );
+    assert_eq!(log.covering_seq(b"c", u64::MAX), newest);
+    assert_eq!(
+        log.first_newer_overlap(b"x", b"z", REBUILD as u64)
+            .map(|t| t.seq),
+        Some(newest)
+    );
+    let listed = log.to_sorted_vec();
+    assert_eq!(listed.len(), REBUILD + 1);
+    assert_eq!(listed[0].seq, newest);
+    assert!(
+        log.index
+            .load()
+            .is_some_and(|index| index.covered <= REBUILD),
+        "the index covered a position that was not ready"
+    );
+}
+
 fn key() -> impl Strategy<Value = Vec<u8>> {
     proptest::collection::vec(0u8..6, 0..3)
 }
