@@ -979,6 +979,10 @@ pub struct Transaction {
     /// pessimistic scan that could not possibly find a promoted key,
     /// instead of walking `tracked` once per yielded key.
     promoted_seq: AtomicU64,
+    /// A read was made through [`Transaction::get_for_update`]: a commit that
+    /// writes nothing at `SnapshotIsolation`, or under DefraLevel's
+    /// write-free relaxation, has a read to check. Only latches on.
+    for_update_reads: AtomicBool,
     /// Savepoint stack: how much of each buffer the transaction held when each
     /// was set.
     savepoints: Vec<Savepoint>,
@@ -1116,6 +1120,7 @@ impl Transaction {
             early_validation,
             reading,
             promoted_seq: AtomicU64::new(snapshot_seq),
+            for_update_reads: AtomicBool::new(false),
             savepoints: Vec::new(),
             callbacks: Callbacks::default(),
             claim,
@@ -1486,6 +1491,9 @@ impl Transaction {
         // Tells `scan_read_seq` a promoted key might exist, so it is worth
         // looking `tracked` up for a pessimistic scan.
         self.promoted_seq.fetch_max(read_seq, Ordering::AcqRel);
+        // Read only by the commit, which holds the transaction alone: the
+        // end of every borrow that could store it orders the store first.
+        self.for_update_reads.store(true, Ordering::Relaxed);
         let committed = || self.read_noting(&state, prefixed, read_seq);
         match self.read_own(prefixed, committed)? {
             Some(own) => Ok(own),
@@ -2027,7 +2035,15 @@ impl Transaction {
         // (`commit_write_free`, plan 3.8). A transaction never carries a
         // range delete (`delete_range` refuses a non-empty range).
         let write_free = writes.is_empty() && merges.is_empty() && appends.is_empty();
-        let tracked = self.tracked.drain();
+        // F2: when the level checks none of this transaction's reads, the set
+        // holds none: it is built from no read, and no scan stretch, which
+        // only widens reads and adds written keys, is folded into it.
+        let checks_no_read = write_free && self.checks_no_read_written_free();
+        let tracked = if checks_no_read {
+            Vec::new()
+        } else {
+            self.tracked.drain()
+        };
         let mut checks = self.validation_set(tracked, &writes, &merges);
         // DefraLevel's relaxation of a write-free transaction: an optimistic
         // one read one consistent snapshot and changes nothing, so no read of
@@ -2054,7 +2070,11 @@ impl Transaction {
         // Behind the `take`, not threaded through `validation_set`, so a
         // transaction that never scans (the common case) pays no `Vec`
         // round trip for an empty run list on its commit path.
-        if let Some(runs) = self.scan_runs.take().filter(|_| !relaxed) {
+        if let Some(runs) = self
+            .scan_runs
+            .take()
+            .filter(|_| !relaxed && !checks_no_read)
+        {
             let mut runs = drain(&runs);
             if let Some(classifier) = classifier {
                 let before = runs.len();
@@ -2098,6 +2118,27 @@ impl Transaction {
             scan_runs_dropped,
             _contain: contain,
         })
+    }
+
+    /// Whether a commit that writes nothing checks none of its reads at this
+    /// transaction's level, so its reads need not be drained, sorted or
+    /// filtered, and no scan stretch folded over them (F2):
+    /// `ReadCommitted` checks no read of a key the commit does not write,
+    /// and `SnapshotIsolation` and DefraLevel's write-free relaxation check
+    /// only `get_for_update` reads. The other levels check every read. A
+    /// validated scan's range is checked apart from the reads, either way.
+    /// `validation_set` keeps exactly these reads, so the two agree
+    /// (`a_scan_validates_like_gets_of_what_it_walked`).
+    fn checks_no_read_written_free(&mut self) -> bool {
+        let for_update = *self.for_update_reads.get_mut();
+        match self.isolation {
+            IsolationLevel::ReadCommitted => true,
+            IsolationLevel::SnapshotIsolation => !for_update,
+            IsolationLevel::DefraLevel if self.projects() => !for_update,
+            IsolationLevel::RepeatableRead
+            | IsolationLevel::Serializable
+            | IsolationLevel::DefraLevel => false,
+        }
     }
 
     /// Run `f`, which calls the caller's [`KeyClassifier`]. A panic in it

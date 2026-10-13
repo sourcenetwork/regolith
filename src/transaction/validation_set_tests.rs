@@ -351,6 +351,55 @@ fn duplicate_tracked_cells_are_deduped_keeping_the_newest() {
     drop(tx);
 }
 
+/// F2: a transaction that writes nothing, at a level that checks none of
+/// its reads, hands the engine a set with no read and leaves its reads
+/// undrained. A `get_for_update` at `SnapshotIsolation` or under DefraLevel's
+/// write-free relaxation, and any read at a level that checks every read,
+/// builds the set from the drained reads, and the read is in it. Which path
+/// a commit takes changes no set: `a_scan_validates_like_gets_of_what_it_walked`
+/// compares both against the twin's built set, and
+/// `a_validated_scan_that_writes_nothing_is_checked` shows a validated
+/// range kept on the short path.
+#[test]
+fn a_write_free_commit_builds_no_set_where_its_level_checks_nothing() {
+    for flavor in 0..2u8 {
+        for level in (0..5u8).map(isolation_level) {
+            for for_update in [false, true] {
+                let dir = TempDir::new().expect("tempdir");
+                let db = open_any(flavor, false, &dir);
+                db.put_external(b"k", b"v").expect("put");
+                let mut tx = db.begin(level);
+                if for_update {
+                    tx.get_for_update(b"k").expect("read");
+                } else {
+                    tx.get(b"k").expect("read");
+                }
+                let relaxed = flavor == 0 && level == IsolationLevel::DefraLevel;
+                let nothing = match level {
+                    IsolationLevel::ReadCommitted => true,
+                    IsolationLevel::SnapshotIsolation => !for_update,
+                    IsolationLevel::DefraLevel if relaxed => !for_update,
+                    _ => false,
+                };
+                let case = format!("flavor {flavor}, {level:?}, for update {for_update}");
+                let drained = tx.drain_for_commit().expect("drain");
+                assert!(drained.write_free, "{case}");
+                assert_eq!(
+                    drained.commit.checks.reads.is_empty(),
+                    nothing,
+                    "{case}: the set"
+                );
+                assert_eq!(
+                    tx.tracked.len(),
+                    usize::from(nothing),
+                    "{case}: the reads drained"
+                );
+                drop(drained);
+            }
+        }
+    }
+}
+
 /// Whether the transaction buffered a merge operand for `prefixed`.
 fn has_operands(tx: &Transaction, prefixed: &[u8]) -> bool {
     let mut found = false;
