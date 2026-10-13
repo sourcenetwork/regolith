@@ -75,7 +75,7 @@ ASSUME Mutant \in {"none", "OutOfOrder", "AbortHole", "NoHelping", "SyncPastGap"
                    "UnitNoDrain", "SettleAnyEpoch", "KeepMemtable", "NoEpochGate",
                    "PassBeforeApply", "RollbackForgets", "NoFreeze", "StopHoldsClaim",
                    "TrustEarly", "PublishBeforeSync", "DecideAnyOrder", "WorkBeyond",
-                   "SyncNoWait"}
+                   "SyncNoWait", "SkipOnPublished"}
 
 \* The ticket numbers of the run.
 Slots == 1..MaxSlots
@@ -347,15 +347,43 @@ Contends(a) ==
 \* its own, whether or not the tickets before it are decided).
 DecideSlot(a) == IF Mutant = "DecideAnyOrder" THEN mine[a] ELSE dto + 1
 
-\* The verdict on order i, worked out now: "abort" if it loses a conflict.
-VerdictOf(i) == IF Conflict(i) THEN "abort" ELSE "commit"
+\* Does the deciding thread skip the look above the horizon for order i?
+\* It skips when nothing was handed a sequence above the horizon: nx, the
+\* last sequence handed out in the tip the thread read, is at or below it
+\* (RegolithEngine::validate and decide_txn, `ceiling <= early.horizon`). A
+\* commit nobody committed under then finishes its check with no lookup at
+\* all. Picture a baker who knows the last ticket served before yours was
+\* number 5, and that you already checked the board up to number 5: there
+\* is nothing newer to look at.
+\* Mutant SkipOnPublished asks the published horizon instead of nx: an order
+\* decided and not yet published is above the horizon but not visible, so
+\* the look that would have found it is skipped.
+SkipsCheck(i, nx) ==
+  \* The broken version compares what readers can see...
+  IF Mutant = "SkipOnPublished" THEN visible <= hor[owner[i]]
+  \* ...the design compares the last sequence handed out.
+  ELSE nx <= hor[owner[i]]
+
+\* Does order i lose a conflict, decided from a tip whose last sequence is
+\* nx? Only a transaction can; the skip, when it applies, finds nothing
+\* above the horizon because nothing is there (ceiling_skips_the_check_above
+\* in PipelineCheck.lean).
+Loses(i, nx) ==
+  \* A conflict above the horizon...
+  /\ Conflict(i)
+  \* ...that the deciding thread looks for.
+  /\ ~SkipsCheck(i, nx)
+
+\* The verdict on order i, decided from a tip whose last sequence is nx:
+\* "abort" if it loses a conflict.
+VerdictOf(i, nx) == IF Loses(i, nx) THEN "abort" ELSE "commit"
 
 \* The sequence order i takes when the last one handed out is nx: the next
 \* one for a commit that brings writes, none for one that only read, and
 \* none for an abort (mutant AbortHole: an abort takes the next one too).
 SeqOf(i, nx) ==
   \* A commit with writes, or the broken version's abort, takes one.
-  IF (~Conflict(i) /\ Writes[owner[i]] # {}) \/ (Conflict(i) /\ Mutant = "AbortHole")
+  IF (~Loses(i, nx) /\ Writes[owner[i]] # {}) \/ (Loses(i, nx) /\ Mutant = "AbortHole")
     \* The next one.
     THEN nx + 1
     \* Anything else takes none.

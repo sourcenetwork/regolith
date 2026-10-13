@@ -589,15 +589,22 @@ impl RegolithEngine {
         base: &After,
         decision: &mut Decision,
     ) -> io::Result<()> {
+        let ceiling = base.next_seq.saturating_sub(1);
         let run = || -> io::Result<(Fate, Option<Vec<WriteBatchOp>>)> {
+            // Every item clean at the horizon and nothing handed a sequence
+            // above it: the check above the horizon finds nothing, item by
+            // item (`RegolithEngine::validate`), so it needs no view. Appends
+            // are numbered against the view.
+            if txn.appends.is_empty() && txn.early.is_clean() && ceiling <= txn.early.horizon {
+                let fate = Fate::Commit {
+                    merges_commuted: 0,
+                    writes_elided: 0,
+                };
+                return Ok((fate, None));
+            }
+            hook::at(hook::Stage::Validate);
             let view = self.view.load();
-            let fate = match self.validate(
-                &txn.checks,
-                &txn.ops,
-                &txn.early,
-                &view,
-                base.next_seq.saturating_sub(1),
-            )? {
+            let fate = match self.validate(&txn.checks, &txn.ops, &txn.early, &view, ceiling)? {
                 Verdict::Conflict(conflict) => return Ok((Fate::Conflict(conflict), None)),
                 Verdict::Accept {
                     merges_commuted,

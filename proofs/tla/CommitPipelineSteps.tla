@@ -243,7 +243,7 @@ DecideCas(a) ==
      \* If there is no verdict yet, this one is written...
      /\ IF dec[i] = "none"
           \* ...commit or abort...
-          THEN /\ dec'   = [dec EXCEPT ![i] = VerdictOf(i)]
+          THEN /\ dec'   = [dec EXCEPT ![i] = VerdictOf(i, nx)]
                \* ...with the next sequence if it takes one...
                /\ sq'    = [sq EXCEPT ![i] = SeqOf(i, nx)]
                \* ...stamped with the epoch of the state it came from...
@@ -272,7 +272,7 @@ DecideNow(a) ==
      \* The steps are taken in one go.
      /\ ~SmallSteps
      \* The verdict is written: commit or abort...
-     /\ dec'     = [dec EXCEPT ![i] = VerdictOf(i)]
+     /\ dec'     = [dec EXCEPT ![i] = VerdictOf(i, tipNext)]
      \* ...with the next sequence if it takes one...
      /\ sq'      = [sq EXCEPT ![i] = SeqOf(i, tipNext)]
      \* ...of the current state...
@@ -282,13 +282,13 @@ DecideNow(a) ==
      \* ...and of the current memtable.
      /\ memOf'   = [memOf EXCEPT ![i] = memGen]
      \* A commit's writes, if it brought any, go into the memtable.
-     /\ ap'      = [ap EXCEPT ![i] = ~Conflict(i) /\ Writes[owner[i]] # {}]
+     /\ ap'      = [ap EXCEPT ![i] = ~Loses(i, tipNext) /\ Writes[owner[i]] # {}]
      \* The tip is this order...
      /\ tipIdx'  = i
      \* ...with the sequence it took, if any, the last handed out...
      /\ tipNext' = IF SeqOf(i, tipNext) # 0 THEN SeqOf(i, tipNext) ELSE tipNext
      \* ...and a commit that brought writes charged to the memtable.
-     /\ tipUsed' = IF ~Conflict(i) /\ Writes[owner[i]] # {} THEN tipUsed + 1 ELSE tipUsed
+     /\ tipUsed' = IF ~Loses(i, tipNext) /\ Writes[owner[i]] # {} THEN tipUsed + 1 ELSE tipUsed
      \* The line moves past it.
      /\ dto'     = i
      \* A note another thread made for this ticket before the last rollback

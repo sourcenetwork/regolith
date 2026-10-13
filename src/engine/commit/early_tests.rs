@@ -411,3 +411,48 @@ fn a_commit_nothing_landed_under_never_reads_a_table() {
     assert!(matches!(outcome, Outcome::Landed { .. }), "{outcome:?}");
     assert_eq!(lookups, 0, "the commit read a table block");
 }
+
+/// Nothing was handed a sequence above the horizon of a commit's early
+/// check, so deciding its slot reads nothing, not even the view
+/// (`ceiling_skips_the_check_above` in `PipelineCheck.lean`). Once a write
+/// lands between the early check and the slot, the slot is checked above
+/// the horizon, and still commits when the write touched nothing it read.
+#[test]
+fn a_slot_nothing_was_decided_above_reads_nothing_when_it_is_decided() {
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    let (_dir, engine) = open();
+    apply(&engine, &Step::Put(0, 0));
+    let checked = Rc::new(Cell::new(0));
+    let counter = Rc::clone(&checked);
+    super::hook::set(move |stage| {
+        if stage == super::hook::Stage::Validate {
+            counter.set(counter.get() + 1);
+        }
+    });
+    let shape = Shape {
+        reads: vec![(0, 0)],
+        scan: Some((0, 1)),
+        writes: vec![(0, Step::Put(0, 1))],
+        blind: false,
+        exempt: None,
+    };
+    let (checks, ops) = commit_of(&shape, engine.snapshot_seq());
+    let (alone, _) = split_commit(&engine, checks, ops, || {});
+    let checked_alone = checked.get();
+    let (checks, ops) = commit_of(&shape, engine.snapshot_seq());
+    let (behind, _) = split_commit(&engine, checks, ops, || apply(&engine, &Step::Put(2, 1)));
+    super::hook::clear();
+    assert!(matches!(alone, Outcome::Landed { .. }), "{alone:?}");
+    assert_eq!(
+        checked_alone, 0,
+        "a slot nothing was decided above read the view"
+    );
+    assert!(matches!(behind, Outcome::Landed { .. }), "{behind:?}");
+    assert_eq!(
+        checked.get(),
+        1,
+        "a slot a write was decided above was not checked above its horizon"
+    );
+}
