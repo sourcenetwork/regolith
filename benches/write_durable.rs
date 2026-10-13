@@ -91,6 +91,10 @@ fn run_rep(threads: usize, dur: Duration) -> Rep {
     let elapsed = start.elapsed().as_secs_f64();
     let cpu_delta = common::cpu_seconds() - cpu0;
     let ops = written.load(Ordering::Relaxed) as f64;
+    assert!(
+        !common::rotated(&db),
+        "a memtable was sealed inside a timed repetition: raise write_buffer_size so every row times the write path alone"
+    );
     db.close().expect("close db");
     drop(db);
     drop(tmp);

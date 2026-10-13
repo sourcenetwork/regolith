@@ -199,6 +199,19 @@ pub fn open(tag: &str, opts: regolith::Options) -> (TempDb, regolith::Db) {
     (tmp, db)
 }
 
+/// Whether `db`, which held no table and no sealed memtable when a timed
+/// window began, sealed a memtable in it: one waits for its flush, or a table
+/// was written. A bench whose rows must all time the write path alone checks
+/// this, because a row that rotated timed a flush the others did not.
+pub fn rotated(db: &regolith::Db) -> bool {
+    let property = |name: &str| {
+        db.get_int_property(name)
+            .unwrap_or_else(|| panic!("the database does not report {name}"))
+    };
+    property("regolith.num-entries-imm-mem-tables") > 0
+        || property("regolith.total-sst-files-size") > 0
+}
+
 pub fn default_opts() -> regolith::Options {
     regolith::Options::default()
 }

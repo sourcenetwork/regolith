@@ -42,10 +42,12 @@ fn env_u64(name: &str, default: u64) -> u64 {
 
 /// One cache shard and a memtable large enough that a repetition stays inside
 /// it, so the number measures the memtable and WAL append path rather than a
-/// flush storm, and RSS stays bounded across the whole sweep.
+/// flush storm; each repetition checks that it did. The memtable grows only
+/// with what a repetition writes, and each repetition's database is dropped,
+/// so RSS stays bounded across the whole sweep.
 fn opts() -> Options {
     common::default_opts()
-        .write_buffer_size(64 * 1024 * 1024)
+        .write_buffer_size(1 << 30)
         .block_cache_size(8 * 1024 * 1024)
         .block_cache_num_shard_bits(0)
 }
@@ -99,6 +101,10 @@ fn run_rep(threads: usize, dur: Duration) -> Rep {
     let elapsed = start.elapsed().as_secs_f64();
     let cpu_delta = common::cpu_seconds() - cpu0;
     let ops = written.load(Ordering::Relaxed) as f64;
+    assert!(
+        !common::rotated(&db),
+        "a memtable was sealed inside a timed repetition: raise write_buffer_size so every row times the write path alone"
+    );
     db.close().expect("close db");
     drop(db);
     drop(tmp);

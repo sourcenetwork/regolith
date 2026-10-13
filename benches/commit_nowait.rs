@@ -68,11 +68,11 @@ fn env_u64(name: &str, default: u64) -> u64 {
 }
 
 /// A memtable large enough that a repetition never rotates, so the number is
-/// the commit path and not a flush.
+/// the commit path and not a flush; each repetition checks that it did not.
 fn opts(durability: DurabilityMode) -> Options {
     common::default_opts()
         .durability(durability)
-        .write_buffer_size(256 * 1024 * 1024)
+        .write_buffer_size(1 << 30)
         .block_cache_size(8 * 1024 * 1024)
         .block_cache_num_shard_bits(0)
 }
@@ -207,6 +207,10 @@ fn run_rep(durability: DurabilityMode, mode: Mode, writers: usize, dur: Duration
     let elapsed = start.elapsed().as_secs_f64();
     latencies.sort_unstable();
     let commits = committed.load(Ordering::Relaxed) as f64;
+    assert!(
+        !common::rotated(db.db()),
+        "a memtable was sealed inside a timed repetition: raise write_buffer_size so every row times the write path alone"
+    );
     db.db().close().expect("close db");
     drop(db);
     drop(tmp);
