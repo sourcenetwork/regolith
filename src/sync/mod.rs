@@ -123,6 +123,8 @@ pub use lazy::Lazy;
 pub use mutex::{Lock, LockOwned, Mutex, MutexGuard, OwnedMutexGuard};
 pub use notify::{Notified, Notify};
 pub use once_cell::OnceCell;
+#[cfg(test)]
+pub(crate) use owned_lock::between_take_and_grant;
 pub(crate) use owned_lock::{OwnedLock, OwnedWait, OwnerId, TryLock};
 pub use owner::{Owner, ThreadOwner};
 pub use reentrant_mutex::{ReentrantMutex, ReentrantMutexGuard, ReentrantMutexLock};

@@ -496,6 +496,68 @@ pub fn calibration_a_poll_without_the_hand_back_leaves_a_call_untold() {
     );
 }
 
+/// Defect F1. A release hands the lock to an owed wait in two steps, the
+/// name and then the grant, while the waiting transaction polls. `poll` is
+/// the production poll, or for the calibration one that takes the name a
+/// handoff is still granting for a hold. Whatever the order, a poll that says
+/// the transaction holds the lock is right, and the lock ends with the
+/// transaction. The witness is a poll that left the wait pending while the
+/// handoff went through; the calibration, at the same bound, shows the search
+/// reaches the poll between the handoff's two steps.
+fn a_poll_racing_a_handoff(
+    name: &'static str,
+    poll: fn(&PendingLock, OwnerId, Option<&WaitSlot>) -> Polled,
+) {
+    explore(name, 2, 10, 1, move |witness| {
+        let key_lock = StdArc::new(KeyLock::for_model());
+        let (holder, waiter) = (LockOwner::new(), LockOwner::new());
+        let (h, me) = (holder.id(), waiter.id());
+        assert_eq!(key_lock.lock.try_lock(h), TryLock::Taken);
+        let pending = StdArc::new(PendingLock::new(StdArc::clone(&key_lock)));
+        // Owed: the wait loses every race the bound allows.
+        assert_eq!(poll(&pending, me, None), Polled::Pending);
+        for _ in 0..MAX_BYPASS {
+            assert!(key_lock.lock.unlock(h));
+            assert_eq!(key_lock.lock.try_lock(h), TryLock::Taken);
+            assert_eq!(poll(&pending, me, None), Polled::Pending);
+        }
+        let releaser = {
+            let key_lock = StdArc::clone(&key_lock);
+            thread::spawn(move || assert!(key_lock.lock.unlock(h)))
+        };
+        let polled = poll(&pending, me, None);
+        releaser.join().expect("releaser");
+        let says_held = matches!(polled, Polled::Acquired | Polled::Mine);
+        let holds = key_lock.lock.holder() == me.word();
+        if polled == Polled::Pending && holds {
+            witness.record();
+        }
+        // Settle before the verdict: the wait, if still pending, is granted.
+        if !says_held && polled != Polled::Done {
+            assert_eq!(pending.poll(me, None), Polled::Acquired);
+        }
+        key_lock.lock.unlock(me);
+        assert!(
+            !says_held || holds,
+            "a poll said the transaction holds a lock the handoff then freed"
+        );
+    });
+}
+
+/// The F1 model on the production poll.
+pub fn a_poll_racing_a_handoff_is_never_fooled() {
+    a_poll_racing_a_handoff("a_poll_racing_a_handoff_is_never_fooled", PendingLock::poll);
+}
+
+/// Its calibration: the poll before the fix, which took the name a handoff
+/// had written, and not granted yet, for the transaction's own hold.
+pub fn calibration_a_poll_trusting_a_half_made_handoff_breaks_exclusion() {
+    a_poll_racing_a_handoff(
+        "calibration_a_poll_trusting_a_half_made_handoff_breaks_exclusion",
+        PendingLock::poll_trusting_a_half_made_handoff,
+    );
+}
+
 /// The last use of an entry is given back, and the entry retired, while
 /// another caller looks the entry up and takes a use: never both. Either
 /// the use came first and the entry stays, or the retirement did and the

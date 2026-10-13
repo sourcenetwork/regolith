@@ -31,6 +31,10 @@
 //!   other's poll returns waiting, and is told whenever the release's wake
 //!   fell inside that poll, so the free lock never waits on the poller's
 //!   caller coming back.
+//! - **A poll racing a handoff is never fooled** (defect F1): a release
+//!   hands the lock to an owed wait, name first and grant second, while the
+//!   waiting transaction polls; a poll that says "held" is right, and the
+//!   lock ends with the transaction.
 //! - **A take racing a push keeps the order**: the owner pushes `on_abort`
 //!   callbacks into the first four its claim holds in place while another
 //!   thread takes them; the take reads only slots whose push it saw complete
@@ -89,6 +93,17 @@ fn two_pollers_on_one_wait_are_both_told() {
 #[should_panic(expected = "a call that met the poll was never told")]
 fn calibration_a_poll_without_the_hand_back_leaves_a_call_untold() {
     locks::calibration_a_poll_without_the_hand_back_leaves_a_call_untold();
+}
+
+#[test]
+fn a_poll_racing_a_handoff_is_never_fooled() {
+    locks::a_poll_racing_a_handoff_is_never_fooled();
+}
+
+#[test]
+#[should_panic(expected = "a poll said the transaction holds a lock the handoff then freed")]
+fn calibration_a_poll_trusting_a_half_made_handoff_breaks_exclusion() {
+    locks::calibration_a_poll_trusting_a_half_made_handoff_breaks_exclusion();
 }
 
 #[test]

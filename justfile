@@ -1245,6 +1245,8 @@ tla:
     check MC_LockTable_Red_CompleteOnWaker             RED OwnQueue
     check MC_LockTable_Red_ReleaseAtWrite              RED IsolationAtLanding
     check MC_LockTable_Red_ReleaseAtDelivery           RED HeldOnlyWhileNeeded
+    check MC_LockTable_Green_EarlyPoll                 GREEN
+    check MC_LockTable_Red_MineBeforeGrant             RED MutualExclusion
     spec=LockTableCalls
     check MC_LockTableCalls_Green                      GREEN
     check MC_LockTableCalls_Red_NewestShadows          RED OneQueuedWait

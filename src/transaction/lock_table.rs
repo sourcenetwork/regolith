@@ -214,10 +214,11 @@ impl LockTable {
 /// A pessimistic transaction's name in the key locks it holds or waits for.
 ///
 /// Its address is the name, so it is aligned past the lock's queue bits and
-/// has a size of its own. Held through an `Arc` by the transaction, by the
-/// commit whose locks wait for it to land, and by the transaction's close
-/// claim, so the name stays unique while any lock can carry it.
-#[repr(align(64))]
+/// its handoff mark ([`OwnerId::ALIGN`]) and has a size of its own. Held
+/// through an `Arc` by the transaction, by the commit whose locks wait for it
+/// to land, and by the transaction's close claim, so the name stays unique
+/// while any lock can carry it.
+#[repr(align(128))]
 pub(crate) struct LockOwner {
     /// Gives the owner a size, so no two owners share an address.
     _place: u8,
@@ -333,7 +334,7 @@ impl PendingLock {
     /// and finds the mark wakes again: a call that met it is told even if
     /// the poller's own caller never comes back.
     pub(super) fn poll(&self, owner: OwnerId, told: Option<&WaitSlot>) -> Polled {
-        self.poll_checked::<true>(owner, told)
+        self.poll_checked::<true, false>(owner, told)
     }
 
     /// [`poll`](Self::poll) as it was before the hand-back: the loom
@@ -341,13 +342,32 @@ impl PendingLock {
     /// untold.
     #[cfg(loom)]
     pub(super) fn poll_without_recheck(&self, owner: OwnerId, told: Option<&WaitSlot>) -> Polled {
-        self.poll_checked::<false>(owner, told)
+        self.poll_checked::<false, false>(owner, told)
+    }
+
+    /// [`poll`](Self::poll) as it was before defect F1's fix: it takes the
+    /// transaction's name for a hold even while a handoff wrote it and has
+    /// not granted it. The loom calibration that shows that breaks mutual
+    /// exclusion.
+    #[cfg(loom)]
+    pub(super) fn poll_trusting_a_half_made_handoff(
+        &self,
+        owner: OwnerId,
+        told: Option<&WaitSlot>,
+    ) -> Polled {
+        self.poll_checked::<true, true>(owner, told)
     }
 
     /// [`poll`](Self::poll) with the hand-back of a wake that came while it
-    /// ran (`RECHECK`), or without it for the loom calibration that shows it
-    /// is needed.
-    fn poll_checked<const RECHECK: bool>(&self, owner: OwnerId, told: Option<&WaitSlot>) -> Polled {
+    /// ran (`RECHECK`), or without it, and with the name a handoff is still
+    /// granting taken for a hold (`TRUST_MARK`) or not: the production poll
+    /// is `<true, false>`, and the other forms are the loom calibrations that
+    /// show each rule is needed.
+    fn poll_checked<const RECHECK: bool, const TRUST_MARK: bool>(
+        &self,
+        owner: OwnerId,
+        told: Option<&WaitSlot>,
+    ) -> Polled {
         let state = &self.wakeup.state;
         match state.compare_exchange(IDLE, POLLING, Ordering::AcqRel, Ordering::Acquire) {
             Ok(_) => {}
@@ -368,10 +388,12 @@ impl PendingLock {
             .with_mut(|wait| unsafe { (*wait).poll(lock, owner, &self.waker) });
         let polled = if ready.is_ready() {
             Polled::Acquired
-        } else if lock.holder() == owner.word() {
+        } else if lock.holder() == owner.word() || (TRUST_MARK && trusts_mark(lock, owner)) {
             // Another call of the transaction took it while this one waited;
             // the lock cannot be handed to this wait while its own owner
-            // holds it, so the cancel only withdraws.
+            // holds it, so the cancel only withdraws. A handoff to this wait
+            // that is not granted yet names it with `GRANTING`, which this
+            // comparison never matches: the wait stays, and the grant wakes it.
             // SAFETY: as above.
             self.wait
                 .with_mut(|wait| unsafe { (*wait).cancel(lock, owner) });
@@ -421,6 +443,19 @@ impl PendingLock {
         self.wakeup.state.store(DONE, Ordering::Release);
         self.wakeup.wake_all();
     }
+}
+
+/// Whether the lock names `owner`, a handoff's marked name included: only the
+/// loom calibration of defect F1 asks, and outside loom nothing does.
+#[cfg(loom)]
+fn trusts_mark(lock: &crate::sync::OwnedLock, owner: OwnerId) -> bool {
+    lock.names(owner)
+}
+
+/// Outside loom no poll takes a marked name for a hold.
+#[cfg(not(loom))]
+fn trusts_mark(_lock: &crate::sync::OwnedLock, _owner: OwnerId) -> bool {
+    false
 }
 
 /// What a wake of a [`PendingLock`] tells: every [`LockWait`](crate::LockWait)
@@ -616,6 +651,67 @@ mod tests {
         assert!(b.lock.unlock(kept.id()));
         table.unpin(b"b", &b);
         assert_eq!(table.len(), 0);
+    }
+
+    /// Make `waiter`'s wait owed: it loses every race the bound allows while
+    /// `holder` releases and barges back in. `holder` holds the lock after.
+    fn owe(lock: &OwnedLock, holder: OwnerId, waiter: OwnerId, pending: &PendingLock) {
+        assert_eq!(pending.poll(waiter, None), Polled::Pending, "queued");
+        for _ in 0..crate::sync::MAX_BYPASS {
+            assert!(lock.unlock(holder));
+            assert_eq!(lock.try_lock(holder), TryLock::Taken, "barged");
+            assert_eq!(pending.poll(waiter, None), Polled::Pending, "a lost race");
+        }
+    }
+
+    /// F1. A release hands the lock to an owed wait in two steps: it writes
+    /// the waiter's name, then grants the waiter. The waiting transaction
+    /// polls between the two (on another thread, in the code; here inside
+    /// the hook) and must not take the name for a hold of its own: that
+    /// would withdraw the wait, the grant would then fail and free the lock,
+    /// and the transaction would go on believing it holds the key.
+    #[test]
+    fn a_poll_between_the_name_and_the_grant_does_not_conclude_mine() {
+        let lock = Arc::new(KeyLock::new());
+        let (holder, waiter) = (LockOwner::new(), LockOwner::new());
+        let (h, w) = (holder.id(), waiter.id());
+        assert_eq!(lock.lock.try_lock(h), TryLock::Taken);
+        let pending = Arc::new(PendingLock::new(Arc::clone(&lock)));
+        owe(&lock.lock, h, w, &pending);
+
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        {
+            let (pending, seen, lock) =
+                (Arc::clone(&pending), Arc::clone(&seen), Arc::clone(&lock));
+            crate::sync::between_take_and_grant(move || {
+                let polled = pending.poll(w, None);
+                let tried = lock.lock.try_lock(w);
+                *seen.lock().unwrap() = Some((polled, tried));
+            });
+        }
+        assert!(
+            lock.lock.unlock(h),
+            "the release hands the lock to the owed wait"
+        );
+        let (polled, tried) = seen
+            .lock()
+            .unwrap()
+            .take()
+            .expect("the handoff ran the hook");
+        assert_ne!(
+            polled,
+            Polled::Mine,
+            "the poll took the half-made handoff for a hold"
+        );
+        assert_ne!(
+            tried,
+            TryLock::Mine,
+            "a try took the half-made handoff for a hold"
+        );
+        // The grant went through: the wait is the holder.
+        assert_eq!(lock.lock.holder(), w.word(), "the handoff was undone");
+        assert_eq!(pending.poll(w, None), Polled::Acquired);
+        assert!(lock.lock.unlock(w));
     }
 
     #[test]
