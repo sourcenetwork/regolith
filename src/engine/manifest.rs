@@ -1258,6 +1258,8 @@ mod legacy_overlap_fault_tests;
 #[cfg(test)]
 mod legacy_overlap_tests;
 #[cfg(test)]
+mod legacy_test_support;
+#[cfg(test)]
 mod level_order_tests;
 
 #[cfg(test)]

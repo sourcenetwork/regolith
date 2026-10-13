@@ -24,7 +24,7 @@
 
 use std::collections::BTreeSet;
 
-use super::super::range_tombstone::{RangeTombstone, sort_dedup_tombstones};
+use super::super::range_tombstone::{RangeTombstone, coalesced};
 use super::*;
 
 /// What an open moved to L0, for the engine to finish and report.
@@ -124,31 +124,6 @@ impl Repair {
             range_deletes,
         })
     }
-}
-
-/// `tombstones` with every run of ranges that share a sequence and touch
-/// or overlap joined into one, oldest sequence first.
-///
-/// A compaction clips a tombstone to each table it writes, so one
-/// `delete_range` can reach here as a piece per table. Joined, the pieces
-/// delete exactly what they deleted apart: the same keys, at the same
-/// sequence.
-pub(super) fn coalesced(mut tombstones: Vec<RangeTombstone>) -> Vec<RangeTombstone> {
-    sort_dedup_tombstones(&mut tombstones);
-    // Stable, so each sequence keeps its ranges in start order.
-    tombstones.sort_by_key(|tombstone| tombstone.seq);
-    let mut joined: Vec<RangeTombstone> = Vec::with_capacity(tombstones.len());
-    for tombstone in tombstones {
-        match joined.last_mut() {
-            Some(last) if last.seq == tombstone.seq && tombstone.start <= last.end => {
-                if tombstone.end > last.end {
-                    last.end = tombstone.end;
-                }
-            }
-            _ => joined.push(tombstone),
-        }
-    }
-    joined
 }
 
 /// Check key order without changing the installation order needed by a

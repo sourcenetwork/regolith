@@ -12,146 +12,16 @@
 
 use std::sync::Arc;
 
-use proptest::prelude::*;
 use tempfile::TempDir;
 
-use super::legacy_overlap::coalesced;
 use super::legacy_overlap_tests::{ids, manifest, options, record_move};
+use super::legacy_test_support::*;
 use super::*;
+use crate::Db;
 use crate::column_family::{DEFAULT_CF_ID, prefix_key};
-use crate::engine::internal_key::{VALUE_TYPE_MERGE, VALUE_TYPE_VALUE, encode_internal_key};
+use crate::engine::internal_key::{VALUE_TYPE_MERGE, VALUE_TYPE_VALUE};
 use crate::engine::memtable::range_tombstone_work;
-use crate::engine::range_tombstone::{RangeTombstone, max_covering_seq};
 use crate::engine::seal::test_keys::{TestKeys, keyring};
-use crate::engine::sstable::SsTableWriter;
-use crate::options::CompressionType;
-use crate::{Db, MergeOperator, Options};
-
-/// One entry of a table: key, sequence, kind, value.
-type Entry<'a> = (&'a [u8], u64, u8, &'a [u8]);
-
-/// A range tombstone of a table: start, end, sequence.
-type Tombstone<'a> = (&'a [u8], &'a [u8], u64);
-
-/// Write table `id` holding `entries`, given in key order, and
-/// `tombstones`, all in the default column family.
-fn table_of(
-    dir: &Path,
-    id: u64,
-    entries: &[Entry<'_>],
-    tombstones: &[Tombstone<'_>],
-) -> SsTableMeta {
-    let path = dir.join(sst_filename(id));
-    let mut writer =
-        SsTableWriter::new(&path, 4096, 10, CompressionType::None, None, false, 4096).unwrap();
-    for (key, seq, kind, value) in entries {
-        writer
-            .add(
-                &encode_internal_key(&prefix_key(DEFAULT_CF_ID, key), *seq, *kind),
-                value,
-            )
-            .unwrap();
-    }
-    for (start, end, seq) in tombstones {
-        writer.add_range_tombstone(
-            &prefix_key(DEFAULT_CF_ID, start),
-            &prefix_key(DEFAULT_CF_ID, end),
-            *seq,
-        );
-    }
-    let summary = writer.finish().unwrap().unwrap();
-    SsTableMeta {
-        file_id: id,
-        smallest_key: summary.smallest_user_key,
-        largest_key: summary.largest_user_key,
-        file_size: std::fs::metadata(path).unwrap().len(),
-        num_entries: summary.num_entries,
-        global_seq: None,
-    }
-}
-
-/// An empty database directory, and its table directory.
-fn empty_db() -> (TempDir, PathBuf) {
-    let dir = TempDir::new().unwrap();
-    let sst_dir = dir.path().join("sst");
-    std::fs::create_dir_all(&sst_dir).unwrap();
-    std::fs::create_dir_all(dir.path().join("wal")).unwrap();
-    std::fs::write(dir.path().join("LOCK"), []).unwrap();
-    (dir, sst_dir)
-}
-
-fn add(level: usize, meta: SsTableMeta) -> ManifestRecord {
-    ManifestRecord::AddFile { level, meta }
-}
-
-struct Concat;
-
-impl MergeOperator for Concat {
-    fn full_merge(&self, _key: &[u8], base: Option<&[u8]>, operands: &[&[u8]]) -> Option<Vec<u8>> {
-        let mut out = base.map(<[u8]>::to_vec).unwrap_or_default();
-        for operand in operands {
-            out.extend_from_slice(operand);
-        }
-        Some(out)
-    }
-
-    fn name(&self) -> &'static str {
-        "concat"
-    }
-}
-
-fn merging() -> Options {
-    options().merge_operator(Some(Arc::new(Concat)))
-}
-
-fn get(db: &Db, key: &[u8]) -> Option<Vec<u8>> {
-    db.get(key).unwrap().map(|value| value.to_vec())
-}
-
-/// `key` as a read pinned at `seq` sees it.
-fn get_at(db: &Db, key: &[u8], seq: u64) -> Option<Vec<u8>> {
-    db.engine()
-        .get_slice_at(&prefix_key(DEFAULT_CF_ID, key), seq)
-        .unwrap()
-        .map(|value| value.to_vec())
-}
-
-fn files_per_level(db: &Db) -> Vec<u64> {
-    (0..MAX_LEVELS)
-        .map(|level| {
-            db.get_int_property(&format!("regolith.num-files-at-level{level}"))
-                .unwrap()
-        })
-        .collect()
-}
-
-/// A point read, a batch read and a scan of `db` all agree with
-/// `expected`, absent keys included.
-fn assert_reads(db: &Db, when: &str, expected: &[(&[u8], Option<&[u8]>)]) {
-    for (key, value) in expected {
-        assert_eq!(
-            get(db, key).as_deref(),
-            *value,
-            "{when}: get({})",
-            String::from_utf8_lossy(key)
-        );
-    }
-    let keys: Vec<&[u8]> = expected.iter().map(|(key, _)| *key).collect();
-    let batch = db.multi_get(&keys).unwrap();
-    for ((key, value), got) in expected.iter().zip(&batch) {
-        assert_eq!(
-            got.as_deref(),
-            *value,
-            "{when}: multi_get({})",
-            String::from_utf8_lossy(key)
-        );
-    }
-    let live: Vec<(Vec<u8>, Vec<u8>)> = expected
-        .iter()
-        .filter_map(|(key, value)| value.map(|value| (key.to_vec(), value.to_vec())))
-        .collect();
-    assert_eq!(db.scan(None, None).unwrap(), live, "{when}: scan");
-}
 
 /// Level 1 itself overlaps: the old table and, beside it, a table with one
 /// key and a range tombstone that widens its recorded range over the old
@@ -478,25 +348,6 @@ fn a_database_open_records_the_move_and_logs_the_tombstones_before_it_returns() 
         "the log the first open wrote holds the moved table's tombstone"
     );
     assert_eq!(get(&db, b"r"), None);
-}
-
-/// A copy of the database directory `from`, with a lock file of its own.
-fn copy_of(from: &Path) -> TempDir {
-    fn copy_tree(from: &Path, to: &Path) {
-        std::fs::create_dir_all(to).unwrap();
-        for entry in std::fs::read_dir(from).unwrap().flatten() {
-            let target = to.join(entry.file_name());
-            if entry.path().is_dir() {
-                copy_tree(&entry.path(), &target);
-            } else if entry.file_name() != "LOCK" {
-                std::fs::copy(entry.path(), &target).unwrap();
-            }
-        }
-    }
-    let copy = TempDir::new().unwrap();
-    copy_tree(from, copy.path());
-    std::fs::write(copy.path().join("LOCK"), []).unwrap();
-    copy
 }
 
 /// A moved table that was ingested at a sequence of its own (D48) keeps
@@ -1051,56 +902,4 @@ fn a_tree_moved_whole_into_level_0_takes_writes_while_a_worker_relieves_the_stop
     crate::through_stalls(|| db.delete(b"w")).unwrap();
     crate::through_stalls(|| db.delete(b"t")).unwrap();
     assert_wide_reads(db, "with a worker");
-}
-
-fn tombstone(start: &[u8], end: &[u8], seq: u64) -> RangeTombstone {
-    RangeTombstone::new(start.to_vec(), end.to_vec(), seq)
-}
-
-fn as_tuples(tombstones: &[RangeTombstone]) -> Vec<(&[u8], &[u8], u64)> {
-    tombstones
-        .iter()
-        .map(|t| (t.start.as_slice(), t.end.as_slice(), t.seq))
-        .collect()
-}
-
-#[test]
-fn pieces_of_one_range_delete_are_joined_and_others_are_not() {
-    let joined = coalesced(vec![
-        // One delete at sequence 9, clipped to three tables, one piece twice.
-        tombstone(b"c", b"f", 9),
-        tombstone(b"a", b"c", 9),
-        tombstone(b"e", b"h", 9),
-        tombstone(b"a", b"c", 9),
-        // The same range at another sequence is another delete.
-        tombstone(b"a", b"h", 4),
-        // A gap: `h` itself is not deleted at 9.
-        tombstone(b"i", b"k", 9),
-    ]);
-    let expected: [(&[u8], &[u8], u64); 3] = [(b"a", b"h", 4), (b"a", b"h", 9), (b"i", b"k", 9)];
-    assert_eq!(as_tuples(&joined), expected);
-    assert!(coalesced(Vec::new()).is_empty());
-}
-
-proptest! {
-    /// Joined, the tombstones delete what they deleted apart: for every key
-    /// and every snapshot, the newest covering sequence is the same.
-    #[test]
-    fn joined_range_deletes_cover_exactly_what_the_pieces_covered(
-        pieces in prop::collection::vec((0u8..12, 0u8..12, 1u64..5), 0..12),
-        key in 0u8..12,
-        snapshot in 0u64..6,
-    ) {
-        let pieces: Vec<RangeTombstone> = pieces
-            .into_iter()
-            .map(|(a, b, seq)| tombstone(&[a.min(b)], &[a.max(b)], seq))
-            .collect();
-        let joined = coalesced(pieces.clone());
-        prop_assert_eq!(
-            max_covering_seq(&joined, &[key], snapshot),
-            max_covering_seq(&pieces, &[key], snapshot)
-        );
-        prop_assert!(joined.windows(2).all(|pair| pair[0].seq <= pair[1].seq));
-        prop_assert!(joined.len() <= pieces.len());
-    }
 }
