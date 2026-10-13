@@ -195,9 +195,13 @@ pub enum Ticker {
     /// read-write open records the move, so the next open counts nothing;
     /// a read-only open moves them in its own view, every time.
     ManifestTablesDemoted = 38,
+    /// Compaction jobs run because more than half of the entries they read
+    /// were deletions and the entries those delete. Each is also counted in
+    /// [`Ticker::CompactionCount`]. Level and universal compaction only.
+    CompactionDeletionTriggered = 39,
 }
 
-const NUM_TICKERS: usize = 39;
+const NUM_TICKERS: usize = 40;
 
 impl Ticker {
     /// Every defined ticker, in discriminant order. Adding a variant
@@ -242,6 +246,7 @@ impl Ticker {
         Ticker::BlockCacheAddRefusedHeld,
         Ticker::CommitConflictsAfterDelete,
         Ticker::ManifestTablesDemoted,
+        Ticker::CompactionDeletionTriggered,
     ];
 
     /// Stable string name for exporting to monitoring systems.
@@ -286,6 +291,7 @@ impl Ticker {
             Ticker::BlockCacheAddRefusedHeld => "regolith.block_cache.add_refused_held",
             Ticker::CommitConflictsAfterDelete => "regolith.commit.conflicts_after_delete",
             Ticker::ManifestTablesDemoted => "regolith.manifest.tables_demoted",
+            Ticker::CompactionDeletionTriggered => "regolith.compaction.deletion_triggered",
         }
     }
 }

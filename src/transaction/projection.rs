@@ -11,7 +11,7 @@
 //! `get_parts` is a plain read and is validated as the level validates any
 //! read.
 
-use crate::sync::internal::Mutex;
+use kovan::Atom;
 
 use super::{
     Arc, AtomicBool, DEFAULT_CF_ID, DbSlice, IsolationLevel, KeyState, Ordering, Transaction,
@@ -23,12 +23,30 @@ use super::{
 const INLINE: usize = 8;
 
 /// A sorted set of part ids.
+#[derive(Clone)]
 enum PartSet {
     Inline { len: u8, ids: [u32; INLINE] },
     Heap(Vec<u32>),
 }
 
 impl PartSet {
+    const EMPTY: Self = Self::Inline {
+        len: 0,
+        ids: [0; INLINE],
+    };
+
+    /// This set and `parts`.
+    fn with(&self, parts: &[u32]) -> Self {
+        let mut wider = self.clone();
+        parts.iter().for_each(|part| wider.insert(*part));
+        wider
+    }
+
+    fn holds_all(&self, parts: &[u32]) -> bool {
+        let held = self.as_slice();
+        parts.iter().all(|part| held.binary_search(part).is_ok())
+    }
+
     fn as_slice(&self) -> &[u32] {
         match self {
             Self::Inline { len, ids } => &ids[..usize::from(*len)],
@@ -63,30 +81,31 @@ pub(super) struct Projection {
     /// narrows again.
     full: AtomicBool,
     /// The parts read. Meaningless once `full`.
-    //
-    // vertexia: a mutex, taken only by `get_parts` and the commit, on a set a
-    // handful of ids long; a lock-free append list if one projected key is
-    // ever read from many threads at once.
-    parts: Mutex<PartSet>,
+    ///
+    /// A transaction is shared between threads, so two of them can read one
+    /// key by parts at once. The set is never changed in place: a read that
+    /// adds parts builds the wider set and installs it by compare-and-swap
+    /// over the one it was built from, and builds again when another read
+    /// got there first. So no read's parts are lost, and none waits.
+    parts: Atom<PartSet>,
 }
 
 impl Projection {
     pub(super) fn new(parts: &[u32]) -> Self {
-        let projection = Self {
+        Self {
             full: AtomicBool::new(false),
-            parts: Mutex::new(PartSet::Inline {
-                len: 0,
-                ids: [0; INLINE],
-            }),
-        };
-        projection.widen(parts);
-        projection
+            parts: Atom::new(PartSet::EMPTY.with(parts)),
+        }
     }
 
     /// Add `parts` to the set.
     pub(super) fn widen(&self, parts: &[u32]) {
-        let mut held = self.parts.lock();
-        parts.iter().for_each(|part| held.insert(*part));
+        // A key read again by parts it was already read by, the usual case,
+        // installs nothing and allocates nothing.
+        if self.parts.peek(|held| held.holds_all(parts)) {
+            return;
+        }
+        self.parts.rcu(|held| held.with(parts));
     }
 
     /// The key was read in whole.
@@ -100,7 +119,7 @@ impl Projection {
         if self.full.load(Ordering::Acquire) {
             f(None)
         } else {
-            f(Some(self.parts.lock().as_slice()))
+            self.parts.peek(|held| f(Some(held.as_slice())))
         }
     }
 }
@@ -293,5 +312,42 @@ mod tests {
     #[test]
     fn no_parts_is_an_empty_set_not_a_whole_read() {
         assert_eq!(parts(&Projection::new(&[])), Some(Vec::new()));
+    }
+
+    /// Threads reading one key by different parts at the same moment: every
+    /// part any of them read is in the set afterwards. A widening that
+    /// overwrote the set it did not build on would drop another thread's.
+    #[test]
+    fn reads_of_one_key_from_several_threads_lose_no_part() {
+        const THREADS: u32 = 4;
+        // Enough parts each to pass the inline ids, so the set changes shape
+        // under the race too. Fewer rounds under miri, which is far slower.
+        const EACH: u32 = 5;
+        for round in 0..if cfg!(miri) { 20 } else { 2_000u32 } {
+            let projection = Projection::new(&[]);
+            let start = std::sync::Barrier::new(THREADS as usize);
+            std::thread::scope(|scope| {
+                for thread in 0..THREADS {
+                    let (projection, start) = (&projection, &start);
+                    scope.spawn(move || {
+                        start.wait();
+                        for i in 0..EACH {
+                            // One part at a time and all at once, in turn.
+                            let part = thread * EACH + i;
+                            if (round + i) % 2 == 0 {
+                                projection.widen(&[part]);
+                            } else {
+                                projection.widen(&[part, thread * EACH]);
+                            }
+                        }
+                    });
+                }
+            });
+            assert_eq!(
+                parts(&projection),
+                Some((0..THREADS * EACH).collect::<Vec<_>>()),
+                "round {round}"
+            );
+        }
     }
 }

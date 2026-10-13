@@ -171,13 +171,14 @@ pub trait Env: Send + Sync + std::fmt::Debug {
     /// filled. That is always correct, and it is the one place a committing
     /// thread waits for another to write.
     ///
-    /// What the default costs: one operating-system lock covers the file.
+    /// What the default costs: one lock covers the file.
     /// The log writes of concurrent commits run one at a time, and a sync of
     /// the log holds the lock for as long as the device takes, so no commit
     /// writes its record while a sync is in flight. A write that arrives
     /// ahead of a gap is copied and kept in memory until the gap is filled,
     /// which is bounded by the commits in flight. A thread that finds the
-    /// lock taken blocks, inside [`IoQueue::poll`](crate::IoQueue::poll) or
+    /// lock taken parks until it is let go, inside
+    /// [`IoQueue::poll`](crate::IoQueue::poll) or
     /// [`commit_nowait`](crate::Transaction::commit_nowait) as anywhere
     /// else, so those calls lose their promise never to wait on another
     /// thread. An environment that takes commits from more than one thread,

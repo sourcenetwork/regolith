@@ -44,6 +44,7 @@ fn table(
             file_size: 1,
             num_entries,
             global_seq: None,
+            deletions: None,
         },
         Arc::clone(reader),
     )

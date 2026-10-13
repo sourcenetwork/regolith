@@ -576,6 +576,11 @@ tla:
     check MC_LsmOrder_Green_Demote                     GREEN
     check MC_LsmOrder_Red_DemoteLevelOnly              RED ReadNewest
     check MC_LsmOrder_Red_NoDemotion                   RED ReadNewest
+    # E38: a universal merge takes L0 files that lie next to one another.
+    # Lean: Regolith/LsmOrder.lean, merge_window_reads_newest,
+    # merge_gapped_breaks_reads.
+    check MC_LsmOrder_Green_L0Merge                    GREEN
+    check MC_LsmOrder_Red_L0MergeGap                   RED ReadNewest
     # E14, the range deletes of the tables an open moves out of overlapping
     # levels: copied into the recovered memtable, and logged before the
     # manifest records the move. Lean: Regolith/RangeDelete.lean,
@@ -736,12 +741,19 @@ tla:
     check MC_StripeCompaction_Red_IgnoreStripes        RED SnapshotReadsKept
     # E27: a pass retires a range tombstone below its range and every
     # snapshot. Green_Retires is the witness that the fix retires at all.
+    # The Rewrite rows check a pass over one run alone, which a pass picked
+    # for its deletions (D14) runs on a bottom-level table and on the only
+    # run of a universal pool.
     # Lean: Regolith/TombstoneRetirement.lean, retire_keeps_reads.
     spec=TombstoneRetirement
     check MC_TombstoneRetirement_Green                 GREEN
     check MC_TombstoneRetirement_Green_Retires         RED NothingRetired
     check MC_TombstoneRetirement_Red_IgnoreSnapshots   RED SnapshotReadsKept
     check MC_TombstoneRetirement_Red_IgnoreDeeper      RED SnapshotReadsKept
+    check MC_TombstoneRetirement_Green_Rewrite         GREEN
+    check MC_TombstoneRetirement_Green_RewriteRetires  RED NothingRetired
+    check MC_TombstoneRetirement_Red_RewriteIgnoreSnapshots RED SnapshotReadsKept
+    check MC_TombstoneRetirement_Red_RewriteIgnoreDeeper RED SnapshotReadsKept
     # 4.6, D54: the snapshot registry on per-thread slots with counted
     # entries, moved handles, copies and shared slots. Lean:
     # Regolith/SnapshotRegistry.lean, scan_respects_live,

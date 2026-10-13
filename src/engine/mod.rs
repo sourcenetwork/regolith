@@ -416,6 +416,10 @@ impl EngineOptions {
     pub(crate) fn to_compaction_options(&self) -> CompactionOptions {
         CompactionOptions {
             l0_compaction_trigger: self.l0_compaction_trigger,
+            level0_slowdown_writes_trigger: self.level0_slowdown_writes_trigger,
+            level0_stop_writes_trigger: self.level0_stop_writes_trigger,
+            soft_pending_compaction_bytes_limit: self.soft_pending_compaction_bytes_limit,
+            hard_pending_compaction_bytes_limit: self.hard_pending_compaction_bytes_limit,
             level_base_bytes: self.level_base_bytes,
             level_size_multiplier: self.level_size_multiplier,
             target_file_size: self.target_file_size,
@@ -2102,6 +2106,8 @@ impl RegolithEngine {
                 &self.options.to_compaction_options(),
                 &self.snapshot_registry,
                 &self.compaction_claims,
+                // A caller's own pass: nothing a census step stops for.
+                &|| false,
             );
             self.unkeep(kept);
             outcome.inspect_err(|err| self.compaction_failed(err))?

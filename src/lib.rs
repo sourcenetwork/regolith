@@ -1147,6 +1147,12 @@ impl Db {
     /// [`CompactionFilter`] (see its note on snapshots). Dropping the
     /// returned `Snapshot` releases the pin and may allow subsequent
     /// compactions to reclaim more space.
+    ///
+    /// A snapshot held for long also defers the compaction of deleted
+    /// ranges: a table holding a deletion newer than the oldest live
+    /// snapshot is not compacted for its deletions until that snapshot is
+    /// dropped (see [`CompactionStyle`]), so scans over a range deleted
+    /// since then keep walking its deletions meanwhile.
     pub fn snapshot(&self) -> Snapshot {
         let (seq, pin) = self.engine.register_snapshot_at_horizon();
         Snapshot {
@@ -1393,7 +1399,8 @@ impl Db {
     /// The returned [`CompactionOutcome`] separates the two reasons a
     /// pass can do nothing, because a caller has to act on them
     /// differently. [`CompactionOutcome::Idle`] means nothing was over
-    /// its compaction trigger and the tree is settled.
+    /// its compaction trigger, no deleted range was worth a pass (see
+    /// [`CompactionStyle`]), and the tree is settled.
     /// [`CompactionOutcome::Contended`] means work may be pending but
     /// another thread is in the way, so the right response is to try again
     /// later rather than conclude the engine is done: another pass holds the
@@ -1424,9 +1431,10 @@ impl Db {
     /// # }
     /// ```
     ///
-    /// Every compaction style regolith offers reduces the file count it
-    /// merges, so a loop driven by `DidWork` cannot be fed forever by
-    /// its own output.
+    /// A size-triggered compaction reduces the file count it merges, and
+    /// a compaction picked for its deletions moves them one level down or
+    /// discards them, so a loop driven by `DidWork` cannot be fed forever
+    /// by its own output.
     ///
     /// Safe to call with background workers running: the job is picked
     /// under the same engine-wide compaction gate and the same claims on
@@ -1508,6 +1516,9 @@ impl Db {
     /// are what the environment's [`env::Env::disk_space`] reports, and
     /// `None` where it reports nothing: the default [`env::StdEnv`] reports
     /// them on Unix, and not on Windows or WASI.
+    ///
+    /// `regolith.num-uncounted-tables` is the number of tables whose
+    /// deletions have not been counted yet (see [`CompactionStyle`]).
     pub fn get_int_property(&self, name: &str) -> Option<u64> {
         if let Some(level_str) = name.strip_prefix("regolith.num-files-at-level") {
             let level: usize = level_str.parse().ok()?;
@@ -1554,6 +1565,11 @@ impl Db {
                 self.engine.disk_space().map(|d| d.available_inodes)
             }
             "regolith.background-errors" => Some(self.engine.background_error_count()),
+            // Tables whose deletions have not been counted yet: tables an
+            // earlier version or a restored backup left, which are counted
+            // in the background. A table that cannot be read stays counted
+            // here.
+            "regolith.num-uncounted-tables" => Some(self.engine.current_version().uncounted as u64),
             _ => None,
         }
     }

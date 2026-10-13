@@ -23,13 +23,15 @@
 //! caller sees the lock's contents exactly as the panicking thread left
 //! them and deals with it as ordinary state.
 //!
-//! The wrapper serves the structures later phases replace (the commit
-//! pipeline, the version set). No blocking reader-writer lock and no
-//! condvar is left: the read view, the snapshot registry and the key lock
-//! table that used them are lock-free. The engine's background state, its close and
-//! its compaction gate use the lock-free [`crate::sync`] primitives instead,
-//! and a thread that has to wait on one of those waits through [`block_on`]
-//! or [`wait_here`], below.
+//! Nothing the engine runs on Unix, Windows or WASI takes it any more, so
+//! there it is compiled for tests alone. One use is left elsewhere: the
+//! read cursor of a file on a target with no positional read
+//! (`env::std_env`), which regolith builds for no file system on. No
+//! blocking reader-writer lock and no condvar is left either: the read
+//! view, the snapshot registry and the key lock table that used them are
+//! lock-free. What has to exclude or wait uses the lock-free
+//! [`crate::sync`] primitives, and a thread that has to wait on one of
+//! those waits through [`block_on`] or [`wait_here`], below.
 //!
 //! [`UnsafeCell`] lives here for the same reason as everything else: a
 //! `std::cell::UnsafeCell` is invisible to loom, so state that is handed
@@ -65,61 +67,70 @@ pub(crate) fn seq_cst_handshake() {
     fence(Ordering::SeqCst);
 }
 
-#[cfg(loom)]
-use loom::sync as imp;
-#[cfg(not(loom))]
-use std::sync as imp;
+#[cfg(any(test, not(any(unix, windows, target_os = "wasi"))))]
+pub(crate) use os_mutex::Mutex;
 
-pub(crate) use imp::MutexGuard;
-
-use std::sync::PoisonError;
-
-/// A mutex that hands back its guard rather than a `LockResult`.
-///
-/// See the module docs for why poisoning is absorbed rather than
-/// propagated.
-#[derive(Default)]
-pub(crate) struct Mutex<T>(imp::Mutex<T>);
-
-impl<T> Mutex<T> {
-    /// A new mutex holding `value`.
-    #[cfg(not(loom))]
-    pub(crate) const fn new(value: T) -> Self {
-        Self(imp::Mutex::new(value))
-    }
-
-    /// A new mutex holding `value`.
-    ///
-    /// Not `const` under loom: the mock allocates its own state.
+/// The one blocking lock, kept apart so that what compiles it in is said
+/// in one place: tests, and a target with no positional read.
+#[cfg(any(test, not(any(unix, windows, target_os = "wasi"))))]
+// A loom build compiles the tests that use it out.
+#[cfg_attr(loom, allow(dead_code))]
+mod os_mutex {
     #[cfg(loom)]
-    pub(crate) fn new(value: T) -> Self {
-        Self(imp::Mutex::new(value))
+    use loom::sync as imp;
+    #[cfg(not(loom))]
+    use std::sync as imp;
+
+    use imp::MutexGuard;
+    use std::sync::PoisonError;
+
+    /// A mutex that hands back its guard rather than a `LockResult`.
+    ///
+    /// See the module docs for why poisoning is absorbed rather than
+    /// propagated.
+    #[derive(Default)]
+    pub(crate) struct Mutex<T>(imp::Mutex<T>);
+
+    impl<T> Mutex<T> {
+        /// A new mutex holding `value`.
+        #[cfg(not(loom))]
+        pub(crate) const fn new(value: T) -> Self {
+            Self(imp::Mutex::new(value))
+        }
+
+        /// A new mutex holding `value`.
+        ///
+        /// Not `const` under loom: the mock allocates its own state.
+        #[cfg(loom)]
+        pub(crate) fn new(value: T) -> Self {
+            Self(imp::Mutex::new(value))
+        }
+
+        /// Consume the mutex and return what it held.
+        #[allow(dead_code)]
+        pub(crate) fn into_inner(self) -> T {
+            self.0.into_inner().unwrap_or_else(PoisonError::into_inner)
+        }
     }
 
-    /// Consume the mutex and return what it held.
-    #[allow(dead_code)]
-    pub(crate) fn into_inner(self) -> T {
-        self.0.into_inner().unwrap_or_else(PoisonError::into_inner)
-    }
-}
+    impl<T> Mutex<T> {
+        /// Lock, blocking until the mutex is available.
+        pub(crate) fn lock(&self) -> MutexGuard<'_, T> {
+            self.0.lock().unwrap_or_else(PoisonError::into_inner)
+        }
 
-impl<T> Mutex<T> {
-    /// Lock, blocking until the mutex is available.
-    pub(crate) fn lock(&self) -> MutexGuard<'_, T> {
-        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+        /// Borrow the contents mutably. Exclusive access is proven by
+        /// `&mut self`, so this takes no lock.
+        #[allow(dead_code)]
+        pub(crate) fn get_mut(&mut self) -> &mut T {
+            self.0.get_mut().unwrap_or_else(PoisonError::into_inner)
+        }
     }
 
-    /// Borrow the contents mutably. Exclusive access is proven by
-    /// `&mut self`, so this takes no lock.
-    #[allow(dead_code)]
-    pub(crate) fn get_mut(&mut self) -> &mut T {
-        self.0.get_mut().unwrap_or_else(PoisonError::into_inner)
-    }
-}
-
-impl<T: std::fmt::Debug> std::fmt::Debug for Mutex<T> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.0.fmt(f)
+    impl<T: std::fmt::Debug> std::fmt::Debug for Mutex<T> {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            self.0.fmt(f)
+        }
     }
 }
 

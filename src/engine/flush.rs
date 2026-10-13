@@ -28,6 +28,7 @@ use super::log_retirement::{self, RetiredLogs};
 use super::manifest::VersionEdit;
 use super::memtable::MemTable;
 use super::pending_outputs::PendingOutputs;
+use super::range_tombstone::RangeTombstoneSet;
 use super::read_view::ReadViewCell;
 use super::sstable::{LiveSst, SsTableMeta, SsTableReader, SsTableWriter, sst_filename};
 use super::version_store::VersionStore;
@@ -323,6 +324,14 @@ impl Flusher {
             self.options.keyring.as_deref(),
         )?;
 
+        // The table carries the memtable's range tombstones, so the entries
+        // they hide are counted with its deletions as they are written.
+        if !range_tombstones.is_empty() {
+            writer.hidden_by(Arc::new(RangeTombstoneSet::from_vec(
+                range_tombstones.clone(),
+            )));
+        }
+
         // Walk the memtable in internal-key order and copy every version
         // and tombstone into the SSTable unchanged, preserving MVCC.
         // The walk streams straight out of the arena: a flush holds one
@@ -377,6 +386,7 @@ impl Flusher {
                 file_size,
                 num_entries,
                 global_seq: None,
+                deletions: Some(summary.deletions),
             },
             reader,
         );

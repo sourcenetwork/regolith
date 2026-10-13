@@ -172,6 +172,7 @@ fn every_record_but_reservations_and_retirements_needs_a_sync() {
         file_size: 1,
         num_entries: 1,
         global_seq: None,
+        deletions: None,
     };
     let needs = [
         ManifestRecord::AddFile { level: 0, meta },
