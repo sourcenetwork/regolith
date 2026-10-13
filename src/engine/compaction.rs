@@ -37,7 +37,7 @@ use crate::engine::compaction_backoff::FailureBackoff;
 use crate::engine::compaction_gate::CompactionGate;
 use crate::engine::io::job::JobBody;
 use crate::engine::pending_outputs::PendingOutputs;
-use crate::env::{Env, JoinHandle};
+use crate::env::{Env, FileLock, JoinHandle};
 use kovan_queue::seg_queue::SegQueue;
 
 mod census;
@@ -201,6 +201,10 @@ impl CompactionScheduler {
 
     /// Start one or more background compaction threads.
     ///
+    /// `directory` is the engine's lock on its directory. Each worker holds
+    /// a share of it until it has returned, so the directory stays locked
+    /// while a worker could still write in it, the engine gone or not.
+    ///
     /// `gate` is the engine-wide compaction gate: a worker's pass holds it
     /// shared, so workers run side by side, and a foreground job holds it
     /// alone. `claims` keeps passes that share it off each other's tables.
@@ -232,6 +236,7 @@ impl CompactionScheduler {
     // shared handles the workers would have taken unread.
     #[cfg_attr(target_arch = "wasm32", allow(unused_variables))]
     pub(crate) fn start(
+        directory: Arc<dyn FileLock>,
         gate: CompactionGate,
         snapshot_registry: Arc<SnapshotRegistry>,
         versions: Arc<VersionStore>,
@@ -291,6 +296,7 @@ impl CompactionScheduler {
                 let health_clone = Arc::clone(&health);
                 let flush_clone = Arc::clone(&scheduler.flush);
                 let jobs_clone = Arc::clone(&scheduler.jobs);
+                let directory_clone = Arc::clone(&directory);
 
                 let spawned = spawn_worker(&*opts.env, i, move || {
                     compaction_loop(
@@ -309,6 +315,9 @@ impl CompactionScheduler {
                         claims_clone,
                         health_clone,
                     );
+                    // Let go of the directory only now, with every handle
+                    // this worker wrote through dropped above.
+                    drop(directory_clone);
                 });
 
                 match spawned {
@@ -585,6 +594,14 @@ fn compaction_loop(
             // for. It takes the compaction gate alone, waiting here for the
             // passes other workers have in flight.
             let ran_job = jobs.run_one();
+            // A job can hold the engine's last reference: its caller dropped
+            // every handle without waiting, and the engine was torn down here
+            // when the job ended, signalling shutdown. Nothing else in this
+            // round is wanted then; the worker returns at once, and the
+            // directory it keeps a share of is released when it has.
+            if ran_job && shutdown.load(Ordering::Acquire) {
+                break;
+            }
             // Frozen memtables, oldest first: a flush feeds L0, and the
             // commit path left it to this thread (E9). Not held back by the
             // compaction backoff, which is about compaction failing.
@@ -2381,6 +2398,16 @@ mod universal_order_tests;
 mod tests {
     use super::*;
 
+    /// A directory lock that excludes nothing: what a scheduler built
+    /// without an engine is handed, so a test can count its shares.
+    struct NoLock;
+
+    impl FileLock for NoLock {}
+
+    fn no_lock() -> Arc<dyn FileLock> {
+        Arc::new(NoLock)
+    }
+
     fn rt(start: &[u8], end: &[u8], seq: u64) -> RangeTombstone {
         RangeTombstone::new(start.to_vec(), end.to_vec(), seq)
     }
@@ -2507,6 +2534,7 @@ mod tests {
                 super::super::manifest::VersionSet::open(dir.path(), &sst_dir).unwrap(),
             ));
             let scheduler = CompactionScheduler::start(
+                no_lock(),
                 CompactionGate::new(),
                 Arc::new(SnapshotRegistry::new()),
                 Arc::clone(&versions),
@@ -2572,6 +2600,39 @@ mod tests {
         }
     }
 
+    /// Each worker holds a share of the directory until it has returned, so
+    /// an engine torn down on a worker leaves the directory locked while
+    /// that worker runs.
+    #[test]
+    fn every_worker_holds_the_directory_until_it_returns() {
+        let dir = tempfile::tempdir().unwrap();
+        let sst_dir = dir.path().join("sst");
+        std::fs::create_dir_all(&sst_dir).unwrap();
+        let versions = Arc::new(VersionStore::new(
+            super::super::manifest::VersionSet::open(dir.path(), &sst_dir).unwrap(),
+        ));
+        let directory = no_lock();
+        let scheduler = CompactionScheduler::start(
+            Arc::clone(&directory),
+            CompactionGate::new(),
+            Arc::new(SnapshotRegistry::new()),
+            Arc::clone(&versions),
+            Arc::from(sst_dir.as_path()),
+            Arc::new(BlockCache::new(4096)),
+            CompactionOptions {
+                max_background_compactions: 2,
+                ..CompactionOptions::default()
+            },
+            Arc::new(crate::engine::StallSignal::for_tests(&versions)),
+            Arc::new(Claims::new()),
+            Arc::new(BackgroundHealth::default()),
+        )
+        .unwrap();
+        assert_eq!(Arc::strong_count(&directory), 3, "one share per worker");
+        scheduler.shutdown();
+        assert_eq!(Arc::strong_count(&directory), 1, "a joined worker let go");
+    }
+
     #[test]
     fn failed_start_joins_the_workers_it_already_spawned() {
         let dir = tempfile::tempdir().unwrap();
@@ -2586,9 +2647,11 @@ mod tests {
             ..CompactionOptions::default()
         };
 
+        let directory = no_lock();
         let started = {
             let _guard = SpawnFailureGuard::allowing(2);
             CompactionScheduler::start(
+                Arc::clone(&directory),
                 CompactionGate::new(),
                 Arc::new(SnapshotRegistry::new()),
                 Arc::clone(&versions),
@@ -2606,8 +2669,10 @@ mod tests {
             Err(e) => assert_eq!(e.kind(), std::io::ErrorKind::Unsupported),
         }
         // Every worker that did start has exited and been joined, so
-        // its clone of the version set is gone.
+        // its clone of the version set is gone, and so is its share of the
+        // directory.
         assert_eq!(Arc::strong_count(&versions), 1);
+        assert_eq!(Arc::strong_count(&directory), 1);
     }
 
     #[test]
@@ -2690,6 +2755,7 @@ mod tests {
         let started = {
             let _guard = SpawnFailureGuard::allowing(7);
             CompactionScheduler::start(
+                no_lock(),
                 CompactionGate::new(),
                 Arc::new(SnapshotRegistry::new()),
                 Arc::clone(&versions),
