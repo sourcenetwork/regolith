@@ -249,7 +249,7 @@ fn split_commit(
         EarlyVerdict::Marks(early) => early,
     };
     between();
-    let request = WriteRequest::Txn(TxnRequest {
+    let request = WriteRequest::Txn(Box::new(TxnRequest {
         checks,
         ops,
         appends: Vec::new(),
@@ -257,7 +257,7 @@ fn split_commit(
         perf: crate::PerfLevel::Disable,
         early,
         read_queue: None,
-    });
+    }));
     let settled = engine
         .commit_through_pipeline(request)
         .map_err(|e| e.to_string());

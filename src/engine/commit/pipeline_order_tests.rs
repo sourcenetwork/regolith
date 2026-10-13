@@ -514,7 +514,7 @@ proptest! {
                                         done.lock().push(Done { snapshot, writes, txn: true, seq: None });
                                         continue;
                                     }
-                                    EarlyVerdict::Marks(early) => WriteRequest::Txn(TxnRequest {
+                                    EarlyVerdict::Marks(early) => WriteRequest::Txn(Box::new(TxnRequest {
                                         checks,
                                         ops,
                                         appends: Vec::new(),
@@ -522,7 +522,7 @@ proptest! {
                                         perf: crate::PerfLevel::Disable,
                                         early,
                                         read_queue: None,
-                                    }),
+                                    })),
                                 }
                             } else {
                                 WriteRequest::Batch { ops, durability, disable_wal: false }

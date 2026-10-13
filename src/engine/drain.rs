@@ -39,13 +39,14 @@ use super::commit::{Help, Needs, OrderedTicket};
 use super::memtable::MemTable;
 use super::{RegolithEngine, memtable_needs_flush};
 
-/// Whether a drain seals the active memtable unconditionally, or only once
-/// it has grown past the write buffer.
+/// How a drain seals the active memtable, when it holds anything.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ActiveFlush {
-    /// Only a memtable past the write buffer: what a close needs.
-    WhenFull,
-    /// Whatever it holds: what a checkpoint and an explicit flush need. A
+    /// In place, with no fresh log and without the writable check: what a
+    /// close needs. The log stays the newest until the flush makes it
+    /// redundant, so it is never synced (`Ordered::seal_in_place`).
+    ForClose,
+    /// Behind a fresh log: what a checkpoint and an explicit flush need. A
     /// capture names tables and copies no log, so a write still in a
     /// memtable would be absent from it.
     Always,
@@ -80,18 +81,17 @@ impl RegolithEngine {
     pub(crate) fn drain_all(&self, active: ActiveFlush) -> Drain {
         let ticket = self.ordered_unit(Needs::VERSIONS, move |engine, ord| {
             let view = engine.view.load();
-            let seal_active = match active {
-                ActiveFlush::WhenFull => memtable_needs_flush(&view.active),
-                ActiveFlush::Always => {
-                    !view.active.is_empty() || view.active.has_range_tombstones()
-                }
-            };
+            let seal_active = memtable_needs_flush(&view.active);
             let mut targets = view.frozen.clone();
             drop(view);
             if seal_active {
-                // Sealed without the writable check: a drain for close runs
-                // with the database already closing.
-                targets.push(ord.seal(false)?);
+                targets.push(match active {
+                    // A drain for close runs with the database already
+                    // closing, and seals the last memtable without the
+                    // writable check.
+                    ActiveFlush::ForClose => ord.seal_in_place()?,
+                    ActiveFlush::Always => ord.seal(false)?,
+                });
             }
             Ok(targets)
         });

@@ -3555,7 +3555,9 @@ mod tests {
         let db = Db::open(dir.path(), Options::default()).unwrap();
         db.put(b"k", b"v").unwrap();
 
-        let blocked_wal_path = dir.path().join("wal").join("wal_000002.log");
+        // The log close creates after its flush: the open's log is 1 and the
+        // flush's table 2.
+        let blocked_wal_path = dir.path().join("wal").join("wal_000003.log");
         std::fs::create_dir(&blocked_wal_path).unwrap();
 
         match db.close().unwrap_err() {
@@ -3564,6 +3566,8 @@ mod tests {
         }
 
         assert_eq!(db.get(b"k").unwrap(), Some(b"v".to_vec()));
+        // The failed close left the database taking writes again.
+        db.put(b"after", b"close").unwrap();
 
         std::fs::remove_dir(&blocked_wal_path).unwrap();
         db.close().unwrap();
@@ -3579,6 +3583,7 @@ mod tests {
         drop(db);
         let reopened = Db::open(dir.path(), Options::default()).unwrap();
         assert_eq!(reopened.get(b"k").unwrap(), Some(b"v".to_vec()));
+        assert_eq!(reopened.get(b"after").unwrap(), Some(b"close".to_vec()));
     }
 
     #[test]

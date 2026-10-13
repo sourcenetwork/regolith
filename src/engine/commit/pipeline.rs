@@ -368,22 +368,34 @@ impl RegolithEngine {
                 },
             };
             let mut seen = None;
+            let mut applies = false;
             if desc.decision().is_none() {
-                // Another thread is deciding it now: it is given about as
-                // long as the decision takes before this thread repeats the
-                // work (P5).
-                if !desc.mark(DECIDING) {
+                // The thread that claims the decision claims its apply in
+                // the same instruction: it goes on to apply what it decided.
+                let before = desc.claim(DECIDING | APPLYING);
+                applies = before & APPLYING == 0;
+                if before & DECIDING != 0 {
+                    // Another thread is deciding it now: it is given about
+                    // as long as the decision takes before this thread
+                    // repeats the work (P5).
                     courtesy(desc.work_size(), || desc.decision().is_some());
                 }
                 if desc.decision().is_none() {
                     hook::at(hook::Stage::Decide);
                     match self.decide(pipe, index, desc, help) {
                         Ok(tip) => seen = Some(tip),
-                        Err(job) => return Turn::Blocked(job),
+                        Err(job) => {
+                            if applies {
+                                // Nothing is decided to apply: the thread
+                                // that decides it applies it.
+                                desc.unclaim(APPLYING);
+                            }
+                            return Turn::Blocked(job);
+                        }
                     }
                 }
             }
-            self.settle(pipe, index, desc, seen);
+            self.settle(pipe, index, desc, seen, applies);
         }
     }
 
@@ -627,7 +639,7 @@ impl RegolithEngine {
             run()
         } else {
             let (decided, counted) = crate::perf_context::on_behalf(txn.perf, run);
-            decision.perf = Some(counted);
+            decision.perf = Some(Box::new(counted));
             decided
         };
         match decided {
@@ -654,13 +666,15 @@ impl RegolithEngine {
     ///
     /// `seen` is a tip the caller read, used in place of a new load for as
     /// long as it is still the tip: the slot holds it at the moment that is
-    /// checked, which is all a load would tell.
+    /// checked, which is all a load would tell. `applies`: the caller
+    /// claimed the slot's apply already, with its decision.
     pub(super) fn settle(
         &self,
         pipe: &Pipeline,
         index: u64,
         desc: &RingArc<Descriptor>,
         mut seen: Option<RingArc<Decision>>,
+        applies: bool,
     ) {
         // Borrowed: `desc` holds its decision for as long as it lives. A
         // reference of its own is taken only for the tip.
@@ -689,7 +703,7 @@ impl RegolithEngine {
                 // for a decision. Two threads applying one slot at once is
                 // harmless, and costs the arena every node that lost its
                 // race.
-                if !desc.mark(APPLYING) {
+                if !applies && !desc.mark(APPLYING) {
                     courtesy(decision.ops as usize, || desc.is(APPLIED));
                 }
                 if !desc.is(APPLIED) {
@@ -972,7 +986,8 @@ impl RegolithEngine {
         let Some(decision) = desc.decision() else {
             return Err(io::Error::other("a commit finished without a decision"));
         };
-        let perf = decision.perf.map(Box::new);
+        // The decision is shared, so its count is copied out.
+        let perf = decision.perf.as_deref().map(|counted| Box::new(*counted));
         let landed = || {
             if let Some(stats) = stats {
                 ops_of(desc, decision).count_written(stats);

@@ -61,6 +61,34 @@ use super::wal_seal::{self, SEALED_PREFIX_LEN};
 use crate::env::{Env, LogFile, WriteMode};
 use crate::portability::{AtomicBool, AtomicU64, Ordering};
 
+/// What a log does as it fills, so that the sync at its seal finds it
+/// mostly written (E46): each time the records written pass another
+/// multiple of `every` bytes, the writer of the record that passed it notes
+/// the multiple and calls `kick`, and the log writeback lane hands what was
+/// passed to the host's writeback ([`Log::write_back_ahead`],
+/// `log_writeback.rs`). Nothing here is a sync: `durable` and the gate are
+/// not involved, and the host may write a dirty page out at any time
+/// anyway; this only makes it sooner.
+#[derive(Clone)]
+pub(crate) struct EarlyWriteback {
+    /// `every` is `1 << shift`, so a record's test is two shifts.
+    shift: u32,
+    kick: Arc<dyn Fn() + Send + Sync>,
+}
+
+impl EarlyWriteback {
+    /// Call `kick` each time the log grows past another multiple of
+    /// `every`, rounded up to a power of two.
+    // Only the log writeback lane makes one, and it runs on Linux alone.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) fn new(every: u64, kick: Arc<dyn Fn() + Send + Sync>) -> Self {
+        Self {
+            shift: every.max(1).next_power_of_two().trailing_zeros(),
+            kick,
+        }
+    }
+}
+
 /// Where one commit's record goes and what frames it: everything about the
 /// record that is not its operations, fixed when the commit is decided.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -111,6 +139,14 @@ pub(crate) struct Log {
     /// What poisoned the log, for the rollback to hand to every commit it
     /// fails.
     failure: Take<io::Error>,
+    /// Asks for writeback off the commit path as the log fills, if anyone is
+    /// there to start it ([`EarlyWriteback`]).
+    early: Option<EarlyWriteback>,
+    /// The end of the last whole multiple of the early writeback's size a
+    /// record passed.
+    ahead: AtomicU64,
+    /// How far the lane has handed the log to the host's writeback.
+    handed: AtomicU64,
 }
 
 impl Log {
@@ -162,6 +198,9 @@ impl Log {
             gate: Gate::new(),
             poisoned: AtomicBool::new(false),
             failure: Take::empty(),
+            early: None,
+            ahead: AtomicU64::new(0),
+            handed: AtomicU64::new(0),
         })
     }
 
@@ -192,7 +231,38 @@ impl Log {
             gate: Gate::new(),
             poisoned: AtomicBool::new(false),
             failure: Take::empty(),
+            early: None,
+            ahead: AtomicU64::new(0),
+            handed: AtomicU64::new(0),
         })
+    }
+
+    /// The same log, asking for `early` writeback as it fills.
+    pub(crate) fn with_early_writeback(mut self, early: Option<EarlyWriteback>) -> Self {
+        self.early = early;
+        self
+    }
+
+    /// Hand the part of the log records passed since the last call to the
+    /// host's writeback ([`LogFile::start_writeback`]). Called by the log
+    /// writeback lane alone, so the two offsets need no claim. A record still
+    /// on its way below a multiple another record passed keeps its pages
+    /// dirty for the seal's sync, which writes them.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) fn write_back_ahead(&self) {
+        let ahead = self.ahead.load(Ordering::Acquire);
+        let handed = self.handed.load(Ordering::Acquire);
+        if ahead > handed {
+            self.file.start_writeback(handed, ahead - handed);
+            self.handed.store(ahead, Ordering::Release);
+        }
+    }
+
+    /// Test-only: how far the lane has handed the log to the host's
+    /// writeback.
+    #[cfg(test)]
+    pub(crate) fn handed(&self) -> u64 {
+        self.handed.load(Ordering::Acquire)
     }
 
     /// Get the path to this log.
@@ -329,7 +399,18 @@ impl Log {
         super::commit::hook::at(super::commit::hook::Stage::InWrite);
         let wrote = self.file.write_all_at(place.offset, record);
         self.gate.leave(entry);
-        wrote.map(|()| true)
+        wrote?;
+        // One record ends past each multiple, so each is noted and kicked
+        // once, or once per thread that wrote that record; a record that
+        // passes none costs two shifts and a compare.
+        if let Some(early) = &self.early
+            && place.offset >> early.shift != place.end() >> early.shift
+        {
+            self.ahead
+                .fetch_max(place.end() >> early.shift << early.shift, Ordering::AcqRel);
+            (early.kick)();
+        }
+        Ok(true)
     }
 
     /// Wait until every write that may land below `through`, the end of
@@ -512,8 +593,17 @@ impl Log {
     /// whole file is durable. The order is [`super::wal::Wal::close`]'s, for
     /// the reason given there (`proofs/tla/WalRecovery.tla`, RED
     /// `CloseWithoutSync`). Called with the pipeline drained.
+    ///
+    /// When no record before CLOSE is left unsynced, the first sync is
+    /// skipped and the one after CLOSE covers what is left: the stamp of a
+    /// log no sync has covered yet, the case of a close that finds the log
+    /// empty. A crash then may tear the stamp, and replay reads the log as
+    /// unstamped and drops it, which loses nothing since it held no record
+    /// (`WalRecovery.tla`, RED `UnstampedRefuses`).
     pub(crate) fn close(&self, end: u64) -> io::Result<()> {
-        self.sync_through(end)?;
+        if end > self.durable().max(self.stamp_len) {
+            self.sync_through(end)?;
+        }
         let mut record = vec![0u8; self.prefix_len()];
         let place = self.place(end, 0, self.epoch())?;
         self.finish_record(wal_frame::KIND_CLOSE, &place, &mut record)?;
