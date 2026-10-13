@@ -175,10 +175,11 @@ impl Drop for TempDb {
     }
 }
 
-/// Copy the database directory `from` to `to`, everything but its `LOCK`.
-/// The copy takes a lock of its own when it is opened, and the lock of a
-/// database still open cannot be read on Windows, where its holder shares
-/// it for nothing but deletion.
+/// Copy the database directory `from` to `to`, everything but the contents
+/// of its `LOCK`, which the copy gets empty. The lock of a database still
+/// open cannot be read on Windows, where its holder shares it for nothing
+/// but deletion; an empty `LOCK` is one a read-write open adopts and stamps,
+/// and one a read-only open, which never creates it, can lock shared.
 pub fn copy_db(from: &Path, to: &Path) {
     fs::create_dir_all(to).unwrap_or_else(|e| panic!("create {}: {e}", to.display()));
     for entry in fs::read_dir(from).unwrap_or_else(|e| panic!("read {}: {e}", from.display())) {
@@ -186,7 +187,9 @@ pub fn copy_db(from: &Path, to: &Path) {
         let (src, dst) = (entry.path(), to.join(entry.file_name()));
         if src.is_dir() {
             copy_db(&src, &dst);
-        } else if entry.file_name() != "LOCK" {
+        } else if entry.file_name() == "LOCK" {
+            fs::write(&dst, []).unwrap_or_else(|e| panic!("create {}: {e}", dst.display()));
+        } else {
             fs::copy(&src, &dst).unwrap_or_else(|e| panic!("copy {}: {e}", src.display()));
         }
     }
