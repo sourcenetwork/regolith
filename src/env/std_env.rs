@@ -110,7 +110,11 @@ impl Env for StdEnv {
             .write(true)
             .truncate(mode == WriteMode::Truncate)
             .open(path)?;
-        Ok(Box::new(StdLogFile { file }))
+        Ok(Box::new(StdLogFile {
+            file,
+            #[cfg(target_vendor = "apple")]
+            writeback: super::deferred_error::DeferredError::default(),
+        }))
     }
 
     fn metadata(&self, path: &Path) -> io::Result<FileMeta> {
@@ -388,6 +392,10 @@ impl WriteFile for StdWriteFile {
 #[derive(Debug)]
 struct StdLogFile {
     file: File,
+    /// An error the log writeback lane's `fsync` got, for the next sync to
+    /// report (`deferred_error.rs`).
+    #[cfg(target_vendor = "apple")]
+    writeback: super::deferred_error::DeferredError,
 }
 
 #[cfg(any(unix, windows, target_os = "wasi"))]
@@ -424,8 +432,17 @@ impl LogFile for StdLogFile {
         Ok(())
     }
 
+    #[cfg(not(target_vendor = "apple"))]
     fn sync_data(&self) -> io::Result<()> {
         self.file.sync_data()
+    }
+
+    // `F_FULLFSYNC` on Apple. It runs after any `fsync` the writeback lane has
+    // in flight, and reports that one's error first if it got one: the host
+    // may report a failed page to one sync and not the next.
+    #[cfg(target_vendor = "apple")]
+    fn sync_data(&self) -> io::Result<()> {
+        self.writeback.sync(|| self.file.sync_data())
     }
 
     fn set_len(&self, len: u64) -> io::Result<()> {
@@ -442,6 +459,22 @@ impl LogFile for StdLogFile {
     // still reports a page that failed; a writeback it could not start leaves
     // the pages dirty for that sync. So its result is not needed. Miri cannot
     // call into the C library.
+    // Apple has no call that starts writeback without waiting for it, so the
+    // lane, on its own thread, writes the pages out with a plain `fsync`: no
+    // drive cache flush, which the seal's `F_FULLFSYNC` adds. The whole file,
+    // whatever the range. A failed one is kept for the next sync of this
+    // handle to report, never dropped (`deferred_error.rs`).
+    #[cfg(target_vendor = "apple")]
+    fn start_writeback(&self, _offset: u64, _len: u64) {
+        self.writeback.writeback(|| {
+            #[cfg(test)]
+            if log_tests::FAIL_WRITEBACK.with(std::cell::Cell::take) {
+                return Err(io::Error::other("injected writeback failure"));
+            }
+            rustix::fs::fsync(&self.file).map_err(io::Error::from)
+        });
+    }
+
     #[cfg(all(target_os = "linux", not(miri)))]
     fn start_writeback(&self, offset: u64, len: u64) {
         use std::os::fd::AsRawFd;
@@ -784,6 +817,36 @@ mod tests {
 mod log_tests {
     use crate::env::{WriteMode, std_env};
     use tempfile::TempDir;
+
+    #[cfg(target_vendor = "apple")]
+    std::thread_local! {
+        /// Set: the next writeback this thread starts on a log fails.
+        pub(super) static FAIL_WRITEBACK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// On Apple a writeback is a plain `fsync`, and an error it got is
+    /// reported by the next sync of the handle, once; one that succeeds
+    /// leaves the next sync as it was.
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn a_failed_writeback_is_reported_by_the_next_sync_of_the_log() {
+        let dir = TempDir::new().unwrap();
+        let env = std_env();
+        let log = env
+            .open_log(&dir.path().join("log"), WriteMode::Truncate)
+            .unwrap();
+        log.write_all_at(0, b"0123").unwrap();
+        log.start_writeback(0, 4);
+        log.sync_data().unwrap();
+
+        log.write_all_at(4, b"4567").unwrap();
+        FAIL_WRITEBACK.with(|fail| fail.set(true));
+        log.start_writeback(0, 8);
+        let err = log.sync_data().unwrap_err();
+        assert!(err.to_string().contains("injected"), "{err}");
+        log.sync_data().unwrap();
+        assert_eq!(env.read(&dir.path().join("log")).unwrap(), b"01234567");
+    }
 
     #[test]
     fn positional_writes_land_at_their_offsets_in_any_order() {

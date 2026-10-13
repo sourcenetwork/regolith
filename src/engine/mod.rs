@@ -32,13 +32,14 @@ pub(crate) mod internal_key;
 pub(crate) mod io;
 pub(crate) mod iterator;
 pub(crate) mod log_retirement;
-// The log writeback lane exists only where the host has the writeback hint
-// it starts (`LogFile::start_writeback`).
-#[cfg(target_os = "linux")]
+// The log writeback lane exists only where the host has a way to start the
+// writeback (`LogFile::start_writeback`): `sync_file_range` on Linux, a plain
+// `fsync` on Apple, where the seal's sync is `F_FULLFSYNC`.
+#[cfg(any(target_os = "linux", target_vendor = "apple"))]
 mod log_writeback;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_vendor = "apple"))]
 type WritebackLane = log_writeback::LogWritebackLane;
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
 type WritebackLane = std::convert::Infallible;
 pub(crate) mod lookup_key;
 #[cfg(loom)]
@@ -397,9 +398,12 @@ pub(crate) struct EngineOptions {
     pub(crate) universal_compaction_options: crate::options::UniversalCompactionOptions,
     pub(crate) evict_compaction_data_from_page_cache: bool,
     pub(crate) max_background_compactions: usize,
-    /// See [`crate::Options::log_writeback`]. Read on Linux alone, the one
-    /// host with the writeback hint.
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    /// See [`crate::Options::log_writeback`]. Read on Linux and Apple alone,
+    /// the hosts with a way to start the writeback.
+    #[cfg_attr(
+        not(any(target_os = "linux", target_vendor = "apple")),
+        allow(dead_code)
+    )]
     pub(crate) log_writeback: bool,
     /// See [`crate::Options::inline_compaction`].
     pub(crate) inline_compaction: bool,
@@ -637,7 +641,7 @@ pub(crate) struct RegolithEngine {
     owed_queued: AtomicBool,
     /// The thread that hands the active log to the host's writeback as it
     /// fills, ahead of its seal, when [`crate::Options::log_writeback`] is on
-    /// and background threads run on Linux (`log_writeback.rs`).
+    /// and background threads run on Linux or Apple (`log_writeback.rs`).
     log_writeback: Option<WritebackLane>,
     /// Where the disk check looks.
     disk_dir: PathBuf,
@@ -820,15 +824,16 @@ impl RegolithEngine {
         // active log is handed to the host's writeback as it fills, on a
         // thread of its own (E46, `Options::log_writeback`). Off by default:
         // the thread is one more than the compaction threads plan 3.13 and
-        // 4.5 promise. Only Linux has the hint (`LogFile::start_writeback`);
-        // elsewhere the thread would have nothing to start.
-        #[cfg(target_os = "linux")]
+        // 4.5 promise. Only Linux and Apple have a way to start the writeback
+        // (`LogFile::start_writeback`); elsewhere the thread would have
+        // nothing to start.
+        #[cfg(any(target_os = "linux", target_vendor = "apple"))]
         let log_writeback = if has_worker && options.log_writeback {
             Some(log_writeback::LogWritebackLane::start(&*env)?)
         } else {
             None
         };
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
         let log_writeback: Option<WritebackLane> = None;
         let early =
             background_step::early_writeback(log_writeback.as_ref(), options.write_buffer_size);
@@ -882,7 +887,7 @@ impl RegolithEngine {
             _db_lock: db_lock,
         });
 
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_vendor = "apple"))]
         if let Some(lane) = &engine.log_writeback {
             let me = engine.me.clone();
             lane.set_hook(Box::new(move || {
@@ -3283,7 +3288,7 @@ impl RegolithEngine {
         // ticket is told. The log is closed, so the lane has nothing left to
         // hand over.
         self.compaction.shutdown();
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_vendor = "apple"))]
         if let Some(lane) = &self.log_writeback {
             lane.shutdown();
         }

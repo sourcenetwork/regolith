@@ -36,6 +36,8 @@
 
 mod buffered;
 mod db_lock;
+#[cfg(any(target_vendor = "apple", test))]
+mod deferred_error;
 mod mem_env;
 pub(crate) mod mem_file;
 mod mem_log;
@@ -465,13 +467,16 @@ pub trait LogFile: Send + Sync {
     }
 
     /// Start writing the `len` bytes at `offset`, all written already, back
-    /// to the device, and return without waiting for them: a hint that
-    /// leaves less for the next [`sync_data`](LogFile::sync_data) to write.
+    /// to the device: a hint that leaves less for the next
+    /// [`sync_data`](LogFile::sync_data) to write. Called on a thread of its
+    /// own (`Options::log_writeback`), so it may wait for the writes, as the
+    /// standard environment's does on Apple.
     ///
-    /// It makes nothing durable and reports nothing. An implementation
+    /// It makes nothing durable and returns nothing. An implementation
     /// that cannot start the writeback does nothing, as the default does;
     /// the bytes are then written by the next sync, which reports any
-    /// failure. The hint must not hide a failure from that sync.
+    /// failure. The hint must not hide a failure from that sync: one it
+    /// meets is reported by the next sync of the same handle.
     fn start_writeback(&self, offset: u64, len: u64) {
         let _ = (offset, len);
     }

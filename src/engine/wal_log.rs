@@ -79,8 +79,12 @@ pub(crate) struct EarlyWriteback {
 impl EarlyWriteback {
     /// Call `kick` each time the log grows past another multiple of
     /// `every`, rounded up to a power of two.
-    // Only the log writeback lane makes one, and it runs on Linux alone.
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    // Only the log writeback lane makes one, and it runs on Linux and Apple
+    // alone.
+    #[cfg_attr(
+        not(any(target_os = "linux", target_vendor = "apple")),
+        allow(dead_code)
+    )]
     pub(crate) fn new(every: u64, kick: Arc<dyn Fn() + Send + Sync>) -> Self {
         Self {
             shift: every.max(1).next_power_of_two().trailing_zeros(),
@@ -248,7 +252,10 @@ impl Log {
     /// writeback lane alone, so the two offsets need no claim. A record still
     /// on its way below a multiple another record passed keeps its pages
     /// dirty for the seal's sync, which writes them.
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    #[cfg_attr(
+        not(any(target_os = "linux", target_vendor = "apple")),
+        allow(dead_code)
+    )]
     pub(crate) fn write_back_ahead(&self) {
         let ahead = self.ahead.load(Ordering::Acquire);
         let handed = self.handed.load(Ordering::Acquire);
