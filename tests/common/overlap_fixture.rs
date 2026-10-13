@@ -153,7 +153,19 @@ pub fn assert_reads(
     scan: impl Fn() -> Vec<(Vec<u8>, Vec<u8>)>,
     expected: &BTreeMap<Vec<u8>, Vec<u8>>,
 ) {
-    for key in KEYS {
+    assert_reads_of(&KEYS, read, get, multi_get, scan, expected);
+}
+
+/// [`assert_reads`] over the keys `keys`.
+pub fn assert_reads_of(
+    keys: &[&[u8]],
+    read: &str,
+    get: impl Fn(&[u8]) -> Option<Vec<u8>>,
+    multi_get: impl Fn(&[&[u8]]) -> Vec<Option<Vec<u8>>>,
+    scan: impl Fn() -> Vec<(Vec<u8>, Vec<u8>)>,
+    expected: &BTreeMap<Vec<u8>, Vec<u8>>,
+) {
+    for key in keys.iter().copied() {
         assert_eq!(
             get(key).as_ref(),
             expected.get(key),
@@ -161,8 +173,8 @@ pub fn assert_reads(
             String::from_utf8_lossy(key)
         );
     }
-    let batch = multi_get(&KEYS);
-    for (key, got) in KEYS.iter().zip(&batch) {
+    let batch = multi_get(keys);
+    for (key, got) in keys.iter().zip(&batch) {
         assert_eq!(
             got.as_ref(),
             expected.get(*key),
@@ -176,7 +188,18 @@ pub fn assert_reads(
 
 /// [`assert_reads`] through `db` itself.
 pub fn assert_db_reads(read: &str, db: &Db, expected: &BTreeMap<Vec<u8>, Vec<u8>>) {
-    assert_reads(
+    assert_db_reads_of(&KEYS, read, db, expected);
+}
+
+/// [`assert_reads_of`] through `db` itself.
+pub fn assert_db_reads_of(
+    keys: &[&[u8]],
+    read: &str,
+    db: &Db,
+    expected: &BTreeMap<Vec<u8>, Vec<u8>>,
+) {
+    assert_reads_of(
+        keys,
         read,
         |key| db.get(key).unwrap().map(|v| v.to_vec()),
         |keys| {

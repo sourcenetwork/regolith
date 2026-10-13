@@ -136,6 +136,13 @@ pub mod wal_format;
 /// holds.
 pub mod overlap_fixture;
 
+/// The first open of a database an earlier release wrote, across a power
+/// cut at each of its I/O calls.
+pub mod open_sweep;
+
+/// Every warning a test thread logs, through one subscriber for the binary.
+pub mod log_capture;
+
 /// An `Env` that counts SSTable opens and reads, and can hold reads at the
 /// device: what the non-blocking read tests pin.
 pub mod device_env;

@@ -11,19 +11,16 @@
 
 mod common;
 
-use std::cell::RefCell;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Once};
+use std::sync::Arc;
 
 use common::keys::Keys;
+use common::log_capture::warnings_of;
 use common::overlap_fixture::{
     self as fixture, MOVED, assert_db_reads, assert_reads, moved, value,
 };
 use regolith::{Db, Error, FixedLengthPrefix, Options, Statistics, Ticker};
-use tracing::field::{Field, Visit};
-use tracing::span;
-use tracing::{Event, Level, Metadata, Subscriber};
 
 fn opts() -> Options {
     fixture::with_operator(Options::default())
@@ -36,70 +33,6 @@ fn files_at(db: &Db, level: usize) -> u64 {
 
 fn levels(db: &Db) -> Vec<u64> {
     (0..7).map(|level| files_at(db, level)).collect()
-}
-
-thread_local! {
-    /// The warnings this thread has logged since [`warnings_of`] last asked.
-    static LOGGED: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
-}
-
-/// The one subscriber of this test binary: it keeps each warning in a list
-/// of the thread that logged it.
-///
-/// One for the whole binary, not one per test: the tests run on threads
-/// of one process, and a subscriber set for one thread only can lose the
-/// warning to another thread that reaches the same log line first while
-/// that subscriber is being registered (`tracing` then remembers that
-/// nobody listens to it). With one subscriber for every thread there is
-/// nothing to race.
-struct Warnings;
-
-struct Message<'a>(&'a mut String);
-
-impl Visit for Message<'_> {
-    fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
-        if field.name() == "message" {
-            *self.0 = format!("{value:?}");
-        }
-    }
-}
-
-impl Subscriber for Warnings {
-    fn enabled(&self, metadata: &Metadata<'_>) -> bool {
-        *metadata.level() <= Level::WARN
-    }
-
-    fn new_span(&self, _: &span::Attributes<'_>) -> span::Id {
-        span::Id::from_u64(1)
-    }
-
-    fn record(&self, _: &span::Id, _: &span::Record<'_>) {}
-
-    fn record_follows_from(&self, _: &span::Id, _: &span::Id) {}
-
-    fn event(&self, event: &Event<'_>) {
-        let mut message = String::new();
-        event.record(&mut Message(&mut message));
-        // A thread being torn down has no list left to keep it in.
-        let _ = LOGGED.try_with(|logged| logged.borrow_mut().push(message));
-    }
-
-    fn enter(&self, _: &span::Id) {}
-
-    fn exit(&self, _: &span::Id) {}
-}
-
-/// Run `open` and return what it returned with every warning this thread
-/// logged while it ran.
-fn warnings_of<T>(open: impl FnOnce() -> T) -> (T, Vec<String>) {
-    static INSTALL: Once = Once::new();
-    INSTALL.call_once(|| {
-        tracing::subscriber::set_global_default(Warnings)
-            .expect("no other subscriber is set in this test binary");
-    });
-    LOGGED.with(|logged| logged.borrow_mut().clear());
-    let out = open();
-    (out, LOGGED.with(|logged| logged.take()))
 }
 
 /// The lines among `warnings` that report the move.
