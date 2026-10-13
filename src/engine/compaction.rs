@@ -1235,7 +1235,7 @@ fn perform_compaction_to(
 
     // Compaction inputs are obsolete after publication; caching their full
     // scan evicts foreground reads and retains buffers until the merge ends.
-    let scan_cache = BlockCache::new(0);
+    let scan_cache = BlockCache::with_config(0, 0, true);
     let CompactionOutputs {
         edits: new_file_edits,
         infos: output_file_infos,
