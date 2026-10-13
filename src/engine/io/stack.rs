@@ -181,6 +181,24 @@ impl<T> Stack<T> {
         }
     }
 
+    /// Set [`SHUT`] when the stack is empty and carries no flag: a taker that
+    /// served every value pushed so far closes the list in the same step that
+    /// finds it empty, so a push either lands before and is served by it, or
+    /// is refused after. `false` when a value came in first: take it, and try
+    /// again.
+    pub(crate) fn shut_if_empty(&self) -> bool {
+        // Release: what the taker did before closing (the values it served)
+        // is visible to every push the flag refuses.
+        self.head
+            .compare_exchange(
+                ptr::null_mut(),
+                flags_only(SHUT),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
     /// Clear [`IDLE`] on an empty stack: the owner is awake again. `true`
     /// when this call cleared it, so no push will.
     pub(crate) fn wake_if_resting(&self) -> bool {
@@ -309,6 +327,18 @@ mod tests {
         assert_eq!(stack.take_open().collect::<Vec<_>>(), vec![4]);
         assert_eq!(stack.flags(), SHUT);
         assert_eq!(stack.push(5, SHUT), Err(5));
+    }
+
+    #[test]
+    fn shut_if_empty_closes_only_an_empty_list() {
+        let stack = Stack::new();
+        stack.push(1, SHUT).unwrap();
+        assert!(!stack.shut_if_empty(), "a value came in first");
+        assert_eq!(stack.take_open().collect::<Vec<_>>(), vec![1]);
+        assert!(stack.shut_if_empty());
+        assert_eq!(stack.flags(), SHUT);
+        assert_eq!(stack.push(2, SHUT), Err(2));
+        assert!(!stack.shut_if_empty(), "closed already");
     }
 
     #[test]

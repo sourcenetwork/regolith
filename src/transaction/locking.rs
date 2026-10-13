@@ -4,7 +4,11 @@
 //! lands.
 //!
 //! Both kinds of call share one wait per key and transaction (a
-//! `PendingLock`), kept in the transaction across calls: a
+//! `PendingLock`), kept in the transaction across calls. Publishing it is
+//! one linearizable step of the transaction's wait map, so two calls that
+//! find the lock taken at once never both queue a wait: the one that loses
+//! gives its candidate's use back before the candidate could queue, and polls
+//! the published wait instead (`LockTableCalls.tla`). A
 //! [`try_get_for_update`](Transaction::try_get_for_update) that returned a
 //! [`LockWait`] and runs again continues the same wait, with the losses it
 //! counted toward the bypass bound, and so does a blocking call on the same
@@ -15,22 +19,42 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use super::lock_table::{LandingLocks, LockOwner, LockTable, PendingLock, Polled};
+use super::lock_table::{KeyLock, LandingLocks, LockTable, LockWaits, PendingLock, Polled};
 use super::{Transaction, TransactionError, TxResult, strip_cf_prefix};
 use crate::engine::io::shared::{QueueShared, WaitSlot};
-use crate::sync::TryLock;
-use crate::txn_buffer::TxnBuffer;
-use crate::{DEFAULT_TRANSACTION_KEYS_INLINE, Error, LockWait, WouldBlock};
+use crate::sync::{OwnerId, TryLock};
+use crate::{Error, LockWait, WouldBlock};
+
+/// Buckets a transaction's wait map starts with, made by its first wait: a
+/// transaction waits on few keys at once, and the map grows past this on
+/// demand.
+const LOCK_WAIT_BUCKETS: usize = 8;
+
+#[cfg(test)]
+std::thread_local! {
+    /// Run once by the next call on this thread that found the key held and
+    /// has not published its wait yet: what another call of the same
+    /// transaction could do in between.
+    static BEFORE_PUBLISH: std::cell::Cell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Have the next call on this thread that finds its key held run `hook`
+/// before it publishes its wait.
+#[cfg(test)]
+pub(super) fn before_publish(hook: impl FnOnce() + 'static) {
+    BEFORE_PUBLISH.set(Some(Box::new(hook)));
+}
 
 /// How a lock call waits when another transaction holds the lock.
 #[derive(Clone, Copy)]
 enum Waiting {
     /// Not at all: return a [`LockWait`].
     Never,
-    /// Block the thread until the deadline, in platform microseconds;
-    /// `None` on a platform with no clock, where nothing bounds a wait and
-    /// the call fails at once instead.
-    Until(Option<u64>),
+    /// Block the thread for up to the transaction's lock timeout, counted
+    /// from the first time the call finds the lock taken; on a platform with
+    /// no clock nothing bounds a wait, and the call fails at once instead.
+    Until,
 }
 
 impl Transaction {
@@ -39,37 +63,43 @@ impl Transaction {
     /// when it passes. `true` when the transaction already held the lock. An
     /// optimistic transaction takes no locks.
     pub(super) fn lock_key(&self, key: &[u8]) -> TxResult<bool> {
-        let Some(table) = self.lock_table.as_ref() else {
+        let (Some(table), Some(owner)) = (self.lock_table.as_ref(), self.lock_owner.as_ref())
+        else {
             return Ok(false);
         };
-        if self.held_locks.contains_key(key) {
-            return Ok(true);
-        }
-        let timeout = u64::try_from(self.lock_timeout.as_micros()).unwrap_or(u64::MAX);
-        let deadline = crate::env::platform_micros().map(|now| now.saturating_add(timeout));
-        self.acquire(table, key, Waiting::Until(deadline))
+        self.acquire(table, owner.id(), key, Waiting::Until)
     }
 
     /// [`Self::lock_key`] that never waits: a lock another transaction holds
     /// is [`WouldBlock::Locked`].
     pub(super) fn try_lock_key(&self, key: &[u8]) -> TxResult<bool> {
-        let Some(table) = self.lock_table.as_ref() else {
+        let (Some(table), Some(owner)) = (self.lock_table.as_ref(), self.lock_owner.as_ref())
+        else {
             return Ok(false);
         };
-        if self.held_locks.contains_key(key) {
-            return Ok(true);
-        }
-        self.acquire(table, key, Waiting::Never)
+        self.acquire(table, owner.id(), key, Waiting::Never)
     }
 
-    fn acquire(&self, table: &LockTable, key: &[u8], waiting: Waiting) -> TxResult<bool> {
-        let owner = self.lock_owner().id();
+    /// Take `key`'s lock for `owner`, this transaction's name. The loop's
+    /// first look is whether the transaction holds the key already, so a call
+    /// that does pays one lookup.
+    fn acquire(
+        &self,
+        table: &LockTable,
+        owner: OwnerId,
+        key: &[u8],
+        waiting: Waiting,
+    ) -> TxResult<bool> {
         // Looked up before anything queues, so a queue that is not open fails
         // the call cleanly.
         let queue = match waiting {
             Waiting::Never => self.lock_wait_queue()?,
-            Waiting::Until(_) => None,
+            Waiting::Until => None,
         };
+        // When a blocking call stops waiting, in platform microseconds: set
+        // the first time it finds the lock taken, so a call that takes the
+        // lock at once reads no clock.
+        let mut deadline: Option<Option<u64>> = None;
         loop {
             if self.held_locks.contains_key(key) {
                 return Ok(true);
@@ -90,9 +120,21 @@ impl Transaction {
                             return Ok(true);
                         }
                         TryLock::Busy => {
-                            let pending = Arc::new(PendingLock::new(key_lock));
-                            self.lock_waits().insert(key.to_vec(), Arc::clone(&pending));
-                            pending
+                            #[cfg(test)]
+                            if let Some(hook) = BEFORE_PUBLISH.take() {
+                                hook();
+                            }
+                            match self.publish_wait(key, key_lock) {
+                                Ok(pending) => pending,
+                                Err(lost) => {
+                                    // Another call of the transaction published
+                                    // its wait first; this candidate never
+                                    // queued. Its use goes back, and the next
+                                    // look finds that wait.
+                                    table.unpin(key, lost.key_lock());
+                                    continue;
+                                }
+                            }
                         }
                     }
                 }
@@ -101,7 +143,7 @@ impl Transaction {
                 Waiting::Never => {
                     let slot = Arc::new(WaitSlot::new());
                     pending.note(Arc::clone(&slot), queue.clone());
-                    match self.poll_wait(table, key, &pending, Some(&slot))? {
+                    match self.poll_wait(table, owner, key, &pending, Some(&slot))? {
                         Polled::Acquired => return Ok(self.took(key, &pending)),
                         Polled::Mine => return Ok(true),
                         // Another call ended the wait: look again from the top.
@@ -113,9 +155,14 @@ impl Transaction {
                         }
                     }
                 }
-                Waiting::Until(deadline) => {
+                Waiting::Until => {
+                    let deadline = *deadline.get_or_insert_with(|| {
+                        let timeout =
+                            u64::try_from(self.lock_timeout.as_micros()).unwrap_or(u64::MAX);
+                        crate::env::platform_micros().map(|now| now.saturating_add(timeout))
+                    });
                     pending.sleep_here();
-                    match self.poll_wait(table, key, &pending, None)? {
+                    match self.poll_wait(table, owner, key, &pending, None)? {
                         Polled::Acquired => return Ok(self.took(key, &pending)),
                         Polled::Mine => return Ok(true),
                         Polled::Done => continue,
@@ -155,11 +202,11 @@ impl Transaction {
     fn poll_wait(
         &self,
         table: &LockTable,
+        owner: OwnerId,
         key: &[u8],
         pending: &PendingLock,
         told: Option<&WaitSlot>,
     ) -> TxResult<Polled> {
-        let owner = self.lock_owner().id();
         let closed = |pending: &PendingLock| {
             if let Some(told) = told {
                 told.complete();
@@ -192,21 +239,43 @@ impl Transaction {
             .filter(|pending| !pending.is_done())
     }
 
-    fn lock_waits(&self) -> &TxnBuffer<Vec<u8>, Arc<PendingLock>> {
-        self.lock_waits
-            .get_or_init(|| Box::new(TxnBuffer::new(DEFAULT_TRANSACTION_KEYS_INLINE)))
+    /// Make a wait on `key_lock`, which the caller pinned for it, this
+    /// transaction's wait for `key`, unless another call of the transaction
+    /// published a live one first. Inserting into an empty place, or
+    /// replacing a wait that is over, is one linearizable step of the map,
+    /// so at most one live wait per transaction and key is ever published,
+    /// and only a published wait is polled (and so queued). `Err` hands back
+    /// the candidate, never polled, for the caller to give its use back.
+    fn publish_wait(
+        &self,
+        key: &[u8],
+        key_lock: Arc<KeyLock>,
+    ) -> Result<Arc<PendingLock>, Arc<PendingLock>> {
+        let candidate = Arc::new(PendingLock::new(key_lock));
+        let waits = self.lock_waits();
+        let mut present = waits.insert_if_absent(key.to_vec(), Arc::clone(&candidate));
+        loop {
+            match present {
+                None => return Ok(candidate),
+                Some(live) if !live.is_done() => return Err(candidate),
+                Some(_) => {
+                    present = match waits
+                        .replace_if(key.to_vec(), Arc::clone(&candidate), |held| held.is_done())
+                    {
+                        Ok(_) => None,
+                        Err(Some(current)) => Some(current),
+                        // Entries leave only when the transaction ends, so
+                        // never; insert again all the same.
+                        Err(None) => waits.insert_if_absent(key.to_vec(), Arc::clone(&candidate)),
+                    };
+                }
+            }
+        }
     }
 
-    /// The name this transaction's locks carry, made by its first lock call,
-    /// and handed to its close claim so `close` can release its locks.
-    pub(super) fn lock_owner(&self) -> &Arc<LockOwner> {
-        self.lock_owner.get_or_init(|| {
-            let owner = LockOwner::new();
-            if let Some(claim) = &self.claim {
-                claim.hold_locks_of(Arc::clone(&owner));
-            }
-            owner
-        })
+    fn lock_waits(&self) -> &LockWaits {
+        self.lock_waits
+            .get_or_init(|| Box::new(LockWaits::with_capacity(LOCK_WAIT_BUCKETS)))
     }
 
     /// The queue a [`LockWait`] this transaction hands out completes on:
@@ -227,28 +296,30 @@ impl Transaction {
     /// Let go of every lock this transaction holds and every wait it left,
     /// as it ends.
     pub(super) fn release_locks(&mut self) {
-        let (Some(table), Some(owner)) = (self.lock_table.as_ref(), self.lock_owner.get()) else {
+        let (Some(table), Some(owner)) = (self.lock_table.as_ref(), self.lock_owner.as_ref())
+        else {
             return;
         };
         let owner = owner.id();
-        if let Some(waits) = self.lock_waits.get_mut() {
-            for (key, pending) in waits.drain() {
+        if let Some(waits) = self.lock_waits.take() {
+            for (key, pending) in *waits {
                 if pending.abandon(owner) {
                     table.unpin(&key, pending.key_lock());
                 }
             }
         }
-        for (key, key_lock) in self.held_locks.drain() {
+        // Taken off in place: no list of them is built to walk.
+        self.held_locks.drain_with(|key, key_lock| {
             key_lock.lock.unlock(owner);
             table.unpin(&key, &key_lock);
-        }
+        });
     }
 
     /// The locks this transaction holds, taken out of it for a commit that
     /// lands later: they are released by whoever lands it.
     pub(super) fn take_landing_locks(&mut self) -> Option<Arc<LandingLocks>> {
         let table = Arc::clone(self.lock_table.as_ref()?);
-        let owner = Arc::clone(self.lock_owner.get()?);
+        let owner = Arc::clone(self.lock_owner.as_ref()?);
         let keys = self.held_locks.drain();
         (!keys.is_empty()).then(|| Arc::new(LandingLocks::new(table, owner, keys)))
     }

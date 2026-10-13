@@ -180,7 +180,7 @@ pub use callbacks::{AbortReason, CommitInfo, TransactionHooks};
 use callbacks::{Callbacks, Prepare};
 pub(crate) use claim::Claim;
 pub use cursor::{Page, ScanCheck, TxnCursor, TxnScanStream};
-use lock_table::{KeyLock, PendingLock};
+use lock_table::{KeyLock, LockWaits};
 pub(crate) use lock_table::{LockOwner, LockTable};
 pub use policy::{KeyClass, KeyClassifier};
 use projection::Projection;
@@ -976,11 +976,14 @@ pub struct Transaction {
     held_locks: TxnBuffer<Vec<u8>, Arc<KeyLock>>,
     /// The database's lock table; `None` for an optimistic transaction.
     lock_table: Option<Arc<LockTable>>,
-    /// The name this transaction's locks carry, made by its first lock call.
-    lock_owner: OnceLock<Arc<LockOwner>>,
+    /// The name this transaction's locks carry: taken at begin for a
+    /// pessimistic transaction, from the ones this thread's earlier
+    /// transactions gave back (`LockOwner::take`), and given back when it
+    /// ends. `None` for an optimistic transaction.
+    lock_owner: Option<Arc<LockOwner>>,
     /// The waits for locks other transactions held, one per key, kept across
     /// calls (`locking`). Allocated by the first wait.
-    lock_waits: OnceLock<Box<TxnBuffer<Vec<u8>, Arc<PendingLock>>>>,
+    lock_waits: OnceLock<Box<LockWaits>>,
     lock_timeout: Duration,
     resolved: bool,
     resources_released: bool,
@@ -1061,6 +1064,11 @@ impl Transaction {
             .transaction_hooks()
             .is_some()
             .then(|| Claim::track(&engine, false));
+        let lock_owner = lock_table.as_ref().map(|_| LockOwner::take());
+        // `close` releases the locks of a transaction it aborts by this name.
+        if let (Some(claim), Some(owner)) = (&claim, &lock_owner) {
+            claim.hold_locks_of(Arc::clone(owner));
+        }
         Self {
             engine,
             snapshot_seq,
@@ -1085,7 +1093,7 @@ impl Transaction {
             prepare_state: Prepare::Pending,
             held_locks: TxnBuffer::new(keys_inline),
             lock_table,
-            lock_owner: OnceLock::new(),
+            lock_owner,
             lock_waits: OnceLock::new(),
             lock_timeout,
             resolved: false,
@@ -1720,11 +1728,15 @@ impl Transaction {
     /// neither rewind a later read of that key nor launder a write
     /// that landed around the lock manager in the meantime.
     ///
+    /// Inside a [`Transaction::before_commit`] callback the rollback is one
+    /// of the callback's effects: if the callback fails, the savepoint is set
+    /// again and the writes and appends the rollback took are put back, in
+    /// their order.
+    ///
     /// Returns [`TransactionError::NoSavepoint`] when no savepoint is set.
     pub fn rollback_to_savepoint(&mut self) -> TxResult<()> {
         let mark = self.savepoints.pop().ok_or(TransactionError::NoSavepoint)?;
-        self.writes.truncate(mark.writes);
-        self.truncate_appends(mark.appends);
+        self.roll_back_to(mark);
         Ok(())
     }
 
@@ -1732,12 +1744,15 @@ impl Transaction {
     /// since it stay, and an older savepoint, if one is set, becomes the
     /// current one. O(1).
     ///
+    /// Inside a [`Transaction::before_commit`] callback the release is one of
+    /// the callback's effects: if the callback fails, the savepoint is set
+    /// again where it was.
+    ///
     /// Returns [`TransactionError::NoSavepoint`] when no savepoint is set.
     pub fn release_savepoint(&mut self) -> TxResult<()> {
-        self.savepoints
-            .pop()
-            .map(drop)
-            .ok_or(TransactionError::NoSavepoint)
+        let mark = self.savepoints.pop().ok_or(TransactionError::NoSavepoint)?;
+        self.released(mark);
+        Ok(())
     }
 
     /// Commit the transaction. Every key in the validation set is
@@ -1870,13 +1885,30 @@ impl Transaction {
     /// assert!(!lost.to_string().contains("zoe"));
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
-    pub fn commit(mut self) -> TxResult<CommitReceipt> {
+    pub fn commit(self) -> TxResult<CommitReceipt> {
+        self.conclude(Self::commit_inner)
+    }
+
+    /// End the transaction as a commit that failed with `error` before it
+    /// reached the engine, as [`Transaction::commit`] ends one whose
+    /// `prepare` returned it: the abort callbacks run once, with that error.
+    /// For a caller that ran `prepare` itself (`transact_async`).
+    fn fail_commit(self, error: TransactionError) -> TxResult<CommitReceipt> {
+        self.conclude(|_| Err(error))
+    }
+
+    /// Win the commit claim, run `attempt`, and end the transaction by its
+    /// result: release its resources, then run the callbacks of the outcome.
+    fn conclude(
+        mut self,
+        attempt: impl FnOnce(&mut Self) -> TxResult<CommitReceipt>,
+    ) -> TxResult<CommitReceipt> {
         // `close` may have aborted the transaction since it began: the commit
         // is then refused, and `close` ran the abort callbacks.
         let claimed = self.claim.as_ref().is_none_or(|claim| claim.begin_commit());
         self.committing = claimed;
         let result = if claimed {
-            self.commit_inner()
+            attempt(&mut self)
         } else {
             Err(Error::Closed.into())
         };
@@ -2393,6 +2425,13 @@ impl Drop for Transaction {
         self.release_resources();
         if abandoned {
             self.finish_dropped();
+        }
+        // The claim holds a clone of the lock owner; letting it go first lets
+        // the owner be lent to this thread's next transaction when nothing
+        // else holds either.
+        self.claim = None;
+        if let Some(owner) = self.lock_owner.take() {
+            LockOwner::give_back(owner);
         }
     }
 }

@@ -7,8 +7,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use regolith::{
-    DurabilityMode, OptimisticTransactionDb, Options, RetryPolicy, TransactError, TransactionDb,
-    TxnOptions, ready,
+    AbortReason, DurabilityMode, Error, OptimisticTransactionDb, Options, RetryPolicy,
+    TransactError, TransactionDb, TransactionError, TxnOptions, ready,
 };
 use tempfile::TempDir;
 
@@ -498,4 +498,70 @@ fn block_on_idles_through_a_backoff_and_runs_the_attempt_again() {
             pair[1] - pair[0]
         );
     }
+}
+
+/// A `before_commit` callback that fails once and would succeed if called
+/// again: `transact` ends the attempt with its error, so `transact_async` must
+/// too, with the callback run once, the abort callbacks run once, and nothing
+/// committed.
+#[test]
+fn a_before_commit_error_ends_the_attempt_without_running_the_callback_again() {
+    let dir = TempDir::new().unwrap();
+    let db = OptimisticTransactionDb::open(dir.path(), Options::default()).unwrap();
+    let mut queue = db.db().io_queue();
+    let (calls, aborts, runs) = (
+        Arc::new(AtomicUsize::new(0)),
+        Arc::new(AtomicUsize::new(0)),
+        Arc::new(AtomicUsize::new(0)),
+    );
+    let attempt = |txn: &mut regolith::Transaction| {
+        runs.fetch_add(1, Ordering::SeqCst);
+        let counted = Arc::clone(&calls);
+        let mut failures_left = 1;
+        txn.before_commit(move |_| {
+            counted.fetch_add(1, Ordering::SeqCst);
+            if failures_left > 0 {
+                failures_left -= 1;
+                return Err(Error::InvalidArgument("rejected".into()).into());
+            }
+            Ok(())
+        });
+        let aborted = Arc::clone(&aborts);
+        txn.on_abort(move |why| {
+            if matches!(why, AbortReason::Error(_)) {
+                aborted.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+        txn.put(b"k", b"v")
+    };
+    let rejected = |outcome: &Result<((), regolith::CommitReceipt), TransactError<_>>| {
+        matches!(
+            outcome,
+            Err(TransactError::Engine(TransactionError::Engine(
+                Error::InvalidArgument(_)
+            )))
+        )
+    };
+
+    let blocking = db.transact(&RetryPolicy::default(), |txn, _| attempt(txn));
+    assert!(rejected(&blocking), "{blocking:?}");
+    let counts = || [&runs, &calls, &aborts].map(|count| count.swap(0, Ordering::SeqCst));
+    assert_eq!(
+        counts(),
+        [1, 1, 1],
+        "transact: runs, callback calls, aborts"
+    );
+
+    let nonblocking = queue.block_on(db.transact_async(
+        queue.id(),
+        &RetryPolicy::default(),
+        async |txn, _| attempt(txn),
+    ));
+    assert!(rejected(&nonblocking), "{nonblocking:?}");
+    assert_eq!(
+        counts(),
+        [1, 1, 1],
+        "transact_async: runs, callback calls, aborts"
+    );
+    assert_eq!(db.db().get(b"k").unwrap(), None, "nothing committed");
 }

@@ -150,16 +150,14 @@ impl Transaction {
             once_key,
             classifier_for(&self.policy, self.isolation),
         )?;
-        self.appends
-            .get_or_init(|| Box::new(TxnBuffer::new(0)))
-            .insert(
-                (),
-                PendingAppend {
-                    log: Arc::clone(log),
-                    entry: entry.to_vec(),
-                    once_key: once_key.map(<[u8]>::to_vec),
-                },
-            );
+        self.appends_buffer().insert(
+            (),
+            PendingAppend {
+                log: Arc::clone(log),
+                entry: entry.to_vec(),
+                once_key: once_key.map(<[u8]>::to_vec),
+            },
+        );
         Ok(())
     }
 
@@ -173,6 +171,11 @@ impl Transaction {
             }
             _ => Ok(()),
         }
+    }
+
+    /// The buffer the appends are queued in, made by the first one.
+    pub(super) fn appends_buffer(&self) -> &TxnBuffer<(), PendingAppend> {
+        self.appends.get_or_init(|| Box::new(TxnBuffer::new(0)))
     }
 
     /// How many appends the transaction has made: the mark a savepoint keeps.

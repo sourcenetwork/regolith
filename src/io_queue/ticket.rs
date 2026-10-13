@@ -108,7 +108,10 @@ impl CommitTicket {
 
     /// Run `f` once with the commit's outcome: at the poll that delivers it,
     /// on the thread that owns the ticket's queue, or at once, on this
-    /// thread, if the ticket is ready already. `f` runs after the
+    /// thread, if the ticket is ready already. A registration that races the
+    /// delivery, from any thread, is run by that delivery before the ticket
+    /// is ready: this thread runs `f` only when [`is_ready`](Self::is_ready)
+    /// already answers `true`. `f` runs after the
     /// transaction's own callbacks and the database hooks. It must not block
     /// or re-enter the database; a panic in it is caught and reported to
     /// [`EventListener::on_callback_panic`](crate::EventListener::on_callback_panic),

@@ -299,6 +299,265 @@ pub fn a_lock_wait_reaches_its_own_queue() {
     });
 }
 
+/// One transaction's wait map for one key, as the loom models see it. The
+/// production map is not loom's, so a loom mutex stands for its one
+/// linearizable step: publishing into an empty place or over a wait that is
+/// over (`Transaction::publish_wait`). Newest last.
+struct Waits {
+    published: loom::sync::Mutex<Vec<StdArc<PendingLock>>>,
+    /// The old buffer's publication, for the calibration: every wait is
+    /// added, and a lookup finds the newest.
+    shadows: bool,
+    /// Publications lost to another call's: the race the model is about.
+    lost: AtomicUsize,
+}
+
+impl Waits {
+    fn live(&self) -> Option<StdArc<PendingLock>> {
+        let published = self.published.lock().expect("the map");
+        published.iter().rev().find(|wait| !wait.is_done()).cloned()
+    }
+
+    fn publish(&self, candidate: StdArc<PendingLock>) -> Option<StdArc<PendingLock>> {
+        let mut published = self.published.lock().expect("the map");
+        if !self.shadows && published.iter().any(|wait| !wait.is_done()) {
+            self.lost.fetch_add(1, Ordering::SeqCst);
+            return None;
+        }
+        published.push(StdArc::clone(&candidate));
+        Some(candidate)
+    }
+}
+
+/// One call of the transaction, as `Transaction::acquire` makes it, up to
+/// its return: the slot it waits on, or `None` once the transaction holds
+/// the lock.
+fn lock_call(key_lock: &StdArc<KeyLock>, waits: &Waits, me: OwnerId) -> Option<StdArc<WaitSlot>> {
+    loop {
+        let pending = match waits.live() {
+            Some(pending) => pending,
+            None => {
+                assert!(key_lock.pin(), "the holder's use keeps the entry");
+                match key_lock.lock.try_lock(me) {
+                    TryLock::Taken => return None,
+                    TryLock::Mine => {
+                        key_lock.unpin_and_retire();
+                        return None;
+                    }
+                    TryLock::Busy => {
+                        let candidate = StdArc::new(PendingLock::new(StdArc::clone(key_lock)));
+                        match waits.publish(candidate) {
+                            Some(pending) => pending,
+                            None => {
+                                // Lost: given back unpolled, and looked up again.
+                                key_lock.unpin_and_retire();
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
+        };
+        let slot = StdArc::new(WaitSlot::new());
+        pending.note(StdArc::clone(&slot), None);
+        match pending.poll(me, Some(&slot)) {
+            Polled::Acquired | Polled::Mine => return None,
+            Polled::Done => continue,
+            Polled::Pending | Polled::Busy => return Some(slot),
+        }
+    }
+}
+
+/// Two calls of one transaction ask for a key another transaction holds, at
+/// once: both may find no wait and make one. Then the holder releases, and
+/// each call that was told calls again. The transaction must take the freed
+/// lock: the release tells the wait in the line, and a told call's lookup
+/// finds that wait. `shadows` plants the old publication for the
+/// calibration. The witness is a call that lost the publication.
+fn two_calls_on_one_transaction(name: &'static str, shadows: bool) {
+    explore(name, 2, 10, usize::from(!shadows), move |witness| {
+        let key_lock = StdArc::new(KeyLock::for_model());
+        let (holder, waiter) = (LockOwner::new(), LockOwner::new());
+        let me = waiter.id();
+        assert_eq!(key_lock.lock.try_lock(holder.id()), TryLock::Taken);
+        let waits = StdArc::new(Waits {
+            published: loom::sync::Mutex::new(Vec::new()),
+            shadows,
+            lost: AtomicUsize::new(0),
+        });
+        let other = {
+            let (key_lock, waits) = (StdArc::clone(&key_lock), StdArc::clone(&waits));
+            thread::spawn(move || lock_call(&key_lock, &waits, me))
+        };
+        let slots = [
+            lock_call(&key_lock, &waits, me),
+            other.join().expect("call"),
+        ];
+        if waits.lost.load(Ordering::SeqCst) > 0 {
+            witness.record();
+        }
+        // The holder lets go; each told call calls again, once.
+        assert!(key_lock.lock.unlock(holder.id()));
+        for slot in slots.iter().flatten() {
+            if slot.is_ready() {
+                let _ = lock_call(&key_lock, &waits, me);
+            }
+        }
+        let took = key_lock.lock.holder() == me.word();
+        // Settle before the verdict, so a failure is the assertion alone.
+        for wait in waits.published.lock().expect("the map").iter() {
+            wait.abandon(me);
+        }
+        key_lock.lock.unlock(me);
+        assert!(took, "the transaction never took the freed lock");
+    });
+}
+
+/// Two calls of one transaction behind a holder share one wait, and the
+/// release reaches it.
+pub fn two_calls_on_one_transaction_share_one_wait() {
+    two_calls_on_one_transaction("two_calls_on_one_transaction_share_one_wait", false);
+}
+
+/// Its calibration: the old publication, where each call adds its own wait
+/// and a lookup finds the newest. The release tells the older wait, at the
+/// front of the line, and the told call's lookup finds the newer one.
+pub fn calibration_two_published_waits_hide_the_told_one() {
+    two_calls_on_one_transaction("calibration_two_published_waits_hide_the_told_one", true);
+}
+
+/// Two calls of one transaction poll one wait that is already queued, while
+/// the holder releases: one polls, and the other may meet that poll and
+/// return waiting with its note recorded. `poll` is the production poll, or
+/// the old one without the hand-back for the calibration. Whatever the
+/// order, once nobody took the freed lock every call that returned waiting
+/// was told, so the transaction's next poll is never left to the poller's own
+/// caller, which may never come back. The witness is a call that met the poll.
+fn two_pollers_on_one_wait(
+    name: &'static str,
+    poll: fn(&PendingLock, OwnerId, Option<&WaitSlot>) -> Polled,
+) {
+    explore(name, 2, 10, 1, move |witness| {
+        let key_lock = StdArc::new(KeyLock::for_model());
+        let (holder, waiter) = (LockOwner::new(), LockOwner::new());
+        let me = waiter.id();
+        assert_eq!(key_lock.lock.try_lock(holder.id()), TryLock::Taken);
+        let pending = StdArc::new(PendingLock::new(StdArc::clone(&key_lock)));
+        // Queued already: an earlier call polled it and returned waiting.
+        let earlier = StdArc::new(WaitSlot::new());
+        pending.note(StdArc::clone(&earlier), None);
+        assert_eq!(poll(&pending, me, Some(&earlier)), Polled::Pending);
+        let call = move |pending: &PendingLock| {
+            let slot = StdArc::new(WaitSlot::new());
+            pending.note(StdArc::clone(&slot), None);
+            (poll(pending, me, Some(&slot)), slot)
+        };
+        let releaser = {
+            let key_lock = StdArc::clone(&key_lock);
+            thread::spawn(move || assert!(key_lock.lock.unlock(holder.id())))
+        };
+        let other = {
+            let pending = StdArc::clone(&pending);
+            thread::spawn(move || call(&pending))
+        };
+        let mine = call(&pending);
+        releaser.join().expect("releaser");
+        let outcomes = [mine, other.join().expect("call")];
+        if outcomes
+            .iter()
+            .all(|(polled, _)| *polled != Polled::Acquired)
+        {
+            let told = outcomes.iter().all(|(_, slot)| slot.is_ready());
+            if outcomes.iter().any(|(polled, _)| *polled == Polled::Busy) {
+                witness.record();
+            }
+            // Settle the wait before the verdict, so a failure is the
+            // assertion and nothing else: the freed lock is the wait's.
+            assert_eq!(pending.poll(me, None), Polled::Acquired);
+            assert!(told, "a call that met the poll was never told");
+        }
+        assert!(key_lock.lock.unlock(me));
+    });
+}
+
+/// The two-poller model on the production poll.
+pub fn two_pollers_on_one_wait_are_both_told() {
+    two_pollers_on_one_wait("two_pollers_on_one_wait_are_both_told", PendingLock::poll);
+}
+
+/// Its calibration: the poll without the hand-back of a wake that came
+/// while it ran. A release whose wake falls inside the first call's poll,
+/// with the second call noting itself after that wake and meeting the poll,
+/// leaves the second call untold.
+pub fn calibration_a_poll_without_the_hand_back_leaves_a_call_untold() {
+    two_pollers_on_one_wait(
+        "calibration_a_poll_without_the_hand_back_leaves_a_call_untold",
+        PendingLock::poll_without_recheck,
+    );
+}
+
+/// Defect F1. A release hands the lock to an owed wait in two steps, the
+/// name and then the grant, while the waiting transaction polls. `poll` is
+/// the production poll, or for the calibration one that takes the name a
+/// handoff is still granting for a hold. Whatever the order, a poll that says
+/// the transaction holds the lock is right, and the lock ends with the
+/// transaction. The witness is a poll that left the wait pending while the
+/// handoff went through; the calibration, at the same bound, shows the search
+/// reaches the poll between the handoff's two steps.
+fn a_poll_racing_a_handoff(
+    name: &'static str,
+    poll: fn(&PendingLock, OwnerId, Option<&WaitSlot>) -> Polled,
+) {
+    explore(name, 2, 10, 1, move |witness| {
+        let key_lock = StdArc::new(KeyLock::for_model());
+        let (holder, waiter) = (LockOwner::new(), LockOwner::new());
+        let (h, me) = (holder.id(), waiter.id());
+        assert_eq!(key_lock.lock.try_lock(h), TryLock::Taken);
+        let pending = StdArc::new(PendingLock::new(StdArc::clone(&key_lock)));
+        // Owed: the wait loses every race the bound allows.
+        assert_eq!(poll(&pending, me, None), Polled::Pending);
+        for _ in 0..MAX_BYPASS {
+            assert!(key_lock.lock.unlock(h));
+            assert_eq!(key_lock.lock.try_lock(h), TryLock::Taken);
+            assert_eq!(poll(&pending, me, None), Polled::Pending);
+        }
+        let releaser = {
+            let key_lock = StdArc::clone(&key_lock);
+            thread::spawn(move || assert!(key_lock.lock.unlock(h)))
+        };
+        let polled = poll(&pending, me, None);
+        releaser.join().expect("releaser");
+        let says_held = matches!(polled, Polled::Acquired | Polled::Mine);
+        let holds = key_lock.lock.holder() == me.word();
+        if polled == Polled::Pending && holds {
+            witness.record();
+        }
+        // Settle before the verdict: the wait, if still pending, is granted.
+        if !says_held && polled != Polled::Done {
+            assert_eq!(pending.poll(me, None), Polled::Acquired);
+        }
+        key_lock.lock.unlock(me);
+        assert!(
+            !says_held || holds,
+            "a poll said the transaction holds a lock the handoff then freed"
+        );
+    });
+}
+
+/// The F1 model on the production poll.
+pub fn a_poll_racing_a_handoff_is_never_fooled() {
+    a_poll_racing_a_handoff("a_poll_racing_a_handoff_is_never_fooled", PendingLock::poll);
+}
+
+/// Its calibration: the poll before the fix, which took the name a handoff
+/// had written, and not granted yet, for the transaction's own hold.
+pub fn calibration_a_poll_trusting_a_half_made_handoff_breaks_exclusion() {
+    a_poll_racing_a_handoff(
+        "calibration_a_poll_trusting_a_half_made_handoff_breaks_exclusion",
+        PendingLock::poll_trusting_a_half_made_handoff,
+    );
+}
+
 /// The last use of an entry is given back, and the entry retired, while
 /// another caller looks the entry up and takes a use: never both. Either
 /// the use came first and the entry stays, or the retirement did and the

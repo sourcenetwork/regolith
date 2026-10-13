@@ -270,7 +270,8 @@ async fn wait_out(would_block: WouldBlock) {
 /// [`run`] for an attempt that never blocks: it reads through a `CacheOnly`
 /// handle on `queue`, runs its `before_commit` callbacks with
 /// [`Transaction::prepare`], waiting out any miss, and commits through
-/// [`Transaction::commit_nowait`]. A write stall does not end the attempt:
+/// [`Transaction::commit_nowait`]. Any other error from `prepare` is the
+/// attempt's outcome, as it is for `commit`. A write stall does not end the attempt:
 /// its commit stays pending and the ticket completes once the stop is
 /// relieved. A commit whose validation needed a block the cache does not
 /// hold waits for that read and runs the attempt again, uncounted, with the
@@ -298,11 +299,14 @@ async fn run_async<T, E>(
         };
         // A callback that misses stays queued with its effects rolled back,
         // so preparing again after the wait resumes where it stopped. Any
-        // other failure is left for the commit to report.
-        while let Err(TransactionError::WouldBlock(would_block)) = txn.prepare() {
-            wait_out(would_block).await;
-        }
-        match txn.commit_nowait().await {
+        // other failure is the attempt's outcome, as `commit` makes it: a
+        // failed callback stays queued, and preparing again would run it
+        // again, and commit if it then passed.
+        let outcome = match ready(|| txn.prepare()).await {
+            Ok(()) => txn.commit_nowait().await,
+            Err(error) => txn.fail_commit(error),
+        };
+        match outcome {
             Ok(receipt) => return Ok((value, receipt)),
             Err(TransactionError::Conflict(conflict)) => {
                 lost += 1;
@@ -345,7 +349,11 @@ impl OptimisticTransactionDb {
     /// that read and runs the attempt again; that run is not counted against
     /// the policy, and it gets the same previous conflict. An error from `f`
     /// ends the attempt with [`TransactError::Closure`] and is not retried;
-    /// any failure but a conflict ends it with [`TransactError::Engine`].
+    /// any failure but a conflict ends it with [`TransactError::Engine`]. A
+    /// `before_commit` callback that fails is such a failure, as it is for
+    /// [`OptimisticTransactionDb::transact`]: the attempt ends with its
+    /// error, the callback is not run again, and the abort callbacks run
+    /// once.
     ///
     /// A re-run starts as soon as the future is polled again, unless the
     /// policy asks for a wait first ([`RetryPolicy::backoff`]). That wait
