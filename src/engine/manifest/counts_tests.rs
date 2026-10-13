@@ -87,7 +87,12 @@ fn a_table_and_its_counts_are_one_batch_and_read_back_together() {
         tags.push(batch.records[pos]);
         ManifestRecord::decode(batch.records, &mut pos).unwrap();
     }
-    assert_eq!(tags, [TAG_ADD_FILE, TAG_TABLE_COUNTS]);
+    // A new manifest's first batch also records, in front of the edits,
+    // that its range deletes were checked: it has none to check.
+    assert_eq!(
+        tags,
+        [TAG_RANGE_DELETES_CHECKED, TAG_ADD_FILE, TAG_TABLE_COUNTS]
+    );
 
     drop(vs);
     let vs = f.open();
