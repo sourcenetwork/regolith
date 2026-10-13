@@ -24,6 +24,8 @@ pub(crate) struct Recording {
     /// created and removed: `create <name>` and `remove <name>`; and every
     /// writeback started: `writeback <offset> <len>`.
     pub ops: Vec<String>,
+    /// The name of every thread spawned, in order.
+    pub spawned: Vec<String>,
 }
 
 #[derive(Debug, Default)]
@@ -231,6 +233,7 @@ impl Env for RecordingEnv {
         name: &str,
         body: Box<dyn FnOnce() + Send + 'static>,
     ) -> io::Result<Box<dyn JoinHandle>> {
+        self.events.lock().unwrap().spawned.push(name.to_string());
         self.inner.spawn(name, body)
     }
 }

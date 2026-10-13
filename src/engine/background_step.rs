@@ -74,8 +74,8 @@ pub(super) const OWED_STEP: u8 = 0b01;
 /// Owed: the disk check a database with no worker runs once after open.
 pub(super) const OWED_DISK_CHECK: u8 = 0b10;
 
-/// The early writeback of the logs an engine creates (E46,
-/// `log_writeback.rs`): each time the active log grows by an eighth of the
+/// The early writeback of the logs an engine creates, when the lane runs
+/// (E46, `log_writeback.rs`): each time the active log grows by an eighth of the
 /// write buffer, the lane hands what was written to the host's writeback, so
 /// the rotation that seals the log syncs about that much at most, inside the
 /// ordered step where every writer waits, instead of the whole log. Never

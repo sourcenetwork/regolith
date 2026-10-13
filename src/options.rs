@@ -498,6 +498,7 @@ pub struct Options {
     pub(crate) fifo_compaction_options: FifoCompactionOptions,
     pub(crate) universal_compaction_options: UniversalCompactionOptions,
     pub(crate) max_background_compactions: usize,
+    pub(crate) log_writeback: bool,
     /// `None` until [`Options::inline_compaction`] is called: resolved by
     /// [`Options::inline_compaction_resolved`].
     pub(crate) inline_compaction: Option<bool>,
@@ -550,6 +551,7 @@ impl Default for Options {
             universal_compaction_options: UniversalCompactionOptions::default(),
             evict_compaction_data_from_page_cache: false,
             max_background_compactions: DEFAULT_MAX_BACKGROUND_COMPACTIONS,
+            log_writeback: false,
             inline_compaction: None,
             max_subcompactions: 1,
             partitioned_index: false,
@@ -634,6 +636,7 @@ impl std::fmt::Debug for Options {
                 "max_background_compactions",
                 &self.max_background_compactions,
             )
+            .field("log_writeback", &self.log_writeback)
             .field("inline_compaction", &self.inline_compaction_resolved())
             .field("max_subcompactions", &self.max_subcompactions)
             .field("partitioned_index", &self.partitioned_index)
@@ -1173,6 +1176,7 @@ impl Options {
             universal_compaction_options: self.universal_compaction_options,
             evict_compaction_data_from_page_cache: self.evict_compaction_data_from_page_cache,
             max_background_compactions: self.max_background_compactions,
+            log_writeback: self.log_writeback,
             inline_compaction: self.inline_compaction_resolved(),
             partitioned_index: self.partitioned_index,
             cache_index_and_filter_blocks: self.cache_index_and_filter_blocks,
@@ -1694,6 +1698,16 @@ mod tests {
         assert_eq!(
             eo.cache_index_and_filter_blocks,
             opts.cache_index_and_filter_blocks
+        );
+        assert!(
+            !opts.log_writeback,
+            "the log writeback lane is off by default"
+        );
+        assert!(
+            Options::default()
+                .log_writeback(true)
+                .to_engine_options()
+                .log_writeback
         );
     }
 

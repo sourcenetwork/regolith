@@ -397,6 +397,10 @@ pub(crate) struct EngineOptions {
     pub(crate) universal_compaction_options: crate::options::UniversalCompactionOptions,
     pub(crate) evict_compaction_data_from_page_cache: bool,
     pub(crate) max_background_compactions: usize,
+    /// See [`crate::Options::log_writeback`]. Read on Linux alone, the one
+    /// host with the writeback hint.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) log_writeback: bool,
     /// See [`crate::Options::inline_compaction`].
     pub(crate) inline_compaction: bool,
     pub(crate) partitioned_index: bool,
@@ -501,6 +505,7 @@ impl Default for EngineOptions {
             universal_compaction_options: crate::options::UniversalCompactionOptions::default(),
             evict_compaction_data_from_page_cache: false,
             max_background_compactions: 1,
+            log_writeback: false,
             inline_compaction: false,
             partitioned_index: false,
             metadata_block_size: 4096,
@@ -631,8 +636,8 @@ pub(crate) struct RegolithEngine {
     /// one is left until it ran.
     owed_queued: AtomicBool,
     /// The thread that hands the active log to the host's writeback as it
-    /// fills, ahead of its seal, where background threads run on Linux
-    /// (`log_writeback.rs`).
+    /// fills, ahead of its seal, when [`crate::Options::log_writeback`] is on
+    /// and background threads run on Linux (`log_writeback.rs`).
     log_writeback: Option<WritebackLane>,
     /// Where the disk check looks.
     disk_dir: PathBuf,
@@ -811,12 +816,14 @@ impl RegolithEngine {
             move || flusher.flush_all_frozen()
         }));
 
-        // Where background threads run, the active log is handed to the
-        // host's writeback as it fills, on a thread of its own (E46). Only
-        // Linux has the hint (`LogFile::start_writeback`); elsewhere the
-        // thread would have nothing to start.
+        // When the caller asked for it and background threads run, the
+        // active log is handed to the host's writeback as it fills, on a
+        // thread of its own (E46, `Options::log_writeback`). Off by default:
+        // the thread is one more than the compaction threads plan 3.13 and
+        // 4.5 promise. Only Linux has the hint (`LogFile::start_writeback`);
+        // elsewhere the thread would have nothing to start.
         #[cfg(target_os = "linux")]
-        let log_writeback = if has_worker {
+        let log_writeback = if has_worker && options.log_writeback {
             Some(log_writeback::LogWritebackLane::start(&*env)?)
         } else {
             None
