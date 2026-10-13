@@ -131,7 +131,7 @@ pub(super) const SPIN_ROUNDS: u32 = 64;
 pub(super) const SPIN_BUDGET: usize = 4;
 /// How long a blocking waiter waits in all, from when it first had to,
 /// before it writes the record itself (WU5).
-pub(super) const PATIENCE: Duration = Duration::from_micros(50);
+pub(super) const PATIENCE: Duration = Duration::from_micros(100);
 /// Slots the decided frontier may move past while the claim a waiter saw
 /// stays put, before the waiter takes the holder for stopped and writes the
 /// record itself (WU5): with nobody stopped, deciding that many slots takes
