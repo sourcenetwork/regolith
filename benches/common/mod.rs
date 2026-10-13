@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+pub mod counting_env;
 pub mod start;
 
 /// This process's arguments, without the `--bench` marker cargo appends.
