@@ -638,3 +638,6 @@ mod pipeline_tests;
 
 #[cfg(test)]
 mod allocate_tests;
+
+#[cfg(test)]
+mod helping_tests;
