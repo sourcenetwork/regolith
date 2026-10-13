@@ -175,9 +175,14 @@ impl RegolithEngine {
                 _ if nothing_above => continue,
                 _ => (horizon.max(range.observed_seq), memtables_only),
             };
-            if let Some((key, seq, theirs)) =
-                self.written_in_range_of(&range.lo, &range.hi, floor, view, memtables_only)?
-            {
+            if let Some((key, seq, theirs)) = self.written_in_range_of(
+                &range.lo,
+                &range.hi,
+                floor,
+                u64::MAX,
+                view,
+                memtables_only,
+            )? {
                 return Ok(Verdict::Conflict(Conflict::new(
                     key,
                     Access::ScannedRange,

@@ -36,7 +36,7 @@ fn a_tombstone_free_memtable_answers_from_the_gate_alone() {
     let mt = memtable();
     assert!(!mt.has_range_tombstones());
     assert_eq!(mt.covering_range_tombstone_seq(b"k", u64::MAX), 0);
-    assert_eq!(mt.newer_range_tombstone(b"a", b"z", 0), None);
+    assert_eq!(mt.newer_range_tombstone(b"a", b"z", 0, u64::MAX), None);
     mt.delete_range(b"a", b"z", 1);
     assert!(mt.has_range_tombstones());
 }

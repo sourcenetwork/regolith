@@ -43,7 +43,7 @@ fn an_empty_log_answers_nothing_and_holds_nothing() {
     assert_eq!(log.len(), 0);
     assert_eq!(log.bytes(), 0);
     assert_eq!(log.covering_seq(b"k", u64::MAX), 0);
-    assert!(log.first_newer_overlap(b"a", b"z", 0).is_none());
+    assert!(log.first_newer_overlap(b"a", b"z", 0, u64::MAX).is_none());
     assert!(log.to_sorted_vec().is_empty());
 }
 
@@ -425,7 +425,7 @@ fn a_position_claimed_while_a_rebuild_scans_is_not_indexed() {
     );
     assert_eq!(log.covering_seq(b"c", u64::MAX), newest);
     assert_eq!(
-        log.first_newer_overlap(b"x", b"z", REBUILD as u64)
+        log.first_newer_overlap(b"x", b"z", REBUILD as u64, u64::MAX)
             .map(|t| t.seq),
         Some(newest)
     );
@@ -482,8 +482,8 @@ proptest! {
             prop_assert_eq!(batched.covering_seq(a, *n), pushed.covering_seq(a, *n));
             let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
             prop_assert_eq!(
-                batched.first_newer_overlap(lo, hi, *n).map(|t| (&t.start, &t.end, t.seq)),
-                pushed.first_newer_overlap(lo, hi, *n).map(|t| (&t.start, &t.end, t.seq))
+                batched.first_newer_overlap(lo, hi, *n, u64::MAX).map(|t| (&t.start, &t.end, t.seq)),
+                pushed.first_newer_overlap(lo, hi, *n, u64::MAX).map(|t| (&t.start, &t.end, t.seq))
             );
         }
     }
@@ -517,7 +517,7 @@ proptest! {
             prop_assert_eq!(log.covering_seq(a, *n), model_covering(&all, a, *n));
             let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
             let expected = sorted.iter().find(|t| t.seq > *n && t.overlaps(lo, hi));
-            let got = log.first_newer_overlap(lo, hi, *n);
+            let got = log.first_newer_overlap(lo, hi, *n, u64::MAX);
             prop_assert_eq!(
                 got.map(|t| (&t.start, &t.end, t.seq)),
                 expected.map(|t| (&t.start, &t.end, t.seq))

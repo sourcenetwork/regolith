@@ -509,14 +509,16 @@ impl TombstoneLog {
     }
 
     /// The first tombstone in listing order with a sequence above `floor`
-    /// that overlaps `[lo, hi)`.
+    /// and at or below `ceil` that overlaps `[lo, hi)`. `u64::MAX` as
+    /// `ceil` bounds nothing.
     pub(crate) fn first_newer_overlap(
         &self,
         lo: &[u8],
         hi: &[u8],
         floor: u64,
+        ceil: u64,
     ) -> Option<&RangeTombstone> {
-        let matches = |t: &RangeTombstone| t.seq > floor && t.overlaps(lo, hi);
+        let matches = |t: &RangeTombstone| t.seq > floor && t.seq <= ceil && t.overlaps(lo, hi);
         let mut found: Option<&RangeTombstone> = None;
         let covered = self.scan_index(|index| {
             found = index

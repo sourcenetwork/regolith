@@ -271,20 +271,22 @@ impl MemTable {
     }
 
     /// A range tombstone overlapping `[lo, hi)` with a sequence above
-    /// `floor`, as the first key of the range it deletes and its sequence.
-    /// The first such tombstone in the order `clone_range_tombstones` lists
-    /// them.
+    /// `floor` and at or below `ceil`, as the first key of the range it
+    /// deletes and its sequence. The first such tombstone in the order
+    /// `clone_range_tombstones` lists them. `u64::MAX` as `ceil` bounds
+    /// nothing.
     pub(crate) fn newer_range_tombstone(
         &self,
         lo: &[u8],
         hi: &[u8],
         floor: u64,
+        ceil: u64,
     ) -> Option<(Vec<u8>, u64)> {
         if !self.has_range_tombstones() {
             return None;
         }
         self.range_tombstones
-            .first_newer_overlap(lo, hi, floor)
+            .first_newer_overlap(lo, hi, floor, ceil)
             .map(|t| (t.start.as_slice().max(lo).to_vec(), t.seq))
     }
 
