@@ -40,8 +40,10 @@ pub(crate) enum WriteRequest {
     },
     /// An optimistic transaction's commit. It is validated when its slot is
     /// decided, and lands its own operations, or, when it carries appends,
-    /// the batch deciding it numbered them into.
-    Txn(TxnRequest),
+    /// the batch deciding it numbered them into. Boxed: the request is moved
+    /// several times on its way into the ring, and a plain put should not
+    /// carry a transaction's size each time.
+    Txn(Box<TxnRequest>),
 }
 
 impl WriteRequest {

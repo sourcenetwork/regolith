@@ -639,7 +639,7 @@ impl RegolithEngine {
             run()
         } else {
             let (decided, counted) = crate::perf_context::on_behalf(txn.perf, run);
-            decision.perf = Some(counted);
+            decision.perf = Some(Box::new(counted));
             decided
         };
         match decided {
@@ -986,7 +986,8 @@ impl RegolithEngine {
         let Some(decision) = desc.decision() else {
             return Err(io::Error::other("a commit finished without a decision"));
         };
-        let perf = decision.perf.map(Box::new);
+        // The decision is shared, so its count is copied out.
+        let perf = decision.perf.as_deref().map(|counted| Box::new(*counted));
         let landed = || {
             if let Some(stats) = stats {
                 ops_of(desc, decision).count_written(stats);

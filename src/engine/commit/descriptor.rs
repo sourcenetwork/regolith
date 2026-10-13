@@ -227,7 +227,9 @@ pub(crate) struct Decision {
     /// a transaction whose appends were numbered, a counter reservation.
     pub(super) batch: Option<Vec<WriteBatchOp>>,
     /// What deciding the slot counted, for its own thread's perf context.
-    pub(super) perf: Option<PerfContextSnapshot>,
+    /// Boxed: only a thread that counts sets it, and every decision is
+    /// moved into its allocation whole.
+    pub(super) perf: Option<Box<PerfContextSnapshot>>,
     /// The pipeline's state after the slot. A slot that writes is applied
     /// to `after.memtable` and logged to `after.log`.
     pub(crate) after: After,

@@ -446,7 +446,7 @@ impl RegolithEngine {
             EarlyVerdict::Marks(early) => early,
         };
         Ok(Requested::Queued {
-            request: WriteRequest::Txn(TxnRequest {
+            request: WriteRequest::Txn(Box::new(TxnRequest {
                 checks,
                 ops,
                 appends,
@@ -454,7 +454,7 @@ impl RegolithEngine {
                 perf: crate::PerfContext::level(),
                 early,
                 read_queue,
-            }),
+            })),
             writes,
         })
     }
