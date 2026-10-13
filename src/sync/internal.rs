@@ -46,6 +46,28 @@ pub(crate) use loom::sync::atomic::{AtomicPtr, AtomicU8, AtomicU64, AtomicUsize,
 #[cfg(not(loom))]
 pub(crate) use std::sync::atomic::{AtomicPtr, AtomicU8, AtomicU64, AtomicUsize, Ordering, fence};
 
+/// Take the pointer out of `atomic`, leaving null, through `&mut`: no other
+/// thread can reach the atomic, so this is a plain read and write and not a
+/// locked instruction. What a `Drop` of a cell built on an `AtomicPtr` uses,
+/// since a `swap` there costs a locked exchange for nothing.
+///
+/// Under loom it is still a `swap`: a value that `std::sync::Arc` hands from
+/// one thread to the one that drops it (a job, for one) reaches that thread
+/// by an edge loom cannot see, and loom would take the plain access for a
+/// race. The exclusive access itself is the borrow checker's to prove, not
+/// loom's.
+#[inline(always)]
+pub(crate) fn take_ptr<T>(atomic: &mut AtomicPtr<T>) -> *mut T {
+    #[cfg(not(loom))]
+    {
+        std::mem::replace(atomic.get_mut(), std::ptr::null_mut())
+    }
+    #[cfg(loom)]
+    {
+        atomic.swap(std::ptr::null_mut(), Ordering::AcqRel)
+    }
+}
+
 /// The point between the store and the load of one side of a handshake
 /// built from `SeqCst` accesses, for loom.
 ///

@@ -543,7 +543,8 @@ where
 
 impl<K: 'static, V: 'static> Drop for TxnBuffer<K, V> {
     fn drop(&mut self) {
-        let mut cursor = self.head.swap(core::ptr::null_mut(), Ordering::AcqRel);
+        // `&mut self`: a plain read, not a locked exchange.
+        let mut cursor = core::mem::replace(self.head.get_mut(), core::ptr::null_mut());
         while !cursor.is_null() {
             // SAFETY: `&mut self` means no reader can be walking the
             // list, and each node was allocated by `Box::into_raw`.

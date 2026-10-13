@@ -2,7 +2,7 @@
 
 #![allow(unsafe_code)]
 
-use crate::sync::internal::{AtomicPtr, Ordering};
+use crate::sync::internal::{AtomicPtr, Ordering, take_ptr};
 
 /// A cell holding at most one `T`: [`put`](Take::put) stores a value,
 /// [`take`](Take::take) removes it. Each value put is handed to exactly one
@@ -52,7 +52,12 @@ impl<T> Take<T> {
 
 impl<T> Drop for Take<T> {
     fn drop(&mut self) {
-        drop(self.take());
+        let value = take_ptr(&mut self.0);
+        if !value.is_null() {
+            // SAFETY: as in `put`: the cell's own box, and `&mut self` means
+            // no other thread can take it.
+            drop(unsafe { Box::from_raw(value) });
+        }
     }
 }
 

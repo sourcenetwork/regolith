@@ -39,7 +39,7 @@ use super::super::wal_log::{Log, Place};
 use super::WriteRequest;
 use super::ring::Linked;
 use crate::perf_context::PerfContextSnapshot;
-use crate::sync::internal::{Arc as RingArc, AtomicPtr, AtomicU64, Ordering};
+use crate::sync::internal::{Arc as RingArc, AtomicPtr, AtomicU64, Ordering, take_ptr};
 use crate::{Conflict, QueueId, WriteBatchOp};
 
 /// An `Arc<T>` (the ring's kind, which a loom build swaps) set at most once and then read by any thread for as long as
@@ -98,7 +98,7 @@ impl<T> OnceArc<T> {
 
 impl<T> Drop for OnceArc<T> {
     fn drop(&mut self) {
-        let raw = self.0.swap(ptr::null_mut(), Ordering::AcqRel);
+        let raw = take_ptr(&mut self.0);
         if !raw.is_null() {
             // SAFETY: the cell's own reference, dropped once, here.
             drop(unsafe { RingArc::from_raw(raw.cast_const()) });
@@ -151,7 +151,7 @@ impl<T> Once<T> {
 
 impl<T> Drop for Once<T> {
     fn drop(&mut self) {
-        let raw = self.0.swap(ptr::null_mut(), Ordering::AcqRel);
+        let raw = take_ptr(&mut self.0);
         if !raw.is_null() {
             // SAFETY: the cell's own box, freed once, here.
             drop(unsafe { Box::from_raw(raw) });
