@@ -34,6 +34,7 @@ use super::{COMPRESSION_LZ4, COMPRESSION_NONE, COMPRESSION_SNAPPY, invalid_data}
 use crate::encryption::KeyId;
 use crate::engine::checksum;
 use crate::engine::seal::{DOMAIN_SST, Keyring, NONCE_LEN, OVERHEAD, Sealer, TAG_LEN};
+use crate::env::Env;
 
 /// Sealed, flat index.
 pub(super) const MAGIC_V7: u64 = 0x5245474F_53535407;
@@ -240,6 +241,26 @@ impl TableSeal {
         salt.copy_from_slice(&footer[SALT_AT..NONCE_AT]);
         Ok(Self { sealer, salt })
     }
+}
+
+/// Authenticate the footer of the table at `path` under the key it names,
+/// without opening the rest of the table. An unsealed table's footer
+/// checksum is checked instead, and needs no key.
+///
+/// What a restore checks for each table before it writes anything: a key
+/// the provider has, but with bytes other than the ones that sealed the
+/// table, fails here with [`io::ErrorKind::InvalidData`] (a key it does not
+/// have fails with the provider's error), where opening the restored
+/// database would otherwise be the first to find out. One read of the
+/// footer per table.
+pub(crate) fn authenticate_footer(
+    env: &dyn Env,
+    path: &Path,
+    keyring: Option<&Keyring>,
+) -> io::Result<()> {
+    let file = env.open_read(path)?;
+    let footer = super::read_footer(&*file, file.len()?)?;
+    footer.open_seal(keyring, path).map(drop)
 }
 
 /// What a sealed footer's tag covers: every byte but the nonce and the tag.

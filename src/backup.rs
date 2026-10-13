@@ -297,7 +297,9 @@ impl BackupEngine {
     ///   [`Error::UnknownKey`];
     /// - metadata that does not verify under the key it names (a wrong
     ///   key, or a changed or moved byte) refuses with
-    ///   [`Error::Corruption`].
+    ///   [`Error::Corruption`], and so does a table whose footer does not
+    ///   verify under the key it names: the provider has that key, but not
+    ///   the bytes that sealed the table.
     ///
     /// Each of these refusals comes before anything is written: the target
     /// is left as it was. With a provider the MANIFEST the restore writes is
@@ -331,11 +333,16 @@ impl BackupEngine {
         let manifest = self.read_manifest(backup_id, keyring.as_deref())?;
         // Every key the restored database needs, checked before the first
         // write as the open checks its own: the current key the MANIFEST is
-        // sealed under, and the key each table names.
+        // sealed under, and the key each table names. A table's key is
+        // checked against the table itself, by its footer's tag, so bytes
+        // that are present but not the ones that sealed it refuse here and
+        // not at the restored database's open.
         if let Some(ring) = &keyring {
             ring.current().map_err(Error::from)?;
-            for key in manifest.files.iter().filter_map(|f| f.seal_key) {
-                ring.sealer(key).map_err(Error::from)?;
+            for f in manifest.files.iter().filter(|f| f.seal_key.is_some()) {
+                let src = self.shared_dir.join(shared_filename(f.hash));
+                crate::engine::sstable::authenticate_footer(&*self.env, &src, Some(ring))
+                    .map_err(Error::from)?;
             }
         }
 

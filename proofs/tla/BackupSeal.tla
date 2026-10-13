@@ -23,6 +23,11 @@
 \*     file to backup 1's name, and the restore puts back the wrong tables;
 \*   - the restore refuses (no key, a wrong key, a missing key) only after
 \*     it has already copied tables into the target;
+\*   - backup 2, sealed under key 2, still lists a table under key 1, and
+\*     the provider has the right bytes for key 2 and other bytes under
+\*     key 1: the restore sees key 1 is there, writes the MANIFEST and
+\*     returns Ok, and the target then fails to open, and refuses a second
+\*     restore because it holds a MANIFEST;
 \*   - deleting a backup removes a shared table a sealed backup still needs,
 \*     because the engine holds no key and skipped what it could not read;
 \*   - a power cut leaves metadata that lists a table the pool never got,
@@ -56,8 +61,11 @@
 \*     and checks, before it writes anything: a provider is given, it has the
 \*     key the file names, the tag holds (right key bytes, listing unchanged,
 \*     the file is the one this id wrote), and it has its current key and
-\*     every key a table names. Then it copies every listed table into the
-\*     target, and writes the MANIFEST last, sealed under the current key.
+\*     every key a table names, with the bytes that sealed the table: it
+\*     authenticates each table's footer under its key
+\*     (sstable::authenticate_footer). Then it copies every listed table
+\*     into the target, and writes the MANIFEST last, sealed under the
+\*     current key.
 \*   list_backups names every metadata file in meta/ by its backup id, with
 \*     its summary when its metadata reads and the reason when it does not.
 \*     It reads only the clear listing, so it needs no key.
@@ -99,6 +107,8 @@
 \*   FaithfulRestore       a finished restore holds exactly the tables the
 \*                         backup recorded when it was taken.
 \*   RefusalWritesNothing  a refused restore wrote nothing.
+\*   RestoredOpens         a finished restore names only tables the
+\*                         provider it was given opens.
 \*   ListedRestores        every table an untampered backup lists is in the
 \*                         pool, after any delete and any power cut, even
 \*                         while its metadata does not read.
@@ -120,6 +130,9 @@
 \*   "ManifestFirst"     the MANIFEST before the tables.     FaithfulRestore
 \*   "OverDatabase"      a restore over a finished target.   FaithfulRestore
 \*   "CheckAfterCopy"    key checks after the copies.   RefusalWritesNothing
+\*   "FooterUnchecked"   a table's key is checked for presence only, not
+\*                       against the table, as restore did before.
+\*                                                          RestoredOpens
 \*   "GcSkipsSealed"     a delete counts only plain listings.  ListedRestores
 \*   "GcSkipsUnreadable" a delete counts only listings that read.
 \*                                                          ListedRestores
@@ -237,7 +250,7 @@ ASSUME Mutant \in {"none", "PlainMeta", "PlainRestore", "OpenUnderCurrent",
                    "ListingUnbound", "IdUnbound", "ManifestFirst", "OverDatabase",
                    "CheckAfterCopy", "GcSkipsSealed", "GcSkipsUnreadable", "MetaFirst",
                    "ListSkipsUnreadable", "ListNeedsKey", "StreamSkips", "SweepSkips",
-                   "SyncOnlyRemoved"}
+                   "SyncOnlyRemoved", "FooterUnchecked"}
 
 \* The two key ids the database rotates between (KeyId).
 Keys == {1, 2}
@@ -260,26 +273,30 @@ Plain == 0
 \* A restore given no key provider (restore's `None`). Every stand-in value
 \* in this module is a record shaped like the values beside it, because TLC
 \* refuses to compare a string with a record.
-NoProv == [given |-> FALSE, has |-> {}, right |-> FALSE, cur |-> 1]
+NoProv == [given |-> FALSE, has |-> {}, right |-> {}, cur |-> 1]
 
 \* The providers a restore may be given. `has` is the set of key ids it
-\* hands out, `right` whether their bytes are the ones that sealed, `cur`
-\* the key it names current (KeyProvider::current).
+\* hands out, `right` the ids among them whose bytes are the ones that
+\* sealed, `cur` the key it names current (KeyProvider::current).
 Providers ==
   \* No provider at all.
   {NoProv} \cup
   \* Both keys, the right bytes, key 1 current.
-  { [given |-> TRUE, has |-> {1, 2}, right |-> TRUE, cur |-> 1],
+  { [given |-> TRUE, has |-> {1, 2}, right |-> {1, 2}, cur |-> 1],
     \* Both keys, the right bytes, key 2 current: after a rotation.
-    [given |-> TRUE, has |-> {1, 2}, right |-> TRUE, cur |-> 2],
+    [given |-> TRUE, has |-> {1, 2}, right |-> {1, 2}, cur |-> 2],
     \* Only key 2: key 1 was retired.
-    [given |-> TRUE, has |-> {2}, right |-> TRUE, cur |-> 2],
+    [given |-> TRUE, has |-> {2}, right |-> {2}, cur |-> 2],
     \* Only key 1.
-    [given |-> TRUE, has |-> {1}, right |-> TRUE, cur |-> 1],
+    [given |-> TRUE, has |-> {1}, right |-> {1}, cur |-> 1],
     \* Key 1 only, but it names key 2 current: a current key it lacks.
-    [given |-> TRUE, has |-> {1}, right |-> TRUE, cur |-> 2],
+    [given |-> TRUE, has |-> {1}, right |-> {1}, cur |-> 2],
     \* Both ids, but other bytes under them: the wrong keys.
-    [given |-> TRUE, has |-> {1, 2}, right |-> FALSE, cur |-> 1] }
+    [given |-> TRUE, has |-> {1, 2}, right |-> {}, cur |-> 1],
+    \* Both ids after a rotation, the right bytes for key 2 and other bytes
+    \* under key 1: what opens a backup's metadata sealed under key 2, and
+    \* none of its tables still under key 1.
+    [given |-> TRUE, has |-> {1, 2}, right |-> {2}, cur |-> 2] }
 
 \* The values a slot map's tables take, without the empty marker.
 Held(f) == {f[t] : t \in Tables} \ {NoObj}
@@ -293,7 +310,7 @@ Absent == [on |-> FALSE, key |-> Plain, listing |-> Empty, sealed |-> Empty,
            body |-> Empty, bound |-> 1, reads |-> TRUE]
 
 \* A target with no MANIFEST (`on` says whether it has one).
-NoManifest == [on |-> FALSE, body |-> Empty, sealed |-> FALSE, want |-> Empty]
+NoManifest == [on |-> FALSE, body |-> Empty, sealed |-> FALSE, want |-> Empty, opens |-> FALSE]
 
 \* No removal of metadata waits for its sync.
 NoPend == [b \in Ids |-> Absent]
@@ -358,8 +375,10 @@ VARIABLES
   \* under slot t's file id.
   tgt,
   \* The restore target's MANIFEST: whether there is one (on), what it
-  \* names (body), whether it is sealed, and the tables the backup recorded
-  \* (want, a ghost).
+  \* names (body), whether it is sealed, the tables the backup recorded
+  \* (want, a ghost), and whether the provider the restore was given opens
+  \* every table it names (opens, a ghost: what the restored database's
+  \* open will find).
   tman,
   \* The restore in flight (BackupEngine::restore): its phase ("idle",
   \* "check", "copy", "refused"), the backup id, the provider, the metadata
@@ -725,6 +744,12 @@ Purge(keep) == Remove({b \in Present : Cardinality({c \in Present : c > b}) >= k
 ----------------------------------------------------------------------------
 \* Restoring a backup (BackupEngine::restore).
 
+\* Whether p opens every table of `body`: it has each table's key, with the
+\* bytes that sealed the table.
+TablesOpen(body, p) ==
+  \* For each slot that holds a table, its key is one p has right.
+  \A t \in Tables : body[t] # NoObj => body[t][2] \in p.has \cap p.right
+
 \* Whether provider p has everything restoring backup b from file m needs:
 \* the key the file names, the right bytes, its current key, every key a
 \* table names, and a file that is the one id b wrote, unchanged and
@@ -732,16 +757,16 @@ Purge(keep) == Remove({b \in Present : Cardinality({c \in Present : c > b}) >= k
 Entitled(m, b, p) ==
   \* The file reads: no key opens metadata that does not decode.
   /\ m.reads
-  \* A provider, with the right bytes.
+  \* A provider.
   /\ p.given
-  \* The bytes it gives are the right ones.
-  /\ p.right
-  \* The key the file names.
+  \* The key the file names...
   /\ m.key \in p.has
+  \* ...with the bytes that sealed it.
+  /\ m.key \in p.right
   \* Its own current key, which the MANIFEST is sealed under.
   /\ p.cur \in p.has
-  \* Every key a listed table names.
-  /\ \A t \in Tables : m.body[t] # NoObj => m.body[t][2] \in p.has
+  \* Every key a listed table names, with the bytes that sealed it.
+  /\ TablesOpen(m.body, p)
   \* The listing is the one the tag covers, and the file is b's own.
   /\ m.listing = m.sealed
   \* The file was written as backup b's own.
@@ -765,22 +790,30 @@ MetaOpens(m, b, p) ==
           THEN p.cur = m.key /\ p.cur \in p.has
           \* The design: it opens when the provider has the key the file names.
           ELSE m.key \in p.has
-       \* The tag holds only under the right bytes...
-       /\ p.right
+       \* The tag holds only under the bytes that sealed it...
+       /\ m.key \in p.right
        \* ...over the listing as it was sealed (ListingUnbound skips this)...
        /\ Mutant = "ListingUnbound" \/ m.listing = m.sealed
        \* ...and the id it was sealed as (IdUnbound skips this).
        /\ Mutant = "IdUnbound" \/ m.bound = b
 
 \* Whether p has its current key and every key a table names, the checks
-\* restore makes before its first write.
+\* restore makes before its first write. Each table's key is checked
+\* against the table itself, its footer's tag verified under the bytes p
+\* gives (sstable::authenticate_footer); FooterUnchecked checks only that p
+\* has the key, as restore did before.
 KeysProvided(m, p) ==
   \* No provider: nothing is sealed, nothing to provide.
   \/ ~p.given
   \* Otherwise the current key and each table's key.
   \/ /\ p.cur \in p.has
-     \* and the provider has the key of every table the backup lists.
-     /\ \A t \in Tables : m.body[t] # NoObj => m.body[t][2] \in p.has
+     \* The key of every table the backup lists: with the bytes that sealed
+     \* it, or, under FooterUnchecked, merely present.
+     /\ IF Mutant = "FooterUnchecked"
+        \* The bug: present is enough.
+        THEN \A t \in Tables : m.body[t] # NoObj => m.body[t][2] \in p.has
+        \* The design: each table's footer verifies.
+        ELSE TablesOpen(m.body, p)
 
 \* A restore of backup b with provider p starts: it reads b's metadata.
 StartRestore(b, p) ==
@@ -856,7 +889,7 @@ WriteManifest ==
      \* provider was given (plain under PlainRestore).
      ELSE /\ tman' = [on |-> TRUE, body |-> rs.m.body,
                       sealed |-> rs.p.given /\ Mutant # "PlainRestore",
-                      want |-> rs.want]
+                      want |-> rs.want, opens |-> TablesOpen(rs.m.body, rs.p)]
           \* The restore is over.
           /\ rs' = IdleRs
   \* The target's tables do not move.
@@ -1057,7 +1090,7 @@ TypeOK ==
   \* The target's tables.
   /\ tgt \in [Tables -> Slot]
   \* The target's MANIFEST.
-  /\ tman \in [on : BOOLEAN, body : [Tables -> Slot], sealed : BOOLEAN,
+  /\ tman \in [on : BOOLEAN, body : [Tables -> Slot], sealed : BOOLEAN, opens : BOOLEAN,
                want : [Tables -> Slot]]
   \* The restore in flight.
   /\ rs \in [phase : {"idle", "check", "copy", "refused"}, id : Ids, p : Providers,
@@ -1116,6 +1149,14 @@ FaithfulRestore ==
     /\ tman.body = tman.want
     \* ...and each one it names is in the target.
     /\ \A t \in Tables : tman.body[t] # NoObj => tgt[t] = tman.body[t]
+
+\* A finished restore names only tables the provider it was given opens,
+\* so the restored database opens with it. It rules out the FooterUnchecked
+\* story: backup 2's metadata opens under the right bytes for key 2, its
+\* table under key 1 is only checked to be there, and the restore writes a
+\* MANIFEST naming a table that does not open under the other bytes the
+\* provider holds for key 1.
+RestoredOpens == tman.on => tman.opens
 
 \* A refused restore wrote nothing. It rules out the CheckAfterCopy story:
 \* a provider without its current key is refused only after every table was
