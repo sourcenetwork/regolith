@@ -394,7 +394,11 @@ A database written by 0.1.x opens, and the open rewrites its log in format 2, wh
 refuses to open: the upgrade is one-way. A database a 0.1.x release left with tables of
 overlapping key ranges in one level opens too: the first open moves that level and the
 levels above it into level 0 and logs one warning (the `regolith.manifest.tables_demoted`
-ticker and property count the tables moved).
+ticker and property count the tables moved). A database a 0.1.x release left with a range
+delete below older keys it deletes reads them as deleted: the first open copies every range
+delete that may sit behind such a key in front of every key, logs one warning, and records
+the check so no later open repeats it (`regolith.manifest.range_deletes_copied` counts the
+copies).
 
 ## Encryption at rest
 
