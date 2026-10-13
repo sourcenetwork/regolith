@@ -696,9 +696,12 @@ impl RegolithEngine {
             }
             buf.resize(prefix, 0);
             ops.encode(buf, decision.base_seq);
-            let wrote = log
-                .finish_record(KIND_GROUP, place, buf)
-                .and_then(|()| log.write_record(place, buf));
+            // Looked at again once counted in at the gate: a copy of a record
+            // another thread wrote meanwhile is not written, so none lands
+            // after a sync that covers it began (`wal_gate.rs`, WG4).
+            let wrote = log.finish_record(KIND_GROUP, place, buf).and_then(|()| {
+                log.write_unless(place, buf, || desc.is(WRITTEN) || desc.is(FAILED))
+            });
             let used = buf.len();
             super::trim_stage(buf, *prev, used);
             *prev = used;
@@ -715,7 +718,8 @@ impl RegolithEngine {
                     }
                 }
             }
-            // The commit was discarded by a rollback since it was decided.
+            // The commit was discarded by a rollback since it was decided, or
+            // another thread wrote the record.
             Ok(false) => {}
             Err(err) => {
                 tracing::error!(error = %err, "writing a commit to the write-ahead log failed");

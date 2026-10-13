@@ -345,12 +345,12 @@ loom-tables:
 # helping, the watermark claim, publication, a rollback meeting a decision
 # under way, the step's sections, and parking (a queue's poll never waits:
 # a job its holder parks, a job parked for the step, a rollback parked for
-# a write in flight, the wake of a parked job against its landing and
-# against the claim of the thread that parks it), with thirteen
-# calibrations that must fail. Twenty-seven models, each bounded by a ring
-# of two cells, two or three threads and an explicit preemption bound;
-# measured at 1.3s in all, the largest at 4,214 interleavings. The limit is
-# a hard one: a run that reaches it has failed.
+# a write in flight, a sync parked for a record's late copy in flight, the
+# wake of a parked job against its landing and against the claim of the
+# thread that parks it), with fifteen calibrations that must fail. Thirty
+# models, each bounded by a ring of two cells, two or three threads and an
+# explicit preemption bound; measured at 1.1s in all, the largest at 4,214
+# interleavings. The limit is a hard one: a run that reaches it has failed.
 loom-pipeline:
     RUSTFLAGS="--cfg loom" cargo test --release --test loom_pipeline --no-run
     RUSTFLAGS="--cfg loom" timeout 5m cargo test --release --test loom_pipeline

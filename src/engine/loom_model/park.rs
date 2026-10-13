@@ -2,7 +2,7 @@
 //! parks instead of waiting for another thread, and nobody who waits is
 //! left behind.
 //!
-//! Five handshakes carry it. In each, two sides write one word and then
+//! Six handshakes carry it. In each, two sides write one word and then
 //! read the other's, and a side that misses the other sleeps for ever:
 //!
 //! - a job its holder parks, against a thread blocked on it (`io::job`,
@@ -12,6 +12,9 @@
 //!   version store's step, which the flush exclusion shares the list with;
 //! - a rollback parked for the writes in flight on a failed log, against
 //!   the last write to leave (`wal_gate`, WG1 and WG3);
+//! - a sync parked for a copy of a record still in flight, against the
+//!   copy's way out, and a copy counted in after the turn, against the
+//!   record written (`wal_gate`, WG4);
 //! - the wake of a parked job telling the queues registered on it, against
 //!   the thread that lands it (`io::job`, `Job::ready`);
 //! - that wake against the park itself: a wait that ends before the thread
@@ -280,12 +283,12 @@ pub fn a_rollback_parked_for_a_write_in_flight_cuts_after_it_left() {
             let writer = {
                 let (gate, cut) = (Arc::clone(&gate), Arc::clone(&cut));
                 thread::spawn(move || {
-                    if !gate.enter(0) {
+                    let Some(entry) = gate.enter(0) else {
                         return false;
-                    }
+                    };
                     // The write's bytes go to the host here.
                     let after_the_cut = cut.load(Ordering::SeqCst);
-                    gate.leave(0);
+                    gate.leave(entry);
                     after_the_cut
                 })
             };
@@ -350,6 +353,139 @@ pub fn a_write_counted_in_after_its_epoch_check_lands_after_the_cut() {
             assert!(
                 !after_the_cut,
                 "a write of a discarded commit landed after the cut"
+            );
+        },
+    );
+}
+
+/// The copy of a record that a sync must not have in flight (WG4): a write
+/// that counts in at the gate and, unless `skip_look` says not to, looks
+/// again whether the record is written. `true` when it wrote with the sync
+/// already begun.
+fn late_copy(gate: &Gate, written: &AtomicBool, synced: &AtomicBool, skip_look: bool) -> bool {
+    let Some(entry) = gate.enter(0) else {
+        return false;
+    };
+    let under_the_sync = if skip_look || !written.load(Ordering::Acquire) {
+        // The copy's bytes go to the host here.
+        synced.load(Ordering::SeqCst)
+    } else {
+        false
+    };
+    gate.leave(entry);
+    under_the_sync
+}
+
+/// WG4: a sync of a written record turns the gate and waits for the writes
+/// counted in before the turn, while a late copy of the record counts in and
+/// looks again. The copy was let in before the turn, and the sync then
+/// begins only once it left (it parks, and the copy's way out wakes it), or
+/// it finds the record written and writes nothing. No copy is written under
+/// the sync, and a sync that parked is woken.
+///
+/// Bound: 3 preemptions. One copy, one sync.
+pub fn a_late_copy_never_lands_under_a_sync() {
+    explore_bounded(
+        "a_late_copy_never_lands_under_a_sync",
+        Some(3),
+        8,
+        1,
+        |witness| {
+            let gate = Arc::new(Gate::new());
+            let written = Arc::new(AtomicBool::new(false));
+            let synced = Arc::new(AtomicBool::new(false));
+            let copy = {
+                let (gate, written, synced) =
+                    (Arc::clone(&gate), Arc::clone(&written), Arc::clone(&synced));
+                thread::spawn(move || late_copy(&gate, &written, &synced, false))
+            };
+            // Another thread's write of the record lands; the sync's prefix
+            // covers it.
+            written.store(true, Ordering::Release);
+            let (wakes, waker) = counting();
+            let parked = gate.settle(100, &waker).is_pending();
+            if !parked {
+                synced.store(true, Ordering::SeqCst);
+            }
+            let under_the_sync = copy.join().expect("the copy");
+            assert!(
+                !under_the_sync,
+                "a copy of the record landed under the sync"
+            );
+            if parked {
+                witness.record();
+                assert_eq!(
+                    wakes.load(Ordering::SeqCst),
+                    1,
+                    "a sync parked for a copy in flight and was not woken when it left"
+                );
+                assert_eq!(
+                    gate.settle(100, &waker),
+                    std::task::Poll::Ready(100),
+                    "the copy left"
+                );
+            }
+        },
+    );
+}
+
+/// Calibration for [`a_late_copy_never_lands_under_a_sync`]: a copy that
+/// counts in and writes without looking again. Counted in after the turn,
+/// the sync does not wait for it, and it lands under the sync.
+pub fn a_copy_that_does_not_look_again_lands_under_the_sync() {
+    explore_bounded(
+        "a_copy_that_does_not_look_again_lands_under_the_sync",
+        Some(3),
+        1,
+        0,
+        |_| {
+            let gate = Arc::new(Gate::new());
+            let written = Arc::new(AtomicBool::new(false));
+            let synced = Arc::new(AtomicBool::new(false));
+            let copy = {
+                let (gate, written, synced) =
+                    (Arc::clone(&gate), Arc::clone(&written), Arc::clone(&synced));
+                thread::spawn(move || late_copy(&gate, &written, &synced, true))
+            };
+            written.store(true, Ordering::Release);
+            let (_, waker) = counting();
+            if gate.settle(100, &waker).is_ready() {
+                synced.store(true, Ordering::SeqCst);
+            }
+            let under_the_sync = copy.join().expect("the copy");
+            assert!(
+                !under_the_sync,
+                "a copy of the record landed under the sync"
+            );
+        },
+    );
+}
+
+/// Calibration for [`a_late_copy_never_lands_under_a_sync`]: a sync that
+/// begins without waiting for the writes in flight. A copy that counted in
+/// and looked before the record was written lands under it.
+pub fn a_sync_that_does_not_wait_has_a_copy_land_under_it() {
+    explore_bounded(
+        "a_sync_that_does_not_wait_has_a_copy_land_under_it",
+        Some(3),
+        1,
+        0,
+        |_| {
+            let gate = Arc::new(Gate::new());
+            let written = Arc::new(AtomicBool::new(false));
+            let synced = Arc::new(AtomicBool::new(false));
+            let copy = {
+                let (gate, written, synced) =
+                    (Arc::clone(&gate), Arc::clone(&written), Arc::clone(&synced));
+                thread::spawn(move || late_copy(&gate, &written, &synced, false))
+            };
+            written.store(true, Ordering::Release);
+            // The bug: the sync begins without settling the gate.
+            synced.store(true, Ordering::SeqCst);
+            let under_the_sync = copy.join().expect("the copy");
+            assert!(
+                !under_the_sync,
+                "a copy of the record landed under the sync"
             );
         },
     );

@@ -28,6 +28,14 @@
 //!   file handle and then cleared by the host, so two syncs overlapping on
 //!   the handle could tell a later caller the bytes of a failed one were
 //!   safe.
+//! - **No write lands on a range a sync has begun to cover.** A sector in
+//!   flight when the power goes may come back garbled whatever was being
+//!   written to it, so a late copy of a record, the same bytes a slow
+//!   writer still had on their way, would put synced bytes back at risk.
+//!   Before a sync, [`Log::settle`] waits for every write that may land
+//!   below it, and a write that may be a copy counts in at the gate before
+//!   it looks whether its record is written ([`Log::write_unless`]). See
+//!   `wal_gate.rs`, WG4.
 //! - **A rolled back range is not written by a stale writer.** Every write
 //!   passes the gate (`wal_gate.rs`): it is counted in only while the log is
 //!   still in the epoch its `Place` was decided in, and counted out when it
@@ -46,6 +54,8 @@ use std::sync::Arc;
 use super::seal::{Keyring, NONCE_LEN, OVERHEAD, Sealer};
 use super::take::Take;
 use super::wal_frame::{self, HEADER_LEN};
+#[cfg(test)]
+use super::wal_gate::Entry;
 use super::wal_gate::Gate;
 use super::wal_seal::{self, SEALED_PREFIX_LEN};
 use crate::env::{Env, LogFile, WriteMode};
@@ -297,12 +307,61 @@ impl Log {
     /// offset. `Ok(false)` when the commit it belongs to was discarded by a
     /// rollback since it was decided: nothing is written.
     pub(crate) fn write_record(&self, place: &Place, record: &[u8]) -> io::Result<bool> {
-        if !self.gate.enter(place.epoch) {
+        self.write_unless(place, record, || false)
+    }
+
+    /// [`Log::write_record`] for a record another thread may be writing too:
+    /// once the write is counted in at the gate, `written` says whether the
+    /// record is written already, and then nothing is written either (WG4).
+    pub(crate) fn write_unless(
+        &self,
+        place: &Place,
+        record: &[u8],
+        written: impl FnOnce() -> bool,
+    ) -> io::Result<bool> {
+        let Some(entry) = self.gate.enter(place.epoch) else {
+            return Ok(false);
+        };
+        if written() {
+            self.gate.leave(entry);
             return Ok(false);
         }
+        super::commit::hook::at(super::commit::hook::Stage::InWrite);
         let wrote = self.file.write_all_at(place.offset, record);
-        self.gate.leave(place.epoch);
+        self.gate.leave(entry);
         wrote.map(|()| true)
+    }
+
+    /// Wait until every write that may land below `through`, the end of
+    /// records known written, has returned, and return the offset a sync may
+    /// cover now: `through`, or less when a turn an earlier sync parked on
+    /// is finished here (`wal_gate.rs`, WG4 and WG5). Called by the holder of
+    /// the pipeline's round, before [`Log::sync_through`].
+    pub(crate) fn settle(&self, through: u64) -> io::Result<u64> {
+        // Most syncs find nothing in flight, and need no waker made for them.
+        if let std::task::Poll::Ready(upto) = self.gate.settle(through, std::task::Waker::noop()) {
+            return Ok(upto);
+        }
+        let mut waited = false;
+        crate::sync::internal::wait_here(std::future::poll_fn(|cx| {
+            let settled = self.gate.settle(through, cx.waker());
+            if settled.is_pending() && !waited {
+                waited = true;
+                super::io::scope::waits("positional writes in flight below a sync of the log");
+                super::commit::hook::at(super::commit::hook::Stage::SyncWait);
+            }
+            settled
+        }))
+    }
+
+    /// [`Log::settle`] for a caller that may not wait: `None` when writes
+    /// are still in flight below `through`, and `waker` is then woken by the
+    /// last of them to leave.
+    pub(crate) fn settle_or_park(&self, through: u64, waker: &std::task::Waker) -> Option<u64> {
+        match self.gate.settle(through, waker) {
+            std::task::Poll::Ready(upto) => Some(upto),
+            std::task::Poll::Pending => None,
+        }
     }
 
     /// Make every byte below `through` durable, where `through` is the end
@@ -374,6 +433,9 @@ impl Log {
                 std::thread::yield_now();
             }
         }
+        // A sync that turned the gate for a prefix this cut removes would
+        // otherwise sync up to it later, past records written meanwhile.
+        self.gate.forget_turn();
         let cut = self.cut(offset);
         let cause = self.failure.take();
         if cut.is_ok() {
@@ -408,15 +470,17 @@ impl Log {
     /// guard drops.
     #[cfg(test)]
     pub(crate) fn write_in_flight(&self) -> impl Drop + '_ {
-        struct InFlight<'a>(&'a Gate, u64);
+        struct InFlight<'a>(&'a Gate, Entry);
         impl Drop for InFlight<'_> {
             fn drop(&mut self) {
                 self.0.leave(self.1);
             }
         }
-        let epoch = self.gate.epoch();
-        assert!(self.gate.enter(epoch));
-        InFlight(&self.gate, epoch)
+        let entry = self
+            .gate
+            .enter(self.gate.epoch())
+            .expect("a write of the current epoch is let in");
+        InFlight(&self.gate, entry)
     }
 
     /// Cut off the record at `offset`, which the calling thread alone

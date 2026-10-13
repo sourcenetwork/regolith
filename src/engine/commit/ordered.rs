@@ -536,6 +536,20 @@ impl RegolithEngine {
         // stops that.
         let held = self.hold_round(pipe, help)?;
         let tip = pipe.tip.load();
+        // The body syncs the log through every record decided, all written
+        // now: first every write that may still land there has to return,
+        // a slow writer's late copy of a published record included (WG4).
+        // Nothing is decided meanwhile, so what counts in from here on finds
+        // its record written and writes nothing; one turn of the gate can
+        // leave only an earlier sync's shorter turn to finish first.
+        let log = &tip.after.log;
+        while !log.is_poisoned() {
+            match self.settle_writes(log, tip.after.next_off, help) {
+                None => return None,
+                Some(upto) if upto >= tip.after.next_off => break,
+                Some(_) => {}
+            }
+        }
         if tip.after.log.is_poisoned() {
             if !self.turned_away(&tip, help) {
                 return None;
