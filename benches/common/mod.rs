@@ -174,6 +174,23 @@ impl Drop for TempDb {
     }
 }
 
+/// Copy the database directory `from` to `to`, everything but its `LOCK`.
+/// The copy takes a lock of its own when it is opened, and the lock of a
+/// database still open cannot be read on Windows, where its holder shares
+/// it for nothing but deletion.
+pub fn copy_db(from: &Path, to: &Path) {
+    fs::create_dir_all(to).unwrap_or_else(|e| panic!("create {}: {e}", to.display()));
+    for entry in fs::read_dir(from).unwrap_or_else(|e| panic!("read {}: {e}", from.display())) {
+        let entry = entry.unwrap_or_else(|e| panic!("read {}: {e}", from.display()));
+        let (src, dst) = (entry.path(), to.join(entry.file_name()));
+        if src.is_dir() {
+            copy_db(&src, &dst);
+        } else if entry.file_name() != "LOCK" {
+            fs::copy(&src, &dst).unwrap_or_else(|e| panic!("copy {}: {e}", src.display()));
+        }
+    }
+}
+
 pub fn open(tag: &str, opts: regolith::Options) -> (TempDb, regolith::Db) {
     let tmp = TempDb::new(tag);
     let db = regolith::Db::open(tmp.path(), opts)
