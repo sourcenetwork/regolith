@@ -278,11 +278,6 @@ const TEARS: [TearMode; 2] = [TearMode::Truncate, TearMode::TornSector];
 /// this many log writes: enough for every cut below to fire.
 const APPEND_COMMITS: usize = 100;
 
-/// Allocations per writer for the cuts at the nth log write, by the same
-/// count: a batch of records holds at most one commit of each writer, so
-/// this many make at least this many log writes, enough for the last cut.
-const ALLOCATE_OPS: usize = 120;
-
 #[test]
 fn a_power_cut_leaves_a_gap_free_prefix_of_the_appends_at_immediate_durability() {
     for nth in [4, 17, 40, 90] {
@@ -368,7 +363,7 @@ fn a_power_cut_never_returns_a_value_a_surviving_commit_used_at_immediate_durabi
                 DurabilityMode::Immediate,
                 Trigger::wal_write(nth),
                 tear,
-                ALLOCATE_OPS,
+                30,
             );
             check_recovered_counter(&out, DurabilityMode::Immediate);
         }
@@ -384,7 +379,7 @@ fn a_power_cut_never_returns_a_value_a_surviving_commit_used_at_eventual_durabil
                 DurabilityMode::Eventual,
                 Trigger::wal_write(nth),
                 tear,
-                ALLOCATE_OPS,
+                30,
             );
             check_recovered_counter(&out, DurabilityMode::Eventual);
         }

@@ -391,49 +391,6 @@ fn early_writeback_hands_over_the_multiples_records_passed() {
     assert_eq!(log.handed(), 12288);
 }
 
-/// A batch of records written in one call under the write claim, as the
-/// write stage writes them, kicks once when it passes a multiple of the
-/// early writeback's size, and the lane's call hands over every multiple it
-/// passed.
-#[test]
-fn a_batched_write_past_a_multiple_kicks_once() {
-    let env: Arc<dyn Env> = Arc::new(MemEnv::new());
-    env.create_dir_all(Path::new("wal")).unwrap();
-    let kicks = Arc::new(AtomicU64::new(0));
-    let counted = Arc::clone(&kicks);
-    let early = super::EarlyWriteback::new(
-        4096,
-        Arc::new(move || {
-            counted.fetch_add(1, Ordering::SeqCst);
-        }),
-    );
-    let log = Log::create_in(&env, Path::new("wal/wal_000001.log"), None)
-        .unwrap()
-        .with_early_writeback(Some(early));
-    // Three records framed one after the other into one buffer, past 4096
-    // and 8192.
-    let mut at = log.stamp_len();
-    let mut batch = Vec::new();
-    for seq in 1..=3u64 {
-        let (place, record) = put_record(&log, at, b"k", &[7u8; 3000], seq);
-        batch.extend_from_slice(&record);
-        at = place.end();
-    }
-    let flight = log.count_in(log.epoch(), true).unwrap();
-    assert!(flight.claimed());
-    flight.write_at(log.stamp_len(), &batch).unwrap();
-    drop(flight);
-    assert_eq!(kicks.load(Ordering::SeqCst), 1, "one batch, one kick");
-    log.write_back_ahead();
-    assert_eq!(log.handed(), 8192);
-    // A batch that passes no multiple kicks nothing.
-    let (place, record) = put_record(&log, at, b"k", b"v", 4);
-    let flight = log.count_in(log.epoch(), true).unwrap();
-    flight.write_at(place.offset, &record).unwrap();
-    drop(flight);
-    assert_eq!(kicks.load(Ordering::SeqCst), 1);
-}
-
 /// One step of a writer: which record it writes.
 fn order(records: usize) -> impl Strategy<Value = Vec<usize>> {
     proptest::collection::vec(0..records, 0..records * 3)

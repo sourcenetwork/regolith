@@ -20,10 +20,9 @@
 //!    therefore reads every commit before it straight from the view. Nothing
 //!    applied is visible to a reader until it is published: a snapshot reads
 //!    at the published horizon.
-//! 3. **Write**, in batches (`write_stage.rs`): the thread that holds the
-//!    log's write claim writes every decided record not yet written, one
-//!    contiguous run, with one write. A record is the same bytes whichever
-//!    thread writes it (`engine::wal_log`).
+//! 3. **Write**, in any order: the slot's record goes to its range of the
+//!    log, the same bytes whichever thread writes them
+//!    (`engine::wal_log`).
 //! 4. **Sync**, one round at a time, each a unit one thread claims with one
 //!    compare-and-swap (D53): the round syncs the written prefix of the log
 //!    and raises the durable offset over it. A log that failed is rolled
@@ -37,15 +36,11 @@
 //!
 //! A thread never waits for a lock or for another thread to be scheduled. A
 //! blocking call does wait for device I/O that is under way: a sync round
-//! another thread claimed, an ordered unit (`ordered.rs`) another thread is
-//! running, or a batch of records another thread is writing, which holds
-//! its record. It parks for those, and is woken when they end. On the write
-//! claim alone it parks for a short, bounded time: a record the batch under
-//! way does not hold it then writes itself (`write_stage.rs`). A call made
-//! through `commit_nowait` waits for none of it: it leaves the unit on its
-//! queue and returns, and writes its record itself when the claim is held.
-//! The queue's poll, which then runs the unit, waits for nothing another
-//! thread has either: the unit parks (`park.rs`).
+//! another thread claimed, or an ordered unit (`ordered.rs`) another thread
+//! is running. A call made through `commit_nowait` waits for neither: it
+//! leaves the unit on its queue and returns. The queue's poll, which then
+//! runs the unit, waits for nothing another thread has either: the unit
+//! parks (`park.rs`).
 //!
 //! # Invariants
 //!
@@ -71,16 +66,10 @@
 //!   the ring full. It freezes both frontiers, and the state it leaves is
 //!   of a new epoch: a decision a thread was computing from the old state
 //!   carries the old epoch, and its slot is failed when it is settled.
-//! - **P5, helping is bounded.** A thread decides and publishes only slots
-//!   at or below its own (a rollback slot aside), each at most once, and
-//!   writes the records up to its own and at most one batch past it, bounded
-//!   in bytes (`write_stage.rs`, W4). So one call does at most a ring's
-//!   worth of other commits' work and one batch (E21). A wait on another
-//!   thread's step is bounded too: on the decide and apply chain a courtesy
-//!   of yields, and on the write claim a park of [`WRITE_PATIENCE`] at a
-//!   time, after which the thread does the step itself. Only device I/O
-//!   under way (a batch that holds its record, a round, a unit) is waited
-//!   for to its end.
+//! - **P5, helping is bounded.** A thread decides, writes and publishes only
+//!   slots at or below its own (a rollback slot aside), and each at most
+//!   once, so one call does at most a ring's worth of other commits' work
+//!   (E21).
 
 use std::io;
 use std::sync::Arc;
@@ -89,10 +78,11 @@ use super::super::RegolithEngine;
 use super::super::callback::InCommit;
 use super::super::io::job::Job;
 use super::super::wal::check_write_len;
+use super::super::wal_frame::KIND_GROUP;
 use super::append::AppendOrder;
 use super::descriptor::{
     ADMITTED, APPLIED, APPLYING, After, DECIDING, Decision, Descriptor, FAILED, INSTALLED,
-    Verdict as Fate, WRITTEN, Work, is_immediate,
+    Verdict as Fate, WRITING, WRITTEN, Work, is_immediate,
 };
 use super::hook;
 use super::park::Help;
@@ -101,12 +91,9 @@ use super::ring::{ArcSlot, Installed, Loaded, Ring};
 use super::round::Round;
 use super::spare;
 use super::txn::{TxnRequest, Verdict};
-#[cfg(doc)]
-use super::write_stage::WRITE_PATIENCE;
-use super::write_stage::WriteStage;
 use super::{Settled, WriteRequest};
 use crate::perf_context::{PerfLevel, PerfTimer, PerfTimerField};
-use crate::statistics::Ticker;
+use crate::statistics::{Histogram, Ticker};
 use crate::sync::internal::Arc as RingArc;
 use crate::{Access, WriteBatchOp};
 
@@ -120,8 +107,6 @@ pub(crate) struct Pipeline {
     /// claims or waits on. Replaced by the thread that ran it, before it
     /// lands.
     pub(super) round: ArcSlot<Round>,
-    /// Where the write stage stands (`write_stage.rs`).
-    pub(super) writes: WriteStage,
 }
 
 impl Pipeline {
@@ -135,7 +120,6 @@ impl Pipeline {
         let ring = Ring::new(capacity);
         let genesis = Decision::new(ring.capacity() - 1, Fate::Unit, start);
         Self {
-            writes: WriteStage::new(ring.capacity()),
             ring,
             tip: ArcSlot::new(RingArc::new(genesis)),
             round: ArcSlot::new(Round::new(engine)),
@@ -167,7 +151,7 @@ pub(super) enum Progress {
 
 /// The operations slot `desc` lands, decided as `decision`: the batch
 /// deciding it produced when there is one, else the request's own.
-pub(super) fn ops_of<'a>(desc: &'a Descriptor, decision: &'a Decision) -> Ops<'a> {
+fn ops_of<'a>(desc: &'a Descriptor, decision: &'a Decision) -> Ops<'a> {
     if let Some(batch) = &decision.batch {
         return Ops::Batch(batch);
     }
@@ -187,12 +171,11 @@ const COURTESY_YIELDS: usize = 32;
 ///
 /// Helping is what keeps a stopped thread from holding others (P5), but
 /// several threads repeating one stage at once is wasted work, and in the
-/// apply stage wasted memtable bytes. The courtesy is bounded, in yields, so
-/// a thread that did stop costs each helper a fixed number of yields and
-/// nothing more. It stays a yield and not a park on the decide and apply
-/// chain: those waits are shorter than a park and its wake cost (measured,
-/// E45). A target with one thread has nobody to yield to.
-pub(super) fn courtesy(size: usize, done: impl Fn() -> bool) {
+/// apply stage wasted memtable bytes. The courtesy is bounded, in yields and
+/// never in time, so a thread that did stop costs each helper a fixed number
+/// of yields and nothing more. A target with one thread has nobody to yield
+/// to.
+fn courtesy(size: usize, done: impl Fn() -> bool) {
     if !crate::env::PLATFORM_THREADS {
         return;
     }
@@ -202,6 +185,22 @@ pub(super) fn courtesy(size: usize, done: impl Fn() -> bool) {
         }
         std::thread::yield_now();
     }
+}
+
+std::thread_local! {
+    /// This thread's buffer for the record it is writing, and the length of
+    /// the record before it (`trim_stage`'s one record of hysteresis).
+    static STAGE: std::cell::RefCell<(Vec<u8>, usize)> =
+        const { std::cell::RefCell::new((Vec::new(), 0)) };
+}
+
+/// Test-only: the capacity and the address of this thread's stage buffer.
+#[cfg(test)]
+pub(super) fn stage_buffer() -> (usize, *const u8) {
+    STAGE.with(|stage| {
+        let stage = stage.borrow();
+        (stage.0.capacity(), stage.0.as_ptr())
+    })
 }
 
 impl RegolithEngine {
@@ -299,7 +298,7 @@ impl RegolithEngine {
                 self.run_or_wait(&job);
                 continue;
             }
-            match self.publish_upto(pipe, lap, None, help) {
+            match self.publish_upto(pipe, lap, None) {
                 Progress::Published => return Ok(()),
                 Progress::NeedsSync | Progress::Failed => self.sync_round(pipe, help)?,
                 Progress::Undecided => {}
@@ -356,7 +355,7 @@ impl RegolithEngine {
                     }
                     Loaded::Full => {
                         // The cell still holds the slot a lap earlier.
-                        match self.publish_upto(pipe, index - pipe.ring.capacity(), None, help) {
+                        match self.publish_upto(pipe, index - pipe.ring.capacity(), None) {
                             Progress::Published | Progress::Undecided => {}
                             Progress::NeedsSync | Progress::Failed => {
                                 if let Err(job) = self.sync_round(pipe, help) {
@@ -727,6 +726,82 @@ impl RegolithEngine {
         pipe.ring.pass_decided(index);
     }
 
+    /// Write slot `desc`'s record at its place, if it has one and it is not
+    /// written yet. Any thread may; all write the same bytes.
+    pub(super) fn write_slot(&self, desc: &Descriptor) {
+        let Some(decision) = desc.decision() else {
+            return;
+        };
+        let Some(place) = &decision.place else {
+            return;
+        };
+        if desc.is(WRITTEN) || desc.is(FAILED) {
+            return;
+        }
+        // Another thread is writing it now: the same courtesy before this
+        // thread writes the same bytes a second time.
+        if !desc.mark(WRITING) {
+            courtesy((place.len / 1024) as usize, || desc.is(WRITTEN));
+            if desc.is(WRITTEN) {
+                return;
+            }
+        }
+        hook::at(hook::Stage::Write);
+        let log = &decision.after.log;
+        let ops = ops_of(desc, decision);
+        let _perf = PerfTimer::new(PerfTimerField::WriteWal);
+        // Through `Env`, not `std::time::Instant`: browsers have a clock but
+        // `Instant::now` panics on `wasm32-unknown-unknown`. Read only when
+        // statistics are on.
+        let start = self.statistics().and_then(|_| self.env.now_micros());
+        let wrote = STAGE.with(|stage| {
+            let mut stage = stage.borrow_mut();
+            let (buf, prev) = &mut *stage;
+            buf.clear();
+            let prefix = log.prefix_len();
+            if buf.try_reserve_exact(place.len as usize).is_err() {
+                return Err(io::Error::new(
+                    io::ErrorKind::OutOfMemory,
+                    format!(
+                        "not enough memory to commit this write ({} bytes pending); retry, splitting any very large write batch",
+                        place.len
+                    ),
+                ));
+            }
+            buf.resize(prefix, 0);
+            ops.encode(buf, decision.base_seq);
+            // Looked at again once counted in at the gate: a copy of a record
+            // another thread wrote meanwhile is not written, so none lands
+            // after a sync that covers it began (`wal_gate.rs`, WG4).
+            let wrote = log.finish_record(KIND_GROUP, place, buf).and_then(|()| {
+                log.write_unless(place, buf, || desc.is(WRITTEN) || desc.is(FAILED))
+            });
+            let used = buf.len();
+            super::trim_stage(buf, *prev, used);
+            *prev = used;
+            wrote
+        });
+        match wrote {
+            Ok(true) => {
+                if desc.mark(WRITTEN)
+                    && let Some(s) = self.statistics()
+                {
+                    s.add(Ticker::WalBytesWritten, ops.reported_bytes());
+                    if let Some(micros) = self.elapsed_micros(start) {
+                        s.record(Histogram::WalWriteTime, micros);
+                    }
+                }
+            }
+            // The commit was discarded by a rollback since it was decided, or
+            // another thread wrote the record.
+            Ok(false) => {}
+            Err(err) => {
+                tracing::error!(error = %err, "writing a commit to the write-ahead log failed");
+                log.poison(err);
+            }
+        }
+    }
+
     /// Whether slot `desc` may be published: it takes nothing, or its record
     /// is written and, when it asked for `Immediate`, durable. A slot is
     /// applied before it is decided (P2), so that is not asked here.
@@ -744,16 +819,14 @@ impl RegolithEngine {
     }
 
     /// Publish every slot up to and including `limit`, in ring order,
-    /// writing the records in the way as `help` says (P3,
-    /// `write_stage.rs`). Stops at the first slot that is not publishable
-    /// yet and says why. `own` is the caller's installed descriptor, if it
-    /// has one: see [`Self::own_slot`].
+    /// writing the records in the way (P3). Stops at the first slot that is
+    /// not publishable yet and says why. `own` is the caller's installed
+    /// descriptor, if it has one: see [`Self::own_slot`].
     pub(super) fn publish_upto(
         &self,
         pipe: &Pipeline,
         limit: u64,
         own: Option<&RingArc<Descriptor>>,
-        help: Help<'_>,
     ) -> Progress {
         loop {
             if pipe.ring.is_frozen() {
@@ -792,7 +865,7 @@ impl RegolithEngine {
                     return Progress::Failed;
                 }
                 if !desc.is(WRITTEN) {
-                    self.write_slot(pipe, desc, help);
+                    self.write_slot(desc);
                     if desc.is(WRITTEN) {
                         continue;
                     }
@@ -862,8 +935,8 @@ impl RegolithEngine {
             if let Turn::Blocked(job) = self.help_decide(pipe, index, Help::Leave, Some(desc)) {
                 return Err(job);
             }
-            self.write_slot(pipe, desc, Help::Leave);
-            match self.publish_upto(pipe, index, Some(desc), Help::Leave) {
+            self.write_slot(desc);
+            match self.publish_upto(pipe, index, Some(desc)) {
                 Progress::Published => return Ok(()),
                 Progress::NeedsSync | Progress::Failed => self.sync_round(pipe, Help::Leave)?,
                 Progress::Undecided => {}
@@ -882,8 +955,8 @@ impl RegolithEngine {
                 self.run_or_wait(&job);
                 continue;
             }
-            self.write_slot(pipe, desc, Help::Wait);
-            match self.publish_upto(pipe, index, Some(desc), Help::Wait) {
+            self.write_slot(desc);
+            match self.publish_upto(pipe, index, Some(desc)) {
                 Progress::Published => return,
                 Progress::NeedsSync | Progress::Failed => {
                     // A blocking call gets past the round.
