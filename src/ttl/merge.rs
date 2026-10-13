@@ -1,87 +1,182 @@
-//! The caller's merge operator on a TTL database.
+//! The caller's merge operator on a TTL database, and how a merged key is
+//! stored.
 //!
-//! Every value and every merge operand written through [`super::DbWithTtl`]
-//! carries the time it was written at behind it. The caller's operator
-//! knows nothing of that, so it is shown what the caller wrote, and what it
-//! returns is given the time of the newest write it folded.
+//! Each write expires by its own time: a put and each merge operand live
+//! the TTL from when they were written, and a read folds the writes of a
+//! key that have not expired. A fold cannot be undone, and one value has one
+//! time, so the writes of a merged key are not folded where they are stored:
+//! the database's merge keeps them apart, each with its time, in one stored
+//! value (a *bundle*), and the caller's operator folds the ones that have
+//! not expired when the key is read. Compaction drops a write from a bundle
+//! once it has expired, which a read was ignoring already, so what a read
+//! returns does not depend on which writes a compaction pass met, nor on
+//! when it ran.
 //!
-//! A merge is a write: it gives the value a new TTL, as a put would. So
-//! what a merge folds is the value as it stood when the merge was written,
-//! and a value that had already expired by then is not part of it: the
-//! merge starts the value over, as a put after the expiry would. That is
-//! decided by the times the writes carry, never by the clock when the fold
-//! runs, so a read and every compaction fold the same writes into the same
-//! value, whenever they run.
+//! A bundle, after the writes it holds:
 //!
-//! Operands are written oldest first, with times that do not go back. Two
-//! operands are not folded ahead of their base: whether the older one
-//! started the value over depends on the base, which is not known then.
+//! ```text
+//! [write]... ["RTTL"][version 2][newest time: u64 BE]
+//! write = [flags: u8 (1 the put the merges apply to, 2 has a time)]
+//!         [length: u32 BE][bytes][time: u64 BE, when it has one]
+//! ```
+//!
+//! A write with no time was written past the wrapper (through
+//! [`super::DbWithTtl::inner`]): it never expires and a read through the
+//! wrapper does not see it, as for a plain value written that way.
 
 use std::sync::Arc;
 
-use super::{decode_ttl_suffix, outlived, stamp};
+use super::{TTL_MAGIC, TTL_MAGIC_LEN, TTL_SUFFIX_LEN, TTL_TS_LEN, decode_ttl_suffix};
 use crate::options::MergeOperator;
 
-/// The caller's operator, behind the timestamps.
-pub(super) struct TtlMergeOperator {
-    pub(super) callers: Arc<dyn MergeOperator>,
-    pub(super) ttl_seconds: u64,
+/// The version byte of a bundle's suffix (a plain stamped value has 1).
+const BUNDLE_VERSION: u8 = 2;
+
+/// The flag of the put a bundle's merges apply to.
+const FLAG_BASE: u8 = 1;
+
+/// The flag of a write that carries the time it was written at.
+const FLAG_TIMED: u8 = 2;
+
+/// One write a stored value holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct Piece<'a> {
+    /// The put the merges after it apply to.
+    pub(super) base: bool,
+    /// What the caller wrote.
+    pub(super) value: &'a [u8],
+    /// When, or `None` for a write made past the wrapper.
+    pub(super) at: Option<u64>,
 }
 
-/// What the caller wrote, and the time it was written at: `None` for a
-/// value written past the wrapper, which carries no time and never expires.
-fn unstamp(stamped: &[u8]) -> (&[u8], Option<u64>) {
-    match decode_ttl_suffix(stamped) {
-        Some(decoded) => (&stamped[..decoded.value_len], Some(decoded.timestamp)),
-        None => (stamped, None),
+/// The writes `pieces`, kept apart in one bundle.
+pub(super) fn encode<'a>(pieces: impl IntoIterator<Item = Piece<'a>>) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut newest = 0u64;
+    for piece in pieces {
+        let flags = u8::from(piece.base) * FLAG_BASE + u8::from(piece.at.is_some()) * FLAG_TIMED;
+        out.push(flags);
+        // A write longer than 4 GiB cannot reach a merge: the key and
+        // value size limits bound every write far below that.
+        out.extend_from_slice(&(piece.value.len() as u32).to_be_bytes());
+        out.extend_from_slice(piece.value);
+        if let Some(at) = piece.at {
+            out.extend_from_slice(&at.to_be_bytes());
+            newest = newest.max(at);
+        }
     }
+    out.extend_from_slice(&TTL_MAGIC);
+    out.push(BUNDLE_VERSION);
+    out.extend_from_slice(&newest.to_be_bytes());
+    out
+}
+
+/// The writes `stored` holds when it is a bundle, or `None` when it is not
+/// one, or is not a whole one.
+pub(super) fn decode(stored: &[u8]) -> Option<Vec<Piece<'_>>> {
+    let body_len = stored.len().checked_sub(TTL_SUFFIX_LEN)?;
+    let (mut body, suffix) = stored.split_at(body_len);
+    if suffix[..TTL_MAGIC_LEN] != TTL_MAGIC || suffix[TTL_MAGIC_LEN] != BUNDLE_VERSION {
+        return None;
+    }
+    let mut pieces = Vec::new();
+    while let Some((&flags, rest)) = body.split_first() {
+        if flags & !(FLAG_BASE | FLAG_TIMED) != 0 {
+            return None;
+        }
+        let (len, rest) = rest.split_first_chunk::<4>()?;
+        let len = usize::try_from(u32::from_be_bytes(*len)).ok()?;
+        let (value, rest) = rest.split_at_checked(len)?;
+        let (at, rest) = if flags & FLAG_TIMED != 0 {
+            let (at, rest) = rest.split_first_chunk::<TTL_TS_LEN>()?;
+            (Some(u64::from_be_bytes(*at)), rest)
+        } else {
+            (None, rest)
+        };
+        pieces.push(Piece {
+            base: flags & FLAG_BASE != 0,
+            value,
+            at,
+        });
+        body = rest;
+    }
+    Some(pieces)
+}
+
+/// The writes a stored value or operand holds: a bundle's own, or the one
+/// write a plain value or operand is, a put the merges apply to when `base`.
+fn pieces_of(stored: &[u8], base: bool) -> Vec<Piece<'_>> {
+    if let Some(pieces) = decode(stored) {
+        return pieces;
+    }
+    let piece = match decode_ttl_suffix(stored) {
+        Some(decoded) => Piece {
+            base,
+            value: &stored[..decoded.value_len],
+            at: Some(decoded.timestamp),
+        },
+        None => Piece {
+            base,
+            value: stored,
+            at: None,
+        },
+    };
+    vec![piece]
+}
+
+/// What a read returns from the writes `live` of `key`, which have not
+/// expired: the put they apply to, folded with the merges after it by the
+/// caller's operator. `Ok(None)` when there is none.
+pub(super) fn fold(
+    operator: Option<&dyn MergeOperator>,
+    key: &[u8],
+    live: &[Piece<'_>],
+) -> crate::Result<Option<Vec<u8>>> {
+    let (base, operands) = match live.split_first() {
+        None => return Ok(None),
+        Some((first, rest)) if first.base => (Some(first.value), rest),
+        Some(_) => (None, live),
+    };
+    if operands.is_empty() {
+        return Ok(base.map(<[u8]>::to_vec));
+    }
+    let Some(operator) = operator else {
+        return Err(crate::Error::NoMergeOperator);
+    };
+    let operands: Vec<&[u8]> = operands.iter().map(|piece| piece.value).collect();
+    operator
+        .full_merge(key, base, &operands)
+        .map(Some)
+        .ok_or_else(|| crate::Error::MergeFailed(key.to_vec()))
+}
+
+/// The database's merge on a TTL database: it keeps the writes apart, so a
+/// read can fold the ones that have not expired.
+pub(super) struct TtlMergeOperator {
+    pub(super) callers: Arc<dyn MergeOperator>,
 }
 
 impl MergeOperator for TtlMergeOperator {
-    fn full_merge(&self, key: &[u8], base: Option<&[u8]>, operands: &[&[u8]]) -> Option<Vec<u8>> {
-        let (mut base, mut newest) = match base.map(unstamp) {
-            Some((value, at)) => (Some(value), at),
-            None => (None, None),
-        };
-        let mut kept: Vec<&[u8]> = Vec::with_capacity(operands.len());
-        for operand in operands {
-            let (value, at) = unstamp(operand);
-            if let (Some(before), Some(at)) = (newest, at)
-                && outlived(self.ttl_seconds, before, at)
-            {
-                // Everything written before this operand had expired when
-                // it was written: the value starts over here.
-                base = None;
-                kept.clear();
-            }
-            kept.push(value);
-            newest = newest.max(at);
-        }
-        let merged = self.callers.full_merge(key, base, &kept)?;
-        Some(match newest {
-            Some(at) => stamp(&merged, at),
-            // Nothing it folded carried a time: what the caller's operator
-            // returned is a value written past the wrapper.
-            None => merged,
-        })
+    fn full_merge(&self, _key: &[u8], base: Option<&[u8]>, operands: &[&[u8]]) -> Option<Vec<u8>> {
+        let base = base.map(|base| pieces_of(base, true)).unwrap_or_default();
+        let operands = operands
+            .iter()
+            .flat_map(|operand| pieces_of(operand, false));
+        Some(encode(base.into_iter().chain(operands)))
     }
 
-    /// Not folded while values expire (module docs): compaction keeps the
-    /// operands as they are, and the base's merge folds them.
-    fn partial_merge(&self, key: &[u8], left: &[u8], right: &[u8]) -> Option<Vec<u8>> {
-        if self.ttl_seconds > 0 {
-            return None;
-        }
-        let ((left, early), (right, late)) = (unstamp(left), unstamp(right));
-        let merged = self.callers.partial_merge(key, left, right)?;
-        Some(match early.max(late) {
-            Some(at) => stamp(&merged, at),
-            None => merged,
-        })
+    fn partial_merge(&self, _key: &[u8], left: &[u8], right: &[u8]) -> Option<Vec<u8>> {
+        Some(encode(
+            pieces_of(left, false)
+                .into_iter()
+                .chain(pieces_of(right, false)),
+        ))
     }
 
     fn touches(&self, key: &[u8], operand: &[u8], parts: &[u32]) -> bool {
-        self.callers.touches(key, unstamp(operand).0, parts)
+        pieces_of(operand, false)
+            .iter()
+            .any(|piece| self.callers.touches(key, piece.value, parts))
     }
 
     fn name(&self) -> &'static str {
@@ -91,30 +186,17 @@ impl MergeOperator for TtlMergeOperator {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
-
     use super::*;
+    use crate::ttl::stamp;
 
-    /// The base and the operands of one full merge.
-    type Fold = (Option<Vec<u8>>, Vec<Vec<u8>>);
-
-    /// Concatenates, and records the base and operands of each full merge.
-    #[derive(Default)]
-    struct Concat(Mutex<Vec<Fold>>);
+    /// Concatenates, base first.
+    struct Concat;
 
     impl MergeOperator for Concat {
         fn full_merge(&self, _: &[u8], base: Option<&[u8]>, operands: &[&[u8]]) -> Option<Vec<u8>> {
-            self.0.lock().unwrap().push((
-                base.map(<[u8]>::to_vec),
-                operands.iter().map(|o| o.to_vec()).collect(),
-            ));
             let mut out = base.map(<[u8]>::to_vec).unwrap_or_default();
             out.extend(operands.iter().flat_map(|o| o.iter().copied()));
             Some(out)
-        }
-
-        fn partial_merge(&self, _: &[u8], left: &[u8], right: &[u8]) -> Option<Vec<u8>> {
-            Some([left, right].concat())
         }
 
         fn name(&self) -> &'static str {
@@ -122,91 +204,87 @@ mod tests {
         }
     }
 
-    /// An operator around `Concat` with a TTL of `ttl` seconds.
-    fn operator(ttl: u64) -> (TtlMergeOperator, Arc<Concat>) {
-        let concat = Arc::new(Concat::default());
+    fn piece(base: bool, value: &[u8], at: Option<u64>) -> Piece<'_> {
+        Piece { base, value, at }
+    }
+
+    #[test]
+    fn a_bundle_round_trips_every_write_and_its_time() {
+        let pieces = [
+            piece(true, b"base", Some(7)),
+            piece(false, b"", Some(9)),
+            piece(false, b"raw", None),
+        ];
+        let bundle = encode(pieces);
+        assert_eq!(decode(&bundle).unwrap(), pieces);
+        // It is not a plain stamped value, and a plain one is not a bundle.
+        assert!(decode_ttl_suffix(&bundle).is_none());
+        assert!(decode(&stamp(b"v", 3)).is_none());
+        assert_eq!(decode(&encode([])).unwrap(), []);
+    }
+
+    #[test]
+    fn a_damaged_bundle_is_not_read_as_one() {
+        let bundle = encode([piece(false, b"op", Some(1))]);
+        let body = bundle.len() - TTL_SUFFIX_LEN;
+        // A byte of the body missing: the last write runs past it.
+        let mut short = bundle[..body - 1].to_vec();
+        short.extend_from_slice(&bundle[body..]);
+        assert!(decode(&short).is_none());
+        // A flag no write has.
+        let mut flagged = bundle.clone();
+        flagged[0] = 0x80;
+        assert!(decode(&flagged).is_none());
+        // A length past the body.
+        let mut long_length = bundle.clone();
+        long_length[1..5].copy_from_slice(&u32::MAX.to_be_bytes());
+        assert!(decode(&long_length).is_none());
+    }
+
+    #[test]
+    fn a_merge_keeps_every_write_apart_with_its_time() {
         let op = TtlMergeOperator {
-            callers: concat.clone(),
-            ttl_seconds: ttl,
+            callers: Arc::new(Concat),
         };
-        (op, concat)
-    }
-
-    fn last(concat: &Concat) -> Fold {
-        concat.0.lock().unwrap().last().cloned().unwrap()
-    }
-
-    #[test]
-    fn a_full_merge_folds_what_the_caller_wrote_and_keeps_the_newest_time() {
-        let (op, concat) = operator(100);
         let merged = op
-            .full_merge(
-                b"k",
-                Some(&stamp(b"a", 950)),
-                &[&stamp(b"b", 960), &stamp(b"c", 990)],
-            )
+            .full_merge(b"k", Some(&stamp(b"a", 1)), &[&stamp(b"b", 2), b"raw"])
             .unwrap();
-        assert_eq!(merged, stamp(b"abc", 990));
         assert_eq!(
-            last(&concat),
-            (Some(b"a".to_vec()), vec![b"b".to_vec(), b"c".to_vec()])
+            decode(&merged).unwrap(),
+            [
+                piece(true, b"a", Some(1)),
+                piece(false, b"b", Some(2)),
+                piece(false, b"raw", None)
+            ]
         );
-    }
-
-    /// Each write gives the value a new TTL: a chain of writes each within
-    /// the TTL of the one before is one value, however old its start.
-    #[test]
-    fn a_write_within_the_ttl_of_the_one_before_keeps_the_value() {
-        let (op, concat) = operator(100);
-        let merged = op
-            .full_merge(
-                b"k",
-                Some(&stamp(b"a", 0)),
-                &[&stamp(b"b", 90), &stamp(b"c", 180)],
-            )
+        // Folded again as a base, and two operands folded ahead of it.
+        let ops = op
+            .partial_merge(b"k", &stamp(b"c", 3), &stamp(b"d", 4))
             .unwrap();
-        assert_eq!(merged, stamp(b"abc", 180));
-        assert_eq!(last(&concat).0, Some(b"a".to_vec()));
-    }
-
-    /// A write after the value expired starts it over: what came before is
-    /// not folded, whatever the clock reads when the fold runs.
-    #[test]
-    fn a_write_after_the_value_expired_starts_it_over() {
-        let (op, concat) = operator(100);
-        let merged = op
-            .full_merge(
-                b"k",
-                Some(&stamp(b"old", 0)),
-                &[&stamp(b"x", 50), &stamp(b"new", 300)],
-            )
-            .unwrap();
-        assert_eq!(merged, stamp(b"new", 300));
-        assert_eq!(last(&concat), (None, vec![b"new".to_vec()]));
+        let again = op.full_merge(b"k", Some(&merged), &[&ops]).unwrap();
+        let values: Vec<&[u8]> = decode(&again).unwrap().iter().map(|p| p.value).collect();
+        assert_eq!(values, [&b"a"[..], b"b", b"raw", b"c", b"d"]);
     }
 
     #[test]
-    fn a_value_written_past_the_wrapper_is_folded_as_it_is() {
-        let (op, _) = operator(100);
-        assert_eq!(op.full_merge(b"k", Some(b"raw"), &[b"+"]).unwrap(), b"raw+");
+    fn a_fold_applies_the_live_merges_to_the_live_put() {
+        let concat = Concat;
+        let live = [piece(true, b"a", Some(1)), piece(false, b"b", Some(2))];
         assert_eq!(
-            op.full_merge(b"k", Some(b"raw"), &[&stamp(b"+", 990)])
-                .unwrap(),
-            stamp(b"raw+", 990)
+            fold(Some(&concat), b"k", &live).unwrap(),
+            Some(b"ab".to_vec())
         );
-    }
-
-    #[test]
-    fn operands_are_folded_ahead_of_their_base_only_when_nothing_expires() {
-        let (op, _) = operator(100);
+        // The put expired: the merges alone.
         assert_eq!(
-            op.partial_merge(b"k", &stamp(b"x", 1), &stamp(b"y", 2)),
-            None
+            fold(Some(&concat), b"k", &live[1..]).unwrap(),
+            Some(b"b".to_vec())
         );
-        let (op, _) = operator(0);
-        assert_eq!(
-            op.partial_merge(b"k", &stamp(b"x", 1), &stamp(b"y", 2)),
-            Some(stamp(b"xy", 2))
-        );
+        // Only the put: no operator is asked.
+        assert_eq!(fold(None, b"k", &live[..1]).unwrap(), Some(b"a".to_vec()));
+        assert_eq!(fold(None, b"k", &[]).unwrap(), None);
+        assert!(matches!(
+            fold(None, b"k", &live),
+            Err(crate::Error::NoMergeOperator)
+        ));
     }
 }

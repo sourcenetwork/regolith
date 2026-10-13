@@ -16,6 +16,11 @@
 //! in [`crate::Options::compaction_filter`] by [`DbWithTtl::open`]: as
 //! entries flow through compaction, any whose embedded timestamp is
 //! older than the TTL is dropped.
+//!
+//! A merged key is stored as the writes it holds, each with its time (the
+//! `merge` module), so that what a read returns never depends on which
+//! writes a compaction met: every write expires by its own time, and a
+//! write that has expired is one a read ignores and compaction may drop.
 
 mod merge;
 
@@ -23,7 +28,7 @@ use crate::env::Env;
 use std::path::Path;
 use std::sync::Arc;
 
-use crate::options::{CompactionDecision, CompactionFilter};
+use crate::options::{CompactionDecision, CompactionFilter, MergeOperator};
 use crate::{Db, DbSlice, Options, Result, WriteBatch, WriteBatchOp};
 
 /// Identifier stamped into a TTL-carrying value.
@@ -40,10 +45,31 @@ const TTL_SUFFIX_LEN: usize = TTL_MAGIC_LEN + 1 + TTL_TS_LEN;
 /// `ttl_seconds == 0` disables expiration entirely - the wrapper still
 /// appends the TTL suffix for format consistency, but the filter
 /// keeps every entry and reads never treat any value as expired.
+///
+/// # Merges
+///
+/// Each write expires by its own time: a put and each merge operand live
+/// `ttl_seconds` from when they were written, and a merge does not renew
+/// what was written before it. A read folds the writes of a key that have
+/// not expired, with the caller's [`crate::MergeOperator`]: the put if it
+/// has not expired, and the merges after it that have not. A counter whose
+/// put expired reads as the sum of the operands merged in the last
+/// `ttl_seconds`; once every write of a key has expired, the key reads as
+/// absent.
+///
+/// So that a read returns the same whatever compaction has done, the
+/// writes of a merged key are kept apart, each with its time, until they
+/// expire: the caller's operator folds them when the key is read
+/// ([`crate::MergeOperator::full_merge`]), and is never asked to fold two
+/// operands ahead of a read ([`crate::MergeOperator::partial_merge`]). A
+/// merged key costs the bytes of the writes it holds that have not expired.
 pub struct DbWithTtl {
     inner: Db,
     ttl_seconds: u64,
     env: Arc<dyn Env>,
+    /// The caller's operator, which folds a merged key's live writes on a
+    /// read.
+    merge_operator: Option<Arc<dyn MergeOperator>>,
 }
 
 impl std::fmt::Debug for DbWithTtl {
@@ -67,17 +93,14 @@ impl DbWithTtl {
     /// changes keeps the time it was written at. Its range deletes reach
     /// it unchanged.
     ///
-    /// A [`crate::MergeOperator`] the caller set is shown the base and the
-    /// operands the caller wrote, without their timestamps. A merge in
-    /// [`DbWithTtl::write`] is a write, stamped like a put: it gives the
-    /// value a new TTL, and what the operator returns expires with the
-    /// newest write it folded. What had already expired when a merge was
-    /// written is not folded into it: the merge starts the value over, as a
-    /// put would. Operands are not folded ahead of their base
-    /// ([`crate::MergeOperator::partial_merge`] is not asked). One limit:
-    /// a compaction that meets an expired value without the newer merge
-    /// that renewed it (the merge sits in a table the compaction does not
-    /// read) removes the value, and the merge then starts the value over.
+    /// A merged key is shown to it as a read would return it now (see
+    /// "Merges" on [`DbWithTtl`]); a value it changes then is stored as one
+    /// write, at the time of the newest write it folded.
+    ///
+    /// A [`crate::MergeOperator`] the caller set is shown the put and the
+    /// operands the caller wrote that have not expired, without their
+    /// timestamps, when a merged key is read. A merge in
+    /// [`DbWithTtl::write`] is a write, stamped like a put.
     pub fn open<P: AsRef<Path>>(path: P, mut opts: Options, ttl_seconds: u64) -> Result<Self> {
         // Every value carries a wall-clock stamp, so an environment
         // without a wall clock cannot serve this wrapper at all. Say
@@ -89,22 +112,24 @@ impl DbWithTtl {
                 "a TTL database needs a wall clock, and this Env has none",
             ));
         }
+        let merge_operator = opts.merge_operator.take();
         opts.compaction_filter = Some(Arc::new(TtlCompactionFilter {
             ttl_seconds,
             env: Arc::clone(&env),
             callers: opts.compaction_filter.take(),
+            merge_operator: merge_operator.clone(),
         }));
-        if let Some(callers) = opts.merge_operator.take() {
-            opts.merge_operator = Some(Arc::new(merge::TtlMergeOperator {
-                callers,
-                ttl_seconds,
-            }));
-        }
+        opts.merge_operator = merge_operator.as_ref().map(|callers| {
+            Arc::new(merge::TtlMergeOperator {
+                callers: Arc::clone(callers),
+            }) as Arc<dyn MergeOperator>
+        });
         let inner = Db::open(path, opts)?;
         Ok(Self {
             inner,
             ttl_seconds,
             env,
+            merge_operator,
         })
     }
 
@@ -133,7 +158,7 @@ impl DbWithTtl {
     /// trailing TTL suffix is always stripped from the returned value.
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         match self.inner.get(key)? {
-            Some(stamped) => self.filter_expired(stamped),
+            Some(stored) => self.read(key, stored, self.expiry_horizon()?),
             None => Ok(None),
         }
     }
@@ -143,11 +168,18 @@ impl DbWithTtl {
     /// The TTL suffix is dropped by narrowing the view, so the result
     /// still borrows the bytes the database already owns. Same absence
     /// semantics as [`DbWithTtl::get`]: an expired entry, and a value
-    /// with no decodable TTL suffix, both read as `Ok(None)`.
+    /// with no decodable TTL suffix, both read as `Ok(None)`. A merged
+    /// key's value is folded on the read, so it is a new buffer.
     pub fn get_slice(&self, key: &[u8]) -> Result<Option<DbSlice>> {
         let Some(stamped) = self.inner.get_slice(key)? else {
             return Ok(None);
         };
+        if merge::decode(stamped.as_slice()).is_some() {
+            let horizon = self.expiry_horizon()?;
+            return Ok(self
+                .read(key, stamped.as_slice().to_vec(), horizon)?
+                .map(DbSlice::from_vec));
+        }
         let Some(decoded) = decode_ttl_suffix(stamped.as_slice()) else {
             return Ok(None);
         };
@@ -181,8 +213,8 @@ impl DbWithTtl {
         let raw = self.inner.scan(start, end)?;
         let horizon = self.expiry_horizon()?;
         let mut out = Vec::with_capacity(raw.len());
-        for (k, stamped) in raw {
-            if let Some(v) = strip_if_live(stamped, horizon) {
+        for (k, stored) in raw {
+            if let Some(v) = self.read(&k, stored, horizon)? {
                 out.push((k, v));
             }
         }
@@ -255,8 +287,21 @@ impl DbWithTtl {
         Ok(self.now_seconds()?.saturating_sub(self.ttl_seconds))
     }
 
-    fn filter_expired(&self, stamped: Vec<u8>) -> Result<Option<Vec<u8>>> {
-        Ok(strip_if_live(stamped, self.expiry_horizon()?))
+    /// What a read of `key` returns from what the database stores for it,
+    /// with writes before `horizon` expired: a plain value without its
+    /// stamp, or a merged key's live writes folded by the caller's
+    /// operator. The one place every read decides.
+    fn read(&self, key: &[u8], stored: Vec<u8>, horizon: u64) -> Result<Option<Vec<u8>>> {
+        let Some(pieces) = merge::decode(&stored) else {
+            return Ok(strip_if_live(stored, horizon));
+        };
+        // A write without a time was made past the wrapper, and a read
+        // through it does not see it, as for a plain value.
+        let live: Vec<merge::Piece<'_>> = pieces
+            .into_iter()
+            .filter(|piece| piece.at.is_some_and(|at| horizon == 0 || at >= horizon))
+            .collect();
+        merge::fold(self.merge_operator.as_deref(), key, &live)
     }
 }
 
@@ -331,6 +376,9 @@ pub struct TtlCompactionFilter {
     /// The filter the caller set on a [`DbWithTtl`], asked about every
     /// value this one does not expire.
     callers: Option<Arc<dyn CompactionFilter>>,
+    /// The caller's merge operator, which folds a merged key's live writes
+    /// into what the caller's filter is shown.
+    merge_operator: Option<Arc<dyn MergeOperator>>,
 }
 
 impl TtlCompactionFilter {
@@ -352,31 +400,84 @@ impl TtlCompactionFilter {
             ttl_seconds,
             env,
             callers: None,
+            merge_operator: None,
+        }
+    }
+
+    /// A merged key's writes: those that expired are dropped, which a read
+    /// was ignoring already, and the caller's filter is shown what a read
+    /// returns now. A value it changes is stored as one write, at the time
+    /// of the newest write it folded.
+    fn filter_merged(
+        &self,
+        level: usize,
+        key: &[u8],
+        pieces: Vec<merge::Piece<'_>>,
+    ) -> CompactionDecision {
+        let held = pieces.len();
+        // A write without a time never expires.
+        let kept: Vec<merge::Piece<'_>> = pieces
+            .into_iter()
+            .filter(|piece| {
+                piece
+                    .at
+                    .is_none_or(|at| !expired(self.ttl_seconds, &*self.env, at))
+            })
+            .collect();
+        if kept.is_empty() {
+            return CompactionDecision::Remove;
+        }
+        let pruned = || {
+            if kept.len() == held {
+                CompactionDecision::Keep
+            } else {
+                CompactionDecision::Change(merge::encode(kept.iter().copied()))
+            }
+        };
+        let Some(callers) = &self.callers else {
+            return pruned();
+        };
+        // What a read returns: the writes with a time, folded.
+        let timed: Vec<merge::Piece<'_>> = kept
+            .iter()
+            .copied()
+            .filter(|piece| piece.at.is_some())
+            .collect();
+        let Ok(Some(value)) = merge::fold(self.merge_operator.as_deref(), key, &timed) else {
+            // Nothing a read returns, or a fold the operator declines: the
+            // caller's filter has no value to be shown.
+            return pruned();
+        };
+        match callers.filter(level, key, &value) {
+            CompactionDecision::Keep => pruned(),
+            CompactionDecision::Remove => CompactionDecision::Remove,
+            CompactionDecision::Change(changed) => {
+                let newest = timed.iter().filter_map(|piece| piece.at).max();
+                CompactionDecision::Change(stamp(&changed, newest.unwrap_or(0)))
+            }
         }
     }
 }
 
-/// Whether a value stamped `ts` has outlived `ttl_seconds` by `env`'s wall
-/// clock.
+/// Whether a write stamped `ts` has outlived `ttl_seconds` by `env`'s wall
+/// clock, as a read decides it ([`DbWithTtl::expiry_horizon`]). Never with
+/// a TTL of zero.
 fn expired(ttl_seconds: u64, env: &dyn Env, ts: u64) -> bool {
     // No wall clock means nothing can be shown to have expired,
     // so everything is kept. Dropping data on a guess is the one
-    // outcome this filter must never produce.
-    env.unix_secs()
-        .is_some_and(|now| outlived(ttl_seconds, ts, now))
-}
-
-/// Whether a value stamped `ts` had outlived `ttl_seconds` at `now`: the
-/// test compaction and a merge apply, as a read does. Never with a TTL of
-/// zero.
-fn outlived(ttl_seconds: u64, ts: u64, now: u64) -> bool {
-    // Saturating arithmetic so a clock skew into the past does
-    // not accidentally expire everything.
-    ttl_seconds > 0 && ts < now.saturating_sub(ttl_seconds)
+    // outcome this filter must never produce. Saturating arithmetic so a
+    // clock skew into the past does not accidentally expire everything.
+    ttl_seconds > 0
+        && env
+            .unix_secs()
+            .is_some_and(|now| ts < now.saturating_sub(ttl_seconds))
 }
 
 impl CompactionFilter for TtlCompactionFilter {
     fn filter(&self, level: usize, key: &[u8], value: &[u8]) -> CompactionDecision {
+        if let Some(pieces) = merge::decode(value) {
+            return self.filter_merged(level, key, pieces);
+        }
         let stamp = decode_ttl_suffix(value);
         if stamp
             .as_ref()
