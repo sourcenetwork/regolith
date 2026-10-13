@@ -398,17 +398,26 @@ impl Log {
         let wrote = self.file.write_all_at(place.offset, record);
         self.gate.leave(entry);
         wrote?;
-        // One record ends past each multiple, so each is noted and kicked
-        // once, or once per thread that wrote that record; a record that
-        // passes none costs two shifts and a compare.
+        self.passed(place.offset, place.end());
+        Ok(true)
+    }
+
+    /// After bytes `[offset, end)` were written: when they pass a multiple
+    /// of the early writeback's size, note the last multiple passed and kick
+    /// the lane ([`EarlyWriteback`]). Every write of records calls it, one
+    /// record or a batch of them ([`InFlight::write_at`]). One write ends
+    /// past each multiple, so each is noted and kicked once, or once per
+    /// thread that wrote those bytes; a write that passes none, and every
+    /// write of a log with no early writeback, costs a branch and at most
+    /// two shifts and a compare.
+    fn passed(&self, offset: u64, end: u64) {
         if let Some(early) = &self.early
-            && place.offset >> early.shift != place.end() >> early.shift
+            && offset >> early.shift != end >> early.shift
         {
             self.ahead
-                .fetch_max(place.end() >> early.shift << early.shift, Ordering::AcqRel);
+                .fetch_max(end >> early.shift << early.shift, Ordering::AcqRel);
             (early.kick)();
         }
-        Ok(true)
     }
 
     /// Count a write of records decided in `epoch` in at the gate, and take
@@ -649,7 +658,9 @@ impl InFlight<'_> {
     /// `offset`.
     pub(crate) fn write_at(&self, offset: u64, bytes: &[u8]) -> io::Result<()> {
         super::commit::hook::at(super::commit::hook::Stage::InWrite);
-        self.log.file.write_all_at(offset, bytes)
+        self.log.file.write_all_at(offset, bytes)?;
+        self.log.passed(offset, offset + bytes.len() as u64);
+        Ok(())
     }
 
     /// Count the write out, and let its claim go with it. The writers parked
