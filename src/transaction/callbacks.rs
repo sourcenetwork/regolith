@@ -22,7 +22,10 @@
 //!   outcome the transaction's callbacks run in registration order, then the
 //!   hook's.
 //! - Before the outcome a panic or an error undoes the callback's effects
-//!   (writes, savepoints and registrations) and fails the commit; a
+//!   (writes, appends, savepoints and registrations) and fails the commit,
+//!   a savepoint set before the callback that it rolled back to or released
+//!   included: the savepoint, and what the rollback took, are kept until
+//!   the outermost callback returns `Ok` and put back if it fails; a
 //!   `before_commit` callback that returned an error stays queued, in its
 //!   place, and runs again at the next `prepare`. After the
 //!   outcome a panic is caught and reported to
@@ -53,10 +56,11 @@ use super::exclusive::Exclusive;
 use super::in_place::{BeforeCommit, OnAbort, OnCommit};
 use super::queue::Queue;
 use super::{
-    CommitReceipt, Conflict, Error, IsolationLevel, Transaction, TransactionError, TxResult,
+    CommitReceipt, Conflict, Error, IsolationLevel, Savepoint, Transaction, TransactionError,
+    TxResult, Write,
 };
-use crate::engine::RegolithEngine;
 use crate::engine::callback::{InCommit, contain};
+use crate::engine::{PendingAppend, RegolithEngine};
 
 /// Why a transaction ended without committing, as its
 /// [`Transaction::on_abort`] callbacks and [`TransactionHooks::on_abort`] see
@@ -270,6 +274,26 @@ struct Queues {
     /// callback returns `Ok`, so a failed one takes them back without
     /// reaching into the list `close` may be taking from.
     on_abort: Queue<OnAbort>,
+    /// The savepoints running callbacks rolled back to or released, oldest
+    /// first, with what each rollback took. Emptied when the outermost
+    /// callback returns `Ok`; a failed one puts back what it and the
+    /// callbacks that ran inside it took (`Transaction::rewind`).
+    undo: Vec<Undo>,
+}
+
+/// A savepoint a running `before_commit` callback rolled back to or
+/// released, and what the rollback took off the buffers: what the callback
+/// failing puts back, so it takes back only its own effects.
+struct Undo {
+    savepoint: Savepoint,
+    /// Savepoints left on the stack below it.
+    depth: usize,
+    /// The buffers' lengths right after the rollback or release.
+    writes_len: usize,
+    appends_len: usize,
+    /// The entries the rollback took, newest first.
+    writes: Vec<(Vec<u8>, Write)>,
+    appends: Vec<((), PendingAppend)>,
 }
 
 /// The `before_commit` and `on_commit` callbacks one transaction registered,
@@ -332,6 +356,7 @@ struct Mark {
     before_commit: usize,
     on_commit: usize,
     on_abort: usize,
+    undo: usize,
 }
 
 impl Transaction {
@@ -361,7 +386,9 @@ impl Transaction {
     ///
     /// `f` may mutate what it captured. It runs again only when it returned an
     /// error: an error from `f` takes back the writes it made, the savepoints
-    /// it set and the callbacks it registered, and leaves `f` queued where it
+    /// it set and the callbacks it registered, puts back a savepoint set
+    /// before it that it rolled back to or released (with the writes and
+    /// appends that rollback took), and leaves `f` queued where it
     /// was, so the next [`Transaction::prepare`], or the commit, runs it
     /// again. `f` must therefore not assume it runs once; what it captured
     /// keeps what its failed run did to it. A commit that gets such an error
@@ -529,6 +556,7 @@ impl Transaction {
                 Prepare::Panicked(callback) => panicked(callback).into(),
                 _ => {
                     self.publish_on_abort();
+                    self.forget_undo();
                     return Ok(());
                 }
             },
@@ -562,12 +590,13 @@ impl Transaction {
     }
 
     fn mark(&mut self) -> Mark {
-        let (before_commit, on_commit, on_abort) =
-            self.callbacks.existing().map_or((0, 0, 0), |q| {
+        let (before_commit, on_commit, on_abort, undo) =
+            self.callbacks.existing().map_or((0, 0, 0, 0), |q| {
                 (
                     q.before_commit.mark(),
                     q.on_commit.mark(),
                     q.on_abort.mark(),
+                    q.undo.len(),
                 )
             });
         Mark {
@@ -577,10 +606,90 @@ impl Transaction {
             before_commit,
             on_commit,
             on_abort,
+            undo,
+        }
+    }
+
+    /// Take back the writes and appends made after `savepoint`, which the
+    /// caller just took off the stack. Inside a `before_commit` callback the
+    /// savepoint and what the rollback took are kept, for the callback failing
+    /// to put back; outside one they are dropped.
+    pub(super) fn roll_back_to(&mut self, savepoint: Savepoint) {
+        if self.callbacks.running == 0 {
+            self.writes.truncate(savepoint.writes);
+            self.truncate_appends(savepoint.appends);
+            return;
+        }
+        let mut writes = Vec::new();
+        self.writes
+            .truncate_into(savepoint.writes, |entry| writes.push(entry));
+        let mut appends = Vec::new();
+        if let Some(buffer) = self.appends.get_mut() {
+            buffer.truncate_into(savepoint.appends, |entry| appends.push(entry));
+        }
+        self.keep_undo(savepoint, writes, appends);
+    }
+
+    /// The caller just released `savepoint`: inside a `before_commit`
+    /// callback it is kept, for the callback failing to put back.
+    pub(super) fn released(&mut self, savepoint: Savepoint) {
+        if self.callbacks.running > 0 {
+            self.keep_undo(savepoint, Vec::new(), Vec::new());
+        }
+    }
+
+    fn keep_undo(
+        &mut self,
+        savepoint: Savepoint,
+        writes: Vec<(Vec<u8>, Write)>,
+        appends: Vec<((), PendingAppend)>,
+    ) {
+        let undo = Undo {
+            savepoint,
+            depth: self.savepoints.len(),
+            writes_len: self.writes.len(),
+            appends_len: self.appends_len(),
+            writes,
+            appends,
+        };
+        self.callbacks.queues().undo.push(undo);
+    }
+
+    /// Once the outermost callback returned `Ok`, what its rollbacks took
+    /// stays taken.
+    fn forget_undo(&mut self) {
+        if self.callbacks.running > 0 {
+            return;
+        }
+        if let Some(queues) = self.callbacks.existing() {
+            queues.undo.clear();
         }
     }
 
     fn rewind(&mut self, mark: Mark) {
+        // Newest first, each rollback or release is undone on the state it
+        // left: what was added since is dropped, then what it took goes back
+        // in the order it was made.
+        while let Some(undo) = self
+            .callbacks
+            .existing()
+            .filter(|queues| queues.undo.len() > mark.undo)
+            .and_then(|queues| queues.undo.pop())
+        {
+            self.writes.truncate(undo.writes_len);
+            for (key, write) in undo.writes.into_iter().rev() {
+                self.writes.insert(key, write);
+            }
+            self.truncate_appends(undo.appends_len);
+            if !undo.appends.is_empty() {
+                let buffer = self.appends_buffer();
+                for (unit, append) in undo.appends.into_iter().rev() {
+                    buffer.insert(unit, append);
+                }
+            }
+            self.savepoints.truncate(undo.depth);
+            self.savepoints.push(undo.savepoint);
+        }
         self.writes.truncate(mark.writes);
         self.truncate_appends(mark.appends);
         self.savepoints.truncate(mark.savepoints);

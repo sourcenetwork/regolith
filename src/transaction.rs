@@ -1720,11 +1720,15 @@ impl Transaction {
     /// neither rewind a later read of that key nor launder a write
     /// that landed around the lock manager in the meantime.
     ///
+    /// Inside a [`Transaction::before_commit`] callback the rollback is one
+    /// of the callback's effects: if the callback fails, the savepoint is set
+    /// again and the writes and appends the rollback took are put back, in
+    /// their order.
+    ///
     /// Returns [`TransactionError::NoSavepoint`] when no savepoint is set.
     pub fn rollback_to_savepoint(&mut self) -> TxResult<()> {
         let mark = self.savepoints.pop().ok_or(TransactionError::NoSavepoint)?;
-        self.writes.truncate(mark.writes);
-        self.truncate_appends(mark.appends);
+        self.roll_back_to(mark);
         Ok(())
     }
 
@@ -1732,12 +1736,15 @@ impl Transaction {
     /// since it stay, and an older savepoint, if one is set, becomes the
     /// current one. O(1).
     ///
+    /// Inside a [`Transaction::before_commit`] callback the release is one of
+    /// the callback's effects: if the callback fails, the savepoint is set
+    /// again where it was.
+    ///
     /// Returns [`TransactionError::NoSavepoint`] when no savepoint is set.
     pub fn release_savepoint(&mut self) -> TxResult<()> {
-        self.savepoints
-            .pop()
-            .map(drop)
-            .ok_or(TransactionError::NoSavepoint)
+        let mark = self.savepoints.pop().ok_or(TransactionError::NoSavepoint)?;
+        self.released(mark);
+        Ok(())
     }
 
     /// Commit the transaction. Every key in the validation set is

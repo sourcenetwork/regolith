@@ -493,6 +493,13 @@ where
     /// only when no reader can be walking the list, and a mutable borrow says
     /// so.
     pub(crate) fn truncate(&mut self, len: usize) {
+        self.truncate_into(len, drop);
+    }
+
+    /// [`Self::truncate`], handing each entry it takes off to `taken`, newest
+    /// first, instead of dropping it: what a rollback inside a transaction
+    /// callback keeps, so the callback failing can put it back.
+    pub(crate) fn truncate_into(&mut self, len: usize, mut taken: impl FnMut((K, V))) {
         let before = *self.len.get_mut();
         let mut remaining = before;
         let mut head = *self.head.get_mut();
@@ -510,6 +517,8 @@ where
             }
             head = node.next;
             remaining -= 1;
+            let Node { key, value, .. } = *node;
+            taken((key, value));
         }
         *self.head.get_mut() = head;
         *self.len.get_mut() = remaining;
