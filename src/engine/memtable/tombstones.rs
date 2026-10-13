@@ -143,6 +143,31 @@ unsafe impl Send for TombstoneLog {}
 // SAFETY: as above.
 unsafe impl Sync for TombstoneLog {}
 
+#[cfg(test)]
+thread_local! {
+    /// Test seam: runs once, on this thread, right after the next rebuild
+    /// has looked for the first position not ready. Thread-local so a
+    /// parallel test never fires another test's step.
+    static AFTER_READY_SCAN: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Run the step a test set for this instant, if any.
+#[cfg(test)]
+fn after_ready_scan() {
+    if let Some(step) = AFTER_READY_SCAN.with(|hook| hook.borrow_mut().take()) {
+        step();
+    }
+}
+
+/// Test-only: run `step` once, on this thread, right after the next
+/// rebuild of the index has looked for the first position not ready: the
+/// instant another append's claim lands past that bound.
+#[cfg(test)]
+fn after_next_ready_scan(step: impl FnOnce() + 'static) {
+    AFTER_READY_SCAN.with(|hook| *hook.borrow_mut() = Some(Box::new(step)));
+}
+
 impl TombstoneLog {
     /// An empty log. Allocates nothing until the first append.
     pub(crate) fn new() -> Self {
@@ -264,9 +289,22 @@ impl TombstoneLog {
         if self.holds(&tombstone) {
             return;
         }
-        let heap = tombstone.start.len() + tombstone.end.len() + size_of::<RangeTombstone>();
         // T1: the position is this append's alone.
         let position = self.claimed.fetch_add(1, Ordering::AcqRel);
+        // SAFETY: the add above handed `position` to this append alone.
+        unsafe { self.fill(position, tombstone) };
+    }
+
+    /// The rest of an append once it claimed `position`: write the slot,
+    /// then mark it ready (T2).
+    ///
+    /// # Safety
+    ///
+    /// `position` was handed to the caller by the add on `claimed`, and no
+    /// other call fills it (T1): the slot is the caller's alone.
+    #[inline]
+    unsafe fn fill(&self, position: usize, tombstone: RangeTombstone) {
+        let heap = tombstone.start.len() + tombstone.end.len() + size_of::<RangeTombstone>();
         let (segment, offset) = locate(position);
         let base = self.segment(segment);
         // SAFETY: `offset` is within the segment (see `slot`), and the slot
@@ -309,10 +347,15 @@ impl TombstoneLog {
             None => (0, Vec::new()),
         };
         // T4: the view covers ready positions only, so it stops at the
-        // first one that is not.
-        let published = (covered..self.len())
+        // first one that is not. The count is read once: a position claimed
+        // after the scan passed its bound is not ready, and a second read
+        // would let it into the view.
+        let len = self.len();
+        let published = (covered..len)
             .find(|position| self.get(*position).is_none())
-            .unwrap_or_else(|| self.len());
+            .unwrap_or(len);
+        #[cfg(test)]
+        after_ready_scan();
         if published - covered < REBUILD {
             return;
         }
