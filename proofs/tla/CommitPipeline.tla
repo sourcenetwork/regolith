@@ -89,15 +89,27 @@
 \*               decision whose epoch is not the tip's is stale: its slot is
 \*               failed instead.
 \*   Write, WriteFail
-\*               write_slot: a positional write of the record, behind the
-\*               log's epoch gate (Log::write_record). A failed write
-\*               poisons the log.
-\*   WriteStart, WriteLand
-\*               the same write in two steps, in the runs that set Copies:
-\*               counted in at the gate with the record looked at again
-\*               (Log::write_unless), then landed. A slow owner and a helper
-\*               past the courtesy both write one record, the same bytes;
-\*               the second to look finds it written and writes nothing.
+\*               the record reaches the log in one step, by whichever
+\*               thread may write it, behind the log's epoch gate: the rows
+\*               that leave Copies unset show the write no finer than that.
+\*               A failed write poisons the log.
+\*   Encode, Gather, RunStart, WriteLand, Release, Park, Timeout,
+\*   StealStart, WriteStart, LandFail
+\*               the write as the code makes it, in the rows that set
+\*               Copies (write_unit.rs, the write unit; the table at the
+\*               end of this header names the line of code for each).
+\*               Each owner encodes its own record (Encode). One thread at a
+\*               time holds the write unit: it gathers the run of filled
+\*               records that waits first (Gather), counts in at the gate
+\*               and looks at them again (RunStart), writes them with one
+\*               write that lands (WriteLand) or fails (LandFail), and lets
+\*               the unit go, waking the first thread still waiting for it
+\*               (Release). A thread whose record is in another's hands
+\*               parks on it (Park), and is woken by whoever writes, fills
+\*               or fails it; or its patience runs out (Timeout) and it
+\*               writes the record itself, as a copy, counted in at the
+\*               gate and looked at again first (StealStart). The round's
+\*               holder copies what it needs without waiting (WriteStart).
 \*               A sync waits for the writes in flight below what it
 \*               vouches for before it begins, and so does a unit before
 \*               it syncs, since a sector in flight when the power goes may
@@ -129,7 +141,12 @@
 \* its claim and its end such a thread also runs ordinary code, and a
 \* thread descheduled for good in that window holds up every commit that
 \* needs the round or stands behind the unit. The RED StopHoldsClaim shows
-\* exactly that. Everywhere else a thread may stop for good.
+\* exactly that. Nor does the model stop a thread whose write is in flight
+\* (counted in at the gate): those bytes are with the host, which finishes
+\* the write. Everywhere else a thread may stop for good, and that
+\* includes the holder of the write unit with a run gathered: the others'
+\* patience runs out and they write their records themselves
+\* (MC_CommitPipeline_Green_Copies_Stop).
 \*
 \* SMALL STEPS AND ONE-GO STEPS. Deciding an order is four steps in the
 \* code (install the verdict, apply, move the tip, pass the frontier) and
@@ -233,6 +250,103 @@
 \* the memtable before the next one is decided (AppliedBeforePassed), so the
 \* check reads the memtable itself.
 \*
+\* THE WRITE UNIT, LINE BY LINE. Every variable, step and promise of this
+\* model about the write unit, beside the Rust that does it, in plain words.
+\* (File and line of the tree the model was checked against; the files are
+\* under src/engine.)
+\*
+\*   filled[i]: order i's record is encoded and will not change again.
+\*       The FILLED flag, set by Descriptor::fill (descriptor.rs:579),
+\*       read by Descriptor::record (descriptor.rs:597).
+\*   writer: who holds the write unit. The CLAIMED bit of WriteUnit.word,
+\*       taken by try_claim (write_unit.rs:186) and
+\*       let go by release (write_unit.rs:206).
+\*   gathered[a]: the run the holder collected. The Run that try_batch's
+\*       scan fills (write_unit.rs:738), record by record
+\*       through Run::take (write_unit.rs:376).
+\*   fly[a]: a write counted in at the gate, its bytes on the way. InFlight
+\*       (wal_log.rs:626), made by Log::count_in (wal_log.rs:417)
+\*       and counted out when it drops (wal_log.rs:644).
+\*   asleep, sleepOn[a]: a thread parked on a record. The thread on the
+\*       descriptor's list with PARKED set: Descriptor::register
+\*       (descriptor.rs:644), then park (descriptor.rs:627).
+\*   late[a]: a parked thread whose patience ran out. out_of_patience
+\*       answered yes (write_unit.rs:594); copy_record comes next.
+\*   wanted: a parked thread asked to be woken at the next let go. The
+\*       WANTED bit, set by WriteUnit::note (write_unit.rs:213) from park_on,
+\*       read by the let go's swap.
+\*
+\*   Encode(a): the owner encodes its record. RegolithEngine::fill
+\*       (write_unit.rs:483), called by drive (pipeline.rs:885), drive_nowait
+\*       (pipeline.rs:857) and the allocations (allocate.rs:91).
+\*   Gather(a): claim the free unit and collect the first run. try_batch
+\*       (write_unit.rs:713): try_claim, then the scan from past the written
+\*       hint or the published frontier, whichever is further.
+\*   RunStart(a): count in, look again, keep what still waits.
+\*       log.count_in(run.epoch) (write_unit.rs:778), then the look again
+\*       (write_unit.rs:786), which is Kept.
+\*   WriteLand(a), a run: the run's one write lands. flight.write
+\*       (write_unit.rs:799) through InFlight::write (wal_log.rs:635),
+\*       LogFile::write_all_vectored_at and its pwritev (std_env.rs:405); then
+\*       the count out and the marks (write_unit.rs:806), whose wakes come
+\*       after the let go (write_unit.rs:846).
+\*   WriteLand(a), a copy: copy_record (write_unit.rs:657) through
+\*       Log::write_unless (wal_log.rs:391), then Descriptor::mark, which wakes
+\*       (descriptor.rs:552).
+\*   LandFail(a): a write fails. The error arms of try_batch
+\*       (write_unit.rs:832) and copy_record (write_unit.rs:703): the
+\*       log is poisoned and the parked are woken.
+\*   Release(a): let the unit go and tell. Claim's drop
+\*       (write_unit.rs:897): WriteUnit::release, then tell_waiters
+\*       (write_unit.rs:855), which wakes the first record that
+\*       waits_for_the_unit (write_unit.rs:428) and asks again for the next.
+\*   Park(a): sleep on a record in another's hands. park_on
+\*       (write_unit.rs:622): Descriptor::park, looking again whether the record is
+\*       written, and for a filled record noting the claim it saw as wanted,
+\*       for an unfilled one whether it is filled now.
+\*   Timeout(a): the park's time runs out. park_timeout in Descriptor::park
+\*       (descriptor.rs:633), and out_of_patience saying yes.
+\*   StealStart(a): the copy after the patience. copy_record, through
+\*       Log::write_unless: count in, look again (the `written` test), write.
+\*   WriteStart(a, i): the round's holder copies. sync_written
+\*       (round.rs:218) calls bring_written with Await::Copy
+\*       (round.rs:243).
+\*   Need(a): the record a thread needs next. drive's
+\*       bring_written of its own record (pipeline.rs:894), then publish_upto's
+\*       of the next to publish (pipeline.rs:797).
+\*   Usable, RunFrom, Firsts: which records a run takes. The `usable`
+\*       test of the scan (write_unit.rs:755) and Run::take's same log, same
+\*       epoch, offset that follows on.
+\*
+\*   OneClaim (WU1): try_claim's compare-and-swap; loom
+\*       one_thread_at_a_time_holds_the_unit (commit/loom_write_unit.rs).
+\*   NoWriteUnderSync (WG4, WU3): the gate's settle (wal_gate.rs:240)
+\*       against a write's enter (wal_gate.rs:142) and its look again; loom
+\*       a_run_never_lands_under_a_sync.
+\*   NoLiveThreadBlocked with Patience off (WU4, no lost wake): the mark
+\*       and the park's flag share one word; the note and the let go share
+\*       another. Loom a_parked_writer_is_woken_when_its_record_is_written and
+\*       a_writer_parked_for_the_next_claim_is_woken_when_the_unit_is_let_go.
+\*   EveryLiveCommitCompletes with a stopped holder (WU5): the patience.
+\*       Lean a_park_is_bounded and patience_bounds_the_wait
+\*       (Regolith/PipelineHelping.lean).
+\*
+\* RUST WITH NO STEP OF ITS OWN HERE, and why that loses nothing:
+\*   - the spin before a park (write_unit.rs:578): a wait that ends by
+\*     itself changes nothing;
+\*   - the written hint WriteUnit.written (write_unit.rs:146): it only skips
+\*     records that are written, which the model's scan passes over too;
+\*   - the run's caps MAX_BATCH_RECORDS and MAX_BATCH_BYTES
+\*     (write_unit.rs:118): a run that stops early is a run whose next
+\*     record is not usable, which the model has;
+\*   - the logical ends of a park (FRONTIER_PATIENCE, the ring full): more
+\*     ways for Timeout to happen, which may happen at any time anyway;
+\*   - the line job of a commit_nowait commit (queue_on
+\*     write_unit.rs:244, tell_line write_unit.rs:262): commit_nowait is
+\*     not in this model (see WHAT THE MODEL LEAVES OUT); its handshake is
+\*     the loom model a_queued_commit_is_told_when_the_unit_is_let_go.
+\* MODEL WITH NO RUST: none. Every step and variable above is code.
+\*
 \* THE MODEL IS IN THREE MODULES, each small enough to read in one go:
 \*   CommitPipelineBase.tla   what a configuration chooses, the state, and
 \*                            the small questions the steps ask;
@@ -272,8 +386,23 @@ TypeOK ==
   /\ pc \in [Actors -> {"idle", "open", "begun", "claimed", "ready", "done", "failed", "aborted"}]
   \* The stopped are threads.
   /\ stopped \subseteq Actors
-  \* A write in flight is of an order, or there is none.
-  /\ fly \in [Actors -> 0..MaxSlots]
+  \* The writes in flight are sets of orders: one for a copy, several for
+  \* a run.
+  /\ fly \in [Actors -> SUBSET Slots]
+  \* A record is filled or not.
+  /\ filled \in [Slots -> BOOLEAN]
+  \* The write unit is a thread's, or nobody's.
+  /\ writer \in Actors \cup {0}
+  \* A gathered run is a set of orders.
+  /\ gathered \in [Actors -> SUBSET Slots]
+  \* The parked are threads...
+  /\ asleep \subseteq Actors
+  \* ...each on a record, or 0.
+  /\ sleepOn \in [Actors -> 0..MaxSlots]
+  \* A thread out of patience names the record it will write, or 0.
+  /\ late \in [Actors -> 0..MaxSlots]
+  \* The request to be woken at the next claim is yes or no.
+  /\ wanted \in BOOLEAN
   \* A cell is free exactly when its ticket has not been handed out.
   /\ \A i \in Slots : (i <= tail) <=> cell[i] # "free"
 
@@ -456,15 +585,29 @@ NoLiveThreadBlocked ==
 \* its own, claims the round and syncs both; the owner's copy lands after
 \* the sync began, over bytes it vouched for. Fails under SyncNoWait.
 \* Checked by TLC on the rows that set Copies, and on the code by the loom
-\* models in src/engine/loom_model/park.rs and the tests under the fault
-\* shim in src/engine/commit/late_copy_tests.rs; it has no Lean statement.
+\* models in src/engine/loom_model/park.rs and
+\* src/engine/commit/loom_write_unit.rs (a run, which looks again once
+\* counted in) and the tests under the fault shim in
+\* src/engine/commit/late_copy_tests.rs; it has no Lean statement.
 NoWriteUnderSync ==
-  \* Every write in flight...
-  \A b \in Actors : fly[b] # 0 =>
-     \* ...is of a record no completed sync made durable...
-     /\ sq[fly[b]] > durable
+  \* Every record of every write in flight, a copy or a run...
+  \A b \in Actors : \A j \in fly[b] :
+     \* ...is one no completed sync made durable...
+     /\ sq[j] > durable
      \* ...and no sync under way vouches for.
-     /\ \A a \in round : target[a] = 0 \/ sq[fly[b]] > target[a]
+     /\ \A a \in round : target[a] = 0 \/ sq[j] > target[a]
+
+\* WU1: one holder of the write unit. Only the holder has a run gathered,
+\* and only it has more than one record in flight; every other thread
+\* writes one record at a time, as a copy. Rules out: two threads each
+\* gathered a run and both write it, which is the contention on the file's
+\* lock the unit exists to end, and with a record in both runs, two copies
+\* of it in flight that nobody counted on.
+OneClaim ==
+  \* A gathered run is the holder's.
+  /\ \A a \in Actors : gathered[a] # {} => writer = a
+  \* So is a write of more than one record.
+  /\ \A a \in Actors : Cardinality(fly[a]) > 1 => writer = a
 
 \* The run's ticket bound never stops a live thread, so nothing above is an
 \* artefact of the bound.
@@ -500,8 +643,25 @@ NeverRotated == gen = 0
 NoEarlyAbort == \A a \in Actors : pc[a] # "aborted"
 
 \* "No two threads ever have one record's write in flight." Broken once a
-\* helper's copy is on its way beside the owner's.
-NoTwoCopies == \A a, b \in Actors : a # b /\ fly[a] # 0 => fly[a] # fly[b]
+\* thread out of patience has its copy on its way beside the holder's run.
+NoTwoCopies == \A a, b \in Actors : a # b => fly[a] \cap fly[b] = {}
+
+\* "No run ever holds two records." Broken once the write unit's holder
+\* writes two records with one write.
+NoRunOfTwo == \A a \in Actors : Cardinality(fly[a]) <= 1
+
+\* "No thread ever parks on a record." Broken once a writer sleeps until
+\* the unit's holder writes its record or lets the unit go.
+NeverAsleep == asleep = {}
+
+\* "No thread ever runs out of patience." Broken once a parked writer
+\* gives up on the holder and writes its record itself.
+NeverStolen == \A a \in Actors : late[a] = 0
+
+\* "The write unit is never held by a thread that walked away." Broken once
+\* the holder stops for good with the unit claimed, the case the patience
+\* exists for.
+HolderNeverStops == writer \notin stopped
 
 ----------------------------------------------------------------------------
 \* Liveness: what eventually happens.

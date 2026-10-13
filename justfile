@@ -813,12 +813,27 @@ tla:
     check MC_CommitPipeline_Red_DecideAnyOrder_Order        RED SeqInRingOrder
     check MC_CommitPipeline_Red_WorkBeyond                  RED WorksUpToItsOwn
     check MC_CommitPipeline_Red_StopHoldsClaim              RED NoLiveThreadBlocked
-    # WG4: a record's late copy, the same bytes a slow owner still had in
-    # flight, never lands under a sync that covers it. Rust:
-    # src/engine/commit/late_copy_tests.rs, under the fault shim.
+    # The write unit (E45, L58; src/engine/commit/write_unit.rs): each owner
+    # encodes its own record, one thread at a time writes the run of filled
+    # records with one write, the others park on their record and are woken,
+    # or run out of patience and write it themselves as a copy (WG4: a late
+    # copy or run never lands under a sync that covers it). Rust:
+    # src/engine/commit/late_copy_tests.rs and write_unit_tests.rs, the loom
+    # models in src/engine/commit/loom_model.rs (write_unit_*). Lean:
+    # Regolith/PipelineHelping.lean, a_park_is_bounded, run_step_counts.
     check MC_CommitPipeline_Green_Copies                    GREEN
     check MC_CommitPipeline_Green_Copies_InFlight           RED NoTwoCopies
+    check MC_CommitPipeline_Green_Copies_Runs               RED NoRunOfTwo
+    check MC_CommitPipeline_Green_Copies_Parks              RED NeverAsleep
+    check MC_CommitPipeline_Green_Copies_Steals             RED NeverStolen
+    check MC_CommitPipeline_Green_Copies_Woken              GREEN
+    check MC_CommitPipeline_Green_Copies_Stop               GREEN
+    check MC_CommitPipeline_Green_Copies_Stop_Holder        RED HolderNeverStops
+    check MC_CommitPipeline_Green_Copies_Rollback           GREEN
     check MC_CommitPipeline_Red_SyncNoWait                  RED NoWriteUnderSync
+    check MC_CommitPipeline_Red_StealNoRecheck              RED NoWriteUnderSync
+    check MC_CommitPipeline_Red_GatherBeforeCountIn         RED NoWriteUnderSync
+    check MC_CommitPipeline_Red_LostWake                    RED NoLiveThreadBlocked
     # Decision 3 of plan 4.7: a queue's poll never waits for another thread.
     # A job that cannot get the round, the version store's step, the flush
     # exclusion or a failed log clear of writes parks: it leaves a note, looks
