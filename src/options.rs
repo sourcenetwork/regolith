@@ -609,23 +609,25 @@ impl PrefixExtractor for FixedLengthPrefix {
 }
 
 /// The name of [`FixedLengthPrefix`] of `width`, made once per width and
-/// kept for the life of the process, so asking for it again takes no lock
-/// for a width up to 64.
+/// kept for the life of the process. Asking for it takes no lock: a width up
+/// to 64 has a cell of its own, and a wider one is kept in a lock-free map.
 fn fixed_length_name(width: usize) -> &'static str {
-    use std::collections::BTreeMap;
-    use std::sync::{Mutex, OnceLock, PoisonError};
+    use std::sync::OnceLock;
+
+    use kovan_map::HopscotchMap;
 
     static SMALL: [OnceLock<&'static str>; 65] = [const { OnceLock::new() }; 65];
-    static LARGE: Mutex<BTreeMap<usize, &'static str>> = Mutex::new(BTreeMap::new());
+    static LARGE: OnceLock<HopscotchMap<usize, &'static str>> = OnceLock::new();
     let make = || &*Box::leak(format!("FixedLengthPrefix({width})").into_boxed_str());
-    match SMALL.get(width) {
-        Some(name) => name.get_or_init(make),
-        None => LARGE
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .entry(width)
-            .or_insert_with(make),
+    if let Some(name) = SMALL.get(width) {
+        return name.get_or_init(make);
     }
+    let large = LARGE.get_or_init(HopscotchMap::new);
+    // Threads that miss the same width at once each make a name and the map
+    // keeps one: the others stay allocated, one per racing thread at most.
+    large
+        .get(&width)
+        .unwrap_or_else(|| large.get_or_insert(width, make()))
 }
 
 /// Compaction strategy used by the background compaction thread.
