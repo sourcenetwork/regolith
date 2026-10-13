@@ -78,6 +78,8 @@ mod families;
 pub(crate) mod hook;
 #[cfg(loom)]
 pub mod loom_model;
+#[cfg(loom)]
+pub mod loom_write_unit;
 mod ordered;
 mod park;
 mod pipeline;
@@ -95,6 +97,7 @@ mod terminator;
 mod turn;
 mod txn;
 mod write_check;
+mod write_unit;
 
 use super::wal::MAX_RECORD_LEN;
 pub(crate) use append::PendingAppend;
@@ -169,8 +172,9 @@ enum Requested {
 pub(crate) enum NowaitCommit {
     /// The outcome: decided, published or failed.
     Done(CommitOutcome),
-    /// Decided and written, not yet published: it waits for a sync, or for
-    /// a unit ahead of it. The outcome is in the commit once it is told.
+    /// Decided, not yet published: it waits for a sync, for a unit ahead of
+    /// it, or for the write unit another thread holds to let go before its
+    /// record is written. The outcome is in the commit once it is told.
     Pending(PendingCommit),
 }
 
@@ -635,6 +639,9 @@ mod written_tests;
 
 #[cfg(test)]
 mod pipeline_tests;
+
+#[cfg(test)]
+mod write_unit_tests;
 
 #[cfg(test)]
 mod allocate_tests;

@@ -160,6 +160,7 @@ pub mod loom_exports {
     //! them. It does not exist in an ordinary build.
 
     pub use crate::engine::commit::loom_model as pipeline;
+    pub use crate::engine::commit::loom_write_unit as write_unit;
     pub use crate::engine::loom_model::{
         arena, families, gate, handoff, io_queue, jobs, park, skiplist, slice, snapshots, step,
         tombstones, version,

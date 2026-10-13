@@ -22,6 +22,18 @@
 //!   (the batch a transaction's appends were numbered into, the record's
 //!   place) and names the memtable and the log through its [`After`], so a
 //!   stage never reads state that a later slot may have changed.
+//! - **D4, a record is encoded once, by one thread, before it is shared.**
+//!   The thread that claims [`FILLING`] encodes the slot's record into the
+//!   descriptor's own buffer and then sets [`FILLED`]; nobody reads the
+//!   buffer before that flag, and nobody writes it after. So the thread that
+//!   writes a run of records (`write_unit.rs`) reads finished bytes and
+//!   encodes none of them.
+//! - **D5, a thread parked on a slot is woken.** It goes on the slot's list
+//!   and sets [`PARKED`] in the flag word, then looks again at what it waits
+//!   for; whoever sets [`FILLED`], [`WRITTEN`] or [`FAILED`] reads
+//!   [`PARKED`] in the same read-modify-write and wakes the list. Two
+//!   read-modify-writes of one word are ordered, so one of the two sees the
+//!   other.
 
 #![allow(unsafe_code)]
 
@@ -29,6 +41,13 @@ use std::io;
 use std::ops::Range;
 use std::ptr;
 use std::sync::Arc;
+
+// A thread that parks on a slot is unparked through loom in a loom build,
+// so the models see whether a wake can be lost.
+#[cfg(loom)]
+use loom::thread::{self, Thread};
+#[cfg(not(loom))]
+use std::thread::{self, Thread};
 
 use super::super::DurabilityMode;
 use super::super::io::job::{Delivery, Job};
@@ -39,7 +58,7 @@ use super::super::wal_log::{Log, Place};
 use super::WriteRequest;
 use super::ring::Linked;
 use crate::perf_context::PerfContextSnapshot;
-use crate::sync::internal::{Arc as RingArc, AtomicPtr, AtomicU64, Ordering, take_ptr};
+use crate::sync::internal::{Arc as RingArc, AtomicPtr, AtomicU64, Ordering, UnsafeCell, take_ptr};
 use crate::{Conflict, QueueId, WriteBatchOp};
 
 /// An `Arc<T>` (the ring's kind, which a loom build swaps) set at most once and then read by any thread for as long as
@@ -316,8 +335,9 @@ pub(super) const FAILED: u64 = 1 << 2;
 /// that claims it claims [`APPLYING`] in the same instruction, since it goes
 /// on to apply what it decided.
 pub(super) const DECIDING: u64 = 1 << 3;
-/// A thread is writing the slot's record. A hint, as [`DECIDING`].
-pub(super) const WRITING: u64 = 1 << 4;
+/// The slot's record is encoded in the descriptor's buffer, and the buffer
+/// does not change again (D4).
+pub(super) const FILLED: u64 = 1 << 4;
 /// A thread is applying the slot's operations. A hint, as [`DECIDING`].
 pub(super) const APPLYING: u64 = 1 << 5;
 /// The descriptor is in the ring: its index is the slot it holds. Set by
@@ -331,6 +351,26 @@ pub(super) const ADMITTED: u64 = 1 << 7;
 /// An `allocate_nowait` caller gave its reservation up before the slot was
 /// decided: whoever decides it refuses it. Set by its owner.
 pub(super) const ABANDONED: u64 = 1 << 8;
+/// A thread claimed the encoding of the slot's record (D4).
+pub(super) const FILLING: u64 = 1 << 9;
+/// A thread parked on the slot ([`Descriptor::park`]): whoever sets
+/// [`FILLED`], [`WRITTEN`] or [`FAILED`] wakes the slot's list (D5). Never
+/// cleared: a wake that finds nobody left costs one swap of an empty list.
+pub(super) const PARKED: u64 = 1 << 10;
+/// The flags whose setting wakes the threads parked on the slot.
+const WAKES: u64 = FILLED | WRITTEN | FAILED;
+
+/// A slot's record buffer, handed from thread to thread by D4: written by
+/// the one thread that claimed `FILLING`, before `FILLED`, and only read
+/// after.
+struct Record(UnsafeCell<Vec<u8>>);
+
+// SAFETY: a `Vec<u8>` may move between threads.
+unsafe impl Send for Record {}
+// SAFETY (D4): one writer, which claimed `FILLING` with a read-modify-write,
+// and readers only after the release of `FILLED`, which they acquire; with
+// `&mut`, nobody else.
+unsafe impl Sync for Record {}
 
 /// One slot's descriptor. See the module docs.
 pub(crate) struct Descriptor {
@@ -358,6 +398,13 @@ pub(crate) struct Descriptor {
     /// Who is told, on the landing thread, when the slot lands: a
     /// pessimistic commit's key locks, released then. Closed with [`SHUT`].
     landing: Stack<Arc<dyn Delivery>>,
+    /// The slot's record, framed and ready to write, once [`FILLED`] is
+    /// set (D4). Its allocation is kept between commits with the
+    /// descriptor's (`spare.rs`).
+    record: Record,
+    /// Threads parked on the slot (D5). Never closed: a parked thread looks
+    /// again at what it waits for after it is on the list.
+    sleepers: Stack<Thread>,
     /// See [`Self::is_blocking`].
     blocking: bool,
 }
@@ -365,6 +412,12 @@ pub(crate) struct Descriptor {
 impl Descriptor {
     /// A descriptor for `work`. `blocking`: see [`Self::is_blocking`].
     pub(super) fn new(work: Work, blocking: bool) -> Self {
+        Self::with_record(work, blocking, Vec::new())
+    }
+
+    /// [`Self::new`], encoding its record into `record`'s allocation: one a
+    /// thread kept from a descriptor it is done with (`spare.rs`).
+    pub(super) fn with_record(work: Work, blocking: bool, record: Vec<u8>) -> Self {
         Self {
             index: AtomicU64::new(0),
             work,
@@ -376,6 +429,8 @@ impl Descriptor {
             failure: Take::empty(),
             body: Take::empty(),
             landing: Stack::new(),
+            record: Record(UnsafeCell::new(record)),
+            sleepers: Stack::new(),
             blocking,
         }
     }
@@ -492,8 +547,119 @@ impl Descriptor {
     }
 
     /// Set the flags of `mask` (D2). `true` when this call set one of them.
+    /// Setting [`FILLED`], [`WRITTEN`] or [`FAILED`] wakes every thread
+    /// parked on the slot (D5).
     pub(super) fn mark(&self, mask: u64) -> bool {
-        self.flags.fetch_or(mask, Ordering::AcqRel) & mask != mask
+        let before = self.flags.fetch_or(mask, Ordering::AcqRel);
+        if mask & WAKES != 0 && before & PARKED != 0 {
+            self.wake();
+        }
+        before & mask != mask
+    }
+
+    /// [`Self::mark`] that leaves the wake to the caller: `(set, parked)`,
+    /// whether this call set one of the flags and whether a thread is
+    /// parked on the slot, which the caller then wakes with
+    /// [`Self::wake`]. For the writer of a run of records, which lets the
+    /// write unit go before it wakes anybody (`write_unit.rs`).
+    pub(super) fn mark_quiet(&self, mask: u64) -> (bool, bool) {
+        let before = self.flags.fetch_or(mask, Ordering::AcqRel);
+        (before & mask != mask, before & PARKED != 0)
+    }
+
+    /// Every flag, as one load.
+    pub(super) fn flags(&self) -> u64 {
+        self.flags.load(Ordering::Acquire)
+    }
+
+    /// Encode the slot's record into the descriptor's buffer with `encode`
+    /// and set [`FILLED`], unless another call claimed that already. `Ok`
+    /// says whether this call filled it; an `Err` from `encode` leaves the
+    /// slot unfilled for good, and the caller fails the log.
+    pub(super) fn fill(
+        &self,
+        encode: impl FnOnce(&mut Vec<u8>) -> io::Result<()>,
+    ) -> io::Result<bool> {
+        if self.flags.fetch_or(FILLING, Ordering::AcqRel) & FILLING != 0 {
+            return Ok(false);
+        }
+        // SAFETY (D4): the claim of `FILLING` above gave this call the
+        // buffer, and nobody reads it before `FILLED` is set below.
+        self.record
+            .0
+            .with_mut(|record| encode(unsafe { &mut *record }))?;
+        self.mark(FILLED);
+        Ok(true)
+    }
+
+    /// The slot's record, once [`FILLED`] is set: the bytes to write at its
+    /// place.
+    pub(super) fn record(&self) -> Option<&[u8]> {
+        if !self.is(FILLED) {
+            return None;
+        }
+        // SAFETY (D4): `FILLED` was set after the buffer's last write, and
+        // the acquire load above saw it; nothing writes the buffer again
+        // while the descriptor is shared, and the borrow does not outlive
+        // `self`.
+        Some(self.record.0.with(|record| unsafe { (*record).as_slice() }))
+    }
+
+    /// Take the record's buffer out, for the descriptor's next use: with
+    /// `&mut`, nobody else can reach it. A loom build keeps no buffer
+    /// (`spare.rs`).
+    #[cfg(not(loom))]
+    pub(super) fn take_record(&mut self) -> Vec<u8> {
+        self.record.0.with_mut(|record| {
+            // SAFETY: `&mut self` is the only access to the descriptor.
+            std::mem::take(unsafe { &mut *record })
+        })
+    }
+
+    /// Park this thread on the slot until it is woken or `patience` ran
+    /// out, unless `ready` holds once the thread is on the slot's list with
+    /// [`PARKED`] set: `false` then, and the thread did not park (D5).
+    /// Whoever makes `ready` hold sets a flag of this word and reads
+    /// [`PARKED`] in the same instruction, or reads a word the caller wrote
+    /// after this returns, so one of the two sees the other. A loom build
+    /// parks until it is woken, with no time to fall back on: the model
+    /// then shows the wake comes.
+    pub(super) fn park(&self, patience: std::time::Duration, ready: impl FnOnce() -> bool) -> bool {
+        if !self.register(ready) {
+            return false;
+        }
+        super::super::io::scope::waits("a slot's record, under way on another thread");
+        #[cfg(not(loom))]
+        thread::park_timeout(patience);
+        #[cfg(loom)]
+        {
+            let _ = patience;
+            thread::park();
+        }
+        true
+    }
+
+    /// The first half of [`Self::park`]: put this thread on the slot's list,
+    /// set [`PARKED`], and look again. `true` when it should sleep now.
+    pub(super) fn register(&self, ready: impl FnOnce() -> bool) -> bool {
+        // A list that is never closed takes every push.
+        let _ = self.sleepers.push(thread::current(), 0);
+        self.flags.fetch_or(PARKED, Ordering::SeqCst);
+        !ready()
+    }
+
+    /// Loom-only: whether a thread is still on the slot's list, unwoken.
+    #[cfg(loom)]
+    pub(super) fn has_sleepers(&self) -> bool {
+        !self.sleepers.is_empty()
+    }
+
+    /// Wake every thread parked on the slot. Each looks again at what it
+    /// waits for, and parks again if it still waits.
+    pub(super) fn wake(&self) {
+        for sleeper in self.sleepers.take_open() {
+            sleeper.unpark();
+        }
     }
 
     /// Set the flags of `mask` and return every flag as it was before: one

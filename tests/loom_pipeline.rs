@@ -40,6 +40,13 @@
 //!   the wake of a parked job had off the list when the job landed is told
 //!   once.
 //!
+//! - **The write unit** (E45, L58): one thread at a time holds the unit; a
+//!   writer parked on its record is woken when the holder's run writes it,
+//!   and when the holder lets the unit go with the record still waiting; a
+//!   run looks at its record again once counted in at the gate, so it never
+//!   lands under a sync; and a `commit_nowait` commit left on its queue is
+//!   told when the unit is let go.
+//!
 //! Every model is bounded by a small scenario (a ring of two cells, two
 //! threads or two and a reader) and an explicit preemption bound given in
 //! the model's own code, never by a time limit. Each is paired with a
@@ -49,7 +56,7 @@
 
 #![cfg(loom)]
 
-use regolith::loom_exports::{park, pipeline, step};
+use regolith::loom_exports::{park, pipeline, step, write_unit};
 
 #[test]
 fn an_index_is_installed_or_voided_never_both() {
@@ -244,4 +251,53 @@ fn a_wake_that_comes_before_the_park_tells_the_queues_with_the_job_free() {
 #[should_panic(expected = "a queue was told the job may go on while it was still claimed")]
 fn a_wake_that_tells_at_once_reaches_a_queue_with_the_job_claimed() {
     park::a_wake_that_tells_at_once_reaches_a_queue_with_the_job_claimed();
+}
+
+#[test]
+fn a_parked_writer_is_woken_when_its_record_is_written() {
+    write_unit::a_parked_writer_is_woken_when_its_record_is_written();
+}
+
+#[test]
+fn a_writer_parked_for_the_next_claim_is_woken_when_the_unit_is_let_go() {
+    write_unit::a_writer_parked_for_the_next_claim_is_woken_when_the_unit_is_let_go();
+}
+
+#[test]
+#[should_panic(expected = "a writer parked for the next claim was never woken")]
+fn a_holder_that_tells_nobody_leaves_a_writer_asleep() {
+    write_unit::calibration_a_holder_that_tells_nobody_leaves_a_writer_asleep();
+}
+
+#[test]
+fn a_run_never_lands_under_a_sync() {
+    write_unit::a_run_never_lands_under_a_sync();
+}
+
+#[test]
+#[should_panic(expected = "a run landed under the sync")]
+fn a_run_that_does_not_look_again_lands_under_the_sync() {
+    write_unit::calibration_a_run_that_does_not_look_again_lands_under_the_sync();
+}
+
+#[test]
+fn one_thread_at_a_time_holds_the_unit() {
+    write_unit::one_thread_at_a_time_holds_the_unit();
+}
+
+#[test]
+#[should_panic]
+fn a_claim_that_is_a_load_and_a_store_writes_two_runs_at_once() {
+    write_unit::calibration_a_claim_that_is_a_load_and_a_store_writes_two_runs_at_once();
+}
+
+#[test]
+fn a_queued_commit_is_told_when_the_unit_is_let_go() {
+    write_unit::a_queued_commit_is_told_when_the_unit_is_let_go();
+}
+
+#[test]
+#[should_panic(expected = "a commit left on its queue waits on a job nobody releases")]
+fn a_commit_that_notes_before_it_loads_waits_on_a_job_nobody_releases() {
+    write_unit::calibration_a_commit_that_notes_before_it_loads_waits_on_a_job_nobody_releases();
 }
