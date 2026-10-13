@@ -1051,6 +1051,7 @@ tla:
     check MC_SyncNotify_Red_CancelNoPassOn             RED CancelPassesOn
     check MC_SyncNotify_Red_NoRecheck                  RED NoLostWakeup
     check MC_SyncNotify_Red_NoGenCheck                 RED NoLostWakeup
+    check MC_SyncNotify_Red_FrontGenCheck              RED NoLostWakeup
     # regolith::sync::RwLock and ReentrantRwLock after D49, with D50's
     # upgradable read, one step of src/sync/raw_rwlock.rs at a time on the
     # queue of Sync.tla. Lean: Regolith/Sync.lean for the exclusive side.

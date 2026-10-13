@@ -625,6 +625,43 @@ fn notify_waiters_reaches_a_registered_waiter() {
     });
 }
 
+/// A `Notified` created before a `notify_waiters` passes its generation
+/// check and is held up before it queues; the broadcast runs, and a newer
+/// waiter queues ahead of it. The older one is still owed the broadcast
+/// wherever it lands in the queue: a pass that only looks at the front
+/// stops at the newer waiter and leaves the older one parked for good,
+/// which loom reports as a deadlock.
+#[test]
+fn an_older_notified_queued_behind_a_newer_one_gets_the_broadcast() {
+    explore(
+        "an_older_notified_queued_behind_a_newer_one_gets_the_broadcast",
+        3,
+        5,
+        || {
+            let notify = Arc::new(Notify::new());
+            let created = Arc::new(AtomicBool::new(false));
+            let older = {
+                let (notify, created) = (Arc::clone(&notify), Arc::clone(&created));
+                thread::spawn(move || {
+                    let waiting = notify.notified();
+                    created.store(true, Ordering::Release);
+                    block_on(waiting);
+                })
+            };
+            wait_for(&created);
+            notify.notify_waiters();
+            // Created after the broadcast, so it is not this one's.
+            let mut newer = Box::pin(notify.notified());
+            let polled = newer
+                .as_mut()
+                .poll(&mut Context::from_waker(std::task::Waker::noop()));
+            assert!(polled.is_pending(), "nothing notified it");
+            older.join().expect("older");
+            drop(newer);
+        },
+    );
+}
+
 #[test]
 fn a_dropped_notified_passes_its_notify_one_on() {
     // SHRUNK: one preemption where there were two (1.2 million interleavings,
