@@ -35,6 +35,17 @@
 \* upgradable read for anybody. It only tells a waiting upgrade "the
 \* readers have left", and the upgrader takes the write itself.
 \*
+\* A fourth piece (E48): a reader or writer that finds the lock taken spins a
+\* little before it queues, and a queued waiter that loses a retry spins on
+\* its own waiter node before it sleeps, exactly as the Mutex does in Sync.tla
+\* (steps PreSpin, PreSpinOut, SpinStart, SpinEnd; the table of where each
+\* lives in the code is in Sync.tla). Tiny example of what must not go wrong:
+\* a writer spins on its node; a reader leaves and nudges it, waking nobody,
+\* because the writer is awake; the writer's spin then runs out. It must read
+\* its node before it sleeps, or it sleeps beside the nudge for ever
+\* (MC_SyncRwLock_Red_SpinNoRecheck). The upgrade's own wait never spins, so
+\* D50's upgradable read is untouched.
+\*
 \* What this model shows, over every interleaving of two or three tasks, one
 \* step of the lock at a time: a writer is alone, every guard a task holds
 \* is counted in the lock, nobody loses more than Bound races, a handoff
@@ -179,6 +190,11 @@
 \*   MC_SyncRwLock_Red_PassTakesWrite   E33 as the code was: the pass reads
 \*                                      UPGRADING and takes the write for
 \*                                      the node in its slot: GuardsCounted.
+\*   MC_SyncRwLock_Red_SpinNoRecheck   a waiter whose spin on its node runs
+\*                                      out sleeps without reading the marks;
+\*                                      the release that nudged it while it
+\*                                      spun woke nobody: NoLostWakeup.
+\* Every row above runs the spins, and checks SpinningUnarmed.
 
 \* Borrow the standard TLA+ books: counting numbers, lists, and sizes of finite sets.
 EXTENDS Naturals, Sequences, FiniteSets
@@ -247,9 +263,9 @@ ASSUME Mutant # "AnyReaderUpgrade" => \A t \in Upgrades : Role[t] = "upread"
 ASSUME Kind = "Plain" => MaxDepth = 1 /\ \A t, u \in Tasks : t # u => Owner[t] # Owner[u]
 \* The reentrant lock has no upgradable read.
 ASSUME Kind = "Reentrant" => Upgrades = {} /\ \A t \in Tasks : Role[t] # "upread"
-\* The mutant is "none" or one of the five planted bugs.
+\* The mutant is "none" or one of the six planted bugs.
 ASSUME Mutant \in {"none", "UnboundedBarging", "AnyReaderUpgrade", "UpgradeNoHoldBack",
-                   "OwnerUnaware", "PassTakesWrite"}
+                   "OwnerUnaware", "PassTakesWrite", "SpinNoRecheck"}
 
 \* Configuration helpers, named in the MC_SyncRwLock_*.cfg files.
 \* Every task is its own Owner (a plain RwLock).
@@ -363,6 +379,10 @@ VARIABLES
   \* A local of UpgradeWait::cancel: whether the dropped upgrade's node withdrew (it had not been
   \* granted), so the queue must be told.
   upW,
+  \* Whether the future spins on its own node after a lost try (Wait::spin_park), as in Sync.tla:
+  \* while it is TRUE the node has no waker a release could claim, so a release that nudges or grants
+  \* it only sets the mark, and the spin itself sees the mark. The upgrade's own wait never spins.
+  spinning,
   \* A local of the pass under way: whether WAKE_FRONT was up when the pass began (`wake_front`).
   dWF,
   \* A local of the pass under way: the reader count of the lock as its nudging pictures it
@@ -420,7 +440,7 @@ nodes == <<phase, nudged, owedMark, nkind>>
 \* What the tasks hold, and the reentrant lock's own counts.
 guards == <<got, held, mode, rdepth, wowner, wdepth>>
 \* The locals of a waiting future.
-futs == <<bypass, passOn, upW>>
+futs == <<bypass, passOn, upW, spinning>>
 \* The locals of the pass under way.
 dloc == <<dWF, dSR, dSW, dSU, dSG, dPos, dFirst, dRaised, dSent, dHand, dFrontW, dClearQ, dClearH>>
 \* The ghosts no step of the queue touches.
@@ -442,7 +462,8 @@ Rest == {"idle", "holding", "parked", "upparked", "rupwait"}
 \* others are instructions inside one poll, one release, one cancellation or one drain, named where
 \* they are used.
 PCs == Rest \cup DrainPCs \cup
-       {"push", "enqt", "park0", "repark", "gcons", "ncons", "try", "owe", "wd1", "wd2", "gb1",
+       {"pspin", "push", "enqt", "park0", "repark", "nspin", "gcons", "ncons", "try", "owe", "wd1",
+        "wd2", "gb1",
         "gb2", "gb3", "relt", "uptry", "uppush", "upenq", "uppark0", "upfin", "upunl", "upwul",
         "uprel", "upwd"}
 
@@ -702,14 +723,54 @@ Acquire(t) ==
               /\ pc' = [pc EXCEPT ![t] = "holding"]
          \* No: only a task that waits goes on,
          ELSE /\ t \in Waits
-              \* to push its node. (Losing this first attempt is no bypass: nobody has passed the
-              \* caller yet.)
-              /\ pc' = [pc EXCEPT ![t] = "push"]
+              \* to spin, and then to push its node. (Losing this first attempt is no bypass:
+              \* nobody has passed the caller yet.)
+              /\ pc' = [pc EXCEPT ![t] = "pspin"]
               \* Nothing is entered.
               /\ UNCHANGED <<lockw, guards, bargedOwed, readInUpgrade>>
   \* Nothing else changes.
   /\ UNCHANGED <<qbits, owedCount, arrivals, waiting, upSlot, nodes, wake, wl, futs, dloc, ret,
                  dEarned, lost, overran>>
+
+\* Whether a spinner that reads this state word stops and queues (queue::stops_spin): a handoff is
+\* owed, or waiters are queued and nobody holds the drain role, as in Sync.tla.
+StopsSpin == handoff \/ (queued /\ ~drainOn)
+
+\* One round of the spin before queueing (contend::spin_take), as in Sync.tla: one load of the state
+\* word, and, when its request fits and the spin need not stop, one compare-and-swap from exactly the
+\* state loaded, which is one step here at the instant of the swap. A round that sees no room
+\* changes nothing, so it is no step.
+PreSpin(t) ==
+  \* The task is spinning before it queues.
+  /\ pc[t] = "pspin"
+  \* Must it stop?
+  /\ IF StopsSpin
+       \* Yes: it goes on to push its node, entering nothing.
+       THEN /\ pc' = [pc EXCEPT ![t] = "push"] /\ UNCHANGED <<lockw, guards, bargedOwed, readInUpgrade>>
+       \* No: the round enters the lock word if the request fits (no handoff is owed here),
+       ELSE /\ CanBarge(Role[t])
+            \* exactly as the first attempt would,
+            /\ EnterWord(Role[t])
+            \* and it is a guard at once.
+            /\ NewGuard(t) /\ UNCHANGED got
+            \* (No handoff is owed, so nothing is barged past one.)
+            /\ UNCHANGED bargedOwed
+            \* A reader that entered past a waiting upgrade is recorded.
+            /\ readInUpgrade' = (readInUpgrade \/ (Role[t] = "read" /\ upgrading))
+            \* It holds.
+            /\ pc' = [pc EXCEPT ![t] = "holding"]
+  \* Nothing else changes.
+  /\ UNCHANGED <<qbits, owedCount, arrivals, waiting, upSlot, nodes, wake, wl, futs, dloc, ret,
+                 dEarned, lost, overran, turns>>
+
+\* The spin before queueing runs out of rounds (spin::Budget): the task goes on to push its node,
+\* after any number of rounds, none included.
+PreSpinOut(t) ==
+  \* The task is spinning before it queues, and goes on to push its node.
+  /\ pc[t] = "pspin" /\ pc' = [pc EXCEPT ![t] = "push"]
+  \* Nothing else changes.
+  /\ UNCHANGED <<lockw, qbits, owedCount, arrivals, waiting, upSlot, nodes, wake, wl, guards, futs,
+                 dloc, ret, dEarned, ghosts>>
 
 \* The waiter arms a fresh node and pushes it on the arrival stack (Wait::enqueue, then
 \* WaitQueue::push: one compare-and-swap on the stack).
@@ -768,13 +829,41 @@ Park0(t) ==
   /\ UNCHANGED <<lockw, qbits, owedCount, arrivals, waiting, upSlot, owedMark, nkind, wake, wl,
                  guards, futs, dloc, ret, dEarned, ghosts>>
 
-\* After a failed try the future registers its waker again and looks at its node.
+\* After a failed try the future looks at its node at once (Wait::spin_park with a budget of zero,
+\* or a node marked already: then Wait::park with the waker).
 Repark(t) ==
   \* The task's try failed, and it looks at its node.
   /\ pc[t] = "repark" /\ Look(t)
   \* Nothing else changes.
   /\ UNCHANGED <<lockw, qbits, owedCount, arrivals, waiting, upSlot, owedMark, nkind, wake, wl,
                  guards, futs, dloc, ret, dEarned, ghosts>>
+
+\* After a failed try the future spins on its own node instead (Wait::spin_park), as in Sync.tla:
+\* Waiter::begin_spin found nothing marked and took the node's ARMED bit down, so a release that
+\* nudges or grants it now only sets the mark (a task that is not "parked" goes on no wake list).
+SpinStart(t) ==
+  \* The task's try failed, and nothing is granted or nudged yet.
+  /\ pc[t] = "repark" /\ phase[t] = "waiting" /\ ~nudged[t]
+  \* The future spins: its node is unarmed.
+  /\ spinning' = [spinning EXCEPT ![t] = TRUE] /\ pc' = [pc EXCEPT ![t] = "nspin"]
+  \* Nothing else changes.
+  /\ UNCHANGED <<lockw, qbits, owedCount, arrivals, waiting, upSlot, nodes, wake, wl, guards, bypass,
+                 passOn, upW, dloc, ret, dEarned, ghosts>>
+
+\* The spin on the node ends (it saw a mark, or ran out) and the future looks at its node, arming the
+\* waker and reading the marks in one compare-and-swap. (Mutant SpinNoRecheck: a spin that runs out
+\* sleeps without reading the marks; a nudge that came while it spun called no waker, so the waiter
+\* sleeps beside it for ever.)
+SpinEnd(t) ==
+  \* The task is spinning on its node; the spin is over and the node is armed again.
+  /\ pc[t] = "nspin" /\ spinning' = [spinning EXCEPT ![t] = FALSE]
+  \* As built it looks; under the bug it may go to sleep without looking.
+  /\ \/ Look(t)
+     \* (the bug: straight to sleep, reading nothing)
+     \/ Mutant = "SpinNoRecheck" /\ pc' = [pc EXCEPT ![t] = "parked"] /\ UNCHANGED <<phase, nudged>>
+  \* Nothing else changes.
+  /\ UNCHANGED <<lockw, qbits, owedCount, arrivals, waiting, upSlot, owedMark, nkind, wake, wl,
+                 guards, bypass, passOn, upW, dloc, ret, dEarned, ghosts>>
 
 \* The executor polls a future whose waker was called. The future looks at its node.
 Poll(t) ==
@@ -799,7 +888,7 @@ GrantCons(t) ==
   /\ pc' = [pc EXCEPT ![t] = "holding"]
   \* Nothing else changes.
   /\ UNCHANGED <<lockw, drainOn, dirty, queued, handoff, wakeFront, owedCount, arrivals, waiting,
-                 upSlot, nodes, wake, wl, passOn, upW, dloc, ret, dEarned, bargedOwed,
+                 upSlot, nodes, wake, wl, passOn, upW, spinning, dloc, ret, dEarned, bargedOwed,
                  readInUpgrade, overran, turns>>
 
 \* A nudged future takes back the nudge marker (one fetch-and), then chooses its try: the one that
@@ -833,7 +922,7 @@ Try(t) ==
             \* and so is a reader that entered past a waiting upgrade.
             /\ readInUpgrade' = (readInUpgrade \/ (Role[t] = "read" /\ upgrading))
             \* Next it withdraws its node. Nothing is counted.
-            /\ pc' = [pc EXCEPT ![t] = "wd1"] /\ UNCHANGED <<bypass, lost>>
+            /\ pc' = [pc EXCEPT ![t] = "wd1"] /\ UNCHANGED <<bypass, spinning, lost>>
        \* No: a loss, counted unless HANDOFF was up. The ghost counts it if the node still waits.
        ELSE /\ lost' = [lost EXCEPT ![t] = IF ~handoff /\ phase[t] = "waiting" THEN @ + 1 ELSE @]
             \* The future's own count goes up by one, but never past Bound.
@@ -844,7 +933,7 @@ Try(t) ==
             /\ UNCHANGED <<lockw, got, bargedOwed, readInUpgrade>>
   \* Nothing else changes.
   /\ UNCHANGED <<qbits, owedCount, arrivals, waiting, upSlot, nodes, wake, wl, held, mode, rdepth,
-                 wowner, wdepth, passOn, upW, dloc, ret, dEarned, overran, turns>>
+                 wowner, wdepth, passOn, upW, spinning, dloc, ret, dEarned, overran, turns>>
 
 \* The try that would be the waiter's Bound-th counted loss (Lock::take_or_owe, taken whole: its
 \* seven instructions are checked one by one in Sync.tla). A waiter whose node was granted already,
@@ -859,7 +948,7 @@ Owe(t) ==
        \* Yes: nothing counts, and it looks at its node again.
        THEN /\ pc' = [pc EXCEPT ![t] = "repark"]
             \* Nothing else of the try changes.
-            /\ UNCHANGED <<lockw, drainOn, dirty, handoff, owedCount, owedMark, got, bypass, lost,
+            /\ UNCHANGED <<lockw, drainOn, dirty, handoff, owedCount, owedMark, got, bypass, spinning, lost,
                            ret, dEarned, readInUpgrade>>
        \* No. Does the request fit?
        ELSE IF Admits(Role[t])
@@ -870,7 +959,7 @@ Owe(t) ==
               \* Next it withdraws its node.
               /\ pc' = [pc EXCEPT ![t] = "wd1"]
               \* Nothing is owed or counted.
-              /\ UNCHANGED <<drainOn, dirty, handoff, owedCount, owedMark, bypass, lost, ret,
+              /\ UNCHANGED <<drainOn, dirty, handoff, owedCount, owedMark, bypass, spinning, lost, ret,
                              dEarned>>
          \* No: HANDOFF goes up, in this same compare-and-swap,
          ELSE /\ handoff' = TRUE
@@ -885,7 +974,7 @@ Owe(t) ==
               /\ UNCHANGED <<lockw, got, readInUpgrade>>
   \* Nothing else changes.
   /\ UNCHANGED <<queued, nudgeOut, wakeFront, arrivals, waiting, upSlot, phase, nudged, nkind, wake,
-                 wl, held, mode, rdepth, wowner, wdepth, passOn, upW, dloc, bargedOwed, overran,
+                 wl, held, mode, rdepth, wowner, wdepth, passOn, upW, spinning, dloc, bargedOwed, overran,
                  turns>>
 
 ----------------------------------------------------------------------------
@@ -914,7 +1003,7 @@ Wd1(t) ==
   /\ pc[t] = "wd1" /\ Withdraw(t)
   \* Nothing else changes.
   /\ UNCHANGED <<lockw, qbits, owedCount, arrivals, waiting, upSlot, owedMark, nkind, wake, wl,
-                 guards, bypass, upW, dloc, ret, dEarned, ghosts>>
+                 guards, bypass, upW, spinning, dloc, ret, dEarned, ghosts>>
 
 \* The waiting future is dropped (the caller gave up): it leaves its node. A wake on its way to it
 \* now has nobody to wake.
@@ -926,7 +1015,7 @@ Cancel(t) ==
   \* Its locals are forgotten, and it leaves its node.
   /\ Forget(t) /\ Withdraw(t)
   \* Nothing else changes.
-  /\ UNCHANGED <<lockw, qbits, owedCount, arrivals, waiting, upSlot, owedMark, nkind, guards, upW,
+  /\ UNCHANGED <<lockw, qbits, owedCount, arrivals, waiting, upSlot, owedMark, nkind, guards, upW, spinning,
                  dloc, ret, dEarned, bargedOwed, readInUpgrade, overran, turns>>
 
 \* The withdrawn future tells the queue (Policy::withdrawn: a transition with Step::Drain): a
@@ -945,7 +1034,7 @@ Wd2(t) ==
   \* A pass will look: this task's own, or the one under way. Then it holds, or is idle.
   /\ Transit(t, RestPc(t, got[t]))
   \* Nothing else changes.
-  /\ UNCHANGED <<lockw, queued, handoff, owedCount, arrivals, waiting, upSlot, nodes, wake, wl, upW,
+  /\ UNCHANGED <<lockw, queued, handoff, owedCount, arrivals, waiting, upSlot, nodes, wake, wl, upW, spinning,
                  dloc, bargedOwed, readInUpgrade, overran, turns>>
 
 \* A future that leaves after a grant takes back the nudge marker (one fetch-and) before it gives
@@ -971,13 +1060,13 @@ Gb2(t) ==
        \* Yes: the entry leaves its hand, and it goes on to ask for the pass.
        THEN /\ got' = [got EXCEPT ![t] = @ - 1] /\ pc' = [pc EXCEPT ![t] = "gb3"]
             \* Its guard and its locals wait for that step.
-            /\ UNCHANGED <<held, mode, rdepth, wowner, wdepth, bypass, lost>>
+            /\ UNCHANGED <<held, mode, rdepth, wowner, wdepth, bypass, spinning, lost>>
        \* No: what it entered itself, if anything, becomes its guard,
        ELSE /\ SettleTo(t, got[t] - 1)
             \* its locals are forgotten, and it holds, or is idle.
             /\ Forget(t) /\ pc' = [pc EXCEPT ![t] = RestPc(t, got[t] - 1)]
   \* Nothing else changes.
-  /\ UNCHANGED <<qbits, owedCount, arrivals, waiting, upSlot, nodes, wake, wl, passOn, upW, dloc,
+  /\ UNCHANGED <<qbits, owedCount, arrivals, waiting, upSlot, nodes, wake, wl, passOn, upW, spinning, dloc,
                  ret, dEarned, bargedOwed, readInUpgrade, overran, turns>>
 
 \* It asks for the pass (Policy::released: a transition with Step::Wake that raises WAKE_FRONT).
@@ -991,7 +1080,7 @@ Gb3(t) ==
   /\ Asks(t, RestPc(t, got[t]))
   \* Nothing else changes.
   /\ UNCHANGED <<lockw, queued, nudgeOut, handoff, owedCount, arrivals, waiting, upSlot, nodes,
-                 wake, wl, passOn, upW, dloc, bargedOwed, readInUpgrade, overran, turns>>
+                 wake, wl, passOn, upW, spinning, dloc, bargedOwed, readInUpgrade, overran, turns>>
 
 ----------------------------------------------------------------------------
 \* Releasing.
@@ -1224,7 +1313,7 @@ UpCancel(t) ==
             /\ pc' = [pc EXCEPT ![t] = "upunl"]
   \* Nothing else changes.
   /\ UNCHANGED <<lockw, qbits, owedCount, arrivals, waiting, upSlot, nudged, owedMark, nkind,
-                 guards, bypass, passOn, dloc, ret, dEarned, ghosts>>
+                 guards, bypass, passOn, spinning, dloc, ret, dEarned, ghosts>>
 
 \* The dropped upgrade lets the upgradable read go (RawRwLock::upgradable_unlock: one fetch-and
 \* that lowers UPGRADABLE and UPGRADING). It is the only step that ever releases them for this
@@ -1278,7 +1367,7 @@ UpWithdrawn(t) ==
   /\ Transit(t, "idle")
   \* Nothing else changes.
   /\ UNCHANGED <<lockw, queued, handoff, wakeFront, owedCount, arrivals, waiting, upSlot, nodes,
-                 wake, wl, guards, bypass, passOn, dloc, ghosts>>
+                 wake, wl, guards, bypass, passOn, spinning, dloc, ghosts>>
 
 \* Mutant AnyReaderUpgrade only: a plain reader asks to upgrade. It holds new readers back and
 \* waits to be the only reader, which another reader doing the same never lets happen.
@@ -1602,6 +1691,8 @@ NudgeAt(d, i) ==
   \* The node is marked, if the nudge reaches it, and the pass notes what is on its way.
   IN /\ nudged' = [nudged EXCEPT ![n] = @ \/ hit] /\ dSent' = sent
      \* A sleeping future is to be woken.
+     \* Only a sleeping future (its waker armed) is to be woken; one that spins on its node reads
+     \* the mark itself, so the release skips its wake.
      /\ wl' = IF hit /\ pc[n] = "parked" THEN wl \cup {n} ELSE wl
      \* Does the walk go on?
      /\ IF WalksOn(i)
@@ -1767,6 +1858,8 @@ Init ==
   /\ wdepth = IF Kind = "Plain" THEN 0 ELSE Cardinality({t \in Tasks : StartsWith(t, "write")})
   \* No future has lost a race or carries anything.
   /\ bypass = [t \in Tasks |-> 0] /\ passOn = [t \in Tasks |-> FALSE] /\ upW = [t \in Tasks |-> FALSE]
+  \* Nobody spins on its node.
+  /\ spinning = [t \in Tasks |-> FALSE]
   \* No pass is under way.
   /\ dWF = FALSE /\ dSR = 0 /\ dSW = FALSE /\ dSU = FALSE /\ dSG = FALSE /\ dPos = 0
   \* (its other locals)
@@ -1786,8 +1879,12 @@ Init ==
 
 \* The steps a task takes on its own once started: they must happen.
 Internal(t) ==
-  \* The waiter's own steps up to its try,
+  \* The spin before queueing,
+  \/ PreSpin(t) \/ PreSpinOut(t)
+  \* the waiter's own steps up to its try,
   \/ Push(t) \/ Publish(t) \/ Park0(t) \/ Repark(t) \/ Poll(t) \/ GrantCons(t) \/ NudgeCons(t)
+  \* the spin on its own node after a failed try,
+  \/ SpinStart(t) \/ SpinEnd(t)
   \* its two kinds of try, leaving the queue,
   \/ Try(t) \/ Owe(t) \/ Wd1(t) \/ Wd2(t) \/ Gb1(t) \/ Gb2(t) \/ Gb3(t)
   \* asking for a pass after a release,
@@ -1819,6 +1916,10 @@ Spec == Init /\ [][Next]_vars /\ Fairness
 
 ----------------------------------------------------------------------------
 \* Invariants.
+
+\* A SPINNING WAITER IS NEVER ARMED, as in Sync.tla: a future spins on its node only inside its
+\* poll, at the spin step, with its node waiting or granted while it spun.
+SpinningUnarmed == \A t \in Tasks : spinning[t] => pc[t] = "nspin" /\ phase[t] \in {"waiting", "granted"}
 
 \* Every variable holds what its comment says.
 TypeOK ==

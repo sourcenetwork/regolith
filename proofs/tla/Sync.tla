@@ -14,6 +14,16 @@
 \* is free gets it, even past the queue. A release only "nudges" the oldest
 \* waiters: it wakes them so they can try again.
 \*
+\* Waiting is costly too: a task that queues and sleeps must be woken by the
+\* release, and the thread that runs it may have to be woken by the kernel. So a
+\* task that finds the lock held first spins a little (E48): it looks at the lock
+\* now and then for a short while and takes it if it is let go meanwhile; only
+\* then does it queue. And a queued waiter that has just lost a retry spins on its
+\* own waiter node before it sleeps: a release that nudges it then sets the mark
+\* without waking anybody, because the waiter is awake and watching its node.
+\* Tiny example: tasks A and B take turns at a lock on two cores. A holds; B spins;
+\* A lets go; B sees it and takes it; nobody queued, nobody slept, nobody was woken.
+\*
 \* Barging alone is unfair. Tiny example: task A waits. Each time the lock is
 \* released A is nudged, but before A gets to run, task B, which is already
 \* running, grabs the lock again. A loses the race, and loses it again, for
@@ -25,7 +35,8 @@
 \*
 \* What can go wrong, each a RED configuration below: a waiter starves; a
 \* release frees the lock and tells nobody; somebody barges past an owed
-\* handoff; a waiter that gave up (its future was dropped) keeps the lock it
+\* handoff (a spinner too); a waiter that stops spinning goes to sleep without
+\* looking, though a release nudged it while it spun and woke nobody; a waiter that gave up (its future was dropped) keeps the lock it
 \* had just been handed; a change made while another thread was serving the
 \* queue is never looked at; a thread serving the queue is kept at it by
 \* releases that have nobody to tell; a reentrant lock is freed while a
@@ -114,11 +125,17 @@
 \*   - The state word (WaitQueue::state, src/sync/queue.rs) holds the free
 \*     permits above six flag bits: DRAINING, DIRTY, QUEUED, NUDGE_OUT,
 \*     HANDOFF and WAKE_FRONT. Each is a variable below.
-\*   - Acquire (Contend::poll, src/sync/contend.rs). One compare-and-swap
-\*     takes the permits when they are free and HANDOFF is down, whoever
-\*     waits: barging (contend::take). When it fails the caller pushes a
-\*     waiter node on the arrival stack, raises QUEUED, and looks at its node
-\*     once more before sleeping. It does not spin.
+\*   - Acquire (Contend::poll, src/sync/contend.rs; a Mutex makes this first
+\*     attempt inline, RawSemaphore::take_one). One compare-and-swap takes the
+\*     permits when they are free and HANDOFF is down, whoever waits: barging
+\*     (contend::take). When it fails the out-of-line path tries once more
+\*     from the state the first attempt saw (Retake, contend::take_from),
+\*     then spins: it reads the state word now and then and takes the permits
+\*     if a read shows them free, until it runs out of rounds or sees a
+\*     handoff owed or waiters queued with nobody changing the queue
+\*     (PreSpin, PreSpinOut; contend::spin_take). Then it pushes a waiter node
+\*     on the arrival stack, raises QUEUED, and looks at its node once more
+\*     before sleeping.
 \*   - Release (RawSemaphore::release, src/sync/raw_semaphore.rs). One add
 \*     puts the permits back in the state word. Only if waiters are queued
 \*     and no nudge is already on its way (or a handoff is owed) does it go
@@ -145,6 +162,12 @@
 \*     that would be its Bound-th counted loss is Lock::take_or_owe: it
 \*     counts itself owed, marks its node, and in one compare-and-swap
 \*     either takes the permits or raises HANDOFF.
+\*   - After a failed retry the future may spin on its own node (SpinStart,
+\*     SpinEnd; Wait::spin_park): Waiter::begin_spin takes the node's ARMED
+\*     bit down, so a release that nudges or grants it finds no waker to claim
+\*     and only sets the mark; the spin ends when it sees a mark or runs out,
+\*     and the look that follows arms the waker and reads the marks in one
+\*     compare-and-swap.
 \*   - Cancellation (Contend::cancel). A dropped future withdraws its node;
 \*     a nudge it carried unused passes to the next front (WAKE_FRONT), and
 \*     permits it had been granted are released like any others.
@@ -233,6 +256,15 @@
 \*     pass reads "has this node withdrawn" in the same step as it acts on
 \*     the node (the grant and the nudge check again, atomically).
 \*   - Memory ordering is loom's (plan 7.1).
+\*   - How long a spin lasts. The code counts rounds and adapts the count per
+\*     lock (spin::Budget: doubled when a spin saw what it waited for, halved
+\*     when one ran out without seeing room, raised to one by a won retry;
+\*     spin::Gaps spaces the reads). Here a spin may end after any number of
+\*     rounds, none included, so every count the code can reach is covered;
+\*     the count only sets how fast the code is, never what it does.
+\*   - Reads that see the lock taken. A spin round that reads the word and
+\*     finds no room changes nothing, and a round whose compare-and-swap
+\*     fails changes nothing either: neither is a step here.
 \*
 \* SHORT SCENARIOS. Three tasks that each ask as often as they like, at one
 \* step per instruction, are over four million states: far more than a row
@@ -296,6 +328,143 @@
 \*                                HandoffExclusive.
 \*   MC_Sync_Red_NoDepth          a reentrant guard drop frees the lock at
 \*                                any depth: ReentrancyDepth.
+\*   MC_Sync_Red_SpinNoRecheck    a waiter whose spin on its node runs out
+\*                                sleeps without reading the node's marks;
+\*                                a release that nudged it while it spun
+\*                                woke nobody: NoLostWakeup.
+\*   MC_Sync_Red_SpinIgnoresOwed  the spin before queueing does not stop for
+\*                                an owed handoff and takes the lock the
+\*                                release freed for the owed waiter:
+\*                                HandoffExclusive.
+\* Every row above runs the spins: the GREEN rows check every safety promise
+\* with tasks that spin before queueing and on their nodes, and SpinningUnarmed
+\* in each of them checks that a spinner is never left armed.
+
+\* ===========================================================================
+\* WHERE EACH PIECE OF THIS MODEL LIVES IN THE RUST CODE (E48)
+\* ===========================================================================
+\* Read it as: "this word of the model" is "this place in the program", and
+\* what it means in plain words. Paths are under src/sync/; line numbers are
+\* those of the commit that adds this table. A step of the model is one
+\* atomic instruction of the program unless the line says otherwise.
+\*
+\* THE STATE (what the program remembers):
+\*   avail       raw_semaphore.rs:126 and queue.rs:182 (WaitQueue::state, the
+\*               bits above FIRST_BIT): how many permits are free.
+\*   drainOn     queue.rs:91 DRAINING: somebody is serving the queue.
+\*   dirty       queue.rs:93 DIRTY: the queue changed while it was served.
+\*   queued      queue.rs:95 QUEUED: waiters may be queued.
+\*   nudgeOut    queue.rs:97 NUDGE_OUT: a nudge is on its way to a waiter.
+\*   handoff     queue.rs:99 HANDOFF: a waiter is owed the lock; no barging.
+\*   wakeFront   queue.rs:102 WAKE_FRONT: a release asks to wake the front.
+\*   owedCount   queue.rs:186 WaitQueue::owed: how many waiters are owed.
+\*   arrivals    queue.rs:183 WaitQueue::arrivals: the stack new waiters join.
+\*   waiting     raw_semaphore.rs:37 RawSemaphore::waiting: the sorted queue.
+\*   phase       waiter.rs:54 PHASE bits: waiting, granted, cancelled.
+\*   nudged      waiter.rs:63 NUDGED: told to try again, not looked yet.
+\*   owedMark    waiter.rs:64 OWED: this waiter is counted owed.
+\*   wake, wl    waiter.rs:574 WakeList and its calls in Drop (waiter.rs:664):
+\*               whose waker is (to be) called.
+\*   got, held   the permits a future took (raw_semaphore.rs:279 poll_one's
+\*               Ready) and the guard that holds them (mutex.rs:149 its drop).
+\*   owner,depth reentrant_mutex.rs:117 enter, 103 reenter, 124 unlock.
+\*   bypass      contend.rs:172 Contend::bypass: races this waiter lost.
+\*   marked, took, seenH   locals of Policy::owe_or_take (queue.rs:408).
+\*   passOn      the flag Cancel::Withdrawn carries (waiter.rs:816).
+\*   spinning    no field of its own: the stretch of Wait::spin_park
+\*               (waiter.rs:767) after Waiter::begin_spin (waiter.rs:283)
+\*               cleared ARMED (waiter.rs:294) and before the look re-arms it.
+\*               While it is TRUE the node has no waker to claim
+\*               (waiter.rs:115 claimable), so a release only marks it.
+\*   dWF ... dClearH   locals of Policy::drain (queue.rs:347) and
+\*               RawSemaphore::pass (raw_semaphore.rs:188).
+\*   pc, ret     where each task is in the code; not a field.
+\*   lost, bargedOwed, dPasses, dEarned, overran, turns   bookkeeping the
+\*               model keeps to state its promises; no field.
+\*
+\* THE STEPS (what the program does), each with the instruction it is:
+\*   Acquire     the first attempt: mutex.rs:224 poll_one ->
+\*               raw_semaphore.rs:89 take_one (a load at :91, then the swap at
+\*               :94 from the free word or at :99 from the state loaded), or
+\*               for a Semaphore contend.rs:213 try_take -> contend.rs:88 take.
+\*   Retake      contend.rs:212 take_from(seen): the out-of-line path's first
+\*               swap, from the state the inline attempt saw (contend.rs:100).
+\*   PreSpin     one round of contend.rs:134 spin_take: the stop test at :143
+\*               (queue.rs:119 stops_spin), the load at :146, and the swap at
+\*               :153 when the load showed room.
+\*   PreSpinOut  the spin's rounds run out (spin.rs:68 Gaps, spin.rs:109
+\*               Budget::rounds); contend.rs:164 halves the budget.
+\*   Reenter     reentrant_mutex.rs:103 reenter.
+\*   Push        waiter.rs:731 Wait::enqueue -> queue.rs:236 WaitQueue::push.
+\*   Publish     queue.rs:379 Policy::enqueue's transition (queue.rs:313).
+\*   Park0       contend.rs:224 park(queue, None) -> waiter.rs:213 Waiter::park.
+\*   Repark      contend.rs:267 spin_park with no spin (budget 0, or the node
+\*               marked: begin_spin false) -> waiter.rs:743 Wait::park.
+\*   SpinStart   waiter.rs:767 spin_park -> waiter.rs:283 begin_spin: a load,
+\*               and a swap clearing ARMED (waiter.rs:294) if it was armed.
+\*   SpinEnd     the spin loop's last waiter.rs:306 marked() read, then the
+\*               look waiter.rs:743 park(Some(waker)), whose last swap arms the
+\*               waker and reads the marks together (waiter.rs:213).
+\*   Poll        the executor polls a woken future: poll_one -> poll_contended
+\*               (raw_semaphore.rs:293) -> contend.rs:197 poll_from -> park.
+\*   GrantCons   contend.rs:228 Park::Granted -> queue.rs:232 consume_nudge.
+\*   NudgeCons   contend.rs:239 Park::Nudged -> queue.rs:232 consume_nudge.
+\*   Try         contend.rs:213 try_take for a retry; a loss counts at :262.
+\*   Owe1..Owe7  contend.rs:242 take_or_owe -> queue.rs:408 owe_or_take:
+\*               the owed count, Waiter::owe (waiter.rs:313), the swap,
+\*               Waiter::unowe (waiter.rs:334), forgive (queue.rs:226), the
+\*               fetch-or, and the last transition.
+\*   Wd1, Wd2    contend.rs:278 Contend::cancel -> waiter.rs:816 Wait::cancel
+\*               -> waiter.rs:355 withdraw, then queue.rs:388 withdrawn.
+\*   Cancel      the future is dropped: mutex.rs Lock's drop ->
+\*               raw_semaphore.rs:306 PermitWait::cancel -> Contend::cancel.
+\*   Gb1..Gb3    Cancel::Granted in Contend::cancel: consume_nudge, give_back
+\*               (raw_semaphore.rs:170) = release, released.
+\*   Release     raw_semaphore.rs:122 release: the add at :126, the test
+\*               queue.rs:110 wants_drain.
+\*   Released    raw_semaphore.rs:136 release_wakes -> queue.rs:396 released.
+\*   Give        moving an owned guard (OwnedMutexGuard): no instruction.
+\*   D0          queue.rs:347 drain's fetch-and, queue.rs:254 take, and the
+\*               list's absorb, tidy and front (list.rs:60, :117, :85).
+\*   DH, DG, DGB the handoff loop of RawSemaphore::pass: take_for_waiter
+\*               (raw_semaphore.rs:198), WakeList::grant (waiter.rs:592),
+\*               and the add that puts back a refused grant.
+\*   DHO         queue.rs:221 hands_off.
+\*   DNB..DNF    the nudging walk of pass (raw_semaphore.rs:215-221):
+\*               Nudges::nudge -> WakeList::nudge (waiter.rs:609) ->
+\*               Waiter::touch (waiter.rs:184), and Nudges::finish
+\*               (queue.rs:159).
+\*   DEnd, DEx   the end of drain: the exit swap, then the wakers called as
+\*               the WakeList drops (waiter.rs:664).
+\*
+\* THE PROMISES (what must always hold), and what in the code keeps them:
+\*   MutualExclusion, PermitsConserved   every take is a swap that checks
+\*               the permits (take_one, take_from, spin_take, admit).
+\*   BoundedBypass, HandoffExclusive    the bypass count and owe_or_take;
+\*               every barging swap refuses HANDOFF (take_one :92/:97,
+\*               take_from, stops_spin for the spin).
+\*   NoLostWakeup (MarkedWoken, Stranded)  park's swaps read the marks as
+\*               they arm the waker; a spin ends in that same look.
+\*   SpinningUnarmed   begin_spin clears ARMED before the spin, and only the
+\*               look after it sets ARMED again.
+\*   CancelPassesOn    Contend::cancel gives a grant back.
+\*   DrainBounded, DrainsEndWhenWaitersSettle   queue.rs:313-375.
+\*   EveryWaiterServed   the bypass bound plus the handoff.
+\*
+\* WHAT IS IN THE CODE BUT NOT A STEP HERE, and why that is safe:
+\*   - The budget's own reads and writes (spin.rs Budget::won, ran_out):
+\*     a hint that only sizes spins; the model lets a spin be any length.
+\*   - The pause between spin reads (spin.rs:49 pause): no memory access.
+\*   - A spin round that sees no room, and a swap that fails: they change
+\*     no memory, so they are stutters.
+\*   - The waker slots (registering, taking): see WHAT THE MODEL LEAVES OUT.
+\* WHAT IS A STEP HERE BUT NOT IN THE CODE: Retake for a Semaphore or a
+\* ReentrantMutex, whose acquire has no inline attempt: one barging attempt
+\* more than the code makes, which only lets the model do more.
+\*
+\* The same table holds for SyncRwLock.tla's acquire, retry and spin steps,
+\* with RawRwLock's admit (raw_rwlock.rs) in place of the semaphore's; the
+\* RwLock has no Retake (it has no inline attempt).
 
 \* Borrow the standard TLA+ books: counting numbers, lists, and sizes of finite sets.
 EXTENDS Naturals, Sequences, FiniteSets
@@ -364,10 +533,11 @@ ASSUME Tasks \subseteq Nat \ {0} /\ Owners \subseteq Nat \ {0}
 ASSUME Kind = "Reentrant" => Permits = 1 /\ Cardinality(Start) <= 1
 \* The tasks that start with a guard are tasks, and a task comes after a task or after nobody.
 ASSUME Start \subseteq Tasks /\ \A t \in Tasks : Follows[t] \in Tasks \cup {0}
-\* The mutant is "none" or one of the eleven planted bugs.
+\* The mutant is "none" or one of the thirteen planted bugs.
 ASSUME Mutant \in {"none", "UnboundedBarging", "LoseQueuePosition", "ReleaseNoWake", "NoRecheck",
                    "NoDirty", "LowerPendingMarker", "ReleaseDirties", "ExitIgnoresRequest",
-                   "CancelNoPassOn", "IgnoreOwed", "NoDepth"}
+                   "CancelNoPassOn", "IgnoreOwed", "NoDepth", "SpinNoRecheck",
+                   "SpinIgnoresOwed"}
 
 \* Configuration helpers, named in the MC_Sync_*.cfg files.
 \* Every task asks for one permit.
@@ -458,6 +628,12 @@ VARIABLES
   seenH,
   \* A local of Contend::cancel: whether the withdrawn node carried a nudge nobody used.
   passOn,
+  \* Whether the future spins on its own node after a lost try (Wait::spin_park in
+  \* src/sync/waiter.rs). In the code this is the stretch between Waiter::begin_spin, which takes
+  \* the node's ARMED bit down, and the look that arms it again: while it is TRUE the node has no
+  \* waker a release could claim, so a release that nudges or grants it only sets the mark, and
+  \* the spin itself sees the mark. It is the future's own state, so it sits with its locals.
+  spinning,
   \* A local of the pass under way: whether WAKE_FRONT was up when the pass began (`wake_front`).
   dWF,
   \* A local of the pass under way: the free permits not yet promised to a nudged waiter (`budget`).
@@ -507,7 +683,7 @@ word == <<avail, drainOn, dirty, queued, nudgeOut, handoff, wakeFront>>
 \* The fields of every waiter node.
 nodes == <<phase, nudged, owedMark>>
 \* The locals of a waiting future.
-futs == <<bypass, marked, took, seenH, passOn>>
+futs == <<bypass, marked, took, seenH, passOn, spinning>>
 \* The locals of the pass under way.
 dloc == <<dWF, dBudget, dPos, dFirst, dRaised, dSent, dHand, dClearQ, dClearH>>
 \* What the tasks hold.
@@ -525,9 +701,9 @@ DrainPCs == {"d0", "dh", "dg", "dgb", "dho", "dnb", "dni", "dnt", "dnf", "dend",
 \* a guard another task moved to it. "parked": its future returned Pending and sleeps. The others
 \* are instructions inside one poll, one release, one cancellation or one drain, named where they
 \* are used.
-PCs == {"idle", "holding", "owned", "parked", "push", "enqt", "park0", "repark", "gcons", "ncons",
-        "try", "owe1", "owe2", "owe3", "owe4", "owe5", "owe6", "owe7", "wd1", "wd2", "gb1", "gb2",
-        "gb3", "relt"} \cup DrainPCs
+PCs == {"idle", "holding", "owned", "parked", "retake", "pspin", "push", "enqt", "park0", "repark",
+        "nspin", "gcons", "ncons", "try", "owe1", "owe2", "owe3", "owe4", "owe5", "owe6", "owe7",
+        "wd1", "wd2", "gb1", "gb2", "gb3", "relt"} \cup DrainPCs
 
 ----------------------------------------------------------------------------
 \* Helpers.
@@ -719,14 +895,15 @@ Acquire(t) ==
             /\ pc' = [pc EXCEPT ![t] = "holding"]
        \* No: only a task that waits goes on,
        ELSE /\ t \in Waits
-            \* to push its node. (Losing this first attempt is no bypass: nobody has passed the
+            \* to the attempt its out-of-line path makes next, then the spin, and only then to
+            \* pushing its node. (Losing this first attempt is no bypass: nobody has passed the
             \* caller yet, the holder was simply there first.)
-            /\ pc' = [pc EXCEPT ![t] = "push"]
+            /\ pc' = [pc EXCEPT ![t] = "retake"]
             \* Nothing is taken.
             /\ UNCHANGED <<avail, guards, bargedOwed>>
   \* Nothing else changes.
   /\ UNCHANGED <<drainOn, dirty, queued, nudgeOut, handoff, wakeFront, owedCount, arrivals, waiting,
-                 nodes, wake, wl, bypass, marked, took, seenH, passOn, dloc, ret, lost, tally>>
+                 nodes, wake, wl, bypass, marked, took, seenH, passOn, spinning, dloc, ret, lost, tally>>
 
 \* Reentrant: a task whose Owner holds the lock enters again at once, idle or holding
 \* (ReentrantMutex::reenter). Nothing barges: the owner is already inside.
@@ -746,6 +923,81 @@ Reenter(t) ==
   \* Nothing else changes.
   /\ UNCHANGED <<word, owedCount, arrivals, waiting, nodes, wake, wl, got, owner, futs, dloc, ret,
                  lost, bargedOwed, tally>>
+
+\* The attempt the out-of-line path makes first (Contend::poll_from, contend::take_from): the same
+\* compare-and-swap as Acquire's, from the state the inline attempt saw. A Mutex's lock() made its
+\* first attempt inline (RawSemaphore::take_one); this is its second, just after, which a free
+\* permit with a queue bit up can still win. A Semaphore or ReentrantMutex acquire has no inline
+\* attempt, so for them this step is one attempt more than the code makes: the model lets them
+\* barge in one more way than they can, which only widens what is checked.
+Retake(t) ==
+  \* The task's first attempt failed.
+  /\ pc[t] = "retake"
+  \* Are the permits free, with no handoff owed?
+  /\ IF CanBarge(t)
+       \* Yes: they leave the state word,
+       THEN /\ avail' = avail - Need[t]
+            \* and are its guard at once.
+            /\ Guard(t, Need[t])
+            \* If a handoff was owed at this moment, that is recorded.
+            /\ bargedOwed' = (bargedOwed \/ handoff)
+            \* It holds.
+            /\ pc' = [pc EXCEPT ![t] = "holding"]
+       \* No: it goes on to spin.
+       ELSE /\ pc' = [pc EXCEPT ![t] = "pspin"]
+            \* Nothing is taken.
+            /\ UNCHANGED <<avail, guards, bargedOwed>>
+  \* Nothing else changes.
+  /\ UNCHANGED <<drainOn, dirty, queued, nudgeOut, handoff, wakeFront, owedCount, arrivals, waiting,
+                 nodes, wake, wl, futs, dloc, ret, lost, turns, tally>>
+
+\* Whether a spinner that reads this state word stops and queues (queue::stops_spin): a handoff is
+\* owed, or waiters are queued and nobody holds the drain role. A queue whose role is taken may be
+\* emptying (a waiter that won its retry is leaving it), so the spinner looks again then.
+\* (Mutant SpinIgnoresOwed: the spin does not stop for an owed handoff.)
+StopsSpin == (handoff /\ Mutant # "SpinIgnoresOwed") \/ (queued /\ ~drainOn)
+
+\* One round of the spin before queueing (contend::spin_take): after a pause, one load of the state
+\* word; when it shows the permits free and the spin need not stop, one compare-and-swap from exactly
+\* the state loaded. That swap succeeds only if nothing changed since the load, so the load and a
+\* swap that succeeds are one step here, at the instant of the swap; a swap that fails is a round
+\* that saw nothing, and changes nothing. A round that sees the lock taken changes nothing either,
+\* so it is no step at all. (Mutant SpinIgnoresOwed: the spin takes the permits past an owed
+\* handoff, as a swap that never looked at HANDOFF would.)
+PreSpin(t) ==
+  \* The task is spinning before it queues.
+  /\ pc[t] = "pspin"
+  \* Must it stop?
+  /\ IF StopsSpin
+       \* Yes: it goes on to push its node,
+       THEN /\ pc' = [pc EXCEPT ![t] = "push"]
+            \* taking nothing.
+            /\ UNCHANGED <<avail, guards, bargedOwed>>
+       \* No: the round takes the permits if they are free.
+       ELSE /\ Admit(t)
+            \* They leave the state word,
+            /\ avail' = avail - Need[t]
+            \* and are its guard at once.
+            /\ Guard(t, Need[t])
+            \* If a handoff was owed at this moment (only under the bug), that is recorded.
+            /\ bargedOwed' = (bargedOwed \/ handoff)
+            \* It holds.
+            /\ pc' = [pc EXCEPT ![t] = "holding"]
+  \* Nothing else changes.
+  /\ UNCHANGED <<drainOn, dirty, queued, nudgeOut, handoff, wakeFront, owedCount, arrivals, waiting,
+                 nodes, wake, wl, futs, dloc, ret, lost, turns, tally>>
+
+\* The spin before queueing runs out of rounds (the lock's budget, spin::Budget): the task goes on
+\* to push its node. How many rounds a spin has is a count the lock adapts, so here the spin may
+\* end after any number of rounds, none included.
+PreSpinOut(t) ==
+  \* The task is spinning before it queues.
+  /\ pc[t] = "pspin"
+  \* It goes on to push its node.
+  /\ pc' = [pc EXCEPT ![t] = "push"]
+  \* Nothing else changes.
+  /\ UNCHANGED <<word, owedCount, arrivals, waiting, nodes, wake, wl, guards, futs, dloc, ret, lost,
+                 bargedOwed, turns, tally>>
 
 \* The waiter arms a fresh node and pushes it on the arrival stack (Wait::enqueue, then
 \* WaitQueue::push: one compare-and-swap on the stack).
@@ -821,8 +1073,10 @@ Park0(t) ==
   /\ UNCHANGED <<word, owedCount, arrivals, waiting, owedMark, wake, wl, guards, futs, dloc, ret,
                  lost, bargedOwed, turns, tally>>
 
-\* After a failed try the future registers its waker again and looks at its node (Wait::park with
-\* the waker): a mark set meanwhile is read here.
+\* After a failed try the future looks at its node at once (Wait::spin_park with a budget of zero,
+\* or a node marked already, which Waiter::begin_spin reports: then Wait::park with the waker, which
+\* registers the waker and reads the marks in one compare-and-swap): a mark set meanwhile is read
+\* here.
 Repark(t) ==
   \* The task's try failed.
   /\ pc[t] = "repark"
@@ -831,6 +1085,47 @@ Repark(t) ==
   \* Nothing else changes.
   /\ UNCHANGED <<word, owedCount, arrivals, waiting, owedMark, wake, wl, guards, futs, dloc, ret,
                  lost, bargedOwed, turns, tally>>
+
+\* After a failed try the future spins on its own node instead (Wait::spin_park): Waiter::begin_spin
+\* found nothing marked and took the node's ARMED bit down, so from now on a release that nudges or
+\* grants this node finds no waker to claim and only sets the mark (in Nudge and DG below, a task
+\* that is not "parked" goes on no wake list). The future stays inside its poll.
+SpinStart(t) ==
+  \* The task's try failed.
+  /\ pc[t] = "repark"
+  \* Nothing has been granted or nudged yet (begin_spin's load).
+  /\ phase[t] = "waiting" /\ ~nudged[t]
+  \* The future spins: its node is unarmed.
+  /\ spinning' = [spinning EXCEPT ![t] = TRUE]
+  \* It goes on spinning.
+  /\ pc' = [pc EXCEPT ![t] = "nspin"]
+  \* Nothing else changes.
+  /\ UNCHANGED <<word, owedCount, arrivals, waiting, nodes, wake, wl, guards, bypass, marked, took,
+                 seenH, passOn, dloc, ret, lost, bargedOwed, turns, tally>>
+
+\* The spin on the node ends: it saw a mark (Waiter::marked), or its rounds ran out. Either way the
+\* future then looks at its node the way Repark does (Wait::park with the waker): it arms the waker
+\* and reads the marks in the same compare-and-swap, so a nudge that came while it spun, even one
+\* that landed just as it gave up, is read now, and the future retries instead of sleeping beside
+\* it. (Mutant SpinNoRecheck: a spin that runs out arms the waker and sleeps without reading the
+\* marks; a release that nudged it while it spun called no waker, because it was spinning, so the
+\* waiter now sleeps beside a nudge nobody will ever wake it for.)
+SpinEnd(t) ==
+  \* The task is spinning on its node.
+  /\ pc[t] = "nspin"
+  \* The spin is over: the node is armed again in this step.
+  /\ spinning' = [spinning EXCEPT ![t] = FALSE]
+  \* As built it looks at its node; under the bug it may also go to sleep without looking.
+  /\ \/ Look(t)
+     \* (only under the bug, the other way out:)
+     \/ /\ Mutant = "SpinNoRecheck"
+        \* (the bug: straight to sleep,)
+        /\ pc' = [pc EXCEPT ![t] = "parked"]
+        \* (reading nothing.)
+        /\ UNCHANGED <<phase, nudged>>
+  \* Nothing else changes.
+  /\ UNCHANGED <<word, owedCount, arrivals, waiting, owedMark, wake, wl, guards, bypass, marked,
+                 took, seenH, passOn, dloc, ret, lost, bargedOwed, turns, tally>>
 
 \* The executor polls a future whose waker was called. The future looks at its node.
 Poll(t) ==
@@ -844,7 +1139,7 @@ Poll(t) ==
   /\ Look(t)
   \* Nothing else changes.
   /\ UNCHANGED <<word, owedCount, arrivals, waiting, owedMark, wl, guards, bypass, marked, took,
-                 seenH, passOn, dloc, ret, lost, bargedOwed, turns, tally>>
+                 seenH, passOn, spinning, dloc, ret, lost, bargedOwed, turns, tally>>
 
 \* A granted future takes back the nudge marker (WaitQueue::consume_nudge: one fetch-and), and its
 \* acquire is complete: the granted permits are its guard.
@@ -861,7 +1156,7 @@ GrantCons(t) ==
   /\ pc' = [pc EXCEPT ![t] = "holding"]
   \* Nothing else changes.
   /\ UNCHANGED <<avail, drainOn, dirty, queued, handoff, wakeFront, owedCount, arrivals, waiting,
-                 nodes, wake, wl, marked, took, seenH, passOn, dloc, ret, bargedOwed, turns, tally>>
+                 nodes, wake, wl, marked, took, seenH, passOn, spinning, dloc, ret, bargedOwed, turns, tally>>
 
 \* A nudged future takes back the nudge marker (one fetch-and), then chooses its try: the one that
 \* would be its Bound-th counted loss is Lock::take_or_owe, every other is Lock::try_take. That
@@ -925,7 +1220,7 @@ Try(t) ==
             /\ UNCHANGED <<avail, got, bargedOwed, turns, tally>>
   \* Nothing else changes.
   /\ UNCHANGED <<drainOn, dirty, queued, nudgeOut, handoff, wakeFront, owedCount, arrivals, nodes,
-                 wake, wl, held, owner, depth, marked, took, seenH, passOn, dloc, ret, turns, tally>>
+                 wake, wl, held, owner, depth, marked, took, seenH, passOn, spinning, dloc, ret, turns, tally>>
 
 \* take_or_owe, first instruction (Policy::owe_or_take): the waiter counts itself owed, before its
 \* node is marked and before the bit is raised, so a pass that sees the bit sees the count too.
@@ -958,7 +1253,7 @@ Owe2(t) ==
   /\ pc' = [pc EXCEPT ![t] = "owe3"]
   \* Nothing else changes.
   /\ UNCHANGED <<word, owedCount, arrivals, waiting, phase, nudged, wake, wl, guards, bypass,
-                 took, seenH, passOn, dloc, ret, lost, bargedOwed, turns, tally>>
+                 took, seenH, passOn, spinning, dloc, ret, lost, bargedOwed, turns, tally>>
 
 \* take_or_owe, the compare-and-swap. A marked waiter, in one indivisible step: leaves a state
 \* that already has HANDOFF up alone (the loss will not count); or takes the permits if they fit;
@@ -1010,7 +1305,7 @@ Owe3(t) ==
               /\ UNCHANGED <<avail, got, took, seenH, bargedOwed, turns>>
   \* Nothing else changes.
   /\ UNCHANGED <<queued, nudgeOut, wakeFront, owedCount, arrivals, waiting, nodes, wake, wl, held,
-                 owner, depth, marked, passOn, dloc, turns, dPasses, overran>>
+                 owner, depth, marked, passOn, spinning, dloc, turns, dPasses, overran>>
 
 \* take_or_owe, taking the mark back (Waiter::unowe): the waiter took the permits itself, or found
 \* a handoff already owed to another, so it is not owed after all. If a pass granted the node
@@ -1076,7 +1371,7 @@ Owe6(t) ==
             \* It goes on.
             /\ pc' = [pc EXCEPT ![t] = OweNext(t)]
   \* Nothing else changes.
-  /\ UNCHANGED <<word, owedCount, arrivals, waiting, nodes, wake, wl, guards, passOn, dloc,
+  /\ UNCHANGED <<word, owedCount, arrivals, waiting, nodes, wake, wl, guards, passOn, spinning, dloc,
                  ret, lost, bargedOwed, turns, tally>>
 
 \* take_or_owe, asking for one more pass (a transition with Step::Drain that changes nothing
@@ -1090,7 +1385,7 @@ Owe7(t) ==
   /\ Transit(t, OweNext(t))
   \* Nothing else changes.
   /\ UNCHANGED <<avail, queued, nudgeOut, handoff, wakeFront, owedCount, arrivals, waiting, nodes,
-                 wake, wl, guards, passOn, dloc, lost, bargedOwed, turns, dPasses, overran>>
+                 wake, wl, guards, passOn, spinning, dloc, lost, bargedOwed, turns, dPasses, overran>>
 
 ----------------------------------------------------------------------------
 \* Leaving the queue: Contend::cancel, src/sync/contend.rs.
@@ -1128,7 +1423,7 @@ Wd1(t) ==
   /\ Withdraw(t, FALSE)
   \* Nothing else changes.
   /\ UNCHANGED <<word, owedCount, arrivals, waiting, owedMark, wake, wl, guards, bypass,
-                 marked, took, seenH, dloc, ret, lost, bargedOwed, turns, tally>>
+                 marked, took, seenH, spinning, dloc, ret, lost, bargedOwed, turns, tally>>
 
 \* The waiting future is dropped (the caller gave up): it leaves its node. A wake on its way to it
 \* now has nobody to wake.
@@ -1144,7 +1439,7 @@ Cancel(t) ==
   \* It leaves its node.
   /\ Withdraw(t, TRUE)
   \* Nothing else changes.
-  /\ UNCHANGED <<word, owedCount, arrivals, waiting, owedMark, guards, marked, took, seenH, dloc,
+  /\ UNCHANGED <<word, owedCount, arrivals, waiting, owedMark, guards, marked, took, seenH, spinning, dloc,
                  ret, bargedOwed, turns, tally>>
 
 \* The withdrawn future tells the queue (Policy::withdrawn: a transition with Step::Drain): a
@@ -1168,7 +1463,7 @@ Wd2(t) ==
   /\ Transit(t, After(got[t]))
   \* Nothing else changes.
   /\ UNCHANGED <<avail, queued, handoff, owedCount, arrivals, waiting, nodes, wake, wl, marked, took,
-                 seenH, dloc, bargedOwed, turns, dPasses, overran>>
+                 seenH, spinning, dloc, bargedOwed, turns, dPasses, overran>>
 
 \* A future that leaves after a grant takes back the nudge marker (one fetch-and) before it gives
 \* the granted permits back.
@@ -1206,7 +1501,7 @@ Gb2(t) ==
             /\ pc' = [pc EXCEPT ![t] = After(got[t] - Need[t])]
   \* Nothing else changes.
   /\ UNCHANGED <<drainOn, dirty, queued, nudgeOut, handoff, wakeFront, owedCount, arrivals, waiting,
-                 nodes, wake, wl, marked, took, seenH, passOn, dloc, ret, bargedOwed, turns, tally>>
+                 nodes, wake, wl, marked, took, seenH, passOn, spinning, dloc, ret, bargedOwed, turns, tally>>
 
 \* It asks for the pass (Policy::released: a transition with Step::Wake that raises WAKE_FRONT).
 Gb3(t) ==
@@ -1221,7 +1516,7 @@ Gb3(t) ==
   /\ Asks(t, After(got[t]))
   \* Nothing else changes.
   /\ UNCHANGED <<avail, queued, nudgeOut, handoff, owedCount, arrivals, waiting, nodes, wake, wl,
-                 marked, took, seenH, passOn, dloc, bargedOwed, turns, dPasses, overran>>
+                 marked, took, seenH, passOn, spinning, dloc, bargedOwed, turns, dPasses, overran>>
 
 ----------------------------------------------------------------------------
 \* Releasing and moving owned guards.
@@ -1401,7 +1696,8 @@ DG(d) ==
                  /\ got' = [got EXCEPT ![h] = @ + dHand]
                  \* and the pass's hand is empty.
                  /\ dHand' = 0
-                 \* A sleeping future is to be woken.
+                 \* A sleeping future (its waker armed) is to be woken. One that runs, spinning on
+                 \* its node included, is not: it reads the grant itself.
                  /\ wl' = IF pc[h] = "parked" THEN wl \cup {h} ELSE wl
                  \* The loop goes round again.
                  /\ pc' = [pc EXCEPT ![d] = "dh"]
@@ -1513,7 +1809,8 @@ Nudge(i) ==
   IN /\ nudged' = [nudged EXCEPT ![n] = @ \/ hit]
      \* The pass notes that a nudge is on its way: this one, or the earlier one.
      /\ dSent' = (dSent \/ hit \/ pending)
-     \* A sleeping future is to be woken.
+     \* A sleeping future (its waker armed) is to be woken. One that runs, spinning on its node
+     \* included, is not: the release skips the wake and the spinner reads the mark itself.
      /\ wl' = IF hit /\ pc[n] = "parked" THEN wl \cup {n} ELSE wl
      \* The budget shrinks by the request (never below zero).
      /\ dBudget' = IF dBudget >= Need[n] THEN dBudget - Need[n] ELSE 0
@@ -1687,6 +1984,8 @@ Init ==
   /\ marked = [t \in Tasks |-> FALSE] /\ took = [t \in Tasks |-> FALSE]
   \* (its other locals)
   /\ seenH = [t \in Tasks |-> FALSE] /\ passOn = [t \in Tasks |-> FALSE]
+  \* Nobody spins on its node.
+  /\ spinning = [t \in Tasks |-> FALSE]
   \* No pass is under way.
   /\ dWF = FALSE /\ dBudget = 0 /\ dPos = 0 /\ dFirst = FALSE /\ dRaised = FALSE /\ dSent = FALSE
   \* (its other locals)
@@ -1705,8 +2004,12 @@ Init ==
 
 \* The steps a task takes on its own once started: they must happen.
 Internal(t) ==
-  \* The waiter's own steps up to its try,
+  \* The attempt and the spin before queueing,
+  \/ Retake(t) \/ PreSpin(t) \/ PreSpinOut(t)
+  \* the waiter's own steps up to its try,
   \/ Push(t) \/ Publish(t) \/ Park0(t) \/ Repark(t) \/ Poll(t) \/ GrantCons(t) \/ NudgeCons(t) \/ Try(t)
+  \* the spin on its own node after a failed try,
+  \/ SpinStart(t) \/ SpinEnd(t)
   \* the try that may raise HANDOFF,
   \/ Owe1(t) \/ Owe2(t) \/ Owe3(t) \/ Owe4(t) \/ Owe5(t) \/ Owe6(t) \/ Owe7(t)
   \* leaving the queue, and asking for a pass after a release,
@@ -1757,6 +2060,8 @@ TypeOK ==
   /\ pc \in [Tasks -> PCs]
   \* The ghosts are a small count and two yes-or-no notes.
   /\ dPasses \in 0..PassMax /\ dEarned \in BOOLEAN /\ overran \in BOOLEAN
+  \* Each future spins on its node or not.
+  /\ spinning \in [Tasks -> BOOLEAN]
 
 \* Only the holder of the drain role is inside the drain, and there is at most one.
 \* Rules out two threads sorting the same waiting list at once, which would corrupt it: the list
@@ -1843,6 +2148,19 @@ MarkedWoken ==
     pc[t] = "parked" /\ (phase[t] = "granted" \/ nudged[t]) =>
       \* its waker was called, or the pass under way is about to call it.
       wake[t] \/ t \in wl
+
+\* A SPINNING WAITER IS NEVER ARMED. A future spins on its node only inside its poll, at the step
+\* the spin runs at, with its node still in the queue's hands (waiting, or granted while it spun:
+\* only the future itself can withdraw it, and it is busy spinning); so its node has no waker a
+\* release could claim, and a release that marks it calls no waker: the spinner reads the mark
+\* itself.
+\* Rules out, for example: a future asleep (its waker armed) that the model still counts as
+\* spinning, so that a release would skip its wake.
+SpinningUnarmed ==
+  \* For every task:
+  \A t \in Tasks :
+    \* if it spins, it is at the spin step, and its node waits or was granted while it spun.
+    spinning[t] => pc[t] = "nspin" /\ phase[t] \in {"waiting", "granted"}
 
 \* Every task is between operations and nobody holds the drain role.
 Quiescent == ~drainOn /\ \A t \in Tasks : pc[t] \in {"idle", "holding", "owned", "parked"}
