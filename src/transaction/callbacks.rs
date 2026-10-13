@@ -369,7 +369,7 @@ impl Transaction {
             let claim = Claim::track(engine, committing);
             // The locks taken before the claim existed are `close`'s to
             // release too.
-            if let Some(owner) = owner.get() {
+            if let Some(owner) = owner {
                 claim.hold_locks_of(Arc::clone(owner));
             }
             claim

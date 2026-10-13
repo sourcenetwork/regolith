@@ -976,8 +976,11 @@ pub struct Transaction {
     held_locks: TxnBuffer<Vec<u8>, Arc<KeyLock>>,
     /// The database's lock table; `None` for an optimistic transaction.
     lock_table: Option<Arc<LockTable>>,
-    /// The name this transaction's locks carry, made by its first lock call.
-    lock_owner: OnceLock<Arc<LockOwner>>,
+    /// The name this transaction's locks carry: taken at begin for a
+    /// pessimistic transaction, from the ones this thread's earlier
+    /// transactions gave back (`LockOwner::take`), and given back when it
+    /// ends. `None` for an optimistic transaction.
+    lock_owner: Option<Arc<LockOwner>>,
     /// The waits for locks other transactions held, one per key, kept across
     /// calls (`locking`). Allocated by the first wait.
     lock_waits: OnceLock<Box<LockWaits>>,
@@ -1061,6 +1064,11 @@ impl Transaction {
             .transaction_hooks()
             .is_some()
             .then(|| Claim::track(&engine, false));
+        let lock_owner = lock_table.as_ref().map(|_| LockOwner::take());
+        // `close` releases the locks of a transaction it aborts by this name.
+        if let (Some(claim), Some(owner)) = (&claim, &lock_owner) {
+            claim.hold_locks_of(Arc::clone(owner));
+        }
         Self {
             engine,
             snapshot_seq,
@@ -1085,7 +1093,7 @@ impl Transaction {
             prepare_state: Prepare::Pending,
             held_locks: TxnBuffer::new(keys_inline),
             lock_table,
-            lock_owner: OnceLock::new(),
+            lock_owner,
             lock_waits: OnceLock::new(),
             lock_timeout,
             resolved: false,
@@ -2417,6 +2425,13 @@ impl Drop for Transaction {
         self.release_resources();
         if abandoned {
             self.finish_dropped();
+        }
+        // The claim holds a clone of the lock owner; letting it go first lets
+        // the owner be lent to this thread's next transaction when nothing
+        // else holds either.
+        self.claim = None;
+        if let Some(owner) = self.lock_owner.take() {
+            LockOwner::give_back(owner);
         }
     }
 }

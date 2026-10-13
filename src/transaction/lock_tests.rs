@@ -133,3 +133,38 @@ fn two_calls_behind_a_holder_share_one_wait_and_the_release_reaches_it() {
     );
     assert_ne!(holder(&db, b"k"), 0);
 }
+
+/// E42. A thread's transactions, one after another, share one lock owner:
+/// none is allocated in steady state. A commit whose locks wait for its
+/// landing keeps its owner, and the next transaction gets another name.
+#[test]
+fn owners_are_lent_to_the_next_transaction_unless_a_landing_holds_them() {
+    let dir = TempDir::new().unwrap();
+    let db = TransactionDb::open(
+        dir.path(),
+        Options::default().durability(crate::DurabilityMode::Immediate),
+    )
+    .unwrap();
+    let name = |txn: &Transaction| txn.lock_owner.as_ref().unwrap().id().word();
+    let first = db.begin(&TxnOptions::new());
+    let lent = name(&first);
+    first.put(b"a", b"1").unwrap();
+    first.commit().unwrap();
+    let second = db.begin(&TxnOptions::new());
+    assert_eq!(name(&second), lent, "a plain commit gives its owner back");
+
+    let mut queue = db.db().io_queue();
+    let landing = db.begin(&TxnOptions::new().io_queue(queue.id()));
+    let held = name(&landing);
+    landing.put(b"b", b"2").unwrap();
+    let ticket = landing.commit_nowait();
+    assert!(!ticket.is_ready(), "an Immediate commit waits for its sync");
+    let next = db.begin(&TxnOptions::new());
+    assert_ne!(
+        name(&next),
+        held,
+        "an owner was lent while its commit's locks wait for the landing"
+    );
+    queue.block_on(ticket).unwrap();
+    drop((second, next));
+}

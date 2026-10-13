@@ -224,9 +224,60 @@ pub(crate) struct LockOwner {
     _place: u8,
 }
 
+/// Owners a thread keeps for its next pessimistic transactions. A thread
+/// runs one transaction at a time as a rule; the few beyond that cover
+/// transactions it holds open side by side.
+const OWNER_POOL: usize = 4;
+
+std::thread_local! {
+    /// The owners this thread's ended transactions gave back
+    /// ([`LockOwner::give_back`]), each held by nothing else.
+    static OWNERS: std::cell::RefCell<Vec<Arc<LockOwner>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
 impl LockOwner {
     pub(super) fn new() -> Arc<Self> {
         Arc::new(Self { _place: 0 })
+    }
+
+    /// A name for a pessimistic transaction that begins on this thread: one
+    /// an earlier transaction of the thread gave back, else a new one. So a
+    /// thread that runs transactions one after another allocates no owner
+    /// and changes no count in steady state.
+    pub(super) fn take() -> Arc<Self> {
+        OWNERS
+            .try_with(|pool| pool.borrow_mut().pop())
+            .ok()
+            .flatten()
+            .unwrap_or_else(Self::new)
+    }
+
+    /// Give `owner` back as its transaction ends, for this thread's next
+    /// transaction, if nothing else holds it. A commit whose locks are
+    /// released at its landing (`LandingLocks`) and a close claim each hold a
+    /// clone while they may still carry or release the name, so an owner one
+    /// of them holds is dropped instead, and the name is never lent out while
+    /// a lock can still carry it for the old transaction. A name a handoff
+    /// wrote for the old transaction and has not cleared yet carries the
+    /// handoff's mark, which the next transaction's calls never take for a
+    /// hold (`OwnedLock`).
+    pub(super) fn give_back(owner: Arc<Self>) {
+        // Nothing ever makes a `Weak` of an owner, so a strong count of one is
+        // every reference. The fence pairs with the release the last other
+        // holder's drop made, so what it did with the name happened before
+        // the name is lent again.
+        if Arc::strong_count(&owner) != 1 {
+            return;
+        }
+        std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
+        // A thread that is exiting has no pool left; the owner is dropped.
+        let _ = OWNERS.try_with(|pool| {
+            let mut pool = pool.borrow_mut();
+            if pool.len() < OWNER_POOL {
+                pool.push(owner);
+            }
+        });
     }
 
     /// The name this owner's locks carry.
@@ -651,6 +702,34 @@ mod tests {
         assert!(b.lock.unlock(kept.id()));
         table.unpin(b"b", &b);
         assert_eq!(table.len(), 0);
+    }
+
+    /// E42. An owner is lent to the thread's next transaction only when its
+    /// transaction held the last reference: one a landing commit or a close
+    /// claim still holds is never lent, and its name stays its own.
+    #[test]
+    fn an_owner_is_lent_again_only_when_nothing_else_holds_it() {
+        OWNERS.with(|pool| pool.borrow_mut().clear());
+        let owner = LockOwner::take();
+        let name = owner.id().word();
+        let landing = Arc::clone(&owner);
+        LockOwner::give_back(owner);
+        let next = LockOwner::take();
+        assert_ne!(next.id().word(), name, "lent while another holder had it");
+        drop(landing);
+        let name = next.id().word();
+        LockOwner::give_back(next);
+        let again = LockOwner::take();
+        assert_eq!(again.id().word(), name, "the only holder gave it back");
+        for _ in 0..OWNER_POOL + 2 {
+            LockOwner::give_back(LockOwner::new());
+        }
+        assert_eq!(
+            OWNERS.with(|pool| pool.borrow().len()),
+            OWNER_POOL,
+            "the pool is bounded"
+        );
+        OWNERS.with(|pool| pool.borrow_mut().clear());
     }
 
     /// Make `waiter`'s wait owed: it loses every race the bound allows while
