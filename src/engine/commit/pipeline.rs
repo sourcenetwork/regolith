@@ -365,6 +365,7 @@ impl RegolithEngine {
                     }
                 },
             };
+            let mut seen = None;
             if desc.decision().is_none() {
                 // Another thread is deciding it now: it is given about as
                 // long as the decision takes before this thread repeats the
@@ -374,12 +375,13 @@ impl RegolithEngine {
                 }
                 if desc.decision().is_none() {
                     hook::at(hook::Stage::Decide);
-                    if let Turn::Blocked(job) = self.decide(pipe, index, desc, help) {
-                        return Turn::Blocked(job);
+                    match self.decide(pipe, index, desc, help) {
+                        Ok(tip) => seen = Some(tip),
+                        Err(job) => return Turn::Blocked(job),
                     }
                 }
             }
-            self.settle(pipe, index, desc);
+            self.settle(pipe, index, desc, seen);
         }
     }
 
@@ -399,57 +401,57 @@ impl RegolithEngine {
     }
 
     /// Give slot `index` its decision, unless it has one by the time this
-    /// returns or a unit is in the way.
+    /// returns or a unit is in the way (`Err`). `Ok` holds the tip this call
+    /// read last, which [`Self::settle`] starts from while it is still the
+    /// tip.
     fn decide(
         &self,
         pipe: &Pipeline,
         index: u64,
         desc: &RingArc<Descriptor>,
         help: Help<'_>,
-    ) -> Turn {
+    ) -> Result<RingArc<Decision>, Arc<Job>> {
         // P1: the tip read here is the state after slot `index - 1` as long
         // as that slot is still the newest decided one, which is checked
         // after the read. A decision computed from an older tip loses the
         // install below to the one that already decided the slot.
         let mut prev = pipe.tip.load();
         if !pipe.ring.is_next_to_decide(index) || desc.decision().is_some() {
-            return Turn::Done;
+            return Ok(prev);
         }
         if let Work::Unit { job, .. } = &desc.work {
             if job.is_done() {
                 // The unit's body ended without deciding the slot: it
                 // unwound. The pipeline goes on from where it was.
                 desc.decide(Decision::new(index, Fate::Unit, prev.after.clone()));
-                return Turn::Done;
+                return Ok(prev);
             }
             if self.pass(job, help) {
-                return Turn::Done;
+                return Ok(prev);
             }
-            return Turn::Blocked(Arc::clone(job));
+            return Err(Arc::clone(job));
         }
 
         let mut refused = None;
         // Read after the tip: a tip the check already replaced means its
         // job was made before, so it is seen here.
         if desc.turn_job.get().is_some() || self.turn_is_due(desc, &prev.after) {
-            match self.take_turn(index, desc, help) {
-                Ok(turned) => refused = turned.refused.as_ref().map(crate::Error::clone_io),
-                Err(job) => return Turn::Blocked(job),
-            }
+            refused = self
+                .take_turn(index, desc, help)?
+                .refused
+                .as_ref()
+                .map(crate::Error::clone_io);
             // The check left the state it made, rotated or not, in the tip,
             // before its job landed.
             prev = pipe.tip.load();
             if !pipe.ring.is_next_to_decide(index) {
-                return Turn::Done;
+                return Ok(prev);
             }
         }
         let base = &prev.after;
         let decision = match refused {
             Some(err) => Decision::new(index, Fate::Refused(err), base.clone()),
-            None => match self.decide_reading(index, desc, base) {
-                Ok(decision) => decision,
-                Err(job) => return Turn::Blocked(job),
-            },
+            None => self.decide_reading(index, desc, base)?,
         };
         if let Fate::Conflict(conflict) = &decision.verdict {
             let ticker = match conflict.mine() {
@@ -465,7 +467,7 @@ impl RegolithEngine {
         } else {
             desc.decide(decision);
         }
-        Turn::Done
+        Ok(prev)
     }
 
     /// The decision of a write, a transaction or a counter reservation from
@@ -640,12 +642,25 @@ impl RegolithEngine {
     /// and pass the decided frontier over it (P1, P2). A decision computed
     /// from a state a rollback has since discarded lands nothing: its slot
     /// is failed instead (P4).
-    pub(super) fn settle(&self, pipe: &Pipeline, index: u64, desc: &RingArc<Descriptor>) {
+    ///
+    /// `seen` is a tip the caller read, used in place of a new load for as
+    /// long as it is still the tip: the slot holds it at the moment that is
+    /// checked, which is all a load would tell.
+    pub(super) fn settle(
+        &self,
+        pipe: &Pipeline,
+        index: u64,
+        desc: &RingArc<Descriptor>,
+        mut seen: Option<RingArc<Decision>>,
+    ) {
         let Some(decision) = desc.decision_arc() else {
             return;
         };
         loop {
-            let tip = pipe.tip.load();
+            let tip = match seen.take() {
+                Some(tip) if pipe.tip.holds(&tip) => tip,
+                _ => pipe.tip.load(),
+            };
             if tip.index >= decision.index {
                 // Another thread moved the tip here, or a rollback took the
                 // slot in.

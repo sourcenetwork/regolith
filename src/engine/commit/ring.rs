@@ -587,6 +587,14 @@ impl<T: Linked> ArcSlot<T> {
         value
     }
 
+    /// Whether `value` is the value the slot holds now: what a [`Self::load`]
+    /// made now would return, with no pin and no new reference. The caller
+    /// holds `value`, so its address cannot have been reused by another value
+    /// in between.
+    pub(super) fn holds(&self, value: &Arc<T>) -> bool {
+        ptr::eq(self.current.load(Ordering::SeqCst), Arc::as_ptr(value))
+    }
+
     /// Replace `expected` with `next`, when `expected` is still the value
     /// the slot holds. The caller holds `expected`, so its address cannot
     /// have been reused by another value in between.
