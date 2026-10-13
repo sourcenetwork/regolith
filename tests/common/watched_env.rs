@@ -201,6 +201,11 @@ impl LogFile for WatchedLog {
         self.watch.note_caller();
         self.inner.set_len(len)
     }
+
+    fn start_writeback(&self, offset: u64, len: u64) {
+        self.watch.note_caller();
+        self.inner.start_writeback(offset, len);
+    }
 }
 
 impl Env for WatchedEnv {

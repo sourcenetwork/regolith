@@ -1,8 +1,9 @@
 //! The threads a database starts (plan 3.13 and 4.5): as many compaction
 //! workers as `Options::max_background_compactions` asks for, started through
-//! its `Env` when it opens, and no other thread at any time. A caller that
-//! runs a pinned worker pool sizes it around that number, so the number is a
-//! promise.
+//! its `Env` when it opens, and no other thread at any time, unless the caller
+//! asks for the log writeback lane (`Options::log_writeback`), which is one
+//! more on Linux with a worker. A caller that runs a pinned worker pool sizes
+//! it around that number, so the number is a promise.
 //!
 //! Each configuration is opened, put through writes, a flush, a compaction,
 //! reads, a snapshot, transactions with a blocking and a ticketed commit, an
@@ -151,6 +152,8 @@ struct Row {
     /// instead of the host's files.
     in_memory: bool,
     workers: usize,
+    /// Whether it asks for the log writeback lane.
+    lane: bool,
 }
 
 const fn on_files(
@@ -165,12 +168,13 @@ const fn on_files(
         options,
         in_memory: false,
         workers,
+        lane: false,
     }
 }
 
 /// The transaction layers add no thread, so the default options run through
 /// every handle and each other configuration through one.
-const ROWS: [Row; 12] = [
+const ROWS: [Row; 14] = [
     on_files(
         "the default options",
         Handle::Plain,
@@ -230,6 +234,7 @@ const ROWS: [Row; 12] = [
         options: |env| Options::memory().env(env),
         in_memory: true,
         workers: 0,
+        lane: false,
     },
     on_files(
         "a sync on every commit",
@@ -258,13 +263,45 @@ const ROWS: [Row; 12] = [
         },
         1,
     ),
+    Row {
+        name: "the log writeback lane, asked for",
+        handle: Handle::Plain,
+        options: |env| Options::default().env(env).log_writeback(true),
+        in_memory: false,
+        workers: 1,
+        lane: true,
+    },
+    // With no worker the lane is not started, asked for or not.
+    Row {
+        name: "the log writeback lane, asked for with no worker",
+        handle: Handle::Plain,
+        options: |env| {
+            Options::default()
+                .env(env)
+                .max_background_compactions(0)
+                .log_writeback(true)
+        },
+        in_memory: false,
+        workers: 0,
+        lane: true,
+    },
 ];
 
-/// The names the workers of a database with `workers` of them carry.
-fn worker_names(workers: usize) -> Vec<String> {
-    (0..workers)
+/// Whether `row` starts the log writeback lane: asked for, with a worker,
+/// on Linux, the one host with the writeback hint.
+fn lane_runs(row: &Row) -> bool {
+    row.lane && row.workers > 0 && cfg!(target_os = "linux")
+}
+
+/// The names of the threads `row` starts: its workers, then the lane.
+fn thread_names(row: &Row) -> Vec<String> {
+    let mut names: Vec<String> = (0..row.workers)
         .map(|index| format!("regolith-compaction-{index}"))
-        .collect()
+        .collect();
+    if lane_runs(row) {
+        names.push("regolith-log-writeback".to_string());
+    }
+    names
 }
 
 fn watched(row: &Row) -> (Arc<dyn Env>, Arc<Watch>) {
@@ -283,12 +320,12 @@ fn a_database_starts_the_compaction_workers_it_was_asked_for_and_no_other_thread
         let dir = tempfile::tempdir().unwrap();
         let (env, watch) = watched(row);
         let before = process_threads();
-        let expected = before.map(|before| before + row.workers);
+        let expected = before.map(|before| before + thread_names(row).len());
 
         let opened = Opened::open(row.handle, dir.path(), (row.options)(Arc::clone(&env)));
         assert_eq!(
             watch.started(),
-            worker_names(row.workers),
+            thread_names(row),
             "{case}: threads asked of the env at open"
         );
         assert_eq!(process_threads(), expected, "{case}: threads after open");
@@ -296,7 +333,7 @@ fn a_database_starts_the_compaction_workers_it_was_asked_for_and_no_other_thread
         use_it(&opened);
         assert_eq!(
             watch.started(),
-            worker_names(row.workers),
+            thread_names(row),
             "{case}: threads asked of the env in the database's whole life"
         );
         assert_eq!(process_threads(), expected, "{case}: threads after use");
@@ -313,7 +350,7 @@ fn a_database_starts_the_compaction_workers_it_was_asked_for_and_no_other_thread
         common::eventually(&format!("{case}: every worker is gone after close"), || {
             process_threads() == before
         });
-        assert_eq!(watch.started(), worker_names(row.workers), "{case}");
+        assert_eq!(watch.started(), thread_names(row), "{case}");
         assert_eq!(watch.strangers(&me), [], "{case}: after close");
 
         // A read-only handle on what was written starts no thread, whatever
