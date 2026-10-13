@@ -64,17 +64,19 @@ mod shell {
         }
 
         /// Put `value` in the allocation and hand it out as an `Arc<T>`.
+        ///
+        /// No `Arc::get_mut` here: it would ask again, with a locked
+        /// instruction, what S1 already says.
         pub(super) fn fill(self, value: T) -> Arc<T> {
-            let mut arc = self.0;
-            match Arc::get_mut(&mut arc) {
-                Some(slot) => {
-                    slot.write(value);
-                    // SAFETY: the value was written on the line above.
-                    unsafe { arc.assume_init() }
-                }
-                // S1 makes this unreachable; a new allocation is always
-                // right.
-                None => Arc::new(value),
+            let raw = Arc::into_raw(self.0).cast_mut();
+            // SAFETY (S1): the shell's `Arc` is the only reference to the
+            // allocation, strong or weak, so nothing else reads or writes it
+            // while the value goes in. `raw` came from `Arc::into_raw`, and
+            // `T` has the layout of `MaybeUninit<T>`, so `Arc::from_raw`
+            // takes it back as an `Arc<T>` once the value is written.
+            unsafe {
+                (*raw).write(value);
+                Arc::from_raw(raw.cast_const().cast::<T>())
             }
         }
     }
