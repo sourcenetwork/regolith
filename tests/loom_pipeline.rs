@@ -16,6 +16,9 @@
 //!   old one.
 //! - **The pin**: a descriptor, or the pipeline's state, loaded while it is
 //!   retired or replaced is alive.
+//! - **The drop at the swap**: a replaced tip is dropped at once when no
+//!   load is counted in, and waits on the list otherwise; no value is
+//!   dropped while loaded or dropped twice.
 //! - **Decide with helping**: two threads decide the same two slots at
 //!   once; each slot gets one decision and the sequences are dense.
 //! - **The watermark claim**: two commits need the log durable; one claims
@@ -83,6 +86,17 @@ fn a_loader_that_does_not_pin_reads_a_dropped_descriptor() {
 #[test]
 fn a_tip_loaded_while_it_is_replaced_is_alive() {
     pipeline::a_tip_loaded_while_it_is_replaced_is_alive();
+}
+
+#[test]
+fn a_tip_replaced_twice_while_loaded_drops_each_value_once() {
+    pipeline::a_tip_replaced_twice_while_loaded_drops_each_value_once();
+}
+
+#[test]
+#[should_panic(expected = "a loader holds a tip that was already dropped")]
+fn a_replace_that_reads_the_pins_before_its_swap_drops_a_loaded_tip() {
+    pipeline::a_replace_that_reads_the_pins_before_its_swap_drops_a_loaded_tip();
 }
 
 #[test]

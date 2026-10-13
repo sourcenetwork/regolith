@@ -607,8 +607,26 @@ impl<T: Linked> ArcSlot<T> {
             Ordering::SeqCst,
         ) {
             Ok(old) => {
-                self.retire(old);
-                self.collect();
+                // The common case: no load under way and nothing waiting on
+                // the list. A load that could hold `old`'s address without a
+                // reference of its own counted itself in `pins` before it
+                // read `current`, so before the swap above, and is still
+                // counted when `pins` is read after it (the argument
+                // `collect` makes). Read as zero, `old` goes at once, with
+                // no trip through the list: three locked instructions fewer
+                // on every commit.
+                seq_cst_handshake();
+                if self.limbo.load(Ordering::SeqCst).is_null()
+                    && self.pins.load(Ordering::SeqCst) == 0
+                {
+                    // SAFETY: the slot's own reference to the value it held,
+                    // swapped out above, on no list, with no load that could
+                    // hold its address.
+                    T::retired(unsafe { Arc::from_raw(old.cast_const()) });
+                } else {
+                    self.retire(old);
+                    self.collect();
+                }
                 true
             }
             Err(_) => {

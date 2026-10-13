@@ -32,9 +32,10 @@
 //! Each positive model has a calibration that writes one step the wrong way
 //! out of plain loom atomics and must fail: a void that is not a
 //! compare-and-swap, a cleaner that takes the descriptor of an install
-//! under way, a frontier passed before the tip moved, a claim that is a
-//! load and a store, a frontier published before the horizon, and a settle
-//! that does not look at the epoch.
+//! under way, a replacement that reads the pins before its swap, a frontier
+//! passed before the tip moved, a claim that is a load and a store, a
+//! frontier published before the horizon, and a settle that does not look
+//! at the epoch.
 
 #![allow(unsafe_code)]
 
@@ -454,6 +455,150 @@ pub fn a_tip_loaded_while_it_is_replaced_is_alive() {
             replacer.join().expect("replacer");
             loader.join().expect("loader");
             assert_eq!(tip.load().index, 2);
+        },
+    );
+}
+
+/// A value for the tip cell that counts its drops, one counter per value.
+struct Counted {
+    /// Which value this is: 0, 1 or 2.
+    id: usize,
+    /// How many times each value was dropped.
+    drops: Arc<[AtomicUsize; 3]>,
+    link: AtomicPtr<Counted>,
+}
+
+impl Counted {
+    fn new(id: usize, drops: &Arc<[AtomicUsize; 3]>) -> Arc<Self> {
+        Arc::new(Self {
+            id,
+            drops: Arc::clone(drops),
+            link: AtomicPtr::new(ptr::null_mut()),
+        })
+    }
+}
+
+impl Drop for Counted {
+    fn drop(&mut self) {
+        self.drops[self.id].fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+impl Linked for Counted {
+    fn link(&self) -> &AtomicPtr<Self> {
+        &self.link
+    }
+}
+
+/// The tip cell's drop at the swap (`ArcSlot::replace`): a replacement
+/// that finds no load counted in and nothing on the list drops the replaced
+/// value at once; one that finds a load puts it on the list, where a later
+/// replacement or the cell's own drop drops it. A thread replaces the tip
+/// twice while another loads it: whichever value the load returns is not
+/// dropped while it holds it, no value is dropped twice, and once the cell
+/// is dropped every value is dropped exactly once.
+///
+/// Bound: 3 preemptions. The race is the load's window between counting
+/// itself in and taking its reference, which one switch opens and one
+/// closes; the second replacement is there for a value the first left on
+/// the list, which a third switch reaches.
+pub fn a_tip_replaced_twice_while_loaded_drops_each_value_once() {
+    explore_bounded(
+        "a_tip_replaced_twice_while_loaded_drops_each_value_once",
+        Some(3),
+        8,
+        1,
+        |witness| {
+            let drops = Arc::new(std::array::from_fn(|_| AtomicUsize::new(0)));
+            let tip = Arc::new(ArcSlot::new(Counted::new(0, &drops)));
+            let replacer = {
+                let (tip, drops) = (Arc::clone(&tip), Arc::clone(&drops));
+                thread::spawn(move || {
+                    for next in 1..3 {
+                        let seen = tip.load();
+                        assert!(tip.replace(&seen, Counted::new(next, &drops)));
+                    }
+                })
+            };
+            let loader = {
+                let (tip, drops) = (Arc::clone(&tip), Arc::clone(&drops));
+                let witness = witness.clone();
+                thread::spawn(move || {
+                    let seen = tip.load();
+                    // The load got a value the replacer goes on to replace.
+                    if seen.id < 2 {
+                        witness.record();
+                    }
+                    assert_eq!(
+                        drops[seen.id].load(Ordering::SeqCst),
+                        0,
+                        "a loaded tip was dropped"
+                    );
+                })
+            };
+            replacer.join().expect("replacer");
+            loader.join().expect("loader");
+            assert_eq!(tip.load().id, 2);
+            // A replaced value is dropped at once or waits on the list, never
+            // twice, and the tip is never dropped while the cell holds it.
+            let gone: Vec<usize> = drops.iter().map(|d| d.load(Ordering::SeqCst)).collect();
+            assert!(gone[0] <= 1 && gone[1] <= 1 && gone[2] == 0, "{gone:?}");
+            drop(tip);
+            let gone: Vec<usize> = drops.iter().map(|d| d.load(Ordering::SeqCst)).collect();
+            assert_eq!(gone, [1, 1, 1], "every value, each once");
+        },
+    );
+}
+
+/// Calibration for [`a_tip_replaced_twice_while_loaded_drops_each_value_once`]:
+/// a replacement that looks at the pins before its swap instead of after.
+/// A load that counts itself in and reads the old value between the look
+/// and the swap is missed, the value is dropped under it, and the load holds
+/// a dropped tip.
+pub fn a_replace_that_reads_the_pins_before_its_swap_drops_a_loaded_tip() {
+    explore_bounded(
+        "a_replace_that_reads_the_pins_before_its_swap_drops_a_loaded_tip",
+        Some(3),
+        2,
+        1,
+        |witness| {
+            // The tip names value 1 or value 2.
+            let current = Arc::new(AtomicU64::new(1));
+            let pins = Arc::new(AtomicUsize::new(0));
+            // 1 while value 1 is alive.
+            let alive = Arc::new(AtomicU64::new(1));
+            let replacer = {
+                let (current, pins, alive) =
+                    (Arc::clone(&current), Arc::clone(&pins), Arc::clone(&alive));
+                thread::spawn(move || {
+                    let loads = pins.load(Ordering::SeqCst);
+                    current.store(2, Ordering::SeqCst);
+                    if loads == 0 {
+                        alive.store(0, Ordering::SeqCst);
+                    }
+                })
+            };
+            let loader = {
+                let (current, pins, alive) =
+                    (Arc::clone(&current), Arc::clone(&pins), Arc::clone(&alive));
+                let witness = witness.clone();
+                thread::spawn(move || {
+                    pins.fetch_add(1, Ordering::SeqCst);
+                    if current.load(Ordering::SeqCst) == 1 {
+                        witness.record();
+                        assert_eq!(
+                            alive.load(Ordering::SeqCst),
+                            1,
+                            "a loader holds a tip that was already dropped"
+                        );
+                    }
+                    pins.fetch_sub(1, Ordering::SeqCst);
+                })
+            };
+            replacer.join().expect("replacer");
+            if let Err(payload) = loader.join() {
+                std::panic::resume_unwind(payload);
+            }
         },
     );
 }
