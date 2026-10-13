@@ -440,8 +440,11 @@ impl JoinHandle for StdJoinHandle {
         // A worker asked to join itself is the one tearing the database
         // down: it held the last reference, inside a job whose caller
         // dropped its handle without waiting. It cannot wait for its own
-        // exit, which follows as soon as it returns to its loop and finds
-        // the shutdown it just signalled; the handle is let go instead.
+        // exit, which follows as soon as the job returns to its loop and
+        // the loop finds the shutdown it just signalled; the handle is let
+        // go instead. The directory stays locked until then: the worker
+        // holds a share of the lock and drops it as it exits
+        // (`CompactionScheduler::start`).
         if self.0.thread().id() == std::thread::current().id() {
             return;
         }

@@ -32,7 +32,15 @@ impl BackupEngine {
     /// Remove every shared table no backup in the repository lists, a batch
     /// of [`SWEEP`] at a time (module docs). Only names the engine gives a
     /// shared table are considered; anything else in `shared/` stays.
+    ///
+    /// Starts with a sync of `meta/`, and removes nothing unless it succeeds:
+    /// a backup's metadata removed by this call, or by an earlier one whose
+    /// sync failed and that a retry finds already gone, is then durable
+    /// before any table it listed goes. Without it a power cut could bring
+    /// the metadata back and keep the removals, leaving a backup that lists
+    /// tables the pool no longer has (`BackupSeal.tla`, `SyncOnlyRemoved`).
     pub(super) fn collect_shared(&self) -> Result<()> {
+        self.env.sync_dir(&self.meta_dir).map_err(Error::from)?;
         let mut walk = self.env.read_dir(&self.shared_dir).map_err(Error::from)?;
         let mut removed_any = false;
         let mut first = true;

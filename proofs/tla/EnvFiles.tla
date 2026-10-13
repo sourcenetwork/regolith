@@ -43,7 +43,11 @@
 \* "current". Two things must hold for that to always find the file:
 \*   - the Env's rename puts the file under the new name BEFORE it takes it
 \*     from the old one (MemEnv::rename, and the OPFS mirror and pool), so
-\*     at every instant one of the two names holds it;
+\*     at every instant one of the two names holds it. MemEnv's rename first
+\*     marks the old name as leaving, a write that takes the file from no
+\*     name and so changes nothing a reopen sees; it is left out here, and
+\*     EnvRename.tla checks what it is for: a removal or a second rename
+\*     racing the move;
 \*   - a reopen that loaded the names before the whole move ran (it knows
 \*     only the old name, and the file is already under the new one) loads
 \*     the names again when its open finds nothing, and tries again.

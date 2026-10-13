@@ -666,10 +666,18 @@ mod model {
     //! key, a block a reader holds is still the cache's entry for its key
     //! unless an explicit removal took it, and the accounted bytes are
     //! exactly the charges of what the cache returns, within the budget.
+    //!
+    //! The model holds strong references only where a reader would: in the
+    //! explicit pins. What it knows of the cache's other entries is held
+    //! weakly, which keeps no block from the hand, so the sequences exercise
+    //! ordinary eviction and unpinning; and the run must show it did, by an
+    //! unpinned entry the hand evicted under pressure.
 
+    use std::cell::Cell;
     use std::collections::HashMap;
 
     use proptest::prelude::*;
+    use proptest::test_runner::{Config, TestRunner};
 
     use super::*;
 
@@ -695,85 +703,128 @@ mod model {
         ]
     }
 
-    proptest! {
-        #![proptest_config(ProptestConfig::with_cases(128))]
-        #[test]
-        fn the_cache_matches_its_sequential_model(
-            ops in proptest::collection::vec(op(), 1..200),
-            shard_bits in 0u32..2,
-        ) {
-            let cache = BlockCache::with_config(96 * 1024, shard_bits, false);
-            // The last block inserted under each key: the only one the
-            // cache may return for it.
-            let mut latest: HashMap<(u64, u64), Arc<Block>> = HashMap::new();
-            // Blocks a reader holds, with the key they were read under.
-            let mut pins: Vec<((u64, u64), Arc<Block>)> = Vec::new();
-            for op in ops {
-                match op {
-                    Op::Insert { file, block, size } => {
-                        let b = dummy_block(size);
-                        cache.insert(file, block * 4096, Arc::clone(&b));
-                        // An insert either replaces the key's entry or,
-                        // refused, leaves the cache as its search left it:
-                        // the older block if the hand did not take it.
-                        match cache.get(file, block * 4096) {
-                            Some(got) if Arc::ptr_eq(&got, &b) => {
-                                latest.insert((file, block), b);
-                            }
-                            Some(got) => prop_assert!(
-                                latest.get(&(file, block)).is_some_and(|old| Arc::ptr_eq(old, &got)),
-                                "a refused insert left a block that was never the latest"
-                            ),
-                            None => {
-                                latest.remove(&(file, block));
-                            }
+    /// What the model keeps of the last block inserted under a key: a weak
+    /// reference, which leaves the block's count to the cache and the
+    /// readers, and keeps its allocation, so no later block can take its
+    /// address while the model compares by it.
+    type Seen = std::sync::Weak<Block>;
+
+    fn seen(block: &Arc<Block>) -> Seen {
+        Arc::downgrade(block)
+    }
+
+    /// Whether `block` is the one `seen` was taken of.
+    fn is(seen: &Seen, block: &Arc<Block>) -> bool {
+        std::ptr::eq(seen.as_ptr(), Arc::as_ptr(block))
+    }
+
+    /// One generated sequence against the cache. Counts in `evicted` each
+    /// entry the hand took under pressure while no reader held it.
+    fn check(ops: Vec<Op>, shard_bits: u32, evicted: &Cell<u64>) -> Result<(), TestCaseError> {
+        // A third of what the 72 keys can hold at once, so inserts meet a
+        // full cache and the hand runs.
+        let cache = BlockCache::with_config(32 * 1024, shard_bits, false);
+        // The last block inserted under each key that the cache still
+        // holds: the only one it may return for that key.
+        let mut latest: HashMap<(u64, u64), Seen> = HashMap::new();
+        // Blocks a reader holds, with the key they were read under.
+        let mut pins: Vec<((u64, u64), Arc<Block>)> = Vec::new();
+        for op in ops {
+            match op {
+                Op::Insert { file, block, size } => {
+                    let b = dummy_block(size);
+                    cache.insert(file, block * 4096, Arc::clone(&b));
+                    // An insert either replaces the key's entry or, refused,
+                    // leaves the cache as its search left it: the older
+                    // block if the hand did not take it.
+                    match cache.get(file, block * 4096) {
+                        Some(got) if Arc::ptr_eq(&got, &b) => {
+                            latest.insert((file, block), seen(&b));
                         }
-                    }
-                    Op::Get { file, block } => {
-                        let _ = cache.get(file, block * 4096);
-                    }
-                    Op::Pin { file, block } => {
-                        if let Some(b) = cache.get(file, block * 4096) {
-                            pins.push(((file, block), b));
+                        Some(got) => prop_assert!(
+                            latest.get(&(file, block)).is_some_and(|old| is(old, &got)),
+                            "a refused insert left a block that was never the latest"
+                        ),
+                        None => {
+                            latest.remove(&(file, block));
                         }
-                    }
-                    Op::Unpin => {
-                        if !pins.is_empty() {
-                            pins.remove(0);
-                        }
-                    }
-                    Op::EvictFile { file } => {
-                        cache.evict_file(file);
-                        latest.retain(|(f, _), _| *f != file);
-                        pins.retain(|((f, _), _)| *f != file);
-                    }
-                    Op::Clear => {
-                        cache.clear();
-                        latest.clear();
-                        pins.clear();
                     }
                 }
-                prop_assert!(cache.usage() <= cache.capacity());
-                let mut charged = 0usize;
-                for (&(file, block), want) in &latest {
-                    if let Some(got) = cache.get(file, block * 4096) {
-                        prop_assert!(Arc::ptr_eq(&got, want), "a stale block for ({}, {})", file, block);
+                Op::Get { file, block } => {
+                    let _ = cache.get(file, block * 4096);
+                }
+                Op::Pin { file, block } => {
+                    if let Some(b) = cache.get(file, block * 4096) {
+                        pins.push(((file, block), b));
+                    }
+                }
+                Op::Unpin => {
+                    if !pins.is_empty() {
+                        pins.remove(0);
+                    }
+                }
+                Op::EvictFile { file } => {
+                    cache.evict_file(file);
+                    latest.retain(|(f, _), _| *f != file);
+                    pins.retain(|((f, _), _)| *f != file);
+                }
+                Op::Clear => {
+                    cache.clear();
+                    latest.clear();
+                    pins.clear();
+                }
+            }
+            prop_assert!(cache.usage() <= cache.capacity());
+            let mut charged = 0usize;
+            let mut gone = Vec::new();
+            for (&(file, block), want) in &latest {
+                match cache.get(file, block * 4096) {
+                    Some(got) => {
+                        prop_assert!(is(want, &got), "a stale block for ({}, {})", file, block);
                         charged += entry_charge(&CacheEntry::Data(got));
                     }
-                }
-                prop_assert_eq!(cache.usage(), charged, "the total is not what the cache holds");
-                for ((file, block), held) in &pins {
-                    if let Some(want) = latest.get(&(*file, *block))
-                        && Arc::ptr_eq(held, want)
-                    {
-                        let got = cache.get(*file, *block * 4096);
+                    // No explicit removal took it: the hand did, under the
+                    // pressure of an insert.
+                    None => {
                         prop_assert!(
-                            got.is_some_and(|got| Arc::ptr_eq(&got, held)),
+                            !pins
+                                .iter()
+                                .any(|(key, held)| *key == (file, block) && is(want, held)),
                             "a block a reader holds was evicted"
                         );
+                        gone.push((file, block));
                     }
                 }
             }
+            prop_assert_eq!(
+                cache.usage(),
+                charged,
+                "the total is not what the cache holds"
+            );
+            for key in gone {
+                latest.remove(&key);
+                evicted.set(evicted.get() + 1);
+            }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn the_cache_matches_its_sequential_model() {
+        let mut runner = TestRunner::new(Config {
+            cases: 128,
+            failure_persistence: None,
+            ..Config::default()
+        });
+        let evicted = Cell::new(0u64);
+        let input = (proptest::collection::vec(op(), 1..200), 0u32..2);
+        runner
+            .run(&input, |(ops, shard_bits)| check(ops, shard_bits, &evicted))
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert!(
+            evicted.get() > 0,
+            "no sequence saw the hand evict an entry no reader held: the model never \
+             exercised eviction"
+        );
     }
 }

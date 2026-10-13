@@ -28,6 +28,9 @@
 //! - **Cancellation at every await point**: a future polled once and then
 //!   dropped races the release that may hand it the lock or nudge it;
 //!   whatever it was given must reach the next waiter.
+//! - **No access after free**: a waiter node handed back to the allocator
+//!   counts as written (`Waiter::retire`), so a party that touches a node
+//!   after letting go of its reference fails every model as a race.
 //! - **Reentrancy depth**: an owner nests and unwinds while another owner
 //!   waits.
 //! - **The upgradable read**: it shares with readers, upgrades while they
@@ -622,6 +625,43 @@ fn notify_waiters_reaches_a_registered_waiter() {
     });
 }
 
+/// A `Notified` created before a `notify_waiters` passes its generation
+/// check and is held up before it queues; the broadcast runs, and a newer
+/// waiter queues ahead of it. The older one is still owed the broadcast
+/// wherever it lands in the queue: a pass that only looks at the front
+/// stops at the newer waiter and leaves the older one parked for good,
+/// which loom reports as a deadlock.
+#[test]
+fn an_older_notified_queued_behind_a_newer_one_gets_the_broadcast() {
+    explore(
+        "an_older_notified_queued_behind_a_newer_one_gets_the_broadcast",
+        3,
+        5,
+        || {
+            let notify = Arc::new(Notify::new());
+            let created = Arc::new(AtomicBool::new(false));
+            let older = {
+                let (notify, created) = (Arc::clone(&notify), Arc::clone(&created));
+                thread::spawn(move || {
+                    let waiting = notify.notified();
+                    created.store(true, Ordering::Release);
+                    block_on(waiting);
+                })
+            };
+            wait_for(&created);
+            notify.notify_waiters();
+            // Created after the broadcast, so it is not this one's.
+            let mut newer = Box::pin(notify.notified());
+            let polled = newer
+                .as_mut()
+                .poll(&mut Context::from_waker(std::task::Waker::noop()));
+            assert!(polled.is_pending(), "nothing notified it");
+            older.join().expect("older");
+            drop(newer);
+        },
+    );
+}
+
 #[test]
 fn a_dropped_notified_passes_its_notify_one_on() {
     // SHRUNK: one preemption where there were two (1.2 million interleavings,
@@ -646,6 +686,40 @@ fn a_dropped_notified_passes_its_notify_one_on() {
         }
         waiter.join().expect("waiter");
     });
+}
+
+/// A queued `Notified` is dropped on its own thread while a broadcast's
+/// wake list takes its waker. The grant let go of the queue's reference,
+/// so once the wake list lets go of its own the dropped future frees the
+/// node; the wake list must be done with the node by then. Under loom a
+/// freed node counts as written (`Waiter::retire`), so a wake list that
+/// reads the node's link after letting it go fails this model.
+#[test]
+fn a_notified_dropped_while_its_broadcast_wakes_it_outlives_the_wake_list() {
+    explore(
+        "a_notified_dropped_while_its_broadcast_wakes_it_outlives_the_wake_list",
+        3,
+        5,
+        || {
+            let notify = Arc::new(Notify::new());
+            let queued = Arc::new(AtomicBool::new(false));
+            let dropper = {
+                let (notify, queued) = (Arc::clone(&notify), Arc::clone(&queued));
+                thread::spawn(move || {
+                    let mut waiting = Box::pin(notify.notified());
+                    let polled = waiting
+                        .as_mut()
+                        .poll(&mut Context::from_waker(std::task::Waker::noop()));
+                    assert!(polled.is_pending(), "nothing notified it yet");
+                    queued.store(true, Ordering::Release);
+                    drop(waiting);
+                })
+            };
+            wait_for(&queued);
+            notify.notify_waiters();
+            dropper.join().expect("dropper");
+        },
+    );
 }
 
 #[test]

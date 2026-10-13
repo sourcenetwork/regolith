@@ -635,7 +635,12 @@ pub(crate) struct RegolithEngine {
     /// The host platform. Cloned out of [`EngineOptions`] so the read
     /// and write paths reach it without going through `options`.
     env: Arc<dyn Env>,
-    _db_lock: Box<dyn FileLock>,
+    /// The lock on the database directory, shared with every compaction
+    /// worker, so the directory is released only once the engine and every
+    /// worker are gone. An engine torn down on its own worker (a job held the
+    /// last reference) cannot join that worker, which keeps its share until
+    /// it has returned: no other open writes the directory while it might.
+    _db_lock: Arc<dyn FileLock>,
 }
 
 impl RegolithEngine {
@@ -643,7 +648,7 @@ impl RegolithEngine {
     pub(crate) fn open(db_dir: &Path, mut options: EngineOptions) -> std::io::Result<Arc<Self>> {
         options.read_only = false;
         let env = Arc::clone(&options.env);
-        let db_lock = env.lock_file(db_dir, true)?;
+        let db_lock: Arc<dyn FileLock> = Arc::from(env.lock_file(db_dir, true)?);
         let sst_dir = db_dir.join("sst");
         let wal_dir = db_dir.join("wal");
 
@@ -775,6 +780,7 @@ impl RegolithEngine {
         // instead of aborting; the directory lock and the fresh WAL
         // drop with this return.
         let compaction = CompactionScheduler::start(
+            Arc::clone(&db_lock),
             compaction_gate.clone(),
             Arc::clone(&snapshot_registry),
             Arc::clone(&versions),
@@ -883,7 +889,7 @@ impl RegolithEngine {
         mut options: EngineOptions,
     ) -> std::io::Result<Arc<Self>> {
         let env = Arc::clone(&options.env);
-        let db_lock = env.lock_file(db_dir, false)?;
+        let db_lock: Arc<dyn FileLock> = Arc::from(env.lock_file(db_dir, false)?);
         let sst_dir = db_dir.join("sst");
         let wal_dir = db_dir.join("wal");
 

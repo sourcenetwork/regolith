@@ -459,6 +459,42 @@ fn a_part_read_is_refused_by_an_append_to_its_part_and_by_no_other() {
     }
 }
 
+/// A locking read of a part reads the part's document, as a plain read of it
+/// does: `--shape parts` runs at `read-committed`, the one level whose plans
+/// hold locking reads. Before, it read the point key of the same number,
+/// which no parts append writes, and recorded a list that was there as
+/// nothing.
+#[test]
+fn a_locking_read_of_a_part_reads_its_document() {
+    let scratch = Scratch::new("parts-locking-read");
+    let db = scratch.open_shaped(Isolation::ReadCommitted, Shape::Parts);
+    commit(
+        &db,
+        Model::ListAppend,
+        Shape::Parts,
+        &plan(vec![append(0, 7)]),
+    )
+    .unwrap();
+    let observed = commit(
+        &db,
+        Model::ListAppend,
+        Shape::Parts,
+        &plan(vec![read_for_update(0), read_for_update(1), read(0)]),
+    )
+    .unwrap();
+    let lists: Vec<&MopVal> = observed.iter().map(|mop| &mop.2).collect();
+    assert_eq!(
+        lists,
+        [
+            &MopVal::List(vec![7]),
+            &MopVal::Null,
+            &MopVal::List(vec![7])
+        ],
+        "the append in part 0, nothing in part 1, and a locking read that agrees with a plain one"
+    );
+    assert_eq!(stored(&db, 0), None, "a parts plan wrote a point key");
+}
+
 #[test]
 fn appends_to_one_part_both_commit_and_do_not_reach_its_neighbour() {
     let scratch = Scratch::new("parts-read");

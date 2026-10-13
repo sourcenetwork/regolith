@@ -59,6 +59,9 @@ pub(crate) enum Message {
     /// A timed wait on this queue: `slot` is ready at the owner's first
     /// poll that finds the queue's clock at `due` microseconds or later.
     Timer { due: u64, slot: Arc<WaitSlot> },
+    /// A `CacheOnly` call read these landed blocks (sorted) and finished
+    /// without a wait: what the queue kept for it may go.
+    Finished(Box<[UnitKey]>),
 }
 
 /// What a finished unit left for the reads of one queue.
@@ -87,6 +90,11 @@ pub(crate) struct QueueShared {
     /// [`thread_token`]: I/O regolith starts on a thread goes to the queue
     /// that thread owns.
     owner: AtomicUsize,
+    /// How many completed waits the owner keeps for their calls' next runs
+    /// (`io_queue::ledger`). A call that read landed blocks tells the queue
+    /// when it finishes only while there are some, so a call with nothing
+    /// kept for it sends nothing.
+    kept: AtomicUsize,
 }
 
 #[cfg(not(loom))]
@@ -117,6 +125,7 @@ impl QueueShared {
             bound,
             landed: OnceLock::new(),
             owner: AtomicUsize::new(0),
+            kept: AtomicUsize::new(0),
         }
     }
 
@@ -235,6 +244,17 @@ impl QueueShared {
             .insert(key, landing);
     }
 
+    /// Whether the owner keeps any completed wait for a call's next run.
+    pub(crate) fn keeps(&self) -> bool {
+        self.kept.load(Ordering::Relaxed) != 0
+    }
+
+    /// The owner keeps `kept` completed waits now. Set before the waits it
+    /// completes are told, so a call run again once told sees them.
+    pub(crate) fn set_kept(&self, kept: usize) {
+        self.kept.store(kept, Ordering::Relaxed);
+    }
+
     /// Let go of what landed for `key`.
     pub(crate) fn forget(&self, key: &UnitKey) {
         if let Some(landed) = self.landed.get() {
@@ -258,13 +278,28 @@ impl SlotWaiter for QueueShared {
 pub(crate) struct WaitSlot {
     /// One waker per listening `IoWait`, closed with [`SHUT`] when ready.
     wakers: Stack<Arc<AtomicWaker>>,
+    /// The landed blocks the call that recorded this wait had read, sorted:
+    /// it reads them again when it is run again, so its queue keeps them
+    /// until then. Empty for any other wait.
+    holds: Box<[UnitKey]>,
 }
 
 impl WaitSlot {
     pub(crate) fn new() -> Self {
+        Self::holding(Box::default())
+    }
+
+    /// The wait of a call that read the landed blocks `holds` (sorted).
+    pub(crate) fn holding(holds: Box<[UnitKey]>) -> Self {
         Self {
             wakers: Stack::new(),
+            holds,
         }
+    }
+
+    /// The landed blocks the call that recorded this wait had read, sorted.
+    pub(crate) fn holds(&self) -> &[UnitKey] {
+        &self.holds
     }
 
     pub(crate) fn is_ready(&self) -> bool {

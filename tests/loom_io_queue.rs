@@ -18,8 +18,9 @@
 //!   with a new waker, while the owner completes it; the waker it last gave
 //!   is woken. A clone polled on another thread is woken through its own.
 //! - **No unit outlives close**: a miss that started before close puts its
-//!   unit in the table while close sweeps it; the unit is released by the
-//!   sweep or by the miss itself.
+//!   unit in the table while close sweeps it; once close has returned and
+//!   the miss has ended, the unit is released, by the sweep or by the miss
+//!   itself. When close returns, the miss may still hold it in the table.
 //! - **A group's sync runs once**: three member threads race the job a
 //!   commit group's fsync is; one claim wins and the sync runs once.
 //! - **Exactly one completion per member queue**: member queues register on

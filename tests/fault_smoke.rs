@@ -28,6 +28,8 @@ mod cut_ack;
 mod cut_record;
 #[path = "fault_smoke/open_variadic.rs"]
 mod open_variadic;
+#[path = "fault_smoke/rename_pairs.rs"]
+mod rename_pairs;
 
 use std::path::Path;
 use std::time::Duration;

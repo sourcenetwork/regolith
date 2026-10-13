@@ -725,10 +725,10 @@ tla:
     # the pool a batch at a time, reading each listing as its walk of meta/
     # reaches it, and removes every unlisted table and no listed one. Lean:
     # Regolith/BackupSeal.lean, entitled_restore_is_faithful,
-    # refusal_writes_nothing, collect_keeps_listed, last_write_holds_all,
-    # listing_names_every_backup, purge_keeps_the_newest, collect_stream_eq,
-    # stream_holds_one_batch, sweep_eq, sweep_removes_every_unlisted,
-    # list_pages_all.
+    # restored_tables_verify, refusal_writes_nothing, collect_keeps_listed,
+    # last_write_holds_all, listing_names_every_backup, purge_keeps_the_newest,
+    # collect_stream_eq, stream_holds_one_batch, sweep_eq,
+    # sweep_removes_every_unlisted, list_pages_all.
     spec=BackupSeal
     check MC_BackupSeal_Green                          GREEN
     check MC_BackupSeal_Green_Attack                   GREEN
@@ -745,8 +745,10 @@ tla:
     check MC_BackupSeal_Red_ManifestFirst              RED FaithfulRestore
     check MC_BackupSeal_Red_OverDatabase               RED FaithfulRestore
     check MC_BackupSeal_Red_CheckAfterCopy             RED RefusalWritesNothing
+    check MC_BackupSeal_Red_FooterUnchecked            RED RestoredOpens
     check MC_BackupSeal_Red_GcSkipsSealed              RED ListedRestores
     check MC_BackupSeal_Red_GcSkipsUnreadable          RED ListedRestores
+    check MC_BackupSeal_Red_SyncOnlyRemoved            RED ListedRestores
     check MC_BackupSeal_Red_MetaFirst                  RED ListedRestores
     check MC_BackupSeal_Red_ListSkipsUnreadable        RED ListingNamesEvery
     check MC_BackupSeal_Red_ListNeedsKey               RED ListingNamesEvery
@@ -973,6 +975,15 @@ tla:
     check MC_NonBlocking_Red_EarlyFire                 RED TimerNotEarly
     check MC_NonBlocking_Red_DropForgets               RED DroppedHoldsNothing
     check MC_NonBlocking_Red_TimerWrongQueue           RED TimerOnOwnQueue
+    # D53, what a read run again finds: a landing that a call still needs is
+    # held past the queue's byte bound until the call runs again, so a call
+    # needing more blocks at once than the bound finishes, and the eviction
+    # that held nothing never let it.
+    spec=LandingHold
+    check MC_LandingHold_Green                         GREEN
+    check MC_LandingHold_Green_Three                   GREEN
+    check MC_LandingHold_Red_Fifo                      RED EveryCallFinishes
+    check MC_LandingHold_Red_NoHolds                   RED RunsKeepProgress
     # Phase 7 integration: with no worker and inline compaction on, no
     # stopped writer waits on a relief nobody runs. Every piece of progress
     # lands the stall's unit (relief handed back), a contended writer reads
@@ -1016,15 +1027,20 @@ tla:
     check MC_StallRelief_Red_CommitGivesUp             RED NoLostCommit
     check MC_StallRelief_Green_Commit_InlineOff        GREEN
     check MC_StallRelief_Red_CommitLeftToCaller        RED NoLostCommit
-    # E16: with no worker, a write that owes a step of background work runs
-    # exactly one, and L0 stays at its compaction trigger (at the stop
-    # trigger when every write seals). Lean: Regolith/OwedStep.lean,
-    # write_one_step, l0_bounded, l0_bounded_by_stop.
+    # E16: with no worker, a write that owes a step of background work and
+    # runs it inline runs exactly one, and L0 stays at its compaction trigger
+    # (at the stop trigger when every write seals). A writer with a queue
+    # leaves the step there for its polls: L0 may then pass the trigger, and
+    # stays within the stop trigger plus the sealed memtables a rotation
+    # keeps. Lean: Regolith/OwedStep.lean, write_one_step, l0_bounded,
+    # l0_bounded_by_stop, queued_l0_bounded, queued_passes_trigger.
     spec=OwedStep
     check MC_OwedStep_Green                            GREEN
     check MC_OwedStep_Green_TinyMemtable               GREEN
+    check MC_OwedStep_Green_Queued                     GREEN
     check MC_OwedStep_Red_FlushOwesNothing             RED L0Bounded
     check MC_OwedStep_Red_StepUntilIdle                RED OneStepPerWrite
+    check MC_OwedStep_Red_QueuedTightBound             RED L0Bounded
     # regolith::sync's locks after D49: barging with bounded bypass, for
     # Mutex, Semaphore and ReentrantMutex, one step per atomic instruction
     # of src/sync. Lean: Regolith/Sync.lean, mutual_exclusion,
@@ -1064,6 +1080,7 @@ tla:
     check MC_SyncNotify_Red_CancelNoPassOn             RED CancelPassesOn
     check MC_SyncNotify_Red_NoRecheck                  RED NoLostWakeup
     check MC_SyncNotify_Red_NoGenCheck                 RED NoLostWakeup
+    check MC_SyncNotify_Red_FrontGenCheck              RED NoLostWakeup
     # regolith::sync::RwLock and ReentrantRwLock after D49, with D50's
     # upgradable read, one step of src/sync/raw_rwlock.rs at a time on the
     # queue of Sync.tla. Lean: Regolith/Sync.lean for the exclusive side.
@@ -1232,6 +1249,16 @@ tla:
     check MC_EnvFiles_Green_Rename                     GREEN
     check MC_EnvFiles_Red_RemoveFirst                  RED OpenFindsFile
     check MC_EnvFiles_Red_NoReload                     RED OpenFindsFile
+    # MemEnv's rename racing other changes to the namespace: the rename marks
+    # its source before it puts the file at the destination, so a removal or
+    # a rename that moves the destination on cannot make it undo itself.
+    # Green_Moved is the witness that the GREEN run reaches that race.
+    spec=EnvRename
+    check MC_EnvRename_Green                           GREEN
+    check MC_EnvRename_Green_FourCalls                 GREEN
+    check MC_EnvRename_Green_Moved                     RED NeverMovedOn
+    check MC_EnvRename_Red_Rollback                    RED Linearizable
+    check MC_EnvRename_Red_RemoveIgnoresMark           RED Linearizable
     # The pessimistic lock table (plan 4.6, 4.10): one holder per key, no
     # lost wake-up, bounded bypass, a wait delivered to its own queue, and a
     # lock released when its commit lands. Lean: Regolith/LockTable.lean,

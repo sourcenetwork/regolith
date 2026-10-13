@@ -31,7 +31,7 @@ use crate::sync::internal::UnsafeCell;
 /// What names one unit in the shared table: the block cache's key for the
 /// block, and the per-block allocation guard of a size-limited read. Reads of
 /// one block with the same guard share one unit.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct UnitKey {
     pub(crate) file_id: u64,
     pub(crate) offset: u64,

@@ -11,7 +11,11 @@
 //! # Invariants
 //!
 //! - The file holds exactly the contiguous written prefix: every byte below
-//!   `end`, and nothing above it.
+//!   `end`, and nothing above it, unless an append or a cut failed. That
+//!   failure is latched: the file may then hold part of the append past
+//!   `end`, with its write position past it too, so no append and no sync
+//!   is taken until a cut ([`LogFile::set_len`]) succeeds and puts the file
+//!   back at a known length.
 //! - A held write starts above `end`. Filling the gap below it appends it in
 //!   the same call, so no write that could be appended stays held.
 //! - Bytes held are bounded by what the commit pipeline has in flight: a
@@ -42,6 +46,9 @@ struct Inner {
     end: u64,
     /// Writes that arrived ahead of a gap, by the offset they start at.
     held: BTreeMap<u64, Vec<u8>>,
+    /// The kind of the append or cut that failed, until a cut succeeds: a
+    /// later append would land past the bytes it left (see the module docs).
+    failed: Option<io::ErrorKind>,
 }
 
 #[cfg(test)]
@@ -73,13 +80,19 @@ impl SerialLog {
                 (file, end)
             }
         };
-        Ok(Self {
+        Ok(Self::over(file, end))
+    }
+
+    /// A log over `file`, which holds `end` bytes and writes next at `end`.
+    fn over(file: Box<dyn WriteFile>, end: u64) -> Self {
+        Self {
             inner: Mutex::new(Inner {
                 file,
                 end,
                 held: BTreeMap::new(),
+                failed: None,
             }),
-        })
+        }
     }
 }
 
@@ -92,6 +105,28 @@ impl SerialLog {
 }
 
 impl Inner {
+    /// Refuse an append or a sync while a failure is latched.
+    fn usable(&self) -> io::Result<()> {
+        match self.failed {
+            None => Ok(()),
+            Some(kind) => Err(io::Error::new(
+                kind,
+                "an earlier write to the log failed; it takes no more writes until it is truncated",
+            )),
+        }
+    }
+
+    /// Append `buf` at the end. A failure is latched: the file may hold a
+    /// prefix of `buf` past `end` now.
+    fn append(&mut self, buf: &[u8]) -> io::Result<()> {
+        if let Err(err) = self.file.write_all(buf) {
+            self.failed = Some(err.kind());
+            return Err(err);
+        }
+        self.end += buf.len() as u64;
+        Ok(())
+    }
+
     /// Append every held write that now starts at or below the end.
     fn append_held(&mut self) -> io::Result<()> {
         while let Some(entry) = self.held.first_entry() {
@@ -101,13 +136,10 @@ impl Inner {
             }
             let buf = entry.remove();
             let covered = (self.end - at).min(buf.len() as u64) as usize;
-            // Kept if the append fails, so a later write or sync tries again
-            // and reports it: the caller that handed it over was told `Ok`.
-            if let Err(err) = self.file.write_all(&buf[covered..]) {
-                self.held.insert(at, buf);
-                return Err(err);
-            }
-            self.end += (buf.len() - covered) as u64;
+            // Not kept when it fails: the latch refuses every sync from
+            // here, so nothing vouches for the commit that handed it over,
+            // and the cut that lifts the latch drops every held write.
+            self.append(&buf[covered..])?;
         }
         Ok(())
     }
@@ -128,31 +160,37 @@ impl LogFile for SerialLog {
         if end <= inner.end {
             return Ok(());
         }
+        inner.usable()?;
         if offset > inner.end {
             inner.held.insert(offset, buf.to_vec());
             return Ok(());
         }
         let covered = (inner.end - offset) as usize;
-        inner.file.write_all(&buf[covered..])?;
-        inner.end = end;
+        inner.append(&buf[covered..])?;
         inner.append_held()
     }
 
     fn sync_data(&self) -> io::Result<()> {
         let mut inner = self.inner()?;
-        // A held write whose append failed earlier is tried again here: a
-        // sync must not vouch for bytes the file never took.
-        inner.append_held()?;
+        // Every held write starts above the end unless an append failed,
+        // and that failure is latched: a sync must not vouch for bytes the
+        // file never took, or took at the wrong offset.
+        inner.usable()?;
         inner.file.sync_data()
     }
 
     fn set_len(&self, len: u64) -> io::Result<()> {
         let mut inner = self.inner()?;
-        inner.file.set_len(len)?;
+        if let Err(err) = inner.file.set_len(len) {
+            // The length and the write position are unknown now too.
+            inner.failed = Some(err.kind());
+            return Err(err);
+        }
         inner.end = len;
         // Everything held starts above the old end, so above the new one
         // too: the writes of commits the truncation discards.
         inner.held.clear();
+        inner.failed = None;
         Ok(())
     }
 }
@@ -270,6 +308,128 @@ mod tests {
                 "round {round}"
             );
         }
+    }
+
+    /// A file whose append number `fail_in` (from 0) puts the first
+    /// `prefix` bytes of its buffer in the file and then fails, as a short
+    /// write followed by an error does. Every other call passes through.
+    struct ShortOnce {
+        file: Box<dyn WriteFile>,
+        fail_in: Option<usize>,
+        prefix: usize,
+    }
+
+    impl WriteFile for ShortOnce {
+        fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
+            match self.fail_in {
+                Some(0) => {
+                    self.fail_in = None;
+                    self.file.write_all(&buf[..self.prefix.min(buf.len())])?;
+                    Err(io::Error::other("injected short append"))
+                }
+                Some(n) => {
+                    self.fail_in = Some(n - 1);
+                    self.file.write_all(buf)
+                }
+                None => self.file.write_all(buf),
+            }
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.file.flush()
+        }
+
+        fn sync_all(&mut self) -> io::Result<()> {
+            self.file.sync_all()
+        }
+
+        fn set_len(&mut self, len: u64) -> io::Result<()> {
+            self.file.set_len(len)
+        }
+
+        fn len(&self) -> io::Result<u64> {
+            self.file.len()
+        }
+    }
+
+    fn short_once(env: &MemEnv, fail_in: usize, prefix: usize) -> SerialLog {
+        let file = env
+            .open_write(Path::new("/db/log"), WriteMode::Truncate)
+            .unwrap();
+        SerialLog::over(
+            Box::new(ShortOnce {
+                file,
+                fail_in: Some(fail_in),
+                prefix,
+            }),
+            0,
+        )
+    }
+
+    fn held(env: &MemEnv) -> String {
+        String::from_utf8_lossy(&env.read(Path::new("/db/log")).unwrap()).into_owned()
+    }
+
+    /// An append that fails part way leaves bytes past the end the log
+    /// counts. Until a cut puts the file back at a known length, a retry of
+    /// the same write must not land after them and report success, and no
+    /// sync may vouch for the file.
+    #[test]
+    fn a_retry_after_a_short_failed_append_is_refused_until_the_log_is_cut() {
+        let env = env();
+        let log = short_once(&env, 1, 3);
+        log.write_all_at(0, b"head").unwrap();
+        assert!(
+            log.write_all_at(4, b"record").is_err(),
+            "setup: the append fails"
+        );
+        assert_eq!(held(&env), "headrec", "setup: part of it reached the file");
+        let retried = log.write_all_at(4, b"record");
+        assert!(
+            retried.is_err(),
+            "a retry was acknowledged with the file holding {:?}",
+            held(&env)
+        );
+        assert!(
+            log.sync_data().is_err(),
+            "a sync vouched for a file holding {:?}",
+            held(&env)
+        );
+        // A rollback cuts back to where the failed write began, and the
+        // log takes the write again.
+        log.set_len(4).unwrap();
+        log.write_all_at(4, b"record").unwrap();
+        log.sync_data().unwrap();
+        assert_eq!(held(&env), "headrecord");
+    }
+
+    /// The same for a held write whose append fails part way once the gap
+    /// below it is filled: a later sync must not append it again after the
+    /// bytes that reached the file and vouch for them.
+    #[test]
+    fn a_held_write_whose_append_fails_part_way_is_not_appended_again() {
+        let env = env();
+        let log = short_once(&env, 1, 2);
+        log.write_all_at(4, b"5678").unwrap();
+        assert!(
+            log.write_all_at(0, b"1234").is_err(),
+            "setup: the held append fails"
+        );
+        assert_eq!(held(&env), "123456", "setup: part of it reached the file");
+        assert!(
+            log.sync_data().is_err(),
+            "a sync vouched for a file holding {:?}",
+            held(&env)
+        );
+        assert!(
+            log.write_all_at(4, b"5678").is_err(),
+            "a retry was acknowledged with the file holding {:?}",
+            held(&env)
+        );
+        log.set_len(4).unwrap();
+        log.write_all_at(4, b"5678").unwrap();
+        log.sync_data().unwrap();
+        assert_eq!(held(&env), "12345678");
     }
 
     proptest! {

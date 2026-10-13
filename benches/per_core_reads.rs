@@ -22,7 +22,6 @@
 mod common;
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Instant;
 
 use regolith::{Db, Options, WriteBatch};
 
@@ -64,29 +63,33 @@ fn rate(
     background: impl Fn(&AtomicBool) + Sync,
 ) -> f64 {
     let done = AtomicBool::new(false);
-    let start = Instant::now();
-    std::thread::scope(|scope| {
+    let line = common::start::StartLine::new(threads);
+    let elapsed = std::thread::scope(|scope| {
         let background = &background;
         let done_ref = &done;
         let writer = scope.spawn(move || background(done_ref));
         let readers: Vec<_> = (0..threads as u64)
             .map(|t| {
-                let read = &read;
+                let (read, line) = (&read, &line);
                 scope.spawn(move || {
                     let mut rng = common::Rng::new(0x7B_1000 + t);
+                    line.wait();
                     for _ in 0..per_thread {
                         read(&mut rng);
                     }
                 })
             })
             .collect();
+        let start = line.start();
         for reader in readers {
             reader.join().expect("reader");
         }
+        let elapsed = start.elapsed();
         done.store(true, Ordering::Release);
         writer.join().expect("background");
+        elapsed
     });
-    (threads as u64 * per_thread) as f64 / start.elapsed().as_secs_f64()
+    (threads as u64 * per_thread) as f64 / elapsed.as_secs_f64()
 }
 
 fn get_under_publisher(threads: usize, keys: u64, per_thread: u64) -> f64 {
