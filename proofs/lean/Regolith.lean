@@ -13,6 +13,10 @@ import Regolith.Publication
 -- E2: syncing the sealed log before the next log takes a record makes
 -- recovery a gap-free prefix. Backs `proofs/tla/WalRotation.tla`.
 import Regolith.WalRecovery
+-- E46: a close that seals its last log in place and creates the next one
+-- only after the flush is durable keeps recovery a gap-free prefix. Backs
+-- `proofs/tla/WalRecovery.tla`.
+import Regolith.WalClose
 -- Plan 3.6: commit-ordered append numbers appends densely from 1, once per
 -- once key, in commit order, and a snapshot sees exactly rows 1..H. Backs
 -- `proofs/tla/CommitOrderedAppend.tla` and `CommitOrderedAppendCrash.tla`.

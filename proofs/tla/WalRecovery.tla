@@ -28,8 +28,21 @@
 \* then O = 2 and P = 2: something proven synced is damaged, and replay
 \* refuses to open rather than lose it in silence.
 \*
+\* A close that still has writes in memory (E46). Close has to put the
+\* last memtable into a table. The old way sealed it like a rotation: sync
+\* the whole log (tens of megabytes), create a new log, flush, close the new
+\* log. The new way seals it "in place": the log stays the newest file, so
+\* a torn tail there is still fine and it needs no sync; the flush writes
+\* the table and, in the same synced manifest batch, the note "recovery
+\* skips this log"; only then is the log removed and the next log created
+\* and closed. Tiny example: commits 1 and 2 sit unsynced in log 1 at
+\* close. A power cut before the manifest batch is durable finds log 1 as
+\* the newest file and keeps a prefix of it; one after finds 1 and 2 in a
+\* table. Creating the next log first (the RED NewLogBeforeFlush) would
+\* make the unsynced log 1 an earlier file, whose torn tail refuses.
+\*
 \* What this model shows: over every interleaving of appends, syncs,
-\* rotations, a clean close and crashes, and against every state a crash can
+\* rotations, flushes, a clean close and crashes, and against every state a crash can
 \* leave, the database opens after any crash an honest disk can produce,
 \* opens with commits 1..n and no hole, keeps every synced commit, never
 \* quietly drops something a stamp proves synced, and never opens under a
@@ -78,9 +91,23 @@
 \*                  completed Wal::sync_data covered (record i's `st`).
 \*   Sync(k)        Wal::sync_data: `synced_through` moves, once the sync
 \*                  returns, to the offset it began at.
-\*   AppendClose    Wal::close: sync, append CLOSE, sync; the engine's
-\*                  close calls it, and nothing is appended after CLOSE.
-\*   Rotate         RegolithEngine::swap_wal (WalRotation.tla).
+\*   AppendClose    Log::close (wal_log.rs): sync every record, append
+\*                  CLOSE, sync; nothing is appended after CLOSE.
+\*   Rotate         Ordered::seal (WalRotation.tla); also what a close that
+\*                  failed after sealing in place does before it takes a
+\*                  write again (Ordered::reopen_log).
+\*   Flush          A flush of the oldest frozen memtable (flush.rs): its
+\*                  table, and min_wal_id past its log, in one synced
+\*                  manifest batch; then the log is removed.
+\*   SealInPlace    Ordered::seal_in_place: close seals the last memtable
+\*                  and keeps its log as the newest, unsynced; no commit is
+\*                  decided after it.
+\*   FlushInPlace   That memtable's flush, once every earlier one is done
+\*                  (oldest first, drain.rs DR3): the log's commits are in a
+\*                  table, and the log is removed. No log file exists now.
+\*   CloseNext      Ordered::close_log after a seal in place: the next log
+\*                  is created and CLOSE appended to it; a Sync makes it
+\*                  durable.
 \*   Crash          WalReplayIter reads P from every usable record
 \*                  (wal_frame::proof_past scans past the damage), refuses
 \*                  when O < P, and otherwise ends the log at O; recovery
@@ -174,6 +201,10 @@
 \*     crash it must survive (RED StampUnsynced).
 \*   - A group of commits is one record here, so it holds one commit; a
 \*     group of several survives or is lost whole, like one commit.
+\*   - SEAL IN PLACE. A close may leave its last log unsynced because the
+\*     log stays the newest file until the flush's manifest batch, durable,
+\*     says recovery skips it; the next log is created only after that
+\*     (RED NewLogBeforeFlush creates it first).
 \*
 \* CONFIGURATIONS.
 \*   MC_WalRecovery_Green_Immediate          every invariant holds
@@ -188,6 +219,7 @@
 \*   MC_WalRecovery_Red_NoTruncate           RecoveryOpens fails
 \*   MC_WalRecovery_Red_StampNotSealed       AckedSurvive fails
 \*   MC_WalRecovery_Red_StampUnsynced        RecoveryOpens fails
+\*   MC_WalRecovery_Red_NewLogBeforeFlush    RecoveryOpens fails
 
 \* Borrow the standard TLA+ books: counting numbers, lists, and sizes of finite sets.
 EXTENDS Naturals, Sequences, FiniteSets
@@ -220,17 +252,18 @@ ASSUME Mode \in {"Immediate", "Eventual"}
 ASSUME Frame \in {"Checksum", "AEAD"}
 \* Residual is a yes or a no.
 ASSUME Residual \in BOOLEAN
-\* The mutant is "none" or one of the seven planted bugs.
+\* The mutant is "none" or one of the eight planted bugs.
 ASSUME Mutant \in {"none", "DropBelowP", "RefuseAboveP", "Format1",
                    "CloseWithoutSync", "NoTruncate", "StampNotSealed",
-                   "StampUnsynced"}
+                   "StampUnsynced", "NewLogBeforeFlush"}
 
 \* The state: everything that changes from one step to the next. Each line says what the variable
 \* stands for in the real program.
 VARIABLES
-  \* The earlier log files, oldest first. Each is a list of records [c, st, ok]: the commit number
-  \* (0 for a CLOSE record), the stamp, and whether the bytes are usable (FALSE only for a dropped
-  \* tail that was left in the file).
+  \* The earlier log files, oldest first. Each is a list of records [c, st, ok, dur]: the commit
+  \* number (0 for a CLOSE record), the stamp, whether the bytes are usable (FALSE only for a dropped
+  \* tail that was left in the file), and whether a completed sync covered them (FALSE only under
+  \* the planted bug NewLogBeforeFlush).
   sealed,
   \* The newest log file: the list of records [c, st] as the writer wrote them (the active Wal,
   \* src/engine/wal.rs). `st` is the record's stamp, "synced_through": how much of the log the last
@@ -244,10 +277,19 @@ VARIABLES
   \* The last commit number appended; commits are numbered 1, 2, 3, ...
   next,
   \* How many crashes with recovery have happened.
-  crashes
+  crashes,
+  \* The commits flushed into tables, in order: their manifest batch is durable and recovery
+  \* replays no log that holds them (min_wal_id, log_retirement.rs).
+  tables,
+  \* Whether close sealed the last memtable in place: the newest log takes no record and waits for
+  \* its memtable's flush (Ordered::seal_in_place).
+  inplace,
+  \* Whether a newest log file exists. FALSE between the in-place flush, which removed the log,
+  \* and the creation of the next one.
+  haslog
 
 \* Every variable, so a step that changes none of them is a stutter.
-vars == <<sealed, log, synced, closed, next, crashes>>
+vars == <<sealed, log, synced, closed, next, crashes, tables, inplace, haslog>>
 
 ----------------------------------------------------------------------------
 \* Helpers.
@@ -276,20 +318,32 @@ SealedFrom(j) == IF j > Len(sealed) THEN <<>> ELSE CommitsOf(sealed[j]) \o Seale
 \* All of them, from the first.
 SealedCommits == SealedFrom(1)
 
+\* The commits of the earlier logs that a completed sync covered: all of them in the engine.
+RECURSIVE DurableFrom(_)
+\* Walk the earlier logs from the j-th on, keeping each record a sync covered.
+DurableFrom(j) ==
+  \* Past the last earlier log: nothing.
+  IF j > Len(sealed) THEN <<>>
+  \* This log's synced records' commits, then the later logs'.
+  ELSE CommitsOf(SelectSeq(sealed[j], LAMBDA r : r.dur)) \o DurableFrom(j + 1)
+
 \* A gap-free prefix of commit order: commits 1, 2, ..., n.
 IsPrefix(s) == s = [i \in 1..Len(s) |-> i]
 
-\* The commits a completed sync made durable: every earlier log (synced at
-\* rotation or at the truncation after a crash) and the synced prefix.
-SyncedCommits == Range(SealedCommits) \cup Range(CommitsOf(SubSeq(log, 1, synced)))
+\* The commits a completed sync made durable: those in tables, every earlier
+\* log (synced at rotation or at the truncation after a crash) and the
+\* synced prefix of the newest.
+SyncedCommits ==
+  \* The tables' commits, the earlier logs' synced ones, and the newest log's synced prefix.
+  Range(tables) \cup Range(DurableFrom(1)) \cup Range(CommitsOf(SubSeq(log, 1, synced)))
 
 \* The commits acknowledged to their callers. Immediate acknowledges a
 \* commit once a completed sync covers it; Eventual when it is appended.
 Acked ==
   \* Under Immediate: the commits a completed sync covers.
   IF Mode = "Immediate" THEN SyncedCommits
-  \* Under Eventual: every commit appended, in the earlier logs and in the newest.
-  ELSE Range(SealedCommits) \cup Range(CommitsOf(log))
+  \* Under Eventual: every commit appended, in tables, the earlier logs and the newest.
+  ELSE Range(tables) \cup Range(SealedCommits) \cup Range(CommitsOf(log))
 
 ----------------------------------------------------------------------------
 \* Crash states of the newest log. A crash state is a record:
@@ -298,8 +352,10 @@ Acked ==
 \*   keyOk      whether the key provider returned the key the log was
 \*              sealed under (always TRUE with checksums);
 \*   rot        whether the last synced group was damaged (Residual only);
-\*   stampTorn  whether the crash tore the newest log's stamp (only the
-\*              StampUnsynced defect can, see StampTears).
+\*   stampTorn  whether the crash tore the newest log's stamp (see
+\*              StampTears);
+\*   tear       whether the crash garbled a record of an earlier log that
+\*              no sync covered (only NewLogBeforeFlush leaves one).
 
 \* What an unsynced record may become. Format 2 treats every unusable
 \* record alike, so one kind suffices; format 1 tells zeros and a partial
@@ -317,12 +373,25 @@ UnsyncedKinds ==
 \* is nothing to tear. The StampUnsynced defect writes the stamp in place
 \* and lets the first record's sync carry it, the way an unsealed log does;
 \* until that sync (synced = 0) a power cut may leave half a stamp.
+\* No log file, no stamp.
 StampTears ==
+  \* With no newest log file there is no stamp to tear.
+  IF ~haslog THEN {FALSE}
   \* Only the defect, only with sealed frames, only before the first sync.
-  IF Frame = "AEAD" /\ Mutant = "StampUnsynced" /\ synced = 0
+  ELSE IF Frame = "AEAD" /\ Mutant = "StampUnsynced" /\ synced = 0
     \* Then the stamp may come back torn or whole.
     THEN BOOLEAN
     \* Otherwise it always comes back whole.
+    ELSE {FALSE}
+
+\* Whether a crash can garble an earlier log: only when one holds a record
+\* no sync covered, which only the NewLogBeforeFlush defect leaves.
+EarlierTears ==
+  \* Some earlier log holds a record no completed sync covered...
+  IF \E j \in 1..Len(sealed) : \E i \in 1..Len(sealed[j]) : ~sealed[j][i].dur
+    \* ...then the crash may garble it, or not.
+    THEN BOOLEAN
+    \* Otherwise every earlier log survives whole.
     ELSE {FALSE}
 
 \* Every crash state at this moment. L is how many records the file keeps
@@ -345,7 +414,9 @@ CrashStates ==
       \* Whether the last synced record rotted.
       rot |-> rot,
       \* Whether the stamp came back torn.
-      stampTorn |-> torn] :
+      stampTorn |-> torn,
+      \* Whether an unsynced record of an earlier log came back garbled.
+      tear |-> early] :
        \* f picks a kind for each unsynced record the file still holds...
        f \in {g \in [(synced + 1)..L -> UnsyncedKinds] :
                 \* ...and only the last of them may be cut short.
@@ -356,8 +427,10 @@ CrashStates ==
     key \in (IF Frame = "AEAD" THEN BOOLEAN ELSE {TRUE}),
     \* Rot only in the Residual configurations, and only of a synced record.
     rot \in (IF Residual /\ synced > 0 THEN BOOLEAN ELSE {FALSE}),
-    \* A torn stamp only under the defect.
-    torn \in StampTears}
+    \* A torn stamp where one can tear.
+    torn \in StampTears,
+    \* A garbled earlier log where one can be.
+    early \in EarlierTears}
 
 \* How many records the crash left in the file: they are a prefix.
 PLen(cs) == Cardinality({i \in DOMAIN cs.st : cs.st[i] # "absent"})
@@ -437,8 +510,10 @@ RefusedNewest(cs) ==
 \* Replay refuses an earlier log: they are complete, so any unusable
 \* record there, or a stamp that fails, is damage.
 RefusedSealed(cs) ==
-  \* Some earlier log j...
-  \E j \in 1..Len(sealed) :
+  \* An earlier log garbled where no sync had covered it reads as damage...
+  \/ cs.tear
+  \* ...or some earlier log j...
+  \/ \E j \in 1..Len(sealed) :
     \* ...whose stamp fails under this key...
     \/ ~StampKeyOk(cs)
     \* ...or that holds a record that is not usable: rot, or a failed tag.
@@ -447,9 +522,9 @@ RefusedSealed(cs) ==
 \* Recovery refuses to open.
 Refused(cs) == RefusedSealed(cs) \/ RefusedNewest(cs)
 
-\* What recovery yields when it opens: every earlier log's commits, then
-\* the newest log's records before O.
-Recovered(cs) == SealedCommits \o CommitsOf(SubSeq(log, 1, O(cs) - 1))
+\* What recovery yields when it opens: the commits in tables, every earlier
+\* log's commits, then the newest log's records before O.
+Recovered(cs) == tables \o SealedCommits \o CommitsOf(SubSeq(log, 1, O(cs) - 1))
 
 \* Recovery reports a discarded tail: it dropped bytes the file holds,
 \* which is a warn line, two tickers and an EventListener callback.
@@ -472,11 +547,19 @@ Init ==
   /\ next    = 0
   \* No crash yet.
   /\ crashes = 0
+  \* No table yet.
+  /\ tables  = <<>>
+  \* Nothing sealed in place.
+  /\ inplace = FALSE
+  \* The newest log exists.
+  /\ haslog  = TRUE
 
 \* A commit group appends its record, stamped with the completed sync.
 AppendRecord ==
   \* The log is not closed.
   /\ ~closed
+  \* Close did not seal the last memtable in place: no commit is decided after that.
+  /\ ~inplace
   \* The model may still commit.
   /\ next < MaxCommits
   \* A record with the next commit number, stamped with the current synced count, joins the end of
@@ -485,7 +568,7 @@ AppendRecord ==
   \* One more commit was appended.
   /\ next' = next + 1
   \* Nothing else changes.
-  /\ UNCHANGED <<sealed, synced, closed, crashes>>
+  /\ UNCHANGED <<sealed, synced, closed, crashes, tables, inplace, haslog>>
 
 \* A sync that began when k records were written completes: they are
 \* durable. Records appended while it ran keep the older stamp.
@@ -495,10 +578,12 @@ Sync(k) ==
   \* Those k records are durable now.
   /\ synced' = k
   \* Nothing else changes.
-  /\ UNCHANGED <<sealed, log, closed, next, crashes>>
+  /\ UNCHANGED <<sealed, log, closed, next, crashes, tables, inplace, haslog>>
 
 \* Rotation (E2, WalRotation.tla): the newest log is synced, sealed, and a
-\* new log with a synced stamp takes the next record.
+\* new log takes the next record. Also the way a close that failed after
+\* sealing in place takes writes again (Ordered::reopen_log): the log it
+\* left unsynced is synced before the next one exists.
 Rotate ==
   \* The log is not closed.
   /\ ~closed
@@ -506,14 +591,17 @@ Rotate ==
   /\ log # <<>>
   \* One more file may be opened.
   /\ Len(sealed) + 1 < MaxFiles
-  \* The newest log joins the earlier logs, whole and usable: the rotation synced it.
-  /\ sealed' = Append(sealed, [i \in 1..Len(log) |-> [c |-> log[i].c, st |-> log[i].st, ok |-> TRUE]])
+  \* The newest log joins the earlier logs, whole, usable and durable: the rotation synced it.
+  /\ sealed' = Append(sealed, [i \in 1..Len(log) |->
+                 [c |-> log[i].c, st |-> log[i].st, ok |-> TRUE, dur |-> TRUE]])
   \* A new, empty log is the newest.
   /\ log'    = <<>>
   \* Nothing in it is synced.
   /\ synced' = 0
+  \* A seal in place, if there was one, is over: commits go to the new log.
+  /\ inplace' = FALSE
   \* Nothing else changes.
-  /\ UNCHANGED <<closed, next, crashes>>
+  /\ UNCHANGED <<closed, next, crashes, tables, haslog>>
 
 \* A clean close appends CLOSE once every record is synced; a Sync then
 \* makes CLOSE durable. The mutant appends it without the first sync.
@@ -521,6 +609,8 @@ Rotate ==
 AppendClose ==
   \* The log is not closed yet.
   /\ ~closed
+  \* Close did not seal the last memtable in place (that close ends with CloseNext).
+  /\ ~inplace
   \* Format 1 has no CLOSE record.
   /\ Mutant # "Format1"
   \* Every record is synced (the planted bug CloseWithoutSync skips this).
@@ -530,7 +620,87 @@ AppendClose ==
   \* The log is closed.
   /\ closed' = TRUE
   \* Nothing else changes.
-  /\ UNCHANGED <<sealed, synced, next, crashes>>
+  /\ UNCHANGED <<sealed, synced, next, crashes, tables, inplace, haslog>>
+
+\* A flush of the oldest frozen memtable: its commits join the tables, and
+\* its log, whose writes the same synced manifest batch says are in a table,
+\* is no longer replayed, and is removed.
+Flush ==
+  \* An earlier log is waiting for its memtable's flush.
+  /\ sealed # <<>>
+  \* Its commits are in a table now, durably.
+  /\ tables' = tables \o CommitsOf(Head(sealed))
+  \* Its log is skipped by recovery and removed.
+  /\ sealed' = Tail(sealed)
+  \* Nothing else changes.
+  /\ UNCHANGED <<log, synced, closed, next, crashes, inplace, haslog>>
+
+\* Close seals the last memtable in place (Ordered::seal_in_place): its log
+\* stays the newest, unsynced, and takes no more records. The planted bug
+\* NewLogBeforeFlush creates the next log right away instead, which makes
+\* the unsynced log an earlier one before its flush is durable.
+SealInPlace ==
+  \* The log is not closed and not sealed in place already.
+  /\ ~closed /\ ~inplace
+  \* The memtable holds something: the log holds a commit.
+  /\ \E i \in 1..Len(log) : log[i].c # 0
+  \* Either the planted bug or the engine's step:
+  /\ IF Mutant = "NewLogBeforeFlush"
+       \* the bug: one more file may be opened,
+       THEN /\ Len(sealed) + 1 < MaxFiles
+            \* the unsynced log becomes an earlier log as it is, durable only where a sync covered it,
+            /\ sealed' = Append(sealed, [i \in 1..Len(log) |->
+                           [c |-> log[i].c, st |-> log[i].st, ok |-> TRUE, dur |-> i <= synced]])
+            \* and a new, empty log is the newest, with nothing synced;
+            /\ log' = <<>>
+            \* nothing in it is synced,
+            /\ synced' = 0
+            \* and no seal in place is left to finish.
+            /\ UNCHANGED inplace
+       \* the engine: the log is sealed in place, nothing else moves.
+       ELSE /\ inplace' = TRUE
+            \* The log, its synced count and the earlier logs stay as they are.
+            /\ UNCHANGED <<sealed, log, synced>>
+  \* Nothing else changes.
+  /\ UNCHANGED <<closed, next, crashes, tables, haslog>>
+
+\* The flush of the memtable sealed in place, once every earlier one is in a
+\* table (flushes go oldest first): its commits join the tables in one
+\* synced manifest batch that also says recovery skips its log, and then
+\* the log is removed. The pages it still had dirty are dropped, never
+\* written. No log file exists until CloseNext.
+FlushInPlace ==
+  \* Close sealed the last memtable in place.
+  /\ inplace
+  \* Every earlier memtable is flushed already.
+  /\ sealed = <<>>
+  \* Its commits are in a table now, durably.
+  /\ tables' = tables \o CommitsOf(log)
+  \* Its log is gone.
+  /\ log' = <<>>
+  \* So nothing of it is synced.
+  /\ synced' = 0
+  \* No newest log file exists.
+  /\ haslog' = FALSE
+  \* The seal in place is done.
+  /\ inplace' = FALSE
+  \* The database takes no commit any more.
+  /\ closed' = TRUE
+  \* Nothing else changes.
+  /\ UNCHANGED <<sealed, next, crashes>>
+
+\* The end of a close that sealed in place (Ordered::close_log): the next
+\* log is created and CLOSE appended to it, unsynced; no record precedes
+\* CLOSE, as AppendClose asks. A Sync then makes CLOSE durable.
+CloseNext ==
+  \* The in-place flush removed the log, and no next log exists yet.
+  /\ ~haslog
+  \* A next log exists now.
+  /\ haslog' = TRUE
+  \* It holds CLOSE, stamped with nothing synced.
+  /\ log' = <<[c |-> 0, st |-> 0]>>
+  \* Nothing else changes.
+  /\ UNCHANGED <<sealed, synced, closed, next, crashes, tables, inplace>>
 
 \* A crash (or a reopen after a clean close) and a recovery that opens.
 \* The newest log is truncated at O, synced, and becomes an earlier log;
@@ -545,15 +715,16 @@ Crash ==
   /\ \E cs \in CrashStates :
        \* from which recovery opens.
        /\ ~Refused(cs)
-       \* The newest log becomes an earlier log:
-       /\ sealed' = Append(sealed,
+       \* The newest log, if a file exists, becomes an earlier log:
+       /\ sealed' = IF ~haslog THEN sealed ELSE Append(sealed,
             \* under the bug NoTruncate,
             IF Mutant = "NoTruncate"
               \* every record the file still holds, usable or not;
-              THEN [i \in 1..PLen(cs) |-> [c |-> log[i].c, st |-> log[i].st, ok |-> Usable(cs, i)]]
+              THEN [i \in 1..PLen(cs) |->
+                      [c |-> log[i].c, st |-> log[i].st, ok |-> Usable(cs, i), dur |-> TRUE]]
               \* in the engine, only the records before the first unusable one: the rest was cut off
               \* and the cut was synced.
-              ELSE [i \in 1..(O(cs) - 1) |-> [c |-> log[i].c, st |-> log[i].st, ok |-> TRUE]])
+              ELSE [i \in 1..(O(cs) - 1) |-> [c |-> log[i].c, st |-> log[i].st, ok |-> TRUE, dur |-> TRUE]])
        \* Commits are numbered on from the last recovered one.
        /\ next' = Len(Recovered(cs))
   \* A new, empty log is the newest.
@@ -564,6 +735,12 @@ Crash ==
   /\ closed'  = FALSE
   \* One more crash happened.
   /\ crashes' = crashes + 1
+  \* The open creates the new log, and no seal in place is under way.
+  /\ haslog'  = TRUE
+  \* A crash ends any close that was under way.
+  /\ inplace' = FALSE
+  \* What tables hold stays.
+  /\ UNCHANGED tables
 
 \* Every step the system can take.
 Next ==
@@ -575,6 +752,14 @@ Next ==
   \/ Rotate
   \* A clean close appends CLOSE.
   \/ AppendClose
+  \* The oldest frozen memtable is flushed.
+  \/ Flush
+  \* Close seals the last memtable in place.
+  \/ SealInPlace
+  \* Its flush.
+  \/ FlushInPlace
+  \* The next log, created and closed.
+  \/ CloseNext
   \* The machine crashes and recovers.
   \/ Crash
 
@@ -597,6 +782,12 @@ TypeOK ==
   /\ next \in 0..MaxCommits
   \* No more crashes than the budget.
   /\ crashes \in 0..MaxCrashes
+  \* The tables hold no more commits than were made.
+  /\ Len(tables) <= MaxCommits
+  \* The two flags are yes or no.
+  /\ inplace \in BOOLEAN /\ haslog \in BOOLEAN
+  \* No log file means no record and nothing synced.
+  /\ (~haslog => log = <<>>)
 
 \* A crash the device's flush honoured, opened with the right key, never
 \* leaves a database that refuses to open. It rules out, say, a power cut

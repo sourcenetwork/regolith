@@ -1,7 +1,7 @@
 //! A clean close ends the log with CLOSE after a sync of everything before
 //! it; a close that cannot vouch for the log leaves CLOSE out; and an open
-//! reports the tail it drops (`proofs/tla/WalRecovery.tla`, `AppendClose`
-//! and `Discarded`).
+//! reports the tail it drops (`proofs/tla/WalRecovery.tla`, `AppendClose`,
+//! `CloseNext` and `Discarded`).
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -45,29 +45,43 @@ impl EventListener for Reports {
     }
 }
 
-/// Close flushes what the memtable holds and seals its log, so the log
-/// it closes holds only CLOSE, claiming the stamp before it synced.
+/// Close flushes what the memtable holds into a table and removes the log
+/// it was written to; the next log holds only CLOSE, claiming the stamp
+/// before it synced (`WalRecovery.tla`, `CloseNext`).
 #[test]
-fn close_ends_the_log_with_close_claiming_everything_before_it() {
+fn close_ends_in_a_next_log_holding_only_close() {
     let dir = TempDir::new().unwrap();
     let db = Db::open(dir.path(), Options::default()).unwrap();
     db.put(b"a", b"1").unwrap();
     db.put(b"b", b"2").unwrap();
+    let written = log_of(&dir);
     db.close().unwrap();
-    let (kind, claim, at) = last_record(&log_of(&dir));
+    let next = log_of(&dir);
+    assert_ne!(next, written, "the log the writes went to is removed");
+    assert_eq!(
+        std::fs::read_dir(dir.path().join("wal")).unwrap().count(),
+        1,
+        "one log is left"
+    );
+    let (kind, claim, at) = last_record(&next);
     assert_eq!(kind, KIND_CLOSE);
+    assert_eq!(at, STAMP_LEN as u64, "CLOSE follows the stamp");
     assert_eq!(
         claim, at,
         "the sync before CLOSE covered every byte before it"
     );
     assert_eq!(
-        std::fs::metadata(log_of(&dir)).unwrap().len(),
+        std::fs::metadata(&next).unwrap().len(),
         at + HEADER_LEN as u64
     );
     assert!(
         db.put(b"c", b"3").is_err(),
         "a closed database takes no write"
     );
+    drop(db);
+    let db = Db::open(dir.path(), Options::default()).unwrap();
+    assert_eq!(db.get(b"a").unwrap(), Some(b"1".to_vec()));
+    assert_eq!(db.get(b"b").unwrap(), Some(b"2".to_vec()));
 }
 
 /// A latched database may have bytes at the end of its log nobody can
@@ -79,8 +93,8 @@ fn a_latched_database_closes_without_appending_close() {
     db.put(b"a", b"1").unwrap();
     db.engine().latch_callback_panic("test");
     db.close().unwrap();
-    // Close flushed the memtable into a table and sealed its log, so the
-    // log left holds nothing: not even CLOSE.
+    // Close flushed the memtable into a table and removed its log, so the
+    // next log, the one left, holds nothing: not even CLOSE.
     assert_eq!(
         std::fs::metadata(log_of(&dir)).unwrap().len(),
         STAMP_LEN as u64

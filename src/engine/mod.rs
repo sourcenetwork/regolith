@@ -10,6 +10,8 @@ mod blocked_call_tests;
 pub(crate) mod bloom;
 pub(crate) mod callback;
 pub(crate) mod checksum;
+#[cfg(test)]
+mod close_in_place_tests;
 pub(crate) mod commit;
 pub(crate) mod compaction;
 #[cfg(not(target_arch = "wasm32"))]
@@ -3191,6 +3193,17 @@ impl RegolithEngine {
                 Ok(())
             }
             Err(err) => {
+                // Commits go on in a log of their own: one the close sealed
+                // in place is synced and followed by a fresh one first. If
+                // that fails too the database is latched, so no commit lands
+                // in a log a flush removes.
+                if self.pipeline.is_some()
+                    && let Err(reopen) =
+                        self.ordered(|engine, ord| ord.reopen_log(engine.is_latched()))
+                {
+                    tracing::error!(error = %reopen, "taking writes again after a failed close failed");
+                    self.latch_wal_failure(&reopen);
+                }
                 // Reads through queues work again on the database the failed
                 // close left open, and lock waits queue again.
                 self.cache.reopen_io();
@@ -3214,15 +3227,7 @@ impl RegolithEngine {
         // would vouch for them: replay would then refuse the crash it should
         // survive. Such a log is left for recovery to judge. Checked in the
         // ordered step, where a failing commit latches.
-        self.ordered(|engine, ord| {
-            let latched = engine.is_latched();
-            ord.close_log(latched).inspect_err(|err| {
-                if !latched {
-                    tracing::error!(error = %err, "closing the write-ahead log failed");
-                    engine.latch_wal_failure(err);
-                }
-            })
-        })?;
+        self.ordered(|engine, ord| ord.close_log(engine.is_latched()))?;
         // Stop and join regolith's threads. A worker waiting for the
         // compaction gate exits once whoever holds the gate lets go: a job on
         // another worker when it ends, a queue's job that was handed the
@@ -3235,7 +3240,7 @@ impl RegolithEngine {
     }
 
     fn flush_memtables_for_close(&self) -> std::io::Result<()> {
-        self.drain_memtables(ActiveFlush::WhenFull)
+        self.drain_memtables(ActiveFlush::ForClose)
     }
 
     /// Rewrite the manifest now, the way growth does on its own.
