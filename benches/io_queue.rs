@@ -159,8 +159,11 @@ fn io_queue_miss_to_ready(c: &mut Criterion) {
     let snapshot = db
         .snapshot()
         .with_read_mode(ReadMode::CacheOnly(queue.id()));
+    // Criterion calls the closure once per sample, so the sweep lives outside
+    // it: a sweep started again in each sample would read again the blocks
+    // the last sample read, which the queue still holds.
+    let mut sweep = Sweep::new(MISS_KEYS, block_size);
     group.bench_function("own_queue", |b| {
-        let mut sweep = Sweep::new(MISS_KEYS, block_size);
         b.iter_custom(|iters| {
             let reads = env.table_reads();
             let start = Instant::now();
@@ -192,8 +195,8 @@ fn io_queue_miss_to_ready(c: &mut Criterion) {
                 answers.send(db.get(k).expect("read")).expect("answer");
             }
         });
+        let mut sweep = Sweep::new(MISS_KEYS, block_size);
         group.bench_function("hop_to_io_thread", |b| {
-            let mut sweep = Sweep::new(MISS_KEYS, block_size);
             b.iter_custom(|iters| {
                 let reads = env.table_reads();
                 let start = Instant::now();
