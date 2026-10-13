@@ -154,7 +154,9 @@ mod claim;
 mod cursor;
 mod early;
 mod exclusive;
+mod first_four;
 mod handoff;
+mod in_place;
 #[cfg(loom)]
 pub mod lock_loom;
 mod lock_table;
@@ -842,8 +844,8 @@ pub struct Transaction {
     /// refuses every non-empty range), so a savepoint has nothing in it to
     /// take back.
     savepoints: Vec<Savepoint>,
-    /// What the caller registered to run when the transaction ends. Nothing,
-    /// and no allocation, until the first registration.
+    /// What the caller registered to run when the transaction ends, the
+    /// first four of each kind in place: no allocation for them.
     callbacks: Callbacks,
     /// Shared with the engine so `close` can abort the transaction; made when
     /// the first `on_abort` callback is registered, or at once under a

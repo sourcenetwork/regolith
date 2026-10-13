@@ -8,6 +8,7 @@
 
 #![allow(unsafe_code)]
 
+#[derive(Default)]
 pub(super) struct Exclusive<T>(T);
 
 // SAFETY: the only ways in are `&mut self` and by value, so a shared
@@ -16,16 +17,8 @@ pub(super) struct Exclusive<T>(T);
 unsafe impl<T: Send> Sync for Exclusive<T> {}
 
 impl<T> Exclusive<T> {
-    pub(super) fn new(value: T) -> Self {
-        Self(value)
-    }
-
     pub(super) fn get_mut(&mut self) -> &mut T {
         &mut self.0
-    }
-
-    pub(super) fn into_inner(self) -> T {
-        self.0
     }
 }
 
@@ -44,8 +37,8 @@ mod tests {
 
     #[test]
     fn the_value_is_reached_through_exclusive_access_only() {
-        let mut value = Exclusive::new(Cell::new(1));
+        let mut value = Exclusive(Cell::new(1));
         value.get_mut().set(2);
-        assert_eq!(value.into_inner().get(), 2);
+        assert_eq!(value.0.get(), 2);
     }
 }
