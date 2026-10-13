@@ -98,6 +98,40 @@ fn a_bottom_compaction_does_not_bring_back_a_key_a_buried_range_delete_deletes()
     assert_reads(&db, "after a reopen", &BURIED);
 }
 
+/// What a 0.1.x ingest left when the older key had not left level 0 yet: a
+/// flushed table holds `k` at 10 in level 0, and the ingested table, `z` and
+/// a range delete over `[b, t)` at 20, went to the bottom level, which its
+/// point keys met nothing in. Level 0 is read before the bottom level, so a
+/// read found `k` first.
+#[test]
+fn a_range_delete_in_the_bottom_level_deletes_an_older_key_of_level_0() {
+    let (dir, sst_dir) = empty_db();
+    let key = table_of(&sst_dir, 8, &[(b"k", 10, VALUE_TYPE_VALUE, b"old")], &[]);
+    let ingest = table_of(
+        &sst_dir,
+        3,
+        &[(b"z", 20, VALUE_TYPE_VALUE, b"ingested")],
+        &[(b"b", b"t", 20)],
+    );
+    manifest(
+        dir.path(),
+        &[
+            add(0, key),
+            add(6, ingest),
+            ManifestRecord::SetNextFileId(101),
+            ManifestRecord::SetLastSeq(20),
+            ManifestRecord::SetMinWalId(5),
+        ],
+    );
+    let db = Db::open(dir.path(), options()).unwrap();
+    assert_eq!(copied(&db), Some(1));
+    let expected: [(&[u8], Option<&[u8]>); 2] = [(b"k", None), (b"z", Some(b"ingested"))];
+    assert_reads(&db, "after the open", &expected);
+    assert_eq!(get_at(&db, b"k", 19).as_deref(), Some(&b"old"[..]));
+    db.compact_range(None, None).wait().unwrap();
+    assert_reads(&db, "after compacting everything", &expected);
+}
+
 /// The order a release that rotated its memtable into an ingest without
 /// flushing it could leave inside level 0: the range delete in an older
 /// table, an older key it deletes in a newer one. Read newest first, the
@@ -171,6 +205,57 @@ fn a_range_delete_already_in_front_of_what_it_deletes_is_not_copied() {
         &db,
         "after the open",
         &[(b"c", None), (b"d", None), (b"y", Some(b"y"))],
+    );
+}
+
+/// One range delete whose pieces two levels hold, both below older keys
+/// they delete, is copied, and counted, once.
+#[test]
+fn the_pieces_of_one_range_delete_are_copied_as_one() {
+    let (dir, sst_dir) = empty_db();
+    let keys = table_of(
+        &sst_dir,
+        8,
+        &[
+            (b"c", 10, VALUE_TYPE_VALUE, b"old"),
+            (b"m", 10, VALUE_TYPE_VALUE, b"old"),
+        ],
+        &[],
+    );
+    let first = table_of(
+        &sst_dir,
+        3,
+        &[(b"a", 20, VALUE_TYPE_VALUE, b"a")],
+        &[(b"b", b"k", 20)],
+    );
+    let second = table_of(
+        &sst_dir,
+        4,
+        &[(b"z", 20, VALUE_TYPE_VALUE, b"z")],
+        &[(b"k", b"t", 20)],
+    );
+    manifest(
+        dir.path(),
+        &[
+            add(1, keys),
+            add(5, first),
+            add(6, second),
+            ManifestRecord::SetNextFileId(101),
+            ManifestRecord::SetLastSeq(20),
+            ManifestRecord::SetMinWalId(5),
+        ],
+    );
+    let db = Db::open(dir.path(), options()).unwrap();
+    assert_eq!(copied(&db), Some(1));
+    assert_reads(
+        &db,
+        "after the open",
+        &[
+            (b"a", Some(b"a")),
+            (b"c", None),
+            (b"m", None),
+            (b"z", Some(b"z")),
+        ],
     );
 }
 
