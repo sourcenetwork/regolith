@@ -1,5 +1,5 @@
 //! Every call the engine makes of the caller's [`PrefixExtractor`], and the
-//! two forms a table's prefix bloom comes in.
+//! forms a table's prefix bloom comes in.
 //!
 //! The extractor is the caller's code, and it carves a prefix out of the
 //! caller's key. So a table built here asks it about the key as the caller
@@ -10,30 +10,36 @@
 //! column families is two entries, and a seek in one family is not answered
 //! by the other's keys.
 //!
-//! That is the [`PrefixForm::CallerKey`] form. A table written before it
-//! existed holds [`PrefixForm::EngineKey`]: the extractor was asked about
-//! the engine's key, the family id in front of the caller's, and the bloom
-//! holds what it returned. Such a table is still filtered exactly as it was
-//! built, by asking the extractor the same way, so nothing it holds is
-//! ruled out wrongly. It is the one place the extractor still sees an
-//! engine key, and only while such a table is in level 0: a compaction
-//! writes every table in the caller-key form. Nothing starts a table in the
-//! old form any more, outside this crate's own tests.
+//! A table records the extractor that built its prefix bloom by name, in the
+//! [`PrefixForm::Named`] form every table is written in. A seek asks a
+//! table's bloom only when that name is the name of the extractor the
+//! database runs with now: a bloom built from other prefixes can say a
+//! prefix is absent from a table that holds it. A table of an older form
+//! records no name, so a seek reads it without its prefix filter:
+//! [`PrefixForm::EngineKey`], whose entries the extractor carved out of the
+//! engine's key (the caller's behind its family id), and
+//! [`PrefixForm::CallerKey`], the caller's key with no name. A compaction
+//! rewrites either into the named form.
 //!
 //! A table says which form it holds in the header of its bloom region
-//! (`filter_block`), and a seek asks each table in the table's own form
-//! ([`PrefixProbe`]).
+//! (`filter_block`).
 
 use crate::column_family::{CF_PREFIX_LEN, META_CF_ID};
 use crate::options::PrefixExtractor;
 
-/// Which key a table's prefix bloom was built from.
+/// Which key a table's prefix bloom was built from, and whether the table
+/// names the extractor that built it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PrefixForm {
-    /// The engine's key. Read; written only by this crate's tests.
+    /// The engine's key, with no name. Read; written only by this crate's
+    /// tests.
     EngineKey,
-    /// The caller's key, with the family id in front of each entry.
+    /// The caller's key, with the family id in front of each entry, and no
+    /// name. Read; written only by this crate's tests.
     CallerKey,
+    /// The caller's key, as in [`PrefixForm::CallerKey`], and the name of
+    /// the extractor that built it.
+    Named,
 }
 
 impl PrefixForm {
@@ -42,6 +48,7 @@ impl PrefixForm {
         match self {
             Self::EngineKey => 0,
             Self::CallerKey => 1,
+            Self::Named => 2,
         }
     }
 
@@ -51,6 +58,7 @@ impl PrefixForm {
         match tag {
             0 => Some(Self::EngineKey),
             1 => Some(Self::CallerKey),
+            2 => Some(Self::Named),
             _ => None,
         }
     }
@@ -65,7 +73,7 @@ fn callers(prefixed: &[u8]) -> Option<(&[u8; CF_PREFIX_LEN], &[u8])> {
 }
 
 /// The bloom entry of `form` for the engine key `prefixed`, written into
-/// `out`. In the caller-key form that is the family id, then what the
+/// `out`. In the caller-key forms that is the family id, then what the
 /// extractor carves out of the caller's key. `false`, with `out` empty, when
 /// the key gets no entry.
 pub(crate) fn entry(
@@ -76,7 +84,7 @@ pub(crate) fn entry(
 ) -> bool {
     out.clear();
     match form {
-        PrefixForm::CallerKey => {
+        PrefixForm::CallerKey | PrefixForm::Named => {
             let Some((family, key)) = callers(prefixed) else {
                 return false;
             };
@@ -96,25 +104,20 @@ pub(crate) fn entry(
     true
 }
 
-/// The bloom keys of one prefix seek, one for each form a table's prefix
-/// bloom comes in.
-pub(crate) struct PrefixProbe<'a> {
-    extractor: &'a dyn PrefixExtractor,
-    /// The seek's prefix as the engine keys it.
-    prefixed: &'a [u8],
+/// The bloom key of one prefix seek, and the name of the extractor that
+/// made it.
+pub(crate) struct PrefixProbe {
+    /// The name of the extractor the database runs with.
+    name: &'static str,
     /// `None` when the extractor derives no bloom key from the caller's
-    /// prefix: the seek then rules out no table of the caller-key form.
+    /// prefix: the seek then rules out no table.
     caller_key: Option<Vec<u8>>,
-    /// Made the first time the seek meets a table of the engine-key form,
-    /// so a database with none never asks the extractor about an engine
-    /// key. `Some(None)`: asked, and the extractor gave no key.
-    engine_key: Option<Option<Vec<u8>>>,
 }
 
-impl<'a> PrefixProbe<'a> {
+impl PrefixProbe {
     /// The probe of a seek for the engine prefix `prefixed`. The extractor
     /// is asked about the caller's prefix here, once.
-    pub(crate) fn new(extractor: &'a dyn PrefixExtractor, prefixed: &'a [u8]) -> Self {
+    pub(crate) fn new(extractor: &dyn PrefixExtractor, prefixed: &[u8]) -> Self {
         let caller_key = callers(prefixed).and_then(|(family, prefix)| {
             let extracted = extractor.extract_query(prefix)?;
             let mut key = Vec::with_capacity(CF_PREFIX_LEN + extracted.len());
@@ -123,24 +126,20 @@ impl<'a> PrefixProbe<'a> {
             Some(key)
         });
         Self {
-            extractor,
-            prefixed,
+            name: extractor.name(),
             caller_key,
-            engine_key: None,
         }
     }
 
-    /// The bloom key to ask a table of `form` with, or `None` when there is
-    /// none, in which case the table is not ruled out.
-    pub(crate) fn key_for(&mut self, form: PrefixForm) -> Option<&[u8]> {
-        match form {
-            PrefixForm::CallerKey => self.caller_key.as_deref(),
-            PrefixForm::EngineKey => {
-                let (extractor, prefixed) = (self.extractor, self.prefixed);
-                self.engine_key
-                    .get_or_insert_with(|| extractor.extract_query(prefixed).map(<[u8]>::to_vec))
-                    .as_deref()
-            }
+    /// The bloom key to ask a table's prefix bloom with, when the extractor
+    /// named `built_by` built it; `None` when there is none, and the table
+    /// is then not ruled out. A bloom another extractor built is never
+    /// asked.
+    pub(crate) fn key_for(&self, built_by: &[u8]) -> Option<&[u8]> {
+        if built_by == self.name.as_bytes() {
+            self.caller_key.as_deref()
+        } else {
+            None
         }
     }
 }
@@ -148,31 +147,31 @@ impl<'a> PrefixProbe<'a> {
 #[cfg(test)]
 thread_local! {
     /// Test seam: while set, a table this thread starts builds its prefix
-    /// bloom in the engine-key form.
-    static WRITE_ENGINE_KEY_FORM: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// bloom in this form.
+    static WRITE_FORM: std::cell::Cell<Option<PrefixForm>> = const { std::cell::Cell::new(None) };
 }
 
-/// The form a table started now builds its prefix bloom in: the caller-key
-/// form, except in a test of this crate that asked for the old one.
+/// The form a table started now builds its prefix bloom in: the named form,
+/// except in a test of this crate that asked for an older one.
 pub(crate) fn form_to_write() -> PrefixForm {
     #[cfg(test)]
-    if WRITE_ENGINE_KEY_FORM.with(std::cell::Cell::get) {
-        return PrefixForm::EngineKey;
+    if let Some(form) = WRITE_FORM.with(std::cell::Cell::get) {
+        return form;
     }
-    PrefixForm::CallerKey
+    PrefixForm::Named
 }
 
-/// Test-only: run `f` with every table this thread starts built in the
-/// engine-key form, as tables written before the caller-key form were.
+/// Test-only: run `f` with every table this thread starts built in `form`,
+/// as tables written before the next form were.
 #[cfg(test)]
-pub(crate) fn writing_engine_key_form<T>(f: impl FnOnce() -> T) -> T {
-    struct Restore(bool);
+pub(crate) fn writing_form<T>(form: PrefixForm, f: impl FnOnce() -> T) -> T {
+    struct Restore(Option<PrefixForm>);
     impl Drop for Restore {
         fn drop(&mut self) {
-            WRITE_ENGINE_KEY_FORM.with(|form| form.set(self.0));
+            WRITE_FORM.with(|cell| cell.set(self.0));
         }
     }
-    let _restore = Restore(WRITE_ENGINE_KEY_FORM.with(|form| form.replace(true)));
+    let _restore = Restore(WRITE_FORM.with(|cell| cell.replace(Some(form))));
     f()
 }
 
@@ -209,32 +208,33 @@ mod tests {
 
     #[test]
     fn an_entry_is_the_family_id_and_the_prefix_of_the_callers_key() {
-        let extractor = Asked::default();
-        let form = PrefixForm::CallerKey;
-        let mut out = vec![9];
-        assert!(entry(form, &extractor, &prefix_key(7, b"abcdef"), &mut out));
-        assert_eq!(out, prefix_key(7, b"abc"));
-        // Too short for the extractor: no entry.
-        assert!(!entry(form, &extractor, &prefix_key(7, b"ab"), &mut out));
-        assert!(out.is_empty());
-        assert_eq!(
-            *extractor.keys.lock().unwrap(),
-            [b"abcdef".to_vec(), b"ab".to_vec()],
-            "asked about the caller's key"
-        );
+        for form in [PrefixForm::Named, PrefixForm::CallerKey] {
+            let extractor = Asked::default();
+            let mut out = vec![9];
+            assert!(entry(form, &extractor, &prefix_key(7, b"abcdef"), &mut out));
+            assert_eq!(out, prefix_key(7, b"abc"));
+            // Too short for the extractor: no entry.
+            assert!(!entry(form, &extractor, &prefix_key(7, b"ab"), &mut out));
+            assert!(out.is_empty());
+            assert_eq!(
+                *extractor.keys.lock().unwrap(),
+                [b"abcdef".to_vec(), b"ab".to_vec()],
+                "asked about the caller's key"
+            );
+        }
     }
 
     #[test]
     fn the_databases_own_entries_get_no_entry_and_are_not_shown() {
         let extractor = Asked::default();
-        let form = PrefixForm::CallerKey;
+        let form = PrefixForm::Named;
         let registry = prefix_key(META_CF_ID, b"name:x");
         let mut out = Vec::new();
         assert!(!entry(form, &extractor, &registry, &mut out));
         assert!(!entry(form, &extractor, b"abc", &mut out), "no family id");
         let registry_prefix = prefix_key(META_CF_ID, b"name:");
-        let mut probe = PrefixProbe::new(&extractor, &registry_prefix);
-        assert_eq!(probe.key_for(form), None);
+        let probe = PrefixProbe::new(&extractor, &registry_prefix);
+        assert_eq!(probe.key_for(b"asked"), None);
         assert!(extractor.keys.lock().unwrap().is_empty());
         assert!(extractor.seeks.lock().unwrap().is_empty());
     }
@@ -254,56 +254,53 @@ mod tests {
         assert_eq!(*extractor.keys.lock().unwrap(), [prefixed]);
     }
 
+    /// A seek asks the extractor about the caller's prefix once, and has a
+    /// key only for a table the same extractor built.
     #[test]
-    fn a_seek_asks_about_the_callers_prefix_and_about_the_engines_only_for_an_old_table() {
+    fn a_seek_asks_only_a_table_built_by_an_extractor_of_the_same_name() {
         let extractor = Asked::default();
         let prefixed = prefix_key(7, b"abcd");
-        let mut probe = PrefixProbe::new(&extractor, &prefixed);
+        let probe = PrefixProbe::new(&extractor, &prefixed);
         let caller_key = prefix_key(7, b"abc");
-        assert_eq!(probe.key_for(PrefixForm::CallerKey), Some(&caller_key[..]));
-        assert_eq!(probe.key_for(PrefixForm::CallerKey), Some(&caller_key[..]));
+        assert_eq!(probe.key_for(b"asked"), Some(&caller_key[..]));
+        assert_eq!(probe.key_for(b"other"), None);
+        assert_eq!(probe.key_for(b""), None);
+        assert_eq!(probe.key_for(b"aske"), None);
         assert_eq!(*extractor.seeks.lock().unwrap(), [b"abcd".to_vec()]);
-
-        // The engine-key form: the first three bytes of the engine's key,
-        // which are bytes of the family id, asked for once.
-        assert_eq!(probe.key_for(PrefixForm::EngineKey), Some(&[0, 0, 0][..]));
-        assert_eq!(probe.key_for(PrefixForm::EngineKey), Some(&[0, 0, 0][..]));
-        assert_eq!(
-            *extractor.seeks.lock().unwrap(),
-            [b"abcd".to_vec(), prefixed.clone()]
-        );
     }
 
-    /// A prefix shorter than the extractor's width rules out no table of
-    /// the caller-key form, and an old table is still asked the way it was
-    /// built: with what the extractor carves out of the engine's prefix.
+    /// A prefix shorter than the extractor's width rules out no table.
     #[test]
-    fn a_prefix_the_extractor_gives_no_key_for_asks_only_an_old_table() {
+    fn a_prefix_the_extractor_gives_no_key_for_rules_out_no_table() {
         let extractor = Asked::default();
         let prefixed = prefix_key(7, b"ab");
-        let mut probe = PrefixProbe::new(&extractor, &prefixed);
-        assert_eq!(probe.key_for(PrefixForm::CallerKey), None);
-        assert_eq!(probe.key_for(PrefixForm::EngineKey), Some(&[0, 0, 0][..]));
-
+        assert_eq!(
+            PrefixProbe::new(&extractor, &prefixed).key_for(b"asked"),
+            None
+        );
         let short = [0, 7];
-        let mut probe = PrefixProbe::new(&extractor, &short);
-        assert_eq!(probe.key_for(PrefixForm::CallerKey), None);
-        assert_eq!(probe.key_for(PrefixForm::EngineKey), None);
+        assert_eq!(PrefixProbe::new(&extractor, &short).key_for(b"asked"), None);
     }
 
     #[test]
     fn a_form_round_trips_through_its_tag_and_an_unknown_tag_is_no_form() {
-        for form in [PrefixForm::EngineKey, PrefixForm::CallerKey] {
+        for form in [
+            PrefixForm::EngineKey,
+            PrefixForm::CallerKey,
+            PrefixForm::Named,
+        ] {
             assert_eq!(PrefixForm::from_tag(form.tag()), Some(form));
         }
-        assert_eq!(PrefixForm::from_tag(2), None);
+        assert_eq!(PrefixForm::from_tag(3), None);
         assert_eq!(PrefixForm::from_tag(0xFF), None);
     }
 
     #[test]
-    fn a_table_is_started_in_the_caller_key_form_unless_a_test_asks_for_the_old_one() {
-        assert_eq!(form_to_write(), PrefixForm::CallerKey);
-        writing_engine_key_form(|| assert_eq!(form_to_write(), PrefixForm::EngineKey));
-        assert_eq!(form_to_write(), PrefixForm::CallerKey);
+    fn a_table_is_started_in_the_named_form_unless_a_test_asks_for_an_older_one() {
+        assert_eq!(form_to_write(), PrefixForm::Named);
+        for form in [PrefixForm::EngineKey, PrefixForm::CallerKey] {
+            writing_form(form, || assert_eq!(form_to_write(), form));
+        }
+        assert_eq!(form_to_write(), PrefixForm::Named);
     }
 }

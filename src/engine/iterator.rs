@@ -142,11 +142,7 @@ impl LevelIter {
     /// level iterator empty if no table of it can contain a key with the
     /// prefix `probe` is for. A table ruled out this way is counted as a
     /// useful bloom check. Memtable levels always perform a normal seek.
-    fn seek_with_prefix_skip(
-        &mut self,
-        target: &[u8],
-        probe: &mut PrefixProbe<'_>,
-    ) -> io::Result<()> {
+    fn seek_with_prefix_skip(&mut self, target: &[u8], probe: &PrefixProbe) -> io::Result<()> {
         match self {
             Self::Memtable(it) => {
                 it.seek(target);
@@ -892,11 +888,7 @@ impl LevelConcatIter {
     /// tables are in key order, so it ends at the first one that can hold
     /// the prefix, and at the first one that starts past it, after which no
     /// table holds it and the level is left empty.
-    fn seek_with_prefix_skip(
-        &mut self,
-        target: &[u8],
-        probe: &mut PrefixProbe<'_>,
-    ) -> io::Result<()> {
+    fn seek_with_prefix_skip(&mut self, target: &[u8], probe: &PrefixProbe) -> io::Result<()> {
         let prefix = user_key_of(target);
         let mut idx = self
             .files
@@ -1074,11 +1066,7 @@ impl MergingIter {
         Ok(())
     }
 
-    fn seek_with_prefix_skip(
-        &mut self,
-        target: &[u8],
-        probe: &mut PrefixProbe<'_>,
-    ) -> io::Result<()> {
+    fn seek_with_prefix_skip(&mut self, target: &[u8], probe: &PrefixProbe) -> io::Result<()> {
         for lvl in &mut self.levels {
             lvl.seek_with_prefix_skip(target, probe)?;
         }
@@ -1704,10 +1692,9 @@ impl RegolithIterator {
         // prefix bloom was built in.
         let search_key = LookupKey::from_prefixed(prefix, u64::MAX);
         let res = match self.prefix_extractor.as_deref() {
-            Some(extractor) => self.inner.seek_with_prefix_skip(
-                search_key.internal(),
-                &mut PrefixProbe::new(extractor, prefix),
-            ),
+            Some(extractor) => self
+                .inner
+                .seek_with_prefix_skip(search_key.internal(), &PrefixProbe::new(extractor, prefix)),
             None => self.inner.seek(search_key.internal()),
         };
         if let Err(e) = res {

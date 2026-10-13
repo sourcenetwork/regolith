@@ -547,13 +547,10 @@ impl WriteOptions {
 /// still answers for one column family at a time: a prefix one family
 /// holds does not make a table look as if another family held it.
 ///
-/// One case differs. A table written by a release that handed the
-/// extractor the database's own form of the key (the caller's key behind
-/// a 4-byte column-family id) is filtered the way it was built, so
-/// nothing it holds is skipped: a prefix seek that meets such a table
-/// also calls `extract_query` with the caller's prefix behind those 4
-/// bytes. Every table written since holds the caller's form, and a
-/// compaction rewrites the old ones into it.
+/// Changing the extractor is allowed: each table records the name of the
+/// extractor that built it, and a prefix seek reads a table built under
+/// another name, or before names were recorded, without its prefix filter
+/// until a compaction rewrites it.
 ///
 /// A panic in this trait's code while a commit's memtable rotation runs it
 /// fails that commit with [`crate::Error::CallbackPanicked`] and latches the
@@ -578,8 +575,11 @@ pub trait PrefixExtractor: Send + Sync + 'static {
         (extracted == prefix).then_some(extracted)
     }
 
-    /// A stable, human-readable identifier for this extractor. Used
-    /// by tracing and diagnostics.
+    /// A stable, human-readable identifier for this extractor, recorded in
+    /// every table it builds. Two extractors that carve out different
+    /// prefixes must have different names: a table's prefix filter is used
+    /// only under the name it records. Also used by tracing and
+    /// diagnostics.
     fn name(&self) -> &'static str;
 }
 
@@ -601,9 +601,33 @@ impl PrefixExtractor for FixedLengthPrefix {
         self.extract(prefix)
     }
 
+    /// `FixedLengthPrefix(N)`: the width is part of what it extracts, so it
+    /// is part of its name.
     fn name(&self) -> &'static str {
-        "FixedLengthPrefix"
+        fixed_length_name(self.0)
     }
+}
+
+/// The name of [`FixedLengthPrefix`] of `width`, made once per width and
+/// kept for the life of the process. Asking for it takes no lock: a width up
+/// to 64 has a cell of its own, and a wider one is kept in a lock-free map.
+fn fixed_length_name(width: usize) -> &'static str {
+    use std::sync::OnceLock;
+
+    use kovan_map::HopscotchMap;
+
+    static SMALL: [OnceLock<&'static str>; 65] = [const { OnceLock::new() }; 65];
+    static LARGE: OnceLock<HopscotchMap<usize, &'static str>> = OnceLock::new();
+    let make = || &*Box::leak(format!("FixedLengthPrefix({width})").into_boxed_str());
+    if let Some(name) = SMALL.get(width) {
+        return name.get_or_init(make);
+    }
+    let large = LARGE.get_or_init(HopscotchMap::new);
+    // Threads that miss the same width at once each make a name and the map
+    // keeps one: the others stay allocated, one per racing thread at most.
+    large
+        .get(&width)
+        .unwrap_or_else(|| large.get_or_insert(width, make()))
 }
 
 /// Compaction strategy used by the background compaction thread.
@@ -1586,7 +1610,12 @@ mod tests {
         assert_eq!(ex.extract(b"abcd"), Some(&b"abcd"[..]));
         assert_eq!(ex.extract(b"abc"), None);
         assert_eq!(ex.extract(b""), None);
-        assert_eq!(ex.name(), "FixedLengthPrefix");
+        assert_eq!(ex.name(), "FixedLengthPrefix(4)");
+        // Each width its own name, the same every time it is asked.
+        assert_eq!(FixedLengthPrefix(4).name(), ex.name());
+        assert_eq!(FixedLengthPrefix(65).name(), "FixedLengthPrefix(65)");
+        assert_eq!(FixedLengthPrefix(65).name(), FixedLengthPrefix(65).name());
+        assert_ne!(FixedLengthPrefix(3).name(), ex.name());
     }
 
     #[test]

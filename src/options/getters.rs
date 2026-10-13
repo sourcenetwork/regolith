@@ -223,7 +223,7 @@ mod tests {
             compaction_filter: |o| o.compaction_filter(Some(Arc::new(KeepAll)))
                 => |o| o.get_compaction_filter().is_some_and(|f| f.name() == "keep-all"),
             prefix_extractor: |o| o.prefix_extractor(Some(Arc::new(FixedLengthPrefix(2))))
-                => |o| o.get_prefix_extractor().is_some_and(|p| p.name() == "FixedLengthPrefix"),
+                => |o| o.get_prefix_extractor().is_some_and(|p| p.name() == "FixedLengthPrefix(2)"),
             merge_operator: |o| o.merge_operator(Some(Arc::new(Declines)))
                 => |o| o.get_merge_operator().is_some_and(|m| m.name() == "declines"),
             atomic_flush: |o| o.atomic_flush(true) => |o| o.get_atomic_flush(),

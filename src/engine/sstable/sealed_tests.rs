@@ -104,10 +104,10 @@ fn a_sealed_table_round_trips_in_every_layout_and_holds_no_plaintext() {
             // The first four bytes of these keys stand where a family id
             // does, so a prefix is the four bytes after them.
             let extractor = crate::FixedLengthPrefix(4);
-            let mut held = PrefixProbe::new(&extractor, b"key_0001");
-            assert!(reader.may_have_prefix(&mut held, &cache).unwrap());
-            let mut absent = PrefixProbe::new(&extractor, b"key_9999");
-            assert!(!reader.may_have_prefix(&mut absent, &cache).unwrap());
+            let held = PrefixProbe::new(&extractor, b"key_0001");
+            assert!(reader.may_have_prefix(&held, &cache).unwrap());
+            let absent = PrefixProbe::new(&extractor, b"key_9999");
+            assert!(!reader.may_have_prefix(&absent, &cache).unwrap());
         }
     }
 }

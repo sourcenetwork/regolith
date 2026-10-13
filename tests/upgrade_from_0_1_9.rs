@@ -27,7 +27,7 @@
 //!
 //! 0.1.9 handed the extractor the key behind its 4-byte column-family id,
 //! so each of those tables' prefix filters holds, for every key, the id and
-//! the first four bytes of the key the caller wrote.
+//! the first four bytes of the key the caller wrote, and names no extractor.
 
 // Native-only, like every test that touches the filesystem.
 #![cfg(not(target_arch = "wasm32"))]
@@ -266,12 +266,13 @@ fn prefix_seek(
     (found.len(), ruled_out)
 }
 
-/// A database 0.1.9 wrote with a prefix extractor keeps filtering its prefix
-/// seeks the way its tables were built, and finds every row; once a
-/// compaction has rewritten the tables, the filter is on the key the caller
-/// wrote.
+/// A database 0.1.9 wrote with a prefix extractor finds every row of a
+/// prefix seek. Its tables name no extractor, so a seek reads them without
+/// their prefix filter; a table written now names the one it was built with
+/// and is filtered on the key the caller wrote, and so is every table once a
+/// compaction has rewritten them.
 #[test]
-fn a_0_1_9_database_with_a_prefix_extractor_keeps_filtering_its_prefix_seeks() {
+fn a_0_1_9_database_with_a_prefix_extractor_reads_its_old_tables_whole() {
     let tmp = TempDir::new().unwrap();
     let db_dir = tmp.path().join("db");
     copy_tree(&fixture_dir().with_file_name("v0_1_9_prefix"), &db_dir);
@@ -293,25 +294,22 @@ fn a_0_1_9_database_with_a_prefix_extractor_keeps_filtering_its_prefix_seeks() {
     };
     assert_eq!(db.get_int_property("regolith.num-files-at-level0"), Some(3));
 
-    // Each table's filter holds the family id and four bytes of the key, so
-    // a seek for `tenA0009` in the default family rules out only the one
-    // table that has no `tenA` there, and finds nothing in the other two.
-    assert_eq!(seek(None, b"tenA0009"), (0, 1));
-    assert_eq!(seek(None, b"tenA0001"), (2, 1));
-    assert_eq!(seek(None, b"tenC0007:"), (2, 2));
-    assert_eq!(seek(None, b"tenZ0001"), (0, 3));
-    assert_eq!(seek(Some(&named), b"tenA0001"), (1, 2));
-    assert_eq!(seek(Some(&named), b"tenB0002"), (1, 1));
-    // A prefix of fewer than four of the caller's bytes is not filtered.
+    // No table 0.1.9 wrote is ruled out, whatever its filter holds.
+    assert_eq!(seek(None, b"tenA0009"), (0, 0));
+    assert_eq!(seek(None, b"tenA0001"), (2, 0));
+    assert_eq!(seek(None, b"tenC0007:"), (2, 0));
+    assert_eq!(seek(None, b"tenZ0001"), (0, 0));
+    assert_eq!(seek(Some(&named), b"tenA0001"), (1, 0));
+    assert_eq!(seek(Some(&named), b"tenB0002"), (1, 0));
     assert_eq!(seek(None, b"ten"), (6, 0));
     assert_eq!(seek(Some(&named), b""), (4, 0));
 
     // A table written now is filtered on the key the caller wrote, next to
-    // the three that are not.
+    // the three that are read whole.
     db.put(b"tenA0009:z", b"11").unwrap();
     db.flush().unwrap();
-    assert_eq!(seek(None, b"tenA0009"), (1, 1));
-    assert_eq!(seek(None, b"tenA0008"), (0, 2));
+    assert_eq!(seek(None, b"tenA0009"), (1, 0));
+    assert_eq!(seek(None, b"tenA0008"), (0, 1));
 
     // The compaction rewrites the four overlapping tables into one, and the
     // filter then tells `tenA0008` from `tenA0009`.
