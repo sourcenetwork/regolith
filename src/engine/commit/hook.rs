@@ -15,7 +15,8 @@ pub(crate) enum Stage {
     Validate,
     /// Before a decided slot is applied.
     Apply,
-    /// Before a slot's owner encodes its record into its descriptor.
+    /// Inside the encoding of a slot's record into its descriptor, the
+    /// encoding claimed (`FILLING`) and the record not filled yet.
     Fill,
     /// Before a slot's record is written: the write unit claimed and its
     /// run gathered, or a copy about to count in.

@@ -10,8 +10,10 @@
 //!
 //! 1. **Fill.** Once its slot is decided, a commit's owner encodes its record
 //!    into its own descriptor's buffer and sets the slot's `FILLED` flag
-//!    (D4 in `descriptor.rs`). Owners encode in parallel; nobody encodes
-//!    another thread's record while holding anything.
+//!    (D4 in `descriptor.rs`). Owners encode in parallel. A thread that needs
+//!    another's record written and finds nobody encoding it encodes it the
+//!    same way, rather than wait for an owner that may not be running;
+//!    nobody encodes while holding the unit.
 //! 2. **Claim.** A thread that needs a record written claims the unit with
 //!    one compare-and-swap of its word.
 //! 3. **Gather.** The holder collects the run of filled, unwritten records
@@ -28,7 +30,7 @@
 //! # Who waits, and for how long
 //!
 //! A thread whose record is not written finds the unit claimed by another
-//! thread, or (for another thread's record) the record not filled yet.
+//! thread, or the record being encoded by another thread.
 //!
 //! - **A blocking commit** ([`Await::Park`]) spins about as long as one
 //!   write takes, then parks on the record. Whoever writes it, fills it or
@@ -91,7 +93,7 @@ use super::super::RegolithEngine;
 use super::super::io::job::Job;
 use super::super::wal_frame::KIND_GROUP;
 use super::super::wal_log::Place;
-use super::descriptor::{Decision, Descriptor, FAILED, FILLED, PARKED, WRITTEN};
+use super::descriptor::{Decision, Descriptor, FAILED, FILLED, FILLING, PARKED, WRITTEN};
 use super::hook;
 use super::park::Help;
 use super::pipeline::{Pipeline, ops_of};
@@ -477,9 +479,11 @@ impl Waiting {
 
 impl RegolithEngine {
     /// Encode slot `desc`'s record into its descriptor (D4): what its owner
-    /// does once the slot is decided, before it needs the record written. A
-    /// slot with no record, discarded, written or filled already is left as
-    /// it is. A record that cannot be encoded fails the log.
+    /// does once the slot is decided, before it needs the record written,
+    /// and what any thread that needs the record written does when nobody
+    /// has encoded it. A slot with no record, discarded, written, or filled
+    /// or being filled already is left as it is. A record that cannot be
+    /// encoded fails the log.
     pub(super) fn fill(&self, desc: &Descriptor) {
         let Some(decision) = desc.decision() else {
             return;
@@ -487,11 +491,14 @@ impl RegolithEngine {
         let Some(place) = &decision.place else {
             return;
         };
-        if desc.flags() & (FILLED | WRITTEN | FAILED) != 0 {
+        if desc.flags() & (FILLED | FILLING | WRITTEN | FAILED) != 0 {
             return;
         }
-        hook::at(hook::Stage::Fill);
-        if let Err(err) = desc.fill(|buf| encode(buf, desc, decision, place)) {
+        let encoded = desc.fill(|buf| {
+            hook::at(hook::Stage::Fill);
+            encode(buf, desc, decision, place)
+        });
+        if let Err(err) = encoded {
             tracing::error!(error = %err, "building a commit's write-ahead log record failed");
             decision.after.log.poison(err);
         }
@@ -524,6 +531,14 @@ impl RegolithEngine {
                 return Brought::Failed;
             }
             let filled = flags & FILLED != 0;
+            if !filled && flags & FILLING == 0 {
+                // Not filled, and nobody is encoding it: whoever needs the
+                // record written encodes it, as its owner would (D4). It is
+                // not under the unit's claim, and nobody parks on an owner
+                // that is slow to come back to its record (WU2).
+                self.fill(desc);
+                continue;
+            }
             let seen = if filled {
                 match self.try_batch(pipe, desc) {
                     Tried::Wrote => continue,
@@ -542,8 +557,8 @@ impl RegolithEngine {
             } else {
                 pipe.writes.word.load(Ordering::Acquire)
             };
-            // In another thread's hands: the unit's holder, or the owner
-            // that has not filled the record yet.
+            // In another thread's hands: the unit's holder, or the thread
+            // encoding the record now.
             if !wait.spun {
                 wait.spun = true;
                 self.spin(pipe, desc, flags, seen);

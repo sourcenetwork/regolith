@@ -224,11 +224,12 @@ fn a_commit_behind_a_stopped_holder_writes_the_records_itself() {
     );
 }
 
-/// WU5 for a record its owner never filled: an owner that stopped after its
-/// slot was decided, before it encoded the record, holds nobody up. The
-/// commit behind it encodes the record on its own thread and writes it.
+/// WU5 for a record its owner is encoding: an owner that stopped after it
+/// claimed the encoding of its record, before it filled it, holds nobody up
+/// for longer than the patience. The commit behind it encodes the record on
+/// its own thread and writes it as a copy.
 #[test]
-fn a_commit_behind_an_owner_that_stopped_before_it_filled_writes_its_record() {
+fn a_commit_behind_an_owner_that_stopped_while_it_encoded_writes_its_record() {
     let dir = TempDir::new().unwrap();
     let engine = RegolithEngine::open(dir.path(), EngineOptions::default()).unwrap();
     let owner = Arc::clone(&engine);
@@ -250,6 +251,40 @@ fn a_commit_behind_an_owner_that_stopped_before_it_filled_writes_its_record() {
         },
     );
     stopped.expect("the owner's commit, written by the commit behind it");
+    assert_eq!(
+        engine.get(&key(b"owner"), u64::MAX).unwrap(),
+        Some(b"v".to_vec())
+    );
+}
+
+/// D4: a record nobody is encoding is encoded by the thread that needs it
+/// written, into the slot's own descriptor, and goes out in a run like any
+/// other: no park on an owner that is not running, and no copy. Here the
+/// owner stopped before it decided its slot; the commit behind decides it,
+/// encodes its record, and writes it.
+#[test]
+fn a_record_nobody_encoded_is_encoded_by_the_thread_that_needs_it() {
+    let dir = TempDir::new().unwrap();
+    let engine = RegolithEngine::open(dir.path(), EngineOptions::default()).unwrap();
+    let owner = Arc::clone(&engine);
+    let behind = Arc::clone(&engine);
+    let stopped = stopped_at(
+        Stage::Decide,
+        move || owner.submit(eventual_put(b"owner", b"v")),
+        move || {
+            let staged = within_deadline(move || {
+                behind
+                    .submit(eventual_put(b"behind", b"v"))
+                    .expect("the commit behind");
+                super::write_unit::stage_buffer().0
+            });
+            assert_eq!(
+                staged, 0,
+                "the commit behind copied the owner's record instead of encoding it into its slot"
+            );
+        },
+    );
+    stopped.expect("the owner's commit, encoded and written by the commit behind it");
     assert_eq!(
         engine.get(&key(b"owner"), u64::MAX).unwrap(),
         Some(b"v".to_vec())

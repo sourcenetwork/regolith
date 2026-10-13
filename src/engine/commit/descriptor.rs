@@ -23,11 +23,12 @@
 //!   place) and names the memtable and the log through its [`After`], so a
 //!   stage never reads state that a later slot may have changed.
 //! - **D4, a record is encoded once, by one thread, before it is shared.**
-//!   The thread that claims [`FILLING`] encodes the slot's record into the
-//!   descriptor's own buffer and then sets [`FILLED`]; nobody reads the
-//!   buffer before that flag, and nobody writes it after. So the thread that
-//!   writes a run of records (`write_unit.rs`) reads finished bytes and
-//!   encodes none of them.
+//!   The thread that claims [`FILLING`] (the slot's owner, or a thread that
+//!   needs the record written and found nobody encoding it) encodes the
+//!   slot's record into the descriptor's own buffer and then sets
+//!   [`FILLED`]; nobody reads the buffer before that flag, and nobody writes
+//!   it after. So the thread that writes a run of records (`write_unit.rs`)
+//!   reads finished bytes and encodes none of them.
 //! - **D5, a thread parked on a slot is woken.** It goes on the slot's list
 //!   and sets [`PARKED`] in the flag word, then looks again at what it waits
 //!   for; whoever sets [`FILLED`], [`WRITTEN`] or [`FAILED`] reads
