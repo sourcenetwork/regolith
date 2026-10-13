@@ -71,6 +71,7 @@ mod allocate;
 mod append;
 mod content;
 mod counter;
+mod counters;
 mod descriptor;
 mod early;
 mod families;
@@ -97,6 +98,7 @@ mod write_check;
 
 use super::wal::MAX_RECORD_LEN;
 pub(crate) use append::PendingAppend;
+pub(crate) use counters::Counters;
 pub(crate) use descriptor::After;
 use descriptor::{Descriptor, Work};
 use early::EarlyVerdict;
@@ -633,3 +635,6 @@ mod written_tests;
 
 #[cfg(test)]
 mod pipeline_tests;
+
+#[cfg(test)]
+mod allocate_tests;

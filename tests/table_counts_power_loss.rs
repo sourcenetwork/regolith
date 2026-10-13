@@ -129,7 +129,7 @@ fn cut_a_flush(trigger: &Trigger, tear: TearMode) -> u64 {
         .get_int_property("regolith.num-files-at-level0")
         .expect("the property exists");
     let recovered = fault::assert_valid_prefix(&db, &out.history);
-    fault::assert_acked_survived(&recovered, &out.acked);
+    fault::assert_acked_survived(&recovered, &out.acked());
     tables
 }
 

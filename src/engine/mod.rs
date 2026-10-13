@@ -103,8 +103,8 @@ use read_horizon::ReadHorizon;
 pub(crate) use read_rule::ReadRule;
 use read_view::{ReadView, ReadViewCell};
 use recovery::{
-    replay_logs, report_discarded_tail, report_dropped_manifest_tail,
-    rewrite_recovered_memtable_to_wal,
+    hoist_range_deletes, replay_logs, report_demoted_tables, report_discarded_tail,
+    report_dropped_manifest_tail, rewrite_recovered_memtable_to_wal,
 };
 use skiplist::InsertHint;
 pub(crate) use snapshot_registry::SnapshotPin;
@@ -612,6 +612,8 @@ pub(crate) struct RegolithEngine {
     owed_queued: AtomicBool,
     /// Where the disk check looks.
     disk_dir: PathBuf,
+    /// Tables this open moved out of overlapping levels (`recovery.rs`).
+    tables_demoted_at_open: u64,
     /// A step relieving a stop waits on some thread's queue: no second one
     /// is left until it ran (`background_step.rs`).
     stall_step_queued: AtomicBool,
@@ -650,7 +652,7 @@ impl RegolithEngine {
         if let Some(keyring) = &options.keyring {
             keyring.current()?;
         }
-        let version_set = VersionSet::open_with_policy(
+        let mut version_set = VersionSet::open_with_policy(
             &env,
             db_dir,
             &sst_dir,
@@ -660,6 +662,8 @@ impl RegolithEngine {
         if let Some(tail) = version_set.dropped_tail() {
             report_dropped_manifest_tail(&options, version_set.manifest_path(), tail);
         }
+        let manifest_path = version_set.manifest_path().to_path_buf();
+        let demotion = version_set.take_demotion();
         let version = version_set.current();
         let latest_seq = version.last_seq;
 
@@ -689,6 +693,9 @@ impl RegolithEngine {
             wal::truncate_durably(&*env, &path, tail.offset)?;
             report_discarded_tail(&options, &path, tail, latest_seq);
         }
+        // Into the memtable the new log is written from just below, so
+        // they are durable there before the edit that records the move.
+        let (moved, latest_seq) = hoist_range_deletes(demotion, &memtable, latest_seq);
 
         let wal_id = next_wal_id(version.next_file_id, &wal_files);
         let wal_path = wal_dir.join(wal_filename(wal_id));
@@ -712,12 +719,21 @@ impl RegolithEngine {
         // retired with the logs flushes left behind. Recorded unsynced: if
         // the record is lost, the replayed logs are replayed again beside
         // the new one, which repeats their writes and nothing older.
+        //
+        // An open that moved overlapping levels records the move in this
+        // same batch, which is then synced: the new log already holds the
+        // moved tables' range tombstones, so no crash leaves the move
+        // without them (LegacyRangeRead.tla, RED `MoveBeforeLog`).
         versions.run(|versions| {
             versions.apply(&[
                 VersionEdit::SetNextFileId(wal_id + 1),
                 VersionEdit::SetMinWalId(wal_id),
             ])
         })?;
+        let tables_demoted_at_open = moved.map_or(0, |moved| moved.tables);
+        if let Some(moved) = moved {
+            report_demoted_tables(&options, &manifest_path, moved, false);
+        }
         let removed =
             log_retirement::remove_below(&*env, &wal_dir, wal_id, options.statistics.as_deref());
         let retired_logs = RetiredLogs::new(wal_dir.clone(), !removed);
@@ -810,6 +826,7 @@ impl RegolithEngine {
             owed: AtomicU8::new(owed),
             owed_queued: AtomicBool::new(false),
             disk_dir: db_dir.to_path_buf(),
+            tables_demoted_at_open,
             stall_step_queued: AtomicBool::new(false),
             stall_steps_idle: std::sync::atomic::AtomicUsize::new(0),
             options,
@@ -823,6 +840,7 @@ impl RegolithEngine {
                     memtable,
                     closed: false,
                     epoch: 0,
+                    counters: commit::Counters::empty(),
                 },
                 me.clone(),
             )),
@@ -883,7 +901,7 @@ impl RegolithEngine {
             options.write_buffer_size,
             options.max_write_buffer_number,
         );
-        let version_set = VersionSet::open_read_only(
+        let mut version_set = VersionSet::open_read_only(
             &env,
             db_dir,
             &sst_dir,
@@ -893,6 +911,10 @@ impl RegolithEngine {
         if let Some(tail) = version_set.dropped_tail() {
             report_dropped_manifest_tail(&options, version_set.manifest_path(), tail);
         }
+        // A read-only open moves overlapping levels in its own view only:
+        // the manifest keeps them, and every open moves them again until a
+        // read-write one records the move.
+        let demotion = version_set.take_demotion();
         let version = version_set.current();
         let latest_seq = version.last_seq;
 
@@ -910,6 +932,11 @@ impl RegolithEngine {
         )?;
         if let Some((path, tail)) = discarded {
             report_discarded_tail(&options, &path, tail, latest_seq);
+        }
+        let (moved, latest_seq) = hoist_range_deletes(demotion, &memtable, latest_seq);
+        let tables_demoted_at_open = moved.map_or(0, |moved| moved.tables);
+        if let Some(moved) = moved {
+            report_demoted_tables(&options, version_set.manifest_path(), moved, true);
         }
 
         let cache = Arc::new(
@@ -972,6 +999,7 @@ impl RegolithEngine {
             owed: AtomicU8::new(0),
             owed_queued: AtomicBool::new(false),
             disk_dir: db_dir.to_path_buf(),
+            tables_demoted_at_open,
             stall_step_queued: AtomicBool::new(false),
             stall_steps_idle: std::sync::atomic::AtomicUsize::new(0),
             options,
@@ -2900,6 +2928,12 @@ impl RegolithEngine {
             .get(level)
             .map(|files| files.len() as u64)
             .unwrap_or(0)
+    }
+
+    /// Tables this open moved out of overlapping levels: zero once a
+    /// read-write open has recorded the move.
+    pub(crate) fn tables_demoted_at_open(&self) -> u64 {
+        self.tables_demoted_at_open
     }
 
     /// Total size in bytes across every level of the current
