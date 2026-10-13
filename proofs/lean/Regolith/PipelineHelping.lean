@@ -43,6 +43,29 @@ every stage. B never waits for A.
 6. `held_round_blocks`: the one exception, stated and proved. A thread that
    stops while it holds the round stops the commits that wait for the
    sync, which is why the pipeline treats the holder as doing device I/O.
+7. `run_step_counts`, `run_never_goes_back`: records reach the log in runs
+   (`src/engine/commit/write_unit.rs`): one step of one thread, the holder
+   of the write unit, takes the write step of several slots at once. That
+   step moves each slot it writes one stage on and no slot back, and
+   leaves exactly as many steps fewer as it wrote records. So the safety
+   half of lock-freedom stands with runs: a run is many helper steps taken
+   together, and the count of steps left only falls.
+8. `a_park_is_bounded`, `patience_bounds_the_wait`: a thread whose record
+   is in another thread's hands (the unit's holder, or an owner that has
+   not encoded its record yet) parks, and after a bounded number of its own
+   steps it writes the record itself, whatever every other thread does,
+   the holder that stopped for good included. Wakes from other threads only
+   shorten that (`wakes_only_shorten`). So the write step of the first
+   unfinished slot is always within reach of one live thread, and
+   `helper_alone_finishes` keeps its meaning. `without_patience_waits_for_a_wake`
+   says why the patience is there: without it a parked thread needs another
+   thread to wake it (the TLA+ RED `LostWake`).
+
+The rule that changed: a thread writes the records up to its own, and a run
+it writes as the unit's holder may reach past its own, by one run at most,
+bounded in records and bytes (P5 in `pipeline.rs`, WU6 in `write_unit.rs`);
+`helping_is_bounded` bounds the steps for the slots up to its own, and the
+run past it adds one step.
 
 What stays in TLA+: that the interleavings of several threads keep
 finishing slots (the liveness half). TLC checks it for two and three
@@ -666,6 +689,402 @@ theorem held_round_blocks (before : List Cell) : ¬ Enabled false before .sync :
   have := h.2.2 rfl
   -- `false = true` is absurd.
   exact Bool.noConfusion this
+
+/-! ## The write unit: runs of records
+
+The records reach the log through the write unit
+(`src/engine/commit/write_unit.rs`). Each owner encodes its own record; one
+thread at a time, the holder, writes the run of encoded records that waits
+first with one write. Tiny example: slots 1, 2 and 3 are settled and their
+owners encoded their records; the holder writes all three with one write.
+In the steps of this file that is three `write` steps taken at once. -/
+
+/-- What a run does to one slot: a slot whose next step is the write moves
+past it, and any other slot is left as it is. -/
+def writeOne (c : Cell) : Cell :=
+  -- Look at the slot's next step.
+  match next c with
+  -- Its write: it moves to the stage after.
+  | some (.write, st) => ⟨c.kind, st⟩
+  -- Anything else: the run does not touch it.
+  | _ => c
+
+/-- One run over a list of slots: every slot whose next step is the write
+is written, in one step of one thread. (A real run writes one stretch of
+them, the first that waits; proving it for all of them at once covers every
+stretch, since a slot the run leaves out is simply left as it is.) -/
+def runStep : List Cell → List Cell
+  -- No slot, nothing written.
+  | [] => []
+  -- The first slot as the run leaves it, then the rest.
+  | c :: rest => writeOne c :: runStep rest
+
+/-- One for a slot whose next step is the write, else none. -/
+def writes (c : Cell) : Nat :=
+  -- Look at the slot's next step.
+  match next c with
+  -- Its write: one record.
+  | some (.write, _) => 1
+  -- Anything else: none.
+  | _ => 0
+
+/-- How many records a run over the list writes. -/
+def writable : List Cell → Nat
+  -- No slot, no record.
+  | [] => 0
+  -- The first slot's, then the rest's.
+  | c :: rest => writes c + writable rest
+
+/-- One slot under a run: its steps left fall by one when it was written
+and stay the same otherwise, and it stays well formed. -/
+theorem write_one_counts (c : Cell)
+    -- The slot's stage is one its kind passes through.
+    (hwf : WellFormed c) :
+    -- The claim itself; its proof follows.
+    todo (writeOne c) + writes c = todo c ∧ WellFormed (writeOne c) := by
+  -- Name the slot's kind and stage.
+  obtain ⟨k, s0⟩ := c
+  -- Every kind and stage, read off the tables (well formed, where it
+  -- matters, by the definition).
+  cases k <;> cases s0 <;> simp_all [writeOne, writes, next, todo, WellFormed]
+
+/-- **A run counts every record it writes, once.** After one run the slots
+need exactly as many steps fewer as the run wrote records, and are all
+still well formed: many write steps taken as one, so the count of steps
+left, which one live thread alone brings to zero (`helper_alone_finishes`),
+only falls. Rules out a run that writes a record and leaves its slot
+needing the write still, or that undoes a slot it passed over. -/
+theorem run_step_counts (l : List Cell)
+    -- Every slot's stage is one its kind passes through.
+    (hwf : ∀ c ∈ l, WellFormed c) :
+    -- The claim itself; its proof follows.
+    total (runStep l) + writable l = total l ∧ ∀ c ∈ runStep l, WellFormed c := by
+  -- By induction on the slots.
+  induction l with
+  -- Case: the empty list.
+  | nil =>
+    -- Nothing to write, nothing to count.
+    simp [runStep, writable, total]
+  -- Case: a first slot and the rest, the claim known for the rest (ih).
+  | cons c rest ih =>
+    -- The first slot under the run.
+    obtain ⟨h1, hw1⟩ := write_one_counts c (hwf c List.mem_cons_self)
+    -- The rest under the run, by induction.
+    obtain ⟨h2, hw2⟩ := ih (fun x hx => hwf x (List.mem_cons_of_mem _ hx))
+    -- Split the claim in two.
+    refine ⟨?_, ?_⟩
+    -- The count: unfold one level of each definition...
+    · simp only [runStep, writable, total]
+      -- ...and add the two equations.
+      omega
+    -- Well formed: take any slot after the run.
+    · intro x hx
+      -- It is the first slot or one of the rest.
+      simp only [runStep, List.mem_cons] at hx
+      -- Look at which.
+      cases hx with
+      -- The first: by `write_one_counts`.
+      | inl h => exact h ▸ hw1
+      -- One of the rest: by induction.
+      | inr h => exact hw2 x h
+
+/-- **A run moves no slot back.** Every slot a run writes goes one stage on,
+and every other stays where it was: nobody's progress is undone, whoever
+holds the write unit. -/
+theorem run_never_goes_back (c : Cell) : rank c.stage ≤ rank (writeOne c).stage := by
+  -- Name the slot's kind and stage.
+  obtain ⟨k, s0⟩ := c
+  -- Every kind and stage, read off the tables.
+  cases k <;> cases s0 <;> simp [writeOne, next, rank]
+
+/-! ## The write unit: a park is bounded
+
+A thread that needs a record written finds it in another thread's hands:
+the unit's holder is writing a run, or the record's owner has not encoded
+it yet. It spins about as long as one write takes, then parks on the
+record. It wakes when another thread writes the record (the holder's run,
+or a copy) or when its patience runs out; then it writes the record itself,
+as a copy through the gate (`write_unit.rs`, WU5).
+
+Tiny example, with a patience of two slices: the holder stops for good with
+the unit. The waiter spins (one step), parks with two slices left, one
+slice passes, the other passes, its patience is out, it writes the record:
+five steps of its own, and nobody else did anything. -/
+
+/-- Where a thread stands whose record is in another thread's hands. -/
+inductive Waiting where
+  /-- It spins, about as long as one write takes. -/
+  | spinning
+  /-- It sleeps on the record, with `left` more slices of its patience. -/
+  | parked (left : Nat)
+  /-- Its patience ran out: it is about to write the record itself. -/
+  | copying
+  /-- The record is in the log. -/
+  | written
+  -- Two such values can be compared for equality.
+  deriving DecidableEq
+
+/-- The waiting thread's own next step, which needs no other thread: the
+spin ends and it parks with its whole patience, a slice of patience passes,
+the patience runs out, or the copy is written. (In the code the slices are
+`park_timeout`s, each at most what is left of `PATIENCE`, or the logical
+triggers that end the wait sooner.) -/
+def own (patience : Nat) : Waiting → Waiting
+  -- The spin ends: it parks with all its patience.
+  | .spinning => .parked patience
+  -- A slice passes.
+  | .parked (n + 1) => .parked n
+  -- No slice left: it goes to write the record itself.
+  | .parked 0 => .copying
+  -- The copy is written, through the gate (or found written by then).
+  | .copying => .written
+  -- A written record stays written.
+  | .written => .written
+
+/-- What another thread can do to the waiting thread: write its record (a
+run of the holder's, or another's copy), which wakes it with its record in
+the log. Another thread can also do nothing at all, as one that stopped. -/
+def woken (_ : Waiting) : Waiting := .written
+
+/-- The steps the waiting thread still needs on its own. -/
+def stepsLeft (patience : Nat) : Waiting → Nat
+  -- Spin, every slice, the run out, the copy.
+  | .spinning => patience + 3
+  -- The slices left, the run out, the copy.
+  | .parked n => n + 2
+  -- The copy.
+  | .copying => 1
+  -- Nothing.
+  | .written => 0
+
+/-- Each own step of a thread not yet written leaves exactly one step
+fewer. -/
+theorem own_counts (p : Nat) (w : Waiting)
+    -- The record is not in the log yet.
+    (hw : w ≠ .written) :
+    -- The claim itself; its proof follows.
+    stepsLeft p (own p w) + 1 = stepsLeft p w := by
+  -- Look at where the thread stands.
+  cases w with
+  -- Spinning: it parks with all its patience, one step fewer.
+  | spinning => simp [own, stepsLeft]
+  -- Parked with some slices left: look at how many.
+  | parked n =>
+    -- None or some.
+    cases n with
+    -- None: it goes to copy, one step fewer.
+    | zero => simp [own, stepsLeft]
+    -- Some: one slice fewer.
+    | succ m => simp [own, stepsLeft]
+  -- Copying: the copy is written, one step fewer.
+  | copying => simp [own, stepsLeft]
+  -- Written: ruled out by the hypothesis.
+  | written => exact absurd rfl hw
+
+/-- **Wakes only shorten the wait.** Whatever another thread does to the
+waiting thread, it never needs more of its own steps afterwards. -/
+theorem wakes_only_shorten (p : Nat) (w : Waiting) : stepsLeft p (woken w) ≤ stepsLeft p w := by
+  -- A woken thread needs no step at all.
+  simp [woken, stepsLeft]
+
+/-- A schedule: who takes the next step, the waiting thread (`true`) or
+some other thread (`false`). -/
+def exec (p : Nat) : List Bool → Waiting → Waiting
+  -- No step left: where it stands.
+  | [], w => w
+  -- The waiting thread's own step, then the rest.
+  | true :: rest, w => exec p rest (own p w)
+  -- Another thread's step, then the rest.
+  | false :: rest, w => exec p rest (woken w)
+
+/-- How many of a schedule's steps are the waiting thread's own. -/
+def ownSteps : List Bool → Nat
+  -- None in an empty schedule.
+  | [] => 0
+  -- One more for each of its own.
+  | true :: rest => ownSteps rest + 1
+  -- None for another thread's.
+  | false :: rest => ownSteps rest
+
+/-- A written record stays written, whoever steps. -/
+theorem written_stays (p : Nat) (s : List Bool) : exec p s .written = .written := by
+  -- By induction on the schedule.
+  induction s with
+  -- Case: no step.
+  | nil => rfl
+  -- Case: a first step, the claim known for the rest (ih).
+  | cons b rest ih =>
+    -- Whose step it is.
+    cases b with
+    -- Another's: woken stays written, then the rest by induction.
+    | false => simpa [exec, woken] using ih
+    -- Its own: written stays written, then the rest by induction.
+    | true => simpa [exec, own] using ih
+
+/-- Needing no own step means the record is written. -/
+theorem written_of_no_steps (p : Nat) (w : Waiting)
+    -- It needs no step of its own.
+    (h : stepsLeft p w = 0) : w = .written := by
+  -- Look at where the thread stands.
+  cases w with
+  -- Spinning needs `p + 3`, not zero.
+  | spinning => simp [stepsLeft] at h
+  -- Parked needs at least two, not zero.
+  | parked n => simp [stepsLeft] at h
+  -- Copying needs one, not zero.
+  | copying => simp [stepsLeft] at h
+  -- Written: that is the claim.
+  | written => rfl
+
+/-- **A park is bounded.** However the other threads' steps fall between
+its own, the waiting thread's record is in the log once it has taken as
+many of its own steps as it needed: other threads may wake it sooner, and
+may do nothing at all, as a holder that stopped for good with the write
+unit claimed. Rules out a waiter that sleeps for ever behind a preempted or
+stopped holder: the defect of the reverted write stage (E45, L55). -/
+theorem a_park_is_bounded (p : Nat) (s : List Bool) (w : Waiting)
+    -- The schedule holds at least as many of its own steps as it needs.
+    (h : stepsLeft p w ≤ ownSteps s) : exec p s w = .written := by
+  -- By induction on the schedule, for every place the thread may stand.
+  induction s generalizing w with
+  -- Case: no step left.
+  | nil =>
+    -- No own step in an empty schedule, so it needed none...
+    have : stepsLeft p w = 0 := by
+      -- ...the bound says at most zero...
+      simp [ownSteps] at h
+      -- ...so exactly zero.
+      omega
+    -- ...and needing none means written.
+    exact written_of_no_steps p w this
+  -- Case: a first step, the claim known for the rest (ih).
+  | cons b rest ih =>
+    -- Whose step it is.
+    cases b with
+    -- Another thread's: it writes the record, and written stays written.
+    | false =>
+      -- Unfold one step of the schedule.
+      simp only [exec, woken]
+      -- Written stays written.
+      exact written_stays p rest
+    -- Its own.
+    | true =>
+      -- Unfold one step of the schedule.
+      simp only [exec]
+      -- Written already, or not.
+      by_cases hw : w = .written
+      -- Written: its own step keeps it written, and so does the rest.
+      · subst hw
+        -- Written stays written.
+        exact written_stays p rest
+      -- Not written: one own step fewer is needed after this one.
+      · apply ih
+        -- The count of `own_counts`...
+        have := own_counts p w hw
+        -- ...against the schedule's own steps, one fewer after this one.
+        simp [ownSteps] at h
+        -- The arithmetic.
+        omega
+
+/-- An own step never adds to what the thread needs. -/
+theorem own_never_adds (p : Nat) (w : Waiting) : stepsLeft p (own p w) ≤ stepsLeft p w := by
+  -- Written already, or not.
+  by_cases hw : w = .written
+  -- Written: its own step keeps it written.
+  · subst hw
+    -- Read the tables.
+    simp [own, stepsLeft]
+  -- Not written: one step fewer, by `own_counts`.
+  · have := own_counts p w hw
+    -- The arithmetic.
+    omega
+
+/-- No schedule adds to what the thread needs: every step, its own or
+another thread's, leaves it needing as many own steps or fewer. -/
+theorem exec_never_adds (p : Nat) (s : List Bool) (w : Waiting) :
+    -- The claim itself; its proof follows.
+    stepsLeft p (exec p s w) ≤ stepsLeft p w := by
+  -- By induction on the schedule, for every place the thread may stand.
+  induction s generalizing w with
+  -- Case: no step.
+  | nil =>
+    -- Nothing changes.
+    simp [exec]
+  -- Case: a first step, the claim known for the rest (ih).
+  | cons b rest ih =>
+    -- Whose step it is.
+    cases b with
+    -- Another's: the wake, then the rest.
+    | false =>
+      -- The rest after the wake needs no more than the wake left...
+      have h1 := ih (woken w)
+      -- ...and the wake left no more than before.
+      have h2 := wakes_only_shorten p w
+      -- Unfold one step and chain the two.
+      simp only [exec]
+      -- The arithmetic.
+      omega
+    -- Its own: the step, then the rest.
+    | true =>
+      -- The rest after the step needs no more than the step left...
+      have h1 := ih (own p w)
+      -- ...and the step left no more than before.
+      have h2 := own_never_adds p w
+      -- Unfold one step and chain the two.
+      simp only [exec]
+      -- The arithmetic.
+      omega
+
+/-- **The patience bounds the wait.** A thread that began to wait (it
+spins first) never needs more than its patience and three more of its own
+steps, whatever has happened since: spin, the slices, the run out, the
+copy. With `a_park_is_bounded`: within that many of its own steps its
+record is in the log. -/
+theorem patience_bounds_the_wait (p : Nat) (s : List Bool) :
+    -- The claim itself; its proof follows.
+    stepsLeft p (exec p s .spinning) ≤ p + 3 := by
+  -- No schedule adds to what it needed when it began...
+  have := exec_never_adds p s .spinning
+  -- ...which was its patience and three.
+  simpa [stepsLeft] using this
+
+/-- What a parked thread does on its own when it has no patience: it goes
+on sleeping. -/
+def ownNoPatience : Waiting → Waiting
+  -- The spin ends: it parks.
+  | .spinning => .parked 0
+  -- Parked: it stays parked, with no time out.
+  | .parked n => .parked n
+  -- The others as with patience.
+  | .copying => .written
+  -- Written stays written.
+  | .written => .written
+
+/-- A schedule run with no patience. -/
+def execNoPatience : List Bool → Waiting → Waiting
+  -- No step left: where it stands.
+  | [], w => w
+  -- Its own step, then the rest.
+  | true :: rest, w => execNoPatience rest (ownNoPatience w)
+  -- Another thread's step, then the rest.
+  | false :: rest, w => execNoPatience rest (woken w)
+
+/-- **Without patience a parked thread waits for a wake.** With no time
+out, a parked thread taking only its own steps sleeps on for ever, however
+many it takes: only another thread's wake gets its record written. That is
+why the code has the patience (WU5), and why a lost wake would be a stuck
+commit (the TLA+ RED `LostWake`, checked with the time out taken away). -/
+theorem without_patience_waits_for_a_wake (n k : Nat) :
+    -- The claim itself; its proof follows.
+    execNoPatience (List.replicate k true) (.parked n) = .parked n := by
+  -- By induction on the number of own steps.
+  induction k with
+  -- Case: none.
+  | zero => rfl
+  -- Case: one more, the claim known for the fewer (ih).
+  | succ k ih =>
+    -- One own step leaves it parked, then the rest by induction.
+    simpa [List.replicate, execNoPatience, ownNoPatience] using ih
 
 -- The end of this file's names.
 end Regolith.PipelineHelping
