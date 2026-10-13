@@ -109,9 +109,11 @@ impl RegolithEngine {
         // Whatever scope this thread is in holds: none for a thread that
         // reads the device, the helper's own queue for one that must not.
         let decision = self.decide_work(index, desc, base);
-        if scope::current().is_some()
-            && let Fate::Refused(err) = &decision.verdict
+        // The verdict first: it is a field of the decision at hand, and the
+        // scope is a thread-local read only a refused slot needs.
+        if let Fate::Refused(err) = &decision.verdict
             && is_would_block(err)
+            && scope::current().is_some()
         {
             let job = desc.decide_job.get_or_set(Job::new(Box::new(DecideSlot {
                 engine: self.me.clone(),
