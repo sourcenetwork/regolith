@@ -3,32 +3,44 @@
 //!
 //! # Invariants
 //!
-//! * **T1, one writer.** Appends come from the one thread that applies
-//!   writes to the memtable: the commit leader under the pipeline mutex, or
-//!   recovery's replay. That is the skip list's own contract (S2 in
-//!   `engine::skiplist`), and debug builds check it the same way.
-//! * **T2, prefix publication.** An append writes its tombstone into slot
-//!   `len` first and only then publishes `len + 1` with a release store. A
-//!   reader acquires `len` and reads only the slots below it, so it sees a
-//!   prefix of the appends, in append order, every one of them whole. Seeing
-//!   an append before its contents is the defect T2 rules out.
-//! * **T3, never moved, never removed.** A published slot is never written
+//! * **T1, any number of writers, each slot written once.** An append takes
+//!   the next position with one `fetch_add`, so no two appends share a slot,
+//!   and none waits for another. The commit pipeline lets whichever thread
+//!   reaches a decided commit apply it (`engine::commit`), so two threads
+//!   can append the same tombstone; an append that finds its tombstone
+//!   already in the log adds nothing, and the rare pair that both get in is
+//!   harmless: a tombstone listed twice deletes what it deletes once, and
+//!   every listing drops exact duplicates.
+//! * **T2, a slot is whole before it is ready.** An append writes its
+//!   tombstone into its slot first and only then sets the slot's `ready`
+//!   flag with a release store. A reader acquires the number of positions
+//!   handed out and reads only the slots below it whose flag it acquires as
+//!   set, so every tombstone it reads is whole. A slot handed out and not
+//!   yet ready is skipped: its append has not returned, so the commit it
+//!   belongs to is not applied, and no reader's snapshot includes it.
+//! * **T3, never moved, never removed.** A ready slot is never written
 //!   again and is freed only when the memtable is dropped, so a reader needs
 //!   no reclamation for the log itself.
-//! * **T4, the index is an optimization over a prefix.** Every
-//!   [`REBUILD`] appends the writer publishes, through kovan, a sorted view
-//!   of the first `covered` appends with a running maximum of their ends. A
-//!   reader binary-searches that view and scans the at most `REBUILD - 1`
-//!   appends past it, so a point lookup costs `O(log n)` rather than `O(n)`.
-//!   A loom build has no index and scans the whole prefix, which is the
+//! * **T4, the index is an optimization over a prefix of ready slots.**
+//!   Every [`REBUILD`] appends, or once after a batch of them
+//!   ([`TombstoneLog::extend`]), a writer publishes, through kovan, a sorted
+//!   view of the first `covered` positions, every one of them ready, with a
+//!   running maximum of their ends. A reader binary-searches that view and
+//!   scans the positions past it, so a point lookup costs `O(log n)` rather
+//!   than `O(n)`. The view stops at the first slot not ready yet, since a
+//!   slot it passed would never be read again; a slot that stays unready
+//!   (its thread was descheduled) only lengthens the scan past the view. A
+//!   loom build has no index and scans every position, which is the
 //!   protocol T2 is about.
 //!
 //! Why a tombstone a commit published is seen by every read after it: the
-//! leader appends (T2's release on `len`) before it publishes the commit's
-//! sequence through the read horizon, itself a release read-modify-write. A
-//! reader whose snapshot includes the tombstone acquired a horizon at or
-//! past it, so `len` covers the append for that reader. A reader under the
-//! pipeline mutex is ordered by the mutex.
+//! commit's apply returns only after the append set `ready` (T2's release),
+//! and the commit's sequence is published through the read horizon, itself
+//! a release read-modify-write, only after its apply. A reader whose
+//! snapshot includes the tombstone acquired a horizon at or past it, so it
+//! acquires the position count and the flag as the append left them. A
+//! validation in the pipeline's ordered step runs after the apply of every
+//! commit before it.
 
 #![allow(unsafe_code)]
 
@@ -37,8 +49,6 @@ use std::mem::{MaybeUninit, size_of};
 use std::ptr;
 
 use super::super::range_tombstone::RangeTombstone;
-#[cfg(debug_assertions)]
-use crate::sync::internal::{AtomicBool, SingleWriterGuard};
 use crate::sync::internal::{AtomicPtr, AtomicUsize, Ordering, UnsafeCell};
 
 /// Slots in the first segment; each later segment doubles.
@@ -53,8 +63,42 @@ const SEGMENTS: usize = 30;
 #[cfg(not(loom))]
 pub(crate) const REBUILD: usize = 16;
 
-/// One slot: a tombstone once the slot's position is below `len`.
-type Slot = UnsafeCell<MaybeUninit<RangeTombstone>>;
+#[cfg(all(test, not(loom)))]
+thread_local! {
+    /// Test seam: how many indexes this thread has published.
+    static INDEXES_BUILT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+
+    /// Test seam: how many slots this thread has looked at for a
+    /// duplicate, one at a time ([`TombstoneLog::holds`]).
+    static DUPLICATE_LOOKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Test seam: what this thread's appends have cost since the last call, as
+/// the indexes it published and the slots it looked at for a duplicate. A
+/// test pins the cost of an append by these counts, not by a time.
+#[cfg(all(test, not(loom)))]
+pub(crate) fn work_since_last_call() -> (usize, usize) {
+    (
+        INDEXES_BUILT.with(|built| built.replace(0)),
+        DUPLICATE_LOOKS.with(|looks| looks.replace(0)),
+    )
+}
+
+/// One slot: a tombstone once `ready` is set.
+struct Slot {
+    /// `1` once `value` is written and never written again (T2, T3).
+    ready: AtomicUsize,
+    value: UnsafeCell<MaybeUninit<RangeTombstone>>,
+}
+
+impl Slot {
+    fn empty() -> Self {
+        Self {
+            ready: AtomicUsize::new(0),
+            value: UnsafeCell::new(MaybeUninit::uninit()),
+        }
+    }
+}
 
 /// Which segment `position` lives in, and its offset there.
 #[inline]
@@ -97,26 +141,26 @@ struct TombstoneIndex {
 
 /// The log. See the module docs for its invariants.
 pub(crate) struct TombstoneLog {
-    /// Segment `k` holds `FIRST_SEGMENT << k` slots; null until the writer
-    /// first needs it. Written only by the writer, before the `len` release
-    /// that publishes the first slot in it.
+    /// Segment `k` holds `FIRST_SEGMENT << k` slots; null until an append
+    /// first needs it, then installed by one compare-and-swap.
     segments: [AtomicPtr<Slot>; SEGMENTS],
-    /// Appends published (T2).
-    len: AtomicUsize,
-    /// Heap bytes the published tombstones own, for the memtable's size.
+    /// Positions handed out to appends (T1). A reader's scan ends here.
+    claimed: AtomicUsize,
+    /// Heap bytes the ready tombstones own, for the memtable's size.
     bytes: AtomicUsize,
     /// The sorted view of a prefix (T4); empty until the first rebuild.
     #[cfg(not(loom))]
     index: kovan::AtomOption<TombstoneIndex>,
-    /// T1's debug detector.
-    #[cfg(debug_assertions)]
-    writing: AtomicBool,
+    /// One rebuild of the index at a time: a second thread that would
+    /// rebuild leaves it to the first rather than build the same view.
+    #[cfg(not(loom))]
+    rebuilding: AtomicUsize,
 }
 
-// SAFETY: a slot is written only by the single writer (T1) before the
-// release that publishes it, and read only after the acquire that observes
-// that release (T2); a `RangeTombstone` is `Send + Sync`. Segment pointers
-// and counters are atomics.
+// SAFETY: a slot is written only by the one append its position was handed
+// to (T1), before the release that marks it ready, and read only after the
+// acquire that observes that release (T2); a `RangeTombstone` is
+// `Send + Sync`. Segment pointers and counters are atomics.
 unsafe impl Send for TombstoneLog {}
 // SAFETY: as above.
 unsafe impl Sync for TombstoneLog {}
@@ -126,80 +170,222 @@ impl TombstoneLog {
     pub(crate) fn new() -> Self {
         Self {
             segments: std::array::from_fn(|_| AtomicPtr::new(ptr::null_mut())),
-            len: AtomicUsize::new(0),
+            claimed: AtomicUsize::new(0),
             bytes: AtomicUsize::new(0),
             #[cfg(not(loom))]
             index: kovan::AtomOption::none(),
-            #[cfg(debug_assertions)]
-            writing: AtomicBool::new(false),
+            #[cfg(not(loom))]
+            rebuilding: AtomicUsize::new(0),
         }
     }
 
-    /// Appends published so far, acquired: every slot below it is whole.
+    /// Positions handed out so far, acquired: a scan of the log ends here.
+    /// A position below it may not be ready yet; [`Self::get`] says.
     #[inline]
     pub(crate) fn len(&self) -> usize {
-        self.len.load(Ordering::Acquire)
+        self.claimed.load(Ordering::Acquire)
     }
 
-    /// Heap bytes the published tombstones own.
+    /// Heap bytes the ready tombstones own.
     pub(crate) fn bytes(&self) -> usize {
         self.bytes.load(Ordering::Relaxed)
     }
 
-    /// The tombstone at `position`, which must be below a `len` this thread
-    /// acquired.
+    /// The slot at `position`, or `None` when its segment is not installed
+    /// yet (its append has not got that far).
     #[inline]
-    fn get(&self, position: usize) -> &RangeTombstone {
+    fn slot(&self, position: usize) -> Option<&Slot> {
         let (segment, offset) = locate(position);
         let base = self.segments[segment].load(Ordering::Acquire);
-        // SAFETY: `position` is below an acquired `len`, so the writer
-        // allocated this segment and wrote this slot before the release
-        // this thread observed (T2), and never writes it again (T3). The
-        // reference lives no longer than `self`, which owns the slot.
-        unsafe { (*base.add(offset)).with(|slot| (*slot).assume_init_ref()) }
+        if base.is_null() {
+            return None;
+        }
+        // SAFETY: a segment holds `segment_len(segment)` slots and `locate`
+        // returns an offset below that; a segment installed is never freed
+        // or replaced while the log lives (T3).
+        Some(unsafe { &*base.add(offset) })
     }
 
-    /// Append `tombstone`. Only the memtable's one writer calls this (T1).
-    pub(crate) fn push(&self, tombstone: RangeTombstone) {
-        #[cfg(debug_assertions)]
-        let _single = SingleWriterGuard::enter(
-            &self.writing,
-            "range tombstones are appended by one writer at a time (T1)",
-        );
-        let heap = tombstone.start.len() + tombstone.end.len() + size_of::<RangeTombstone>();
-        // Only this thread writes `len`, so its own last store is current.
-        let position = self.len.load(Ordering::Relaxed);
-        let (segment, offset) = locate(position);
-        let mut base = self.segments[segment].load(Ordering::Relaxed);
-        if base.is_null() {
-            let slots: Box<[Slot]> = (0..segment_len(segment))
-                .map(|_| UnsafeCell::new(MaybeUninit::uninit()))
-                .collect();
-            base = Box::into_raw(slots).cast::<Slot>();
-            self.segments[segment].store(base, Ordering::Release);
+    /// The tombstone at `position`, or `None` while its append has not
+    /// marked it ready (T2).
+    #[inline]
+    fn get(&self, position: usize) -> Option<&RangeTombstone> {
+        let slot = self.slot(position)?;
+        if slot.ready.load(Ordering::Acquire) == 0 {
+            return None;
         }
-        // SAFETY: the slot is past every published position, so no reader
-        // reaches it (T2), and this is the one writer (T1).
+        // SAFETY: the flag was acquired as set, so the append wrote this
+        // slot before the release this thread observed (T2), and nothing
+        // writes it again (T3). The reference lives no longer than `self`,
+        // which owns the slot.
+        Some(unsafe { slot.value.with(|value| (*value).assume_init_ref()) })
+    }
+
+    /// The tombstone at a position the index covers: ready by T4.
+    #[inline]
+    fn indexed(&self, position: u32) -> &RangeTombstone {
+        static NEVER: std::sync::OnceLock<RangeTombstone> = std::sync::OnceLock::new();
+        self.get(position as usize)
+            // T4 makes this unreachable; an empty range deletes nothing.
+            .unwrap_or_else(|| NEVER.get_or_init(|| RangeTombstone::new(Vec::new(), Vec::new(), 0)))
+    }
+
+    /// Whether the log already holds `tombstone`. A commit's applies run in
+    /// sequence order, so its tombstone, when present, sits above every
+    /// ready tombstone of a lower sequence: the walk from the end stops at
+    /// the first of those.
+    fn holds(&self, tombstone: &RangeTombstone) -> bool {
+        for position in (0..self.len()).rev() {
+            #[cfg(all(test, not(loom)))]
+            DUPLICATE_LOOKS.with(|looks| looks.set(looks.get() + 1));
+            let Some(held) = self.get(position) else {
+                continue;
+            };
+            if held.seq < tombstone.seq {
+                return false;
+            }
+            if held.seq == tombstone.seq
+                && held.start == tombstone.start
+                && held.end == tombstone.end
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// The segment `segment`, installed by this call when no append has
+    /// needed it yet.
+    fn segment(&self, segment: usize) -> *mut Slot {
+        let installed = self.segments[segment].load(Ordering::Acquire);
+        if !installed.is_null() {
+            return installed;
+        }
+        let slots: Box<[Slot]> = (0..segment_len(segment)).map(|_| Slot::empty()).collect();
+        let fresh = Box::into_raw(slots).cast::<Slot>();
+        match self.segments[segment].compare_exchange(
+            ptr::null_mut(),
+            fresh,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => fresh,
+            Err(winner) => {
+                // SAFETY: `fresh` came from `Box::into_raw` of a boxed slice
+                // of exactly this many slots just above, and no other thread
+                // has seen it.
+                drop(unsafe {
+                    Box::from_raw(ptr::slice_from_raw_parts_mut(fresh, segment_len(segment)))
+                });
+                winner
+            }
+        }
+    }
+
+    /// Append `tombstone`, unless the log already holds it (T1). Any number
+    /// of threads may append at once.
+    pub(crate) fn push(&self, tombstone: RangeTombstone) {
+        if self.holds(&tombstone) {
+            return;
+        }
+        self.append(tombstone);
+        #[cfg(not(loom))]
+        self.maybe_rebuild();
+    }
+
+    /// Append every tombstone of `batch` the log does not hold yet, then
+    /// publish one index over them all (T4).
+    ///
+    /// What [`Self::push`] does for each, at a cost linear in the batch
+    /// (one sort of it aside): `push` looks through the log for its
+    /// tombstone and rebuilds the index every [`REBUILD`] appends, so `n`
+    /// pushes of tombstones that share a sequence cost on the order of
+    /// `n * n` slot reads. Here the log is looked at once, before the first
+    /// append, and the index is built once, after the last. For recovery,
+    /// which can bring thousands at a time.
+    ///
+    /// Each append is the one `push` makes (T1, T2), so any number of
+    /// threads may run this beside appends and reads. A tombstone another
+    /// thread appends after the one look can end up listed twice, which is
+    /// harmless (T1), and a rebuild another thread has under way leaves
+    /// this batch to the next one, as it leaves any append. Recovery calls
+    /// it before the memtable is shared, where neither can happen.
+    pub(crate) fn extend(&self, mut batch: Vec<RangeTombstone>) {
+        let same = |a: &RangeTombstone, b: &RangeTombstone| {
+            a.seq == b.seq && a.start == b.start && a.end == b.end
+        };
+        // In listing order: the batch's own duplicates fall side by side,
+        // and the index's sort of these appends finds them sorted.
+        batch.sort_by(listing_order);
+        batch.dedup_by(|a, b| same(a, b));
+        let held = self.len();
+        if held > 0 {
+            let mut existing: Vec<&RangeTombstone> = (0..held)
+                .filter_map(|position| self.get(position))
+                .collect();
+            existing.sort_by(|a, b| listing_order(a, b));
+            batch.retain(|tombstone| {
+                existing
+                    .binary_search_by(|held| listing_order(held, tombstone))
+                    .is_err()
+            });
+        }
+        for tombstone in batch {
+            self.append(tombstone);
+        }
+        #[cfg(not(loom))]
+        self.maybe_rebuild();
+    }
+
+    /// Write `tombstone` into the next position and mark it ready (T1, T2).
+    fn append(&self, tombstone: RangeTombstone) {
+        let heap = tombstone.start.len() + tombstone.end.len() + size_of::<RangeTombstone>();
+        // T1: the position is this append's alone.
+        let position = self.claimed.fetch_add(1, Ordering::AcqRel);
+        let (segment, offset) = locate(position);
+        let base = self.segment(segment);
+        // SAFETY: `offset` is within the segment (see `slot`), and the slot
+        // is this append's alone until the release below (T1, T2).
+        let slot = unsafe { &*base.add(offset) };
+        // SAFETY: as above; no reader touches `value` before `ready` is set.
         unsafe {
-            (*base.add(offset)).with_mut(|slot| {
-                (*slot).write(tombstone);
+            slot.value.with_mut(|value| {
+                (*value).write(tombstone);
             });
         }
         self.bytes.fetch_add(heap, Ordering::Relaxed);
-        // T2: the slot is whole before the length that names it.
-        self.len.store(position + 1, Ordering::Release);
-        #[cfg(not(loom))]
-        self.maybe_rebuild(position + 1);
+        // T2: the slot is whole before the flag that says so.
+        slot.ready.store(1, Ordering::Release);
     }
 
-    /// Publish a sorted view of the first `published` appends once
-    /// [`REBUILD`] appends have gathered past the current one. Writer only.
+    /// Publish a sorted view of the leading ready positions once [`REBUILD`]
+    /// of them have gathered past the current view (T4). One thread at a
+    /// time: another that would rebuild leaves it to the one that is.
     #[cfg(not(loom))]
-    fn maybe_rebuild(&self, published: usize) {
+    fn maybe_rebuild(&self) {
+        let covered = self.index.load().map_or(0, |index| index.covered);
+        if self.len() - covered < REBUILD {
+            return;
+        }
+        if self.rebuilding.swap(1, Ordering::AcqRel) != 0 {
+            return;
+        }
+        self.rebuild();
+        self.rebuilding.store(0, Ordering::Release);
+    }
+
+    /// [`Self::maybe_rebuild`]'s work, with the rebuild flag held.
+    #[cfg(not(loom))]
+    fn rebuild(&self) {
         let (covered, old_order) = match self.index.load() {
             Some(index) => (index.covered, index.order.to_vec()),
             None => (0, Vec::new()),
         };
+        // T4: the view covers ready positions only, so it stops at the
+        // first one that is not.
+        let published = (covered..self.len())
+            .find(|position| self.get(*position).is_none())
+            .unwrap_or_else(|| self.len());
         if published - covered < REBUILD {
             return;
         }
@@ -211,8 +397,7 @@ impl TombstoneLog {
         let Ok(first_new) = u32::try_from(covered) else {
             return;
         };
-        let by_listing =
-            |a: &u32, b: &u32| listing_order(self.get(*a as usize), self.get(*b as usize));
+        let by_listing = |a: &u32, b: &u32| listing_order(self.indexed(*a), self.indexed(*b));
         let mut fresh: Vec<u32> = (first_new..last).collect();
         fresh.sort_by(by_listing);
         let mut order = Vec::with_capacity(published);
@@ -233,13 +418,13 @@ impl TombstoneLog {
         let mut reach = Vec::with_capacity(order.len());
         for &position in &order {
             let farthest = match reach.last() {
-                Some(&prev) if self.get(prev as usize).end >= self.get(position as usize).end => {
-                    prev
-                }
+                Some(&prev) if self.indexed(prev).end >= self.indexed(position).end => prev,
                 _ => position,
             };
             reach.push(farthest);
         }
+        #[cfg(test)]
+        INDEXES_BUILT.with(|built| built.set(built.get() + 1));
         self.index.store_some(TombstoneIndex {
             covered: published,
             order: order.into_boxed_slice(),
@@ -258,22 +443,21 @@ impl TombstoneLog {
         let covered = self.scan_index(|index| {
             let mut j = index
                 .order
-                .partition_point(|&p| self.get(p as usize).start.as_slice() <= user_key);
+                .partition_point(|&p| self.indexed(p).start.as_slice() <= user_key);
             while j > 0 {
                 j -= 1;
-                if self.get(index.reach[j] as usize).end.as_slice() <= user_key {
+                if self.indexed(index.reach[j]).end.as_slice() <= user_key {
                     break;
                 }
-                let tombstone = self.get(index.order[j] as usize);
+                let tombstone = self.indexed(index.order[j]);
                 if tombstone.seq <= snapshot_seq && tombstone.covers(user_key) {
                     best = best.max(tombstone.seq);
                 }
             }
         });
         // The index is loaded before `len`, so `len` is never below what it
-        // covers and the two together read one prefix.
-        for position in covered..self.len() {
-            let tombstone = self.get(position);
+        // covers and the two together read every position once.
+        for tombstone in (covered..self.len()).filter_map(|position| self.get(position)) {
             if tombstone.seq <= snapshot_seq && tombstone.covers(user_key) {
                 best = best.max(tombstone.seq);
             }
@@ -295,11 +479,10 @@ impl TombstoneLog {
             found = index
                 .order
                 .iter()
-                .map(|&p| self.get(p as usize))
+                .map(|&p| self.indexed(p))
                 .find(|t| matches(t));
         });
-        for position in covered..self.len() {
-            let tombstone = self.get(position);
+        for tombstone in (covered..self.len()).filter_map(|position| self.get(position)) {
             if matches(tombstone)
                 && found.is_none_or(|best| listing_order(tombstone, best) == CmpOrdering::Less)
             {
@@ -309,13 +492,15 @@ impl TombstoneLog {
         found
     }
 
-    /// Whether any published tombstone satisfies `pred`.
+    /// Whether any ready tombstone satisfies `pred`.
     pub(crate) fn any(&self, mut pred: impl FnMut(&RangeTombstone) -> bool) -> bool {
-        (0..self.len()).any(|position| pred(self.get(position)))
+        (0..self.len())
+            .filter_map(|position| self.get(position))
+            .any(&mut pred)
     }
 
-    /// Every published tombstone, sorted and deduplicated as the memtable
-    /// has always listed them.
+    /// Every ready tombstone, sorted and deduplicated as the memtable has
+    /// always listed them.
     ///
     /// The index is already in listing order, so only the tail past it is
     /// sorted and merged in: `O(n + t log t)` for `t < REBUILD`, not a sort
@@ -326,11 +511,11 @@ impl TombstoneLog {
             indexed = index
                 .order
                 .iter()
-                .map(|&position| self.get(position as usize).clone())
+                .map(|&position| self.indexed(position).clone())
                 .collect();
         });
         let mut tail: Vec<RangeTombstone> = (covered..self.len())
-            .map(|position| self.get(position).clone())
+            .filter_map(|position| self.get(position).cloned())
             .collect();
         tail.sort_by(listing_order);
         let mut merged = Vec::with_capacity(indexed.len() + tail.len());
@@ -372,18 +557,27 @@ impl Drop for TombstoneLog {
     fn drop(&mut self) {
         // `&mut self`: no other thread can touch the log, so relaxed loads
         // read the final values.
-        let len = self.len.load(Ordering::Relaxed);
-        for position in 0..len {
+        let claimed = self.claimed.load(Ordering::Relaxed);
+        for position in 0..claimed {
             let (segment, offset) = locate(position);
             let base = self.segments[segment].load(Ordering::Relaxed);
-            // SAFETY: `&mut self` excludes every reader, and each position
-            // below `len` was written exactly once (T2, T3).
-            unsafe { (*base.add(offset)).with_mut(|slot| (*slot).assume_init_drop()) };
+            if base.is_null() {
+                continue;
+            }
+            // SAFETY: `&mut self` excludes every reader and writer; a slot
+            // whose flag is set was written exactly once (T2, T3), and one
+            // whose flag is clear holds nothing to drop.
+            unsafe {
+                let slot = &*base.add(offset);
+                if slot.ready.load(Ordering::Relaxed) != 0 {
+                    slot.value.with_mut(|value| (*value).assume_init_drop());
+                }
+            }
         }
         for (segment, base) in self.segments.iter().enumerate() {
             let base = base.load(Ordering::Relaxed);
             if !base.is_null() {
-                // SAFETY: allocated in `push` as a boxed slice of exactly
+                // SAFETY: installed in `segment` as a boxed slice of exactly
                 // this many slots, and freed once, here.
                 drop(unsafe {
                     Box::from_raw(ptr::slice_from_raw_parts_mut(base, segment_len(segment)))

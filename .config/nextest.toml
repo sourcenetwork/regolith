@@ -96,5 +96,6 @@ default-filter = """
         or test(=level_style_zero_workers_survives_the_stop_trigger)
         or test(=many_workers_keep_every_level_a_single_sorted_run)
         or test(=has_and_get_size_never_disagree_with_get)
+        or test(=engine::manifest::legacy_overlap_tests::a_torn_repair_batch_is_replayed_whole_or_repaired_again)
     )
 """

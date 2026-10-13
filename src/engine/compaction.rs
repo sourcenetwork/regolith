@@ -23,12 +23,12 @@ use super::manifest::{MAX_LEVELS, VersionEdit, overlapping};
 use super::range_tombstone::{
     RangeTombstone, RangeTombstoneSet, exclusive_successor, sort_dedup_tombstones,
 };
-use super::read_view::VersionStore;
 use super::snapshot_registry::SnapshotRegistry;
 use super::sstable::{
     LiveSst, MetadataPolicy, SsTableInternalIter, SsTableMeta, SsTableReader, SsTableWriter,
     remove_sst_in, sst_filename,
 };
+use super::version_store::VersionStore;
 use crate::engine::background_health::BackgroundHealth;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::engine::background_health::Job;
@@ -40,7 +40,9 @@ use crate::engine::pending_outputs::PendingOutputs;
 use crate::env::{Env, JoinHandle};
 use kovan_queue::seg_queue::SegQueue;
 
+mod census;
 pub(crate) mod claims;
+mod deletion;
 mod retire;
 mod stripes;
 
@@ -445,6 +447,13 @@ impl Drop for SpawnFailureGuard {
 #[derive(Clone)]
 pub(crate) struct CompactionOptions {
     pub(crate) l0_compaction_trigger: usize,
+    /// The L0 thresholds that slow and stop writes, as the write-stall
+    /// classification reads them (`stall_state.rs`); 0 turns one off. A pass
+    /// reads them to tell whether one is near (`deletion::stall_near`).
+    pub(crate) level0_slowdown_writes_trigger: usize,
+    pub(crate) level0_stop_writes_trigger: usize,
+    pub(crate) soft_pending_compaction_bytes_limit: u64,
+    pub(crate) hard_pending_compaction_bytes_limit: u64,
     pub(crate) level_base_bytes: u64,
     pub(crate) level_size_multiplier: u64,
     pub(crate) target_file_size: u64,
@@ -499,6 +508,10 @@ impl Default for CompactionOptions {
     fn default() -> Self {
         Self {
             l0_compaction_trigger: L0_COMPACTION_TRIGGER,
+            level0_slowdown_writes_trigger: 0,
+            level0_stop_writes_trigger: 0,
+            soft_pending_compaction_bytes_limit: 0,
+            hard_pending_compaction_bytes_limit: 0,
             level_base_bytes: DEFAULT_LEVEL_BASE_BYTES,
             level_size_multiplier: LEVEL_SIZE_MULTIPLIER,
             target_file_size: DEFAULT_TARGET_FILE_SIZE,
@@ -589,6 +602,9 @@ fn compaction_loop(
                     &opts,
                     &snapshot_registry,
                     &claims,
+                    // What a census step stops for: this worker was told of
+                    // other work, or to shut down.
+                    &|| shutdown.load(Ordering::Acquire) || pending.load(Ordering::Acquire),
                 ) {
                     Ok(outcome) => {
                         backoff.record_success();
@@ -608,16 +624,9 @@ fn compaction_loop(
                         // Surface the failure to any registered
                         // listeners so metrics pipelines and
                         // debuggers notice it - the scheduler
-                        // itself keeps running.
-                        if !opts.listeners.is_empty() {
-                            let err = crate::Error::from(crate::Error::clone_io(&e));
-                            crate::event_listener::dispatch(&opts.listeners, |l| {
-                                l.on_background_error(
-                                    crate::event_listener::BackgroundErrorReason::Compaction,
-                                    &err,
-                                )
-                            });
-                        }
+                        // itself keeps running. A listener's panic is
+                        // logged where it was caught.
+                        let _told = tell_failure(&opts.listeners, &e);
                         false
                     }
                 }
@@ -657,7 +666,9 @@ fn compaction_loop(
 pub enum CompactionOutcome {
     /// A compaction job ran to completion.
     DidWork,
-    /// No level was over its trigger. Nothing to do.
+    /// Nothing was due: no level was over its trigger and no deleted range
+    /// was worth a pass. Such a pass may have counted the deletions of one
+    /// table an older release wrote, which compacts nothing.
     Idle,
     /// Work may be pending, but another thread is in the way: another
     /// pass holds the input files, or an exclusive user of the compaction
@@ -675,6 +686,13 @@ pub enum CompactionOutcome {
 /// two can never diverge on what "one job" means. Callers hold either
 /// side of the engine-wide compaction gate and pass the engine-wide
 /// claims.
+///
+/// Under level and universal compaction a job is size-triggered or
+/// deletion-triggered, whichever the turn rule gives (`deletion.rs`). A
+/// pass that found neither, with no write stall near, runs one step of the
+/// census (`census.rs`) and still reports what the jobs did: the census
+/// compacts nothing. `interrupted` is what such a step stops for; a caller
+/// with nothing to stop it for passes `&|| false`.
 pub(crate) fn pick_and_run_compaction(
     versions: &Arc<VersionStore>,
     sst_dir: &Path,
@@ -682,29 +700,105 @@ pub(crate) fn pick_and_run_compaction(
     opts: &CompactionOptions,
     snapshots: &SnapshotRegistry,
     claims: &Claims,
+    interrupted: &dyn Fn() -> bool,
 ) -> std::io::Result<CompactionOutcome> {
-    match opts.compaction_style {
-        crate::options::CompactionStyle::Level => {
-            pick_and_run_level_compaction(versions, sst_dir, cache, opts, snapshots, claims)
+    let pool = match opts.compaction_style {
+        crate::options::CompactionStyle::Level => None,
+        // One L0 pool, so there is nothing safe to pick in parallel: FIFO
+        // drops across it and universal merges across it, so two jobs would
+        // pick overlapping inputs. The claim is held until this returns, by
+        // any path.
+        crate::options::CompactionStyle::Fifo | crate::options::CompactionStyle::Universal => {
+            match claims.pool() {
+                Some(pool) => Some(pool),
+                None => return Ok(CompactionOutcome::Contended),
+            }
         }
-        crate::options::CompactionStyle::Fifo => {
-            // One L0 pool, so there is nothing safe to pick in parallel. The
-            // claim is held until this returns, by any path.
-            let Some(_pool) = claims.pool() else {
-                return Ok(CompactionOutcome::Contended);
-            };
-            Ok(outcome(run_fifo_pass(versions, sst_dir, opts)?))
-        }
-        crate::options::CompactionStyle::Universal => {
-            // Same: universal merges across all L0 files, so two jobs
-            // would pick overlapping inputs.
-            let Some(_pool) = claims.pool() else {
-                return Ok(CompactionOutcome::Contended);
-            };
-            Ok(outcome(pick_and_run_universal(
-                versions, sst_dir, cache, opts, snapshots,
-            )?))
-        }
+    };
+    if opts.compaction_style == crate::options::CompactionStyle::Fifo {
+        // FIFO never merges tables, so no deletion is ever compacted away
+        // and nothing is counted for it.
+        return Ok(outcome(run_fifo_pass(versions, sst_dir, cache, opts)?));
+    }
+    let pressed = deletion::stall_near(&versions.current(), opts);
+    let ran = if pool.is_some() {
+        claims.turn.pass(
+            pressed,
+            || pick_and_run_universal(versions, sst_dir, cache, opts, snapshots).map(outcome),
+            || run_universal_deletion_merge(versions, sst_dir, cache, opts, snapshots),
+        )?
+    } else {
+        claims.turn.pass(
+            pressed,
+            || pick_and_run_level_compaction(versions, sst_dir, cache, opts, snapshots, claims),
+            || run_level_deletion_pass(versions, sst_dir, cache, opts, snapshots, claims),
+        )?
+    };
+    if ran != CompactionOutcome::DidWork && !pressed {
+        census::step(versions, cache, opts, claims, pool.is_some(), interrupted);
+    }
+    Ok(ran)
+}
+
+/// Run the level-style pass picked for its deletions, if there is one
+/// (`deletion::pick_level`). Claimed and checked as a size-triggered pass
+/// is in [`compact_level`].
+fn run_level_deletion_pass(
+    versions: &Arc<VersionStore>,
+    sst_dir: &Path,
+    cache: &BlockCache,
+    opts: &CompactionOptions,
+    snapshots: &SnapshotRegistry,
+    claims: &Claims,
+) -> std::io::Result<CompactionOutcome> {
+    let Some(job) = deletion::pick_level(&versions.current(), snapshots.oldest_live_seq(), cache)
+    else {
+        return Ok(CompactionOutcome::Idle);
+    };
+    let Some(_claim) = claims.tables(
+        job.inputs
+            .iter()
+            .chain(&job.below)
+            .map(Arc::clone)
+            .collect(),
+    ) else {
+        return Ok(CompactionOutcome::Contended);
+    };
+    let current = versions.current();
+    if !claims::all_live(&current.levels[job.level], &job.inputs)
+        || !claims::all_live(&current.levels[job.target], &job.below)
+    {
+        return Ok(CompactionOutcome::Contended);
+    }
+    perform_compaction_to(
+        versions, sst_dir, cache, opts, job.level, job.target, job.inputs, job.below, snapshots,
+    )?;
+    count_deletion_triggered(opts);
+    Ok(CompactionOutcome::DidWork)
+}
+
+/// Run the universal-style merge picked for its deletions, if there is one
+/// (`deletion::pick_universal`). The caller holds the pool's claim.
+fn run_universal_deletion_merge(
+    versions: &Arc<VersionStore>,
+    sst_dir: &Path,
+    cache: &BlockCache,
+    opts: &CompactionOptions,
+    snapshots: &SnapshotRegistry,
+) -> std::io::Result<CompactionOutcome> {
+    let Some(runs) =
+        deletion::pick_universal(&versions.current(), snapshots.oldest_live_seq(), cache)
+    else {
+        return Ok(CompactionOutcome::Idle);
+    };
+    perform_universal_merge(versions, sst_dir, cache, opts, runs, snapshots)?;
+    count_deletion_triggered(opts);
+    Ok(CompactionOutcome::DidWork)
+}
+
+fn count_deletion_triggered(opts: &CompactionOptions) {
+    if let Some(statistics) = &opts.statistics {
+        statistics.add(crate::statistics::Ticker::CompactionDeletionTriggered, 1);
     }
 }
 
@@ -738,19 +832,22 @@ fn pick_and_run_universal(
     // Snapshot L0 under the version lock, then make decisions
     // without holding it.
     let l0_files: Vec<Arc<LiveSst>> = {
-        let version = versions.lock().current();
+        let version = versions.current();
         version.levels[0].clone()
     };
     if l0_files.len() < 2 {
         return Ok(false);
     }
 
-    // Sort newest-first. Age is approximated by `file_id`: every
-    // fresh flush / merge output gets a strictly larger id than
-    // any previous one (handed out monotonically by the version
-    // set), so largest = newest.
-    let mut by_age: Vec<Arc<LiveSst>> = l0_files;
-    by_age.sort_by_key(|f| std::cmp::Reverse(f.meta.file_id));
+    // Newest first. L0 lists its tables by age, oldest first, and that is
+    // the order a read follows, so it is the order here. A file id is not
+    // an age: a merge's output draws its id when it starts writing and takes
+    // the place of its oldest input, so a run flushed while the merge ran
+    // has the smaller id and the newer place. Ordered by id, the size rule
+    // could merge the runs on either side of such a run and leave it out,
+    // and the output, placed below it, would hide a newer write under an
+    // older one.
+    let by_age: Vec<Arc<LiveSst>> = l0_files.into_iter().rev().collect();
 
     // Rule 1 - size ratio merge. Accumulate newest files into a
     // candidate group; keep adding until the group's total size
@@ -817,9 +914,9 @@ fn pick_and_run_universal(
 }
 
 /// Merge every file in `inputs` into a single new L0 file. Input
-/// files are removed from the version; the new file gets a fresh
-/// id (so it sorts as the newest L0 file under the picker's
-/// age-by-file_id ordering).
+/// files are removed from the version; the new file gets a fresh id
+/// and takes the place of its oldest input, so its age in L0 is that
+/// input's, whatever its id.
 ///
 /// The output is deliberately **one** file regardless of
 /// [`CompactionOptions::target_file_size`]. Under this style each L0
@@ -863,9 +960,30 @@ fn perform_universal_merge(
 pub(crate) fn run_fifo_pass(
     versions: &Arc<VersionStore>,
     sst_dir: &Path,
+    cache: &BlockCache,
     opts: &CompactionOptions,
 ) -> std::io::Result<bool> {
-    pick_and_run_fifo(versions, sst_dir, opts)
+    pick_and_run_fifo(versions, sst_dir, cache, opts)
+}
+
+/// Tell `listeners` a compaction pass failed with `err`: the one place a
+/// failing pass is told, whether it ran on a worker or on a caller's
+/// thread. A listener's panic comes back as an error where a background
+/// step contains it (`engine::callback`), already logged there.
+pub(crate) fn tell_failure(
+    listeners: &[Arc<dyn crate::event_listener::EventListener>],
+    err: &std::io::Error,
+) -> Result<(), crate::Error> {
+    if listeners.is_empty() {
+        return Ok(());
+    }
+    let err = crate::Error::from(crate::Error::clone_io(err));
+    crate::event_listener::dispatch_contained(listeners, |l| {
+        l.on_background_error(
+            crate::event_listener::BackgroundErrorReason::Compaction,
+            &err,
+        )
+    })
 }
 
 /// Force-merge every L0 file into a single run. Called by the
@@ -881,7 +999,7 @@ pub(crate) fn run_universal_full_compaction(
     snapshots: &SnapshotRegistry,
 ) -> std::io::Result<()> {
     let l0_files: Vec<Arc<LiveSst>> = {
-        let version = versions.lock().current();
+        let version = versions.current();
         version.levels[0].clone()
     };
     if l0_files.len() < 2 {
@@ -898,7 +1016,7 @@ fn pick_and_run_level_compaction(
     snapshots: &SnapshotRegistry,
     claims: &Claims,
 ) -> std::io::Result<CompactionOutcome> {
-    let version = versions.lock().current();
+    let version = versions.current();
 
     // Check L0 first
     if version.l0_count() >= opts.l0_compaction_trigger {
@@ -919,13 +1037,14 @@ fn pick_and_run_level_compaction(
 /// FIFO picker: every flush lands a new L0 file, and regolith never
 /// merges in this style. After each pass, if the total bytes held
 /// across L0 exceed `max_table_files_size`, we unlink the oldest
-/// file (smallest `file_id`) and emit a `RemoveFile` edit. We stop
+/// file (the first L0 lists) and emit a `RemoveFile` edit. We stop
 /// when the cap is satisfied or only one file remains - a single
 /// oversized file is not worth deleting because that would lose
 /// data with no successor on disk.
 fn pick_and_run_fifo(
     versions: &Arc<VersionStore>,
     sst_dir: &Path,
+    cache: &BlockCache,
     opts: &CompactionOptions,
 ) -> std::io::Result<bool> {
     let limit = opts.fifo_compaction_options.max_table_files_size;
@@ -937,7 +1056,7 @@ fn pick_and_run_fifo(
     // make decisions outside it so we don't hold the lock across
     // the unlink syscall.
     let l0_files: Vec<Arc<crate::engine::sstable::LiveSst>> = {
-        let version = versions.lock().current();
+        let version = versions.current();
         version.levels[0].clone()
     };
 
@@ -946,14 +1065,17 @@ fn pick_and_run_fifo(
         return Ok(false);
     }
 
-    // Sort by file_id ascending - smaller id was allocated earlier,
-    // so it is the oldest file by construction.
-    let mut by_age: Vec<Arc<crate::engine::sstable::LiveSst>> = l0_files;
-    by_age.sort_by_key(|f| f.meta.file_id);
+    // Oldest first: the order L0 lists its tables in, which is the order a
+    // read follows. Not the order of their file ids (E38): an ingest draws
+    // its id when it stages its file and installs it later, at the newest
+    // place, so a table flushed in between has the larger id and the older
+    // place. Dropped by id, the ingested table would go first and the
+    // older value under it would read again.
+    let by_age: Vec<Arc<crate::engine::sstable::LiveSst>> = l0_files;
 
     let mut running_total = total;
     let mut edits: Vec<VersionEdit> = Vec::new();
-    let mut removed_paths: Vec<std::path::PathBuf> = Vec::new();
+    let mut removed: Vec<Arc<crate::engine::sstable::LiveSst>> = Vec::new();
     for file in &by_age {
         // Always keep at least one file alive - dropping the only
         // remaining file would delete every byte of user data the
@@ -968,7 +1090,7 @@ fn pick_and_run_fifo(
             level: 0,
             file_id: file.meta.file_id,
         });
-        removed_paths.push(sst_dir.join(sst_filename(file.meta.file_id)));
+        removed.push(Arc::clone(file));
         running_total = running_total.saturating_sub(file.meta.file_size);
     }
 
@@ -976,16 +1098,15 @@ fn pick_and_run_fifo(
         return Ok(false);
     }
 
-    versions.lock().apply(&edits)?;
+    versions.run(|versions| versions.apply(&edits))?;
 
-    // Best-effort unlink. The `LiveSst` reader Arcs in older
-    // versions (held by long-running snapshots / iterators) keep
-    // file descriptors open, so the kernel preserves the inode
-    // until those readers drop. A failure here doesn't corrupt the
-    // database - the manifest already reflects the removal.
-    for path in &removed_paths {
-        let _ = opts.env.remove_file(path);
-    }
+    // Best-effort unlink, as after a merge. The `LiveSst` reader Arcs in
+    // older versions (held by long-running snapshots / iterators) keep
+    // file descriptors open, so the kernel preserves the inode until those
+    // readers drop. A failure here doesn't corrupt the database - the
+    // manifest already reflects the removal.
+    delete_old_files(&*opts.env, sst_dir, &removed, cache);
+    tell_deleted(&opts.listeners, sst_dir, &removed);
 
     if let Some(s) = &opts.statistics {
         s.add(
@@ -1041,7 +1162,7 @@ fn compact_level(
 
     // Choose the inputs from the current version, skipping what another
     // pass holds, then claim them (`claims.rs`).
-    let version = versions.lock().current();
+    let version = versions.current();
     let level_files = &version.levels[level];
     if level_files.is_empty() {
         return Ok(CompactionOutcome::Idle);
@@ -1093,7 +1214,7 @@ fn compact_level(
     // the version stays there while its claim is, and one that is gone was
     // compacted already, so compacting it again would put its rows in the
     // level twice.
-    let current = versions.lock().current();
+    let current = versions.current();
     if !claims::all_live(&current.levels[level], &input_files)
         || !claims::all_live(&current.levels[target_level], &overlap_files)
     {
@@ -1151,7 +1272,7 @@ pub(crate) fn run_compact_range(
 ) -> std::io::Result<()> {
     for level in 0..MAX_LEVELS - 1 {
         loop {
-            let version = versions.lock().current();
+            let version = versions.current();
             let files = &version.levels[level];
             if files.is_empty() {
                 break;
@@ -1225,7 +1346,7 @@ pub(crate) fn reseal_tables(
         return Ok(());
     };
     let current = Some(keyring.current_id());
-    let version = versions.lock().current();
+    let version = versions.current();
     let stale: Vec<(usize, Arc<LiveSst>)> = version
         .levels
         .iter()
@@ -1389,7 +1510,12 @@ fn perform_compaction_to(
     if let Some(filter) = opts.compaction_filter.as_ref() {
         merged_range_tombstones.retain(|rt| {
             !matches!(
-                filter.filter_range_delete(target_level, &rt.start, &rt.end),
+                super::filter_call::filter_range_delete(
+                    filter.as_ref(),
+                    target_level,
+                    &rt.start,
+                    &rt.end
+                ),
                 crate::options::CompactionDecision::Remove
             )
         });
@@ -1426,9 +1552,10 @@ fn perform_compaction_to(
     let live = snapshots.live_seqs();
     // Read with the inputs fixed too: the levels below the output can only
     // gain a key of these inputs' ranges through this pass.
-    let version = versions.lock().current();
-    let retirement = Retirement::new(target_level, &version, live.first().copied());
-    let carried = retirement.carried_tombstones(&merged_range_tombstones);
+    let version = versions.current();
+    let retirement = Retirement::new(target_level, &version, &input_files, live.first().copied());
+    // Shared with each output's writer, which counts what they hide of it.
+    let carried = Arc::new(retirement.carried_tombstones(&merged_range_tombstones));
 
     let CompactionOutputs {
         edits: new_file_edits,
@@ -1462,8 +1589,7 @@ fn perform_compaction_to(
     // Atomically apply the remove / add edits. `SetNextFileId` is not
     // needed here - each output file already advanced it when it was
     // allocated above.
-    {
-        let mut versions = versions.lock();
+    versions.run(|versions| -> std::io::Result<()> {
         if level == 0 && target_level == 0 {
             // An L0 to L0 merge has to be placed, not appended.
             //
@@ -1493,6 +1619,16 @@ fn perform_compaction_to(
                 .iter()
                 .position(|f| input_ids.contains(&f.meta.file_id))
                 .unwrap_or(0);
+            // The inputs lie next to one another in L0 (E38). A table left
+            // out between them would keep a newer place than the output and
+            // hide the writes of every input newer than it.
+            debug_assert!(
+                current.levels[0][oldest..]
+                    .iter()
+                    .take(input_ids.len())
+                    .all(|f| input_ids.contains(&f.meta.file_id)),
+                "the inputs of a merge inside L0 lie next to one another"
+            );
 
             let mut rebuilt: Vec<VersionEdit> = Vec::new();
             for f in current.levels[0].iter() {
@@ -1523,17 +1659,22 @@ fn perform_compaction_to(
                 });
             }
             pending.offered_to_manifest();
-            versions.apply(&rebuilt)?;
+            versions.apply(&rebuilt)
         } else {
             pending.offered_to_manifest();
-            versions.apply(&edits)?;
+            versions.apply(&edits)
         }
-    }
+    })?;
 
     // Unlink the old SSTable paths. Their file descriptors stay alive
     // through any `Arc<LiveSst>` still held by older versions or by
     // iterators, so the data remains readable until those Arcs drop.
-    delete_old_files(&*opts.env, sst_dir, &input_files, &overlap_files, cache);
+    delete_old_files(
+        &*opts.env,
+        sst_dir,
+        input_files.iter().chain(&overlap_files),
+        cache,
+    );
 
     // Publish compaction statistics. Bytes-in is the sum of
     // every input file's on-disk size; bytes-out is the sum of
@@ -1571,13 +1712,11 @@ fn perform_compaction_to(
             };
             crate::event_listener::dispatch(&opts.listeners, |l| l.on_table_file_created(&info));
         }
-        for f in input_files.iter().chain(overlap_files.iter()) {
-            let info = crate::event_listener::TableFileDeletionInfo {
-                file_id: f.meta.file_id,
-                file_path: sst_dir.join(sst_filename(f.meta.file_id)),
-            };
-            crate::event_listener::dispatch(&opts.listeners, |l| l.on_table_file_deleted(&info));
-        }
+        tell_deleted(
+            &opts.listeners,
+            sst_dir,
+            input_files.iter().chain(&overlap_files),
+        );
         let job_info = crate::event_listener::CompactionJobInfo {
             input_level: level,
             output_level: target_level,
@@ -1672,7 +1811,7 @@ fn stream_compaction_outputs(
     overlap_files: &[Arc<LiveSst>],
     live: &[u64],
     merged_range_tombstones: &RangeTombstoneSet,
-    carried_range_tombstones: &RangeTombstoneSet,
+    carried_range_tombstones: &Arc<RangeTombstoneSet>,
     retirement: &Retirement<'_>,
 ) -> std::io::Result<CompactionOutputs> {
     let all_files: Vec<Arc<LiveSst>> = input_files
@@ -1780,7 +1919,8 @@ struct StreamingCompactionWriter<'a> {
     sst_dir: &'a Path,
     opts: &'a CompactionOptions,
     target_level: usize,
-    range_tombstones: &'a RangeTombstoneSet,
+    /// The range tombstones the pass writes out.
+    range_tombstones: &'a Arc<RangeTombstoneSet>,
     point_ranges: Vec<(Vec<u8>, Vec<u8>)>,
     current: Option<StreamingOutputBuilder>,
     edits: Vec<VersionEdit>,
@@ -1794,7 +1934,7 @@ impl<'a> StreamingCompactionWriter<'a> {
         sst_dir: &'a Path,
         opts: &'a CompactionOptions,
         target_level: usize,
-        range_tombstones: &'a RangeTombstoneSet,
+        range_tombstones: &'a Arc<RangeTombstoneSet>,
     ) -> Self {
         Self {
             versions,
@@ -1854,17 +1994,11 @@ impl<'a> StreamingCompactionWriter<'a> {
             return Ok(());
         }
 
-        let file_id = {
-            let mut guard = self.versions.lock();
-            let current = guard.current();
-            let id = current.next_file_id;
-            guard.apply(&[VersionEdit::SetNextFileId(id + 1)])?;
-            id
-        };
+        let file_id = self.versions.take_file_id()?;
 
         let path = self.sst_dir.join(sst_filename(file_id));
         self.pending.track(path.clone());
-        let writer = SsTableWriter::new_in(
+        let mut writer = SsTableWriter::new_in(
             &self.opts.env,
             &path,
             self.opts.block_size,
@@ -1875,6 +2009,12 @@ impl<'a> StreamingCompactionWriter<'a> {
             self.opts.metadata_block_size,
             self.opts.keyring.as_deref(),
         )?;
+        // The output carries the tombstones of these that reach its keys
+        // (`finish_current`), so what they hide of it is counted with its
+        // deletions as it is written.
+        if !self.range_tombstones.is_empty() {
+            writer.hidden_by(Arc::clone(self.range_tombstones));
+        }
 
         self.current = Some(StreamingOutputBuilder {
             file_id,
@@ -1951,6 +2091,7 @@ impl<'a> StreamingCompactionWriter<'a> {
                 file_size,
                 num_entries,
                 global_seq: None,
+                deletions: Some(summary.deletions),
             },
             reader,
         );
@@ -1998,13 +2139,7 @@ impl<'a> StreamingCompactionWriter<'a> {
             return Ok(());
         }
 
-        let file_id = {
-            let mut guard = self.versions.lock();
-            let current = guard.current();
-            let id = current.next_file_id;
-            guard.apply(&[VersionEdit::SetNextFileId(id + 1)])?;
-            id
-        };
+        let file_id = self.versions.take_file_id()?;
 
         let path = self.sst_dir.join(sst_filename(file_id));
         self.pending.track(path.clone());
@@ -2052,6 +2187,7 @@ impl<'a> StreamingCompactionWriter<'a> {
                 file_size,
                 num_entries: summary.num_entries,
                 global_seq: None,
+                deletions: Some(summary.deletions),
             },
             reader,
         );
@@ -2193,14 +2329,35 @@ fn find_overlapping(files: &[Arc<LiveSst>], min_key: &[u8], max_key: &[u8]) -> V
     overlapping(files, min_key, max_key).to_vec()
 }
 
-fn delete_old_files(
+/// Tell `listeners` each of `files` was removed, once its version edit is
+/// applied and its name unlinked: the one place a compaction says so, after
+/// a merge and after a FIFO pass alike.
+fn tell_deleted<'a>(
+    listeners: &[Arc<dyn crate::event_listener::EventListener>],
+    sst_dir: &Path,
+    files: impl IntoIterator<Item = &'a Arc<LiveSst>>,
+) {
+    if listeners.is_empty() {
+        return;
+    }
+    for file in files {
+        let info = crate::event_listener::TableFileDeletionInfo {
+            file_id: file.meta.file_id,
+            file_path: sst_dir.join(sst_filename(file.meta.file_id)),
+        };
+        crate::event_listener::dispatch(listeners, |l| l.on_table_file_deleted(&info));
+    }
+}
+
+/// Evict each of `files` from the block cache and unlink it, best effort:
+/// a failure is logged and left for the next open's sweep.
+fn delete_old_files<'a>(
     env: &dyn Env,
     sst_dir: &Path,
-    input_files: &[Arc<LiveSst>],
-    overlap_files: &[Arc<LiveSst>],
+    files: impl IntoIterator<Item = &'a Arc<LiveSst>>,
     cache: &BlockCache,
 ) {
-    for file in input_files.iter().chain(overlap_files.iter()) {
+    for file in files {
         let path = sst_dir.join(sst_filename(file.meta.file_id));
         cache.evict_file(file.meta.file_id);
         if let Err(e) = remove_sst_in(env, &path) {
@@ -2214,7 +2371,11 @@ fn delete_old_files(
 }
 
 #[cfg(test)]
+mod fifo_order_tests;
+#[cfg(test)]
 mod retire_tests;
+#[cfg(test)]
+mod universal_order_tests;
 
 #[cfg(test)]
 mod tests {

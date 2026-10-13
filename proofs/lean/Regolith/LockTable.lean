@@ -1,3 +1,4 @@
+-- The barging lock and its proofs, which this file builds on.
 import Regolith.Sync
 
 /-!
@@ -57,6 +58,7 @@ comments. `l.filter p` keeps the elements of `l` that pass the test `p`;
 `decide P` turns a yes-or-no fact `P` into the answer `true` or `false`.
 -/
 
+-- Everything below is named Regolith.LockTable.<name>.
 namespace Regolith.LockTable
 
 /-! ## A table entry and its use count -/
@@ -82,17 +84,20 @@ inductive EStep : Entry → Entry → Prop
   | pin (s : Entry) (r : Nat)
       -- The entry is still in the table.
       (h : s.retired = false) :
+      -- After: one more use, and `r` is among the users.
       EStep s { s with uses := s.uses + 1, users := r :: s.users }
   /-- A call gives its use back (`LockTable::unpin`, the decrement). -/
   | unpin (s : Entry) (r : Nat)
       -- `r` holds a use.
       (h : r ∈ s.users) :
+      -- After: one use fewer, and `r` is no longer among the users.
       EStep s { s with uses := s.uses - 1, users := s.users.erase r }
   /-- The entry is taken out of the table (`KeyLock::retire`): one
   compare-and-swap that succeeds only from a count of zero. -/
   | retire (s : Entry)
       -- Nobody uses it.
       (h : s.uses = 0) :
+      -- After: the entry is marked retired.
       EStep s { s with retired := true }
 
 /-- Any number of entry steps, one after another. -/
@@ -105,6 +110,8 @@ inductive ESteps : Entry → Entry → Prop
 /-- What stays true of an entry: the count is exactly the number of users,
 and a retired entry has none. -/
 def EInv (s : Entry) : Prop :=
+  -- The count is the number of users, and if the entry is retired the user
+  -- list is empty.
   s.uses = s.users.length ∧ (s.retired = true → s.users = [])
 
 /-- Every entry step keeps `EInv`. -/
@@ -113,17 +120,20 @@ theorem estep_inv {s t : Entry}
     (hs : EInv s)
     -- One step.
     (h : EStep s t) :
+    -- Then it holds after the step.
     EInv t := by
   -- Split the invariant into its two halves.
   obtain ⟨hc, hr⟩ := hs
   -- Look at which step was taken.
   cases h with
+  -- A call took a use.
   | pin r hret =>
     -- One more use and one more user; the entry is not retired, so the
     -- second half asks nothing.
     refine ⟨by simp [hc], fun hx => ?_⟩
     -- "Retired" contradicts the step's condition.
     simp [hret] at hx
+  -- A call gave its use back.
   | unpin r hmem =>
     -- One use fewer, and the user list is one shorter.
     refine ⟨by simp [hc, List.length_erase_of_mem hmem], fun hx => ?_⟩
@@ -133,6 +143,7 @@ theorem estep_inv {s t : Entry}
     rw [this] at hmem
     -- Nothing is a member of the empty list.
     simp at hmem
+  -- The entry was retired.
   | retire hzero =>
     -- The count does not change; a count of zero means no users.
     refine ⟨hc, fun _ => ?_⟩
@@ -147,6 +158,7 @@ theorem esteps_inv {s t : Entry}
     (hs : EInv s)
     -- Any number of steps.
     (h : ESteps s t) :
+    -- Then it holds at the end.
     EInv t := by
   -- By induction on the steps taken.
   induction h with
@@ -164,6 +176,7 @@ theorem retired_unused {r : Nat} {s : Entry}
     (h : ESteps (Entry.made r) s)
     -- It has left the table.
     (hret : s.retired = true) :
+    -- Then nobody uses it.
     s.users = [] := by
   -- A freshly made entry has one use, one user, and is not retired.
   have h0 : EInv (Entry.made r) := ⟨rfl, fun hx => by simp [Entry.made] at hx⟩
@@ -185,7 +198,7 @@ structure T where
   inbox made it ready (`WaitSlot::complete`). -/
   ready : List (Nat × Nat)
   /-- The transactions whose commit is written and not yet visible
-  (`commit_nowait` before its group lands). -/
+  (`commit_nowait` before the commit lands). -/
   pending : List Nat
 
 /-- The start: the lock free, every inbox empty, nothing ready, nothing
@@ -197,6 +210,8 @@ note is kept only while its wait is still woken (a waiter that tried again
 or gave up has used its note up). Every request the step newly woke gets a
 note, in the inbox of its own thread `Q r` (`Note::deliver`). -/
 def notes (Q : Nat → Nat) (old new : Sync.M) (inbox : Nat → List Nat) (q : Nat) : List Nat :=
+  -- The old notes of inbox `q` whose request is still woken, then the
+  -- requests the step newly woke whose own thread is `q`.
   (inbox q).filter (fun r => decide (r ∈ new.woken)) ++
     new.woken.filter (fun r => decide (r ∉ old.woken) && decide (Q r = q))
 
@@ -212,11 +227,15 @@ inductive Step (B : Nat) (Q : Nat → Nat) : T → T → Prop
       (h : Sync.Step B s.lock m)
       -- Every pending committer still owns the lock afterwards.
       (keep : ∀ r ∈ s.pending, r ∈ m.owners) :
+      -- After: the lock is `m`, the notes are delivered, a ready wait is kept
+      -- only while its request is still woken, and the pending commits stay.
       Step B Q s ⟨m, notes Q s.lock m s.inbox,
                   s.ready.filter (fun p => decide (p.1 ∈ m.woken)), s.pending⟩
   /-- Thread `q` reads its inbox (`IoQueue::poll`): every note in it makes
   its wait ready, and it is `q` that made it ready. -/
   | poll (s : T) (q : Nat) :
+      -- After: inbox `q` is empty, and each note that was in it is a ready
+      -- wait, made ready by `q`.
       Step B Q s { s with inbox := fun x => if x = q then [] else s.inbox x,
                           ready := s.ready ++ (s.inbox q).map (fun r => (r, q)) }
   /-- A holder commits with `commit_nowait`: its commit is written and not
@@ -224,10 +243,12 @@ inductive Step (B : Nat) (Q : Nat → Nat) : T → T → Prop
   | write (s : T) (r : Nat)
       -- `r` holds the lock.
       (hr : r ∈ s.lock.owners) :
+      -- After: `r` is among the pending commits.
       Step B Q s { s with pending := r :: s.pending }
   /-- The commit lands: it is visible now. From here on its transaction
   may release the lock like any holder. -/
   | land (s : T) (r : Nat) :
+      -- After: `r` is no longer among the pending commits.
       Step B Q s { s with pending := s.pending.filter (fun x => decide (x ≠ r)) }
 
 /-- Any number of table steps, one after another. -/
@@ -240,6 +261,8 @@ inductive Steps (B : Nat) (Q : Nat → Nat) : T → T → Prop
 /-- A request has been told that the lock may be its: the note is in its
 own thread's inbox, or its wait was made ready by its own thread. -/
 def Told (Q : Nat → Nat) (s : T) (r : Nat) : Prop :=
+  -- Its note is in its own thread's inbox, or its wait is ready and its
+  -- own thread made it so.
   r ∈ s.inbox (Q r) ∨ (r, Q r) ∈ s.ready
 
 /-- What stays true of the table. -/
@@ -279,105 +302,170 @@ theorem step_inv {B : Nat} {Q : Nat → Nat} {s t : T}
     (hs : Inv Q s)
     -- One step.
     (h : Step B Q s t) :
+    -- Then it holds after the step.
     Inv Q t := by
   -- Look at which step was taken.
   cases h with
+  -- A step of the key's lock.
   | lock m hstep keep =>
     -- The lock moved to `m`; build the six facts one by one.
     refine ⟨fun r hr => ?_, fun q r hr => ?_, fun r q hr => ?_, fun q r hr => ?_,
             fun r q hr => ?_, keep⟩
-    · -- Told: `r` is woken after the step. Was it woken before?
+    -- Told: `r` is woken after the step.
+    ·
+      -- Was it woken before?
       by_cases hold : r ∈ s.lock.woken
-      · -- Yes: it had been told, by a note or a ready wait.
+      -- Yes, it was woken before.
+      ·
+        -- It had been told, by a note or a ready wait.
         rcases hs.told r hold with hi | hrd
-        · -- The note is kept, since `r` is still woken.
+        -- By a note.
+        ·
+          -- The note is kept, since `r` is still woken.
           exact Or.inl (by simp [notes, hi, hr])
-        · -- The ready wait is kept, since `r` is still woken.
+        -- By a ready wait.
+        ·
+          -- The ready wait is kept, since `r` is still woken.
           exact Or.inr (by simp [hrd, hr])
-      · -- No: the step woke it, so it put a note in `r`'s own inbox.
+      -- No, it was not woken before.
+      ·
+        -- The step woke it, so it put a note in `r`'s own inbox.
         exact Or.inl (by simp [notes, hr, hold])
-    · -- Own inbox: where did the note in inbox `q` come from?
+    -- Own inbox: a note is in inbox `q` after the step.
+    ·
+      -- Where did it come from? Spell the new inbox out.
       simp only [notes, List.mem_append, List.mem_filter, Bool.and_eq_true,
         decide_eq_true_eq] at hr
       -- An old note, or a new one.
       rcases hr with ⟨hi, _⟩ | ⟨_, _, hq⟩
-      · -- An old note was in its own inbox already.
+      -- An old note.
+      ·
+        -- It was in its own inbox already.
         exact hs.own_inbox q r hi
-      · -- A new note is put in the inbox of `Q r`.
+      -- A new note.
+      ·
+        -- It is put in the inbox of `Q r`.
         exact hq
-    · -- Own ready: a ready wait that is kept was ready before.
+    -- Own ready: a ready wait that is kept was ready before.
+    ·
+      -- Spell out what a kept ready wait is: an old one that passed the test.
       simp only [List.mem_filter, decide_eq_true_eq] at hr
       -- It was made ready by its own thread then.
       exact hs.own_ready r q hr.1
-    · -- Fresh inbox: every note left is for a request woken now.
+    -- Fresh inbox: every note left is for a request woken now.
+    ·
+      -- Spell the new inbox out: old notes that were kept, and new ones.
       simp only [notes, List.mem_append, List.mem_filter, Bool.and_eq_true,
         decide_eq_true_eq] at hr
       -- An old note was kept only if so; a new one is for a woken request.
       rcases hr with ⟨_, hw⟩ | ⟨hw, _, _⟩ <;> exact hw
-    · -- Fresh ready: only waits of requests woken now were kept.
+    -- Fresh ready: only waits of requests woken now were kept.
+    ·
+      -- Spell out the test a kept wait passed.
       simp only [List.mem_filter, decide_eq_true_eq] at hr
       -- The filter's test says it.
       exact hr.2
+  -- A thread read its inbox.
   | poll q =>
     -- Thread `q` read its inbox; the lock did not move.
     refine ⟨fun r hr => ?_, fun x r hr => ?_, fun r x hr => ?_, fun x r hr => ?_,
             fun r x hr => ?_, hs.pending_holds⟩
-    · -- Told: `r` was told before, by a note or a ready wait.
+    -- Told: `r` is woken, and the lock did not move.
+    ·
+      -- `r` was told before, by a note or a ready wait.
       rcases hs.told r hr with hi | hrd
-      · -- A note. Is `r`'s inbox the one just read?
+      -- By a note.
+      ·
+        -- Is `r`'s inbox the one just read?
         by_cases hq : Q r = q
-        · -- Yes: the note became a ready wait, made ready by `q = Q r`.
+        -- Yes: the note was read.
+        ·
+          -- It became a ready wait, made ready by `q = Q r`: the second half of told.
           refine Or.inr ?_
           -- The new ready list is the old one plus the notes read.
           simp only [List.mem_append, List.mem_map]
           -- It is among the notes read, paired with `q`.
           exact Or.inr ⟨r, by rw [← hq]; exact hi, by rw [hq]⟩
-        · -- No: `r`'s inbox was not touched.
+        -- No.
+        ·
+          -- `r`'s inbox was not touched: the note is still in it.
           exact Or.inl (by simp [hq, hi])
-      · -- A ready wait stays ready.
+      -- By a ready wait.
+      ·
+        -- A ready wait stays ready.
         exact Or.inr (List.mem_append.2 (Or.inl hrd))
-    · -- Own inbox: a note still in an inbox was there before.
+    -- Own inbox: a note still in an inbox was there before.
+    ·
+      -- Is inbox `x` the one just read?
       by_cases hx : x = q
-      · -- The inbox just read is empty: no note is in it.
+      -- Yes: the inbox just read.
+      ·
+        -- It is empty: no note is in it.
         simp [hx] at hr
-      · -- Another inbox is unchanged.
+      -- No: another inbox.
+      ·
+        -- It is unchanged.
         simp only [hx, ite_false] at hr
         -- So the old fact applies.
         exact hs.own_inbox x r hr
-    · -- Own ready: an old ready wait, or a note just read.
+    -- Own ready: an old ready wait, or a note just read.
+    ·
+      -- Spell the new ready list out: the old one plus the notes read.
       simp only [List.mem_append, List.mem_map, Prod.mk.injEq] at hr
       -- Split the two cases.
       rcases hr with hrd | ⟨y, hy, rfl, rfl⟩
-      · -- An old one was made ready by its own thread.
+      -- An old ready wait.
+      ·
+        -- It was made ready by its own thread.
         exact hs.own_ready r x hrd
-      · -- A note read from inbox `x` was in its own inbox: `Q r = x`.
+      -- A note just read from inbox `x`.
+      ·
+        -- It was in its own inbox: `Q r = x`.
         exact (hs.own_inbox _ _ hy).symm
-    · -- Fresh inbox: a note still in an inbox was there before.
+    -- Fresh inbox: a note still in an inbox was there before.
+    ·
+      -- Is inbox `x` the one just read?
       by_cases hx : x = q
-      · -- The inbox just read is empty.
+      -- Yes: the inbox just read.
+      ·
+        -- It is empty.
         simp [hx] at hr
-      · -- Another inbox is unchanged.
+      -- No: another inbox.
+      ·
+        -- It is unchanged.
         simp only [hx, ite_false] at hr
         -- So the old fact applies.
         exact hs.fresh_inbox x r hr
-    · -- Fresh ready: an old ready wait, or a note just read.
+    -- Fresh ready: an old ready wait, or a note just read.
+    ·
+      -- Spell the new ready list out: the old one plus the notes read.
       simp only [List.mem_append, List.mem_map, Prod.mk.injEq] at hr
       -- Split the two cases.
       rcases hr with hrd | ⟨y, hy, rfl, rfl⟩
-      · -- An old one is of a woken request.
+      -- An old ready wait.
+      ·
+        -- It is of a woken request.
         exact hs.fresh_ready r x hrd
-      · -- A note was for a woken request.
+      -- A note just read.
+      ·
+        -- It was for a woken request.
         exact hs.fresh_inbox _ _ hy
+  -- A commit was written.
   | write r hr =>
     -- Only the pending list grew, by a transaction that holds the lock.
     refine ⟨hs.told, hs.own_inbox, hs.own_ready, hs.fresh_inbox, hs.fresh_ready,
             fun x hx => ?_⟩
     -- `x` is the new committer or an old one.
     rcases List.mem_cons.1 hx with rfl | hx
-    · -- The new one holds the lock: the step required it.
+    -- The new committer.
+    ·
+      -- It holds the lock: the step required it.
       exact hr
-    · -- An old one held it before, and the lock did not move.
+    -- An old one.
+    ·
+      -- It held the lock before, and the lock did not move.
       exact hs.pending_holds x hx
+  -- A commit landed.
   | land r =>
     -- Only the pending list shrank.
     refine ⟨hs.told, hs.own_inbox, hs.own_ready, hs.fresh_inbox, hs.fresh_ready,
@@ -389,6 +477,7 @@ theorem step_inv {B : Nat} {Q : Nat → Nat} {s t : T}
 theorem reachable_inv {B : Nat} {Q : Nat → Nat} {s : T}
     -- `s` is reachable from the start.
     (h : Steps B Q init s) :
+    -- Then the invariant holds in `s`.
     Inv Q s := by
   -- By induction on the steps taken.
   induction h with
@@ -403,11 +492,13 @@ around it and changes nothing inside it. -/
 theorem lock_reachable {B : Nat} {Q : Nat → Nat} {s : T}
     -- `s` is reachable from the start.
     (h : Steps B Q init s) :
+    -- Then its lock is reachable from the lock's own start.
     Sync.Steps B Sync.init s.lock := by
   -- By induction on the steps taken.
   induction h with
   -- No step: the lock is at its own start.
   | refl => exact .refl _
+  -- Some steps, then one more.
   | tail _ hstep ih =>
     -- Look at which step was taken last.
     cases hstep with
@@ -429,6 +520,7 @@ theorem mutual_exclusion {B : Nat} {Q : Nat → Nat}
     (hB : 0 < B) {s : T}
     -- `s` is reachable from the start.
     (h : Steps B Q init s) :
+    -- Then the holders, by a take or by a handoff, are at most one.
     (s.lock.owners ++ s.lock.handed).length ≤ 1 :=
   -- The lock is the one proved in `Regolith.Sync`.
   (Sync.mutual_exclusion hB (lock_reachable h)).1
@@ -445,6 +537,7 @@ theorem no_stranded_front {B : Nat} {Q : Nat → Nat}
     (hq : s.lock.queue = x :: t)
     -- The lock is free.
     (hf : s.lock.free = true) :
+    -- Then `x` has been told.
     Told Q s x :=
   -- The lock woke its front (`Regolith.Sync`), and the table told it.
   (reachable_inv h).told x (Sync.no_stranded_head hB (lock_reachable h) hq hf)
@@ -459,6 +552,7 @@ theorem handed_is_told {B : Nat} {Q : Nat → Nat}
     (h : Steps B Q init s) {x : Nat}
     -- `x` was handed the lock.
     (hx : x ∈ s.lock.handed) :
+    -- Then `x` has been told.
     Told Q s x :=
   -- The lock woke it (`Regolith.Sync`), and the table told it.
   (reachable_inv h).told x (Sync.handed_woken hB (lock_reachable h) hx)
@@ -472,6 +566,7 @@ theorem bounded_bypass {B : Nat} {Q : Nat → Nat}
     (h : Steps B Q init s) {x : Nat}
     -- `x` waits.
     (hx : x ∈ s.lock.queue) :
+    -- Then it has lost at most `B` races.
     s.lock.bypass x ≤ B :=
   -- The lock is the one proved in `Regolith.Sync`.
   Sync.bounded_bypass hB (lock_reachable h) hx
@@ -484,6 +579,7 @@ theorem note_on_own_queue {B : Nat} {Q : Nat → Nat} {s : T}
     (h : Steps B Q init s) {q r : Nat}
     -- A note for `r` is in inbox `q`.
     (hr : r ∈ s.inbox q) :
+    -- Then `q` is `r`'s own thread.
     q = Q r :=
   -- The invariant says `Q r = q`.
   ((reachable_inv h).own_inbox q r hr).symm
@@ -496,6 +592,7 @@ theorem ready_by_own_queue {B : Nat} {Q : Nat → Nat} {s : T}
     (h : Steps B Q init s) {q r : Nat}
     -- `r`'s wait was made ready by thread `q`.
     (hr : (r, q) ∈ s.ready) :
+    -- Then `q` is `r`'s own thread.
     q = Q r :=
   -- The invariant says so.
   (reachable_inv h).own_ready r q hr
@@ -513,9 +610,11 @@ theorem isolation_at_landing {B : Nat} {Q : Nat → Nat}
     (hr : r ∈ s.pending)
     -- `u` holds the key, by its own take or by a handoff.
     (hu : u ∈ s.lock.owners ++ s.lock.handed) :
+    -- Then `u` is `r`.
     u = r := by
   -- A pending committer holds the lock,
   have hown : r ∈ s.lock.owners ++ s.lock.handed :=
+    -- by the invariant: it is among the owners,
     List.mem_append.2 (Or.inl ((reachable_inv h).pending_holds r hr))
   -- and there is at most one holder.
   have hle := mutual_exclusion hB h
@@ -537,14 +636,17 @@ inductive EStepNoCas : Entry → Entry → Prop
   | pin (s : Entry) (r : Nat)
       -- The entry is still in the table.
       (h : s.retired = false) :
+      -- After: one more use, and `r` is among the users.
       EStepNoCas s { s with uses := s.uses + 1, users := r :: s.users }
   /-- As `EStep.unpin`. -/
   | unpin (s : Entry) (r : Nat)
       -- `r` holds a use.
       (h : r ∈ s.users) :
+      -- After: one use fewer, and `r` is no longer among the users.
       EStepNoCas s { s with uses := s.uses - 1, users := s.users.erase r }
   /-- The defect: no look at the count. -/
   | retire (s : Entry) :
+      -- After: the entry is marked retired.
       EStepNoCas s { s with retired := true }
 
 /-- Any number of `EStepNoCas` steps. -/
@@ -560,6 +662,7 @@ at the count: it has left the table while call 2 still uses it, and the
 next caller will make a second lock for the same key. The law of
 `retired_unused` fails. -/
 theorem retire_unchecked_strands_a_user :
+    -- Some reachable state is retired and still has call 2 as its user.
     ∃ s, EStepsNoCas (Entry.made 1) s ∧ s.retired = true ∧ s.users = [2] := by
   -- The state is whatever these three steps reach:
   refine ⟨_, .tail (.tail (.tail (.refl _)
@@ -577,6 +680,7 @@ inductive StepNoNote (B : Nat) : T → T → Prop
   | lock (s : T) (m : Sync.M)
       -- The lock takes one of its own steps.
       (h : Sync.Step B s.lock m) :
+      -- After: only the lock moved; no inbox changed.
       StepNoNote B s { s with lock := m }
 
 /-- Any number of `StepNoNote` steps. -/
@@ -591,6 +695,8 @@ waits, transaction 1 releases. The lock woke 2, but no note was delivered:
 the lock is free, 2 is its front, and 2 has no note in its inbox and no
 ready wait. The law of `no_stranded_front` fails. -/
 theorem undelivered_note_strands :
+    -- Some reachable state has the lock free and 2 at the front, and 2 was
+    -- never told.
     ∃ s, StepsNoNote 1 init s ∧ s.lock.free = true ∧ s.lock.queue = [2] ∧
       ¬ Told (fun r => r) s 2 := by
   -- The state is whatever these three steps reach:
@@ -609,6 +715,8 @@ theorem undelivered_note_strands :
 that never hands off, a waiter loses 2 races. The law of `bounded_bypass`
 fails. (The counterexample is the lock's own, from `Regolith.Sync`.) -/
 theorem unbounded_barging_breaks_bound :
+    -- Some state the lock reaches without handoffs has 2 waiting with 2 lost
+    -- races.
     ∃ s, Sync.StepsNoHand Sync.init s ∧ 2 ∈ s.queue ∧ s.bypass 2 = 2 :=
   -- Proved for the lock in `Regolith.Sync`.
   Sync.unbounded_barging_breaks_bound
@@ -616,6 +724,8 @@ theorem unbounded_barging_breaks_bound :
 /-- The inbox after a lock step with the defect: a new note goes into the
 inbox of the thread after the right one. -/
 def notesWrong (Q : Nat → Nat) (old new : Sync.M) (inbox : Nat → List Nat) (q : Nat) : List Nat :=
+  -- The old notes of inbox `q` whose request is still woken, then the
+  -- requests newly woken, each in the inbox one after its own thread's.
   (inbox q).filter (fun r => decide (r ∈ new.woken)) ++
     new.woken.filter (fun r => decide (r ∉ old.woken) && decide (Q r + 1 = q))
 
@@ -626,6 +736,7 @@ inductive StepWrongQueue (B : Nat) (Q : Nat → Nat) : T → T → Prop
   | lock (s : T) (m : Sync.M)
       -- The lock takes one of its own steps.
       (h : Sync.Step B s.lock m) :
+      -- After: the lock is `m`, and the new notes went to the wrong inboxes.
       StepWrongQueue B Q s { s with lock := m, inbox := notesWrong Q s.lock m s.inbox }
 
 /-- Any number of `StepWrongQueue` steps. -/
@@ -641,6 +752,7 @@ waits, transaction 1 releases. The note for transaction 2 lands in thread
 3's inbox: thread 3 would complete transaction 2's wait. The law of
 `note_on_own_queue` fails. -/
 theorem wrong_queue_breaks_own_queue :
+    -- Some reachable state has the note for transaction 2 in inbox 3.
     ∃ s, StepsWrongQueue 1 (fun r => r) init s ∧ 2 ∈ s.inbox 3 := by
   -- The state is whatever these three steps reach:
   refine ⟨_, .tail (.tail (.tail (.refl _)
@@ -662,11 +774,13 @@ inductive StepNoKeep (B : Nat) : T → T → Prop
   | lock (s : T) (m : Sync.M)
       -- The lock takes one of its own steps.
       (h : Sync.Step B s.lock m) :
+      -- After: only the lock moved, whoever was pending.
       StepNoKeep B s { s with lock := m }
   /-- As `Step.write`. -/
   | write (s : T) (r : Nat)
       -- `r` holds the lock.
       (hr : r ∈ s.lock.owners) :
+      -- After: `r` is among the pending commits.
       StepNoKeep B s { s with pending := r :: s.pending }
 
 /-- Any number of `StepNoKeep` steps. -/
@@ -681,6 +795,7 @@ and writes its commit, which is not visible yet. Its lock is released at
 once, and transaction 2 takes the key: it would read the key as it was
 before transaction 1's commit. The law of `isolation_at_landing` fails. -/
 theorem release_at_write_breaks_isolation :
+    -- Some reachable state has 1's commit pending while 2 holds the key.
     ∃ s, StepsNoKeep 1 init s ∧ 1 ∈ s.pending ∧ 2 ∈ s.lock.owners := by
   -- The state is whatever these four steps reach:
   refine ⟨_, .tail (.tail (.tail (.tail (.refl _)
@@ -693,4 +808,5 @@ theorem release_at_write_breaks_isolation :
     -- and transaction 2 takes the free lock.
     (.lock _ _ (.fast _ 2 (by decide) rfl rfl)), by decide, by decide⟩
 
+-- End of the namespace opened at the top.
 end Regolith.LockTable

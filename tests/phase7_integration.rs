@@ -35,6 +35,7 @@
 //! The column-family fence on each group-commit path, the group left owing
 //! its fsync included, is tested where the fence is, in
 //! `engine::commit::families`.
+#![cfg(not(target_arch = "wasm32"))]
 
 mod common;
 
@@ -304,7 +305,7 @@ fn snapshots_moved_across_threads_keep_their_versions_through_compaction() {
         let held = holder.join().unwrap();
         assert!(!held.is_empty());
         // The rest drop on yet another thread while this one waits on them.
-        let waiter = scope.spawn(|| db.wait_for_snapshots(Duration::from_secs(30)));
+        let waiter = scope.spawn(|| db.wait_for_snapshots().wait(Duration::from_secs(30)));
         std::thread::sleep(Duration::from_millis(20));
         drop(held);
         assert_eq!(waiter.join().unwrap(), 0, "the wait missed a release");

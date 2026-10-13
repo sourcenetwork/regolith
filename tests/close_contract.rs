@@ -412,3 +412,38 @@ fn a_close_that_fails_behind_a_failing_flush_leaves_the_database_open() {
         );
     }
 }
+
+/// The error an open reports when the directory is still held.
+fn held(result: Result<Db, Error>) -> bool {
+    matches!(result, Err(Error::Io(io)) if io.kind() == std::io::ErrorKind::AlreadyExists)
+}
+
+/// Close ends the database's work; it does not give the directory back. The
+/// directory stays held until the handle that was closed, and every snapshot
+/// taken from it, has been dropped, and only then can it be opened again. On
+/// a file system and in memory alike.
+#[test]
+fn a_closed_database_holds_its_directory_until_its_handles_are_dropped() {
+    let dir = TempDir::new().unwrap();
+    let memory = Options::memory();
+    let memory = || Options::memory().env(Arc::clone(memory.get_env()));
+    let cases: [(&std::path::Path, &dyn Fn() -> Options); 2] = [
+        (dir.path(), &Options::default),
+        (std::path::Path::new("held-in-memory"), &memory),
+    ];
+    for (path, options) in cases {
+        let db = Db::open(path, options()).unwrap();
+        db.put(b"k", b"v").unwrap();
+        let snapshot = db.snapshot();
+        db.close().unwrap();
+        assert!(matches!(db.put(b"k", b"w"), Err(Error::Closed)));
+
+        assert!(held(Db::open(path, options())), "closed, handle alive");
+        drop(db);
+        assert!(held(Db::open(path, options())), "a snapshot is alive");
+        drop(snapshot);
+
+        let reopened = Db::open(path, options()).unwrap();
+        assert_eq!(reopened.get(b"k").unwrap(), Some(b"v".to_vec()));
+    }
+}

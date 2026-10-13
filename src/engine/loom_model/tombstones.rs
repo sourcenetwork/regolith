@@ -12,7 +12,8 @@ use loom::cell::UnsafeCell;
 use loom::sync::Arc;
 use loom::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
-use super::{explore, memtable};
+use super::{explore, explore_bounded, memtable};
+use crate::engine::range_tombstone::RangeTombstone;
 
 /// A reader racing two appends sees a prefix of them: whenever it sees the
 /// second tombstone it sees the first, and every tombstone it lists is
@@ -145,6 +146,144 @@ pub fn a_length_published_before_its_tombstone_is_caught() {
             };
             writer.join().expect("writer");
             reader.join().expect("reader");
+        },
+    );
+}
+
+/// T1: two threads append at once, as two helpers of the commit pipeline
+/// applying two slots do. Each append is handed a position of its own, so
+/// both tombstones are listed, whole.
+///
+/// Bound: 3 preemptions.
+pub fn two_appends_at_once_are_both_listed() {
+    explore_bounded(
+        "two_appends_at_once_are_both_listed",
+        Some(3),
+        8,
+        1,
+        |witness| {
+            let mt = Arc::new(memtable());
+            let appenders: Vec<_> = [(&b"a"[..], &b"c"[..], 1u64), (b"m", b"p", 2)]
+                .into_iter()
+                .map(|(start, end, seq)| {
+                    let mt = Arc::clone(&mt);
+                    loom::thread::spawn(move || mt.delete_range(start, end, seq))
+                })
+                .collect();
+            for appender in appenders {
+                appender.join().expect("appender");
+            }
+            witness.record();
+            let seqs: Vec<u64> = mt.clone_range_tombstones().iter().map(|t| t.seq).collect();
+            assert_eq!(seqs.len(), 2, "an append was lost: {seqs:?}");
+            assert_eq!(mt.covering_range_tombstone_seq(b"b", u64::MAX), 1);
+            assert_eq!(mt.covering_range_tombstone_seq(b"n", u64::MAX), 2);
+        },
+    );
+}
+
+/// The same tombstone appended by two threads at once, as two helpers
+/// applying one slot do, is listed once and deletes what it deleted.
+///
+/// Bound: 3 preemptions.
+pub fn one_tombstone_appended_twice_is_listed_once() {
+    explore_bounded(
+        "one_tombstone_appended_twice_is_listed_once",
+        Some(3),
+        8,
+        1,
+        |witness| {
+            let mt = Arc::new(memtable());
+            let appenders: Vec<_> = (0..2)
+                .map(|_| {
+                    let mt = Arc::clone(&mt);
+                    loom::thread::spawn(move || mt.delete_range(b"a", b"c", 1))
+                })
+                .collect();
+            for appender in appenders {
+                appender.join().expect("appender");
+            }
+            witness.record();
+            assert_eq!(
+                mt.clone_range_tombstones().len(),
+                1,
+                "one tombstone was listed twice"
+            );
+            assert_eq!(mt.covering_range_tombstone_seq(b"b", u64::MAX), 1);
+        },
+    );
+}
+
+/// T1 for a batch: two tombstones appended as one batch
+/// (`MemTable::delete_ranges`, the way recovery brings them) beside a
+/// single append on another thread. Each of the three is handed a position
+/// of its own, so all are listed, whole, and each deletes what it deletes.
+///
+/// Bound: 3 preemptions.
+pub fn a_batch_beside_an_append_loses_neither() {
+    explore_bounded(
+        "a_batch_beside_an_append_loses_neither",
+        Some(3),
+        8,
+        1,
+        |witness| {
+            let mt = Arc::new(memtable());
+            let batch = {
+                let mt = Arc::clone(&mt);
+                loom::thread::spawn(move || {
+                    mt.delete_ranges(vec![
+                        RangeTombstone::new(b"e".to_vec(), b"g".to_vec(), 1),
+                        RangeTombstone::new(b"a".to_vec(), b"c".to_vec(), 1),
+                    ]);
+                })
+            };
+            let single = {
+                let mt = Arc::clone(&mt);
+                loom::thread::spawn(move || mt.delete_range(b"m", b"p", 2))
+            };
+            batch.join().expect("batch");
+            single.join().expect("single");
+            witness.record();
+            let listed = mt.clone_range_tombstones();
+            assert_eq!(listed.len(), 3, "an append was lost: {listed:?}");
+            assert_eq!(mt.covering_range_tombstone_seq(b"b", u64::MAX), 1);
+            assert_eq!(mt.covering_range_tombstone_seq(b"f", u64::MAX), 1);
+            assert_eq!(mt.covering_range_tombstone_seq(b"n", u64::MAX), 2);
+            assert_eq!(mt.covering_range_tombstone_seq(b"d", u64::MAX), 0);
+        },
+    );
+}
+
+/// Calibration for [`two_appends_at_once_are_both_listed`]: a position
+/// taken by a load and a store. Both appends read the same length and are
+/// handed the same position.
+pub fn a_position_taken_by_a_load_and_a_store_is_handed_out_twice() {
+    explore_bounded(
+        "a_position_taken_by_a_load_and_a_store_is_handed_out_twice",
+        Some(3),
+        2,
+        1,
+        |witness| {
+            let claimed = Arc::new(AtomicUsize::new(0));
+            let appenders: Vec<_> = (0..2)
+                .map(|_| {
+                    let claimed = Arc::clone(&claimed);
+                    loom::thread::spawn(move || {
+                        let position = claimed.load(Ordering::Acquire);
+                        claimed.store(position + 1, Ordering::Release);
+                        position
+                    })
+                })
+                .collect();
+            let positions: Vec<usize> = appenders
+                .into_iter()
+                .map(|appender| appender.join().expect("appender"))
+                .collect();
+            witness.record();
+            assert_ne!(
+                positions[0], positions[1],
+                "two appends were handed one position"
+            );
         },
     );
 }

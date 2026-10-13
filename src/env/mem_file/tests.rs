@@ -284,3 +284,43 @@ proptest! {
         }
     }
 }
+
+#[test]
+fn an_append_at_a_length_lands_only_at_that_length() {
+    let file = file_with(b"0123");
+    assert_eq!(file.append_at(2, &[b"xx"], &Free).unwrap(), AppendAt::Past);
+    assert_eq!(file.append_at(6, &[b"xx"], &Free).unwrap(), AppendAt::Short);
+    assert_eq!(file.to_vec(), b"0123", "neither changed the file");
+    assert_eq!(
+        file.append_at(4, &[b"45", b"67"], &Free).unwrap(),
+        AppendAt::Appended(8)
+    );
+    assert_eq!(file.to_vec(), b"01234567");
+    // The same record again: written already.
+    assert_eq!(
+        file.append_at(4, &[b"4567"], &Free).unwrap(),
+        AppendAt::Past
+    );
+    assert_eq!(file.to_vec(), b"01234567");
+}
+
+/// A second append of one record meets the first between its copy and its
+/// publish. It does not wait: it copies and lands, and the first, whose
+/// publish then fails, finds the file past its offset. The record is there
+/// once.
+#[test]
+fn two_appends_at_one_length_land_once_and_neither_waits() {
+    let file = Arc::new(file_with(b"stamp"));
+    let racing = Arc::clone(&file);
+    between_write_and_publish(move || {
+        assert_eq!(
+            racing.append_at(5, &[b"record"], &Free).unwrap(),
+            AppendAt::Appended(11)
+        );
+    });
+    assert_eq!(
+        file.append_at(5, &[b"record"], &Free).unwrap(),
+        AppendAt::Past
+    );
+    assert_eq!(file.to_vec(), b"stamprecord");
+}

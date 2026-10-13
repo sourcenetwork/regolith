@@ -110,7 +110,7 @@ struct PipelineFreeDuringFlush {
 impl EventListener for PipelineFreeDuringFlush {
     fn on_flush_completed(&self, _: &FlushJobInfo) {
         if let Some(engine) = self.engine.get().and_then(Weak::upgrade) {
-            let free = engine.pipeline.try_lock().is_some();
+            let free = engine.pipeline_is_idle();
             self.free.lock().unwrap().push(free);
         }
     }
@@ -446,4 +446,62 @@ fn a_worker_whose_pass_waits_for_the_gate_holds_back_no_retired_view() {
 #[test]
 fn a_worker_whose_job_waits_for_the_gate_holds_back_no_retired_view() {
     a_worker_waiting_for_the_gate_frees_a_retired_view(GateWait::Job);
+}
+
+struct Wakes(std::sync::atomic::AtomicUsize);
+
+impl std::task::Wake for Wakes {
+    fn wake(self: Arc<Self>) {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// The exclusion a queue's poll took for a unit's body is found held by
+/// that thread's own calls, which go on, and by no other thread.
+#[test]
+fn the_exclusion_held_for_a_units_body_is_held_for_its_thread_alone() {
+    let dir = TempDir::new().unwrap();
+    let engine = RegolithEngine::open(dir.path(), tiny(0)).unwrap();
+    let hold = engine
+        .flusher
+        .hold_or_park(std::task::Waker::noop())
+        .expect("no flush is in flight");
+    // The body's own calls: neither waits, and neither releases it.
+    drop(engine.flusher.flushing().expect("held by this thread"));
+    drop(engine.flusher.try_flushing().expect("held by this thread"));
+    std::thread::scope(|scope| {
+        let other = scope.spawn(|| engine.flusher.try_flushing().is_some());
+        assert!(!other.join().unwrap(), "another thread flushed under it");
+    });
+    drop(hold);
+    assert!(engine.flusher.try_flushing().is_some(), "released");
+}
+
+/// A job that finds a flush in flight parks, and the release of the
+/// exclusion wakes the jobs parked for it.
+#[test]
+fn a_job_that_finds_a_flush_in_flight_is_woken_when_it_ends() {
+    let dir = TempDir::new().unwrap();
+    let engine = RegolithEngine::open(dir.path(), tiny(0)).unwrap();
+    let wakes = Arc::new(Wakes(std::sync::atomic::AtomicUsize::new(0)));
+    let waker = std::task::Waker::from(Arc::clone(&wakes));
+    let count = || wakes.0.load(std::sync::atomic::Ordering::SeqCst);
+    let (taken, is_taken) = mpsc::channel();
+    let (release, released) = mpsc::channel::<()>();
+    std::thread::scope(|scope| {
+        let flusher = &engine.flusher;
+        let flusher = scope.spawn(move || {
+            let flushing = flusher.flushing().unwrap();
+            taken.send(()).unwrap();
+            let _ = released.recv();
+            drop(flushing);
+        });
+        is_taken.recv_timeout(Duration::from_secs(30)).unwrap();
+        assert!(engine.flusher.hold_or_park(&waker).is_none());
+        assert_eq!(count(), 0);
+        drop(release);
+        flusher.join().unwrap();
+    });
+    assert_eq!(count(), 1);
+    assert!(engine.flusher.hold_or_park(&waker).is_some());
 }

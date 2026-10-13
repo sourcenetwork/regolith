@@ -101,8 +101,13 @@ fn a_sealed_table_round_trips_in_every_layout_and_holds_no_plaintext() {
             let lk = LookupKey::from_prefixed(&key(150), u64::MAX);
             let found = reader.get(&lk, &mut Vec::new(), &cache).unwrap();
             assert!(matches!(found, LookupResult::Found { seq: 7, .. }));
-            assert!(reader.may_have_prefix(b"key_", &cache).unwrap());
-            assert!(!reader.may_have_prefix(b"nope", &cache).unwrap());
+            // The first four bytes of these keys stand where a family id
+            // does, so a prefix is the four bytes after them.
+            let extractor = crate::FixedLengthPrefix(4);
+            let held = PrefixProbe::new(&extractor, b"key_0001");
+            assert!(reader.may_have_prefix(&held, &cache).unwrap());
+            let absent = PrefixProbe::new(&extractor, b"key_9999");
+            assert!(!reader.may_have_prefix(&absent, &cache).unwrap());
         }
     }
 }

@@ -357,6 +357,7 @@ WakeAll(G) == [G EXCEPT !.wake = [t \in Threads |-> t \in {G.q[i] : i \in 1..Len
 ----------------------------------------------------------------------------
 \* THE START. Nobody is inside, nobody waits, nothing is owed.
 
+\* The first state: every part of the gate is empty, as listed below.
 Init ==
   \* No pass is in flight.
   /\ shared = {}

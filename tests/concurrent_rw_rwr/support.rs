@@ -96,6 +96,44 @@ impl Rendezvous {
     }
 }
 
+/// Run `stage` on `threads` threads at once; when every one has staged, run
+/// `force` on the calling thread; then run `finish` on each thread with what
+/// it staged. Everything `force` does therefore lands after every thread has
+/// staged and before any of them finishes.
+///
+/// A thread that panics while it stages never arrives, which fails its peers
+/// at the rendezvous after `HANDOFF` instead of hanging them. `finish` may
+/// assert freely: nothing waits on a thread once it runs.
+pub fn forced_between<T>(
+    threads: usize,
+    stage: impl Fn(usize) -> T + Sync,
+    force: impl FnOnce(),
+    finish: impl Fn(usize, T) + Sync,
+) {
+    let staged = Rendezvous::new(threads + 1);
+    std::thread::scope(|scope| {
+        let (staged, stage, finish) = (&staged, &stage, &finish);
+        let workers: Vec<_> = (0..threads)
+            .map(|t| {
+                scope.spawn(move || {
+                    let mine = stage(t);
+                    staged.wait(); // every thread has staged
+                    staged.wait(); // what was forced has landed
+                    finish(t, mine);
+                })
+            })
+            .collect();
+        staged.wait();
+        force();
+        staged.wait();
+        for worker in workers {
+            if let Err(panic) = worker.join() {
+                std::panic::resume_unwind(panic);
+            }
+        }
+    });
+}
+
 /// Violations seen by threads that must keep arriving at a [`Rendezvous`], so
 /// that a failure cannot strand their peers. The test judges them after the
 /// scope has ended.

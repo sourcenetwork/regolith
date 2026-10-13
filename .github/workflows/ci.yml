@@ -73,6 +73,12 @@ jobs:
       - if: runner.os == 'macOS'
         run: brew install coreutils
       - run: just test
+      # `regolith::testing` is behind a feature no default build has. Its
+      # tests run on one host: the checks are plain Rust with nothing a
+      # platform changes, and the build they need is a second build of the
+      # whole library, which the slower hosts would pay for nothing.
+      - if: matrix.os == 'ubuntu-latest'
+        run: just test-testing
 
 
   # Every job below carries a `timeout-minutes` a few times its measured

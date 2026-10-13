@@ -42,6 +42,7 @@
 //! properties; see each one's doc comment for its measured runtime.
 //! Every test here is in the default run. `just mvcc` runs the file on
 //! its own, and `just mvcc-slow` one test at a time with its output shown.
+#![cfg(not(target_arch = "wasm32"))]
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Barrier};

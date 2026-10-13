@@ -5,9 +5,10 @@
 //! [data block 0][data block 1]...[data block n][range_tombstone block][bloom region][index block][footer]
 //! ```
 //!
-//! The bloom region is two blooms concatenated behind a length header:
-//! `[prefix_bloom_len: u64 LE][prefix_bloom_bytes][user_key_bloom_bytes]`.
+//! The bloom region is two blooms concatenated behind a header:
+//! `[prefix_bloom_len: 7 bytes LE][prefix form: u8][prefix_bloom_bytes][user_key_bloom_bytes]`.
 //! A zero length means the file was written without a prefix extractor.
+//! The form says which key the prefix bloom was built from (`prefix_call`).
 //!
 //! Data blocks store **internal keys** - `user_key || !seq || value_type` -
 //! sorted so that newer versions of the same user key appear before older
@@ -70,27 +71,31 @@ use super::block::{Block, BlockBuilder, BlockHandle, RESTART_INTERVAL, decode_en
 use super::block_cache::BlockCache;
 use super::bloom::{BloomFilterBuilder, encode_bloom_block};
 use super::checksum;
-use super::filter_block::FilterBlock;
+use super::filter_block::{FilterBlock, prefix_header, prefix_section};
 use super::index_block::IndexBlock;
-use super::internal_key::{
-    VALUE_TYPE_DELETION, VALUE_TYPE_MERGE, decode_internal_key, user_key_of,
-};
+#[cfg(test)]
+use super::internal_key::user_key_of;
+use super::internal_key::{VALUE_TYPE_DELETION, VALUE_TYPE_MERGE, decode_internal_key};
 use super::io::Landed;
 use super::io::scope;
 use super::io::unit::{UnitKey, Work};
 use super::lookup_key::LookupKey;
+use super::prefix_call::{self, PrefixForm, PrefixProbe};
 use super::range_tombstone::{RangeTombstone, RangeTombstoneSet, table_key_range};
 use super::seal::{Keyring, OVERHEAD};
 use crate::DbSlice;
 use crate::env::{BufferedWriter, Env, ReadFile, WriteMode};
 use crate::options::{CompressionType, PrefixExtractor};
 
+mod block_codec;
+mod deletions;
 mod global_seq;
 mod key_walk;
 mod sealed;
 #[cfg(test)]
 mod size_limit_tests;
 
+pub(crate) use deletions::{BlockCount, DeletionCounter, Deletions};
 pub(crate) use sealed::TableSeal;
 use sealed::{MAGIC_V7, MAGIC_V8, SEALED_FOOTER_SIZE};
 
@@ -395,6 +400,12 @@ pub(crate) struct SsTableMeta {
     /// whose entries carry their own. A compaction rewrites an ingested
     /// table's entries at this sequence, so its outputs have `None`.
     pub(crate) global_seq: Option<u64>,
+    /// The table's deletions and what they hide, counted as it was written.
+    /// `None` for a table whose manifest record carries no counts: one
+    /// written before they existed, restored from a backup, or ingested
+    /// without a read of every entry. The census counts it later
+    /// (`compaction::census`).
+    pub(crate) deletions: Option<Deletions>,
 }
 
 /// A live SSTable: metadata plus an already-opened reader. Held by
@@ -600,6 +611,8 @@ pub(crate) struct SsTableWriteSummary {
     pub(crate) smallest_user_key: Vec<u8>,
     pub(crate) largest_user_key: Vec<u8>,
     pub(crate) num_entries: u64,
+    /// The deletions among the entries written and what they hide.
+    pub(crate) deletions: Deletions,
 }
 
 fn encode_index_block(entries: &[(Vec<u8>, BlockHandle)]) -> Vec<u8> {
@@ -835,6 +848,12 @@ pub(crate) struct SsTableWriter {
     bloom_builder: BloomFilterBuilder,
     prefix_bloom_builder: Option<BloomFilterBuilder>,
     prefix_extractor: Option<Arc<dyn PrefixExtractor>>,
+    /// Which key the prefix bloom's entries are built from, fixed when the
+    /// table is started and recorded in its bloom region.
+    prefix_form: PrefixForm,
+    /// The prefix-bloom entry of the key being added, and of the key before
+    /// it: the two buffers swap, so a run of one prefix is hashed once.
+    prefix_entry: Vec<u8>,
     last_prefix: Option<Vec<u8>>,
     range_tombstones: Vec<RangeTombstone>,
     block_size: usize,
@@ -852,6 +871,8 @@ pub(crate) struct SsTableWriter {
     seal: Option<TableSeal>,
     /// A sealed block's frame, reused from one block to the next.
     frame: Vec<u8>,
+    /// The deletions among the entries added so far.
+    deletions: DeletionCounter,
 }
 
 impl SsTableWriter {
@@ -883,6 +904,8 @@ impl SsTableWriter {
             bloom_builder: BloomFilterBuilder::new(bloom_bits_per_key),
             prefix_bloom_builder,
             prefix_extractor,
+            prefix_form: prefix_call::form_to_write(),
+            prefix_entry: Vec::new(),
             last_prefix: None,
             range_tombstones: Vec::new(),
             block_size,
@@ -897,7 +920,18 @@ impl SsTableWriter {
             metadata_block_size,
             seal,
             frame: Vec::new(),
+            deletions: DeletionCounter::default(),
         })
+    }
+
+    /// Tell the writer the range tombstones this table will carry, before
+    /// its first entry, so the entries they hide are counted as they are
+    /// added. Whoever writes a table knows them up front: a flush has its
+    /// memtable's, a compaction the ones it carries on. Said or not, the
+    /// tombstones themselves are attached with
+    /// [`Self::add_range_tombstone`].
+    pub(crate) fn hidden_by(&mut self, tombstones: Arc<RangeTombstoneSet>) {
+        self.deletions.hidden_by(tombstones);
     }
 
     /// Start writing an SSTable through the standard environment.
@@ -937,10 +971,12 @@ impl SsTableWriter {
     /// Add an `(internal_key, value)` pair. Internal keys must arrive in
     /// sorted order. For tombstones, pass an empty value.
     pub(crate) fn add(&mut self, internal_key: &[u8], value: &[u8]) -> io::Result<()> {
-        let user_key = user_key_of(internal_key);
+        let (user_key, seq, value_type) = decode_internal_key(internal_key);
+        let first_of_key = user_key != self.last_bloom_user_key.as_slice();
+        self.deletions.see(user_key, seq, value_type, first_of_key);
 
         // Only add each distinct user key to the bloom filter once.
-        if user_key != self.last_bloom_user_key.as_slice() {
+        if first_of_key {
             self.bloom_builder.add_key(user_key);
             self.last_bloom_user_key = user_key.to_vec();
 
@@ -948,18 +984,20 @@ impl SsTableWriter {
             // distinct prefixes form contiguous runs. Only hash each
             // distinct prefix once.
             if let (Some(extractor), Some(builder)) = (
-                self.prefix_extractor.as_ref(),
+                self.prefix_extractor.as_deref(),
                 self.prefix_bloom_builder.as_mut(),
-            ) && let Some(prefix) = extractor.extract(user_key)
+            ) && prefix_call::entry(
+                self.prefix_form,
+                extractor,
+                user_key,
+                &mut self.prefix_entry,
+            ) && self.last_prefix.as_deref() != Some(self.prefix_entry.as_slice())
             {
-                let changed = match &self.last_prefix {
-                    Some(p) => p.as_slice() != prefix,
-                    None => true,
-                };
-                if changed {
-                    builder.add_key(prefix);
-                    self.last_prefix = Some(prefix.to_vec());
-                }
+                builder.add_key(&self.prefix_entry);
+                std::mem::swap(
+                    self.last_prefix.get_or_insert_default(),
+                    &mut self.prefix_entry,
+                );
             }
         }
 
@@ -1018,23 +1056,30 @@ impl SsTableWriter {
             )?
         };
 
-        // Bloom region layout:
-        //   [prefix_bloom_len: u64 LE][prefix_bloom_bytes][user_key_bloom_bytes]
+        // Bloom region layout (see `filter_block`):
+        //   [prefix section len: 7 bytes LE][prefix form: u8][prefix section][user_key_bloom_bytes]
         //
-        // A `prefix_bloom_len` of 0 means "no prefix bloom" - the file
-        // was built without a prefix extractor (or there were zero
-        // extractable prefixes). The marker is written unconditionally,
-        // so the reader needs no separate case for it.
-        let prefix_bloom_data = match self.prefix_bloom_builder.take() {
-            Some(builder) => encode_bloom_block(&builder.build()),
-            None => Vec::new(),
+        // The prefix section names the extractor that built the prefix
+        // bloom, then holds the bloom. A length of 0 means "no prefix
+        // bloom" - the file was built without a prefix extractor. The
+        // header is written unconditionally, so the reader needs no
+        // separate case for it.
+        let prefix_bloom_data = match (self.prefix_bloom_builder.take(), &self.prefix_extractor) {
+            (Some(builder), Some(extractor)) => prefix_section(
+                self.prefix_form,
+                extractor.name(),
+                encode_bloom_block(&builder.build()),
+            ),
+            _ => Vec::new(),
         };
         let user_bloom = self.bloom_builder.build();
         let user_bloom_data = encode_bloom_block(&user_bloom);
 
-        let mut bloom_region =
-            Vec::with_capacity(8 + prefix_bloom_data.len() + user_bloom_data.len());
-        bloom_region.extend_from_slice(&(prefix_bloom_data.len() as u64).to_le_bytes());
+        let prefix_header = prefix_header(self.prefix_form, prefix_bloom_data.len())?;
+        let mut bloom_region = Vec::with_capacity(
+            prefix_header.len() + prefix_bloom_data.len() + user_bloom_data.len(),
+        );
+        bloom_region.extend_from_slice(&prefix_header);
         bloom_region.extend_from_slice(&prefix_bloom_data);
         bloom_region.extend_from_slice(&user_bloom_data);
         let bloom_offset = self.current_offset;
@@ -1146,6 +1191,7 @@ impl SsTableWriter {
             smallest_user_key,
             largest_user_key,
             num_entries: self.num_entries,
+            deletions: self.deletions.counted(),
         }))
     }
 
@@ -1157,7 +1203,8 @@ impl SsTableWriter {
 
         let block_offset = self.current_offset;
 
-        let (codec_byte, payload) = match self.compression {
+        let (codec_byte, payload) = match block_codec::block_codec(self.compression, raw_data.len())
+        {
             CompressionType::None => (COMPRESSION_NONE, raw_data.clone()),
             CompressionType::Lz4 => (COMPRESSION_LZ4, lz4_flex::compress_prepend_size(&raw_data)),
             CompressionType::Snappy => {
@@ -1917,17 +1964,28 @@ impl SsTableReader {
             .transpose()
     }
 
-    /// Whether this SSTable *might* contain a user key whose prefix
-    /// equals `prefix`. Returns `true` conservatively when the file
-    /// was built without a prefix bloom (no negative information
-    /// available). Returns `false` only when the prefix bloom is
-    /// present and positively rules the prefix out.
+    /// Whether this SSTable *might* contain a key of the prefix seek
+    /// `probe` is for, asked in the form this table's prefix bloom was
+    /// built in. Returns `true` conservatively when the file was built
+    /// without a prefix bloom (no negative information available).
+    /// Returns `false` only when the prefix bloom is present and
+    /// positively rules the prefix out.
     ///
     /// Fallible because the filter region may live in the block cache
     /// and need re-reading; under [`MetadataPolicy::Pinned`] it cannot
     /// fail.
-    pub(crate) fn may_have_prefix(&self, prefix: &[u8], cache: &BlockCache) -> io::Result<bool> {
-        Ok(self.filter(cache)?.may_have_prefix(prefix))
+    pub(crate) fn may_have_prefix(
+        &self,
+        probe: &PrefixProbe,
+        cache: &BlockCache,
+    ) -> io::Result<bool> {
+        Ok(self.filter(cache)?.may_have_prefix(probe))
+    }
+
+    /// The form of this table's prefix bloom, when it has one.
+    #[cfg(test)]
+    pub(crate) fn prefix_form(&self, cache: &BlockCache) -> io::Result<Option<PrefixForm>> {
+        Ok(self.filter(cache)?.prefix_form())
     }
 
     /// Largest seq of any range tombstone in this SSTable that covers
@@ -1946,6 +2004,18 @@ impl SsTableReader {
     /// RT coverage during scans.
     pub(crate) fn range_tombstones(&self) -> &[RangeTombstone] {
         self.range_tombstones.as_slice()
+    }
+
+    /// Whether one of this table's range tombstones covers every key of
+    /// `[first, last]`.
+    pub(crate) fn range_tombstone_over(&self, first: &[u8], last: &[u8]) -> bool {
+        self.range_tombstones.covers_whole(first, last)
+    }
+
+    /// This table's range tombstones that reach into `[start, end)`, each
+    /// cut to it.
+    pub(crate) fn range_tombstones_within(&self, start: &[u8], end: &[u8]) -> Vec<RangeTombstone> {
+        self.range_tombstones.clipped_overlaps(start, end)
     }
 
     /// Point lookup for `user_key` visible at `snapshot_seq`.
@@ -2464,6 +2534,7 @@ mod tests {
         let mut key_buf = Vec::new();
         reader.get_size(&lk, &mut key_buf, cache, None)
     }
+    use crate::column_family::prefix_key;
     use crate::engine::internal_key::{VALUE_TYPE_VALUE, encode_internal_key};
     use tempfile::TempDir;
 
@@ -2645,44 +2716,59 @@ mod tests {
         assert_eq!(reader.covering_range_tombstone_seq(b"nn", 100), 7);
     }
 
+    /// A table of three tenants in family 1 and one in family 2, written
+    /// with a four-byte extractor.
+    fn prefix_table(path: &Path) -> SsTableReader {
+        let extractor: Arc<dyn PrefixExtractor> = Arc::new(crate::options::FixedLengthPrefix(4));
+        let mut writer = SsTableWriter::new(
+            path,
+            4096,
+            10,
+            CompressionType::None,
+            Some(extractor),
+            false,
+            4096,
+        )
+        .unwrap();
+        for (family, tenant) in [(1, "aaaa"), (1, "bbbb"), (1, "cccc"), (2, "dddd")] {
+            for i in 0..4 {
+                let key = prefix_key(family, format!("{tenant}:key{i}").as_bytes());
+                writer.add(&ik(&key, 1), b"v").unwrap();
+            }
+        }
+        writer.finish().unwrap().unwrap();
+        SsTableReader::open(path, 1).unwrap()
+    }
+
+    /// Whether `reader` might hold a key of `family` that starts with the
+    /// caller's `prefix`, by its prefix bloom and a four-byte extractor.
+    fn might_hold(reader: &SsTableReader, cache: &BlockCache, family: u32, prefix: &[u8]) -> bool {
+        let prefixed = prefix_key(family, prefix);
+        let probe = PrefixProbe::new(&crate::options::FixedLengthPrefix(4), &prefixed);
+        reader.may_have_prefix(&probe, cache).unwrap()
+    }
+
     #[test]
     fn test_sstable_prefix_bloom_roundtrip() {
         let dir = TempDir::new().unwrap();
-        let path = dir.path().join("prefix.sst");
         let cache = BlockCache::new(1024 * 1024);
-        let extractor: Arc<dyn PrefixExtractor> = Arc::new(crate::options::FixedLengthPrefix(4));
+        let reader = prefix_table(&dir.path().join("prefix.sst"));
+        assert_eq!(reader.prefix_form(&cache).unwrap(), Some(PrefixForm::Named));
 
-        {
-            let mut writer = SsTableWriter::new(
-                &path,
-                4096,
-                10,
-                CompressionType::None,
-                Some(extractor.clone()),
-                false,
-                4096,
-            )
-            .unwrap();
-            for tenant in &["aaaa", "bbbb", "cccc"] {
-                for i in 0..4 {
-                    let user_key = format!("{}:key{}", tenant, i);
-                    writer.add(&ik(user_key.as_bytes(), 1), b"v").unwrap();
-                }
-            }
-            writer.finish().unwrap().unwrap();
-        }
-
-        let reader = SsTableReader::open(&path, 1).unwrap();
         // Present prefixes
-        assert!(reader.may_have_prefix(b"aaaa", &cache).unwrap());
-        assert!(reader.may_have_prefix(b"bbbb", &cache).unwrap());
-        assert!(reader.may_have_prefix(b"cccc", &cache).unwrap());
+        assert!(might_hold(&reader, &cache, 1, b"aaaa"));
+        assert!(might_hold(&reader, &cache, 1, b"bbbb"));
+        assert!(might_hold(&reader, &cache, 1, b"cccc:key"));
+        assert!(might_hold(&reader, &cache, 2, b"dddd"));
+        // A prefix one family holds is not one the other holds.
+        assert!(!might_hold(&reader, &cache, 2, b"aaaa"));
+        assert!(!might_hold(&reader, &cache, 1, b"dddd"));
         // Absent prefixes (with 10 bits/key the FP rate is ~1%; these
         // specific strings should all be rejected).
         let mut false_positives = 0;
         for i in 0..200u32 {
             let p = format!("zz{:02}", i);
-            if reader.may_have_prefix(p.as_bytes(), &cache).unwrap() {
+            if might_hold(&reader, &cache, 1, p.as_bytes()) {
                 false_positives += 1;
             }
         }
@@ -2694,12 +2780,61 @@ mod tests {
 
         // Point lookups still work - user-key bloom is independent.
         assert_eq!(
-            probe_get(&reader, b"bbbb:key2", u64::MAX, &cache).unwrap(),
+            probe_get(&reader, &prefix_key(1, b"bbbb:key2"), u64::MAX, &cache).unwrap(),
             LookupResult::Found {
                 seq: 1,
                 value: DbSlice::from_vec(b"v".to_vec())
             }
         );
+    }
+
+    /// A table in a form that names no extractor says so, and a seek reads
+    /// it without its prefix filter, whatever its bloom holds.
+    #[test]
+    fn a_table_that_names_no_extractor_is_not_ruled_out() {
+        let dir = TempDir::new().unwrap();
+        let cache = BlockCache::new(1024 * 1024);
+        for (name, form) in [
+            ("engine.sst", PrefixForm::EngineKey),
+            ("caller.sst", PrefixForm::CallerKey),
+        ] {
+            let path = dir.path().join(name);
+            let reader = prefix_call::writing_form(form, || prefix_table(&path));
+            assert_eq!(reader.prefix_form(&cache).unwrap(), Some(form));
+            assert!(might_hold(&reader, &cache, 1, b"aaaa"));
+            assert!(might_hold(&reader, &cache, 1, b"zzzz"));
+            assert!(might_hold(&reader, &cache, 3, b"aaaa"));
+        }
+    }
+
+    /// With an extractor that carves nothing out of any key, the table's
+    /// prefix bloom holds no entry and rules nothing out.
+    #[test]
+    fn a_prefix_bloom_with_no_entry_rules_nothing_out() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("short.sst");
+        let cache = BlockCache::new(1024 * 1024);
+        let extractor: Arc<dyn PrefixExtractor> = Arc::new(crate::options::FixedLengthPrefix(4));
+        let mut writer = SsTableWriter::new(
+            &path,
+            4096,
+            10,
+            CompressionType::None,
+            Some(extractor),
+            false,
+            4096,
+        )
+        .unwrap();
+        // One of the database's own entries, and a key shorter than four.
+        writer
+            .add(&ik(&prefix_key(0, b"name:family"), 1), b"v")
+            .unwrap();
+        writer.add(&ik(&prefix_key(1, b"abc"), 1), b"v").unwrap();
+        writer.finish().unwrap().unwrap();
+
+        let reader = SsTableReader::open(&path, 1).unwrap();
+        assert!(might_hold(&reader, &cache, 1, b"zzzz"));
+        assert!(might_hold(&reader, &cache, 1, b"abc"));
     }
 
     #[test]
@@ -2722,9 +2857,10 @@ mod tests {
         let reader = SsTableReader::open(&path, 1).unwrap();
         let cache = BlockCache::new(1024 * 1024);
         // Every query comes back `true`: no negative information.
-        assert!(reader.may_have_prefix(b"aaaa", &cache).unwrap());
-        assert!(reader.may_have_prefix(b"zzzz", &cache).unwrap());
-        assert!(reader.may_have_prefix(b"anything", &cache).unwrap());
+        assert_eq!(reader.prefix_form(&cache).unwrap(), None);
+        assert!(might_hold(&reader, &cache, 1, b"aaaa"));
+        assert!(might_hold(&reader, &cache, 1, b"zzzz"));
+        assert!(might_hold(&reader, &cache, 9, b"anything"));
     }
 
     // ── filename / misc helpers ─────────────────────────────────

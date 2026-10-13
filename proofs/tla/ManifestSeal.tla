@@ -56,6 +56,7 @@
 \* Naturals for counting, Sequences for the log of batches.
 EXTENDS Naturals, Sequences
 
+\* The knobs of a run. Each configuration file (MC_ManifestSeal_*.cfg) gives them values.
 CONSTANTS
   \* The most batches the manifest holds at once: bounds the model.
   MaxBatches,
@@ -67,6 +68,8 @@ ASSUME MaxBatches \in Nat \ {0}
 \* Only the design and the two defects.
 ASSUME Mutant \in {"none", "TagOnlyStop", "TagOnlyRefuse"}
 
+\* The state: everything that changes from one step to the next. Each line says what the variable
+\* stands for in the real program.
 VARIABLES
   \* The batches as written, oldest first. Each is [key |-> k]: the key id
   \* it was sealed under, which the engine writes in clear beside the

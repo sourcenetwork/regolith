@@ -13,10 +13,8 @@
 //!
 //! # Merge operators
 //!
-//! [`check_touches`] checks the other law an operator carries: that
-//! [`MergeOperator::touches`] survives the early folding below.
-//!
-//! [`check_merge_operator`] and [`check_touches`] are the two checks.
+//! [`check_merge_operator`] and [`check_touches`] are the two checks, one for
+//! each law a [`MergeOperator`] carries.
 //!
 //! [`check_merge_operator`] checks the law that lets compaction fold operands
 //! early. For any run of operands, cut into contiguous groups, each group
@@ -68,6 +66,47 @@
 //! Without it a transaction that read some parts with
 //! [`Transaction::get_parts`](crate::Transaction::get_parts) could commit
 //! over a part a folded operand changed.
+//!
+//! ```
+//! use regolith::MergeOperator;
+//! use regolith::testing::check_touches;
+//! use regolith::testing::proptest::collection::vec;
+//! use regolith::testing::proptest::prelude::*;
+//!
+//! /// A value of two one-byte parts. An operand is `[part, delta]`: it adds
+//! /// `delta` to one part, and touches that part only.
+//! struct Fields;
+//!
+//! impl MergeOperator for Fields {
+//!     fn name(&self) -> &'static str {
+//!         "fields"
+//!     }
+//!
+//!     fn full_merge(&self, _key: &[u8], base: Option<&[u8]>, operands: &[&[u8]]) -> Option<Vec<u8>> {
+//!         let mut fields: [u8; 2] = base.map_or(Some([0; 2]), |base| base.try_into().ok())?;
+//!         for &operand in operands {
+//!             let &[part, delta] = operand else { return None };
+//!             let field = fields.get_mut(usize::from(part))?;
+//!             *field = field.wrapping_add(delta);
+//!         }
+//!         Some(fields.to_vec())
+//!     }
+//!
+//!     fn partial_merge(&self, _key: &[u8], left: &[u8], right: &[u8]) -> Option<Vec<u8>> {
+//!         let (&[part, a], &[other, b]) = (left, right) else { return None };
+//!         (part == other).then(|| vec![part, a.wrapping_add(b)])
+//!     }
+//!
+//!     fn touches(&self, _key: &[u8], operand: &[u8], parts: &[u32]) -> bool {
+//!         operand.first().is_none_or(|part| parts.contains(&u32::from(*part)))
+//!     }
+//! }
+//!
+//! let operands = || (0u8..2, any::<u8>()).prop_map(|(part, delta)| vec![part, delta]);
+//! let checked = check_touches(&Fields, any::<Vec<u8>>(), operands(), vec(0u32..2, 0..=2))?;
+//! assert!(checked.folds > 0, "no two operands folded, so the law was never tested");
+//! # Ok::<(), String>(())
+//! ```
 
 use std::cell::Cell;
 
@@ -105,6 +144,12 @@ pub struct MergeCheck {
 /// as an operand and as a stored value. A run the operator declines when its
 /// operands are applied one at a time is rejected as a generation fault, and a
 /// strategy that makes too many of them fails the check.
+///
+/// `keys` generates the keys the operator is handed, exactly as generated:
+/// the database hands an operator the key its caller wrote, with nothing in
+/// front of it. An operator that dispatches on its key is checked one value
+/// shape at a time, with `keys` generating the keys of the shape `bases` and
+/// `operands` belong to.
 ///
 /// Failures name the shrunk run that broke the law. The `PROPTEST_CASES`
 /// environment variable sets the number of runs, as for any property test.
@@ -174,8 +219,9 @@ pub struct TouchesCheck {
 ///
 /// `parts` generates the part sets a reader names (they are sorted and
 /// deduplicated before use), and `operands` the operands the operator
-/// accepts. Failures name the shrunk case. The `PROPTEST_CASES` environment
-/// variable sets the number of cases.
+/// accepts. `keys` generates the keys the operator is handed, as for
+/// [`check_merge_operator`]. Failures name the shrunk case. The
+/// `PROPTEST_CASES` environment variable sets the number of cases.
 pub fn check_touches<O: MergeOperator + ?Sized>(
     operator: &O,
     keys: impl Strategy<Value = Vec<u8>>,
@@ -540,5 +586,84 @@ mod tests {
         )
         .unwrap();
         assert_eq!(checked.folds, 0);
+    }
+
+    /// Dispatches on the first byte of the key, as an operator that serves
+    /// several value shapes does: a key under `c` holds a counter, and any
+    /// other key is not its own, so it declines. Records every key handed
+    /// to it.
+    #[derive(Default)]
+    struct ByKey {
+        seen: std::sync::Mutex<Vec<Vec<u8>>>,
+    }
+
+    impl ByKey {
+        fn serves(&self, key: &[u8]) -> Option<()> {
+            self.seen.lock().unwrap().push(key.to_vec());
+            key.starts_with(b"c").then_some(())
+        }
+    }
+
+    impl MergeOperator for ByKey {
+        fn name(&self) -> &'static str {
+            "by-key"
+        }
+
+        fn full_merge(
+            &self,
+            key: &[u8],
+            base: Option<&[u8]>,
+            operands: &[&[u8]],
+        ) -> Option<Vec<u8>> {
+            self.serves(key)?;
+            let mut total = base.map_or(Some(0), counter)?;
+            for operand in operands {
+                total = total.wrapping_add(counter(operand)?);
+            }
+            Some(total.to_be_bytes().to_vec())
+        }
+
+        fn partial_merge(&self, key: &[u8], left: &[u8], right: &[u8]) -> Option<Vec<u8>> {
+            self.serves(key)?;
+            let folded = counter(left)?.wrapping_add(counter(right)?);
+            Some(folded.to_be_bytes().to_vec())
+        }
+
+        fn touches(&self, key: &[u8], _: &[u8], _: &[u32]) -> bool {
+            self.serves(key);
+            true
+        }
+    }
+
+    /// Keys of `shape`: the byte, then up to three more.
+    fn keys_under(shape: u8) -> impl Strategy<Value = Vec<u8>> {
+        vec(any::<u8>(), 0..4).prop_map(move |rest| [&[shape][..], &rest].concat())
+    }
+
+    /// The checks hand the operator the keys their strategy generates and
+    /// nothing in front of them, as the database hands it the keys its
+    /// callers wrote. An operator that dispatches on its key is therefore
+    /// checked on the keys it meets in the database.
+    #[test]
+    fn the_checks_hand_the_operator_the_keys_the_strategy_generates() {
+        let op = ByKey::default();
+        let merged = check_merge_operator(&op, keys_under(b'c'), counters(), counters()).unwrap();
+        assert!(merged.folds > 0);
+        let touched = check_touches(&op, keys_under(b'c'), counters(), part_sets()).unwrap();
+        assert!(touched.folds > 0);
+        let seen = op.seen.lock().unwrap();
+        assert!(!seen.is_empty());
+        for key in seen.iter() {
+            assert!(key.starts_with(b"c") && key.len() <= 4, "{key:?}");
+        }
+    }
+
+    /// Keys the operator does not serve are a fault of the strategy: the
+    /// check fails instead of passing on runs that tested nothing.
+    #[test]
+    fn keys_the_operator_does_not_serve_fail_the_check() {
+        let op = ByKey::default();
+        let err = check_merge_operator(&op, keys_under(b'x'), counters(), counters()).unwrap_err();
+        assert!(err.contains("gave up"), "{err}");
     }
 }

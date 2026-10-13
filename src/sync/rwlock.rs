@@ -90,7 +90,9 @@ impl<T: ?Sized> RwLock<T> {
             .then(|| RwLockUpgradableReadGuard { lock: self })
     }
 
-    /// Waits to share the lock.
+    /// Waits to share the lock. Uncontended, the first poll is one atomic
+    /// read-modify-write. Contended, it is lock-free, not wait-free: see
+    /// [Progress](super#progress).
     pub fn read(&self) -> Read<'_, T> {
         Read {
             lock: self,
@@ -98,7 +100,9 @@ impl<T: ?Sized> RwLock<T> {
         }
     }
 
-    /// Waits to hold the lock alone.
+    /// Waits to hold the lock alone. Uncontended, the first poll is one atomic
+    /// read-modify-write. Contended, it is lock-free, not wait-free: see
+    /// [Progress](super#progress).
     pub fn write(&self) -> Write<'_, T> {
         Write {
             lock: self,
@@ -116,7 +120,8 @@ impl<T: ?Sized> RwLock<T> {
         }
     }
 
-    /// Waits for the upgradable read.
+    /// Waits for the upgradable read. It makes the progress
+    /// [`read`](Self::read) does.
     pub fn upgradable_read(&self) -> UpgradableRead<'_, T> {
         UpgradableRead {
             lock: self,
@@ -143,6 +148,11 @@ impl<T: ?Sized> fmt::Debug for RwLock<T> {
 }
 
 /// Shared access to a [`RwLock`]'s value; releases on drop.
+///
+/// The release is one atomic read-modify-write when no waiter needs telling.
+/// Otherwise it is lock-free, not wait-free: it returns after one pass over
+/// the queue, plus at most one for each operation of another thread that
+/// lands on the queue meanwhile (see [Progress](super#progress)).
 #[must_use = "dropping the guard releases the lock at once"]
 pub struct RwLockReadGuard<'a, T: ?Sized> {
     lock: &'a RwLock<T>,
@@ -170,7 +180,8 @@ impl<T: ?Sized + fmt::Debug> fmt::Debug for RwLockReadGuard<'_, T> {
     }
 }
 
-/// Exclusive access to a [`RwLock`]'s value; releases on drop.
+/// Exclusive access to a [`RwLock`]'s value; releases on drop. The release
+/// makes the progress [`RwLockReadGuard`]'s does.
 #[must_use = "dropping the guard releases the lock at once"]
 pub struct RwLockWriteGuard<'a, T: ?Sized> {
     lock: &'a RwLock<T>,
@@ -253,7 +264,8 @@ impl<T: ?Sized + fmt::Debug> fmt::Debug for OwnedRwLockWriteGuard<T> {
 }
 
 /// The upgradable read of a [`RwLock`]: shared access that can become
-/// exclusive without a writer getting in between. Releases on drop.
+/// exclusive without a writer getting in between. Releases on drop, with
+/// the progress [`RwLockReadGuard`]'s release makes.
 #[must_use = "dropping the guard releases the lock at once"]
 pub struct RwLockUpgradableReadGuard<'a, T: ?Sized> {
     lock: &'a RwLock<T>,

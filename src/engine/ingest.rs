@@ -9,8 +9,8 @@
 //! key, which is what lets every entry read at one sequence.
 //!
 //! **Installing** runs holding the compaction gate alone, which keeps every
-//! level below L0 as it is and lets L0 only grow, and takes the commit
-//! pipeline's mutex only for what has to be ordered against commits:
+//! level below L0 as it is and lets L0 only grow, and does in an ordered
+//! unit of the commit pipeline only what has to be ordered against commits:
 //!
 //! 1. flush the memtables holding a key of the table's range, so writers
 //!    wait for a flush only when there is an overlap;
@@ -27,16 +27,17 @@
 //!    read at (`SsTableMeta::global_seq`), and raises the last sequence;
 //! 6. publish the sequence on the read horizon.
 //!
-//! A commit draws and publishes under the same mutex, so from the draw to
-//! the publish the sequence is a pending slot no publication passes
+//! The install draws and publishes in one ordered step of the commit
+//! pipeline, so from the draw to the publish the sequence is a pending slot
+//! no publication passes
 //! (IngestPublication.tla, `RepeatableSnapshot`; Lean
 //! `repeatable_snapshot`). A snapshot taken before the publish reads none of
 //! the table, whose entries read at the new sequence, and one taken after
 //! reads all of it.
 //!
-//! Which L0 tables hold a key of the range is read before the mutex is
-//! taken, since it can read a block; under the mutex only a table that
-//! arrived in L0 since then is probed.
+//! Which L0 tables hold a key of the range is read before the ordered step,
+//! since it can read a block; inside the step only a table that arrived in
+//! L0 since then is probed.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -47,14 +48,16 @@ use crate::portability::{AtomicU64, Ordering};
 use crate::sst_file_writer::IngestOptions;
 
 use super::block_cache::BlockCache;
-use super::compaction_gate::Exclusive;
+use super::commit::{Help, Needs, OrderedTicket};
 use super::internal_key::decode_internal_key;
 use super::lookup_key::with_key_scratch;
 use super::manifest::{MAX_LEVELS, Version, VersionEdit, overlapping};
 use super::memtable::MemTable;
 use super::pending_outputs::PendingOutputs;
 use super::range_tombstone::table_key_range;
-use super::sstable::{LiveSst, SsTableMeta, SsTableReader, SsTableWriter, sst_filename};
+use super::sstable::{
+    DeletionCounter, Deletions, LiveSst, SsTableMeta, SsTableReader, SsTableWriter, sst_filename,
+};
 use super::{RegolithEngine, event_listener};
 
 /// Block-cache ids for tables being validated, handed out downward from the
@@ -78,6 +81,8 @@ struct StagedTable {
     largest: Vec<u8>,
     file_size: u64,
     num_entries: u64,
+    /// The table's point deletions, counted while it was validated.
+    deletions: Deletions,
     /// The column families the table holds keys of, ascending, each once.
     /// The install fences them in the ordered step, as a write's keys are.
     families: Vec<u32>,
@@ -119,6 +124,31 @@ impl Staged {
     pub(crate) fn is_empty(&self) -> bool {
         self.tables.is_empty()
     }
+
+    /// The install of what was staged, before any of it began
+    /// ([`RegolithEngine::ingest_install_advance`]).
+    pub(crate) fn into_install(self, options: IngestOptions) -> Install {
+        Install {
+            tables: self.tables.into_iter(),
+            options,
+            _probes: self.probes,
+            current: None,
+        }
+    }
+}
+
+/// An install under way: the tables still to install, and the one whose
+/// ordered unit is in the ring. A job a queue's poll runs keeps this while
+/// it is parked at a unit's entry. Dropped, it unlinks the staged files not
+/// installed and lets the validation reads go.
+pub(crate) struct Install {
+    tables: std::vec::IntoIter<StagedTable>,
+    options: IngestOptions,
+    /// The validation reads, let go when the install ends, by any path.
+    _probes: Option<ProbeIds>,
+    /// The table being installed: the path the caller handed in, and its
+    /// unit.
+    current: Option<(PathBuf, OrderedTicket<IngestedTable>)>,
 }
 
 impl ProbeIds {
@@ -143,23 +173,29 @@ impl RegolithEngine {
     ///
     /// Each file is copied into the table directory, or hard-linked when
     /// `move_files` is set and the environment has hard links, and validated,
-    /// with no lock and no gate held. [`Self::ingest_install`] then installs
+    /// with no lock and no gate held. [`Self::ingest_install_advance`] then installs
     /// what this staged.
+    ///
+    /// `None` when a queue's poll parked: the file ids are taken in one
+    /// section of the version store's step, before anything is copied, and
+    /// a poll that finds the step held by another thread parks there with
+    /// nothing staged.
     pub(crate) fn ingest_stage<F>(
         &self,
         files: &[PathBuf],
         opts: &IngestOptions,
-        mut validate_user_key: F,
-    ) -> io::Result<Staged>
+        validate_user_key: &mut F,
+        help: Help<'_>,
+    ) -> io::Result<Option<Staged>>
     where
         F: FnMut(&[u8]) -> io::Result<()>,
     {
         self.ensure_writable()?;
         if files.is_empty() {
-            return Ok(Staged {
+            return Ok(Some(Staged {
                 tables: Vec::new(),
                 probes: None,
-            });
+            }));
         }
         if opts.snapshot_consistency && self.oldest_live_seq() != u64::MAX {
             return Err(io::Error::other(
@@ -169,18 +205,25 @@ impl RegolithEngine {
             ));
         }
 
+        let Some(kept) = self.keep(Needs::VERSIONS, help) else {
+            return Ok(None);
+        };
+        let first_id = self.versions.take_file_ids(files.len() as u64);
+        self.unkeep(kept);
+        let first_id = first_id?;
+
         let mut probes = ProbeIds {
             cache: Arc::clone(&self.cache),
             ids: Vec::with_capacity(files.len()),
         };
         let mut tables = Vec::with_capacity(files.len());
-        for path in files {
-            tables.push(self.stage(path, opts, &mut validate_user_key, &mut probes)?);
+        for (path, file_id) in files.iter().zip(first_id..) {
+            tables.push(self.stage(path, file_id, opts, validate_user_key, &mut probes)?);
         }
-        Ok(Staged {
+        Ok(Some(Staged {
             tables,
             probes: Some(probes),
-        })
+        }))
     }
 
     /// The second half of a bulk ingest: install what
@@ -199,42 +242,81 @@ impl RegolithEngine {
     /// installed; a source whose removal fails is left and logged, since
     /// the ingest itself succeeded. A crash between the install and the
     /// removal leaves it too.
-    pub(crate) fn ingest_install(
+    ///
+    /// The caller holds the gate until the install ends. `Ok(false)` when a
+    /// queue's poll parked at the entry of a table's unit: the next call
+    /// goes on with that table. A call that waits (`Help::Wait`) never gets
+    /// `Ok(false)`.
+    pub(crate) fn ingest_install_advance(
         &self,
-        _gate: &Exclusive,
-        staged: Staged,
-        opts: &IngestOptions,
-    ) -> io::Result<()> {
-        // The validation reads are let go when this returns, by any path.
-        let Staged {
-            tables,
-            probes: _probes,
-        } = staged;
+        install: &mut Install,
+        help: Help<'_>,
+    ) -> io::Result<bool> {
         self.ensure_writable()?;
-        for table in tables {
-            let source = table.source.clone();
-            let installed = self.install(table, opts)?;
-            self.announce(&source, &installed);
-            if opts.move_files
-                && let Err(e) = crate::env::remove_file_and_sync_parent(&*self.env, &source)
-            {
-                tracing::warn!(
-                    source = %source.display(),
-                    error = %e,
-                    "could not remove an ingested file's source"
-                );
+        loop {
+            if let Some((source, ticket)) = install.current.take() {
+                let Some(installed) = self.ordered_advance(&ticket, help) else {
+                    install.current = Some((source, ticket));
+                    return Ok(false);
+                };
+                self.installed(&source, &installed?, &install.options);
             }
+            let Some(table) = install.tables.next() else {
+                break;
+            };
+            let source = table.source.clone();
+            let unit = self.install_unit(table, &install.options)?;
+            install.current = Some((source, unit));
         }
         self.compaction.notify();
-        Ok(())
+        Ok(true)
     }
 
-    /// Copy or link `source` into the table directory under a fresh id,
-    /// sync it, and validate the copy. Takes no lock beyond the id
-    /// allocation's.
+    /// See the table whose unit is in the ring through, waiting on this
+    /// thread: what an install does when the job that ran it is settled
+    /// without being run to its end. A unit in the ring is run by whichever
+    /// thread reaches it, so the table would be installed after its caller
+    /// had been told the ingest failed. `true` when that table went in and
+    /// it was the last: the ingest is complete after all.
+    pub(crate) fn ingest_install_settle(&self, install: &mut Install) -> bool {
+        let Some((source, ticket)) = install.current.take() else {
+            return false;
+        };
+        if !ticket.entered() {
+            return false;
+        }
+        let Some(Ok(installed)) = self.ordered_advance(&ticket, Help::Wait) else {
+            return false;
+        };
+        self.installed(&source, &installed, &install.options);
+        let complete = install.tables.len() == 0;
+        if complete {
+            self.compaction.notify();
+        }
+        complete
+    }
+
+    /// What follows a table's install: its listeners are told, and its
+    /// source removed when the caller let the file move.
+    fn installed(&self, source: &Path, installed: &IngestedTable, opts: &IngestOptions) {
+        self.announce(source, installed);
+        if opts.move_files
+            && let Err(e) = crate::env::remove_file_and_sync_parent(&*self.env, source)
+        {
+            tracing::warn!(
+                source = %source.display(),
+                error = %e,
+                "could not remove an ingested file's source"
+            );
+        }
+    }
+
+    /// Copy or link `source` into the table directory under `file_id`,
+    /// sync it, and validate the copy. Takes no lock.
     fn stage<F>(
         &self,
         source: &Path,
+        file_id: u64,
         opts: &IngestOptions,
         validate_user_key: &mut F,
         probes: &mut ProbeIds,
@@ -247,12 +329,6 @@ impl RegolithEngine {
                 return e;
             }
             io::Error::new(e.kind(), format!("ingest: {}: {e}", source.display()))
-        };
-        let file_id = {
-            let mut versions = self.versions.lock();
-            let id = versions.current().next_file_id;
-            versions.apply(&[VersionEdit::SetNextFileId(id + 1)])?;
-            id
         };
         let path = self.sst_dir.join(sst_filename(file_id));
         let mut pending = PendingOutputs::new(Arc::clone(&self.env));
@@ -297,7 +373,7 @@ impl RegolithEngine {
         )
         .map_err(named)?;
         let mut families = Vec::new();
-        let (points, num_entries) = self
+        let (points, num_entries, deletions) = self
             .validate_entries(&reader, validate_user_key, &mut families)
             .map_err(named)?;
         let tombstones = reader.range_tombstones();
@@ -337,6 +413,7 @@ impl RegolithEngine {
             largest,
             file_size,
             num_entries,
+            deletions,
             families,
             pending,
         })
@@ -399,23 +476,30 @@ impl RegolithEngine {
 
     /// Stream every entry of a staged table once, holding one data block:
     /// sizes, column families, and strictly ascending user keys. Returns
-    /// the first and last user key, and the entry count.
+    /// the first and last user key, the entry count, and the table's
+    /// deletions, counted here because every entry is in hand anyway.
     #[allow(clippy::type_complexity)]
     fn validate_entries<F>(
         &self,
         reader: &SsTableReader,
         validate_user_key: &mut F,
         families: &mut Vec<u32>,
-    ) -> io::Result<(Option<(Vec<u8>, Vec<u8>)>, u64)>
+    ) -> io::Result<(Option<(Vec<u8>, Vec<u8>)>, u64, Deletions)>
     where
         F: FnMut(&[u8]) -> io::Result<()>,
     {
         let mut first: Option<Vec<u8>> = None;
         let mut last: Vec<u8> = Vec::new();
         let mut count = 0u64;
+        // Each key once and every entry at the one sequence the ingest
+        // draws, so nothing in the table hides anything else in it: the
+        // deletions are the point deletions, and their sequence is filled in
+        // at install.
+        let mut deletions = DeletionCounter::default();
         let mut entries = reader.iter_internal_stream(&self.cache)?;
         while let Some((ik, value)) = entries.next_entry()? {
-            let (user_key, _, _) = decode_internal_key(&ik);
+            let (user_key, _, value_type) = decode_internal_key(&ik);
+            deletions.see(user_key, 0, value_type, true);
             self.validate_prefixed_key_size(user_key)?;
             self.validate_value_size(&value)?;
             validate_user_key(user_key).map_err(|e| {
@@ -441,26 +525,48 @@ impl RegolithEngine {
             last.extend_from_slice(user_key);
             count += 1;
         }
-        Ok((first.map(|first| (first, last)), count))
+        Ok((first.map(|first| (first, last)), count, deletions.counted()))
     }
 
-    /// Install one staged table: steps 1 to 6 of the module docs.
-    fn install(&self, table: StagedTable, opts: &IngestOptions) -> io::Result<IngestedTable> {
-        let (lo, hi) = (table.smallest.as_slice(), table.largest.as_slice());
-        let probed = if opts.ingest_behind {
+    /// The ordered unit that installs one staged table: steps 1 to 6 of the
+    /// module docs. Not in the ring until it is advanced.
+    fn install_unit(
+        &self,
+        table: StagedTable,
+        opts: &IngestOptions,
+    ) -> io::Result<OrderedTicket<IngestedTable>> {
+        let behind = opts.ingest_behind;
+        let probed = if behind {
             Vec::new()
         } else {
+            let (lo, hi) = (table.smallest.as_slice(), table.largest.as_slice());
             self.l0_holders(&self.published_version(), lo, hi)?
         };
+        // The install takes its turn through the commit pipeline: whichever
+        // thread reaches its slot runs it, with every earlier commit
+        // published and no later one decided until the table is installed
+        // and its sequence published.
+        // The install may flush the memtables holding a key of the table.
+        Ok(self.ordered_unit(Needs::FLUSH, move |engine, ord| {
+            engine.install_ordered(ord, table, behind, &probed)
+        }))
+    }
 
-        let _pipeline = self.lock_pipeline();
-        // The ordered step: a family the table writes into that a drop
-        // retired since the table was validated refuses the install, before
-        // it takes a sequence.
+    /// [`Self::install`] in the ordered step.
+    fn install_ordered(
+        &self,
+        ord: &mut super::commit::Ordered<'_>,
+        table: StagedTable,
+        behind: bool,
+        probed: &[(u64, bool)],
+    ) -> io::Result<IngestedTable> {
+        let (lo, hi) = (table.smallest.as_slice(), table.largest.as_slice());
+        // A family the table writes into that a drop retired since the table
+        // was validated refuses the install, before it takes a sequence.
         self.cf_fence_ids(&table.families)?;
-        let level = if opts.ingest_behind {
+        let level = if behind {
             self.behind_level(lo, hi)?
-        } else if self.flush_memtables_holding(lo, hi)? {
+        } else if self.flush_memtables_holding(ord, lo, hi)? {
             0
         } else {
             let version = self.published_version();
@@ -471,9 +577,14 @@ impl RegolithEngine {
                 };
             placement(&version, lo, hi, &mut holds)?
         };
-        self.sync_active_wal()?;
+        // Every commit ordered before the ingest is durable before the
+        // manifest record that makes the ingest durable: under `Eventual` a
+        // power cut must leave a gap-free prefix of commit order, and the
+        // memtables holding none of the file's keys are not flushed. A
+        // failed sync latches the log, as a rotation's does.
+        ord.sync_log()?;
 
-        let seq = self.latest_seq.fetch_add(1, Ordering::AcqRel) + 1;
+        let seq = ord.take_seq();
 
         #[cfg(test)]
         if let Some(hook) = AFTER_INGEST_SEQ.with(|slot| slot.borrow_mut().take()) {
@@ -488,6 +599,7 @@ impl RegolithEngine {
             largest,
             file_size,
             num_entries,
+            deletions,
             pending,
             ..
         } = table;
@@ -500,14 +612,21 @@ impl RegolithEngine {
                 file_size,
                 num_entries,
                 global_seq: Some(seq),
+                // Every entry reads at `seq`, the point deletions included.
+                deletions: Some(Deletions {
+                    newest_seq: if deletions.points > 0 { seq } else { 0 },
+                    ..deletions
+                }),
             },
             Arc::new(reader),
         );
         pending.offered_to_manifest();
-        self.versions.lock().apply(&[
-            VersionEdit::AddFile { level, file },
-            VersionEdit::SetLastSeq(seq),
-        ])?;
+        self.versions.run(|versions| {
+            versions.apply(&[
+                VersionEdit::AddFile { level, file },
+                VersionEdit::SetLastSeq(seq),
+            ])
+        })?;
         self.visible_seq.publish(seq);
 
         Ok(IngestedTable {
@@ -535,13 +654,18 @@ impl RegolithEngine {
     }
 
     /// Flush, oldest first, every memtable up to the newest one holding a
-    /// key of `[lo, hi]`, and say whether there was one. Caller holds the
-    /// pipeline mutex, so the active memtable takes no write meanwhile.
-    fn flush_memtables_holding(&self, lo: &[u8], hi: &[u8]) -> io::Result<bool> {
+    /// key of `[lo, hi]`, and say whether there was one. Runs in the ordered
+    /// step, so the active memtable takes no write meanwhile.
+    fn flush_memtables_holding(
+        &self,
+        ord: &mut super::commit::Ordered<'_>,
+        lo: &[u8],
+        hi: &[u8],
+    ) -> io::Result<bool> {
         let view = self.view.load();
         let target = if view.active.holds_key_in(lo, hi) {
             drop(view);
-            self.seal_active()?
+            ord.seal(true)?
         } else {
             match view.frozen.iter().rev().find(|mt| mt.holds_key_in(lo, hi)) {
                 Some(frozen) => Arc::clone(frozen),
@@ -554,28 +678,8 @@ impl RegolithEngine {
         Ok(true)
     }
 
-    /// Sync the active log, so every commit ordered before the ingest is
-    /// durable before the manifest record that makes the ingest durable:
-    /// under `Eventual` a power cut must leave a gap-free prefix of commit
-    /// order, and the memtables holding none of the file's keys are not
-    /// flushed. A failed sync latches the log, as a rotation's does. Caller
-    /// holds the pipeline mutex, so no group is appending.
-    fn sync_active_wal(&self) -> io::Result<()> {
-        let mut guard = self.active_wal.lock();
-        let wal = guard.as_mut().ok_or_else(Self::read_only_error)?;
-        if let Err(err) = wal.sync_data() {
-            drop(guard);
-            tracing::error!(error = %err, "syncing the write-ahead log before an ingest failed");
-            self.latch_wal_failure(&err);
-            self.notify_wal_error(&err)?;
-            return Err(err);
-        }
-        Ok(())
-    }
-
     /// `ingest_behind`'s level: the bottom one, refused when anything in the
-    /// tree holds or may hold a key of `[lo, hi]`. Caller holds the pipeline
-    /// mutex.
+    /// tree holds or may hold a key of `[lo, hi]`. Runs in the ordered step.
     fn behind_level(&self, lo: &[u8], hi: &[u8]) -> io::Result<usize> {
         let view = self.view.load();
         let in_memory = std::iter::once(&view.active)

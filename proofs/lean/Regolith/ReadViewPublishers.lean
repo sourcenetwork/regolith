@@ -2,8 +2,9 @@
 # ReadViewPublishers: every publisher of the read view loses nothing
 
 This file backs the TLA+ model `proofs/tla/ReadViewPublishers.tla`. TLC
-checks there three rotations, their flushes, a compaction and an ingest
-racing. Here the same rules are proved for every number of publications.
+checks there rotations, their flushes, a rollback, a compaction and an
+ingest racing. Here the same rules are proved for every number of
+publications.
 
 ## The story, for a reader who has never seen the code
 
@@ -12,13 +13,20 @@ memtable writers append to (the active one), the memtables waiting for a
 flush (frozen, oldest first), and the tables of the current version. Data
 lives in exactly those three places.
 
-Several threads change the view: a rotation seals the active memtable
-behind a fresh one; a flush (the compaction worker's, a writer's after its
-commit, or a writer's inside a stall step) installs a frozen memtable's
-table and then retires the memtable; a compaction and an ingest install
-tables. Each builds the next view from the view it loaded and swaps it in
-with one compare-and-swap (CAS): only if the view it built from is still
-the published one. Otherwise it builds again on the newer view.
+Several threads change the view: a rotation, in an ordered unit of the
+commit pipeline, seals the active memtable behind a fresh one; a rollback,
+after the log failed, replaces the active memtable by a copy without the
+commits it discards; a flush (the compaction worker's, a writer's after its
+commit, or a rotation's that has to make room first) installs a frozen
+memtable's table and retires the memtable; a compaction and an ingest
+install tables. Each builds the next view from the view it loaded and swaps
+it in with one compare-and-swap (CAS): only if the view it built from is
+still the published one. Otherwise it builds again on the newer view.
+
+A rotation and a rollback both hold the pipeline's round, so they never run
+at once; the version publishes run one at a time in the version store's
+step. A rotation or a rollback can still race a version publish, and that is
+what the CAS is for.
 
 Tiny example of what the CAS prevents. The view is (active 2, frozen [1],
 tables [1]) and a flush is about to retire memtable 1; it builds (active 2,
@@ -35,19 +43,27 @@ the newer view instead.
    publications is a run of updates, each applied to its predecessor,
    which is what the steps below are.
 2. `no_lost_memtable`: every memtable ever made is active, frozen, or has
-   its table in the version (TLA+ `NoLostMemtable`).
+   its table in the version, or a rollback replaced it by its copy, which is
+   such a memtable (TLA+ `NoLostMemtable`).
 3. `no_lost_ingest`: every ingested table is in the version (TLA+
    `NoLostIngest`).
 4. `retired_stay_gone`: a memtable a flush retired is never active or
    frozen again (TLA+ `RetiredStayGone`).
 5. `frozen_sorted`: the frozen list is in seal order (TLA+
    `FrozenInSealOrder`).
-6. The RED cases, as counterexamples: a retire stored without the CAS loses
+6. `replaced_stay_gone`: a memtable a rollback replaced is never active,
+   frozen or flushed again (TLA+ `ReplacedStayGone`).
+7. The RED cases, as counterexamples: a retire stored without the CAS loses
    a racing seal (`plain_retire_loses_a_seal`), and so does a compaction's
-   version publish stored without it (`plain_version_loses_a_seal`).
-7. One publication per flush: the code installs a flushed memtable's table
+   version publish stored without it (`plain_version_loses_a_seal`); a
+   rollback stored without it loses a racing ingest
+   (`plain_rollback_loses_an_ingest`) and brings back a memtable a racing
+   flush retired (`plain_rollback_brings_back_a_flushed_memtable`); a
+   rotation that runs beside a rollback freezes the memtable the rollback
+   meant to replace (`seal_beside_a_rollback_freezes_the_replaced_memtable`).
+8. One publication per flush: the code installs a flushed memtable's table
    and retires the memtable in one view (`flushView`). Every such run is a
-   run of the steps above (`real_reach_reach`), so items 2 to 5 hold for
+   run of the steps above (`real_reach_reach`), so items 2 to 6 hold for
    it, and in it no view ever holds a memtable and its table at once
    (`flush_keeps_sources_disjoint`, TLA+ `NoDoubleSource`). Publishing the
    two apart leaves a view that holds both
@@ -90,6 +106,13 @@ def rotate (fresh : Nat) (v : View) : View :=
   -- Active is the fresh memtable; the old active joins the end of frozen.
   { v with active := fresh, frozen := v.frozen ++ [v.active] }
 
+/-- A rollback's update (`roll_back`): `fresh`, the copy made before the
+publication, is active where the memtable it replaces, `old`, was. A view
+whose active memtable is not `old` is left as it is. -/
+def replaceActive (old fresh : Nat) (v : View) : View :=
+  -- The copy in place of the replaced memtable; nothing else changes.
+  { v with active := if v.active = old then fresh else v.active }
+
 /-- A flush's install of memtable `m`'s table (a version publish). -/
 def install (m : Nat) (v : View) : View :=
   -- The version holds `m`'s table now.
@@ -120,6 +143,7 @@ def cas (published base next : View) : View :=
 /-- **`cas_applies_to_current`.** A swap that goes in has the effect of the
 update applied to the view published now: what was loaded is what is there. -/
 theorem cas_applies_to_current (published base : View) (upd : View → View)
+    -- The compare-and-swap went in: the published view is the one that was loaded.
     (h : published = base) :
     -- The claim itself; its proof follows.
     cas published base (upd base) = upd published := by
@@ -137,7 +161,7 @@ theorem cas_out (published base next : View) (h : published ≠ base) :
 /-! ## Part 2. The steps and what every reachable state keeps -/
 
 /-- Everything at one moment: the published view, how many memtables exist
-(numbered `1..made`), and two ghosts the rules talk about. -/
+(numbered `1..made`), and three ghosts the rules talk about. -/
 structure World where
   /-- The published view. -/
   view : View
@@ -147,11 +171,13 @@ structure World where
   retired : List Nat
   /-- Every table an ingest installed. -/
   ingested : List Nat
+  /-- Every memtable a rollback replaced by its copy. -/
+  replaced : List Nat
 
 /-- The start: memtable 1 is active, nothing else exists. -/
 def init : World :=
-  -- Active 1, nothing frozen, no table, nothing retired or ingested.
-  ⟨⟨1, [], [], []⟩, 1, [], []⟩
+  -- Active 1, nothing frozen, no table, nothing retired, ingested or replaced.
+  ⟨⟨1, [], [], []⟩, 1, [], [], []⟩
 
 /-- The publications, each one CAS that went in, so each one's update
 applied to the view published now (`cas_applies_to_current`). -/
@@ -160,6 +186,13 @@ inductive Step : World → World → Prop
   | rotate (w : World) :
       -- The view sealed, and one more memtable exists.
       Step w { w with view := rotate (w.made + 1) w.view, made := w.made + 1 }
+  /-- A rollback: its copy, number `made + 1`, replaces the active memtable.
+  The round it holds keeps a rotation out between its reading which memtable
+  is active and its publication, so the one it replaces is the active one. -/
+  | rollback (w : World) :
+      -- The copy is active, one more memtable exists, and the old one is noted.
+      Step w { w with view := replaceActive w.view.active (w.made + 1) w.view,
+                      made := w.made + 1, replaced := w.view.active :: w.replaced }
   /-- A flush installs the table of frozen memtable `m`. -/
   | install (w : World) (m : Nat) (h : m ∈ w.view.frozen) :
       -- The version holds `m`'s table.
@@ -194,9 +227,10 @@ structure Inv (w : World) : Prop where
   frozen_old : ∀ m ∈ w.view.frozen, 1 ≤ m ∧ m < w.made
   /-- Every flushed memtable is older than the active one. -/
   tables_old : ∀ m ∈ w.view.tables, m < w.made
-  /-- Every memtable made is active, frozen, or has its table installed. -/
+  /-- Every memtable made was replaced by its copy, or is active, frozen, or
+  has its table installed. -/
   no_lost : ∀ m, 1 ≤ m → m ≤ w.made →
-    m = w.view.active ∨ m ∈ w.view.frozen ∨ m ∈ w.view.tables
+    m ∈ w.replaced ∨ m = w.view.active ∨ m ∈ w.view.frozen ∨ m ∈ w.view.tables
   /-- A retired memtable's table is installed. -/
   retired_in_tables : ∀ r ∈ w.retired, r ∈ w.view.tables
   /-- A retired memtable is not frozen. -/
@@ -205,11 +239,14 @@ structure Inv (w : World) : Prop where
   ingests_kept : ∀ t ∈ w.ingested, t ∈ w.view.ingests
   /-- The frozen list is in the order the memtables were made. -/
   frozen_sorted : w.view.frozen.Pairwise (· < ·)
+  /-- A replaced memtable is older than the active one, is not frozen and has
+  no table. -/
+  replaced_gone : ∀ r ∈ w.replaced, r < w.made ∧ r ∉ w.view.frozen ∧ r ∉ w.view.tables
 
 /-- The start keeps every fact. -/
 theorem inv_init : Inv init := by
   -- One field at a time; the start has one memtable and nothing else.
-  refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩
+  refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩
   -- One memtable exists.
   · simp [init]
   -- Memtable 1 is active and is the newest.
@@ -219,7 +256,7 @@ theorem inv_init : Inv init := by
   -- Nothing is installed.
   · intro m hm; simp [init] at hm
   -- The only memtable, 1, is the active one.
-  · intro m h1 h2; left; simp [init] at h2 ⊢; omega
+  · intro m h1 h2; right; left; simp [init] at h2 ⊢; omega
   -- Nothing is retired.
   · intro r hr; simp [init] at hr
   -- Nothing is retired.
@@ -228,16 +265,19 @@ theorem inv_init : Inv init := by
   · intro t ht; simp [init] at ht
   -- An empty list is in order.
   · simp [init]
+  -- Nothing is replaced.
+  · intro r hr; simp [init] at hr
 
 /-- Every step keeps every fact. -/
 theorem inv_step {w u : World} (hw : Inv w) (hst : Step w u) : Inv u := by
   -- One case per kind of publication.
   cases hst with
+  -- Case: a rotation.
   | rotate =>
     -- The old active memtable is the newest one, number `made`.
     have hact := hw.active_newest
     -- Prove the facts one at a time.
-    refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩
+    refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩
     -- One more memtable exists.
     · simp only; omega
     -- The fresh one, `made + 1`, is active.
@@ -259,17 +299,19 @@ theorem inv_step {w u : World} (hw : Inv w) (hst : Step w u) : Inv u := by
       -- Split: is it the fresh one?
       by_cases hm : m = w.made + 1
       -- The fresh one is active.
-      · left; simp [rotate, hm]
+      · right; left; simp [rotate, hm]
       -- Otherwise it is one of `1..made`, placed as before.
       · have hle : m ≤ w.made := by simp only at h2; omega
         -- Where it was before the seal.
-        rcases hw.no_lost m h1 hle with h | h | h
+        rcases hw.no_lost m h1 hle with h | h | h | h
+        -- A replaced one is still noted as replaced.
+        · left; exact h
         -- The old active one is now the newest frozen one.
-        · right; left; simp [rotate, h]
+        · right; right; left; simp [rotate, h]
         -- An old frozen one is still frozen.
-        · right; left; simp [rotate, h]
+        · right; right; left; simp [rotate, h]
         -- An installed one is still installed.
-        · right; right; simpa [rotate] using h
+        · right; right; right; simpa [rotate] using h
     -- Retired ones keep their tables: tables are unchanged.
     · intro r hr; simpa [rotate] using hw.retired_in_tables r hr
     -- Retired ones are not frozen: not before, and not the old active.
@@ -288,11 +330,101 @@ theorem inv_step {w u : World} (hw : Inv w) (hst : Step w u) : Inv u := by
       refine ⟨hw.frozen_sorted, trivial, ?_⟩
       -- Each old frozen one is below the old active one, `made`.
       intro a ha b hb; subst hb; have := hw.frozen_old a ha; omega
+    -- Replaced ones stay out: older than `made`, so not the memtable sealed
+    -- now, and tables are unchanged.
+    · intro r hr
+      -- What was known of it before the seal.
+      obtain ⟨hlt, hfr, htb⟩ := hw.replaced_gone r hr
+      -- The three parts, one at a time.
+      refine ⟨?_, ?_, ?_⟩
+      -- Older than `made`, so than `made + 1`.
+      · simp only; omega
+      -- Not in `frozen ++ [active]`: not frozen before, and not `made`.
+      · simp only [rotate, List.mem_append, List.mem_singleton, not_or]
+        -- Not an old frozen one, and not the old active one (`made`).
+        exact ⟨hfr, by omega⟩
+      -- No table: tables are unchanged.
+      · simpa [rotate] using htb
+  -- Case: a rollback replaces the active memtable by its copy.
+  | rollback =>
+    -- The old active memtable is the newest one, number `made`.
+    have hact := hw.active_newest
+    -- Prove the facts one at a time.
+    refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩
+    -- One more memtable exists.
+    · simp only; omega
+    -- The copy, `made + 1`, is active.
+    · simp [replaceActive]
+    -- Frozen is unchanged, and older than `made`, so than `made + 1`.
+    · intro m hm
+      -- It was frozen before the rollback.
+      have := hw.frozen_old m (by simpa [replaceActive] using hm)
+      -- So it is at least 1 and below `made + 1`.
+      simp only; omega
+    -- Tables are unchanged, and older than `made`, so than `made + 1`.
+    · intro m hm
+      -- Its table was installed before the rollback.
+      have := hw.tables_old m (by simpa [replaceActive] using hm)
+      -- So it is below `made + 1`.
+      simp only; omega
+    -- Nothing lost: split on the memtable's number.
+    · intro m h1 h2
+      -- Split: is it the copy?
+      by_cases hm : m = w.made + 1
+      -- The copy is active.
+      · right; left; simp [replaceActive, hm]
+      -- Otherwise it is one of `1..made`, placed as before.
+      · have hle : m ≤ w.made := by simp only at h2; omega
+        -- Where it was before the rollback.
+        rcases hw.no_lost m h1 hle with h | h | h | h
+        -- A replaced one is still noted as replaced.
+        · left; simp [h]
+        -- The old active one is the one replaced now.
+        · left; simp [h]
+        -- A frozen one is still frozen.
+        · right; right; left; simpa [replaceActive] using h
+        -- An installed one is still installed.
+        · right; right; right; simpa [replaceActive] using h
+    -- Retired ones keep their tables: tables are unchanged.
+    · intro r hr; simpa [replaceActive] using hw.retired_in_tables r hr
+    -- Retired ones are not frozen: frozen is unchanged.
+    · intro r hr; simpa [replaceActive] using hw.retired_gone r hr
+    -- Ingests are unchanged.
+    · intro t ht; simpa [replaceActive] using hw.ingests_kept t ht
+    -- Frozen, unchanged, is in order.
+    · simpa [replaceActive] using hw.frozen_sorted
+    -- Replaced ones stay out: the one replaced now, and the earlier ones.
+    · intro r hr
+      -- A member of `active :: l` is the old active one or in `l`.
+      simp only [List.mem_cons] at hr
+      -- Split on which.
+      rcases hr with rfl | hr
+      -- The old active one, number `made`: every frozen one and every table
+      -- is older than it.
+      · refine ⟨(by simp only; omega), ?_, ?_⟩
+        -- Not frozen: a frozen one is below `made`.
+        · intro hin
+          -- If it were frozen it would be below `made`, which it is.
+          have := hw.frozen_old w.view.active (by simpa [replaceActive] using hin)
+          -- A number is not below itself.
+          omega
+        -- No table: a flushed one is below `made`.
+        · intro hin
+          -- If it had a table it would be below `made`, which it is.
+          have := hw.tables_old w.view.active (by simpa [replaceActive] using hin)
+          -- A number is not below itself.
+          omega
+      -- An earlier one: as before, with one more memtable made.
+      · obtain ⟨hlt, hfr, htb⟩ := hw.replaced_gone r hr
+        -- The three parts: older than `made + 1`, not frozen, no table.
+        exact ⟨(by simp only; omega), by simpa [replaceActive] using hfr,
+          by simpa [replaceActive] using htb⟩
+  -- Case: a flush installs the table of frozen memtable m.
   | install m h =>
     -- `m` is frozen, so older than the active one.
     have hm := hw.frozen_old m h
     -- Prove the facts one at a time.
-    refine ⟨hw.made_pos, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩
+    refine ⟨hw.made_pos, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩
     -- The active one is unchanged.
     · simpa [install] using hw.active_newest
     -- Frozen is unchanged.
@@ -310,13 +442,15 @@ theorem inv_step {w u : World} (hw : Inv w) (hst : Step w u) : Inv u := by
     -- Nothing lost: every place grew or stayed.
     · intro x h1 h2
       -- Where it was before.
-      rcases hw.no_lost x h1 h2 with h' | h' | h'
+      rcases hw.no_lost x h1 h2 with h' | h' | h' | h'
+      -- Still noted as replaced.
+      · left; exact h'
       -- Still active.
-      · left; simpa [install] using h'
-      -- Still frozen.
       · right; left; simpa [install] using h'
+      -- Still frozen.
+      · right; right; left; simpa [install] using h'
       -- Still installed, behind `m`.
-      · right; right; simp [install, h']
+      · right; right; right; simp [install, h']
     -- Retired ones' tables: still installed.
     · intro r hr; simp [install, hw.retired_in_tables r hr]
     -- Retired ones: frozen is unchanged.
@@ -325,11 +459,24 @@ theorem inv_step {w u : World} (hw : Inv w) (hst : Step w u) : Inv u := by
     · intro t ht; simpa [install] using hw.ingests_kept t ht
     -- Frozen, unchanged, is in order.
     · simpa [install] using hw.frozen_sorted
+    -- Replaced ones stay out: `m` is frozen, so it is none of them.
+    · intro r hr
+      -- What was known of it before the install.
+      obtain ⟨hlt, hfr, htb⟩ := hw.replaced_gone r hr
+      -- Older than the active one as before; then the two lists.
+      refine ⟨hlt, ?_, ?_⟩
+      -- Frozen is unchanged.
+      · simpa [install] using hfr
+      -- Not in `m :: tables`: it is not `m`, and it had no table.
+      · simp only [install, List.mem_cons, not_or]
+        -- If it were `m` it would be frozen, which it is not.
+        exact ⟨fun hrm => hfr (by rw [hrm]; exact h), htb⟩
+  -- Case: a flush retires memtable m.
   | retire m h =>
     -- `m`'s table is installed, so it is older than the active one.
     have hm := hw.tables_old m h
     -- Prove the facts one at a time.
-    refine ⟨hw.made_pos, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩
+    refine ⟨hw.made_pos, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩
     -- The active one is unchanged.
     · simpa [retire] using hw.active_newest
     -- Frozen only lost `m`: every one left was frozen before.
@@ -343,17 +490,19 @@ theorem inv_step {w u : World} (hw : Inv w) (hst : Step w u) : Inv u := by
     -- Nothing lost: a frozen one other than `m` stays frozen; `m` is installed.
     · intro x h1 h2
       -- Where it was before.
-      rcases hw.no_lost x h1 h2 with h' | h' | h'
+      rcases hw.no_lost x h1 h2 with h' | h' | h' | h'
+      -- Still noted as replaced.
+      · left; exact h'
       -- Still active.
-      · left; simpa [retire] using h'
+      · right; left; simpa [retire] using h'
       -- Was frozen: split on whether it is `m`.
       · by_cases hx : x = m
         -- It is `m`: its table is installed.
-        · right; right; subst hx; simpa [retire] using h
+        · right; right; right; subst hx; simpa [retire] using h
         -- It is not: still frozen.
-        · right; left; simp [retire, List.mem_filter, h', hx]
+        · right; right; left; simp [retire, List.mem_filter, h', hx]
       -- Still installed.
-      · right; right; simpa [retire] using h'
+      · right; right; right; simpa [retire] using h'
     -- Retired ones' tables: `m`'s is installed, and the others as before.
     · intro r hr
       -- A member of `m :: l` is `m` or in `l`.
@@ -381,9 +530,22 @@ theorem inv_step {w u : World} (hw : Inv w) (hst : Step w u) : Inv u := by
     · intro t ht; simpa [retire] using hw.ingests_kept t ht
     -- A filtered list in order stays in order.
     · simpa [retire] using hw.frozen_sorted.filter _
+    -- Replaced ones stay out: frozen only lost `m`, and tables are unchanged.
+    · intro r hr
+      -- What was known of it before the retire.
+      obtain ⟨hlt, hfr, htb⟩ := hw.replaced_gone r hr
+      -- Older than the active one as before; then the two lists.
+      refine ⟨hlt, ?_, ?_⟩
+      -- Not in the filtered list: it was not in the list.
+      · simp only [retire, List.mem_filter, not_and]
+        -- It was not frozen at all.
+        intro hin; exact absurd hin hfr
+      -- Tables are unchanged.
+      · simpa [retire] using htb
+  -- Case: an ingest adds table t.
   | ingest t =>
     -- Prove the facts one at a time; only the ingests change.
-    refine ⟨hw.made_pos, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩
+    refine ⟨hw.made_pos, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩
     -- The active one is unchanged.
     · simpa [ingest] using hw.active_newest
     -- Frozen is unchanged.
@@ -408,6 +570,9 @@ theorem inv_step {w u : World} (hw : Inv w) (hst : Step w u) : Inv u := by
       · simp [ingest, hw.ingests_kept x hx]
     -- Frozen, unchanged, is in order.
     · simpa [ingest] using hw.frozen_sorted
+    -- Replaced ones: no memtable place changed.
+    · intro r hr; simpa [ingest] using hw.replaced_gone r hr
+  -- Case: a compaction.
   | compact =>
     -- Nothing changes: the view is the same.
     simpa [compact] using hw
@@ -416,16 +581,21 @@ theorem inv_step {w u : World} (hw : Inv w) (hst : Step w u) : Inv u := by
 theorem inv_reach {w : World} (h : Reach w) : Inv w := by
   -- By how `w` was reached: the start, or one step from a reachable world.
   induction h with
+  -- The start satisfies every fact.
   | init => exact inv_init
+  -- One more step keeps them.
   | step _ hst ih => exact inv_step ih hst
 
 /-! ## Part 3. The rules -/
 
 /-- **`no_lost_memtable`.** Every memtable ever made is active, frozen, or
-has its table in the version: no publication left one out. -/
+has its table in the version: no publication left one out. One a rollback
+replaced is the exception, and its copy, a memtable made after it, is under
+this same rule. -/
 theorem no_lost_memtable {w : World} (h : Reach w) :
     -- The claim itself; its proof follows.
-    ∀ m, 1 ≤ m → m ≤ w.made → m = w.view.active ∨ m ∈ w.view.frozen ∨ m ∈ w.view.tables :=
+    ∀ m, 1 ≤ m → m ≤ w.made →
+      m ∈ w.replaced ∨ m = w.view.active ∨ m ∈ w.view.frozen ∨ m ∈ w.view.tables :=
   -- One of the facts every reachable world keeps.
   (inv_reach h).no_lost
 
@@ -458,6 +628,21 @@ theorem frozen_sorted {w : World} (h : Reach w) :
   -- One of the facts every reachable world keeps.
   (inv_reach h).frozen_sorted
 
+/-- **`replaced_stay_gone`.** A memtable a rollback replaced is never
+active, frozen or flushed again: the commits the rollback discarded, which
+it still holds, reach no reader and no table. -/
+theorem replaced_stay_gone {w : World} (h : Reach w) :
+    -- The claim itself; its proof follows.
+    ∀ r ∈ w.replaced, r ≠ w.view.active ∧ r ∉ w.view.frozen ∧ r ∉ w.view.tables := by
+  -- The facts every reachable world keeps.
+  have hi := inv_reach h
+  -- Take a replaced memtable.
+  intro r hr
+  -- It is older than the newest memtable, is not frozen and has no table.
+  obtain ⟨hlt, hfr, htb⟩ := hi.replaced_gone r hr
+  -- Not the active one, which is the newest; the rest as just noted.
+  exact ⟨(by rw [hi.active_newest]; omega), hfr, htb⟩
+
 /-! ## Part 4. One publication per flush
 
 The steps of Part 2 publish a flush's install and its retire apart, and
@@ -477,6 +662,11 @@ inductive RealStep : World → World → Prop
   | rotate (w : World) :
       -- The view sealed, and one more memtable exists.
       RealStep w { w with view := rotate (w.made + 1) w.view, made := w.made + 1 }
+  /-- A rollback, as in Part 2. -/
+  | rollback (w : World) :
+      -- The copy is active, one more memtable exists, and the old one is noted.
+      RealStep w { w with view := replaceActive w.view.active (w.made + 1) w.view,
+                          made := w.made + 1, replaced := w.view.active :: w.replaced }
   /-- A flush of frozen memtable `m`: one publication. -/
   | flush (w : World) (m : Nat) (h : m ∈ w.view.frozen) :
       -- The table in, the memtable out, and `m` noted as retired.
@@ -502,12 +692,16 @@ Part 2 reach: a flush is an install followed by a retire. -/
 theorem real_reach_reach {w : World} (h : RealReach w) : Reach w := by
   -- By how `w` was reached.
   induction h with
+  -- The start is reachable in Part 2 as well.
   | init => exact Reach.init
+  -- Case: the steps so far, then one more.
   | step _ hst ih =>
     -- One case per publication.
     cases hst with
     -- A rotation is a step of Part 2.
     | rotate => exact Reach.step ih (Step.rotate _)
+    -- A rollback is a step of Part 2.
+    | rollback => exact Reach.step ih (Step.rollback _)
     -- A flush: the install, then the retire, whose table is now installed.
     | flush m hm =>
       -- First the install.
@@ -527,14 +721,17 @@ theorem flush_keeps_sources_disjoint {w : World} (h : RealReach w) :
     ∀ m ∈ w.view.frozen, m ∉ w.view.tables := by
   -- By how `w` was reached.
   induction h with
+  -- Case: the start.
   | init =>
     -- Nothing is frozen at the start.
     intro m hm; simp [init] at hm
+  -- Case: the steps so far, then one more, with the claim before the step (ih) known.
   | step hr hst ih =>
     -- The facts of Part 2 for the world before the step.
     have hi := inv_reach (real_reach_reach hr)
     -- One case per publication.
     cases hst with
+    -- Case: a rotation.
     | rotate =>
       -- Take a frozen memtable of the new view.
       intro m hm
@@ -547,6 +744,11 @@ theorem flush_keeps_sources_disjoint {w : World} (h : RealReach w) :
       · exact ih m hm
       -- The old active one: every installed table is older than it.
       · intro ht; have := hi.tables_old m ht; rw [hm, hi.active_newest] at this; omega
+    -- Case: a rollback.
+    | rollback =>
+      -- A rollback changes neither the frozen list nor the tables.
+      simpa [replaceActive] using ih
+    -- Case: a flush of frozen memtable f.
     | flush f hf =>
       -- Take a frozen memtable of the new view.
       intro m hm
@@ -562,9 +764,11 @@ theorem flush_keeps_sources_disjoint {w : World} (h : RealReach w) :
       · exact hm.2 ht
       -- Installed before: but it was frozen before and not installed.
       · exact ih m hm.1 ht
+    -- Case: an ingest.
     | ingest t =>
       -- Ingests do not touch memtables or their tables.
       simpa [ingest] using ih
+    -- Case: a compaction.
     | compact =>
       -- Nothing changes.
       simpa [compact] using ih
@@ -595,6 +799,8 @@ which keeps 3 active and 2 frozen (bug `PlainRetire`). -/
 theorem plain_retire_loses_a_seal :
     -- What the rotation published, and what the plain store leaves.
     let sealed := rotate 3 flushed
+    -- What the flush's plain store leaves: the view it built before the rotation, with memtable 1
+    -- retired.
     let stored := retire 1 flushed
     -- The plain store loses memtable 3 ...
     ¬ (3 = stored.active ∨ 3 ∈ stored.frozen ∨ 3 ∈ stored.tables) ∧
@@ -618,6 +824,7 @@ puts back active 1: memtable 2, which exists, is in no place (bug
 theorem plain_version_loses_a_seal :
     -- What the rotation published, and what the plain store leaves.
     let sealed := rotate 2 init.view
+    -- What the compaction's plain store leaves: the view it built before the rotation.
     let stored := compact init.view
     -- The plain store loses memtable 2 ...
     ¬ (2 = stored.active ∨ 2 ∈ stored.frozen ∨ 2 ∈ stored.tables) ∧
@@ -629,6 +836,93 @@ theorem plain_version_loses_a_seal :
   · simp [compact, init]
   -- The views differ, so the swap loses.
   · simp [cas, rotate, init]
+
+/-- The view in the story below: memtable 1 sealed behind 2, not flushed. -/
+def sealedOnce : View := ⟨2, [1], [], []⟩
+
+/-- **`plain_rollback_loses_an_ingest`.** A rollback built its view from the
+start (active 1), with memtable 2 as its copy; an ingest then published
+table 101. Stored without the CAS, the rollback's view puts back a version
+without the table: the ingest's rows are in no view. With the CAS the swap
+loses, and the rollback built again keeps the table and makes its copy
+active (bug `PlainRollback`). -/
+theorem plain_rollback_loses_an_ingest :
+    -- What the ingest published while the rollback was at work.
+    let installed := ingest 101 init.view
+    -- What the rollback's plain store leaves: the view it built before the ingest.
+    let stored := replaceActive 1 2 init.view
+    -- The plain store loses the table ...
+    101 ∉ stored.ingests ∧
+    -- ... while the CAS refuses it ...
+    cas installed init.view stored = installed ∧
+    -- ... and the rollback built again keeps the table, its copy active.
+    101 ∈ (replaceActive 1 2 installed).ingests ∧ (replaceActive 1 2 installed).active = 2 := by
+  -- Every part is a computation on small lists.
+  refine ⟨?_, ?_, ?_, ?_⟩
+  -- The view built before the ingest has no ingested table.
+  · simp [replaceActive, init]
+  -- The views differ, so the swap loses.
+  · simp [cas, ingest, init]
+  -- The rebuilt view starts from the ingest's, so it holds the table.
+  · simp [replaceActive, ingest, init]
+  -- Memtable 1 is still active there, so the copy takes its place.
+  · simp [replaceActive, ingest, init]
+
+/-- **`plain_rollback_brings_back_a_flushed_memtable`.** A rollback built its
+view from `sealedOnce` (memtable 1 frozen, 2 active), with memtable 3 as its
+copy of 2; a flush then published table 1 and retired memtable 1 in one
+view. Stored without the CAS, the rollback's view puts memtable 1 back in
+the frozen list and takes its table out: the next flush writes it a second
+time. With the CAS the swap loses, and the rollback built again leaves 1
+retired and its table in (bug `PlainRollback`). -/
+theorem plain_rollback_brings_back_a_flushed_memtable :
+    -- What the flush published while the rollback was at work.
+    let flushedOne := flushView 1 sealedOnce
+    -- What the rollback's plain store leaves: the view it built before the flush.
+    let stored := replaceActive 2 3 sealedOnce
+    -- The plain store freezes memtable 1 again and drops its table ...
+    1 ∈ stored.frozen ∧ 1 ∉ stored.tables ∧
+    -- ... while the CAS refuses it ...
+    cas flushedOne sealedOnce stored = flushedOne ∧
+    -- ... and the rollback built again leaves 1 out of the frozen list, its table in.
+    1 ∉ (replaceActive 2 3 flushedOne).frozen ∧ 1 ∈ (replaceActive 2 3 flushedOne).tables := by
+  -- Every part is a computation on small lists.
+  refine ⟨?_, ?_, ?_, ?_, ?_⟩
+  -- The view built before the flush has memtable 1 frozen.
+  · simp [replaceActive, sealedOnce]
+  -- And no table.
+  · simp [replaceActive, sealedOnce]
+  -- The views differ, so the swap loses.
+  · simp [cas, flushView, retire, install, sealedOnce]
+  -- The rebuilt view starts from the flush's, where 1 is not frozen.
+  · simp [replaceActive, flushView, retire, install, sealedOnce]
+  -- And where its table is installed.
+  · simp [replaceActive, flushView, retire, install, sealedOnce]
+
+/-- **`seal_beside_a_rollback_freezes_the_replaced_memtable`.** Why a
+rotation and a rollback take turns (bug `SealOutsideRound`). A rollback set
+out to replace memtable 1 by its copy; a rotation that did not hold the
+round published its seal of 1 behind a fresh 2. The rollback's swap loses;
+it builds again on the sealed view, finds a memtable active that is not the
+one it replaces, and leaves the view as it is. Memtable 1, with the
+discarded commits in it, is frozen and waits for a flush. -/
+theorem seal_beside_a_rollback_freezes_the_replaced_memtable :
+    -- What the rotation published while the rollback was at work.
+    let sealed := rotate 2 init.view
+    -- The rollback's first build loses its swap ...
+    cas sealed init.view (replaceActive 1 3 init.view) = sealed ∧
+    -- ... its second build changes nothing ...
+    replaceActive 1 3 sealed = sealed ∧
+    -- ... and the memtable it set out to replace is frozen.
+    1 ∈ sealed.frozen := by
+  -- Every part is a computation on small lists.
+  refine ⟨?_, ?_, ?_⟩
+  -- The views differ, so the swap loses.
+  · simp [cas, rotate, init]
+  -- Memtable 2 is active, not 1, so the update keeps the view.
+  · simp [replaceActive, rotate, init]
+  -- The seal put memtable 1 at the end of the frozen list.
+  · simp [rotate, init]
 
 -- The end of this file's names.
 end Regolith.ReadViewPublishers

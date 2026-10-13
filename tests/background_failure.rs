@@ -8,6 +8,7 @@
 //! stopped behind failing work must get that failure back rather than
 //! wait forever, one that was already waiting when the work failed
 //! included, and writes must resume once the fault clears.
+#![cfg(not(target_arch = "wasm32"))]
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -109,6 +110,13 @@ impl Env for SstBudgetEnv {
             return Err(io::Error::other("Too many open files (os error 24)"));
         }
         self.inner.open_read(path)
+    }
+    fn open_log(
+        &self,
+        path: &Path,
+        mode: WriteMode,
+    ) -> io::Result<Box<dyn regolith::env::LogFile>> {
+        self.inner.open_log(path, mode)
     }
     fn open_write(&self, path: &Path, mode: WriteMode) -> io::Result<Box<dyn WriteFile>> {
         if is_sst(path) {

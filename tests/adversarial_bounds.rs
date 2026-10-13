@@ -6,6 +6,7 @@
 //! staged group and rotates once per group, so this file measures what
 //! the active memtable actually reaches rather than assuming the bound
 //! holds.
+#![cfg(not(target_arch = "wasm32"))]
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -193,9 +194,10 @@ fn measure_with(
 /// measured in a db whose `write_buffer_size` is large enough that this one
 /// batch can never trigger a rotation.
 ///
-/// This is the same quantity `admit_from_ring` bounds a group's overshoot
-/// by: the first ticket is always admitted whatever it costs, so the active
-/// memtable holds at most `write_buffer_size` plus one request. Measuring it
+/// This is the quantity the rotation check of a write's turn bounds the
+/// active memtable's overshoot by: a write whose turn comes with the
+/// memtable below `write_buffer_size` goes in whatever it costs, so the
+/// active memtable holds at most that size plus one request. Measuring it
 /// in-process rather than hard-coding a byte count cancels the per-entry
 /// arena overhead (node header, tower, internal key, alignment), which
 /// differs by allocator and platform, out of the bound that uses it.
@@ -221,10 +223,10 @@ fn one_request_cost(batch_ops: usize, value_len: usize) -> u64 {
 /// Three structural bounds, none of them wall-clock:
 ///
 /// * `peak_active <= write_buffer_size + 2 * one_request_cost`, exactly the
-///   overshoot [`Options::write_buffer_size`] documents and exactly what
-///   `admit_from_ring` implements (admission stops once `projected >= room`,
-///   the first ticket is always admitted, `run_group` rotates before it
-///   applies).
+///   overshoot [`Options::write_buffer_size`] documents and what the
+///   rotation check implements (a write whose turn comes with the memtable
+///   at the size rotates before it is decided; one whose turn comes below
+///   it goes in whatever it costs).
 /// * `peak_all <= max_write_buffer_number * (write_buffer_size +
 ///   2 * one_request_cost)`, the same claim over every live memtable.
 /// * `peak_reserved <= documented_high_water(&opts)`, the same bound the

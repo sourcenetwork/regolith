@@ -4,7 +4,7 @@ default:
     @just --list
 
 # Everything CI enforces on every push, in the order it fails fastest.
-gate: fmt lint doc test deny
+gate: fmt lint doc test test-testing deny
 
 fmt:
     cargo fmt --all -- --check
@@ -12,11 +12,17 @@ fmt:
 fmt-fix:
     cargo fmt --all
 
+# The second pass of `lint`, `doc` and `msrv` turns on `testing`: the
+# feature adds `regolith::testing`, which no default build contains, so
+# the default pass never sees it.
+
 lint:
     cargo clippy --workspace --all-targets -- -D warnings
+    cargo clippy -p regolith --all-targets --features testing -- -D warnings
 
 doc:
     RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
+    RUSTDOCFLAGS="-D warnings" cargo doc -p regolith --no-deps --features testing
 
 # nextest, not `cargo test`: each test gets its own process, so a
 # wedged test fails on the profile's slow-timeout instead of holding the
@@ -44,11 +50,19 @@ bounded limit recipe +command:
     [ "$code" -ne 124 ] || echo "error: just {{recipe}} did not finish within {{limit}} and was stopped" >&2; \
     exit "$code"
 
+# `regolith::testing` under its feature: the contract checks' own tests,
+# then every doc test again, which adds the ones that call the checks.
+
+test-testing:
+    cargo nextest run -p regolith --features testing --lib testing::
+    cargo test -p regolith --features testing --doc
+
 deny:
     cargo deny check
 
 msrv:
     cargo "+$(grep -m1 '^rust-version' Cargo.toml | cut -d'"' -f2)" check --workspace
+    cargo "+$(grep -m1 '^rust-version' Cargo.toml | cut -d'"' -f2)" check -p regolith --features testing
 
 # The summary line CI annotates a build with.
 # Through nextest, like the gate: one process per test, so a wedged
@@ -267,15 +281,11 @@ stress secs="600":
 # baseline; they are the wall time `cargo test`'s own summary line
 # reported for the test binary, excluding compilation.
 #
-# The debug run carries one extra calibration: the skip list's
-# single-writer guard (S2) is a `debug_assert`, so the model proving it
-# fires is compiled out of a release build. The arena's single-writer
-# guard (A8) is debug-only the same way, but its own calibration runs in
-# both profiles with a different expected panic message per profile (a
-# debug build trips the guard, a release build trips loom's tracked
-# cell), so it does not add to the debug-only gap the way S2's does.
-# Seven of the models are `should_panic` calibrations that deliberately
-# get the ordering wrong; they are what make the passes mean anything.
+# Both profiles run the same nineteen models: the memtable takes writes
+# from any thread, so there is no single-writer guard left for a debug
+# build to trip. Seven of the models are `should_panic` calibrations that
+# deliberately get the ordering wrong; they are what make the passes mean
+# anything.
 
 # Loom is bounded. Every recipe below builds its models first and then runs
 # them under a hard limit of 10 minutes (15 for the nightly twins): a run
@@ -292,7 +302,7 @@ loom-debug:
     RUSTFLAGS="--cfg loom" timeout 10m cargo test --test loom_memtable
 
 # Loom models for `regolith::sync`: every primitive's wait protocol,
-# with four calibrations that must fail. Release only: the larger models
+# with five calibrations that must fail. Release only: the larger models
 # explore 0.1 to 0.4 million interleavings each (about four minutes in
 # all), which a debug build multiplies several times over.
 loom-sync:
@@ -343,18 +353,37 @@ loom-tombstones:
     RUSTFLAGS="--cfg loom" cargo test --release --test loom_range_tombstones --no-run
     RUSTFLAGS="--cfg loom" timeout 10m cargo test --release --test loom_range_tombstones
 
-# Loom models for the open-file slot table (acquire, evict, release, drain)
+# Loom models for the open-file slot table (acquire, evict, release, drain,
+# and D60's park of a reopen that may not wait and the wake of a freed slot)
 # and the column-family registry (create, drop and use racing in the
-# ordered step), with three calibrations that must fail. Release, like
+# ordered step), with five calibrations that must fail. Release, like
 # `loom-io`.
 loom-tables:
     RUSTFLAGS="--cfg loom" cargo test --release --test loom_tables --no-run
     RUSTFLAGS="--cfg loom" timeout 10m cargo test --release --test loom_tables
 
+# Loom models for the lock-free commit pipeline (plan 4.7) and the version
+# store's step: reserve and void, a cell's next lap, the pin, deciding with
+# helping, the watermark claim, publication, a rollback meeting a decision
+# under way, the step's sections, and parking (a queue's poll never waits:
+# a job its holder parks, a job parked for the step, a rollback parked for
+# a write in flight, a sync parked for a record's late copy in flight, the
+# wake of a parked job against its landing and against the claim of the
+# thread that parks it), with fifteen calibrations that must fail. Thirty
+# models, each bounded by a ring of two cells, two or three threads and an
+# explicit preemption bound; measured at 1.1s in all, the largest at 4,214
+# interleavings. The limit is a hard one: a run that reaches it has failed.
+loom-pipeline:
+    RUSTFLAGS="--cfg loom" cargo test --release --test loom_pipeline --no-run
+    RUSTFLAGS="--cfg loom" timeout 5m cargo test --release --test loom_pipeline
+
 # Loom models for the pessimistic lock table (plan 4.6, 4.10): one holder
 # per key, the bypass bound, a wait delivered to its own queue, the table's
-# use count, and close meeting a wait being queued, with five calibrations
-# that must fail. Release only; the ten run in under ten seconds.
+# use count, and close meeting a wait being queued; and for the first four
+# abort callbacks a transaction's claim holds in place, pushed while another
+# thread takes them (at a bound that explores every schedule). Six
+# calibrations must fail. Release only; the thirteen run in under ten
+# seconds.
 loom-locks:
     RUSTFLAGS="--cfg loom" cargo test --release --test loom_locks --no-run
     RUSTFLAGS="--cfg loom" timeout 10m cargo test --release --test loom_locks
@@ -367,7 +396,7 @@ loom-gate:
     RUSTFLAGS="--cfg loom" cargo test --release --test loom_gate --no-run
     RUSTFLAGS="--cfg loom" timeout 10m cargo test --release --test loom_gate
 
-loom-all: loom loom-debug loom-sync loom-io loom-snapshots loom-view loom-cache loom-tombstones loom-tables loom-locks loom-gate
+loom-all: loom loom-debug loom-sync loom-io loom-snapshots loom-view loom-cache loom-tombstones loom-tables loom-locks loom-gate loom-pipeline
 
 # The read-view chaos workload at a larger size than `cargo test` runs it:
 # 4 instances x 2 rounds x 120 versions by default, against 2 x 1 x 50.
@@ -461,6 +490,12 @@ tla:
         # bad. Both name the invariant, and both count.
         broke=$(sed -n -e 's/^Error: Invariant \(.*\) is violated\.$/\1/p' \
                        -e 's/^Error: Invariant \(.*\) is violated by the initial state:$/\1/p' <<<"$out" | head -1)
+        # A broken promise about whole runs (a PROPERTY) is reported without its name. A row that
+        # plants a bug against one names exactly one PROPERTY in its configuration, so that is the
+        # one that broke.
+        if [ -z "$broke" ] && grep -q '^Error: Temporal properties were violated\.$' <<<"$out"; then
+            broke=$(sed -n 's/^PROPERTY \(.*\)$/\1/p' "$cfg.cfg" | head -1)
+        fi
         states=$(sed -n 's/^.* states generated, \([0-9,]*\) distinct states found.*$/\1/p' <<<"$out" | tail -1)
         took=$(sed -n 's/^Finished in \(.*\) at (.*$/\1/p' <<<"$out" | tail -1)
         if [ "$code" -eq 124 ]; then
@@ -531,6 +566,14 @@ tla:
     check MC_DefraLevel_Green_ValidatedScan            GREEN
     check MC_DefraLevel_Red_PlainScanDecides           RED INV_ScanDecisionsCurrent
     check MC_DefraLevel_Red_ReasonNewestWrite          RED INV_ReasonsExact
+    # The exempt reads a caller must not decide on: a scan inside a
+    # commutative prefix and a read by no parts. Each GREEN uses the
+    # exemption as declared; each RED decides on it and loses.
+    check MC_DefraLevel_Green_CommutativeScan          GREEN
+    check MC_DefraLevel_Red_DecideOnCommutativeScan    RED INV_SeatExclusive
+    check MC_DefraLevel_Green_ClaimUndeclared          GREEN
+    check MC_DefraLevel_Green_NoParts                  GREEN
+    check MC_DefraLevel_Red_DecideOnNoParts            RED INV_PartsCurrent
     # E1. Lean: Regolith/LsmOrder.lean, compact_range_reads_newest.
     spec=LsmOrder
     # E31, a flush's table and its memtable's retirement are one publication.
@@ -549,6 +592,24 @@ tla:
     check MC_LsmOrder_Green_Demote                     GREEN
     check MC_LsmOrder_Red_DemoteLevelOnly              RED ReadNewest
     check MC_LsmOrder_Red_NoDemotion                   RED ReadNewest
+    # E38: a universal merge takes L0 files that lie next to one another.
+    # Lean: Regolith/LsmOrder.lean, merge_window_reads_newest,
+    # merge_gapped_breaks_reads.
+    check MC_LsmOrder_Green_L0Merge                    GREEN
+    check MC_LsmOrder_Red_L0MergeGap                   RED ReadNewest
+    # E14 and E37, the range deletes of the tables an open moves out of
+    # overlapping levels and those 0.1.x left below older keys they delete:
+    # copied into the recovered memtable, and logged before the manifest
+    # records the move and the check. Lean: Regolith/RangeDelete.lean,
+    # hoisted_delete_reads_by_sequence.
+    spec=LegacyRangeRead
+    check MC_LegacyRangeRead_Green                     GREEN
+    check MC_LegacyRangeRead_Red_NoHoist               RED ReadNewest
+    check MC_LegacyRangeRead_Red_PreScanOnly           RED ReadNewest
+    check MC_LegacyRangeRead_Red_MoveBeforeLog         RED ReadNewest
+    check MC_LegacyRangeRead_Green_Buried              GREEN
+    check MC_LegacyRangeRead_Red_BuriedRetired         RED ScanNewest
+    check MC_LegacyRangeRead_Red_CheckBeforeLog        RED HeadNewest
     # E6. Lean: Regolith/BatchView.lean, batch_one_view_newest.
     spec=BatchRead
     check MC_BatchRead_Green                           GREEN
@@ -569,7 +630,7 @@ tla:
     check MC_WalRotation_Green                         GREEN
     check MC_WalRotation_Red_NoSync                    RED RecoversPrefix
     check MC_WalRotation_Red_NoSync_Gap                RED NoGap
-    # Plan 3.6, commit-ordered append (supersedes defradb.rs #1911). Each
+    # Plan 3.6, commit-ordered append. Each
     # Teeth row is GREEN: its mutant breaks nothing but its RED's invariant.
     # Lean: Regolith/Append.lean, dense_from_one, unique_positions,
     # at_most_once, commit_order, snapshot_sees_prefix.
@@ -615,6 +676,10 @@ tla:
     check MC_Allocate_Red_LogAfterUse_Reuse                    RED INV_UsesUnique
     check MC_Allocate_Teeth_InTxn                              GREEN
     check MC_Allocate_Teeth_LogAfterUse                        GREEN
+    # A reservation is handed out before it is published; a log failure that
+    # discards it writes the counter back. TLC only.
+    check MC_Allocate_Green_Rollback                   GREEN
+    check MC_Allocate_Red_ForgetOnRollback             RED INV_HandedOutOnce
     # 4.2, E3: WAL format 2 replay. Lean: Regolith/WalRecovery.lean,
     # recovers_prefix2.
     spec=WalRecovery
@@ -696,12 +761,19 @@ tla:
     check MC_StripeCompaction_Red_IgnoreStripes        RED SnapshotReadsKept
     # E27: a pass retires a range tombstone below its range and every
     # snapshot. Green_Retires is the witness that the fix retires at all.
+    # The Rewrite rows check a pass over one run alone, which a pass picked
+    # for its deletions (D14) runs on a bottom-level table and on the only
+    # run of a universal pool.
     # Lean: Regolith/TombstoneRetirement.lean, retire_keeps_reads.
     spec=TombstoneRetirement
     check MC_TombstoneRetirement_Green                 GREEN
     check MC_TombstoneRetirement_Green_Retires         RED NothingRetired
     check MC_TombstoneRetirement_Red_IgnoreSnapshots   RED SnapshotReadsKept
     check MC_TombstoneRetirement_Red_IgnoreDeeper      RED SnapshotReadsKept
+    check MC_TombstoneRetirement_Green_Rewrite         GREEN
+    check MC_TombstoneRetirement_Green_RewriteRetires  RED NothingRetired
+    check MC_TombstoneRetirement_Red_RewriteIgnoreSnapshots RED SnapshotReadsKept
+    check MC_TombstoneRetirement_Red_RewriteIgnoreDeeper RED SnapshotReadsKept
     # 4.6, D54: the snapshot registry on per-thread slots with counted
     # entries, moved handles, copies and shared slots. Lean:
     # Regolith/SnapshotRegistry.lean, scan_respects_live,
@@ -715,42 +787,151 @@ tla:
     check MC_SnapshotRegistry_Red_CloneFresh           RED LiveCovered
     check MC_SnapshotRegistry_Red_PlainClaim           RED MinBelowLive
     check MC_SnapshotRegistry_Red_JoinNoRecheck        RED LiveEntryExact
+    # E15: waiting for the last snapshot. With threads, the release that
+    # drains the last pin wakes the waiter; on a target with one thread the
+    # call reports what is still pinned and never waits. Lean:
+    # Regolith/SnapshotWait.lean, no_lost_wake, one_thread_never_waits.
+    spec=SnapshotWait
+    check MC_SnapshotWait_Green                        GREEN
+    check MC_SnapshotWait_Green_NoThreads              GREEN
+    check MC_SnapshotWait_Red_WaitAnyway               RED NeverWaitsAlone
+    check MC_SnapshotWait_Red_FutureAfterWatch         RED NoLostWake
+    check MC_SnapshotWait_Red_ReadThenMark             RED NoLostWake
     # 4.6, D54: per-thread statistics shards. Lean: Regolith/ShardedStats.lean,
     # total_after_adds, read_between, reads_monotone.
     spec=ShardedStats
     check MC_ShardedStats_Green                        GREEN
     check MC_ShardedStats_Red_LostUpdate               RED QuiescentExact
     check MC_ShardedStats_Red_PartialRead              RED ReadBetween
-    # E10, group commit. Lean: Regolith/GroupCommit.lean, group_eq_serial.
-    spec=GroupCommit
-    check MC_GroupCommit_Green                         GREEN
-    check MC_GroupCommit_Green_Live                    GREEN
-    check MC_GroupCommit_Green_LivePlain               GREEN
-    check MC_GroupCommit_Green_ReadOnly                GREEN
-    check MC_GroupCommit_Red_ViewOnly                  RED SerialEquivalent
-    check MC_GroupCommit_Red_TrustEarly                RED SerialEquivalent
-    check MC_GroupCommit_Red_PublishBeforeSync         RED DurableBeforeVisible
-    # E21, the bounded leader: one group per turn, then hand off.
-    check MC_GroupCommit_Red_DrainAll                  RED BoundedTurn
-    # D53, the group fsync as a claimable job for commit_nowait members.
-    # Green_Nowait_Owes is the witness that the GREEN run leaves groups owed.
-    # Lean: Regolith/IoQueue.lean, group_sync_once, group_visible_after_sync.
-    check MC_GroupCommit_Green_Nowait                  GREEN
-    check MC_GroupCommit_Green_NowaitLive              GREEN
-    check MC_GroupCommit_Green_Nowait_Owes             RED NothingOwed
-    check MC_GroupCommit_Red_DoubleClaim               RED SingleSync
-    # 4.7, the lock-free commit pipeline. Lean: Regolith/Pipeline.lean,
-    # seqs_dense and reader_sees_published.
+    # E10 and 4.7, the lock-free commit pipeline as built: helping, voiding,
+    # the check in two parts (early, then in ring order), the round (one
+    # claim on the log's device step), the rollback of a failed log, ordered
+    # units and rotation through the ring, and bounded work (E21). It carries
+    # every rule of the group commit it replaced; the model's header lists
+    # which rule and which row took each one over. A Green row whose name
+    # ends in Discards, Stale, Rotates, Voids, Helps or Aborts is a witness:
+    # the GREEN run beside it with one false claim added, which must break,
+    # so the GREEN run is known to reach the case. Lean:
+    # Regolith/Pipeline.lean, seqs_dense, reader_sees_published,
+    # rollback_as_if_never_decided, rollback_keeps_published,
+    # sync_covers_only_written; Regolith/PipelineCheck.lean,
+    # later_slot_aborts, abort_has_cause, early_check_split,
+    # published_only_loses_an_update; Regolith/PipelineHelping.lean,
+    # first_unfinished_can_step, helper_alone_finishes, helping_is_bounded.
     spec=CommitPipeline
-    check MC_CommitPipeline_Green                      GREEN
-    check MC_CommitPipeline_Green_Live                 GREEN
-    check MC_CommitPipeline_Green_LiveIngest           GREEN
-    check MC_CommitPipeline_Green_LiveApart            GREEN
-    check MC_CommitPipeline_Red_OutOfOrder             RED ReadersSeePrefix
-    check MC_CommitPipeline_Red_AbortHole              RED NoHole
-    check MC_CommitPipeline_Red_NoHelping              RED NoLiveThreadBlocked
-    check MC_CommitPipeline_Red_SyncPastGap            RED DurableImpliesWritten
-    check MC_CommitPipeline_Red_ValidatePublished      RED NoLostUpdate
+    check MC_CommitPipeline_Green                           GREEN
+    check MC_CommitPipeline_Green_Stop                      GREEN
+    check MC_CommitPipeline_Green_Live                      GREEN
+    check MC_CommitPipeline_Green_LiveIngest                GREEN
+    check MC_CommitPipeline_Green_LiveApart                 GREEN
+    check MC_CommitPipeline_Green_LiveThree_Head1           GREEN
+    check MC_CommitPipeline_Green_LiveThree_Head2           GREEN
+    check MC_CommitPipeline_Green_LiveThree_Head3           GREEN
+    check MC_CommitPipeline_Green_Rollback                  GREEN
+    check MC_CommitPipeline_Green_Rollback_Discards         RED NothingThrownOut
+    check MC_CommitPipeline_Green_Rollback_Stale            RED NoStaleVerdict
+    check MC_CommitPipeline_Green_Rollback_Three            GREEN
+    check MC_CommitPipeline_Green_Rotation                  GREEN
+    check MC_CommitPipeline_Green_Rotation_Rotates          RED NeverRotated
+    check MC_CommitPipeline_Green_Rotation_Three            GREEN
+    check MC_CommitPipeline_Green_Unit_Rollback             GREEN
+    check MC_CommitPipeline_Green_Live_Voids                RED NothingVoided
+    check MC_CommitPipeline_Green_Live_Helps                RED StoppedStaysUnfinished
+    check MC_CommitPipeline_Green_Early                     GREEN
+    check MC_CommitPipeline_Green_Early_Aborts              RED NoEarlyAbort
+    check MC_CommitPipeline_Green_ReadOnly                  GREEN
+    check MC_CommitPipeline_Green_Plain                     GREEN
+    check MC_CommitPipeline_Red_OutOfOrder                  RED ReadersSeePrefix
+    check MC_CommitPipeline_Red_AbortHole                   RED NoHole
+    check MC_CommitPipeline_Red_NoHelping                   RED NoLiveThreadBlocked
+    check MC_CommitPipeline_Red_SyncPastGap                 RED DurableImpliesWritten
+    check MC_CommitPipeline_Red_ValidatePublished           RED NoLostUpdate
+    check MC_CommitPipeline_Red_VoidNotCas                  RED OwnerSeesItsFate
+    check MC_CommitPipeline_Red_TwoSyncs                    RED OneRound
+    check MC_CommitPipeline_Red_TwoSyncs_Durable            RED DurableWithinDecided
+    check MC_CommitPipeline_Red_FrontierFirst               RED PublishedIsVisible
+    check MC_CommitPipeline_Red_UnitNoDrain                 RED DurableImpliesWritten
+    check MC_CommitPipeline_Red_UnitNoDrain_SealedLog       RED InFlightInCurrentLog
+    check MC_CommitPipeline_Red_UnitNoDrain_Unit            RED DurableImpliesWritten
+    check MC_CommitPipeline_Red_SettleAnyEpoch              RED NoHole
+    check MC_CommitPipeline_Red_SettleAnyEpoch_Abort        RED AbortsHaveCause
+    check MC_CommitPipeline_Red_KeepMemtable                RED MemtableOnlyLive
+    check MC_CommitPipeline_Red_NoEpochGate                 RED RecordsAreLive
+    check MC_CommitPipeline_Red_PassBeforeApply             RED AppliedBeforePassed
+    check MC_CommitPipeline_Red_PassBeforeApply_LostUpdate  RED NoLostUpdate
+    check MC_CommitPipeline_Red_RollbackForgets             RED PublishedPrefix
+    check MC_CommitPipeline_Red_RollbackForgets_Ack         RED NoFalseAck
+    check MC_CommitPipeline_Red_NoFreeze                    RED NoHole
+    check MC_CommitPipeline_Red_TrustEarly                  RED NoLostUpdate
+    check MC_CommitPipeline_Red_PublishBeforeSync           RED DurableBeforeVisible
+    check MC_CommitPipeline_Red_DecideAnyOrder              RED DecidedIsPrefix
+    check MC_CommitPipeline_Red_DecideAnyOrder_Order        RED SeqInRingOrder
+    check MC_CommitPipeline_Red_WorkBeyond                  RED WorksUpToItsOwn
+    check MC_CommitPipeline_Red_StopHoldsClaim              RED NoLiveThreadBlocked
+    # WG4: a record's late copy, the same bytes a slow owner still had in
+    # flight, never lands under a sync that covers it. Rust:
+    # src/engine/commit/late_copy_tests.rs, under the fault shim.
+    check MC_CommitPipeline_Green_Copies                    GREEN
+    check MC_CommitPipeline_Green_Copies_InFlight           RED NoTwoCopies
+    check MC_CommitPipeline_Red_SyncNoWait                  RED NoWriteUnderSync
+    # Decision 3 of plan 4.7: a queue's poll never waits for another thread.
+    # A job that cannot get the round, the version store's step, the flush
+    # exclusion or a failed log clear of writes parks: it leaves a note, looks
+    # again, gives back what it took and frees its claim, and whoever waited
+    # on it is told. Green_Parks is the witness that the GREEN runs park.
+    # Lean: Regolith/Parking.lean, no_parked_job_is_forgotten,
+    # no_second_look_forgets_a_job.
+    spec=Parking
+    check MC_Parking_Green                             GREEN
+    check MC_Parking_Green_Round                       GREEN
+    check MC_Parking_Green_OneQueue                    GREEN
+    check MC_Parking_Green_Sleeper                     GREEN
+    check MC_Parking_Green_TwoQueues                   GREEN
+    check MC_Parking_Green_Parks                       RED NeverParked
+    check MC_Parking_Red_PollWaits                     RED NoPollWaits
+    check MC_Parking_Red_KeepsTool                     RED ParkedHoldsNothing
+    check MC_Parking_Red_NoSecondLook                  RED JobLands
+    check MC_Parking_Red_ReleaseTellsNobody            RED JobLands
+    check MC_Parking_Red_WakeOnlyStepper               RED JobLands
+    check MC_Parking_Red_ParkTellsNobody               RED JobLands
+    check MC_Parking_Red_WakeFindsClaimed              RED JobLands
+    check MC_Parking_Red_StaleTellDelivers             RED JobLands
+    # The step that replaced the version store's mutex: one section at a
+    # time, in the order handed over, run by whichever thread holds the step,
+    # none left behind, and a job that keeps the step never waits.
+    # Green_Parks is the witness that the GREEN run parks a job, and
+    # Red_KeeperStops the stated limit: a job that stops while it keeps the
+    # step keeps the callers behind it waiting. Lean:
+    # Regolith/VersionStep.lean, one_holder, runs_in_push_order,
+    # none_left_behind, giving_up_blind_leaves_a_section.
+    spec=VersionStep
+    check MC_VersionStep_Green                         GREEN
+    check MC_VersionStep_Green_OneCaller               GREEN
+    check MC_VersionStep_Green_Parks                   RED NeverParked
+    check MC_VersionStep_Red_HoldWithoutCas            RED OneAtATime
+    check MC_VersionStep_Red_HoldWithoutCas_LostEdit   RED NoLostEdit
+    check MC_VersionStep_Red_GiveUpBlind               RED NoneLeftBehind
+    check MC_VersionStep_Red_NewestFirst               RED InPushOrder
+    check MC_VersionStep_Red_ReturnEarly               RED FinishedBeforeReturn
+    check MC_VersionStep_Red_HolderWaits               RED NoHolderWaits
+    check MC_VersionStep_Red_ReleaseTellsNobody        RED EverySectionRuns
+    check MC_VersionStep_Red_NoSecondTry               RED EverySectionRuns
+    check MC_VersionStep_Red_KeeperStops               RED EverySectionRuns
+    # The landing listeners of a slot: told exactly once, after the commit
+    # is visible or discarded, by whichever thread lands the slot; a
+    # publisher that stops before it takes them leaves the telling to the
+    # next. Red_StopAfterTake is the stated limit: one that stops holding
+    # the listeners it took keeps them. Lean: Regolith/Landing.lean,
+    # told_at_most_once, one_place, closed_sheet_is_empty,
+    # read_then_clear_tells_twice.
+    spec=Landing
+    check MC_Landing_Green                             GREEN
+    check MC_Landing_Green_Discarded                   GREEN
+    check MC_Landing_Red_TakeNoShut                    RED EveryListenerTold
+    check MC_Landing_Red_ReadThenClear                 RED ToldAtMostOnce
+    check MC_Landing_Red_TellBeforeHorizon             RED ToldAfterLanding
+    check MC_Landing_Red_FrontierFirst                 RED EveryListenerTold
+    check MC_Landing_Red_StopAfterTake                 RED EveryListenerTold
     # R13 and D53, non-blocking reads on per-thread I/O queues: single-flight
     # units claimed by one CAS, completions only on the asking queue, idle
     # wakeups. Lean: Regolith/IoQueue.lean, claim_once, told_at_most_once,
@@ -768,10 +949,10 @@ tla:
     check MC_NonBlocking_Red_DoubleRun                 RED SingleRun
     check MC_NonBlocking_Red_SelfIoNowhere             RED NoOrphanUnit
     check MC_NonBlocking_Red_BusyWoken                 RED BusyNeverWoken
-    # D53, the commit side's units: a group's fsync claimed by one member's
-    # poll and told to every member's own queue, and a stall's passive unit
-    # landed by its clearer or by a writer's second look. Lean:
-    # Regolith/IoQueue.lean, group_sync_once, group_visible_after_sync,
+    # D53, the commit side's units: a sync round claimed by the poll of one
+    # of the queues that wait on it and told to each of them, and a stall's
+    # passive unit landed by its clearer or by a writer's second look. Lean:
+    # Regolith/IoQueue.lean, round_sync_once, round_visible_after_sync,
     # ticket_ready_only_at_own_poll, stall_lands_when_clear.
     check MC_NonBlocking_Green_Commit                  GREEN
     check MC_NonBlocking_Green_Stall                   GREEN
@@ -779,6 +960,18 @@ tla:
     check MC_NonBlocking_Red_PublishAtWrite            RED VisibleAfterSync
     check MC_NonBlocking_Red_DeliverOnLander           RED DeliveredOnOwnPoll
     check MC_NonBlocking_Red_NoRecheck                 RED StallLandsWhenClear
+    # D53, timed waits (the wait a retry backs off on): completed only by
+    # the poll of the queue that was asked, not before the due time, by an
+    # owner that polls again within what its poll reported, and by the drop
+    # of the queue. Lean: Regolith/IoQueue.lean, timed_wait_completed_once,
+    # timed_wait_completed_by_owner, timed_wait_not_before_due,
+    # dropped_queue_holds_no_wait, poll_after_wake_in_completes.
+    check MC_NonBlocking_Green_Timer                   GREEN
+    check MC_NonBlocking_Green_TimerLive               GREEN
+    check MC_NonBlocking_Red_IdlePastDue               RED AllDone
+    check MC_NonBlocking_Red_EarlyFire                 RED TimerNotEarly
+    check MC_NonBlocking_Red_DropForgets               RED DroppedHoldsNothing
+    check MC_NonBlocking_Red_TimerWrongQueue           RED TimerOnOwnQueue
     # Phase 7 integration: with no worker and inline compaction on, no
     # stopped writer waits on a relief nobody runs. Every piece of progress
     # lands the stall's unit (relief handed back), a contended writer reads
@@ -810,13 +1003,38 @@ tla:
     check MC_StallRelief_Green_ReliefFails             GREEN
     check MC_StallRelief_Red_NoFailLand                RED NoWaitOnceFailing
     check MC_StallRelief_Red_NoFailRecheck             RED NoWaitOnceFailing
+    # A commit is never lost to a stall: however its call ends, its write
+    # went in or it was told a failure. It is not handed the wait a plain
+    # write is, inline compaction off included (L32), and it does not give
+    # up while its steps make progress. Lean: Regolith/StallCommit.lean,
+    # no_lost_commit, takes_wait_loses_a_commit, gives_up_loses_a_commit,
+    # left_to_caller_loses_a_commit.
+    check MC_StallRelief_Green_Commit                  GREEN
+    check MC_StallRelief_Green_Commit_Failures         GREEN
+    check MC_StallRelief_Red_CommitTakesWait           RED NoLostCommit
+    check MC_StallRelief_Red_CommitGivesUp             RED NoLostCommit
+    check MC_StallRelief_Green_Commit_InlineOff        GREEN
+    check MC_StallRelief_Red_CommitLeftToCaller        RED NoLostCommit
+    # E16: with no worker, a write that owes a step of background work runs
+    # exactly one, and L0 stays at its compaction trigger (at the stop
+    # trigger when every write seals). Lean: Regolith/OwedStep.lean,
+    # write_one_step, l0_bounded, l0_bounded_by_stop.
+    spec=OwedStep
+    check MC_OwedStep_Green                            GREEN
+    check MC_OwedStep_Green_TinyMemtable               GREEN
+    check MC_OwedStep_Red_FlushOwesNothing             RED L0Bounded
+    check MC_OwedStep_Red_StepUntilIdle                RED OneStepPerWrite
     # regolith::sync's locks after D49: barging with bounded bypass, for
-    # Mutex, Semaphore and ReentrantMutex. Lean: Regolith/Sync.lean,
-    # mutual_exclusion, bounded_bypass, owed_exclusive.
+    # Mutex, Semaphore and ReentrantMutex, one step per atomic instruction
+    # of src/sync. Lean: Regolith/Sync.lean, mutual_exclusion,
+    # bounded_bypass, owed_at_bound, owed_exclusive.
     spec=Sync
     check MC_Sync_Green_Mutex                          GREEN
+    check MC_Sync_Green_MutexBarger                    GREEN
+    check MC_Sync_Green_MutexBoth                      GREEN
     check MC_Sync_Green_MutexLive                      GREEN
     check MC_Sync_Green_Semaphore                      GREEN
+    check MC_Sync_Green_BigRequest                     GREEN
     check MC_Sync_Green_SemaphoreLive                  GREEN
     check MC_Sync_Green_Reentrant                      GREEN
     check MC_Sync_Green_ReentrantLive                  GREEN
@@ -825,8 +1043,17 @@ tla:
     check MC_Sync_Red_LoseQueuePosition                RED BoundedBypass
     check MC_Sync_Red_CancelNoPassOn                   RED CancelPassesOn
     check MC_Sync_Red_NoRecheck                        RED NoLostWakeup
+    check MC_Sync_Red_NoDirty                          RED NoLostWakeup
+    check MC_Sync_Red_LowerPendingMarker               RED EveryWaiterServed
     check MC_Sync_Red_IgnoreOwed                       RED HandoffExclusive
     check MC_Sync_Red_NoDepth                          RED ReentrancyDepth
+    # E32, what a drain costs its thread: one pass, and one more for each
+    # waiter operation, or release with a node queued, that lands on it.
+    # Green_PassesGrow is the witness that the passes do grow with those
+    # (lock-free, not wait-free): FewPasses is no promise and must fail.
+    check MC_Sync_Red_ReleaseDirties                   RED DrainBounded
+    check MC_Sync_Red_ExitIgnoresRequest               RED NoLostWakeup
+    check MC_Sync_Green_PassesGrow                     RED FewPasses
     # regolith::sync::Notify, which keeps FIFO handoff. Lean:
     # Regolith/SyncFifo.lean, fifo_served, no_stranded_waiter.
     spec=SyncNotify
@@ -837,17 +1064,25 @@ tla:
     check MC_SyncNotify_Red_NoRecheck                  RED NoLostWakeup
     check MC_SyncNotify_Red_NoGenCheck                 RED NoLostWakeup
     # regolith::sync::RwLock and ReentrantRwLock after D49, with D50's
-    # upgradable read.
+    # upgradable read, one step of src/sync/raw_rwlock.rs at a time on the
+    # queue of Sync.tla. Lean: Regolith/Sync.lean for the exclusive side.
     spec=SyncRwLock
     check MC_SyncRwLock_Green_Plain                    GREEN
     check MC_SyncRwLock_Green_WriterLive               GREEN
     check MC_SyncRwLock_Green_ReaderLive               GREEN
+    check MC_SyncRwLock_Green_Upgrade                  GREEN
+    check MC_SyncRwLock_Green_UpgradeLive              GREEN
     check MC_SyncRwLock_Green_Reentrant                GREEN
     check MC_SyncRwLock_Green_ReentrantLive            GREEN
     check MC_SyncRwLock_Red_UnboundedBarging           RED BoundedBypass
     check MC_SyncRwLock_Red_AnyReaderUpgrade           RED NoUpgradeDeadlock
     check MC_SyncRwLock_Red_UpgradeNoHoldBack          RED UpgradeHoldsBack
     check MC_SyncRwLock_Red_OwnerUnaware               RED NoSelfDeadlock
+    # E33: a dropped upgrade while the reader leaves and the next task takes
+    # the upgradable read. The RED is the step the fix removed: the pass
+    # reads UPGRADING and takes the write for the node in its slot.
+    check MC_SyncRwLock_Green_UpgradeDropped           GREEN
+    check MC_SyncRwLock_Red_PassTakesWrite             RED GuardsCounted
     # The compaction gate (4.6, E28): a pass shares it, a job holds it
     # alone, no waiter is passed over more than Bound times either way, the
     # worker takes turns between jobs and passes, and a job parked on its
@@ -874,18 +1109,25 @@ tla:
     check MC_SyncLatch_Green_Barrier                   GREEN
     check MC_SyncLatch_Red_NoRecheck                   RED NoLostWakeup
     check MC_SyncLatch_Red_CountCheck                  RED NoLostWakeup
-    # regolith::sync::OnceCell and Lazy: exactly one value is published.
+    # regolith::sync::OnceCell and Lazy: one pointer published by one
+    # compare-and-swap, and a one-permit semaphore for the initializers'
+    # turns, which a publisher opens wide.
     spec=SyncOnce
     check MC_SyncOnce_Green                            GREEN
-    check MC_SyncOnce_Red_CancelNoReset                RED NoLostWakeup
     check MC_SyncOnce_Red_PlainStore                   RED PublishedOnce
-    check MC_SyncOnce_Red_NoRecheck                    RED NoLostWakeup
-    check MC_SyncOnce_Red_ReparkStale                  RED NoLostWakeup
-    # Transaction callbacks (3.16), delivered on the committing thread (D53).
-    # Lean: Regolith/Callbacks.lean, exactly_once, order, attempts_isolated,
-    # delivered_once, delivered_on_queue_thread.
+    check MC_SyncOnce_Red_LoserKeepsOwn                RED ReadersAgree
+    check MC_SyncOnce_Red_CancelNoReset                RED NoLostWakeup
+    check MC_SyncOnce_Red_PublishNoOpen                RED NoLostWakeup
+    # Transaction callbacks (3.16), told on the committing thread (D53), in
+    # both forms of commit: the blocking commit `transact` calls, and
+    # commit_nowait, whose pending ticket is resolved from its commit's
+    # slot at delivery. Lean: Regolith/Callbacks.lean, exactly_once, order,
+    # attempts_isolated, delivered_once, delivered_on_queue_thread,
+    # resolved_after_landing, resolved_once_on_queue_thread.
     spec=TxnCallbacks
     check MC_TxnCallbacks_Green_Immediate              GREEN
+    check MC_TxnCallbacks_Green_Blocking               GREEN
+    check MC_TxnCallbacks_Green_Nowait                 GREEN
     check MC_TxnCallbacks_Green_Eventual               GREEN
     check MC_TxnCallbacks_Red_CommitBeforeDurable      RED CommitAfterDurable
     check MC_TxnCallbacks_Red_SkipCallbackWrites       RED NoLostUpdate
@@ -900,18 +1142,25 @@ tla:
     check MC_ReadView_Red_FreeEarly                    RED NoFreedRead
     check MC_ReadView_Red_StaleLoad                    RED FreshLoad
     check MC_ReadView_Red_PlainStore                   RED ChainOfPublications
-    # Phase 7 integration: the read view's publishers as group commit and the
-    # flush off the commit path left them, every one by compare-and-swap.
-    # A flush installs its table and retires its memtable in one publication.
+    # The read view's publishers as the commit pipeline and the flush off the
+    # commit path have them, every one by compare-and-swap: a rotation in its
+    # ordered unit and a rollback, one at a time (the round); a flush, a
+    # compaction and an ingest, one version publish at a time (the step). A
+    # flush installs its table and retires its memtable in one publication.
     # Lean: Regolith/ReadViewPublishers.lean, no_lost_memtable,
-    # retired_stay_gone, flush_keeps_sources_disjoint,
+    # retired_stay_gone, replaced_stay_gone, flush_keeps_sources_disjoint,
     # split_install_holds_a_memtable_twice, plain_retire_loses_a_seal,
-    # plain_version_loses_a_seal.
+    # plain_version_loses_a_seal, plain_rollback_loses_an_ingest,
+    # plain_rollback_brings_back_a_flushed_memtable,
+    # seal_beside_a_rollback_freezes_the_replaced_memtable.
     spec=ReadViewPublishers
     check MC_ReadViewPublishers_Green                  GREEN
     check MC_ReadViewPublishers_Red_SplitRetire        RED NoDoubleSource
     check MC_ReadViewPublishers_Red_PlainRetire        RED NoLostMemtable
     check MC_ReadViewPublishers_Red_PlainVersion       RED NoLostMemtable
+    check MC_ReadViewPublishers_Red_PlainRollback      RED NoLostIngest
+    check MC_ReadViewPublishers_Red_PlainRollbackFlush RED RetiredStayGone
+    check MC_ReadViewPublishers_Red_SealOutsideRound   RED ReplacedStayGone
     # 4.6, Phase 7b: the lock-free CLOCK block cache. Lean:
     # Regolith/ClockCache.lean, evict_only_unpinned, reachable_safe,
     # two_level_bounded and used_exact.
@@ -920,12 +1169,19 @@ tla:
     check MC_ClockCache_Red_IgnorePins                 RED NoFreedPin
     check MC_ClockCache_Red_Unbounded                  RED ByteBound
     check MC_ClockCache_Red_LandingUnheld              RED LandedReadable
-    # 4.6, Phase 7b: a memtable's append-only range-tombstone log. Lean:
-    # Regolith/TombstoneLog.lean, prefix_whole and published_seen.
+    # 4.6, Phase 7b and 4.7: a memtable's append-only range-tombstone log,
+    # appended to by whichever threads apply commits. Green_Twice is the
+    # witness that the GREEN run appends one tombstone twice. Lean:
+    # Regolith/TombstoneLog.lean, one_slot_each, ready_whole and
+    # published_seen.
     spec=TombstoneLog
-    check MC_TombstoneLog_Green                        GREEN
-    check MC_TombstoneLog_Red_LenFirst                 RED PrefixWhole
-    check MC_TombstoneLog_Red_HorizonFirst             RED PublishedSeen
+    check MC_TombstoneLog_Green               GREEN
+    check MC_TombstoneLog_Green_Readers       GREEN
+    check MC_TombstoneLog_Green_Twice         RED NeverTwice
+    check MC_TombstoneLog_Red_ReadyFirst      RED ReadWhole
+    check MC_TombstoneLog_Red_HorizonFirst    RED PublishedSeen
+    check MC_TombstoneLog_Red_LoadStore       RED OneSlotEach
+    check MC_TombstoneLog_Red_LoadStore_Lost  RED PublishedSeen
     # 4.6, Phase 7c1: the open-file slot table under max_open_files. Lean:
     # Regolith/OpenFileTable.lean, open_le_cap, never_closes_in_use,
     # reads_own_file.
@@ -935,19 +1191,29 @@ tla:
     check MC_OpenFileTable_Red_IgnoreReaders           RED NeverClosedInUse
     check MC_OpenFileTable_Red_NoOwnerRecheck          RED ReadsOwnFile
     check MC_OpenFileTable_Red_OutsideTable            RED AtMostCap
-    # 4.6, Phase 7c1: column-family create, drop and use, fenced in the
-    # ordered step. Lean: Regolith/CfRegistry.lean, no_write_after_drop,
-    # no_write_before_birth, life_in_order.
+    # D60: a queue unit's reopen never waits for a slot, and a parked one is
+    # never forgotten. Lean: Regolith/OpenFileNoWait.lean, never_waits;
+    # Regolith/OpenFileNoWaitProof.lean, retry_never_lost; the REDs in
+    # Regolith/OpenFileNoWaitRed.lean.
+    check MC_OpenFileTable_Green_NoWait                GREEN
+    check MC_OpenFileTable_Green_NoWaitTwoSlots        GREEN
+    check MC_OpenFileTable_Red_Waits                   RED NeverWaits
+    check MC_OpenFileTable_Red_MarkFirst               RED RetryNeverLost
+    check MC_OpenFileTable_Red_PublishDropsWanted      RED RetryNeverLost
+    check MC_OpenFileTable_Red_WakeNeedsParked         RED RetryNeverLost
+    # 4.6, Phase 7c1 and 4.7: column-family create, drop and use, fenced when
+    # a slot of the commit ring is decided. Lean: Regolith/CfRegistry.lean,
+    # no_write_after_drop, no_write_before_birth, life_in_order.
     spec=CfRegistry
     check MC_CfRegistry_Green                          GREEN
     check MC_CfRegistry_Red_FenceOutside               RED NoWriteAfterDrop
     check MC_CfRegistry_Red_RetireLate                 RED NoWriteAfterDrop
     check MC_CfRegistry_Red_ReuseId                    RED LifeInOrder
-    # Phase 7 integration: the fence on every group-commit path (the
-    # leader's own request, a queued ticket, the hand-off's held ticket, a
-    # transaction member, an ingest's install). Lean: group_no_write_after_drop,
-    # fenced_at_hand_off_lands_after_drop.
-    check MC_CfRegistry_Red_FenceAtHandOff             RED NoWriteAfterDrop
+    # The fence on the pipeline's one path: a write's, a transaction's and
+    # an ingest's slot are each checked when the slot is decided, not when it
+    # is taken. Lean: ring_no_write_after_drop,
+    # fenced_at_install_lands_after_drop.
+    check MC_CfRegistry_Red_FenceAtInstall             RED NoWriteAfterDrop
     check MC_CfRegistry_Red_TxnUnfenced                RED NoWriteAfterDrop
     # 4.6, Phase 7c1: the env file maps, positional reads and lock-free
     # in-memory files. Lean: Regolith/EnvFiles.lean, positional_reads_own,
@@ -958,6 +1224,13 @@ tla:
     check MC_EnvFiles_Red_SharedCursor                 RED ReadsOwnBytes
     check MC_EnvFiles_Red_NoFreeze                     RED CurrentHoldsFinished
     check MC_EnvFiles_Red_StaleFrozen                  RED CurrentHoldsFinished
+    # A table renamed aside while its handles reopen it: the Env's rename adds
+    # the new name before it drops the old, and a reopen that found nothing
+    # loads the names again. Lean: Regolith/EnvFilesRename.lean,
+    # open_finds_file, and the REDs remove_first_loses and no_reload_loses.
+    check MC_EnvFiles_Green_Rename                     GREEN
+    check MC_EnvFiles_Red_RemoveFirst                  RED OpenFindsFile
+    check MC_EnvFiles_Red_NoReload                     RED OpenFindsFile
     # The pessimistic lock table (plan 4.6, 4.10): one holder per key, no
     # lost wake-up, bounded bypass, a wait delivered to its own queue, and a
     # lock released when its commit lands. Lean: Regolith/LockTable.lean,
@@ -1011,8 +1284,16 @@ lean:
     fi
     lake env lean Audit.lean
 
-# Every formal check: the TLA+ models and the Lean proofs.
-proofs: tla lean
+# Every line of a TLA+ model, a TLC configuration and a Lean proof carries a
+# plain-words comment directly above it, written for a reader who knows
+# neither the language nor the code; `proofs/check-comments.sh` states the
+# rule and fails on any line without one. No file is left out.
+# Fail when a proof line has no comment above it.
+proofs-comments:
+    proofs/check-comments.sh
+
+# Every formal check: the TLA+ models, the Lean proofs, and their comments.
+proofs: tla lean proofs-comments
 
 # ---------- consistency ----------
 
@@ -1096,6 +1377,9 @@ elle-matrix:
     # get_for_update, the one read that level leaves unvalidated and
     # SnapshotIsolation validates.
     check pessimistic-rc      list-append read-committed     --isolation read-committed --threads 8 --txns 50 --keys 4 --seed 2
+    # The same level over registers: a lock that times out aborts its
+    # transaction, and a value an aborted transaction wrote must never be read.
+    check pessimistic-rc-rw   rw-register read-committed     --isolation read-committed --threads 8 --txns 50 --keys 4 --seed 3
     check pessimistic-hotkey  list-append read-committed     --isolation read-committed --threads 8 --txns 50 --keys 1 --seed 1
     # Serializable validates the whole read set, so the strongest model
     # Elle offers must hold.
@@ -1116,6 +1400,35 @@ elle-matrix:
     # key both commit, which first-committer-wins forbids.
     check defra-level         list-append strict-serializable --isolation defra-level --threads 8 --txns 60 --keys 4 --seed 16
     check defra-level-rw      rw-register strict-serializable --isolation defra-level --threads 8 --txns 60 --keys 4 --seed 17
+    # DefraLevel with a key classifier (`--shape`, README.md). In the
+    # `classified` shape every transaction also stores a content-addressed
+    # block it read as missing, adds a key to a commutative prefix it scanned
+    # and appends to a log. The classes say none of that conflicts, and none
+    # of it may loosen the point operations beside it: the strongest model
+    # must hold, and elle-gen itself fails the row when a commit left a head
+    # without its log entry.
+    check defra-classified    list-append strict-serializable --isolation defra-level --shape classified --threads 8 --txns 60 --keys 4 --seed 18
+    check defra-classified-rw rw-register strict-serializable --isolation defra-level --shape classified --threads 8 --txns 60 --keys 4 --seed 19
+    # Commit-ordered appends: a key is a log, an append is
+    # `Transaction::append` and a read is the log in one snapshot. An append
+    # is never validated at any level and positions follow commit order, so
+    # every level must hold the strongest model, the pessimistic flavour too.
+    check defra-appends       list-append strict-serializable --isolation defra-level --shape appends --threads 8 --txns 60 --keys 4 --seed 20
+    check si-appends          list-append strict-serializable --isolation snapshot-isolation --shape appends --threads 8 --txns 60 --keys 4 --seed 21
+    check pessimistic-appends list-append strict-serializable --isolation read-committed --shape appends --threads 8 --txns 60 --keys 4 --seed 22
+    # Projected reads: a key is one part of a document, an append is an
+    # operand on the part and a read is `get_parts` naming it. Two keys share
+    # a document, so a reader of one part commits beside an append to the
+    # other, and is refused by an append to its own.
+    check defra-parts         list-append strict-serializable --isolation defra-level --shape parts --threads 8 --txns 60 --keys 4 --seed 23
+    # A prefix scan: every read is one validated scan of all the keys,
+    # recorded as a read of each. Scan-then-write is the shape of write skew,
+    # which a validated scan refuses at every level. The rw-register row has
+    # keys enough that most writes create one: a key that appears under a
+    # scan, which only a validated range sees.
+    check defra-scan          list-append strict-serializable --isolation defra-level --shape scan --threads 8 --txns 60 --keys 4 --seed 24
+    check defra-scan-phantoms rw-register strict-serializable --isolation defra-level --shape scan --threads 8 --txns 60 --keys 64 --seed 25
+    check repeatable-read-scan list-append strict-serializable --isolation repeatable-read --shape scan --threads 8 --txns 60 --keys 4 --seed 26
     exit $fail
 
 # ---------- portability ----------
@@ -1157,7 +1470,7 @@ wasm-native records="5000" sustained="20000":
 
 # The OPFS contract against a real browser. `wasm-pack test` cannot
 # drive these: it appends `--tests`, which builds every target in
-# `tests/`, and all but the three `wasm_opfs*` files are native-only.
+# `tests/`, and all but the four `wasm_opfs*` files are native-only.
 # The runner is named per target instead, so only the named test
 # binaries are built.
 #
@@ -1189,7 +1502,7 @@ wasm-browser:
     # That budget covers the tests, not a driver or a browser that never
     # starts, so each suite is built first and then run under a hard limit
     # of twice the budget: the runner's own message comes first.
-    for suite in wasm_opfs wasm_opfs_main wasm_opfs_memory; do
+    for suite in wasm_opfs wasm_opfs_main wasm_opfs_memory wasm_opfs_transactions; do
         echo "== $suite =="
         cargo test --target wasm32-unknown-unknown --test "$suite" --no-run
         just bounded 6m wasm-browser cargo test --target wasm32-unknown-unknown --test "$suite"

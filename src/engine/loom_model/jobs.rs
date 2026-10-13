@@ -1,6 +1,6 @@
 //! Models of the commit side of the per-thread I/O queues (D53, plan 4.10):
-//! a job (a commit group's fsync) claimed by one compare-and-swap among the
-//! member queues that race for it, the one completion it pushes to each
+//! a job (a sync round of the commit pipeline) claimed by one
+//! compare-and-swap among the queues of the commits that race for it, the one completion it pushes to each
 //! member queue, and a ticket's callbacks racing the delivery of its outcome.
 //!
 //! Each positive model drives the production types: `Job`, `QueueShared`

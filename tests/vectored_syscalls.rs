@@ -65,11 +65,41 @@ impl WriteFile for CountingWrite {
     }
 }
 
+/// The log the host hands out, with every write at an offset counted as
+/// the one host write it is.
+struct CountingLog {
+    inner: Box<dyn regolith::env::LogFile>,
+    counters: Arc<Counters>,
+}
+
+impl regolith::env::LogFile for CountingLog {
+    fn write_all_at(&self, offset: u64, buf: &[u8]) -> io::Result<()> {
+        self.counters.writes.fetch_add(1, Ordering::Relaxed);
+        self.inner.write_all_at(offset, buf)
+    }
+    fn sync_data(&self) -> io::Result<()> {
+        self.inner.sync_data()
+    }
+    fn set_len(&self, len: u64) -> io::Result<()> {
+        self.inner.set_len(len)
+    }
+}
+
 impl Env for CountingEnv {
     fn open_write(&self, path: &Path, mode: WriteMode) -> io::Result<Box<dyn WriteFile>> {
         let inner = self.inner.open_write(path, mode)?;
         Ok(Box::new(CountingWrite {
             inner,
+            counters: Arc::clone(&self.counters),
+        }))
+    }
+    fn open_log(
+        &self,
+        path: &Path,
+        mode: WriteMode,
+    ) -> io::Result<Box<dyn regolith::env::LogFile>> {
+        Ok(Box::new(CountingLog {
+            inner: self.inner.open_log(path, mode)?,
             counters: Arc::clone(&self.counters),
         }))
     }

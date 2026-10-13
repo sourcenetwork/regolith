@@ -173,22 +173,65 @@ pub(crate) fn frame_record(
     offset: u64,
     out: &mut Vec<u8>,
 ) -> io::Result<()> {
+    out.clear();
+    out.reserve(HEADER_LEN + payload.len() + OVERHEAD);
+    out.resize(SEALED_PREFIX_LEN, 0);
+    out.extend_from_slice(payload);
+    let aead_nonce = super::seal::fresh_nonce()?;
+    frame_in_place(
+        sealer,
+        kind,
+        synced_through,
+        nonce,
+        offset,
+        &aead_nonce,
+        out,
+    )
+}
+
+/// Bytes a sealed record puts in front of its operations: the header and the
+/// AEAD nonce.
+pub(crate) const SEALED_PREFIX_LEN: usize = HEADER_LEN + NONCE_LEN;
+
+/// Frame and seal, in place, the record whose operations sit in `buf` after
+/// [`SEALED_PREFIX_LEN`] bytes left for the header and the AEAD nonce. The
+/// record is of `kind`, written at `offset` of the log stamped with `nonce`
+/// when the last completed sync covered `synced_through`, and sealed under
+/// `sealer` with `aead_nonce`. Given the same arguments it produces the same
+/// bytes, which is what lets any thread write a commit's record.
+pub(crate) fn frame_in_place(
+    sealer: &Sealer,
+    kind: u8,
+    synced_through: u64,
+    nonce: u64,
+    offset: u64,
+    aead_nonce: &[u8; NONCE_LEN],
+    buf: &mut Vec<u8>,
+) -> io::Result<()> {
     debug_assert!(
         synced_through <= offset,
         "a record claims only what is behind it"
     );
-    let len = u32::try_from(payload.len() + OVERHEAD)
+    let payload_len = buf.len().checked_sub(SEALED_PREFIX_LEN).ok_or_else(|| {
+        io::Error::other("a sealed record was framed without room for its header")
+    })?;
+    let len = u32::try_from(payload_len + OVERHEAD)
         .map_err(|_| io::Error::other("a write-ahead log record is too large to seal"))?;
     let mut fields = [0u8; 17];
     fields[0..4].copy_from_slice(&len.to_le_bytes());
     fields[4] = kind;
     fields[5..13].copy_from_slice(&synced_through.to_le_bytes());
     let check = checksum::wal_group_header(nonce, offset, &fields);
-    out.clear();
-    out.reserve(HEADER_LEN + payload.len() + OVERHEAD);
-    out.extend_from_slice(&fields);
-    out.extend_from_slice(&check.to_le_bytes());
-    sealer.seal_frame(&record_aad(nonce, offset, &fields), payload, out)
+    buf[..17].copy_from_slice(&fields);
+    buf[17..HEADER_LEN].copy_from_slice(&check.to_le_bytes());
+    buf[HEADER_LEN..SEALED_PREFIX_LEN].copy_from_slice(aead_nonce);
+    let tag = sealer.seal_with(
+        aead_nonce,
+        &record_aad(nonce, offset, &fields),
+        &mut buf[SEALED_PREFIX_LEN..],
+    )?;
+    buf.extend_from_slice(&tag);
+    Ok(())
 }
 
 /// Open the sealed payload `payload` of the record whose header fields are
@@ -214,6 +257,13 @@ pub(crate) fn create_durably(
     path: &Path,
     stamp: &[u8],
 ) -> io::Result<Box<dyn WriteFile>> {
+    stage_durably(env, path, stamp)?;
+    env.open_write(path, WriteMode::Append)
+}
+
+/// The creation half of [`create_durably`]: afterwards the log at `path`
+/// holds `stamp` and nothing else, durably, and is not open.
+pub(crate) fn stage_durably(env: &Arc<dyn Env>, path: &Path, stamp: &[u8]) -> io::Result<()> {
     let staged = path.with_extension("tmp");
     {
         let mut file = env.open_write(&staged, WriteMode::Truncate)?;
@@ -221,8 +271,7 @@ pub(crate) fn create_durably(
         file.sync_data()?;
     }
     env.rename(&staged, path)?;
-    crate::env::sync_parent_dir(&**env, path)?;
-    env.open_write(path, WriteMode::Append)
+    crate::env::sync_parent_dir(&**env, path)
 }
 
 /// Remove the staging files [`create_durably`] leaves in `wal_dir` when a

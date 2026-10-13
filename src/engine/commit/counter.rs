@@ -16,8 +16,8 @@ impl RegolithEngine {
     /// nothing hidden by a sequence bound: the newest committed value.
     /// `None` when the key is absent.
     ///
-    /// The caller holds the pipeline mutex, so the view is complete: every
-    /// earlier group is applied to it. A value of any length but eight is
+    /// The caller is deciding a slot, in ring order, so the view is
+    /// complete: every earlier commit is applied to it. A value of any length but eight is
     /// refused with `InvalidInput`, which surfaces as
     /// [`crate::Error::InvalidArgument`], and names no key bytes.
     pub(super) fn read_u64_in_view(&self, key: &[u8], view: &ReadView) -> io::Result<Option<u64>> {

@@ -151,6 +151,9 @@ impl Env for CountingEnv {
             counters: Arc::clone(&self.counters),
         }))
     }
+    fn open_log(&self, p: &Path, mode: WriteMode) -> io::Result<Box<dyn regolith::env::LogFile>> {
+        self.inner.open_log(p, mode)
+    }
     fn open_write(&self, p: &Path, mode: WriteMode) -> io::Result<Box<dyn WriteFile>> {
         self.inner.open_write(p, mode)
     }

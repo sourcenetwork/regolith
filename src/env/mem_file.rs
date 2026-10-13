@@ -23,6 +23,15 @@
 //!   writes again, on the new extent. The copy reads only below the length
 //!   it froze, never the bytes a concurrent appender may be writing.
 //!
+//! - **An append at one length only.** The positional log of `MemEnv`
+//!   (`mem_log.rs`) appends a record only while the file is exactly as long
+//!   as the record's offset ([`MemFile::append_at`]). It is the append
+//!   above with that one condition, read from the same state word the
+//!   append then moves, so it lands at that length or not at all. A second
+//!   thread appending the same record while the first is still copying
+//!   does not wait for it: it copies, as any write that meets `WRITER`
+//!   does, and the first finds the file already past its offset.
+//!
 //! Every write is lock-free (a failed CAS means another write landed), and a
 //! read is wait-free. A read sees every write that finished before it began:
 //! a finished append published its length on the extent every later load
@@ -167,6 +176,8 @@ impl Extent {
 enum Change<'a> {
     /// Append these slices at the end, wherever the end is when it lands.
     Append(&'a [&'a [u8]]),
+    /// Append these slices only while the file is exactly this long.
+    AppendAt(u64, &'a [&'a [u8]]),
     /// Write these bytes at `at`, extending the file with zeros to reach it.
     /// Only the OPFS mirror writes at an offset.
     #[cfg(any(test, all(target_arch = "wasm32", target_os = "unknown")))]
@@ -179,7 +190,7 @@ impl Change<'_> {
     /// Where the write starts and the length after it, for a file now `len`.
     fn bounds(&self, len: u64) -> io::Result<(u64, u64)> {
         let (at, end) = match self {
-            Change::Append(slices) => {
+            Change::Append(slices) | Change::AppendAt(_, slices) => {
                 let n: u64 = slices.iter().map(|s| s.len() as u64).sum();
                 (len, len.checked_add(n))
             }
@@ -204,7 +215,7 @@ impl Change<'_> {
     /// [`Extent::copy_in`]).
     unsafe fn fill(&self, extent: &Extent, at: usize) {
         match self {
-            Change::Append(slices) => {
+            Change::Append(slices) | Change::AppendAt(_, slices) => {
                 let mut at = at;
                 for slice in slices.iter() {
                     // SAFETY: forwarded from the caller.
@@ -219,6 +230,18 @@ impl Change<'_> {
             Change::SetLen(_) => {}
         }
     }
+}
+
+/// What [`MemFile::append_at`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AppendAt {
+    /// The file was as long as the offset: the bytes are appended, and the
+    /// file is this long now.
+    Appended(u64),
+    /// The file is longer than the offset: what starts there is written.
+    Past,
+    /// The file is shorter than the offset: a gap lies below it.
+    Short,
 }
 
 /// A file held in memory, read without any lock. See the module docs.
@@ -314,6 +337,23 @@ impl MemFile {
         self.change(&Change::Append(slices), charge)
     }
 
+    /// Append `slices` only if the file is exactly `at` bytes long now, and
+    /// say which side of `at` its length was on otherwise. Never waits: see
+    /// the module docs.
+    pub(crate) fn append_at(
+        &self,
+        at: u64,
+        slices: &[&[u8]],
+        charge: &dyn Charge,
+    ) -> io::Result<AppendAt> {
+        let (before, after) = self.change(&Change::AppendAt(at, slices), charge)?;
+        Ok(match before.cmp(&at) {
+            std::cmp::Ordering::Equal => AppendAt::Appended(after),
+            std::cmp::Ordering::Greater => AppendAt::Past,
+            std::cmp::Ordering::Less => AppendAt::Short,
+        })
+    }
+
     /// Write `buf` at `at`. Returns the length before and after.
     #[cfg(any(test, all(target_arch = "wasm32", target_os = "unknown")))]
     pub(crate) fn write_at(
@@ -336,6 +376,13 @@ impl MemFile {
             let extent = self.current.load();
             let state = settled(&extent);
             let len = state & LEN;
+            if let Change::AppendAt(only_at, _) = change
+                && *only_at != len
+            {
+                // Not the length the append is for: nothing changes, and
+                // the caller reads which side of it the file is on.
+                return Ok((len, len));
+            }
             let (at, end) = change.bounds(len)?;
             let grow = end.saturating_sub(len);
             charge.reserve(grow)?;
@@ -499,7 +546,7 @@ thread_local! {
 /// Run `hook` inside this thread's next append in place, between its write
 /// and its publish.
 #[cfg(test)]
-fn between_write_and_publish(hook: impl FnOnce() + 'static) {
+pub(super) fn between_write_and_publish(hook: impl FnOnce() + 'static) {
     BETWEEN_WRITE_AND_PUBLISH.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
 }
 

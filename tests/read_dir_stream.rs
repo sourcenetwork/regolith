@@ -12,6 +12,7 @@
 //! directory first carries every entry it acts on; one that keeps a bounded
 //! subset (the live logs recovery sorts, a page of backup ids) carries at
 //! most that subset. The probe counts, it does not time: no benchmark.
+#![cfg(not(target_arch = "wasm32"))]
 
 use std::collections::{HashMap, HashSet};
 use std::io;
@@ -129,6 +130,14 @@ impl Env for WalkProbe {
     fn open_read(&self, path: &Path) -> io::Result<Box<dyn ReadFile>> {
         self.act(path);
         self.inner.open_read(path)
+    }
+    fn open_log(
+        &self,
+        path: &Path,
+        mode: WriteMode,
+    ) -> io::Result<Box<dyn regolith::env::LogFile>> {
+        self.act(path);
+        self.inner.open_log(path, mode)
     }
     fn open_write(&self, path: &Path, mode: WriteMode) -> io::Result<Box<dyn WriteFile>> {
         self.act(path);

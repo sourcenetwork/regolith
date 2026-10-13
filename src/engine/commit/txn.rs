@@ -1,19 +1,20 @@
-//! An optimistic transaction as a member of a commit group (E10).
+//! An optimistic transaction as a slot of the commit ring (E10).
 //!
-//! A transaction's commit joins the same commit groups plain writes use, so a
-//! group shares one WAL append and at most one fsync. The leader decides each
-//! member in group order: it validates the member against the view plus the
-//! writes of the members before it in the group, and only a member that
-//! passes takes sequences, positions for its appends, and a record. This is
-//! `GroupCommit.tla` and `group_eq_serial` in `GroupCommit.lean`: each member
-//! gets the verdict committing the members one at a time, in group order,
-//! would give it. A member validated against the view alone would commit over
-//! an earlier member's write of the same key (RED ViewOnly).
+//! A transaction's commit takes a slot of the ring plain writes use, so it
+//! shares their sync rounds. Its slot is decided in ring order by whichever
+//! thread reaches it: the commit is validated against the view, which by
+//! then holds the writes of every slot decided before it, and only a commit
+//! that passes takes sequences, positions for its appends, and a record.
+//! This is `NoLostUpdate` in `CommitPipeline.tla` and `later_slot_aborts` in
+//! `PipelineCheck.lean`: each commit gets the verdict committing them one at
+//! a time, in ring order, gives it. A commit validated against a view that
+//! lacked an earlier slot's writes would commit over its write of the same
+//! key (RED ValidatePublished), which is why a slot is applied before the
+//! next is decided (`pipeline.rs`, P2).
 //!
-//! The check of one member is the check a transaction committing alone
+//! The check of one commit is the check a transaction committing alone
 //! always ran: [`RegolithEngine::validate`] runs it against whatever view it
-//! is given, and the group hands it a view whose newest source holds the
-//! earlier members' writes at the sequences they will take (see `group.rs`).
+//! is given.
 
 use std::io;
 
@@ -23,7 +24,6 @@ use super::early::{Early, Mark};
 use super::replaced::Replaced;
 use super::write_check::WriteCheck;
 use crate::perf_context::{PerfContextSnapshot, PerfLevel};
-use crate::statistics::Ticker;
 use crate::{Access, Conflict, WriteBatchOp};
 
 /// An optimistic transaction's commit, handed to the commit pipeline.
@@ -35,27 +35,23 @@ pub(crate) struct TxnRequest {
     /// Its appends, numbered only if it validates.
     pub(crate) appends: Vec<PendingAppend>,
     pub(crate) durability: DurabilityMode,
-    /// Framed WAL bytes the member can stage at most: its record with every
-    /// append counted at the bound its layout declares.
-    pub(crate) record_bound: usize,
-    /// Memtable bytes the member can add at most, appends counted the same way.
-    pub(crate) cost_bound: usize,
-    /// The committing thread's perf level: the leader counts the member's
-    /// validation at it, on that thread's behalf.
+    /// The committing thread's perf level: whichever thread decides the
+    /// slot counts the commit's validation at it, on that thread's behalf.
     pub(crate) perf: PerfLevel,
-    /// The check the transaction ran at a horizon before it queued; the
-    /// leader checks only what landed above it.
+    /// The check the transaction ran at a horizon before it took a slot;
+    /// deciding the slot checks only what landed above it.
     pub(crate) early: Early,
-    /// Committed by `commit_nowait`: the commit must not wait for its
-    /// group's fsync, so a group carrying it that needs one is left owing it
-    /// (`deferred.rs`).
-    pub(crate) nowait: bool,
+    /// Set for a commit made without waiting through a `CacheOnly` handle:
+    /// the queue its validation reads send their misses to. Whichever thread
+    /// decides the slot reads only the cache for it, and a miss refuses the
+    /// commit with the wait (`read_mode.rs`).
+    pub(crate) read_queue: Option<crate::QueueId>,
 }
 
-/// The leader's verdict on one transaction member.
+/// What validating one transaction's commit found.
 #[derive(Debug)]
 pub(crate) enum Verdict {
-    /// It validated. The counts are recorded once the group lands.
+    /// It validated. The counts are recorded once the commit lands.
     Accept {
         merges_commuted: u64,
         writes_elided: u64,
@@ -64,7 +60,7 @@ pub(crate) enum Verdict {
     Conflict(Conflict),
 }
 
-/// What one ticket of a commit group learns when its group completes.
+/// What a commit learns once its slot is published.
 #[derive(Debug)]
 pub(crate) enum Settled {
     /// A plain write landed; the last sequence its operations took.
@@ -75,26 +71,22 @@ pub(crate) enum Settled {
         seq: Option<u64>,
         merges_commuted: u64,
         writes_elided: u64,
-        /// What the leader counted validating it, when its thread counts.
+        /// What deciding its slot counted validating it, when its thread
+        /// counts.
         perf: Option<Box<PerfContextSnapshot>>,
     },
     /// A transaction lost a race and wrote nothing.
     Conflict {
         conflict: Conflict,
-        /// What the leader counted validating it, when its thread counts.
+        /// What deciding its slot counted validating it, when its thread
+        /// counts.
         perf: Option<Box<PerfContextSnapshot>>,
-    },
-    /// The group was written and still owes its fsync: what the member
-    /// learns is taken from `group` once it lands, as member `member`.
-    Pending {
-        group: std::sync::Arc<super::GroupSync>,
-        member: usize,
     },
 }
 
 impl Settled {
     /// The sequence a plain write landed at. A plain write only ever settles
-    /// as [`Settled::Write`] once its group landed; anything else is
+    /// as [`Settled::Write`] once it landed; anything else is
     /// reported, not trusted.
     pub(crate) fn into_seq(self) -> io::Result<u64> {
         match self {
@@ -112,12 +104,12 @@ impl RegolithEngine {
     /// scans, then its written keys in operation order, so a multi-key
     /// conflict names the same key on every run.
     ///
-    /// `early` is the check the transaction ran at a horizon before it
-    /// queued: an item it found clean is checked here only if something
+    /// `early` is the check the transaction ran at a horizon before it took
+    /// a slot: an item it found clean is checked here only if something
     /// landed on it above that horizon, and then in full (`early.rs`).
-    /// `ceiling` is the newest sequence `view` holds, the earlier members of
-    /// the group included; a content-addressed put looks itself up only when
-    /// something landed above the transaction's snapshot.
+    /// `ceiling` is the newest sequence `view` holds, the slots decided
+    /// before this one included; a content-addressed put looks itself up
+    /// only when something landed above the transaction's snapshot.
     pub(super) fn validate(
         &self,
         checks: &ValidationSet,
@@ -149,12 +141,6 @@ impl RegolithEngine {
                 && let Some((seq, theirs)) =
                     self.read_changed(check, (latest_seq, newest), u64::MAX, view)?
             {
-                // The commit-level `CommitConflicts` ticker is recorded once
-                // per commit where the outcome is mapped; this is the per-key
-                // subset.
-                if let Some(s) = self.statistics() {
-                    s.add(Ticker::CommitConflictsOnRead, 1);
-                }
                 return Ok(Verdict::Conflict(Conflict::new(
                     check.key.clone(),
                     check.access,
@@ -176,9 +162,6 @@ impl RegolithEngine {
             if let Some((key, seq, theirs)) =
                 self.written_in_range_of(&range.lo, &range.hi, floor, view, memtables_only)?
             {
-                if let Some(s) = self.statistics() {
-                    s.add(Ticker::CommitConflictsOnRead, 1);
-                }
                 return Ok(Verdict::Conflict(Conflict::new(
                     key,
                     Access::ScannedRange,
@@ -277,9 +260,6 @@ impl RegolithEngine {
                     WriteCheck::Commuted => merges_commuted += 1,
                     WriteCheck::Elided => writes_elided += 1,
                     WriteCheck::Conflict { seq, theirs } => {
-                        if let Some(s) = self.statistics() {
-                            s.add(Ticker::CommitConflictsOnWrite, 1);
-                        }
                         return Ok(Verdict::Conflict(Conflict::new(
                             key.clone(),
                             mine,

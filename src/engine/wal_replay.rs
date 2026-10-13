@@ -59,7 +59,7 @@ enum Framing {
     Unstamped,
     /// 0.1.x logs: one checksummed record per write.
     V1,
-    /// One record per commit group, each bound to this log's nonce.
+    /// One record per commit, each bound to this log's nonce.
     V2 { nonce: u64 },
 }
 
@@ -349,8 +349,8 @@ impl WalReplayIter {
 
     /// Read the format 2 record at `consumed`. `Ok(false)` when it is not
     /// usable: the file ends inside it, a check or its tag fails, or its
-    /// operations do not parse. A group's operations are all checked here,
-    /// before any is yielded, so a group is replayed whole or not at all.
+    /// operations do not parse. A record's operations are all checked here,
+    /// before any is yielded, so a commit is replayed whole or not at all.
     fn read_v2_record(&mut self, nonce: u64) -> io::Result<bool> {
         let offset = self.consumed;
         let remaining = self.file_len - offset;

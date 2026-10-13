@@ -5,6 +5,7 @@
 //! hold the metadata, so every lookup has to re-read and re-decode it,
 //! and check that reads still return the same answers as the pinned
 //! configuration - including range scans, iterators and misses.
+#![cfg(not(target_arch = "wasm32"))]
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};

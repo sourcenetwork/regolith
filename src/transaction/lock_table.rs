@@ -210,8 +210,8 @@ impl LockTable {
 ///
 /// Its address is the name, so it is aligned past the lock's queue bits and
 /// has a size of its own. Held through an `Arc` by the transaction, by the
-/// commit whose locks wait for their group to land, and by the transaction's
-/// close claim, so the name stays unique while any lock can carry it.
+/// commit whose locks wait for it to land, and by the transaction's close
+/// claim, so the name stays unique while any lock can carry it.
 #[repr(align(64))]
 pub(crate) struct LockOwner {
     /// Gives the owner a size, so no two owners share an address.
@@ -445,8 +445,8 @@ impl Note {
     }
 }
 
-/// The key locks a pessimistic commit holds while its group lands, released
-/// by the thread that lands it: once the commit is applied and visible (and
+/// The key locks a pessimistic commit holds until it lands, released by the
+/// thread that lands it: once the commit is applied and visible (and
 /// durable at `Immediate`), whether or not its outcome was delivered.
 pub(super) struct LandingLocks {
     table: Arc<LockTable>,

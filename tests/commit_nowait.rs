@@ -379,6 +379,108 @@ fn a_prepare_that_would_block_resolves_the_ticket_with_its_wait() {
     assert_eq!(db.db().get(b"k").unwrap(), None);
 }
 
+/// The commit's own validation honours `CacheOnly` as its reads do: a block
+/// it needs and the cache does not hold ends the commit with the wait for
+/// it, in the ticket, having taken no sequence. The read is on the queue,
+/// and the commit made again after the queue's polls lands.
+#[test]
+fn a_validation_that_would_block_resolves_the_ticket_with_its_wait() {
+    let dir = TempDir::new().unwrap();
+    let options = || Options::default().block_size(256);
+    {
+        let db = OptimisticTransactionDb::open(dir.path(), options()).unwrap();
+        for i in 0..2_000u32 {
+            db.db().put(format!("k{i:05}").as_bytes(), b"x").unwrap();
+        }
+        db.db().flush().unwrap();
+        db.db().close().unwrap();
+    }
+    let db = OptimisticTransactionDb::open(dir.path(), options()).unwrap();
+    let mut queue = db.db().io_queue();
+    let cache_only = TxnOptions::new().read_mode(ReadMode::CacheOnly(queue.id()));
+    // A blind write to a key whose newest version is in a table no block of
+    // which is cached, and a commit after the snapshot, so that validating
+    // the write has to look that version up.
+    let attempt = || {
+        let txn = db.begin(&cache_only);
+        txn.put(b"k01000", b"mine").unwrap();
+        db.db().put(b"other", b"x").unwrap();
+        txn.commit_nowait()
+    };
+    let ticket = attempt();
+    let before = db.db().latest_sequence();
+    assert!(ticket.is_ready(), "a refused commit waits for nothing");
+    assert!(
+        matches!(
+            queue.block_on(ticket),
+            Err(TransactionError::WouldBlock(WouldBlock::Io(_)))
+        ),
+        "the commit's validation read the device"
+    );
+    assert_eq!(db.db().latest_sequence(), before);
+    assert_eq!(db.db().get(b"k01000").unwrap(), Some(b"x".to_vec()));
+
+    let mut attempts = 0;
+    loop {
+        attempts += 1;
+        assert!(attempts < 100, "the commit never found its blocks");
+        queue.poll(IoBudget::ALL);
+        match queue.block_on(attempt()) {
+            Ok(_) => break,
+            Err(TransactionError::WouldBlock(WouldBlock::Io(_))) => {}
+            Err(other) => panic!("the commit failed: {other:?}"),
+        }
+    }
+    assert_eq!(db.db().get(b"k01000").unwrap(), Some(b"mine".to_vec()));
+}
+
+/// More commits left waiting for their sync than the commit ring holds. The
+/// commit that finds the ring full does not sync to make room: it waits on
+/// its queue like the others, and one poll's sync lands them all.
+#[test]
+fn a_commit_that_finds_the_ring_full_waits_on_its_queue() {
+    let dir = TempDir::new().unwrap();
+    let stats = Arc::new(regolith::Statistics::new());
+    let db = OptimisticTransactionDb::open(
+        dir.path(),
+        Options::default()
+            .durability(DurabilityMode::Immediate)
+            .statistics(Some(Arc::clone(&stats))),
+    )
+    .unwrap();
+    let syncs = || stats.get_ticker(regolith::Ticker::WalSyncCount);
+    let mut queue = db.db().io_queue();
+    // The ring holds at most 1024 commits on any machine.
+    const COMMITS: usize = 1_100;
+    let synced_before = syncs();
+    let tickets: Vec<_> = (0..COMMITS)
+        .map(|i| {
+            let txn = db.begin(&on(&queue));
+            txn.put(format!("k{i:04}").as_bytes(), b"v").unwrap();
+            txn.commit_nowait()
+        })
+        .collect();
+    assert_eq!(
+        syncs(),
+        synced_before,
+        "a commit_nowait call synced the log to make room in the ring"
+    );
+    assert!(tickets.iter().all(|ticket| !ticket.is_ready()));
+    assert_eq!(db.db().get(b"k0000").unwrap(), None);
+
+    for (i, ticket) in tickets.into_iter().enumerate() {
+        queue
+            .block_on(ticket)
+            .unwrap_or_else(|err| panic!("commit {i}: {err:?}"));
+    }
+    for i in 0..COMMITS {
+        assert_eq!(
+            db.db().get(format!("k{i:04}").as_bytes()).unwrap(),
+            Some(b"v".to_vec())
+        );
+    }
+}
+
 /// A pessimistic commit keeps its key locks until it lands, so a second
 /// transaction cannot lock the key and read past a commit that is written but
 /// not yet visible; and it lets them go when it lands, whoever lands it,
@@ -422,14 +524,4 @@ fn a_pessimistic_nowait_commit_holds_its_locks_until_it_lands() {
     drop(rival);
     assert_eq!(queue.poll(IoBudget::ALL).completed, 1);
     assert!(ticket.is_ready());
-}
-
-/// The ticket is `Send + Sync`: its callbacks may be registered from any
-/// thread, and it can be awaited on another.
-#[test]
-fn the_ticket_is_send_and_sync() {
-    fn shared<T: Send + Sync>() {}
-    shared::<regolith::CommitTicket>();
-    shared::<regolith::JobTicket>();
-    shared::<regolith::StallWait>();
 }

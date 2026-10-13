@@ -1,0 +1,215 @@
+//! Loom models of the lock-free commit pipeline (plan 4.7) and of the step
+//! the version store's sections run in.
+//!
+//! ```text
+//! RUSTFLAGS="--cfg loom" cargo test --release --test loom_pipeline
+//! ```
+//!
+//! The models live in `src/engine/commit/loom_model.rs`,
+//! `src/engine/loom_model/step.rs` and `src/engine/loom_model/park.rs`,
+//! next to the crate-private types they drive. What each proves:
+//!
+//! - **Reserve and void**: an owner installs the index it reserved while a
+//!   helper voids it; exactly one wins, and the descriptor is dropped once.
+//! - **A cell's next lap**: a slot is retired while the index one lap later
+//!   is installed into its cell; the new descriptor is never taken for the
+//!   old one.
+//! - **The pin**: a descriptor, or the pipeline's state, loaded while it is
+//!   retired or replaced is alive.
+//! - **Decide with helping**: two threads decide the same two slots at
+//!   once; each slot gets one decision and the sequences are dense.
+//! - **The watermark claim**: two commits need the log durable; one claims
+//!   the round and syncs, the other parks and is woken, and no two syncs
+//!   overlap.
+//! - **Publish**: two helpers publish one slot; whoever sees it published
+//!   finds the read horizon at its sequence.
+//! - **A rollback meeting a decision under way**: the decision computed
+//!   from the discarded state never becomes the pipeline's state.
+//! - **The version step**: two sections handed over at once never overlap,
+//!   both run, and a caller parked on its section is woken.
+//! - **Parking** (a queue's poll never waits for another thread): a thread
+//!   blocked on a job its holder parks runs it; a job parked for the step
+//!   is woken when the step is given up; a rollback parked for a write in
+//!   flight cuts the log only after the write left; a sync parked for a
+//!   copy of a record in flight begins only after the copy left, and a copy
+//!   counted in after the sync turned the gate writes nothing; and a queue
+//!   the wake of a parked job had off the list when the job landed is told
+//!   once.
+//!
+//! Every model is bounded by a small scenario (a ring of two cells, two
+//! threads or two and a reader) and an explicit preemption bound given in
+//! the model's own code, never by a time limit. Each is paired with a
+//! calibration that writes one step the wrong way and must fail; without
+//! them a search that never reached the bad interleaving would pass for the
+//! same reason a broken one does.
+
+#![cfg(loom)]
+
+use regolith::loom_exports::{park, pipeline, step};
+
+#[test]
+fn an_index_is_installed_or_voided_never_both() {
+    pipeline::an_index_is_installed_or_voided_never_both();
+}
+
+#[test]
+#[should_panic(expected = "an index was installed and voided")]
+fn a_void_that_is_not_a_compare_and_swap_gives_an_index_two_fates() {
+    pipeline::a_void_that_is_not_a_compare_and_swap_gives_an_index_two_fates();
+}
+
+#[test]
+fn a_cell_retired_while_it_takes_the_next_lap_keeps_the_new_descriptor() {
+    pipeline::a_cell_retired_while_it_takes_the_next_lap_keeps_the_new_descriptor();
+}
+
+#[test]
+#[should_panic(expected = "a cleaner took the descriptor of an install under way")]
+fn a_cleaner_that_takes_an_install_under_way_empties_a_ready_cell() {
+    pipeline::a_cleaner_that_takes_an_install_under_way_empties_a_ready_cell();
+}
+
+#[test]
+fn a_descriptor_loaded_while_its_slot_is_retired_is_alive() {
+    pipeline::a_descriptor_loaded_while_its_slot_is_retired_is_alive();
+}
+
+#[test]
+#[should_panic(expected = "a loader read a descriptor that was already dropped")]
+fn a_loader_that_does_not_pin_reads_a_dropped_descriptor() {
+    pipeline::a_loader_that_does_not_pin_reads_a_dropped_descriptor();
+}
+
+#[test]
+fn a_tip_loaded_while_it_is_replaced_is_alive() {
+    pipeline::a_tip_loaded_while_it_is_replaced_is_alive();
+}
+
+#[test]
+fn two_helpers_decide_two_slots_in_ring_order() {
+    pipeline::two_helpers_decide_two_slots_in_ring_order();
+}
+
+#[test]
+#[should_panic(expected = "two slots took overlapping sequences, or left a hole")]
+fn a_frontier_passed_before_the_tip_moved_gives_two_slots_one_sequence() {
+    pipeline::a_frontier_passed_before_the_tip_moved_gives_two_slots_one_sequence();
+}
+
+#[test]
+fn a_round_is_claimed_by_one_commit_and_wakes_the_other() {
+    pipeline::a_round_is_claimed_by_one_commit_and_wakes_the_other();
+}
+
+/// Loom reports the overlap itself: the two syncs write one tracked cell
+/// with nothing ordering them.
+#[test]
+#[should_panic(expected = "Concurrent write accesses")]
+fn a_claim_that_is_a_load_and_a_store_lets_two_syncs_overlap() {
+    pipeline::a_claim_that_is_a_load_and_a_store_lets_two_syncs_overlap();
+}
+
+#[test]
+fn a_published_slot_is_visible_to_whoever_sees_it_published() {
+    pipeline::a_published_slot_is_visible_to_whoever_sees_it_published();
+}
+
+#[test]
+#[should_panic(expected = "a slot was published before the horizon reached it")]
+fn a_frontier_passed_before_the_horizon_hides_a_published_slot() {
+    pipeline::a_frontier_passed_before_the_horizon_hides_a_published_slot();
+}
+
+#[test]
+fn a_decision_computed_before_a_rollback_never_becomes_the_tip() {
+    pipeline::a_decision_computed_before_a_rollback_never_becomes_the_tip();
+}
+
+#[test]
+#[should_panic(expected = "a decision of the discarded state became the tip")]
+fn a_settle_that_ignores_the_epoch_brings_a_discarded_state_back() {
+    pipeline::a_settle_that_ignores_the_epoch_brings_a_discarded_state_back();
+}
+
+#[test]
+fn sections_never_overlap_and_none_is_left_behind() {
+    step::sections_never_overlap_and_none_is_left_behind();
+}
+
+#[test]
+#[should_panic(expected = "a section was left on the list with nobody to run it")]
+fn a_step_given_up_without_looking_leaves_a_section_behind() {
+    step::a_step_given_up_without_looking_leaves_a_section_behind();
+}
+
+#[test]
+fn a_job_its_holder_parks_is_run_by_the_thread_that_waited() {
+    park::a_job_its_holder_parks_is_run_by_the_thread_that_waited();
+}
+
+#[test]
+#[should_panic(expected = "a thread slept on a parked job with nobody left to wake it")]
+fn a_waiter_that_does_not_look_again_sleeps_on_a_parked_job() {
+    park::a_waiter_that_does_not_look_again_sleeps_on_a_parked_job();
+}
+
+#[test]
+fn a_job_parked_for_the_step_is_woken_when_it_is_given_up() {
+    park::a_job_parked_for_the_step_is_woken_when_it_is_given_up();
+}
+
+#[test]
+#[should_panic(expected = "a job parked for the step and was not woken when it was given up")]
+fn a_job_that_parks_without_a_second_try_sleeps_on_a_free_step() {
+    park::a_job_that_parks_without_a_second_try_sleeps_on_a_free_step();
+}
+
+#[test]
+fn a_rollback_parked_for_a_write_in_flight_cuts_after_it_left() {
+    park::a_rollback_parked_for_a_write_in_flight_cuts_after_it_left();
+}
+
+#[test]
+#[should_panic(expected = "a write of a discarded commit landed after the cut")]
+fn a_write_counted_in_after_its_epoch_check_lands_after_the_cut() {
+    park::a_write_counted_in_after_its_epoch_check_lands_after_the_cut();
+}
+
+#[test]
+fn a_late_copy_never_lands_under_a_sync() {
+    park::a_late_copy_never_lands_under_a_sync();
+}
+
+#[test]
+#[should_panic(expected = "a copy of the record landed under the sync")]
+fn a_copy_that_does_not_look_again_lands_under_the_sync() {
+    park::a_copy_that_does_not_look_again_lands_under_the_sync();
+}
+
+#[test]
+#[should_panic(expected = "a copy of the record landed under the sync")]
+fn a_sync_that_does_not_wait_has_a_copy_land_under_it() {
+    park::a_sync_that_does_not_wait_has_a_copy_land_under_it();
+}
+
+#[test]
+fn a_queue_off_the_list_when_the_job_lands_is_told_once() {
+    park::a_queue_off_the_list_when_the_job_lands_is_told_once();
+}
+
+#[test]
+#[should_panic(expected = "a queue was never told the landing")]
+fn a_wake_that_registers_again_blindly_loses_a_landing() {
+    park::a_wake_that_registers_again_blindly_loses_a_landing();
+}
+
+#[test]
+fn a_wake_that_comes_before_the_park_tells_the_queues_with_the_job_free() {
+    park::a_wake_that_comes_before_the_park_tells_the_queues_with_the_job_free();
+}
+
+#[test]
+#[should_panic(expected = "a queue was told the job may go on while it was still claimed")]
+fn a_wake_that_tells_at_once_reaches_a_queue_with_the_job_claimed() {
+    park::a_wake_that_tells_at_once_reaches_a_queue_with_the_job_claimed();
+}

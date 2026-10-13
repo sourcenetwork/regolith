@@ -68,7 +68,8 @@
 \* Tiny example 5, the rotation that fails. Writer 1's write was let in with
 \* no stop, and finds the active memtable full and the memtable cap reached:
 \* it flushes the oldest frozen memtable itself, holding the gate, before it
-\* seals the active one (rotate_if_full). Meanwhile the stop comes on;
+\* seals the active one (the rotation of a write's turn,
+\* RegolithEngine::rotate, src/engine/commit/turn.rs). Meanwhile the stop comes on;
 \* writer 2 finds the gate held and waits. Writer 1's flush ends, with the
 \* stop still on. Then its seal fails (the next log cannot be created, or
 \* the old one cannot be synced), and writer 1 returns the error. The flush
@@ -97,13 +98,33 @@
 \* once registered, as a fresh write would: only while a stop still holds
 \* (RegolithEngine::stall_wait).
 \*
+\* Tiny example 7, the commit. A plain write that is stopped can be handed
+\* the wait: its caller still has the data and writes again. A transaction's
+\* commit cannot be made a second time, so the commit that meets a stop is
+\* not ended with the wait: it stays, waits on the unit like any stopped
+\* writer, and writes once the unit lands (RegolithEngine::admit_commit,
+\* admit_commit_nowait, src/engine/mod.rs). Commit 1 finds the stop on and
+\* the gate held by writer 2's step. Handed the wait, it would be over,
+\* with nothing of it written and nothing said that the stop will not
+\* clear: the transaction would be lost to the stall. It also does not give
+\* up while its own steps make progress, as a plain writer at its bound
+\* does.
+\*
+\* Tiny example 8, inline compaction off (L32). With no worker and inline
+\* compaction turned off, a stopped plain write is handed the wait at once
+\* and its caller drives compaction (Db::compact_step). A commit that blocks
+\* is not handed it: nobody else is certain to compact, so it relieves the
+\* stop itself, as far as the stop needs (RegolithEngine::admit_commit).
+\*
 \* What this model checks cannot happen: every writer has finished or
 \* waits on the stall, the job is not running or still to relieve, no latch
 \* and no recorded failure is on its way to land the unit, and a writer
 \* waits: nobody is left to land its unit (NoStrandedWait). And: the engine
 \* latched, its landing is done, and a writer waits (NoWaitOnceLatched).
 \* And: the relief's failure is recorded, its landing is done, and a writer
-\* waits (NoWaitOnceFailing).
+\* waits (NoWaitOnceFailing). And: a commit that met a stop is over with
+\* its write not in and without having been told the latch or the relief's
+\* failure (NoLostCommit).
 \*
 \* WHAT IS MODELLED, and the code each piece mirrors:
 \*   stopped   whether writes are stopped now (StallSignal::classify)
@@ -118,6 +139,8 @@
 \*   failing   whether the relief's last attempt failed and none has
 \*             succeeded since (BackgroundHealth::failing)
 \*   telling   whether a failure was recorded and has yet to land the unit
+\*   fate      how each commit's call ended: its write went in, it was
+\*             told a failure, it gave up, or it was handed the wait
 \*
 \* WHAT IS LEFT OUT, and why that loses nothing:
 \*   - The kind of stop and of step (flush or compaction): any step may
@@ -184,8 +207,40 @@
 \*                                  recorded failure again (example 6, the
 \*                                  gap): NoWaitOnceFailing breaks.
 \*
-\* Lean, proofs/lean/Regolith/StallRelief.lean, proves the rules for any
-\* number of writers, and each RED as a run of the buggy steps.
+\*   MC_StallRelief_Green_Commit    the real code, one commit and one
+\*                                  plain writer, with a relief that may
+\*                                  fail: however the commit's call ends,
+\*                                  NoLostCommit holds, with the other
+\*                                  three.
+\*   MC_StallRelief_Green_Commit_Failures
+\*                                  the same pair with an engine that may
+\*                                  latch and a rotation whose seal may
+\*                                  fail: NoLostCommit holds.
+\*   MC_StallRelief_Red_CommitTakesWait
+\*                                  a commit the stall would leave waiting
+\*                                  is handed the wait and its call is over
+\*                                  (example 7): NoLostCommit breaks.
+\*   MC_StallRelief_Green_Commit_InlineOff
+\*                                  no worker and inline compaction off: a
+\*                                  stopped plain write is handed the wait,
+\*                                  a commit relieves the stop itself:
+\*                                  NoLostCommit and NoStrandedWait hold.
+\*   MC_StallRelief_Red_CommitLeftToCaller
+\*                                  there, the commit is handed the wait as
+\*                                  a plain write is: NoLostCommit breaks.
+\*   MC_StallRelief_Red_CommitGivesUp
+\*                                  a commit gives up at a plain writer's
+\*                                  bound, with the stop on and its own
+\*                                  steps making progress: NoLostCommit
+\*                                  breaks.
+\*
+\* Lean, proofs/lean/Regolith/StallRelief.lean, proves the three rules about
+\* waiting for any number of writers, and each of their REDs as a run of
+\* the buggy steps. proofs/lean/Regolith/StallCommit.lean proves
+\* NoLostCommit for one commit's call against anything the rest of the
+\* database does (no_lost_commit), and its three REDs as runs of the buggy
+\* steps. The tests check it too (tests/commit_through_stall.rs,
+\* src/engine/commit/stall_commit_tests.rs).
 
 \* Numbers, for the progress count.
 EXTENDS Naturals
@@ -205,18 +260,34 @@ CONSTANTS
   Failures,
   \* Whether the run follows a relief that fails and recovers. FALSE leaves
   \* the model as it was before that was added.
-  ReliefFails
+  ReliefFails,
+  \* The writers that are a transaction's commit, which cannot be made
+  \* again. The empty set leaves the model as it was before commits were
+  \* added.
+  Commits,
+  \* Whether inline compaction is turned off on this database with no
+  \* worker: a stopped plain write is handed the wait, and its caller
+  \* compacts; a commit still relieves the stop itself. FALSE leaves the
+  \* model as it was before this was added.
+  InlineOff
 
 \* The bug names this model knows.
 ASSUME Mode \in {"Green", "NoRelief", "NoHandBack", "NoRecheck",
                  "NoLatchLand", "NoLatchRecheck", "NoRotateRefresh",
-                 "NoFailLand", "NoFailRecheck"}
+                 "NoFailLand", "NoFailRecheck", "CommitTakesWait",
+                 "CommitGivesUp", "CommitLeftToCaller"}
 
 \* Failures is a yes or a no.
 ASSUME Failures \in BOOLEAN
 
 \* So is ReliefFails.
 ASSUME ReliefFails \in BOOLEAN
+
+\* The commits are some of the writers.
+ASSUME Commits \subseteq Writers
+
+\* InlineOff is a yes or a no.
+ASSUME InlineOff \in BOOLEAN
 
 \* The state that changes from step to step.
 VARIABLES
@@ -239,10 +310,16 @@ VARIABLES
   \* Whether the relief's failure is recorded: a stopped write is told it.
   failing,
   \* Whether a failure was recorded and has yet to land the unit.
-  telling
+  telling,
+  \* How each commit's call ended: "none" while it has not, "in" once its
+  \* write went in, "told" when it was told a failure that says the write
+  \* cannot be made (the latch, the relief's failure, a seal that failed),
+  \* "busy" when it gave up with the stop on, "wait" when it was handed the
+  \* wait. Kept for commits only; a plain writer's stays "none".
+  fate
 
 \* Every variable.
-vars == <<stopped, gate, job, wpc, progress, seen, latched, landing, failing, telling>>
+vars == <<stopped, gate, job, wpc, progress, seen, latched, landing, failing, telling, fate>>
 
 \* The two the latch owns, for the steps that leave them alone.
 latch == <<latched, landing>>
@@ -264,13 +341,18 @@ Init ==
   /\ wpc = [w \in Writers |-> "write"]
   \* Nothing counted, nothing read.
   /\ progress = 0
+  \* No writer has read the count.
   /\ seen = [w \in Writers |-> 0]
-  \* The engine takes writes, and no latch is under way.
+  \* The engine takes writes: it has not latched.
   /\ latched = FALSE
+  \* No latch is under way: none has its landing owed.
   /\ landing = FALSE
-  \* The relief works, and no failure is being told.
+  \* The relief works: no failure is recorded.
   /\ failing = FALSE
+  \* No failure is being told: none has its landing owed.
   /\ telling = FALSE
+  \* No call has ended.
+  /\ fate = [w \in Writers |-> "none"]
 
 \* What a step may leave: the stop on or off, while the budget for leaving
 \* it on lasts; then off.
@@ -281,6 +363,25 @@ Outcomes == IF progress < MaxSteps THEN BOOLEAN ELSE {FALSE}
 \* stop cleared.
 Lands(s) == Mode # "NoHandBack" \/ ~s
 
+\* Whether writer w, at the point where the stall leaves a writer waiting,
+\* is ended instead: the planted bug CommitTakesWait, for a commit.
+Consumed(w) == Mode = "CommitTakesWait" /\ w \in Commits
+
+\* Whether writer w, stopped on a database with inline compaction off, is
+\* handed the wait: a plain write is, its caller holding the data; a
+\* commit is not, except under the planted bug CommitLeftToCaller.
+LeftToCaller(w) == InlineOff /\ (w \notin Commits \/ Mode = "CommitLeftToCaller")
+
+\* Whether writer w may give up with the stop on after a step of its own
+\* that made progress: a plain writer at its bound may (Error::Busy); a
+\* commit has no bound on its steps, except under the planted bug
+\* CommitGivesUp.
+MayGiveUp(w) == w \notin Commits \/ Mode = "CommitGivesUp"
+
+\* The record of how calls ended, once writer w's call ended as `how`. Only
+\* a commit's call is recorded.
+Ended(w, how) == IF w \in Commits THEN [fate EXCEPT ![w] = how] ELSE fate
+
 \* The unit lands: every writer waiting on it wakes and writes again
 \* (StallSignal::land, then the writer's retry).
 Land(f) == [x \in Writers |-> IF f[x] = "waiting" THEN "write" ELSE f[x]]
@@ -289,12 +390,16 @@ Land(f) == [x \in Writers |-> IF f[x] = "waiting" THEN "write" ELSE f[x]]
 JobStart ==
   \* Not started, and the gate is free.
   /\ job = "idle"
+  \* (The gate is free.)
   /\ gate = "free"
   \* It holds the gate for its whole run.
   /\ gate' = "job"
+  \* The job is at work, holding the gate.
   /\ job' = "holding"
   \* Nothing else changes.
   /\ UNCHANGED <<stopped, wpc, progress, seen, latch, relief>>
+  \* No commit's call ends in this step.
+  /\ UNCHANGED fate
 
 \* The job's work is done and it releases the gate. The real code goes on
 \* to relieve; bug NoRelief ends here.
@@ -307,6 +412,8 @@ JobEnd ==
   /\ job' = IF Mode = "NoRelief" THEN "done" ELSE "relieving"
   \* Nothing else changes.
   /\ UNCHANGED <<stopped, wpc, progress, seen, latch, relief>>
+  \* No commit's call ends in this step.
+  /\ UNCHANGED fate
 
 \* The job's relief (relieve_after_foreground). With the gate free, its
 \* steps run, leaving the stop on or off, and its progress lands the unit.
@@ -315,17 +422,22 @@ JobEnd ==
 JobRelieve ==
   \* It released the gate and has not relieved yet.
   /\ job = "relieving"
+  \* Is the gate free?
   /\ IF gate = "free"
      \* Steps, then the count and the landing.
      THEN /\ stopped' \in Outcomes
+          \* The progress is counted.
           /\ progress' = progress + 1
+          \* The progress lands: waiters are let go.
           /\ wpc' = Land(wpc)
      \* Left to the writer holding the gate.
      ELSE UNCHANGED <<stopped, progress, wpc>>
   \* The job is finished.
   /\ job' = "done"
-  \* The gate, what writers read and the latch are as they were.
+  \* The gate, what writers read, the latch and the relief's record are as they were.
   /\ UNCHANGED <<gate, seen, latch, relief>>
+  \* No commit's call ends in this step.
+  /\ UNCHANGED fate
 
 \* Writer w writes. On a latched engine it is told the latch and returns.
 \* Not stopped: the write goes in, may bring on the stop, and leaves one
@@ -337,39 +449,73 @@ JobRelieve ==
 WriterTry(w) ==
   \* The writer is about to write.
   /\ wpc[w] = "write"
+  \* Has the engine latched?
   /\ IF latched
      \* Told the latch (admit_write, or the write itself): it returns.
      THEN /\ wpc' = [wpc EXCEPT ![w] = "done"]
+          \* Its call ended with a failure told.
+          /\ fate' = Ended(w, "told")
+          \* The stop, the gate and what the writer read are unchanged.
           /\ UNCHANGED <<stopped, gate, seen>>
+     \* Not latched. Is the stop off?
      ELSE IF ~stopped
-          THEN \* Written; the stop may come on; one step owed.
+          \* The stop is off: the write is let in, one of two ways.
+          THEN
+               \* Written; the stop may come on; one step owed.
                \/ /\ stopped' \in BOOLEAN
+                  \* The writer owes one step.
                   /\ wpc' = [wpc EXCEPT ![w] = "owing"]
+                  \* Its write is in.
+                  /\ fate' = Ended(w, "in")
+                  \* The gate and what the writer read are unchanged.
                   /\ UNCHANGED <<gate, seen>>
                \* Or let in, and the memtable cap is reached: its rotation
-               \* takes the free gate to flush (rotate_if_full). The stop
+               \* takes the free gate to flush (RegolithEngine::rotate). The stop
                \* may come on meanwhile.
                \/ /\ Failures
+                  \* The gate is free,
                   /\ gate = "free"
+                  \* and the rotation's flush takes it.
                   /\ gate' = w
+                  \* The stop may come on meanwhile.
                   /\ stopped' \in BOOLEAN
+                  \* The writer is rotating, flushing under the gate.
                   /\ wpc' = [wpc EXCEPT ![w] = "rotating"]
-                  /\ UNCHANGED seen
+                  \* What the writer read is unchanged, and its call has not ended: the
+                  \* write goes in once the rotation's seal goes through.
+                  /\ UNCHANGED <<seen, fate>>
+          \* The stop is on. Is the relief's failure recorded?
           ELSE IF failing
                \* Stopped, and the relief's failure is recorded: told that
                \* failure (RegolithEngine::stopped), and it returns.
                THEN /\ wpc' = [wpc EXCEPT ![w] = "done"]
+                    \* Its call ended with a failure told.
+                    /\ fate' = Ended(w, "told")
+                    \* The stop, the gate and what the writer read are unchanged.
                     /\ UNCHANGED <<stopped, gate, seen>>
+               \* The relief works. Is the relief left to the caller (inline compaction off)?
+               ELSE IF LeftToCaller(w)
+                    \* Handed the wait (RegolithEngine::stopped, StallWait): the call is over.
+                    THEN /\ wpc' = [wpc EXCEPT ![w] = "done"]
+                         \* A commit's call ended with the wait (the bug only).
+                         /\ fate' = Ended(w, "wait")
+                         \* The stop, the gate and what the writer read are unchanged.
+                         /\ UNCHANGED <<stopped, gate, seen>>
+               \* The writer relieves the stop itself. Is the gate free?
                ELSE IF gate = "free"
                     \* Stopped, gate free: its step takes the gate.
                     THEN /\ gate' = w
+                         \* The writer runs a relieving step.
                          /\ wpc' = [wpc EXCEPT ![w] = "relieving"]
-                         /\ UNCHANGED <<stopped, seen>>
-                    \* Stopped, gate held: it read the count before its
-                    \* step, and the step is contended.
+                         \* The stop and what the writer read are unchanged, and its call goes on.
+                         /\ UNCHANGED <<stopped, seen, fate>>
+                    \* Stopped, gate held: it read the count before its step, and
+                    \* the step is contended.
                     ELSE /\ seen' = [seen EXCEPT ![w] = progress]
+                         \* The writer is contended.
                          /\ wpc' = [wpc EXCEPT ![w] = "contended"]
-                         /\ UNCHANGED <<stopped, gate>>
+                         \* The stop and the gate are unchanged, and its call goes on.
+                         /\ UNCHANGED <<stopped, gate, fate>>
   \* Nothing else changes.
   /\ UNCHANGED <<job, progress, latch, relief>>
 
@@ -384,26 +530,47 @@ WriterTry(w) ==
 WriterRegister(w) ==
   \* The writer was contended.
   /\ wpc[w] = "contended"
+  \* Has the engine latched? (The bug NoLatchRecheck does not look.)
   /\ IF latched /\ Mode # "NoLatchRecheck"
      \* Latched: landed for whoever else is on the unit, and w returns
      \* the latch.
      THEN /\ wpc' = [Land(wpc) EXCEPT ![w] = "done"]
+          \* Its call ended with a failure told.
+          /\ fate' = Ended(w, "told")
+          \* The count does not change.
           /\ UNCHANGED progress
+     \* Not latched. Is the stop off now?
      ELSE IF ~stopped
           \* Cleared: counted, landed, and w writes again.
           THEN /\ progress' = progress + 1
+               \* The progress lands, and w writes again.
                /\ wpc' = [Land(wpc) EXCEPT ![w] = "write"]
+               \* Its call goes on.
+               /\ UNCHANGED fate
+          \* Still stopped. Is the relief's failure recorded? (The bug NoFailRecheck does not look.)
           ELSE IF failing /\ Mode # "NoFailRecheck"
                \* The relief is failing: landed for whoever else is on
                \* the unit, and w returns the failure.
                THEN /\ wpc' = [Land(wpc) EXCEPT ![w] = "done"]
+                    \* Its call ended with a failure told.
+                    /\ fate' = Ended(w, "told")
+                    \* The count does not change.
                     /\ UNCHANGED progress
+               \* The relief works. Did the count move since w read it? (The bug NoRecheck does
+               \* not look.)
                ELSE IF Mode # "NoRecheck" /\ seen[w] # progress
                     \* Progress it missed: landed, and w writes again.
                     THEN /\ wpc' = [Land(wpc) EXCEPT ![w] = "write"]
-                         /\ UNCHANGED progress
-                    \* Nothing missed: it waits.
-                    ELSE /\ wpc' = [wpc EXCEPT ![w] = "waiting"]
+                         \* The count does not change, and its call goes on.
+                         /\ UNCHANGED <<progress, fate>>
+                    \* Nothing missed: it waits. A plain writer's caller holds the wait and
+                    \* writes again once the unit lands; a commit waits inside its call. (The
+                    \* bug CommitTakesWait hands a commit the wait here, and its call is over.)
+                    ELSE /\ wpc' = [wpc EXCEPT ![w] = IF Consumed(w) THEN "done" ELSE "waiting"]
+                         \* A call ended here ended with the wait: nothing of it is written,
+                         \* and it was told nothing that says the write cannot be made.
+                         /\ fate' = IF Consumed(w) THEN Ended(w, "wait") ELSE fate
+                         \* The count does not change.
                          /\ UNCHANGED progress
   \* Nothing else changes.
   /\ UNCHANGED <<stopped, gate, job, seen, latch, relief>>
@@ -413,11 +580,16 @@ WriterRegister(w) ==
 WriterStepEnd(w) ==
   \* The writer is relieving and holds the gate.
   /\ wpc[w] = "relieving"
+  \* The step may or may not clear the stop.
   /\ stopped' \in Outcomes
+  \* The gate is free again.
   /\ gate' = "free"
+  \* The writer counts its progress next.
   /\ wpc' = [wpc EXCEPT ![w] = "relRefresh"]
   \* Nothing else changes.
   /\ UNCHANGED <<job, progress, seen, latch, relief>>
+  \* No commit's call ends in this step.
+  /\ UNCHANGED fate
 
 \* Writer w counts its step's progress (refresh), which lands the unit as
 \* Lands says; then it looks again, or, with the stop on, gives up (its
@@ -425,9 +597,15 @@ WriterStepEnd(w) ==
 WriterRefresh(w) ==
   \* The writer released the gate after its relieving step.
   /\ wpc[w] = "relRefresh"
+  \* The progress is counted.
   /\ progress' = progress + 1
-  /\ \E next \in (IF stopped THEN {"write", "done"} ELSE {"write"}) :
-       wpc' = [(IF Lands(stopped) THEN Land(wpc) ELSE wpc) EXCEPT ![w] = next]
+  \* The writer goes on to write again; if the stop is still on, one that has a bound on its
+  \* steps may return instead (MayGiveUp: a plain writer, never a commit in the real code).
+  /\ \E next \in (IF stopped /\ MayGiveUp(w) THEN {"write", "done"} ELSE {"write"}) :
+       \* When the progress lands, waiters are let go.
+       /\ wpc' = [(IF Lands(stopped) THEN Land(wpc) ELSE wpc) EXCEPT ![w] = next]
+       \* A call that returned here gave up with the stop on; one that goes on has not ended.
+       /\ fate' = IF next = "done" THEN Ended(w, "busy") ELSE fate
   \* Nothing else changes.
   /\ UNCHANGED <<stopped, gate, job, seen, latch, relief>>
 
@@ -437,49 +615,68 @@ WriterRefresh(w) ==
 OwedTry(w) ==
   \* The writer's write went in and left a step owing.
   /\ wpc[w] = "owing"
+  \* Has the engine not latched, and is the gate free?
   /\ IF ~latched /\ gate = "free"
      \* The step takes the gate.
      THEN /\ gate' = w
+          \* The writer runs its owed step.
           /\ wpc' = [wpc EXCEPT ![w] = "owedStep"]
      \* Contended, or latched: the writer returns.
      ELSE /\ wpc' = [wpc EXCEPT ![w] = "done"]
+          \* The gate is unchanged.
           /\ UNCHANGED gate
   \* Nothing else changes.
   /\ UNCHANGED <<stopped, job, progress, seen, latch, relief>>
+  \* No commit's call ends in this step.
+  /\ UNCHANGED fate
 
 \* Writer w's owed step ends: the stop is left on or off, and the gate
 \* released.
 OwedStepEnd(w) ==
   \* The owed step holds the gate.
   /\ wpc[w] = "owedStep"
+  \* The step may or may not clear the stop.
   /\ stopped' \in Outcomes
+  \* The gate is free again.
   /\ gate' = "free"
+  \* The writer counts its progress next.
   /\ wpc' = [wpc EXCEPT ![w] = "owedRefresh"]
   \* Nothing else changes.
   /\ UNCHANGED <<job, progress, seen, latch, relief>>
+  \* No commit's call ends in this step.
+  /\ UNCHANGED fate
 
 \* Writer w counts its owed step's progress, which lands the unit as Lands
 \* says, and returns: it relieves nothing more.
 OwedRefresh(w) ==
   \* The owed step released the gate.
   /\ wpc[w] = "owedRefresh"
+  \* The progress is counted.
   /\ progress' = progress + 1
+  \* The writer returns; when the progress lands, waiters are let go.
   /\ wpc' = [(IF Lands(stopped) THEN Land(wpc) ELSE wpc) EXCEPT ![w] = "done"]
   \* Nothing else changes.
   /\ UNCHANGED <<stopped, gate, job, seen, latch, relief>>
+  \* No commit's call ends in this step.
+  /\ UNCHANGED fate
 
 \* Writer w's rotation ends its flush: the stop is left on or off, and the
 \* gate released; the seal is next (rotate_full, src/engine/mod.rs).
 RotateEnd(w) ==
   \* The rotation holds the gate.
   /\ wpc[w] = "rotating"
+  \* The flush may or may not clear the stop.
   /\ stopped' \in Outcomes
+  \* The gate is free again.
   /\ gate' = "free"
+  \* The seal is next: the rotation is about to leave.
   /\ wpc' = [wpc EXCEPT ![w] = "rotLeave"]
   \* Nothing else changes.
   /\ UNCHANGED <<job, progress, seen, latch, relief>>
+  \* No commit's call ends in this step.
+  /\ UNCHANGED fate
 
-\* Writer w's rotation leaves (rotate_if_full). The seal goes through: the
+\* Writer w's rotation leaves (RegolithEngine::rotate). The seal goes through: the
 \* progress is counted, lands the unit as Lands says, and the write goes in
 \* and leaves a step owing. Or the seal fails: the real code counts the
 \* progress all the same, and the writer returns its error; bug
@@ -487,17 +684,28 @@ RotateEnd(w) ==
 RotateLeave(w) ==
   \* The rotation's flush is done and the gate released.
   /\ wpc[w] = "rotLeave"
-  /\ \/ \* Sealed: counted, landed, and the write is in.
+  \* The seal goes one of two ways.
+  /\ \/
+        \* Sealed: the progress is counted,
         /\ progress' = progress + 1
+        \* it lands the unit as Lands says, and the write is in, with a step owing.
         /\ wpc' = [(IF Lands(stopped) THEN Land(wpc) ELSE wpc) EXCEPT ![w] = "owing"]
-     \/ \* The seal failed.
-        IF Mode # "NoRotateRefresh"
-        \* Counted and landed on the way out, and w returns the error.
-        THEN /\ progress' = progress + 1
-             /\ wpc' = [(IF Lands(stopped) THEN Land(wpc) ELSE wpc) EXCEPT ![w] = "done"]
-        \* The bug: w returns the error, and nothing is counted.
-        ELSE /\ wpc' = [wpc EXCEPT ![w] = "done"]
-             /\ UNCHANGED progress
+        \* Its write is in.
+        /\ fate' = Ended(w, "in")
+     \* Or the seal failed: w returns the seal's error, a failure told.
+     \/
+        \* Its call ended with that failure.
+        /\ fate' = Ended(w, "told")
+        \* Does the rotation count its progress on the way out? (The bug NoRotateRefresh does not.)
+        /\ IF Mode # "NoRotateRefresh"
+           \* Counted and landed on the way out, and w returns the error.
+           THEN /\ progress' = progress + 1
+                \* The progress lands the unit as Lands says, and w returns the error.
+                /\ wpc' = [(IF Lands(stopped) THEN Land(wpc) ELSE wpc) EXCEPT ![w] = "done"]
+           \* The bug: w returns the error, and nothing is counted.
+           ELSE /\ wpc' = [wpc EXCEPT ![w] = "done"]
+                \* The count does not change.
+                /\ UNCHANGED progress
   \* Nothing else changes.
   /\ UNCHANGED <<stopped, gate, job, seen, latch, relief>>
 
@@ -505,14 +713,18 @@ RotateLeave(w) ==
 \* stored, and every write is told the latch from now on. Any thread, at any
 \* moment, once.
 LatchFlag ==
-  \* Only in a run that follows failures, and only once.
+  \* Only in a run that follows failures,
   /\ Failures
+  \* and only once.
   /\ ~latched
-  \* The flag is stored; the landing is owed.
+  \* The flag is stored,
   /\ latched' = TRUE
+  \* and the landing is owed.
   /\ landing' = TRUE
   \* Nothing else changes.
   /\ UNCHANGED <<stopped, gate, job, wpc, progress, seen, relief>>
+  \* No commit's call ends in this step.
+  /\ UNCHANGED fate
 
 \* The engine latches, second half: the unit is landed, so every writer
 \* waiting on it writes again and is told the latch. Bug NoLatchLand lands
@@ -526,19 +738,25 @@ LatchLand ==
   /\ wpc' = IF Mode # "NoLatchLand" THEN Land(wpc) ELSE wpc
   \* Nothing else changes.
   /\ UNCHANGED <<stopped, gate, job, progress, seen, latched, relief>>
+  \* No commit's call ends in this step.
+  /\ UNCHANGED fate
 
 \* The relief fails, first half (BackgroundHealth::record_failure): the
 \* failure is stored, and a stopped write is told it from now on. Any
 \* thread, at any moment the relief is not already failing.
 FailFlag ==
-  \* Only in a run that follows a failing relief, and only while it works.
+  \* Only in a run that follows a failing relief,
   /\ ReliefFails
+  \* and only while the relief works.
   /\ ~failing
-  \* The failure is stored; the landing is owed.
+  \* The failure is stored,
   /\ failing' = TRUE
+  \* and the landing is owed.
   /\ telling' = TRUE
   \* Nothing else changes.
   /\ UNCHANGED <<stopped, gate, job, wpc, progress, seen, latch>>
+  \* No commit's call ends in this step.
+  /\ UNCHANGED fate
 
 \* The relief fails, second half: the unit is landed, so every writer
 \* waiting on it writes again and is told the failure. Bug NoFailLand lands
@@ -552,6 +770,8 @@ FailLand ==
   /\ wpc' = IF Mode # "NoFailLand" THEN Land(wpc) ELSE wpc
   \* Nothing else changes.
   /\ UNCHANGED <<stopped, gate, job, progress, seen, latch, failing>>
+  \* No commit's call ends in this step.
+  /\ UNCHANGED fate
 
 \* The relief succeeds again (BackgroundHealth::record_success): the record
 \* is cleared, and a stopped write waits as before. A landing still owed
@@ -563,6 +783,8 @@ ReliefRecovers ==
   /\ failing' = FALSE
   \* Nothing else changes.
   /\ UNCHANGED <<stopped, gate, job, wpc, progress, seen, latch, telling>>
+  \* No commit's call ends in this step.
+  /\ UNCHANGED fate
 
 \* Every step anyone can take.
 Next ==
@@ -574,8 +796,11 @@ Next ==
   \/ FailFlag \/ FailLand \/ ReliefRecovers
   \* A writer writes, registers, steps, rotates or counts.
   \/ \E w \in Writers :
+       \* A writer tries to write, registers as a waiter, ends its relieving step or counts it;
        \/ WriterTry(w) \/ WriterRegister(w) \/ WriterStepEnd(w) \/ WriterRefresh(w)
+       \* or it takes, ends or counts the step it owed;
        \/ OwedTry(w) \/ OwedStepEnd(w) \/ OwedRefresh(w)
+       \* or its rotation ends its flush, or leaves.
        \/ RotateEnd(w) \/ RotateLeave(w)
 
 \* Every behaviour: start in Init, then take Next steps or stutter.
@@ -597,13 +822,18 @@ TypeOK ==
                           "waiting", "done"}]
   \* The count is a number, and so is what each writer read.
   /\ progress \in Nat
+  \* (What each writer read is a number.)
   /\ seen \in [Writers -> Nat]
-  \* The latch and its owed landing are each a yes or a no.
+  \* The latch is a yes or a no,
   /\ latched \in BOOLEAN
+  \* and so is its owed landing.
   /\ landing \in BOOLEAN
-  \* So are the relief's recorded failure and its owed landing.
+  \* The relief's recorded failure is a yes or a no,
   /\ failing \in BOOLEAN
+  \* and so is its owed landing.
   /\ telling \in BOOLEAN
+  \* Each call has ended one of the ways, or not yet; a plain writer's is not recorded.
+  /\ fate \in [Writers -> {"none", "in", "told", "busy", "wait"}]
 
 \* THE RULE. Once every writer has finished or waits on the stall, the job
 \* is not running or still to relieve, and neither a latch nor a recorded
@@ -643,5 +873,21 @@ NoWaitOnceFailing ==
   (failing /\ ~telling)
     \* ... no writer waits.
     => \A w \in Writers : wpc[w] # "waiting"
+
+\* THE COMMIT'S RULE. No commit is lost to a stall: however a commit's call
+\* ends, its write went in, or it was told a failure that says the write
+\* cannot be made (the engine latched, the relief of the stop is failing, a
+\* rotation's seal failed). It is never handed the wait, as a plain write
+\* is (example 7), and it never gives up while its own steps make progress.
+\* The record is kept in every mode, so the rule is read off what happened,
+\* in every interleaving with the job, the latch, a failing relief and
+\* rotations. NoStrandedWait is the other half of "a commit waits the stop
+\* out": a commit left waiting always has someone on the way to land its
+\* unit. Checked by TLC and by the tests (tests/commit_through_stall.rs,
+\* src/engine/commit/stall_commit_tests.rs); the Lean statement is still
+\* owed.
+NoLostCommit ==
+  \* Every commit's call has not ended, or ended with its write in, or with a failure told.
+  \A c \in Commits : fate[c] \in {"none", "in", "told"}
 
 ====

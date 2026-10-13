@@ -61,9 +61,13 @@ pub struct FlushJobInfo {
     pub file_size: u64,
     /// Number of point entries in the flushed SSTable.
     pub num_entries: u64,
-    /// Smallest user key in the file.
+    /// Lower bound of the file in storage order. A table holds entries of
+    /// every column family, so this is not a key as the caller wrote it:
+    /// it is the 4-byte big-endian id of a column family, then the
+    /// caller's key in that family. Not a key to read back with.
     pub smallest_key: Vec<u8>,
-    /// Largest user key in the file.
+    /// Upper bound of the file in storage order, in the form of
+    /// [`FlushJobInfo::smallest_key`].
     pub largest_key: Vec<u8>,
     /// Wall-clock duration of the flush, from memtable rotation
     /// through manifest apply.
@@ -118,10 +122,11 @@ pub struct TableFileCreationInfo {
     pub num_entries: u64,
 }
 
-/// Information about an SSTable file that was just unlinked from
-/// disk. Fires after compaction has committed the version edit
-/// that removed the file from the live set and the physical
-/// `unlink(2)` has succeeded.
+/// Information about an SSTable file a compaction just removed. Fires
+/// after the compaction has committed the version edit that took the file
+/// out of the live set and has removed the file's name. The removal is
+/// best effort: one that fails is logged and left for the next open to
+/// sweep, and the listener is told all the same.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct TableFileDeletionInfo {
@@ -229,9 +234,9 @@ pub trait EventListener: Send + Sync + 'static {
         let _ = info;
     }
 
-    /// Called after an SSTable file has been physically unlinked
-    /// from disk (after the manifest edit that removed it from
-    /// the live set has been applied).
+    /// Called after a compaction took an SSTable file out of the live
+    /// set (the manifest edit is applied) and removed the file's name;
+    /// see [`TableFileDeletionInfo`] for a removal that fails.
     fn on_table_file_deleted(&self, info: &TableFileDeletionInfo) {
         let _ = info;
     }
@@ -257,6 +262,55 @@ pub trait EventListener: Send + Sync + 'static {
     /// newer write was, so a caller can count the reasons in its own
     /// telemetry. A [`crate::OptimisticTransactionDb::transact`] retry that
     /// conflicts again calls it again.
+    ///
+    /// # Example
+    ///
+    /// A listener that counts lost commits, apart from those that lost to a
+    /// delete: a caller usually settles those as "already gone".
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use std::sync::atomic::{AtomicU64, Ordering};
+    ///
+    /// use regolith::{
+    ///     Conflict, EventListener, OptimisticTransactionDb, Options, TransactionError, TxnOptions,
+    ///     WriteKind,
+    /// };
+    ///
+    /// #[derive(Default)]
+    /// struct Lost {
+    ///     to_a_delete: AtomicU64,
+    ///     to_a_write: AtomicU64,
+    /// }
+    ///
+    /// impl EventListener for Lost {
+    ///     // Counts and returns: a listener must not block or call the database.
+    ///     fn on_conflict(&self, conflict: &Conflict) {
+    ///         let counter = match conflict.theirs() {
+    ///             WriteKind::Delete | WriteKind::RangeDelete => &self.to_a_delete,
+    ///             _ => &self.to_a_write,
+    ///         };
+    ///         counter.fetch_add(1, Ordering::Relaxed);
+    ///     }
+    /// }
+    ///
+    /// let lost = Arc::new(Lost::default());
+    /// let options = Options::memory().listeners(vec![lost.clone()]);
+    /// let db = OptimisticTransactionDb::open("rows", options)?;
+    /// db.db().put(b"row", b"1")?;
+    ///
+    /// // The row is deleted between this transaction's read and its commit.
+    /// let txn = db.begin(&TxnOptions::new());
+    /// txn.get_for_update(b"row")?;
+    /// db.db().delete(b"row")?;
+    /// txn.put(b"row", b"2")?;
+    ///
+    /// // The commit returns the conflict, and the listener was told once.
+    /// assert!(matches!(txn.commit(), Err(TransactionError::Conflict(_))));
+    /// assert_eq!(lost.to_a_delete.load(Ordering::Relaxed), 1);
+    /// assert_eq!(lost.to_a_write.load(Ordering::Relaxed), 0);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     fn on_conflict(&self, conflict: &Conflict) {
         let _ = conflict;
     }

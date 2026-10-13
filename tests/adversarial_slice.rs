@@ -5,6 +5,7 @@
 //! or to hand the arena a shape it was not sized for. Run these under a
 //! sanitizer to get the full value: a use-after-free here is silent
 //! without one.
+#![cfg(not(target_arch = "wasm32"))]
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};

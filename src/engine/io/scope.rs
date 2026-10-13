@@ -13,17 +13,99 @@
 //! the seam reads the thread-local only after the block cache missed, where
 //! a device read would cost far more than the read of one word.
 //!
-//! [`blocking`] clears the mode for a stretch that must read the device, a
-//! unit run by `IoQueue::poll` in particular, whoever calls it.
+//! [`unit_run`] clears the mode for the stretch a unit run by
+//! `IoQueue::poll` reads the device, whoever calls it, and marks that
+//! stretch as one that may not wait for an open-file slot (D60): a reopen
+//! under `max_open_files` that finds every slot busy parks on the queue
+//! running the unit instead, and the run sees that it did.
+//!
+//! [`no_wait`] marks the stretch a queue's poll steps a job, which parks
+//! instead of waiting for another thread (`engine::commit::park`). Every
+//! path of the engine that waits for another thread calls [`waits`] first:
+//! where a thread goes to sleep or spins for one, and where a call that
+//! chose to block takes something another thread may hold (a round or a
+//! unit in its way, the version store's step, the flush exclusion, the
+//! compaction gate), whether or not anything is in its way this time. So
+//! the check does not depend on a race being lost while a test runs. Such
+//! a path inside the stretch is a defect: the job should have parked. In a
+//! build with debug assertions the stretch fails when it ends, naming the
+//! path. Not at the wait itself, which may sit where unwinding is not safe
+//! (a section handed to `engine::step` borrows from the frame that waits
+//! for it).
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::num::NonZeroU64;
+use std::sync::Arc;
 
+use super::shared::QueueShared;
+use crate::env::open_file_limit::slots::SlotWaiter;
 use crate::io_queue::QueueId;
 
 thread_local! {
     /// The queue misses go to on this thread right now; `0` is `Blocking`.
     static QUEUE: Cell<u64> = const { Cell::new(0) };
+    /// The queue whose unit this thread is running, while it runs one.
+    static RUNNING: RefCell<Option<Running>> = const { RefCell::new(None) };
+    /// This thread is inside a [`no_wait`] stretch.
+    static NO_WAIT: Cell<bool> = const { Cell::new(false) };
+    /// What this thread waited for inside its [`no_wait`] stretch, if it
+    /// did: the first such wait.
+    static WAITED: Cell<Option<&'static str>> = const { Cell::new(None) };
+}
+
+/// A stretch that must not wait for another thread, until it is dropped.
+#[must_use = "the stretch lasts only while the scope is alive"]
+pub(crate) struct NoWait {
+    previous: bool,
+}
+
+impl Drop for NoWait {
+    fn drop(&mut self) {
+        NO_WAIT.with(|no_wait| no_wait.set(self.previous));
+        if self.previous {
+            // The outermost stretch reports.
+            return;
+        }
+        let waited = WAITED.with(Cell::take);
+        if cfg!(debug_assertions)
+            && !std::thread::panicking()
+            && let Some(what) = waited
+        {
+            panic!("a queue's poll took a path that waits for another thread: {what}");
+        }
+    }
+}
+
+/// Mark what this thread does until the scope drops as a stretch that must
+/// not wait for another thread: a job stepped by a queue's poll
+/// (`Job::step`).
+pub(crate) fn no_wait() -> NoWait {
+    NoWait {
+        previous: NO_WAIT.with(|no_wait| no_wait.replace(true)),
+    }
+}
+
+/// This thread is on a path that waits for another one, for `what`: about
+/// to sleep or spin, or taking, as a call that blocks, something another
+/// thread may hold. Inside a [`no_wait`] stretch that is a defect, noted
+/// here and reported when the stretch ends. A loom model's threads share
+/// the host's thread-locals, so nothing is noted there.
+#[inline]
+pub(crate) fn waits(what: &'static str) {
+    if cfg!(all(debug_assertions, not(loom))) && NO_WAIT.with(Cell::get) {
+        WAITED.with(|waited| {
+            if waited.get().is_none() {
+                waited.set(Some(what));
+            }
+        });
+    }
+}
+
+/// A unit run in progress on this thread.
+struct Running {
+    queue: Arc<QueueShared>,
+    /// A reopen in this run found every open-file slot busy and parked.
+    parked: bool,
 }
 
 /// A mode set on this thread until it is dropped, which restores the one
@@ -46,7 +128,9 @@ pub(crate) fn cache_only(id: QueueId) -> Scope {
     }
 }
 
-/// Let this thread read the device until the scope drops.
+/// Let this thread read the device until the scope drops: a job run by
+/// `IoQueue::poll`, whoever calls it. A job never parks, so a reopen inside
+/// it is a `Blocking` one.
 pub(crate) fn blocking() -> Scope {
     Scope {
         previous: QUEUE.with(|queue| queue.replace(0)),
@@ -59,12 +143,75 @@ pub(crate) fn current() -> Option<QueueId> {
     NonZeroU64::new(QUEUE.with(Cell::get)).map(QueueId::new)
 }
 
+/// The run of one unit on this thread, from [`unit_run`]: the device may be
+/// read, but no slot may be waited for.
+#[must_use = "the run holds only while the scope is alive"]
+pub(crate) struct UnitRun {
+    _device: Scope,
+    previous: Option<Running>,
+}
+
+impl UnitRun {
+    /// Whether a reopen in this run parked instead of reading.
+    pub(crate) fn parked(&self) -> bool {
+        RUNNING.with(|running| running.borrow().as_ref().is_some_and(|run| run.parked))
+    }
+}
+
+impl Drop for UnitRun {
+    fn drop(&mut self) {
+        RUNNING.with(|running| *running.borrow_mut() = self.previous.take());
+    }
+}
+
+/// Run a unit of `queue`'s on this thread until the scope drops: read the
+/// device, and park a reopen that finds no open-file slot on `queue`.
+pub(crate) fn unit_run(queue: &Arc<QueueShared>) -> UnitRun {
+    let device = Scope {
+        previous: QUEUE.with(|queue| queue.replace(0)),
+    };
+    let run = Running {
+        queue: Arc::clone(queue),
+        parked: false,
+    };
+    UnitRun {
+        _device: device,
+        previous: RUNNING.with(|running| running.borrow_mut().replace(run)),
+    }
+}
+
+/// Who a reopen on this thread parks, when it may not wait for a slot: the
+/// queue whose unit runs here. `None` outside a unit run, where the reopen
+/// belongs to a `Blocking` read and may wait.
+pub(crate) fn reopen_waiter() -> Option<Arc<dyn SlotWaiter>> {
+    RUNNING.with(|running| {
+        running
+            .borrow()
+            .as_ref()
+            .map(|run| Arc::clone(&run.queue) as Arc<dyn SlotWaiter>)
+    })
+}
+
+/// A reopen in the unit run on this thread parked.
+pub(crate) fn note_parked() {
+    RUNNING.with(|running| {
+        if let Some(run) = running.borrow_mut().as_mut() {
+            run.parked = true;
+        }
+    });
+}
+
 #[cfg(all(test, not(loom)))]
 mod tests {
     use super::*;
+    use crate::engine::io::shared::test_id;
 
     fn id(n: u64) -> QueueId {
         QueueId::new(NonZeroU64::new(n).unwrap())
+    }
+
+    fn queue() -> Arc<QueueShared> {
+        Arc::new(QueueShared::new(test_id(), 1 << 20))
     }
 
     #[test]
@@ -74,7 +221,7 @@ mod tests {
             let _outer = cache_only(id(7));
             assert_eq!(current(), Some(id(7)));
             {
-                let _inner = blocking();
+                let _inner = unit_run(&queue());
                 assert_eq!(current(), None);
             }
             assert_eq!(current(), Some(id(7)));
@@ -86,18 +233,39 @@ mod tests {
     fn an_unwind_restores_the_mode() {
         let caught = std::panic::catch_unwind(|| {
             let _scope = cache_only(id(3));
+            let _run = unit_run(&queue());
             panic!("unwind through the scope");
         });
         assert!(caught.is_err());
         assert_eq!(current(), None);
+        assert!(reopen_waiter().is_none());
     }
 
     #[test]
     fn the_mode_is_per_thread() {
         let _scope = cache_only(id(9));
-        std::thread::spawn(|| assert_eq!(current(), None))
-            .join()
-            .unwrap();
-        assert_eq!(current(), Some(id(9)));
+        let _run = unit_run(&queue());
+        std::thread::spawn(|| {
+            assert_eq!(current(), None);
+            assert!(reopen_waiter().is_none());
+        })
+        .join()
+        .unwrap();
+        assert!(reopen_waiter().is_some());
+    }
+
+    #[test]
+    fn only_a_unit_run_parks_a_reopen_and_sees_that_it_did() {
+        assert!(reopen_waiter().is_none(), "a Blocking read may wait");
+        note_parked();
+        let run = unit_run(&queue());
+        assert!(reopen_waiter().is_some());
+        assert!(!run.parked());
+        note_parked();
+        assert!(run.parked());
+        drop(run);
+        assert!(reopen_waiter().is_none());
+        // A new run starts unparked.
+        assert!(!unit_run(&queue()).parked());
     }
 }

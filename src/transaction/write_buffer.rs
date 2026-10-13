@@ -14,7 +14,7 @@ use std::io;
 use std::ops::ControlFlow;
 
 use crate::DbSlice;
-use crate::engine::apply_merge;
+use crate::engine::merge_call::apply_merge;
 use crate::options::MergeOperator;
 use crate::txn_buffer::TxnBuffer;
 
@@ -104,7 +104,8 @@ impl KeyWrites {
 
 /// What `operands`, oldest first, make of the key they lie on: `base` when the
 /// transaction replaced the key (`None` inside: it deleted it), else what
-/// `committed` reads from the database.
+/// `committed` reads from the database. `key` is the buffer's key, which
+/// carries the column-family prefix; the operator is handed the caller's.
 fn merged(
     op: &dyn MergeOperator,
     key: &[u8],

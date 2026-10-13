@@ -1,15 +1,11 @@
-//! Validation outside the pipeline mutex (`early_check_split` in
-//! `GroupCommit.lean`): checking a commit up to a horizon `h` before it
-//! queues, and only above `h` under the mutex, decides as one check of every
-//! version does.
-
-use std::sync::mpsc;
-use std::time::Duration;
+//! Validation outside the pipeline (`early_check_split` in
+//! `PipelineCheck.lean`): checking a commit up to a horizon `h` before it
+//! takes a slot, and only above `h` when its slot is decided, decides as one
+//! check of every version does.
 
 use proptest::prelude::*;
 use tempfile::TempDir;
 
-use super::super::wal::ops_record_len;
 use super::super::{ConflictKey, EngineOptions, RangeCheck, ReadRule, ValidationSet};
 use super::early::EarlyVerdict;
 use super::*;
@@ -35,12 +31,16 @@ impl crate::MergeOperator for Concat {
 }
 
 fn open() -> (TempDir, Arc<RegolithEngine>) {
+    open_with(EngineOptions::default())
+}
+
+fn open_with(options: EngineOptions) -> (TempDir, Arc<RegolithEngine>) {
     let dir = TempDir::new().unwrap();
     let engine = RegolithEngine::open(
         dir.path(),
         EngineOptions {
             merge_operator: Some(Arc::new(Concat)),
-            ..EngineOptions::default()
+            ..options
         },
     )
     .unwrap();
@@ -250,19 +250,16 @@ fn split_commit(
     };
     between();
     let request = WriteRequest::Txn(TxnRequest {
-        record_bound: ops_record_len(&ops),
-        cost_bound: ops.iter().map(batch_op_memtable_cost).sum(),
         checks,
         ops,
         appends: Vec::new(),
         durability: DurabilityMode::Eventual,
         perf: crate::PerfLevel::Disable,
         early,
-        nowait: false,
+        read_queue: None,
     });
-    let mut pipe = engine.pipeline.lock();
     let settled = engine
-        .lead_with(&mut pipe, request)
+        .commit_through_pipeline(request)
         .map_err(|e| e.to_string());
     let outcome = match settled {
         Ok(Settled::Committed {
@@ -281,7 +278,6 @@ fn split_commit(
             latest: conflict.latest_seq(),
         },
         Ok(Settled::Write(_)) => panic!("a transaction settled as a plain write"),
-        Ok(Settled::Pending { .. }) => panic!("a blocking commit was left pending"),
         Err(e) => Outcome::Refused(e),
     };
     (outcome, false)
@@ -298,13 +294,13 @@ proptest! {
     #![proptest_config(ProptestConfig::with_cases(256))]
 
     /// The commit checked up to a horizon taken partway through the writes
-    /// that follow its snapshot, and above it under the mutex, decides as the
-    /// same commit checked in full once every write has landed. When the
-    /// check at the horizon settles the commit, the commit aborts either
-    /// way and only the reason it names may differ: another conflicting
-    /// key, or a refusal a write above the horizon caused (a
-    /// content-addressed key that came to hold different bytes), which the
-    /// full check meets first.
+    /// that follow its snapshot, and above it when its slot is decided,
+    /// decides as the same commit checked in full once every write has
+    /// landed. When the check at the horizon settles the commit, the outcome
+    /// is the same and only which conflicting key it names may differ: a
+    /// conflict behind a put to a content-addressed key, which a write above
+    /// the horizon can turn into a refusal the full check meets first, is
+    /// not settled at the horizon.
     #[test]
     fn checking_up_to_a_horizon_then_above_it_decides_as_one_check(
         before in proptest::collection::vec(step(), 0..5),
@@ -319,8 +315,12 @@ proptest! {
                 apply(engine, s);
             }
         }
-        let snapshot = split.snapshot_seq();
-        prop_assert_eq!(snapshot, whole.snapshot_seq());
+        // Pinned, as a transaction pins the snapshot it validates against:
+        // a compaction on the worker keeps every version above it, a
+        // deletion included, until both commits are decided.
+        let (snapshot, split_pin) = split.register_snapshot_at_horizon();
+        let (whole_snapshot, whole_pin) = whole.register_snapshot_at_horizon();
+        prop_assert_eq!(snapshot, whole_snapshot);
         for engine in [&split, &whole] {
             for s in &until_horizon {
                 apply(engine, s);
@@ -340,18 +340,102 @@ proptest! {
         // Every write has landed: the check at the horizon sees them all and
         // nothing lands above it, so this is one check of every version.
         let (whole_outcome, _) = split_commit(&whole, checks, ops, || {});
+        split.release_snapshot(split_pin);
+        whole.release_snapshot(whole_pin);
         match (&split_outcome, &whole_outcome) {
-            (Outcome::Lost { .. }, Outcome::Lost { .. } | Outcome::Refused(_)) if settled_early => {}
+            (Outcome::Lost { .. }, Outcome::Lost { .. }) if settled_early => {}
             _ => prop_assert_eq!(&split_outcome, &whole_outcome),
         }
         prop_assert_eq!(read_all(&split), read_all(&whole));
     }
 }
 
-/// A commit the check at the horizon settles never waits for the pipeline:
-/// it aborts while another thread holds the mutex.
+/// What made the property test above disagree with itself: it took its
+/// snapshot without pinning it, and the engine's worker raced it. A table
+/// that holds one deletion and nothing else is mostly dead, so a pass picked
+/// for its deletions compacts it; with no snapshot pinned below the deletion
+/// that pass retires it, and a check against the unpinned snapshot then
+/// finds no newer version of the key. Which engine the worker reached
+/// first decided the outcome. A transaction pins its snapshot from `begin`
+/// until its commit is decided, and with the pin the deletion stays and the
+/// check conflicts. Run here without a worker, one pass at a time.
 #[test]
-fn a_conflict_found_at_the_horizon_does_not_wait_for_the_pipeline() {
+fn a_deletion_newer_than_a_pinned_snapshot_stays_for_the_check() {
+    let quiet = || EngineOptions {
+        max_background_compactions: 0,
+        ..EngineOptions::default()
+    };
+    let entries = |engine: &RegolithEngine| {
+        engine
+            .current_version()
+            .levels
+            .iter()
+            .flatten()
+            .map(|t| t.meta.num_entries)
+            .sum::<u64>()
+    };
+    let read_of_b = |snapshot| ValidationSet {
+        reads: vec![ConflictKey {
+            key: key_of(b"b"),
+            observed_seq: snapshot,
+            found: false,
+            access: Access::Read,
+            rule: ReadRule::Seq,
+        }],
+        writes_at: None,
+        blind_merges_commute: false,
+        exempt: Vec::new(),
+        ranges: Vec::new(),
+    };
+
+    // Nothing pinned: the pass runs and the deletion leaves the tree.
+    let (_dir, engine) = open_with(quiet());
+    apply(&engine, &Step::Delete(1));
+    apply(&engine, &Step::Flush);
+    assert_eq!(entries(&engine), 1);
+    assert_eq!(
+        engine.run_one_compaction_pass().unwrap(),
+        crate::CompactionOutcome::DidWork
+    );
+    assert_eq!(entries(&engine), 0, "the deletion retired");
+
+    // Pinned below the deletion: no pass is picked for it, a compaction of
+    // the whole range keeps it, and the check sees it.
+    let (_dir, engine) = open_with(quiet());
+    let (snapshot, pin) = engine.register_snapshot_at_horizon();
+    apply(&engine, &Step::Delete(1));
+    apply(&engine, &Step::Flush);
+    assert_eq!(
+        engine.run_one_compaction_pass().unwrap(),
+        crate::CompactionOutcome::Idle
+    );
+    engine
+        .start_foreground(crate::engine::Work::CompactRange {
+            lower: key_of(b"a"),
+            upper: key_of(b"z"),
+        })
+        .wait()
+        .unwrap();
+    assert!(engine.current_version().levels[0].is_empty(), "compacted");
+    assert_eq!(
+        entries(&engine),
+        1,
+        "the pinned snapshot keeps the deletion"
+    );
+    match engine.check_early(&read_of_b(snapshot), &[]).unwrap() {
+        EarlyVerdict::Conflict(conflict) => {
+            assert_eq!(conflict.key(), key_of(b"b").as_slice());
+            assert_eq!(conflict.latest_seq(), snapshot + 1);
+        }
+        EarlyVerdict::Marks(_) => panic!("the check missed the deletion of b"),
+    }
+    engine.release_snapshot(pin);
+}
+
+/// A commit the check at the horizon settles never enters the pipeline: it
+/// aborts without taking a slot of the commit ring.
+#[test]
+fn a_conflict_found_at_the_horizon_does_not_enter_the_pipeline() {
     let (_dir, engine) = open();
     let snapshot = engine.snapshot_seq();
     apply(&engine, &Step::Put(0, 1));
@@ -368,36 +452,31 @@ fn a_conflict_found_at_the_horizon_does_not_wait_for_the_pipeline() {
         exempt: Vec::new(),
         ranges: Vec::new(),
     };
-    let held = engine.pipeline.lock();
-    let (done, outcome) = mpsc::channel();
-    std::thread::scope(|scope| {
-        scope.spawn(|| {
-            let mut points = std::collections::BTreeMap::new();
-            points.insert(key_of(b"a"), Some(b"mine".to_vec()));
-            let committed = engine.commit_optimistic(
-                checks,
-                points,
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                DurabilityMode::Eventual,
-            );
-            done.send(committed).unwrap();
-        });
-        let committed = outcome
-            .recv_timeout(Duration::from_secs(30))
-            .expect("the commit waited for the pipeline mutex");
-        drop(held);
-        let CommitOutcome::Conflict(conflict) = committed.unwrap() else {
-            panic!("a stale read for update conflicts");
-        };
-        assert_eq!(conflict.key(), key_of(b"a").as_slice());
-        assert_eq!(conflict.mine(), Access::ReadForUpdate);
-    });
+    let taken = engine.pipeline_slots_taken();
+    let mut points = std::collections::BTreeMap::new();
+    points.insert(key_of(b"a"), Some(b"mine".to_vec()));
+    let committed = engine.commit_optimistic(
+        checks,
+        points,
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        DurabilityMode::Eventual,
+    );
+    let CommitOutcome::Conflict(conflict) = committed.unwrap() else {
+        panic!("a stale read for update conflicts");
+    };
+    assert_eq!(conflict.key(), key_of(b"a").as_slice());
+    assert_eq!(conflict.mine(), Access::ReadForUpdate);
+    assert_eq!(
+        engine.pipeline_slots_taken(),
+        taken,
+        "the commit took a slot of the ring before it aborted"
+    );
 }
 
 /// With nothing committed since the snapshot the check at the horizon reads
-/// nothing, and the leader looks only at the memtables: a key whose versions
+/// nothing, and deciding the slot looks only at the memtables: a key whose versions
 /// all sit in a table is never looked up there.
 #[test]
 fn a_commit_nothing_landed_under_never_reads_a_table() {

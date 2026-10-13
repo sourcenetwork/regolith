@@ -6,12 +6,15 @@
 //! one it walked past. The check asks every source of the view for an entry of
 //! the range above the snapshot. It never merges sources or reads a value, but
 //! it does read every block of the range, so it costs about one more scan of
-//! it, under the write pipeline.
+//! it. That scan runs on the committing thread ahead of the pipeline, up to
+//! a sampled horizon; deciding the slot asks only the memtables for what
+//! landed above it, and the tables too only when one took a newer sequence
+//! since or the horizon's check was left open (`early.rs`, `txn.rs`).
 //
 // vertexia: a table keeps no sequence range, so every table that overlaps the
 // range is read. Recording each table's newest sequence in the manifest would
-// let the walk skip tables written before the snapshot, and Phase 6 moves it
-// ahead of the pipeline mutex up to a sampled horizon.
+// let the walk skip tables written before the snapshot. The walk up to a
+// sampled horizon already runs ahead of the pipeline (`early.rs`).
 
 use std::io;
 

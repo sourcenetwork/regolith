@@ -1,7 +1,7 @@
 //! How a commit judges one read against the versions committed after it.
 //!
 //! The transaction layer decides the rule when it builds the validation set;
-//! the engine applies it under the pipeline mutex, only to a key whose newest
+//! the engine applies it when the commit's slot is decided, only to a key whose newest
 //! version is newer than the read. A key nothing touched since the read costs
 //! the one lookup of its newest version whatever the rule.
 

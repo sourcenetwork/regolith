@@ -83,7 +83,9 @@ impl<T: ?Sized> ReentrantMutex<T> {
         None
     }
 
-    /// Waits for the lock, at once if `owner` already holds it.
+    /// Waits for the lock, at once if `owner` already holds it. A
+    /// contended wait is lock-free, not wait-free: see
+    /// [Progress](super#progress).
     pub fn lock<'a>(&'a self, owner: &'a Owner) -> ReentrantMutexLock<'a, T> {
         ReentrantMutexLock {
             mutex: self,
@@ -146,7 +148,10 @@ impl<T: ?Sized> fmt::Debug for ReentrantMutex<T> {
 }
 
 /// Shared access to a [`ReentrantMutex`]'s value; drops one level of the
-/// hold.
+/// hold. The drop of the last level releases the lock, which is lock-free,
+/// not wait-free: with waiters it returns after one pass over the queue,
+/// plus at most one for each operation of another thread that lands on the
+/// queue meanwhile (see [Progress](super#progress)).
 #[must_use = "dropping the guard releases one level of the lock at once"]
 pub struct ReentrantMutexGuard<'a, T: ?Sized> {
     mutex: &'a ReentrantMutex<T>,

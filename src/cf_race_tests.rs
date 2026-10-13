@@ -36,8 +36,8 @@ fn open(dir: &std::path::Path) -> Db {
 /// Writers hammer a family through every write path while it is dropped
 /// under them; round after round, nothing survives in the dropped range.
 ///
-/// Each writer writes a bounded run, so the commit leader's drain ends and
-/// the drop reaches the ordered step while writes are still arriving.
+/// Each writer writes a bounded run, so the drop's turn in the commit ring
+/// comes while writes are still arriving.
 #[test]
 fn a_write_racing_a_drop_is_deleted_or_refused() {
     const WRITES: u64 = 300;

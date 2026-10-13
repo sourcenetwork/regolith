@@ -40,6 +40,7 @@
 //! Every test here is in the default run. Everything that writes six
 //! figures of operations, a 64 MiB value, or fills a filesystem states its
 //! measured runtime at the test.
+#![cfg(not(target_arch = "wasm32"))]
 
 use std::collections::BTreeMap;
 use std::fs;
