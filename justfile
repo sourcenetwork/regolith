@@ -712,10 +712,10 @@ tla:
     # the pool a batch at a time, reading each listing as its walk of meta/
     # reaches it, and removes every unlisted table and no listed one. Lean:
     # Regolith/BackupSeal.lean, entitled_restore_is_faithful,
-    # refusal_writes_nothing, collect_keeps_listed, last_write_holds_all,
-    # listing_names_every_backup, purge_keeps_the_newest, collect_stream_eq,
-    # stream_holds_one_batch, sweep_eq, sweep_removes_every_unlisted,
-    # list_pages_all.
+    # restored_tables_verify, refusal_writes_nothing, collect_keeps_listed,
+    # last_write_holds_all, listing_names_every_backup, purge_keeps_the_newest,
+    # collect_stream_eq, stream_holds_one_batch, sweep_eq,
+    # sweep_removes_every_unlisted, list_pages_all.
     spec=BackupSeal
     check MC_BackupSeal_Green                          GREEN
     check MC_BackupSeal_Green_Attack                   GREEN
@@ -732,8 +732,10 @@ tla:
     check MC_BackupSeal_Red_ManifestFirst              RED FaithfulRestore
     check MC_BackupSeal_Red_OverDatabase               RED FaithfulRestore
     check MC_BackupSeal_Red_CheckAfterCopy             RED RefusalWritesNothing
+    check MC_BackupSeal_Red_FooterUnchecked            RED RestoredOpens
     check MC_BackupSeal_Red_GcSkipsSealed              RED ListedRestores
     check MC_BackupSeal_Red_GcSkipsUnreadable          RED ListedRestores
+    check MC_BackupSeal_Red_SyncOnlyRemoved            RED ListedRestores
     check MC_BackupSeal_Red_MetaFirst                  RED ListedRestores
     check MC_BackupSeal_Red_ListSkipsUnreadable        RED ListingNamesEvery
     check MC_BackupSeal_Red_ListNeedsKey               RED ListingNamesEvery
@@ -960,6 +962,15 @@ tla:
     check MC_NonBlocking_Red_EarlyFire                 RED TimerNotEarly
     check MC_NonBlocking_Red_DropForgets               RED DroppedHoldsNothing
     check MC_NonBlocking_Red_TimerWrongQueue           RED TimerOnOwnQueue
+    # D53, what a read run again finds: a landing that a call still needs is
+    # held past the queue's byte bound until the call runs again, so a call
+    # needing more blocks at once than the bound finishes, and the eviction
+    # that held nothing never let it.
+    spec=LandingHold
+    check MC_LandingHold_Green                         GREEN
+    check MC_LandingHold_Green_Three                   GREEN
+    check MC_LandingHold_Red_Fifo                      RED EveryCallFinishes
+    check MC_LandingHold_Red_NoHolds                   RED RunsKeepProgress
     # Phase 7 integration: with no worker and inline compaction on, no
     # stopped writer waits on a relief nobody runs. Every piece of progress
     # lands the stall's unit (relief handed back), a contended writer reads

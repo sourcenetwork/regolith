@@ -96,8 +96,8 @@ mod sealed;
 mod size_limit_tests;
 
 pub(crate) use deletions::{BlockCount, DeletionCounter, Deletions};
-pub(crate) use sealed::TableSeal;
 use sealed::{MAGIC_V7, MAGIC_V8, SEALED_FOOTER_SIZE};
+pub(crate) use sealed::{TableSeal, authenticate_footer};
 
 /// SSTable magic number: "REGOSST\x05" - flat index, 72-byte footer,
 /// metadata regions checksummed. Written by regolith today.

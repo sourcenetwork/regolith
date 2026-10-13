@@ -51,6 +51,14 @@
 //!   the mark (one read-modify-write after the park) and releases the unit
 //!   itself.
 //!
+//! - **A read run again finds what it found before.** What landed for a
+//!   queue is bounded by its bytes, but a landing a call run again still
+//!   needs is held past the bound until that run: the blocks the call read
+//!   before its wait, and the block it waited for (`io_queue::ledger`). So a
+//!   call that needs more blocks at once than the bound (a `multi_get`, a
+//!   collecting scan, a merge read) still finishes when it is run again after
+//!   each poll (`LandingHold.tla`).
+//!
 //! - **A poll waits for no other thread.** A job that needs something
 //!   another thread holds parks on its queue instead of waiting, and is
 //!   stepped again once it may go on (`job.rs`, Parking).
@@ -508,11 +516,16 @@ impl IoRuntime {
             return Err(queue_gone());
         };
         match queue.landed(&key) {
-            Some(Landing::Ready(landed)) => return Ok(landed),
+            Some(Landing::Ready(landed)) => {
+                scope::note_hit(&queue, key);
+                return Ok(landed);
+            }
             Some(Landing::Failed(err)) => return Err(crate::Error::clone_io(&err)),
             None => {}
         }
-        let slot = Arc::new(WaitSlot::new());
+        // The call will be run again: its wait carries the landed blocks it
+        // read so far, which its queue keeps for that run.
+        let slot = Arc::new(WaitSlot::holding(scope::note_wait()));
         if !queue.admit(bytes) {
             // The queue owes its whole bound: wait for room instead of adding
             // a unit, and record the read when it is run again.

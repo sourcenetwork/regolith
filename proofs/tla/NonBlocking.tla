@@ -96,7 +96,12 @@
 \*               landed for the queue (QueueShared::landed). The block cache
 \*               is left out on purpose: it only ever makes a re-run find its
 \*               block sooner, so this is the hard case, the one where only
-\*               the landing carries the read (a disabled cache).
+\*               the landing carries the read (a disabled cache). `have`
+\*               only grows: a re-run finds every block that landed for it.
+\*               The code bounds the landings by bytes, and keeps that
+\*               promise by holding past the bound what a call run again
+\*               still needs (src/io_queue/ledger.rs); LandingHold.tla
+\*               checks that, for calls that need several blocks at once.
 \*   timed       the timed waits a queue's owner holds: IoQueue::timers,
 \*               src/io_queue/queue.rs
 \*   elapsed     the clock, as far as a timed wait can tell: the waits whose
@@ -107,7 +112,8 @@
 \*   - Memory ordering and the exact CAS loops: the loom models check those
 \*     (tests/loom_io_queue.rs). Here each CAS is one atomic step.
 \*   - The byte bound on a queue: it delays a read (a "room" wait) but never
-\*     changes who is told what.
+\*     changes who is told what. The bound on what stays landed is
+\*     LandingHold.tla's, see `have` above.
 \*   - What a dropped queue does with its units: it releases them exactly
 \*     as close does (Release below), which adds no new kind of step. What
 \*     it does with its timed waits is a step of its own (DropQueue), so the

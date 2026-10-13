@@ -8,13 +8,14 @@ use std::sync::Arc;
 use std::task::Waker;
 use std::time::Duration;
 
+use super::ledger::Ledger;
 use super::timers::Timers;
 use super::{IoBudget, IoProgress, QueueId};
 use crate::engine::block_cache::BlockCache;
 use crate::engine::io::IoRuntime;
 use crate::engine::io::job::{Delivery, Job};
 use crate::engine::io::shared::{Landing, Message, QueueShared, WaitSlot};
-use crate::engine::io::unit::{Outcome, Ran, Unit, UnitKey};
+use crate::engine::io::unit::{Outcome, Ran, Unit};
 use crate::env::Env;
 
 /// Queue ids are unique in the process, so a handle that names a queue of
@@ -58,7 +59,10 @@ static NEXT_QUEUE: AtomicU64 = AtomicU64::new(1);
 /// the bound (a few hundred blocks of the database's block size), a further
 /// miss waits for room instead of adding a read, and records its read when it
 /// is run again. One read larger than the bound is still admitted when the
-/// queue owes nothing else.
+/// queue owes nothing else. What landed for the queue is kept within the
+/// same bound, except what a call run again still needs: a call that reads
+/// more blocks at once than the bound holds still finishes when it is run
+/// again after each poll (`ledger.rs`).
 ///
 /// Dropping the queue completes every wait recorded on it, on the dropping
 /// thread; a read run again through a handle that still names it fails with
@@ -94,9 +98,8 @@ pub struct IoQueue {
     parked: Vec<Arc<Unit>>,
     /// Reads that found the byte bound full.
     room: Vec<Arc<WaitSlot>>,
-    /// What landed for this queue, oldest first, with what each costs.
-    landed: VecDeque<(UnitKey, usize)>,
-    landed_bytes: usize,
+    /// What landed for this queue, and what calls run again still need.
+    ledger: Ledger,
     /// The timed waits recorded on this queue and not yet due.
     timers: Timers,
     /// The database's environment, whose clock the timed waits are measured
@@ -154,8 +157,7 @@ impl IoQueue {
             order: VecDeque::new(),
             parked: Vec::new(),
             room: Vec::new(),
-            landed: VecDeque::new(),
-            landed_bytes: 0,
+            ledger: Ledger::default(),
             timers: Timers::default(),
             env,
             _owner: PhantomData,
@@ -284,6 +286,10 @@ impl IoQueue {
             self.take_inbox(&mut completed);
         }
         self.make_room();
+        // Once every message this poll took is in: what calls still need is
+        // held, and the rest of what landed fits the bound again.
+        self.ledger.settle(&self.shared);
+        self.shared.set_kept(self.ledger.kept());
         let wake_in = self.fire_timers(&mut completed);
         IoProgress {
             completed,
@@ -394,7 +400,11 @@ impl IoQueue {
         for message in self.shared.take_inbox() {
             match message {
                 Message::Read { unit, slot } => self.accept(unit, slot, completed),
-                Message::Room(slot) => self.room.push(slot),
+                Message::Room(slot) => {
+                    self.ledger.hold(&slot);
+                    self.ledger.seen(slot.holds());
+                    self.room.push(slot);
+                }
                 Message::Done(unit) => {
                     if let Some(waiting) = self.waiting.remove(&address(&unit)) {
                         self.land(&unit);
@@ -417,6 +427,7 @@ impl IoQueue {
                 }
                 Message::SlotFreed => self.unpark(),
                 Message::Timer { due, slot } => self.timers.record(due, slot),
+                Message::Finished(read) => self.ledger.seen(&read),
                 Message::Ready(job) => {
                     // Settled meanwhile (closed, or run by a blocking
                     // caller): its `JobDone` took it out of `jobs`.
@@ -473,6 +484,10 @@ impl IoQueue {
     /// unit the first time. A unit that finished before the registration is
     /// read here, as its completion would have been.
     fn accept(&mut self, unit: Arc<Unit>, slot: Arc<WaitSlot>, completed: &mut usize) {
+        // Hold what the call read before this wait; a kept wait it covers
+        // was the same call's earlier run, which this one replaces.
+        self.ledger.hold(&slot);
+        self.ledger.seen(slot.holds());
         if let Some(waiting) = self.waiting.get_mut(&address(&unit)) {
             waiting.slots.push(slot);
             return;
@@ -494,15 +509,19 @@ impl IoQueue {
     }
 
     /// Complete `slots`, reads of `unit`, and give back the bytes they owed.
-    fn complete(&self, unit: &Unit, slots: Vec<Arc<WaitSlot>>) {
+    /// Each wait is kept, with the block, for its call's next run.
+    fn complete(&mut self, unit: &Unit, slots: Vec<Arc<WaitSlot>>) {
         for slot in slots {
             self.shared.release(unit.bytes());
+            self.ledger.completed(Some(unit.key()), Arc::clone(&slot));
+            self.shared.set_kept(self.ledger.kept());
             slot.complete();
         }
     }
 
     /// Keep what `unit` read, or the error it met, for the reads run again on
-    /// this queue, and let the oldest landings go past the byte bound.
+    /// this queue. The poll lets landings go past the byte bound once it has
+    /// taken every message in (`Ledger::settle`).
     fn land(&mut self, unit: &Unit) {
         let (landing, charge) = match unit.outcome() {
             Some(Outcome::Landed(landed)) => (Landing::Ready(landed.clone()), landed.charge()),
@@ -513,27 +532,37 @@ impl IoQueue {
             Some(Outcome::Released) | None => return,
         };
         self.shared.land(unit.key(), landing);
-        self.landed.push_back((unit.key(), charge));
-        self.landed_bytes = self.landed_bytes.saturating_add(charge);
-        while self.landed_bytes > self.shared.bound() && self.landed.len() > 1 {
-            let Some((key, charge)) = self.landed.pop_front() else {
-                break;
-            };
-            self.landed_bytes -= charge;
-            if !self.landed.iter().any(|(held, _)| *held == key) {
-                self.shared.forget(&key);
+        self.ledger.land(unit.key(), charge);
+    }
+
+    /// Wake the reads that waited for room, once the queue owes less than its
+    /// bound. Each wait is kept for its call's next run, as a read's is.
+    fn make_room(&mut self) {
+        if !self.room.is_empty() && self.shared.pending() < self.shared.bound() {
+            for slot in std::mem::take(&mut self.room) {
+                self.ledger.completed(None, Arc::clone(&slot));
+                self.shared.set_kept(self.ledger.kept());
+                slot.complete();
             }
         }
     }
 
-    /// Wake the reads that waited for room, once the queue owes less than its
-    /// bound.
-    fn make_room(&mut self) {
-        if !self.room.is_empty() && self.shared.pending() < self.shared.bound() {
-            for slot in self.room.drain(..) {
-                slot.complete();
-            }
-        }
+    /// Bytes of what landed for this queue and is still kept.
+    #[cfg(test)]
+    pub(crate) fn landed_bytes(&self) -> usize {
+        self.ledger.bytes()
+    }
+
+    /// Whether a call in progress holds the block `key` landed.
+    #[cfg(test)]
+    pub(crate) fn holds(&self, key: &crate::engine::io::unit::UnitKey) -> bool {
+        self.ledger.is_held(key)
+    }
+
+    /// The blocks still landed for this queue, oldest first.
+    #[cfg(test)]
+    pub(crate) fn landed_keys(&self) -> Vec<crate::engine::io::unit::UnitKey> {
+        self.ledger.keys()
     }
 
     /// The database's unit table.
@@ -564,6 +593,7 @@ impl Drop for IoQueue {
                     }
                 }
                 Message::Room(slot) | Message::Timer { slot, .. } => slot.complete(),
+                Message::Finished(_) => {}
                 // Its unit or job is in `waiting` or `jobs`, and is handled
                 // there; so is every unit this queue parked.
                 Message::Done(_) | Message::JobDone(_) | Message::Ready(_) | Message::SlotFreed => {
@@ -599,9 +629,8 @@ impl Drop for IoQueue {
             slot.complete();
         }
         self.timers.complete_all();
-        for (key, _) in self.landed.drain(..) {
-            self.shared.forget(&key);
-        }
+        self.ledger.clear(&self.shared);
+        self.shared.set_kept(0);
     }
 }
 
