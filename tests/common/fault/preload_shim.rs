@@ -350,6 +350,18 @@ fn contains(hay: &[u8], needle: &str) -> bool {
     hay.windows(n.len()).any(|w| w == n)
 }
 
+/// Whether `path` is tracked: under the database directory, or that
+/// directory itself. The root carries a trailing separator to keep the
+/// harness's own files beside the directory out; the directory is matched
+/// whole so that its own sync, which makes the names of the files directly
+/// in it durable, is recorded too.
+fn tracked(path: &[u8], root: &str) -> bool {
+    contains(path, root) || {
+        let dir = root.trim_end_matches('/');
+        !dir.is_empty() && (path == dir.as_bytes() || path.strip_suffix(b"/") == Some(dir.as_bytes()))
+    }
+}
+
 fn tag_of(fd: c_int) -> u8 {
     if fd < 0 || fd as usize >= MAX_FD {
         return TAG_UNTRACKED;
@@ -379,7 +391,7 @@ unsafe fn maybe_die(kind: u8, tag: u8) {
 }
 
 unsafe fn after_open(fd: c_int, path: &[u8], flags: c_int) {
-    if fd < 0 || !contains(path, &config().root) {
+    if fd < 0 || !tracked(path, &config().root) {
         if fd >= 0 {
             set_tag(fd, TAG_UNTRACKED);
         }
