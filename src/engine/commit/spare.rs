@@ -13,9 +13,15 @@
 //!
 //! # Invariants
 //!
-//! - **S1, a shell has one owner.** It is made only from an `Arc` that
-//!   [`Arc::get_mut`] says is unique: no other strong reference and no weak
-//!   one. Nobody else can reach the allocation, then or later.
+//! - **S1, a shell has one owner.** It is made only from an `Arc` whose
+//!   counts say it is unique: one strong reference, read before an acquire
+//!   fence, and no weak one. Nobody else can reach the allocation, then or
+//!   later: a weak reference is made only from a strong one, and the last
+//!   other strong reference was let go of before the fence (its release
+//!   decrement is what the read saw), so all its use of the value happened
+//!   first. That is what [`Arc::get_mut`] asks too, with a locked
+//!   compare-and-swap of the weak count it needs only against a weak
+//!   reference being made at the same time, which takes a strong one.
 //! - **S2, a shell holds no value.** The value was moved out when the shell
 //!   was made, and the allocation is typed `MaybeUninit` from then on, so it
 //!   is never read or dropped as a value again and pins nothing: no log, no
@@ -38,19 +44,34 @@ mod shell {
     use std::mem::MaybeUninit;
     use std::ptr;
     use std::sync::Arc;
+    use std::sync::atomic::{Ordering, fence};
 
     /// The allocation of an `Arc<T>` whose value was moved out (S1, S2).
     pub(super) struct Shell<T>(Arc<MaybeUninit<T>>);
 
+    /// Whether `arc` is the only reference to its allocation, strong or
+    /// weak (S1): two plain loads and a fence, where [`Arc::get_mut`] takes a
+    /// locked compare-and-swap and a store even to say no.
+    pub(super) fn unique<T>(arc: &Arc<T>) -> bool {
+        if Arc::strong_count(arc) != 1 {
+            return false;
+        }
+        // Pairs with the release decrement of whichever thread let go of
+        // the last other strong reference: its use of the value, and any
+        // weak reference it made, happened before what follows.
+        fence(Ordering::Acquire);
+        Arc::weak_count(arc) == 0
+    }
+
     impl<T> Shell<T> {
         /// Move the value out of `arc` and keep its allocation, when `arc`
         /// is the last reference; otherwise hand `arc` back.
-        pub(super) fn take(mut arc: Arc<T>) -> Result<(Self, T), Arc<T>> {
-            if Arc::get_mut(&mut arc).is_none() {
+        pub(super) fn take(arc: Arc<T>) -> Result<(Self, T), Arc<T>> {
+            if !unique(&arc) {
                 return Err(arc);
             }
             let raw = Arc::into_raw(arc);
-            // SAFETY (S1): `get_mut` said this is the only reference, strong
+            // SAFETY (S1): `unique` said this is the only reference, strong
             // or weak, so no other thread reads the value, and it is moved
             // out exactly once, here.
             let value = unsafe { ptr::read(raw) };
@@ -68,13 +89,15 @@ mod shell {
         /// [`Self::take`] does for a value nobody needs, with no copy of it
         /// out of the allocation first: a descriptor or a decision is a few
         /// hundred bytes.
-        pub(super) fn recycle(mut arc: Arc<T>) -> Option<Self> {
-            Arc::get_mut(&mut arc)?;
+        pub(super) fn recycle(arc: Arc<T>) -> Option<Self> {
+            if !unique(&arc) {
+                return None;
+            }
             let raw = Arc::into_raw(arc).cast_mut();
             // SAFETY (S2): as in `take`; from here on the allocation is only
             // seen as uninitialized, so the shell never drops the value.
             let shell = Self(unsafe { Arc::from_raw(raw.cast_const().cast::<MaybeUninit<T>>()) });
-            // SAFETY (S1): `get_mut` said this is the only reference, so no
+            // SAFETY (S1): `unique` said this is the only reference, so no
             // other thread reads the value, and it is dropped exactly once,
             // here. A drop that unwinds leaves the shell to free the
             // allocation, dropping nothing.
@@ -84,8 +107,8 @@ mod shell {
 
         /// Put `value` in the allocation and hand it out as an `Arc<T>`.
         ///
-        /// No `Arc::get_mut` here: it would ask again, with a locked
-        /// instruction, what S1 already says.
+        /// No uniqueness check here: it would ask again what S1 already
+        /// says.
         pub(super) fn fill(self, value: T) -> Arc<T> {
             let raw = Arc::into_raw(self.0).cast_mut();
             // SAFETY (S1): the shell's `Arc` is the only reference to the
@@ -299,6 +322,44 @@ mod tests {
         assert_eq!(Arc::as_ptr(&again) as usize, address, "the same allocation");
         drop(again);
         assert_eq!(drops.load(Ordering::SeqCst), 2, "each value dropped once");
+    }
+
+    /// A value written on another thread, which then let go of its
+    /// reference: the counts say the last reference is unique only with what
+    /// that thread did before letting go visible here. Under miri a fence
+    /// that does not pair with the release decrement is a data race on the
+    /// value.
+    #[test]
+    fn a_value_let_go_of_on_another_thread_is_taken_with_its_writes() {
+        struct Plain(std::cell::UnsafeCell<u64>);
+        // SAFETY: the test writes the cell on one thread and reads it on
+        // another only after the counts say the writer let go.
+        unsafe impl Sync for Plain {}
+        let arc = Arc::new(Plain(std::cell::UnsafeCell::new(0)));
+        let other = Arc::clone(&arc);
+        assert!(!super::shell::unique(&arc), "two strong references");
+        let writer = std::thread::spawn(move || {
+            // SAFETY: nobody reads the cell until this reference is gone.
+            unsafe { *other.0.get() = 42 };
+            drop(other);
+        });
+        while !super::shell::unique(&arc) {
+            std::thread::yield_now();
+        }
+        let Ok((_shell, value)) = Shell::take(arc) else {
+            panic!("the last reference was not taken");
+        };
+        assert_eq!(value.0.into_inner(), 42, "the writer's write was lost");
+        writer.join().unwrap();
+    }
+
+    #[test]
+    fn a_weak_reference_keeps_a_value_from_being_recycled() {
+        let arc = Arc::new(5u64);
+        let weak = Arc::downgrade(&arc);
+        assert!(!super::shell::unique(&arc), "a weak reference is out");
+        assert!(Shell::recycle(arc).is_none());
+        assert!(weak.upgrade().is_none());
     }
 
     #[test]
