@@ -875,11 +875,11 @@ impl RegolithEngine {
         if wrote_upto != 0 {
             // WU7: the slots the run made publishable are published before
             // their owners are woken, so a woken owner finds its commit done.
-            self.publish_ready(pipe, wrote_upto);
+            self.publish_ready(pipe, wrote_upto, Some(target));
         }
         // Woken once the unit is let go, and each descriptor let go of right
         // after, so an owner that wakes finds its descriptor its own.
-        for (slot, parked) in run.held.iter_mut().zip(parked) {
+        for (slot, parked) in run.held[..run.len].iter_mut().zip(parked) {
             if let Some(held) = slot.take()
                 && parked
             {

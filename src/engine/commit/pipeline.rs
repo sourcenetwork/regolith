@@ -920,8 +920,14 @@ impl RegolithEngine {
     /// Publish, in ring order, the slots up to `limit` that are publishable
     /// now, writing nothing and waiting for nothing: what the write unit's
     /// holder does for the run it wrote (`write_unit.rs`, WU7), so the
-    /// owners it then wakes find their commits published.
-    pub(super) fn publish_ready(&self, pipe: &Pipeline, limit: u64) {
+    /// owners it then wakes find their commits published. `own` is a
+    /// descriptor the caller holds, installed: see [`Self::own_slot`].
+    pub(super) fn publish_ready(
+        &self,
+        pipe: &Pipeline,
+        limit: u64,
+        own: Option<&RingArc<Descriptor>>,
+    ) {
         loop {
             if pipe.ring.is_frozen() {
                 return;
@@ -934,22 +940,29 @@ impl RegolithEngine {
             if next > pipe.ring.decided() {
                 return;
             }
-            let desc = match pipe.ring.load(next) {
-                Loaded::Ready(desc) => desc,
-                // A void slot, as in `publish_upto`.
-                Loaded::Void | Loaded::Gone => {
-                    pipe.ring.pass_published(next);
-                    continue;
-                }
-                Loaded::Empty | Loaded::Full => return,
+            let loaded;
+            let desc = match Self::own_slot(own, next) {
+                Some(desc) => desc,
+                None => match pipe.ring.load(next) {
+                    Loaded::Ready(desc) => {
+                        loaded = desc;
+                        &loaded
+                    }
+                    // A void slot, as in `publish_upto`.
+                    Loaded::Void | Loaded::Gone => {
+                        pipe.ring.pass_published(next);
+                        continue;
+                    }
+                    Loaded::Empty | Loaded::Full => return,
+                },
             };
             let Some(decision) = desc.decision() else {
                 return;
             };
-            if !Self::publishable_slot(&desc, decision) {
+            if !Self::publishable_slot(desc, decision) {
                 return;
             }
-            self.publish_slot(pipe, next, &desc, decision);
+            self.publish_slot(pipe, next, desc, decision);
         }
     }
 

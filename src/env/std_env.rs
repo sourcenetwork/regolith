@@ -469,7 +469,7 @@ impl LogFile for StdLogFile {
     }
 
     // One `pwritev` for the run of records the log's write unit gathered,
-    // re-issued for what a short write left. On Linux through the C
+    // re-issued for what a short write left; one `pwrite` for a run of one. On Linux through the C
     // library's `pwritev`, as `write_all_at` goes through its `pwrite`, so
     // the fault shim the power-loss tests preload sees every log write. Miri
     // cannot call into the C library, and takes the default.
@@ -479,6 +479,11 @@ impl LogFile for StdLogFile {
         mut offset: u64,
         bufs: &[std::io::IoSlice<'_>],
     ) -> io::Result<()> {
+        // A run of one record is a plain positional write: the kernel
+        // copies no vector for it.
+        if let [one] = bufs {
+            return self.write_all_at(offset, one);
+        }
         // The slices the call is handed are the caller's; a short write
         // advances a copy of the list, which stays on the stack for a run of
         // up to `INLINE` records and takes one allocation past that.
