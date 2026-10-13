@@ -159,18 +159,54 @@
 \*     INV_IdenticalRewritesCommit  no reader is refused while the value is the
 \*                                  one it read. A liveness property, kept as
 \*                                  an invariant on refusals.
-\*   WriteFreeWorkload [3.8]
+\*   WriteFreeWorkload [3.8, E50], run at every level
 \*     ReadOnly    optimistic, reads both skew keys at its snapshot, writes
 \*                 nothing.
+\*     ForUpdateReader  optimistic, reads skew key A plainly and skew key B
+\*                 with get_for_update, both at its snapshot, writes nothing.
 \*     Promoter    pessimistic, reads skew key A at its snapshot, then skew key
 \*                 B with get_for_update at a later horizon, writes nothing.
 \*                 Its lock on B is not modelled: dropping it only adds
 \*                 interleavings, and the RED needs none of them.
 \*     SkewWriter  writes both keys, one more each.
-\*     INV_WriteFreeCommits     a write-free DefraLevel transaction never
-\*                              conflicts.
+\*     Latcher     a failure that latches the database read-only at any
+\*                 moment: every later commit that writes is refused.
+\*     A commit that writes nothing takes no part in the commit pipeline: it
+\*     is the step CommitWriteFree, which takes no sequence and checks what
+\*     the level checks against the newest state (the published horizon).
+\*     INV_WriteFreeCommits     a write-free transaction whose level checks
+\*                              none of its reads (ReadCommitted,
+\*                              SnapshotIsolation, DefraLevel's relaxation)
+\*                              never conflicts.
 \*     INV_WriteFreeConsistent  every committed write-free transaction read one
-\*                              point in time.
+\*                              point in time, but a pessimistic one at
+\*                              ReadCommitted or SnapshotIsolation, whose
+\*                              get_for_update reads the newest value by design.
+\*     INV_WriteFreeAtHorizon   every read the level promises to check still
+\*                              holds its value when the commit is made: the
+\*                              commit is placed at the published horizon.
+\*     INV_WriteFreeTakesNoSequence  the sequence counts the commits that
+\*                              wrote, and nothing else.
+\*     INV_WriteFreeReceipt     a write-free commit's receipt is its snapshot.
+\*     INV_LatchRefusesOnlyWrites  a latched database refuses only commits
+\*                              that write.
+\*   ReadOnlyAnomalyWorkload [E50; Fekete, O'Neil and O'Neil 2004]
+\*     Withdrawer  SnapshotIsolation. Reads balances A and B, puts A to A + B.
+\*     Depositor   SnapshotIsolation. Reads balance B, puts it one higher.
+\*     Reporter    the configuration's Level. Reads both, writes nothing.
+\*     The anomaly: the withdrawal reads (1, 1); the deposit commits B = 2;
+\*     the report reads (1, 2); the withdrawal commits A = 2, the sum it
+\*     read. The final (2, 2) puts the withdrawal before the deposit, and the
+\*     report's (1, 2) puts the deposit before the withdrawal: no order of
+\*     the three gives what the report saw.
+\*     INV_NoReadOnlyAnomaly    no report commits a pair that no serial order
+\*                              of the writers committed before it passes
+\*                              through. A report at RepeatableRead or
+\*                              Serializable checks its reads at its commit,
+\*                              so one committed after the withdrawal is
+\*                              refused. One committed before it cannot be,
+\*                              at any level: only the writers' own level
+\*                              prevents that (IsolationLevel's docs).
 \*   LogWorkload, LogDecisionWorkload [3.2, 3.6]
 \*     LogAppenders  append one entry each.
 \*     LogReader     reads the head, appends, and stores the head it read as
@@ -260,6 +296,21 @@
 \*                              pessimistic transaction whose get_for_update
 \*                              read past its snapshot (rejected by the plan).
 \*                              INV_WriteFreeConsistent RED.
+\*   WriteFreeUnchecked         a write-free commit checks nothing at any
+\*                              level. INV_NoReadOnlyAnomaly RED at
+\*                              Serializable, INV_WriteFreeAtHorizon RED at
+\*                              RepeatableRead.
+\*   WriteFreeRefusedWhenLatched  a latched database refuses a write-free
+\*                              commit too (the 0.1.x engine).
+\*                              INV_LatchRefusesOnlyWrites RED.
+\*   WriteFreeTakesSequence     a write-free commit takes a sequence.
+\*                              INV_WriteFreeTakesNoSequence RED.
+\*   ReceiptAtHorizon           a write-free commit's receipt names the
+\*                              horizon it was checked at, not its snapshot.
+\*                              INV_WriteFreeReceipt RED.
+\*   WriteFreeChecksPlainReads  a write-free commit checks every plain read
+\*                              whatever its level. INV_WriteFreeCommits RED at
+\*                              SnapshotIsolation.
 \*   OwnAppendVisible           a log reader sees its own append at the next
 \*                              position.          INV_NoPhantomAppend RED.
 \*   MergeBeforeScanReadsBase   a scan over a key the transaction merged into
@@ -294,10 +345,93 @@
 \*                                nothing, and Green_Parts the same decision
 \*                                with part 1 named.
 \* A fifth RED, Red_Parts_RepeatableRead, runs the real rule at another
-\* level: get_parts at RepeatableRead is a get (INV_PartsRelaxed).
+\* level: get_parts at RepeatableRead is a get (INV_PartsRelaxed). A sixth,
+\* MC_SnapshotIsolation_Red_ReadOnlyAnomaly, runs the real rule with the
+\* report at SnapshotIsolation, which checks nothing: the anomaly the type's
+\* docs warn about (INV_NoReadOnlyAnomaly).
+\*
+\* THE WRITE-FREE COMMIT, PIECE BY PIECE AGAINST THE CODE (E50). Line numbers
+\* are those of commit f03e5e5 on perf/e50-readonly. Each row says what the
+\* model piece stands for in the running program, in everyday words.
+\*
+\*   A transaction "writes nothing"                  WriteFree(t)
+\*     The commit drains the buffered writes; when no put, delete, merge or
+\*     append is left, it takes the write-free road.
+\*     Transaction::drain_for_commit, `write_free`   src/transaction.rs:2037
+\*     (a transaction never carries a range delete: delete_range refuses one)
+\*   Which road the commit takes                    Commit(t): IF WriteFree(t)
+\*     Writes nothing: the write-free check. Writes: a slot of the pipeline.
+\*     Transaction::commit_inner                     src/transaction.rs:1994-1996
+\*     Transaction::commit_nowait_inner              src/transaction/nowait.rs:294-297
+\*   The write-free check itself                     CommitWriteFree(t)
+\*     RegolithEngine::commit_write_free             src/engine/commit/mod.rs:545-615
+\*     - "the database is open" is all it asks, so a latched database
+\*       commits it (no LATCH branch unless the planted bug)
+\*                                                   mod.rs:550, ensure_open (engine/mod.rs:1158)
+\*     - it looks at the newest published state: the clock in the model
+\*                                                   mod.rs:553, `horizon`
+\*     - a read made at or after that point cannot have been written over;
+\*       no read below it means nothing to look up    mod.rs:555-560
+\*     - each read the level checks: refused when a newer write changed it
+\*       (Conflicts(t) through ReadCands and ReadDecider)
+\*                                                   mod.rs:564-591, read_changed (commit/read_rules.rs:42)
+\*     - each validated scan: refused when anything was written in its range
+\*       (ScanCands, ScanDecider)                     mod.rs:594-613, written_in_range (commit/range_rule.rs:31)
+\*     - a refusal names the key, what the transaction did with it and the
+\*       newer write (Abort(t), ReasonOf(t))          mod.rs:583, 605, Conflict::new (src/conflict.rs:128)
+\*     - it takes no sequence: clock unchanged        mod.rs:614, CommitOutcome::Ok { seq: None }
+\*     - its receipt is its snapshot: receipt' = snap  receipt_of (src/transaction.rs:2460)
+\*   Which reads a level checks                      KeptReads(t), ValidatedReads(t), ForUpdateKept(t)
+\*     Every point read at RepeatableRead, Serializable and DefraLevel; at
+\*     SnapshotIsolation only get_for_update reads; at ReadCommitted only
+\*     keys the commit writes, so none here.
+\*     Transaction::validation_set                   src/transaction.rs:2191-2278 (filter at 2210-2221)
+\*     scan stretches folded over the reads          scan_range::cover (src/transaction/scan_range.rs:294)
+\*     validated ranges                              validated_range::checks (src/transaction/validated_range.rs:57)
+\*   DefraLevel's write-free relaxation              ValidatesNothing(t)
+\*     An optimistic DefraLevel transaction that writes nothing keeps only
+\*     its get_for_update reads and no scan.
+\*     drain_for_commit, `relaxed` and the `retain`  src/transaction.rs:2054-2059, 2076, 2095
+\*   The transaction's level and flavour             LevelOf(t), Pessimistic(t), Classified(t)
+\*     Transaction::isolation, Transaction::mode, Transaction::projects
+\*                                                   src/transaction.rs (fields), src/transaction/projection.rs:259
+\*   A get_for_update read                           ReadForUpdate(r) (optimistic), Promote(p) (pessimistic)
+\*     Served at the snapshot when optimistic, at the newest published state
+\*     with the key's lock held when pessimistic; marked to be checked.
+\*     Transaction::read_for_update, read_horizon    src/transaction.rs:1488-1504, 2301-2311
+\*   A failure that latches the database             Latch(l), latched
+\*     RegolithEngine::latch, is_latched             src/engine/mod.rs:1208, 1214
+\*   A commit that writes, on a latched database     CommitWriting(t), the `latched` branch
+\*     request_commit's ensure_writable              src/engine/commit/mod.rs:417 (engine/mod.rs:1170)
+\*
+\* Code steps with no step of their own here, and why none is needed:
+\*   - F2, the short road for a level that checks no read
+\*     (checks_no_read_written_free, src/transaction.rs:2041, 2132): it
+\*     builds the same set as the long road (no read), so the model's one
+\*     KeptReads stands for both; the property test
+\*     a_scan_validates_like_gets_of_what_it_walked compares them.
+\*   - The horizon is sampled before the view is loaded, and a version above
+\*     the horizon found in the view fails the read (mod.rs:553-577). In the
+\*     model a commit is one step, so no commit lands between the sample and
+\*     the look-up: the extra refusal only adds refusals, which no GREEN
+\*     invariant forbids for a read that is checked at all (a level that
+\*     checks nothing looks nothing up). Lean: full_ok_of_later,
+\*     scan_ok_of_later; Rust tests a_commit_published_into_a_new_memtable_is_not_missed
+\*     and a_version_folded_under_a_newer_one_still_fails_the_check.
+\*   - The cache-only scope of commit_nowait (mod.rs:561): the model has no
+\*     cache; Rust test a_cache_only_commit_that_writes_nothing_never_reads_the_device.
+\*   - The conflict counter (Ticker::CommitConflictsOnRead) changes no outcome.
+\* Model steps with no code of their own: PromisedChecks, FitsSerialOrder and
+\* the flags are bookkeeping that watches the run; the engine has none of it.
 \*
 \* LEAN, for every size (proofs/lean/Regolith):
-\*   Validation.lean     ordinary_serial, value_serial, contentAddressed_serial,
+\*   Validation.lean     writeFree_at_horizon (INV_WriteFreeAtHorizon: a
+\*                       write-free commit whose checks passed at the
+\*                       published horizon read the serial state there),
+\*                       full_ok_of_later and scan_ok_of_later (a check that
+\*                       also counts writes above the horizon refuses more,
+\*                       never less),
+\*                       ordinary_serial, value_serial, contentAddressed_serial,
 \*                       parts_serial, scan_serial, exempt_serial (Log reads,
 \*                       commutative stretches, empty parts), blindMerge_serial,
 \*                       and all_classes_serial: a history whose every commit
@@ -310,7 +444,8 @@
 \*   Relaxations.lean    blindMerge_commutes, identical_rewrite,
 \*                       commutative_union, appends_advance_head and
 \*                       appends_keep_dense (INV_LogDense),
-\*                       writeFree_at_snapshot (INV_WriteFreeConsistent); the
+\*                       writeFree_at_snapshot (INV_WriteFreeConsistent),
+\*                       read_only_anomaly (MC_Serializable_Red_ReadOnlyAnomaly); the
 \*                       REDs exempt_decision_breaks_serial
 \*                       (Red_DecideOnLogRead, Red_PartsNamesOther,
 \*                       Red_DecideOnCommutativeScan, Red_DecideOnNoParts:
@@ -359,10 +494,17 @@ PartsRewriterWorkload ==
 ValueWorkload ==
   \* Transaction 40 reads the version key; 41 and 42 rewrite it.
   [NoExtras EXCEPT !["ValueReaders"] = {40}, !["VersionWriters"] = {41, 42}]
-\* Write-free transactions: a read-only, a promoter and a skew writer.
+\* Write-free transactions: a read-only, a for-update reader, a promoter, a skew writer, and a
+\* failure that latches the database read-only.
 WriteFreeWorkload ==
-  \* Transaction 50 only reads, 51 promotes a read, 52 writes both skew keys.
-  [NoExtras EXCEPT !["ReadOnlys"] = {50}, !["Promoters"] = {51}, !["SkewWriters"] = {52}]
+  \* Transaction 50 only reads, 51 promotes a read, 52 writes both skew keys, 53 reads B with
+  \* get_for_update, and failure 57 latches the database.
+  [NoExtras EXCEPT !["ReadOnlys"] = {50}, !["Promoters"] = {51}, !["SkewWriters"] = {52},
+                   !["ForUpdateReaders"] = {53}, !["Latchers"] = {57}]
+\* The read-only anomaly: a withdrawal and a deposit at SnapshotIsolation, and a report.
+ReadOnlyAnomalyWorkload ==
+  \* Transaction 54 withdraws, 55 deposits, 56 reports.
+  [NoExtras EXCEPT !["Withdrawers"] = {54}, !["Depositors"] = {55}, !["Reporters"] = {56}]
 \* The log: two appenders and a reader that appends too.
 LogWorkload ==
   \* Transactions 60 and 61 append; 62 reads the head and appends.
@@ -462,6 +604,10 @@ Init ==
   /\ cepoch    = 0
   \* with no increment counted on top.
   /\ cinc      = {}
+  \* No commit has a receipt yet.
+  /\ receipt   = [t \in Txns |-> 0]
+  \* No failure has latched the database.
+  /\ latched   = FALSE
 
 \* The remote block's parents are fixed by its content, not by the local
 \* heads; the scan is the head-set read the merge path makes. A block already
@@ -755,6 +901,35 @@ BeginPromoter(p) ==
   \* Nothing built from a value, no operations chosen.
   /\ UNCHANGED <<seen, ops>>
 
+\* Skew key A read plainly at the snapshot; the get_for_update of B comes later, in ReadForUpdate.
+BeginForUpdateReader(r) ==
+  \* It reads skew key A at its snapshot and writes nothing.
+  /\ Do(r, {SkewA}, {}, {}, {}, NoIntent)
+  \* Nothing built from a value, no operations chosen.
+  /\ UNCHANGED <<seen, ops>>
+
+\* The bank's withdrawal: both balances read, balance A put to A + B, a value that tells which B it
+\* read.
+BeginWithdrawer(w) ==
+  \* It reads both balances and will put A to their sum, as they are at its snapshot.
+  /\ Do(w, {SkewA, SkewB}, {}, {SkewA}, {}, SkewA :> store[SkewA] + store[SkewB])
+  \* Nothing else built from a value, no operations chosen.
+  /\ UNCHANGED <<seen, ops>>
+
+\* The bank's deposit: balance B read and put one higher.
+BeginDepositor(d) ==
+  \* It reads balance B and will put it one higher than it is at its snapshot.
+  /\ Do(d, {SkewB}, {}, {SkewB}, {}, SkewB :> store[SkewB] + 1)
+  \* Nothing else built from a value, no operations chosen.
+  /\ UNCHANGED <<seen, ops>>
+
+\* The report: both balances read at the snapshot, nothing written.
+BeginReporter(r) ==
+  \* It reads both balances and writes nothing.
+  /\ Do(r, {SkewA, SkewB}, {}, {}, {}, NoIntent)
+  \* Nothing built from a value, no operations chosen.
+  /\ UNCHANGED <<seen, ops>>
+
 \* Both skew keys one more, blind.
 BeginSkewWriter(w) ==
   \* It will put both skew keys, each one more than it holds now, reading neither.
@@ -949,6 +1124,14 @@ Begin(t) ==
        [] t \in Promoters      -> BeginPromoter(t)
        \* a skew writer:
        [] t \in SkewWriters    -> BeginSkewWriter(t)
+       \* a for-update reader:
+       [] t \in ForUpdateReaders -> BeginForUpdateReader(t)
+       \* the bank's withdrawal:
+       [] t \in Withdrawers    -> BeginWithdrawer(t)
+       \* the bank's deposit:
+       [] t \in Depositors     -> BeginDepositor(t)
+       \* the report:
+       [] t \in Reporters      -> BeginReporter(t)
        \* a log appender:
        [] t \in LogAppenders   -> BeginLogAppender(t)
        \* a log reader:
@@ -975,7 +1158,7 @@ Begin(t) ==
        [] t \in NoPartDeciders -> BeginNoPartDecider(t)
   \* A begin commits nothing: the store, the history and the bookkeeping stay as they were.
   /\ UNCHANGED <<clock, store, hist, forUpdate, flags, parents, stale, dupRefused,
-                 wrongReceipt, needlessRefusal, cbase, cepoch, cinc>>
+                 wrongReceipt, needlessRefusal, cbase, cepoch, cinc, receipt, latched>>
 
 \* A pessimistic promoter reads skew key B with get_for_update at the
 \* current horizon, past its snapshot [3.8].
@@ -989,7 +1172,23 @@ Promote(p) ==
   \* Nothing else changes.
   /\ UNCHANGED <<clock, store, hist, phase, snap, tracked, runs, written, merged, intended,
                  seen, ops, flags, parents, stale, dupRefused, wrongReceipt,
-                 needlessRefusal, cbase, cepoch, cinc>>
+                 needlessRefusal, cbase, cepoch, cinc, receipt, latched>>
+
+\* An optimistic for-update reader reads skew key B with get_for_update. An optimistic transaction
+\* reads every key at its snapshot (Transaction::read_horizon), so this read is served there too; what
+\* makes it different from a plain read is that the commit checks it, at SnapshotIsolation and above
+\* (KeyState::for_update).
+ReadForUpdate(r) ==
+  \* The reader is open,
+  /\ phase[r] = "open"
+  \* and has not made this read yet.
+  /\ forUpdate[r] = {}
+  \* It reads skew key B as of its own snapshot.
+  /\ forUpdate' = [forUpdate EXCEPT ![r] = {<<SkewB, snap[r]>>}]
+  \* Nothing else changes.
+  /\ UNCHANGED <<clock, store, hist, phase, snap, tracked, runs, written, merged, intended,
+                 seen, ops, flags, parents, stale, dupRefused, wrongReceipt,
+                 needlessRefusal, cbase, cepoch, cinc, receipt, latched>>
 
 ----------------------------------------------------------------------------
 \* The ghosts the later workloads' invariants read, computed when a
@@ -1025,6 +1224,65 @@ Consistent(t) ==
   \* There is a sequence s, from its snapshot up to now, at which both keys held exactly what it
   \* read.
   \E s \in snap[t]..clock : <<ValueAt(SkewA, s), ValueAt(SkewB, s)>> = SkewSeen(t)
+
+\* The write-free transactions that read the skew keys.
+SkewReaders == ReadOnlys \cup Promoters \cup ForUpdateReaders \cup Reporters
+
+\* Whether t's level promises that what it read is one point in time. Every optimistic transaction
+\* reads one snapshot. A pessimistic one at ReadCommitted or SnapshotIsolation does not: its
+\* get_for_update reads the newest value by design, and that level checks nothing that would tie the
+\* two reads together.
+PromisesOnePoint(t) == ~(Pessimistic(t) /\ LevelOf(t) \in {"ReadCommitted", "SnapshotIsolation"})
+
+\* The reads a write-free transaction's level promises to check, each as <<key, the sequence it was
+\* served at>>: the commit must refuse when one of them no longer holds. This is the promise of
+\* each level, written out apart from the commit rule (KeptReads) so a planted bug in the rule
+\* cannot change it.
+PromisedChecks(t) ==
+  \* plain: every key it read plainly, at its snapshot.
+  LET plain == {<<k, snap[t]>> : k \in tracked[t]}
+  \* At RepeatableRead and Serializable, and for a pessimistic transaction at DefraLevel: every read.
+  IN CASE LevelOf(t) \in {"RepeatableRead", "Serializable"} -> plain \cup forUpdate[t]
+       \* (The pessimistic DefraLevel case, which validates as at RepeatableRead.)
+       [] LevelOf(t) = "DefraLevel" /\ Pessimistic(t)        -> plain \cup forUpdate[t]
+       \* At ReadCommitted: none.
+       [] LevelOf(t) = "ReadCommitted"                        -> {}
+       \* At SnapshotIsolation, and under DefraLevel's write-free relaxation: the get_for_update reads.
+       [] OTHER                                               -> forUpdate[t]
+
+\* THE READ-ONLY ANOMALY'S SERIAL ORDERS. A balance pair is <<A, B>>: skew key A and skew key B.
+
+\* What running writer t alone does to the pair s: the deposit raises B by one, the withdrawal puts A
+\* to A + B.
+BankStep(t, s) == IF t \in Depositors THEN <<s[1], s[2] + 1>> ELSE <<s[1] + s[2], s[2]>>
+
+\* Run the writers of list o one at a time, first first, from the pair s.
+RECURSIVE BankRun(_, _)
+\* (The run: with no writer left, the pair as it is; otherwise the first writer's step, then the
+\* rest.)
+BankRun(o, s) == IF o = <<>> THEN s ELSE BankRun(Tail(o), BankStep(Head(o), s))
+
+\* The pair before any commit.
+BankStart == <<InitStore[SkewA], InitStore[SkewB]>>
+
+\* Every order of the bank's writers that committed so far: each a list naming each of them once.
+BankOrders ==
+  \* done: the withdrawals and deposits that committed.
+  LET done == {t \in Withdrawers \cup Depositors : phase[t] = "committed"}
+  \* The lists of length |done| over done that repeat no writer.
+  IN {o \in [1..Cardinality(done) -> done] :
+        \A i, j \in 1..Cardinality(done) : i # j => o[i] # o[j]}
+
+\* What report r read fits a serial order of the writers committed so far: some order of them, run
+\* one at a time, leaves exactly the balances the database holds (so each writer read in that order
+\* what it really read), and passes, before or after one of its steps, through the pair r read.
+FitsSerialOrder(r) ==
+  \* Some order of the committed writers
+  \E o \in BankOrders :
+     \* reproduces the balances held now,
+     /\ BankRun(o, BankStart) = <<store[SkewA], store[SkewB]>>
+     \* and after its first i steps, for some i, shows the pair the report read.
+     /\ \E i \in 0..Len(o) : BankRun(SubSeq(o, 1, i), BankStart) = SkewSeen(r)
 
 \* What a log reader saw of the log: positions 1..head at its snapshot, and,
 \* under MUTANT OwnAppendVisible, its own entry at the next position.
@@ -1130,8 +1388,15 @@ CommitFlags(t) ==
   \* A value reader whose key holds a different value now.
   \cup (IF t \in ValueReaders /\ store[VersionKey] # ValueAt(VersionKey, snap[t])
         THEN {"ValueStale"} ELSE {})
-  \* A write-free transaction whose two reads fit no single point in time.
-  \cup (IF t \in ReadOnlys \cup Promoters /\ ~Consistent(t) THEN {"Skew"} ELSE {})
+  \* A write-free transaction whose two reads fit no single point in time, where its level promises
+  \* one.
+  \cup (IF t \in SkewReaders /\ PromisesOnePoint(t) /\ ~Consistent(t) THEN {"Skew"} ELSE {})
+  \* A write-free transaction one of whose reads its level promises to check no longer holds the
+  \* value it read when it commits.
+  \cup (IF WriteFree(t) /\ \E c \in PromisedChecks(t) : ValueAt(c[1], c[2]) # store[c[1]]
+        THEN {"WriteFreeStale"} ELSE {})
+  \* A report whose pair fits no serial order of the writers committed before it.
+  \cup (IF t \in Reporters /\ ~FitsSerialOrder(t) THEN {"ReadOnlyAnomaly"} ELSE {})
   \* A log decider whose head moved.
   \cup (IF t \in LogDeciders /\ store[LogHead] # ValueAt(LogHead, snap[t])
         THEN {"LogDecisionStale"} ELSE {})
@@ -1176,59 +1441,119 @@ Count(t, n) ==
   \* A commit that does not touch the counter changes nothing here.
   ELSE UNCHANGED <<cbase, cepoch, cinc>>
 
-\* The commit: abort with a reason when a check fails (Conflicts), or apply
-\* every write at the next sequence and add it to the history. A promoter
-\* commits only after its get_for_update.
+\* An abort: a check failed (Conflicts), so the transaction is refused with a reason and writes
+\* nothing. Shared by the two kinds of commit below.
+Abort(t) ==
+  \* The transaction ends refused.
+  /\ phase'  = [phase EXCEPT ![t] = "aborted"]
+  \* A bad reason or a needless refusal is flagged.
+  /\ flags'  = flags \cup AbortFlags(t)
+  \* A blind increment refused although no reset committed after it began: needless.
+  /\ needlessRefusal' = (needlessRefusal \/ (t \in Incrementers /\ snap[t] >= cepoch))
+  \* A merger refused although every newer write to its keys stored what it writes: a
+  \* refused duplicate.
+  /\ dupRefused' = (dupRefused \/
+                    (t \in Mergers /\ \A k \in written[t] :
+                        After(k, snap[t]) # {} => store[k] = intended[t][k]))
+  \* The history drops what no open snapshot can read any more.
+  /\ hist'   = Prune(hist, phase', clock)
+  \* An abort writes nothing and takes no receipt.
+  /\ UNCHANGED <<clock, store, parents, stale, wrongReceipt, cbase, cepoch, cinc, receipt>>
+
+\* A commit that writes (RegolithEngine::commit_optimistic, src/engine/commit/mod.rs): a slot of
+\* the commit pipeline, decided against everything committed before it. Abort with a reason when a
+\* check fails, or apply every write at the next sequence and add it to the history. On a database
+\* latched read-only it is refused before any check (ensure_writable) and writes nothing.
+CommitWriting(t) ==
+  \* A latched database refuses the commit:
+  IF latched
+    \* it ends failed,
+    THEN /\ phase' = [phase EXCEPT ![t] = "failed"]
+         \* the history drops what no open snapshot can read any more,
+         /\ hist'  = Prune(hist, phase', clock)
+         \* and nothing else changes: no write, no flag, no receipt.
+         /\ UNCHANGED <<clock, store, flags, parents, stale, dupRefused, wrongReceipt,
+                        needlessRefusal, cbase, cepoch, cinc, receipt>>
+  \* A check failed: the transaction aborts.
+  ELSE IF Conflicts(t) THEN Abort(t)
+  \* Every check passed: the transaction commits.
+  ELSE /\ phase'    = [phase EXCEPT ![t] = "committed"]
+       \* It takes the next sequence.
+       /\ clock'    = clock + 1
+       \* Its receipt names that sequence.
+       /\ receipt'  = [receipt EXCEPT ![t] = clock + 1]
+       \* Every key gets its new value.
+       /\ store'    = [k \in Keys |-> NewValue(t, k)]
+       \* Its writes join the history, which is then pruned.
+       /\ hist'     = Prune(hist \cup Records(t, clock + 1), phase', clock + 1)
+       \* A decision on changed inputs is flagged.
+       /\ flags'    = flags \cup CommitFlags(t)
+       \* The DAG bookkeeping:
+       /\ parents'  = IF t \in Appenders
+                        \* an appender's block records the heads it marked as its parents;
+                        THEN [parents EXCEPT ![t] = {h \in Blocks : MarkerKey(h, t) \in written[t]}]
+                        \* a merger that wrote the remote block
+                        ELSE IF t \in Mergers /\ written[t] # {}
+                        \* records the parents the remote block names;
+                        THEN [parents EXCEPT ![Remote] = RemoteParents]
+                        \* anyone else changes nothing.
+                        ELSE parents
+       \* A write built from a definition that has since changed is noted as stale.
+       /\ stale'    = (stale \/ ((t = Writer \/ t \in Migrators) /\ store[DefKey] # seen[t]))
+       \* A read-merger whose count moved is noted as a wrong receipt.
+       /\ wrongReceipt' = (wrongReceipt \/ (t \in ReadMergers /\ store[CounterKey] # seen[t]))
+       \* The counter's contract is updated.
+       /\ Count(t, clock + 1)
+       \* No refusal happened.
+       /\ UNCHANGED <<needlessRefusal, dupRefused>>
+
+\* A commit that writes nothing (RegolithEngine::commit_write_free, src/engine/commit/mod.rs; routed
+\* there by Transaction::drain_for_commit at every level): it takes no slot of the pipeline and no
+\* sequence. It checks what its level checks (KeptReads, ScanDecider) against the newest published
+\* state, the clock, in this one step, and is placed there: every commit made before it comes first,
+\* every later one after it, and it writes nothing a later one could miss. A latched database
+\* commits it too (ensure_open, not ensure_writable). Its receipt is its snapshot.
+CommitWriteFree(t) ==
+  \* Under the planted bug WriteFreeRefusedWhenLatched a latched database refuses it, as the 0.1.x
+  \* engine did: it ends failed and nothing else changes.
+  IF latched /\ Mutant = "WriteFreeRefusedWhenLatched"
+    \* (It ends failed,
+    THEN /\ phase' = [phase EXCEPT ![t] = "failed"]
+         \* the history drops what no open snapshot can read any more,
+         /\ hist'  = Prune(hist, phase', clock)
+         \* and nothing else changes.)
+         /\ UNCHANGED <<clock, store, flags, parents, stale, dupRefused, wrongReceipt,
+                        needlessRefusal, cbase, cepoch, cinc, receipt>>
+  \* A check failed: the transaction aborts.
+  ELSE IF Conflicts(t) THEN Abort(t)
+  \* Every check passed: the transaction commits.
+  ELSE /\ phase'    = [phase EXCEPT ![t] = "committed"]
+       \* It takes no sequence (under the planted bug WriteFreeTakesSequence it takes the next one).
+       /\ clock'    = IF Mutant = "WriteFreeTakesSequence" THEN clock + 1 ELSE clock
+       \* Its receipt names its snapshot (under the planted bug ReceiptAtHorizon, the horizon it was
+       \* checked at).
+       /\ receipt'  = [receipt EXCEPT ![t] = IF Mutant = "ReceiptAtHorizon" THEN clock
+                                              ELSE snap[t]]
+       \* The history drops what no open snapshot can read any more.
+       /\ hist'     = Prune(hist, phase', clock')
+       \* A decision on changed inputs is flagged.
+       /\ flags'    = flags \cup CommitFlags(t)
+       \* It writes nothing: the store and every piece of write bookkeeping stay as they were.
+       /\ UNCHANGED <<store, parents, stale, dupRefused, wrongReceipt, needlessRefusal,
+                      cbase, cepoch, cinc>>
+
+\* The commit. A promoter and a for-update reader commit only after their get_for_update.
 Commit(t) ==
   \* The transaction is open.
   /\ phase[t] = "open"
-  \* A promoter has made its late read.
+  \* A promoter has made its late read,
   /\ t \in Promoters => forUpdate[t] # {}
-  \* Run the checks.
-  /\ IF Conflicts(t)
-       \* A check failed: the transaction aborts.
-       THEN /\ phase'  = [phase EXCEPT ![t] = "aborted"]
-            \* A bad reason or a needless refusal is flagged.
-            /\ flags'  = flags \cup AbortFlags(t)
-            \* A blind increment refused although no reset committed after it began: needless.
-            /\ needlessRefusal' = (needlessRefusal \/ (t \in Incrementers /\ snap[t] >= cepoch))
-            \* A merger refused although every newer write to its keys stored what it writes: a
-            \* refused duplicate.
-            /\ dupRefused' = (dupRefused \/
-                              (t \in Mergers /\ \A k \in written[t] :
-                                  After(k, snap[t]) # {} => store[k] = intended[t][k]))
-            \* The history drops what no open snapshot can read any more.
-            /\ hist'   = Prune(hist, phase', clock)
-            \* An abort writes nothing.
-            /\ UNCHANGED <<clock, store, parents, stale, wrongReceipt, cbase, cepoch, cinc>>
-       \* Every check passed: the transaction commits.
-       ELSE /\ phase'    = [phase EXCEPT ![t] = "committed"]
-            \* It takes the next sequence.
-            /\ clock'    = clock + 1
-            \* Every key gets its new value.
-            /\ store'    = [k \in Keys |-> NewValue(t, k)]
-            \* Its writes join the history, which is then pruned.
-            /\ hist'     = Prune(hist \cup Records(t, clock + 1), phase', clock + 1)
-            \* A decision on changed inputs is flagged.
-            /\ flags'    = flags \cup CommitFlags(t)
-            \* The DAG bookkeeping:
-            /\ parents'  = IF t \in Appenders
-                             \* an appender's block records the heads it marked as its parents;
-                             THEN [parents EXCEPT ![t] = {h \in Blocks : MarkerKey(h, t) \in written[t]}]
-                             \* a merger that wrote the remote block
-                             ELSE IF t \in Mergers /\ written[t] # {}
-                             \* records the parents the remote block names;
-                             THEN [parents EXCEPT ![Remote] = RemoteParents]
-                             \* anyone else changes nothing.
-                             ELSE parents
-            \* A write built from a definition that has since changed is noted as stale.
-            /\ stale'    = (stale \/ ((t = Writer \/ t \in Migrators) /\ store[DefKey] # seen[t]))
-            \* A read-merger whose count moved is noted as a wrong receipt.
-            /\ wrongReceipt' = (wrongReceipt \/ (t \in ReadMergers /\ store[CounterKey] # seen[t]))
-            \* The counter's contract is updated.
-            /\ Count(t, clock + 1)
-            \* No refusal happened.
-            /\ UNCHANGED <<needlessRefusal, dupRefused>>
+  \* and a for-update reader its read.
+  /\ t \in ForUpdateReaders => forUpdate[t] # {}
+  \* One that writes nothing takes the write-free commit; any other is a slot of the pipeline.
+  /\ IF WriteFree(t) THEN CommitWriteFree(t) ELSE CommitWriting(t)
+  \* The latch is not a commit's to set.
+  /\ UNCHANGED latched
   \* What the transactions recorded stays as it was.
   /\ UNCHANGED <<snap, tracked, runs, written, intended, merged, seen, ops, forUpdate>>
 
@@ -1259,16 +1584,37 @@ Clear(c) ==
      /\ cepoch'   = clock + 1
      \* with nothing counted on top.
      /\ cinc'     = {}
+     \* Its receipt names that sequence.
+     /\ receipt'  = [receipt EXCEPT ![c] = clock + 1]
      \* Nothing else changes.
      /\ UNCHANGED <<snap, tracked, runs, written, intended, merged, seen, ops, forUpdate,
-                    flags, parents, stale, dupRefused, wrongReceipt, needlessRefusal>>
+                    flags, parents, stale, dupRefused, wrongReceipt, needlessRefusal, latched>>
 
-\* Every step: a begin, a commit, a promotion or a range delete.
-Next == \/ \E t \in Txns \ Clearers : Begin(t) \/ Commit(t)
+\* A failure latches the database read-only (RegolithEngine::latch, src/engine/mod.rs): a log write
+\* that failed, a callback that panicked inside the ordered step. It can happen at any moment, and
+\* once.
+Latch(l) ==
+  \* This failure has not happened yet.
+  /\ phase[l]  = "idle"
+  \* It happens now; "committed" here only means "has happened".
+  /\ phase'    = [phase EXCEPT ![l] = "committed"]
+  \* The database is latched read-only from now on.
+  /\ latched'  = TRUE
+  \* Nothing else changes: the store, the history and every transaction's record stay.
+  /\ UNCHANGED <<clock, store, hist, snap, tracked, runs, written, intended, merged, seen, ops,
+                 forUpdate, flags, parents, stale, dupRefused, wrongReceipt, needlessRefusal,
+                 cbase, cepoch, cinc, receipt>>
+
+\* Every step: a begin, a commit, a late read, a range delete or a latch.
+Next == \/ \E t \in Txns \ (Clearers \cup Latchers) : Begin(t) \/ Commit(t)
         \* a promoter makes its late read,
         \/ \E p \in Promoters : Promote(p)
-        \* or a plain range delete runs.
+        \* a for-update reader makes its read,
+        \/ \E r \in ForUpdateReaders : ReadForUpdate(r)
+        \* a plain range delete runs,
         \/ \E c \in Clearers : Clear(c)
+        \* or a failure latches the database.
+        \/ \E l \in Latchers : Latch(l)
 
 \* Every behaviour, with weak fairness so every enabled step is taken.
 Spec == Init /\ [][Next]_vars /\ WF_vars(Next)
@@ -1285,8 +1631,8 @@ TypeOK ==
   /\ store \in [Keys -> Nat]
   \* Every history entry has the record shape.
   /\ hist \subseteq Records_
-  \* Every transaction is in one of the four phases.
-  /\ phase \in [Txns -> {"idle", "open", "committed", "aborted"}]
+  \* Every transaction is in one of the five phases.
+  /\ phase \in [Txns -> {"idle", "open", "committed", "aborted", "failed"}]
   \* Reads, writes and merges name keys.
   /\ \A t \in Txns : tracked[t] \subseteq Keys /\ written[t] \subseteq Keys /\ merged[t] \subseteq Keys
   \* Every stretch is a pair of keys, the first at or before the last.
@@ -1301,6 +1647,10 @@ TypeOK ==
   /\ cbase \in Nat /\ cepoch \in Nat /\ cinc \subseteq Nat
   \* The stale mark is a yes or a no.
   /\ stale \in BOOLEAN
+  \* Every receipt is a sequence number.
+  /\ receipt \in [Txns -> Nat]
+  \* The latch is a yes or a no.
+  /\ latched \in BOOLEAN
 
 \* THE HEADLINE for the head set. An append that did its scan, built its
 \* block and asked to commit is never turned away by a sweep that reclaimed
@@ -1407,16 +1757,69 @@ INV_ValueReadsCurrent == "ValueStale" \notin flags
 \* refused for it.
 INV_IdenticalRewritesCommit == "IdenticalRewriteRefused" \notin flags
 
-\* A write-free DefraLevel transaction never conflicts.
-\* Rules out, for example: a transaction that only reads is refused. It has nothing to lose: it can
-\* simply count as having run at its snapshot.
-INV_WriteFreeCommits == \A r \in ReadOnlys : phase[r] # "aborted"
+\* A write-free transaction whose level checks none of its reads never conflicts: at ReadCommitted,
+\* at SnapshotIsolation, and under DefraLevel's write-free relaxation, a transaction that only read
+\* plainly is never refused.
+\* Rules out, for example: a report that only reads is refused at SnapshotIsolation because a writer
+\* changed what it read. It has nothing to lose: it read one snapshot and counts as having run there.
+INV_WriteFreeCommits ==
+  \* Every read-only transaction and every report whose level checks no plain read
+  \A r \in ReadOnlys \cup Reporters :
+     \* (ReadCommitted, SnapshotIsolation, or DefraLevel's optimistic rules)
+     LevelOf(r) \in {"ReadCommitted", "SnapshotIsolation"} \/ Classified(r)
+       \* is never refused.
+       => phase[r] # "aborted"
 
 \* Every committed write-free transaction read the state of one point in
-\* time: no read skew.
+\* time: no read skew. A pessimistic one at ReadCommitted or SnapshotIsolation is left out: its
+\* get_for_update reads the newest value by design, and its level promises nothing more.
 \* Rules out, for example: a write-free transaction reads key A before a commit and key B after it,
 \* two values that no single moment ever showed together.
 INV_WriteFreeConsistent == "Skew" \notin flags
+
+\* E50. A write-free commit is placed at the published horizon: every read its level promises to
+\* check (PromisedChecks) still holds, when it commits, the value it read.
+\* Rules out, for example: at Serializable, a transaction reads key A, a writer commits a new A, and
+\* the transaction still commits with the old A, as if no check had run.
+INV_WriteFreeAtHorizon == "WriteFreeStale" \notin flags
+
+\* E50, Fekete, O'Neil and O'Neil (2004). No report commits a pair of balances that no serial order
+\* of the withdrawals and deposits committed before it passes through.
+\* Rules out, for example: the withdrawal read (1, 1) and the deposit committed B = 2; the report
+\* read (1, 2); the withdrawal committed A = 2 from the sum it read; then the report commits (1, 2),
+\* a sheet that shows the deposit without the withdrawal although the withdrawal had to come first.
+INV_NoReadOnlyAnomaly == "ReadOnlyAnomaly" \notin flags
+
+\* E50. A commit that writes nothing takes no sequence: the clock counts exactly the commits that
+\* wrote (and the plain range deletes).
+\* Rules out, for example: two reports commit and the next writer's sequence is two higher than it
+\* would be, as if the reports had written.
+INV_WriteFreeTakesNoSequence ==
+  \* The clock equals the number of
+  clock = Cardinality({t \in Txns :
+                       \* commits that have happened
+                       /\ phase[t] = "committed"
+                       \* and wrote: a plain range delete, or a transaction (not a latch) that is not
+                       \* write-free.
+                       /\ (t \in Clearers \/ (t \notin Latchers /\ ~WriteFree(t)))})
+
+\* E50, the operator's decision (L59). A committed write-free transaction's receipt is the snapshot
+\* it read at.
+\* Rules out, for example: a report began at sequence 3, two writers committed, and its receipt
+\* says 5.
+INV_WriteFreeReceipt ==
+  \* For every transaction that is not a range delete and not a latch:
+  \A t \in Txns \ (Clearers \cup Latchers) :
+     \* if it committed and wrote nothing,
+     phase[t] = "committed" /\ WriteFree(t)
+       \* has its snapshot as its receipt.
+       => receipt[t] = snap[t]
+
+\* E50, the operator's decision (L59). A database latched read-only refuses only commits that
+\* write: a write-free commit writes nothing, so the latch never fails it.
+\* Rules out, for example: a failure latches the database and a report that only read is then
+\* refused although it would change nothing.
+INV_LatchRefusesOnlyWrites == \A t \in Txns : phase[t] = "failed" => ~WriteFree(t)
 
 \* Appends and log reads are never validated, so no appender or log reader
 \* is refused.

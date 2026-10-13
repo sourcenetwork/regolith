@@ -540,8 +540,29 @@ tla:
     check MC_DefraLevel_Red_Parts_RepeatableRead       RED INV_PartsRelaxed
     check MC_DefraLevel_Green_ValueReads               GREEN
     check MC_DefraLevel_Red_SeqOnlyValidation          RED INV_IdenticalRewritesCommit
+    # E50, a commit that writes nothing at every level: no pipeline slot, no
+    # sequence, its level's checks at the published horizon, the receipt its
+    # snapshot, a latched database commits it. Lean:
+    # Regolith/Validation.lean, writeFree_at_horizon; Regolith/Relaxations.lean,
+    # read_only_anomaly.
+    check MC_ReadCommitted_Green_WriteFree             GREEN
+    check MC_SnapshotIsolation_Green_WriteFree         GREEN
+    check MC_RepeatableRead_Green_WriteFree            GREEN
+    check MC_Serializable_Green_WriteFree              GREEN
     check MC_DefraLevel_Green_WriteFree                GREEN
     check MC_DefraLevel_Red_WriteFreePessimistic       RED INV_WriteFreeConsistent
+    check MC_RepeatableRead_Red_WriteFreeUnchecked     RED INV_WriteFreeAtHorizon
+    check MC_SnapshotIsolation_Red_WriteFreeChecksPlainReads RED INV_WriteFreeCommits
+    check MC_SnapshotIsolation_Red_WriteFreeRefusedWhenLatched RED INV_LatchRefusesOnlyWrites
+    check MC_SnapshotIsolation_Red_WriteFreeTakesSequence RED INV_WriteFreeTakesNoSequence
+    check MC_SnapshotIsolation_Red_ReceiptAtHorizon    RED INV_WriteFreeReceipt
+    # The read-only anomaly (Fekete, O'Neil and O'Neil 2004): a report checked at
+    # its commit is refused after the withdrawal; unchecked, it commits a sheet
+    # no serial order gives, as one at SnapshotIsolation does by design.
+    check MC_Serializable_Green_ReadOnlyAnomaly        GREEN
+    check MC_RepeatableRead_Green_ReadOnlyAnomaly      GREEN
+    check MC_Serializable_Red_ReadOnlyAnomaly          RED INV_NoReadOnlyAnomaly
+    check MC_SnapshotIsolation_Red_ReadOnlyAnomaly     RED INV_NoReadOnlyAnomaly
     check MC_DefraLevel_Green_Log                      GREEN
     check MC_DefraLevel_Red_OwnAppendVisible           RED INV_NoPhantomAppend
     check MC_DefraLevel_Red_DecideOnLogRead            RED INV_LogDecisionsCurrent

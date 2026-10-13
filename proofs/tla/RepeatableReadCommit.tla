@@ -78,9 +78,14 @@
 \*         nothing or the transaction puts the key; never with no part
 \*         named. Like any read but a presence read, it stands for a write
 \*         of its key, which is why the put fallback is needed.
-\*   RegolithEngine::commit_write_free [3.8]          src/engine/commit/mod.rs
-\*         Write-free transactions. An optimistic DefraLevel transaction
-\*         with no put, delete, merge or append validates no plain read. A
+\*   RegolithEngine::commit_write_free [3.8, E50]     src/engine/commit/mod.rs
+\*   Transaction::drain_for_commit                              src/transaction.rs
+\*         Write-free transactions. A commit with no put, delete, merge or
+\*         append takes no part in the commit pipeline, at every level and
+\*         in both flavours: it takes no sequence, checks what its level
+\*         checks against the published state, commits on a database
+\*         latched read-only, and its receipt names its snapshot. An
+\*         optimistic DefraLevel one checks only its get_for_update reads; a
 \*         pessimistic one validates as at RepeatableRead.
 \*   KeyClass::Log, Transaction::append [3.2, 3.6]    src/transaction/append.rs
 \*         Log keys. A read of a key of the log range is never validated at
@@ -178,7 +183,8 @@ CONSTANTS
   ContentAddressedRanges,
   \* The isolation level every transaction runs at, one of the names of IsolationLevel
   \* (src/transaction.rs): "ReadCommitted", "SnapshotIsolation", "RepeatableRead", "Serializable" or
-  \* "DefraLevel".
+  \* "DefraLevel". The two writers of the read-only anomaly run at SnapshotIsolation whatever it says
+  \* (LevelOf below).
   Level,
   \* "none" for the real rules, or the name of the one rule a RED configuration breaks on purpose
   \* (the list is in RepeatableRead.tla, MUTANTS).
@@ -188,7 +194,8 @@ CONSTANTS
 RoleNames == {"Collectors", "Linkers", "Holders",
               "PartReaders", "PartRewriters", "PartWriters",
               "ValueReaders", "VersionWriters",
-              "ReadOnlys", "Promoters", "SkewWriters",
+              "ReadOnlys", "Promoters", "SkewWriters", "ForUpdateReaders", "Latchers",
+              "Withdrawers", "Depositors", "Reporters",
               "LogAppenders", "LogReaders", "LogDeciders",
               "TallyMergers", "OwnWriters",
               "Checkers", "Revokers", "Granters",
@@ -223,6 +230,22 @@ ReadOnlys      == Extras["ReadOnlys"]
 Promoters      == Extras["Promoters"]
 \* Skew writers: each writes both skew keys in one commit.
 SkewWriters    == Extras["SkewWriters"]
+\* For-update readers: optimistic and write-free; each reads skew key A plainly and skew key B with
+\* get_for_update, both at its snapshot (an optimistic transaction reads everything there).
+ForUpdateReaders == Extras["ForUpdateReaders"]
+\* Latchers: not transactions. Each is one failure (a log write that failed, a callback that
+\* panicked) that latches the database read-only: from then on every commit that writes is refused.
+Latchers       == Extras["Latchers"]
+\* Withdrawers: the bank's withdrawal of the read-only anomaly. Each reads both skew keys (balance A
+\* and balance B) and puts A to A + B, a value that tells which B it read. Runs at
+\* SnapshotIsolation.
+Withdrawers    == Extras["Withdrawers"]
+\* Depositors: the bank's deposit. Each reads balance B and puts it one higher. Runs at
+\* SnapshotIsolation.
+Depositors     == Extras["Depositors"]
+\* Reporters: the read-only report of the anomaly. Each reads both balances and writes nothing, at
+\* the configuration's Level.
+Reporters      == Extras["Reporters"]
 \* Log appenders: each appends one entry to the log.
 LogAppenders   == Extras["LogAppenders"]
 \* Log readers: each reads the log's head, appends an entry, and stores the head it read as its
@@ -284,7 +307,9 @@ ASSUME Mutant \in {"none", "ReadMergeBlind", "PutMergeBlind", "PutMergeElides",
                    "CaDeleteExempt", "PresenceReadFull", "PresenceUnchecked",
                    "PartsIgnorePut", "PartsIgnoreTouch", "PartsNoAbsentFallback",
                    "PartsNoPutFallback", "PartsNamesOther", "SeqOnlyValidation",
-                   "WriteFreePessimistic", "OwnAppendVisible", "MergeBeforeScanReadsBase",
+                   "WriteFreePessimistic", "WriteFreeUnchecked", "WriteFreeRefusedWhenLatched",
+                   "WriteFreeTakesSequence", "ReceiptAtHorizon", "WriteFreeChecksPlainReads",
+                   "OwnAppendVisible", "MergeBeforeScanReadsBase",
                    "PutsBeforeMerges", "OwnMergesInvisible", "ReasonNewestWrite",
                    "PlainScanDecides"}
 \* The remote block is a number of its own: not an appender's block and not the seed.
@@ -484,7 +509,7 @@ Accesses == {"Read", "ReadParts", "ReadPresence", "ReadForUpdate", "ScannedThenW
 \* for; RepeatableRead.tla says what each means.
 FlagNames == {"HoldStale", "PartsStale", "PartsRefusedNeedlessly", "ValueStale",
               "IdenticalRewriteRefused", "Skew", "LogDecisionStale", "PhantomAppend",
-              "OwnMismatch", "ScanStale", "BadReason"}
+              "OwnMismatch", "ScanStale", "BadReason", "WriteFreeStale", "ReadOnlyAnomaly"}
 
 \* The state: everything that changes from one step to the next. Each line says what the variable
 \* stands for in the real program.
@@ -500,8 +525,9 @@ VARIABLES
   \* versions the engine keeps in its memtables and tables, each stamped with its sequence and kind
   \* (src/engine/internal_key.rs).
   hist,
-  \* Where each transaction is in its life: "idle" (not begun), "open", "committed" or "aborted" (a
-  \* Transaction, src/transaction.rs).
+  \* Where each transaction is in its life: "idle" (not begun), "open", "committed", "aborted" (it
+  \* lost a race) or "failed" (a database latched read-only refused its writes) (a Transaction,
+  \* src/transaction.rs).
   phase,
   \* The sequence each transaction took as its snapshot when it began (Transaction::snapshot_seq).
   snap,
@@ -551,12 +577,18 @@ VARIABLES
   cepoch,
   \* The counter's contract, part 3: the commit sequences of the increments counted on top of that
   \* write.
-  cinc
+  cinc,
+  \* The sequence each committed transaction's receipt carries (CommitReceipt::seq,
+  \* src/transaction/receipt.rs): the one its writes took, or its snapshot when it wrote nothing.
+  receipt,
+  \* TRUE once a failure latched the database read-only (RegolithEngine::is_latched,
+  \* src/engine/mod.rs): every commit that writes is refused from then on.
+  latched
 
 \* Every variable, so a step that changes none of them is a stutter.
 vars == <<clock, store, hist, phase, snap, tracked, runs, written, merged, intended, seen,
           ops, forUpdate, flags, parents, stale, dupRefused, wrongReceipt,
-          needlessRefusal, cbase, cepoch, cinc>>
+          needlessRefusal, cbase, cepoch, cinc, receipt, latched>>
 
 \* The keys that hold a value now.
 Stored == {k \in Keys : store[k] # Absent}
@@ -637,19 +669,27 @@ Yield(S, lo, hi) == {k \in S : lo <= k[1] /\ k[1] <= hi}
 Stretch(Y) == IF Y = {} THEN {} ELSE {<<MinKey(Y), MaxKey(Y)>>}
 
 \* TxnScanStream::yield_cursor: the yielded keys it records as reads, only
-\* where IsolationLevel::validates_scanned_keys holds.
+\* where IsolationLevel::validates_scanned_keys holds. Only transactions at the configuration's Level
+\* scan (the anomaly's writers, the one role with a level of its own, scan nothing), so Level is
+\* their level.
 ScanReads(Y) == IF Level = "Serializable" THEN Y ELSE {}
 
 ----------------------------------------------------------------------------
 \* WHO CONSULTS THE CLASSIFIER.
 
-\* A pessimistic transaction. At DefraLevel it validates exactly as at
-\* RepeatableRead and consults no classifier [3.1].
+\* The level transaction t runs at (TxnOptions::isolation, src/transaction/txn_options.rs). The
+\* engine lets each transaction pick its own: the anomaly's withdrawal and deposit run at
+\* SnapshotIsolation beside a report at the configuration's Level, and every other role runs at
+\* Level.
+LevelOf(t) == IF t \in Withdrawers \cup Depositors THEN "SnapshotIsolation" ELSE Level
+
+\* A pessimistic transaction (TransactionDb, src/transaction.rs). At DefraLevel it validates exactly
+\* as at RepeatableRead and consults no classifier [3.1].
 Pessimistic(t) == t \in Promoters
 
 \* The transaction runs under DefraLevel's optimistic rules: key classes,
 \* value validation, blind merges, write-free commits.
-Classified(t) == Level = "DefraLevel" /\ ~Pessimistic(t)
+Classified(t) == LevelOf(t) = "DefraLevel" /\ ~Pessimistic(t)
 
 \* KeyClass::ContentAddressed, applied where the classifier is consulted.
 CA(t, k) == Classified(t) /\ k[1] \in ContentAddressedRanges
@@ -660,20 +700,24 @@ LogKey(t, k) == Classified(t) /\ k[1] \in LogRanges
 \* The transaction appends to the log at commit.
 Appends(t) == t \in LogAppenders \cup LogReaders
 
-\* Plan section [3.8]: no put, delete, merge or append.
+\* Plan section [3.8]: no put, delete, merge or append (Transaction::drain_for_commit's
+\* `write_free`). Such a commit takes no part in the commit pipeline, at every level.
 WriteFree(t) == written[t] = {} /\ merged[t] = {} /\ ~Appends(t)
 
-\* Plan section [3.8]: a write-free optimistic DefraLevel transaction validates no
-\* plain read; its snapshot is consistent on its own. MUTANT
-\* WriteFreePessimistic extends that to a pessimistic one, which the plan
-\* rejects.
+\* Plan section [3.8]: DefraLevel's write-free relaxation (drain_for_commit's `relaxed`). A
+\* write-free optimistic DefraLevel transaction validates no plain read and no scan: its snapshot is
+\* consistent on its own; it still checks what it read with get_for_update (KeptReads). MUTANT
+\* WriteFreePessimistic extends that to a pessimistic one, which the plan rejects; MUTANT
+\* WriteFreeUnchecked to a write-free transaction at any level.
 ValidatesNothing(t) ==
   \* It writes nothing, and
   /\ WriteFree(t)
   \* either it runs under DefraLevel's optimistic rules,
   /\ \/ Classified(t)
-     \* or it is pessimistic and the planted bug WriteFreePessimistic lets it skip validation too.
+     \* or it is pessimistic and the planted bug WriteFreePessimistic lets it skip validation too,
      \/ Pessimistic(t) /\ Mutant = "WriteFreePessimistic"
+     \* or the planted bug WriteFreeUnchecked lets every write-free transaction skip it.
+     \/ Mutant = "WriteFreeUnchecked"
 
 \* policy::exempt_content_addressed: the content-addressed keys the commit
 \* puts or merges, which nothing validates. The newest write decides, so a
@@ -754,10 +798,13 @@ ValidatedReads(t) ==
   \* Of the keys t recorded as read, keep:
   {k \in tracked[t] :
      \* every one at RepeatableRead, Serializable and DefraLevel
-     \* (IsolationLevel::validates_every_read);
-     IF Level \in {"RepeatableRead", "Serializable", "DefraLevel"} THEN TRUE
+     \* (IsolationLevel::validates_every_read), and, under the planted bug WriteFreeChecksPlainReads,
+     \* every one of a write-free transaction at any level;
+     IF \/ LevelOf(t) \in {"RepeatableRead", "Serializable", "DefraLevel"}
+        \/ WriteFree(t) /\ Mutant = "WriteFreeChecksPlainReads"
+     THEN TRUE
      \* at ReadCommitted only a key the commit also writes;
-     ELSE IF Level = "ReadCommitted" THEN k \in written[t]
+     ELSE IF LevelOf(t) = "ReadCommitted" THEN k \in written[t]
      \* at SnapshotIsolation a key read with get_for_update or one the commit also writes.
      ELSE k \in ForUpdate(t) \/ k \in written[t]}
 
@@ -765,9 +812,9 @@ ValidatedReads(t) ==
 \* walked joins the reads, anchored at the begin snapshot.
 \* policy::run_is_commutative: at DefraLevel a stretch whose two ends lie in
 \* one declared range is dropped before cover sees it.
-Commutative(s) ==
+Commutative(t, s) ==
   \* Only DefraLevel drops stretches.
-  /\ Level = "DefraLevel"
+  /\ LevelOf(t) = "DefraLevel"
   \* Under the planted bug PolicyIgnoresRange,
   /\ IF Mutant = "PolicyIgnoresRange"
        \* the stretch is dropped when either end lies in a commutative range;
@@ -775,7 +822,7 @@ Commutative(s) ==
        \* the real rule drops it only when both ends lie in the same commutative range.
        ELSE s[1][1] \in CommutativeRanges /\ s[2][1] = s[1][1]
 \* The stretches of t that cover reads: those the policy did not drop.
-CoveredRuns(t) == {s \in runs[t] : ~Commutative(s)}
+CoveredRuns(t) == {s \in runs[t] : ~Commutative(t, s)}
 
 \* Key k lies inside a stretch of t that covers reads.
 Walked(t, k) == \E s \in CoveredRuns(t) : KeyLeq(s[1], k) /\ KeyLeq(k, s[2])
@@ -816,18 +863,29 @@ PartRead(t) ==
      \* Otherwise a projected read over the named parts.
      ELSE {Rd(PartKey, snap[t], "ReadParts", "parts", NamedParts(t))}
 
+\* The get_for_update reads a commit validates, each at the sequence it was served at. At
+\* ReadCommitted none: validation_set keeps a read there only when the commit writes its key, and a
+\* get_for_update records no write. Under the planted bug WriteFreeUnchecked a write-free commit
+\* keeps none either.
+ForUpdateKept(t) ==
+  \* None at ReadCommitted, or for a write-free commit under the planted bug WriteFreeUnchecked;
+  IF LevelOf(t) = "ReadCommitted" \/ (WriteFree(t) /\ Mutant = "WriteFreeUnchecked") THEN {}
+  \* otherwise each one, run through the class rule.
+  ELSE UNION {Classify(t, f[1], f[2], "ReadForUpdate") : f \in forUpdate[t]}
+
 \* Every read the commit validates. A point read and a stretch over the same
 \* written key are one read, recorded as the point read.
 KeptReads(t) ==
-  \* A transaction that validates nothing keeps no read.
-  IF ValidatesNothing(t) THEN {}
+  \* A transaction under the write-free relaxation keeps only its get_for_update reads
+  \* (drain_for_commit's `retain` of Access::ReadForUpdate).
+  IF ValidatesNothing(t) THEN ForUpdateKept(t)
   \* The point reads the level validates, each run through the class rule;
   ELSE UNION {Classify(t, k, snap[t], "Read") : k \in ValidatedReads(t)}
        \* plus the written or merged keys a covered stretch walked over that were not point reads;
        \cup UNION {Classify(t, k, snap[t], "ScannedThenWrote") :
                      k \in {j \in written[t] \cup merged[t] : Walked(t, j)} \ ValidatedReads(t)}
        \* plus the get_for_update reads, each at the sequence it was served at;
-       \cup UNION {Classify(t, f[1], f[2], "ReadForUpdate") : f \in forUpdate[t]}
+       \cup ForUpdateKept(t)
        \* plus the read by parts.
        \cup PartRead(t)
 
