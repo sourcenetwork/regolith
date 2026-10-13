@@ -42,6 +42,11 @@ fn one_tombstone_appended_twice_is_listed_once() {
 }
 
 #[test]
+fn a_batch_beside_an_append_loses_neither() {
+    tombstones::a_batch_beside_an_append_loses_neither();
+}
+
+#[test]
 #[should_panic(expected = "two appends were handed one position")]
 fn a_position_taken_by_a_load_and_a_store_is_handed_out_twice() {
     tombstones::a_position_taken_by_a_load_and_a_store_is_handed_out_twice();

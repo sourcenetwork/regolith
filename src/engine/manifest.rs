@@ -21,6 +21,9 @@ mod suspects;
 mod tail;
 pub(crate) use tail::DroppedTail;
 
+mod legacy_overlap;
+pub(crate) use legacy_overlap::Demotion;
+
 /// Maximum number of levels in the LSM tree.
 pub(crate) const MAX_LEVELS: usize = 7;
 
@@ -479,6 +482,12 @@ pub(crate) struct VersionSet {
     /// Every key a batch of the manifest on disk is sealed under, so a
     /// rotation can tell whether the file still names a retired key.
     sealed_under: Vec<KeyId>,
+    /// What this open moved out of overlapping levels, until the engine
+    /// takes it.
+    demotion: Option<Demotion>,
+    /// The edit that records that move, not in the manifest yet:
+    /// [`Self::apply`] writes it in front of its next batch.
+    unlogged: Vec<ManifestRecord>,
 }
 
 struct ManifestReplay {
@@ -491,6 +500,9 @@ struct ManifestReplay {
     salt: Option<[u8; 16]>,
     /// Every key a replayed batch was sealed under.
     key_ids: Vec<KeyId>,
+    repair: legacy_overlap::Repair,
+    /// What `repair` moved, with the moved tables' range tombstones.
+    demotion: Option<Demotion>,
 }
 
 impl VersionSet {
@@ -516,6 +528,8 @@ impl VersionSet {
     ) -> io::Result<Self> {
         let manifest_path = db_dir.join("MANIFEST");
 
+        let mut demotion = None;
+        let mut unlogged = Vec::new();
         let manifest_bytes;
         let mut dropped_tail = None;
         let salt;
@@ -540,6 +554,8 @@ impl VersionSet {
             if replayed_cleanly && env.capabilities().file_lock {
                 super::orphan_sweep::sweep_unreferenced_tables(&**env, sst_dir, &replay.version)?;
             }
+            demotion = replay.demotion;
+            unlogged = replay.repair.records;
 
             // Trim through its own handle, and close it before the
             // append handle is opened. A torn or corrupt tail is the
@@ -590,12 +606,17 @@ impl VersionSet {
             keyring,
             sealing,
             sealed_under,
+            demotion,
+            unlogged,
         };
         // The one-time conversion of a database written without encryption
         // and opened with a key provider: its manifest names every table
         // and key range in plaintext, so it is rewritten sealed now rather
-        // than whenever it next grows past its rewrite threshold.
-        if convert {
+        // than whenever it next grows past its rewrite threshold. An open
+        // that moved tables rewrites it with the batch that records the
+        // move (`apply`): the rewrite would record the move too, before the
+        // engine has made the moved tables' range tombstones durable.
+        if convert && set.unlogged.is_empty() {
             set.compact_manifest()?;
         }
         Ok(set)
@@ -699,6 +720,9 @@ impl VersionSet {
             keyring,
             sealing,
             sealed_under: replay.key_ids,
+            // Read-only: the view is repaired, the manifest never is.
+            demotion: replay.demotion,
+            unlogged: Vec::new(),
         })
     }
 
@@ -716,6 +740,15 @@ impl VersionSet {
     /// Get the current version.
     pub(crate) fn current(&self) -> Arc<Version> {
         Arc::clone(&self.current)
+    }
+
+    /// What this open moved out of overlapping levels, handed over once:
+    /// `None` when it moved nothing, which is every open after the move is
+    /// in the manifest. The caller owes the moved tables' range tombstones
+    /// a place in front of every key they cover before its first
+    /// [`Self::apply`], which is what records the move.
+    pub(crate) fn take_demotion(&mut self) -> Option<Demotion> {
+        self.demotion.take()
     }
 
     /// Path of the manifest file on disk.
@@ -791,9 +824,25 @@ impl VersionSet {
             "a level below L0 holds tables that overlap beyond a shared boundary key"
         );
 
-        let records: Vec<ManifestRecord> = edits.iter().map(VersionEdit::to_record).collect();
+        // The move an open made of overlapping levels goes in the same
+        // batch, in front: the log then replays to the version the edits
+        // were applied to, and a crash keeps both or neither.
+        let mut records = std::mem::take(&mut self.unlogged);
+        let moved = records.len();
+        let recorded_move = moved > 0;
+        records.extend(edits.iter().map(VersionEdit::to_record));
         let (encoded, sealed_under) =
-            Self::encode_records(&records, self.manifest_bytes, self.sealing.as_ref())?;
+            match Self::encode_records(&records, self.manifest_bytes, self.sealing.as_ref()) {
+                Ok(encoded) => encoded,
+                Err(e) => {
+                    // Nothing was written, so the move is still owed to the
+                    // next batch. Past this point an error drops the writer,
+                    // and only a reopen may decide what the file holds.
+                    records.truncate(moved);
+                    self.unlogged = records;
+                    return Err(e);
+                }
+            };
         let requires_sync = records.iter().any(ManifestRecord::requires_sync);
         // An append or sync error leaves an uncertain tail. Only reopen
         // may decide which complete frames survived; neither a later
@@ -824,8 +873,10 @@ impl VersionSet {
         // Rewriting costs one record per live table and happens only once
         // the log has grown to a multiple of that, so the cost per edit
         // is constant and the file stays within a bounded factor of its
-        // smallest possible size.
-        if self.manifest_bytes > Self::compact_threshold(live_files) {
+        // smallest possible size. The conversion the open left to this
+        // batch (see `open_with_policy`) is the same rewrite.
+        let convert = recorded_move && self.keyring.is_some() && self.sealing.is_none();
+        if convert || self.manifest_bytes > Self::compact_threshold(live_files) {
             self.compact_manifest()?;
         }
 
@@ -885,6 +936,8 @@ impl VersionSet {
         self.manifest_bytes = image.len() as u64;
         self.sealing = sealing;
         self.sealed_under = sealed_under.into_iter().collect();
+        // The image is the current version, a move included.
+        self.unlogged.clear();
 
         let file = self
             .env
@@ -1140,6 +1193,8 @@ impl VersionSet {
             valid_len = offset;
         }
 
+        let repair = legacy_overlap::Repair::prepare(&mut surviving)?;
+
         // Below L0 a level is one sorted run. The log lists a level's tables in
         // the order they arrived, which is how `Version::add_file` placed
         // them, so a stable sort puts each back where it was.
@@ -1168,8 +1223,10 @@ impl VersionSet {
                 version.levels[level].push(LiveSst::new(meta, reader));
             }
         }
-        // The log is untrusted input, and a level that is not one sorted run
-        // cannot be searched, so a manifest that says so is refused.
+        // Every level left below L0 is one sorted run now: the repair above
+        // moved the ones that were not. A read finds a key's tables in such
+        // a level by binary search and in no other, and the log is untrusted
+        // input, so this is checked rather than taken from the repair.
         if let Some((level, left, right)) = version.find_overlap() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -1181,17 +1238,25 @@ impl VersionSet {
         }
 
         Ok(ManifestReplay {
-            version,
             valid_len,
             stamp_len: stamp,
             salt,
             key_ids,
+            demotion: repair.demotion(&version.levels[0]),
+            repair,
+            version,
         })
     }
 }
 
 #[cfg(test)]
 mod atomic_tests;
+#[cfg(test)]
+mod demotion_tests;
+#[cfg(test)]
+mod legacy_overlap_fault_tests;
+#[cfg(test)]
+mod legacy_overlap_tests;
 #[cfg(test)]
 mod level_order_tests;
 

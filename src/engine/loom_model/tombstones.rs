@@ -13,6 +13,7 @@ use loom::sync::Arc;
 use loom::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use super::{explore, explore_bounded, memtable};
+use crate::engine::range_tombstone::RangeTombstone;
 
 /// A reader racing two appends sees a prefix of them: whenever it sees the
 /// second tombstone it sees the first, and every tombstone it lists is
@@ -209,6 +210,46 @@ pub fn one_tombstone_appended_twice_is_listed_once() {
                 "one tombstone was listed twice"
             );
             assert_eq!(mt.covering_range_tombstone_seq(b"b", u64::MAX), 1);
+        },
+    );
+}
+
+/// T1 for a batch: two tombstones appended as one batch
+/// (`MemTable::delete_ranges`, the way recovery brings them) beside a
+/// single append on another thread. Each of the three is handed a position
+/// of its own, so all are listed, whole, and each deletes what it deletes.
+///
+/// Bound: 3 preemptions.
+pub fn a_batch_beside_an_append_loses_neither() {
+    explore_bounded(
+        "a_batch_beside_an_append_loses_neither",
+        Some(3),
+        8,
+        1,
+        |witness| {
+            let mt = Arc::new(memtable());
+            let batch = {
+                let mt = Arc::clone(&mt);
+                loom::thread::spawn(move || {
+                    mt.delete_ranges(vec![
+                        RangeTombstone::new(b"e".to_vec(), b"g".to_vec(), 1),
+                        RangeTombstone::new(b"a".to_vec(), b"c".to_vec(), 1),
+                    ]);
+                })
+            };
+            let single = {
+                let mt = Arc::clone(&mt);
+                loom::thread::spawn(move || mt.delete_range(b"m", b"p", 2))
+            };
+            batch.join().expect("batch");
+            single.join().expect("single");
+            witness.record();
+            let listed = mt.clone_range_tombstones();
+            assert_eq!(listed.len(), 3, "an append was lost: {listed:?}");
+            assert_eq!(mt.covering_range_tombstone_seq(b"b", u64::MAX), 1);
+            assert_eq!(mt.covering_range_tombstone_seq(b"f", u64::MAX), 1);
+            assert_eq!(mt.covering_range_tombstone_seq(b"n", u64::MAX), 2);
+            assert_eq!(mt.covering_range_tombstone_seq(b"d", u64::MAX), 0);
         },
     );
 }

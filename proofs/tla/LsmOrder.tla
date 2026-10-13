@@ -85,11 +85,14 @@
 \*     An external file takes a fresh sequence and is placed at a level
 \*     (`placement`), after the memtables holding a key of its range are
 \*     flushed (`flush_memtables_holding`).
-\*   manifest replay                  src/engine/manifest.rs
-\*     On this branch the open still refuses a deeper level whose tables
-\*     overlap (Version::find_overlap, "manifest lists tables ... with
-\*     overlapping key ranges"). The demotion below (Legacy = "Demote") is
-\*     the plan's answer (E14, D13), modelled here ahead of the code.
+\*   manifest replay, Repair::prepare src/engine/manifest.rs,
+\*                                    src/engine/manifest/legacy_overlap.rs
+\*     Replay finds the deepest level whose tables overlap and moves every
+\*     level from 1 down to it into L0 (E14, D13): the deepest level's
+\*     tables oldest, the L0 files it already held newest, each level's
+\*     tables in the order the manifest lists them. The move reaches the
+\*     manifest as one batch, with the open's first edit
+\*     (VersionSet::apply). That is Open below, with Legacy = "Demote".
 \*   rotate, Ordered::seal            src/engine/commit/turn.rs, ordered.rs
 \*                                    (Freeze here)
 \*     A write whose turn comes with the active memtable full has the
@@ -147,8 +150,12 @@
 \*     there is none. A memtable holding a key in the range is flushed
 \*     first (D48), so the action requires none does.
 \*   Legacy = "Demote": at open, if levels overlap, take the deepest such
-\*     level d and move every table of levels 1..d to the end of L0: level
-\*     by level, each level's tables newest first by sequence.
+\*     level d and move every table of levels 1..d to the end of L0, level
+\*     by level. Within one level the tables may be taken in ANY order: no
+\*     two of them hold the same key (Lean: noShared_level_ordered), so no
+\*     read can tell. The engine takes them in the order the manifest lists
+\*     them, since a table does not record its newest sequence; Open below
+\*     tries every order, the engine's among them.
 \*
 \* DESIGN CHOICE where the plan leaves room (recorded in the report). Plan
 \* 4.3 says the overlapping level's tables move to L0. Moved alone they sit
@@ -163,7 +170,8 @@
 \* range widened by the tombstone. LegacyIngest models that: before Open,
 \* a file of one key is placed by its point key and recorded with a wider
 \* range. Range tombstones themselves are left out: the overlap they cause
-\* in recorded ranges is what breaks the binary search.
+\* in recorded ranges is what breaks the binary search. What the open does
+\* with the tombstones of the tables it moves is LegacyRangeRead.tla.
 \*
 \* WHAT THE MODEL LEAVES OUT, and why that loses nothing.
 \*   - compact_range flushes the memtable before it picks; here a flush may
@@ -298,19 +306,11 @@ Insert(T, t) ==
   \* Those tables, then t, then the others.
   IN SubSeq(T, 1, i) \o <<t>> \o SubSeq(T, i + 1, Len(T))
 
-\* The newest sequence a set of versions holds: its age.
-AgeOf(F) == Max({v[2] : v \in F})
+\* Every way of listing the positions 1..n once each: the orders n tables can be taken in.
+Orders(n) == {p \in [1..n -> 1..n] : \A a, b \in 1..n : a # b => p[a] # p[b]}
 
-\* Tables newest first by their newest sequence.
-RECURSIVE AgeOrder(_)
-\* Sort the tables T, newest first.
-AgeOrder(T) ==
-  \* No table: nothing.
-  IF T = <<>> THEN <<>>
-  \* i: a position whose table is at least as new as every other.
-  ELSE LET i == CHOOSE x \in 1..Len(T) : \A y \in 1..Len(T) : AgeOf(T[y].v) <= AgeOf(T[x].v)
-       \* That table first, then the others sorted the same way.
-       IN <<T[i]>> \o AgeOrder(Keep(T, {i}, 1))
+\* The tables T taken in the order p, as L0 files.
+Listed(T, p) == [i \in 1..Len(T) |-> T[p[i]].v]
 
 \* The version sets of a sequence of tables, as L0 files.
 Files(T) == [i \in 1..Len(T) |-> T[i].v]
@@ -453,15 +453,22 @@ OverlapLevels ==
        \* whose recorded ranges share a key.
        t # u /\ RangesMeet(lv[j][t].lo, lv[j][t].hi, lv[j][u].lo, lv[j][u].hi)}
 
-\* The tables of the levels in D, in level order, each level's tables
-\* newest first: the files they become in L0, in read order.
-RECURSIVE Demoted(_, _)
+\* One order for each level's tables: ord[j] is an order of level j's.
+OrderChoices ==
+  \* Every function from levels to orders
+  {ord \in [1..Levels -> UNION {Orders(Len(lv[j])) : j \in 1..Levels}] :
+     \* that gives each level an order of its own tables.
+     \A j \in 1..Levels : ord[j] \in Orders(Len(lv[j]))}
+
+\* The tables of the levels in D, in level order, each level's tables in
+\* the order ord gives it: the files they become in L0, in read order.
+RECURSIVE Demoted(_, _, _)
 \* Walk the levels from j down:
-Demoted(D, j) ==
+Demoted(D, j, ord) ==
   \* past the last level, nothing;
   IF j > Levels THEN <<>>
-  \* otherwise this level's tables newest first if the level is in D, followed by the deeper levels.
-  ELSE (IF j \in D THEN Files(AgeOrder(lv[j])) ELSE <<>>) \o Demoted(D, j + 1)
+  \* otherwise this level's tables in its order if the level is in D, followed by the deeper levels.
+  ELSE (IF j \in D THEN Listed(lv[j], ord[j]) ELSE <<>>) \o Demoted(D, j + 1, ord)
 
 \* The levels the configured open demotes. The fix: every level from L1
 \* down to the deepest overlapping one. The defect: the overlapping ones.
@@ -708,8 +715,9 @@ Open ==
   /\ ~opened
   \* Now it has.
   /\ opened' = TRUE
-  \* The demoted tables are added at the old end of L0, in read order.
-  /\ l0'     = l0 \o Demoted(DemotedLevels, 1)
+  \* The demoted tables are added at the old end of L0, level after level, each level's tables
+  \* in some order: every order is tried.
+  /\ \E ord \in OrderChoices : l0' = l0 \o Demoted(DemotedLevels, 1, ord)
   \* The demoted levels are empty; the others stay.
   /\ lv'     = [j \in 1..Levels |-> IF j \in DemotedLevels THEN <<>> ELSE lv[j]]
   \* Nothing else changes.

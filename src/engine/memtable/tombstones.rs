@@ -22,7 +22,8 @@
 //!   again and is freed only when the memtable is dropped, so a reader needs
 //!   no reclamation for the log itself.
 //! * **T4, the index is an optimization over a prefix of ready slots.**
-//!   Every [`REBUILD`] appends a writer publishes, through kovan, a sorted
+//!   Every [`REBUILD`] appends, or once after a batch of them
+//!   ([`TombstoneLog::extend`]), a writer publishes, through kovan, a sorted
 //!   view of the first `covered` positions, every one of them ready, with a
 //!   running maximum of their ends. A reader binary-searches that view and
 //!   scans the positions past it, so a point lookup costs `O(log n)` rather
@@ -61,6 +62,27 @@ const SEGMENTS: usize = 30;
 /// scans past the index.
 #[cfg(not(loom))]
 pub(crate) const REBUILD: usize = 16;
+
+#[cfg(all(test, not(loom)))]
+thread_local! {
+    /// Test seam: how many indexes this thread has published.
+    static INDEXES_BUILT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+
+    /// Test seam: how many slots this thread has looked at for a
+    /// duplicate, one at a time ([`TombstoneLog::holds`]).
+    static DUPLICATE_LOOKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Test seam: what this thread's appends have cost since the last call, as
+/// the indexes it published and the slots it looked at for a duplicate. A
+/// test pins the cost of an append by these counts, not by a time.
+#[cfg(all(test, not(loom)))]
+pub(crate) fn work_since_last_call() -> (usize, usize) {
+    (
+        INDEXES_BUILT.with(|built| built.replace(0)),
+        DUPLICATE_LOOKS.with(|looks| looks.replace(0)),
+    )
+}
 
 /// One slot: a tombstone once `ready` is set.
 struct Slot {
@@ -214,6 +236,8 @@ impl TombstoneLog {
     /// the first of those.
     fn holds(&self, tombstone: &RangeTombstone) -> bool {
         for position in (0..self.len()).rev() {
+            #[cfg(all(test, not(loom)))]
+            DUPLICATE_LOOKS.with(|looks| looks.set(looks.get() + 1));
             let Some(held) = self.get(position) else {
                 continue;
             };
@@ -264,6 +288,57 @@ impl TombstoneLog {
         if self.holds(&tombstone) {
             return;
         }
+        self.append(tombstone);
+        #[cfg(not(loom))]
+        self.maybe_rebuild();
+    }
+
+    /// Append every tombstone of `batch` the log does not hold yet, then
+    /// publish one index over them all (T4).
+    ///
+    /// What [`Self::push`] does for each, at a cost linear in the batch
+    /// (one sort of it aside): `push` looks through the log for its
+    /// tombstone and rebuilds the index every [`REBUILD`] appends, so `n`
+    /// pushes of tombstones that share a sequence cost on the order of
+    /// `n * n` slot reads. Here the log is looked at once, before the first
+    /// append, and the index is built once, after the last. For recovery,
+    /// which can bring thousands at a time.
+    ///
+    /// Each append is the one `push` makes (T1, T2), so any number of
+    /// threads may run this beside appends and reads. A tombstone another
+    /// thread appends after the one look can end up listed twice, which is
+    /// harmless (T1), and a rebuild another thread has under way leaves
+    /// this batch to the next one, as it leaves any append. Recovery calls
+    /// it before the memtable is shared, where neither can happen.
+    pub(crate) fn extend(&self, mut batch: Vec<RangeTombstone>) {
+        let same = |a: &RangeTombstone, b: &RangeTombstone| {
+            a.seq == b.seq && a.start == b.start && a.end == b.end
+        };
+        // In listing order: the batch's own duplicates fall side by side,
+        // and the index's sort of these appends finds them sorted.
+        batch.sort_by(listing_order);
+        batch.dedup_by(|a, b| same(a, b));
+        let held = self.len();
+        if held > 0 {
+            let mut existing: Vec<&RangeTombstone> = (0..held)
+                .filter_map(|position| self.get(position))
+                .collect();
+            existing.sort_by(|a, b| listing_order(a, b));
+            batch.retain(|tombstone| {
+                existing
+                    .binary_search_by(|held| listing_order(held, tombstone))
+                    .is_err()
+            });
+        }
+        for tombstone in batch {
+            self.append(tombstone);
+        }
+        #[cfg(not(loom))]
+        self.maybe_rebuild();
+    }
+
+    /// Write `tombstone` into the next position and mark it ready (T1, T2).
+    fn append(&self, tombstone: RangeTombstone) {
         let heap = tombstone.start.len() + tombstone.end.len() + size_of::<RangeTombstone>();
         // T1: the position is this append's alone.
         let position = self.claimed.fetch_add(1, Ordering::AcqRel);
@@ -281,8 +356,6 @@ impl TombstoneLog {
         self.bytes.fetch_add(heap, Ordering::Relaxed);
         // T2: the slot is whole before the flag that says so.
         slot.ready.store(1, Ordering::Release);
-        #[cfg(not(loom))]
-        self.maybe_rebuild();
     }
 
     /// Publish a sorted view of the leading ready positions once [`REBUILD`]
@@ -350,6 +423,8 @@ impl TombstoneLog {
             };
             reach.push(farthest);
         }
+        #[cfg(test)]
+        INDEXES_BUILT.with(|built| built.set(built.get() + 1));
         self.index.store_some(TombstoneIndex {
             covered: published,
             order: order.into_boxed_slice(),

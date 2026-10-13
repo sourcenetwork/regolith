@@ -476,6 +476,27 @@ impl Db {
     /// Returns [`Error::Io`] with [`std::io::ErrorKind::Unsupported`]
     /// when the platform cannot start the background compaction
     /// thread, as a single-threaded target does.
+    ///
+    /// # Databases written by 0.1.x
+    ///
+    /// A database written by a 0.1.x release can hold a level below level 0
+    /// whose tables overlap in key range: that release placed an ingested
+    /// table carrying a range tombstone by the range of its keys and
+    /// recorded it with the wider range of the tombstone. Such a database
+    /// is valid and opens. The first open moves the tables of that level,
+    /// and of every level above it down to level 1, into level 0, oldest
+    /// level first, where tables may overlap. No table is rewritten and
+    /// nothing is lost: every read returns the newest version, and a key
+    /// that a range tombstone of a moved table covers and that is older
+    /// than it reads as deleted, as that tombstone says (0.1.x could still
+    /// return it from a level it read first). The open logs one warning,
+    /// counts the moved tables in [`Ticker::ManifestTablesDemoted`] and in
+    /// the `regolith.manifest.tables_demoted` property, and records the move
+    /// before it returns, so the next open has nothing to move. Compaction
+    /// then brings the tables back down as it does any level 0 table; until
+    /// it has, they count toward the level 0 write thresholds. A read-only
+    /// open makes the same move in its own view, every time, and writes
+    /// nothing.
     pub fn open<P: AsRef<Path>>(path: P, opts: Options) -> Result<Self> {
         opts.validate()?;
         let read_only = opts.read_only;
@@ -514,7 +535,8 @@ impl Db {
     /// The handle replays any existing WAL files into memory so reads
     /// see committed-but-unflushed writes, but it does not create,
     /// rewrite, compact, or delete files. Mutating APIs return
-    /// [`Error::ReadOnly`].
+    /// [`Error::ReadOnly`]. A database a 0.1.x release left with an
+    /// overlapping level reads correctly here too, see [`Db::open`].
     pub fn open_read_only<P: AsRef<Path>>(path: P, mut opts: Options) -> Result<Self> {
         opts.read_only = true;
         Self::open(path, opts)
@@ -1476,12 +1498,18 @@ impl Db {
 
     /// Return the integer value of a named property, or `None` if
     /// `name` isn't recognized or doesn't have an integer form.
+    ///
+    /// `regolith.manifest.tables_demoted` is the number of tables this open
+    /// moved to level 0 out of levels a 0.1.x release left overlapping (see
+    /// [`Db::open`]): zero once a read-write open has recorded the move, and
+    /// the same count at every read-only open until then.
     pub fn get_int_property(&self, name: &str) -> Option<u64> {
         if let Some(level_str) = name.strip_prefix("regolith.num-files-at-level") {
             let level: usize = level_str.parse().ok()?;
             return Some(self.engine.num_files_at_level(level));
         }
         match name {
+            "regolith.manifest.tables_demoted" => Some(self.engine.tables_demoted_at_open()),
             "regolith.total-sst-files-size" => Some(self.engine.total_sst_size()),
             "regolith.cur-size-active-mem-table" => Some(self.engine.active_memtable_size()),
             "regolith.memtable-reserved-bytes" => Some(self.engine.memtables_reserved_size()),

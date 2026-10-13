@@ -4,6 +4,10 @@
 -- E1: the read order returns the newest visible version, and compacting a
 -- closed L0 input set keeps that. Backs `proofs/tla/LsmOrder.tla`.
 import Regolith.LsmOrder
+-- E14: a range delete copied into the first layer a read walks deletes
+-- every older key below it, however the layers are ordered. Backs
+-- `proofs/tla/LegacyRangeRead.tla`.
+import Regolith.RangeDelete
 -- E6: a batch read resolved against one view answers as of one point in
 -- time. Backs `proofs/tla/BatchRead.tla`.
 import Regolith.BatchView

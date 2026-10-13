@@ -189,9 +189,15 @@ pub enum Ticker {
     /// did with the key, so one conflict can count here and there. A
     /// key deleted and then put again counts as a conflict with the put.
     CommitConflictsAfterDelete = 37,
+    /// Tables an open moved to level 0 because an earlier release had left
+    /// their level with overlapping key ranges, which a level below 0
+    /// cannot hold. The data is unchanged, and the open is logged once. A
+    /// read-write open records the move, so the next open counts nothing;
+    /// a read-only open moves them in its own view, every time.
+    ManifestTablesDemoted = 38,
 }
 
-const NUM_TICKERS: usize = 38;
+const NUM_TICKERS: usize = 39;
 
 impl Ticker {
     /// Every defined ticker, in discriminant order. Adding a variant
@@ -235,6 +241,7 @@ impl Ticker {
         Ticker::ManifestTailDiscardedBytes,
         Ticker::BlockCacheAddRefusedHeld,
         Ticker::CommitConflictsAfterDelete,
+        Ticker::ManifestTablesDemoted,
     ];
 
     /// Stable string name for exporting to monitoring systems.
@@ -278,6 +285,7 @@ impl Ticker {
             Ticker::ManifestTailDiscardedBytes => "regolith.manifest.tail_discarded_bytes",
             Ticker::BlockCacheAddRefusedHeld => "regolith.block_cache.add_refused_held",
             Ticker::CommitConflictsAfterDelete => "regolith.commit.conflicts_after_delete",
+            Ticker::ManifestTablesDemoted => "regolith.manifest.tables_demoted",
         }
     }
 }

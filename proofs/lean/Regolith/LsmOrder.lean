@@ -1750,9 +1750,12 @@ answers what reading the one table binary search finds answers
 search; the TLA+ configuration `MC_LsmOrder_Red_NoDemotion` shows the read
 it gets wrong.
 
-The engine on this branch still refuses such a database at open
-(`Version::find_overlap`, src/engine/manifest.rs); the demotion proved
-correct here is the plan's rule (D13), ahead of the code. -/
+The engine demotes while it replays the manifest (`Repair::prepare`,
+src/engine/manifest/legacy_overlap.rs): every level from 1 down to the
+deepest overlapping one goes to the old end of L0, level after level, each
+level's tables in the order the manifest lists them. Range tombstones are
+not part of this file: what the open does with those of the tables it
+moves is `Regolith/RangeDelete.lean`. -/
 
 /-- The flat read order of a tree. -/
 def treeOrder (mems l0 : List Source) (levels : List (List Source)) : List Source :=
@@ -1760,8 +1763,9 @@ def treeOrder (mems l0 : List Source) (levels : List (List Source)) : List Sourc
   mems ++ l0 ++ levels.flatten
 
 /-- The L0 files after the open demotes levels `1..d`: the old L0 files,
-then those levels' tables, level by level, each level in the order given
-(age order: newest first). -/
+then those levels' tables, level by level, each level in the order given.
+The engine takes a level's tables in the order the manifest lists them;
+`noShared_level_ordered` below is why any order of one level will do. -/
 def demoteL0 (d : Nat) (l0 : List Source) (levels : List (List Source)) : List Source :=
   -- The old L0 files, then the tables of the first d levels, level after level.
   l0 ++ (levels.take d).flatten
