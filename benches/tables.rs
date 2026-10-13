@@ -66,14 +66,10 @@ fn open_files(c: &mut Criterion) {
             group.bench_with_input(BenchmarkId::new(id, threads), &threads, |b, &threads| {
                 b.iter_custom(|iters| {
                     let db = Arc::clone(&db);
-                    common::start::on_threads(
-                        threads,
-                        (iters / threads as u64).max(1),
-                        move |t, i| {
-                            let k = (i * 7919 + t as u64 * 104_729) % (TABLES * KEYS_PER_TABLE);
-                            black_box(db.get(&common::key(k)).expect("read"));
-                        },
-                    )
+                    common::start::on_threads(threads, iters, move |t, i| {
+                        let k = (i * 7919 + t as u64 * 104_729) % (TABLES * KEYS_PER_TABLE);
+                        black_box(db.get(&common::key(k)).expect("read"));
+                    })
                 })
             });
         }
@@ -115,17 +111,13 @@ fn mem_env(c: &mut Criterion) {
             |b, &threads| {
                 b.iter_custom(|iters| {
                     let files = Arc::clone(&files);
-                    common::start::on_threads(
-                        threads,
-                        (iters / threads as u64).max(1),
-                        move |t, i| {
-                            let file = &files[(t + i as usize) % FILES];
-                            let at = (i * 4096) % (FILE_BYTES as u64 - 4096);
-                            let mut buf = [0u8; 4096];
-                            file.read_exact_at(at, &mut buf).expect("read");
-                            black_box(&buf);
-                        },
-                    )
+                    common::start::on_threads(threads, iters, move |t, i| {
+                        let file = &files[(t + i as usize) % FILES];
+                        let at = (i * 4096) % (FILE_BYTES as u64 - 4096);
+                        let mut buf = [0u8; 4096];
+                        file.read_exact_at(at, &mut buf).expect("read");
+                        black_box(&buf);
+                    })
                 })
             },
         );
@@ -136,24 +128,19 @@ fn mem_env(c: &mut Criterion) {
             |b, &threads| {
                 b.iter_custom(|iters| {
                     let (env, files) = (env.clone(), Arc::clone(&files));
-                    common::start::on_threads(
-                        threads,
-                        (iters / threads as u64).max(1),
-                        move |t, i| {
-                            if t % 4 == 3 {
-                                let log = PathBuf::from(format!("/bench/log{t}"));
-                                let mut file =
-                                    env.open_write(&log, WriteMode::Append).expect("log");
-                                file.write_all(&i.to_le_bytes()).expect("append");
-                            } else {
-                                let file = &files[(t + i as usize) % FILES];
-                                let mut buf = [0u8; 512];
-                                file.read_exact_at((i * 512) % (FILE_BYTES as u64 - 512), &mut buf)
-                                    .expect("read");
-                                black_box(&buf);
-                            }
-                        },
-                    )
+                    common::start::on_threads(threads, iters, move |t, i| {
+                        if t % 4 == 3 {
+                            let log = PathBuf::from(format!("/bench/log{t}"));
+                            let mut file = env.open_write(&log, WriteMode::Append).expect("log");
+                            file.write_all(&i.to_le_bytes()).expect("append");
+                        } else {
+                            let file = &files[(t + i as usize) % FILES];
+                            let mut buf = [0u8; 512];
+                            file.read_exact_at((i * 512) % (FILE_BYTES as u64 - 512), &mut buf)
+                                .expect("read");
+                            black_box(&buf);
+                        }
+                    })
                 })
             },
         );
@@ -186,14 +173,10 @@ fn column_families(c: &mut Criterion) {
             |b, &threads| {
                 b.iter_custom(|iters| {
                     let (db, families) = (Arc::clone(&db), Arc::clone(&families));
-                    common::start::on_threads(
-                        threads,
-                        (iters / threads as u64).max(1),
-                        move |t, i| {
-                            let family = &families[(t + i as usize) % FAMILIES];
-                            black_box(db.get_cf(family, &common::key(i % 1_000)).expect("read"));
-                        },
-                    )
+                    common::start::on_threads(threads, iters, move |t, i| {
+                        let family = &families[(t + i as usize) % FAMILIES];
+                        black_box(db.get_cf(family, &common::key(i % 1_000)).expect("read"));
+                    })
                 })
             },
         );
@@ -203,15 +186,11 @@ fn column_families(c: &mut Criterion) {
             |b, &threads| {
                 b.iter_custom(|iters| {
                     let (db, families) = (Arc::clone(&db), Arc::clone(&families));
-                    common::start::on_threads(
-                        threads,
-                        (iters / threads as u64).max(1),
-                        move |t, i| {
-                            let family = &families[(t + i as usize) % FAMILIES];
-                            db.put_cf(family, &common::key(i % 1_000), b"value")
-                                .expect("write");
-                        },
-                    )
+                    common::start::on_threads(threads, iters, move |t, i| {
+                        let family = &families[(t + i as usize) % FAMILIES];
+                        db.put_cf(family, &common::key(i % 1_000), b"value")
+                            .expect("write");
+                    })
                 })
             },
         );

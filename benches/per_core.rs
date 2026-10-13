@@ -59,7 +59,7 @@ fn snapshot_begin_end(c: &mut Criterion) {
         for threads in THREADS {
             group.bench_with_input(BenchmarkId::new(name, threads), &threads, |b, &threads| {
                 b.iter_custom(|iters| {
-                    common::start::on_threads(threads, (iters / threads as u64).max(1), |_, _| {
+                    common::start::on_threads(threads, iters, |_, _| {
                         drop(black_box(db.snapshot()));
                     })
                 })
@@ -80,7 +80,7 @@ fn txn_begin_rollback(c: &mut Criterion) {
             &threads,
             |b, &threads| {
                 b.iter_custom(|iters| {
-                    common::start::on_threads(threads, (iters / threads as u64).max(1), |_, _| {
+                    common::start::on_threads(threads, iters, |_, _| {
                         drop(black_box(db.begin(&TxnOptions::default())));
                     })
                 })
@@ -105,7 +105,7 @@ fn get(c: &mut Criterion) {
         for threads in THREADS {
             group.bench_with_input(BenchmarkId::new(name, threads), &threads, |b, &threads| {
                 b.iter_custom(|iters| {
-                    common::start::on_threads(threads, (iters / threads as u64).max(1), |_, _| {
+                    common::start::on_threads(threads, iters, |_, _| {
                         black_box(db.get(b"k").expect("get"));
                     })
                 })

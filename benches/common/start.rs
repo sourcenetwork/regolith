@@ -64,18 +64,31 @@ impl StartLine {
     }
 }
 
-/// Run `op(thread, i)` for `i` in `0..per_thread` on each of `threads`
-/// threads, and return the wall time from a common start until the last
-/// thread is done.
-pub fn on_threads(threads: usize, per_thread: u64, op: impl Fn(usize, u64) + Sync) -> Duration {
+/// How many of `total` calls thread `t` of `threads` runs: `total / threads`,
+/// one more for the first `total % threads` threads, so the shares add up to
+/// exactly `total`. A criterion `iter_custom` divides its time by the
+/// iterations it asked for; every thread running `total / threads` calls, at
+/// least one, would time fewer calls than that (or more, below one call per
+/// thread) and misstate the time per call.
+pub fn share(total: u64, threads: usize, t: usize) -> u64 {
+    let threads = threads as u64;
+    total / threads + u64::from((t as u64) < total % threads)
+}
+
+/// Run `total` calls of `op(thread, i)` spread over `threads` threads, `i`
+/// counting each thread's own calls from 0 (thread `t` runs
+/// [`share`]`(total, threads, t)` of them), and return the wall time from a
+/// common start until the last thread is done.
+pub fn on_threads(threads: usize, total: u64, op: impl Fn(usize, u64) + Sync) -> Duration {
     let line = StartLine::new(threads);
     std::thread::scope(|scope| {
         let workers: Vec<_> = (0..threads)
             .map(|t| {
                 let (op, line) = (&op, &line);
+                let calls = share(total, threads, t);
                 scope.spawn(move || {
                     line.wait();
-                    for i in 0..per_thread {
+                    for i in 0..calls {
                         op(t, i);
                     }
                 })

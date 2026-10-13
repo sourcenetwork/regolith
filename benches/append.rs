@@ -60,7 +60,7 @@ fn commit_rate(shape: Shape, threads: usize, per_thread: u64) -> f64 {
     let log: Arc<dyn LogLayout> = Arc::new(Journal);
     let mut rng = common::Rng::new(0xA11C_0001);
     let value = common::rand_value(&mut rng, VALUE_LEN);
-    let secs = common::start::on_threads(threads, per_thread, |t, i| {
+    let secs = common::start::on_threads(threads, threads as u64 * per_thread, |t, i| {
         let t = t as u64;
         let id = t * per_thread + i;
         let tx = db.begin(&TxnOptions::new());
@@ -103,7 +103,7 @@ fn allocate_latency(calls: usize) -> (f64, f64) {
 /// Allocations per second of `threads` callers on one counter.
 fn allocate_rate(threads: usize, per_thread: u64) -> f64 {
     let (_tmp, db) = common::open("allocate-rate", common::default_opts());
-    let secs = common::start::on_threads(threads, per_thread, |_, _| {
+    let secs = common::start::on_threads(threads, threads as u64 * per_thread, |_, _| {
         db.allocate(b"ids", 4).unwrap();
     })
     .as_secs_f64();
