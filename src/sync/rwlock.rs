@@ -266,14 +266,29 @@ impl<T: ?Sized + fmt::Debug> fmt::Debug for OwnedRwLockWriteGuard<T> {
 /// The upgradable read of a [`RwLock`]: shared access that can become
 /// exclusive without a writer getting in between. Releases on drop, with
 /// the progress [`RwLockReadGuard`]'s release makes.
+///
+/// It moves to another thread only when `T` is `Send` as well as `Sync`:
+/// an upgrade turns it into `&mut T`, so moving it can move the value. A
+/// value that may be shared but not moved, such as a
+/// [`std::sync::MutexGuard`], keeps the guard on its thread:
+///
+/// ```compile_fail,E0277
+/// use regolith::sync::RwLockUpgradableReadGuard;
+/// use std::sync::MutexGuard;
+///
+/// fn moves<T: Send>() {}
+/// moves::<RwLockUpgradableReadGuard<'static, Option<MutexGuard<'static, ()>>>>();
+/// ```
 #[must_use = "dropping the guard releases the lock at once"]
 pub struct RwLockUpgradableReadGuard<'a, T: ?Sized> {
     lock: &'a RwLock<T>,
 }
 
-// SAFETY: like a read guard, it hands out `&T` only.
-unsafe impl<T: ?Sized + Sync> Send for RwLockUpgradableReadGuard<'_, T> {}
-// SAFETY: as above.
+// SAFETY: moving it moves `&T` access and, through `upgrade` and
+// `try_upgrade`, `&mut T` access, as moving the `Upgrade` future does.
+unsafe impl<T: ?Sized + Send + Sync> Send for RwLockUpgradableReadGuard<'_, T> {}
+// SAFETY: `&RwLockUpgradableReadGuard` reaches `&T` only: both upgrades
+// take the guard by value.
 unsafe impl<T: ?Sized + Sync> Sync for RwLockUpgradableReadGuard<'_, T> {}
 
 impl<'a, T: ?Sized> RwLockUpgradableReadGuard<'a, T> {

@@ -190,9 +190,14 @@ mod tests {
         send_sync::<BoundedReceiver<u8>>();
         // An owner moves with its task but is never shared (see `Owner`).
         send::<Owner>();
+        // A value that may be shared but not moved: the upgradable read
+        // can still be shared, and its doc test pins that it cannot move.
+        sync::<RwLockUpgradableReadGuard<'static, Option<std::sync::MutexGuard<'static, ()>>>>();
     }
 
     fn send<T: Send>() {}
+
+    fn sync<T: Sync>() {}
 
     #[test]
     fn async_entry_points_return_send_and_sync_futures() {
