@@ -267,7 +267,9 @@ impl RegolithEngine {
             loop {
                 match pipe.ring.install(index, desc) {
                     Installed::Done => {
-                        desc.mark(INSTALLED);
+                        if !desc.is_blocking() {
+                            desc.mark(INSTALLED);
+                        }
                         return Ok(index);
                     }
                     Installed::Lost => break,
@@ -1001,7 +1003,7 @@ impl RegolithEngine {
     /// until the pipeline discards it, and return what was decided for it.
     pub(super) fn commit_through_pipeline(&self, request: WriteRequest) -> io::Result<Settled> {
         let pipe = self.pipe()?;
-        let desc = spare::descriptor(Work::Request(request));
+        let desc = spare::descriptor(Work::Request(request), true);
         let index = self.enter(pipe, &desc);
         self.drive(pipe, index, &desc);
         let settled = Self::settled(self.statistics(), &desc);

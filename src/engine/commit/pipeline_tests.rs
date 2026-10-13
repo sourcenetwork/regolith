@@ -88,7 +88,7 @@ pub(super) fn install(
     request: WriteRequest,
 ) -> (u64, RingArc<Descriptor>) {
     let pipe = engine.pipe().unwrap();
-    let desc = RingArc::new(Descriptor::new(Work::Request(request)));
+    let desc = RingArc::new(Descriptor::new(Work::Request(request), false));
     let index = engine.enter(pipe, &desc);
     (index, desc)
 }

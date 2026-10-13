@@ -368,7 +368,7 @@ impl RegolithEngine {
             Requested::Queued { request, writes } => (request, writes),
         };
         let pipe = self.pipe()?;
-        let desc = spare::descriptor(Work::Request(request));
+        let desc = spare::descriptor(Work::Request(request), false);
         if !writes {
             // It takes no capacity, so no stall holds it.
             desc.mark(descriptor::ADMITTED);

@@ -120,8 +120,9 @@ mod kept {
 }
 
 /// A descriptor for `work`, in a kept allocation when this thread has one.
-pub(super) fn descriptor(work: Work) -> RingArc<Descriptor> {
-    let desc = Descriptor::new(work);
+/// `blocking`: see [`Descriptor::is_blocking`].
+pub(super) fn descriptor(work: Work, blocking: bool) -> RingArc<Descriptor> {
+    let desc = Descriptor::new(work, blocking);
     #[cfg(not(loom))]
     {
         kept::make(&kept::DESCRIPTOR, desc)

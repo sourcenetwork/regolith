@@ -352,7 +352,7 @@ impl RegolithEngine {
             engine: self.me.clone(),
             index: Arc::clone(&index),
         }));
-        let desc = Descriptor::new(Work::Unit { job, index, needs });
+        let desc = Descriptor::new(Work::Unit { job, index, needs }, false);
         desc.body.put(body);
         RingArc::new(desc)
     }

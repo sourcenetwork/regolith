@@ -72,11 +72,14 @@ impl RegolithEngine {
     pub(crate) fn allocate(&self, key: Vec<u8>, n: u64) -> io::Result<Range<u64>> {
         self.ensure_writable()?;
         let pipe = self.pipe()?;
-        let desc = spare::descriptor(Work::Allocate {
-            key,
-            n,
-            read_queue: None,
-        });
+        let desc = spare::descriptor(
+            Work::Allocate {
+                key,
+                n,
+                read_queue: None,
+            },
+            true,
+        );
         let index = self.enter(pipe, &desc);
         // Every slot up to this one is decided, this one included: the
         // reservation is made then. Its record is left to whoever passes
@@ -118,11 +121,14 @@ impl RegolithEngine {
         let pipe = self.pipe()?;
         // Neither this slot nor one this call helps decide reads the device.
         let _scope = scope::cache_only(queue);
-        let desc = spare::descriptor(Work::Allocate {
-            key,
-            n,
-            read_queue: Some(queue),
-        });
+        let desc = spare::descriptor(
+            Work::Allocate {
+                key,
+                n,
+                read_queue: Some(queue),
+            },
+            false,
+        );
         let in_the_way = match self.try_enter(pipe, &desc, Help::Leave) {
             // The reservation was given up: nothing is taken.
             Err(job) => Some(job),

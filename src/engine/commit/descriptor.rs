@@ -317,7 +317,8 @@ pub(super) const WRITING: u64 = 1 << 4;
 /// A thread is applying the slot's operations. A hint, as [`DECIDING`].
 pub(super) const APPLYING: u64 = 1 << 5;
 /// The descriptor is in the ring: its index is the slot it holds. Set by
-/// its owner, which is the only thread that reads it.
+/// its owner, which is the only thread that reads it, and only on a
+/// descriptor that is not [`Descriptor::is_blocking`].
 pub(super) const INSTALLED: u64 = 1 << 6;
 /// A `commit_nowait` commit has the write-stall admission behind it, or
 /// needs none because it writes nothing: it may take a slot. Set by its
@@ -353,10 +354,13 @@ pub(crate) struct Descriptor {
     /// Who is told, on the landing thread, when the slot lands: a
     /// pessimistic commit's key locks, released then. Closed with [`SHUT`].
     landing: Stack<Arc<dyn Delivery>>,
+    /// See [`Self::is_blocking`].
+    blocking: bool,
 }
 
 impl Descriptor {
-    pub(super) fn new(work: Work) -> Self {
+    /// A descriptor for `work`. `blocking`: see [`Self::is_blocking`].
+    pub(super) fn new(work: Work, blocking: bool) -> Self {
         Self {
             index: AtomicU64::new(0),
             work,
@@ -368,13 +372,25 @@ impl Descriptor {
             failure: Take::empty(),
             body: Take::empty(),
             landing: Stack::new(),
+            blocking,
         }
+    }
+
+    /// Whether the descriptor is a blocking call's: its owner brings the slot
+    /// through itself and returns once it is published, so nothing listens
+    /// for its landing ([`Self::listen`] is never called on it) and the owner
+    /// never asks whether it is installed. Its owner sets no [`INSTALLED`]
+    /// flag, and [`Self::land`] has nobody to tell: two locked instructions a
+    /// commit saves.
+    pub(super) fn is_blocking(&self) -> bool {
+        self.blocking
     }
 
     /// Tell `waiter`, on the landing thread, when the slot lands: when its
     /// commit is visible to readers, or discarded. `false` when it already
     /// landed: the caller tells `waiter` itself.
     pub(super) fn listen(&self, waiter: Arc<dyn Delivery>) -> bool {
+        debug_assert!(!self.blocking, "a blocking call's commit has no listener");
         self.landing.push(waiter, SHUT).is_ok()
     }
 
@@ -390,7 +406,7 @@ impl Descriptor {
     /// Whether the commit was refused before it took a slot
     /// ([`Self::refuse`]).
     pub(super) fn is_refused(&self) -> bool {
-        self.is(FAILED) && !self.is(INSTALLED)
+        !self.blocking && self.is(FAILED) && !self.is(INSTALLED)
     }
 
     /// Tell everyone listening that the slot landed. Every thread that
@@ -400,6 +416,9 @@ impl Descriptor {
     /// tells them. A thread stopped after it took them keeps the ones it
     /// took until it runs again.
     pub(super) fn land(&self) {
+        if self.blocking {
+            return;
+        }
         for waiter in self.landing.take(SHUT) {
             waiter.deliver();
         }
