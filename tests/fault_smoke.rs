@@ -23,6 +23,8 @@
 
 mod common;
 
+#[path = "fault_smoke/cut_ack.rs"]
+mod cut_ack;
 #[path = "fault_smoke/cut_record.rs"]
 mod cut_record;
 #[path = "fault_smoke/open_variadic.rs"]
@@ -333,7 +335,7 @@ fn immediate_durability_survives_a_power_cut() {
 
     let recovered = reopen(&db);
     let report = fault::assert_valid_prefix(&recovered, &out.history);
-    fault::assert_acked_survived(&report, &out.acked);
+    fault::assert_acked_survived(&report, &out.acked());
     assert_eq!(
         report.k,
         out.history.len(),
@@ -556,7 +558,7 @@ fn a_clean_shutdown_loses_nothing() {
         "clean shutdown must keep every write: {}",
         report.summary(),
     );
-    fault::assert_acked_survived(&report, &out.acked);
+    fault::assert_acked_survived(&report, &out.acked());
 }
 
 /// Proves the byte-level mutators do exactly what their names say, on
@@ -667,7 +669,7 @@ fn a_crash_inside_one_write_batch_applies_all_of_it_or_none() {
                     r.k,
                     boundaries,
                 );
-                fault::assert_acked_survived(&r, &out.acked);
+                fault::assert_acked_survived(&r, &out.acked());
             }
             fault::Recovery::RefusedToOpen(e) => {
                 assert_eq!(
