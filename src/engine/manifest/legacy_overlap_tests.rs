@@ -41,6 +41,8 @@ fn table(
         file_size: std::fs::metadata(path).unwrap().len(),
         num_entries: summary.num_entries,
         global_seq: None,
+        // A 0.1.x table: recorded without deletion counts.
+        deletions: None,
     }
 }
 

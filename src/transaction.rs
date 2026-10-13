@@ -420,6 +420,12 @@ impl OptimisticTransactionDb {
     pub fn allocate(&self, key: &[u8], n: u64) -> Result<Range<u64>> {
         self.inner.allocate(key, n)
     }
+
+    /// [`Db::allocate_nowait`] on the underlying database: the reservation
+    /// that never waits, handing back a wait on `queue` instead.
+    pub fn allocate_nowait(&self, queue: QueueId, key: &[u8], n: u64) -> Result<Range<u64>> {
+        self.inner.allocate_nowait(queue, key, n)
+    }
 }
 
 /// Pessimistic-concurrency-control wrapper over a [`Db`].
@@ -531,6 +537,12 @@ impl TransactionDb {
     /// the counter at `key`, outside any transaction and never a conflict.
     pub fn allocate(&self, key: &[u8], n: u64) -> Result<Range<u64>> {
         self.inner.allocate(key, n)
+    }
+
+    /// [`Db::allocate_nowait`] on the underlying database: the reservation
+    /// that never waits, handing back a wait on `queue` instead.
+    pub fn allocate_nowait(&self, queue: QueueId, key: &[u8], n: u64) -> Result<Range<u64>> {
+        self.inner.allocate_nowait(queue, key, n)
     }
 }
 
@@ -1451,7 +1463,9 @@ impl Transaction {
     }
 
     /// Buffer a put. For pessimistic transactions, acquires an
-    /// exclusive lock on the key if not already held.
+    /// exclusive lock on the key if not already held, waiting for a lock
+    /// another transaction holds as [`Transaction::get_for_update`] does: up
+    /// to the lock timeout, then [`TransactionError::Busy`].
     ///
     /// A put of a constant claims nothing: if the key holds exactly these
     /// bytes at commit, the write does not conflict. Read the key with
@@ -1496,7 +1510,9 @@ impl Transaction {
     }
 
     /// Buffer a delete. For pessimistic transactions, acquires an
-    /// exclusive lock on the key if not already held.
+    /// exclusive lock on the key if not already held, waiting for a lock
+    /// another transaction holds as [`Transaction::get_for_update`] does: up
+    /// to the lock timeout, then [`TransactionError::Busy`].
     ///
     /// In an optimistic transaction, a delete of a key it did not read
     /// conflicts with a newer commit to the key unless that commit left the
@@ -1560,7 +1576,11 @@ impl Transaction {
 
     /// Buffer a merge operand. Merges are conflict-checked at the key
     /// level, so two optimistic transactions that run concurrently cannot
-    /// both commit a merge to the same key.
+    /// both commit a merge to the same key. For pessimistic transactions,
+    /// acquires an exclusive lock on the key if not already held, waiting
+    /// for a lock another transaction holds as
+    /// [`Transaction::get_for_update`] does: up to the lock timeout, then
+    /// [`TransactionError::Busy`].
     ///
     /// Refused with [`TransactionError::Engine`] carrying
     /// [`Error::NoMergeOperator`], buffering nothing, when the database has

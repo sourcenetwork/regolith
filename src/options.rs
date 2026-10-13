@@ -290,6 +290,10 @@ pub trait MergeOperator: Send + Sync + 'static {
     /// base value still folds. The default implementation returns
     /// `None`, which leaves such runs as written.
     ///
+    /// A [`crate::DbWithTtl`] never calls it: it keeps a merged key's
+    /// writes apart until a read, so that each expires by its own time,
+    /// and folds them then with [`MergeOperator::full_merge`].
+    ///
     /// # Example
     ///
     /// An append-only list: an operand is one item behind a one-byte length,
@@ -604,9 +608,37 @@ impl PrefixExtractor for FixedLengthPrefix {
 
 /// Compaction strategy used by the background compaction thread.
 ///
-/// Regolith currently ships two styles. More can be added in follow-up
-/// work (universal / size-tiered is the obvious next one) without
-/// breaking callers, since the field is consumed by name.
+/// # Deleted ranges
+///
+/// Under [`Level`](Self::Level) and [`Universal`](Self::Universal) a key
+/// range that was written and then deleted is compacted without a call
+/// from you. Besides the size triggers, a compaction runs when more than
+/// half of the entries it would read are deletions and the entries they
+/// delete, so that it discards more than it copies. It is an ordinary
+/// compaction, counted in
+/// [`Ticker::CompactionDeletionTriggered`](crate::Ticker::CompactionDeletionTriggered).
+/// Size-triggered work goes first, but passes such a compaction over at
+/// most [`sync::MAX_BYPASS`](crate::sync::MAX_BYPASS) times, unless L0 is
+/// within one table of a threshold that slows or stops writes.
+///
+/// Three things limit it:
+///
+/// - A live [`Snapshot`](crate::Snapshot), or an open transaction, older
+///   than the newest deletion in a table defers the compaction of that
+///   table for its deletions until the snapshot is dropped or the
+///   transaction ends: a deletion a snapshot still needs cannot be
+///   discarded. Size-triggered compaction goes on meanwhile.
+/// - A table written by an earlier version of regolith, or restored from a
+///   backup, carries no count of its deletions. Each such table is read
+///   once in the background, a bounded step at a time, and only then
+///   weighed. The property `regolith.num-uncounted-tables`
+///   ([`Db::get_int_property`](crate::Db::get_int_property)) says how many
+///   are left.
+/// - A deleted range that is a small part of the tables it lives in is not
+///   compacted for its deletions, since rewriting those tables would copy
+///   more than it discards. It goes when a size-triggered compaction
+///   reaches it, or when [`Db::compact_range`](crate::Db::compact_range)
+///   is called on it.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum CompactionStyle {
     /// Standard leveled compaction: L0 collects flushes, then files
@@ -630,6 +662,9 @@ pub enum CompactionStyle {
     /// [`Options::level0_stop_writes_trigger`]) cannot be relieved by
     /// compaction under this style. Set them to `0` unless the byte
     /// cap is guaranteed to bite first.
+    ///
+    /// For the same reason a deleted key and its deletion both stay until
+    /// their table is dropped: no compaction runs for deletions here.
     Fifo,
     /// Universal (size-tiered): all files live at L0 and are
     /// merged into progressively larger runs based on size ratios
@@ -660,7 +695,7 @@ pub struct FifoCompactionOptions {
     /// Soft cap on the total bytes held by SSTables. After every
     /// flush, if the sum of file sizes exceeds this number, the
     /// background compaction thread unlinks the oldest SSTables
-    /// (smallest `file_id` first) until the cap is satisfied or
+    /// (oldest first, as L0 lists them) until the cap is satisfied or
     /// only one file remains. Must be greater than zero when FIFO
     /// compaction is selected. Default: 1 GiB.
     pub max_table_files_size: u64,

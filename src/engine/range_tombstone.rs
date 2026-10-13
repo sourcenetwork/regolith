@@ -110,6 +110,26 @@ impl RangeTombstoneSet {
         best
     }
 
+    /// Whether one tombstone of the set covers every key of the closed
+    /// range `[first, last]`. Two tombstones that only cover it between them
+    /// do not count.
+    pub(crate) fn covers_whole(&self, first: &[u8], last: &[u8]) -> bool {
+        let mut idx = self
+            .tombstones
+            .partition_point(|rt| rt.start.as_slice() <= first);
+        while idx > 0 {
+            idx -= 1;
+            // No tombstone at or before `idx` ends past `last`.
+            if self.prefix_max_end[idx].as_slice() <= last {
+                break;
+            }
+            if self.tombstones[idx].end.as_slice() > last {
+                return true;
+            }
+        }
+        false
+    }
+
     pub(crate) fn clipped_overlaps(&self, start: &[u8], end: &[u8]) -> Vec<RangeTombstone> {
         let mut result = Vec::new();
         if start >= end {
@@ -299,6 +319,25 @@ mod tests {
         ]);
         assert_eq!(set.max_covering_seq(b"f", u64::MAX), 0);
         assert_eq!(set.max_covering_seq(b"g", u64::MAX), 3);
+    }
+
+    #[test]
+    fn a_whole_range_is_covered_only_by_one_tombstone_over_all_of_it() {
+        let set = RangeTombstoneSet::from_vec(vec![
+            RangeTombstone::new(b"a".to_vec(), b"c".to_vec(), 1),
+            RangeTombstone::new(b"b".to_vec(), b"k".to_vec(), 2),
+            RangeTombstone::new(b"k".to_vec(), b"p".to_vec(), 3),
+        ]);
+        assert!(set.covers_whole(b"b", b"j"));
+        assert!(set.covers_whole(b"a", b"b"));
+        assert!(set.covers_whole(b"k", b"o"));
+        // The end is exclusive.
+        assert!(!set.covers_whole(b"b", b"k"));
+        // Covered between two tombstones, by neither alone.
+        assert!(!set.covers_whole(b"c", b"m"));
+        assert!(!set.covers_whole(b"0", b"b"));
+        assert!(!set.covers_whole(b"q", b"r"));
+        assert!(!RangeTombstoneSet::default().covers_whole(b"a", b"b"));
     }
 
     #[test]

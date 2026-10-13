@@ -243,6 +243,10 @@ mod tests {
         let db = open(&dir);
         crate::through_stalls(|| db.put(b"k", b"v")).unwrap();
         db.flush().unwrap();
+        // Held below the tombstones, so that the step a later write owes
+        // does not compact the first one away with the key it covers
+        // (`compaction::deletion`).
+        let _below_the_tombstones = db.snapshot();
         crate::through_stalls(|| db.delete_range(b"a", b"m")).unwrap();
         let first = db.latest_sequence();
         {
@@ -287,6 +291,10 @@ mod tests {
     fn a_tombstone_in_an_older_source_does_not_reach_the_visit_of_a_newer_one() {
         let dir = TempDir::new().unwrap();
         let db = open(&dir);
+        // A table holding nothing but a tombstone is compacted away by the
+        // step the next write owes, unless a snapshot below the tombstone
+        // is live (`compaction::deletion`). This one keeps it in L0.
+        let _below_the_tombstone = db.snapshot();
         crate::through_stalls(|| db.delete_range(b"a", b"z")).unwrap();
         let tombstone = db.latest_sequence();
         db.flush().unwrap();
@@ -326,6 +334,7 @@ mod tests {
             file_size: 0,
             num_entries: summary.num_entries,
             global_seq: None,
+            deletions: None,
         };
         LiveSst::new(meta, Arc::new(SsTableReader::open(&path, file_id).unwrap()))
     }

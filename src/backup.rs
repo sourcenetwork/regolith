@@ -309,6 +309,10 @@ impl BackupEngine {
     /// target, so a restore that does not return `Ok` (an error, or a
     /// crash) leaves a directory that is not yet a database. Run the
     /// restore again into it before opening it.
+    ///
+    /// A backup does not carry the tables' deletion counts: the restored
+    /// database counts them again in the background once it is opened (see
+    /// [`CompactionStyle`](crate::CompactionStyle)).
     pub fn restore<P: AsRef<Path>>(
         &self,
         backup_id: BackupId,
@@ -651,6 +655,9 @@ fn encode_engine_manifest(
                     file_size: f.file_size,
                     num_entries: f.num_entries,
                     global_seq: f.global_seq,
+                    // Not in a backup's metadata: counted again after the
+                    // restored database opens (`compaction::census`).
+                    deletions: None,
                 },
             )
         }),

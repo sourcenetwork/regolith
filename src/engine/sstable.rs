@@ -73,9 +73,9 @@ use super::bloom::{BloomFilterBuilder, encode_bloom_block};
 use super::checksum;
 use super::filter_block::{FilterBlock, prefix_header};
 use super::index_block::IndexBlock;
-use super::internal_key::{
-    VALUE_TYPE_DELETION, VALUE_TYPE_MERGE, decode_internal_key, user_key_of,
-};
+#[cfg(test)]
+use super::internal_key::user_key_of;
+use super::internal_key::{VALUE_TYPE_DELETION, VALUE_TYPE_MERGE, decode_internal_key};
 use super::io::Landed;
 use super::io::scope;
 use super::io::unit::{UnitKey, Work};
@@ -87,12 +87,15 @@ use crate::DbSlice;
 use crate::env::{BufferedWriter, Env, ReadFile, WriteMode};
 use crate::options::{CompressionType, PrefixExtractor};
 
+mod block_codec;
+mod deletions;
 mod global_seq;
 mod key_walk;
 mod sealed;
 #[cfg(test)]
 mod size_limit_tests;
 
+pub(crate) use deletions::{BlockCount, DeletionCounter, Deletions};
 pub(crate) use sealed::TableSeal;
 use sealed::{MAGIC_V7, MAGIC_V8, SEALED_FOOTER_SIZE};
 
@@ -397,6 +400,12 @@ pub(crate) struct SsTableMeta {
     /// whose entries carry their own. A compaction rewrites an ingested
     /// table's entries at this sequence, so its outputs have `None`.
     pub(crate) global_seq: Option<u64>,
+    /// The table's deletions and what they hide, counted as it was written.
+    /// `None` for a table whose manifest record carries no counts: one
+    /// written before they existed, restored from a backup, or ingested
+    /// without a read of every entry. The census counts it later
+    /// (`compaction::census`).
+    pub(crate) deletions: Option<Deletions>,
 }
 
 /// A live SSTable: metadata plus an already-opened reader. Held by
@@ -602,6 +611,8 @@ pub(crate) struct SsTableWriteSummary {
     pub(crate) smallest_user_key: Vec<u8>,
     pub(crate) largest_user_key: Vec<u8>,
     pub(crate) num_entries: u64,
+    /// The deletions among the entries written and what they hide.
+    pub(crate) deletions: Deletions,
 }
 
 fn encode_index_block(entries: &[(Vec<u8>, BlockHandle)]) -> Vec<u8> {
@@ -860,6 +871,8 @@ pub(crate) struct SsTableWriter {
     seal: Option<TableSeal>,
     /// A sealed block's frame, reused from one block to the next.
     frame: Vec<u8>,
+    /// The deletions among the entries added so far.
+    deletions: DeletionCounter,
 }
 
 impl SsTableWriter {
@@ -907,7 +920,18 @@ impl SsTableWriter {
             metadata_block_size,
             seal,
             frame: Vec::new(),
+            deletions: DeletionCounter::default(),
         })
+    }
+
+    /// Tell the writer the range tombstones this table will carry, before
+    /// its first entry, so the entries they hide are counted as they are
+    /// added. Whoever writes a table knows them up front: a flush has its
+    /// memtable's, a compaction the ones it carries on. Said or not, the
+    /// tombstones themselves are attached with
+    /// [`Self::add_range_tombstone`].
+    pub(crate) fn hidden_by(&mut self, tombstones: Arc<RangeTombstoneSet>) {
+        self.deletions.hidden_by(tombstones);
     }
 
     /// Start writing an SSTable through the standard environment.
@@ -947,10 +971,12 @@ impl SsTableWriter {
     /// Add an `(internal_key, value)` pair. Internal keys must arrive in
     /// sorted order. For tombstones, pass an empty value.
     pub(crate) fn add(&mut self, internal_key: &[u8], value: &[u8]) -> io::Result<()> {
-        let user_key = user_key_of(internal_key);
+        let (user_key, seq, value_type) = decode_internal_key(internal_key);
+        let first_of_key = user_key != self.last_bloom_user_key.as_slice();
+        self.deletions.see(user_key, seq, value_type, first_of_key);
 
         // Only add each distinct user key to the bloom filter once.
-        if user_key != self.last_bloom_user_key.as_slice() {
+        if first_of_key {
             self.bloom_builder.add_key(user_key);
             self.last_bloom_user_key = user_key.to_vec();
 
@@ -1159,6 +1185,7 @@ impl SsTableWriter {
             smallest_user_key,
             largest_user_key,
             num_entries: self.num_entries,
+            deletions: self.deletions.counted(),
         }))
     }
 
@@ -1170,7 +1197,8 @@ impl SsTableWriter {
 
         let block_offset = self.current_offset;
 
-        let (codec_byte, payload) = match self.compression {
+        let (codec_byte, payload) = match block_codec::block_codec(self.compression, raw_data.len())
+        {
             CompressionType::None => (COMPRESSION_NONE, raw_data.clone()),
             CompressionType::Lz4 => (COMPRESSION_LZ4, lz4_flex::compress_prepend_size(&raw_data)),
             CompressionType::Snappy => {
@@ -1970,6 +1998,18 @@ impl SsTableReader {
     /// RT coverage during scans.
     pub(crate) fn range_tombstones(&self) -> &[RangeTombstone] {
         self.range_tombstones.as_slice()
+    }
+
+    /// Whether one of this table's range tombstones covers every key of
+    /// `[first, last]`.
+    pub(crate) fn range_tombstone_over(&self, first: &[u8], last: &[u8]) -> bool {
+        self.range_tombstones.covers_whole(first, last)
+    }
+
+    /// This table's range tombstones that reach into `[start, end)`, each
+    /// cut to it.
+    pub(crate) fn range_tombstones_within(&self, start: &[u8], end: &[u8]) -> Vec<RangeTombstone> {
+        self.range_tombstones.clipped_overlaps(start, end)
     }
 
     /// Point lookup for `user_key` visible at `snapshot_seq`.

@@ -17,15 +17,20 @@
 //! - Bytes held are bounded by what the commit pipeline has in flight: a
 //!   write is held only while an earlier commit's write has not arrived.
 //!
-//! One lock covers the file and the held writes. No device sync runs under
-//! it except the caller's own [`LogFile::sync_data`].
+//! One lock covers the file and the held writes: the file is appended to
+//! through `&mut`, so one caller at a time has it. It is a
+//! [`crate::sync::Mutex`], which no thread sleeps on in the kernel: free, it
+//! is one compare-and-swap to take, and a caller that finds another thread's
+//! device call in the way parks until that call returns. No device sync
+//! runs under it except the caller's own [`LogFile::sync_data`].
 
 use std::collections::BTreeMap;
 use std::io;
 use std::path::Path;
 
 use super::{Env, LogFile, WriteFile, WriteMode};
-use crate::sync::internal::Mutex;
+use crate::sync::internal::wait_here;
+use crate::sync::{Mutex, MutexGuard};
 
 pub(super) struct SerialLog {
     inner: Mutex<Inner>,
@@ -78,6 +83,14 @@ impl SerialLog {
     }
 }
 
+impl SerialLog {
+    /// The file and the held writes, to this caller alone. Waits on this
+    /// thread for the caller that has them, which is inside one device call.
+    fn inner(&self) -> io::Result<MutexGuard<'_, Inner>> {
+        wait_here(self.inner.lock())
+    }
+}
+
 impl Inner {
     /// Append every held write that now starts at or below the end.
     fn append_held(&mut self) -> io::Result<()> {
@@ -105,7 +118,7 @@ impl LogFile for SerialLog {
         if buf.is_empty() {
             return Ok(());
         }
-        let mut inner = self.inner.lock();
+        let mut inner = self.inner()?;
         let Some(end) = offset.checked_add(buf.len() as u64) else {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -126,7 +139,7 @@ impl LogFile for SerialLog {
     }
 
     fn sync_data(&self) -> io::Result<()> {
-        let mut inner = self.inner.lock();
+        let mut inner = self.inner()?;
         // A held write whose append failed earlier is tried again here: a
         // sync must not vouch for bytes the file never took.
         inner.append_held()?;
@@ -134,7 +147,7 @@ impl LogFile for SerialLog {
     }
 
     fn set_len(&self, len: u64) -> io::Result<()> {
-        let mut inner = self.inner.lock();
+        let mut inner = self.inner()?;
         inner.file.set_len(len)?;
         inner.end = len;
         // Everything held starts above the old end, so above the new one
@@ -208,6 +221,55 @@ mod tests {
         let log = open(&env, WriteMode::Update);
         log.write_all_at(5, b"record").unwrap();
         assert_eq!(env.read(Path::new("/db/log")).unwrap(), b"stamprecord");
+    }
+
+    /// Several threads each writing every record of a log at once, half of
+    /// them front to back and half back to front: the file ends up holding
+    /// every record once, at its offset, as if one thread had written them
+    /// in order. A writer that found the end of the file, let another writer
+    /// in and then appended would write a record a second time.
+    #[test]
+    fn records_written_by_several_threads_at_once_land_in_offset_order() {
+        const THREADS: usize = 4;
+        let rounds = if cfg!(miri) { 2 } else { 40 };
+        for round in 0..rounds {
+            let mut records = Vec::new();
+            let mut at = 0u64;
+            for i in 0..96usize {
+                let len = 1 + (i * 7 + round) % 23;
+                records.push((at, vec![i as u8 + 1; len]));
+                at += len as u64;
+            }
+            let env = env();
+            let log = open(&env, WriteMode::Truncate);
+            let start = std::sync::Barrier::new(THREADS);
+            std::thread::scope(|scope| {
+                for thread in 0..THREADS {
+                    let (log, records, start) = (&log, &records, &start);
+                    scope.spawn(move || {
+                        start.wait();
+                        // Every record, so two threads meet at the record
+                        // the file ends at; back to front for every other
+                        // thread, so writes arrive ahead of gaps too.
+                        let mut order: Vec<usize> = (0..records.len()).collect();
+                        if thread % 2 == 1 {
+                            order.reverse();
+                        }
+                        for i in order {
+                            let (offset, bytes) = &records[i];
+                            log.write_all_at(*offset, bytes).unwrap();
+                        }
+                    });
+                }
+            });
+            log.sync_data().unwrap();
+            let want: Vec<u8> = records.iter().flat_map(|(_, b)| b.clone()).collect();
+            assert_eq!(
+                env.read(Path::new("/db/log")).unwrap(),
+                want,
+                "round {round}"
+            );
+        }
     }
 
     proptest! {

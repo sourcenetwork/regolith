@@ -208,6 +208,56 @@ fn a_write_decided_before_a_rollback_is_not_made_after_it() {
     }
 }
 
+/// A rollback by a call that may wait does not cut the file while a write is
+/// in flight, and goes on once the last one has left: it is woken by that
+/// write, not by looking again.
+#[test]
+fn a_rollback_waits_for_the_writes_in_flight_and_cuts_once_they_left() {
+    for home in homes() {
+        let path = home.dir.join("wal_000001.log");
+        let log = Log::create_in(&home.env, &path, None).unwrap();
+        let (kept, a) = put_record(&log, log.stamp_len(), b"kept", b"1", 1);
+        log.write_record(&kept, &a).unwrap();
+        let (discarded, b) = put_record(&log, kept.end(), b"discarded", b"2", 2);
+        log.write_record(&discarded, &b).unwrap();
+        let whole = home.env.metadata(&path).unwrap().len;
+        assert_eq!(whole, discarded.end());
+
+        let moved_to = log.epoch() + 1;
+        // Two writes of the old epoch stand in the gate.
+        let (first, second) = (log.write_in_flight(), log.write_in_flight());
+        std::thread::scope(|scope| {
+            let (done, rolled_back) = std::sync::mpsc::channel();
+            let log = &log;
+            scope.spawn(move || {
+                let _ = done.send(log.rollback_to(kept.end(), moved_to));
+            });
+            // The rollback has moved the gate on, so it is past the point
+            // where it looks for writes in flight, or about to look.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            while log.epoch() != moved_to {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the rollback never began"
+                );
+                std::thread::yield_now();
+            }
+            drop(first);
+            // One write is still in flight: whatever the rollback's thread
+            // has done by now, it has not cut.
+            assert_eq!(home.env.metadata(&path).unwrap().len, whole);
+            assert!(rolled_back.try_recv().is_err(), "the rollback did not wait");
+            drop(second);
+            let (cause, cut) = rolled_back
+                .recv_timeout(std::time::Duration::from_secs(30))
+                .expect("the last write to leave wakes the rollback");
+            cut.unwrap();
+            assert!(cause.is_none());
+        });
+        assert_eq!(home.env.metadata(&path).unwrap().len, kept.end());
+    }
+}
+
 #[test]
 fn a_failed_sync_does_not_move_the_durable_offset() {
     for home in homes() {

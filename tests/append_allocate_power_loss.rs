@@ -24,8 +24,6 @@
 mod common;
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::OpenOptions;
-use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -84,16 +82,6 @@ fn open(path: &Path, durability: DurabilityMode) -> OptimisticTransactionDb {
     .unwrap()
 }
 
-/// One unbuffered write per acknowledgement, so a kill a microsecond later
-/// cannot lose the record of what the caller was told.
-fn acker(spec: &ChildSpec) -> std::fs::File {
-    OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&spec.ack_path)
-        .unwrap()
-}
-
 /// Run `attempt`, a transaction built and committed. A write stall does not
 /// end its commit, which waits the stall out, so the attempt is made once;
 /// any failure fails the child.
@@ -109,7 +97,7 @@ fn append_child(spec: &ChildSpec) {
     let handles: Vec<_> = (0..THREADS)
         .map(|t| {
             let (db, log) = (Arc::clone(&db), Arc::clone(&log));
-            let mut acks = acker(spec);
+            let mut acks = fault::Acks::open(&spec.ack_path);
             let commits = spec.ops;
             std::thread::spawn(move || {
                 for i in 0..commits {
@@ -123,7 +111,7 @@ fn append_child(spec: &ChildSpec) {
                         .unwrap();
                         tx.commit()
                     });
-                    acks.write_all(format!("{t} {i}\n").as_bytes()).unwrap();
+                    acks.ack([t as u64, i as u64]);
                 }
             })
         })
@@ -138,7 +126,7 @@ fn allocate_child(spec: &ChildSpec) {
     let handles: Vec<_> = (0..THREADS)
         .map(|t| {
             let db = Arc::clone(&db);
-            let mut acks = acker(spec);
+            let mut acks = fault::Acks::open(&spec.ack_path);
             let rounds = spec.ops;
             std::thread::spawn(move || {
                 for round in 0..rounds {
@@ -159,8 +147,7 @@ fn allocate_child(spec: &ChildSpec) {
                         }
                         tx.commit()
                     });
-                    let line: String = range.map(|v| format!("{v}\n")).collect();
-                    acks.write_all(line.as_bytes()).unwrap();
+                    acks.ack_all(range.map(|v| [v]));
                 }
             })
         })
@@ -245,10 +232,8 @@ fn check_recovered_log(out: &ChildOutcome, durability: DurabilityMode) {
 
     // Immediate: an acknowledged commit survives any cut.
     if durability == DurabilityMode::Immediate {
-        let acked = std::fs::read_to_string(&out.spec.ack_path).unwrap_or_default();
-        for line in acked.lines() {
-            let (t, i) = line.split_once(' ').unwrap();
-            let key = (t.parse::<usize>().unwrap(), i.parse::<usize>().unwrap());
+        for [t, i] in out.acks.of() {
+            let key = (t as usize, i as usize);
             assert!(seen.contains(&key), "acknowledged commit {key:?} was lost");
         }
     }
@@ -346,9 +331,7 @@ fn check_recovered_counter(out: &ChildOutcome, durability: DurabilityMode) {
         next.start
     );
     if durability == DurabilityMode::Immediate {
-        let acked = std::fs::read_to_string(&out.spec.ack_path).unwrap_or_default();
-        for line in acked.lines() {
-            let v: u64 = line.parse().unwrap();
+        for [v] in out.acks.of() {
             assert!(values.contains(&v), "acknowledged use of {v} was lost");
         }
     }

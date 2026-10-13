@@ -1,3 +1,45 @@
+//! The MANIFEST: the log of which tables the database holds at each level,
+//! and the version it replays into.
+//!
+//! # Format
+//!
+//! A stamp (`REGOMAN`, a format byte, a checksum; sealed on an encrypted
+//! database), then batches. A batch is one [`VersionSet::apply`]: every
+//! record of it under one length and one checksum, so recovery installs all
+//! of an edit or none of it (`tail.rs` says how the end of the log is
+//! judged). A record is a tag byte and its fields:
+//!
+//! ```text
+//! 1  a table added to a level: level, file id, key range, size, entries
+//! 2  a table removed from a level
+//! 3  the last sequence held in tables
+//! 4  the next file id
+//! 5  the oldest write-ahead log still needed
+//! 6  every table dropped at once
+//! 7  tag 1 for an ingested table, with the sequence its entries read at
+//! 8  the deletion counts of a table this manifest lists: file id, point
+//!    deletions, hidden entries, newest point deletion
+//! ```
+//!
+//! # Tag 8 and older databases
+//!
+//! A table written by this build is recorded as its tag 1 or tag 7 followed
+//! by a tag 8 in the same batch, so a power cut leaves both or neither. A
+//! table recorded without a tag 8 (by a build that predates it, or restored
+//! from a backup) reads back with its counts unknown and is counted in the
+//! background by the census (`compaction::census`), which then appends a tag
+//! 8 on its own. That batch is not synced: it adds knowledge about a table
+//! and changes no read, so a crash that loses it leaves the table unknown
+//! and it is counted again.
+//!
+//! A tag 8 naming a table the manifest no longer lists is ignored: the
+//! table was compacted away, and nothing is left to know about it. A tag 8
+//! whose counts cannot be those of its table is ignored too.
+//!
+//! So a database written by an earlier build opens unchanged. The reverse
+//! does not hold, as for tag 7 before it: a build that predates tag 8
+//! refuses a manifest holding one, naming the unknown tag.
+
 use std::io::{self};
 use std::path::{Path, PathBuf};
 
@@ -11,7 +53,9 @@ use crate::env::{BufferedWriter, Env, WriteMode};
 
 use super::checksum;
 use super::seal::Keyring;
-use super::sstable::{LiveSst, MetadataPolicy, SsTableMeta, SsTableReader, sst_filename};
+use super::sstable::{
+    Deletions, LiveSst, MetadataPolicy, SsTableMeta, SsTableReader, sst_filename,
+};
 use crate::encryption::KeyId;
 
 mod sealed;
@@ -48,6 +92,10 @@ pub(crate) struct Version {
     pub(crate) next_file_id: u64,
     pub(crate) last_seq: u64,
     pub(crate) min_wal_id: u64,
+    /// How many of the tables have no deletion counts yet
+    /// ([`SsTableMeta::deletions`] is `None`): what is left for the census.
+    /// Kept as edits apply, so reading it walks nothing.
+    pub(crate) uncounted: usize,
 }
 
 impl Version {
@@ -57,6 +105,7 @@ impl Version {
             next_file_id: 1,
             last_seq: 0,
             min_wal_id: 0,
+            uncounted: 0,
         }
     }
 
@@ -74,6 +123,7 @@ impl Version {
     /// deeper at its sorted position, after any table with the same smallest
     /// key.
     fn add_file(&mut self, level: usize, file: Arc<LiveSst>) {
+        self.uncounted += usize::from(file.meta.deletions.is_none());
         let files = &mut self.levels[level];
         if level == 0 {
             files.push(file);
@@ -103,6 +153,45 @@ impl Version {
     /// only at a shared boundary key.
     pub(crate) fn levels_are_sorted_runs(&self) -> bool {
         self.find_overlap().is_none()
+    }
+
+    /// Take table `file_id` out of `level`, if it is there.
+    fn remove_file(&mut self, level: usize, file_id: u64) {
+        let Self {
+            levels, uncounted, ..
+        } = self;
+        levels[level].retain(|file| {
+            let stays = file.meta.file_id != file_id;
+            if !stays && file.meta.deletions.is_none() {
+                *uncounted = uncounted.saturating_sub(1);
+            }
+            stays
+        });
+    }
+
+    /// Record `deletions` as the counts of table `file_id` of `level`, in
+    /// place: the table keeps its position, its reader and its file. A table
+    /// that is not there is left alone.
+    fn count_file(&mut self, level: usize, file_id: u64, deletions: Deletions) {
+        let Self {
+            levels, uncounted, ..
+        } = self;
+        let Some(slot) = levels[level]
+            .iter_mut()
+            .find(|file| file.meta.file_id == file_id)
+        else {
+            return;
+        };
+        if slot.meta.deletions.is_none() {
+            *uncounted = uncounted.saturating_sub(1);
+        }
+        *slot = LiveSst::new(
+            SsTableMeta {
+                deletions: Some(deletions),
+                ..slot.meta.clone()
+            },
+            Arc::clone(&slot.reader),
+        );
     }
 }
 
@@ -135,12 +224,28 @@ pub(crate) fn covering<'level>(
 /// filesystem for a runtime edit.
 #[derive(Clone)]
 pub(crate) enum VersionEdit {
-    AddFile { level: usize, file: Arc<LiveSst> },
-    RemoveFile { level: usize, file_id: u64 },
+    AddFile {
+        level: usize,
+        file: Arc<LiveSst>,
+    },
+    RemoveFile {
+        level: usize,
+        file_id: u64,
+    },
+    /// The deletion counts of a table already at `level`, which had none:
+    /// what the census found by reading it. Changes no read.
+    CountFile {
+        level: usize,
+        file_id: u64,
+        deletions: Deletions,
+    },
     SetLastSeq(u64),
     SetNextFileId(u64),
     SetMinWalId(u64),
-    Reset { next_file_id: u64, min_wal_id: u64 },
+    Reset {
+        next_file_id: u64,
+        min_wal_id: u64,
+    },
 }
 
 /// Serialized form of a version edit. All edits in one apply share a
@@ -153,6 +258,10 @@ enum ManifestRecord {
     RemoveFile {
         level: usize,
         file_id: u64,
+    },
+    TableCounts {
+        file_id: u64,
+        deletions: Deletions,
     },
     SetLastSeq(u64),
     SetNextFileId(u64),
@@ -178,23 +287,37 @@ const TAG_RESET: u8 = 6;
 /// record existed never carries it, so it reads unchanged; a build that
 /// predates the record refuses one that does, naming the unknown tag.
 const TAG_ADD_INGESTED_FILE: u8 = 7;
+/// The deletion counts of a table this manifest lists (D14): its file id,
+/// then its point deletions, its hidden entries and its newest point
+/// deletion's sequence. Written after a new table's `AddFile` in the same
+/// batch, and alone by the census for a table recorded without one. The
+/// module docs say what a build that predates it does, and what this build
+/// does with a table that has none.
+const TAG_TABLE_COUNTS: u8 = 8;
 /// [`ManifestRecord::RangeDeletesChecked`], no payload. Every manifest this
 /// build writes carries it; one that does not was written by an earlier
 /// release, whose first open by this build runs the check and records it.
 /// A build that predates the record refuses a manifest holding it, naming
-/// the unknown tag. 8 is left to the record of per-table entry counts.
+/// the unknown tag.
 const TAG_RANGE_DELETES_CHECKED: u8 = 9;
 
 impl VersionEdit {
-    fn to_record(&self) -> ManifestRecord {
-        match self {
-            VersionEdit::AddFile { level, file } => ManifestRecord::AddFile {
-                level: *level,
-                meta: file.meta.clone(),
-            },
+    /// The records this edit is logged as, appended to `records`.
+    fn to_records(&self, records: &mut Vec<ManifestRecord>) {
+        records.push(match self {
+            VersionEdit::AddFile { level, file } => {
+                push_table(records, *level, file.meta.clone());
+                return;
+            }
             VersionEdit::RemoveFile { level, file_id } => ManifestRecord::RemoveFile {
                 level: *level,
                 file_id: *file_id,
+            },
+            VersionEdit::CountFile {
+                file_id, deletions, ..
+            } => ManifestRecord::TableCounts {
+                file_id: *file_id,
+                deletions: *deletions,
             },
             VersionEdit::SetLastSeq(seq) => ManifestRecord::SetLastSeq(*seq),
             VersionEdit::SetNextFileId(id) => ManifestRecord::SetNextFileId(*id),
@@ -206,8 +329,20 @@ impl VersionEdit {
                 next_file_id: *next_file_id,
                 min_wal_id: *min_wal_id,
             },
-        }
+        });
     }
+}
+
+/// The records of one table at `level`: its `AddFile`, then its counts when
+/// it has them. The one place a table becomes records, so an edit and a
+/// whole manifest image write a table the same way.
+fn push_table(records: &mut Vec<ManifestRecord>, level: usize, meta: SsTableMeta) {
+    let counts = meta.deletions.map(|deletions| ManifestRecord::TableCounts {
+        file_id: meta.file_id,
+        deletions,
+    });
+    records.push(ManifestRecord::AddFile { level, meta });
+    records.extend(counts);
 }
 
 impl ManifestRecord {
@@ -222,6 +357,9 @@ impl ManifestRecord {
     /// holding only writes that the log the open rewrote them into also
     /// holds. Each becomes durable with the next synced batch.
     ///
+    /// A table's counts lost on their own change no read either: the table
+    /// reads back with its counts unknown, and the census counts it again.
+    ///
     /// The record that the range deletes were checked does not ask for a
     /// sync on its own either: in a new manifest it rides the first batch,
     /// and a later synced batch, which every table's record is, makes it
@@ -233,6 +371,7 @@ impl ManifestRecord {
             self,
             ManifestRecord::SetNextFileId(_)
                 | ManifestRecord::SetMinWalId(_)
+                | ManifestRecord::TableCounts { .. }
                 | ManifestRecord::RangeDeletesChecked
         )
     }
@@ -260,6 +399,13 @@ impl ManifestRecord {
                 buf.push(TAG_REMOVE_FILE);
                 buf.extend_from_slice(&(*level as u32).to_le_bytes());
                 buf.extend_from_slice(&file_id.to_le_bytes());
+            }
+            ManifestRecord::TableCounts { file_id, deletions } => {
+                buf.push(TAG_TABLE_COUNTS);
+                buf.extend_from_slice(&file_id.to_le_bytes());
+                buf.extend_from_slice(&deletions.points.to_le_bytes());
+                buf.extend_from_slice(&deletions.dead.to_le_bytes());
+                buf.extend_from_slice(&deletions.newest_seq.to_le_bytes());
             }
             ManifestRecord::SetLastSeq(seq) => {
                 buf.push(TAG_LAST_SEQ);
@@ -326,6 +472,7 @@ impl ManifestRecord {
                         file_size,
                         num_entries,
                         global_seq,
+                        deletions: None,
                     },
                 }))
             }
@@ -334,6 +481,15 @@ impl ManifestRecord {
                 validate_level_index(level)?;
                 let file_id = read_u64(data, pos)?;
                 Ok(Some(ManifestRecord::RemoveFile { level, file_id }))
+            }
+            TAG_TABLE_COUNTS => {
+                let file_id = read_u64(data, pos)?;
+                let deletions = Deletions {
+                    points: read_u64(data, pos)?,
+                    dead: read_u64(data, pos)?,
+                    newest_seq: read_u64(data, pos)?,
+                };
+                Ok(Some(ManifestRecord::TableCounts { file_id, deletions }))
             }
             TAG_LAST_SEQ => {
                 let seq = read_u64(data, pos)?;
@@ -466,7 +622,7 @@ fn encode_image(
     }
     for (level, meta) in files {
         validate_level_index(level)?;
-        records.push(ManifestRecord::AddFile { level, meta });
+        push_table(&mut records, level, meta);
     }
     let mut image = VersionSet::stamp_bytes(sealing.map(|s| &s.salt));
     let (batch, sealed_under) = VersionSet::encode_records(&records, image.len() as u64, sealing)?;
@@ -857,7 +1013,9 @@ impl VersionSet {
     pub(crate) fn apply(&mut self, edits: &[VersionEdit]) -> io::Result<()> {
         for edit in edits {
             match edit {
-                VersionEdit::AddFile { level, .. } | VersionEdit::RemoveFile { level, .. } => {
+                VersionEdit::AddFile { level, .. }
+                | VersionEdit::RemoveFile { level, .. }
+                | VersionEdit::CountFile { level, .. } => {
                     validate_level_index(*level)?;
                 }
                 VersionEdit::SetLastSeq(_)
@@ -875,7 +1033,14 @@ impl VersionSet {
                     version.add_file(*level, Arc::clone(file));
                 }
                 VersionEdit::RemoveFile { level, file_id } => {
-                    version.levels[*level].retain(|f| f.meta.file_id != *file_id);
+                    version.remove_file(*level, *file_id);
+                }
+                VersionEdit::CountFile {
+                    level,
+                    file_id,
+                    deletions,
+                } => {
+                    version.count_file(*level, *file_id, *deletions);
                 }
                 VersionEdit::SetLastSeq(seq) => {
                     version.last_seq = raised_last_seq(version.last_seq, *seq);
@@ -891,6 +1056,7 @@ impl VersionSet {
                     min_wal_id,
                 } => {
                     version.levels = (0..MAX_LEVELS).map(|_| Vec::new()).collect();
+                    version.uncounted = 0;
                     version.last_seq = 0;
                     version.next_file_id = *next_file_id;
                     version.min_wal_id = *min_wal_id;
@@ -915,7 +1081,7 @@ impl VersionSet {
         let records_check = records
             .iter()
             .any(|record| matches!(record, ManifestRecord::RangeDeletesChecked));
-        records.extend(edits.iter().map(VersionEdit::to_record));
+        edits.iter().for_each(|edit| edit.to_records(&mut records));
         let (encoded, sealed_under) =
             match Self::encode_records(&records, self.manifest_bytes, self.sealing.as_ref()) {
                 Ok(encoded) => encoded,
@@ -1215,6 +1381,11 @@ impl VersionSet {
         // time would fail on the unlinked files even though a later
         // RemoveFile record cancels them out.
         let mut surviving: Vec<Vec<SsTableMeta>> = vec![Vec::new(); MAX_LEVELS];
+        // The counts each listed table was recorded with, by file id. A
+        // table's own record carries none, so they are joined to the
+        // survivors at the end, in one lookup each.
+        let mut counts: std::collections::HashMap<u64, Deletions> =
+            std::collections::HashMap::new();
         let mut last_seq: u64 = 0;
         let mut next_file_id: u64 = 1;
         let mut min_wal_id: u64 = 0;
@@ -1257,6 +1428,10 @@ impl VersionSet {
                     }
                     ManifestRecord::RemoveFile { level, file_id } => {
                         surviving[level].retain(|m| m.file_id != file_id);
+                        counts.remove(&file_id);
+                    }
+                    ManifestRecord::TableCounts { file_id, deletions } => {
+                        counts.insert(file_id, deletions);
                     }
                     ManifestRecord::SetLastSeq(seq) => {
                         last_seq = raised_last_seq(last_seq, seq);
@@ -1274,6 +1449,7 @@ impl VersionSet {
                         for level in &mut surviving {
                             level.clear();
                         }
+                        counts.clear();
                         last_seq = 0;
                         next_file_id = reset_next_file_id;
                         min_wal_id = reset_min_wal_id;
@@ -1299,7 +1475,14 @@ impl VersionSet {
         version.next_file_id = next_file_id;
         version.min_wal_id = min_wal_id;
         for (level, files) in surviving.into_iter().enumerate() {
-            for meta in files {
+            for mut meta in files {
+                // Counts naming a table no longer listed were dropped with
+                // it, or name nothing: either way they are not looked up.
+                // Counts that cannot be this table's are not believed.
+                meta.deletions = counts
+                    .remove(&meta.file_id)
+                    .filter(|deletions| deletions.fits(meta.num_entries));
+                version.uncounted += usize::from(meta.deletions.is_none());
                 let path = sst_dir.join(sst_filename(meta.file_id));
                 let reader = Arc::new(
                     SsTableReader::open_with(env, &path, meta.file_id, policy, keyring)
@@ -1341,10 +1524,38 @@ impl VersionSet {
     }
 }
 
+/// Test-only: rewrite the manifest of the closed, unencrypted database at
+/// `db_dir` as a build before the deletion counts would have written it:
+/// every batch as it is, without its tag 8 records. The tables then read
+/// back with their counts unknown.
+#[cfg(test)]
+pub(crate) fn forget_counts(db_dir: &Path) {
+    let path = db_dir.join("MANIFEST");
+    let data = std::fs::read(&path).unwrap();
+    let mut out = data[..MANIFEST_STAMP_LEN].to_vec();
+    let mut offset = MANIFEST_STAMP_LEN;
+    while let Some(batch) = tail::batch_at(&data, offset) {
+        let mut records = Vec::new();
+        let mut pos = 0;
+        while let Some(record) = ManifestRecord::decode(batch.records, &mut pos).unwrap() {
+            if !matches!(record, ManifestRecord::TableCounts { .. }) {
+                records.push(record);
+            }
+        }
+        let (encoded, _) = VersionSet::encode_records(&records, out.len() as u64, None).unwrap();
+        out.extend_from_slice(&encoded);
+        offset = batch.end;
+    }
+    assert_eq!(offset, data.len(), "the manifest replays whole");
+    std::fs::write(&path, out).unwrap();
+}
+
 #[cfg(test)]
 mod atomic_tests;
 #[cfg(test)]
 mod buried_delete_tests;
+#[cfg(test)]
+mod counts_tests;
 #[cfg(test)]
 mod demotion_tests;
 #[cfg(test)]
@@ -1399,6 +1610,7 @@ mod tests {
                 file_size,
                 num_entries: summary.num_entries,
                 global_seq: None,
+                deletions: None,
             },
             reader,
         )
@@ -1423,6 +1635,7 @@ mod tests {
             file_size: 128,
             num_entries: 2,
             global_seq: None,
+            deletions: None,
         }
     }
 
@@ -1551,6 +1764,7 @@ mod tests {
                     file_size: 4096,
                     num_entries: 128,
                     global_seq: None,
+                    deletions: None,
                 },
             },
             ManifestRecord::AddFile {
@@ -1562,6 +1776,7 @@ mod tests {
                     file_size: 512,
                     num_entries: 3,
                     global_seq: Some(77),
+                    deletions: None,
                 },
             },
             ManifestRecord::RemoveFile {
