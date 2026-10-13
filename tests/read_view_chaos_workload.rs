@@ -68,6 +68,16 @@ fn env(name: &str, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
+/// Takes its writer out of the live count when the writer ends, by a
+/// return or by a panic.
+struct Leaving(Arc<AtomicU64>);
+
+impl Drop for Leaving {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 /// One workload thread and the counter it bumps after every operation.
 struct Worker {
     role: String,
@@ -249,6 +259,10 @@ fn run_instance(versions: u64, min_rounds: u64) -> Vec<String> {
     for w in 0..WRITERS {
         let (db, live, gate) = (Arc::clone(&db), Arc::clone(&live), Arc::clone(&gate));
         workers.push(worker(format!("writer {w}"), move |beat| {
+            // Counted out however the writer ends: a writer that panicked
+            // and stayed counted would keep every other thread looping, and
+            // the run would hang where it should fail on the join below.
+            let _leaving = Leaving(live);
             gate.wait();
             for v in 1..=versions {
                 for i in 0..KEYS_PER_WRITER {
@@ -256,7 +270,6 @@ fn run_instance(versions: u64, min_rounds: u64) -> Vec<String> {
                     beat.fetch_add(1, Ordering::Relaxed);
                 }
             }
-            live.fetch_sub(1, Ordering::AcqRel);
         }));
     }
 
