@@ -24,11 +24,13 @@
 //!
 //! The uncontended rows run twice: with the lock in the benchmark's stack
 //! frame, as before, and in a `Box`, where a lock behind an `Arc` or in a
-//! heap-allocated structure lives. A locked instruction on a stack line
-//! next to the benchmark's own spills measured about 7 cycles slower than
-//! on a heap line, for both locks, and how much of that std's loop showed
-//! changed with the stack's placement, so the boxed rows are the steadier
-//! comparison.
+//! heap-allocated structure lives. On the Intel host these were measured on,
+//! the same lock-and-unlock loop ran at one of two speeds about 7 cycles
+//! apart, for this crate's locks and for `std::sync::Mutex` alike, depending
+//! on where the code and the lock landed (perf counters put the slower speed
+//! on loops decoded entirely from the micro-op cache, with both locked
+//! instructions microcoded). Two placements of each lock make one lucky or
+//! unlucky layout less likely to decide the comparison.
 //!
 //! The locks barge: a caller takes a free lock even while others wait. A
 //! caller that finds the lock held while nobody is queued spins a little
