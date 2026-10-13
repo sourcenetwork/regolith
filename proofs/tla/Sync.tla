@@ -1899,6 +1899,18 @@ FewPasses == dPasses < 3
 \* Rules out a waiter that waits for ever although the lock keeps being released: because its
 \* losses are never counted, or because it holds the drain role and every pass is followed by a
 \* release that asks for another (defect E32).
+\*
+\* SCOPE: this row checks that the waiter gets the lock, not only that it is woken and retries.
+\* It follows the request (phase[t], the phase of the waiter's node), not the future (pc[t]).
+\* Only two steps move phase[t] off "waiting": a pass grants the node, or the future withdraws
+\* it. In the live configurations no watched future is dropped (Drops = {}), so a withdraw there
+\* comes only after the waiter's own try took the lock. A wake whose retry loses leaves phase[t]
+\* at "waiting": the loss is counted and the future sleeps again. So a waiter that is woken and
+\* loses for ever breaks this row.
+\* A row written on the future instead, (pc[t] = "parked") ~> (pc[t] # "parked"), would promise
+\* much less: a woken future's poll takes pc from "parked" to its retry whether or not the retry
+\* wins, so that row would hold for a waiter that never gets the lock. It checks a wake and a
+\* retry, not acquisition, and must not be cited for this promise.
 EveryWaiterServed == \A t \in Watched : (phase[t] = "waiting") ~> (phase[t] # "waiting")
 
 \* A waiter operation lands on a drain: task t queues, withdraws, or claims its handoff, and
