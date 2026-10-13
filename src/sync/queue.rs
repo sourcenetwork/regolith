@@ -105,6 +105,7 @@ pub(super) const FIRST_BIT: u32 = 6;
 
 /// Whether a release that saw `prev` must run a drain pass: waiters are
 /// queued and no nudge is already on its way, or a handoff is owed.
+#[inline]
 pub(super) fn wants_drain(prev: usize) -> bool {
     prev & QUEUED != 0 && (prev & NUDGE_OUT == 0 || prev & HANDOFF != 0)
 }

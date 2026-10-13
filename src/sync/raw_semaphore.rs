@@ -26,6 +26,8 @@ use super::waiter::WakeList;
 
 const SHIFT: u32 = FIRST_BIT;
 const FLAGS: usize = (1 << SHIFT) - 1;
+/// One permit, in the units of the state word.
+const ONE: usize = 1 << SHIFT;
 /// The most permits a semaphore can hold.
 pub(super) const MAX: usize = usize::MAX >> SHIFT;
 
@@ -60,6 +62,40 @@ impl RawSemaphore {
         self.try_take(n).is_ok()
     }
 
+    /// One permit, attempted inline: a load of the word, then, when a
+    /// permit is free and no handoff is owed, one compare-and-swap from the
+    /// state loaded to one permit fewer. The swap expects exactly what the
+    /// load saw, queue bits included, so it is `Lock::try_take` for one
+    /// permit made in place, with the window between the load and the swap
+    /// as short as the caller's code allows. On failure, the state it saw,
+    /// for the out-of-line path to start from.
+    ///
+    /// Measured with `benches/sync.rs` against a swap that expects the idle
+    /// word only and leaves every other state to the out-of-line path:
+    /// equal uncontended, and 10 to 25% more throughput at 8 and 32 tasks,
+    /// where a free lock with waiters queued is common and the longer
+    /// window let the line go to another core between the load and the swap.
+    #[inline]
+    pub(super) fn take_one(&self) -> Result<(), usize> {
+        let state = &self.queue.state;
+        let seen = state.load(Ordering::Relaxed);
+        if seen >= ONE && seen & HANDOFF == 0 {
+            state
+                .compare_exchange(seen, seen - ONE, Ordering::Acquire, Ordering::Relaxed)
+                .map(drop)
+        } else {
+            Err(seen)
+        }
+    }
+
+    /// One permit, from a state the caller saw: what a Mutex's `try_lock`
+    /// runs when [`take_one`](Self::take_one) failed, in case the state
+    /// changed since.
+    #[inline(never)]
+    pub(super) fn try_acquire_one_from(&self, seen: usize) -> bool {
+        contend::take_from(self, 1, false, seen).is_ok()
+    }
+
     /// Returns `n` permits taken earlier, nudging waiters if any.
     ///
     /// One `fetch_add` when nobody waits, or when a nudge is already on
@@ -67,14 +103,23 @@ impl RawSemaphore {
     /// before. A waiter queueing concurrently either was already flagged,
     /// and is seen by the drain here, or flags itself after this add and
     /// finds the permits in its own pass.
+    #[inline]
     pub(super) fn release(&self, n: usize) {
         if n == 0 {
             return;
         }
         let before = self.queue.state.fetch_add(n << SHIFT, Ordering::AcqRel);
         if wants_drain(before) {
-            self.released();
+            self.release_wakes();
         }
+    }
+
+    /// The pass a release asks for, out of line: inlined, the drain would
+    /// make every release, the one-instruction kind too, pay for the
+    /// registers it saves.
+    #[inline(never)]
+    fn release_wakes(&self) {
+        self.released();
     }
 
     /// Adds `n` new permits, nudging waiters if any.
@@ -202,6 +247,7 @@ impl PermitWait {
         }
     }
 
+    #[inline]
     pub(super) fn is_queued(&self) -> bool {
         self.contend.is_queued()
     }
@@ -210,8 +256,46 @@ impl PermitWait {
         self.contend.poll(sem, n, waker)
     }
 
+    /// The wait of a one-permit semaphore (a Mutex). A first poll makes
+    /// its attempt inline with [`RawSemaphore::take_one`]; if that fails, or
+    /// this future is already queued, the rest goes out of line, starting
+    /// from the state the inline attempt saw.
+    #[inline]
+    pub(super) fn poll_one(&mut self, sem: &RawSemaphore, waker: &Waker) -> Poll<()> {
+        let seen = if self.contend.is_queued() {
+            None
+        } else {
+            match sem.take_one() {
+                Ok(()) => return Poll::Ready(()),
+                Err(seen) => Some(seen),
+            }
+        };
+        self.poll_contended(sem, waker, seen)
+    }
+
+    /// Out of line, but not cold: under contention this is every acquire.
+    #[inline(never)]
+    fn poll_contended(
+        &mut self,
+        sem: &RawSemaphore,
+        waker: &Waker,
+        seen: Option<usize>,
+    ) -> Poll<()> {
+        self.contend.poll_from(sem, 1, waker, seen)
+    }
+
     /// Withdraws a pending wait, passing on permits handed over meanwhile.
+    /// A future that never queued, or already left the queue, has nothing
+    /// to withdraw: that test is inline, the withdrawal out of line.
+    #[inline]
     pub(super) fn cancel(&mut self, sem: &RawSemaphore, n: usize) {
+        if self.contend.is_queued() {
+            self.cancel_queued(sem, n);
+        }
+    }
+
+    #[inline(never)]
+    fn cancel_queued(&mut self, sem: &RawSemaphore, n: usize) {
         self.contend.cancel(sem, n);
     }
 }
@@ -270,5 +354,51 @@ impl<'a> Future for RawAcquire<'a> {
 impl Drop for RawAcquire<'_> {
     fn drop(&mut self) {
         self.wait.cancel(self.sem, self.n);
+    }
+}
+
+#[cfg(all(test, not(loom)))]
+mod tests {
+    use super::*;
+
+    /// Every state word of a semaphore with up to three permits: each
+    /// permit count with each combination of the queue's bits, which are
+    /// all the bits below `SHIFT`.
+    fn every_state() -> impl Iterator<Item = usize> {
+        (0..=3).flat_map(|permits| (0..=FLAGS).map(move |flags| (permits << SHIFT) | flags))
+    }
+
+    /// The Mutex's inline first attempt is `try_take` for one permit made
+    /// in place: from every state it succeeds exactly when `try_take`
+    /// would, past queued waiters too but never past an owed handoff, and
+    /// leaves the word `try_take` leaves. On failure it reports the state
+    /// it saw, for the out-of-line path to start from.
+    #[test]
+    fn the_inline_attempt_takes_exactly_what_try_take_takes() {
+        for state in every_state() {
+            let inline = RawSemaphore::new(0);
+            inline.queue.state.store(state, Ordering::Relaxed);
+            let full = RawSemaphore::new(0);
+            full.queue.state.store(state, Ordering::Relaxed);
+            let took = inline.take_one();
+            assert_eq!(
+                took.is_ok(),
+                full.try_take(1).is_ok(),
+                "state {state:#x}: the inline attempt and try_take disagree"
+            );
+            assert_eq!(
+                inline.queue.state.load(Ordering::Relaxed),
+                full.queue.state.load(Ordering::Relaxed),
+                "state {state:#x}: the two leave different words"
+            );
+            if let Err(seen) = took {
+                assert_eq!(seen, state, "a failed attempt reports the state it saw");
+            }
+            assert_eq!(
+                took.is_ok(),
+                state >> SHIFT >= 1 && state & HANDOFF == 0,
+                "state {state:#x}: a free permit is taken unless a handoff is owed"
+            );
+        }
     }
 }

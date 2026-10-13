@@ -71,13 +71,29 @@ pub(super) trait Lock: Policy {
 /// One compare-and-swap loop taking `need` through [`Lock::admit`]; past
 /// an owed handoff only for the drain that hands it out.
 pub(super) fn take<L: Lock + ?Sized>(lock: &L, need: usize, for_waiter: bool) -> Result<(), usize> {
+    let failure = if for_waiter {
+        Ordering::Acquire
+    } else {
+        Ordering::Relaxed
+    };
+    take_from(lock, need, for_waiter, lock.queue().state.load(failure))
+}
+
+/// [`take`] from a state the caller has just read, saving the load: the
+/// first compare-and-swap expects `current`, and a stale value only fails it
+/// once.
+pub(super) fn take_from<L: Lock + ?Sized>(
+    lock: &L,
+    need: usize,
+    for_waiter: bool,
+    mut current: usize,
+) -> Result<(), usize> {
     let (success, failure) = if for_waiter {
         (Ordering::AcqRel, Ordering::Acquire)
     } else {
         (Ordering::Acquire, Ordering::Relaxed)
     };
     let state = &lock.queue().state;
-    let mut current = state.load(failure);
     loop {
         let next = match lock.admit(current, need) {
             Some(next) if for_waiter || current & HANDOFF == 0 => next,
@@ -104,6 +120,7 @@ impl Contend {
         }
     }
 
+    #[inline]
     pub(super) fn is_queued(&self) -> bool {
         self.wait.is_queued()
     }
@@ -111,13 +128,30 @@ impl Contend {
     /// Ready once `need` is taken, by the caller's own attempt or by a
     /// handoff.
     pub(super) fn poll<L: Lock>(&mut self, lock: &L, need: usize, waker: &Waker) -> Poll<()> {
+        self.poll_from(lock, need, waker, None)
+    }
+
+    /// [`poll`](Self::poll) for a caller that has just read the state word
+    /// itself and found it `seen` (a Mutex's inline attempt): a first poll
+    /// starts its attempt from that state instead of loading it again.
+    pub(super) fn poll_from<L: Lock>(
+        &mut self,
+        lock: &L,
+        need: usize,
+        waker: &Waker,
+        seen: Option<usize>,
+    ) -> Poll<()> {
         let queue = lock.queue();
         let mut park = if self.wait.is_queued() {
             self.wait.park(queue, Some(waker))
         } else {
             // Losing this first attempt is not a bypass: nobody has passed
             // the caller yet, the holder was simply there first.
-            if lock.try_take(need).is_ok() {
+            let first = match seen {
+                Some(seen) => take_from(lock, need, false, seen),
+                None => lock.try_take(need),
+            };
+            if first.is_ok() {
                 return Poll::Ready(());
             }
             lock.enqueue(&mut self.wait, need, waker);

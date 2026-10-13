@@ -683,6 +683,7 @@ impl Wait {
         Self { node: None }
     }
 
+    #[inline]
     pub(super) fn is_queued(&self) -> bool {
         self.node.is_some()
     }
