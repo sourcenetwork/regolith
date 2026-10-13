@@ -1512,6 +1512,11 @@ impl Db {
     /// [`Db::open`]): zero once a read-write open has recorded the move, and
     /// the same count at every read-only open until then.
     ///
+    /// `regolith.disk-available-bytes` and `regolith.disk-available-inodes`
+    /// are what the environment's [`env::Env::disk_space`] reports, and
+    /// `None` where it reports nothing: the default [`env::StdEnv`] reports
+    /// them on Unix, and not on Windows or WASI.
+    ///
     /// `regolith.num-uncounted-tables` is the number of tables whose
     /// deletions have not been counted yet (see [`CompactionStyle`]).
     pub fn get_int_property(&self, name: &str) -> Option<u64> {

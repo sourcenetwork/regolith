@@ -290,6 +290,10 @@ pub trait MergeOperator: Send + Sync + 'static {
     /// base value still folds. The default implementation returns
     /// `None`, which leaves such runs as written.
     ///
+    /// A [`crate::DbWithTtl`] never calls it: it keeps a merged key's
+    /// writes apart until a read, so that each expires by its own time,
+    /// and folds them then with [`MergeOperator::full_merge`].
+    ///
     /// # Example
     ///
     /// An append-only list: an operand is one item behind a one-byte length,

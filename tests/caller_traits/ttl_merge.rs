@@ -1,7 +1,7 @@
 //! A caller's `MergeOperator` on a TTL database: it is shown the values and
 //! operands the caller wrote, never the time the database keeps behind
-//! them; a merge renews the value, and what it folds expires with the
-//! newest write it folded.
+//! them, and only the writes that have not expired: each write expires by
+//! its own time.
 
 use std::sync::{Arc, Mutex};
 
@@ -15,7 +15,6 @@ type Fold = (Option<Vec<u8>>, Vec<Vec<u8>>);
 struct Concat {
     full: Mutex<Vec<Fold>>,
     partial: Mutex<Vec<(Vec<u8>, Vec<u8>)>>,
-    touched: Mutex<Vec<Vec<u8>>>,
 }
 
 impl MergeOperator for Concat {
@@ -37,11 +36,6 @@ impl MergeOperator for Concat {
             .unwrap()
             .push((left.to_vec(), right.to_vec()));
         Some([left, right].concat())
-    }
-
-    fn touches(&self, _key: &[u8], operand: &[u8], _parts: &[u32]) -> bool {
-        self.touched.lock().unwrap().push(operand.to_vec());
-        true
     }
 
     fn name(&self) -> &'static str {
@@ -75,15 +69,14 @@ fn a_ttl_database_shows_the_merge_operator_what_the_caller_wrote() {
     );
 
     // Two operands with no base, in two tables a compaction merges. The
-    // operator folds them with no base; it is not asked to fold the two
-    // ahead of a base, since whether the older one started the value over
-    // depends on the base.
+    // database keeps them apart, each with its time, and the operator folds
+    // them when the key is read: it is never asked to fold two operands
+    // ahead of a read, since they may expire at different times.
     merge(&db, b"m", b"x");
     db.inner().flush().unwrap();
     merge(&db, b"m", b"y");
     db.compact_range(None, None).wait().unwrap();
     assert_eq!(db.get(b"m").unwrap(), Some(b"xy".to_vec()));
-    // Operands are not folded ahead of their base while values expire.
     assert!(operator.partial.lock().unwrap().is_empty());
     for (base, operands) in operator.full.lock().unwrap().iter() {
         for value in base.iter().chain(operands) {
@@ -94,18 +87,22 @@ fn a_ttl_database_shows_the_merge_operator_what_the_caller_wrote() {
         }
     }
 
-    // A merge is a write: the folded value lives an hour from the newest
-    // write it holds, and expires after that.
+    // Each write expires by its own time: an hour and a quarter on, the put
+    // and the first merge have expired and the second merge has not.
     env.advance_micros(HOUR / 2);
     merge(&db, b"k", b"+two");
     env.advance_micros(HOUR * 3 / 4);
-    assert_eq!(db.get(b"k").unwrap(), Some(b"base+one+two".to_vec()));
+    assert_eq!(db.get(b"k").unwrap(), Some(b"+two".to_vec()));
+    assert_eq!(
+        operator.full.lock().unwrap().last().unwrap(),
+        &(None, vec![b"+two".to_vec()])
+    );
     env.advance_micros(HOUR / 2);
     assert_eq!(db.get(b"k").unwrap(), None);
 }
 
-/// A base that expired is not folded into a merge written after it: the
-/// merge starts the value over, as a put after the expiry would.
+/// A merge does not renew what was written before it: a base that expired
+/// is not folded into a merge, written before or after the expiry.
 #[test]
 fn an_expired_base_is_left_out_of_a_merge() {
     let env = Arc::new(MemEnv::new());
