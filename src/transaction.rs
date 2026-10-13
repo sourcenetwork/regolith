@@ -650,7 +650,9 @@ pub enum ScanDirection {
 /// unless a flush or an ingest landed since the first pass. The commits and
 /// plain writes behind it in the pipeline, [`crate::Db::put`] included, are
 /// decided only after that second pass, so a large scan delays every writer
-/// by one lookup per scanned key. Below this level a scan records one entry
+/// by one lookup per scanned key. A transaction that writes nothing does not
+/// enter the pipeline: its commit checks every entry once, on the committing
+/// thread, and holds up no writer. Below this level a scan records one entry
 /// per stretch of keys it walked, not one per key.
 ///
 /// # A write-free reader needs writers that validate their reads
@@ -669,82 +671,95 @@ pub enum ScanDirection {
 /// result must be one a serial order could have produced.
 ///
 /// A reader at `RepeatableRead` or `Serializable` checks every read at its
-/// commit, so one that commits after the writer whose input it missed is
-/// refused: the report below, made at `Serializable` and committed after the
-/// withdrawal, conflicts on `x`. One that commits first cannot be refused,
-/// since the write it missed is not there yet; only the writers' level
-/// prevents that.
+/// commit, against every commit decided by then, published or not, so one
+/// that commits after the writer whose input it missed is refused: the
+/// report below, made at `Serializable` and committed after the withdrawal,
+/// conflicts on `checking`. One that commits first cannot be refused, since
+/// the write it missed is not there yet; only the writers' level prevents
+/// that.
 ///
-/// Two balances, and a rule that a withdrawal which leaves their total
-/// below zero costs one more:
+/// The example, the same one the TLA+ model (`RepeatableRead.tla`), the Lean
+/// proof (`read_only_anomaly`) and the tests use. A checking account holds
+/// 30 and a savings account 0. A withdrawal reads both and takes 25 from
+/// checking, plus a fee of 1 when the total it saw is under 35. A deposit
+/// puts 20 into savings. The withdrawal reads first (30 and 0, so it will
+/// charge the fee), the deposit commits, a report reads (30, 20), and the
+/// withdrawal commits checking = 4. The fee says the withdrawal ran before
+/// the deposit; the report says the deposit ran first and the withdrawal
+/// not yet. No order of the three gives both.
 ///
 /// ```
 /// use regolith::{
 ///     IsolationLevel, OptimisticTransactionDb, Options, TransactionError, TxnOptions,
 /// };
 ///
-/// fn balance(bytes: Option<Vec<u8>>) -> i64 {
-///     bytes.map_or(0, |bytes| i64::from_be_bytes(bytes.try_into().expect("eight bytes")))
+/// fn balance(bytes: Option<Vec<u8>>) -> u64 {
+///     bytes.map_or(0, |bytes| u64::from_be_bytes(bytes.try_into().expect("eight bytes")))
 /// }
 ///
-/// // What a report that writes nothing saw, and the `x` the database ends
-/// // with, when the two writers run at `writers`.
-/// let run = |writers: IsolationLevel| -> Result<((i64, i64), i64), Box<dyn std::error::Error>> {
-///     let db = OptimisticTransactionDb::open("balances", Options::memory())?;
+/// // What a report that writes nothing saw, and the checking balance the
+/// // database ends with, when the two writers run at `writers`.
+/// let run = |writers: IsolationLevel| -> Result<((u64, u64), u64), Box<dyn std::error::Error>> {
+///     let db = OptimisticTransactionDb::open("bank", Options::memory())?;
+///     db.db().put(b"checking", &30u64.to_be_bytes())?;
 ///     let writer = TxnOptions::new().isolation(writers);
 ///
-///     // The withdrawal reads both balances: a total of 0.
+///     // The withdrawal reads both balances: a total of 30.
 ///     let withdrawal = db.begin(&writer);
-///     let (x, y) = (balance(withdrawal.get(b"x")?), balance(withdrawal.get(b"y")?));
+///     let checking = balance(withdrawal.get(b"checking")?);
+///     let savings = balance(withdrawal.get(b"savings")?);
 ///
-///     // A deposit of 20 into `y` commits.
+///     // A deposit of 20 into savings commits.
 ///     let deposit = db.begin(&writer);
-///     let before = balance(deposit.get(b"y")?);
-///     deposit.put(b"y", &(before + 20).to_be_bytes())?;
+///     let before = balance(deposit.get(b"savings")?);
+///     deposit.put(b"savings", &(before + 20).to_be_bytes())?;
 ///     deposit.commit()?;
 ///
 ///     // The report reads both balances and writes nothing.
 ///     let report = db.begin(&TxnOptions::new().isolation(IsolationLevel::DefraLevel));
-///     let seen = (balance(report.get(b"x")?), balance(report.get(b"y")?));
+///     let seen = (balance(report.get(b"checking")?), balance(report.get(b"savings")?));
 ///     report.commit()?;
 ///
-///     // The withdrawal takes 10 from `x`, and 1 more for the total it read.
-///     let penalty = i64::from(x + y - 10 < 0);
-///     withdrawal.put(b"x", &(x - 10 - penalty).to_be_bytes())?;
+///     // The withdrawal takes 25, and a fee of 1 for the total under 35 it read.
+///     let fee = u64::from(checking + savings < 35);
+///     withdrawal.put(b"checking", &(checking - 25 - fee).to_be_bytes())?;
 ///     // It may lose its commit; either way, look at what is left.
 ///     let _ = withdrawal.commit();
-///     Ok((seen, balance(db.db().get(b"x")?)))
+///     Ok((seen, balance(db.db().get(b"checking")?)))
 /// };
 ///
 /// // Snapshot isolation lets the withdrawal commit on the total it read.
 /// // The report saw the deposit and no withdrawal, so the withdrawal comes
-/// // after both, yet it was charged as if no deposit had been made: no
-/// // order of the three produces what the report read.
-/// assert_eq!(run(IsolationLevel::SnapshotIsolation)?, ((0, 20), -11));
+/// // after both, yet it was charged the fee as if no deposit had been made:
+/// // no order of the three produces what the report read.
+/// assert_eq!(run(IsolationLevel::SnapshotIsolation)?, ((30, 20), 4));
 ///
-/// // A writer that validates its reads loses instead, because the `y` it
+/// // A writer that validates its reads loses instead, because the savings it
 /// // read changed. The report read the state after the deposit alone.
-/// assert_eq!(run(IsolationLevel::RepeatableRead)?, ((0, 20), 0));
+/// assert_eq!(run(IsolationLevel::RepeatableRead)?, ((30, 20), 30));
 ///
 /// // A report at `Serializable` that commits after the withdrawal checks
-/// // what it read there, finds the withdrawal's `x`, and is refused.
-/// let db = OptimisticTransactionDb::open("balances", Options::memory())?;
+/// // what it read, finds the withdrawal's checking, and is refused.
+/// let db = OptimisticTransactionDb::open("bank", Options::memory())?;
+/// db.db().put(b"checking", &30u64.to_be_bytes())?;
 /// let writer = TxnOptions::new().isolation(IsolationLevel::SnapshotIsolation);
 /// let withdrawal = db.begin(&writer);
-/// let (x, y) = (balance(withdrawal.get(b"x")?), balance(withdrawal.get(b"y")?));
+/// let checking = balance(withdrawal.get(b"checking")?);
+/// let savings = balance(withdrawal.get(b"savings")?);
 /// let deposit = db.begin(&writer);
-/// let before = balance(deposit.get(b"y")?);
-/// deposit.put(b"y", &(before + 20).to_be_bytes())?;
+/// let before = balance(deposit.get(b"savings")?);
+/// deposit.put(b"savings", &(before + 20).to_be_bytes())?;
 /// deposit.commit()?;
 /// let report = db.begin(&TxnOptions::new().isolation(IsolationLevel::Serializable));
-/// assert_eq!((balance(report.get(b"x")?), balance(report.get(b"y")?)), (0, 20));
-/// let penalty = i64::from(x + y - 10 < 0);
-/// withdrawal.put(b"x", &(x - 10 - penalty).to_be_bytes())?;
+/// let seen = (balance(report.get(b"checking")?), balance(report.get(b"savings")?));
+/// assert_eq!(seen, (30, 20));
+/// let fee = u64::from(checking + savings < 35);
+/// withdrawal.put(b"checking", &(checking - 25 - fee).to_be_bytes())?;
 /// withdrawal.commit()?;
 /// let Err(TransactionError::Conflict(lost)) = report.commit() else {
-///     panic!("the report read an `x` the withdrawal replaced");
+///     panic!("the report read a checking balance the withdrawal replaced");
 /// };
-/// assert_eq!(lost.key(), b"x");
+/// assert_eq!(lost.key(), b"checking");
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -814,8 +829,10 @@ pub enum IsolationLevel {
     /// - Write-free transactions. A transaction that writes nothing
     ///   validates no plain read: it read one snapshot, and nothing it did
     ///   can have moved. It checks only the reads it made through
-    ///   [`Transaction::get_for_update`], against the newest published
-    ///   state, and, like a commit that writes nothing at any level, takes
+    ///   [`Transaction::get_for_update`], each by value, against what is
+    ///   published and what is decided and not yet published (see
+    ///   [`Transaction::commit`]), and, like a commit that writes nothing at
+    ///   any level, takes
     ///   no part in the commit pipeline, so its commit waits for no writer.
     ///   What it read lies on a serial order of the commits only while every
     ///   writer on the database validates its own reads: a writer at
@@ -1852,9 +1869,12 @@ impl Transaction {
     /// A commit with no put, delete, merge or append writes nothing, at any
     /// level and in either flavour: it takes no part in the write pipeline,
     /// no capacity and no sequence, and no stall or other commit holds it up.
-    /// On the calling thread it checks what its level checks against
-    /// everything committed and visible at that moment, and is placed there:
-    /// every commit visible by then comes before it. At
+    /// On the calling thread it checks what its level checks at two points:
+    /// everything visible at that moment, where it is placed (every commit
+    /// visible by then comes before it), and everything decided by then and
+    /// not yet visible, so it is refused whenever a commit through the
+    /// pipeline, decided after those, would be. A read checked by value
+    /// passes a rewrite of the bytes it read. At
     /// [`IsolationLevel::ReadCommitted`] that is nothing; at
     /// [`IsolationLevel::SnapshotIsolation`] only the reads made through
     /// [`Transaction::get_for_update`]; at [`IsolationLevel::RepeatableRead`]
@@ -1888,7 +1908,9 @@ impl Transaction {
     /// locks, and then returned as [`TransactionError::Conflict`].
     ///
     /// The [`CommitReceipt`] carries the sequence the writes became visible
-    /// at. A commit with no writes returns the sequence of its snapshot.
+    /// at. A commit with no writes returns the sequence of its snapshot,
+    /// even for a pessimistic transaction whose `get_for_update` reads were
+    /// served later than that.
     ///
     /// The commit begins with [`Transaction::prepare`]: the transaction's
     /// `before_commit` callbacks, then the database's

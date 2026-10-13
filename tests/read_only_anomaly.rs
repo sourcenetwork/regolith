@@ -1,25 +1,27 @@
 //! The read-only anomaly of Fekete, O'Neil and O'Neil (2004) against the
 //! real engine, with a report that writes nothing at every isolation level.
 //!
-//! Two balances `x` and `y` start at 0. A withdrawal reads both and takes 10
-//! from `x`, and one more when their total would go below zero. A deposit
-//! adds 20 to `y`. Both run at `SnapshotIsolation`. The withdrawal reads
-//! first; the deposit commits; a report then reads both balances (it sees
-//! the deposit and not the withdrawal); the withdrawal commits, charged the
-//! penalty on the total it read. No order of the three gives what the
-//! report saw: the penalty puts the withdrawal before the deposit, and the
-//! report puts the deposit before the withdrawal.
+//! The worked example, the same as in `IsolationLevel`'s docs, the TLA+
+//! model (`RepeatableRead.tla`) and the Lean proof (`read_only_anomaly`). A
+//! checking account holds 30 and a savings account 0. A withdrawal reads
+//! both and takes 25 from checking, plus a fee of 1 when the total it saw is
+//! under 35. A deposit puts 20 into savings. Both run at
+//! `SnapshotIsolation`. The withdrawal reads first (30 and 0: it will charge
+//! the fee); the deposit commits; a report then reads (30, 20); the
+//! withdrawal commits checking = 30 - 25 - 1 = 4. No order of the three gives
+//! what the report saw: the fee puts the withdrawal before the deposit, and
+//! the report puts the deposit before the withdrawal.
 //!
 //! A report at `RepeatableRead` or `Serializable` checks its reads at its
-//! commit, so one that commits after the withdrawal finds `x` changed and is
-//! refused: it never returns the impossible balance sheet. Its commit takes
+//! commit, so one that commits after the withdrawal finds checking changed
+//! and is refused: it never returns the impossible sheet. Its commit takes
 //! no part in the commit pipeline (E50), and the check there is what keeps
-//! it. A report at `ReadCommitted` or `SnapshotIsolation`, and an optimistic
-//! one at `DefraLevel`, checks nothing, commits, and saw one snapshot: what
-//! those levels promise, and why the type's docs tell callers to give the
-//! writers a validating level. With the writers at `RepeatableRead` the
-//! withdrawal is refused and every report is consistent, whenever it
-//! commits.
+//! it. A pessimistic report at `DefraLevel` checks its reads too. A report
+//! at `ReadCommitted` or `SnapshotIsolation`, and an optimistic one at
+//! `DefraLevel`, checks nothing, commits, and saw one snapshot: what those
+//! levels promise, and why the type's docs tell callers to give the writers
+//! a validating level. With the writers at `RepeatableRead` the withdrawal
+//! is refused and every report is consistent, whenever it commits.
 
 use regolith::{
     Access, IsolationLevel, OptimisticTransactionDb, Options, Transaction, TransactionDb,
@@ -34,9 +36,12 @@ const LEVELS: [IsolationLevel; 5] = [
     IsolationLevel::DefraLevel,
 ];
 
-fn balance(bytes: Option<Vec<u8>>) -> i64 {
+const CHECKING: &[u8] = b"checking";
+const SAVINGS: &[u8] = b"savings";
+
+fn balance(bytes: Option<Vec<u8>>) -> u64 {
     bytes.map_or(0, |bytes| {
-        i64::from_be_bytes(bytes.try_into().expect("eight bytes"))
+        u64::from_be_bytes(bytes.try_into().expect("eight bytes"))
     })
 }
 
@@ -63,18 +68,25 @@ impl AnyDb {
         }
     }
 
-    fn get(&self, key: &[u8]) -> i64 {
+    fn get(&self, key: &[u8]) -> u64 {
         balance(match self {
             Self::Optimistic(db) => db.db().get(key).unwrap(),
             Self::Pessimistic(db) => db.db().get(key).unwrap(),
         })
+    }
+
+    fn put(&self, key: &[u8], value: u64) {
+        match self {
+            Self::Optimistic(db) => db.db().put(key, &value.to_be_bytes()).unwrap(),
+            Self::Pessimistic(db) => db.db().put(key, &value.to_be_bytes()).unwrap(),
+        }
     }
 }
 
 /// What one run left: what the report read and how its commit ended, and
 /// whether the withdrawal committed.
 struct Outcome {
-    seen: (i64, i64),
+    seen: (u64, u64),
     report: Result<(), TransactionError>,
     withdrawn: bool,
 }
@@ -89,27 +101,29 @@ fn run(
     report_last: bool,
 ) -> Outcome {
     let db = AnyDb::open(optimistic);
+    db.put(CHECKING, 30);
     let withdrawal = db.begin(writers);
-    let (x, y) = (
-        balance(withdrawal.get(b"x").unwrap()),
-        balance(withdrawal.get(b"y").unwrap()),
+    let (checking, savings) = (
+        balance(withdrawal.get(CHECKING).unwrap()),
+        balance(withdrawal.get(SAVINGS).unwrap()),
     );
+    assert_eq!((checking, savings), (30, 0));
 
     let deposit = db.begin(writers);
-    let before = balance(deposit.get(b"y").unwrap());
-    deposit.put(b"y", &(before + 20).to_be_bytes()).unwrap();
+    let before = balance(deposit.get(SAVINGS).unwrap());
+    deposit.put(SAVINGS, &(before + 20).to_be_bytes()).unwrap();
     deposit.commit().unwrap();
 
     let report = db.begin(reader);
     let seen = (
-        balance(report.get(b"x").unwrap()),
-        balance(report.get(b"y").unwrap()),
+        balance(report.get(CHECKING).unwrap()),
+        balance(report.get(SAVINGS).unwrap()),
     );
 
     let withdraw = |withdrawal: Transaction| {
-        let penalty = i64::from(x + y - 10 < 0);
+        let fee = u64::from(checking + savings < 35);
         withdrawal
-            .put(b"x", &(x - 10 - penalty).to_be_bytes())
+            .put(CHECKING, &(checking - 25 - fee).to_be_bytes())
             .unwrap();
         withdrawal.commit().is_ok()
     };
@@ -121,9 +135,9 @@ fn run(
         (report, withdraw(withdrawal))
     };
     assert_eq!(
-        db.get(b"x"),
-        if withdrawn { -11 } else { 0 },
-        "the withdrawal's commit decides x"
+        db.get(CHECKING),
+        if withdrawn { 4 } else { 30 },
+        "the withdrawal's commit decides checking"
     );
     Outcome {
         seen,
@@ -143,8 +157,8 @@ fn checks_reads(level: IsolationLevel, optimistic: bool) -> bool {
 }
 
 /// Snapshot writers, a report committed after both: where the report checks
-/// its reads it is refused on `x`, which the withdrawal replaced after the
-/// report read it, so the impossible sheet (0, 20) is never committed. Where
+/// its reads it is refused on checking, which the withdrawal replaced after
+/// the report read it, so the impossible sheet (30, 20) is never committed. Where
 /// it checks nothing it commits the one snapshot it read.
 #[test]
 fn a_report_that_commits_after_the_withdrawal_is_refused_where_it_checks_its_reads() {
@@ -158,14 +172,14 @@ fn a_report_that_commits_after_the_withdrawal_is_refused_where_it_checks_its_rea
             );
             assert_eq!(
                 out.seen,
-                (0, 20),
+                (30, 20),
                 "{case}: the report saw the deposit alone"
             );
             if checks_reads(reader, optimistic) {
                 let Err(TransactionError::Conflict(lost)) = out.report else {
                     panic!("{case}: the report committed a sheet no order produces");
                 };
-                assert_eq!(lost.key(), b"x", "{case}");
+                assert_eq!(lost.key(), CHECKING, "{case}");
                 assert_eq!(lost.mine(), Access::Read, "{case}");
             } else {
                 assert!(
@@ -187,7 +201,7 @@ fn a_report_that_commits_first_commits_at_every_level() {
         for reader in LEVELS {
             let out = run(optimistic, IsolationLevel::SnapshotIsolation, reader, false);
             assert!(out.report.is_ok(), "{reader:?}, optimistic {optimistic}");
-            assert_eq!(out.seen, (0, 20), "{reader:?}, optimistic {optimistic}");
+            assert_eq!(out.seen, (30, 20), "{reader:?}, optimistic {optimistic}");
             assert!(out.withdrawn, "{reader:?}, optimistic {optimistic}");
         }
     }
@@ -214,7 +228,7 @@ fn validating_writers_leave_every_report_consistent() {
                     "{case}: the withdrawal read a y the deposit replaced"
                 );
                 assert!(out.report.is_ok(), "{case}");
-                assert_eq!(out.seen, (0, 20), "{case}");
+                assert_eq!(out.seen, (30, 20), "{case}");
             }
         }
     }
