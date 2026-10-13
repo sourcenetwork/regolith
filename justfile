@@ -359,20 +359,23 @@ loom-tables:
 # helping, the watermark claim, publication, a rollback meeting a decision
 # under way, the step's sections, and parking (a queue's poll never waits:
 # a job its holder parks, a job parked for the step, a rollback parked for
-# a write in flight, the wake of a parked job against its landing and
-# against the claim of the thread that parks it), with thirteen
-# calibrations that must fail. Twenty-seven models, each bounded by a ring
-# of two cells, two or three threads and an explicit preemption bound;
-# measured at 1.3s in all, the largest at 4,214 interleavings. The limit is
-# a hard one: a run that reaches it has failed.
+# a write in flight, a sync parked for a record's late copy in flight, the
+# wake of a parked job against its landing and against the claim of the
+# thread that parks it), with fifteen calibrations that must fail. Thirty
+# models, each bounded by a ring of two cells, two or three threads and an
+# explicit preemption bound; measured at 1.1s in all, the largest at 4,214
+# interleavings. The limit is a hard one: a run that reaches it has failed.
 loom-pipeline:
     RUSTFLAGS="--cfg loom" cargo test --release --test loom_pipeline --no-run
     RUSTFLAGS="--cfg loom" timeout 5m cargo test --release --test loom_pipeline
 
 # Loom models for the pessimistic lock table (plan 4.6, 4.10): one holder
 # per key, the bypass bound, a wait delivered to its own queue, the table's
-# use count, and close meeting a wait being queued, with five calibrations
-# that must fail. Release only; the ten run in under ten seconds.
+# use count, and close meeting a wait being queued; and for the first four
+# abort callbacks a transaction's claim holds in place, pushed while another
+# thread takes them (at a bound that explores every schedule). Six
+# calibrations must fail. Release only; the thirteen run in under ten
+# seconds.
 loom-locks:
     RUSTFLAGS="--cfg loom" cargo test --release --test loom_locks --no-run
     RUSTFLAGS="--cfg loom" timeout 10m cargo test --release --test loom_locks
@@ -852,6 +855,12 @@ tla:
     check MC_CommitPipeline_Red_DecideAnyOrder_Order        RED SeqInRingOrder
     check MC_CommitPipeline_Red_WorkBeyond                  RED WorksUpToItsOwn
     check MC_CommitPipeline_Red_StopHoldsClaim              RED NoLiveThreadBlocked
+    # WG4: a record's late copy, the same bytes a slow owner still had in
+    # flight, never lands under a sync that covers it. Rust:
+    # src/engine/commit/late_copy_tests.rs, under the fault shim.
+    check MC_CommitPipeline_Green_Copies                    GREEN
+    check MC_CommitPipeline_Green_Copies_InFlight           RED NoTwoCopies
+    check MC_CommitPipeline_Red_SyncNoWait                  RED NoWriteUnderSync
     # Decision 3 of plan 4.7: a queue's poll never waits for another thread.
     # A job that cannot get the round, the version store's step, the flush
     # exclusion or a failed log clear of writes parks: it leaves a note, looks
@@ -983,12 +992,16 @@ tla:
     check MC_StallRelief_Red_NoFailRecheck             RED NoWaitOnceFailing
     # A commit is never lost to a stall: however its call ends, its write
     # went in or it was told a failure. It is not handed the wait a plain
-    # write is, and it does not give up while its steps make progress.
-    # Checked by TLC and the tests; the Lean statement is still owed.
+    # write is, inline compaction off included (L32), and it does not give
+    # up while its steps make progress. Lean: Regolith/StallCommit.lean,
+    # no_lost_commit, takes_wait_loses_a_commit, gives_up_loses_a_commit,
+    # left_to_caller_loses_a_commit.
     check MC_StallRelief_Green_Commit                  GREEN
     check MC_StallRelief_Green_Commit_Failures         GREEN
     check MC_StallRelief_Red_CommitTakesWait           RED NoLostCommit
     check MC_StallRelief_Red_CommitGivesUp             RED NoLostCommit
+    check MC_StallRelief_Green_Commit_InlineOff        GREEN
+    check MC_StallRelief_Red_CommitLeftToCaller        RED NoLostCommit
     # E16: with no worker, a write that owes a step of background work runs
     # exactly one, and L0 stays at its compaction trigger (at the stop
     # trigger when every write seals). Lean: Regolith/OwedStep.lean,

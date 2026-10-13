@@ -130,8 +130,11 @@ jobs:
   # step and the version store on it (`version_store`, whose tests are the
   # step's), the positional log and its gate (`wal_log`, `wal_gate`), the
   # stack, the parked list and the job the queues are built on
-  # (`io::stack`, `io::parked`, `io::job`), and the in-memory log with the
-  # append it rests on (`env::mem_log`, two tests of `env::mem_file`).
+  # (`io::stack`, `io::parked`, `io::job`), the in-memory log with the
+  # append it rests on (`env::mem_log`, two tests of `env::mem_file`), and
+  # a transaction's callbacks kept in place and the first four abort
+  # callbacks a claim holds (`transaction::in_place`,
+  # `transaction::first_four`).
   # Interpreted execution is orders of magnitude slower than native, so
   # the tests that would not finish are scaled down under `cfg(miri)` in
   # the tests themselves, with every assertion left intact: the two
@@ -181,7 +184,7 @@ jobs:
         with:
           components: miri
       - uses: Swatinem/rust-cache@v2
-      - run: "cargo miri test --lib -- --test-threads=1 engine::arena:: engine::skiplist:: engine::memtable:: engine::block:: slice::tests:: sync:: engine::commit::ring:: engine::commit::spare:: engine::take:: engine::version_store:: engine::wal_log:: engine::wal_gate:: engine::io::stack:: engine::io::parked:: engine::io::job:: env::mem_log:: env::mem_file::tests::an_append_at env::mem_file::tests::two_appends_at"
+      - run: "cargo miri test --lib -- --test-threads=1 engine::arena:: engine::skiplist:: engine::memtable:: engine::block:: slice::tests:: sync:: engine::commit::ring:: engine::commit::spare:: engine::take:: engine::version_store:: engine::wal_log:: engine::wal_gate:: engine::io::stack:: engine::io::parked:: engine::io::job:: transaction::in_place:: transaction::first_four:: env::mem_log:: env::mem_file::tests::an_append_at env::mem_file::tests::two_appends_at"
 
   # Long-running stress, soak, and fault-injection tests. Gated behind
   # `#[ignore]` in the main crate so `cargo test` stays fast for PRs;

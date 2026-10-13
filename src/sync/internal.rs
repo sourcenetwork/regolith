@@ -44,9 +44,9 @@ pub(crate) use loom::sync::Arc;
 pub(crate) use std::sync::Arc;
 
 #[cfg(loom)]
-pub(crate) use loom::sync::atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering, fence};
+pub(crate) use loom::sync::atomic::{AtomicPtr, AtomicU8, AtomicU64, AtomicUsize, Ordering, fence};
 #[cfg(not(loom))]
-pub(crate) use std::sync::atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering, fence};
+pub(crate) use std::sync::atomic::{AtomicPtr, AtomicU8, AtomicU64, AtomicUsize, Ordering, fence};
 
 /// The point between the store and the load of one side of a handshake
 /// built from `SeqCst` accesses, for loom.

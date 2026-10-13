@@ -110,6 +110,12 @@
 \* up while its own steps make progress, as a plain writer at its bound
 \* does.
 \*
+\* Tiny example 8, inline compaction off (L32). With no worker and inline
+\* compaction turned off, a stopped plain write is handed the wait at once
+\* and its caller drives compaction (Db::compact_step). A commit that blocks
+\* is not handed it: nobody else is certain to compact, so it relieves the
+\* stop itself, as far as the stop needs (RegolithEngine::admit_commit).
+\*
 \* What this model checks cannot happen: every writer has finished or
 \* waits on the stall, the job is not running or still to relieve, no latch
 \* and no recorded failure is on its way to land the unit, and a writer
@@ -155,12 +161,6 @@
 \*     the case of this model where no writer ever holds the gate: after the
 \*     latch nothing is promised to clear the stop, so the latch lands the
 \*     unit.
-\*   - A database with no worker and inline compaction turned off. There a
-\*     stopped plain writer runs no step either, and its caller is told to
-\*     compact; a commit still relieves the stop itself, since nobody else
-\*     is certain to. That a commit does is not shown by this model, where
-\*     every stopped writer relieves: it is checked by the tests
-\*     (tests/no_worker_stall_relief.rs).
 \*   - Why the engine latched, and which thread did it: any thread, at any
 \*     moment, once.
 \*   - Which work failed and on which thread: the worker's flush or
@@ -220,6 +220,14 @@
 \*                                  a commit the stall would leave waiting
 \*                                  is handed the wait and its call is over
 \*                                  (example 7): NoLostCommit breaks.
+\*   MC_StallRelief_Green_Commit_InlineOff
+\*                                  no worker and inline compaction off: a
+\*                                  stopped plain write is handed the wait,
+\*                                  a commit relieves the stop itself:
+\*                                  NoLostCommit and NoStrandedWait hold.
+\*   MC_StallRelief_Red_CommitLeftToCaller
+\*                                  there, the commit is handed the wait as
+\*                                  a plain write is: NoLostCommit breaks.
 \*   MC_StallRelief_Red_CommitGivesUp
 \*                                  a commit gives up at a plain writer's
 \*                                  bound, with the stop on and its own
@@ -228,9 +236,11 @@
 \*
 \* Lean, proofs/lean/Regolith/StallRelief.lean, proves the three rules about
 \* waiting for any number of writers, and each of their REDs as a run of
-\* the buggy steps. NoLostCommit is checked by TLC here and by the tests
-\* (tests/commit_through_stall.rs, src/engine/commit/stall_commit_tests.rs);
-\* its Lean statement is still owed.
+\* the buggy steps. proofs/lean/Regolith/StallCommit.lean proves
+\* NoLostCommit for one commit's call against anything the rest of the
+\* database does (no_lost_commit), and its three REDs as runs of the buggy
+\* steps. The tests check it too (tests/commit_through_stall.rs,
+\* src/engine/commit/stall_commit_tests.rs).
 
 \* Numbers, for the progress count.
 EXTENDS Naturals
@@ -254,13 +264,18 @@ CONSTANTS
   \* The writers that are a transaction's commit, which cannot be made
   \* again. The empty set leaves the model as it was before commits were
   \* added.
-  Commits
+  Commits,
+  \* Whether inline compaction is turned off on this database with no
+  \* worker: a stopped plain write is handed the wait, and its caller
+  \* compacts; a commit still relieves the stop itself. FALSE leaves the
+  \* model as it was before this was added.
+  InlineOff
 
 \* The bug names this model knows.
 ASSUME Mode \in {"Green", "NoRelief", "NoHandBack", "NoRecheck",
                  "NoLatchLand", "NoLatchRecheck", "NoRotateRefresh",
                  "NoFailLand", "NoFailRecheck", "CommitTakesWait",
-                 "CommitGivesUp"}
+                 "CommitGivesUp", "CommitLeftToCaller"}
 
 \* Failures is a yes or a no.
 ASSUME Failures \in BOOLEAN
@@ -270,6 +285,9 @@ ASSUME ReliefFails \in BOOLEAN
 
 \* The commits are some of the writers.
 ASSUME Commits \subseteq Writers
+
+\* InlineOff is a yes or a no.
+ASSUME InlineOff \in BOOLEAN
 
 \* The state that changes from step to step.
 VARIABLES
@@ -348,6 +366,11 @@ Lands(s) == Mode # "NoHandBack" \/ ~s
 \* Whether writer w, at the point where the stall leaves a writer waiting,
 \* is ended instead: the planted bug CommitTakesWait, for a commit.
 Consumed(w) == Mode = "CommitTakesWait" /\ w \in Commits
+
+\* Whether writer w, stopped on a database with inline compaction off, is
+\* handed the wait: a plain write is, its caller holding the data; a
+\* commit is not, except under the planted bug CommitLeftToCaller.
+LeftToCaller(w) == InlineOff /\ (w \notin Commits \/ Mode = "CommitLeftToCaller")
 
 \* Whether writer w may give up with the stop on after a step of its own
 \* that made progress: a plain writer at its bound may (Error::Busy); a
@@ -470,7 +493,15 @@ WriterTry(w) ==
                     /\ fate' = Ended(w, "told")
                     \* The stop, the gate and what the writer read are unchanged.
                     /\ UNCHANGED <<stopped, gate, seen>>
-               \* The relief works. Is the gate free?
+               \* The relief works. Is the relief left to the caller (inline compaction off)?
+               ELSE IF LeftToCaller(w)
+                    \* Handed the wait (RegolithEngine::stopped, StallWait): the call is over.
+                    THEN /\ wpc' = [wpc EXCEPT ![w] = "done"]
+                         \* A commit's call ended with the wait (the bug only).
+                         /\ fate' = Ended(w, "wait")
+                         \* The stop, the gate and what the writer read are unchanged.
+                         /\ UNCHANGED <<stopped, gate, seen>>
+               \* The writer relieves the stop itself. Is the gate free?
                ELSE IF gate = "free"
                     \* Stopped, gate free: its step takes the gate.
                     THEN /\ gate' = w

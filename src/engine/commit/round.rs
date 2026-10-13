@@ -31,6 +31,7 @@ use std::task::Waker;
 use super::super::RegolithEngine;
 use super::super::callback::InCommit;
 use super::super::io::job::{Job, JobBody, Step};
+use super::super::wal_log::Log;
 use super::descriptor::{Decision, WRITTEN};
 use super::hook;
 use super::park::Help;
@@ -171,12 +172,15 @@ impl RegolithEngine {
     /// log that failed, in this round or before it, is rolled back here
     /// (P4).
     ///
-    /// `false` when a poll's round parked: the log failed and writes of the
-    /// commits to discard are still in flight. The round is then as it was,
-    /// for the next thread that claims it.
+    /// `false` when a poll's round parked: writes are still in flight below
+    /// the prefix it syncs, or the log failed and writes of the commits to
+    /// discard are. The round is then as it was, for the next thread that
+    /// claims it.
     fn run_sync_round(&self, pipe: &Pipeline, round: &RingArc<Round>, help: Help<'_>) -> bool {
         let tip = pipe.tip.load();
-        self.sync_written(pipe, &tip);
+        if !self.sync_written(pipe, &tip, help) {
+            return false;
+        }
         if tip.after.log.is_poisoned() {
             if !self.turned_away(&tip, help) {
                 return false;
@@ -208,11 +212,12 @@ impl RegolithEngine {
     }
 
     /// The sync of one round: the written prefix of the log `tip` names,
-    /// unless the log already failed.
-    fn sync_written(&self, pipe: &Pipeline, tip: &Decision) {
+    /// unless the log already failed. `false` when a poll's round parked on
+    /// writes in flight below the prefix (WG4).
+    fn sync_written(&self, pipe: &Pipeline, tip: &Decision, help: Help<'_>) -> bool {
         let log = &tip.after.log;
         if log.is_poisoned() {
-            return;
+            return true;
         }
         // The written prefix ends where the first unwritten record starts,
         // or after the newest decided slot when every record is written.
@@ -238,6 +243,12 @@ impl RegolithEngine {
             }
         }
         if through > log.durable() && !log.is_poisoned() {
+            let Some(through) = self.settle_writes(log, through, help) else {
+                return false;
+            };
+            if through <= log.durable() || log.is_poisoned() {
+                return true;
+            }
             let _perf = PerfTimer::new(PerfTimerField::WriteWal);
             let start = self.statistics().and_then(|_| self.env.now_micros());
             match log.sync_through(through) {
@@ -254,6 +265,29 @@ impl RegolithEngine {
                     log.poison(err);
                 }
             }
+        }
+        true
+    }
+
+    /// Wait, as `help` says, until no write in flight may land below
+    /// `through` on `log`, and return the offset a sync may cover now
+    /// (`wal_gate.rs`, WG4 and WG5). `None` when a poll parked: its waker is
+    /// woken by the last of those writes to leave. Called by the holder of
+    /// the round.
+    pub(super) fn settle_writes(&self, log: &Log, through: u64, help: Help<'_>) -> Option<u64> {
+        match help {
+            Help::Park(waker) => log.settle_or_park(through, waker),
+            Help::Wait | Help::Leave => match log.settle(through) {
+                Ok(upto) => Some(upto),
+                // Only where one thread cannot wait for another, and there no
+                // other thread has a write in flight: the log is failed rather
+                // than synced over a write nobody can account for.
+                Err(err) => {
+                    tracing::error!(error = %err, "a sync of the write-ahead log could not wait for the writes in flight");
+                    log.poison(err);
+                    Some(log.durable())
+                }
+            },
         }
     }
 }

@@ -30,8 +30,11 @@
 //! - **Parking** (a queue's poll never waits for another thread): a thread
 //!   blocked on a job its holder parks runs it; a job parked for the step
 //!   is woken when the step is given up; a rollback parked for a write in
-//!   flight cuts the log only after the write left; and a queue the wake of
-//!   a parked job had off the list when the job landed is told once.
+//!   flight cuts the log only after the write left; a sync parked for a
+//!   copy of a record in flight begins only after the copy left, and a copy
+//!   counted in after the sync turned the gate writes nothing; and a queue
+//!   the wake of a parked job had off the list when the job landed is told
+//!   once.
 //!
 //! Every model is bounded by a small scenario (a ring of two cells, two
 //! threads or two and a reader) and an explicit preemption bound given in
@@ -170,6 +173,23 @@ fn a_rollback_parked_for_a_write_in_flight_cuts_after_it_left() {
 #[should_panic(expected = "a write of a discarded commit landed after the cut")]
 fn a_write_counted_in_after_its_epoch_check_lands_after_the_cut() {
     park::a_write_counted_in_after_its_epoch_check_lands_after_the_cut();
+}
+
+#[test]
+fn a_late_copy_never_lands_under_a_sync() {
+    park::a_late_copy_never_lands_under_a_sync();
+}
+
+#[test]
+#[should_panic(expected = "a copy of the record landed under the sync")]
+fn a_copy_that_does_not_look_again_lands_under_the_sync() {
+    park::a_copy_that_does_not_look_again_lands_under_the_sync();
+}
+
+#[test]
+#[should_panic(expected = "a copy of the record landed under the sync")]
+fn a_sync_that_does_not_wait_has_a_copy_land_under_it() {
+    park::a_sync_that_does_not_wait_has_a_copy_land_under_it();
 }
 
 #[test]

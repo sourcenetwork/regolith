@@ -1,6 +1,7 @@
 //! The gate every write of a positional log passes: what keeps the write of
 //! a discarded commit from landing after the rollback that discarded it cut
-//! the file (`wal_log.rs`).
+//! the file, and any write from landing on a range a sync has begun to make
+//! durable (`wal_log.rs`).
 //!
 //! One word holds the log's write epoch and the number of writes in flight.
 //! A write is counted in by a compare-and-swap that succeeds only while the
@@ -22,8 +23,43 @@
 //!   leave.** A job a queue's poll steps registers its waker and looks at
 //!   the count a last time; the write that takes the count to zero under a
 //!   moved epoch wakes the waker registered. One of the two sees the other.
+//!
+//! # A sync and the writes in flight (WG4)
+//!
+//! A sector being written when the power goes may come back garbled,
+//! whatever bytes were being written to it: a disk without power-loss
+//! protection promises nothing for a sector in flight. So no write may land
+//! on a range of the log once a sync that covers the range has begun.
+//! Putting synced bytes back in flight, even the very same bytes, would let
+//! a power cut take commits that were durable. The pipeline writes one
+//! record from two threads when the first is slow (the courtesy in
+//! `commit::pipeline`), so a late copy of a record is the case to rule out.
+//!
+//! So a write also counts in on one of two sides, the one the gate names
+//! when it enters, and then looks again at whether its record is written
+//! already: one that is leaves without writing. A sync of the written
+//! prefix first turns the gate to the other side, then waits until every
+//! write counted on the side it turned away from has left. A write counted
+//! in before the turn has returned before the sync begins; one counted in
+//! after it finds every record of the prefix written, and writes none of
+//! them. Writes of records past the prefix go on meanwhile, on the new
+//! side: a sync waits for the writes in flight when it began, never for a
+//! stream of new ones.
+//!
+//! - **WG4, no write lands below a sync's prefix after the sync began.**
+//!   The turn and a write's count in are each one compare-and-swap of the
+//!   side word, so every write is on exactly one side of a turn. The sync
+//!   reads the written records before the turn, and a write reads its
+//!   record after counting in, each behind a `SeqCst` fence: a write the
+//!   turn did not count sees the record written.
+//! - **WG5, a turn is waited out once.** The turn and the prefix it was
+//!   made for are kept until the side it turned away from has drained, so a
+//!   sync that parked and runs again finishes its own turn rather than
+//!   turning again behind newer writes, and syncs no further than that
+//!   prefix. Only the holder of the pipeline's round turns or settles the
+//!   gate, so one turn is outstanding at most.
 
-use std::task::Waker;
+use std::task::{Poll, Waker};
 
 use super::io::atomic_waker::AtomicWaker;
 use crate::sync::internal::{AtomicU64, Ordering, fence};
@@ -33,12 +69,47 @@ use crate::sync::internal::{AtomicU64, Ordering, fence};
 const WRITER_BITS: u32 = 24;
 const WRITERS: u64 = (1 << WRITER_BITS) - 1;
 
+/// The bit of the side word that names the side a write counts in on now.
+const SIDE_BIT: u32 = 63;
+/// Bits of the side word that count the writes in flight of one side: the
+/// low side's from bit 0, the high side's above them.
+const SIDE_BITS: u32 = 31;
+const SIDE_COUNT: u64 = (1 << SIDE_BITS) - 1;
+
+/// The side a write counting in on `sides` now joins: 0 or 1.
+fn current(sides: u64) -> u64 {
+    sides >> SIDE_BIT
+}
+
+/// The writes in flight counted on `side`.
+fn on_side(sides: u64, side: u64) -> u64 {
+    (sides >> (side * u64::from(SIDE_BITS))) & SIDE_COUNT
+}
+
+/// One write counted on `side`.
+fn one_on(side: u64) -> u64 {
+    1 << (side * u64::from(SIDE_BITS))
+}
+
+/// A write let in: what [`Gate::leave`] counts out.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Entry {
+    epoch: u64,
+    side: u64,
+}
+
 /// See the module docs.
 pub(crate) struct Gate {
     /// `epoch << WRITER_BITS | writes in flight`.
     word: AtomicU64,
-    /// The rollback parked until the writes in flight have left (WG3). One
-    /// at a time: a rollback holds the pipeline's round.
+    /// The side writes count in on now (bit 63), and the writes in flight
+    /// on each side (WG4).
+    sides: AtomicU64,
+    /// The prefix a sync turned the gate for, while the side it turned away
+    /// from has not drained; 0 when no turn is outstanding (WG5).
+    turned: AtomicU64,
+    /// The rollback or the sync parked until the writes it waits for have
+    /// left (WG3, WG4). One at a time: either holds the pipeline's round.
     cleared: AtomicWaker,
 }
 
@@ -47,6 +118,8 @@ impl Gate {
     pub(crate) fn new() -> Self {
         Self {
             word: AtomicU64::new(0),
+            sides: AtomicU64::new(0),
+            turned: AtomicU64::new(0),
             cleared: AtomicWaker::new(),
         }
     }
@@ -56,13 +129,16 @@ impl Gate {
         self.word.load(Ordering::SeqCst) >> WRITER_BITS
     }
 
-    /// Count a write decided in `epoch` in. `false` when the gate has moved
+    /// Count a write decided in `epoch` in. `None` when the gate has moved
     /// on: the write is of a discarded commit and is not made (WG1).
-    pub(crate) fn enter(&self, epoch: u64) -> bool {
+    ///
+    /// The caller looks at whether its record is written already only after
+    /// this returns, and writes nothing when it is (WG4).
+    pub(crate) fn enter(&self, epoch: u64) -> Option<Entry> {
         let mut word = self.word.load(Ordering::SeqCst);
         loop {
             if word >> WRITER_BITS != epoch {
-                return false;
+                return None;
             }
             debug_assert!(
                 word & WRITERS < WRITERS,
@@ -74,19 +150,46 @@ impl Gate {
                 Ordering::SeqCst,
                 Ordering::SeqCst,
             ) {
-                Ok(_) => return true,
+                Ok(_) => break,
                 Err(now) => word = now,
             }
         }
+        let mut sides = self.sides.load(Ordering::SeqCst);
+        let side = loop {
+            let side = current(sides);
+            debug_assert!(
+                on_side(sides, side) < SIDE_COUNT,
+                "more writes in flight than a side counts"
+            );
+            match self.sides.compare_exchange_weak(
+                sides,
+                sides + one_on(side),
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => break side,
+                Err(now) => sides = now,
+            }
+        };
+        // Paired with the fence a sync makes between reading the written
+        // records and looking at the sides (WG4).
+        fence(Ordering::SeqCst);
+        Some(Entry { epoch, side })
     }
 
-    /// Count out a write that [`Self::enter`] let in for `epoch`.
-    pub(crate) fn leave(&self, epoch: u64) {
+    /// Count out a write that [`Self::enter`] let in.
+    pub(crate) fn leave(&self, entry: Entry) {
+        let sides = self.sides.fetch_sub(one_on(entry.side), Ordering::SeqCst) - one_on(entry.side);
+        // The last write of a side a sync turned away from: the sync goes on
+        // (WG4).
+        let drained = on_side(sides, entry.side) == 0 && current(sides) != entry.side;
         let left = self.word.fetch_sub(1, Ordering::SeqCst) - 1;
-        if left & WRITERS == 0 && left >> WRITER_BITS != epoch {
-            // The gate moved on under this write, and it was the last one
-            // in flight: a rollback parked for it goes on (WG3). With the
-            // fence in `clear_or_park`, one side sees the other.
+        // The gate moved on under this write, and it was the last one in
+        // flight: a rollback parked for it goes on (WG3).
+        let cleared = left & WRITERS == 0 && left >> WRITER_BITS != entry.epoch;
+        if drained || cleared {
+            // With the fence in `clear_or_park` and in `settle`, one side
+            // sees the other.
             fence(Ordering::SeqCst);
             self.cleared.wake();
         }
@@ -114,6 +217,66 @@ impl Gate {
         self.word.load(Ordering::SeqCst) & WRITERS == 0
     }
 
+    /// Forget a turn a sync made: a rollback cut the log back, and the
+    /// prefix it was made for is gone. Called with no write in flight.
+    pub(crate) fn forget_turn(&self) {
+        debug_assert!(self.is_clear());
+        self.turned.store(0, Ordering::SeqCst);
+    }
+
+    /// WG4 for a sync of the records written below `through`, called by the
+    /// holder of the pipeline's round once it knows them written: `Ready`
+    /// with the offset the sync may cover now. Every write that may land
+    /// below it has returned, and none will start.
+    ///
+    /// That is `through` itself when nothing was in flight or this call made
+    /// the turn and waited it out. A turn an earlier call made and parked on
+    /// is finished first, for its own prefix, and the offset is then the
+    /// lower of the two (WG5). `Pending` registers `waker`, which the last
+    /// write of the side turned away from wakes.
+    pub(crate) fn settle(&self, through: u64, waker: &Waker) -> Poll<u64> {
+        debug_assert!(through > 0, "a prefix past the stamp");
+        // Paired with the fence a write makes after counting in (WG4).
+        fence(Ordering::SeqCst);
+        loop {
+            let turned = self.turned.load(Ordering::SeqCst);
+            if turned != 0 {
+                let away = current(self.sides.load(Ordering::SeqCst)) ^ 1;
+                if on_side(self.sides.load(Ordering::SeqCst), away) != 0 {
+                    self.cleared.register(waker);
+                    fence(Ordering::SeqCst);
+                    if on_side(self.sides.load(Ordering::SeqCst), away) != 0 {
+                        return Poll::Pending;
+                    }
+                }
+                self.turned.store(0, Ordering::SeqCst);
+                return Poll::Ready(turned.min(through));
+            }
+            let sides = self.sides.load(Ordering::SeqCst);
+            let now = current(sides);
+            debug_assert_eq!(
+                on_side(sides, now ^ 1),
+                0,
+                "a side turned away from drained before its turn was let go"
+            );
+            if on_side(sides, now) == 0 {
+                return Poll::Ready(through);
+            }
+            self.turned.store(through, Ordering::SeqCst);
+            // Only this side's count can change under the turn, so one
+            // exchange that fails is retried with what it read.
+            let mut seen = sides;
+            while let Err(now) = self.sides.compare_exchange_weak(
+                seen,
+                seen ^ (1 << SIDE_BIT),
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                seen = now;
+            }
+        }
+    }
+
     /// [`Self::is_clear`] for a rollback that may not wait: when a write is
     /// still in flight, `waker` is woken by the last one to leave, and
     /// `false` tells the caller to park (WG3). Called after [`Self::turn`].
@@ -128,80 +291,5 @@ impl Gate {
 }
 
 #[cfg(all(test, not(loom)))]
-mod tests {
-    use super::*;
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering as StdOrdering};
-    use std::task::Wake;
-
-    struct Count(AtomicUsize);
-
-    impl Wake for Count {
-        fn wake(self: Arc<Self>) {
-            self.0.fetch_add(1, StdOrdering::SeqCst);
-        }
-    }
-
-    fn counting() -> (Arc<Count>, Waker) {
-        let count = Arc::new(Count(AtomicUsize::new(0)));
-        (Arc::clone(&count), Waker::from(count))
-    }
-
-    #[test]
-    fn a_write_of_the_current_epoch_is_let_in_and_one_of_an_older_epoch_is_not() {
-        let gate = Gate::new();
-        assert_eq!(gate.epoch(), 0);
-        assert!(gate.enter(0));
-        assert!(!gate.is_clear());
-        gate.leave(0);
-        assert!(gate.is_clear());
-        gate.turn(1);
-        assert_eq!(gate.epoch(), 1);
-        assert!(!gate.enter(0), "a write decided before the gate moved");
-        assert!(gate.is_clear(), "a write turned away is never counted");
-        assert!(gate.enter(1));
-        gate.leave(1);
-    }
-
-    #[test]
-    fn the_epoch_moves_with_writes_in_flight_and_keeps_them_counted() {
-        let gate = Gate::new();
-        assert!(gate.enter(0));
-        assert!(gate.enter(0));
-        gate.turn(7);
-        assert_eq!(gate.epoch(), 7);
-        assert!(!gate.is_clear());
-        gate.leave(0);
-        assert!(!gate.is_clear());
-        gate.leave(0);
-        assert!(gate.is_clear());
-    }
-
-    #[test]
-    fn a_parked_rollback_is_woken_by_the_last_write_to_leave() {
-        let gate = Gate::new();
-        assert!(gate.enter(0));
-        assert!(gate.enter(0));
-        gate.turn(1);
-        let (count, waker) = counting();
-        assert!(!gate.clear_or_park(&waker), "two writes are in flight");
-        gate.leave(0);
-        assert_eq!(count.0.load(StdOrdering::SeqCst), 0, "one write is left");
-        gate.leave(0);
-        assert_eq!(count.0.load(StdOrdering::SeqCst), 1);
-        assert!(gate.clear_or_park(&waker));
-        assert_eq!(count.0.load(StdOrdering::SeqCst), 1, "nothing to wait for");
-    }
-
-    #[test]
-    fn a_write_that_leaves_under_its_own_epoch_wakes_nobody() {
-        let gate = Gate::new();
-        let (count, waker) = counting();
-        assert!(gate.enter(0));
-        // Nothing moved the gate: the rollback that would park has not
-        // begun, so no waker is taken.
-        gate.cleared.register(&waker);
-        gate.leave(0);
-        assert_eq!(count.0.load(StdOrdering::SeqCst), 0);
-    }
-}
+#[path = "wal_gate_tests.rs"]
+mod tests;

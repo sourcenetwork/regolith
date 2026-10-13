@@ -13,8 +13,14 @@ pub(crate) enum Stage {
     Apply,
     /// Before a slot's record is written.
     Write,
+    /// Inside a record's write: counted in at the log's gate, the record
+    /// not written by anyone yet, its bytes not yet with the host.
+    InWrite,
     /// Before a sync round is claimed.
     Sync,
+    /// A sync about to wait for writes in flight below the prefix it syncs
+    /// (`wal_gate.rs`, WG4).
+    SyncWait,
     /// Before a slot is published.
     Publish,
     /// A `commit_nowait` commit found writes stopped and is about to take

@@ -44,6 +44,10 @@ CONSTANTS
   Buffer,
   \* Whether steps nothing can fall between are taken in one go.
   Coarse,
+  \* Whether a record's write takes two steps, counted in at the log's gate
+  \* and landed, so a helper's copy of a record can be in flight beside its
+  \* owner's (WG4). FALSE: one step, as the model was before copies.
+  Copies,
   \* Which rule is deliberately broken; "none" is the real design.
   Mutant
 
@@ -63,14 +67,15 @@ ASSUME Plain \subseteq Committers /\ EarlyBegin \subseteq Committers \ Plain
 ASSUME Stoppers \subseteq Actors /\ Head \in Actors \cup {0}
 \* The bounds are plain counts, and the memtable holds at least one commit.
 ASSUME MaxSlots \in Nat /\ MaxStops \in Nat /\ MaxFails \in Nat /\ Buffer \in Nat \ {0}
-\* The switch is yes or no.
-ASSUME Coarse \in BOOLEAN
+\* The switches are yes or no.
+ASSUME Coarse \in BOOLEAN /\ Copies \in BOOLEAN
 \* The list of rules a run may break, one at a time.
 ASSUME Mutant \in {"none", "OutOfOrder", "AbortHole", "NoHelping", "SyncPastGap",
                    "ValidatePublished", "VoidNotCas", "TwoSyncs", "FrontierFirst",
                    "UnitNoDrain", "SettleAnyEpoch", "KeepMemtable", "NoEpochGate",
                    "PassBeforeApply", "RollbackForgets", "NoFreeze", "StopHoldsClaim",
-                   "TrustEarly", "PublishBeforeSync", "DecideAnyOrder", "WorkBeyond"}
+                   "TrustEarly", "PublishBeforeSync", "DecideAnyOrder", "WorkBeyond",
+                   "SyncNoWait"}
 
 \* The ticket numbers of the run.
 Slots == 1..MaxSlots
@@ -163,12 +168,15 @@ VARIABLES
   \* epoch, memtable>>.
   seen,
   \* The threads that walked away for good.
-  stopped
+  stopped,
+  \* The record whose write each thread has in flight: counted in at the
+  \* log's gate, its bytes not yet with the host; 0 for none.
+  fly
 
 \* All of the above, so "nothing changed" can be said in one word.
 vars == <<tail, cell, owner, dec, sq, ep, ap, wr, failed, logOf, memOf, dto, frozen, tipIdx,
           tipNext, tipUsed, epoch, logEp, memGen, gen, durable, pub, visible, round, target, claimant,
-          rbLast, poisoned, fails, pc, snap, hor, mine, seen, stopped>>
+          rbLast, poisoned, fails, pc, snap, hor, mine, seen, stopped, fly>>
 
 \* Groups of variables an action leaves alone, named once so each action
 \* can say so in a line.
