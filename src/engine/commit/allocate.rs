@@ -81,7 +81,7 @@ impl RegolithEngine {
         // Every slot up to this one is decided, this one included: the
         // reservation is made then. Its record is left to whoever passes
         // the slot next.
-        while let Turn::Blocked(job) = self.help_decide(pipe, index, Help::Wait) {
+        while let Turn::Blocked(job) = self.help_decide(pipe, index, Help::Wait, Some(&desc)) {
             self.run_or_wait(&job);
         }
         let reserved = Self::reserved(&desc);
@@ -126,7 +126,7 @@ impl RegolithEngine {
         let in_the_way = match self.try_enter(pipe, &desc, Help::Leave) {
             // The reservation was given up: nothing is taken.
             Err(job) => Some(job),
-            Ok(index) => match self.help_decide(pipe, index, Help::Leave) {
+            Ok(index) => match self.help_decide(pipe, index, Help::Leave, Some(&desc)) {
                 Turn::Done => None,
                 Turn::Blocked(job) => {
                     desc.mark(ABANDONED);
