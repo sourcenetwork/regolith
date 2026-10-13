@@ -47,11 +47,16 @@
 //! stream of new ones.
 //!
 //! - **WG4, no write lands below a sync's prefix after the sync began.**
-//!   The turn and a write's count in are each one compare-and-swap of the
-//!   side word, so every write is on exactly one side of a turn. The sync
-//!   reads the written records before the turn, and a write reads its
-//!   record after counting in, each behind a `SeqCst` fence: a write the
-//!   turn did not count sees the record written.
+//!   The turn and a write's count in are each a read-modify-write of the
+//!   side word, and so is a sync's look at the side word when it finds
+//!   nothing in flight and turns nothing. Read-modify-writes of one word
+//!   are ordered one after another, so every write is on exactly one side
+//!   of the sync's: before it, and the sync sees it in flight and waits; or
+//!   after it, and then everything the sync knew before it, the written
+//!   records among it, is known to the write once it counted in (the sync's
+//!   read-modify-write releases, the write's acquires), so the write sees
+//!   its record written and writes nothing. No fence on the write's side:
+//!   the cost is one read-modify-write per sync, not a fence per write.
 //! - **WG5, a turn is waited out once.** The turn and the prefix it was
 //!   made for are kept until the side it turned away from has drained, so a
 //!   sync that parked and runs again finishes its own turn rather than
@@ -171,9 +176,7 @@ impl Gate {
                 Err(now) => sides = now,
             }
         };
-        // Paired with the fence a sync makes between reading the written
-        // records and looking at the sides (WG4).
-        fence(Ordering::SeqCst);
+        // WG4 needs no fence here: see `settle`.
         Some(Entry { epoch, side })
     }
 
@@ -236,8 +239,6 @@ impl Gate {
     /// write of the side turned away from wakes.
     pub(crate) fn settle(&self, through: u64, waker: &Waker) -> Poll<u64> {
         debug_assert!(through > 0, "a prefix past the stamp");
-        // Paired with the fence a write makes after counting in (WG4).
-        fence(Ordering::SeqCst);
         loop {
             let turned = self.turned.load(Ordering::SeqCst);
             if turned != 0 {
@@ -252,7 +253,11 @@ impl Gate {
                 self.turned.store(0, Ordering::SeqCst);
                 return Poll::Ready(turned.min(through));
             }
-            let sides = self.sides.load(Ordering::SeqCst);
+            // A read-modify-write that changes nothing, not a load (WG4): a
+            // write that counts in after it acquires what this thread knew
+            // before it, the records it found written, and so writes none of
+            // them; one that counted in before it is seen here, in flight.
+            let sides = self.sides.fetch_add(0, Ordering::SeqCst);
             let now = current(sides);
             debug_assert_eq!(
                 on_side(sides, now ^ 1),

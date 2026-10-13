@@ -107,9 +107,19 @@ impl RegolithEngine {
     /// `early` is the check the transaction ran at a horizon before it took
     /// a slot: an item it found clean is checked here only if something
     /// landed on it above that horizon, and then in full (`early.rs`).
-    /// `ceiling` is the newest sequence `view` holds, the slots decided
-    /// before this one included; a content-addressed put looks itself up
-    /// only when something landed above the transaction's snapshot.
+    /// `ceiling` is the last sequence handed out before this slot, so the
+    /// newest any version in `view` holds; a content-addressed put looks
+    /// itself up only when something landed above the transaction's
+    /// snapshot.
+    ///
+    /// When `ceiling` is at or below the horizon, nothing landed above it at
+    /// all, and an item the early check found clean is clean with no lookup
+    /// (`ceiling_skips_the_check_above` in `PipelineCheck.lean`): a commit
+    /// nobody committed under, the common case, finishes its check here
+    /// without touching the view. Every sequence is handed out through the
+    /// pipeline's state ([`super::After::next_seq`]: a slot's operations, a
+    /// counter reservation, an ingest's, the rollback's floor), so no
+    /// version anywhere is newer than `ceiling`.
     pub(super) fn validate(
         &self,
         checks: &ValidationSet,
@@ -121,12 +131,15 @@ impl RegolithEngine {
         let mut merges_commuted = 0u64;
         let mut writes_elided = 0u64;
         let horizon = early.horizon;
+        // Nothing was handed a sequence above the horizon.
+        let nothing_above = ceiling <= horizon;
         // No table holds a sequence above the horizon, so whatever landed
         // above it is in a memtable of the view.
         let memtables_only = view.version.last_seq <= horizon;
         let landed = |key: &[u8], mark: Mark| -> io::Result<bool> {
             Ok(mark == Mark::Dirty
-                || self.landed_above_horizon(key, horizon, view, memtables_only)?)
+                || (!nothing_above
+                    && self.landed_above_horizon(key, horizon, view, memtables_only)?))
         };
         for (at, check) in checks.reads.iter().enumerate() {
             if !landed(&check.key, early.mark(at))? {
@@ -157,6 +170,8 @@ impl RegolithEngine {
         for (at, range) in checks.ranges.iter().enumerate() {
             let (floor, memtables_only) = match early.mark(reads + at) {
                 Mark::Dirty => (range.observed_seq, false),
+                // Clean at the horizon, and nothing above it.
+                _ if nothing_above => continue,
                 _ => (horizon.max(range.observed_seq), memtables_only),
             };
             if let Some((key, seq, theirs)) =

@@ -267,7 +267,9 @@ impl RegolithEngine {
             loop {
                 match pipe.ring.install(index, desc) {
                     Installed::Done => {
-                        desc.mark(INSTALLED);
+                        if !desc.is_blocking() {
+                            desc.mark(INSTALLED);
+                        }
                         return Ok(index);
                     }
                     Installed::Lost => break,
@@ -289,14 +291,14 @@ impl RegolithEngine {
             if pipe.ring.published() >= lap {
                 return Ok(());
             }
-            if let Turn::Blocked(job) = self.help_decide(pipe, lap, help) {
+            if let Turn::Blocked(job) = self.help_decide(pipe, lap, help, None) {
                 if !matches!(help, Help::Wait) {
                     return Err(job);
                 }
                 self.run_or_wait(&job);
                 continue;
             }
-            match self.publish_upto(pipe, lap) {
+            match self.publish_upto(pipe, lap, None) {
                 Progress::Published => return Ok(()),
                 Progress::NeedsSync | Progress::Failed => self.sync_round(pipe, help)?,
                 Progress::Undecided => {}
@@ -307,8 +309,15 @@ impl RegolithEngine {
     /// Decide every slot up to and including `upto`, in ring order (P1),
     /// voiding the ones reserved and never installed. A round or a unit in
     /// the way is dealt with as `help` says (`park.rs`), and handed back
-    /// when the call does not get past it.
-    pub(super) fn help_decide(&self, pipe: &Pipeline, upto: u64, help: Help<'_>) -> Turn {
+    /// when the call does not get past it. `own` is the caller's installed
+    /// descriptor, if it has one: see [`Self::own_slot`].
+    pub(super) fn help_decide(
+        &self,
+        pipe: &Pipeline,
+        upto: u64,
+        help: Help<'_>,
+        own: Option<&RingArc<Descriptor>>,
+    ) -> Turn {
         loop {
             let decided = pipe.ring.decided();
             if decided >= upto {
@@ -323,102 +332,128 @@ impl RegolithEngine {
                 continue;
             }
             let index = decided + 1;
-            match pipe.ring.load(index) {
-                // Void, or its cell already took a later lap: a void slot
-                // holds nothing, so its cell is not kept for it (R6).
-                Loaded::Void | Loaded::Gone => {
-                    pipe.ring.pass_decided(index);
-                }
-                Loaded::Empty => {
-                    // Reserved, not installed: its owner may have stopped.
-                    // Void it; the owner's install then fails and it
-                    // reserves again.
-                    pipe.ring.void(index);
-                }
-                Loaded::Full => {
-                    // The cell still holds the slot a lap earlier.
-                    match self.publish_upto(pipe, index - pipe.ring.capacity()) {
-                        Progress::Published | Progress::Undecided => {}
-                        Progress::NeedsSync | Progress::Failed => {
-                            if let Err(job) = self.sync_round(pipe, help) {
-                                return Turn::Blocked(job);
+            let loaded;
+            let desc = match Self::own_slot(own, index) {
+                Some(desc) => desc,
+                None => match pipe.ring.load(index) {
+                    Loaded::Ready(desc) => {
+                        loaded = desc;
+                        &loaded
+                    }
+                    // Void, or its cell already took a later lap: a void slot
+                    // holds nothing, so its cell is not kept for it (R6).
+                    Loaded::Void | Loaded::Gone => {
+                        pipe.ring.pass_decided(index);
+                        continue;
+                    }
+                    Loaded::Empty => {
+                        // Reserved, not installed: its owner may have stopped.
+                        // Void it; the owner's install then fails and it
+                        // reserves again.
+                        pipe.ring.void(index);
+                        continue;
+                    }
+                    Loaded::Full => {
+                        // The cell still holds the slot a lap earlier.
+                        match self.publish_upto(pipe, index - pipe.ring.capacity(), None) {
+                            Progress::Published | Progress::Undecided => {}
+                            Progress::NeedsSync | Progress::Failed => {
+                                if let Err(job) = self.sync_round(pipe, help) {
+                                    return Turn::Blocked(job);
+                                }
                             }
                         }
+                        continue;
                     }
+                },
+            };
+            let mut seen = None;
+            if desc.decision().is_none() {
+                // Another thread is deciding it now: it is given about as
+                // long as the decision takes before this thread repeats the
+                // work (P5).
+                if !desc.mark(DECIDING) {
+                    courtesy(desc.work_size(), || desc.decision().is_some());
                 }
-                Loaded::Ready(desc) => {
-                    if desc.decision().is_none() {
-                        // Another thread is deciding it now: it is given
-                        // about as long as the decision takes before this
-                        // thread repeats the work (P5).
-                        if !desc.mark(DECIDING) {
-                            courtesy(desc.work_size(), || desc.decision().is_some());
-                        }
-                        if desc.decision().is_none() {
-                            hook::at(hook::Stage::Decide);
-                            if let Turn::Blocked(job) = self.decide(pipe, index, &desc, help) {
-                                return Turn::Blocked(job);
-                            }
-                        }
+                if desc.decision().is_none() {
+                    hook::at(hook::Stage::Decide);
+                    match self.decide(pipe, index, desc, help) {
+                        Ok(tip) => seen = Some(tip),
+                        Err(job) => return Turn::Blocked(job),
                     }
-                    self.settle(pipe, index, &desc);
                 }
             }
+            self.settle(pipe, index, desc, seen);
         }
     }
 
+    /// `own` when it is the descriptor installed at `index`: what
+    /// [`Ring::load`] would hand back for that slot, without the pin and the
+    /// reference it takes.
+    ///
+    /// A frontier reaches `index` only while the slot is not past it, so not
+    /// published and not retired: the cell still holds the descriptor its
+    /// owner installed, and an installed slot is never voided (R1). A caller
+    /// passes `own` only once its descriptor is installed, so its index is
+    /// the slot's. Should another thread pass the slot meanwhile, every step
+    /// taken with `own` is one a reference loaded a moment earlier would take
+    /// too, and each is checked by the compare-and-swap that ends it.
+    fn own_slot(own: Option<&RingArc<Descriptor>>, index: u64) -> Option<&RingArc<Descriptor>> {
+        own.filter(|own| own.index() == index)
+    }
+
     /// Give slot `index` its decision, unless it has one by the time this
-    /// returns or a unit is in the way.
+    /// returns or a unit is in the way (`Err`). `Ok` holds the tip this call
+    /// read last, which [`Self::settle`] starts from while it is still the
+    /// tip.
     fn decide(
         &self,
         pipe: &Pipeline,
         index: u64,
         desc: &RingArc<Descriptor>,
         help: Help<'_>,
-    ) -> Turn {
+    ) -> Result<RingArc<Decision>, Arc<Job>> {
         // P1: the tip read here is the state after slot `index - 1` as long
         // as that slot is still the newest decided one, which is checked
         // after the read. A decision computed from an older tip loses the
         // install below to the one that already decided the slot.
         let mut prev = pipe.tip.load();
         if !pipe.ring.is_next_to_decide(index) || desc.decision().is_some() {
-            return Turn::Done;
+            return Ok(prev);
         }
         if let Work::Unit { job, .. } = &desc.work {
             if job.is_done() {
                 // The unit's body ended without deciding the slot: it
                 // unwound. The pipeline goes on from where it was.
                 desc.decide(Decision::new(index, Fate::Unit, prev.after.clone()));
-                return Turn::Done;
+                return Ok(prev);
             }
             if self.pass(job, help) {
-                return Turn::Done;
+                return Ok(prev);
             }
-            return Turn::Blocked(Arc::clone(job));
+            return Err(Arc::clone(job));
         }
 
         let mut refused = None;
         // Read after the tip: a tip the check already replaced means its
         // job was made before, so it is seen here.
         if desc.turn_job.get().is_some() || self.turn_is_due(desc, &prev.after) {
-            match self.take_turn(index, desc, help) {
-                Ok(turned) => refused = turned.refused.as_ref().map(crate::Error::clone_io),
-                Err(job) => return Turn::Blocked(job),
-            }
+            refused = self
+                .take_turn(index, desc, help)?
+                .refused
+                .as_ref()
+                .map(crate::Error::clone_io);
             // The check left the state it made, rotated or not, in the tip,
             // before its job landed.
             prev = pipe.tip.load();
             if !pipe.ring.is_next_to_decide(index) {
-                return Turn::Done;
+                return Ok(prev);
             }
         }
         let base = &prev.after;
         let decision = match refused {
             Some(err) => Decision::new(index, Fate::Refused(err), base.clone()),
-            None => match self.decide_reading(index, desc, base) {
-                Ok(decision) => decision,
-                Err(job) => return Turn::Blocked(job),
-            },
+            None => self.decide_reading(index, desc, base)?,
         };
         if let Fate::Conflict(conflict) = &decision.verdict {
             let ticker = match conflict.mine() {
@@ -434,7 +469,7 @@ impl RegolithEngine {
         } else {
             desc.decide(decision);
         }
-        Turn::Done
+        Ok(prev)
     }
 
     /// The decision of a write, a transaction or a counter reservation from
@@ -554,15 +589,22 @@ impl RegolithEngine {
         base: &After,
         decision: &mut Decision,
     ) -> io::Result<()> {
+        let ceiling = base.next_seq.saturating_sub(1);
         let run = || -> io::Result<(Fate, Option<Vec<WriteBatchOp>>)> {
+            // Every item clean at the horizon and nothing handed a sequence
+            // above it: the check above the horizon finds nothing, item by
+            // item (`RegolithEngine::validate`), so it needs no view. Appends
+            // are numbered against the view.
+            if txn.appends.is_empty() && txn.early.is_clean() && ceiling <= txn.early.horizon {
+                let fate = Fate::Commit {
+                    merges_commuted: 0,
+                    writes_elided: 0,
+                };
+                return Ok((fate, None));
+            }
+            hook::at(hook::Stage::Validate);
             let view = self.view.load();
-            let fate = match self.validate(
-                &txn.checks,
-                &txn.ops,
-                &txn.early,
-                &view,
-                base.next_seq.saturating_sub(1),
-            )? {
+            let fate = match self.validate(&txn.checks, &txn.ops, &txn.early, &view, ceiling)? {
                 Verdict::Conflict(conflict) => return Ok((Fate::Conflict(conflict), None)),
                 Verdict::Accept {
                     merges_commuted,
@@ -609,12 +651,27 @@ impl RegolithEngine {
     /// and pass the decided frontier over it (P1, P2). A decision computed
     /// from a state a rollback has since discarded lands nothing: its slot
     /// is failed instead (P4).
-    pub(super) fn settle(&self, pipe: &Pipeline, index: u64, desc: &RingArc<Descriptor>) {
-        let Some(decision) = desc.decision_arc() else {
+    ///
+    /// `seen` is a tip the caller read, used in place of a new load for as
+    /// long as it is still the tip: the slot holds it at the moment that is
+    /// checked, which is all a load would tell.
+    pub(super) fn settle(
+        &self,
+        pipe: &Pipeline,
+        index: u64,
+        desc: &RingArc<Descriptor>,
+        mut seen: Option<RingArc<Decision>>,
+    ) {
+        // Borrowed: `desc` holds its decision for as long as it lives. A
+        // reference of its own is taken only for the tip.
+        let Some(decision) = desc.decision() else {
             return;
         };
         loop {
-            let tip = pipe.tip.load();
+            let tip = match seen.take() {
+                Some(tip) if pipe.tip.holds(&tip) => tip,
+                _ => pipe.tip.load(),
+            };
             if tip.index >= decision.index {
                 // Another thread moved the tip here, or a rollback took the
                 // slot in.
@@ -638,11 +695,14 @@ impl RegolithEngine {
                 if !desc.is(APPLIED) {
                     hook::at(hook::Stage::Apply);
                     let _perf = PerfTimer::new(PerfTimerField::WriteMemtable);
-                    ops_of(desc, &decision).apply(&decision.after.memtable, decision.base_seq);
+                    ops_of(desc, decision).apply(&decision.after.memtable, decision.base_seq);
                     desc.mark(APPLIED);
                 }
             }
-            if pipe.tip.replace(&tip, RingArc::clone(&decision)) {
+            let Some(next) = desc.decision_arc() else {
+                break;
+            };
+            if pipe.tip.replace(&tip, next) {
                 // The tip that was: this may be its last reference, and its
                 // allocation then serves this thread's next decision.
                 spare::keep_decision(tip);
@@ -746,8 +806,14 @@ impl RegolithEngine {
 
     /// Publish every slot up to and including `limit`, in ring order,
     /// writing the records in the way (P3). Stops at the first slot that is
-    /// not publishable yet and says why.
-    pub(super) fn publish_upto(&self, pipe: &Pipeline, limit: u64) -> Progress {
+    /// not publishable yet and says why. `own` is the caller's installed
+    /// descriptor, if it has one: see [`Self::own_slot`].
+    pub(super) fn publish_upto(
+        &self,
+        pipe: &Pipeline,
+        limit: u64,
+        own: Option<&RingArc<Descriptor>>,
+    ) -> Progress {
         loop {
             if pipe.ring.is_frozen() {
                 return Progress::Failed;
@@ -760,48 +826,55 @@ impl RegolithEngine {
             if next > pipe.ring.decided() {
                 return Progress::Undecided;
             }
-            match pipe.ring.load(next) {
-                // As when deciding: a void slot, whose cell may have moved
-                // on (R6).
-                Loaded::Void | Loaded::Gone => {
-                    pipe.ring.pass_published(next);
+            let loaded;
+            let desc = match Self::own_slot(own, next) {
+                Some(desc) => desc,
+                None => match pipe.ring.load(next) {
+                    Loaded::Ready(desc) => {
+                        loaded = desc;
+                        &loaded
+                    }
+                    // As when deciding: a void slot, whose cell may have moved
+                    // on (R6).
+                    Loaded::Void | Loaded::Gone => {
+                        pipe.ring.pass_published(next);
+                        continue;
+                    }
+                    Loaded::Empty | Loaded::Full => return Progress::Undecided,
+                },
+            };
+            let Some(decision) = desc.decision() else {
+                return Progress::Undecided;
+            };
+            if !Self::publishable_slot(desc, decision) {
+                if decision.after.log.is_poisoned() {
+                    return Progress::Failed;
                 }
-                Loaded::Empty | Loaded::Full => return Progress::Undecided,
-                Loaded::Ready(desc) => {
-                    let Some(decision) = desc.decision() else {
-                        return Progress::Undecided;
-                    };
-                    if !Self::publishable_slot(&desc, decision) {
-                        if decision.after.log.is_poisoned() {
-                            return Progress::Failed;
-                        }
-                        if !desc.is(WRITTEN) {
-                            self.write_slot(&desc);
-                            if desc.is(WRITTEN) {
-                                continue;
-                            }
-                            // The write failed, or a rollback discarded the
-                            // slot under it.
-                            return Progress::Failed;
-                        }
-                        return Progress::NeedsSync;
+                if !desc.is(WRITTEN) {
+                    self.write_slot(desc);
+                    if desc.is(WRITTEN) {
+                        continue;
                     }
-                    hook::at(hook::Stage::Publish);
-                    // P3: the horizon first, then the frontier. A failed
-                    // slot took no sequence that still exists.
-                    if !desc.is(FAILED)
-                        && let Some(last) = decision.last_seq()
-                    {
-                        self.visible_seq.publish(last);
-                    }
-                    // Landed: visible, or holding nothing. Told before the
-                    // frontier passes, so a publisher that stops between
-                    // the two leaves the telling to the next one here.
-                    desc.land();
-                    if pipe.ring.pass_published(next) {
-                        pipe.ring.retire(next);
-                    }
+                    // The write failed, or a rollback discarded the slot
+                    // under it.
+                    return Progress::Failed;
                 }
+                return Progress::NeedsSync;
+            }
+            hook::at(hook::Stage::Publish);
+            // P3: the horizon first, then the frontier. A failed slot took no
+            // sequence that still exists.
+            if !desc.is(FAILED)
+                && let Some(last) = decision.last_seq()
+            {
+                self.visible_seq.publish(last);
+            }
+            // Landed: visible, or holding nothing. Told before the frontier
+            // passes, so a publisher that stops between the two leaves the
+            // telling to the next one here.
+            desc.land();
+            if pipe.ring.pass_published(next) {
+                pipe.ring.retire(next);
             }
         }
     }
@@ -845,11 +918,11 @@ impl RegolithEngine {
         desc: &RingArc<Descriptor>,
     ) -> Result<(), Arc<Job>> {
         loop {
-            if let Turn::Blocked(job) = self.help_decide(pipe, index, Help::Leave) {
+            if let Turn::Blocked(job) = self.help_decide(pipe, index, Help::Leave, Some(desc)) {
                 return Err(job);
             }
             self.write_slot(desc);
-            match self.publish_upto(pipe, index) {
+            match self.publish_upto(pipe, index, Some(desc)) {
                 Progress::Published => return Ok(()),
                 Progress::NeedsSync | Progress::Failed => self.sync_round(pipe, Help::Leave)?,
                 Progress::Undecided => {}
@@ -864,12 +937,12 @@ impl RegolithEngine {
     pub(super) fn drive(&self, pipe: &Pipeline, index: u64, desc: &RingArc<Descriptor>) {
         super::super::io::scope::waits("a commit that blocks until it is published");
         loop {
-            if let Turn::Blocked(job) = self.help_decide(pipe, index, Help::Wait) {
+            if let Turn::Blocked(job) = self.help_decide(pipe, index, Help::Wait, Some(desc)) {
                 self.run_or_wait(&job);
                 continue;
             }
             self.write_slot(desc);
-            match self.publish_upto(pipe, index) {
+            match self.publish_upto(pipe, index, Some(desc)) {
                 Progress::Published => return,
                 Progress::NeedsSync | Progress::Failed => {
                     // A blocking call gets past the round.
@@ -937,7 +1010,7 @@ impl RegolithEngine {
     /// until the pipeline discards it, and return what was decided for it.
     pub(super) fn commit_through_pipeline(&self, request: WriteRequest) -> io::Result<Settled> {
         let pipe = self.pipe()?;
-        let desc = spare::descriptor(Work::Request(request));
+        let desc = spare::descriptor(Work::Request(request), true);
         let index = self.enter(pipe, &desc);
         self.drive(pipe, index, &desc);
         let settled = Self::settled(self.statistics(), &desc);

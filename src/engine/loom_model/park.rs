@@ -13,8 +13,9 @@
 //! - a rollback parked for the writes in flight on a failed log, against
 //!   the last write to leave (`wal_gate`, WG1 and WG3);
 //! - a sync parked for a copy of a record still in flight, against the
-//!   copy's way out, and a copy counted in after the turn, against the
-//!   record written (`wal_gate`, WG4);
+//!   copy's way out, and a copy counted in after the turn, or after a sync
+//!   that found nothing in flight, against the record written (`wal_gate`,
+//!   WG4);
 //! - the wake of a parked job telling the queues registered on it, against
 //!   the thread that lands it (`io::job`, `Job::ready`);
 //! - that wake against the park itself: a wait that ends before the thread
@@ -482,6 +483,51 @@ pub fn a_sync_that_does_not_wait_has_a_copy_land_under_it() {
             written.store(true, Ordering::Release);
             // The bug: the sync begins without settling the gate.
             synced.store(true, Ordering::SeqCst);
+            let under_the_sync = copy.join().expect("the copy");
+            assert!(
+                !under_the_sync,
+                "a copy of the record landed under the sync"
+            );
+        },
+    );
+}
+
+/// Calibration for [`a_late_copy_never_lands_under_a_sync`], WG4 with no
+/// fence on the write's side: a sync that finds nothing in flight with a
+/// plain load of the side word, not a read-modify-write. The copy counts in
+/// and looks at the record, the sync marks the record written and looks at
+/// the sides; with nothing ordering the two loads after the two writes,
+/// each misses the other's, the sync begins with nothing to wait for, and
+/// the copy, which found the record unwritten, lands under it.
+pub fn a_sync_that_only_loads_the_sides_has_a_copy_land_under_it() {
+    explore_bounded(
+        "a_sync_that_only_loads_the_sides_has_a_copy_land_under_it",
+        Some(3),
+        1,
+        0,
+        |_| {
+            let sides = Arc::new(AtomicUsize::new(0));
+            let written = Arc::new(AtomicBool::new(false));
+            let synced = Arc::new(AtomicBool::new(false));
+            let copy = {
+                let (sides, written, synced) = (
+                    Arc::clone(&sides),
+                    Arc::clone(&written),
+                    Arc::clone(&synced),
+                );
+                thread::spawn(move || {
+                    // Counted in, with no fence after, as `Gate::enter` is.
+                    sides.fetch_add(1, Ordering::SeqCst);
+                    let under = !written.load(Ordering::Acquire) && synced.load(Ordering::SeqCst);
+                    sides.fetch_sub(1, Ordering::SeqCst);
+                    under
+                })
+            };
+            written.store(true, Ordering::Release);
+            // The bug: a load where `Gate::settle` makes a read-modify-write.
+            if sides.load(Ordering::SeqCst) == 0 {
+                synced.store(true, Ordering::SeqCst);
+            }
             let under_the_sync = copy.join().expect("the copy");
             assert!(
                 !under_the_sync,

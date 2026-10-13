@@ -911,9 +911,6 @@ pub struct Transaction {
     /// at commit, which is where the order the engine applies them in is
     /// restored.
     writes: TxnBuffer<Vec<u8>, Write>,
-    /// Range deletes buffered for commit. Not tracked in the
-    /// optimistic conflict set (initial impl limitation).
-    range_deletes: SegQueue<(Vec<u8>, Vec<u8>)>,
     /// The `append` calls, in the order they were made. Not part of `writes`:
     /// their positions do not exist until the commit orders them, so nothing
     /// in the transaction can read them. Allocated by the first `append`, and
@@ -953,10 +950,6 @@ pub struct Transaction {
     promoted_seq: AtomicU64,
     /// Savepoint stack: how much of each buffer the transaction held when each
     /// was set.
-    ///
-    /// `range_deletes` is not marked: it has no producer (`delete_range`
-    /// refuses every non-empty range), so a savepoint has nothing in it to
-    /// take back.
     savepoints: Vec<Savepoint>,
     /// What the caller registered to run when the transaction ends, the
     /// first four of each kind in place: no allocation for them.
@@ -1077,7 +1070,6 @@ impl Transaction {
             isolation,
             policy,
             writes: TxnBuffer::new(keys_inline),
-            range_deletes: SegQueue::new(),
             appends: OnceLock::new(),
             tracked: TxnBuffer::new(keys_inline),
             scan_runs: OnceLock::new(),
@@ -1950,7 +1942,6 @@ impl Transaction {
         // hands over the stored keys and values instead of cloning each
         // one. `settle` says what the drained writes commit as.
         let (writes, merges) = settle(self.writes.drain());
-        let range_deletes = drain(&self.range_deletes);
         let appends = self.appends.take().map_or_else(Vec::new, |mut buffer| {
             // Newest first out of the buffer; the commit wants the order made.
             let mut made = buffer.drain();
@@ -1965,11 +1956,8 @@ impl Transaction {
         // transaction qualifies: a pessimistic one validates as at
         // RepeatableRead, since its `get_for_update` reads past the snapshot
         // can see two points in time.
-        let write_free = self.projects()
-            && writes.is_empty()
-            && merges.is_empty()
-            && range_deletes.is_empty()
-            && appends.is_empty();
+        let write_free =
+            self.projects() && writes.is_empty() && merges.is_empty() && appends.is_empty();
         if write_free {
             checks
                 .reads
@@ -2020,7 +2008,9 @@ impl Transaction {
             commit: TxnCommit {
                 checks,
                 point_ops: writes,
-                range_deletes,
+                // `delete_range` refuses every non-empty range, so a
+                // transaction never carries one.
+                range_deletes: Vec::new(),
                 merges,
                 appends,
                 durability: self.durability,

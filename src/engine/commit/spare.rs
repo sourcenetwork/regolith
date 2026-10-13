@@ -63,18 +63,39 @@ mod shell {
             Ok((Self(shell), value))
         }
 
+        /// Drop the value of `arc` where it lies and keep its allocation,
+        /// when `arc` is the last reference; otherwise let `arc` go. What
+        /// [`Self::take`] does for a value nobody needs, with no copy of it
+        /// out of the allocation first: a descriptor or a decision is a few
+        /// hundred bytes.
+        pub(super) fn recycle(mut arc: Arc<T>) -> Option<Self> {
+            Arc::get_mut(&mut arc)?;
+            let raw = Arc::into_raw(arc).cast_mut();
+            // SAFETY (S2): as in `take`; from here on the allocation is only
+            // seen as uninitialized, so the shell never drops the value.
+            let shell = Self(unsafe { Arc::from_raw(raw.cast_const().cast::<MaybeUninit<T>>()) });
+            // SAFETY (S1): `get_mut` said this is the only reference, so no
+            // other thread reads the value, and it is dropped exactly once,
+            // here. A drop that unwinds leaves the shell to free the
+            // allocation, dropping nothing.
+            unsafe { ptr::drop_in_place(raw) };
+            Some(shell)
+        }
+
         /// Put `value` in the allocation and hand it out as an `Arc<T>`.
+        ///
+        /// No `Arc::get_mut` here: it would ask again, with a locked
+        /// instruction, what S1 already says.
         pub(super) fn fill(self, value: T) -> Arc<T> {
-            let mut arc = self.0;
-            match Arc::get_mut(&mut arc) {
-                Some(slot) => {
-                    slot.write(value);
-                    // SAFETY: the value was written on the line above.
-                    unsafe { arc.assume_init() }
-                }
-                // S1 makes this unreachable; a new allocation is always
-                // right.
-                None => Arc::new(value),
+            let raw = Arc::into_raw(self.0).cast_mut();
+            // SAFETY (S1): the shell's `Arc` is the only reference to the
+            // allocation, strong or weak, so nothing else reads or writes it
+            // while the value goes in. `raw` came from `Arc::into_raw`, and
+            // `T` has the layout of `MaybeUninit<T>`, so `Arc::from_raw`
+            // takes it back as an `Arc<T>` once the value is written.
+            unsafe {
+                (*raw).write(value);
+                Arc::from_raw(raw.cast_const().cast::<T>())
             }
         }
     }
@@ -117,11 +138,21 @@ mod kept {
         let _ = slot.try_with(|slot| slot.set(Some(shell)));
         Some(value)
     }
+
+    /// [`keep`] for a value nobody needs: dropped where it lies, and its
+    /// allocation kept when `arc` was the last reference.
+    pub(super) fn recycle<T>(slot: &'static LocalKey<Slot<T>>, arc: Arc<T>) {
+        if let Some(shell) = Shell::recycle(arc) {
+            // S3: a shell already there is freed by the `set`.
+            let _ = slot.try_with(|slot| slot.set(Some(shell)));
+        }
+    }
 }
 
 /// A descriptor for `work`, in a kept allocation when this thread has one.
-pub(super) fn descriptor(work: Work) -> RingArc<Descriptor> {
-    let desc = Descriptor::new(work);
+/// `blocking`: see [`Descriptor::is_blocking`].
+pub(super) fn descriptor(work: Work, blocking: bool) -> RingArc<Descriptor> {
+    let desc = Descriptor::new(work, blocking);
     #[cfg(not(loom))]
     {
         kept::make(&kept::DESCRIPTOR, desc)
@@ -136,7 +167,7 @@ pub(super) fn descriptor(work: Work) -> RingArc<Descriptor> {
 /// its allocation when nobody else holds it.
 pub(super) fn keep_descriptor(desc: RingArc<Descriptor>) {
     #[cfg(not(loom))]
-    drop(kept::keep(&kept::DESCRIPTOR, desc));
+    kept::recycle(&kept::DESCRIPTOR, desc);
     #[cfg(loom)]
     drop(desc);
 }
@@ -158,7 +189,7 @@ pub(super) fn decision(decision: Decision) -> RingArc<Decision> {
 /// past. Its allocation is kept when nobody else holds it.
 pub(super) fn keep_decision(decision: RingArc<Decision>) {
     #[cfg(not(loom))]
-    drop(kept::keep(&kept::DECISION, decision));
+    kept::recycle(&kept::DECISION, decision);
     #[cfg(loom)]
     drop(decision);
 }
@@ -244,6 +275,28 @@ mod tests {
         assert_eq!(again.1, 2);
         assert_eq!(Arc::as_ptr(&again) as usize, address, "the same allocation");
         assert_eq!(drops.load(Ordering::SeqCst), 1);
+        drop(again);
+        assert_eq!(drops.load(Ordering::SeqCst), 2, "each value dropped once");
+    }
+
+    #[test]
+    fn a_recycled_value_is_dropped_where_it_lies_and_its_allocation_serves_again() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let arc = Arc::new(Counted(Arc::clone(&drops), 1));
+        let address = Arc::as_ptr(&arc) as usize;
+        let shared = Arc::clone(&arc);
+        assert!(Shell::recycle(arc).is_none(), "a shared value was recycled");
+        assert_eq!(
+            drops.load(Ordering::SeqCst),
+            0,
+            "a shared value was dropped"
+        );
+        let Some(shell) = Shell::recycle(shared) else {
+            panic!("the last reference was not recycled");
+        };
+        assert_eq!(drops.load(Ordering::SeqCst), 1, "dropped once, in place");
+        let again = shell.fill(Counted(Arc::clone(&drops), 2));
+        assert_eq!(Arc::as_ptr(&again) as usize, address, "the same allocation");
         drop(again);
         assert_eq!(drops.load(Ordering::SeqCst), 2, "each value dropped once");
     }

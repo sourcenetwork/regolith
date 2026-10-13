@@ -352,7 +352,7 @@ impl RegolithEngine {
             engine: self.me.clone(),
             index: Arc::clone(&index),
         }));
-        let desc = Descriptor::new(Work::Unit { job, index, needs });
+        let desc = Descriptor::new(Work::Unit { job, index, needs }, false);
         desc.body.put(body);
         RingArc::new(desc)
     }
@@ -437,7 +437,7 @@ impl RegolithEngine {
             if let Some(result) = ticket.result.take() {
                 return Some(result);
             }
-            match self.help_decide(pipe, index, help) {
+            match self.help_decide(pipe, index, help, None) {
                 Turn::Blocked(job) => match help {
                     Help::Wait => self.run_or_wait(&job),
                     Help::Leave | Help::Park(_) => return None,
@@ -446,7 +446,7 @@ impl RegolithEngine {
                     // Every slot before the unit is published, and the unit
                     // takes nothing: the frontier passes it here, so the
                     // unit leaves nothing in the ring.
-                    let _ = self.publish_upto(pipe, index);
+                    let _ = self.publish_upto(pipe, index, None);
                     return Some(ticket.result.take().unwrap_or_else(|| Err(unfinished())));
                 }
             }
@@ -486,7 +486,7 @@ impl RegolithEngine {
         desc.decide(Decision::new(index, Fate::Unit, ord.state));
         // The state the body left is the tip before the round is let go:
         // a rollback, which needs the round, then starts from it.
-        self.settle(pipe, index, &desc);
+        self.settle(pipe, index, &desc, None);
         self.unkeep(kept);
         drop(held);
         true
@@ -498,7 +498,7 @@ impl RegolithEngine {
     /// caller waits for; a poll parks, and `false` says so.
     fn drain_before(&self, pipe: &Pipeline, index: u64, help: Help<'_>) -> bool {
         loop {
-            match self.publish_upto(pipe, index - 1) {
+            match self.publish_upto(pipe, index - 1, None) {
                 Progress::Published => return true,
                 Progress::NeedsSync | Progress::Failed => {
                     if self.sync_round(pipe, help).is_err() {
@@ -506,7 +506,7 @@ impl RegolithEngine {
                     }
                 }
                 Progress::Undecided => {
-                    if let Turn::Blocked(job) = self.help_decide(pipe, index - 1, help) {
+                    if let Turn::Blocked(job) = self.help_decide(pipe, index - 1, help, None) {
                         if !matches!(help, Help::Wait) {
                             return false;
                         }

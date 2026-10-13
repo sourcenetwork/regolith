@@ -26,7 +26,7 @@
 use core::marker::PhantomData;
 use core::ptr;
 
-use crate::sync::internal::{AtomicPtr, Ordering};
+use crate::sync::internal::{AtomicPtr, Ordering, take_ptr};
 
 /// The inbox's owner is asleep and waits for the next push to wake it.
 pub(crate) const IDLE: usize = 0b01;
@@ -207,7 +207,9 @@ impl<T> Stack<T> {
 
 impl<T> Drop for Stack<T> {
     fn drop(&mut self) {
-        drop(self.take(0));
+        // SAFETY: `&mut self` means no other thread can push or take, so
+        // every node on the list is this call's.
+        drop(unsafe { Taken::oldest_first(split(take_ptr(&mut self.head)).0) });
     }
 }
 

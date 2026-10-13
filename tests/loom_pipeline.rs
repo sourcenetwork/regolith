@@ -15,7 +15,11 @@
 //!   is installed into its cell; the new descriptor is never taken for the
 //!   old one.
 //! - **The pin**: a descriptor, or the pipeline's state, loaded while it is
-//!   retired or replaced is alive.
+//!   retired or replaced is alive, and one loaded while it is installed is
+//!   the one installed.
+//! - **The drop at the swap**: a replaced tip is dropped at once when no
+//!   load is counted in, and waits on the list otherwise; no value is
+//!   dropped while loaded or dropped twice.
 //! - **Decide with helping**: two threads decide the same two slots at
 //!   once; each slot gets one decision and the sequences are dense.
 //! - **The watermark claim**: two commits need the log durable; one claims
@@ -70,6 +74,17 @@ fn a_cleaner_that_takes_an_install_under_way_empties_a_ready_cell() {
 }
 
 #[test]
+fn a_descriptor_loaded_while_it_is_installed_is_the_one_installed() {
+    pipeline::a_descriptor_loaded_while_it_is_installed_is_the_one_installed();
+}
+
+#[test]
+#[should_panic(expected = "a loader found the slot READY and its cell empty")]
+fn a_stamp_that_does_not_release_the_pointer_shows_an_empty_ready_cell() {
+    pipeline::a_stamp_that_does_not_release_the_pointer_shows_an_empty_ready_cell();
+}
+
+#[test]
 fn a_descriptor_loaded_while_its_slot_is_retired_is_alive() {
     pipeline::a_descriptor_loaded_while_its_slot_is_retired_is_alive();
 }
@@ -83,6 +98,17 @@ fn a_loader_that_does_not_pin_reads_a_dropped_descriptor() {
 #[test]
 fn a_tip_loaded_while_it_is_replaced_is_alive() {
     pipeline::a_tip_loaded_while_it_is_replaced_is_alive();
+}
+
+#[test]
+fn a_tip_replaced_twice_while_loaded_drops_each_value_once() {
+    pipeline::a_tip_replaced_twice_while_loaded_drops_each_value_once();
+}
+
+#[test]
+#[should_panic(expected = "a loader holds a tip that was already dropped")]
+fn a_replace_that_reads_the_pins_before_its_swap_drops_a_loaded_tip() {
+    pipeline::a_replace_that_reads_the_pins_before_its_swap_drops_a_loaded_tip();
 }
 
 #[test]
@@ -190,6 +216,12 @@ fn a_copy_that_does_not_look_again_lands_under_the_sync() {
 #[should_panic(expected = "a copy of the record landed under the sync")]
 fn a_sync_that_does_not_wait_has_a_copy_land_under_it() {
     park::a_sync_that_does_not_wait_has_a_copy_land_under_it();
+}
+
+#[test]
+#[should_panic(expected = "a copy of the record landed under the sync")]
+fn a_sync_that_only_loads_the_sides_has_a_copy_land_under_it() {
+    park::a_sync_that_only_loads_the_sides_has_a_copy_land_under_it();
 }
 
 #[test]

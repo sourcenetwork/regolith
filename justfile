@@ -863,6 +863,7 @@ tla:
     check MC_CommitPipeline_Red_RollbackForgets_Ack         RED NoFalseAck
     check MC_CommitPipeline_Red_NoFreeze                    RED NoHole
     check MC_CommitPipeline_Red_TrustEarly                  RED NoLostUpdate
+    check MC_CommitPipeline_Red_SkipOnPublished             RED NoLostUpdate
     check MC_CommitPipeline_Red_PublishBeforeSync           RED DurableBeforeVisible
     check MC_CommitPipeline_Red_DecideAnyOrder              RED DecidedIsPrefix
     check MC_CommitPipeline_Red_DecideAnyOrder_Order        RED SeqInRingOrder

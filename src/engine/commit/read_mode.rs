@@ -51,7 +51,7 @@ impl DecideSlot {
         let Some(pipe) = engine.pipeline.as_ref() else {
             return true;
         };
-        while let Turn::Blocked(job) = engine.help_decide(pipe, self.index, help) {
+        while let Turn::Blocked(job) = engine.help_decide(pipe, self.index, help, None) {
             if !matches!(help, Help::Wait) {
                 return false;
             }

@@ -83,6 +83,11 @@ impl Early {
     pub(crate) fn mark(&self, at: usize) -> Mark {
         self.marks.get(at).copied().unwrap_or(Mark::Clean)
     }
+
+    /// Whether every item is [`Mark::Clean`].
+    pub(crate) fn is_clean(&self) -> bool {
+        self.marks.is_empty()
+    }
 }
 
 /// The early check's answer: a conflict found at the horizon, or the marks

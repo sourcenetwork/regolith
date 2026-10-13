@@ -9,6 +9,10 @@ pub(crate) enum Stage {
     Reserve,
     /// Before a slot's decision is computed.
     Decide,
+    /// Before a transaction's slot is checked against the view, above the
+    /// horizon of its early check. A slot nothing was decided above skips
+    /// it.
+    Validate,
     /// Before a decided slot is applied.
     Apply,
     /// Before a slot's record is written.

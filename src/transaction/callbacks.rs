@@ -278,7 +278,10 @@ struct Queues {
 /// `Queues::on_abort`.)
 #[derive(Default)]
 pub(crate) struct Callbacks {
-    queues: Exclusive<Queues>,
+    /// In place, with no allocation, but only once something is registered:
+    /// a transaction with none writes no empty queues when it begins and
+    /// reads none when it is dropped.
+    queues: Exclusive<Option<Queues>>,
     /// Whether anything was registered since the queues were last taken: the
     /// one check a transaction with no callbacks pays at each point.
     registered: bool,
@@ -290,15 +293,21 @@ pub(crate) struct Callbacks {
 impl Callbacks {
     fn queues(&mut self) -> &mut Queues {
         self.registered = true;
-        self.queues.get_mut()
+        self.queues.get_mut().get_or_insert_with(Queues::default)
     }
 
     fn existing(&mut self) -> Option<&mut Queues> {
-        self.registered.then(|| self.queues.get_mut())
+        if !self.registered {
+            return None;
+        }
+        self.queues.get_mut().as_mut()
     }
 
     fn take(&mut self) -> Option<Queues> {
-        std::mem::take(&mut self.registered).then(|| std::mem::take(self.queues.get_mut()))
+        if !std::mem::take(&mut self.registered) {
+            return None;
+        }
+        self.queues.get_mut().take()
     }
 }
 

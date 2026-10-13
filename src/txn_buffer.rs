@@ -103,8 +103,11 @@ pub(crate) struct TxnBuffer<K: 'static, V: 'static> {
     /// hold `&mut self`.
     removed: u64,
     /// An index over the list, built once it grows past `spill_at`.
-    /// Values are pointers into the list rather than copies of it.
-    spill: OnceLock<ConcurrentMap<K, NodeRef<K, V>>>,
+    /// Values are pointers into the list rather than copies of it. Boxed: a
+    /// map is a few hundred bytes of cache-padded fields, and a buffer that
+    /// never grows that far (most do not) would otherwise carry them, in
+    /// every transaction that is built, moved and dropped.
+    spill: OnceLock<Box<ConcurrentMap<K, NodeRef<K, V>>>>,
     /// Entries buffered before the index is built. `0` never indexes.
     spill_at: usize,
     /// Set once `spill` is published. An insert reads it after its push and
@@ -374,9 +377,9 @@ where
     /// Create the index and open it to inserts. `None` when another thread
     /// already did, and is seeding it.
     fn publish(&self) -> Option<&ConcurrentMap<K, NodeRef<K, V>>> {
-        self.spill.set(ConcurrentMap::new()).ok()?;
+        self.spill.set(Box::new(ConcurrentMap::new())).ok()?;
         self.spill_published.store(true, Ordering::SeqCst);
-        self.spill.get()
+        self.spill.get().map(|spill| &**spill)
     }
 
     /// Link every node already listed into `spill`, newest first, then let
@@ -543,7 +546,8 @@ where
 
 impl<K: 'static, V: 'static> Drop for TxnBuffer<K, V> {
     fn drop(&mut self) {
-        let mut cursor = self.head.swap(core::ptr::null_mut(), Ordering::AcqRel);
+        // `&mut self`: a plain read, not a locked exchange.
+        let mut cursor = core::mem::replace(self.head.get_mut(), core::ptr::null_mut());
         while !cursor.is_null() {
             // SAFETY: `&mut self` means no reader can be walking the
             // list, and each node was allocated by `Box::into_raw`.
