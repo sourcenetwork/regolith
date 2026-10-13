@@ -1,8 +1,9 @@
 //! The commit path: how a write or a transaction's commit becomes durable,
 //! applied and visible.
 //!
-//! Every commit goes through the lock-free pipeline (`pipeline.rs`, plan
-//! 4.7): it takes a slot of the commit ring with one atomic add, and from
+//! Every commit that writes goes through the lock-free pipeline
+//! (`pipeline.rs`, plan 4.7): it takes a slot of the commit ring with one
+//! atomic add, and from
 //! there whichever thread reaches the slot decides it, applies it, writes
 //! its record, syncs the log and publishes it. A committer helps every
 //! commit ahead of its own and never waits for another thread to be
@@ -21,6 +22,10 @@
 //! or the step, as above, and a commit for a write stall to clear), `close`
 //! (for the commits and the background work in flight), and
 //! `wait_for_snapshots` (for the last snapshot to be released).
+//!
+//! A transaction that writes nothing takes no slot at any level: its commit
+//! is checked at the published horizon on the committing thread
+//! (`RegolithEngine::commit_write_free`, plan 3.8, E50).
 //!
 //! An optimistic transaction's commit is a slot like any write (E10). It is
 //! decided in ring order against the view, which by then holds every commit

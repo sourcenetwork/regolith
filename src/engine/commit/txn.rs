@@ -1,6 +1,7 @@
 //! An optimistic transaction as a slot of the commit ring (E10).
 //!
-//! A transaction's commit takes a slot of the ring plain writes use, so it
+//! A transaction's commit that writes takes a slot of the ring plain writes
+//! use (one that writes nothing does not: `commit_write_free`), so it
 //! shares their sync rounds. Its slot is decided in ring order by whichever
 //! thread reaches it: the commit is validated against the view, which by
 //! then holds the writes of every slot decided before it, and only a commit
