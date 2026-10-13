@@ -1086,5 +1086,58 @@ theorem without_patience_waits_for_a_wake (n k : Nat) :
     -- One own step leaves it parked, then the rest by induction.
     simpa [List.replicate, execNoPatience, ownNoPatience] using ih
 
+/-! ## Shortcuts that keep the bound
+
+Two steps of the code end a wait sooner than the machine above allows, and
+neither adds a step the thread needs.
+
+A record nobody is encoding: its owner has not begun, or stopped before it
+began. The thread that needs it claims the encoding and encodes it itself
+instead of parking (`write_unit.rs`, `RegolithEngine::fill`; the TLA+
+`EncodeStart`): its spin ends straight in a write of its own.
+
+A thread far from its turn (`pipeline.rs`, P6) parks on its own slot until
+its turn nears: a finished commit tells it (NEAR), its slot lands or fails,
+or `TURN_PATIENCE` runs out. That is this same machine, with `written` read
+as "awake and helping again": a wake is `woken`, a slice of
+`TURN_PATIENCE` is a slice of patience, and running out wakes it, which is
+one step more than it needs. -/
+
+/-- The waiting thread's own step when it may encode the record itself:
+from the spin straight to writing it, otherwise as before. -/
+def ownEncoding (patience : Nat) : Waiting → Waiting
+  -- The spin ends in a write of its own: nobody is encoding the record.
+  | .spinning => .copying
+  -- Any other place: the step it took before.
+  | w => own patience w
+
+/-- **Encoding it itself never adds a step.** A thread that encodes the
+record nobody is encoding needs no more of its own steps than one that
+parks: the bound of `a_park_is_bounded` still holds. -/
+theorem encoding_never_adds (p : Nat) (w : Waiting) :
+    -- The claim itself; its proof follows.
+    stepsLeft p (ownEncoding p w) ≤ stepsLeft p w := by
+  -- Look at where the thread stands.
+  cases w with
+  -- Spinning: one step to write, against the whole patience.
+  | spinning => simp [ownEncoding, stepsLeft]
+  -- Any other place: the step it took before, which never adds.
+  | parked n => exact own_never_adds p (.parked n)
+  -- (Copying: the same.)
+  | copying => exact own_never_adds p .copying
+  -- (Written: the same.)
+  | written => exact own_never_adds p .written
+
+/-- **A park far from the turn is bounded.** A thread parked far from its
+turn with `n` slices of its patience left is awake and helping once it has
+taken `n + 2` of its own steps, however the other threads' steps fall,
+whether or not any of them tells it. With `helping_is_bounded`, the slots
+before its own are then finished within a bounded number of steps. -/
+theorem a_turn_park_is_bounded (p n : Nat) (s : List Bool)
+    -- The schedule holds at least `n + 2` of its own steps.
+    (h : n + 2 ≤ ownSteps s) : exec p s (.parked n) = .written :=
+  -- The park bound, with what a parked thread needs read off the table.
+  a_park_is_bounded p s (.parked n) (by simpa [stepsLeft] using h)
+
 -- The end of this file's names.
 end Regolith.PipelineHelping
