@@ -398,6 +398,42 @@ struct StdLogFile {
     writeback: super::deferred_error::DeferredError,
 }
 
+#[cfg(all(any(unix, target_os = "wasi"), not(miri)))]
+impl StdLogFile {
+    /// One vectored positional write: how many bytes it took.
+    #[cfg(target_os = "linux")]
+    fn pwritev(&self, offset: u64, bufs: &[std::io::IoSlice<'_>]) -> io::Result<usize> {
+        use std::os::fd::AsRawFd;
+        let offset = i64::try_from(offset).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "a log offset past what the host can address",
+            )
+        })?;
+        // At most what one call takes; the caller writes the rest after.
+        let count = bufs.len().min(1024);
+        // SAFETY: `IoSlice` is ABI-compatible with `iovec` on Unix, and the
+        // `count` slices it points at are borrowed for the call, which only
+        // reads them. The descriptor is this handle's own and stays open.
+        #[allow(unsafe_code)]
+        let wrote = unsafe {
+            libc::pwritev(
+                self.file.as_raw_fd(),
+                bufs.as_ptr().cast::<libc::iovec>(),
+                count as libc::c_int,
+                offset,
+            )
+        };
+        usize::try_from(wrote).map_err(|_| io::Error::last_os_error())
+    }
+
+    /// One vectored positional write: how many bytes it took.
+    #[cfg(not(target_os = "linux"))]
+    fn pwritev(&self, offset: u64, bufs: &[std::io::IoSlice<'_>]) -> io::Result<usize> {
+        rustix::io::pwritev(&self.file, bufs, offset).map_err(io::Error::from)
+    }
+}
+
 #[cfg(any(unix, windows, target_os = "wasi"))]
 impl LogFile for StdLogFile {
     // Through `std`, which calls the C library's `pwrite`: the fault shim
@@ -424,6 +460,49 @@ impl LogFile for StdLogFile {
                 Ok(n) => {
                     buf = &buf[n..];
                     offset += n as u64;
+                }
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    }
+
+    // One `pwritev` for the run of records the log's write unit gathered,
+    // re-issued for what a short write left. On Linux through the C
+    // library's `pwritev`, as `write_all_at` goes through its `pwrite`, so
+    // the fault shim the power-loss tests preload sees every log write. Miri
+    // cannot call into the C library, and takes the default.
+    #[cfg(all(any(unix, target_os = "wasi"), not(miri)))]
+    fn write_all_vectored_at(
+        &self,
+        mut offset: u64,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> io::Result<()> {
+        // The slices the call is handed are the caller's; a short write
+        // advances a copy of the list, which stays on the stack for a run of
+        // up to `INLINE` records and takes one allocation past that.
+        const INLINE: usize = 64;
+        let mut inline = [std::io::IoSlice::new(&[]); INLINE];
+        let mut heap = Vec::new();
+        let mut rest: &mut [std::io::IoSlice<'_>] = if bufs.len() <= INLINE {
+            inline[..bufs.len()].copy_from_slice(bufs);
+            &mut inline[..bufs.len()]
+        } else {
+            heap.extend_from_slice(bufs);
+            &mut heap[..]
+        };
+        while !rest.is_empty() {
+            match self.pwritev(offset, rest) {
+                Ok(0) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "a positional write made no progress",
+                    ));
+                }
+                Ok(n) => {
+                    offset += n as u64;
+                    std::io::IoSlice::advance_slices(&mut rest, n);
                 }
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
                 Err(e) => return Err(e),

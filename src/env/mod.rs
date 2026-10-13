@@ -448,6 +448,27 @@ pub trait LogFile: Send + Sync {
     /// Write every byte of `buf` at `offset`, extending the file as needed.
     fn write_all_at(&self, offset: u64, buf: &[u8]) -> io::Result<()>;
 
+    /// Write every byte of `bufs` at `offset`, one buffer right after the
+    /// other, extending the file as needed: several whole records the log
+    /// writes with one call. The contract is [`write_all_at`]'s for the
+    /// concatenated bytes; an error may leave any part of them written.
+    ///
+    /// The default writes each buffer in turn with
+    /// [`write_all_at`](LogFile::write_all_at). An implementation that has
+    /// a vectored positional write (`pwritev`) should use it: the log then
+    /// takes one call, and on most filesystems one turn of the file's lock,
+    /// for many records.
+    ///
+    /// [`write_all_at`]: LogFile::write_all_at
+    fn write_all_vectored_at(&self, offset: u64, bufs: &[io::IoSlice<'_>]) -> io::Result<()> {
+        let mut at = offset;
+        for buf in bufs {
+            self.write_all_at(at, buf)?;
+            at += buf.len() as u64;
+        }
+        Ok(())
+    }
+
     /// Make the contiguous written prefix durable, data only (`fdatasync`),
     /// as [`WriteFile::sync_data`] does.
     ///
