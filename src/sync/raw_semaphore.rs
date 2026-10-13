@@ -62,23 +62,38 @@ impl RawSemaphore {
         self.try_take(n).is_ok()
     }
 
-    /// One permit, attempted inline: a load of the word, then, when a
-    /// permit is free and no handoff is owed, one compare-and-swap from the
-    /// state loaded to one permit fewer. The swap expects exactly what the
-    /// load saw, queue bits included, so it is `Lock::try_take` for one
-    /// permit made in place, with the window between the load and the swap
-    /// as short as the caller's code allows. On failure, the state it saw,
-    /// for the out-of-line path to start from.
+    /// One permit, attempted inline: a load of the word, then one
+    /// compare-and-swap. When the load finds the free state of a
+    /// [`Mutex`](super::Mutex) (one permit, every queue bit down) the swap
+    /// expects that constant, so it does not wait on arithmetic over the
+    /// loaded value; otherwise, when a permit is free and no handoff is
+    /// owed, it swaps from exactly the state loaded to one permit fewer.
+    /// Either way it is `Lock::try_take` for one permit made in place, with
+    /// the window between the load and the swap as short as the caller's
+    /// code allows. On failure, the state it saw, for the out-of-line path
+    /// to start from.
     ///
-    /// Measured with `benches/sync.rs` against a swap that expects the idle
-    /// word only and leaves every other state to the out-of-line path:
-    /// equal uncontended, and 10 to 25% more throughput at 8 and 32 tasks,
-    /// where a free lock with waiters queued is common and the longer
-    /// window let the line go to another core between the load and the swap.
+    /// Measured with `benches/sync.rs` (E48), against three other shapes:
+    /// a swap from the loaded state only (2 cycles slower uncontended, the
+    /// same contended); a swap that expects the free state only and leaves
+    /// every other state to the out-of-line path (10 to 25% less throughput
+    /// at 8 and 32 tasks, where a free lock with waiters queued is common
+    /// and the longer window let the line go between the load and the swap);
+    /// and a swap with no load first (7 to 9 cycles faster uncontended, as
+    /// fast as `std::sync::Mutex`, but 20 to 30% less throughput at 8 and 32
+    /// tasks: a swap bound to fail takes the line from the holder, and it
+    /// fails whenever a queue bit is up, though the lock may be free). The
+    /// load is what this costs uncontended: it cannot complete before the
+    /// previous release's locked add.
     #[inline]
     pub(super) fn take_one(&self) -> Result<(), usize> {
         let state = &self.queue.state;
         let seen = state.load(Ordering::Relaxed);
+        if seen == ONE {
+            return state
+                .compare_exchange(ONE, 0, Ordering::Acquire, Ordering::Relaxed)
+                .map(drop);
+        }
         if seen >= ONE && seen & HANDOFF == 0 {
             state
                 .compare_exchange(seen, seen - ONE, Ordering::Acquire, Ordering::Relaxed)
