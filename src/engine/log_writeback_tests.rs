@@ -112,8 +112,8 @@ fn the_default_options_start_no_lane() {
     );
 }
 
-/// Asked for, the lane is exactly one thread more, named for it, on Linux
-/// with a worker; with no worker it is not started.
+/// Asked for, the lane is exactly one thread more, named for it, on Linux or
+/// Apple with a worker; with no worker it is not started.
 #[test]
 fn the_option_starts_exactly_one_lane_with_a_worker() {
     let lanes = |spawned: &[String]| {
@@ -127,7 +127,11 @@ fn the_option_starts_exactly_one_lane_with_a_worker() {
             .max_background_compactions(1)
             .log_writeback(true),
     );
-    assert_eq!(lanes(&on), usize::from(cfg!(target_os = "linux")), "{on:?}");
+    assert_eq!(
+        lanes(&on),
+        usize::from(cfg!(any(target_os = "linux", target_vendor = "apple"))),
+        "{on:?}"
+    );
     let off = spawned_by(Options::default().max_background_compactions(1));
     assert_eq!(on.len(), off.len() + lanes(&on), "{on:?} against {off:?}");
     let no_worker = spawned_by(
@@ -141,7 +145,7 @@ fn the_option_starts_exactly_one_lane_with_a_worker() {
 /// With the option on and a worker, the lane hands the active log to the
 /// host's writeback a multiple of an eighth of the write buffer at a time,
 /// and never more than the records written.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_vendor = "apple"))]
 #[test]
 fn a_database_with_the_lane_hands_its_log_over_as_it_fills() {
     let dir = TempDir::new().unwrap();

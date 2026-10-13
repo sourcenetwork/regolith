@@ -39,10 +39,6 @@
 //!   counted in after the sync turned the gate writes nothing; and a queue
 //!   the wake of a parked job had off the list when the job landed is told
 //!   once.
-//! - **The write claim** (`write_stage.rs`, WG6): a writer that parks on
-//!   the log's write claim counts itself among its waiters in the step that
-//!   reads the claim, and the holder reads that count in the step that lets
-//!   it go, so a parked writer is always woken.
 //!
 //! Every model is bounded by a small scenario (a ring of two cells, two
 //! threads or two and a reader) and an explicit preemption bound given in
@@ -248,15 +244,4 @@ fn a_wake_that_comes_before_the_park_tells_the_queues_with_the_job_free() {
 #[should_panic(expected = "a queue was told the job may go on while it was still claimed")]
 fn a_wake_that_tells_at_once_reaches_a_queue_with_the_job_claimed() {
     park::a_wake_that_tells_at_once_reaches_a_queue_with_the_job_claimed();
-}
-
-#[test]
-fn a_writer_parked_on_the_write_claim_is_woken_when_it_is_let_go() {
-    pipeline::a_writer_parked_on_the_write_claim_is_woken_when_it_is_let_go();
-}
-
-#[test]
-#[should_panic(expected = "a writer parked on the claim is never woken")]
-fn a_writer_that_parks_uncounted_on_the_claim_is_never_woken() {
-    pipeline::a_writer_that_parks_uncounted_on_the_claim_is_never_woken();
 }

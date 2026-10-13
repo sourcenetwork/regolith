@@ -447,18 +447,21 @@ impl Options {
     /// whole write buffer's worth of log stalls every writer. With this on,
     /// each time the log grows by an eighth of [`Options::write_buffer_size`]
     /// (at least 1 MiB) the thread starts the writeback of what was written,
-    /// and the rotation syncs about that eighth. Measured on one machine
-    /// (NVMe, btrfs with compression, 32 MiB write buffer): the rotation's
-    /// stall went from about 14 to 24 ms to about 2.5 ms. Durability is
-    /// unchanged: the writeback makes nothing durable, the sync at the
-    /// rotation still does.
+    /// and the rotation syncs about that eighth. On Linux the writeback is
+    /// started with `sync_file_range`. On Apple, where the rotation's sync is
+    /// `F_FULLFSYNC` (the pages and the drive's cache), it is a plain `fsync`,
+    /// which writes the pages without the cache flush; an error it gets is
+    /// reported by the log's next sync. Measured on one Linux machine (NVMe,
+    /// btrfs with compression, 32 MiB write buffer): the rotation's stall
+    /// went from about 14 to 24 ms to about 2.5 ms. Not measured on Apple.
+    /// Durability is unchanged: the writeback makes nothing durable, the
+    /// sync at the rotation still does.
     ///
     /// It starts one extra thread, named `regolith-log-writeback`, through
-    /// [`Options::env`], and only on Linux, which has the writeback hint
-    /// (`sync_file_range`), and only when a compaction worker runs
-    /// ([`Options::max_background_compactions`] above `0`). The database's
-    /// thread budget then grows by one. Elsewhere it is accepted and does
-    /// nothing.
+    /// [`Options::env`], only on Linux and Apple targets, and only when a
+    /// compaction worker runs ([`Options::max_background_compactions`] above
+    /// `0`). The database's thread budget then grows by one. Elsewhere it is
+    /// accepted and does nothing.
     #[must_use]
     pub fn log_writeback(mut self, log_writeback: bool) -> Self {
         self.log_writeback = log_writeback;
