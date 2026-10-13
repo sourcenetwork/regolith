@@ -435,6 +435,31 @@ impl LogFile for StdLogFile {
     fn len(&self) -> io::Result<u64> {
         Ok(self.file.metadata()?.len())
     }
+
+    // `sync_file_range` with `SYNC_FILE_RANGE_WRITE` alone starts the
+    // writeback of the range's dirty pages and waits for none of it. It does
+    // not move the file's writeback error past this handle, so `fdatasync`
+    // still reports a page that failed; a writeback it could not start leaves
+    // the pages dirty for that sync. So its result is not needed. Miri cannot
+    // call into the C library.
+    #[cfg(all(target_os = "linux", not(miri)))]
+    fn start_writeback(&self, offset: u64, len: u64) {
+        use std::os::fd::AsRawFd;
+        let (Ok(offset), Ok(len)) = (i64::try_from(offset), i64::try_from(len)) else {
+            return;
+        };
+        // SAFETY: the descriptor is this handle's own and stays open for the
+        // call, which reads and writes no memory of this process.
+        #[allow(unsafe_code)]
+        let _ = unsafe {
+            libc::sync_file_range(
+                self.file.as_raw_fd(),
+                offset,
+                len,
+                libc::SYNC_FILE_RANGE_WRITE,
+            )
+        };
+    }
 }
 
 struct StdJoinHandle(std::thread::JoinHandle<()>);

@@ -191,28 +191,81 @@ impl Ordered<'_> {
 
     /// Move the active memtable to the frozen list behind a fresh one and a
     /// fresh log, and return it. `check` refuses on a database that is not
-    /// writable; a drain for close passes `false`.
+    /// writable.
     pub(crate) fn seal(&mut self, check: bool) -> io::Result<Arc<MemTable>> {
         if check {
             self.engine.ensure_writable()?;
         }
         // Everything fallible happens before the publication, so a rotation
         // that fails leaves the view as it was.
-        let engine = self.engine;
-        let fresh = Arc::new(MemTable::new(&engine.memtable_config)?);
-        let new_wal_id = engine.versions.take_file_id()?;
-        // Recovery takes the newest log by the id in its file name
-        // (`wal_scan::live`) and tolerates a torn tail only there, so a log
-        // has to be complete on disk before any newer file exists, an empty
-        // one included: sync it, then create the next one.
-        self.sync_log()?;
-        let log = Arc::new(Log::create_in(
-            &engine.env,
-            &engine.wal_dir.join(wal_filename(new_wal_id)),
-            engine.options.keyring.as_deref(),
-        )?);
-        log.start_epoch(self.state.epoch);
+        let fresh = Arc::new(MemTable::new(&self.engine.memtable_config)?);
+        let (id, log) = self.next_log()?;
+        let sealed = self.freeze(fresh);
+        self.install_log(id, log);
+        Ok(sealed)
+    }
 
+    /// Seal the active memtable for close without a fresh log: the log it
+    /// was written to stays the newest, unsynced, and the database takes no
+    /// commit from here on. What a close's drain does (E46).
+    ///
+    /// Recovery tolerates a torn tail in the newest log, so this log needs
+    /// no sync while it is the newest. The memtable's flush records, in the
+    /// same synced manifest batch as its table, that recovery skips this
+    /// log, and only then removes it; [`Self::close_log`] creates the next
+    /// log after that. The pages the log still had dirty are dropped with
+    /// it, never written. A close that fails before the flush calls
+    /// [`Self::reopen_log`], which syncs this log before any newer one
+    /// exists, as [`Self::seal`] does (`proofs/tla/WalRecovery.tla`,
+    /// `SealInPlace`, RED `NewLogBeforeFlush`).
+    pub(crate) fn seal_in_place(&mut self) -> io::Result<Arc<MemTable>> {
+        let fresh = Arc::new(MemTable::new(&self.engine.memtable_config)?);
+        let sealed = self.freeze(fresh);
+        self.state.closed = true;
+        Ok(sealed)
+    }
+
+    /// Sync the active log and create the one after it, without putting
+    /// it in place: the fallible half of a rotation.
+    ///
+    /// Recovery takes the newest log by the id in its file name
+    /// (`wal_scan::live`) and tolerates a torn tail only there, so a log
+    /// has to be complete on disk before any newer file exists, an empty
+    /// one included: sync it, then create the next one (E2).
+    fn next_log(&mut self) -> io::Result<(u64, Arc<Log>)> {
+        self.sync_log()?;
+        self.create_log()
+    }
+
+    /// Create the log after the active one, named by a fresh file id.
+    fn create_log(&self) -> io::Result<(u64, Arc<Log>)> {
+        let engine = self.engine;
+        let id = engine.versions.take_file_id()?;
+        let log = Arc::new(
+            Log::create_in(
+                &engine.env,
+                &engine.wal_dir.join(wal_filename(id)),
+                engine.options.keyring.as_deref(),
+            )?
+            .with_early_writeback(engine.early_writeback()),
+        );
+        log.start_epoch(self.state.epoch);
+        Ok((id, log))
+    }
+
+    /// Put `log`, created by [`Self::create_log`] under `id`, in place of
+    /// the active log.
+    fn install_log(&mut self, id: u64, log: Arc<Log>) {
+        self.engine
+            .wal_id
+            .store(id, std::sync::atomic::Ordering::Release);
+        self.state.next_off = log.stamp_len();
+        self.state.log = log;
+    }
+
+    /// Move the active memtable to the frozen list behind `fresh`, and
+    /// return it: the publication half of a seal, which cannot fail.
+    fn freeze(&mut self, fresh: Arc<MemTable>) -> Arc<MemTable> {
         // Stamped before it is published as frozen: from then on a flush on
         // another thread may take it, and the flush reads both stamps. The
         // ordered step is held, so no write enters it after this.
@@ -225,21 +278,16 @@ impl Ordered<'_> {
 
         // One publication: the sealed memtable joins `frozen` in the same
         // view that hands writers the fresh active one.
-        let sealed = engine.view.update_memtables(|active, frozen| {
+        let sealed = self.engine.view.update_memtables(|active, frozen| {
             let sealed = Arc::clone(active);
             let mut next_frozen = frozen.to_vec();
             next_frozen.push(Arc::clone(&sealed));
             (Arc::clone(&fresh), next_frozen, sealed)
         });
         debug_assert!(Arc::ptr_eq(&sealed, &sealing));
-        engine
-            .wal_id
-            .store(new_wal_id, std::sync::atomic::Ordering::Release);
-        self.state.next_off = log.stamp_len();
-        self.state.log = log;
         self.state.memtable = fresh;
         self.state.mem_used = 0;
-        Ok(sealed)
+        sealed
     }
 
     /// Commit `ops` here, inside the unit: logged, synced when `durability`
@@ -333,14 +381,49 @@ impl Ordered<'_> {
     }
 
     /// Close the active log cleanly, after which every commit is refused.
-    /// A log left in an unknown state by an earlier failure is only synced:
-    /// CLOSE would vouch for bytes nobody can account for.
+    /// A log left in an unknown state by an earlier failure (`latched`) is
+    /// only synced: CLOSE would vouch for bytes nobody can account for.
+    ///
+    /// Called once every memtable is flushed. When the close sealed the
+    /// active memtable in place ([`Self::seal_in_place`]), its log is in a
+    /// table by now and removed: the next log is created here, after that,
+    /// and closed, so the directory ends in a closed log as after any close.
+    /// A creation that fails leaves the state as it was, for
+    /// [`Self::reopen_log`]; a sync or a write of the log that fails latches
+    /// the database, since what reached the device is unknown.
     pub(crate) fn close_log(&mut self, latched: bool) -> io::Result<()> {
-        if latched {
-            return self.state.log.sync_through(self.state.next_off);
+        if self.state.closed {
+            let (id, log) = self.create_log()?;
+            self.install_log(id, log);
         }
-        self.state.closed = true;
-        self.state.log.close(self.state.next_off)
+        let closed = if latched {
+            self.state.log.sync_through(self.state.next_off)
+        } else {
+            self.state.closed = true;
+            self.state.log.close(self.state.next_off)
+        };
+        if let Err(err) = &closed
+            && !latched
+        {
+            tracing::error!(error = %err, "closing the write-ahead log failed");
+            self.engine.latch_wal_failure(err);
+        }
+        closed
+    }
+
+    /// Take commits again after a close that failed. A close that sealed
+    /// the active memtable in place left the log it was written to active
+    /// and its memtable perhaps not flushed, so a commit there would land in
+    /// a log the flush removes: the log is synced and the next one created
+    /// first, as a rotation does. A latched database stays refused.
+    pub(crate) fn reopen_log(&mut self, latched: bool) -> io::Result<()> {
+        if !self.state.closed || latched {
+            return Ok(());
+        }
+        let (id, log) = self.next_log()?;
+        self.install_log(id, log);
+        self.state.closed = false;
+        Ok(())
     }
 }
 
