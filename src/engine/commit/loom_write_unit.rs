@@ -50,27 +50,34 @@ use loom::sync::Arc;
 use loom::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use loom::thread;
 
-use super::descriptor::{Descriptor, FILLED, WRITTEN, Work};
+use super::descriptor::{Descriptor, FILLED, FILLING, WRITTEN, Work};
 use super::write_unit::{QUEUED, WANTED, WriteUnit, waits_for_the_unit};
 use crate::engine::loom_model::explore_bounded;
 use crate::engine::wal_gate::Gate;
 
-/// A slot whose record its owner encoded: what a holder may gather (D4).
-fn filled_slot() -> Arc<Descriptor> {
-    let desc = Descriptor::new(
+/// A slot whose record nobody encoded yet.
+fn unfilled_slot() -> Arc<Descriptor> {
+    Arc::new(Descriptor::new(
         Work::Allocate {
             key: Vec::new(),
             n: 0,
             read_queue: None,
         },
         true,
-    );
-    desc.fill(|buf| {
-        buf.extend_from_slice(b"record");
-        Ok(())
-    })
-    .expect("a record is encoded");
-    Arc::new(desc)
+    ))
+}
+
+/// The encoding of the models' record into a slot's buffer.
+fn encode(buf: &mut Vec<u8>) -> std::io::Result<()> {
+    buf.extend_from_slice(b"record");
+    Ok(())
+}
+
+/// A slot whose record its owner encoded: what a holder may gather (D4).
+fn filled_slot() -> Arc<Descriptor> {
+    let desc = unfilled_slot();
+    desc.fill(encode).expect("a record is encoded");
+    desc
 }
 
 /// What a writer does to have its filled record in the log while the unit
@@ -474,6 +481,133 @@ pub fn calibration_a_commit_that_notes_before_it_loads_waits_on_a_job_nobody_rel
                     "a commit left on its queue waits on a job nobody releases"
                 );
             }
+        },
+    );
+}
+
+/// D4, the encoding claim: the owner and a thread that needs the record
+/// written, finding nobody encoding it, both set out to encode it
+/// (`RegolithEngine::fill`). Exactly one claims the encoding and writes the
+/// buffer; the record is whole once it is filled. The buffer is a tracked
+/// cell, so two encoders at once would be a data race loom fails.
+///
+/// Bound: 3 preemptions.
+pub fn one_thread_encodes_a_record() {
+    explore_bounded("one_thread_encodes_a_record", Some(3), 4, 1, |witness| {
+        let desc = unfilled_slot();
+        let encoded = Arc::new(AtomicUsize::new(0));
+        let helper = {
+            let (desc, encoded) = (Arc::clone(&desc), Arc::clone(&encoded));
+            thread::spawn(move || {
+                if desc.fill(encode).expect("the helper's encoding") {
+                    encoded.fetch_add(1, Ordering::SeqCst);
+                }
+            })
+        };
+        if desc.fill(encode).expect("the owner's encoding") {
+            encoded.fetch_add(1, Ordering::SeqCst);
+        } else {
+            witness.record();
+        }
+        helper.join().expect("the helper");
+        assert_eq!(
+            encoded.load(Ordering::SeqCst),
+            1,
+            "a record was encoded twice, or not at all"
+        );
+        assert_eq!(desc.record(), Some(&b"record"[..]));
+    });
+}
+
+/// Calibration for [`one_thread_encodes_a_record`]: an encoding claimed
+/// with a load and a store. Both threads find the record unclaimed and
+/// write its buffer at once.
+pub fn calibration_an_encoding_claimed_with_a_load_and_a_store_writes_one_buffer_twice() {
+    explore_bounded(
+        "calibration_an_encoding_claimed_with_a_load_and_a_store_writes_one_buffer_twice",
+        Some(3),
+        1,
+        0,
+        |_| {
+            let word = Arc::new(AtomicU64::new(0));
+            let buffer = Arc::new(Host(UnsafeCell::new(0)));
+            let encoders: Vec<_> = (0..2)
+                .map(|_| {
+                    let (word, buffer) = (Arc::clone(&word), Arc::clone(&buffer));
+                    thread::spawn(move || {
+                        if word.load(Ordering::Acquire) & FILLING == 0 {
+                            word.store(FILLING, Ordering::Release);
+                            buffer.write();
+                        }
+                    })
+                })
+                .collect();
+            for encoder in encoders {
+                encoder.join().expect("an encoder");
+            }
+        },
+    );
+}
+
+/// D5, the fill's wake: a thread that needs the record finds another
+/// encoding it and parks on it until it is filled. It is always woken: the
+/// fill's flag and the park's flag are read-modify-writes of one word, so
+/// one sees the other. What it then reads is the whole record (D4).
+///
+/// Bound: 3 preemptions.
+pub fn a_writer_parked_on_a_record_being_encoded_is_woken_when_it_is_filled() {
+    explore_bounded(
+        "a_writer_parked_on_a_record_being_encoded_is_woken_when_it_is_filled",
+        Some(3),
+        4,
+        1,
+        |witness| {
+            let desc = unfilled_slot();
+            let owner = {
+                let desc = Arc::clone(&desc);
+                thread::spawn(move || {
+                    let _ = desc.fill(encode).expect("the owner's encoding");
+                })
+            };
+            if !desc.fill(encode).expect("the waiter's encoding")
+                && desc.park(Duration::ZERO, || desc.is(FILLED))
+            {
+                witness.record();
+            }
+            owner.join().expect("the owner");
+            assert_eq!(desc.record(), Some(&b"record"[..]));
+        },
+    );
+}
+
+/// Calibration for
+/// [`a_writer_parked_on_a_record_being_encoded_is_woken_when_it_is_filled`]:
+/// an encoder that sets the filled flag without reading the parked one. A
+/// thread that parked on the record while it was being encoded is never
+/// woken.
+pub fn calibration_a_fill_that_wakes_nobody_leaves_a_writer_asleep() {
+    explore_bounded(
+        "calibration_a_fill_that_wakes_nobody_leaves_a_writer_asleep",
+        Some(3),
+        1,
+        0,
+        |_| {
+            let desc = unfilled_slot();
+            let owner = {
+                let desc = Arc::clone(&desc);
+                thread::spawn(move || {
+                    // The bug: the flag is set, the parked are not woken.
+                    if desc.claim(FILLING) & FILLING == 0 {
+                        let _ = desc.mark_quiet(FILLED);
+                    }
+                })
+            };
+            let sleeps = desc.claim(FILLING) & FILLING != 0 && desc.register(|| desc.is(FILLED));
+            owner.join().expect("the owner");
+            assert!(
+                !(sleeps && desc.has_sleepers()),
+                "a writer parked on a record being encoded was never woken"
+            );
         },
     );
 }

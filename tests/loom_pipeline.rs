@@ -6,6 +6,8 @@
 //! ```
 //!
 //! The models live in `src/engine/commit/loom_model.rs`,
+//! `src/engine/commit/loom_write_unit.rs`,
+//! `src/engine/commit/loom_turn_wait.rs`,
 //! `src/engine/loom_model/step.rs` and `src/engine/loom_model/park.rs`,
 //! next to the crate-private types they drive. What each proves:
 //!
@@ -44,8 +46,14 @@
 //!   writer parked on its record is woken when the holder's run writes it,
 //!   and when the holder lets the unit go with the record still waiting; a
 //!   run looks at its record again once counted in at the gate, so it never
-//!   lands under a sync; and a `commit_nowait` commit left on its queue is
-//!   told when the unit is let go.
+//!   lands under a sync; a `commit_nowait` commit left on its queue is
+//!   told when the unit is let go; one thread at a time encodes a record,
+//!   the owner or a thread that needs it; and a writer parked on a record
+//!   being encoded is woken when it is filled.
+//! - **A call far from its turn** (E45 step 2, `turn_wait.rs`): a blocking
+//!   call parked on its own slot is named by the pass that brings its turn
+//!   near and told by the next finished commit, and is woken when its slot
+//!   lands, whoever published it.
 //!
 //! Every model is bounded by a small scenario (a ring of two cells, two
 //! threads or two and a reader) and an explicit preemption bound given in
@@ -56,7 +64,7 @@
 
 #![cfg(loom)]
 
-use regolith::loom_exports::{park, pipeline, step, write_unit};
+use regolith::loom_exports::{park, pipeline, step, turn_wait, write_unit};
 
 #[test]
 fn an_index_is_installed_or_voided_never_both() {
@@ -300,4 +308,48 @@ fn a_queued_commit_is_told_when_the_unit_is_let_go() {
 #[should_panic(expected = "a commit left on its queue waits on a job nobody releases")]
 fn a_commit_that_notes_before_it_loads_waits_on_a_job_nobody_releases() {
     write_unit::calibration_a_commit_that_notes_before_it_loads_waits_on_a_job_nobody_releases();
+}
+
+#[test]
+fn one_thread_encodes_a_record() {
+    write_unit::one_thread_encodes_a_record();
+}
+
+#[test]
+#[should_panic]
+fn an_encoding_claimed_with_a_load_and_a_store_writes_one_buffer_twice() {
+    write_unit::calibration_an_encoding_claimed_with_a_load_and_a_store_writes_one_buffer_twice();
+}
+
+#[test]
+fn a_writer_parked_on_a_record_being_encoded_is_woken_when_it_is_filled() {
+    write_unit::a_writer_parked_on_a_record_being_encoded_is_woken_when_it_is_filled();
+}
+
+#[test]
+#[should_panic(expected = "a writer parked on a record being encoded was never woken")]
+fn a_fill_that_wakes_nobody_leaves_a_writer_asleep() {
+    write_unit::calibration_a_fill_that_wakes_nobody_leaves_a_writer_asleep();
+}
+
+#[test]
+fn a_call_far_from_its_turn_is_named_and_told() {
+    turn_wait::a_call_far_from_its_turn_is_named_and_told();
+}
+
+#[test]
+#[should_panic(expected = "a call far from its turn was never told")]
+fn a_pass_that_reads_the_count_first_leaves_a_sleeper_untold() {
+    turn_wait::calibration_a_pass_that_reads_the_count_first_leaves_a_sleeper_untold();
+}
+
+#[test]
+fn a_call_far_from_its_turn_is_woken_when_its_slot_lands() {
+    turn_wait::a_call_far_from_its_turn_is_woken_when_its_slot_lands();
+}
+
+#[test]
+#[should_panic(expected = "a call far from its turn slept through its landing")]
+fn a_call_that_looks_before_it_registers_sleeps_through_its_landing() {
+    turn_wait::calibration_a_call_that_looks_before_it_registers_sleeps_through_its_landing();
 }

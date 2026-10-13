@@ -79,6 +79,8 @@ pub(crate) mod hook;
 #[cfg(loom)]
 pub mod loom_model;
 #[cfg(loom)]
+pub mod loom_turn_wait;
+#[cfg(loom)]
 pub mod loom_write_unit;
 mod ordered;
 mod park;
