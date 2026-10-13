@@ -61,8 +61,11 @@
 //! only after: at most one slot, the one just past the decided frontier,
 //! holds a decision that is not applied yet. The check applies it itself
 //! with [`RegolithEngine::settle`], as any helper of the pipeline does: one
-//! memtable insert per operation, no I/O, and no wait for the thread that
-//! decided it. A rollback in progress is not helped: the frontiers are then
+//! memtable insert per operation and no I/O. When another thread is applying
+//! that slot already, the check first yields to it a bounded number of times
+//! (`courtesy` in `pipeline.rs`: 32 yields plus two per operation of the
+//! slot) and then applies the slot itself, so it never waits on that thread
+//! beyond those yields. A rollback in progress is not helped: the frontiers are then
 //! frozen, `c` still counts the operations the rollback is discarding, and a
 //! read they changed is refused until it ends.
 
