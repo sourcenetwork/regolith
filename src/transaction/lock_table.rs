@@ -237,6 +237,10 @@ const POLLING: usize = 1;
 /// The wait is over: the lock was taken, found held by the transaction, or
 /// the wait was abandoned.
 const DONE: usize = 2;
+/// Set beside [`POLLING`] by a wake that came while the poll ran. Such a
+/// wake told only the notes recorded before it, so the poll that leaves the
+/// wait pending finds it here and wakes again (`PendingLock::poll`).
+const WOKEN: usize = 4;
 
 /// What one poll of a [`PendingLock`] found.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -262,14 +266,13 @@ pub(super) struct PendingLock {
     /// The key's lock, with a use taken for this wait.
     key_lock: Arc<KeyLock>,
     /// The place in the lock's queue. Touched only by the call that moved
-    /// `state` from `IDLE`.
+    /// `Wakeup::state` from `IDLE`.
     wait: UnsafeCell<OwnedWait>,
-    state: AtomicUsize,
     wakeup: Arc<Wakeup>,
     waker: Waker,
 }
 
-// SAFETY: `wait` is touched only by the one call that moved `state` from
+// SAFETY: `wait` is touched only by the one call that moved `Wakeup::state` from
 // `IDLE` (to `POLLING`, or to `DONE` when it abandons the wait), so no two
 // threads ever reach it at once; everything else is atomic or `Sync`.
 unsafe impl Send for PendingLock {}
@@ -280,13 +283,13 @@ impl PendingLock {
     /// A wait on `key_lock`, which the caller pinned for it.
     pub(super) fn new(key_lock: Arc<KeyLock>) -> Self {
         let wakeup = Arc::new(Wakeup {
+            state: AtomicUsize::new(IDLE),
             notes: Stack::new(),
             sleepers: Stack::new(),
         });
         Self {
             key_lock,
             wait: UnsafeCell::new(OwnedWait::new()),
-            state: AtomicUsize::new(IDLE),
             waker: Waker::from(Arc::clone(&wakeup)),
             wakeup,
         }
@@ -297,7 +300,7 @@ impl PendingLock {
     }
 
     pub(super) fn is_done(&self) -> bool {
-        self.state.load(Ordering::Acquire) == DONE
+        self.wakeup.state.load(Ordering::Acquire) == DONE
     }
 
     /// Complete `slot` on `queue` (directly with none) at the lock's next
@@ -317,11 +320,31 @@ impl PendingLock {
     /// Poll the wait once for `owner`. `told` is the completion the calling
     /// call recorded for itself with [`note`](Self::note), if it did: a poll
     /// that ends the wait voids it, since that call does not wait after all.
+    ///
+    /// A call that finds another polling returns [`Polled::Busy`] with its
+    /// note recorded. A wake that came while that poll ran told only the
+    /// notes recorded before it, and its nudge is still on the wait, so it
+    /// marks the poll [`WOKEN`], and the poll that leaves the wait pending
+    /// and finds the mark wakes again: a call that met it is told even if
+    /// the poller's own caller never comes back.
     pub(super) fn poll(&self, owner: OwnerId, told: Option<&WaitSlot>) -> Polled {
-        match self
-            .state
-            .compare_exchange(IDLE, POLLING, Ordering::AcqRel, Ordering::Acquire)
-        {
+        self.poll_checked::<true>(owner, told)
+    }
+
+    /// [`poll`](Self::poll) as it was before the hand-back: the loom
+    /// calibration that shows a call meeting the poll is otherwise left
+    /// untold.
+    #[cfg(loom)]
+    pub(super) fn poll_without_recheck(&self, owner: OwnerId, told: Option<&WaitSlot>) -> Polled {
+        self.poll_checked::<false>(owner, told)
+    }
+
+    /// [`poll`](Self::poll) with the hand-back of a wake that came while it
+    /// ran (`RECHECK`), or without it for the loom calibration that shows it
+    /// is needed.
+    fn poll_checked<const RECHECK: bool>(&self, owner: OwnerId, told: Option<&WaitSlot>) -> Polled {
+        let state = &self.wakeup.state;
+        match state.compare_exchange(IDLE, POLLING, Ordering::AcqRel, Ordering::Acquire) {
             Ok(_) => {}
             Err(DONE) => {
                 if let Some(told) = told {
@@ -352,7 +375,13 @@ impl PendingLock {
             Polled::Pending
         };
         if polled == Polled::Pending {
-            self.state.store(IDLE, Ordering::Release);
+            // The swap reads the mark a wake that came while this poll ran
+            // left (`Wakeup::wake_all`). A call this poll turned away noted
+            // itself before it looked, so what that wake missed is told here.
+            let ended = state.swap(IDLE, Ordering::AcqRel);
+            if RECHECK && ended & WOKEN != 0 {
+                self.wakeup.wake_all();
+            }
         } else {
             if let Some(told) = told {
                 told.complete();
@@ -367,6 +396,7 @@ impl PendingLock {
     /// wait's use is the caller's to give back.
     pub(super) fn abandon(&self, owner: OwnerId) -> bool {
         if self
+            .wakeup
             .state
             .compare_exchange(IDLE, DONE, Ordering::AcqRel, Ordering::Acquire)
             .is_err()
@@ -383,7 +413,7 @@ impl PendingLock {
     /// The wait is over: every other call of the transaction waiting on it
     /// runs again.
     fn finish(&self) {
-        self.state.store(DONE, Ordering::Release);
+        self.wakeup.state.store(DONE, Ordering::Release);
         self.wakeup.wake_all();
     }
 }
@@ -392,12 +422,30 @@ impl PendingLock {
 /// handed out since the last wake, each on its own queue, and every thread
 /// that blocks on the wait.
 struct Wakeup {
+    /// The wait's [`IDLE`], [`POLLING`] (with [`WOKEN`] when a wake came
+    /// while it ran) or [`DONE`]. Here rather than in the wait, so a wake
+    /// can mark the poll it falls into.
+    state: AtomicUsize,
     notes: Stack<Note>,
     sleepers: Stack<Thread>,
 }
 
 impl Wakeup {
     fn wake_all(&self) {
+        // Mark a poll under way before telling the notes: one this wake
+        // misses was recorded after it, by a call the poll turned away.
+        let mut state = self.state.load(Ordering::Acquire);
+        while state == POLLING {
+            match self.state.compare_exchange_weak(
+                state,
+                POLLING | WOKEN,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(actual) => state = actual,
+            }
+        }
         for note in self.notes.take(0) {
             note.deliver();
         }
