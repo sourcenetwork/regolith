@@ -23,9 +23,15 @@ The third layer holds a range delete over `b` at sequence 2. The walk finds
 was deleted at 2.
 
 The fix (`recovery::hoist_range_deletes` in `src/engine/recovery.rs`): the open
-that moves such tables copies their range deletes into the memtable it
-recovers, the first layer of every walk. Then the walk has passed the delete
-before it meets any key.
+copies into the memtable it recovers, the first layer of every walk, the
+range deletes of the tables it moves out of overlapping levels (E14), and,
+once per database, every range delete that has a layer read before it
+holding a key it may cover (`buried_range_deletes`, E37). Then the walk has
+passed the delete before it meets any key. A range delete the check leaves
+where it is has no layer before it holding the key, so the walk passes it
+before any key of that layer or a later one too; this file proves the case
+where every delete is copied, and `proofs/tla/LegacyRangeRead.tla` checks the
+check's own choice for one key (`MC_LegacyRangeRead_Green_Buried`).
 
 ## What is proved, in plain words
 

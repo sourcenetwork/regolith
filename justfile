@@ -576,15 +576,19 @@ tla:
     check MC_LsmOrder_Green_Demote                     GREEN
     check MC_LsmOrder_Red_DemoteLevelOnly              RED ReadNewest
     check MC_LsmOrder_Red_NoDemotion                   RED ReadNewest
-    # E14, the range deletes of the tables an open moves out of overlapping
-    # levels: copied into the recovered memtable, and logged before the
-    # manifest records the move. Lean: Regolith/RangeDelete.lean,
+    # E14 and E37, the range deletes of the tables an open moves out of
+    # overlapping levels and those 0.1.x left below older keys they delete:
+    # copied into the recovered memtable, and logged before the manifest
+    # records the move and the check. Lean: Regolith/RangeDelete.lean,
     # hoisted_delete_reads_by_sequence.
     spec=LegacyRangeRead
     check MC_LegacyRangeRead_Green                     GREEN
     check MC_LegacyRangeRead_Red_NoHoist               RED ReadNewest
     check MC_LegacyRangeRead_Red_PreScanOnly           RED ReadNewest
     check MC_LegacyRangeRead_Red_MoveBeforeLog         RED ReadNewest
+    check MC_LegacyRangeRead_Green_Buried              GREEN
+    check MC_LegacyRangeRead_Red_BuriedRetired         RED ScanNewest
+    check MC_LegacyRangeRead_Red_CheckBeforeLog        RED HeadNewest
     # E6. Lean: Regolith/BatchView.lean, batch_one_view_newest.
     spec=BatchRead
     check MC_BatchRead_Green                           GREEN
