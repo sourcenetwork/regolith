@@ -136,6 +136,10 @@ pub mod wal_format;
 /// holds.
 pub mod overlap_fixture;
 
+/// The database 0.1.9 left with a range delete below older keys it covers,
+/// and what it holds.
+pub mod buried_fixture;
+
 /// The first open of a database an earlier release wrote, across a power
 /// cut at each of its I/O calls.
 pub mod open_sweep;
