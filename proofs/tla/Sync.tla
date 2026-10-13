@@ -82,8 +82,12 @@
 \*   no_stranded_head,            a free lock with waiters has nudged its
 \*   handed_woken                 head; a waiter handed the lock is woken
 \*                                (NoLostWakeup here)
-\*   unbounded_barging_breaks_bound, release_without_wake_strands
-\*                                the RED cases, as counterexamples
+\*   no_lost_wakeup_spinning,     a waiter asleep with its waker armed never
+\*   mark_spinning_wakes_nobody   has an unread mark, spins included, and a
+\*                                release that finds it spinning calls no
+\*                                waker (SpinningUnarmed, NoLostWakeup here)
+\*   unbounded_barging_breaks_bound, release_without_wake_strands,
+\*   spin_without_look_strands    the RED cases, as counterexamples
 \* The Lean machine has no drain role, so DrainBounded and the two liveness
 \* promises are checked here only.
 \*
@@ -112,8 +116,14 @@
 \*                                                    waiter's own drain)
 \*   a_drain_that_found_nobody_queued_ends_while_another_thread_releases
 \*                                                    DrainBounded
-\* Each of the last two has a calibration that writes the one step the old
-\* way and must fail.
+\*   the_first_attempt_refuses_a_lock_owed_to_a_waiter  HandoffExclusive,
+\*                                                    BoundedBypass, for the
+\*                                                    Mutex's inline attempt
+\*   a_nudge_while_the_waiter_spins_is_never_lost      NoLostWakeup,
+\*                                                    SpinningUnarmed
+\* Each of the last four has a calibration that writes the one step the old
+\* way (or, for E48, without its guard) and must fail. Every other model above
+\* runs the spins too: under loom a spin has one round.
 \*
 \* DrainBounded is also checked by two unit tests of src/sync/contend.rs,
 \* which race a release against a drain at a chosen instant:
