@@ -1236,6 +1236,16 @@ tla:
     check MC_EnvFiles_Green_Rename                     GREEN
     check MC_EnvFiles_Red_RemoveFirst                  RED OpenFindsFile
     check MC_EnvFiles_Red_NoReload                     RED OpenFindsFile
+    # MemEnv's rename racing other changes to the namespace: the rename marks
+    # its source before it puts the file at the destination, so a removal or
+    # a rename that moves the destination on cannot make it undo itself.
+    # Green_Moved is the witness that the GREEN run reaches that race.
+    spec=EnvRename
+    check MC_EnvRename_Green                           GREEN
+    check MC_EnvRename_Green_FourCalls                 GREEN
+    check MC_EnvRename_Green_Moved                     RED NeverMovedOn
+    check MC_EnvRename_Red_Rollback                    RED Linearizable
+    check MC_EnvRename_Red_RemoveIgnoresMark           RED Linearizable
     # The pessimistic lock table (plan 4.6, 4.10): one holder per key, no
     # lost wake-up, bounded bypass, a wait delivered to its own queue, and a
     # lock released when its commit lands. Lean: Regolith/LockTable.lean,

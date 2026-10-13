@@ -65,8 +65,8 @@ pub(crate) trait Charge {
     /// Reserve `bytes` more before a write makes them visible. An error
     /// refuses the write, which then changes nothing.
     fn reserve(&self, bytes: u64) -> io::Result<()>;
-    /// Give back `bytes`: a reservation whose attempt lost a race, or a
-    /// file that shrank.
+    /// Give back `bytes`: a reservation whose attempt lost a race or
+    /// failed, or a file that shrank.
     fn release(&self, bytes: u64);
 }
 
@@ -384,24 +384,33 @@ impl MemFile {
                 return Ok((len, len));
             }
             let (at, end) = change.bounds(len)?;
+            let need = to_usize(end)?;
             let grow = end.saturating_sub(len);
             charge.reserve(grow)?;
-            let landed = if state & (WRITER | FROZEN) == 0
+            let attempt = if state & (WRITER | FROZEN) == 0
                 && at == len
                 && end >= len
-                && to_usize(end)? <= extent.capacity()
+                && need <= extent.capacity()
             {
-                self.in_place(&extent, state, change, len, end)
+                Ok(self.in_place(&extent, state, change, len, end))
             } else {
-                self.copy(&extent, state, change, at, len, end)?
+                self.copy(&extent, state, change, at, len, end)
             };
-            if landed {
-                if end < len {
-                    charge.release(len - end);
+            match attempt {
+                Ok(true) => {
+                    if end < len {
+                        charge.release(len - end);
+                    }
+                    return Ok((len, end));
                 }
-                return Ok((len, end));
+                // Nothing landed, whether the attempt lost a race or failed:
+                // the reservation goes back either way.
+                Ok(false) => charge.release(grow),
+                Err(err) => {
+                    charge.release(grow);
+                    return Err(err);
+                }
             }
-            charge.release(grow);
         }
     }
 

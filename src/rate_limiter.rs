@@ -20,6 +20,8 @@ use std::sync::Arc;
 #[cfg(not(target_arch = "wasm32"))]
 use std::time::Duration;
 
+use kovan::Atom;
+
 use crate::portability::{AtomicBool, AtomicU64, Ordering};
 
 // The module's own tests measure real elapsed time to prove the
@@ -112,6 +114,7 @@ pub(crate) fn throttle_background(
 const SLEEP_SLICE: Duration = Duration::from_millis(50);
 
 /// Nanoseconds `bytes` take at `rate` bytes per second, saturating.
+#[cfg(not(target_arch = "wasm32"))]
 fn nanos_for(bytes: u64, rate: u64) -> u64 {
     let nanos = u128::from(bytes).saturating_mul(1_000_000_000) / u128::from(rate.max(1));
     u64::try_from(nanos).unwrap_or(u64::MAX)
@@ -126,25 +129,55 @@ fn bytes_for(nanos: u64, rate: u64) -> u64 {
 /// Default rate-limiter implementation: one token bucket refilled
 /// continuously at `bytes_per_second`, holding at most `burst_bytes`.
 ///
-/// The bucket is a single clock reading kept in an atomic: the time at which
-/// every byte served so far will have been paid for at the rate (the
-/// "theoretical arrival time" of the generic cell rate algorithm). A request
-/// for `n` bytes moves it forward by `n / rate` with one compare-and-swap,
-/// from now if the bucket had refilled meanwhile, and may proceed once the
-/// new time is within `burst_bytes / rate` of now; until then it sleeps.
-/// Reservations are taken in the order the compare-and-swaps land, so
-/// requests are served first come, first served, and a request larger than
-/// the burst simply waits for the bytes past it. Nobody takes a lock.
+/// The bucket runs on a *byte clock*: how many bytes it has refilled since
+/// it was made, each stretch of time counted at the rate set for it. Its
+/// state is one reading of that clock, kept in an atomic: the reading at
+/// which every byte reserved so far is paid for (the "theoretical arrival
+/// time" of the generic cell rate algorithm, counted in bytes). A request
+/// for `n` bytes moves it forward by `n` with one compare-and-swap, from
+/// the clock's reading now if the bucket had refilled meanwhile, and may
+/// proceed once the clock is within `burst_bytes` of the new reading; until
+/// then it sleeps. Reservations are taken in the order the compare-and-swaps
+/// land, so requests are served first come, first served, and a request
+/// larger than the burst simply waits for the bytes past it. Nobody takes a
+/// lock.
+///
+/// What is owed is counted in bytes, so it holds no rate. A rate change
+/// ([`TokenBucketRateLimiter::set_bytes_per_second`]) replaces the clock's
+/// pace in one step, from the instant it lands: every byte not yet served,
+/// a waiting request's included, is then served at the new rate, and a
+/// request racing the change reads the clock at one pace or the other,
+/// never a mixture of the two.
 ///
 /// A fresh bucket is full: the first `burst_bytes` are served at once.
 pub struct TokenBucketRateLimiter {
-    rate: AtomicU64,
+    /// The rate and where the byte clock stood when it was set; replaced
+    /// whole by a rate change.
+    pace: Atom<Pace>,
     burst_bytes: u64,
-    /// Platform-clock nanoseconds at which every reserved byte is paid for.
-    paid_until: AtomicU64,
+    /// The byte-clock reading at which every reserved byte is paid for.
+    paid: AtomicU64,
     shutdown: AtomicBool,
     total_high: AtomicU64,
     total_low: AtomicU64,
+}
+
+/// The pace the byte clock runs at, from one instant on.
+struct Pace {
+    /// Bytes per second; `0` turns the limiter off.
+    rate: u64,
+    /// The byte clock's reading at `since`.
+    at: u64,
+    /// Platform-clock nanoseconds this pace began at.
+    since: u64,
+}
+
+impl Pace {
+    /// The byte clock's reading at platform time `now`.
+    fn clock(&self, now: u64) -> u64 {
+        self.at
+            .saturating_add(bytes_for(now.saturating_sub(self.since), self.rate))
+    }
 }
 
 impl TokenBucketRateLimiter {
@@ -160,9 +193,13 @@ impl TokenBucketRateLimiter {
     /// asserted, because this is a public constructor.
     pub fn new(bytes_per_second: u64, burst_bytes: u64) -> Self {
         Self {
-            rate: AtomicU64::new(bytes_per_second),
+            pace: Atom::new(Pace {
+                rate: bytes_per_second,
+                at: 0,
+                since: crate::env::platform_nanos().unwrap_or(0),
+            }),
             burst_bytes: burst_bytes.max(1),
-            paid_until: AtomicU64::new(0),
+            paid: AtomicU64::new(0),
             shutdown: AtomicBool::new(false),
             total_high: AtomicU64::new(0),
             total_low: AtomicU64::new(0),
@@ -177,31 +214,30 @@ impl TokenBucketRateLimiter {
         self.shutdown.store(true, Ordering::Release);
     }
 
-    /// Reserve `bytes` at `rate`, at `now`, and return the time the request
-    /// may proceed.
-    fn reserve(&self, bytes: u64, rate: u64, now: u64) -> u64 {
-        let cost = nanos_for(bytes, rate);
-        let burst = nanos_for(self.burst_bytes, rate);
-        let mut current = self.paid_until.load(Ordering::Acquire);
+    /// Reserve `bytes` with the byte clock reading `clock`, and return the
+    /// reading at which they are paid for.
+    fn reserve(&self, bytes: u64, clock: u64) -> u64 {
+        let mut current = self.paid.load(Ordering::Acquire);
         loop {
             // A bucket idle long enough refilled: the debt starts now.
-            let next = current.max(now).saturating_add(cost);
-            match self.paid_until.compare_exchange_weak(
+            let next = current.max(clock).saturating_add(bytes);
+            match self.paid.compare_exchange_weak(
                 current,
                 next,
                 Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
-                Ok(_) => return next.saturating_sub(burst),
+                Ok(_) => return next,
                 Err(actual) => current = actual,
             }
         }
     }
 
-    /// Sleep until `ready_at` on the platform clock, or until stopped.
-    /// `false` when stopped first.
+    /// Sleep until the byte clock reads `ready`, or until stopped. `false`
+    /// when stopped first. Each slice reads the pace again, so a rate
+    /// changed meanwhile paces the bytes still owed.
     #[cfg(not(target_arch = "wasm32"))]
-    fn wait_until(&self, ready_at: u64) -> bool {
+    fn wait_until(&self, ready: u64) -> bool {
         loop {
             if self.shutdown.load(Ordering::Acquire) {
                 return false;
@@ -209,17 +245,23 @@ impl TokenBucketRateLimiter {
             let Some(now) = crate::env::platform_nanos() else {
                 return true;
             };
-            if now >= ready_at {
+            let (rate, clock) = {
+                let pace = self.pace.load();
+                (pace.rate, pace.clock(now))
+            };
+            // A limiter turned off serves what waits on it.
+            if rate == 0 || clock >= ready {
                 return true;
             }
-            std::thread::sleep(SLEEP_SLICE.min(Duration::from_nanos(ready_at - now)));
+            let owed = nanos_for(ready - clock, rate).max(1);
+            std::thread::sleep(SLEEP_SLICE.min(Duration::from_nanos(owed)));
         }
     }
 
     /// A target with no thread to sleep serves at once rather than spin:
     /// nothing on it calls a limiter that must block. `false` when stopped.
     #[cfg(target_arch = "wasm32")]
-    fn wait_until(&self, _ready_at: u64) -> bool {
+    fn wait_until(&self, _ready: u64) -> bool {
         !self.shutdown.load(Ordering::Acquire)
     }
 
@@ -230,36 +272,47 @@ impl TokenBucketRateLimiter {
         };
     }
 
-    /// Change the refill rate, for the requests after this call. The bytes
-    /// still owed are carried over at the new rate, so the change takes
-    /// effect cleanly from now.
+    /// Change the refill rate from this call on. Every byte not yet served
+    /// is served at the new rate, a waiting request's included: the bytes
+    /// owed are counted in bytes, and the change only sets the pace the
+    /// byte clock runs at from now. A limiter turned back on from `0`
+    /// starts with a full bucket, as a fresh one does.
     pub fn set_bytes_per_second(&self, bytes_per_second: u64) {
-        let old = self.rate.swap(bytes_per_second, Ordering::AcqRel);
-        let (Some(now), true) = (
-            crate::env::platform_nanos(),
-            old > 0 && bytes_per_second > 0,
-        ) else {
-            return;
-        };
-        let mut current = self.paid_until.load(Ordering::Acquire);
         loop {
-            let owed = bytes_for(current.saturating_sub(now), old);
-            let next = now.saturating_add(nanos_for(owed, bytes_per_second));
-            match self.paid_until.compare_exchange_weak(
-                current,
-                next,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => return,
-                Err(actual) => current = actual,
+            let now = crate::env::platform_nanos().unwrap_or(0);
+            let current = self.pace.load();
+            let mut at = current.clock(now);
+            if current.rate == 0 {
+                // Nothing was paced while off: nothing is owed from then.
+                at = at.max(self.paid.load(Ordering::Acquire));
+            }
+            let next = Pace {
+                rate: bytes_per_second,
+                at,
+                since: now,
+            };
+            #[cfg(test)]
+            in_rate_change();
+            if self.pace.compare_and_swap(&current, next).is_ok() {
+                return;
             }
         }
     }
 
+    /// Test-only: whether more than `bytes` are reserved and not yet paid
+    /// for.
+    #[cfg(test)]
+    fn owes_more_than(&self, bytes: u64) -> bool {
+        let Some(now) = crate::env::platform_nanos() else {
+            return false;
+        };
+        let clock = self.pace.load().clock(now);
+        self.paid.load(Ordering::Acquire).saturating_sub(clock) > bytes
+    }
+
     /// The refill rate, in bytes per second.
     pub fn get_bytes_per_second(&self) -> u64 {
-        self.rate.load(Ordering::Acquire)
+        self.pace.load().rate
     }
 
     /// Total bytes served at `pri` since construction. Excludes requests
@@ -269,6 +322,22 @@ impl TokenBucketRateLimiter {
             Priority::High => self.total_high.load(Ordering::Relaxed),
             Priority::Low => self.total_low.load(Ordering::Relaxed),
         }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test seam: runs once, on this thread, in the middle of the next rate
+    /// change, where a request on another thread could land.
+    static IN_RATE_CHANGE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Run the step a test set for this instant, if any.
+#[cfg(test)]
+fn in_rate_change() {
+    if let Some(step) = IN_RATE_CHANGE.with(|hook| hook.borrow_mut().take()) {
+        step();
     }
 }
 
@@ -283,18 +352,20 @@ impl RateLimiter for TokenBucketRateLimiter {
         if self.shutdown.load(Ordering::Acquire) {
             return;
         }
-        let rate = self.rate.load(Ordering::Acquire);
         // Rate limiting is a function of elapsed time. A platform with no
         // monotonic clock cannot measure it, so the limiter serves every
         // request at once instead of blocking on a bucket that could never
         // refill; a rate of zero turns it off.
-        let now = crate::env::platform_nanos();
-        let (Some(now), true) = (now, rate > 0 && bytes > 0) else {
+        let clock = crate::env::platform_nanos().and_then(|now| {
+            let pace = self.pace.load();
+            (pace.rate > 0 && bytes > 0).then(|| pace.clock(now))
+        });
+        let Some(clock) = clock else {
             self.count(bytes, pri);
             return;
         };
-        let ready_at = self.reserve(bytes, rate, now);
-        if pri == Priority::High || self.wait_until(ready_at) {
+        let paid = self.reserve(bytes, clock);
+        if pri == Priority::High || self.wait_until(paid.saturating_sub(self.burst_bytes)) {
             self.count(bytes, pri);
         }
     }
@@ -443,6 +514,89 @@ mod tests {
             start.elapsed() < Duration::from_secs(2),
             "request took {:?} after rate bump",
             start.elapsed()
+        );
+    }
+
+    /// Run `step` once, on this thread, in the middle of its next rate
+    /// change.
+    fn in_next_rate_change(step: impl FnOnce() + 'static) {
+        IN_RATE_CHANGE.with(|hook| *hook.borrow_mut() = Some(Box::new(step)));
+    }
+
+    /// Wait for a 1-byte request on another thread, for at most `limit`;
+    /// `None` when it was still waiting then. The limiter is stopped
+    /// either way, so the thread ends.
+    fn one_byte_wait(lim: &Arc<TokenBucketRateLimiter>, limit: Duration) -> Option<Duration> {
+        let (done, waited) = std::sync::mpsc::channel();
+        let next = {
+            let lim = Arc::clone(lim);
+            thread::spawn(move || {
+                let start = Instant::now();
+                lim.request(1, Priority::Low);
+                let _ = done.send(start.elapsed());
+            })
+        };
+        let waited = waited.recv_timeout(limit).ok();
+        lim.stop();
+        next.join().unwrap();
+        waited
+    }
+
+    /// A request that reserves while a rate change is under way owes its
+    /// bytes at one rate: a 1-byte request after the change to 1 B/s waits
+    /// about a second, not the thousand seconds its debt would come to if
+    /// it were read as owed at the old rate of 1000 B/s.
+    #[test]
+    fn a_request_racing_a_rate_change_is_owed_at_one_rate() {
+        let lim = Arc::new(TokenBucketRateLimiter::new(1_000, 1));
+        let racing = Arc::clone(&lim);
+        in_next_rate_change(move || racing.request(1, Priority::Low));
+        lim.set_bytes_per_second(1);
+        assert_eq!(
+            lim.get_total_bytes_through(Priority::Low),
+            1,
+            "setup: the racing request was served"
+        );
+        let waited = one_byte_wait(&lim, Duration::from_secs(10));
+        assert!(
+            waited.is_some(),
+            "the next byte at 1 B/s waited more than 10 s"
+        );
+    }
+
+    /// A rate raised while a request waits serves the bytes it still owes
+    /// at the new rate: a request that would wait 10 s at 1000 B/s ends
+    /// soon after the rate goes to 100 MB/s.
+    #[test]
+    fn a_rate_raised_while_a_request_waits_serves_it_at_the_new_rate() {
+        let lim = Arc::new(TokenBucketRateLimiter::new(1_000, 1));
+        lim.request(1, Priority::Low);
+        let reserved = lim.get_total_bytes_through(Priority::Low);
+        let (done, waited) = std::sync::mpsc::channel();
+        let waiter = {
+            let lim = Arc::clone(&lim);
+            thread::spawn(move || {
+                lim.request(10_000, Priority::Low);
+                let _ = done.send(());
+            })
+        };
+        // Until the waiter has reserved: its bytes are then owed.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !lim.owes_more_than(1) {
+            assert!(
+                Instant::now() < deadline,
+                "setup: the waiter never reserved"
+            );
+            thread::yield_now();
+        }
+        lim.set_bytes_per_second(100_000_000);
+        let served = waited.recv_timeout(Duration::from_secs(5)).is_ok();
+        lim.stop();
+        waiter.join().unwrap();
+        assert!(served, "a waiting request kept the old rate");
+        assert_eq!(
+            lim.get_total_bytes_through(Priority::Low),
+            reserved + 10_000
         );
     }
 
