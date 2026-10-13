@@ -22,6 +22,11 @@
 //!   given back while another caller takes one; never both.
 //! - **No wait outlives close**: a wait queued while close marks the gate and
 //!   wakes every waiter is told, or its call abandons it.
+//! - **A take racing a push keeps the order**: the owner pushes `on_abort`
+//!   callbacks into the first four its claim holds in place while another
+//!   thread takes them; the take reads only slots whose push it saw complete
+//!   and every entry comes out once, oldest first, in place and across the
+//!   edge to the overflow.
 //!
 //! Each is paired with a calibration that writes the one step the wrong way
 //! and must fail.
@@ -56,6 +61,16 @@ fn no_lock_wait_outlives_close() {
 }
 
 #[test]
+fn a_take_racing_a_push_keeps_the_order() {
+    locks::a_take_racing_a_push_keeps_the_order();
+}
+
+#[test]
+fn a_take_racing_a_push_keeps_the_order_across_the_edge() {
+    locks::a_take_racing_a_push_keeps_the_order_across_the_edge();
+}
+
+#[test]
 #[should_panic(expected = "two owners hold one key")]
 fn calibration_a_take_without_a_cas_admits_two_holders() {
     locks::calibration_a_take_without_a_cas_admits_two_holders();
@@ -83,4 +98,10 @@ fn calibration_a_retire_without_a_cas_retires_a_used_entry() {
 #[should_panic(expected = "a lock wait outlived close")]
 fn calibration_a_wait_that_ignores_the_gate_outlives_close() {
     locks::calibration_a_wait_that_ignores_the_gate_outlives_close();
+}
+
+#[test]
+#[should_panic(expected = "a take handed an entry out of order or not exactly once")]
+fn calibration_a_take_past_a_slot_not_filled_breaks_the_order() {
+    locks::calibration_a_take_past_a_slot_not_filled_breaks_the_order();
 }

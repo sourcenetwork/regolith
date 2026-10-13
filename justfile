@@ -357,8 +357,11 @@ loom-pipeline:
 
 # Loom models for the pessimistic lock table (plan 4.6, 4.10): one holder
 # per key, the bypass bound, a wait delivered to its own queue, the table's
-# use count, and close meeting a wait being queued, with five calibrations
-# that must fail. Release only; the ten run in under ten seconds.
+# use count, and close meeting a wait being queued; and for the first four
+# abort callbacks a transaction's claim holds in place, pushed while another
+# thread takes them (at a bound that explores every schedule). Six
+# calibrations must fail. Release only; the thirteen run in under ten
+# seconds.
 loom-locks:
     RUSTFLAGS="--cfg loom" cargo test --release --test loom_locks --no-run
     RUSTFLAGS="--cfg loom" timeout 10m cargo test --release --test loom_locks

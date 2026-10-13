@@ -20,11 +20,11 @@
 
 #![allow(unsafe_code)]
 
-use std::cell::UnsafeCell;
 use std::mem::MaybeUninit;
-use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 
 use super::handoff::{Handoff, Taken};
+// Loom's under `--cfg loom`: `super::lock_loom` races a push against a take.
+use crate::sync::internal::{AtomicU8, AtomicUsize, Ordering, UnsafeCell};
 
 /// Entries the list holds in place before it uses the overflow.
 pub(super) const IN_PLACE: usize = 4;
@@ -85,7 +85,7 @@ impl<T> FirstFour<T> {
         };
         // SAFETY: slot `at` is EMPTY, and only this thread fills slots, so
         // nothing reads or writes its value until the store below.
-        unsafe { (*slot.value.get()).write(value) };
+        slot.value.with_mut(|cell| unsafe { (*cell).write(value) });
         slot.state.store(FULL, Ordering::Release);
         self.pushed.store(at + 1, Ordering::Relaxed);
     }
@@ -98,17 +98,32 @@ impl<T> FirstFour<T> {
             at: 0,
             stopped: false,
             rest: None,
+            #[cfg(loom)]
+            past_empty: false,
+        }
+    }
+
+    /// The take a loom calibration breaks: it runs on past a slot not filled
+    /// yet instead of stopping there.
+    #[cfg(loom)]
+    pub(super) fn take_past_empty(&self) -> TakeFirst<'_, T> {
+        TakeFirst {
+            past_empty: true,
+            ..self.take()
         }
     }
 }
 
 impl<T> Drop for FirstFour<T> {
     fn drop(&mut self) {
-        for slot in &mut self.slots {
-            if *slot.state.get_mut() == FULL {
+        for slot in &self.slots {
+            // `&mut self` excludes every other access, so the load sees the
+            // last state stored.
+            if slot.state.load(Ordering::Relaxed) == FULL {
                 // SAFETY: a FULL slot holds a value nobody took, and `&mut
                 // self` excludes every other access.
-                unsafe { slot.value.get_mut().assume_init_drop() };
+                slot.value
+                    .with_mut(|cell| unsafe { (*cell).assume_init_drop() });
             }
         }
     }
@@ -121,6 +136,24 @@ pub(super) struct TakeFirst<'a, T> {
     /// A slot was found not filled: nothing past it is handed out.
     stopped: bool,
     rest: Option<Taken<T>>,
+    /// The calibration's take ([`FirstFour::take_past_empty`]).
+    #[cfg(loom)]
+    past_empty: bool,
+}
+
+impl<T> TakeFirst<'_, T> {
+    /// Whether a slot not filled yet ends this take: always.
+    #[cfg(not(loom))]
+    fn stops_at_empty(&self) -> bool {
+        true
+    }
+
+    /// Whether a slot not filled yet ends this take: always, but in a loom
+    /// calibration's.
+    #[cfg(loom)]
+    fn stops_at_empty(&self) -> bool {
+        !self.past_empty
+    }
 }
 
 impl<T> Iterator for TakeFirst<'_, T> {
@@ -133,10 +166,15 @@ impl<T> Iterator for TakeFirst<'_, T> {
                 .state
                 .compare_exchange(FULL, TAKEN, Ordering::Acquire, Ordering::Relaxed)
             {
-                // SAFETY: the exchange made the filled value this taker's
-                // alone, and the Acquire pairs with the push's Release.
-                Ok(_) => return Some(unsafe { (*slot.value.get()).assume_init_read() }),
-                Err(EMPTY) => {
+                Ok(_) => {
+                    // SAFETY: the exchange made the filled value this taker's
+                    // alone, and the Acquire pairs with the push's Release.
+                    let value = slot
+                        .value
+                        .with(|cell| unsafe { (*cell).assume_init_read() });
+                    return Some(value);
+                }
+                Err(EMPTY) if self.stops_at_empty() => {
                     self.stopped = true;
                     self.at = IN_PLACE;
                     return None;
@@ -153,7 +191,7 @@ impl<T> Iterator for TakeFirst<'_, T> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(loom)))]
 mod tests {
     use std::sync::Arc;
 
