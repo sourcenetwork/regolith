@@ -22,6 +22,19 @@
 //!   given back while another caller takes one; never both.
 //! - **No wait outlives close**: a wait queued while close marks the gate and
 //!   wakes every waiter is told, or its call abandons it.
+//! - **Two calls on one transaction share one wait**: two calls find the key
+//!   held at once and may both make a wait; one is published, the other is
+//!   given back unpolled, and the holder's release reaches the published one,
+//!   so the transaction takes the freed lock.
+//! - **Two pollers on one wait are both told**: two calls of one transaction
+//!   poll one queued wait while the holder releases; a call that meets the
+//!   other's poll returns waiting, and is told whenever the release's wake
+//!   fell inside that poll, so the free lock never waits on the poller's
+//!   caller coming back.
+//! - **A poll racing a handoff is never fooled** (defect F1): a release
+//!   hands the lock to an owed wait, name first and grant second, while the
+//!   waiting transaction polls; a poll that says "held" is right, and the
+//!   lock ends with the transaction.
 //! - **A take racing a push keeps the order**: the owner pushes `on_abort`
 //!   callbacks into the first four its claim holds in place while another
 //!   thread takes them; the take reads only slots whose push it saw complete
@@ -58,6 +71,39 @@ fn a_retired_entry_is_never_used() {
 #[test]
 fn no_lock_wait_outlives_close() {
     locks::no_lock_wait_outlives_close();
+}
+
+#[test]
+fn two_calls_on_one_transaction_share_one_wait() {
+    locks::two_calls_on_one_transaction_share_one_wait();
+}
+
+#[test]
+#[should_panic(expected = "the transaction never took the freed lock")]
+fn calibration_two_published_waits_hide_the_told_one() {
+    locks::calibration_two_published_waits_hide_the_told_one();
+}
+
+#[test]
+fn two_pollers_on_one_wait_are_both_told() {
+    locks::two_pollers_on_one_wait_are_both_told();
+}
+
+#[test]
+#[should_panic(expected = "a call that met the poll was never told")]
+fn calibration_a_poll_without_the_hand_back_leaves_a_call_untold() {
+    locks::calibration_a_poll_without_the_hand_back_leaves_a_call_untold();
+}
+
+#[test]
+fn a_poll_racing_a_handoff_is_never_fooled() {
+    locks::a_poll_racing_a_handoff_is_never_fooled();
+}
+
+#[test]
+#[should_panic(expected = "a poll said the transaction holds a lock the handoff then freed")]
+fn calibration_a_poll_trusting_a_half_made_handoff_breaks_exclusion() {
+    locks::calibration_a_poll_trusting_a_half_made_handoff_breaks_exclusion();
 }
 
 #[test]

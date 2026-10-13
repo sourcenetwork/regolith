@@ -48,9 +48,14 @@ What is proved, in plain words:
    that transaction's own inbox being read. TLA+: `OwnQueue`.
 5. `isolation_at_landing`: while a commit is written and not yet visible,
    only its own transaction holds the key. TLA+: `IsolationAtLanding`.
-6. The RED cases, as counterexamples: `retire_unchecked_strands_a_user`,
+6. `handoff_exclusion`: a handoff is two steps (the waiter's name, marked,
+   then the grant), and a waiter's poll never takes the marked name for a
+   hold, so at most one transaction believes it holds the key. TLA+:
+   `MutualExclusion` with the two-step `Drain` and `Grant`.
+7. The RED cases, as counterexamples: `retire_unchecked_strands_a_user`,
    `undelivered_note_strands`, `unbounded_barging_breaks_bound`,
-   `wrong_queue_breaks_own_queue` and `release_at_write_breaks_isolation`.
+   `wrong_queue_breaks_own_queue`, `release_at_write_breaks_isolation` and
+   `mine_before_grant_breaks_exclusion`.
 
 How to read the Lean: `def` defines a function or a property, `theorem`
 states a fact and its proof follows `:= by`. Lines starting with `--` are
@@ -807,6 +812,351 @@ theorem release_at_write_breaks_isolation :
     (.lock _ _ (.release _ 1 (by decide))))
     -- and transaction 2 takes the free lock.
     (.lock _ _ (.fast _ 2 (by decide) rfl rfl)), by decide, by decide⟩
+
+/-! ## The handoff's two steps (defect F1)
+
+A release that owes the lock to a waiter hands it over in two steps
+(`OwnedLock::pass`): it writes the waiter's name into the lock's state
+word, then grants the waiter. A waiter that withdrew in between is not
+granted, and the name is cleared again. The name a handoff writes carries
+the GRANTING mark until the grant is through (`owned_lock.rs`), and a
+waiter's poll may conclude "my transaction holds the key already"
+(`Polled::Mine`) only from a name without the mark.
+
+Tiny example of the defect, where the poll did not look at the mark.
+Transaction 1 is owed the key and 2 releases it. The handoff writes 1's
+name. Before the grant, 1 polls, reads its own name, leaves the line and
+says "held". The grant finds 1 gone and clears the name. 2 takes the free
+key again. Both believe they hold it.
+
+This section proves the rule for every number of transactions and steps:
+with the mark respected, whoever believes it holds the key is the
+unmarked name in the state word, so at most one transaction does
+(`handoff_exclusion`); and with the mark ignored, two do
+(`mine_before_grant_breaks_exclusion`). TLA+: the two-step `Drain` and
+`Grant` of `LockTable.tla`, rows `MC_LockTable_Green_EarlyPoll` and
+`MC_LockTable_Red_MineBeforeGrant`.
+-/
+
+/-- The lock's state word and what each transaction believes. -/
+structure H where
+  /-- The name in the state word with its GRANTING mark (`true` while the
+  handoff that wrote it has not granted yet), or `none` when free. -/
+  word : Option (Nat × Bool)
+  /-- The waiters still in the lock's line. -/
+  line : List Nat
+  /-- Whether a transaction's call said "held" and it has not let go since. -/
+  held : Nat → Bool
+
+/-- The start: the key free, nobody waiting, nobody believing it holds it. -/
+def H.init : H := ⟨none, [], fun _ => false⟩
+
+/-- The steps of the state word, for a poll that takes a marked name for a
+hold when `trust` is `true` (the defect) and only an unmarked one when it
+is `false` (the code). -/
+inductive HStep (trust : Bool) : H → H → Prop
+  /-- A transaction takes the free key in one compare-and-swap (`try_lock`),
+  writing its own name, unmarked, and its call says "held". -/
+  | take (s : H) (r : Nat)
+      -- The key is free.
+      (free : s.word = none) :
+      -- After: the word names `r`, and `r` believes it holds the key.
+      HStep trust s { s with word := some (r, false),
+                             held := fun x => if x = r then true else s.held x }
+  /-- The holder lets go (`unlock`): the word is cleared. -/
+  | release (s : H) (r : Nat) (m : Bool)
+      -- The word names `r`,
+      (named : s.word = some (r, m))
+      -- and `r` believes it holds the key.
+      (hr : s.held r = true) :
+      -- After: the word is free, and `r` no longer believes it holds the key.
+      HStep trust s { s with word := none,
+                             held := fun x => if x = r then false else s.held x }
+  /-- A transaction joins the line. -/
+  | enqueue (s : H) (r : Nat) :
+      -- After: `r` is in the line.
+      HStep trust s { s with line := r :: s.line }
+  /-- A waiter leaves the line: it gives up (`PendingLock::abandon`). -/
+  | withdraw (s : H) (r : Nat) :
+      -- After: `r` is no longer in the line.
+      HStep trust s { s with line := s.line.erase r }
+  /-- A handoff's first step (`take_for_waiter`): the free key gets a
+  waiter's name, marked. -/
+  | name (s : H) (r : Nat)
+      -- The key is free,
+      (free : s.word = none)
+      -- and `r` waits in the line.
+      (queued : r ∈ s.line) :
+      -- After: the word names `r`, marked.
+      HStep trust s { s with word := some (r, true) }
+  /-- Its second step, when the waiter is still in the line: the grant
+  goes through, the waiter leaves the line holding the key, and the mark
+  goes (`granted`). -/
+  | grant (s : H) (r : Nat)
+      -- The word names `r`, marked,
+      (named : s.word = some (r, true))
+      -- and `r` is still in the line.
+      (queued : r ∈ s.line) :
+      -- After: the name is unmarked, `r` left the line and believes it
+      -- holds the key.
+      HStep trust s { s with word := some (r, false), line := s.line.erase r,
+                             held := fun x => if x = r then true else s.held x }
+  /-- Its second step, when the waiter withdrew: no grant, and the name is
+  cleared again (`clear_holder`). -/
+  | clear (s : H) (r : Nat)
+      -- The word names `r`, marked,
+      (named : s.word = some (r, true))
+      -- and `r` is no longer in the line.
+      (gone : r ∉ s.line) :
+      -- After: the word is free.
+      HStep trust s { s with word := none }
+  /-- A waiter's poll reads its own name in the word and concludes that its
+  transaction holds the key already (`Polled::Mine`): it leaves the line
+  and its call says "held". The code reads only an unmarked name; the
+  defect reads a marked one as well. -/
+  | mine (s : H) (r : Nat) (m : Bool)
+      -- The word names `r`, with mark `m`,
+      (named : s.word = some (r, m))
+      -- which the poll accepts: unmarked, or any name in the defect.
+      (rule : m = false ∨ trust = true) :
+      -- After: `r` left the line and believes it holds the key.
+      HStep trust s { s with line := s.line.erase r,
+                             held := fun x => if x = r then true else s.held x }
+
+/-- Any number of `HStep` steps, one after another. -/
+inductive HSteps (trust : Bool) : H → H → Prop
+  /-- No step at all. -/
+  | refl (s : H) : HSteps trust s s
+  /-- Some steps, then one more. -/
+  | tail {s t u : H} : HSteps trust s t → HStep trust t u → HSteps trust s u
+
+/-- What stays true while the mark is respected: a transaction that
+believes it holds the key is the unmarked name in the state word. -/
+def HInv (s : H) : Prop :=
+  -- Every believer is the unmarked name.
+  ∀ r, s.held r = true → s.word = some (r, false)
+
+/-- The start keeps `HInv`: nobody believes anything. -/
+theorem hinv_init : HInv H.init := by
+  -- A believer at the start would have `false = true`.
+  intro r hr
+  -- Which is impossible.
+  simp [H.init] at hr
+
+/-- Every step of the code (the mark respected) keeps `HInv`. -/
+theorem hstep_inv {s t : H}
+    -- One step of the code.
+    (h : HStep false s t)
+    -- The invariant held before it.
+    (hi : HInv s) :
+    -- Then it holds after.
+    HInv t := by
+  -- One case per kind of step.
+  cases h with
+  -- A take of the free key.
+  | take r free =>
+    -- Take a believer `x` after the take.
+    intro x hx
+    -- Is it the taker?
+    by_cases hxr : x = r
+    -- Yes.
+    ·
+      -- Put `r` for `x`: the new word is exactly that name, unmarked, and
+      -- the rewrite closes the goal by that.
+      rw [hxr]
+    -- No.
+    ·
+      -- Then it believed before the take.
+      simp [hxr] at hx
+      -- So the word named it then.
+      have h2 := hi x hx
+      -- But the word was free.
+      rw [free] at h2
+      -- `none = some _` is impossible.
+      simp at h2
+  -- A release by the holder.
+  | release r m named hr =>
+    -- Take a believer `x` after the release.
+    intro x hx
+    -- Is it the transaction that let go?
+    by_cases hxr : x = r
+    -- Yes.
+    ·
+      -- Then its belief was just cleared: put `r` for `x`.
+      rw [hxr] at hx
+      -- Its belief reads `false = true`, which is impossible.
+      simp at hx
+    -- No.
+    ·
+      -- Then it believed before the release.
+      simp [hxr] at hx
+      -- So the word named it then.
+      have h2 := hi x hx
+      -- But the word named `r`.
+      rw [named] at h2
+      -- The two words are one, so the pairs agree.
+      injection h2 with h3
+      -- So the names agree.
+      injection h3 with h4 h5
+      -- And `x = r` is against the case we are in.
+      exact absurd h4.symm hxr
+  -- A transaction joins the line.
+  | enqueue r =>
+    -- Take a believer `x`: the word and the beliefs are as before.
+    intro x hx
+    -- So the invariant before gives it.
+    exact hi x hx
+  -- A waiter leaves the line.
+  | withdraw r =>
+    -- Take a believer `x`: the word and the beliefs are as before.
+    intro x hx
+    -- So the invariant before gives it.
+    exact hi x hx
+  -- A handoff writes a marked name.
+  | name r free queued =>
+    -- Take a believer `x`: it believed before.
+    intro x hx
+    -- So the word named it then.
+    have h2 := hi x hx
+    -- But the word was free.
+    rw [free] at h2
+    -- `none = some _` is impossible.
+    simp at h2
+  -- A handoff's grant goes through.
+  | grant r named queued =>
+    -- Take a believer `x` after the grant.
+    intro x hx
+    -- Is it the waiter granted?
+    by_cases hxr : x = r
+    -- Yes.
+    ·
+      -- Put `r` for `x`: the new word is exactly that name, unmarked, and
+      -- the rewrite closes the goal by that.
+      rw [hxr]
+    -- No.
+    ·
+      -- Then it believed before the grant.
+      simp [hxr] at hx
+      -- So the word named it then, unmarked.
+      have h2 := hi x hx
+      -- But the word carried the mark.
+      rw [named] at h2
+      -- The two words are one, so the pairs agree.
+      injection h2 with h3
+      -- So the marks agree.
+      injection h3 with h4 h5
+      -- And `true = false` is impossible.
+      cases h5
+  -- A handoff's grant finds the waiter gone and clears the name.
+  | clear r named gone =>
+    -- Take a believer `x`: it believed before.
+    intro x hx
+    -- So the word named it, unmarked.
+    have h2 := hi x hx
+    -- But the word carried the mark.
+    rw [named] at h2
+    -- The two words are one, so the pairs agree.
+    injection h2 with h3
+    -- So the marks agree.
+    injection h3 with h4 h5
+    -- And `true = false` is impossible.
+    cases h5
+  -- A poll concludes its transaction holds the key already.
+  | mine r m named rule =>
+    -- The poll accepted the name, so it was unmarked.
+    have hm : m = false := by
+      -- Either the name was unmarked, or `false = true`.
+      cases rule with
+      -- Unmarked: that is the claim.
+      | inl h => exact h
+      -- `false = true`: impossible.
+      | inr h => cases h
+    -- Take a believer `x` after the poll.
+    intro x hx
+    -- Is it the waiter that polled?
+    by_cases hxr : x = r
+    -- Yes.
+    ·
+      -- Then put `r` for `x`.
+      rw [hxr]
+      -- The word is the one before the poll.
+      show s.word = some (r, false)
+      -- It names `r` with mark `m`, and `m` is `false`.
+      rw [named, hm]
+    -- No.
+    ·
+      -- Then it believed before, and the word did not change.
+      simp [hxr] at hx
+      -- So the invariant before gives it.
+      exact hi x hx
+
+/-- Every state the code reaches from a state that keeps `HInv` keeps it. -/
+theorem hsteps_inv {s t : H}
+    -- Any number of steps of the code.
+    (h : HSteps false s t)
+    -- The invariant held at the first state.
+    (hi : HInv s) :
+    -- Then it holds at the last.
+    HInv t := by
+  -- By induction on the steps.
+  induction h with
+  -- No step: the state is the first state.
+  | refl => exact hi
+  -- Some steps, then one more: the last step keeps it.
+  | tail _ hlast ih => exact hstep_inv hlast ih
+
+/-- **`handoff_exclusion`.** In every state the code reaches, at most one
+transaction believes it holds the key, a half-made handoff included. TLA+:
+`MutualExclusion`, row `MC_LockTable_Green_EarlyPoll`. -/
+theorem handoff_exclusion {s : H}
+    -- A state the code reaches.
+    (h : HSteps false H.init s)
+    -- Two transactions,
+    (r u : Nat)
+    -- the first believing it holds the key,
+    (hr : s.held r = true)
+    -- and the second too.
+    (hu : s.held u = true) :
+    -- Then they are the same transaction.
+    r = u := by
+  -- The invariant holds in `s`.
+  have hi := hsteps_inv h hinv_init
+  -- So the word names `r`, unmarked.
+  have h1 := hi r hr
+  -- And it names `u`, unmarked.
+  have h2 := hi u hu
+  -- The two are the same word.
+  rw [h1] at h2
+  -- So the pairs agree.
+  injection h2 with h3
+  -- So the names agree.
+  injection h3 with h4 h5
+
+/-- **`mine_before_grant_breaks_exclusion`.** With the mark ignored: 2 takes
+the key and 1 joins the line; 2 releases and the handoff writes 1's name;
+1's poll reads it and says "held"; the grant finds 1 gone and clears the
+name; 2 takes the free key again. Both believe they hold it. The law of
+`handoff_exclusion` fails. -/
+theorem mine_before_grant_breaks_exclusion :
+    -- Some state the defect reaches has 1 and 2 both believing they hold
+    -- the key.
+    ∃ s, HSteps true H.init s ∧ s.held 1 = true ∧ s.held 2 = true := by
+  -- The state is whatever these seven steps reach:
+  refine ⟨_, .tail (.tail (.tail (.tail (.tail (.tail (.tail (.refl _)
+    -- 2 takes the free key,
+    (.take _ 2 rfl))
+    -- 1 joins the line,
+    (.enqueue _ 1))
+    -- 2 releases,
+    (.release _ 2 false rfl rfl))
+    -- the handoff writes 1's name, marked,
+    (.name _ 1 rfl (by decide)))
+    -- 1's poll takes the marked name for a hold and leaves the line,
+    (.mine _ 1 true rfl (Or.inr rfl)))
+    -- the grant finds 1 gone and clears the name,
+    (.clear _ 1 rfl (by decide)))
+    -- and 2 takes the free key again.
+    (.take _ 2 rfl), rfl, rfl⟩
 
 -- End of the namespace opened at the top.
 end Regolith.LockTable

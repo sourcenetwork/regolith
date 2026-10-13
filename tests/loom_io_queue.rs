@@ -27,7 +27,9 @@
 //!   the group's job while another member runs it; each that registered is
 //!   pushed one completion.
 //! - **A ticket's callback runs exactly once**: `on_complete` races the
-//!   delivery of the outcome; the callback runs once, with the outcome.
+//!   delivery of the outcome; the callback runs once, with the outcome, on
+//!   the registering thread only once the ticket is ready and on the
+//!   delivering thread only before.
 //!
 //! Each is paired with a calibration that writes the one step the wrong way
 //! and must fail; without them a search that never reached the bad
@@ -121,6 +123,12 @@ fn a_ticket_callback_runs_exactly_once() {
 #[should_panic(expected = "the group synced twice")]
 fn calibration_a_job_claimed_without_a_cas_runs_twice() {
     jobs::calibration_a_job_claimed_without_a_cas_runs_twice();
+}
+
+#[test]
+#[should_panic(expected = "a callback ran on the registering thread before the ticket was ready")]
+fn calibration_a_list_closed_before_readiness_runs_a_callback_early() {
+    jobs::calibration_a_list_closed_before_readiness_runs_a_callback_early();
 }
 
 #[test]

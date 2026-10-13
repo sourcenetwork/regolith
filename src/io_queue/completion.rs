@@ -23,9 +23,14 @@
 //!   `on_complete` callback, then marks the ticket ready and wakes the task
 //!   awaiting it and every thread blocked on it.
 //!
-//! An `on_complete` registered while delivery is under way is refused by the
-//! closed callback list and runs at once on the registering thread, so each
-//! callback runs exactly once, at delivery or at registration. Nothing here
+//! **Ready** is the `on_complete` list closed. Delivery takes the list, runs
+//! what it took, and takes it again until it finds it empty, and closes it
+//! in the same compare-and-swap that finds it so. An `on_complete` registered
+//! while delivery is under way therefore lands on the list and runs on the
+//! delivering thread before the ticket is ready, as one registered before
+//! does; one the closed list refuses finds the ticket ready, and runs at
+//! once on the registering thread. Each callback runs exactly once, and the
+//! registering thread runs one only when the ticket is ready. Nothing here
 //! takes a lock.
 
 use std::sync::{Arc, OnceLock, Weak};
@@ -40,8 +45,9 @@ use crate::sync::internal::{AtomicUsize, Ordering};
 
 const PENDING: usize = 0;
 const DECIDED: usize = 1;
+/// Delivery began. Ready is not a state of its own: it is the `on_complete`
+/// list closed with [`SHUT`] (module docs).
 const DELIVERING: usize = 2;
-const READY: usize = 3;
 
 /// A callback that runs once with the outcome.
 pub(crate) type Callback<T> = Box<dyn FnOnce(&T) + Send>;
@@ -60,7 +66,8 @@ pub(crate) struct Completion<T> {
     /// What the outcome owes before anything else: a commit's own callbacks
     /// and the database hooks. Closed with [`SHUT`] at delivery.
     first: Stack<Callback<T>>,
-    /// The ticket's `on_complete` callbacks, closed with [`SHUT`] at delivery.
+    /// The ticket's `on_complete` callbacks, closed with [`SHUT`] at the end
+    /// of delivery: closed is ready.
     on_complete: Stack<Callback<T>>,
     /// Threads blocked in [`Completion::wait_decided`], closed with [`SHUT`]
     /// once the outcome is decided.
@@ -134,15 +141,16 @@ impl<T: Send + Sync + 'static> Completion<T> {
         self.state.load(Ordering::Acquire) != PENDING
     }
 
-    /// Whether the ticket's holder may see the outcome: delivery finished.
+    /// Whether the ticket's holder may see the outcome: delivery ran every
+    /// callback and closed the list.
     pub(crate) fn is_ready(&self) -> bool {
-        self.state.load(Ordering::Acquire) == READY
+        self.on_complete.flags() & SHUT != 0
     }
 
     /// Deliver the decided outcome on this thread: what it owes first, then
-    /// each `on_complete` callback, then readiness and the wakes. Runs once;
-    /// a call before the decision, or after another delivery began, does
-    /// nothing.
+    /// each `on_complete` callback, the ones registered while it runs
+    /// included, then readiness and the wakes. Runs once; a call before the
+    /// decision, or after another delivery began, does nothing.
     pub(crate) fn deliver_decided(&self) {
         if self
             .state
@@ -157,21 +165,31 @@ impl<T: Send + Sync + 'static> Completion<T> {
         for f in self.first.take(SHUT) {
             f(outcome);
         }
-        for f in self.on_complete.take(SHUT) {
-            crate::engine::callback::survive(|| self.report.upgrade(), self.name, || f(outcome));
+        // A registration racing this lands on the list and is served by the
+        // next take; the close that finds the list empty is the step that
+        // makes the ticket ready, so a registration it refuses sees it ready.
+        loop {
+            for f in self.on_complete.take_open() {
+                crate::engine::callback::survive(
+                    || self.report.upgrade(),
+                    self.name,
+                    || f(outcome),
+                );
+            }
+            if self.on_complete.shut_if_empty() {
+                break;
+            }
         }
-        self.state.store(READY, Ordering::Release);
         self.waker.wake();
     }
 
-    /// Run `f` with the outcome once: at delivery, or now if delivery has
-    /// begun or finished.
+    /// Run `f` with the outcome once: at delivery, on the delivering thread,
+    /// or now, on this thread, if the ticket is ready.
     pub(crate) fn on_complete(&self, f: Callback<T>) {
         if self.is_ready() {
             self.run_now(f);
         } else if let Err(f) = self.on_complete.push(f, SHUT) {
-            // Delivery took the list after the check: it is under way or
-            // done, and the outcome is decided.
+            // Delivery closed the list after the check: the ticket is ready.
             self.run_now(f);
         }
     }
@@ -278,6 +296,38 @@ mod tests {
             counted.fetch_add(1, Ordering::SeqCst);
         }));
         assert_eq!(runs.load(Ordering::SeqCst), 1);
+    }
+
+    /// Another thread registers while delivery is under way (the delivering
+    /// thread is inside an earlier callback): the callback still runs on the
+    /// delivering thread, before the ticket is ready, as the public
+    /// `on_complete` contract promises for a ticket not ready yet.
+    #[test]
+    fn a_callback_registered_during_delivery_runs_on_the_delivering_thread() {
+        let done = completion();
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (racing, saw) = (Arc::clone(&done), Arc::clone(&seen));
+        done.on_complete(Box::new(move |_| {
+            std::thread::spawn(move || {
+                let ticket = Arc::clone(&racing);
+                racing.on_complete(Box::new(move |_| {
+                    let ready = ticket.is_ready();
+                    saw.lock()
+                        .unwrap()
+                        .push((std::thread::current().id(), ready));
+                }));
+            })
+            .join()
+            .unwrap();
+        }));
+        assert!(done.decide(1));
+        done.deliver_decided();
+        assert!(done.is_ready());
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [(std::thread::current().id(), false)],
+            "ran on the delivering thread, before the ticket was ready"
+        );
     }
 
     #[test]

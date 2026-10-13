@@ -16,8 +16,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use regolith::{
-    AbortReason, Db, Error, OptimisticTransactionDb, Options, Transaction, TransactionDb,
-    TransactionError, TransactionHooks, TxResult, TxnOptions,
+    AbortReason, Db, Error, LogLayout, OptimisticTransactionDb, Options, Transaction,
+    TransactionDb, TransactionError, TransactionHooks, TxResult, TxnOptions,
 };
 use tempfile::TempDir;
 
@@ -516,4 +516,204 @@ fn a_hook_panic_a_callback_ignored_poisons_the_transaction() {
     );
     assert_eq!(entries(&log), ["abort:panicked"]);
     assert_eq!(db.db().get(b"k").unwrap(), None);
+}
+
+/// A one-key log for the append cases: the head at `journal-head`, entry `p`
+/// at `journal/` and `p` in eight big-endian bytes.
+struct Journal;
+
+impl LogLayout for Journal {
+    fn head_key(&self) -> &[u8] {
+        b"journal-head"
+    }
+
+    fn entry_key(&self, position: u64, out: &mut Vec<u8>) {
+        out.extend_from_slice(b"journal/");
+        out.extend_from_slice(&position.to_be_bytes());
+    }
+
+    fn max_entry_key_len(&self) -> usize {
+        b"journal/".len() + 8
+    }
+}
+
+fn refused() -> TransactionError {
+    Error::InvalidArgument("refused".into()).into()
+}
+
+fn is_refused(result: TxResult<()>) -> bool {
+    matches!(
+        result,
+        Err(TransactionError::Engine(Error::InvalidArgument(_)))
+    )
+}
+
+/// The entry `Journal` holds at `position`, if any.
+fn journal_entry(db: &Db, position: u64) -> Option<Vec<u8>> {
+    let mut key = Vec::new();
+    Journal.entry_key(position, &mut key);
+    db.get(&key).unwrap().map(|value| value.to_vec())
+}
+
+#[test]
+fn a_failed_callback_that_rolled_back_the_callers_savepoint_puts_it_all_back() {
+    for fixture in Fixture::both() {
+        let journal: Arc<dyn LogLayout> = Arc::new(Journal);
+        let mut txn = fixture.begin();
+        // The caller's savepoint is set on an empty transaction, so the
+        // callback's rollback takes the caller's write and append with it.
+        txn.set_savepoint();
+        txn.put(b"kept", b"1").unwrap();
+        txn.append(&journal, b"entry", None).unwrap();
+        let mut failures_left = 1;
+        txn.before_commit(move |txn| {
+            if failures_left > 0 {
+                failures_left -= 1;
+                txn.rollback_to_savepoint()?;
+                txn.put(b"doomed", b"x")?;
+                return Err(refused());
+            }
+            Ok(())
+        });
+
+        assert!(is_refused(txn.prepare()));
+        assert_eq!(
+            txn.get(b"kept").unwrap().as_deref(),
+            Some(&b"1"[..]),
+            "the failed callback's rollback took the caller's write"
+        );
+        assert_eq!(txn.get(b"doomed").unwrap(), None);
+
+        // The retry succeeds without touching anything, so the commit carries
+        // exactly what the caller buffered.
+        txn.prepare().unwrap();
+        txn.commit().unwrap();
+        assert_eq!(
+            fixture.db().get(b"kept").unwrap().as_deref(),
+            Some(&b"1"[..])
+        );
+        assert_eq!(fixture.db().get(b"doomed").unwrap(), None);
+        assert_eq!(
+            journal_entry(fixture.db(), 1).as_deref(),
+            Some(&b"entry"[..]),
+            "the failed callback's rollback took the caller's append"
+        );
+    }
+}
+
+#[test]
+fn a_failed_callback_that_rolled_back_the_callers_savepoint_leaves_it_set() {
+    for fixture in Fixture::both() {
+        let mut txn = fixture.begin();
+        txn.put(b"before", b"1").unwrap();
+        txn.set_savepoint();
+        txn.put(b"after", b"2").unwrap();
+        let mut failures_left = 1;
+        txn.before_commit(move |txn| {
+            if failures_left > 0 {
+                failures_left -= 1;
+                txn.rollback_to_savepoint()?;
+                return Err(refused());
+            }
+            Ok(())
+        });
+        assert!(is_refused(txn.prepare()));
+        assert_eq!(txn.get(b"after").unwrap().as_deref(), Some(&b"2"[..]));
+
+        // The caller's savepoint is back where the caller set it: rolling back
+        // to it takes `after` and keeps `before`, and it was the only one.
+        txn.rollback_to_savepoint().unwrap();
+        assert!(matches!(
+            txn.rollback_to_savepoint(),
+            Err(TransactionError::NoSavepoint)
+        ));
+        txn.prepare().unwrap();
+        txn.commit().unwrap();
+        assert_eq!(
+            fixture.db().get(b"before").unwrap().as_deref(),
+            Some(&b"1"[..])
+        );
+        assert_eq!(fixture.db().get(b"after").unwrap(), None);
+    }
+}
+
+#[test]
+fn a_failed_callback_that_released_the_callers_savepoint_leaves_it_set() {
+    for fixture in Fixture::both() {
+        let mut txn = fixture.begin();
+        txn.put(b"before", b"1").unwrap();
+        txn.set_savepoint();
+        txn.put(b"after", b"2").unwrap();
+        let mut failures_left = 1;
+        txn.before_commit(move |txn| {
+            if failures_left > 0 {
+                failures_left -= 1;
+                txn.release_savepoint()?;
+                txn.put(b"doomed", b"x")?;
+                return Err(refused());
+            }
+            Ok(())
+        });
+        assert!(is_refused(txn.prepare()));
+
+        // The released savepoint is back, at the mark the caller set it at.
+        txn.rollback_to_savepoint().unwrap();
+        assert_eq!(txn.get(b"after").unwrap(), None);
+        assert_eq!(txn.get(b"before").unwrap().as_deref(), Some(&b"1"[..]));
+        txn.prepare().unwrap();
+        txn.commit().unwrap();
+        assert_eq!(
+            fixture.db().get(b"before").unwrap().as_deref(),
+            Some(&b"1"[..])
+        );
+        assert_eq!(fixture.db().get(b"after").unwrap(), None);
+        assert_eq!(fixture.db().get(b"doomed").unwrap(), None);
+    }
+}
+
+#[test]
+fn a_rollback_inside_a_callback_that_succeeded_is_undone_when_the_outer_one_fails() {
+    for fixture in Fixture::both() {
+        let mut txn = fixture.begin();
+        txn.set_savepoint();
+        txn.put(b"kept", b"1").unwrap();
+        let mut failures_left = 1;
+        txn.before_commit(move |txn| {
+            // Runs `inner`, queued behind this callback, inside it.
+            txn.prepare()?;
+            if failures_left > 0 {
+                failures_left -= 1;
+                return Err(refused());
+            }
+            Ok(())
+        });
+        let mut rollbacks_left = 1;
+        txn.before_commit(move |txn| {
+            if rollbacks_left > 0 {
+                rollbacks_left -= 1;
+                txn.rollback_to_savepoint()?;
+            }
+            txn.put(b"inner", b"2")
+        });
+
+        assert!(is_refused(txn.prepare()));
+        assert_eq!(txn.get(b"kept").unwrap().as_deref(), Some(&b"1"[..]));
+        assert_eq!(txn.get(b"inner").unwrap(), None);
+        txn.release_savepoint().unwrap();
+        assert!(matches!(
+            txn.release_savepoint(),
+            Err(TransactionError::NoSavepoint)
+        ));
+
+        txn.prepare().unwrap();
+        txn.commit().unwrap();
+        assert_eq!(
+            fixture.db().get(b"kept").unwrap().as_deref(),
+            Some(&b"1"[..])
+        );
+        assert_eq!(
+            fixture.db().get(b"inner").unwrap().as_deref(),
+            Some(&b"2"[..])
+        );
+    }
 }

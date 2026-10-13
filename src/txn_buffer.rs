@@ -493,6 +493,13 @@ where
     /// only when no reader can be walking the list, and a mutable borrow says
     /// so.
     pub(crate) fn truncate(&mut self, len: usize) {
+        self.truncate_into(len, drop);
+    }
+
+    /// [`Self::truncate`], handing each entry it takes off to `taken`, newest
+    /// first, instead of dropping it: what a rollback inside a transaction
+    /// callback keeps, so the callback failing can put it back.
+    pub(crate) fn truncate_into(&mut self, len: usize, mut taken: impl FnMut((K, V))) {
         let before = *self.len.get_mut();
         let mut remaining = before;
         let mut head = *self.head.get_mut();
@@ -510,6 +517,8 @@ where
             }
             head = node.next;
             remaining -= 1;
+            let Node { key, value, .. } = *node;
+            taken((key, value));
         }
         *self.head.get_mut() = head;
         *self.len.get_mut() = remaining;
@@ -526,21 +535,33 @@ where
     /// into a keyed structure anyway and gets it for free by keeping the
     /// first value it sees for a key.
     pub(crate) fn drain(&mut self) -> Vec<(K, V)> {
-        let mut drained = Vec::with_capacity(self.len.load(Ordering::Acquire));
-        let mut cursor = self.head.swap(core::ptr::null_mut(), Ordering::AcqRel);
-        while !cursor.is_null() {
-            // SAFETY: this thread took the list out of the buffer and has
-            // `&mut self`, so it is the only owner of these nodes.
-            let node = unsafe { Box::from_raw(cursor) };
-            cursor = node.next;
-            drained.push((node.key, node.value));
-        }
-        self.len.store(0, Ordering::Release);
-        self.removed += drained.len() as u64;
-        self.spill = OnceLock::new();
-        self.spill_published.store(false, Ordering::Release);
-        self.spill_seeded.store(false, Ordering::Release);
+        let mut drained = Vec::with_capacity(*self.len.get_mut());
+        self.drain_with(|key, value| drained.push((key, value)));
         drained
+    }
+
+    /// [`Self::drain`] handing each entry to `f`, newest first, instead of
+    /// collecting them: for a caller that only walks them once, so nothing
+    /// is allocated to hold them.
+    ///
+    /// Each node leaves the list before `f` sees it, so a panic in `f` leaves
+    /// the rest listed, and the buffer's `Drop` frees them.
+    pub(crate) fn drain_with(&mut self, mut f: impl FnMut(K, V)) {
+        // The index points into the list, so it goes first.
+        self.spill = OnceLock::new();
+        *self.spill_published.get_mut() = false;
+        *self.spill_seeded.get_mut() = false;
+        let taken = *self.len.get_mut();
+        *self.len.get_mut() = 0;
+        self.removed += taken as u64;
+        while !self.head.get_mut().is_null() {
+            // SAFETY: `&mut self` makes this thread the only one that can reach
+            // the list, and the head is a node `push` allocated by `Box::into_raw`.
+            let node = unsafe { Box::from_raw(*self.head.get_mut()) };
+            *self.head.get_mut() = node.next;
+            let Node { key, value, .. } = *node;
+            f(key, value);
+        }
     }
 }
 
