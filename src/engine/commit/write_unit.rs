@@ -162,7 +162,7 @@ pub(crate) struct WriteUnit {
 
 /// A value alone on its cache line.
 #[repr(align(128))]
-struct Padded<T>(T);
+pub(super) struct Padded<T>(pub(super) T);
 
 /// The job `commit_nowait` commits wait on for the unit to be let go.
 struct Line {

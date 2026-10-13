@@ -70,6 +70,21 @@
 //!   the ring full. It freezes both frontiers, and the state it leaves is
 //!   of a new epoch: a decision a thread was computing from the old state
 //!   carries the old epoch, and its slot is failed when it is settled.
+//! - **P6, a call far from its turn sleeps until its turn nears.** A
+//!   blocking call whose slot is more than [`turn_wait::LEAD`] slots past the decided
+//!   frontier, and that finds the next slot being decided by another thread,
+//!   parks on its own slot instead of yielding to that thread over and over.
+//!   The thread that passes the decided frontier over slot `i` names slot
+//!   `i + LEAD` (a rollback's jump names the slots past it the same way),
+//!   and the next blocking call whose commit is done wakes the owners of
+//!   the slots named, so a sleeper wakes while [`turn_wait::LEAD`] slots are still to
+//!   be decided before its own, and is helping by its turn. A slot that
+//!   fails or lands wakes its owner too: another thread may have carried
+//!   it all the way. A sleeper that nobody wakes wakes after
+//!   [`turn_wait::TURN_PATIENCE`] and helps (`turn_wait.rs`, T1 to T3). The
+//!   park changes no step a thread takes, only when it takes it: every safety
+//!   rule above holds whatever the sleepers do, and progress holds with the
+//!   patience bound (`PipelineHelping.lean`, `a_park_is_bounded`).
 //! - **P5, helping is bounded.** A thread decides and publishes only slots
 //!   at or below its own (a rollback slot aside), and each at most once. It
 //!   writes the records of those slots, and a run it writes as the write
@@ -88,7 +103,7 @@ use super::super::io::job::Job;
 use super::super::wal::check_write_len;
 use super::append::AppendOrder;
 use super::descriptor::{
-    ADMITTED, APPLIED, APPLYING, After, DECIDING, Decision, Descriptor, FAILED, INSTALLED,
+    ADMITTED, APPLIED, APPLYING, After, DECIDING, Decision, Descriptor, FAILED, INSTALLED, NEAR,
     Verdict as Fate, WRITTEN, Work, is_immediate,
 };
 use super::hook;
@@ -97,6 +112,7 @@ use super::request::Ops;
 use super::ring::{ArcSlot, Installed, Loaded, Ring};
 use super::round::Round;
 use super::spare;
+use super::turn_wait::{self, Turns};
 use super::txn::{TxnRequest, Verdict};
 use super::write_unit::{Await, Brought, WriteUnit};
 use super::{Settled, WriteRequest};
@@ -118,6 +134,9 @@ pub(crate) struct Pipeline {
     /// The single-flight unit records reach the log through
     /// (`write_unit.rs`).
     pub(super) writes: WriteUnit,
+    /// The calls asleep far from their turn, and the slots named and told
+    /// as near it (P6, `turn_wait.rs`).
+    pub(super) turns: Turns,
 }
 
 impl Pipeline {
@@ -136,6 +155,7 @@ impl Pipeline {
             tip: ArcSlot::new(RingArc::new(genesis)),
             round: ArcSlot::new(Round::new(engine)),
             writes,
+            turns: Turns::new(),
         }
     }
 }
@@ -319,6 +339,10 @@ impl RegolithEngine {
         help: Help<'_>,
         own: Option<&RingArc<Descriptor>>,
     ) -> Turn {
+        // The slot this call last parked far from its turn at (P6): a call
+        // whose patience ran out with the frontier where it was helps, and
+        // parks again only once the frontier moved on.
+        let mut parked_at = None;
         loop {
             let decided = pipe.ring.decided();
             if decided >= upto {
@@ -344,7 +368,7 @@ impl RegolithEngine {
                     // Void, or its cell already took a later lap: a void slot
                     // holds nothing, so its cell is not kept for it (R6).
                     Loaded::Void | Loaded::Gone => {
-                        pipe.ring.pass_decided(index);
+                        self.pass_decided(pipe, index);
                         continue;
                     }
                     Loaded::Empty => {
@@ -378,9 +402,23 @@ impl RegolithEngine {
                 let before = desc.claim(DECIDING | APPLYING);
                 applies = before & APPLYING == 0;
                 if before & DECIDING != 0 {
-                    // Another thread is deciding it now: it is given about
-                    // as long as the decision takes before this thread
-                    // repeats the work (P5).
+                    // Another thread is deciding it now. A blocking call far
+                    // from its turn sleeps until its turn nears (P6), and
+                    // looks again; one near its turn gives the other thread
+                    // about as long as the decision takes before it repeats
+                    // the work (P5).
+                    if let Some(own) = own
+                        && matches!(help, Help::Wait)
+                        && parked_at != Some(index)
+                        && self.park_far(pipe, own, index)
+                    {
+                        parked_at = Some(index);
+                        if applies {
+                            // Nobody waits on a claim this thread left.
+                            desc.unclaim(APPLYING);
+                        }
+                        continue;
+                    }
                     courtesy(desc.work_size(), || desc.decision().is_some());
                 }
                 if desc.decision().is_none() {
@@ -726,7 +764,58 @@ impl RegolithEngine {
                 break;
             }
         }
-        pipe.ring.pass_decided(index);
+        self.pass_decided(pipe, index);
+    }
+
+    /// Pass the decided frontier from `index - 1` to `index` (R5) and, when
+    /// this call passed it and somebody sleeps far from its turn, wake the
+    /// owner of slot `index + LEAD` (P6, `Turns::name`). `true` when this
+    /// call passed it.
+    pub(super) fn pass_decided(&self, pipe: &Pipeline, index: u64) -> bool {
+        if !pipe.ring.pass_decided(index) {
+            return false;
+        }
+        pipe.turns.name(index);
+        true
+    }
+
+    /// Wake the calls parked far from their turn whose turn now nears, up
+    /// to the slot the decided frontier last named (P6). Called by a
+    /// blocking call whose commit is done, off the decided frontier's path;
+    /// each slot is told once, by whichever call claims it.
+    pub(super) fn wake_near(&self, pipe: &Pipeline) {
+        let Some((from, to)) = pipe.turns.claim_told() else {
+            return;
+        };
+        // A published slot is retired: its owner, if asleep, was woken as it
+        // landed (`Descriptor::land`).
+        for slot in (from + 1).max(pipe.ring.published() + 1)..=to {
+            if let Loaded::Ready(desc) = pipe.ring.load(slot) {
+                desc.mark(NEAR);
+            }
+        }
+    }
+
+    /// Park the blocking call that owns `own`, installed, until its turn
+    /// nears: the decided frontier within [`turn_wait::LEAD`] slots of its slot,
+    /// or [`turn_wait::TURN_PATIENCE`] passed (P6). `false` when it is near its turn
+    /// already, and does not park; the caller then gives the thread deciding
+    /// slot `next` its courtesy.
+    pub(super) fn park_far(&self, pipe: &Pipeline, own: &RingArc<Descriptor>, next: u64) -> bool {
+        let turns = &pipe.turns;
+        if !crate::env::PLATFORM_THREADS || !own.is_blocking() || own.index() <= next + turns.lead()
+        {
+            return false;
+        }
+        // Counted before it registers: a thread that passes the frontier
+        // after this names its slot (T1).
+        turns.count_in();
+        hook::at(hook::Stage::TurnWait);
+        own.park(turn_wait::TURN_PATIENCE, || {
+            turns.near(own, pipe.ring.decided())
+        });
+        turns.count_out();
+        true
     }
 
     /// Whether slot `desc` may be published: it takes nothing, or its record
@@ -935,7 +1024,12 @@ impl RegolithEngine {
             // A blocking call is never left waiting on a queue.
             let _ = self.bring_written(pipe, desc, Await::Park);
             match self.publish_upto(pipe, index, Some(desc), Await::Park) {
-                Progress::Published => return,
+                Progress::Published => {
+                    // Done: wake who waits for its turn, off the decided
+                    // frontier's path (P6).
+                    self.wake_near(pipe);
+                    return;
+                }
                 Progress::NeedsSync | Progress::Failed => {
                     // A blocking call gets past the round.
                     let _ = self.sync_round(pipe, Help::Wait);

@@ -786,6 +786,8 @@ impl RegolithEngine {
         debug_assert!(replaced, "only a rollback replaces its own marker");
         pipe.ring.thaw(last);
         pipe.ring.thaw_decided(last);
+        // The jump names the slots past it as a pass would (P6).
+        pipe.turns.name(last);
         for desc in &failed {
             pipe.ring.retire(desc.index());
         }

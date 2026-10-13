@@ -355,11 +355,15 @@ pub(super) const ABANDONED: u64 = 1 << 8;
 /// A thread claimed the encoding of the slot's record (D4).
 pub(super) const FILLING: u64 = 1 << 9;
 /// A thread parked on the slot ([`Descriptor::park`]): whoever sets
-/// [`FILLED`], [`WRITTEN`] or [`FAILED`] wakes the slot's list (D5). Never
+/// [`FILLED`], [`WRITTEN`], [`FAILED`] or [`NEAR`] wakes the slot's list
+/// (D5), and so does a blocking slot's landing ([`Descriptor::land`]). Never
 /// cleared: a wake that finds nobody left costs one swap of an empty list.
 pub(super) const PARKED: u64 = 1 << 10;
+/// The decided frontier came within `LEAD` slots of the slot: its owner,
+/// parked far from its turn, wakes (`turn_wait.rs`, P6).
+pub(super) const NEAR: u64 = 1 << 11;
 /// The flags whose setting wakes the threads parked on the slot.
-const WAKES: u64 = FILLED | WRITTEN | FAILED;
+const WAKES: u64 = FILLED | WRITTEN | FAILED | NEAR;
 
 /// A slot's record buffer, handed from thread to thread by D4: written by
 /// the one thread that claimed `FILLING`, before `FILLED`, and only read
@@ -477,6 +481,14 @@ impl Descriptor {
     /// took until it runs again.
     pub(super) fn land(&self) {
         if self.blocking {
+            // Its owner may sleep far from its turn (`pipeline.rs`, P6):
+            // a slot with no record, published by whoever helps, has no
+            // other flag that would wake it. The owner sets `PARKED` and
+            // then reads the decided frontier, which passed this slot
+            // before this read: one of the two sees the other.
+            if self.flags.load(Ordering::SeqCst) & PARKED != 0 {
+                self.wake();
+            }
             return;
         }
         for waiter in self.landing.take(SHUT) {
@@ -646,6 +658,9 @@ impl Descriptor {
         // A list that is never closed takes every push.
         let _ = self.sleepers.push(thread::current(), 0);
         self.flags.fetch_or(PARKED, Ordering::SeqCst);
+        // Against a landing's look at `PARKED` after the frontier it reads
+        // in `ready` passed: one of the two sees the other.
+        crate::sync::internal::seq_cst_handshake();
         !ready()
     }
 

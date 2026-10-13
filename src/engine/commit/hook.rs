@@ -18,6 +18,10 @@ pub(crate) enum Stage {
     /// Inside the encoding of a slot's record into its descriptor, the
     /// encoding claimed (`FILLING`) and the record not filled yet.
     Fill,
+    /// A blocking call far from its turn found the next slot decided by
+    /// another thread and is about to park until its turn nears
+    /// (`pipeline.rs`, P6).
+    TurnWait,
     /// Before a slot's record is written: the write unit claimed and its
     /// run gathered, or a copy about to count in.
     Write,

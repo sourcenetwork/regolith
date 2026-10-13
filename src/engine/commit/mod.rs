@@ -95,6 +95,7 @@ mod spare;
 mod stall;
 mod terminator;
 mod turn;
+mod turn_wait;
 mod txn;
 mod write_check;
 mod write_unit;
@@ -642,6 +643,9 @@ mod pipeline_tests;
 
 #[cfg(test)]
 mod write_unit_tests;
+
+#[cfg(test)]
+mod turn_wait_tests;
 
 #[cfg(test)]
 mod allocate_tests;
