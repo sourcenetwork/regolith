@@ -346,7 +346,10 @@ impl Waiter {
 
     /// Takes the waker a claim set aside, then gives the slot back. If a
     /// grant or nudge marked a waker armed meanwhile, claims that one too
-    /// and reports [`Taken::Again`]. The caller holds the taking bit.
+    /// and reports [`Taken::Again`]. The caller holds the taking bit. After
+    /// [`Taken::Done`] the caller has let go of the node: unless it held
+    /// the last reference, it must not touch the node again, since the
+    /// party holding the last one may free or reuse it at once.
     fn take_claimed(&self) -> (Option<Waker>, Taken) {
         let mut state = self.state.load(Ordering::Acquire);
         // SAFETY: the taking bit makes the taken slot this caller's.
@@ -379,6 +382,19 @@ impl Waiter {
             // SAFETY: forwarded from the caller.
             drop(slot.with_mut(|slot| unsafe { (*slot).take() }));
         }
+    }
+
+    /// Under loom, freeing the node counts as a write to every word of it.
+    /// loom then checks that each earlier access, by any party, happened
+    /// before the free, so a party that touches the node after letting go
+    /// of its reference fails the model instead of reading freed memory
+    /// unseen.
+    #[cfg(loom)]
+    fn retire(&mut self) {
+        self.state.with_mut(|_| ());
+        self.next.with_mut(|_| ());
+        self.wake_next.with_mut(|_| ());
+        self.payload.with_mut(|_| ());
     }
 }
 
@@ -463,6 +479,9 @@ impl Pool {
             Ok(()) => return,
             Err(Pooled(node)) => node,
         };
+        // SAFETY: as above, the caller owns the node outright.
+        #[cfg(loom)]
+        unsafe { &mut *node.as_ptr() }.retire();
         // SAFETY: every node is a leaked `Box` and this one is unreferenced.
         drop(unsafe { Box::from_raw(node.as_ptr()) });
     }
@@ -581,12 +600,18 @@ impl<'a> WakeList<'a> {
         let node = NonNull::new(self.head)?;
         // SAFETY: this list holds the node's wake reference.
         let waiter = unsafe { node.as_ref() };
+        // The link is read while this list still holds the node. The take
+        // below may let go of the last reference but one, and the party
+        // holding that one may then free or reuse the node at once. Nobody
+        // else writes the link meanwhile: the taking bit keeps every other
+        // wake list from claiming the node until the take lets it go.
+        let next = waiter.wake_next.load(Ordering::Relaxed);
         let (waker, taken) = waiter.take_claimed();
         match taken {
             // The node stays at the front for the waker just claimed.
             Taken::Again => {}
             Taken::Done(last) => {
-                self.head = waiter.wake_next.load(Ordering::Relaxed);
+                self.head = next;
                 if self.head.is_null() {
                     self.tail = ptr::null_mut();
                 }
