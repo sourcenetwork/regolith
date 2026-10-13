@@ -207,6 +207,12 @@ fn a_sync_that_does_not_wait_has_a_copy_land_under_it() {
 }
 
 #[test]
+#[should_panic(expected = "a copy of the record landed under the sync")]
+fn a_sync_that_only_loads_the_sides_has_a_copy_land_under_it() {
+    park::a_sync_that_only_loads_the_sides_has_a_copy_land_under_it();
+}
+
+#[test]
 fn a_queue_off_the_list_when_the_job_lands_is_told_once() {
     park::a_queue_off_the_list_when_the_job_lands_is_told_once();
 }
