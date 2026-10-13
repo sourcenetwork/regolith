@@ -125,7 +125,12 @@ fn time_opens(label: &str, shape: &Path, scratch: &Path, reps: u64, puts: u64) {
                     db.get(last.as_bytes()).expect("get").is_some(),
                     "{label}: the last put did not survive"
                 );
-                std::mem::forget(db);
+                // Every copy is opened once and never again: closed here, its
+                // descriptors, lock and worker are given back, so a later
+                // repetition is not refused for the files earlier ones held.
+                db.close().expect("close");
+                drop(db);
+                fs::remove_dir_all(&dir).expect("remove the copy");
                 micros.push(elapsed);
             }
             Err(e) => {
