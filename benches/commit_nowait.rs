@@ -22,8 +22,8 @@
 mod common;
 
 use std::collections::VecDeque;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};
 
 use regolith::{
@@ -165,12 +165,12 @@ fn run_rep(durability: DurabilityMode, mode: Mode, writers: usize, dur: Duration
         OptimisticTransactionDb::open(tmp.path(), opts(durability))
             .unwrap_or_else(|e| panic!("open db at {}: {e}", tmp.path().display())),
     );
-    let barrier = Arc::new(Barrier::new(writers + 1));
+    let line = Arc::new(common::start::StartLine::new(writers));
     let committed = Arc::new(AtomicU64::new(0));
     let mut handles = Vec::with_capacity(writers);
     for w in 0..writers {
         let db = Arc::clone(&db);
-        let barrier = Arc::clone(&barrier);
+        let line = Arc::clone(&line);
         let committed = Arc::clone(&committed);
         handles.push(std::thread::spawn(move || {
             let mut rng = common::Rng::new(0x0C0_17A1 ^ w as u64);
@@ -189,8 +189,7 @@ fn run_rep(durability: DurabilityMode, mode: Mode, writers: usize, dur: Duration
             writer.drain(&mut warmup);
             // Sized for a fast run so the measured loop does not reallocate.
             let mut latencies: Vec<u32> = Vec::with_capacity(1 << 16);
-            barrier.wait();
-            let deadline = Instant::now() + dur;
+            let deadline = line.wait() + dur;
             let first = writer.next;
             while Instant::now() < deadline {
                 writer.one(mode, &mut latencies);
@@ -200,8 +199,7 @@ fn run_rep(durability: DurabilityMode, mode: Mode, writers: usize, dur: Duration
             latencies
         }));
     }
-    barrier.wait();
-    let start = Instant::now();
+    let start = line.start();
     let mut latencies: Vec<u32> = Vec::new();
     for h in handles {
         latencies.extend(h.join().expect("writer thread panicked"));
