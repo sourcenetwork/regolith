@@ -100,7 +100,7 @@ use super::pipeline::{Pipeline, ops_of};
 use super::ring::{ArcSlot, Linked, Loaded};
 use crate::perf_context::{PerfTimer, PerfTimerField};
 use crate::statistics::{Histogram, Ticker};
-use crate::sync::internal::{Arc as RingArc, AtomicPtr, AtomicU64, Ordering};
+use crate::sync::internal::{Arc as RingArc, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 
 /// The unit is claimed.
 pub(super) const CLAIMED: u64 = 1;
@@ -124,6 +124,11 @@ pub(super) const MAX_BATCH_BYTES: u64 = 1 << 20;
 /// Rounds of `spin_loop` a waiter gives the holder before it parks, leaves
 /// or copies: about as long as one host write of a run takes.
 pub(super) const SPIN_ROUNDS: u32 = 64;
+/// Waiters that spin at once at the most; any other parks at once. A
+/// spinner holds a processor, and more of them than a few take processors
+/// from the holder and the threads deciding, which then run late and make
+/// every waiter wait longer.
+pub(super) const SPIN_BUDGET: usize = 4;
 /// How long a blocking waiter waits in all, from when it first had to,
 /// before it writes the record itself (WU5).
 pub(super) const PATIENCE: Duration = Duration::from_micros(50);
@@ -150,7 +155,14 @@ pub(crate) struct WriteUnit {
     /// its queue: released, and replaced, by the holder that lets go a claim
     /// a commit was queued on.
     line: ArcSlot<Line>,
+    /// The waiters spinning now ([`SPIN_BUDGET`]), on a line of its own so
+    /// their counting does not slow the claim's word.
+    spinners: Padded<AtomicUsize>,
 }
+
+/// A value alone on its cache line.
+#[repr(align(128))]
+struct Padded<T>(T);
 
 /// The job `commit_nowait` commits wait on for the unit to be let go.
 struct Line {
@@ -180,6 +192,7 @@ impl WriteUnit {
             word: AtomicU64::new(0),
             written: AtomicU64::new(last),
             line: ArcSlot::new(Line::fresh()),
+            spinners: Padded(AtomicUsize::new(0)),
         }
     }
 
@@ -589,17 +602,22 @@ impl RegolithEngine {
     }
 
     /// Spin about one write's length, until the record's flags change from
-    /// `flags` or the claim `seen` lets the unit go.
+    /// `flags` or the claim `seen` lets the unit go, unless [`SPIN_BUDGET`]
+    /// waiters spin already.
     fn spin(&self, pipe: &Pipeline, desc: &Descriptor, flags: u64, seen: u64) {
         if !crate::env::PLATFORM_THREADS {
             return;
         }
-        for _ in 0..SPIN_ROUNDS {
-            if desc.flags() != flags || !pipe.writes.holds(seen) {
-                return;
+        let spinners = &pipe.writes.spinners.0;
+        if spinners.fetch_add(1, Ordering::Relaxed) < SPIN_BUDGET {
+            for _ in 0..SPIN_ROUNDS {
+                if desc.flags() != flags || !pipe.writes.holds(seen) {
+                    break;
+                }
+                std::hint::spin_loop();
             }
-            std::hint::spin_loop();
         }
+        spinners.fetch_sub(1, Ordering::Relaxed);
     }
 
     /// Whether a blocking waiter has waited long enough to write the record
@@ -814,6 +832,7 @@ impl RegolithEngine {
         let wrote = flight.write(run.offset, &slices[..keep]);
         drop(flight);
         let mut parked = [false; MAX_BATCH_RECORDS];
+        let mut wrote_upto = 0;
         match wrote {
             Ok(()) => {
                 let stats = self.statistics();
@@ -835,13 +854,14 @@ impl RegolithEngine {
                 {
                     s.record(Histogram::WalWriteTime, micros);
                 }
+                let last = run
+                    .records()
+                    .nth(keep - 1)
+                    .map_or(run.first, |held| held.index());
                 if clean {
-                    let last = run
-                        .records()
-                        .nth(keep - 1)
-                        .map_or(run.first, |held| held.index());
                     unit.written.store(last.max(start - 1), Ordering::Release);
                 }
+                wrote_upto = last;
             }
             Err(err) => {
                 tracing::error!(error = %err, "writing commits to the write-ahead log failed");
@@ -852,6 +872,11 @@ impl RegolithEngine {
             }
         }
         drop(claim);
+        if wrote_upto != 0 {
+            // WU7: the slots the run made publishable are published before
+            // their owners are woken, so a woken owner finds its commit done.
+            self.publish_ready(pipe, wrote_upto);
+        }
         // Woken once the unit is let go, and each descriptor let go of right
         // after, so an owner that wakes finds its descriptor its own.
         for (slot, parked) in run.held.iter_mut().zip(parked) {

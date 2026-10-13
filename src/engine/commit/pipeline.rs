@@ -804,21 +804,63 @@ impl RegolithEngine {
                 }
                 return Progress::NeedsSync;
             }
-            hook::at(hook::Stage::Publish);
-            // P3: the horizon first, then the frontier. A failed slot took no
-            // sequence that still exists.
-            if !desc.is(FAILED)
-                && let Some(last) = decision.last_seq()
-            {
-                self.visible_seq.publish(last);
+            self.publish_slot(pipe, next, desc, decision);
+        }
+    }
+
+    /// Publish slot `index`, held by `desc` and decided as `decision`, which
+    /// is publishable and the next to publish (P3).
+    fn publish_slot(&self, pipe: &Pipeline, index: u64, desc: &Descriptor, decision: &Decision) {
+        hook::at(hook::Stage::Publish);
+        // P3: the horizon first, then the frontier. A failed slot took no
+        // sequence that still exists.
+        if !desc.is(FAILED)
+            && let Some(last) = decision.last_seq()
+        {
+            self.visible_seq.publish(last);
+        }
+        // Landed: visible, or holding nothing. Told before the frontier
+        // passes, so a publisher that stops between the two leaves the
+        // telling to the next one here.
+        desc.land();
+        if pipe.ring.pass_published(index) {
+            pipe.ring.retire(index);
+        }
+    }
+
+    /// Publish, in ring order, the slots up to `limit` that are publishable
+    /// now, writing nothing and waiting for nothing: what the write unit's
+    /// holder does for the run it wrote (`write_unit.rs`, WU7), so the
+    /// owners it then wakes find their commits published.
+    pub(super) fn publish_ready(&self, pipe: &Pipeline, limit: u64) {
+        loop {
+            if pipe.ring.is_frozen() {
+                return;
             }
-            // Landed: visible, or holding nothing. Told before the frontier
-            // passes, so a publisher that stops between the two leaves the
-            // telling to the next one here.
-            desc.land();
-            if pipe.ring.pass_published(next) {
-                pipe.ring.retire(next);
+            let published = pipe.ring.published();
+            if published >= limit {
+                return;
             }
+            let next = published + 1;
+            if next > pipe.ring.decided() {
+                return;
+            }
+            let desc = match pipe.ring.load(next) {
+                Loaded::Ready(desc) => desc,
+                // A void slot, as in `publish_upto`.
+                Loaded::Void | Loaded::Gone => {
+                    pipe.ring.pass_published(next);
+                    continue;
+                }
+                Loaded::Empty | Loaded::Full => return,
+            };
+            let Some(decision) = desc.decision() else {
+                return;
+            };
+            if !Self::publishable_slot(&desc, decision) {
+                return;
+            }
+            self.publish_slot(pipe, next, &desc, decision);
         }
     }
 
