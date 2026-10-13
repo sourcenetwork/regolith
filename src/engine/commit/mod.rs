@@ -95,6 +95,7 @@ mod terminator;
 mod turn;
 mod txn;
 mod write_check;
+mod write_stage;
 
 use super::wal::MAX_RECORD_LEN;
 pub(crate) use append::PendingAppend;

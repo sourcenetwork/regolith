@@ -192,7 +192,7 @@ impl RegolithEngine {
         pipe.round.replace(round, Round::new(self.me.clone()));
         // The slots this round made durable, and the ones behind them that
         // waited only for those: bounded by what was decided when it began.
-        let _ = self.publish_upto(pipe, tip.index, None);
+        let _ = self.publish_upto(pipe, tip.index, None, help);
         true
     }
 
@@ -236,7 +236,7 @@ impl RegolithEngine {
             if !Arc::ptr_eq(&decision.after.log, log) {
                 continue;
             }
-            self.write_slot(&desc);
+            self.write_slot(pipe, &desc, help);
             if !desc.is(WRITTEN) {
                 through = place.offset;
                 break;

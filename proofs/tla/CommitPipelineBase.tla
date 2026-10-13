@@ -75,7 +75,7 @@ ASSUME Mutant \in {"none", "OutOfOrder", "AbortHole", "NoHelping", "SyncPastGap"
                    "UnitNoDrain", "SettleAnyEpoch", "KeepMemtable", "NoEpochGate",
                    "PassBeforeApply", "RollbackForgets", "NoFreeze", "StopHoldsClaim",
                    "TrustEarly", "PublishBeforeSync", "DecideAnyOrder", "WorkBeyond",
-                   "SyncNoWait", "SkipOnPublished"}
+                   "SyncNoWait", "SkipOnPublished", "BatchNoRecheck", "ParkUncovered"}
 
 \* The ticket numbers of the run.
 Slots == 1..MaxSlots
@@ -169,17 +169,26 @@ VARIABLES
   seen,
   \* The threads that walked away for good.
   stopped,
-  \* The record whose write each thread has in flight: counted in at the
-  \* log's gate, its bytes not yet with the host; 0 for none.
-  fly
+  \* The records whose write each thread has in flight: counted in at the
+  \* log's gate, their bytes not yet with the host; empty for none. A copy
+  \* is one record; a batch is a run of them (write_stage.rs).
+  fly,
+  \* The thread holding the log's write claim (wal_gate.rs, WG6): the one
+  \* whose batch is in flight; 0 for nobody.
+  claim,
+  \* The threads parked until a record in the batch under way is written
+  \* (write_stage.rs, a blocking writer's park).
+  asleep
 
 \* All of the above, so "nothing changed" can be said in one word.
 vars == <<tail, cell, owner, dec, sq, ep, ap, wr, failed, logOf, memOf, dto, frozen, tipIdx,
           tipNext, tipUsed, epoch, logEp, memGen, gen, durable, pub, visible, round, target, claimant,
-          rbLast, poisoned, fails, pc, snap, hor, mine, seen, stopped, fly>>
+          rbLast, poisoned, fails, pc, snap, hor, mine, seen, stopped, fly, claim, asleep>>
 
 \* Groups of variables an action leaves alone, named once so each action
 \* can say so in a line.
+\* The writes in flight, the write claim and who sleeps on it.
+flyVars == <<fly, claim, asleep>>
 \* The ring's cells and who owns them.
 ringVars == <<tail, cell, owner>>
 \* What is decided for each order.
@@ -200,6 +209,9 @@ threadVars == <<pc, snap, hor, mine, seen, stopped>>
 
 \* The biggest number in a set of numbers.
 Max(S) == CHOOSE m \in S : \A n \in S : n <= m
+
+\* The smallest number in a set of numbers.
+Min(S) == CHOOSE m \in S : \A n \in S : m <= n
 
 \* Order i holds a sequence that still counts: it took one and was not
 \* thrown out.
@@ -275,8 +287,9 @@ Publishable(i) ==
 \* Thread a has not walked away.
 Live(a) == a \notin stopped
 
-\* Thread a has an order in the ring that is not finished, so it helps.
-Helping(a) == Live(a) /\ pc[a] = "ready"
+\* Thread a has an order in the ring that is not finished, so it helps,
+\* unless it is parked on a write under way.
+Helping(a) == Live(a) /\ pc[a] = "ready" /\ a \notin asleep
 
 \* Thread a stands behind an ordered unit another thread claimed: it waits
 \* for that thread to finish the unit and does nothing else meanwhile.

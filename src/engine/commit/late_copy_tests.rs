@@ -3,8 +3,9 @@
 //! that covers it has begun.
 //!
 //! An owner stops inside its record's write, or just before it, through
-//! the pipeline's test hooks; a helper behind it writes the same record
-//! past the courtesy and a sync wants the log durable. The workload runs in
+//! the pipeline's test hooks, and a sync behind it wants the log durable. A
+//! blocking helper waits for a write in flight as for any device I/O, and
+//! writes a record nobody has in flight itself (`write_stage.rs`). The workload runs in
 //! a child process, this test binary run again with the `LD_PRELOAD` shim
 //! of `tests/common/fault`, which journals every write and sync of the log
 //! in the order they reached the host. The parent reads the journal: a write
@@ -45,14 +46,15 @@ const CHILD_DIR: &str = "REGOLITH_LATE_COPY_DIR";
 /// Where the owner stops, and what runs the sync.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Scenario {
-    /// Inside its write, counted in at the gate; a durable commit behind it
-    /// writes the record and syncs the log.
+    /// Inside its write, counted in at the gate and holding the log's write
+    /// claim; a durable commit behind it waits for that write and syncs.
     InWrite,
-    /// Before its write, past its claim of it; a durable commit behind it
-    /// writes the record and syncs the log, and the owner goes on after.
+    /// Before its write, before it takes the claim; a durable commit behind
+    /// it writes the record in its batch and syncs the log, and the owner
+    /// goes on after.
     BeforeWrite,
-    /// Inside its write; a commit behind it writes and publishes the record,
-    /// and a rotation syncs the log before it seals it.
+    /// Inside its write; a commit behind it waits for that write and
+    /// publishes the record, and a rotation syncs the log before it seals it.
     Rotation,
 }
 
@@ -127,14 +129,14 @@ fn run_scenario(scenario: Scenario, dir: &Path) {
         .expect("the owner never reached its write");
 
     // What the sync's thread says first: that it waits for the owner's
-    // write, or that its call returned.
+    // write, a write in flight, or that its call returned.
     let (said, heard) = mpsc::channel();
     let syncer = {
         let engine = Arc::clone(&engine);
         let waits = said.clone();
         std::thread::spawn(move || {
             hook::set(move |stage| {
-                if stage == Stage::SyncWait {
+                if stage == Stage::SyncWait || stage == Stage::WriteWait {
                     let _ = waits.send("waits");
                 }
             });
@@ -309,12 +311,11 @@ fn check(scenario: Scenario) -> Copies {
 }
 
 #[test]
-fn a_late_copy_from_inside_the_write_returns_before_the_sync() {
+fn a_write_in_flight_is_waited_for_and_never_copied() {
     let copies = check(Scenario::InWrite);
-    assert_eq!(
-        copies.len(),
-        1,
-        "the helper wrote a copy of the owner's record: {copies:?}"
+    assert!(
+        copies.is_empty(),
+        "a blocking helper copied a record whose write was in flight: {copies:?}"
     );
 }
 
@@ -325,11 +326,10 @@ fn an_owner_that_finds_its_record_written_writes_nothing() {
 }
 
 #[test]
-fn a_rotation_syncs_its_log_only_after_a_late_copy_returned() {
+fn a_rotation_syncs_its_log_only_after_the_write_in_flight_returned() {
     let copies = check(Scenario::Rotation);
-    assert_eq!(
-        copies.len(),
-        1,
-        "the helper wrote a copy of the owner's record: {copies:?}"
+    assert!(
+        copies.is_empty(),
+        "a blocking helper copied a record whose write was in flight: {copies:?}"
     );
 }

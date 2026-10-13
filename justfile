@@ -347,9 +347,10 @@ loom-tables:
 # a job its holder parks, a job parked for the step, a rollback parked for
 # a write in flight, a sync parked for a record's late copy in flight, the
 # wake of a parked job against its landing and against the claim of the
-# thread that parks it), with fifteen calibrations that must fail. Thirty
-# models, each bounded by a ring of two cells, two or three threads and an
-# explicit preemption bound; measured at 1.1s in all, the largest at 4,214
+# thread that parks it), and the hand-on of the log's write claim to a
+# writer parked on it, with 19 calibrations that must fail. 37 tests, each
+# bounded by a ring of two cells, two or three threads and an explicit
+# preemption bound; measured at 0.7s in all, the claim's hand-on at 185
 # interleavings. The limit is a hard one: a run that reaches it has failed.
 loom-pipeline:
     RUSTFLAGS="--cfg loom" cargo test --release --test loom_pipeline --no-run
@@ -819,6 +820,10 @@ tla:
     check MC_CommitPipeline_Green_Copies                    GREEN
     check MC_CommitPipeline_Green_Copies_InFlight           RED NoTwoCopies
     check MC_CommitPipeline_Red_SyncNoWait                  RED NoWriteUnderSync
+    check MC_CommitPipeline_Green_Copies_Batches            RED NoBatchOfTwo
+    check MC_CommitPipeline_Green_Copies_Parks              RED NeverAsleep
+    check MC_CommitPipeline_Red_BatchNoRecheck              RED NoWriteUnderSync
+    check MC_CommitPipeline_Red_ParkUncovered               RED NoLiveThreadBlocked
     # Decision 3 of plan 4.7: a queue's poll never waits for another thread.
     # A job that cannot get the round, the version store's step, the flush
     # exclusion or a failed log clear of writes parks: it leaves a note, looks
