@@ -31,6 +31,12 @@ This file proves, for every number of slots and every read and write set:
    checks itself, on its own thread, against the versions up to a horizon `h`
    it sampled, and whichever thread decides its slot then looks only above
    `h`. The two halves decide as one check of every version.
+   `store_below_ceiling`, `ceiling_skips_the_check_above`,
+   `skip_on_ceiling_is_one_check`: no version is newer than the last
+   sequence handed out (the ceiling), so when that is at or below `h` the
+   look above `h` finds nothing and the decision skips it; RED
+   `skip_on_published_loses_an_update` guards the skip with the published
+   horizon instead and loses an update (`MC_CommitPipeline_Red_SkipOnPublished`).
 5. The RED case as a concrete counterexample:
    `published_only_loses_an_update`, a slot checked against a view that lacks
    an earlier slot's writes (`MC_CommitPipeline_Red_ValidatePublished`), and
@@ -394,6 +400,164 @@ theorem early_check_cover (vs early : List (Nat × Nat)) (t : Txn) (h : Nat)
     · exact ⟨v, hsub v hv, hk, hlt⟩
     -- Above `h`, so above the snapshot.
     · exact ⟨v, hv, hk, by omega⟩
+
+/-! ## Nothing handed out above the horizon: the look above it is skipped -/
+
+/-
+The code (`RegolithEngine::validate` and `decide_txn` in
+`src/engine/commit`) knows `ceiling`, the last sequence handed out before the
+slot it decides (`base.next_seq - 1`). When `ceiling` is at or below the
+horizon `h` of the transaction's early check, it does not look above `h` at
+all. Story: a baker serves ticket 6 and knows the last ticket served before
+it was ticket 5; the customer already checked the board up to ticket 5. There
+is nothing newer to look at, so nobody walks to the board again. The three
+facts below say why that is exact: the store never holds a version above the
+last sequence handed out, so the look above `h` finds nothing, so the check
+is the early check alone.
+-/
+
+/-- **The ceiling bounds the store.** When no version in the store is newer
+than `s`, the last sequence handed out, none is newer than the last sequence
+handed out after any number of slots are decided: a slot that lands puts its
+writes at the next sequence, which becomes the last one handed out. Every
+sequence the code hands out goes through the pipeline's state
+(`After::next_seq`: a slot's operations, a counter reservation, an ingest's,
+a rollback's floor), so this is the code's `ceiling`. -/
+theorem store_below_ceiling (ts : List Txn) :
+    -- For every store and last sequence...
+    ∀ (store : List (Nat × Nat)) (s : Nat),
+      -- ...if no version is newer than the last sequence...
+      (∀ v ∈ store, v.2 ≤ s) →
+        -- ...then after the slots none is newer than the new last sequence.
+        ∀ v ∈ (after store s ts).1, v.2 ≤ (after store s ts).2 := by
+  -- By induction on the slots, for every store and sequence.
+  induction ts with
+  -- Case: no slot.
+  | nil =>
+    -- Take the store, the sequence, the bound, a version and where it is.
+    intro store s hb v hv
+    -- Nothing was decided: the store and the sequence are the same.
+    simp only [after] at hv ⊢
+    -- So the bound we were given is the one asked for.
+    exact hb v hv
+  -- Case: a first slot and then the rest, the claim known for the rest (ih).
+  | cons t rest ih =>
+    -- Take the store, the sequence and the bound.
+    intro store s hb
+    -- Does the first slot land?
+    by_cases hl : lands store t = true
+    -- It lands: its writes join the store at `s + 1`.
+    · rw [after_cons_lands store s t rest hl]
+      -- The rest follow by induction, once the bigger store is below `s + 1`.
+      apply ih
+      -- Take a version of the bigger store and where it is.
+      intro v hv
+      -- It is one of the new writes, or one of the old versions.
+      rcases List.mem_append.mp hv with hw | hs
+      -- A new write: it is at `s + 1` itself.
+      · obtain ⟨k, _, rfl⟩ := List.mem_map.mp hw
+        -- `s + 1` is at or below `s + 1`.
+        simp
+      -- An old version: at or below `s`, so below `s + 1`.
+      · exact Nat.le_succ_of_le (hb v hs)
+    -- It aborts: the store and the sequence are unchanged.
+    · simp only [Bool.not_eq_true] at hl
+      -- Take the aborting step.
+      rw [after_cons_aborts store s t rest hl]
+      -- The rest follow by induction from the same bound.
+      exact ih store s hb
+
+/-- **Nothing above the ceiling.** When every version is at or below `c` and
+`c` is at or below the horizon `h`, the look above `h` finds nothing. -/
+theorem nothing_above_ceiling (vs : List (Nat × Nat)) (t : Txn) (h c : Nat)
+    -- No version is newer than the ceiling.
+    (hb : ∀ v ∈ vs, v.2 ≤ c)
+    -- The ceiling is at or below the horizon.
+    (hch : c ≤ h) :
+    -- The look above the horizon finds no version.
+    vs.any (fun v => t.touched.contains v.1 && decide (h < v.2)) = false := by
+  -- Unfold into "no version is a touched key above the horizon".
+  simp only [List.any_eq_false, Bool.and_eq_true, List.contains_iff_mem, decide_eq_true_eq,
+    not_and]
+  -- Take a version, where it is, and that its key was touched.
+  intro v hv _
+  -- It is at or below the ceiling...
+  have hle := hb v hv
+  -- ...so at or below the horizon, not above it.
+  omega
+
+/-- **The skip is exact.** With the early check's view as in
+`early_check_cover`, and every version at or below a ceiling that is at or
+below the horizon, the one check of every version is the early check alone:
+the slot's decision needs no lookup. -/
+theorem ceiling_skips_the_check_above (vs early : List (Nat × Nat)) (t : Txn) (h c : Nat)
+    -- The early view holds only real versions.
+    (hsub : ∀ v ∈ early, v ∈ vs)
+    -- It holds every version newer than the snapshot up to `h`.
+    (hcov : ∀ v ∈ vs, t.snap < v.2 → v.2 ≤ h → v ∈ early)
+    -- The horizon is sampled after the snapshot.
+    (hsh : t.snap ≤ h)
+    -- No version is newer than the ceiling.
+    (hb : ∀ v ∈ vs, v.2 ≤ c)
+    -- The ceiling is at or below the horizon.
+    (hch : c ≤ h) :
+    -- One check of every version equals the early check.
+    conflicts vs t = conflicts early t := by
+  -- Split the one check at the horizon, drop the empty half above it, and
+  -- an `or` with `false` is what it was.
+  rw [early_check_cover vs early t h hsub hcov hsh, nothing_above_ceiling vs t h c hb hch,
+    Bool.or_false]
+
+/-- The check a slot runs when its decision skips the look above the horizon
+whenever `guard` is at or below it: the early check alone then, the early
+check and the look above the horizon otherwise. The code's guard is the
+ceiling; mutant SkipOnPublished's is the published horizon. -/
+def checkSkipping (vs early : List (Nat × Nat)) (t : Txn) (h guard : Nat) : Bool :=
+  -- The guard allows the skip: the early check's verdict alone.
+  if guard ≤ h then conflicts early t
+  -- Otherwise both halves.
+  else conflicts early t || vs.any (fun v => t.touched.contains v.1 && decide (h < v.2))
+
+/-- **The skip with the ceiling as its guard is the one check.** -/
+theorem skip_on_ceiling_is_one_check (vs early : List (Nat × Nat)) (t : Txn) (h c : Nat)
+    -- The early view holds only real versions.
+    (hsub : ∀ v ∈ early, v ∈ vs)
+    -- It holds every version newer than the snapshot up to `h`.
+    (hcov : ∀ v ∈ vs, t.snap < v.2 → v.2 ≤ h → v ∈ early)
+    -- The horizon is sampled after the snapshot.
+    (hsh : t.snap ≤ h)
+    -- No version is newer than the ceiling.
+    (hb : ∀ v ∈ vs, v.2 ≤ c) :
+    -- Skipping on the ceiling decides as one check of every version.
+    checkSkipping vs early t h c = conflicts vs t := by
+  -- Look at whether the guard allows the skip.
+  by_cases hch : c ≤ h
+  -- It does: take the skipping branch of the `if`.
+  · simp only [checkSkipping, hch, ↓reduceIte]
+    -- The early check alone, which is the one check.
+    exact (ceiling_skips_the_check_above vs early t h c hsub hcov hsh hb hch).symm
+  -- It does not: take the other branch of the `if`.
+  · simp only [checkSkipping, hch, ↓reduceIte]
+    -- Both halves, which is the one check by `early_check_cover`.
+    exact (early_check_cover vs early t h hsub hcov hsh).symm
+
+/-- **RED SkipOnPublished.** The skip guarded by the published horizon. Slot
+1 committed key 1 at sequence 1 and is not published yet, so the published
+horizon is 0, and so is the horizon of the early check of a transaction that
+read key 1 at snapshot 0: its early view holds nothing. The broken guard
+(published 0 at or below horizon 0) skips, finds no conflict, and the
+transaction commits over slot 1's write: a lost update. The ceiling (1) is
+above the horizon, so the design looks and aborts it, as the one check does.
+-/
+theorem skip_on_published_loses_an_update :
+    -- The broken guard lets it commit,
+    checkSkipping [(1, 1)] [] ⟨0, [1], [1], false⟩ 0 0 = false ∧
+      -- the design's guard aborts it,
+      checkSkipping [(1, 1)] [] ⟨0, [1], [1], false⟩ 0 1 = true ∧
+        -- which is what one check of every version says.
+        conflicts [(1, 1)] ⟨0, [1], [1], false⟩ = true := by
+  -- Concrete lists and numbers: evaluate.
+  decide
 
 /-! ## The RED case: checking against what is published only -/
 

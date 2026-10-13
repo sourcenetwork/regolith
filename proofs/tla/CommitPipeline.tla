@@ -51,8 +51,13 @@
 \*       checking up to a horizon on the committer's own thread and above
 \*       it when the slot is decided equals one check (NoLostUpdate,
 \*       AbortsHaveCause).
-\*   published_only_loses_an_update
-\*       RED ValidatePublished as a concrete counterexample.
+\*   store_below_ceiling, ceiling_skips_the_check_above
+\*       no version is newer than the last sequence handed out, so when
+\*       that is at or below the horizon the look above it finds nothing
+\*       and is skipped (SkipsCheck, Loses).
+\*   published_only_loses_an_update, skip_on_published_loses_an_update
+\*       RED ValidatePublished and RED SkipOnPublished as concrete
+\*       counterexamples.
 \* The other half of lock-freedom, that the interleavings of several
 \* threads keep finishing slots (LockFree, EveryLiveCommitCompletes), is
 \* checked here by TLC, on small instances.
@@ -64,7 +69,8 @@
 \*               the read horizon and checks itself, on its own thread,
 \*               against everything visible up to it; a conflict there
 \*               aborts it at once. Whichever thread decides its slot then
-\*               looks only above that horizon (Conflict).
+\*               looks only above that horizon (Conflict), and not at all
+\*               when nothing was handed a sequence above it (SkipsCheck).
 \*   Reserve     Ring::reserve, one fetch_add on the tail.
 \*   Fill        Ring::install, one compare-and-swap of the cell's stamp.
 \*   Void        Ring::void by a helper that reaches a reserved cell with
@@ -175,6 +181,9 @@
 \*                                 against a view that lacks an earlier
 \*                                 slot's writes), Red_PassBeforeApply_LostUpdate
 \*     RED TrustEarly           -> Red_TrustEarly
+\*     (new with the skip)      -> Red_SkipOnPublished: the skip asked of
+\*                                 the published horizon, not the last
+\*                                 sequence handed out
 \*   SeqFollowsDecisionOrder    -> SeqInRingOrder; Red_DecideAnyOrder_Order
 \*   StoreHoldsCommits          -> AppliedBeforePassed and MemtableOnlyLive;
 \*                                 Red_PassBeforeApply, Red_KeepMemtable

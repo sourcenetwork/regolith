@@ -212,7 +212,7 @@ fn a_record_written_ahead_of_an_unwritten_one_is_not_recovered() {
     let (second_index, second) = install(&engine, eventual_put(b"second", b"v"));
     let pipe = engine.pipe().unwrap();
     assert!(matches!(
-        engine.help_decide(pipe, second_index, Help::Wait),
+        engine.help_decide(pipe, second_index, Help::Wait, None),
         Turn::Done
     ));
     // Only the second commit's record is written: a hole lies before it.

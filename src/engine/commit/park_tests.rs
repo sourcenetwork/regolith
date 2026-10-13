@@ -130,7 +130,8 @@ fn a_rotation_check_on_a_poll_parks_for_a_held_round_and_rotates_when_woken() {
         .unwrap();
     let (index, write) = install(&engine, eventual_put(b"next", b"v"));
     // What a `commit_nowait` call is handed and leaves on its queue.
-    let super::pipeline::Turn::Blocked(check) = engine.help_decide(pipe, index, Help::Leave) else {
+    let super::pipeline::Turn::Blocked(check) = engine.help_decide(pipe, index, Help::Leave, None)
+    else {
         panic!("the rotation check was not due");
     };
     let (wakes, waker) = counting();
