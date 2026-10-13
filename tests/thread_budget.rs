@@ -2,8 +2,8 @@
 //! workers as `Options::max_background_compactions` asks for, started through
 //! its `Env` when it opens, and no other thread at any time, unless the caller
 //! asks for the log writeback lane (`Options::log_writeback`), which is one
-//! more on Linux with a worker. A caller that runs a pinned worker pool sizes
-//! it around that number, so the number is a promise.
+//! more on Linux and Apple with a worker. A caller that runs a pinned worker
+//! pool sizes it around that number, so the number is a promise.
 //!
 //! Each configuration is opened, put through writes, a flush, a compaction,
 //! reads, a snapshot, transactions with a blocking and a ticketed commit, an
@@ -288,9 +288,9 @@ const ROWS: [Row; 14] = [
 ];
 
 /// Whether `row` starts the log writeback lane: asked for, with a worker,
-/// on Linux, the one host with the writeback hint.
+/// on Linux or Apple, the hosts with a way to start the writeback.
 fn lane_runs(row: &Row) -> bool {
-    row.lane && row.workers > 0 && cfg!(target_os = "linux")
+    row.lane && row.workers > 0 && cfg!(any(target_os = "linux", target_vendor = "apple"))
 }
 
 /// The names of the threads `row` starts: its workers, then the lane.
