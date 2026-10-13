@@ -49,6 +49,10 @@
 //!   install under way and is left alone. All four accesses are `SeqCst`,
 //!   which is what makes "one of the two sees the other" hold
 //!   (`sync::internal::seq_cst_handshake` says how loom is shown that).
+//!   The pointer and the holder word are written only by the thread that
+//!   locked the holder word, and read after an acquire of what that thread
+//!   released (the stamp, or the holder word itself), so their stores are
+//!   `Release` or `Relaxed`, not locked exchanges.
 //! - **R4, nobody waits for a cell.** A thread that finds a cell's holder
 //!   word busy (another thread is inside the few instructions of an install,
 //!   a load or a clean, or stopped there) does not wait: an owner gives its
@@ -322,10 +326,16 @@ impl<T> Ring<T> {
                 return Installed::Lost;
             }
         }
-        // The holder word is LOCKED by this thread.
+        // The holder word is LOCKED by this thread, so nobody else writes
+        // the pointer or the holder word until it is let go below. Neither
+        // store is part of R3's handshake, and neither needs `SeqCst` (a
+        // locked exchange each): a loader reads them only after it read the
+        // stamp READY, which the compare-and-swap below releases, and a
+        // cleaner only after its compare-and-swap of the holder word took
+        // this `Release` store's value.
         let raw = Arc::into_raw(Arc::clone(desc)).cast_mut();
-        cell.desc.store(raw, Ordering::SeqCst);
-        cell.holder.store(held(index), Ordering::SeqCst);
+        cell.desc.store(raw, Ordering::Relaxed);
+        cell.holder.store(held(index), Ordering::Release);
         if cell
             .stamp
             .compare_exchange(
@@ -497,11 +507,17 @@ impl<T> Ring<T> {
         // R3: the stamp said the slot is over before the pins are read.
         seq_cst_handshake();
         if cell.pins.load(Ordering::SeqCst) != 0 {
-            cell.holder.store(holder, Ordering::SeqCst);
+            cell.holder.store(holder, Ordering::Release);
             return false;
         }
-        let raw = cell.desc.swap(ptr::null_mut(), Ordering::SeqCst);
-        cell.holder.store(EMPTY, Ordering::SeqCst);
+        // The holder word is LOCKED by this thread and no load is counted
+        // in, so nobody else reads or writes the pointer: a plain read and
+        // write, not a locked exchange. The next install reads the pointer
+        // only after its compare-and-swap of the holder word took the
+        // `Release` store of EMPTY, and overwrites it.
+        let raw = cell.desc.load(Ordering::Relaxed);
+        cell.desc.store(ptr::null_mut(), Ordering::Relaxed);
+        cell.holder.store(EMPTY, Ordering::Release);
         if !raw.is_null() {
             // SAFETY (R3): the holder word was LOCKED by this thread with no
             // load counted in, so `raw` is the cell's own reference, taken

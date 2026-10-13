@@ -15,7 +15,8 @@
 //!   is installed into its cell; the new descriptor is never taken for the
 //!   old one.
 //! - **The pin**: a descriptor, or the pipeline's state, loaded while it is
-//!   retired or replaced is alive.
+//!   retired or replaced is alive, and one loaded while it is installed is
+//!   the one installed.
 //! - **The drop at the swap**: a replaced tip is dropped at once when no
 //!   load is counted in, and waits on the list otherwise; no value is
 //!   dropped while loaded or dropped twice.
@@ -70,6 +71,17 @@ fn a_cell_retired_while_it_takes_the_next_lap_keeps_the_new_descriptor() {
 #[should_panic(expected = "a cleaner took the descriptor of an install under way")]
 fn a_cleaner_that_takes_an_install_under_way_empties_a_ready_cell() {
     pipeline::a_cleaner_that_takes_an_install_under_way_empties_a_ready_cell();
+}
+
+#[test]
+fn a_descriptor_loaded_while_it_is_installed_is_the_one_installed() {
+    pipeline::a_descriptor_loaded_while_it_is_installed_is_the_one_installed();
+}
+
+#[test]
+#[should_panic(expected = "a loader found the slot READY and its cell empty")]
+fn a_stamp_that_does_not_release_the_pointer_shows_an_empty_ready_cell() {
+    pipeline::a_stamp_that_does_not_release_the_pointer_shows_an_empty_ready_cell();
 }
 
 #[test]

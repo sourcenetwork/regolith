@@ -32,7 +32,8 @@
 //! Each positive model has a calibration that writes one step the wrong way
 //! out of plain loom atomics and must fail: a void that is not a
 //! compare-and-swap, a cleaner that takes the descriptor of an install
-//! under way, a replacement that reads the pins before its swap, a frontier
+//! under way, a stamp that does not release the pointer stored before it,
+//! a replacement that reads the pins before its swap, a frontier
 //! passed before the tip moved, a claim that is a load and a store, a
 //! frontier published before the horizon, and a settle that does not look
 //! at the epoch.
@@ -214,6 +215,90 @@ pub fn a_cell_retired_while_it_takes_the_next_lap_keeps_the_new_descriptor() {
                 2,
                 "R3: a descriptor was dropped twice, or never"
             );
+        },
+    );
+}
+
+/// R3 for an install and a load at once: a helper loads a slot while its
+/// owner installs it, as `help_decide` does when it reaches a slot whose
+/// owner is still installing. The owner writes the descriptor's pointer
+/// and the holder word with plain stores, and the stamp's compare-and-swap
+/// publishes both: a load that finds the slot READY finds the descriptor
+/// installed, never an empty cell or another slot's.
+///
+/// Bound: 3 preemptions.
+pub fn a_descriptor_loaded_while_it_is_installed_is_the_one_installed() {
+    explore_bounded(
+        "a_descriptor_loaded_while_it_is_installed_is_the_one_installed",
+        Some(3),
+        8,
+        1,
+        |witness| {
+            let drops = Arc::new(AtomicUsize::new(0));
+            let ring: Arc<Ring<Probe>> = Arc::new(Ring::new(2));
+            let index = ring.reserve();
+            let owner = {
+                let (ring, drops) = (Arc::clone(&ring), Arc::clone(&drops));
+                thread::spawn(move || {
+                    let desc = probe(index, &drops);
+                    assert!(matches!(ring.install(index, &desc), Installed::Done));
+                })
+            };
+            let helper = {
+                let ring = Arc::clone(&ring);
+                let witness = witness.clone();
+                thread::spawn(move || match ring.load(index) {
+                    Loaded::Ready(desc) => {
+                        witness.record();
+                        assert_eq!(desc.id, index, "R3: a READY slot held another descriptor");
+                    }
+                    Loaded::Empty => {}
+                    _ => panic!("R1: a slot under install read as neither installed nor reserved"),
+                })
+            };
+            owner.join().expect("owner");
+            helper.join().expect("helper");
+            drop(ring);
+            assert_eq!(
+                drops.load(Ordering::SeqCst),
+                1,
+                "R3: dropped twice, or never"
+            );
+        },
+    );
+}
+
+/// Calibration for
+/// [`a_descriptor_loaded_while_it_is_installed_is_the_one_installed`]: an
+/// install whose stamp does not release what went in before it. A plain
+/// store of the pointer, then a plain store of the stamp: a loader that
+/// finds the stamp READY may find the pointer not there yet.
+pub fn a_stamp_that_does_not_release_the_pointer_shows_an_empty_ready_cell() {
+    explore_bounded(
+        "a_stamp_that_does_not_release_the_pointer_shows_an_empty_ready_cell",
+        Some(3),
+        1,
+        0,
+        |_| {
+            let stamp = Arc::new(AtomicU64::new(FREE));
+            // The slot's descriptor, 0 for none.
+            let desc = Arc::new(AtomicU64::new(0));
+            let owner = {
+                let (stamp, desc) = (Arc::clone(&stamp), Arc::clone(&desc));
+                thread::spawn(move || {
+                    desc.store(1, Ordering::Relaxed);
+                    // The bug: the stamp moves with no release.
+                    stamp.store(READY, Ordering::Relaxed);
+                })
+            };
+            if stamp.load(Ordering::SeqCst) == READY {
+                assert_eq!(
+                    desc.load(Ordering::SeqCst),
+                    1,
+                    "a loader found the slot READY and its cell empty"
+                );
+            }
+            owner.join().expect("owner");
         },
     );
 }
