@@ -651,6 +651,10 @@ tla:
     check MC_Allocate_Red_LogAfterUse_Reuse                    RED INV_UsesUnique
     check MC_Allocate_Teeth_InTxn                              GREEN
     check MC_Allocate_Teeth_LogAfterUse                        GREEN
+    # A reservation is handed out before it is published; a log failure that
+    # discards it writes the counter back. TLC only.
+    check MC_Allocate_Green_Rollback                   GREEN
+    check MC_Allocate_Red_ForgetOnRollback             RED INV_HandedOutOnce
     # 4.2, E3: WAL format 2 replay. Lean: Regolith/WalRecovery.lean,
     # recovers_prefix2.
     spec=WalRecovery

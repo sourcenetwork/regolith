@@ -836,6 +836,7 @@ impl RegolithEngine {
                     memtable,
                     closed: false,
                     epoch: 0,
+                    counters: commit::Counters::empty(),
                 },
                 me.clone(),
             )),

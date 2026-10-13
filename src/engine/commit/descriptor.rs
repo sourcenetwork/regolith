@@ -183,6 +183,9 @@ pub(crate) struct After {
     /// lands nothing (`pipeline.rs`, P4). It is also the write epoch of
     /// `log`: a record placed in an older epoch is not written.
     pub(crate) epoch: u64,
+    /// The counters reservations have read or set, at their values as of
+    /// this state (`counters.rs`).
+    pub(crate) counters: super::counters::Counters,
 }
 
 /// What the pipeline decided for one slot.
@@ -280,8 +283,14 @@ pub(super) struct Turned {
 pub(super) enum Work {
     /// A plain write or a transaction's commit.
     Request(WriteRequest),
-    /// Reserve `n` values of the counter at `key` (`allocate.rs`).
-    Allocate { key: Vec<u8>, n: u64 },
+    /// Reserve `n` values of the counter at `key` (`allocate.rs`). With a
+    /// `read_queue` the counter is read from the cache alone, as a
+    /// `CacheOnly` commit's validation is (`read_mode.rs`).
+    Allocate {
+        key: Vec<u8>,
+        n: u64,
+        read_queue: Option<QueueId>,
+    },
     /// An ordered unit (`ordered.rs`): its body runs when the slot's turn
     /// comes, on whichever thread claims the job. `index` tells the body
     /// which slot it is, since a job knows nothing of the ring; `needs` is
@@ -314,6 +323,9 @@ pub(super) const INSTALLED: u64 = 1 << 6;
 /// needs none because it writes nothing: it may take a slot. Set by its
 /// owner, which is the only thread that reads it.
 pub(super) const ADMITTED: u64 = 1 << 7;
+/// An `allocate_nowait` caller gave its reservation up before the slot was
+/// decided: whoever decides it refuses it. Set by its owner.
+pub(super) const ABANDONED: u64 = 1 << 8;
 
 /// One slot's descriptor. See the module docs.
 pub(crate) struct Descriptor {
@@ -435,6 +447,7 @@ impl Descriptor {
     pub(super) fn read_queue(&self) -> Option<QueueId> {
         match &self.work {
             Work::Request(WriteRequest::Txn(txn)) => txn.read_queue,
+            Work::Allocate { read_queue, .. } => *read_queue,
             _ => None,
         }
     }

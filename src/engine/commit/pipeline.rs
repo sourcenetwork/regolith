@@ -483,8 +483,20 @@ impl RegolithEngine {
                 if let Err(err) = Self::take_place(desc, &mut decision, logged) {
                     return refuse(err);
                 }
+                // A counter the slot writes is read again by the next
+                // reservation of it (`counters.rs`).
+                let kept = decision
+                    .after
+                    .counters
+                    .forget_written(&ops_of(desc, &decision));
+                if let Some(kept) = kept {
+                    decision.after.counters = kept;
+                }
             }
-            Work::Allocate { key, n } => {
+            Work::Allocate { key, n, .. } => {
+                if let Some(err) = Self::abandoned(desc) {
+                    return refuse(err);
+                }
                 // Fenced like any write: the counter lives in a family.
                 if let Err(err) = self.cf_fence_keys(std::iter::once(key.as_slice())) {
                     return refuse(err);
