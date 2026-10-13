@@ -18,6 +18,10 @@ impl CompactionFilter for CacheInspector {
         self.calls.fetch_add(1, Ordering::Relaxed);
         CompactionDecision::Keep
     }
+
+    fn name(&self) -> &'static str {
+        "cache-inspector"
+    }
 }
 
 #[test]
