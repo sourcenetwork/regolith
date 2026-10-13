@@ -11,9 +11,10 @@
 
 mod common;
 
+use std::cell::RefCell;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Once};
 
 use common::keys::Keys;
 use common::overlap_fixture::{
@@ -37,9 +38,21 @@ fn levels(db: &Db) -> Vec<u64> {
     (0..7).map(|level| files_at(db, level)).collect()
 }
 
-/// Collects every warning logged on the thread it is the default for.
-#[derive(Clone, Default)]
-struct Warnings(Arc<Mutex<Vec<String>>>);
+thread_local! {
+    /// The warnings this thread has logged since [`warnings_of`] last asked.
+    static LOGGED: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+}
+
+/// The one subscriber of this test binary: it keeps each warning in a list
+/// of the thread that logged it.
+///
+/// One for the whole binary, not one per test: the tests run on threads
+/// of one process, and a subscriber set for one thread only can lose the
+/// warning to another thread that reaches the same log line first while
+/// that subscriber is being registered (`tracing` then remembers that
+/// nobody listens to it). With one subscriber for every thread there is
+/// nothing to race.
+struct Warnings;
 
 struct Message<'a>(&'a mut String);
 
@@ -67,7 +80,8 @@ impl Subscriber for Warnings {
     fn event(&self, event: &Event<'_>) {
         let mut message = String::new();
         event.record(&mut Message(&mut message));
-        self.0.lock().unwrap().push(message);
+        // A thread being torn down has no list left to keep it in.
+        let _ = LOGGED.try_with(|logged| logged.borrow_mut().push(message));
     }
 
     fn enter(&self, _: &span::Id) {}
@@ -75,12 +89,17 @@ impl Subscriber for Warnings {
     fn exit(&self, _: &span::Id) {}
 }
 
-/// Run `open` and return what it returned with every warning it logged.
+/// Run `open` and return what it returned with every warning this thread
+/// logged while it ran.
 fn warnings_of<T>(open: impl FnOnce() -> T) -> (T, Vec<String>) {
-    let warnings = Warnings::default();
-    let out = tracing::subscriber::with_default(warnings.clone(), open);
-    let lines = warnings.0.lock().unwrap().clone();
-    (out, lines)
+    static INSTALL: Once = Once::new();
+    INSTALL.call_once(|| {
+        tracing::subscriber::set_global_default(Warnings)
+            .expect("no other subscriber is set in this test binary");
+    });
+    LOGGED.with(|logged| logged.borrow_mut().clear());
+    let out = open();
+    (out, LOGGED.with(|logged| logged.take()))
 }
 
 /// The lines among `warnings` that report the move.
