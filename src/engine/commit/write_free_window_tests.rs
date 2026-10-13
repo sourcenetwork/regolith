@@ -186,6 +186,41 @@ fn a_report_that_checks_nothing_commits_in_the_same_window() {
     }
 }
 
+/// A commit with nothing to check (ReadCommitted, or SnapshotIsolation with
+/// plain reads only) takes no point and touches no other commit's slot: a put
+/// stopped after its decision and before its apply is still unapplied when
+/// the read-only commit returns, and the decided frontier has not moved.
+#[test]
+fn a_commit_with_nothing_to_check_touches_no_slot_in_flight() {
+    for level in [
+        IsolationLevel::ReadCommitted,
+        IsolationLevel::SnapshotIsolation,
+    ] {
+        let dir = TempDir::new().unwrap();
+        let db = AnyDb::open(true, &dir);
+        db.db().put(CHECKING, &30u64.to_be_bytes()).unwrap();
+        let tx = db.begin(level);
+        assert_eq!(balance(tx.get(CHECKING).unwrap()), 30);
+        let engine = db.db().engine();
+        let mut frontier = None;
+        stopped_at(
+            Stage::Apply,
+            || db.db().put(CHECKING, &31u64.to_be_bytes()),
+            || {
+                let before = engine.last_decided_seq();
+                assert!(tx.commit().is_ok());
+                frontier = Some((before, engine.last_decided_seq()));
+            },
+        )
+        .unwrap();
+        let (before, after) = frontier.unwrap();
+        assert_eq!(
+            before, after,
+            "{level:?}: the read-only commit settled the put"
+        );
+    }
+}
+
 /// How a transaction reads the key it checks.
 #[derive(Clone, Copy, Debug)]
 enum Read {

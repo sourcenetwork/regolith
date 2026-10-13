@@ -107,6 +107,11 @@ impl RegolithEngine {
         read_queue: Option<crate::QueueId>,
     ) -> io::Result<CommitOutcome> {
         self.ensure_open()?;
+        // Nothing to check: no point is needed, and no other commit's slot is
+        // touched (ReadCommitted, or SnapshotIsolation with plain reads only).
+        if checks.reads.is_empty() && checks.ranges.is_empty() {
+            return Ok(CommitOutcome::Ok { seq: None });
+        }
         let at = self.write_free_points();
         // Only an item read below the decided frontier can have been written
         // over.
