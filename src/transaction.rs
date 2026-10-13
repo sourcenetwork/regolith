@@ -1877,13 +1877,30 @@ impl Transaction {
     /// assert!(!lost.to_string().contains("zoe"));
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
-    pub fn commit(mut self) -> TxResult<CommitReceipt> {
+    pub fn commit(self) -> TxResult<CommitReceipt> {
+        self.conclude(Self::commit_inner)
+    }
+
+    /// End the transaction as a commit that failed with `error` before it
+    /// reached the engine, as [`Transaction::commit`] ends one whose
+    /// `prepare` returned it: the abort callbacks run once, with that error.
+    /// For a caller that ran `prepare` itself (`transact_async`).
+    fn fail_commit(self, error: TransactionError) -> TxResult<CommitReceipt> {
+        self.conclude(|_| Err(error))
+    }
+
+    /// Win the commit claim, run `attempt`, and end the transaction by its
+    /// result: release its resources, then run the callbacks of the outcome.
+    fn conclude(
+        mut self,
+        attempt: impl FnOnce(&mut Self) -> TxResult<CommitReceipt>,
+    ) -> TxResult<CommitReceipt> {
         // `close` may have aborted the transaction since it began: the commit
         // is then refused, and `close` ran the abort callbacks.
         let claimed = self.claim.as_ref().is_none_or(|claim| claim.begin_commit());
         self.committing = claimed;
         let result = if claimed {
-            self.commit_inner()
+            attempt(&mut self)
         } else {
             Err(Error::Closed.into())
         };
