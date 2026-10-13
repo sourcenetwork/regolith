@@ -1,14 +1,15 @@
 //! A commit that writes nothing (plan 3.8, E50): at every level and in both
 //! flavours it takes no slot of the commit pipeline, checks what its level
-//! checks against the published horizon, commits on a database latched
-//! read-only, and reports the snapshot it read at.
+//! checks at the published horizon and at the decided frontier
+//! (`write_free.rs`), commits on a database latched read-only, and reports
+//! its snapshot as its receipt.
 //!
-//! The check's horizon is sampled before its view is loaded, and a version
-//! above an item's read found in the view fails the item even above the
-//! horizon. Two tests stop the committer between the two with the
-//! `WriteFree` hook to show why each half is needed: a memtable sealed and a
-//! commit published there, and a version at or below the horizon folded by
-//! compaction under a newer one.
+//! Two tests stop the committer between taking its points and loading its
+//! view with the `WriteFree` hook: a commit made there comes after the check
+//! and does not refuse it, and a version at or below the points that
+//! compaction folds there under a newer one still fails the read. The
+//! windows of the pipeline (a commit decided and not applied, applied and not
+//! published, discarded by a rollback) are in `write_free_window_tests.rs`.
 
 use std::sync::Arc;
 
@@ -245,7 +246,7 @@ fn a_commit_that_writes_nothing_reports_its_snapshot() {
 }
 
 /// Run `commit` with `between` run on the committing thread once the check
-/// sampled its horizon and before it loads its view.
+/// took its points and before it loads its view.
 fn between_horizon_and_view<T>(between: impl FnOnce() + 'static, commit: impl FnOnce() -> T) -> T {
     let mut between = Some(between);
     hook::set(move |stage| {
@@ -260,13 +261,14 @@ fn between_horizon_and_view<T>(between: impl FnOnce() + 'static, commit: impl Fn
     out
 }
 
-/// A memtable sealed and a commit of the key published after the horizon
-/// was sampled: the view the check loads holds the new memtable, so the
-/// commit is seen. Loading the view before the horizon would check a view
-/// without that memtable under a horizon that covers its commit, and miss
-/// the write.
+/// A memtable sealed and a commit of the key published after the check took
+/// its points: that commit comes after the write-free one, which is placed
+/// at its points, and does not refuse it, although the view the check loads
+/// holds the new memtable and the write in it. Loading that view after the
+/// points is what makes every commit at or below them reachable through it
+/// (the loom model `horizon_then_view`); a commit after them is left out.
 #[test]
-fn a_commit_published_into_a_new_memtable_is_not_missed() {
+fn a_commit_made_after_the_points_does_not_refuse_the_check() {
     for level in [IsolationLevel::RepeatableRead, IsolationLevel::Serializable] {
         let dir = TempDir::new().unwrap();
         let db = Arc::new(OptimisticTransactionDb::open(dir.path(), Options::default()).unwrap());
@@ -283,20 +285,20 @@ fn a_commit_published_into_a_new_memtable_is_not_missed() {
             },
             || tx.commit(),
         );
-        let Err(TransactionError::Conflict(lost)) = outcome else {
-            panic!("{level:?}: the write of k was missed: {outcome:?}");
-        };
-        assert_eq!(lost.key(), b"k", "{level:?}");
+        assert!(
+            outcome.is_ok(),
+            "{level:?}: a commit after the check's points refused it: {outcome:?}"
+        );
     }
 }
 
-/// A version of the key at or below the horizon, folded by compaction under
-/// a newer one above it before the check loads its view: the newer version
-/// fails the read although it lies above the horizon, since the one it
-/// stands for lies below. A lookup bounded at the horizon would find only
-/// the version the snapshot holds and miss the change. Rewriting the bytes
-/// the transaction read shows the same for a read checked by value: the
-/// value at the horizon was not the one read.
+/// A version of the key at or below the points, folded by compaction under a
+/// newer one above them before the check loads its view: a table then holds
+/// a sequence above the points, so the newer version fails the read, since
+/// the one it may stand for lies below. A lookup bounded at the points would
+/// find only the version the snapshot holds and miss the change. Rewriting
+/// the bytes the transaction read shows the same for a read checked by
+/// value: the value at the points was not the one read.
 #[test]
 fn a_version_folded_under_a_newer_one_still_fails_the_check() {
     for (level, read) in [

@@ -1251,7 +1251,6 @@ impl RegolithEngine {
     /// The last sequence the commit pipeline decided: every commit decided
     /// so far took sequences at or below it. A database opened read-only
     /// decides none, so there it is the published horizon.
-    #[cfg(test)]
     pub(crate) fn last_decided_seq(&self) -> u64 {
         match self.pipeline_state() {
             Some(tip) => tip.after.next_seq.saturating_sub(1),
@@ -2680,13 +2679,26 @@ impl RegolithEngine {
     /// is accumulated on the way down, mirroring the read path: a
     /// tombstone in a newer source outranks a point entry found in an
     /// older one.
+    #[inline]
     fn latest_version_in_view(
         &self,
         key: &[u8],
         view: &ReadView,
     ) -> std::io::Result<Option<(u64, WriteKind)>> {
-        let lk = LookupKey::from_prefixed(key, u64::MAX);
-        let walked = view.walk_newest_first(key, u64::MAX, |source, max_rt_seq| {
+        self.latest_version_upto(key, u64::MAX, view)
+    }
+
+    /// [`Self::latest_version_in_view`] among the writes at or below `ceil`:
+    /// what the key held for a reader at `ceil`, for a check that takes no
+    /// slot of the commit ring (`commit/write_free.rs`).
+    fn latest_version_upto(
+        &self,
+        key: &[u8],
+        ceil: u64,
+        view: &ReadView,
+    ) -> std::io::Result<Option<(u64, WriteKind)>> {
+        let lk = LookupKey::from_prefixed(key, ceil);
+        let walked = view.walk_newest_first(key, ceil, |source, max_rt_seq| {
             let version = match source {
                 Source::Memtable(mt) => mt.latest_version(&lk),
                 Source::Table(reader) => {

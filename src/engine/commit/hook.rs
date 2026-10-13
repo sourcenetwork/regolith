@@ -30,7 +30,8 @@ pub(crate) enum Stage {
     /// A `commit_nowait` commit found writes stopped and is about to take
     /// the stall's unit.
     Stall,
-    /// A commit that writes nothing sampled the published horizon and is
+    /// A commit that writes nothing took the points it is checked at (the
+    /// published horizon and the decided frontier, `write_free.rs`) and is
     /// about to load the view it checks in.
     WriteFree,
 }

@@ -70,7 +70,7 @@ use std::sync::Arc;
 use super::{CommitOutcome, DurabilityMode, RegolithEngine, ValidationSet, grouped_batch_ops};
 use crate::statistics::Ticker;
 use crate::sync::internal::Arc as RingArc;
-use crate::{Access, Conflict, WriteBatchOp};
+use crate::{Conflict, WriteBatchOp};
 
 mod allocate;
 mod append;
@@ -100,6 +100,7 @@ mod terminator;
 mod turn;
 mod txn;
 mod write_check;
+mod write_free;
 
 use super::wal::MAX_RECORD_LEN;
 pub(crate) use append::PendingAppend;
@@ -517,108 +518,6 @@ pub(crate) fn conclude_settled(
 }
 
 impl RegolithEngine {
-    /// Commit a transaction that writes nothing (no put, delete, merge or
-    /// append), at any level and in either flavour (plan 3.8): check what
-    /// its level asked to have checked, `checks`, and take no part in the
-    /// commit pipeline.
-    ///
-    /// The check runs on the calling thread against the published horizon
-    /// `h`, sampled once here. An item passes when nothing was written over
-    /// it after its read, up to `h`; when every item passes, the commit is
-    /// serialized at `h`: every commit published by then comes before it,
-    /// and every commit published later comes after it and takes nothing
-    /// from it, since it writes nothing (`writeFree_at_horizon` in
-    /// Validation.lean, `CommitWriteFree` in RepeatableRead.tla). An item
-    /// read at or after `h` has nothing published over it and is not looked
-    /// up, so a commit nobody committed under loads no view.
-    ///
-    /// `h` is sampled before the view is loaded, so the view holds every
-    /// version at or below `h`, or a newer version of the same key that
-    /// compaction kept in its place. A version above an item's read found in
-    /// the view therefore fails the item even when it lies above `h`: it may
-    /// stand for one at or below `h` that compaction folded under it. That is
-    /// a refusal a check of every version up to `h` might not make, never an
-    /// acceptance it would refuse, and it needs a commit to land on the item
-    /// between the sample and the load.
-    ///
-    /// It writes nothing, so a database latched read-only commits it too
-    /// (only `ensure_open` is asked), and it takes no sequence: its receipt
-    /// names the snapshot the transaction read at. With `read_queue` set (a
-    /// `commit_nowait` through a `CacheOnly` handle) the check reads the
-    /// cache alone and a miss refuses the commit with the wait for the
-    /// block, as the pipeline's validation does (`read_mode.rs`).
-    pub(crate) fn commit_write_free(
-        &self,
-        checks: &crate::engine::ValidationSet,
-        read_queue: Option<crate::QueueId>,
-    ) -> io::Result<CommitOutcome> {
-        self.ensure_open()?;
-        // Sampled before the view is loaded: the view then holds every
-        // version at or below it.
-        let horizon = self.visible_seq.visible();
-        // Only an item read below the horizon can have been written over.
-        let open = |observed: u64| observed < horizon;
-        if !checks.reads.iter().any(|read| open(read.observed_seq))
-            && !checks.ranges.iter().any(|range| open(range.observed_seq))
-        {
-            return Ok(CommitOutcome::Ok { seq: None });
-        }
-        let _scope = read_queue.map(super::io::scope::cache_only);
-        hook::at(hook::Stage::WriteFree);
-        let view = self.view.load();
-        for check in checks.reads.iter().filter(|read| open(read.observed_seq)) {
-            let Some(latest) = self.latest_version_in_view(&check.key, &view)? else {
-                continue;
-            };
-            if latest.0 <= check.observed_seq {
-                continue;
-            }
-            // Above the horizon: the item fails whatever its rule (see the
-            // docs). At or below it, nothing above the horizon landed on the
-            // key, so the read's rule judges the versions up to `h`.
-            let changed = if latest.0 > horizon {
-                Some(latest)
-            } else {
-                self.read_changed(check, latest, horizon, &view)?
-            };
-            if let Some((seq, theirs)) = changed {
-                if let Some(s) = self.statistics() {
-                    s.add(Ticker::CommitConflictsOnRead, 1);
-                }
-                return Ok(CommitOutcome::Conflict(Conflict::new(
-                    check.key.clone(),
-                    check.access,
-                    theirs,
-                    check.observed_seq,
-                    seq,
-                )));
-            }
-        }
-        // A validated scan decided on a whole range: any write inside it after
-        // the scan's snapshot fails it, as the pipeline's check does.
-        for range in checks
-            .ranges
-            .iter()
-            .filter(|range| open(range.observed_seq))
-        {
-            if let Some((key, seq, theirs)) =
-                self.written_in_range(&range.lo, &range.hi, range.observed_seq, &view)?
-            {
-                if let Some(s) = self.statistics() {
-                    s.add(Ticker::CommitConflictsOnRead, 1);
-                }
-                return Ok(CommitOutcome::Conflict(Conflict::new(
-                    key,
-                    Access::ScannedRange,
-                    theirs,
-                    range.observed_seq,
-                    seq,
-                )));
-            }
-        }
-        Ok(CommitOutcome::Ok { seq: None })
-    }
-
     /// Hand a plain write to the commit pipeline and block until it is
     /// durable and applied, or until the pipeline discards it. Returns the
     /// last sequence its operations took.
@@ -706,6 +605,9 @@ mod allocate_tests;
 
 #[cfg(test)]
 mod write_free_tests;
+
+#[cfg(test)]
+mod write_free_window_tests;
 
 #[cfg(test)]
 mod helping_tests;
