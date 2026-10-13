@@ -458,10 +458,16 @@ fn live_a_whole_life(env: &Arc<Recording>, dir: &Path) {
     db.put(b"after", b"v").unwrap();
     assert_eq!(db.get(b"refused").unwrap(), None);
 
-    assert!(
-        db.get_int_property("regolith.disk-available-bytes")
-            .is_some()
-    );
+    // The database asks its environment on every platform; the standard one
+    // answers from the file system on Unix, and on Windows, where the
+    // standard library has no call for free space, it answers nothing.
+    let asked = calls.count("Env::disk_space");
+    let available = db.get_int_property("regolith.disk-available-bytes");
+    assert!(calls.count("Env::disk_space") > asked);
+    #[cfg(unix)]
+    assert!(available.is_some());
+    #[cfg(windows)]
+    assert!(available.is_none());
     Checkpoint::new(&db)
         .unwrap()
         .create(dir.join("checkpoint"))
@@ -532,6 +538,14 @@ fn a_database_calls_every_method_of_its_environment_under_its_own_directories() 
     live_a_whole_life(&env, dir.path());
     let calls = &env.calls;
 
+    // The database calls each method on every platform, whatever the
+    // standard environment does with it there: `sync_dir` syncs the
+    // directory on Unix and returns at once on Windows, which has no
+    // directory sync; `drop_page_cache` advises the kernel on Linux and does
+    // nothing elsewhere; positional reads and log writes are `pread` and
+    // `pwrite` on Unix, `seek_read` and `seek_write` on Windows, with no
+    // shared cursor or lock on either.
+    //
     // An environment with a log of its own is never asked the length of a
     // file it writes: only the default log asks (the test below).
     let mut expected: BTreeSet<&str> = NO_CALLER.into_iter().collect();
