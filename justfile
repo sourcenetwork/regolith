@@ -808,6 +808,12 @@ tla:
     check MC_CommitPipeline_Red_DecideAnyOrder_Order        RED SeqInRingOrder
     check MC_CommitPipeline_Red_WorkBeyond                  RED WorksUpToItsOwn
     check MC_CommitPipeline_Red_StopHoldsClaim              RED NoLiveThreadBlocked
+    # WG4: a record's late copy, the same bytes a slow owner still had in
+    # flight, never lands under a sync that covers it. Rust:
+    # src/engine/commit/late_copy_tests.rs, under the fault shim.
+    check MC_CommitPipeline_Green_Copies                    GREEN
+    check MC_CommitPipeline_Green_Copies_InFlight           RED NoTwoCopies
+    check MC_CommitPipeline_Red_SyncNoWait                  RED NoWriteUnderSync
     # Decision 3 of plan 4.7: a queue's poll never waits for another thread.
     # A job that cannot get the round, the version store's step, the flush
     # exclusion or a failed log clear of writes parks: it leaves a note, looks

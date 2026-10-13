@@ -86,6 +86,17 @@
 \*               write_slot: a positional write of the record, behind the
 \*               log's epoch gate (Log::write_record). A failed write
 \*               poisons the log.
+\*   WriteStart, WriteLand
+\*               the same write in two steps, in the runs that set Copies:
+\*               counted in at the gate with the record looked at again
+\*               (Log::write_unless), then landed. A slow owner and a helper
+\*               past the courtesy both write one record, the same bytes;
+\*               the second to look finds it written and writes nothing.
+\*               A sync waits for the writes in flight below what it
+\*               vouches for before it begins, and so does a unit before
+\*               it syncs, since a sector in flight when the power goes may
+\*               come back garbled whatever was being written to it
+\*               (wal_gate.rs, WG4; NoWriteUnderSync).
 \*   ClaimRound, SyncBegin, SyncOk, SyncFail
 \*               round.rs: the round is one claim on the log's device step.
 \*               Whoever claims it syncs the written prefix.
@@ -252,6 +263,8 @@ TypeOK ==
   /\ pc \in [Actors -> {"idle", "open", "begun", "claimed", "ready", "done", "failed", "aborted"}]
   \* The stopped are threads.
   /\ stopped \subseteq Actors
+  \* A write in flight is of an order, or there is none.
+  /\ fly \in [Actors -> 0..MaxSlots]
   \* A cell is free exactly when its ticket has not been handed out.
   /\ \A i \in Slots : (i <= tail) <=> cell[i] # "free"
 
@@ -425,6 +438,25 @@ NoLiveThreadBlocked ==
   \* With no step left for any live thread, each of them has its answer.
   (~ENABLED LiveNext) => \A a \in Actors \ stopped : pc[a] \in {"done", "failed", "aborted"}
 
+\* WG4: no write lands on a range of the log after a sync that covers it has
+\* begun. A sector in flight when the power goes may come back garbled
+\* whatever bytes were being written to it, so a late copy of a record, the
+\* very bytes already there, must not be in flight over what a sync made
+\* durable or is making durable. Tiny example: the owner of order 1 is slow
+\* inside its write; order 2's thread writes order 1's record for it, then
+\* its own, claims the round and syncs both; the owner's copy lands after
+\* the sync began, over bytes it vouched for. Fails under SyncNoWait.
+\* Checked by TLC on the rows that set Copies, and on the code by the loom
+\* models in src/engine/loom_model/park.rs and the tests under the fault
+\* shim in src/engine/commit/late_copy_tests.rs; it has no Lean statement.
+NoWriteUnderSync ==
+  \* Every write in flight...
+  \A b \in Actors : fly[b] # 0 =>
+     \* ...is of a record no completed sync made durable...
+     /\ sq[fly[b]] > durable
+     \* ...and no sync under way vouches for.
+     /\ \A a \in round : target[a] = 0 \/ sq[fly[b]] > target[a]
+
 \* The run's ticket bound never stops a live thread, so nothing above is an
 \* artefact of the bound.
 BoundNeverBinds ==
@@ -457,6 +489,10 @@ NeverRotated == gen = 0
 \* "No transaction is ever turned away by its own early check." Broken
 \* once one is.
 NoEarlyAbort == \A a \in Actors : pc[a] # "aborted"
+
+\* "No two threads ever have one record's write in flight." Broken once a
+\* helper's copy is on its way beside the owner's.
+NoTwoCopies == \A a, b \in Actors : a # b /\ fly[a] # 0 => fly[a] # fly[b]
 
 ----------------------------------------------------------------------------
 \* Liveness: what eventually happens.
