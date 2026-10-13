@@ -241,11 +241,14 @@ impl Ordered<'_> {
     fn create_log(&self) -> io::Result<(u64, Arc<Log>)> {
         let engine = self.engine;
         let id = engine.versions.take_file_id()?;
-        let log = Arc::new(Log::create_in(
-            &engine.env,
-            &engine.wal_dir.join(wal_filename(id)),
-            engine.options.keyring.as_deref(),
-        )?);
+        let log = Arc::new(
+            Log::create_in(
+                &engine.env,
+                &engine.wal_dir.join(wal_filename(id)),
+                engine.options.keyring.as_deref(),
+            )?
+            .with_early_writeback(engine.early_writeback()),
+        );
         log.start_epoch(self.state.epoch);
         Ok((id, log))
     }

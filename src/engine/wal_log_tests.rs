@@ -333,6 +333,64 @@ fn a_close_after_every_record_is_synced_syncs_once() {
     );
 }
 
+/// Each record that passes a multiple of the early writeback's size kicks
+/// once, and the lane's call hands over exactly the multiples passed since
+/// its last call, never a byte a record has not passed.
+// Records the host's writeback calls on the file system, which miri cannot
+// reach.
+#[cfg_attr(miri, ignore)]
+#[test]
+fn early_writeback_hands_over_the_multiples_records_passed() {
+    let dir = TempDir::new().unwrap();
+    let wal_dir = dir.path().join("wal");
+    std::fs::create_dir_all(&wal_dir).unwrap();
+    let recording = Arc::new(RecordingEnv::default());
+    let env: Arc<dyn Env> = recording.clone();
+    let kicks = Arc::new(AtomicU64::new(0));
+    let counted = Arc::clone(&kicks);
+    let early = super::EarlyWriteback::new(
+        4096,
+        Arc::new(move || {
+            counted.fetch_add(1, Ordering::SeqCst);
+        }),
+    );
+    let log = Log::create_in(&env, &wal_dir.join("wal_000001.log"), None)
+        .unwrap()
+        .with_early_writeback(Some(early));
+    let mut at = log.stamp_len();
+    let mut write = |len: usize| {
+        let (place, record) = put_record(&log, at, b"k", &vec![7u8; len], 1);
+        log.write_record(&place, &record).unwrap();
+        at = place.end();
+    };
+    // Below the first multiple: no kick, nothing to hand over.
+    write(1000);
+    log.write_back_ahead();
+    assert_eq!(kicks.load(Ordering::SeqCst), 0);
+    // One record passes 4096 and 8192 at once: one kick, two multiples.
+    write(9000);
+    assert_eq!(kicks.load(Ordering::SeqCst), 1);
+    log.write_back_ahead();
+    // A record that passes nothing changes nothing.
+    write(10);
+    log.write_back_ahead();
+    // The next one passes 12288.
+    write(4000);
+    assert_eq!(kicks.load(Ordering::SeqCst), 2);
+    log.write_back_ahead();
+    let handed: Vec<String> = recording
+        .events
+        .lock()
+        .unwrap()
+        .ops
+        .iter()
+        .filter(|o| o.starts_with("writeback"))
+        .cloned()
+        .collect();
+    assert_eq!(handed, ["writeback 0 8192", "writeback 8192 4096"]);
+    assert_eq!(log.handed(), 12288);
+}
+
 /// One step of a writer: which record it writes.
 fn order(records: usize) -> impl Strategy<Value = Vec<usize>> {
     proptest::collection::vec(0..records, 0..records * 3)

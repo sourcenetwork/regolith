@@ -20,8 +20,9 @@ pub(crate) struct Recording {
     /// `sync`.
     pub log: Vec<String>,
     /// Everything `log` holds, plus every rename and directory sync, in
-    /// the order they happened: `rename <to>` and `sync dir`; and every log
-    /// created and removed: `create <name>` and `remove <name>`.
+    /// the order they happened: `rename <to>` and `sync dir`; every log
+    /// created and removed: `create <name>` and `remove <name>`; and every
+    /// writeback started: `writeback <offset> <len>`.
     pub ops: Vec<String>,
 }
 
@@ -121,6 +122,15 @@ impl LogFile for RecordingLog {
 
     fn len(&self) -> io::Result<u64> {
         self.inner.len()
+    }
+
+    fn start_writeback(&self, offset: u64, len: u64) {
+        self.events
+            .lock()
+            .unwrap()
+            .ops
+            .push(format!("writeback {offset} {len}"));
+        self.inner.start_writeback(offset, len);
     }
 }
 
