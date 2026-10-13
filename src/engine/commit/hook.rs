@@ -30,6 +30,9 @@ pub(crate) enum Stage {
     /// A `commit_nowait` commit found writes stopped and is about to take
     /// the stall's unit.
     Stall,
+    /// A commit that writes nothing sampled the published horizon and is
+    /// about to load the view it checks in.
+    WriteFree,
 }
 
 #[cfg(test)]

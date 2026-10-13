@@ -668,11 +668,20 @@ pub enum ScanDirection {
 /// runs at. Give the writers a validating level when a write-free reader's
 /// result must be one a serial order could have produced.
 ///
+/// A reader at `RepeatableRead` or `Serializable` checks every read at its
+/// commit, so one that commits after the writer whose input it missed is
+/// refused: the report below, made at `Serializable` and committed after the
+/// withdrawal, conflicts on `x`. One that commits first cannot be refused,
+/// since the write it missed is not there yet; only the writers' level
+/// prevents that.
+///
 /// Two balances, and a rule that a withdrawal which leaves their total
 /// below zero costs one more:
 ///
 /// ```
-/// use regolith::{IsolationLevel, OptimisticTransactionDb, Options, TxnOptions};
+/// use regolith::{
+///     IsolationLevel, OptimisticTransactionDb, Options, TransactionError, TxnOptions,
+/// };
 ///
 /// fn balance(bytes: Option<Vec<u8>>) -> i64 {
 ///     bytes.map_or(0, |bytes| i64::from_be_bytes(bytes.try_into().expect("eight bytes")))
@@ -716,6 +725,26 @@ pub enum ScanDirection {
 /// // A writer that validates its reads loses instead, because the `y` it
 /// // read changed. The report read the state after the deposit alone.
 /// assert_eq!(run(IsolationLevel::RepeatableRead)?, ((0, 20), 0));
+///
+/// // A report at `Serializable` that commits after the withdrawal checks
+/// // what it read there, finds the withdrawal's `x`, and is refused.
+/// let db = OptimisticTransactionDb::open("balances", Options::memory())?;
+/// let writer = TxnOptions::new().isolation(IsolationLevel::SnapshotIsolation);
+/// let withdrawal = db.begin(&writer);
+/// let (x, y) = (balance(withdrawal.get(b"x")?), balance(withdrawal.get(b"y")?));
+/// let deposit = db.begin(&writer);
+/// let before = balance(deposit.get(b"y")?);
+/// deposit.put(b"y", &(before + 20).to_be_bytes())?;
+/// deposit.commit()?;
+/// let report = db.begin(&TxnOptions::new().isolation(IsolationLevel::Serializable));
+/// assert_eq!((balance(report.get(b"x")?), balance(report.get(b"y")?)), (0, 20));
+/// let penalty = i64::from(x + y - 10 < 0);
+/// withdrawal.put(b"x", &(x - 10 - penalty).to_be_bytes())?;
+/// withdrawal.commit()?;
+/// let Err(TransactionError::Conflict(lost)) = report.commit() else {
+///     panic!("the report read an `x` the withdrawal replaced");
+/// };
+/// assert_eq!(lost.key(), b"x");
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -786,13 +815,15 @@ pub enum IsolationLevel {
     ///   validates no plain read: it read one snapshot, and nothing it did
     ///   can have moved. It checks only the reads it made through
     ///   [`Transaction::get_for_update`], against the newest published
-    ///   state, and takes no part in the commit pipeline, so its commit
-    ///   waits for no writer. What it read lies on a serial order of the
-    ///   commits only while every writer on the database validates its own
-    ///   reads: a writer at `SnapshotIsolation` or `ReadCommitted` beside it
-    ///   breaks that (see "A write-free reader needs writers that validate
-    ///   their reads" on this type). A pessimistic transaction at this level
-    ///   is not write-free, since its `get_for_update` reads can see two
+    ///   state, and, like a commit that writes nothing at any level, takes
+    ///   no part in the commit pipeline, so its commit waits for no writer.
+    ///   What it read lies on a serial order of the commits only while every
+    ///   writer on the database validates its own reads: a writer at
+    ///   `SnapshotIsolation` or `ReadCommitted` beside it breaks that (see
+    ///   "A write-free reader needs writers that validate their reads" on
+    ///   this type). A pessimistic transaction at this level that writes
+    ///   nothing gets no relaxation: it checks every read, as at
+    ///   `RepeatableRead`, since its `get_for_update` reads can see two
     ///   points in time.
     ///
     /// A scan checked with [`ScanCheck::Range`] is stricter than any of
@@ -1808,18 +1839,27 @@ impl Transaction {
     /// the same [`crate::Error`] a plain write reports, [`crate::Error::Busy`]
     /// for the last). A commit too large to log fails with
     /// [`TransactionError::Engine`] of [`crate::Error::InvalidArgument`] and
-    /// applies nothing; split it into smaller transactions. A commit with no
-    /// buffered writes takes no capacity and no stall holds it: it validates
-    /// its read set and returns. That validation
-    /// still takes its turn in the write pipeline, behind the commits ahead
-    /// of it. An optimistic transaction at
-    /// [`IsolationLevel::DefraLevel`] that writes nothing is the exception: it
-    /// takes no part in the pipeline and validates only its
-    /// [`Transaction::get_for_update`] reads. Its plain reads are one
-    /// snapshot, which lies on a serial order of the commits only while every
-    /// writer on the database validates its own reads: a writer at
-    /// [`IsolationLevel::SnapshotIsolation`], the default, breaks that (see
-    /// [`IsolationLevel`]).
+    /// applies nothing; split it into smaller transactions.
+    ///
+    /// A commit with no put, delete, merge or append writes nothing, at any
+    /// level and in either flavour: it takes no part in the write pipeline,
+    /// no capacity and no sequence, and no stall or other commit holds it up.
+    /// On the calling thread it checks what its level checks against
+    /// everything committed and visible at that moment, and is placed there:
+    /// every commit visible by then comes before it. At
+    /// [`IsolationLevel::ReadCommitted`] that is nothing; at
+    /// [`IsolationLevel::SnapshotIsolation`] only the reads made through
+    /// [`Transaction::get_for_update`]; at [`IsolationLevel::RepeatableRead`]
+    /// and [`IsolationLevel::Serializable`] every read the level validates;
+    /// and a scan checked with [`ScanCheck::Range`] at each of them. So a
+    /// read-only transaction at the first two never conflicts unless it asked
+    /// to. An optimistic transaction at [`IsolationLevel::DefraLevel`] checks
+    /// only its `get_for_update` reads: its plain reads are one snapshot,
+    /// which lies on a serial order of the commits only while every writer on
+    /// the database validates its own reads, and a writer at
+    /// `SnapshotIsolation`, the default, breaks that (see [`IsolationLevel`]).
+    /// A pessimistic one checks every read, as at `RepeatableRead`. Since it
+    /// writes nothing, it commits on a database latched read-only too.
     ///
     /// Concurrent commits go through one pipeline with each other and with
     /// plain writes, with no lock: each is decided in the order it entered,
@@ -1944,7 +1984,8 @@ impl Transaction {
         // `validate_ops_sizes` and before the commit takes a slot, gated on
         // the commit carrying an op. See the comment there for why.
         let outcome = if drained.write_free {
-            self.engine.commit_write_free(&drained.commit.checks)
+            // A blocking commit does its own I/O: no cache-only scope.
+            self.engine.commit_write_free(&drained.commit.checks, None)
         } else {
             let commit = drained.commit;
             self.engine.commit_with_conflict_check(
@@ -1980,17 +2021,22 @@ impl Transaction {
             made.reverse();
             made.into_iter().map(|(_, append)| append).collect()
         });
+        // A commit with no put, delete, merge or append writes nothing, at
+        // any level and in either flavour: it takes no part in the commit
+        // pipeline and checks what its level checks at the published horizon
+        // (`commit_write_free`, plan 3.8). A transaction never carries a
+        // range delete (`delete_range` refuses a non-empty range).
+        let write_free = writes.is_empty() && merges.is_empty() && appends.is_empty();
         let tracked = self.tracked.drain();
         let mut checks = self.validation_set(tracked, &writes, &merges);
-        // A write-free transaction at DefraLevel read one consistent snapshot
-        // and changes nothing, so no read of it can be stale in a way that
-        // matters, except a read it asked to have checked. Only an optimistic
-        // transaction qualifies: a pessimistic one validates as at
+        // DefraLevel's relaxation of a write-free transaction: an optimistic
+        // one read one consistent snapshot and changes nothing, so no read of
+        // it can be stale in a way that matters, except a read it asked to
+        // have checked. A pessimistic one keeps every check of
         // RepeatableRead, since its `get_for_update` reads past the snapshot
-        // can see two points in time.
-        let write_free =
-            self.projects() && writes.is_empty() && merges.is_empty() && appends.is_empty();
-        if write_free {
+        // can see two points in time (`MC_DefraLevel_Red_WriteFreePessimistic`).
+        let relaxed = write_free && self.projects();
+        if relaxed {
             checks
                 .reads
                 .retain(|read| read.access == Access::ReadForUpdate);
@@ -2008,7 +2054,7 @@ impl Transaction {
         // Behind the `take`, not threaded through `validation_set`, so a
         // transaction that never scans (the common case) pays no `Vec`
         // round trip for an empty run list on its commit path.
-        if let Some(runs) = self.scan_runs.take().filter(|_| !write_free) {
+        if let Some(runs) = self.scan_runs.take().filter(|_| !relaxed) {
             let mut runs = drain(&runs);
             if let Some(classifier) = classifier {
                 let before = runs.len();
@@ -2026,7 +2072,7 @@ impl Transaction {
                 &self.full_read_rule(),
             );
         }
-        if let Some(records) = self.scan_ranges.take().filter(|_| !write_free) {
+        if let Some(records) = self.scan_ranges.take().filter(|_| !relaxed) {
             checks.ranges = validated_range::checks(&drain(&records), self.snapshot_seq);
         }
         // After the scans are folded in, so the reads they added for put or
@@ -2342,8 +2388,8 @@ impl Transaction {
 /// What a transaction's commit hands the engine, drained out of it.
 struct Drained {
     commit: TxnCommit,
-    /// A write-free optimistic commit at `DefraLevel`: it takes no part in
-    /// the write pipeline.
+    /// A commit with no put, delete, merge or append, at any level: it takes
+    /// no part in the write pipeline (`RegolithEngine::commit_write_free`).
     write_free: bool,
     /// Scanned stretches the classifier dropped, recorded once the commit
     /// succeeds.

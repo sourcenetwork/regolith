@@ -664,11 +664,14 @@ fn scan_against_twin(
         "the twin buffered what the scanner did"
     );
 
-    let write_free = flavor == 0 && level == IsolationLevel::DefraLevel && written.is_empty();
+    // Writing nothing takes the write-free commit at every level; only an
+    // optimistic transaction at DefraLevel relaxes what it checks.
+    let write_free = written.is_empty();
     prop_assert_eq!(drained.write_free, write_free);
+    let relaxed = write_free && flavor == 0 && level == IsolationLevel::DefraLevel;
     let mut want: BTreeMap<Vec<u8>, (u64, Check)> = twin_set
         .iter()
-        .filter(|(key, _)| !write_free || asked.contains(key.as_slice()))
+        .filter(|(key, _)| !relaxed || asked.contains(key.as_slice()))
         .map(|(key, (seq, read))| {
             (
                 key.clone(),
@@ -676,7 +679,7 @@ fn scan_against_twin(
             )
         })
         .collect();
-    if !write_free {
+    if !relaxed {
         for key in &covered {
             if written.contains(key) || point_read(key) {
                 want.insert(key.clone(), (begin_seq, Check::Read));

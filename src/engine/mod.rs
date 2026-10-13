@@ -2680,26 +2680,13 @@ impl RegolithEngine {
     /// is accumulated on the way down, mirroring the read path: a
     /// tombstone in a newer source outranks a point entry found in an
     /// older one.
-    #[inline]
     fn latest_version_in_view(
         &self,
         key: &[u8],
         view: &ReadView,
     ) -> std::io::Result<Option<(u64, WriteKind)>> {
-        self.latest_version_upto(key, u64::MAX, view)
-    }
-
-    /// [`Self::latest_version_in_view`] among the writes at or below `snap`,
-    /// for a check that takes no slot of the commit ring and so must not see
-    /// a commit that is decided and not yet published.
-    fn latest_version_upto(
-        &self,
-        key: &[u8],
-        snap: u64,
-        view: &ReadView,
-    ) -> std::io::Result<Option<(u64, WriteKind)>> {
-        let lk = LookupKey::from_prefixed(key, snap);
-        let walked = view.walk_newest_first(key, snap, |source, max_rt_seq| {
+        let lk = LookupKey::from_prefixed(key, u64::MAX);
+        let walked = view.walk_newest_first(key, u64::MAX, |source, max_rt_seq| {
             let version = match source {
                 Source::Memtable(mt) => mt.latest_version(&lk),
                 Source::Table(reader) => {
