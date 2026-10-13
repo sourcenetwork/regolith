@@ -13,6 +13,12 @@
 //! sync then finds written. Where the host has no such hint, nothing is
 //! started and the seal writes the log as before.
 //!
+//! Off unless the caller turns it on ([`crate::Options::log_writeback`]):
+//! the lane is a thread beyond the compaction threads the database
+//! otherwise keeps to (plan 3.13 and 4.5), so asking for it is the caller's
+//! call. Off, no log has an early writeback, and a record's write costs one
+//! branch on `None`.
+//!
 //! A thread of its own, not a job for the compaction workers: a worker is
 //! busy for the length of a flush or a compaction pass under exactly the
 //! load that rotates, and writeback waiting behind one is writeback the

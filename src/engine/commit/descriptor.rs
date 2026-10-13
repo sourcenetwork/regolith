@@ -30,6 +30,13 @@ use std::ops::Range;
 use std::ptr;
 use std::sync::Arc;
 
+// A parked thread is unparked through loom in a loom build, so the model
+// sees whether a wake can be lost.
+#[cfg(loom)]
+use loom::thread::{self, Thread};
+#[cfg(not(loom))]
+use std::thread::{self, Thread};
+
 use super::super::DurabilityMode;
 use super::super::io::job::{Delivery, Job};
 use super::super::io::stack::{SHUT, Stack};
@@ -316,8 +323,6 @@ pub(super) const FAILED: u64 = 1 << 2;
 /// that claims it claims [`APPLYING`] in the same instruction, since it goes
 /// on to apply what it decided.
 pub(super) const DECIDING: u64 = 1 << 3;
-/// A thread is writing the slot's record. A hint, as [`DECIDING`].
-pub(super) const WRITING: u64 = 1 << 4;
 /// A thread is applying the slot's operations. A hint, as [`DECIDING`].
 pub(super) const APPLYING: u64 = 1 << 5;
 /// The descriptor is in the ring: its index is the slot it holds. Set by
@@ -331,6 +336,11 @@ pub(super) const ADMITTED: u64 = 1 << 7;
 /// An `allocate_nowait` caller gave its reservation up before the slot was
 /// decided: whoever decides it refuses it. Set by its owner.
 pub(super) const ABANDONED: u64 = 1 << 8;
+/// A thread parked on the slot ([`Descriptor::park`]): whoever sets
+/// [`WRITTEN`] or [`FAILED`] wakes it, and so does whoever passes the decided
+/// frontier over the slot or hands the log's write claim on to it. Never
+/// cleared: a wake that finds nobody left costs a look at an empty list.
+pub(super) const PARKED: u64 = 1 << 9;
 
 /// One slot's descriptor. See the module docs.
 pub(crate) struct Descriptor {
@@ -358,6 +368,10 @@ pub(crate) struct Descriptor {
     /// Who is told, on the landing thread, when the slot lands: a
     /// pessimistic commit's key locks, released then. Closed with [`SHUT`].
     landing: Stack<Arc<dyn Delivery>>,
+    /// Threads parked on the slot ([`Self::park`]). Never closed: a parked
+    /// thread looks again at what it waits for after it is on the list, so a
+    /// wake that comes before it parks is not lost.
+    sleepers: Stack<Thread>,
     /// See [`Self::is_blocking`].
     blocking: bool,
 }
@@ -376,6 +390,7 @@ impl Descriptor {
             failure: Take::empty(),
             body: Take::empty(),
             landing: Stack::new(),
+            sleepers: Stack::new(),
             blocking,
         }
     }
@@ -492,8 +507,55 @@ impl Descriptor {
     }
 
     /// Set the flags of `mask` (D2). `true` when this call set one of them.
+    /// Setting [`WRITTEN`] or [`FAILED`] wakes every thread parked on the
+    /// slot: the flag and [`PARKED`] share this word, so of a waiter's
+    /// read-modify-write and this one the later sees the earlier.
     pub(super) fn mark(&self, mask: u64) -> bool {
-        self.flags.fetch_or(mask, Ordering::AcqRel) & mask != mask
+        let before = self.flags.fetch_or(mask, Ordering::AcqRel);
+        if before & PARKED != 0 && mask & (WRITTEN | FAILED) != 0 {
+            self.wake();
+        }
+        before & mask != mask
+    }
+
+    /// Park this thread on the slot for at most `patience`, unless `ready`
+    /// holds once the thread is on the slot's list. `true` when it held and
+    /// the thread did not park. Whoever makes `ready` hold changes what it
+    /// reads first and then looks for [`PARKED`] (or reads a count the
+    /// caller made after this returns), so one of the two sees the other.
+    /// A loom build parks until it is woken: the model then shows that the
+    /// wake comes, with no time to fall back on.
+    pub(super) fn park(&self, patience: std::time::Duration, ready: impl Fn() -> bool) -> bool {
+        // A list that never closes takes every push.
+        let _ = self.sleepers.push(thread::current(), 0);
+        self.flags.fetch_or(PARKED, Ordering::SeqCst);
+        if ready() {
+            return true;
+        }
+        super::super::io::scope::waits(
+            "a slot's record or its decision, under way on another thread",
+        );
+        #[cfg(not(loom))]
+        thread::park_timeout(patience);
+        #[cfg(loom)]
+        {
+            let _ = patience;
+            thread::park();
+        }
+        false
+    }
+
+    /// Whether a thread parked on the slot since it was made.
+    pub(super) fn has_parked(&self) -> bool {
+        self.flags.load(Ordering::SeqCst) & PARKED != 0
+    }
+
+    /// Wake every thread parked on the slot. Each looks again at what it
+    /// waits for, and parks again if it still waits.
+    pub(super) fn wake(&self) {
+        for sleeper in self.sleepers.take_open() {
+            sleeper.unpark();
+        }
     }
 
     /// Set the flags of `mask` and return every flag as it was before: one
