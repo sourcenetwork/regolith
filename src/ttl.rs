@@ -4,7 +4,7 @@
 //! suffix appended at the end:
 //!
 //! ```text
-//! stored = [user_value]["LTTL"][version: u8][timestamp: u64_be]
+//! stored = [user_value]["RTTL"][version: u8][timestamp: u64_be]
 //! ```
 //!
 //! Reads strip the trailing suffix before returning and compare the
@@ -61,8 +61,16 @@ const TTL_SUFFIX_LEN: usize = TTL_MAGIC_LEN + 1 + TTL_TS_LEN;
 /// writes of a merged key are kept apart, each with its time, until they
 /// expire: the caller's operator folds them when the key is read
 /// ([`crate::MergeOperator::full_merge`]), and is never asked to fold two
-/// operands ahead of a read ([`crate::MergeOperator::partial_merge`]). A
-/// merged key costs the bytes of the writes it holds that have not expired.
+/// operands ahead of a read ([`crate::MergeOperator::partial_merge`]). The
+/// cost: a merged key keeps every write of the last `ttl_seconds`, and each
+/// read of it folds them all.
+///
+/// A merge written through [`DbWithTtl::inner`], or by regolith 0.1.9,
+/// which did not stamp merges, has no time. It is folded as a database
+/// without TTL folds it, which is how 0.1.9 read it: the caller's operator
+/// is shown the put and merges before it as they are stored, timestamps
+/// and all, and what it returns reads as a stamped value would. Writes that
+/// have expired are left out of that fold.
 pub struct DbWithTtl {
     inner: Db,
     ttl_seconds: u64,
@@ -174,20 +182,18 @@ impl DbWithTtl {
         let Some(stamped) = self.inner.get_slice(key)? else {
             return Ok(None);
         };
+        let horizon = self.expiry_horizon()?;
         if merge::decode(stamped.as_slice()).is_some() {
-            let horizon = self.expiry_horizon()?;
             return Ok(self
                 .read(key, stamped.as_slice().to_vec(), horizon)?
                 .map(DbSlice::from_vec));
         }
-        let Some(decoded) = decode_ttl_suffix(stamped.as_slice()) else {
-            return Ok(None);
-        };
-        let horizon = self.expiry_horizon()?;
-        if horizon > 0 && decoded.timestamp < horizon {
-            return Ok(None);
+        match decode_ttl_suffix(stamped.as_slice()) {
+            Some(decoded) if is_live(decoded.timestamp, horizon) => {
+                Ok(stamped.try_subslice(0..decoded.value_len))
+            }
+            _ => Ok(None),
         }
-        Ok(stamped.try_subslice(0..decoded.value_len))
     }
 
     /// Delete `key`. Range deletes are delegated to the inner
@@ -284,7 +290,7 @@ impl DbWithTtl {
         if self.ttl_seconds == 0 {
             return Ok(0);
         }
-        Ok(self.now_seconds()?.saturating_sub(self.ttl_seconds))
+        Ok(horizon_at(self.ttl_seconds, self.now_seconds()?))
     }
 
     /// What a read of `key` returns from what the database stores for it,
@@ -295,14 +301,39 @@ impl DbWithTtl {
         let Some(pieces) = merge::decode(&stored) else {
             return Ok(strip_if_live(stored, horizon));
         };
-        // A write without a time was made past the wrapper, and a read
-        // through it does not see it, as for a plain value.
-        let live: Vec<merge::Piece<'_>> = pieces
-            .into_iter()
-            .filter(|piece| piece.at.is_some_and(|at| horizon == 0 || at >= horizon))
-            .collect();
-        merge::fold(self.merge_operator.as_deref(), key, &live)
+        Ok(
+            merge::read(self.merge_operator.as_deref(), key, &pieces, horizon)?
+                .map(|(value, _)| value),
+        )
     }
+}
+
+/// The second before which a write has expired at `now` under
+/// `ttl_seconds`; 0, so that none has, with a TTL of zero. Saturating, so a
+/// clock skewed into the past does not expire everything.
+fn horizon_at(ttl_seconds: u64, now: u64) -> u64 {
+    if ttl_seconds == 0 {
+        return 0;
+    }
+    now.saturating_sub(ttl_seconds)
+}
+
+/// Whether a write stamped `at` is live when writes before `horizon` have
+/// expired. A read and compaction both decide it here.
+fn is_live(at: u64, horizon: u64) -> bool {
+    horizon == 0 || at >= horizon
+}
+
+/// The value a stamped buffer holds and its time, if it carries a stamp
+/// that is live under `horizon`.
+fn live_value(stamped: Vec<u8>, horizon: u64) -> Option<(Vec<u8>, u64)> {
+    let decoded = decode_ttl_suffix(&stamped)?;
+    if !is_live(decoded.timestamp, horizon) {
+        return None;
+    }
+    let mut out = stamped;
+    out.truncate(decoded.value_len);
+    Some((out, decoded.timestamp))
 }
 
 /// Return the raw user value with the trailing TTL suffix removed.
@@ -314,15 +345,7 @@ pub fn strip_timestamp(stamped: &[u8]) -> Option<&[u8]> {
 }
 
 fn strip_if_live(stamped: Vec<u8>, horizon: u64) -> Option<Vec<u8>> {
-    let decoded = decode_ttl_suffix(&stamped)?;
-    // horizon == 0 means "no expiration" (ttl=0). Otherwise a value
-    // whose timestamp is strictly below the horizon has aged out.
-    if horizon > 0 && decoded.timestamp < horizon {
-        return None;
-    }
-    let mut out = stamped;
-    out.truncate(decoded.value_len);
-    Some(out)
+    live_value(stamped, horizon).map(|(value, _)| value)
 }
 
 fn stamp(value: &[u8], ts: u64) -> Vec<u8> {
@@ -414,15 +437,12 @@ impl TtlCompactionFilter {
         key: &[u8],
         pieces: Vec<merge::Piece<'_>>,
     ) -> CompactionDecision {
+        let horizon = self.horizon();
         let held = pieces.len();
         // A write without a time never expires.
         let kept: Vec<merge::Piece<'_>> = pieces
             .into_iter()
-            .filter(|piece| {
-                piece
-                    .at
-                    .is_none_or(|at| !expired(self.ttl_seconds, &*self.env, at))
-            })
+            .filter(|piece| piece.at.is_none_or(|at| is_live(at, horizon)))
             .collect();
         if kept.is_empty() {
             return CompactionDecision::Remove;
@@ -437,13 +457,9 @@ impl TtlCompactionFilter {
         let Some(callers) = &self.callers else {
             return pruned();
         };
-        // What a read returns: the writes with a time, folded.
-        let timed: Vec<merge::Piece<'_>> = kept
-            .iter()
-            .copied()
-            .filter(|piece| piece.at.is_some())
-            .collect();
-        let Ok(Some(value)) = merge::fold(self.merge_operator.as_deref(), key, &timed) else {
+        let Ok(Some((value, newest))) =
+            merge::read(self.merge_operator.as_deref(), key, &kept, horizon)
+        else {
             // Nothing a read returns, or a fold the operator declines: the
             // caller's filter has no value to be shown.
             return pruned();
@@ -452,25 +468,21 @@ impl TtlCompactionFilter {
             CompactionDecision::Keep => pruned(),
             CompactionDecision::Remove => CompactionDecision::Remove,
             CompactionDecision::Change(changed) => {
-                let newest = timed.iter().filter_map(|piece| piece.at).max();
-                CompactionDecision::Change(stamp(&changed, newest.unwrap_or(0)))
+                CompactionDecision::Change(stamp(&changed, newest))
             }
         }
     }
-}
 
-/// Whether a write stamped `ts` has outlived `ttl_seconds` by `env`'s wall
-/// clock, as a read decides it ([`DbWithTtl::expiry_horizon`]). Never with
-/// a TTL of zero.
-fn expired(ttl_seconds: u64, env: &dyn Env, ts: u64) -> bool {
-    // No wall clock means nothing can be shown to have expired,
-    // so everything is kept. Dropping data on a guess is the one
-    // outcome this filter must never produce. Saturating arithmetic so a
-    // clock skew into the past does not accidentally expire everything.
-    ttl_seconds > 0
-        && env
+    /// The second before which a write has expired by the wall clock now,
+    /// as a read decides it ([`DbWithTtl::expiry_horizon`]).
+    fn horizon(&self) -> u64 {
+        // No wall clock means nothing can be shown to have expired, so
+        // everything is kept. Dropping data on a guess is the one outcome
+        // this filter must never produce.
+        self.env
             .unix_secs()
-            .is_some_and(|now| ts < now.saturating_sub(ttl_seconds))
+            .map_or(0, |now| horizon_at(self.ttl_seconds, now))
+    }
 }
 
 impl CompactionFilter for TtlCompactionFilter {
@@ -481,7 +493,7 @@ impl CompactionFilter for TtlCompactionFilter {
         let stamp = decode_ttl_suffix(value);
         if stamp
             .as_ref()
-            .is_some_and(|s| expired(self.ttl_seconds, &*self.env, s.timestamp))
+            .is_some_and(|s| !is_live(s.timestamp, self.horizon()))
         {
             return CompactionDecision::Remove;
         }
