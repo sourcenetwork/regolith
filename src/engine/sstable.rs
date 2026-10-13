@@ -87,6 +87,7 @@ use crate::DbSlice;
 use crate::env::{BufferedWriter, Env, ReadFile, WriteMode};
 use crate::options::{CompressionType, PrefixExtractor};
 
+mod block_codec;
 mod global_seq;
 mod key_walk;
 mod sealed;
@@ -1170,7 +1171,8 @@ impl SsTableWriter {
 
         let block_offset = self.current_offset;
 
-        let (codec_byte, payload) = match self.compression {
+        let (codec_byte, payload) = match block_codec::block_codec(self.compression, raw_data.len())
+        {
             CompressionType::None => (COMPRESSION_NONE, raw_data.clone()),
             CompressionType::Lz4 => (COMPRESSION_LZ4, lz4_flex::compress_prepend_size(&raw_data)),
             CompressionType::Snappy => {
