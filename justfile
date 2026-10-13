@@ -933,12 +933,16 @@ tla:
     check MC_StallRelief_Red_NoFailRecheck             RED NoWaitOnceFailing
     # A commit is never lost to a stall: however its call ends, its write
     # went in or it was told a failure. It is not handed the wait a plain
-    # write is, and it does not give up while its steps make progress.
-    # Checked by TLC and the tests; the Lean statement is still owed.
+    # write is, inline compaction off included (L32), and it does not give
+    # up while its steps make progress. Lean: Regolith/StallCommit.lean,
+    # no_lost_commit, takes_wait_loses_a_commit, gives_up_loses_a_commit,
+    # left_to_caller_loses_a_commit.
     check MC_StallRelief_Green_Commit                  GREEN
     check MC_StallRelief_Green_Commit_Failures         GREEN
     check MC_StallRelief_Red_CommitTakesWait           RED NoLostCommit
     check MC_StallRelief_Red_CommitGivesUp             RED NoLostCommit
+    check MC_StallRelief_Green_Commit_InlineOff        GREEN
+    check MC_StallRelief_Red_CommitLeftToCaller        RED NoLostCommit
     # E16: with no worker, a write that owes a step of background work runs
     # exactly one, and L0 stays at its compaction trigger (at the stop
     # trigger when every write seals). Lean: Regolith/OwedStep.lean,

@@ -174,6 +174,11 @@ import Regolith.EnvFilesRename
 -- relieves a stop lands the unit too, so a writer that was waiting is told
 -- what a fresh write is told. Backs `proofs/tla/StallRelief.tla`.
 import Regolith.StallRelief
+-- A commit is never lost to a stall: its call ends with its write in or
+-- told a failure, never handed the wait a plain write is (inline compaction
+-- off included) and never given up while it makes room. Backs the commit
+-- rows of `proofs/tla/StallRelief.tla`.
+import Regolith.StallCommit
 -- E15: waiting for the last snapshot. A sleeping waiter always has a pin
 -- still held or a release on its way to wake it, and on a target with one
 -- thread the call returns the count of pins held without waiting. Backs
