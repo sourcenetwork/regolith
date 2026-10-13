@@ -1831,7 +1831,10 @@ impl Db {
     /// it again for as long as the iterator lives, so a `Snapshot` that
     /// has already been dropped can still be counted here, which is
     /// exactly the case an embedder tracking its own transaction objects
-    /// would miss.
+    /// would miss. An open transaction pins its snapshot too, until its
+    /// commit is decided or it is rolled back; a
+    /// [`Transaction::commit_nowait`](crate::Transaction::commit_nowait)
+    /// commit holds it until the commit lands.
     ///
     /// The handle reports a count rather than an error because whether
     /// outstanding readers are a failure is the caller's decision:

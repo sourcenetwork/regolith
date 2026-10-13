@@ -24,18 +24,54 @@
 //! waits for this one's owner to poll its queue (`LockTable.tla`,
 //! `IsolationAtLanding`).
 //!
+//! The transaction's snapshot stays pinned until the commit lands too, and
+//! is let go by the same thread. A commit left behind a write stall has not
+//! taken its slot, so the check of what landed above its early horizon is
+//! still to come, and it reads every version above the snapshot. Unpinned,
+//! a compaction meanwhile may retire a deletion newer than the snapshot
+//! (there is no live snapshot below it), and the check would let through a
+//! commit that conflicts with it.
+//!
 //! Exactly one outcome per transaction, whichever way it ends: the commit
 //! claim is won here as `commit` wins it, and the callbacks of the outcome
 //! run once, at return for a ticket ready then, else at delivery, through the
 //! same function `commit` uses (`callbacks::Ending`).
 
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use super::{Transaction, TransactionError, TxResult, receipt_of};
 use crate::engine::io::job::Delivery;
 use crate::engine::io::shared::QueueShared;
-use crate::engine::{NowaitCommit, PendingCommit, RegolithEngine, conclude_settled};
+use crate::engine::{NowaitCommit, PendingCommit, RegolithEngine, SnapshotPin, conclude_settled};
 use crate::{CommitReceipt, CommitTicket, Error};
+
+/// The snapshot pin of a commit that lands later, let go by whoever lands
+/// it (see the module docs).
+struct LandingSnapshot {
+    engine: Weak<RegolithEngine>,
+    /// Taken once: a `try_lock` that finds it held means the other caller is
+    /// letting it go.
+    pin: crate::sync::Mutex<SnapshotPin>,
+}
+
+impl LandingSnapshot {
+    fn release(&self) {
+        let Some(mut pin) = self.pin.try_lock() else {
+            return;
+        };
+        let pin = pin.take();
+        // A database that is gone took its snapshot registry with it.
+        if let Some(engine) = self.engine.upgrade() {
+            engine.release_snapshot(pin);
+        }
+    }
+}
+
+impl Delivery for LandingSnapshot {
+    fn deliver(&self) {
+        self.release();
+    }
+}
 
 /// How far `commit_nowait` got before it returned.
 enum Committed {
@@ -179,6 +215,10 @@ impl Transaction {
                 scan_runs_dropped,
             } => {
                 let locks = self.take_landing_locks();
+                let snapshot = Arc::new(LandingSnapshot {
+                    engine: Arc::downgrade(&engine),
+                    pin: crate::sync::Mutex::new(self.snapshot_pin.take()),
+                });
                 self.release_resources();
                 let ending = self.ending();
                 let stats = engine.statistics_arc();
@@ -206,6 +246,9 @@ impl Transaction {
                     && !pending.listen(Arc::clone(&locks) as Arc<dyn Delivery>)
                 {
                     locks.release();
+                }
+                if !pending.listen(Arc::clone(&snapshot) as Arc<dyn Delivery>) {
+                    snapshot.release();
                 }
                 let waiter: Arc<dyn Delivery> = Arc::clone(&completion) as Arc<dyn Delivery>;
                 // Told on the queue once the commit is published. A queue
