@@ -81,7 +81,7 @@ pub(super) const OWED_DISK_CHECK: u8 = 0b10;
 /// ordered step where every writer waits, instead of the whole log. Never
 /// less than a MiB at a time, so a small buffer is not handed over in
 /// slivers. None without the lane.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_vendor = "apple"))]
 pub(super) fn early_writeback(
     lane: Option<&WritebackLane>,
     write_buffer_size: usize,
@@ -92,7 +92,7 @@ pub(super) fn early_writeback(
 }
 
 /// No lane, so no early writeback: the seal syncs the log whole.
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
 pub(super) fn early_writeback(
     _lane: Option<&WritebackLane>,
     _write_buffer_size: usize,
@@ -132,7 +132,7 @@ impl RegolithEngine {
 
     /// Hand what the active log's records passed to the host's writeback:
     /// what a kick of the lane runs.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_vendor = "apple"))]
     pub(super) fn write_back_log_ahead(&self) {
         if let Some(tip) = self.pipeline_state() {
             tip.after.log.write_back_ahead();

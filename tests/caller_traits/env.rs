@@ -512,8 +512,8 @@ fn live_a_whole_life(env: &Arc<Recording>, dir: &Path) {
     assert_eq!(db.get(&key(0)).unwrap(), Some(b"first".to_vec()));
     drop(db);
 
-    // The log writeback lane, asked for (`Options::log_writeback`): on Linux,
-    // with a worker, the log is handed to the environment's log as it grows
+    // The log writeback lane, asked for (`Options::log_writeback`): on Linux
+    // and Apple, with a worker, the log is handed to the environment's log as it grows
     // past each eighth of the write buffer, here each MiB. The lane runs on
     // a thread of its own, so the call is waited for.
     let db = Db::open(
@@ -525,7 +525,7 @@ fn live_a_whole_life(env: &Arc<Recording>, dir: &Path) {
     for i in 0..6 {
         db.put(&key(i), value.as_slice()).unwrap();
     }
-    if cfg!(target_os = "linux") {
+    if cfg!(any(target_os = "linux", target_vendor = "apple")) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
         let mut pause = std::time::Duration::from_micros(50);
         while calls.count("LogFile::start_writeback") == 0 {
@@ -583,8 +583,9 @@ fn a_database_calls_every_method_of_its_environment_under_its_own_directories() 
     // file it writes: only the default log asks (the test below).
     let mut expected: BTreeSet<&str> = NO_CALLER.into_iter().collect();
     expected.insert("WriteFile::len");
-    // The log writeback lane runs on Linux alone, the one host with the hint.
-    if !cfg!(target_os = "linux") {
+    // The log writeback lane runs on Linux and Apple alone, the hosts with a
+    // way to start the writeback.
+    if !cfg!(any(target_os = "linux", target_vendor = "apple")) {
         expected.insert("LogFile::start_writeback");
     }
     assert_eq!(never_called(calls), expected);
@@ -614,9 +615,10 @@ fn the_default_log_serves_a_database_through_open_write() {
     live_a_whole_life(&env, dir.path());
     let calls = &env.calls;
 
-    // The log writeback lane runs on Linux alone, the one host with the hint.
+    // The log writeback lane runs on Linux and Apple alone, the hosts with a
+    // way to start the writeback.
     let mut expected: BTreeSet<&str> = NO_CALLER.into_iter().collect();
-    if !cfg!(target_os = "linux") {
+    if !cfg!(any(target_os = "linux", target_vendor = "apple")) {
         expected.insert("LogFile::start_writeback");
     }
     assert_eq!(never_called(calls), expected);

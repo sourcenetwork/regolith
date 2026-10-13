@@ -10,8 +10,11 @@
 //! (`wal_log::EarlyWriteback`), and this lane starts the writeback of what
 //! writers passed ([`crate::env::LogFile::start_writeback`]): no sync, no
 //! claim on the pipeline, no durability promised, only pages the seal's
-//! sync then finds written. Where the host has no such hint, nothing is
-//! started and the seal writes the log as before.
+//! sync then finds written. On Linux that is `sync_file_range`; on Apple,
+//! whose `sync_data` is `F_FULLFSYNC` (the pages and the drive's cache), it
+//! is a plain `fsync`, which writes the pages out without flushing the drive
+//! cache, so the seal's `F_FULLFSYNC` finds them written. Where the host has
+//! neither, there is no lane and the seal writes the log as before.
 //!
 //! Off unless the caller turns it on ([`crate::Options::log_writeback`]):
 //! the lane is a thread beyond the compaction threads the database
@@ -25,9 +28,11 @@
 //! seal does itself. Not on the writer's thread either: starting writeback
 //! costs the caller the host's work of writing the pages out, compression
 //! included on a filesystem that compresses, which the writer would pay on
-//! the commit path. Not a sync of the log ahead either: on btrfs a sync
-//! holds the file against writes while it runs, and syncing ahead measured
-//! slower there than the one sync at the seal.
+//! the commit path. Not a durable sync of the log ahead either: on btrfs a
+//! sync holds the file against writes while it runs, and syncing ahead
+//! measured slower there than the one sync at the seal. Apple's `fsync` is
+//! no durable sync, since it leaves the drive's cache; its effect on the
+//! seal there has not been measured.
 //!
 //! # Invariants
 //!
