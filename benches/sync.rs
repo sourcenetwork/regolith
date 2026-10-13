@@ -31,6 +31,8 @@
 //!
 //! No async runtime is involved: the executors are the functions below.
 
+mod common;
+
 use std::future::Future;
 use std::hint::black_box;
 use std::pin::{Pin, pin};
@@ -142,10 +144,10 @@ fn on_threads(
     park: bool,
 ) -> Duration {
     let op = Arc::new(op);
-    let start = Arc::new(std::sync::Barrier::new(tasks + 1));
+    let line = Arc::new(common::start::StartLine::new(tasks));
     let threads: Vec<_> = (0..tasks)
         .map(|_| {
-            let (op, start) = (Arc::clone(&op), Arc::clone(&start));
+            let (op, line) = (Arc::clone(&op), Arc::clone(&line));
             std::thread::spawn(move || {
                 let flag = Arc::new(Flag(AtomicBool::new(false)));
                 let waker = if park {
@@ -153,15 +155,14 @@ fn on_threads(
                 } else {
                     Waker::from(Arc::clone(&flag))
                 };
-                start.wait();
+                line.wait();
                 for _ in 0..per_task {
                     op(&waker, &flag);
                 }
             })
         })
         .collect();
-    start.wait();
-    let began = Instant::now();
+    let began = line.start();
     for thread in threads {
         thread.join().expect("worker");
     }

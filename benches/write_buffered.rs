@@ -13,8 +13,8 @@
 
 mod common;
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};
 
 use regolith::{Options, WriteOptions};
@@ -59,12 +59,12 @@ struct Rep {
 fn run_rep(threads: usize, dur: Duration) -> Rep {
     let (tmp, db) = common::open("write-buffered", opts());
     let db = Arc::new(db);
-    let barrier = Arc::new(Barrier::new(threads + 1));
+    let line = Arc::new(common::start::StartLine::new(threads));
     let written = Arc::new(AtomicU64::new(0));
     let mut handles = Vec::with_capacity(threads);
     for t in 0..threads {
         let db = Arc::clone(&db);
-        let barrier = Arc::clone(&barrier);
+        let line = Arc::clone(&line);
         let written = Arc::clone(&written);
         handles.push(std::thread::spawn(move || {
             let wo = WriteOptions::default();
@@ -75,8 +75,7 @@ fn run_rep(threads: usize, dur: Duration) -> Rep {
                 db.put_opt(&wo, &common::key(base + i), &value)
                     .expect("warmup put");
             }
-            barrier.wait();
-            let deadline = Instant::now() + dur;
+            let deadline = line.wait() + dur;
             let mut i = WARMUP_OPS;
             loop {
                 for _ in 0..CLOCK_EVERY {
@@ -91,9 +90,9 @@ fn run_rep(threads: usize, dur: Duration) -> Rep {
             written.fetch_add(i - WARMUP_OPS, Ordering::Relaxed);
         }));
     }
-    barrier.wait();
+    line.all_ready();
     let cpu0 = common::cpu_seconds();
-    let start = Instant::now();
+    let start = line.go();
     for h in handles {
         h.join().expect("writer thread panicked");
     }

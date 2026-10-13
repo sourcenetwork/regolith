@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 /// clock. Used once: one line per timed run.
 pub struct StartLine {
     ready: Barrier,
-    go: Barrier,
+    release: Barrier,
     at: OnceLock<Instant>,
 }
 
@@ -24,7 +24,7 @@ impl StartLine {
     pub fn new(workers: usize) -> Self {
         StartLine {
             ready: Barrier::new(workers + 1),
-            go: Barrier::new(workers + 1),
+            release: Barrier::new(workers + 1),
             at: OnceLock::new(),
         }
     }
@@ -34,7 +34,7 @@ impl StartLine {
     /// as the coordinator's window.
     pub fn wait(&self) -> Instant {
         self.ready.wait();
-        self.go.wait();
+        self.release.wait();
         *self
             .at
             .get()
@@ -44,10 +44,22 @@ impl StartLine {
     /// The coordinator's side, once every worker is spawned: wait until all
     /// are at the line, start the clock, then let them go.
     pub fn start(&self) -> Instant {
+        self.all_ready();
+        self.go()
+    }
+
+    /// The first half of [`Self::start`], for a coordinator that reads
+    /// something else (a CPU counter) with every worker parked at the line.
+    pub fn all_ready(&self) {
         self.ready.wait();
+    }
+
+    /// The second half of [`Self::start`]: start the clock, then let the
+    /// workers go.
+    pub fn go(&self) -> Instant {
         let now = Instant::now();
         let _ = self.at.set(now);
-        self.go.wait();
+        self.release.wait();
         now
     }
 }
