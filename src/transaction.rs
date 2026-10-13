@@ -180,7 +180,7 @@ pub use callbacks::{AbortReason, CommitInfo, TransactionHooks};
 use callbacks::{Callbacks, Prepare};
 pub(crate) use claim::Claim;
 pub use cursor::{Page, ScanCheck, TxnCursor, TxnScanStream};
-use lock_table::{KeyLock, PendingLock};
+use lock_table::{KeyLock, LockWaits};
 pub(crate) use lock_table::{LockOwner, LockTable};
 pub use policy::{KeyClass, KeyClassifier};
 use projection::Projection;
@@ -980,7 +980,7 @@ pub struct Transaction {
     lock_owner: OnceLock<Arc<LockOwner>>,
     /// The waits for locks other transactions held, one per key, kept across
     /// calls (`locking`). Allocated by the first wait.
-    lock_waits: OnceLock<Box<TxnBuffer<Vec<u8>, Arc<PendingLock>>>>,
+    lock_waits: OnceLock<Box<LockWaits>>,
     lock_timeout: Duration,
     resolved: bool,
     resources_released: bool,

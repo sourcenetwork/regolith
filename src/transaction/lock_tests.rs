@@ -2,13 +2,13 @@
 //! the table stays bounded by the locks in use, and `close` releases the
 //! locks of the transactions it aborts and no others.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use tempfile::TempDir;
 
 use super::*;
-use crate::WouldBlock;
+use crate::{LockWait, WouldBlock};
 
 fn pes_db() -> (TransactionDb, TempDir) {
     let dir = TempDir::new().unwrap();
@@ -90,4 +90,46 @@ fn close_releases_the_locks_of_the_transactions_it_aborts() {
     // Each ends as usual; a lock close released is not released twice.
     drop((early, late, plain));
     assert_eq!(db.locks.len(), 0);
+}
+
+/// Two calls of one transaction find the key held by another transaction at
+/// once: the second runs whole inside the first, between the first's lookup
+/// and its publication. They must share one wait, so the holder's release
+/// reaches a call that polls it, and that call takes the free lock.
+#[test]
+fn two_calls_behind_a_holder_share_one_wait_and_the_release_reaches_it() {
+    let (db, _dir) = pes_db();
+    let other = db.begin(&TxnOptions::new());
+    other.put(b"k", b"v").unwrap();
+    let txn = Arc::new(db.begin(&TxnOptions::new()));
+    let key = prefix_key(DEFAULT_CF_ID, b"k");
+    let inner = Arc::new(Mutex::new(None));
+    {
+        let (txn, key, inner) = (Arc::clone(&txn), key.clone(), Arc::clone(&inner));
+        locking::before_publish(move || {
+            *inner.lock().unwrap() = Some(txn.try_lock_key(&key));
+        });
+    }
+    let waits: Vec<LockWait> = [
+        txn.try_lock_key(&key),
+        inner.lock().unwrap().take().unwrap(),
+    ]
+    .into_iter()
+    .map(|call| match call {
+        Err(TransactionError::WouldBlock(WouldBlock::Locked(wait))) => wait,
+        other => panic!("the key is held: {other:?}"),
+    })
+    .collect();
+    assert!(waits.iter().all(|wait| !wait.is_ready()));
+
+    other.commit().unwrap();
+    assert!(
+        waits.iter().any(LockWait::is_ready),
+        "the release told neither call"
+    );
+    assert!(
+        matches!(txn.try_lock_key(&key), Ok(false)),
+        "the told call runs again and takes the free lock"
+    );
+    assert_ne!(holder(&db, b"k"), 0);
 }

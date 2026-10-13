@@ -22,6 +22,10 @@
 //!   given back while another caller takes one; never both.
 //! - **No wait outlives close**: a wait queued while close marks the gate and
 //!   wakes every waiter is told, or its call abandons it.
+//! - **Two calls on one transaction share one wait**: two calls find the key
+//!   held at once and may both make a wait; one is published, the other is
+//!   given back unpolled, and the holder's release reaches the published one,
+//!   so the transaction takes the freed lock.
 //! - **Two pollers on one wait are both told**: two calls of one transaction
 //!   poll one queued wait while the holder releases; a call that meets the
 //!   other's poll returns waiting, and is told whenever the release's wake
@@ -63,6 +67,17 @@ fn a_retired_entry_is_never_used() {
 #[test]
 fn no_lock_wait_outlives_close() {
     locks::no_lock_wait_outlives_close();
+}
+
+#[test]
+fn two_calls_on_one_transaction_share_one_wait() {
+    locks::two_calls_on_one_transaction_share_one_wait();
+}
+
+#[test]
+#[should_panic(expected = "the transaction never took the freed lock")]
+fn calibration_two_published_waits_hide_the_told_one() {
+    locks::calibration_two_published_waits_hide_the_told_one();
 }
 
 #[test]

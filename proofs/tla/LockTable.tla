@@ -76,8 +76,10 @@
 \* WHAT THE MODEL LEAVES OUT, and why that loses nothing.
 \*   - One key. Each key has its own lock, and no step touches two.
 \*   - One call per transaction at a time. A second thread of the same
-\*     transaction reads its own name in the state word and returns; it
-\*     never queues (the loom models cover it).
+\*     transaction reads its own name in the state word and returns, or
+\*     shares the transaction's one wait for the key: LockTableCalls.tla
+\*     checks two calls of one transaction, one wait between them, and a
+\*     wake that falls inside one call's poll.
 \*   - Close. It wakes every waiter and refuses new ones; the loom model
 \*     no_lock_wait_outlives_close checks it against the real types.
 \*   - The drain role (which thread runs a pass over the waiting line). A

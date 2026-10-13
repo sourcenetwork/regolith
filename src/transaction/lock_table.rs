@@ -60,6 +60,11 @@ const KEY_BUCKETS: usize = 64;
 /// The use count of an entry taken out of the table.
 const RETIRED: usize = usize::MAX;
 
+/// One transaction's waits, one per key: a wait is published by one
+/// linearizable insert, or by replacing a wait that is over
+/// (`Transaction::publish_wait`), and stays until the transaction ends.
+pub(super) type LockWaits = HashMap<Vec<u8>, Arc<PendingLock>>;
+
 /// The table of key locks one [`TransactionDb`](super::TransactionDb) keeps.
 pub(crate) struct LockTable {
     keys: HashMap<Vec<u8>, Arc<KeyLock>>,
