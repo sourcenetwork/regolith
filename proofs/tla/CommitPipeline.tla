@@ -251,100 +251,182 @@
 \* check reads the memtable itself.
 \*
 \* THE WRITE UNIT, LINE BY LINE. Every variable, step and promise of this
-\* model about the write unit, beside the Rust that does it, in plain words.
-\* (File and line of the tree the model was checked against; the files are
-\* under src/engine.)
+\* model about the write unit and about a thread parked far from its turn,
+\* beside the Rust that does it, in plain words. (File and line of the tree
+\* the model was checked against; the files are under src/engine.)
 \*
-\*   filled[i]: order i's record is encoded and will not change again.
-\*       The FILLED flag, set by Descriptor::fill (descriptor.rs:579),
-\*       read by Descriptor::record (descriptor.rs:597).
+\*   filled[i]: order i's record is encoded and will not change again. The
+\*       FILLED flag, set by Descriptor::fill (commit/descriptor.rs:592), read by
+\*       Descriptor::record (commit/descriptor.rs:610).
+\*   filling[i], encoding[a]: somebody claimed the encoding of order i's
+\*       record, and which record thread a has in hand. The FILLING flag
+\*       (commit/descriptor.rs:356), claimed by the fetch_or at the top of
+\*       Descriptor::fill; the encoding is the closure that call runs.
 \*   writer: who holds the write unit. The CLAIMED bit of WriteUnit.word,
-\*       taken by try_claim (write_unit.rs:186) and
-\*       let go by release (write_unit.rs:206).
-\*   gathered[a]: the run the holder collected. The Run that try_batch's
-\*       scan fills (write_unit.rs:738), record by record
-\*       through Run::take (write_unit.rs:376).
+\*       taken by try_claim (commit/write_unit.rs:201) and let go by release
+\*       (commit/write_unit.rs:221).
+\*   gathered[a]: the run the holder collected. The Run that try_batch's scan
+\*       fills (commit/write_unit.rs:788), record by record through Run::take
+\*       (commit/write_unit.rs:391).
 \*   fly[a]: a write counted in at the gate, its bytes on the way. InFlight
-\*       (wal_log.rs:626), made by Log::count_in (wal_log.rs:417)
-\*       and counted out when it drops (wal_log.rs:644).
+\*       (wal_log.rs:626), made by Log::count_in (wal_log.rs:417) and counted out
+\*       when it drops (wal_log.rs:644).
+\*   runEnd[a]: the last record of the run thread a wrote. wrote_upto in
+\*       try_batch (commit/write_unit.rs:864).
 \*   asleep, sleepOn[a]: a thread parked on a record. The thread on the
 \*       descriptor's list with PARKED set: Descriptor::register
-\*       (descriptor.rs:644), then park (descriptor.rs:627).
-\*   late[a]: a parked thread whose patience ran out. out_of_patience
-\*       answered yes (write_unit.rs:594); copy_record comes next.
-\*   wanted: a parked thread asked to be woken at the next let go. The
-\*       WANTED bit, set by WriteUnit::note (write_unit.rs:213) from park_on,
-\*       read by the let go's swap.
+\*       (commit/descriptor.rs:657), then park (commit/descriptor.rs:640).
+\*   late[a]: a parked thread whose patience ran out. out_of_patience answered
+\*       yes (commit/write_unit.rs:594); copy_record comes next.
+\*   wanted: a parked thread asked to be woken at the next let go. The WANTED
+\*       bit, set by WriteUnit::note (commit/write_unit.rs:228) from park_on, read
+\*       by the let go's swap.
+\*   turnAsleep, turnAt[a]: threads parked far from their turn, and where the
+\*       frontier stood when each last parked. Turns.far counts them
+\*       (commit/turn_wait.rs:52); parked_at in help_decide
+\*       (commit/pipeline.rs:345) is turnAt.
+\*   nearTo, wokenTo: the orders named as near, and the orders told so.
+\*       Turns.near_to and Turns.woken_to (commit/turn_wait.rs:54,
+\*       commit/turn_wait.rs:56).
+\*   nearMark[i]: order i was told its turn is near. The NEAR flag
+\*       (commit/descriptor.rs:364), set by wake_near's mark
+\*       (commit/pipeline.rs:794).
+\*   owes[a]: thread a's commit is done and it still has to tell. drive's call
+\*       of wake_near once publish_upto says Published (commit/pipeline.rs:1030).
+\*   Lead: how far past the next order a thread's own must be before it parks
+\*       far from its turn. Turns::lead (commit/turn_wait.rs:73): LEAD
+\*       (commit/turn_wait.rs:41), and one more for every LEAD_PER_SLEEPER
+\*       sleepers.
+\*   Patience: a sleeper may give up waiting. PATIENCE for a record
+\*       (commit/write_unit.rs:134), TURN_PATIENCE far from the turn
+\*       (commit/turn_wait.rs:46).
 \*
-\*   Encode(a): the owner encodes its record. RegolithEngine::fill
-\*       (write_unit.rs:483), called by drive (pipeline.rs:885), drive_nowait
-\*       (pipeline.rs:857) and the allocations (allocate.rs:91).
+\*   EncodeStart(a, i), EncodeEnd(a): claim the encoding of a record nobody is
+\*       encoding, encode it, set FILLED and wake the parked. RegolithEngine::fill
+\*       (commit/write_unit.rs:500), called by drive (commit/pipeline.rs:1016) for
+\*       the owner's own record, by the allocations (commit/allocate.rs:91), and
+\*       by bring_written for a record a thread needs that nobody is encoding
+\*       (commit/write_unit.rs:548); Descriptor::fill and its mark
+\*       (commit/descriptor.rs:565).
 \*   Gather(a): claim the free unit and collect the first run. try_batch
-\*       (write_unit.rs:713): try_claim, then the scan from past the written
-\*       hint or the published frontier, whichever is further.
+\*       (commit/write_unit.rs:746): try_claim, then the scan from past the
+\*       written hint or the published frontier, whichever is further.
 \*   RunStart(a): count in, look again, keep what still waits.
-\*       log.count_in(run.epoch) (write_unit.rs:778), then the look again
-\*       (write_unit.rs:786), which is Kept.
+\*       log.count_in(run.epoch) (commit/write_unit.rs:811), then the look again,
+\*       which is Kept.
 \*   WriteLand(a), a run: the run's one write lands. flight.write
-\*       (write_unit.rs:799) through InFlight::write (wal_log.rs:635),
-\*       LogFile::write_all_vectored_at and its pwritev (std_env.rs:405); then
-\*       the count out and the marks (write_unit.rs:806), whose wakes come
-\*       after the let go (write_unit.rs:846).
-\*   WriteLand(a), a copy: copy_record (write_unit.rs:657) through
-\*       Log::write_unless (wal_log.rs:391), then Descriptor::mark, which wakes
-\*       (descriptor.rs:552).
-\*   LandFail(a): a write fails. The error arms of try_batch
-\*       (write_unit.rs:832) and copy_record (write_unit.rs:703): the
-\*       log is poisoned and the parked are woken.
+\*       (commit/write_unit.rs:832) through InFlight::write (wal_log.rs:635),
+\*       LogFile::write_all_vectored_at and its pwritev (../env/std_env.rs:477);
+\*       then the count out and the marks, whose wakes come after the let go.
+\*   WriteLand(a), a copy: copy_record (commit/write_unit.rs:690) through
+\*       Log::write_unless (wal_log.rs:391), then Descriptor::mark, which wakes.
+\*   LandFail(a): a write fails. The error arms of try_batch and copy_record:
+\*       the log is poisoned and the parked are woken.
 \*   Release(a): let the unit go and tell. Claim's drop
-\*       (write_unit.rs:897): WriteUnit::release, then tell_waiters
-\*       (write_unit.rs:855), which wakes the first record that
-\*       waits_for_the_unit (write_unit.rs:428) and asks again for the next.
-\*   Park(a): sleep on a record in another's hands. park_on
-\*       (write_unit.rs:622): Descriptor::park, looking again whether the record is
-\*       written, and for a filled record noting the claim it saw as wanted,
-\*       for an unfilled one whether it is filled now.
-\*   Timeout(a): the park's time runs out. park_timeout in Descriptor::park
-\*       (descriptor.rs:633), and out_of_patience saying yes.
+\*       (commit/write_unit.rs:937): WriteUnit::release, then tell_waiters
+\*       (commit/write_unit.rs:895), which wakes the first record that
+\*       waits_for_the_unit (commit/write_unit.rs:443) and asks again for the
+\*       next.
+\*   PubHorizon(a), PubFrontier(a) with PublishesRun(a, p): the holder
+\*       publishes what its run made publishable before it wakes the run's owners
+\*       (WU7). publish_ready (commit/pipeline.rs:924), called after the let go
+\*       (commit/write_unit.rs:878); each order through publishable_slot and
+\*       publish_slot (commit/pipeline.rs:902), as every publisher does.
+\*   Park(a): sleep on a record in another's hands: filled and the unit
+\*       claimed, or being encoded. park_on (commit/write_unit.rs:655):
+\*       Descriptor::park, looking again whether the record is written, and for a
+\*       filled record noting the claim it saw as wanted, for one being encoded
+\*       whether it is filled now.
+\*   Timeout(a): the park's time runs out. park_timeout in Descriptor::park,
+\*       and out_of_patience (commit/write_unit.rs:627) saying yes.
 \*   StealStart(a): the copy after the patience. copy_record, through
 \*       Log::write_unless: count in, look again (the `written` test), write.
-\*   WriteStart(a, i): the round's holder copies. sync_written
-\*       (round.rs:218) calls bring_written with Await::Copy
-\*       (round.rs:243).
-\*   Need(a): the record a thread needs next. drive's
-\*       bring_written of its own record (pipeline.rs:894), then publish_upto's
-\*       of the next to publish (pipeline.rs:797).
-\*   Usable, RunFrom, Firsts: which records a run takes. The `usable`
-\*       test of the scan (write_unit.rs:755) and Run::take's same log, same
-\*       epoch, offset that follows on.
+\*   WriteStart(a, i): the round's holder copies. sync_written calls
+\*       bring_written with Await::Copy (commit/round.rs:243).
+\*   Need(a): the record a thread needs next. drive's bring_written of its own
+\*       record (commit/pipeline.rs:1025), then publish_upto's of the next to
+\*       publish (commit/pipeline.rs:886).
+\*   Usable, RunFrom, Firsts: which records a run takes. The `usable` test of
+\*       the scan and Run::take's same log, same epoch, offset that follows on.
+\*   Pass, Void, DecideNow, UnitRun with Named(i): a frontier pass names the
+\*       orders whose turn is now near. RegolithEngine::pass_decided
+\*       (commit/pipeline.rs:774): Ring::pass_decided (commit/ring.rs:244), then
+\*       Turns::name (commit/turn_wait.rs:79); the void path and the ordered units
+\*       pass through the same function.
+\*   RbFinish with Named: a rollback's jump names the orders past it.
+\*       thaw_decided then Turns::name (commit/ordered.rs:790).
+\*   TurnPark(a): a blocking thread far from its turn, finding the next order
+\*       being decided by another (its DECIDING claim taken), parks on its own
+\*       order. help_decide (commit/pipeline.rs:413), then park_far
+\*       (commit/pipeline.rs:804): Turns::count_in (commit/turn_wait.rs:111),
+\*       Descriptor::park with Turns::near (commit/turn_wait.rs:125) as its look.
+\*   TurnWake(a): the sleeper wakes: NEAR set, or TURN_PATIENCE passed; then
+\*       Turns::count_out and help_decide looks again.
+\*   WakeNear(a): a finished commit tells the named orders. wake_near
+\*       (commit/pipeline.rs:786): Turns::claim_told (commit/turn_wait.rs:92),
+\*       then mark(NEAR) on each order in the ring.
+\*   PubFrontier waking a told owner from turnAsleep: a blocking slot's
+\*       landing wakes whoever parked on it. Descriptor::land
+\*       (commit/descriptor.rs:482), called by publish_slot and by the rollback.
 \*
 \*   OneClaim (WU1): try_claim's compare-and-swap; loom
 \*       one_thread_at_a_time_holds_the_unit (commit/loom_write_unit.rs).
-\*   NoWriteUnderSync (WG4, WU3): the gate's settle (wal_gate.rs:240)
-\*       against a write's enter (wal_gate.rs:142) and its look again; loom
+\*   OneEncoder (D4): Descriptor::fill's claim of FILLING; loom
+\*       one_thread_encodes_a_record, its calibration
+\*       an_encoding_claimed_with_a_load_and_a_store_writes_one_buffer_twice; RED
+\*       EncodeNoClaim.
+\*   NoWriteUnderSync (WG4, WU3): the gate's settle (wal_gate.rs:242) against
+\*       a write's enter (wal_gate.rs:144) and its look again; loom
 \*       a_run_never_lands_under_a_sync.
-\*   NoLiveThreadBlocked with Patience off (WU4, no lost wake): the mark
-\*       and the park's flag share one word; the note and the let go share
-\*       another. Loom a_parked_writer_is_woken_when_its_record_is_written and
-\*       a_writer_parked_for_the_next_claim_is_woken_when_the_unit_is_let_go.
-\*   EveryLiveCommitCompletes with a stopped holder (WU5): the patience.
-\*       Lean a_park_is_bounded and patience_bounds_the_wait
+\*   DurableBeforeVisible through the holder's publishing (WU7): publish_ready
+\*       asks publishable_slot like every publisher; RED RunSkipsCheck.
+\*   NoLiveThreadBlocked with Patience off (WU4, no lost wake): the mark and
+\*       the park's flag share one word; the note and the let go share another.
+\*       Loom a_parked_writer_is_woken_when_its_record_is_written,
+\*       a_writer_parked_for_the_next_claim_is_woken_when_the_unit_is_let_go and
+\*       a_writer_parked_on_a_record_being_encoded_is_woken_when_it_is_filled; RED
+\*       LostWake.
+\*   NoLiveThreadBlocked with Patience off, far from the turn (P6, T1 to T3):
+\*       the count against the pass, each behind a handshake; the claim of the
+\*       named orders; the landing's wake. Rows Green_Turn, RED TurnNeverTold and
+\*       RED LeadZero; loom a_call_far_from_its_turn_is_named_and_told and
+\*       a_call_far_from_its_turn_is_woken_when_its_slot_lands
+\*       (commit/loom_turn_wait.rs), with their calibrations.
+\*   EveryLiveCommitCompletes with a stopped holder (WU5) and with a sleeper
+\*       nobody tells: the patience. Lean a_park_is_bounded,
+\*       patience_bounds_the_wait, encoding_never_adds and a_turn_park_is_bounded
 \*       (Regolith/PipelineHelping.lean).
 \*
 \* RUST WITH NO STEP OF ITS OWN HERE, and why that loses nothing:
-\*   - the spin before a park (write_unit.rs:578): a wait that ends by
-\*     itself changes nothing;
-\*   - the written hint WriteUnit.written (write_unit.rs:146): it only skips
-\*     records that are written, which the model's scan passes over too;
+\*   - the spin before a park (commit/write_unit.rs:607) and its budget
+\*     SPIN_BUDGET (commit/write_unit.rs:131), past which a waiter parks at
+\*     once: a wait that ends by itself changes nothing, and which waiters
+\*     spin first changes nothing either;
+\*   - the written hint WriteUnit.written (commit/write_unit.rs:153): it only
+\*     skips records that are written, which the model's scan passes over too;
 \*   - the run's caps MAX_BATCH_RECORDS and MAX_BATCH_BYTES
-\*     (write_unit.rs:118): a run that stops early is a run whose next
+\*     (commit/write_unit.rs:120): a run that stops early is a run whose next
 \*     record is not usable, which the model has;
 \*   - the logical ends of a park (FRONTIER_PATIENCE, the ring full): more
 \*     ways for Timeout to happen, which may happen at any time anyway;
-\*   - the line job of a commit_nowait commit (queue_on
-\*     write_unit.rs:244, tell_line write_unit.rs:262): commit_nowait is
-\*     not in this model (see WHAT THE MODEL LEAVES OUT); its handshake is
-\*     the loom model a_queued_commit_is_told_when_the_unit_is_let_go.
+\*   - the lead growing with the sleepers (LEAD_PER_SLEEPER): a larger lead
+\*     only names orders sooner; the rows take Lead as a constant, 1 where a
+\*     thread must be told and 0 where parks happen as eagerly as can be and
+\*     patience wakes them;
+\*   - a turn sleeper woken by its record filled or written, or by its slot
+\*     failed: wakes the model leaves out, so it shows that the ones it keeps
+\*     are enough;
+\*   - parked_at belongs to one call of help_decide, turnAt to the thread: a
+\*     thread that leaves help_decide for a unit and comes back may park once
+\*     more in the code, which only patience in the model would allow; such a
+\*     park is bounded the same way (a_turn_park_is_bounded);
+\*   - the round's holder may encode a record nobody is encoding before it
+\*     copies it (bring_written with Await::Copy): its copy in the model needs
+\*     no fill;
+\*   - the line job of a commit_nowait commit (queue_on, tell_line):
+\*     commit_nowait is not in this model (see WHAT THE MODEL LEAVES OUT); its
+\*     handshake is the loom model
+\*     a_queued_commit_is_told_when_the_unit_is_let_go.
 \* MODEL WITH NO RUST: none. Every step and variable above is code.
 \*
 \* THE MODEL IS IN THREE MODULES, each small enough to read in one go:
@@ -403,6 +485,23 @@ TypeOK ==
   /\ late \in [Actors -> 0..MaxSlots]
   \* The request to be woken at the next claim is yes or no.
   /\ wanted \in BOOLEAN
+  \* An encoding claim is yes or no for each record...
+  /\ filling \in [Slots -> BOOLEAN]
+  \* ...and a thread has one record in hand, or none.
+  /\ encoding \in [Actors -> 0..MaxSlots]
+  \* A run's end is an order, or 0.
+  /\ runEnd \in [Actors -> 0..MaxSlots]
+  \* The threads parked far from their turn are threads...
+  /\ turnAsleep \subseteq Actors
+  \* ...each remembering where the frontier stood, or 0.
+  /\ turnAt \in [Actors -> 0..(MaxSlots + 1)]
+  \* The orders named and told are ticket numbers, or 0, or up to Lead past
+  \* the last ticket.
+  /\ nearTo \in 0..(MaxSlots + Lead) /\ wokenTo \in 0..(MaxSlots + Lead)
+  \* Each order is marked near or not...
+  /\ nearMark \in [Slots -> BOOLEAN]
+  \* ...and each thread owes a telling or not.
+  /\ owes \in [Actors -> BOOLEAN]
   \* A cell is free exactly when its ticket has not been handed out.
   /\ \A i \in Slots : (i <= tail) <=> cell[i] # "free"
 
@@ -575,6 +674,8 @@ NotesAreForUndecided ==
 NoLiveThreadBlocked ==
   \* With no step left for any live thread, each of them has its answer.
   (~ENABLED LiveNext) => \A a \in Actors \ stopped : pc[a] \in {"done", "failed", "aborted"}
+                                                    \* ...and is awake to take it home.
+                                                    /\ a \notin asleep /\ a \notin turnAsleep
 
 \* WG4: no write lands on a range of the log after a sync that covers it has
 \* begun. A sector in flight when the power goes may come back garbled
@@ -653,6 +754,25 @@ NoRunOfTwo == \A a \in Actors : Cardinality(fly[a]) <= 1
 \* "No thread ever parks on a record." Broken once a writer sleeps until
 \* the unit's holder writes its record or lets the unit go.
 NeverAsleep == asleep = {}
+
+\* D4: one encoder a record. The FILLING claim lets one thread encode a
+\* record into its slot's buffer; two at once would write one buffer
+\* together, and the run's holder could send the mixture to the log.
+\* Rules out: the owner and a helper both encoding record 1 at once. Fails
+\* under EncodeNoClaim.
+OneEncoder == \A a, b \in Actors : a # b /\ encoding[a] # 0 => encoding[a] # encoding[b]
+
+\* "Only an owner ever encodes its record." Broken once a thread that needs
+\* a record nobody is encoding encodes it itself.
+OwnersEncodeOwn == \A a \in Actors : encoding[a] # 0 => encoding[a] = mine[a]
+
+\* "No thread ever parks far from its turn." Broken once one does (step 2).
+NeverTurnParked == turnAsleep = {}
+
+\* "No run ever ends past its holder's own order." Broken once a holder
+\* writes a run that reaches past its own order, which its publishing of
+\* the run (WU7) then publishes past its own order too.
+NoRunPastOwn == \A a \in Actors : runEnd[a] <= mine[a]
 
 \* "No thread ever runs out of patience." Broken once a parked writer
 \* gives up on the holder and writes its record itself.

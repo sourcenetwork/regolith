@@ -813,14 +813,17 @@ tla:
     check MC_CommitPipeline_Red_DecideAnyOrder_Order        RED SeqInRingOrder
     check MC_CommitPipeline_Red_WorkBeyond                  RED WorksUpToItsOwn
     check MC_CommitPipeline_Red_StopHoldsClaim              RED NoLiveThreadBlocked
-    # The write unit (E45, L58; src/engine/commit/write_unit.rs): each owner
-    # encodes its own record, one thread at a time writes the run of filled
-    # records with one write, the others park on their record and are woken,
-    # or run out of patience and write it themselves as a copy (WG4: a late
-    # copy or run never lands under a sync that covers it). Rust:
-    # src/engine/commit/late_copy_tests.rs and write_unit_tests.rs, the loom
-    # models in src/engine/commit/loom_model.rs (write_unit_*). Lean:
-    # Regolith/PipelineHelping.lean, a_park_is_bounded, run_step_counts.
+    # The write unit (E45, L58; src/engine/commit/write_unit.rs): the owner
+    # encodes its record, or a thread that needs it and finds nobody encoding
+    # it does; one thread at a time writes the run of filled records with one
+    # write and publishes what it made publishable; the others park on their
+    # record and are woken, or run out of patience and write it themselves
+    # as a copy (WG4: a late copy or run never lands under a sync that
+    # covers it). Rust: src/engine/commit/late_copy_tests.rs and
+    # write_unit_tests.rs, the loom models in
+    # src/engine/commit/loom_write_unit.rs. Lean:
+    # Regolith/PipelineHelping.lean, a_park_is_bounded, run_step_counts,
+    # encoding_never_adds.
     check MC_CommitPipeline_Green_Copies                    GREEN
     check MC_CommitPipeline_Green_Copies_InFlight           RED NoTwoCopies
     check MC_CommitPipeline_Green_Copies_Runs               RED NoRunOfTwo
@@ -834,6 +837,22 @@ tla:
     check MC_CommitPipeline_Red_StealNoRecheck              RED NoWriteUnderSync
     check MC_CommitPipeline_Red_GatherBeforeCountIn         RED NoWriteUnderSync
     check MC_CommitPipeline_Red_LostWake                    RED NoLiveThreadBlocked
+    check MC_CommitPipeline_Green_Copies_HelperEncodes      RED OwnersEncodeOwn
+    check MC_CommitPipeline_Green_Copies_RunPastOwn         RED NoRunPastOwn
+    check MC_CommitPipeline_Red_EncodeNoClaim               RED OneEncoder
+    check MC_CommitPipeline_Red_RunSkipsCheck               RED DurableBeforeVisible
+    # A blocking thread far from its turn (E45 step 2, P6;
+    # src/engine/commit/turn_wait.rs) parks on its own order; the pass that
+    # brings its turn near names it, and the next finished commit tells it.
+    # Green_Turn checks with no time outs that nobody sleeps for good. Rust:
+    # src/engine/commit/turn_wait_tests.rs, the loom models in
+    # src/engine/commit/loom_turn_wait.rs. Lean:
+    # Regolith/PipelineHelping.lean, a_turn_park_is_bounded.
+    check MC_CommitPipeline_Green_Copies_TurnParks          RED NeverTurnParked
+    check MC_CommitPipeline_Green_Turn                      GREEN
+    check MC_CommitPipeline_Green_Turn_Parks                RED NeverTurnParked
+    check MC_CommitPipeline_Red_TurnNeverTold               RED NoLiveThreadBlocked
+    check MC_CommitPipeline_Red_LeadZero                    RED NoLiveThreadBlocked
     # Decision 3 of plan 4.7: a queue's poll never waits for another thread.
     # A job that cannot get the round, the version store's step, the flush
     # exclusion or a failed log clear of writes parks: it leaves a note, looks

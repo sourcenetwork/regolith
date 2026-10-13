@@ -61,6 +61,11 @@ CONSTANTS
   \* so (NoLiveThreadBlocked). That is how a row checks no wake is ever
   \* lost.
   Patience,
+  \* How many slots past the next one to decide a blocking thread's own slot
+  \* must be before it parks far from its turn rather than wait on the
+  \* thread deciding (pipeline.rs, P6, the lead). 0: any thread whose slot
+  \* is not the next one may park.
+  Lead,
   \* Which rule is deliberately broken; "none" is the real design.
   Mutant
 
@@ -81,7 +86,7 @@ ASSUME Stoppers \subseteq Actors /\ Head \in Actors \cup {0}
 \* The bounds are plain counts, and the memtable holds at least one commit.
 ASSUME MaxSlots \in Nat /\ MaxStops \in Nat /\ MaxFails \in Nat /\ Buffer \in Nat \ {0}
 \* The switches are yes or no.
-ASSUME Coarse \in BOOLEAN /\ Copies \in BOOLEAN /\ Patience \in BOOLEAN
+ASSUME Coarse \in BOOLEAN /\ Copies \in BOOLEAN /\ Patience \in BOOLEAN /\ Lead \in Nat
 \* The list of rules a run may break, one at a time.
 ASSUME Mutant \in {"none", "OutOfOrder", "AbortHole", "NoHelping", "SyncPastGap",
                    "ValidatePublished", "VoidNotCas", "TwoSyncs", "FrontierFirst",
@@ -89,7 +94,7 @@ ASSUME Mutant \in {"none", "OutOfOrder", "AbortHole", "NoHelping", "SyncPastGap"
                    "PassBeforeApply", "RollbackForgets", "NoFreeze", "StopHoldsClaim",
                    "TrustEarly", "PublishBeforeSync", "DecideAnyOrder", "WorkBeyond",
                    "SyncNoWait", "SkipOnPublished", "StealNoRecheck", "GatherBeforeCountIn",
-                   "LostWake"}
+                   "LostWake", "EncodeNoClaim", "TurnNeverTold", "RunSkipsCheck"}
 
 \* The ticket numbers of the run.
 Slots == 1..MaxSlots
@@ -207,18 +212,57 @@ VARIABLES
   late,
   \* Whether a parked thread asked to be woken when the write unit is let
   \* go (the WANTED bit of WriteUnit.word).
-  wanted
+  wanted,
+  \* Whether somebody claimed the encoding of each order's record and has
+  \* not finished it (descriptor.rs, the FILLING flag).
+  filling,
+  \* The record each thread is encoding now; 0 for none (write_unit.rs,
+  \* RegolithEngine::fill, on the owner's thread or on a thread that needs
+  \* the record written and found nobody encoding it).
+  encoding,
+  \* The last record of the last run each thread wrote; 0 for none. The
+  \* holder publishes up to it before it wakes the run's owners
+  \* (pipeline.rs, publish_ready, WU7).
+  runEnd,
+  \* The threads parked far from their turn (pipeline.rs, park_far, P6).
+  turnAsleep,
+  \* The next slot to decide when each thread last parked far from its
+  \* turn: a thread parks at most once while the frontier stands still,
+  \* then helps; 0 for never.
+  turnAt,
+  \* Every order up to this one has its turn near: the decided frontier
+  \* named it while somebody slept far from its turn (pipeline.rs, near_to).
+  nearTo,
+  \* Every order up to this one was told so by a finished commit
+  \* (pipeline.rs, woken_to).
+  wokenTo,
+  \* Whether each order was told its turn is near (descriptor.rs, NEAR).
+  nearMark,
+  \* Whether each thread, its commit done, still has to tell the orders the
+  \* frontier named (pipeline.rs, drive calling wake_near).
+  owes
 
 \* All of the above, so "nothing changed" can be said in one word.
 vars == <<tail, cell, owner, dec, sq, ep, ap, wr, failed, logOf, memOf, dto, frozen, tipIdx,
           tipNext, tipUsed, epoch, logEp, memGen, gen, durable, pub, visible, round, target, claimant,
           rbLast, poisoned, fails, pc, snap, hor, mine, seen, stopped, fly, filled, writer, gathered,
-          asleep, sleepOn, late, wanted>>
+          asleep, sleepOn, late, wanted, filling, encoding, runEnd, turnAsleep, turnAt, nearTo, wokenTo,
+          nearMark, owes>>
 
 \* Groups of variables an action leaves alone, named once so each action
 \* can say so in a line.
 \* The write unit and the threads that wait on records.
-writeVars == <<filled, writer, gathered, asleep, sleepOn, late, wanted>>
+writeVars == <<filled, writer, gathered, asleep, sleepOn, late, wanted, filling, encoding, runEnd,
+               turnAsleep, turnAt, nearTo, wokenTo, nearMark, owes>>
+\* The naming and telling of orders whose turn is near (step 2).
+wakeVars == <<nearTo, wokenTo, nearMark, owes>>
+\* The encoding claims, the run ends, the far-from-turn parks and their
+\* wakes: what the write unit's own steps leave alone, named once.
+moreVars == <<filling, encoding, runEnd, turnAsleep, turnAt, wakeVars>>
+\* What a step that moves the decided frontier or tells an owner leaves
+\* alone among the write unit's variables.
+unitVars == <<filled, writer, gathered, asleep, sleepOn, late, wanted, filling, encoding, runEnd,
+              turnAsleep, turnAt>>
 \* The ring's cells and who owns them.
 ringVars == <<tail, cell, owner>>
 \* What is decided for each order.
@@ -321,6 +365,8 @@ Live(a) == a \notin stopped
 \* unless it is parked on a record or about to write one it gave up
 \* waiting for: then that is all it does.
 Helping(a) == Live(a) /\ pc[a] = "ready" /\ a \notin asleep /\ late[a] = 0
+              \* (Nor asleep far from its turn, nor in the middle of an encoding.)
+              /\ a \notin turnAsleep /\ encoding[a] = 0
 
 \* Thread a stands behind an ordered unit another thread claimed: it waits
 \* for that thread to finish the unit and does nothing else meanwhile.
@@ -517,5 +563,23 @@ Kept(run) ==
   \* The real one: every record with no written or thrown-out one at or
   \* before it.
   ELSE {j \in run : \A k \in run : k <= j => ~wr[k] /\ ~failed[k]}
+
+\* Thread a may publish order p because its last run wrote that far: the
+\* holder publishes what its run made publishable before it wakes the
+\* run's owners (pipeline.rs, publish_ready, WU7). Publishing an order that
+\* may be finished is safe whoever does it; this is the one way a thread
+\* publishes past its own order.
+PublishesRun(a, p) ==
+  \* Only in the runs that show writes step by step...
+  /\ Copies
+  \* ...by a thread that is here, not asleep, not about to copy...
+  /\ Live(a) /\ a \notin asleep /\ a \notin turnAsleep /\ late[a] = 0
+  \* ...and the order is at or before the end of its last run.
+  /\ p <= runEnd[a]
+
+\* How far the turn is near once the decided frontier passes order i: the
+\* pass names order i + Lead, but only while somebody sleeps far from its
+\* turn (pipeline.rs, pass_decided: near_to.fetch_max when far is not 0).
+Named(i) == IF turnAsleep # {} /\ i + Lead > nearTo THEN i + Lead ELSE nearTo
 
 ====

@@ -44,6 +44,24 @@ Init ==
   /\ late     = [a \in Actors |-> 0]
   \* Nobody asked to be woken when the unit is let go.
   /\ wanted   = FALSE
+  \* Nobody is encoding a record...
+  /\ filling  = [i \in Slots |-> FALSE]
+  \* ...so no thread has one in hand.
+  /\ encoding = [a \in Actors |-> 0]
+  \* Nobody wrote a run yet.
+  /\ runEnd   = [a \in Actors |-> 0]
+  \* Nobody is parked far from its turn...
+  /\ turnAsleep = {}
+  \* ...or ever was.
+  /\ turnAt   = [a \in Actors |-> 0]
+  \* No order was named...
+  /\ nearTo   = 0
+  \* ...or told...
+  /\ wokenTo  = 0
+  \* ...so none is marked near.
+  /\ nearMark = [i \in Slots |-> FALSE]
+  \* No thread has a commit done yet.
+  /\ owes     = [a \in Actors |-> FALSE]
   \* Nothing was thrown out.
   /\ failed   = [i \in Slots |-> FALSE]
   \* No record belongs to a log yet.
@@ -215,8 +233,10 @@ Void(a) ==
      /\ cell' = [cell EXCEPT ![i] = "void"]
      \* The line moves past it.
      /\ dto'  = i
+     \* The pass names the order whose turn is now near (step 2).
+     /\ nearTo' = Named(i)
      \* Nothing else changes.
-     /\ UNCHANGED <<fly, writeVars, tail, owner, decVars, ap, wr, failed, tipVars, epochVars, durable, pub, visible,
+     /\ UNCHANGED <<fly, unitVars, wokenTo, nearMark, owes, tail, owner, decVars, ap, wr, failed, tipVars, epochVars, durable, pub, visible,
                     claimVars, failVars, threadVars>>
 
 \* Thread a looks at the next order in line and notes down the tip: the
@@ -308,8 +328,10 @@ DecideNow(a) ==
      \* A note another thread made for this ticket before the last rollback
      \* is used up: its compare-and-swap would lose.
      /\ seen'    = [b \in Actors |-> IF seen[b][1] = i THEN NoNote ELSE seen[b]]
+     \* The pass names the order whose turn is now near (step 2).
+     /\ nearTo'  = Named(i)
      \* Nothing else changes.
-     /\ UNCHANGED <<fly, writeVars, ringVars, wr, failed, epochVars, durable, pub, visible, claimVars, failVars,
+     /\ UNCHANGED <<fly, unitVars, wokenTo, nearMark, owes, ringVars, wr, failed, epochVars, durable, pub, visible, claimVars, failVars,
                     pc, snap, hor, mine, stopped>>
 
 \* Thread a puts order i's writes into the memtable its verdict names.
@@ -408,8 +430,10 @@ Pass(a) ==
      /\ MayWork(a, i)
      \* The line moves past it.
      /\ dto' = i
+     \* The pass names the order whose turn is now near (step 2).
+     /\ nearTo' = Named(i)
      \* Nothing else changes.
-     /\ UNCHANGED <<fly, writeVars, ringVars, decVars, ap, wr, failed, tipVars, epochVars, durable, pub, visible,
+     /\ UNCHANGED <<fly, unitVars, wokenTo, nearMark, owes, ringVars, decVars, ap, wr, failed, tipVars, epochVars, durable, pub, visible,
                     claimVars, failVars, threadVars>>
 
 \* Order i's record may be written by thread a in one go, without the write
@@ -483,7 +507,7 @@ WriteLand(a) ==
   \* ...and waits for nothing now.
   /\ sleepOn' = [b \in Actors |-> IF b \in asleep /\ sleepOn[b] \in fly[a] THEN 0 ELSE sleepOn[b]]
   \* Nothing else changes.
-  /\ UNCHANGED <<filled, writer, gathered, late, wanted, ringVars, decVars, ap, failed, dto, tipVars,
+  /\ UNCHANGED <<moreVars, filled, writer, gathered, late, wanted, ringVars, decVars, ap, failed, dto, tipVars,
                  epochVars, durable, pub, visible, claimVars, failVars, threadVars>>
 
 \* With copies, a write in flight fails: the device says no. The log is
@@ -506,11 +530,13 @@ LandFail(a) ==
   \* ...and waits for nothing now.
   /\ sleepOn'  = [b \in Actors |-> IF b \in asleep /\ sleepOn[b] \in fly[a] THEN 0 ELSE sleepOn[b]]
   \* Nothing else changes.
-  /\ UNCHANGED <<filled, writer, gathered, late, wanted, ringVars, decVars, ap, wr, failed, dto,
+  /\ UNCHANGED <<moreVars, filled, writer, gathered, late, wanted, ringVars, decVars, ap, wr, failed, dto,
                  tipVars, epochVars, durable, pub, visible, claimVars, rbLast, frozen, threadVars>>
 
 \* THE WRITE UNIT (write_unit.rs). With Copies, the records reach the log
-\* the way the code sends them: each owner encodes its own record (Encode);
+\* the way the code sends them: each owner encodes its own record, or a
+\* thread that needs one nobody is encoding encodes it (EncodeStart,
+\* EncodeEnd);
 \* one thread at a time holds the write unit, gathers the run of filled
 \* records that waits first (Gather), counts in at the gate and looks at
 \* them again (RunStart), writes them with one write (WriteLand), and lets
@@ -527,29 +553,51 @@ LandFail(a) ==
 \* holding the unit, thread 2 would have run out of patience and written
 \* record 2 itself.
 
-\* Thread a, the owner of order i, encodes i's record into its own
-\* descriptor, once i is settled (write_unit.rs, RegolithEngine::fill;
-\* descriptor.rs, Descriptor::fill). Whoever slept waiting for it to be
-\* filled is woken: setting the flag reads the parked flag in the same
-\* instruction (D5).
-Encode(a) ==
-  \* The thread's own order...
-  LET i == mine[a]
-  \* ...in a run that shows writes step by step, by a thread that helps...
-  IN /\ Copies /\ Helping(a)
-     \* ...settled, a commit with a record...
-     /\ i <= dto /\ Brings(i)
-     \* ...not filled, not in the log, not thrown out.
-     /\ ~filled[i] /\ ~wr[i] /\ ~failed[i]
+\* Thread a claims the encoding of order i's record: its own, once i is
+\* settled, or the record it needs next when nobody is encoding it
+\* (write_unit.rs, RegolithEngine::fill; descriptor.rs, Descriptor::fill,
+\* the FILLING claim, one read-modify-write). Mutant EncodeNoClaim skips the
+\* claim, so two threads can encode one record into one buffer at once.
+EncodeStart(a, i) ==
+  \* A run that shows writes step by step, by a thread that helps.
+  /\ Copies /\ Helping(a)
+  \* Its own record, or the one it needs next.
+  /\ i \in {mine[a], Need(a)} \ {0}
+  \* Settled, a commit with a record...
+  /\ i <= dto /\ Brings(i)
+  \* ...not filled, not in the log, not thrown out...
+  /\ ~filled[i] /\ ~wr[i] /\ ~failed[i]
+  \* ...and nobody is encoding it (the broken version does not look).
+  /\ (~filling[i] \/ Mutant = "EncodeNoClaim")
+  \* The claim is this thread's...
+  /\ filling'  = [filling EXCEPT ![i] = TRUE]
+  \* ...and it has the record in hand.
+  /\ encoding' = [encoding EXCEPT ![a] = i]
+  \* Nothing else changes.
+  /\ UNCHANGED <<wakeVars, fly, filled, writer, gathered, asleep, sleepOn, late, wanted, runEnd, turnAsleep, turnAt,
+                 ringVars, decVars, ap, wr, failed, dto, tipVars, epochVars, durable, pub, visible,
+                 claimVars, failVars, threadVars>>
+
+\* Thread a finishes encoding the record it has in hand and sets the filled
+\* flag. Whoever slept waiting for it to be filled is woken: setting the
+\* flag reads the parked flag in the same instruction (D5).
+EncodeEnd(a) ==
+  \* The record the thread is encoding.
+  LET i == encoding[a]
+  \* It has one in hand.
+  IN /\ i # 0
      \* The record is filled.
-     /\ filled' = [filled EXCEPT ![i] = TRUE]
+     /\ filled'   = [filled EXCEPT ![i] = TRUE]
+     \* The thread has nothing in hand now.
+     /\ encoding' = [encoding EXCEPT ![a] = 0]
      \* Whoever slept on it is awake...
-     /\ asleep' = {b \in asleep : sleepOn[b] # i}
+     /\ asleep'   = {b \in asleep : sleepOn[b] # i}
      \* ...and waits for nothing now.
-     /\ sleepOn' = [b \in Actors |-> IF b \in asleep /\ sleepOn[b] = i THEN 0 ELSE sleepOn[b]]
+     /\ sleepOn'  = [b \in Actors |-> IF b \in asleep /\ sleepOn[b] = i THEN 0 ELSE sleepOn[b]]
      \* Nothing else changes.
-     /\ UNCHANGED <<fly, writer, gathered, late, wanted, ringVars, decVars, ap, wr, failed, dto, tipVars,
-                    epochVars, durable, pub, visible, claimVars, failVars, threadVars>>
+     /\ UNCHANGED <<wakeVars, fly, writer, gathered, late, wanted, filling, runEnd, turnAsleep, turnAt, ringVars,
+                    decVars, ap, wr, failed, dto, tipVars, epochVars, durable, pub, visible, claimVars,
+                    failVars, threadVars>>
 
 \* Thread a claims the free write unit with one compare-and-swap and
 \* gathers the first run: the first usable record past the published
@@ -576,7 +624,7 @@ Gather(a) ==
      \* The unit is this thread's.
      /\ writer'   = a
      \* Nothing else changes.
-     /\ UNCHANGED <<fly, filled, asleep, sleepOn, late, wanted, ringVars, decVars, ap, wr, failed, dto,
+     /\ UNCHANGED <<moreVars, fly, filled, asleep, sleepOn, late, wanted, ringVars, decVars, ap, wr, failed, dto,
                     tipVars, epochVars, durable, pub, visible, claimVars, failVars, threadVars>>
 
 \* The holder counts its run in at the log's gate, and looks at the records
@@ -588,12 +636,17 @@ RunStart(a) ==
   \* The thread holds the unit, with a run gathered and nothing in flight.
   /\ writer = a /\ gathered[a] # {} /\ fly[a] = {}
   \* In flight: what the look keeps, if the gate lets the run in.
-  /\ fly' = [fly EXCEPT ![a] = IF ep[Min(gathered[a])] = logEp THEN Kept(gathered[a]) ELSE {}]
+  /\ LET kept == IF ep[Min(gathered[a])] = logEp THEN Kept(gathered[a]) ELSE {}
+     \* In flight: what the look keeps, if the gate lets the run in...
+     IN /\ fly' = [fly EXCEPT ![a] = kept]
+        \* ...and the holder will publish up to its last record (WU7).
+        /\ runEnd' = [runEnd EXCEPT ![a] = IF kept = {} THEN runEnd[a] ELSE Max(kept)]
   \* The run is no longer only gathered.
   /\ gathered' = [gathered EXCEPT ![a] = {}]
   \* Nothing else changes.
-  /\ UNCHANGED <<filled, writer, asleep, sleepOn, late, wanted, ringVars, decVars, ap, wr, failed, dto,
-                 tipVars, epochVars, durable, pub, visible, claimVars, failVars, threadVars>>
+  /\ UNCHANGED <<wakeVars, filled, writer, asleep, sleepOn, late, wanted, filling, encoding, turnAsleep, turnAt,
+                 ringVars, decVars, ap, wr, failed, dto, tipVars, epochVars, durable, pub, visible,
+                 claimVars, failVars, threadVars>>
 
 \* The holder lets the unit go, its run landed (write_unit.rs, Claim's drop
 \* and tell_waiters). When a parked thread asked to be woken at the next
@@ -623,7 +676,7 @@ Release(a) ==
      \* The request stands while another record has somebody parked on it.
      /\ wanted'  = (wanted /\ Mutant # "LostWake" /\ (waiting \ woken) # {})
      \* Nothing else changes.
-     /\ UNCHANGED <<fly, filled, gathered, late, ringVars, decVars, ap, wr, failed, dto, tipVars,
+     /\ UNCHANGED <<moreVars, fly, filled, gathered, late, ringVars, decVars, ap, wr, failed, dto, tipVars,
                     epochVars, durable, pub, visible, claimVars, failVars, threadVars>>
 
 \* Thread a parks on the record it needs (write_unit.rs, park_on;
@@ -631,8 +684,8 @@ Release(a) ==
 \* parked flag, and looks again; then it sleeps. A filled record is in the
 \* hands of the unit's holder: the thread also asks that holder to wake it
 \* when it lets the unit go, which only works while that holder still holds
-\* it (the request is a compare-and-swap on that claim). A record that is
-\* not filled is in its owner's hands: the fill wakes it. The spin before
+\* it (the request is a compare-and-swap on that claim). A record being
+\* encoded is in its encoder's hands: the fill wakes it. The spin before
 \* the park is not shown: a wait that ends by itself changes nothing.
 Park(a) ==
   \* The record it needs.
@@ -645,8 +698,8 @@ Park(a) ==
      \* The record is filled and the unit is another thread's, or the
      \* record is another's and not filled yet.
      /\ \/ filled[i] /\ writer # 0 /\ writer # a
-        \* (Or another thread's record, not filled yet.)
-        \/ ~filled[i] /\ i # mine[a]
+        \* (Or a record another thread is encoding now.)
+        \/ ~filled[i] /\ filling[i]
      \* The thread sleeps...
      /\ asleep'  = asleep \cup {a}
      \* ...on that record...
@@ -654,8 +707,84 @@ Park(a) ==
      \* ...having asked the holder to wake it, for a filled record.
      /\ wanted'  = (wanted \/ filled[i])
      \* Nothing else changes.
-     /\ UNCHANGED <<fly, filled, writer, gathered, late, ringVars, decVars, ap, wr, failed, dto, tipVars,
+     /\ UNCHANGED <<moreVars, fly, filled, writer, gathered, late, ringVars, decVars, ap, wr, failed, dto, tipVars,
                     epochVars, durable, pub, visible, claimVars, failVars, threadVars>>
+
+\* STEP 2, A THREAD FAR FROM ITS TURN (pipeline.rs, P6). A blocking
+\* thread finds the next order being decided by another thread, and its
+\* own order is more than Lead orders past that one: instead of waiting on
+\* that thread over and over, it parks on its own order (TurnPark). It is
+\* woken once the decided frontier comes within Lead orders of its own
+\* (TurnWake: the thread that passes the frontier names it, and a thread
+\* whose commit is done wakes it), or when its patience runs out; then it
+\* helps. It parks at most once while the frontier stands still.
+\* Tiny example: thread 1 decides order 1; thread 3, whose order is 3,
+\* parks; thread 1 passes order 1, which names order 3 when Lead is 1;
+\* thread 3 wakes and decides order 2 and its own.
+
+\* Thread a parks far from its turn.
+TurnPark(a) ==
+  \* The next order to decide.
+  LET next == dto + 1
+  \* A blocking thread that helps, holds neither the round nor a unit.
+  IN /\ a \in Committers /\ Helping(a) /\ a \notin round /\ claimant # a
+     \* Its own order is more than Lead past the next one...
+     /\ mine[a] > next + Lead
+     \* ...not named, not told: its turn is not near (the look after it
+     \* registered on its own order; pipeline.rs, park_far's near).
+     /\ mine[a] > nearTo /\ ~nearMark[mine[a]]
+     \* Another thread is deciding the next order: it has noted the tip for
+     \* it (the DECIDING claim).
+     /\ \E b \in Actors \ {a} : seen[b] # NoNote /\ seen[b][1] = next
+     \* It has not parked already while the frontier stood here.
+     /\ turnAt[a] # next
+     \* It sleeps...
+     /\ turnAsleep' = turnAsleep \cup {a}
+     \* ...remembering where the frontier stood.
+     /\ turnAt'     = [turnAt EXCEPT ![a] = next]
+     \* Nothing else changes.
+     /\ UNCHANGED <<wakeVars, fly, filled, writer, gathered, asleep, sleepOn, late, wanted, filling, encoding, runEnd,
+                    ringVars, decVars, ap, wr, failed, dto, tipVars, epochVars, durable, pub, visible,
+                    claimVars, failVars, threadVars>>
+
+\* Thread a, parked far from its turn, wakes: its order was told its turn
+\* is near, or its patience ran out (TURN_PATIENCE). In the code a record
+\* filled, written or thrown out wakes it too; the model leaves those wakes
+\* out, so it shows that the ones it keeps are enough.
+TurnWake(a) ==
+  \* It sleeps far from its turn.
+  /\ a \in turnAsleep
+  \* Its order was told, or it gave up waiting. An IF, so TLC tries one
+  \* branch.
+  /\ IF nearMark[mine[a]] THEN TRUE ELSE Patience
+  \* It is awake and helps again.
+  /\ turnAsleep' = turnAsleep \ {a}
+  \* Nothing else changes.
+  /\ UNCHANGED <<wakeVars, fly, filled, writer, gathered, asleep, sleepOn, late, wanted, filling, encoding, runEnd,
+                 turnAt, ringVars, decVars, ap, wr, failed, dto, tipVars, epochVars, durable, pub,
+                 visible, claimVars, failVars, threadVars>>
+
+\* Thread a, its commit done, tells the orders the frontier named since the
+\* last telling that their turn is near (pipeline.rs, wake_near: one
+\* compare-and-swap of woken_to up to near_to, then a NEAR mark on every
+\* order in between that is in the ring, which wakes whoever parked on it).
+\* Shown as one step: a thread that has claimed the range always finishes
+\* marking it. Mutant TurnNeverTold claims the range and marks nothing.
+WakeNear(a) ==
+  \* The thread is here, awake, with its commit done.
+  /\ owes[a] /\ Live(a) /\ a \notin asleep /\ a \notin turnAsleep
+  \* The orders it tells: past the last told, up to the last named, and in
+  \* the ring.
+  /\ LET told == {i \in Slots : i > wokenTo /\ i <= nearTo /\ cell[i] = "ready"}
+     \* Those orders are marked near (the broken version marks none).
+     IN nearMark' = [i \in Slots |-> nearMark[i] \/ (i \in told /\ Mutant # "TurnNeverTold")]
+  \* The range is told.
+  /\ wokenTo' = IF nearTo > wokenTo THEN nearTo ELSE wokenTo
+  \* The thread owes nothing now.
+  /\ owes' = [owes EXCEPT ![a] = FALSE]
+  \* Nothing else changes.
+  /\ UNCHANGED <<nearTo, fly, unitVars, ringVars, decVars, ap, wr, failed, dto, tipVars, epochVars, durable,
+                 pub, visible, claimVars, failVars, threadVars>>
 
 \* Thread a's patience runs out while it sleeps (write_unit.rs,
 \* out_of_patience: PATIENCE, or the decided frontier moving on while the
@@ -671,7 +800,7 @@ Timeout(a) ==
   \* ...and waits for nothing now.
   /\ sleepOn' = [sleepOn EXCEPT ![a] = 0]
   \* Nothing else changes.
-  /\ UNCHANGED <<fly, filled, writer, gathered, wanted, ringVars, decVars, ap, wr, failed, dto, tipVars,
+  /\ UNCHANGED <<moreVars, fly, filled, writer, gathered, wanted, ringVars, decVars, ap, wr, failed, dto, tipVars,
                  epochVars, durable, pub, visible, claimVars, failVars, threadVars>>
 
 \* The thread whose patience ran out writes its record itself, as a copy
@@ -692,7 +821,7 @@ StealStart(a) ==
      \* It is no longer about to write.
      /\ late' = [late EXCEPT ![a] = 0]
      \* Nothing else changes.
-     /\ UNCHANGED <<filled, writer, gathered, asleep, sleepOn, wanted, ringVars, decVars, ap, wr, failed,
+     /\ UNCHANGED <<moreVars, filled, writer, gathered, asleep, sleepOn, wanted, ringVars, decVars, ap, wr, failed,
                     dto, tipVars, epochVars, durable, pub, visible, claimVars, failVars, threadVars>>
 
 \* Thread a writes order i's record and the device says no: the log is
@@ -905,9 +1034,14 @@ RbFinish(a) ==
                       IF b \in asleep /\ (sleepOn[b] \in out \/ (mine[b] > pub /\ mine[b] <= hi))
                         THEN 0 ELSE sleepOn[b]]
      \* Nothing else changes.
-     /\ UNCHANGED <<fly, filled, writer, gathered, late, wanted, ringVars, dec, sq, ep, logOf, ap,
-                    tipUsed, epoch, gen, durable, target, claimant, fails, snap, hor, mine, seen,
-                    stopped>>
+     \* A committer told here will tell the orders whose turn is near.
+     /\ owes'    = [b \in Actors |->
+                      owes[b] \/ (b \in Committers /\ pc[b] = "ready" /\ Live(b) /\ mine[b] > pub
+                                 /\ mine[b] <= hi)]
+     \* Nothing else changes.
+     /\ UNCHANGED <<filling, encoding, runEnd, turnAsleep, turnAt, nearTo, wokenTo, nearMark, fly, filled,
+                    writer, gathered, late, wanted, ringVars, dec, sq, ep, logOf, ap, tipUsed, epoch, gen,
+                    durable, target, claimant, fails, snap, hor, mine, seen, stopped>>
 
 \* Thread a raises the read horizon to the next order's sequence: the
 \* first half of publishing it.
@@ -920,12 +1054,13 @@ PubHorizon(a) ==
      /\ SmallSteps
      \* No rollback holds the frontier.
      /\ ~frozen
-     \* It may be finished.
-     /\ Publishable(p)
+     \* It may be finished (mutant RunSkipsCheck: a holder publishing its
+     \* run takes a written record as finished).
+     /\ (Publishable(p) \/ (Mutant = "RunSkipsCheck" /\ PublishesRun(a, p) /\ wr[p]))
      \* It holds a sequence readers do not see yet.
      /\ Takes(p) /\ visible < sq[p]
-     \* The thread may work on it.
-     /\ MayWork(a, p)
+     \* The thread may work on it, or its last run wrote that far (WU7).
+     /\ (MayWork(a, p) \/ PublishesRun(a, p))
      \* Readers now see it.
      /\ visible' = sq[p]
      \* Nothing else changes.
@@ -947,12 +1082,12 @@ PubFrontier(a) ==
   IN /\ p <= dto
      \* No rollback holds the frontier.
      /\ ~frozen
-     \* It may be finished.
-     /\ Publishable(p)
+     \* It may be finished (mutant RunSkipsCheck: see PubHorizon).
+     /\ (Publishable(p) \/ (Mutant = "RunSkipsCheck" /\ PublishesRun(a, p) /\ wr[p]))
      \* Taken one by one: if it holds a sequence, readers see it already.
      /\ (SmallSteps /\ Takes(p) => visible >= sq[p] \/ Mutant = "FrontierFirst")
-     \* The thread may work on it.
-     /\ MayWork(a, p)
+     \* The thread may work on it, or its last run wrote that far (WU7).
+     /\ (MayWork(a, p) \/ PublishesRun(a, p))
      \* The order is finished.
      /\ pub' = p
      \* Taken in one go: the horizon is raised here.
@@ -963,8 +1098,14 @@ PubFrontier(a) ==
                 THEN [pc EXCEPT ![o] = ToldAs(failed[p])]
                 \* Nobody is waiting on it here: no thread is told.
                 ELSE pc
+     \* A committer so told will tell the orders whose turn is near.
+     /\ owes' = IF o \in Committers /\ pc[o] = "ready" /\ mine[o] = p /\ Live(o)
+                \* It will, before it returns.
+                THEN [owes EXCEPT ![o] = TRUE]
+                \* Nobody told here.
+                ELSE owes
      \* Nothing else changes.
-     /\ UNCHANGED <<fly, writeVars, ringVars, decVars, ap, wr, failed, dto, tipVars, epochVars, durable,
+     /\ UNCHANGED <<fly, unitVars, nearTo, wokenTo, nearMark, ringVars, decVars, ap, wr, failed, dto, tipVars, epochVars, durable,
                     claimVars, failVars, snap, hor, mine, seen, stopped>>
 
 \* Mutant OutOfOrder only: the horizon jumps to a later order that happens
@@ -1053,10 +1194,12 @@ UnitRun(a) ==
      /\ tipNext' = IF Writes[owner[i]] # {} THEN tipNext + 1 ELSE tipNext
      \* The line moves past it.
      /\ dto'     = i
+     \* The pass names the order whose turn is now near (step 2).
+     /\ nearTo'  = Named(i)
      \* The job is done.
      /\ claimant' = 0
      \* Nothing else changes.
-     /\ UNCHANGED <<fly, writeVars, ringVars, wr, failed, tipUsed, epochVars, pub, visible, round, target, failVars,
+     /\ UNCHANGED <<fly, unitVars, wokenTo, nearMark, owes, ringVars, wr, failed, tipUsed, epochVars, pub, visible, round, target, failVars,
                     threadVars>>
 
 \* The claimant runs the rotation check in the turn of the write at the
@@ -1099,15 +1242,21 @@ PipelineStep(a) ==
      \/ \E i \in Slots : Apply(a, i) \/ Write(a, i) \/ WriteFail(a, i) \/ PublishAny(a, i)
      \* With copies, a write in two steps: counted in for an order, then landed.
      \/ \E i \in Slots : WriteStart(a, i)
-     \* The write unit: a record encoded, a run gathered, a park.
-     \/ Encode(a) \/ Gather(a) \/ Park(a)
+     \* The write unit: a record's encoding claimed, a run gathered, a park.
+     \/ \E i \in Slots : EncodeStart(a, i)
+     \* (A run gathered, a park on a record.)
+     \/ Gather(a) \/ Park(a)
+     \* Step 2: a park far from the thread's turn.
+     \/ TurnPark(a)
 
 \* Thread a is in none of the write unit's waits or claims: it holds no
 \* unit, does not sleep, has not run out of patience, and has no write in
 \* flight. Only such a thread takes the pipeline's other steps; one that is
 \* in the middle of a write takes only that write's steps, as the code,
 \* which does each of them in one call, does.
-Free(a) == writer # a /\ a \notin asleep /\ late[a] = 0 /\ fly[a] = {}
+Free(a) == writer # a /\ a \notin asleep /\ late[a] = 0 /\ fly[a] = {} /\ encoding[a] = 0
+           \* (Nor asleep far from its turn.)
+           /\ a \notin turnAsleep
 
 \* Any one step of a thread that has not walked away.
 LiveStep(a) ==
@@ -1117,6 +1266,9 @@ LiveStep(a) ==
   \* count in, its landing (or failure) and the unit let go; the time out
   \* of a park, and the copy after it.
   /\ \/ RunStart(a) \/ WriteLand(a) \/ LandFail(a) \/ Release(a) \/ Timeout(a) \/ StealStart(a)
+     \* (An encoding finished, a park far from the turn ended, the orders
+     \* whose turn is near told by a thread whose commit is done.)
+     \/ EncodeEnd(a) \/ TurnWake(a) \/ WakeNear(a)
      \* ...or, in none of those, one of the pipeline's other steps.
      \/ Free(a) /\ PipelineStep(a)
 
