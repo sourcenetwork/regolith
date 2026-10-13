@@ -310,7 +310,9 @@ pub(super) const WRITTEN: u64 = 1 << 1;
 /// A rollback discarded the slot: its owner learns the failure.
 pub(super) const FAILED: u64 = 1 << 2;
 /// A thread is deciding the slot. A hint: another thread that needs the
-/// decision gives this one a moment before it repeats the work.
+/// decision gives this one a moment before it repeats the work. The thread
+/// that claims it claims [`APPLYING`] in the same instruction, since it goes
+/// on to apply what it decided.
 pub(super) const DECIDING: u64 = 1 << 3;
 /// A thread is writing the slot's record. A hint, as [`DECIDING`].
 pub(super) const WRITING: u64 = 1 << 4;
@@ -490,6 +492,18 @@ impl Descriptor {
     /// Set the flags of `mask` (D2). `true` when this call set one of them.
     pub(super) fn mark(&self, mask: u64) -> bool {
         self.flags.fetch_or(mask, Ordering::AcqRel) & mask != mask
+    }
+
+    /// Set the flags of `mask` and return every flag as it was before: one
+    /// locked instruction that claims several hints and says which of them
+    /// this call claimed.
+    pub(super) fn claim(&self, mask: u64) -> u64 {
+        self.flags.fetch_or(mask, Ordering::AcqRel)
+    }
+
+    /// Clear the hints of `mask`, which this thread claimed and gives up.
+    pub(super) fn unclaim(&self, mask: u64) {
+        self.flags.fetch_and(!mask, Ordering::AcqRel);
     }
 }
 

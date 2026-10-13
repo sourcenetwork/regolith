@@ -486,7 +486,7 @@ impl RegolithEngine {
         desc.decide(Decision::new(index, Fate::Unit, ord.state));
         // The state the body left is the tip before the round is let go:
         // a rollback, which needs the round, then starts from it.
-        self.settle(pipe, index, &desc, None);
+        self.settle(pipe, index, &desc, None, false);
         self.unkeep(kept);
         drop(held);
         true
