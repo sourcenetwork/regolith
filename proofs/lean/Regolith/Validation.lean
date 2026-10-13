@@ -1353,5 +1353,102 @@ theorem all_classes_serial (E : Env)
     -- Take the first half of the lift's conclusion: the two states are equal.
     h (fun _ _ => trivial) hv).1
 
+/-! ## A commit that writes nothing, checked at the published horizon (plan 3.8, E50)
+
+A transaction that writes nothing commits outside the commit pipeline, at
+every level (`RegolithEngine::commit_write_free`, src/engine/commit/mod.rs).
+It samples the published horizon: the commits published so far, the history
+`h` here. It checks each read its level promises to check against the writes
+published since its snapshot, `newer E h m` (it missed the `m` newest commits
+of `h`). When every check passes it is placed right after the last commit of
+`h`, and its commit changes no state.
+
+Tiny example: a report reads balance A at 1 and balance B at 2; before it
+commits, a withdrawal publishes A = 2. At the horizon the check of A fails,
+so the report is refused instead of claiming a sheet (1, 2) that the
+database, with the withdrawal in it, no longer shows.
+
+`writeFree_at_horizon` says the placement is right: every read that passed
+holds at the horizon what it held at the snapshot, and the state at the
+horizon is the serial state of the commits published by then. A commit that
+writes nothing changes no state, so placing it there keeps the history
+serial whatever is published after it (the TLA+ invariant
+`INV_WriteFreeAtHorizon` checks the same over interleavings).
+
+The engine also counts a write it finds above the horizon against the read,
+since such a version may stand for one at or below the horizon that
+compaction folded under it. `full_ok_of_later` and `scan_ok_of_later` show
+that counting more writes only refuses more: a full read or a validated scan
+that passes against the published writes and the later ones together passes
+against the published ones alone. A read checked by value, presence or parts
+is judged by its rule only when nothing landed on its key above the horizon,
+which is exactly its rule against the published writes.
+-/
+
+/-- When every write of the list fails `q`, the walk finds nothing: the
+converse of `lastWhere_none`. -/
+theorem lastWhere_none_of {q : Write → Bool} :
+    -- The statement: if every write of the list fails q, the walk from the newest end finds nothing.
+    ∀ {ws : List Write}, (∀ x ∈ ws, q x = false) → lastWhere q ws = none
+  -- No writes: the walk finds nothing, by its definition.
+  | [], _ => rfl
+  -- A write w followed by the newer writes ws.
+  | w :: ws, h => by
+    -- The newer writes all fail q too, so this same theorem on the shorter list finds nothing there.
+    have ht : lastWhere q ws = none :=
+      -- (each write of ws is a write of w :: ws, which fails q)
+      lastWhere_none_of (fun x hx => h x (List.mem_cons_of_mem _ hx))
+    -- And w itself fails q.
+    have hw : q w = false := h w List.mem_cons_self
+    -- Unfold one step of the walk: nothing among the newer writes, and w fails q, so nothing.
+    simp [lastWhere, ht, hw]
+
+/-- **`full_ok_of_later`.** A full read that no write touched among the
+published writes and the later ones together is untouched among the
+published ones: the engine's stricter check refuses more, never less. -/
+theorem full_ok_of_later (E : Env) {k : Nat} {σ : State} {ws later : List Write}
+    -- The check passed against the published writes followed by the later ones.
+    (h : Ok E (.full k) σ (ws ++ later)) : Ok E (.full k) σ ws := by
+  -- Unfold the check on both sides: the walk for a write affecting k finds nothing.
+  simp only [Ok] at h ⊢
+  -- Every write of the longer list fails to affect k, so every write of the published part does.
+  exact lastWhere_none_of (fun x hx => lastWhere_none h x (List.mem_append_left later hx))
+
+/-- **`scan_ok_of_later`.** The same for a validated scan: no write in its
+range among all the writes means none among the published ones. -/
+theorem scan_ok_of_later (E : Env) {lo hi : Nat} {σ : State} {ws later : List Write}
+    -- The check passed against the published writes followed by the later ones.
+    (h : Ok E (.scan lo hi) σ (ws ++ later)) : Ok E (.scan lo hi) σ ws := by
+  -- Unfold the check on both sides: no write affects any key of the range.
+  simp only [Ok] at h ⊢
+  -- A published write is also a write of the longer list, where it affects no key of the range.
+  exact fun w hw => h w (List.mem_append_left later hw)
+
+/-- **`writeFree_at_horizon` (E50).** A commit that writes nothing, whose
+every checked read passed its rule against the writes published between its
+snapshot and the published horizon, read at the horizon what it read at its
+snapshot, and the state at the horizon is the serial state of the commits
+published by then. So the commit, placed right after them, is serial: it
+read the one-at-a-time state there, and it changes nothing a later commit
+could depend on. This is why it needs no slot of the commit pipeline. -/
+theorem writeFree_at_horizon (E : Env) (hinit : CAConsistent E E.init) {h : List Txn}
+    -- (`m`: how many of the published commits it missed; `rs`: the reads its level checks)
+    {m : Nat} {rs : List Read}
+    -- The commits published by the horizon form a valid history,
+    (hv : Valid E h)
+    -- the transaction missed no more of them than there are,
+    (hm : m ≤ h.length)
+    -- and each read it checks passed its rule against the writes published since its snapshot.
+    (hpass : ∀ r ∈ rs, Ok E r (run E (h.drop m)) (newer E h m)) :
+    -- The statement: every checked read holds at the horizon what it held at the snapshot, and the
+    -- state at the horizon is the serial state of the published commits.
+    (∀ r ∈ rs, Agree E r (run E (h.drop m)) (run E h)) ∧ run E h = serial E h := by
+  -- Two things to show; the second is the combined theorem above, applied to the published history.
+  refine ⟨fun r hr => ?_, all_classes_serial E hinit h hv⟩
+  -- See the state at the horizon as the snapshot with the writes published since applied on top.
+  rw [run_split E h m hm]
+  -- The read's rule passed against those writes, and every rule is sound.
+  exact ok_current E (hpass r hr)
+
 -- The end of this file's names.
 end Regolith.Validation

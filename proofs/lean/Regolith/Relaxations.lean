@@ -27,8 +27,10 @@ relaxation is stated exactly, with the RED cases as counterexamples:
   `INV_WriteFreeConsistent`): what a transaction read is the serial state at
   its snapshot, so a write-free one serializes there.
 * `exempt_decision_breaks_serial` (`MC_DefraLevel_Red_DecideOnLogRead`,
-  `MC_DefraLevel_Red_PartsNamesOther`) and `promoted_read_skew`
-  (`MC_DefraLevel_Red_WriteFreePessimistic`): the RED cases.
+  `MC_DefraLevel_Red_PartsNamesOther`), `promoted_read_skew`
+  (`MC_DefraLevel_Red_WriteFreePessimistic`) and `read_only_anomaly`
+  (`MC_Serializable_Red_ReadOnlyAnomaly`, `MC_SnapshotIsolation_Red_ReadOnlyAnomaly`):
+  the RED cases.
 
 ## The story, for a reader who has never seen the code
 
@@ -552,6 +554,51 @@ theorem promoted_read_skew :
   -- Key 1 and key 2 before the writer, and after it.
   simp [applyWrites, applyWrite, upd, demo]
 
+
+/-- The read-only anomaly's deposit (Fekete, O'Neil and O'Neil 2004), decided
+on the state `σ` it read: balance B, key 2, put one higher. -/
+def deposit (σ : State) : List Write := [.put 2 (σ 2 + 1)]
+
+/-- The anomaly's withdrawal, decided on the state `σ` it read: balance A,
+key 1, put to A + B + 1, a value that tells which B it read. -/
+def withdrawal (σ : State) : List Write := [.put 1 (σ 1 + σ 2 + 1)]
+
+/-- What the report reads: the state after the deposit alone, with the
+withdrawal not yet published. -/
+def afterDeposit : State := applyWrites demo demo.init (deposit demo.init)
+
+/-- **`read_only_anomaly` (E50).** The anomaly of Fekete, O'Neil and O'Neil
+(2004) with every balance starting at 0. The withdrawal reads (0, 0); the
+deposit commits B = 1; the report reads (0, 1); the withdrawal commits
+A = 1, decided on what it read, so the history ends at (1, 1). Run one at a
+time, deposit then withdrawal ends at A = 2, not the history's state;
+withdrawal then deposit ends at the history's state, through (0, 0), (1, 0)
+and (1, 1), none of which is the report's (0, 1). So a report that commits
+(0, 1) after the withdrawal claims a sheet no order of the three gives. The
+last line is why a report at RepeatableRead or Serializable is refused there:
+its check of A at the horizon, against the withdrawal's published write,
+fails (`MC_Serializable_Red_ReadOnlyAnomaly` plants the bug of skipping it). -/
+theorem read_only_anomaly :
+    -- The report reads A = 0 and B = 1;
+    (afterDeposit 1 = 0 ∧ afterDeposit 2 = 1) ∧
+      -- the history (the deposit, then the withdrawal decided at the start) ends at A = 1, B = 1;
+      (applyWrites demo afterDeposit (withdrawal demo.init) 1 = 1 ∧
+        applyWrites demo afterDeposit (withdrawal demo.init) 2 = 1) ∧
+      -- deposit then withdrawal, one at a time, ends at A = 2, not the history's state;
+      applyWrites demo afterDeposit (withdrawal afterDeposit) 1 = 2 ∧
+      -- withdrawal then deposit passes through (1, 0), which is not the report's (0, 1),
+      (applyWrites demo demo.init (withdrawal demo.init) 1 = 1 ∧
+        applyWrites demo demo.init (withdrawal demo.init) 2 = 0) ∧
+      -- and ends at the history's state (1, 1), which is not the report's either;
+      (applyWrites demo (applyWrites demo demo.init (withdrawal demo.init))
+          (deposit (applyWrites demo demo.init (withdrawal demo.init))) 1 = 1 ∧
+        applyWrites demo (applyWrites demo demo.init (withdrawal demo.init))
+          (deposit (applyWrites demo demo.init (withdrawal demo.init))) 2 = 1) ∧
+      -- and the report's check of A, against the withdrawal's published write, fails.
+      ¬ Ok demo (.full 1) afterDeposit (withdrawal demo.init) := by
+  -- Every part is a computation on small numbers: unfold the writes and the check, and evaluate.
+  simp [afterDeposit, deposit, withdrawal, applyWrites, applyWrite, upd, demo, Ok, lastWhere,
+    affects]
 
 /-- **`blindMerge_across_replacement`: why the blind-merge rule refuses a newer
 replacement.** With a put of key 7 between a merge's snapshot and its
