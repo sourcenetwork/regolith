@@ -55,7 +55,7 @@ bounded limit recipe +command:
 
 test-testing:
     cargo nextest run -p regolith --features testing --lib testing::
-    cargo test -p regolith --features testing --doc
+    just bounded 5m test-testing cargo test -p regolith --features testing --doc
 
 deny:
     cargo deny check
