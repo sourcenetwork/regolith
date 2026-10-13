@@ -1003,15 +1003,20 @@ tla:
     check MC_StallRelief_Red_CommitGivesUp             RED NoLostCommit
     check MC_StallRelief_Green_Commit_InlineOff        GREEN
     check MC_StallRelief_Red_CommitLeftToCaller        RED NoLostCommit
-    # E16: with no worker, a write that owes a step of background work runs
-    # exactly one, and L0 stays at its compaction trigger (at the stop
-    # trigger when every write seals). Lean: Regolith/OwedStep.lean,
-    # write_one_step, l0_bounded, l0_bounded_by_stop.
+    # E16: with no worker, a write that owes a step of background work and
+    # runs it inline runs exactly one, and L0 stays at its compaction trigger
+    # (at the stop trigger when every write seals). A writer with a queue
+    # leaves the step there for its polls: L0 may then pass the trigger, and
+    # stays within the stop trigger plus the sealed memtables a rotation
+    # keeps. Lean: Regolith/OwedStep.lean, write_one_step, l0_bounded,
+    # l0_bounded_by_stop, queued_l0_bounded, queued_passes_trigger.
     spec=OwedStep
     check MC_OwedStep_Green                            GREEN
     check MC_OwedStep_Green_TinyMemtable               GREEN
+    check MC_OwedStep_Green_Queued                     GREEN
     check MC_OwedStep_Red_FlushOwesNothing             RED L0Bounded
     check MC_OwedStep_Red_StepUntilIdle                RED OneStepPerWrite
+    check MC_OwedStep_Red_QueuedTightBound             RED L0Bounded
     # regolith::sync's locks after D49: barging with bounded bypass, for
     # Mutex, Semaphore and ReentrantMutex, one step per atomic instruction
     # of src/sync. Lean: Regolith/Sync.lean, mutual_exclusion,

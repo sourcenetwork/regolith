@@ -188,9 +188,11 @@ import Regolith.StallCommit
 -- thread the call returns the count of pins held without waiting. Backs
 -- `proofs/tla/SnapshotWait.tla`.
 import Regolith.SnapshotWait
--- E16: with no worker, a write runs exactly the one step of background work
--- it found owed, and L0 never passes its compaction trigger (its stop
--- trigger when every write seals). Backs `proofs/tla/OwedStep.tla`.
+-- E16: with no worker, a write that runs its owed step inline runs exactly
+-- the one step of background work it found owed, and L0 never passes its
+-- compaction trigger (its stop trigger when every write seals); with the
+-- step left on the writer's queue, L0 never passes the stop trigger plus
+-- the sealed memtables a rotation keeps. Backs `proofs/tla/OwedStep.tla`.
 import Regolith.OwedStep
 -- 4.6, 4.10: the pessimistic lock table. One holder per key, a retired
 -- table entry has no user, a waiter the lock may serve is told through its

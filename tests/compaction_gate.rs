@@ -58,40 +58,39 @@ fn cold_l0(workers: usize) -> (TempDir, Arc<Db>, Arc<Device>) {
     (dir, Arc::new(db), device)
 }
 
-/// E28. Four threads hand the worker exclusive jobs as fast as they can, far
-/// faster than it runs them, for as long as the writer runs: its job queue is
-/// kept thousands deep and is never empty. Each job flushes what the writer
-/// wrote into L0 and compacts nothing, its range holding no key. The worker
-/// must still flush and compact between the jobs, so the writer gets through:
-/// a stop that held it would last as long as the stream.
-///
-/// The worker this replaced ran every queued job before anything else, so
-/// under this stream it never compacted, L0 reached the stop trigger and the
-/// writer stayed stopped until the deadline.
-#[test]
-fn an_endless_stream_of_jobs_never_starves_the_compaction_worker() {
-    const WRITES: u32 = 3_000;
-    const STOP: usize = 6;
-    const PRODUCERS: usize = 4;
-    /// Jobs handed over and not yet ended, at most: what bounds the memory
-    /// the stream holds.
-    const IN_FLIGHT: usize = 4_096;
-    let dir = TempDir::new().unwrap();
-    let db = Db::open(
-        dir.path(),
-        Options::default()
-            .write_buffer_size(16 * 1024)
-            .l0_compaction_trigger(2)
-            .level0_slowdown_writes_trigger(4)
-            .level0_stop_writes_trigger(STOP),
-    )
-    .unwrap();
+/// Jobs handed over and not yet ended, at most: what bounds the memory the
+/// stream of jobs holds.
+const IN_FLIGHT: usize = 4_096;
+/// The threads handing the jobs over.
+const PRODUCERS: usize = 4;
+
+/// Sets its flag when dropped.
+struct StopOnDrop<'a>(&'a AtomicBool);
+
+impl Drop for StopOnDrop<'_> {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
+/// E28's stream. Four threads hand `db` exclusive jobs as fast as they can,
+/// far faster than it runs them, for as long as the writer runs: the job
+/// queue is kept thousands deep and is never empty. Each job flushes what the
+/// writer wrote into L0 and compacts nothing, its range holding no key.
+/// Meanwhile `put` writes keys `0..writes` in order, waiting out every stall,
+/// up to [`STUCK`]; any other error fails the writer. Returns how many keys
+/// went in and how many jobs were handed over. Each job counts itself out of
+/// `in_flight` when it ends, and into `failed` when it failed.
+fn stream_jobs_beside_a_writer(
+    db: &Db,
+    writes: u32,
+    in_flight: &Arc<AtomicUsize>,
+    failed: &Arc<AtomicUsize>,
+    put: impl Fn(u32) -> regolith::Result<()>,
+) -> (u32, usize) {
     let writer_done = AtomicBool::new(false);
-    let in_flight = Arc::new(AtomicUsize::new(0));
-    let failed = Arc::new(AtomicUsize::new(0));
     let handed = AtomicUsize::new(0);
     let deadline = Instant::now() + STUCK;
-
     let written = std::thread::scope(|scope| {
         for _ in 0..PRODUCERS {
             scope.spawn(|| {
@@ -101,7 +100,7 @@ fn an_endless_stream_of_jobs_never_starves_the_compaction_worker() {
                         continue;
                     }
                     in_flight.fetch_add(1, Ordering::SeqCst);
-                    let (in_flight, failed) = (Arc::clone(&in_flight), Arc::clone(&failed));
+                    let (in_flight, failed) = (Arc::clone(in_flight), Arc::clone(failed));
                     db.compact_range(Some(b"zz0"), Some(b"zz1"))
                         .on_complete(move |result| {
                             if result.is_err() {
@@ -114,10 +113,15 @@ fn an_endless_stream_of_jobs_never_starves_the_compaction_worker() {
             });
         }
 
+        // Stops the producers however the writer ends, by a return or a
+        // panic: a writer that failed and left them running would leave the
+        // scope waiting on them for ever, and the test would hang where it
+        // should report the failure.
+        let _stop = StopOnDrop(&writer_done);
         let mut written = 0;
-        'writes: for i in 0..WRITES {
+        'writes: for i in 0..writes {
             loop {
-                match db.put(format!("k{i:06}").as_bytes(), &[3u8; 1024]) {
+                match put(i) {
                     Ok(()) => break,
                     Err(Error::WouldBlock(WouldBlock::Stall(stall))) => {
                         // The stop clears once the worker compacts. Bounded
@@ -136,8 +140,36 @@ fn an_endless_stream_of_jobs_never_starves_the_compaction_worker() {
             }
             written += 1;
         }
-        writer_done.store(true, Ordering::SeqCst);
         written
+    });
+    (written, handed.load(Ordering::SeqCst))
+}
+
+/// E28. The stream never starves the compaction worker: it must still flush
+/// and compact between the jobs, so the writer gets through. A stop that
+/// held it would last as long as the stream.
+///
+/// The worker this replaced ran every queued job before anything else, so
+/// under this stream it never compacted, L0 reached the stop trigger and the
+/// writer stayed stopped until the deadline.
+#[test]
+fn an_endless_stream_of_jobs_never_starves_the_compaction_worker() {
+    const WRITES: u32 = 3_000;
+    const STOP: usize = 6;
+    let dir = TempDir::new().unwrap();
+    let db = Db::open(
+        dir.path(),
+        Options::default()
+            .write_buffer_size(16 * 1024)
+            .l0_compaction_trigger(2)
+            .level0_slowdown_writes_trigger(4)
+            .level0_stop_writes_trigger(STOP),
+    )
+    .unwrap();
+    let in_flight = Arc::new(AtomicUsize::new(0));
+    let failed = Arc::new(AtomicUsize::new(0));
+    let (written, handed) = stream_jobs_beside_a_writer(&db, WRITES, &in_flight, &failed, |i| {
+        db.put(format!("k{i:06}").as_bytes(), &[3u8; 1024])
     });
 
     assert_eq!(
@@ -148,7 +180,6 @@ fn an_endless_stream_of_jobs_never_starves_the_compaction_worker() {
     eventually("the queued jobs end", || {
         in_flight.load(Ordering::SeqCst) == 0
     });
-    let handed = handed.load(Ordering::SeqCst);
     assert!(
         handed >= IN_FLIGHT,
         "only {handed} jobs were handed over while the writer ran: the stream was no stream"
@@ -161,6 +192,35 @@ fn an_endless_stream_of_jobs_never_starves_the_compaction_worker() {
             Some(vec![3u8; 1024])
         );
     }
+}
+
+/// A writer that fails stops the stream on its way out, so the test reports
+/// the failure. Before, the producers ran on until the writer was done, and a
+/// writer that panicked was never done: the scope waited on them for ever.
+#[test]
+fn a_failing_writer_stops_the_stream_of_jobs() {
+    let dir = TempDir::new().unwrap();
+    let db = Arc::new(Db::open(dir.path(), Options::default()).unwrap());
+    let in_flight = Arc::new(AtomicUsize::new(0));
+    let failed = Arc::new(AtomicUsize::new(0));
+    let outcome = {
+        let (db, in_flight, failed) =
+            (Arc::clone(&db), Arc::clone(&in_flight), Arc::clone(&failed));
+        returns("a failing writer ends the stream", move || {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                stream_jobs_beside_a_writer(&db, 100, &in_flight, &failed, |i| {
+                    if i == 10 {
+                        return Err(Error::InvalidArgument("a planted failure".into()));
+                    }
+                    db.put(format!("k{i:06}").as_bytes(), b"v")
+                })
+            }))
+        })
+    };
+    assert!(outcome.is_err(), "the planted failure was not reported");
+    eventually("the queued jobs end", || {
+        in_flight.load(Ordering::SeqCst) == 0
+    });
 }
 
 /// A job on a caller's queue never makes its poll wait for the gate. While

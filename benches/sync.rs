@@ -31,6 +31,8 @@
 //!
 //! No async runtime is involved: the executors are the functions below.
 
+mod common;
+
 use std::future::Future;
 use std::hint::black_box;
 use std::pin::{Pin, pin};
@@ -133,19 +135,20 @@ fn uncontended(c: &mut Criterion) {
     group.finish();
 }
 
-/// Runs `per_task` ops on each of `tasks` threads and returns the wall
-/// time from a common start.
+/// Runs `total` ops spread over `tasks` threads (`common::start::share`)
+/// and returns the wall time from a common start.
 fn on_threads(
     tasks: usize,
-    per_task: u64,
+    total: u64,
     op: impl Fn(&Waker, &Flag) + Send + Sync + 'static,
     park: bool,
 ) -> Duration {
     let op = Arc::new(op);
-    let start = Arc::new(std::sync::Barrier::new(tasks + 1));
+    let line = Arc::new(common::start::StartLine::new(tasks));
     let threads: Vec<_> = (0..tasks)
-        .map(|_| {
-            let (op, start) = (Arc::clone(&op), Arc::clone(&start));
+        .map(|t| {
+            let (op, line) = (Arc::clone(&op), Arc::clone(&line));
+            let per_task = common::start::share(total, tasks, t);
             std::thread::spawn(move || {
                 let flag = Arc::new(Flag(AtomicBool::new(false)));
                 let waker = if park {
@@ -153,15 +156,14 @@ fn on_threads(
                 } else {
                     Waker::from(Arc::clone(&flag))
                 };
-                start.wait();
+                line.wait();
                 for _ in 0..per_task {
                     op(&waker, &flag);
                 }
             })
         })
         .collect();
-    start.wait();
-    let began = Instant::now();
+    let began = line.start();
     for thread in threads {
         thread.join().expect("worker");
     }
@@ -185,15 +187,16 @@ impl Future for YieldOnce {
     }
 }
 
-/// Runs `tasks` tasks of `per_task` locks each on this thread, polling
-/// only the tasks whose waker fired.
-fn on_one_thread(mutex: &Mutex<u64>, tasks: usize, per_task: u64) -> Duration {
+/// Runs `total` locks spread over `tasks` tasks (`common::start::share`) on
+/// this thread, polling only the tasks whose waker fired.
+fn on_one_thread(mutex: &Mutex<u64>, tasks: usize, total: u64) -> Duration {
     let flags: Vec<_> = (0..tasks)
         .map(|_| Arc::new(Flag(AtomicBool::new(true))))
         .collect();
     let wakers: Vec<_> = flags.iter().map(|f| Waker::from(Arc::clone(f))).collect();
     let mut futures: Vec<Pin<Box<dyn Future<Output = ()> + '_>>> = (0..tasks)
-        .map(|_| {
+        .map(|t| {
+            let per_task = common::start::share(total, tasks, t);
             Box::pin(async move {
                 for _ in 0..per_task {
                     let mut guard = mutex.lock().await;
@@ -235,11 +238,10 @@ fn contended(c: &mut Criterion) {
             group.bench_with_input(BenchmarkId::new(name, tasks), &tasks, |b, &tasks| {
                 b.iter_custom(|iters| {
                     let mutex = Arc::new(Mutex::new(0u64));
-                    let per_task = (iters / tasks as u64).max(1);
                     let park = matches!(executor, Executor::Park);
                     on_threads(
                         tasks,
-                        per_task,
+                        iters,
                         move |waker, flag| {
                             *block_on(mutex.lock(), waker, flag, executor) += 1;
                         },
@@ -254,17 +256,16 @@ fn contended(c: &mut Criterion) {
             |b, &tasks| {
                 b.iter_custom(|iters| {
                     let mutex = Mutex::new(0u64);
-                    on_one_thread(&mutex, tasks, (iters / tasks as u64).max(1))
+                    on_one_thread(&mutex, tasks, iters)
                 })
             },
         );
         group.bench_with_input(BenchmarkId::new("std_mutex", tasks), &tasks, |b, &tasks| {
             b.iter_custom(|iters| {
                 let mutex = Arc::new(std::sync::Mutex::new(0u64));
-                let per_task = (iters / tasks as u64).max(1);
                 on_threads(
                     tasks,
-                    per_task,
+                    iters,
                     move |_, _| {
                         *mutex.lock().expect("unpoisoned") += 1;
                     },

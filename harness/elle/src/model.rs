@@ -62,7 +62,8 @@ impl ValueSource {
 ///
 /// `ReadForUpdate` is a read through `get_for_update` that the transaction
 /// does not write back, recorded as a plain read. It is the one read
-/// `ReadCommitted` leaves unvalidated and `SnapshotIsolation` validates.
+/// `ReadCommitted` leaves unvalidated and `SnapshotIsolation` validates. In
+/// the `parts` shape it locks the part's document and records the part.
 ///
 /// `ScanAll` is one validated scan of the whole key prefix. Elle's models
 /// have no range operation, so it is recorded as a read of every key of
@@ -309,6 +310,18 @@ impl TxnPlan {
                     read.insert(*key);
                     let current = tx.get(&key_bytes(*key))?;
                     observed.push(read_mop(model, *key, current.as_deref()));
+                }
+                // A part lives in its document, as for a plain read: the
+                // locking read takes the document's key and reads the part.
+                PlannedMop::ReadForUpdate { key } if shape == Shape::Parts => {
+                    let (document, part) = part_key(*key);
+                    let current = tx.get_for_update(&document)?;
+                    let value = parts::list_of(current.as_deref(), part);
+                    observed.push(Mop(
+                        "r".into(),
+                        *key,
+                        value.map_or(MopVal::Null, MopVal::List),
+                    ));
                 }
                 PlannedMop::ReadForUpdate { key } => {
                     read.insert(*key);
