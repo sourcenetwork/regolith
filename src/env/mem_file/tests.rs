@@ -143,6 +143,33 @@ fn a_refused_charge_changes_nothing_and_a_cut_gives_bytes_back() {
     assert_eq!(charge.held.load(StdOrdering::SeqCst), 4);
 }
 
+/// A write whose charge was reserved and whose attempt then fails, here
+/// because no buffer that large can be had, gives the reservation back: a
+/// failed write leaks no charge, as a refused one does not.
+#[test]
+fn a_write_that_fails_after_its_charge_was_reserved_gives_it_back() {
+    let charge = Bounded {
+        held: StdAtomicU64::new(0),
+        max: u64::MAX,
+    };
+    let file = MemFile::new();
+    file.append(&[b"abcd"], &charge).unwrap();
+    let err = file.set_len(1 << 61, &charge).unwrap_err();
+    assert_eq!(
+        err.kind(),
+        io::ErrorKind::OutOfMemory,
+        "setup: the copy cannot get its buffer"
+    );
+    assert_eq!(
+        charge.held.load(StdOrdering::SeqCst),
+        4,
+        "the failed write kept its charge"
+    );
+    assert_eq!(file.to_vec(), b"abcd");
+    file.append(&[b"ef"], &charge).unwrap();
+    assert_eq!(charge.held.load(StdOrdering::SeqCst), 6);
+}
+
 /// One appender writes numbered records; readers on other threads read the
 /// whole file again and again. Every read is a prefix of the records, and
 /// holds at least every record whose append returned before the read began.
