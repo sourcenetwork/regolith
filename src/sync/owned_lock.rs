@@ -231,6 +231,12 @@ impl Default for OwnedLock {
 }
 
 impl Lock for OwnedLock {
+    /// A transaction keeps its key locks until it commits or aborts, across
+    /// its own reads, writes and log sync, so a holder is seldom about to
+    /// let go when another owner asks: a spin would only burn the asker's
+    /// time. Its waiters queue at once, as `LockTable.tla` models them.
+    const SPINS: bool = false;
+
     /// A waiter's `need` is its owner's name: the lock is admitted to it
     /// only while free, and then names it.
     fn admit(&self, state: usize, need: usize) -> Option<usize> {

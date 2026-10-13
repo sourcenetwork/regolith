@@ -84,6 +84,7 @@
 use core::ptr::{self, NonNull};
 
 use super::internal::{AtomicPtr, AtomicUsize, Ordering};
+use super::spin::Budget;
 use super::waiter::{Pool, Wait, Waiter, WakeList, release_queued};
 
 /// The drain role is held.
@@ -108,6 +109,15 @@ pub(super) const FIRST_BIT: u32 = 6;
 #[inline]
 pub(super) fn wants_drain(prev: usize) -> bool {
     prev & QUEUED != 0 && (prev & NUDGE_OUT == 0 || prev & HANDOFF != 0)
+}
+
+/// Whether a contender that saw `state` stops spinning and queues: a
+/// handoff is owed, or waiters are queued and nobody is changing the queue.
+/// A queue with the drain role taken may be emptying (a waiter that won its
+/// retry is withdrawing), so a spinner looks again after its next gap.
+#[inline]
+pub(super) fn stops_spin(state: usize) -> bool {
+    state & HANDOFF != 0 || state & (QUEUED | DRAINING) == QUEUED
 }
 
 /// The nudges of one pass. It raises [`NUDGE_OUT`] before the first nudge
@@ -175,6 +185,8 @@ pub(super) struct WaitQueue {
     /// Queued waiters marked owed a handoff.
     owed: AtomicUsize,
     pool: Pool,
+    /// How many rounds a contended acquire spins (see `spin`).
+    pub(super) spin: Budget,
 }
 
 impl WaitQueue {
@@ -186,6 +198,7 @@ impl WaitQueue {
                 cancels: AtomicUsize::new(0),
                 owed: AtomicUsize::new(0),
                 pool: Pool::new(),
+                spin: Budget::new(),
             }
         }
     }

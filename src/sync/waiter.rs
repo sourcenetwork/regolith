@@ -49,6 +49,7 @@ use core::task::{Poll, Waker};
 
 use super::internal::{AtomicPtr, AtomicUsize, Ordering, UnsafeCell};
 use super::queue::WaitQueue;
+use super::spin::pause;
 
 const PHASE: usize = 0b11;
 const WAITING: usize = 0;
@@ -269,6 +270,42 @@ impl Waiter {
                 Err(actual) => state = actual,
             }
         }
+    }
+
+    /// Readies the node for its future to spin on, inside a poll: a grant
+    /// or nudge that comes while it spins must only set its mark, never
+    /// claim the waker. So an armed waker is disarmed; it stays in its slot
+    /// for [`park`](Self::park) to arm again, which reads the marks in the
+    /// same compare-and-swap. False when the node is granted or nudged
+    /// already, so there is nothing to wait for. In the common case, a
+    /// future woken by the claim of its waker, nothing is armed and this is
+    /// one load.
+    fn begin_spin(&self) -> bool {
+        let mut state = self.state.load(Ordering::Acquire);
+        loop {
+            if state & PHASE == GRANTED || state & NUDGED != 0 {
+                return false;
+            }
+            if state & ARMED == 0 {
+                return true;
+            }
+            match self.state.compare_exchange_weak(
+                state,
+                state & !ARMED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(actual) => state = actual,
+            }
+        }
+    }
+
+    /// Whether a grant or nudge has reached the node: what a spin waits
+    /// for. A plain load; the look that follows the spin synchronizes.
+    fn marked(&self) -> bool {
+        let state = self.state.load(Ordering::Relaxed);
+        state & PHASE == GRANTED || state & NUDGED != 0
     }
 
     /// Marks a waiting node as owed a handoff. False when it already left
@@ -721,6 +758,31 @@ impl Wait {
         }
     }
 
+    /// After a lost retry: spins on the node for up to the queue's
+    /// budget, then looks at it as [`park`](Self::park) with `waker` does.
+    /// A grant or nudge that comes during the spin finds the node unarmed,
+    /// so it only sets its mark, and the spin sees the mark; if the spin
+    /// runs out, the look arms the waker and reads the marks in one
+    /// compare-and-swap, so a mark set as the spin gave up is not lost.
+    pub(super) fn spin_park(&mut self, queue: &WaitQueue, waker: &Waker) -> Park {
+        if let Some(node) = self.node {
+            let rounds = queue.spin.rounds();
+            // SAFETY: this future holds its reference until it clears `node`.
+            let waiter = unsafe { node.as_ref() };
+            if rounds > 0 && waiter.begin_spin() {
+                if (0..rounds).any(|_| {
+                    pause();
+                    waiter.marked()
+                }) {
+                    queue.spin.won(rounds);
+                } else {
+                    queue.spin.ran_out(rounds);
+                }
+            }
+        }
+        self.park(queue, Some(waker))
+    }
+
     /// For a primitive that only grants: ready once granted.
     pub(super) fn poll(&mut self, queue: &WaitQueue, waker: Option<&Waker>) -> Poll<usize> {
         match self.park(queue, waker) {
@@ -774,3 +836,103 @@ impl Wait {
 unsafe impl Send for Wait {}
 // SAFETY: `&Wait` exposes nothing.
 unsafe impl Sync for Wait {}
+
+#[cfg(all(test, not(loom)))]
+mod tests {
+    use super::super::test_support::Polled;
+    use super::*;
+
+    /// A queue with one waiter armed, as after a poll that returned
+    /// `Pending`, and the waker that counts its wakes.
+    fn armed() -> (WaitQueue, Wait, Polled<core::future::Pending<()>>) {
+        let queue = WaitQueue::new(0);
+        let counter = Polled::new(core::future::pending::<()>());
+        let mut wait = Wait::new();
+        wait.enqueue(&queue, 1, &counter.waker());
+        assert!(matches!(wait.park(&queue, None), Park::Pending));
+        (queue, wait, counter)
+    }
+
+    fn node(wait: &Wait) -> NonNull<Waiter> {
+        wait.node.expect("queued")
+    }
+
+    /// B, the spin on the waiter's own node. A nudge that finds the waiter
+    /// spinning (disarmed by `begin_spin`) sets the mark and calls no
+    /// waker; the look that ends the spin finds the mark.
+    #[test]
+    fn a_nudge_that_finds_its_waiter_spinning_marks_it_and_wakes_nobody() {
+        let (queue, mut wait, counter) = armed();
+        // SAFETY: the future holds its reference for the whole test.
+        let waiter = unsafe { node(&wait).as_ref() };
+        assert!(waiter.begin_spin(), "nothing marked yet: the waiter spins");
+        let mut woken = WakeList::new(&queue);
+        assert!(woken.nudge(node(&wait)), "a nudge is on its way");
+        drop(woken);
+        assert_eq!(
+            counter.wakes(),
+            0,
+            "a spinning waiter's waker is not called"
+        );
+        assert!(waiter.marked(), "the spin sees the mark");
+        assert!(matches!(
+            wait.park(&queue, Some(&counter.waker())),
+            Park::Nudged
+        ));
+        assert!(matches!(wait.cancel(&queue), Cancel::Withdrawn(false)));
+    }
+
+    /// The same nudge to an armed waiter claims its waker and calls it: what
+    /// `begin_spin` saves a spinning waiter.
+    #[test]
+    fn a_nudge_that_finds_its_waiter_armed_calls_its_waker() {
+        let (queue, mut wait, counter) = armed();
+        let mut woken = WakeList::new(&queue);
+        assert!(woken.nudge(node(&wait)));
+        drop(woken);
+        assert_eq!(counter.wakes(), 1, "an armed waiter is woken");
+        assert!(matches!(
+            wait.park(&queue, Some(&counter.waker())),
+            Park::Nudged
+        ));
+        assert!(matches!(wait.cancel(&queue), Cancel::Withdrawn(false)));
+    }
+
+    /// A mark set just as the spin gives up is not lost: the look that arms
+    /// the waker again reads the marks in the same compare-and-swap, so the
+    /// waiter retries instead of sleeping beside it.
+    #[test]
+    fn a_nudge_as_the_spin_gives_up_is_seen_by_the_look() {
+        let (queue, mut wait, counter) = armed();
+        // SAFETY: as above.
+        let waiter = unsafe { node(&wait).as_ref() };
+        assert!(waiter.begin_spin());
+        assert!(!waiter.marked(), "the spin runs out with nothing marked");
+        let mut woken = WakeList::new(&queue);
+        assert!(woken.nudge(node(&wait)), "the nudge lands as it gives up");
+        drop(woken);
+        assert_eq!(counter.wakes(), 0);
+        assert!(
+            matches!(wait.park(&queue, Some(&counter.waker())), Park::Nudged),
+            "the look found the nudge; the waiter does not sleep beside it"
+        );
+        assert!(matches!(wait.cancel(&queue), Cancel::Withdrawn(false)));
+    }
+
+    /// A node marked before the spin begins needs no spin: `begin_spin`
+    /// says so and leaves the mark for the look.
+    #[test]
+    fn a_marked_node_does_not_spin() {
+        let (queue, mut wait, counter) = armed();
+        let mut woken = WakeList::new(&queue);
+        assert!(woken.nudge(node(&wait)));
+        drop(woken);
+        // SAFETY: as above.
+        assert!(!unsafe { node(&wait).as_ref() }.begin_spin());
+        assert!(matches!(
+            wait.park(&queue, Some(&counter.waker())),
+            Park::Nudged
+        ));
+        assert!(matches!(wait.cancel(&queue), Cancel::Withdrawn(false)));
+    }
+}

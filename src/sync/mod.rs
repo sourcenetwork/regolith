@@ -108,6 +108,7 @@ mod reentrant_mutex;
 mod reentrant_rwlock;
 mod rwlock;
 mod semaphore;
+mod spin;
 #[cfg(all(test, not(loom)))]
 pub(crate) mod test_support;
 mod waiter;
