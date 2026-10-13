@@ -497,6 +497,26 @@ impl Db {
     /// it has, they count toward the level 0 write thresholds. A read-only
     /// open makes the same move in its own view, every time, and writes
     /// nothing.
+    ///
+    /// The same releases could leave an ingested table's range delete in the
+    /// bottom level below older keys it deletes, with no level overlapping. A
+    /// point read then found such a key before the range delete and returned
+    /// it, while a scan did not; a compaction of the bottom level would drop
+    /// the range delete and bring the key back for good. The first open of a
+    /// database that does not record this check copies every range delete
+    /// that has a newer level, a level 0 table read before it or the
+    /// recovered log holding keys in its range in front of every key, so the
+    /// key reads as deleted everywhere. A copy deletes only what its range
+    /// delete deletes, so the copies of range deletes that were in front
+    /// already change no read. The open logs one warning, counts the copies
+    /// in [`Ticker::ManifestRangeDeletesCopied`] and in the
+    /// `regolith.manifest.range_deletes_copied` property, and records the
+    /// check before it returns; a database this release creates records it
+    /// from the start and is never checked. The copies are one level 0
+    /// table after the first flush, which compaction carries down; where the
+    /// copied ranges are wide, that is a one-time rewrite of the data inside
+    /// them. A read-only open copies in its own view, every time, and writes
+    /// nothing.
     pub fn open<P: AsRef<Path>>(path: P, opts: Options) -> Result<Self> {
         opts.validate()?;
         let read_only = opts.read_only;
@@ -536,7 +556,8 @@ impl Db {
     /// see committed-but-unflushed writes, but it does not create,
     /// rewrite, compact, or delete files. Mutating APIs return
     /// [`Error::ReadOnly`]. A database a 0.1.x release left with an
-    /// overlapping level reads correctly here too, see [`Db::open`].
+    /// overlapping level, or with a range delete below older keys it
+    /// deletes, reads correctly here too, see [`Db::open`].
     pub fn open_read_only<P: AsRef<Path>>(path: P, mut opts: Options) -> Result<Self> {
         opts.read_only = true;
         Self::open(path, opts)
@@ -1503,6 +1524,11 @@ impl Db {
     /// moved to level 0 out of levels a 0.1.x release left overlapping (see
     /// [`Db::open`]): zero once a read-write open has recorded the move, and
     /// the same count at every read-only open until then.
+    /// `regolith.manifest.range_deletes_copied` is the number of range
+    /// deletes this open copied in front of keys an earlier release may have
+    /// left them behind (see [`Db::open`]): zero once a read-write open has
+    /// recorded the check, and the same count at every read-only open until
+    /// then.
     pub fn get_int_property(&self, name: &str) -> Option<u64> {
         if let Some(level_str) = name.strip_prefix("regolith.num-files-at-level") {
             let level: usize = level_str.parse().ok()?;
@@ -1510,6 +1536,9 @@ impl Db {
         }
         match name {
             "regolith.manifest.tables_demoted" => Some(self.engine.tables_demoted_at_open()),
+            "regolith.manifest.range_deletes_copied" => {
+                Some(self.engine.range_deletes_copied_at_open())
+            }
             "regolith.total-sst-files-size" => Some(self.engine.total_sst_size()),
             "regolith.cur-size-active-mem-table" => Some(self.engine.active_memtable_size()),
             "regolith.memtable-reserved-bytes" => Some(self.engine.memtables_reserved_size()),

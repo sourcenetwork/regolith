@@ -439,7 +439,8 @@ fn a_sealed_manifest_records_the_move_sealed() {
         &[(b"b", b"t", 20)],
     );
     let ring = keyring(&[7]);
-    let image = encode_manifest_image(101, 20, 5, [(1, old), (1, ingest)], Some(&ring)).unwrap();
+    let image =
+        encode_manifest_image(101, 20, 5, false, [(1, old), (1, ingest)], Some(&ring)).unwrap();
     std::fs::write(dir.path().join("MANIFEST"), &image).unwrap();
     let open = |ring: Option<Arc<Keyring>>| {
         VersionSet::open_with_policy(
@@ -500,7 +501,8 @@ fn a_batch_that_fails_before_it_is_written_leaves_the_move_to_the_next_one() {
     );
     let keys = TestKeys::new(&[7]);
     let ring = Arc::new(Keyring::new(keys.clone()));
-    let image = encode_manifest_image(101, 20, 5, [(1, old), (1, ingest)], Some(&ring)).unwrap();
+    let image =
+        encode_manifest_image(101, 20, 5, false, [(1, old), (1, ingest)], Some(&ring)).unwrap();
     std::fs::write(dir.path().join("MANIFEST"), &image).unwrap();
     let open = || {
         VersionSet::open_with_policy(

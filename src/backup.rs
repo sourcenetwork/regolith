@@ -240,6 +240,8 @@ impl BackupEngine {
             next_file_id,
             last_seq,
             sealed_under: sealer.as_ref().map(|s| s.id()),
+            // The database is open, so this build checked it at its open.
+            range_deletes_checked: true,
         };
         let bytes = format::encode(&manifest, id, sealer.as_ref()).map_err(Error::from)?;
         atomic_write(&*self.env, &self.meta_path(id), &bytes).map_err(Error::from)?;
@@ -638,6 +640,7 @@ fn encode_engine_manifest(
         m.next_file_id,
         m.last_seq,
         m.next_file_id,
+        m.range_deletes_checked,
         m.files.iter().map(|f| {
             (
                 f.level as usize,

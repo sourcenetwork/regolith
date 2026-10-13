@@ -8,6 +8,7 @@ pub(crate) mod block_cache;
 #[cfg(all(test, not(loom)))]
 mod blocked_call_tests;
 pub(crate) mod bloom;
+mod buried_range_deletes;
 pub(crate) mod callback;
 pub(crate) mod checksum;
 pub(crate) mod commit;
@@ -103,8 +104,8 @@ use read_horizon::ReadHorizon;
 pub(crate) use read_rule::ReadRule;
 use read_view::{ReadView, ReadViewCell};
 use recovery::{
-    hoist_range_deletes, replay_logs, report_demoted_tables, report_discarded_tail,
-    report_dropped_manifest_tail, rewrite_recovered_memtable_to_wal,
+    hoist_range_deletes, replay_logs, report_copied_range_deletes, report_demoted_tables,
+    report_discarded_tail, report_dropped_manifest_tail, rewrite_recovered_memtable_to_wal,
 };
 use skiplist::InsertHint;
 pub(crate) use snapshot_registry::SnapshotPin;
@@ -610,6 +611,9 @@ pub(crate) struct RegolithEngine {
     disk_dir: PathBuf,
     /// Tables this open moved out of overlapping levels (`recovery.rs`).
     tables_demoted_at_open: u64,
+    /// Range tombstones this open copied in front of older keys they may
+    /// delete (`buried_range_deletes.rs`).
+    range_deletes_copied_at_open: u64,
     /// A step relieving a stop waits on some thread's queue: no second one
     /// is left until it ran (`background_step.rs`).
     stall_step_queued: AtomicBool,
@@ -660,6 +664,7 @@ impl RegolithEngine {
         }
         let manifest_path = version_set.manifest_path().to_path_buf();
         let demotion = version_set.take_demotion();
+        let check = !version_set.range_deletes_checked();
         let version = version_set.current();
         let latest_seq = version.last_seq;
 
@@ -691,7 +696,8 @@ impl RegolithEngine {
         }
         // Into the memtable the new log is written from just below, so
         // they are durable there before the edit that records the move.
-        let (moved, latest_seq) = hoist_range_deletes(demotion, &memtable, latest_seq);
+        let (moved, copied, latest_seq) =
+            hoist_range_deletes(demotion, check, &version, &memtable, latest_seq);
 
         let wal_id = next_wal_id(version.next_file_id, &wal_files);
         let wal_path = wal_dir.join(wal_filename(wal_id));
@@ -719,7 +725,11 @@ impl RegolithEngine {
         // An open that moved overlapping levels records the move in this
         // same batch, which is then synced: the new log already holds the
         // moved tables' range tombstones, so no crash leaves the move
-        // without them (LegacyRangeRead.tla, RED `MoveBeforeLog`).
+        // without them (LegacyRangeRead.tla, RED `MoveBeforeLog`). The
+        // first open of a database written without the record of the range
+        // delete check records it here too, synced for the same reason (RED
+        // `CheckBeforeLog`); a new database records it unsynced, having
+        // nothing to copy.
         versions.run(|versions| {
             versions.apply(&[
                 VersionEdit::SetNextFileId(wal_id + 1),
@@ -730,6 +740,7 @@ impl RegolithEngine {
         if let Some(moved) = moved {
             report_demoted_tables(&options, &manifest_path, moved, false);
         }
+        report_copied_range_deletes(&options, &manifest_path, copied, false);
         let removed =
             log_retirement::remove_below(&*env, &wal_dir, wal_id, options.statistics.as_deref());
         let retired_logs = RetiredLogs::new(wal_dir.clone(), !removed);
@@ -823,6 +834,7 @@ impl RegolithEngine {
             owed_queued: AtomicBool::new(false),
             disk_dir: db_dir.to_path_buf(),
             tables_demoted_at_open,
+            range_deletes_copied_at_open: copied,
             stall_step_queued: AtomicBool::new(false),
             stall_steps_idle: std::sync::atomic::AtomicUsize::new(0),
             options,
@@ -910,6 +922,7 @@ impl RegolithEngine {
         // the manifest keeps them, and every open moves them again until a
         // read-write one records the move.
         let demotion = version_set.take_demotion();
+        let check = !version_set.range_deletes_checked();
         let version = version_set.current();
         let latest_seq = version.last_seq;
 
@@ -928,11 +941,13 @@ impl RegolithEngine {
         if let Some((path, tail)) = discarded {
             report_discarded_tail(&options, &path, tail, latest_seq);
         }
-        let (moved, latest_seq) = hoist_range_deletes(demotion, &memtable, latest_seq);
+        let (moved, copied, latest_seq) =
+            hoist_range_deletes(demotion, check, &version, &memtable, latest_seq);
         let tables_demoted_at_open = moved.map_or(0, |moved| moved.tables);
         if let Some(moved) = moved {
             report_demoted_tables(&options, version_set.manifest_path(), moved, true);
         }
+        report_copied_range_deletes(&options, version_set.manifest_path(), copied, true);
 
         let cache = Arc::new(
             BlockCache::with_config(
@@ -995,6 +1010,7 @@ impl RegolithEngine {
             owed_queued: AtomicBool::new(false),
             disk_dir: db_dir.to_path_buf(),
             tables_demoted_at_open,
+            range_deletes_copied_at_open: copied,
             stall_step_queued: AtomicBool::new(false),
             stall_steps_idle: std::sync::atomic::AtomicUsize::new(0),
             options,
@@ -2927,6 +2943,13 @@ impl RegolithEngine {
     /// read-write open has recorded the move.
     pub(crate) fn tables_demoted_at_open(&self) -> u64 {
         self.tables_demoted_at_open
+    }
+
+    /// Range tombstones this open copied in front of older keys an earlier
+    /// release may have left them behind: zero once a read-write open has
+    /// recorded the check.
+    pub(crate) fn range_deletes_copied_at_open(&self) -> u64 {
+        self.range_deletes_copied_at_open
     }
 
     /// Total size in bytes across every level of the current

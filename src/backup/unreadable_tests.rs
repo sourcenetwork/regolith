@@ -372,6 +372,7 @@ fn a_listing_whose_sizes_overflow_is_reported_not_summed() {
         next_file_id: 3,
         last_seq: 1,
         sealed_under: None,
+        range_deletes_checked: true,
     };
     let id = BackupId(1);
     fs::write(

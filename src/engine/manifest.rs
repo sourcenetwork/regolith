@@ -146,12 +146,25 @@ pub(crate) enum VersionEdit {
 /// Serialized form of a version edit. All edits in one apply share a
 /// checksummed frame, so recovery cannot install half a file replacement.
 enum ManifestRecord {
-    AddFile { level: usize, meta: SsTableMeta },
-    RemoveFile { level: usize, file_id: u64 },
+    AddFile {
+        level: usize,
+        meta: SsTableMeta,
+    },
+    RemoveFile {
+        level: usize,
+        file_id: u64,
+    },
     SetLastSeq(u64),
     SetNextFileId(u64),
     SetMinWalId(u64),
-    Reset { next_file_id: u64, min_wal_id: u64 },
+    Reset {
+        next_file_id: u64,
+        min_wal_id: u64,
+    },
+    /// The range deletes of this manifest's tables have been checked for
+    /// ones an earlier release left behind older keys they cover, and those
+    /// were copied in front of them (`engine::buried_range_deletes`).
+    RangeDeletesChecked,
 }
 
 const TAG_ADD_FILE: u8 = 1;
@@ -165,6 +178,12 @@ const TAG_RESET: u8 = 6;
 /// record existed never carries it, so it reads unchanged; a build that
 /// predates the record refuses one that does, naming the unknown tag.
 const TAG_ADD_INGESTED_FILE: u8 = 7;
+/// [`ManifestRecord::RangeDeletesChecked`], no payload. Every manifest this
+/// build writes carries it; one that does not was written by an earlier
+/// release, whose first open by this build runs the check and records it.
+/// A build that predates the record refuses a manifest holding it, naming
+/// the unknown tag. 8 is left to the record of per-table entry counts.
+const TAG_RANGE_DELETES_CHECKED: u8 = 9;
 
 impl VersionEdit {
     fn to_record(&self) -> ManifestRecord {
@@ -202,10 +221,19 @@ impl ManifestRecord {
     /// names, and the logs a lost retirement covered are replayed again,
     /// holding only writes that the log the open rewrote them into also
     /// holds. Each becomes durable with the next synced batch.
+    ///
+    /// The record that the range deletes were checked does not ask for a
+    /// sync on its own either: in a new manifest it rides the first batch,
+    /// and a later synced batch, which every table's record is, makes it
+    /// durable before the database holds anything to check. The version set
+    /// syncs the batch that records it in a manifest written without it
+    /// (`VersionSet::sync_check_record`).
     fn requires_sync(&self) -> bool {
         !matches!(
             self,
-            ManifestRecord::SetNextFileId(_) | ManifestRecord::SetMinWalId(_)
+            ManifestRecord::SetNextFileId(_)
+                | ManifestRecord::SetMinWalId(_)
+                | ManifestRecord::RangeDeletesChecked
         )
     }
 
@@ -253,6 +281,7 @@ impl ManifestRecord {
                 buf.extend_from_slice(&next_file_id.to_le_bytes());
                 buf.extend_from_slice(&min_wal_id.to_le_bytes());
             }
+            ManifestRecord::RangeDeletesChecked => buf.push(TAG_RANGE_DELETES_CHECKED),
         }
     }
 
@@ -326,6 +355,7 @@ impl ManifestRecord {
                     min_wal_id,
                 }))
             }
+            TAG_RANGE_DELETES_CHECKED => Ok(Some(ManifestRecord::RangeDeletesChecked)),
             _ => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("unknown manifest record tag: {}", tag),
@@ -384,8 +414,9 @@ fn raised_last_seq(current: u64, stamp: u64) -> u64 {
 }
 
 /// A whole MANIFEST describing one version: the stamp, then one frame
-/// holding the file-id counter, the last sequence, the oldest live WAL and
-/// an `AddFile` per table, level by level in the order given.
+/// holding the file-id counter, the last sequence, the oldest live WAL, the
+/// record that the range deletes were checked when `range_deletes_checked`,
+/// and an `AddFile` per table, level by level in the order given.
 ///
 /// The one encoder of a canonical manifest: the rewrite that bounds the log
 /// and a backup restore both write it, so the two cannot drift apart.
@@ -398,11 +429,20 @@ pub(crate) fn encode_manifest_image(
     next_file_id: u64,
     last_seq: u64,
     min_wal_id: u64,
+    range_deletes_checked: bool,
     files: impl IntoIterator<Item = (usize, SsTableMeta)>,
     keyring: Option<&Arc<Keyring>>,
 ) -> io::Result<Vec<u8>> {
     let sealing = VersionSet::fresh_sealing(keyring)?;
-    Ok(encode_image(next_file_id, last_seq, min_wal_id, files, sealing.as_ref())?.0)
+    Ok(encode_image(
+        next_file_id,
+        last_seq,
+        min_wal_id,
+        range_deletes_checked,
+        files,
+        sealing.as_ref(),
+    )?
+    .0)
 }
 
 /// [`encode_manifest_image`], sealed under `sealing` when given: its salt in
@@ -412,6 +452,7 @@ fn encode_image(
     next_file_id: u64,
     last_seq: u64,
     min_wal_id: u64,
+    range_deletes_checked: bool,
     files: impl IntoIterator<Item = (usize, SsTableMeta)>,
     sealing: Option<&ManifestSeal>,
 ) -> io::Result<(Vec<u8>, Option<KeyId>)> {
@@ -420,6 +461,9 @@ fn encode_image(
         ManifestRecord::SetLastSeq(last_seq),
         ManifestRecord::SetMinWalId(min_wal_id),
     ];
+    if range_deletes_checked {
+        records.push(ManifestRecord::RangeDeletesChecked);
+    }
     for (level, meta) in files {
         validate_level_index(level)?;
         records.push(ManifestRecord::AddFile { level, meta });
@@ -485,9 +529,17 @@ pub(crate) struct VersionSet {
     /// What this open moved out of overlapping levels, until the engine
     /// takes it.
     demotion: Option<Demotion>,
-    /// The edit that records that move, not in the manifest yet:
-    /// [`Self::apply`] writes it in front of its next batch.
+    /// The edit that records that move, and the record that the range
+    /// deletes were checked, not in the manifest yet: [`Self::apply`]
+    /// writes them in front of its next batch.
     unlogged: Vec<ManifestRecord>,
+    /// The manifest on disk records that the range deletes were checked
+    /// ([`ManifestRecord::RangeDeletesChecked`]).
+    range_deletes_checked: bool,
+    /// The manifest was written without that record, so its tables may hold
+    /// what the check copies: the batch that records it is synced, and an
+    /// open that returned has recorded it.
+    sync_check_record: bool,
 }
 
 struct ManifestReplay {
@@ -503,6 +555,8 @@ struct ManifestReplay {
     repair: legacy_overlap::Repair,
     /// What `repair` moved, with the moved tables' range tombstones.
     demotion: Option<Demotion>,
+    /// A replayed batch recorded that the range deletes were checked.
+    range_deletes_checked: bool,
 }
 
 impl VersionSet {
@@ -530,6 +584,8 @@ impl VersionSet {
 
         let mut demotion = None;
         let mut unlogged = Vec::new();
+        let mut range_deletes_checked = false;
+        let mut sync_check_record = false;
         let manifest_bytes;
         let mut dropped_tail = None;
         let salt;
@@ -556,6 +612,10 @@ impl VersionSet {
             }
             demotion = replay.demotion;
             unlogged = replay.repair.records;
+            range_deletes_checked = replay.range_deletes_checked;
+            // A stamp-less file is a creation a crash caught: it lists no
+            // table, so it is a new manifest.
+            sync_check_record = replay.stamp_len > 0 && !range_deletes_checked;
 
             // Trim through its own handle, and close it before the
             // append handle is opened. A torn or corrupt tail is the
@@ -594,6 +654,13 @@ impl VersionSet {
             (Version::new(), file)
         };
 
+        // A manifest that does not say the range deletes were checked gets
+        // the record with the open's first edit, after the engine has run
+        // the check and logged what it copied. A new one has nothing to
+        // check, and records it the same way.
+        if !range_deletes_checked {
+            unlogged.push(ManifestRecord::RangeDeletesChecked);
+        }
         let sealing = Self::sealing(keyring.as_ref(), salt)?;
         let convert = keyring.is_some() && sealing.is_none();
         let mut set = Self {
@@ -608,14 +675,16 @@ impl VersionSet {
             sealed_under,
             demotion,
             unlogged,
+            range_deletes_checked,
+            sync_check_record,
         };
         // The one-time conversion of a database written without encryption
         // and opened with a key provider: its manifest names every table
         // and key range in plaintext, so it is rewritten sealed now rather
         // than whenever it next grows past its rewrite threshold. An open
-        // that moved tables rewrites it with the batch that records the
-        // move (`apply`): the rewrite would record the move too, before the
-        // engine has made the moved tables' range tombstones durable.
+        // with a move or a check to record rewrites it with the batch that
+        // records them (`apply`): the rewrite would record the move now,
+        // before the engine has made the range tombstones it copies durable.
         if convert && set.unlogged.is_empty() {
             set.compact_manifest()?;
         }
@@ -723,6 +792,8 @@ impl VersionSet {
             // Read-only: the view is repaired, the manifest never is.
             demotion: replay.demotion,
             unlogged: Vec::new(),
+            range_deletes_checked: replay.range_deletes_checked,
+            sync_check_record: false,
         })
     }
 
@@ -749,6 +820,17 @@ impl VersionSet {
     /// [`Self::apply`], which is what records the move.
     pub(crate) fn take_demotion(&mut self) -> Option<Demotion> {
         self.demotion.take()
+    }
+
+    /// Whether the manifest records that the range deletes of its tables
+    /// were checked for ones an earlier release left behind older keys they
+    /// cover. `false` on the first open of a database such a release wrote,
+    /// and on the first open of a new one: the caller then owes the check,
+    /// and copies of what it finds in front of every key they cover, before
+    /// its first [`Self::apply`], which records it. A read-only open owes
+    /// the check every time.
+    pub(crate) fn range_deletes_checked(&self) -> bool {
+        self.range_deletes_checked
     }
 
     /// Path of the manifest file on disk.
@@ -830,6 +912,9 @@ impl VersionSet {
         let mut records = std::mem::take(&mut self.unlogged);
         let moved = records.len();
         let recorded_move = moved > 0;
+        let records_check = records
+            .iter()
+            .any(|record| matches!(record, ManifestRecord::RangeDeletesChecked));
         records.extend(edits.iter().map(VersionEdit::to_record));
         let (encoded, sealed_under) =
             match Self::encode_records(&records, self.manifest_bytes, self.sealing.as_ref()) {
@@ -843,7 +928,8 @@ impl VersionSet {
                     return Err(e);
                 }
             };
-        let requires_sync = records.iter().any(ManifestRecord::requires_sync);
+        let requires_sync = records.iter().any(ManifestRecord::requires_sync)
+            || (records_check && self.sync_check_record);
         // An append or sync error leaves an uncertain tail. Only reopen
         // may decide which complete frames survived; neither a later
         // append nor a rewrite from the old version may bypass that tail.
@@ -862,6 +948,7 @@ impl VersionSet {
         let live_files: u64 = version.levels.iter().map(|l| l.len() as u64).sum();
         self.current = Arc::new(version);
         self.manifest_bytes += encoded.len() as u64;
+        self.range_deletes_checked |= records_check;
         if let Some(id) = sealed_under
             && !self.sealed_under.contains(&id)
         {
@@ -907,6 +994,7 @@ impl VersionSet {
             version.next_file_id,
             version.last_seq,
             version.min_wal_id,
+            self.range_deletes_checked,
             version
                 .levels
                 .iter()
@@ -936,7 +1024,8 @@ impl VersionSet {
         self.manifest_bytes = image.len() as u64;
         self.sealing = sealing;
         self.sealed_under = sealed_under.into_iter().collect();
-        // The image is the current version, a move included.
+        // The image is the current version, a move included. A check
+        // not recorded yet is not in it: the next open runs it again.
         self.unlogged.clear();
 
         let file = self
@@ -1129,6 +1218,7 @@ impl VersionSet {
         let mut last_seq: u64 = 0;
         let mut next_file_id: u64 = 1;
         let mut min_wal_id: u64 = 0;
+        let mut range_deletes_checked = false;
         // The stamp is not a record. `valid_len` starts past it so a
         // clean replay ends exactly at the file length, which is what
         // `judge_end` compares against.
@@ -1188,6 +1278,7 @@ impl VersionSet {
                         next_file_id = reset_next_file_id;
                         min_wal_id = reset_min_wal_id;
                     }
+                    ManifestRecord::RangeDeletesChecked => range_deletes_checked = true,
                 }
             }
             valid_len = offset;
@@ -1245,12 +1336,15 @@ impl VersionSet {
             demotion: repair.demotion(&version.levels[0]),
             repair,
             version,
+            range_deletes_checked,
         })
     }
 }
 
 #[cfg(test)]
 mod atomic_tests;
+#[cfg(test)]
+mod buried_delete_tests;
 #[cfg(test)]
 mod demotion_tests;
 #[cfg(test)]

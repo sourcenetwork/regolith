@@ -1,14 +1,16 @@
 //! Recovery from the write-ahead logs at open: replay them into a
-//! memtable, deal with the newest log's discarded tail, give the tables an
-//! open moved out of overlapping levels their range tombstones back in
-//! front, and rewrite what was recovered into a fresh log.
+//! memtable, deal with the newest log's discarded tail, put in front of
+//! every key the range tombstones of the tables an open moved out of
+//! overlapping levels and those an earlier release may have left behind
+//! older keys they delete, and rewrite what was recovered into a fresh log.
 
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use super::buried_range_deletes::buried_range_deletes;
 use super::internal_key;
-use super::manifest::Demotion;
+use super::manifest::{Demotion, Version};
 use super::memtable::MemTable;
 use super::range_tombstone::RangeTombstone;
 use super::seal::Keyring;
@@ -132,43 +134,63 @@ pub(super) struct Moved {
     pub(super) range_deletes: usize,
 }
 
-/// Put the range tombstones of the tables the open moved out of
-/// overlapping levels into `memtable`. Returns what the open moved, `None`
-/// when it moved nothing, and the largest sequence recovered, at least
-/// `latest_seq`.
+/// Put in `memtable` the range tombstones of the tables the open moved out
+/// of overlapping levels, and, when `check` (the manifest does not record
+/// that it was done), those `version` holds that an earlier release may
+/// have left behind older keys they delete (`buried_range_deletes`).
+/// Returns what the open moved, `None` when it moved nothing, how many
+/// range tombstones the check copied, and the largest sequence recovered,
+/// at least `latest_seq`.
 ///
 /// A moved table can hold a range tombstone newer than a key it covers in
-/// a source read before it (`manifest/legacy_overlap.rs`), and a read stops
-/// at the first source holding the key. The recovered memtable is the
-/// newest source, so from it each tombstone is in front of every key it
-/// covers, wherever a later flush or compaction takes its table. The log
-/// the open writes from this memtable keeps it there across a restart.
-/// One a replayed log already brought is not added again.
+/// a source read before it (`manifest/legacy_overlap.rs`), and so can a
+/// table a 0.1.x ingest placed in the bottom level; a read stops at the
+/// first source holding the key. The recovered memtable is the newest
+/// source, so from it each tombstone is in front of every key it covers,
+/// wherever a later flush or compaction takes its table, and before any
+/// compaction can retire the original. The log the open writes from this
+/// memtable keeps it there across a restart. One a replayed log already
+/// brought is not added again. The check runs first, on the memtable as the
+/// logs left it.
 ///
 /// One batch: its cost is linear in the tombstones copied, however many
 /// share a sequence (`MemTable::delete_ranges`). They are moved in, not
 /// cloned, so the copy holds each once. How many there can be is bounded by
-/// what the moved tables hold, which their readers keep in memory already;
-/// their bytes count toward the memtable's size, so the first write that
-/// finds it past the write buffer seals it, and its flush writes them to
-/// one level 0 table like any other range tombstone.
+/// what the tables hold, which their readers keep in memory already; their
+/// bytes count toward the memtable's size, so the first write that finds it
+/// past the write buffer seals it, and its flush writes them to one level 0
+/// table like any other range tombstone.
 pub(super) fn hoist_range_deletes(
     demotion: Option<Demotion>,
+    check: bool,
+    version: &Version,
     memtable: &MemTable,
     latest_seq: u64,
-) -> (Option<Moved>, u64) {
-    let Some(demotion) = demotion else {
-        return (None, latest_seq);
+) -> (Option<Moved>, u64, u64) {
+    let moved_tables = demotion.as_ref().map_or(0, |demotion| demotion.tables);
+    let buried = if check {
+        buried_range_deletes(version, memtable, moved_tables as usize)
+    } else {
+        Vec::new()
     };
-    let moved = Moved {
-        tables: demotion.tables,
-        deepest_level: demotion.deepest_level,
-        range_deletes: demotion.range_deletes.len(),
+    let copied = buried.len() as u64;
+    let (moved, mut batch) = match demotion {
+        Some(demotion) => (
+            Some(Moved {
+                tables: demotion.tables,
+                deepest_level: demotion.deepest_level,
+                range_deletes: demotion.range_deletes.len(),
+            }),
+            demotion.range_deletes,
+        ),
+        None => (None, Vec::new()),
     };
-    let newest = demotion.range_deletes.iter().map(|t| t.seq).max();
-    memtable.delete_ranges(demotion.range_deletes);
+    batch.extend(buried);
+    let newest = batch.iter().map(|t| t.seq).max();
+    memtable.delete_ranges(batch);
     (
-        Some(moved),
+        moved,
+        copied,
         newest.map_or(latest_seq, |seq| latest_seq.max(seq)),
     )
 }
@@ -203,6 +225,43 @@ pub(super) fn report_demoted_tables(
     );
     if let Some(stats) = options.statistics.as_ref() {
         stats.add(Ticker::ManifestTablesDemoted, demotion.tables);
+    }
+}
+
+/// Tell the operator that the open copied `copied` range tombstones an
+/// earlier release may have left behind older keys they delete in front of
+/// every key: one warn line and the `ManifestRangeDeletesCopied` ticker.
+/// `manifest` is the file that lists their tables. Nothing when it copied
+/// none.
+///
+/// A read-write open calls this once the manifest records the check, so a
+/// later open checks nothing and reports nothing. A read-only open copies
+/// them in its own view, every time.
+pub(super) fn report_copied_range_deletes(
+    options: &super::EngineOptions,
+    manifest: &Path,
+    copied: u64,
+    read_only: bool,
+) {
+    if copied == 0 {
+        return;
+    }
+    let message = if read_only {
+        "copied range deletes an earlier release may have left behind older keys \
+         they delete in front of them for this read-only open: open the database \
+         for writing once to keep the copies"
+    } else {
+        "copied range deletes an earlier release may have left behind older keys \
+         they delete in front of them: no data was lost and no action is needed"
+    };
+    tracing::warn!(
+        path = %manifest.display(),
+        range_deletes = copied,
+        read_only,
+        "{message}"
+    );
+    if let Some(stats) = options.statistics.as_ref() {
+        stats.add(Ticker::ManifestRangeDeletesCopied, copied);
     }
 }
 
