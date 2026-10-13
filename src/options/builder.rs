@@ -790,7 +790,7 @@ mod tests {
         assert_eq!(options.compaction_filter.unwrap().name(), "keep-all");
         assert_eq!(
             options.prefix_extractor.unwrap().name(),
-            "FixedLengthPrefix"
+            "FixedLengthPrefix(2)"
         );
         assert_eq!(options.merge_operator.unwrap().name(), "concat");
         assert_eq!(options.listeners.len(), 1);

@@ -71,7 +71,7 @@ use super::block::{Block, BlockBuilder, BlockHandle, RESTART_INTERVAL, decode_en
 use super::block_cache::BlockCache;
 use super::bloom::{BloomFilterBuilder, encode_bloom_block};
 use super::checksum;
-use super::filter_block::{FilterBlock, prefix_header};
+use super::filter_block::{FilterBlock, prefix_header, prefix_section};
 use super::index_block::IndexBlock;
 use super::internal_key::{
     VALUE_TYPE_DELETION, VALUE_TYPE_MERGE, decode_internal_key, user_key_of,
@@ -1032,14 +1032,20 @@ impl SsTableWriter {
         };
 
         // Bloom region layout (see `filter_block`):
-        //   [prefix_bloom_len: 7 bytes LE][prefix form: u8][prefix_bloom_bytes][user_key_bloom_bytes]
+        //   [prefix section len: 7 bytes LE][prefix form: u8][prefix section][user_key_bloom_bytes]
         //
-        // A `prefix_bloom_len` of 0 means "no prefix bloom" - the file
-        // was built without a prefix extractor. The header is written
-        // unconditionally, so the reader needs no separate case for it.
-        let prefix_bloom_data = match self.prefix_bloom_builder.take() {
-            Some(builder) => encode_bloom_block(&builder.build()),
-            None => Vec::new(),
+        // The prefix section names the extractor that built the prefix
+        // bloom, then holds the bloom. A length of 0 means "no prefix
+        // bloom" - the file was built without a prefix extractor. The
+        // header is written unconditionally, so the reader needs no
+        // separate case for it.
+        let prefix_bloom_data = match (self.prefix_bloom_builder.take(), &self.prefix_extractor) {
+            (Some(builder), Some(extractor)) => prefix_section(
+                self.prefix_form,
+                extractor.name(),
+                encode_bloom_block(&builder.build()),
+            ),
+            _ => Vec::new(),
         };
         let user_bloom = self.bloom_builder.build();
         let user_bloom_data = encode_bloom_block(&user_bloom);
@@ -1944,7 +1950,7 @@ impl SsTableReader {
     /// fail.
     pub(crate) fn may_have_prefix(
         &self,
-        probe: &mut PrefixProbe<'_>,
+        probe: &PrefixProbe,
         cache: &BlockCache,
     ) -> io::Result<bool> {
         Ok(self.filter(cache)?.may_have_prefix(probe))
@@ -2700,8 +2706,8 @@ mod tests {
     /// caller's `prefix`, by its prefix bloom and a four-byte extractor.
     fn might_hold(reader: &SsTableReader, cache: &BlockCache, family: u32, prefix: &[u8]) -> bool {
         let prefixed = prefix_key(family, prefix);
-        let mut probe = PrefixProbe::new(&crate::options::FixedLengthPrefix(4), &prefixed);
-        reader.may_have_prefix(&mut probe, cache).unwrap()
+        let probe = PrefixProbe::new(&crate::options::FixedLengthPrefix(4), &prefixed);
+        reader.may_have_prefix(&probe, cache).unwrap()
     }
 
     #[test]
@@ -2709,10 +2715,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let cache = BlockCache::new(1024 * 1024);
         let reader = prefix_table(&dir.path().join("prefix.sst"));
-        assert_eq!(
-            reader.prefix_form(&cache).unwrap(),
-            Some(PrefixForm::CallerKey)
-        );
+        assert_eq!(reader.prefix_form(&cache).unwrap(), Some(PrefixForm::Named));
 
         // Present prefixes
         assert!(might_hold(&reader, &cache, 1, b"aaaa"));
@@ -2747,31 +2750,23 @@ mod tests {
         );
     }
 
-    /// A table in the form tables had before the caller-key form says so,
-    /// and is asked the way it was built: its four-byte prefixes are the
-    /// family ids, so it rules out a family it does not hold and nothing
-    /// within one it does.
+    /// A table in a form that names no extractor says so, and a seek reads
+    /// it without its prefix filter, whatever its bloom holds.
     #[test]
-    fn a_table_of_the_engine_key_form_is_asked_the_way_it_was_built() {
+    fn a_table_that_names_no_extractor_is_not_ruled_out() {
         let dir = TempDir::new().unwrap();
         let cache = BlockCache::new(1024 * 1024);
-        let path = dir.path().join("old.sst");
-        let reader = prefix_call::writing_engine_key_form(|| prefix_table(&path));
-        assert_eq!(
-            reader.prefix_form(&cache).unwrap(),
-            Some(PrefixForm::EngineKey)
-        );
-
-        assert!(might_hold(&reader, &cache, 1, b"aaaa"));
-        assert!(might_hold(&reader, &cache, 2, b"dddd"));
-        assert!(
-            might_hold(&reader, &cache, 1, b"zzzz"),
-            "it holds the family, which is all its entries say"
-        );
-        assert!(might_hold(&reader, &cache, 2, b"aaaa"));
-        assert!(!might_hold(&reader, &cache, 3, b"aaaa"));
-        // A prefix too short for a caller-key entry is still asked of it.
-        assert!(!might_hold(&reader, &cache, 3, b"aa"));
+        for (name, form) in [
+            ("engine.sst", PrefixForm::EngineKey),
+            ("caller.sst", PrefixForm::CallerKey),
+        ] {
+            let path = dir.path().join(name);
+            let reader = prefix_call::writing_form(form, || prefix_table(&path));
+            assert_eq!(reader.prefix_form(&cache).unwrap(), Some(form));
+            assert!(might_hold(&reader, &cache, 1, b"aaaa"));
+            assert!(might_hold(&reader, &cache, 1, b"zzzz"));
+            assert!(might_hold(&reader, &cache, 3, b"aaaa"));
+        }
     }
 
     /// With an extractor that carves nothing out of any key, the table's
