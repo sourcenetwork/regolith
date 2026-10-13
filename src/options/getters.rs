@@ -62,6 +62,7 @@ copy_getters! {
     get_fifo_compaction_options => fifo_compaction_options: FifoCompactionOptions,
     get_universal_compaction_options => universal_compaction_options: UniversalCompactionOptions,
     get_max_background_compactions => max_background_compactions: usize,
+    get_log_writeback => log_writeback: bool,
     get_max_subcompactions => max_subcompactions: usize,
     get_evict_compaction_data_from_page_cache => evict_compaction_data_from_page_cache: bool,
     get_partitioned_index => partitioned_index: bool,
@@ -261,6 +262,8 @@ mod tests {
             } => |o| o.get_universal_compaction_options().size_ratio == 5,
             max_background_compactions: |o| o.max_background_compactions(4)
                 => |o| o.get_max_background_compactions() == 4,
+            log_writeback: |o| o.log_writeback(true)
+                => |o| o.get_log_writeback(),
             // The default follows the target's worker count, so the row
             // sets the other answer, whichever that is.
             inline_compaction: |o| o.inline_compaction(DEFAULT_MAX_BACKGROUND_COMPACTIONS > 0)

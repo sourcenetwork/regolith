@@ -20,8 +20,12 @@ pub(crate) struct Recording {
     /// `sync`.
     pub log: Vec<String>,
     /// Everything `log` holds, plus every rename and directory sync, in
-    /// the order they happened: `rename <to>` and `sync dir`.
+    /// the order they happened: `rename <to>` and `sync dir`; every log
+    /// created and removed: `create <name>` and `remove <name>`; and every
+    /// writeback started: `writeback <offset> <len>`.
     pub ops: Vec<String>,
+    /// The name of every thread spawned, in order.
+    pub spawned: Vec<String>,
 }
 
 #[derive(Debug, Default)]
@@ -117,6 +121,21 @@ impl LogFile for RecordingLog {
     fn set_len(&self, len: u64) -> io::Result<()> {
         self.inner.set_len(len)
     }
+
+    fn start_writeback(&self, offset: u64, len: u64) {
+        self.events
+            .lock()
+            .unwrap()
+            .ops
+            .push(format!("writeback {offset} {len}"));
+        self.inner.start_writeback(offset, len);
+    }
+}
+
+fn file_name(path: &Path) -> String {
+    path.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default()
 }
 
 fn is_wal(path: &Path) -> bool {
@@ -143,6 +162,13 @@ impl Env for RecordingEnv {
         if !is_wal(path) {
             return Ok(inner);
         }
+        if mode == WriteMode::Truncate {
+            self.events
+                .lock()
+                .unwrap()
+                .ops
+                .push(format!("create {}", file_name(path)));
+        }
         Ok(Box::new(RecordingLog {
             inner,
             events: Arc::clone(&self.events),
@@ -161,6 +187,13 @@ impl Env for RecordingEnv {
         self.inner.metadata(path)
     }
     fn remove_file(&self, path: &Path) -> io::Result<()> {
+        if is_wal(path) {
+            self.events
+                .lock()
+                .unwrap()
+                .ops
+                .push(format!("remove {}", file_name(path)));
+        }
         self.inner.remove_file(path)
     }
     fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
@@ -196,6 +229,7 @@ impl Env for RecordingEnv {
         name: &str,
         body: Box<dyn FnOnce() + Send + 'static>,
     ) -> io::Result<Box<dyn JoinHandle>> {
+        self.events.lock().unwrap().spawned.push(name.to_string());
         self.inner.spawn(name, body)
     }
 }

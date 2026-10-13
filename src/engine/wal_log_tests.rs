@@ -12,9 +12,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use proptest::prelude::*;
 use tempfile::TempDir;
 
+use super::super::recovery_tests::RecordingEnv;
 use super::super::seal::{Keyring, test_keys};
 use super::super::wal::{Wal, WalEntry, encode_put_record, fault};
-use super::super::wal_frame::KIND_GROUP;
+use super::super::wal_frame::{HEADER_LEN, KIND_GROUP};
 use super::super::wal_replay::{WalPosition, WalReplayIter};
 use super::{Log, Place};
 use crate::env::{Env, MemEnv, std_env};
@@ -300,6 +301,187 @@ fn a_closed_log_replays_whole_and_is_vouched_for_by_close() {
             assert!(replay(&home.env, &path, keyring.as_deref()).is_err());
         }
     }
+}
+
+/// A log through the recording Env, in a `wal/` directory of `dir`, and the
+/// record of what the host saw, cleared once the log exists.
+fn recorded_log(dir: &TempDir) -> (Log, Arc<RecordingEnv>, PathBuf) {
+    let wal_dir = dir.path().join("wal");
+    std::fs::create_dir_all(&wal_dir).unwrap();
+    let recording = Arc::new(RecordingEnv::default());
+    let env: Arc<dyn Env> = recording.clone();
+    let path = wal_dir.join("wal_000001.log");
+    let log = Log::create_in(&env, &path, None).unwrap();
+    *recording.events.lock().unwrap() = Default::default();
+    (log, recording, path)
+}
+
+/// A close that finds no record syncs once, after CLOSE: the one sync
+/// covers the stamp and CLOSE together (`WalRecovery.tla`, the torn stamp
+/// row), and the log replays as cleanly closed.
+// Counts the host's syncs on the file system, which miri cannot sync.
+#[cfg_attr(miri, ignore)]
+#[test]
+fn a_close_with_no_record_syncs_once_after_close() {
+    let dir = TempDir::new().unwrap();
+    let (log, recording, path) = recorded_log(&dir);
+    log.close(log.stamp_len()).unwrap();
+    assert_eq!(
+        recording.events.lock().unwrap().log,
+        vec![format!("write {HEADER_LEN}"), "sync".to_string()],
+        "CLOSE, then one sync"
+    );
+    assert_eq!(log.durable(), log.stamp_len() + HEADER_LEN as u64);
+    let env: Arc<dyn Env> = recording.clone();
+    assert!(replay(&env, &path, None).unwrap().is_empty());
+}
+
+/// RED `CloseWithoutSync`: a record no sync covered is synced before CLOSE
+/// is written, so a crash cannot keep CLOSE and lose the record.
+// Counts the host's syncs on the file system, which miri cannot sync.
+#[cfg_attr(miri, ignore)]
+#[test]
+fn a_close_after_an_unsynced_record_syncs_it_before_close() {
+    let dir = TempDir::new().unwrap();
+    let (log, recording, _) = recorded_log(&dir);
+    let (place, record) = put_record(&log, log.stamp_len(), b"k", b"v", 1);
+    log.write_record(&place, &record).unwrap();
+    log.close(place.end()).unwrap();
+    assert_eq!(
+        recording.events.lock().unwrap().log,
+        vec![
+            format!("write {}", record.len()),
+            "sync".to_string(),
+            format!("write {HEADER_LEN}"),
+            "sync".to_string()
+        ],
+        "the record synced, then CLOSE, then a sync"
+    );
+}
+
+/// A close after a sync that already covered every record skips the
+/// first sync too: nothing before CLOSE is left unsynced.
+// Counts the host's syncs on the file system, which miri cannot sync.
+#[cfg_attr(miri, ignore)]
+#[test]
+fn a_close_after_every_record_is_synced_syncs_once() {
+    let dir = TempDir::new().unwrap();
+    let (log, recording, _) = recorded_log(&dir);
+    let (place, record) = put_record(&log, log.stamp_len(), b"k", b"v", 1);
+    log.write_record(&place, &record).unwrap();
+    log.sync_through(place.end()).unwrap();
+    log.close(place.end()).unwrap();
+    assert_eq!(
+        recording.events.lock().unwrap().log,
+        vec![
+            format!("write {}", record.len()),
+            "sync".to_string(),
+            format!("write {HEADER_LEN}"),
+            "sync".to_string()
+        ],
+        "the record's own sync, then CLOSE and one sync"
+    );
+}
+
+/// Each record that passes a multiple of the early writeback's size kicks
+/// once, and the lane's call hands over exactly the multiples passed since
+/// its last call, never a byte a record has not passed.
+// Records the host's writeback calls on the file system, which miri cannot
+// reach.
+#[cfg_attr(miri, ignore)]
+#[test]
+fn early_writeback_hands_over_the_multiples_records_passed() {
+    let dir = TempDir::new().unwrap();
+    let wal_dir = dir.path().join("wal");
+    std::fs::create_dir_all(&wal_dir).unwrap();
+    let recording = Arc::new(RecordingEnv::default());
+    let env: Arc<dyn Env> = recording.clone();
+    let kicks = Arc::new(AtomicU64::new(0));
+    let counted = Arc::clone(&kicks);
+    let early = super::EarlyWriteback::new(
+        4096,
+        Arc::new(move || {
+            counted.fetch_add(1, Ordering::SeqCst);
+        }),
+    );
+    let log = Log::create_in(&env, &wal_dir.join("wal_000001.log"), None)
+        .unwrap()
+        .with_early_writeback(Some(early));
+    let mut at = log.stamp_len();
+    let mut write = |len: usize| {
+        let (place, record) = put_record(&log, at, b"k", &vec![7u8; len], 1);
+        log.write_record(&place, &record).unwrap();
+        at = place.end();
+    };
+    // Below the first multiple: no kick, nothing to hand over.
+    write(1000);
+    log.write_back_ahead();
+    assert_eq!(kicks.load(Ordering::SeqCst), 0);
+    // One record passes 4096 and 8192 at once: one kick, two multiples.
+    write(9000);
+    assert_eq!(kicks.load(Ordering::SeqCst), 1);
+    log.write_back_ahead();
+    // A record that passes nothing changes nothing.
+    write(10);
+    log.write_back_ahead();
+    // The next one passes 12288.
+    write(4000);
+    assert_eq!(kicks.load(Ordering::SeqCst), 2);
+    log.write_back_ahead();
+    let handed: Vec<String> = recording
+        .events
+        .lock()
+        .unwrap()
+        .ops
+        .iter()
+        .filter(|o| o.starts_with("writeback"))
+        .cloned()
+        .collect();
+    assert_eq!(handed, ["writeback 0 8192", "writeback 8192 4096"]);
+    assert_eq!(log.handed(), 12288);
+}
+
+/// A batch of records written in one call under the write claim, as the
+/// write stage writes them, kicks once when it passes a multiple of the
+/// early writeback's size, and the lane's call hands over every multiple it
+/// passed.
+#[test]
+fn a_batched_write_past_a_multiple_kicks_once() {
+    let env: Arc<dyn Env> = Arc::new(MemEnv::new());
+    env.create_dir_all(Path::new("wal")).unwrap();
+    let kicks = Arc::new(AtomicU64::new(0));
+    let counted = Arc::clone(&kicks);
+    let early = super::EarlyWriteback::new(
+        4096,
+        Arc::new(move || {
+            counted.fetch_add(1, Ordering::SeqCst);
+        }),
+    );
+    let log = Log::create_in(&env, Path::new("wal/wal_000001.log"), None)
+        .unwrap()
+        .with_early_writeback(Some(early));
+    // Three records framed one after the other into one buffer, past 4096
+    // and 8192.
+    let mut at = log.stamp_len();
+    let mut batch = Vec::new();
+    for seq in 1..=3u64 {
+        let (place, record) = put_record(&log, at, b"k", &[7u8; 3000], seq);
+        batch.extend_from_slice(&record);
+        at = place.end();
+    }
+    let flight = log.count_in(log.epoch(), true).unwrap();
+    assert!(flight.claimed());
+    flight.write_at(log.stamp_len(), &batch).unwrap();
+    drop(flight);
+    assert_eq!(kicks.load(Ordering::SeqCst), 1, "one batch, one kick");
+    log.write_back_ahead();
+    assert_eq!(log.handed(), 8192);
+    // A batch that passes no multiple kicks nothing.
+    let (place, record) = put_record(&log, at, b"k", b"v", 4);
+    let flight = log.count_in(log.epoch(), true).unwrap();
+    flight.write_at(place.offset, &record).unwrap();
+    drop(flight);
+    assert_eq!(kicks.load(Ordering::SeqCst), 1);
 }
 
 /// One step of a writer: which record it writes.

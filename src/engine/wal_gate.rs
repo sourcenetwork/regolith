@@ -32,8 +32,9 @@
 //! on a range of the log once a sync that covers the range has begun.
 //! Putting synced bytes back in flight, even the very same bytes, would let
 //! a power cut take commits that were durable. The pipeline writes one
-//! record from two threads when the first is slow (the courtesy in
-//! `commit::pipeline`), so a late copy of a record is the case to rule out.
+//! record from two threads when a claim's holder is slow to reach it (a
+//! copy, `commit::write_stage`), so a late copy of a record is the case to
+//! rule out.
 //!
 //! So a write also counts in on one of two sides, the one the gate names
 //! when it enters, and then looks again at whether its record is written
@@ -63,6 +64,27 @@
 //!   turning again behind newer writes, and syncs no further than that
 //!   prefix. Only the holder of the pipeline's round turns or settles the
 //!   gate, so one turn is outstanding at most.
+//!
+//! # The write claim (WG6)
+//!
+//! Writes of one file are put one after another by the host whatever the
+//! caller does: a positional write takes the file's lock, and a second
+//! writer spins or sleeps on it. So the log's records reach it one batch at
+//! a time (`commit::write_stage`): a write that counts in may take the
+//! log's write claim in the same read-modify-write of the side word, and
+//! the claim is let go in the one that counts it out. The holder gathers
+//! the records waiting to be written after it counted in, so it looks at
+//! each record after its count in, exactly as a single write looks at its
+//! own (WG4).
+//!
+//! - **WG6, one claim, let go with the count out.** The claim is a bit of
+//!   the side word, set only by a count in that finds it clear and cleared
+//!   only by the count out of the write that set it. A writer that finds it
+//!   set and parks counts itself among the claim's waiters, in the same
+//!   word, before it looks at the claim a last time; the count out that
+//!   lets the claim go reads that count in its own read-modify-write. One of
+//!   the two sees the other: the waiter finds the claim free and takes it,
+//!   or the holder sees a waiter and wakes the next writer in line.
 
 use std::task::{Poll, Waker};
 
@@ -77,9 +99,17 @@ const WRITERS: u64 = (1 << WRITER_BITS) - 1;
 /// The bit of the side word that names the side a write counts in on now.
 const SIDE_BIT: u32 = 63;
 /// Bits of the side word that count the writes in flight of one side: the
-/// low side's from bit 0, the high side's above them.
-const SIDE_BITS: u32 = 31;
+/// low side's from bit 0, the high side's above them. As many as the epoch
+/// word counts writes in flight with.
+const SIDE_BITS: u32 = WRITER_BITS;
 const SIDE_COUNT: u64 = (1 << SIDE_BITS) - 1;
+/// The bit of the side word that is the log's write claim (WG6).
+const CLAIM: u64 = 1 << 62;
+/// Writers parked until the claim is let go: a count from this bit up to
+/// the claim's.
+const WAITER_SHIFT: u32 = 2 * SIDE_BITS;
+const ONE_WAITER: u64 = 1 << WAITER_SHIFT;
+const WAITERS: u64 = CLAIM - ONE_WAITER;
 
 /// The side a write counting in on `sides` now joins: 0 or 1.
 fn current(sides: u64) -> u64 {
@@ -101,6 +131,15 @@ fn one_on(side: u64) -> u64 {
 pub(crate) struct Entry {
     epoch: u64,
     side: u64,
+    /// This write took the log's write claim when it counted in (WG6).
+    claimed: bool,
+}
+
+impl Entry {
+    /// Whether this write holds the log's write claim.
+    pub(crate) fn claimed(&self) -> bool {
+        self.claimed
+    }
 }
 
 /// See the module docs.
@@ -140,6 +179,16 @@ impl Gate {
     /// The caller looks at whether its record is written already only after
     /// this returns, and writes nothing when it is (WG4).
     pub(crate) fn enter(&self, epoch: u64) -> Option<Entry> {
+        self.count_in(epoch, false)
+    }
+
+    /// [`Self::enter`], taking the log's write claim with the count in when
+    /// nobody holds it ([`Entry::claimed`], WG6).
+    pub(crate) fn enter_claiming(&self, epoch: u64) -> Option<Entry> {
+        self.count_in(epoch, true)
+    }
+
+    fn count_in(&self, epoch: u64, claim: bool) -> Option<Entry> {
         let mut word = self.word.load(Ordering::SeqCst);
         loop {
             if word >> WRITER_BITS != epoch {
@@ -160,29 +209,67 @@ impl Gate {
             }
         }
         let mut sides = self.sides.load(Ordering::SeqCst);
-        let side = loop {
+        let (side, claimed) = loop {
             let side = current(sides);
             debug_assert!(
                 on_side(sides, side) < SIDE_COUNT,
                 "more writes in flight than a side counts"
             );
+            let claimed = claim && sides & CLAIM == 0;
+            let taken = if claimed { CLAIM } else { 0 };
             match self.sides.compare_exchange_weak(
                 sides,
-                sides + one_on(side),
+                (sides + one_on(side)) | taken,
                 Ordering::SeqCst,
                 Ordering::SeqCst,
             ) {
-                Ok(_) => break side,
+                Ok(_) => break (side, claimed),
                 Err(now) => sides = now,
             }
         };
         // WG4 needs no fence here: see `settle`.
-        Some(Entry { epoch, side })
+        Some(Entry {
+            epoch,
+            side,
+            claimed,
+        })
     }
 
-    /// Count out a write that [`Self::enter`] let in.
-    pub(crate) fn leave(&self, entry: Entry) {
-        let sides = self.sides.fetch_sub(one_on(entry.side), Ordering::SeqCst) - one_on(entry.side);
+    /// Whether a write holds the log's write claim now.
+    pub(crate) fn is_claimed(&self) -> bool {
+        self.sides.load(Ordering::SeqCst) & CLAIM != 0
+    }
+
+    /// Count a writer that is about to park among the claim's waiters. `false`
+    /// when the claim is free by now: the caller is not counted, and takes
+    /// the claim instead of parking (WG6). The caller registered where it
+    /// is woken before this.
+    pub(crate) fn wait_for_claim(&self) -> bool {
+        let before = self.sides.fetch_add(ONE_WAITER, Ordering::SeqCst);
+        debug_assert!(
+            before & WAITERS < WAITERS,
+            "more parked writers than the gate counts"
+        );
+        if before & CLAIM == 0 {
+            self.sides.fetch_sub(ONE_WAITER, Ordering::SeqCst);
+            return false;
+        }
+        true
+    }
+
+    /// Count a parked writer out of the claim's waiters, once it woke.
+    pub(crate) fn unwait(&self) {
+        self.sides.fetch_sub(ONE_WAITER, Ordering::SeqCst);
+    }
+
+    /// Count out a write that [`Self::enter`] let in, and let its claim go
+    /// with it. The writers parked on the claim when it was let go: the
+    /// caller wakes the next one in line (WG6). Zero for a write that held
+    /// no claim.
+    pub(crate) fn leave(&self, entry: Entry) -> u64 {
+        let out = one_on(entry.side) + if entry.claimed { CLAIM } else { 0 };
+        let before = self.sides.fetch_sub(out, Ordering::SeqCst);
+        let sides = before - out;
         // The last write of a side a sync turned away from: the sync goes on
         // (WG4).
         let drained = on_side(sides, entry.side) == 0 && current(sides) != entry.side;
@@ -195,6 +282,11 @@ impl Gate {
             // sees the other.
             fence(Ordering::SeqCst);
             self.cleared.wake();
+        }
+        if entry.claimed {
+            (before & WAITERS) >> WAITER_SHIFT
+        } else {
+            0
         }
     }
 

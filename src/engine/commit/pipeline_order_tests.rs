@@ -215,8 +215,9 @@ fn a_record_written_ahead_of_an_unwritten_one_is_not_recovered() {
         engine.help_decide(pipe, second_index, Help::Wait, None),
         Turn::Done
     ));
-    // Only the second commit's record is written: a hole lies before it.
-    engine.write_slot(&second);
+    // Only the second commit's record is written: a hole lies before it. A
+    // copy, which writes its one record; a batch would begin with the first.
+    engine.write_copy(&second);
     assert_eq!(engine.snapshot_seq(), base, "neither commit is published");
 
     let cut = TempDir::new().unwrap();
@@ -514,7 +515,7 @@ proptest! {
                                         done.lock().push(Done { snapshot, writes, txn: true, seq: None });
                                         continue;
                                     }
-                                    EarlyVerdict::Marks(early) => WriteRequest::Txn(TxnRequest {
+                                    EarlyVerdict::Marks(early) => WriteRequest::Txn(Box::new(TxnRequest {
                                         checks,
                                         ops,
                                         appends: Vec::new(),
@@ -522,7 +523,7 @@ proptest! {
                                         perf: crate::PerfLevel::Disable,
                                         early,
                                         read_queue: None,
-                                    }),
+                                    })),
                                 }
                             } else {
                                 WriteRequest::Batch { ops, durability, disable_wal: false }

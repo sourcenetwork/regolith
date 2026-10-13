@@ -29,7 +29,11 @@ Init ==
   \* Nothing is in the log.
   /\ wr       = [i \in Slots |-> FALSE]
   \* No write is in flight.
-  /\ fly      = [a \in Actors |-> 0]
+  /\ fly      = [a \in Actors |-> {}]
+  \* Nobody holds the write claim.
+  /\ claim    = 0
+  \* Nobody is parked on a write.
+  /\ asleep   = {}
   \* Nothing was thrown out.
   /\ failed   = [i \in Slots |-> FALSE]
   \* No record belongs to a log yet.
@@ -96,7 +100,7 @@ Begin(a) ==
   \* It is open.
   /\ pc'   = [pc EXCEPT ![a] = "open"]
   \* Nothing else changes.
-  /\ UNCHANGED <<fly, ringVars, decVars, ap, wr, failed, dto, tipVars, epochVars, durable, pub, visible,
+  /\ UNCHANGED <<flyVars, ringVars, decVars, ap, wr, failed, dto, tipVars, epochVars, durable, pub, visible,
                  claimVars, failVars, hor, mine, seen, stopped>>
 
 \* Transaction a asks to commit, and its own early check finds that
@@ -110,7 +114,7 @@ EarlyAbort(a) ==
   \* Its call returns with the conflict.
   /\ pc' = [pc EXCEPT ![a] = "aborted"]
   \* Nothing else changes.
-  /\ UNCHANGED <<fly, ringVars, decVars, ap, wr, failed, dto, tipVars, epochVars, durable, pub, visible,
+  /\ UNCHANGED <<flyVars, ringVars, decVars, ap, wr, failed, dto, tipVars, epochVars, durable, pub, visible,
                  claimVars, failVars, snap, hor, mine, seen, stopped>>
 
 \* Thread a pulls the next ticket: one add on the tail. A transaction
@@ -148,7 +152,7 @@ Reserve(a) ==
      \* It now has to write its order down.
      /\ pc'    = [pc EXCEPT ![a] = "claimed"]
      \* Nothing else changes.
-     /\ UNCHANGED <<fly, decVars, ap, wr, failed, dto, tipVars, epochVars, durable, pub, visible,
+     /\ UNCHANGED <<flyVars, decVars, ap, wr, failed, dto, tipVars, epochVars, durable, pub, visible,
                     claimVars, failVars, seen, stopped>>
 
 \* Thread a writes its order into its cell: the compare-and-swap wins.
@@ -162,7 +166,7 @@ Fill(a) ==
   \* From now on the thread helps.
   /\ pc'   = [pc EXCEPT ![a] = "ready"]
   \* Nothing else changes.
-  /\ UNCHANGED <<fly, tail, owner, decVars, ap, wr, failed, dto, tipVars, epochVars, durable, pub,
+  /\ UNCHANGED <<flyVars, tail, owner, decVars, ap, wr, failed, dto, tipVars, epochVars, durable, pub,
                  visible, claimVars, failVars, snap, hor, mine, seen, stopped>>
 
 \* Thread a finds its ticket was thrown away: it must pull another one.
@@ -174,7 +178,7 @@ Retry(a) ==
   \* Back to the ticket machine, with the same snapshot.
   /\ pc' = [pc EXCEPT ![a] = "begun"]
   \* Nothing else changes.
-  /\ UNCHANGED <<fly, ringVars, decVars, ap, wr, failed, dto, tipVars, epochVars, durable, pub, visible,
+  /\ UNCHANGED <<flyVars, ringVars, decVars, ap, wr, failed, dto, tipVars, epochVars, durable, pub, visible,
                  claimVars, failVars, snap, hor, mine, seen, stopped>>
 
 \* Helper a reaches the next ticket in line and finds no order on it: its
@@ -202,7 +206,7 @@ Void(a) ==
      \* The line moves past it.
      /\ dto'  = i
      \* Nothing else changes.
-     /\ UNCHANGED <<fly, tail, owner, decVars, ap, wr, failed, tipVars, epochVars, durable, pub, visible,
+     /\ UNCHANGED <<flyVars, tail, owner, decVars, ap, wr, failed, tipVars, epochVars, durable, pub, visible,
                     claimVars, failVars, threadVars>>
 
 \* Thread a looks at the next order in line and notes down the tip: the
@@ -220,7 +224,7 @@ ReadTip(a) ==
   \* It notes the ticket, the last sequence, the epoch and the memtable.
   /\ seen' = [seen EXCEPT ![a] = <<DecideSlot(a), tipNext, epoch, memGen>>]
   \* Nothing else changes.
-  /\ UNCHANGED <<fly, ringVars, decVars, ap, wr, failed, dto, tipVars, epochVars, durable, pub,
+  /\ UNCHANGED <<flyVars, ringVars, decVars, ap, wr, failed, dto, tipVars, epochVars, durable, pub,
                  visible, claimVars, failVars, pc, snap, hor, mine, stopped>>
 
 \* Thread a writes the verdict it worked out from its note, with one
@@ -258,7 +262,7 @@ DecideCas(a) ==
      \* compare-and-swap, which changes nothing.
      /\ seen' = [b \in Actors |-> IF seen[b][1] = i THEN NoNote ELSE seen[b]]
      \* Nothing else changes.
-     /\ UNCHANGED <<fly, ringVars, ap, wr, failed, dto, tipVars, epochVars, durable, pub, visible,
+     /\ UNCHANGED <<flyVars, ringVars, ap, wr, failed, dto, tipVars, epochVars, durable, pub, visible,
                     claimVars, failVars, pc, snap, hor, mine, stopped>>
 
 \* Thread a decides the next order in one go, when no rollback can fall
@@ -295,7 +299,7 @@ DecideNow(a) ==
      \* is used up: its compare-and-swap would lose.
      /\ seen'    = [b \in Actors |-> IF seen[b][1] = i THEN NoNote ELSE seen[b]]
      \* Nothing else changes.
-     /\ UNCHANGED <<fly, ringVars, wr, failed, epochVars, durable, pub, visible, claimVars, failVars,
+     /\ UNCHANGED <<flyVars, ringVars, wr, failed, epochVars, durable, pub, visible, claimVars, failVars,
                     pc, snap, hor, mine, stopped>>
 
 \* Thread a puts order i's writes into the memtable its verdict names.
@@ -319,7 +323,7 @@ Apply(a, i) ==
   \* The writes are in the memtable the verdict names.
   /\ ap' = [ap EXCEPT ![i] = TRUE]
   \* Nothing else changes.
-  /\ UNCHANGED <<fly, ringVars, decVars, wr, failed, dto, tipVars, epochVars, durable, pub, visible,
+  /\ UNCHANGED <<flyVars, ringVars, decVars, wr, failed, dto, tipVars, epochVars, durable, pub, visible,
                  claimVars, failVars, threadVars>>
 
 \* Thread a moves the tip to the next order's verdict: from now on the
@@ -348,7 +352,7 @@ TipMove(a) ==
      \* ...and a commit that brought writes is charged to the memtable.
      /\ tipUsed' = IF Brings(i) THEN tipUsed + 1 ELSE tipUsed
      \* Nothing else changes.
-     /\ UNCHANGED <<fly, ringVars, decVars, ap, wr, failed, dto, epochVars, durable, pub, visible,
+     /\ UNCHANGED <<flyVars, ringVars, decVars, ap, wr, failed, dto, epochVars, durable, pub, visible,
                     claimVars, failVars, threadVars>>
 
 \* Thread a finds the next order's verdict came from a state a rollback
@@ -374,7 +378,7 @@ MarkStale(a) ==
      \* The order is thrown out.
      /\ failed' = [failed EXCEPT ![i] = TRUE]
      \* Nothing else changes.
-     /\ UNCHANGED <<fly, ringVars, decVars, ap, wr, dto, tipVars, epochVars, durable, pub, visible,
+     /\ UNCHANGED <<flyVars, ringVars, decVars, ap, wr, dto, tipVars, epochVars, durable, pub, visible,
                     claimVars, failVars, threadVars>>
 
 \* Thread a moves the line past the next order: it is settled, either as
@@ -395,7 +399,7 @@ Pass(a) ==
      \* The line moves past it.
      /\ dto' = i
      \* Nothing else changes.
-     /\ UNCHANGED <<fly, ringVars, decVars, ap, wr, failed, tipVars, epochVars, durable, pub, visible,
+     /\ UNCHANGED <<flyVars, ringVars, decVars, ap, wr, failed, tipVars, epochVars, durable, pub, visible,
                     claimVars, failVars, threadVars>>
 
 \* Order i's record may be written by thread a. A thread writes its own
@@ -425,7 +429,7 @@ Write(a, i) ==
   \* The record is in the log.
   /\ wr' = [wr EXCEPT ![i] = TRUE]
   \* Nothing else changes.
-  /\ UNCHANGED <<fly, ringVars, decVars, ap, failed, dto, tipVars, epochVars, durable, pub, visible,
+  /\ UNCHANGED <<flyVars, ringVars, decVars, ap, failed, dto, tipVars, epochVars, durable, pub, visible,
                  claimVars, failVars, threadVars>>
 
 \* With copies, the first of a write's two steps: thread a counts in at the
@@ -436,26 +440,114 @@ WriteStart(a, i) ==
   \* Writes take two steps in this run.
   /\ Copies
   \* The thread has no other write in flight.
-  /\ fly[a] = 0
+  /\ fly[a] = {}
   \* The record may be written, and is not written yet (the look again).
   /\ CanWrite(a, i)
-  \* Its write is in flight.
-  /\ fly' = [fly EXCEPT ![a] = i]
+  \* Its write is in flight: one record, written as a copy, without the claim.
+  /\ fly' = [fly EXCEPT ![a] = {i}]
   \* Nothing else changes.
-  /\ UNCHANGED <<ringVars, decVars, ap, wr, failed, dto, tipVars, epochVars, durable, pub, visible,
-                 claimVars, failVars, threadVars>>
+  /\ UNCHANGED <<claim, asleep, ringVars, decVars, ap, wr, failed, dto, tipVars, epochVars, durable,
+                 pub, visible, claimVars, failVars, threadVars>>
 
-\* The second step: thread a's write lands, and the record is in the log,
-\* whoever's copy got there first.
+\* Order j's record may go into a batch: it is a commit with a record, not
+\* thrown out, placed in the log's current epoch, and not written yet when
+\* the batch looks, which is after its count in (W2, WG4). Mutant
+\* BatchNoRecheck takes a record that is written already: the batch looked
+\* before its count in, and a sync began in between.
+Usable(j) == Brings(j) /\ ~failed[j] /\ ep[j] = logEp /\ (~wr[j] \/ Mutant = "BatchNoRecheck")
+
+\* The batch that starts at order f: every settled order from f on whose
+\* record may go in, as long as no record between f and it may not (W1: a
+\* batch is one contiguous run; a written record in the middle ends it).
+\* Orders with no record (an abort, a thrown-away ticket) take no bytes and
+\* do not end it.
+Gather(f) == {j \in f..dto : Usable(j) /\ \A k \in f..j : Brings(k) => Usable(k)}
+
+\* With copies, thread a takes the log's write claim in the step that counts
+\* its write in (WG6), and gathers a batch: from the first settled order
+\* past the published frontier whose record may be written, every record
+\* after it in one run. The batch may hold records of orders after the
+\* thread's own: one batch past its own at most (P5). Tiny example: orders
+\* 1 and 2 are decided and neither record is written; thread 2 writes both
+\* with one write while thread 1 sleeps until its record is in.
+BatchStart(a) ==
+  \* Writes take two steps in this run, and nobody holds the claim.
+  /\ Copies /\ claim = 0
+  \* The thread has no write in flight, and a record it may write now.
+  /\ fly[a] = {} /\ \E i \in Slots : CanWrite(a, i)
+  \* The first record that may go in a batch...
+  /\ LET firsts == {j \in (pub + 1)..dto : Usable(j)}
+     \* ...exists, and the batch starts there.
+     IN /\ firsts # {}
+        \* The batch is in flight...
+        /\ fly'   = [fly EXCEPT ![a] = Gather(Min(firsts))]
+        \* ...and the claim is the thread's.
+        /\ claim' = a
+  \* Nothing else changes.
+  /\ UNCHANGED <<asleep, ringVars, decVars, ap, wr, failed, dto, tipVars, epochVars, durable, pub,
+                 visible, claimVars, failVars, threadVars>>
+
+\* Thread a needs its own record written, finds the claim held by another
+\* thread whose batch holds that record, and parks: the record's write is
+\* device I/O under way. A record the batch does not hold, the thread
+\* writes itself after a short wait (write_stage.rs), which the model takes
+\* as no park at all: a wait that ends by itself changes nothing. Mutant
+\* ParkUncovered parks on a record the batch does not hold, with nothing to
+\* end the wait but that record being written.
+Park(a) ==
+  \* Writes take two steps in this run; the thread is helping, holds
+  \* neither the round nor a unit, and has no write in flight.
+  /\ Copies /\ Helping(a) /\ a \notin round /\ claimant # a /\ fly[a] = {}
+  \* Another thread holds the claim.
+  /\ claim # 0 /\ claim # a
+  \* Its own record is settled and not written.
+  /\ Brings(mine[a]) /\ ~wr[mine[a]] /\ mine[a] <= dto
+  \* The batch under way holds it (the broken version does not look).
+  /\ IF Mutant = "ParkUncovered" THEN TRUE ELSE mine[a] \in fly[claim]
+  \* The thread sleeps.
+  /\ asleep' = asleep \cup {a}
+  \* Nothing else changes.
+  /\ UNCHANGED <<fly, claim, ringVars, decVars, ap, wr, failed, dto, tipVars, epochVars, durable,
+                 pub, visible, claimVars, failVars, threadVars>>
+
+\* Thread a wakes: its record is written (the batch marked it, which wakes
+\* whoever sleeps on it), or its order was thrown out. In the design it also
+\* wakes when the claim is let go or the batch does not hold its record (the
+\* hand-on and the end of the short wait); the broken version waits only
+\* for its record.
+Wake(a) ==
+  \* It sleeps, and has not walked away.
+  /\ a \in asleep /\ Live(a)
+  \* Its record is in, or its order is gone, or (in the design) the claim
+  \* is free or its record is not in the batch. An IF, not an or: TLC tries
+  \* every branch of an or in a step, and fly[0] is no value.
+  /\ IF wr[mine[a]] \/ failed[mine[a]] THEN TRUE
+     \* The broken version waits for nothing else.
+     ELSE IF Mutant = "ParkUncovered" THEN FALSE
+     \* The claim was let go: the hand-on wakes the next writer.
+     ELSE IF claim = 0 THEN TRUE
+     \* The batch does not hold its record: the short wait ends.
+     ELSE mine[a] \notin fly[claim]
+  \* It is awake.
+  /\ asleep' = asleep \ {a}
+  \* Nothing else changes.
+  /\ UNCHANGED <<fly, claim, ringVars, decVars, ap, wr, failed, dto, tipVars, epochVars, durable,
+                 pub, visible, claimVars, failVars, threadVars>>
+
+\* The second step: thread a's write lands, and its records are in the
+\* log, whoever's copy got there first. They are marked written before the
+\* count out (W3), and the count out lets the claim go.
 WriteLand(a) ==
   \* The thread has a write in flight.
-  /\ fly[a] # 0
-  \* The record is in the log.
-  /\ wr'  = [wr EXCEPT ![fly[a]] = TRUE]
+  /\ fly[a] # {}
+  \* Every record of it is in the log.
+  /\ wr'    = [j \in Slots |-> wr[j] \/ j \in fly[a]]
   \* The write is over.
-  /\ fly' = [fly EXCEPT ![a] = 0]
+  /\ fly'   = [fly EXCEPT ![a] = {}]
+  \* A batch lets the claim go with its count out.
+  /\ claim' = IF claim = a THEN 0 ELSE claim
   \* Nothing else changes.
-  /\ UNCHANGED <<ringVars, decVars, ap, failed, dto, tipVars, epochVars, durable, pub, visible,
+  /\ UNCHANGED <<asleep, ringVars, decVars, ap, failed, dto, tipVars, epochVars, durable, pub, visible,
                  claimVars, failVars, threadVars>>
 
 \* Thread a writes order i's record and the device says no: the log is
@@ -470,7 +562,7 @@ WriteFail(a, i) ==
   \* One more failure happened.
   /\ fails'    = fails + 1
   \* Nothing else changes: the record is not in the log.
-  /\ UNCHANGED <<fly, ringVars, decVars, ap, wr, failed, dto, tipVars, epochVars, durable, pub, visible,
+  /\ UNCHANGED <<flyVars, ringVars, decVars, ap, wr, failed, dto, tipVars, epochVars, durable, pub, visible,
                  claimVars, rbLast, frozen, threadVars>>
 
 \* Thread a has a reason to claim the round: the next order to finish is a
@@ -502,7 +594,7 @@ ClaimRound(a) ==
   \* Now it does.
   /\ round' = round \cup {a}
   \* Nothing else changes.
-  /\ UNCHANGED <<fly, ringVars, decVars, ap, wr, failed, dto, tipVars, epochVars, durable, pub, visible,
+  /\ UNCHANGED <<flyVars, ringVars, decVars, ap, wr, failed, dto, tipVars, epochVars, durable, pub, visible,
                  target, claimant, failVars, threadVars>>
 
 \* The round's holder starts the sync: it works out how far the log is
@@ -519,11 +611,11 @@ SyncBegin(a) ==
   \* or: TLC tries every branch of an or in a step, the order of one too.
   /\ \/ Mutant = "SyncNoWait"
      \* The real code.
-     \/ \A b \in Actors : IF fly[b] = 0 THEN TRUE ELSE sq[fly[b]] > SyncTarget
+     \/ \A b \in Actors : \A j \in fly[b] : sq[j] > SyncTarget
   \* It notes how far it will vouch.
   /\ target' = [target EXCEPT ![a] = SyncTarget]
   \* Nothing else changes.
-  /\ UNCHANGED <<fly, ringVars, decVars, ap, wr, failed, dto, tipVars, epochVars, durable, pub, visible,
+  /\ UNCHANGED <<flyVars, ringVars, decVars, ap, wr, failed, dto, tipVars, epochVars, durable, pub, visible,
                  round, claimant, failVars, threadVars>>
 
 \* The sync returns: what the holder noted is safe now. The round is free
@@ -538,7 +630,7 @@ SyncOk(a) ==
   \* The round is given up, or kept for the rollback.
   /\ round'   = IF poisoned THEN round ELSE round \ {a}
   \* Nothing else changes.
-  /\ UNCHANGED <<fly, ringVars, decVars, ap, wr, failed, dto, tipVars, epochVars, pub, visible, claimant,
+  /\ UNCHANGED <<flyVars, ringVars, decVars, ap, wr, failed, dto, tipVars, epochVars, pub, visible, claimant,
                  failVars, threadVars>>
 
 \* The sync returns and the device says no. The log is poisoned; the
@@ -555,7 +647,7 @@ SyncFail(a) ==
   \* The sync is over, and vouched for nothing.
   /\ target'   = [target EXCEPT ![a] = 0]
   \* Nothing else changes.
-  /\ UNCHANGED <<fly, ringVars, decVars, ap, wr, failed, dto, tipVars, epochVars, durable, pub, visible,
+  /\ UNCHANGED <<flyVars, ringVars, decVars, ap, wr, failed, dto, tipVars, epochVars, durable, pub, visible,
                  round, claimant, rbLast, frozen, threadVars>>
 
 \* The round's holder finds nothing to do and lets the round go. In the
@@ -572,7 +664,7 @@ RoundIdle(a) ==
   \* The round is given up.
   /\ round' = round \ {a}
   \* Nothing else changes.
-  /\ UNCHANGED <<fly, ringVars, decVars, ap, wr, failed, dto, tipVars, epochVars, durable, pub, visible,
+  /\ UNCHANGED <<flyVars, ringVars, decVars, ap, wr, failed, dto, tipVars, epochVars, durable, pub, visible,
                  target, claimant, failVars, threadVars>>
 
 \* The rollback's first step, by the round's holder: both frontiers stop
@@ -593,7 +685,7 @@ RbFreeze(a) ==
   \* The last ticket of the old state, kept as one more than it.
   /\ rbLast' = Covered + 1
   \* Nothing else changes.
-  /\ UNCHANGED <<fly, ringVars, decVars, ap, wr, failed, dto, tipVars, logEp, memGen, gen, durable, pub,
+  /\ UNCHANGED <<flyVars, ringVars, decVars, ap, wr, failed, dto, tipVars, logEp, memGen, gen, durable, pub,
                  visible, claimVars, poisoned, fails, threadVars>>
 
 \* The rollback's second step: finish what can be finished, throw out the
@@ -622,7 +714,7 @@ RbFinish(a) ==
      \* ...and its rollback is under way.
      /\ rbLast # 0
      \* The writes in flight have landed: it cuts the log only after (WG2).
-     /\ \A b \in Actors : fly[b] = 0
+     /\ \A b \in Actors : fly[b] = {}
      \* The publishable orders are finished here: readers see them.
      /\ visible' = Max({visible, SeqUpTo(upto)})
      \* The rest are thrown out.
@@ -658,7 +750,7 @@ RbFinish(a) ==
      \* The round is given up.
      /\ round'   = round \ {a}
      \* Nothing else changes.
-     /\ UNCHANGED <<fly, ringVars, dec, sq, ep, logOf, ap, tipUsed, epoch, gen, durable, target,
+     /\ UNCHANGED <<flyVars, ringVars, dec, sq, ep, logOf, ap, tipUsed, epoch, gen, durable, target,
                     claimant, fails, snap, hor, mine, seen, stopped>>
 
 \* Thread a raises the read horizon to the next order's sequence: the
@@ -681,7 +773,7 @@ PubHorizon(a) ==
      \* Readers now see it.
      /\ visible' = sq[p]
      \* Nothing else changes.
-     /\ UNCHANGED <<fly, ringVars, decVars, ap, wr, failed, dto, tipVars, epochVars, durable, pub,
+     /\ UNCHANGED <<flyVars, ringVars, decVars, ap, wr, failed, dto, tipVars, epochVars, durable, pub,
                     claimVars, failVars, threadVars>>
 
 \* Thread a moves the published frontier past the next order: the second
@@ -716,7 +808,7 @@ PubFrontier(a) ==
                 \* Nobody is waiting on it here: no thread is told.
                 ELSE pc
      \* Nothing else changes.
-     /\ UNCHANGED <<fly, ringVars, decVars, ap, wr, failed, dto, tipVars, epochVars, durable,
+     /\ UNCHANGED <<flyVars, ringVars, decVars, ap, wr, failed, dto, tipVars, epochVars, durable,
                     claimVars, failVars, snap, hor, mine, seen, stopped>>
 
 \* Mutant OutOfOrder only: the horizon jumps to a later order that happens
@@ -735,7 +827,7 @@ PublishAny(a, i) ==
   \* The horizon jumps to it.
   /\ visible' = sq[i]
   \* Nothing else changes.
-  /\ UNCHANGED <<fly, ringVars, decVars, ap, wr, failed, dto, tipVars, epochVars, durable, pub,
+  /\ UNCHANGED <<flyVars, ringVars, decVars, ap, wr, failed, dto, tipVars, epochVars, durable, pub,
                  claimVars, failVars, threadVars>>
 
 \* Thread a claims the job at the next ticket: an ordered unit, or the
@@ -754,7 +846,7 @@ ClaimNext(a) ==
   \* The job is this thread's.
   /\ claimant' = a
   \* Nothing else changes.
-  /\ UNCHANGED <<fly, ringVars, decVars, ap, wr, failed, dto, tipVars, epochVars, durable, pub, visible,
+  /\ UNCHANGED <<flyVars, ringVars, decVars, ap, wr, failed, dto, tipVars, epochVars, durable, pub, visible,
                  round, target, failVars, threadVars>>
 
 \* The claimant can run its job: everything before the ticket is finished,
@@ -769,7 +861,7 @@ CanRunNext(a) ==
   /\ round = {}
   \* No write is in flight: the job syncs the log, and waited for those
   \* first (WG4).
-  /\ \A b \in Actors : fly[b] = 0
+  /\ \A b \in Actors : fly[b] = {}
   \* The pipeline is drained up to the ticket.
   /\ Drained(dto + 1)
 
@@ -808,7 +900,7 @@ UnitRun(a) ==
      \* The job is done.
      /\ claimant' = 0
      \* Nothing else changes.
-     /\ UNCHANGED <<fly, ringVars, wr, failed, tipUsed, epochVars, pub, visible, round, target, failVars,
+     /\ UNCHANGED <<flyVars, ringVars, wr, failed, tipUsed, epochVars, pub, visible, round, target, failVars,
                     threadVars>>
 
 \* The claimant runs the rotation check in the turn of the write at the
@@ -829,7 +921,7 @@ TurnRun(a) ==
   \* The job is done.
   /\ claimant' = 0
   \* Nothing else changes: the write itself is decided next.
-  /\ UNCHANGED <<fly, ringVars, decVars, ap, wr, failed, dto, tipIdx, tipNext, epoch, logEp, memGen, pub,
+  /\ UNCHANGED <<flyVars, ringVars, decVars, ap, wr, failed, dto, tipIdx, tipNext, epoch, logEp, memGen, pub,
                  visible, round, target, failVars, threadVars>>
 
 \* Any one step of a thread that has not walked away.
@@ -852,6 +944,8 @@ LiveStep(a) ==
      \/ \E i \in Slots : Apply(a, i) \/ Write(a, i) \/ WriteFail(a, i) \/ PublishAny(a, i)
      \* With copies, a write in two steps: counted in for an order, then landed.
      \/ \E i \in Slots : WriteStart(a, i)
+     \* A batch under the write claim, and a park on it and the wake.
+     \/ BatchStart(a) \/ Park(a) \/ Wake(a)
      \* The landing.
      \/ WriteLand(a)
 
@@ -872,11 +966,11 @@ Stop(a) ==
   /\ ((a \notin round /\ claimant # a) \/ Mutant = "StopHoldsClaim")
   \* It has no write in flight: those bytes are with the host, which
   \* finishes the write whatever the thread does next.
-  /\ fly[a] = 0
+  /\ fly[a] = {}
   \* It is gone.
   /\ stopped' = stopped \cup {a}
   \* Nothing else changes.
-  /\ UNCHANGED <<fly, ringVars, decVars, ap, wr, failed, dto, tipVars, epochVars, durable, pub, visible,
+  /\ UNCHANGED <<flyVars, ringVars, decVars, ap, wr, failed, dto, tipVars, epochVars, durable, pub, visible,
                  claimVars, failVars, pc, snap, hor, mine, seen>>
 
 \* A step of some thread that is still here.

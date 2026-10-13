@@ -11,6 +11,8 @@ pub(crate) mod bloom;
 mod buried_range_deletes;
 pub(crate) mod callback;
 pub(crate) mod checksum;
+#[cfg(test)]
+mod close_in_place_tests;
 pub(crate) mod commit;
 pub(crate) mod compaction;
 #[cfg(not(target_arch = "wasm32"))]
@@ -32,6 +34,14 @@ pub(crate) mod internal_key;
 pub(crate) mod io;
 pub(crate) mod iterator;
 pub(crate) mod log_retirement;
+// The log writeback lane exists only where the host has the writeback hint
+// it starts (`LogFile::start_writeback`).
+#[cfg(target_os = "linux")]
+mod log_writeback;
+#[cfg(target_os = "linux")]
+type WritebackLane = log_writeback::LogWritebackLane;
+#[cfg(not(target_os = "linux"))]
+type WritebackLane = std::convert::Infallible;
 pub(crate) mod lookup_key;
 #[cfg(loom)]
 pub mod loom_model;
@@ -374,6 +384,10 @@ pub(crate) struct EngineOptions {
     pub(crate) universal_compaction_options: crate::options::UniversalCompactionOptions,
     pub(crate) evict_compaction_data_from_page_cache: bool,
     pub(crate) max_background_compactions: usize,
+    /// See [`crate::Options::log_writeback`]. Read on Linux alone, the one
+    /// host with the writeback hint.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) log_writeback: bool,
     /// See [`crate::Options::inline_compaction`].
     pub(crate) inline_compaction: bool,
     pub(crate) partitioned_index: bool,
@@ -482,6 +496,7 @@ impl Default for EngineOptions {
             universal_compaction_options: crate::options::UniversalCompactionOptions::default(),
             evict_compaction_data_from_page_cache: false,
             max_background_compactions: 1,
+            log_writeback: false,
             inline_compaction: false,
             partitioned_index: false,
             metadata_block_size: 4096,
@@ -611,6 +626,10 @@ pub(crate) struct RegolithEngine {
     /// A job running what is owed waits on some thread's queue: no second
     /// one is left until it ran.
     owed_queued: AtomicBool,
+    /// The thread that hands the active log to the host's writeback as it
+    /// fills, ahead of its seal, when [`crate::Options::log_writeback`] is on
+    /// and background threads run on Linux (`log_writeback.rs`).
+    log_writeback: Option<WritebackLane>,
     /// Where the disk check looks.
     disk_dir: PathBuf,
     /// Tables this open moved out of overlapping levels (`recovery.rs`).
@@ -716,7 +735,6 @@ impl RegolithEngine {
         // From here on the log is written by position, by whichever thread
         // reaches a decided commit (`wal_log`).
         let (log, log_end) = wal.into_log()?;
-        let log = Arc::new(log);
 
         let versions = Arc::new(VersionStore::new(version_set));
         let view = Arc::new(ReadViewCell::new(ReadView {
@@ -821,6 +839,22 @@ impl RegolithEngine {
             move || flusher.flush_all_frozen()
         }));
 
+        // When the caller asked for it and background threads run, the
+        // active log is handed to the host's writeback as it fills, on a
+        // thread of its own (E46, `Options::log_writeback`). Off by default:
+        // the thread is one more than the compaction threads plan 3.13 and
+        // 4.5 promise. Only Linux has the hint (`LogFile::start_writeback`);
+        // elsewhere the thread would have nothing to start.
+        #[cfg(target_os = "linux")]
+        let log_writeback = if has_worker && options.log_writeback {
+            Some(log_writeback::LogWritebackLane::start(&*env)?)
+        } else {
+            None
+        };
+        #[cfg(not(target_os = "linux"))]
+        let log_writeback: Option<WritebackLane> = None;
+        let early =
+            background_step::early_writeback(log_writeback.as_ref(), options.write_buffer_size);
         let engine = Arc::new_cyclic(|me| Self {
             me: me.clone(),
             view,
@@ -842,6 +876,7 @@ impl RegolithEngine {
             has_worker,
             owed: AtomicU8::new(owed),
             owed_queued: AtomicBool::new(false),
+            log_writeback,
             disk_dir: db_dir.to_path_buf(),
             tables_demoted_at_open,
             range_deletes_copied_at_open: copied,
@@ -852,7 +887,7 @@ impl RegolithEngine {
                 commit::commit_ring_capacity(),
                 commit::After {
                     next_seq: latest_seq + 1,
-                    log,
+                    log: Arc::new(log.with_early_writeback(early)),
                     next_off: log_end,
                     mem_used: memtable.approximate_size(),
                     memtable,
@@ -871,6 +906,16 @@ impl RegolithEngine {
             env,
             _db_lock: db_lock,
         });
+
+        #[cfg(target_os = "linux")]
+        if let Some(lane) = &engine.log_writeback {
+            let me = engine.me.clone();
+            lane.set_hook(Box::new(move || {
+                if let Some(engine) = me.upgrade() {
+                    engine.write_back_log_ahead();
+                }
+            }));
+        }
 
         // Arm write back-pressure before the first write. A database
         // reopened with L0 already past its stop trigger would
@@ -1019,6 +1064,7 @@ impl RegolithEngine {
             has_worker: false,
             owed: AtomicU8::new(0),
             owed_queued: AtomicBool::new(false),
+            log_writeback: None,
             disk_dir: db_dir.to_path_buf(),
             tables_demoted_at_open,
             range_deletes_copied_at_open: copied,
@@ -3169,7 +3215,10 @@ impl RegolithEngine {
         // The sequence goes on from where it was: a commit published before
         // the drop may still be raising the read horizon to its own
         // sequence, which a horizon set back to zero would then jump to.
-        ord.replace(fresh, Arc::new(new_log));
+        ord.replace(
+            fresh,
+            Arc::new(new_log.with_early_writeback(self.early_writeback())),
+        );
         self.wal_id.store(wal_id, Ordering::Release);
 
         self.versions
@@ -3289,6 +3338,17 @@ impl RegolithEngine {
                 Ok(())
             }
             Err(err) => {
+                // Commits go on in a log of their own: one the close sealed
+                // in place is synced and followed by a fresh one first. If
+                // that fails too the database is latched, so no commit lands
+                // in a log a flush removes.
+                if self.pipeline.is_some()
+                    && let Err(reopen) =
+                        self.ordered(|engine, ord| ord.reopen_log(engine.is_latched()))
+                {
+                    tracing::error!(error = %reopen, "taking writes again after a failed close failed");
+                    self.latch_wal_failure(&reopen);
+                }
                 // Reads through queues work again on the database the failed
                 // close left open, and lock waits queue again.
                 self.cache.reopen_io();
@@ -3312,28 +3372,25 @@ impl RegolithEngine {
         // would vouch for them: replay would then refuse the crash it should
         // survive. Such a log is left for recovery to judge. Checked in the
         // ordered step, where a failing commit latches.
-        self.ordered(|engine, ord| {
-            let latched = engine.is_latched();
-            ord.close_log(latched).inspect_err(|err| {
-                if !latched {
-                    tracing::error!(error = %err, "closing the write-ahead log failed");
-                    engine.latch_wal_failure(err);
-                }
-            })
-        })?;
+        self.ordered(|engine, ord| ord.close_log(engine.is_latched()))?;
         // Stop and join regolith's threads. A worker waiting for the
         // compaction gate exits once whoever holds the gate lets go: a job on
         // another worker when it ends, a queue's job that was handed the
         // gate while it was parked when the sweep above settled it. Then a
         // foreground job the workers never ran fails with `Closed`, and its
-        // ticket is told.
+        // ticket is told. The log is closed, so the lane has nothing left to
+        // hand over.
         self.compaction.shutdown();
+        #[cfg(target_os = "linux")]
+        if let Some(lane) = &self.log_writeback {
+            lane.shutdown();
+        }
 
         Ok(())
     }
 
     fn flush_memtables_for_close(&self) -> std::io::Result<()> {
-        self.drain_memtables(ActiveFlush::WhenFull)
+        self.drain_memtables(ActiveFlush::ForClose)
     }
 
     /// Rewrite the manifest now, the way growth does on its own.

@@ -59,18 +59,46 @@ use std::sync::Weak;
 use std::task::Waker;
 
 use super::RegolithEngine;
+use super::WritebackLane;
 use super::background_health::{Hazard, Job};
 use super::callback::InBackground;
 use super::commit::{Help, Needs};
 use super::compaction::CompactionOutcome;
 use super::io::job::{Job as IoJob, JobBody, Step};
 use super::io::shared::QueueShared;
+use super::wal_log::EarlyWriteback;
 use crate::portability::Ordering;
 
 /// Owed: one bounded step of flush or compaction.
 pub(super) const OWED_STEP: u8 = 0b01;
 /// Owed: the disk check a database with no worker runs once after open.
 pub(super) const OWED_DISK_CHECK: u8 = 0b10;
+
+/// The early writeback of the logs an engine creates, when the lane runs
+/// (E46, `log_writeback.rs`): each time the active log grows by an eighth of the
+/// write buffer, the lane hands what was written to the host's writeback, so
+/// the rotation that seals the log syncs about that much at most, inside the
+/// ordered step where every writer waits, instead of the whole log. Never
+/// less than a MiB at a time, so a small buffer is not handed over in
+/// slivers. None without the lane.
+#[cfg(target_os = "linux")]
+pub(super) fn early_writeback(
+    lane: Option<&WritebackLane>,
+    write_buffer_size: usize,
+) -> Option<EarlyWriteback> {
+    let lane = lane?;
+    let every = (write_buffer_size as u64 / 8).max(1 << 20);
+    Some(EarlyWriteback::new(every, lane.kicker()))
+}
+
+/// No lane, so no early writeback: the seal syncs the log whole.
+#[cfg(not(target_os = "linux"))]
+pub(super) fn early_writeback(
+    _lane: Option<&WritebackLane>,
+    _write_buffer_size: usize,
+) -> Option<EarlyWriteback> {
+    None
+}
 
 impl RegolithEngine {
     /// Hand the memtable a writer just sealed to whoever flushes it: the
@@ -93,6 +121,21 @@ impl RegolithEngine {
             self.compaction.notify();
         } else {
             self.owe(OWED_STEP);
+        }
+    }
+
+    /// The early writeback for a log this engine creates
+    /// ([`early_writeback`]).
+    pub(super) fn early_writeback(&self) -> Option<EarlyWriteback> {
+        early_writeback(self.log_writeback.as_ref(), self.options.write_buffer_size)
+    }
+
+    /// Hand what the active log's records passed to the host's writeback:
+    /// what a kick of the lane runs.
+    #[cfg(target_os = "linux")]
+    pub(super) fn write_back_log_ahead(&self) {
+        if let Some(tip) = self.pipeline_state() {
+            tip.after.log.write_back_ahead();
         }
     }
 

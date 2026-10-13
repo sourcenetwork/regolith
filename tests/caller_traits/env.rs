@@ -165,6 +165,11 @@ impl LogFile for Log {
         self.1.note("LogFile::set_len");
         self.0.set_len(len)
     }
+
+    fn start_writeback(&self, offset: u64, len: u64) {
+        self.1.note("LogFile::start_writeback");
+        self.0.start_writeback(offset, len);
+    }
 }
 
 /// The directory lock: the trait has no method, so what is recorded is that
@@ -377,7 +382,7 @@ impl Env for DefaultLog<'_> {
 
 /// Every method of the five traits, and the drop of the lock, which is all
 /// a `FileLock` does.
-const EVERY_METHOD: [&str; 37] = [
+const EVERY_METHOD: [&str; 38] = [
     "Env::create_dir_all",
     "Env::read_dir",
     "Env::open_read",
@@ -413,6 +418,7 @@ const EVERY_METHOD: [&str; 37] = [
     "LogFile::write_all_at",
     "LogFile::sync_data",
     "LogFile::set_len",
+    "LogFile::start_writeback",
     "FileLock dropped",
     "JoinHandle::join",
 ];
@@ -505,6 +511,33 @@ fn live_a_whole_life(env: &Arc<Recording>, dir: &Path) {
     let db = Db::open_read_only(&db_dir, options()).unwrap();
     assert_eq!(db.get(&key(0)).unwrap(), Some(b"first".to_vec()));
     drop(db);
+
+    // The log writeback lane, asked for (`Options::log_writeback`): on Linux,
+    // with a worker, the log is handed to the environment's log as it grows
+    // past each eighth of the write buffer, here each MiB. The lane runs on
+    // a thread of its own, so the call is waited for.
+    let db = Db::open(
+        dir.join("lane"),
+        options().write_buffer_size(8 << 20).log_writeback(true),
+    )
+    .unwrap();
+    let value = vec![9u8; 256 * 1024];
+    for i in 0..6 {
+        db.put(&key(i), value.as_slice()).unwrap();
+    }
+    if cfg!(target_os = "linux") {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        let mut pause = std::time::Duration::from_micros(50);
+        while calls.count("LogFile::start_writeback") == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the lane handed nothing over in 20 s"
+            );
+            std::thread::sleep(pause);
+            pause = (pause * 2).min(std::time::Duration::from_millis(20));
+        }
+    }
+    db.close().unwrap();
 }
 
 /// An environment recording into fresh `Calls`, allowed the paths under
@@ -550,6 +583,10 @@ fn a_database_calls_every_method_of_its_environment_under_its_own_directories() 
     // file it writes: only the default log asks (the test below).
     let mut expected: BTreeSet<&str> = NO_CALLER.into_iter().collect();
     expected.insert("WriteFile::len");
+    // The log writeback lane runs on Linux alone, the one host with the hint.
+    if !cfg!(target_os = "linux") {
+        expected.insert("LogFile::start_writeback");
+    }
     assert_eq!(never_called(calls), expected);
     let outside = calls.outside.lock().unwrap();
     assert!(
@@ -577,10 +614,12 @@ fn the_default_log_serves_a_database_through_open_write() {
     live_a_whole_life(&env, dir.path());
     let calls = &env.calls;
 
-    assert_eq!(
-        never_called(calls),
-        NO_CALLER.into_iter().collect::<BTreeSet<&str>>()
-    );
+    // The log writeback lane runs on Linux alone, the one host with the hint.
+    let mut expected: BTreeSet<&str> = NO_CALLER.into_iter().collect();
+    if !cfg!(target_os = "linux") {
+        expected.insert("LogFile::start_writeback");
+    }
+    assert_eq!(never_called(calls), expected);
     let outside = calls.outside.lock().unwrap();
     assert!(
         outside.is_empty(),

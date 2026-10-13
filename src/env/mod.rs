@@ -479,6 +479,18 @@ pub trait LogFile: Send + Sync {
 
     /// Cut the file to exactly `len` bytes.
     fn set_len(&self, len: u64) -> io::Result<()>;
+
+    /// Start writing the `len` bytes at `offset`, all written already, back
+    /// to the device, and return without waiting for them: a hint that
+    /// leaves less for the next [`sync_data`](LogFile::sync_data) to write.
+    ///
+    /// It makes nothing durable and reports nothing. An implementation
+    /// that cannot start the writeback does nothing, as the default does;
+    /// the bytes are then written by the next sync, which reports any
+    /// failure. The hint must not hide a failure from that sync.
+    fn start_writeback(&self, offset: u64, len: u64) {
+        let _ = (offset, len);
+    }
 }
 
 /// A held directory lock. The lock is released when this is dropped.
