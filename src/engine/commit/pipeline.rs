@@ -653,7 +653,9 @@ impl RegolithEngine {
         desc: &RingArc<Descriptor>,
         mut seen: Option<RingArc<Decision>>,
     ) {
-        let Some(decision) = desc.decision_arc() else {
+        // Borrowed: `desc` holds its decision for as long as it lives. A
+        // reference of its own is taken only for the tip.
+        let Some(decision) = desc.decision() else {
             return;
         };
         loop {
@@ -684,11 +686,14 @@ impl RegolithEngine {
                 if !desc.is(APPLIED) {
                     hook::at(hook::Stage::Apply);
                     let _perf = PerfTimer::new(PerfTimerField::WriteMemtable);
-                    ops_of(desc, &decision).apply(&decision.after.memtable, decision.base_seq);
+                    ops_of(desc, decision).apply(&decision.after.memtable, decision.base_seq);
                     desc.mark(APPLIED);
                 }
             }
-            if pipe.tip.replace(&tip, RingArc::clone(&decision)) {
+            let Some(next) = desc.decision_arc() else {
+                break;
+            };
+            if pipe.tip.replace(&tip, next) {
                 // The tip that was: this may be its last reference, and its
                 // allocation then serves this thread's next decision.
                 spare::keep_decision(tip);
