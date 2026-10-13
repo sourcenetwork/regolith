@@ -102,7 +102,20 @@
 \*               vouches for before it begins, and so does a unit before
 \*               it syncs, since a sector in flight when the power goes may
 \*               come back garbled whatever was being written to it
-\*               (wal_gate.rs, WG4; NoWriteUnderSync).
+\*               (wal_gate.rs, WG4; NoWriteUnderSync). In the code this is
+\*               the copy a call that may not wait writes
+\*               (write_stage.rs, write_copy).
+\*   BatchStart, Park, Wake
+\*               write_stage.rs: the host puts the writes of one file one
+\*               after another, so the records go in batches. A thread
+\*               takes the log's write claim in the step that counts its
+\*               write in (WG6), gathers every settled record not written
+\*               yet, in one run from the first, and writes them with one
+\*               write (WriteLand lands it and lets the claim go). A
+\*               blocking writer whose record the batch holds sleeps until
+\*               it is written (OneClaim, NoWriteUnderSync, and
+\*               NoLiveThreadBlocked with the sleepers; RED BatchNoRecheck
+\*               and ParkUncovered).
 \*   ClaimRound, SyncBegin, SyncOk, SyncFail
 \*               round.rs: the round is one claim on the log's device step.
 \*               Whoever claims it syncs the written prefix.
@@ -272,8 +285,12 @@ TypeOK ==
   /\ pc \in [Actors -> {"idle", "open", "begun", "claimed", "ready", "done", "failed", "aborted"}]
   \* The stopped are threads.
   /\ stopped \subseteq Actors
-  \* A write in flight is of an order, or there is none.
-  /\ fly \in [Actors -> 0..MaxSlots]
+  \* The writes in flight are sets of orders.
+  /\ fly \in [Actors -> SUBSET Slots]
+  \* The write claim is a thread's, or nobody's.
+  /\ claim \in Actors \cup {0}
+  \* The sleepers are threads.
+  /\ asleep \subseteq Actors
   \* A cell is free exactly when its ticket has not been handed out.
   /\ \A i \in Slots : (i <= tail) <=> cell[i] # "free"
 
@@ -459,12 +476,21 @@ NoLiveThreadBlocked ==
 \* models in src/engine/loom_model/park.rs and the tests under the fault
 \* shim in src/engine/commit/late_copy_tests.rs; it has no Lean statement.
 NoWriteUnderSync ==
-  \* Every write in flight...
-  \A b \in Actors : fly[b] # 0 =>
-     \* ...is of a record no completed sync made durable...
-     /\ sq[fly[b]] > durable
+  \* Every record of every write in flight, a copy or a batch...
+  \A b \in Actors : \A j \in fly[b] :
+     \* ...is one no completed sync made durable...
+     /\ sq[j] > durable
      \* ...and no sync under way vouches for.
-     /\ \A a \in round : target[a] = 0 \/ sq[fly[b]] > target[a]
+     /\ \A a \in round : target[a] = 0 \/ sq[j] > target[a]
+
+\* WG6: only the claim's holder has a batch, and the holder's write is in
+\* flight: the claim is let go with the count out, never while a batch is
+\* still on its way.
+OneClaim ==
+  \* Whoever holds the claim has its batch in flight.
+  /\ claim # 0 => fly[claim] # {}
+  \* Nobody else has more than one record in flight.
+  /\ \A b \in Actors : b # claim => Cardinality(fly[b]) <= 1
 
 \* The run's ticket bound never stops a live thread, so nothing above is an
 \* artefact of the bound.
@@ -501,7 +527,15 @@ NoEarlyAbort == \A a \in Actors : pc[a] # "aborted"
 
 \* "No two threads ever have one record's write in flight." Broken once a
 \* helper's copy is on its way beside the owner's.
-NoTwoCopies == \A a, b \in Actors : a # b /\ fly[a] # 0 => fly[a] # fly[b]
+NoTwoCopies == \A a, b \in Actors : a # b => fly[a] \cap fly[b] = {}
+
+\* "No batch ever holds two records." Broken once a batch writes two
+\* records with one write.
+NoBatchOfTwo == \A a \in Actors : Cardinality(fly[a]) <= 1
+
+\* "No thread ever parks on a write." Broken once a blocking writer sleeps
+\* until the batch under way writes its record.
+NeverAsleep == asleep = {}
 
 ----------------------------------------------------------------------------
 \* Liveness: what eventually happens.

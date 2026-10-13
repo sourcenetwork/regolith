@@ -43,6 +43,21 @@ every stage. B never waits for A.
 6. `held_round_blocks`: the one exception, stated and proved. A thread that
    stops while it holds the round stops the commits that wait for the
    sync, which is why the pipeline treats the holder as doing device I/O.
+7. `batch_step_counts`, `batch_never_goes_back`: the write stage writes
+   records in batches (`src/engine/commit/write_stage.rs`): one step of one
+   thread takes the write step of several slots at once. That step moves
+   every slot it writes exactly one stage on and no slot back, and leaves
+   exactly as many steps fewer as it wrote records. So the safety half of
+   lock-freedom stands with batches: a batch is many helper steps taken
+   together, and the count of steps left only falls.
+
+The rule that changed: a thread now writes the records up to its own and
+at most one batch past it, bounded in bytes (P5 in `pipeline.rs`, W4 in
+`write_stage.rs`); `helping_is_bounded` bounds the steps for the slots up to
+its own, and the batch past it adds one step. A blocking writer whose record
+is in a batch under way waits for that batch as for device I/O, like the
+round (`held_round_blocks`); one whose record is not in it writes the record
+itself after a short wait, which is a helper step.
 
 What stays in TLA+: that the interleavings of several threads keep
 finishing slots (the liveness half). TLC checks it for two and three
@@ -666,6 +681,104 @@ theorem held_round_blocks (before : List Cell) : ¬ Enabled false before .sync :
   have := h.2.2 rfl
   -- `false = true` is absurd.
   exact Bool.noConfusion this
+
+/-! ## The write stage in batches -/
+
+/-- What a batch does to one slot: a slot whose next step is the write
+moves past it, and any other slot is left as it is. -/
+def writeOne (c : Cell) : Cell :=
+  -- Look at the slot's next step.
+  match next c with
+  -- Its write: it moves to the stage after.
+  | some (.write, st) => ⟨c.kind, st⟩
+  -- Anything else: the batch does not touch it.
+  | _ => c
+
+/-- One batch over a list of slots: every slot whose next step is the write
+is written, in one step of one thread. (A real batch writes one contiguous
+run of them; proving it for all of them at once covers every run.) -/
+def batchStep : List Cell → List Cell
+  -- No slot, nothing written.
+  | [] => []
+  -- The first slot as the batch leaves it, then the rest.
+  | c :: rest => writeOne c :: batchStep rest
+
+/-- One for a slot whose next step is the write, else none. -/
+def writes (c : Cell) : Nat :=
+  -- Look at the slot's next step.
+  match next c with
+  -- Its write: one record.
+  | some (.write, _) => 1
+  -- Anything else: none.
+  | _ => 0
+
+/-- How many records a batch over the list writes. -/
+def writable : List Cell → Nat
+  -- No slot, no record.
+  | [] => 0
+  -- The first slot's, then the rest's.
+  | c :: rest => writes c + writable rest
+
+/-- One slot under a batch: its steps left fall by one when it was written
+and stay the same otherwise, and it stays well formed. -/
+theorem write_one_counts (c : Cell)
+    -- The slot's stage is one its kind passes through.
+    (hwf : WellFormed c) :
+    -- The claim itself; its proof follows.
+    todo (writeOne c) + writes c = todo c ∧ WellFormed (writeOne c) := by
+  -- Name the slot's kind and stage.
+  obtain ⟨k, s0⟩ := c
+  -- Every kind and stage, read off the tables (well formed, where it
+  -- matters, by the definition).
+  cases k <;> cases s0 <;> simp_all [writeOne, writes, next, todo, WellFormed]
+
+/-- **A batch counts every record it writes, once.** After one batch the
+slots need exactly as many steps fewer as the batch wrote records, and are
+all still well formed: many write steps taken as one, so the count of steps
+left, which one live thread alone brings to zero (`helper_alone_finishes`),
+only falls. -/
+theorem batch_step_counts (l : List Cell)
+    -- Every slot's stage is one its kind passes through.
+    (hwf : ∀ c ∈ l, WellFormed c) :
+    -- The claim itself; its proof follows.
+    total (batchStep l) + writable l = total l ∧ ∀ c ∈ batchStep l, WellFormed c := by
+  -- By induction on the slots.
+  induction l with
+  -- Case: the empty list.
+  | nil =>
+    -- Nothing to write, nothing to count.
+    simp [batchStep, writable, total]
+  -- Case: a first slot and the rest, the claim known for the rest (ih).
+  | cons c rest ih =>
+    -- The first slot under the batch.
+    obtain ⟨h1, hw1⟩ := write_one_counts c (hwf c List.mem_cons_self)
+    -- The rest under the batch, by induction.
+    obtain ⟨h2, hw2⟩ := ih (fun x hx => hwf x (List.mem_cons_of_mem _ hx))
+    -- Split the claim in two.
+    refine ⟨?_, ?_⟩
+    -- The count: unfold one level of each definition...
+    · simp only [batchStep, writable, total]
+      -- ...and add the two equations.
+      omega
+    -- Well formed: take any slot after the batch.
+    · intro x hx
+      -- It is the first slot or one of the rest.
+      simp only [batchStep, List.mem_cons] at hx
+      -- Look at which.
+      cases hx with
+      -- The first: by `write_one_counts`.
+      | inl h => exact h ▸ hw1
+      -- One of the rest: by induction.
+      | inr h => exact hw2 x h
+
+/-- **A batch moves no slot back.** Every slot a batch writes goes one
+stage on, and every other stays where it was: nobody's progress is undone,
+whoever holds the write claim. -/
+theorem batch_never_goes_back (c : Cell) : rank c.stage ≤ rank (writeOne c).stage := by
+  -- Name the slot's kind and stage.
+  obtain ⟨k, s0⟩ := c
+  -- Every kind and stage, read off the tables.
+  cases k <;> cases s0 <;> simp [writeOne, next, rank]
 
 -- The end of this file's names.
 end Regolith.PipelineHelping

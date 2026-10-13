@@ -1220,3 +1220,89 @@ pub fn a_settle_that_ignores_the_epoch_brings_a_discarded_state_back() {
         2,
     );
 }
+
+/// How a writer that finds the log's write claim held decides to park.
+#[derive(Clone, Copy)]
+enum ClaimWait {
+    /// The production order (`write_stage.rs`, WG6): counted among the
+    /// claim's waiters in the side word, reading the claim in the same step.
+    Counted,
+    /// Calibration: a load of the claim, then a park, counted nowhere.
+    Uncounted,
+}
+
+fn claim_handoff(name: &'static str, how: ClaimWait, min_witnesses: usize) {
+    use super::super::wal_gate::Gate;
+
+    explore_bounded(name, Some(3), 4, min_witnesses, move |witness| {
+        let gate = Arc::new(Gate::new());
+        // The holder counted its batch in and took the claim with it.
+        let held = gate.enter_claiming(0).expect("a write of epoch zero");
+        assert!(held.claimed(), "WG6: a free claim was not taken");
+        let holder = {
+            let gate = Arc::clone(&gate);
+            // The count out lets the claim go and reads the waiters in one
+            // step: more than none means the next writer in line is woken.
+            thread::spawn(move || gate.leave(held) > 0)
+        };
+        let waiter = {
+            let gate = Arc::clone(&gate);
+            thread::spawn(move || {
+                loop {
+                    if let Some(entry) = gate.enter_claiming(0) {
+                        let claimed = entry.claimed();
+                        gate.leave(entry);
+                        if claimed {
+                            // It took the claim: it never parked.
+                            return false;
+                        }
+                    }
+                    let parks = match how {
+                        ClaimWait::Counted => gate.wait_for_claim(),
+                        ClaimWait::Uncounted => gate.is_claimed(),
+                    };
+                    if parks {
+                        // It parks here, until it is woken.
+                        return true;
+                    }
+                }
+            })
+        };
+        let woke = holder.join().expect("holder");
+        let parked = waiter.join().expect("waiter");
+        if parked {
+            witness.record();
+            assert!(woke, "WG6: a writer parked on the claim is never woken");
+        }
+    });
+}
+
+/// WG6: a writer finds the log's write claim held and parks while the
+/// holder lets it go. The writer counts itself among the claim's waiters in
+/// the side word and reads the claim in the same read-modify-write; the
+/// holder reads the count in the one that lets the claim go. Of two
+/// read-modify-writes of one word the later sees the earlier: the writer
+/// finds the claim free and takes it, or the holder sees it waiting and
+/// wakes it. A writer that parks is always woken.
+///
+/// Bound: 3 preemptions.
+pub fn a_writer_parked_on_the_write_claim_is_woken_when_it_is_let_go() {
+    claim_handoff(
+        "a_writer_parked_on_the_write_claim_is_woken_when_it_is_let_go",
+        ClaimWait::Counted,
+        1,
+    );
+}
+
+/// Calibration for
+/// [`a_writer_parked_on_the_write_claim_is_woken_when_it_is_let_go`]: the
+/// writer loads the claim and parks without counting itself. The holder
+/// lets the claim go right after the load, sees no waiter, wakes nobody,
+/// and the writer stays parked.
+pub fn a_writer_that_parks_uncounted_on_the_claim_is_never_woken() {
+    claim_handoff(
+        "a_writer_that_parks_uncounted_on_the_claim_is_never_woken",
+        ClaimWait::Uncounted,
+        0,
+    );
+}

@@ -446,7 +446,7 @@ impl RegolithEngine {
                     // Every slot before the unit is published, and the unit
                     // takes nothing: the frontier passes it here, so the
                     // unit leaves nothing in the ring.
-                    let _ = self.publish_upto(pipe, index, None);
+                    let _ = self.publish_upto(pipe, index, None, help);
                     return Some(ticket.result.take().unwrap_or_else(|| Err(unfinished())));
                 }
             }
@@ -498,7 +498,7 @@ impl RegolithEngine {
     /// caller waits for; a poll parks, and `false` says so.
     fn drain_before(&self, pipe: &Pipeline, index: u64, help: Help<'_>) -> bool {
         loop {
-            match self.publish_upto(pipe, index - 1, None) {
+            match self.publish_upto(pipe, index - 1, None, help) {
                 Progress::Published => return true,
                 Progress::NeedsSync | Progress::Failed => {
                     if self.sync_round(pipe, help).is_err() {

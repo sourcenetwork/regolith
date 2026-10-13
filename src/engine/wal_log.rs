@@ -54,9 +54,7 @@ use std::sync::Arc;
 use super::seal::{Keyring, NONCE_LEN, OVERHEAD, Sealer};
 use super::take::Take;
 use super::wal_frame::{self, HEADER_LEN};
-#[cfg(test)]
-use super::wal_gate::Entry;
-use super::wal_gate::Gate;
+use super::wal_gate::{Entry, Gate};
 use super::wal_seal::{self, SEALED_PREFIX_LEN};
 use crate::env::{Env, LogFile, WriteMode};
 use crate::portability::{AtomicBool, AtomicU64, Ordering};
@@ -332,6 +330,41 @@ impl Log {
         wrote.map(|()| true)
     }
 
+    /// Count a write of records decided in `epoch` in at the gate, and take
+    /// the log's write claim with it when `claim` asks and nobody holds it
+    /// (`wal_gate.rs`, WG6). `None` when the gate has moved on: the records
+    /// are of discarded commits and are not written (WG1). The caller looks
+    /// at whether each record is written already only now, and writes none
+    /// that is (WG4).
+    pub(crate) fn count_in(&self, epoch: u64, claim: bool) -> Option<InFlight<'_>> {
+        let entry = if claim {
+            self.gate.enter_claiming(epoch)
+        } else {
+            self.gate.enter(epoch)
+        }?;
+        Some(InFlight {
+            log: self,
+            entry: Some(entry),
+        })
+    }
+
+    /// Whether a write holds the log's write claim now (WG6).
+    pub(crate) fn is_claimed(&self) -> bool {
+        self.gate.is_claimed()
+    }
+
+    /// Count a writer that is about to park among the waiters on the write
+    /// claim: `false` when the claim is free by now, and the caller is not
+    /// counted (WG6). [`Self::unwait`] counts it out once it woke.
+    pub(crate) fn wait_for_claim(&self) -> bool {
+        self.gate.wait_for_claim()
+    }
+
+    /// See [`Self::wait_for_claim`].
+    pub(crate) fn unwait(&self) {
+        self.gate.unwait();
+    }
+
     /// Wait until every write that may land below `through`, the end of
     /// records known written, has returned, and return the offset a sync may
     /// cover now: `through`, or less when a turn an earlier sync parked on
@@ -469,18 +502,9 @@ impl Log {
     /// epoch does while its bytes are on their way to the host, until the
     /// guard drops.
     #[cfg(test)]
-    pub(crate) fn write_in_flight(&self) -> impl Drop + '_ {
-        struct InFlight<'a>(&'a Gate, Entry);
-        impl Drop for InFlight<'_> {
-            fn drop(&mut self) {
-                self.0.leave(self.1);
-            }
-        }
-        let entry = self
-            .gate
-            .enter(self.gate.epoch())
-            .expect("a write of the current epoch is let in");
-        InFlight(&self.gate, entry)
+    pub(crate) fn write_in_flight(&self) -> InFlight<'_> {
+        self.count_in(self.gate.epoch(), false)
+            .expect("a write of the current epoch is let in")
     }
 
     /// Cut off the record at `offset`, which the calling thread alone
@@ -514,6 +538,44 @@ impl std::fmt::Debug for Log {
             .field("durable", &self.durable())
             .field("sealed", &self.seal.is_some())
             .finish_non_exhaustive()
+    }
+}
+
+/// A write counted in at the log's gate: its bytes may land until it is
+/// counted out, by [`InFlight::leave`] or, on unwind, by its drop, so a
+/// rollback or a sync never waits on a write whose thread has unwound.
+pub(crate) struct InFlight<'a> {
+    log: &'a Log,
+    entry: Option<Entry>,
+}
+
+impl InFlight<'_> {
+    /// Whether this write holds the log's write claim (WG6).
+    pub(crate) fn claimed(&self) -> bool {
+        self.entry.is_some_and(|entry| entry.claimed())
+    }
+
+    /// Write `bytes`, whole records built by [`Log::finish_record`], at
+    /// `offset`.
+    pub(crate) fn write_at(&self, offset: u64, bytes: &[u8]) -> io::Result<()> {
+        super::commit::hook::at(super::commit::hook::Stage::InWrite);
+        self.log.file.write_all_at(offset, bytes)
+    }
+
+    /// Count the write out, and let its claim go with it. The writers parked
+    /// on the claim when it was let go; zero when it held none.
+    pub(crate) fn leave(mut self) -> u64 {
+        self.entry
+            .take()
+            .map_or(0, |entry| self.log.gate.leave(entry))
+    }
+}
+
+impl Drop for InFlight<'_> {
+    fn drop(&mut self) {
+        if let Some(entry) = self.entry.take() {
+            self.log.gate.leave(entry);
+        }
     }
 }
 

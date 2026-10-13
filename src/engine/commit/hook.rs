@@ -20,6 +20,10 @@ pub(crate) enum Stage {
     /// Inside a record's write: counted in at the log's gate, the record
     /// not written by anyone yet, its bytes not yet with the host.
     InWrite,
+    /// A blocking call found the log's write claim held by another thread
+    /// and is about to park until the record it needs is written
+    /// (`write_stage.rs`).
+    WriteWait,
     /// Before a sync round is claimed.
     Sync,
     /// A sync about to wait for writes in flight below the prefix it syncs
