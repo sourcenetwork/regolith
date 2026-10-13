@@ -555,50 +555,69 @@ theorem promoted_read_skew :
   simp [applyWrites, applyWrite, upd, demo]
 
 
-/-- The read-only anomaly's deposit (Fekete, O'Neil and O'Neil 2004), decided
-on the state `σ` it read: balance B, key 2, put one higher. -/
-def deposit (σ : State) : List Write := [.put 2 (σ 2 + 1)]
+/-- The bank of the read-only anomaly (Fekete, O'Neil and O'Neil 2004), the
+worked example the TLA+ model, the Rust tests and the docs share: checking
+is key 1 and holds 30, savings is key 2 and holds 0 (absent). Built from
+`demo`, the small environment above, where every key starts absent. -/
+def bankStart : State := upd demo.init 1 30
 
-/-- The anomaly's withdrawal, decided on the state `σ` it read: balance A,
-key 1, put to A + B + 1, a value that tells which B it read. -/
-def withdrawal (σ : State) : List Write := [.put 1 (σ 1 + σ 2 + 1)]
+/-- The fee the withdrawal charges on the balances it saw in `σ`: 1 when
+their total is under 35, else 0. -/
+def fee (σ : State) : Nat := if σ 1 + σ 2 < 35 then 1 else 0
+
+/-- The withdrawal, decided on the state `σ` it read: checking, key 1, put
+to its balance less 25 and the fee. -/
+def withdrawal (σ : State) : List Write := [.put 1 (σ 1 - 25 - fee σ)]
+
+/-- The deposit, decided on the state `σ` it read: savings, key 2, put 20
+higher. -/
+def deposit (σ : State) : List Write := [.put 2 (σ 2 + 20)]
 
 /-- What the report reads: the state after the deposit alone, with the
 withdrawal not yet published. -/
-def afterDeposit : State := applyWrites demo demo.init (deposit demo.init)
+def afterDeposit : State := applyWrites demo bankStart (deposit bankStart)
 
-/-- **`read_only_anomaly` (E50).** The anomaly of Fekete, O'Neil and O'Neil
-(2004) with every balance starting at 0. The withdrawal reads (0, 0); the
-deposit commits B = 1; the report reads (0, 1); the withdrawal commits
-A = 1, decided on what it read, so the history ends at (1, 1). Run one at a
-time, deposit then withdrawal ends at A = 2, not the history's state;
-withdrawal then deposit ends at the history's state, through (0, 0), (1, 0)
-and (1, 1), none of which is the report's (0, 1). So a report that commits
-(0, 1) after the withdrawal claims a sheet no order of the three gives. The
-last line is why a report at RepeatableRead or Serializable is refused there:
-its check of A at the horizon, against the withdrawal's published write,
-fails (`MC_Serializable_Red_ReadOnlyAnomaly` plants the bug of skipping it). -/
+/-- The state after the withdrawal alone, run first on the starting state. -/
+def afterWithdrawal : State := applyWrites demo bankStart (withdrawal bankStart)
+
+/-- **`read_only_anomaly` (E50).** The worked example, in numbers. The
+withdrawal reads (30, 0), so it will charge the fee; the deposit commits
+savings = 20; the report reads (30, 20); the withdrawal commits checking =
+30 - 25 - 1 = 4, decided on what it read, so the history ends at (4, 20).
+
+Run one at a time, deposit then withdrawal ends at checking 5 (no fee: the
+withdrawal sees 50), not the history's state. Withdrawal then deposit ends
+at the history's state, passing through (30, 0), (4, 0) and (4, 20), none of
+which is the report's (30, 20). So a report that commits (30, 20) after the
+withdrawal claims a sheet no order of the three gives.
+
+The last line is why a report at RepeatableRead or Serializable is refused
+there: its check of checking (`.full 1`, key 1 checked by sequence),
+against the withdrawal's write, fails. `MC_Serializable_Red_ReadOnlyAnomaly`
+plants the bug of skipping that check, and
+`MC_Serializable_Red_ReadOnlyAnomalyPublishedOnly` the bug of counting only
+published writes while the withdrawal is decided and not yet visible. -/
 theorem read_only_anomaly :
-    -- The report reads A = 0 and B = 1;
-    (afterDeposit 1 = 0 ∧ afterDeposit 2 = 1) ∧
-      -- the history (the deposit, then the withdrawal decided at the start) ends at A = 1, B = 1;
-      (applyWrites demo afterDeposit (withdrawal demo.init) 1 = 1 ∧
-        applyWrites demo afterDeposit (withdrawal demo.init) 2 = 1) ∧
-      -- deposit then withdrawal, one at a time, ends at A = 2, not the history's state;
-      applyWrites demo afterDeposit (withdrawal afterDeposit) 1 = 2 ∧
-      -- withdrawal then deposit passes through (1, 0), which is not the report's (0, 1),
-      (applyWrites demo demo.init (withdrawal demo.init) 1 = 1 ∧
-        applyWrites demo demo.init (withdrawal demo.init) 2 = 0) ∧
-      -- and ends at the history's state (1, 1), which is not the report's either;
-      (applyWrites demo (applyWrites demo demo.init (withdrawal demo.init))
-          (deposit (applyWrites demo demo.init (withdrawal demo.init))) 1 = 1 ∧
-        applyWrites demo (applyWrites demo demo.init (withdrawal demo.init))
-          (deposit (applyWrites demo demo.init (withdrawal demo.init))) 2 = 1) ∧
-      -- and the report's check of A, against the withdrawal's published write, fails.
-      ¬ Ok demo (.full 1) afterDeposit (withdrawal demo.init) := by
-  -- Every part is a computation on small numbers: unfold the writes and the check, and evaluate.
-  simp [afterDeposit, deposit, withdrawal, applyWrites, applyWrite, upd, demo, Ok, lastWhere,
-    affects]
+    -- The report reads checking 30 and savings 20;
+    (afterDeposit 1 = 30 ∧ afterDeposit 2 = 20) ∧
+      -- the history (the deposit, then the withdrawal decided at the start) ends at (4, 20);
+      (applyWrites demo afterDeposit (withdrawal bankStart) 1 = 4 ∧
+        applyWrites demo afterDeposit (withdrawal bankStart) 2 = 20) ∧
+      -- deposit then withdrawal, one at a time, leaves checking 5, not the history's 4;
+      applyWrites demo afterDeposit (withdrawal afterDeposit) 1 = 5 ∧
+      -- withdrawal then deposit starts at (30, 0), which is not the report's (30, 20),
+      (bankStart 1 = 30 ∧ bankStart 2 = 0) ∧
+      -- passes through (4, 0), which is not it either,
+      (afterWithdrawal 1 = 4 ∧ afterWithdrawal 2 = 0) ∧
+      -- and ends at the history's (4, 20), which is not it either;
+      (applyWrites demo afterWithdrawal (deposit afterWithdrawal) 1 = 4 ∧
+        applyWrites demo afterWithdrawal (deposit afterWithdrawal) 2 = 20) ∧
+      -- and the report's check of checking, against the withdrawal's write, fails.
+      ¬ Ok demo (.full 1) afterDeposit (withdrawal bankStart) := by
+  -- Every part is a computation on small numbers: unfold the states, the writes and the check, and
+  -- evaluate.
+  simp [afterDeposit, afterWithdrawal, bankStart, deposit, withdrawal, fee, applyWrites,
+    applyWrite, upd, demo, Ok, lastWhere, affects]
 
 /-- **`blindMerge_across_replacement`: why the blind-merge rule refuses a newer
 replacement.** With a put of key 7 between a merge's snapshot and its

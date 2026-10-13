@@ -485,11 +485,12 @@
 \*
 \* LEAN, for every size (proofs/lean/Regolith):
 \*   Validation.lean     writeFree_at_horizon (INV_WriteFreeAtHorizon: a
-\*                       write-free commit whose checks passed at the
-\*                       published horizon read the serial state there),
+\*                       write-free commit whose checks passed read, at the
+\*                       published horizon, the serial state there, each
+\*                       read taken at the point it was served),
 \*                       full_ok_of_later and scan_ok_of_later (a check that
-\*                       also counts writes above the horizon refuses more,
-\*                       never less),
+\*                       also counts decided writes, or a version above a
+\*                       point, refuses more, never less),
 \*                       ordinary_serial, value_serial, contentAddressed_serial,
 \*                       parts_serial, scan_serial, exempt_serial (Log reads,
 \*                       commutative stretches, empty parts), blindMerge_serial,
