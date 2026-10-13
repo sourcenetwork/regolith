@@ -115,8 +115,11 @@ fn point_read(c: &mut Criterion) {
         ("hot_cache", &hot, &hot_acc),
         ("cold_cache", &cold, &cold_acc),
     ] {
+        // Outside the closure, which criterion calls once per sample: a
+        // sequence started again in each sample would find in the cache the
+        // blocks the last sample read, and the cold cache would read warm.
+        let mut rng = common::Rng::new(0xA5A5_1234);
         group.bench_function(id, |b| {
-            let mut rng = common::Rng::new(0xA5A5_1234);
             b.iter_custom(|iters| {
                 let cpu0 = common::cpu_seconds();
                 let start = Instant::now();
