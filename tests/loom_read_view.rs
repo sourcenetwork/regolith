@@ -611,6 +611,89 @@ fn sampling_the_horizon_first_is_caught_by_the_read_path_model() {
     });
 }
 
+/// The load order the write-free commit depends on (E50): the published
+/// horizon first, the view second (`RegolithEngine::commit_write_free`,
+/// src/engine/commit/mod.rs:553 and 563). It is the reverse of the read
+/// path's, and for a different reason: a plain read is placed where it
+/// loaded its view, while a commit that writes nothing is placed at the
+/// horizon it sampled, so every commit published by then must be reachable
+/// through the view it checks in.
+///
+/// A committer seals the active memtable, applies its write to the fresh
+/// one, and only then publishes its sequence (the pipeline's publication
+/// order). A checker that sampled a horizon covering that commit must load a
+/// view that reaches the fresh memtable. Loading the view first can pair the
+/// old view with that horizon and miss the write, which the negative control
+/// below shows.
+#[test]
+fn the_write_free_check_samples_the_horizon_before_it_loads_the_view() {
+    run_model("horizon_then_view", 168, || {
+        let cell = Arc::new(Cell::new(View::initial()));
+        let horizon = Arc::new(AtomicU64::new(1));
+
+        let committer = {
+            let cell = Arc::clone(&cell);
+            let horizon = Arc::clone(&horizon);
+            thread::spawn(move || {
+                cell.rcu(|view| rotate(view, FRESH));
+                horizon.store(2, Ordering::Release);
+            })
+        };
+
+        let checker = {
+            let cell = Arc::clone(&cell);
+            let horizon = Arc::clone(&horizon);
+            thread::spawn(move || {
+                let sampled = horizon.load(Ordering::Acquire);
+                let view = cell.load();
+                if sampled >= 2 {
+                    assert_ne!(
+                        view.reachable_ids() & (1u16 << FRESH),
+                        0,
+                        "the check's horizon covers the commit but its view \
+                         misses the memtable the commit wrote to: {view:?}",
+                    );
+                }
+            })
+        };
+
+        committer.join().unwrap();
+        checker.join().unwrap();
+    });
+}
+
+#[test]
+fn loading_the_view_first_is_caught_by_the_write_free_model() {
+    expect_violation("horizon_then_view/view_first", || {
+        let cell = Arc::new(Cell::new(View::initial()));
+        let horizon = Arc::new(AtomicU64::new(1));
+
+        let committer = {
+            let cell = Arc::clone(&cell);
+            let horizon = Arc::clone(&horizon);
+            thread::spawn(move || {
+                cell.rcu(|view| rotate(view, FRESH));
+                horizon.store(2, Ordering::Release);
+            })
+        };
+
+        let checker = {
+            let cell = Arc::clone(&cell);
+            let horizon = Arc::clone(&horizon);
+            thread::spawn(move || {
+                let view = cell.load();
+                let sampled = horizon.load(Ordering::Acquire);
+                if sampled >= 2 {
+                    assert_ne!(view.reachable_ids() & (1u16 << FRESH), 0);
+                }
+            })
+        };
+
+        committer.join().unwrap();
+        checker.join().unwrap();
+    });
+}
+
 #[test]
 fn the_packing_round_trips_every_field() {
     let view = View {
