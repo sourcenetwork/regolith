@@ -17,8 +17,7 @@ mod common;
 
 use std::hint::black_box;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Barrier};
-use std::time::{Duration, Instant};
+use std::sync::Arc;
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use regolith::env::{Env, MemEnv, ReadFile, WriteMode};
@@ -26,34 +25,6 @@ use regolith::{ColumnFamilyHandle, Db, Options, WriteBatch};
 
 /// The thread counts every case runs at.
 const THREADS: [usize; 4] = [1, 4, 16, 64];
-
-/// Run `op(thread, i)` for `i` in `0..per_thread` on each of `threads`
-/// threads, and return the wall time from a common start.
-fn on_threads(
-    threads: usize,
-    per_thread: u64,
-    op: impl Fn(usize, u64) + Send + Sync + 'static,
-) -> Duration {
-    let op = Arc::new(op);
-    let start = Arc::new(Barrier::new(threads + 1));
-    let workers: Vec<_> = (0..threads)
-        .map(|t| {
-            let (op, start) = (Arc::clone(&op), Arc::clone(&start));
-            std::thread::spawn(move || {
-                start.wait();
-                for i in 0..per_thread {
-                    op(t, i);
-                }
-            })
-        })
-        .collect();
-    start.wait();
-    let began = Instant::now();
-    for worker in workers {
-        worker.join().expect("bench worker");
-    }
-    began.elapsed()
-}
 
 const TABLES: u64 = 64;
 const KEYS_PER_TABLE: u64 = 500;
@@ -95,10 +66,14 @@ fn open_files(c: &mut Criterion) {
             group.bench_with_input(BenchmarkId::new(id, threads), &threads, |b, &threads| {
                 b.iter_custom(|iters| {
                     let db = Arc::clone(&db);
-                    on_threads(threads, (iters / threads as u64).max(1), move |t, i| {
-                        let k = (i * 7919 + t as u64 * 104_729) % (TABLES * KEYS_PER_TABLE);
-                        black_box(db.get(&common::key(k)).expect("read"));
-                    })
+                    common::start::on_threads(
+                        threads,
+                        (iters / threads as u64).max(1),
+                        move |t, i| {
+                            let k = (i * 7919 + t as u64 * 104_729) % (TABLES * KEYS_PER_TABLE);
+                            black_box(db.get(&common::key(k)).expect("read"));
+                        },
+                    )
                 })
             });
         }
@@ -140,13 +115,17 @@ fn mem_env(c: &mut Criterion) {
             |b, &threads| {
                 b.iter_custom(|iters| {
                     let files = Arc::clone(&files);
-                    on_threads(threads, (iters / threads as u64).max(1), move |t, i| {
-                        let file = &files[(t + i as usize) % FILES];
-                        let at = (i * 4096) % (FILE_BYTES as u64 - 4096);
-                        let mut buf = [0u8; 4096];
-                        file.read_exact_at(at, &mut buf).expect("read");
-                        black_box(&buf);
-                    })
+                    common::start::on_threads(
+                        threads,
+                        (iters / threads as u64).max(1),
+                        move |t, i| {
+                            let file = &files[(t + i as usize) % FILES];
+                            let at = (i * 4096) % (FILE_BYTES as u64 - 4096);
+                            let mut buf = [0u8; 4096];
+                            file.read_exact_at(at, &mut buf).expect("read");
+                            black_box(&buf);
+                        },
+                    )
                 })
             },
         );
@@ -157,19 +136,24 @@ fn mem_env(c: &mut Criterion) {
             |b, &threads| {
                 b.iter_custom(|iters| {
                     let (env, files) = (env.clone(), Arc::clone(&files));
-                    on_threads(threads, (iters / threads as u64).max(1), move |t, i| {
-                        if t % 4 == 3 {
-                            let log = PathBuf::from(format!("/bench/log{t}"));
-                            let mut file = env.open_write(&log, WriteMode::Append).expect("log");
-                            file.write_all(&i.to_le_bytes()).expect("append");
-                        } else {
-                            let file = &files[(t + i as usize) % FILES];
-                            let mut buf = [0u8; 512];
-                            file.read_exact_at((i * 512) % (FILE_BYTES as u64 - 512), &mut buf)
-                                .expect("read");
-                            black_box(&buf);
-                        }
-                    })
+                    common::start::on_threads(
+                        threads,
+                        (iters / threads as u64).max(1),
+                        move |t, i| {
+                            if t % 4 == 3 {
+                                let log = PathBuf::from(format!("/bench/log{t}"));
+                                let mut file =
+                                    env.open_write(&log, WriteMode::Append).expect("log");
+                                file.write_all(&i.to_le_bytes()).expect("append");
+                            } else {
+                                let file = &files[(t + i as usize) % FILES];
+                                let mut buf = [0u8; 512];
+                                file.read_exact_at((i * 512) % (FILE_BYTES as u64 - 512), &mut buf)
+                                    .expect("read");
+                                black_box(&buf);
+                            }
+                        },
+                    )
                 })
             },
         );
@@ -202,10 +186,14 @@ fn column_families(c: &mut Criterion) {
             |b, &threads| {
                 b.iter_custom(|iters| {
                     let (db, families) = (Arc::clone(&db), Arc::clone(&families));
-                    on_threads(threads, (iters / threads as u64).max(1), move |t, i| {
-                        let family = &families[(t + i as usize) % FAMILIES];
-                        black_box(db.get_cf(family, &common::key(i % 1_000)).expect("read"));
-                    })
+                    common::start::on_threads(
+                        threads,
+                        (iters / threads as u64).max(1),
+                        move |t, i| {
+                            let family = &families[(t + i as usize) % FAMILIES];
+                            black_box(db.get_cf(family, &common::key(i % 1_000)).expect("read"));
+                        },
+                    )
                 })
             },
         );
@@ -215,11 +203,15 @@ fn column_families(c: &mut Criterion) {
             |b, &threads| {
                 b.iter_custom(|iters| {
                     let (db, families) = (Arc::clone(&db), Arc::clone(&families));
-                    on_threads(threads, (iters / threads as u64).max(1), move |t, i| {
-                        let family = &families[(t + i as usize) % FAMILIES];
-                        db.put_cf(family, &common::key(i % 1_000), b"value")
-                            .expect("write");
-                    })
+                    common::start::on_threads(
+                        threads,
+                        (iters / threads as u64).max(1),
+                        move |t, i| {
+                            let family = &families[(t + i as usize) % FAMILIES];
+                            db.put_cf(family, &common::key(i % 1_000), b"value")
+                                .expect("write");
+                        },
+                    )
                 })
             },
         );
