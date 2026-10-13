@@ -23,11 +23,25 @@ use super::super::{EngineOptions, RegolithEngine};
 use super::descriptor::Work;
 use super::ordered::Ordered;
 use super::park::{Help, Needs};
-use super::pipeline_tests::{durable_put, eventual_put, install, key, open_engine, seq_of};
+use super::pipeline_tests::{durable_put, eventual_put, install, key, seq_of};
 use crate::{IoBudget, OptimisticTransactionDb, Options, TxnOptions};
 
 /// Step `job` as a queue's poll does once its claim won. `false` when the
 /// job parked.
+/// No worker. A test here has another thread hold the one thing a unit
+/// needs, at a moment the test chooses; a worker takes the flush exclusion
+/// and the version store's step on its own, at moments it chooses.
+fn open_engine(dir: &TempDir) -> Arc<RegolithEngine> {
+    RegolithEngine::open(
+        dir.path(),
+        EngineOptions {
+            max_background_compactions: 0,
+            ..EngineOptions::default()
+        },
+    )
+    .expect("engine open")
+}
+
 fn poll_step(job: &Arc<Job>, waker: &Waker) -> bool {
     assert!(job.claim(), "nobody else has the job");
     job.step(waker)
