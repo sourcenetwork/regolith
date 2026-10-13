@@ -169,6 +169,7 @@ impl RegolithEngine {
     /// published horizon: two loads of the ring's frontiers, and no
     /// read-modify-write.
     pub(super) fn write_free_points(&self) -> Points {
+        hook::at(hook::Stage::WriteFreePoints);
         if let Some(pipe) = self.pipeline.as_ref() {
             // Read before `published`: when nothing reserved by then is still
             // unpublished, nothing decided by then is either, and the

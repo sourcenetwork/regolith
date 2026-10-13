@@ -292,6 +292,51 @@ fn a_commit_made_after_the_points_does_not_refuse_the_check() {
     }
 }
 
+/// Run `commit` with `before` run on the committing thread just before the
+/// check takes its points.
+fn before_the_points<T>(before: impl FnOnce() + 'static, commit: impl FnOnce() -> T) -> T {
+    let mut before = Some(before);
+    hook::set(move |stage| {
+        if stage == Stage::WriteFreePoints
+            && let Some(before) = before.take()
+        {
+            before();
+        }
+    });
+    let out = commit();
+    hook::clear();
+    out
+}
+
+/// A memtable sealed and a commit of the key published just before the check
+/// takes its points: the points cover that commit, and the view the check
+/// loads after them holds the new memtable and the write in it, so the read
+/// is refused. Loading the view before the points would check a view without
+/// that memtable under points that cover its commit, and miss the write (the
+/// loom model `horizon_then_view` explores the same order).
+#[test]
+fn a_commit_published_just_before_the_points_is_not_missed() {
+    for level in [IsolationLevel::RepeatableRead, IsolationLevel::Serializable] {
+        let dir = TempDir::new().unwrap();
+        let db = Arc::new(OptimisticTransactionDb::open(dir.path(), Options::default()).unwrap());
+        db.db().put(b"k", b"v0").unwrap();
+        let tx = db.begin(&TxnOptions::new().isolation(level));
+        tx.get(b"k").unwrap();
+        let raw = Arc::clone(&db);
+        let outcome = before_the_points(
+            move || {
+                raw.db().engine().seal_active().unwrap();
+                raw.db().put(b"k", b"v1").unwrap();
+            },
+            || tx.commit(),
+        );
+        let Err(TransactionError::Conflict(lost)) = outcome else {
+            panic!("{level:?}: the write of k was missed: {outcome:?}");
+        };
+        assert_eq!(lost.key(), b"k", "{level:?}");
+    }
+}
+
 /// A version of the key at or below the points, folded by compaction under a
 /// newer one above them before the check loads its view: a table then holds
 /// a sequence above the points, so the newer version fails the read, since
