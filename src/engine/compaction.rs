@@ -1233,6 +1233,9 @@ fn perform_compaction_to(
     // version that snapshot reads, would be dropped.
     let live = snapshots.live_seqs();
 
+    // Compaction inputs are obsolete after publication; caching their full
+    // scan evicts foreground reads and retains buffers until the merge ends.
+    let scan_cache = BlockCache::new(0);
     let CompactionOutputs {
         edits: new_file_edits,
         infos: output_file_infos,
@@ -1240,7 +1243,7 @@ fn perform_compaction_to(
     } = stream_compaction_outputs(
         versions,
         sst_dir,
-        cache,
+        &scan_cache,
         opts,
         target_level,
         &input_files,
@@ -2001,6 +2004,9 @@ fn delete_old_files(
         }
     }
 }
+
+#[cfg(test)]
+mod cache_tests;
 
 #[cfg(test)]
 mod tests {
