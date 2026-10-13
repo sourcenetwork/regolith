@@ -137,10 +137,11 @@ fn a_call_near_its_turn_does_not_park() {
 }
 
 /// P6 end to end: the owner of slot 1 stops while it decides it; the owner
-/// of a slot far behind it parks. Another thread decides the slots between,
-/// which names the far slot, and its commit done wakes the sleeper, which
-/// then carries every slot before its own through, the stopped owner's
-/// included.
+/// of a slot far behind it counts itself in to park, and the test holds it
+/// there so its patience cannot run out first. Another thread decides the
+/// slots between, which names the far slot, and its commit done tells it;
+/// the far call then finds its turn near and carries every slot before its
+/// own through, the stopped owner's included.
 #[test]
 fn a_call_far_from_its_turn_is_woken_when_its_turn_nears() {
     let dir = TempDir::new().unwrap();
@@ -162,6 +163,7 @@ fn a_call_far_from_its_turn_is_woken_when_its_turn_nears() {
     let (stopped, owner_stopped) = mpsc::channel();
     let (release, released) = mpsc::channel::<()>();
     let (parked, far_parked) = mpsc::channel();
+    let (wake, woken) = mpsc::channel::<()>();
     thread::scope(|scope| {
         let owner_thread = {
             let (engine, owner) = (&engine, &owner);
@@ -189,6 +191,9 @@ fn a_call_far_from_its_turn_is_woken_when_its_turn_nears() {
                     if stage == Stage::TurnWait && !fired {
                         fired = true;
                         parked.send(()).unwrap();
+                        // Held where it is counted in and about to sleep,
+                        // so its patience cannot run out first.
+                        let _ = woken.recv_timeout(DEADLINE);
                     }
                 });
                 engine.drive(engine.pipe().unwrap(), far_index, far);
@@ -214,6 +219,7 @@ fn a_call_far_from_its_turn_is_woken_when_its_turn_nears() {
             far.is(NEAR),
             "the finished commit told the sleeper its turn neared"
         );
+        wake.send(()).unwrap();
         far_thread.join().unwrap();
         release.send(()).unwrap();
         owner_thread.join().unwrap();
