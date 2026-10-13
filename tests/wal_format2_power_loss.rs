@@ -105,7 +105,7 @@ fn immediate_every_tear_at_every_cut_keeps_every_acknowledged_write() {
             let on_disk = std::fs::read(&wal).unwrap();
             let (opts, reports, stats) = reporting(out.spec.options());
             match fault::recover_and_validate(&db, opts, &out.history) {
-                Recovery::Recovered(r) => fault::assert_acked_survived(&r, &out.acked),
+                Recovery::Recovered(r) => fault::assert_acked_survived(&r, &out.acked()),
                 Recovery::RefusedToOpen(e) => {
                     failures.push(format!("{tear:?} at write {nth}: refused: {e}"));
                     continue;
@@ -246,7 +246,7 @@ fn a_whole_final_record_with_garbage_after_it_opens_as_a_tail() {
 
         let (opts, reports, _) = reporting(out.spec.options());
         match fault::recover_and_validate(&db, opts, &out.history) {
-            Recovery::Recovered(r) => fault::assert_acked_survived(&r, &out.acked),
+            Recovery::Recovered(r) => fault::assert_acked_survived(&r, &out.acked()),
             Recovery::RefusedToOpen(e) => panic!("at write {nth}: refused: {e}"),
         }
         let taken = reports.taken();
@@ -402,7 +402,7 @@ fn red_no_truncate_the_dropped_tail_is_truncated_durably_before_the_next_log() {
         "both logs survive the cut"
     );
     match fault::recover_and_validate(&db, first.spec.options(), &first.history) {
-        Recovery::Recovered(r) => fault::assert_acked_survived(&r, &first.acked),
+        Recovery::Recovered(r) => fault::assert_acked_survived(&r, &first.acked()),
         Recovery::RefusedToOpen(e) => {
             panic!("the truncated log must replay as an earlier log: {e}")
         }

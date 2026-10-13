@@ -60,8 +60,6 @@
 mod common;
 
 use std::collections::BTreeSet;
-use std::fs::OpenOptions;
-use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -196,19 +194,13 @@ fn stages_child(spec: &ChildSpec) {
     let handles: Vec<_> = (0..THREADS)
         .map(|t| {
             let db = Arc::clone(&db);
-            // One unbuffered write per acknowledgement, so a kill a
-            // microsecond later cannot lose the record of what was told.
-            let mut acks = OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&spec.ack_path)
-                .unwrap();
+            let mut acks = fault::Acks::open(&spec.ack_path);
             let commits = spec.ops;
             std::thread::spawn(move || {
                 let mut queue = (t == NOWAIT_TXN).then(|| db.db().io_queue());
                 for i in 0..commits {
                     commit(&db, queue.as_mut(), t, i);
-                    acks.write_all(format!("{t} {i}\n").as_bytes()).unwrap();
+                    acks.ack([t as u64, i as u64]);
                 }
             })
         })
@@ -367,10 +359,8 @@ fn check_recovered(out: &ChildOutcome, cut: &Cut, commits: usize, acks_hold: boo
         "{what}: the counter must count exactly the surviving transactions"
     );
     if acks_hold {
-        let acked = std::fs::read_to_string(&out.spec.ack_path).unwrap_or_default();
-        for line in acked.lines() {
-            let (t, i) = line.split_once(' ').unwrap();
-            let (t, i) = (t.parse::<usize>().unwrap(), i.parse::<usize>().unwrap());
+        for [t, i] in out.acks.of() {
+            let (t, i) = (t as usize, i as usize);
             let durable = t == SYNCED_BATCH || cut.durability == DurabilityMode::Immediate;
             assert!(
                 !durable || i < survived[t],

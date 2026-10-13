@@ -224,6 +224,10 @@ async fn appends_are_numbered_in_commit_order_and_continue_after_a_remount() {
     }
 }
 
+/// Mirror mode is durable only across `OpfsEnv::persist`: it offers no
+/// durable sync, so a database on it runs at Eventual. Appends a persist
+/// wrote out come back after a remount; the ones committed after the last
+/// persist may be lost, but what comes back is never reordered or holed.
 #[wasm_bindgen_test]
 async fn appends_in_mirror_mode_come_back_once_they_are_persisted() {
     let name = "regolith-test-append-mirror";
@@ -231,24 +235,64 @@ async fn appends_in_mirror_mode_come_back_once_they_are_persisted() {
         force_mode: Some(OpfsMode::Mirror),
         ..OpfsOptions::default()
     };
-    let expected = {
+    let durability = DurabilityMode::Eventual;
+    let persisted = {
         let env = OpfsEnv::mount(name, options).await.expect("mount");
         assert_eq!(env.mode(), OpfsMode::Mirror);
-        let db = open(&env, DurabilityMode::Immediate);
-        let expected = append_in_every_way(&db);
-        db.db().flush().expect("flush");
+        assert!(!env.capabilities().durable_sync);
+        let db = open(&env, durability);
+        let persisted = append_in_every_way(&db);
         db.db().close().expect("close");
         env.persist().await.expect("persist");
         assert_eq!(env.pending_bytes(), 0);
-        expected
+        persisted
     };
 
+    // Appends committed after the persist, by a database closed but never
+    // persisted again.
+    let later = ["after the persist", "and after it", "last of all"];
+    {
+        let env = OpfsEnv::mount(name, options).await.expect("remount");
+        let db = open(&env, durability);
+        assert_eq!(
+            log_of(db.db()),
+            persisted,
+            "persisted appends must come back"
+        );
+        let tx = begin(&db);
+        tx.append(&journal(), later[0].as_bytes(), None)
+            .expect("append");
+        tx.append(&journal(), later[1].as_bytes(), None)
+            .expect("append");
+        tx.commit().expect("commit");
+        let tx = begin(&db);
+        tx.append(&journal(), later[2].as_bytes(), None)
+            .expect("append");
+        tx.commit().expect("commit");
+        db.db().close().expect("close");
+        assert!(
+            env.pending_bytes() > 0,
+            "the later appends wait for a persist"
+        );
+    }
+
     let env = OpfsEnv::mount(name, options).await.expect("remount");
-    let db = open(&env, DurabilityMode::Immediate);
-    assert_eq!(
-        log_of(db.db()),
-        expected,
-        "persisted appends must come back"
+    let db = open(&env, durability);
+    // `log_of` fails on a hole below the head.
+    let log = log_of(db.db());
+    let committed: Vec<&str> = persisted.iter().copied().chain(later).collect();
+    assert!(
+        log.len() >= persisted.len() && log.iter().zip(&committed).all(|(a, b)| a == b),
+        "the log must be the persisted appends and then a prefix of the later ones, in \
+         commit order: {log:?}"
     );
+    // The log continues at the head that came back.
+    let tx = begin(&db);
+    tx.append(&journal(), b"after the remount", None)
+        .expect("append");
+    tx.commit().expect("commit");
+    let mut continued = log.clone();
+    continued.push("after the remount".to_string());
+    assert_eq!(log_of(db.db()), continued);
     db.db().close().expect("close");
 }
