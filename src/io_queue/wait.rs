@@ -23,8 +23,10 @@ use crate::engine::io::unit::UnitKey;
 pub enum WouldBlock {
     /// A `CacheOnly` read needs a block the cache does not hold. The read is
     /// recorded on the queue the handle's [`ReadMode`](crate::ReadMode)
-    /// names; poll that queue, then run the read again.
-    #[error("the read needs a block that is not cached; poll its I/O queue and run the read again")]
+    /// names; poll that queue, then run the read again. Also what
+    /// [`Db::allocate_nowait`](crate::Db::allocate_nowait) hands back when
+    /// device work is in its way: the wait is recorded on the queue it names.
+    #[error("the call needs I/O that is not done yet; poll its I/O queue and run the call again")]
     Io(IoWait),
     /// A write met a write stall: too many level-0 tables, too many memtables
     /// waiting to be flushed, or too much data waiting to be compacted. The
@@ -133,8 +135,9 @@ pub struct IoWait {
 }
 
 impl IoWait {
-    /// A wait on `slot`, recorded on `queue` for `unit` (`None` for a wait for
-    /// room in the queue's byte bound).
+    /// A wait on `slot`, recorded on `queue` for `unit` (`None` for a wait
+    /// that names no block: room in the queue's byte bound, or work of the
+    /// commit pipeline in an allocation's way).
     pub(crate) fn new(queue: &QueueShared, unit: Option<UnitKey>, slot: Arc<WaitSlot>) -> Self {
         Self {
             listen: Listen::new(slot),
@@ -151,7 +154,10 @@ impl IoWait {
 
     /// The device read this wait waits on. `None` for a read that found its
     /// queue's byte bound full: it waits until the queue owes less, and then
-    /// records its read when it is run again.
+    /// records its read when it is run again. `None` too for a
+    /// [`Db::allocate_nowait`](crate::Db::allocate_nowait) that found other
+    /// work of the commit pipeline in its way: it waits until that work is
+    /// done.
     pub fn unit(&self) -> Option<IoUnit> {
         self.unit
     }

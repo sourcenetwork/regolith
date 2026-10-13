@@ -70,12 +70,13 @@ use super::super::wal_log::Log;
 use super::super::{
     DurabilityMode, MemTable, RegolithEngine, apply_batch_op_to_memtable, batch_op_wal_bytes,
 };
+use super::counters::Counters;
 use super::descriptor::{
     After, Decision, Descriptor, FAILED, INSTALLED, Verdict as Fate, Work, is_immediate,
 };
 use super::park::{Help, Needs};
 use super::pipeline::{Pipeline, Progress, Turn};
-use super::request::batch_op_memtable_cost;
+use super::request::{Ops, batch_op_memtable_cost};
 use super::ring::Loaded;
 use super::round::HeldRound;
 use crate::WriteBatchOp;
@@ -160,10 +161,12 @@ impl Ordered<'_> {
         self.state.next_seq.saturating_sub(1)
     }
 
-    /// Take the next sequence, for an ingested table.
+    /// Take the next sequence, for an ingested table. The table may hold a
+    /// key whose counter the pipeline keeps, so it keeps none from here.
     pub(crate) fn take_seq(&mut self) -> u64 {
         let seq = self.state.next_seq;
         self.state.next_seq += 1;
+        self.state.counters = Counters::empty();
         seq
     }
 
@@ -310,6 +313,9 @@ impl Ordered<'_> {
                 .map(batch_op_memtable_cost)
                 .fold(0usize, usize::saturating_add),
         );
+        if let Some(kept) = self.state.counters.forget_written(&Ops::Batch(ops)) {
+            self.state.counters = kept;
+        }
         engine.visible_seq.publish(last);
         Ok(last)
     }
@@ -323,6 +329,7 @@ impl Ordered<'_> {
         self.state.log = log;
         self.state.memtable = memtable;
         self.state.mem_used = 0;
+        self.state.counters = Counters::empty();
     }
 
     /// Close the active log cleanly, after which every commit is refused.
@@ -649,6 +656,9 @@ impl RegolithEngine {
             }
         }
         after.mem_used = after.memtable.approximate_size();
+        // A discarded reservation may have handed its range out already:
+        // its counter goes back before any later slot is decided.
+        self.write_back_reservations(&mut after, &failed);
 
         let cause = cause.unwrap_or_else(|| {
             io::Error::other("the write-ahead log failed and unfinished commits were discarded")

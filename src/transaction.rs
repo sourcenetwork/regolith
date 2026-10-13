@@ -415,6 +415,12 @@ impl OptimisticTransactionDb {
     pub fn allocate(&self, key: &[u8], n: u64) -> Result<Range<u64>> {
         self.inner.allocate(key, n)
     }
+
+    /// [`Db::allocate_nowait`] on the underlying database: the reservation
+    /// that never waits, handing back a wait on `queue` instead.
+    pub fn allocate_nowait(&self, queue: QueueId, key: &[u8], n: u64) -> Result<Range<u64>> {
+        self.inner.allocate_nowait(queue, key, n)
+    }
 }
 
 /// Pessimistic-concurrency-control wrapper over a [`Db`].
@@ -526,6 +532,12 @@ impl TransactionDb {
     /// the counter at `key`, outside any transaction and never a conflict.
     pub fn allocate(&self, key: &[u8], n: u64) -> Result<Range<u64>> {
         self.inner.allocate(key, n)
+    }
+
+    /// [`Db::allocate_nowait`] on the underlying database: the reservation
+    /// that never waits, handing back a wait on `queue` instead.
+    pub fn allocate_nowait(&self, queue: QueueId, key: &[u8], n: u64) -> Result<Range<u64>> {
+        self.inner.allocate_nowait(queue, key, n)
     }
 }
 
