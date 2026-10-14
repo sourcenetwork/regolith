@@ -14,7 +14,7 @@
 use std::fs;
 use std::path::Path;
 
-use regolith::{Db, Options};
+use regolith::{Db, Options, TransactionError, TxResult};
 use tempfile::TempDir;
 
 /// Options with a small write buffer (4 KiB) so memtable flushes
@@ -112,6 +112,18 @@ pub fn eventually(what: &str, mut reached: impl FnMut() -> bool) {
         );
         std::thread::sleep(backoff);
         backoff = (backoff * 2).min(std::time::Duration::from_millis(5));
+    }
+}
+
+/// Whether a commit landed: `true` when it committed, `false` when it lost
+/// to a conflict. Any other failure fails the test with the error, so a
+/// commit that failed for another reason is never read as a conflict.
+#[track_caller]
+pub fn committed<T>(outcome: &TxResult<T>) -> bool {
+    match outcome {
+        Ok(_) => true,
+        Err(TransactionError::Conflict(_)) => false,
+        Err(other) => panic!("a commit failed for a reason other than a conflict: {other}"),
     }
 }
 

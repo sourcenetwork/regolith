@@ -68,6 +68,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@nextest
       - uses: extractions/setup-just@v2
+      # `just test` runs the doc tests under coreutils `timeout`, which
+      # macOS does not ship.
+      - if: runner.os == 'macOS'
+        run: brew install coreutils
       - run: just test
       # `regolith::testing` is behind a feature no default build has. Its
       # tests run on one host: the checks are plain Rust with nothing a
@@ -259,10 +263,11 @@ jobs:
   # budget.
 
 
-  # Long-running stress, soak, and fault-injection tests. Gated behind
-  # `#[ignore]` in the main crate so `cargo test` stays fast for PRs;
-  # this job unlocks them via `--ignored`. Runs on the nightly schedule,
-  # manual dispatch, or direct pushes to `main`, never on PRs.
+  # A second full run of the workspace, in a release build and one test at
+  # a time with its output shown (`just test-slow`). No test is unlocked by
+  # it: the stress and soak tests are in the ordinary run too. Runs on the
+  # nightly schedule, manual dispatch, or direct pushes to `main`, never on
+  # PRs.
   nightly-stress:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || github.event_name == 'push'
     runs-on: ubuntu-latest
@@ -273,7 +278,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@nextest
-      - name: Run ignored tests (stress / soak / concurrency)
+      - name: Whole workspace in release, one test at a time
         run: just test-slow
 
   # The five `regolith::sync` loom models whose three threads all contend

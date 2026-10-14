@@ -22,6 +22,8 @@ use regolith::{
 };
 use tempfile::TempDir;
 
+mod common;
+
 fn opt_db(dir: &TempDir) -> OptimisticTransactionDb {
     OptimisticTransactionDb::open(dir.path(), Options::default()).unwrap()
 }
@@ -763,7 +765,7 @@ fn repeatable_read_commits_when_a_scanned_key_is_reclaimed_underneath() {
         append.put(b"marker/current/new", b"0").unwrap();
         let result = append.commit();
         assert_eq!(
-            result.is_ok(),
+            common::committed(&result),
             reclaimed_commits,
             "{level:?}: optimistic append under a reclamation: {result:?}"
         );
@@ -789,7 +791,7 @@ fn repeatable_read_commits_when_a_scanned_key_is_reclaimed_underneath() {
         append.put(b"head/new", b"0").unwrap();
         let result = append.commit();
         assert_eq!(
-            result.is_ok(),
+            common::committed(&result),
             reclaimed_commits,
             "{level:?}: pessimistic append under a reclamation: {result:?}"
         );
@@ -865,7 +867,7 @@ fn repeatable_read_admits_write_skew_through_scans() {
         b.put(b"y", b"b").unwrap();
         a.commit().unwrap();
         assert_eq!(
-            b.commit().is_ok(),
+            common::committed(&b.commit()),
             both_commit,
             "{level:?}: the second of two scan-then-write-the-other transactions"
         );
