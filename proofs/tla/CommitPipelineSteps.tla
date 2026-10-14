@@ -803,6 +803,42 @@ Timeout(a) ==
   /\ UNCHANGED <<moreVars, fly, filled, writer, gathered, wanted, ringVars, decVars, ap, wr, failed, dto, tipVars,
                  epochVars, durable, pub, visible, claimVars, failVars, threadVars>>
 
+\* THE FAST PATH (write_unit.rs, write_alone, WU8). An owner whose record
+\* is settled, and nobody else has in hand, finds the write unit free with
+\* no request on it and no write in flight: it encodes its record and
+\* writes it by itself, through the gate as a copy is (the count in and
+\* the look again are StealStart's), skipping the unit's claim, gather and
+\* wakes. Under contention the unit takes over. Mutant DirectAnyTime takes
+\* the fast path whatever the unit and the gate say: the guard is about
+\* speed, and the model stays safe without it (row Green_Direct_AnyTime).
+\* Mutant DirectNoRecheck writes without the look again: see StealStart.
+DirectStart(a) ==
+  \* Its own order.
+  LET i == mine[a]
+  \* A run that shows writes step by step; a thread that helps, holds
+  \* neither the round nor a unit.
+  IN /\ Copies /\ Helping(a) /\ a \notin round /\ claimant # a
+     \* Settled, a commit with a record...
+     /\ i <= dto /\ Brings(i)
+     \* ...that nobody has in hand, not in the log, not thrown out.
+     /\ ~filled[i] /\ ~filling[i] /\ ~wr[i] /\ ~failed[i]
+     \* The unit is free with no request on it, and no write is in flight
+     \* (the broken version does not look).
+     /\ \/ writer = 0 /\ ~wanted /\ \A b \in Actors : fly[b] = {}
+        \* (Or the broken version.)
+        \/ Mutant = "DirectAnyTime"
+     \* The record is encoded...
+     /\ filled'  = [filled EXCEPT ![i] = TRUE]
+     \* ...which wakes whoever slept on it...
+     /\ asleep'  = {b \in asleep : sleepOn[b] # i}
+     \* ...and they wait for nothing now.
+     /\ sleepOn' = [b \in Actors |-> IF b \in asleep /\ sleepOn[b] = i THEN 0 ELSE sleepOn[b]]
+     \* The thread is about to write it by itself.
+     /\ late'    = [late EXCEPT ![a] = i]
+     \* Nothing else changes.
+     /\ UNCHANGED <<moreVars, fly, writer, gathered, wanted, ringVars, decVars, ap, wr, failed, dto, tipVars,
+                    epochVars, durable, pub, visible, claimVars, failVars, threadVars>>
+
 \* The thread whose patience ran out writes its record itself, as a copy
 \* (write_unit.rs, copy_record through Log::write_unless): it counts in at
 \* the gate, in the epoch the record was placed in, and looks again whether
@@ -816,7 +852,8 @@ StealStart(a) ==
   IN /\ i # 0 /\ fly[a] = {}
      \* In flight: the record, if the gate lets it in and the look finds it
      \* still to write (the broken version does not look).
-     /\ fly' = [fly EXCEPT ![a] = IF ep[i] = logEp /\ ((~wr[i] /\ ~failed[i]) \/ Mutant = "StealNoRecheck")
+     /\ fly' = [fly EXCEPT ![a] = IF ep[i] = logEp /\ ((~wr[i] /\ ~failed[i]) \/ Mutant = "StealNoRecheck"
+                                                    \/ (Mutant = "DirectNoRecheck" /\ i = mine[a]))
                                    THEN {i} ELSE {}]
      \* It is no longer about to write.
      /\ late' = [late EXCEPT ![a] = 0]
@@ -1246,6 +1283,8 @@ PipelineStep(a) ==
      \/ \E i \in Slots : EncodeStart(a, i)
      \* (A run gathered, a park on a record.)
      \/ Gather(a) \/ Park(a)
+     \* The fast path: an owner writes its record by itself.
+     \/ DirectStart(a)
      \* Step 2: a park far from the thread's turn.
      \/ TurnPark(a)
 

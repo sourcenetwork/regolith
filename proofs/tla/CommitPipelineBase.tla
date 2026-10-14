@@ -94,7 +94,8 @@ ASSUME Mutant \in {"none", "OutOfOrder", "AbortHole", "NoHelping", "SyncPastGap"
                    "PassBeforeApply", "RollbackForgets", "NoFreeze", "StopHoldsClaim",
                    "TrustEarly", "PublishBeforeSync", "DecideAnyOrder", "WorkBeyond",
                    "SyncNoWait", "SkipOnPublished", "StealNoRecheck", "GatherBeforeCountIn",
-                   "LostWake", "EncodeNoClaim", "TurnNeverTold", "RunSkipsCheck"}
+                   "LostWake", "EncodeNoClaim", "TurnNeverTold", "RunSkipsCheck",
+                   "DirectAnyTime", "DirectNoRecheck"}
 
 \* The ticket numbers of the run.
 Slots == 1..MaxSlots

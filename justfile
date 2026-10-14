@@ -841,6 +841,14 @@ tla:
     check MC_CommitPipeline_Green_Copies_RunPastOwn         RED NoRunPastOwn
     check MC_CommitPipeline_Red_EncodeNoClaim               RED OneEncoder
     check MC_CommitPipeline_Red_RunSkipsCheck               RED DurableBeforeVisible
+    # The fast path (WU8): a lone owner writes its record by itself when the
+    # unit is free and no write is in flight. Green_Direct_AnyTime takes it
+    # with its guard removed and stays GREEN: the guard is about speed, the
+    # look again once counted in keeps it safe (Red_DirectNoRecheck). Loom:
+    # the_fast_path_racing_a_claimer_writes_only_whole_records.
+    check MC_CommitPipeline_Green_Copies_Direct             RED NeverDirect
+    check MC_CommitPipeline_Green_Direct_AnyTime            GREEN
+    check MC_CommitPipeline_Red_DirectNoRecheck             RED NoWriteUnderSync
     # A blocking thread far from its turn (E45 step 2, P6;
     # src/engine/commit/turn_wait.rs) parks on its own order; the pass that
     # brings its turn near names it, and the next finished commit tells it.

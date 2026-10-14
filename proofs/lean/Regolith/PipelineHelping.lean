@@ -1094,7 +1094,10 @@ neither adds a step the thread needs.
 A record nobody is encoding: its owner has not begun, or stopped before it
 began. The thread that needs it claims the encoding and encodes it itself
 instead of parking (`write_unit.rs`, `RegolithEngine::fill`; the TLA+
-`EncodeStart`): its spin ends straight in a write of its own.
+`EncodeStart`): its spin ends straight in a write of its own. The fast
+path of a lone owner (`write_unit.rs`, `write_alone`, WU8; the TLA+
+`DirectStart`) is the same step taken before any wait: it encodes and
+writes its own record at once, so it needs no step this machine counts.
 
 A thread far from its turn (`pipeline.rs`, P6) parks on its own slot until
 its turn nears: a finished commit tells it (NEAR), its slot lands or fails,
