@@ -665,8 +665,8 @@ fn reaches_fresh(view: &View) -> bool {
 
 /// The load order the write-free commit depends on (E50): its points (the
 /// published horizon and the decided frontier) first, the view second
-/// (`RegolithEngine::commit_write_free`, src/engine/commit/write_free.rs:110
-/// and 121). It is the reverse of the read path's, and for a different
+/// (`RegolithEngine::commit_write_free`, src/engine/commit/write_free.rs:118
+/// and 129). It is the reverse of the read path's, and for a different
 /// reason: a plain read is placed where it loaded its view, while a commit
 /// that writes nothing is placed at its points, so every commit at or below
 /// them must be reachable through the view it checks in.
@@ -788,7 +788,7 @@ impl Slot {
     }
 
     /// The write-free check: when the slot holds a decision, settle it
-    /// (`apply_decided`, write_free.rs:194-207), then read the decided
+    /// (`apply_decided`, write_free.rs:203-216), then read the decided
     /// frontier, then look at the memtable. Returns whether a decision was
     /// there when the check began, the frontier it read, and whether the
     /// memtable held the write. `help` off is the calibration's broken check.
