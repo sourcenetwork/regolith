@@ -95,7 +95,7 @@ ASSUME Mutant \in {"none", "OutOfOrder", "AbortHole", "NoHelping", "SyncPastGap"
                    "TrustEarly", "PublishBeforeSync", "DecideAnyOrder", "WorkBeyond",
                    "SyncNoWait", "SkipOnPublished", "StealNoRecheck", "GatherBeforeCountIn",
                    "LostWake", "EncodeNoClaim", "TurnNeverTold", "RunSkipsCheck",
-                   "DirectAnyTime", "DirectNoRecheck"}
+                   "DirectAnyTime", "DirectNoRecheck", "NoteTrustsALoad", "FirstOnly"}
 
 \* The ticket numbers of the run.
 Slots == 1..MaxSlots
@@ -241,29 +241,50 @@ VARIABLES
   nearMark,
   \* Whether each thread, its commit done, still has to tell the orders the
   \* frontier named (pipeline.rs, drive calling wake_near).
-  owes
+  owes,
+  \* How many times the write unit has been claimed: the claim a waiter saw
+  \* is told from a later one (the claim number in WriteUnit.word).
+  claimNo,
+  \* The claim each thread saw when it found the unit taken, 0 for none:
+  \* the claim its note is for (write_unit.rs, bring_written, `seen`).
+  saw,
+  \* Every claim a note was ever put on: what a stale load of the unit's
+  \* word could still show (only mutant NoteTrustsALoad reads it).
+  noted,
+  \* The record each thread is about to park on, having found it in
+  \* another's hands, 0 for none (between the look and the park).
+  looking
 
 \* All of the above, so "nothing changed" can be said in one word.
 vars == <<tail, cell, owner, dec, sq, ep, ap, wr, failed, logOf, memOf, dto, frozen, tipIdx,
           tipNext, tipUsed, epoch, logEp, memGen, gen, durable, pub, visible, round, target, claimant,
           rbLast, poisoned, fails, pc, snap, hor, mine, seen, stopped, fly, filled, writer, gathered,
           asleep, sleepOn, late, wanted, filling, encoding, runEnd, turnAsleep, turnAt, nearTo, wokenTo,
-          nearMark, owes>>
+          nearMark, owes, claimNo, saw, noted, looking>>
 
 \* Groups of variables an action leaves alone, named once so each action
 \* can say so in a line.
-\* The write unit and the threads that wait on records.
+\* Every variable of the write unit and of the threads that wait: the
+\* filled records, the unit's holder and its run, the parked threads and
+\* their notes, the encodings under way, and the parks far from the turn
+\* with their naming and telling.
 writeVars == <<filled, writer, gathered, asleep, sleepOn, late, wanted, filling, encoding, runEnd,
-               turnAsleep, turnAt, nearTo, wokenTo, nearMark, owes>>
-\* The naming and telling of orders whose turn is near (step 2).
+               turnAsleep, turnAt, nearTo, wokenTo, nearMark, owes, claimNo, saw, noted, looking>>
+\* The naming and telling of orders whose turn is near (step 2): how far
+\* the frontier named, how far a finished commit told, which orders are
+\* marked near, and who still has to tell.
 wakeVars == <<nearTo, wokenTo, nearMark, owes>>
-\* The encoding claims, the run ends, the far-from-turn parks and their
-\* wakes: what the write unit's own steps leave alone, named once.
-moreVars == <<filling, encoding, runEnd, turnAsleep, turnAt, wakeVars>>
-\* What a step that moves the decided frontier or tells an owner leaves
-\* alone among the write unit's variables.
+\* The claim count, the claim each waiter saw, the claims ever noted, and
+\* the parks under way.
+noteVars == <<claimNo, saw, noted, looking>>
+\* What most write-unit steps leave alone: the encodings under way, the
+\* runs' last records, the parks far from the turn, and the two groups
+\* above.
+moreVars == <<filling, encoding, runEnd, turnAsleep, turnAt, wakeVars, noteVars>>
+\* The write unit's variables that a step moving a frontier or telling an
+\* owner leaves alone: all of them but the naming and telling.
 unitVars == <<filled, writer, gathered, asleep, sleepOn, late, wanted, filling, encoding, runEnd,
-              turnAsleep, turnAt>>
+              turnAsleep, turnAt, noteVars>>
 \* The ring's cells and who owns them.
 ringVars == <<tail, cell, owner>>
 \* What is decided for each order.
@@ -368,6 +389,8 @@ Live(a) == a \notin stopped
 Helping(a) == Live(a) /\ pc[a] = "ready" /\ a \notin asleep /\ late[a] = 0
               \* (Nor asleep far from its turn, nor in the middle of an encoding.)
               /\ a \notin turnAsleep /\ encoding[a] = 0
+              \* (Nor about to park.)
+              /\ looking[a] = 0
 
 \* Thread a stands behind an ordered unit another thread claimed: it waits
 \* for that thread to finish the unit and does nothing else meanwhile.

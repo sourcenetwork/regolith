@@ -830,19 +830,24 @@ tla:
     check MC_CommitPipeline_Green_Copies_Parks              RED NeverAsleep
     check MC_CommitPipeline_Green_Copies_Steals             RED NeverStolen
     check MC_CommitPipeline_Green_Copies_Woken              GREEN
-    check MC_CommitPipeline_Green_Copies_Stop               GREEN
+    check MC_CommitPipeline_Green_Copies_Stop_Head1         GREEN
+    check MC_CommitPipeline_Green_Copies_Stop_Head2         GREEN
     check MC_CommitPipeline_Green_Copies_Stop_Holder        RED HolderNeverStops
-    check MC_CommitPipeline_Green_Copies_Rollback           GREEN
+    check MC_CommitPipeline_Green_Copies_Rollback_Head1     GREEN
+    check MC_CommitPipeline_Green_Copies_Rollback_Head2     GREEN
     check MC_CommitPipeline_Red_SyncNoWait                  RED NoWriteUnderSync
     check MC_CommitPipeline_Red_StealNoRecheck              RED NoWriteUnderSync
     check MC_CommitPipeline_Red_GatherBeforeCountIn         RED NoWriteUnderSync
     check MC_CommitPipeline_Red_LostWake                    RED NoLiveThreadBlocked
+    # Three threads (about 55 s, the one row over 20 s): a parked thread
+    # that trusts a load showing an old claim's note sleeps for good.
+    check MC_CommitPipeline_Red_NoteTrustsALoad             RED NoLiveThreadBlocked
     check MC_CommitPipeline_Green_Copies_HelperEncodes      RED OwnersEncodeOwn
     check MC_CommitPipeline_Green_Copies_RunPastOwn         RED NoRunPastOwn
     check MC_CommitPipeline_Red_EncodeNoClaim               RED OneEncoder
     check MC_CommitPipeline_Red_RunSkipsCheck               RED DurableBeforeVisible
-    # The fast path (WU8): a lone owner writes its record by itself when the
-    # unit is free and no write is in flight. Green_Direct_AnyTime takes it
+    # The fast path (WU8): an owner writes its record by itself when it finds
+    # the unit free with no note on it. Green_Direct_AnyTime takes it
     # with its guard removed and stays GREEN: the guard is about speed, the
     # look again once counted in keeps it safe (Red_DirectNoRecheck). Loom:
     # the_fast_path_racing_a_claimer_writes_only_whole_records.
