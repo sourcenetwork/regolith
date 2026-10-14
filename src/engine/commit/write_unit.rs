@@ -34,7 +34,7 @@
 //!
 //! - **A blocking commit** ([`Await::Park`]) spins about as long as one
 //!   write takes, then parks on the record. Whoever writes it, fills it or
-//!   fails it wakes it, and the holder that lets the unit go wakes the first
+//!   fails it wakes it, and the holder that lets the unit go wakes every
 //!   parked record that is still waiting (WU4). Its patience is bounded: past
 //!   [`PATIENCE`] since it first had to wait, or once the decided frontier
 //!   moved [`FRONTIER_PATIENCE`] slots while the claim it saw stayed put, or
@@ -71,10 +71,11 @@
 //!   the count out (WG2).
 //! - **WU4, no lost wake.** A thread parks only after it is on the record's
 //!   list with `PARKED` set (D5), and, for a filled record, after it marked
-//!   the claim it saw as wanted; it then looks again. Whoever writes, fills
-//!   or fails the record reads `PARKED` in the same read-modify-write, and
-//!   the holder reads `WANTED` in the swap that lets the unit go. One of
-//!   each pair sees the other.
+//!   the claim it saw as wanted, with a compare-and-swap that reads the
+//!   word as it is now; it then looks again. Whoever writes, fills or fails
+//!   the record reads `PARKED` in the same read-modify-write, and the holder
+//!   reads `WANTED` in the swap that lets the unit go and then wakes every
+//!   record still waiting. One of each pair sees the other.
 //! - **WU5, a park is bounded.** A blocking waiter parks for at most
 //!   [`PATIENCE`] in all before it writes the record itself, and the
 //!   logical triggers end it sooner, without a clock: a preempted holder
@@ -115,7 +116,7 @@ use crate::sync::internal::{Arc as RingArc, AtomicPtr, AtomicU64, AtomicUsize, O
 /// The unit is claimed.
 pub(super) const CLAIMED: u64 = 1;
 /// A blocking thread parked for the next claim: the holder that lets the
-/// unit go wakes the first parked record still waiting (WU4).
+/// unit go wakes every parked record still waiting (WU4).
 pub(super) const WANTED: u64 = 1 << 1;
 /// A `commit_nowait` commit left the unit on its queue: the holder that
 /// lets the unit go releases the line job its queue waits on.
@@ -290,6 +291,19 @@ impl WriteUnit {
         Some(Arc::clone(&self.line.load().job))
     }
 
+    /// What the holder of a claim let go with `notes` owes its waiters: the
+    /// line job released when a `commit_nowait` commit was queued on it
+    /// (D53), and `true` when a waiter noted it, so that every record still
+    /// waiting for the unit must be woken ([`wake_if_waiting`], WU4). Every
+    /// one, not the first only: a note put on a free unit for the next
+    /// holder is read by nobody when nobody claims it again.
+    pub(super) fn tell(&self, notes: u64) -> bool {
+        if notes & QUEUED != 0 {
+            self.tell_line();
+        }
+        notes & WANTED != 0
+    }
+
     /// Release the line job, after a claim a commit was queued on was let
     /// go, and put a fresh one in its place.
     pub(super) fn tell_line(&self) {
@@ -460,6 +474,16 @@ pub(super) fn stage_buffer() -> (usize, *const u8) {
 /// parked on it (WU4). What the holder that lets the unit go looks for.
 pub(super) fn waits_for_the_unit(flags: u64) -> bool {
     flags & (FILLED | PARKED | WRITTEN | FAILED) == FILLED | PARKED
+}
+
+/// Wake whoever sleeps on `desc` waiting for the unit (WU4). `PARKED` is a
+/// hint that stays set once a thread parked on the slot: a slot whose
+/// sleepers left costs one look at an empty list. It is not cleared when a
+/// sleeper leaves, since another thread may be parking on the same slot.
+pub(super) fn wake_if_waiting(desc: &Descriptor) {
+    if waits_for_the_unit(desc.flags()) {
+        desc.wake();
+    }
 }
 
 /// Frame slot `desc`'s record, decided as `decision` with its place at
@@ -668,7 +692,7 @@ impl RegolithEngine {
 
     /// Park on slot `desc` until it is woken or the patience left runs out
     /// (WU4, WU5). A filled record marks the claim `seen` as wanted, so the
-    /// holder that lets it go wakes the first parked record still waiting;
+    /// holder that lets it go wakes every parked record still waiting;
     /// an unfilled one waits for its owner to fill it.
     fn park_on(
         &self,
@@ -929,14 +953,12 @@ impl RegolithEngine {
         Tried::Wrote
     }
 
-    /// The claim `claimed` was let go with `notes` on it: wake the first
-    /// parked record still waiting for the unit, and release the line job
-    /// the queues of `commit_nowait` commits wait on (WU4, D53).
+    /// The claim `claimed` was let go with `notes` on it: release the line
+    /// job the queues of `commit_nowait` commits wait on, and wake every
+    /// record still waiting for the unit (WU4, D53). Bounded by the ring:
+    /// only slots past the published frontier and up to the decided one.
     fn tell_waiters(&self, pipe: &Pipeline, notes: u64) {
-        if notes & QUEUED != 0 {
-            pipe.writes.tell_line();
-        }
-        if notes & WANTED == 0 {
+        if !pipe.writes.tell(notes) {
             return;
         }
         let start = pipe
@@ -945,23 +967,12 @@ impl RegolithEngine {
             .load(Ordering::Acquire)
             .max(pipe.ring.published())
             + 1;
-        let mut woke = false;
         for index in start..=pipe.ring.decided() {
-            let desc = match pipe.ring.load(index) {
-                Loaded::Ready(desc) => desc,
-                Loaded::Void | Loaded::Gone => continue,
+            match pipe.ring.load(index) {
+                Loaded::Ready(desc) => wake_if_waiting(&desc),
+                Loaded::Void | Loaded::Gone => {}
                 Loaded::Empty | Loaded::Full => break,
-            };
-            if !waits_for_the_unit(desc.flags()) {
-                continue;
             }
-            if woke {
-                // Another parked record: the next claim's holder looks too.
-                pipe.writes.word.fetch_or(WANTED, Ordering::AcqRel);
-                return;
-            }
-            desc.wake();
-            woke = true;
         }
     }
 }
