@@ -188,7 +188,7 @@ pub(crate) fn explore(
 /// Models with three threads that each make several atomic accesses need
 /// one: unbounded, their search runs for hours without reaching a new kind
 /// of interleaving.
-fn explore_bounded(
+pub(crate) fn explore_bounded(
     name: &'static str,
     preemptions: Option<usize>,
     min_interleavings: usize,

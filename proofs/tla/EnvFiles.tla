@@ -33,12 +33,32 @@
 \* reads any more: A's append "finished", but no later read can see it.
 \* With the freeze, A's publishing CAS fails, and A appends again on E2.
 \*
+\* PART 3, a table renamed while its handles reopen it. Under
+\* max_open_files a table's file is closed while it is not read, and
+\* reopened by name (PathEntry::reopen, src/env/open_file_limit/mod.rs).
+\* A compaction that removes a table some reader still holds renames the
+\* file aside instead (Shared::relocate): it first records both names (the
+\* old one as "previous"), then asks the Env to rename, then records only
+\* the new one. A reopen loads the names and tries "previous", then
+\* "current". Two things must hold for that to always find the file:
+\*   - the Env's rename puts the file under the new name BEFORE it takes it
+\*     from the old one (MemEnv::rename, and the OPFS mirror and pool), so
+\*     at every instant one of the two names holds it;
+\*   - a reopen that loaded the names before the whole move ran (it knows
+\*     only the old name, and the file is already under the new one) loads
+\*     the names again when its open finds nothing, and tries again.
+\* Tiny example. Thread 1 loads the names: "A". Thread 2 moves the table
+\* to "B" from start to end. Thread 1 opens "A": nothing there. It loads
+\* the names again, sees "B", and opens "B".
+\*
 \* What this model checks cannot happen:
 \*   - a disk read returns bytes from another offset (ReadsOwnBytes);
 \*   - a memory read misses a write that finished before it began
 \*     (ReadSeesFinished), or the current buffer misses one
 \*     (CurrentHoldsFinished);
-\*   - a record lands twice (AtMostOnce).
+\*   - a record lands twice (AtMostOnce);
+\*   - a reopen finds the file under none of its names while it is being
+\*     renamed (OpenFindsFile).
 \*
 \* WHAT IS MODELLED, and the code each piece mirrors:
 \*   cursor, pgot     the shared position of a seek-then-read file, and
@@ -49,6 +69,9 @@
 \*   wbit, frozen     the WRITER and FROZEN bits of Extent::state
 \*   finished         the appends that returned
 \*   wpc.. / rpc..    each writer's and reader's step and what it holds
+\*   mph              how far the move has got (PathEntry::names and the
+\*                    Env's map: which names hold the file)
+\*   opc, over        each reopen's step, and which recorded names it loaded
 \*
 \* WHAT IS LEFT OUT, and why that loses nothing:
 \*   - Byte counts: a record is one slot of a sequence; an append of n
@@ -75,9 +98,19 @@
 \*                                   buffer is frozen NOW, though it was not
 \*                                   at its build: CurrentHoldsFinished
 \*                                   breaks.
+\*   MC_EnvFiles_Green_Rename        two reopens racing one move. Every rule
+\*                                   holds.
+\*   MC_EnvFiles_Red_RemoveFirst     the Env's rename takes the old name
+\*                                   before it adds the new one: OpenFindsFile
+\*                                   breaks.
+\*   MC_EnvFiles_Red_NoReload        a reopen that found nothing gives up
+\*                                   without loading the names again:
+\*                                   OpenFindsFile breaks.
 \*
-\* Lean, proofs/lean/Regolith/EnvFiles.lean, proves the same rules for
-\* every number of readers, writers and steps.
+\* Lean, proofs/lean/Regolith/EnvFiles.lean, proves the first four rules
+\* for every number of readers, writers and steps;
+\* proofs/lean/Regolith/EnvFilesRename.lean proves OpenFindsFile for every
+\* number of reopens and every order of steps.
 
 \* We use numbers, sequences and finite sets.
 EXTENDS Naturals, Sequences, FiniteSets
@@ -94,11 +127,16 @@ CONSTANTS
   MemReaders,
   \* How many buffers may ever exist (a bound for TLC).
   MaxExt,
+  \* Threads reopening a table while it is renamed aside (Part 3).
+  Openers,
   \* "none" for the real code, or the name of one planted bug.
   Mutant
 
 \* The bug names this model knows.
-ASSUME Mutant \in {"none", "SharedCursor", "NoFreeze", "StaleFrozen"}
+ASSUME Mutant \in {"none", "SharedCursor", "NoFreeze", "StaleFrozen",
+                   \* and Part 3's: a rename that removes first, a reopen
+                   \* that never loads the names again.
+                   "RemoveFirst", "NoReload"}
 \* Every disk reader reads one offset.
 ASSUME At \in [DiskReaders -> Nat]
 
@@ -159,16 +197,25 @@ VARIABLES
   \* [MemReaders -> Nat]: the length it loaded.
   rlen,
   \* [MemReaders -> Seq(Writers)]: what it read.
-  rgot
+  rgot,
+  \* Part 3: how far the move has got, 0 (not begun) to 4 (settled).
+  mph,
+  \* [Openers -> step name]: each reopen's step.
+  opc,
+  \* [Openers -> 0..2]: which recorded names each reopen loaded.
+  over
 
 \* All the variables, for "nothing else changes".
 \* The disk part's variables.
 diskVars == <<cursor, ppc, pgot>>
 \* The in-memory part's variables.
 memVars == <<cur, buf, len, wbit, frozen, nextExt, finished, wpc, wext, wlen,
+             \* (continued: the rest of the in-memory part)
              wsaw, wnew, rpc, rfin, rext, rlen, rgot>>
-\* Both together.
-vars == <<diskVars, memVars>>
+\* The rename part's variables.
+nameVars == <<mph, opc, over>>
+\* All three together.
+vars == <<diskVars, memVars, nameVars>>
 
 \* Every variable holds the kind of value it should.
 TypeOK ==
@@ -180,13 +227,22 @@ TypeOK ==
   /\ cur \in Exts
   \* Lengths are numbers and bits are booleans.
   /\ len \in [Exts -> Nat]
+  \* Each buffer's WRITER bit is a yes or a no.
   /\ wbit \in [Exts -> BOOLEAN]
+  \* Each buffer's FROZEN bit is a yes or a no.
   /\ frozen \in [Exts -> BOOLEAN]
   \* Finished appends are writers' records.
   /\ finished \subseteq Writers
   \* Each writer and memory reader is at one step.
   /\ wpc \in [Writers -> {"start", "claimed", "written", "built", "frozen", "done"}]
+  \* Each memory reader is at one step.
   /\ rpc \in [MemReaders -> {"start", "begun", "loaded", "lenread", "done"}]
+  \* The move is in one of its five phases.
+  /\ mph \in 0..4
+  \* Each reopen is at one step, holding one of the three recorded names.
+  /\ opc \in [Openers -> {"load", "prev", "cur", "reload", "found", "lost"}]
+  \* Each reopen holds one of the three recorded names.
+  /\ over \in [Openers -> 0..2]
 
 \* The start: an empty file in buffer 1, nobody has done anything.
 Init ==
@@ -194,14 +250,17 @@ Init ==
   /\ cursor = 0
   \* Disk readers have not read.
   /\ ppc = [r \in DiskReaders |-> "start"]
+  \* They have got nothing yet.
   /\ pgot = [r \in DiskReaders |-> 0]
   \* Readers load buffer 1.
   /\ cur = 1
   \* Every buffer is empty.
   /\ buf = [e \in Exts |-> <<>>]
+  \* Every buffer's published length is 0.
   /\ len = [e \in Exts |-> 0]
   \* No WRITER bit, nothing frozen.
   /\ wbit = [e \in Exts |-> FALSE]
+  \* No buffer is frozen.
   /\ frozen = [e \in Exts |-> FALSE]
   \* The next new buffer is number 2.
   /\ nextExt = 2
@@ -209,16 +268,30 @@ Init ==
   /\ finished = {}
   \* Every writer is about to append.
   /\ wpc = [w \in Writers |-> "start"]
+  \* Each writer works on buffer 1 to begin with.
   /\ wext = [w \in Writers |-> 1]
+  \* Each writer has seen length 0.
   /\ wlen = [w \in Writers |-> 0]
+  \* No writer has seen any bit set.
   /\ wsaw = [w \in Writers |-> [bit |-> FALSE, frz |-> FALSE]]
+  \* No writer has built a buffer.
   /\ wnew = [w \in Writers |-> <<>>]
   \* Every memory reader is about to read.
   /\ rpc = [r \in MemReaders |-> "start"]
+  \* No reader has noted any finished append.
   /\ rfin = [r \in MemReaders |-> {}]
+  \* Each reader would load buffer 1.
   /\ rext = [r \in MemReaders |-> 1]
+  \* Each reader has read no length.
   /\ rlen = [r \in MemReaders |-> 0]
+  \* Each reader has read nothing.
   /\ rgot = [r \in MemReaders |-> <<>>]
+  \* The move has not begun: the file is under "A", and the names say "A".
+  /\ mph = 0
+  \* Every reopen is about to load the names.
+  /\ opc = [o \in Openers |-> "load"]
+  \* Each reopen holds the names from before the move.
+  /\ over = [o \in Openers |-> 0]
 
 \* ---------------------------------------------------------------------------
 \* Part 1: disk reads.
@@ -233,6 +306,7 @@ PRead(r) ==
   /\ ppc[r] = "start"
   \* It gets the bytes at its own offset, in one step.
   /\ pgot' = [pgot EXCEPT ![r] = Data(At[r])]
+  \* The reader is done.
   /\ ppc' = [ppc EXCEPT ![r] = "done"]
   \* Nothing else changes.
   /\ UNCHANGED <<cursor, memVars>>
@@ -245,6 +319,7 @@ Seek(r) ==
   /\ ppc[r] = "start"
   \* The shared cursor goes to its offset.
   /\ cursor' = At[r]
+  \* It goes on to read at the cursor.
   /\ ppc' = [ppc EXCEPT ![r] = "sought"]
   \* Nothing else changes.
   /\ UNCHANGED <<pgot, memVars>>
@@ -255,6 +330,7 @@ ReadAtCursor(r) ==
   /\ ppc[r] = "sought"
   \* It gets the bytes at the cursor, which another reader may have moved.
   /\ pgot' = [pgot EXCEPT ![r] = Data(cursor)]
+  \* The reader is done.
   /\ ppc' = [ppc EXCEPT ![r] = "done"]
   \* Nothing else changes.
   /\ UNCHANGED <<cursor, memVars>>
@@ -270,15 +346,19 @@ InPlaceClaim(w) ==
   /\ wpc[w] = "start"
   \* The current buffer is free to append to.
   /\ ~wbit[cur]
+  \* ... and is not frozen.
   /\ ~frozen[cur]
   \* The CAS sets WRITER.
   /\ wbit' = [wbit EXCEPT ![cur] = TRUE]
   \* The writer remembers the buffer and its length.
   /\ wext' = [wext EXCEPT ![w] = cur]
+  \* It remembers the published length it saw.
   /\ wlen' = [wlen EXCEPT ![w] = len[cur]]
+  \* It goes on to write above that length.
   /\ wpc' = [wpc EXCEPT ![w] = "claimed"]
   \* Nothing else changes.
   /\ UNCHANGED <<diskVars, cur, buf, len, frozen, nextExt, finished, wsaw, wnew,
+                 \* (continued: the readers' variables)
                  rpc, rfin, rext, rlen, rgot>>
 
 \* An append in place, step 2: write the record just above the published
@@ -288,9 +368,11 @@ InPlaceWrite(w) ==
   /\ wpc[w] = "claimed"
   \* Its record goes right after the published records.
   /\ buf' = [buf EXCEPT ![wext[w]] = SubSeq(buf[wext[w]], 1, wlen[w]) \o <<w>>]
+  \* It goes on to publish.
   /\ wpc' = [wpc EXCEPT ![w] = "written"]
   \* Nothing else changes.
   /\ UNCHANGED <<diskVars, cur, len, wbit, frozen, nextExt, finished, wext, wlen,
+                 \* (continued: the rest of the in-memory part)
                  wsaw, wnew, rpc, rfin, rext, rlen, rgot>>
 
 \* An append in place, step 3: publish the new length with a CAS that
@@ -299,18 +381,25 @@ InPlaceWrite(w) ==
 InPlacePublish(w) ==
   \* The writer wrote its record.
   /\ wpc[w] = "written"
+  \* Call the writer's buffer e.
   /\ LET e == wext[w] IN
        \* Not frozen: the CAS publishes, and the append has finished.
        IF ~frozen[e]
+       \* The CAS wins: the length grows by its record ...
        THEN /\ len' = [len EXCEPT ![e] = wlen[w] + 1]
+            \* ... the WRITER bit is released ...
             /\ wbit' = [wbit EXCEPT ![e] = FALSE]
+            \* ... and the append has finished.
             /\ finished' = finished \cup {w}
+            \* The writer is done.
             /\ wpc' = [wpc EXCEPT ![w] = "done"]
        \* Frozen: the CAS fails; the buffer is dead and the writer retries.
        ELSE /\ wpc' = [wpc EXCEPT ![w] = "start"]
+            \* The length, the bit and the finished set stay.
             /\ UNCHANGED <<len, wbit, finished>>
   \* Nothing else changes.
   /\ UNCHANGED <<diskVars, cur, buf, frozen, nextExt, wext, wlen, wsaw, wnew,
+                 \* (continued: the readers' variables)
                  rpc, rfin, rext, rlen, rgot>>
 
 \* A copy, step 1: build a new buffer from the current one's published
@@ -318,16 +407,21 @@ InPlacePublish(w) ==
 CopyBuild(w) ==
   \* The writer is about to append, and a buffer number is left.
   /\ wpc[w] = "start"
+  \* A new buffer number is left.
   /\ nextExt <= MaxExt
   \* The new buffer: the published records, then this one.
   /\ wnew' = [wnew EXCEPT ![w] = SubSeq(buf[cur], 1, len[cur]) \o <<w>>]
   \* The writer remembers the buffer and the state word it saw.
   /\ wext' = [wext EXCEPT ![w] = cur]
+  \* It remembers the published length it saw.
   /\ wlen' = [wlen EXCEPT ![w] = len[cur]]
+  \* It remembers the bits it saw: the word its freeze CAS will expect.
   /\ wsaw' = [wsaw EXCEPT ![w] = [bit |-> wbit[cur], frz |-> frozen[cur]]]
+  \* It goes on to freeze the old buffer.
   /\ wpc' = [wpc EXCEPT ![w] = "built"]
   \* Nothing else changes.
   /\ UNCHANGED <<diskVars, cur, buf, len, wbit, frozen, nextExt, finished,
+                 \* (continued: the readers' variables)
                  rpc, rfin, rext, rlen, rgot>>
 
 \* A copy, step 2: freeze the old buffer with a CAS on the word it saw when
@@ -340,25 +434,34 @@ CopyBuild(w) ==
 CopyFreeze(w) ==
   \* The writer built its new buffer.
   /\ wpc[w] = "built"
+  \* Call the writer's buffer e.
   /\ LET e == wext[w] IN
        \* The bug NoFreeze, or a buffer frozen when it built: go straight to
        \* the swap. The bug StaleFrozen also goes straight on when the buffer
        \* is frozen NOW, though its length may have grown since the build.
        IF \/ Mutant = "NoFreeze"
+          \* ... it was already frozen when it built ...
           \/ wsaw[w].frz
+          \* ... or, with the bug StaleFrozen, it is frozen now ...
           \/ Mutant = "StaleFrozen" /\ frozen[e]
+       \* ... then it skips the freeze and goes on to swap.
        THEN /\ wpc' = [wpc EXCEPT ![w] = "frozen"]
+            \* No bit changes.
             /\ UNCHANGED frozen
        \* The word is still what it saw: the CAS sets FROZEN.
        ELSE IF len[e] = wlen[w] /\ wbit[e] = wsaw[w].bit /\ ~frozen[e]
+            \* Its CAS wins: the old buffer is frozen ...
             THEN /\ frozen' = [frozen EXCEPT ![e] = TRUE]
+                 \* ... and it goes on to swap.
                  /\ wpc' = [wpc EXCEPT ![w] = "frozen"]
             \* The word changed (an append published, or another copy froze
             \* it): start over.
             ELSE /\ wpc' = [wpc EXCEPT ![w] = "start"]
+                 \* No bit changes.
                  /\ UNCHANGED frozen
   \* Nothing else changes.
   /\ UNCHANGED <<diskVars, cur, buf, len, wbit, nextExt, finished, wext, wlen,
+                 \* (continued: the rest of the in-memory part)
                  wsaw, wnew, rpc, rfin, rext, rlen, rgot>>
 
 \* A copy, step 3: swap the new buffer in with a CAS on the file's pointer.
@@ -368,15 +471,21 @@ CopySwap(w) ==
   /\ wpc[w] = "frozen"
   \* The pointer still names the old buffer: the CAS wins ...
   /\ IF cur = wext[w]
+     \* Its CAS wins: readers now load the new buffer ...
      THEN /\ cur' = nextExt
           \* ... and the new buffer holds what the writer built, all published.
           /\ buf' = [buf EXCEPT ![nextExt] = wnew[w]]
+          \* ... published to its full length ...
           /\ len' = [len EXCEPT ![nextExt] = Len(wnew[w])]
+          \* ... and the next buffer number moves on.
           /\ nextExt' = nextExt + 1
+          \* ... and the append has finished.
           /\ finished' = finished \cup {w}
+          \* The writer is done.
           /\ wpc' = [wpc EXCEPT ![w] = "done"]
      \* ... otherwise another copy won: start over.
      ELSE /\ wpc' = [wpc EXCEPT ![w] = "start"]
+          \* The file and the finished set stay as they were.
           /\ UNCHANGED <<cur, buf, len, nextExt, finished>>
   \* Nothing else changes.
   /\ UNCHANGED <<diskVars, wbit, frozen, wext, wlen, wsaw, wnew, rpc, rfin, rext, rlen, rgot>>
@@ -387,9 +496,11 @@ ReadBegin(r) ==
   /\ rpc[r] = "start"
   \* Every append that returned before this moment must be seen.
   /\ rfin' = [rfin EXCEPT ![r] = finished]
+  \* It goes on to load the buffer.
   /\ rpc' = [rpc EXCEPT ![r] = "begun"]
   \* Nothing else changes.
   /\ UNCHANGED <<diskVars, cur, buf, len, wbit, frozen, nextExt, finished, wpc, wext,
+                 \* (continued: the rest of the in-memory part)
                  wlen, wsaw, wnew, rext, rlen, rgot>>
 
 \* A memory read, step 2: load the file's current buffer.
@@ -398,9 +509,11 @@ ReadLoad(r) ==
   /\ rpc[r] = "begun"
   \* It holds the buffer the pointer names now.
   /\ rext' = [rext EXCEPT ![r] = cur]
+  \* It goes on to read the length.
   /\ rpc' = [rpc EXCEPT ![r] = "loaded"]
   \* Nothing else changes.
   /\ UNCHANGED <<diskVars, cur, buf, len, wbit, frozen, nextExt, finished, wpc, wext,
+                 \* (continued: the rest of the in-memory part)
                  wlen, wsaw, wnew, rfin, rlen, rgot>>
 
 \* A memory read, step 3: load that buffer's published length.
@@ -409,9 +522,11 @@ ReadLen(r) ==
   /\ rpc[r] = "loaded"
   \* It reads the length published on it now.
   /\ rlen' = [rlen EXCEPT ![r] = len[rext[r]]]
+  \* It goes on to copy.
   /\ rpc' = [rpc EXCEPT ![r] = "lenread"]
   \* Nothing else changes.
   /\ UNCHANGED <<diskVars, cur, buf, len, wbit, frozen, nextExt, finished, wpc, wext,
+                 \* (continued: the rest of the in-memory part)
                  wlen, wsaw, wnew, rfin, rext, rgot>>
 
 \* A memory read, step 4: copy the records below that length.
@@ -420,18 +535,125 @@ ReadCopy(r) ==
   /\ rpc[r] = "lenread"
   \* It copies the published records of its buffer.
   /\ rgot' = [rgot EXCEPT ![r] = SubSeq(buf[rext[r]], 1, rlen[r])]
+  \* The reader is done.
   /\ rpc' = [rpc EXCEPT ![r] = "done"]
   \* Nothing else changes.
   /\ UNCHANGED <<diskVars, cur, buf, len, wbit, frozen, nextExt, finished, wpc, wext,
+                 \* (continued: the rest of the in-memory part)
                  wlen, wsaw, wnew, rfin, rext, rlen>>
+
+\* ---------------------------------------------------------------------------
+\* Part 3: a table renamed aside while its handles reopen it.
+\* ---------------------------------------------------------------------------
+
+\* The names the table's entry records (PathEntry::names), by how many
+\* times the move has stored them: 0 before the move, 1 while the rename
+\* runs (both names, the old as "previous"), 2 once it settled.
+NamesAt(v) ==
+  \* Before the move: only "A".
+  IF v = 0 THEN [cur |-> "A", prev |-> "none"]
+  \* During the rename: "B" now, and "A" as where it was.
+  ELSE IF v = 1 THEN [cur |-> "B", prev |-> "A"]
+  \* Settled: only "B".
+  ELSE [cur |-> "B", prev |-> "none"]
+
+\* Which names the move has stored so far, at phase p: 0 at phase 0, 1
+\* through phases 1 to 3 (the rename runs in between), 2 at phase 4.
+Version(p) ==
+  \* Nothing stored yet.
+  IF p = 0 THEN 0
+  \* The settled names are the last store.
+  ELSE IF p = 4 THEN 2
+  \* The names with "previous" stand while the Env renames.
+  ELSE 1
+
+\* Whether name n holds the file now. The Env's rename is two map writes,
+\* phases 2 and 3: the real one adds "B" (phase 2) before it takes "A"
+\* away (phase 3); the bug RemoveFirst takes "A" away first.
+Holds(n) ==
+  \* The old name, "A".
+  IF n = "A"
+  \* It holds the file until its removal.
+  THEN IF Mutant = "RemoveFirst" THEN mph < 2 ELSE mph < 3
+  \* The new name, "B": it holds the file from its insertion on.
+  ELSE IF Mutant = "RemoveFirst" THEN mph >= 3 ELSE mph >= 2
+
+\* The mover takes its next step, each one atomic: store both names (1),
+\* the Env's first map write (2), its second (3), store the settled names
+\* (4). Only when there are reopens to race, so the other configurations
+\* keep this part still.
+Move ==
+  \* There is a reopen to race, and the move is not done.
+  /\ Openers # {}
+  \* ... and the move is not done.
+  /\ mph < 4
+  \* One step further.
+  /\ mph' = mph + 1
+  \* No reopen moves in this step.
+  /\ UNCHANGED <<opc, over>>
+
+\* A reopen loads the names the entry records now (the Atom load).
+OLoad(o) ==
+  \* It is about to load.
+  /\ opc[o] = "load"
+  \* It holds the names stored so far.
+  /\ over' = [over EXCEPT ![o] = Version(mph)]
+  \* It tries "previous" first when there is one, else "current".
+  /\ opc' = [opc EXCEPT ![o] = IF NamesAt(Version(mph)).prev # "none" THEN "prev" ELSE "cur"]
+  \* The move does not step here.
+  /\ UNCHANGED mph
+
+\* A reopen opens its "previous" name: found, or it tries "current".
+OPrev(o) ==
+  \* It is trying "previous".
+  /\ opc[o] = "prev"
+  \* The file is there, or it goes on to "current".
+  /\ opc' = [opc EXCEPT ![o] = IF Holds(NamesAt(over[o]).prev) THEN "found" ELSE "cur"]
+  \* Nothing else changes.
+  /\ UNCHANGED <<mph, over>>
+
+\* A reopen opens its "current" name: found, or it looks at the names again.
+OCur(o) ==
+  \* It is trying "current".
+  /\ opc[o] = "cur"
+  \* The file is there, or it goes to look at the names again.
+  /\ opc' = [opc EXCEPT ![o] = IF Holds(NamesAt(over[o]).cur) THEN "found" ELSE "reload"]
+  \* Nothing else changes.
+  /\ UNCHANGED <<mph, over>>
+
+\* A reopen whose names held nothing loads them again: if a move stored new
+\* ones since, it tries those; if not, the file is really gone and it
+\* reports NotFound. The bug NoReload always reports NotFound here.
+OReload(o) ==
+  \* Both its names held nothing.
+  /\ opc[o] = "reload"
+  \* Newer names: start over with them; the same ones: give up.
+  /\ opc' = [opc EXCEPT ![o] =
+               \* (newer names, and not the bug: load them; else: NotFound)
+               IF Version(mph) # over[o] /\ Mutant # "NoReload" THEN "load" ELSE "lost"]
+  \* Nothing else changes.
+  /\ UNCHANGED <<mph, over>>
 
 \* Every step anyone can take.
 Next ==
-  \/ \E r \in DiskReaders : PRead(r) \/ Seek(r) \/ ReadAtCursor(r)
-  \/ \E w \in Writers :
-       \/ InPlaceClaim(w) \/ InPlaceWrite(w) \/ InPlacePublish(w)
-       \/ CopyBuild(w) \/ CopyFreeze(w) \/ CopySwap(w)
-  \/ \E r \in MemReaders : ReadBegin(r) \/ ReadLoad(r) \/ ReadLen(r) \/ ReadCopy(r)
+  \* Parts 1 and 2: Part 3's names do not change.
+  \/ /\ \/ \E r \in DiskReaders : PRead(r) \/ Seek(r) \/ ReadAtCursor(r)
+        \* Or a writer's step:
+        \/ \E w \in Writers :
+             \* an append in place, step by step,
+             \/ InPlaceClaim(w) \/ InPlaceWrite(w) \/ InPlacePublish(w)
+             \* or an append through a copy, step by step.
+             \/ CopyBuild(w) \/ CopyFreeze(w) \/ CopySwap(w)
+        \* Or a memory reader's step.
+        \/ \E r \in MemReaders : ReadBegin(r) \/ ReadLoad(r) \/ ReadLen(r) \/ ReadCopy(r)
+     \* (Part 3 stays still.)
+     /\ UNCHANGED nameVars
+  \* Part 3: the move, or a reopen's step; Parts 1 and 2 stay still.
+  \/ /\ \/ Move
+        \* Or a reopen's step.
+        \/ \E o \in Openers : OLoad(o) \/ OPrev(o) \/ OCur(o) \/ OReload(o)
+     \* (Parts 1 and 2 stay still.)
+     /\ UNCHANGED <<diskVars, memVars>>
 
 \* The behaviours: start in Init, take Next steps.
 Spec == Init /\ [][Next]_vars
@@ -466,5 +688,14 @@ AtMostOnce ==
   LET s == SubSeq(buf[cur], 1, len[cur]) IN
     \* ... hold no record at two positions.
     \A i, j \in 1..Len(s) : s[i] = s[j] => i = j
+
+\* A reopen always finds the file, however the move and it interleave.
+\* Rules out: the rename takes "A" away, a reopen tries "A" and then "B"
+\* before "B" is added, and the read fails on a table that exists. Rules
+\* out too: a reopen that knew only "A", while the whole move ran, giving
+\* up on "A" instead of looking at the names again.
+OpenFindsFile ==
+  \* No reopen ever ends up with nothing.
+  \A o \in Openers : opc[o] # "lost"
 
 ====
