@@ -35,7 +35,7 @@ fn a_serial_durable_writer_still_syncs_once_per_write() {
     let db = Db::open(dir.path(), durable_opts(Some(Arc::clone(&stats)))).unwrap();
 
     for i in 0..16 {
-        db.put(format!("k{i:03}").as_bytes(), b"v").unwrap();
+        regolith::through_stalls(|| db.put(format!("k{i:03}").as_bytes(), b"v")).unwrap();
     }
     assert_eq!(stats.get_ticker(Ticker::WalSyncCount), 16);
 }
@@ -96,7 +96,7 @@ fn a_snapshot_never_observes_a_torn_batch() {
                 for i in 0..BATCH {
                     batch.put(format!("b{round:04}_{i:02}").as_bytes(), b"v");
                 }
-                db.write(batch).unwrap();
+                regolith::through_stalls(|| db.write(batch.clone())).unwrap();
             }
         }));
     }
@@ -133,7 +133,7 @@ fn every_writer_reads_its_own_write_immediately() {
         handles.push(thread::spawn(move || {
             for i in 0..PER_WRITER {
                 let key = format!("ryw{w}_{i:05}");
-                db.put(key.as_bytes(), b"mine").unwrap();
+                regolith::through_stalls(|| db.put(key.as_bytes(), b"mine")).unwrap();
                 let snap = db.snapshot();
                 assert_eq!(
                     snap.get(key.as_bytes()).unwrap(),
@@ -161,8 +161,10 @@ fn every_committed_write_survives_a_reopen() {
             let db = Arc::clone(&db);
             handles.push(thread::spawn(move || {
                 for i in 0..PER_WRITER {
-                    db.put(format!("d{w}_{i:04}").as_bytes(), b"durable")
-                        .unwrap();
+                    regolith::through_stalls(|| {
+                        db.put(format!("d{w}_{i:04}").as_bytes(), b"durable")
+                    })
+                    .unwrap();
                 }
             }));
         }
@@ -205,7 +207,8 @@ fn every_synced_write_replays_from_the_wal_without_a_close() {
             let db = Arc::clone(&db);
             handles.push(thread::spawn(move || {
                 for i in 0..PER_WRITER {
-                    db.put(format!("wal{w}_{i:04}").as_bytes(), b"v").unwrap();
+                    regolith::through_stalls(|| db.put(format!("wal{w}_{i:04}").as_bytes(), b"v"))
+                        .unwrap();
                 }
             }));
         }
@@ -250,8 +253,10 @@ fn mixed_durability_writers_all_commit() {
         let db = Arc::clone(&db);
         handles.push(thread::spawn(move || {
             for i in 0..PER_LANE {
-                db.put_opt(&opts, format!("m{lane}_{i:04}").as_bytes(), b"v")
-                    .unwrap();
+                regolith::through_stalls(|| {
+                    db.put_opt(&opts, format!("m{lane}_{i:04}").as_bytes(), b"v")
+                })
+                .unwrap();
             }
         }));
     }
@@ -285,8 +290,10 @@ fn administrative_operations_still_exclude_writers() {
         writers.push(thread::spawn(move || {
             let mut i = 0usize;
             while !stop.load(Ordering::Acquire) {
-                db.put(format!("a{w}_{i:05}").as_bytes(), &[b'x'; 128])
-                    .unwrap();
+                regolith::through_stalls(|| {
+                    db.put(format!("a{w}_{i:05}").as_bytes(), &[b'x'; 128])
+                })
+                .unwrap();
                 i += 1;
             }
             i
@@ -295,7 +302,7 @@ fn administrative_operations_still_exclude_writers() {
 
     let deadline = Instant::now() + Duration::from_millis(500);
     while Instant::now() < deadline {
-        db.compact_range(None, None).unwrap();
+        db.compact_range(None, None).wait().unwrap();
     }
     stop.store(true, Ordering::Release);
 
@@ -322,7 +329,7 @@ fn a_batch_of_many_operations_gets_one_sync() {
     for i in 0..256 {
         batch.put(format!("batch{i:04}").as_bytes(), b"v");
     }
-    db.write(batch).unwrap();
+    regolith::through_stalls(|| db.write(batch.clone())).unwrap();
 
     assert_eq!(
         stats.get_ticker(Ticker::WalSyncCount),

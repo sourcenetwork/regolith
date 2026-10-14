@@ -1,9 +1,8 @@
 use super::*;
 use crate::env::{
-    Capabilities, DirEntry, FileLock, FileMeta, JoinHandle, MemEnv, ReadFile, WriteFile,
+    Capabilities, FileLock, FileMeta, JoinHandle, MemEnv, ReadDir, ReadFile, WriteFile,
 };
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
 
 fn legacy_manifest() -> Vec<u8> {
     // Spell out the original format so the fixture cannot change with
@@ -226,7 +225,7 @@ impl Env for RewriteFailureEnv {
         self.inner.create_dir_all(path)
     }
 
-    fn read_dir(&self, path: &Path) -> io::Result<Vec<DirEntry>> {
+    fn read_dir(&self, path: &Path) -> io::Result<ReadDir<'_>> {
         self.inner.read_dir(path)
     }
 
@@ -287,10 +286,6 @@ impl Env for RewriteFailureEnv {
         body: Box<dyn FnOnce() + Send + 'static>,
     ) -> io::Result<Box<dyn JoinHandle>> {
         self.inner.spawn(name, body)
-    }
-
-    fn sleep(&self, dur: Duration) {
-        self.inner.sleep(dur)
     }
 }
 

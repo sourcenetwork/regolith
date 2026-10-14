@@ -168,6 +168,7 @@ impl Txn {
             durability: self.durability,
             perf: crate::PerfContext::level(),
             early,
+            nowait: false,
         }))
     }
 
@@ -677,6 +678,7 @@ proptest! {
                         Settled::Write(seq) => Decided::Wrote(seq),
                         Settled::Committed { seq, .. } => Decided::Landed(seq),
                         Settled::Conflict { conflict, .. } => lost(&conflict),
+                        Settled::Pending { .. } => panic!("a blocking group was left pending"),
                     }),
             )
             .collect();

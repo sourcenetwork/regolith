@@ -30,12 +30,13 @@ pub fn open(dir: &TempDir) -> Db {
 }
 
 /// Put `count` sequential keys `key_000000..key_{count-1:06}` with
-/// value `val_{i:06}`. Predictable filler for write-path tests.
+/// value `val_{i:06}`. Predictable filler for write-path tests; a write a
+/// stall stops waits for the stall to clear, as a blocking caller does.
 pub fn fill_sequential(db: &Db, count: usize) {
     for i in 0..count {
         let k = format!("key_{:06}", i);
         let v = format!("val_{:06}", i);
-        db.put(k.as_bytes(), v.as_bytes()).unwrap();
+        regolith::through_stalls(|| db.put(k.as_bytes(), v.as_bytes())).unwrap();
     }
 }
 
@@ -78,7 +79,40 @@ fn count_with_extension(dir: &Path, ext: &str) -> usize {
 /// Force a full flush + compaction by calling `compact_range(None, None)`.
 /// Blocks until the compaction scheduler reports completion.
 pub fn force_compaction(db: &Db) {
-    db.compact_range(None, None).unwrap();
+    db.compact_range(None, None).wait().unwrap();
+}
+
+/// How long a call that must not wait, or must end, is given before a test
+/// calls it stuck. Far past anything a loaded host needs; a test only ever
+/// sits this long when it fails.
+pub const STUCK: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Run `call` on its own thread and hand back its result, failing the test
+/// when it has not returned by [`STUCK`]: how a test checks that a call does
+/// not wait, or does end, without hanging when it does not.
+pub fn returns<T: Send + 'static>(what: &str, call: impl FnOnce() -> T + Send + 'static) -> T {
+    let (done, result) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = done.send(call());
+    });
+    result
+        .recv_timeout(STUCK)
+        .unwrap_or_else(|_| panic!("{what} did not return in {STUCK:?}"))
+}
+
+/// Wait until `reached` holds, by [`STUCK`], with a bounded backoff and no
+/// fixed sleep; fails the test, naming `what`, when it never does.
+pub fn eventually(what: &str, mut reached: impl FnMut() -> bool) {
+    let deadline = std::time::Instant::now() + STUCK;
+    let mut backoff = std::time::Duration::from_micros(50);
+    while !reached() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{what}: not in {STUCK:?}"
+        );
+        std::thread::sleep(backoff);
+        backoff = (backoff * 2).min(std::time::Duration::from_millis(5));
+    }
 }
 
 /// Fault injection: subprocess crash harness, power-loss simulation,

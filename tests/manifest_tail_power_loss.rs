@@ -58,8 +58,10 @@ fn flush_then_die(spec: &ChildSpec) {
     let ops = history.ops();
     for op in &ops[..ops.len() / 2] {
         match &op.value {
-            OpValue::Put(v) => db.put(&op.key, v).expect("child: put"),
-            OpValue::Delete => db.delete(&op.key).expect("child: delete"),
+            OpValue::Put(v) => regolith::through_stalls(|| db.put(&op.key, v)).expect("child: put"),
+            OpValue::Delete => {
+                regolith::through_stalls(|| db.delete(&op.key)).expect("child: delete")
+            }
         }
     }
     db.flush().expect("child: flush");

@@ -49,7 +49,7 @@ fn ingest_under_concurrent_writers_stays_visible_and_loses_nothing() {
                 for k in 0..8 {
                     batch.put(format!("w{w}_{round:06}_{k}").as_bytes(), b"v");
                 }
-                db.write(batch).unwrap();
+                regolith::through_stalls(|| db.write(batch.clone())).unwrap();
                 written.fetch_add(1, Ordering::Relaxed);
                 round += 1;
             }
@@ -70,6 +70,7 @@ fn ingest_under_concurrent_writers_stays_visible_and_loses_nothing() {
                 ..IngestOptions::default()
             },
         )
+        .wait()
         .unwrap();
 
         // Visible immediately, from this thread and from a fresh snapshot.
@@ -172,8 +173,10 @@ fn wal_disabled_writers_in_a_group_do_not_break_recovery() {
                 ..regolith::WriteOptions::default()
             };
             for i in 0..500usize {
-                db.put_opt(&wo, format!("d{w}_{i:04}").as_bytes(), b"v")
-                    .unwrap();
+                regolith::through_stalls(|| {
+                    db.put_opt(&wo, format!("d{w}_{i:04}").as_bytes(), b"v")
+                })
+                .unwrap();
             }
         }));
     }

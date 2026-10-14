@@ -434,24 +434,24 @@ proptest! {
             match *step {
                 Step::Put(n) => {
                     let value = format!("value-{n}-{index}-{}", "x".repeat(40)).into_bytes();
-                    db.put(&key(n), &value).unwrap();
+                    crate::through_stalls(|| db.put(&key(n), &value)).unwrap();
                     model.insert(key(n), value);
                 }
                 Step::Delete(n) => {
-                    db.delete(&key(n)).unwrap();
+                    crate::through_stalls(|| db.delete(&key(n))).unwrap();
                     model.remove(&key(n));
                 }
                 Step::DeleteRange(lo, hi) => {
-                    db.delete_range(&key(lo), &key(hi)).unwrap();
+                    crate::through_stalls(|| db.delete_range(&key(lo), &key(hi))).unwrap();
                     model.retain(|k, _| !(key(lo)..key(hi)).contains(k));
                 }
                 Step::Flush => db.flush().unwrap(),
                 Step::Pick => {
                     db.compact_step().unwrap();
                 }
-                Step::Settle => db.compact_range(None, None).unwrap(),
+                Step::Settle => db.compact_range(None, None).wait().unwrap(),
                 Step::Bounded(lo, hi) => {
-                    db.compact_range(Some(&key(lo)), Some(&key(hi))).unwrap();
+                    db.compact_range(Some(&key(lo)), Some(&key(hi))).wait().unwrap();
                 }
             }
             prop_assert!(

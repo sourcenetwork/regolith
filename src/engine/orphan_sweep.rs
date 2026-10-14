@@ -18,6 +18,10 @@
 //! so no other writer can be creating one of these files. Removing them
 //! is idempotent: a crash part way through leaves a directory the next
 //! open sweeps the same way.
+//!
+//! The directory is walked one entry at a time and each orphan is removed
+//! as the walk reaches it, so the sweep holds the version's live ids,
+//! which the open holds anyway, and one entry, never the directory.
 
 use std::collections::HashSet;
 use std::io;
@@ -48,11 +52,17 @@ pub(crate) fn sweep_unreferenced_tables(
         return Ok(report);
     }
     for entry in env.read_dir(sst_dir)? {
-        let Some(id) = table_id(&entry.path) else {
-            continue;
-        };
-        if live.contains(&id) || id >= version.next_file_id {
-            continue;
+        let entry = entry?;
+        // A table renamed aside on removal while a handle read it (see
+        // `env::open_file_limit`): its handles died with the process.
+        let removed = crate::env::is_removed_table(&entry.path);
+        if !removed {
+            let Some(id) = table_id(&entry.path) else {
+                continue;
+            };
+            if live.contains(&id) || id >= version.next_file_id {
+                continue;
+            }
         }
         let len = env.metadata(&entry.path).map(|m| m.len).unwrap_or(0);
         match env.remove_file(&entry.path) {
@@ -131,6 +141,18 @@ mod tests {
         assert_eq!(report.files, 0);
         assert!(dir.path().join("000010.sst").exists());
         assert!(dir.path().join("000042.sst").exists());
+    }
+
+    #[test]
+    fn removes_tables_renamed_aside_on_removal() {
+        let dir = tempfile::tempdir().unwrap();
+        touch(dir.path(), "000003.sst.removed-17", 10);
+        touch(dir.path(), "000004.sst", 1);
+        let report =
+            sweep_unreferenced_tables(&*std_env(), dir.path(), &version_with_next_id(4)).unwrap();
+        assert_eq!(report.files, 1);
+        assert!(!dir.path().join("000003.sst.removed-17").exists());
+        assert!(dir.path().join("000004.sst").exists());
     }
 
     #[test]

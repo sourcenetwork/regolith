@@ -37,7 +37,8 @@
 mod buffered;
 mod db_lock;
 mod mem_env;
-mod open_file_limit;
+pub(crate) mod mem_file;
+pub(crate) mod open_file_limit;
 mod types;
 // The browser's Origin Private File System. Only compiled for
 // `wasm32-unknown-unknown`, the one target with no `std::fs` at all;
@@ -48,6 +49,8 @@ pub mod opfs;
 #[cfg(any(test, all(target_arch = "wasm32", target_os = "unknown")))]
 mod persist_order;
 mod std_env;
+#[cfg(test)]
+pub(crate) mod walk_fault;
 // WASI has `std::fs` but no threads. `WasiEnv` delegates every
 // filesystem call to `StdEnv` and says so where it matters: a spawn
 // that explains itself instead of a bare `Unsupported`, and no
@@ -63,12 +66,39 @@ pub use types::{Capabilities, DirEntry, DiskSpace, FileMeta, WriteMode};
 pub use wasi::WasiEnv;
 
 pub(crate) use buffered::BufferedWriter;
-pub(crate) use open_file_limit::OpenFileLimit;
+pub(crate) use open_file_limit::{OpenFileLimit, is_removed_table};
 
 use std::io;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
+
+/// A walk over the entries directly under one directory, from
+/// [`Env::read_dir`]: each item is one entry, or the error that stopped the
+/// walk. It may borrow the environment, so it lives no longer than that.
+pub type ReadDir<'a> = Box<dyn Iterator<Item = io::Result<DirEntry>> + 'a>;
+
+/// The entries directly under `dir` in a flat namespace that keeps its
+/// files and its directories as two sets of whole paths, files first.
+///
+/// Lazy, so a walk holds what the two set iterators hold (one bucket of a
+/// kovan map each), never the listing. Shared by [`MemEnv`] and the OPFS
+/// stores, which keep their namespace that way.
+pub(crate) fn flat_children<'a>(
+    dir: &Path,
+    files: impl Iterator<Item = std::path::PathBuf> + 'a,
+    dirs: impl Iterator<Item = std::path::PathBuf> + 'a,
+) -> ReadDir<'a> {
+    let dir = dir.to_path_buf();
+    let under = move |path: &std::path::PathBuf| path.parent() == Some(dir.as_path());
+    let files = files.filter(under.clone()).map(|path| DirEntry {
+        path,
+        is_dir: false,
+    });
+    let dirs = dirs
+        .filter(under)
+        .map(|path| DirEntry { path, is_dir: true });
+    Box::new(files.chain(dirs).map(Ok))
+}
 
 /// Whether the target has more than one thread at all. A wasm module built
 /// without the `atomics` target feature has exactly one, and
@@ -95,9 +125,25 @@ pub trait Env: Send + Sync + std::fmt::Debug {
     /// directory already exists.
     fn create_dir_all(&self, path: &Path) -> io::Result<()>;
 
-    /// The entries directly under `path`, in unspecified order. regolith
-    /// sorts whatever it needs sorted.
-    fn read_dir(&self, path: &Path) -> io::Result<Vec<DirEntry>>;
+    /// Walk the entries directly under `path`, in unspecified order.
+    ///
+    /// The walk streams: an implementation holds a bounded batch of
+    /// entries at a time, whatever the directory holds (`readdir`'s
+    /// buffer, one bucket of an in-memory map), never the whole listing.
+    /// Every caller in regolith acts on each entry as it comes or keeps a
+    /// bounded subset of them, so no walk costs memory in proportion to
+    /// the directory. An implementation that collected the directory
+    /// before yielding would break that bound for every caller.
+    ///
+    /// An entry present for the whole walk is yielded exactly once. One
+    /// created, removed or renamed while the walk runs may or may not be
+    /// yielded, as POSIX `readdir` has it, so a caller may remove an entry
+    /// it was handed and keep walking.
+    ///
+    /// Opening a walk of a directory that does not exist fails with
+    /// [`std::io::ErrorKind::NotFound`]. An error part way through is
+    /// yielded as an `Err` item.
+    fn read_dir(&self, path: &Path) -> io::Result<ReadDir<'_>>;
 
     /// Open `path` for positional reading.
     fn open_read(&self, path: &Path) -> io::Result<Box<dyn ReadFile>>;
@@ -167,14 +213,6 @@ pub trait Env: Send + Sync + std::fmt::Debug {
         name: &str,
         body: Box<dyn FnOnce() + Send + 'static>,
     ) -> io::Result<Box<dyn JoinHandle>>;
-
-    /// Block the calling thread for `dur`.
-    ///
-    /// A no-op on a platform that cannot block. The only caller is the
-    /// per-write slowdown delay, which is back-pressure rather than
-    /// correctness, so skipping it costs throughput smoothing and
-    /// nothing else.
-    fn sleep(&self, dur: Duration);
 
     /// Free and total space on the filesystem holding `path`.
     ///
@@ -555,5 +593,45 @@ mod tests {
         env.set_clocks(Some(1_000), Some(0));
         assert_eq!(elapsed_micros(&env, Some(400)), Some(600));
         assert_eq!(elapsed_micros(&env, None), None);
+    }
+
+    #[test]
+    fn flat_children_are_the_direct_entries_files_first() {
+        let path = std::path::PathBuf::from;
+        let files = [
+            path("db/MANIFEST"),
+            path("db/sst/000001.sst"),
+            path("other/MANIFEST"),
+        ];
+        let dirs = [path("db"), path("db/sst"), path("db/sst/deeper")];
+        let listed: Vec<DirEntry> =
+            flat_children(Path::new("db"), files.into_iter(), dirs.into_iter())
+                .map(Result::unwrap)
+                .collect();
+        assert_eq!(
+            listed,
+            vec![
+                DirEntry {
+                    path: path("db/MANIFEST"),
+                    is_dir: false,
+                },
+                DirEntry {
+                    path: path("db/sst"),
+                    is_dir: true,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn flat_children_pull_the_namespace_only_as_far_as_the_walk_goes() {
+        let pulled = std::cell::Cell::new(0);
+        let files = (0..1_000).map(|i| {
+            pulled.set(pulled.get() + 1);
+            std::path::PathBuf::from(format!("db/{i}"))
+        });
+        let mut walk = flat_children(Path::new("db"), files, std::iter::empty());
+        assert_eq!(walk.next().unwrap().unwrap().file_name(), "0");
+        assert_eq!(pulled.get(), 1, "the walk read ahead of its caller");
     }
 }

@@ -50,7 +50,9 @@ fn build(tag: &str, block_cache_size: usize, keys: &[Vec<u8>]) -> (common::TempD
         }
         db.write(batch).expect("fill write");
     }
-    db.compact_range(None, None).expect("fill compaction");
+    db.compact_range(None, None)
+        .wait()
+        .expect("fill compaction");
     for k in keys {
         assert!(db.get(k).expect("warm read").is_some(), "key missing");
     }

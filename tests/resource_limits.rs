@@ -208,13 +208,13 @@ fn a_zero_length_key_and_a_zero_length_value_survive_flush_and_compaction() {
     let dir = TempDir::new().unwrap();
     let db = Db::open(dir.path(), opts_with(4 * 1024)).unwrap();
 
-    db.put(b"", b"").unwrap();
-    db.put(b"a", b"").unwrap();
-    db.put(b"b", b"nonempty").unwrap();
+    regolith::through_stalls(|| db.put(b"", b"")).unwrap();
+    regolith::through_stalls(|| db.put(b"a", b"")).unwrap();
+    regolith::through_stalls(|| db.put(b"b", b"nonempty")).unwrap();
     assert_eq!(db.get(b"").unwrap(), Some(Vec::new()));
     assert_eq!(db.get(b"absent").unwrap(), None);
 
-    db.compact_range(None, None).unwrap();
+    db.compact_range(None, None).wait().unwrap();
     assert_eq!(db.get(b"").unwrap(), Some(Vec::new()));
     assert_eq!(db.get(b"a").unwrap(), Some(Vec::new()));
 
@@ -232,8 +232,8 @@ fn a_zero_length_key_and_a_zero_length_value_survive_flush_and_compaction() {
     assert_eq!(db.get(b"").unwrap(), Some(Vec::new()));
     assert_eq!(db.get(b"b").unwrap(), Some(b"nonempty".to_vec()));
 
-    db.delete(b"").unwrap();
-    db.compact_range(None, None).unwrap();
+    regolith::through_stalls(|| db.delete(b"")).unwrap();
+    db.compact_range(None, None).wait().unwrap();
     assert_eq!(
         db.get(b"").unwrap(),
         None,
@@ -252,7 +252,7 @@ fn a_zero_length_key_and_a_zero_length_value_survive_flush_and_compaction() {
 fn a_write_batch_with_zero_operations_is_a_successful_no_op() {
     let dir = TempDir::new().unwrap();
     let db = Db::open(dir.path(), opts_with(4 * 1024)).unwrap();
-    db.put(b"k", b"v").unwrap();
+    regolith::through_stalls(|| db.put(b"k", b"v")).unwrap();
 
     let before = scan_in_order(&db);
     let memtable_before = db.get_int_property("regolith.cur-size-all-mem-tables");
@@ -261,7 +261,7 @@ fn a_write_batch_with_zero_operations_is_a_successful_no_op() {
     let empty = WriteBatch::new();
     assert_eq!(empty.len(), 0);
     assert!(empty.is_empty());
-    db.write(empty).unwrap();
+    regolith::through_stalls(|| db.write(empty.clone())).unwrap();
 
     assert_eq!(scan_in_order(&db), before, "an empty batch changed state");
     assert_eq!(
@@ -300,7 +300,7 @@ fn delete_range_covers_exactly_zero_one_and_all_keys() {
     let fresh = |dir: &TempDir| {
         let db = Db::open(dir.path(), opts_with(4 * 1024)).unwrap();
         for key in &keys {
-            db.put(key, b"v").unwrap();
+            regolith::through_stalls(|| db.put(key, b"v")).unwrap();
         }
         db
     };
@@ -308,15 +308,15 @@ fn delete_range_covers_exactly_zero_one_and_all_keys() {
     // Zero keys: a range that lies entirely past the last key.
     let dir = TempDir::new().unwrap();
     let db = fresh(&dir);
-    db.delete_range(b"m", b"z").unwrap();
+    regolith::through_stalls(|| db.delete_range(b"m", b"z")).unwrap();
     assert_eq!(scan_in_order(&db).len(), 5);
-    db.compact_range(None, None).unwrap();
+    db.compact_range(None, None).wait().unwrap();
     assert_eq!(scan_in_order(&db).len(), 5, "an empty range deleted data");
 
     // One key: the half-open range [c, d) holds exactly "c".
     let dir = TempDir::new().unwrap();
     let db = fresh(&dir);
-    db.delete_range(b"c", b"d").unwrap();
+    regolith::through_stalls(|| db.delete_range(b"c", b"d")).unwrap();
     let after = scan_in_order(&db);
     assert_eq!(after.len(), 4);
     assert!(!after.contains_key(b"c".as_slice()));
@@ -324,15 +324,15 @@ fn delete_range_covers_exactly_zero_one_and_all_keys() {
         after.contains_key(b"d".as_slice()),
         "the exclusive upper bound must survive"
     );
-    db.compact_range(None, None).unwrap();
+    db.compact_range(None, None).wait().unwrap();
     assert_eq!(scan_in_order(&db), after);
 
     // All keys: an unbounded-below range up past the last key.
     let dir = TempDir::new().unwrap();
     let db = fresh(&dir);
-    db.delete_range(b"", b"\xff").unwrap();
+    regolith::through_stalls(|| db.delete_range(b"", b"\xff")).unwrap();
     assert!(scan_in_order(&db).is_empty());
-    db.compact_range(None, None).unwrap();
+    db.compact_range(None, None).wait().unwrap();
     assert!(scan_in_order(&db).is_empty());
     db.close().unwrap();
     drop(db);
@@ -368,7 +368,7 @@ fn the_value_size_limit_is_exact_on_the_point_and_batch_paths() {
     let at_limit = seeded_bytes(0x5123_A11E, LIMIT);
     let over_limit = seeded_bytes(0x5123_A11E, LIMIT + 1);
 
-    db.put(b"exact", &at_limit).unwrap();
+    regolith::through_stalls(|| db.put(b"exact", &at_limit)).unwrap();
     assert_eq!(db.get(b"exact").unwrap(), Some(at_limit.clone()));
 
     expect_invalid_argument(db.put(b"over", &over_limit), "max_value_size");
@@ -379,7 +379,7 @@ fn the_value_size_limit_is_exact_on_the_point_and_batch_paths() {
 
     let mut batch = WriteBatch::new();
     batch.put(b"batch_exact", &at_limit);
-    db.write(batch).unwrap();
+    regolith::through_stalls(|| db.write(batch.clone())).unwrap();
     assert_eq!(db.get(b"batch_exact").unwrap(), Some(at_limit));
 
     let mut batch = WriteBatch::new();
@@ -414,22 +414,25 @@ fn the_key_size_limit_is_exact_on_the_point_and_batch_paths() {
     let at_limit = vec![b'k'; LIMIT];
     let over_limit = vec![b'k'; LIMIT + 1];
 
-    db.put(&at_limit, b"v").unwrap();
+    regolith::through_stalls(|| db.put(&at_limit, b"v")).unwrap();
     assert_eq!(db.get(&at_limit).unwrap(), Some(b"v".to_vec()));
-    db.delete(&at_limit).unwrap();
-    db.put(&at_limit, b"v").unwrap();
-    db.compact_range(Some(&at_limit), None).unwrap();
+    regolith::through_stalls(|| db.delete(&at_limit)).unwrap();
+    regolith::through_stalls(|| db.put(&at_limit, b"v")).unwrap();
+    db.compact_range(Some(&at_limit), None).wait().unwrap();
 
     expect_invalid_argument(db.put(&over_limit, b"v"), "max_key_size");
     expect_invalid_argument(db.delete(&over_limit), "max_key_size");
     expect_invalid_argument(db.delete_range(&over_limit, b"\xff"), "max_key_size");
     expect_invalid_argument(db.delete_range(b"", &over_limit), "max_key_size");
-    expect_invalid_argument(db.compact_range(Some(&over_limit), None), "max_key_size");
+    expect_invalid_argument(
+        db.compact_range(Some(&over_limit), None).wait(),
+        "max_key_size",
+    );
 
     let mut batch = WriteBatch::new();
     batch.put(&at_limit, b"batched");
     batch.delete_range(&at_limit, b"\xff");
-    db.write(batch).unwrap();
+    regolith::through_stalls(|| db.write(batch.clone())).unwrap();
 
     let mut batch = WriteBatch::new();
     batch.put(&over_limit, b"v");
@@ -489,12 +492,12 @@ fn the_default_size_maxima_round_trip_at_exactly_the_limit() {
         };
 
         let db = Db::open(dir.path(), Options::default()).unwrap();
-        db.put(b"biggest", &value).unwrap();
-        db.put(&key, b"long key").unwrap();
+        regolith::through_stalls(|| db.put(b"biggest", &value)).unwrap();
+        regolith::through_stalls(|| db.put(&key, b"long key")).unwrap();
         assert_eq!(db.get(b"biggest").unwrap().as_ref(), Some(&value));
         assert_eq!(db.get(&key).unwrap(), Some(b"long key".to_vec()));
 
-        db.compact_range(None, None).unwrap();
+        db.compact_range(None, None).wait().unwrap();
         assert_eq!(db.get(b"biggest").unwrap().as_ref(), Some(&value));
         assert_eq!(db.get(&key).unwrap(), Some(b"long key".to_vec()));
         db.close().unwrap();
@@ -525,12 +528,12 @@ fn one_key_overwritten_100_000_times_collapses_to_a_single_version() {
         let db = Db::open(dir.path(), opts_with(64 * 1024)).unwrap();
 
         for i in 0..WRITES {
-            db.put(b"hot", format!("v{i:07}").as_bytes()).unwrap();
+            regolith::through_stalls(|| db.put(b"hot", format!("v{i:07}").as_bytes())).unwrap();
         }
         let last = format!("v{:07}", WRITES - 1).into_bytes();
         assert_eq!(db.get(b"hot").unwrap(), Some(last.clone()));
 
-        db.compact_range(None, None).unwrap();
+        db.compact_range(None, None).wait().unwrap();
 
         let live = scan_in_order(&db);
         assert_eq!(live.len(), 1, "compaction kept more than the live version");
@@ -568,10 +571,12 @@ fn one_hundred_thousand_distinct_keys_scan_in_order() {
         let db = Db::open(dir.path(), opts_with(256 * 1024)).unwrap();
 
         for i in 0..KEYS {
-            db.put(
-                format!("key_{i:07}").as_bytes(),
-                format!("value_{i:07}").as_bytes(),
-            )
+            regolith::through_stalls(|| {
+                db.put(
+                    format!("key_{i:07}").as_bytes(),
+                    format!("value_{i:07}").as_bytes(),
+                )
+            })
             .unwrap();
         }
 
@@ -598,7 +603,7 @@ fn one_hundred_thousand_distinct_keys_scan_in_order() {
         iter.status().unwrap();
         assert_eq!(seen, KEYS, "the scan lost or invented keys");
 
-        db.compact_range(None, None).unwrap();
+        db.compact_range(None, None).wait().unwrap();
         assert_eq!(scan_in_order(&db).len(), KEYS);
     });
 }
@@ -616,7 +621,7 @@ fn a_write_batch_of_100_000_operations_applies_atomically() {
         const OPS: usize = 100_000;
         let dir = TempDir::new().unwrap();
         let db = Db::open(dir.path(), opts_with(256 * 1024)).unwrap();
-        db.put(b"sentinel", b"before").unwrap();
+        regolith::through_stalls(|| db.put(b"sentinel", b"before")).unwrap();
 
         let before = db.snapshot();
 
@@ -630,7 +635,7 @@ fn a_write_batch_of_100_000_operations_applies_atomically() {
             batch.delete(format!("b_{i:07}").as_bytes());
         }
         assert_eq!(batch.len(), OPS + OPS.div_ceil(10));
-        db.write(batch).unwrap();
+        regolith::through_stalls(|| db.write(batch.clone())).unwrap();
 
         assert_eq!(
             before.get(b"b_0000001").unwrap(),
@@ -692,8 +697,8 @@ fn megabyte_keys_mixed_with_short_keys_survive_prefix_compression() {
             let short = format!("p{i:02}_short").into_bytes();
             expected.insert(long.clone(), format!("long{i}").into_bytes());
             expected.insert(short.clone(), format!("short{i}").into_bytes());
-            db.put(&long, format!("long{i}").as_bytes()).unwrap();
-            db.put(&short, format!("short{i}").as_bytes()).unwrap();
+            regolith::through_stalls(|| db.put(&long, format!("long{i}").as_bytes())).unwrap();
+            regolith::through_stalls(|| db.put(&short, format!("short{i}").as_bytes())).unwrap();
         }
 
         // Four keys that share a full megabyte of prefix and differ only
@@ -703,7 +708,7 @@ fn megabyte_keys_mixed_with_short_keys_survive_prefix_compression() {
             key.extend_from_slice(&filler);
             key.extend_from_slice(format!("{j:04}").as_bytes());
             expected.insert(key.clone(), format!("shared{j}").into_bytes());
-            db.put(&key, format!("shared{j}").as_bytes()).unwrap();
+            regolith::through_stalls(|| db.put(&key, format!("shared{j}").as_bytes())).unwrap();
         }
 
         let verify = |db: &Db, stage: &str| {
@@ -730,7 +735,7 @@ fn megabyte_keys_mixed_with_short_keys_survive_prefix_compression() {
         };
 
         verify(&db, "in memory");
-        db.compact_range(None, None).unwrap();
+        db.compact_range(None, None).wait().unwrap();
         verify(&db, "after compaction");
         db.close().unwrap();
         drop(db);
@@ -772,7 +777,8 @@ fn a_deep_level_structure_still_answers_every_read() {
         for i in 0..KEYS {
             let key = format!("k{i:06}").into_bytes();
             let value = format!("value_for_{i:06}").into_bytes();
-            db.put(&key, &value).unwrap();
+            // Through stalls: a busy host's compaction worker falls behind.
+            regolith::through_stalls(|| db.put(&key, &value)).unwrap();
             expected.insert(key, value);
         }
 

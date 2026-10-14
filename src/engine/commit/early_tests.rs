@@ -258,6 +258,7 @@ fn split_commit(
         durability: DurabilityMode::Eventual,
         perf: crate::PerfLevel::Disable,
         early,
+        nowait: false,
     });
     let mut pipe = engine.pipeline.lock();
     let settled = engine
@@ -280,6 +281,7 @@ fn split_commit(
             latest: conflict.latest_seq(),
         },
         Ok(Settled::Write(_)) => panic!("a transaction settled as a plain write"),
+        Ok(Settled::Pending { .. }) => panic!("a blocking commit was left pending"),
         Err(e) => Outcome::Refused(e),
     };
     (outcome, false)
@@ -298,8 +300,11 @@ proptest! {
     /// The commit checked up to a horizon taken partway through the writes
     /// that follow its snapshot, and above it under the mutex, decides as the
     /// same commit checked in full once every write has landed. When the
-    /// check at the horizon settles the commit, the outcome is the same and
-    /// only which conflicting key it names may differ.
+    /// check at the horizon settles the commit, the commit aborts either
+    /// way and only the reason it names may differ: another conflicting
+    /// key, or a refusal a write above the horizon caused (a
+    /// content-addressed key that came to hold different bytes), which the
+    /// full check meets first.
     #[test]
     fn checking_up_to_a_horizon_then_above_it_decides_as_one_check(
         before in proptest::collection::vec(step(), 0..5),
@@ -336,7 +341,7 @@ proptest! {
         // nothing lands above it, so this is one check of every version.
         let (whole_outcome, _) = split_commit(&whole, checks, ops, || {});
         match (&split_outcome, &whole_outcome) {
-            (Outcome::Lost { .. }, Outcome::Lost { .. }) if settled_early => {}
+            (Outcome::Lost { .. }, Outcome::Lost { .. } | Outcome::Refused(_)) if settled_early => {}
             _ => prop_assert_eq!(&split_outcome, &whole_outcome),
         }
         prop_assert_eq!(read_all(&split), read_all(&whole));

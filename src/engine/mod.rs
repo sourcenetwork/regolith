@@ -12,9 +12,11 @@ pub(crate) mod commit;
 pub(crate) mod compaction;
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) mod compaction_backoff;
+pub(crate) mod compaction_gate;
 pub(crate) mod disk_check;
 pub(crate) mod filter_block;
 mod flush;
+mod foreground;
 pub(crate) mod index_block;
 mod ingest;
 #[cfg(test)]
@@ -37,6 +39,7 @@ pub(crate) mod range_tombstone;
 pub(crate) mod read_horizon;
 mod read_rule;
 pub(crate) mod read_view;
+mod reclaim;
 mod recovery;
 pub(crate) mod seal;
 pub(crate) mod skiplist;
@@ -48,26 +51,33 @@ pub(crate) mod wal;
 #[cfg(test)]
 mod wal_close_tests;
 pub(crate) mod wal_frame;
+#[cfg(test)]
+mod wal_order_tests;
 pub(crate) mod wal_replay;
 #[cfg(test)]
 mod wal_rotation_tests;
+mod wal_scan;
 pub(crate) mod wal_seal;
 pub(crate) mod wal_v1;
 
 use crate::portability::{AtomicBool, AtomicU8, AtomicU64, Ordering};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::sync::internal::{Gate, Mutex, MutexGuard, OwnedGateWriteGuard};
+use crate::sync::OnceCell;
+use crate::sync::internal::{Mutex, wait_here};
 use kovan_queue::array_queue::ArrayQueue;
 
-use background_health::{BackgroundHealth, Hazard, Job};
+use background_health::{BackgroundHealth, Job};
 use block_cache::BlockCache;
 pub(crate) use commit::PendingAppend;
+pub(crate) use commit::{GroupSync, NowaitCommit, Settled, TxnCommit, conclude_settled};
 use commit::{Pipeline, StallSignal, WriteSlot};
-use compaction::{CompactionOptions, CompactionOutcome, CompactionScheduler};
+use compaction::{Claims, CompactionOptions, CompactionOutcome, CompactionScheduler};
+use compaction_gate::{CompactionGate, Exclusive};
+pub(crate) use foreground::Work;
 use lookup_key::{LookupKey, with_key_scratch};
 use manifest::{VersionEdit, VersionSet};
 use memtable::{MemTable, MemTableConfig};
@@ -76,12 +86,13 @@ const STOP_TOO_MANY_MEMTABLES: &str = "stop: too many memtables";
 use log_retirement::RetiredLogs;
 use read_horizon::ReadHorizon;
 pub(crate) use read_rule::ReadRule;
-use read_view::{ReadView, ReadViewCell, VersionStore};
+use read_view::{ReadView, ReadViewCell, VersionStore, ViewGuard};
 use recovery::{
     replay_logs, report_discarded_tail, report_dropped_manifest_tail,
     rewrite_recovered_memtable_to_wal,
 };
 use skiplist::InsertHint;
+pub(crate) use snapshot_registry::SnapshotPin;
 use snapshot_registry::SnapshotRegistry;
 use source_walk::Source;
 
@@ -255,7 +266,7 @@ fn batch_op_wal_bytes(op: &WriteBatchOp) -> u64 {
 }
 
 fn memtable_needs_flush(memtable: &MemTable) -> bool {
-    !memtable.is_empty() || !memtable.clone_range_tombstones().is_empty()
+    !memtable.is_empty() || memtable.has_range_tombstones()
 }
 
 /// Apply one batch op to `memtable`, threading `hint` through the point
@@ -363,6 +374,8 @@ pub(crate) struct EngineOptions {
     pub(crate) universal_compaction_options: crate::options::UniversalCompactionOptions,
     pub(crate) evict_compaction_data_from_page_cache: bool,
     pub(crate) max_background_compactions: usize,
+    /// See [`crate::Options::inline_compaction`].
+    pub(crate) inline_compaction: bool,
     pub(crate) partitioned_index: bool,
     pub(crate) metadata_block_size: usize,
     pub(crate) cache_index_and_filter_blocks: bool,
@@ -429,17 +442,6 @@ impl EngineOptions {
             env: Arc::clone(&self.env),
         }
     }
-
-    /// The stall policy implied by this configuration: with no
-    /// background worker there is nobody to signal a parked writer, so
-    /// the writer compacts on its own thread instead.
-    pub(crate) fn stall_policy(&self) -> StallPolicy {
-        if self.max_background_compactions == 0 {
-            StallPolicy::CompactInline
-        } else {
-            StallPolicy::WaitForWorker
-        }
-    }
 }
 
 impl Default for EngineOptions {
@@ -476,6 +478,7 @@ impl Default for EngineOptions {
             universal_compaction_options: crate::options::UniversalCompactionOptions::default(),
             evict_compaction_data_from_page_cache: false,
             max_background_compactions: 1,
+            inline_compaction: false,
             partitioned_index: false,
             metadata_block_size: 4096,
             cache_index_and_filter_blocks: false,
@@ -498,6 +501,10 @@ const IO_QUEUE_BLOCKS: usize = 256;
 
 /// The core LSM-tree engine.
 pub(crate) struct RegolithEngine {
+    /// This engine, for the work it leaves on a queue (a commit group's
+    /// fsync, an owed step): held weakly, so pending work never keeps a
+    /// database open that every caller dropped.
+    me: std::sync::Weak<RegolithEngine>,
     /// The published read view: the active memtable, the frozen
     /// memtables and the version every read resolves against. Loading
     /// it is the whole of a read's source acquisition - one shared lock
@@ -522,21 +529,26 @@ pub(crate) struct RegolithEngine {
     /// true lives in [`ReadHorizon`], which is where it is model-checked.
     visible_seq: ReadHorizon,
     close_state: AtomicU8,
-    close_lock: Mutex<()>,
+    /// One close at a time; a second caller waits for the first and then
+    /// reads what it left in `close_state`. A [`crate::sync::Mutex`], so no
+    /// thread sleeps in the kernel on it: close is a call that chose to
+    /// block, and waits on its own thread.
+    close_lock: crate::sync::Mutex<()>,
     /// Transactions that `close` must abort. See `open_transactions`.
     open_transactions: open_transactions::OpenTransactions,
     active_wal: Mutex<Option<Wal>>,
     wal_id: AtomicU64,
     sst_dir: PathBuf,
     wal_dir: PathBuf,
-    compaction: Mutex<CompactionScheduler>,
-    /// Engine-wide RwLock that coordinates foreground and background
-    /// compaction. Background workers each hold a read lock so they
-    /// can run concurrently; foreground callers (`compact_range`,
-    /// `ingest_external_files`, `checkpoint_capture`) hold the write
-    /// lock to exclude all background activity for the duration of
-    /// their pass.
-    compaction_lock: Arc<Gate>,
+    /// The compaction workers. Every call on it takes `&self` and none
+    /// waits, so nothing guards it.
+    compaction: CompactionScheduler,
+    /// The engine-wide gate that keeps a compaction pass and the operations
+    /// that must not see a table replaced underneath them apart: a pass,
+    /// on a worker or on a caller's thread, holds it shared, and
+    /// `compact_range`, an ingest, a checkpoint, `drop_all` and a backup's
+    /// capture hold it alone (`compaction_gate.rs`).
+    compaction_gate: CompactionGate,
     /// Tracks the sequence numbers of every live snapshot so compaction
     /// can cut each key's versions into stripes no snapshot straddles,
     /// and drop or fold what no reader can see. A snapshot registers
@@ -544,6 +556,11 @@ pub(crate) struct RegolithEngine {
     /// the list with [`SnapshotRegistry::live_seqs`] once its inputs are
     /// fixed.
     snapshot_registry: Arc<SnapshotRegistry>,
+    /// The database's column-family registry, attached by `Db::open` before
+    /// the first write. The commit leader fences every write against it in
+    /// the ordered step (`commit::families`); an engine with none fences
+    /// nothing. Read with one atomic load once set.
+    families: std::sync::OnceLock<Arc<crate::column_family::CfRegistry>>,
     options: EngineOptions,
     /// Bounded ring of writers waiting for a commit group. Writers push a
     /// ticket here and park; they never block on `pipeline`, which is what
@@ -565,15 +582,13 @@ pub(crate) struct RegolithEngine {
     /// a tail no later write may extend, or when a caller's code panicked
     /// inside the commit's ordered step. Once set, every write fails loud
     /// with the original reason instead of appending after unknown bytes or
-    /// state.
-    write_latch: Mutex<Option<WriteLatch>>,
-    /// Cheap gate on `write_latch`, checked on every write.
-    write_latched: AtomicBool,
-    /// Signal used by foreground writers to wait out a "stop writes"
-    /// condition (too many L0 files, too many unflushed memtables).
-    /// The background compaction thread holds a clone of this `Arc`
-    /// and calls [`StallSignal::notify_all`] after each compaction
-    /// pass so blocked writers can re-check their thresholds.
+    /// state. Written once, by one compare-and-swap, so the first reason is
+    /// the one kept; every write checks it with one load.
+    write_latch: OnceCell<WriteLatch>,
+    /// The write stall: the level writers cache, and the unit writers a
+    /// stop threshold stopped wait on (D23). Whoever relieves a threshold
+    /// (a flush, a compaction pass on a worker or a caller's thread)
+    /// refreshes it, which lands the unit once writes may go on.
     stall_signal: Arc<StallSignal>,
     /// Cached stall level: 0 = none, 1 = slowdown, 2 = stop.
     /// Updated by `rotate_memtable` (after changing L0/memtable
@@ -583,19 +598,35 @@ pub(crate) struct RegolithEngine {
     /// level is nonzero, saving 2 lock round-trips per write in
     /// the common no-stall case.
     cached_stall_level: Arc<AtomicU8>,
-    /// How a stalled writer makes room. See [`StallPolicy`].
-    stall_policy: StallPolicy,
+    /// With no worker, a write stopped by a stall leaves the step that
+    /// clears it on its thread's queue, or runs it inline with no queue,
+    /// and a slowed write owes one ([`crate::Options::inline_compaction`]).
+    inline_compaction: bool,
     /// A compaction worker runs: it flushes what writers seal. Without one,
     /// a writer owes the flush itself (`background_step.rs`).
     has_worker: bool,
-    /// A database with no worker owes a bounded step of background work,
-    /// which the next write to leave the commit pipeline runs.
-    background_owed: AtomicBool,
-    /// File ids currently being compacted, shared with every background
-    /// worker and with [`RegolithEngine::run_one_compaction_pass`]. One set
-    /// for the whole engine is what stops a foreground pass and a
-    /// worker from picking overlapping inputs.
-    compaction_in_progress: Arc<Mutex<HashSet<u64>>>,
+    /// What a database with no worker owes the background, as
+    /// `background_step::OWED_*` bits: a bounded step of flush or
+    /// compaction, the disk check. The next write to leave the commit
+    /// pipeline runs it, on its thread's queue or inline (`background_step.rs`).
+    owed: AtomicU8,
+    /// A job running what is owed waits on some thread's queue: no second
+    /// one is left until it ran.
+    owed_queued: AtomicBool,
+    /// Where the disk check looks.
+    disk_dir: PathBuf,
+    /// A step relieving a stop waits on some thread's queue: no second one
+    /// is left until it ran (`background_step.rs`).
+    stall_step_queued: AtomicBool,
+    /// Steps in a row that found nothing to do while a stop held: past
+    /// [`Self::MAX_IDLE_PASSES`] the stop is one no step relieves.
+    stall_steps_idle: std::sync::atomic::AtomicUsize,
+    /// The tables compaction passes are working on, shared with every
+    /// background worker and with [`RegolithEngine::run_one_compaction_pass`].
+    /// One record for the whole engine is what stops a pass on a caller's
+    /// thread and a worker from picking overlapping inputs
+    /// (`compaction/claims.rs`).
+    compaction_claims: Arc<Claims>,
     /// Whether background flushes and compactions are currently failing.
     background_health: Arc<BackgroundHealth>,
     /// The host platform. Cloned out of [`EngineOptions`] so the read
@@ -604,30 +635,12 @@ pub(crate) struct RegolithEngine {
     _db_lock: Box<dyn FileLock>,
 }
 
-/// How a writer that has hit a "stop writes" threshold makes room.
-///
-/// Decided once at open from
-/// [`crate::Options::max_background_compactions`] and never
-/// re-evaluated, so write-stall behavior is a property of the
-/// configuration rather than of a runtime accident.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum StallPolicy {
-    /// Background workers exist. Park on the stall condvar until a
-    /// worker reports progress, re-checking on a bounded timeout.
-    WaitForWorker,
-    /// No background worker exists. The stalling writer is the
-    /// compactor: it performs the compaction itself, on its own
-    /// thread, and never parks.
-    CompactInline,
-}
-
 impl RegolithEngine {
     /// Open or create the database at the given path.
     pub(crate) fn open(db_dir: &Path, mut options: EngineOptions) -> std::io::Result<Arc<Self>> {
         options.read_only = false;
         let env = Arc::clone(&options.env);
         let db_lock = env.lock_file(db_dir, true)?;
-        disk_check::spawn(&env, db_dir.to_path_buf());
         let sst_dir = db_dir.join("sst");
         let wal_dir = db_dir.join("wal");
 
@@ -661,8 +674,7 @@ impl RegolithEngine {
         );
         let memtable = Arc::new(MemTable::new(&memtable_config)?);
         wal_seal::remove_staged(&*env, &wal_dir)?;
-        let mut wal_files = list_wal_files(&*env, &wal_dir)?;
-        wal_files.retain(|path| should_replay_wal(path, version.min_wal_id));
+        let wal_files = wal_scan::live(&*env, &wal_dir, version.min_wal_id)?;
 
         let (latest_seq, discarded) = replay_logs(
             &env,
@@ -717,29 +729,45 @@ impl RegolithEngine {
         );
         let compaction_opts = options.to_compaction_options();
 
-        let compaction_lock = Arc::new(Gate::new());
+        let compaction_gate = CompactionGate::new();
         let snapshot_registry = Arc::new(SnapshotRegistry::with_env(Arc::clone(&env)));
-        let stall_signal = Arc::new(StallSignal::new());
-        let compaction_in_progress = Arc::new(Mutex::new(HashSet::new()));
-        let background_health = Arc::new(BackgroundHealth::default());
+        let cached_stall_level = Arc::new(AtomicU8::new(0));
+        let stall_signal = Arc::new(StallSignal::new(
+            Arc::clone(&view),
+            options.clone(),
+            Arc::clone(&cached_stall_level),
+        ));
+        let compaction_claims = Arc::new(Claims::new());
+        let background_health = Arc::new(BackgroundHealth::relieving(Arc::clone(&stall_signal)));
         // `max_background_compactions == 0` starts no worker, which is
         // how a single-threaded target opens at all. A platform that
         // cannot spawn a worker it was asked for fails the open here
         // instead of aborting; the directory lock and the fresh WAL
         // drop with this return.
         let compaction = CompactionScheduler::start(
-            Arc::clone(&compaction_lock),
+            compaction_gate.clone(),
             Arc::clone(&snapshot_registry),
             Arc::clone(&versions),
             Arc::from(sst_dir.as_path()),
             Arc::clone(&cache),
             compaction_opts,
             Arc::clone(&stall_signal),
-            Arc::clone(&compaction_in_progress),
+            Arc::clone(&compaction_claims),
             Arc::clone(&background_health),
         )?;
         let has_worker = compaction.has_workers();
-        let cached_stall_level = Arc::new(AtomicU8::new(0));
+        // The disk check is background work (D15): never on the open path
+        // and never on a thread of its own. A worker runs it; with none, the
+        // first write owes it, on its thread's queue or inline.
+        let owed = if has_worker {
+            let check = disk_check::DiskCheck::new(Arc::clone(&env), db_dir.to_path_buf());
+            if let Err(check) = compaction.submit(Box::new(check)) {
+                check.release();
+            }
+            0
+        } else {
+            background_step::OWED_DISK_CHECK
+        };
         // The workers flush what writers seal (E9), through a flusher that
         // holds nothing of the engine, so a worker never keeps a database
         // open that every caller dropped.
@@ -751,14 +779,14 @@ impl RegolithEngine {
             options.clone(),
             Arc::clone(&background_health),
             Arc::clone(&stall_signal),
-            Arc::clone(&cached_stall_level),
         ));
         compaction.set_flush(Box::new({
             let flusher = Arc::clone(&flusher);
             move || flusher.flush_all_frozen()
         }));
 
-        let engine = Arc::new(Self {
+        let engine = Arc::new_cyclic(|me| Self {
+            me: me.clone(),
             view,
             memtable_config,
             versions,
@@ -766,27 +794,31 @@ impl RegolithEngine {
             latest_seq: AtomicU64::new(latest_seq),
             visible_seq: ReadHorizon::new(latest_seq),
             close_state: AtomicU8::new(CLOSE_STATE_OPEN),
-            close_lock: Mutex::new(()),
+            close_lock: crate::sync::Mutex::new(()),
             open_transactions: open_transactions::OpenTransactions::new(),
             active_wal: Mutex::new(Some(wal)),
             wal_id: AtomicU64::new(wal_id),
             sst_dir,
             wal_dir,
-            compaction: Mutex::new(compaction),
-            compaction_lock,
+            compaction,
+            compaction_gate,
             snapshot_registry,
-            stall_policy: options.stall_policy(),
+            families: std::sync::OnceLock::new(),
+            inline_compaction: options.inline_compaction,
             has_worker,
-            background_owed: AtomicBool::new(false),
+            owed: AtomicU8::new(owed),
+            owed_queued: AtomicBool::new(false),
+            disk_dir: db_dir.to_path_buf(),
+            stall_step_queued: AtomicBool::new(false),
+            stall_steps_idle: std::sync::atomic::AtomicUsize::new(0),
             options,
             commit_ring: Self::new_commit_ring(),
             pipeline: Mutex::new(Pipeline::new()),
             flusher,
-            write_latch: Mutex::new(None),
-            write_latched: AtomicBool::new(false),
+            write_latch: OnceCell::new(),
             stall_signal,
             cached_stall_level,
-            compaction_in_progress,
+            compaction_claims,
             background_health,
             env,
             _db_lock: db_lock,
@@ -853,8 +885,7 @@ impl RegolithEngine {
         let latest_seq = version.last_seq;
 
         let memtable = Arc::new(MemTable::new(&memtable_config)?);
-        let mut wal_files = list_wal_files(&*env, &wal_dir)?;
-        wal_files.retain(|path| should_replay_wal(path, version.min_wal_id));
+        let wal_files = wal_scan::live(&*env, &wal_dir, version.min_wal_id)?;
 
         // A read-only open writes nothing, so the tail stays in the file;
         // the next read-write open drops it again and truncates it.
@@ -884,12 +915,15 @@ impl RegolithEngine {
             version: versions.lock().current(),
         }));
         versions.attach_view(Arc::clone(&view));
-        let compaction_lock = Arc::new(Gate::new());
         let snapshot_registry = Arc::new(SnapshotRegistry::with_env(Arc::clone(&env)));
-        let stall_signal = Arc::new(StallSignal::new());
-        let wal_id = next_wal_id(version.next_file_id, &wal_files);
-        let background_health = Arc::new(BackgroundHealth::default());
         let cached_stall_level = Arc::new(AtomicU8::new(0));
+        let stall_signal = Arc::new(StallSignal::new(
+            Arc::clone(&view),
+            options.clone(),
+            Arc::clone(&cached_stall_level),
+        ));
+        let wal_id = next_wal_id(version.next_file_id, &wal_files);
+        let background_health = Arc::new(BackgroundHealth::relieving(Arc::clone(&stall_signal)));
         // Never flushes: a read-only engine refuses every write before one
         // could seal a memtable.
         let flusher = Arc::new(flush::Flusher::new(
@@ -900,10 +934,10 @@ impl RegolithEngine {
             options.clone(),
             Arc::clone(&background_health),
             Arc::clone(&stall_signal),
-            Arc::clone(&cached_stall_level),
         ));
 
-        Ok(Arc::new(Self {
+        Ok(Arc::new_cyclic(|me| Self {
+            me: me.clone(),
             view,
             memtable_config,
             versions,
@@ -911,32 +945,33 @@ impl RegolithEngine {
             latest_seq: AtomicU64::new(latest_seq),
             visible_seq: ReadHorizon::new(latest_seq),
             close_state: AtomicU8::new(CLOSE_STATE_OPEN),
-            close_lock: Mutex::new(()),
+            close_lock: crate::sync::Mutex::new(()),
             open_transactions: open_transactions::OpenTransactions::new(),
             active_wal: Mutex::new(None),
             wal_id: AtomicU64::new(wal_id),
             sst_dir,
             wal_dir,
-            compaction: Mutex::new(CompactionScheduler::disabled()),
-            compaction_lock,
+            compaction: CompactionScheduler::disabled(),
+            compaction_gate: CompactionGate::new(),
             snapshot_registry,
-            // A read-only engine has no worker, so a writer could never
-            // be woken. Writes are rejected before they reach the stall
-            // path, and inline compaction refuses a read-only engine,
-            // so this policy can only ever produce an error, never a
-            // wait that nobody will end.
-            stall_policy: StallPolicy::CompactInline,
+            families: std::sync::OnceLock::new(),
+            // Writes are refused before they reach the stall, so a
+            // read-only engine never stalls one.
+            inline_compaction: false,
             has_worker: false,
-            background_owed: AtomicBool::new(false),
+            owed: AtomicU8::new(0),
+            owed_queued: AtomicBool::new(false),
+            disk_dir: db_dir.to_path_buf(),
+            stall_step_queued: AtomicBool::new(false),
+            stall_steps_idle: std::sync::atomic::AtomicUsize::new(0),
             options,
             commit_ring: Self::new_commit_ring(),
             pipeline: Mutex::new(Pipeline::new()),
             flusher,
-            write_latch: Mutex::new(None),
-            write_latched: AtomicBool::new(false),
+            write_latch: OnceCell::new(),
             stall_signal,
             cached_stall_level,
-            compaction_in_progress: Arc::new(Mutex::new(HashSet::new())),
+            compaction_claims: Arc::new(Claims::new()),
             background_health,
             env,
             _db_lock: db_lock,
@@ -1024,8 +1059,8 @@ impl RegolithEngine {
 
     pub(crate) fn ensure_writable(&self) -> std::io::Result<()> {
         self.ensure_open()?;
-        if let Some(latched) = self.latched() {
-            return Err(latched);
+        if self.is_latched() {
+            return Err(self.latched_error());
         }
         if self.is_read_only() {
             Err(Self::read_only_error())
@@ -1049,26 +1084,47 @@ impl RegolithEngine {
         self.latch(WriteLatch::CallbackPanicked(callback));
     }
 
-    /// Keep the first reason: it is the one that explains the rest.
+    /// Keep the first reason: it is the one that explains the rest. One
+    /// compare-and-swap publishes it, and a later reason finds the cell
+    /// full and is dropped.
+    ///
+    /// Every path that latches the engine comes through here, and a latched
+    /// engine relieves no stall: each later write fails before it does any
+    /// of the work that would. So the unit stopped writers wait on is landed
+    /// (E35), and each of them, run again, is told the latch
+    /// ([`Self::admit_write`]). The reason is published before the unit is
+    /// taken: a writer that registers after the take reads it
+    /// ([`Self::stall_wait`]), so none is missed.
     fn latch(&self, latch: WriteLatch) {
-        self.write_latch.lock().get_or_insert(latch);
-        self.write_latched.store(true, Ordering::Release);
-        // A writer a stall stopped is waiting for the stop to clear, and no
-        // write will be taken when it does: wake it to read the latch now
-        // (`wait_for_write_capacity_slow`).
-        self.stall_signal.notify_all();
+        let _ = self.write_latch.set(latch);
+        self.stall_signal.land();
     }
 
-    /// The latch, if the engine is latched: what every write on it is told
-    /// from then on.
-    fn latched(&self) -> Option<std::io::Error> {
-        self.write_latched
-            .load(Ordering::Acquire)
-            .then(|| self.latched_error())
+    /// Whether a failure latched the engine against writes. One load.
+    pub(crate) fn is_latched(&self) -> bool {
+        self.write_latch.get().is_some()
+    }
+
+    /// Test-only: the compaction gate.
+    #[cfg(test)]
+    pub(crate) fn compaction_gate(&self) -> &CompactionGate {
+        &self.compaction_gate
+    }
+
+    /// Test-only: the scheduler, to hand a worker a job of the test's.
+    #[cfg(test)]
+    pub(crate) fn compaction_scheduler(&self) -> &CompactionScheduler {
+        &self.compaction
+    }
+
+    /// Test-only: no compaction pass holds a claim.
+    #[cfg(test)]
+    pub(crate) fn compaction_claims_idle(&self) -> bool {
+        self.compaction_claims.is_idle()
     }
 
     fn latched_error(&self) -> std::io::Error {
-        match self.write_latch.lock().as_ref() {
+        match self.write_latch.get() {
             Some(WriteLatch::Wal(kind, message)) => std::io::Error::new(
                 *kind,
                 format!("write-ahead log left in an unknown state: {message}"),
@@ -1085,10 +1141,11 @@ impl RegolithEngine {
     /// Install a new log, named `new_wal_id`, as the active one and hand back
     /// the log it seals.
     ///
-    /// Recovery takes the newest log by file name and tolerates a torn tail
-    /// only there, so a log has to be complete on disk before any newer file
-    /// exists, an empty one included, and `Eventual` durability never syncs a
-    /// log on its own. Hence the order, all under the `active_wal` lock so no
+    /// Recovery takes the newest log by the id in its file name
+    /// (`wal_scan::live`) and tolerates a torn tail only there, so a log has
+    /// to be complete on disk before any newer file exists, an empty one
+    /// included, and `Eventual` durability never syncs a log on its own.
+    /// Hence the order, all under the `active_wal` lock so no
     /// commit appends to the old log in between: sync it, create the new
     /// file, swap. A failed sync latches the log as unknown, since its tail
     /// can no longer be vouched for and a retried sync may report success for
@@ -1199,6 +1256,12 @@ impl RegolithEngine {
         self.options.statistics.clone()
     }
 
+    /// The table of units and jobs in flight, and the registry of open
+    /// queues, for this database.
+    pub(crate) fn io(&self) -> &io::IoRuntime {
+        self.cache.io()
+    }
+
     /// A new I/O queue for one thread, on this database's block cache.
     ///
     /// What the queue may owe is bounded by bytes: [`IO_QUEUE_BLOCKS`]
@@ -1211,40 +1274,44 @@ impl RegolithEngine {
         )
     }
 
-    /// Register a new live snapshot at `seq` so compaction keeps
-    /// every version it might need to see. Balanced by
-    /// [`Self::release_snapshot`] when the snapshot drops.
-    pub(crate) fn register_snapshot(&self, seq: u64) {
+    /// Pin a copy of the snapshot `pin` holds, so compaction keeps every
+    /// version it might need to see for as long as the copy lives. The copy
+    /// shares the original's entry and is covered from the moment the
+    /// original was. Balanced by [`Self::release_snapshot`].
+    pub(crate) fn clone_snapshot_pin(&self, pin: &SnapshotPin) -> SnapshotPin {
+        let copy = self.snapshot_registry.clone_pin(pin);
+        if copy.is_registered()
+            && let Some(s) = self.statistics()
+        {
+            s.add(crate::statistics::Ticker::SnapshotsRegistered, 1);
+        }
+        copy
+    }
+
+    /// Pin a snapshot at the current read horizon by announce, sample and
+    /// confirm (see `snapshot_registry`), so a concurrent compaction either
+    /// lists the pin or saw a horizon no newer than it. Returns the pinned
+    /// sequence and the pin, released by [`Self::release_snapshot`] on
+    /// whatever thread drops the handle. A closed database pins nothing.
+    pub(crate) fn register_snapshot_at_horizon(&self) -> (u64, SnapshotPin) {
         if self.is_closed() {
+            return (self.visible_seq.visible(), SnapshotPin::none());
+        }
+        let pinned = self.snapshot_registry.pin(&self.visible_seq);
+        if let Some(s) = self.statistics() {
+            s.add(crate::statistics::Ticker::SnapshotsRegistered, 1);
+        }
+        pinned
+    }
+
+    /// Release a snapshot pin taken by
+    /// [`Self::register_snapshot_at_horizon`] or
+    /// [`Self::clone_snapshot_pin`], exactly where it was announced.
+    pub(crate) fn release_snapshot(&self, pin: SnapshotPin) {
+        if !pin.is_registered() {
             return;
         }
-        self.snapshot_registry.register(seq);
-        if let Some(s) = self.statistics() {
-            s.add(crate::statistics::Ticker::SnapshotsRegistered, 1);
-        }
-    }
-
-    /// Pin a snapshot at the current read horizon, sampling the
-    /// horizon and registering the pin as one step so a concurrent
-    /// compaction cannot cut its stripes from a registry that does
-    /// not yet contain this pin. Returns the pinned sequence.
-    pub(crate) fn register_snapshot_at_horizon(&self) -> u64 {
-        if self.is_closed() {
-            return self.visible_seq.visible();
-        }
-        let seq = self
-            .snapshot_registry
-            .register_at(|| self.visible_seq.visible());
-        if let Some(s) = self.statistics() {
-            s.add(crate::statistics::Ticker::SnapshotsRegistered, 1);
-        }
-        seq
-    }
-
-    /// Release a snapshot pin previously taken via
-    /// [`Self::register_snapshot`].
-    pub(crate) fn release_snapshot(&self, seq: u64) {
-        self.snapshot_registry.release(seq);
+        self.snapshot_registry.release(pin);
         if let Some(s) = self.statistics() {
             s.add(crate::statistics::Ticker::SnapshotsReleased, 1);
         }
@@ -1927,92 +1994,26 @@ impl RegolithEngine {
     /// Classify the current state against the configured stall
     /// thresholds; see [`stall_state::classify`].
     fn stall_state(&self) -> Option<(&'static str, bool)> {
-        stall_state::classify(&self.view.load(), &self.options)
+        self.stall_signal.classify()
     }
 
-    /// Fixed per-write slowdown delay. Keeping this small (1 ms)
-    /// gives foreground writers a steady back-pressure signal
-    /// without freezing progress entirely; compaction gets cycles
-    /// to catch up and the writer learns that the engine is under
-    /// pressure.
-    const SLOWDOWN_DELAY: std::time::Duration = std::time::Duration::from_millis(1);
-
-    /// Block the current writer until the engine is ready to
-    /// accept another write, or (when `no_slowdown` is set) return
-    /// [`crate::Error::Busy`] immediately if any stall condition is
-    /// active. Returns the number of microseconds the caller spent
-    /// stalled, which is also published to the
-    /// [`crate::statistics::Ticker::WriteStallMicros`] counter.
-    /// Refresh the cached stall level from the current L0 /
-    /// memtable / pending-bytes state. Called after any event that
-    /// changes those counters (memtable rotation, compaction pass).
+    /// Refresh the cached stall level from the current L0 / memtable /
+    /// pending-bytes state, and land the unit stopped writers wait on once
+    /// writes may go on. Called after any event that changes those
+    /// counters: a memtable rotation, a flush, a compaction pass, an ingest.
     pub(crate) fn refresh_stall_level(&self) {
-        stall_state::refresh(&self.cached_stall_level, &self.view.load(), &self.options);
+        self.stall_signal.refresh();
     }
 
-    /// Test-only: the stall level writers cache: 0 for none, 1 for a
-    /// slowdown, 2 for a stop.
+    /// The write stall writers wait on.
     #[cfg(test)]
-    pub(crate) fn cached_stall_level(&self) -> u8 {
-        self.cached_stall_level.load(Ordering::Acquire)
+    pub(crate) fn stall_signal(&self) -> &StallSignal {
+        &self.stall_signal
     }
 
-    /// How long a stalled writer parks before re-checking its
-    /// thresholds. The wait is bounded so a missed notification costs
-    /// one re-check rather than wedging the writer forever.
-    const STALL_WAIT: std::time::Duration = std::time::Duration::from_millis(100);
-
-    /// Park until a compaction pass reports progress, or
-    /// [`Self::STALL_WAIT`] elapses.
-    ///
-    /// Shared by both stall policies: `WaitForWorker` waits on the
-    /// background worker, and `CompactInline` waits on whichever other
-    /// foreground thread currently holds the input files it needs.
-    /// One wait step for a writer stopped behind background work, or the
-    /// error that says waiting would not end.
-    ///
-    /// Too many memtables means flushes are behind or failing. The worker
-    /// flushes what writers seal, but one that keeps failing may not be
-    /// retried before the poll that next wakes it, so a stopped writer
-    /// retries the oldest flush itself, unless another thread holds the
-    /// flush exclusion, and returns that flush's error if it fails. Any other stop is relieved by
-    /// compaction; while the last compaction pass failed, the writer
-    /// returns that failure instead of waiting on a retry that is
-    /// likely to fail the same way.
-    fn wait_out_stop(&self, reason: &'static str) -> Result<(), crate::Error> {
-        if reason == STOP_TOO_MANY_MEMTABLES {
-            if let Some(flushing) = self.flusher.flushing.try_lock() {
-                // The flush is the background's, run on this writer's turn: a
-                // panic in a caller's code fails it without unwinding here.
-                let _background = callback::InBackground::enter();
-                let flushed = self.flush_oldest_frozen(&flushing);
-                drop(flushing);
-                return match flushed {
-                    Ok(_) => {
-                        self.refresh_stall_level();
-                        self.stall_signal.notify_all();
-                        Ok(())
-                    }
-                    Err(source) => Err(crate::Error::BackgroundFailed {
-                        job: Job::Flush.name(),
-                        hazard: Hazard::of(&source).label(),
-                        source,
-                    }),
-                };
-            }
-        } else if let Some(failure) = self.background_health.failing(Job::Compaction) {
-            return Err(failure.to_error());
-        }
-        self.wait_for_stall_signal();
-        Ok(())
-    }
-
-    fn wait_for_stall_signal(&self) {
-        self.stall_signal.wait(Self::STALL_WAIT);
-    }
-
-    /// Upper bound on compaction jobs one stalled write will perform on
-    /// its own thread before giving up with [`crate::Error::Busy`].
+    /// Upper bound on background steps one stopped write runs on its own
+    /// thread, with no worker, inline compaction on and no queue to leave
+    /// them on, before it gives up with [`crate::Error::Busy`] (E16).
     ///
     /// The bound exists to cap write latency, not to cap iterations for
     /// their own sake: one L0 -> L1 pass normally drains the entire L0
@@ -2020,9 +2021,9 @@ impl RegolithEngine {
     /// going to be rescued by another one on this thread.
     const MAX_INLINE_PASSES: usize = 32;
 
-    /// How many times in a row an inline compaction pass may report
-    /// nothing to do while a stop-writes threshold is still active,
-    /// before the write is failed with [`crate::Error::Busy`].
+    /// How many times in a row a step may report nothing to do while a
+    /// stop threshold is still active, before the stop counts as one no
+    /// step relieves and the write fails with [`crate::Error::Busy`].
     ///
     /// Not zero, because another thread can relieve the stall between
     /// this thread's threshold check and its pick, and that races to
@@ -2036,39 +2037,20 @@ impl RegolithEngine {
     /// Run at most one pending compaction job on the calling thread and
     /// report whether any work was done.
     ///
-    /// Takes the read side of the engine-wide compaction lock, exactly
-    /// as a background worker does, and shares the engine's in-progress
-    /// file-id set, so a foreground pass and a worker can never pick
-    /// overlapping inputs.
+    /// Holds the engine-wide compaction gate shared, exactly as a
+    /// background worker does, and uses the engine's claims, so a pass here
+    /// and a worker never pick overlapping inputs.
     ///
-    /// Lock-order invariant: the caller must not hold `write_lock`.
-    /// `ingest_external_files` holds the write side of the compaction
-    /// lock while it takes `write_lock`, so acquiring them in the
-    /// opposite order here would invert the hierarchy. The stall path
-    /// satisfies this because it runs before the write path takes
-    /// `write_lock`, never inside it.
+    /// It never waits for another thread: when a `compact_range`, an
+    /// ingest, a checkpoint, a `drop_all` or a backup holds the gate alone,
+    /// or is owed it, this reports `Contended` at once. The thread asking
+    /// may be the one that holds it, and a caller's call waits for no other
+    /// thread (plan 4.10).
     pub(crate) fn run_one_compaction_pass(&self) -> std::io::Result<CompactionOutcome> {
-        self.run_one_compaction_pass_on(true)
-    }
-
-    /// [`Self::run_one_compaction_pass`], or, unless `wait`, `Contended`
-    /// at once when a `compact_range`, an ingest, a checkpoint or a
-    /// `drop_all` holds the compaction lock or waits for it. A write's owed
-    /// step never waits: the thread that owes it may be the one holding the
-    /// lock.
-    pub(crate) fn run_one_compaction_pass_on(
-        &self,
-        wait: bool,
-    ) -> std::io::Result<CompactionOutcome> {
         self.ensure_writable()?;
         let outcome = {
-            let _guard = if wait {
-                self.compaction_lock.read()
-            } else {
-                match self.compaction_lock.try_read() {
-                    Some(guard) => guard,
-                    None => return Ok(CompactionOutcome::Contended),
-                }
+            let Some(_pass) = self.compaction_gate.try_shared() else {
+                return Ok(CompactionOutcome::Contended);
             };
             self.ensure_writable()?;
             compaction::pick_and_run_compaction(
@@ -2077,12 +2059,11 @@ impl RegolithEngine {
                 &self.cache,
                 &self.options.to_compaction_options(),
                 &self.snapshot_registry,
-                &self.compaction_in_progress,
+                &self.compaction_claims,
             )?
         };
-        // Mirror the worker loop's post-pass work so a writer parked on
-        // the condvar in `WaitForWorker` mode re-checks its thresholds.
-        self.stall_signal.notify_all();
+        // As a worker does after each pass: writers a stop stopped are told
+        // once the pass relieved it.
         self.refresh_stall_level();
         Ok(outcome)
     }
@@ -2094,150 +2075,205 @@ impl RegolithEngine {
     /// explicit flush and a close write memtables out the same way.
     pub(crate) fn flush_active_memtable(&self) -> std::io::Result<()> {
         self.ensure_writable()?;
-        self.drain_memtables(ActiveFlush::Always)?;
+        let drained = self.drain_memtables(ActiveFlush::Always);
+        // A failed drain too: a stopped writer its flush held off looks
+        // again (`StallSignal`, relief handed back).
         self.refresh_stall_level();
-        Ok(())
+        drained
     }
 
+    /// The write-stall admission every write passes before it applies
+    /// anything (D23). It never waits:
+    ///
+    /// - no stall: `Ok`;
+    /// - a slowdown: `Ok`, or [`crate::Error::Busy`] under `no_slowdown`.
+    ///   With no worker and inline compaction on, the write owes one step of
+    ///   background work, run once it committed;
+    /// - a stop: [`crate::Error::WouldBlock`] with a
+    ///   [`crate::StallWait`] completed on this thread's queue when the
+    ///   stall clears, or [`crate::Error::Busy`] under `no_slowdown`, or the
+    ///   failure of the background work that would relieve it when that
+    ///   work keeps failing, since waiting would not end. With no worker
+    ///   and inline compaction on, the stop's step is left on this thread's
+    ///   queue, or, with no queue, run inline, bounded (E16), and the write
+    ///   then goes on once that relieved the stop.
     // Not closed and no cached stall is the overwhelming common case, so
     // this fast check stays inlined at every call site rather than a call
     // instruction: two byte loads and two branches over state the engine
     // already keeps resident (`close_state`, `cached_stall_level`), which
     // also skips the `stall_state()` call that loads the read view and
-    // walks L0. Anything past that is parking or an inline compaction
-    // pass, so it is cold and kept out of line instead of bloating every
-    // caller that never stalls.
+    // walks L0. Anything past that is cold and kept out of line instead of
+    // bloating every caller that never stalls.
     #[inline]
-    pub(crate) fn wait_for_write_capacity(&self, no_slowdown: bool) -> Result<u64, crate::Error> {
+    pub(crate) fn admit_write(&self, no_slowdown: bool) -> Result<(), crate::Error> {
         if !self.is_closed() && self.cached_stall_level.load(Ordering::Acquire) == 0 {
-            return Ok(0);
+            return Ok(());
         }
-        self.wait_for_write_capacity_slow(no_slowdown)
+        self.admit_write_slow(no_slowdown)
     }
 
     #[cold]
     #[inline(never)]
-    fn wait_for_write_capacity_slow(&self, no_slowdown: bool) -> Result<u64, crate::Error> {
+    fn admit_write_slow(&self, no_slowdown: bool) -> Result<(), crate::Error> {
         if self.is_closed() {
             return Err(crate::Error::Closed);
         }
-
-        let start = self.env.now_micros();
-        let mut any_stall = false;
-        let mut inline_passes = 0usize;
-        let mut idle_passes = 0usize;
-
-        loop {
-            if self.is_closed() {
-                return Err(crate::Error::Closed);
+        // A latched engine takes no write and relieves no stall, so the
+        // answer is the latch: what the write is told once it is admitted,
+        // told here instead of a wait that would not end (E35).
+        if self.is_latched() {
+            return Err(self.latched_error().into());
+        }
+        match self.stall_state() {
+            None => {
+                // Stall cleared: update the cache so subsequent writers take
+                // the fast path.
+                self.cached_stall_level.store(0, Ordering::Release);
+                self.stall_steps_idle.store(0, Ordering::Release);
+                Ok(())
             }
-            // Read on every wake: a latched engine takes no write, so a
-            // writer that waited for the stop to clear would wait for
-            // nothing, and for ever where the worker cannot clear it.
-            if let Some(latched) = self.latched() {
-                return Err(latched.into());
+            Some((reason, false)) => {
+                if no_slowdown {
+                    return Err(crate::Error::Busy(reason));
+                }
+                self.stall_steps_idle.store(0, Ordering::Release);
+                // No delay: a sleep relieves nothing. With no worker the
+                // writer pays one step instead, which is what makes the write
+                // rate track compaction on a host with no worker.
+                if !self.has_worker && self.inline_compaction {
+                    self.owe(background_step::OWED_STEP);
+                }
+                Ok(())
             }
-            match self.stall_state() {
-                None => {
-                    // Stall cleared - update the cache so
-                    // subsequent writers take the fast path.
-                    self.cached_stall_level.store(0, Ordering::Release);
-                    break;
+            Some((reason, true)) => {
+                if no_slowdown {
+                    return Err(crate::Error::Busy(reason));
                 }
-                Some((reason, true)) => {
-                    if no_slowdown {
-                        return Err(crate::Error::Busy(reason));
-                    }
-                    any_stall = true;
-                    match self.stall_policy {
-                        StallPolicy::WaitForWorker => self.wait_out_stop(reason)?,
-                        StallPolicy::CompactInline => {
-                            // A frozen memtable is flushed first: with no
-                            // worker, nothing else writes it out.
-                            match self.run_one_background_step(true)? {
-                                // Files came out of L0; the next
-                                // `stall_state()` sees it. Only real
-                                // work counts against the budget,
-                                // because only real work is latency
-                                // this thread is paying for.
-                                CompactionOutcome::DidWork => {
-                                    idle_passes = 0;
-                                    inline_passes += 1;
-                                    if inline_passes > Self::MAX_INLINE_PASSES {
-                                        return Err(crate::Error::Busy(reason));
-                                    }
-                                }
-                                // Another thread already holds the
-                                // inputs this writer needs. That thread
-                                // *is* the worker here, and it notifies
-                                // this signal when its job ends, so
-                                // wait for it exactly as
-                                // `WaitForWorker` does. Waiting is not
-                                // charged to the inline budget: a
-                                // contended wait is bounded by the
-                                // holder's job, which always terminates
-                                // and always deregisters, after which
-                                // this thread sees `DidWork` from its
-                                // own pass or `Idle` and gives up.
-                                CompactionOutcome::Contended => {
-                                    idle_passes = 0;
-                                    self.wait_for_stall_signal();
-                                }
-                                // Idle is ambiguous under
-                                // concurrency: it means "nothing to
-                                // compact right now", which is what a
-                                // wedged engine looks like *and* what
-                                // an engine another thread just
-                                // relieved looks like. Re-check the
-                                // thresholds from the top instead of
-                                // failing a write that no longer needs
-                                // to fail. Bounded so the genuinely
-                                // unrelievable case still returns
-                                // rather than spinning: a picker that
-                                // declines this many times in a row
-                                // while the stall persists is not
-                                // going to change its mind.
-                                CompactionOutcome::Idle => {
-                                    idle_passes += 1;
-                                    if idle_passes > Self::MAX_IDLE_PASSES {
-                                        return Err(crate::Error::Busy(reason));
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                Some((reason, false)) => {
-                    if no_slowdown {
-                        return Err(crate::Error::Busy(reason));
-                    }
-                    any_stall = true;
-                    match self.stall_policy {
-                        StallPolicy::WaitForWorker => self.env.sleep(Self::SLOWDOWN_DELAY),
-                        // Sleeping accomplishes nothing with no worker.
-                        // The writer pays one compaction job instead,
-                        // which is what makes the write rate track
-                        // compaction on a single-threaded host.
-                        StallPolicy::CompactInline => {
-                            self.run_one_background_step(true)?;
-                        }
-                    }
-                    // One slowdown delay per call - don't loop, or
-                    // a writer that just crossed the trigger would
-                    // stall indefinitely at low rates.
-                    break;
-                }
+                self.stopped(reason)
             }
         }
+    }
 
-        // No monotonic clock means nothing was measured. The ticker
-        // stays untouched rather than gaining a fabricated zero, and
-        // the caller is told the same thing.
-        let micros = self.elapsed_micros(start);
-        if any_stall && let (Some(micros), Some(s)) = (micros, self.statistics()) {
+    /// A write a stop threshold stopped: the wait for the stop to clear, or
+    /// the error that says waiting would not end.
+    fn stopped(&self, reason: &'static str) -> Result<(), crate::Error> {
+        if let Some(failure) = self.failing_relief(reason) {
+            return Err(failure);
+        }
+        let queue = self.io().current_queue();
+        if !self.has_worker && self.inline_compaction {
+            if self.stall_steps_idle.load(Ordering::Acquire) > Self::MAX_IDLE_PASSES {
+                return Err(crate::Error::Busy(reason));
+            }
+            match &queue {
+                None => return self.relieve_inline(),
+                Some(queue) => self.leave_stall_step(queue),
+            }
+        }
+        Err(self.stall_wait(queue, reason, None))
+    }
+
+    /// The failure a write stopped for `reason` is told while the work that
+    /// relieves that stop is failing: its last attempt failed and none has
+    /// succeeded since ([`BackgroundHealth::failing`]). A wait would not end
+    /// while it does, so the failure is the answer, OS error included. The
+    /// one answer for a write that is stopped now and for one that was
+    /// already waiting ([`Self::stall_wait`]).
+    fn failing_relief(&self, reason: &'static str) -> Option<crate::Error> {
+        let relief = if reason == STOP_TOO_MANY_MEMTABLES {
+            Job::Flush
+        } else {
+            Job::Compaction
+        };
+        self.background_health
+            .failing(relief)
+            .map(|failure| failure.to_error())
+    }
+
+    /// What a stopped write returns: the wait for the stall `reason` to
+    /// clear, or what says the wait would not end: the latch when the engine
+    /// latched meanwhile (E35), the relief's failure when it failed
+    /// meanwhile (E36). `queue` and `seen` are [`StallSignal::wait`]'s.
+    fn stall_wait(
+        &self,
+        queue: Option<Arc<io::shared::QueueShared>>,
+        reason: &'static str,
+        seen: Option<usize>,
+    ) -> crate::Error {
+        let wait = self.stall_signal.wait(self.io(), queue, reason, seen);
+        // Read only now that the wait is recorded. A latch publishes its
+        // reason before it lands the unit, so either it found this wait
+        // there or the reason is read here; the unit is landed again for the
+        // writers that registered on it beside this one.
+        if self.is_latched() {
+            self.stall_signal.land();
+            return self.latched_error().into();
+        }
+        // The same for a relief that failed: the failure is stored before
+        // the unit is landed (`BackgroundHealth::record_failure`). Read as
+        // a write that arrives now reads it, only while a stop still holds:
+        // one that cleared meanwhile landed the wait above, and the write,
+        // run again, goes in.
+        if let Some((reason, true)) = self.stall_state()
+            && let Some(failure) = self.failing_relief(reason)
+        {
+            self.stall_signal.land();
+            return failure;
+        }
+        crate::Error::WouldBlock(crate::WouldBlock::Stall(wait))
+    }
+
+    /// Relieve a stop on this thread, for a writer with no queue on a
+    /// database with no worker and inline compaction on: bounded steps until
+    /// the stop clears, then the write goes on. A step another thread holds
+    /// the inputs of hands the writer a wait instead; a stop no step relieves
+    /// fails the write with [`crate::Error::Busy`]. The time spent is charged
+    /// to [`crate::Ticker::WriteStallMicros`].
+    fn relieve_inline(&self) -> Result<(), crate::Error> {
+        let start = self.env.now_micros();
+        let mut passes = 0usize;
+        let mut idle = 0usize;
+        let relieved = loop {
+            if self.is_closed() {
+                break Err(crate::Error::Closed);
+            }
+            let Some((reason, true)) = self.stall_state() else {
+                break Ok(());
+            };
+            let seen = self.stall_signal.progress();
+            match self.run_one_background_step()? {
+                CompactionOutcome::DidWork => {
+                    idle = 0;
+                    passes += 1;
+                    if passes > Self::MAX_INLINE_PASSES {
+                        break Err(crate::Error::Busy(reason));
+                    }
+                }
+                // Another thread holds the inputs: the write waits until that
+                // thread's work is done and looks again, as any stopped write
+                // does (`StallSignal`, relief handed back).
+                CompactionOutcome::Contended => {
+                    break Err(self.stall_wait(None, reason, Some(seen)));
+                }
+                // Idle is ambiguous under concurrency: "nothing to compact
+                // right now" is what a wedged engine looks like and also what
+                // an engine another thread just relieved looks like, so the
+                // thresholds are checked again from the top, a bounded number
+                // of times.
+                CompactionOutcome::Idle => {
+                    idle += 1;
+                    if idle > Self::MAX_IDLE_PASSES {
+                        break Err(crate::Error::Busy(reason));
+                    }
+                }
+            }
+        };
+        // No monotonic clock means nothing was measured: the ticker stays
+        // untouched rather than gaining a fabricated zero.
+        if let (Some(micros), Some(s)) = (self.elapsed_micros(start), self.statistics()) {
             s.add(crate::statistics::Ticker::WriteStallMicros, micros);
         }
-        Ok(micros.unwrap_or(0))
+        relieved
     }
 
     pub(crate) fn commit_with_conflict_check(
@@ -2432,17 +2468,36 @@ impl RegolithEngine {
     /// group applies into: the same one when nothing rotated, a fresh load
     /// otherwise. The active memtable changes only under the pipeline mutex,
     /// so between the two nothing else can have replaced it.
-    fn rotate_if_full(&self, view: Arc<ReadView>) -> std::io::Result<Arc<ReadView>> {
+    fn rotate_if_full<'v>(&'v self, view: ViewGuard<'v>) -> std::io::Result<ViewGuard<'v>> {
         if view.active.approximate_size() < self.options.write_buffer_size {
             return Ok(view);
         }
+        // Released before anything below publishes or waits on the
+        // background flush, so the views it retires are handed to the
+        // reclaimer at once rather than when this group is done (see
+        // `read_view::quiesce`), and no view is held across a wait.
+        drop(view);
+        let rotated = self.rotate_full();
+        // Whatever the rotation came to (E35). A flush took a memtable out
+        // and put a table in, a seal put a memtable in, and a rotation that
+        // fails part way leaves either one done, so the thresholds are
+        // classified again on every way out, once the rotation holds no
+        // flush exclusion: a stopped writer its flush held off looks again
+        // (`StallSignal`, relief handed back).
+        self.refresh_stall_level();
+        rotated?;
+        Ok(self.view.load())
+    }
+
+    /// [`Self::rotate_if_full`] once the active memtable is full. Its one
+    /// caller classifies the stall thresholds again whatever this returns.
+    fn rotate_full(&self) -> std::io::Result<()> {
         // A rotation leaves at most `max_write_buffer_number` memtables. One
         // that may leave none but the fresh active one flushes what it seals
         // here, as every rotation did before flushes left the commit path.
         let room = self.options.max_write_buffer_number.checked_sub(1);
         if room == Some(0) {
-            self.rotate_memtable()?;
-            return Ok(self.view.load());
+            return self.rotate_memtable();
         }
         // Normally the flushes behind it are done and nothing is written
         // here. When they are not, the oldest frozen memtables are written
@@ -2450,7 +2505,13 @@ impl RegolithEngine {
         // only when the background has fallen a whole memtable behind.
         if let Some(room) = room {
             while self.view.load().frozen.len() >= room {
-                if !self.flush_oldest_frozen(&self.flusher.flushing.lock())? {
+                // The exclusion is released before the caller refreshes the
+                // level.
+                let flushed = self
+                    .flusher
+                    .flushing()
+                    .and_then(|flushing| self.flush_oldest_frozen(&flushing));
+                if !flushed? {
                     break;
                 }
             }
@@ -2459,8 +2520,7 @@ impl RegolithEngine {
         // by the writer once it leaves the pipeline.
         self.seal_active()?;
         self.flush_sealed_later();
-        self.refresh_stall_level();
-        Ok(self.view.load())
+        Ok(())
     }
 
     /// Seal the active memtable and flush it, and every frozen one before
@@ -2512,7 +2572,7 @@ impl RegolithEngine {
             let sealed = Arc::clone(active);
             let mut next_frozen = frozen.to_vec();
             next_frozen.push(Arc::clone(&sealed));
-            (fresh, next_frozen, sealed)
+            (Arc::clone(&fresh), next_frozen, sealed)
         });
         debug_assert!(Arc::ptr_eq(&sealed, &sealing));
         self.wal_id.store(new_wal_id, Ordering::Release);
@@ -2541,7 +2601,7 @@ impl RegolithEngine {
             .iter()
             .any(|mt| Arc::ptr_eq(mt, target))
         {
-            if !self.flush_oldest_frozen(&self.flusher.flushing.lock())? {
+            if !self.flush_oldest_frozen(&self.flusher.flushing()?)? {
                 break;
             }
         }
@@ -2552,7 +2612,10 @@ impl RegolithEngine {
     /// it, then wake the compaction worker, or, with none, owe the next
     /// write a bounded step. Returns `false` when there was
     /// nothing frozen to flush. See [`Flusher::flush_oldest`].
-    fn flush_oldest_frozen(&self, flushing: &MutexGuard<'_, ()>) -> std::io::Result<bool> {
+    fn flush_oldest_frozen(
+        &self,
+        flushing: &crate::sync::MutexGuard<'_, ()>,
+    ) -> std::io::Result<bool> {
         let flushed = self.flusher.flush_oldest(flushing)?;
         if flushed {
             self.after_flush();
@@ -2563,24 +2626,20 @@ impl RegolithEngine {
     /// Synchronously compact SSTables overlapping the user-key range
     /// `[start, end)` down to the bottommost non-empty level.
     ///
-    /// - Acquires the engine-wide compaction lock so the background
-    ///   scheduler can't pick an overlapping input set concurrently.
+    /// - The caller holds the compaction gate alone (`_gate`), so no
+    ///   compaction pass picks an overlapping input set meanwhile. It is
+    ///   held before the flush below, in the gate -> pipeline order an
+    ///   ingest and `drop_all` take too.
     /// - Flushes the active memtable first so any matching in-memory
     ///   data reaches L0 before compaction picks inputs.
     /// - Walks levels 0..MAX_LEVELS-1, picking range-overlapping files
     ///   and merging them into the next level.
     pub(crate) fn compact_range(
         &self,
+        _gate: &Exclusive,
         start: Option<&[u8]>,
         end: Option<&[u8]>,
     ) -> std::io::Result<()> {
-        self.ensure_writable()?;
-        // 1. Exclude all background workers for the duration of the
-        //    range walk. Write lock blocks until every in-flight
-        //    background pass releases its read lock. Taken before the
-        //    flush below, in the `compaction_lock -> pipeline` order an
-        //    ingest and `drop_all` take too.
-        let _compact_guard = self.compaction_lock.write();
         self.ensure_writable()?;
 
         // 2. Flush the active memtable so any in-memory data that
@@ -2590,11 +2649,10 @@ impl RegolithEngine {
         // A log sealed under a key other than the current one is rotated
         // away even when its memtable is empty, so a full compaction leaves
         // no file naming a rotated key.
-        let needs_flush = |mt: &MemTable| {
-            !mt.is_empty() || !mt.clone_range_tombstones().is_empty() || self.wal_key_is_stale()
-        };
+        let needs_flush =
+            |mt: &MemTable| !mt.is_empty() || mt.has_range_tombstones() || self.wal_key_is_stale();
         if needs_flush(&self.view.load().active) {
-            let _write_guard = self.pipeline.lock();
+            let _write_guard = self.lock_pipeline();
             if needs_flush(&self.view.load().active) {
                 self.rotate_memtable()?;
             }
@@ -2652,6 +2710,9 @@ impl RegolithEngine {
                 versions.compact_manifest()?;
             }
         }
+        // The passes emptied L0 toward the bottom: writers a stop stopped are
+        // told once it no longer holds.
+        self.refresh_stall_level();
         Ok(())
     }
 
@@ -2672,33 +2733,44 @@ impl RegolithEngine {
                 .is_some_and(|wal| wal.seal_key() != Some(current))
     }
 
-    /// Atomically capture a consistent snapshot of the on-disk state
-    /// for checkpoint / backup purposes.
+    /// What a checkpoint or a backup does before it takes the compaction
+    /// gate: write every memtable out, so every write acknowledged so far is
+    /// in an SSTable.
     ///
-    /// Flushes the active memtable (if non-empty) under the write
-    /// lock so every live byte is in an SSTable, compacts the
-    /// manifest so the on-disk form is a single rewrite of the
-    /// current version, and returns the captured `Arc<Version>` plus
+    /// Drain, do not merely seal. A capture names the SSTables of the
+    /// current version and copies no WAL, so a memtable that is still
+    /// waiting on a background flush would be missing from the result
+    /// entirely.
+    pub(crate) fn checkpoint_drain(&self) -> std::io::Result<()> {
+        self.ensure_writable()?;
+        self.drain_memtables(ActiveFlush::Always)
+    }
+
+    /// [`Self::checkpoint_drain`] and [`Self::checkpoint_capture`] on this
+    /// thread, waiting here for the gate: a call that chose to block (a
+    /// backup).
+    pub(crate) fn checkpoint_capture_here(&self) -> std::io::Result<CheckpointSnapshot> {
+        self.checkpoint_drain()?;
+        self.checkpoint_capture(self.compaction_gate.exclusive()?)
+    }
+
+    /// Atomically capture a consistent snapshot of the on-disk state
+    /// for checkpoint / backup purposes, after
+    /// [`Self::checkpoint_drain`].
+    ///
+    /// Compacts the manifest so the on-disk form is a single rewrite of
+    /// the current version, and returns the captured `Arc<Version>` plus
     /// the paths of the files a caller needs to copy or hard-link.
     ///
-    /// The returned [`CheckpointSnapshot`] holds the engine's
-    /// compaction lock, pinning every referenced file against
-    /// concurrent unlink. Callers MUST drop the snapshot as soon as
-    /// their filesystem work is done - a snapshot whose lifetime
-    /// outlives the enclosing function scope can deadlock a
-    /// concurrent `db.close()` / `drop(db)` that joins the background
-    /// compaction thread (the thread will block on the same lock the
-    /// snapshot holds).
-    pub(crate) fn checkpoint_capture(&self) -> std::io::Result<CheckpointSnapshot> {
-        self.ensure_writable()?;
-        // Drain, do not merely seal. A checkpoint captures the SSTables
-        // the current version names and copies no WAL, so a memtable that
-        // is still waiting on a background flush would be missing from
-        // the result entirely. Done before the compaction lock is taken,
-        // because flushing needs it.
-        self.drain_memtables(ActiveFlush::Always)?;
-
-        let compaction_guard = Gate::write_owned(&self.compaction_lock);
+    /// The returned [`CheckpointSnapshot`] holds `gate`, the compaction
+    /// gate held alone, pinning every referenced file against concurrent
+    /// unlink. Callers drop the snapshot as soon as their filesystem work
+    /// is done: until then no compaction runs, and a `db.close()` that
+    /// joins a compaction worker waiting for the gate waits too.
+    pub(crate) fn checkpoint_capture(
+        &self,
+        gate: Exclusive,
+    ) -> std::io::Result<CheckpointSnapshot> {
         self.ensure_writable()?;
 
         let version;
@@ -2712,7 +2784,7 @@ impl RegolithEngine {
             version = versions.current();
             // Read here, under the same lock that produced `version`, so
             // the two cannot disagree. A concurrent flush takes this lock
-            // but not the compaction lock held above, so it is free to
+            // but not the compaction gate held above, so it is free to
             // append `AddFile` records naming files this checkpoint will
             // not copy, and a rewrite can replace the file entirely.
             let path = versions.manifest_path().to_path_buf();
@@ -2723,7 +2795,7 @@ impl RegolithEngine {
             version,
             manifest_bytes,
             sst_dir: self.sst_dir.clone(),
-            _compaction_guard: compaction_guard,
+            _gate: gate,
         })
     }
 
@@ -2921,10 +2993,21 @@ impl RegolithEngine {
 
     /// Drop all data in the engine.
     pub(crate) fn drop_all(&self) -> std::io::Result<()> {
+        let dropped = self.drop_all_excluded();
+        // Once every exclusion the drop held is released, failed or not: a
+        // stopped writer it held off looks again (`StallSignal`, relief
+        // handed back). On success nothing is left for any threshold to
+        // count.
+        self.refresh_stall_level();
+        dropped
+    }
+
+    /// [`Self::drop_all`] under its exclusions.
+    fn drop_all_excluded(&self) -> std::io::Result<()> {
         self.ensure_writable()?;
         // Exclude background compaction for the whole drop, as
-        // `compact_range`, `ingest_external_files` and `checkpoint_capture`
-        // do. Without it a worker holding the read side runs straight
+        // `compact_range`, an ingest's install and `checkpoint_capture`
+        // do. Without it a worker holding the gate shared runs straight
         // through the `Reset` below and then applies its `AddFile`, which
         // `VersionSet::apply` lays over whatever version is current: a file
         // full of pre-drop rows lands in the freshly emptied version, and
@@ -2932,15 +3015,17 @@ impl RegolithEngine {
         // version never named it. The drop reports success and the data is
         // still there, across a reopen.
         //
-        // Taken before `pipeline`, matching the `compaction_lock ->
-        // write_lock` order documented on `run_one_compaction_pass`.
-        let _compact_guard = self.compaction_lock.write();
-        let _write_guard = self.pipeline.lock();
+        // Taken before `pipeline`, in the gate -> pipeline order every
+        // exclusive user of the gate takes. `drop_all` is a call that does
+        // its own I/O and chose to block (plan 3.0), so it waits for the
+        // gate on its own thread.
+        let _gate = self.compaction_gate.exclusive()?;
+        let _write_guard = self.lock_pipeline();
         // A flush the background is running took its memtable before the
         // drop and installs its table after it: held here, it finishes first
         // and the `Reset` below removes its table, instead of laying it over
         // the emptied version.
-        let _flushing = self.flusher.flushing.lock();
+        let _flushing = self.flusher.flushing()?;
         self.ensure_writable()?;
 
         // Published before the version `Reset` below, so no reader can
@@ -2949,7 +3034,8 @@ impl RegolithEngine {
         // readers: a concurrent reader may still briefly observe
         // pre-drop SSTable data, exactly as before this view existed.
         let fresh = Arc::new(MemTable::new(&self.memtable_config)?);
-        self.view.update_memtables(|_, _| (fresh, Vec::new(), ()));
+        self.view
+            .update_memtables(|_, _| (Arc::clone(&fresh), Vec::new(), ()));
 
         let (old_version, wal_id, wal_path, new_wal) = {
             let mut versions = self.versions.lock();
@@ -2979,7 +3065,6 @@ impl RegolithEngine {
         })?;
         remove_obsolete_wal_files(&*self.env, &self.wal_dir, &wal_path)
             .map_err(|e| std::io::Error::new(e.kind(), format!("drop_all removing wals: {e}")))?;
-
         Ok(())
     }
 
@@ -2989,7 +3074,7 @@ impl RegolithEngine {
     #[cfg(test)]
     pub(crate) fn active_memtable_is_empty(&self) -> bool {
         let view = self.view.load();
-        view.active.is_empty() && view.active.clone_range_tombstones().is_empty()
+        view.active.is_empty() && !view.active.has_range_tombstones()
     }
 
     /// Test-only: number of SSTable files at `level` in the current
@@ -3035,8 +3120,26 @@ impl RegolithEngine {
     }
 
     /// Flush all data to disk and shut down background threads.
+    ///
+    /// The close contract (plan 3.0), in order:
+    ///
+    /// 1. Every commit ticket the final sync covers is resolved: the group a
+    ///    nowait leader left owing its fsync lands here, so its members learn
+    ///    they committed. No group is written after, since every write
+    ///    checks the database open.
+    /// 2. Every queue with a pending unit is told: a read's completion, after
+    ///    which the read run again answers `Closed`; a stalled write's wait;
+    ///    a job a queue owns, settled as its body settles a closed database
+    ///    (a foreground job's ticket fails with `Closed`).
+    /// 3. The `on_abort` callbacks of transactions still open run, on this
+    ///    thread.
+    /// 4. The memtables are flushed, the log closed, and regolith's threads
+    ///    joined; a foreground job the workers had not run fails with
+    ///    `Closed`.
     pub(crate) fn close(&self) -> std::io::Result<()> {
-        let _close_guard = self.close_lock.lock();
+        // Close does its own I/O and chose to block (plan 3.0): a second
+        // close waits here, on its own thread, for the first.
+        let _close_guard = wait_here(self.close_lock.lock())?;
         match self.close_state.load(Ordering::Acquire) {
             CLOSE_STATE_CLOSED => return Ok(()),
             CLOSE_STATE_CLOSING => return Err(Self::closed_error()),
@@ -3045,7 +3148,12 @@ impl RegolithEngine {
 
         self.close_state
             .store(CLOSE_STATE_CLOSING, Ordering::Release);
-        self.stall_signal.notify_all();
+        // The tickets the final sync covers are resolved first: the owed
+        // group lands under the pipeline, and no group is written after.
+        drop(self.lock_pipeline());
+        // Every write a stall stopped is told now, and finds the database
+        // closing when it runs again.
+        self.stall_signal.land();
         // Every queue waiting on a read gets its completion now, and the read
         // run again sees the database closing.
         self.cache.close_io();
@@ -3061,10 +3169,11 @@ impl RegolithEngine {
             }
             Err(err) => {
                 // Reads through queues work again on the database the failed
-                // close left open.
+                // close left open, and lock waits queue again.
                 self.cache.reopen_io();
+                self.open_transactions.reopen_locks();
                 self.close_state.store(CLOSE_STATE_OPEN, Ordering::Release);
-                self.stall_signal.notify_all();
+                self.refresh_stall_level();
                 Err(err)
             }
         }
@@ -3072,7 +3181,7 @@ impl RegolithEngine {
 
     fn close_inner(&self) -> std::io::Result<()> {
         if self.is_read_only() {
-            self.compaction.lock().shutdown();
+            self.compaction.shutdown();
             return Ok(());
         }
 
@@ -3085,7 +3194,7 @@ impl RegolithEngine {
             // CLOSE would vouch for them: replay would then refuse the
             // crash it should survive. Such a log is left for recovery to
             // judge. Checked under the lock a failing commit latches under.
-            if self.write_latched.load(Ordering::Acquire) {
+            if self.is_latched() {
                 wal.sync_data()?;
             } else if let Err(err) = wal.close() {
                 drop(guard);
@@ -3094,22 +3203,13 @@ impl RegolithEngine {
                 return Err(err);
             }
         }
-        // Signal under the mutex, join without it.
-        //
-        // A worker parked in `compaction_lock.read()` cannot exit until
-        // whoever holds that gate is done, and `ingest_external_files` holds
-        // it across a call that wants this same mutex. Joining while holding
-        // the mutex therefore closes a cycle: close waits on the worker, the
-        // worker waits on the ingest gate, and ingest waits on this mutex.
-        // Dropping the guard before the join is what breaks it.
-        let handles = {
-            let mut scheduler = self.compaction.lock();
-            scheduler.signal_shutdown();
-            scheduler.take_handles()
-        };
-        for handle in handles {
-            handle.join();
-        }
+        // Stop and join regolith's threads. A worker waiting for the
+        // compaction gate exits once whoever holds the gate lets go: a job on
+        // another worker when it ends, a queue's job that was handed the
+        // gate while it was parked when the sweep above settled it. Then a
+        // foreground job the workers never ran fails with `Closed`, and its
+        // ticket is told.
+        self.compaction.shutdown();
 
         Ok(())
     }
@@ -3148,17 +3248,13 @@ impl RegolithEngine {
     #[cfg(test)]
     pub(crate) fn memtables_hold_no_data(&self) -> bool {
         let view = self.view.load();
-        view.frozen.is_empty()
-            && view.active.is_empty()
-            && view.active.clone_range_tombstones().is_empty()
+        view.frozen.is_empty() && view.active.is_empty() && !view.active.has_range_tombstones()
     }
 
     fn drain_memtables(&self, active: ActiveFlush) -> std::io::Result<()> {
         let active_pending = |view: &ReadView| match active {
             ActiveFlush::WhenFull => memtable_needs_flush(&view.active),
-            ActiveFlush::Always => {
-                !view.active.is_empty() || !view.active.clone_range_tombstones().is_empty()
-            }
+            ActiveFlush::Always => !view.active.is_empty() || view.active.has_range_tombstones(),
         };
 
         // The set to drain is fixed here and never extended. A drain that
@@ -3168,7 +3264,7 @@ impl RegolithEngine {
         // `ActiveFlush::Always`, so a checkpoint taken while anything is
         // writing would hang rather than capture.
         let targets: Vec<Arc<MemTable>> = {
-            let _write_guard = self.pipeline.lock();
+            let _write_guard = self.lock_pipeline();
             let view = self.view.load();
             let seal_active = active_pending(&view);
             if !seal_active && view.frozen.is_empty() {
@@ -3201,7 +3297,7 @@ impl RegolithEngine {
                     let sealed = Arc::clone(active);
                     let mut next_frozen = frozen.to_vec();
                     next_frozen.push(Arc::clone(&sealed));
-                    (fresh, next_frozen, sealed)
+                    (Arc::clone(&fresh), next_frozen, sealed)
                 });
                 debug_assert!(Arc::ptr_eq(&sealed, &sealing));
                 self.wal_id.store(new_wal_id, Ordering::Release);
@@ -3230,21 +3326,19 @@ enum ActiveFlush {
 
 /// A consistent snapshot of on-disk state captured by
 /// [`RegolithEngine::checkpoint_capture`]. Holds the engine's compaction
-/// lock for its entire lifetime, so no background or foreground
-/// compaction can unlink files referenced by `version` while the
-/// snapshot is alive. Callers MUST drop this snapshot as soon as
-/// they are done with the filesystem work - a snapshot whose
-/// lifetime outlives the enclosing function scope can deadlock a
-/// concurrent `db.close()` / `drop(db)` that joins the background
-/// compaction thread (the thread will block waiting for the same
-/// lock the snapshot holds).
+/// gate alone for its entire lifetime, so no compaction can unlink files
+/// referenced by `version` while the snapshot is alive. Callers MUST drop
+/// this snapshot as soon as they are done with the filesystem work: while
+/// it lives no compaction runs, and a concurrent `db.close()` /
+/// `drop(db)` that joins a compaction worker waiting for the gate waits
+/// for the snapshot too.
 pub(crate) struct CheckpointSnapshot {
     pub(crate) version: Arc<manifest::Version>,
     /// The manifest exactly as it described `version`, captured under
     /// the same lock.
     ///
     /// The bytes are held rather than a path and a length. A concurrent
-    /// flush takes `versions.lock()` but not the compaction lock this
+    /// flush takes `versions.lock()` but not the compaction gate this
     /// snapshot holds, so it can append `AddFile` records naming files
     /// this checkpoint will not copy, and a manifest rewrite can replace
     /// the file wholesale. Re-reading the path later would then pick up
@@ -3256,8 +3350,8 @@ pub(crate) struct CheckpointSnapshot {
     /// canonical size, so this is bounded by the live SSTable count.
     pub(crate) manifest_bytes: Vec<u8>,
     pub(crate) sst_dir: PathBuf,
-    /// Compaction lock guard, scoped to the snapshot's lifetime.
-    _compaction_guard: OwnedGateWriteGuard,
+    /// The compaction gate, held alone for the snapshot's lifetime.
+    _gate: Exclusive,
 }
 
 impl CheckpointSnapshot {
@@ -3268,32 +3362,6 @@ impl CheckpointSnapshot {
     pub(crate) fn sst_filename(id: u64) -> String {
         sst_filename(id)
     }
-}
-
-/// The WAL files in `dir`, oldest first.
-///
-/// The order is the id in each name read as a number. The names are padded
-/// to six digits, so as text `wal_1000000.log` sorts before
-/// `wal_999999.log`; recovery judges the last file of this list as the one
-/// a crash may have torn, so the text order would refuse a power cut in log
-/// 1,000,000 as damage and accept damage in log 999,999 as a torn tail.
-/// Every lister goes through here, so no caller orders the names itself. A
-/// name with no id sorts before every numbered log, by name.
-fn list_wal_files(env: &dyn Env, dir: &Path) -> std::io::Result<Vec<PathBuf>> {
-    let mut files = Vec::new();
-    if env.exists(dir) {
-        for entry in env.read_dir(dir)? {
-            if entry
-                .path
-                .extension()
-                .is_some_and(|ext| ext == "log" || ext == "wal")
-            {
-                files.push(entry.path);
-            }
-        }
-    }
-    files.sort_by(|a, b| (wal_file_id(a), a).cmp(&(wal_file_id(b), b)));
-    Ok(files)
 }
 
 fn remove_obsolete_sst_files(
@@ -3320,7 +3388,8 @@ fn remove_obsolete_wal_files(
     keep_path: &Path,
 ) -> std::io::Result<()> {
     let mut removed_any = false;
-    for path in list_wal_files(env, wal_dir)? {
+    for path in wal_scan::walk(env, wal_dir)? {
+        let path = path?;
         if path == keep_path {
             continue;
         }
@@ -3408,6 +3477,3 @@ fn apply_replayed_wal_entry(memtable: &MemTable, entry: WalEntry) -> u64 {
 
 #[cfg(test)]
 mod recovery_tests;
-
-#[cfg(test)]
-mod wal_order_tests;

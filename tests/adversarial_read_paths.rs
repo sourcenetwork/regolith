@@ -223,12 +223,12 @@ fn run(seed: u64, steps: usize, opts: Options) {
             0..=39 => {
                 let k = key_of(rng.below(KEY_SPACE));
                 let v = value_of(&mut rng);
-                db.put(&k, &v).unwrap();
+                regolith::through_stalls(|| db.put(&k, &v)).unwrap();
                 model.insert(k, v);
             }
             40..=54 => {
                 let k = key_of(rng.below(KEY_SPACE));
-                db.delete(&k).unwrap();
+                regolith::through_stalls(|| db.delete(&k)).unwrap();
                 model.remove(&k);
             }
             55..=64 => {
@@ -236,7 +236,7 @@ fn run(seed: u64, steps: usize, opts: Options) {
                 let b = rng.below(KEY_SPACE);
                 let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
                 let (lo, hi) = (key_of(lo), key_of(hi));
-                db.delete_range(&lo, &hi).unwrap();
+                regolith::through_stalls(|| db.delete_range(&lo, &hi)).unwrap();
                 let doomed: Vec<Vec<u8>> = model
                     .range(lo.clone()..hi.clone())
                     .map(|(k, _)| k.clone())
@@ -249,13 +249,13 @@ fn run(seed: u64, steps: usize, opts: Options) {
                 let k = key_of(rng.below(KEY_SPACE));
                 let operand = value_of(&mut rng);
                 if merges_enabled {
-                    db.merge(&k, &operand).unwrap();
+                    regolith::through_stalls(|| db.merge(&k, &operand)).unwrap();
                     model
                         .entry(k)
                         .and_modify(|v| v.extend_from_slice(&operand))
                         .or_insert_with(|| operand.clone());
                 } else {
-                    db.put(&k, &operand).unwrap();
+                    regolith::through_stalls(|| db.put(&k, &operand)).unwrap();
                     model.insert(k, operand);
                 }
             }
@@ -274,7 +274,7 @@ fn run(seed: u64, steps: usize, opts: Options) {
                         staged.push((k, Some(v)));
                     }
                 }
-                db.write(batch).unwrap();
+                regolith::through_stalls(|| db.write(batch.clone())).unwrap();
                 for (k, v) in staged {
                     match v {
                         Some(v) => {
@@ -287,7 +287,7 @@ fn run(seed: u64, steps: usize, opts: Options) {
                 }
             }
             _ => {
-                db.compact_range(None, None).unwrap();
+                db.compact_range(None, None).wait().unwrap();
             }
         }
 

@@ -592,7 +592,9 @@ fn the_locators_find_the_wal_manifest_and_sstable() {
     {
         let d = Db::open(&db, Options::default().write_buffer_size(4 * 1024)).unwrap();
         for i in 0..2000u32 {
-            d.put(format!("k{i:06}").as_bytes(), &[b'v'; 64]).unwrap();
+            // A write a stall stops waits for it to clear: on a busy host
+            // the compaction worker falls behind two thousand small flushes.
+            regolith::through_stalls(|| d.put(format!("k{i:06}").as_bytes(), &[b'v'; 64])).unwrap();
         }
         d.close().unwrap();
     }

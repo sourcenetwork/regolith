@@ -112,6 +112,7 @@ fn a_commit_above_a_pending_ingest_is_not_published_before_it() {
         *slot.borrow_mut() = Some(Window::open(&held, move || put_other(&writer_db)));
     });
     db.ingest_external_files(&[path], IngestOptions::default())
+        .wait()
         .unwrap();
 
     seen.borrow_mut()
@@ -140,6 +141,7 @@ fn a_snapshot_taken_before_an_ingest_installs_reads_one_value_throughout() {
         *slot.borrow_mut() = Some((window, snapshot, before));
     });
     db.ingest_external_files(&[path], IngestOptions::default())
+        .wait()
         .unwrap();
 
     let (window, snapshot, before) = seen
@@ -176,6 +178,7 @@ fn a_transaction_that_read_the_value_an_ingest_replaces_conflicts() {
     });
     db.db()
         .ingest_external_files(&[path], IngestOptions::default())
+        .wait()
         .unwrap();
 
     let (window, txn, read) = seen

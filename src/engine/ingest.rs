@@ -8,9 +8,9 @@
 //! from: key and value sizes, live column families, and one entry per user
 //! key, which is what lets every entry read at one sequence.
 //!
-//! **Installing** runs under the compaction lock, which keeps every level
-//! below L0 as it is and lets L0 only grow, and takes the commit pipeline's
-//! mutex only for what has to be ordered against commits:
+//! **Installing** runs holding the compaction gate alone, which keeps every
+//! level below L0 as it is and lets L0 only grow, and takes the commit
+//! pipeline's mutex only for what has to be ordered against commits:
 //!
 //! 1. flush the memtables holding a key of the table's range, so writers
 //!    wait for a flush only when there is an overlap;
@@ -47,6 +47,7 @@ use crate::portability::{AtomicU64, Ordering};
 use crate::sst_file_writer::IngestOptions;
 
 use super::block_cache::BlockCache;
+use super::compaction_gate::Exclusive;
 use super::internal_key::decode_internal_key;
 use super::lookup_key::with_key_scratch;
 use super::manifest::{MAX_LEVELS, Version, VersionEdit, overlapping};
@@ -77,6 +78,9 @@ struct StagedTable {
     largest: Vec<u8>,
     file_size: u64,
     num_entries: u64,
+    /// The column families the table holds keys of, ascending, each once.
+    /// The install fences them in the ordered step, as a write's keys are.
+    families: Vec<u32>,
     /// Unlinks the staged file if the ingest ends before the manifest
     /// edit names it.
     pending: PendingOutputs,
@@ -93,14 +97,31 @@ struct IngestedTable {
 }
 
 /// Drops the validation reads from the shared block cache when the ingest
-/// returns, by any path: they were read under probe ids nothing asks for
+/// ends, by any path: they were read under probe ids nothing asks for
 /// again.
-struct ProbeIds<'a> {
-    cache: &'a BlockCache,
+struct ProbeIds {
+    cache: Arc<BlockCache>,
     ids: Vec<u64>,
 }
 
-impl ProbeIds<'_> {
+/// The tables an ingest staged, from the end of its staging to its install:
+/// what the job holds while it waits for the compaction gate. Dropped before
+/// the install, it unlinks the staged files and lets their validation reads
+/// go.
+pub(crate) struct Staged {
+    tables: Vec<StagedTable>,
+    /// `None` when there was nothing to stage.
+    probes: Option<ProbeIds>,
+}
+
+impl Staged {
+    /// Nothing was staged, so nothing is left to install.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.tables.is_empty()
+    }
+}
+
+impl ProbeIds {
     fn next(&mut self) -> u64 {
         let id = NEXT_PROBE_ID.fetch_sub(1, Ordering::Relaxed);
         self.ids.push(id);
@@ -108,7 +129,7 @@ impl ProbeIds<'_> {
     }
 }
 
-impl Drop for ProbeIds<'_> {
+impl Drop for ProbeIds {
     fn drop(&mut self) {
         for &id in &self.ids {
             self.cache.evict_file(id);
@@ -117,34 +138,28 @@ impl Drop for ProbeIds<'_> {
 }
 
 impl RegolithEngine {
-    /// Bulk-ingest externally built tables, each at a fresh sequence,
-    /// without rewriting them (D48).
+    /// The first half of a bulk ingest of externally built tables, each at a
+    /// fresh sequence, without rewriting them (D48): staging.
     ///
     /// Each file is copied into the table directory, or hard-linked when
-    /// `move_files` is set and the environment has hard links, with no lock
-    /// held. Writers then wait only for a flush of a memtable holding a key
-    /// of the file's range, if there is one, and for the manifest edit that
-    /// installs it. The entries order after every write acknowledged before
-    /// the call and before every write acknowledged after it, and no
-    /// snapshot sees them appear under it. Files are installed one at a
-    /// time; an error leaves the ones before it installed.
-    ///
-    /// With `move_files`, each source path is removed once its table is
-    /// installed; a source whose removal fails is left and logged, since
-    /// the ingest itself succeeded. A crash between the install and the
-    /// removal leaves it too.
-    pub(crate) fn ingest_external_files<F>(
+    /// `move_files` is set and the environment has hard links, and validated,
+    /// with no lock and no gate held. [`Self::ingest_install`] then installs
+    /// what this staged.
+    pub(crate) fn ingest_stage<F>(
         &self,
         files: &[PathBuf],
         opts: &IngestOptions,
         mut validate_user_key: F,
-    ) -> io::Result<()>
+    ) -> io::Result<Staged>
     where
         F: FnMut(&[u8]) -> io::Result<()>,
     {
         self.ensure_writable()?;
         if files.is_empty() {
-            return Ok(());
+            return Ok(Staged {
+                tables: Vec::new(),
+                probes: None,
+            });
         }
         if opts.snapshot_consistency && self.oldest_live_seq() != u64::MAX {
             return Err(io::Error::other(
@@ -155,19 +170,48 @@ impl RegolithEngine {
         }
 
         let mut probes = ProbeIds {
-            cache: &self.cache,
+            cache: Arc::clone(&self.cache),
             ids: Vec::with_capacity(files.len()),
         };
-        let mut staged = Vec::with_capacity(files.len());
+        let mut tables = Vec::with_capacity(files.len());
         for path in files {
-            staged.push(self.stage(path, opts, &mut validate_user_key, &mut probes)?);
+            tables.push(self.stage(path, opts, &mut validate_user_key, &mut probes)?);
         }
+        Ok(Staged {
+            tables,
+            probes: Some(probes),
+        })
+    }
 
-        // Excludes every compaction, so the levels the placement reads stay
-        // as they are until the table is in.
-        let _compact_guard = self.compaction_lock.write();
+    /// The second half of a bulk ingest: install what
+    /// [`Self::ingest_stage`] staged, holding the compaction gate alone, so
+    /// the levels the placement reads stay as they are until each table is
+    /// in.
+    ///
+    /// Writers wait only for a flush of a memtable holding a key of a
+    /// table's range, if there is one, and for the manifest edit that
+    /// installs it. The entries order after every write acknowledged before
+    /// the call and before every write acknowledged after it, and no
+    /// snapshot sees them appear under it. Tables are installed one at a
+    /// time; an error leaves the ones before it installed.
+    ///
+    /// With `move_files`, each source path is removed once its table is
+    /// installed; a source whose removal fails is left and logged, since
+    /// the ingest itself succeeded. A crash between the install and the
+    /// removal leaves it too.
+    pub(crate) fn ingest_install(
+        &self,
+        _gate: &Exclusive,
+        staged: Staged,
+        opts: &IngestOptions,
+    ) -> io::Result<()> {
+        // The validation reads are let go when this returns, by any path.
+        let Staged {
+            tables,
+            probes: _probes,
+        } = staged;
         self.ensure_writable()?;
-        for table in staged {
+        for table in tables {
             let source = table.source.clone();
             let installed = self.install(table, opts)?;
             self.announce(&source, &installed);
@@ -181,7 +225,7 @@ impl RegolithEngine {
                 );
             }
         }
-        self.compaction.lock().notify();
+        self.compaction.notify();
         Ok(())
     }
 
@@ -193,7 +237,7 @@ impl RegolithEngine {
         source: &Path,
         opts: &IngestOptions,
         validate_user_key: &mut F,
-        probes: &mut ProbeIds<'_>,
+        probes: &mut ProbeIds,
     ) -> io::Result<StagedTable>
     where
         F: FnMut(&[u8]) -> io::Result<()>,
@@ -252,11 +296,13 @@ impl RegolithEngine {
             self.options.keyring.as_deref(),
         )
         .map_err(named)?;
+        let mut families = Vec::new();
         let (points, num_entries) = self
-            .validate_entries(&reader, validate_user_key)
+            .validate_entries(&reader, validate_user_key, &mut families)
             .map_err(named)?;
         let tombstones = reader.range_tombstones();
         for rt in tombstones {
+            note_family(&mut families, &rt.start);
             for (bound, which) in [(&rt.start, "start"), (&rt.end, "end")] {
                 self.validate_prefixed_key_size(bound)
                     .and_then(|()| validate_user_key(bound))
@@ -280,6 +326,8 @@ impl RegolithEngine {
             ));
         };
         let file_size = self.env.metadata(&path)?.len;
+        families.sort_unstable();
+        families.dedup();
         Ok(StagedTable {
             source: source.to_path_buf(),
             path,
@@ -289,6 +337,7 @@ impl RegolithEngine {
             largest,
             file_size,
             num_entries,
+            families,
             pending,
         })
     }
@@ -306,7 +355,7 @@ impl RegolithEngine {
         &self,
         source: &Path,
         dest: &Path,
-        probes: &mut ProbeIds<'_>,
+        probes: &mut ProbeIds,
     ) -> io::Result<bool> {
         let Some(keyring) = self.options.keyring.as_deref() else {
             return Ok(false);
@@ -356,6 +405,7 @@ impl RegolithEngine {
         &self,
         reader: &SsTableReader,
         validate_user_key: &mut F,
+        families: &mut Vec<u32>,
     ) -> io::Result<(Option<(Vec<u8>, Vec<u8>)>, u64)>
     where
         F: FnMut(&[u8]) -> io::Result<()>,
@@ -386,6 +436,7 @@ impl RegolithEngine {
             if first.is_none() {
                 first = Some(user_key.to_vec());
             }
+            note_family(families, user_key);
             last.clear();
             last.extend_from_slice(user_key);
             count += 1;
@@ -402,7 +453,11 @@ impl RegolithEngine {
             self.l0_holders(&self.published_version(), lo, hi)?
         };
 
-        let _pipeline = self.pipeline.lock();
+        let _pipeline = self.lock_pipeline();
+        // The ordered step: a family the table writes into that a drop
+        // retired since the table was validated refuses the install, before
+        // it takes a sequence.
+        self.cf_fence_ids(&table.families)?;
         let level = if opts.ingest_behind {
             self.behind_level(lo, hi)?
         } else if self.flush_memtables_holding(lo, hi)? {
@@ -581,6 +636,17 @@ impl RegolithEngine {
 /// The table's recorded range meets `[lo, hi]`.
 fn meets(file: &LiveSst, lo: &[u8], hi: &[u8]) -> bool {
     file.meta.smallest_key.as_slice() <= hi && lo <= file.meta.largest_key.as_slice()
+}
+
+/// Record the column family `key` belongs to, once per run of keys in one
+/// family. Keys arrive sorted, so the run ends only when the family does.
+fn note_family(families: &mut Vec<u32>, key: &[u8]) {
+    if let Some(prefix) = key.first_chunk::<{ crate::column_family::CF_PREFIX_LEN }>() {
+        let id = u32::from_be_bytes(*prefix);
+        if families.last() != Some(&id) {
+            families.push(id);
+        }
+    }
 }
 
 /// LsmOrder.tla's placement of a table of range `[lo, hi]`, nothing in the

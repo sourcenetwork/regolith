@@ -43,7 +43,7 @@ use std::sync::Arc as StdArc;
 use std::sync::atomic::{AtomicUsize as StdAtomicUsize, Ordering as StdOrdering};
 
 use loom::sync::Arc;
-use loom::sync::atomic::{AtomicU64, Ordering};
+use loom::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use loom::thread;
 
 /// Memtable ids. Small enough to pack into a nibble, distinct enough
@@ -623,4 +623,165 @@ fn the_packing_round_trips_every_field() {
     };
     assert_eq!(View::unpack(view.pack()), view);
     assert_eq!(View::unpack(View::initial().pack()), View::initial());
+}
+
+// ---------------------------------------------------------------------------
+// Reclamation and freshness: what `ReadViewCell` relies on kovan for.
+//
+// kovan's epoch protocol is not loom-instrumented (see the module docs), so
+// these two models transcribe the guarantee regolith builds on rather than
+// kovan's code: a reader announces itself before it loads the published
+// view, and a publisher frees the view it replaced only once no reader that
+// could have loaded it is still announced. That is the shape of
+// `ViewGuard` (pin, then load) against `Atom::compare_and_swap` (swap, then
+// retire), with one reader standing in for every reservation slot.
+
+/// The two views of the reclamation models and the cells around them.
+struct Reclaim {
+    /// Index of the published view.
+    published: AtomicU64,
+    /// Whether each view's memory has been given back.
+    freed: [AtomicBool; 2],
+    /// The reader's reservation: set before its load, cleared after its
+    /// last use of the view.
+    reading: AtomicBool,
+}
+
+impl Reclaim {
+    fn new() -> Self {
+        Self {
+            published: AtomicU64::new(0),
+            freed: [AtomicBool::new(false), AtomicBool::new(false)],
+            reading: AtomicBool::new(false),
+        }
+    }
+}
+
+/// One reader against one publication. `wait_for_readers` is the real
+/// rule; without it the publisher frees the view it replaced at once.
+///
+/// The announcement and the two cross-checks are read-modify-writes. kovan
+/// orders a reservation against a retirement with sequentially consistent
+/// fences, which loom models only as acquire/release; a read-modify-write
+/// always reads the newest value of its word and synchronizes with the one
+/// it reads, which gives the model the same "one side sees the other"
+/// guarantee the fences give kovan.
+fn reclaim_model(wait_for_readers: bool, deferred: &StdArc<StdAtomicUsize>) {
+    let cell = Arc::new(Reclaim::new());
+
+    let reader = {
+        let cell = Arc::clone(&cell);
+        thread::spawn(move || {
+            cell.reading.swap(true, Ordering::AcqRel);
+            let index = cell.published.fetch_add(0, Ordering::AcqRel) as usize;
+            assert!(
+                !cell.freed[index].load(Ordering::Acquire),
+                "a reader read a view that was already freed"
+            );
+            cell.reading.swap(false, Ordering::AcqRel);
+        })
+    };
+
+    let publisher = {
+        let cell = Arc::clone(&cell);
+        let deferred = StdArc::clone(deferred);
+        thread::spawn(move || {
+            let replaced = cell.published.swap(1, Ordering::AcqRel) as usize;
+            if wait_for_readers && cell.reading.fetch_or(false, Ordering::AcqRel) {
+                // A reader may hold it: the free waits for that reader.
+                deferred.fetch_add(1, StdOrdering::Relaxed);
+            } else {
+                cell.freed[replaced].store(true, Ordering::Release);
+            }
+        })
+    };
+
+    reader.join().unwrap();
+    publisher.join().unwrap();
+}
+
+/// A replaced view is freed only when no reader holds it.
+#[test]
+fn a_reader_never_reads_a_freed_view() {
+    let deferred = StdArc::new(StdAtomicUsize::new(0));
+    let seen = StdArc::clone(&deferred);
+    run_model("reclaim_waits_for_readers", 8, move || {
+        reclaim_model(true, &seen)
+    });
+    assert!(
+        deferred.load(StdOrdering::Relaxed) > 0,
+        "no schedule ever had a reader pinned across the publication"
+    );
+}
+
+/// RED: freeing the replaced view without waiting for readers.
+#[test]
+fn freeing_without_waiting_for_readers_is_caught() {
+    let deferred = StdArc::new(StdAtomicUsize::new(0));
+    expect_violation("reclaim_waits_for_readers/free_at_once", move || {
+        reclaim_model(false, &deferred)
+    });
+}
+
+/// One publication that happened before a reader's load began, made known
+/// to the reader by a release/acquire pair the way a commit's horizon is.
+/// `cached_load` is the defect: a reader answering from a view it loaded
+/// before it learned of the publication.
+fn freshness_model(cached_load: bool, witnessed: &StdArc<StdAtomicUsize>) {
+    let cell = Arc::new(Cell::new(View::initial()));
+    let announced = Arc::new(AtomicBool::new(false));
+
+    let publisher = {
+        let cell = Arc::clone(&cell);
+        let announced = Arc::clone(&announced);
+        thread::spawn(move || {
+            cell.rcu(|view| rotate(view, FRESH));
+            announced.store(true, Ordering::Release);
+        })
+    };
+
+    let reader = {
+        let cell = Arc::clone(&cell);
+        let announced = Arc::clone(&announced);
+        let witnessed = StdArc::clone(witnessed);
+        thread::spawn(move || {
+            let early = cell.load();
+            if announced.load(Ordering::Acquire) {
+                let view = if cached_load { early } else { cell.load() };
+                witnessed.fetch_add(1, StdOrdering::Relaxed);
+                assert!(
+                    view.generation >= 1,
+                    "a load that began after a publication returned an older view"
+                );
+            }
+        })
+    };
+
+    publisher.join().unwrap();
+    reader.join().unwrap();
+}
+
+/// A load never returns a view older than one published before the load
+/// began.
+#[test]
+fn a_load_after_a_publication_sees_it_or_newer() {
+    let witnessed = StdArc::new(StdAtomicUsize::new(0));
+    let seen = StdArc::clone(&witnessed);
+    run_model("load_after_publication", 8, move || {
+        freshness_model(false, &seen)
+    });
+    assert!(
+        witnessed.load(StdOrdering::Relaxed) > 0,
+        "no schedule ever had the reader learn of the publication"
+    );
+}
+
+/// RED: answering from a view loaded before the reader learned of the
+/// publication.
+#[test]
+fn a_reader_answering_from_an_earlier_load_is_caught() {
+    let witnessed = StdArc::new(StdAtomicUsize::new(0));
+    expect_violation("load_after_publication/cached_load", move || {
+        freshness_model(true, &witnessed)
+    });
 }

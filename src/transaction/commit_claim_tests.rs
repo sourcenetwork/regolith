@@ -68,6 +68,29 @@ fn a_sweep_in_the_middle_of_the_commit_leaves_it_to_commit() {
     assert_eq!(db.db().get(b"k").unwrap().as_deref(), Some(&b"v"[..]));
 }
 
+/// A transaction `close` already tracks (its `on_abort` was registered
+/// before the commit) is swept while its commit runs: the sweep loses the
+/// claim to the commit, so only `on_commit` runs.
+#[test]
+fn a_sweep_during_the_commit_of_a_tracked_transaction_leaves_it_to_commit() {
+    let dir = TempDir::new().unwrap();
+    let db = OptimisticTransactionDb::open(dir.path(), Options::default()).unwrap();
+    let log = Log::default();
+    let mut txn = db.begin(&TxnOptions::new());
+    txn.put(b"k", b"v").unwrap();
+    let l = Arc::clone(&log);
+    txn.on_abort(move |_| note(&l, "abort"));
+    let engine = Arc::clone(&txn.engine);
+    txn.before_commit(move |_| {
+        engine.open_transactions().abort_all(&engine);
+        Ok(())
+    });
+    let l = Arc::clone(&log);
+    txn.on_commit(move |_| note(&l, "commit"));
+    txn.commit().unwrap();
+    assert_eq!(entries(&log), ["commit"], "the sweep won a claimed commit");
+}
+
 #[test]
 fn the_same_holds_for_a_pessimistic_transaction() {
     let dir = TempDir::new().unwrap();

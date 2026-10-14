@@ -360,7 +360,7 @@ fn expected_cover(
         if !merged && (key >= 6 || seeded & (1 << key) == 0) {
             continue;
         }
-        let promoted = matches!(tx.mode, TxMode::Pessimistic { .. })
+        let promoted = matches!(tx.mode, TxMode::Pessimistic)
             .then(|| tx.tracked.get(&prefixed))
             .flatten()
             .map(|state| state.read_seq.load(Ordering::Acquire))

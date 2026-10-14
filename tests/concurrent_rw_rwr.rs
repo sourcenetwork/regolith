@@ -66,7 +66,7 @@ use std::time::{Duration, Instant};
 
 use regolith::{
     Db, IsolationLevel, OptimisticTransactionDb, Transaction, TransactionDb, TransactionError,
-    TxResult, TxnOptions,
+    TxResult, TxnOptions, WouldBlock,
 };
 use tempfile::TempDir;
 
@@ -168,6 +168,9 @@ fn commit_with_retry<T>(what: &str, mut attempt: impl FnMut() -> TxResult<T>) ->
     for refused in 0..MAX_ATTEMPTS {
         match attempt() {
             Ok(_) => return refused as u64,
+            // A write stall stopped the commit before it applied anything:
+            // wait for the stall to clear, then run the attempt again.
+            Err(TransactionError::WouldBlock(WouldBlock::Stall(stall))) => stall.wait(),
             result if retryable(&result) => back_off(refused),
             Err(e) => panic!("{what}: unexpected transaction error: {e}"),
         }
@@ -372,7 +375,7 @@ fn snapshot_sum(db: &impl Flavour, level: IsolationLevel, storage: Storage) {
             "{level:?}: the forced transfer never reached a table"
         );
         db.raw().flush().unwrap();
-        db.raw().compact_range(None, None).unwrap();
+        db.raw().compact_range(None, None).wait().unwrap();
     }
     let rest: u64 = (1..ACCOUNTS)
         .map(|i| decode(auditor.get(&account(i)).unwrap()))

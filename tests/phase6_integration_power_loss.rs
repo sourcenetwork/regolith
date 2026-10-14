@@ -91,11 +91,13 @@ impl FlushPath {
             FlushPath::Worker => options.max_background_compactions(1),
             FlushPath::AfterCommit => options.max_background_compactions(0),
             // One table at L0 slows every write down, and a slowed write with
-            // no worker first runs one bounded step. The compaction trigger is
-            // out of reach and the stop trigger off, so the steps between
-            // flushes find nothing to do.
+            // no worker and inline compaction on owes one bounded step, run
+            // once its commit returned. The compaction trigger is out of reach
+            // and the stop trigger off, so the steps between flushes find
+            // nothing to do.
             FlushPath::StallStep => options
                 .max_background_compactions(0)
+                .inline_compaction(true)
                 .level0_slowdown_writes_trigger(1)
                 .level0_stop_writes_trigger(0)
                 .l0_compaction_trigger(1000),
@@ -150,7 +152,7 @@ fn overwrite(spec: &ChildSpec, path: FlushPath) {
         .unwrap();
     if let FlushPath::StallStep = path {
         // The table that turns the slowdown on.
-        db.put(b"seed", b"v").expect("child: seed");
+        regolith::through_stalls(|| db.put(b"seed", b"v")).expect("child: seed");
         db.flush().expect("child: seed flush");
     }
     for i in 0..spec.ops {
@@ -163,7 +165,7 @@ fn overwrite(spec: &ChildSpec, path: FlushPath) {
         let mut batch = WriteBatch::new();
         batch.put(&key(i), &value(i));
         batch.put(&own_key(i), &value(i));
-        db.write(batch).expect("child: write");
+        regolith::through_stalls(|| db.write(batch.clone())).expect("child: write");
         acks.write_all(format!("{i}\n").as_bytes()).unwrap();
     }
     env.fail_tables(false);

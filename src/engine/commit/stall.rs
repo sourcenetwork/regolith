@@ -1,129 +1,459 @@
-//! Broadcast wake-up for stalled writers.
+//! The write stall as a unit writers wait on, completed on each writer's own
+//! queue when the stall clears (D23, plan 4.10).
+//!
+//! A write stopped by a stall threshold applies nothing and returns
+//! [`WouldBlock::Stall`](crate::WouldBlock::Stall) at once, with a
+//! [`StallWait`](crate::StallWait). Every writer stopped during one stall
+//! waits on the same *passive* job (`engine::io::job`): no poll runs it, and
+//! it lands only when the stall clears.
+//!
+//! - **Who clears it.** Whoever makes the progress that clears the stall
+//!   re-classifies it here ([`StallSignal::refresh`]): a flush on a worker or
+//!   on a writer's queue, a compaction pass, a rotation, an ingest. When
+//!   writes are no longer stopped it lands the job, which pushes one
+//!   completion to each stopped writer's queue and completes each wait with
+//!   no queue directly.
+//! - **No lost wakeup.** A writer gets or installs the job, registers its
+//!   wait on it, and only then classifies the stall again: if the stall
+//!   cleared in between, the writer lands the job itself. A clearer stores
+//!   the level before it takes the job. So either the clearer finds the
+//!   writer's job, or the writer sees the cleared stall.
+//! - **Relief handed back.** On a database with no worker and inline
+//!   compaction on, stopped writers relieve the stop themselves, and one
+//!   whose step finds another thread's flush or job in the way waits for
+//!   that thread instead. That thread may stop relieving with the stop
+//!   still on: a write that ran its one owed step and returned, a job that
+//!   ended, a relief that gave up. So there every piece of progress lands
+//!   the job, stop or no stop, and each waiter looks again and relieves the
+//!   stop itself or is contended anew. A waiter that saw the contention
+//!   before such a landing and registered after it would miss it: progress
+//!   is counted before the level is stored, the writer reads the count
+//!   before its step and again once registered, and lands its own job when
+//!   the count moved (`StallRelief.tla`, RED NoRecheck).
+//! - **No thread waits.** Nothing here parks or sleeps; the slowdown delay
+//!   and the timed wait a stopped writer used to park on are gone.
 
-use std::time::Duration;
-
-#[cfg(not(target_arch = "wasm32"))]
 use std::sync::Arc;
-#[cfg(not(target_arch = "wasm32"))]
-use std::time::Instant;
 
-#[cfg(not(target_arch = "wasm32"))]
-use kovan_channel::signal::Signal;
-#[cfg(not(target_arch = "wasm32"))]
-use kovan_queue::array_queue::ArrayQueue;
+use kovan::Atom;
 
-/// How many stalled writers can hold a registration at once.
-#[cfg(not(target_arch = "wasm32"))]
-const STALL_WAITER_SLOTS: usize = 256;
+use super::super::io::IoRuntime;
+use super::super::io::job::{Delivery, Job};
+use super::super::io::shared::{QueueShared, WaitSlot};
+use super::super::read_view::ReadViewCell;
+use super::super::{EngineOptions, stall_state};
+use crate::StallWait;
+use crate::portability::{AtomicU8, AtomicUsize, Ordering};
 
-/// Bounded broadcast wake-up for writers parked on a stop-writes stall.
-///
-/// Writers register a signal and park with a deadline; the compaction
-/// worker drains every registration after each pass. The ring is bounded,
-/// and a writer that finds it full parks without registering, which stays
-/// live because the deadline alone already bounds every wait.
-#[cfg(not(target_arch = "wasm32"))]
+/// The stall writers are stopped on now, if any, and the level writers cache.
 pub(crate) struct StallSignal {
-    waiters: ArrayQueue<Arc<Signal>>,
+    view: Arc<ReadViewCell>,
+    options: EngineOptions,
+    /// The level writers check on every write: 0 none, 1 slowdown, 2 stop.
+    level: Arc<AtomicU8>,
+    /// The unit writers stopped since the stall began wait on.
+    current: Atom<Option<Arc<Job>>>,
+    /// Stopped writers relieve the stop themselves: no worker, inline
+    /// compaction on.
+    writers_relieve: bool,
+    /// Pieces of progress so far, counted before each re-classification.
+    progress: AtomicUsize,
 }
 
-/// On wasm32 there is nothing to park: the platform has no threads, so
-/// compaction runs on the calling thread and a stalled writer has no
-/// worker to wait for. Waiting would deadlock rather than delay, so the
-/// wait returns immediately and the caller re-checks its thresholds.
-#[cfg(target_arch = "wasm32")]
-pub(crate) struct StallSignal;
-
-#[cfg(target_arch = "wasm32")]
 impl StallSignal {
-    pub(crate) fn new() -> Self {
-        Self
-    }
-
-    /// Returns at once: the work this would wait for happens inline.
-    pub(crate) fn wait(&self, _timeout: Duration) {}
-
-    /// No registrations exist to wake.
-    pub(crate) fn notify_all(&self) {}
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-impl StallSignal {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(
+        view: Arc<ReadViewCell>,
+        options: EngineOptions,
+        level: Arc<AtomicU8>,
+    ) -> Self {
         Self {
-            waiters: ArrayQueue::new(STALL_WAITER_SLOTS),
+            writers_relieve: options.max_background_compactions == 0 && options.inline_compaction,
+            view,
+            options,
+            level,
+            current: Atom::new(None),
+            progress: AtomicUsize::new(0),
         }
     }
 
-    /// Park the calling writer for at most `timeout`.
-    pub(crate) fn wait(&self, timeout: Duration) {
-        let signal = Arc::new(Signal::new());
-        let _ = self.waiters.push(Arc::clone(&signal));
-        signal.wait_deadline(Instant::now() + timeout);
-        // Mark our own registration stale so a later `notify_all` does not
-        // spend a wake-up on a signal nobody is waiting on any more.
-        signal.notify();
+    /// A signal over an empty view of `versions`, for a test that starts
+    /// workers on their own.
+    #[cfg(test)]
+    pub(crate) fn for_tests(versions: &super::super::read_view::VersionStore) -> Self {
+        use super::super::memtable::{MemTable, MemTableConfig};
+        use super::super::read_view::ReadView;
+        let view = Arc::new(ReadViewCell::new(ReadView {
+            active: Arc::new(MemTable::new(&MemTableConfig::default()).expect("memtable")),
+            frozen: Vec::new(),
+            version: versions.lock().current(),
+        }));
+        Self::new(view, EngineOptions::default(), Arc::new(AtomicU8::new(0)))
     }
 
-    /// Wake every registered writer so it can re-check its thresholds.
-    pub(crate) fn notify_all(&self) {
-        while let Some(waiter) = self.waiters.pop() {
-            if !waiter.is_notified() {
-                waiter.notify();
+    /// The thresholds against the current view: `None`, or the reason and
+    /// whether writes are stopped (`true`) or slowed (`false`).
+    pub(crate) fn classify(&self) -> Option<(&'static str, bool)> {
+        stall_state::classify(&self.view.load(), &self.options)
+    }
+
+    /// Re-classify after work that can change the thresholds' inputs (a
+    /// rotation, a flush, a compaction pass, an ingest), store the level
+    /// writers cache, and land the unit stopped writers wait on once writes
+    /// are no longer stopped, or, where stopped writers relieve the stop
+    /// themselves, whatever the stop (module docs). Called once the work
+    /// released the flush or compaction exclusion it held.
+    pub(crate) fn refresh(&self) {
+        // Counted before the level is stored and the unit taken: a writer
+        // contended before this and registered after the take sees the count
+        // moved (module docs).
+        self.progress.fetch_add(1, Ordering::SeqCst);
+        let level = match self.classify() {
+            None => 0,
+            Some((_, false)) => 1,
+            Some((_, true)) => 2,
+        };
+        // Stored before the unit is taken: a writer that registered after the
+        // take sees this level when it classifies again (module docs).
+        self.level.store(level, Ordering::Release);
+        if level < 2 || self.writers_relieve {
+            self.land();
+        }
+    }
+
+    /// The pieces of progress so far, read by a writer before a relief step
+    /// that may find another thread's work in the way.
+    pub(crate) fn progress(&self) -> usize {
+        self.progress.load(Ordering::SeqCst)
+    }
+
+    /// Land the unit stopped writers wait on now, whatever the stall: close,
+    /// and a writer that found the stall cleared after it registered.
+    pub(crate) fn land(&self) {
+        if let Some(job) = self.current.swap(None).as_ref() {
+            job.release();
+        }
+    }
+
+    /// A wait for the stall `reason` to clear, for a write that stopped on
+    /// it. Recorded on `queue` when the writer's thread has one, so it is
+    /// completed at that queue's poll; else completed directly by whoever
+    /// clears the stall. `seen` is the [`Self::progress`] a writer whose
+    /// relief step was contended read before the step: progress since then
+    /// completes the wait at once, so the writer looks again.
+    pub(crate) fn wait(
+        &self,
+        io: &IoRuntime,
+        queue: Option<Arc<QueueShared>>,
+        reason: &'static str,
+        seen: Option<usize>,
+    ) -> StallWait {
+        let job = self.unit();
+        let slot = Arc::new(WaitSlot::new());
+        let waiter = Arc::clone(&slot) as Arc<dyn Delivery>;
+        let id = queue.as_ref().map(|queue| queue.id());
+        let recorded = match &queue {
+            // The queue's owner registers on the unit at its next poll; a
+            // unit that landed by then is told at once (`IoQueue::accept_job`).
+            Some(queue) => io.wait_on(queue, Arc::clone(&job), Some(Arc::clone(&waiter))),
+            None => false,
+        };
+        // No queue, or one dropped meanwhile: the lander tells the wait
+        // itself; refused when it landed already.
+        if !recorded && !job.listen(waiter) {
+            slot.complete();
+        }
+        // Classified again only now that the wait is recorded, so a clearer
+        // that came before the registration is not missed; and the progress
+        // read again, so a landing between the contended step and the
+        // registration is not missed either.
+        if self.classify().is_none_or(|(_, stopped)| !stopped) {
+            self.refresh();
+        } else if seen.is_some_and(|seen| seen != self.progress()) {
+            self.land();
+        }
+        StallWait::new(slot, job, id, reason)
+    }
+
+    /// The unit for the stall now, installed by the first writer to stop.
+    fn unit(&self) -> Arc<Job> {
+        loop {
+            let current = self.current.load();
+            if let Some(job) = current.as_ref()
+                && !job.is_done()
+            {
+                return Arc::clone(job);
+            }
+            let fresh = Job::passive();
+            if self
+                .current
+                .compare_and_swap(&current, Some(Arc::clone(&fresh)))
+                .is_ok()
+            {
+                return fresh;
             }
         }
     }
-}
 
-impl Default for StallSignal {
-    fn default() -> Self {
-        Self::new()
+    /// Test-only: whether a unit is installed and has not landed, as it is
+    /// from the first write a stall stops until the landing.
+    #[cfg(test)]
+    pub(crate) fn has_unit(&self) -> bool {
+        self.current
+            .load()
+            .as_ref()
+            .is_some_and(|job| !job.is_done())
     }
 }
 
-#[cfg(all(test, not(target_arch = "wasm32")))]
+#[cfg(all(test, not(loom)))]
 mod tests {
+    use std::sync::{Mutex, mpsc};
+    use std::time::Duration;
+
     use super::*;
-    use std::thread;
+    use crate::column_family::{DEFAULT_CF_ID, prefix_key};
+    use crate::engine::compaction::CompactionOutcome;
+    use crate::engine::{DurabilityMode, RegolithEngine};
+    use crate::portability::AtomicBool;
+    use crate::{Error, IoBudget, PrefixExtractor, WouldBlock, WriteBatchOp};
+
+    fn put(key: &[u8]) -> Vec<WriteBatchOp> {
+        vec![WriteBatchOp::Put {
+            key: prefix_key(DEFAULT_CF_ID, key),
+            value: b"v".to_vec(),
+        }]
+    }
+
+    /// No worker, one L0 table at the stop.
+    pub(super) fn stopped_engine_with(
+        options: EngineOptions,
+    ) -> (tempfile::TempDir, Arc<RegolithEngine>) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let engine = RegolithEngine::open(
+            dir.path(),
+            EngineOptions {
+                max_background_compactions: 0,
+                level0_stop_writes_trigger: 1,
+                ..options
+            },
+        )
+        .unwrap();
+        engine
+            .apply_batch(put(b"k"), DurabilityMode::Eventual, false)
+            .unwrap();
+        engine.flush_active_memtable().unwrap();
+        (dir, engine)
+    }
+
+    /// Stopped writers wait for a compaction someone else runs.
+    fn stopped_engine() -> (tempfile::TempDir, Arc<RegolithEngine>) {
+        stopped_engine_with(EngineOptions {
+            l0_compaction_trigger: 1,
+            ..EngineOptions::default()
+        })
+    }
+
+    /// Stopped writers relieve the stop themselves, and no step can: level 0
+    /// is below its compaction trigger.
+    fn stopped_engine_where_writers_relieve() -> (tempfile::TempDir, Arc<RegolithEngine>) {
+        stopped_engine_with(EngineOptions {
+            inline_compaction: true,
+            l0_compaction_trigger: 100,
+            ..EngineOptions::default()
+        })
+    }
 
     #[test]
-    fn stall_signal_wakes_a_registered_waiter() {
-        let signal = Arc::new(StallSignal::new());
-        let waiter = Arc::clone(&signal);
-        let handle = thread::spawn(move || {
-            waiter.wait(Duration::from_secs(5));
+    fn a_wait_with_no_queue_is_completed_by_whoever_clears_the_stall() {
+        let (_dir, engine) = stopped_engine();
+        let signal = engine.stall_signal();
+        assert!(matches!(signal.classify(), Some((_, true))));
+        let wait = signal.wait(engine.io(), None, "stop", None);
+        assert!(!wait.is_ready());
+        let again = signal.wait(engine.io(), None, "stop", None);
+        assert!(!again.is_ready());
+        engine.run_one_compaction_pass().unwrap();
+        assert!(
+            wait.is_ready(),
+            "the pass cleared the stall and landed the unit"
+        );
+        assert!(again.is_ready(), "one unit for every writer of the stall");
+    }
+
+    #[test]
+    fn a_wait_on_a_queue_is_completed_only_at_that_queues_poll() {
+        let (_dir, engine) = stopped_engine();
+        let signal = engine.stall_signal();
+        let mut queue = engine.io_queue();
+        let shared = engine.io().queue(queue.id());
+        let wait = signal.wait(engine.io(), shared, "stop", None);
+        queue.poll(IoBudget::ALL);
+        assert!(!wait.is_ready());
+        engine.run_one_compaction_pass().unwrap();
+        assert!(!wait.is_ready(), "cleared, but not delivered yet");
+        assert_eq!(queue.poll(IoBudget::ALL).completed, 1);
+        assert!(wait.is_ready());
+    }
+
+    #[test]
+    fn a_wait_for_a_stall_that_already_cleared_is_ready_at_once() {
+        let (_dir, engine) = stopped_engine();
+        engine.run_one_compaction_pass().unwrap();
+        let wait = engine.stall_signal().wait(engine.io(), None, "stop", None);
+        assert!(wait.is_ready());
+    }
+
+    #[test]
+    fn a_step_that_leaves_the_stop_hands_it_back_to_the_writer_it_held_off() {
+        let (_dir, engine) = stopped_engine_where_writers_relieve();
+        // A job holds the compaction gate: the stopped write's own step is
+        // contended, and the write waits for the job's thread.
+        let gate = engine.compaction_gate().exclusive().unwrap();
+        let Err(Error::WouldBlock(WouldBlock::Stall(wait))) = engine.admit_write(false) else {
+            panic!("a contended relief returns a wait");
+        };
+        assert!(!wait.is_ready());
+        drop(gate);
+        // That thread runs one step, which leaves the stop on, and relieves
+        // no further: an owed step after its commit, or a job that ended.
+        assert!(matches!(
+            engine.run_one_background_step().unwrap(),
+            CompactionOutcome::Idle
+        ));
+        assert!(matches!(engine.stall_signal().classify(), Some((_, true))));
+        assert!(wait.is_ready(), "handed back: the writer looks again");
+        // Looking again, the writer finds no step that relieves the stop and
+        // says so, instead of waiting for ever.
+        assert!(matches!(engine.admit_write(false), Err(Error::Busy(_))));
+    }
+
+    #[test]
+    fn progress_between_a_contended_step_and_its_wait_completes_the_wait() {
+        let (_dir, engine) = stopped_engine();
+        let signal = engine.stall_signal();
+        let early = signal.wait(engine.io(), None, "stop", None);
+        // The writer read the progress, and its step was contended.
+        let seen = signal.progress();
+        // The holder's work ends with the stop on; with a worker relieving,
+        // nothing lands.
+        signal.refresh();
+        assert!(!early.is_ready());
+        assert!(
+            !signal
+                .wait(engine.io(), None, "stop", Some(signal.progress()))
+                .is_ready()
+        );
+        // The writer registers only now: it sees the progress it missed.
+        assert!(
+            signal
+                .wait(engine.io(), None, "stop", Some(seen))
+                .is_ready()
+        );
+    }
+
+    #[test]
+    fn a_stall_step_dropped_unrun_hands_the_stop_back() {
+        let (_dir, engine) = stopped_engine_where_writers_relieve();
+        // Writer A's stop left the relieving step on A's queue.
+        let queue_a = engine.io_queue();
+        let shared_a = engine.io().queue(queue_a.id()).unwrap();
+        engine.leave_stall_step(&shared_a);
+        // Writer B found it there and waits.
+        let mut queue_b = engine.io_queue();
+        let shared_b = engine.io().queue(queue_b.id());
+        let wait = engine
+            .stall_signal()
+            .wait(engine.io(), shared_b, "stop", None);
+        queue_b.poll(IoBudget::ALL);
+        assert!(!wait.is_ready());
+        // A's queue goes away before A polled it.
+        drop(queue_a);
+        queue_b.poll(IoBudget::ALL);
+        assert!(wait.is_ready(), "B looks again and leaves its own step");
+    }
+
+    /// Holds the flush that calls it, once armed, until it is let go.
+    pub(super) struct HeldFlush {
+        pub(super) armed: AtomicBool,
+        pub(super) entered: Mutex<mpsc::Sender<()>>,
+        pub(super) release: Mutex<mpsc::Receiver<()>>,
+    }
+
+    impl PrefixExtractor for HeldFlush {
+        fn extract<'a>(&self, key: &'a [u8]) -> Option<&'a [u8]> {
+            if self.armed.swap(false, Ordering::AcqRel) {
+                self.entered.lock().unwrap().send(()).unwrap();
+                self.release
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(60))
+                    .expect("the flush was never let go");
+            }
+            Some(key)
+        }
+
+        fn name(&self) -> &'static str {
+            "held-flush"
+        }
+    }
+
+    /// A stopped write whose own step finds another writer's owed flush in
+    /// flight waits for that writer. The flush adds an L0 table, so the stop
+    /// is still on when it ends, and that writer writes nothing more: the
+    /// stop is handed back, and the stopped write looks again instead of
+    /// waiting for a relief nobody runs.
+    #[test]
+    fn a_flush_that_leaves_the_stop_hands_it_back_to_the_writer_it_held_off() {
+        let (entered, when_entered) = mpsc::channel();
+        let (release, when_released) = mpsc::channel();
+        let held = Arc::new(HeldFlush {
+            armed: AtomicBool::new(false),
+            entered: Mutex::new(entered),
+            release: Mutex::new(when_released),
         });
-        // Drain-and-notify until the waiter has registered and exited; the
-        // deadline in `wait` bounds this even if the notify races ahead.
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while !handle.is_finished() && Instant::now() < deadline {
-            signal.notify_all();
-            thread::yield_now();
-        }
-        handle.join().expect("waiter thread panicked");
-    }
-
-    #[test]
-    fn stall_signal_wait_returns_on_its_deadline_without_a_notify() {
-        let signal = StallSignal::new();
-        let start = Instant::now();
-        signal.wait(Duration::from_millis(20));
-        assert!(start.elapsed() >= Duration::from_millis(15));
-    }
-
-    #[test]
-    fn stall_signal_survives_more_waiters_than_slots() {
-        let signal = StallSignal::new();
-        for _ in 0..(STALL_WAITER_SLOTS * 2) {
-            let _ = signal.waiters.push(Arc::new(Signal::new()));
-        }
-        signal.notify_all();
-        // Every surviving registration was drained, so the ring is
-        // available again for the next round of stalled writers.
-        assert!(signal.waiters.pop().is_none());
+        let (_dir, engine) = stopped_engine_with(EngineOptions {
+            inline_compaction: true,
+            l0_compaction_trigger: 100,
+            write_buffer_size: 2 * 1024,
+            prefix_extractor: Some(held.clone()),
+            ..EngineOptions::default()
+        });
+        let fill = |key: &[u8]| {
+            let ops = vec![WriteBatchOp::Put {
+                key: prefix_key(DEFAULT_CF_ID, key),
+                value: vec![7u8; 1024],
+            }];
+            engine
+                .apply_batch(ops, DurabilityMode::Eventual, false)
+                .unwrap();
+        };
+        // Two 1 KiB puts fill the buffer, so the third seals it, and the
+        // step that write owes flushes it.
+        fill(b"a");
+        fill(b"b");
+        held.armed.store(true, Ordering::Release);
+        let wait = std::thread::scope(|scope| {
+            scope.spawn(|| fill(b"c"));
+            when_entered
+                .recv_timeout(Duration::from_secs(60))
+                .expect("the sealing write never flushed");
+            let Err(Error::WouldBlock(WouldBlock::Stall(wait))) = engine.admit_write(false) else {
+                panic!("a relief contended by a flush in flight returns a wait");
+            };
+            assert!(!wait.is_ready());
+            release.send(()).unwrap();
+            wait
+        });
+        // The sealing write returned: its flush is done, and it writes no more.
+        assert!(matches!(engine.stall_signal().classify(), Some((_, true))));
+        assert!(wait.is_ready(), "handed back: the writer looks again");
     }
 }
 
-#[cfg(all(test, not(target_arch = "wasm32")))]
+#[cfg(all(test, not(loom)))]
 #[path = "stall_failure_tests.rs"]
 mod failure_tests;
+
+#[cfg(all(test, not(loom)))]
+#[path = "stall_latch_tests.rs"]
+mod latch_tests;

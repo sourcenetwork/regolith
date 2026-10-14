@@ -46,11 +46,10 @@
 
 use std::io;
 use std::path::Path;
-use std::time::Duration;
 
 use super::std_env::StdEnv;
 use super::{
-    Capabilities, DirEntry, Env, FileLock, FileMeta, JoinHandle, ReadFile, WriteFile, WriteMode,
+    Capabilities, Env, FileLock, FileMeta, JoinHandle, ReadDir, ReadFile, WriteFile, WriteMode,
 };
 
 /// The WASI host: `std::fs` over a preopened directory, with no
@@ -77,7 +76,7 @@ impl Env for WasiEnv {
         self.fs.create_dir_all(path)
     }
 
-    fn read_dir(&self, path: &Path) -> io::Result<Vec<DirEntry>> {
+    fn read_dir(&self, path: &Path) -> io::Result<ReadDir<'_>> {
         self.fs.read_dir(path)
     }
 
@@ -148,16 +147,6 @@ impl Env for WasiEnv {
             io::ErrorKind::Unsupported,
             format!("cannot start thread {name}: WASI has no threads"),
         ))
-    }
-
-    /// Blocks the single thread through `poll_oneoff`, which wasmtime
-    /// implements.
-    ///
-    /// Only the write-slowdown delay calls this, and a database on
-    /// this target runs with no background worker, so the stall path
-    /// compacts inline and never reaches it.
-    fn sleep(&self, dur: Duration) {
-        self.fs.sleep(dur);
     }
 
     /// Nothing to do: WASI has no `posix_fadvise`.

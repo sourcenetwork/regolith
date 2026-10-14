@@ -46,6 +46,10 @@ pub(crate) struct TxnRequest {
     /// The check the transaction ran at a horizon before it queued; the
     /// leader checks only what landed above it.
     pub(crate) early: Early,
+    /// Committed by `commit_nowait`: the commit must not wait for its
+    /// group's fsync, so a group carrying it that needs one is left owing it
+    /// (`deferred.rs`).
+    pub(crate) nowait: bool,
 }
 
 /// The leader's verdict on one transaction member.
@@ -80,11 +84,18 @@ pub(crate) enum Settled {
         /// What the leader counted validating it, when its thread counts.
         perf: Option<Box<PerfContextSnapshot>>,
     },
+    /// The group was written and still owes its fsync: what the member
+    /// learns is taken from `group` once it lands, as member `member`.
+    Pending {
+        group: std::sync::Arc<super::GroupSync>,
+        member: usize,
+    },
 }
 
 impl Settled {
     /// The sequence a plain write landed at. A plain write only ever settles
-    /// as [`Settled::Write`]; anything else is reported, not trusted.
+    /// as [`Settled::Write`] once its group landed; anything else is
+    /// reported, not trusted.
     pub(crate) fn into_seq(self) -> io::Result<u64> {
         match self {
             Settled::Write(seq) => Ok(seq),

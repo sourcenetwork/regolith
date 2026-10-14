@@ -40,9 +40,12 @@
 //! `src/backup/format.rs`; the rules are checked in
 //! `proofs/tla/BackupSeal.tla` and `proofs/lean/Regolith/BackupSeal.lean`.
 
+mod collect;
 mod format;
+mod listing;
 
-use std::collections::HashSet;
+pub use listing::Backups;
+
 use std::io::{self};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -77,10 +80,37 @@ pub struct BackupInfo {
     pub bytes: u64,
 }
 
+/// A backup [`BackupEngine::list_backups`] found but could not read.
+///
+/// Its metadata file is in the repository, but what the backup holds cannot
+/// be read: the file is damaged, was written by a version of regolith this
+/// build does not read, or the disk failed the read. [`BackupEngine::restore`]
+/// refuses it for the same reason.
+///
+/// While it is in the repository no shared file is removed, because nothing
+/// can tell which ones it needs: [`BackupEngine::delete_backup`] and
+/// [`BackupEngine::purge_old_backups`] still delete the backups they are
+/// asked to, then fail naming it. Deleting it removes it like any other
+/// backup.
+#[derive(Debug, thiserror::Error)]
+#[error("backup {id} cannot be read: {reason}")]
+#[non_exhaustive]
+pub struct UnreadableBackup {
+    /// The backup's id, from its metadata file's name.
+    pub id: BackupId,
+    /// Why its metadata could not be read: [`Error::Corruption`] for a
+    /// damaged file or a version this build does not read, [`Error::Io`]
+    /// when the read itself failed.
+    #[source]
+    pub reason: Error,
+}
+
 /// Content-addressed backup repository for one or more databases.
 ///
-/// Multiple [`BackupEngine`] instances should not share a backup
-/// directory - there is no cross-process locking. A single process
+/// Multiple [`BackupEngine`] instances must not share a backup directory:
+/// there is no cross-process locking, and a delete or purge in one removes
+/// every shared file no finished backup lists, including the tables another
+/// one's unfinished backup has copied and not yet listed. A single process
 /// may reuse one instance for many backups.
 ///
 /// The engine holds no key. A backup of an encrypted database is sealed
@@ -141,9 +171,14 @@ impl BackupEngine {
     /// The metadata is written last, after every table it lists is durable
     /// in `shared/`, so a crash part way leaves no backup and at most some
     /// unlisted shared files, which a later backup of the same tables
-    /// reuses.
+    /// reuses and a later delete or purge removes.
+    ///
+    /// # Errors
+    ///
+    /// Fails with [`Error::Corruption`] when `meta/` already holds the
+    /// largest backup id there is, since no backup can follow it.
     pub fn create_backup(&mut self, db: &Db) -> Result<BackupId> {
-        let id = BackupId(self.next_backup_id()?);
+        let id = self.next_backup_id()?;
         // A backup records when it was taken. Without a wall clock
         // there is no honest value to write, so the call fails here
         // rather than stamping every backup with the epoch.
@@ -160,12 +195,12 @@ impl BackupEngine {
             .map_err(Error::from)?;
 
         // Take the snapshot in a limited scope so its held
-        // compaction lock is released before we touch the backup
+        // compaction gate is released before we touch the backup
         // metadata directory. `checkpoint_capture` holds the
-        // engine's compaction lock, which pins the captured file
+        // engine's compaction gate, which pins the captured file
         // set against concurrent unlink while we hash + copy.
         let (files, next_file_id, last_seq) = {
-            let snapshot = db.engine().checkpoint_capture().map_err(Error::from)?;
+            let snapshot = db.engine().checkpoint_capture_here().map_err(Error::from)?;
 
             let mut files = Vec::new();
             for (level_idx, level) in snapshot.version.levels.iter().enumerate() {
@@ -196,7 +231,7 @@ impl BackupEngine {
                 snapshot.version.next_file_id,
                 snapshot.version.last_seq,
             )
-            // snapshot drops here, releasing the compaction lock.
+            // snapshot drops here, releasing the compaction gate.
         };
 
         let manifest = BackupManifest {
@@ -207,42 +242,37 @@ impl BackupEngine {
             sealed_under: sealer.as_ref().map(|s| s.id()),
         };
         let bytes = format::encode(&manifest, id, sealer.as_ref()).map_err(Error::from)?;
-        let manifest_path = self.meta_dir.join(backup_filename(id.0));
-        atomic_write(&*self.env, &manifest_path, &bytes).map_err(Error::from)?;
+        atomic_write(&*self.env, &self.meta_path(id), &bytes).map_err(Error::from)?;
         Ok(id)
     }
 
-    /// Return a summary of every backup currently stored. Ordered
-    /// by backup id (creation order).
+    /// Every backup in the repository, in id order (creation order), each
+    /// exactly once, streamed: an `Ok` item holds `Ok` with the backup's
+    /// summary when its metadata reads, `Err` with its id and the reason
+    /// when it does not ([`UnreadableBackup`]). No backup is left out, so
+    /// the listing's length is the number of backups the repository holds,
+    /// readable or not.
     ///
-    /// Needs no key: a sealed backup keeps its listing readable. A backup
-    /// whose metadata cannot be read is left out.
-    pub fn list_backups(&self) -> Vec<BackupInfo> {
-        let mut out = Vec::new();
-        let Ok(entries) = self.env.read_dir(&self.meta_dir) else {
-            return out;
-        };
-        let mut ids: Vec<u64> = entries
-            .iter()
-            .filter_map(|e| parse_backup_id(&e.file_name()))
-            .collect();
-        ids.sort_unstable();
-        for id in ids {
-            let path = self.meta_dir.join(backup_filename(id));
-            let Ok(bytes) = self.env.read(&path) else {
-                continue;
-            };
-            let Ok(listing) = format::decode_listing(&bytes) else {
-                continue;
-            };
-            out.push(BackupInfo {
-                id: BackupId(id),
-                created_at_unix: listing.created_at_unix,
-                file_count: listing.objects.len(),
-                bytes: listing.objects.iter().map(|&(_, size)| size).sum(),
-            });
-        }
-        out
+    /// The listing walks `meta/` a page of ids at a time ([`Backups`]), so
+    /// it holds one page and one backup's listing however many backups the
+    /// repository keeps. It owns what it reads, so the engine may delete
+    /// what it lists while it lists it.
+    ///
+    /// A backup is a file in `meta/` named as [`BackupEngine::create_backup`]
+    /// names one. Anything else there is not a backup: the staging file a
+    /// backup cut short by a crash left, for one, never became one.
+    ///
+    /// Needs no key: a sealed backup keeps its listing readable, so a backup
+    /// of an encrypted database lists as `Ok` without its provider. Reads
+    /// every backup's metadata, one file at a time.
+    ///
+    /// # Errors
+    ///
+    /// An `Err` item says a walk of the `meta/` directory itself failed, and
+    /// ends the listing: the backups after it cannot be accounted for, and
+    /// the listing says so rather than end as if there were none.
+    pub fn list_backups(&self) -> Backups {
+        Backups::new(Arc::clone(&self.env), self.meta_dir.clone())
     }
 
     /// Restore `backup_id` into `target_dir`. The target directory
@@ -325,95 +355,151 @@ impl BackupEngine {
         Ok(())
     }
 
-    /// Delete `backup_id`. Shared files whose reference count drops
-    /// to zero are removed from disk.
+    /// Delete `backup_id`, then remove every shared file no remaining backup
+    /// lists.
     ///
-    /// Needs no key. A shared file is removed only when every other
-    /// backup's metadata was read and none lists it: when one cannot be
-    /// read this fails, the backup gone and every shared file kept.
+    /// Needs no key, and nothing from the deleted backup's own metadata: a
+    /// backup that cannot be read ([`UnreadableBackup`]) is deleted like any
+    /// other, and the shared files only it listed go with it. Deleting a
+    /// backup that is not there deletes nothing and still removes the
+    /// shared files no backup lists, such as those a backup cut short by a
+    /// crash copied and never listed.
+    ///
+    /// The deletion is durable before any shared file is removed, so a
+    /// power cut never leaves a backup that lists a removed file.
+    ///
+    /// The collection sweeps `shared/` a batch of tables at a time and, for
+    /// each batch, reads every remaining listing one at a time: it holds one
+    /// batch of candidates and one listing, however many backups and tables
+    /// the repository keeps.
+    ///
+    /// # Errors
+    ///
+    /// Every remaining backup's listing is read, sealed or not. When one
+    /// cannot be read, `backup_id` is deleted all the same but no shared
+    /// file is removed from then on, since leaving that listing out could
+    /// remove a file the backup needs; the error names that backup. Delete
+    /// or repair it, and the next delete or purge removes them. A walk of
+    /// `meta/` that breaks part way stops the collection the same way.
     pub fn delete_backup(&mut self, backup_id: BackupId) -> Result<()> {
-        let path = self.meta_dir.join(backup_filename(backup_id.0));
-        if !self.env.exists(&path) {
-            return Ok(());
-        }
-        let listing = self.read_listing(backup_id)?;
-        crate::env::remove_file_and_sync_parent(&*self.env, &path).map_err(Error::from)?;
-        self.gc_shared(&listing)?;
-        Ok(())
+        self.remove_backups([Ok(backup_id)])?;
+        self.collect_shared()
     }
 
-    /// Delete every backup except the `keep` most recent.
+    /// Delete every backup except the `keep` most recent, by id, oldest
+    /// first, then remove every shared file no remaining backup lists.
+    ///
+    /// Every backup counts, readable or not: one that cannot be read
+    /// ([`UnreadableBackup`]) is deleted when it is among the oldest and
+    /// kept when it is among the `keep` most recent, as
+    /// [`BackupEngine::list_backups`] lists it. Needs no key.
+    ///
+    /// One walk of `meta/` counts the backups, and a second walks their ids
+    /// in order, a page at a time, deleting the oldest: the purge holds a
+    /// page of ids whatever `keep` is and however many backups there are.
+    ///
+    /// # Errors
+    ///
+    /// Fails before deleting anything when the `meta/` directory cannot be
+    /// read. A walk of `meta/` that breaks part way stops the purge: the
+    /// backups deleted so far each had `keep` newer ones, and no shared file
+    /// is removed. When a remaining backup cannot be read, the backups to
+    /// delete are deleted all the same but no shared file is removed, as
+    /// [`BackupEngine::delete_backup`] does, and the error names it.
     pub fn purge_old_backups(&mut self, keep: usize) -> Result<()> {
-        let infos = self.list_backups();
-        if infos.len() <= keep {
-            return Ok(());
-        }
-        let to_remove = infos.len() - keep;
-        for info in infos.into_iter().take(to_remove) {
-            self.delete_backup(info.id)?;
-        }
-        Ok(())
+        let mut total = 0usize;
+        self.each_backup_id(|_| total += 1)?;
+        let ids = listing::Ids::new(Arc::clone(&self.env), self.meta_dir.clone());
+        self.remove_backups(ids.take(total.saturating_sub(keep)))?;
+        self.collect_shared()
     }
 
-    /// Remove the shared files `removed` listed that no remaining backup
-    /// lists. Every remaining backup counts, sealed or not, since each
-    /// keeps its listing readable without a key; one whose listing cannot
-    /// be read stops the collection before anything is removed, because
-    /// leaving it out could remove a file it still needs.
-    fn gc_shared(&self, removed: &Listing) -> Result<()> {
-        let mut still_referenced = HashSet::new();
-        for entry in self.env.read_dir(&self.meta_dir).map_err(Error::from)? {
-            let Some(id) = parse_backup_id(&entry.file_name()) else {
-                continue;
-            };
-            let listing = self
-                .env
-                .read(&entry.path)
-                .and_then(|bytes| format::decode_listing(&bytes))
-                .map_err(|e| {
-                    io::Error::new(
-                        e.kind(),
-                        format!("backup {id} cannot be read, so no shared file was removed: {e}"),
-                    )
-                })?;
-            still_referenced.extend(listing.objects.into_iter().map(|(hash, _)| hash));
-        }
-        for &(hash, _) in &removed.objects {
-            if !still_referenced.contains(&hash) {
-                let p = self.shared_dir.join(shared_filename(hash));
-                match crate::env::remove_file_and_sync_parent(&*self.env, &p) {
-                    Ok(()) => {}
-                    Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-                    Err(e) => return Err(Error::from(e)),
+    /// Remove the metadata of every backup in `ids`, oldest first, then sync
+    /// `meta/` once, before any shared file is removed: a removal undone by
+    /// a power cut must not bring back a backup listing a shared file that
+    /// is gone. A walk that breaks stops the removals there; the ones made
+    /// are synced all the same, and the error returned.
+    fn remove_backups(&self, ids: impl IntoIterator<Item = io::Result<BackupId>>) -> Result<()> {
+        let mut removed = false;
+        let mut stopped = Ok(());
+        for id in ids {
+            let removal = id.and_then(|id| match self.env.remove_file(&self.meta_path(id)) {
+                Ok(()) => {
+                    removed = true;
+                    Ok(())
                 }
+                Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+                Err(e) => Err(e),
+            });
+            if let Err(e) = removal {
+                stopped = Err(Error::from(e));
+                break;
+            }
+        }
+        if removed {
+            self.env.sync_dir(&self.meta_dir).map_err(Error::from)?;
+        }
+        stopped
+    }
+
+    /// Call `f` with the id of every backup in `meta/`, in the order one
+    /// walk meets them, holding none of them: what counting the backups and
+    /// finding the largest id need.
+    fn each_backup_id(&self, mut f: impl FnMut(BackupId)) -> Result<()> {
+        for entry in self.env.read_dir(&self.meta_dir).map_err(Error::from)? {
+            if let Some(id) = parse_backup_id(&entry.map_err(Error::from)?.file_name()) {
+                f(id);
             }
         }
         Ok(())
+    }
+
+    fn meta_path(&self, id: BackupId) -> PathBuf {
+        self.meta_dir.join(backup_filename(id))
     }
 
     fn read_manifest(&self, id: BackupId, keyring: Option<&Keyring>) -> Result<BackupManifest> {
-        let path = self.meta_dir.join(backup_filename(id.0));
-        let bytes = self.env.read(&path).map_err(Error::from)?;
+        let bytes = self.env.read(&self.meta_path(id)).map_err(Error::from)?;
         format::decode(&bytes, id, keyring).map_err(Error::from)
     }
 
-    fn read_listing(&self, id: BackupId) -> Result<Listing> {
-        let path = self.meta_dir.join(backup_filename(id.0));
-        let bytes = self.env.read(&path).map_err(Error::from)?;
-        format::decode_listing(&bytes).map_err(Error::from)
+    fn read_listing(&self, id: BackupId) -> io::Result<Listing> {
+        read_listing(&*self.env, &self.meta_dir, id)
     }
 
-    fn next_backup_id(&self) -> Result<u64> {
-        let mut max_id = 0u64;
-        for entry in self.env.read_dir(&self.meta_dir).map_err(Error::from)? {
-            if let Some(id) = parse_backup_id(&entry.file_name())
-                && id > max_id
-            {
-                max_id = id;
-            }
-        }
-        Ok(max_id + 1)
+    /// One past the largest backup id `meta/` holds, from one walk that
+    /// keeps only the largest so far.
+    fn next_backup_id(&self) -> Result<BackupId> {
+        let mut last = 0u64;
+        self.each_backup_id(|id| last = last.max(id.0))?;
+        last.checked_add(1).map(BackupId).ok_or_else(|| {
+            Error::corruption(format!(
+                "backup {last} has the largest id there is, so no backup can follow it"
+            ))
+        })
     }
+}
+
+/// Backup `id`'s clear listing, read from `meta_dir`: no key needed.
+fn read_listing(env: &dyn Env, meta_dir: &Path, id: BackupId) -> io::Result<Listing> {
+    format::decode_listing(&env.read(&meta_dir.join(backup_filename(id)))?)
+}
+
+/// What [`BackupEngine::list_backups`] reports for a backup whose listing
+/// reads. A listing whose sizes add up past `u64` is damaged: no backup
+/// holds that many bytes.
+fn summarize(id: BackupId, listing: &Listing) -> io::Result<BackupInfo> {
+    let bytes = listing
+        .objects
+        .iter()
+        .try_fold(0u64, |sum, &(_, size)| sum.checked_add(size))
+        .ok_or_else(|| invalid_data(format!("backup {id}: its tables' sizes overflow")))?;
+    Ok(BackupInfo {
+        id,
+        created_at_unix: listing.created_at_unix,
+        file_count: listing.objects.len(),
+        bytes,
+    })
 }
 
 fn hash_file(env: &dyn Env, path: &Path) -> io::Result<u128> {
@@ -517,13 +603,24 @@ fn shared_filename(hash: u128) -> String {
     format!("{:032x}.sst", hash)
 }
 
-fn backup_filename(id: u64) -> String {
-    format!("{:06}.backup", id)
+fn backup_filename(id: BackupId) -> String {
+    format!("{:06}.backup", id.0)
 }
 
-fn parse_backup_id(name: &str) -> Option<u64> {
-    let stem = name.strip_suffix(".backup")?;
-    stem.parse::<u64>().ok()
+/// The content id a shared table's file name carries. Only the name
+/// [`shared_filename`] writes parses, so a name and a content id map one to
+/// one.
+fn parse_shared_filename(name: &str) -> Option<u128> {
+    let hash = u128::from_str_radix(name.strip_suffix(".sst")?, 16).ok()?;
+    (shared_filename(hash) == name).then_some(hash)
+}
+
+/// The backup id a metadata file's name carries. Only the name
+/// [`backup_filename`] writes parses: `7.backup` or `+7.backup` would name
+/// a file the engine reads as `000007.backup`, a different file.
+fn parse_backup_id(name: &str) -> Option<BackupId> {
+    let id = BackupId(name.strip_suffix(".backup")?.parse::<u64>().ok()?);
+    (backup_filename(id) == name).then_some(id)
 }
 
 /// Encode a restored backup as an engine MANIFEST, through the engine's own
@@ -560,3 +657,6 @@ fn encode_engine_manifest(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod unreadable_tests;

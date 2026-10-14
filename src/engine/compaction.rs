@@ -1,5 +1,5 @@
 use std::cmp::Ordering as CmpOrdering;
-use std::collections::{BinaryHeap, HashSet};
+use std::collections::BinaryHeap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 // The periodic worker poll is the only user of these, and the worker
@@ -34,11 +34,17 @@ use crate::engine::background_health::BackgroundHealth;
 use crate::engine::background_health::Job;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::engine::compaction_backoff::FailureBackoff;
+use crate::engine::compaction_gate::CompactionGate;
+use crate::engine::io::job::JobBody;
 use crate::engine::pending_outputs::PendingOutputs;
 use crate::env::{Env, JoinHandle};
+use kovan_queue::seg_queue::SegQueue;
 
+pub(crate) mod claims;
 mod retire;
 mod stripes;
+
+pub(crate) use claims::Claims;
 
 use retire::Retirement;
 
@@ -67,7 +73,49 @@ const WORKER_POLL_INTERVAL: Duration = Duration::from_secs(1);
 /// exists, which is after its workers start.
 type FlushHook = Arc<std::sync::OnceLock<Box<dyn Fn() + Send + Sync>>>;
 
+/// Jobs handed to the workers instead of run on a caller's thread: a
+/// foreground job (`compact_range`, an ingest, a checkpoint) and the disk
+/// check (D15, plan 4.10). Whichever worker wakes first runs each, in
+/// arrival order, before it flushes or compacts. What bounds it: each job is
+/// a call a caller made and holds a ticket for, plus one disk check per open.
+pub(crate) struct WorkerJobs {
+    jobs: SegQueue<Box<dyn JobBody>>,
+    /// Set by shutdown: no job is accepted after it.
+    closed: AtomicBool,
+}
+
+impl WorkerJobs {
+    fn new() -> Self {
+        Self {
+            jobs: SegQueue::new(),
+            closed: AtomicBool::new(false),
+        }
+    }
+
+    /// Run the oldest queued job on this worker, if there is one. One at a
+    /// time, so a worker's passes and flushes take turns with the jobs
+    /// however many are queued (E28).
+    #[cfg(not(target_arch = "wasm32"))]
+    fn run_one(&self) -> bool {
+        self.jobs.pop().map(|job| job.run()).is_some()
+    }
+
+    /// Settle every job still queued without running it: the workers have
+    /// stopped. Called after they joined, so no job is left untold.
+    pub(crate) fn release_queued(&self) {
+        self.closed.store(true, Ordering::Release);
+        while let Some(job) = self.jobs.pop() {
+            job.release();
+        }
+    }
+}
+
 /// Manages background compaction on one or more dedicated OS threads.
+///
+/// Every call takes `&self` and none waits for another: the engine holds it
+/// with no lock around it. Its state is the workers' shutdown flag, the
+/// coalescing flag of the wake-up channel and two lock-free queues (the jobs,
+/// and the workers' join handles, which shutdown takes).
 pub(crate) struct CompactionScheduler {
     shutdown: Arc<AtomicBool>,
     /// Wake-up channel. One token wakes one idle worker.
@@ -76,11 +124,17 @@ pub(crate) struct CompactionScheduler {
     /// so a flush storm cannot queue thousands of wake-ups for work a
     /// single pass already covers.
     pending: Arc<AtomicBool>,
+    /// How many workers were started. Fixed at start, so it still says
+    /// whether workers ran once their handles were taken.
+    workers: usize,
     /// Joined through the env, so a target that cannot spawn threads
     /// runs compaction in the foreground instead of failing to build.
-    handles: Vec<Box<dyn JoinHandle>>,
+    /// Popped by whichever shutdown comes first; each handle is joined once.
+    handles: SegQueue<Box<dyn JoinHandle>>,
     /// The flush the workers run before compacting.
     flush: FlushHook,
+    /// Jobs handed to the workers.
+    jobs: Arc<WorkerJobs>,
 }
 
 impl CompactionScheduler {
@@ -91,15 +145,50 @@ impl CompactionScheduler {
             shutdown: Arc::new(AtomicBool::new(true)),
             trigger,
             pending: Arc::new(AtomicBool::new(false)),
-            handles: Vec::new(),
+            workers: 0,
+            handles: SegQueue::new(),
             flush: FlushHook::default(),
+            jobs: Arc::new(WorkerJobs::new()),
         }
+    }
+
+    /// Hand `job` to the workers, waking one. `Err` hands it back when no
+    /// worker runs or they were told to stop.
+    pub(crate) fn submit(&self, job: Box<dyn JobBody>) -> Result<(), Box<dyn JobBody>> {
+        if self.workers == 0 || self.jobs.closed.load(Ordering::Acquire) {
+            return Err(job);
+        }
+        self.jobs.jobs.push(job);
+        // Re-checked after the push: a shutdown that began meanwhile may
+        // have released the queue before this job reached it.
+        if self.jobs.closed.load(Ordering::Acquire) {
+            self.jobs.release_queued();
+            return Ok(());
+        }
+        self.notify();
+        Ok(())
+    }
+
+    /// Test-only: run `work` on a worker, as a job in its next round.
+    #[cfg(test)]
+    pub(crate) fn run_on_worker(&self, work: impl FnOnce() + Send + 'static) {
+        struct OnWorker<F>(F);
+        impl<F: FnOnce() + Send> JobBody for OnWorker<F> {
+            fn run(self: Box<Self>) {
+                (self.0)();
+            }
+            fn release(self: Box<Self>) {}
+        }
+        assert!(
+            self.submit(Box::new(OnWorker(work))).is_ok(),
+            "no worker runs here"
+        );
     }
 
     /// Whether background workers run here. Without one, a writer that
     /// seals a memtable or fills L0 owes the work itself (E9, E16).
     pub(crate) fn has_workers(&self) -> bool {
-        !self.handles.is_empty()
+        self.workers != 0
     }
 
     /// Install what the workers run before compacting: the engine's flush
@@ -110,20 +199,18 @@ impl CompactionScheduler {
 
     /// Start one or more background compaction threads.
     ///
-    /// `compaction_lock` is the engine-wide RwLock that serializes
-    /// foreground callers (write lock) with background workers (read
-    /// lock). Multiple workers can run concurrently; the in-progress
-    /// set inside `compaction_loop` ensures they don't pick overlapping
-    /// input sets.
+    /// `gate` is the engine-wide compaction gate: a worker's pass holds it
+    /// shared, so workers run side by side, and a foreground job holds it
+    /// alone. `claims` keeps passes that share it off each other's tables.
     ///
     /// `snapshot_registry` lets each compaction pass read the live
     /// snapshots, so it can cut each key's versions into stripes and
     /// drop or fold what no reader of a stripe can see.
     ///
-    /// `in_progress` is the engine-wide set of file ids currently being
-    /// compacted. The engine owns it and shares it with the foreground
-    /// inline compaction path, so a worker and a foreground pass can
-    /// never pick overlapping inputs.
+    /// `claims` is the engine-wide record of the tables passes are working
+    /// on. The engine owns it and shares it with the passes its callers'
+    /// threads run, so a worker and such a pass never pick overlapping
+    /// inputs.
     ///
     /// `max_background_compactions == 0` starts no worker at all and
     /// returns a scheduler equivalent to [`CompactionScheduler::disabled`];
@@ -143,14 +230,14 @@ impl CompactionScheduler {
     // shared handles the workers would have taken unread.
     #[cfg_attr(target_arch = "wasm32", allow(unused_variables))]
     pub(crate) fn start(
-        compaction_lock: Arc<crate::sync::internal::Gate>,
+        gate: CompactionGate,
         snapshot_registry: Arc<SnapshotRegistry>,
         versions: Arc<VersionStore>,
         sst_dir: Arc<Path>,
         cache: Arc<BlockCache>,
         opts: CompactionOptions,
         stall_signal: Arc<crate::engine::StallSignal>,
-        in_progress: Arc<crate::sync::internal::Mutex<HashSet<u64>>>,
+        claims: Arc<Claims>,
         health: Arc<BackgroundHealth>,
     ) -> std::io::Result<Self> {
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -177,43 +264,47 @@ impl CompactionScheduler {
 
         #[cfg(not(target_arch = "wasm32"))]
         {
-            let mut scheduler = Self {
+            let scheduler = Self {
                 shutdown: Arc::clone(&shutdown),
                 trigger,
                 pending: Arc::clone(&pending),
-                handles: Vec::with_capacity(worker_count),
+                workers: worker_count,
+                handles: SegQueue::new(),
                 flush: FlushHook::default(),
+                jobs: Arc::new(WorkerJobs::new()),
             };
 
             for i in 0..worker_count {
                 let shutdown_clone = Arc::clone(&shutdown);
                 let receiver_clone = receiver.clone();
                 let pending_clone = Arc::clone(&pending);
-                let lock_clone = Arc::clone(&compaction_lock);
+                let gate_clone = gate.clone();
                 let registry_clone = Arc::clone(&snapshot_registry);
                 let versions_clone = Arc::clone(&versions);
                 let sst_dir_clone = Arc::clone(&sst_dir);
                 let cache_clone = Arc::clone(&cache);
                 let opts_clone = opts.clone();
                 let stall_clone = Arc::clone(&stall_signal);
-                let in_progress_clone = Arc::clone(&in_progress);
+                let claims_clone = Arc::clone(&claims);
                 let health_clone = Arc::clone(&health);
                 let flush_clone = Arc::clone(&scheduler.flush);
+                let jobs_clone = Arc::clone(&scheduler.jobs);
 
                 let spawned = spawn_worker(&*opts.env, i, move || {
                     compaction_loop(
                         flush_clone,
+                        jobs_clone,
                         shutdown_clone,
                         receiver_clone,
                         pending_clone,
-                        lock_clone,
+                        gate_clone,
                         registry_clone,
                         versions_clone,
                         sst_dir_clone,
                         cache_clone,
                         opts_clone,
                         stall_clone,
-                        in_progress_clone,
+                        claims_clone,
                         health_clone,
                     );
                 });
@@ -258,36 +349,36 @@ impl CompactionScheduler {
     /// them, so a `notify_one` here would leave the rest sleeping until
     /// their condvar timeout and make close latency scale with
     /// `max_background_compactions`.
-    pub(crate) fn shutdown(&mut self) {
+    pub(crate) fn shutdown(&self) {
         self.signal_shutdown();
-        for handle in self.take_handles() {
-            handle.join();
-        }
+        self.join_workers();
+        self.release_jobs();
+    }
+
+    /// Settle every job handed to the workers that they did not run, once
+    /// they stopped, and refuse every later one.
+    pub(crate) fn release_jobs(&self) {
+        self.jobs.release_queued();
     }
 
     /// Tell every worker to stop, without waiting for any of them.
-    ///
-    /// Split from the join so a caller holding a lock a worker needs can
-    /// release it before waiting. See [`Self::take_handles`].
-    pub(crate) fn signal_shutdown(&mut self) {
+    pub(crate) fn signal_shutdown(&self) {
         self.shutdown.store(true, Ordering::Release);
         // One token per worker, bypassing the coalescing gate, so every
         // thread wakes now instead of waiting out its periodic poll.
-        for _ in 0..self.handles.len() {
+        for _ in 0..self.workers {
             self.trigger.send(());
         }
     }
 
-    /// Take the worker handles so they can be joined with no lock held.
-    ///
-    /// Joining while holding the mutex that guards this scheduler is a
-    /// deadlock: a worker parked in `compaction_lock.read()` cannot exit
-    /// until whoever holds that gate finishes, and `ingest_external_files`
-    /// holds it across a call that wants this very mutex. Handing the
-    /// handles out lets the caller drop its guard first, which is the only
-    /// ordering in which all three can make progress.
-    pub(crate) fn take_handles(&mut self) -> Vec<Box<dyn crate::env::JoinHandle>> {
-        std::mem::take(&mut self.handles)
+    /// Join every worker not joined yet. A worker waiting for the compaction
+    /// gate exits once whoever holds the gate lets go, so this returns only
+    /// then. Each handle is popped by one caller and joined once, so two
+    /// shutdowns at once join disjoint workers.
+    pub(crate) fn join_workers(&self) {
+        while let Some(handle) = self.handles.pop() {
+            handle.join();
+        }
     }
 }
 
@@ -439,21 +530,30 @@ impl Default for CompactionOptions {
 #[allow(clippy::too_many_arguments)]
 fn compaction_loop(
     flush: FlushHook,
+    jobs: Arc<WorkerJobs>,
     shutdown: Arc<AtomicBool>,
     trigger: Receiver<()>,
     pending: Arc<AtomicBool>,
-    compaction_lock: Arc<crate::sync::internal::Gate>,
+    gate: CompactionGate,
     snapshot_registry: Arc<SnapshotRegistry>,
     versions: Arc<VersionStore>,
     sst_dir: Arc<Path>,
     cache: Arc<BlockCache>,
     opts: CompactionOptions,
     stall_signal: Arc<crate::engine::StallSignal>,
-    in_progress: Arc<crate::sync::internal::Mutex<HashSet<u64>>>,
+    claims: Arc<Claims>,
     health: Arc<BackgroundHealth>,
 ) {
+    // The engine throttles this thread's I/O, and no caller's.
+    crate::rate_limiter::mark_worker_thread();
     let mut backoff = FailureBackoff::default();
     loop {
+        // About to idle: release the read views this thread's last pass
+        // was holding back, so an idle worker never pins a replaced
+        // version's table descriptors. The waits inside a round (for the
+        // gate, for the flush exclusion) release them where they park
+        // (`sync::internal::block_on`).
+        crate::engine::read_view::idle();
         // Wait for a trigger, or fall through on the periodic poll.
         // The gate is reopened before the pass runs, so a notification
         // that lands mid-pass queues a token instead of being swallowed.
@@ -463,34 +563,32 @@ fn compaction_loop(
             RecvDeadline::Disconnected => break,
         }
 
-        if shutdown.load(Ordering::Acquire) {
-            break;
-        }
-        // Frozen memtables first, oldest first: a flush feeds L0, and the
-        // commit path left it to this thread (E9). Not held back by the
-        // compaction backoff, which is about compaction failing.
-        if let Some(flush) = flush.get() {
-            flush();
-        }
-        if !backoff.ready(Instant::now()) {
-            continue;
-        }
-
-        // Drive compactions until there's nothing to do. Each pass
-        // takes a read lock so multiple workers can run concurrently.
-        // Foreground callers (`compact_range`, `ingest_external_files`,
-        // `checkpoint_capture`) take the write lock, which blocks until
-        // all workers finish their current pass.
-        loop {
-            let did_work = {
-                let _guard = compaction_lock.read();
+        // Rounds, until one finds nothing to do. Each round gives one turn
+        // to each kind of work, so none keeps another waiting however much
+        // of it there is (E28): a stream of jobs used to hold this thread in
+        // its job queue, and a busy L0 in its passes.
+        while !shutdown.load(Ordering::Acquire) {
+            // One job a caller handed over: a call a caller holds a ticket
+            // for. It takes the compaction gate alone, waiting here for the
+            // passes other workers have in flight.
+            let ran_job = jobs.run_one();
+            // Frozen memtables, oldest first: a flush feeds L0, and the
+            // commit path left it to this thread (E9). Not held back by the
+            // compaction backoff, which is about compaction failing.
+            if let Some(flush) = flush.get() {
+                flush();
+            }
+            // One compaction pass, holding the gate shared so that workers
+            // run side by side.
+            let did_work = backoff.ready(Instant::now()) && {
+                let _pass = gate.shared();
                 match pick_and_run_compaction(
                     &versions,
                     &sst_dir,
                     &cache,
                     &opts,
                     &snapshot_registry,
-                    &in_progress,
+                    &claims,
                 ) {
                     Ok(outcome) => {
                         backoff.record_success();
@@ -525,14 +623,17 @@ fn compaction_loop(
                 }
             };
 
-            // After each pass, wake any foreground writer that was
-            // blocked by a "stop writes" condition so it can re-check
-            // thresholds against the freshly-updated version.
-            stall_signal.notify_all();
+            // After each round, re-classify the stall against the freshly
+            // updated version: writers a stop stopped are told once it no
+            // longer holds.
+            stall_signal.refresh();
 
-            if !did_work || shutdown.load(Ordering::Acquire) {
+            if !ran_job && !did_work {
                 break;
             }
+        }
+        if shutdown.load(Ordering::Acquire) {
+            break;
         }
     }
 }
@@ -558,9 +659,10 @@ pub enum CompactionOutcome {
     DidWork,
     /// No level was over its trigger. Nothing to do.
     Idle,
-    /// Work is pending, but another thread holds the input files. The
-    /// caller should wait for that thread rather than conclude the
-    /// engine is idle.
+    /// Work may be pending, but another thread is in the way: another
+    /// pass holds the input files, or an exclusive user of the compaction
+    /// gate holds it or is owed it. The caller should try again later
+    /// rather than conclude the engine is idle.
     Contended,
 }
 
@@ -571,82 +673,37 @@ pub enum CompactionOutcome {
 /// Shared by the background worker loop and by the engine's foreground
 /// pass ([`crate::engine::RegolithEngine::run_one_compaction_pass`]) so the
 /// two can never diverge on what "one job" means. Callers hold either
-/// side of the engine-wide compaction lock and pass the engine-wide
-/// `in_progress` set.
-/// Sentinel claim for the styles that merge across the whole L0 pool.
-///
-/// File ids are allocated from a counter, so `u64::MAX` is never a real
-/// one and can stand for "the entire pool is spoken for". Claiming it
-/// keeps the exclusion honest when the pool happens to be empty, where
-/// claiming only the live ids would claim nothing and exclude nobody.
-const WHOLE_POOL_CLAIM: u64 = u64::MAX;
-
-/// Claim every live file, or report that another worker already holds one.
-///
-/// Used by the styles whose jobs span the whole L0 pool. Checking that the
-/// in-progress set is empty without then claiming anything does not
-/// exclude a second worker: it reaches the same check and finds the same
-/// empty set. The check and the claim have to be one critical section.
-fn claim_whole_pool(
-    versions: &Arc<VersionStore>,
-    in_progress: &crate::sync::internal::Mutex<HashSet<u64>>,
-) -> Option<Vec<u64>> {
-    let mut ip = in_progress.lock();
-    if !ip.is_empty() {
-        return None;
-    }
-    let version = versions.lock().current();
-    let mut ids: Vec<u64> = version
-        .levels
-        .iter()
-        .flat_map(|files| files.iter().map(|f| f.meta.file_id))
-        .collect();
-    ids.push(WHOLE_POOL_CLAIM);
-    for &id in &ids {
-        ip.insert(id);
-    }
-    Some(ids)
-}
-
-/// Drop a claim. Always runs, including on a failed job, so a worker that
-/// errors does not strand the files it held.
-fn release_claim(in_progress: &crate::sync::internal::Mutex<HashSet<u64>>, ids: &[u64]) {
-    let mut ip = in_progress.lock();
-    for id in ids {
-        ip.remove(id);
-    }
-}
-
+/// side of the engine-wide compaction gate and pass the engine-wide
+/// claims.
 pub(crate) fn pick_and_run_compaction(
     versions: &Arc<VersionStore>,
     sst_dir: &Path,
     cache: &BlockCache,
     opts: &CompactionOptions,
     snapshots: &SnapshotRegistry,
-    in_progress: &crate::sync::internal::Mutex<HashSet<u64>>,
+    claims: &Claims,
 ) -> std::io::Result<CompactionOutcome> {
     match opts.compaction_style {
         crate::options::CompactionStyle::Level => {
-            pick_and_run_level_compaction(versions, sst_dir, cache, opts, snapshots, in_progress)
+            pick_and_run_level_compaction(versions, sst_dir, cache, opts, snapshots, claims)
         }
         crate::options::CompactionStyle::Fifo => {
-            // One L0 pool, so there is nothing safe to pick in parallel.
-            let Some(claim) = claim_whole_pool(versions, in_progress) else {
+            // One L0 pool, so there is nothing safe to pick in parallel. The
+            // claim is held until this returns, by any path.
+            let Some(_pool) = claims.pool() else {
                 return Ok(CompactionOutcome::Contended);
             };
-            let result = run_fifo_pass(versions, sst_dir, opts);
-            release_claim(in_progress, &claim);
-            Ok(outcome(result?))
+            Ok(outcome(run_fifo_pass(versions, sst_dir, opts)?))
         }
         crate::options::CompactionStyle::Universal => {
             // Same: universal merges across all L0 files, so two jobs
             // would pick overlapping inputs.
-            let Some(claim) = claim_whole_pool(versions, in_progress) else {
+            let Some(_pool) = claims.pool() else {
                 return Ok(CompactionOutcome::Contended);
             };
-            let result = pick_and_run_universal(versions, sst_dir, cache, opts, snapshots);
-            release_claim(in_progress, &claim);
-            Ok(outcome(result?))
+            Ok(outcome(pick_and_run_universal(
+                versions, sst_dir, cache, opts, snapshots,
+            )?))
         }
     }
 }
@@ -839,28 +896,20 @@ fn pick_and_run_level_compaction(
     cache: &BlockCache,
     opts: &CompactionOptions,
     snapshots: &SnapshotRegistry,
-    in_progress: &crate::sync::internal::Mutex<HashSet<u64>>,
+    claims: &Claims,
 ) -> std::io::Result<CompactionOutcome> {
     let version = versions.lock().current();
 
     // Check L0 first
     if version.l0_count() >= opts.l0_compaction_trigger {
-        return compact_l0(versions, sst_dir, cache, opts, snapshots, in_progress);
+        return compact_l0(versions, sst_dir, cache, opts, snapshots, claims);
     }
 
     // Check other levels
     for level in 1..MAX_LEVELS - 1 {
         let target = level_target_size(level, opts);
         if version.level_size(level) > target {
-            return compact_level(
-                versions,
-                sst_dir,
-                cache,
-                opts,
-                level,
-                snapshots,
-                in_progress,
-            );
+            return compact_level(versions, sst_dir, cache, opts, level, snapshots, claims);
         }
     }
 
@@ -968,9 +1017,9 @@ fn compact_l0(
     cache: &BlockCache,
     opts: &CompactionOptions,
     snapshots: &SnapshotRegistry,
-    in_progress: &crate::sync::internal::Mutex<HashSet<u64>>,
+    claims: &Claims,
 ) -> std::io::Result<CompactionOutcome> {
-    compact_level(versions, sst_dir, cache, opts, 0, snapshots, in_progress)
+    compact_level(versions, sst_dir, cache, opts, 0, snapshots, claims)
 }
 
 /// Compact a level into the next level using the standard size-based
@@ -983,69 +1032,75 @@ fn compact_level(
     opts: &CompactionOptions,
     level: usize,
     snapshots: &SnapshotRegistry,
-    in_progress: &crate::sync::internal::Mutex<HashSet<u64>>,
+    claims: &Claims,
 ) -> std::io::Result<CompactionOutcome> {
     let target_level = level + 1;
     if target_level >= MAX_LEVELS {
         return Ok(CompactionOutcome::Idle);
     }
 
-    // Choose the input set and claim it in a single critical section.
-    //
-    // Checking that a file is unclaimed and then claiming it in a later
-    // lock hold does not exclude anything: two workers can both observe
-    // the same file free, both claim it, and both compact the same inputs
-    // into two output sets covering the same key range. Every level below
-    // L0 is read as one sorted run, so a level holding both sets is no
-    // longer sorted, and a scan across it stops at the first key that does
-    // not advance.
-    //
-    // The version is read under the same hold, so the files claimed are
-    // the ones live at claim time rather than ones another worker has
-    // already replaced. `in_progress` is taken before `versions`
-    // throughout this module; no path holds a version guard across a claim.
-    let (input_files, overlap_files, all_ids) = {
-        let mut ip = in_progress.lock();
-        let version = versions.lock().current();
+    // Choose the inputs from the current version, skipping what another
+    // pass holds, then claim them (`claims.rs`).
+    let version = versions.lock().current();
+    let level_files = &version.levels[level];
+    if level_files.is_empty() {
+        return Ok(CompactionOutcome::Idle);
+    }
+    let held = |file: &Arc<LiveSst>| file.claimed.load(Ordering::Acquire);
 
-        let level_files = &version.levels[level];
-        if level_files.is_empty() {
-            return Ok(CompactionOutcome::Idle);
-        }
-
-        // L0 files may overlap each other, so the level goes in one job and
-        // any claimed file blocks it. L1+ files do not overlap, so one
-        // unclaimed file at a time is a valid job on its own.
-        let picked: Vec<Arc<LiveSst>> = if level == 0 {
-            if level_files.iter().any(|f| ip.contains(&f.meta.file_id)) {
-                return Ok(CompactionOutcome::Contended);
-            }
-            level_files.clone()
-        } else {
-            match level_files.iter().find(|f| !ip.contains(&f.meta.file_id)) {
-                Some(f) => vec![Arc::clone(f)],
-                None => return Ok(CompactionOutcome::Contended),
-            }
-        };
-
-        let (min_key, max_key) = key_range(&picked);
-        let overlapping = find_overlapping(&version.levels[target_level], &min_key, &max_key);
-        if overlapping.iter().any(|f| ip.contains(&f.meta.file_id)) {
+    // L0 files may overlap each other, so the level goes in one job and
+    // any claimed file blocks it. L1+ files do not overlap, so one
+    // unclaimed file at a time is a valid job on its own.
+    let input_files: Vec<Arc<LiveSst>> = if level == 0 {
+        if level_files.iter().any(held) {
             return Ok(CompactionOutcome::Contended);
         }
-
-        let ids: Vec<u64> = picked
-            .iter()
-            .chain(overlapping.iter())
-            .map(|f| f.meta.file_id)
-            .collect();
-        for &id in &ids {
-            ip.insert(id);
+        level_files.clone()
+    } else {
+        match level_files.iter().find(|file| !held(file)) {
+            Some(file) => vec![Arc::clone(file)],
+            None => return Ok(CompactionOutcome::Contended),
         }
-        (picked, overlapping, ids)
     };
 
-    let result = perform_compaction(
+    let (min_key, max_key) = key_range(&input_files);
+    let overlap_files = find_overlapping(&version.levels[target_level], &min_key, &max_key);
+    if overlap_files.iter().any(held) {
+        return Ok(CompactionOutcome::Contended);
+    }
+
+    #[cfg(test)]
+    after_pick();
+
+    // Seeing a table unclaimed above excludes nothing: two passes can both
+    // see it free. The claim does, one compare-and-swap per table, and gives
+    // everything back when it meets a table another pass took meanwhile.
+    // Held until this returns, by any path, so a pass that errors does not
+    // strand its tables.
+    let Some(_claim) = claims.tables(
+        input_files
+            .iter()
+            .chain(&overlap_files)
+            .map(Arc::clone)
+            .collect(),
+    ) else {
+        return Ok(CompactionOutcome::Contended);
+    };
+
+    // The version these were picked from may be behind: a pass that held one
+    // of them can have installed its outputs and let go between the pick and
+    // the claim. Read again now that the claims are held. A table still in
+    // the version stays there while its claim is, and one that is gone was
+    // compacted already, so compacting it again would put its rows in the
+    // level twice.
+    let current = versions.lock().current();
+    if !claims::all_live(&current.levels[level], &input_files)
+        || !claims::all_live(&current.levels[target_level], &overlap_files)
+    {
+        return Ok(CompactionOutcome::Contended);
+    }
+
+    perform_compaction(
         versions,
         sst_dir,
         cache,
@@ -1054,14 +1109,28 @@ fn compact_level(
         input_files,
         overlap_files,
         snapshots,
-    );
-
-    // Always deregister, even on error, so workers don't stall
-    // forever waiting for a slot that will never clear.
-    release_claim(in_progress, &all_ids);
-
-    result?;
+    )?;
     Ok(CompactionOutcome::DidWork)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test seam: run once on this thread between a pass's pick of its
+    /// inputs and its claim of them, where another pass can compact the
+    /// same tables away. Thread-local, so a parallel test never runs
+    /// another test's hook.
+    static AFTER_PICK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Run and clear the [`AFTER_PICK`] hook. Taken before it runs, so a pass
+/// the hook itself makes does not run it again.
+#[cfg(test)]
+fn after_pick() {
+    let hook = AFTER_PICK.with(|hook| hook.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
 }
 
 /// Run a manual `compact_range` pass synchronously: for every level from
@@ -1069,7 +1138,7 @@ fn compact_level(
 /// push them down to the next level. Returns once no level has any more
 /// files in the range that can be pushed down.
 ///
-/// Callers must hold the engine-wide compaction lock so the background
+/// Callers must hold the engine-wide compaction gate so the background
 /// scheduler can't pick an overlapping input set concurrently.
 pub(crate) fn run_compact_range(
     versions: &Arc<VersionStore>,
@@ -1144,7 +1213,7 @@ pub(crate) fn run_compact_range(
 /// The tables are listed once, so a key rotated while this runs cannot keep
 /// it going. Each rewrite is an ordinary one-table compaction into the same
 /// level (L0 keeps its order), so it reduces versions exactly as any
-/// compaction would. The caller holds the compaction lock.
+/// compaction would. The caller holds the compaction gate.
 pub(crate) fn reseal_tables(
     versions: &Arc<VersionStore>,
     sst_dir: &Path,
@@ -1848,9 +1917,8 @@ impl<'a> StreamingCompactionWriter<'a> {
         let num_entries = summary.num_entries;
         let file_size = self.opts.env.metadata(&current.path)?.len;
 
-        if let Some(limiter) = &self.opts.rate_limiter {
-            limiter.request(file_size, crate::rate_limiter::Priority::Low);
-        }
+        // On a worker only: a caller's own compaction is never throttled.
+        crate::rate_limiter::throttle_background(self.opts.rate_limiter.as_ref(), file_size)?;
 
         if self.opts.evict_compaction_data_from_page_cache {
             self.opts.env.drop_page_cache(&current.path);
@@ -1962,9 +2030,8 @@ impl<'a> StreamingCompactionWriter<'a> {
 
         let file_size = self.opts.env.metadata(&path)?.len;
 
-        if let Some(limiter) = &self.opts.rate_limiter {
-            limiter.request(file_size, crate::rate_limiter::Priority::Low);
-        }
+        // On a worker only: a caller's own compaction is never throttled.
+        crate::rate_limiter::throttle_background(self.opts.rate_limiter.as_ref(), file_size)?;
 
         if self.opts.evict_compaction_data_from_page_cache {
             self.opts.env.drop_page_cache(&path);
@@ -2177,6 +2244,173 @@ mod tests {
         assert_eq!(db.get(b"k").unwrap().as_deref(), Some(&b"v"[..]));
     }
 
+    /// A pass picks its inputs, and before it claims them another pass
+    /// compacts the same tables, installs its outputs and lets go. The first
+    /// pass's claims succeed, on tables that are no longer in the version:
+    /// it must find that out and report `Contended`, never compact them a
+    /// second time.
+    #[test]
+    fn a_pass_whose_pick_went_stale_before_its_claim_backs_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = std::rc::Rc::new(
+            crate::Db::open(
+                dir.path(),
+                crate::Options::default()
+                    .max_background_compactions(0)
+                    .l0_compaction_trigger(2),
+            )
+            .unwrap(),
+        );
+        // Two L0 tables, which is the trigger, with nothing compacting them
+        // yet: a flush only owes a step to the next write, and no write
+        // follows the second flush.
+        for table in 0..2u32 {
+            for i in 0..40u32 {
+                db.put(
+                    format!("k{i:03}").as_bytes(),
+                    format!("v{table}").as_bytes(),
+                )
+                .unwrap();
+            }
+            db.flush().unwrap();
+        }
+        assert_eq!(
+            db.engine().level_file_count(0),
+            2,
+            "the pass needs its work"
+        );
+
+        let raced = std::rc::Rc::new(std::cell::Cell::new(None));
+        AFTER_PICK.with(|hook| {
+            let (db, raced) = (std::rc::Rc::clone(&db), std::rc::Rc::clone(&raced));
+            *hook.borrow_mut() = Some(Box::new(move || {
+                raced.set(Some(db.compact_step().unwrap()));
+            }));
+        });
+        let outer = db.compact_step().unwrap();
+
+        assert_eq!(
+            raced.get(),
+            Some(CompactionOutcome::DidWork),
+            "the racing pass compacted the picked tables"
+        );
+        assert_eq!(
+            outer,
+            CompactionOutcome::Contended,
+            "the first pass compacted tables another pass had already replaced"
+        );
+        assert_eq!(db.engine().level_file_count(0), 0);
+        assert!(
+            db.engine().compaction_claims_idle(),
+            "a claim was left held"
+        );
+        // Every key once, at its newest value.
+        let mut iter = db.iter();
+        iter.seek_to_first();
+        let mut seen = 0;
+        while iter.valid() {
+            assert_eq!(iter.value(), Some(&b"v1"[..]));
+            seen += 1;
+            iter.next();
+        }
+        assert_eq!(seen, 40, "a key was lost or doubled");
+    }
+
+    /// Callers hand jobs over and wake the workers from many threads while a
+    /// shutdown stops them: every job a hand-over accepted is run or settled
+    /// exactly once, every refused one comes back, and the shutdown joins.
+    #[test]
+    fn jobs_handed_over_while_the_workers_stop_are_each_run_or_settled_once() {
+        use std::sync::atomic::AtomicUsize;
+
+        struct Counted {
+            ran: Arc<AtomicUsize>,
+            settled: Arc<AtomicUsize>,
+        }
+        impl JobBody for Counted {
+            fn run(self: Box<Self>) {
+                self.ran.fetch_add(1, Ordering::SeqCst);
+            }
+            fn release(self: Box<Self>) {
+                self.settled.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        const SUBMITTERS: usize = 4;
+        const JOBS: usize = 300;
+        for round in 0..20 {
+            let dir = tempfile::tempdir().unwrap();
+            let sst_dir = dir.path().join("sst");
+            std::fs::create_dir_all(&sst_dir).unwrap();
+            let versions = Arc::new(VersionStore::new(
+                super::super::manifest::VersionSet::open(dir.path(), &sst_dir).unwrap(),
+            ));
+            let scheduler = CompactionScheduler::start(
+                CompactionGate::new(),
+                Arc::new(SnapshotRegistry::new()),
+                Arc::clone(&versions),
+                Arc::from(sst_dir.as_path()),
+                Arc::new(BlockCache::new(4096)),
+                CompactionOptions {
+                    max_background_compactions: 2,
+                    ..CompactionOptions::default()
+                },
+                Arc::new(crate::engine::StallSignal::for_tests(&versions)),
+                Arc::new(Claims::new()),
+                Arc::new(BackgroundHealth::default()),
+            )
+            .unwrap();
+            assert!(scheduler.has_workers());
+            let (ran, settled) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+            let (accepted, refused) = (AtomicUsize::new(0), AtomicUsize::new(0));
+            std::thread::scope(|scope| {
+                for _ in 0..SUBMITTERS {
+                    scope.spawn(|| {
+                        for _ in 0..JOBS {
+                            let job = Box::new(Counted {
+                                ran: Arc::clone(&ran),
+                                settled: Arc::clone(&settled),
+                            });
+                            match scheduler.submit(job) {
+                                Ok(()) => accepted.fetch_add(1, Ordering::SeqCst),
+                                Err(_) => refused.fetch_add(1, Ordering::SeqCst),
+                            };
+                            scheduler.notify();
+                        }
+                    });
+                }
+                // Stops the workers part way through the hand-overs, later
+                // each round.
+                scope.spawn(|| {
+                    while accepted.load(Ordering::SeqCst) + refused.load(Ordering::SeqCst)
+                        < round * SUBMITTERS * JOBS / 20
+                    {
+                        std::hint::spin_loop();
+                    }
+                    scheduler.shutdown();
+                });
+            });
+            // A second shutdown finds nothing left to join or settle.
+            scheduler.shutdown();
+            let (accepted, refused) = (
+                accepted.load(Ordering::SeqCst),
+                refused.load(Ordering::SeqCst),
+            );
+            assert_eq!(accepted + refused, SUBMITTERS * JOBS);
+            assert_eq!(
+                ran.load(Ordering::SeqCst) + settled.load(Ordering::SeqCst),
+                accepted,
+                "round {round}: an accepted job was dropped or handled twice"
+            );
+            assert!(
+                scheduler
+                    .submit(Box::new(Counted { ran, settled }))
+                    .is_err(),
+                "a stopped scheduler accepted a job"
+            );
+        }
+    }
+
     #[test]
     fn failed_start_joins_the_workers_it_already_spawned() {
         let dir = tempfile::tempdir().unwrap();
@@ -2194,14 +2428,14 @@ mod tests {
         let started = {
             let _guard = SpawnFailureGuard::allowing(2);
             CompactionScheduler::start(
-                Arc::new(crate::sync::internal::Gate::new()),
+                CompactionGate::new(),
                 Arc::new(SnapshotRegistry::new()),
                 Arc::clone(&versions),
                 Arc::from(sst_dir.as_path()),
                 Arc::new(BlockCache::new(4096)),
                 opts,
-                Arc::new(crate::engine::StallSignal::new()),
-                Arc::new(crate::sync::internal::Mutex::new(HashSet::new())),
+                Arc::new(crate::engine::StallSignal::for_tests(&versions)),
+                Arc::new(Claims::new()),
                 Arc::new(BackgroundHealth::default()),
             )
         };
@@ -2295,14 +2529,14 @@ mod tests {
         let started = {
             let _guard = SpawnFailureGuard::allowing(7);
             CompactionScheduler::start(
-                Arc::new(crate::sync::internal::Gate::new()),
+                CompactionGate::new(),
                 Arc::new(SnapshotRegistry::new()),
                 Arc::clone(&versions),
                 Arc::from(sst_dir.as_path()),
                 Arc::new(BlockCache::new(4096)),
                 opts,
-                Arc::new(crate::engine::StallSignal::new()),
-                Arc::new(crate::sync::internal::Mutex::new(HashSet::new())),
+                Arc::new(crate::engine::StallSignal::for_tests(&versions)),
+                Arc::new(Claims::new()),
                 Arc::new(BackgroundHealth::default()),
             )
         };

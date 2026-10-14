@@ -359,16 +359,18 @@ fn delete_then_compact_then_reopen_keeps_every_surviving_version() {
 
     let (before_scan, before_iter) = {
         let (db, stats) = open_instrumented(dir.path(), 16 * 1024);
+        // Through stalls: on a host with few cores the compaction worker
+        // falls behind these writes, and a stopped write waits for it.
         for i in 0..total {
-            db.put(&key_at(i), &stamped_value(1)).unwrap();
+            regolith::through_stalls(|| db.put(&key_at(i), &stamped_value(1))).unwrap();
         }
         for i in (1..total).step_by(3) {
-            db.put(&key_at(i), &stamped_value(2)).unwrap();
+            regolith::through_stalls(|| db.put(&key_at(i), &stamped_value(2))).unwrap();
         }
         for i in (2..total).step_by(3) {
-            db.delete(&key_at(i)).unwrap();
+            regolith::through_stalls(|| db.delete(&key_at(i))).unwrap();
         }
-        db.compact_range(None, None).unwrap();
+        db.compact_range(None, None).wait().unwrap();
 
         for (i, want) in expected.iter().enumerate() {
             assert_eq!(
@@ -408,7 +410,7 @@ fn delete_then_compact_then_reopen_keeps_every_surviving_version() {
     assert_same_view(&before_scan, &drain_iter(&db), "post-reopen iterator");
 
     // Compacting the recovered database must not change its content.
-    db.compact_range(None, None).unwrap();
+    db.compact_range(None, None).wait().unwrap();
     assert_same_view(
         &before_scan,
         &db.scan(None, None).unwrap(),
@@ -448,7 +450,7 @@ fn an_iterator_survives_the_compaction_that_unlinks_its_files() {
         db.put(&key_at(i), &stamped_value(1)).unwrap();
     }
     // Land the whole view in files, so there is something to unlink.
-    db.compact_range(None, None).unwrap();
+    db.compact_range(None, None).wait().unwrap();
 
     let baseline = drain_iter(&db);
     assert_eq!(baseline.len(), total);
@@ -472,7 +474,7 @@ fn an_iterator_survives_the_compaction_that_unlinks_its_files() {
     for i in 0..total {
         db.put(&key_at(i), &stamped_value(2)).unwrap();
     }
-    db.compact_range(None, None).unwrap();
+    db.compact_range(None, None).wait().unwrap();
 
     let unlinked = files_before.iter().filter(|p| !p.exists()).count();
     assert!(
@@ -527,7 +529,7 @@ fn concurrent_iterators_are_unaffected_by_compactions_beneath_them() {
         seed_batch.put(&key_at(i), &stamped_value(1));
     }
     db.write(seed_batch).unwrap();
-    db.compact_range(None, None).unwrap();
+    db.compact_range(None, None).wait().unwrap();
 
     let baseline = Arc::new(db.scan(None, None).unwrap());
     assert_eq!(baseline.len(), total);
@@ -551,7 +553,7 @@ fn concurrent_iterators_are_unaffected_by_compactions_beneath_them() {
                     batch.put(&key_at(i), &stamped_value(generation));
                 }
                 db.write(batch).unwrap();
-                db.compact_range(None, None).unwrap();
+                db.compact_range(None, None).wait().unwrap();
             }
             live.done_one();
         })
@@ -666,7 +668,7 @@ fn a_snapshot_pins_every_version_its_reads_need() {
         for i in (0..keys).step_by(2) {
             db.put(&key_at(i), &stamped_value(generation)).unwrap();
         }
-        db.compact_range(None, None).unwrap();
+        db.compact_range(None, None).wait().unwrap();
     }
 
     for (generation, snap, view) in &snapshots {
@@ -692,7 +694,7 @@ fn a_snapshot_pins_every_version_its_reads_need() {
     drop(newest);
     drop(middle);
     assert_eq!(db.get_int_property("regolith.num-snapshots"), Some(1));
-    db.compact_range(None, None).unwrap();
+    db.compact_range(None, None).wait().unwrap();
 
     let (generation, snap, view) = snapshots.pop().unwrap();
     assert_eq!(generation, 1);
@@ -704,7 +706,7 @@ fn a_snapshot_pins_every_version_its_reads_need() {
 
     drop(snap);
     assert_eq!(db.get_int_property("regolith.num-snapshots"), Some(0));
-    db.compact_range(None, None).unwrap();
+    db.compact_range(None, None).wait().unwrap();
     for i in 0..keys {
         assert_eq!(
             db.get(&key_at(i)).unwrap().as_deref(),

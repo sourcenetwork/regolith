@@ -18,12 +18,14 @@ use super::internal_key::{
     compare_internal_keys, decode_internal_key,
 };
 use super::lookup_key::LookupKey;
-use super::range_tombstone::{RangeTombstone, RangeTombstoneSet};
+use super::range_tombstone::RangeTombstone;
 use super::skiplist::{ArenaSkipList, InsertHint, NodeRef};
 use crate::DbSlice;
-use crate::sync::internal::{Arc, AtomicUsize, Mutex, Ordering};
+use crate::sync::internal::Arc;
+use tombstones::TombstoneLog;
 
 mod key_walk;
+mod tombstones;
 
 /// Everything a memtable needs to build its arena: the engine-wide chunk
 /// pool, the per-memtable byte budget, and the chunk sizing policy.
@@ -74,40 +76,21 @@ impl Default for MemTableConfig {
 /// Supports many concurrent readers and a single writer (serialized
 /// externally by the engine's write lock).
 ///
-/// Range tombstones are stored in a separate `Mutex<RangeTombstoneSet>`
-/// rather than interleaved with point entries. Range deletes are orders
-/// of magnitude rarer than point writes, and keeping them separate lets
-/// a point lookup skip the lock entirely while the memtable holds no
-/// range tombstone (see `range_tombstone_bytes`); once it holds one,
-/// every lookup takes the lock.
+/// Range tombstones live beside the skip list in an append-only log
+/// (`tombstones::TombstoneLog`) rather than interleaved with point
+/// entries. Range deletes are orders of magnitude rarer than point writes,
+/// and keeping them apart lets a point lookup skip them with one acquire
+/// load while the memtable holds none. Once it holds some, a lookup reads a
+/// published prefix of them without any lock, and an append never blocks a
+/// reader (T1 to T4 in that module).
 pub(crate) struct MemTable {
     list: ArenaSkipList,
-    range_tombstones: Mutex<RangeTombstoneSet>,
-    /// Heap bytes the range tombstones hold. They are the one part of a
-    /// memtable that does not live in the arena, so they are counted
-    /// separately and added into [`MemTable::approximate_size`].
-    ///
-    /// Also the lock-free gate in [`MemTable::covering_range_tombstone_seq`]:
-    /// it only ever rises, and zero means no range tombstone was ever
-    /// recorded, so a lookup that reads zero skips the mutex.
-    ///
-    /// Why a reader can never miss a tombstone visible at its snapshot:
-    /// `delete_range` raises this counter (Release) while it still holds the
-    /// tombstone mutex, on the commit leader, before the leader publishes the
-    /// tombstone's sequence `T` through the read horizon (`ReadHorizon::publish`,
-    /// a Release read-modify-write). A reader outside the pipeline mutex takes
-    /// its snapshot `S` from `ReadHorizon::visible` (Acquire). Every publish is
-    /// a read-modify-write on that one atomic, so they form one release
-    /// sequence and a reader that observed any `S >= T` synchronizes with the
-    /// publish of the group that wrote `T`; the increment therefore
-    /// happens-before that reader's load and it cannot read zero. A reader
-    /// with `S < T` may read either value: it is not allowed to see the
-    /// tombstone anyway, and `max_covering_seq` filters it out by sequence, so
-    /// both paths return the same answer. A reader under the pipeline mutex
-    /// (commit validation probes at `u64::MAX`) is ordered by the mutex itself.
-    /// A sealed memtable takes no further range deletes, so the argument
-    /// covers frozen memtables as well.
-    range_tombstone_bytes: AtomicUsize,
+    /// The range tombstones. Their published length is also the gate a
+    /// lookup checks first: zero means none was ever recorded. Why a reader
+    /// can never miss a tombstone visible at its snapshot is argued on the
+    /// log's module docs; a sealed memtable takes no further range deletes,
+    /// so the argument covers frozen memtables as well.
+    range_tombstones: TombstoneLog,
     /// The write-ahead log that backs this memtable's contents, recorded
     /// when the memtable is sealed and the log rotated away from it.
     ///
@@ -152,8 +135,7 @@ impl MemTable {
         })?;
         Ok(Self {
             list,
-            range_tombstones: Mutex::new(RangeTombstoneSet::default()),
-            range_tombstone_bytes: AtomicUsize::new(0),
+            range_tombstones: TombstoneLog::new(),
             sealed_wal: OnceLock::new(),
             sealed_seq: OnceLock::new(),
         })
@@ -252,54 +234,55 @@ impl MemTable {
     }
 
     /// Record a range tombstone - every user key in `[start, end)`
-    /// is considered deleted as of `seq`.
+    /// is considered deleted as of `seq`. Called only by the memtable's one
+    /// writer, as the point writes are.
     pub(crate) fn delete_range(&self, start: &[u8], end: &[u8], seq: u64) {
-        let heap = start.len() + end.len() + size_of::<RangeTombstone>();
-        let mut tombstones = self.range_tombstones.lock();
-        tombstones.push(RangeTombstone::new(start.to_vec(), end.to_vec(), seq));
-        // Under the guard, so nobody can find the tombstone through the lock
-        // while the gate still reads zero.
-        self.range_tombstone_bytes
-            .fetch_add(heap, Ordering::Release);
+        self.range_tombstones
+            .push(RangeTombstone::new(start.to_vec(), end.to_vec(), seq));
     }
 
-    /// Return a snapshot of every range tombstone currently held.
+    /// Whether this memtable holds any range tombstone. One acquire load.
+    pub(crate) fn has_range_tombstones(&self) -> bool {
+        self.range_tombstones.len() != 0
+    }
+
+    /// Return a snapshot of every range tombstone currently held, sorted by
+    /// start, then end, then newest first, with exact duplicates dropped.
     /// Used by flush (to persist them into the produced SSTable)
     /// and by the iterator / scan paths to query cover info.
     pub(crate) fn clone_range_tombstones(&self) -> Vec<RangeTombstone> {
-        self.range_tombstones.lock().as_slice().to_vec()
+        self.range_tombstones.to_sorted_vec()
     }
 
     /// A range tombstone overlapping `[lo, hi)` with a sequence above
     /// `floor`, as the first key of the range it deletes and its sequence.
+    /// The first such tombstone in the order `clone_range_tombstones` lists
+    /// them.
     pub(crate) fn newer_range_tombstone(
         &self,
         lo: &[u8],
         hi: &[u8],
         floor: u64,
     ) -> Option<(Vec<u8>, u64)> {
-        if self.range_tombstone_bytes.load(Ordering::Acquire) == 0 {
+        if !self.has_range_tombstones() {
             return None;
         }
         self.range_tombstones
-            .lock()
-            .iter()
-            .find(|t| t.seq > floor && t.overlaps(lo, hi))
+            .first_newer_overlap(lo, hi, floor)
             .map(|t| (t.start.as_slice().max(lo).to_vec(), t.seq))
     }
 
     /// Largest seq of any range tombstone covering `user_key` that is
     /// visible at `snapshot_seq`. Returns `0` if no such tombstone
     /// exists - `0` is a safe sentinel because real seqs start at 1.
+    ///
+    /// Takes no lock: the gate is one acquire load, and past it the log
+    /// is read as a published prefix.
     pub(crate) fn covering_range_tombstone_seq(&self, user_key: &[u8], snapshot_seq: u64) -> u64 {
-        // The gate: see `range_tombstone_bytes` for why a reader whose
-        // snapshot can see a tombstone always reads nonzero here.
-        if self.range_tombstone_bytes.load(Ordering::Acquire) == 0 {
+        if !self.has_range_tombstones() {
             return 0;
         }
-        self.range_tombstones
-            .lock()
-            .max_covering_seq(user_key, snapshot_seq)
+        self.range_tombstones.covering_seq(user_key, snapshot_seq)
     }
 
     /// The newest entry for `lk`'s user key at or below its snapshot, with the
@@ -504,7 +487,7 @@ impl MemTable {
     /// memtable's true resident cost only by the unused tail of the
     /// newest chunk; [`MemTable::reserved_size`] is that exact figure.
     pub(crate) fn approximate_size(&self) -> usize {
-        self.list.arena().used_bytes() + self.range_tombstone_bytes.load(Ordering::Relaxed)
+        self.list.arena().used_bytes() + self.range_tombstones.bytes()
     }
 
     /// Most arena bytes one `(key, value)` entry can add to a memtable.
@@ -519,7 +502,7 @@ impl MemTable {
     /// Bytes this memtable actually took from the global allocator: the
     /// sum of its arena chunk sizes, plus the range-tombstone heap.
     pub(crate) fn reserved_size(&self) -> usize {
-        self.list.arena().reserved_bytes() + self.range_tombstone_bytes.load(Ordering::Relaxed)
+        self.list.arena().reserved_bytes() + self.range_tombstones.bytes()
     }
 
     pub(crate) fn is_empty(&self) -> bool {

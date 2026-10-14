@@ -10,11 +10,12 @@
 //!
 //! # Why interposition works here
 //!
-//! regolith performs every data read and write through `std::fs`, which on
+//! regolith performs every write through `std::fs`, which on
 //! `*-linux-gnu` calls the glibc `write`/`pwrite64`/`writev`/`fsync`/
 //! `fdatasync`/`open64`/`openat` symbols through the PLT. It uses `rustix`
-//! (raw syscalls, NOT interposable) only for `flock` and `fadvise`, which
-//! move no file data. There is no `mmap` write path.
+//! (raw syscalls, NOT interposable) only for `flock`, `fadvise` and the
+//! positional reads of its tables (`pread`), none of which writes file data.
+//! There is no `mmap` write path.
 //!
 //! # Journal format
 //!

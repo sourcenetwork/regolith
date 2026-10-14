@@ -26,10 +26,10 @@ use super::memtable::MemTable;
 use super::pending_outputs::PendingOutputs;
 use super::read_view::{ReadViewCell, VersionStore};
 use super::sstable::{LiveSst, SsTableMeta, SsTableReader, SsTableWriter, sst_filename};
-use super::{EngineOptions, event_listener, stall_state};
+use super::{EngineOptions, event_listener};
 use crate::env::Env;
-use crate::portability::AtomicU8;
-use crate::sync::internal::{Mutex, MutexGuard};
+use crate::sync::internal::wait_here;
+use crate::sync::{Mutex, MutexGuard};
 
 /// What a flush needs, shared by the engine and its compaction workers.
 pub(crate) struct Flusher {
@@ -43,13 +43,10 @@ pub(crate) struct Flusher {
     options: EngineOptions,
     env: Arc<dyn Env>,
     health: Arc<BackgroundHealth>,
-    /// Woken after each flush a worker makes, for writers stopped on too
-    /// many memtables.
+    /// Refreshed after each flush a worker makes: a flush removes a memtable
+    /// and adds an L0 file, both of which the stall thresholds count, and
+    /// writers stopped on too many memtables are told once it cleared.
     stall_signal: Arc<StallSignal>,
-    /// The stall level writers cache. A worker's flush adds an L0 file the
-    /// stop trigger counts, so it refreshes the level as a writer's rotation
-    /// does.
-    stall_level: Arc<AtomicU8>,
     /// Serializes [`Flusher::flush_oldest`] against itself.
     ///
     /// The exclusion is not protecting shared state, which the read view
@@ -66,7 +63,14 @@ pub(crate) struct Flusher {
     /// mutex until the file is installed. A memtable holding none of its keys
     /// may be flushed after it and land in front of it in L0, which changes no
     /// read: the two share no key (LsmOrder.tla, Lean `ingest_ordered`).
-    pub(crate) flushing: Mutex<()>,
+    ///
+    /// A [`crate::sync::Mutex`]: one compare-and-swap to take when free, and
+    /// no thread sleeps in the kernel on it. A step a write owes only tries
+    /// it ([`Flusher::try_flushing`]); what must have a memtable flushed
+    /// before it goes on (a worker, a job's drain, close, a rotation at the
+    /// memtable cap) waits for the flush in flight on its own thread
+    /// ([`Flusher::flushing`]).
+    flushing: Mutex<()>,
 }
 
 impl Flusher {
@@ -79,7 +83,6 @@ impl Flusher {
         options: EngineOptions,
         health: Arc<BackgroundHealth>,
         stall_signal: Arc<StallSignal>,
-        stall_level: Arc<AtomicU8>,
     ) -> Self {
         Self {
             view,
@@ -90,9 +93,19 @@ impl Flusher {
             options,
             health,
             stall_signal,
-            stall_level,
             flushing: Mutex::new(()),
         }
+    }
+
+    /// The flush exclusion, waited for on this thread. Fails only on
+    /// `wasm32`, when this same thread is already inside a flush.
+    pub(crate) fn flushing(&self) -> std::io::Result<MutexGuard<'_, ()>> {
+        wait_here(self.flushing.lock())
+    }
+
+    /// The flush exclusion if no flush is in flight, without waiting.
+    pub(crate) fn try_flushing(&self) -> Option<MutexGuard<'_, ()>> {
+        self.flushing.try_lock()
     }
 
     /// Flush every frozen memtable, oldest first, as a background step: what
@@ -105,13 +118,18 @@ impl Flusher {
     pub(crate) fn flush_all_frozen(&self) {
         let _background = InBackground::enter();
         loop {
-            let flushing = self.flushing.lock();
+            // The worker may wait here on a writer's or a checkpoint's
+            // flush, a whole table write. The wait releases the views its
+            // last read holds back before it parks.
+            let Ok(flushing) = self.flushing() else {
+                break;
+            };
             let flushed = self.flush_oldest(&flushing);
             drop(flushing);
             // One memtable fewer and maybe one L0 file more: writers cache
-            // the level that leaves, and those stopped re-check it.
-            stall_state::refresh(&self.stall_level, &self.view.load(), &self.options);
-            self.stall_signal.notify_all();
+            // the level that leaves, and those a stop stopped are told once
+            // it no longer holds.
+            self.stall_signal.refresh();
             if !matches!(flushed, Ok(true)) {
                 break;
             }
@@ -265,14 +283,10 @@ impl Flusher {
         let num_entries = summary.num_entries;
 
         // Throttle background I/O so bursts of flush writes don't
-        // starve foreground traffic. Rate-limiting is opt-in via
+        // starve foreground traffic: on a worker only, never on a
+        // caller's call. Rate-limiting is opt-in via
         // `Options::rate_limiter`; a `None` limiter is a no-op.
-        if let Some(limiter) = &self.options.rate_limiter {
-            callback::contain("RateLimiter", || {
-                limiter.request(file_size, crate::rate_limiter::Priority::Low)
-            })
-            .map_err(crate::Error::into_io_error)?;
-        }
+        crate::rate_limiter::throttle_background(self.options.rate_limiter.as_ref(), file_size)?;
 
         let reader = Arc::new(SsTableReader::open_with(
             &self.env,

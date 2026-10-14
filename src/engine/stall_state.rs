@@ -1,13 +1,13 @@
-//! The write-stall thresholds, and the level writers cache from them.
+//! The write-stall thresholds.
 //!
 //! One classification for every thread that changes what it reads: a writer
 //! after a rotation, a compaction pass, and a flush on a background worker,
 //! which adds an L0 file the stop trigger counts (E9). Writers read the
-//! cached level on every write and classify again only when it is not zero.
+//! level `commit::stall::StallSignal` caches from it on every write and
+//! classify again only when it is not zero.
 
 use super::read_view::ReadView;
 use super::{EngineOptions, STOP_TOO_MANY_MEMTABLES};
-use crate::portability::{AtomicU8, Ordering};
 
 /// Snapshot the current write-stall inputs: L0 file count,
 /// in-memory memtable count (active + frozen), and total bytes
@@ -29,10 +29,10 @@ fn snapshot(view: &ReadView) -> (usize, usize, u64) {
 /// thresholds. Returns:
 ///
 /// * `None` - writes may proceed freely.
-/// * `Some(("...", true))` - hard stop: block writers until
-///   compaction relieves the condition.
-/// * `Some(("...", false))` - slowdown: add a small delay per
-///   write so the foreground write rate tracks compaction.
+/// * `Some(("...", true))` - hard stop: a write applies nothing and returns
+///   a wait for the stall to clear.
+/// * `Some(("...", false))` - slowdown: writes proceed; with no worker and
+///   inline compaction on, each owes a step of background work.
 pub(super) fn classify(view: &ReadView, opts: &EngineOptions) -> Option<(&'static str, bool)> {
     let (l0, memtables, pending_bytes) = snapshot(view);
     // Stop conditions dominate over slowdown. An unconfigured
@@ -86,15 +86,4 @@ pub(super) fn classify(view: &ReadView, opts: &EngineOptions) -> Option<(&'stati
         return Some(("slowdown: pending compaction bytes over soft limit", false));
     }
     None
-}
-
-/// Store the level `view` puts writers at in `cached`: 0 none, 1 slowdown,
-/// 2 stop.
-pub(super) fn refresh(cached: &AtomicU8, view: &ReadView, opts: &EngineOptions) {
-    let level = match classify(view, opts) {
-        None => 0,
-        Some((_, false)) => 1,
-        Some((_, true)) => 2,
-    };
-    cached.store(level, Ordering::Release);
 }

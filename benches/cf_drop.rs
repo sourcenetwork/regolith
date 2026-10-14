@@ -41,6 +41,7 @@ fn main() {
         }
         let started = Instant::now();
         db.compact_range(None, None)
+            .wait()
             .unwrap_or_else(|e| panic!("compact: {e}"));
         pass_us.push(started.elapsed().as_secs_f64() * 1e6);
     }

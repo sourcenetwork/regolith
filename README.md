@@ -155,6 +155,42 @@ arrives, never a busy one. Iterators, transaction cursors and streams pick up
 exactly where a wait stopped them. Transactions take the mode from
 `TxnOptions::read_mode`.
 
+## Commits that never block
+
+`Transaction::commit_nowait` hands back a `CommitTicket` at once. The ticket is a
+`Future` of the commit's outcome, completed only at a poll of the queue named by
+`TxnOptions::io_queue`, on the thread that owns it; with no queue the commit syncs
+inline and the ticket is ready already. Commits from many threads still share one
+log write and one fsync per group: the fsync is a unit that the first member thread
+to poll claims and runs, and it tells every member's queue. At
+`DurabilityMode::Immediate` a commit is visible only once that fsync returned.
+
+```rust
+use regolith::{OptimisticTransactionDb, Options, TxnOptions};
+
+let db = OptimisticTransactionDb::open("/tmp/nowait_db", Options::default())?;
+let mut queue = db.db().io_queue(); // one per thread
+let txn = db.begin(&TxnOptions::new().io_queue(queue.id()));
+txn.put(b"key", b"value")?;
+let ticket = txn.commit_nowait();
+ticket.on_complete(|outcome| println!("committed: {}", outcome.is_ok()));
+let receipt = queue.block_on(ticket)?; // or `ticket.await` while other tasks run
+```
+
+The `on_commit`, `on_abort` and `on_complete` callbacks run exactly once, on the
+thread that delivers the outcome. Dropping a ticket cancels nothing; dropping its
+queue delivers what the queue holds on the dropping thread. `transact_async` is the
+retrying form: its attempts read through a `CacheOnly` handle, a miss suspends the
+attempt instead of ending it (`ready(|| txn.get(k)).await`), and it needs no runtime.
+
+No write waits on a write stall. A write a stop stops applies nothing and returns
+`Error::WouldBlock(WouldBlock::Stall(wait))`, whose wait completes on the writer's
+own queue once background work clears the stall; `through_stalls` waits it out for
+a blocking caller. With no compaction worker, `Options::inline_compaction(true)`
+makes the stopped writer run the step that clears the stall on its own queue, or
+inline with no queue. `compact_range`, `ingest_external_files` and `checkpoint`
+return a `JobTicket` the same way, run on the worker or on the caller's queue.
+
 ## Transactions
 
 Pick the isolation a unit of work actually needs. The level decides how much of the
@@ -260,6 +296,17 @@ check sees it.
 
 `TransactionDb` is the pessimistic flavour: it takes key locks, so contention waits
 instead of retrying. `OptimisticTransactionDb` validates at commit and retries.
+
+The key locks live in a lock-free table: taking a free lock is one compare-and-swap, and no
+call takes a mutex or waits on a condition variable. A free lock goes to whoever asks first,
+even while others wait; a waiter passed over `regolith::sync::MAX_BYPASS` times is handed the
+lock, so none starves. `get_for_update`, `put`, `delete` and `merge` wait for a lock another
+transaction holds, up to `with_lock_timeout`, and then fail with `TransactionError::Busy`,
+which is also what ends a deadlock. `try_get_for_update` never waits: it returns
+`WouldBlock::Locked` with a `LockWait`, completed on the transaction's own `IoQueue` at
+that queue's poll once the lock may be free, and the call is then run again. A
+`commit_nowait` releases its locks when the commit lands, not when its ticket is delivered,
+so another transaction never waits for this one's owner to poll.
 
 A commit that loses a race returns `TransactionError::Conflict`. Its `Conflict` names the
 key, what the transaction did with it (`Access`) and the newer write that won

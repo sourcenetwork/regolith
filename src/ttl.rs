@@ -208,10 +208,10 @@ impl DbWithTtl {
         &self.inner
     }
 
-    /// Synchronously compact every SSTable overlapping `[start, end)`
-    /// down the tree. Expired entries are physically removed via the
-    /// installed [`TtlCompactionFilter`].
-    pub fn compact_range(&self, start: Option<&[u8]>, end: Option<&[u8]>) -> Result<()> {
+    /// Compact every SSTable overlapping `[start, end)` down the tree, as
+    /// a job (see [`Db::compact_range`]). Expired entries are physically
+    /// removed via the installed [`TtlCompactionFilter`].
+    pub fn compact_range(&self, start: Option<&[u8]>, end: Option<&[u8]>) -> crate::JobTicket {
         self.inner.compact_range(start, end)
     }
 
@@ -383,7 +383,7 @@ mod tests {
         let payload = vec![0u8; 512];
         for i in 0..32 {
             let key = format!("__flush_{}_{:04}", tag, i);
-            db.put(key.as_bytes(), &payload).unwrap();
+            crate::through_stalls(|| db.put(key.as_bytes(), &payload)).unwrap();
         }
     }
 
@@ -403,7 +403,7 @@ mod tests {
         let db = DbWithTtl::open(dir.path(), Options::default(), 0).unwrap();
         db.put(b"k", b"v").unwrap();
         // Even after a compaction nothing should be dropped.
-        db.compact_range(None, None).unwrap();
+        db.compact_range(None, None).wait().unwrap();
         assert_eq!(db.get(b"k").unwrap(), Some(b"v".to_vec()));
     }
 
@@ -434,16 +434,15 @@ mod tests {
         for i in 0..20 {
             let key = format!("old_{i:02}");
             let stamped = stamp(b"payload", ancient);
-            db.inner().put(key.as_bytes(), &stamped).unwrap();
+            crate::through_stalls(|| db.inner().put(key.as_bytes(), &stamped)).unwrap();
         }
         // And 20 fresh entries written normally.
         for i in 0..20 {
-            db.put(format!("new_{i:02}").as_bytes(), b"payload")
-                .unwrap();
+            crate::through_stalls(|| db.put(format!("new_{i:02}").as_bytes(), b"payload")).unwrap();
         }
 
         force_flush(&db, "ttl");
-        db.compact_range(None, None).unwrap();
+        db.compact_range(None, None).wait().unwrap();
 
         // Reads via DbWithTtl: stale is gone, fresh survives.
         for i in 0..20 {
@@ -530,7 +529,7 @@ mod tests {
     fn get_slice_strips_the_suffix_without_copying() {
         let dir = TempDir::new().unwrap();
         let db = DbWithTtl::open(dir.path(), tiny_opts(), 0).unwrap();
-        db.put(b"k", b"payload").unwrap();
+        crate::through_stalls(|| db.put(b"k", b"payload")).unwrap();
 
         let slice = db.get_slice(b"k").unwrap().expect("present");
         assert_eq!(slice.as_slice(), b"payload");
@@ -544,12 +543,13 @@ mod tests {
         let db = DbWithTtl::open(dir.path(), tiny_opts(), 1).unwrap();
         // Write straight through the inner `Db` with an ancient stamp so
         // the test does not have to wait a wall-clock second.
-        db.inner()
-            .put(
+        crate::through_stalls(|| {
+            db.inner().put(
                 b"stale",
                 &stamp(b"payload", now_seconds().saturating_sub(1000)),
             )
-            .unwrap();
+        })
+        .unwrap();
         assert_eq!(db.get_slice(b"stale").unwrap(), None);
         assert_eq!(db.get(b"stale").unwrap(), None);
     }
@@ -558,7 +558,7 @@ mod tests {
     fn get_slice_hides_a_value_too_short_to_carry_a_suffix() {
         let dir = TempDir::new().unwrap();
         let db = DbWithTtl::open(dir.path(), tiny_opts(), 0).unwrap();
-        db.inner().put(b"raw", b"ab").unwrap();
+        crate::through_stalls(|| db.inner().put(b"raw", b"ab")).unwrap();
         assert_eq!(db.get_slice(b"raw").unwrap(), None);
         assert_eq!(db.get(b"raw").unwrap(), None);
     }

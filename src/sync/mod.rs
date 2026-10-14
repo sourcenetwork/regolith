@@ -79,6 +79,7 @@ pub mod loom_model;
 mod mutex;
 mod notify;
 mod once_cell;
+mod owned_lock;
 mod owner;
 mod queue;
 mod raw_rwlock;
@@ -88,7 +89,7 @@ mod reentrant_rwlock;
 mod rwlock;
 mod semaphore;
 #[cfg(all(test, not(loom)))]
-mod test_support;
+pub(crate) mod test_support;
 mod waiter;
 
 pub use barrier::{Barrier, BarrierWait, BarrierWaitResult};
@@ -102,6 +103,7 @@ pub use lazy::Lazy;
 pub use mutex::{Lock, LockOwned, Mutex, MutexGuard, OwnedMutexGuard};
 pub use notify::{Notified, Notify};
 pub use once_cell::OnceCell;
+pub(crate) use owned_lock::{OwnedLock, OwnedWait, OwnerId, TryLock};
 pub use owner::{Owner, ThreadOwner};
 pub use reentrant_mutex::{ReentrantMutex, ReentrantMutexGuard, ReentrantMutexLock};
 pub use reentrant_rwlock::{
@@ -109,8 +111,8 @@ pub use reentrant_rwlock::{
     ReentrantWriteGuard,
 };
 pub use rwlock::{
-    Read, RwLock, RwLockReadGuard, RwLockUpgradableReadGuard, RwLockWriteGuard, UpgradableRead,
-    Upgrade, Write,
+    OwnedRwLockWriteGuard, Read, RwLock, RwLockReadGuard, RwLockUpgradableReadGuard,
+    RwLockWriteGuard, UpgradableRead, Upgrade, Write, WriteOwned,
 };
 pub use semaphore::{Acquire, AcquireOwned, OwnedSemaphorePermit, Semaphore, SemaphorePermit};
 
@@ -139,6 +141,8 @@ mod tests {
         send_sync::<Write<'static, u8>>();
         send_sync::<RwLockReadGuard<'static, u8>>();
         send_sync::<RwLockWriteGuard<'static, u8>>();
+        send_sync::<WriteOwned<u8>>();
+        send_sync::<OwnedRwLockWriteGuard<u8>>();
         send_sync::<RwLockUpgradableReadGuard<'static, u8>>();
         send_sync::<UpgradableRead<'static, u8>>();
         send_sync::<Upgrade<'static, u8>>();

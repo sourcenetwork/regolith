@@ -9,18 +9,15 @@ use std::sync::Arc;
 
 use crate::env::{BufferedWriter, Env, WriteMode};
 
-use crate::sync::internal::RwLock;
-
 use super::checksum;
 use super::seal::Keyring;
-use super::sstable::{
-    LiveSst, MetadataPolicy, SsTableMeta, SsTableReader, sst_filename, table_carries_data,
-};
+use super::sstable::{LiveSst, MetadataPolicy, SsTableMeta, SsTableReader, sst_filename};
 use crate::encryption::KeyId;
 
 mod sealed;
 use sealed::{MANIFEST_FORMAT_SEALED, ManifestSeal, SEALED_STAMP_LEN};
 
+mod suspects;
 mod tail;
 pub(crate) use tail::DroppedTail;
 
@@ -460,7 +457,9 @@ const APPROX_ADD_FILE_RECORD_BYTES: u64 = 256;
 
 /// Manages the current version and persists version edits to a manifest log.
 pub(crate) struct VersionSet {
-    current: Arc<RwLock<Arc<Version>>>,
+    // No lock of its own: `apply` takes `&mut self`, and every caller
+    // reaches the set through the version store's guard.
+    current: Arc<Version>,
     manifest_path: PathBuf,
     /// Bytes the manifest holds on disk, tracked rather than stat'ed so
     /// the rewrite check costs nothing on the common path.
@@ -492,39 +491,6 @@ struct ManifestReplay {
     salt: Option<[u8; 16]>,
     /// Every key a replayed batch was sealed under.
     key_ids: Vec<KeyId>,
-}
-
-/// An unreferenced `*.sst` file that the discarded-table guard could not
-/// dismiss as a crash artifact, with the reason it counts.
-struct SuspectTable {
-    path: PathBuf,
-    /// `None` when the file's metadata could not be read.
-    len: Option<u64>,
-    reason: String,
-}
-
-/// How many suspects the guard's error message names before summarising
-/// the rest. The cap is reported in the message so a long list never
-/// reads as a short one.
-const SUSPECTS_NAMED: usize = 8;
-
-fn describe_suspects(suspects: &[SuspectTable]) -> String {
-    let mut out = suspects
-        .iter()
-        .take(SUSPECTS_NAMED)
-        .map(|s| match s.len {
-            Some(len) => format!("{} ({len} bytes, {})", s.path.display(), s.reason),
-            None => format!("{} (size unknown, {})", s.path.display(), s.reason),
-        })
-        .collect::<Vec<_>>()
-        .join(", ");
-    if suspects.len() > SUSPECTS_NAMED {
-        out.push_str(&format!(
-            ", and {} more not named here",
-            suspects.len() - SUSPECTS_NAMED
-        ));
-    }
-    out
 }
 
 impl VersionSet {
@@ -615,7 +581,7 @@ impl VersionSet {
         let sealing = Self::sealing(keyring.as_ref(), salt)?;
         let convert = keyring.is_some() && sealing.is_none();
         let mut set = Self {
-            current: Arc::new(RwLock::new(Arc::new(version))),
+            current: Arc::new(version),
             manifest_path,
             manifest_bytes,
             manifest_writer: Some(writer),
@@ -724,7 +690,7 @@ impl VersionSet {
         let sealing = Self::sealing(keyring.as_ref(), replay.salt)?;
 
         Ok(Self {
-            current: Arc::new(RwLock::new(Arc::new(replay.version))),
+            current: Arc::new(replay.version),
             manifest_path,
             manifest_bytes: replay.valid_len as u64,
             manifest_writer: None,
@@ -749,7 +715,7 @@ impl VersionSet {
 
     /// Get the current version.
     pub(crate) fn current(&self) -> Arc<Version> {
-        Arc::clone(&*self.current.read())
+        Arc::clone(&self.current)
     }
 
     /// Path of the manifest file on disk.
@@ -845,7 +811,7 @@ impl VersionSet {
         self.manifest_writer = Some(writer);
 
         let live_files: u64 = version.levels.iter().map(|l| l.len() as u64).sum();
-        *self.current.write() = Arc::new(version);
+        self.current = Arc::new(version);
         self.manifest_bytes += encoded.len() as u64;
         if let Some(id) = sealed_under
             && !self.sealed_under.contains(&id)
@@ -1052,17 +1018,17 @@ impl VersionSet {
         keyring: Option<&Keyring>,
     ) -> io::Result<Option<DroppedTail>> {
         if replay.stamp_len == 0 {
-            let suspects = Self::suspect_tables(env, sst_dir, keyring);
-            if !suspects.is_empty() {
+            let suspects = suspects::suspect_tables(env, sst_dir, keyring);
+            if suspects.count() > 0 {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!(
                         "{} is damaged at offset 0: it has no header, yet {} table file(s) in {} \
                          may hold data ({}); the database is left untouched",
                         manifest_path.display(),
-                        suspects.len(),
+                        suspects.count(),
                         sst_dir.display(),
-                        describe_suspects(&suspects),
+                        suspects.describe(),
                     ),
                 ));
             }
@@ -1078,81 +1044,6 @@ impl VersionSet {
             .zip(replay.salt.as_ref())
             .map(|(keyring, salt)| tail::Opener { keyring, salt });
         tail::judge(data, replay.valid_len, manifest_path, sealed).map(Some)
-    }
-
-    /// The unreferenced `*.sst` files that could plausibly hold live data.
-    ///
-    /// A zero-length table, or one whose footer records no entry and no
-    /// range tombstone, holds nothing an open could lose, so it is logged
-    /// and skipped rather than counted.
-    ///
-    /// Everything else counts, including a file whose footer will not
-    /// parse. An unreadable file cannot be proved empty, and keeping the
-    /// database shut preserves it for repair.
-    ///
-    /// Nothing is deleted here, so a crash part way through recovery
-    /// leaves the directory exactly as this pass found it and the next
-    /// open reaches the same verdict.
-    fn suspect_tables(
-        env: &dyn Env,
-        sst_dir: &Path,
-        keyring: Option<&Keyring>,
-    ) -> Vec<SuspectTable> {
-        let entries = match env.read_dir(sst_dir) {
-            Ok(entries) => entries,
-            Err(e) => {
-                tracing::warn!(
-                    dir = %sst_dir.display(),
-                    error = %e,
-                    "could not list the SSTable directory while checking for discarded tables"
-                );
-                return Vec::new();
-            }
-        };
-
-        let mut suspects = Vec::new();
-        for entry in entries {
-            let path = entry.path.clone();
-            if path.extension().and_then(|ext| ext.to_str()) != Some("sst") {
-                continue;
-            }
-            let len = match env.metadata(&path) {
-                Ok(meta) => Some(meta.len),
-                Err(e) => {
-                    suspects.push(SuspectTable {
-                        path,
-                        len: None,
-                        reason: format!("unreadable: {e}"),
-                    });
-                    continue;
-                }
-            };
-            if len == Some(0) {
-                tracing::warn!(
-                    path = %path.display(),
-                    "ignoring a zero-length orphan SSTable left by a crash inside a flush"
-                );
-                continue;
-            }
-            match table_carries_data(env, &path, keyring) {
-                Ok(true) => suspects.push(SuspectTable {
-                    path,
-                    len,
-                    reason: "carries data".to_string(),
-                }),
-                Ok(false) => tracing::warn!(
-                    path = %path.display(),
-                    "ignoring an orphan SSTable whose footer records no entry and no range tombstone"
-                ),
-                Err(e) => suspects.push(SuspectTable {
-                    path,
-                    len,
-                    reason: format!("unreadable footer: {e}"),
-                }),
-            }
-        }
-        suspects.sort_by(|a, b| a.path.cmp(&b.path));
-        suspects
     }
 
     /// Replay every record, then open a reader for each surviving file

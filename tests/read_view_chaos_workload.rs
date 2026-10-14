@@ -21,7 +21,7 @@ use std::sync::{Arc, Barrier, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use regolith::{Db, IngestOptions, Options, SstFileWriter};
+use regolith::{Db, IngestOptions, Options, SstFileWriter, through_stalls};
 use tempfile::TempDir;
 
 const WRITERS: usize = 4;
@@ -242,7 +242,7 @@ fn run_instance(versions: u64, min_rounds: u64) -> Vec<String> {
         .flat_map(|w| (0..KEYS_PER_WRITER).map(move |i| key_of(w, i)))
         .collect();
     for k in &keys {
-        db.put(k, &value_of(0)).expect("seed");
+        through_stalls(|| db.put(k, &value_of(0))).expect("seed");
     }
 
     let live = Arc::new(AtomicU64::new(WRITERS as u64));
@@ -264,7 +264,10 @@ fn run_instance(versions: u64, min_rounds: u64) -> Vec<String> {
             gate.wait();
             for v in 1..=versions {
                 for i in 0..KEYS_PER_WRITER {
-                    db.put(&key_of(w, i), &value_of(v)).expect("put");
+                    // A write a stall stops waits for the stall to clear, as
+                    // a blocking caller does: on a host with few cores the
+                    // compaction worker falls behind these writers.
+                    through_stalls(|| db.put(&key_of(w, i), &value_of(v))).expect("put");
                     beat.fetch_add(1, Ordering::Relaxed);
                 }
             }
@@ -278,7 +281,7 @@ fn run_instance(versions: u64, min_rounds: u64) -> Vec<String> {
             gate.wait();
             let mut n = 0u64;
             loop {
-                db.compact_range(None, None).expect("compact_range");
+                db.compact_range(None, None).wait().expect("compact_range");
                 n += 1;
                 beat.fetch_add(1, Ordering::Relaxed);
                 if n >= COMPACT_PASSES_PER_INSTANCE || (n >= 2 && live.load(Ordering::Acquire) == 0)
@@ -298,9 +301,9 @@ fn run_instance(versions: u64, min_rounds: u64) -> Vec<String> {
             loop {
                 let name = format!("cf_{n}");
                 if let Ok(h) = db.create_column_family(&name) {
-                    db.put_cf(&h, b"x", b"y").expect("put_cf");
+                    through_stalls(|| db.put_cf(&h, b"x", b"y")).expect("put_cf");
                     let _ = db.list_column_families();
-                    db.drop_column_family(h).expect("drop_cf");
+                    through_stalls(|| db.drop_column_family(h.clone())).expect("drop_cf");
                 }
                 n += 1;
                 beat.fetch_add(1, Ordering::Relaxed);
@@ -323,6 +326,7 @@ fn run_instance(versions: u64, min_rounds: u64) -> Vec<String> {
             loop {
                 let p = external_table(&ext, n);
                 db.ingest_external_files(&[p], IngestOptions::default())
+                    .wait()
                     .expect("ingest");
                 n += 1;
                 beat.fetch_add(1, Ordering::Relaxed);
@@ -343,7 +347,7 @@ fn run_instance(versions: u64, min_rounds: u64) -> Vec<String> {
             let mut n = 0u64;
             loop {
                 let target = cp.join(format!("cp_{n}"));
-                db.checkpoint(&target).expect("checkpoint");
+                db.checkpoint(&target).wait().expect("checkpoint");
                 std::fs::remove_dir_all(&target).expect("rm checkpoint");
                 n += 1;
                 beat.fetch_add(1, Ordering::Relaxed);

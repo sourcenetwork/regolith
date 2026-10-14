@@ -418,6 +418,33 @@ impl Options {
         self
     }
 
+    /// With no compaction worker ([`Options::max_background_compactions`]
+    /// `0`), let a write a stall stopped run the step that relieves it.
+    /// Off by default; the [`Options::embedded`] and [`Options::wasm`]
+    /// presets turn it on.
+    ///
+    /// A write stopped by a stall threshold never waits: it applies nothing
+    /// and returns [`crate::Error::WouldBlock`] with a
+    /// [`crate::StallWait`]. With a worker, the worker's flushes and
+    /// compactions clear the stall. With none, nothing clears it unless a
+    /// caller compacts, and this option says who:
+    ///
+    /// - **On.** The stopped write leaves the step (one flush or one
+    ///   compaction pass) on its thread's [`crate::IoQueue`], run at that
+    ///   queue's polls, one per poll, until the stall clears; a thread with
+    ///   no queue runs the steps inline instead, bounded, and its write goes
+    ///   on once they cleared the stall. A slowed write, under a slowdown
+    ///   threshold, owes one step the same way.
+    /// - **Off.** The caller clears the stall with [`crate::Db::compact_step`]
+    ///   or [`crate::Db::flush`]; the stopped writes' waits complete then.
+    ///
+    /// Ignored when a worker runs.
+    #[must_use]
+    pub fn inline_compaction(mut self, inline_compaction: bool) -> Self {
+        self.inline_compaction = inline_compaction;
+        self
+    }
+
     /// Accepted for compatibility with earlier releases.
     ///
     /// Compaction now streams a k-way merge with bounded memory
@@ -589,8 +616,17 @@ impl Options {
     /// fails with EMFILE. With a limit, the least recently read tables
     /// have their descriptor closed and reopened on the next read; a
     /// read that misses the block cache on such a table pays an `open`.
-    /// The limit is soft: tables a compaction has just deleted stay open
-    /// until no snapshot or iterator can read them.
+    ///
+    /// The limit is hard: SSTable descriptors never number more than
+    /// `max_open_files`, and none is closed while a read uses it. A table
+    /// a compaction deletes while a snapshot or iterator still reads it is
+    /// renamed aside rather than unlinked, so its descriptor stays closable
+    /// and reopens under the new name; the last reader unlinks it, and a
+    /// crash leaves it for the next writable open to remove. When more
+    /// threads read distinct tables at once than there are descriptors, a
+    /// read waits for one of the reads already running to finish. A
+    /// `CacheOnly` handle never reopens a table itself: its miss goes to
+    /// its I/O queue like any other device read.
     #[must_use]
     pub fn max_open_files(mut self, max_open_files: usize) -> Self {
         self.max_open_files = max_open_files;
@@ -602,7 +638,6 @@ impl Options {
 mod tests {
     use super::*;
     use crate::rate_limiter::TokenBucketRateLimiter;
-    use std::time::Duration;
 
     struct KeepAll;
 
@@ -711,7 +746,6 @@ mod tests {
             .statistics(Some(Arc::new(crate::Statistics::new())))
             .rate_limiter(Some(Arc::new(TokenBucketRateLimiter::new(
                 1 << 20,
-                Duration::from_millis(10),
                 1 << 20,
             ))));
         assert_eq!(options.compaction_filter.unwrap().name(), "keep-all");

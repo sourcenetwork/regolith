@@ -84,7 +84,7 @@ fn a_counter_that_is_not_eight_bytes_is_refused_and_left_alone() {
     let dir = TempDir::new().unwrap();
     let db = Db::open(dir.path(), Options::default()).unwrap();
     for bad in [&b""[..], b"1234567", b"123456789"] {
-        db.put(b"ids", bad).unwrap();
+        regolith::through_stalls(|| db.put(b"ids", bad)).unwrap();
         for n in [0, 1] {
             let err = db.allocate(b"ids", n).unwrap_err();
             assert!(matches!(err, Error::InvalidArgument(_)), "{err:?}");
@@ -101,7 +101,7 @@ fn a_counter_that_is_not_eight_bytes_is_refused_and_left_alone() {
 fn the_counter_stops_below_the_largest_value_and_reserves_nothing_past_it() {
     let dir = TempDir::new().unwrap();
     let db = Db::open(dir.path(), Options::default()).unwrap();
-    db.put(b"ids", &(u64::MAX - 3).to_be_bytes()).unwrap();
+    regolith::through_stalls(|| db.put(b"ids", &(u64::MAX - 3).to_be_bytes())).unwrap();
     assert_eq!(db.allocate(b"ids", 2).unwrap(), u64::MAX - 2..u64::MAX);
     assert_eq!(counter(&db, b"ids"), Some(u64::MAX - 1));
     for n in [1, 2, u64::MAX] {
@@ -209,7 +209,9 @@ fn values_reserved_by_a_transaction_that_aborts_are_skipped() {
 }
 
 /// A write under a hard stall that compaction cannot relieve fails with
-/// `Busy`; allocation is not a write the stall applies to.
+/// `Busy` (with inline compaction on and no queue, the write runs the steps
+/// itself and finds none relieves it); allocation is not a write the stall
+/// applies to.
 #[test]
 fn allocation_does_not_wait_while_writes_are_stalled() {
     let dir = TempDir::new().unwrap();
@@ -226,7 +228,8 @@ fn allocation_does_not_wait_while_writes_are_stalled() {
             .level0_stop_writes_trigger(2)
             .level0_slowdown_writes_trigger(2)
             .l0_compaction_trigger(64)
-            .max_background_compactions(0),
+            .max_background_compactions(0)
+            .inline_compaction(true),
     )
     .unwrap();
     let _pin = db.snapshot();

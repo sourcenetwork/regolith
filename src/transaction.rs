@@ -14,7 +14,9 @@
 //!   and hold them until commit / rollback. Contention is resolved
 //!   when the lock is taken rather than at commit, and a
 //!   timeout-based deadlock defense returns [`TransactionError::Busy`]
-//!   when a lock cannot be acquired in time. Best for workloads
+//!   when a lock cannot be acquired in time.
+//!   [`Transaction::try_get_for_update`] never waits: it returns a
+//!   [`LockWait`](crate::LockWait) instead. Best for workloads
 //!   where contention is high and retry cost dominates.
 //!
 //! Both flavors share a single [`Transaction`] type. The type
@@ -130,20 +132,19 @@ use crate::portability::{AtomicBool, AtomicU64, Ordering};
 use kovan_queue::seg_queue::SegQueue;
 
 use crate::txn_buffer::TxnBuffer;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::ops::Range;
 use std::path::Path;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
-
-use crate::sync::internal::{Condvar, Mutex};
 
 use crate::column_family::{DEFAULT_CF_ID, prefix_key};
 use crate::conflict::RedactedKey;
 use crate::engine::commit::EarlyWrite;
 use crate::engine::io::scope::Scope;
 use crate::engine::{
-    CommitOutcome, ConflictKey, PendingAppend, ReadRule, RegolithEngine, ValidationSet, callback,
+    CommitOutcome, ConflictKey, PendingAppend, ReadRule, RegolithEngine, TxnCommit, ValidationSet,
+    callback,
 };
 use crate::{Access, Conflict, Db, DbSlice, Error, Options, QueueId, ReadMode, Result};
 
@@ -154,6 +155,11 @@ mod cursor;
 mod early;
 mod exclusive;
 mod handoff;
+#[cfg(loom)]
+pub mod lock_loom;
+mod lock_table;
+mod locking;
+mod nowait;
 mod policy;
 mod projection;
 mod queue;
@@ -167,10 +173,12 @@ pub use callbacks::{AbortReason, CommitInfo, TransactionHooks};
 use callbacks::{Callbacks, Prepare};
 pub(crate) use claim::Claim;
 pub use cursor::{Page, ScanCheck, TxnCursor, TxnScanStream};
+use lock_table::{KeyLock, PendingLock};
+pub(crate) use lock_table::{LockOwner, LockTable};
 pub use policy::{KeyClass, KeyClassifier};
 use projection::Projection;
 pub use receipt::CommitReceipt;
-pub use retry::{RetryPolicy, TransactError};
+pub use retry::{RetryPolicy, TransactError, ready};
 use scan_range::ScanRun;
 pub use txn_options::TxnOptions;
 use validated_range::RangeRecord;
@@ -194,12 +202,16 @@ pub enum TransactionError {
     /// Never [`Error::WouldBlock`]: that is [`TransactionError::WouldBlock`].
     #[error(transparent)]
     Engine(Error),
-    /// The call returned instead of waiting: a read through a transaction
+    /// The call returned instead of waiting. A read through a transaction
     /// begun with [`ReadMode::CacheOnly`](crate::ReadMode::CacheOnly)
-    /// needed a block the cache does not hold. Poll the queue the wait
+    /// needed a block the cache does not hold: poll the queue the wait
     /// names, then run the call again (see [`TxnOptions::read_mode`]); a
-    /// cursor or stream carries on where it stopped. Not a reason to roll
-    /// back.
+    /// cursor or stream carries on where it stopped, and the read is not a
+    /// reason to roll back. A commit met a write stall
+    /// ([`crate::WouldBlock::Stall`]), or a
+    /// [`Transaction::commit_nowait`] would have read the device to run its
+    /// `before_commit` callbacks: the transaction applied nothing and ended
+    /// with its `on_abort` callbacks; run it again once the wait is ready.
     #[error("{0}")]
     WouldBlock(crate::WouldBlock),
     /// A key in the transaction's validation set was written by
@@ -245,6 +257,21 @@ impl std::fmt::Debug for TransactionError {
                 .finish(),
             Self::NoSavepoint => f.write_str("NoSavepoint"),
             Self::UnsupportedRangeDelete => f.write_str("UnsupportedRangeDelete"),
+        }
+    }
+}
+
+impl TransactionError {
+    /// A copy of this error, for an outcome several readers are handed (see
+    /// [`Error::duplicate`]).
+    pub(crate) fn duplicate(&self) -> Self {
+        match self {
+            Self::Engine(err) => Self::Engine(err.duplicate()),
+            Self::WouldBlock(would_block) => Self::WouldBlock(would_block.clone()),
+            Self::Conflict(conflict) => Self::Conflict(conflict.clone()),
+            Self::Busy(key) => Self::Busy(key.clone()),
+            Self::NoSavepoint => Self::NoSavepoint,
+            Self::UnsupportedRangeDelete => Self::UnsupportedRangeDelete,
         }
     }
 }
@@ -353,10 +380,11 @@ impl OptimisticTransactionDb {
     /// the database handle that began it.
     pub fn begin(&self, opts: &TxnOptions) -> Transaction {
         let engine = self.inner.engine_arc();
-        let snapshot_seq = engine.register_snapshot_at_horizon();
+        let (snapshot_seq, snapshot_pin) = engine.register_snapshot_at_horizon();
         Transaction::new(
             engine,
             snapshot_seq,
+            snapshot_pin,
             self.inner.durability(),
             TxMode::Optimistic,
             None,
@@ -391,16 +419,21 @@ impl OptimisticTransactionDb {
 /// Pessimistic-concurrency-control wrapper over a [`Db`].
 ///
 /// Transactions acquire exclusive locks on every key they touch
-/// for update (via `put`, `delete`, or `get_for_update`) and hold
-/// the locks until commit or rollback. Lock contention is resolved
-/// immediately, not at commit. A timeout-based deadlock defense
-/// surfaces as [`TransactionError::Busy`] when a lock cannot be
-/// acquired in time.
+/// for update (via `put`, `delete`, `merge`, `get_for_update` or
+/// `try_get_for_update`) and hold the locks until commit or rollback.
+/// Lock contention is resolved immediately, not at commit. A
+/// timeout-based deadlock defense surfaces as [`TransactionError::Busy`]
+/// when a lock cannot be acquired in time.
+///
+/// The locks live in a lock-free table: taking a free lock is one
+/// compare-and-swap, and no call takes a mutex or waits on a condition
+/// variable. A free lock goes to whoever asks first, even while others
+/// wait, and a waiter passed over [`MAX_BYPASS`](crate::sync::MAX_BYPASS)
+/// times is handed it, so no waiter starves.
 pub struct TransactionDb {
     isolation: IsolationLevel,
     inner: Db,
-    lock_manager: Arc<LockManager>,
-    tx_id: AtomicU64,
+    locks: Arc<LockTable>,
     lock_timeout: Duration,
 }
 
@@ -417,11 +450,18 @@ impl TransactionDb {
     /// The lock-acquisition timeout defaults to `DEFAULT_LOCK_TIMEOUT`;
     /// customize it via [`TransactionDb::with_lock_timeout`].
     pub fn open<P: AsRef<Path>>(path: P, opts: Options) -> Result<Self> {
+        let inner = Db::open(path, opts)?;
+        let locks = Arc::new(LockTable::new());
+        // `close` releases the locks of the transactions it aborts and wakes
+        // every waiter.
+        inner
+            .engine_arc()
+            .open_transactions()
+            .track_locks(Arc::clone(&locks));
         Ok(Self {
-            inner: Db::open(path, opts)?,
+            inner,
             isolation: IsolationLevel::default(),
-            lock_manager: Arc::new(LockManager::new()),
-            tx_id: AtomicU64::new(1),
+            locks,
             lock_timeout: DEFAULT_LOCK_TIMEOUT,
         })
     }
@@ -432,7 +472,11 @@ impl TransactionDb {
     }
 
     /// Override the default lock-acquisition timeout for every
-    /// future transaction created by this db.
+    /// future transaction created by this db: how long a blocking lock call
+    /// ([`Transaction::get_for_update`], `put`, `delete`, `merge`) waits for
+    /// a lock another transaction holds before it fails with
+    /// [`TransactionError::Busy`]. [`Transaction::try_get_for_update`] never
+    /// waits, so the timeout does not apply to it.
     pub fn with_lock_timeout(mut self, timeout: Duration) -> Self {
         self.lock_timeout = timeout;
         self
@@ -448,14 +492,14 @@ impl TransactionDb {
     /// the database handle that began it.
     pub fn begin(&self, opts: &TxnOptions) -> Transaction {
         let engine = self.inner.engine_arc();
-        let snapshot_seq = engine.register_snapshot_at_horizon();
-        let id = self.tx_id.fetch_add(1, Ordering::Relaxed);
+        let (snapshot_seq, snapshot_pin) = engine.register_snapshot_at_horizon();
         Transaction::new(
             engine,
             snapshot_seq,
+            snapshot_pin,
             self.inner.durability(),
-            TxMode::Pessimistic { tx_id: id },
-            Some(Arc::clone(&self.lock_manager)),
+            TxMode::Pessimistic,
+            Some(Arc::clone(&self.locks)),
             self.lock_timeout,
             opts.resolve_isolation(self.isolation),
             self.inner.transaction_keys_inline(),
@@ -698,7 +742,7 @@ impl IsolationLevel {
 #[derive(Clone, Copy)]
 enum TxMode {
     Optimistic,
-    Pessimistic { tx_id: u64 },
+    Pessimistic,
 }
 
 /// An in-flight transaction. Created by
@@ -725,6 +769,10 @@ pub struct Transaction {
     /// The key classes [`IsolationLevel::DefraLevel`] applies.
     policy: Option<Arc<dyn KeyClassifier>>,
     snapshot_seq: u64,
+    /// Where `snapshot_seq` is pinned in the engine's snapshot registry.
+    /// Released exactly there when the transaction ends, on whichever
+    /// thread that happens.
+    snapshot_pin: crate::engine::SnapshotPin,
     durability: crate::engine::DurabilityMode,
     mode: TxMode,
     /// Buffer of the transaction's writes: puts, deletes and merge
@@ -792,15 +840,25 @@ pub struct Transaction {
     /// `on_abort` registered inside a `before_commit` callback, starts as
     /// committing too: `close` must not abort a commit that began.
     committing: bool,
+    /// The commit is a [`Transaction::commit_nowait`]: the `before_commit`
+    /// callbacks' reads keep the transaction's read mode instead of reading
+    /// the device, so one that would block ends the commit with that wait.
+    nowait: bool,
     /// How far [`Transaction::prepare`] got.
     prepare_state: Prepare,
-    /// Keys for which this transaction holds a pessimistic lock.
-    /// A set rather than a list: membership is checked on every
-    /// locking operation, and release order does not matter.
-    /// Released by `Drop` if not already released by `commit` or
-    /// `rollback`.
-    held_locks: TxnBuffer<Vec<u8>, ()>,
-    lock_manager: Option<Arc<LockManager>>,
+    /// Keys for which this transaction holds a pessimistic lock, each with
+    /// its lock and the use of it the hold took. A set rather than a list:
+    /// membership is checked on every locking operation, and release order
+    /// does not matter. Released by `Drop` if not already released by
+    /// `commit` or `rollback`, or by the landing of a `commit_nowait`.
+    held_locks: TxnBuffer<Vec<u8>, Arc<KeyLock>>,
+    /// The database's lock table; `None` for an optimistic transaction.
+    lock_table: Option<Arc<LockTable>>,
+    /// The name this transaction's locks carry, made by its first lock call.
+    lock_owner: OnceLock<Arc<LockOwner>>,
+    /// The waits for locks other transactions held, one per key, kept across
+    /// calls (`locking`). Allocated by the first wait.
+    lock_waits: OnceLock<Box<TxnBuffer<Vec<u8>, Arc<PendingLock>>>>,
     lock_timeout: Duration,
     resolved: bool,
     resources_released: bool,
@@ -866,9 +924,10 @@ impl Transaction {
     fn new(
         engine: Arc<RegolithEngine>,
         snapshot_seq: u64,
+        snapshot_pin: crate::engine::SnapshotPin,
         durability: crate::engine::DurabilityMode,
         mode: TxMode,
-        lock_manager: Option<Arc<LockManager>>,
+        lock_table: Option<Arc<LockTable>>,
         lock_timeout: Duration,
         isolation: IsolationLevel,
         keys_inline: usize,
@@ -883,6 +942,7 @@ impl Transaction {
         Self {
             engine,
             snapshot_seq,
+            snapshot_pin,
             durability,
             mode,
             isolation,
@@ -900,9 +960,12 @@ impl Transaction {
             callbacks: Callbacks::default(),
             claim,
             committing: false,
+            nowait: false,
             prepare_state: Prepare::Pending,
             held_locks: TxnBuffer::new(keys_inline),
-            lock_manager,
+            lock_table,
+            lock_owner: OnceLock::new(),
+            lock_waits: OnceLock::new(),
             lock_timeout,
             resolved: false,
             resources_released: false,
@@ -923,9 +986,11 @@ impl Transaction {
 
     /// Route this thread's device misses as the transaction's mode says, for
     /// one read call. Inside `commit` every read blocks: the commit does its
-    /// own I/O, the `before_commit` callbacks' reads included.
+    /// own I/O, the `before_commit` callbacks' reads included. Inside
+    /// `commit_nowait` they keep the mode, and one that misses ends the
+    /// commit with its wait.
     fn read_scope(&self) -> Option<Scope> {
-        if self.committing {
+        if self.committing && !self.nowait {
             return None;
         }
         self.reading.mode.scope()
@@ -1120,20 +1185,75 @@ impl Transaction {
     /// This is how a transaction claims a key: a bare put of a constant is not
     /// a claim, since a write of the bytes the key already holds does not
     /// conflict (see the module documentation).
+    ///
+    /// A pessimistic transaction waits for a lock another transaction holds,
+    /// up to the database's lock timeout
+    /// ([`TransactionDb::with_lock_timeout`]), and then fails with
+    /// [`TransactionError::Busy`]: the defense against a deadlock, since no
+    /// wait-for graph is kept. The wait parks this thread, holding no mutex
+    /// and no condition variable, and is woken when the lock may be free. It
+    /// keeps the transaction's place among the key's waiters, so after
+    /// [`MAX_BYPASS`](crate::sync::MAX_BYPASS) losses to callers that took
+    /// the lock first it is handed the lock. On a platform with no clock
+    /// (wasm32 in a browser) nothing can bound a wait, so a lock another
+    /// transaction holds fails with `Busy` at once. A database closed while
+    /// the call waits ends it with [`Error::Closed`].
+    /// [`Transaction::try_get_for_update`] is the form that never waits.
     pub fn get_for_update(&self, key: &[u8]) -> TxResult<Option<Vec<u8>>> {
         let _scope = self.read_scope();
         let prefixed = prefix_key(DEFAULT_CF_ID, key);
         let already_held = self.lock_key(&prefixed)?;
-        let horizon = self.read_horizon(&prefixed, already_held);
-        let (state, read_seq) = self.observe(&prefixed, horizon, true);
+        self.read_for_update(&prefixed, already_held)
+    }
+
+    /// [`Transaction::get_for_update`] that never waits for a lock.
+    ///
+    /// When another transaction holds `key`'s lock, it takes nothing, reads
+    /// nothing, and returns [`TransactionError::WouldBlock`] with a
+    /// [`WouldBlock::Locked`](crate::WouldBlock::Locked) wait: wait for it,
+    /// then call again (`ready(|| txn.try_get_for_update(key))` does both
+    /// inside an async attempt). The wait is completed on this transaction's
+    /// [`IoQueue`](crate::IoQueue) at that queue's poll, or directly, on the
+    /// releasing thread, for a transaction with no queue (see
+    /// [`LockWait`](crate::LockWait)); it says only that the lock may be free
+    /// now. The call run again takes the lock, or returns a new wait when
+    /// another caller took it first. The transaction keeps its place among
+    /// the key's waiters across those calls, so after
+    /// [`MAX_BYPASS`](crate::sync::MAX_BYPASS) losses it is handed the lock
+    /// and the call run again finds it held. A transaction that stops calling
+    /// keeps its place, and any lock handed to it, until it ends: the waiters
+    /// behind it wait on it meanwhile, as they would on a holder.
+    ///
+    /// Once the lock is held, this is `get_for_update`: the read is served as
+    /// of the moment the lock was taken, and a `CacheOnly` read that misses
+    /// returns [`WouldBlock::Io`](crate::WouldBlock::Io) with the lock kept.
+    /// A database closed while the transaction waits makes the wait ready,
+    /// and the call run again fails with [`Error::Closed`]. A transaction
+    /// that names a queue not open on this database fails with
+    /// [`Error::InvalidArgument`] when it would wait.
+    ///
+    /// An optimistic transaction takes no locks, so for it this is
+    /// `get_for_update`.
+    pub fn try_get_for_update(&self, key: &[u8]) -> TxResult<Option<Vec<u8>>> {
+        let _scope = self.read_scope();
+        let prefixed = prefix_key(DEFAULT_CF_ID, key);
+        let already_held = self.try_lock_key(&prefixed)?;
+        self.read_for_update(&prefixed, already_held)
+    }
+
+    /// What `get_for_update` reads once the lock, if any, is held:
+    /// `already_held` says the transaction held it before this call.
+    fn read_for_update(&self, prefixed: &[u8], already_held: bool) -> TxResult<Option<Vec<u8>>> {
+        let horizon = self.read_horizon(prefixed, already_held);
+        let (state, read_seq) = self.observe(prefixed, horizon, true);
         // Tells `scan_read_seq` a promoted key might exist, so it is worth
         // looking `tracked` up for a pessimistic scan.
         self.promoted_seq.fetch_max(read_seq, Ordering::AcqRel);
-        let committed = || self.read_noting(&state, &prefixed, read_seq);
-        match self.read_own(&prefixed, committed)? {
+        let committed = || self.read_noting(&state, prefixed, read_seq);
+        match self.read_own(prefixed, committed)? {
             Some(own) => Ok(own),
             None => Ok(committed()
-                .map_err(|e| read_error(e, &prefixed))?
+                .map_err(|e| read_error(e, prefixed))?
                 .map(DbSlice::into_vec)),
         }
     }
@@ -1293,23 +1413,29 @@ impl Transaction {
     /// write with [`crate::WriteOptions::default`], in the same order: key
     /// and value sizes are validated first, along with the size of the
     /// record the commit will log (at most 1 GiB), so an oversized commit
-    /// is rejected before it waits, then it blocks while a stop trigger is
-    /// active and pays the slowdown delay while a slowdown trigger is
-    /// active, before the conflict check and before any commit lock is
-    /// taken. A wait that admits the commit is charged to
-    /// [`crate::Ticker::WriteStallMicros`]. A stall the engine cannot
-    /// relieve surfaces as [`TransactionError::Engine`] carrying the same
-    /// [`crate::Error::Busy`] reason a plain write reports. A
-    /// commit too large to log fails with [`TransactionError::Engine`] of
-    /// [`crate::Error::InvalidArgument`] and applies nothing; split it
-    /// into smaller transactions. A commit with no buffered writes skips the
-    /// stall wait: it validates its read set and returns. That validation
+    /// is rejected first, then the write-stall admission runs, before the
+    /// conflict check and before any commit lock is taken. A commit never
+    /// waits on a stall. Under a stop trigger it applies nothing and
+    /// returns [`TransactionError::WouldBlock`] with a
+    /// [`crate::WouldBlock::Stall`] wait, and the transaction ends with its
+    /// `on_abort` callbacks; run it again once the wait is ready
+    /// ([`OptimisticTransactionDb::transact`] does both). A slowdown
+    /// trigger delays nothing. With no compaction worker and
+    /// [`crate::Options::inline_compaction`] on, a commit from a thread with
+    /// no [`crate::IoQueue`] relieves a stop inline instead, and that time
+    /// is charged to [`crate::Ticker::WriteStallMicros`]. A stall the
+    /// engine cannot relieve surfaces as [`TransactionError::Engine`]
+    /// carrying the same [`crate::Error::Busy`] reason a plain write
+    /// reports. A commit too large to log fails with
+    /// [`TransactionError::Engine`] of [`crate::Error::InvalidArgument`] and
+    /// applies nothing; split it into smaller transactions. A commit with no
+    /// buffered writes skips the stall admission: it validates its read set
+    /// and returns. That validation
     /// still runs under the write pipeline, so it can wait behind a commit
     /// group that is writing the log. An optimistic transaction at
     /// [`IsolationLevel::DefraLevel`] that writes nothing is the exception: it
     /// takes no part in the pipeline and validates only its
-    /// [`Transaction::get_for_update`] reads. A pessimistic transaction keeps
-    /// its key locks for the duration of the wait.
+    /// [`Transaction::get_for_update`] reads.
     ///
     /// Concurrent commits share commit groups with each other and with plain
     /// writes: one log write and, at [`crate::DurabilityMode::Immediate`], one
@@ -1372,6 +1498,37 @@ impl Transaction {
 
     fn commit_inner(&mut self) -> TxResult<CommitReceipt> {
         self.prepare()?;
+        let drained = self.drain_for_commit()?;
+        // The write-stall admission (same order as a plain write with
+        // `WriteOptions::default()`: closed/read-only, then size
+        // validation, then the stall wait) runs inside
+        // `commit_optimistic`, after its own `ensure_writable` and
+        // `validate_ops_sizes` and before the pipeline mutex, gated on
+        // the commit carrying an op. See the comment there for why.
+        let outcome = if drained.write_free {
+            self.engine.commit_write_free(&drained.commit.checks)
+        } else {
+            let commit = drained.commit;
+            self.engine.commit_with_conflict_check(
+                commit.checks,
+                commit.point_ops,
+                commit.range_deletes,
+                commit.merges,
+                commit.appends,
+                commit.durability,
+            )
+        };
+        receipt_of(
+            self.engine.statistics(),
+            outcome,
+            self.snapshot_seq,
+            drained.scan_runs_dropped,
+        )
+    }
+
+    /// Everything the commit hands the engine, drained out of the
+    /// transaction once its `before_commit` callbacks ran.
+    fn drain_for_commit(&mut self) -> TxResult<Drained> {
         // `&mut self` here means buffering is over, so draining the
         // concurrent buffers cannot race. Every buffer is moved out
         // rather than copied: the transaction is being consumed, so
@@ -1408,8 +1565,9 @@ impl Transaction {
         // consult: the policy is installed on the optimistic database alone,
         // and every other level ignores it.
         let classifier = policy::classifier_for(&self.policy, self.isolation);
-        // The classifier is the caller's code, and a panic in it is caught.
-        let _commit = classifier.map(|_| callback::InCommit::enter());
+        // The classifier is the caller's code, and a panic in it is caught,
+        // here and in the engine's validation the commit then runs.
+        let contain = classifier.map(|_| callback::InCommit::enter());
         // Counted here, recorded only once the commit succeeded: a commit
         // that aborts or fails dropped nothing.
         let mut scan_runs_dropped = 0u64;
@@ -1444,43 +1602,19 @@ impl Transaction {
                 policy::exempt_content_addressed(classifier, &mut checks, &writes, &merges)
             })?;
         }
-
-        // The write-stall admission (same order as a plain write with
-        // `WriteOptions::default()`: closed/read-only, then size
-        // validation, then the stall wait) runs inside
-        // `commit_optimistic`, after its own `ensure_writable` and
-        // `validate_ops_sizes` and before the pipeline mutex, gated on
-        // the commit carrying an op. See the comment there for why.
-        let outcome = if write_free {
-            self.engine.commit_write_free(&checks)?
-        } else {
-            self.engine.commit_with_conflict_check(
+        Ok(Drained {
+            commit: TxnCommit {
                 checks,
-                writes,
+                point_ops: writes,
                 range_deletes,
                 merges,
                 appends,
-                self.durability,
-            )?
-        };
-        match outcome {
-            CommitOutcome::Ok { seq } => {
-                if let Some(s) = self.engine.statistics() {
-                    s.add(crate::Ticker::CommitCount, 1);
-                    if scan_runs_dropped > 0 {
-                        s.add(crate::Ticker::PolicyScanRunsDropped, scan_runs_dropped);
-                    }
-                }
-                Ok(CommitReceipt::new(seq.unwrap_or(self.snapshot_seq)))
-            }
-            CommitOutcome::Conflict(mut conflict) => {
-                conflict.strip_cf_prefix();
-                if let Some(s) = self.engine.statistics() {
-                    s.add(crate::Ticker::CommitConflicts, 1);
-                }
-                Err(TransactionError::Conflict(conflict))
-            }
-        }
+                durability: self.durability,
+            },
+            write_free,
+            scan_runs_dropped,
+            _contain: contain,
+        })
     }
 
     /// Run `f`, which calls the caller's [`KeyClassifier`]. A panic in it
@@ -1630,29 +1764,20 @@ impl Transaction {
         }
     }
 
-    /// Take `key`'s exclusive lock in pessimistic mode. Returns
-    /// `true` when this transaction already held it. A no-op for an
-    /// optimistic transaction, which takes no locks.
-    fn lock_key(&self, key: &[u8]) -> TxResult<bool> {
-        match self.mode {
-            TxMode::Optimistic => Ok(false),
-            TxMode::Pessimistic { tx_id } => self.acquire_lock(key, tx_id),
-        }
-    }
-
     /// Sequence a fresh read of `key` is anchored at, given whether
     /// this transaction already held the key's lock.
     ///
     /// The pessimistic horizon is sampled with the lock held: a
-    /// committing writer publishes the engine's visible seq before
-    /// releasing the lock, and the lock manager's mutex is the
-    /// release/acquire edge, so nothing newer can hide behind it.
+    /// committing writer's commit is visible before its lock is released
+    /// (at once for `commit`, when its group lands for `commit_nowait`), and
+    /// the lock's state word is the release/acquire edge between them, so
+    /// nothing newer can hide behind it.
     /// Under a lock this transaction already holds nothing can have
     /// advanced, so the anchor recorded then still stands.
     fn read_horizon(&self, key: &[u8], already_held: bool) -> u64 {
         match self.mode {
             TxMode::Optimistic => self.snapshot_seq,
-            TxMode::Pessimistic { .. } => {
+            TxMode::Pessimistic => {
                 if already_held && let Some(state) = self.tracked.get(key) {
                     return state.read_seq.load(Ordering::Acquire);
                 }
@@ -1733,7 +1858,7 @@ impl Transaction {
             // An optimistic transaction reads every key at its begin
             // snapshot: `read_horizon` never returns anything else.
             TxMode::Optimistic => self.snapshot_seq,
-            TxMode::Pessimistic { .. } => {
+            TxMode::Pessimistic => {
                 if self.promoted_seq.load(Ordering::Acquire) <= self.snapshot_seq {
                     return self.snapshot_seq;
                 }
@@ -1764,21 +1889,6 @@ impl Transaction {
             .push(run);
     }
 
-    /// Acquire `key`'s exclusive lock. Returns `true` when this
-    /// transaction already held it.
-    fn acquire_lock(&self, key: &[u8], tx_id: u64) -> TxResult<bool> {
-        let Some(lm) = self.lock_manager.as_ref() else {
-            return Ok(false);
-        };
-        if self.held_locks.get(key).is_some() {
-            return Ok(true);
-        }
-        lm.acquire(key, tx_id, self.lock_timeout)
-            .map_err(|_| TransactionError::Busy(strip_cf_prefix(key.to_vec())))?;
-        self.held_locks.insert(key.to_vec(), ());
-        Ok(false)
-    }
-
     fn release_resources(&mut self) {
         if self.resources_released {
             return;
@@ -1787,14 +1897,51 @@ impl Transaction {
         if let Some(claim) = &self.claim {
             self.engine.open_transactions().remove(claim.id);
         }
-        if let Some(lm) = self.lock_manager.as_ref()
-            && let TxMode::Pessimistic { tx_id } = self.mode
-        {
-            for (key, ()) in self.held_locks.drain() {
-                lm.release(&key, tx_id);
+        self.release_locks();
+        self.engine.release_snapshot(self.snapshot_pin.take());
+    }
+}
+
+/// What a transaction's commit hands the engine, drained out of it.
+struct Drained {
+    commit: TxnCommit,
+    /// A write-free optimistic commit at `DefraLevel`: it takes no part in
+    /// the write pipeline.
+    write_free: bool,
+    /// Scanned stretches the classifier dropped, recorded once the commit
+    /// succeeds.
+    scan_runs_dropped: u64,
+    /// Contains a panic in the caller's classifier until the commit is
+    /// decided.
+    _contain: Option<callback::InCommit>,
+}
+
+/// The commit's receipt or the reason it failed, from what the engine
+/// decided, with the commit's counts recorded. The one mapping a
+/// synchronous commit and a ticket's delivery share.
+fn receipt_of(
+    stats: Option<&crate::Statistics>,
+    outcome: std::io::Result<CommitOutcome>,
+    snapshot_seq: u64,
+    scan_runs_dropped: u64,
+) -> TxResult<CommitReceipt> {
+    match outcome? {
+        CommitOutcome::Ok { seq } => {
+            if let Some(s) = stats {
+                s.add(crate::Ticker::CommitCount, 1);
+                if scan_runs_dropped > 0 {
+                    s.add(crate::Ticker::PolicyScanRunsDropped, scan_runs_dropped);
+                }
             }
+            Ok(CommitReceipt::new(seq.unwrap_or(snapshot_seq)))
         }
-        self.engine.release_snapshot(self.snapshot_seq);
+        CommitOutcome::Conflict(mut conflict) => {
+            conflict.strip_cf_prefix();
+            if let Some(s) = stats {
+                s.add(crate::Ticker::CommitConflicts, 1);
+            }
+            Err(TransactionError::Conflict(conflict))
+        }
     }
 }
 
@@ -1842,85 +1989,8 @@ impl Drop for Transaction {
     }
 }
 
-// ─── LockManager ────────────────────────────────────────────────────────────
-
-/// Single-shard exclusive lock manager used by [`TransactionDb`].
-///
-/// The hash map maps user keys to the tx id that currently holds
-/// the lock. Acquires block on the condvar until the lock is free
-/// or the deadline expires. Sharding the map for higher
-/// concurrency is a future optimization: regolith transactions today
-/// expect low-to-moderate concurrency, so a single mutex is fine.
-struct LockManager {
-    locks: Mutex<HashMap<Vec<u8>, u64>>,
-    cvar: Condvar,
-}
-
-impl LockManager {
-    fn new() -> Self {
-        Self {
-            locks: Mutex::new(HashMap::new()),
-            cvar: Condvar::new(),
-        }
-    }
-
-    /// Acquire an exclusive lock on `key` for `tx_id`. Blocks up
-    /// to `timeout`. Returns `Err(())` on timeout.
-    fn acquire(&self, key: &[u8], tx_id: u64, timeout: Duration) -> std::result::Result<(), ()> {
-        // Microseconds from the platform clock. `None` means this
-        // platform cannot measure a timeout at all, which is the same
-        // single-threaded platform on which no other transaction can
-        // be holding the lock, so the wait simply is not bounded by a
-        // deadline there.
-        let deadline =
-            crate::env::platform_micros().map(|now| now.saturating_add(timeout.as_micros() as u64));
-        let mut guard = self.locks.lock();
-        loop {
-            match guard.get(key) {
-                Some(&holder) if holder == tx_id => {
-                    // Re-entrant: same transaction already holds the
-                    // lock. Treat as a success.
-                    return Ok(());
-                }
-                Some(_) => {
-                    let remaining = match (deadline, crate::env::platform_micros()) {
-                        (Some(deadline), Some(now)) => {
-                            if now >= deadline {
-                                return Err(());
-                            }
-                            Duration::from_micros(deadline - now)
-                        }
-                        _ => timeout,
-                    };
-                    let (next, result) = self
-                        .cvar
-                        .wait_timeout(guard, remaining)
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    guard = next;
-                    if result.timed_out() && guard.get(key).is_some_and(|&h| h != tx_id) {
-                        return Err(());
-                    }
-                }
-                None => {
-                    guard.insert(key.to_vec(), tx_id);
-                    return Ok(());
-                }
-            }
-        }
-    }
-
-    /// Release `key`'s lock if held by `tx_id`. Notifies any
-    /// waiters.
-    fn release(&self, key: &[u8], tx_id: u64) {
-        let mut guard = self.locks.lock();
-        if let Some(&holder) = guard.get(key)
-            && holder == tx_id
-        {
-            guard.remove(key);
-            self.cvar.notify_all();
-        }
-    }
-}
+#[cfg(test)]
+mod lock_tests;
 
 #[cfg(test)]
 mod validation_set_tests;
@@ -1934,7 +2004,7 @@ mod commit_claim_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Statistics, Ticker, WriteKind};
+    use crate::WriteKind;
     use tempfile::TempDir;
 
     fn opt_db() -> (OptimisticTransactionDb, TempDir) {
@@ -2528,83 +2598,82 @@ mod tests {
 
     // -- Write-stall admission --------------------------------------------
 
-    fn slowdown_opts(stats: &Arc<Statistics>) -> Options {
+    fn stop_opts() -> Options {
         Options::default()
             // Tiny memtable so every handful of puts rolls an L0 file.
             .write_buffer_size(4 * 1024)
             // Disable automatic compaction so L0 can't drain on us.
             .l0_compaction_trigger(1000)
-            // Slow down once L0 has 2 files, never stop (high trigger).
-            .level0_slowdown_writes_trigger(2)
-            .level0_stop_writes_trigger(10_000)
+            // Stop writes once L0 has 2 files.
+            .level0_slowdown_writes_trigger(0)
+            .level0_stop_writes_trigger(2)
             // Disable the memtable-count trigger so this isolates the L0
-            // slowdown path.
+            // stop.
             .max_write_buffer_number(0)
-            .statistics(Some(Arc::clone(stats)))
     }
 
-    /// Write `plain` past the slowdown trigger with the recipe of
-    /// `test_write_stall_slowdown_accumulates_micros`. The worker writes the
-    /// sealed memtables out off the commit path, and a loaded host can let
-    /// the writes outrun it, so the second half waits for L0 to reach the
-    /// trigger: those writes pay the slowdown.
-    fn cross_slowdown(plain: &Db) {
+    /// Write `plain` until L0 reaches the stop trigger. The worker writes
+    /// the sealed memtables out off the commit path.
+    fn cross_stop(plain: &Db) {
         let payload = vec![0xCDu8; 600];
+        let l0 = || {
+            plain
+                .get_int_property("regolith.num-files-at-level0")
+                .unwrap_or(0)
+        };
         for i in 0..64 {
+            if l0() + plain.engine.frozen_memtables() as u64 >= 2 {
+                break;
+            }
             let k = format!("k{i:04}");
-            plain.put(k.as_bytes(), &payload).unwrap();
+            crate::through_stalls(|| plain.put(k.as_bytes(), &payload)).unwrap();
         }
         crate::tests::wait_for_l0_files(plain, 2);
-        for i in 64..128 {
-            let k = format!("k{i:04}");
-            plain.put(k.as_bytes(), &payload).unwrap();
-        }
     }
 
-    /// Drive `plain` past the slowdown trigger, then check that a commit
-    /// through `begin` is charged the wait only when it carries a write.
-    fn probe_slowdown_ticker(plain: &Db, stats: &Statistics, begin: impl Fn() -> Transaction) {
-        cross_slowdown(plain);
-        let stall = stats.get_ticker(Ticker::WriteStallMicros);
-        assert!(
-            stall > 0,
-            "expected WriteStallMicros > 0 after crossing the slowdown trigger, got {stall}"
-        );
+    /// Drive `plain` to the stop, then check that a commit through `begin`
+    /// meets it as a plain write does when, and only when, it carries a
+    /// write: it applies nothing and returns the stall's wait, which the
+    /// clearing compaction completes.
+    fn probe_stop(plain: &Db, begin: impl Fn() -> Transaction) {
+        cross_stop(plain);
 
-        let before = stats.get_ticker(Ticker::WriteStallMicros);
         let tx = begin();
         tx.get(b"k0000").unwrap();
-        tx.commit().unwrap();
-        assert_eq!(
-            stats.get_ticker(Ticker::WriteStallMicros),
-            before,
-            "a read-only commit must not be charged for the write-stall wait"
+        tx.commit()
+            .expect("a read-only commit takes no capacity, so a stall does not stop it");
+
+        let tx = begin();
+        tx.put(b"txn", b"v").unwrap();
+        let stall = match tx.commit() {
+            Err(TransactionError::WouldBlock(crate::WouldBlock::Stall(stall))) => stall,
+            other => panic!("a writing commit under a stop returns its wait, got {other:?}"),
+        };
+        assert_eq!(plain.get(b"txn").unwrap(), None, "it applied nothing");
+        plain.compact_range(None, None).wait().unwrap();
+        assert!(
+            stall.is_ready(),
+            "the clearing compaction completed the wait"
         );
 
         let tx = begin();
         tx.put(b"txn", b"v").unwrap();
         tx.commit().unwrap();
-        assert!(
-            stats.get_ticker(Ticker::WriteStallMicros) > before,
-            "a writing commit under a slowdown must be charged for the wait"
-        );
         assert_eq!(plain.get(b"txn").unwrap(), Some(b"v".to_vec()));
     }
 
     #[test]
-    fn optimistic_commit_is_charged_the_slowdown_like_a_plain_write() {
-        let stats = Arc::new(Statistics::new());
+    fn optimistic_commit_meets_the_stop_like_a_plain_write() {
         let dir = TempDir::new().unwrap();
-        let db = OptimisticTransactionDb::open(dir.path(), slowdown_opts(&stats)).unwrap();
-        probe_slowdown_ticker(db.db(), &stats, || db.begin(&TxnOptions::new()));
+        let db = OptimisticTransactionDb::open(dir.path(), stop_opts()).unwrap();
+        probe_stop(db.db(), || db.begin(&TxnOptions::new()));
     }
 
     #[test]
-    fn pessimistic_commit_is_charged_the_slowdown_like_a_plain_write() {
-        let stats = Arc::new(Statistics::new());
+    fn pessimistic_commit_meets_the_stop_like_a_plain_write() {
         let dir = TempDir::new().unwrap();
-        let db = TransactionDb::open(dir.path(), slowdown_opts(&stats)).unwrap();
-        probe_slowdown_ticker(db.db(), &stats, || db.begin(&TxnOptions::new()));
+        let db = TransactionDb::open(dir.path(), stop_opts()).unwrap();
+        probe_stop(db.db(), || db.begin(&TxnOptions::new()));
     }
 
     #[test]
@@ -2621,30 +2690,27 @@ mod tests {
     }
 
     /// The closed-handle test above cannot tell whether `commit_optimistic`'s
-    /// `ensure_writable` call runs before the stall wait, because a closed
-    /// handle produces the identical error either way (`wait_for_write_capacity`
-    /// also refuses a closed engine). A latched write-ahead-log failure
-    /// under `StallPolicy::WaitForWorker` is the one case that can: without
-    /// the pre-wait check, the commit would sleep out the slowdown delay
-    /// first and only then report the WAL error, charging the wait to
-    /// `WriteStallMicros` on the way. Regression for deleting that call.
+    /// `ensure_writable` call runs before the stall admission, because a
+    /// closed handle produces the identical error either way (`admit_write`
+    /// also refuses a closed engine). A latched write-ahead-log failure under
+    /// a stop is the one case that can: without the check before the
+    /// admission, the commit would report the stall instead of the WAL
+    /// error, and a caller would wait for a stall to clear on a database that
+    /// can take no write at all. Regression for deleting that call.
     #[test]
-    fn commit_on_a_wal_failed_handle_is_refused_before_the_stall_wait() {
-        let stats = Arc::new(Statistics::new());
+    fn commit_on_a_wal_failed_handle_is_refused_before_the_stall() {
         let dir = TempDir::new().unwrap();
-        let db = OptimisticTransactionDb::open(dir.path(), slowdown_opts(&stats)).unwrap();
+        let db = OptimisticTransactionDb::open(dir.path(), stop_opts()).unwrap();
 
-        cross_slowdown(db.db());
-        let stall = stats.get_ticker(Ticker::WriteStallMicros);
+        cross_stop(db.db());
         assert!(
-            stall > 0,
-            "expected WriteStallMicros > 0 after crossing the slowdown trigger, got {stall}"
+            matches!(db.db().engine.stall_signal().classify(), Some((_, true))),
+            "precondition: writes are stopped"
         );
 
         db.db()
             .engine
             .latch_wal_failure(&std::io::Error::other("injected"));
-        let before = stats.get_ticker(Ticker::WriteStallMicros);
 
         let tx = db.begin(&TxnOptions::new());
         tx.put(b"txn", b"v").unwrap();
@@ -2658,11 +2724,6 @@ mod tests {
             }
             other => panic!("expected an Engine(Io) WAL failure, got {other:?}"),
         }
-        assert_eq!(
-            stats.get_ticker(Ticker::WriteStallMicros),
-            before,
-            "a commit refused for a WAL failure must not pay the stall wait"
-        );
     }
 
     // A scan's read set grows by yielded key, not by call: a key it

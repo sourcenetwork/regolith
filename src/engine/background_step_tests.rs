@@ -58,7 +58,7 @@ fn write_until_sealed(engine: &RegolithEngine, prefix: &str) -> usize {
 fn a_rotating_write_returns_without_flushing() {
     let dir = TempDir::new().unwrap();
     let engine = RegolithEngine::open(dir.path(), tiny(1)).unwrap();
-    let flushing = engine.flusher.flushing.lock();
+    let flushing = engine.flusher.flushing().unwrap();
     let (done, returned) = mpsc::channel();
     std::thread::scope(|scope| {
         scope.spawn(|| {
@@ -165,7 +165,7 @@ fn frozen_memtables_install_in_l0_oldest_first_whoever_flushes() {
     .unwrap();
     const ROUNDS: u8 = 6;
     {
-        let _held = engine.flusher.flushing.lock();
+        let _held = engine.flusher.flushing().unwrap();
         // Each round seals a memtable holding `k = round`.
         for round in 0..ROUNDS {
             put(&engine, b"k", &[round]).unwrap();
@@ -214,7 +214,7 @@ fn a_rotation_never_leaves_more_memtables_than_the_cap() {
     let dir = TempDir::new().unwrap();
     // The default cap of two: the active memtable and one frozen.
     let engine = RegolithEngine::open(dir.path(), tiny(1)).unwrap();
-    let held = engine.flusher.flushing.lock();
+    let held = engine.flusher.flushing().unwrap();
     write_until_sealed(&engine, "first");
     assert_eq!(engine.view.load().frozen.len(), 1);
     let (done, returned) = mpsc::channel();
@@ -278,4 +278,172 @@ fn without_a_worker_writes_compact_once_l0_reaches_its_trigger() {
             Some(vec![7u8; 1024])
         );
     }
+}
+
+/// The worker waits on the flush exclusion while a writer or a checkpoint
+/// flushes, a whole table write. The wait releases the views its last read
+/// holds back before it parks, as every blocking wait of the engine does,
+/// so a view retired meanwhile is freed during the wait rather than after
+/// it.
+#[test]
+fn a_worker_waiting_on_the_flush_exclusion_holds_back_no_retired_view() {
+    let dir = TempDir::new().unwrap();
+    let engine = RegolithEngine::open(dir.path(), tiny(0)).unwrap();
+    // A memtable only the published view names, so it is dropped exactly
+    // when the view that names it is freed.
+    let probe = {
+        let doomed = Arc::new(super::MemTable::new(&engine.memtable_config).unwrap());
+        let probe = Arc::downgrade(&doomed);
+        engine
+            .view
+            .update_memtables(|_, frozen| (Arc::clone(&doomed), frozen.to_vec(), ()));
+        probe
+    };
+    let held = engine.flusher.flushing().unwrap();
+    let (waiting_tx, waiting) = mpsc::channel();
+    std::thread::scope(|scope| {
+        let worker = scope.spawn(|| {
+            // The worker's last read: a load after the probe's view was
+            // published, released at once.
+            assert!(engine.view.load().active.is_empty());
+            waiting_tx.send(()).unwrap();
+            engine.flusher.flush_all_frozen();
+        });
+        waiting.recv().unwrap();
+        // Retire the probe's view while the worker waits for the exclusion.
+        let fresh = Arc::new(super::MemTable::new(&engine.memtable_config).unwrap());
+        engine
+            .view
+            .update_memtables(|_, frozen| (Arc::clone(&fresh), frozen.to_vec(), ()));
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut backoff = Duration::from_millis(1);
+        while probe.upgrade().is_some() && std::time::Instant::now() < deadline {
+            assert!(!worker.is_finished(), "the worker passed a held exclusion");
+            super::read_view::idle();
+            drop(engine.view.load());
+            std::thread::sleep(backoff);
+            backoff = (backoff * 2).min(Duration::from_millis(50));
+        }
+        let freed = probe.upgrade().is_none();
+        drop(held);
+        worker.join().unwrap();
+        assert!(
+            freed,
+            "a view retired while the worker waited on the flush exclusion stayed alive"
+        );
+    });
+}
+
+/// Where a worker's round waits for the compaction gate.
+#[derive(Clone, Copy, Debug)]
+enum GateWait {
+    /// Its pass waits for a job that holds the gate alone.
+    Pass,
+    /// A job it runs waits for a pass that holds the gate shared.
+    Job,
+}
+
+/// A worker's round waits for the gate in two places: its pass, behind a
+/// job that holds the gate alone, and a job it runs, behind passes. Each
+/// wait releases the views the thread's last read holds back before it
+/// parks, so a view retired while it waits is freed during the wait rather
+/// than after it. The job reads engine state of its own after the round
+/// began, so a release at the top of the round would not be enough.
+fn a_worker_waiting_for_the_gate_frees_a_retired_view(wait: GateWait) {
+    let dir = TempDir::new().unwrap();
+    let engine = RegolithEngine::open(dir.path(), tiny(1)).unwrap();
+    // The worker sits in a job of the test's until the gate is taken, so
+    // what it does next is known: the rest of this round.
+    let (in_job, when_in_job) = mpsc::channel();
+    let (go, gone) = mpsc::channel::<()>();
+    engine.compaction_scheduler().run_on_worker(move || {
+        in_job.send(()).unwrap();
+        let _ = gone.recv();
+    });
+    when_in_job
+        .recv_timeout(Duration::from_secs(60))
+        .expect("the worker never ran the job");
+
+    let gate = engine.compaction_gate();
+    let (alone, shared, ticket) = match wait {
+        GateWait::Pass => (Some(gate.exclusive().unwrap()), None, None),
+        GateWait::Job => {
+            let shared = gate.try_shared().expect("no pass runs and no job waits");
+            // Queued behind the test's job: the next round runs it, and it
+            // waits for the gate alone.
+            let ticket = engine.start_foreground(super::foreground::Work::CompactRange {
+                lower: key_of(b"y0"),
+                upper: key_of(b"y1"),
+            });
+            (None, Some(shared), Some(ticket))
+        }
+    };
+    // A memtable only the published view names, so it is dropped exactly
+    // when the view that names it is freed.
+    let probe = {
+        let doomed = Arc::new(super::MemTable::new(&engine.memtable_config).unwrap());
+        let probe = Arc::downgrade(&doomed);
+        engine
+            .view
+            .update_memtables(|_, frozen| (Arc::clone(&doomed), frozen.to_vec(), ()));
+        probe
+    };
+    // Every load the worker makes before it waits is followed by a
+    // re-classification of the stall: one after its flush step, and, when
+    // its pass is let through, one more at the end of the round.
+    let loads = match wait {
+        GateWait::Pass => 1,
+        GateWait::Job => 2,
+    };
+    let before = engine.stall_signal().progress();
+    go.send(()).unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    let mut backoff = Duration::from_millis(1);
+    while engine.stall_signal().progress().wrapping_sub(before) < loads {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{wait:?}: the worker's round never reached the gate"
+        );
+        std::thread::sleep(backoff);
+        backoff = (backoff * 2).min(Duration::from_millis(50));
+    }
+
+    // Retire the probe's view while the worker waits for the gate.
+    let fresh = Arc::new(super::MemTable::new(&engine.memtable_config).unwrap());
+    engine
+        .view
+        .update_memtables(|_, frozen| (Arc::clone(&fresh), frozen.to_vec(), ()));
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let mut backoff = Duration::from_millis(1);
+    while probe.upgrade().is_some() && std::time::Instant::now() < deadline {
+        super::read_view::idle();
+        drop(engine.view.load());
+        std::thread::sleep(backoff);
+        backoff = (backoff * 2).min(Duration::from_millis(50));
+    }
+    let freed = probe.upgrade().is_none();
+    if let Some(ticket) = &ticket {
+        assert!(
+            !ticket.is_ready(),
+            "setup: the job ran while a pass held the gate"
+        );
+    }
+    drop((alone, shared));
+    if let Some(ticket) = ticket {
+        ticket.wait().unwrap();
+    }
+    assert!(
+        freed,
+        "{wait:?}: a view retired while the worker waited for the gate stayed alive"
+    );
+}
+
+#[test]
+fn a_worker_whose_pass_waits_for_the_gate_holds_back_no_retired_view() {
+    a_worker_waiting_for_the_gate_frees_a_retired_view(GateWait::Pass);
+}
+
+#[test]
+fn a_worker_whose_job_waits_for_the_gate_holds_back_no_retired_view() {
+    a_worker_waiting_for_the_gate_frees_a_retired_view(GateWait::Job);
 }

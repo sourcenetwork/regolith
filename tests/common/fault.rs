@@ -43,9 +43,10 @@
 //!
 //! This is the ALICE model driven by what regolith actually did, not by an
 //! assumption about what regolith does. Interposition is sound here because
-//! regolith performs all data I/O through `std::fs`, which calls the glibc
-//! symbols; it uses `rustix` raw syscalls only for `flock` and `fadvise`,
-//! which move no file data, and it has no `mmap` write path.
+//! regolith performs every write through `std::fs`, which calls the glibc
+//! symbols; it uses `rustix` raw syscalls only for `flock`, `fadvise` and
+//! the positional reads of its tables (`pread`), none of which writes file
+//! data, and it has no `mmap` write path.
 //!
 //! The weaker option (c) exists as [`power::simulate_power_loss_modelled`]
 //! for platforms where the shim cannot run. **It is not used on this

@@ -5,9 +5,7 @@
 use std::ops::ControlFlow;
 
 use super::super::MergeChain;
-use super::{
-    DbSlice, LookupKey, MemTable, NodeRef, Ordering, VALUE_TYPE_MERGE, decode_internal_key,
-};
+use super::{DbSlice, LookupKey, MemTable, NodeRef, VALUE_TYPE_MERGE, decode_internal_key};
 
 /// Visits one entry of a key in a memtable: its node, sequence and value type.
 pub(crate) trait VisitNode<'mem, R>:
@@ -132,11 +130,9 @@ impl MemTable {
         {
             return true;
         }
-        self.range_tombstone_bytes.load(Ordering::Acquire) != 0
+        self.has_range_tombstones()
             && self
                 .range_tombstones
-                .lock()
-                .iter()
                 .any(|rt| rt.start.as_slice() <= last && first < rt.end.as_slice())
     }
 

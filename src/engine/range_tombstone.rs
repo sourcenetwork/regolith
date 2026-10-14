@@ -71,12 +71,6 @@ impl RangeTombstoneSet {
         }
     }
 
-    pub(crate) fn push(&mut self, tombstone: RangeTombstone) {
-        self.tombstones.push(tombstone);
-        sort_dedup_tombstones(&mut self.tombstones);
-        self.prefix_max_end = build_prefix_max_end(&self.tombstones);
-    }
-
     pub(crate) fn is_empty(&self) -> bool {
         self.tombstones.is_empty()
     }

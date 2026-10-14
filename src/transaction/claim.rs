@@ -19,10 +19,12 @@
 //! after the winner took the list stays in it, and the owner takes it at the
 //! end of the transaction.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
-use super::callbacks::{AbortReason, OnAbort, survive};
+use super::TransactionHooks;
+use super::callbacks::{AbortReason, OnAbort, survive_after};
 use super::handoff::Handoff;
+use super::lock_table::LockOwner;
 use crate::engine::RegolithEngine;
 use crate::portability::{AtomicU8, Ordering};
 
@@ -35,6 +37,9 @@ pub(crate) struct Claim {
     pub(crate) id: u64,
     state: AtomicU8,
     on_abort: Handoff<OnAbort>,
+    /// The name a pessimistic transaction's key locks carry, once it has
+    /// one: `close` releases the locks of the transactions it aborts.
+    lock_owner: OnceLock<Arc<LockOwner>>,
 }
 
 impl Claim {
@@ -50,11 +55,22 @@ impl Claim {
             id: engine.open_transactions().next_id(),
             state: AtomicU8::new(if committing { COMMITTING } else { OPEN }),
             on_abort: Handoff::default(),
+            lock_owner: OnceLock::new(),
         });
         if !committing && !engine.is_closed() {
             engine.open_transactions().insert(Arc::clone(&claim));
         }
         claim
+    }
+
+    /// Record the name the transaction's key locks carry.
+    pub(super) fn hold_locks_of(&self, owner: Arc<LockOwner>) {
+        let _ = self.lock_owner.set(owner);
+    }
+
+    /// The name the transaction's key locks carry, if it took any.
+    pub(crate) fn lock_owner(&self) -> Option<&Arc<LockOwner>> {
+        self.lock_owner.get()
     }
 
     fn win(&self, to: u8) -> bool {
@@ -92,29 +108,42 @@ impl Claim {
     }
 
     /// Run the `on_abort` callbacks still registered, oldest first, each at
-    /// most once: this call took them, so no other thread has them.
-    pub(super) fn run_callbacks(&self, engine: &RegolithEngine, reason: &AbortReason<'_>) {
+    /// most once: this call took them, so no other thread has them. A panic
+    /// is reported to `report`'s listeners.
+    pub(super) fn run_callbacks(&self, report: Option<&RegolithEngine>, reason: &AbortReason<'_>) {
         for f in self.on_abort.take() {
-            survive(engine, "on_abort", || f(reason));
+            survive_after(report, "on_abort", || f(reason));
         }
     }
 
     /// What an abort owes: the transaction's `on_abort` callbacks, then the
-    /// database hook's. The one function the owner and `close` both call.
-    pub(super) fn run_abort(&self, engine: &RegolithEngine, reason: &AbortReason<'_>) {
-        self.run_callbacks(engine, reason);
-        if let Some(hooks) = engine.transaction_hooks() {
-            survive(engine, "TransactionHooks::on_abort", || {
+    /// database hook's. The one function the owner, a ticket's delivery and
+    /// `close` all call.
+    pub(super) fn run_abort(
+        &self,
+        report: Option<&RegolithEngine>,
+        hooks: Option<&std::sync::Arc<dyn TransactionHooks>>,
+        reason: &AbortReason<'_>,
+    ) {
+        self.run_callbacks(report, reason);
+        if let Some(hooks) = hooks {
+            survive_after(report, "TransactionHooks::on_abort", || {
                 hooks.on_abort(reason)
             });
         }
     }
 
     /// `close` ends the transaction if it is still open, on the closing
-    /// thread.
-    pub(crate) fn abort_for_close(&self, engine: &RegolithEngine) {
-        if self.abort() {
-            self.run_abort(engine, &AbortReason::Closed);
+    /// thread. `true` when this call ended it.
+    pub(crate) fn abort_for_close(&self, engine: &RegolithEngine) -> bool {
+        let won = self.abort();
+        if won {
+            self.run_abort(
+                Some(engine),
+                engine.transaction_hooks(),
+                &AbortReason::Closed,
+            );
         }
+        won
     }
 }

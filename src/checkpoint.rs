@@ -18,24 +18,24 @@
 //!
 //! # Atomicity
 //!
-//! The implementation briefly holds the engine write-lock to flush
-//! the active memtable into an L0 SSTable and compact the live
-//! manifest. The lock is released before any files are linked.
-//! Because the captured version pins every referenced SSTable
-//! against concurrent compaction reclamation, writers running in
-//! parallel with [`Checkpoint::create`] cannot race a file unlink or
-//! tear the checkpoint.
+//! The job first drains the memtables into L0 tables, with nothing
+//! held that compaction needs. It then holds the compaction gate alone
+//! while it rewrites the manifest, captures the version and links the
+//! tables that version names, so no compaction can unlink one of them
+//! under the links. Writers run in parallel throughout: what they write
+//! after the drain is not in the checkpoint, and cannot tear it.
 
 use std::path::Path;
 
-use crate::engine::CheckpointSnapshot;
+use crate::engine::compaction_gate::Exclusive;
+use crate::engine::{CheckpointSnapshot, RegolithEngine};
 use crate::env::{Env, WriteMode};
-use crate::{Db, Error, Result};
+use crate::{Db, Error, JobTicket, Result};
 
 /// A handle to a [`Db`] prepared for checkpointing. The handle itself
 /// captures no engine state - the actual flush, version snapshot,
 /// and filesystem work all happen inside [`Checkpoint::create`] under
-/// a single held compaction lock, so dropping the `Checkpoint`
+/// a single held compaction gate, so dropping the `Checkpoint`
 /// without calling `create` is free.
 pub struct Checkpoint<'db> {
     db: &'db Db,
@@ -47,7 +47,10 @@ impl<'db> Checkpoint<'db> {
         Ok(Self { db })
     }
 
-    /// Materialize the checkpoint in `target_dir`.
+    /// Materialize the checkpoint in `target_dir`, as a job: the call
+    /// returns a [`JobTicket`] at once, as [`Db::checkpoint`] does, and the
+    /// job runs on the compaction worker, or on this thread's queue, or, with
+    /// neither, before this returns.
     ///
     /// Atomically:
     /// 1. Flushes the active memtable into an L0 SSTable.
@@ -57,18 +60,18 @@ impl<'db> Checkpoint<'db> {
     /// 4. Hard-links every captured SSTable into `target_dir/sst/`.
     /// 5. Copies the compacted manifest into `target_dir/MANIFEST`.
     ///
-    /// The engine's compaction lock is held for steps 2-5 so no
+    /// The engine's compaction gate is held for steps 2-5 so no
     /// concurrent compaction can unlink a referenced file mid-copy.
-    /// It is released as soon as `create` returns - so dropping the
-    /// [`Checkpoint`] or the source [`Db`] after the call cannot
+    /// It is released as soon as the job finishes - so dropping the
+    /// [`Checkpoint`] or the source [`Db`] after the ticket is ready cannot
     /// deadlock.
     ///
     /// The target directory is created (recursively) if it does not
     /// exist. Fails if the target already contains a non-empty
     /// `sst/` directory, if a hard-link attempt crosses filesystems,
     /// or if the target path cannot be written.
-    pub fn create<P: AsRef<Path>>(&self, target_dir: P) -> Result<()> {
-        self.create_inner(target_dir.as_ref(), |_| {})
+    pub fn create<P: AsRef<Path>>(&self, target_dir: P) -> JobTicket {
+        self.db.checkpoint(target_dir)
     }
 
     /// [`Checkpoint::create`] with a hook that runs after the capture
@@ -83,33 +86,78 @@ impl<'db> Checkpoint<'db> {
         target_dir: P,
         after_capture: impl FnOnce(&Db),
     ) -> Result<()> {
-        self.create_inner(target_dir.as_ref(), after_capture)
+        create_inner(self.db.engine(), target_dir.as_ref(), || {
+            after_capture(self.db)
+        })
     }
+}
 
-    fn create_inner(&self, target_dir: &Path, after_capture: impl FnOnce(&Db)) -> Result<()> {
+/// What a checkpoint job does before it takes the compaction gate, on the
+/// thread that runs it: ready the target directory, and drain the memtables
+/// so every write acknowledged so far is in a table.
+pub(crate) fn prepare(engine: &RegolithEngine, target_dir: &Path) -> Result<()> {
+    let target_sst = target_dir.join("sst");
+    let target_wal = target_dir.join("wal");
+
+    let env = engine.env();
+    env.create_dir_all(&target_sst).map_err(Error::from)?;
+    env.create_dir_all(&target_wal).map_err(Error::from)?;
+
+    // One entry is enough to know, so the walk stops at the first.
+    let occupied = env
+        .read_dir(&target_sst)
+        .and_then(|mut walk| walk.next().transpose())
+        .map_err(Error::from)?
+        .is_some();
+    if occupied {
+        return Err(Error::Io(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "checkpoint target sst directory is not empty",
+        )));
+    }
+    engine.checkpoint_drain().map_err(Error::from)
+}
+
+/// What a checkpoint job does holding the compaction gate alone, after
+/// [`prepare`]: capture the version and its manifest, link every table it
+/// names into `target_dir`, and write the manifest there. The gate is
+/// released when this returns.
+pub(crate) fn capture_into(
+    engine: &RegolithEngine,
+    gate: Exclusive,
+    target_dir: &Path,
+) -> Result<()> {
+    capture_into_between(engine, gate, target_dir, || {})
+}
+
+/// A whole checkpoint on this thread, waiting here for the gate, with a hook
+/// between the capture and the copy.
+#[cfg(test)]
+fn create_inner(
+    engine: &RegolithEngine,
+    target_dir: &Path,
+    after_capture: impl FnOnce(),
+) -> Result<()> {
+    prepare(engine, target_dir)?;
+    let gate = engine.compaction_gate().exclusive().map_err(Error::from)?;
+    capture_into_between(engine, gate, target_dir, after_capture)
+}
+
+fn capture_into_between(
+    engine: &RegolithEngine,
+    gate: Exclusive,
+    target_dir: &Path,
+    after_capture: impl FnOnce(),
+) -> Result<()> {
+    {
         let target_sst = target_dir.join("sst");
-        let target_wal = target_dir.join("wal");
+        let env = engine.env();
 
-        let env = self.db.engine().env();
-        env.create_dir_all(&target_sst).map_err(Error::from)?;
-        env.create_dir_all(&target_wal).map_err(Error::from)?;
-
-        if !env.read_dir(&target_sst).map_err(Error::from)?.is_empty() {
-            return Err(Error::Io(std::io::Error::new(
-                std::io::ErrorKind::AlreadyExists,
-                "checkpoint target sst directory is not empty",
-            )));
-        }
-
-        // `checkpoint_capture` holds the compaction lock for the
-        // lifetime of the returned snapshot, so the captured file
-        // set cannot be unlinked while we hard-link it. The
-        // snapshot is a local - it drops before `create` returns,
-        // releasing the lock without outlasting this function.
-        // Keeping the lock scoped this way is what lets a caller
-        // safely call `db.close()` or `drop(db)` after `create`.
-        let snapshot = self.db.engine().checkpoint_capture().map_err(Error::from)?;
-        after_capture(self.db);
+        // The snapshot holds the compaction gate for its lifetime, so the
+        // captured file set cannot be unlinked while it is hard-linked. It
+        // is a local: it drops before this returns, releasing the gate.
+        let snapshot = engine.checkpoint_capture(gate).map_err(Error::from)?;
+        after_capture();
 
         for level in &snapshot.version.levels {
             for file in level {
@@ -190,7 +238,7 @@ mod tests {
         let payload = vec![0u8; 512];
         for i in 0..32 {
             let key = format!("__flush_{}_{:04}", tag, i);
-            db.put(key.as_bytes(), &payload).unwrap();
+            crate::through_stalls(|| db.put(key.as_bytes(), &payload)).unwrap();
         }
     }
 
@@ -201,7 +249,7 @@ mod tests {
         let db = Db::open(src_dir.path(), Options::default()).unwrap();
 
         let cp = Checkpoint::new(&db).unwrap();
-        cp.create(tgt_dir.path()).unwrap();
+        cp.create(tgt_dir.path()).wait().unwrap();
         drop(db);
 
         let reopened = Db::open(tgt_dir.path(), Options::default()).unwrap();
@@ -219,7 +267,7 @@ mod tests {
         db.put(b"c", b"3").unwrap();
 
         let cp = Checkpoint::new(&db).unwrap();
-        cp.create(tgt_dir.path()).unwrap();
+        cp.create(tgt_dir.path()).wait().unwrap();
 
         // Source DB stays alive through the reopen.
         let reopened = Db::open(tgt_dir.path(), Options::default()).unwrap();
@@ -239,18 +287,18 @@ mod tests {
 
         for i in 0..200 {
             let k = format!("key_{:05}", i);
-            db.put(k.as_bytes(), k.as_bytes()).unwrap();
+            crate::through_stalls(|| db.put(k.as_bytes(), k.as_bytes())).unwrap();
         }
         force_flush(&db, "a");
-        db.compact_range(None, None).unwrap();
+        db.compact_range(None, None).wait().unwrap();
 
         // Add a few memtable-only writes after the compaction to
         // exercise the flush-before-capture path.
-        db.put(b"post_1", b"pv1").unwrap();
-        db.put(b"post_2", b"pv2").unwrap();
+        crate::through_stalls(|| db.put(b"post_1", b"pv1")).unwrap();
+        crate::through_stalls(|| db.put(b"post_2", b"pv2")).unwrap();
 
         let cp = Checkpoint::new(&db).unwrap();
-        cp.create(tgt_dir.path()).unwrap();
+        cp.create(tgt_dir.path()).wait().unwrap();
 
         let reopened = Db::open(tgt_dir.path(), Options::default()).unwrap();
         for i in 0..200 {
@@ -290,7 +338,7 @@ mod tests {
         }
 
         let cp = Checkpoint::new(&db).unwrap();
-        cp.create(tgt_dir.path()).unwrap();
+        cp.create(tgt_dir.path()).wait().unwrap();
 
         let reopened = Db::open(tgt_dir.path(), no_background_flush()).unwrap();
         for i in 0..200u64 {
@@ -318,7 +366,7 @@ mod tests {
         db.delete_range(b"k_0010", b"k_0020").unwrap();
 
         let cp = Checkpoint::new(&db).unwrap();
-        cp.create(tgt_dir.path()).unwrap();
+        cp.create(tgt_dir.path()).wait().unwrap();
 
         let reopened = Db::open(tgt_dir.path(), no_background_flush()).unwrap();
         for i in 0..50u64 {
@@ -343,7 +391,7 @@ mod tests {
             db.put(format!("k{i:04}").as_bytes(), b"v").unwrap();
         }
 
-        let snapshot = db.engine().checkpoint_capture().unwrap();
+        let snapshot = db.engine().checkpoint_capture_here().unwrap();
         drop(snapshot);
 
         assert!(
@@ -356,7 +404,7 @@ mod tests {
     /// The manifest a checkpoint writes must describe exactly the
     /// SSTables it hardlinked.
     ///
-    /// The capture holds the compaction lock, but a concurrent flush
+    /// The capture holds the compaction gate, but a concurrent flush
     /// takes only the version lock, so it can append records naming
     /// files the checkpoint will not copy. Worse, the manifest is
     /// rewritten once it grows past a multiple of its canonical size, so
@@ -393,7 +441,7 @@ mod tests {
         for _ in 0..8 {
             let tgt = TempDir::new().unwrap();
             let cp = Checkpoint::new(&db).unwrap();
-            cp.create(tgt.path()).unwrap();
+            cp.create(tgt.path()).wait().unwrap();
 
             let reopened = Db::open(tgt.path(), Options::default()).unwrap();
             for i in 0..300u64 {
@@ -413,7 +461,7 @@ mod tests {
     /// A manifest rewrite landing between the capture and the copy must
     /// not change what the checkpoint writes.
     ///
-    /// The capture holds the compaction lock, but a flush takes only the
+    /// The capture holds the compaction gate, but a flush takes only the
     /// version lock, and a rewrite replaces the manifest file wholesale.
     /// Re-reading the path at copy time would then pick up a *different*
     /// manifest, and truncating it at a length measured against the old
@@ -483,7 +531,7 @@ mod tests {
         }
 
         let cp = Checkpoint::new(&db).unwrap();
-        cp.create(tgt_dir.path()).unwrap();
+        cp.create(tgt_dir.path()).wait().unwrap();
 
         let copied: std::collections::HashSet<_> = std::fs::read_dir(tgt_dir.path().join("sst"))
             .unwrap()
@@ -513,7 +561,7 @@ mod tests {
 
         for i in 0..50 {
             let k = format!("seed_{:03}", i);
-            db.put(k.as_bytes(), k.as_bytes()).unwrap();
+            crate::through_stalls(|| db.put(k.as_bytes(), k.as_bytes())).unwrap();
         }
 
         let stop = Arc::new(AtomicBool::new(false));
@@ -525,7 +573,7 @@ mod tests {
                 let mut batch = WriteBatch::new();
                 let k = format!("live_{:06}", i);
                 batch.put(k.as_bytes(), k.as_bytes());
-                writer_db.write(batch).unwrap();
+                crate::through_stalls(|| writer_db.write(batch.clone())).unwrap();
                 i += 1;
             }
             i
@@ -534,7 +582,7 @@ mod tests {
         // Let the writer make some progress, then take a checkpoint.
         for _ in 0..5 {
             let cp = Checkpoint::new(&db).unwrap();
-            cp.create(tgt_dir.path()).unwrap();
+            cp.create(tgt_dir.path()).wait().unwrap();
             // Reset target for the next iteration.
             std::fs::remove_dir_all(tgt_dir.path()).unwrap();
             std::fs::create_dir_all(tgt_dir.path()).unwrap();
@@ -542,13 +590,13 @@ mod tests {
 
         // Final checkpoint we'll actually open.
         let cp = Checkpoint::new(&db).unwrap();
-        cp.create(tgt_dir.path()).unwrap();
+        cp.create(tgt_dir.path()).wait().unwrap();
 
         stop.store(true, Ordering::Relaxed);
         let _total_writes = writer.join().unwrap();
 
         // Source survives and is still usable.
-        db.put(b"after_checkpoint", b"ok").unwrap();
+        crate::through_stalls(|| db.put(b"after_checkpoint", b"ok")).unwrap();
         assert_eq!(db.get(b"after_checkpoint").unwrap(), Some(b"ok".to_vec()));
 
         // Checkpoint opens cleanly and contains the seed data it
@@ -568,12 +616,12 @@ mod tests {
 
         for i in 0..100 {
             let k = format!("dur_{:04}", i);
-            db.put(k.as_bytes(), k.as_bytes()).unwrap();
+            crate::through_stalls(|| db.put(k.as_bytes(), k.as_bytes())).unwrap();
         }
         force_flush(&db, "x");
 
         let cp = Checkpoint::new(&db).unwrap();
-        cp.create(tgt_dir.path()).unwrap();
+        cp.create(tgt_dir.path()).wait().unwrap();
 
         db.close().unwrap();
         drop(db);
