@@ -145,7 +145,11 @@ impl RegolithEngine {
             // the ones above both it and the floor are visited.
             let above = floor.max(max_rt_seq);
             let visit = |seq: u64, value_type: u8, value: DbSlice| match value_type {
-                VALUE_TYPE_MERGE if operator.is_none_or(|op| op.touches(key, &value, parts)) => {
+                VALUE_TYPE_MERGE
+                    if operator.is_none_or(|op| {
+                        super::super::merge_call::touches(op, key, &value, parts)
+                    }) =>
+                {
                     ControlFlow::Break(Decisive::Operand { seq })
                 }
                 VALUE_TYPE_MERGE => ControlFlow::Continue(()),
@@ -313,7 +317,7 @@ mod tests {
                         continue;
                     }
                     Op::Compact => {
-                        db.compact_range(None, None).unwrap();
+                        db.compact_range(None, None).wait().unwrap();
                         continue;
                     }
                 }

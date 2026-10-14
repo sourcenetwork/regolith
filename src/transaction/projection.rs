@@ -11,7 +11,7 @@
 //! `get_parts` is a plain read and is validated as the level validates any
 //! read.
 
-use crate::sync::internal::Mutex;
+use kovan::Atom;
 
 use super::{
     Arc, AtomicBool, DEFAULT_CF_ID, DbSlice, IsolationLevel, KeyState, Ordering, Transaction,
@@ -23,12 +23,30 @@ use super::{
 const INLINE: usize = 8;
 
 /// A sorted set of part ids.
+#[derive(Clone)]
 enum PartSet {
     Inline { len: u8, ids: [u32; INLINE] },
     Heap(Vec<u32>),
 }
 
 impl PartSet {
+    const EMPTY: Self = Self::Inline {
+        len: 0,
+        ids: [0; INLINE],
+    };
+
+    /// This set and `parts`.
+    fn with(&self, parts: &[u32]) -> Self {
+        let mut wider = self.clone();
+        parts.iter().for_each(|part| wider.insert(*part));
+        wider
+    }
+
+    fn holds_all(&self, parts: &[u32]) -> bool {
+        let held = self.as_slice();
+        parts.iter().all(|part| held.binary_search(part).is_ok())
+    }
+
     fn as_slice(&self) -> &[u32] {
         match self {
             Self::Inline { len, ids } => &ids[..usize::from(*len)],
@@ -63,30 +81,31 @@ pub(super) struct Projection {
     /// narrows again.
     full: AtomicBool,
     /// The parts read. Meaningless once `full`.
-    //
-    // vertexia: a mutex, taken only by `get_parts` and the commit, on a set a
-    // handful of ids long; a lock-free append list if one projected key is
-    // ever read from many threads at once.
-    parts: Mutex<PartSet>,
+    ///
+    /// A transaction is shared between threads, so two of them can read one
+    /// key by parts at once. The set is never changed in place: a read that
+    /// adds parts builds the wider set and installs it by compare-and-swap
+    /// over the one it was built from, and builds again when another read
+    /// got there first. So no read's parts are lost, and none waits.
+    parts: Atom<PartSet>,
 }
 
 impl Projection {
     pub(super) fn new(parts: &[u32]) -> Self {
-        let projection = Self {
+        Self {
             full: AtomicBool::new(false),
-            parts: Mutex::new(PartSet::Inline {
-                len: 0,
-                ids: [0; INLINE],
-            }),
-        };
-        projection.widen(parts);
-        projection
+            parts: Atom::new(PartSet::EMPTY.with(parts)),
+        }
     }
 
     /// Add `parts` to the set.
     pub(super) fn widen(&self, parts: &[u32]) {
-        let mut held = self.parts.lock();
-        parts.iter().for_each(|part| held.insert(*part));
+        // A key read again by parts it was already read by, the usual case,
+        // installs nothing and allocates nothing.
+        if self.parts.peek(|held| held.holds_all(parts)) {
+            return;
+        }
+        self.parts.rcu(|held| held.with(parts));
     }
 
     /// The key was read in whole.
@@ -100,7 +119,7 @@ impl Projection {
         if self.full.load(Ordering::Acquire) {
             f(None)
         } else {
-            f(Some(self.parts.lock().as_slice()))
+            self.parts.peek(|held| f(Some(held.as_slice())))
         }
     }
 }
@@ -144,7 +163,87 @@ impl Transaction {
     /// under it, and regolith cannot see that. A key that does not hold
     /// the parts scheme the operator's `touches` understands should not be
     /// read this way.
+    ///
+    /// # After compaction
+    ///
+    /// The check can refuse a read it would have passed, never the reverse.
+    /// When a put and the operands committed after it are all newer than the
+    /// read and no snapshot lies between them, compaction folds them into one
+    /// put, which no longer says which parts those operands touched. From
+    /// then on the read is validated against the folded put as against any
+    /// put: it stands only if the folded value is exactly the bytes it read.
+    /// So a read that stood before the fold, because the put left the bytes
+    /// it read and the later operands touched other parts, is refused after
+    /// it. Operands with no put among them keep their answer when they are
+    /// folded, by the contract of `touches`.
+    ///
+    /// # Example
+    ///
+    /// `Fields` is the operator of the [`crate::MergeOperator::touches`]
+    /// example: a value is a stock level and a price, one byte each, and an
+    /// operand adds to one of them.
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    ///
+    /// use regolith::{
+    ///     IsolationLevel, OptimisticTransactionDb, Options, TransactionError, TxnOptions,
+    /// };
+    /// # use regolith::MergeOperator;
+    /// # const STOCK: u8 = 0;
+    /// # const PRICE: u8 = 1;
+    /// # struct Fields;
+    /// # impl MergeOperator for Fields {
+    /// #     fn name(&self) -> &'static str {
+    /// #         "fields"
+    /// #     }
+    /// #     fn full_merge(&self, _key: &[u8], base: Option<&[u8]>, operands: &[&[u8]]) -> Option<Vec<u8>> {
+    /// #         let mut fields: [u8; 2] = base.map_or(Some([0; 2]), |base| base.try_into().ok())?;
+    /// #         for &operand in operands {
+    /// #             let &[part, delta] = operand else { return None };
+    /// #             let field = fields.get_mut(usize::from(part))?;
+    /// #             *field = field.wrapping_add(delta);
+    /// #         }
+    /// #         Some(fields.to_vec())
+    /// #     }
+    /// #     fn touches(&self, _key: &[u8], operand: &[u8], parts: &[u32]) -> bool {
+    /// #         operand.first().is_none_or(|part| parts.contains(&u32::from(*part)))
+    /// #     }
+    /// # }
+    ///
+    /// let options = Options::memory().merge_operator(Some(Arc::new(Fields)));
+    /// let db = OptimisticTransactionDb::open("items", options)?
+    ///     .with_isolation(IsolationLevel::DefraLevel);
+    /// db.db().put(b"item", &[10, 50])?;
+    /// let price = [u32::from(PRICE)];
+    ///
+    /// // The whole value comes back, and the decision rests on the price:
+    /// // stock that arrives before the commit is no conflict.
+    /// let txn = db.begin(&TxnOptions::new());
+    /// let item = txn.get_parts(b"item", &price)?.expect("the item exists");
+    /// assert_eq!(item, [10, 50]);
+    /// db.db().merge(b"item", &[STOCK, 5])?;
+    /// txn.put(b"quote", &item[1..])?;
+    /// txn.commit()?;
+    ///
+    /// // A read that found nothing decided on the key's absence, which any
+    /// // write of the key ends.
+    /// let txn = db.begin(&TxnOptions::new());
+    /// assert!(txn.get_parts(b"new-item", &price)?.is_none());
+    /// db.db().merge(b"new-item", &[STOCK, 1])?;
+    /// txn.put(b"quote", b"none")?;
+    /// assert!(matches!(txn.commit(), Err(TransactionError::Conflict(_))));
+    ///
+    /// // Naming no parts reads the value and validates nothing.
+    /// let txn = db.begin(&TxnOptions::new());
+    /// txn.get_parts(b"item", &[])?;
+    /// db.db().merge(b"item", &[PRICE, 5])?;
+    /// txn.put(b"note", b"seen")?;
+    /// txn.commit()?;
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     pub fn get_parts(&self, key: &[u8], parts: &[u32]) -> TxResult<Option<DbSlice>> {
+        let _scope = self.read_scope();
         if !self.projects() {
             return self.get_slice(key);
         }
@@ -213,5 +312,42 @@ mod tests {
     #[test]
     fn no_parts_is_an_empty_set_not_a_whole_read() {
         assert_eq!(parts(&Projection::new(&[])), Some(Vec::new()));
+    }
+
+    /// Threads reading one key by different parts at the same moment: every
+    /// part any of them read is in the set afterwards. A widening that
+    /// overwrote the set it did not build on would drop another thread's.
+    #[test]
+    fn reads_of_one_key_from_several_threads_lose_no_part() {
+        const THREADS: u32 = 4;
+        // Enough parts each to pass the inline ids, so the set changes shape
+        // under the race too. Fewer rounds under miri, which is far slower.
+        const EACH: u32 = 5;
+        for round in 0..if cfg!(miri) { 20 } else { 2_000u32 } {
+            let projection = Projection::new(&[]);
+            let start = std::sync::Barrier::new(THREADS as usize);
+            std::thread::scope(|scope| {
+                for thread in 0..THREADS {
+                    let (projection, start) = (&projection, &start);
+                    scope.spawn(move || {
+                        start.wait();
+                        for i in 0..EACH {
+                            // One part at a time and all at once, in turn.
+                            let part = thread * EACH + i;
+                            if (round + i) % 2 == 0 {
+                                projection.widen(&[part]);
+                            } else {
+                                projection.widen(&[part, thread * EACH]);
+                            }
+                        }
+                    });
+                }
+            });
+            assert_eq!(
+                parts(&projection),
+                Some((0..THREADS * EACH).collect::<Vec<_>>()),
+                "round {round}"
+            );
+        }
     }
 }

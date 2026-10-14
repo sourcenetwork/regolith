@@ -1,3 +1,5 @@
+#![cfg(not(target_arch = "wasm32"))]
+
 use regolith::{Db, IngestOptions, Options, SstFileWriter};
 use tempfile::TempDir;
 
@@ -30,6 +32,7 @@ fn no_writers_at_all() {
                 ..IngestOptions::default()
             },
         )
+        .wait()
         .unwrap();
         let missing: Vec<usize> = (0..64)
             .filter(|i| {
@@ -67,7 +70,7 @@ fn one_plain_write_between_ingests() {
     let db = Db::open(dir.path(), opts.clone()).unwrap();
 
     for batch in 0..5usize {
-        db.put(format!("plain{batch}").as_bytes(), b"p").unwrap();
+        regolith::through_stalls(|| db.put(format!("plain{batch}").as_bytes(), b"p")).unwrap();
         let path = staging.path().join(format!("ing_{batch}.sst"));
         build(&path, batch, &opts);
         db.ingest_external_files(
@@ -77,6 +80,7 @@ fn one_plain_write_between_ingests() {
                 ..IngestOptions::default()
             },
         )
+        .wait()
         .unwrap();
         for i in 0..64 {
             let k = format!("ing_{batch:04}_{i:03}");
@@ -109,6 +113,7 @@ fn cold_cache_per_ingest() {
                 ..IngestOptions::default()
             },
         )
+        .wait()
         .unwrap();
         db.close().unwrap();
     }

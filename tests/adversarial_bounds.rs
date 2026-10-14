@@ -6,12 +6,13 @@
 //! staged group and rotates once per group, so this file measures what
 //! the active memtable actually reaches rather than assuming the bound
 //! holds.
+#![cfg(not(target_arch = "wasm32"))]
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::thread;
 
-use regolith::{Db, OptimisticTransactionDb, Options, TxnOptions, WriteBatch};
+use regolith::{Db, OptimisticTransactionDb, Options, TransactionError, TxnOptions, WriteBatch};
 use tempfile::TempDir;
 
 fn active_bytes(db: &Db) -> u64 {
@@ -54,7 +55,7 @@ fn a_single_writer_keeps_the_active_memtable_near_its_budget() {
 
     let mut peak = 0u64;
     for i in 0..20_000 {
-        db.put(format!("k{i:08}").as_bytes(), &[b'v'; 128]).unwrap();
+        regolith::through_stalls(|| db.put(format!("k{i:08}").as_bytes(), &[b'v'; 128])).unwrap();
         peak = peak.max(active_bytes(&db));
     }
     println!(
@@ -172,7 +173,7 @@ fn measure_with(
                 for k in 0..batch_ops {
                     batch.put(format!("w{w:02}_{round:05}_{k:03}").as_bytes(), &value);
                 }
-                db.write(batch).unwrap();
+                regolith::through_stalls(|| db.write(batch.clone())).unwrap();
             }
         }));
     }
@@ -193,9 +194,10 @@ fn measure_with(
 /// measured in a db whose `write_buffer_size` is large enough that this one
 /// batch can never trigger a rotation.
 ///
-/// This is the same quantity `admit_from_ring` bounds a group's overshoot
-/// by: the first ticket is always admitted whatever it costs, so the active
-/// memtable holds at most `write_buffer_size` plus one request. Measuring it
+/// This is the quantity the rotation check of a write's turn bounds the
+/// active memtable's overshoot by: a write whose turn comes with the
+/// memtable below `write_buffer_size` goes in whatever it costs, so the
+/// active memtable holds at most that size plus one request. Measuring it
 /// in-process rather than hard-coding a byte count cancels the per-entry
 /// arena overhead (node header, tower, internal key, alignment), which
 /// differs by allocator and platform, out of the bound that uses it.
@@ -211,7 +213,7 @@ fn one_request_cost(batch_ops: usize, value_len: usize) -> u64 {
     for k in 0..batch_ops {
         batch.put(format!("w00_00000_{k:03}").as_bytes(), &value);
     }
-    db.write(batch).unwrap();
+    regolith::through_stalls(|| db.write(batch.clone())).unwrap();
     active_bytes(&db)
 }
 
@@ -221,10 +223,10 @@ fn one_request_cost(batch_ops: usize, value_len: usize) -> u64 {
 /// Three structural bounds, none of them wall-clock:
 ///
 /// * `peak_active <= write_buffer_size + 2 * one_request_cost`, exactly the
-///   overshoot [`Options::write_buffer_size`] documents and exactly what
-///   `admit_from_ring` implements (admission stops once `projected >= room`,
-///   the first ticket is always admitted, `run_group` rotates before it
-///   applies).
+///   overshoot [`Options::write_buffer_size`] documents and what the
+///   rotation check implements (a write whose turn comes with the memtable
+///   at the size rotates before it is decided; one whose turn comes below
+///   it goes in whatever it costs).
 /// * `peak_all <= max_write_buffer_number * (write_buffer_size +
 ///   2 * one_request_cost)`, the same claim over every live memtable.
 /// * `peak_reserved <= documented_high_water(&opts)`, the same bound the
@@ -342,7 +344,7 @@ fn optimistic_transactions_do_not_lose_conflicts_under_group_commit() {
         )
         .unwrap(),
     );
-    tdb.db().put(b"counter", b"0").unwrap();
+    regolith::through_stalls(|| tdb.db().put(b"counter", b"0")).unwrap();
 
     let committed = Arc::new(AtomicUsize::new(0));
     let conflicts = Arc::new(AtomicUsize::new(0));
@@ -365,8 +367,13 @@ fn optimistic_transactions_do_not_lose_conflicts_under_group_commit() {
                     Ok(_) => {
                         committed.fetch_add(1, Ordering::Relaxed);
                     }
-                    Err(_) => {
+                    Err(TransactionError::Conflict(_)) => {
                         conflicts.fetch_add(1, Ordering::Relaxed);
+                    }
+                    // Counted as a conflict, any other failure would pass
+                    // unseen: it applied nothing, so the totals still agree.
+                    Err(other) => {
+                        panic!("a commit failed for a reason other than a conflict: {other}")
                     }
                 }
             }
@@ -434,7 +441,7 @@ fn a_batch_larger_than_the_group_cap_stays_atomic() {
     for k in 0..width {
         batch.put(format!("huge_{k:05}").as_bytes(), &[b'h'; 512]);
     }
-    db.write(batch).unwrap();
+    regolith::through_stalls(|| db.write(batch.clone())).unwrap();
     stop.store(true, Ordering::Relaxed);
     reader.join().unwrap();
 
@@ -473,7 +480,7 @@ fn closing_under_concurrent_writers_never_hangs_or_lies() {
         handles.push(thread::spawn(move || {
             for i in 0..4_000usize {
                 let key = format!("c{w:02}_{i:05}");
-                if db.put(key.as_bytes(), b"v").is_ok() {
+                if regolith::through_stalls(|| db.put(key.as_bytes(), b"v")).is_ok() {
                     acknowledged.lock().unwrap().push(key);
                 } else {
                     break;

@@ -207,14 +207,21 @@ fn bump(db: &dyn TxnDb, key: &[u8]) -> Attempts {
     acc
 }
 
-fn fan_out(threads: usize, body: impl Fn(usize) -> Attempts + Sync) -> Attempts {
+/// Run `body` on `threads` threads from a common start, and return what they
+/// did with the wall time from that start until the last one is done.
+fn fan_out(threads: usize, body: impl Fn(usize) -> Attempts + Sync) -> (Attempts, Duration) {
+    let line = common::start::StartLine::new(threads);
     std::thread::scope(|scope| {
         let handles: Vec<_> = (0..threads)
             .map(|t| {
-                let body = &body;
-                scope.spawn(move || body(t))
+                let (body, line) = (&body, &line);
+                scope.spawn(move || {
+                    line.wait();
+                    body(t)
+                })
             })
             .collect();
+        let start = line.start();
         let mut total = Attempts::default();
         for h in handles {
             total.add(
@@ -222,7 +229,7 @@ fn fan_out(threads: usize, body: impl Fn(usize) -> Attempts + Sync) -> Attempts 
                     .unwrap_or_else(|_| panic!("worker thread panicked")),
             );
         }
-        total
+        (total, start.elapsed())
     })
 }
 
@@ -248,7 +255,7 @@ impl Race {
 }
 
 fn counter_race(db: &dyn TxnDb) -> Race {
-    let attempts = fan_out(RACE_THREADS, |_| {
+    let (attempts, _) = fan_out(RACE_THREADS, |_| {
         let mut acc = Attempts::default();
         for _ in 0..RACE_INCREMENTS {
             acc.add(bump(db, COUNTER_KEY));
@@ -331,15 +338,14 @@ fn hot_key(n: u64) -> Vec<u8> {
 /// Every thread walks the same small key set from a different starting
 /// offset, so each round has all eight threads overlapping.
 fn contended_rate(db: &dyn TxnDb, per_thread: u64) -> (f64, Attempts) {
-    let start = Instant::now();
-    let attempts = fan_out(CONTENDED_THREADS, |t| {
+    let (attempts, elapsed) = fan_out(CONTENDED_THREADS, |t| {
         let mut acc = Attempts::default();
         for i in 0..per_thread {
             acc.add(bump(db, &hot_key(t as u64 + i)));
         }
         acc
     });
-    (rate(attempts.commits, start.elapsed()), attempts)
+    (rate(attempts.commits, elapsed), attempts)
 }
 
 struct Timing {

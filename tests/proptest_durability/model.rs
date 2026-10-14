@@ -18,7 +18,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use regolith::{Db, DurabilityMode, MergeOperator, Options, WriteBatch};
+use regolith::{Db, DurabilityMode, MergeOperator, Options, WriteBatch, through_stalls};
 
 // ── the model ──────────────────────────────────────────────────
 
@@ -46,10 +46,10 @@ pub(crate) type Model = BTreeMap<Vec<u8>, Vec<u8>>;
 
 pub(crate) fn apply_to_db(db: &Db, op: &Op) -> regolith::Result<()> {
     match op {
-        Op::Single(Unit::Put(k, v)) => db.put(k, v),
-        Op::Single(Unit::Delete(k)) => db.delete(k),
-        Op::Single(Unit::DeleteRange(s, e)) => db.delete_range(s, e),
-        Op::Single(Unit::Merge(k, o)) => db.merge(k, o),
+        Op::Single(Unit::Put(k, v)) => through_stalls(|| db.put(k, v)),
+        Op::Single(Unit::Delete(k)) => through_stalls(|| db.delete(k)),
+        Op::Single(Unit::DeleteRange(s, e)) => through_stalls(|| db.delete_range(s, e)),
+        Op::Single(Unit::Merge(k, o)) => through_stalls(|| db.merge(k, o)),
         Op::Batch(units) => {
             let mut batch = WriteBatch::new();
             for unit in units {
@@ -60,9 +60,9 @@ pub(crate) fn apply_to_db(db: &Db, op: &Op) -> regolith::Result<()> {
                     Unit::Merge(k, o) => batch.merge(k, o),
                 }
             }
-            db.write(batch)
+            through_stalls(|| db.write(batch.clone()))
         }
-        Op::Compact => db.compact_range(None, None),
+        Op::Compact => db.compact_range(None, None).wait(),
     }
 }
 

@@ -158,7 +158,9 @@ fn compact_only(spec: &ChildSpec) {
         manual_compaction_opts(spec.write_buffer_size),
     )
     .expect("child: open db");
-    db.compact_range(None, None).expect("child: compact_range");
+    db.compact_range(None, None)
+        .wait()
+        .expect("child: compact_range");
     db.close().expect("child: close");
 }
 
@@ -257,7 +259,7 @@ fn immediate_durability_loses_no_acknowledged_write_at_any_cut_point() {
 
         match fault::recover_and_validate(&db, write_buffered_opts(1 << 20), &out.history) {
             Recovery::Recovered(r) => {
-                fault::assert_acked_survived(&r, &out.acked);
+                fault::assert_acked_survived(&r, &out.acked());
                 summary.push(format!(
                     "kill at WAL write {nth}: acked {}, recovered prefix {}",
                     out.acked_count(),
@@ -450,7 +452,7 @@ fn a_power_cut_during_a_memtable_flush_keeps_every_acknowledged_write() {
     let (out, report) = cut_power_inside_flush(&db, 3);
 
     match fault::recover_and_validate(&db, write_buffered_opts(8 * 1024), &out.history) {
-        Recovery::Recovered(r) => fault::assert_acked_survived(&r, &out.acked),
+        Recovery::Recovered(r) => fault::assert_acked_survived(&r, &out.acked()),
         Recovery::RefusedToOpen(e) => panic!(
             "a power cut inside a flush left a database that refuses to open, after {} \
              acknowledged writes: {e}\n{}",
@@ -500,7 +502,7 @@ fn a_power_cut_during_the_first_memtable_flush_keeps_every_acknowledged_write() 
     let (out, report) = cut_power_inside_flush(&db, 1);
 
     match fault::recover_and_validate(&db, write_buffered_opts(8 * 1024), &out.history) {
-        Recovery::Recovered(r) => fault::assert_acked_survived(&r, &out.acked),
+        Recovery::Recovered(r) => fault::assert_acked_survived(&r, &out.acked()),
         Recovery::RefusedToOpen(e) => {
             let salvage = tmp.path().join("salvage");
             fault::copy_tree(&db, &salvage);
@@ -567,7 +569,7 @@ fn a_power_cut_during_a_compaction_keeps_every_write_it_was_merging() {
         for i in 0..KEYS {
             let key = format!("key_{:06}", (i * STRIDE) % KEYS).into_bytes();
             let value = fault::garbage(i as u64, 128);
-            d.put(&key, &value).expect("fill put");
+            regolith::through_stalls(|| d.put(&key, &value)).expect("fill put");
             history.put(key, value);
         }
         d.close().expect("close after fill");
@@ -688,7 +690,7 @@ fn a_power_cut_during_a_manifest_append_keeps_every_acknowledged_write() {
     );
 
     match fault::recover_and_validate(&db, write_buffered_opts(8 * 1024), &out.history) {
-        Recovery::Recovered(r) => fault::assert_acked_survived(&r, &out.acked),
+        Recovery::Recovered(r) => fault::assert_acked_survived(&r, &out.acked()),
         Recovery::RefusedToOpen(e) => panic!(
             "a power cut inside a MANIFEST append left a database that refuses to open, \
              after {} acknowledged writes: {e}\n{}",
@@ -738,7 +740,7 @@ fn a_power_cut_during_recovery_from_an_earlier_cut_loses_nothing_more() {
         "the first cut discarded nothing\n{}",
         first_report.summary(),
     );
-    let acked = first.acked.clone();
+    let acked = first.acked();
     assert!(!acked.is_empty(), "the first run acknowledged no write");
 
     // Recover a copy, so the yardstick is measured without disturbing the
@@ -905,7 +907,7 @@ fn a_write_batch_is_all_or_nothing_at_every_cut_point() {
                     r.k,
                 );
                 if cut == CutPoint::End {
-                    fault::assert_acked_survived(&r, &out.acked);
+                    fault::assert_acked_survived(&r, &out.acked());
                 }
             }
             Recovery::RefusedToOpen(e) => {

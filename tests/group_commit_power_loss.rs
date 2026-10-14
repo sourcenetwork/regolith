@@ -1,21 +1,25 @@
-//! Optimistic transactions committed in shared groups across a power cut.
+//! Optimistic transactions whose commits share syncs of the log, across a
+//! power cut.
 //!
 //! The workload runs in a child process under the `LD_PRELOAD` shim: several
 //! threads commit optimistic transactions that each bump one shared counter
-//! (read through `get_for_update`, so concurrent commits conflict, inside a
-//! group as across groups) and write a pair of keys of their own. The child
+//! (read through `get_for_update`, so concurrent commits conflict, whether
+//! or not one sync covers them) and write a pair of keys of their own. The child
 //! dies at the nth write or fsync of the log, the directory is rebuilt as the
 //! filesystem would have left it, discarding every byte never synced, and the
 //! database is reopened. Small memtables make the run rotate logs and flush
 //! tables on the way.
 //!
 //! - Each transaction's writes survive together or not at all, whichever
-//!   group carried it and wherever the cut tore that group.
+//!   sync covered it and wherever the cut tore the log.
 //! - Each thread's surviving commits are a prefix of the commits it made.
 //! - The counter equals the number of surviving commits: no surviving commit
 //!   was lost under another, and none survived without its increment.
 //! - At Immediate every acknowledged commit survives; a commit is
-//!   acknowledged only once the fsync of its group returned.
+//!   acknowledged only once the fsync that covers it returned.
+//!
+//! Every run is made twice: plain, and encrypted at rest, where each commit
+//! is one sealed record (#266 x #265).
 //!
 //! # Linux only
 //!
@@ -26,8 +30,6 @@
 mod common;
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::OpenOptions;
-use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -35,6 +37,7 @@ use std::time::Duration;
 use common::fault::{
     self, ChildOutcome, ChildSpec, CrashRun, CutPoint, Phase, PowerLossOptions, TearMode, Trigger,
 };
+use common::keys::Keys;
 use regolith::DurabilityMode;
 use regolith::prelude::*;
 use tempfile::TempDir;
@@ -57,14 +60,16 @@ fn dispatch(spec: &ChildSpec) {
     }
 }
 
-fn open(path: &Path, durability: DurabilityMode) -> OptimisticTransactionDb {
-    OptimisticTransactionDb::open(
-        path,
-        Options::default()
-            .durability(durability)
-            .write_buffer_size(4 * 1024),
-    )
-    .unwrap()
+fn open(path: &Path, durability: DurabilityMode, encrypted: bool) -> OptimisticTransactionDb {
+    let options = Options::default()
+        .durability(durability)
+        .write_buffer_size(4 * 1024);
+    let options = if encrypted {
+        options.key_provider(Keys::new(&[1]))
+    } else {
+        options
+    };
+    OptimisticTransactionDb::open(path, options).unwrap()
 }
 
 fn number(bytes: Option<Vec<u8>>) -> u64 {
@@ -76,17 +81,11 @@ fn pair_key(t: usize, i: usize, half: &str) -> Vec<u8> {
 }
 
 fn pairs_child(spec: &ChildSpec) {
-    let db = Arc::new(open(&spec.db_path, spec.durability));
+    let db = Arc::new(open(&spec.db_path, spec.durability, spec.encrypted));
     let handles: Vec<_> = (0..THREADS)
         .map(|t| {
             let db = Arc::clone(&db);
-            // One unbuffered write per acknowledgement, so a kill a
-            // microsecond later cannot lose the record of what was told.
-            let mut acks = OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&spec.ack_path)
-                .unwrap();
+            let mut acks = fault::Acks::open(&spec.ack_path);
             let commits = spec.ops;
             std::thread::spawn(move || {
                 for i in 0..commits {
@@ -103,7 +102,7 @@ fn pairs_child(spec: &ChildSpec) {
                             Err(other) => panic!("child: commit: {other}"),
                         }
                     }
-                    acks.write_all(format!("{t} {i}\n").as_bytes()).unwrap();
+                    acks.ack([t as u64, i as u64]);
                 }
             })
         })
@@ -119,11 +118,13 @@ fn crash_and_cut(
     trigger: Trigger,
     tear: TearMode,
     commits: usize,
+    encrypted: bool,
 ) -> (TempDir, ChildOutcome) {
     let dir = TempDir::new().unwrap();
     let spec = ChildSpec::new(Phase::Custom(PAIRS.to_string()), dir.path().join("db"))
         .ops(commits)
-        .durability(durability);
+        .durability(durability)
+        .encrypted(encrypted);
     let out = CrashRun::new(spec)
         .trigger(trigger)
         .timeout(CHILD_TIMEOUT)
@@ -135,7 +136,7 @@ fn crash_and_cut(
 }
 
 fn check_recovered(out: &ChildOutcome, durability: DurabilityMode, commits: usize) {
-    let db = open(&out.spec.db_path, durability);
+    let db = open(&out.spec.db_path, durability, out.spec.encrypted);
     let mut survived: BTreeMap<usize, BTreeSet<usize>> = BTreeMap::new();
     for t in 0..THREADS {
         for i in 0..commits {
@@ -166,10 +167,8 @@ fn check_recovered(out: &ChildOutcome, durability: DurabilityMode, commits: usiz
         "the counter must count exactly the surviving commits"
     );
     if durability == DurabilityMode::Immediate {
-        let acked = std::fs::read_to_string(&out.spec.ack_path).unwrap_or_default();
-        for line in acked.lines() {
-            let (t, i) = line.split_once(' ').unwrap();
-            let (t, i) = (t.parse::<usize>().unwrap(), i.parse::<usize>().unwrap());
+        for [t, i] in out.acks.of() {
+            let (t, i) = (t as usize, i as usize);
             assert!(
                 survived.get(&t).is_some_and(|done| done.contains(&i)),
                 "acknowledged commit {i} of thread {t} was lost"
@@ -186,20 +185,60 @@ fn check_recovered(out: &ChildOutcome, durability: DurabilityMode, commits: usiz
 }
 
 const TEARS: [TearMode; 2] = [TearMode::Truncate, TearMode::TornSector];
-/// Commits per writer. A group holds at most one commit of each of the
-/// `THREADS` writers, so this many commits per writer make at least this many
-/// log writes and log fsyncs: enough for every cut below to fire.
+/// Commits per writer. A writer makes its next commit only once the last is
+/// durable, so one sync covers at most one commit of each of the `THREADS`
+/// writers, and this many commits per writer make at least this many log
+/// writes and log fsyncs: enough for every cut below to fire.
 const COMMITS: usize = 100;
+/// Plain, then encrypted at rest.
+const SEALED: [bool; 2] = [false, true];
 
 #[test]
 fn a_power_cut_keeps_whole_transactions_and_every_acknowledged_one_at_immediate() {
-    for nth in [3, 15, 40, 90] {
-        for tear in TEARS {
+    for encrypted in SEALED {
+        for nth in [3, 15, 40, 90] {
+            for tear in TEARS {
+                let (_dir, out) = crash_and_cut(
+                    DurabilityMode::Immediate,
+                    Trigger::wal_write(nth),
+                    tear,
+                    COMMITS,
+                    encrypted,
+                );
+                check_recovered(&out, DurabilityMode::Immediate, COMMITS);
+            }
+        }
+    }
+}
+
+#[test]
+fn a_power_cut_keeps_whole_transactions_at_eventual() {
+    for encrypted in SEALED {
+        for nth in [3, 40, 90] {
+            for tear in TEARS {
+                let (_dir, out) = crash_and_cut(
+                    DurabilityMode::Eventual,
+                    Trigger::wal_write(nth),
+                    tear,
+                    COMMITS,
+                    encrypted,
+                );
+                check_recovered(&out, DurabilityMode::Eventual, COMMITS);
+            }
+        }
+    }
+}
+
+#[test]
+fn a_power_cut_at_a_group_fsync_keeps_every_commit_it_acknowledged() {
+    for encrypted in SEALED {
+        for nth in [2, 10, 30] {
             let (_dir, out) = crash_and_cut(
                 DurabilityMode::Immediate,
-                Trigger::wal_write(nth),
-                tear,
+                Trigger::wal_fsync(nth),
+                TearMode::Truncate,
                 COMMITS,
+                encrypted,
             );
             check_recovered(&out, DurabilityMode::Immediate, COMMITS);
         }
@@ -207,45 +246,20 @@ fn a_power_cut_keeps_whole_transactions_and_every_acknowledged_one_at_immediate(
 }
 
 #[test]
-fn a_power_cut_keeps_whole_transactions_at_eventual() {
-    for nth in [3, 40, 90] {
-        for tear in TEARS {
-            let (_dir, out) = crash_and_cut(
-                DurabilityMode::Eventual,
-                Trigger::wal_write(nth),
-                tear,
-                COMMITS,
-            );
-            check_recovered(&out, DurabilityMode::Eventual, COMMITS);
-        }
-    }
-}
-
-#[test]
-fn a_power_cut_at_a_group_fsync_keeps_every_commit_it_acknowledged() {
-    for nth in [2, 10, 30] {
-        let (_dir, out) = crash_and_cut(
-            DurabilityMode::Immediate,
-            Trigger::wal_fsync(nth),
-            TearMode::Truncate,
-            COMMITS,
-        );
-        check_recovered(&out, DurabilityMode::Immediate, COMMITS);
-    }
-}
-
-#[test]
 fn the_clean_run_lands_every_commit() {
-    let dir = TempDir::new().unwrap();
-    let spec = ChildSpec::new(Phase::Custom(PAIRS.to_string()), dir.path().join("db"))
-        .ops(10)
-        .durability(DurabilityMode::Immediate);
-    let out = CrashRun::new(spec).trigger(Trigger::None).run();
-    out.assert_clean();
-    check_recovered(&out, DurabilityMode::Immediate, 10);
-    let db = open(&out.spec.db_path, DurabilityMode::Immediate);
-    assert_eq!(
-        number(db.db().get(b"counter").unwrap()),
-        THREADS as u64 * 10 + 1
-    );
+    for encrypted in SEALED {
+        let dir = TempDir::new().unwrap();
+        let spec = ChildSpec::new(Phase::Custom(PAIRS.to_string()), dir.path().join("db"))
+            .ops(10)
+            .durability(DurabilityMode::Immediate)
+            .encrypted(encrypted);
+        let out = CrashRun::new(spec).trigger(Trigger::None).run();
+        out.assert_clean();
+        check_recovered(&out, DurabilityMode::Immediate, 10);
+        let db = open(&out.spec.db_path, DurabilityMode::Immediate, encrypted);
+        assert_eq!(
+            number(db.db().get(b"counter").unwrap()),
+            THREADS as u64 * 10 + 1
+        );
+    }
 }

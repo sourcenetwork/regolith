@@ -1,32 +1,32 @@
-//! Optimistic transactions share commit groups (E10, `GroupCommit.tla`),
-//! through the public API, with the first group made certain instead of left
-//! to the scheduler.
+//! Optimistic transactions decided together in the commit pipeline (E10,
+//! `CommitPipeline.tla`), through the public API, with the first overlap
+//! made certain instead of left to the scheduler.
 //!
 //! Many threads run read-modify-write transactions over a few hot keys at
 //! Immediate durability. The history is then checked against a run of the
 //! committed transactions one at a time in receipt order: every value a
 //! committed transaction read through `get_for_update` is the value that run
-//! holds at its turn, and the database ends where that run ends. A group that
-//! let a member commit over an earlier member's write would show a read the
-//! serial run contradicts (RED ViewOnly), and a lost update would show in the
-//! final counters.
+//! holds at its turn, and the database ends where that run ends. A slot
+//! decided without the writes of the commits before it would show a read the
+//! serial run contradicts (RED PassBeforeApply), and a lost update would
+//! show in the final counters.
 //!
-//! Threads started together share a group only by luck: on one or two cores,
-//! or on a filesystem whose fsync returns at once, each commit can finish
-//! before the next begins. So the pipeline is held, as a leader in the middle
-//! of a group holds it, until every thread's first commit is queued behind
-//! it. The ring only says whether it is full, so plain filler writes take
-//! every slot the threads do not, and a full ring means every thread is
-//! queued. The fillers go first and fill whole groups, so the threads' first
-//! commits land in one group together, on any core count and any filesystem.
+//! Threads started together overlap only by luck: on one or two cores, or on
+//! a filesystem whose fsync returns at once, each commit can finish before
+//! the next begins. So the round, the one claim on the log's device step, is
+//! held, as a thread in the middle of a sync holds it, until every thread's
+//! first commit is decided: each is then in the ring, validated against the
+//! ones before it, and waits behind the round. When the round is let go, one
+//! sync covers them all, on any core count and any filesystem.
 
 use std::collections::BTreeMap;
-use std::time::Instant;
+use std::sync::Arc;
+use std::thread;
 
 use tempfile::TempDir;
 
-use super::*;
-use crate::column_family::{DEFAULT_CF_ID, prefix_key};
+use super::overlap_tests::wait_until_decided;
+use crate::statistics::Ticker;
 use crate::{
     IsolationLevel, OptimisticTransactionDb, Options, Statistics, TransactionError, TxnOptions,
 };
@@ -75,54 +75,9 @@ impl Rng {
     }
 }
 
-/// Plain writes of other keys, queued as parked writers would queue them, in
-/// every ring slot the threads will not take. Eventual, so they ask for no
-/// fsync of their own.
-fn fill_ring_but(engine: &RegolithEngine, free: usize) -> Vec<Arc<WriteSlot>> {
-    let fillers = engine.commit_ring.capacity() - free;
-    assert_eq!(
-        fillers % MAX_GROUP_MEMBERS,
-        MAX_GROUP_MEMBERS - free,
-        "setup: the fillers leave the last group exactly the threads' {free} places"
-    );
-    (0..fillers)
-        .map(|i| {
-            let slot = Arc::new(WriteSlot::new());
-            slot.arm(WriteRequest::Put {
-                key: prefix_key(DEFAULT_CF_ID, format!("filler/{i:05}").as_bytes()),
-                value: b"f".to_vec(),
-                durability: DurabilityMode::Eventual,
-                disable_wal: false,
-            })
-            .expect("a fresh slot arms");
-            engine
-                .commit_ring
-                .push(Arc::clone(&slot))
-                .map_err(|_| "ring full")
-                .unwrap();
-            slot
-        })
-        .collect()
-}
-
-/// Wait, with a deadline and a bounded backoff, until the commit ring is
-/// full: the fillers and one ticket per thread.
-fn wait_until_every_thread_is_queued(engine: &RegolithEngine) {
-    let deadline = Instant::now() + Duration::from_secs(60);
-    let mut pause = Duration::from_micros(50);
-    while !engine.commit_ring.is_full() {
-        assert!(
-            Instant::now() < deadline,
-            "the threads never queued behind the held pipeline"
-        );
-        thread::sleep(pause);
-        pause = (pause * 2).min(Duration::from_millis(20));
-    }
-}
-
-/// Whichever thread's commit comes first in the group, some other thread's
-/// first transaction reads neither key the first one writes, so at least two
-/// of the first commits succeed in that one group.
+/// Whichever thread's commit is decided first, some other thread's first
+/// transaction reads neither key the first one writes, so at least two of
+/// the first commits succeed and wait for the same sync.
 fn assert_two_first_commits_can_share() {
     let pairs: Vec<(usize, usize)> = (0..THREADS).map(|t| Rng::of_thread(t).pair()).collect();
     for (first, &(written, _)) in pairs.iter().enumerate() {
@@ -152,11 +107,13 @@ fn run_once(isolation: IsolationLevel) -> u64 {
         .unwrap(),
     );
     let engine = Arc::clone(&db.db().engine);
+    let pipe = engine.pipe().unwrap();
+    let before = pipe.ring.decided();
 
-    // Held as a leader holds it while its group is written and synced: a
-    // commit that arrives cannot lead, so it queues its ticket and parks.
-    let held = engine.pipeline.lock();
-    let fillers = fill_ring_but(&engine, THREADS);
+    // Held as a thread holds it while it syncs: a commit that arrives is
+    // decided, and then waits for the round, as does a transaction that
+    // lost a conflict, whose answer comes in ring order.
+    let held = engine.hold_round(pipe, super::park::Help::Wait);
     let handles: Vec<_> = (0..THREADS)
         .map(|t| {
             let db = Arc::clone(&db);
@@ -195,11 +152,11 @@ fn run_once(isolation: IsolationLevel) -> u64 {
             })
         })
         .collect();
-    wait_until_every_thread_is_queued(&engine);
+    wait_until_decided(pipe, before + THREADS as u64);
     assert_eq!(
         stats.get_ticker(Ticker::CommitCount),
         0,
-        "nothing commits while the pipeline is held"
+        "no commit returns while the round is held"
     );
     drop(held);
 
@@ -207,9 +164,6 @@ fn run_once(isolation: IsolationLevel) -> u64 {
         .into_iter()
         .flat_map(|h| h.join().expect("a writer panicked"))
         .collect();
-    for filler in &fillers {
-        assert!(filler.is_done(), "a filler write was never committed");
-    }
     history.sort_by_key(|c| c.seq);
     assert!(
         history.windows(2).all(|w| w[0].seq < w[1].seq),
@@ -241,24 +195,24 @@ fn run_once(isolation: IsolationLevel) -> u64 {
     stats.get_ticker(Ticker::WalSyncCount)
 }
 
-/// The run is checked against the serial run, and its first commits, queued
-/// behind the held pipeline, share one group's fsync.
+/// The run is checked against the serial run, and its first commits,
+/// decided behind the held round, share one fsync.
 fn run(isolation: IsolationLevel) {
     let commits = (THREADS * COMMITS_PER_THREAD) as u64;
     let fsyncs = run_once(isolation);
     assert!(
         fsyncs < commits,
         "{commits} Immediate commits by {THREADS} threads took {fsyncs} fsyncs: \
-         no commit ever shared a group"
+         no commit ever shared an fsync"
     );
 }
 
 #[test]
-fn concurrent_transactions_in_groups_equal_a_serial_run_in_commit_order() {
+fn concurrent_transactions_decided_together_equal_a_serial_run_in_commit_order() {
     run(IsolationLevel::SnapshotIsolation);
 }
 
 #[test]
-fn serializable_transactions_in_groups_equal_a_serial_run_in_commit_order() {
+fn serializable_transactions_decided_together_equal_a_serial_run_in_commit_order() {
     run(IsolationLevel::Serializable);
 }

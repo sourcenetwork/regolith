@@ -6,7 +6,8 @@
 //! caller then polls the `Statistics` object (via
 //! [`Statistics::get_ticker`], [`Statistics::get_histogram_snapshot`],
 //! or [`Statistics::to_string`]) to export the values to their
-//! monitoring stack of choice.
+//! monitoring stack of choice. A caller that kept only the database
+//! reads the same object back with [`crate::Db::statistics`].
 //!
 //! # Metric names
 //!
@@ -55,24 +56,29 @@ use crate::portability::{AtomicU64, Ordering};
 #[repr(usize)]
 #[non_exhaustive]
 pub enum Ticker {
-    /// Total key + value bytes written to the memtable. Counts
-    /// raw user bytes; does not include internal encoding
-    /// overhead, the CF prefix, or WAL framing.
+    /// Key and value bytes of the writes that committed: the key and
+    /// the value of each put and the key of each delete. Counts raw
+    /// user bytes; does not include internal encoding overhead, the
+    /// CF prefix, or WAL framing.
+    ///
+    /// This and the four counters of operations below count a write
+    /// once it has committed, whichever call made it: a put, a write
+    /// batch, a column family's call, a transaction's commit. A write
+    /// that failed, was refused or lost a conflict adds nothing.
     BytesWritten = 0,
     /// Total value bytes returned from point lookups that found
     /// a live value.
     BytesRead = 1,
-    /// Number of successful `put` operations routed through
-    /// `apply_batch`.
+    /// Number of puts that committed.
     KeysWritten = 2,
     /// Number of `get` calls (including lookups that returned
     /// `None`).
     KeysRead = 3,
-    /// Number of `delete` operations.
+    /// Number of deletes that committed.
     KeysDeleted = 4,
-    /// Number of range-delete operations.
+    /// Number of range deletes that committed.
     RangeDeletesWritten = 5,
-    /// Number of merge operands written.
+    /// Number of merge operands that committed.
     MergesWritten = 6,
     /// Block cache hits (the block was already resident).
     BlockCacheHit = 7,
@@ -82,7 +88,9 @@ pub enum Ticker {
     /// populated the cache).
     BlockCacheAdd = 9,
     /// Bloom-filter "useful" hits - the filter correctly
-    /// answered "not present" and spared a block read.
+    /// answered "not present" and spared a block read. Counts a point
+    /// lookup a table's key filter ruled out, and a table a prefix seek's
+    /// prefix filter ruled out.
     BloomFilterUseful = 10,
     /// Bloom-filter "full positive" hits - the filter said
     /// "maybe", and the key was actually present in the block.
@@ -105,9 +113,13 @@ pub enum Ticker {
     IterSeekCount = 19,
     /// Number of `Iter::next` calls that produced a key.
     IterNextCount = 20,
-    /// Microseconds writers spent in write-stall waits that admitted the
-    /// write: plain writes and transactional commits that carry writes
-    /// alike. A wait that ends in a busy or closed error is not counted.
+    /// Microseconds threads spent held by a write stall: relieving it
+    /// inline, or blocked until it cleared (a commit that waits a stop out,
+    /// [`crate::StallWait::wait`]).
+    ///
+    /// A wait that is polled or awaited on a queue holds no thread and is
+    /// not counted, nor is inline relief that ends in a busy or closed
+    /// error.
     WriteStallMicros = 21,
     /// Number of snapshots registered via `Db::snapshot`.
     SnapshotsRegistered = 22,
@@ -163,9 +175,40 @@ pub enum Ticker {
     /// Bytes discarded from the end of the MANIFEST at open, summed over the
     /// discards [`Ticker::ManifestTailDiscarded`] counts.
     ManifestTailDiscardedBytes = 35,
+    /// Blocks the block cache refused to keep because every block its hand
+    /// could take was held by a reader (or by another insert's hand), so
+    /// keeping one more would pass the byte budget. The read that loaded the
+    /// block still uses it, uncached. A steady count means the cache is too
+    /// small for the blocks readers hold at once.
+    BlockCacheAddRefusedHeld = 36,
+    /// The subset of [`Ticker::CommitConflicts`] where the newer write
+    /// that decided the race was a delete or a range delete: a key the
+    /// transaction read or wrote was removed after its snapshot. It says
+    /// what the newer write was, where [`Ticker::CommitConflictsOnRead`]
+    /// and [`Ticker::CommitConflictsOnWrite`] say what the transaction
+    /// did with the key, so one conflict can count here and there. A
+    /// key deleted and then put again counts as a conflict with the put.
+    CommitConflictsAfterDelete = 37,
+    /// Tables an open moved to level 0 because an earlier release had left
+    /// their level with overlapping key ranges, which a level below 0
+    /// cannot hold. The data is unchanged, and the open is logged once. A
+    /// read-write open records the move, so the next open counts nothing;
+    /// a read-only open moves them in its own view, every time.
+    ManifestTablesDemoted = 38,
+    /// Compaction jobs run because more than half of the entries they read
+    /// were deletions and the entries those delete. Each is also counted in
+    /// [`Ticker::CompactionCount`]. Level and universal compaction only.
+    CompactionDeletionTriggered = 39,
+    /// Range deletes an open copied in front of every key because an
+    /// earlier release may have left them behind older keys they delete,
+    /// where a read would find the older key first. The data is unchanged,
+    /// and the open is logged once. A read-write open records that it
+    /// checked, so the next open counts nothing; a read-only open copies
+    /// them in its own view, every time.
+    ManifestRangeDeletesCopied = 40,
 }
 
-const NUM_TICKERS: usize = 36;
+const NUM_TICKERS: usize = 41;
 
 impl Ticker {
     /// Every defined ticker, in discriminant order. Adding a variant
@@ -207,6 +250,11 @@ impl Ticker {
         Ticker::WalRemoveFailed,
         Ticker::ManifestTailDiscarded,
         Ticker::ManifestTailDiscardedBytes,
+        Ticker::BlockCacheAddRefusedHeld,
+        Ticker::CommitConflictsAfterDelete,
+        Ticker::ManifestTablesDemoted,
+        Ticker::CompactionDeletionTriggered,
+        Ticker::ManifestRangeDeletesCopied,
     ];
 
     /// Stable string name for exporting to monitoring systems.
@@ -248,6 +296,11 @@ impl Ticker {
             Ticker::WalRemoveFailed => "regolith.wal.remove_failed",
             Ticker::ManifestTailDiscarded => "regolith.manifest.tail_discarded",
             Ticker::ManifestTailDiscardedBytes => "regolith.manifest.tail_discarded_bytes",
+            Ticker::BlockCacheAddRefusedHeld => "regolith.block_cache.add_refused_held",
+            Ticker::CommitConflictsAfterDelete => "regolith.commit.conflicts_after_delete",
+            Ticker::ManifestTablesDemoted => "regolith.manifest.tables_demoted",
+            Ticker::CompactionDeletionTriggered => "regolith.compaction.deletion_triggered",
+            Ticker::ManifestRangeDeletesCopied => "regolith.manifest.range_deletes_copied",
         }
     }
 }
@@ -275,8 +328,8 @@ pub enum Histogram {
     FlushTime = 5,
     /// Bytes returned per `Db::get` that found a live value.
     BytesPerRead = 6,
-    /// Total bytes applied per `Db::write` (keys + values across
-    /// every op in the batch).
+    /// Bytes per write that committed (a put, a batch, a commit):
+    /// what that write added to [`Ticker::BytesWritten`].
     BytesPerWrite = 7,
     /// Wall-clock microseconds to append a batch to the WAL
     /// (including fsync when durability is Immediate).

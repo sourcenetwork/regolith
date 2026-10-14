@@ -97,6 +97,7 @@ fn a_writer_commits_while_an_ingest_copies_its_file() {
         *handle.borrow_mut() = Some(spawned);
     });
     db.ingest_external_files(&[path], IngestOptions::default())
+        .wait()
         .unwrap();
     let spawned = writer.borrow_mut().take().expect("the hook ran");
     spawned.join().unwrap().unwrap();
@@ -117,7 +118,9 @@ fn a_memtable_holding_a_key_of_the_range_is_flushed_before_the_table_installs() 
     let before = db.snapshot();
     let path = source(dir.path(), "s.sst", &[(b"j", b"new"), (b"k", b"new")]);
 
-    db.ingest_external_files(&[path], ingest_opts()).unwrap();
+    db.ingest_external_files(&[path], ingest_opts())
+        .wait()
+        .unwrap();
 
     assert_eq!(
         db.get_int_property("regolith.num-entries-active-mem-table"),
@@ -139,6 +142,7 @@ fn a_memtable_holding_no_key_of_the_range_is_not_flushed() {
     let path = source(dir.path(), "s.sst", &[(b"m", b"new"), (b"n", b"new")]);
 
     db.ingest_external_files(&[path], IngestOptions::default())
+        .wait()
         .unwrap();
 
     assert_eq!(
@@ -168,6 +172,7 @@ fn a_range_tombstone_in_a_memtable_reaching_the_range_counts_as_a_key_of_it() {
     let path = source(dir.path(), "s.sst", &[(b"b", b"new")]);
 
     db.ingest_external_files(&[path], IngestOptions::default())
+        .wait()
         .unwrap();
 
     assert_eq!(
@@ -192,6 +197,7 @@ fn an_l0_table_whose_range_meets_the_file_but_holds_none_of_its_keys_lets_it_go_
     // [a, z] meets [m, n], but no key of the L0 table lies in it.
     let clear = source(dir.path(), "clear.sst", &[(b"m", b"new"), (b"n", b"new")]);
     db.ingest_external_files(&[clear], IngestOptions::default())
+        .wait()
         .unwrap();
     assert_eq!(files_at(&db, 0), 1);
     assert_eq!(files_at(&db, MAX_LEVELS - 1), 1);
@@ -201,6 +207,7 @@ fn an_l0_table_whose_range_meets_the_file_but_holds_none_of_its_keys_lets_it_go_
     db.flush().unwrap();
     let held = source(dir.path(), "held.sst", &[(b"o", b"new"), (b"p", b"new")]);
     db.ingest_external_files(&[held], IngestOptions::default())
+        .wait()
         .unwrap();
     assert_eq!(files_at(&db, 0), 3);
     assert_eq!(db.get(b"p").unwrap().as_deref(), Some(&b"new"[..]));
@@ -217,7 +224,7 @@ fn reads_iterators_and_snapshots_see_the_recorded_sequence() {
     for key in &keys {
         db.put(key, b"old").unwrap();
     }
-    db.compact_range(None, None).unwrap();
+    db.compact_range(None, None).wait().unwrap();
     let before = db.snapshot();
 
     let entries: Vec<(&[u8], &[u8])> = keys
@@ -226,7 +233,9 @@ fn reads_iterators_and_snapshots_see_the_recorded_sequence() {
         .map(|k| (k.as_slice(), &b"new"[..]))
         .collect();
     let path = source(dir.path(), "s.sst", &entries);
-    db.ingest_external_files(&[path], ingest_opts()).unwrap();
+    db.ingest_external_files(&[path], ingest_opts())
+        .wait()
+        .unwrap();
     assert_eq!(
         recorded_seqs(&db),
         vec![
@@ -315,7 +324,9 @@ fn a_table_stored_at_other_sequences_reads_at_the_recorded_one() {
             let before = db.snapshot();
             let path = dir.path().join("raw.sst");
             raw_source(&path, &keys, stored_seq, partitioned);
-            db.ingest_external_files(&[path], ingest_opts()).unwrap();
+            db.ingest_external_files(&[path], ingest_opts())
+                .wait()
+                .unwrap();
             let case = format!("partitioned {partitioned}, stored at {stored_seq}");
 
             for key in &keys {
@@ -347,13 +358,14 @@ fn a_transaction_that_read_a_key_before_an_ingest_replaced_it_conflicts() {
     let dir = TempDir::new().unwrap();
     let db = OptimisticTransactionDb::open(dir.path().join("db"), options()).unwrap();
     db.db().put(b"k", b"old").unwrap();
-    db.db().compact_range(None, None).unwrap();
+    db.db().compact_range(None, None).wait().unwrap();
 
     let txn = db.begin(&TxnOptions::new().isolation(IsolationLevel::SnapshotIsolation));
     assert_eq!(txn.get(b"k").unwrap().as_deref(), Some(&b"old"[..]));
     let path = source(dir.path(), "s.sst", &[(b"k", b"new")]);
     db.db()
         .ingest_external_files(&[path], ingest_opts())
+        .wait()
         .unwrap();
     txn.put(b"k", b"old, updated").unwrap();
     match txn.commit() {
@@ -376,11 +388,12 @@ fn compaction_writes_the_recorded_sequence_into_its_output_and_records_none() {
     db.flush().unwrap();
     let path = source(dir.path(), "s.sst", &[(b"k", b"new"), (b"l", b"new")]);
     db.ingest_external_files(&[path], IngestOptions::default())
+        .wait()
         .unwrap();
     let seq = db.latest_sequence();
     assert_eq!(recorded_seqs(&db), vec![(0, None), (0, Some(seq))]);
 
-    db.compact_range(None, None).unwrap();
+    db.compact_range(None, None).wait().unwrap();
 
     let version = db.engine.published_version();
     let mut seen = Vec::new();
@@ -413,12 +426,13 @@ fn an_ingested_table_reopens_and_checkpoints_at_its_recorded_sequence() {
     let db_path = dir.path().join("db");
     let db = Db::open(&db_path, options()).unwrap();
     db.put(b"k", b"old").unwrap();
-    db.compact_range(None, None).unwrap();
+    db.compact_range(None, None).wait().unwrap();
     let path = source(dir.path(), "s.sst", &[(b"k", b"new")]);
     db.ingest_external_files(&[path], IngestOptions::default())
+        .wait()
         .unwrap();
     let seq = db.latest_sequence();
-    db.checkpoint(dir.path().join("checkpoint")).unwrap();
+    db.checkpoint(dir.path().join("checkpoint")).wait().unwrap();
     db.close().unwrap();
     drop(db);
 
@@ -453,7 +467,10 @@ fn a_source_holding_a_key_twice_is_refused_and_leaves_nothing_behind() {
         .unwrap();
     writer.finish().unwrap().unwrap();
 
-    match db.ingest_external_files(&[path], IngestOptions::default()) {
+    match db
+        .ingest_external_files(&[path], IngestOptions::default())
+        .wait()
+    {
         Err(crate::Error::InvalidArgument(message)) => {
             assert!(
                 message.contains("more than one entry for a key"),
@@ -502,6 +519,7 @@ fn a_moved_file_is_linked_and_its_source_removed_and_a_copied_one_is_independent
             ..IngestOptions::default()
         },
     )
+    .wait()
     .unwrap();
     assert!(!moved.exists(), "a moved source is removed once installed");
 
@@ -509,6 +527,7 @@ fn a_moved_file_is_linked_and_its_source_removed_and_a_copied_one_is_independent
     // touching the table, which is why only a move is linked.
     let copied = source(dir.path(), "copied.sst", &[(b"c", b"copied")]);
     db.ingest_external_files(std::slice::from_ref(&copied), IngestOptions::default())
+        .wait()
         .unwrap();
     assert!(copied.exists());
     std::fs::write(&copied, b"rewritten in place").unwrap();
@@ -537,7 +556,7 @@ fn a_refused_install_unlinks_the_staged_file() {
         ingest_behind: true,
         ..IngestOptions::default()
     };
-    assert!(db.ingest_external_files(&[path], behind).is_err());
+    assert!(db.ingest_external_files(&[path], behind).wait().is_err());
     assert_eq!(
         tables(),
         1,
@@ -567,7 +586,9 @@ fn concurrent_ingests_of_files_with_the_same_layout_read_their_own_bytes() {
                         .map(|k| (k.as_slice(), value.as_bytes()))
                         .collect();
                     let path = source(&staging, &format!("t{t}r{round}.sst"), &entries);
-                    db.ingest_external_files(&[path], ingest_opts()).unwrap();
+                    db.ingest_external_files(&[path], ingest_opts())
+                        .wait()
+                        .unwrap();
                     for key in &keys {
                         assert_eq!(db.get(key).unwrap().as_deref(), Some(value.as_bytes()));
                     }

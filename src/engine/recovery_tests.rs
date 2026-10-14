@@ -105,7 +105,7 @@ fn framed_put(memtable: &MemTable, key: &[u8], seq: u64, size: usize) -> Vec<u8>
 fn recording_wal(path: &std::path::Path) -> (Wal, Arc<RecordingEnv>) {
     let recording = Arc::new(RecordingEnv::default());
     let env: Arc<dyn crate::env::Env> = recording.clone();
-    let wal = Wal::create_in(&env, path).unwrap();
+    let wal = Wal::create_in(&env, path, None).unwrap();
     *recording.events.lock().unwrap() = Recording::default();
     (wal, recording)
 }

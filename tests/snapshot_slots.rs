@@ -75,7 +75,8 @@ fn snapshots_dropped_on_other_threads_are_released_exactly() {
         worker.join().unwrap();
     }
     assert_eq!(live_snapshots(&db), 0);
-    assert_eq!(db.wait_for_snapshots(std::time::Duration::from_secs(5)), 0);
+    let readers = db.wait_for_snapshots();
+    assert_eq!(readers.wait(std::time::Duration::from_secs(5)), 0);
 }
 
 /// A snapshot taken on one thread, moved to another, keeps its version
@@ -94,7 +95,7 @@ fn a_moved_snapshot_keeps_its_version_through_compaction() {
     .unwrap();
     db.put(b"k", b"new").unwrap();
     db.flush().unwrap();
-    db.compact_range(None, None).unwrap();
+    db.compact_range(None, None).wait().unwrap();
     let seen = thread::spawn(move || {
         let value = snapshot.get(b"k").unwrap();
         drop(snapshot);
