@@ -266,6 +266,12 @@ impl WriteUnit {
         }
     }
 
+    /// Test-only: the notes on the claim that holds the unit now.
+    #[cfg(test)]
+    pub(super) fn notes(&self) -> u64 {
+        self.word.load(Ordering::Acquire) & NOTES
+    }
+
     /// Whether the claim `seen` still holds the unit.
     pub(super) fn holds(&self, seen: u64) -> bool {
         self.word.load(Ordering::Acquire) & !NOTES == seen & !NOTES

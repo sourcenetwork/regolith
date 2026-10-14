@@ -306,6 +306,16 @@ fn the_holder_that_lets_the_unit_go_wakes_the_writer_parked_behind_it() {
         waiter_parked
             .recv_timeout(DEADLINE)
             .expect("the writer never parked behind the holder");
+        // The hook fires before the park: the writer is let on only once
+        // its note is on the holder's claim, so the holder owes it a wake.
+        let deadline = std::time::Instant::now() + DEADLINE;
+        while pipe.writes.notes() & WANTED == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the writer's note never reached the holder's claim"
+            );
+            thread::yield_now();
+        }
         held_go.send(()).unwrap();
         waiter_writing
             .recv_timeout(DEADLINE)
