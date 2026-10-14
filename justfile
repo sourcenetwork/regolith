@@ -559,6 +559,10 @@ tla:
     check MC_SnapshotIsolation_Red_WriteFreeRefusedWhenLatched RED INV_LatchRefusesOnlyWrites
     check MC_SnapshotIsolation_Red_WriteFreeTakesSequence RED INV_WriteFreeTakesNoSequence
     check MC_SnapshotIsolation_Red_ReceiptAtHorizon    RED INV_WriteFreeReceipt
+    # A value read judged where it is placed: changed at the published point,
+    # restored by a commit decided and not yet visible, it is refused.
+    check MC_DefraLevel_Green_WriteFreeRestore         GREEN
+    check MC_DefraLevel_Red_JudgedAtDecidedOnly        RED INV_WriteFreeAtHorizon
     # Write-free scans: a validated range is checked at every level but under
     # DefraLevel's relaxation, a plain scan's keys at Serializable.
     check MC_Serializable_Green_WriteFreeScan          GREEN

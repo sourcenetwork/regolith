@@ -25,6 +25,16 @@
 \* append. RepeatableRead does not check what a scan returned, and lets it
 \* through.
 \*
+\* How the checks are run. TLC, the model checker, tries every order in which
+\* a handful of transactions can take their steps. A configuration file
+\* (MC_*.cfg) picks the transactions and the level and names the promises to
+\* check in every state. A GREEN configuration runs the rule as the engine
+\* has it, and TLC must find no order that breaks a promise. A RED one plants
+\* one bug (`Mutant`, see MUTANTS below) or runs a level that does not make a
+\* promise, and TLC must find an order that breaks exactly the promise it
+\* names. A RED shows that the GREEN's promise really rests on the line of
+\* the rule its bug removes.
+\*
 \* What this model shows: which level refuses which of these, for the
 \* workloads a Merkle-DAG CRDT store runs, and that DefraLevel (RepeatableRead
 \* with relaxations the caller declares key by key) refuses every stale
@@ -171,6 +181,12 @@
 \*                 only let it see more orders of events, never fewer, and
 \*                 the promoter's RED (Red_WriteFreePessimistic) needs none of
 \*                 the orders a lock would forbid.
+\*     (RestoreWorkload, a second small workload: the for-update reader, a
+\*     Bumper that puts B to 2 visible at once, and a Restorer that puts B back
+\*     to 1, decided before it is visible. With the restore decided and the
+\*     bump visible, B holds 1 with every decided commit counted and 2 at the
+\*     published point: the read must be refused, being placed at the
+\*     published point.)
 \*     SkewWriter  writes both keys, each either back to the value it holds
 \*                 (an identical rewrite) or one more. Its commit happens in
 \*                 two steps, decided first and published later (CommitWriting,
@@ -343,6 +359,10 @@
 \*                              checked. INV_WriteFreeCommits RED.
 \*   WriteFreeIgnoresRanges     a write-free commit skips its validated
 \*                              scans. INV_ScanDecisionsCurrent RED.
+\*   WriteFreeJudgedAtDecidedOnly  a read checked by value, parts or presence
+\*                              is judged with every decided commit counted
+\*                              and not at the published point.
+\*                              INV_WriteFreeAtHorizon RED (RestoreWorkload).
 \*   WriteFreeRefusedWhenLatched  a latched database refuses a write-free
 \*                              commit too (the 0.1.x engine).
 \*                              INV_LatchRefusesOnlyWrites RED.
@@ -394,8 +414,8 @@
 \* docs warn about (INV_NoReadOnlyAnomaly).
 \*
 \* THE WRITE-FREE COMMIT, PIECE BY PIECE AGAINST THE CODE (E50). Line numbers
-\* are those of the Rust files at commit f6ecd37 on perf/e50-readonly; the
-\* commits after it change only proofs and tests. Each entry says what the
+\* are those of the Rust files at commit b229c27 on perf/e50-readonly; the
+\* commits after it change only proofs and test comments. Each entry says what the
 \* model piece stands for in the running program, in everyday words, then
 \* where the program does it.
 \*
@@ -406,29 +426,37 @@
 \*       Transaction::commit_inner                        src/transaction.rs:2016-2018
 \*       Transaction::commit_nowait_inner                 src/transaction/nowait.rs:294-297
 \*   The write-free check, one step here.                 CommitWriteFree(t)
-\*       RegolithEngine::commit_write_free                src/engine/commit/write_free.rs:104-160
+\*       RegolithEngine::commit_write_free                src/engine/commit/write_free.rs:107-168
 \*     It asks only that the database is open, so a latched database commits it.
-\*       ensure_open (no latch branch but the planted bug) write_free.rs:109, src/engine/mod.rs:1158
+\*       ensure_open (no latch branch but the planted bug) write_free.rs:112, src/engine/mod.rs:1158
+\*     A commit with nothing to check (no read its level checks, no validated
+\*     scan) returns there, before it takes any point: it touches no other
+\*     commit's slot. In the model its KeptReads and ScanDecider are empty,
+\*     so the step commits whatever the points are: no point is needed.
+\*                                                        write_free.rs:115-117
 \*     It takes its two points: the published horizon (`published` here) and
-\*     the decided frontier (`clock` here). When a slot is decided and not
-\*     applied, it applies it first, as any helper of the pipeline does, so
-\*     the decided frontier counts it.
-\*       write_free_points, apply_decided                 write_free.rs:166-188, 194-207
+\*     the decided frontier. In this model the decided frontier is `clock`:
+\*     the newest sequence a decided commit took, which runs ahead of
+\*     `published` while a commit is decided and not yet visible (see the
+\*     variable's comment in RepeatableReadCommit.tla). When a slot is decided
+\*     and not applied, the check applies it first, as any helper of the
+\*     pipeline does, so the decided frontier counts it.
+\*       write_free_points, apply_decided                 write_free.rs:174-197, 203-216
 \*       (the pipeline's own apply: settle, src/engine/commit/pipeline.rs:671;
 \*        the decided frontier: last_decided_seq, src/engine/mod.rs:1254)
 \*     A read, or a validated scan, made at or after the decided frontier has
-\*     nothing over it and is not looked up.               write_free.rs:113-118
+\*     nothing over it and is not looked up.               write_free.rs:121-126
 \*     Each read the level checks (ReadCands, ReadDecider): refused when its
 \*     rule finds it stale with every decided commit counted; a read checked
 \*     by value, parts or presence is also judged at the published point.
-\*       write_free_read, stale_at                        write_free.rs:211-235, 240-262
+\*       write_free_read, stale_at                        write_free.rs:220-244, 249-271
 \*       (the rules themselves: read_changed, src/engine/commit/read_rules.rs:42)
 \*     Each validated scan (ScanCands, ScanDecider): refused by any write in
-\*     its range up to the decided frontier.                write_free.rs:133-158
+\*     its range up to the decided frontier.                write_free.rs:141-166
 \*       (written_in_range_of, src/engine/commit/range_rule.rs:47)
 \*     A refusal names the key, what the transaction did with it and the
-\*     newer write (Abort(t), ReasonOf(t)).                 write_free_conflict, write_free.rs:276
-\*     It takes no sequence: `clock` is unchanged.          write_free.rs:159, Ok { seq: None }
+\*     newer write (Abort(t), ReasonOf(t)).                 write_free_conflict, write_free.rs:285
+\*     It takes no sequence: `clock` is unchanged.          write_free.rs:167, Ok { seq: None }
 \*     Its receipt is its snapshot: receipt' = snap.        receipt_of, src/transaction.rs:2482
 \*   Which reads a level checks.                          KeptReads, ValidatedReads, ForUpdateKept
 \*       Every point read at RepeatableRead, Serializable and DefraLevel; at
@@ -457,13 +485,15 @@
 \*       request_commit's ensure_writable                    src/engine/commit/mod.rs:423 (engine/mod.rs:1170)
 \*
 \* Code steps with no step of their own here, and why none is needed:
-\*   - Taking the points before loading the view (write_free.rs:110, 121). A
+\*   - Taking the points before loading the view (write_free.rs:118, 129). A
 \*     commit is one step in the model, so nothing can land between the two;
 \*     the loom model `horizon_then_view` (tests/loom_read_view.rs) checks
-\*     that order, and `apply_then_frontier` the help-apply before the
-\*     decided frontier is read.
+\*     that order, `apply_then_frontier` the help-apply before the decided
+\*     frontier is read, and the Rust test
+\*     a_commit_published_just_before_the_points_is_not_missed the order on
+\*     the real engine.
 \*   - A version above a point refusing the read when a table holds a sequence
-\*     above that point (write_free.rs:250-260): the model keeps no tables, so
+\*     above that point (write_free.rs:255-269): the model keeps no tables, so
 \*     every version above a point is in memory and is left out exactly as the
 \*     code leaves it out when no table holds one. The extra refusal only
 \*     refuses more (Lean full_ok_of_later, scan_ok_of_later; Rust test
@@ -471,7 +501,7 @@
 \*   - A rollback, and the versions it discards: the model has none. Rust tests
 \*     a_rollback_leaves_nothing_to_refuse_a_check and
 \*     a_latched_database_s_discarded_versions_refuse_no_check.
-\*   - The cache-only scope of commit_nowait (write_free.rs:119): the model has
+\*   - The cache-only scope of commit_nowait (write_free.rs:127): the model has
 \*     no cache; Rust test a_cache_only_commit_that_writes_nothing_never_reads_the_device.
 \*   - A commit that took a slot and is not decided yet: in the model a commit
 \*     is decided in the step that checks it, so there is no such state; the
@@ -570,6 +600,11 @@ PessimisticAnomalyWorkload ==
   \* Transaction 54 withdraws, 55 deposits, 58 reports pessimistically.
   [NoExtras EXCEPT !["Withdrawers"] = {54}, !["Depositors"] = {55},
                    !["PessimisticReporters"] = {58}]
+\* A value read whose key changed where it is published and came back where it is decided: the
+\* for-update reader, a bumper and a restorer.
+RestoreWorkload ==
+  \* Transaction 53 reads B with get_for_update, 95 puts B to 2, 96 puts B back to 1.
+  [NoExtras EXCEPT !["ForUpdateReaders"] = {53}, !["Bumpers"] = {95}, !["Restorers"] = {96}]
 \* Write-free scans: a validated scan and a plain one, beside a revoker and a granter.
 WriteFreeScanWorkload ==
   \* Transaction 93 scans with a validated range, 94 with a plain scan; 91 revokes, 92 grants.
@@ -1028,6 +1063,20 @@ BeginScanReader(r) ==
      \* Nothing built from a value, no operations chosen.
      /\ UNCHANGED <<seen, ops>>
 
+\* Skew key B put to 2, blind.
+BeginBumper(b) ==
+  \* It will put skew key B to 2, reading nothing.
+  /\ Do(b, {}, {}, {SkewB}, {}, SkewB :> 2)
+  \* Nothing built from a value, no operations chosen.
+  /\ UNCHANGED <<seen, ops>>
+
+\* Skew key B put back to 1, its value before anything ran, blind.
+BeginRestorer(r) ==
+  \* It will put skew key B to 1, reading nothing.
+  /\ Do(r, {}, {}, {SkewB}, {}, SkewB :> 1)
+  \* Nothing built from a value, no operations chosen.
+  /\ UNCHANGED <<seen, ops>>
+
 \* Both skew keys written blind: each back to the value it holds (an identical rewrite) or one more.
 BeginSkewWriter(w) ==
   \* step: 0 for an identical rewrite, 1 for one more; the writer picks one.
@@ -1237,6 +1286,10 @@ Begin(t) ==
        [] t \in RangeReaders   -> BeginRangeReader(t)
        \* a scan reader:
        [] t \in ScanReaders    -> BeginScanReader(t)
+       \* a bumper:
+       [] t \in Bumpers        -> BeginBumper(t)
+       \* a restorer:
+       [] t \in Restorers      -> BeginRestorer(t)
        \* a log appender:
        [] t \in LogAppenders   -> BeginLogAppender(t)
        \* a log reader:
@@ -1603,8 +1656,8 @@ Abort(t) ==
 \* The writers whose commit the model takes in two steps, decided first (CommitWriting) and
 \* published later (Publish), so a write-free commit can run while it is decided and not yet
 \* visible. In the real program every commit passes those stages (pipeline.rs); the model gives the
-\* window to these two roles only, to keep the number of states small.
-TwoStep(t) == t \in Withdrawers \cup SkewWriters
+\* window to these three roles only, to keep the number of states small.
+TwoStep(t) == t \in Withdrawers \cup SkewWriters \cup Restorers
 
 \* Some commit is decided and not yet published.
 Pending == \E u \in Txns : phase[u] = "decided"

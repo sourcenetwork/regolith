@@ -10,6 +10,16 @@
 \* snapshot, something I relied on? If so the transaction is refused (it
 \* "aborts") and the caller runs it again. This check is "validation".
 \*
+\* How the checks are run. TLC, the model checker, tries every order in which
+\* a handful of transactions can take their steps. A configuration file
+\* (MC_*.cfg) picks the transactions and the level and names the promises to
+\* check in every state. A GREEN configuration runs the rule as the engine
+\* has it, and TLC must find no order that breaks a promise. A RED one plants
+\* one bug (`Mutant`, the list is in RepeatableRead.tla) or runs a level that
+\* does not make a promise, and TLC must find an order that breaks exactly the
+\* promise it names. A RED shows that the GREEN's promise really rests on
+\* the line of the rule its bug removes.
+\*
 \* Tiny example. Two people each read a counter that says 5 and each write
 \* back 6. If both commits are let through, the counter says 6 and one
 \* increment is lost. Validation refuses the second commit, because the key
@@ -196,7 +206,7 @@ RoleNames == {"Collectors", "Linkers", "Holders",
               "ValueReaders", "VersionWriters",
               "ReadOnlys", "Promoters", "SkewWriters", "ForUpdateReaders", "Latchers",
               "Withdrawers", "Depositors", "Reporters", "PessimisticReporters",
-              "RangeReaders", "ScanReaders",
+              "RangeReaders", "ScanReaders", "Bumpers", "Restorers",
               "LogAppenders", "LogReaders", "LogDeciders",
               "TallyMergers", "OwnWriters",
               "Checkers", "Revokers", "Granters",
@@ -255,6 +265,11 @@ RangeReaders   == Extras["RangeReaders"]
 \* Scan readers: each makes a plain scan of the grant range and writes nothing. At Serializable every
 \* key the scan returned is a read the commit checks.
 ScanReaders    == Extras["ScanReaders"]
+\* Bumpers: each puts skew key B to 2, visible at once.
+Bumpers        == Extras["Bumpers"]
+\* Restorers: each puts skew key B back to 1, its value before anything ran; decided first and
+\* visible later.
+Restorers      == Extras["Restorers"]
 \* Log appenders: each appends one entry to the log.
 LogAppenders   == Extras["LogAppenders"]
 \* Log readers: each reads the log's head, appends an entry, and stores the head it read as its
@@ -320,6 +335,7 @@ ASSUME Mutant \in {"none", "ReadMergeBlind", "PutMergeBlind", "PutMergeElides",
                    "WriteFreeTakesSequence", "ReceiptAtHorizon", "WriteFreeChecksPlainReads",
                    "WriteFreePublishedOnly", "ValueAboveHorizonRefuses",
                    "ReadCommittedChecksForUpdate", "WriteFreeIgnoresRanges",
+                   "WriteFreeJudgedAtDecidedOnly",
                    "OwnAppendVisible", "MergeBeforeScanReadsBase",
                    "PutsBeforeMerges", "OwnMergesInvisible", "ReasonNewestWrite",
                    "PlainScanDecides"}
@@ -997,8 +1013,10 @@ ReadDecider(r) ==
      THEN {Newest(decided)}
      \* Refused with every decided write counted: as strict as the pipeline.
      ELSE IF atDecided # {} THEN atDecided
-     \* A read checked by sequence that holds there holds at the published point too.
-     ELSE IF r.rule = "seq" THEN {}
+     \* A read checked by sequence that holds there holds at the published point too. Under the
+     \* planted bug WriteFreeJudgedAtDecidedOnly every rule stops here, unjudged at the published
+     \* point.
+     ELSE IF r.rule = "seq" \/ Mutant = "WriteFreeJudgedAtDecidedOnly" THEN {}
      \* Any other rule is judged at the published point as well.
      ELSE RuleDecider(r, visible)
 
@@ -1051,7 +1069,7 @@ ScanDecider(t) ==
   \* newer: every write inside the grant range after t's snapshot (only the published ones under
   \* the planted bug WriteFreePublishedOnly).
   LET newer == {w \in hist : /\ w.key[1] = AclRange /\ w.seq > snap[t]
-                             /\ Mutant # "WriteFreePublishedOnly" \/ w.seq <= published}
+                             /\ (Mutant # "WriteFreePublishedOnly" \/ w.seq <= published)}
   \* Nothing fails when t makes no validated scan, or decides on a plain scan (the planted bug), or
   \* validates nothing, or skips its scans as a write-free commit (the planted bug), or nothing
   \* landed;
