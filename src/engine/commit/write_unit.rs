@@ -291,6 +291,38 @@ impl WriteUnit {
         Some(Arc::clone(&self.line.load().job))
     }
 
+    /// Loom-only calibration of [`Self::note`]: the note trusted when a
+    /// plain load shows it on the claim, as the code once did. The load may
+    /// show a claim that was let go already, and the waiter sleeps on it.
+    #[cfg(loom)]
+    pub(super) fn note_trusting_a_load(&self, seen: u64, note: u64) -> bool {
+        let word = self.word.load(Ordering::Acquire);
+        if word & !NOTES != seen & !NOTES {
+            return false;
+        }
+        word & note != 0 || self.note(seen, note)
+    }
+
+    /// Loom-only calibration of [`Self::tell`] and `tell_waiters`: one
+    /// waiting record is woken and, when another waits, `WANTED` is put back
+    /// on the word for the next holder, as the code once did. The unit may
+    /// be free by then and nobody claims it again.
+    #[cfg(loom)]
+    pub(super) fn tell_the_first_only(&self, notes: u64, records: &[&Descriptor]) {
+        if notes & WANTED == 0 {
+            return;
+        }
+        let mut waiting = records
+            .iter()
+            .filter(|desc| waits_for_the_unit(desc.flags()));
+        if let Some(first) = waiting.next() {
+            if waiting.next().is_some() {
+                self.word.fetch_or(WANTED, Ordering::AcqRel);
+            }
+            first.wake();
+        }
+    }
+
     /// What the holder of a claim let go with `notes` owes its waiters: the
     /// line job released when a `commit_nowait` commit was queued on it
     /// (D53), and `true` when a waiter noted it, so that every record still

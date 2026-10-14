@@ -49,8 +49,10 @@
 //!   lands under a sync; a `commit_nowait` commit left on its queue is
 //!   told when the unit is let go; one thread at a time encodes a record,
 //!   the owner or a thread that needs it; and a writer parked on a record
-//!   being encoded is woken when it is filled; and the fast path of a lone
-//!   writer racing a claimer writes only whole records.
+//!   being encoded is woken when it is filled; the fast path of a writer
+//!   racing a claimer writes only whole records; and two writers behind a
+//!   holder are never left asleep, on the production note, park, release,
+//!   tell and wake (the review's two lost wakes are its calibrations).
 //! - **A call far from its turn** (E45 step 2, `turn_wait.rs`): a blocking
 //!   call parked on its own slot is named by the pass that brings its turn
 //!   near and told by the next finished commit, and is woken when its slot
@@ -364,4 +366,21 @@ fn the_fast_path_racing_a_claimer_writes_only_whole_records() {
 #[should_panic]
 fn a_fast_path_that_marks_its_record_filled_first_lets_a_claimer_read_it_half_encoded() {
     write_unit::calibration_a_fast_path_that_marks_its_record_filled_first_lets_a_claimer_read_it_half_encoded();
+}
+
+#[test]
+fn two_writers_behind_a_holder_are_never_left_asleep() {
+    write_unit::two_writers_behind_a_holder_are_never_left_asleep();
+}
+
+#[test]
+#[should_panic(expected = "a writer behind the holder was left asleep")]
+fn a_note_trusted_off_a_load_leaves_a_writer_asleep() {
+    write_unit::calibration_a_note_trusted_off_a_load_leaves_a_writer_asleep();
+}
+
+#[test]
+#[should_panic(expected = "a writer behind the holder was left asleep")]
+fn a_holder_that_wakes_the_first_record_only_leaves_a_writer_asleep() {
+    write_unit::calibration_a_holder_that_wakes_the_first_record_only_leaves_a_writer_asleep();
 }

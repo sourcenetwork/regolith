@@ -50,8 +50,8 @@ use loom::sync::Arc;
 use loom::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use loom::thread;
 
-use super::descriptor::{Descriptor, FILLED, FILLING, WRITTEN, Work};
-use super::write_unit::{QUEUED, WANTED, WriteUnit, waits_for_the_unit};
+use super::descriptor::{Descriptor, FILLED, FILLING, PARKED, WRITTEN, Work};
+use super::write_unit::{QUEUED, WANTED, WriteUnit, waits_for_the_unit, wake_if_waiting};
 use crate::engine::loom_model::explore_bounded;
 use crate::engine::wal_gate::Gate;
 
@@ -713,5 +713,189 @@ pub fn calibration_a_fast_path_that_marks_its_record_filled_first_lets_a_claimer
             write_through_gate(&gate, &desc);
             claimer.join().expect("the claimer");
         },
+    );
+}
+
+/// How a model's waiters note the claim and how its holders tell: the code
+/// as it is, or one of the two ways it once lost a wake.
+#[derive(Clone, Copy, PartialEq)]
+enum Tell {
+    /// `WriteUnit::note`, `WriteUnit::tell` and `wake_if_waiting` on every
+    /// record: the production code.
+    AsBuilt,
+    /// The note trusted off a plain load.
+    NoteTrustsALoad,
+    /// One record woken, `WANTED` put back on the word for the next holder.
+    FirstOnly,
+}
+
+/// A holder lets the unit go and tells, as Claim's drop and `tell_waiters`
+/// do: the notes read in the swap, then every record still waiting woken.
+fn let_go(unit: &WriteUnit, claimed: u64, records: &[&Descriptor], how: Tell) {
+    let notes = unit.release(claimed);
+    if how == Tell::FirstOnly {
+        unit.tell_the_first_only(notes, records);
+    } else if unit.tell(notes) {
+        for desc in records {
+            wake_if_waiting(desc);
+        }
+    }
+}
+
+/// The run of a holder that claimed the unit: from the first usable record,
+/// in ring order, up to the first that is not, each marked written; then
+/// the unit let go and told, and the run's sleepers woken (`try_batch`).
+fn run_and_let_go(unit: &WriteUnit, claimed: u64, records: &[&Descriptor], how: Tell) {
+    let mut started = false;
+    let mut parked = Vec::new();
+    for desc in records {
+        if desc.flags() & (FILLED | WRITTEN) != FILLED {
+            if started {
+                break;
+            }
+            continue;
+        }
+        started = true;
+        let (_, sleeping) = desc.mark_quiet(WRITTEN);
+        if sleeping {
+            parked.push(*desc);
+        }
+    }
+    let_go(unit, claimed, records, how);
+    for desc in parked {
+        desc.wake();
+    }
+}
+
+/// Whether a waiter that saw the claim `seen` should sleep on its record
+/// `mine`: it is on the list with `PARKED` set, and looks again, its note
+/// on the claim part of the look (`park_on`).
+fn should_sleep(unit: &WriteUnit, mine: &Descriptor, seen: u64, how: Tell) -> bool {
+    mine.register(|| {
+        mine.is(WRITTEN)
+            || !match how {
+                Tell::NoteTrustsALoad => unit.note_trusting_a_load(seen, WANTED),
+                Tell::AsBuilt | Tell::FirstOnly => unit.note(seen, WANTED),
+            }
+    })
+}
+
+/// One writer of a filled record, as `bring_written` with `Await::Park` goes
+/// about it: claim the unit and write a run, or park on its record with a
+/// note on the claim it saw, and look again when woken. `records` are every
+/// record of the model, in ring order.
+fn writer(unit: &WriteUnit, mine: &Descriptor, records: &[&Descriptor]) {
+    while !mine.is(WRITTEN) {
+        match unit.try_claim() {
+            Ok(claimed) => run_and_let_go(unit, claimed, records, Tell::AsBuilt),
+            Err(seen) => {
+                if should_sleep(unit, mine, seen, Tell::AsBuilt) {
+                    thread::park();
+                }
+            }
+        }
+    }
+}
+
+/// A calibration's writer: one try, which writes a run or registers to
+/// sleep without sleeping (a thread loom finds asleep for good stops the
+/// test process). `true` when it would sleep.
+fn writer_once(unit: &WriteUnit, mine: &Descriptor, records: &[&Descriptor], how: Tell) -> bool {
+    match unit.try_claim() {
+        Ok(claimed) => {
+            run_and_let_go(unit, claimed, records, how);
+            false
+        }
+        Err(seen) => should_sleep(unit, mine, seen, how),
+    }
+}
+
+/// The two lost wakes the review found, as one scenario. A holder holds
+/// the unit; records F, X and R are filled, in ring order, and X is
+/// written already, so a run that starts at F stops before R. W1 writes F
+/// and W2 writes R, each claiming the unit or parking with a note on the
+/// claim it saw. Every writer ends with its record written: a parked one is
+/// always woken, or its note is refused and it looks again. With the code
+/// as built a lost wake leaves a thread asleep for good, which loom
+/// reports; a calibration's writers register without sleeping, and the
+/// model asks whether anybody woke them.
+fn two_writers_behind_a_holder(name: &'static str, how: Tell, min: usize, witnessed: usize) {
+    explore_bounded(name, Some(3), min, witnessed, move |witness| {
+        let unit = Arc::new(WriteUnit::new(0));
+        let (f, x, r) = (filled_slot(), filled_slot(), filled_slot());
+        let _ = x.mark_quiet(WRITTEN);
+        let claimed = unit.try_claim().expect("the holder claims first");
+        let spawn = |mine: Arc<Descriptor>| {
+            let (unit, f, x, r) = (
+                Arc::clone(&unit),
+                Arc::clone(&f),
+                Arc::clone(&x),
+                Arc::clone(&r),
+            );
+            thread::spawn(move || {
+                let records = [&*f, &*x, &*r];
+                if how == Tell::AsBuilt {
+                    writer(&unit, &mine, &records);
+                    false
+                } else {
+                    writer_once(&unit, &mine, &records, how)
+                }
+            })
+        };
+        let w1 = spawn(Arc::clone(&f));
+        let w2 = spawn(Arc::clone(&r));
+        let_go(&unit, claimed, &[&f, &x, &r], how);
+        let asleep = [(w1.join().expect("W1"), &f), (w2.join().expect("W2"), &r)];
+        if how == Tell::AsBuilt {
+            if f.is(PARKED) && r.is(PARKED) {
+                witness.record();
+            }
+            assert!(f.is(WRITTEN) && r.is(WRITTEN));
+        }
+        for (sleeps, desc) in asleep {
+            assert!(
+                !(sleeps && desc.has_sleepers()),
+                "a writer behind the holder was left asleep"
+            );
+        }
+    });
+}
+
+/// WU4 on the production note, register, park, mark, release, tell and
+/// wake: two writers behind a holder are never left asleep.
+///
+/// Bound: 3 preemptions.
+pub fn two_writers_behind_a_holder_are_never_left_asleep() {
+    two_writers_behind_a_holder(
+        "two_writers_behind_a_holder_are_never_left_asleep",
+        Tell::AsBuilt,
+        8,
+        1,
+    );
+}
+
+/// Calibration for [`two_writers_behind_a_holder_are_never_left_asleep`]:
+/// the note trusted off a plain load. W2 reads the holder's claim with
+/// W1's note on it after that claim was let go, registers to sleep on a
+/// note nobody will read, and nobody wakes it.
+pub fn calibration_a_note_trusted_off_a_load_leaves_a_writer_asleep() {
+    two_writers_behind_a_holder(
+        "calibration_a_note_trusted_off_a_load_leaves_a_writer_asleep",
+        Tell::NoteTrustsALoad,
+        1,
+        0,
+    );
+}
+
+/// Calibration for [`two_writers_behind_a_holder_are_never_left_asleep`]:
+/// a holder that wakes the first waiting record only and puts `WANTED`
+/// back on the free unit. Nobody claims the unit again, and the writer of
+/// the second record is never woken.
+pub fn calibration_a_holder_that_wakes_the_first_record_only_leaves_a_writer_asleep() {
+    two_writers_behind_a_holder(
+        "calibration_a_holder_that_wakes_the_first_record_only_leaves_a_writer_asleep",
+        Tell::FirstOnly,
+        1,
+        0,
     );
 }
