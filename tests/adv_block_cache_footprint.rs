@@ -94,11 +94,9 @@ fn adv_footprint_child() {
     let heap_before = LIVE.load(Ordering::Relaxed);
     let db = Db::open(
         dir.path(),
-        Options {
-            block_cache_size: BUDGET,
-            block_cache_num_shard_bits: bits,
-            ..Options::default()
-        },
+        Options::default()
+            .block_cache_size(BUDGET)
+            .block_cache_num_shard_bits(bits),
     )
     .unwrap();
     let heap_after = LIVE.load(Ordering::Relaxed);
@@ -138,7 +136,9 @@ fn empty_db_footprint_is_flat_in_shard_count() {
         );
         let line = stdout
             .lines()
-            .find(|l| l.starts_with("ADVRESULT"))
+            // Anywhere in the line: with one test thread libtest prints
+            // "test <name> ... " in front of what the child prints.
+            .find_map(|l| l.find("ADVRESULT").map(|at| &l[at..]))
             .unwrap_or_else(|| panic!("child at shard_bits {bits} printed no result:\n{stdout}"))
             .to_string();
         let field = |name: &str| -> i64 {

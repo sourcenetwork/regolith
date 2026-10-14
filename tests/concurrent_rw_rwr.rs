@@ -11,8 +11,9 @@
 //! Every wait has a deadline, and a helper ends when the last thread that can
 //! ask it for anything is gone.
 //!
-//! Scenarios 1 to 4 and 7 run on both transaction flavours; 5 and 6 need the
-//! optimistic one. Every scenario runs on two storage shapes: the default,
+//! Scenarios 1 to 4, 7, 9 and 11 run on both transaction flavours, and 10 runs
+//! its forced half on both; 5, 6 and 8 need the optimistic one. Every scenario
+//! runs on two storage shapes: the default,
 //! where only the active memtable is ever probed, and a small write buffer
 //! with flushes in the worker loops, where the conflict probes walk SSTables
 //! too. A scenario claims a probe reached a table only after counting block
@@ -52,6 +53,26 @@
 //!    commits, and then the reader commits: only `Serializable` validates a
 //!    scan, but a row the reader scanned and then writes is validated at
 //!    every level.
+//! 8. Content-addressed keys (`DefraLevel`, optimistic). Eight transactions
+//!    create one block, each reading whether it is stored before putting it:
+//!    with a classifier all commit at `DefraLevel`, anywhere else one does.
+//!    A block that was read and found is refused only by a write that takes
+//!    it away, a put of one is never validated, and a delete of one is
+//!    validated like any delete.
+//! 9. Appends. Eight transactions append to one log, with a once key they
+//!    share, and none is refused at any level: positions are dense from 1,
+//!    follow the commits' receipts, and the once key took one entry. A
+//!    commit refused over another key appends nothing, and a transaction
+//!    that reads the head and then the entries finds every one while appends
+//!    commit around it.
+//! 10. Projected reads (`DefraLevel`, optimistic). Eight transactions read a
+//!     part of one document and increment that part: the first on each part
+//!     commits, where at any other level the first of all does. A read by
+//!     parts is refused by a forced write only when it changes a named part.
+//! 11. Write-free transactions. A commit that wrote nothing validates no
+//!     plain read at `DefraLevel` on the optimistic flavour and is placed at
+//!     its snapshot; a read through `get_for_update` is still checked, and
+//!     every other level validates what it always does.
 
 // Native-only. wasm-pack builds every test target for wasm32, and these use
 // threads and the filesystem. The browser suite lives in tests/wasm_opfs*.rs.
@@ -66,21 +87,32 @@ use std::time::{Duration, Instant};
 
 use regolith::{
     Db, IsolationLevel, OptimisticTransactionDb, Transaction, TransactionDb, TransactionError,
-    TxResult,
+    TxResult, TxnOptions,
 };
 use tempfile::TempDir;
 
 /// The scenarios that need a database of their own shape live in their own
 /// files. The `#[path]` attributes are what keep `tests/concurrent_rw_rwr/`
 /// from being picked up as further test targets.
+#[path = "concurrent_rw_rwr/appends.rs"]
+mod appends;
 #[path = "concurrent_rw_rwr/blind_merge.rs"]
 mod blind_merge;
 #[path = "concurrent_rw_rwr/commutative_prefix.rs"]
 mod commutative_prefix;
+#[path = "concurrent_rw_rwr/content_addressed.rs"]
+mod content_addressed;
+/// The merge operator over values of three parts the projected reads use.
+#[path = "common/parted.rs"]
+mod parted;
+#[path = "concurrent_rw_rwr/projected_reads.rs"]
+mod projected_reads;
 #[path = "concurrent_rw_rwr/scan_commit.rs"]
 mod scan_commit;
 #[path = "concurrent_rw_rwr/support.rs"]
 mod support;
+#[path = "concurrent_rw_rwr/write_free.rs"]
+mod write_free;
 
 use support::{Rendezvous, STORAGES, Storage, table_lookups};
 
@@ -138,7 +170,7 @@ fn decode(raw: Option<Vec<u8>>) -> u64 {
     })
 }
 
-fn retryable(result: &TxResult<()>) -> bool {
+fn retryable<T>(result: &TxResult<T>) -> bool {
     matches!(
         result,
         Err(TransactionError::Busy(_) | TransactionError::Conflict { .. })
@@ -163,11 +195,11 @@ fn back_off(refused: usize) {
 /// Bounded twice, by attempts and by `RETRY_DEADLINE`, with a growing
 /// back-off between attempts, so a livelock fails loudly and a slow machine
 /// is not hammered while it waits.
-fn commit_with_retry(what: &str, mut attempt: impl FnMut() -> TxResult<()>) -> u64 {
+fn commit_with_retry<T>(what: &str, mut attempt: impl FnMut() -> TxResult<T>) -> u64 {
     let deadline = Instant::now() + RETRY_DEADLINE;
     for refused in 0..MAX_ATTEMPTS {
         match attempt() {
-            Ok(()) => return refused as u64,
+            Ok(_) => return refused as u64,
             result if retryable(&result) => back_off(refused),
             Err(e) => panic!("{what}: unexpected transaction error: {e}"),
         }
@@ -192,13 +224,13 @@ impl Drop for StopOnDrop<'_> {
 
 /// Both transaction flavours behind one interface.
 trait Flavour: Sync {
-    fn begin(&self, level: IsolationLevel) -> Transaction<'_>;
+    fn begin_at(&self, level: IsolationLevel) -> Transaction;
     fn raw(&self) -> &Db;
 }
 
 impl Flavour for OptimisticTransactionDb {
-    fn begin(&self, level: IsolationLevel) -> Transaction<'_> {
-        self.begin_transaction_with(level)
+    fn begin_at(&self, level: IsolationLevel) -> Transaction {
+        self.begin(&TxnOptions::new().isolation(level))
     }
     fn raw(&self) -> &Db {
         self.db()
@@ -206,8 +238,8 @@ impl Flavour for OptimisticTransactionDb {
 }
 
 impl Flavour for TransactionDb {
-    fn begin(&self, level: IsolationLevel) -> Transaction<'_> {
-        self.begin_transaction_with(level)
+    fn begin_at(&self, level: IsolationLevel) -> Transaction {
+        self.begin(&TxnOptions::new().isolation(level))
     }
     fn raw(&self) -> &Db {
         self.db()
@@ -244,7 +276,7 @@ fn lost_update(db: &impl Flavour, level: IsolationLevel, storage: Storage) {
         for t in 0..THREADS {
             let (all_read, phase, first_round_commits) = (&all_read, &phase, &first_round_commits);
             scope.spawn(move || {
-                let tx = db.begin(level);
+                let tx = db.begin_at(level);
                 // Arrive at the rendezvous whatever the read did, so one
                 // failed reader cannot strand the other seven; judge it after.
                 let read = tx.get(b"counter");
@@ -285,7 +317,7 @@ fn lost_update(db: &impl Flavour, level: IsolationLevel, storage: Storage) {
                     }
                     // The stale write lost; increment again from a fresh read.
                     commit_with_retry("counter retry", || {
-                        let tx = db.begin(level);
+                        let tx = db.begin_at(level);
                         let value = decode(tx.get(b"counter")?);
                         tx.put(b"counter", &encode(value + 1))?;
                         tx.commit()
@@ -334,7 +366,7 @@ fn account(i: u64) -> Vec<u8> {
 }
 
 fn transfer(db: &impl Flavour, level: IsolationLevel, from: u64, to: u64) -> TxResult<()> {
-    let tx = db.begin(level);
+    let tx = db.begin_at(level);
     let a = decode(tx.get(&account(from))?);
     let b = decode(tx.get(&account(to))?);
     if a == 0 {
@@ -342,10 +374,10 @@ fn transfer(db: &impl Flavour, level: IsolationLevel, from: u64, to: u64) -> TxR
     }
     tx.put(&account(from), &encode(a - 1))?;
     tx.put(&account(to), &encode(b + 1))?;
-    tx.commit()
+    tx.commit().map(|_| ())
 }
 
-fn audit(tx: &Transaction<'_>) -> u64 {
+fn audit(tx: &Transaction) -> u64 {
     (0..ACCOUNTS)
         .map(|i| decode(tx.get(&account(i)).unwrap()))
         .sum()
@@ -361,7 +393,7 @@ fn snapshot_sum(db: &impl Flavour, level: IsolationLevel, storage: Storage) {
     // one it has not, commits in the middle of the audit. On `Tables` a
     // flush and a compaction follow it while the audit's snapshot is pinned:
     // the versions the audit has yet to read must survive both.
-    let auditor = db.begin(level);
+    let auditor = db.begin_at(level);
     let first = decode(auditor.get(&account(0)).unwrap());
     let (_, lookups) = table_lookups(|| {
         commit_with_retry("forced transfer", || transfer(db, level, 0, ACCOUNTS - 1))
@@ -372,7 +404,7 @@ fn snapshot_sum(db: &impl Flavour, level: IsolationLevel, storage: Storage) {
             "{level:?}: the forced transfer never reached a table"
         );
         db.raw().flush().unwrap();
-        db.raw().compact_range(None, None).unwrap();
+        db.raw().compact_range(None, None).wait().unwrap();
     }
     let rest: u64 = (1..ACCOUNTS)
         .map(|i| decode(auditor.get(&account(i)).unwrap()))
@@ -428,7 +460,7 @@ fn snapshot_sum(db: &impl Flavour, level: IsolationLevel, storage: Storage) {
                 overlapped.load(Ordering::Acquire),
                 reached_tables.load(Ordering::Acquire)
             );
-            let tx = db.begin(level);
+            let tx = db.begin_at(level);
             let began = db.raw().snapshot().sequence();
             assert_eq!(audit(&tx), TOTAL, "{level:?}: audit {audits}");
             if db.raw().snapshot().sequence() > began {
@@ -438,7 +470,7 @@ fn snapshot_sum(db: &impl Flavour, level: IsolationLevel, storage: Storage) {
         }
     });
 
-    let tx = db.begin(level);
+    let tx = db.begin_at(level);
     assert_eq!(audit(&tx), TOTAL, "{level:?}: final total");
 }
 
@@ -532,7 +564,7 @@ enum Read {
 const READS: [Read; 2] = [Read::Plain, Read::ForUpdate];
 
 impl Read {
-    fn of(self, tx: &Transaction<'_>, key: &[u8]) -> Option<Vec<u8>> {
+    fn of(self, tx: &Transaction, key: &[u8]) -> Option<Vec<u8>> {
         match self {
             Self::Plain => tx.get(key),
             Self::ForUpdate => tx.get_for_update(key),
@@ -563,7 +595,7 @@ fn point_read_repeats<D: Flavour>(db: &D, level: IsolationLevel, storage: Storag
             storage.flush(db.raw());
         },
         |r, force| {
-            let tx = db.begin(level);
+            let tx = db.begin_at(level);
             let first = decode(read.of(&tx, &shared(r)));
             force();
             assert_eq!(
@@ -631,9 +663,9 @@ fn late(r: usize) -> Vec<u8> {
     format!("row/late-{r}").into_bytes()
 }
 
-fn scanned(tx: &Transaction<'_>) -> BTreeSet<Vec<u8>> {
+fn scanned(tx: &Transaction) -> BTreeSet<Vec<u8>> {
     tx.scan_stream(Some(b"row/"), Some(b"row0"))
-        .map(|(key, _)| key)
+        .map(|item| item.unwrap().0)
         .collect()
 }
 
@@ -656,7 +688,7 @@ fn scan_repeats<D: Flavour>(db: &D, level: IsolationLevel, storage: Storage, rea
             storage.flush(db.raw());
         },
         |r, force| {
-            let tx = db.begin(level);
+            let tx = db.begin_at(level);
             // A row read before the scan: a pessimistic `get_for_update`
             // locks it, and the scan has to serve it where `get` does, in the
             // middle of a stretch.
@@ -691,7 +723,7 @@ fn scan_repeats<D: Flavour>(db: &D, level: IsolationLevel, storage: Storage, rea
             let inserted = format!("row/new-{r}").into_bytes();
             assert!(!second.contains(&inserted));
             assert!(
-                scanned(&db.begin(level)).contains(&inserted),
+                scanned(&db.begin_at(level)).contains(&inserted),
                 "{level:?} {read:?}: a later transaction sees the insertion"
             );
         },

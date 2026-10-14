@@ -1,9 +1,12 @@
 //! A key merged N times in one optimistic transaction is validated with
 //! one conflict probe, not N.
 //!
-//! Each probe runs while `commit_optimistic` holds the pipeline mutex that
-//! every other writer is waiting on, so a probe per merge op instead of per
-//! distinct key multiplies commit cost by the merges in the transaction.
+//! A commit probes its keys up to the read horizon before it queues, and the
+//! commit group's leader then looks only at the memtables for what landed
+//! above it, so a probe per merge op instead of per distinct key multiplies
+//! commit cost by the merges in the transaction. A key only reaches a table
+//! when something committed after the transaction's snapshot: with nothing
+//! newer, no key can conflict and none is probed at all.
 //! A probe stops at the key's newest entry, merge operands included: a
 //! newer operand is a newer write, wherever it is stored. `Statistics::BloomFilterFullPositive`
 //! is the public-API proxy for probe count here: each probe that reaches
@@ -17,7 +20,7 @@ use std::sync::Arc;
 
 use regolith::{
     IsolationLevel, MergeOperator, OptimisticTransactionDb, Options, Statistics, Ticker,
-    TransactionError,
+    TransactionError, TxnOptions,
 };
 
 /// Sums big-endian i64 deltas, so two `+1` operands make `+2` and the
@@ -51,11 +54,9 @@ fn a_key_merged_many_times_is_probed_once() {
 
     let dir = tempfile::tempdir().unwrap();
     let stats = Arc::new(Statistics::new());
-    let options = Options {
-        merge_operator: Some(Arc::new(CounterMerge)),
-        statistics: Some(stats.clone()),
-        ..Options::default()
-    };
+    let options = Options::default()
+        .merge_operator(Some(Arc::new(CounterMerge)))
+        .statistics(Some(stats.clone()));
     let db = OptimisticTransactionDb::open(dir.path(), options).unwrap();
 
     // Flush the base value so every probe below has to reach the SSTable
@@ -65,7 +66,25 @@ fn a_key_merged_many_times_is_probed_once() {
     db.db().flush().unwrap();
     stats.reset();
 
-    let tx = db.begin_transaction_with(IsolationLevel::SnapshotIsolation);
+    // Nothing committed since the snapshot: no key can have changed, and
+    // none is looked up in a table.
+    let tx = db.begin(&TxnOptions::new().isolation(IsolationLevel::SnapshotIsolation));
+    for _ in 0..MERGES {
+        tx.merge(b"counter", &1i64.to_be_bytes()).unwrap();
+    }
+    tx.commit().unwrap();
+    assert_eq!(
+        stats.get_ticker(Ticker::BloomFilterFullPositive),
+        0,
+        "with nothing committed since the snapshot, no key is probed in a table"
+    );
+
+    // A write after the snapshot makes the commit look, once per key, and
+    // the flush puts the key's newest version back in a table.
+    db.db().flush().unwrap();
+    stats.reset();
+    let tx = db.begin(&TxnOptions::new().isolation(IsolationLevel::SnapshotIsolation));
+    db.db().put(b"unrelated", b"newer").unwrap();
     for _ in 0..MERGES {
         tx.merge(b"counter", &1i64.to_be_bytes()).unwrap();
     }
@@ -78,7 +97,7 @@ fn a_key_merged_many_times_is_probed_once() {
     );
     assert_eq!(
         db.db().get(b"counter").unwrap().as_deref(),
-        Some(MERGES.to_be_bytes().as_slice())
+        Some((2 * MERGES).to_be_bytes().as_slice())
     );
 }
 
@@ -89,11 +108,9 @@ fn keys_merged_in_an_interleaved_order_are_probed_once_each() {
 
     let dir = tempfile::tempdir().unwrap();
     let stats = Arc::new(Statistics::new());
-    let options = Options {
-        merge_operator: Some(Arc::new(CounterMerge)),
-        statistics: Some(stats.clone()),
-        ..Options::default()
-    };
+    let options = Options::default()
+        .merge_operator(Some(Arc::new(CounterMerge)))
+        .statistics(Some(stats.clone()));
     let db = OptimisticTransactionDb::open(dir.path(), options).unwrap();
 
     // Flushed, as above, so every probe has to consult the SSTable's bloom
@@ -104,7 +121,9 @@ fn keys_merged_in_an_interleaved_order_are_probed_once_each() {
     db.db().flush().unwrap();
     stats.reset();
 
-    let tx = db.begin_transaction_with(IsolationLevel::SnapshotIsolation);
+    let tx = db.begin(&TxnOptions::new().isolation(IsolationLevel::SnapshotIsolation));
+    // A write after the snapshot, so the commit has to look.
+    db.db().put(b"unrelated", b"newer").unwrap();
     for i in 0..MERGES {
         tx.merge(KEYS[i % KEYS.len()], &1i64.to_be_bytes()).unwrap();
     }
@@ -148,13 +167,10 @@ fn operands_merged_in_an_interleaved_order_read_back_in_the_order_they_were_buff
     const OPERANDS: usize = 90;
 
     let dir = tempfile::tempdir().unwrap();
-    let options = Options {
-        merge_operator: Some(Arc::new(AppendMerge)),
-        ..Options::default()
-    };
+    let options = Options::default().merge_operator(Some(Arc::new(AppendMerge)));
     let db = OptimisticTransactionDb::open(dir.path(), options).unwrap();
 
-    let tx = db.begin_transaction_with(IsolationLevel::SnapshotIsolation);
+    let tx = db.begin(&TxnOptions::new().isolation(IsolationLevel::SnapshotIsolation));
     let mut expected: [Vec<u8>; KEYS.len()] = Default::default();
     for i in 0..OPERANDS {
         // An uneven walk over the keys, so no key's operands sit side by side.
@@ -198,15 +214,12 @@ fn a_newer_merge_operand_conflicts_a_point_read_wherever_it_is_stored() {
         OperandAt::SameTable,
     ] {
         let dir = tempfile::tempdir().unwrap();
-        let options = Options {
-            merge_operator: Some(Arc::new(CounterMerge)),
-            ..Options::default()
-        };
+        let options = Options::default().merge_operator(Some(Arc::new(CounterMerge)));
         let db = OptimisticTransactionDb::open(dir.path(), options).unwrap();
         db.db().put(b"counter", &0i64.to_be_bytes()).unwrap();
         db.db().flush().unwrap();
 
-        let tx = db.begin_transaction_with(IsolationLevel::RepeatableRead);
+        let tx = db.begin(&TxnOptions::new().isolation(IsolationLevel::RepeatableRead));
         assert_eq!(
             tx.get(b"counter").unwrap().as_deref(),
             Some(0i64.to_be_bytes().as_slice())
@@ -218,7 +231,7 @@ fn a_newer_merge_operand_conflicts_a_point_read_wherever_it_is_stored() {
             OperandAt::SeparateTable => db.db().flush().unwrap(),
             OperandAt::SameTable => {
                 db.db().flush().unwrap();
-                db.db().compact_range(None, None).unwrap();
+                db.db().compact_range(None, None).wait().unwrap();
             }
         }
 

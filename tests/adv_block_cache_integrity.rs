@@ -6,6 +6,7 @@
 //! file that is being evicted. If the cache ever returned a block under
 //! the wrong key, or dropped one it still owed, the values read here
 //! would not match what was written.
+#![cfg(not(target_arch = "wasm32"))]
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Barrier};
@@ -32,23 +33,21 @@ fn readers_never_see_a_wrong_block_while_compaction_evicts_files() {
     let db = Arc::new(
         Db::open(
             dir.path(),
-            Options {
+            Options::default()
                 // Far smaller than the data, so the hand never stops.
-                block_cache_size: 256 * 1024,
-                block_cache_num_shard_bits: 4,
-                block_size: 1024,
-                write_buffer_size: 256 * 1024,
-                statistics: Some(Arc::clone(&stats)),
-                ..Options::default()
-            },
+                .block_cache_size(256 * 1024)
+                .block_cache_num_shard_bits(4)
+                .block_size(1024)
+                .write_buffer_size(256 * 1024)
+                .statistics(Some(Arc::clone(&stats))),
         )
         .unwrap(),
     );
 
     for i in 0..KEYS {
-        db.put(&key(i), &value(i)).unwrap();
+        regolith::through_stalls(|| db.put(&key(i), &value(i))).unwrap();
     }
-    db.compact_range(None, None).unwrap();
+    db.compact_range(None, None).wait().unwrap();
 
     let stop = Arc::new(AtomicBool::new(false));
     let barrier = Arc::new(Barrier::new(5));
@@ -81,9 +80,9 @@ fn readers_never_see_a_wrong_block_while_compaction_evicts_files() {
     // `evict_file` under the readers.
     for round in 0..6u32 {
         for i in (round..KEYS).step_by(97) {
-            db.put(&key(i), &value(i)).unwrap();
+            regolith::through_stalls(|| db.put(&key(i), &value(i))).unwrap();
         }
-        db.compact_range(None, None).unwrap();
+        db.compact_range(None, None).wait().unwrap();
     }
     stop.store(true, Ordering::Relaxed);
 
@@ -118,20 +117,18 @@ fn a_disabled_cache_serves_the_same_storm() {
     let db = Arc::new(
         Db::open(
             dir.path(),
-            Options {
-                block_cache_size: 0,
-                block_cache_num_shard_bits: 8,
-                block_size: 1024,
-                write_buffer_size: 256 * 1024,
-                ..Options::default()
-            },
+            Options::default()
+                .block_cache_size(0)
+                .block_cache_num_shard_bits(8)
+                .block_size(1024)
+                .write_buffer_size(256 * 1024),
         )
         .unwrap(),
     );
     for i in 0..KEYS {
-        db.put(&key(i), &value(i)).unwrap();
+        regolith::through_stalls(|| db.put(&key(i), &value(i))).unwrap();
     }
-    db.compact_range(None, None).unwrap();
+    db.compact_range(None, None).wait().unwrap();
 
     let stop = Arc::new(AtomicBool::new(false));
     let readers: Vec<_> = (0..4u32)
@@ -150,9 +147,9 @@ fn a_disabled_cache_serves_the_same_storm() {
         .collect();
     for _ in 0..3 {
         for i in (0..KEYS).step_by(211) {
-            db.put(&key(i), &value(i)).unwrap();
+            regolith::through_stalls(|| db.put(&key(i), &value(i))).unwrap();
         }
-        db.compact_range(None, None).unwrap();
+        db.compact_range(None, None).wait().unwrap();
     }
     stop.store(true, Ordering::Relaxed);
     for r in readers {

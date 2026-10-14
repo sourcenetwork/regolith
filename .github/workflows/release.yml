@@ -36,17 +36,35 @@ defaults:
     shell: bash
 
 jobs:
+  # Each job carries a `timeout-minutes`, so one that hangs is cancelled
+  # and named, where GitHub's default would hold a runner for six hours.
   gate:
     runs-on: ubuntu-latest
+    # The test job's work on one runner: the tests take about ten
+    # minutes there, the rest about two.
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt, llvm-tools-preview
       - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@nextest
 
+      # nextest, not `cargo test`: a wedged test fails on the profile's
+      # slow-timeout instead of holding the job until its limit.
       - name: Test
-        run: cargo test
+        run: cargo nextest run
+
+      # nextest cannot run doc tests, so they run under a hard limit, the
+      # one `just test` gives them.
+      - name: Doc tests
+        run: |
+          timeout 5m cargo test --doc || {
+            code=$?
+            [ "$code" -ne 124 ] || echo "::error::the doc tests did not finish within 5 minutes and were stopped"
+            exit "$code"
+          }
 
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
@@ -67,6 +85,10 @@ jobs:
   publish:
     needs: gate
     runs-on: ubuntu-latest
+    # Runs only on a release tag, so it is not measured on pull requests:
+    # `cargo publish` packages the crate and builds it once to verify it,
+    # a few minutes of work.
+    timeout-minutes: 20
     if: >-
       (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v'))
       || (github.event_name == 'workflow_dispatch' && github.event.inputs.dry_run == 'false')
@@ -90,6 +112,8 @@ jobs:
   github-release:
     needs: publish
     runs-on: ubuntu-latest
+    # A log of the commits since the last tag and one API call: seconds.
+    timeout-minutes: 10
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     steps:
       - uses: actions/checkout@v4

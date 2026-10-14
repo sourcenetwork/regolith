@@ -4,6 +4,7 @@
 //! became an iterator: a corrupt log fails the open loud, an intact log
 //! recovers every acknowledged write, and no corruption is ever silently
 //! skipped. "Opened with the wrong data" is the failure these tests hunt.
+#![cfg(not(target_arch = "wasm32"))]
 
 use std::fs;
 use std::fs::OpenOptions;
@@ -12,13 +13,13 @@ use std::path::{Path, PathBuf};
 use regolith::{Db, Options, WriteOptions};
 use tempfile::TempDir;
 
+mod common;
+
 fn opts() -> Options {
-    Options {
+    Options::default()
         // Large enough that nothing flushes: everything under test stays
         // in the WAL, which is the point.
-        write_buffer_size: 8 * 1024 * 1024,
-        ..Options::default()
-    }
+        .write_buffer_size(8 * 1024 * 1024)
 }
 
 fn wal_files(db_dir: &Path) -> Vec<PathBuf> {
@@ -80,7 +81,7 @@ fn a_zero_length_wal_opens_clean() {
         for i in 0..200 {
             db.put(format!("s{i:04}").as_bytes(), b"v").unwrap();
         }
-        db.compact_range(None, None).unwrap();
+        db.compact_range(None, None).wait().unwrap();
         db.close().unwrap();
     }
     for path in wal_files(dir.path()) {
@@ -267,13 +268,10 @@ fn an_oversized_length_header_is_refused_not_allocated() {
     };
 
     let mut bytes = source.clone();
-    // The first record header sits after the 12-byte format stamp, not
-    // at offset 0. Inflating bytes 0..4 would corrupt the stamp
-    // instead, which is a different failure with a different rule:
-    // a log with no valid stamp holds nothing that was ever
-    // acknowledged and is discarded, so the probe would pass on the
-    // wrong reason. Matches `WAL_STAMP_LEN` in `src/engine/wal.rs`.
-    const STAMP: usize = 12;
+    // The first record header sits after the format stamp, not at offset
+    // 0. Inflating the stamp instead would be a different failure with a
+    // different rule, so the probe would pass on the wrong reason.
+    const STAMP: usize = common::wal_format::STAMP_LEN;
     bytes[STAMP..STAMP + 4].copy_from_slice(&u32::MAX.to_le_bytes());
 
     let dir = TempDir::new().unwrap();
@@ -287,65 +285,55 @@ fn an_oversized_length_header_is_refused_not_allocated() {
     fs::write(dir.path().join("wal").join("wal_000001.log"), &bytes).unwrap();
 
     let err = Db::open(dir.path(), opts()).expect_err("a 4 GiB length header must be refused");
-    // What matters is that the open was refused and the reason names
-    // the framing, not which of the three refusal paths reached it: a
-    // length that runs past the end of the file is caught as a
-    // truncation, as a checksum mismatch, or by the whole-record-follows
-    // rule, depending on what the inflated header lands on.
+    // The writes were synced one by one, so the records after the damaged
+    // one prove it durable: the open is refused, naming where.
     let text = format!("{err:?}");
     assert!(
-        text.contains("truncated")
-            || text.contains("checksum")
-            || text.contains("runs past the end"),
+        text.contains(&format!("damaged at offset {STAMP}")),
         "unexpected error for an oversized length header: {err:?}"
     );
 }
 
 /// Corruption in an *earlier* WAL must fail the open, not be skipped in
-/// favour of the later one that replays cleanly.
+/// favour of the later one that replays cleanly. The two logs are one
+/// seeded log split at a record boundary, as a rotation there would have
+/// left them (`wal_format::split_at`); the earlier one was complete when
+/// the newer one began, so any damage in it is loss.
 #[test]
 fn corruption_in_an_earlier_wal_is_not_skipped() {
+    const COUNT: usize = 64;
     let dir = TempDir::new().unwrap();
+    let bytes = seed(&dir, COUNT);
+    let only = wal_files(dir.path()).pop().expect("one WAL");
+    let bounds = common::wal_format::record_bounds(&bytes);
+    let (mut earlier, later) = common::wal_format::split_at(&bytes, bounds[COUNT / 2]);
+    fs::remove_file(&only).unwrap();
+    let target = dir.path().join("wal").join("wal_000001.log");
+    fs::write(dir.path().join("wal").join("wal_000002.log"), &later).unwrap();
+
+    // The control: the split alone serves every write.
+    fs::write(&target, &earlier).unwrap();
+    let manifest = dir.path().join("MANIFEST");
+    let before_control = fs::read(&manifest).unwrap();
     {
-        let db = Db::open(
-            dir.path(),
-            Options {
-                write_buffer_size: 4 * 1024,
-                ..Options::default()
-            },
-        )
-        .unwrap();
-        for i in 0..400 {
-            db.put(format!("m{i:04}").as_bytes(), &[b'x'; 128]).unwrap();
-        }
-        db.close().unwrap();
+        let db = Db::open(dir.path(), opts()).expect("the split alone opens");
+        assert_eq!(db.scan(None, None).unwrap(), expected(COUNT));
     }
-    // Reopen with a big buffer so the recovered state is rewritten into a
-    // single WAL, then add more behind it. The log is captured while the
-    // database is open, before `close` flushes it away.
-    let (target, mut bytes) = {
-        let db = Db::open(dir.path(), opts()).unwrap();
-        for i in 400..500 {
-            db.put(format!("m{i:04}").as_bytes(), &[b'y'; 128]).unwrap();
-        }
-        let files = wal_files(dir.path());
-        let target = files.first().expect("at least one WAL").clone();
-        let bytes = fs::read(&target).unwrap();
-        drop(db);
-        (target, bytes)
-    };
-    assert!(bytes.len() > 40, "WAL too small to corrupt meaningfully");
-    let at = bytes.len() / 2;
-    bytes[at] ^= 0xFF;
-    fs::write(&target, &bytes).unwrap();
+    // That open rewrote the logs and recorded the pair as retired, so lay
+    // the pair and the manifest down again, the pair damaged.
+    fs::write(&manifest, &before_control).unwrap();
+    for path in wal_files(dir.path()) {
+        fs::remove_file(path).unwrap();
+    }
+    let at = earlier.len() / 2;
+    earlier[at] ^= 0xFF;
+    fs::write(&target, &earlier).unwrap();
+    fs::write(dir.path().join("wal").join("wal_000002.log"), &later).unwrap();
 
     let err = Db::open(dir.path(), opts()).expect_err("corrupt WAL must fail the open");
     assert!(
-        format!("{err:?}").to_lowercase().contains("checksum")
-            || format!("{err:?}").to_lowercase().contains("truncated")
-            || format!("{err:?}").to_lowercase().contains("invalid")
-            || format!("{err:?}").to_lowercase().contains("record"),
-        "unexpected error: {err:?}"
+        format!("{err}").contains("wal_000001.log"),
+        "the refusal must name the damaged log: {err}"
     );
     assert!(
         target.exists(),

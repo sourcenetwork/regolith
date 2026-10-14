@@ -6,9 +6,8 @@
 //! of these assert that the fault actually fired, not merely that nothing
 //! blew up.
 //!
-//! Runtime: the default set finishes in a few seconds. The two
-//! tests are called out individually below; run them with
-//! `just test-fault-slow`.
+//! Runtime: the whole file finishes in a few seconds. Run it on its own
+//! with `just test-fault`.
 
 //! # Linux only
 //!
@@ -23,8 +22,14 @@
 
 mod common;
 
+#[path = "fault_smoke/cut_ack.rs"]
+mod cut_ack;
+#[path = "fault_smoke/cut_record.rs"]
+mod cut_record;
 #[path = "fault_smoke/open_variadic.rs"]
 mod open_variadic;
+#[path = "fault_smoke/rename_pairs.rs"]
+mod rename_pairs;
 
 use std::path::Path;
 use std::time::Duration;
@@ -45,10 +50,7 @@ fn crash_child() {
 }
 
 fn small_opts() -> Options {
-    Options {
-        write_buffer_size: 1 << 20,
-        ..Options::default()
-    }
+    Options::default().write_buffer_size(1 << 20)
 }
 
 fn reopen(dir: &Path) -> Db {
@@ -99,6 +101,127 @@ fn the_shim_records_regoliths_real_file_io() {
         "no fsync recorded, so nothing could ever be called durable\n{}",
         out.journal,
     );
+}
+
+/// Proves builders racing on a cold cache each get a working shim: every
+/// path a builder returns exports every interposer, however their source
+/// writes, compiles and installs interleave.
+///
+/// Catches: builders sharing one source path, where one builder's
+/// truncating write lands while another's `rustc` reads it, so an empty
+/// source compiles into a library that interposes nothing. Such a library
+/// once ran a crash test whose fault never fired and whose journal stayed
+/// empty. Builders arrive spread over the time `rustc` takes to start and
+/// read its source, as test threads reaching their first crash run do.
+#[test]
+fn builders_racing_on_a_cold_cache_each_get_a_working_shim() {
+    const BUILDERS: usize = 8;
+    for round in 0..6u64 {
+        let cold = TempDir::new().unwrap();
+        let start = std::sync::Barrier::new(BUILDERS);
+        std::thread::scope(|scope| {
+            let builders: Vec<_> = (0..BUILDERS as u64)
+                .map(|b| {
+                    let (cold, start) = (cold.path(), &start);
+                    scope.spawn(move || {
+                        start.wait();
+                        std::thread::sleep(Duration::from_millis((b * 37 + round * 11) % 150));
+                        fault::shim::build_in(cold)
+                    })
+                })
+                .collect();
+            for builder in builders {
+                let lib = builder.join().unwrap().expect("a racing builder failed");
+                assert_eq!(
+                    fault::shim::missing_interposer(&lib).unwrap(),
+                    None,
+                    "round {round}: a racing builder returned a shim that interposes nothing"
+                );
+            }
+        });
+        // Each builder removed its own source; only the installed object
+        // remains.
+        let left: Vec<_> = std::fs::read_dir(cold.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(left.len(), 1, "builders left files behind: {left:?}");
+    }
+}
+
+/// Proves a cached shim that interposes nothing is rebuilt rather than
+/// used, and that the check tells an export from an import.
+///
+/// Catches: a cache that trusts any file at the shim's path, so one bad
+/// install poisons every later run until someone deletes it by hand.
+#[test]
+fn a_cached_shim_that_interposes_nothing_is_rebuilt() {
+    let dir = TempDir::new().unwrap();
+    let lib = fault::shim::build_in(dir.path()).unwrap();
+    // A valid shared object that defines none of the interposers but, like
+    // any Rust library, imports `write` and `close` from libc.
+    let empty = dir.path().join("empty.rs");
+    std::fs::write(&empty, "#[no_mangle]\npub extern \"C\" fn unrelated() {}\n").unwrap();
+    let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
+    let status = std::process::Command::new(rustc)
+        .args(["--edition", "2021", "--crate-type", "cdylib", "-o"])
+        .arg(&lib)
+        .arg(&empty)
+        .status()
+        .unwrap();
+    assert!(status.success(), "setup: the empty library compiles");
+    assert_eq!(
+        fault::shim::missing_interposer(&lib).unwrap(),
+        Some(fault::shim::INTERPOSERS[0]),
+        "an object that only imports `write` passed as exporting it"
+    );
+    let rebuilt = fault::shim::build_in(dir.path()).unwrap();
+    assert_eq!(rebuilt, lib);
+    assert_eq!(
+        fault::shim::missing_interposer(&rebuilt).unwrap(),
+        None,
+        "the cached library that interposes nothing was used as is"
+    );
+}
+
+/// Proves the cached shim belongs to the compiler that built it: another
+/// compiler names another object, and the one this run builds carries the
+/// key of the compiler this run uses.
+///
+/// Catches: a cache keyed on the shim's source alone. A shim built under
+/// one toolchain was then preloaded into a test binary built by another,
+/// fired no fault and recorded nothing, and every power-loss test failed
+/// until someone deleted the cache by hand.
+#[test]
+fn the_cached_shim_is_keyed_on_the_compiler_that_builds_it() {
+    let stable = "rustc 1.99.0 (b940084d7 2026-09-28)\nhost: x86_64-unknown-linux-gnu\n";
+    let nightly = "rustc 1.99.0-nightly (c79e8f894 2026-08-04)\nhost: x86_64-unknown-linux-gnu\n";
+    assert_eq!(
+        fault::shim::cache_key(stable),
+        fault::shim::cache_key(stable)
+    );
+    assert_ne!(
+        fault::shim::cache_key(stable),
+        fault::shim::cache_key(nightly),
+        "two compilers would share one cached shim"
+    );
+
+    let identity = fault::shim::compiler_identity().unwrap();
+    assert!(identity.contains("rustc"), "{identity}");
+    let dir = TempDir::new().unwrap();
+    let lib = fault::shim::build_in(dir.path()).unwrap();
+    let name = lib.file_name().unwrap().to_string_lossy().into_owned();
+    assert!(
+        name.contains(&format!("{:016x}", fault::shim::cache_key(&identity))),
+        "{name} is not named after this run's compiler"
+    );
+    // A shim left there by another compiler is not the one this run uses.
+    let other = dir.path().join(format!(
+        "libregolith_fault_shim_{:016x}.so",
+        fault::shim::cache_key("some other compiler")
+    ));
+    std::fs::write(&other, b"not this compiler's shim").unwrap();
+    assert_eq!(fault::shim::build_in(dir.path()).unwrap(), lib);
 }
 
 /// Proves a kill point is byte-exact rather than wall-clock: asking to die
@@ -213,7 +336,7 @@ fn immediate_durability_survives_a_power_cut() {
 
     let recovered = reopen(&db);
     let report = fault::assert_valid_prefix(&recovered, &out.history);
-    fault::assert_acked_survived(&report, &out.acked);
+    fault::assert_acked_survived(&report, &out.acked());
     assert_eq!(
         report.k,
         out.history.len(),
@@ -436,7 +559,7 @@ fn a_clean_shutdown_loses_nothing() {
         "clean shutdown must keep every write: {}",
         report.summary(),
     );
-    fault::assert_acked_survived(&report, &out.acked);
+    fault::assert_acked_survived(&report, &out.acked());
 }
 
 /// Proves the byte-level mutators do exactly what their names say, on
@@ -472,16 +595,11 @@ fn the_locators_find_the_wal_manifest_and_sstable() {
     let tmp = TempDir::new().unwrap();
     let db = tmp.path().join("db");
     {
-        let d = Db::open(
-            &db,
-            Options {
-                write_buffer_size: 4 * 1024,
-                ..Options::default()
-            },
-        )
-        .unwrap();
+        let d = Db::open(&db, Options::default().write_buffer_size(4 * 1024)).unwrap();
         for i in 0..2000u32 {
-            d.put(format!("k{i:06}").as_bytes(), &[b'v'; 64]).unwrap();
+            // A write a stall stops waits for it to clear: on a busy host
+            // the compaction worker falls behind two thousand small flushes.
+            regolith::through_stalls(|| d.put(format!("k{i:06}").as_bytes(), &[b'v'; 64])).unwrap();
         }
         d.close().unwrap();
     }
@@ -552,7 +670,7 @@ fn a_crash_inside_one_write_batch_applies_all_of_it_or_none() {
                     r.k,
                     boundaries,
                 );
-                fault::assert_acked_survived(&r, &out.acked);
+                fault::assert_acked_survived(&r, &out.acked());
             }
             fault::Recovery::RefusedToOpen(e) => {
                 assert_eq!(

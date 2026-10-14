@@ -159,18 +159,18 @@ fn run() -> Result<(), String> {
     let background = args.background_compactions;
     let profile = args.profile;
     let options = move || {
-        let mut opts = profile.options();
-        if let Some(n) = background {
-            opts.max_background_compactions = n;
+        let opts = profile.options();
+        match background {
+            Some(n) => opts.max_background_compactions(n),
+            None => opts,
         }
-        opts
     };
 
     reporter.note(&format!(
         "profile={} records={} background_compactions={}",
         profile.label(),
         args.records,
-        options().max_background_compactions
+        options().get_max_background_compactions()
     ));
 
     // On wasm a background compaction worker cannot exist, and the
@@ -181,8 +181,7 @@ fn run() -> Result<(), String> {
     // for wasm, so the lib test cfg is unbuildable there.
     #[cfg(target_family = "wasm")]
     {
-        let mut hostile = profile.options();
-        hostile.max_background_compactions = 1;
+        let hostile = profile.options().max_background_compactions(1);
         match hostile.validate() {
             Ok(()) => {
                 return Err(

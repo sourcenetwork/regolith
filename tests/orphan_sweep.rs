@@ -32,14 +32,7 @@ fn key(i: u32) -> Vec<u8> {
 /// A closed store with several flushed tables, and the ids that are live.
 fn seeded_store() -> (tempfile::TempDir, BTreeSet<u64>) {
     let dir = tempfile::tempdir().unwrap();
-    let db = Db::open(
-        dir.path(),
-        Options {
-            l0_compaction_trigger: 1_000,
-            ..Options::default()
-        },
-    )
-    .unwrap();
+    let db = Db::open(dir.path(), Options::default().l0_compaction_trigger(1_000)).unwrap();
     for batch in 0..4u32 {
         for i in 0..500u32 {
             db.put(&key(batch * 500 + i), b"value").unwrap();
@@ -133,10 +126,10 @@ fn a_torn_manifest_suppresses_the_sweep() {
 fn an_environment_without_a_process_lock_sweeps_nothing() {
     let env: Arc<dyn Env> = Arc::new(MemEnv::new());
     assert!(!env.capabilities().file_lock);
-    let opts = || Options {
-        env: Arc::clone(&env),
-        max_background_compactions: 0,
-        ..Options::default()
+    let opts = || {
+        Options::default()
+            .env(Arc::clone(&env))
+            .max_background_compactions(0)
     };
     let dir = Path::new("/db");
 

@@ -12,6 +12,7 @@
 //!
 //! Scale is read from `REGOLITH_ADV_ROUNDS` (default 1) so the same gate
 //! can be cranked up for a soak without editing it.
+#![cfg(not(target_arch = "wasm32"))]
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
@@ -166,11 +167,9 @@ pub fn run(scale: &Scale, surface: Surface) -> Outcome {
     let stats = Arc::new(Statistics::new());
     let db = Db::open(
         dir.path(),
-        Options {
-            write_buffer_size: 16 * 1024,
-            statistics: Some(Arc::clone(&stats)),
-            ..Options::default()
-        },
+        Options::default()
+            .write_buffer_size(16 * 1024)
+            .statistics(Some(Arc::clone(&stats))),
     )
     .expect("open failed");
     let db = Arc::new(db);
@@ -179,7 +178,7 @@ pub fn run(scale: &Scale, surface: Surface) -> Outcome {
         .flat_map(|w| (0..scale.keys_per_writer).map(move |i| key_of(w, i)))
         .collect();
     for k in &keys {
-        db.put(k, &value_of(0)).expect("seed put failed");
+        regolith::through_stalls(|| db.put(k, &value_of(0))).expect("seed put failed");
     }
 
     let writers_live = Arc::new(AtomicU64::new(scale.writers as u64));
@@ -201,7 +200,8 @@ pub fn run(scale: &Scale, surface: Surface) -> Outcome {
             gate.wait();
             for v in 1..=versions {
                 for i in 0..keys_each {
-                    db.put(&key_of(w, i), &value_of(v)).expect("put failed");
+                    regolith::through_stalls(|| db.put(&key_of(w, i), &value_of(v)))
+                        .expect("put failed");
                 }
             }
             live.fetch_sub(1, Ordering::AcqRel);
@@ -217,7 +217,9 @@ pub fn run(scale: &Scale, surface: Surface) -> Outcome {
             gate.wait();
             let mut n = 0u64;
             loop {
-                db.compact_range(None, None).expect("compact_range failed");
+                db.compact_range(None, None)
+                    .wait()
+                    .expect("compact_range failed");
                 n += 1;
                 if n >= 3 && live.load(Ordering::Acquire) == 0 && stop.load(Ordering::Acquire) {
                     break;
@@ -489,21 +491,14 @@ fn snapshot_churn_instance() -> (u64, Vec<String>) {
     let scale = default_scale();
     let dir = TempDir::new().expect("tempdir");
     let db = Arc::new(
-        Db::open(
-            dir.path(),
-            Options {
-                write_buffer_size: 16 * 1024,
-                ..Options::default()
-            },
-        )
-        .expect("open"),
+        Db::open(dir.path(), Options::default().write_buffer_size(16 * 1024)).expect("open"),
     );
 
     let keys: Vec<Vec<u8>> = (0..scale.writers)
         .flat_map(|w| (0..scale.keys_per_writer).map(move |i| key_of(w, i)))
         .collect();
     for k in &keys {
-        db.put(k, &value_of(0)).expect("seed put");
+        regolith::through_stalls(|| db.put(k, &value_of(0))).expect("seed put");
     }
 
     let live = Arc::new(AtomicU64::new(scale.writers as u64));
@@ -519,7 +514,7 @@ fn snapshot_churn_instance() -> (u64, Vec<String>) {
             gate.wait();
             for v in 1..=versions {
                 for i in 0..keys_each {
-                    db.put(&key_of(w, i), &value_of(v)).expect("put");
+                    regolith::through_stalls(|| db.put(&key_of(w, i), &value_of(v))).expect("put");
                 }
             }
             live.fetch_sub(1, Ordering::AcqRel);
@@ -533,7 +528,7 @@ fn snapshot_churn_instance() -> (u64, Vec<String>) {
             gate.wait();
             let mut n = 0u64;
             loop {
-                db.compact_range(None, None).expect("compact_range");
+                db.compact_range(None, None).wait().expect("compact_range");
                 n += 1;
                 if n >= 3 && live.load(Ordering::Acquire) == 0 {
                     break;
@@ -599,14 +594,7 @@ fn snapshot_churn_instance() -> (u64, Vec<String>) {
 fn drop_all_racing_every_read_surface_never_invents_data() {
     let dir = TempDir::new().expect("tempdir");
     let db = Arc::new(
-        Db::open(
-            dir.path(),
-            Options {
-                write_buffer_size: 8 * 1024,
-                ..Options::default()
-            },
-        )
-        .expect("open"),
+        Db::open(dir.path(), Options::default().write_buffer_size(8 * 1024)).expect("open"),
     );
     let keys: Vec<Vec<u8>> = (0..64).map(|i| key_of(0, i)).collect();
     let refs: Vec<&[u8]> = keys.iter().map(|k| k.as_slice()).collect();
@@ -621,10 +609,12 @@ fn drop_all_racing_every_read_surface_never_invents_data() {
             while !stop.load(Ordering::Acquire) {
                 v += 1;
                 for i in 0..64 {
-                    db.put(&key_of(0, i), &value_of(v * 10 + w as u64))
-                        .expect("put");
+                    regolith::through_stalls(|| {
+                        db.put(&key_of(0, i), &value_of(v * 10 + w as u64))
+                    })
+                    .expect("put");
                 }
-                db.delete_range(&key_of(0, 10), &key_of(0, 20))
+                regolith::through_stalls(|| db.delete_range(&key_of(0, 10), &key_of(0, 20)))
                     .expect("delete_range");
             }
         }));
@@ -635,7 +625,7 @@ fn drop_all_racing_every_read_surface_never_invents_data() {
         handles.push(thread::spawn(move || {
             while !stop.load(Ordering::Acquire) {
                 db.drop_all().expect("drop_all");
-                db.compact_range(None, None).expect("compact_range");
+                db.compact_range(None, None).wait().expect("compact_range");
             }
         }));
     }
@@ -677,7 +667,7 @@ fn drop_all_racing_every_read_surface_never_invents_data() {
     }
 
     // Quiesced: every surface must now agree.
-    db.compact_range(None, None).expect("compact_range");
+    db.compact_range(None, None).wait().expect("compact_range");
     let mut it = db.iter();
     it.seek_to_first();
     let mut fwd = Vec::new();

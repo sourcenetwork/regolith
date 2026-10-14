@@ -1,6 +1,6 @@
 //! Where an ingested table lands. A table is placed by the range it will be
-//! recorded with, tombstones included, so a deep level never ends up holding
-//! two tables that overlap.
+//! recorded with, tombstones included, so a level below L0 never ends up
+//! holding two tables that overlap.
 
 use std::path::Path;
 
@@ -37,18 +37,15 @@ fn files_at(db: &Db, level: usize) -> u64 {
 }
 
 #[test]
-fn a_source_whose_tombstone_reaches_existing_data_lands_in_l0_not_beside_it() {
+fn a_source_whose_tombstone_reaches_existing_data_lands_above_it_not_beside_it() {
     let dir = TempDir::new().unwrap();
-    let options = Options {
-        max_background_compactions: 0,
-        ..Options::default()
-    };
+    let options = Options::default().max_background_compactions(0);
     let db = Db::open(dir.path(), options).unwrap();
     for key in [b"c", b"d", b"e", b"f"] {
         db.put(key, b"old").unwrap();
     }
     db.flush().unwrap();
-    db.compact_range(None, None).unwrap();
+    db.compact_range(None, None).wait().unwrap();
     let bottom = MAX_LEVELS - 1;
     assert_eq!(
         files_at(&db, bottom),
@@ -61,13 +58,21 @@ fn a_source_whose_tombstone_reaches_existing_data_lands_in_l0_not_beside_it() {
     let source = dir.path().join("source.sst");
     source_with_tombstone(&source, &[b"m", b"n", b"p"], b"a", b"g");
     db.ingest_external_files(&[source], IngestOptions::default())
+        .wait()
         .unwrap();
 
-    assert_eq!(files_at(&db, 0), 1, "the ingested table is in L0");
+    // The deepest level whose tables, and every level's above it, the
+    // recorded range does not meet (LsmOrder.tla's placement).
+    assert_eq!(
+        files_at(&db, bottom - 1),
+        1,
+        "the ingested table is in the level above the old one"
+    );
+    assert_eq!(files_at(&db, 0), 0);
     assert_eq!(
         files_at(&db, bottom),
         1,
-        "beside the old table, not in its level"
+        "not beside the old table, in its level"
     );
     assert_eq!(
         db.get(b"d").unwrap(),
@@ -83,21 +88,19 @@ fn a_source_whose_tombstone_reaches_existing_data_lands_in_l0_not_beside_it() {
 #[test]
 fn a_source_whose_tombstone_stays_clear_of_existing_data_still_goes_to_the_bottom() {
     let dir = TempDir::new().unwrap();
-    let options = Options {
-        max_background_compactions: 0,
-        ..Options::default()
-    };
+    let options = Options::default().max_background_compactions(0);
     let db = Db::open(dir.path(), options).unwrap();
     for key in [b"c", b"d", b"e", b"f"] {
         db.put(key, b"old").unwrap();
     }
     db.flush().unwrap();
-    db.compact_range(None, None).unwrap();
+    db.compact_range(None, None).wait().unwrap();
     let bottom = MAX_LEVELS - 1;
 
     let source = dir.path().join("source.sst");
     source_with_tombstone(&source, &[b"m", b"n", b"p"], b"q", b"s");
     db.ingest_external_files(&[source], IngestOptions::default())
+        .wait()
         .unwrap();
 
     assert_eq!(files_at(&db, 0), 0);

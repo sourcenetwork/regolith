@@ -14,6 +14,7 @@
 //! keys present for writer `w` must be a *prefix* of its sequence: a hole
 //! means the engine acknowledged `i` as durable, then lost it while
 //! keeping the later `i + 1`.
+#![cfg(not(target_arch = "wasm32"))]
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -37,14 +38,12 @@ fn key(writer: usize, index: usize) -> Vec<u8> {
 }
 
 fn opts(durability: DurabilityMode) -> Options {
-    Options {
+    Options::default()
         // Small enough that the run rotates memtables and flushes while
         // the writers are still going, so the kill lands with live frozen
         // memtables and a compaction in flight.
-        write_buffer_size: 32 * 1024,
-        durability,
-        ..Options::default()
-    }
+        .write_buffer_size(32 * 1024)
+        .durability(durability)
 }
 
 /// The child half: write flat out from `WRITERS` threads, then exit
@@ -73,10 +72,11 @@ fn child(mode: &str, dir: &Path) -> ! {
                     for slot in 0..BATCH_OPS {
                         batch.put(&key(w, i * BATCH_OPS + slot), b"v");
                     }
-                    if db.write_opt(&wopts, batch).is_err() {
+                    if regolith::through_stalls(|| db.write_opt(&wopts, batch.clone())).is_err() {
                         return;
                     }
-                } else if db.put_opt(&wopts, &key(w, i), b"v").is_err() {
+                } else if regolith::through_stalls(|| db.put_opt(&wopts, &key(w, i), b"v")).is_err()
+                {
                     return;
                 }
                 i += 1;

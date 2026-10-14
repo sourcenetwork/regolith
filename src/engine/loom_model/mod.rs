@@ -9,7 +9,7 @@
 //!
 //! # What loom here does and does not prove
 //!
-//! Loom sees the atomics that come from `crate::sync` and the locks
+//! Loom sees the atomics that come from `crate::sync::internal` and the locks
 //! built on them, and nothing else. It therefore checks:
 //!
 //! - that a reader which observes a node observes the links that were
@@ -23,17 +23,20 @@
 //! - that a reader pinning one version walks a whole snapshot across a
 //!   concurrent compaction, and that a flush and a compaction
 //!   publishing at once cannot lose one another's edits;
-//! - that the arena's chunk list, a `crate::sync::UnsafeCell` rather than
-//!   a lock (invariant A8 in `engine::arena`), sees no access that is
-//!   not ordered before or after every other access to it: every model
-//!   that allocates now runs its allocations through the tracked cell,
-//!   so a broken A8 contract fails the model the same way a broken S1
-//!   would.
+//! - that two threads allocating from one arena at once are handed ranges
+//!   of their own (invariant A8 in `engine::arena`), two threads inserting
+//!   into one skip list at once both land, and one entry inserted twice is
+//!   held once (S2 in `engine::skiplist`): the memtable takes writes from
+//!   any thread, as the commit pipeline needs;
+//! - that the sections of a step never overlap and none is left behind
+//!   (`engine::step`);
+//! - that a job a queue's poll parks instead of waiting is woken, and that
+//!   nobody who waited on it is left behind (`engine::commit::park`).
 //!
 //! The version models in [`version`] are protocol models and say so:
 //! the production `VersionSet` writes a manifest record and opens an
 //! SSTable reader inside `apply`, and its locks come from `std::sync`
-//! rather than from `crate::sync`, so loom can neither run it nor see
+//! rather than from `crate::sync::internal`, so loom can neither run it nor see
 //! its ordering. What they reproduce is the part loom can decide - the
 //! `Arc<Version>` pin, the clone-mutate-store, and the lock scope around
 //! it - with the table contents stood in for.
@@ -64,14 +67,9 @@
 //! retires the frozen memtable before it installs the table, a relaxed
 //! read horizon, a compaction that publishes its removals and its
 //! addition as two versions, two version swaps with nothing serializing
-//! them, two arena allocations with nothing serializing them - and the
-//! pair is only meaningful if the wrong one fails. They are run as
-//! `#[should_panic]` tests in `tests/loom_memtable.rs`. [`arena`]'s
-//! calibration is two expectations gated on one test by
-//! `debug_assertions`, because the arena's single-writer guard is itself
-//! debug-only: a debug build proves the guard trips, a release build
-//! proves the tracked cell catches the same race once the guard is
-//! compiled out.
+//! them, an arena cursor and a list link moved by a load and a store -
+//! and the pair is only meaningful if the wrong one fails. They are run
+//! as `#[should_panic]` tests in `tests/loom_memtable.rs`.
 //!
 //! A calibration stops at the first schedule that trips its assertion,
 //! so [`explore`]'s floors never execute for one: the panic unwinds past
@@ -80,9 +78,17 @@
 //! found the bug, not how large its search space is.
 
 pub mod arena;
+pub mod families;
+pub mod gate;
 pub mod handoff;
+pub mod io_queue;
+pub mod jobs;
+pub mod park;
 pub mod skiplist;
 pub mod slice;
+pub mod snapshots;
+pub mod step;
+pub mod tombstones;
 pub mod version;
 
 use std::sync::Arc as StdArc;
@@ -126,11 +132,11 @@ fn probe(user_key: &[u8]) -> LookupKey {
 /// executing one. The witness count is that missing half, and [`explore`]
 /// fails a model whose witness stays at zero.
 #[derive(Clone)]
-pub(super) struct Witness(StdArc<AtomicUsize>);
+pub(crate) struct Witness(StdArc<AtomicUsize>);
 
 impl Witness {
     /// Record that this execution reached the interesting state.
-    pub(super) fn record(&self) {
+    pub(crate) fn record(&self) {
         self.0.fetch_add(1, StdOrdering::Relaxed);
     }
 
@@ -168,8 +174,23 @@ impl Drop for Report {
 /// exists to check. A model that fails either floor fails, because a
 /// model that explores one schedule, or that never reaches its own
 /// interesting branch, is worse than no model at all.
-fn explore(
+pub(crate) fn explore(
     name: &'static str,
+    min_interleavings: usize,
+    min_witnesses: usize,
+    model: impl Fn(&Witness) + Sync + Send + 'static,
+) {
+    explore_bounded(name, None, min_interleavings, min_witnesses, model);
+}
+
+/// [`explore`] with at most `preemptions` preemptions per schedule, or
+/// none when `None`. `LOOM_MAX_PREEMPTIONS` overrides a bound given here.
+/// Models with three threads that each make several atomic accesses need
+/// one: unbounded, their search runs for hours without reaching a new kind
+/// of interleaving.
+pub(crate) fn explore_bounded(
+    name: &'static str,
+    preemptions: Option<usize>,
     min_interleavings: usize,
     min_witnesses: usize,
     model: impl Fn(&Witness) + Sync + Send + 'static,
@@ -190,7 +211,9 @@ fn explore(
         }
     };
 
-    loom::model::Builder::new().check(counted);
+    let mut builder = loom::model::Builder::new();
+    builder.preemption_bound = builder.preemption_bound.or(preemptions);
+    builder.check(counted);
 
     let explored = runs.load(StdOrdering::Relaxed);
     let witnessed = witness.count();

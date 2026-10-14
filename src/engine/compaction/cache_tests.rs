@@ -54,18 +54,21 @@ fn compaction_does_not_populate_the_foreground_cache() {
                     largest_key: summary.largest_user_key,
                     file_size: std::fs::metadata(&path).unwrap().len(),
                     num_entries: summary.num_entries,
+                    global_seq: None,
+                    deletions: Some(summary.deletions),
                 },
                 Arc::new(SsTableReader::open(&path, 1).unwrap()),
             );
             versions
-                .lock()
-                .apply(&[
-                    VersionEdit::SetNextFileId(2),
-                    VersionEdit::AddFile {
-                        level: 0,
-                        file: Arc::clone(&input),
-                    },
-                ])
+                .run(|versions| {
+                    versions.apply(&[
+                        VersionEdit::SetNextFileId(2),
+                        VersionEdit::AddFile {
+                            level: 0,
+                            file: Arc::clone(&input),
+                        },
+                    ])
+                })
                 .unwrap();
             let cache = Arc::new(BlockCache::new(1024 * 1024));
             let inspector = Arc::new(CacheInspector {
@@ -91,7 +94,7 @@ fn compaction_does_not_populate_the_foreground_cache() {
             )
             .unwrap();
             assert_eq!(inspector.calls.load(Ordering::Relaxed), expected.len());
-            let version = versions.lock().current();
+            let version = versions.current();
             assert!(version.levels[0].is_empty());
             let read_cache = BlockCache::new(0);
             let actual: Vec<_> = version.levels[1]

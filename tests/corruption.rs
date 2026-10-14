@@ -17,12 +17,14 @@ use std::fs::{self, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
 
-use regolith::{Db, Error, Options};
+use std::sync::Arc;
+
+use regolith::{Db, DurabilityMode, Error, Options, Statistics, Ticker};
 use tempfile::TempDir;
 
 mod common;
 
-use common::{count_sst_files, count_wal_files, force_compaction, open};
+use common::{count_sst_files, count_wal_files, force_compaction, open, wal_format};
 
 // ── helpers ─────────────────────────────────────────────────────
 
@@ -73,28 +75,73 @@ fn assert_open_fails_with_kind(dir: &TempDir, expected: io::ErrorKind) {
 
 // ── WAL tail corruption ─────────────────────────────────────────
 
+/// Options that report what an open discards.
+fn reporting_opts(reports: &Arc<wal_format::TailReports>) -> (Options, Arc<Statistics>) {
+    let stats = Arc::new(Statistics::new());
+    let opts = common::small_opts()
+        .listeners(vec![reports.clone() as Arc<dyn regolith::EventListener>])
+        .statistics(Some(Arc::clone(&stats)));
+    (opts, stats)
+}
+
 #[test]
-fn torn_wal_tail_checksum_flip_fails_open_and_keeps_wal() {
-    // A checksum mismatch means replay cannot prove which committed
-    // records are safe. Open must fail closed and leave the WAL for
-    // repair/inspection rather than silently keeping only a prefix.
+fn damage_a_later_record_proves_synced_fails_open_and_keeps_wal() {
+    // Under Immediate durability each record carries the offset the sync
+    // before it covered, so the second record proves the first durable.
+    // Damage to the first is then loss of an acknowledged write: open
+    // must fail closed and leave the log for repair or inspection.
     let dir = TempDir::new().unwrap();
     {
-        let db = open(&dir);
-        db.put(b"good_1", b"1").unwrap();
-        db.put(b"good_2", b"2").unwrap();
+        let db = Db::open(
+            dir.path(),
+            common::small_opts().durability(DurabilityMode::Immediate),
+        )
+        .unwrap();
+        regolith::through_stalls(|| db.put(b"good_1", b"1")).unwrap();
+        regolith::through_stalls(|| db.put(b"good_2", b"2")).unwrap();
     }
 
     let wal = first_wal(dir.path());
     let wal_count = count_wal_files(dir.path());
-    let size = fs::metadata(&wal).unwrap().len() as usize;
-    // Flip the last byte of the file - always part of the trailing
-    // record's 4-byte checksum.
-    flip_byte(&wal, size - 1);
+    let bounds = wal_format::record_bounds(&fs::read(&wal).unwrap());
+    flip_byte(&wal, bounds[1] - 1);
 
     assert_open_fails_with_kind(&dir, io::ErrorKind::InvalidData);
     assert!(wal.exists());
     assert_eq!(count_wal_files(dir.path()), wal_count);
+}
+
+#[test]
+fn a_damaged_final_record_nothing_proves_synced_is_dropped_and_reported() {
+    // Nothing after the last record vouches for it, so a crash was free
+    // to leave it in any state: the open keeps every record before it,
+    // drops it, and says so.
+    let dir = TempDir::new().unwrap();
+    {
+        let db = open(&dir);
+        regolith::through_stalls(|| db.put(b"good_1", b"1")).unwrap();
+        regolith::through_stalls(|| db.put(b"good_2", b"2")).unwrap();
+    }
+    let wal = first_wal(dir.path());
+    let bytes = fs::read(&wal).unwrap();
+    let bounds = wal_format::record_bounds(&bytes);
+    flip_byte(&wal, bytes.len() - 1);
+
+    let reports = wal_format::TailReports::new();
+    let (opts, stats) = reporting_opts(&reports);
+    let db = Db::open(dir.path(), opts).unwrap();
+    assert_eq!(db.get(b"good_1").unwrap(), Some(b"1".to_vec()));
+    assert_eq!(db.get(b"good_2").unwrap(), None);
+    let taken = reports.taken();
+    assert_eq!(taken.len(), 1);
+    assert_eq!(taken[0].file_path, wal);
+    assert_eq!(taken[0].offset, bounds[1] as u64);
+    assert_eq!(taken[0].discarded_bytes, (bytes.len() - bounds[1]) as u64);
+    assert_eq!(stats.get_ticker(Ticker::WalTailDiscarded), 1);
+    assert_eq!(
+        stats.get_ticker(Ticker::WalTailDiscardedBytes),
+        taken[0].discarded_bytes
+    );
 }
 
 #[test]
@@ -109,22 +156,13 @@ fn wal_truncated_at_arbitrary_offset_replays_the_whole_records_before_the_cut() 
         let dir = TempDir::new().unwrap();
         {
             let db = open(&dir);
-            db.put(b"a", b"1").unwrap();
-            db.put(b"b", b"2").unwrap();
+            regolith::through_stalls(|| db.put(b"a", b"1")).unwrap();
+            regolith::through_stalls(|| db.put(b"b", b"2")).unwrap();
         }
         let wal = first_wal(dir.path());
         let wal_count = count_wal_files(dir.path());
         let full = fs::read(&wal).unwrap();
-        // `[stamp: 12][len: u32 LE][type: u8][payload][crc: u32 LE]`,
-        // so this is where the first record ends. The length is read
-        // after the stamp, not at byte zero: reading it at zero takes
-        // four bytes of the REGO stamp as a length and lands the cut
-        // somewhere arbitrary. Matches `WAL_STAMP_LEN` in
-        // `src/engine/wal.rs`.
-        const STAMP: u64 = 12;
-        let len =
-            u32::from_le_bytes(full[STAMP as usize..STAMP as usize + 4].try_into().unwrap()) as u64;
-        let first_end = STAMP + 9 + len;
+        let first_end = wal_format::record_bounds(&full)[1] as u64;
         let cut = full.len() as u64 - trim;
         assert!(
             cut > first_end && cut < full.len() as u64,
@@ -142,19 +180,23 @@ fn wal_truncated_at_arbitrary_offset_replays_the_whole_records_before_the_cut() 
 }
 
 #[test]
-fn wal_checksum_flip_in_final_record_fails_open() {
-    // Flipping a checksum byte in the last record is still a
-    // corruption signal. Do not convert it into a clean stop.
+fn wal_checksum_flip_in_final_record_of_a_closed_log_fails_open() {
+    // A clean close syncs every record and then appends CLOSE, which
+    // proves the whole log durable. Damage to the final record is then
+    // corruption, not a crash: do not convert it into a clean stop.
     let dir = TempDir::new().unwrap();
     {
         let db = open(&dir);
-        db.put(b"first", b"v1").unwrap();
-        db.put(b"second", b"v2").unwrap();
+        regolith::through_stalls(|| db.put(b"first", b"v1")).unwrap();
+        regolith::through_stalls(|| db.put(b"second", b"v2")).unwrap();
+        db.close().unwrap();
     }
     let wal = first_wal(dir.path());
-    let size = fs::metadata(&wal).unwrap().len() as usize;
-    // Flip the very last byte (high byte of the trailing checksum).
-    flip_byte(&wal, size - 1);
+    let bytes = fs::read(&wal).unwrap();
+    let bounds = wal_format::record_bounds(&bytes);
+    let close = bounds[bounds.len() - 2];
+    assert_eq!(wal_format::kind_at(&bytes, close), wal_format::KIND_CLOSE);
+    flip_byte(&wal, close - 1);
 
     assert_open_fails_with_kind(&dir, io::ErrorKind::InvalidData);
     assert!(wal.exists());
@@ -173,7 +215,7 @@ fn manifest_deleted_prevents_reopen_of_nonempty_db() {
     {
         let db = open(&dir);
         for i in 0..200 {
-            db.put(format!("k_{:04}", i).as_bytes(), &[0u8; 64])
+            regolith::through_stalls(|| db.put(format!("k_{:04}", i).as_bytes(), &[0u8; 64]))
                 .unwrap();
         }
         force_compaction(&db);
@@ -192,11 +234,9 @@ fn manifest_deleted_prevents_reopen_of_nonempty_db() {
 }
 
 fn manifest_options() -> Options {
-    Options {
-        max_background_compactions: 0,
-        l0_compaction_trigger: 100,
-        ..Options::default()
-    }
+    Options::default()
+        .max_background_compactions(0)
+        .l0_compaction_trigger(100)
 }
 
 #[test]
@@ -205,10 +245,10 @@ fn corrupted_manifest_batch_preserves_the_earlier_flush() {
     let manifest = dir.path().join("MANIFEST");
     let second_end = {
         let db = Db::open(dir.path(), manifest_options()).unwrap();
-        db.put(b"k1", b"v1").unwrap();
+        regolith::through_stalls(|| db.put(b"k1", b"v1")).unwrap();
         db.flush().unwrap();
         let first_end = fs::metadata(&manifest).unwrap().len();
-        db.put(b"k2", b"v2").unwrap();
+        regolith::through_stalls(|| db.put(b"k2", b"v2")).unwrap();
         db.flush().unwrap();
         let second_end = fs::metadata(&manifest).unwrap().len();
         assert!(second_end > first_end);
@@ -237,16 +277,16 @@ fn corrupted_completed_compaction_refuses_missing_inputs_without_rewriting() {
     let manifest = dir.path().join("MANIFEST");
     let (inputs, compaction_end) = {
         let db = Db::open(dir.path(), manifest_options()).unwrap();
-        db.put(b"k1", b"v1").unwrap();
+        regolith::through_stalls(|| db.put(b"k1", b"v1")).unwrap();
         db.flush().unwrap();
-        db.put(b"k2", b"v2").unwrap();
+        regolith::through_stalls(|| db.put(b"k2", b"v2")).unwrap();
         db.flush().unwrap();
         let inputs: Vec<_> = fs::read_dir(dir.path().join("sst"))
             .unwrap()
             .map(|entry| entry.unwrap().path())
             .collect();
         assert_eq!(inputs.len(), 2);
-        db.compact_range(None, None).unwrap();
+        db.compact_range(None, None).wait().unwrap();
         let end = fs::metadata(&manifest).unwrap().len() as usize;
         db.close().unwrap();
         (inputs, end)
@@ -273,6 +313,110 @@ fn corrupted_completed_compaction_refuses_missing_inputs_without_rewriting() {
     assert_eq!(count_sst_files(dir.path()), 1);
 }
 
+/// Three flushes, one table each, and the manifest's length after each.
+fn three_flushes(dir: &Path) -> [usize; 3] {
+    let manifest = dir.join("MANIFEST");
+    let db = Db::open(dir, manifest_options()).unwrap();
+    let mut ends = [0; 3];
+    for (i, end) in ends.iter_mut().enumerate() {
+        regolith::through_stalls(|| db.put(format!("k{i}").as_bytes(), b"v")).unwrap();
+        db.flush().unwrap();
+        *end = fs::metadata(&manifest).unwrap().len() as usize;
+    }
+    db.close().unwrap();
+    ends
+}
+
+/// E29: damage below a batch that needed a sync and has bytes after it is
+/// no crash's doing, because those bytes were written only once that sync
+/// had made everything before it durable. The open refuses, naming the file
+/// and both offsets, and leaves the manifest as it found it.
+#[test]
+fn damage_below_a_batch_a_later_sync_proves_refuses_naming_both_offsets() {
+    let dir = TempDir::new().unwrap();
+    let manifest = dir.path().join("MANIFEST");
+    let [first, second, _] = three_flushes(dir.path());
+    flip_byte(&manifest, first - 1);
+    let damaged = fs::read(&manifest).unwrap();
+    let err = match Db::open(dir.path(), manifest_options()) {
+        Err(Error::Corruption(e)) => e.to_string(),
+        Err(e) => panic!("expected a corruption error, got {e:?}"),
+        Ok(_) => panic!("damage a later sync proves durable must not open"),
+    };
+    assert!(err.contains("MANIFEST is damaged at offset"), "{err}");
+    assert!(err.contains(&format!("below offset {second}")), "{err}");
+    assert_eq!(fs::read(&manifest).unwrap(), damaged);
+}
+
+/// E29: bytes after the last batch that read back whole, which no later
+/// batch proves durable, are a crash's unsynced tail. A read-write open
+/// drops them, truncates the file and reports it with a warn line and two
+/// tickers; every table stays.
+#[test]
+fn a_torn_manifest_tail_is_dropped_truncated_and_reported() {
+    let dir = TempDir::new().unwrap();
+    let manifest = dir.path().join("MANIFEST");
+    three_flushes(dir.path());
+    let whole = fs::read(&manifest).unwrap();
+    let mut torn = whole.clone();
+    torn.extend_from_slice(&[0xAB; 37]);
+    fs::write(&manifest, &torn).unwrap();
+
+    let stats = Arc::new(Statistics::new());
+    let db = Db::open(
+        dir.path(),
+        manifest_options().statistics(Some(Arc::clone(&stats))),
+    )
+    .unwrap();
+    assert_eq!(stats.get_ticker(Ticker::ManifestTailDiscarded), 1);
+    assert_eq!(stats.get_ticker(Ticker::ManifestTailDiscardedBytes), 37);
+    for i in 0..3 {
+        assert_eq!(
+            db.get(format!("k{i}").as_bytes()).unwrap().as_deref(),
+            Some(&b"v"[..])
+        );
+    }
+    assert!(
+        fs::read(&manifest).unwrap().starts_with(&whole),
+        "the open keeps every batch that read back whole"
+    );
+    drop(db);
+    let stats = Arc::new(Statistics::new());
+    Db::open(
+        dir.path(),
+        manifest_options().statistics(Some(Arc::clone(&stats))),
+    )
+    .unwrap();
+    assert_eq!(
+        stats.get_ticker(Ticker::ManifestTailDiscarded),
+        0,
+        "the first open truncated the tail"
+    );
+}
+
+/// E29: a read-only open reports a torn manifest tail and leaves it.
+#[test]
+fn a_read_only_open_reports_a_torn_manifest_tail_and_leaves_it() {
+    let dir = TempDir::new().unwrap();
+    let manifest = dir.path().join("MANIFEST");
+    three_flushes(dir.path());
+    let mut torn = fs::read(&manifest).unwrap();
+    torn.extend_from_slice(&[0; 21]);
+    fs::write(&manifest, &torn).unwrap();
+
+    let stats = Arc::new(Statistics::new());
+    let db = Db::open_read_only(
+        dir.path(),
+        manifest_options().statistics(Some(Arc::clone(&stats))),
+    )
+    .unwrap();
+    assert_eq!(stats.get_ticker(Ticker::ManifestTailDiscarded), 1);
+    assert_eq!(stats.get_ticker(Ticker::ManifestTailDiscardedBytes), 21);
+    assert_eq!(db.get(b"k2").unwrap().as_deref(), Some(&b"v"[..]));
+    drop(db);
+    assert_eq!(fs::read(&manifest).unwrap(), torn);
+}
+
 // ── SSTable corruption ──────────────────────────────────────────
 
 #[test]
@@ -284,7 +428,7 @@ fn truncated_sst_file_to_below_footer_reports_error_on_open() {
     {
         let db = open(&dir);
         for i in 0..100 {
-            db.put(format!("k_{:04}", i).as_bytes(), b"v").unwrap();
+            regolith::through_stalls(|| db.put(format!("k_{:04}", i).as_bytes(), b"v")).unwrap();
         }
         force_compaction(&db);
     }
@@ -310,7 +454,7 @@ fn sst_footer_magic_byte_flip_detected_on_open() {
     {
         let db = open(&dir);
         for i in 0..50 {
-            db.put(format!("k_{:02}", i).as_bytes(), b"v").unwrap();
+            regolith::through_stalls(|| db.put(format!("k_{:02}", i).as_bytes(), b"v")).unwrap();
         }
         force_compaction(&db);
     }
@@ -336,7 +480,7 @@ fn stray_file_in_sst_dir_does_not_break_open() {
     let dir = TempDir::new().unwrap();
     {
         let db = open(&dir);
-        db.put(b"k", b"v").unwrap();
+        regolith::through_stalls(|| db.put(b"k", b"v")).unwrap();
         force_compaction(&db);
     }
     let sst_dir = dir.path().join("sst");
@@ -357,7 +501,7 @@ fn clean_close_then_reopen_has_stable_file_count() {
     {
         let db = open(&dir);
         for i in 0..300 {
-            db.put(format!("k_{:04}", i).as_bytes(), b"v").unwrap();
+            regolith::through_stalls(|| db.put(format!("k_{:04}", i).as_bytes(), b"v")).unwrap();
         }
         force_compaction(&db);
     }

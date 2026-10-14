@@ -23,14 +23,12 @@ use regolith::{Db, Options, WriteBatch};
 /// Small blocks so a modest number of rows spans many restart points and
 /// more than one block.
 fn blocky_options() -> Options {
-    Options {
-        write_buffer_size: 256 * 1024,
-        block_size: 4 * 1024,
-        block_cache_size: 0,
-        target_file_size: 512 * 1024,
-        max_background_compactions: 0,
-        ..Options::default()
-    }
+    Options::default()
+        .write_buffer_size(256 * 1024)
+        .block_size(4 * 1024)
+        .block_cache_size(0)
+        .target_file_size(512 * 1024)
+        .max_background_compactions(0)
 }
 
 const KEYS: u64 = 5_000;
@@ -42,10 +40,11 @@ fn build(dir: &std::path::Path) {
     for i in 0..KEYS {
         batch.put(&i.to_be_bytes(), &value);
         if batch.buffered_bytes() >= 64 * 1024 {
-            db.write(std::mem::take(&mut batch)).unwrap();
+            let full = std::mem::take(&mut batch);
+            regolith::through_stalls(|| db.write(full.clone())).unwrap();
         }
     }
-    db.write(batch).unwrap();
+    regolith::through_stalls(|| db.write(batch.clone())).unwrap();
     db.flush().unwrap();
     db.close().unwrap();
 }
@@ -79,7 +78,7 @@ fn a_reverse_walk_is_the_forward_walk_backwards() {
     let forward: Vec<Vec<u8>> = db
         .scan_stream(None, None)
         .unwrap()
-        .map(|(k, _)| k)
+        .map(|entry| entry.unwrap().0)
         .collect();
     assert_eq!(forward.len() as u64, KEYS);
 

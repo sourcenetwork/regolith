@@ -33,10 +33,7 @@ fn crash_child() {
 }
 
 fn opts() -> Options {
-    Options {
-        write_buffer_size: 1 << 20,
-        ..Options::default()
-    }
+    Options::default().write_buffer_size(1 << 20)
 }
 
 fn cut_inside_a_wal_write(db: &std::path::Path, nth: u64, tear: TearMode) -> ChildOutcome {
@@ -63,7 +60,7 @@ fn probe(tear: TearMode, nth: u64) -> Result<usize, String> {
     }
     match fault::recover_and_validate(&db, opts(), &out.history) {
         Recovery::Recovered(r) => {
-            fault::assert_acked_survived(&r, &out.acked);
+            fault::assert_acked_survived(&r, &out.acked());
             Ok(r.k)
         }
         Recovery::RefusedToOpen(e) => Err(format!(

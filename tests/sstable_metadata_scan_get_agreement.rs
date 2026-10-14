@@ -30,13 +30,11 @@ fn value(i: usize) -> Vec<u8> {
 }
 
 fn build_opts(partitioned: bool) -> Options {
-    Options {
-        write_buffer_size: 1 << 20,
-        partitioned_index: partitioned,
-        metadata_block_size: if partitioned { 128 } else { 4096 },
-        block_size: 256,
-        ..Options::default()
-    }
+    Options::default()
+        .write_buffer_size(1 << 20)
+        .partitioned_index(partitioned)
+        .metadata_block_size(if partitioned { 128 } else { 4096 })
+        .block_size(256)
 }
 
 /// One file of a planted database directory: its path relative to the
@@ -57,7 +55,7 @@ fn fixture(partitioned: bool) -> Vec<PlantedFile> {
             db.put(&key(i), &value(i)).expect("put");
         }
         db.delete_range(b"k_000050", b"k_000060").expect("range");
-        db.compact_range(None, None).expect("compact");
+        db.compact_range(None, None).wait().expect("compact");
         db.close().expect("close");
     }
     let mut out = Vec::new();

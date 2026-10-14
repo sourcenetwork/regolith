@@ -71,12 +71,6 @@ impl RangeTombstoneSet {
         }
     }
 
-    pub(crate) fn push(&mut self, tombstone: RangeTombstone) {
-        self.tombstones.push(tombstone);
-        sort_dedup_tombstones(&mut self.tombstones);
-        self.prefix_max_end = build_prefix_max_end(&self.tombstones);
-    }
-
     pub(crate) fn is_empty(&self) -> bool {
         self.tombstones.is_empty()
     }
@@ -114,6 +108,26 @@ impl RangeTombstoneSet {
         }
 
         best
+    }
+
+    /// Whether one tombstone of the set covers every key of the closed
+    /// range `[first, last]`. Two tombstones that only cover it between them
+    /// do not count.
+    pub(crate) fn covers_whole(&self, first: &[u8], last: &[u8]) -> bool {
+        let mut idx = self
+            .tombstones
+            .partition_point(|rt| rt.start.as_slice() <= first);
+        while idx > 0 {
+            idx -= 1;
+            // No tombstone at or before `idx` ends past `last`.
+            if self.prefix_max_end[idx].as_slice() <= last {
+                break;
+            }
+            if self.tombstones[idx].end.as_slice() > last {
+                return true;
+            }
+        }
+        false
     }
 
     pub(crate) fn clipped_overlaps(&self, start: &[u8], end: &[u8]) -> Vec<RangeTombstone> {
@@ -190,6 +204,31 @@ pub(crate) fn table_key_range<'tombstone>(
         })
 }
 
+/// `tombstones` with every run of ranges that share a sequence and touch
+/// or overlap joined into one, oldest sequence first.
+///
+/// A compaction clips a tombstone to each table it writes, so one
+/// `delete_range` can reach here as a piece per table. Joined, the pieces
+/// delete exactly what they deleted apart: the same keys, at the same
+/// sequence.
+pub(crate) fn coalesced(mut tombstones: Vec<RangeTombstone>) -> Vec<RangeTombstone> {
+    sort_dedup_tombstones(&mut tombstones);
+    // Stable, so each sequence keeps its ranges in start order.
+    tombstones.sort_by_key(|tombstone| tombstone.seq);
+    let mut joined: Vec<RangeTombstone> = Vec::with_capacity(tombstones.len());
+    for tombstone in tombstones {
+        match joined.last_mut() {
+            Some(last) if last.seq == tombstone.seq && tombstone.start <= last.end => {
+                if tombstone.end > last.end {
+                    last.end = tombstone.end;
+                }
+            }
+            _ => joined.push(tombstone),
+        }
+    }
+    joined
+}
+
 pub(crate) fn sort_dedup_tombstones(tombstones: &mut Vec<RangeTombstone>) {
     tombstones.sort_by(|a, b| {
         a.start
@@ -218,6 +257,7 @@ fn build_prefix_max_end(tombstones: &[RangeTombstone]) -> Vec<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     #[test]
     fn covers_half_open() {
@@ -282,6 +322,25 @@ mod tests {
     }
 
     #[test]
+    fn a_whole_range_is_covered_only_by_one_tombstone_over_all_of_it() {
+        let set = RangeTombstoneSet::from_vec(vec![
+            RangeTombstone::new(b"a".to_vec(), b"c".to_vec(), 1),
+            RangeTombstone::new(b"b".to_vec(), b"k".to_vec(), 2),
+            RangeTombstone::new(b"k".to_vec(), b"p".to_vec(), 3),
+        ]);
+        assert!(set.covers_whole(b"b", b"j"));
+        assert!(set.covers_whole(b"a", b"b"));
+        assert!(set.covers_whole(b"k", b"o"));
+        // The end is exclusive.
+        assert!(!set.covers_whole(b"b", b"k"));
+        // Covered between two tombstones, by neither alone.
+        assert!(!set.covers_whole(b"c", b"m"));
+        assert!(!set.covers_whole(b"0", b"b"));
+        assert!(!set.covers_whole(b"q", b"r"));
+        assert!(!RangeTombstoneSet::default().covers_whole(b"a", b"b"));
+    }
+
+    #[test]
     fn clipped_overlaps_returns_fragments_in_order() {
         let set = RangeTombstoneSet::from_vec(vec![
             RangeTombstone::new(b"a".to_vec(), b"z".to_vec(), 5),
@@ -334,5 +393,58 @@ mod tests {
         assert_eq!(exclusive_successor(b"a"), b"a\0");
         assert!(b"a".as_slice() < exclusive_successor(b"a").as_slice());
         assert!(exclusive_successor(b"a").as_slice() < b"aa".as_slice());
+    }
+
+    fn tombstone(start: &[u8], end: &[u8], seq: u64) -> RangeTombstone {
+        RangeTombstone::new(start.to_vec(), end.to_vec(), seq)
+    }
+
+    fn as_tuples(tombstones: &[RangeTombstone]) -> Vec<(&[u8], &[u8], u64)> {
+        tombstones
+            .iter()
+            .map(|t| (t.start.as_slice(), t.end.as_slice(), t.seq))
+            .collect()
+    }
+
+    #[test]
+    fn pieces_of_one_range_delete_are_joined_and_others_are_not() {
+        let joined = coalesced(vec![
+            // One delete at sequence 9, clipped to three tables, one piece twice.
+            tombstone(b"c", b"f", 9),
+            tombstone(b"a", b"c", 9),
+            tombstone(b"e", b"h", 9),
+            tombstone(b"a", b"c", 9),
+            // The same range at another sequence is another delete.
+            tombstone(b"a", b"h", 4),
+            // A gap: `h` itself is not deleted at 9.
+            tombstone(b"i", b"k", 9),
+        ]);
+        let expected: [(&[u8], &[u8], u64); 3] =
+            [(b"a", b"h", 4), (b"a", b"h", 9), (b"i", b"k", 9)];
+        assert_eq!(as_tuples(&joined), expected);
+        assert!(coalesced(Vec::new()).is_empty());
+    }
+
+    proptest! {
+        /// Joined, the tombstones delete what they deleted apart: for every key
+        /// and every snapshot, the newest covering sequence is the same.
+        #[test]
+        fn joined_range_deletes_cover_exactly_what_the_pieces_covered(
+            pieces in prop::collection::vec((0u8..12, 0u8..12, 1u64..5), 0..12),
+            key in 0u8..12,
+            snapshot in 0u64..6,
+        ) {
+            let pieces: Vec<RangeTombstone> = pieces
+                .into_iter()
+                .map(|(a, b, seq)| tombstone(&[a.min(b)], &[a.max(b)], seq))
+                .collect();
+            let joined = coalesced(pieces.clone());
+            prop_assert_eq!(
+                max_covering_seq(&joined, &[key], snapshot),
+                max_covering_seq(&pieces, &[key], snapshot)
+            );
+            prop_assert!(joined.windows(2).all(|pair| pair[0].seq <= pair[1].seq));
+            prop_assert!(joined.len() <= pieces.len());
+        }
     }
 }

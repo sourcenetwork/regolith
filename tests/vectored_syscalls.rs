@@ -8,7 +8,7 @@
 #![cfg(not(target_arch = "wasm32"))]
 
 use regolith::env::{
-    Capabilities, DirEntry, Env, FileLock, FileMeta, JoinHandle, ReadFile, StdEnv, WriteFile,
+    Capabilities, Env, FileLock, FileMeta, JoinHandle, ReadDir, ReadFile, StdEnv, WriteFile,
     WriteMode,
 };
 use regolith::{Db, Options, WriteBatch, WriteOptions};
@@ -65,6 +65,26 @@ impl WriteFile for CountingWrite {
     }
 }
 
+/// The log the host hands out, with every write at an offset counted as
+/// the one host write it is.
+struct CountingLog {
+    inner: Box<dyn regolith::env::LogFile>,
+    counters: Arc<Counters>,
+}
+
+impl regolith::env::LogFile for CountingLog {
+    fn write_all_at(&self, offset: u64, buf: &[u8]) -> io::Result<()> {
+        self.counters.writes.fetch_add(1, Ordering::Relaxed);
+        self.inner.write_all_at(offset, buf)
+    }
+    fn sync_data(&self) -> io::Result<()> {
+        self.inner.sync_data()
+    }
+    fn set_len(&self, len: u64) -> io::Result<()> {
+        self.inner.set_len(len)
+    }
+}
+
 impl Env for CountingEnv {
     fn open_write(&self, path: &Path, mode: WriteMode) -> io::Result<Box<dyn WriteFile>> {
         let inner = self.inner.open_write(path, mode)?;
@@ -73,10 +93,20 @@ impl Env for CountingEnv {
             counters: Arc::clone(&self.counters),
         }))
     }
+    fn open_log(
+        &self,
+        path: &Path,
+        mode: WriteMode,
+    ) -> io::Result<Box<dyn regolith::env::LogFile>> {
+        Ok(Box::new(CountingLog {
+            inner: self.inner.open_log(path, mode)?,
+            counters: Arc::clone(&self.counters),
+        }))
+    }
     fn create_dir_all(&self, p: &Path) -> io::Result<()> {
         self.inner.create_dir_all(p)
     }
-    fn read_dir(&self, p: &Path) -> io::Result<Vec<DirEntry>> {
+    fn read_dir(&self, p: &Path) -> io::Result<ReadDir<'_>> {
         self.inner.read_dir(p)
     }
     fn open_read(&self, p: &Path) -> io::Result<Box<dyn ReadFile>> {
@@ -116,9 +146,6 @@ impl Env for CountingEnv {
     ) -> io::Result<Box<dyn JoinHandle>> {
         self.inner.spawn(name, f)
     }
-    fn sleep(&self, d: std::time::Duration) {
-        self.inner.sleep(d)
-    }
 }
 
 /// A record whose payload is at or above the buffer capacity bypasses the
@@ -128,13 +155,10 @@ impl Env for CountingEnv {
 fn a_large_wal_record_costs_one_host_write() {
     let dir = TempDir::new().unwrap();
     let counters = Arc::new(Counters::default());
-    let opts = Options {
-        env: Arc::new(CountingEnv {
-            inner: StdEnv,
-            counters: Arc::clone(&counters),
-        }),
-        ..Default::default()
-    };
+    let opts = Options::default().env(Arc::new(CountingEnv {
+        inner: StdEnv,
+        counters: Arc::clone(&counters),
+    }));
     let db = Db::open(dir.path(), opts).unwrap();
 
     // Settle: opening writes MANIFEST records of its own.

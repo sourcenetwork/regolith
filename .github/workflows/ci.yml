@@ -68,11 +68,26 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@nextest
       - uses: extractions/setup-just@v2
+      # `just test` runs the doc tests under coreutils `timeout`, which
+      # macOS does not ship.
+      - if: runner.os == 'macOS'
+        run: brew install coreutils
       - run: just test
+      # `regolith::testing` is behind a feature no default build has. Its
+      # tests run on one host: the checks are plain Rust with nothing a
+      # platform changes, and the build they need is a second build of the
+      # whole library, which the slower hosts would pay for nothing.
+      - if: matrix.os == 'ubuntu-latest'
+        run: just test-testing
 
 
+  # Every job below carries a `timeout-minutes` a few times its measured
+  # run time, so one that hangs is cancelled in minutes and named, where
+  # GitHub's default would hold a runner for six hours.
   clippy:
     runs-on: ubuntu-latest
+    # Measured at 35 s.
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -85,6 +100,8 @@ jobs:
 
   fmt:
     runs-on: ubuntu-latest
+    # Measured at 13 s.
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -96,6 +113,8 @@ jobs:
 
   doc:
     runs-on: ubuntu-latest
+    # Measured at 30 s.
+    timeout-minutes: 15
     env:
       RUSTDOCFLAGS: -D warnings
     steps:
@@ -108,6 +127,8 @@ jobs:
 
   alloc-budget:
     runs-on: ubuntu-latest
+    # Measured at 45 s.
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -144,6 +165,8 @@ jobs:
   # unserialized insert only runs there.
   msrv:
     runs-on: ubuntu-latest
+    # Measured at 35 s.
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.90
@@ -164,6 +187,8 @@ jobs:
 
   deny:
     runs-on: ubuntu-latest
+    # Measured at 25 s.
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: EmbarkStudios/cargo-deny-action@v2
@@ -238,10 +263,11 @@ jobs:
   # budget.
 
 
-  # Long-running stress, soak, and fault-injection tests. Gated behind
-  # `#[ignore]` in the main crate so `cargo test` stays fast for PRs;
-  # this job unlocks them via `--ignored`. Runs on the nightly schedule,
-  # manual dispatch, or direct pushes to `main`, never on PRs.
+  # A second full run of the workspace, in a release build and one test at
+  # a time with its output shown (`just test-slow`). No test is unlocked by
+  # it: the stress and soak tests are in the ordinary run too. Runs on the
+  # nightly schedule, manual dispatch, or direct pushes to `main`, never on
+  # PRs.
   nightly-stress:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || github.event_name == 'push'
     runs-on: ubuntu-latest
@@ -252,8 +278,36 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@nextest
-      - name: Run ignored tests (stress / soak / concurrency)
+      - name: Whole workspace in release, one test at a time
         run: just test-slow
+
+  # The five `regolith::sync` loom models whose three threads all contend
+  # for one lock or semaphore, at preemption bound 2. The model-checking
+  # workflow runs them at bound 1 on every change. At bound 2 each runs a
+  # smaller scenario of its own and takes 2 s to 6 minutes on a workstation,
+  # so they run here, nightly, one job per model. The limit is per model;
+  # the recipe stops the run itself, as a failure, at 15 minutes. A model
+  # that reaches it must be made smaller, not given more time.
+  loom-sync-deep:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        model:
+          - mutex_excludes_and_loses_no_wakeup_at_bound_2
+          - a_cancelled_mutex_waiter_racing_the_handoff_loses_nothing_at_bound_2
+          - a_semaphore_never_hands_out_more_permits_than_it_has_at_bound_2
+          - an_upgradable_read_upgrades_while_readers_and_a_writer_contend_at_bound_2
+          - a_cancelled_rwlock_writer_racing_the_last_reader_loses_nothing_at_bound_2
+    steps:
+      - uses: actions/checkout@v4
+      - uses: extractions/setup-just@v2
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Loom ${{ matrix.model }}
+        run: just loom-sync-deep ${{ matrix.model }}
 
   # Durability, split out from `test` because it fails for different
   # reasons and is worth reading on its own: crash recovery, power loss,

@@ -18,16 +18,14 @@ const N: usize = 4_000;
 /// Options pinned identically on every target so the bytes on disk are
 /// a function of the data alone.
 fn opts() -> Options {
-    Options {
-        write_buffer_size: 32 * 1024,
-        target_file_size: 64 * 1024,
-        level_base_bytes: 256 * 1024,
-        block_size: 4 * 1024,
-        block_cache_size: 0,
-        max_background_compactions: 0,
-        bloom_bits_per_key: 10,
-        ..Options::default()
-    }
+    Options::default()
+        .write_buffer_size(32 * 1024)
+        .target_file_size(64 * 1024)
+        .level_base_bytes(256 * 1024)
+        .block_size(4 * 1024)
+        .block_cache_size(0)
+        .max_background_compactions(0)
+        .bloom_bits_per_key(10)
 }
 
 fn key(i: usize) -> Vec<u8> {
@@ -83,6 +81,7 @@ fn write(dir: &str) -> Result<(), String> {
         .map_err(|e| format!("delete_range: {e:?}"))?;
     db.flush().map_err(|e| format!("flush: {e:?}"))?;
     db.compact_range(None, None)
+        .wait()
         .map_err(|e| format!("compact_range: {e:?}"))?;
     db.close().map_err(|e| format!("close: {e:?}"))?;
     println!("WROTE {N} records to {dir}");

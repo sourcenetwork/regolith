@@ -6,7 +6,8 @@
 //! caller then polls the `Statistics` object (via
 //! [`Statistics::get_ticker`], [`Statistics::get_histogram_snapshot`],
 //! or [`Statistics::to_string`]) to export the values to their
-//! monitoring stack of choice.
+//! monitoring stack of choice. A caller that kept only the database
+//! reads the same object back with [`crate::Db::statistics`].
 //!
 //! # Metric names
 //!
@@ -24,8 +25,16 @@
 //! `Options::statistics = None` short-circuits every instrumentation
 //! site behind an `Option::is_some` check plus an `Arc` clone at
 //! open time. The hot-path overhead is a single branch. Reaching
-//! for a non-`None` statistics object adds one `fetch_add` per
-//! ticker update and a short mutex for histogram updates.
+//! for a non-`None` statistics object adds one relaxed `fetch_add` per
+//! ticker update and a few atomic operations per histogram sample, all
+//! on the calling thread's own shard.
+//!
+//! # Per-thread shards (plan 4.6, D54)
+//!
+//! Every ticker and histogram is kept once per thread number (see
+//! `per_thread`), each copy on cache lines of its own, so threads on
+//! different cores never write the same line. A read sums the copies.
+//! [`Statistics`] states what a read sees while updates run.
 //!
 //! # Histograms
 //!
@@ -36,6 +45,8 @@
 //! that drops in behind the existing API without breaking
 //! callers.
 
+use kovan::CachePadded;
+
 use crate::portability::{AtomicU64, Ordering};
 
 /// Enumerated counters incremented by the engine. Every variant
@@ -43,25 +54,31 @@ use crate::portability::{AtomicU64, Ordering};
 /// up a ticker is `O(1)` and thread-safe.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(usize)]
+#[non_exhaustive]
 pub enum Ticker {
-    /// Total key + value bytes written to the memtable. Counts
-    /// raw user bytes; does not include internal encoding
-    /// overhead, the CF prefix, or WAL framing.
+    /// Key and value bytes of the writes that committed: the key and
+    /// the value of each put and the key of each delete. Counts raw
+    /// user bytes; does not include internal encoding overhead, the
+    /// CF prefix, or WAL framing.
+    ///
+    /// This and the four counters of operations below count a write
+    /// once it has committed, whichever call made it: a put, a write
+    /// batch, a column family's call, a transaction's commit. A write
+    /// that failed, was refused or lost a conflict adds nothing.
     BytesWritten = 0,
     /// Total value bytes returned from point lookups that found
     /// a live value.
     BytesRead = 1,
-    /// Number of successful `put` operations routed through
-    /// `apply_batch`.
+    /// Number of puts that committed.
     KeysWritten = 2,
     /// Number of `get` calls (including lookups that returned
     /// `None`).
     KeysRead = 3,
-    /// Number of `delete` operations.
+    /// Number of deletes that committed.
     KeysDeleted = 4,
-    /// Number of range-delete operations.
+    /// Number of range deletes that committed.
     RangeDeletesWritten = 5,
-    /// Number of merge operands written.
+    /// Number of merge operands that committed.
     MergesWritten = 6,
     /// Block cache hits (the block was already resident).
     BlockCacheHit = 7,
@@ -71,7 +88,9 @@ pub enum Ticker {
     /// populated the cache).
     BlockCacheAdd = 9,
     /// Bloom-filter "useful" hits - the filter correctly
-    /// answered "not present" and spared a block read.
+    /// answered "not present" and spared a block read. Counts a point
+    /// lookup a table's key filter ruled out, and a table a prefix seek's
+    /// prefix filter ruled out.
     BloomFilterUseful = 10,
     /// Bloom-filter "full positive" hits - the filter said
     /// "maybe", and the key was actually present in the block.
@@ -94,19 +113,25 @@ pub enum Ticker {
     IterSeekCount = 19,
     /// Number of `Iter::next` calls that produced a key.
     IterNextCount = 20,
-    /// Microseconds writers spent in write-stall waits that admitted the
-    /// write: plain writes and transactional commits that carry writes
-    /// alike. A wait that ends in a busy or closed error is not counted.
+    /// Microseconds threads spent held by a write stall: relieving it
+    /// inline, or blocked until it cleared (a commit that waits a stop out,
+    /// [`crate::StallWait::wait`]).
+    ///
+    /// A wait that is polled or awaited on a queue holds no thread and is
+    /// not counted, nor is inline relief that ends in a busy or closed
+    /// error.
     WriteStallMicros = 21,
     /// Number of snapshots registered via `Db::snapshot`.
     SnapshotsRegistered = 22,
     /// Number of snapshots released (dropped or explicitly
     /// released).
     SnapshotsReleased = 23,
-    /// Number of incomplete trailing WAL records discarded during
-    /// recovery. A non-zero value means a crash left a partly written
-    /// record behind and the bytes from it to end-of-file were dropped;
-    /// the discard is also logged with the file and the offset.
+    /// Opens that discarded the end of the newest write-ahead log: the
+    /// bytes from its first unusable record on, which no surviving record
+    /// proves were made durable, as a crash leaves an unsynced tail. Each
+    /// is also logged and passed to
+    /// [`crate::EventListener::on_wal_tail_discarded`], with the file and
+    /// the offset.
     WalTailDiscarded = 24,
     /// Optimistic or pessimistic transaction commits that returned
     /// `Ok`.
@@ -135,50 +160,103 @@ pub enum Ticker {
     /// policy declared them safe to leave unvalidated. Counted only
     /// for commits that returned `Ok`.
     PolicyScanRunsDropped = 31,
+    /// Bytes discarded from the end of the newest write-ahead log at open,
+    /// summed over the discards [`Ticker::WalTailDiscarded`] counts.
+    WalTailDiscardedBytes = 32,
+    /// Write-ahead logs that could not be removed once their writes were in
+    /// tables. Each is logged, never replayed, and removed again by the
+    /// next flush or open.
+    WalRemoveFailed = 33,
+    /// Opens that discarded the end of the MANIFEST: the bytes from its
+    /// first batch that does not read back whole, which no later batch
+    /// proves were made durable, as a crash leaves an unsynced tail. Each
+    /// is also logged with the file and the offset.
+    ManifestTailDiscarded = 34,
+    /// Bytes discarded from the end of the MANIFEST at open, summed over the
+    /// discards [`Ticker::ManifestTailDiscarded`] counts.
+    ManifestTailDiscardedBytes = 35,
+    /// Blocks the block cache refused to keep because every block its hand
+    /// could take was held by a reader (or by another insert's hand), so
+    /// keeping one more would pass the byte budget. The read that loaded the
+    /// block still uses it, uncached. A steady count means the cache is too
+    /// small for the blocks readers hold at once.
+    BlockCacheAddRefusedHeld = 36,
+    /// The subset of [`Ticker::CommitConflicts`] where the newer write
+    /// that decided the race was a delete or a range delete: a key the
+    /// transaction read or wrote was removed after its snapshot. It says
+    /// what the newer write was, where [`Ticker::CommitConflictsOnRead`]
+    /// and [`Ticker::CommitConflictsOnWrite`] say what the transaction
+    /// did with the key, so one conflict can count here and there. A
+    /// key deleted and then put again counts as a conflict with the put.
+    CommitConflictsAfterDelete = 37,
+    /// Tables an open moved to level 0 because an earlier release had left
+    /// their level with overlapping key ranges, which a level below 0
+    /// cannot hold. The data is unchanged, and the open is logged once. A
+    /// read-write open records the move, so the next open counts nothing;
+    /// a read-only open moves them in its own view, every time.
+    ManifestTablesDemoted = 38,
+    /// Compaction jobs run because more than half of the entries they read
+    /// were deletions and the entries those delete. Each is also counted in
+    /// [`Ticker::CompactionCount`]. Level and universal compaction only.
+    CompactionDeletionTriggered = 39,
+    /// Range deletes an open copied in front of every key because an
+    /// earlier release may have left them behind older keys they delete,
+    /// where a read would find the older key first. The data is unchanged,
+    /// and the open is logged once. A read-write open records that it
+    /// checked, so the next open counts nothing; a read-only open copies
+    /// them in its own view, every time.
+    ManifestRangeDeletesCopied = 40,
 }
 
-const NUM_TICKERS: usize = 32;
-
-/// Every defined ticker, in discriminant order. Used by
-/// [`Statistics::dump`] to iterate all slots. Keep this in sync
-/// with the [`Ticker`] enum - adding a variant without
-/// appending here will silently drop it from the dump output.
-const ALL_TICKERS: &[Ticker] = &[
-    Ticker::BytesWritten,
-    Ticker::BytesRead,
-    Ticker::KeysWritten,
-    Ticker::KeysRead,
-    Ticker::KeysDeleted,
-    Ticker::RangeDeletesWritten,
-    Ticker::MergesWritten,
-    Ticker::BlockCacheHit,
-    Ticker::BlockCacheMiss,
-    Ticker::BlockCacheAdd,
-    Ticker::BloomFilterUseful,
-    Ticker::BloomFilterFullPositive,
-    Ticker::CompactionBytesRead,
-    Ticker::CompactionBytesWritten,
-    Ticker::CompactionCount,
-    Ticker::FlushBytesWritten,
-    Ticker::FlushCount,
-    Ticker::WalBytesWritten,
-    Ticker::WalSyncCount,
-    Ticker::IterSeekCount,
-    Ticker::IterNextCount,
-    Ticker::WriteStallMicros,
-    Ticker::SnapshotsRegistered,
-    Ticker::SnapshotsReleased,
-    Ticker::WalTailDiscarded,
-    Ticker::CommitCount,
-    Ticker::CommitConflicts,
-    Ticker::CommitConflictsOnRead,
-    Ticker::CommitConflictsOnWrite,
-    Ticker::CommitWritesElided,
-    Ticker::PolicyBlindMergesCommuted,
-    Ticker::PolicyScanRunsDropped,
-];
+const NUM_TICKERS: usize = 41;
 
 impl Ticker {
+    /// Every defined ticker, in discriminant order. Adding a variant
+    /// without appending it here would drop it from [`Statistics::dump`].
+    pub const ALL: &'static [Ticker] = &[
+        Ticker::BytesWritten,
+        Ticker::BytesRead,
+        Ticker::KeysWritten,
+        Ticker::KeysRead,
+        Ticker::KeysDeleted,
+        Ticker::RangeDeletesWritten,
+        Ticker::MergesWritten,
+        Ticker::BlockCacheHit,
+        Ticker::BlockCacheMiss,
+        Ticker::BlockCacheAdd,
+        Ticker::BloomFilterUseful,
+        Ticker::BloomFilterFullPositive,
+        Ticker::CompactionBytesRead,
+        Ticker::CompactionBytesWritten,
+        Ticker::CompactionCount,
+        Ticker::FlushBytesWritten,
+        Ticker::FlushCount,
+        Ticker::WalBytesWritten,
+        Ticker::WalSyncCount,
+        Ticker::IterSeekCount,
+        Ticker::IterNextCount,
+        Ticker::WriteStallMicros,
+        Ticker::SnapshotsRegistered,
+        Ticker::SnapshotsReleased,
+        Ticker::WalTailDiscarded,
+        Ticker::CommitCount,
+        Ticker::CommitConflicts,
+        Ticker::CommitConflictsOnRead,
+        Ticker::CommitConflictsOnWrite,
+        Ticker::CommitWritesElided,
+        Ticker::PolicyBlindMergesCommuted,
+        Ticker::PolicyScanRunsDropped,
+        Ticker::WalTailDiscardedBytes,
+        Ticker::WalRemoveFailed,
+        Ticker::ManifestTailDiscarded,
+        Ticker::ManifestTailDiscardedBytes,
+        Ticker::BlockCacheAddRefusedHeld,
+        Ticker::CommitConflictsAfterDelete,
+        Ticker::ManifestTablesDemoted,
+        Ticker::CompactionDeletionTriggered,
+        Ticker::ManifestRangeDeletesCopied,
+    ];
+
     /// Stable string name for exporting to monitoring systems.
     pub fn name(&self) -> &'static str {
         match self {
@@ -214,16 +292,26 @@ impl Ticker {
             Ticker::CommitWritesElided => "regolith.commit.writes_elided",
             Ticker::PolicyBlindMergesCommuted => "regolith.policy.blind_merges_commuted",
             Ticker::PolicyScanRunsDropped => "regolith.policy.scan_runs_dropped",
+            Ticker::WalTailDiscardedBytes => "regolith.wal.tail_discarded_bytes",
+            Ticker::WalRemoveFailed => "regolith.wal.remove_failed",
+            Ticker::ManifestTailDiscarded => "regolith.manifest.tail_discarded",
+            Ticker::ManifestTailDiscardedBytes => "regolith.manifest.tail_discarded_bytes",
+            Ticker::BlockCacheAddRefusedHeld => "regolith.block_cache.add_refused_held",
+            Ticker::CommitConflictsAfterDelete => "regolith.commit.conflicts_after_delete",
+            Ticker::ManifestTablesDemoted => "regolith.manifest.tables_demoted",
+            Ticker::CompactionDeletionTriggered => "regolith.compaction.deletion_triggered",
+            Ticker::ManifestRangeDeletesCopied => "regolith.manifest.range_deletes_copied",
         }
     }
 }
 
 /// Enumerated histograms recorded by the engine. Every variant
-/// is backed by one histogram slot in [`Statistics`], guarded
-/// by its own short mutex so recording is non-contending
-/// across histograms.
+/// is backed by one histogram slot in [`Statistics`] updated with
+/// lock-free atomics, so recording never blocks a thread and
+/// histograms do not contend with each other.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(usize)]
+#[non_exhaustive]
 pub enum Histogram {
     /// Wall-clock microseconds per `Db::get` call.
     DbGet = 0,
@@ -240,8 +328,8 @@ pub enum Histogram {
     FlushTime = 5,
     /// Bytes returned per `Db::get` that found a live value.
     BytesPerRead = 6,
-    /// Total bytes applied per `Db::write` (keys + values across
-    /// every op in the batch).
+    /// Bytes per write that committed (a put, a batch, a commit):
+    /// what that write added to [`Ticker::BytesWritten`].
     BytesPerWrite = 7,
     /// Wall-clock microseconds to append a batch to the WAL
     /// (including fsync when durability is Immediate).
@@ -251,7 +339,7 @@ pub enum Histogram {
 const NUM_HISTOGRAMS: usize = 9;
 
 /// Every defined histogram, in discriminant order. Same pattern
-/// as [`ALL_TICKERS`].
+/// as [`Ticker::ALL`].
 const ALL_HISTOGRAMS: &[Histogram] = &[
     Histogram::DbGet,
     Histogram::DbWrite,
@@ -347,23 +435,14 @@ impl HistogramData {
         self.max.fetch_max(value, Ordering::Relaxed);
     }
 
-    fn snapshot(&self) -> HistogramSnapshot {
-        let count = self.count.load(Ordering::Relaxed);
-        if count == 0 {
-            return HistogramSnapshot {
-                count: 0,
-                sum: 0,
-                min: 0,
-                max: 0,
-            };
-        }
-        let min = self.min.load(Ordering::Relaxed);
-        HistogramSnapshot {
-            count,
-            sum: self.sum.load(Ordering::Relaxed),
-            min: if min == u64::MAX { 0 } else { min },
-            max: self.max.load(Ordering::Relaxed),
-        }
+    /// Folds this shard's state into `acc`: counts and sums add, the
+    /// minimum and maximum widen. `acc.min` is `u64::MAX` until a shard
+    /// with a sample is folded in.
+    fn fold_into(&self, acc: &mut HistogramSnapshot) {
+        acc.count = acc.count.wrapping_add(self.count.load(Ordering::Relaxed));
+        acc.sum = acc.sum.saturating_add(self.sum.load(Ordering::Relaxed));
+        acc.min = acc.min.min(self.min.load(Ordering::Relaxed));
+        acc.max = acc.max.max(self.max.load(Ordering::Relaxed));
     }
 
     fn clear(&self) {
@@ -374,13 +453,58 @@ impl HistogramData {
     }
 }
 
+/// One thread number's copy of every ticker and histogram.
+#[derive(Debug)]
+struct Shard {
+    tickers: [AtomicU64; NUM_TICKERS],
+    histograms: [HistogramData; NUM_HISTOGRAMS],
+}
+
+impl Shard {
+    fn new() -> Self {
+        // `AtomicU64` is not `Copy`, so `[x; N]` does not apply.
+        Self {
+            tickers: std::array::from_fn(|_| AtomicU64::new(0)),
+            histograms: std::array::from_fn(|_| HistogramData::default()),
+        }
+    }
+}
+
 /// Engine-wide counters and histograms. Constructed by the
 /// caller and passed to [`crate::Options::statistics`]. The
 /// engine clones the `Arc` into the paths it wants to
 /// instrument and updates it with lock-free atomics.
+///
+/// # Per-thread shards
+///
+/// Each ticker and histogram is kept once per thread number, each copy on
+/// cache lines of its own: one per core, rounded up to a power of two and
+/// capped, with threads past the cap sharing copies. An update is one
+/// relaxed atomic add on the calling thread's copy (a histogram sample a
+/// few), so cores never contend on a line. A read adds the copies up.
+///
+/// # What a read sees
+///
+/// - **Exact once quiescent.** With no update running, [`get_ticker`]
+///   returns the sum of every amount added since the last [`reset`],
+///   modulo 2^64, and a histogram snapshot counts every sample recorded.
+///   Two threads sharing a copy lose nothing: every update is an atomic
+///   read-modify-write.
+/// - **Monotonic while updates run.** A ticker read returns a total
+///   between the ticker's total when the read began and its total when the
+///   read ended. It is never less than a total an earlier read of the same
+///   ticker returned, where "earlier" means that read's result reached this
+///   one's thread (the same thread, or through any synchronisation), unless
+///   a [`reset`] ran in between.
+/// - **Not a snapshot across metrics.** Two tickers read one after the
+///   other may each include an update the other does not, and a histogram
+///   sample being recorded may show in its count before its sum.
+///
+/// [`get_ticker`]: Statistics::get_ticker
+/// [`reset`]: Statistics::reset
 pub struct Statistics {
-    tickers: [AtomicU64; NUM_TICKERS],
-    histograms: [HistogramData; NUM_HISTOGRAMS],
+    /// One per thread number; the length is a power of two.
+    shards: Box<[CachePadded<Shard>]>,
 }
 
 impl std::fmt::Debug for Statistics {
@@ -397,39 +521,67 @@ impl Default for Statistics {
 
 impl Statistics {
     /// Construct a fresh `Statistics` with every ticker and
-    /// histogram at zero.
+    /// histogram at zero, with one shard per thread number.
     pub fn new() -> Self {
-        // `AtomicU64` is not `Copy`, so we can't use the
-        // `[x; N]` syntax. `std::array::from_fn` is the
-        // cleanest alternative.
-        let tickers = std::array::from_fn(|_| AtomicU64::new(0));
-        let histograms = std::array::from_fn(|_| HistogramData::default());
+        Self::with_shards(crate::per_thread::width())
+    }
+
+    /// A `Statistics` with `shards` copies (rounded up to a power of two).
+    fn with_shards(shards: usize) -> Self {
+        let shards = shards.max(1).next_power_of_two();
         Self {
-            tickers,
-            histograms,
+            shards: (0..shards)
+                .map(|_| CachePadded::new(Shard::new()))
+                .collect(),
         }
     }
 
-    /// Read the current value of a ticker. Guaranteed to be
-    /// consistent with the corresponding `fetch_add` via
-    /// `Ordering::Relaxed` - callers that need stronger
-    /// ordering should wrap their own fences.
-    pub fn get_ticker(&self, ticker: Ticker) -> u64 {
-        self.tickers[ticker as usize].load(Ordering::Relaxed)
+    /// The calling thread's shard.
+    #[inline]
+    fn shard(&self) -> &Shard {
+        &self.shards[crate::per_thread::index() & (self.shards.len() - 1)]
     }
 
-    /// Return an immutable snapshot of a histogram's state.
+    /// Read the current total of a ticker: the sum of every shard. See
+    /// [`Statistics`] for what a read concurrent with updates returns.
+    pub fn get_ticker(&self, ticker: Ticker) -> u64 {
+        self.shards
+            .iter()
+            .map(|shard| shard.tickers[ticker as usize].load(Ordering::Relaxed))
+            .fold(0, u64::wrapping_add)
+    }
+
+    /// Return an immutable snapshot of a histogram's state, merged across
+    /// every shard.
     pub fn get_histogram_snapshot(&self, hist: Histogram) -> HistogramSnapshot {
-        self.histograms[hist as usize].snapshot()
+        let mut merged = HistogramSnapshot {
+            count: 0,
+            sum: 0,
+            min: u64::MAX,
+            max: 0,
+        };
+        for shard in self.shards.iter() {
+            shard.histograms[hist as usize].fold_into(&mut merged);
+        }
+        if merged.count == 0 {
+            return HistogramSnapshot::default();
+        }
+        if merged.min == u64::MAX {
+            // A sample counted before its minimum landed.
+            merged.min = 0;
+        }
+        merged
     }
 
     /// Zero every ticker and clear every histogram.
     pub fn reset(&self) {
-        for t in &self.tickers {
-            t.store(0, Ordering::Relaxed);
-        }
-        for h in &self.histograms {
-            h.clear();
+        for shard in self.shards.iter() {
+            for t in &shard.tickers {
+                t.store(0, Ordering::Relaxed);
+            }
+            for h in &shard.histograms {
+                h.clear();
+            }
         }
     }
 
@@ -438,16 +590,16 @@ impl Statistics {
     pub fn dump(&self) -> String {
         let mut out = String::new();
         out.push_str("-- tickers --\n");
-        for ticker in ALL_TICKERS {
+        for ticker in Ticker::ALL {
             out.push_str(&format!(
                 "{:40} {}\n",
                 ticker.name(),
-                self.tickers[*ticker as usize].load(Ordering::Relaxed)
+                self.get_ticker(*ticker)
             ));
         }
         out.push_str("-- histograms --\n");
         for hist in ALL_HISTOGRAMS {
-            let snap = self.histograms[*hist as usize].snapshot();
+            let snap = self.get_histogram_snapshot(*hist);
             out.push_str(&format!(
                 "{:40} count={} sum={} min={} max={} avg={}\n",
                 hist.name(),
@@ -461,15 +613,24 @@ impl Statistics {
         out
     }
 
-    /// Add `amount` to `ticker`. `Ordering::Relaxed` - callers
-    /// that need stronger ordering should provide their own.
+    /// Add `amount` to `ticker`: one relaxed `fetch_add` on the calling
+    /// thread's shard.
+    #[inline]
     pub(crate) fn add(&self, ticker: Ticker, amount: u64) {
-        self.tickers[ticker as usize].fetch_add(amount, Ordering::Relaxed);
+        self.shard().tickers[ticker as usize].fetch_add(amount, Ordering::Relaxed);
     }
 
-    /// Record a single sample into `hist`.
+    /// Record a single sample into `hist`, in the calling thread's shard.
+    #[inline]
     pub(crate) fn record(&self, hist: Histogram, value: u64) {
-        self.histograms[hist as usize].record(value);
+        self.shard().histograms[hist as usize].record(value);
+    }
+
+    /// [`Self::add`] into shard `shard` (taken modulo the shard count).
+    #[cfg(test)]
+    fn add_to(&self, shard: usize, ticker: Ticker, amount: u64) {
+        self.shards[shard & (self.shards.len() - 1)].tickers[ticker as usize]
+            .fetch_add(amount, Ordering::Relaxed);
     }
 }
 
@@ -535,6 +696,104 @@ mod tests {
         assert_eq!(snap.max, 80_000);
     }
 
+    /// More threads than shards, so shards are shared: once every writer
+    /// has finished, each ticker's total is exactly the sum of its adds.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn ticker_totals_are_exact_once_writers_are_quiescent() {
+        const ADDS: u64 = 50_000;
+        let stats = std::sync::Arc::new(Statistics::with_shards(4));
+        let start = std::sync::Arc::new(std::sync::Barrier::new(16));
+        let threads: Vec<_> = (0..16u64)
+            .map(|t| {
+                let (stats, start) = (std::sync::Arc::clone(&stats), std::sync::Arc::clone(&start));
+                std::thread::spawn(move || {
+                    start.wait();
+                    for i in 0..ADDS {
+                        stats.add(Ticker::KeysRead, 1);
+                        stats.add(Ticker::BytesRead, t + i);
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        assert_eq!(stats.get_ticker(Ticker::KeysRead), 16 * ADDS);
+        let expected: u64 = (0..16u64)
+            .map(|t| (0..ADDS).map(|i| t + i).sum::<u64>())
+            .sum();
+        assert_eq!(stats.get_ticker(Ticker::BytesRead), expected);
+        assert_eq!(
+            stats.get_ticker(Ticker::KeysWritten),
+            0,
+            "untouched tickers stay zero"
+        );
+    }
+
+    #[test]
+    fn a_read_sums_every_shard() {
+        let stats = Statistics::with_shards(8);
+        for shard in 0..8 {
+            stats.add_to(shard, Ticker::WalSyncCount, 1 << shard);
+        }
+        assert_eq!(stats.get_ticker(Ticker::WalSyncCount), 0xFF);
+        stats.reset();
+        assert_eq!(
+            stats.get_ticker(Ticker::WalSyncCount),
+            0,
+            "reset clears every shard"
+        );
+    }
+
+    /// While writers run, no read of a ticker returns less than an earlier
+    /// read of it did.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn concurrent_reads_never_go_backwards() {
+        let stats = std::sync::Arc::new(Statistics::with_shards(4));
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writers: Vec<_> = (0..6)
+            .map(|_| {
+                let (stats, stop) = (std::sync::Arc::clone(&stats), std::sync::Arc::clone(&stop));
+                std::thread::spawn(move || {
+                    let mut added = 0u64;
+                    while !stop.load(std::sync::atomic::Ordering::Relaxed) || added < 10_000 {
+                        stats.add(Ticker::IterNextCount, 3);
+                        added += 1;
+                    }
+                    added
+                })
+            })
+            .collect();
+        let mut last = 0u64;
+        for _ in 0..20_000 {
+            let now = stats.get_ticker(Ticker::IterNextCount);
+            assert!(now >= last, "read {now} after reading {last}");
+            assert_eq!(now % 3, 0, "a read sums whole adds");
+            last = now;
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let total: u64 = writers.into_iter().map(|w| w.join().unwrap()).sum();
+        assert!(last <= total * 3);
+        assert_eq!(stats.get_ticker(Ticker::IterNextCount), total * 3);
+    }
+
+    #[test]
+    fn a_histogram_merges_its_shards() {
+        let stats = Statistics::with_shards(4);
+        for (shard, value) in [(0usize, 7u64), (1, 2), (1, 30), (3, 11)] {
+            stats.shards[shard].histograms[Histogram::DbGet as usize].record(value);
+        }
+        let snap = stats.get_histogram_snapshot(Histogram::DbGet);
+        assert_eq!((snap.count, snap.sum, snap.min, snap.max), (4, 50, 2, 30));
+        stats.reset();
+        assert_eq!(
+            stats.get_histogram_snapshot(Histogram::DbGet),
+            HistogramSnapshot::default()
+        );
+    }
+
     #[test]
     fn an_empty_histogram_snapshots_as_zero_and_reset_empties_it() {
         let stats = Statistics::new();
@@ -584,6 +843,14 @@ mod tests {
     }
 
     #[test]
+    fn ticker_all_lists_every_ticker_in_discriminant_order() {
+        assert_eq!(Ticker::ALL.len(), NUM_TICKERS);
+        for (slot, ticker) in Ticker::ALL.iter().enumerate() {
+            assert_eq!(*ticker as usize, slot, "{} is out of order", ticker.name());
+        }
+    }
+
+    #[test]
     fn dump_contains_every_ticker_and_histogram_name() {
         let s = Statistics::new();
         let out = s.dump();
@@ -595,7 +862,7 @@ mod tests {
 
     #[test]
     fn every_metric_name_is_unique_and_surface_prefixed() {
-        const SURFACES: [&str; 11] = [
+        const SURFACES: [&str; 12] = [
             "write",
             "read",
             "iter",
@@ -604,11 +871,12 @@ mod tests {
             "compaction",
             "flush",
             "wal",
+            "manifest",
             "snapshot",
             "commit",
             "policy",
         ];
-        let mut names: Vec<&str> = ALL_TICKERS
+        let mut names: Vec<&str> = Ticker::ALL
             .iter()
             .map(|t| t.name())
             .chain(ALL_HISTOGRAMS.iter().map(|h| h.name()))

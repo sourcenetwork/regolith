@@ -14,6 +14,7 @@
 //! The capture now drains active *and* frozen under `write_lock`, so a
 //! write acknowledged before the call is in a memtable when the lock is
 //! taken and in an SSTable when it is released.
+#![cfg(not(target_arch = "wasm32"))]
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -23,10 +24,7 @@ use regolith::{Db, Options, WriteBatch};
 use tempfile::TempDir;
 
 fn tiny() -> Options {
-    Options {
-        write_buffer_size: 4 * 1024,
-        ..Options::default()
-    }
+    Options::default().write_buffer_size(4 * 1024)
 }
 
 fn one_instance(seed_keys: usize, checkpoints: usize) -> Option<String> {
@@ -36,7 +34,7 @@ fn one_instance(seed_keys: usize, checkpoints: usize) -> Option<String> {
 
     for i in 0..seed_keys {
         let k = format!("seed_{i:03}");
-        db.put(k.as_bytes(), k.as_bytes()).expect("seed put");
+        regolith::through_stalls(|| db.put(k.as_bytes(), k.as_bytes())).expect("seed put");
     }
 
     let stop = Arc::new(AtomicBool::new(false));
@@ -48,7 +46,7 @@ fn one_instance(seed_keys: usize, checkpoints: usize) -> Option<String> {
             let mut b = WriteBatch::new();
             let k = format!("live_{i:06}");
             b.put(k.as_bytes(), k.as_bytes());
-            wdb.write(b).expect("live write");
+            regolith::through_stalls(|| wdb.write(b.clone())).expect("live write");
             i += 1;
         }
     });
@@ -57,7 +55,7 @@ fn one_instance(seed_keys: usize, checkpoints: usize) -> Option<String> {
     for round in 0..checkpoints {
         let _ = std::fs::remove_dir_all(tgt.path());
         std::fs::create_dir_all(tgt.path()).expect("mkdir");
-        db.checkpoint(tgt.path()).expect("checkpoint");
+        db.checkpoint(tgt.path()).wait().expect("checkpoint");
         let reopened = Db::open(tgt.path(), Options::default()).expect("reopen checkpoint");
         for i in 0..seed_keys {
             let k = format!("seed_{i:03}");

@@ -162,12 +162,10 @@ fn enospc_child_body(mount: &Path) {
     measured("ENOSPC on a full 8 MiB tmpfs", || {
         let db_path = mount.join("db");
         let background = Arc::new(BackgroundErrorLog::default());
-        let opts = Options {
-            write_buffer_size: 32 * 1024,
-            target_file_size: 64 * 1024,
-            listeners: vec![background.clone()],
-            ..Options::default()
-        };
+        let opts = Options::default()
+            .write_buffer_size(32 * 1024)
+            .target_file_size(64 * 1024)
+            .listeners(vec![background.clone()]);
         let db = Db::open(&db_path, opts.clone()).expect("opening on an empty tmpfs");
 
         let ballast = mount.join("ballast");
@@ -190,7 +188,7 @@ fn enospc_child_body(mount: &Path) {
         let mut acked: Vec<usize> = Vec::new();
         let mut failure = None;
         for i in 0..100_000usize {
-            match db.put(format!("k{i:06}").as_bytes(), &value) {
+            match regolith::through_stalls(|| db.put(format!("k{i:06}").as_bytes(), &value)) {
                 Ok(()) => acked.push(i),
                 Err(e) => {
                     failure = Some(e);
@@ -249,7 +247,7 @@ fn enospc_child_body(mount: &Path) {
         // it is not allowed to report the failure as corruption, and it is
         // not allowed to leave the data it did not manage to rewrite
         // unreadable.
-        match db.compact_range(None, None) {
+        match db.compact_range(None, None).wait() {
             Ok(()) => println!("[resource_limits] compact_range succeeded on a full disk"),
             Err(Error::Io(io)) => {
                 println!("[resource_limits] compact_range on a full disk: {io}")
@@ -268,7 +266,7 @@ fn enospc_child_body(mount: &Path) {
 
         // Freeing space must make the same handle writable again.
         fs::remove_file(&ballast).unwrap();
-        db.put(b"after_space_returned", b"ok")
+        regolith::through_stalls(|| db.put(b"after_space_returned", b"ok"))
             .expect("the database stayed wedged after space was freed");
         assert_eq!(
             db.get(b"after_space_returned").unwrap(),

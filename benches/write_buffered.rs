@@ -13,8 +13,8 @@
 
 mod common;
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};
 
 use regolith::{Options, WriteOptions};
@@ -42,14 +42,14 @@ fn env_u64(name: &str, default: u64) -> u64 {
 
 /// One cache shard and a memtable large enough that a repetition stays inside
 /// it, so the number measures the memtable and WAL append path rather than a
-/// flush storm, and RSS stays bounded across the whole sweep.
+/// flush storm; each repetition checks that it did. The memtable grows only
+/// with what a repetition writes, and each repetition's database is dropped,
+/// so RSS stays bounded across the whole sweep.
 fn opts() -> Options {
-    Options {
-        write_buffer_size: 64 * 1024 * 1024,
-        block_cache_size: 8 * 1024 * 1024,
-        block_cache_num_shard_bits: 0,
-        ..common::default_opts()
-    }
+    common::default_opts()
+        .write_buffer_size(1 << 30)
+        .block_cache_size(8 * 1024 * 1024)
+        .block_cache_num_shard_bits(0)
 }
 
 struct Rep {
@@ -61,12 +61,12 @@ struct Rep {
 fn run_rep(threads: usize, dur: Duration) -> Rep {
     let (tmp, db) = common::open("write-buffered", opts());
     let db = Arc::new(db);
-    let barrier = Arc::new(Barrier::new(threads + 1));
+    let line = Arc::new(common::start::StartLine::new(threads));
     let written = Arc::new(AtomicU64::new(0));
     let mut handles = Vec::with_capacity(threads);
     for t in 0..threads {
         let db = Arc::clone(&db);
-        let barrier = Arc::clone(&barrier);
+        let line = Arc::clone(&line);
         let written = Arc::clone(&written);
         handles.push(std::thread::spawn(move || {
             let wo = WriteOptions::default();
@@ -77,8 +77,7 @@ fn run_rep(threads: usize, dur: Duration) -> Rep {
                 db.put_opt(&wo, &common::key(base + i), &value)
                     .expect("warmup put");
             }
-            barrier.wait();
-            let deadline = Instant::now() + dur;
+            let deadline = line.wait() + dur;
             let mut i = WARMUP_OPS;
             loop {
                 for _ in 0..CLOCK_EVERY {
@@ -93,15 +92,19 @@ fn run_rep(threads: usize, dur: Duration) -> Rep {
             written.fetch_add(i - WARMUP_OPS, Ordering::Relaxed);
         }));
     }
-    barrier.wait();
+    line.all_ready();
     let cpu0 = common::cpu_seconds();
-    let start = Instant::now();
+    let start = line.go();
     for h in handles {
         h.join().expect("writer thread panicked");
     }
     let elapsed = start.elapsed().as_secs_f64();
     let cpu_delta = common::cpu_seconds() - cpu0;
     let ops = written.load(Ordering::Relaxed) as f64;
+    assert!(
+        !common::rotated(&db),
+        "a memtable was sealed inside a timed repetition: raise write_buffer_size so every row times the write path alone"
+    );
     db.close().expect("close db");
     drop(db);
     drop(tmp);

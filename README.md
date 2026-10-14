@@ -125,6 +125,72 @@ A crash partway through leaves a valid prefix of the stream, never a
 half-applied flush. Work that must land all-or-nothing wants a single
 `WriteBatch` and has to pay the memory for it.
 
+## Reads that never block
+
+A thread that must never wait on the disk reads through a `CacheOnly` handle.
+Such a read never touches the device: when it needs a block the cache does not
+hold, it returns `Error::WouldBlock` at once and records the block on the
+thread's own I/O queue. The thread polls that queue when it has nothing else
+to run, which reads the blocks it waits on, and then runs the read again:
+
+```rust
+use regolith::{Error, IoBudget, ReadMode, WouldBlock};
+
+let mut queue = db.io_queue(); // one per thread
+let snap = db.snapshot().with_read_mode(ReadMode::CacheOnly(queue.id()));
+let value = loop {
+    match snap.get(b"key") {
+        Err(Error::WouldBlock(WouldBlock::Io(wait))) => {
+            queue.poll(IoBudget::ALL); // or `wait.await` while other tasks run
+        }
+        other => break other?,
+    }
+};
+```
+
+A block several threads miss is read once, by whichever thread's poll claims
+it first, and every waiting queue is told. A completion only ever reaches the
+queue that asked, and `IoQueue::idle_waker` wakes an idle thread when one
+arrives, never a busy one. Iterators, transaction cursors and streams pick up
+exactly where a wait stopped them. Transactions take the mode from
+`TxnOptions::read_mode`.
+
+## Commits that never block
+
+`Transaction::commit_nowait` hands back a `CommitTicket` at once. The ticket is a
+`Future` of the commit's outcome, completed only at a poll of the queue named by
+`TxnOptions::io_queue`, on the thread that owns it; with no queue the commit syncs
+inline and the ticket is ready already. Commits from many threads still share one
+log write and one fsync per group: the fsync is a unit that the first member thread
+to poll claims and runs, and it tells every member's queue. At
+`DurabilityMode::Immediate` a commit is visible only once that fsync returned.
+
+```rust
+use regolith::{OptimisticTransactionDb, Options, TxnOptions};
+
+let db = OptimisticTransactionDb::open("/tmp/nowait_db", Options::default())?;
+let mut queue = db.db().io_queue(); // one per thread
+let txn = db.begin(&TxnOptions::new().io_queue(queue.id()));
+txn.put(b"key", b"value")?;
+let ticket = txn.commit_nowait();
+ticket.on_complete(|outcome| println!("committed: {}", outcome.is_ok()));
+let receipt = queue.block_on(ticket)?; // or `ticket.await` while other tasks run
+```
+
+The `on_commit`, `on_abort` and `on_complete` callbacks run exactly once, on the
+thread that delivers the outcome. Dropping a ticket cancels nothing; dropping its
+queue delivers what the queue holds on the dropping thread. `transact_async` is the
+retrying form: its attempts read through a `CacheOnly` handle, a miss suspends the
+attempt instead of ending it (`ready(|| txn.get(k)).await`), and it needs no runtime.
+
+No write waits on a write stall. A write a stop stops applies nothing and returns
+`Error::WouldBlock(WouldBlock::Stall(wait))`, whose wait completes on the writer's
+own queue once background work clears the stall; `through_stalls` waits it out for
+a blocking caller. With no compaction worker, `Options::inline_compaction(true)`
+makes the stopped writer run the step that clears the stall on its own queue, or
+inline with no queue. `compact_range`, `ingest_external_files` and `checkpoint`
+return a `JobTicket` the same way, run on the worker or on the caller's queue.
+
 ## Transactions
 
 Pick the isolation a unit of work actually needs. The level decides how much of the
@@ -132,11 +198,11 @@ transaction's footprint is validated at commit, so a stricter level refuses more
 commits fewer.
 
 ```rust
-use regolith::{IsolationLevel, OptimisticTransactionDb, Options};
+use regolith::{IsolationLevel, OptimisticTransactionDb, Options, TxnOptions};
 
 let db = OptimisticTransactionDb::open("/tmp/txn_db", Options::default())?;
 
-let mut txn = db.begin_transaction_with(IsolationLevel::Serializable);
+let mut txn = db.begin(&TxnOptions::new().isolation(IsolationLevel::Serializable));
 let balance = txn.get(b"account")?.unwrap_or_default();
 txn.put(b"account", b"debited")?;
 txn.commit()?;
@@ -169,10 +235,10 @@ at `Serializable` holds one read-set entry per key it yields until the transacti
 resolves, and its commit checks each one while every writer waits; below it, a scan holds
 one entry per stretch of keys it walked.
 
-`DefraLevel` is `RepeatableRead` with three relaxations, which apply to optimistic
+`DefraLevel` is `RepeatableRead` with four relaxations, which apply to optimistic
 transactions only. A pessimistic transaction at this level validates as `RepeatableRead`.
 What the commit validates, by kind of key (the first is `RepeatableRead` itself, the other
-three are the relaxations):
+four are the relaxations):
 
 - An ordinary key: every point read of it is validated, whether it found a value or not,
   and a put or delete of it conflicts with any commit to the key since the transaction
@@ -196,6 +262,20 @@ three are the relaxations):
   caller's contract is that the key determines its bytes, as a content hash does; regolith
   cannot check it, and a transaction that writes other bytes under the key commits too, the
   last commit to land winning.
+- A key declared `KeyClass::Log`, with the same classifier: a read of it is never validated,
+  and a put, delete or merge of it is refused with `Error::LogKeyWrite`. Only
+  `Transaction::append` writes the keys of a commit-ordered log.
+
+`Transaction::append(&log, entry, once_key)` adds an entry to a commit-ordered log, whose
+keys a `LogLayout` names. At commit, in the ordered step after validation, the entry takes
+the log's next position, dense from 1, and the entry, its once key and the head key are
+written in the same atomic commit. Positions follow commit order, a transaction that
+aborts takes none, an append is never validated so it never conflicts (at every level, for
+both flavours), and an append whose once key already holds a position writes nothing.
+`Db::allocate(key, n)` reserves `n` values of a `u64` counter in the same ordered step. It
+is never a conflict, never waits on a write stall, and is logged before any commit that
+uses one of its values, so after a crash no value a surviving commit used is returned
+again. Values reserved by a transaction that aborts are skipped.
 
 A transaction reads its own puts, deletes and merges in the order it made them, and the
 commit applies them in that order: an operand applies to the put or delete before it, and a
@@ -217,6 +297,47 @@ check sees it.
 `TransactionDb` is the pessimistic flavour: it takes key locks, so contention waits
 instead of retrying. `OptimisticTransactionDb` validates at commit and retries.
 
+The key locks live in a lock-free table: taking a free lock is one compare-and-swap, and no
+call takes a mutex or waits on a condition variable. A free lock goes to whoever asks first,
+even while others wait; a waiter passed over `regolith::sync::MAX_BYPASS` times is handed the
+lock, so none starves. `get_for_update`, `put`, `delete` and `merge` wait for a lock another
+transaction holds, up to `with_lock_timeout`, and then fail with `TransactionError::Busy`,
+which is also what ends a deadlock. `try_get_for_update` never waits: it returns
+`WouldBlock::Locked` with a `LockWait`, completed on the transaction's own `IoQueue` at
+that queue's poll once the lock may be free, and the call is then run again. A
+`commit_nowait` releases its locks when the commit lands, not when its ticket is delivered,
+so another transaction never waits for this one's owner to poll.
+
+A commit that loses a race returns `TransactionError::Conflict`. Its `Conflict` names the
+key, what the transaction did with it (`Access`) and the newer write that won
+(`WriteKind`), with the two sequences. Its message gives the key's length and a short hash,
+never its bytes, since a key can hold user data. An `EventListener::on_conflict` hears each
+conflict once, after the commit released its locks, so a caller can count the reasons.
+
+`transact` runs a closure in a transaction and commits it. After a conflict it runs the
+closure again at once, in a fresh transaction, handing it the conflict it lost to, up to the
+policy's `max_attempts`. The closure can settle the race from that reason instead of
+redoing its work blindly. An error from the closure ends the attempt and is not retried.
+
+```rust
+use regolith::{RetryPolicy, TransactionError, WriteKind};
+
+let (_, receipt) = db.transact(&RetryPolicy::default(), |txn, lost| {
+    // `lost` is the conflict the previous attempt lost to, `None` on the first run.
+    if lost.is_some_and(|conflict| conflict.theirs() == WriteKind::Delete) {
+        return Ok(()); // the document was deleted by the writer that won
+    }
+    txn.get_for_update(b"doc")?;
+    txn.delete(b"doc")?;
+    Ok::<_, TransactionError>(())
+})?;
+println!("visible at sequence {}", receipt.seq());
+```
+
+`commit` returns a `CommitReceipt` whose `seq()` is the sequence its writes became visible
+at, or the snapshot's sequence for a commit that wrote nothing. A sequence orders commits
+within one database; do not keep it across `drop_all` or in a restored database.
+
 Buffering a read or a write takes `&self`, so one transaction can be shared across
 threads without a lock around it. The write buffer and the read set are lock-free, and
 every read is folded into the commit-time validation set no matter which thread recorded
@@ -225,15 +346,13 @@ those are the points where the buffer stops changing.
 
 ```rust
 use std::sync::Arc;
-use regolith::{IsolationLevel, OptimisticTransactionDb, Options};
+use regolith::{IsolationLevel, OptimisticTransactionDb, Options, TxnOptions};
 
-let db = Arc::new(OptimisticTransactionDb::open("/tmp/shared_db", Options::default())?);
+let db = OptimisticTransactionDb::open("/tmp/shared_db", Options::default())?;
 
-// `begin_transaction` borrows the database, so the transaction cannot outlive it or be
-// stored in a `'static` container. `begin_transaction_owned` returns an
-// `OwnedTransaction`, which carries an `Arc` on the database instead and can be boxed,
-// shared, and moved freely.
-let txn = Arc::new(db.begin_transaction_owned(IsolationLevel::Serializable));
+// A `Transaction` has no lifetime and borrows nothing from the database, so it can be
+// boxed, shared, and moved freely, and it outlives the handle that began it.
+let txn = Arc::new(db.begin(&TxnOptions::new().isolation(IsolationLevel::Serializable)));
 
 std::thread::scope(|scope| {
     for thread in 0..4 {
@@ -263,6 +382,44 @@ Either way, recovery reaches a **valid prefix** of the write history: some numbe
 writes applied, in order, no gaps, no half-applied batch. A `WriteBatch` is atomic under
 both modes.
 
+Every log record carries the offset the last completed sync made durable. A power cut can
+leave the end of the newest log torn, zeroed or garbled; recovery drops what no sync
+covered, truncates it, and reports it (a warn line, the `regolith.wal.tail_discarded`
+tickers and `EventListener::on_wal_tail_discarded`). Damage to bytes a surviving record
+proves were synced refuses the open instead. Rot inside the last synced group of a crashed
+log cannot be told from a torn write, so it is dropped the same way: reported, never
+silent.
+
+A database written by 0.1.x opens, and the open rewrites its log in format 2, which 0.1.x
+refuses to open: the upgrade is one-way. A database a 0.1.x release left with tables of
+overlapping key ranges in one level opens too: the first open moves that level and the
+levels above it into level 0 and logs one warning (the `regolith.manifest.tables_demoted`
+ticker and property count the tables moved). A database a 0.1.x release left with a range
+delete below older keys it deletes reads them as deleted: the first open copies every range
+delete that may sit behind such a key in front of every key, logs one warning, and records
+the check so no later open repeats it (`regolith.manifest.range_deletes_copied` counts the
+copies).
+
+## Encryption at rest
+
+```rust,ignore
+let opts = Options::default().key_provider(Arc::new(MyKeys));
+```
+
+With a `KeyProvider` installed, every table block, log record and manifest batch is sealed
+with AES-256-GCM-SIV under the provider's current key, and its tag takes the place of the
+checksum: a random-access read still decrypts one block, and a frame whose tag fails is
+treated exactly as a failed checksum is, the torn-tail rule of the log included. Values are
+plaintext inside the engine, so merges, byte-equality checks, value-validated reads,
+content-addressed keys, appends and allocations all work unchanged.
+
+Each file names the key it was sealed under, so a rotated key keeps old data readable for
+as long as the provider still provides it. An encrypted database opened without a provider,
+or with a provider missing a key some file names, refuses to open. An unencrypted database
+opens with a provider and is sealed as compaction rewrites it; `Db::compact_range` on an
+encrypted database rewrites everything not sealed under the current key at once, which is
+how a key is retired.
+
 ## Platforms
 
 | Target | Status |
@@ -274,20 +431,21 @@ both modes.
 
 Pure Rust throughout: no C toolchain, no FFI, no linker surprises. Compaction runs on an
 ordinary OS thread; no async runtime is required. On a target without threads, set
-`max_background_compactions = 0` and compaction runs on the calling thread.
+`max_background_compactions(0)` and compaction runs on the calling thread.
 
 ## Configuration
 
 ```rust
 use regolith::{CompressionType, Options};
 
-let opts = Options {
-    write_buffer_size: 64 * 1024 * 1024,
-    block_cache_size: 512 * 1024 * 1024,
-    compression: CompressionType::Lz4,
-    ..Default::default()
-};
+let opts = Options::default()
+    .write_buffer_size(64 * 1024 * 1024)
+    .block_cache_size(512 * 1024 * 1024)
+    .compression(CompressionType::Lz4);
 ```
+
+Every option is a builder method named after it, so a new option in a later release is a
+new method and an existing chain keeps compiling.
 
 Three ready-made profiles: `Options::default()` for a server, `Options::embedded()` for a
 1-4 MiB budget, and `Options::wasm()` for a browser or wasi module. Every value and the
@@ -335,11 +493,15 @@ The suite is the argument for trusting any of the above.
 just gate       # format, lint, docs, tests, dependency audit
 just test       # the whole suite under cargo-nextest
 just loom-all   # exhaustive model checking of the publication protocols
-just tla        # TLA+ model of commit validation per isolation level
+just tla        # TLA+ models: commit validation per isolation level, the storage engine
+just lean       # Lean proofs behind the storage-engine models, for every size
+just proofs     # both of the above
 just elle       # Elle consistency checking of transaction histories
 just chaos      # the full-size read-view chaos workload
 just wasm       # the wasm32-wasip1 lifecycle under wasmtime
 ```
+
+`just test` and the other recipes that run under a limit need GNU `timeout` (coreutils).
 
 Each badge above is a workflow of its own, so a red one names exactly which property
 regressed.

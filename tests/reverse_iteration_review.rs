@@ -10,6 +10,7 @@
 //! The oracle in every case is the forward scan, sorted. A backward walk
 //! that disagrees with it has either skipped a key or invented one, and
 //! the failure message prints both sequences.
+#![cfg(not(target_arch = "wasm32"))]
 
 use std::collections::BTreeSet;
 
@@ -17,11 +18,9 @@ use regolith::{Db, DurabilityMode, Options};
 use tempfile::TempDir;
 
 fn opts() -> Options {
-    Options {
-        write_buffer_size: 4 * 1024,
-        durability: DurabilityMode::Eventual,
-        ..Options::default()
-    }
+    Options::default()
+        .write_buffer_size(4 * 1024)
+        .durability(DurabilityMode::Eventual)
 }
 
 /// Write `keys`, then check the reverse walk against the forward one.
@@ -31,10 +30,10 @@ fn check(label: &str, keys: &[Vec<u8>], flush: bool) -> usize {
     let dir = TempDir::new().expect("tempdir");
     let db = Db::open(dir.path(), opts()).expect("open");
     for k in keys {
-        db.put(k, b"v").expect("put");
+        regolith::through_stalls(|| db.put(k, b"v")).expect("put");
     }
     if flush {
-        db.compact_range(None, None).expect("compact");
+        db.compact_range(None, None).wait().expect("compact");
     }
 
     let unique: BTreeSet<Vec<u8>> = keys.iter().cloned().collect();
@@ -170,9 +169,9 @@ fn the_snapshot_iterator_reaches_the_same_last_key() {
     let db = Db::open(dir.path(), opts()).expect("open");
     let keys: Vec<Vec<u8>> = (0..=12usize).map(|n| ff(n, &[0x01])).collect();
     for k in &keys {
-        db.put(k, b"v").expect("put");
+        regolith::through_stalls(|| db.put(k, b"v")).expect("put");
     }
-    db.compact_range(None, None).expect("compact");
+    db.compact_range(None, None).wait().expect("compact");
 
     let expected: Vec<Vec<u8>> = {
         let s: BTreeSet<Vec<u8>> = keys.iter().cloned().collect();

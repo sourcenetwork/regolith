@@ -69,8 +69,7 @@ async fn a_database_opened_on_the_main_thread_round_trips_through_persist() {
         let env = OpfsEnv::mount(name, OpfsOptions::default())
             .await
             .expect("mount");
-        let mut options = Options::embedded();
-        options.env = env.as_env();
+        let options = Options::embedded().env(env.as_env());
 
         let db = Db::open(env.db_path(), options).expect("open");
         db.put(b"main", b"thread").expect("put");
@@ -84,8 +83,7 @@ async fn a_database_opened_on_the_main_thread_round_trips_through_persist() {
     let env = OpfsEnv::mount(name, OpfsOptions::default())
         .await
         .expect("remount");
-    let mut options = Options::embedded();
-    options.env = env.as_env();
+    let options = Options::embedded().env(env.as_env());
     let db = Db::open(env.db_path(), options).expect("reopen");
     assert_eq!(
         db.get(b"main").expect("get").as_deref(),
@@ -101,8 +99,7 @@ async fn a_database_larger_than_the_mirror_bound_is_refused_at_mount() {
         let env = OpfsEnv::mount(name, OpfsOptions::default())
             .await
             .expect("mount");
-        let mut options = Options::embedded();
-        options.env = env.as_env();
+        let options = Options::embedded().env(env.as_env());
         let db = Db::open(env.db_path(), options).expect("open");
         for i in 0..64u32 {
             db.put(format!("k{i:04}").as_bytes(), &[b'v'; 512])
@@ -113,6 +110,12 @@ async fn a_database_larger_than_the_mirror_bound_is_refused_at_mount() {
         env.persist().await.expect("persist");
     }
 
+    // What the stored database occupies once loaded whole.
+    let stored = OpfsEnv::mount(name, OpfsOptions::default())
+        .await
+        .expect("mount within the bound")
+        .resident_bytes();
+
     let tiny = OpfsOptions {
         max_resident_bytes: 1024,
         ..OpfsOptions::default()
@@ -120,9 +123,11 @@ async fn a_database_larger_than_the_mirror_bound_is_refused_at_mount() {
     let error = OpfsEnv::mount(name, tiny)
         .await
         .expect_err("a database over the bound must be refused, not silently loaded");
+    // The mount stops reading once past the bound and only sums the sizes of
+    // the rest, so it reports the whole size without holding it.
     assert!(
-        matches!(error, OpfsError::ResidencyExceeded { .. }),
-        "expected ResidencyExceeded, got {error:?}"
+        matches!(error, OpfsError::ResidencyExceeded { resident, limit: 1024 } if resident == stored),
+        "expected ResidencyExceeded of {stored} bytes, got {error:?}"
     );
     assert!(
         error.to_string().contains("worker"),
@@ -146,18 +151,68 @@ async fn mirror_mode_refuses_immediate_durability() {
         "precondition: mirror mode does not provide durable sync"
     );
 
-    let options = Options {
-        env: std::sync::Arc::new(env.clone()),
-        durability: regolith::DurabilityMode::Immediate,
-        max_background_compactions: 0,
-        ..Options::default()
+    let options = Options::default()
+        .env(std::sync::Arc::new(env.clone()))
+        .durability(regolith::DurabilityMode::Immediate)
+        .max_background_compactions(0);
+    let Err(error) = Db::open("/regolith-test-main-durability", options) else {
+        panic!("Immediate durability must be refused on a non-durable env");
     };
-    let error = Db::open("/regolith-test-main-durability", options)
-        .err()
-        .expect("Immediate durability must be refused on a non-durable env");
     let text = error.to_string();
     assert!(
         text.contains("durable_sync"),
         "the refusal must name the capability, got: {text}"
     );
+}
+
+/// One persist batch carrying new tables, the manifest that names them and
+/// the deletion of the tables a compaction replaced: mirror mode writes the
+/// tables first, the MANIFEST last and deletes after both (E20), and the
+/// database reopens from what it wrote.
+#[wasm_bindgen_test]
+async fn a_batch_of_new_tables_a_manifest_and_deletions_reopens() {
+    let name = "regolith-test-main-persist-order";
+    {
+        let env = OpfsEnv::mount(name, OpfsOptions::default())
+            .await
+            .expect("mount");
+        let options = Options::embedded().env(env.as_env());
+        let db = Db::open(env.db_path(), options).expect("open");
+        for round in 0..4u32 {
+            for i in 0..32u32 {
+                db.put(
+                    format!("k{i:04}").as_bytes(),
+                    format!("v{round}").as_bytes(),
+                )
+                .expect("put");
+            }
+            db.flush().expect("flush");
+        }
+        env.persist().await.expect("persist the flushed tables");
+        db.compact_range(None, None).wait().expect("compact");
+        db.put(b"after", b"compaction").expect("put");
+        db.flush().expect("flush");
+        db.close().expect("close");
+        env.persist().await.expect("persist the compaction");
+        assert_eq!(env.pending_bytes(), 0);
+    }
+
+    let env = OpfsEnv::mount(name, OpfsOptions::default())
+        .await
+        .expect("remount");
+    let options = Options::embedded().env(env.as_env());
+    let db = Db::open(env.db_path(), options).expect("reopen");
+    for i in 0..32u32 {
+        assert_eq!(
+            db.get(format!("k{i:04}").as_bytes())
+                .expect("get")
+                .as_deref(),
+            Some(&b"v3"[..])
+        );
+    }
+    assert_eq!(
+        db.get(b"after").expect("get").as_deref(),
+        Some(&b"compaction"[..])
+    );
+    db.close().expect("close");
 }

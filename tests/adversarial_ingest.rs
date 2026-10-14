@@ -4,6 +4,7 @@
 //! lock and publishes the read horizon outside it, so this drives it
 //! against a stream of ordinary writers and a reader that demands the
 //! ingested file be visible the moment `ingest_external_files` returns.
+#![cfg(not(target_arch = "wasm32"))]
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -32,10 +33,7 @@ fn build_sst(path: &std::path::Path, batch: usize, opts: &Options) {
 fn ingest_under_concurrent_writers_stays_visible_and_loses_nothing() {
     let dir = TempDir::new().unwrap();
     let staging = TempDir::new().unwrap();
-    let opts = Options {
-        write_buffer_size: 32 * 1024,
-        ..Options::default()
-    };
+    let opts = Options::default().write_buffer_size(32 * 1024);
     let db = Arc::new(Db::open(dir.path(), opts.clone()).unwrap());
 
     let stop = Arc::new(AtomicBool::new(false));
@@ -52,7 +50,7 @@ fn ingest_under_concurrent_writers_stays_visible_and_loses_nothing() {
                 for k in 0..8 {
                     batch.put(format!("w{w}_{round:06}_{k}").as_bytes(), b"v");
                 }
-                db.write(batch).unwrap();
+                regolith::through_stalls(|| db.write(batch.clone())).unwrap();
                 written.fetch_add(1, Ordering::Relaxed);
                 round += 1;
             }
@@ -73,6 +71,7 @@ fn ingest_under_concurrent_writers_stays_visible_and_loses_nothing() {
                 ..IngestOptions::default()
             },
         )
+        .wait()
         .unwrap();
 
         // Visible immediately, from this thread and from a fresh snapshot.
@@ -161,10 +160,7 @@ fn wal_disabled_writers_in_a_group_do_not_break_recovery() {
     let db = Arc::new(
         Db::open(
             dir.path(),
-            Options {
-                write_buffer_size: 8 * 1024 * 1024,
-                ..Options::default()
-            },
+            Options::default().write_buffer_size(8 * 1024 * 1024),
         )
         .unwrap(),
     );
@@ -178,8 +174,10 @@ fn wal_disabled_writers_in_a_group_do_not_break_recovery() {
                 ..regolith::WriteOptions::default()
             };
             for i in 0..500usize {
-                db.put_opt(&wo, format!("d{w}_{i:04}").as_bytes(), b"v")
-                    .unwrap();
+                regolith::through_stalls(|| {
+                    db.put_opt(&wo, format!("d{w}_{i:04}").as_bytes(), b"v")
+                })
+                .unwrap();
             }
         }));
     }

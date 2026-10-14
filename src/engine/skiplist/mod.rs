@@ -22,25 +22,39 @@
 //!
 //! # Concurrency contract
 //!
-//! Exactly one thread inserts at a time (the engine serializes writers on
-//! its write lock); any number of threads read concurrently and lock-free.
-//! [`ArenaSkipList::insert_with_hint`] is the same single writer with a
-//! private splice: it takes an [`InsertHint`] bound to one list and, for
-//! a key that sorts after the hint's position, starts its descent there
-//! instead of at the head. See [`InsertHint`] for the invariants (H1 to
-//! H3) that make a hint safe to reuse across a whole run of inserts.
+//! Any number of threads insert at once, and any number read, with no lock.
+//! The commit pipeline lets whichever thread reaches a decided commit apply
+//! it (`engine::commit`, plan 4.7), so two threads can be inserting the very
+//! same entries. An insert is therefore **idempotent per internal key**: the
+//! key is the user key, the sequence and the value type, and the list holds
+//! at most one node per key (S2). Inserting a key the list already holds
+//! links nothing and changes nothing.
+//!
+//! [`ArenaSkipList::insert_with_hint`] is the same insert with a private
+//! splice: it takes an [`InsertHint`] bound to one list and, for a key that
+//! sorts after the hint's position, starts its descent there instead of at
+//! the head. See [`InsertHint`] for the invariants (H1 to H3) that make a
+//! hint safe to reuse across a whole run of inserts.
 //!
 //! The safety of the whole module rests on these invariants, named at
 //! every `unsafe` site that relies on them. They are what the loom and
 //! miri models exist to check.
 //!
 //! - **S1 (publication).** Every byte of a node - header, tower, key and
-//!   value - is written before the single `Release` store that links it
-//!   into level 0. A reader that observes the node through an `Acquire`
-//!   load therefore observes it fully initialised.
-//! - **S2 (single writer).** At most one thread is inside `insert` at a
-//!   time. A `debug_assert`-backed flag catches a violation in test and
-//!   debug builds.
+//!   value - is written before the compare-and-swap that links it into
+//!   level 0. A reader that observes the node through an `Acquire` load
+//!   therefore observes it fully initialised. A node is linked at level 0
+//!   first and at each higher level after, so a node reachable at any level
+//!   is reachable at level 0.
+//! - **S2 (one node per key, linked by compare-and-swap).** A node is
+//!   linked at a level by one compare-and-swap of its predecessor's link,
+//!   from the successor the inserter saw to the node. An inserter that
+//!   loses the swap walks forward from the same predecessor, whose key is
+//!   still below its own (S3), and tries again. At level 0 the walk is also
+//!   the duplicate check: an inserter that finds its own key there has lost
+//!   to a thread inserting the same entry, and links nothing. Level 0 is a
+//!   sorted list with no duplicates because every link into it is such a
+//!   swap between a strictly smaller key and a strictly larger one.
 //! - **S3 (no unlinking).** No node is ever removed. A `next` pointer
 //!   observed once stays a valid node pointer until the whole arena dies.
 //! - **S4 (provenance).** Every node pointer derives from the pointer
@@ -57,8 +71,8 @@
 //!   and every tower walk is bounded by the node's own height, so no
 //!   read runs past the tower into the key bytes.
 //! - **S8 (`Send` + `Sync`).** The only cross-thread communication is
-//!   through the tower's `AtomicPtr`s, and the only mutation is by the
-//!   single writer: S1 plus S2 plus S3.
+//!   through the tower's `AtomicPtr`s, and the only mutation of a published
+//!   node is a compare-and-swap of one of them: S1 plus S2 plus S3.
 //! - **S9 (head sentinel).** The head is a standalone allocation owned
 //!   by the list, so its address is stable for the list's life and an
 //!   untouched memtable reserves no arena chunk at all.
@@ -73,7 +87,7 @@ use std::ptr::NonNull;
 
 use super::arena::Arena;
 use super::internal_key::{INTERNAL_KEY_SUFFIX_LEN, compare_internal_keys, compare_internal_split};
-use crate::sync::{Arc, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
+use crate::sync::internal::{Arc, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 
 #[cfg(test)]
 mod tests;
@@ -318,9 +332,11 @@ impl<'a> NodeRef<'a> {
 ///   (null counts as plus infinity). This is what lets one bracket check
 ///   at level `L` vouch for every level above it.
 /// - **H3 (adjacency is advisory).** `next[l]` was `prev[l]`'s successor
-///   at level `l` when the hint was last written. A plain `insert` in
-///   between may have linked a node there; the hint is never trusted on
-///   this, every level it is used at is re-read first.
+///   at level `l` when the hint was last written. Another insert, on this
+///   thread or any other, may have linked a node there since; the hint is
+///   never trusted on this, every level it is used at is re-read first, and
+///   the compare-and-swap that links a node catches whatever changed after
+///   the re-read.
 ///
 /// Why H2 survives a write-back: after the descent and the repair loop
 /// in `insert_inner`, every level below the new node's height holds the
@@ -351,18 +367,17 @@ pub(crate) struct ArenaSkipList {
     /// standalone allocation rather than an arena one, so an untouched
     /// memtable reserves no arena chunk at all (S9).
     head: NonNull<u8>,
-    /// xorshift64 state for the height draw. Only the single writer
-    /// mutates it, so `Relaxed` suffices and the type stays `Sync`.
+    /// xorshift64 state for the height draw. Two inserters may draw from
+    /// the same state and so draw the same height; any height in range is a
+    /// valid one (S7), so `Relaxed` suffices.
     rnd: AtomicU64,
     count: AtomicUsize,
-    #[cfg(debug_assertions)]
-    inserting: crate::sync::AtomicBool,
 }
 
 // SAFETY (S8): the only cross-thread communication is through the tower's
-// `AtomicPtr`s with `Release`/`Acquire` (S1), the only mutation is by the
-// single writer (S2), and no node is ever unlinked or freed while the
-// list lives (S3, A5).
+// `AtomicPtr`s (S1), a published node is only ever changed by a
+// compare-and-swap of one of them (S2), and no node is ever unlinked or
+// freed while the list lives (S3, A5).
 unsafe impl Send for ArenaSkipList {}
 // SAFETY: see the `Send` impl above.
 unsafe impl Sync for ArenaSkipList {}
@@ -388,8 +403,6 @@ impl ArenaSkipList {
             // reproducible across runs, which the tests rely on.
             rnd: AtomicU64::new(0x2545_F491_4F6C_DD1D),
             count: AtomicUsize::new(0),
-            #[cfg(debug_assertions)]
-            inserting: crate::sync::AtomicBool::new(false),
         })
     }
 
@@ -403,7 +416,7 @@ impl ArenaSkipList {
         self.first().is_none()
     }
 
-    /// Number of entries inserted.
+    /// Number of entries the list holds.
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.count.load(Ordering::Acquire)
@@ -449,7 +462,10 @@ impl ArenaSkipList {
         self.insert_inner(user_key, seq, value_type, value, Some(hint))
     }
 
-    /// Insert `user_key || !seq || value_type -> value`.
+    /// Insert `user_key || !seq || value_type -> value`, unless the list
+    /// already holds that internal key (S2): then nothing changes, and the
+    /// value given is not looked at. Any number of threads may insert at
+    /// once.
     ///
     /// The internal key is assembled directly inside the node, so no
     /// intermediate buffer is built and nothing is copied twice.
@@ -521,12 +537,6 @@ impl ArenaSkipList {
         value: &[u8],
         hint: Option<&mut InsertHint<'a>>,
     ) -> bool {
-        #[cfg(debug_assertions)]
-        let _writer = crate::sync::SingleWriterGuard::enter(
-            &self.inserting,
-            "ArenaSkipList::insert is single-writer (S2); the engine must serialize writers",
-        );
-
         let key_len = user_key.len() + INTERNAL_KEY_SUFFIX_LEN;
         if u32::try_from(key_len).is_err() || u32::try_from(value.len()).is_err() {
             tracing::error!(
@@ -599,6 +609,16 @@ impl ArenaSkipList {
             }
         }
 
+        // S2: the key is already there, put by a thread applying the same
+        // commit. Checked before the node is allocated, so the common
+        // duplicate costs no arena bytes.
+        // SAFETY (S1, S3): `next[0]` is null or a live node.
+        if !next[0].is_null()
+            && compare_internal_split(unsafe { node_key(next[0]) }, user_key, &trailer).is_eq()
+        {
+            return true;
+        }
+
         let size = node_size(key_len, value.len(), height);
         let Some(node) = self.arena.alloc(size, NODE_ALIGN) else {
             // The global allocator refused. Aborting is what `Vec::push`
@@ -613,8 +633,8 @@ impl ArenaSkipList {
         // arena, and `size` was computed from exactly these lengths, so
         // every write below stays inside the allocation. The node is not
         // reachable yet, so plain stores need no synchronisation.
+        let raw = node.as_ptr();
         unsafe {
-            let raw = node.as_ptr();
             init_node_header(raw, key_len, value.len(), height);
             let key_at = raw.add(NODE_HEADER + PTR_SIZE * height);
             std::ptr::copy_nonoverlapping(user_key.as_ptr(), key_at, user_key.len());
@@ -624,20 +644,46 @@ impl ArenaSkipList {
                 INTERNAL_KEY_SUFFIX_LEN,
             );
             std::ptr::copy_nonoverlapping(value.as_ptr(), key_at.add(key_len), value.len());
-            // Still unreachable: seed the forward pointers with plain
-            // stores. For every level the node occupies, `next[level]`
-            // was either just computed by the descent or just
-            // re-checked by the repair loop above, and this thread is
-            // the only writer (S2), so it equals what `next_at` would
-            // read now; no re-read is needed.
-            for (level, &successor) in next.iter().enumerate().take(height) {
-                link(raw, level).store(successor, Ordering::Relaxed);
-            }
-            // S1: the only synchronising stores in the module. Level 0
-            // first, so a reader that reaches the node from a higher
-            // level always finds it linked at the bottom too.
-            for (level, slot) in prev.iter().enumerate().take(height) {
-                link(slot.as_ptr(), level).store(raw, Ordering::Release);
+        }
+
+        // Link the node, level 0 first, so a reader that reaches it from a
+        // higher level always finds it linked at the bottom too (S1).
+        for level in 0..height {
+            loop {
+                // SAFETY (S1, S7): `raw` is this thread's node, of height
+                // greater than `level`, and nothing links to it at `level`
+                // yet: no other thread reads or writes this slot, so a plain
+                // store is enough. The swap below publishes it.
+                unsafe { link(raw, level) }.store(next[level], Ordering::Relaxed);
+                // SAFETY (H1, S1, S3, S7): `prev[level]` is the head or a
+                // live node of height greater than `level`.
+                let linked = unsafe { link(prev[level].as_ptr(), level) }.compare_exchange(
+                    next[level],
+                    raw,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                );
+                if linked.is_ok() {
+                    break;
+                }
+                // S2: another insert linked a node after `prev[level]`. Its
+                // key is still below this one's and nothing is ever
+                // unlinked (S3), so the splice is found again by walking on
+                // from it.
+                // SAFETY: as in the descent above.
+                let (p, n) = unsafe { walk_level(prev[level], level, user_key, &trailer) };
+                prev[level] = p;
+                next[level] = n;
+                // SAFETY (S1, S3): `n` is null or a live node.
+                if level == 0
+                    && !n.is_null()
+                    && compare_internal_split(unsafe { node_key(n) }, user_key, &trailer).is_eq()
+                {
+                    // Lost to a thread inserting this very entry. The node
+                    // built here was never linked, so no reader can reach
+                    // it; its bytes stay in the arena, unused.
+                    return true;
+                }
             }
         }
 

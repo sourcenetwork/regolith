@@ -29,7 +29,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 
 use regolith::{
-    IsolationLevel, KeyClass, KeyClassifier, OptimisticTransactionDb, Transaction, TransactionError,
+    IsolationLevel, KeyClass, KeyClassifier, OptimisticTransactionDb, Transaction,
+    TransactionError, TxnOptions,
 };
 
 use super::support::{Findings, Rendezvous, STORAGES, Storage, table_lookups};
@@ -100,17 +101,17 @@ fn heads_before(round: usize, walk: Walk) -> BTreeSet<Vec<u8>> {
 /// Begin, scan the heads and write thread `t`'s two keys. The keys sort
 /// between the first and the last head, so they lie inside the stretch the
 /// scan walked.
-fn stage<'db>(
-    db: &'db OptimisticTransactionDb,
+fn stage(
+    db: &OptimisticTransactionDb,
     level: IsolationLevel,
     walk: Walk,
     round: usize,
     t: usize,
-) -> (Transaction<'db>, BTreeSet<Vec<u8>>) {
-    let tx = db.begin_transaction_with(level);
+) -> (Transaction, BTreeSet<Vec<u8>>) {
+    let tx = db.begin(&TxnOptions::new().isolation(level));
     let seen = tx
         .scan_stream(Some(b"h/"), Some(walk.end()))
-        .map(|(key, _)| key)
+        .map(|item| item.unwrap().0)
         .collect();
     tx.put(&unique(round, t), &[t as u8]).unwrap();
     tx.put(&fresh(round), SHARED_VALUE).unwrap();
@@ -165,10 +166,11 @@ fn heads_overlap(level: IsolationLevel, walk: Walk, storage: Storage) {
                         sync.wait();
                     }
                     match first {
-                        Ok(()) => {
+                        Ok(_) => {
                             first_commits.fetch_add(1, Ordering::Relaxed);
                         }
-                        Err(TransactionError::Conflict { key, .. }) => {
+                        Err(TransactionError::Conflict(conflict)) => {
+                            let key = conflict.key();
                             findings.check(key == fresh(round), || {
                                 format!("{case} round {round}: conflict on {key:?}")
                             });

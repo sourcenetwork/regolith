@@ -46,21 +46,15 @@ impl MergeOperator for CounterMerge {
 }
 
 fn options() -> Options {
-    Options {
-        merge_operator: Some(Arc::new(CounterMerge)),
-        block_size: 512,
-        write_buffer_size: 4 * 1024 * 1024,
-        max_background_compactions: 0,
-        ..Options::default()
-    }
+    Options::default()
+        .merge_operator(Some(Arc::new(CounterMerge)))
+        .block_size(512)
+        .write_buffer_size(4 * 1024 * 1024)
+        .max_background_compactions(0)
 }
 
 fn partitioned() -> Options {
-    Options {
-        partitioned_index: true,
-        metadata_block_size: 512,
-        ..options()
-    }
+    options().partitioned_index(true).metadata_block_size(512)
 }
 
 fn counter(db: &Db) -> i64 {
@@ -110,7 +104,7 @@ fn a_chain_a_snapshot_kept_unfolded_reads_whole_and_compacts_whole() {
         merge_operands(&db);
         db.flush().unwrap();
         let flushed = sst_bytes(&db);
-        db.compact_range(None, None).unwrap();
+        db.compact_range(None, None).wait().unwrap();
         assert!(
             sst_bytes(&db) > flushed / 2,
             "the chain stayed unfolded: {} bytes from {flushed}",
@@ -127,7 +121,7 @@ fn a_chain_a_snapshot_kept_unfolded_reads_whole_and_compacts_whole() {
         let unfolded = sst_bytes(&db);
         db.merge(b"counter", &1i64.to_be_bytes()).unwrap();
         db.flush().unwrap();
-        db.compact_range(None, None).unwrap();
+        db.compact_range(None, None).wait().unwrap();
         assert!(
             sst_bytes(&db) < unfolded / 4,
             "the chain was folded: {} bytes from {unfolded}",

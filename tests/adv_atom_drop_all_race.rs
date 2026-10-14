@@ -7,6 +7,7 @@
 //! removes it - but "whatever comes back is a value this workload ever
 //! wrote". A freed view reads as garbage or crashes; it does not read
 //! as a well-formed older value.
+#![cfg(not(target_arch = "wasm32"))]
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
@@ -44,14 +45,7 @@ fn readers_never_observe_a_freed_view_across_drop_all() {
 
     let dir = TempDir::new().expect("tempdir");
     let db = Arc::new(
-        Db::open(
-            dir.path(),
-            Options {
-                write_buffer_size: 8 * 1024,
-                ..Options::default()
-            },
-        )
-        .expect("open"),
+        Db::open(dir.path(), Options::default().write_buffer_size(8 * 1024)).expect("open"),
     );
 
     let bad: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
@@ -112,13 +106,13 @@ fn readers_never_observe_a_freed_view_across_drop_all() {
             gate.wait();
             for round in 1..=rounds {
                 for i in 0..KEYS {
-                    db.put(&key(i), &value(round)).expect("put");
+                    regolith::through_stalls(|| db.put(&key(i), &value(round))).expect("put");
                 }
                 if round.is_multiple_of(7) {
                     db.drop_all().expect("drop_all");
                 }
                 if round.is_multiple_of(11) {
-                    db.compact_range(None, None).expect("compact");
+                    db.compact_range(None, None).wait().expect("compact");
                 }
             }
             done.store(true, Ordering::Release);

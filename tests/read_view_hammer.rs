@@ -17,6 +17,7 @@
 //! smallest shape that still has every publisher running at once; the
 //! soak shape is 900 and 400, which is hours of CPU and tens of GB of
 //! scratch space, not a gate.
+#![cfg(not(target_arch = "wasm32"))]
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
@@ -57,16 +58,7 @@ fn stamp_of(v: &[u8]) -> u64 {
 }
 
 fn open(dir: &TempDir) -> Arc<Db> {
-    Arc::new(
-        Db::open(
-            dir.path(),
-            Options {
-                write_buffer_size: 8 * 1024,
-                ..Options::default()
-            },
-        )
-        .expect("open"),
-    )
+    Arc::new(Db::open(dir.path(), Options::default().write_buffer_size(8 * 1024)).expect("open"))
 }
 
 #[test]
@@ -85,7 +77,7 @@ fn overwritten_keys_never_vanish_and_never_travel_backwards() {
         .flat_map(|w| (0..KEYS_PER_WRITER).map(move |i| key_of(w, i)))
         .collect();
     for k in &keys {
-        db.put(k, &value_of(0)).expect("seed");
+        regolith::through_stalls(|| db.put(k, &value_of(0))).expect("seed");
     }
 
     let bad: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
@@ -107,7 +99,7 @@ fn overwritten_keys_never_vanish_and_never_travel_backwards() {
                 for i in 0..KEYS_PER_WRITER {
                     b.put(&key_of(w, i), &value_of(v));
                 }
-                db.write(b).expect("write batch");
+                regolith::through_stalls(|| db.write(b.clone())).expect("write batch");
             }
             live.fetch_sub(1, Ordering::AcqRel);
         }));
@@ -192,7 +184,7 @@ fn overwritten_keys_never_vanish_and_never_travel_backwards() {
             // rather than pushing publication churn any harder.
             let mut passes = 0u32;
             while live.load(Ordering::Acquire) > 0 && passes < compaction_passes {
-                db.compact_range(None, None).expect("compact_range");
+                db.compact_range(None, None).wait().expect("compact_range");
                 passes += 1;
             }
         }));
@@ -219,7 +211,7 @@ fn overwritten_keys_never_vanish_and_never_travel_backwards() {
             while live.load(Ordering::Acquire) > 0 && n < CF_CHURN_PASSES {
                 let name = format!("chaos_cf_{n}");
                 if let Ok(cf) = db.create_column_family(&name) {
-                    let _ = db.put_cf(&cf, b"x", b"y");
+                    let _ = regolith::through_stalls(|| db.put_cf(&cf, b"x", b"y"));
                     let _ = db.drop_column_family(cf);
                 }
                 n += 1;

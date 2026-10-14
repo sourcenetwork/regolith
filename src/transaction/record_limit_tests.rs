@@ -2,8 +2,6 @@
 //! whose framed WAL record would exceed the limit is refused before it
 //! waits, applies nothing and consumes no sequence number.
 
-use std::io;
-
 use tempfile::TempDir;
 
 use super::*;
@@ -39,7 +37,7 @@ fn puts_framing_to(framed: usize, count: usize) -> Vec<WriteBatchOp> {
 /// Buffer 17 zeroed values straight into `tx.writes`: `Transaction::put`
 /// would copy each one again into a fresh buffer of its own, and the
 /// values here are already the buffers the commit will frame.
-fn refuses_an_oversized_commit(db: &Db, tx: Transaction<'_>) {
+fn refuses_an_oversized_commit(db: &Db, tx: Transaction) {
     let seq0 = db.latest_sequence();
 
     for op in puts_framing_to(MAX_RECORD_LEN as usize + 1, 17) {
@@ -52,12 +50,11 @@ fn refuses_an_oversized_commit(db: &Db, tx: Transaction<'_>) {
     let err = tx
         .commit()
         .expect_err("an oversized commit must be refused");
-    let TransactionError::Io(e) = err else {
-        panic!("expected TransactionError::Io, got {err:?}");
+    let TransactionError::Engine(Error::InvalidArgument(message)) = err else {
+        panic!("expected TransactionError::Engine(InvalidArgument), got {err:?}");
     };
-    assert_eq!(e.kind(), io::ErrorKind::InvalidInput);
     assert_eq!(
-        e.to_string(),
+        message,
         format!(
             "write is too large: it would log {} bytes and one write can log at most {}; \
              split it into smaller writes",
@@ -78,9 +75,9 @@ fn refuses_an_oversized_commit(db: &Db, tx: Transaction<'_>) {
 fn an_oversized_commit_is_refused_and_leaves_no_trace() {
     let dir = TempDir::new().expect("tempdir");
     let db = OptimisticTransactionDb::open(dir.path(), Options::default()).expect("open");
-    refuses_an_oversized_commit(db.db(), db.begin_transaction());
+    refuses_an_oversized_commit(db.db(), db.begin(&TxnOptions::new()));
 
     let dir = TempDir::new().expect("tempdir");
     let db = TransactionDb::open(dir.path(), Options::default()).expect("open");
-    refuses_an_oversized_commit(db.db(), db.begin_transaction());
+    refuses_an_oversized_commit(db.db(), db.begin(&TxnOptions::new()));
 }

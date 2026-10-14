@@ -24,12 +24,10 @@ fn two_tables(compaction_style: CompactionStyle) -> (TempDir, Arc<Db>) {
     let dir = TempDir::new().unwrap();
     let db = Db::open(
         dir.path(),
-        Options {
-            compaction_style,
-            l0_compaction_trigger: 2,
-            max_background_compactions: 0,
-            ..Options::default()
-        },
+        Options::default()
+            .compaction_style(compaction_style)
+            .l0_compaction_trigger(2)
+            .max_background_compactions(0),
     )
     .unwrap();
     db.put(b"k", b"v").unwrap();
@@ -77,7 +75,7 @@ fn compact_range_keeps_a_snapshot_registered_after_its_live_read() {
     let (_dir, db) = two_tables(CompactionStyle::Level);
     let landed = register_then_overwrite(&db);
 
-    db.compact_range(None, None).unwrap();
+    db.compact_range(None, None).wait().unwrap();
 
     assert_snapshot_kept_its_version(&db, &landed);
 }
@@ -87,7 +85,7 @@ fn a_universal_compact_range_keeps_a_snapshot_registered_after_its_live_read() {
     let (_dir, db) = two_tables(CompactionStyle::Universal);
     let landed = register_then_overwrite(&db);
 
-    db.compact_range(None, None).unwrap();
+    db.compact_range(None, None).wait().unwrap();
 
     assert_snapshot_kept_its_version(&db, &landed);
 }

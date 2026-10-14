@@ -18,16 +18,12 @@
 //! the passes mean something. They are `#[should_panic]`, and the
 //! expected message is the assertion the wrong ordering trips.
 //!
-//! One calibration only exists in a debug build: the skip list's
-//! single-writer guard (invariant S2) is a `debug_assert`, so the model
-//! that proves it fires on an unserialized insert is compiled out of a
-//! release build. Both profiles run in CI for that reason.
-//!
-//! The arena's single-writer guard (invariant A8) is debug-only the same
-//! way, but its calibration runs in both profiles: a debug build proves
-//! the guard trips, a release build proves loom's tracked cell catches
-//! the same unserialized race once the guard is compiled out, so the
-//! expected panic message differs by profile on that one test.
+//! The memtable takes writes from any thread (the commit pipeline applies
+//! a slot from whichever thread reaches it), so the arena and the skip list
+//! are modelled with two writers at once: two allocations get ranges of
+//! their own, two inserts both land, and one entry inserted twice is held
+//! once. Their calibrations rebuild the one compare-and-swap each rests on
+//! as a load and a store.
 
 #![cfg(loom)]
 
@@ -50,8 +46,8 @@ fn the_two_step_seek_loses_a_key_that_is_present() {
 }
 
 #[test]
-fn two_serialized_writers_and_a_reader_share_one_key() {
-    skiplist::two_serialized_writers_and_a_reader_share_one_key();
+fn two_writers_and_a_reader_share_one_key() {
+    skiplist::two_writers_and_a_reader_share_one_key();
 }
 
 #[test]
@@ -59,30 +55,26 @@ fn a_hinted_run_publishes_whole_nodes_to_a_concurrent_reader() {
     skiplist::a_hinted_run_publishes_whole_nodes_to_a_concurrent_reader();
 }
 
-/// The S2 guard is a `debug_assert`, so this calibration only exists in
-/// a debug build. Run it with `RUSTFLAGS="--cfg loom" cargo test --test
-/// loom_memtable`, without `--release`.
-#[cfg(debug_assertions)]
 #[test]
-#[should_panic(expected = "insert is single-writer (S2)")]
-fn an_unserialized_insert_trips_the_single_writer_guard() {
-    skiplist::an_unserialized_insert_trips_the_single_writer_guard();
+fn two_writers_of_one_entry_hold_it_once() {
+    skiplist::two_writers_of_one_entry_hold_it_once();
 }
 
-/// Invariant A8: two unserialized `Arena::alloc` calls must never both
-/// touch the chunk list. A debug build's guard trips before either
-/// thread reaches the state; a release build has no guard, so it is
-/// loom's tracked cell that reports the concurrent write, which is the
-/// calibration that proves the cell replacing the removed `Mutex` is
-/// actually seen by the model.
-#[cfg_attr(debug_assertions, should_panic(expected = "single-writer (A8)"))]
-#[cfg_attr(
-    not(debug_assertions),
-    should_panic(expected = "Concurrent write accesses")
-)]
 #[test]
-fn two_unserialized_allocations_race_the_arena() {
-    arena::two_unserialized_allocations_race_the_arena();
+#[should_panic(expected = "an insert was lost")]
+fn a_link_stored_without_a_compare_and_swap_loses_an_insert() {
+    skiplist::a_link_stored_without_a_compare_and_swap_loses_an_insert();
+}
+
+#[test]
+fn two_allocations_at_once_get_ranges_of_their_own() {
+    arena::two_allocations_at_once_get_ranges_of_their_own();
+}
+
+#[test]
+#[should_panic(expected = "two allocations share bytes")]
+fn a_cursor_moved_by_a_load_and_a_store_hands_one_range_out_twice() {
+    arena::a_cursor_moved_by_a_load_and_a_store_hands_one_range_out_twice();
 }
 
 #[test]

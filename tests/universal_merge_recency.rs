@@ -19,19 +19,17 @@ use regolith::{
 /// Universal compaction with tiny files, so a handful of writes produces
 /// several L0 runs and the merge has something to fold.
 fn universal_options(workers: usize) -> Options {
-    Options {
-        compaction_style: CompactionStyle::Universal,
-        universal_compaction_options: UniversalCompactionOptions::default(),
-        write_buffer_size: 32 * 1024,
-        block_size: 4 * 1024,
-        block_cache_size: 0,
-        target_file_size: 64 * 1024,
-        l0_compaction_trigger: 2,
-        level0_slowdown_writes_trigger: 0,
-        level0_stop_writes_trigger: 0,
-        max_background_compactions: workers,
-        ..Options::default()
-    }
+    Options::default()
+        .compaction_style(CompactionStyle::Universal)
+        .universal_compaction_options(UniversalCompactionOptions::default())
+        .write_buffer_size(32 * 1024)
+        .block_size(4 * 1024)
+        .block_cache_size(0)
+        .target_file_size(64 * 1024)
+        .l0_compaction_trigger(2)
+        .level0_slowdown_writes_trigger(0)
+        .level0_stop_writes_trigger(0)
+        .max_background_compactions(workers)
 }
 
 /// Fill enough to leave several L0 files behind.
@@ -42,7 +40,7 @@ fn seed(db: &Db, rounds: u64) {
         for i in 0..200u64 {
             batch.put(&(r * 1000 + i).to_be_bytes(), &filler);
         }
-        db.write(batch).unwrap();
+        regolith::through_stalls(|| db.write(batch.clone())).unwrap();
         db.flush().unwrap();
     }
 }
@@ -59,12 +57,12 @@ fn a_write_that_lands_during_a_universal_merge_is_not_overtaken() {
         let dir = tempfile::tempdir().unwrap();
         let db = Db::open(dir.path(), universal_options(4)).unwrap();
 
-        db.put(KEY, b"old").unwrap();
+        regolith::through_stalls(|| db.put(KEY, b"old")).unwrap();
         seed(&db, 6);
 
         // Newer value, then a flush to push it into its own L0 file while the
         // background workers are merging what came before.
-        db.put(KEY, b"new").unwrap();
+        regolith::through_stalls(|| db.put(KEY, b"new")).unwrap();
         db.flush().unwrap();
 
         // Give the merge time to land its output.
@@ -106,17 +104,20 @@ fn a_universal_merge_keeps_every_key_it_folded() {
     for i in 0..N {
         batch.put(&i.to_be_bytes(), &value);
         if batch.buffered_bytes() >= 16 * 1024 {
-            db.write(std::mem::take(&mut batch)).unwrap();
+            let full = std::mem::take(&mut batch);
+            regolith::through_stalls(|| db.write(full.clone())).unwrap();
         }
     }
-    db.write(batch).unwrap();
+    regolith::through_stalls(|| db.write(batch.clone())).unwrap();
     db.flush().unwrap();
     while db.compact_step().unwrap() == CompactionOutcome::DidWork {}
 
-    let mut scan = db.scan_stream(None, None).unwrap();
-    let seen = scan.by_ref().count();
-    scan.status().unwrap();
-    assert_eq!(seen as u64, N, "a merge must not drop or duplicate keys");
+    let seen = db
+        .scan_stream(None, None)
+        .unwrap()
+        .try_fold(0u64, |seen, entry| entry.map(|_| seen + 1))
+        .unwrap();
+    assert_eq!(seen, N, "a merge must not drop or duplicate keys");
 
     for i in (0..N).step_by(97) {
         assert_eq!(

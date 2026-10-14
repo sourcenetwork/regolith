@@ -48,10 +48,7 @@ fn num(x: f64) -> String {
 /// The fill skips the WAL: it is setup, not a measured write path, and the
 /// compaction that follows puts every key in an SSTable anyway.
 fn build(keys: &[Vec<u8>]) -> (common::TempDb, Db) {
-    let opts = Options {
-        block_cache_size: BLOCK_CACHE,
-        ..Options::default()
-    };
+    let opts = Options::default().block_cache_size(BLOCK_CACHE);
     let (tmp, db) = common::open("scan", opts);
     let wopts = WriteOptions {
         disable_wal: true,
@@ -68,7 +65,9 @@ fn build(keys: &[Vec<u8>]) -> (common::TempDb, Db) {
         }
         db.write_opt(&wopts, batch).expect("fill write");
     }
-    db.compact_range(None, None).expect("fill compaction");
+    db.compact_range(None, None)
+        .wait()
+        .expect("fill compaction");
     (tmp, db)
 }
 
@@ -120,9 +119,12 @@ fn scan(c: &mut Criterion) {
 
     let mut group = c.benchmark_group("scan_seek");
     group.throughput(Throughput::Elements(1));
+    // Each key sequence lives outside its closure, which criterion calls once
+    // per sample: started again in each sample, it would find in the cache
+    // the blocks the last sample read.
 
+    let mut rng = common::Rng::new(0x1111_2222);
     group.bench_function("seek", |b| {
-        let mut rng = common::Rng::new(0x1111_2222);
         b.iter(|| {
             let target = &keys[(rng.next() % N_KEYS) as usize];
             let mut it = db.iter();
@@ -132,8 +134,8 @@ fn scan(c: &mut Criterion) {
         });
     });
 
+    let mut rng = common::Rng::new(0x3333_4444);
     group.bench_function("seek_for_prev", |b| {
-        let mut rng = common::Rng::new(0x3333_4444);
         b.iter(|| {
             let target = &keys[(rng.next() % N_KEYS) as usize];
             let mut it = db.iter();
@@ -145,8 +147,8 @@ fn scan(c: &mut Criterion) {
 
     // Seek plus a drain of the whole ten-key prefix group, which is what a
     // prefix lookup actually costs a caller.
+    let mut rng = common::Rng::new(0x5555_6666);
     group.bench_function("seek_prefix_group_of_10", |b| {
-        let mut rng = common::Rng::new(0x5555_6666);
         let groups = N_KEYS / PREFIX_GROUP;
         b.iter(|| {
             let g = rng.next() % groups;

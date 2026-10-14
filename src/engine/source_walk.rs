@@ -44,6 +44,22 @@ pub(crate) struct Skip {
     /// or any entry at or below it. `None` when the key's entries here ran
     /// out first.
     pub(crate) stop: Option<u64>,
+    /// The value type of the entry `stop` names. Meaningless when `stop` is
+    /// `None`.
+    pub(crate) stop_type: u8,
+}
+
+/// How one source's visit of a key's entries above a floor ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Above<R> {
+    /// The visit broke with a result.
+    Broke(R),
+    /// It reached an entry at or below the floor, so every older entry, in
+    /// this source and the older ones, is below it too.
+    Floor,
+    /// This source's entries for the key ran out above the floor; an older
+    /// source may hold more.
+    Exhausted,
 }
 
 impl ReadView {
@@ -115,17 +131,13 @@ mod tests {
     use crate::engine::memtable::MemTableConfig;
     use crate::engine::sstable::{LiveSst, Materialize, PointValue, SsTableMeta, SsTableWriter};
     use crate::options::CompressionType;
-    use crate::portability::Ordering;
     use crate::{Db, Options};
     use std::sync::Arc;
     use tempfile::TempDir;
 
     /// A database where only an explicit flush moves data between sources.
     fn open(dir: &TempDir) -> Db {
-        let options = Options {
-            max_background_compactions: 0,
-            ..Options::default()
-        };
+        let options = Options::default().max_background_compactions(0);
         Db::open(dir.path(), options).unwrap()
     }
 
@@ -134,14 +146,9 @@ mod tests {
         prefix_key(DEFAULT_CF_ID, name)
     }
 
-    /// Seal the active memtable and leave it frozen. Only an ingest in
-    /// flight keeps a rotation from flushing the memtable it seals.
+    /// Seal the active memtable and leave it frozen.
     fn freeze_active(db: &Db) {
-        let engine = db.engine();
-        let _pipeline = engine.pipeline.lock();
-        engine.ingest_holds_flushes.store(true, Ordering::Release);
-        engine.rotate_memtable().unwrap();
-        engine.ingest_holds_flushes.store(false, Ordering::Release);
+        db.engine().seal_active().unwrap();
     }
 
     /// Where `view` keeps `source`: "active", "frozen N" or "L<level> N",
@@ -193,13 +200,13 @@ mod tests {
     fn the_walk_visits_memtables_before_tables_newest_first_and_stops_at_the_first_break() {
         let dir = TempDir::new().unwrap();
         let db = open(&dir);
-        db.put(b"a", b"1").unwrap();
+        crate::through_stalls(|| db.put(b"a", b"1")).unwrap();
         db.flush().unwrap();
-        db.put(b"b", b"2").unwrap();
+        crate::through_stalls(|| db.put(b"b", b"2")).unwrap();
         db.flush().unwrap();
-        db.put(b"c", b"3").unwrap();
+        crate::through_stalls(|| db.put(b"c", b"3")).unwrap();
         freeze_active(&db);
-        db.put(b"d", b"4").unwrap();
+        crate::through_stalls(|| db.put(b"d", b"4")).unwrap();
         let view = db.engine().view.load();
 
         // Every L0 table is visited, whatever its key range.
@@ -234,9 +241,13 @@ mod tests {
     fn an_exhausted_walk_continues_with_the_newest_covering_tombstone_sequence() {
         let dir = TempDir::new().unwrap();
         let db = open(&dir);
-        db.put(b"k", b"v").unwrap();
+        crate::through_stalls(|| db.put(b"k", b"v")).unwrap();
         db.flush().unwrap();
-        db.delete_range(b"a", b"m").unwrap();
+        // Held below the tombstones, so that the step a later write owes
+        // does not compact the first one away with the key it covers
+        // (`compaction::deletion`).
+        let _below_the_tombstones = db.snapshot();
+        crate::through_stalls(|| db.delete_range(b"a", b"m")).unwrap();
         let first = db.latest_sequence();
         {
             let view = db.engine().view.load();
@@ -247,7 +258,7 @@ mod tests {
 
         // The first tombstone moves into a table; a newer one covers `k` too.
         db.flush().unwrap();
-        db.delete_range(b"b", b"z").unwrap();
+        crate::through_stalls(|| db.delete_range(b"b", b"z")).unwrap();
         let second = db.latest_sequence();
         let view = db.engine().view.load();
         assert_eq!(walk_all(&view, b"k", u64::MAX).1, second);
@@ -263,9 +274,9 @@ mod tests {
     fn a_tombstone_in_a_newer_source_reaches_the_visit_of_an_older_table() {
         let dir = TempDir::new().unwrap();
         let db = open(&dir);
-        db.put(b"k", b"v").unwrap();
+        crate::through_stalls(|| db.put(b"k", b"v")).unwrap();
         db.flush().unwrap();
-        db.delete_range(b"a", b"z").unwrap();
+        crate::through_stalls(|| db.delete_range(b"a", b"z")).unwrap();
         let tombstone = db.latest_sequence();
         db.flush().unwrap();
         let view = db.engine().view.load();
@@ -280,10 +291,14 @@ mod tests {
     fn a_tombstone_in_an_older_source_does_not_reach_the_visit_of_a_newer_one() {
         let dir = TempDir::new().unwrap();
         let db = open(&dir);
-        db.delete_range(b"a", b"z").unwrap();
+        // A table holding nothing but a tombstone is compacted away by the
+        // step the next write owes, unless a snapshot below the tombstone
+        // is live (`compaction::deletion`). This one keeps it in L0.
+        let _below_the_tombstone = db.snapshot();
+        crate::through_stalls(|| db.delete_range(b"a", b"z")).unwrap();
         let tombstone = db.latest_sequence();
         db.flush().unwrap();
-        db.put(b"k", b"v").unwrap();
+        crate::through_stalls(|| db.put(b"k", b"v")).unwrap();
         db.flush().unwrap();
         let view = db.engine().view.load();
 
@@ -318,6 +333,8 @@ mod tests {
             largest_key: summary.largest_user_key,
             file_size: 0,
             num_entries: summary.num_entries,
+            global_seq: None,
+            deletions: None,
         };
         LiveSst::new(meta, Arc::new(SsTableReader::open(&path, file_id).unwrap()))
     }

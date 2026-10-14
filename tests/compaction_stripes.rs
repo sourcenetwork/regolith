@@ -20,7 +20,7 @@ use proptest::prelude::*;
 use regolith::{
     CompactionDecision, CompactionFilter, CompactionOutcome, CompactionStyle, CompressionType, Db,
     DbWithTtl, Env, IsolationLevel, MemEnv, MergeOperator, OptimisticTransactionDb, Options,
-    Snapshot, TransactionError, TxResult,
+    Snapshot, TransactionError, TxResult, TxnOptions,
 };
 
 /// Sums big-endian `i64` deltas. `fold` is whether two deltas fold into one
@@ -258,17 +258,15 @@ fn run(flavor: Flavor, style: CompactionStyle, ops: &[Op]) -> Result<(), TestCas
     let dir = tempfile::tempdir().unwrap();
     let db = Db::open(
         dir.path(),
-        Options {
-            merge_operator: Some(flavor.operator()),
-            compaction_style: style,
+        Options::default()
+            .merge_operator(Some(flavor.operator()))
+            .compaction_style(style)
             // Compaction runs only where the case asks for it.
-            max_background_compactions: 0,
-            l0_compaction_trigger: 2,
+            .max_background_compactions(0)
+            .l0_compaction_trigger(2)
             // One key's versions per output file, so a compaction splits the
             // tree into many files and later ones pick among them.
-            target_file_size: 1,
-            ..Options::default()
-        },
+            .target_file_size(1),
     )
     .unwrap();
 
@@ -312,7 +310,7 @@ fn run(flavor: Flavor, style: CompactionStyle, ops: &[Op]) -> Result<(), TestCas
                 None
             }
             Op::Compact => {
-                db.compact_range(None, None).unwrap();
+                db.compact_range(None, None).wait().unwrap();
                 check(flavor, &db, &log, &held)?;
                 None
             }
@@ -384,13 +382,11 @@ fn counter(db: &Db) -> i64 {
 
 /// Options for a counter database; `fold` is whether two deltas fold alone.
 fn counter_options(fold: bool) -> Options {
-    Options {
-        merge_operator: Some(Arc::new(Sum { fold })),
+    Options::default()
+        .merge_operator(Some(Arc::new(Sum { fold })))
         // Raw bytes, so file sizes follow the entry count.
-        compression: CompressionType::None,
-        max_background_compactions: 0,
-        ..Options::default()
-    }
+        .compression(CompressionType::None)
+        .max_background_compactions(0)
 }
 
 /// Merge [`OPERANDS`] increments of one into the counter.
@@ -410,7 +406,7 @@ fn operands_above_a_live_snapshot_fold_when_the_operator_can() {
     db.flush().unwrap();
     let flushed = sst_bytes(&db);
 
-    db.compact_range(None, None).unwrap();
+    db.compact_range(None, None).wait().unwrap();
 
     assert!(
         sst_bytes(&db) < flushed / 4,
@@ -431,7 +427,7 @@ fn operands_above_a_live_snapshot_stay_operands_when_the_operator_cannot_fold_th
     db.flush().unwrap();
     let flushed = sst_bytes(&db);
 
-    db.compact_range(None, None).unwrap();
+    db.compact_range(None, None).wait().unwrap();
 
     assert!(
         sst_bytes(&db) > flushed / 2,
@@ -453,7 +449,7 @@ fn a_put_above_a_live_snapshot_folds_the_operands_over_it_whatever_the_operator(
     db.flush().unwrap();
     let flushed = sst_bytes(&db);
 
-    db.compact_range(None, None).unwrap();
+    db.compact_range(None, None).wait().unwrap();
 
     assert!(
         sst_bytes(&db) < flushed / 4,
@@ -480,11 +476,9 @@ fn the_background_worker_folds_above_a_live_snapshot() {
     let dir = tempfile::tempdir().unwrap();
     let db = Db::open(
         dir.path(),
-        Options {
-            max_background_compactions: 1,
-            l0_compaction_trigger: 2,
-            ..counter_options(true)
-        },
+        counter_options(true)
+            .max_background_compactions(1)
+            .l0_compaction_trigger(2),
     )
     .unwrap();
     db.put(b"counter", &100i64.to_be_bytes()).unwrap();
@@ -511,7 +505,8 @@ fn the_background_worker_folds_above_a_live_snapshot() {
 
 /// Whether any SSTable under `dir` holds `needle`.
 fn tables_hold(env: &MemEnv, dir: &Path, needle: &[u8]) -> bool {
-    env.read_dir(dir).unwrap().into_iter().any(|entry| {
+    env.read_dir(dir).unwrap().any(|entry| {
+        let entry = entry.unwrap();
         if entry.is_dir {
             tables_hold(env, &entry.path, needle)
         } else if entry.path.extension().is_some_and(|ext| ext == "sst") {
@@ -534,12 +529,10 @@ fn an_expired_value_is_reclaimed_by_compaction_while_a_snapshot_is_live() {
     env.set_clocks(Some(0), Some(1_000_000));
     let db = DbWithTtl::open(
         root,
-        Options {
-            env: Arc::new(env.clone()),
-            compression: CompressionType::None,
-            max_background_compactions: 0,
-            ..Options::default()
-        },
+        Options::default()
+            .env(Arc::new(env.clone()))
+            .compression(CompressionType::None)
+            .max_background_compactions(0),
         TTL,
     )
     .unwrap();
@@ -559,7 +552,7 @@ fn an_expired_value_is_reclaimed_by_compaction_while_a_snapshot_is_live() {
         "expired values read absent"
     );
 
-    db.compact_range(None, None).unwrap();
+    db.compact_range(None, None).wait().unwrap();
 
     assert!(
         !tables_hold(&env, root, MARKER),
@@ -595,11 +588,9 @@ fn the_range_delete_filter_runs_while_a_snapshot_is_live() {
     let dir = tempfile::tempdir().unwrap();
     let db = Db::open(
         dir.path(),
-        Options {
-            compaction_filter: Some(Arc::new(DropRangeDeletes)),
-            max_background_compactions: 0,
-            ..Options::default()
-        },
+        Options::default()
+            .compaction_filter(Some(Arc::new(DropRangeDeletes)))
+            .max_background_compactions(0),
     )
     .unwrap();
     for key in b'a'..=b'f' {
@@ -610,7 +601,7 @@ fn the_range_delete_filter_runs_while_a_snapshot_is_live() {
     assert_eq!(snapshot.get(b"c").unwrap(), None, "the range delete holds");
     db.flush().unwrap();
 
-    db.compact_range(None, None).unwrap();
+    db.compact_range(None, None).wait().unwrap();
 
     // The filter removed the tombstone, so the values it hid read again, to
     // the snapshot as well as to the head.
@@ -623,7 +614,7 @@ fn the_range_delete_filter_runs_while_a_snapshot_is_live() {
 // --- DefraLevel ---------------------------------------------------------
 
 /// Whether a commit failed on a conflict.
-fn conflicted(result: TxResult<()>) -> bool {
+fn conflicted<T>(result: TxResult<T>) -> bool {
     matches!(result, Err(TransactionError::Conflict { .. }))
 }
 
@@ -634,12 +625,12 @@ fn a_blind_merge_commits_after_the_operands_beside_it_were_compacted() {
         let db = OptimisticTransactionDb::open(dir.path(), counter_options(fold)).unwrap();
         db.db().put(b"counter", &0i64.to_be_bytes()).unwrap();
 
-        let tx = db.begin_transaction_with(IsolationLevel::DefraLevel);
+        let tx = db.begin(&TxnOptions::new().isolation(IsolationLevel::DefraLevel));
         tx.merge(b"counter", &1i64.to_be_bytes()).unwrap();
         merge_ones(db.db());
         db.db().flush().unwrap();
         let flushed = sst_bytes(db.db());
-        db.db().compact_range(None, None).unwrap();
+        db.db().compact_range(None, None).wait().unwrap();
         if fold {
             assert!(
                 sst_bytes(db.db()) < flushed / 4,
@@ -691,13 +682,13 @@ fn a_replacement_above_the_snapshot_still_conflicts_after_the_operands_over_it_w
             let db = OptimisticTransactionDb::open(dir.path(), counter_options(fold)).unwrap();
             db.db().put(b"counter", &0i64.to_be_bytes()).unwrap();
 
-            let tx = db.begin_transaction_with(IsolationLevel::DefraLevel);
+            let tx = db.begin(&TxnOptions::new().isolation(IsolationLevel::DefraLevel));
             tx.merge(b"counter", &1i64.to_be_bytes()).unwrap();
             replacement.apply(db.db());
             merge_ones(db.db());
             db.db().flush().unwrap();
             let flushed = sst_bytes(db.db());
-            db.db().compact_range(None, None).unwrap();
+            db.db().compact_range(None, None).wait().unwrap();
 
             // The operands fold onto a put or delete above the snapshot
             // whatever the operator, and into one another only if it can.

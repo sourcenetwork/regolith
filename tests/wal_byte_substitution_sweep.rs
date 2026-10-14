@@ -16,11 +16,9 @@ use tempfile::TempDir;
 const KEYS: usize = 24;
 
 fn opts() -> Options {
-    Options {
-        write_buffer_size: 8 * 1024 * 1024,
-        durability: DurabilityMode::Immediate,
-        ..Options::default()
-    }
+    Options::default()
+        .write_buffer_size(8 * 1024 * 1024)
+        .durability(DurabilityMode::Immediate)
 }
 
 fn wal_of(db: &Path) -> PathBuf {

@@ -40,7 +40,9 @@
 //!
 //! The full-scale tests are larger versions of the same
 //! properties; see each one's doc comment for its measured runtime.
-//! `just mvcc` runs the fast set, `just mvcc-slow` the full-scale set.
+//! Every test here is in the default run. `just mvcc` runs the file on
+//! its own, and `just mvcc-slow` one test at a time with its output shown.
+#![cfg(not(target_arch = "wasm32"))]
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Barrier};
@@ -108,8 +110,7 @@ fn a_snapshots_view_is_byte_identical_for_its_whole_life() {
 /// shape the original probe ran at: 2000 keys, 6 writer threads and
 /// 120000 writes racing a snapshot that pins every version of them.
 ///
-/// Kept out of the
-/// default run so `cargo test` stays fast; `just mvcc-slow` runs it.
+/// `just mvcc-slow` shows the counts it prints.
 #[test]
 fn snapshot_stability_at_full_scale() {
     let counts = run_snapshot_stability(&StabilityScale {
@@ -162,8 +163,7 @@ fn a_reader_never_observes_a_write_batch_half_applied() {
 /// Full-scale version of
 /// [`a_reader_never_observes_a_write_batch_half_applied`].
 ///
-/// Run with
-/// `just mvcc-slow`.
+/// `just mvcc-slow` shows the counts it prints.
 #[test]
 fn batch_atomicity_at_full_scale() {
     let (checks, generations) = run_batch_atomicity(&AtomicityScale {
@@ -231,8 +231,7 @@ fn a_repeated_read_of_one_key_never_travels_backwards() {
 /// for the mechanism. Measured clean 3 of 3 runs after, at about 1M
 /// reads across 192k writes per run.
 ///
-/// Run with
-/// `just mvcc-slow`.
+/// `just mvcc-slow` shows the counts it prints.
 #[test]
 fn monotonic_reads_at_full_scale() {
     let outcome = run_monotonic_reads(&MonotonicScale {
@@ -359,16 +358,18 @@ fn delete_then_compact_then_reopen_keeps_every_surviving_version() {
 
     let (before_scan, before_iter) = {
         let (db, stats) = open_instrumented(dir.path(), 16 * 1024);
+        // Through stalls: on a host with few cores the compaction worker
+        // falls behind these writes, and a stopped write waits for it.
         for i in 0..total {
-            db.put(&key_at(i), &stamped_value(1)).unwrap();
+            regolith::through_stalls(|| db.put(&key_at(i), &stamped_value(1))).unwrap();
         }
         for i in (1..total).step_by(3) {
-            db.put(&key_at(i), &stamped_value(2)).unwrap();
+            regolith::through_stalls(|| db.put(&key_at(i), &stamped_value(2))).unwrap();
         }
         for i in (2..total).step_by(3) {
-            db.delete(&key_at(i)).unwrap();
+            regolith::through_stalls(|| db.delete(&key_at(i))).unwrap();
         }
-        db.compact_range(None, None).unwrap();
+        db.compact_range(None, None).wait().unwrap();
 
         for (i, want) in expected.iter().enumerate() {
             assert_eq!(
@@ -408,7 +409,7 @@ fn delete_then_compact_then_reopen_keeps_every_surviving_version() {
     assert_same_view(&before_scan, &drain_iter(&db), "post-reopen iterator");
 
     // Compacting the recovered database must not change its content.
-    db.compact_range(None, None).unwrap();
+    db.compact_range(None, None).wait().unwrap();
     assert_same_view(
         &before_scan,
         &db.scan(None, None).unwrap(),
@@ -438,17 +439,19 @@ fn delete_then_compact_then_reopen_keeps_every_surviving_version() {
 #[test]
 fn an_iterator_survives_the_compaction_that_unlinks_its_files() {
     let dir = TempDir::new().unwrap();
-    let (mut opts, stats) = instrumented(4 * 1024);
+    let (opts, stats) = instrumented(4 * 1024);
     // Small output files so the iterator's view spans several of them.
-    opts.target_file_size = 16 * 1024;
+    let opts = opts.target_file_size(16 * 1024);
     let db = Db::open(dir.path(), opts).unwrap();
 
+    // Through stalls: a compaction worker that falls behind leaves this
+    // fill near the level-0 stop, and a stopped write waits for it.
     let total = 1_200usize;
     for i in 0..total {
-        db.put(&key_at(i), &stamped_value(1)).unwrap();
+        regolith::through_stalls(|| db.put(&key_at(i), &stamped_value(1))).unwrap();
     }
     // Land the whole view in files, so there is something to unlink.
-    db.compact_range(None, None).unwrap();
+    db.compact_range(None, None).wait().unwrap();
 
     let baseline = drain_iter(&db);
     assert_eq!(baseline.len(), total);
@@ -470,9 +473,9 @@ fn an_iterator_survives_the_compaction_that_unlinks_its_files() {
 
     // Rewrite everything underneath the half-consumed iterator.
     for i in 0..total {
-        db.put(&key_at(i), &stamped_value(2)).unwrap();
+        regolith::through_stalls(|| db.put(&key_at(i), &stamped_value(2))).unwrap();
     }
-    db.compact_range(None, None).unwrap();
+    db.compact_range(None, None).wait().unwrap();
 
     let unlinked = files_before.iter().filter(|p| !p.exists()).count();
     assert!(
@@ -527,7 +530,7 @@ fn concurrent_iterators_are_unaffected_by_compactions_beneath_them() {
         seed_batch.put(&key_at(i), &stamped_value(1));
     }
     db.write(seed_batch).unwrap();
-    db.compact_range(None, None).unwrap();
+    db.compact_range(None, None).wait().unwrap();
 
     let baseline = Arc::new(db.scan(None, None).unwrap());
     assert_eq!(baseline.len(), total);
@@ -551,7 +554,7 @@ fn concurrent_iterators_are_unaffected_by_compactions_beneath_them() {
                     batch.put(&key_at(i), &stamped_value(generation));
                 }
                 db.write(batch).unwrap();
-                db.compact_range(None, None).unwrap();
+                db.compact_range(None, None).wait().unwrap();
             }
             live.done_one();
         })
@@ -666,7 +669,7 @@ fn a_snapshot_pins_every_version_its_reads_need() {
         for i in (0..keys).step_by(2) {
             db.put(&key_at(i), &stamped_value(generation)).unwrap();
         }
-        db.compact_range(None, None).unwrap();
+        db.compact_range(None, None).wait().unwrap();
     }
 
     for (generation, snap, view) in &snapshots {
@@ -692,7 +695,7 @@ fn a_snapshot_pins_every_version_its_reads_need() {
     drop(newest);
     drop(middle);
     assert_eq!(db.get_int_property("regolith.num-snapshots"), Some(1));
-    db.compact_range(None, None).unwrap();
+    db.compact_range(None, None).wait().unwrap();
 
     let (generation, snap, view) = snapshots.pop().unwrap();
     assert_eq!(generation, 1);
@@ -704,7 +707,7 @@ fn a_snapshot_pins_every_version_its_reads_need() {
 
     drop(snap);
     assert_eq!(db.get_int_property("regolith.num-snapshots"), Some(0));
-    db.compact_range(None, None).unwrap();
+    db.compact_range(None, None).wait().unwrap();
     for i in 0..keys {
         assert_eq!(
             db.get(&key_at(i)).unwrap().as_deref(),

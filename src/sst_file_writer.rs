@@ -4,9 +4,10 @@
 //! without going through a [`crate::Db`], and
 //! [`crate::Db::ingest_external_files`] bulk-loads those files into a
 //! running database. All entries in a single ingest file are assigned
-//! one freshly-allocated sequence number at ingest time; the
-//! placeholder seq (`0`) embedded by this writer is rewritten as the
-//! engine re-emits the file into `sst_dir`.
+//! one freshly-allocated sequence number at ingest time. The file is
+//! installed as it is, copied or linked: the database records that
+//! sequence beside the file and reads every entry at it, so the
+//! placeholder seq (`0`) this writer embeds is never read.
 
 use std::path::{Path, PathBuf};
 
@@ -22,7 +23,7 @@ use crate::options::Options;
 /// duplicates and out-of-order keys are rejected with an error. Every
 /// entry is written with a placeholder sequence number of `0`; the
 /// real sequence number is assigned by the engine when the file is
-/// ingested.
+/// ingested, and every entry reads at it.
 pub struct SstFileWriter {
     inner: SsTableWriter,
     path: PathBuf,
@@ -37,9 +38,13 @@ pub struct SstFileWriter {
 pub struct SstFileMeta {
     /// Path the file was written to.
     pub path: PathBuf,
-    /// Smallest user key in the file.
+    /// Lower bound of the file in storage order. A file can hold entries of
+    /// several column families ([`SstFileWriter::put_cf`]), so this is not
+    /// a key as the caller wrote it: it is the 4-byte big-endian id of a
+    /// column family, then the caller's key in that family.
     pub smallest_user_key: Vec<u8>,
-    /// Largest user key in the file.
+    /// Upper bound of the file in storage order, in the form of
+    /// [`SstFileMeta::smallest_user_key`].
     pub largest_user_key: Vec<u8>,
     /// Number of point entries written (puts + deletes).
     pub num_entries: u64,
@@ -47,13 +52,27 @@ pub struct SstFileMeta {
 
 /// Options controlling how [`crate::Db::ingest_external_files`] moves
 /// files into the database.
+///
+/// Unless `ingest_behind` is set, a file goes to the deepest level such
+/// that no L0 table holds a key of the file's range and no table of that
+/// level or any level above it overlaps the range; with no such level it
+/// goes in front of every L0 table. The range includes the file's range
+/// tombstones.
 #[derive(Debug, Clone, Copy)]
 pub struct IngestOptions {
-    /// Advisory: whether to treat the source file as movable. In the
-    /// current implementation the engine always re-emits the ingest
-    /// file (to rewrite sequence numbers), so the source path is left
-    /// untouched regardless of this flag - the caller is free to
-    /// delete or re-ingest it.
+    /// Move each file into the database instead of copying it.
+    ///
+    /// With `true`, the file is hard-linked into the database's table
+    /// directory where the environment has hard links (it is copied
+    /// where it has none, or where the link fails, across filesystems
+    /// say), and its source path is removed once it is installed. The
+    /// caller hands the file over: it must not write to it afterwards.
+    /// A source whose removal fails is left in place and logged, since
+    /// the ingest itself succeeded; so is one a crash catches between
+    /// the install and the removal.
+    ///
+    /// With `false`, the default, the file is copied and the source is
+    /// left untouched: the caller may rewrite, delete or re-ingest it.
     pub move_files: bool,
     /// Reject the ingest if any live snapshot is pinned. Ingest
     /// assigns a single new seq to every entry in the file; a snapshot
@@ -62,7 +81,8 @@ pub struct IngestOptions {
     pub snapshot_consistency: bool,
     /// Force every ingest file to land at the bottommost level. The
     /// ingest is rejected if any input file's user-key range overlaps
-    /// an existing SSTable at any level.
+    /// an existing SSTable at any level, or a memtable holds a key in
+    /// it.
     pub ingest_behind: bool,
 }
 
@@ -93,6 +113,7 @@ impl SstFileWriter {
             opts.prefix_extractor.clone(),
             opts.partitioned_index,
             opts.metadata_block_size,
+            opts.keyring().as_deref(),
         )
         .map_err(crate::Error::from)?;
         Ok(Self {
@@ -214,13 +235,7 @@ mod tests {
     fn test_create_rejects_invalid_options() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("bad-options.sst");
-        match SstFileWriter::create(
-            &path,
-            &Options {
-                block_size: 0,
-                ..Options::default()
-            },
-        ) {
+        match SstFileWriter::create(&path, &Options::default().block_size(0)) {
             Ok(_) => panic!("expected invalid options error"),
             Err(crate::Error::InvalidArgument(message)) => assert!(message.contains("block_size")),
             Err(other) => panic!("expected invalid argument, got {other:?}"),
@@ -273,11 +288,7 @@ mod tests {
     fn test_configured_key_value_size_limits_are_enforced() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("limited.sst");
-        let opts = Options {
-            max_key_size: 3,
-            max_value_size: 4,
-            ..Options::default()
-        };
+        let opts = Options::default().max_key_size(3).max_value_size(4);
         let mut w = SstFileWriter::create(&path, &opts).unwrap();
 
         w.put(b"abc", b"1234").unwrap();
@@ -299,6 +310,7 @@ mod tests {
         );
 
         db.ingest_external_files(&[sst_path], IngestOptions::default())
+            .wait()
             .unwrap();
 
         assert_eq!(db.get(b"apple").unwrap(), Some(b"red".to_vec()));
@@ -310,10 +322,12 @@ mod tests {
     }
 
     #[test]
-    fn test_ingest_overlap_lands_at_l0() {
+    fn test_ingest_overlap_lands_above_the_level_it_overlaps() {
         let (db, dir) = open_tmp();
         db.put(b"banana", b"old").unwrap();
-        db.compact_range(None, None).unwrap();
+        db.compact_range(None, None).wait().unwrap();
+        let bottom = crate::engine::manifest::MAX_LEVELS - 1;
+        assert_eq!(db.level_file_count(bottom), 1);
 
         let sst_path = dir.path().join("external-overlap.sst");
         build_sst(
@@ -322,11 +336,15 @@ mod tests {
         );
 
         db.ingest_external_files(&[sst_path], IngestOptions::default())
+            .wait()
             .unwrap();
 
         assert_eq!(db.get(b"apple").unwrap(), Some(b"a".to_vec()));
         assert_eq!(db.get(b"banana").unwrap(), Some(b"new".to_vec()));
-        assert!(db.level_file_count(0) >= 1);
+        // The deepest level above every table the range overlaps.
+        assert_eq!(db.level_file_count(bottom - 1), 1);
+        assert_eq!(db.level_file_count(bottom), 1);
+        assert_eq!(db.level_file_count(0), 0);
     }
 
     #[test]
@@ -334,13 +352,14 @@ mod tests {
         let (db, dir) = open_tmp();
         db.put(b"aaa", b"x").unwrap();
         db.put(b"bbb", b"y").unwrap();
-        db.compact_range(None, None).unwrap();
+        db.compact_range(None, None).wait().unwrap();
         let before_l0 = db.level_file_count(0);
 
         let sst_path = dir.path().join("external-disjoint.sst");
         build_sst(&sst_path, &[(b"mmm", Some(b"m")), (b"nnn", Some(b"n"))]);
 
         db.ingest_external_files(&[sst_path], IngestOptions::default())
+            .wait()
             .unwrap();
 
         assert_eq!(db.get(b"mmm").unwrap(), Some(b"m".to_vec()));
@@ -362,14 +381,14 @@ mod tests {
             ingest_behind: true,
             ..Default::default()
         };
-        assert!(db.ingest_external_files(&[sst_path], opts).is_err());
+        assert!(db.ingest_external_files(&[sst_path], opts).wait().is_err());
     }
 
     #[test]
     fn test_ingest_behind_forces_bottommost() {
         let (db, dir) = open_tmp();
         db.put(b"aaa", b"x").unwrap();
-        db.compact_range(None, None).unwrap();
+        db.compact_range(None, None).wait().unwrap();
 
         let sst_path = dir.path().join("external-behind-ok.sst");
         build_sst(&sst_path, &[(b"zzz", Some(b"z"))]);
@@ -378,7 +397,7 @@ mod tests {
             ingest_behind: true,
             ..Default::default()
         };
-        db.ingest_external_files(&[sst_path], opts).unwrap();
+        db.ingest_external_files(&[sst_path], opts).wait().unwrap();
 
         assert_eq!(db.get(b"zzz").unwrap(), Some(b"z".to_vec()));
         // Placed at the bottommost level - not L0.
@@ -406,6 +425,7 @@ mod tests {
         }
 
         db.ingest_external_files(&[sst_path], IngestOptions::default())
+            .wait()
             .unwrap();
 
         for (k, v) in &entries {
@@ -430,6 +450,7 @@ mod tests {
 
         let err = db
             .ingest_external_files(&[sst_path], IngestOptions::default())
+            .wait()
             .unwrap_err();
         drop(snap);
         let msg = format!("{err}");
@@ -449,7 +470,7 @@ mod tests {
             snapshot_consistency: false,
             ..Default::default()
         };
-        db.ingest_external_files(&[sst_path], opts).unwrap();
+        db.ingest_external_files(&[sst_path], opts).wait().unwrap();
 
         // Live db sees both.
         assert_eq!(db.get(b"a").unwrap(), Some(b"1".to_vec()));
@@ -464,14 +485,15 @@ mod tests {
     fn test_ingest_then_compact_range_merges() {
         let (db, dir) = open_tmp();
         db.put(b"aaa", b"old").unwrap();
-        db.compact_range(None, None).unwrap();
+        db.compact_range(None, None).wait().unwrap();
 
         let sst_path = dir.path().join("external-merge.sst");
         build_sst(&sst_path, &[(b"bbb", Some(b"b")), (b"ccc", Some(b"c"))]);
         db.ingest_external_files(&[sst_path], IngestOptions::default())
+            .wait()
             .unwrap();
 
-        db.compact_range(None, None).unwrap();
+        db.compact_range(None, None).wait().unwrap();
 
         assert_eq!(db.get(b"aaa").unwrap(), Some(b"old".to_vec()));
         assert_eq!(db.get(b"bbb").unwrap(), Some(b"b".to_vec()));
