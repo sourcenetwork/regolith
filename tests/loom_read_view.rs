@@ -611,10 +611,13 @@ fn sampling_the_horizon_first_is_caught_by_the_read_path_model() {
     });
 }
 
-/// Preemptions the write-free models explore: every interleaving of their
-/// two threads with up to this many forced switches. Each model has two
-/// threads of a few steps, so this covers every order of their steps.
-const WRITE_FREE_PREEMPTIONS: usize = 3;
+/// Preemptions the write-free models explore. At this bound the search is
+/// saturated: raising it to 12 explores no new interleaving (525 for
+/// `horizon_then_view` and 114 for `apply_then_frontier`, the same at 8 and
+/// at 12, measured). loom's search with no bound at all reports fewer, 336 and
+/// 114, because without a bound it prunes more orders as equivalent, not
+/// because it reaches more states. Each model has two threads of a few steps.
+const WRITE_FREE_PREEMPTIONS: usize = 8;
 
 /// [`run_model`] with [`WRITE_FREE_PREEMPTIONS`] as an explicit bound.
 fn run_bounded_model(name: &str, floor: usize, body: impl Fn() + Send + Sync + 'static) -> usize {
@@ -676,7 +679,7 @@ fn reaches_fresh(view: &View) -> bool {
 /// reaches the fresh memtable.
 #[test]
 fn the_write_free_check_samples_the_horizon_before_it_loads_the_view() {
-    run_bounded_model("horizon_then_view", 86, || {
+    run_bounded_model("horizon_then_view", 262, || {
         let cell = Arc::new(Cell::new(View::initial()));
         let horizon = Arc::new(AtomicU64::new(1));
 
@@ -806,7 +809,7 @@ impl Slot {
 /// and a frontier past a slot means its write is in the memtable.
 #[test]
 fn the_write_free_check_counts_a_commit_decided_before_it() {
-    run_bounded_model("apply_then_frontier", 29, || {
+    run_bounded_model("apply_then_frontier", 57, || {
         let slot = Arc::new(Slot::new());
         let pipeline = {
             let slot = Arc::clone(&slot);
