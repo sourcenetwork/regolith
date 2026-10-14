@@ -450,9 +450,9 @@ fn acquire_parking(sem: &RawSemaphore) {
 /// E48, the first attempt. A waiter queues behind the holder; the holder
 /// lets go and at once tries to take the lock back with the Mutex's own
 /// inline attempt, `MAX_BYPASS + 2` times, so the waiter loses its retries
-/// until it is owed a handoff. Whenever the holder saw the handoff owed before its attempt, the
-/// attempt must fail: the lock is the waiter's. The waiter is served and no
-/// permit is lost.
+/// until it is owed a handoff. Whenever the holder saw the handoff owed
+/// before its attempt, the attempt must fail: the lock is the waiter's. The
+/// waiter is served and no permit is lost.
 pub fn the_first_attempt_refuses_a_lock_owed_to_a_waiter() {
     owed_handoff_model(
         "the_first_attempt_refuses_a_lock_owed_to_a_waiter",

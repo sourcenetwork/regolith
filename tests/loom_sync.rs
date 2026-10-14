@@ -47,12 +47,16 @@
 //!   `src/sync/loom_model.rs`, each with a calibration that writes its step
 //!   the wrong way and must fail.
 //!
-//! - **The spins (E48)**: under loom a spin has one round, so every model
-//!   here also runs the spin before queueing and the spin on the waiter's
-//!   node. Two models check them directly on the production semaphore: the
-//!   Mutex's inline first attempt refuses a lock owed to a queued waiter,
-//!   and a nudge that lands while the waiter spins, calling no waker, is
-//!   never lost. Each has a calibration that drops the guard and must fail.
+//! - **The spins (E48)**: under loom a spin has one round. Every model here
+//!   runs the spin before queueing; the spin on the waiter's node is
+//!   reached only where a model makes sure of it, because a spin that runs
+//!   out halves the budget to zero rounds. Two models check the spins
+//!   directly on the production semaphore: the Mutex's inline first attempt
+//!   refuses a lock owed to a queued waiter, and a nudge that lands while
+//!   the waiter spins on its node, calling no waker, or just after the
+//!   spin's last read, is never lost; the second counts the spins on the
+//!   node and the marks each way and fails if any count is below its floor.
+//!   Each has a calibration that takes the guard away and must fail.
 //!
 //! The waiter-node free list is a pass-through to the allocator under loom
 //! (see `Pool`), so node recycling itself is covered by miri and the unit
