@@ -400,8 +400,10 @@ struct StdLogFile {
 
 #[cfg(all(any(unix, target_os = "wasi"), not(miri)))]
 impl StdLogFile {
-    /// One vectored positional write: how many bytes it took.
-    #[cfg(target_os = "linux")]
+    /// One vectored positional write: how many bytes it took. Through the C
+    /// library's `pwritev64`, whose offset is 64 bits on 32-bit hosts too, so
+    /// the fault shim the power-loss tests preload sees it.
+    #[cfg(all(target_os = "linux", any(target_env = "gnu", target_env = "musl")))]
     fn pwritev(&self, offset: u64, bufs: &[std::io::IoSlice<'_>]) -> io::Result<usize> {
         use std::os::fd::AsRawFd;
         let offset = i64::try_from(offset).map_err(|_| {
@@ -417,7 +419,7 @@ impl StdLogFile {
         // reads them. The descriptor is this handle's own and stays open.
         #[allow(unsafe_code)]
         let wrote = unsafe {
-            libc::pwritev(
+            libc::pwritev64(
                 self.file.as_raw_fd(),
                 bufs.as_ptr().cast::<libc::iovec>(),
                 count as libc::c_int,
@@ -428,7 +430,7 @@ impl StdLogFile {
     }
 
     /// One vectored positional write: how many bytes it took.
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(all(target_os = "linux", any(target_env = "gnu", target_env = "musl"))))]
     fn pwritev(&self, offset: u64, bufs: &[std::io::IoSlice<'_>]) -> io::Result<usize> {
         rustix::io::pwritev(&self.file, bufs, offset).map_err(io::Error::from)
     }
