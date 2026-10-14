@@ -173,10 +173,13 @@ Init ==
   /\ nextMt = 2
   \* Nothing ingested or compacted yet.
   /\ ingested = 0
+  \* No compaction has run.
   /\ compacted = 0
   \* Every publisher is idle, with nothing built.
   /\ sPhase = "idle" /\ sBase = NoView /\ sNext = NoView
+  \* The flush is idle, with no target and nothing built.
   /\ fPhase = "idle" /\ fTarget = 0 /\ fBase = NoView /\ fNext = NoView
+  \* The version publisher (a compaction or an ingest) is idle, with nothing built.
   /\ cPhase = "idle" /\ cIngest = FALSE /\ cBase = NoView /\ cNext = NoView
   \* Nobody holds the version-set mutex.
   /\ vOwner = "none"
@@ -195,12 +198,14 @@ Swaps(base, plain) == plain \/ pub = base
 SealBuild ==
   \* Idle, and a fresh memtable may still be made.
   /\ sPhase = "idle"
+  \* (The budget of memtables is not spent.)
   /\ nextMt <= MaxMemtables
   \* It built from the view published now.
   /\ sBase' = pub
   \* The fresh memtable is active; the sealed one is the newest frozen.
   /\ sNext' = [active |-> nextMt, frozen |-> Append(pub.frozen, pub.active),
                tables |-> pub.tables]
+  \* The rotation has built its view.
   /\ sPhase' = "built"
   \* Nothing else changes.
   /\ UNCHANGED <<pub, nextMt, ingested, compacted, fPhase, fTarget, fBase, fNext,
@@ -215,6 +220,7 @@ SealSwap ==
   /\ IF Swaps(sBase, FALSE)
      \* In: its view is published, and the next fresh memtable is a new one.
      THEN /\ pub' = sNext
+          \* The next fresh memtable takes the next number.
           /\ nextMt' = nextMt + 1
      \* Out: nothing changes, and it builds again.
      ELSE UNCHANGED <<pub, nextMt>>
@@ -231,9 +237,11 @@ SealSwap ==
 FlushPick ==
   \* Idle, and something is frozen.
   /\ fPhase = "idle"
+  \* (At least one memtable is frozen.)
   /\ pub.frozen # <<>>
   \* The oldest frozen memtable.
   /\ fTarget' = Head(pub.frozen)
+  \* The flush has picked its target.
   /\ fPhase' = "picked"
   \* Nothing else changes.
   /\ UNCHANGED <<pub, nextMt, ingested, compacted, sPhase, sBase, sNext, fBase, fNext,
@@ -247,17 +255,20 @@ FlushPick ==
 FlushInstallBuild ==
   \* The table is written, and the mutex is free or already the flush's.
   /\ fPhase = "picked"
+  \* (Nobody else holds the version mutex.)
   /\ vOwner \in {"none", "flush"}
   \* It holds the mutex until its swap goes in.
   /\ vOwner' = "flush"
   \* It built from the view published now, adding its table.
   /\ fBase' = pub
+  \* The view it built:
   /\ fNext' = IF Split
                \* The split bugs: the table only.
                THEN [pub EXCEPT !.tables = pub.tables \cup {fTarget}]
                \* The real code: the table, and the memtable gone, together.
                ELSE [pub EXCEPT !.tables = pub.tables \cup {fTarget},
                                 !.frozen = Without(pub.frozen, fTarget)]
+  \* The flush has built its install.
   /\ fPhase' = "installBuilt"
   \* Nothing else changes.
   /\ UNCHANGED <<pub, nextMt, ingested, compacted, sPhase, sBase, sNext, fTarget,
@@ -269,19 +280,27 @@ FlushInstallBuild ==
 FlushInstallSwap ==
   \* It built its view.
   /\ fPhase = "installBuilt"
+  \* Does the swap go in? The bug PlainVersion stores without the compare-and-swap, so it always
+  \* does.
   /\ IF Swaps(fBase, Mode = "PlainVersion")
      \* In: the version with the table is published; the mutex is free.
      THEN /\ pub' = fNext
+          \* The mutex is free again.
           /\ vOwner' = "none"
           \* The real code retired the memtable in it: the flush is done.
           \* The split bugs still owe the retire.
           /\ IF Split
+             \* The split bugs: the table is in, and the retire is still owed.
              THEN /\ fPhase' = "installed"
+                  \* Nothing is retired yet.
                   /\ UNCHANGED retired
+             \* The design: the flush is done.
              ELSE /\ fPhase' = "idle"
+                  \* Its memtable is recorded as retired.
                   /\ retired' = retired \cup {fTarget}
      \* Out: back to build, the mutex still its own.
      ELSE /\ fPhase' = "picked"
+          \* Nothing is published; the mutex and the retired set stay as they are.
           /\ UNCHANGED <<pub, vOwner, retired>>
   \* Nothing else changes.
   /\ UNCHANGED <<nextMt, ingested, compacted, sPhase, sBase, sNext, fTarget, fBase, fNext,
@@ -295,7 +314,9 @@ FlushRetireBuild ==
   /\ fPhase = "installed"
   \* It built from the view published now, without its memtable.
   /\ fBase' = pub
+  \* The view it built: the published one without its memtable in the frozen list.
   /\ fNext' = [pub EXCEPT !.frozen = Without(pub.frozen, fTarget)]
+  \* The flush has built its retire.
   /\ fPhase' = "retireBuilt"
   \* Nothing else changes.
   /\ UNCHANGED <<pub, nextMt, ingested, compacted, sPhase, sBase, sNext, fTarget,
@@ -306,13 +327,18 @@ FlushRetireBuild ==
 FlushRetireSwap ==
   \* It built its view.
   /\ fPhase = "retireBuilt"
+  \* Does the swap go in? The bug PlainRetire stores without the compare-and-swap, so it always
+  \* does.
   /\ IF Swaps(fBase, Mode = "PlainRetire")
      \* In: the memtable is gone from the frozen list, for good.
      THEN /\ pub' = fNext
+          \* The memtable is recorded as retired.
           /\ retired' = retired \cup {fTarget}
+          \* The flush is done.
           /\ fPhase' = "idle"
      \* Out: back to build on what won.
      ELSE /\ fPhase' = "installed"
+          \* Nothing is published or retired.
           /\ UNCHANGED <<pub, retired>>
   \* Nothing else changes.
   /\ UNCHANGED <<nextMt, ingested, compacted, sPhase, sBase, sNext, fTarget, fBase, fNext,
@@ -326,6 +352,7 @@ FlushRetireSwap ==
 VersionResult(v, ingest) ==
   \* An ingest: `v` with the next ingested table added ...
   IF ingest
+  \* (That view.)
   THEN [v EXCEPT !.tables = v.tables \cup {IngestTable(ingested + 1)}]
   \* ... a compaction: `v` as it is.
   ELSE v
@@ -335,15 +362,21 @@ VersionResult(v, ingest) ==
 VersionBuild ==
   \* Idle, and the mutex is free.
   /\ cPhase = "idle"
+  \* (Nobody holds the version mutex.)
   /\ vOwner = "none"
   \* It is an ingest, if one is left, or a compaction, if one is left.
   /\ \E ingest \in BOOLEAN :
+       \* The kind chosen still has budget left.
        /\ IF ingest THEN ingested < MaxIngests ELSE compacted < MaxCompactions
+       \* It remembers which kind it is.
        /\ cIngest' = ingest
+       \* The view it built, from the published one.
        /\ cNext' = VersionResult(pub, ingest)
   \* It holds the mutex until its swap goes in.
   /\ vOwner' = "version"
+  \* It built from the view published now.
   /\ cBase' = pub
+  \* It has built its view.
   /\ cPhase' = "built"
   \* Nothing else changes.
   /\ UNCHANGED <<pub, nextMt, ingested, compacted, sPhase, sBase, sNext,
@@ -354,8 +387,11 @@ VersionBuild ==
 VersionRebuild ==
   \* Its swap lost.
   /\ cPhase = "retry"
+  \* It builds again from the view published now.
   /\ cBase' = pub
+  \* The same kind of change, applied to that view.
   /\ cNext' = VersionResult(pub, cIngest)
+  \* It has built its view.
   /\ cPhase' = "built"
   \* Nothing else changes.
   /\ UNCHANGED <<pub, nextMt, ingested, compacted, sPhase, sBase, sNext,
@@ -366,15 +402,22 @@ VersionRebuild ==
 VersionSwap ==
   \* It built its view.
   /\ cPhase = "built"
+  \* Does the swap go in? The bug PlainVersion stores without the compare-and-swap, so it always
+  \* does.
   /\ IF Swaps(cBase, Mode = "PlainVersion")
      \* In: published; count the ingest or the compaction.
      THEN /\ pub' = cNext
+          \* An ingest is counted,
           /\ ingested' = IF cIngest THEN ingested + 1 ELSE ingested
+          \* or a compaction is.
           /\ compacted' = IF cIngest THEN compacted ELSE compacted + 1
+          \* The publisher is idle again.
           /\ cPhase' = "idle"
+          \* The mutex is free.
           /\ vOwner' = "none"
      \* Out: build again on what won.
      ELSE /\ cPhase' = "retry"
+          \* Nothing is published or counted, and it keeps the mutex.
           /\ UNCHANGED <<pub, ingested, compacted, vOwner>>
   \* Nothing else changes.
   /\ UNCHANGED <<nextMt, sPhase, sBase, sNext, fPhase, fTarget, fBase, fNext,
@@ -402,7 +445,9 @@ TypeOK ==
   /\ pub.active \in 1..MaxMemtables
   \* ... and the counters stay in their bounds.
   /\ nextMt \in 2..(MaxMemtables + 1)
+  \* The ingests stay within their budget.
   /\ ingested \in 0..MaxIngests
+  \* The compactions stay within their budget.
   /\ compacted \in 0..MaxCompactions
 
 \* THE HEADLINE. Every memtable ever made holds its data in a published

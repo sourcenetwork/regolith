@@ -1,3 +1,4 @@
+-- The one-key update of a function (`set`) and its two laws come from OpenFileTable.lean.
 import Regolith.OpenFileTable
 
 /-!

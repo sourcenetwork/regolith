@@ -9,7 +9,8 @@ snapshot. Tiny example of the danger: the horizon is 0, reader A reads 0, a
 commit makes the horizon 1, a compaction finds no snapshot and deletes the
 version at 0, then A registers at 0 and reads a version that is gone.
 
-THE CODE (`src/engine/snapshot_registry.rs`, `chain.rs`). No lock. Every
+THE CODE (`src/engine/snapshot_registry.rs` and
+`src/engine/snapshot_registry/chain.rs`). No lock. Every
 thread number owns a slot; a slot has entries; an entry holds one sequence
 and a count of the pins on it. A reader announces the horizon `v` it read in
 an entry of its slot (a new entry, or one more count on an entry that holds
@@ -76,15 +77,20 @@ up to (not including) `a + n`, its sequence at `a + n` is the one it had
 at `a`. Example ruled out: a snapshot announced at 5 whose entry says 7 a
 moment later while the snapshot still holds it. -/
 theorem held_keeps_seq (e : Entry) (a : Nat) :
+    -- The statement: for every n, if the entry is held at every moment from a up to (not including)
+    -- a + n, its sequence at a + n is the one at a.
     ∀ n, (∀ t, a ≤ t → t < a + n → 1 ≤ e.pins t) → e.seq (a + n) = e.seq a := by
   -- Count the moments one at a time, from zero upward.
   intro n
   -- Prove it for every `n` by induction: true for 0, and each next step.
   induction n with
+  -- Case: n is 0.
   | zero =>
     -- No moment has passed: `a + 0` is `a`, so both sides are the same.
     intro _
+    -- Both sides are the same thing.
     rfl
+  -- Case: n is k + 1, with the claim for k (ih) known.
   | succ k ih =>
     -- Assume pins hold the entry over the first `k + 1` moments.
     intro hheld
@@ -128,6 +134,8 @@ structure Pin (H : Nat → Nat) where
 /-- While the snapshot is not released, a scan that reads its entry at or
 after the announce sees `v`. -/
 theorem Pin.reads_v {H : Nat → Nat} (p : Pin H) :
+    -- The statement: at every moment from the announce up to (not including) the release, a scan of
+    -- the entry reads v.
     ∀ t, p.tS ≤ t → t < p.tRel → p.entry.reads t = some p.v := by
   -- Take a moment `t` in the protected stretch.
   intro t h1 h2
@@ -137,6 +145,7 @@ theorem Pin.reads_v {H : Nat → Nat} (p : Pin H) :
   have hp : 1 ≤ p.entry.pins (p.tS + n) := p.held _ h1 h2
   -- ...and that sequence is still the one announced, `v`.
   have hs : p.entry.seq (p.tS + n) = p.v := by
+    -- A held entry keeps its sequence since the announce, and the announce wrote v.
     rw [held_keeps_seq p.entry p.tS n (fun t' a b => p.held t' a (by omega)), p.announced]
   -- Unfold what a scan reads and use both facts.
   simp [Entry.reads, hp, hs]
@@ -156,6 +165,7 @@ the least of the sampled horizon and what the scan saw there. -/
 def minimum (H : Nat → Nat) (p : Pin H) (sc : Scan) : Nat :=
   -- The scan saw some value: the minimum cannot exceed it or the sample.
   match p.entry.reads sc.tB with
+  -- It saw the value w: the smaller of the sampled horizon and w.
   | some w => min (H sc.tA) w
   -- It saw a free entry: only the sample bounds the minimum.
   | none => H sc.tA
@@ -172,10 +182,14 @@ theorem scan_respects_live {H : Nat → Nat}
     (hlive : tU < p.tRel)
     -- ...and the compaction uses it after its scan.
     (huse : sc.tB ≤ tU) :
+    -- The statement: the minimum is at most v; and the scan saw v in the entry, or the sampled
+    -- horizon is at most v.
     minimum H p sc ≤ p.v ∧ (p.entry.reads sc.tB = some p.v ∨ H sc.tA ≤ p.v) := by
   -- Two cases: the scan read the entry after the announce, or before.
   by_cases hB : p.tS ≤ sc.tB
-  · -- After: the entry held `v` and the scan saw it.
+  -- After: the entry held `v` and the scan saw it.
+  ·
+    -- A scan of the entry inside the protected stretch reads v.
     have hread := p.reads_v sc.tB hB (by omega)
     -- The scan listed `v`, which is the second half.
     refine ⟨?_, Or.inl hread⟩
@@ -183,9 +197,10 @@ theorem scan_respects_live {H : Nat → Nat}
     simp only [minimum, hread]
     -- ...so it is at most `v`.
     exact Nat.min_le_right _ _
-  · -- Before: the sample came before the scan, which came before the
-    -- announce, which came before the confirm. The horizon only rises, and
-    -- the confirm read `v`, so the sample read at most `v`.
+  -- Before: the sample came before the scan, which came before the announce, which came before the
+  -- confirm. The horizon only rises, and the confirm read `v`, so the sample read at most `v`.
+  ·
+    -- The sampled horizon is at most v:
     have hc : H sc.tA ≤ p.v := by
       -- Replace `v` by the horizon at the confirm.
       rw [← p.confirmed]
@@ -197,9 +212,13 @@ theorem scan_respects_live {H : Nat → Nat}
     unfold minimum
     -- Whatever the scan saw, the minimum is at most the sample.
     split
-    · -- It saw some value: the `min` is at most the sample, at most `v`.
+    -- It saw some value: the `min` is at most the sample, at most `v`.
+    ·
+      -- The smaller of two numbers is at most the first, the sample; and the sample is at most v.
       exact Nat.le_trans (Nat.min_le_left _ _) hc
-    · -- It saw nothing: the minimum is the sample, at most `v`.
+    -- It saw nothing: the minimum is the sample, at most `v`.
+    ·
+      -- Exactly the bound just shown.
       exact hc
 
 /-- A copy of the live snapshot `p`, made at `tJ` while `p` still held its
@@ -211,6 +230,7 @@ def Pin.copy {H : Nat → Nat} (p : Pin H) (tJ tRel2 : Nat)
     -- code runs (the original exists before it is copied); the proof only
     -- needs the second: the copy's count arrives before the original's leaves.
     (_hJ : p.tS ≤ tJ) (hJr : tJ < p.tRel)
+    -- The copy's own count: the entry is held at every moment from the copy to the copy's release.
     (hcopy : ∀ t, tJ ≤ t → t < tRel2 → 1 ≤ p.entry.pins t) : Pin H :=
   -- Everything is the original's except the release.
   { p with
@@ -229,10 +249,18 @@ original is dropped and a scan that read its entry afterwards and the
 copy's slot before misses the copy (that is the RED `CloneFresh`, which
 does not join). -/
 theorem clone_respects_live {H : Nat → Nat} (hH : Rises H) (p : Pin H)
+    -- The moment the copy is made and the moment the copy is released; the copy is made while the
+    -- original is live.
     (tJ tRel2 : Nat) (hJ : p.tS ≤ tJ) (hJr : tJ < p.tRel)
+    -- The copy's own count holds the entry from then until its release.
     (hcopy : ∀ t, tJ ≤ t → t < tRel2 → 1 ≤ p.entry.pins t)
+    -- A scan, and the moment the compaction uses its list: before the copy's release and after the
+    -- scan.
     (sc : Scan) (tU : Nat) (hlive : tU < tRel2) (huse : sc.tB ≤ tU) :
+    -- q is the copy, seen as a pin of its own.
     let q := p.copy tJ tRel2 hJ hJr hcopy
+    -- The statement: the minimum is at most the copy's sequence; and the scan saw it, or the
+    -- sampled horizon is at most it.
     minimum H q sc ≤ q.v ∧ (q.entry.reads sc.tB = some q.v ∨ H sc.tA ≤ q.v) :=
   -- The copy is a `Pin`, so the general theorem applies to it.
   scan_respects_live hH _ sc tU hlive huse
@@ -279,38 +307,50 @@ theorem pins_exact : ∀ (ops : List Op) (c : Nat → Nat) (l : List Nat),
     (∀ q, c q = l.count q) → ∀ q, (run c l ops).1 q = (run c l ops).2.count q := by
   -- Induct on the ops, for every starting state.
   intro ops
+  -- Induction on the list of operations: first none, then one more in front.
   induction ops with
+  -- Case: no operation.
   | nil =>
     -- No ops: the start already agrees.
     intro c l h q
+    -- The starting counts agree, by assumption.
     exact h q
+  -- Case: an operation op, then the rest.
   | cons op ops ih =>
     -- One op, then the rest: show the op keeps the counts exact, then use
     -- the induction for the rest.
     intro c l h
+    -- By the claim for the rest, it is enough that the counts agree after op.
     apply ih
     -- Take any place `q`.
     intro q
     -- What the op is.
     cases op with
+    -- Case: op adds a pin at place p.
     | add p =>
       -- An add: the count at `p` and the list both gain one at `p`.
       simp only [step, live, List.count_cons, h q]
       -- Whether `q` is `p` decides both sides the same way.
       by_cases hq : q = p
+      -- q is p: both sides gain one.
       · subst hq; simp
+      -- q is another place: neither side changes.
       · simp [hq, Ne.symm hq]
+    -- Case: op releases a pin recorded at place p.
     | release t p =>
       -- A release: both lose one at `p` (never below zero).
       simp only [step, live, List.count_erase, h q]
       -- Again `q` is `p` or not.
       by_cases hq : q = p
+      -- q is p: both sides lose one.
       · subst hq; simp
+      -- q is another place: neither side changes.
       · simp [hq, Ne.symm hq]
 
 /-- A release of a live pin never takes a count below zero: while the
 counts are exact, the place of a live pin has a count of at least 1. -/
 theorem release_has_a_count (c : Nat → Nat) (l : List Nat) (p : Nat)
+    -- The counts are exact, and a live pin is recorded at p.
     (h : ∀ q, c q = l.count q) (hp : p ∈ l) : 1 ≤ c p := by
   -- The count is the number of live pins at `p`, and one of them is live.
   rw [h p]
@@ -333,18 +373,28 @@ and reads the still-empty entry at moment 2; the reader stores 0 at moment
 1, above the snapshot. With the confirm, every later read gives 1, not 0,
 so the reader announces again instead. -/
 theorem no_confirm_breaks_min :
+    -- The statement, seven facts about the example: the horizon only rises; it starts at 0; the
+    -- reader's entry is free at moment 2 and holds 0 at moment 3;
     Rises redH ∧ redH 0 = 0 ∧ redSlot 2 = none ∧ redSlot 3 = some 0 ∧
+    -- the horizon is 1 at moment 1, which is above 0; and after moment 3 it is never 0 again.
     redH 1 = 1 ∧ 0 < redH 1 ∧ (∀ t, 3 < t → redH t ≠ 0) := by
   -- Seven facts: the two that need an argument first, the rest by computing.
   refine ⟨?_, by decide, by decide, by decide, by decide, by decide, ?_⟩
-  · -- `redH` is 0 then 1: it never goes down.
+  -- `redH` is 0 then 1: it never goes down.
+  ·
+    -- Take two moments, i no later than j.
     intro i j hij
     -- Unfold it and compare the cases.
     unfold redH
+    -- Four cases, by which side of the change each moment is on; each is arithmetic.
     split <;> split <;> omega
-  · -- After moment 3 the horizon is 1, never 0.
+  -- After moment 3 the horizon is 1, never 0.
+  ·
+    -- Take a moment t after 3.
     intro t ht
+    -- Unfold the example horizon.
     unfold redH
+    -- Two cases, by which side of the change t is on; each is arithmetic.
     split <;> omega
 
 /-- The original's entry in RED `CloneFresh`: it holds 0 with one count
@@ -375,7 +425,10 @@ original's entry at moment 5, now free. The copy is live at 0 from moment 3
 on, yet the scan saw it nowhere and the sample, 1, is above it. Joining the
 original's entry instead (`clone_respects_live`) keeps 0 in view. -/
 theorem fresh_clone_breaks_cover :
+    -- The statement, five facts about the example: the horizon is 1 at moment 1; the copy's entry
+    -- is free at moment 2; the original's entry is free at moment 5;
     redH 1 = 1 ∧ copyEntry.reads 2 = none ∧ origEntry.reads 5 = none ∧
+    -- the copy's entry holds 0 at moment 6; and the sampled horizon, 1, is not at most 0.
     copyEntry.reads 6 = some 0 ∧ ¬ (redH 1 ≤ 0) := by
   -- Every fact is a small computation.
   refine ⟨by decide, ?_, ?_, ?_, by decide⟩ <;> simp [Entry.reads, copyEntry, origEntry]
@@ -397,16 +450,21 @@ place 2 on thread 2; A moves to thread 2 and is released there. -/
 def redCounts : Nat → Nat :=
   -- Start with no counts, add A, add B, release A on thread 2.
   stepHere redHere (stepHere redHere (stepHere redHere (fun _ => 0) (.add 0)) (.add 2))
+    -- (The last operation: the release of A, done on thread 2.)
     (.release 2 0)
 
 /-- **`release_elsewhere_breaks_count`.** After that run, B is the only live
 pin and it records place 2, but place 2's count is 0: a scan skips B's
 entry while B is live. Place 0 keeps A's stale count forever. -/
 theorem release_elsewhere_breaks_count :
+    -- The statement: place 2's count is 0,
     redCounts 2 = 0 ∧
+      -- although exactly one live pin is recorded at place 2,
       (live (live (live [] (.add 0)) (.add 2)) (.release 2 0)).count 2 = 1 ∧
+      -- and place 0 keeps a count of 1.
       redCounts 0 = 1 := by
   -- Every fact is a small computation.
   decide
 
+-- End of the namespace opened at the top.
 end Regolith.SnapshotRegistry

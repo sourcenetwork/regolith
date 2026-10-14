@@ -120,6 +120,7 @@ def cas (published base next : View) : View :=
 /-- **`cas_applies_to_current`.** A swap that goes in has the effect of the
 update applied to the view published now: what was loaded is what is there. -/
 theorem cas_applies_to_current (published base : View) (upd : View → View)
+    -- The compare-and-swap went in: the published view is the one that was loaded.
     (h : published = base) :
     -- The claim itself; its proof follows.
     cas published base (upd base) = upd published := by
@@ -233,6 +234,7 @@ theorem inv_init : Inv init := by
 theorem inv_step {w u : World} (hw : Inv w) (hst : Step w u) : Inv u := by
   -- One case per kind of publication.
   cases hst with
+  -- Case: a rotation.
   | rotate =>
     -- The old active memtable is the newest one, number `made`.
     have hact := hw.active_newest
@@ -288,6 +290,7 @@ theorem inv_step {w u : World} (hw : Inv w) (hst : Step w u) : Inv u := by
       refine ⟨hw.frozen_sorted, trivial, ?_⟩
       -- Each old frozen one is below the old active one, `made`.
       intro a ha b hb; subst hb; have := hw.frozen_old a ha; omega
+  -- Case: a flush installs the table of frozen memtable m.
   | install m h =>
     -- `m` is frozen, so older than the active one.
     have hm := hw.frozen_old m h
@@ -325,6 +328,7 @@ theorem inv_step {w u : World} (hw : Inv w) (hst : Step w u) : Inv u := by
     · intro t ht; simpa [install] using hw.ingests_kept t ht
     -- Frozen, unchanged, is in order.
     · simpa [install] using hw.frozen_sorted
+  -- Case: a flush retires memtable m.
   | retire m h =>
     -- `m`'s table is installed, so it is older than the active one.
     have hm := hw.tables_old m h
@@ -381,6 +385,7 @@ theorem inv_step {w u : World} (hw : Inv w) (hst : Step w u) : Inv u := by
     · intro t ht; simpa [retire] using hw.ingests_kept t ht
     -- A filtered list in order stays in order.
     · simpa [retire] using hw.frozen_sorted.filter _
+  -- Case: an ingest adds table t.
   | ingest t =>
     -- Prove the facts one at a time; only the ingests change.
     refine ⟨hw.made_pos, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩
@@ -408,6 +413,7 @@ theorem inv_step {w u : World} (hw : Inv w) (hst : Step w u) : Inv u := by
       · simp [ingest, hw.ingests_kept x hx]
     -- Frozen, unchanged, is in order.
     · simpa [ingest] using hw.frozen_sorted
+  -- Case: a compaction.
   | compact =>
     -- Nothing changes: the view is the same.
     simpa [compact] using hw
@@ -416,7 +422,9 @@ theorem inv_step {w u : World} (hw : Inv w) (hst : Step w u) : Inv u := by
 theorem inv_reach {w : World} (h : Reach w) : Inv w := by
   -- By how `w` was reached: the start, or one step from a reachable world.
   induction h with
+  -- The start satisfies every fact.
   | init => exact inv_init
+  -- One more step keeps them.
   | step _ hst ih => exact inv_step ih hst
 
 /-! ## Part 3. The rules -/
@@ -502,7 +510,9 @@ Part 2 reach: a flush is an install followed by a retire. -/
 theorem real_reach_reach {w : World} (h : RealReach w) : Reach w := by
   -- By how `w` was reached.
   induction h with
+  -- The start is reachable in Part 2 as well.
   | init => exact Reach.init
+  -- Case: the steps so far, then one more.
   | step _ hst ih =>
     -- One case per publication.
     cases hst with
@@ -527,14 +537,17 @@ theorem flush_keeps_sources_disjoint {w : World} (h : RealReach w) :
     ∀ m ∈ w.view.frozen, m ∉ w.view.tables := by
   -- By how `w` was reached.
   induction h with
+  -- Case: the start.
   | init =>
     -- Nothing is frozen at the start.
     intro m hm; simp [init] at hm
+  -- Case: the steps so far, then one more, with the claim before the step (ih) known.
   | step hr hst ih =>
     -- The facts of Part 2 for the world before the step.
     have hi := inv_reach (real_reach_reach hr)
     -- One case per publication.
     cases hst with
+    -- Case: a rotation.
     | rotate =>
       -- Take a frozen memtable of the new view.
       intro m hm
@@ -547,6 +560,7 @@ theorem flush_keeps_sources_disjoint {w : World} (h : RealReach w) :
       · exact ih m hm
       -- The old active one: every installed table is older than it.
       · intro ht; have := hi.tables_old m ht; rw [hm, hi.active_newest] at this; omega
+    -- Case: a flush of frozen memtable f.
     | flush f hf =>
       -- Take a frozen memtable of the new view.
       intro m hm
@@ -562,9 +576,11 @@ theorem flush_keeps_sources_disjoint {w : World} (h : RealReach w) :
       · exact hm.2 ht
       -- Installed before: but it was frozen before and not installed.
       · exact ih m hm.1 ht
+    -- Case: an ingest.
     | ingest t =>
       -- Ingests do not touch memtables or their tables.
       simpa [ingest] using ih
+    -- Case: a compaction.
     | compact =>
       -- Nothing changes.
       simpa [compact] using ih
@@ -595,6 +611,8 @@ which keeps 3 active and 2 frozen (bug `PlainRetire`). -/
 theorem plain_retire_loses_a_seal :
     -- What the rotation published, and what the plain store leaves.
     let sealed := rotate 3 flushed
+    -- What the flush's plain store leaves: the view it built before the rotation, with memtable 1
+    -- retired.
     let stored := retire 1 flushed
     -- The plain store loses memtable 3 ...
     ¬ (3 = stored.active ∨ 3 ∈ stored.frozen ∨ 3 ∈ stored.tables) ∧
@@ -618,6 +636,7 @@ puts back active 1: memtable 2, which exists, is in no place (bug
 theorem plain_version_loses_a_seal :
     -- What the rotation published, and what the plain store leaves.
     let sealed := rotate 2 init.view
+    -- What the compaction's plain store leaves: the view it built before the rotation.
     let stored := compact init.view
     -- The plain store loses memtable 2 ...
     ¬ (2 = stored.active ∨ 2 ∈ stored.frozen ∨ 2 ∈ stored.tables) ∧

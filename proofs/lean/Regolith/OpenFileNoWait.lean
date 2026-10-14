@@ -1,3 +1,4 @@
+-- The slot table this file extends: its slot phases and its one-key update (`set`).
 import Regolith.OpenFileTable
 
 /-!
@@ -344,7 +345,9 @@ theorem never_waits (cap : Nat) (nw : Nat → Bool) (s : St) (u : Nat)
   | mark =>
     -- Is there a slot left to look at?
     by_cases hm : s.markAt u < cap
-    · -- That slot is free or busy, and either way the CAS takes one step.
+    -- Yes: there is a slot left to look at.
+    ·
+      -- That slot is free or busy, and either way the CAS takes one step.
       cases hf : s.free (s.markAt u)
       -- Busy: it marks the slot.
       · exact ⟨_, Step.markBusy s u hpc hm hf⟩

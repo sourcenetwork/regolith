@@ -185,6 +185,7 @@
 \* entries a walk meets; Sequences for the order it meets them in.
 EXTENDS Naturals, FiniteSets, Sequences
 
+\* The knobs of a run. Each configuration file (MC_BackupSeal_*.cfg) gives them values.
 CONSTANTS
   \* How many backups the model may take in one behaviour: bounds it.
   MaxBackups,
@@ -302,6 +303,8 @@ Min(a, b) == IF a < b THEN a ELSE b
 IdleRs == [phase |-> "idle", id |-> 1, p |-> NoProv, m |-> Absent, want |-> Empty,
            ent |-> FALSE, wrote |-> FALSE]
 
+\* The state: everything that changes from one step to the next. Each line says what the variable
+\* stands for in the real program.
 VARIABLES
   \* The database's tables: live[t] is the key table slot t is sealed under,
   \* 0 when the slot holds no table (Version.levels; SsTableReader::seal_key).
@@ -373,6 +376,7 @@ vars == <<live, current, shared, meta, recorded, bk, tgt, tman, rs, made, restor
 ----------------------------------------------------------------------------
 \* The start: an empty database under key 1, an empty pool, no backup.
 
+\* Init describes the one state every run starts in.
 Init ==
   \* No table yet.
   /\ live = [t \in Tables |-> 0]
@@ -454,6 +458,7 @@ StartBackup ==
   /\ bk.phase = "idle"
   \* And no restore or collection running on the same engine.
   /\ rs.phase = "idle"
+  \* And no collection is running.
   /\ gc.phase = "idle"
   \* Within the model's budget.
   /\ made < MaxBackups
@@ -488,6 +493,7 @@ WriteMeta ==
   /\ bk.phase = "copy"
   \* Only once every table it lists is in the pool. MetaFirst skips this.
   /\ \/ Mutant = "MetaFirst"
+     \* The design: every table the backup lists is already in the pool.
      \/ \A t \in Tables : bk.objs[t] # NoObj => bk.objs[t] \in shared
   \* The file: sealed under the backup's key (plain under PlainMeta), the
   \* listing in the clear and the same listing under the tag, the body, and
@@ -543,9 +549,11 @@ NextBatch ==
   /\ gc.phase = "batch"
   \* Where this batch starts, and where it ends.
   /\ LET start == IF Mutant = "SweepSkips" /\ gc.spos > 0 THEN gc.spos + 1 ELSE gc.spos
+         \* The batch ends Sweep files later, or at the end of the pool if that comes first.
          stop == Min(start + Sweep, Len(gc.sorder))
          \* The batch's pool files.
          batch == {gc.sorder[i] : i \in (start + 1)..stop}
+     \* An empty batch after the first?
      IN IF batch = {} /\ gc.spos > 0
         \* Nothing left: the sweep is done.
         THEN gc' = [gc EXCEPT !.phase = "done"]
@@ -571,24 +579,30 @@ NextBatch ==
 WalkNext ==
   \* A walk is running and has entries left.
   /\ gc.phase = "walk"
+  \* (An entry is left.)
   /\ gc.pos < Len(gc.order)
   \* At a batch boundary (a whole batch handed out), StreamSkips loses one.
   /\ LET skip == Mutant = "StreamSkips" /\ gc.pos > 0 /\ gc.pos % Batch = 0
          \* The position of the entry handed out now.
          i == IF skip THEN gc.pos + 2 ELSE gc.pos + 1
+     \* Is that position past the end of the walk?
      IN IF i > Len(gc.order)
         \* The lost entry was the last one: the walk ends with nothing more.
         THEN gc' = [gc EXCEPT !.pos = i]
         \* Otherwise backup c's listing is read.
         ELSE LET c == gc.order[i]
+             \* Does its listing fail to read (the bug GcSkipsUnreadable not planted)?
              IN IF ~meta[c].reads /\ Mutant # "GcSkipsUnreadable"
                 \* It does not read: the sweep stops, removing nothing more.
                 THEN gc' = [gc EXCEPT !.pos = i, !.phase = "stopped"]
                 \* It counts unless it does not read (GcSkipsUnreadable) or is
                 \* sealed (GcSkipsSealed); what it lists is struck.
                 ELSE LET counted == /\ meta[c].reads
+                                    \* and, under the bug GcSkipsSealed, only when it is not sealed.
                                     /\ Mutant # "GcSkipsSealed" \/ meta[c].key = Plain
+                         \* The pool files that listing names, if it counts.
                          names == IF counted THEN Held(meta[c].listing) ELSE {}
+                     \* The walk moves on, and those files stop being candidates for removal.
                      IN gc' = [gc EXCEPT !.pos = i, !.cand = @ \ names]
   \* Nothing else moves.
   /\ UNCHANGED <<live, current, shared, meta, recorded, bk, tgt, tman, rs, made, restores, adv>>
@@ -598,6 +612,7 @@ WalkNext ==
 WalkDone ==
   \* A walk with no entry left.
   /\ gc.phase = "walk"
+  \* (No entry is left.)
   /\ gc.pos >= Len(gc.order)
   \* Removal comes next.
   /\ gc' = [gc EXCEPT !.phase = "remove"]
@@ -649,6 +664,7 @@ Entitled(m, b, p) ==
   /\ m.reads
   \* A provider, with the right bytes.
   /\ p.given
+  \* The bytes it gives are the right ones.
   /\ p.right
   \* The key the file names.
   /\ m.key \in p.has
@@ -658,6 +674,7 @@ Entitled(m, b, p) ==
   /\ \A t \in Tables : m.body[t] # NoObj => m.body[t][2] \in p.has
   \* The listing is the one the tag covers, and the file is b's own.
   /\ m.listing = m.sealed
+  \* The file was written as backup b's own.
   /\ m.bound = b
 
 \* Whether the engine opens file m as backup b under p (format::decode).
@@ -667,13 +684,16 @@ MetaOpens(m, b, p) ==
   /\ m.reads
   \* Plain metadata needs no key.
   /\ IF m.key = Plain THEN TRUE
+     \* Sealed metadata:
      ELSE
        \* A sealed file needs a provider (Error::KeyProviderRequired)...
        /\ p.given
        \* ...with the key the file names (Error::UnknownKey). OpenUnderCurrent
        \* opens it under the provider's current key instead.
        /\ IF Mutant = "OpenUnderCurrent"
+          \* The bug: it opens only when the provider's current key is the key the file names.
           THEN p.cur = m.key /\ p.cur \in p.has
+          \* The design: it opens when the provider has the key the file names.
           ELSE m.key \in p.has
        \* The tag holds only under the right bytes...
        /\ p.right
@@ -689,6 +709,7 @@ KeysProvided(m, p) ==
   \/ ~p.given
   \* Otherwise the current key and each table's key.
   \/ /\ p.cur \in p.has
+     \* and the provider has the key of every table the backup lists.
      /\ \A t \in Tables : m.body[t] # NoObj => m.body[t][2] \in p.has
 
 \* A restore of backup b with provider p starts: it reads b's metadata.
@@ -696,7 +717,9 @@ StartRestore(b, p) ==
   \* One restore at a time, and no backup or collection running on this
   \* engine.
   /\ rs.phase = "idle"
+  \* No backup is being created.
   /\ bk.phase = "idle"
+  \* No collection is running.
   /\ gc.phase = "idle"
   \* Within the model's budget.
   /\ restores < MaxRestores
@@ -720,6 +743,7 @@ Check ==
   \* The file opens, and the keys are there. CheckAfterCopy leaves the key
   \* checks to the end.
   /\ LET pass == /\ MetaOpens(rs.m, rs.id, rs.p)
+                 \* and every key is provided (the bug CheckAfterCopy leaves that check for later).
                  /\ Mutant = "CheckAfterCopy" \/ KeysProvided(rs.m, rs.p)
      \* Go on to copy, or refuse.
      IN rs' = [rs EXCEPT !.phase = IF pass THEN "copy" ELSE "refused"]
@@ -750,17 +774,20 @@ WriteManifest ==
   /\ rs.phase = "copy"
   \* Only once every listed table is in the target. ManifestFirst skips it.
   /\ \/ Mutant = "ManifestFirst"
+     \* The design: every table the backup lists is already in the target.
      \/ \A t \in Tables : rs.m.listing[t] # NoObj => tgt[t] = rs.m.listing[t]
   \* CheckAfterCopy checks the keys only now, after the copies.
   /\ IF Mutant = "CheckAfterCopy" /\ ~KeysProvided(rs.m, rs.p)
      \* It refuses here, the tables already in the target.
      THEN /\ rs' = [rs EXCEPT !.phase = "refused"]
+          \* No MANIFEST is written.
           /\ UNCHANGED tman
      \* The engine: the MANIFEST names the body's tables, sealed whenever a
      \* provider was given (plain under PlainRestore).
      ELSE /\ tman' = [on |-> TRUE, body |-> rs.m.body,
                       sealed |-> rs.p.given /\ Mutant # "PlainRestore",
                       want |-> rs.want]
+          \* The restore is over.
           /\ rs' = IdleRs
   \* The target's tables do not move.
   /\ UNCHANGED <<live, current, shared, meta, recorded, bk, tgt, made, restores, adv, gc>>
@@ -780,6 +807,7 @@ ResetTarget ==
   /\ rs.phase = "idle"
   \* Something to remove.
   /\ \/ tgt # Empty
+     \* or a MANIFEST.
      \/ tman.on
   \* No table...
   /\ tgt' = Empty
@@ -819,6 +847,7 @@ TamperListing(b, t, o) ==
   /\ meta[b].on
   \* Slot t's table under either key, or nothing, but not what is there.
   /\ o \in {<<t, k>> : k \in Keys} \cup {NoObj}
+  \* (It differs from what the listing holds now, so the edit changes something.)
   /\ o # meta[b].listing[t]
   \* The listing changes; the tag and the body do not.
   /\ meta' = [meta EXCEPT ![b].listing[t] = o]
@@ -835,6 +864,7 @@ Swap ==
   /\ gc.phase = "idle"
   \* Both exist.
   /\ meta[1].on
+  \* (Backup 2's metadata file exists too.)
   /\ meta[2].on
   \* Each file now sits under the other's name.
   /\ meta' = [meta EXCEPT ![1] = meta[2], ![2] = meta[1]]
@@ -948,15 +978,23 @@ TypeOK ==
              m : MetaType, want : [Tables -> Slot], ent : BOOLEAN, wrote : BOOLEAN]
   \* The budgets.
   /\ made \in 0..MaxBackups
+  \* The restores started are within their budget.
   /\ restores \in 0..MaxRestores
+  \* A file changed behind the engine's back at most once.
   /\ adv \in 0..1
   \* The collection in flight: its walks and its candidates.
   /\ gc.phase \in {"idle", "batch", "walk", "remove", "done", "stopped"}
+  \* The sweep's order is a sequence of pool files.
   /\ gc.sorder \in Seq(Objs)
+  \* Its position is within the pool, or one past it.
   /\ gc.spos \in 0..Cardinality(Objs) + 1
+  \* The batch in hand is a set of pool files.
   /\ gc.from \subseteq Objs
+  \* The candidates for removal are pool files.
   /\ gc.cand \subseteq Objs
+  \* The walk's order is a sequence of backup ids.
   /\ gc.order \in Seq(Ids)
+  \* Its position is within the backups, or one past them.
   /\ gc.pos \in 0..MaxBackups + 1
 
 \* No backup's metadata is plain, and no restored MANIFEST is. It rules out
@@ -1004,6 +1042,7 @@ RefusalWritesNothing == rs.phase = "refused" => ~rs.wrote
 \* backup 2 still lists) and the MetaFirst story (a power cut after the
 \* metadata and before its tables).
 ListedRestores ==
+  \* For every backup id b:
   \A b \in Ids :
     \* For a file whose listing is the one it was sealed with...
     (meta[b].on /\ meta[b].listing = meta[b].sealed) =>

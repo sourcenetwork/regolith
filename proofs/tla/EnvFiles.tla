@@ -210,7 +210,6 @@ VARIABLES
 diskVars == <<cursor, ppc, pgot>>
 \* The in-memory part's variables.
 memVars == <<cur, buf, len, wbit, frozen, nextExt, finished, wpc, wext, wlen,
-             \* (continued: the rest of the in-memory part)
              wsaw, wnew, rpc, rfin, rext, rlen, rgot>>
 \* The rename part's variables.
 nameVars == <<mph, opc, over>>
@@ -227,19 +226,19 @@ TypeOK ==
   /\ cur \in Exts
   \* Lengths are numbers and bits are booleans.
   /\ len \in [Exts -> Nat]
-  \* Each buffer's WRITER bit is a yes or a no.
+  \* Each buffer's WRITER bit is set or not.
   /\ wbit \in [Exts -> BOOLEAN]
-  \* Each buffer's FROZEN bit is a yes or a no.
+  \* Each buffer is frozen or not.
   /\ frozen \in [Exts -> BOOLEAN]
   \* Finished appends are writers' records.
   /\ finished \subseteq Writers
   \* Each writer and memory reader is at one step.
   /\ wpc \in [Writers -> {"start", "claimed", "written", "built", "frozen", "done"}]
-  \* Each memory reader is at one step.
+  \* Each memory reader is at one of its steps.
   /\ rpc \in [MemReaders -> {"start", "begun", "loaded", "lenread", "done"}]
   \* The move is in one of its five phases.
   /\ mph \in 0..4
-  \* Each reopen is at one step, holding one of the three recorded names.
+  \* Each reopen is at one of its six steps.
   /\ opc \in [Openers -> {"load", "prev", "cur", "reload", "found", "lost"}]
   \* Each reopen holds one of the three recorded names.
   /\ over \in [Openers -> 0..2]
@@ -250,13 +249,13 @@ Init ==
   /\ cursor = 0
   \* Disk readers have not read.
   /\ ppc = [r \in DiskReaders |-> "start"]
-  \* They have got nothing yet.
+  \* They have got no bytes.
   /\ pgot = [r \in DiskReaders |-> 0]
   \* Readers load buffer 1.
   /\ cur = 1
   \* Every buffer is empty.
   /\ buf = [e \in Exts |-> <<>>]
-  \* Every buffer's published length is 0.
+  \* Every published length is 0.
   /\ len = [e \in Exts |-> 0]
   \* No WRITER bit, nothing frozen.
   /\ wbit = [e \in Exts |-> FALSE]
@@ -268,23 +267,23 @@ Init ==
   /\ finished = {}
   \* Every writer is about to append.
   /\ wpc = [w \in Writers |-> "start"]
-  \* Each writer works on buffer 1 to begin with.
+  \* Every writer's remembered buffer is buffer 1, not used yet;
   /\ wext = [w \in Writers |-> 1]
-  \* Each writer has seen length 0.
+  \* its remembered length is 0;
   /\ wlen = [w \in Writers |-> 0]
-  \* No writer has seen any bit set.
+  \* it saw neither bit;
   /\ wsaw = [w \in Writers |-> [bit |-> FALSE, frz |-> FALSE]]
-  \* No writer has built a buffer.
+  \* and it has built nothing.
   /\ wnew = [w \in Writers |-> <<>>]
   \* Every memory reader is about to read.
   /\ rpc = [r \in MemReaders |-> "start"]
-  \* No reader has noted any finished append.
+  \* No memory reader has noted which appends returned;
   /\ rfin = [r \in MemReaders |-> {}]
-  \* Each reader would load buffer 1.
+  \* each holds buffer 1, not used yet;
   /\ rext = [r \in MemReaders |-> 1]
-  \* Each reader has read no length.
+  \* has read the length 0;
   /\ rlen = [r \in MemReaders |-> 0]
-  \* Each reader has read nothing.
+  \* and has copied nothing.
   /\ rgot = [r \in MemReaders |-> <<>>]
   \* The move has not begun: the file is under "A", and the names say "A".
   /\ mph = 0
@@ -306,7 +305,7 @@ PRead(r) ==
   /\ ppc[r] = "start"
   \* It gets the bytes at its own offset, in one step.
   /\ pgot' = [pgot EXCEPT ![r] = Data(At[r])]
-  \* The reader is done.
+  \* The read is done.
   /\ ppc' = [ppc EXCEPT ![r] = "done"]
   \* Nothing else changes.
   /\ UNCHANGED <<cursor, memVars>>
@@ -319,7 +318,7 @@ Seek(r) ==
   /\ ppc[r] = "start"
   \* The shared cursor goes to its offset.
   /\ cursor' = At[r]
-  \* It goes on to read at the cursor.
+  \* The reader has sought.
   /\ ppc' = [ppc EXCEPT ![r] = "sought"]
   \* Nothing else changes.
   /\ UNCHANGED <<pgot, memVars>>
@@ -330,7 +329,7 @@ ReadAtCursor(r) ==
   /\ ppc[r] = "sought"
   \* It gets the bytes at the cursor, which another reader may have moved.
   /\ pgot' = [pgot EXCEPT ![r] = Data(cursor)]
-  \* The reader is done.
+  \* The read is done.
   /\ ppc' = [ppc EXCEPT ![r] = "done"]
   \* Nothing else changes.
   /\ UNCHANGED <<cursor, memVars>>
@@ -346,19 +345,18 @@ InPlaceClaim(w) ==
   /\ wpc[w] = "start"
   \* The current buffer is free to append to.
   /\ ~wbit[cur]
-  \* ... and is not frozen.
+  \* (It is not frozen.)
   /\ ~frozen[cur]
   \* The CAS sets WRITER.
   /\ wbit' = [wbit EXCEPT ![cur] = TRUE]
   \* The writer remembers the buffer and its length.
   /\ wext' = [wext EXCEPT ![w] = cur]
-  \* It remembers the published length it saw.
+  \* (Its published length.)
   /\ wlen' = [wlen EXCEPT ![w] = len[cur]]
-  \* It goes on to write above that length.
+  \* The writer has claimed the buffer.
   /\ wpc' = [wpc EXCEPT ![w] = "claimed"]
   \* Nothing else changes.
   /\ UNCHANGED <<diskVars, cur, buf, len, frozen, nextExt, finished, wsaw, wnew,
-                 \* (continued: the readers' variables)
                  rpc, rfin, rext, rlen, rgot>>
 
 \* An append in place, step 2: write the record just above the published
@@ -368,11 +366,10 @@ InPlaceWrite(w) ==
   /\ wpc[w] = "claimed"
   \* Its record goes right after the published records.
   /\ buf' = [buf EXCEPT ![wext[w]] = SubSeq(buf[wext[w]], 1, wlen[w]) \o <<w>>]
-  \* It goes on to publish.
+  \* The writer has written its record.
   /\ wpc' = [wpc EXCEPT ![w] = "written"]
   \* Nothing else changes.
   /\ UNCHANGED <<diskVars, cur, len, wbit, frozen, nextExt, finished, wext, wlen,
-                 \* (continued: the rest of the in-memory part)
                  wsaw, wnew, rpc, rfin, rext, rlen, rgot>>
 
 \* An append in place, step 3: publish the new length with a CAS that
@@ -381,25 +378,24 @@ InPlaceWrite(w) ==
 InPlacePublish(w) ==
   \* The writer wrote its record.
   /\ wpc[w] = "written"
-  \* Call the writer's buffer e.
+  \* e is the buffer the writer claimed.
   /\ LET e == wext[w] IN
        \* Not frozen: the CAS publishes, and the append has finished.
        IF ~frozen[e]
-       \* The CAS wins: the length grows by its record ...
+       \* The published length grows by one,
        THEN /\ len' = [len EXCEPT ![e] = wlen[w] + 1]
-            \* ... the WRITER bit is released ...
+            \* the WRITER bit is cleared,
             /\ wbit' = [wbit EXCEPT ![e] = FALSE]
-            \* ... and the append has finished.
+            \* the append has returned,
             /\ finished' = finished \cup {w}
-            \* The writer is done.
+            \* and the writer is done.
             /\ wpc' = [wpc EXCEPT ![w] = "done"]
        \* Frozen: the CAS fails; the buffer is dead and the writer retries.
        ELSE /\ wpc' = [wpc EXCEPT ![w] = "start"]
-            \* The length, the bit and the finished set stay.
+            \* Nothing is published.
             /\ UNCHANGED <<len, wbit, finished>>
   \* Nothing else changes.
   /\ UNCHANGED <<diskVars, cur, buf, frozen, nextExt, wext, wlen, wsaw, wnew,
-                 \* (continued: the readers' variables)
                  rpc, rfin, rext, rlen, rgot>>
 
 \* A copy, step 1: build a new buffer from the current one's published
@@ -407,21 +403,20 @@ InPlacePublish(w) ==
 CopyBuild(w) ==
   \* The writer is about to append, and a buffer number is left.
   /\ wpc[w] = "start"
-  \* A new buffer number is left.
+  \* (A buffer number is left.)
   /\ nextExt <= MaxExt
   \* The new buffer: the published records, then this one.
   /\ wnew' = [wnew EXCEPT ![w] = SubSeq(buf[cur], 1, len[cur]) \o <<w>>]
   \* The writer remembers the buffer and the state word it saw.
   /\ wext' = [wext EXCEPT ![w] = cur]
-  \* It remembers the published length it saw.
+  \* (Its published length.)
   /\ wlen' = [wlen EXCEPT ![w] = len[cur]]
-  \* It remembers the bits it saw: the word its freeze CAS will expect.
+  \* (The two bits it saw.)
   /\ wsaw' = [wsaw EXCEPT ![w] = [bit |-> wbit[cur], frz |-> frozen[cur]]]
-  \* It goes on to freeze the old buffer.
+  \* The writer has built its copy.
   /\ wpc' = [wpc EXCEPT ![w] = "built"]
   \* Nothing else changes.
   /\ UNCHANGED <<diskVars, cur, buf, len, wbit, frozen, nextExt, finished,
-                 \* (continued: the readers' variables)
                  rpc, rfin, rext, rlen, rgot>>
 
 \* A copy, step 2: freeze the old buffer with a CAS on the word it saw when
@@ -434,25 +429,25 @@ CopyBuild(w) ==
 CopyFreeze(w) ==
   \* The writer built its new buffer.
   /\ wpc[w] = "built"
-  \* Call the writer's buffer e.
+  \* e is the buffer the writer copied from.
   /\ LET e == wext[w] IN
        \* The bug NoFreeze, or a buffer frozen when it built: go straight to
        \* the swap. The bug StaleFrozen also goes straight on when the buffer
        \* is frozen NOW, though its length may have grown since the build.
        IF \/ Mutant = "NoFreeze"
-          \* ... it was already frozen when it built ...
+          \* or it saw the buffer frozen already;
           \/ wsaw[w].frz
-          \* ... or, with the bug StaleFrozen, it is frozen now ...
+          \* or, under the bug StaleFrozen, the buffer is frozen now.
           \/ Mutant = "StaleFrozen" /\ frozen[e]
-       \* ... then it skips the freeze and goes on to swap.
+       \* The writer goes on to the swap.
        THEN /\ wpc' = [wpc EXCEPT ![w] = "frozen"]
             \* No bit changes.
             /\ UNCHANGED frozen
        \* The word is still what it saw: the CAS sets FROZEN.
        ELSE IF len[e] = wlen[w] /\ wbit[e] = wsaw[w].bit /\ ~frozen[e]
-            \* Its CAS wins: the old buffer is frozen ...
+            \* The buffer is frozen.
             THEN /\ frozen' = [frozen EXCEPT ![e] = TRUE]
-                 \* ... and it goes on to swap.
+                 \* The writer goes on to the swap.
                  /\ wpc' = [wpc EXCEPT ![w] = "frozen"]
             \* The word changed (an append published, or another copy froze
             \* it): start over.
@@ -461,7 +456,6 @@ CopyFreeze(w) ==
                  /\ UNCHANGED frozen
   \* Nothing else changes.
   /\ UNCHANGED <<diskVars, cur, buf, len, wbit, nextExt, finished, wext, wlen,
-                 \* (continued: the rest of the in-memory part)
                  wsaw, wnew, rpc, rfin, rext, rlen, rgot>>
 
 \* A copy, step 3: swap the new buffer in with a CAS on the file's pointer.
@@ -471,21 +465,21 @@ CopySwap(w) ==
   /\ wpc[w] = "frozen"
   \* The pointer still names the old buffer: the CAS wins ...
   /\ IF cur = wext[w]
-     \* Its CAS wins: readers now load the new buffer ...
+     \* The pointer names the new buffer ...
      THEN /\ cur' = nextExt
           \* ... and the new buffer holds what the writer built, all published.
           /\ buf' = [buf EXCEPT ![nextExt] = wnew[w]]
-          \* ... published to its full length ...
+          \* (Its published length is all of it.)
           /\ len' = [len EXCEPT ![nextExt] = Len(wnew[w])]
-          \* ... and the next buffer number moves on.
+          \* The next new buffer takes the next number.
           /\ nextExt' = nextExt + 1
-          \* ... and the append has finished.
+          \* The append has returned,
           /\ finished' = finished \cup {w}
-          \* The writer is done.
+          \* and the writer is done.
           /\ wpc' = [wpc EXCEPT ![w] = "done"]
      \* ... otherwise another copy won: start over.
      ELSE /\ wpc' = [wpc EXCEPT ![w] = "start"]
-          \* The file and the finished set stay as they were.
+          \* Nothing is swapped.
           /\ UNCHANGED <<cur, buf, len, nextExt, finished>>
   \* Nothing else changes.
   /\ UNCHANGED <<diskVars, wbit, frozen, wext, wlen, wsaw, wnew, rpc, rfin, rext, rlen, rgot>>
@@ -496,11 +490,10 @@ ReadBegin(r) ==
   /\ rpc[r] = "start"
   \* Every append that returned before this moment must be seen.
   /\ rfin' = [rfin EXCEPT ![r] = finished]
-  \* It goes on to load the buffer.
+  \* The read has begun.
   /\ rpc' = [rpc EXCEPT ![r] = "begun"]
   \* Nothing else changes.
   /\ UNCHANGED <<diskVars, cur, buf, len, wbit, frozen, nextExt, finished, wpc, wext,
-                 \* (continued: the rest of the in-memory part)
                  wlen, wsaw, wnew, rext, rlen, rgot>>
 
 \* A memory read, step 2: load the file's current buffer.
@@ -509,11 +502,10 @@ ReadLoad(r) ==
   /\ rpc[r] = "begun"
   \* It holds the buffer the pointer names now.
   /\ rext' = [rext EXCEPT ![r] = cur]
-  \* It goes on to read the length.
+  \* The reader has loaded the pointer.
   /\ rpc' = [rpc EXCEPT ![r] = "loaded"]
   \* Nothing else changes.
   /\ UNCHANGED <<diskVars, cur, buf, len, wbit, frozen, nextExt, finished, wpc, wext,
-                 \* (continued: the rest of the in-memory part)
                  wlen, wsaw, wnew, rfin, rlen, rgot>>
 
 \* A memory read, step 3: load that buffer's published length.
@@ -522,11 +514,10 @@ ReadLen(r) ==
   /\ rpc[r] = "loaded"
   \* It reads the length published on it now.
   /\ rlen' = [rlen EXCEPT ![r] = len[rext[r]]]
-  \* It goes on to copy.
+  \* The reader has read the length.
   /\ rpc' = [rpc EXCEPT ![r] = "lenread"]
   \* Nothing else changes.
   /\ UNCHANGED <<diskVars, cur, buf, len, wbit, frozen, nextExt, finished, wpc, wext,
-                 \* (continued: the rest of the in-memory part)
                  wlen, wsaw, wnew, rfin, rext, rgot>>
 
 \* A memory read, step 4: copy the records below that length.
@@ -535,11 +526,10 @@ ReadCopy(r) ==
   /\ rpc[r] = "lenread"
   \* It copies the published records of its buffer.
   /\ rgot' = [rgot EXCEPT ![r] = SubSeq(buf[rext[r]], 1, rlen[r])]
-  \* The reader is done.
+  \* The read is done.
   /\ rpc' = [rpc EXCEPT ![r] = "done"]
   \* Nothing else changes.
   /\ UNCHANGED <<diskVars, cur, buf, len, wbit, frozen, nextExt, finished, wpc, wext,
-                 \* (continued: the rest of the in-memory part)
                  wlen, wsaw, wnew, rfin, rext, rlen>>
 
 \* ---------------------------------------------------------------------------
@@ -583,7 +573,7 @@ Holds(n) ==
 \* (4). Only when there are reopens to race, so the other configurations
 \* keep this part still.
 Move ==
-  \* There is a reopen to race, and the move is not done.
+  \* There is a reopen to race ...
   /\ Openers # {}
   \* ... and the move is not done.
   /\ mph < 4
@@ -636,15 +626,16 @@ OReload(o) ==
 
 \* Every step anyone can take.
 Next ==
-  \* Parts 1 and 2: Part 3's names do not change.
+  \* Parts 1 and 2 (Part 3's names do not change): a disk reader reads at its own offset, or
+  \* seeks, or reads at the shared cursor;
   \/ /\ \/ \E r \in DiskReaders : PRead(r) \/ Seek(r) \/ ReadAtCursor(r)
-        \* Or a writer's step:
+        \* or a writer
         \/ \E w \in Writers :
-             \* an append in place, step by step,
+             \* appends in place (claim, write, publish)
              \/ InPlaceClaim(w) \/ InPlaceWrite(w) \/ InPlacePublish(w)
-             \* or an append through a copy, step by step.
+             \* or by copying (build, freeze, swap);
              \/ CopyBuild(w) \/ CopyFreeze(w) \/ CopySwap(w)
-        \* Or a memory reader's step.
+        \* or a memory reader takes one of its four steps.
         \/ \E r \in MemReaders : ReadBegin(r) \/ ReadLoad(r) \/ ReadLen(r) \/ ReadCopy(r)
      \* (Part 3 stays still.)
      /\ UNCHANGED nameVars

@@ -284,7 +284,7 @@ loom-debug:
     RUSTFLAGS="--cfg loom" timeout 10m cargo test --test loom_memtable
 
 # Loom models for `regolith::sync`: every primitive's wait protocol,
-# with four calibrations that must fail. Release only: the larger models
+# with five calibrations that must fail. Release only: the larger models
 # explore 0.1 to 0.4 million interleavings each (about four minutes in
 # all), which a debug build multiplies several times over.
 loom-sync:
@@ -449,6 +449,12 @@ tla:
         # bad. Both name the invariant, and both count.
         broke=$(sed -n -e 's/^Error: Invariant \(.*\) is violated\.$/\1/p' \
                        -e 's/^Error: Invariant \(.*\) is violated by the initial state:$/\1/p' <<<"$out" | head -1)
+        # A broken promise about whole runs (a PROPERTY) is reported without its name. A row that
+        # plants a bug against one names exactly one PROPERTY in its configuration, so that is the
+        # one that broke.
+        if [ -z "$broke" ] && grep -q '^Error: Temporal properties were violated\.$' <<<"$out"; then
+            broke=$(sed -n 's/^PROPERTY \(.*\)$/\1/p' "$cfg.cfg" | head -1)
+        fi
         states=$(sed -n 's/^.* states generated, \([0-9,]*\) distinct states found.*$/\1/p' <<<"$out" | tail -1)
         took=$(sed -n 's/^Finished in \(.*\) at (.*$/\1/p' <<<"$out" | tail -1)
         if [ "$code" -eq 124 ]; then
@@ -703,6 +709,16 @@ tla:
     check MC_SnapshotRegistry_Red_CloneFresh           RED LiveCovered
     check MC_SnapshotRegistry_Red_PlainClaim           RED MinBelowLive
     check MC_SnapshotRegistry_Red_JoinNoRecheck        RED LiveEntryExact
+    # E15: waiting for the last snapshot. With threads, the release that
+    # drains the last pin wakes the waiter; on a target with one thread the
+    # call reports what is still pinned and never waits. Lean:
+    # Regolith/SnapshotWait.lean, no_lost_wake, one_thread_never_waits.
+    spec=SnapshotWait
+    check MC_SnapshotWait_Green                        GREEN
+    check MC_SnapshotWait_Green_NoThreads              GREEN
+    check MC_SnapshotWait_Red_WaitAnyway               RED NeverWaitsAlone
+    check MC_SnapshotWait_Red_FutureAfterWatch         RED NoLostWake
+    check MC_SnapshotWait_Red_ReadThenMark             RED NoLostWake
     # 4.6, D54: per-thread statistics shards. Lean: Regolith/ShardedStats.lean,
     # total_after_adds, read_between, reads_monotone.
     spec=ShardedStats
@@ -798,13 +814,26 @@ tla:
     check MC_StallRelief_Green_ReliefFails             GREEN
     check MC_StallRelief_Red_NoFailLand                RED NoWaitOnceFailing
     check MC_StallRelief_Red_NoFailRecheck             RED NoWaitOnceFailing
+    # E16: with no worker, a write that owes a step of background work runs
+    # exactly one, and L0 stays at its compaction trigger (at the stop
+    # trigger when every write seals). Lean: Regolith/OwedStep.lean,
+    # write_one_step, l0_bounded, l0_bounded_by_stop.
+    spec=OwedStep
+    check MC_OwedStep_Green                            GREEN
+    check MC_OwedStep_Green_TinyMemtable               GREEN
+    check MC_OwedStep_Red_FlushOwesNothing             RED L0Bounded
+    check MC_OwedStep_Red_StepUntilIdle                RED OneStepPerWrite
     # regolith::sync's locks after D49: barging with bounded bypass, for
-    # Mutex, Semaphore and ReentrantMutex. Lean: Regolith/Sync.lean,
-    # mutual_exclusion, bounded_bypass, owed_exclusive.
+    # Mutex, Semaphore and ReentrantMutex, one step per atomic instruction
+    # of src/sync. Lean: Regolith/Sync.lean, mutual_exclusion,
+    # bounded_bypass, owed_at_bound, owed_exclusive.
     spec=Sync
     check MC_Sync_Green_Mutex                          GREEN
+    check MC_Sync_Green_MutexBarger                    GREEN
+    check MC_Sync_Green_MutexBoth                      GREEN
     check MC_Sync_Green_MutexLive                      GREEN
     check MC_Sync_Green_Semaphore                      GREEN
+    check MC_Sync_Green_BigRequest                     GREEN
     check MC_Sync_Green_SemaphoreLive                  GREEN
     check MC_Sync_Green_Reentrant                      GREEN
     check MC_Sync_Green_ReentrantLive                  GREEN
@@ -813,8 +842,17 @@ tla:
     check MC_Sync_Red_LoseQueuePosition                RED BoundedBypass
     check MC_Sync_Red_CancelNoPassOn                   RED CancelPassesOn
     check MC_Sync_Red_NoRecheck                        RED NoLostWakeup
+    check MC_Sync_Red_NoDirty                          RED NoLostWakeup
+    check MC_Sync_Red_LowerPendingMarker               RED EveryWaiterServed
     check MC_Sync_Red_IgnoreOwed                       RED HandoffExclusive
     check MC_Sync_Red_NoDepth                          RED ReentrancyDepth
+    # E32, what a drain costs its thread: one pass, and one more for each
+    # waiter operation, or release with a node queued, that lands on it.
+    # Green_PassesGrow is the witness that the passes do grow with those
+    # (lock-free, not wait-free): FewPasses is no promise and must fail.
+    check MC_Sync_Red_ReleaseDirties                   RED DrainBounded
+    check MC_Sync_Red_ExitIgnoresRequest               RED NoLostWakeup
+    check MC_Sync_Green_PassesGrow                     RED FewPasses
     # regolith::sync::Notify, which keeps FIFO handoff. Lean:
     # Regolith/SyncFifo.lean, fifo_served, no_stranded_waiter.
     spec=SyncNotify
@@ -825,17 +863,25 @@ tla:
     check MC_SyncNotify_Red_NoRecheck                  RED NoLostWakeup
     check MC_SyncNotify_Red_NoGenCheck                 RED NoLostWakeup
     # regolith::sync::RwLock and ReentrantRwLock after D49, with D50's
-    # upgradable read.
+    # upgradable read, one step of src/sync/raw_rwlock.rs at a time on the
+    # queue of Sync.tla. Lean: Regolith/Sync.lean for the exclusive side.
     spec=SyncRwLock
     check MC_SyncRwLock_Green_Plain                    GREEN
     check MC_SyncRwLock_Green_WriterLive               GREEN
     check MC_SyncRwLock_Green_ReaderLive               GREEN
+    check MC_SyncRwLock_Green_Upgrade                  GREEN
+    check MC_SyncRwLock_Green_UpgradeLive              GREEN
     check MC_SyncRwLock_Green_Reentrant                GREEN
     check MC_SyncRwLock_Green_ReentrantLive            GREEN
     check MC_SyncRwLock_Red_UnboundedBarging           RED BoundedBypass
     check MC_SyncRwLock_Red_AnyReaderUpgrade           RED NoUpgradeDeadlock
     check MC_SyncRwLock_Red_UpgradeNoHoldBack          RED UpgradeHoldsBack
     check MC_SyncRwLock_Red_OwnerUnaware               RED NoSelfDeadlock
+    # E33: a dropped upgrade while the reader leaves and the next task takes
+    # the upgradable read. The RED is the step the fix removed: the pass
+    # reads UPGRADING and takes the write for the node in its slot.
+    check MC_SyncRwLock_Green_UpgradeDropped           GREEN
+    check MC_SyncRwLock_Red_PassTakesWrite             RED GuardsCounted
     # The compaction gate (4.6, E28): a pass shares it, a job holds it
     # alone, no waiter is passed over more than Bound times either way, the
     # worker takes turns between jobs and passes, and a job parked on its
@@ -862,18 +908,25 @@ tla:
     check MC_SyncLatch_Green_Barrier                   GREEN
     check MC_SyncLatch_Red_NoRecheck                   RED NoLostWakeup
     check MC_SyncLatch_Red_CountCheck                  RED NoLostWakeup
-    # regolith::sync::OnceCell and Lazy: exactly one value is published.
+    # regolith::sync::OnceCell and Lazy: one pointer published by one
+    # compare-and-swap, and a one-permit semaphore for the initializers'
+    # turns, which a publisher opens wide.
     spec=SyncOnce
     check MC_SyncOnce_Green                            GREEN
-    check MC_SyncOnce_Red_CancelNoReset                RED NoLostWakeup
     check MC_SyncOnce_Red_PlainStore                   RED PublishedOnce
-    check MC_SyncOnce_Red_NoRecheck                    RED NoLostWakeup
-    check MC_SyncOnce_Red_ReparkStale                  RED NoLostWakeup
-    # Transaction callbacks (3.16), delivered on the committing thread (D53).
-    # Lean: Regolith/Callbacks.lean, exactly_once, order, attempts_isolated,
-    # delivered_once, delivered_on_queue_thread.
+    check MC_SyncOnce_Red_LoserKeepsOwn                RED ReadersAgree
+    check MC_SyncOnce_Red_CancelNoReset                RED NoLostWakeup
+    check MC_SyncOnce_Red_PublishNoOpen                RED NoLostWakeup
+    # Transaction callbacks (3.16), told on the committing thread (D53), in
+    # both forms of commit: the blocking commit `transact` calls, and
+    # commit_nowait, whose pending ticket is resolved from its commit group
+    # at delivery. Lean: Regolith/Callbacks.lean, exactly_once, order,
+    # attempts_isolated, delivered_once, delivered_on_queue_thread,
+    # resolved_after_landing, resolved_once_on_queue_thread.
     spec=TxnCallbacks
     check MC_TxnCallbacks_Green_Immediate              GREEN
+    check MC_TxnCallbacks_Green_Blocking               GREEN
+    check MC_TxnCallbacks_Green_Nowait                 GREEN
     check MC_TxnCallbacks_Green_Eventual               GREEN
     check MC_TxnCallbacks_Red_CommitBeforeDurable      RED CommitAfterDurable
     check MC_TxnCallbacks_Red_SkipCallbackWrites       RED NoLostUpdate
@@ -1016,8 +1069,19 @@ lean:
     fi
     lake env lean Audit.lean
 
-# Every formal check: the TLA+ models and the Lean proofs.
-proofs: tla lean
+# Every line of a TLA+ model, a TLC configuration and a Lean proof carries a
+# plain-words comment directly above it, written for a reader who knows
+# neither the language nor the code; `proofs/check-comments.sh` states the
+# rule and fails on any line without one. The commit-pipeline models
+# (CommitPipeline, GroupCommit, NonBlocking, and Pipeline.lean and
+# IoQueue.lean) are left out: they are being rewritten on the commit-pipeline
+# branch, and they join this check by deleting the `--except` below.
+# Fail when a proof line has no comment above it.
+proofs-comments:
+    proofs/check-comments.sh --except '/(MC_)?(CommitPipeline|GroupCommit|NonBlocking)[_.]|/(Pipeline|IoQueue|GroupCommit)\.lean$'
+
+# Every formal check: the TLA+ models, the Lean proofs, and their comments.
+proofs: tla lean proofs-comments
 
 # ---------- consistency ----------
 

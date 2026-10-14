@@ -1,3 +1,4 @@
+-- The model whose buggy variants are run here: its state, steps and rules.
 import Regolith.OpenFileNoWait
 
 /-!

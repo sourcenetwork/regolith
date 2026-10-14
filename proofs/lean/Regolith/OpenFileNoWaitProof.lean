@@ -1,3 +1,4 @@
+-- The first half: the steps, the facts `Inv` and the lemmas used here.
 import Regolith.OpenFileNoWait
 
 /-!
@@ -82,7 +83,8 @@ theorem inv_step {cap : Nat} {nw : Nat → Bool} {s s' : St} {u : Nat} (hs : Inv
     refine inv_frame (u := u) hs (by simp [hpc, Pc.calm]) (by simp [Pc.calm])
       -- Every other thread's step is as it was, and nobody's slot changed.
       (fun r hr => by simp [set_apply, hr]) (fun _ _ => rfl)
-      -- Parking, messages, the list and looks are unchanged, the real publish keeps every mark; free slots next.
+      -- Parking, messages, the list and looks are unchanged, and the real publish keeps every
+      -- mark; free slots are checked next.
       rfl rfl rfl rfl (by simp) ?_
     -- A marked free slot: not the published one; any other is as it was.
     intro i _ hf
@@ -98,7 +100,9 @@ theorem inv_step {cap : Nat} {nw : Nat → Bool} {s s' : St} {u : Nat} (hs : Inv
     by_cases hc : s.readers (s.at_ u) = 1 ∧ s.phase (s.at_ u) = .open_ ∧
         -- (and the slot is marked)
         s.wanted (s.at_ u) = true
-    · -- It did: `u` goes on to clear the mark.
+    -- It did: `u` goes on to clear the mark.
+    ·
+      -- `u` is in the middle of a read, so it is not parked.
       have hp := notparked u (by simp [hpc])
       -- Each fact after the leave.
       refine ⟨?_, ?_, ?_, ?_, ?_, ?_⟩
@@ -150,7 +154,9 @@ theorem inv_step {cap : Nat} {nw : Nat → Bool} {s s' : St} {u : Nat} (hs : Inv
           (waking_frame (u := u) (by simp [hpc]) (fun r hr => by simp [set_apply, hr]))
           -- Its look and every mark are as they were.
           rfl (fun _ h => h)
-    · -- It did not: `u` goes back to its start, a calm step.
+    -- It did not: `u` goes back to its start, a calm step.
+    ·
+      -- A calm step keeps every fact once the conditions listed below are shown.
       refine inv_frame (u := u) hs (by simp [hpc, Pc.calm]) (by simp [hc, Pc.calm])
         -- Every other thread's step is as it was, and nobody's slot changed.
         (fun r hr => by simp [set_apply, hr]) (fun _ _ => rfl)
@@ -160,7 +166,9 @@ theorem inv_step {cap : Nat} {nw : Nat → Bool} {s s' : St} {u : Nat} (hs : Inv
       intro j hw hf
       -- Is it the slot `u` left?
       by_cases hj : j = s.at_ u
-      · -- It is. It is marked, so by `hc` it did not have exactly one open reader.
+      -- It is the slot `u` left.
+      ·
+        -- It is marked, so by `hc` it did not have exactly one open reader. Write it as `s.at_ u`.
         subst hj
         -- Unfold what free means, now and before.
         simp only [St.free, set_apply, ite_true] at hf ⊢

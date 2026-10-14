@@ -163,7 +163,8 @@ ASSUME \A f \in Files : f \in Nat \ {0}
 ASSUME NoWait \subseteq Threads
 \* The bug names this model knows.
 ASSUME Mutant \in {"none", "IgnoreReaders", "NoOwnerRecheck", "OutsideTable",
-                   \* and the D60 bugs: a waiting unit, a park that marks first, a publish that drops the mark, a wake that tells only parked units.
+                   \* and the D60 bugs: a waiting unit, a park that marks first, a publish
+                   \* that drops the mark, a wake that tells only parked units.
                    "Waits", "MarkFirst", "PublishDropsWanted", "WakeNeedsParked"}
 
 \* For the configurations: thread 1 reads table 1, thread 2 reads table 2.
@@ -312,11 +313,11 @@ Init ==
 \* A slot a claim may take: empty, or open with nobody reading it. The bug
 \* IgnoreReaders also takes an open slot that has readers.
 Claimable(s) ==
-  \* Empty: there is nothing to close.
+  \* An empty slot;
   \/ phase[s] = "empty"
-  \* Or open ...
+  \* or an open slot
   \/ /\ phase[s] = "open"
-     \* ... with nobody reading it (the bug IgnoreReaders takes it anyway).
+     \* that nobody reads (the bug IgnoreReaders does not ask).
      /\ (holders[s] = {} \/ Mutant = "IgnoreReaders")
 
 \* Who a wake tells. The real code tells every queue it took off the list;
@@ -336,11 +337,11 @@ Telling(taken) ==
 Look(t, s) ==
   \* The thread is starting a read and has reads left.
   /\ pc[t] = "start"
-  \* It has reads left.
+  \* (It has reads left.)
   /\ left[t] > 0
   \* The slot is open and holds the table this thread wants.
   /\ phase[s] = "open"
-  \* Its owner is the table this thread wants.
+  \* (It holds the table this thread wants.)
   /\ owner[s] = Want[t]
   \* It remembers the word: the phase and how many readers.
   /\ seen' = [seen EXCEPT ![t] = [phase |-> phase[s], count |-> Cardinality(holders[s])]]
@@ -359,7 +360,7 @@ Look(t, s) ==
 Miss(t) ==
   \* The thread is starting a read and has reads left.
   /\ pc[t] = "start"
-  \* It has reads left.
+  \* (It has reads left.)
   /\ left[t] > 0
   \* It goes to claim a slot.
   /\ pc' = [pc EXCEPT ![t] = "claim"]
@@ -374,23 +375,23 @@ Miss(t) ==
 Cas(t) ==
   \* The thread is at its CAS, on its slot s.
   /\ pc[t] = "cas"
-  \* Call the thread's slot s.
+  \* s is the slot the thread is at.
   /\ LET s == at[t] IN
        \* The word now equals the word it saw ...
        IF /\ phase[s] = seen[t].phase
-          \* ... and the same number of readers ...
+          \* and the count of readers equals the count it saw ...
           /\ Cardinality(holders[s]) = seen[t].count
        \* ... so the CAS wins: the thread counts as a reader, then rechecks.
        THEN /\ holders' = [holders EXCEPT ![s] = holders[s] \cup {t}]
-            \* It goes on to check the owner.
+            \* It rechecks next.
             /\ pc' = [pc EXCEPT ![t] = "recheck"]
             \* It stays at its slot.
             /\ UNCHANGED at
        \* ... otherwise the CAS fails and the thread starts over.
        ELSE /\ pc' = [pc EXCEPT ![t] = "start"]
-            \* It is at no slot now.
+            \* It is at no slot.
             /\ at' = [at EXCEPT ![t] = None]
-            \* Nobody's reading changes.
+            \* The readers do not change.
             /\ UNCHANGED holders
   \* Nothing else changes.
   /\ UNCHANGED <<phase, owner, desc, alive, fileOf, next, seen, using, got, left>>
@@ -403,7 +404,7 @@ Cas(t) ==
 Recheck(t) ==
   \* The thread won its CAS on slot s.
   /\ pc[t] = "recheck"
-  \* Call the thread's slot s.
+  \* s is the slot the thread is at.
   /\ LET s == at[t] IN
        \* The slot still holds its table (or the bug does not look) ...
        IF owner[s] = Want[t] \/ Mutant = "NoOwnerRecheck"
@@ -411,13 +412,13 @@ Recheck(t) ==
        THEN /\ using' = [using EXCEPT ![t] = desc[s]]
             \* It reads next.
             /\ pc' = [pc EXCEPT ![t] = "read"]
-            \* It stays a reader, at its slot.
+            \* It stays a reader of its slot.
             /\ UNCHANGED <<holders, at>>
        \* ... otherwise the slot was reloaded with another table: it stops
        \* counting as a reader (the code drops its hold, Held::drop, the same
        \* decrement as a leave) and starts over.
        ELSE /\ holders' = [holders EXCEPT ![s] = holders[s] \ {t}]
-            \* It reads through no file.
+            \* It reads through nothing.
             /\ UNCHANGED using
             \* Like a leave, a drop that frees a WANTED slot goes on to clear
             \* the mark and wake the list; this read has not happened, so
@@ -475,7 +476,7 @@ ClaimOutside(t) ==
   /\ next' = next + 1
   \* It reads through it, at no slot.
   /\ using' = [using EXCEPT ![t] = next]
-  \* It is at no slot now.
+  \* It is at no slot.
   /\ at' = [at EXCEPT ![t] = None]
   \* It reads next.
   /\ pc' = [pc EXCEPT ![t] = "read"]
@@ -490,7 +491,7 @@ ClaimOutside(t) ==
 \* The bug Waits removes this step, so a unit that finds no free slot sits
 \* at "claim" like a Blocking read, waiting for another thread.
 SweepMiss(t) ==
-  \* Only a queue unit, and only without the bug.
+  \* Only a queue unit takes this step.
   /\ t \in NoWait
   \* Not with the bug Waits, which has no such step.
   /\ Mutant # "Waits"
@@ -524,7 +525,7 @@ Register(t) ==
 \* SlotTable::mark_or_claim). A slot that freed since the sweep it claims;
 \* a busy one it marks WANTED and moves on.
 Mark(t) ==
-  \* The unit is looking, and has a slot left to look at.
+  \* The unit is looking at the slots.
   /\ pc[t] = "mark"
   \* It has a slot left to look at.
   /\ markAt[t] <= Cap
@@ -555,9 +556,9 @@ Mark(t) ==
 
 \* The unit has looked at every slot and every one was busy (Parking::Parked).
 MarkDone(t) ==
-  \* The look went past the last slot.
+  \* The unit is looking at the slots.
   /\ pc[t] = "mark"
-  \* It has looked at every slot.
+  \* It has looked at every slot: the look went past the last one.
   /\ markAt[t] > Cap
   \* The real code parks now; the bug MarkFirst only now joins the list.
   /\ pc' = [pc EXCEPT ![t] = IF Mutant = "MarkFirst" THEN "register" ELSE "park"]
@@ -601,7 +602,7 @@ Park(t) ==
 \* taking the inbox, then IoQueue::unpark): the unit is unparked and its
 \* read starts over, joining its slot or claiming one.
 Poll(t) ==
-  \* The read is parked, and a message waits.
+  \* The read is parked: its poll has returned.
   /\ pc[t] = "idle"
   \* A message waits in its inbox.
   /\ told[t]
@@ -621,7 +622,7 @@ Poll(t) ==
 Close(t) ==
   \* The thread claimed slot s.
   /\ pc[t] = "close"
-  \* Call the thread's slot s.
+  \* s is the slot the thread claimed.
   /\ LET s == at[t] IN
        \* The old file is closed (if there was one).
        /\ alive' = alive \ {desc[s]}
@@ -643,7 +644,7 @@ Open(t) ==
   /\ pc[t] = "open"
   \* There is an opening number left.
   /\ next <= MaxDesc
-  \* Call the thread's slot s.
+  \* s is the slot the thread claimed.
   /\ LET s == at[t] IN
        \* Its table is now open ...
        /\ alive' = alive \cup {next}
@@ -655,7 +656,7 @@ Open(t) ==
        /\ owner' = [owner EXCEPT ![s] = Want[t]]
        \* ... and which is open, with this thread as a reader.
        /\ phase' = [phase EXCEPT ![s] = "open"]
-       \* ... with this thread as a reader.
+       \* (This thread is one of its readers.)
        /\ holders' = [holders EXCEPT ![s] = holders[s] \cup {t}]
        \* The mark stays, unless the bug drops it.
        /\ wanted' = IF Mutant = "PublishDropsWanted"
@@ -771,43 +772,43 @@ Wake(t) ==
 
 \* Every step thread t can take on its own.
 OwnStep(t) ==
-  \* Or: it looks at a slot for its table.
+  \* It looks at a slot and finds its table there;
   \/ \E s \in Slots : Look(t, s)
-  \* Or: it goes to claim a slot.
+  \* or it finds its table in no slot;
   \/ Miss(t)
-  \* Or: its join's CAS.
+  \* or it tries its compare-and-swap;
   \/ Cas(t)
-  \* Or: its owner check.
+  \* or it rechecks the slot it joined;
   \/ Recheck(t)
-  \* Or: it claims a free slot.
+  \* or it claims a slot for its table;
   \/ \E s \in Slots : Claim(t, s)
-  \* Or: the bug OutsideTable's open outside the table.
+  \* or, with no slot to claim, it opens the file outside the table;
   \/ ClaimOutside(t)
-  \* Or: a unit's sweep comes back empty.
+  \* or, a unit, its sweep comes back empty;
   \/ SweepMiss(t)
-  \* Or: a unit joins the parked list.
+  \* or, a unit, it joins the parked list;
   \/ Register(t)
-  \* Or: a unit looks at one slot.
+  \* or, a unit, it looks at one slot;
   \/ Mark(t)
-  \* Or: a unit's look is done.
+  \* or, a unit, its look is done;
   \/ MarkDone(t)
-  \* Or: a unit that claimed in its look wakes the list.
+  \* or, a unit that claimed in its look, it wakes the list;
   \/ ParkWake(t)
-  \* Or: a unit parks.
+  \* or, a unit, it parks;
   \/ Park(t)
-  \* Or: a unit's poll takes its message.
+  \* or, a unit, its poll takes its message;
   \/ Poll(t)
-  \* Or: a claimer closes the old file.
+  \* or it closes the file of the slot it claimed;
   \/ Close(t)
-  \* Or: a claimer opens and publishes its table.
+  \* or it opens its table's file in that slot;
   \/ Open(t)
-  \* Or: it reads.
+  \* or it reads;
   \/ Read(t)
-  \* Or: it leaves its slot.
+  \* or it leaves;
   \/ Leave(t)
-  \* Or: a leaver clears a mark.
+  \* or, having freed a wanted slot, it clears the mark;
   \/ ClearW(t)
-  \* Or: a leaver wakes the list.
+  \* or, having cleared the mark, it wakes the list.
   \/ Wake(t)
 
 \* Every step any thread can take.

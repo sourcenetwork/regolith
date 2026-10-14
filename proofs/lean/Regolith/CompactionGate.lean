@@ -77,6 +77,7 @@ added at the back, `l.erase t` is `l` without `t`, and `h :: rest` is a list
 whose first element is `h`.
 -/
 
+-- Everything below is named Regolith.CompactionGate.<name>.
 namespace Regolith.CompactionGate
 
 /-! ## Part 1. The gate -/
@@ -366,7 +367,8 @@ theorem step_inv {B : Nat}
     -- Nobody entered or left, so the first fact is as before.
     refine ⟨hs.excl, ?_, ?_, ?_, nodup_snoc hs.nodup ht⟩
     -- Every waiter's count is at most `B`.
-    · -- Take a waiter `x` of the new queue.
+    ·
+      -- Take a waiter `x` of the new queue.
       intro x hx
       -- Its count is 0 if it is the newcomer, and the old count otherwise.
       show (if x = t then 0 else s.lost x) ≤ B
@@ -383,7 +385,8 @@ theorem step_inv {B : Nat}
         -- The newcomer: ruled out just above.
         · exact absurd (List.mem_singleton.1 h) hxt
     -- A waiter at the bound is the owed one.
-    · -- Take a waiter `x` of the new queue whose count is `B`.
+    ·
+      -- Take a waiter `x` of the new queue whose count is `B`.
       intro x hx hl
       -- Its count is 0 if it is the newcomer, and the old count otherwise.
       change (if x = t then 0 else s.lost x) = B at hl
@@ -429,7 +432,8 @@ theorem step_inv {B : Nat}
     -- from a list without repeats leaves no repeats.
     refine ⟨enter_excl hf, ?_, ?_, ?_, hs.nodup.erase t⟩
     -- Those still waiting waited before, and counts did not change.
-    · -- Take a waiter `x` of the new queue.
+    ·
+      -- Take a waiter `x` of the new queue.
       intro x hx
       -- Its count is its old count.
       show (enter s (s.kind t)).lost x ≤ B
@@ -438,7 +442,8 @@ theorem step_inv {B : Nat}
       -- `x` was in the old queue, where the invariant bounds it.
       exact hs.bound x (List.mem_of_mem_erase hx)
     -- Nobody was owed, so no remaining waiter can be at the bound.
-    · -- Take a waiter `x` of the new queue whose count is `B`.
+    ·
+      -- Take a waiter `x` of the new queue whose count is `B`.
       intro x hx hl
       -- Its count is its old count.
       change (enter s (s.kind t)).lost x = B at hl
@@ -451,7 +456,8 @@ theorem step_inv {B : Nat}
       -- "nobody" is not "`x`".
       cases h
     -- Nobody is owed after the step either.
-    · -- Suppose `x` were owed after the step.
+    ·
+      -- Suppose `x` were owed after the step.
       intro x hx
       -- Who is owed did not change.
       change (enter s (s.kind t)).owed = some x at hx
@@ -466,7 +472,8 @@ theorem step_inv {B : Nat}
     -- Nobody entered or left and the queue is the same.
     refine ⟨hs.excl, ?_, ?_, ?_, hs.nodup⟩
     -- Every waiter's count is at most `B`.
-    · -- Take a waiter `x`.
+    ·
+      -- Take a waiter `x`.
       intro x hx
       -- Its count is one more if it is `t`, and unchanged otherwise.
       show (if x = t then s.lost t + 1 else s.lost x) ≤ B
@@ -477,7 +484,8 @@ theorem step_inv {B : Nat}
       -- Another waiter: unchanged, and bounded before.
       · rw [ite_eq_right hxt]; exact hs.bound x hx
     -- A waiter at the bound is the owed one.
-    · -- Take a waiter `x` whose count is now `B`.
+    ·
+      -- Take a waiter `x` whose count is now `B`.
       intro x hx hl
       -- Its count is one more if it is `t`, and unchanged otherwise.
       change (if x = t then s.lost t + 1 else s.lost x) = B at hl
@@ -496,7 +504,8 @@ theorem step_inv {B : Nat}
         -- "nobody" is not "`x`".
         cases h
     -- The owed waiter, if there is one now, is `t`, which waits.
-    · -- Suppose `x` is owed after the step.
+    ·
+      -- Suppose `x` is owed after the step.
       intro x hx
       -- The owed waiter after the step is `t` if `t` reached `B`, else nobody.
       change (if s.lost t + 1 = B then some t else none) = some x at hx
@@ -524,14 +533,16 @@ theorem step_inv {B : Nat}
     -- The first fact from `enter_excl`; the last is the second half above.
     refine ⟨enter_excl hf, ?_, ?_, ?_, hnd.2⟩
     -- Those still waiting waited before, and counts did not change.
-    · -- Take a waiter `x` of the new queue.
+    ·
+      -- Take a waiter `x` of the new queue.
       intro x hx
       -- Its count is its old count.
       show (enter s (s.kind h)).lost x ≤ B
       -- Entering does not touch the counts; `x` was in the old queue.
       rw [enter_lost]; exact hs.bound x (hin x hx)
     -- A remaining waiter at the bound is still the owed one.
-    · -- Take a waiter `x` of the new queue whose count is `B`.
+    ·
+      -- Take a waiter `x` of the new queue whose count is `B`.
       intro x hx hl
       -- Its count is its old count.
       change (enter s (s.kind h)).lost x = B at hl
@@ -546,7 +557,8 @@ theorem step_inv {B : Nat}
       -- It was `x`, which is not `h`, so it is unchanged: still `x`.
       rw [hox, ite_eq_right (fun e => hne (Option.some.inj e))]
     -- The owed waiter after the step is in the new queue.
-    · -- Suppose `x` is owed after the step.
+    ·
+      -- Suppose `x` is owed after the step.
       intro x hx
       -- After the step the owed waiter is nobody if it was `h`, else unchanged.
       change (if s.owed = some h then none else s.owed) = some x at hx
@@ -826,14 +838,16 @@ theorem owed_only_gets_nearer {B : Nat} {s t : Gate} {w : Nat}
     -- Is the front waiter the owed one?
     by_cases hhw : h = w
     -- Yes: `w` is handed the gate, and nobody is owed afterwards.
-    · -- The first possibility is the one to show.
+    ·
+      -- The first possibility is the one to show.
       refine Or.inl ?_
       -- After the step the owed waiter is nobody if it was `h`, else unchanged.
       show (if s.owed = some h then none else s.owed) = none
       -- The owed waiter was `w`, and `h` is `w`: the `then` side.
       rw [how, hhw, ite_eq_left rfl]
     -- No: `h` was in front of `w` and is gone from the queue, so `w` is nearer.
-    · -- The second possibility is the one to show, in two halves.
+    ·
+      -- The second possibility is the one to show, in two halves.
       refine Or.inr (Or.inl ⟨?_, ?_⟩)
       -- `w` is still owed: the owed waiter was not `h`, so it is unchanged.
       · show (if s.owed = some h then none else s.owed) = some w

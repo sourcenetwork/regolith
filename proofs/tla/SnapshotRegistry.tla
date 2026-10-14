@@ -14,7 +14,8 @@
 \* v1 it deletes v0. Reader A finishes registering at 0 and reads k: v0 is
 \* gone. The protocol below stops that.
 \*
-\* WHAT THIS MODELS (src/engine/snapshot_registry.rs and its chain.rs). There
+\* WHAT THIS MODELS (src/engine/snapshot_registry.rs and
+\* src/engine/snapshot_registry/chain.rs). There
 \* is no lock. Every thread number has a slot; a slot has entries; an entry
 \* holds one sequence and a count of the pins on it. A reader registers in
 \* its own thread's slot in three moves:
@@ -91,6 +92,7 @@
 \* for the symmetry helper `Permutations`.
 EXTENDS Integers, FiniteSets, TLC
 
+\* The knobs of a run. Each configuration file (MC_SnapshotRegistry_*.cfg) gives them values.
 CONSTANTS
   \* The snapshot handles, as model values. A handle is a `Snapshot` or a
   \* `Transaction` (src/lib.rs, src/transaction.rs); it registers, may be
@@ -140,6 +142,8 @@ ASSUME JoinMode \in {"Recheck", "NoRecheck"}
 \* Every entry in the registry is named by its slot and its place in it.
 Pos == Slots \X Entries
 
+\* The state: everything that changes from one step to the next. Each line says what the variable
+\* stands for in the real program.
 VARIABLES
   \* The newest commit a snapshot may read: `ReadHorizon` in
   \* src/engine/read_horizon.rs.
@@ -406,6 +410,7 @@ JoinCheck(h) ==
   /\ IF eseq[at[h]] = hseq[h] \/ JoinMode = "NoRecheck"
        \* The join stands; next the confirm.
        THEN /\ phase' = [phase EXCEPT ![h] = AfterAnnounce]
+            \* The counts, the entries' sequences and the handles' places do not change.
             /\ UNCHANGED <<pins, eseq, at>>
        \* Wrong sequence: one count off, the handle holds nothing again...
        ELSE /\ pins' = DropPins(at[h])
@@ -429,6 +434,7 @@ Confirm_(h) ==
   /\ IF horizon = hseq[h]
        \* Still the same: live. Its count stays where it is.
        THEN /\ phase' = [phase EXCEPT ![h] = "live"]
+            \* Nothing else of the registry or of the handle changes.
             /\ UNCHANGED <<pins, eseq, at, hseq>>
        \* Moved on: one count off its entry...
        ELSE /\ pins' = DropPins(at[h])
@@ -491,6 +497,8 @@ Release(h) ==
   \* The entry the release touches.
   \* The fix: the recorded entry. RED: the same place in this thread's slot.
   /\ LET p == IF ReleaseMode = "Recorded" THEN at[h]
+              \* The bug ReleaseHere: the same index, but in the slot of the thread that drops the
+              \* handle.
               ELSE <<MySlot(h), at[h][2]>> IN
        \* One count off, if there is one to take (a count never goes below 0).
        IF pins[p] > 0
@@ -505,6 +513,7 @@ Release(h) ==
   \* It may register again later. What it read is forgotten: an idle
   \* handle's sequence is never read, so this only merges alike states.
   /\ phase' = [phase EXCEPT ![h] = "idle"]
+  \* Its sequence is set back to 0.
   /\ hseq' = [hseq EXCEPT ![h] = 0]
   \* Nothing else moves.
   /\ UNCHANGED <<horizon, slotOf, saw, thread,

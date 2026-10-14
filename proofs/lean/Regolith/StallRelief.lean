@@ -292,7 +292,9 @@ inductive Step (m : Mode) : State → State → Prop
   look. And only while the relief's failure is not recorded (`hf`); bug
   `noFailRecheck` does not look. -/
   | registerFresh (s : State) (hl : s.latched = false ∨ m = .noLatchRecheck)
+      -- The relief's failure is not recorded, or the mode is the bug's, which does not look.
       (hf : s.failing = false ∨ m = .noFailRecheck)
+      -- A fresh contended writer is there, and the stop is on.
       (h1 : 0 < s.fresh) (h2 : s.stopped = true) :
       -- One more waiter.
       Step m s { s with fresh := s.fresh - 1, waiting := s.waiting + 1 }
@@ -300,11 +302,13 @@ inductive Step (m : Mode) : State → State → Prop
   latch's flag: it lands the unit and is told the latch. Not in bug
   `noLatchRecheck`. -/
   | registerLatchedFresh (s : State) (h0 : m ≠ .noLatchRecheck) (h1 : 0 < s.fresh)
+      -- The engine has latched.
       (h2 : s.latched = true) :
       -- Landed, and the writer is finished.
       Step m s (land { s with fresh := s.fresh - 1 })
   /-- A stale contended writer registers on a latched engine: the same. -/
   | registerLatchedStale (s : State) (h0 : m ≠ .noLatchRecheck) (h1 : 0 < s.stale)
+      -- The engine has latched.
       (h2 : s.latched = true) :
       -- Landed, and the writer is finished.
       Step m s (land { s with stale := s.stale - 1 })
@@ -321,6 +325,7 @@ inductive Step (m : Mode) : State → State → Prop
   /-- A writer let in with no stop has to rotate at the memtable cap: its
   flush takes the free gate, and the stop may come on meanwhile (`b`). -/
   | rotate (s : State) (b : Bool) (h1 : 0 < s.writing) (h2 : s.stopped = false)
+      -- The gate is free.
       (h3 : s.gate = .free) :
       -- It holds the gate.
       Step m s { s with stopped := b, gate := .writer, writing := s.writing - 1,
@@ -365,6 +370,7 @@ inductive Step (m : Mode) : State → State → Prop
   /-- A writer about to write is stopped while the relief's failure is
   recorded: it is told the failure and returns. -/
   | toldFailing (s : State) (h1 : 0 < s.writing) (h2 : s.stopped = true)
+      -- The relief's failure is recorded.
       (h3 : s.failing = true) :
       -- It is finished.
       Step m s { s with writing := s.writing - 1 }
@@ -372,12 +378,14 @@ inductive Step (m : Mode) : State → State → Prop
   recorded failure: it lands the unit and is told the failure. Not in bug
   `noFailRecheck`. -/
   | registerFailingFresh (s : State) (h0 : m ≠ .noFailRecheck) (h1 : 0 < s.fresh)
+      -- The stop is on, and the relief's failure is recorded.
       (h2 : s.stopped = true) (h3 : s.failing = true) :
       -- Landed, and the writer is finished.
       Step m s (land { s with fresh := s.fresh - 1 })
   /-- A stale contended writer registers with the stop on and reads the
   recorded failure: the same. -/
   | registerFailingStale (s : State) (h0 : m ≠ .noFailRecheck) (h1 : 0 < s.stale)
+      -- The stop is on, and the relief's failure is recorded.
       (h2 : s.stopped = true) (h3 : s.failing = true) :
       -- Landed, and the writer is finished.
       Step m s (land { s with stale := s.stale - 1 })
@@ -413,6 +421,7 @@ theorem inv_start (n : Nat) (b : Bool) : Inv (start n b) := by
 
 /-- A free gate means no writer's step holds it. -/
 theorem holding_zero {s : State} (hw1 : s.gate = .writer ↔ s.holding = 1)
+    -- At most one writer's step holds the gate, and the gate is free.
     (hw2 : s.holding ≤ 1) (h : s.gate = .free) : s.holding = 0 := by
   -- One holding would mean a writer's gate, not a free one.
   have : s.holding ≠ 1 := fun h' => by rw [hw1.mpr h'] at h; cases h
@@ -425,6 +434,7 @@ theorem inv_step {s t : State} (hs : Inv s) (hst : Step .green s t) : Inv t := b
   obtain ⟨⟨hw1, hw2⟩, hj, hwait, hfresh⟩ := hs
   -- One case per kind of step.
   cases hst with
+  -- Case: the job takes the free gate.
   | jobStart h1 h2 =>
     -- The gate was free, so no writer's step held it.
     have h0 := holding_zero hw1 hw2 h2
@@ -440,6 +450,7 @@ theorem inv_step {s t : State} (hs : Inv s) (hst : Step .green s t) : Inv t := b
     · intro _; exact Or.inl rfl
     -- So does a fresh contended writer.
     · intro _; exact Or.inl rfl
+  -- Case: the job ends its work and releases the gate.
   | jobEnd h =>
     -- The job held the gate, so no writer's step did.
     have hg : s.gate = .job := hj.mpr h
@@ -455,6 +466,7 @@ theorem inv_step {s t : State} (hs : Inv s) (hst : Step .green s t) : Inv t := b
     · intro _; exact Or.inr (Or.inl rfl)
     -- So does a fresh contended writer.
     · intro _; exact Or.inr (Or.inl rfl)
+  -- Case: the job relieves, with the gate free.
   | jobRelieveFree b h1 h2 =>
     -- The gate is free, so no writer holds it.
     have h0 := holding_zero hw1 hw2 h2
@@ -470,6 +482,7 @@ theorem inv_step {s t : State} (hs : Inv s) (hst : Step .green s t) : Inv t := b
     · intro h; simp [land, count] at h
     -- Nobody is fresh.
     · intro h; simp [land, count] at h
+  -- Case: the job's relief finds a writer's step holding the gate.
   | jobRelieveHeld h1 h2 =>
     -- A writer's step holds the gate.
     have hrel : s.holding = 1 := hw1.mp h2
@@ -481,9 +494,11 @@ theorem inv_step {s t : State} (hs : Inv s) (hst : Step .green s t) : Inv t := b
     · intro _; exact Or.inr (Or.inr (Or.inl hrel))
     -- So does a fresh contended writer.
     · intro _; exact Or.inr (Or.inr (Or.inl hrel))
+  -- Case: a writer's write goes in.
   | write b h1 h2 =>
     -- Only the stop and two writer counts change: the facts stay.
     exact ⟨⟨hw1, hw2⟩, hj, hwait, hfresh⟩
+  -- Case: a stopped writer finds the gate free, and its step takes it.
   | relieve h1 h2 h3 =>
     -- The gate was free, so no writer's step held it.
     have h0 := holding_zero hw1 hw2 h3
@@ -501,6 +516,7 @@ theorem inv_step {s t : State} (hs : Inv s) (hst : Step .green s t) : Inv t := b
     · intro _; exact Or.inr (Or.inr (Or.inl (by simp only; omega)))
     -- So does a fresh contended writer.
     · intro _; exact Or.inr (Or.inr (Or.inl (by simp only; omega)))
+  -- Case: a stopped writer reads the count, and its step finds the gate held.
   | contend h1 h2 h3 =>
     -- The gate is held: by the job at work, or by a writer's step.
     have hp : Pending s := by
@@ -518,6 +534,7 @@ theorem inv_step {s t : State} (hs : Inv s) (hst : Step .green s t) : Inv t := b
     · intro _; exact hp
     -- So does the new fresh writer.
     · intro _; exact hp
+  -- Case: an owing writer's step finds the gate free and takes it.
   | owedTake h1 h2 =>
     -- The gate was free, so no writer's step held it.
     have h0 := holding_zero hw1 hw2 h2
@@ -535,9 +552,11 @@ theorem inv_step {s t : State} (hs : Inv s) (hst : Step .green s t) : Inv t := b
     · intro _; exact Or.inr (Or.inr (Or.inl (by simp only; omega)))
     -- So does a fresh contended writer.
     · intro _; exact Or.inr (Or.inr (Or.inl (by simp only; omega)))
+  -- Case: an owing writer's step finds the gate held, and the writer returns.
   | owedContended h1 h2 =>
     -- Only the owing count changes: the facts stay.
     exact ⟨⟨hw1, hw2⟩, hj, hwait, hfresh⟩
+  -- Case: a writer's step ends and releases the gate.
   | stepEnd b h =>
     -- A writer's step held the gate, so the job was not at work.
     have hg : s.gate = .writer := hw1.mpr (by omega)
@@ -555,6 +574,7 @@ theorem inv_step {s t : State} (hs : Inv s) (hst : Step .green s t) : Inv t := b
     · intro _; exact Or.inr (Or.inr (Or.inr (by simp only; omega)))
     -- So does a fresh contended writer.
     · intro _; exact Or.inr (Or.inr (Or.inr (by simp only; omega)))
+  -- Case: a writer counts its step's progress.
   | refresh back hb h =>
     -- Each fact: the gate as it was, nobody waits, nobody fresh.
     refine ⟨⟨?_, ?_⟩, ?_, ?_, ?_⟩
@@ -568,6 +588,7 @@ theorem inv_step {s t : State} (hs : Inv s) (hst : Step .green s t) : Inv t := b
     · intro h'; simp [progress, lands, land, count] at h'
     -- Nobody is fresh: the progress was counted.
     · intro h'; simp [progress, lands, land, count] at h'
+  -- Case: a contended writer that missed no progress registers and finds the stop cleared.
   | clearedFresh h1 h2 =>
     -- Each fact: the gate as it was, nobody waits, nobody fresh.
     refine ⟨⟨?_, ?_⟩, ?_, ?_, ?_⟩
@@ -581,6 +602,7 @@ theorem inv_step {s t : State} (hs : Inv s) (hst : Step .green s t) : Inv t := b
     · intro h'; simp [land, count] at h'
     -- Nobody is fresh.
     · intro h'; simp [land, count] at h'
+  -- Case: a contended writer that missed some progress registers and finds the stop cleared.
   | clearedStale h1 h2 =>
     -- Each fact: the gate as it was, nobody waits, nobody fresh.
     refine ⟨⟨?_, ?_⟩, ?_, ?_, ?_⟩
@@ -594,6 +616,7 @@ theorem inv_step {s t : State} (hs : Inv s) (hst : Step .green s t) : Inv t := b
     · intro h'; simp [land, count] at h'
     -- Nobody is fresh.
     · intro h'; simp [land, count] at h'
+  -- Case: a contended writer that missed some progress registers with the stop on.
   | registerStale h1 h2 =>
     -- Each fact: the real code lands the unit; the fresh are as they were.
     refine ⟨⟨?_, ?_⟩, ?_, ?_, ?_⟩
@@ -607,6 +630,7 @@ theorem inv_step {s t : State} (hs : Inv s) (hst : Step .green s t) : Inv t := b
     · intro h'; simp [land] at h'
     -- A fresh writer still waits on whoever it did.
     · intro h'; simp only [land, reduceCtorEq, ↓reduceIte] at h' ⊢; exact hfresh h'
+  -- Case: a contended writer that missed no progress registers with the stop on, and waits.
   | registerFresh hl hf h1 h2 =>
     -- It missed no progress, so someone is on the way.
     have hp : Pending s := hfresh h1
@@ -616,6 +640,7 @@ theorem inv_step {s t : State} (hs : Inv s) (hst : Step .green s t) : Inv t := b
     · intro _; exact hp
     -- So do the remaining fresh writers.
     · intro _; exact hp
+  -- Case: a contended writer that missed no progress registers on a latched engine.
   | registerLatchedFresh h0 h1 h2 =>
     -- It missed no progress, so someone is on the way.
     have hp : Pending s := hfresh h1
@@ -631,6 +656,7 @@ theorem inv_step {s t : State} (hs : Inv s) (hst : Step .green s t) : Inv t := b
     · intro h'; simp [land] at h'
     -- The remaining fresh writers wait on that someone.
     · intro _; exact hp
+  -- Case: a contended writer that missed some progress registers on a latched engine.
   | registerLatchedStale h0 h1 h2 =>
     -- Each fact: the unit landed, the fresh are as they were.
     refine ⟨⟨?_, ?_⟩, ?_, ?_, ?_⟩
@@ -644,12 +670,15 @@ theorem inv_step {s t : State} (hs : Inv s) (hst : Step .green s t) : Inv t := b
     · intro h'; simp [land] at h'
     -- A fresh writer still waits on whoever it did.
     · intro h'; exact hfresh h'
+  -- Case: a writer about to write on a latched engine is told the latch and returns.
   | told h1 h2 =>
     -- Only the count of writers about to write changes: the facts stay.
     exact ⟨⟨hw1, hw2⟩, hj, hwait, hfresh⟩
+  -- Case: an owing writer's step fails before it starts on a latched engine.
   | owedLatched h1 h2 =>
     -- Only the owing count changes: the facts stay.
     exact ⟨⟨hw1, hw2⟩, hj, hwait, hfresh⟩
+  -- Case: a writer let in has to rotate, and its flush takes the free gate.
   | rotate b h1 h2 h3 =>
     -- The gate was free, so no writer's step held it.
     have h0 := holding_zero hw1 hw2 h3
@@ -667,6 +696,7 @@ theorem inv_step {s t : State} (hs : Inv s) (hst : Step .green s t) : Inv t := b
     · intro _; exact Or.inr (Or.inr (Or.inl (by simp only; omega)))
     -- So does a fresh contended writer.
     · intro _; exact Or.inr (Or.inr (Or.inl (by simp only; omega)))
+  -- Case: a rotation's seal goes through, and its progress is counted.
   | rotated h =>
     -- Each fact: the gate as it was, nobody waits, nobody fresh.
     refine ⟨⟨?_, ?_⟩, ?_, ?_, ?_⟩
@@ -680,12 +710,15 @@ theorem inv_step {s t : State} (hs : Inv s) (hst : Step .green s t) : Inv t := b
     · intro h'; simp [progress, lands, land, count] at h'
     -- Nobody is fresh: the progress was counted.
     · intro h'; simp [progress, lands, land, count] at h'
+  -- Case: a rotation's seal fails and nothing is counted, the step of bug `noRotateRefresh`.
   | rotateFailUncounted h0 h =>
     -- Not a step of the real code: the mode is not the bug's.
     exact absurd h0 (by decide)
+  -- Case: the engine latches, first half: its flag is stored.
   | latchFlag h =>
     -- Only the latch's two flags change: the facts stay.
     exact ⟨⟨hw1, hw2⟩, hj, hwait, hfresh⟩
+  -- Case: the engine latches, second half: the unit is landed.
   | latchLand h =>
     -- Each fact: the real code lands the unit; the fresh are as they were.
     refine ⟨⟨?_, ?_⟩, ?_, ?_, ?_⟩
@@ -699,9 +732,11 @@ theorem inv_step {s t : State} (hs : Inv s) (hst : Step .green s t) : Inv t := b
     · intro h'; simp [land] at h'
     -- A fresh writer still waits on whoever it did.
     · intro h'; simp only [land, reduceCtorEq, ↓reduceIte] at h' ⊢; exact hfresh h'
+  -- Case: the relief fails, first half: its failure is stored.
   | failFlag h =>
     -- Only the failure's two flags change: the facts stay.
     exact ⟨⟨hw1, hw2⟩, hj, hwait, hfresh⟩
+  -- Case: the relief fails, second half: the unit is landed.
   | failLand h =>
     -- Each fact: the real code lands the unit; the fresh are as they were.
     refine ⟨⟨?_, ?_⟩, ?_, ?_, ?_⟩
@@ -715,12 +750,15 @@ theorem inv_step {s t : State} (hs : Inv s) (hst : Step .green s t) : Inv t := b
     · intro h'; simp [land] at h'
     -- A fresh writer still waits on whoever it did.
     · intro h'; simp only [land, reduceCtorEq, ↓reduceIte] at h' ⊢; exact hfresh h'
+  -- Case: the relief succeeds again, and the record is cleared.
   | recover h =>
     -- Only the failure's record changes: the facts stay.
     exact ⟨⟨hw1, hw2⟩, hj, hwait, hfresh⟩
+  -- Case: a stopped writer about to write is told the recorded failure and returns.
   | toldFailing h1 h2 h3 =>
     -- Only the count of writers about to write changes: the facts stay.
     exact ⟨⟨hw1, hw2⟩, hj, hwait, hfresh⟩
+  -- Case: a contended writer that missed no progress registers and reads the recorded failure.
   | registerFailingFresh h0 h1 h2 h3 =>
     -- It missed no progress, so someone is on the way.
     have hp : Pending s := hfresh h1
@@ -736,6 +774,8 @@ theorem inv_step {s t : State} (hs : Inv s) (hst : Step .green s t) : Inv t := b
     · intro h'; simp [land] at h'
     -- The remaining fresh writers wait on that someone.
     · intro _; exact hp
+  -- Case: a contended writer that missed some progress registers and reads the recorded
+  -- failure.
   | registerFailingStale h0 h1 h2 h3 =>
     -- Each fact: the unit landed, the fresh are as they were.
     refine ⟨⟨?_, ?_⟩, ?_, ?_, ?_⟩
@@ -771,6 +811,7 @@ def OnlyWaiters (s : State) : Prop :=
 nobody is left but waiters, nobody waits: someone was always on the way to
 land the unit. Rules out the story's writer 2 waiting for ever. -/
 theorem no_stranded_wait {s : State} (h : Reach .green s) (ho : OnlyWaiters s) :
+    -- The statement: no writer is waiting.
     s.waiting = 0 := by
   -- The facts of the reachable state.
   have hi := inv_reach h
@@ -806,21 +847,27 @@ theorem settled_start (n : Nat) (b : Bool) : Settled (start n b) := by
 add a waiter are a registration, which the real code makes on an engine
 that has not latched; the latch's own landing empties the unit. -/
 theorem settled_step {s t : State} (hs : Settled s) (hst : Step .green s t) :
+    -- The statement: the latch's fact holds after the step.
     Settled t := by
   -- One case per kind of step.
   cases hst with
   -- The job's steps leave the latch and the waiters alone.
   | jobStart h1 h2 => exact hs
+  -- The job's end: the same.
   | jobEnd h => exact hs
   -- The job's relief lands the unit: nobody waits.
   | jobRelieveFree b h1 h2 => intro _ _; simp [land, count]
+  -- The job's relief left to a writer: no waiter is added.
   | jobRelieveHeld h1 h2 => exact hs
   -- A write, a relieving step, a contended step: no waiter is added.
   | write b h1 h2 => exact hs
+  -- A relieving step's start: the same.
   | relieve h1 h2 h3 => exact hs
+  -- A contended step: the writer is not on the unit yet, so the same.
   | contend h1 h2 h3 => exact hs
   -- The owed step's start: no waiter is added.
   | owedTake h1 h2 => exact hs
+  -- The owed step contended: the writer returns, and no waiter is added.
   | owedContended h1 h2 => exact hs
   -- A step's end: no waiter is added.
   | stepEnd b h => exact hs
@@ -828,6 +875,7 @@ theorem settled_step {s t : State} (hs : Settled s) (hst : Step .green s t) :
   | refresh back hb h => intro _ _; simp [progress, lands, land, count]
   -- A registration that finds the stop cleared lands the unit.
   | clearedFresh h1 h2 => intro _ _; simp [land, count]
+  -- The same for a stale one.
   | clearedStale h1 h2 => intro _ _; simp [land, count]
   -- A stale registration lands the unit in the real code.
   | registerStale h1 h2 => intro _ _; simp [land]
@@ -843,9 +891,11 @@ theorem settled_step {s t : State} (hs : Settled s) (hst : Step .green s t) :
     · cases hl
   -- A registration on a latched engine lands the unit.
   | registerLatchedFresh h0 h1 h2 => intro _ _; simp [land]
+  -- The same for a stale one.
   | registerLatchedStale h0 h1 h2 => intro _ _; simp [land]
   -- A writer told the latch, an owed step that fails: no waiter is added.
   | told h1 h2 => exact hs
+  -- An owed step that fails on a latched engine: no waiter is added.
   | owedLatched h1 h2 => exact hs
   -- A rotation's start: no waiter is added.
   | rotate b h1 h2 h3 => exact hs
@@ -859,6 +909,7 @@ theorem settled_step {s t : State} (hs : Settled s) (hst : Step .green s t) :
   | latchLand h => intro _ _; simp [land]
   -- The relief's failure is recorded or cleared: no waiter is added.
   | failFlag h => exact hs
+  -- The record cleared: the same.
   | recover h => exact hs
   -- The failure's landing empties the unit.
   | failLand h => intro _ _; simp [land]
@@ -866,6 +917,7 @@ theorem settled_step {s t : State} (hs : Settled s) (hst : Step .green s t) :
   | toldFailing h1 h2 h3 => exact hs
   -- A registration that reads the recorded failure lands the unit.
   | registerFailingFresh h0 h1 h2 h3 => intro _ _; simp [land]
+  -- The same for a stale one.
   | registerFailingStale h0 h1 h2 h3 => intro _ _; simp [land]
 
 /-- Every state the real code reaches has the latch's fact. -/
@@ -882,6 +934,7 @@ the engine latched and its landing is done, nobody waits: a latched engine
 clears no stop, so a writer still waiting then would wait until the
 database closes. -/
 theorem no_wait_once_latched {s : State} (h : Reach .green s) (hl : s.latched = true)
+    -- Its landing is done. The statement: no writer is waiting.
     (hd : s.landing = false) : s.waiting = 0 :=
   -- The latch's fact of the reachable state, applied.
   settled_reach h hl hd
@@ -906,16 +959,21 @@ theorem told_step {s t : State} (hs : Told s) (hst : Step .green s t) : Told t :
   cases hst with
   -- The job's steps leave the record and the waiters alone.
   | jobStart h1 h2 => exact hs
+  -- The job's end: the same.
   | jobEnd h => exact hs
   -- The job's relief lands the unit: nobody waits.
   | jobRelieveFree b h1 h2 => intro _ _; simp [land, count]
+  -- The job's relief left to a writer: no waiter is added.
   | jobRelieveHeld h1 h2 => exact hs
   -- A write, a relieving step, a contended step: no waiter is added.
   | write b h1 h2 => exact hs
+  -- A relieving step's start: the same.
   | relieve h1 h2 h3 => exact hs
+  -- A contended step: the writer is not on the unit yet, so the same.
   | contend h1 h2 h3 => exact hs
   -- The owed step's start: no waiter is added.
   | owedTake h1 h2 => exact hs
+  -- The owed step contended: the writer returns, and no waiter is added.
   | owedContended h1 h2 => exact hs
   -- A step's end: no waiter is added.
   | stepEnd b h => exact hs
@@ -923,6 +981,7 @@ theorem told_step {s t : State} (hs : Told s) (hst : Step .green s t) : Told t :
   | refresh back hb h => intro _ _; simp [progress, lands, land, count]
   -- A registration that finds the stop cleared lands the unit.
   | clearedFresh h1 h2 => intro _ _; simp [land, count]
+  -- The same for a stale one.
   | clearedStale h1 h2 => intro _ _; simp [land, count]
   -- A stale registration lands the unit in the real code.
   | registerStale h1 h2 => intro _ _; simp [land]
@@ -938,9 +997,11 @@ theorem told_step {s t : State} (hs : Told s) (hst : Step .green s t) : Told t :
     · cases hf
   -- A registration on a latched engine lands the unit.
   | registerLatchedFresh h0 h1 h2 => intro _ _; simp [land]
+  -- The same for a stale one.
   | registerLatchedStale h0 h1 h2 => intro _ _; simp [land]
   -- A writer told the latch, an owed step that fails: no waiter is added.
   | told h1 h2 => exact hs
+  -- An owed step that fails on a latched engine: no waiter is added.
   | owedLatched h1 h2 => exact hs
   -- A rotation's start: no waiter is added.
   | rotate b h1 h2 h3 => exact hs
@@ -962,6 +1023,7 @@ theorem told_step {s t : State} (hs : Told s) (hst : Step .green s t) : Told t :
   | toldFailing h1 h2 h3 => exact hs
   -- A registration that reads the recorded failure lands the unit.
   | registerFailingFresh h0 h1 h2 h3 => intro _ _; simp [land]
+  -- The same for a stale one.
   | registerFailingStale h0 h1 h2 h3 => intro _ _; simp [land]
 
 /-- Every state the real code reaches has the failing relief's fact. -/
@@ -978,6 +1040,7 @@ the relief's failure is recorded and its landing is done, nobody waits: a
 write that arrives then is told the failure, so one that was already
 waiting has been told it too. -/
 theorem no_wait_once_failing {s : State} (h : Reach .green s) (hf : s.failing = true)
+    -- Its landing is done. The statement: no writer is waiting.
     (hd : s.telling = false) : s.waiting = 0 :=
   -- The failing relief's fact of the reachable state, applied.
   told_reach h hf hd

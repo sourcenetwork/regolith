@@ -61,7 +61,9 @@ impl<T: ?Sized> Mutex<T> {
         self.sem.try_acquire(1).then(|| MutexGuard::new(self))
     }
 
-    /// Waits for the lock.
+    /// Waits for the lock. Uncontended, the first poll is one atomic
+    /// read-modify-write. Contended, it is lock-free, not wait-free: see
+    /// [Progress](super#progress).
     pub fn lock(&self) -> Lock<'_, T> {
         Lock {
             mutex: self,
@@ -99,6 +101,11 @@ impl<T: ?Sized> fmt::Debug for Mutex<T> {
 }
 
 /// Exclusive access to a [`Mutex`]'s value; unlocks on drop.
+///
+/// The release is one atomic read-modify-write when no waiter needs telling.
+/// Otherwise it is lock-free, not wait-free: it returns after one pass over
+/// the queue, plus at most one for each operation of another thread that
+/// lands on the queue meanwhile (see [Progress](super#progress)).
 #[must_use = "dropping the guard unlocks the mutex at once"]
 pub struct MutexGuard<'a, T: ?Sized> {
     mutex: &'a Mutex<T>,
@@ -144,6 +151,7 @@ impl<T: ?Sized + fmt::Debug> fmt::Debug for MutexGuard<'_, T> {
 }
 
 /// Exclusive access to a [`Mutex`] held through an `Arc`; unlocks on drop.
+/// The release makes the progress [`MutexGuard`]'s does.
 #[must_use = "dropping the guard unlocks the mutex at once"]
 pub struct OwnedMutexGuard<T: ?Sized> {
     mutex: Arc<Mutex<T>>,
