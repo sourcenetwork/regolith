@@ -113,6 +113,12 @@ impl LogFile for RecordingLog {
         self.inner.write_all_at(offset, bytes)
     }
 
+    /// One recorded write, as the host sees one `pwritev`.
+    fn write_all_vectored_at(&self, offset: u64, bufs: &[io::IoSlice<'_>]) -> io::Result<()> {
+        let bytes: Vec<u8> = bufs.iter().flat_map(|buf| buf.iter().copied()).collect();
+        self.write_all_at(offset, &bytes)
+    }
+
     fn sync_data(&self) -> io::Result<()> {
         self.events.lock().unwrap().sync();
         self.inner.sync_data()

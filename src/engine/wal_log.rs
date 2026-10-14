@@ -54,9 +54,7 @@ use std::sync::Arc;
 use super::seal::{Keyring, NONCE_LEN, OVERHEAD, Sealer};
 use super::take::Take;
 use super::wal_frame::{self, HEADER_LEN};
-#[cfg(test)]
-use super::wal_gate::Entry;
-use super::wal_gate::Gate;
+use super::wal_gate::{Entry, Gate};
 use super::wal_seal::{self, SEALED_PREFIX_LEN};
 use crate::env::{Env, LogFile, WriteMode};
 use crate::portability::{AtomicBool, AtomicU64, Ordering};
@@ -396,19 +394,29 @@ impl Log {
         record: &[u8],
         written: impl FnOnce() -> bool,
     ) -> io::Result<bool> {
-        let Some(entry) = self.gate.enter(place.epoch) else {
+        let Some(flight) = self.count_in(place.epoch) else {
             return Ok(false);
         };
         if written() {
-            self.gate.leave(entry);
             return Ok(false);
         }
         super::commit::hook::at(super::commit::hook::Stage::InWrite);
         let wrote = self.file.write_all_at(place.offset, record);
-        self.gate.leave(entry);
+        drop(flight);
         wrote?;
         self.passed(place.offset, place.end());
         Ok(true)
+    }
+
+    /// Count a write of records placed in `epoch` in at the gate. `None`
+    /// when the gate has moved on: the records are of discarded commits and
+    /// are not written (WG1). The caller looks at whether each record is
+    /// written already only now, and writes none that is (WG4); the write is
+    /// counted out when the returned value drops, on unwind too, so no sync
+    /// or rollback waits on a write whose thread has gone.
+    pub(crate) fn count_in(&self, epoch: u64) -> Option<InFlight<'_>> {
+        let entry = self.gate.enter(epoch)?;
+        Some(InFlight { log: self, entry })
     }
 
     /// After bytes `[offset, end)` were written: when they pass a multiple
@@ -580,18 +588,9 @@ impl Log {
     /// epoch does while its bytes are on their way to the host, until the
     /// guard drops.
     #[cfg(test)]
-    pub(crate) fn write_in_flight(&self) -> impl Drop + '_ {
-        struct InFlight<'a>(&'a Gate, Entry);
-        impl Drop for InFlight<'_> {
-            fn drop(&mut self) {
-                self.0.leave(self.1);
-            }
-        }
-        let entry = self
-            .gate
-            .enter(self.gate.epoch())
-            .expect("a write of the current epoch is let in");
-        InFlight(&self.gate, entry)
+    pub(crate) fn write_in_flight(&self) -> InFlight<'_> {
+        self.count_in(self.gate.epoch())
+            .expect("a write of the current epoch is let in")
     }
 
     /// Cut off the record at `offset`, which the calling thread alone
@@ -634,6 +633,32 @@ impl std::fmt::Debug for Log {
             .field("durable", &self.durable())
             .field("sealed", &self.seal.is_some())
             .finish_non_exhaustive()
+    }
+}
+
+/// A write counted in at the log's gate ([`Log::count_in`]): its bytes may
+/// land until it drops, which counts it out.
+pub(crate) struct InFlight<'a> {
+    log: &'a Log,
+    entry: Entry,
+}
+
+impl InFlight<'_> {
+    /// Write `records`, whole records built by [`Log::finish_record`] whose
+    /// places follow one another from `offset`, with one call
+    /// ([`LogFile::write_all_vectored_at`]).
+    pub(crate) fn write(&self, offset: u64, records: &[io::IoSlice<'_>]) -> io::Result<()> {
+        super::commit::hook::at(super::commit::hook::Stage::InWrite);
+        self.log.file.write_all_vectored_at(offset, records)?;
+        let len: u64 = records.iter().map(|record| record.len() as u64).sum();
+        self.log.passed(offset, offset + len);
+        Ok(())
+    }
+}
+
+impl Drop for InFlight<'_> {
+    fn drop(&mut self) {
+        self.log.gate.leave(self.entry);
     }
 }
 

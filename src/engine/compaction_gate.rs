@@ -22,6 +22,12 @@
 //! an exclusive user waits likewise for passes. `CompactionGate.tla` and
 //! `CompactionGate.lean` model it, with that old policy as a RED.
 //!
+//! The lock is built without spin (E48): a contended caller queues at once.
+//! The gate is held for a whole compaction pass, a job or a checkpoint's
+//! copy, far longer than a spin could wait out, so a spin would only burn
+//! the caller's time; and the queue is where the gate's bounded waits and
+//! `CompactionGate.tla` place every waiter.
+//!
 //! # Who waits, and how
 //!
 //! - **A compaction worker** waits on its own thread: [`CompactionGate::shared`]
@@ -47,8 +53,14 @@ use crate::sync::internal::wait_here;
 use crate::sync::{OwnedRwLockWriteGuard, RwLock, RwLockReadGuard, WriteOwned};
 
 /// The gate, shared by the engine and its compaction workers.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub(crate) struct CompactionGate(Arc<RwLock<()>>);
+
+impl Default for CompactionGate {
+    fn default() -> Self {
+        Self(Arc::new(RwLock::new_without_spin(())))
+    }
+}
 
 /// A compaction pass's share of the gate, released on drop.
 pub(crate) type Shared<'a> = RwLockReadGuard<'a, ()>;
@@ -134,6 +146,24 @@ mod tests {
     /// How long a stream runs at most before a test gives up on the waiter
     /// it keeps out: far past the few scheduling rounds the waiter needs.
     const STREAM_DEADLINE: Duration = Duration::from_secs(if cfg!(miri) { 300 } else { 30 });
+
+    /// E48. The gate's lock never spins: a contended caller queues at once.
+    /// Its budget is zero from the start and stays zero through a pass that
+    /// waits behind a job, the job's release, and the pass's retry.
+    #[test]
+    fn the_gate_never_spins() {
+        let gate = CompactionGate::new();
+        assert_eq!(gate.0.spin_rounds(), 0);
+        let job = gate.exclusive().expect("free");
+        let mut pass = Polled::new(gate.0.read());
+        pass.pending();
+        drop(job);
+        assert_eq!(pass.wakes(), 1, "the job's release wakes the queued pass");
+        drop(pass.ready());
+        let mut waiting = admission(&gate);
+        drop(waiting.ready());
+        assert_eq!(gate.0.spin_rounds(), 0, "the gate never spins");
+    }
 
     /// An admission polled by hand.
     fn admission(gate: &CompactionGate) -> Polled<impl std::future::Future<Output = Exclusive>> {

@@ -48,7 +48,9 @@ pub fn unbounded<T: 'static>() -> (UnboundedSender<T>, UnboundedReceiver<T>) {
 /// ```
 pub fn bounded<T: 'static>(cap: usize) -> (BoundedSender<T>, BoundedReceiver<T>) {
     let (tx, rx) = kovan_channel::unbounded();
-    let slots = std::sync::Arc::new(RawSemaphore::new(cap.min(MAX)));
+    // A slot frees only when the receiver gets to a message, which may be a
+    // long wait: a sender queues at once.
+    let slots = std::sync::Arc::new(RawSemaphore::without_spin(cap.min(MAX)));
     (
         BoundedSender {
             tx,
@@ -195,8 +197,25 @@ impl<T: 'static> fmt::Debug for BoundedReceiver<T> {
 
 #[cfg(all(test, not(loom)))]
 mod tests {
+    use super::super::queue::Policy;
     use super::*;
     use crate::sync::test_support::{Polled, block_on};
+
+    /// A sender waiting for a slot queues at once and never spins: a slot
+    /// frees only when the receiver gets to a message, which may be long.
+    /// The slots' spin budget stays at zero through a contended send, its
+    /// wake and its retry.
+    #[test]
+    fn a_full_channel_never_spins_its_senders() {
+        let (tx, rx) = bounded(1);
+        assert_eq!(tx.slots.queue().spin.rounds(), 0);
+        tx.try_send(1).expect("room for one");
+        let mut waiting = Polled::new(tx.send_async(2));
+        waiting.pending();
+        assert_eq!(rx.try_recv(), Some(1));
+        waiting.ready();
+        assert_eq!(tx.slots.queue().spin.rounds(), 0, "the slots never spin");
+    }
 
     #[test]
     fn a_full_channel_queues_senders_until_a_receive_frees_a_slot() {

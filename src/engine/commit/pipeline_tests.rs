@@ -475,7 +475,7 @@ fn a_record_is_staged_in_one_exact_reservation_the_next_record_reuses() {
     engine
         .submit(batch())
         .expect("a batch larger than the kept floor still commits");
-    let (cap, ptr) = super::pipeline::stage_buffer();
+    let (cap, ptr) = super::spare::record_buffer();
     assert_eq!(
         cap, framed,
         "the stage must reserve exactly the record's framed length, not a doubling chain"
@@ -483,7 +483,7 @@ fn a_record_is_staged_in_one_exact_reservation_the_next_record_reuses() {
 
     engine.submit(batch()).expect("the next record commits");
     assert_eq!(
-        super::pipeline::stage_buffer(),
+        super::spare::record_buffer(),
         (cap, ptr),
         "a stage already large enough for the next record must not reallocate"
     );
@@ -501,21 +501,21 @@ fn an_outsized_record_gives_its_stage_back_once_two_smaller_ones_were_written() 
         .submit(eventual_put(b"huge", &huge))
         .expect("a record larger than the kept floor still commits");
     assert_eq!(
-        super::pipeline::stage_buffer().0,
+        super::spare::record_buffer().0,
         huge_framed,
         "the thread that just staged the huge record keeps exactly what it staged"
     );
 
     engine.submit(durable_put(b"a", b"v")).unwrap();
     assert_eq!(
-        super::pipeline::stage_buffer().0,
+        super::spare::record_buffer().0,
         huge_framed,
         "one record of hysteresis must not release the stage yet"
     );
 
     engine.submit(durable_put(b"b", b"v")).unwrap();
     assert!(
-        super::pipeline::stage_buffer().0 <= MAX_GROUP_BYTES,
+        super::spare::record_buffer().0 <= MAX_GROUP_BYTES,
         "the stage must be released once two smaller records were written"
     );
     assert_eq!(engine.get(&key(b"huge"), u64::MAX).unwrap(), Some(huge));
@@ -528,7 +528,7 @@ fn a_giant_record_parks_no_more_than_the_retention_cap() {
     engine
         .submit(eventual_put(b"huge", &vec![b'x'; 32 * MAX_GROUP_BYTES]))
         .expect("a record far larger than the kept floor still commits");
-    let cap = super::pipeline::stage_buffer().0;
+    let cap = super::spare::record_buffer().0;
     assert!(
         cap <= MAX_KEPT_STAGE_BYTES,
         "a one-off giant record must not park more than the retention cap, got {cap}"

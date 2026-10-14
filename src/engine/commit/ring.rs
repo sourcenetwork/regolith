@@ -219,7 +219,6 @@ impl<T> Ring<T> {
     }
 
     /// One past the newest index handed out.
-    #[cfg(test)]
     pub(super) fn tail(&self) -> u64 {
         self.tail.load(Ordering::SeqCst)
     }

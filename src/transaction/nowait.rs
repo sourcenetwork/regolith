@@ -289,12 +289,15 @@ impl Transaction {
         };
         let stats = engine.statistics();
         let receipt = |outcome| receipt_of(stats, outcome, self.snapshot_seq, scan_runs_dropped);
-        if write_free {
-            return Committed::Done(receipt(engine.commit_write_free(&commit.checks)));
-        }
         // A `CacheOnly` handle never reads the device, in its commit's own
-        // validation either.
-        commit.read_queue = self.read_mode().queue();
+        // validation either, written or not.
+        let read_queue = self.read_mode().queue();
+        if write_free {
+            return Committed::Done(receipt(
+                engine.commit_write_free(&commit.checks, read_queue),
+            ));
+        }
+        commit.read_queue = read_queue;
         let Some(queue) = queue else {
             // No queue to complete on: the commit syncs inline.
             return Committed::Done(receipt(engine.commit_with_conflict_check(

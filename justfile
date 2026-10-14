@@ -302,7 +302,7 @@ loom-debug:
     RUSTFLAGS="--cfg loom" timeout 10m cargo test --test loom_memtable
 
 # Loom models for `regolith::sync`: every primitive's wait protocol,
-# with five calibrations that must fail. Release only: the larger models
+# with seven calibrations that must fail. Release only: the larger models
 # explore 0.1 to 0.4 million interleavings each (about four minutes in
 # all), which a debug build multiplies several times over.
 loom-sync:
@@ -553,8 +553,47 @@ tla:
     check MC_DefraLevel_Red_Parts_RepeatableRead       RED INV_PartsRelaxed
     check MC_DefraLevel_Green_ValueReads               GREEN
     check MC_DefraLevel_Red_SeqOnlyValidation          RED INV_IdenticalRewritesCommit
+    # E50, a commit that writes nothing at every level: no pipeline slot, no
+    # sequence, its level's checks against every decided commit and at the
+    # published point, the receipt its snapshot, a latched database commits
+    # it. Lean: Regolith/Validation.lean, writeFree_at_horizon;
+    # Regolith/Relaxations.lean, read_only_anomaly.
+    check MC_ReadCommitted_Green_WriteFree             GREEN
+    check MC_SnapshotIsolation_Green_WriteFree         GREEN
+    check MC_RepeatableRead_Green_WriteFree            GREEN
+    check MC_Serializable_Green_WriteFree              GREEN
     check MC_DefraLevel_Green_WriteFree                GREEN
     check MC_DefraLevel_Red_WriteFreePessimistic       RED INV_WriteFreeConsistent
+    check MC_RepeatableRead_Red_WriteFreeUnchecked     RED INV_WriteFreeAtHorizon
+    check MC_SnapshotIsolation_Red_WriteFreeUnchecked  RED INV_WriteFreeAtHorizon
+    check MC_SnapshotIsolation_Red_WriteFreeChecksPlainReads RED INV_WriteFreeCommits
+    check MC_ReadCommitted_Red_ReadCommittedChecksForUpdate RED INV_WriteFreeCommits
+    check MC_DefraLevel_Red_ValueAboveHorizonRefuses   RED INV_WriteFreeIdenticalCommits
+    check MC_SnapshotIsolation_Red_WriteFreeRefusedWhenLatched RED INV_LatchRefusesOnlyWrites
+    check MC_SnapshotIsolation_Red_WriteFreeTakesSequence RED INV_WriteFreeTakesNoSequence
+    check MC_SnapshotIsolation_Red_ReceiptAtHorizon    RED INV_WriteFreeReceipt
+    # A value read judged where it is placed: changed at the published point,
+    # restored by a commit decided and not yet visible, it is refused.
+    check MC_DefraLevel_Green_WriteFreeRestore         GREEN
+    check MC_DefraLevel_Red_JudgedAtDecidedOnly        RED INV_WriteFreeAtHorizon
+    # Write-free scans: a validated range is checked at every level but under
+    # DefraLevel's relaxation, a plain scan's keys at Serializable.
+    check MC_Serializable_Green_WriteFreeScan          GREEN
+    check MC_RepeatableRead_Green_WriteFreeScan        GREEN
+    check MC_DefraLevel_Green_WriteFreeScan            GREEN
+    check MC_RepeatableRead_Red_WriteFreeIgnoresRanges RED INV_ScanDecisionsCurrent
+    check MC_Serializable_Red_WriteFreeScanUnchecked   RED INV_WriteFreeAtHorizon
+    # The read-only anomaly (Fekete, O'Neil and O'Neil 2004): a report checked
+    # against every decided commit is refused once the withdrawal is decided;
+    # checked against the published state alone, or not at all, it commits a
+    # sheet no serial order gives, as one at SnapshotIsolation does by design.
+    check MC_Serializable_Green_ReadOnlyAnomaly        GREEN
+    check MC_RepeatableRead_Green_ReadOnlyAnomaly      GREEN
+    check MC_Serializable_Green_ReadOnlyAnomalyPessimistic GREEN
+    check MC_DefraLevel_Green_ReadOnlyAnomalyPessimistic GREEN
+    check MC_Serializable_Red_ReadOnlyAnomaly          RED INV_NoReadOnlyAnomaly
+    check MC_Serializable_Red_ReadOnlyAnomalyPublishedOnly RED INV_NoReadOnlyAnomaly
+    check MC_SnapshotIsolation_Red_ReadOnlyAnomaly     RED INV_NoReadOnlyAnomaly
     check MC_DefraLevel_Green_Log                      GREEN
     check MC_DefraLevel_Red_OwnAppendVisible           RED INV_NoPhantomAppend
     check MC_DefraLevel_Red_DecideOnLogRead            RED INV_LogDecisionsCurrent
@@ -875,12 +914,59 @@ tla:
     check MC_CommitPipeline_Red_DecideAnyOrder_Order        RED SeqInRingOrder
     check MC_CommitPipeline_Red_WorkBeyond                  RED WorksUpToItsOwn
     check MC_CommitPipeline_Red_StopHoldsClaim              RED NoLiveThreadBlocked
-    # WG4: a record's late copy, the same bytes a slow owner still had in
-    # flight, never lands under a sync that covers it. Rust:
-    # src/engine/commit/late_copy_tests.rs, under the fault shim.
+    # The write unit (E45, L58; src/engine/commit/write_unit.rs): the owner
+    # encodes its record, or a thread that needs it and finds nobody encoding
+    # it does; one thread at a time writes the run of filled records with one
+    # write and publishes what it made publishable; the others park on their
+    # record and are woken, or run out of patience and write it themselves
+    # as a copy (WG4: a late copy or run never lands under a sync that
+    # covers it). Rust: src/engine/commit/late_copy_tests.rs and
+    # write_unit_tests.rs, the loom models in
+    # src/engine/commit/loom_write_unit.rs. Lean:
+    # Regolith/PipelineHelping.lean, a_park_is_bounded, run_step_counts,
+    # encoding_never_adds.
     check MC_CommitPipeline_Green_Copies                    GREEN
     check MC_CommitPipeline_Green_Copies_InFlight           RED NoTwoCopies
+    check MC_CommitPipeline_Green_Copies_Runs               RED NoRunOfTwo
+    check MC_CommitPipeline_Green_Copies_Parks              RED NeverAsleep
+    check MC_CommitPipeline_Green_Copies_Steals             RED NeverStolen
+    check MC_CommitPipeline_Green_Copies_Woken              GREEN
+    check MC_CommitPipeline_Green_Copies_Stop_Head1         GREEN
+    check MC_CommitPipeline_Green_Copies_Stop_Head2         GREEN
+    check MC_CommitPipeline_Green_Copies_Stop_Holder        RED HolderNeverStops
+    check MC_CommitPipeline_Green_Copies_Rollback_Head1     GREEN
+    check MC_CommitPipeline_Green_Copies_Rollback_Head2     GREEN
     check MC_CommitPipeline_Red_SyncNoWait                  RED NoWriteUnderSync
+    check MC_CommitPipeline_Red_StealNoRecheck              RED NoWriteUnderSync
+    check MC_CommitPipeline_Red_GatherBeforeCountIn         RED NoWriteUnderSync
+    check MC_CommitPipeline_Red_LostWake                    RED NoLiveThreadBlocked
+    # Three threads (about 55 s, the one row over 20 s): a parked thread
+    # that trusts a load showing an old claim's note sleeps for good.
+    check MC_CommitPipeline_Red_NoteTrustsALoad             RED NoLiveThreadBlocked
+    check MC_CommitPipeline_Green_Copies_HelperEncodes      RED OwnersEncodeOwn
+    check MC_CommitPipeline_Green_Copies_RunPastOwn         RED NoRunPastOwn
+    check MC_CommitPipeline_Red_EncodeNoClaim               RED OneEncoder
+    check MC_CommitPipeline_Red_RunSkipsCheck               RED DurableBeforeVisible
+    # The fast path (WU8): an owner writes its record by itself when it finds
+    # the unit free with no note on it. Green_Direct_AnyTime takes it
+    # with its guard removed and stays GREEN: the guard is about speed, the
+    # look again once counted in keeps it safe (Red_DirectNoRecheck). Loom:
+    # the_fast_path_racing_a_claimer_writes_only_whole_records.
+    check MC_CommitPipeline_Green_Copies_Direct             RED NeverDirect
+    check MC_CommitPipeline_Green_Direct_AnyTime            GREEN
+    check MC_CommitPipeline_Red_DirectNoRecheck             RED NoWriteUnderSync
+    # A blocking thread far from its turn (E45 step 2, P6;
+    # src/engine/commit/turn_wait.rs) parks on its own order; the pass that
+    # brings its turn near names it, and the next finished commit tells it.
+    # Green_Turn checks with no time outs that nobody sleeps for good. Rust:
+    # src/engine/commit/turn_wait_tests.rs, the loom models in
+    # src/engine/commit/loom_turn_wait.rs. Lean:
+    # Regolith/PipelineHelping.lean, a_turn_park_is_bounded.
+    check MC_CommitPipeline_Green_Copies_TurnParks          RED NeverTurnParked
+    check MC_CommitPipeline_Green_Turn                      GREEN
+    check MC_CommitPipeline_Green_Turn_Parks                RED NeverTurnParked
+    check MC_CommitPipeline_Red_TurnNeverTold               RED NoLiveThreadBlocked
+    check MC_CommitPipeline_Red_LeadZero                    RED NoLiveThreadBlocked
     # Decision 3 of plan 4.7: a queue's poll never waits for another thread.
     # A job that cannot get the round, the version store's step, the flush
     # exclusion or a failed log clear of writes parks: it leaves a note, looks
@@ -1075,6 +1161,12 @@ tla:
     check MC_Sync_Red_ReleaseDirties                   RED DrainBounded
     check MC_Sync_Red_ExitIgnoresRequest               RED NoLostWakeup
     check MC_Sync_Green_PassesGrow                     RED FewPasses
+    # E48: the spin before queueing and the spin on the waiter's own node.
+    # The spin must stop for an owed handoff, and a spin that runs out must
+    # read its node's marks as it arms the waker again: a release that found
+    # it spinning called no waker.
+    check MC_Sync_Red_SpinNoRecheck                    RED NoLostWakeup
+    check MC_Sync_Red_SpinIgnoresOwed                  RED HandoffExclusive
     # regolith::sync::Notify, which keeps FIFO handoff. Lean:
     # Regolith/SyncFifo.lean, fifo_served, no_stranded_waiter.
     spec=SyncNotify
@@ -1105,6 +1197,9 @@ tla:
     # reads UPGRADING and takes the write for the node in its slot.
     check MC_SyncRwLock_Green_UpgradeDropped           GREEN
     check MC_SyncRwLock_Red_PassTakesWrite             RED GuardsCounted
+    # E48: a spin on the node that runs out must read the marks as it arms
+    # the waker again, for the RwLock's waits too.
+    check MC_SyncRwLock_Red_SpinNoRecheck              RED NoLostWakeup
     # The compaction gate (4.6, E28): a pass shares it, a job holds it
     # alone, no waiter is passed over more than Bound times either way, the
     # worker takes turns between jobs and passes, and a job parked on its

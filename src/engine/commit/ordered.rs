@@ -79,6 +79,7 @@ use super::pipeline::{Pipeline, Progress, Turn};
 use super::request::{Ops, batch_op_memtable_cost};
 use super::ring::Loaded;
 use super::round::HeldRound;
+use super::write_unit::Await;
 use crate::WriteBatchOp;
 use crate::portability::{AtomicU64, Ordering};
 use crate::statistics::Ticker;
@@ -529,7 +530,7 @@ impl RegolithEngine {
                     // Every slot before the unit is published, and the unit
                     // takes nothing: the frontier passes it here, so the
                     // unit leaves nothing in the ring.
-                    let _ = self.publish_upto(pipe, index, None);
+                    let _ = self.publish_upto(pipe, index, None, Await::Copy);
                     return Some(ticket.result.take().unwrap_or_else(|| Err(unfinished())));
                 }
             }
@@ -577,12 +578,15 @@ impl RegolithEngine {
 
     /// Bring every slot before `index` through to published, with the
     /// decided frontier at `index - 1`. The caller runs a unit, so it does
-    /// its own device I/O. What another thread has under way a blocking
-    /// caller waits for; a poll parks, and `false` says so.
+    /// its own device I/O, and writes a record another thread is slow to
+    /// write itself (`Await::Copy`). What another thread has under way a
+    /// blocking caller waits for; a poll parks, and `false` says so.
     fn drain_before(&self, pipe: &Pipeline, index: u64, help: Help<'_>) -> bool {
         loop {
-            match self.publish_upto(pipe, index - 1, None) {
+            match self.publish_upto(pipe, index - 1, None, Await::Copy) {
                 Progress::Published => return true,
+                // The holder of a unit copies: never handed a queue's job.
+                Progress::Waits(_) => {}
                 Progress::NeedsSync | Progress::Failed => {
                     if self.sync_round(pipe, help).is_err() {
                         return false;
@@ -782,6 +786,8 @@ impl RegolithEngine {
         debug_assert!(replaced, "only a rollback replaces its own marker");
         pipe.ring.thaw(last);
         pipe.ring.thaw_decided(last);
+        // The jump names the slots past it as a pass would (P6).
+        pipe.turns.name(last);
         for desc in &failed {
             pipe.ring.retire(desc.index());
         }

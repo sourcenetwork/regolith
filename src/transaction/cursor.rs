@@ -75,7 +75,9 @@ pub enum ScanCheck {
     /// reads every block of the range once more, so a range that is large
     /// against the writes since the snapshot costs about a second scan of
     /// it. That walk runs on the committing thread before the commit enters
-    /// the pipeline and holds up no other writer. When the commit's turn in
+    /// the pipeline and holds up no other writer; a transaction that writes
+    /// nothing never enters it, and that walk is its whole check. When the
+    /// commit's turn in
     /// the pipeline comes, it searches only the memtables for what landed in
     /// the range in between. It reads the tables of the range again, with
     /// the writes behind it in the pipeline waiting, only when a flush or an

@@ -20,9 +20,11 @@
 //!    therefore reads every commit before it straight from the view. Nothing
 //!    applied is visible to a reader until it is published: a snapshot reads
 //!    at the published horizon.
-//! 3. **Write**, in any order: the slot's record goes to its range of the
-//!    log, the same bytes whichever thread writes them
-//!    (`engine::wal_log`).
+//! 3. **Write**, in any order: the slot's owner encodes its record once it
+//!    is decided, and the record goes to its range of the log, the same
+//!    bytes whichever thread writes them (`engine::wal_log`). Records reach
+//!    the log in runs, one host write each, through the write unit
+//!    (`write_unit.rs`).
 //! 4. **Sync**, one round at a time, each a unit one thread claims with one
 //!    compare-and-swap (D53): the round syncs the written prefix of the log
 //!    and raises the durable offset over it. A log that failed is rolled
@@ -37,10 +39,12 @@
 //! A thread never waits for a lock or for another thread to be scheduled. A
 //! blocking call does wait for device I/O that is under way: a sync round
 //! another thread claimed, or an ordered unit (`ordered.rs`) another thread
-//! is running. A call made through `commit_nowait` waits for neither: it
-//! leaves the unit on its queue and returns. The queue's poll, which then
-//! runs the unit, waits for nothing another thread has either: the unit
-//! parks (`park.rs`).
+//! is running. It waits for a run of records another thread is writing
+//! too, but with a bounded patience, after which it writes its record
+//! itself (`write_unit.rs`, WU5). A call made through `commit_nowait` waits
+//! for none of these: it leaves the unit on its queue and returns. The
+//! queue's poll, which then runs the unit, waits for nothing another thread
+//! has either: the unit parks (`park.rs`).
 //!
 //! # Invariants
 //!
@@ -66,10 +70,29 @@
 //!   the ring full. It freezes both frontiers, and the state it leaves is
 //!   of a new epoch: a decision a thread was computing from the old state
 //!   carries the old epoch, and its slot is failed when it is settled.
-//! - **P5, helping is bounded.** A thread decides, writes and publishes only
-//!   slots at or below its own (a rollback slot aside), and each at most
-//!   once, so one call does at most a ring's worth of other commits' work
-//!   (E21).
+//! - **P6, a call far from its turn sleeps until its turn nears.** A
+//!   blocking call whose slot is more than [`turn_wait::LEAD`] slots past the next
+//!   slot to decide, and that finds that slot being decided by another thread,
+//!   parks on its own slot instead of yielding to that thread over and over.
+//!   The thread that passes the decided frontier over slot `i` names slot
+//!   `i + LEAD` (a rollback's jump names the slots past it the same way),
+//!   and the next blocking call whose commit is done wakes the owners of
+//!   the slots named, so a sleeper wakes while [`turn_wait::LEAD`] slots are still to
+//!   be decided before its own, and is helping by its turn. A slot that
+//!   fails or lands wakes its owner too: another thread may have carried
+//!   it all the way. A sleeper that nobody wakes wakes after
+//!   [`turn_wait::TURN_PATIENCE`] and helps (`turn_wait.rs`, T1 to T3). The
+//!   park changes no step a thread takes, only when it takes it: every safety
+//!   rule above holds whatever the sleepers do, and progress holds with the
+//!   patience bound (`PipelineHelping.lean`, `a_park_is_bounded`).
+//! - **P5, helping is bounded.** A thread decides and publishes only slots
+//!   at or below its own (a rollback slot aside), and each at most once. It
+//!   writes the records of those slots, and a run it writes as the write
+//!   unit's holder may reach past its own, by at most one run of
+//!   `MAX_BATCH_RECORDS` records and `MAX_BATCH_BYTES` bytes, never past the
+//!   decided frontier (WU6). So one call does at most a ring's worth of
+//!   other commits' work and one run (E21). Waiting is bounded too: a wait
+//!   for a run under way ends after a bounded patience (WU5).
 
 use std::io;
 use std::sync::Arc;
@@ -78,11 +101,10 @@ use super::super::RegolithEngine;
 use super::super::callback::InCommit;
 use super::super::io::job::Job;
 use super::super::wal::check_write_len;
-use super::super::wal_frame::KIND_GROUP;
 use super::append::AppendOrder;
 use super::descriptor::{
-    ADMITTED, APPLIED, APPLYING, After, DECIDING, Decision, Descriptor, FAILED, INSTALLED,
-    Verdict as Fate, WRITING, WRITTEN, Work, is_immediate,
+    ADMITTED, APPLIED, APPLYING, After, DECIDING, Decision, Descriptor, FAILED, INSTALLED, NEAR,
+    Verdict as Fate, WRITTEN, Work, is_immediate,
 };
 use super::hook;
 use super::park::Help;
@@ -90,10 +112,12 @@ use super::request::Ops;
 use super::ring::{ArcSlot, Installed, Loaded, Ring};
 use super::round::Round;
 use super::spare;
+use super::turn_wait::{self, Turns};
 use super::txn::{TxnRequest, Verdict};
+use super::write_unit::{Await, Brought, WriteUnit};
 use super::{Settled, WriteRequest};
 use crate::perf_context::{PerfLevel, PerfTimer, PerfTimerField};
-use crate::statistics::{Histogram, Ticker};
+use crate::statistics::Ticker;
 use crate::sync::internal::Arc as RingArc;
 use crate::{Access, WriteBatchOp};
 
@@ -107,6 +131,12 @@ pub(crate) struct Pipeline {
     /// claims or waits on. Replaced by the thread that ran it, before it
     /// lands.
     pub(super) round: ArcSlot<Round>,
+    /// The single-flight unit records reach the log through
+    /// (`write_unit.rs`).
+    pub(super) writes: WriteUnit,
+    /// The calls asleep far from their turn, and the slots named and told
+    /// as near it (P6, `turn_wait.rs`).
+    pub(super) turns: Turns,
 }
 
 impl Pipeline {
@@ -119,10 +149,13 @@ impl Pipeline {
     ) -> Self {
         let ring = Ring::new(capacity);
         let genesis = Decision::new(ring.capacity() - 1, Fate::Unit, start);
+        let writes = WriteUnit::new(ring.capacity() - 1);
         Self {
             ring,
             tip: ArcSlot::new(RingArc::new(genesis)),
             round: ArcSlot::new(Round::new(engine)),
+            writes,
+            turns: Turns::new(),
         }
     }
 }
@@ -147,11 +180,14 @@ pub(super) enum Progress {
     Failed,
     /// The next slot is not decided yet.
     Undecided,
+    /// A `commit_nowait` call met the write unit claimed by another thread
+    /// on the way to the next slot's record: the job its queue waits on.
+    Waits(Arc<Job>),
 }
 
 /// The operations slot `desc` lands, decided as `decision`: the batch
 /// deciding it produced when there is one, else the request's own.
-fn ops_of<'a>(desc: &'a Descriptor, decision: &'a Decision) -> Ops<'a> {
+pub(super) fn ops_of<'a>(desc: &'a Descriptor, decision: &'a Decision) -> Ops<'a> {
     if let Some(batch) = &decision.batch {
         return Ops::Batch(batch);
     }
@@ -175,6 +211,15 @@ const COURTESY_YIELDS: usize = 32;
 /// never in time, so a thread that did stop costs each helper a fixed number
 /// of yields and nothing more. A target with one thread has nobody to yield
 /// to.
+///
+/// Its two callers, a decision under way and an apply under way, stay
+/// yields where the write path's waits became parks (`write_unit.rs`). A
+/// wait there is about one decision or one apply long, and the thread that
+/// ends it is on the serial decide path: a park needs a host call to wake
+/// it on that path, which measured slower (E45: parks until the slot was
+/// published lost about 30% at 64 writers, wakes from the deciding thread
+/// about 18%). The long waits, for a turn many slots away, park instead
+/// (P6, `turn_wait.rs`).
 fn courtesy(size: usize, done: impl Fn() -> bool) {
     if !crate::env::PLATFORM_THREADS {
         return;
@@ -185,22 +230,6 @@ fn courtesy(size: usize, done: impl Fn() -> bool) {
         }
         std::thread::yield_now();
     }
-}
-
-std::thread_local! {
-    /// This thread's buffer for the record it is writing, and the length of
-    /// the record before it (`trim_stage`'s one record of hysteresis).
-    static STAGE: std::cell::RefCell<(Vec<u8>, usize)> =
-        const { std::cell::RefCell::new((Vec::new(), 0)) };
-}
-
-/// Test-only: the capacity and the address of this thread's stage buffer.
-#[cfg(test)]
-pub(super) fn stage_buffer() -> (usize, *const u8) {
-    STAGE.with(|stage| {
-        let stage = stage.borrow();
-        (stage.0.capacity(), stage.0.as_ptr())
-    })
 }
 
 impl RegolithEngine {
@@ -298,9 +327,10 @@ impl RegolithEngine {
                 self.run_or_wait(&job);
                 continue;
             }
-            match self.publish_upto(pipe, lap, None) {
+            match self.publish_upto(pipe, lap, None, Await::of(help)) {
                 Progress::Published => return Ok(()),
                 Progress::NeedsSync | Progress::Failed => self.sync_round(pipe, help)?,
+                Progress::Waits(job) => return Err(job),
                 Progress::Undecided => {}
             }
         }
@@ -318,6 +348,10 @@ impl RegolithEngine {
         help: Help<'_>,
         own: Option<&RingArc<Descriptor>>,
     ) -> Turn {
+        // The slot this call last parked far from its turn at (P6): a call
+        // whose patience ran out with the frontier where it was helps, and
+        // parks again only once the frontier moved on.
+        let mut parked_at = None;
         loop {
             let decided = pipe.ring.decided();
             if decided >= upto {
@@ -343,7 +377,7 @@ impl RegolithEngine {
                     // Void, or its cell already took a later lap: a void slot
                     // holds nothing, so its cell is not kept for it (R6).
                     Loaded::Void | Loaded::Gone => {
-                        pipe.ring.pass_decided(index);
+                        self.pass_decided(pipe, index);
                         continue;
                     }
                     Loaded::Empty => {
@@ -355,13 +389,15 @@ impl RegolithEngine {
                     }
                     Loaded::Full => {
                         // The cell still holds the slot a lap earlier.
-                        match self.publish_upto(pipe, index - pipe.ring.capacity(), None) {
+                        let lap = index - pipe.ring.capacity();
+                        match self.publish_upto(pipe, lap, None, Await::of(help)) {
                             Progress::Published | Progress::Undecided => {}
                             Progress::NeedsSync | Progress::Failed => {
                                 if let Err(job) = self.sync_round(pipe, help) {
                                     return Turn::Blocked(job);
                                 }
                             }
+                            Progress::Waits(job) => return Turn::Blocked(job),
                         }
                         continue;
                     }
@@ -375,9 +411,23 @@ impl RegolithEngine {
                 let before = desc.claim(DECIDING | APPLYING);
                 applies = before & APPLYING == 0;
                 if before & DECIDING != 0 {
-                    // Another thread is deciding it now: it is given about
-                    // as long as the decision takes before this thread
-                    // repeats the work (P5).
+                    // Another thread is deciding it now. A blocking call far
+                    // from its turn sleeps until its turn nears (P6), and
+                    // looks again; one near its turn gives the other thread
+                    // about as long as the decision takes before it repeats
+                    // the work (P5).
+                    if let Some(own) = own
+                        && matches!(help, Help::Wait)
+                        && parked_at != Some(index)
+                        && self.park_far(pipe, own, index)
+                    {
+                        parked_at = Some(index);
+                        if applies {
+                            // Nobody waits on a claim this thread left.
+                            desc.unclaim(APPLYING);
+                        }
+                        continue;
+                    }
                     courtesy(desc.work_size(), || desc.decision().is_some());
                 }
                 if desc.decision().is_none() {
@@ -723,83 +773,58 @@ impl RegolithEngine {
                 break;
             }
         }
-        pipe.ring.pass_decided(index);
+        self.pass_decided(pipe, index);
     }
 
-    /// Write slot `desc`'s record at its place, if it has one and it is not
-    /// written yet. Any thread may; all write the same bytes.
-    pub(super) fn write_slot(&self, desc: &Descriptor) {
-        let Some(decision) = desc.decision() else {
+    /// Pass the decided frontier from `index - 1` to `index` (R5) and, when
+    /// this call passed it and somebody sleeps far from its turn, wake the
+    /// owner of slot `index + LEAD` (P6, `Turns::name`). `true` when this
+    /// call passed it.
+    pub(super) fn pass_decided(&self, pipe: &Pipeline, index: u64) -> bool {
+        if !pipe.ring.pass_decided(index) {
+            return false;
+        }
+        pipe.turns.name(index);
+        true
+    }
+
+    /// Wake the calls parked far from their turn whose turn now nears, up
+    /// to the slot the decided frontier last named (P6). Called by a
+    /// blocking call whose commit is done, off the decided frontier's path;
+    /// each slot is told once, by whichever call claims it.
+    pub(super) fn wake_near(&self, pipe: &Pipeline) {
+        let Some((from, to)) = pipe.turns.claim_told() else {
             return;
         };
-        let Some(place) = &decision.place else {
-            return;
-        };
-        if desc.is(WRITTEN) || desc.is(FAILED) {
-            return;
-        }
-        // Another thread is writing it now: the same courtesy before this
-        // thread writes the same bytes a second time.
-        if !desc.mark(WRITING) {
-            courtesy((place.len / 1024) as usize, || desc.is(WRITTEN));
-            if desc.is(WRITTEN) {
-                return;
+        // A published slot is retired: its owner, if asleep, was woken as it
+        // landed (`Descriptor::land`).
+        for slot in (from + 1).max(pipe.ring.published() + 1)..=to {
+            if let Loaded::Ready(desc) = pipe.ring.load(slot) {
+                desc.mark(NEAR);
             }
         }
-        hook::at(hook::Stage::Write);
-        let log = &decision.after.log;
-        let ops = ops_of(desc, decision);
-        let _perf = PerfTimer::new(PerfTimerField::WriteWal);
-        // Through `Env`, not `std::time::Instant`: browsers have a clock but
-        // `Instant::now` panics on `wasm32-unknown-unknown`. Read only when
-        // statistics are on.
-        let start = self.statistics().and_then(|_| self.env.now_micros());
-        let wrote = STAGE.with(|stage| {
-            let mut stage = stage.borrow_mut();
-            let (buf, prev) = &mut *stage;
-            buf.clear();
-            let prefix = log.prefix_len();
-            if buf.try_reserve_exact(place.len as usize).is_err() {
-                return Err(io::Error::new(
-                    io::ErrorKind::OutOfMemory,
-                    format!(
-                        "not enough memory to commit this write ({} bytes pending); retry, splitting any very large write batch",
-                        place.len
-                    ),
-                ));
-            }
-            buf.resize(prefix, 0);
-            ops.encode(buf, decision.base_seq);
-            // Looked at again once counted in at the gate: a copy of a record
-            // another thread wrote meanwhile is not written, so none lands
-            // after a sync that covers it began (`wal_gate.rs`, WG4).
-            let wrote = log.finish_record(KIND_GROUP, place, buf).and_then(|()| {
-                log.write_unless(place, buf, || desc.is(WRITTEN) || desc.is(FAILED))
-            });
-            let used = buf.len();
-            super::trim_stage(buf, *prev, used);
-            *prev = used;
-            wrote
+    }
+
+    /// Park the blocking call that owns `own`, installed, until its turn
+    /// nears: the decided frontier within [`turn_wait::LEAD`] slots of its slot,
+    /// or [`turn_wait::TURN_PATIENCE`] passed (P6). `false` when it is near its turn
+    /// already, and does not park; the caller then gives the thread deciding
+    /// slot `next` its courtesy.
+    pub(super) fn park_far(&self, pipe: &Pipeline, own: &RingArc<Descriptor>, next: u64) -> bool {
+        let turns = &pipe.turns;
+        if !crate::env::PLATFORM_THREADS || !own.is_blocking() || own.index() <= next + turns.lead()
+        {
+            return false;
+        }
+        // Counted before it registers: a thread that passes the frontier
+        // after this names its slot (T1).
+        turns.count_in();
+        hook::at(hook::Stage::TurnWait);
+        own.park(turn_wait::TURN_PATIENCE, || {
+            turns.near(own, pipe.ring.decided())
         });
-        match wrote {
-            Ok(true) => {
-                if desc.mark(WRITTEN)
-                    && let Some(s) = self.statistics()
-                {
-                    s.add(Ticker::WalBytesWritten, ops.reported_bytes());
-                    if let Some(micros) = self.elapsed_micros(start) {
-                        s.record(Histogram::WalWriteTime, micros);
-                    }
-                }
-            }
-            // The commit was discarded by a rollback since it was decided, or
-            // another thread wrote the record.
-            Ok(false) => {}
-            Err(err) => {
-                tracing::error!(error = %err, "writing a commit to the write-ahead log failed");
-                log.poison(err);
-            }
-        }
+        turns.count_out();
+        true
     }
 
     /// Whether slot `desc` may be published: it takes nothing, or its record
@@ -819,14 +844,16 @@ impl RegolithEngine {
     }
 
     /// Publish every slot up to and including `limit`, in ring order,
-    /// writing the records in the way (P3). Stops at the first slot that is
-    /// not publishable yet and says why. `own` is the caller's installed
-    /// descriptor, if it has one: see [`Self::own_slot`].
+    /// writing the records in the way as `how` says (P3, `write_unit.rs`).
+    /// Stops at the first slot that is not publishable yet and says why.
+    /// `own` is the caller's installed descriptor, if it has one: see
+    /// [`Self::own_slot`].
     pub(super) fn publish_upto(
         &self,
         pipe: &Pipeline,
         limit: u64,
         own: Option<&RingArc<Descriptor>>,
+        how: Await,
     ) -> Progress {
         loop {
             if pipe.ring.is_frozen() {
@@ -865,31 +892,86 @@ impl RegolithEngine {
                     return Progress::Failed;
                 }
                 if !desc.is(WRITTEN) {
-                    self.write_slot(desc);
-                    if desc.is(WRITTEN) {
-                        continue;
+                    match self.bring_written(pipe, desc, how) {
+                        Brought::Written => continue,
+                        // The write failed, or a rollback discarded the slot
+                        // under it.
+                        Brought::Failed => return Progress::Failed,
+                        Brought::Waits(job) => return Progress::Waits(job),
                     }
-                    // The write failed, or a rollback discarded the slot
-                    // under it.
-                    return Progress::Failed;
                 }
                 return Progress::NeedsSync;
             }
-            hook::at(hook::Stage::Publish);
-            // P3: the horizon first, then the frontier. A failed slot took no
-            // sequence that still exists.
-            if !desc.is(FAILED)
-                && let Some(last) = decision.last_seq()
-            {
-                self.visible_seq.publish(last);
+            self.publish_slot(pipe, next, desc, decision);
+        }
+    }
+
+    /// Publish slot `index`, held by `desc` and decided as `decision`, which
+    /// is publishable and the next to publish (P3).
+    fn publish_slot(&self, pipe: &Pipeline, index: u64, desc: &Descriptor, decision: &Decision) {
+        hook::at(hook::Stage::Publish);
+        // P3: the horizon first, then the frontier. A failed slot took no
+        // sequence that still exists.
+        if !desc.is(FAILED)
+            && let Some(last) = decision.last_seq()
+        {
+            self.visible_seq.publish(last);
+        }
+        // Landed: visible, or holding nothing. Told before the frontier
+        // passes, so a publisher that stops between the two leaves the
+        // telling to the next one here.
+        desc.land();
+        if pipe.ring.pass_published(index) {
+            pipe.ring.retire(index);
+        }
+    }
+
+    /// Publish, in ring order, the slots up to `limit` that are publishable
+    /// now, writing nothing and waiting for nothing: what the write unit's
+    /// holder does for the run it wrote (`write_unit.rs`, WU7), so the
+    /// owners it then wakes find their commits published. `own` is a
+    /// descriptor the caller holds, installed: see [`Self::own_slot`].
+    pub(super) fn publish_ready(
+        &self,
+        pipe: &Pipeline,
+        limit: u64,
+        own: Option<&RingArc<Descriptor>>,
+    ) {
+        loop {
+            if pipe.ring.is_frozen() {
+                return;
             }
-            // Landed: visible, or holding nothing. Told before the frontier
-            // passes, so a publisher that stops between the two leaves the
-            // telling to the next one here.
-            desc.land();
-            if pipe.ring.pass_published(next) {
-                pipe.ring.retire(next);
+            let published = pipe.ring.published();
+            if published >= limit {
+                return;
             }
+            let next = published + 1;
+            if next > pipe.ring.decided() {
+                return;
+            }
+            let loaded;
+            let desc = match Self::own_slot(own, next) {
+                Some(desc) => desc,
+                None => match pipe.ring.load(next) {
+                    Loaded::Ready(desc) => {
+                        loaded = desc;
+                        &loaded
+                    }
+                    // A void slot, as in `publish_upto`.
+                    Loaded::Void | Loaded::Gone => {
+                        pipe.ring.pass_published(next);
+                        continue;
+                    }
+                    Loaded::Empty | Loaded::Full => return,
+                },
+            };
+            let Some(decision) = desc.decision() else {
+                return;
+            };
+            if !Self::publishable_slot(desc, decision) {
+                return;
+            }
+            self.publish_slot(pipe, next, desc, decision);
         }
     }
 
@@ -935,10 +1017,16 @@ impl RegolithEngine {
             if let Turn::Blocked(job) = self.help_decide(pipe, index, Help::Leave, Some(desc)) {
                 return Err(job);
             }
-            self.write_slot(desc);
-            match self.publish_upto(pipe, index, Some(desc)) {
+            if !self.write_alone(pipe, desc) {
+                self.fill(desc);
+            }
+            if let Brought::Waits(job) = self.bring_written(pipe, desc, Await::Leave) {
+                return Err(job);
+            }
+            match self.publish_upto(pipe, index, Some(desc), Await::Leave) {
                 Progress::Published => return Ok(()),
                 Progress::NeedsSync | Progress::Failed => self.sync_round(pipe, Help::Leave)?,
+                Progress::Waits(job) => return Err(job),
                 Progress::Undecided => {}
             }
         }
@@ -947,7 +1035,8 @@ impl RegolithEngine {
     /// Bring slot `index` through every stage and return once it is
     /// published or discarded: what a blocking commit does. It helps every
     /// slot before its own, runs the units in its way, and waits only for
-    /// device I/O another thread has under way.
+    /// device I/O another thread has under way, and for a run of records
+    /// with a bounded patience (`write_unit.rs`, WU5).
     pub(super) fn drive(&self, pipe: &Pipeline, index: u64, desc: &RingArc<Descriptor>) {
         super::super::io::scope::waits("a commit that blocks until it is published");
         loop {
@@ -955,14 +1044,31 @@ impl RegolithEngine {
                 self.run_or_wait(&job);
                 continue;
             }
-            self.write_slot(desc);
-            match self.publish_upto(pipe, index, Some(desc)) {
-                Progress::Published => return,
+            if !self.write_alone(pipe, desc) {
+                self.fill(desc);
+            }
+            // A blocking call is never left waiting on a queue. One that
+            // waits for a sync does not sleep on its record while another
+            // thread has it in hand: it copies it, as the round's holder
+            // does, and is awake to claim the next round (WU5).
+            let how = if desc.decision().is_some_and(|d| d.immediate) {
+                Await::Copy
+            } else {
+                Await::Park
+            };
+            let _ = self.bring_written(pipe, desc, how);
+            match self.publish_upto(pipe, index, Some(desc), Await::Park) {
+                Progress::Published => {
+                    // Done: wake who waits for its turn, off the decided
+                    // frontier's path (P6).
+                    self.wake_near(pipe);
+                    return;
+                }
                 Progress::NeedsSync | Progress::Failed => {
                     // A blocking call gets past the round.
                     let _ = self.sync_round(pipe, Help::Wait);
                 }
-                Progress::Undecided => {}
+                Progress::Undecided | Progress::Waits(_) => {}
             }
         }
     }

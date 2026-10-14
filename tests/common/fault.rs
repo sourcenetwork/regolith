@@ -34,7 +34,7 @@
 //! `strace` is not installed on this machine and there is no way to
 //! install it, so option (a) of the ALICE-style approaches was
 //! unavailable. Option (b) was chosen: a **pure-Rust `LD_PRELOAD`
-//! interposer** over `write`, `pwrite64`, `writev`, `fsync`, `fdatasync`,
+//! interposer** over `write`, `pwrite64`, `pwritev`, `writev`, `fsync`, `fdatasync`,
 //! `open`/`openat`, `ftruncate`, `close`, `rename` and `unlink`. It
 //! records the real syscall stream of the child, including the kernel
 //! thread id and the exact byte offset of every write, and

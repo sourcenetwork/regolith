@@ -32,8 +32,10 @@
 //! on a range of the log once a sync that covers the range has begun.
 //! Putting synced bytes back in flight, even the very same bytes, would let
 //! a power cut take commits that were durable. The pipeline writes one
-//! record from two threads when the first is slow (the courtesy in
-//! `commit::pipeline`), so a late copy of a record is the case to rule out.
+//! record from two threads when the first is slow (a thread whose patience
+//! with the write unit's holder ran out writes the record itself,
+//! `commit::write_unit`), so a late copy of a record, or a run that holds
+//! it, is the case to rule out.
 //!
 //! So a write also counts in on one of two sides, the one the gate names
 //! when it enters, and then looks again at whether its record is written

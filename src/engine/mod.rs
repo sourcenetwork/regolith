@@ -552,7 +552,9 @@ pub(crate) struct RegolithEngine {
     /// One close at a time; a second caller waits for the first and then
     /// reads what it left in `close_state`. A [`crate::sync::Mutex`], so no
     /// thread sleeps in the kernel on it: close is a call that chose to
-    /// block, and waits on its own thread.
+    /// block, and waits on its own thread. Built without spin (E48): a close
+    /// holds it for the whole close, flushes and syncs included, so a second
+    /// close queues at once.
     close_lock: crate::sync::Mutex<()>,
     /// Transactions that `close` must abort. See `open_transactions`.
     open_transactions: open_transactions::OpenTransactions,
@@ -868,7 +870,7 @@ impl RegolithEngine {
             cache,
             visible_seq: ReadHorizon::new(latest_seq),
             close_state: AtomicU8::new(CLOSE_STATE_OPEN),
-            close_lock: crate::sync::Mutex::new(()),
+            close_lock: crate::sync::Mutex::new_without_spin(()),
             open_transactions: open_transactions::OpenTransactions::new(),
             wal_id: AtomicU64::new(wal_id),
             sst_dir,
@@ -1054,7 +1056,7 @@ impl RegolithEngine {
             cache,
             visible_seq: ReadHorizon::new(latest_seq),
             close_state: AtomicU8::new(CLOSE_STATE_OPEN),
-            close_lock: crate::sync::Mutex::new(()),
+            close_lock: crate::sync::Mutex::new_without_spin(()),
             open_transactions: open_transactions::OpenTransactions::new(),
             wal_id: AtomicU64::new(wal_id),
             sst_dir,
@@ -1251,7 +1253,6 @@ impl RegolithEngine {
     /// The last sequence the commit pipeline decided: every commit decided
     /// so far took sequences at or below it. A database opened read-only
     /// decides none, so there it is the published horizon.
-    #[cfg(test)]
     pub(crate) fn last_decided_seq(&self) -> u64 {
         match self.pipeline_state() {
             Some(tip) => tip.after.next_seq.saturating_sub(1),
@@ -2689,17 +2690,17 @@ impl RegolithEngine {
         self.latest_version_upto(key, u64::MAX, view)
     }
 
-    /// [`Self::latest_version_in_view`] among the writes at or below `snap`,
-    /// for a check that takes no slot of the commit ring and so must not see
-    /// a commit that is decided and not yet published.
+    /// [`Self::latest_version_in_view`] among the writes at or below `ceil`:
+    /// what the key held for a reader at `ceil`, for a check that takes no
+    /// slot of the commit ring (`commit/write_free.rs`).
     fn latest_version_upto(
         &self,
         key: &[u8],
-        snap: u64,
+        ceil: u64,
         view: &ReadView,
     ) -> std::io::Result<Option<(u64, WriteKind)>> {
-        let lk = LookupKey::from_prefixed(key, snap);
-        let walked = view.walk_newest_first(key, snap, |source, max_rt_seq| {
+        let lk = LookupKey::from_prefixed(key, ceil);
+        let walked = view.walk_newest_first(key, ceil, |source, max_rt_seq| {
             let version = match source {
                 Source::Memtable(mt) => mt.latest_version(&lk),
                 Source::Table(reader) => {

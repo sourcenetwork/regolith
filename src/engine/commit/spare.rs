@@ -27,7 +27,9 @@
 //!   is never read or dropped as a value again and pins nothing: no log, no
 //!   memtable, no key.
 //! - **S3, a thread keeps one shell of each kind.** A second one is freed, so
-//!   what a thread holds back is bounded by four small allocations.
+//!   what a thread holds back is bounded by four small allocations, and one
+//!   record buffer: the buffer of the last descriptor it let go of that
+//!   nobody else held, trimmed as a stage is (`trim_stage`).
 //!
 //! A loom build keeps no shell: its `Arc` is the model's, and what is reused
 //! here is memory, not a protocol.
@@ -88,12 +90,18 @@ mod shell {
         /// when `arc` is the last reference; otherwise let `arc` go. What
         /// [`Self::take`] does for a value nobody needs, with no copy of it
         /// out of the allocation first: a descriptor or a decision is a few
-        /// hundred bytes.
-        pub(super) fn recycle(arc: Arc<T>) -> Option<Self> {
+        /// hundred bytes. `before` sees the value alone first, to take out
+        /// what is kept beyond it.
+        pub(super) fn recycle(arc: Arc<T>, before: impl FnOnce(&mut T)) -> Option<Self> {
             if !unique(&arc) {
                 return None;
             }
             let raw = Arc::into_raw(arc).cast_mut();
+            // SAFETY (S1): `unique` said this is the only reference, so this
+            // borrow is the only access to the value, and it ends before the
+            // value is dropped below. A `before` that unwinds leaks the
+            // allocation and the value, which frees nothing twice.
+            before(unsafe { &mut *raw });
             // SAFETY (S2): as in `take`; from here on the allocation is only
             // seen as uninitialized, so the shell never drops the value.
             let shell = Self(unsafe { Arc::from_raw(raw.cast_const().cast::<MaybeUninit<T>>()) });
@@ -141,6 +149,9 @@ mod kept {
         pub(super) static DECISION: Slot<Decision> = const { Cell::new(None) };
         pub(super) static ROUND: Slot<Round> = const { Cell::new(None) };
         pub(super) static JOB: Slot<Job> = const { Cell::new(None) };
+        /// The record buffer of the last descriptor this thread kept, and
+        /// the length of the record before it (`trim_stage`'s hysteresis).
+        pub(super) static RECORD: Cell<(Vec<u8>, usize)> = const { Cell::new((Vec::new(), 0)) };
     }
 
     /// `value` in this thread's shell, or in a new allocation when the
@@ -163,34 +174,70 @@ mod kept {
     }
 
     /// [`keep`] for a value nobody needs: dropped where it lies, and its
-    /// allocation kept when `arc` was the last reference.
-    pub(super) fn recycle<T>(slot: &'static LocalKey<Slot<T>>, arc: Arc<T>) {
-        if let Some(shell) = Shell::recycle(arc) {
+    /// allocation kept when `arc` was the last reference. `before` sees the
+    /// value alone first.
+    pub(super) fn recycle<T>(
+        slot: &'static LocalKey<Slot<T>>,
+        arc: Arc<T>,
+        before: impl FnOnce(&mut T),
+    ) {
+        if let Some(shell) = Shell::recycle(arc, before) {
             // S3: a shell already there is freed by the `set`.
             let _ = slot.try_with(|slot| slot.set(Some(shell)));
         }
     }
 }
 
-/// A descriptor for `work`, in a kept allocation when this thread has one.
-/// `blocking`: see [`Descriptor::is_blocking`].
+/// A descriptor for `work`, in a kept allocation when this thread has one,
+/// with the record buffer it kept. `blocking`: see
+/// [`Descriptor::is_blocking`].
 pub(super) fn descriptor(work: Work, blocking: bool) -> RingArc<Descriptor> {
-    let desc = Descriptor::new(work, blocking);
     #[cfg(not(loom))]
     {
-        kept::make(&kept::DESCRIPTOR, desc)
+        let record = kept::RECORD
+            .try_with(|kept| {
+                let (record, prev) = kept.take();
+                kept.set((Vec::new(), prev));
+                record
+            })
+            .unwrap_or_default();
+        kept::make(
+            &kept::DESCRIPTOR,
+            Descriptor::with_record(work, blocking, record),
+        )
     }
     #[cfg(loom)]
     {
-        RingArc::new(desc)
+        RingArc::new(Descriptor::new(work, blocking))
     }
 }
 
+/// Test-only: the capacity and the address of the record buffer this thread
+/// kept for its next descriptor.
+#[cfg(all(test, not(loom)))]
+pub(super) fn record_buffer() -> (usize, *const u8) {
+    kept::RECORD.with(|kept| {
+        let (record, prev) = kept.take();
+        let seen = (record.capacity(), record.as_ptr());
+        kept.set((record, prev));
+        seen
+    })
+}
+
 /// Let go of `desc`, a commit's descriptor its owner is done with, keeping
-/// its allocation when nobody else holds it.
+/// its allocation and its record buffer when nobody else holds it.
 pub(super) fn keep_descriptor(desc: RingArc<Descriptor>) {
     #[cfg(not(loom))]
-    kept::recycle(&kept::DESCRIPTOR, desc);
+    kept::recycle(&kept::DESCRIPTOR, desc, |desc| {
+        let mut record = desc.take_record();
+        let _ = kept::RECORD.try_with(|kept| {
+            let (_, prev) = kept.take();
+            let used = record.len();
+            super::trim_stage(&mut record, prev, used);
+            record.clear();
+            kept.set((record, used));
+        });
+    });
     #[cfg(loom)]
     drop(desc);
 }
@@ -212,7 +259,7 @@ pub(super) fn decision(decision: Decision) -> RingArc<Decision> {
 /// past. Its allocation is kept when nobody else holds it.
 pub(super) fn keep_decision(decision: RingArc<Decision>) {
     #[cfg(not(loom))]
-    kept::recycle(&kept::DECISION, decision);
+    kept::recycle(&kept::DECISION, decision, |_| {});
     #[cfg(loom)]
     drop(decision);
 }
@@ -308,13 +355,16 @@ mod tests {
         let arc = Arc::new(Counted(Arc::clone(&drops), 1));
         let address = Arc::as_ptr(&arc) as usize;
         let shared = Arc::clone(&arc);
-        assert!(Shell::recycle(arc).is_none(), "a shared value was recycled");
+        assert!(
+            Shell::recycle(arc, |_| {}).is_none(),
+            "a shared value was recycled"
+        );
         assert_eq!(
             drops.load(Ordering::SeqCst),
             0,
             "a shared value was dropped"
         );
-        let Some(shell) = Shell::recycle(shared) else {
+        let Some(shell) = Shell::recycle(shared, |_| {}) else {
             panic!("the last reference was not recycled");
         };
         assert_eq!(drops.load(Ordering::SeqCst), 1, "dropped once, in place");
@@ -358,7 +408,7 @@ mod tests {
         let arc = Arc::new(5u64);
         let weak = Arc::downgrade(&arc);
         assert!(!super::shell::unique(&arc), "a weak reference is out");
-        assert!(Shell::recycle(arc).is_none());
+        assert!(Shell::recycle(arc, |_| {}).is_none());
         assert!(weak.upgrade().is_none());
     }
 

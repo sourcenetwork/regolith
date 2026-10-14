@@ -1,6 +1,7 @@
 //! An optimistic transaction as a slot of the commit ring (E10).
 //!
-//! A transaction's commit takes a slot of the ring plain writes use, so it
+//! A transaction's commit that writes takes a slot of the ring plain writes
+//! use (one that writes nothing does not: `commit_write_free`), so it
 //! shares their sync rounds. Its slot is decided in ring order by whichever
 //! thread reaches it: the commit is validated against the view, which by
 //! then holds the writes of every slot decided before it, and only a commit
@@ -174,9 +175,14 @@ impl RegolithEngine {
                 _ if nothing_above => continue,
                 _ => (horizon.max(range.observed_seq), memtables_only),
             };
-            if let Some((key, seq, theirs)) =
-                self.written_in_range_of(&range.lo, &range.hi, floor, view, memtables_only)?
-            {
+            if let Some((key, seq, theirs)) = self.written_in_range_of(
+                &range.lo,
+                &range.hi,
+                floor,
+                u64::MAX,
+                view,
+                memtables_only,
+            )? {
                 return Ok(Verdict::Conflict(Conflict::new(
                     key,
                     Access::ScannedRange,
