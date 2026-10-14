@@ -13,6 +13,7 @@ use std::thread::{self, Thread};
 use crate::sync::internal::Mutex;
 
 use super::request::WriteRequest;
+use super::txn::Settled;
 
 /// Handoff states, cycled `Idle -> Pending -> Done -> Idle`.
 const SLOT_IDLE: u8 = 0;
@@ -21,7 +22,7 @@ const SLOT_DONE: u8 = 2;
 
 struct SlotPayload {
     request: WriteRequest,
-    outcome: Option<io::Result<u64>>,
+    outcome: Option<io::Result<Settled>>,
 }
 
 /// One writer thread's handoff slot, created once and reused for every
@@ -56,6 +57,9 @@ impl WriteSlot {
     /// Returns the request back when the slot is not idle, which means a
     /// previous ticket is still outstanding on this thread. The caller
     /// commits inline instead of racing an in-flight handoff.
+    // The request moves back only on that rare refusal, and boxing the
+    // transaction it can carry would allocate on every commit instead.
+    #[allow(clippy::result_large_err)]
     pub(super) fn arm(&self, request: WriteRequest) -> Result<(), WriteRequest> {
         if self.state.load(Ordering::Acquire) != SLOT_IDLE {
             return Err(request);
@@ -74,10 +78,16 @@ impl WriteSlot {
         std::mem::replace(&mut self.payload.lock().request, WriteRequest::Idle)
     }
 
-    /// Leader side: record the group's outcome and release the writer.
-    pub(super) fn complete(&self, outcome: io::Result<u64>) {
+    /// Leader side: record this ticket's outcome and release the writer.
+    pub(super) fn complete(&self, outcome: io::Result<Settled>) {
         self.payload.lock().outcome = Some(outcome);
         self.state.store(SLOT_DONE, Ordering::Release);
+        self.thread.unpark();
+    }
+
+    /// Leader side: wake the writer so it leads the next group (E21). Its
+    /// ticket stays pending; the writer finds the pipeline free.
+    pub(super) fn wake(&self) {
         self.thread.unpark();
     }
 
@@ -86,10 +96,16 @@ impl WriteSlot {
     }
 
     /// Writer side: collect the outcome and return the slot to service.
-    pub(super) fn finish(&self) -> io::Result<u64> {
+    pub(super) fn finish_settled(&self) -> io::Result<Settled> {
         let outcome = self.payload.lock().outcome.take();
         self.state.store(SLOT_IDLE, Ordering::Release);
         outcome.unwrap_or_else(|| Err(io::Error::other("commit slot completed with no outcome")))
+    }
+
+    /// [`Self::finish_settled`] for a plain write: the last sequence it took.
+    #[cfg(test)]
+    pub(super) fn finish(&self) -> io::Result<u64> {
+        self.finish_settled().and_then(Settled::into_seq)
     }
 }
 
@@ -128,7 +144,7 @@ mod tests {
         let taken = slot.take_request();
         assert_eq!(taken.op_count(), 1);
 
-        slot.complete(Ok(7));
+        slot.complete(Ok(Settled::Write(7)));
         assert!(slot.is_done());
         assert!(slot.finish().is_ok());
         // Back in service for the next write on this thread.

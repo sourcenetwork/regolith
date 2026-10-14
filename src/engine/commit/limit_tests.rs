@@ -278,7 +278,7 @@ fn an_oversized_write_is_refused_before_it_reaches_the_pipeline() {
             };
             engine
                 .commit_optimistic(
-                    &checks,
+                    checks,
                     point_ops,
                     range_deletes,
                     merges,
@@ -351,14 +351,11 @@ fn a_group_past_the_limit_is_refused_whole_before_it_takes_a_sequence() {
     pipe.group.clear();
     for slot in &slots {
         let request = slot.take_request();
-        pipe.group.push(GroupTicket {
-            slot: Some(Arc::clone(slot)),
-            request,
-        });
+        pipe.group
+            .push(GroupTicket::new(Some(Arc::clone(slot)), request));
     }
-    let result = engine.run_and_complete(&mut pipe, engine.view.load());
-    let err = result.expect_err("a group over the record limit must be refused");
-    assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    let own = engine.run_and_complete(&mut pipe, engine.view.load());
+    assert!(own.is_none(), "the group carries no leader request");
     assert_eq!(pipe.stage.len(), 0);
     drop(pipe);
 
@@ -445,10 +442,8 @@ fn a_seeded_group_holds_back_what_does_not_fit() {
     let seed = |pipe: &mut Pipeline| {
         pipe.group.clear();
         pipe.held = None;
-        pipe.group.push(GroupTicket {
-            slot: None,
-            request: durable_put(b"seed", b"value"),
-        });
+        pipe.group
+            .push(GroupTicket::new(None, durable_put(b"seed", b"value")));
     };
     let push_a = |engine: &RegolithEngine| {
         let slot = Arc::new(WriteSlot::new());
@@ -493,10 +488,10 @@ fn a_held_ticket_leads_the_next_group_ahead_of_the_ring() {
 
     let mut pipe = engine.pipeline.lock();
     pipe.group.clear();
-    pipe.held = Some(GroupTicket {
-        slot: Some(Arc::clone(&h_slot)),
-        request: h_slot.take_request(),
-    });
+    pipe.held = Some(GroupTicket::new(
+        Some(Arc::clone(&h_slot)),
+        h_slot.take_request(),
+    ));
     let view = engine.view.load();
     engine.admit_from_ring(&mut pipe, &view, usize::MAX);
 
@@ -557,10 +552,10 @@ fn a_held_ticket_is_committed_by_the_next_drain() {
     {
         let mut pipe = engine.pipeline.lock();
         pipe.group.clear();
-        pipe.held = Some(GroupTicket {
-            slot: Some(Arc::clone(&h_slot)),
-            request: h_slot.take_request(),
-        });
+        pipe.held = Some(GroupTicket::new(
+            Some(Arc::clone(&h_slot)),
+            h_slot.take_request(),
+        ));
     }
 
     assert!(
@@ -581,10 +576,10 @@ fn a_held_ticket_is_committed_by_the_next_drain() {
     h2_slot.arm(durable_put(b"held2", b"v2")).unwrap();
     {
         let mut pipe = engine.pipeline.lock();
-        pipe.held = Some(GroupTicket {
-            slot: Some(Arc::clone(&h2_slot)),
-            request: h2_slot.take_request(),
-        });
+        pipe.held = Some(GroupTicket::new(
+            Some(Arc::clone(&h2_slot)),
+            h2_slot.take_request(),
+        ));
     }
     let seq_own = engine
         .submit(durable_put(b"own", b"v"))

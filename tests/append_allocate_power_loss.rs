@@ -255,6 +255,12 @@ fn check_recovered_log(out: &ChildOutcome, durability: DurabilityMode) {
 
 const TEARS: [TearMode; 2] = [TearMode::Truncate, TearMode::TornSector];
 
+/// Commits per writer for the cuts at the nth log write. Concurrent commits
+/// share a group's one write, and a group holds at most one commit of each
+/// of the `THREADS` writers, so this many commits per writer make at least
+/// this many log writes: enough for every cut below to fire.
+const APPEND_COMMITS: usize = 100;
+
 #[test]
 fn a_power_cut_leaves_a_gap_free_prefix_of_the_appends_at_immediate_durability() {
     for nth in [4, 17, 40, 90] {
@@ -264,7 +270,7 @@ fn a_power_cut_leaves_a_gap_free_prefix_of_the_appends_at_immediate_durability()
                 DurabilityMode::Immediate,
                 Trigger::wal_write(nth),
                 tear,
-                40,
+                APPEND_COMMITS,
             );
             check_recovered_log(&out, DurabilityMode::Immediate);
         }
@@ -280,7 +286,7 @@ fn a_power_cut_leaves_a_gap_free_prefix_of_the_appends_at_eventual_durability() 
                 DurabilityMode::Eventual,
                 Trigger::wal_write(nth),
                 tear,
-                40,
+                APPEND_COMMITS,
             );
             check_recovered_log(&out, DurabilityMode::Eventual);
         }

@@ -59,7 +59,7 @@ fn commit_after_newer_writes(exempt: &[&[u8]], puts: &[&[u8]], merged: &[&[u8]])
         .collect();
     engine
         .commit_optimistic(
-            &checks,
+            checks,
             point_ops,
             Vec::new(),
             merges,
@@ -176,7 +176,7 @@ fn commit_read_of_a_present_key(
         delete.then(|| (key_of(b"c"), None)).into_iter().collect();
     engine
         .commit_optimistic(
-            &checks,
+            checks,
             point_ops,
             Vec::new(),
             Vec::new(),

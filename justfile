@@ -597,8 +597,13 @@ tla:
     spec=GroupCommit
     check MC_GroupCommit_Green                         GREEN
     check MC_GroupCommit_Green_Live                    GREEN
+    check MC_GroupCommit_Green_LivePlain               GREEN
+    check MC_GroupCommit_Green_ReadOnly                GREEN
     check MC_GroupCommit_Red_ViewOnly                  RED SerialEquivalent
+    check MC_GroupCommit_Red_TrustEarly                RED SerialEquivalent
     check MC_GroupCommit_Red_PublishBeforeSync         RED DurableBeforeVisible
+    # E21, the bounded leader: one group per turn, then hand off.
+    check MC_GroupCommit_Red_DrainAll                  RED BoundedTurn
     # 4.7, the lock-free commit pipeline. Lean: Regolith/Pipeline.lean,
     # seqs_dense and reader_sees_published.
     spec=CommitPipeline

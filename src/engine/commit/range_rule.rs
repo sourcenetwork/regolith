@@ -32,6 +32,20 @@ impl RegolithEngine {
         floor: u64,
         view: &ReadView,
     ) -> io::Result<Option<(Vec<u8>, u64, WriteKind)>> {
+        self.written_in_range_of(lo, hi, floor, view, false)
+    }
+
+    /// [`Self::written_in_range`], asking only the memtables when
+    /// `memtables_only` is set: exact when no table holds a sequence above
+    /// `floor` (see `early.rs`).
+    pub(super) fn written_in_range_of(
+        &self,
+        lo: &[u8],
+        hi: &[u8],
+        floor: u64,
+        view: &ReadView,
+        memtables_only: bool,
+    ) -> io::Result<Option<(Vec<u8>, u64, WriteKind)>> {
         if lo >= hi {
             return Ok(None);
         }
@@ -42,6 +56,9 @@ impl RegolithEngine {
             if let Some((key, seq)) = mt.newer_range_tombstone(lo, hi, floor) {
                 return Ok(Some((key, seq, WriteKind::RangeDelete)));
             }
+        }
+        if memtables_only {
+            return Ok(None);
         }
         let levels = &view.version.levels;
         let l0 = levels[0].iter().rev().filter(|file| {

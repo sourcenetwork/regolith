@@ -105,7 +105,7 @@ mod tests {
         let puts: BTreeMap<Vec<u8>, Option<Vec<u8>>> =
             BTreeMap::from([(key_of(b"c"), Some(mine.to_vec()))]);
         engine.commit_optimistic(
-            &checks,
+            checks,
             puts,
             Vec::new(),
             Vec::new(),

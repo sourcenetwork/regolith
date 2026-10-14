@@ -94,7 +94,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use common::fault::{
-    self, ChildOutcome, ChildSpec, CrashRun, CutPoint, History, Phase, PowerLossOptions,
+    self, ChildOutcome, ChildSpec, CrashRun, CutPoint, History, OpKind, Phase, PowerLossOptions,
     PowerLossReport, Recovery, TearMode, Trigger,
 };
 use regolith::{Db, DurabilityMode, Options};
@@ -366,10 +366,11 @@ fn eventual_durability_recovers_to_a_valid_prefix_and_the_loss_is_measured() {
 /// The proof: the whole run wrote to exactly `nth` SSTable files, which is
 /// fewer than `l0_compaction_trigger` (4 by default), so no level compaction
 /// can have started and every SSTable write in the run belongs to a flush;
-/// and the fatal record is a write to the newest of those files. regolith
-/// flushes synchronously on the thread that filled the memtable
-/// (`rotate_memtable` calls `flush_frozen_memtable` in `src/engine/mod.rs`),
-/// so the cut lands with the SSTable written but not yet `fsync`ed and its
+/// and the fatal record is a write to the newest of those files. A rotation
+/// seals the memtable and the compaction worker flushes it (E9), so the
+/// writer can record a log write or two between the worker's fatal write and
+/// the process's death: the fatal record is the last SSTable record, and the
+/// cut lands with that SSTable written but not yet `fsync`ed and its
 /// MANIFEST `AddFile` record not yet appended.
 fn cut_power_inside_flush(db: &Path, nth: u64) -> (ChildOutcome, PowerLossReport) {
     let spec = ChildSpec::new(Phase::DuringFlush, db).durability(DurabilityMode::Immediate);
@@ -399,13 +400,24 @@ fn cut_power_inside_flush(db: &Path, nth: u64) -> (ChildOutcome, PowerLossReport
     let last = out
         .journal
         .records
-        .last()
+        .iter()
+        .rev()
+        .find(|r| r.path.to_string_lossy().ends_with(".sst"))
         .expect("journal must contain the fatal operation");
     let newest = written.last().expect("written is non-empty");
     assert!(
-        last.path.to_string_lossy().ends_with(newest),
-        "the crash landed on {:?} rather than inside the flush's SSTable write\n{}",
+        last.path.to_string_lossy().ends_with(newest) && last.kind == OpKind::Write,
+        "the crash landed on {:?} ({:?}) rather than inside the flush's SSTable write\n{}",
         last.path,
+        last.kind,
+        out.journal,
+    );
+    assert!(
+        !out.journal
+            .records
+            .iter()
+            .any(|r| r.seq > last.seq && r.path.to_string_lossy().ends_with("MANIFEST")),
+        "the manifest moved after the fatal SSTable write\n{}",
         out.journal,
     );
     assert!(

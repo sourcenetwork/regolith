@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc c42ef9dc752aef43853aa8a0e3b33a3719635f99c442b02fa53562817c40dd0c # shrinks to before = [], until_horizon = [], after_horizon = [Merge(2, 0), Flush], shape = Shape { reads: [], scan: None, writes: [(2, Put(0, 0))], blind: false, exempt: None }

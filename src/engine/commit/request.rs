@@ -8,6 +8,7 @@ use super::super::wal::{
     check_record_len, encode_ops_record, encode_put_record, ops_record_len, put_record_len,
 };
 use super::super::{DurabilityMode, MemTable, apply_batch_op_to_memtable, batch_op_wal_bytes};
+use super::txn::TxnRequest;
 use crate::WriteBatchOp;
 
 /// The unit of work one writer hands to the commit leader.
@@ -39,13 +40,19 @@ pub(crate) enum WriteRequest {
         /// Skip the WAL entirely for this writer's operations.
         disable_wal: bool,
     },
+    /// An optimistic transaction's commit. The leader validates it in group
+    /// order and turns it into a [`WriteRequest::Batch`] or into
+    /// [`WriteRequest::Idle`] before anything is staged, so the methods below
+    /// that size a request answer for it with upper bounds, and the ones that
+    /// stage or apply one never see it.
+    Txn(TxnRequest),
 }
 
 impl WriteRequest {
     /// How many sequence numbers this request consumes.
     pub(super) fn op_count(&self) -> u64 {
         match self {
-            WriteRequest::Idle => 0,
+            WriteRequest::Idle | WriteRequest::Txn(_) => 0,
             WriteRequest::Put { .. } => 1,
             WriteRequest::Batch { ops, .. } => ops.len() as u64,
         }
@@ -57,6 +64,7 @@ impl WriteRequest {
             WriteRequest::Put { durability, .. } | WriteRequest::Batch { durability, .. } => {
                 *durability
             }
+            WriteRequest::Txn(txn) => txn.durability,
         }
     }
 
@@ -66,12 +74,15 @@ impl WriteRequest {
             WriteRequest::Put { disable_wal, .. } | WriteRequest::Batch { disable_wal, .. } => {
                 *disable_wal
             }
+            WriteRequest::Txn(_) => false,
         }
     }
 
     /// Framed WAL bytes this request stages: exactly one record, or none
     /// when it skips the log. Every producer refuses a request whose
-    /// record is over the limit, and admission sums it to cap a group.
+    /// record is over the limit, and admission sums it to cap a group. A
+    /// transaction counts the most it can stage once its appends are
+    /// numbered.
     pub(super) fn staged_len(&self) -> usize {
         if self.skips_wal() {
             return 0;
@@ -80,6 +91,7 @@ impl WriteRequest {
             WriteRequest::Idle => 0,
             WriteRequest::Put { key, value, .. } => put_record_len(key, value),
             WriteRequest::Batch { ops, .. } => ops_record_len(ops),
+            WriteRequest::Txn(txn) => txn.record_bound,
         }
     }
 
@@ -106,6 +118,7 @@ impl WriteRequest {
                 MemTable::max_entry_size(key.len(), value.len())
             }
             WriteRequest::Batch { ops, .. } => ops.iter().map(batch_op_memtable_cost).sum(),
+            WriteRequest::Txn(txn) => txn.cost_bound,
         }
     }
 
@@ -118,12 +131,13 @@ impl WriteRequest {
             WriteRequest::Idle => 0,
             WriteRequest::Put { key, value, .. } => (key.len() + value.len() + 8) as u64,
             WriteRequest::Batch { ops, .. } => ops.iter().map(batch_op_wal_bytes).sum(),
+            WriteRequest::Txn(_) => 0,
         }
     }
 
     pub(super) fn encode_wal(&self, out: &mut Vec<u8>, base_seq: u64) {
         match self {
-            WriteRequest::Idle => {}
+            WriteRequest::Idle | WriteRequest::Txn(_) => {}
             WriteRequest::Put { key, value, .. } => encode_put_record(out, key, value, base_seq),
             WriteRequest::Batch { ops, .. } => encode_ops_record(out, ops, base_seq),
         }
@@ -139,7 +153,7 @@ impl WriteRequest {
         seq: &mut u64,
     ) {
         match self {
-            WriteRequest::Idle => {}
+            WriteRequest::Idle | WriteRequest::Txn(_) => {}
             WriteRequest::Put { key, value, .. } => {
                 memtable.put_hinted(hint, key, value, *seq);
                 *seq += 1;
@@ -155,7 +169,7 @@ impl WriteRequest {
 }
 
 /// Upper bound on the memtable bytes one batch operation can add.
-fn batch_op_memtable_cost(op: &WriteBatchOp) -> usize {
+pub(super) fn batch_op_memtable_cost(op: &WriteBatchOp) -> usize {
     match op {
         WriteBatchOp::Put { key, value } => MemTable::max_entry_size(key.len(), value.len()),
         WriteBatchOp::Delete { key } => MemTable::max_entry_size(key.len(), 0),
@@ -193,6 +207,12 @@ impl std::fmt::Debug for WriteRequest {
                 .field("ops", &ops.len())
                 .field("durability", durability)
                 .field("disable_wal", disable_wal)
+                .finish(),
+            WriteRequest::Txn(txn) => f
+                .debug_struct("WriteRequest::Txn")
+                .field("ops", &txn.ops.len())
+                .field("appends", &txn.appends.len())
+                .field("durability", &txn.durability)
                 .finish(),
         }
     }

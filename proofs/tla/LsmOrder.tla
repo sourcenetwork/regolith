@@ -62,12 +62,20 @@
 \*     flushed (`flush_memtables_holding`).
 \*   manifest replay                  src/engine/manifest.rs
 \*     Today refuses a deeper level whose tables overlap (E14).
-\*   flush_oldest_frozen              src/engine/mod.rs (FlushInstall)
-\*     A flush writes the oldest frozen memtable out as a table, then
-\*     installs the table as the newest L0 file and retires the memtable in
-\*     ONE publication of the read view (VersionGuard::retire_with_version,
-\*     src/engine/read_view.rs), so a flush is one step here, and no reader
-\*     loads a view between the two.
+\*   rotate_if_full, seal_active      src/engine/mod.rs (Freeze here)
+\*     A writer whose commit group fills the active memtable seals it under
+\*     the pipeline mutex: it becomes the newest frozen memtable and a fresh
+\*     one takes the writes. The flush is not done there (E9). A rotation
+\*     that would leave more than max_write_buffer_number memtables first
+\*     writes the oldest frozen one out itself: that is the bound MaxImm.
+\*   Flusher::flush_oldest            src/engine/flush.rs (FlushInstall)
+\*     Whoever flushes (the compaction worker, the bounded step a write owes
+\*     with no worker, a rotation at the cap, an explicit flush) takes the
+\*     `flushing` exclusion, picks the OLDEST frozen memtable, writes its
+\*     table, then installs it as the newest L0 file and retires the
+\*     memtable in ONE publication of the read view
+\*     (VersionGuard::retire_with_version, src/engine/read_view.rs), so a
+\*     flush is one step here, and no reader loads a view between the two.
 \*
 \* THE DEFECTS, one per mutant constant.
 \*   Picker = "Intersect" (E1). Picking only the L0 files that intersect the
@@ -75,7 +83,10 @@
 \*     stays in an older, unpicked L0 file, which every read consults first.
 \*   FlushOrder = "Any". With several frozen memtables, a newer one's file
 \*     is installed in L0 before an older one is flushed. The older frozen
-\*     memtable is read before L0, so its older version answers first.
+\*     memtable is read before L0, so its older version answers first. This
+\*     is what flushes off the commit path would do without the `flushing`
+\*     exclusion: two threads flushing at once, the newer memtable's flush
+\*     finishing first.
 \*   FlushPublish = "Split" (E31). The flush publishes the view holding its
 \*     table, and only then, in a second publication, the view without its
 \*     memtable. A reader that loads the view in between holds the memtable
@@ -95,7 +106,9 @@
 \*   Picker = "Closure": add every older L0 file whose key range overlaps
 \*     the picked set's, until nothing changes.
 \*   FlushOrder = "Oldest": a flush installs in memtable order; a file
-\*     written early waits for the older ones.
+\*     written early waits for the older ones. The code gets this from the
+\*     `flushing` exclusion and from always taking the oldest frozen
+\*     memtable, whichever thread flushes.
 \*   FlushPublish = "Together": the table joins L0 and the memtable leaves
 \*     the frozen list in the same publication, so the sources of every view
 \*     a reader can load share no version (NoDoubleSource).
@@ -182,7 +195,7 @@ VARIABLES
            \* no flush is between its two publications. Always {} with
            \* FlushPublish = "Together": the real code has no such moment.
            \* It stands for the flush still holding the `flushing` exclusion
-           \* (flush_oldest_frozen, src/engine/mod.rs) after its table is in.
+           \* (Flusher::flush_oldest, src/engine/flush.rs) after its table is in.
 
 \* Every variable, so a step that changes none of them is a stutter.
 vars == <<seq, mem, imm, l0, lv, opened, owed>>
@@ -389,19 +402,21 @@ Flush ==
   /\ mem' = {}
   /\ UNCHANGED <<seq, imm, lv, opened, owed>>
 
-\* Rotation freezes the memtable: it becomes the newest frozen memtable,
-\* still read before L0, and a new, empty memtable takes the writes.
+\* Rotation freezes the memtable (seal_active, under the pipeline mutex): it
+\* becomes the newest frozen memtable, still read before L0, and a new,
+\* empty memtable takes the writes. Nothing is flushed here (E9).
 Freeze ==
-  /\ MaxImm > 0
-  /\ mem # {}
-  /\ Len(imm) < MaxImm
-  /\ imm' = <<mem>> \o imm
-  /\ mem' = {}
-  /\ UNCHANGED <<seq, l0, lv, opened, owed>>
+  /\ MaxImm > 0                  \* this configuration keeps frozen memtables
+  /\ mem # {}                    \* there is something to freeze
+  /\ Len(imm) < MaxImm           \* under the cap: at the cap the rotation flushes the oldest first
+  /\ imm' = <<mem>> \o imm        \* the memtable joins the front: the newest frozen one
+  /\ mem' = {}                   \* writes go to a fresh, empty memtable
+  /\ UNCHANGED <<seq, l0, lv, opened, owed>>   \* no sequence, file, level or flush in flight changes
 
-\* A flush of frozen memtable i installs its file as the newest L0 file and
-\* drops the memtable. The fix installs only the oldest (the last); the
-\* defect installs whichever flush finished first.
+\* A flush of frozen memtable i (Flusher::flush_oldest, by whatever thread)
+\* installs its file as the newest L0 file and drops the memtable. The fix
+\* installs only the oldest (the last in `imm`); the defect installs
+\* whichever flush finished first.
 \*
 \* The table and the retirement are ONE publication in the real code
 \* (`versions.apply` then `retire_with_version` under the version-set
