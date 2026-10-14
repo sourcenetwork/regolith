@@ -15,8 +15,8 @@
 //! format field and refuses the log as a newer format instead of calling
 //! it damaged. The stamp check covers the 20 bytes before it.
 //!
-//! A commit group is one record of kind [`KIND_GROUP`]. Its payload is the
-//! group's operations back to back, each an operation type byte followed
+//! A commit is one record of kind [`KIND_GROUP`]. Its payload is the
+//! commit's operations back to back, each an operation type byte followed
 //! by that operation's payload, which carries its own lengths and sequence
 //! number. A clean close appends one record of kind [`KIND_CLOSE`], with
 //! an empty payload, and nothing follows it.
@@ -78,7 +78,7 @@ pub(crate) const STAMP_LEN: usize = 24;
 /// Bytes of framing in front of every record's payload.
 pub(crate) const HEADER_LEN: usize = 21;
 
-/// A record holding one commit group's operations.
+/// A record holding one commit's operations.
 pub(crate) const KIND_GROUP: u8 = 0xC0;
 
 /// The record a clean close appends last.

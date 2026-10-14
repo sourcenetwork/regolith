@@ -73,16 +73,19 @@ impl Default for MemTableConfig {
 
 /// Concurrent in-memory sorted table backed by an arena skip list.
 ///
-/// Supports many concurrent readers and a single writer (serialized
-/// externally by the engine's write lock).
+/// Supports many concurrent readers and many concurrent writers, with no
+/// lock. Every write is idempotent: the same entry (key, sequence and kind)
+/// written twice, by one thread or by two at once, is held once. That is
+/// what lets whichever thread reaches a decided commit apply it
+/// (`engine::commit`, plan 4.7).
 ///
 /// Range tombstones live beside the skip list in an append-only log
 /// (`tombstones::TombstoneLog`) rather than interleaved with point
 /// entries. Range deletes are orders of magnitude rarer than point writes,
 /// and keeping them apart lets a point lookup skip them with one acquire
-/// load while the memtable holds none. Once it holds some, a lookup reads a
-/// published prefix of them without any lock, and an append never blocks a
-/// reader (T1 to T4 in that module).
+/// load while the memtable holds none. Once it holds some, a lookup reads
+/// the ready ones without any lock, and an append blocks neither a reader
+/// nor another append (T1 to T4 in that module).
 pub(crate) struct MemTable {
     list: ArenaSkipList,
     /// The range tombstones. Their published length is also the gate a
@@ -105,11 +108,11 @@ pub(crate) struct MemTable {
     /// The highest sequence number this memtable can contain, recorded
     /// when it is sealed.
     ///
-    /// Exact, and free. Sealing happens under the commit pipeline's
-    /// mutex, so every write acknowledged before the seal is already in
-    /// this memtable and no later write can enter it: the global
-    /// sequence counter read at that instant is precisely this
-    /// memtable's ceiling. A flush stamps it into the manifest, which is
+    /// Exact, and free. Sealing happens in the commit pipeline's ordered
+    /// step with every earlier commit applied and published, so every
+    /// write decided before the seal is already in this memtable and no
+    /// later write can enter it: the last sequence decided at that point
+    /// is precisely this memtable's ceiling. A flush stamps it into the manifest, which is
     /// what makes `last_seq` mean "durable in an SSTable through here"
     /// rather than "the newest sequence the engine had handed out when
     /// the flush happened to finish".
@@ -234,8 +237,8 @@ impl MemTable {
     }
 
     /// Record a range tombstone - every user key in `[start, end)`
-    /// is considered deleted as of `seq`. Called only by the memtable's one
-    /// writer, as the point writes are.
+    /// is considered deleted as of `seq`. Idempotent and callable by any
+    /// number of threads at once, as the point writes are.
     pub(crate) fn delete_range(&self, start: &[u8], end: &[u8], seq: u64) {
         self.range_tombstones
             .push(RangeTombstone::new(start.to_vec(), end.to_vec(), seq));

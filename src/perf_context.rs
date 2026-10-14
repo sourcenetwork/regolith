@@ -187,8 +187,9 @@ pub(crate) fn is_timed() -> bool {
 /// return what `f` counted apart from this thread's own counters, which are
 /// left as they were.
 ///
-/// The leader of a commit group validates each transaction in it on behalf of
-/// the thread that committed it; that thread [`absorb`]s the counts, so the
+/// Whichever thread decides a transaction's slot of the commit ring validates
+/// it on behalf of the thread that committed it; that thread [`absorb`]s the
+/// counts, so the
 /// work lands where the module docs say it does, on the originating thread.
 pub(crate) fn on_behalf<T>(level: PerfLevel, f: impl FnOnce() -> T) -> (T, PerfContextSnapshot) {
     /// Puts this thread's own level and counters back, on unwind too.

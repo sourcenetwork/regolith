@@ -8,7 +8,8 @@ use std::time::{Duration, Instant};
 use proptest::prelude::*;
 
 use super::*;
-use crate::engine::manifest::VersionEdit;
+use crate::engine::manifest::{VersionEdit, VersionSet};
+use crate::engine::version_store::VersionStore;
 
 fn memtable() -> Arc<MemTable> {
     let config = crate::engine::memtable::MemTableConfig::new(
@@ -28,7 +29,7 @@ fn store_with_view() -> (tempfile::TempDir, Arc<VersionStore>, Arc<ReadViewCell>
     let cell = Arc::new(ReadViewCell::new(ReadView {
         active: memtable(),
         frozen: Vec::new(),
-        version: store.lock().current(),
+        version: store.current(),
     }));
     store.attach_view(Arc::clone(&cell));
     (dir, store, cell)
@@ -103,8 +104,7 @@ fn racing_publishers_lose_nothing_and_readers_never_go_back() {
             scope.spawn(move || {
                 for id in 1..=VERSIONS {
                     store
-                        .lock()
-                        .apply(&[VersionEdit::SetNextFileId(id)])
+                        .run(|versions| versions.apply(&[VersionEdit::SetNextFileId(id)]))
                         .expect("apply");
                 }
             })
@@ -256,7 +256,9 @@ proptest! {
                     }
                 }
                 Op::Version(id) => {
-                    store.lock().apply(&[VersionEdit::SetNextFileId(id)]).expect("apply");
+                    store
+                        .run(|versions| versions.apply(&[VersionEdit::SetNextFileId(id)]))
+                        .expect("apply");
                     next_file_id = id;
                 }
             }

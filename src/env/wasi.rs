@@ -88,6 +88,10 @@ impl Env for WasiEnv {
         self.fs.open_write(path, mode)
     }
 
+    fn open_log(&self, path: &Path, mode: WriteMode) -> io::Result<Box<dyn super::LogFile>> {
+        self.fs.open_log(path, mode)
+    }
+
     fn metadata(&self, path: &Path) -> io::Result<FileMeta> {
         self.fs.metadata(path)
     }

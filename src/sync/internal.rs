@@ -31,12 +31,10 @@
 //! and a thread that has to wait on one of those waits through [`block_on`]
 //! or [`wait_here`], below.
 //!
-//! [`UnsafeCell`] and [`SingleWriterGuard`] live here for the same reason
-//! as everything else: a `std::cell::UnsafeCell` is invisible to loom, so
-//! state that is mutated without a lock (the arena's chunk list, A8 in
-//! `engine::arena`) goes through the wrapper here instead, and the debug
-//! guard that catches a broken single-writer contract is shared by the
-//! arena and the skip list rather than duplicated between them.
+//! [`UnsafeCell`] lives here for the same reason as everything else: a
+//! `std::cell::UnsafeCell` is invisible to loom, so state that is handed
+//! from one thread to another without a lock (a range tombstone's slot, T2
+//! in `engine::memtable::tombstones`) goes through the wrapper here instead.
 
 #[cfg(loom)]
 pub(crate) use loom::sync::Arc;
@@ -44,14 +42,50 @@ pub(crate) use loom::sync::Arc;
 pub(crate) use std::sync::Arc;
 
 #[cfg(loom)]
-pub(crate) use loom::sync::atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering, fence};
+pub(crate) use loom::sync::atomic::{AtomicPtr, AtomicU8, AtomicU64, AtomicUsize, Ordering, fence};
 #[cfg(not(loom))]
-pub(crate) use std::sync::atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering, fence};
+pub(crate) use std::sync::atomic::{AtomicPtr, AtomicU8, AtomicU64, AtomicUsize, Ordering, fence};
 
-#[cfg(all(loom, debug_assertions))]
-pub(crate) use loom::sync::atomic::AtomicBool;
-#[cfg(all(not(loom), debug_assertions))]
-pub(crate) use std::sync::atomic::AtomicBool;
+/// Take the pointer out of `atomic`, leaving null, through `&mut`: no other
+/// thread can reach the atomic, so this is a plain read and write and not a
+/// locked instruction. What a `Drop` of a cell built on an `AtomicPtr` uses,
+/// since a `swap` there costs a locked exchange for nothing.
+///
+/// Under loom it is still a `swap`: a value that `std::sync::Arc` hands from
+/// one thread to the one that drops it (a job, for one) reaches that thread
+/// by an edge loom cannot see, and loom would take the plain access for a
+/// race. The exclusive access itself is the borrow checker's to prove, not
+/// loom's.
+#[inline(always)]
+pub(crate) fn take_ptr<T>(atomic: &mut AtomicPtr<T>) -> *mut T {
+    #[cfg(not(loom))]
+    {
+        std::mem::replace(atomic.get_mut(), std::ptr::null_mut())
+    }
+    #[cfg(loom)]
+    {
+        atomic.swap(std::ptr::null_mut(), Ordering::AcqRel)
+    }
+}
+
+/// The point between the store and the load of one side of a handshake
+/// built from `SeqCst` accesses, for loom.
+///
+/// Two threads that each store one word and then load the other's ("I am
+/// here" against "it is gone") rely on the one total order C11 gives every
+/// `SeqCst` access of a program: whichever store comes second in that order,
+/// the load after it sees the other store, so at least one side sees the
+/// other. loom does not model that order for accesses, only for
+/// `fence(SeqCst)`, so the handshake fails under loom though it holds in
+/// every real execution. Each side calls this between its store and its
+/// load. Under `--cfg loom` it is a `SeqCst` fence, which gives the model
+/// the order the accesses have; in an ordinary build it is nothing, and the
+/// accesses carry the order themselves.
+#[inline(always)]
+pub(crate) fn seq_cst_handshake() {
+    #[cfg(loom)]
+    fence(Ordering::SeqCst);
+}
 
 #[cfg(loom)]
 use loom::sync as imp;
@@ -60,7 +94,7 @@ use std::sync as imp;
 
 pub(crate) use imp::MutexGuard;
 
-use std::sync::{PoisonError, TryLockError};
+use std::sync::PoisonError;
 
 /// A mutex that hands back its guard rather than a `LockResult`.
 ///
@@ -97,15 +131,6 @@ impl<T> Mutex<T> {
         self.0.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Lock if it is free right now, otherwise `None`.
-    pub(crate) fn try_lock(&self) -> Option<MutexGuard<'_, T>> {
-        match self.0.try_lock() {
-            Ok(guard) => Some(guard),
-            Err(TryLockError::Poisoned(poisoned)) => Some(poisoned.into_inner()),
-            Err(TryLockError::WouldBlock) => None,
-        }
-    }
-
     /// Borrow the contents mutably. Exclusive access is proven by
     /// `&mut self`, so this takes no lock.
     #[allow(dead_code)]
@@ -121,7 +146,8 @@ impl<T: std::fmt::Debug> std::fmt::Debug for Mutex<T> {
 }
 
 /// Interior mutability for state that exactly one thread touches at a
-/// time (the arena's chunk list, invariant A8 in `engine::arena`).
+/// time (a range tombstone's slot before it is marked ready, invariant T2
+/// in `engine::memtable::tombstones`).
 ///
 /// Under loom the cell is instrumented and an access that is not ordered
 /// before or after every other access fails the model; in a normal build
@@ -139,10 +165,6 @@ impl<T> UnsafeCell<T> {
 
     /// Run `f` on a shared pointer to the contents.
     ///
-    /// Only test-only readers (`Arena::chunk_count`, `chunk_sizes`) use
-    /// this today; production code only ever needs exclusive access, so
-    /// a non-test, non-loom build sees it as dead code.
-    #[allow(dead_code)]
     pub(crate) fn with<R>(&self, f: impl FnOnce(*const T) -> R) -> R {
         f(self.0.get())
     }
@@ -262,46 +284,9 @@ pub(crate) fn wait_here<F: core::future::Future>(future: F) -> std::io::Result<F
     }
 }
 
-/// Debug-only detector for a "exactly one thread at a time" contract.
-///
-/// `enter` flips the flag and asserts it was clear; dropping the guard
-/// clears it. Acquire on entry and Release on exit order the guarded
-/// section against the previous holder's, so a violation is always seen
-/// as one rather than as a torn flag. Compiled out of release builds:
-/// the contract is the caller's to keep, this only catches a breach.
-#[cfg(debug_assertions)]
-pub(crate) struct SingleWriterGuard<'a>(&'a AtomicBool);
-
-#[cfg(debug_assertions)]
-impl<'a> SingleWriterGuard<'a> {
-    /// Enter the guarded section; `contract` names the invariant in the
-    /// assertion message when it is broken.
-    pub(crate) fn enter(flag: &'a AtomicBool, contract: &'static str) -> Self {
-        let busy = flag.swap(true, Ordering::Acquire);
-        debug_assert!(!busy, "{contract}");
-        Self(flag)
-    }
-}
-
-#[cfg(debug_assertions)]
-impl Drop for SingleWriterGuard<'_> {
-    fn drop(&mut self) {
-        self.0.store(false, Ordering::Release);
-    }
-}
-
 #[cfg(all(test, not(loom)))]
 mod tests {
     use super::*;
-
-    #[cfg(debug_assertions)]
-    #[test]
-    #[should_panic(expected = "nested")]
-    fn a_nested_entry_trips_the_single_writer_guard() {
-        let flag = AtomicBool::new(false);
-        let _outer = SingleWriterGuard::enter(&flag, "nested entry is not allowed");
-        let _inner = SingleWriterGuard::enter(&flag, "nested entry is not allowed");
-    }
 
     #[test]
     #[allow(unsafe_code)]
@@ -330,6 +315,5 @@ mod tests {
             vec![1, 2, 3, 4],
             "poisoning must not hide what the panicking thread had already written",
         );
-        assert!(mutex.try_lock().is_some(), "try_lock must recover too");
     }
 }

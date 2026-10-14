@@ -159,12 +159,26 @@ impl Error {
     pub(crate) fn into_io_error(self) -> std::io::Error {
         match self {
             Self::Io(io) | Self::Corruption(io) => io,
-            Self::BackgroundFailed { source, .. } => source,
+            // Carried typed, under the failure's own kind: a commit told
+            // that the relief of its stop is failing reaches the caller as
+            // this variant, as a plain write does.
+            Self::BackgroundFailed {
+                job,
+                hazard,
+                source,
+            } => std::io::Error::new(
+                source.kind(),
+                Self::BackgroundFailed {
+                    job,
+                    hazard,
+                    source,
+                },
+            ),
             Self::InvalidArgument(message) => {
                 std::io::Error::new(std::io::ErrorKind::InvalidInput, message)
             }
-            // Carried typed, so a write the commit leader refuses for a
-            // dropped family reaches the caller as this variant.
+            // Carried typed, so a write refused for a dropped family when
+            // it is decided reaches the caller as this variant.
             typed @ Self::InvalidColumnFamily(_) => {
                 std::io::Error::new(std::io::ErrorKind::InvalidInput, typed)
             }
@@ -210,6 +224,15 @@ fn carried(err: &std::io::Error) -> Option<Error> {
         }),
         Error::KeyProviderRequired => Some(Error::KeyProviderRequired),
         Error::UnknownKey { id } => Some(Error::UnknownKey { id: *id }),
+        Error::BackgroundFailed {
+            job,
+            hazard,
+            source,
+        } => Some(Error::BackgroundFailed {
+            job,
+            hazard,
+            source: Error::clone_io(source),
+        }),
         _ => None,
     }
 }

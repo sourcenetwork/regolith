@@ -94,16 +94,12 @@ fn acker(spec: &ChildSpec) -> std::fs::File {
         .unwrap()
 }
 
-/// Run `attempt`, a transaction built and committed, until no write stall
-/// stops its commit: a stopped commit applied nothing, so the attempt is
-/// built again once the stall cleared. Any other failure fails the child.
-fn commit_through_stalls(mut attempt: impl FnMut() -> TxResult<CommitReceipt>) {
-    loop {
-        match attempt() {
-            Ok(_) => return,
-            Err(TransactionError::WouldBlock(regolith::WouldBlock::Stall(stall))) => stall.wait(),
-            Err(other) => panic!("child: commit: {other}"),
-        }
+/// Run `attempt`, a transaction built and committed. A write stall does not
+/// end its commit, which waits the stall out, so the attempt is made once;
+/// any failure fails the child.
+fn commit_through_stalls(attempt: impl FnOnce() -> TxResult<CommitReceipt>) {
+    if let Err(other) = attempt() {
+        panic!("child: commit: {other}");
     }
 }
 
@@ -282,6 +278,14 @@ const TEARS: [TearMode; 2] = [TearMode::Truncate, TearMode::TornSector];
 /// this many log writes: enough for every cut below to fire.
 const APPEND_COMMITS: usize = 100;
 
+/// Rounds per writer for the cuts at the nth log write. A round makes a
+/// reservation's record and, four rounds in five, a commit's; a run of the
+/// write unit holds at most those two of each of the `THREADS` writers (a
+/// reservation returns before its record is written, a commit only once its
+/// own is), so this many rounds make at least 120 log writes: enough for the
+/// last cut below to fire.
+const ALLOCATE_ROUNDS: usize = 140;
+
 #[test]
 fn a_power_cut_leaves_a_gap_free_prefix_of_the_appends_at_immediate_durability() {
     for nth in [4, 17, 40, 90] {
@@ -367,7 +371,7 @@ fn a_power_cut_never_returns_a_value_a_surviving_commit_used_at_immediate_durabi
                 DurabilityMode::Immediate,
                 Trigger::wal_write(nth),
                 tear,
-                30,
+                ALLOCATE_ROUNDS,
             );
             check_recovered_counter(&out, DurabilityMode::Immediate);
         }
@@ -383,7 +387,7 @@ fn a_power_cut_never_returns_a_value_a_surviving_commit_used_at_eventual_durabil
                 DurabilityMode::Eventual,
                 Trigger::wal_write(nth),
                 tear,
-                30,
+                ALLOCATE_ROUNDS,
             );
             check_recovered_counter(&out, DurabilityMode::Eventual);
         }

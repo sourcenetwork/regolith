@@ -86,14 +86,22 @@ pub(crate) struct QueueShared {
     owner: AtomicUsize,
 }
 
+#[cfg(not(loom))]
 thread_local! {
     /// One byte per thread, whose address names the thread while it lives.
     static TOKEN: u8 = const { 0 };
 }
 
+// A loom model's threads share one host thread, so the byte is loom's own
+// thread-local, boxed: its address is the model thread's while it lives.
+#[cfg(loom)]
+loom::thread_local! {
+    static TOKEN: Box<u8> = Box::new(0);
+}
+
 /// A number naming the calling thread, unique among the threads alive now.
 pub(crate) fn thread_token() -> usize {
-    TOKEN.with(|token| std::ptr::from_ref(token).addr())
+    TOKEN.with(|token| std::ptr::from_ref::<u8>(token).addr())
 }
 
 impl QueueShared {

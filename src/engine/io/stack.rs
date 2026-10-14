@@ -26,7 +26,7 @@
 use core::marker::PhantomData;
 use core::ptr;
 
-use crate::sync::internal::{AtomicPtr, Ordering};
+use crate::sync::internal::{AtomicPtr, Ordering, take_ptr};
 
 /// The inbox's owner is asleep and waits for the next push to wake it.
 pub(crate) const IDLE: usize = 0b01;
@@ -129,17 +129,39 @@ impl<T> Stack<T> {
         // publishes what the taker did before it (a unit's outcome) to every
         // pusher the new flags refuse.
         let word = self.head.swap(flags_only(set), Ordering::AcqRel);
-        let (mut node, _) = split(word);
-        // Reverse in place: pushes stacked newest first.
-        let mut oldest_first: *mut Node<T> = ptr::null_mut();
-        while !node.is_null() {
-            // SAFETY: the swap handed this call every node on the list.
-            let next = unsafe { (*node).next };
-            unsafe { (*node).next = oldest_first };
-            oldest_first = node;
-            node = next;
+        // SAFETY: the swap handed this call every node on the list.
+        unsafe { Taken::oldest_first(split(word).0) }
+    }
+
+    /// Take every value, oldest first, and leave the flags as they are: for
+    /// a taker that neither closes the list nor may reopen one another
+    /// thread closed meanwhile.
+    ///
+    /// The list still leaves whole, so a push cannot suffer ABA; and a head
+    /// address that came back between this call's load and its
+    /// compare-and-swap names the list that is there now, which is the one
+    /// it then walks.
+    pub(crate) fn take_open(&self) -> Taken<T> {
+        let mut word = self.head.load(Ordering::Acquire);
+        loop {
+            let (node, flags) = split(word);
+            if node.is_null() {
+                return Taken {
+                    next: ptr::null_mut(),
+                };
+            }
+            match self.head.compare_exchange(
+                word,
+                flags_only(flags),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                // SAFETY: the compare-and-swap handed this call every node
+                // on the list.
+                Ok(_) => return unsafe { Taken::oldest_first(node) },
+                Err(actual) => word = actual,
+            }
         }
-        Taken { next: oldest_first }
     }
 
     /// Set [`IDLE`] when the stack is empty and open, the owner's last step
@@ -185,7 +207,9 @@ impl<T> Stack<T> {
 
 impl<T> Drop for Stack<T> {
     fn drop(&mut self) {
-        drop(self.take(0));
+        // SAFETY: `&mut self` means no other thread can push or take, so
+        // every node on the list is this call's.
+        drop(unsafe { Taken::oldest_first(split(take_ptr(&mut self.head)).0) });
     }
 }
 
@@ -193,6 +217,27 @@ impl<T> Drop for Stack<T> {
 /// are dropped with it.
 pub(crate) struct Taken<T> {
     next: *mut Node<T>,
+}
+
+impl<T> Taken<T> {
+    /// The list whose newest node is `node`, turned oldest first: pushes
+    /// stacked newest first.
+    ///
+    /// # Safety
+    ///
+    /// The caller owns every node reachable from `node`, and nobody else
+    /// reads them.
+    unsafe fn oldest_first(mut node: *mut Node<T>) -> Self {
+        let mut oldest_first: *mut Node<T> = ptr::null_mut();
+        while !node.is_null() {
+            // SAFETY: the caller owns the list.
+            let next = unsafe { (*node).next };
+            unsafe { (*node).next = oldest_first };
+            oldest_first = node;
+            node = next;
+        }
+        Self { next: oldest_first }
+    }
 }
 
 impl<T> Iterator for Taken<T> {
@@ -244,6 +289,26 @@ mod tests {
         assert_eq!(stack.push(3, 0), Ok(SHUT));
         assert_eq!(stack.flags(), SHUT);
         assert_eq!(stack.push(4, SHUT), Err(4));
+    }
+
+    #[test]
+    fn an_open_take_empties_the_list_and_keeps_its_flags() {
+        let stack = Stack::new();
+        assert_eq!(stack.take_open().count(), 0);
+        for i in 0..3 {
+            stack.push(i, SHUT).unwrap();
+        }
+        assert_eq!(stack.take_open().collect::<Vec<_>>(), vec![0, 1, 2]);
+        assert!(stack.is_empty());
+        assert_eq!(stack.flags(), 0);
+        // A list another thread closed stays closed.
+        drop(stack.take(SHUT));
+        assert_eq!(stack.take_open().count(), 0);
+        assert_eq!(stack.flags(), SHUT);
+        assert_eq!(stack.push(4, 0), Ok(SHUT));
+        assert_eq!(stack.take_open().collect::<Vec<_>>(), vec![4]);
+        assert_eq!(stack.flags(), SHUT);
+        assert_eq!(stack.push(5, SHUT), Err(5));
     }
 
     #[test]

@@ -1,15 +1,11 @@
-//! Validation outside the pipeline mutex (`early_check_split` in
-//! `GroupCommit.lean`): checking a commit up to a horizon `h` before it
-//! queues, and only above `h` under the mutex, decides as one check of every
-//! version does.
-
-use std::sync::mpsc;
-use std::time::Duration;
+//! Validation outside the pipeline (`early_check_split` in
+//! `PipelineCheck.lean`): checking a commit up to a horizon `h` before it
+//! takes a slot, and only above `h` when its slot is decided, decides as one
+//! check of every version does.
 
 use proptest::prelude::*;
 use tempfile::TempDir;
 
-use super::super::wal::ops_record_len;
 use super::super::{ConflictKey, EngineOptions, RangeCheck, ReadRule, ValidationSet};
 use super::early::EarlyVerdict;
 use super::*;
@@ -249,20 +245,17 @@ fn split_commit(
         EarlyVerdict::Marks(early) => early,
     };
     between();
-    let request = WriteRequest::Txn(TxnRequest {
-        record_bound: ops_record_len(&ops),
-        cost_bound: ops.iter().map(batch_op_memtable_cost).sum(),
+    let request = WriteRequest::Txn(Box::new(TxnRequest {
         checks,
         ops,
         appends: Vec::new(),
         durability: DurabilityMode::Eventual,
         perf: crate::PerfLevel::Disable,
         early,
-        nowait: false,
-    });
-    let mut pipe = engine.pipeline.lock();
+        read_queue: None,
+    }));
     let settled = engine
-        .lead_with(&mut pipe, request)
+        .commit_through_pipeline(request)
         .map_err(|e| e.to_string());
     let outcome = match settled {
         Ok(Settled::Committed {
@@ -281,7 +274,6 @@ fn split_commit(
             latest: conflict.latest_seq(),
         },
         Ok(Settled::Write(_)) => panic!("a transaction settled as a plain write"),
-        Ok(Settled::Pending { .. }) => panic!("a blocking commit was left pending"),
         Err(e) => Outcome::Refused(e),
     };
     (outcome, false)
@@ -298,13 +290,13 @@ proptest! {
     #![proptest_config(ProptestConfig::with_cases(256))]
 
     /// The commit checked up to a horizon taken partway through the writes
-    /// that follow its snapshot, and above it under the mutex, decides as the
-    /// same commit checked in full once every write has landed. When the
-    /// check at the horizon settles the commit, the commit aborts either
-    /// way and only the reason it names may differ: another conflicting
-    /// key, or a refusal a write above the horizon caused (a
-    /// content-addressed key that came to hold different bytes), which the
-    /// full check meets first.
+    /// that follow its snapshot, and above it when its slot is decided,
+    /// decides as the same commit checked in full once every write has
+    /// landed. When the check at the horizon settles the commit, the outcome
+    /// is the same and only which conflicting key it names may differ: a
+    /// conflict behind a put to a content-addressed key, which a write above
+    /// the horizon can turn into a refusal the full check meets first, is
+    /// not settled at the horizon.
     #[test]
     fn checking_up_to_a_horizon_then_above_it_decides_as_one_check(
         before in proptest::collection::vec(step(), 0..5),
@@ -341,17 +333,17 @@ proptest! {
         // nothing lands above it, so this is one check of every version.
         let (whole_outcome, _) = split_commit(&whole, checks, ops, || {});
         match (&split_outcome, &whole_outcome) {
-            (Outcome::Lost { .. }, Outcome::Lost { .. } | Outcome::Refused(_)) if settled_early => {}
+            (Outcome::Lost { .. }, Outcome::Lost { .. }) if settled_early => {}
             _ => prop_assert_eq!(&split_outcome, &whole_outcome),
         }
         prop_assert_eq!(read_all(&split), read_all(&whole));
     }
 }
 
-/// A commit the check at the horizon settles never waits for the pipeline:
-/// it aborts while another thread holds the mutex.
+/// A commit the check at the horizon settles never enters the pipeline: it
+/// aborts without taking a slot of the commit ring.
 #[test]
-fn a_conflict_found_at_the_horizon_does_not_wait_for_the_pipeline() {
+fn a_conflict_found_at_the_horizon_does_not_enter_the_pipeline() {
     let (_dir, engine) = open();
     let snapshot = engine.snapshot_seq();
     apply(&engine, &Step::Put(0, 1));
@@ -368,36 +360,31 @@ fn a_conflict_found_at_the_horizon_does_not_wait_for_the_pipeline() {
         exempt: Vec::new(),
         ranges: Vec::new(),
     };
-    let held = engine.pipeline.lock();
-    let (done, outcome) = mpsc::channel();
-    std::thread::scope(|scope| {
-        scope.spawn(|| {
-            let mut points = std::collections::BTreeMap::new();
-            points.insert(key_of(b"a"), Some(b"mine".to_vec()));
-            let committed = engine.commit_optimistic(
-                checks,
-                points,
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                DurabilityMode::Eventual,
-            );
-            done.send(committed).unwrap();
-        });
-        let committed = outcome
-            .recv_timeout(Duration::from_secs(30))
-            .expect("the commit waited for the pipeline mutex");
-        drop(held);
-        let CommitOutcome::Conflict(conflict) = committed.unwrap() else {
-            panic!("a stale read for update conflicts");
-        };
-        assert_eq!(conflict.key(), key_of(b"a").as_slice());
-        assert_eq!(conflict.mine(), Access::ReadForUpdate);
-    });
+    let taken = engine.pipeline_slots_taken();
+    let mut points = std::collections::BTreeMap::new();
+    points.insert(key_of(b"a"), Some(b"mine".to_vec()));
+    let committed = engine.commit_optimistic(
+        checks,
+        points,
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        DurabilityMode::Eventual,
+    );
+    let CommitOutcome::Conflict(conflict) = committed.unwrap() else {
+        panic!("a stale read for update conflicts");
+    };
+    assert_eq!(conflict.key(), key_of(b"a").as_slice());
+    assert_eq!(conflict.mine(), Access::ReadForUpdate);
+    assert_eq!(
+        engine.pipeline_slots_taken(),
+        taken,
+        "the commit took a slot of the ring before it aborted"
+    );
 }
 
 /// With nothing committed since the snapshot the check at the horizon reads
-/// nothing, and the leader looks only at the memtables: a key whose versions
+/// nothing, and deciding the slot looks only at the memtables: a key whose versions
 /// all sit in a table is never looked up there.
 #[test]
 fn a_commit_nothing_landed_under_never_reads_a_table() {
@@ -423,4 +410,49 @@ fn a_commit_nothing_landed_under_never_reads_a_table() {
     assert!(!settled_early);
     assert!(matches!(outcome, Outcome::Landed { .. }), "{outcome:?}");
     assert_eq!(lookups, 0, "the commit read a table block");
+}
+
+/// Nothing was handed a sequence above the horizon of a commit's early
+/// check, so deciding its slot reads nothing, not even the view
+/// (`ceiling_skips_the_check_above` in `PipelineCheck.lean`). Once a write
+/// lands between the early check and the slot, the slot is checked above
+/// the horizon, and still commits when the write touched nothing it read.
+#[test]
+fn a_slot_nothing_was_decided_above_reads_nothing_when_it_is_decided() {
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    let (_dir, engine) = open();
+    apply(&engine, &Step::Put(0, 0));
+    let checked = Rc::new(Cell::new(0));
+    let counter = Rc::clone(&checked);
+    super::hook::set(move |stage| {
+        if stage == super::hook::Stage::Validate {
+            counter.set(counter.get() + 1);
+        }
+    });
+    let shape = Shape {
+        reads: vec![(0, 0)],
+        scan: Some((0, 1)),
+        writes: vec![(0, Step::Put(0, 1))],
+        blind: false,
+        exempt: None,
+    };
+    let (checks, ops) = commit_of(&shape, engine.snapshot_seq());
+    let (alone, _) = split_commit(&engine, checks, ops, || {});
+    let checked_alone = checked.get();
+    let (checks, ops) = commit_of(&shape, engine.snapshot_seq());
+    let (behind, _) = split_commit(&engine, checks, ops, || apply(&engine, &Step::Put(2, 1)));
+    super::hook::clear();
+    assert!(matches!(alone, Outcome::Landed { .. }), "{alone:?}");
+    assert_eq!(
+        checked_alone, 0,
+        "a slot nothing was decided above read the view"
+    );
+    assert!(matches!(behind, Outcome::Landed { .. }), "{behind:?}");
+    assert_eq!(
+        checked.get(),
+        1,
+        "a slot a write was decided above was not checked above its horizon"
+    );
 }

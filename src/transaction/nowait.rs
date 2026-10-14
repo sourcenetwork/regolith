@@ -2,22 +2,23 @@
 //! ticket instead of waiting for its fsync (plan 3.0, 3.16, 4.10; D43, D53).
 //!
 //! The commit runs exactly as [`Transaction::commit`] runs it up to the log
-//! write: its `before_commit` callbacks, its validation in a commit group,
-//! the group's append. What differs is the end:
+//! write: its `before_commit` callbacks, its validation when its slot of the
+//! commit ring is decided, its record's write. What differs is the end:
 //!
 //! - With no queue (neither [`TxnOptions::io_queue`](super::TxnOptions::io_queue)
 //!   nor a [`ReadMode::CacheOnly`](crate::ReadMode::CacheOnly) names one) the
 //!   commit syncs inline, as `commit` does, and the ticket is ready.
-//! - With a queue, a group that needs no fsync, or a commit decided without
-//!   one (a conflict, a failed callback), is landed before the call returns,
-//!   and the ticket is ready.
-//! - With a queue, a group that needs an fsync is left owing it, as one unit
-//!   its members' queues wait on (`engine::commit::deferred`). The ticket
-//!   completes on this transaction's queue when the group lands: the
-//!   outcome is resolved, and the transaction's callbacks run, at the poll
-//!   that delivers it, on the queue's thread.
+//! - With a queue, a commit that waits for no fsync, or one decided without
+//!   the log (a conflict, a failed callback), is published before the call
+//!   returns, and the ticket is ready.
+//! - With a queue, a commit that waits for an fsync is left waiting for it:
+//!   the sync is one unit every commit it covers waits on, on each
+//!   committer's own queue (`engine::commit::round`). The ticket completes
+//!   on this transaction's queue once the commit is published: the outcome
+//!   is resolved, and the transaction's callbacks run, at the poll that
+//!   delivers it, on the queue's thread.
 //!
-//! A pessimistic commit's key locks are released when its group lands, by
+//! A pessimistic commit's key locks are released when the commit lands, by
 //! the thread that lands it: the commit is applied and visible by then (and
 //! durable at `Immediate`), so the next holder reads it, and no transaction
 //! waits for this one's owner to poll its queue (`LockTable.tla`,
@@ -33,18 +34,18 @@ use std::sync::Arc;
 use super::{Transaction, TransactionError, TxResult, receipt_of};
 use crate::engine::io::job::Delivery;
 use crate::engine::io::shared::QueueShared;
-use crate::engine::{GroupSync, NowaitCommit, RegolithEngine, Settled, conclude_settled};
+use crate::engine::{NowaitCommit, PendingCommit, RegolithEngine, conclude_settled};
 use crate::{CommitReceipt, CommitTicket, Error};
 
 /// How far `commit_nowait` got before it returned.
 enum Committed {
     /// The outcome is known now.
     Done(TxResult<CommitReceipt>),
-    /// Decided and written; its group owes its fsync. The outcome is member
-    /// `member` of `group`, delivered on `queue`.
+    /// Not published yet: it waits for a write stall to clear before it
+    /// takes its slot, or, decided and written, for its fsync. The outcome
+    /// is in `pending` once it is delivered on `queue`.
     Pending {
-        group: Arc<GroupSync>,
-        member: usize,
+        pending: PendingCommit,
         queue: Arc<QueueShared>,
         scan_runs_dropped: u64,
     },
@@ -56,13 +57,27 @@ impl Transaction {
     /// durable (at [`crate::DurabilityMode::Immediate`]) and visible. Every
     /// outcome comes through the ticket, a conflict included.
     ///
-    /// The commit runs as [`Transaction::commit`] runs it until its group's
-    /// log write: [`Transaction::prepare`] first, then validation in a commit
-    /// group shared with every concurrent commit and write. It never waits for
-    /// the group's fsync: a group that owes one is left owing it as one unit
-    /// shared by every member's queue, which the first member thread to poll
-    /// runs, and the ticket completes on this transaction's queue when it
-    /// lands. A member that committed with a blocking call runs it itself.
+    /// The commit runs as [`Transaction::commit`] runs it until its record
+    /// is written: [`Transaction::prepare`] first, then validation in the
+    /// commit pipeline, in order with every concurrent commit and write. It
+    /// never waits for the log's fsync: the sync is one unit shared by the
+    /// queue of every commit it covers, which the first of their threads to
+    /// poll runs, and the ticket completes on this transaction's queue when
+    /// it lands. A commit made with a blocking call runs it itself. Nor does
+    /// it wait for anything else under way, a memtable rotation or a full
+    /// commit ring: the commit is left on its queue behind that and goes on
+    /// at the poll that finds it done.
+    ///
+    /// A write stall does not end the commit either. A commit that meets a
+    /// stop trigger has not taken its place in the pipeline yet: it is left
+    /// on its queue behind the stall, nothing of it is stored, and at the
+    /// poll that finds the stop relieved it goes on and commits, so its
+    /// ticket completes then. On a database with no worker and
+    /// [`crate::Options::inline_compaction`] on, the queue's polls run the
+    /// steps that relieve the stop too. A commit waiting there is told what
+    /// a write arriving then is told when the stop will not clear (the
+    /// database closed, the engine latched, the relief keeps failing), as
+    /// its outcome.
     ///
     /// - **The queue.** The one [`TxnOptions::io_queue`](super::TxnOptions::io_queue)
     ///   names, else the one this transaction's
@@ -70,10 +85,11 @@ impl Transaction {
     ///   neither, the commit syncs inline, as `commit` does, and the ticket is
     ///   ready when this returns. A queue that is not open on this database
     ///   ends the commit with [`Error::InvalidArgument`].
-    /// - **Ready at return.** A commit whose group needs no fsync (every
-    ///   member at `Eventual` durability), and one decided without the group
-    ///   (a conflict the early check found, a failed `before_commit`
-    ///   callback), returns a ready ticket: its callbacks ran on this thread
+    /// - **Ready at return.** A commit that waits for no fsync (it, and every
+    ///   commit decided before it and not yet visible, at `Eventual`
+    ///   durability), and one decided before the pipeline (a conflict the
+    ///   early check found, a failed `before_commit` callback), returns a
+    ///   ready ticket: its callbacks ran on this thread
     ///   before this returned.
     /// - **Completed on the queue.** Otherwise the outcome is delivered at
     ///   the [`IoQueue::poll`](crate::IoQueue::poll) of this transaction's
@@ -86,13 +102,15 @@ impl Transaction {
     ///   with [`TransactionError::WouldBlock`] in the ticket, and the
     ///   `on_abort` callbacks run. [`OptimisticTransactionDb::transact_async`](super::OptimisticTransactionDb::transact_async)
     ///   prepares first and waits out such a miss instead. The commit's own
-    ///   validation reads the device, as the commit group's leader always
-    ///   does.
+    ///   validation reads only the cache too, whichever thread runs it: a
+    ///   block it needs and the cache does not hold ends the commit with
+    ///   [`TransactionError::WouldBlock`] in the ticket, having taken no
+    ///   sequence and written nothing, and the read is on the queue.
     /// - **Locks and the snapshot.** The snapshot is released when this
     ///   returns. A pessimistic transaction's key locks are held until the
     ///   commit lands (applied and visible, and durable at `Immediate`), so
     ///   no transaction that takes one reads past a commit written but not
-    ///   yet visible. They are released by the thread that lands the group,
+    ///   yet visible. They are released by the thread that lands the commit,
     ///   whether or not this transaction's queue was polled since: another
     ///   transaction never waits for this one's outcome to be delivered.
     ///
@@ -126,8 +144,7 @@ impl Transaction {
                 completion.deliver_decided();
             }
             Committed::Pending {
-                group,
-                member,
+                pending,
                 queue,
                 scan_runs_dropped,
             } => {
@@ -136,15 +153,12 @@ impl Transaction {
                 let ending = self.ending();
                 let stats = engine.statistics_arc();
                 let snapshot_seq = self.snapshot_seq;
-                let waited = Arc::clone(&group);
+                let pending = Arc::new(pending);
+                let waited = Arc::clone(&pending);
                 completion.resolve_with(Box::new(move || {
-                    let settled = conclude_settled(
-                        stats.as_deref(),
-                        Settled::Pending {
-                            group: waited,
-                            member,
-                        },
-                    );
+                    let settled = waited
+                        .settled(stats.as_deref())
+                        .and_then(|settled| conclude_settled(stats.as_deref(), settled));
                     receipt_of(stats.as_deref(), settled, snapshot_seq, scan_runs_dropped)
                 }));
                 let report = Arc::downgrade(&engine);
@@ -156,24 +170,19 @@ impl Transaction {
                     }
                     ending.finish(true, result);
                 }));
-                // Told by whichever thread lands the group, on that thread;
-                // a group that landed already refuses, and they go now.
+                // Told by whichever thread lands the commit, on that thread;
+                // a commit that landed already refuses, and they go now.
                 if let Some(locks) = locks
-                    && !group.job().listen(Arc::clone(&locks) as Arc<dyn Delivery>)
+                    && !pending.listen(Arc::clone(&locks) as Arc<dyn Delivery>)
                 {
                     locks.release();
                 }
                 let waiter: Arc<dyn Delivery> = Arc::clone(&completion) as Arc<dyn Delivery>;
-                if !engine
-                    .io()
-                    .wait_on(&queue, Arc::clone(group.job()), Some(waiter))
-                {
-                    // The queue was dropped since this commit looked it up:
-                    // its drop would have delivered the ticket on its thread,
-                    // so this one does, once the group landed.
-                    group.land_here(&engine);
-                    completion.deliver();
-                }
+                // Told on the queue once the commit is published. A queue
+                // dropped since this commit looked it up would have
+                // delivered the ticket on its thread, so this one does,
+                // once the commit was brought through.
+                engine.await_commit(&pending, &queue, waiter);
             }
         }
         CommitTicket::new(completion)
@@ -197,7 +206,7 @@ impl Transaction {
             return Committed::Done(Err(err));
         }
         let super::Drained {
-            commit,
+            mut commit,
             write_free,
             scan_runs_dropped,
             _contain,
@@ -210,6 +219,9 @@ impl Transaction {
         if write_free {
             return Committed::Done(receipt(engine.commit_write_free(&commit.checks)));
         }
+        // A `CacheOnly` handle never reads the device, in its commit's own
+        // validation either.
+        commit.read_queue = self.read_mode().queue();
         let Some(queue) = queue else {
             // No queue to complete on: the commit syncs inline.
             return Committed::Done(receipt(engine.commit_with_conflict_check(
@@ -223,9 +235,8 @@ impl Transaction {
         };
         match engine.commit_optimistic_nowait(commit) {
             Ok(NowaitCommit::Done(outcome)) => Committed::Done(receipt(Ok(outcome))),
-            Ok(NowaitCommit::Pending { group, member }) => Committed::Pending {
-                group,
-                member,
+            Ok(NowaitCommit::Pending(pending)) => Committed::Pending {
+                pending,
                 queue,
                 scan_runs_dropped,
             },

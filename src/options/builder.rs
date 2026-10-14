@@ -392,13 +392,13 @@ impl Options {
     /// Number of background threads available for compaction.
     ///
     /// `0` starts no background worker at all. Compaction then runs
-    /// on whichever thread asks for it: a writer that reaches a
-    /// write-stall threshold performs a compaction job itself before
-    /// retrying instead of parking on a condvar nobody would ever
-    /// signal. This is the only mode that works on a single-threaded
-    /// host such as `wasm32-wasip1`, where `std::thread::spawn`
-    /// reports [`std::io::ErrorKind::Unsupported`], and it is what
-    /// [`Options::embedded`] selects.
+    /// on whichever thread asks for it: unless
+    /// [`Options::inline_compaction`] was turned off, a writer that
+    /// reaches a write-stall threshold runs the compaction that relieves
+    /// it itself, since nothing else would. This is the only mode that
+    /// works on a single-threaded host such as `wasm32-wasip1`, where
+    /// `std::thread::spawn` reports [`std::io::ErrorKind::Unsupported`],
+    /// and it is what [`Options::embedded`] selects.
     ///
     /// When `> 1`, multiple non-overlapping compaction jobs can
     /// run concurrently (e.g. L1→L2 at key range `[a,m)` on one
@@ -418,10 +418,40 @@ impl Options {
         self
     }
 
+    /// Hand the active write-ahead log to the host's writeback as it fills,
+    /// on a thread of its own, so that the rotation that seals it has little
+    /// left to sync. Off by default.
+    ///
+    /// A rotation makes the log it seals durable before the next log exists,
+    /// inside the step every writer of the database waits on, so syncing a
+    /// whole write buffer's worth of log stalls every writer. With this on,
+    /// each time the log grows by an eighth of [`Options::write_buffer_size`]
+    /// (at least 1 MiB) the thread starts the writeback of what was written,
+    /// and the rotation syncs about that eighth. On Linux the writeback is
+    /// started with `sync_file_range`. On Apple, where the rotation's sync is
+    /// `F_FULLFSYNC` (the pages and the drive's cache), it is a plain `fsync`,
+    /// which writes the pages without the cache flush; an error it gets is
+    /// reported by the log's next sync. Measured on one Linux machine (NVMe,
+    /// btrfs with compression, 32 MiB write buffer): the rotation's stall
+    /// went from about 14 to 24 ms to about 2.5 ms. Not measured on Apple.
+    /// Durability is unchanged: the writeback makes nothing durable, the
+    /// sync at the rotation still does.
+    ///
+    /// It starts one extra thread, named `regolith-log-writeback`, through
+    /// [`Options::env`], only on Linux and Apple targets, and only when a
+    /// compaction worker runs ([`Options::max_background_compactions`] above
+    /// `0`). The database's thread budget then grows by one. Elsewhere it is
+    /// accepted and does nothing.
+    #[must_use]
+    pub fn log_writeback(mut self, log_writeback: bool) -> Self {
+        self.log_writeback = log_writeback;
+        self
+    }
+
     /// With no compaction worker ([`Options::max_background_compactions`]
-    /// `0`), let a write a stall stopped run the step that relieves it.
-    /// Off by default; the [`Options::embedded`] and [`Options::wasm`]
-    /// presets turn it on.
+    /// `0`), whether a write a stall stopped runs the step that relieves it.
+    /// Left unset, it is on for a database with no worker, which could not
+    /// relieve its own stalls otherwise, and off for one that has a worker.
     ///
     /// A write stopped by a stall threshold never waits: it applies nothing
     /// and returns [`crate::Error::WouldBlock`] with a
@@ -435,13 +465,18 @@ impl Options {
     ///   no queue runs the steps inline instead, bounded, and its write goes
     ///   on once they cleared the stall. A slowed write, under a slowdown
     ///   threshold, owes one step the same way.
-    /// - **Off.** The caller clears the stall with [`crate::Db::compact_step`]
-    ///   or [`crate::Db::flush`]; the stopped writes' waits complete then.
+    /// - **Off**, said explicitly: you drive compaction. A stopped write
+    ///   returns its wait, which completes once you cleared the stall with
+    ///   [`crate::Db::compact_step`] or [`crate::Db::flush`]. A transaction's
+    ///   blocking commit is the one writer that still relieves a stop
+    ///   itself, with as many steps as the stop needs and no more, because
+    ///   it cannot be made again and has nobody to wait for; commit with
+    ///   [`crate::Transaction::commit_nowait`] to keep the thread free.
     ///
     /// Ignored when a worker runs.
     #[must_use]
     pub fn inline_compaction(mut self, inline_compaction: bool) -> Self {
-        self.inline_compaction = inline_compaction;
+        self.inline_compaction = Some(inline_compaction);
         self
     }
 

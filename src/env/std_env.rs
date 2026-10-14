@@ -13,6 +13,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 #[cfg(unix)]
 use super::DiskSpace;
+#[cfg(any(unix, windows, target_os = "wasi"))]
+use super::LogFile;
 use super::db_lock;
 use super::{
     Capabilities, DirEntry, Env, FileLock, FileMeta, JoinHandle, ReadDir, ReadFile, WriteFile,
@@ -93,6 +95,26 @@ impl Env for StdEnv {
                 .open(path)?,
         };
         Ok(Box::new(StdWriteFile { file }))
+    }
+
+    /// A log written with positional writes: no cursor, no lock, and no
+    /// `O_APPEND`, under which Linux ignores the offset of a `pwrite`.
+    ///
+    /// Opened with the host's default sharing, as every other file here is:
+    /// on Windows a second handle may read the log while this one writes
+    /// it, which is how a copy of a live directory is taken.
+    #[cfg(any(unix, windows, target_os = "wasi"))]
+    fn open_log(&self, path: &Path, mode: WriteMode) -> io::Result<Box<dyn LogFile>> {
+        let file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(mode == WriteMode::Truncate)
+            .open(path)?;
+        Ok(Box::new(StdLogFile {
+            file,
+            #[cfg(target_vendor = "apple")]
+            writeback: super::deferred_error::DeferredError::default(),
+        }))
     }
 
     fn metadata(&self, path: &Path) -> io::Result<FileMeta> {
@@ -357,6 +379,205 @@ impl WriteFile for StdWriteFile {
 
     fn len(&self) -> io::Result<u64> {
         Ok(self.file.metadata()?.len())
+    }
+}
+
+/// A `std::fs::File` written positionally: the log behind
+/// [`StdEnv::open_log`].
+///
+/// Every write names its own offset, so any number of threads write one
+/// handle at once and none of them waits for another: `pwrite` on Unix and
+/// WASI, `seek_write` on Windows (which moves a cursor nothing here reads).
+#[cfg(any(unix, windows, target_os = "wasi"))]
+#[derive(Debug)]
+struct StdLogFile {
+    file: File,
+    /// An error the log writeback lane's `fsync` got, for the next sync to
+    /// report (`deferred_error.rs`).
+    #[cfg(target_vendor = "apple")]
+    writeback: super::deferred_error::DeferredError,
+}
+
+#[cfg(all(any(unix, target_os = "wasi"), not(miri)))]
+impl StdLogFile {
+    /// One vectored positional write: how many bytes it took. Through the C
+    /// library's `pwritev64`, whose offset is 64 bits on 32-bit hosts too, so
+    /// the fault shim the power-loss tests preload sees it.
+    #[cfg(all(target_os = "linux", any(target_env = "gnu", target_env = "musl")))]
+    fn pwritev(&self, offset: u64, bufs: &[std::io::IoSlice<'_>]) -> io::Result<usize> {
+        use std::os::fd::AsRawFd;
+        let offset = i64::try_from(offset).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "a log offset past what the host can address",
+            )
+        })?;
+        // At most what one call takes; the caller writes the rest after.
+        let count = bufs.len().min(1024);
+        // SAFETY: `IoSlice` is ABI-compatible with `iovec` on Unix, and the
+        // `count` slices it points at are borrowed for the call, which only
+        // reads them. The descriptor is this handle's own and stays open.
+        #[allow(unsafe_code)]
+        let wrote = unsafe {
+            libc::pwritev64(
+                self.file.as_raw_fd(),
+                bufs.as_ptr().cast::<libc::iovec>(),
+                count as libc::c_int,
+                offset,
+            )
+        };
+        usize::try_from(wrote).map_err(|_| io::Error::last_os_error())
+    }
+
+    /// One vectored positional write: how many bytes it took.
+    #[cfg(not(all(target_os = "linux", any(target_env = "gnu", target_env = "musl"))))]
+    fn pwritev(&self, offset: u64, bufs: &[std::io::IoSlice<'_>]) -> io::Result<usize> {
+        rustix::io::pwritev(&self.file, bufs, offset).map_err(io::Error::from)
+    }
+}
+
+#[cfg(any(unix, windows, target_os = "wasi"))]
+impl LogFile for StdLogFile {
+    // Through `std`, which calls the C library's `pwrite`: the fault shim
+    // the power-loss tests preload sees every log write.
+    #[cfg(unix)]
+    fn write_all_at(&self, offset: u64, buf: &[u8]) -> io::Result<()> {
+        std::os::unix::fs::FileExt::write_all_at(&self.file, buf, offset)
+    }
+
+    #[cfg(not(unix))]
+    fn write_all_at(&self, mut offset: u64, mut buf: &[u8]) -> io::Result<()> {
+        while !buf.is_empty() {
+            #[cfg(windows)]
+            let wrote = std::os::windows::fs::FileExt::seek_write(&self.file, buf, offset);
+            #[cfg(target_os = "wasi")]
+            let wrote = rustix::io::pwrite(&self.file, buf, offset).map_err(io::Error::from);
+            match wrote {
+                Ok(0) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "a positional write made no progress",
+                    ));
+                }
+                Ok(n) => {
+                    buf = &buf[n..];
+                    offset += n as u64;
+                }
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    }
+
+    // One `pwritev` for the run of records the log's write unit gathered,
+    // re-issued for what a short write left; one `pwrite` for a run of one. On Linux through the C
+    // library's `pwritev`, as `write_all_at` goes through its `pwrite`, so
+    // the fault shim the power-loss tests preload sees every log write. Miri
+    // cannot call into the C library, and takes the default.
+    #[cfg(all(any(unix, target_os = "wasi"), not(miri)))]
+    fn write_all_vectored_at(
+        &self,
+        mut offset: u64,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> io::Result<()> {
+        // A run of one record is a plain positional write: the kernel
+        // copies no vector for it.
+        if let [one] = bufs {
+            return self.write_all_at(offset, one);
+        }
+        // The slices the call is handed are the caller's; a short write
+        // advances a copy of the list, which stays on the stack for a run of
+        // up to `INLINE` records and takes one allocation past that.
+        const INLINE: usize = 64;
+        let mut inline = [std::io::IoSlice::new(&[]); INLINE];
+        let mut heap = Vec::new();
+        let mut rest: &mut [std::io::IoSlice<'_>] = if bufs.len() <= INLINE {
+            inline[..bufs.len()].copy_from_slice(bufs);
+            &mut inline[..bufs.len()]
+        } else {
+            heap.extend_from_slice(bufs);
+            &mut heap[..]
+        };
+        while !rest.is_empty() {
+            match self.pwritev(offset, rest) {
+                Ok(0) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "a positional write made no progress",
+                    ));
+                }
+                Ok(n) => {
+                    offset += n as u64;
+                    std::io::IoSlice::advance_slices(&mut rest, n);
+                }
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(not(target_vendor = "apple"))]
+    fn sync_data(&self) -> io::Result<()> {
+        self.file.sync_data()
+    }
+
+    // `F_FULLFSYNC` on Apple. It runs after any `fsync` the writeback lane has
+    // in flight, and reports that one's error first if it got one: the host
+    // may report a failed page to one sync and not the next.
+    #[cfg(target_vendor = "apple")]
+    fn sync_data(&self) -> io::Result<()> {
+        self.writeback.sync(|| self.file.sync_data())
+    }
+
+    fn set_len(&self, len: u64) -> io::Result<()> {
+        self.file.set_len(len)
+    }
+
+    fn len(&self) -> io::Result<u64> {
+        Ok(self.file.metadata()?.len())
+    }
+
+    // `sync_file_range` with `SYNC_FILE_RANGE_WRITE` alone starts the
+    // writeback of the range's dirty pages and waits for none of it. It does
+    // not move the file's writeback error past this handle, so `fdatasync`
+    // still reports a page that failed; a writeback it could not start leaves
+    // the pages dirty for that sync. So its result is not needed. Miri cannot
+    // call into the C library.
+    // Apple has no call that starts writeback without waiting for it, so the
+    // lane, on its own thread, writes the pages out with a plain `fsync`: no
+    // drive cache flush, which the seal's `F_FULLFSYNC` adds. The whole file,
+    // whatever the range. A failed one is kept for the next sync of this
+    // handle to report, never dropped (`deferred_error.rs`).
+    #[cfg(target_vendor = "apple")]
+    fn start_writeback(&self, _offset: u64, _len: u64) {
+        self.writeback.writeback(|| {
+            #[cfg(test)]
+            if log_tests::FAIL_WRITEBACK.with(std::cell::Cell::take) {
+                return Err(io::Error::other("injected writeback failure"));
+            }
+            rustix::fs::fsync(&self.file).map_err(io::Error::from)
+        });
+    }
+
+    #[cfg(all(target_os = "linux", not(miri)))]
+    fn start_writeback(&self, offset: u64, len: u64) {
+        use std::os::fd::AsRawFd;
+        let (Ok(offset), Ok(len)) = (i64::try_from(offset), i64::try_from(len)) else {
+            return;
+        };
+        // SAFETY: the descriptor is this handle's own and stays open for the
+        // call, which reads and writes no memory of this process.
+        #[allow(unsafe_code)]
+        let _ = unsafe {
+            libc::sync_file_range(
+                self.file.as_raw_fd(),
+                offset,
+                len,
+                libc::SYNC_FILE_RANGE_WRITE,
+            )
+        };
     }
 }
 
@@ -675,5 +896,101 @@ mod tests {
     fn drop_page_cache_on_a_missing_path_is_silent() {
         let dir = TempDir::new().unwrap();
         std_env().drop_page_cache(&dir.path().join("never_existed"));
+    }
+}
+
+#[cfg(test)]
+mod log_tests {
+    use crate::env::{WriteMode, std_env};
+    use tempfile::TempDir;
+
+    #[cfg(target_vendor = "apple")]
+    std::thread_local! {
+        /// Set: the next writeback this thread starts on a log fails.
+        pub(super) static FAIL_WRITEBACK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// On Apple a writeback is a plain `fsync`, and an error it got is
+    /// reported by the next sync of the handle, once; one that succeeds
+    /// leaves the next sync as it was.
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn a_failed_writeback_is_reported_by_the_next_sync_of_the_log() {
+        let dir = TempDir::new().unwrap();
+        let env = std_env();
+        let log = env
+            .open_log(&dir.path().join("log"), WriteMode::Truncate)
+            .unwrap();
+        log.write_all_at(0, b"0123").unwrap();
+        log.start_writeback(0, 4);
+        log.sync_data().unwrap();
+
+        log.write_all_at(4, b"4567").unwrap();
+        FAIL_WRITEBACK.with(|fail| fail.set(true));
+        log.start_writeback(0, 8);
+        let err = log.sync_data().unwrap_err();
+        assert!(err.to_string().contains("injected"), "{err}");
+        log.sync_data().unwrap();
+        assert_eq!(env.read(&dir.path().join("log")).unwrap(), b"01234567");
+    }
+
+    #[test]
+    fn positional_writes_land_at_their_offsets_in_any_order() {
+        let dir = TempDir::new().unwrap();
+        let env = std_env();
+        let path = dir.path().join("log");
+        let log = env.open_log(&path, WriteMode::Truncate).unwrap();
+        log.write_all_at(8, b"89ab").unwrap();
+        log.write_all_at(0, b"0123").unwrap();
+        log.write_all_at(4, b"4567").unwrap();
+        // The same bytes again: the contract every helper relies on.
+        log.write_all_at(4, b"4567").unwrap();
+        log.sync_data().unwrap();
+        assert_eq!(log.len().unwrap(), 12);
+        assert_eq!(env.read(&path).unwrap(), b"0123456789ab");
+    }
+
+    #[test]
+    fn a_log_opened_for_update_keeps_its_bytes_and_is_cut_by_set_len() {
+        let dir = TempDir::new().unwrap();
+        let env = std_env();
+        let path = dir.path().join("log");
+        env.write(&path, b"stamp+tail").unwrap();
+        let log = env.open_log(&path, WriteMode::Update).unwrap();
+        assert_eq!(log.len().unwrap(), 10);
+        log.set_len(5).unwrap();
+        log.write_all_at(5, b"=next").unwrap();
+        assert_eq!(env.read(&path).unwrap(), b"stamp=next");
+    }
+
+    /// Many threads write disjoint records of one log at once, each record
+    /// twice: nothing is lost and nothing lands in another record's range.
+    #[test]
+    fn concurrent_positional_writes_do_not_disturb_each_other() {
+        const THREADS: usize = 8;
+        const RECORDS: usize = 200;
+        const LEN: usize = 37;
+        let dir = TempDir::new().unwrap();
+        let env = std_env();
+        let path = dir.path().join("log");
+        let log: std::sync::Arc<dyn crate::env::LogFile> =
+            std::sync::Arc::from(env.open_log(&path, WriteMode::Truncate).unwrap());
+        std::thread::scope(|scope| {
+            for t in 0..THREADS {
+                let log = std::sync::Arc::clone(&log);
+                scope.spawn(move || {
+                    for r in (0..RECORDS).filter(|r| r % THREADS == t) {
+                        let bytes = vec![(r % 251) as u8; LEN];
+                        log.write_all_at((r * LEN) as u64, &bytes).unwrap();
+                        log.write_all_at((r * LEN) as u64, &bytes).unwrap();
+                    }
+                });
+            }
+        });
+        let got = env.read(&path).unwrap();
+        assert_eq!(got.len(), RECORDS * LEN);
+        for (r, chunk) in got.chunks(LEN).enumerate() {
+            assert!(chunk.iter().all(|b| *b == (r % 251) as u8), "record {r}");
+        }
     }
 }

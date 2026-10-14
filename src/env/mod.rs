@@ -36,8 +36,11 @@
 
 mod buffered;
 mod db_lock;
+#[cfg(any(target_vendor = "apple", test))]
+mod deferred_error;
 mod mem_env;
 pub(crate) mod mem_file;
+mod mem_log;
 pub(crate) mod open_file_limit;
 mod types;
 // The browser's Origin Private File System. Only compiled for
@@ -48,6 +51,7 @@ pub mod opfs;
 // Pure, so it is unit-tested on the host as well as built for OPFS.
 #[cfg(any(test, all(target_arch = "wasm32", target_os = "unknown")))]
 mod persist_order;
+mod serial_log;
 mod std_env;
 #[cfg(test)]
 pub(crate) mod walk_fault;
@@ -150,6 +154,31 @@ pub trait Env: Send + Sync + std::fmt::Debug {
 
     /// Open `path` for writing, creating it if it does not exist.
     fn open_write(&self, path: &Path, mode: WriteMode) -> io::Result<Box<dyn WriteFile>>;
+
+    /// Open `path` as a write-ahead log written at explicit offsets,
+    /// creating it if it does not exist.
+    ///
+    /// [`WriteMode::Truncate`] starts an empty log. Any other mode keeps
+    /// what the file holds, so writes continue above it.
+    ///
+    /// The default is for an environment outside this crate that has not
+    /// said how it writes at an offset. It opens the file with
+    /// [`Env::open_write`] and puts the writes in offset order behind a
+    /// lock, holding a write that arrives ahead of a gap until the gap is
+    /// filled. That is always correct, and it is the one place a committing
+    /// thread waits for another to write.
+    ///
+    /// No environment of this crate uses the default. Every one a database
+    /// runs on has a log no write of which waits for another: [`StdEnv`]
+    /// and the WASI environment write at an offset on the host, [`MemEnv`]
+    /// appends without a lock, and the OPFS environment writes at an
+    /// offset of its handle or its mirror. An environment that wraps
+    /// another forwards to the one it wraps, and wraps the log it is handed
+    /// when it counts, fails or records writes. An environment of your own
+    /// that can write at an offset should override this too.
+    fn open_log(&self, path: &Path, mode: WriteMode) -> io::Result<Box<dyn LogFile>> {
+        Ok(Box::new(serial_log::SerialLog::open(self, path, mode)?))
+    }
 
     /// Size and kind of the entry at `path`.
     fn metadata(&self, path: &Path) -> io::Result<FileMeta>;
@@ -317,7 +346,7 @@ pub trait WriteFile: Send {
     /// always correct. An environment backed by a POSIX file overrides this
     /// with `writev` so a record assembled from a header and a payload costs
     /// one syscall rather than one per piece. That matters on the WAL path,
-    /// which appends a large commit group that way.
+    /// which appends a large record that way when a log is rewritten.
     ///
     /// This is a throughput and syscall-count optimization, NOT an atomicity
     /// guarantee: a vectored write can still be torn by a crash, exactly as a
@@ -379,6 +408,98 @@ pub trait WriteFile: Send {
     /// Whether the file holds no bytes.
     fn is_empty(&self) -> io::Result<bool> {
         Ok(self.len()? == 0)
+    }
+}
+
+/// A write-ahead log file, written at explicit offsets by any number of
+/// threads at once. Opened by [`Env::open_log`].
+///
+/// regolith's commit pipeline gives every commit its byte range in the log
+/// before anything is written, and then lets whichever thread gets there
+/// first write that range. So unlike a [`WriteFile`], this handle has no
+/// cursor and every method takes `&self`.
+///
+/// # Contract
+///
+/// - **Idempotent writes.** Two calls that name the same offset always carry
+///   the same bytes, and may run at the same time. An implementation may
+///   perform both or only one; the range must end up holding those bytes.
+/// - **Out of order.** A write may land above a range nothing has written
+///   yet. That gap is filled by a later write before any
+///   [`sync_data`](LogFile::sync_data) is expected to cover the bytes above
+///   it: a sync makes durable every byte below the lowest offset never
+///   written, the contiguous written prefix, and may cover more.
+/// - **No write returns before its bytes are held.** Once
+///   [`write_all_at`](LogFile::write_all_at) returns `Ok`, a sync that covers
+///   the range makes it durable, and a reader opened on the path sees the
+///   bytes once every lower offset is written too.
+/// - **Truncation.** [`set_len`](LogFile::set_len) is called only to cut the
+///   file back to an offset where a write began, and only while no write
+///   that reaches that offset or beyond is in flight. A write that lies
+///   wholly below the new length may run at the same time, and its range
+///   holds its bytes afterwards as if the cut had not happened.
+///
+/// # Misuse
+///
+/// Two writes of different bytes to one offset, or a `set_len` racing a
+/// write that reaches the new length, leave the range holding either write
+/// or a mixture; replay then reads the range as a torn tail.
+pub trait LogFile: Send + Sync {
+    /// Write every byte of `buf` at `offset`, extending the file as needed.
+    fn write_all_at(&self, offset: u64, buf: &[u8]) -> io::Result<()>;
+
+    /// Write every byte of `bufs` at `offset`, one buffer right after the
+    /// other, extending the file as needed: several whole records the log
+    /// writes with one call. The contract is [`write_all_at`]'s for the
+    /// concatenated bytes; an error may leave any part of them written.
+    ///
+    /// The default writes each buffer in turn with
+    /// [`write_all_at`](LogFile::write_all_at). An implementation that has
+    /// a vectored positional write (`pwritev`) should use it: the log then
+    /// takes one call, and on most filesystems one turn of the file's lock,
+    /// for many records.
+    ///
+    /// [`write_all_at`]: LogFile::write_all_at
+    fn write_all_vectored_at(&self, offset: u64, bufs: &[io::IoSlice<'_>]) -> io::Result<()> {
+        let mut at = offset;
+        for buf in bufs {
+            self.write_all_at(at, buf)?;
+            at += buf.len() as u64;
+        }
+        Ok(())
+    }
+
+    /// Make the contiguous written prefix durable, data only (`fdatasync`),
+    /// as [`WriteFile::sync_data`] does.
+    ///
+    /// An environment whose [`Capabilities::durable_sync`] is `false` may
+    /// return `Ok(())` without providing durability.
+    fn sync_data(&self) -> io::Result<()>;
+
+    /// Cut the file to exactly `len` bytes.
+    fn set_len(&self, len: u64) -> io::Result<()>;
+
+    /// Length of the file in bytes, counting only what has reached the host.
+    fn len(&self) -> io::Result<u64>;
+
+    /// Whether the file holds no bytes.
+    fn is_empty(&self) -> io::Result<bool> {
+        Ok(self.len()? == 0)
+    }
+
+    /// Start writing the `len` bytes at `offset`, all written already, back
+    /// to the device: a hint that leaves less for the next
+    /// [`sync_data`](LogFile::sync_data) to write. Called on a thread of its
+    /// own (`Options::log_writeback`), so it may wait for the writes, as the
+    /// standard environment's does on Apple.
+    ///
+    /// It makes nothing durable and returns nothing. An implementation
+    /// that cannot start the writeback does nothing, as the default does;
+    /// the bytes are then written by the next sync, which reports any
+    /// failure. The hint must not hide a failure from that sync: one it
+    /// meets is reported by the next sync of the same handle.
+    fn start_writeback(&self, offset: u64, len: u64) {
+        let _ = (offset, len);
     }
 }
 

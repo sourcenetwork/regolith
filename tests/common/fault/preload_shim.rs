@@ -12,7 +12,8 @@
 //!
 //! regolith performs every write through `std::fs`, which on
 //! `*-linux-gnu` calls the glibc `write`/`pwrite64`/`writev`/`fsync`/
-//! `fdatasync`/`open64`/`openat` symbols through the PLT. It uses `rustix`
+//! `fdatasync`/`open64`/`openat` symbols through the PLT, and through the
+//! glibc `pwritev` for a run of log records. It uses `rustix`
 //! (raw syscalls, NOT interposable) only for `flock`, `fadvise` and the
 //! positional reads of its tables (`pread`), none of which writes file data.
 //! There is no `mmap` write path.
@@ -103,6 +104,7 @@ extern "C" {
 type WriteFn = unsafe extern "C" fn(c_int, *const c_void, usize) -> isize;
 type PwriteFn = unsafe extern "C" fn(c_int, *const c_void, usize, i64) -> isize;
 type WritevFn = unsafe extern "C" fn(c_int, *const c_void, c_int) -> isize;
+type PwritevFn = unsafe extern "C" fn(c_int, *const c_void, c_int, i64) -> isize;
 type SyncFn = unsafe extern "C" fn(c_int) -> c_int;
 type OpenFn = unsafe extern "C" fn(*const c_char, c_int, ...) -> c_int;
 type OpenatFn = unsafe extern "C" fn(c_int, *const c_char, c_int, ...) -> c_int;
@@ -350,6 +352,18 @@ fn contains(hay: &[u8], needle: &str) -> bool {
     hay.windows(n.len()).any(|w| w == n)
 }
 
+/// Whether `path` is tracked: under the database directory, or that
+/// directory itself. The root carries a trailing separator to keep the
+/// harness's own files beside the directory out; the directory is matched
+/// whole so that its own sync, which makes the names of the files directly
+/// in it durable, is recorded too.
+fn tracked(path: &[u8], root: &str) -> bool {
+    contains(path, root) || {
+        let dir = root.trim_end_matches('/');
+        !dir.is_empty() && (path == dir.as_bytes() || path.strip_suffix(b"/") == Some(dir.as_bytes()))
+    }
+}
+
 fn tag_of(fd: c_int) -> u8 {
     if fd < 0 || fd as usize >= MAX_FD {
         return TAG_UNTRACKED;
@@ -379,7 +393,7 @@ unsafe fn maybe_die(kind: u8, tag: u8) {
 }
 
 unsafe fn after_open(fd: c_int, path: &[u8], flags: c_int) {
-    if fd < 0 || !contains(path, &config().root) {
+    if fd < 0 || !tracked(path, &config().root) {
         if fd >= 0 {
             set_tag(fd, TAG_UNTRACKED);
         }
@@ -451,6 +465,48 @@ pub unsafe extern "C" fn pwrite64(fd: c_int, buf: *const c_void, count: usize, o
 #[no_mangle]
 pub unsafe extern "C" fn pwrite(fd: c_int, buf: *const c_void, count: usize, off: i64) -> isize {
     pwrite64(fd, buf, count, off)
+}
+
+/// One `struct iovec`: what `pwritev` and `writev` take a list of.
+#[repr(C)]
+struct IoVec {
+    base: *const c_void,
+    len: usize,
+}
+
+/// The bytes the `count` buffers at `iov` hold together: what one vectored
+/// write asks to write.
+unsafe fn iov_len(iov: *const c_void, count: c_int) -> usize {
+    let iov = iov.cast::<IoVec>();
+    (0..count.max(0) as usize).map(|i| (*iov.add(i)).len).sum()
+}
+
+/// A positional vectored write: the log's write unit puts a run of records
+/// at one offset with one of these (`commit::write_unit`), journaled as one
+/// write of the bytes its buffers hold together.
+#[no_mangle]
+pub unsafe extern "C" fn pwritev64(fd: c_int, iov: *const c_void, iovcnt: c_int, off: i64) -> isize {
+    let real = real!(pv, PwritevFn, "pwritev64");
+    let g = Guard::enter();
+    let tag = tag_of(fd);
+    if !g.active() || tag == TAG_UNTRACKED {
+        return real(fd, iov, iovcnt, off);
+    }
+    if config().die_before {
+        maybe_die(DIE_WRITE, tag);
+    }
+    let count = iov_len(iov, iovcnt);
+    let ret = real(fd, iov, iovcnt, off);
+    emit(b'W', fd, off, count as i64, ret as i64, b"");
+    if !config().die_before {
+        maybe_die(DIE_WRITE, tag);
+    }
+    ret
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pwritev(fd: c_int, iov: *const c_void, iovcnt: c_int, off: i64) -> isize {
+    pwritev64(fd, iov, iovcnt, off)
 }
 
 #[no_mangle]

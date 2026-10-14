@@ -10,23 +10,37 @@
 \* The counter is not part of any transaction. The reservation happens in the
 \* one step of the engine that handles one write at a time, the ordered step
 \* (RegolithEngine::allocate, src/engine/commit/allocate.rs): it reads the
-\* counter, adds n, and writes the new counter to the write-ahead log before
-\* it returns. It does not wait for the disk.
+\* counter, adds n, and takes the place of its record, the new counter, in
+\* the write-ahead log's order before it returns. The record itself is
+\* written by whatever passes that place next (a later commit, a flush,
+\* close), so the caller does no I/O for it and does not wait for the disk.
 \*
 \* Tiny example of what can go wrong. Suppose the counter lived only in
 \* memory and its record reached the log later. A caller is handed 1, and
 \* commits a document with id 1; that commit is synced to disk. The power is
 \* cut before the record "1 was handed out" reaches the disk. After the
 \* restart the counter is 0 again, the next caller is handed 1 as well, and
-\* two documents carry id 1. Because the engine writes the reservation before
-\* allocate returns, the log always holds it ahead of any commit that uses
-\* the value, and a power cut keeps a front part of the log: whenever the
-\* use survives, so does the reservation.
+\* two documents carry id 1. Because the reservation takes its place in the
+\* log's order before allocate returns, the log always holds it ahead of
+\* any commit that uses the value, and a power cut keeps a front part of the
+\* log: whenever the use survives, so does the reservation.
+\*
+\* Tiny example two, without a power cut. The caller is handed its numbers
+\* as soon as its reservation takes its place in the log's order, before the
+\* record is published (RegolithEngine::allocate returns once its slot is
+\* decided). A commit ahead of it then fails its sync: the log is rolled
+\* back past every record not yet published, the reservation's included,
+\* and the database goes on. The caller still holds 1..3 and will commit
+\* with them. If the counter went back with the log, the next caller would
+\* be handed 1..3 as well. So the rollback writes the discarded
+\* reservations' counter back (RegolithEngine::write_back_reservations,
+\* src/engine/commit/allocate.rs) before any later slot is decided.
 \*
 \* What this model shows: over every interleaving of a few callers, commits,
-\* aborts, syncs and a power cut, no number is handed out twice, ranges only
-\* grow, allocation never makes a transaction fail, and a number used by a
-\* commit that survived is never handed out again. (Plan 3.7.)
+\* aborts, syncs, log failures and a power cut, no number is handed out
+\* twice, ranges only grow, allocation never makes a transaction fail, and
+\* a number used by a commit that survived is never handed out again. (Plan
+\* 3.7.)
 \*
 \* PROVED FOR EVERY SIZE in Lean, proofs/lean/Regolith/Allocate.lean:
 \*   step_inv, reachable_inv   every allocation starts right after the
@@ -48,12 +62,15 @@
 \* callers, their commits and aborts, syncs and a power cut.
 \*
 \* THE DESIGN (plan 3.7), and the code that implements it.
-\*   Db::allocate     runs in the ordered step (RegolithEngine::allocate,
-\*     src/engine/commit/allocate.rs, under the pipeline mutex): it reads the
+\*   Db::allocate     runs in the ordered step (RegolithEngine::allocate
+\*     and decide_allocation, src/engine/commit/allocate.rs: it takes a slot
+\*     of the commit ring like a write, decided in ring order): it reads the
 \*     counter key from the decided prefix (the log), reserves
-\*     [c + 1, c + n], and writes an allocation record with the new counter
-\*     to the WAL (a put of the counter key, with durability Eventual). It
-\*     returns without a sync: the caller does not wait for the device.
+\*     [c + 1, c + n], and takes the place of an allocation record with the
+\*     new counter in the WAL's order (a put of the counter key, with
+\*     durability Eventual). It returns without writing or syncing: the
+\*     record is written by whatever passes its place next. `wal` below is
+\*     that order; a record is written by the time anything after it is.
 \*   A commit that uses a value is ordered after the allocation that
 \*     returned it, because allocate returned before the commit began. So
 \*     the WAL holds the allocation record first.
@@ -65,6 +82,13 @@
 \*   Aborts           a transaction that aborts after allocating leaves its
 \*     values unused: gaps, like a SQL sequence.
 \*
+\*   Log failures     a failed log write or sync discards every record not
+\*     yet published (a commit here is published when it returns; a
+\*     reservation is published by whatever passes it next). The rollback
+\*     writes the counter back, at the last value a discarded reservation
+\*     handed out, as a record of its own. (Lean does not model log
+\*     failures: TLC checks INV_HandedOutOnce and INV_UseCovered here.)
+\*
 \* THE MISUSES (REDs).
 \*   Mutant = "InTxn"        the counter is read and written inside the
 \*     caller's transaction, as an ordinary validated write in its write
@@ -75,6 +99,9 @@
 \*     before the allocation record. A crash then keeps the use and drops
 \*     the allocation, the counter recovers too low, and the value is
 \*     handed out again.
+\*   Mutant = "ForgetOnRollback"  the rollback discards the reservations
+\*     and writes nothing back. The counter goes back with the log, and a
+\*     number a caller still holds is handed out again, with no power cut.
 \*
 \* READINGS CHOSEN WHERE THE PLAN LEAVES ROOM.
 \*   - One counter key. Two keys are two copies of this model that share
@@ -86,9 +113,9 @@
 \*   - "A committed use implies its allocation is durable" is checked on
 \*     the durable prefix: every use in a durable commit record is covered
 \*     by a durable allocation record (INV_UseDurable).
-\*   - The ordered step is sequential (the commit mutex or the decide stage
-\*     of 4.7), so each allocation is one step; group commit adds nothing a
-\*     sequential order of records does not have.
+\*   - The ordered step is sequential (slots are decided one at a time, in
+\*     ring order), so each allocation is one step; commits that share a
+\*     sync add nothing a sequential order of records does not have.
 \*   - A lazily logged allocation (LogAfterUse) is logged in the order it
 \*     was handed out, so only the use-before-allocation order is wrong.
 \*
@@ -103,6 +130,11 @@
 \*                                   INV_UsesUnique fails: the value really
 \*                                   is used twice after a crash
 \*   MC_Allocate_Teeth_InTxn, MC_Allocate_Teeth_LogAfterUse   GREEN
+\*   MC_Allocate_Green_Rollback      log failures and a power cut:
+\*                                   INV_HandedOutOnce and INV_UseCovered
+\*                                   hold, with the others
+\*   MC_Allocate_Red_ForgetOnRollback
+\*                                   INV_HandedOutOnce fails
 
 \* Borrow the standard TLA+ books: counting numbers, lists, and sizes of finite sets.
 EXTENDS Naturals, Sequences, FiniteSets
@@ -120,16 +152,20 @@ CONSTANTS
   Durability,
   \* The largest number of power cuts the model injects.
   MaxCrashes,
-  \* "none" for the design the engine implements, or the planted bug: "InTxn" or "LogAfterUse".
+  \* The largest number of log failures the model injects; 0 leaves the model as it was before
+  \* they were added.
+  Fails,
+  \* "none" for the design the engine implements, or the planted bug: "InTxn", "LogAfterUse" or
+  \* "ForgetOnRollback".
   Mutant
 
 \* Each caller reserves at least one value, only callers may abort, and the power-cut budget is a
 \* number.
-ASSUME N \in Nat \ {0} /\ MayAbort \subseteq Clients /\ MaxCrashes \in Nat
+ASSUME N \in Nat \ {0} /\ MayAbort \subseteq Clients /\ MaxCrashes \in Nat /\ Fails \in Nat
 \* The durability is one of the two modes.
 ASSUME Durability \in {"Immediate", "Eventual"}
-\* The mutant is "none" or one of the two planted bugs.
-ASSUME Mutant \in {"none", "InTxn", "LogAfterUse"}
+\* The mutant is "none" or one of the three planted bugs.
+ASSUME Mutant \in {"none", "InTxn", "LogAfterUse", "ForgetOnRollback"}
 
 \* The state: everything that changes from one step to the next. Each line says what the variable
 \* stands for in the real program.
@@ -152,10 +188,23 @@ VARIABLES
   \* oldest first.
   late,
   \* How many power cuts happened so far.
-  crashes
+  crashes,
+  \* How many records, counted from the start of the log, are published: a commit when it returns,
+  \* a reservation by whatever passes it next. Moves only in a run that follows log failures.
+  pub,
+  \* How many log failures happened so far.
+  fails,
+  \* Every number handed out since the last power cut. Moves only in a run that follows log
+  \* failures.
+  given,
+  \* Whether a reservation handed out a number already in `given`.
+  twice
 
 \* Every variable, so a step that changes none of them is a stutter.
-vars == <<wal, durable, phase, held, snap, mem, late, crashes>>
+vars == <<wal, durable, phase, held, snap, mem, late, crashes, pub, fails, given, twice>>
+
+\* The variables of log failures, for the steps that leave them alone.
+failVars == <<pub, fails, given, twice>>
 
 \* A caller's phases: not begun, open (InTxn: its transaction has read the
 \* counter), holding values, committed, aborted by its own logic, aborted
@@ -185,6 +234,12 @@ CommitRec(c, us, ctr) ==
   \* A record of kind "commit": the caller, no range, the values used, and the counter it writes (0
   \* for none).
   [kind |-> "commit", c |-> c, lo |-> 0, hi |-> 0, uses |-> us, counter |-> ctr]
+
+\* The rollback's write-back: no caller, nothing allocated, nothing used,
+\* the counter set to v.
+WriteBackRec(v) ==
+  \* A record of kind "writeback" that only writes the counter.
+  [kind |-> "writeback", c |-> "", lo |-> 0, hi |-> 0, uses |-> {}, counter |-> v]
 
 \* The counter key after the first n records: the last value written to
 \* it, 0 when absent.
@@ -225,6 +280,14 @@ Init ==
   /\ late    = <<>>
   \* No power cut happened.
   /\ crashes = 0
+  \* Nothing is published.
+  /\ pub     = 0
+  \* No log failure happened.
+  /\ fails   = 0
+  \* No number was handed out.
+  /\ given   = {}
+  \* No number was handed out twice.
+  /\ twice   = FALSE
 
 \* The design: caller c's allocate runs in the ordered step. It reads the
 \* counter from the log, reserves the next N values, and writes the
@@ -251,14 +314,24 @@ Allocate(c) ==
                   /\ late' = Append(late, r)
                   \* and the log is not written.
                   /\ UNCHANGED wal
-             \* In the design the record is written to the log before allocate returns,
+             \* In the design the record takes its place in the log's order before allocate returns,
              ELSE /\ wal' = Append(wal, r)
                   \* and the bug's variables are untouched.
                   /\ UNCHANGED <<mem, late>>
   \* The caller holds values now.
   /\ phase' = [phase EXCEPT ![c] = "holding"]
-  \* Nothing is synced: the on-disk count, the snapshots and the power cuts stay.
-  /\ UNCHANGED <<durable, snap, crashes>>
+  \* In a run that follows log failures, what it hands out is noted, and whether a number in it was
+  \* handed out before since the last power cut.
+  /\ LET base == IF Mutant = "LogAfterUse" THEN mem ELSE CounterIn(Len(wal))
+         \* The numbers handed out.
+         range == (base + 1)..(base + N)
+     \* Noted only when log failures are followed.
+     IN /\ given' = IF Fails > 0 THEN given \cup range ELSE given
+        \* Handed out twice: one of them was handed out already.
+        /\ twice' = IF Fails > 0 THEN twice \/ range \cap given # {} ELSE twice
+  \* Nothing is synced or published: the on-disk count, the snapshots, the power cuts and the
+  \* failures stay.
+  /\ UNCHANGED <<durable, snap, crashes, pub, fails>>
 
 \* LogAfterUse only: the oldest lazily logged allocation reaches the WAL.
 LogLate ==
@@ -270,6 +343,8 @@ LogLate ==
   /\ late' = Tail(late)
   \* Nothing else changes.
   /\ UNCHANGED <<durable, phase, held, snap, mem, crashes>>
+  \* Log failures are not followed with this bug.
+  /\ UNCHANGED failVars
 
 \* Caller c's transaction commits, using every value it holds. Under
 \* Immediate the commit syncs the WAL, which makes every earlier record
@@ -283,8 +358,10 @@ Commit(c) ==
   /\ durable' = IF Durability = "Immediate" THEN Len(wal) + 1 ELSE durable
   \* The caller is done.
   /\ phase'   = [phase EXCEPT ![c] = "done"]
+  \* A commit returns published, and so is every record before it: it wrote them on its way.
+  /\ pub'     = IF Fails > 0 THEN Len(wal) + 1 ELSE pub
   \* Nothing else changes.
-  /\ UNCHANGED <<held, snap, mem, late, crashes>>
+  /\ UNCHANGED <<held, snap, mem, late, crashes, fails, given, twice>>
 
 \* InTxn only: caller c's transaction reads the counter in its snapshot.
 BeginInTxn(c) ==
@@ -298,6 +375,8 @@ BeginInTxn(c) ==
   /\ phase' = [phase EXCEPT ![c] = "open"]
   \* Nothing else changes.
   /\ UNCHANGED <<wal, durable, held, mem, late, crashes>>
+  \* Log failures are not followed with this bug.
+  /\ UNCHANGED failVars
 
 \* InTxn only: the transaction commits counter = snapshot + N and uses the
 \* values it took. Its read of the counter is validated: if another commit
@@ -307,6 +386,8 @@ CommitInTxn(c) ==
   /\ Mutant = "InTxn"
   \* The caller's transaction is open.
   /\ phase[c] = "open"
+  \* Log failures are not followed with this bug.
+  /\ UNCHANGED failVars
   \* Is the counter still what the transaction read?
   /\ IF CounterIn(Len(wal)) = snap[c]
        \* Yes: it commits one record that uses the next N values and writes the new counter.
@@ -335,6 +416,8 @@ Abort(c) ==
   /\ phase' = [phase EXCEPT ![c] = "aborted"]
   \* Nothing is written; the values it held stay reserved.
   /\ UNCHANGED <<wal, durable, held, snap, mem, late, crashes>>
+  \* Nothing is published or failed.
+  /\ UNCHANGED failVars
 
 \* A sync makes every written record durable: a background sync under
 \* Eventual, or any other commit's sync.
@@ -343,8 +426,11 @@ Sync ==
   /\ durable < Len(wal)
   \* Now every written record is.
   /\ durable' = Len(wal)
+  \* A sync covers records already written, and is followed by their publication: a record on
+  \* disk is one every thread may publish, and a rollback publishes it rather than discard it.
+  /\ pub'     = IF Fails > 0 THEN Len(wal) ELSE pub
   \* Nothing else changes.
-  /\ UNCHANGED <<wal, phase, held, snap, mem, late, crashes>>
+  /\ UNCHANGED <<wal, phase, held, snap, mem, late, crashes, fails, given, twice>>
 
 \* A power cut keeps a gap-free prefix of the records holding every
 \* durable one. Callers in the middle of a transaction die with the
@@ -373,8 +459,41 @@ Crash ==
   /\ late'    = <<>>
   \* One more power cut happened.
   /\ crashes' = crashes + 1
+  \* Recovery replays every record that survived, and publishes it.
+  /\ pub'     = IF Fails > 0 THEN durable' ELSE pub
+  \* A number handed out before a power cut and used by no surviving commit may come back (the
+  \* plan allows it); INV_UsesUnique checks the ones that were used.
+  /\ given'   = IF Fails > 0 THEN {} ELSE given
   \* What the callers were handed is not taken back: they may have shown it to the outside world.
-  /\ UNCHANGED <<held, snap>>
+  /\ UNCHANGED <<held, snap, fails, twice>>
+
+\* A log write or sync fails (RegolithEngine::roll_back, src/engine/commit/ordered.rs): every
+\* record not yet published is cut from the log, and the database goes on. The callers keep what
+\* they were handed. The rollback writes the counter back, at the last value a discarded
+\* reservation handed out, before anything later is decided; the bug ForgetOnRollback does not.
+Fail ==
+  \* Only in a run that follows log failures, while the budget lasts.
+  /\ fails < Fails
+  \* Some record is not published.
+  /\ pub < Len(wal)
+  \* cut: the discarded records; v: the last value a discarded reservation handed out.
+  /\ LET cut  == {k \in (pub + 1)..Len(wal) : wal[k].kind = "alloc"}
+         \* The largest value they handed out, 0 for none.
+         v    == IF cut = {} THEN 0 ELSE Max({wal[k].hi : k \in cut})
+         \* The log as the rollback leaves it, the write-back appended.
+         kept == SubSeq(wal, 1, pub)
+     \* The rollback cuts the log, and writes the counter back unless the bug forgets.
+     IN /\ wal' = IF cut # {} /\ Mutant # "ForgetOnRollback"
+                    \* A reservation was discarded: the kept log, then the write-back.
+                    THEN Append(kept, WriteBackRec(v))
+                    \* None was, or the bug forgets: the kept log alone.
+                    ELSE kept
+        \* The write-back is written by the rollback, which publishes it.
+        /\ pub' = Len(wal')
+  \* One more log failure happened.
+  /\ fails' = fails + 1
+  \* Nothing on disk was cut: a record on disk is published.
+  /\ UNCHANGED <<durable, phase, held, snap, mem, late, crashes, given, twice>>
 
 \* Every step the system can take.
 Next ==
@@ -386,6 +505,8 @@ Next ==
   \/ Sync
   \* The power is cut.
   \/ Crash
+  \* The log fails, and is rolled back past what is not published.
+  \/ Fail
 
 \* Every behaviour: start in Init, then take Next steps or stutter.
 Spec == Init /\ [][Next]_vars
@@ -407,6 +528,14 @@ TypeOK ==
   /\ mem \in Nat
   \* No more power cuts than the budget.
   /\ crashes \in 0..MaxCrashes
+  \* The published count is at most the log's length.
+  /\ pub \in 0..Len(wal)
+  \* No more log failures than the budget.
+  /\ fails \in 0..Fails
+  \* The numbers handed out are a set of numbers.
+  /\ given \in SUBSET Nat
+  \* Handed out twice is a yes or a no.
+  /\ twice \in BOOLEAN
 
 \* Allocation never aborts a transaction.
 \* Rules out, for example: two callers allocate at the same moment and one of their transactions is
@@ -446,5 +575,22 @@ INV_UsesUnique ==
     \* they use no value in common. Rules out, for example: after a power cut a second transaction
     \* is handed value 1 and commits with it, while the first transaction's use of 1 survived.
     j # k /\ wal[j].kind = "commit" /\ wal[k].kind = "commit" => wal[j].uses \cap wal[k].uses = {}
+
+\* No number is handed out twice without a power cut, log failures included:
+\* a caller still holds the numbers a discarded reservation handed it, so the
+\* counter must not go back with the log. Rules out tiny example two.
+INV_HandedOutOnce == ~twice
+
+\* Every number a durable commit uses is at or below the counter the records
+\* before it on disk leave, so the counter a power cut recovers covers it.
+\* What INV_UseDurable asks, read through the counter: a reservation a log
+\* failure discarded is covered by the rollback's write-back instead of its
+\* own record.
+INV_UseCovered ==
+  \* For every commit on disk, each number it uses is covered by the counter the records before it
+  \* on disk leave.
+  \A i \in 1..durable :
+    \* A commit's uses are at or below the counter as of the record before it.
+    wal[i].kind = "commit" => \A v \in wal[i].uses : v <= CounterIn(i - 1)
 
 ====

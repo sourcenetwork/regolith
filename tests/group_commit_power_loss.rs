@@ -1,23 +1,24 @@
-//! Optimistic transactions committed in shared groups across a power cut.
+//! Optimistic transactions whose commits share syncs of the log, across a
+//! power cut.
 //!
 //! The workload runs in a child process under the `LD_PRELOAD` shim: several
 //! threads commit optimistic transactions that each bump one shared counter
-//! (read through `get_for_update`, so concurrent commits conflict, inside a
-//! group as across groups) and write a pair of keys of their own. The child
+//! (read through `get_for_update`, so concurrent commits conflict, whether
+//! or not one sync covers them) and write a pair of keys of their own. The child
 //! dies at the nth write or fsync of the log, the directory is rebuilt as the
 //! filesystem would have left it, discarding every byte never synced, and the
 //! database is reopened. Small memtables make the run rotate logs and flush
 //! tables on the way.
 //!
 //! - Each transaction's writes survive together or not at all, whichever
-//!   group carried it and wherever the cut tore that group.
+//!   sync covered it and wherever the cut tore the log.
 //! - Each thread's surviving commits are a prefix of the commits it made.
 //! - The counter equals the number of surviving commits: no surviving commit
 //!   was lost under another, and none survived without its increment.
 //! - At Immediate every acknowledged commit survives; a commit is
-//!   acknowledged only once the fsync of its group returned.
+//!   acknowledged only once the fsync that covers it returned.
 //!
-//! Every run is made twice: plain, and encrypted at rest, where each group
+//! Every run is made twice: plain, and encrypted at rest, where each commit
 //! is one sealed record (#266 x #265).
 //!
 //! # Linux only
@@ -106,11 +107,6 @@ fn pairs_child(spec: &ChildSpec) {
                         match tx.commit() {
                             Ok(_) => break,
                             Err(TransactionError::Conflict(_)) => continue,
-                            // A stall applied nothing: wait it out, then
-                            // the attempt again.
-                            Err(TransactionError::WouldBlock(regolith::WouldBlock::Stall(
-                                stall,
-                            ))) => stall.wait(),
                             Err(other) => panic!("child: commit: {other}"),
                         }
                     }
@@ -199,9 +195,10 @@ fn check_recovered(out: &ChildOutcome, durability: DurabilityMode, commits: usiz
 }
 
 const TEARS: [TearMode; 2] = [TearMode::Truncate, TearMode::TornSector];
-/// Commits per writer. A group holds at most one commit of each of the
-/// `THREADS` writers, so this many commits per writer make at least this many
-/// log writes and log fsyncs: enough for every cut below to fire.
+/// Commits per writer. A writer makes its next commit only once the last is
+/// durable, so one sync covers at most one commit of each of the `THREADS`
+/// writers, and this many commits per writer make at least this many log
+/// writes and log fsyncs: enough for every cut below to fire.
 const COMMITS: usize = 100;
 /// Plain, then encrypted at rest.
 const SEALED: [bool; 2] = [false, true];

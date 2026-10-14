@@ -148,9 +148,7 @@ mod tests {
 
     /// Seal the active memtable and leave it frozen.
     fn freeze_active(db: &Db) {
-        let engine = db.engine();
-        let _pipeline = engine.pipeline.lock();
-        engine.seal_active().unwrap();
+        db.engine().seal_active().unwrap();
     }
 
     /// Where `view` keeps `source`: "active", "frozen N" or "L<level> N",

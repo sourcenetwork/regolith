@@ -34,7 +34,7 @@
 \*   3 releases: the lock goes straight to 2. Nobody could barge in between.
 \*
 \* A commit made with commit_nowait is written first and becomes visible
-\* later, when its group "lands" (src/transaction/nowait.rs). Its locks are
+\* later, when it "lands" (src/transaction/nowait.rs). Its locks are
 \* released by the thread that lands it, at that moment. Not earlier, or the
 \* next holder would read the key without the commit in it. Not later, at
 \* the moment the committer's own thread hears about the outcome, or
@@ -69,8 +69,9 @@
 \*                 polled: PendingLock::note and sleep_here, lock_table.rs
 \*   inbox, ready  a thread's IoQueue inbox and the LockWait's slot:
 \*                 QueueShared::deliver and WaitSlot, src/engine/io/shared.rs
-\*   pending       commits written and not yet visible: GroupSync,
-\*                 src/engine/commit/deferred.rs
+\*   pending       commits written and not yet visible: a slot of the
+\*                 commit ring and the list of those to tell when it lands,
+\*                 Descriptor::listen, src/engine/commit/descriptor.rs
 \*
 \* WHAT THE MODEL LEAVES OUT, and why that loses nothing.
 \*   - One key. Each key has its own lock, and no step touches two.
@@ -748,14 +749,16 @@ Write(t) ==
        ELSE
             \* the lock is untouched,
             /\ UNCHANGED holder
-            \* and the transaction waits for its group to land.
+            \* and the transaction waits for its commit to land.
             /\ pc' = [pc EXCEPT ![t] = "written"]
   \* Nothing else changes.
   /\ UNCHANGED <<cur, uses, fifo, owed, pin, nudged, lost, note, inbox, ready,
                  readyBy, unparked, budget>>
 
-\* The commit's group lands: it is synced, applied and published, so the
-\* commit is visible (Landing::land). Any thread may be the one to land it.
+\* The commit lands: it is applied, synced and published, so it is visible
+\* (Descriptor::land, src/engine/commit/descriptor.rs; who is told, and
+\* that each is told once, is Landing.tla). Any thread may be the one to
+\* land it.
 Land(t) ==
   \* Its commit is written and not yet visible.
   /\ t \in pending

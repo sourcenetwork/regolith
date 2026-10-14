@@ -522,7 +522,8 @@ impl VersionSet {
         let mut sealed_under = Vec::new();
         let (version, writer) = if env.exists(&manifest_path) {
             let data = env.read(&manifest_path)?;
-            let replay = Self::replay_manifest(env, &data, sst_dir, policy, keyring.as_deref())?;
+            let mut replay =
+                Self::replay_manifest(env, &data, sst_dir, policy, keyring.as_deref())?;
             dropped_tail = Self::judge_end(
                 &**env,
                 &replay,
@@ -537,9 +538,18 @@ impl VersionSet {
             // it does not, another one could be flushing into one of these
             // ids right now.
             let replayed_cleanly = !data.is_empty() && replay.valid_len == data.len();
-            if replayed_cleanly && env.capabilities().file_lock {
-                super::orphan_sweep::sweep_unreferenced_tables(&**env, sst_dir, &replay.version)?;
-            }
+            let highest_table = if replayed_cleanly && env.capabilities().file_lock {
+                super::orphan_sweep::sweep_unreferenced_tables(&**env, sst_dir, &replay.version)?
+                    .highest_kept
+            } else {
+                super::orphan_sweep::highest_table_id(&**env, sst_dir)?
+            };
+            // Every table left in the directory keeps its id: a table or a
+            // log that took it would be written over the file.
+            replay.version.next_file_id = super::orphan_sweep::next_id_past_tables(
+                replay.version.next_file_id,
+                highest_table,
+            );
 
             // Trim through its own handle, and close it before the
             // append handle is opened. A torn or corrupt tail is the
@@ -575,7 +585,12 @@ impl VersionSet {
                 Self::create_stamped(env, &manifest_path, keyring.is_some())?;
             manifest_bytes = len;
             salt = stamp_salt;
-            (Version::new(), file)
+            let mut version = Version::new();
+            version.next_file_id = super::orphan_sweep::next_id_past_tables(
+                version.next_file_id,
+                super::orphan_sweep::highest_table_id(&**env, sst_dir)?,
+            );
+            (version, file)
         };
 
         let sealing = Self::sealing(keyring.as_ref(), salt)?;

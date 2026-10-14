@@ -23,12 +23,12 @@ use super::manifest::{MAX_LEVELS, VersionEdit, overlapping};
 use super::range_tombstone::{
     RangeTombstone, RangeTombstoneSet, exclusive_successor, sort_dedup_tombstones,
 };
-use super::read_view::VersionStore;
 use super::snapshot_registry::SnapshotRegistry;
 use super::sstable::{
     LiveSst, MetadataPolicy, SsTableInternalIter, SsTableMeta, SsTableReader, SsTableWriter,
     remove_sst_in, sst_filename,
 };
+use super::version_store::VersionStore;
 use crate::engine::background_health::BackgroundHealth;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::engine::background_health::Job;
@@ -738,7 +738,7 @@ fn pick_and_run_universal(
     // Snapshot L0 under the version lock, then make decisions
     // without holding it.
     let l0_files: Vec<Arc<LiveSst>> = {
-        let version = versions.lock().current();
+        let version = versions.current();
         version.levels[0].clone()
     };
     if l0_files.len() < 2 {
@@ -881,7 +881,7 @@ pub(crate) fn run_universal_full_compaction(
     snapshots: &SnapshotRegistry,
 ) -> std::io::Result<()> {
     let l0_files: Vec<Arc<LiveSst>> = {
-        let version = versions.lock().current();
+        let version = versions.current();
         version.levels[0].clone()
     };
     if l0_files.len() < 2 {
@@ -898,7 +898,7 @@ fn pick_and_run_level_compaction(
     snapshots: &SnapshotRegistry,
     claims: &Claims,
 ) -> std::io::Result<CompactionOutcome> {
-    let version = versions.lock().current();
+    let version = versions.current();
 
     // Check L0 first
     if version.l0_count() >= opts.l0_compaction_trigger {
@@ -937,7 +937,7 @@ fn pick_and_run_fifo(
     // make decisions outside it so we don't hold the lock across
     // the unlink syscall.
     let l0_files: Vec<Arc<crate::engine::sstable::LiveSst>> = {
-        let version = versions.lock().current();
+        let version = versions.current();
         version.levels[0].clone()
     };
 
@@ -976,7 +976,7 @@ fn pick_and_run_fifo(
         return Ok(false);
     }
 
-    versions.lock().apply(&edits)?;
+    versions.run(|versions| versions.apply(&edits))?;
 
     // Best-effort unlink. The `LiveSst` reader Arcs in older
     // versions (held by long-running snapshots / iterators) keep
@@ -1041,7 +1041,7 @@ fn compact_level(
 
     // Choose the inputs from the current version, skipping what another
     // pass holds, then claim them (`claims.rs`).
-    let version = versions.lock().current();
+    let version = versions.current();
     let level_files = &version.levels[level];
     if level_files.is_empty() {
         return Ok(CompactionOutcome::Idle);
@@ -1093,7 +1093,7 @@ fn compact_level(
     // the version stays there while its claim is, and one that is gone was
     // compacted already, so compacting it again would put its rows in the
     // level twice.
-    let current = versions.lock().current();
+    let current = versions.current();
     if !claims::all_live(&current.levels[level], &input_files)
         || !claims::all_live(&current.levels[target_level], &overlap_files)
     {
@@ -1151,7 +1151,7 @@ pub(crate) fn run_compact_range(
 ) -> std::io::Result<()> {
     for level in 0..MAX_LEVELS - 1 {
         loop {
-            let version = versions.lock().current();
+            let version = versions.current();
             let files = &version.levels[level];
             if files.is_empty() {
                 break;
@@ -1225,7 +1225,7 @@ pub(crate) fn reseal_tables(
         return Ok(());
     };
     let current = Some(keyring.current_id());
-    let version = versions.lock().current();
+    let version = versions.current();
     let stale: Vec<(usize, Arc<LiveSst>)> = version
         .levels
         .iter()
@@ -1426,7 +1426,7 @@ fn perform_compaction_to(
     let live = snapshots.live_seqs();
     // Read with the inputs fixed too: the levels below the output can only
     // gain a key of these inputs' ranges through this pass.
-    let version = versions.lock().current();
+    let version = versions.current();
     let retirement = Retirement::new(target_level, &version, live.first().copied());
     let carried = retirement.carried_tombstones(&merged_range_tombstones);
 
@@ -1462,8 +1462,7 @@ fn perform_compaction_to(
     // Atomically apply the remove / add edits. `SetNextFileId` is not
     // needed here - each output file already advanced it when it was
     // allocated above.
-    {
-        let mut versions = versions.lock();
+    versions.run(|versions| -> std::io::Result<()> {
         if level == 0 && target_level == 0 {
             // An L0 to L0 merge has to be placed, not appended.
             //
@@ -1523,12 +1522,12 @@ fn perform_compaction_to(
                 });
             }
             pending.offered_to_manifest();
-            versions.apply(&rebuilt)?;
+            versions.apply(&rebuilt)
         } else {
             pending.offered_to_manifest();
-            versions.apply(&edits)?;
+            versions.apply(&edits)
         }
-    }
+    })?;
 
     // Unlink the old SSTable paths. Their file descriptors stay alive
     // through any `Arc<LiveSst>` still held by older versions or by
@@ -1854,13 +1853,7 @@ impl<'a> StreamingCompactionWriter<'a> {
             return Ok(());
         }
 
-        let file_id = {
-            let mut guard = self.versions.lock();
-            let current = guard.current();
-            let id = current.next_file_id;
-            guard.apply(&[VersionEdit::SetNextFileId(id + 1)])?;
-            id
-        };
+        let file_id = self.versions.take_file_id()?;
 
         let path = self.sst_dir.join(sst_filename(file_id));
         self.pending.track(path.clone());
@@ -1998,13 +1991,7 @@ impl<'a> StreamingCompactionWriter<'a> {
             return Ok(());
         }
 
-        let file_id = {
-            let mut guard = self.versions.lock();
-            let current = guard.current();
-            let id = current.next_file_id;
-            guard.apply(&[VersionEdit::SetNextFileId(id + 1)])?;
-            id
-        };
+        let file_id = self.versions.take_file_id()?;
 
         let path = self.sst_dir.join(sst_filename(file_id));
         self.pending.track(path.clone());

@@ -244,8 +244,8 @@ impl Transaction {
         }
     }
 
-    /// The locks this transaction holds, taken out of it for a commit whose
-    /// group lands later: they are released by whoever lands it.
+    /// The locks this transaction holds, taken out of it for a commit that
+    /// lands later: they are released by whoever lands it.
     pub(super) fn take_landing_locks(&mut self) -> Option<Arc<LandingLocks>> {
         let table = Arc::clone(self.lock_table.as_ref()?);
         let owner = Arc::clone(self.lock_owner.get()?);

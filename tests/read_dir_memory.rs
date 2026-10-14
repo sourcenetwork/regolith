@@ -100,6 +100,13 @@ impl Env for NoThreads {
     fn open_read(&self, path: &Path) -> io::Result<Box<dyn ReadFile>> {
         self.0.open_read(path)
     }
+    fn open_log(
+        &self,
+        path: &Path,
+        mode: WriteMode,
+    ) -> io::Result<Box<dyn regolith::env::LogFile>> {
+        self.0.open_log(path, mode)
+    }
     fn open_write(&self, path: &Path, mode: WriteMode) -> io::Result<Box<dyn WriteFile>> {
         self.0.open_write(path, mode)
     }

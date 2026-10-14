@@ -104,6 +104,13 @@ impl Env for CaptureEnv {
         self.inner.open_read(path)
     }
 
+    fn open_log(
+        &self,
+        path: &Path,
+        mode: WriteMode,
+    ) -> io::Result<Box<dyn regolith::env::LogFile>> {
+        self.inner.open_log(path, mode)
+    }
     fn open_write(&self, path: &Path, mode: WriteMode) -> io::Result<Box<dyn WriteFile>> {
         let inner = self.inner.open_write(path, mode)?;
         if path.file_name().is_some_and(|name| name == "MANIFEST") {

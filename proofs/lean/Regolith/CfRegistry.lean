@@ -8,21 +8,23 @@ proved for every number of families, writers and steps.
 ## The story, for a reader who has never seen the code
 
 A column family is a named keyspace inside one database; its keys carry the
-family's id in front. Every write takes a sequence number, one after the
-other, in the commit pipeline's "ordered step". Dropping a family writes one
-range tombstone at some sequence `t`: it deletes every key of the family
-written at a sequence below `t`.
+family's id in front. Every write takes a slot of the commit ring, and the
+slots are decided strictly in ring order; deciding a slot is where it takes
+its sequence number. Dropping a family writes one range tombstone at some
+sequence `t`: it deletes every key of the family written at a sequence below
+`t`.
 
 Tiny example of the bug this rules out. Writer W checks that family 5 is
 live, then goes to commit. A drop of family 5 commits first, its tombstone
 at sequence 7. If W's write then takes sequence 8, it lands above the
 tombstone: visible in a family nobody can name any more, and never removed.
 
-The code (`src/engine/commit/families.rs`) checks the family again inside
-the ordered step, right before the write takes its sequence, and the drop
-retires the family inside the ordered step too, right after its tombstone.
-In this file each of those is one atomic step, because the ordered step is
-one thread at a time.
+The code (`src/engine/commit/families.rs`) checks the family again when the
+write's slot is decided, right before the write takes its sequence, and the
+drop retires the family inside its own ordered unit, right after its
+tombstone. In this file each of those is one atomic step, because a slot is
+decided with every slot before it decided and none after it, and it keeps
+one decision whichever threads computed one.
 
 ## What is proved, in plain words
 
@@ -34,19 +36,19 @@ one thread at a time.
 3. `life_in_order`: a family's stage only moves forward, unborn, live,
    dead, so whatever a reader sees, it sees in that order (TLA+
    `LifeInOrder`).
-4. The RED cases, as counterexamples: a fence outside the ordered step lets
+4. The RED cases, as counterexamples: a fence outside the decide stage lets
    a write land after the tombstone (`fence_outside_lands_after_drop`); a
-   retire after the ordered step does too (`late_retire_lands_after_drop`);
+   retire after the drop's unit does too (`late_retire_lands_after_drop`);
    reusing a dropped id brings a family back to life
    (`reused_id_goes_back`).
-5. Group commit: a whole group, its members checked when the group runs,
-   is a run of the steps above (`runGroup_steps`), so the rules hold after
-   any group however its members were admitted
-   (`group_no_write_after_drop`, `group_no_write_before_birth`). The ticket
-   the hand-off holds across a drop is refused when its group runs
-   (`fenced_when_run_refuses_after_drop`); checked at the hand-off instead,
-   or a transaction left unchecked, it lands over the tombstone
-   (`fenced_at_hand_off_lands_after_drop`, TLA+ REDs `FenceAtHandOff` and
+5. The commit ring: any run of slots (writes, creates, drops, in any order),
+   each decided against the registry as it stands at its turn, is a run of
+   the steps above (`decideRing_steps`), so the rules hold after any ring
+   (`ring_no_write_after_drop`, `ring_no_write_before_birth`). A write whose
+   slot is behind a drop's is refused when it is decided
+   (`write_behind_a_drop_is_refused`); checked when its slot was taken
+   instead, or a transaction left unchecked, it lands over the tombstone
+   (`fenced_at_install_lands_after_drop`, TLA+ REDs `FenceAtInstall` and
    `TxnUnfenced`).
 
 ## How to read the Lean
@@ -123,7 +125,7 @@ theorem set_other {α : Type} (f : Nat → α) (k x : Nat) (v : α) (h : x ≠ k
   -- Unfold `set`; the condition `x = k` is false by `h`.
   simp [set, h]
 
-/-- The steps, one atomic step each, as the ordered step takes them. -/
+/-- The steps, one atomic step each, as deciding a slot takes them. -/
 inductive Step : State → State → Prop
   /-- Create family `f`: its meta write takes the next sequence, and the
   registry publishes the id (`create_family`). -/
@@ -134,7 +136,7 @@ inductive Step : State → State → Prop
       Step s { s with seq := s.seq + 1, born := set s.born f (s.seq + 1),
                       life := set s.life f .live }
   /-- Drop family `f`: its tombstone takes the next sequence, and in the same
-  ordered step the registry retires the id (`drop_family`). -/
+  ordered unit the registry retires the id (`drop_family`). -/
   | drop (s : State) (f : Nat)
       -- Only a live family is dropped.
       (h : s.life f = .live) :
@@ -142,9 +144,9 @@ inductive Step : State → State → Prop
       Step s { s with seq := s.seq + 1, tomb := set s.tomb f (s.seq + 1),
                       life := set s.life f .dead }
   /-- A write to family `f` is admitted: the fence finds it live, and the
-  write takes the next sequence (`cf_fence`, then `run_group`). -/
+  write takes the next sequence (`cf_fence`, in `decide_work`). -/
   | land (s : State) (f : Nat)
-      -- The fence: `f` is live right now, in the ordered step.
+      -- The fence: `f` is live right now, as the slot is decided.
       (h : s.life f = .live) :
       -- One more sequence; the write lands at it.
       Step s { s with seq := s.seq + 1, landed := (f, s.seq + 1) :: s.landed }
@@ -441,13 +443,13 @@ theorem life_in_order {s u : State} (h : Steps s u) (g : Nat) :
 
 /-! ## Part 4. The RED cases -/
 
-/-- The steps with the fence moved out of the ordered step: a write is
+/-- The steps with the fence moved out of the decide stage: a write is
 admitted on the strength of a check made earlier, whatever the family is
 now (bug `FenceOutside`). -/
 inductive BlindStep : State → State → Prop
   /-- The same steps as the real code ... -/
   | real {s t : State} : Step s t → BlindStep s t
-  /-- ... plus a write admitted with no check in the ordered step. -/
+  /-- ... plus a write admitted with no check as its slot is decided. -/
   | blind (s : State) (f : Nat) :
       -- The state after this step: only the fields named here change.
       BlindStep s { s with seq := s.seq + 1, landed := (f, s.seq + 1) :: s.landed }
@@ -461,8 +463,8 @@ def dropped : State := { created with seq := 2, tomb := set created.tomb 1 2, li
 /-- After the blind landing: the write lands at 3. -/
 def landedLate : State := { dropped with seq := 3, landed := (1, 3) :: dropped.landed }
 
-/-- **`fence_outside_lands_after_drop`.** With the fence outside the ordered
-step, the story's write lands above the tombstone: create, drop, then the
+/-- **`fence_outside_lands_after_drop`.** With the fence outside the decide
+stage, the story's write lands above the tombstone: create, drop, then the
 blind landing, and the write at 3 sits over the tombstone at 2. -/
 theorem fence_outside_lands_after_drop :
     -- The state after this step: only the fields named here change.
@@ -483,7 +485,7 @@ theorem fence_outside_lands_after_drop :
     -- Simplify the named facts with the definitions; a false one closes the goal.
     simp [landedLate, dropped, created, set, init] at this
 
-/-- The steps with the retire left until after the ordered step (bug
+/-- The steps with the retire left until after the drop's unit (bug
 `RetireLate`): the tombstone commits, but the family stays live meanwhile. -/
 inductive LateStep : State → State → Prop
   /-- The same steps as the real code ... -/
@@ -498,8 +500,8 @@ def droppedLive : State := { created with seq := 2, tomb := set created.tomb 1 2
 /-- After a write the fence admits, because the family still looks live. -/
 def landedLate2 : State := { droppedLive with seq := 3, landed := (1, 3) :: droppedLive.landed }
 
-/-- **`late_retire_lands_after_drop`.** With the retire after the ordered
-step, a write admitted in between passes the fence and lands at 3, over the
+/-- **`late_retire_lands_after_drop`.** With the retire after the drop's
+unit, a write decided in between passes the fence and lands at 3, over the
 tombstone at 2. -/
 theorem late_retire_lands_after_drop :
     -- The state after this step: only the fields named here change.
@@ -531,61 +533,143 @@ theorem reused_id_goes_back :
   -- Dead is rank 2, live is rank 1.
   simp [dropped, created, set, Life.rank]
 
-/-! ## Part 5. Group commit: every member is fenced when its group runs
+/-! ## Part 5. The commit ring: every slot is fenced when it is decided
 
-The commit pipeline runs writes in groups (`src/engine/commit/mod.rs`). A
-member reaches a group by one of several paths: the leader's own request,
-a ticket another writer queued on the ring, the ticket the bounded leader's
-hand-off held across the end of one turn and the start of the next, an
-optimistic transaction's commit. Whatever the path, the group's first act,
-before any sequence, is to check every member against the registry as it
-stands then (`fence_group`). Here a whole group is one function of the
-state, and it is shown to be a run of the single `land` and `refuse` steps
-above, so every rule proved for them holds after any group. -/
+The commit pipeline has one path (`src/engine/commit/pipeline.rs`). A write,
+a transaction's commit, an ingest's install, a create and a drop each take a
+slot of the ring, and the slots are decided in ring order, each by whichever
+thread reaches it. Whatever took the slot, deciding it checks the registry
+as it stands then, before any sequence (`cf_fence`; `cf_fence_ids` for an
+ingest; a create or a drop looks at the registry inside its own unit). Here
+a whole run of slots is one function of the state, and it is shown to be a
+run of the single steps above, so every rule proved for them holds after any
+ring. -/
 
-/-- One group run in the ordered step (`run_and_complete`): the members'
-families, in group order, each checked against the registry as it stands
-when the group runs. A member whose family is live takes the next sequence
-and lands; one whose family is not is refused and takes none. -/
-def runGroup : State → List Nat → State
-  -- No member left: the state as it is.
+/-- What a slot of the ring carries, as far as families go. -/
+inductive Slot where
+  /-- A plain write, a transaction's commit, a counter reservation or an
+  ingest's table, in family `f`. -/
+  | write (f : Nat)
+  /-- A create of family `f`. -/
+  | create (f : Nat)
+  /-- A drop of family `f`. -/
+  | drop (f : Nat)
+
+/-- One slot decided against the registry as it stands at its turn
+(`decide_work`, or the unit's body). A write whose family is live takes the
+next sequence and lands; a create of an id never handed out and a drop of a
+live family do what the steps above do; anything else changes nothing. -/
+def decide (s : State) : Slot → State
+  -- A write: lands when its family is live, else is refused.
+  | .write f =>
+    -- The fence, at the slot's turn.
+    if s.life f = .live then
+      -- One more sequence; the write lands at it.
+      { s with seq := s.seq + 1, landed := (f, s.seq + 1) :: s.landed }
+    -- Refused: nothing changes.
+    else s
+  -- A create: only of an id never handed out.
+  | .create f =>
+    -- The unit looks at the registry.
+    if s.life f = .unborn then
+      -- One more sequence; `f` is born at it and is live.
+      { s with seq := s.seq + 1, born := set s.born f (s.seq + 1), life := set s.life f .live }
+    -- The id is taken or dead: nothing changes.
+    else s
+  -- A drop: only of a live family.
+  | .drop f =>
+    -- The unit looks at the registry.
+    if s.life f = .live then
+      -- One more sequence; the tombstone sits at it and `f` is dead.
+      { s with seq := s.seq + 1, tomb := set s.tomb f (s.seq + 1), life := set s.life f .dead }
+    -- Not live: nothing changes.
+    else s
+
+/-- The ring's slots decided one after the other, in ring order. -/
+def decideRing : State → List Slot → State
+  -- No slot left: the state as it is.
   | s, [] => s
-  -- The next member, of family `f`, then the rest of the group.
-  | s, f :: rest =>
-    -- The rest runs on the state this member leaves behind ...
-    runGroup
-      -- ... which, when `f` is live, holds one more landed write at the
-      -- next sequence, ...
-      (if s.life f = .live then
-        { s with seq := s.seq + 1, landed := (f, s.seq + 1) :: s.landed }
-      -- ... and otherwise is unchanged: the member was refused.
-      else s) rest
+  -- The oldest slot is decided, then the rest on the state it leaves.
+  | s, x :: rest => decideRing (decide s x) rest
 
-/-- A group run is a run of single steps: one `land` or one `refuse` per
-member, in group order. -/
-theorem runGroup_steps (s : State) (ms : List Nat) : Steps s (runGroup s ms) := by
-  -- By the number of members, for every starting state.
-  induction ms generalizing s with
-  -- Case: no member.
-  | nil =>
-    -- No member: zero steps.
-    exact Steps.refl s
-  -- Case: a member f, then the rest, with the claim for the rest (ih) known.
-  | cons f rest ih =>
-    -- Split on whether the member's family is live when the group runs.
+/-- Deciding one slot is one step of the kinds above, or none at all. -/
+theorem decide_steps (s : State) (x : Slot) : Steps s (decide s x) := by
+  -- One case per kind of slot.
+  cases x with
+  -- Case: a write to family f.
+  | write f =>
+    -- Split on whether the family is live at the slot's turn.
     by_cases h : s.life f = .live
-    -- Live: unfold one member of the group; the `if` takes its first branch.
+    -- Live: one `land` step.
     ·
-      -- Unfold one member of the group, its family being live.
-      simp only [runGroup, h, ↓reduceIte]
-      -- The member is one `land` step, and the rest are more steps.
-      exact Steps.cons (Step.land s f h) (ih _)
-    -- Not live: unfold one member; the `if` takes its second branch.
+      -- Unfold the decision; the `if` takes its first branch.
+      simp only [decide, h, ↓reduceIte]
+      -- That is one `land` step, then no more.
+      exact Steps.cons (Step.land s f h) (Steps.refl _)
+    -- Not live: one `refuse` step, which changes nothing.
     ·
-      -- Unfold one member of the group, its family not being live.
-      simp only [runGroup, h, ↓reduceIte]
-      -- The member is one `refuse` step, and the rest are more steps.
-      exact Steps.cons (Step.refuse s f h) (ih _)
+      -- Unfold the decision; the `if` takes its second branch.
+      simp only [decide, h, ↓reduceIte]
+      -- That is one `refuse` step, then no more.
+      exact Steps.cons (Step.refuse s f h) (Steps.refl _)
+  -- Case: a create of family f.
+  | create f =>
+    -- Split on whether the id was never handed out.
+    by_cases h : s.life f = .unborn
+    -- Unborn: one `create` step.
+    ·
+      -- Unfold the decision; the `if` takes its first branch.
+      simp only [decide, h, ↓reduceIte]
+      -- That is one `create` step, then no more.
+      exact Steps.cons (Step.create s f h) (Steps.refl _)
+    -- Taken or dead: no step.
+    ·
+      -- Unfold the decision; the `if` takes its second branch.
+      simp only [decide, h, ↓reduceIte]
+      -- The state is unchanged: zero steps.
+      exact Steps.refl s
+  -- Case: a drop of family f.
+  | drop f =>
+    -- Split on whether the family is live.
+    by_cases h : s.life f = .live
+    -- Live: one `drop` step.
+    ·
+      -- Unfold the decision; the `if` takes its first branch.
+      simp only [decide, h, ↓reduceIte]
+      -- That is one `drop` step, then no more.
+      exact Steps.cons (Step.drop s f h) (Steps.refl _)
+    -- Not live: no step.
+    ·
+      -- Unfold the decision; the `if` takes its second branch.
+      simp only [decide, h, ↓reduceIte]
+      -- The state is unchanged: zero steps.
+      exact Steps.refl s
+
+/-- One run of steps after another is a run of steps. -/
+theorem steps_trans {s t u : State} (h1 : Steps s t) (h2 : Steps t u) : Steps s u := by
+  -- By the number of steps in the first run.
+  induction h1 with
+  -- Case: no step first.
+  | refl =>
+    -- The second run is the whole run.
+    exact h2
+  -- Case: one step, then the rest of the first run.
+  | cons hst _ ih =>
+    -- That step, then the rest followed by the second run.
+    exact Steps.cons hst (ih h2)
+
+/-- A ring decided in order is a run of single steps. -/
+theorem decideRing_steps (s : State) (xs : List Slot) : Steps s (decideRing s xs) := by
+  -- By the number of slots, for every starting state.
+  induction xs generalizing s with
+  -- Case: no slot.
+  | nil =>
+    -- No slot: zero steps.
+    exact Steps.refl s
+  -- Case: a slot x, then the rest, with the claim for the rest (ih) known.
+  | cons x rest ih =>
+    -- The slot's steps, then the rest's from the state it leaves.
+    exact steps_trans (decide_steps s x) (ih _)
 
 /-- Any number of steps from a reachable state reach a reachable state. -/
 theorem reach_steps {s t : State} (hs : Reach s) (h : Steps s t) : Reach t := by
@@ -600,43 +684,47 @@ theorem reach_steps {s t : State} (hs : Reach s) (h : Steps s t) : Reach t := by
     -- One step reaches a reachable state, and the rest follow from it.
     exact ih (Reach.step hs hst)
 
-/-- **`group_no_write_after_drop`.** After any group run from a reachable
+/-- **`ring_no_write_after_drop`.** After any ring decided from a reachable
 state, every write that landed in a dropped family is below its tombstone:
-however its members were admitted, the check when the group runs is what
-keeps the rule (TLA+ `NoWriteAfterDrop` on `MC_CfRegistry_Green`). -/
-theorem group_no_write_after_drop {s : State} (h : Reach s) (ms : List Nat) :
+whatever took each slot and in whatever order, the check when the slot is
+decided is what keeps the rule (TLA+ `NoWriteAfterDrop` on
+`MC_CfRegistry_Green`). -/
+theorem ring_no_write_after_drop {s : State} (h : Reach s) (xs : List Slot) :
     -- The claim itself; its proof follows.
-    ∀ p ∈ (runGroup s ms).landed,
-      (runGroup s ms).tomb p.1 = 0 ∨ p.2 < (runGroup s ms).tomb p.1 :=
-  -- The group is a run of steps, so its end is reachable, and every
+    ∀ p ∈ (decideRing s xs).landed,
+      (decideRing s xs).tomb p.1 = 0 ∨ p.2 < (decideRing s xs).tomb p.1 :=
+  -- The ring is a run of steps, so its end is reachable, and every
   -- reachable state keeps the rule.
-  no_write_after_drop (reach_steps h (runGroup_steps s ms))
+  no_write_after_drop (reach_steps h (decideRing_steps s xs))
 
-/-- **`group_no_write_before_birth`.** After any group run from a reachable
+/-- **`ring_no_write_before_birth`.** After any ring decided from a reachable
 state, every write that landed is above its family's creation. -/
-theorem group_no_write_before_birth {s : State} (h : Reach s) (ms : List Nat) :
+theorem ring_no_write_before_birth {s : State} (h : Reach s) (xs : List Slot) :
     -- The claim itself; its proof follows.
-    ∀ p ∈ (runGroup s ms).landed,
-      0 < (runGroup s ms).born p.1 ∧ (runGroup s ms).born p.1 < p.2 :=
-  -- As above: the group's end is reachable.
-  no_write_before_birth (reach_steps h (runGroup_steps s ms))
+    ∀ p ∈ (decideRing s xs).landed,
+      0 < (decideRing s xs).born p.1 ∧ (decideRing s xs).born p.1 < p.2 :=
+  -- As above: the ring's end is reachable.
+  no_write_before_birth (reach_steps h (decideRing_steps s xs))
 
-/-- In the story, the real code refuses the held ticket: its group runs
-after the drop, finds family 1 dead, and lands nothing. -/
-theorem fenced_when_run_refuses_after_drop : runGroup dropped [1] = dropped := by
-  -- Family 1 is dead in `dropped`, so the one member is refused.
-  simp [runGroup, dropped, created, set, init]
+/-- In the story, the real code refuses the write whose slot is behind the
+drop's: the drop is decided first, and the write finds family 1 dead and
+lands nothing. -/
+theorem write_behind_a_drop_is_refused :
+    -- The drop's slot, then the write's, from the state with family 1 live.
+    decideRing created [.drop 1, .write 1] = dropped := by
+  -- Family 1 is live for the drop and dead for the write.
+  simp [decideRing, decide, dropped, created, set, init]
 
-/-- **`fenced_at_hand_off_lands_after_drop`.** The ticket the hand-off holds,
-checked when the hand-off took it rather than when its group runs (bug
-`FenceAtHandOff`): the check passes in `created`, where family 1 is live;
-the drop's group then runs (tombstone at 2, family 1 dead); the held
-ticket's group runs on that earlier pass, which is a landing with no check,
-and the write at 3 sits over the tombstone at 2. A transaction member that
-skips the check (bug `TxnUnfenced`) lands the same way. -/
-theorem fenced_at_hand_off_lands_after_drop :
-    -- The check at hand-off passes, then the drop, then the unchecked
-    -- landing, and the rule fails.
+/-- **`fenced_at_install_lands_after_drop`.** The write checked when it took
+its slot rather than when the slot is decided (bug `FenceAtInstall`): the
+check passes in `created`, where family 1 is live; the drop's slot, which is
+ahead of it in the ring, is decided (tombstone at 2, family 1 dead); the
+write's slot is decided on that earlier pass, which is a landing with no
+check, and the write at 3 sits over the tombstone at 2. A transaction whose
+slot skips the check (bug `TxnUnfenced`) lands the same way. -/
+theorem fenced_at_install_lands_after_drop :
+    -- The check when the slot is taken passes, then the drop, then the
+    -- unchecked landing, and the rule fails.
     created.life 1 = .live ∧ BlindStep created dropped ∧ BlindStep dropped landedLate ∧
     ¬ (∀ p ∈ landedLate.landed, landedLate.tomb p.1 = 0 ∨ p.2 < landedLate.tomb p.1) := by
   -- The drop, the unchecked landing and the broken rule are the story of

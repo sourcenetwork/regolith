@@ -70,6 +70,12 @@ jobs:
           distribution: temurin
           java-version: '21'
       - uses: extractions/setup-just@v2
+      # Every line of a model, a configuration and a Lean proof carries a
+      # plain-words comment above it, with no file left out. A shell script
+      # with nothing to install; it runs first because it takes a second and
+      # one uncommented line fails the job.
+      - name: Every proof line carries a comment
+        run: just proofs-comments
       - name: TLA+ models, every green and red configuration
         run: just tla
 
@@ -117,18 +123,37 @@ jobs:
   # Miri over the modules that carry the crate's `unsafe`: the arena's
   # chunk layout and bump arithmetic, the skip list's node layout and
   # publication, the memtable's arena-backed slices, the block decoder,
-  # and `regolith::sync`'s waiter nodes, lists and pools. Interpreted
-  # execution is orders of magnitude slower than native, so the tests
-  # that would not finish are scaled down under `cfg(miri)` in the tests
-  # themselves, with every assertion left intact: the two spinning-reader
-  # stress tests are `#[ignore]`d in favour of an interpreter-sized
-  # equivalent, the arena's multi-megabyte fills use a smaller budget,
-  # the `regolith::sync` loops run tens of rounds, not thousands, and the
-  # range-tombstone tests append 40 and 100 tombstones under their
-  # readers, not thousands, and probe every seventh key after an append.
+  # and `regolith::sync`'s waiter nodes, lists and pools. And those of the
+  # commit pipeline: the ring's cells and the slot that holds its tip
+  # (`commit::ring`), the allocations a thread keeps between commits
+  # (`commit::spare`), the cell a value is taken out of once (`take`), the
+  # step and the version store on it (`version_store`, whose tests are the
+  # step's), the positional log and its gate (`wal_log`, `wal_gate`), the
+  # stack, the parked list and the job the queues are built on
+  # (`io::stack`, `io::parked`, `io::job`), the in-memory log with the
+  # append it rests on (`env::mem_log`, two tests of `env::mem_file`), and
+  # a transaction's callbacks kept in place and the first four abort
+  # callbacks a claim holds (`transaction::in_place`,
+  # `transaction::first_four`).
+  # Interpreted execution is orders of magnitude slower than native, so
+  # the tests that would not finish are scaled down under `cfg(miri)` in
+  # the tests themselves, with every assertion left intact: the two
+  # spinning-reader stress tests are `#[ignore]`d in favour of an
+  # interpreter-sized equivalent, the arena's multi-megabyte fills use a
+  # smaller budget, the `regolith::sync` loops run tens of rounds, not
+  # thousands, the range-tombstone tests append 40 and 100 tombstones
+  # under their readers, not thousands, and probe every seventh key after
+  # an append, and the ring, the version store, the skip list and the
+  # in-memory log race a handful of operations a thread, not hundreds.
   #
-  # Measured at 20 minutes on a workstation for the 178 tests. The limit
-  # is six times that: a runner interprets on slower cores. A run that
+  # A test listed here keeps off the file system: miri does not sync a
+  # directory, which every durable write to a real file ends with. The
+  # version store's tests keep their manifest in the in-memory Env, and the
+  # positional log's run over the in-memory Env, whose log is this crate's
+  # own lock-free code, and natively over the file system too.
+  #
+  # Measured at 39 minutes for the 271 tests on a workstation
+  # shared with other work; the limit is three times that. A run that
   # passes it means a test was added at native size; size it as above.
   miri:
     runs-on: ubuntu-latest
@@ -159,7 +184,7 @@ jobs:
         with:
           components: miri
       - uses: Swatinem/rust-cache@v2
-      - run: "cargo miri test --lib -- --test-threads=1 engine::arena:: engine::skiplist:: engine::memtable:: engine::block:: slice::tests:: sync::"
+      - run: "cargo miri test --lib -- --test-threads=1 engine::arena:: engine::skiplist:: engine::memtable:: engine::block:: slice::tests:: sync:: engine::commit::ring:: engine::commit::spare:: engine::take:: engine::version_store:: engine::wal_log:: engine::wal_gate:: engine::io::stack:: engine::io::parked:: engine::io::job:: transaction::in_place:: transaction::first_four:: env::mem_log:: env::mem_file::tests::an_append_at env::mem_file::tests::two_appends_at"
 
   # Long-running stress, soak, and fault-injection tests. Gated behind
   # `#[ignore]` in the main crate so `cargo test` stays fast for PRs;

@@ -13,6 +13,10 @@ import Regolith.Publication
 -- E2: syncing the sealed log before the next log takes a record makes
 -- recovery a gap-free prefix. Backs `proofs/tla/WalRotation.tla`.
 import Regolith.WalRecovery
+-- E46: a close that seals its last log in place and creates the next one
+-- only after the flush is durable, and a close with no record that syncs
+-- once, keep recovery a gap-free prefix. Backs `proofs/tla/WalRecovery.tla`.
+import Regolith.WalClose
 -- Plan 3.6: commit-ordered append numbers appends densely from 1, once per
 -- once key, in commit order, and a snapshot sees exactly rows 1..H. Backs
 -- `proofs/tla/CommitOrderedAppend.tla` and `CommitOrderedAppendCrash.tla`.
@@ -36,13 +40,33 @@ import Regolith.ShardedStats
 -- WalRecovery.lean also holds format 2 replay (4.2), backing
 -- `proofs/tla/WalRecovery.tla`; LsmOrder.lean also holds flush order,
 -- ingest placement, overlap demotion (E14) and binary search.
--- E10: a group commit decides every member as committing them one at a
--- time would. Backs `proofs/tla/GroupCommit.tla`.
-import Regolith.GroupCommit
--- 4.7: deciding in ring order gives dense sequences in ring order, and a
--- reader at the published horizon sees exactly the published commits.
--- Backs `proofs/tla/CommitPipeline.tla`.
+-- 4.7: deciding in ring order gives dense sequences in ring order, a
+-- reader at the published horizon sees exactly the published commits, a
+-- rollback leaves the sequences as if the discarded slots had never been
+-- decided, and a sync vouches only for what is written. Backs
+-- `proofs/tla/CommitPipeline.tla`.
 import Regolith.Pipeline
+-- 4.7: every ordering rule of the pipeline looks back only, so one thread
+-- alone finishes every slot up to its own, wherever the others stopped.
+-- Backs `proofs/tla/CommitPipeline.tla`.
+import Regolith.PipelineHelping
+-- E10, 4.7: the check a slot runs when it is decided. A write that landed
+-- is in the store every later slot is checked against, so no update is
+-- lost; an abort has a cause; and the check split at a horizon decides as
+-- one check. Backs `proofs/tla/CommitPipeline.tla`.
+import Regolith.PipelineCheck
+-- 4.7: a commit's landing listeners. Whoever waits for a commit to land is
+-- told at most once, and a closed list holds nobody. Backs
+-- `proofs/tla/Landing.tla`.
+import Regolith.Landing
+-- 4.10: a queue's poll never waits for another thread. A job that parks for
+-- something another thread holds leaves a note and looks again, so it is
+-- told when that thing is given up. Backs `proofs/tla/Parking.tla`.
+import Regolith.Parking
+-- 4.6: the version store's step. One thread at a time runs the sections
+-- handed over, in the order handed over, and none is left behind. Backs
+-- `proofs/tla/VersionStep.tla`.
+import Regolith.VersionStep
 -- Plan 3.3: an exact partial_merge folds to full_merge in any grouping, and
 -- the touches law. Backs `proofs/tla/RepeatableRead.tla`.
 import Regolith.MergeOperator
@@ -154,6 +178,11 @@ import Regolith.EnvFilesRename
 -- relieves a stop lands the unit too, so a writer that was waiting is told
 -- what a fresh write is told. Backs `proofs/tla/StallRelief.tla`.
 import Regolith.StallRelief
+-- A commit is never lost to a stall: its call ends with its write in or
+-- told a failure, never handed the wait a plain write is (inline compaction
+-- off included) and never given up while it makes room. Backs the commit
+-- rows of `proofs/tla/StallRelief.tla`.
+import Regolith.StallCommit
 -- E15: waiting for the last snapshot. A sleeping waiter always has a pin
 -- still held or a release on its way to wake it, and on a target with one
 -- thread the call returns the count of pins held without waiting. Backs

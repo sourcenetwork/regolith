@@ -198,7 +198,7 @@ structure T where
   inbox made it ready (`WaitSlot::complete`). -/
   ready : List (Nat × Nat)
   /-- The transactions whose commit is written and not yet visible
-  (`commit_nowait` before its group lands). -/
+  (`commit_nowait` before the commit lands). -/
   pending : List Nat
 
 /-- The start: the lock free, every inbox empty, nothing ready, nothing

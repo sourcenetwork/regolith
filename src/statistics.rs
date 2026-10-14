@@ -55,24 +55,29 @@ use crate::portability::{AtomicU64, Ordering};
 #[repr(usize)]
 #[non_exhaustive]
 pub enum Ticker {
-    /// Total key + value bytes written to the memtable. Counts
-    /// raw user bytes; does not include internal encoding
-    /// overhead, the CF prefix, or WAL framing.
+    /// Key and value bytes of the writes that committed: the key and
+    /// the value of each put and the key of each delete. Counts raw
+    /// user bytes; does not include internal encoding overhead, the
+    /// CF prefix, or WAL framing.
+    ///
+    /// This and the four counters of operations below count a write
+    /// once it has committed, whichever call made it: a put, a write
+    /// batch, a column family's call, a transaction's commit. A write
+    /// that failed, was refused or lost a conflict adds nothing.
     BytesWritten = 0,
     /// Total value bytes returned from point lookups that found
     /// a live value.
     BytesRead = 1,
-    /// Number of successful `put` operations routed through
-    /// `apply_batch`.
+    /// Number of puts that committed.
     KeysWritten = 2,
     /// Number of `get` calls (including lookups that returned
     /// `None`).
     KeysRead = 3,
-    /// Number of `delete` operations.
+    /// Number of deletes that committed.
     KeysDeleted = 4,
-    /// Number of range-delete operations.
+    /// Number of range deletes that committed.
     RangeDeletesWritten = 5,
-    /// Number of merge operands written.
+    /// Number of merge operands that committed.
     MergesWritten = 6,
     /// Block cache hits (the block was already resident).
     BlockCacheHit = 7,
@@ -105,12 +110,13 @@ pub enum Ticker {
     IterSeekCount = 19,
     /// Number of `Iter::next` calls that produced a key.
     IterNextCount = 20,
-    /// Microseconds writers spent relieving a write stall inline before the
-    /// write went on: plain writes and transactional commits that carry
-    /// writes alike, on a database with no compaction worker and
-    /// [`crate::Options::inline_compaction`] on. No write waits on a stall,
-    /// so nothing else is counted; relief that ends in a busy or closed
-    /// error is not counted either.
+    /// Microseconds threads spent held by a write stall: relieving it
+    /// inline, or blocked until it cleared (a commit that waits a stop out,
+    /// [`crate::StallWait::wait`]).
+    ///
+    /// A wait that is polled or awaited on a queue holds no thread and is
+    /// not counted, nor is inline relief that ends in a busy or closed
+    /// error.
     WriteStallMicros = 21,
     /// Number of snapshots registered via `Db::snapshot`.
     SnapshotsRegistered = 22,
@@ -286,8 +292,8 @@ pub enum Histogram {
     FlushTime = 5,
     /// Bytes returned per `Db::get` that found a live value.
     BytesPerRead = 6,
-    /// Total bytes applied per `Db::write` (keys + values across
-    /// every op in the batch).
+    /// Bytes per write that committed (a put, a batch, a commit):
+    /// what that write added to [`Ticker::BytesWritten`].
     BytesPerWrite = 7,
     /// Wall-clock microseconds to append a batch to the WAL
     /// (including fsync when durability is Immediate).

@@ -1,5 +1,7 @@
 //! Loom models of the pessimistic lock table: taking a key's lock, releasing
-//! it, and waiting for it (`tests/loom_locks.rs` runs them).
+//! it, and waiting for it; and of the first four `on_abort` callbacks a
+//! transaction's claim holds in place, pushed by its owner while `close`
+//! takes them (`tests/loom_locks.rs` runs them).
 //!
 //! Each positive model drives the production types: [`OwnedLock`] and
 //! [`OwnedWait`], [`KeyLock`]'s use count, [`PendingLock`] and the queue a
@@ -26,6 +28,7 @@ use loom::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use loom::sync::{Arc, Notify};
 use loom::thread;
 
+use super::first_four::{FirstFour, IN_PLACE, TakeFirst};
 use super::lock_table::{KeyLock, LockOwner, PendingLock, Polled};
 use crate::engine::io::CloseGate;
 use crate::engine::io::shared::{Message, QueueShared, WaitSlot};
@@ -579,5 +582,84 @@ pub fn calibration_a_wait_that_ignores_the_gate_outlives_close() {
             key_lock.lock.unlock(holder.id());
             assert!(settled, "a lock wait outlived close");
         },
+    );
+}
+
+/// The first four's models explore every schedule at this bound: a bound of
+/// 100 explores no more (7 and 12 interleavings), and a bound of 3 misses one
+/// and three.
+const FIRST_FOUR_PREEMPTIONS: usize = 4;
+
+/// One thread pushes a transaction's `on_abort` callbacks into the first
+/// four its claim holds while another takes them. The take hands out only
+/// slots whose push it saw complete (each value lives in a loom cell, so a
+/// read not ordered after its write fails the model), and it and the take
+/// after the pushes hand out every entry once, oldest first.
+pub fn a_take_racing_a_push_keeps_the_order() {
+    explore(
+        "a_take_racing_a_push_keeps_the_order",
+        FIRST_FOUR_PREEMPTIONS,
+        // 7 interleavings measured.
+        6,
+        1,
+        |witness| take_racing_two_pushes(0, FirstFour::<usize>::take, witness),
+    );
+}
+
+/// The same across the edge to the overflow: three entries are in place
+/// before the race, so the two pushes fill the last slot and start the
+/// overflow while the take runs.
+pub fn a_take_racing_a_push_keeps_the_order_across_the_edge() {
+    explore(
+        "a_take_racing_a_push_keeps_the_order_across_the_edge",
+        FIRST_FOUR_PREEMPTIONS,
+        // 12 interleavings measured.
+        11,
+        1,
+        |witness| take_racing_two_pushes(IN_PLACE - 1, FirstFour::<usize>::take, witness),
+    );
+}
+
+/// The first four's calibration: a take that runs on past a slot not filled
+/// yet hands a later entry out before an earlier one.
+pub fn calibration_a_take_past_a_slot_not_filled_breaks_the_order() {
+    explore(
+        "calibration_a_take_past_a_slot_not_filled_breaks_the_order",
+        FIRST_FOUR_PREEMPTIONS,
+        1,
+        0,
+        |witness| take_racing_two_pushes(0, FirstFour::<usize>::take_past_empty, witness),
+    );
+}
+
+/// `before` entries pushed, then two more pushed on another thread while
+/// this one takes with `take`, then a plain take of what is left. Recorded
+/// when the racing take handed out the first of the two and met the slot of
+/// the second before its push.
+fn take_racing_two_pushes(
+    before: usize,
+    take: for<'a> fn(&'a FirstFour<usize>) -> TakeFirst<'a, usize>,
+    witness: &Witness,
+) {
+    let list = Arc::new(FirstFour::default());
+    for entry in 0..before {
+        list.push(entry);
+    }
+    let pusher = {
+        let list = Arc::clone(&list);
+        thread::spawn(move || {
+            list.push(before);
+            list.push(before + 1);
+        })
+    };
+    let raced: Vec<usize> = take(&list).collect();
+    pusher.join().expect("pusher");
+    if raced.len() == before + 1 {
+        witness.record();
+    }
+    let all: Vec<usize> = raced.into_iter().chain(list.take()).collect();
+    assert!(
+        all == (0..before + 2).collect::<Vec<_>>(),
+        "a take handed an entry out of order or not exactly once: {all:?}"
     );
 }

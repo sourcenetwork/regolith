@@ -102,6 +102,9 @@ impl Env for Counted {
             in_use: AtomicUsize::new(0),
         }))
     }
+    fn open_log(&self, path: &Path, mode: WriteMode) -> io::Result<Box<dyn crate::env::LogFile>> {
+        self.inner.open_log(path, mode)
+    }
     fn open_write(&self, path: &Path, mode: WriteMode) -> io::Result<Box<dyn WriteFile>> {
         self.inner.open_write(path, mode)
     }

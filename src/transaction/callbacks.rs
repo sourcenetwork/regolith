@@ -37,12 +37,20 @@
 //!   that is still running keeps its own `on_abort` registrations apart until
 //!   it returns `Ok`, so undoing a failed one never touches that list.
 //! - A transaction that registered nothing, under a database with no hooks,
-//!   pays one empty-option check at each point and allocates nothing.
+//!   pays one check of a flag at each point and allocates nothing.
+//! - The `before_commit` and `on_commit` callbacks live in the transaction
+//!   itself: up to four of each, each capturing no more than
+//!   [`INLINE_WORDS`](super::in_place::INLINE_WORDS) machine words, allocate
+//!   nothing. A fifth of a kind moves that kind's overflow to the heap, and
+//!   a larger closure is boxed on its own. An `on_abort` callback is shared
+//!   with `close`, so its first registration allocates the transaction's
+//!   claim, and each one a node of the claim's list.
 
 use std::sync::Arc;
 
 use super::claim::Claim;
 use super::exclusive::Exclusive;
+use super::in_place::{BeforeCommit, OnAbort, OnCommit};
 use super::queue::Queue;
 use super::{
     CommitReceipt, Conflict, Error, IsolationLevel, Transaction, TransactionError, TxResult,
@@ -157,10 +165,6 @@ pub trait TransactionHooks: Send + Sync + 'static {
     }
 }
 
-type BeforeCommit = Box<dyn FnMut(&mut Transaction) -> TxResult<()> + Send>;
-type OnCommit = Box<dyn FnOnce(&CommitReceipt) + Send>;
-pub(super) type OnAbort = Box<dyn FnOnce(&AbortReason<'_>) + Send>;
-
 /// Run `f`, catching a panic in it and naming `callback` in the error.
 ///
 /// The commit's containment (`engine::callback`), switched on for this call:
@@ -205,13 +209,19 @@ struct Queues {
     on_abort: Queue<OnAbort>,
 }
 
-/// The `before_commit` and `on_commit` callbacks one transaction registered:
-/// nothing until the first registration, then one allocation. (The
-/// `on_abort` ones are in the transaction's claim, except while a callback is
-/// running; see `Queues::on_abort`.)
+/// The `before_commit` and `on_commit` callbacks one transaction registered,
+/// kept in the transaction itself (module docs). (The `on_abort` ones are in
+/// the transaction's claim, except while a callback is running; see
+/// `Queues::on_abort`.)
 #[derive(Default)]
 pub(crate) struct Callbacks {
-    queues: Option<Box<Exclusive<Queues>>>,
+    /// In place, with no allocation, but only once something is registered:
+    /// a transaction with none writes no empty queues when it begins and
+    /// reads none when it is dropped.
+    queues: Exclusive<Option<Queues>>,
+    /// Whether anything was registered since the queues were last taken: the
+    /// one check a transaction with no callbacks pays at each point.
+    registered: bool,
     /// `before_commit` callbacks and hooks running now, outermost first: while
     /// there is one, an `on_abort` registration goes to `Queues::on_abort`.
     running: u32,
@@ -219,17 +229,22 @@ pub(crate) struct Callbacks {
 
 impl Callbacks {
     fn queues(&mut self) -> &mut Queues {
-        self.queues
-            .get_or_insert_with(|| Box::new(Exclusive::new(Queues::default())))
-            .get_mut()
+        self.registered = true;
+        self.queues.get_mut().get_or_insert_with(Queues::default)
     }
 
     fn existing(&mut self) -> Option<&mut Queues> {
-        self.queues.as_mut().map(|queues| queues.get_mut())
+        if !self.registered {
+            return None;
+        }
+        self.queues.get_mut().as_mut()
     }
 
     fn take(&mut self) -> Option<Queues> {
-        self.queues.take().map(|queues| (*queues).into_inner())
+        if !std::mem::take(&mut self.registered) {
+            return None;
+        }
+        self.queues.get_mut().take()
     }
 }
 
@@ -296,11 +311,19 @@ impl Transaction {
     /// [`Transaction::prepare`] runs the pending callbacks early, and
     /// [`Transaction::commit`] runs whatever is left. A callback does not run
     /// for a transaction that is rolled back or dropped.
+    ///
+    /// The first four callbacks of this kind a transaction registers are kept
+    /// in the transaction and allocate nothing, as long as each captures no
+    /// more than four machine words; a larger one is boxed, and the fifth
+    /// and later ones are kept on the heap.
     pub fn before_commit(
         &mut self,
         f: impl FnMut(&mut Transaction) -> TxResult<()> + Send + 'static,
     ) {
-        self.callbacks.queues().before_commit.push(Box::new(f));
+        self.callbacks
+            .queues()
+            .before_commit
+            .push(BeforeCommit::new(f));
     }
 
     /// Run `f` once if the transaction commits, when the commit is visible
@@ -315,8 +338,13 @@ impl Transaction {
     /// [`crate::EventListener::on_callback_panic`]; the commit stands and the
     /// other callbacks still run. If the transaction does not commit, `f` is
     /// dropped without running.
+    ///
+    /// The first four callbacks of this kind a transaction registers are kept
+    /// in the transaction and allocate nothing, as long as each captures no
+    /// more than four machine words; a larger one is boxed, and the fifth
+    /// and later ones are kept on the heap.
     pub fn on_commit(&mut self, f: impl FnOnce(&CommitReceipt) + Send + 'static) {
-        self.callbacks.queues().on_commit.push(Box::new(f));
+        self.callbacks.queues().on_commit.push(OnCommit::new(f));
     }
 
     /// Run `f` once if the transaction ends without committing: rolled back,
@@ -335,8 +363,14 @@ impl Transaction {
     /// Registered from inside a [`Transaction::before_commit`] callback or a
     /// [`TransactionHooks::before_commit`], `f` counts as registered when that
     /// callback returns `Ok`; a callback that fails takes it back.
+    ///
+    /// These callbacks are shared with `close`, so the first one registered
+    /// makes the transaction's claim (one allocation, made anyway under a
+    /// database with hooks); the first four are kept in it and allocate
+    /// nothing more, as long as each captures no more than four machine
+    /// words, and the fifth and later ones are kept on the heap.
     pub fn on_abort(&mut self, f: impl FnOnce(&AbortReason<'_>) + Send + 'static) {
-        let f = Box::new(f);
+        let f = OnAbort::new(f);
         if self.callbacks.running > 0 {
             self.callbacks.queues().on_abort.push(f);
         } else {
@@ -392,7 +426,7 @@ impl Transaction {
             .existing()
             .and_then(|queues| queues.before_commit.take())
         {
-            let outcome = self.guarded("before_commit", |txn| f(txn));
+            let outcome = self.guarded("before_commit", |txn| f.call(txn));
             // A callback run inside another one is kept, in place, because
             // that one failing runs it again. At the top it is done with.
             let nested = self.callbacks.running > 0;
@@ -509,7 +543,7 @@ impl Transaction {
     }
 
     fn has_ending(&self) -> bool {
-        self.callbacks.queues.is_some()
+        self.callbacks.registered
             || self.claim.is_some()
             || self.engine.transaction_hooks().is_some()
     }
@@ -590,7 +624,7 @@ impl Ending {
         let report = self.report.upgrade();
         if let Some(mut own) = self.callbacks.take() {
             while let Some(f) = own.on_commit.pop() {
-                survive_after(report.as_deref(), "on_commit", || f(&receipt));
+                survive_after(report.as_deref(), "on_commit", || f.call(&receipt));
             }
         }
         if let Some(hooks) = &self.hooks {

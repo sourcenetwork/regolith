@@ -1,5 +1,5 @@
-//! Tests of the append-only tombstone log: prefix publication under a
-//! racing writer, the index against a linear model across rebuilds, and the
+//! Tests of the append-only tombstone log: publication under racing
+//! writers, the index against a linear model across rebuilds, and the
 //! listing order the memtable has always answered in.
 
 use std::sync::Arc;
@@ -101,9 +101,9 @@ fn the_listing_is_sorted_and_deduplicated_as_before() {
     );
 }
 
-/// The reader's half of T2, under a writer that never stops: every length
-/// a reader acquires names whole tombstones, in append order, and a later
-/// read never sees fewer.
+/// The reader's half of T2, under a writer that never stops: every ready
+/// position a reader acquires holds a whole tombstone, in append order, a
+/// ready position stays ready, and a later read never sees fewer.
 #[test]
 fn readers_see_a_growing_prefix_of_whole_appends_while_a_writer_appends() {
     // Sized for the interpreter under miri: 100 appends still cross three
@@ -120,22 +120,28 @@ fn readers_see_a_growing_prefix_of_whole_appends_while_a_writer_appends() {
                 while !done.load(std::sync::atomic::Ordering::Acquire) || last < APPENDS as usize {
                     let len = log.len();
                     assert!(len >= last, "the prefix shrank from {last} to {len}");
-                    for position in last..len {
-                        let t = log.get(position);
-                        let seq = position as u64 + 1;
-                        assert_eq!(t.seq, seq, "append {position} out of order");
+                    // The one writer's appends become ready in order, so the
+                    // ready positions are a prefix of the ones handed out.
+                    let mut ready = last;
+                    while ready < len {
+                        let Some(t) = log.get(ready) else {
+                            break;
+                        };
+                        let seq = ready as u64 + 1;
+                        assert_eq!(t.seq, seq, "append {ready} out of order");
                         assert_eq!(t.start, format!("s{seq:06}").into_bytes(), "torn append");
                         assert_eq!(t.end, format!("t{seq:06}").into_bytes(), "torn append");
+                        ready += 1;
                     }
-                    // Every published tombstone covers its own start, and a
-                    // lookup never answers a sequence past the prefix.
-                    if len > 0 {
-                        let key = format!("s{len:06}").into_bytes();
+                    // Every ready tombstone covers its own start, and a
+                    // lookup never misses one a scan already read.
+                    if ready > 0 {
+                        let key = format!("s{ready:06}").into_bytes();
                         let seen = log.covering_seq(&key, u64::MAX);
-                        assert!(seen >= len as u64, "a published tombstone was missed");
+                        assert!(seen >= ready as u64, "a ready tombstone was missed");
                     }
-                    checked.fetch_add((len - last) as u64, std::sync::atomic::Ordering::Relaxed);
-                    last = len;
+                    checked.fetch_add((ready - last) as u64, std::sync::atomic::Ordering::Relaxed);
+                    last = ready;
                 }
             });
         }
@@ -155,16 +161,161 @@ fn readers_see_a_growing_prefix_of_whole_appends_while_a_writer_appends() {
     );
 }
 
-/// T1's detector: a second writer inside an append trips the debug guard.
+/// T1: many threads append at once, each its own tombstones, and every one
+/// of them is in the log afterwards, whole.
 #[test]
-#[cfg(debug_assertions)]
-fn a_second_concurrent_writer_trips_the_single_writer_guard() {
+fn concurrent_appenders_lose_nothing() {
+    // Sized for the interpreter as the appends beside readers above are.
+    const THREADS: u64 = if cfg!(miri) { 4 } else { 8 };
+    const EACH: u64 = if cfg!(miri) { 12 } else { 500 };
     let log = TombstoneLog::new();
-    let _held = SingleWriterGuard::enter(&log.writing, "held by the test");
-    let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        log.push(tomb(b"a", b"b", 1));
-    }));
-    assert!(caught.is_err(), "the guard did not catch a second writer");
+    std::thread::scope(|scope| {
+        for t in 0..THREADS {
+            let log = &log;
+            scope.spawn(move || {
+                for i in 0..EACH {
+                    let seq = t * EACH + i + 1;
+                    log.push(tomb(
+                        format!("s{seq:06}").as_bytes(),
+                        format!("t{seq:06}").as_bytes(),
+                        seq,
+                    ));
+                }
+            });
+        }
+    });
+    let listed = log.to_sorted_vec();
+    assert_eq!(listed.len() as u64, THREADS * EACH);
+    for seq in 1..=THREADS * EACH {
+        let key = format!("s{seq:06}");
+        assert_eq!(log.covering_seq(key.as_bytes(), u64::MAX), seq, "{key}");
+    }
+}
+
+/// T1: two threads applying one commit append the same tombstones. Whatever
+/// the interleaving, every listing holds each of them once and every query
+/// answers as if it had been appended once.
+#[test]
+fn the_same_tombstones_appended_by_two_threads_are_listed_once() {
+    const ROUNDS: u64 = if cfg!(miri) { 3 } else { 200 };
+    for round in 0..ROUNDS {
+        let log = TombstoneLog::new();
+        log.push(tomb(b"a", b"c", 1));
+        std::thread::scope(|scope| {
+            for _ in 0..2 {
+                let log = &log;
+                scope.spawn(move || {
+                    for seq in 2..10u64 {
+                        log.push(tomb(b"b", format!("k{seq}").as_bytes(), seq));
+                    }
+                });
+            }
+        });
+        let listed = log.to_sorted_vec();
+        assert_eq!(listed.len(), 9, "round {round}: {listed:?}");
+        assert_eq!(log.covering_seq(b"b", u64::MAX), 9);
+        assert_eq!(log.covering_seq(b"b", 5), 5);
+        assert_eq!(log.covering_seq(b"a", u64::MAX), 1);
+    }
+}
+
+/// T1: an append of a tombstone the log already holds adds nothing.
+#[test]
+fn an_append_of_a_tombstone_already_held_adds_nothing() {
+    let log = TombstoneLog::new();
+    log.push(tomb(b"a", b"m", 4));
+    log.push(tomb(b"c", b"z", 5));
+    let (len, bytes) = (log.len(), log.bytes());
+    log.push(tomb(b"c", b"z", 5));
+    log.push(tomb(b"a", b"m", 4));
+    assert_eq!((log.len(), log.bytes()), (len, bytes));
+    // The same range at another sequence is another tombstone.
+    log.push(tomb(b"a", b"m", 6));
+    assert_eq!(log.len(), len + 1);
+}
+
+/// T2 and T4: a position handed out whose append has not finished is
+/// skipped by every query, the index stops in front of it, and the appends
+/// after it are still read.
+#[test]
+fn a_position_whose_append_has_not_finished_is_skipped_and_not_indexed() {
+    let log = TombstoneLog::new();
+    for seq in 1..=3u64 {
+        log.push(tomb(b"a", b"b", seq));
+    }
+    // A thread took position 3 and was descheduled before writing it.
+    let stuck = log.claimed.fetch_add(1, Ordering::AcqRel);
+    for seq in 4..=(4 + 3 * REBUILD as u64) {
+        log.push(tomb(b"a", b"b", seq));
+    }
+    let newest = 4 + 3 * REBUILD as u64;
+    assert_eq!(log.covering_seq(b"a", u64::MAX), newest);
+    assert_eq!(log.covering_seq(b"a", 3), 3);
+    assert_eq!(log.to_sorted_vec().len() as u64, newest);
+    assert!(log.any(|t| t.seq == newest));
+    assert!(
+        log.index.load().is_none_or(|index| index.covered <= stuck),
+        "the index covered a position that is not ready"
+    );
+}
+
+/// T4: an append that claims its position after a rebuild found every
+/// position below its bound ready is left out of the view the rebuild
+/// publishes, so once it finishes every query finds it. The view covering
+/// it as an empty placeholder would hide it: a lookup stops at the old
+/// ends, and the scan past the view starts above it.
+#[test]
+fn a_position_claimed_while_a_rebuild_scans_is_not_indexed() {
+    let log = Arc::new(TombstoneLog::new());
+    for seq in 1..REBUILD as u64 {
+        log.push(tomb(b"b", b"m", seq));
+    }
+    // A second helper claims the next position right after the rebuild the
+    // REBUILD-th append starts has found every position below its bound
+    // ready, and pauses before it writes the slot.
+    let helper = Arc::clone(&log);
+    after_next_ready_scan(move || {
+        let claimed = helper.claimed.fetch_add(1, Ordering::AcqRel);
+        assert_eq!(
+            claimed, REBUILD,
+            "setup: the claim lands right past the scan"
+        );
+    });
+    log.push(tomb(b"b", b"m", REBUILD as u64));
+    assert_eq!(
+        log.len(),
+        REBUILD + 1,
+        "setup: the helper claimed during the rebuild"
+    );
+    assert!(
+        log.index.load().is_some(),
+        "setup: the append rebuilt the index"
+    );
+    // The helper resumes and finishes its range delete.
+    let newest = REBUILD as u64 + 1;
+    // SAFETY: the helper's claim above handed it position REBUILD, and only
+    // this call fills it.
+    unsafe { log.fill(REBUILD, tomb(b"a", b"zz", newest)) };
+    assert_eq!(
+        log.covering_seq(b"y", u64::MAX),
+        newest,
+        "the delete of y was hidden"
+    );
+    assert_eq!(log.covering_seq(b"c", u64::MAX), newest);
+    assert_eq!(
+        log.first_newer_overlap(b"x", b"z", REBUILD as u64)
+            .map(|t| t.seq),
+        Some(newest)
+    );
+    let listed = log.to_sorted_vec();
+    assert_eq!(listed.len(), REBUILD + 1);
+    assert_eq!(listed[0].seq, newest);
+    assert!(
+        log.index
+            .load()
+            .is_some_and(|index| index.covered <= REBUILD),
+        "the index covered a position that was not ready"
+    );
 }
 
 fn key() -> impl Strategy<Value = Vec<u8>> {
@@ -187,7 +338,8 @@ proptest! {
                 all.push((start.clone(), end.clone(), *seq));
             }
         }
-        prop_assert_eq!(log.len(), all.len());
+        // T1: an append of a tombstone already held may add nothing.
+        prop_assert!(log.len() <= all.len());
         let mut sorted: Vec<RangeTombstone> =
             all.iter().map(|(s, e, q)| tomb(s, e, *q)).collect();
         sort_dedup_tombstones(&mut sorted);

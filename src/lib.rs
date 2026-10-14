@@ -159,9 +159,12 @@ pub mod loom_exports {
     //! check, and this module is the seam that lets the test target call
     //! them. It does not exist in an ordinary build.
 
+    pub use crate::engine::commit::loom_model as pipeline;
+    pub use crate::engine::commit::loom_turn_wait as turn_wait;
+    pub use crate::engine::commit::loom_write_unit as write_unit;
     pub use crate::engine::loom_model::{
-        arena, families, gate, handoff, io_queue, jobs, skiplist, slice, snapshots, tombstones,
-        version,
+        arena, families, gate, handoff, io_queue, jobs, park, skiplist, slice, snapshots, step,
+        tombstones, version,
     };
     pub use crate::env::open_file_limit::loom_model as open_files;
     pub use crate::sync::loom_model as sync;
@@ -430,7 +433,9 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// [`Error::WouldBlock`] with a [`WouldBlock::Stall`] wait, completed on the
 /// writer's own [`IoQueue`] once background work clears the stall; run the
 /// write again then, or wrap it in [`through_stalls`] to wait on this
-/// thread. A slowdown threshold delays nothing.
+/// thread. A slowdown threshold delays nothing. A transaction's commit is
+/// the exception, since it cannot be run again: it waits the stall out
+/// ([`Transaction::commit`], [`Transaction::commit_nowait`]).
 pub struct Db {
     engine: Arc<RegolithEngine>,
     durability: engine::DurabilityMode,
@@ -480,8 +485,8 @@ impl Db {
             RegolithEngine::open(path.as_ref(), engine_opts)?
         };
         let cfs = Arc::new(CfRegistry::new());
-        // Attached before the first write, so the commit leader fences every
-        // write against the registry from the start.
+        // Attached before the first write, so every write is fenced against
+        // the registry when it is decided, from the start.
         engine.attach_families(Arc::clone(&cfs));
         let db = Self {
             engine,
@@ -725,14 +730,7 @@ impl Db {
         self.ensure_writable()?;
         self.validate_write_kv_sizes(key, value)?;
         self.admit_write(opts)?;
-        let stats = self.stats();
-        let _scope = statistics::TimeScope::new(stats, Histogram::DbWrite);
-        let bytes = (key.len() + value.len()) as u64;
-        if let Some(s) = stats {
-            s.add(Ticker::KeysWritten, 1);
-            s.add(Ticker::BytesWritten, bytes);
-            s.record(Histogram::BytesPerWrite, bytes);
-        }
+        let _scope = statistics::TimeScope::new(self.stats(), Histogram::DbWrite);
         perf_context::record_write_call();
         let (dm, disable_wal) = self.resolve_write_opts(opts);
         self.engine
@@ -758,9 +756,6 @@ impl Db {
         self.ensure_writable()?;
         self.validate_key_size(key)?;
         self.admit_write(opts)?;
-        if let Some(s) = self.stats() {
-            s.add(Ticker::KeysDeleted, 1);
-        }
         let mut batch = BTreeMap::new();
         batch.insert(prefix_key(DEFAULT_CF_ID, key), None);
         let (dm, disable_wal) = self.resolve_write_opts(opts);
@@ -788,9 +783,6 @@ impl Db {
         self.engine.require_merge_operator()?;
         self.validate_write_kv_sizes(key, operand)?;
         self.admit_write(opts)?;
-        if let Some(s) = self.stats() {
-            s.add(Ticker::MergesWritten, 1);
-        }
         let (dm, disable_wal) = self.resolve_write_opts(opts);
         self.engine
             .apply_grouped_batch(
@@ -832,9 +824,6 @@ impl Db {
         self.validate_key_size(start)?;
         self.validate_key_size(end)?;
         self.admit_write(opts)?;
-        if let Some(s) = self.stats() {
-            s.add(Ticker::RangeDeletesWritten, 1);
-        }
         let (dm, disable_wal) = self.resolve_write_opts(opts);
         self.engine
             .apply_grouped_batch(
@@ -931,39 +920,7 @@ impl Db {
         self.validate_batch_sizes(&batch, disable_wal)?;
         self.admit_write(opts)?;
         perf_context::record_write_call();
-        let stats = self.stats();
-        let _scope = statistics::TimeScope::new(stats, Histogram::DbWrite);
-        if let Some(s) = stats {
-            let mut bytes: u64 = 0;
-            let mut puts: u64 = 0;
-            let mut deletes: u64 = 0;
-            let mut range_deletes: u64 = 0;
-            let mut merges: u64 = 0;
-            for op in &batch.ops {
-                match op {
-                    WriteBatchOp::Put { key, value } => {
-                        puts += 1;
-                        bytes += (key.len() + value.len()) as u64;
-                    }
-                    WriteBatchOp::Delete { key } => {
-                        deletes += 1;
-                        bytes += key.len() as u64;
-                    }
-                    WriteBatchOp::DeleteRange { .. } => {
-                        range_deletes += 1;
-                    }
-                    WriteBatchOp::Merge { .. } => {
-                        merges += 1;
-                    }
-                }
-            }
-            s.add(Ticker::KeysWritten, puts);
-            s.add(Ticker::KeysDeleted, deletes);
-            s.add(Ticker::BytesWritten, bytes);
-            s.add(Ticker::RangeDeletesWritten, range_deletes);
-            s.add(Ticker::MergesWritten, merges);
-            s.record(Histogram::BytesPerWrite, bytes);
-        }
+        let _scope = statistics::TimeScope::new(self.stats(), Histogram::DbWrite);
         self.engine
             .submit_batch(batch.ops, dm, disable_wal)
             .map_err(Error::from)
@@ -1132,7 +1089,7 @@ impl Db {
         // already gone is refused before any work. A batch is usually one
         // column family, or a few long runs of one, and every distinct run
         // reaches the registry once. A drop that lands after this check is
-        // caught by the commit leader's fence in the ordered step
+        // caught by the fence made when the batch's slot is decided
         // (`engine::commit::families`), which refuses the batch whole, so a
         // batch racing a drop is applied whole before the tombstone or
         // refused whole, never split across it.
@@ -1297,7 +1254,7 @@ impl Db {
     /// Delete all data in the database.
     ///
     /// A call that does its own I/O and waits on this thread: for the
-    /// compaction pass or job in flight, and for the commit group in
+    /// compaction pass or job in flight, and for the commits in
     /// flight, to end. Call it off a thread that must not block. On
     /// `wasm32`, whose one thread cannot wait for itself, a call made from
     /// inside a compaction or a checkpoint (a listener, a compaction filter)
@@ -3465,7 +3422,9 @@ mod tests {
         let db = Db::open(dir.path(), Options::default()).unwrap();
         db.put(b"k", b"v").unwrap();
 
-        let blocked_wal_path = dir.path().join("wal").join("wal_000002.log");
+        // The log close creates after its flush: the open's log is 1 and the
+        // flush's table 2.
+        let blocked_wal_path = dir.path().join("wal").join("wal_000003.log");
         std::fs::create_dir(&blocked_wal_path).unwrap();
 
         match db.close().unwrap_err() {
@@ -3474,6 +3433,8 @@ mod tests {
         }
 
         assert_eq!(db.get(b"k").unwrap(), Some(b"v".to_vec()));
+        // The failed close left the database taking writes again.
+        db.put(b"after", b"close").unwrap();
 
         std::fs::remove_dir(&blocked_wal_path).unwrap();
         db.close().unwrap();
@@ -3489,6 +3450,7 @@ mod tests {
         drop(db);
         let reopened = Db::open(dir.path(), Options::default()).unwrap();
         assert_eq!(reopened.get(b"k").unwrap(), Some(b"v".to_vec()));
+        assert_eq!(reopened.get(b"after").unwrap(), Some(b"close".to_vec()));
     }
 
     #[test]

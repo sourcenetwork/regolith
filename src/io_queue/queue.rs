@@ -161,7 +161,7 @@ impl IoQueue {
     ///
     /// A read or a job nobody has claimed is claimed with one
     /// compare-and-swap and run here, on this thread: a read fills the block
-    /// cache, a commit group's fsync makes the group durable and visible. One
+    /// cache, a sync of the log makes the commits it covers durable and visible. One
     /// another thread is running is left to it, and its completion arrives
     /// when it is done. Each finished one completes every wait recorded on
     /// this queue for it, waking the tasks that await them and running, on
@@ -497,7 +497,7 @@ impl Drop for IoQueue {
             }
         }
         // Each job is settled before what waits on it is told, so a commit's
-        // ticket is told its group's true outcome.
+        // ticket is told the commit's true outcome.
         for (_, wait) in self.jobs.drain() {
             settle_on_drop(runtime, &wait.job);
             for waiter in wait.waiters {
@@ -522,14 +522,16 @@ impl Drop for IoQueue {
 /// What a dropped queue does with a job it waits on, before it tells the
 /// job's waiters. A passive job (a stall) lands with the event it stands
 /// for; its waiters are told now and run their call again. A job nobody runs
-/// yet is settled here by its body's release: a commit group's fsync runs,
+/// yet is settled here by its body's release: a sync round of the log runs,
 /// an owed step is owed again, a foreground job fails. A job another thread
-/// runs is waited for, so its outcome is the one told.
+/// runs is waited for, so its outcome is the one told; one that thread parks
+/// instead is settled here like any job nobody runs.
 fn settle_on_drop(runtime: &IoRuntime, job: &Arc<Job>) {
-    if job.is_done() || job.is_passive() || runtime.release_job(job) {
-        return;
+    loop {
+        if job.is_done() || job.is_passive() || runtime.release_job(job) || job.wait_turn() {
+            return;
+        }
     }
-    job.wait_landed();
 }
 
 impl std::fmt::Debug for IoQueue {
