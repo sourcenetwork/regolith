@@ -73,8 +73,13 @@ aes-gcm-siv = { version = "0.12", default-features = false, features = ["aes", "
 zeroize = "1"
 getrandom = "0.4"
 
-[target.'cfg(unix)'.dependencies]
+[target.'cfg(any(unix, target_os = "wasi"))'.dependencies]
 rustix = { version = "1.1", features = ["fs"] }
+
+# `sync_file_range`, which rustix does not wrap: the log's early writeback
+# (`LogFile::start_writeback`). Already in the tree through getrandom.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 proptest = { version = "1", optional = true }
@@ -239,6 +244,10 @@ name = "group_commit"
 harness = false
 
 [[bench]]
+name = "commit_nowait"
+harness = false
+
+[[bench]]
 name = "ingest"
 harness = false
 
@@ -252,4 +261,16 @@ harness = false
 
 [[bench]]
 name = "encryption"
+harness = false
+
+[[bench]]
+name = "per_core"
+harness = false
+
+[[bench]]
+name = "per_core_reads"
+harness = false
+
+[[bench]]
+name = "tables"
 harness = false

@@ -143,7 +143,7 @@ fn build(encrypted: bool) -> (common::TempDb, Db) {
         }
         db.write_opt(&wopts, batch).unwrap();
     }
-    db.compact_range(None, None).unwrap();
+    db.compact_range(None, None).wait().unwrap();
     db.close().unwrap();
     drop(db);
     let db = Db::open(tmp.path(), options()).unwrap();

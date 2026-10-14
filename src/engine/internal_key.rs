@@ -257,7 +257,7 @@ mod tests {
             for i in 0..8 {
                 db.put(format!("k{i}").as_bytes(), b"v").unwrap();
             }
-            db.compact_range(None, None).unwrap();
+            db.compact_range(None, None).wait().unwrap();
         }
 
         let sst_dir = dir.path().join("sst");

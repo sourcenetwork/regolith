@@ -103,11 +103,13 @@ impl VersionSet {
     }
 }
 
-/// `self.versions.lock().apply(edits)`, the shape of every publishing
-/// call site in the engine.
+/// `self.versions.run(|versions| versions.apply(edits))`, the shape of
+/// every publishing call site in the engine. The mutex here stands for the
+/// version store's step, which runs one section at a time; the step's own
+/// protocol is modelled in `step.rs`.
 ///
-/// The mutex is what makes `apply`'s clone-mutate-store atomic, and it
-/// is held for exactly one `apply` and released immediately after. That
+/// The step is what makes `apply`'s clone-mutate-store atomic, and a
+/// section is exactly one `apply`. That
 /// scope is the whole reason a compaction has to publish its removals
 /// and its addition in one batch: between two `apply` calls the mutex is
 /// free and a reader can pin whatever is current.
@@ -116,8 +118,8 @@ fn apply_locked(pipeline: &Mutex<()>, versions: &VersionSet, edits: &[Edit]) {
     versions.apply(edits);
 }
 
-/// `self.versions.lock().current()`, the shape `RegolithEngine::lookup` has
-/// when it pins the version it will walk.
+/// Pinning the current version from inside the step, the strongest form
+/// of `RegolithEngine::lookup` pinning the version it will walk.
 fn current_locked(pipeline: &Mutex<()>, versions: &VersionSet) -> Arc<Version> {
     let _lock = pipeline.lock().expect("pipeline");
     versions.current()
@@ -140,8 +142,7 @@ fn before_compaction() -> Arc<VersionSet> {
 /// A reader that pins one version never sees a key vanish under a
 /// compaction, because the removals and the addition are one `apply`.
 ///
-/// The reader takes the pipeline mutex to pin its version, exactly as
-/// `RegolithEngine::lookup` does, and then walks the pinned snapshot with no
+/// The reader pins its version and then walks the pinned snapshot with no
 /// lock held at all - which is why the snapshot has to be whole.
 pub fn a_reader_pins_one_version_across_a_compaction() {
     explore(
@@ -229,8 +230,7 @@ pub fn a_split_compaction_apply_hides_a_key() {
 }
 
 /// A flush and a compaction publishing at the same time keep both
-/// edits: the pipeline mutex is what makes `apply`'s clone-mutate-store
-/// atomic.
+/// edits: the step is what makes `apply`'s clone-mutate-store atomic.
 ///
 /// This is the handoff between a writer and compaction. The flush adds a
 /// table at L0 while the compaction removes two L0 tables and adds one
@@ -286,7 +286,7 @@ pub fn a_flush_and_a_compaction_cannot_lose_each_other() {
 }
 
 /// Calibration for [`a_flush_and_a_compaction_cannot_lose_each_other`]:
-/// the same two publishers with the pipeline mutex removed.
+/// the same two publishers with nothing serializing them.
 ///
 /// `apply` reads the current version, mutates a clone and stores it
 /// back. Unserialized, one publisher's clone predates the other's store

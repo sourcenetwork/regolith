@@ -12,6 +12,8 @@
 
 use regolith::{IsolationLevel, MergeOperator, OptimisticTransactionDb, Options, TxnOptions};
 
+mod common;
+
 /// Sums big-endian i64 deltas, so two `+1` operands make `+2` and the
 /// operation is plainly not idempotent.
 struct CounterMerge;
@@ -87,7 +89,7 @@ fn concurrent_writes_of_different_bytes_still_conflict() {
 
         first.commit().unwrap();
         assert!(
-            second.commit().is_err(),
+            !common::committed(&second.commit()),
             "{level:?}: a differing blind write is a lost update"
         );
     }
@@ -130,7 +132,7 @@ fn a_delete_against_a_concurrent_put_still_conflicts() {
 
     first.commit().unwrap();
     assert!(
-        second.commit().is_err(),
+        !common::committed(&second.commit()),
         "delete over a differing put conflicts"
     );
 }
@@ -153,7 +155,7 @@ fn a_stale_read_still_conflicts_even_when_the_write_matches() {
 
     first.commit().unwrap();
     assert!(
-        second.commit().is_err(),
+        !common::committed(&second.commit()),
         "a read that no longer holds must abort whatever the write says"
     );
 }
@@ -187,7 +189,7 @@ fn a_read_modify_write_still_conflicts_at_every_level() {
 
         first.commit().unwrap();
         assert!(
-            second.commit().is_err(),
+            !common::committed(&second.commit()),
             "{level:?}: eliding this write would lose an increment"
         );
         assert_eq!(
@@ -214,7 +216,7 @@ fn a_stale_get_for_update_still_conflicts_when_the_write_matches() {
 
         first.commit().unwrap();
         assert!(
-            second.commit().is_err(),
+            !common::committed(&second.commit()),
             "{level:?}: get_for_update is a read and must still abort"
         );
     }
@@ -234,7 +236,10 @@ fn concurrent_merges_still_conflict() {
     second.merge(b"key", &1i64.to_be_bytes()).unwrap();
 
     first.commit().unwrap();
-    assert!(second.commit().is_err(), "merges are not idempotent");
+    assert!(
+        !common::committed(&second.commit()),
+        "merges are not idempotent"
+    );
 }
 
 /// A sequential rewrite of the same bytes was never a conflict and still is
@@ -324,7 +329,7 @@ fn an_identical_write_under_an_unresolved_operand_still_conflicts() {
             db.db().flush().unwrap();
         }
         assert!(
-            tx.commit().is_err(),
+            !common::committed(&tx.commit()),
             "flush={flush}: a write under an unresolved operand must conflict"
         );
     }

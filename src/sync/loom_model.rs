@@ -20,6 +20,22 @@
 //! was written before the fix (a nudge that finds its waiter already nudged
 //! lowers the marker) and must fail: the drain passes once more for every
 //! release.
+//!
+//! The E48 models drive the production `RawSemaphore` (a Mutex is its
+//! one-permit case) through its own first attempt (`take_one`), spin before
+//! queueing and spin on the waiter's node, each with a calibration that
+//! rebuilds the one guard it checks the wrong way and must fail: the first
+//! attempt must refuse a lock owed to a queued waiter, and a waiter that
+//! stops spinning on its node must read the node's marks as it arms its
+//! waker, since a release that nudged it while it spun called no waker.
+//!
+//! The second model is the same defect with nobody queued: a thread takes
+//! the drain role, its pass finds the queue empty, and another thread keeps
+//! letting a permit go and taking it back. A release that finds the role
+//! taken leaves only its request to wake the front, and a drain whose pass
+//! found nobody queued drops that request, so it runs one pass. Its
+//! calibration writes the release the old way, raising the dirty bit, and
+//! must fail.
 
 use core::cell::Cell;
 use core::task::Waker;
@@ -30,8 +46,8 @@ use loom::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use loom::sync::{Arc, Notify};
 use loom::thread;
 
-use super::contend::{self, Contend, Lock};
-use super::queue::{Arrivals, Policy, QUEUED, Step, WaitQueue};
+use super::contend::{self, Contend, Lock, MAX_BYPASS};
+use super::queue::{Arrivals, FIRST_BIT, HANDOFF, Policy, QUEUED, Step, WaitQueue};
 use super::raw_semaphore::RawSemaphore;
 use super::waiter::{Wait, WakeList};
 
@@ -298,5 +314,288 @@ pub fn calibration_a_marker_lowered_on_a_pending_nudge_keeps_the_drain_passing()
                 "the drain ran {passes} passes for the waiter that holds it"
             );
         },
+    );
+}
+
+/// How many times the other thread lets its permit go in the empty-queue
+/// models.
+const RELEASES: usize = 3;
+
+/// A waiter gives up, and its withdrawal takes the drain role; the pass
+/// finds nobody queued. Meanwhile the thread that holds the other permit
+/// lets it go and takes it back [`RELEASES`] times. The drain runs one
+/// pass, whatever those releases do, and no permit is lost.
+pub fn a_drain_that_found_nobody_queued_ends_while_another_thread_releases() {
+    explore(
+        "a_drain_that_found_nobody_queued_ends_while_another_thread_releases",
+        3,
+        100,
+        1,
+        |witnessed| {
+            let sem = Arc::new(RawSemaphore::new(2));
+            assert!(sem.try_acquire(1), "the other thread's permit");
+            let counted = Counted {
+                sem: &sem,
+                passes: Cell::new(0),
+                most: Cell::new(0),
+            };
+            // A request for both permits queues behind the one that is out.
+            let mut contend = Contend::new();
+            assert!(
+                contend.poll(&counted, 2, Waker::noop()).is_pending(),
+                "one permit is out"
+            );
+            let other = {
+                let sem = Arc::clone(&sem);
+                thread::spawn(move || {
+                    for _ in 0..RELEASES {
+                        sem.release(1);
+                        // Lets the drain run between two releases without
+                        // spending one of the model's few preemptions.
+                        thread::yield_now();
+                        assert!(sem.try_acquire(1), "its permit is free again");
+                    }
+                })
+            };
+            // The waiter gives up while the other thread hammers.
+            counted.take_most();
+            contend.cancel(&counted, 2);
+            let passes = counted.take_most();
+            if passes == 1 {
+                // This thread held the drain role over an empty queue.
+                witnessed.fetch_add(1, StdOrdering::Relaxed);
+            }
+            assert!(
+                passes <= 1,
+                "the drain ran {passes} passes over a queue with nobody in it"
+            );
+            other.join().expect("other");
+            sem.release(1);
+            assert_eq!(sem.available(), 2, "a permit was lost or made up");
+        },
+    );
+}
+
+/// A release written the way it was before the drain was bounded: when it
+/// finds the drain role taken, it raises the dirty bit. The thread that
+/// holds the role over an empty queue then passes once more for each
+/// release that lands before its exit.
+pub fn calibration_a_release_that_dirties_keeps_an_empty_drain_passing() {
+    const DRAINING: usize = 1;
+    const DIRTY: usize = 1 << 1;
+    const QUEUED: usize = 1 << 2;
+    explore(
+        "calibration_a_release_that_dirties_keeps_an_empty_drain_passing",
+        3,
+        0,
+        0,
+        |_witnessed| {
+            // A thread holds the drain role; the waiter that raised QUEUED
+            // is gone, so its pass will find nobody.
+            let state = Arc::new(AtomicUsize::new(DRAINING | QUEUED));
+            let other = {
+                let state = Arc::clone(&state);
+                thread::spawn(move || {
+                    for _ in 0..RELEASES {
+                        // A release that sees QUEUED up asks for a pass.
+                        // The defect: with the role taken, asking is
+                        // raising the dirty bit.
+                        if state.load(Ordering::Acquire) & QUEUED != 0 {
+                            state.fetch_or(DIRTY, Ordering::AcqRel);
+                        }
+                        thread::yield_now();
+                    }
+                })
+            };
+            let mut passes = 0;
+            loop {
+                state.fetch_and(!DIRTY, Ordering::AcqRel);
+                // The pass: nobody is queued, so QUEUED may come down.
+                passes += 1;
+                let seen = state.load(Ordering::Acquire);
+                if seen & DIRTY == 0
+                    && state
+                        .compare_exchange(
+                            seen,
+                            seen & !(DRAINING | QUEUED),
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_ok()
+                {
+                    break;
+                }
+            }
+            other.join().expect("other");
+            assert!(
+                passes <= 1,
+                "the drain ran {passes} passes over a queue with nobody in it"
+            );
+        },
+    );
+}
+
+/// Drives a production [`Contend`] on `sem` to completion on this loom
+/// thread, parking it between polls until its waker fires: a wakeup that
+/// never comes parks it for good, which loom reports as a deadlock.
+fn acquire_parking(sem: &RawSemaphore) {
+    let park = StdArc::new(Unpark(Notify::new()));
+    let waker = Waker::from(StdArc::clone(&park));
+    let mut contend = Contend::new();
+    while contend.poll(sem, 1, &waker).is_pending() {
+        park.0.wait();
+    }
+}
+
+/// E48, the first attempt. A waiter queues behind the holder; the holder
+/// lets go and at once tries to take the lock back with the Mutex's own
+/// inline attempt, `MAX_BYPASS + 2` times, so the waiter loses its retries
+/// until it is owed a handoff. Whenever the holder saw the handoff owed
+/// before its attempt, the attempt must fail: the lock is the waiter's. The
+/// waiter is served and no permit is lost.
+pub fn the_first_attempt_refuses_a_lock_owed_to_a_waiter() {
+    owed_handoff_model(
+        "the_first_attempt_refuses_a_lock_owed_to_a_waiter",
+        RawSemaphore::take_one,
+    );
+}
+
+/// The first attempt written without its HANDOFF test: a swap from the
+/// state loaded whenever a permit is free. Past the bound the holder takes
+/// the lock that was owed to the waiter, and the model must fail.
+pub fn calibration_a_first_attempt_that_ignores_handoff_barges_past_an_owed_waiter() {
+    owed_handoff_model(
+        "calibration_a_first_attempt_that_ignores_handoff_barges_past_an_owed_waiter",
+        |sem| {
+            const ONE: usize = 1 << FIRST_BIT;
+            let state = &sem.queue().state;
+            let seen = state.load(Ordering::Relaxed);
+            if seen >= ONE {
+                state
+                    .compare_exchange(seen, seen - ONE, Ordering::Acquire, Ordering::Relaxed)
+                    .map(drop)
+            } else {
+                Err(seen)
+            }
+        },
+    );
+}
+
+/// SHRUNK to preemption bound 1: at bound 2 the four release-and-attempt
+/// rounds did not finish in five minutes. Bound 1 explores 0.36 million
+/// interleavings in about 25 s and reaches the owed state in 12 thousand of
+/// them; every interleaving of the waiter's retries against the holder's
+/// rounds is still explored, with one preemption on top.
+fn owed_handoff_model(name: &'static str, attempt: fn(&RawSemaphore) -> Result<(), usize>) {
+    explore(name, 1, 10, 1, move |witnessed| {
+        let sem = Arc::new(RawSemaphore::new(1));
+        assert!(sem.try_acquire(1), "free at the start");
+        let waiter = {
+            let sem = Arc::clone(&sem);
+            thread::spawn(move || acquire_parking(&sem))
+        };
+        // Lets the waiter queue first, without spending a preemption.
+        thread::yield_now();
+        let mut held = true;
+        for _ in 0..=MAX_BYPASS + 1 {
+            if held {
+                sem.release(1);
+            }
+            let owed = sem.queue().state.load(Ordering::Acquire) & HANDOFF != 0;
+            held = attempt(&sem).is_ok();
+            if owed {
+                witnessed.fetch_add(1, StdOrdering::Relaxed);
+                assert!(!held, "the holder took a lock owed to the queued waiter");
+            }
+            // The waiter retries now, against a lock the holder took back if
+            // its attempt won: a loss it counts.
+            thread::yield_now();
+        }
+        if held {
+            sem.release(1);
+        }
+        waiter.join().expect("waiter");
+        sem.release(1);
+        assert_eq!(sem.available(), 1, "a permit was lost or made up");
+    });
+}
+
+/// E48, the spins. A waiter queues behind the holder; once it has queued,
+/// the holder puts the lock's spin budget back to one round if the waiter's
+/// spin before queueing used it up (as another waiter's won retry would), so
+/// the waiter's next lost retry does spin on its node. The holder lets go and
+/// takes the lock straight back, so the waiter's retry can lose; then it lets
+/// go again, which can land while the waiter spins on its unarmed node (the
+/// release calls no waker) or just after the spin's last read (only the look
+/// sees it). The waiter is served all the same: a lost wakeup would park it
+/// for good, which loom reports as a deadlock. The model counts the spins on
+/// the node, the marks the spin saw, and the marks only the look saw, and
+/// fails if any of the three never happened.
+pub fn a_nudge_while_the_waiter_spins_is_never_lost() {
+    node_spin_model(
+        "a_nudge_while_the_waiter_spins_is_never_lost",
+        [100, 10, 10],
+    );
+}
+
+/// The same run with the look after a spin that runs out taken away
+/// (`spin_probe::SKIP_LOOK`): the production `Wait::spin_park` then arms
+/// the waker without reading the marks. A nudge that landed while the
+/// waiter spun, or after its last read, is left unread beside a sleeper,
+/// and the arming swap's check fails.
+pub fn calibration_a_node_spin_that_skips_its_look_sleeps_beside_the_mark() {
+    super::waiter::spin_probe::SKIP_LOOK.with(|skip| skip.set(true));
+    node_spin_model(
+        "calibration_a_node_spin_that_skips_its_look_sleeps_beside_the_mark",
+        [0, 0, 0],
+    );
+}
+
+/// The run of the two models above; `floors` are the least counts of node
+/// spins, marks the spin saw, and marks only the look saw.
+fn node_spin_model(name: &'static str, floors: [usize; 3]) {
+    super::waiter::spin_probe::take();
+    explore(name, 2, 10, 1, |witnessed| {
+        let sem = Arc::new(RawSemaphore::new(1));
+        assert!(sem.try_acquire(1), "free at the start");
+        let waiter = {
+            let sem = Arc::clone(&sem);
+            thread::spawn(move || acquire_parking(&sem))
+        };
+        while sem.queue().state.load(Ordering::Acquire) & QUEUED == 0 {
+            thread::yield_now();
+        }
+        if sem.queue().spin.rounds() == 0 {
+            sem.queue().spin.won(0);
+        }
+        sem.release(1);
+        if sem.take_one().is_ok() {
+            // The holder took the lock back past the waiter.
+            witnessed.fetch_add(1, StdOrdering::Relaxed);
+            thread::yield_now();
+            sem.release(1);
+        }
+        waiter.join().expect("waiter");
+        sem.release(1);
+        assert_eq!(sem.available(), 1, "a permit was lost or made up");
+    });
+    let [spins, seen, late] = super::waiter::spin_probe::take();
+    println!(
+        "loom model {name}: {spins} node spins, {seen} marks seen by the spin, {late} only by the look"
+    );
+    assert!(
+        spins >= floors[0],
+        "{name}: {spins} node spins, below the floor {}",
+        floors[0]
+    );
+    assert!(
+        seen >= floors[1],
+        "{name}: {seen} marks seen by a spin, below the floor {}",
+        floors[1]
+    );
+    assert!(
+        late >= floors[2],
+        "{name}: {late} marks seen only by the look, below the floor {}",
+        floors[2]
     );
 }

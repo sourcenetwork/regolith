@@ -3,52 +3,120 @@
 
 This file backs the TLA+ model `proofs/tla/Sync.tla`, invariants
 `MutualExclusion`, `BoundedBypass`, `HandoffExclusive` and `NoLostWakeup`
-(configurations `MC_Sync_*`), and the exclusive side of
-`proofs/tla/SyncRwLock.tla`. TLC checks the concurrent protocol there, step
-by atomic step, for three tasks. Here the Mutex is a sequential state
-machine over the abstract steps (barging fast path, enqueue, release, three
-kinds of poll, two kinds of cancel); a reachable state is the result of any
-sequence of them, so every interleaving of those steps is covered. The
-theorems hold for every number of requests, every number of steps and
-every bound `B` (D49's BOUND).
+(configurations `MC_Sync_*`), the exclusive side of
+`proofs/tla/SyncRwLock.tla` and the turn semaphore of
+`proofs/tla/SyncOnce.tla`. TLC checks the concurrent protocol there, one
+machine instruction at a time, for two or three tasks. Here the Mutex is a
+sequential state machine over the same steps taken whole (barging fast
+path, enqueue, release, four kinds of poll, two kinds of cancel); a
+reachable state is the result of any sequence of them, so every
+interleaving of those steps is covered. The theorems hold for every number
+of requests, every number of steps and every bound `B` of at least 1 (the
+code's `MAX_BYPASS`: 16 in the engine, 2 under loom).
 
-The protocol (D49). The fast path takes a free lock whenever no handoff is
-owed, even while waiters queue: barging. A release with waiters frees the
-lock and wakes the head, which competes when polled, unless the head has
-lost `B` races: then the lock passes straight to the head, stays held, and
-the owed bit shuts barging until the head takes it. A woken head that loses
-keeps its place and counts the loss. A cancelled waiter passes on a handoff
-it was owed (to the next waiter, or frees the lock), and a wake it was given
-(to the next head).
+## The story, for a reader who has never seen the code
 
-What is proved, in plain words:
+A lock lets one task at a time into a piece of code. regolith's async locks
+(src/sync/) let a task take the lock whenever it is free, even when others
+are queued for it ("barging"): the alternative, handing the lock to the
+longest waiter, leaves it idle until that sleeping task is scheduled.
+
+Tiny example of what barging can do: task A waits. Every time the lock is
+released A is woken, but task B, already running, grabs the lock first.
+A loses the race again and again. So a waiter counts the races it loses.
+The retry that would be its `B`-th loss does two things in one indivisible
+step: it finds the lock taken, and it raises a flag that says "a handoff is
+owed". While the flag is up nobody may barge, and the release that follows
+hands the lock straight to that waiter.
+
+What could go wrong: two holders at once; a waiter that loses for ever; a
+newcomer slipping in while a handoff is owed; a waiter asleep beside a free
+lock. The theorems below rule each of these out for the abstract lock, for
+any number of requests.
+
+## The steps, and the code each one stands for
+
+* `fast`: `Contend::poll`'s first try (`Lock::try_take`, also `try_lock`):
+  one compare-and-swap takes a free lock when no handoff is owed, whoever
+  waits.
+* `enqueue`: the try failed, so the caller queues at the tail with a count
+  of 0 (`Lock::enqueue`).
+* `release`: a guard is dropped (`RawSemaphore::release`) and the drain
+  pass that follows runs (`RawSemaphore::pass`). With no handoff owed the
+  lock is free and the head is nudged (woken). With a handoff owed the
+  pass takes the lock for the head and grants it.
+* `pollHanded`: a waiter that was granted the lock is polled and holds it.
+* `pollWin`: a nudged waiter's retry takes the free lock.
+* `pollLose`: a nudged waiter's retry finds the lock taken, below the
+  bound: the count goes up by one (`Contend::bypass`).
+* `pollOwe`: the retry that would be the `B`-th loss (`Lock::take_or_owe`)
+  finds the lock taken: the count reaches `B` and the owed flag goes up,
+  in the same step.
+* `cancelWaiting`, `cancelHanded`: the waiting future is dropped
+  (`Contend::cancel`). A nudge it carried passes to the new head; a lock it
+  had been granted is released like any other.
+
+Three things are simpler here than in the code, and why that is sound for
+these theorems. The release and the drain pass after it are one step: while
+a handoff is owed nobody can take what the release freed (theorem
+`owed_blocks_barging`), so nothing can happen in between that these laws
+could see. The owed flag names its waiter: the code keeps a bit (HANDOFF)
+and a count of waiters marked owed; with one permit only the head is ever
+nudged, so only the head can be the one. And there is no drain role: who
+runs the pass, and how many passes one thread runs, is not in this machine
+at all. That last bound (`DrainBounded` in `Sync.tla`: one pass, plus one
+for each waiter operation or release with a node queued that lands on it)
+is checked in TLA+ only, where the drain is modelled instruction by
+instruction.
+
+## What is proved, in plain words
 
 1. `step_inv` and `reachable_inv`: the invariant holds in every reachable
    state.
 2. `mutual_exclusion`: at most one request holds the lock, and none while
    it is free. TLA+: `MutualExclusion`.
-3. `bounded_bypass`, `lose_below_bound`, `bypass_counts_losses`: a queued
-   request's bypass count never exceeds `B`; a loss happens only below `B`;
-   and only a loss changes a queued request's count, by one. So a request
-   loses at most `B` races. `release_hands_off_at_bound`: once it has lost
-   `B`, the next release hands it the lock. TLA+: `BoundedBypass`.
-4. `owed_exclusive` and `owed_blocks_barging`: while a handoff is owed to
-   `w`, `w` holds the lock and nobody else does, and no step makes anyone
-   but `w` an owner. TLA+: `HandoffExclusive`.
-5. `no_stranded_head` and `handed_woken`: while the lock is free, the head
+3. `bounded_bypass`, `lose_below_bound`, `bypass_counts_losses`,
+   `owed_at_bound`, `at_bound_owed`: a queued request's count never exceeds
+   `B`; a loss happens only below `B`; only a loss changes a request's
+   count, by one; the loss that brings the count to `B` raises the owed
+   flag in the same step; and a waiter whose count is `B` is owed. So a
+   request loses at most `B` races. TLA+: `BoundedBypass`.
+4. `release_hands_off_at_bound`: once a waiter is owed, the release that
+   follows hands it the lock.
+5. `owed_exclusive` and `owed_blocks_barging`: while a handoff is owed the
+   lock is not free and nobody competes for it, and no step makes anyone
+   but the owed waiter an owner. TLA+: `HandoffExclusive`.
+6. `no_stranded_head` and `handed_woken`: while the lock is free, the head
    waiter has been woken; a request handed the lock has been woken.
    TLA+: `NoLostWakeup`.
-6. The RED cases, as counterexamples: `unbounded_barging_breaks_bound` (a
-   release that never hands off lets a waiter lose more than `B` races) and
+7. E48, the waiter's node while its future spins: `no_lost_wakeup_spinning`
+   (a future asleep with its waker armed never has an unread mark on its node,
+   spins included), `mark_spinning_wakes_nobody` (a release that finds the
+   waiter spinning calls no waker; the spinner reads the mark itself) and the
+   RED case `spin_without_look_strands` (a spin that sleeps without its look
+   leaves the waiter asleep beside a mark). TLA+: `NoLostWakeup`,
+   `MC_Sync_Red_SpinNoRecheck`.
+8. The RED cases, as counterexamples: `unbounded_barging_breaks_bound` and
+   `unbounded_barging_leaves_barging_open` (a waiter that never raises the
+   owed flag loses more than `B` races, with barging still open) and
    `release_without_wake_strands` (a release that wakes nobody leaves the
    head asleep beside a free lock).
 
+`Regolith/LockTable.lean` builds the pessimistic lock table on this
+machine: it uses `M`, `init`, `Step`, `Steps`, the four laws
+`mutual_exclusion`, `bounded_bypass`, `no_stranded_head` and
+`handed_woken`, the helper `eq_single_of_mem`, and the RED relation
+`StepsNoHand` with `unbounded_barging_breaks_bound`. Those keep their names
+and their statements here.
+
 How to read the Lean: `def` defines a function or a property, `theorem`
 states a fact and its proof follows `:= by`. Lines starting with `--` are
-comments. `l.erase x` is `l` without its first `x`; `o.toList` is `[w]`
-for `some w` and `[]` for `none`.
+comments. `l.erase x` is `l` without its first `x`. `grind` is Lean's
+automatic prover: it is given the facts in scope and must find the
+argument itself; the comment above each use says what that argument is.
 -/
 
+-- Everything below is named Regolith.Sync.<name>.
 namespace Regolith.Sync
 
 /-! ## The state -/
@@ -58,7 +126,8 @@ every acquire. -/
 structure M where
   /-- The lock is free. -/
   free : Bool
-  /-- The handoff-owed bit, naming the request the lock was handed to. -/
+  /-- The handoff-owed flag (the HANDOFF bit), naming the waiter that
+  raised it. -/
   owed : Option Nat
   /-- The waiting requests, oldest first. A woken head keeps its place. -/
   queue : List Nat
@@ -66,7 +135,7 @@ structure M where
   owners : List Nat
   /-- Requests the lock was handed to, not yet polled: they hold it. -/
   handed : List Nat
-  /-- Requests whose woken bit is set: woken, not yet polled. -/
+  /-- Requests that were nudged or granted and not polled since. -/
   woken : List Nat
   /-- Each request's bypass count: races it lost. -/
   bypass : Nat → Nat
@@ -79,42 +148,43 @@ def init : M := ⟨true, none, [], [], [], [], fun _ => 0, []⟩
 /-- `f` with `f r` replaced by `v`. -/
 def upd (f : Nat → Nat) (r v : Nat) : Nat → Nat := fun x => if x = r then v else f x
 
-/-- Wake the head waiter, unless its woken bit is set already. -/
+/-- The list `l` with every `r` taken out. -/
+def without (l : List Nat) (r : Nat) : List Nat := l.filter (fun x => x != r)
+
+/-- Wake the head waiter, unless it is woken already. -/
 def wakeHead (s : M) : M :=
+  -- Look at the queue.
   match s.queue with
   -- Nobody waits: nobody to wake.
   | [] => s
   -- The head `h` is woken if it is not already.
   | h :: _ => if h ∈ s.woken then s else { s with woken := s.woken ++ [h] }
 
-/-- A release, after the owner's guard is gone: free the lock and wake
-the head, or, if the head has lost `B` races, hand it the lock (it stays
-held), set the owed bit and wake it. -/
-def relFrom (B : Nat) (s : M) : M :=
-  match s.queue with
-  -- Nobody waits: one RMW frees the lock.
-  | [] => { s with free := true }
-  | h :: t =>
-    if s.bypass h < B
-      -- Below the bound: free, and the head competes when polled.
-      then wakeHead { s with free := true }
-      -- At the bound: hand off; the head is popped, holds, and is woken.
-      else { s with owed := some h, handed := s.handed ++ [h], queue := t,
-                    woken := s.woken ++ [h] }
+/-- A release, after the owner's guard is gone, with the drain pass that
+follows it. With a handoff owed, the pass takes the lock for the head and
+grants it: the lock stays held, the head leaves the queue and is woken.
+Otherwise the lock is free and the head is woken to compete. -/
+def relFrom (s : M) : M :=
+  -- Look at the queue and at the owed flag.
+  match s.queue, s.owed with
+  -- A head `h` and a handoff owed: the lock goes to the head.
+  | h :: t, some _ => { s with handed := s.handed ++ [h], queue := t, woken := s.woken ++ [h] }
+  -- Nobody waits, or nothing is owed: free the lock and wake the head, if any.
+  | _, _ => wakeHead { s with free := true }
 
-/-- A handoff passes on (its waiter was cancelled): to the next waiter,
-whatever its count, or the lock is freed if nobody waits. -/
-def passOn (s : M) : M :=
-  match s.queue with
-  -- Nobody waits: free the lock.
-  | [] => { s with free := true }
-  -- The next waiter is handed the lock, and woken.
-  | h :: t => { s with owed := some h, handed := s.handed ++ [h], queue := t,
-                       woken := s.woken ++ [h] }
+/-- The state after the waiting request `r` leaves the queue: it is in
+neither the queue nor the woken list, and a handoff it was owed is owed no
+more. -/
+def leave (s : M) (r : Nat) : M :=
+  -- `r` leaves the queue and the woken list,
+  { s with queue := without s.queue r, woken := without s.woken r,
+           -- and the owed flag comes down if it was `r`'s.
+           owed := if s.owed = some r then none else s.owed }
 
 /-- After a waiting request leaves: if the lock is free and no handoff is
-owed, the new head is woken (a wake the leaver had is passed on). -/
+owed, the new head is woken (a nudge the leaver carried is passed on). -/
 def wakeIfFree (s : M) : M :=
+  -- With the lock free and no handoff owed, wake the head; otherwise change nothing.
   if s.free = true ∧ s.owed = none then wakeHead s else s
 
 /-! ## The steps -/
@@ -130,30 +200,35 @@ inductive Step (B : Nat) : M → M → Prop
       (hf : s.free = true)
       -- No handoff is owed.
       (ho : s.owed = none) :
+      -- After the step: the lock is held, r is an owner, and r has entered.
       Step B s { s with free := false, owners := r :: s.owners, enq := s.enq ++ [r] }
   /-- A contended lock: the fast path failed, so the fresh request `r`
-  registers at the tail with a count of 0. (Its re-check after registering
-  is the fast path again, which failed for the same reason.) -/
+  queues at the tail with a count of 0. (Its look at its node after
+  queueing finds nothing: nobody can have nudged it yet.) -/
   | enqueue (s : M) (r : Nat)
       -- `r` is a fresh request.
       (hr : r ∉ s.enq)
       -- The fast path is shut: the lock is held, or a handoff is owed.
       (hc : s.free = false ∨ s.owed ≠ none) :
+      -- After the step: r is at the tail of the queue, has entered, and has a count of 0.
       Step B s { s with queue := s.queue ++ [r], enq := s.enq ++ [r], bypass := upd s.bypass r 0 }
-  /-- An owner drops its guard. -/
+  /-- An owner drops its guard, and the pass that follows runs. -/
   | release (s : M) (r : Nat)
       -- `r` holds the lock.
       (hr : r ∈ s.owners) :
-      Step B s (relFrom B { s with owners := s.owners.erase r })
-  /-- A woken request that was handed the lock takes it; the owed bit
-  clears. -/
+      -- After the step: r is no longer an owner, and the release rule ran.
+      Step B s (relFrom { s with owners := s.owners.erase r })
+  /-- A woken request that was handed the lock takes it; the owed flag
+  comes down. -/
   | pollHanded (s : M) (h : Nat)
       -- `h` was woken ...
       (hw : h ∈ s.woken)
       -- ... and handed the lock.
       (hh : h ∈ s.handed) :
+      -- After the step: h is an owner, no longer "handed",
       Step B s { s with owners := h :: s.owners, handed := s.handed.erase h,
-                        woken := s.woken.erase h, owed := none }
+                        -- no longer "woken", and no handoff is owed.
+                        woken := without s.woken h, owed := none }
   /-- A woken request wins the race: the lock is free and no handoff owed. -/
   | pollWin (s : M) (h : Nat)
       -- `h` was woken ...
@@ -164,31 +239,59 @@ inductive Step (B : Nat) : M → M → Prop
       (hf : s.free = true)
       -- No handoff is owed.
       (ho : s.owed = none) :
-      Step B s { s with free := false, owners := h :: s.owners, queue := s.queue.erase h,
-                        woken := s.woken.erase h }
-  /-- A woken request loses the race (someone barged in): it keeps its
-  place, its count goes up by one, and its woken bit clears. -/
+      -- After the step: the lock is held, h is an owner, h has left the queue,
+      Step B s { s with free := false, owners := h :: s.owners, queue := without s.queue h,
+                        -- and h is no longer "woken".
+                        woken := without s.woken h }
+  /-- A woken request loses the race (someone barged in), below the bound:
+  it keeps its place, its count goes up by one, and it sleeps again. -/
   | pollLose (s : M) (h : Nat)
       -- `h` was woken ...
       (hw : h ∈ s.woken)
       -- ... and not handed the lock.
       (hh : h ∉ s.handed)
-      -- The fast path is shut for it.
-      (hc : s.free = false ∨ s.owed ≠ none) :
-      Step B s { s with bypass := upd s.bypass h (s.bypass h + 1), woken := s.woken.erase h }
-  /-- A waiting request's future is dropped: it leaves, and a wake it had
-  passes to the new head. -/
+      -- The lock is taken.
+      (hf : s.free = false)
+      -- No handoff is owed.
+      (ho : s.owed = none)
+      -- This loss leaves its count below the bound.
+      (hb : s.bypass h + 1 < B) :
+      -- After the step: h's count is one more, and h is no longer "woken".
+      Step B s { s with bypass := upd s.bypass h (s.bypass h + 1), woken := without s.woken h }
+  /-- A woken request loses the race for the `B`-th time (`take_or_owe`):
+  its count reaches the bound and, in the same step, the owed flag goes up
+  for it. It keeps its place and sleeps again. -/
+  | pollOwe (s : M) (h : Nat)
+      -- `h` was woken ...
+      (hw : h ∈ s.woken)
+      -- ... and not handed the lock.
+      (hh : h ∉ s.handed)
+      -- The lock is taken.
+      (hf : s.free = false)
+      -- No handoff is owed yet.
+      (ho : s.owed = none)
+      -- This loss brings its count to the bound.
+      (hb : s.bypass h + 1 = B) :
+      -- After the step: h's count is one more, h is no longer "woken",
+      Step B s { s with bypass := upd s.bypass h (s.bypass h + 1), woken := without s.woken h,
+                        -- and a handoff is owed to h.
+                        owed := some h }
+  /-- A waiting request's future is dropped: it leaves, and a nudge it
+  carried passes to the new head. -/
   | cancelWaiting (s : M) (r : Nat)
       -- `r` waits.
       (hr : r ∈ s.queue) :
-      Step B s (wakeIfFree { s with queue := s.queue.erase r, woken := s.woken.erase r })
-  /-- A request handed the lock is dropped before it was polled: the
-  handoff passes on. -/
+      -- After the step: r has left, and the new head is woken if the lock is free.
+      Step B s (wakeIfFree (leave s r))
+  /-- A request handed the lock is dropped before it was polled: it gives
+  the lock back, which is a release like any other. -/
   | cancelHanded (s : M) (r : Nat)
       -- `r` was handed the lock.
       (hr : r ∈ s.handed) :
-      Step B s (passOn { s with handed := s.handed.erase r, woken := s.woken.erase r,
-                                owed := none })
+      -- After the step: r is no longer "handed" or "woken", nothing is owed,
+      Step B s (relFrom { s with handed := s.handed.erase r, woken := without s.woken r,
+                                 -- and the release rule ran.
+                                 owed := none })
 
 /-- Any number of steps, one after another. -/
 inductive Steps (B : Nat) : M → M → Prop
@@ -203,171 +306,195 @@ inductive Steps (B : Nat) : M → M → Prop
 structure Inv (B : Nat) (s : M) : Prop where
   /-- The lock is free, or held by exactly one request. -/
   excl : (s.owners ++ s.handed).length + (if s.free = true then 1 else 0) = 1
-  /-- A handoff is pending exactly when owed, to the request owed. -/
-  handed_owed : s.handed = s.owed.toList
-  /-- A woken request holds the lock by handoff, or is the head with a
-  count below the bound. -/
-  woken_ok : ∀ x ∈ s.woken, x ∈ s.handed ∨ ∃ t, s.queue = x :: t ∧ s.bypass x < B
+  /-- A request handed the lock is the one the handoff is owed to. -/
+  handed_owed : ∀ x ∈ s.handed, s.owed = some x
+  /-- The waiter a handoff is owed to was handed the lock, or is the head
+  with a count of exactly the bound. -/
+  owed_ok : ∀ w, s.owed = some w → w ∈ s.handed ∨ ∃ t, s.queue = w :: t ∧ s.bypass w = B
+  /-- While a handoff is owed the lock is not free. -/
+  owed_held : ∀ w, s.owed = some w → s.free = false
+  /-- While a handoff is owed, only the request handed the lock is woken:
+  nobody competes. -/
+  owed_quiet : ∀ w, s.owed = some w → ∀ x ∈ s.woken, x ∈ s.handed
+  /-- A woken request was handed the lock, or is the head. -/
+  woken_ok : ∀ x ∈ s.woken, x ∈ s.handed ∨ ∃ t, s.queue = x :: t
   /-- A request handed the lock has been woken. -/
   handed_woken : ∀ x ∈ s.handed, x ∈ s.woken
-  /-- Every waiting request's count is within the bound. -/
-  bypass_le : ∀ x ∈ s.queue, s.bypass x ≤ B
-  /-- Only the head has ever lost: the others have a count of 0. -/
-  tail_zero : ∀ h t, s.queue = h :: t → ∀ x ∈ t, s.bypass x = 0
+  /-- Every waiting request's count is below the bound, unless the handoff
+  is owed to it. -/
+  below : ∀ x ∈ s.queue, s.bypass x < B ∨ s.owed = some x
   /-- While the lock is free, the head has been woken. -/
   stranded : ∀ h t, s.queue = h :: t → s.free = true → h ∈ s.woken
-  /-- While a handoff is owed, only its request is woken. -/
-  owed_woken : s.owed ≠ none → ∀ x ∈ s.woken, x ∈ s.handed
-  /-- Requests entered once each. -/
-  enq_nodup : s.enq.Nodup
   /-- Every request in the lock's lists entered. -/
   all_enq : ∀ x, x ∈ s.queue ∨ x ∈ s.owners ∨ x ∈ s.handed ∨ x ∈ s.woken → x ∈ s.enq
   /-- No request waits twice. -/
   queue_nodup : s.queue.Nodup
   /-- A waiting request holds nothing. -/
   queue_fresh : ∀ x ∈ s.queue, x ∉ s.owners ∧ x ∉ s.handed
-  /-- No request is woken twice. -/
-  woken_nodup : s.woken.Nodup
 
-/-! ## Helper facts -/
+/-! ## Helper facts about lists -/
 
-/-- A list of length one that holds `x` is `[x]`. -/
+/-- A list of length one that holds `x` is `[x]`. (`Regolith/LockTable.lean`
+uses it: the one holder of a key is the pending committer.) -/
 theorem eq_single_of_mem {l : List Nat} {x : Nat}
     -- `l` has one element ...
     (hl : l.length = 1)
     -- ... and `x` is in it.
     (hx : x ∈ l) :
+    -- The statement: l is the one-element list [x].
     l = [x] := by
-  -- One element: `l = [a]`, and `x ∈ [a]` means `x = a`.
+  -- Look at l, knowing its length is 1.
   match l, hl with
+  -- It is [a] for some a; x is in it, so x is a; replace.
   | [a], _ => simp only [List.mem_singleton] at hx; rw [hx]
 
-/-- Under the invariant, if `r` owns the lock, it is held by `r` alone. -/
-theorem Inv.owner_alone {B : Nat} {s : M}
-    -- The invariant holds.
-    (hs : Inv B s) {r : Nat}
-    -- `r` owns the lock.
-    (hr : r ∈ s.owners) :
-    s.owners = [r] ∧ s.handed = [] ∧ s.free = false ∧ s.owed = none := by
-  have hx := hs.excl
-  -- `r` is among the holders, so the holders are not empty.
-  have hpos : 0 < (s.owners ++ s.handed).length :=
-    List.length_pos_of_mem (List.mem_append.2 (Or.inl hr))
-  -- So the lock is not free, and there is exactly one holder.
-  have hfree : s.free = false := by
-    cases hf : s.free
-    · rfl
-    · rw [hf] at hx; simp only [ite_true] at hx; omega
-  rw [hfree] at hx
-  simp only [Bool.false_eq_true, ite_false, Nat.add_zero] at hx
-  have h1 := eq_single_of_mem hx (List.mem_append.2 (Or.inl hr))
-  -- The single holder is `r`, an owner; nobody is handed the lock.
-  have ho : s.owners = [r] := by
-    cases ho : s.owners with
-    | nil => rw [ho] at hr; simp at hr
-    | cons a l =>
-      rw [ho] at h1
-      simp only [List.cons_append, List.cons.injEq, List.append_eq_nil_iff] at h1
-      obtain ⟨rfl, rfl, -⟩ := h1
-      rfl
-  have hh : s.handed = [] := by
-    rw [ho] at h1; simpa using h1
-  -- No handoff pending, so none owed.
-  have hn : s.owed = none := by
-    have := hs.handed_owed
-    rw [hh] at this
-    cases ho' : s.owed with
-    | none => rfl
-    | some w => rw [ho'] at this; simp at this
-  exact ⟨ho, hh, hfree, hn⟩
+/-- `x` is in "`l` without `r`" exactly when it is in `l` and is not `r`. -/
+theorem mem_without {l : List Nat} {r x : Nat} :
+    -- The statement.
+    x ∈ without l r ↔ x ∈ l ∧ x ≠ r := by
+  -- Unfold "without": it keeps the elements that differ from r.
+  simp [without, List.mem_filter]
 
-/-- Under the invariant, a handoff owed to `w` means `w` alone holds the
-lock, by handoff, and the lock is not free. -/
-theorem Inv.owed_alone {B : Nat} {s : M}
-    -- The invariant holds.
-    (hs : Inv B s) {w : Nat}
-    -- A handoff is owed to `w`.
-    (hw : s.owed = some w) :
-    s.handed = [w] ∧ s.owners = [] ∧ s.free = false := by
-  have hh : s.handed = [w] := by rw [hs.handed_owed, hw]; rfl
-  have hx := hs.excl
-  rw [hh] at hx
-  -- One holder already: no owner, and the lock is not free.
-  have : s.owners = [] ∧ s.free = false := by
-    cases ho : s.owners with
-    | nil =>
-      cases hf : s.free
-      · exact ⟨rfl, rfl⟩
-      · rw [ho, hf] at hx; simp at hx
-    | cons a l => rw [ho] at hx; simp at hx; omega
-  exact ⟨hh, this⟩
+/-- Taking `r` out of a list whose first element is not `r` keeps that
+first element first. -/
+theorem without_cons_ne {x r : Nat} {t : List Nat}
+    -- The first element is not `r`.
+    (h : x ≠ r) :
+    -- The statement: x stays in front of what is left of the rest.
+    without (x :: t) r = x :: without t r := by
+  -- Unfold "without": x passes the test "differs from r".
+  simp [without, h]
 
-/-- Under the invariant, while the lock is free nobody holds it. -/
-theorem Inv.free_empty {B : Nat} {s : M}
-    -- The invariant holds.
-    (hs : Inv B s)
-    -- The lock is free.
-    (hf : s.free = true) :
-    s.owners = [] ∧ s.handed = [] ∧ s.owed = none := by
-  have hx := hs.excl
-  rw [hf] at hx
-  simp only [ite_true] at hx
-  have hl : (s.owners ++ s.handed).length = 0 := by omega
-  rw [List.length_eq_zero_iff, List.append_eq_nil_iff] at hl
-  obtain ⟨ho, hh⟩ := hl
-  refine ⟨ho, hh, ?_⟩
-  -- No handoff pending, so none owed.
-  have := hs.handed_owed
-  rw [hh] at this
-  cases ho' : s.owed with
-  | none => rfl
-  | some w => rw [ho'] at this; simp at this
-
-/-- Under the invariant, a woken request not handed the lock is the head,
-with a count below the bound. -/
-theorem Inv.woken_head {B : Nat} {s : M}
-    -- The invariant holds.
-    (hs : Inv B s) {h : Nat}
-    -- `h` was woken ...
-    (hw : h ∈ s.woken)
-    -- ... and not handed the lock.
-    (hh : h ∉ s.handed) :
-    ∃ t, s.queue = h :: t ∧ s.bypass h < B := by
-  rcases hs.woken_ok h hw with hx | hx
-  · exact absurd hx hh
-  · exact hx
+/-- A list with no repeats still has none after `r` is taken out. -/
+theorem nodup_without {l : List Nat} (r : Nat)
+    -- `l` has no repeats.
+    (h : l.Nodup) :
+    -- The statement: neither has l without r.
+    (without l r).Nodup :=
+  -- Keeping some elements of a list without repeats gives a list without repeats.
+  h.filter _
 
 /-! ## What the helpers change -/
 
 /-- Waking the head changes only the woken list: here is every other
 field, unchanged. -/
 theorem wakeHead_fields (u : M) :
+    -- The statement: after waking the head, every field but the woken list is what it was.
     (wakeHead u).free = u.free ∧ (wakeHead u).owed = u.owed ∧ (wakeHead u).queue = u.queue ∧
     (wakeHead u).owners = u.owners ∧ (wakeHead u).handed = u.handed ∧
     (wakeHead u).bypass = u.bypass ∧ (wakeHead u).enq = u.enq := by
   -- Each branch keeps the fields, or replaces only `woken`.
   unfold wakeHead
+  -- Split on the queue.
   split
+  -- Nobody waits: nothing changed at all.
   · exact ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+  -- A head: whether it was already woken or not, only the woken list can differ.
   · split <;> exact ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
 
-/-- Waking the head when the queue is `h :: t`: `h` joins the woken list
-unless it is in it already. -/
-theorem wakeHead_woken {u : M} {h : Nat} {t : List Nat}
-    -- The head is `h`.
-    (hq : u.queue = h :: t) :
-    (wakeHead u).woken = if h ∈ u.woken then u.woken else u.woken ++ [h] := by
-  -- The match takes the `h :: t` branch.
-  simp only [wakeHead, hq]
-  split <;> rfl
-
-/-- Waking the head of an empty queue changes nothing. -/
-theorem wakeHead_nil {u : M}
-    -- Nobody waits.
-    (hq : u.queue = []) :
-    wakeHead u = u := by
+/-- After waking the head, the woken requests are the ones woken before
+and the head. -/
+theorem wakeHead_woken (u : M) (x : Nat) :
+    -- The statement: x is woken afterwards exactly when it was woken before or is the head.
+    x ∈ (wakeHead u).woken ↔ x ∈ u.woken ∨ ∃ t, u.queue = x :: t := by
+  -- Unfold "wake the head".
   unfold wakeHead
-  rw [hq]
+  -- Split on the queue.
+  split
+  -- Nobody waits: nothing changed, and nobody is the head.
+  · next hq => simp [hq]
+  -- A head h, with t behind it.
+  · next h t hq =>
+    -- Was the head woken already?
+    split
+    -- Yes: the woken list is unchanged.
+    · next hm =>
+      -- Show both directions.
+      constructor
+      -- Woken afterwards means woken before.
+      · exact Or.inl
+      -- Woken before, or the head:
+      · rintro (hx | ⟨t', ht'⟩)
+        -- woken before: still woken.
+        · exact hx
+        -- the head: that is h, which was woken already.
+        · rw [hq] at ht'; cases ht'; exact hm
+    -- No: the head joins the woken list. Spell out membership in the longer list.
+    · simp only [List.mem_append, List.mem_singleton, hq, List.cons.injEq]
+      -- Show both directions.
+      constructor
+      -- Woken afterwards: woken before, or it is h.
+      · rintro (hx | rfl)
+        -- Woken before.
+        · exact Or.inl hx
+        -- It is h, the head.
+        · exact Or.inr ⟨t, rfl, rfl⟩
+      -- Woken before, or the head:
+      · rintro (hx | ⟨t', rfl, -⟩)
+        -- woken before.
+        · exact Or.inl hx
+        -- the head, which was just woken.
+        · exact Or.inr rfl
+
+/-- Waking the head changes no count. -/
+theorem wakeHead_bypass (u : M) : (wakeHead u).bypass = u.bypass :=
+  -- That is one of the unchanged fields.
+  (wakeHead_fields u).2.2.2.2.2.1
+
+/-- Waking the head changes no owner. -/
+theorem wakeHead_owners (u : M) : (wakeHead u).owners = u.owners :=
+  -- That is one of the unchanged fields.
+  (wakeHead_fields u).2.2.2.1
+
+/-- With a head and a handoff owed, the release rule hands the lock to the
+head. -/
+theorem relFrom_handoff {s : M} {h w : Nat} {t : List Nat}
+    -- The head is `h`.
+    (hq : s.queue = h :: t)
+    -- A handoff is owed.
+    (ho : s.owed = some w) :
+    -- The statement: the head is handed the lock, leaves the queue and is woken.
+    relFrom s = { s with handed := s.handed ++ [h], queue := t, woken := s.woken ++ [h] } := by
+  -- Unfold the release rule: with that queue and that flag it takes the first branch.
+  simp [relFrom, hq, ho]
+
+/-- With no handoff owed, the release rule frees the lock and wakes the
+head. -/
+theorem relFrom_free {s : M}
+    -- No handoff is owed.
+    (ho : s.owed = none) :
+    -- The statement: the lock is free and the head is woken.
+    relFrom s = wakeHead { s with free := true } := by
+  -- Unfold the release rule.
+  unfold relFrom
+  -- Split on its two branches.
+  split
+  -- The handoff branch needs a handoff owed: there is none.
+  · next heq => rw [ho] at heq; cases heq
+  -- The other branch is the claim.
+  · rfl
+
+/-- The release rule changes no count. -/
+theorem relFrom_bypass (u : M) : (relFrom u).bypass = u.bypass := by
+  -- Unfold the release rule.
+  unfold relFrom
+  -- Split on its two branches.
+  split
+  -- The handoff branch does not touch the counts.
+  · rfl
+  -- The other branch only wakes the head.
+  · exact wakeHead_bypass _
+
+/-- The release rule makes nobody an owner. -/
+theorem relFrom_owners (u : M) : (relFrom u).owners = u.owners := by
+  -- Unfold the release rule.
+  unfold relFrom
+  -- Split on its two branches.
+  split
+  -- The handoff branch does not touch the owners.
+  · rfl
+  -- The other branch only wakes the head.
+  · exact wakeHead_owners _
 
 /-- With the lock free and nothing owed, `wakeIfFree` wakes the head. -/
 theorem wakeIfFree_free {u : M}
@@ -375,176 +502,674 @@ theorem wakeIfFree_free {u : M}
     (hf : u.free = true)
     -- ... and nothing is owed.
     (ho : u.owed = none) :
+    -- The statement: here "wake if free" is "wake the head".
     wakeIfFree u = wakeHead u := by
+  -- Unfold "wake if free".
   unfold wakeIfFree
+  -- Its condition is true.
   simp [hf, ho]
 
 /-- With the lock held, `wakeIfFree` changes nothing. -/
 theorem wakeIfFree_held {u : M}
     -- The lock is held.
     (hf : u.free = false) :
+    -- The statement: here "wake if free" changes nothing.
     wakeIfFree u = u := by
+  -- Unfold "wake if free".
   unfold wakeIfFree
+  -- Its condition is false.
   simp [hf]
 
-/-! ## Two shapes the invariant takes -/
+/-- `wakeIfFree` changes no count. -/
+theorem wakeIfFree_bypass (u : M) : (wakeIfFree u).bypass = u.bypass := by
+  -- Unfold "wake if free".
+  unfold wakeIfFree
+  -- Split on its condition.
+  split
+  -- It wakes the head, which changes no count.
+  · exact wakeHead_bypass _
+  -- It does nothing.
+  · rfl
 
-/-- **A free lock.** Nobody holds it, no handoff is owed, and exactly the
-head (if any) is woken, with a count below the bound; everyone behind it
-has a count of 0. Such a state satisfies the invariant. -/
-theorem inv_free {B : Nat} {u : M}
-    -- The lock is free, unowed, unheld.
-    (hf : u.free = true) (ho : u.owed = none) (hown : u.owners = []) (hh : u.handed = [])
-    -- Exactly the head is woken.
-    (hw : u.woken = u.queue.take 1)
-    -- The head is below the bound.
-    (hhead : ∀ h t, u.queue = h :: t → u.bypass h < B)
-    -- Those behind it have not lost.
-    (htail : ∀ h t, u.queue = h :: t → ∀ x ∈ t, u.bypass x = 0)
-    -- Requests entered once, and every waiter entered.
-    (hen : u.enq.Nodup) (hall : ∀ x ∈ u.queue, x ∈ u.enq)
-    -- No request waits twice.
-    (hqn : u.queue.Nodup) :
-    Inv B u := by
-  -- The woken requests are the head, which is in the queue.
-  have hwq : ∀ x ∈ u.woken, ∃ t, u.queue = x :: t := by
-    intro x hx
-    rw [hw] at hx
-    cases hq : u.queue with
-    | nil => rw [hq] at hx; simp at hx
-    | cons h t => rw [hq] at hx; simp at hx; exact ⟨t, by rw [hx]⟩
-  refine ⟨by simp [hf, hown, hh], by simp [hh, ho], ?_, by simp [hh], ?_, htail, ?_,
-    by simp [ho], hen, ?_, hqn, by simp [hown, hh], ?_⟩
-  · -- A woken request is the head, below the bound.
-    intro x hx
-    obtain ⟨t, ht⟩ := hwq x hx
-    exact Or.inr ⟨t, ht, hhead x t ht⟩
-  · -- The head is below the bound; the others are at 0.
-    intro x hx
-    cases hq : u.queue with
-    | nil => rw [hq] at hx; simp at hx
-    | cons h t =>
-      rw [hq] at hx
-      rcases List.mem_cons.1 hx with rfl | hx
-      · exact Nat.le_of_lt (hhead x t hq)
-      · rw [htail h t hq x hx]; exact Nat.zero_le _
-  · -- The head is the woken one.
-    intro h t hq _
-    rw [hw, hq]
-    simp
-  · -- Every request named entered: owners and handed are empty, the woken
-    -- one waits.
-    intro x hx
-    rcases hx with hx | hx | hx | hx
-    · exact hall x hx
-    · rw [hown] at hx; simp at hx
-    · rw [hh] at hx; simp at hx
-    · obtain ⟨t, ht⟩ := hwq x hx
-      exact hall x (by rw [ht]; exact List.mem_cons_self)
-  · -- At most one woken request.
-    rw [hw]
-    cases u.queue with
-    | nil => simp
-    | cons h t => simp
+/-- `wakeIfFree` makes nobody an owner. -/
+theorem wakeIfFree_owners (u : M) : (wakeIfFree u).owners = u.owners := by
+  -- Unfold "wake if free".
+  unfold wakeIfFree
+  -- Split on its condition.
+  split
+  -- It wakes the head, which changes no owner.
+  · exact wakeHead_owners _
+  -- It does nothing.
+  · rfl
 
-/-- **A lock just handed off.** Request `h` was handed the lock, owed and
-woken; nobody else holds it or is woken; the waiters left have counts of
-0. Such a state satisfies the invariant. -/
-theorem inv_handoff {B : Nat} {u : M} {h : Nat}
-    -- The lock is held, by handoff to `h`, which is owed and woken.
-    (hf : u.free = false) (ho : u.owed = some h) (hown : u.owners = []) (hh : u.handed = [h])
-    (hw : u.woken = [h])
-    -- The waiters left have not lost.
-    (hz : ∀ x ∈ u.queue, u.bypass x = 0)
-    -- `h` no longer waits.
-    (hhq : h ∉ u.queue)
-    -- Requests entered once; every waiter, and `h`, entered.
-    (hen : u.enq.Nodup) (hall : ∀ x ∈ u.queue, x ∈ u.enq) (hhe : h ∈ u.enq)
-    -- No request waits twice.
-    (hqn : u.queue.Nodup) :
-    Inv B u := by
-  refine ⟨by simp [hf, hown, hh], by simp [hh, ho], ?_, ?_, ?_, ?_, ?_, ?_, hen, ?_, hqn, ?_, ?_⟩
-  · -- The woken one holds by handoff.
-    intro x hx; rw [hw] at hx; left; rw [hh]; exact hx
-  · -- The handed one is woken.
-    intro x hx; rw [hh] at hx; rw [hw]; exact hx
-  · -- Waiters are at 0.
-    intro x hx; rw [hz x hx]; exact Nat.zero_le _
-  · -- Waiters are at 0.
-    intro h' t hq x hx; exact hz x (by rw [hq]; exact List.mem_cons_of_mem _ hx)
-  · -- The lock is held.
-    intro h' t _ hfr; rw [hf] at hfr; simp at hfr
-  · -- Only the handed one is woken.
-    intro _ x hx; rw [hw] at hx; rw [hh]; exact hx
-  · -- Every request named entered.
-    intro x hx
-    rcases hx with hx | hx | hx | hx
-    · exact hall x hx
-    · rw [hown] at hx; simp at hx
-    · rw [hh] at hx; simp at hx; rw [hx]; exact hhe
-    · rw [hw] at hx; simp at hx; rw [hx]; exact hhe
-  · -- A waiter is neither an owner nor `h`.
-    intro x hx
-    refine ⟨by simp [hown], ?_⟩
-    rw [hh]; simp only [List.mem_singleton]
-    intro e; subst e; exact hhq hx
-  · -- One woken request.
-    rw [hw]; simp
+/-! ## What the invariant says about who holds the lock -/
 
-/-- Under the invariant, while the lock is free exactly the head (if any)
-is woken. -/
-theorem Inv.free_woken {B : Nat} {s : M}
+/-- Under the invariant, while the lock is free nobody holds it. -/
+theorem Inv.free_empty {B : Nat} {s : M}
     -- The invariant holds.
     (hs : Inv B s)
     -- The lock is free.
     (hf : s.free = true) :
-    s.woken = s.queue.take 1 := by
-  obtain ⟨-, hh, -⟩ := hs.free_empty hf
-  -- Every woken request is the head.
-  have hsub : ∀ x ∈ s.woken, ∃ t, s.queue = x :: t := by
-    intro x hx
-    rcases hs.woken_ok x hx with h' | ⟨t, ht, -⟩
-    · rw [hh] at h'; simp at h'
-    · exact ⟨t, ht⟩
-  cases hq : s.queue with
-  | nil =>
-    -- No head: nobody woken.
-    cases hw : s.woken with
-    | nil => rfl
-    | cons x l =>
-      obtain ⟨t, ht⟩ := hsub x (by rw [hw]; exact List.mem_cons_self)
-      rw [hq] at ht; simp at ht
-  | cons h t =>
-    -- The head is woken (no stranding), and nobody else.
-    have hhw := hs.stranded h t hq hf
-    have hn := hs.woken_nodup
-    simp only [List.take_succ_cons, List.take_zero]
-    have hall : ∀ x ∈ s.woken, x = h := by
-      intro x hx
-      obtain ⟨t', ht'⟩ := hsub x hx
-      rw [hq] at ht'
-      simp only [List.cons.injEq] at ht'
-      exact ht'.1.symm
-    cases hw : s.woken with
-    | nil => rw [hw] at hhw; simp at hhw
-    | cons a l =>
-      have ha := hall a (by rw [hw]; exact List.mem_cons_self)
-      subst ha
-      rw [hw, List.nodup_cons] at hn
-      cases l with
-      | nil => rfl
-      | cons b l' =>
-        have hb := hall b (by rw [hw]; simp)
-        subst hb
-        exact absurd List.mem_cons_self hn.1
+    -- The statement: there is no owner, and nobody was handed the lock.
+    s.owners = [] ∧ s.handed = [] := by
+  -- Start from "the holders plus one-if-free make exactly 1".
+  have hx := hs.excl
+  -- The lock is free.
+  rw [hf] at hx
+  -- So the count says: holders plus 1 is 1.
+  simp only [ite_true] at hx
+  -- So there are no holders.
+  have hl : (s.owners ++ s.handed).length = 0 := by omega
+  -- An empty joined list means both parts are empty.
+  rw [List.length_eq_zero_iff, List.append_eq_nil_iff] at hl
+  -- That is the claim.
+  exact hl
+
+/-- Under the invariant, if somebody holds the lock (as an owner or by
+handoff), the lock is not free and there is exactly one holder. -/
+theorem Inv.holder {B : Nat} {s : M}
+    -- The invariant holds.
+    (hs : Inv B s) {x : Nat}
+    -- `x` holds the lock.
+    (hx : x ∈ s.owners ++ s.handed) :
+    -- The statement: the lock is not free, and owners and handed requests together number 1.
+    s.free = false ∧ s.owners.length + s.handed.length = 1 := by
+  -- Start from "the holders plus one-if-free make exactly 1".
+  have hx' := hs.excl
+  -- `x` is among the holders, so there is at least one.
+  have hpos : 0 < (s.owners ++ s.handed).length := List.length_pos_of_mem hx
+  -- The length of the joined list is the sum of the two lengths.
+  rw [List.length_append] at hx' hpos
+  -- Split on whether the lock is free.
+  cases hf : s.free
+  -- Not free: the count says the holders number exactly 1.
+  · rw [hf] at hx'; simp only [Bool.false_eq_true, ↓reduceIte, Nat.add_zero] at hx'; exact ⟨rfl, hx'⟩
+  -- Free: at least one holder plus one for "free" is more than 1. Arithmetic says no.
+  · rw [hf] at hx'; simp only [↓reduceIte] at hx'; omega
+
+/-- Under the invariant, when the fast path is shut the lock is not free:
+a handoff is only ever owed on a lock that is held. -/
+theorem Inv.shut_held {B : Nat} {s : M}
+    -- The invariant holds.
+    (hs : Inv B s)
+    -- The fast path is shut.
+    (hc : s.free = false ∨ s.owed ≠ none) :
+    -- The statement: the lock is not free.
+    s.free = false := by
+  -- Two ways the fast path is shut.
+  rcases hc with h | h
+  -- The lock is held: that is the claim.
+  · exact h
+  -- A handoff is owed. Split on the flag.
+  · cases ho : s.owed with
+    -- No handoff owed: against "a handoff is owed".
+    | none => exact absurd ho h
+    -- Owed to w: the invariant says the lock is then not free.
+    | some w => exact hs.owed_held w ho
+
+/-- Under the invariant, a waiting request is below the bound, or the
+handoff is owed to it and its count is exactly the bound. -/
+theorem Inv.at_bound {B : Nat} {s : M}
+    -- The invariant holds.
+    (hs : Inv B s) {x : Nat}
+    -- `x` waits.
+    (hx : x ∈ s.queue) :
+    -- The statement: below the bound, or owed with a count of B.
+    s.bypass x < B ∨ (s.owed = some x ∧ s.bypass x = B) := by
+  -- A waiter is below the bound, or owed.
+  rcases hs.below x hx with h | h
+  -- Below the bound: the first alternative.
+  · exact Or.inl h
+  -- Owed: then it was handed the lock, or is the head with a count of B.
+  · rcases hs.owed_ok x h with h' | ⟨t, -, hb⟩
+    -- Handed the lock: but a waiter holds nothing.
+    · exact absurd h' (hs.queue_fresh x hx).2
+    -- The head with a count of B: the second alternative.
+    · exact Or.inr ⟨h, hb⟩
+
+/-- Under the invariant, a woken request that was not handed the lock
+waits, no handoff is owed, and its count is below the bound. -/
+theorem Inv.woken_waits {B : Nat} {s : M}
+    -- The invariant holds.
+    (hs : Inv B s) {x : Nat}
+    -- `x` was woken ...
+    (hw : x ∈ s.woken)
+    -- ... and not handed the lock.
+    (hh : x ∉ s.handed) :
+    -- The statement: x waits, nothing is owed, and x's count is below B.
+    x ∈ s.queue ∧ s.owed = none ∧ s.bypass x < B := by
+  -- A woken request was handed the lock, or is the head.
+  rcases hs.woken_ok x hw with h | ⟨t, ht⟩
+  -- Handed: but x was not.
+  · exact absurd h hh
+  -- The head: so it waits.
+  · have hq : x ∈ s.queue := by rw [ht]; simp
+    -- Nothing is owed:
+    have ho : s.owed = none := by
+      -- split on the flag.
+      cases ho : s.owed with
+      -- None owed: that is the claim.
+      | none => rfl
+      -- Owed to w: then every woken request was handed the lock, but x was not.
+      | some w => exact absurd (hs.owed_quiet w ho x hw) hh
+    -- Two of the three claims; "below the bound" is left.
+    refine ⟨hq, ho, ?_⟩
+    -- A waiter is below the bound, or owed.
+    rcases hs.below x hq with h | h
+    -- Below the bound: that is the claim.
+    · exact h
+    -- Owed: but nothing is owed.
+    · rw [ho] at h; cases h
+
+/-! ## A free lock whose head is woken -/
+
+/-- **Waking the head of a lock that is held by no handoff.** Take a state
+in which nothing is owed, nobody was handed the lock, every woken request
+is the head, and every waiter is below the bound. After waking the head it
+satisfies the invariant. Three steps end this way: a release with nothing
+owed, a waiter leaving a free lock, and a handed request giving the lock
+back. -/
+theorem inv_wake {B : Nat} {u : M}
+    -- Nothing is owed.
+    (ho : u.owed = none)
+    -- The lock is free, or held by exactly one request.
+    (excl : (u.owners ++ u.handed).length + (if u.free = true then 1 else 0) = 1)
+    -- Nobody was handed the lock.
+    (hh : u.handed = [])
+    -- Every woken request is the head.
+    (woken_ok : ∀ x ∈ u.woken, ∃ t, u.queue = x :: t)
+    -- Every waiter is below the bound.
+    (below : ∀ x ∈ u.queue, u.bypass x < B)
+    -- Every request in the lists entered.
+    (all_enq : ∀ x, x ∈ u.queue ∨ x ∈ u.owners ∨ x ∈ u.woken → x ∈ u.enq)
+    -- No request waits twice.
+    (queue_nodup : u.queue.Nodup)
+    -- A waiting request is no owner.
+    (queue_fresh : ∀ x ∈ u.queue, x ∉ u.owners) :
+    -- The statement: after waking the head, the invariant holds.
+    Inv B (wakeHead u) := by
+  -- Waking the head changes only the woken list. Name the unchanged fields.
+  obtain ⟨hf, ho', hq, hown, hhand, hb, he⟩ := wakeHead_fields u
+  -- And the woken requests afterwards are the old ones and the head.
+  have hw := wakeHead_woken u
+  -- Twelve facts to show, one after another.
+  constructor
+  -- One holder or free: owners, handed and "free" are unchanged.
+  · rw [hown, hhand, hf]; exact excl
+  -- Handed means owed: nobody was handed the lock.
+  · rw [hhand, hh]; simp
+  -- The owed waiter is in its place: nothing is owed.
+  · rw [ho', ho]; simp
+  -- Owed means held: nothing is owed.
+  · rw [ho', ho]; simp
+  -- Owed means nobody competes: nothing is owed.
+  · rw [ho', ho]; simp
+  -- A woken request is the head. Take a woken request x.
+  · intro x hx
+    -- The queue is unchanged.
+    rw [hq]
+    -- It was woken before, or is the head.
+    rcases (hw x).1 hx with h | h
+    -- Woken before: it was the head.
+    · exact Or.inr (woken_ok x h)
+    -- The head.
+    · exact Or.inr h
+  -- A handed request is woken: nobody was handed the lock.
+  · rw [hhand, hh]; simp
+  -- Every waiter is below the bound. Take a waiter x.
+  · intro x hx
+    -- The queue and the counts are unchanged.
+    rw [hq] at hx; rw [hb]
+    -- It was below the bound.
+    exact Or.inl (below x hx)
+  -- The head is woken: take the head h.
+  · intro h t hqq _
+    -- The queue is unchanged.
+    rw [hq] at hqq
+    -- The head is among the woken requests afterwards.
+    exact (hw h).2 (Or.inr ⟨t, hqq⟩)
+  -- Every request in the lists entered. Take such a request x.
+  · intro x hx
+    -- The queue, the owners and the entry list are unchanged; nobody is handed.
+    rw [hq, hown, hhand, hh] at hx; rw [he]
+    -- Which list is x in?
+    rcases hx with h | h | h | h
+    -- The queue: it entered.
+    · exact all_enq x (Or.inl h)
+    -- The owners: it entered.
+    · exact all_enq x (Or.inr (Or.inl h))
+    -- The handed list: that list is empty.
+    · simp at h
+    -- The woken list: x was woken before, or is the head.
+    · rcases (hw x).1 h with h | ⟨t, ht⟩
+      -- Woken before: it entered.
+      · exact all_enq x (Or.inr (Or.inr h))
+      -- The head: it is in the queue, so it entered.
+      · exact all_enq x (Or.inl (by rw [ht]; simp))
+  -- No request waits twice: the queue is unchanged.
+  · rw [hq]; exact queue_nodup
+  -- A waiter holds nothing. Take a waiter x.
+  · intro x hx
+    -- The queue and the owners are unchanged; nobody is handed.
+    rw [hq] at hx; rw [hown, hhand, hh]
+    -- It is no owner, and the handed list is empty.
+    exact ⟨queue_fresh x hx, by simp⟩
 
 /-! ## Every step keeps the invariant -/
 
 /-- The start satisfies the invariant. -/
-theorem init_inv (B : Nat) : Inv B init :=
-  -- The lock is free and nobody waits: the free shape.
-  inv_free rfl rfl rfl rfl rfl (by simp [init]) (by simp [init]) List.nodup_nil
-    (by simp [init]) List.nodup_nil
+theorem init_inv (B : Nat) : Inv B init := by
+  -- Twelve facts about a free lock with every list empty: each one computes.
+  constructor <;> simp [init]
+
+/-- The fast path keeps the invariant. -/
+theorem step_inv_fast {B : Nat} {s : M}
+    -- The invariant holds before.
+    (hs : Inv B s) (r : Nat)
+    -- `r` is fresh.
+    (hr : r ∉ s.enq)
+    -- The lock is free.
+    (hf : s.free = true)
+    -- No handoff is owed.
+    (ho : s.owed = none) :
+    -- The statement: the invariant holds once r holds the lock.
+    Inv B { s with free := false, owners := r :: s.owners, enq := s.enq ++ [r] } := by
+  -- The lock was free, so nobody held it.
+  obtain ⟨hown, hhand⟩ := hs.free_empty hf
+  -- Twelve facts. The holders are now exactly r. Nothing is owed, so the three facts about an
+  -- owed handoff ask nothing. The queue, the woken list and the counts are untouched. The lock
+  -- is not free, so "the head of a free lock is woken" asks nothing. r is fresh, so it is no
+  -- waiter, and it has now entered.
+  constructor <;> grind [Inv]
+
+/-- Joining the queue keeps the invariant. -/
+theorem step_inv_enqueue {B : Nat}
+    -- The bound is at least 1.
+    (hB : 0 < B) {s : M}
+    -- The invariant holds before.
+    (hs : Inv B s) (r : Nat)
+    -- `r` is fresh.
+    (hr : r ∉ s.enq)
+    -- The fast path is shut.
+    (hc : s.free = false ∨ s.owed ≠ none) :
+    -- The statement: the invariant holds once r is at the tail with a count of 0.
+    Inv B { s with queue := s.queue ++ [r], enq := s.enq ++ [r], bypass := upd s.bypass r 0 } := by
+  -- The lock is not free.
+  have hf := hs.shut_held hc
+  -- Twelve facts. The holders, the owed flag and the woken list are untouched. A head stays the
+  -- head when r joins at the tail, and its count is untouched because r is fresh, so it is not
+  -- that head. r's own count is 0, below a bound of at least 1. The lock is not free, so "the
+  -- head of a free lock is woken" asks nothing. r is fresh, so it is not in the queue already
+  -- and holds nothing.
+  constructor <;> grind [Inv, upd]
+
+/-- A release keeps the invariant. -/
+theorem step_inv_release {B : Nat} {s : M}
+    -- The invariant holds before.
+    (hs : Inv B s) (r : Nat)
+    -- `r` holds the lock.
+    (hr : r ∈ s.owners) :
+    -- The statement: the invariant holds after r's guard is gone and the release rule ran.
+    Inv B (relFrom { s with owners := s.owners.erase r }) := by
+  -- r holds the lock, so the lock is not free and there is exactly one holder.
+  obtain ⟨hf, hlen⟩ := hs.holder (List.mem_append.2 (Or.inl hr))
+  -- Taking r out of the owners makes that list one shorter.
+  have hl := List.length_erase_of_mem hr
+  -- There is at least one owner, r.
+  have hpos : 0 < s.owners.length := List.length_pos_of_mem hr
+  -- So without r there is no owner,
+  have he : s.owners.erase r = [] := List.length_eq_zero_iff.1 (by omega)
+  -- and nobody was handed the lock.
+  have hhand : s.handed = [] := List.length_eq_zero_iff.1 (by omega)
+  -- A handoff is owed, or not.
+  have hcase : s.owed = none ∨ ∃ w, s.owed = some w := by cases s.owed <;> simp
+  -- Take the two cases in turn.
+  rcases hcase with ho | ⟨w, ho⟩
+  -- Nothing owed: the lock is freed and the head woken.
+  ·
+    -- That is what the release rule does here.
+    rw [relFrom_free (s := { s with owners := s.owners.erase r }) ho]
+    -- The free lock with its head woken: seven conditions to check.
+    refine inv_wake (u := { s with owners := s.owners.erase r, free := true }) ho ?_ ?_ ?_ ?_ ?_ ?_ ?_
+    -- No holder, and the lock free: the count is 1.
+    · simp [he, hhand]
+    -- Nobody was handed the lock.
+    · exact hhand
+    -- A woken request x is the head:
+    · intro x hx
+      -- it was handed the lock, or is the head.
+      rcases hs.woken_ok x hx with h | h
+      -- Handed: nobody was.
+      · rw [hhand] at h; simp at h
+      -- The head.
+      · exact h
+    -- A waiter x is below the bound:
+    · intro x hx
+      -- it is below the bound, or owed.
+      rcases hs.below x hx with h | h
+      -- Below the bound.
+      · exact h
+      -- Owed: nothing is owed.
+      · rw [ho] at h; cases h
+    -- A request x in the lists entered:
+    · intro x hx
+      -- by the invariant, once we say which of the old lists it is in.
+      apply hs.all_enq
+      -- Which list?
+      rcases hx with h | h | h
+      -- The queue.
+      · exact Or.inl h
+      -- The owners without r: that list is empty.
+      · rw [he] at h; simp at h
+      -- The woken list.
+      · exact Or.inr (Or.inr (Or.inr h))
+    -- No request waits twice.
+    · exact hs.queue_nodup
+    -- A waiter is no owner: there is no owner.
+    · intro x _
+      -- The owners without r are nobody.
+      rw [he]; simp
+  -- A handoff is owed to w: the lock goes to the head.
+  ·
+    -- The owed waiter was handed the lock, or is the head with a count of B.
+    rcases hs.owed_ok w ho with h | ⟨t, hq, hb⟩
+    -- Handed: nobody was.
+    · rw [hhand] at h; simp at h
+    -- The head: the release rule hands it the lock.
+    · rw [relFrom_handoff (s := { s with owners := s.owners.erase r }) hq ho]
+      -- The queue has no repeats,
+      have hnd := hs.queue_nodup
+      -- so w is not among those behind it.
+      rw [hq] at hnd
+      -- Twelve facts. The one holder is now w, by handoff, and the lock stays held. The handoff
+      -- is owed to w, which was handed the lock and woken. Before the step every woken request
+      -- had been handed the lock and nobody had, so w is the only woken one. Those behind w keep
+      -- their counts, are still not owners, and none of them is w.
+      constructor <;> grind [Inv]
+
+/-- Taking a handoff keeps the invariant. -/
+theorem step_inv_pollHanded {B : Nat} {s : M}
+    -- The invariant holds before.
+    (hs : Inv B s) (h : Nat)
+    -- `h` was handed the lock.
+    (hh : h ∈ s.handed) :
+    -- The statement: the invariant holds once h owns the lock and nothing is owed.
+    Inv B { s with owners := h :: s.owners, handed := s.handed.erase h,
+                   -- (h is no longer woken, and the flag is down)
+                   woken := without s.woken h, owed := none } := by
+  -- h holds the lock, so the lock is not free and there is exactly one holder.
+  obtain ⟨hf, hlen⟩ := hs.holder (List.mem_append.2 (Or.inr hh))
+  -- Taking h out of the handed list makes it one shorter.
+  have hl := List.length_erase_of_mem hh
+  -- At least one request was handed the lock, h.
+  have hpos : 0 < s.handed.length := List.length_pos_of_mem hh
+  -- So without h nobody is handed the lock,
+  have he : s.handed.erase h = [] := List.length_eq_zero_iff.1 (by omega)
+  -- and there was no owner.
+  have hown : s.owners = [] := List.length_eq_zero_iff.1 (by omega)
+  -- Twelve facts. The one holder is now h, as an owner. Nothing is owed and nobody is handed
+  -- the lock, so the facts about a handoff ask nothing. The handoff was owed to h, so every
+  -- woken request was h: with h polled nobody is woken. A waiter was below the bound unless the
+  -- handoff was owed to it, and it was owed to h, which did not wait.
+  constructor <;> grind [Inv, mem_without]
+
+/-- Winning the race keeps the invariant. -/
+theorem step_inv_pollWin {B : Nat} {s : M}
+    -- The invariant holds before.
+    (hs : Inv B s) (h : Nat)
+    -- `h` was woken ...
+    (hw : h ∈ s.woken)
+    -- ... and not handed the lock.
+    (hh : h ∉ s.handed)
+    -- The lock is free.
+    (hf : s.free = true)
+    -- No handoff is owed.
+    (ho : s.owed = none) :
+    -- The statement: the invariant holds once h owns the lock and has left the queue.
+    Inv B { s with free := false, owners := h :: s.owners, queue := without s.queue h,
+                   -- (and h is no longer woken)
+                   woken := without s.woken h } := by
+  -- The lock was free, so nobody held it.
+  obtain ⟨hown, hhand⟩ := hs.free_empty hf
+  -- The queue without h still has no repeats.
+  have hnd := nodup_without h hs.queue_nodup
+  -- Twelve facts. The one holder is now h. Nothing is owed. Every woken request was the head,
+  -- which is h: with h polled nobody is woken. The waiters left keep their counts, below the
+  -- bound, and none of them is h. The lock is not free, so "the head of a free lock is woken"
+  -- asks nothing.
+  constructor <;> grind [Inv, mem_without]
+
+/-- Losing a race below the bound keeps the invariant. -/
+theorem step_inv_pollLose {B : Nat} {s : M}
+    -- The invariant holds before.
+    (hs : Inv B s) (h : Nat)
+    -- `h` was woken ...
+    (hw : h ∈ s.woken)
+    -- ... and not handed the lock.
+    (hh : h ∉ s.handed)
+    -- The lock is taken.
+    (hf : s.free = false)
+    -- No handoff is owed.
+    (ho : s.owed = none)
+    -- The loss leaves the count below the bound.
+    (hb : s.bypass h + 1 < B) :
+    -- The statement: the invariant holds once h's count is one more and h sleeps again.
+    Inv B { s with bypass := upd s.bypass h (s.bypass h + 1), woken := without s.woken h } := by
+  -- Twelve facts. The holders, the queue and the owed flag are untouched. Nothing is owed. h's
+  -- new count is below the bound, and every other count is unchanged. Fewer requests are woken,
+  -- and a handed request is not h, so it is still woken. The lock is not free, so "the head of
+  -- a free lock is woken" asks nothing.
+  constructor <;> grind [Inv, upd, mem_without]
+
+/-- The loss that reaches the bound keeps the invariant. -/
+theorem step_inv_pollOwe {B : Nat} {s : M}
+    -- The invariant holds before.
+    (hs : Inv B s) (h : Nat)
+    -- `h` was woken ...
+    (hw : h ∈ s.woken)
+    -- ... and not handed the lock.
+    (hh : h ∉ s.handed)
+    -- The lock is taken.
+    (hf : s.free = false)
+    -- No handoff is owed yet.
+    (ho : s.owed = none)
+    -- The loss brings the count to the bound.
+    (hb : s.bypass h + 1 = B) :
+    -- The statement: the invariant holds once h's count is B, h sleeps again,
+    Inv B { s with bypass := upd s.bypass h (s.bypass h + 1), woken := without s.woken h,
+                   -- and the handoff is owed to h.
+                   owed := some h } := by
+  -- Twelve facts. The holders and the queue are untouched. Nothing was owed, so nobody had been
+  -- handed the lock. h was woken and not handed, so it is the head, and its count is now B: the
+  -- owed waiter is in its place. The lock is taken. Every woken request was the head, h: with
+  -- h asleep nobody is woken, so nobody competes. Every other waiter keeps a count below the
+  -- bound.
+  constructor <;> grind [Inv, upd, mem_without]
+
+/-- A waiter leaving the queue keeps the invariant. -/
+theorem step_inv_cancelWaiting {B : Nat} {s : M}
+    -- The invariant holds before.
+    (hs : Inv B s) (r : Nat)
+    -- `r` waits.
+    (hr : r ∈ s.queue) :
+    -- The statement: the invariant holds once r has left and the new head was woken if needed.
+    Inv B (wakeIfFree (leave s r)) := by
+  -- The queue without r still has no repeats.
+  have hnd := nodup_without r hs.queue_nodup
+  -- The lock is free, or not.
+  rcases Bool.eq_false_or_eq_true s.free with hf | hf
+  -- The lock is free.
+  ·
+    -- Then nothing is owed:
+    have ho : s.owed = none := by
+      -- split on the flag.
+      cases ho : s.owed with
+      -- None owed: that is the claim.
+      | none => rfl
+      -- Owed to w: then the lock would not be free.
+      | some w => have := hs.owed_held w ho; rw [hf] at this; cases this
+    -- Nobody holds a free lock.
+    obtain ⟨hown, hhand⟩ := hs.free_empty hf
+    -- Nothing is owed after r leaves either.
+    have ho' : (if s.owed = some r then none else s.owed) = none := by rw [ho]; simp
+    -- So the new head is woken.
+    rw [wakeIfFree_free (u := leave s r) hf ho']
+    -- The free lock with its head woken: the conditions left to check.
+    refine inv_wake (u := leave s r) ho' ?_ hhand ?_ ?_ ?_ hnd ?_
+    -- The holders and "free" are untouched.
+    · exact hs.excl
+    -- A request x still woken is the head of the queue without r:
+    · intro x hx
+      -- it was woken before, and is not r.
+      obtain ⟨hxw, hne⟩ := mem_without.1 hx
+      -- It was handed the lock, or was the head.
+      rcases hs.woken_ok x hxw with h | ⟨t, ht⟩
+      -- Handed: nobody was.
+      · rw [hhand] at h; simp at h
+      -- The head, and not r: it is still the head once r is gone.
+      · exact ⟨without t r, by show without s.queue r = _; rw [ht]; exact without_cons_ne hne⟩
+    -- A waiter x that is left is below the bound:
+    · intro x hx
+      -- it waited before, so it was below the bound, or owed.
+      rcases hs.below x (mem_without.1 hx).1 with h | h
+      -- Below the bound.
+      · exact h
+      -- Owed: nothing was owed.
+      · rw [ho] at h; cases h
+    -- A request x in the lists entered:
+    · intro x hx
+      -- by the invariant, once we say which of the old lists it is in.
+      apply hs.all_enq
+      -- Which list?
+      rcases hx with h | h | h
+      -- The queue without r: it was in the queue.
+      · exact Or.inl (mem_without.1 h).1
+      -- The owners.
+      · exact Or.inr (Or.inl h)
+      -- The woken list without r: it was woken.
+      · exact Or.inr (Or.inr (Or.inr (mem_without.1 h).1))
+    -- A waiter that is left is no owner: it waited before.
+    · intro x hx
+      -- A waiter was no owner.
+      exact (hs.queue_fresh x (mem_without.1 hx).1).1
+  -- The lock is held: nobody is woken, and the state is just "r has left".
+  ·
+    -- "Wake if free" does nothing.
+    rw [wakeIfFree_held (u := leave s r) hf]
+    -- The owed waiter is still in its place:
+    have hok : ∀ w, (leave s r).owed = some w →
+        w ∈ (leave s r).handed ∨ ∃ t, (leave s r).queue = w :: t ∧ (leave s r).bypass w = B := by
+      -- take a waiter w that the handoff is owed to after r left.
+      intro w hw
+      -- It was owed before, and w is not r (r's own handoff was dropped).
+      have hw' : s.owed = some w ∧ w ≠ r := by
+        -- Unfold what "owed after r left" means.
+        simp only [leave] at hw
+        -- Was the handoff r's?
+        split at hw
+        -- Yes: then nothing is owed now, against "owed to w".
+        · cases hw
+        -- No: the flag is unchanged, and w is not r.
+        · next hne => exact ⟨hw, fun e => hne (e ▸ hw)⟩
+      -- Before the step w was handed the lock, or was the head with a count of B.
+      rcases hs.owed_ok w hw'.1 with h | ⟨t, ht, hb⟩
+      -- Handed: it still is.
+      · exact Or.inl h
+      -- The head, and not r: it is still the head once r is gone, with the same count.
+      · exact Or.inr ⟨without t r, by show without s.queue r = _; rw [ht]; exact without_cons_ne hw'.2, hb⟩
+    -- A woken request is still handed the lock, or the head:
+    have hwok : ∀ x ∈ (leave s r).woken,
+        x ∈ (leave s r).handed ∨ ∃ t, (leave s r).queue = x :: t := by
+      -- take a request x still woken.
+      intro x hx
+      -- It was woken before, and is not r.
+      obtain ⟨hxw, hne⟩ := mem_without.1 hx
+      -- It was handed the lock, or was the head.
+      rcases hs.woken_ok x hxw with h | ⟨t, ht⟩
+      -- Handed: it still is.
+      · exact Or.inl h
+      -- The head, and not r: it is still the head once r is gone.
+      · exact Or.inr ⟨without t r, by show without s.queue r = _; rw [ht]; exact without_cons_ne hne⟩
+    -- Twelve facts. Two were just shown. The holders are untouched, and a handed request is no
+    -- waiter, so it is not r: its handoff is still owed and it is still woken. If a handoff is
+    -- still owed it was owed before, so the lock is held and nobody competes. A waiter that is
+    -- left keeps its count, and if the handoff was owed to it, it still is. The lock is not
+    -- free, so "the head of a free lock is woken" asks nothing.
+    constructor <;> grind [Inv, leave, mem_without]
+
+/-- A handed request giving the lock back keeps the invariant. -/
+theorem step_inv_cancelHanded {B : Nat} {s : M}
+    -- The invariant holds before.
+    (hs : Inv B s) (r : Nat)
+    -- `r` was handed the lock.
+    (hr : r ∈ s.handed) :
+    -- The statement: the invariant holds once r is gone, nothing is owed,
+    Inv B (relFrom { s with handed := s.handed.erase r, woken := without s.woken r,
+                            -- and the release rule ran.
+                            owed := none }) := by
+  -- r holds the lock, so the lock is not free and there is exactly one holder.
+  obtain ⟨hf, hlen⟩ := hs.holder (List.mem_append.2 (Or.inr hr))
+  -- Taking r out of the handed list makes it one shorter.
+  have hl := List.length_erase_of_mem hr
+  -- At least one request was handed the lock, r.
+  have hpos : 0 < s.handed.length := List.length_pos_of_mem hr
+  -- So without r nobody is handed the lock,
+  have he : s.handed.erase r = [] := List.length_eq_zero_iff.1 (by omega)
+  -- and there is no owner.
+  have hown : s.owners = [] := List.length_eq_zero_iff.1 (by omega)
+  -- The handoff was owed to r.
+  have hor := hs.handed_owed r hr
+  -- With nothing owed, the release rule frees the lock and wakes the head.
+  rw [relFrom_free rfl]
+  -- The free lock with its head woken: seven conditions to check.
+  refine inv_wake (u := { s with handed := s.handed.erase r, woken := without s.woken r,
+                                 -- (the state the head is woken in)
+                                 owed := none, free := true }) rfl ?_ ?_ ?_ ?_ ?_ ?_ ?_
+  -- No holder, and the lock free: the count is 1.
+  · simp [he, hown]
+  -- Nobody is handed the lock.
+  · exact he
+  -- Nobody but r was woken, so nobody is woken now. Take a request x still woken:
+  · intro x hx
+    -- it was woken before, and is not r.
+    have hx' := mem_without.1 hx
+    -- While the handoff was owed to r every woken request had been handed the lock, so the
+    -- handoff was owed to x too.
+    have := hs.handed_owed x (hs.owed_quiet r hor x hx'.1)
+    -- It was owed to r.
+    rw [hor] at this
+    -- So x is r: against "x is not r".
+    exact absurd (Option.some.inj this).symm hx'.2
+  -- A waiter x is below the bound:
+  · intro x hx
+    -- it is below the bound, or the handoff was owed to it.
+    rcases hs.below x hx with h | h
+    -- Below the bound.
+    · exact h
+    -- Owed to x: but it was owed to r,
+    · rw [hor] at h
+      -- so x is r,
+      cases h
+      -- which was handed the lock and did not wait.
+      exact absurd hr (hs.queue_fresh r hx).2
+  -- A request x in the lists entered:
+  · intro x hx
+    -- by the invariant, once we say which of the old lists it is in.
+    apply hs.all_enq
+    -- Which list?
+    rcases hx with h | h | h
+    -- The queue.
+    · exact Or.inl h
+    -- The owners.
+    · exact Or.inr (Or.inl h)
+    -- The woken list without r: it was woken.
+    · exact Or.inr (Or.inr (Or.inr (mem_without.1 h).1))
+  -- No request waits twice.
+  · exact hs.queue_nodup
+  -- A waiter is no owner.
+  · intro x hx
+    -- That held before, and the owners are untouched.
+    exact (hs.queue_fresh x hx).1
 
 /-- **Every step keeps the invariant**, for a bound of at least 1. -/
 theorem step_inv {B : Nat}
@@ -554,535 +1179,30 @@ theorem step_inv {B : Nat}
     (hs : Inv B s)
     -- One step of the design.
     (hstep : Step B s t) :
+    -- The statement: the invariant holds after the step.
     Inv B t := by
+  -- Split on the kind of step; each kind has its own theorem above.
   cases hstep with
-  | fast r hr hf ho =>
-    -- The lock was free, so nobody held it; `r` takes it.
-    obtain ⟨hown, hhand, -⟩ := hs.free_empty hf
-    -- `r` is fresh, so in none of the lock's lists.
-    have hfresh : ∀ x, x ∈ s.queue ∨ x ∈ s.owners ∨ x ∈ s.handed ∨ x ∈ s.woken → x ≠ r :=
-      fun x hx e => hr (e ▸ hs.all_enq x hx)
-    refine ⟨?_, hs.handed_owed, hs.woken_ok, hs.handed_woken, hs.bypass_le, hs.tail_zero,
-      ?_, hs.owed_woken, ?_, ?_, hs.queue_nodup, ?_, hs.woken_nodup⟩
-    · -- One holder, `r`; the lock is no longer free.
-      simp [hown, hhand]
-    · -- The lock is not free.
-      intro h t _ hfr; simp at hfr
-    · -- `r` is new to the entry list.
-      rw [List.nodup_append]
-      refine ⟨hs.enq_nodup, by simp, ?_⟩
-      intro a ha b hb hab
-      simp only [List.mem_singleton] at hb
-      subst hb; subst hab
-      exact hr ha
-    · -- `r` entered now; everyone else as before.
-      intro x hx
-      rw [List.mem_append, List.mem_singleton]
-      simp only [List.mem_cons] at hx
-      rcases hx with hx | (rfl | hx) | hx | hx
-      · exact Or.inl (hs.all_enq x (Or.inl hx))
-      · exact Or.inr rfl
-      · exact Or.inl (hs.all_enq x (Or.inr (Or.inl hx)))
-      · exact Or.inl (hs.all_enq x (Or.inr (Or.inr (Or.inl hx))))
-      · exact Or.inl (hs.all_enq x (Or.inr (Or.inr (Or.inr hx))))
-    · -- A waiter is not `r`, and held nothing.
-      intro x hx
-      refine ⟨?_, (hs.queue_fresh x hx).2⟩
-      simp only [List.mem_cons, not_or]
-      exact ⟨hfresh x (Or.inl hx), (hs.queue_fresh x hx).1⟩
-  | enqueue r hr hc =>
-    -- The lock is held: a handoff owed means someone holds it.
-    have hfree : s.free = false := by
-      rcases hc with h | h
-      · exact h
-      · cases hf : s.free
-        · rfl
-        · exfalso; exact h (hs.free_empty hf).2.2
-    -- `r` is fresh, so in none of the lock's lists.
-    have hfresh : ∀ x, x ∈ s.queue ∨ x ∈ s.owners ∨ x ∈ s.handed ∨ x ∈ s.woken → x ≠ r :=
-      fun x hx e => hr (e ▸ hs.all_enq x hx)
-    -- `upd` leaves every request but `r` alone.
-    have hupd : ∀ x, x ≠ r → upd s.bypass r 0 x = s.bypass x := by
-      intro x hx; simp [upd, hx]
-    refine ⟨hs.excl, hs.handed_owed, ?_, hs.handed_woken, ?_, ?_, ?_, hs.owed_woken, ?_, ?_, ?_,
-      ?_, hs.woken_nodup⟩
-    · -- A woken waiter was the head of a non-empty queue; it still is.
-      intro x hx
-      rcases hs.woken_ok x hx with h | ⟨t, hq, hb⟩
-      · exact Or.inl h
-      · refine Or.inr ⟨t ++ [r], by simp [hq], ?_⟩
-        dsimp only; rw [hupd x (hfresh x (Or.inr (Or.inr (Or.inr hx))))]
-        exact hb
-    · -- `r` has count 0; the others as before.
-      intro x hx
-      rw [List.mem_append, List.mem_singleton] at hx
-      rcases hx with hx | rfl
-      · dsimp only; rw [hupd x (hfresh x (Or.inl hx))]; exact hs.bypass_le x hx
-      · simp [upd]
-    · -- Behind the head: the old tail and `r`, all at 0.
-      intro h t hq x hx
-      cases hq0 : s.queue with
-      | nil =>
-        -- `r` alone: no tail.
-        rw [hq0] at hq; simp at hq; obtain ⟨-, rfl⟩ := hq; simp at hx
-      | cons h' t' =>
-        rw [hq0] at hq
-        simp only [List.cons_append, List.cons.injEq] at hq
-        obtain ⟨rfl, rfl⟩ := hq
-        rw [List.mem_append, List.mem_singleton] at hx
-        rcases hx with hx | rfl
-        · dsimp only; rw [hupd x (hfresh x (Or.inl (by rw [hq0]; exact List.mem_cons_of_mem _ hx)))]
-          exact hs.tail_zero _ t' hq0 x hx
-        · simp [upd]
-    · -- The lock is held.
-      intro h t _ hf; rw [hfree] at hf; simp at hf
-    · -- `r` is new to the entry list.
-      rw [List.nodup_append]
-      refine ⟨hs.enq_nodup, by simp, ?_⟩
-      intro a ha b hb hab
-      simp only [List.mem_singleton] at hb
-      subst hb; subst hab
-      exact hr ha
-    · -- `r` entered now; everyone else as before.
-      intro x hx
-      rw [List.mem_append, List.mem_singleton]
-      rw [List.mem_append, List.mem_singleton] at hx
-      rcases hx with (hx | rfl) | hx | hx | hx
-      · exact Or.inl (hs.all_enq x (Or.inl hx))
-      · exact Or.inr rfl
-      · exact Or.inl (hs.all_enq x (Or.inr (Or.inl hx)))
-      · exact Or.inl (hs.all_enq x (Or.inr (Or.inr (Or.inl hx))))
-      · exact Or.inl (hs.all_enq x (Or.inr (Or.inr (Or.inr hx))))
-    · -- `r` is new to the queue.
-      rw [List.nodup_append]
-      refine ⟨hs.queue_nodup, by simp, ?_⟩
-      intro a ha b hb hab
-      simp only [List.mem_singleton] at hb
-      subst hb; subst hab
-      exact hfresh a (Or.inl ha) rfl
-    · -- `r` holds nothing; the others as before.
-      intro x hx
-      rw [List.mem_append, List.mem_singleton] at hx
-      rcases hx with hx | rfl
-      · exact hs.queue_fresh x hx
-      · exact ⟨fun h => hfresh x (Or.inr (Or.inl h)) rfl,
-          fun h => hfresh x (Or.inr (Or.inr (Or.inl h))) rfl⟩
-  | release r hr =>
-    -- `r` held the lock alone.
-    obtain ⟨hown, hhand, hfree, howed⟩ := hs.owner_alone hr
-    -- Nobody is woken unless it is the head with a count below the bound.
-    have hwk : ∀ x ∈ s.woken, ∃ t, s.queue = x :: t ∧ s.bypass x < B := by
-      intro x hx
-      rcases hs.woken_ok x hx with h | h
-      · rw [hhand] at h; simp at h
-      · exact h
-    have hqn := hs.queue_nodup
-    have hallq : ∀ x ∈ s.queue, x ∈ s.enq := fun x hx => hs.all_enq x (Or.inl hx)
-    unfold relFrom
-    simp only [hown, List.erase_cons_head]
-    cases hq : s.queue with
-    | nil =>
-      -- Nobody waits: the lock is free, and nobody is woken.
-      have hwe : s.woken = [] := by
-        cases hw : s.woken with
-        | nil => rfl
-        | cons x l =>
-          obtain ⟨t, ht, -⟩ := hwk x (by rw [hw]; exact List.mem_cons_self)
-          rw [hq] at ht; simp at ht
-      exact inv_free rfl howed rfl hhand (by simp [hwe]) (by simp) (by simp) hs.enq_nodup
-        (by simp) (by simp)
-    | cons h t =>
-      rw [hq] at hqn hallq
-      by_cases hb : s.bypass h < B
-      · -- Below the bound: free, and wake the head. Either way exactly the
-        -- head ends up woken: a woken request before was the head.
-        simp only [hb, ite_true]
-        have hsub : ∀ x ∈ s.woken, x = h := by
-          intro x hx
-          obtain ⟨t', ht', -⟩ := hwk x hx
-          rw [hq] at ht'; simp only [List.cons.injEq] at ht'; exact ht'.1.symm
-        -- The head is below the bound; those behind it at 0; all entered.
-        have hhead : ∀ h' t', h :: t = h' :: t' → s.bypass h' < B := by
-          intro h' t' e; simp only [List.cons.injEq] at e; obtain ⟨e1, -⟩ := e; rw [← e1]; exact hb
-        have htail : ∀ h' t', h :: t = h' :: t' → ∀ x ∈ t', s.bypass x = 0 := by
-          intro h' t' e x hx; simp only [List.cons.injEq] at e; obtain ⟨-, e2⟩ := e
-          rw [← e2] at hx; exact hs.tail_zero h t hq x hx
-        unfold wakeHead
-        simp only
-        by_cases hhw : h ∈ s.woken
-        · -- Already woken: `s.woken` is exactly `[h]`.
-          simp only [hhw, ite_true]
-          have hw1 : s.woken = [h] := by
-            cases hw : s.woken with
-            | nil => rw [hw] at hhw; simp at hhw
-            | cons a l =>
-              have ha := hsub a (by rw [hw]; exact List.mem_cons_self)
-              rw [ha] at hw
-              have hnd := hs.woken_nodup
-              rw [hw, List.nodup_cons] at hnd
-              cases l with
-              | nil => rw [ha]
-              | cons b l' =>
-                have hb' := hsub b (by rw [hw]; simp)
-                rw [hb'] at hnd
-                exact absurd List.mem_cons_self hnd.1
-          exact inv_free rfl howed rfl hhand (by simp [hw1]) hhead htail hs.enq_nodup hallq hqn
-        · -- Not woken: `s.woken` is empty, and `h` is woken now.
-          simp only [hhw, ite_false]
-          have hw0 : s.woken = [] := by
-            cases hw : s.woken with
-            | nil => rfl
-            | cons a l =>
-              have ha := hsub a (by rw [hw]; exact List.mem_cons_self)
-              exact absurd (by rw [hw, ha]; exact List.mem_cons_self) hhw
-          exact inv_free rfl howed rfl hhand (by simp [hw0]) hhead htail hs.enq_nodup hallq hqn
-      · -- At the bound: hand off to the head.
-        simp only [hb, ite_false]
-        -- Nobody was woken: a woken request would be the head below the bound.
-        have hwe : s.woken = [] := by
-          cases hw : s.woken with
-          | nil => rfl
-          | cons x l =>
-            obtain ⟨t', ht, hbx⟩ := hwk x (by rw [hw]; exact List.mem_cons_self)
-            rw [hq] at ht
-            simp only [List.cons.injEq] at ht
-            obtain ⟨rfl, -⟩ := ht
-            exact absurd hbx hb
-        rw [List.nodup_cons] at hqn
-        exact inv_handoff hfree rfl rfl (by simp [hhand]) (by simp [hwe])
-          (fun x hx => hs.tail_zero h t hq x hx) hqn.1 hs.enq_nodup
-          (fun x hx => hallq x (List.mem_cons_of_mem _ hx)) (hallq h List.mem_cons_self) hqn.2
-  | pollHanded h hw hh =>
-    -- The lock was handed to `h` alone, and only `h` is woken.
-    have hho : s.owed = some h := by
-      have := hs.handed_owed
-      rw [this] at hh
-      cases ho : s.owed with
-      | none => rw [ho] at hh; simp at hh
-      | some w => rw [ho] at hh; simp at hh; rw [hh]
-    obtain ⟨hhand, hown, hfree⟩ := hs.owed_alone hho
-    have hwk : s.woken = [h] := by
-      have hsub : ∀ x ∈ s.woken, x = h := by
-        intro x hx
-        have := hs.owed_woken (by simp [hho]) x hx
-        rw [hhand] at this; simpa using this
-      cases hw' : s.woken with
-      | nil => rw [hw'] at hw; simp at hw
-      | cons a l =>
-        have ha := hsub a (by rw [hw']; exact List.mem_cons_self)
-        subst ha
-        have hn := hs.woken_nodup
-        rw [hw', List.nodup_cons] at hn
-        cases l with
-        | nil => rfl
-        | cons b l' =>
-          have hb := hsub b (by rw [hw']; simp)
-          subst hb
-          exact absurd List.mem_cons_self hn.1
-    refine ⟨by simp [hown, hhand, hfree], by simp [hhand], ?_, by simp [hhand], hs.bypass_le,
-      hs.tail_zero, by simp [hfree], by simp, hs.enq_nodup, ?_, hs.queue_nodup, ?_,
-      by simp [hwk]⟩
-    · intro x hx; simp [hwk] at hx
-    · -- The new owner `h` was handed the lock; the rest shrank.
-      intro x hx
-      apply hs.all_enq x
-      rcases hx with hx | hx | hx | hx
-      · exact Or.inl hx
-      · rcases List.mem_cons.1 hx with e | hx
-        · exact Or.inr (Or.inr (Or.inl (e ▸ hh)))
-        · exact Or.inr (Or.inl hx)
-      · exact Or.inr (Or.inr (Or.inl (List.mem_of_mem_erase hx)))
-      · exact Or.inr (Or.inr (Or.inr (List.mem_of_mem_erase hx)))
-    · intro x hx
-      refine ⟨?_, by simp [hhand]⟩
-      simp only [hown, List.mem_cons, List.not_mem_nil, or_false]
-      intro e; subst e
-      exact (hs.queue_fresh x hx).2 (by rw [hhand]; exact List.mem_cons_self)
-  | pollWin h hw hh hf ho =>
-    -- The lock was free: nobody held it. `h` is the head.
-    obtain ⟨hown, hhand, -⟩ := hs.free_empty hf
-    obtain ⟨t, hq, -⟩ := hs.woken_head hw hh
-    have hqn := hs.queue_nodup
-    rw [hq, List.nodup_cons] at hqn
-    -- Only `h` was woken (the free shape), so nobody is woken after.
-    have hwk : s.woken = [h] := by rw [hs.free_woken hf, hq]; simp
-    -- The head leaves the queue, and its woken bit with it.
-    have hqe : s.queue.erase h = t := by rw [hq, List.erase_cons_head]
-    have hwe : s.woken.erase h = [] := by rw [hwk, List.erase_cons_head]
-    simp only [hqe, hwe]
-    refine ⟨by simp [hown, hhand], by simp [hhand, ho], by simp, by simp [hhand], ?_, ?_,
-      by simp, by simp [ho], hs.enq_nodup, ?_, hqn.2, ?_, by simp⟩
-    · intro x hx; exact hs.bypass_le x (by rw [hq]; exact List.mem_cons_of_mem _ hx)
-    · intro h' t' ht' x hx
-      -- The new queue is `t`, the old tail.
-      have ht2 : t = h' :: t' := ht'
-      exact hs.tail_zero h t hq x (by rw [ht2]; exact List.mem_cons_of_mem _ hx)
-    · -- The new owner `h` waited; the rest is drawn from before.
-      intro x hx
-      apply hs.all_enq x
-      rcases hx with hx | hx | hx | hx
-      · exact Or.inl (by rw [hq]; exact List.mem_cons_of_mem _ hx)
-      · rcases List.mem_cons.1 hx with e | hx
-        · exact Or.inl (by rw [hq, e]; exact List.mem_cons_self)
-        · exact Or.inr (Or.inl hx)
-      · exact Or.inr (Or.inr (Or.inl hx))
-      · simp at hx
-    · intro x hx
-      refine ⟨?_, by simp [hhand]⟩
-      simp only [hown, List.mem_cons, List.not_mem_nil, or_false]
-      intro e; subst e; exact hqn.1 hx
-  | pollLose h hw hh hc =>
-    -- `h` is the head, with a count below the bound.
-    obtain ⟨t, hq, hb⟩ := hs.woken_head hw hh
-    have hqn := hs.queue_nodup
-    rw [hq, List.nodup_cons] at hqn
-    -- The lock is held: a handoff owed means someone holds it.
-    have hfree : s.free = false := by
-      rcases hc with h' | h'
-      · exact h'
-      · cases hf : s.free
-        · rfl
-        · exfalso; exact h' (hs.free_empty hf).2.2
-    -- `upd` leaves every request but `h` alone.
-    have hupd : ∀ x, x ≠ h → upd s.bypass h (s.bypass h + 1) x = s.bypass x := by
-      intro x hx; simp [upd, hx]
-    refine ⟨hs.excl, hs.handed_owed, ?_, ?_, ?_, ?_, ?_, ?_, hs.enq_nodup, ?_, hs.queue_nodup,
-      hs.queue_fresh, hs.woken_nodup.erase h⟩
-    · -- The others woken are as before (not `h`, which is no longer woken).
-      intro x hx
-      have hx' := (List.Nodup.mem_erase_iff hs.woken_nodup).1 hx
-      rcases hs.woken_ok x hx'.2 with h' | ⟨t', ht', -⟩
-      · exact Or.inl h'
-      · rw [hq] at ht'; simp only [List.cons.injEq] at ht'
-        exact absurd ht'.1.symm hx'.1
-    · -- `h` holds nothing, so it is not among those handed the lock.
-      intro x hx
-      have hxh : x ≠ h := fun e => hh (e ▸ hx)
-      exact (List.mem_erase_of_ne hxh).2 (hs.handed_woken x hx)
-    · -- `h`'s count was below the bound, so one more is within it.
-      intro x hx
-      by_cases hxh : x = h
-      · subst hxh; simp only [upd, ite_true]; omega
-      · dsimp only; rw [hupd x hxh]; exact hs.bypass_le x hx
-    · -- Those behind `h` are not `h`.
-      intro h' t' ht' x hx
-      rw [hq] at ht'
-      simp only [List.cons.injEq] at ht'
-      obtain ⟨-, e2⟩ := ht'
-      rw [← e2] at hx
-      have hxh : x ≠ h := fun e => hqn.1 (e ▸ hx)
-      dsimp only; rw [hupd x hxh]
-      exact hs.tail_zero h t hq x hx
-    · -- The lock is held.
-      intro h' t' _ hf; rw [hfree] at hf; simp at hf
-    · -- Fewer woken.
-      intro ho x hx
-      exact hs.owed_woken ho x (List.mem_of_mem_erase hx)
-    · intro x hx
-      rcases hx with hx | hx | hx | hx
-      · exact hs.all_enq x (Or.inl hx)
-      · exact hs.all_enq x (Or.inr (Or.inl hx))
-      · exact hs.all_enq x (Or.inr (Or.inr (Or.inl hx)))
-      · exact hs.all_enq x (Or.inr (Or.inr (Or.inr (List.mem_of_mem_erase hx))))
-  | cancelWaiting r hr =>
-    have hqn0 := hs.queue_nodup
-    -- `r` holds nothing.
-    have hrh : r ∉ s.handed := (hs.queue_fresh r hr).2
-    -- The state with `r` gone, before any wake is passed on.
-    generalize hX : ({ s with queue := s.queue.erase r, woken := s.woken.erase r } : M) = X
-    -- Its fields.
-    have hXf : X.free = s.free := by rw [← hX]
-    have hXo : X.owed = s.owed := by rw [← hX]
-    have hXq : X.queue = s.queue.erase r := by rw [← hX]
-    have hXw : X.woken = s.woken.erase r := by rw [← hX]
-    have hXown : X.owners = s.owners := by rw [← hX]
-    have hXh : X.handed = s.handed := by rw [← hX]
-    have hXb : X.bypass = s.bypass := by rw [← hX]
-    have hXe : X.enq = s.enq := by rw [← hX]
-    -- The queue's head, before.
-    obtain ⟨h0, t0, hq⟩ : ∃ h0 t0, s.queue = h0 :: t0 := by
-      cases hq : s.queue with
-      | nil => rw [hq] at hr; simp at hr
-      | cons h0 t0 => exact ⟨h0, t0, rfl⟩
-    have hqn := hqn0
-    rw [hq, List.nodup_cons] at hqn
-    have hall : ∀ x ∈ h0 :: t0, x ∈ s.enq := fun x hx => hs.all_enq x (Or.inl (hq ▸ hx))
-    by_cases hf : s.free = true
-    · -- The lock is free: nobody holds it, and exactly the head is woken.
-      obtain ⟨hown, hhand, howed⟩ := hs.free_empty hf
-      have hwk := hs.free_woken hf
-      rw [hq] at hwk
-      simp only [List.take_succ_cons, List.take_zero] at hwk
-      rw [wakeIfFree_free (by rw [hXf, hf]) (by rw [hXo, howed])]
-      obtain ⟨wf, wo, wq, wown, wh, wb, we⟩ := wakeHead_fields X
-      by_cases hrh0 : r = h0
-      · -- The head left: the next waiter (count 0) is the new head, woken.
-        have hXq' : X.queue = t0 := by rw [hXq, hq, hrh0, List.erase_cons_head]
-        have hXw' : X.woken = [] := by rw [hXw, hwk, hrh0, List.erase_cons_head]
-        cases ht0 : t0 with
-        | nil =>
-          -- Nobody is left to wake.
-          rw [wakeHead_nil (by rw [hXq', ht0])]
-          exact inv_free (by rw [hXf, hf]) (by rw [hXo, howed]) (by rw [hXown, hown])
-            (by rw [hXh, hhand]) (by rw [hXw', hXq', ht0]; rfl) (by rw [hXq', ht0]; simp)
-            (by rw [hXq', ht0]; simp) (by rw [hXe]; exact hs.enq_nodup) (by rw [hXq', ht0]; simp)
-            (by rw [hXq', ht0]; simp)
-        | cons h1 t1 =>
-          -- The next waiter becomes the head and is woken.
-          have hXq'' : X.queue = h1 :: t1 := by rw [hXq', ht0]
-          rw [ht0] at hqn hall
-          have hw1 := wakeHead_woken hXq''
-          rw [hXw'] at hw1
-          apply inv_free (by rw [wf, hXf, hf]) (by rw [wo, hXo, howed]) (by rw [wown, hXown, hown])
-            (by rw [wh, hXh, hhand])
-          · rw [hw1, wq, hXq'']; simp
-          · intro h' t' e
-            rw [wq, hXq''] at e
-            simp only [List.cons.injEq] at e
-            obtain ⟨e1, -⟩ := e
-            rw [wb, hXb, ← e1, hs.tail_zero h0 t0 hq h1 (by rw [ht0]; exact List.mem_cons_self)]
-            exact hB
-          · intro h' t' e x hx
-            rw [wq, hXq''] at e
-            simp only [List.cons.injEq] at e
-            obtain ⟨-, e2⟩ := e
-            rw [← e2] at hx
-            rw [wb, hXb]
-            exact hs.tail_zero h0 t0 hq x (by rw [ht0]; exact List.mem_cons_of_mem _ hx)
-          · rw [we, hXe]; exact hs.enq_nodup
-          · intro x hx; rw [wq, hXq''] at hx; rw [we, hXe]
-            exact hall x (List.mem_cons_of_mem _ hx)
-          · rw [wq, hXq'']; exact hqn.2
-      · -- A waiter behind the head left: the head stays, still woken.
-        have hne : (h0 == r) = false := by simp; exact fun e => hrh0 e.symm
-        have hXq' : X.queue = h0 :: t0.erase r := by
-          rw [hXq, hq]; exact List.erase_cons_tail (by simpa using hne)
-        have hXw' : X.woken = [h0] := by
-          rw [hXw, hwk]; exact List.erase_of_not_mem (by simp; exact fun e => hrh0 e)
-        have hw1 := wakeHead_woken hXq'
-        rw [hXw'] at hw1
-        simp only [List.mem_singleton, ite_true] at hw1
-        apply inv_free (by rw [wf, hXf, hf]) (by rw [wo, hXo, howed]) (by rw [wown, hXown, hown])
-          (by rw [wh, hXh, hhand])
-        · rw [hw1, wq, hXq']; simp
-        · intro h' t' e
-          rw [wq, hXq'] at e
-          simp only [List.cons.injEq] at e
-          obtain ⟨e1, -⟩ := e
-          rw [wb, hXb, ← e1]
-          obtain ⟨-, -, hb⟩ := hs.woken_head (h := h0) (by rw [hwk]; simp) (by rw [hhand]; simp)
-          exact hb
-        · intro h' t' e x hx
-          rw [wq, hXq'] at e
-          simp only [List.cons.injEq] at e
-          obtain ⟨-, e2⟩ := e
-          rw [← e2] at hx
-          rw [wb, hXb]
-          exact hs.tail_zero h0 t0 hq x (List.mem_of_mem_erase hx)
-        · rw [we, hXe]; exact hs.enq_nodup
-        · intro x hx
-          rw [wq, hXq'] at hx
-          rw [we, hXe]
-          rcases List.mem_cons.1 hx with e | hx
-          · rw [e]; exact hall h0 List.mem_cons_self
-          · exact hall x (List.mem_cons_of_mem _ (List.mem_of_mem_erase hx))
-        · rw [wq, hXq', List.nodup_cons]
-          exact ⟨fun hm => hqn.1 (List.mem_of_mem_erase hm), hqn.2.erase r⟩
-    · -- The lock is held: no wake is passed on; `r` simply leaves.
-      have hf' : s.free = false := by cases h' : s.free <;> simp_all
-      rw [wakeIfFree_held (by rw [hXf, hf'])]
-      refine ⟨by rw [hXown, hXh, hXf]; exact hs.excl, by rw [hXh, hXo]; exact hs.handed_owed,
-        ?_, ?_, ?_, ?_, ?_, ?_, by rw [hXe]; exact hs.enq_nodup, ?_,
-        by rw [hXq]; exact hqn0.erase r, ?_, by rw [hXw]; exact hs.woken_nodup.erase r⟩
-      · -- A woken request still holds by handoff, or is still the head.
-        intro x hx
-        rw [hXw] at hx
-        rw [hXh, hXq, hXb]
-        have hx' := (List.Nodup.mem_erase_iff hs.woken_nodup).1 hx
-        rcases hs.woken_ok x hx'.2 with h' | ⟨t', ht', hbx⟩
-        · exact Or.inl h'
-        · refine Or.inr ⟨t'.erase r, ?_, hbx⟩
-          rw [ht']
-          exact List.erase_cons_tail (by simpa using fun e => hx'.1 e)
-      · -- A handed request is not `r`, so it is still woken.
-        intro x hx
-        rw [hXh] at hx
-        rw [hXw]
-        have hxr : x ≠ r := fun e => hrh (e ▸ hx)
-        exact (List.mem_erase_of_ne hxr).2 (hs.handed_woken x hx)
-      · intro x hx; rw [hXq] at hx; rw [hXb]; exact hs.bypass_le x (List.mem_of_mem_erase hx)
-      · -- Behind the head: drawn from the old tail.
-        intro h t ht x hx
-        rw [hXq] at ht
-        rw [hXb]
-        by_cases hrh0 : r = h0
-        · rw [hq, hrh0, List.erase_cons_head] at ht
-          exact hs.tail_zero h0 t0 hq x (by rw [ht]; exact List.mem_cons_of_mem _ hx)
-        · rw [hq, List.erase_cons_tail (by simpa using fun e => hrh0 e.symm)] at ht
-          simp only [List.cons.injEq] at ht
-          obtain ⟨-, e2⟩ := ht
-          rw [← e2] at hx
-          exact hs.tail_zero h0 t0 hq x (List.mem_of_mem_erase hx)
-      · intro h t _ hfr; rw [hXf, hf'] at hfr; simp at hfr
-      · intro ho x hx
-        rw [hXo] at ho; rw [hXw] at hx; rw [hXh]
-        exact hs.owed_woken ho x (List.mem_of_mem_erase hx)
-      · intro x hx
-        rw [hXq, hXown, hXh, hXw] at hx
-        rw [hXe]
-        rcases hx with hx | hx | hx | hx
-        · exact hs.all_enq x (Or.inl (List.mem_of_mem_erase hx))
-        · exact hs.all_enq x (Or.inr (Or.inl hx))
-        · exact hs.all_enq x (Or.inr (Or.inr (Or.inl hx)))
-        · exact hs.all_enq x (Or.inr (Or.inr (Or.inr (List.mem_of_mem_erase hx))))
-      · intro x hx; rw [hXq] at hx; rw [hXown, hXh]
-        exact hs.queue_fresh x (List.mem_of_mem_erase hx)
-  | cancelHanded r hr =>
-    -- The lock was handed to `r` alone, and only `r` is woken.
-    have hho : s.owed = some r := by
-      have := hs.handed_owed
-      rw [this] at hr
-      cases ho : s.owed with
-      | none => rw [ho] at hr; simp at hr
-      | some w => rw [ho] at hr; simp at hr; rw [hr]
-    obtain ⟨hhand, hown, hfree⟩ := hs.owed_alone hho
-    have hwk : s.woken = [r] := by
-      have hsub : ∀ x ∈ s.woken, x = r := by
-        intro x hx
-        have := hs.owed_woken (by simp [hho]) x hx
-        rw [hhand] at this; simpa using this
-      have hrw := hs.handed_woken r (by rw [hhand]; exact List.mem_cons_self)
-      cases hw' : s.woken with
-      | nil => rw [hw'] at hrw; simp at hrw
-      | cons a l =>
-        have ha := hsub a (by rw [hw']; exact List.mem_cons_self)
-        subst ha
-        have hn := hs.woken_nodup
-        rw [hw', List.nodup_cons] at hn
-        cases l with
-        | nil => rfl
-        | cons b l' =>
-          have hb := hsub b (by rw [hw']; simp)
-          subst hb
-          exact absurd List.mem_cons_self hn.1
-    have hqn := hs.queue_nodup
-    have hall : ∀ x ∈ s.queue, x ∈ s.enq := fun x hx => hs.all_enq x (Or.inl hx)
-    unfold passOn
-    simp only [hhand, hwk, List.erase_cons_head]
-    cases hq : s.queue with
-    | nil =>
-      -- Nobody waits: the lock is freed.
-      exact inv_free rfl rfl hown rfl (by simp) (by simp) (by simp) hs.enq_nodup (by simp)
-        (by simp)
-    | cons h t =>
-      -- The next waiter is handed the lock.
-      rw [hq] at hqn hall
-      rw [List.nodup_cons] at hqn
-      exact inv_handoff hfree rfl hown (by simp) (by simp)
-        (fun x hx => hs.tail_zero h t hq x hx) hqn.1 hs.enq_nodup
-        (fun x hx => hall x (List.mem_cons_of_mem _ hx)) (hall h List.mem_cons_self) hqn.2
+  -- The fast path.
+  | fast r hr hf ho => exact step_inv_fast hs r hr hf ho
+  -- Joining the queue.
+  | enqueue r hr hc => exact step_inv_enqueue hB hs r hr hc
+  -- A release.
+  | release r hr => exact step_inv_release hs r hr
+  -- Taking a handoff.
+  | pollHanded h _ hh => exact step_inv_pollHanded hs h hh
+  -- Winning the race.
+  | pollWin h hw hh hf ho => exact step_inv_pollWin hs h hw hh hf ho
+  -- Losing below the bound.
+  | pollLose h hw hh hf ho hb => exact step_inv_pollLose hs h hw hh hf ho hb
+  -- The loss that reaches the bound.
+  | pollOwe h hw hh hf ho hb => exact step_inv_pollOwe hs h hw hh hf ho hb
+  -- A waiter leaves.
+  | cancelWaiting r hr => exact step_inv_cancelWaiting hs r hr
+  -- A handed request gives the lock back.
+  | cancelHanded r hr => exact step_inv_cancelHanded hs r hr
 
-/-- Several steps keep the invariant. -/
+/-- Any number of steps keeps the invariant. -/
 theorem steps_inv {B : Nat}
     -- The bound is at least 1.
     (hB : 0 < B) {s t : M}
@@ -1090,7 +1210,9 @@ theorem steps_inv {B : Nat}
     (hs : Inv B s)
     -- Any number of steps.
     (hsteps : Steps B s t) :
+    -- The statement: the invariant holds at the end.
     Inv B t := by
+  -- Go through the steps one at a time.
   induction hsteps with
   -- No step: nothing changed.
   | refl => exact hs
@@ -1103,7 +1225,9 @@ theorem reachable_inv {B : Nat}
     (hB : 0 < B) {s : M}
     -- `s` is reachable from the start.
     (h : Steps B init s) :
+    -- The statement: the invariant holds in s.
     Inv B s :=
+  -- The start satisfies it, and steps keep it.
   steps_inv hB (init_inv B) h
 
 /-! ## The laws -/
@@ -1115,11 +1239,18 @@ theorem mutual_exclusion {B : Nat}
     (hB : 0 < B) {s : M}
     -- `s` is reachable from the start.
     (h : Steps B init s) :
+    -- The statement: at most one request holds the lock, and while the lock is free nobody does.
     (s.owners ++ s.handed).length ≤ 1 ∧ (s.free = true → s.owners ++ s.handed = []) := by
+  -- The invariant says: holders plus one-if-free make exactly 1.
   have hx := (reachable_inv hB h).excl
+  -- First part: whether the lock is free or not, the holders number at most 1. Second part: suppose
+  -- the lock is free.
   refine ⟨by split at hx <;> omega, fun hf => ?_⟩
+  -- Use "free" in the count.
   rw [hf] at hx
+  -- The count says: holders plus 1 is 1.
   simp only [ite_true] at hx
+  -- So there are no holders: the list is empty.
   exact List.length_eq_zero_iff.1 (by omega)
 
 /-- **Bounded bypass.** A waiting request's count of lost races never
@@ -1131,8 +1262,31 @@ theorem bounded_bypass {B : Nat}
     (h : Steps B init s) {x : Nat}
     -- `x` waits.
     (hx : x ∈ s.queue) :
-    s.bypass x ≤ B :=
-  (reachable_inv hB h).bypass_le x hx
+    -- The statement: x's count is at most B.
+    s.bypass x ≤ B := by
+  -- A waiter is below the bound, or owed with a count of exactly B: at most B either way.
+  rcases (reachable_inv hB h).at_bound hx with h' | ⟨-, h'⟩ <;> omega
+
+/-- **At the bound, owed.** A waiting request whose count is `B` is the one
+the handoff is owed to: barging is shut for as long as it waits.
+TLA+: `BoundedBypass` (a waiter at Bound has HANDOFF up). -/
+theorem at_bound_owed {B : Nat}
+    -- The bound is at least 1.
+    (hB : 0 < B) {s : M}
+    -- `s` is reachable from the start.
+    (h : Steps B init s) {x : Nat}
+    -- `x` waits ...
+    (hx : x ∈ s.queue)
+    -- ... with a count of B.
+    (hb : s.bypass x = B) :
+    -- The statement: the handoff is owed to x.
+    s.owed = some x := by
+  -- A waiter is below the bound, or owed with a count of B.
+  rcases (reachable_inv hB h).at_bound hx with h' | ⟨h', -⟩
+  -- Below the bound: but its count is B.
+  · omega
+  -- Owed: that is the claim.
+  · exact h'
 
 /-- **A loss happens only below the bound.** A woken request that was not
 handed the lock (the only kind that can lose) has lost fewer than `B`
@@ -1146,77 +1300,159 @@ theorem lose_below_bound {B : Nat}
     (hw : x ∈ s.woken)
     -- ... and not handed the lock.
     (hh : x ∉ s.handed) :
-    s.bypass x < B := by
-  obtain ⟨-, -, hb⟩ := (reachable_inv hB h).woken_head hw hh
-  exact hb
+    -- The statement: x's count is below B.
+    s.bypass x < B :=
+  -- A woken request that was not handed the lock waits with a count below B.
+  ((reachable_inv hB h).woken_waits hw hh).2.2
 
-/-- **The count counts losses.** A step that changes a waiting request's
-count adds one to it, and the request was woken and not handed the lock:
-it lost a race. With `lose_below_bound` and `bounded_bypass`, a request
-loses at most `B` races in one acquire. -/
-theorem bypass_counts_losses {B : Nat}
-    -- The bound is at least 1.
-    (hB : 0 < B) {s t : M}
-    -- `s` is reachable from the start.
-    (h : Steps B init s)
+/-- **The count counts losses.** A step that changes the count of a request
+that has entered adds one to it, and the request was woken, was not handed
+the lock, and found the lock taken: it lost a race. With `lose_below_bound`
+and `bounded_bypass`, a request loses at most `B` races in one acquire. -/
+theorem bypass_counts_losses {B : Nat} {s t : M}
     -- One step.
     (hstep : Step B s t) {x : Nat}
-    -- `x` waits.
-    (hx : x ∈ s.queue)
+    -- `x` has entered.
+    (hx : x ∈ s.enq)
     -- Its count changed.
     (hne : t.bypass x ≠ s.bypass x) :
-    t.bypass x = s.bypass x + 1 ∧ x ∈ s.woken ∧ x ∉ s.handed := by
-  have hs := reachable_inv hB h
-  -- The helpers leave every count alone.
-  have hwh : ∀ u : M, (wakeHead u).bypass = u.bypass := by
-    intro u; unfold wakeHead; split
-    · rfl
-    · split <;> rfl
+    -- The statement: the count went up by exactly one, x had been woken and not handed the lock,
+    -- and the lock was taken.
+    t.bypass x = s.bypass x + 1 ∧ x ∈ s.woken ∧ x ∉ s.handed ∧ s.free = false := by
+  -- Split on the kind of step.
   cases hstep with
+  -- The fast path changes no count: against "the count changed".
   | fast => exact absurd rfl hne
+  -- A fresh request r joins the queue.
   | enqueue r hr _ =>
     -- `r` is fresh, so not `x`, which entered before.
-    have hxr : x ≠ r := fun e => hr (e ▸ hs.all_enq x (Or.inl hx))
-    simp [upd, hxr] at hne
-  | release r _ =>
-    exfalso; apply hne
-    unfold relFrom; split
-    · rfl
-    · split
-      · rw [hwh]
-      · rfl
+    have : x ≠ r := fun e => hr (e ▸ hx)
+    -- So x's count is untouched: against "the count changed".
+    simp [upd, this] at hne
+  -- A release changes no count.
+  | release r _ => rw [relFrom_bypass] at hne; exact absurd rfl hne
+  -- Taking a handoff changes no count.
   | pollHanded => exact absurd rfl hne
+  -- Winning the race changes no count.
   | pollWin => exact absurd rfl hne
-  | pollLose h' hw hh _ =>
-    -- Only the loser's count changes.
-    by_cases hxh : x = h'
-    · subst hxh; simp only [upd, ite_true]; exact ⟨trivial, hw, hh⟩
-    · simp [upd, hxh] at hne
-  | cancelWaiting r _ =>
-    exfalso; apply hne
-    unfold wakeIfFree; split
-    · rw [hwh]
-    · rfl
-  | cancelHanded r _ =>
-    exfalso; apply hne
-    unfold passOn; split <;> rfl
+  -- A request h loses below the bound.
+  | pollLose h hw hh hf _ _ =>
+    -- Is x that request?
+    by_cases e : x = h
+    -- Yes: its count went up by one, and it was woken, not handed, with the lock taken.
+    · subst e; exact ⟨by simp [upd], hw, hh, hf⟩
+    -- No: x's count is untouched, against "the count changed".
+    · simp [upd, e] at hne
+  -- A request h loses for the B-th time.
+  | pollOwe h hw hh hf _ _ =>
+    -- Is x that request?
+    by_cases e : x = h
+    -- Yes: its count went up by one, and it was woken, not handed, with the lock taken.
+    · subst e; exact ⟨by simp [upd], hw, hh, hf⟩
+    -- No: x's count is untouched, against "the count changed".
+    · simp [upd, e] at hne
+  -- A waiter leaving changes no count.
+  | cancelWaiting r _ => rw [wakeIfFree_bypass] at hne; exact absurd rfl hne
+  -- A handed request giving the lock back changes no count.
+  | cancelHanded r _ => rw [relFrom_bypass] at hne; exact absurd rfl hne
 
-/-- **At the bound, the next release hands off.** If the head has lost
-`B` races and the owner releases, the head is handed the lock: owed, held
-by it, woken, and the lock is not free. -/
-theorem release_hands_off_at_bound {B : Nat} {s : M} {h r : Nat} {t : List Nat}
-    -- `h` is the head ...
-    (hq : s.queue = h :: t)
-    -- ... and has lost `B` races.
-    (hb : B ≤ s.bypass h) :
-    let u := relFrom B { s with owners := s.owners.erase r }
-    u.owed = some h ∧ h ∈ u.handed ∧ h ∈ u.woken ∧ u.free = s.free := by
-  have : ¬ s.bypass h < B := by omega
-  simp [relFrom, hq, this]
+/-- **The loss that reaches the bound raises the owed flag, in the same
+step.** If one step takes a request's count from below `B` to `B`, the
+handoff is owed to that request right after that step: there is no moment
+at which a waiter has lost `B` races and barging is still open.
+TLA+: `BoundedBypass`; the code: `Lock::take_or_owe`. -/
+theorem owed_at_bound {B : Nat} {s t : M}
+    -- One step.
+    (hstep : Step B s t) {x : Nat}
+    -- `x` has entered.
+    (hx : x ∈ s.enq)
+    -- Its count was below the bound ...
+    (hlt : s.bypass x < B)
+    -- ... and is the bound after the step.
+    (hb : t.bypass x = B) :
+    -- The statement: after the step the handoff is owed to x.
+    t.owed = some x := by
+  -- The count changed.
+  have hne : t.bypass x ≠ s.bypass x := by omega
+  -- Split on the kind of step.
+  cases hstep with
+  -- The fast path changes no count: against "the count changed".
+  | fast => exact absurd rfl hne
+  -- A fresh request r joins the queue.
+  | enqueue r hr _ =>
+    -- `r` is fresh, so not `x`, which entered before.
+    have : x ≠ r := fun e => hr (e ▸ hx)
+    -- So x's count is untouched: against "the count changed".
+    simp [upd, this] at hne
+  -- A release changes no count.
+  | release r _ => rw [relFrom_bypass] at hne; exact absurd rfl hne
+  -- Taking a handoff changes no count.
+  | pollHanded => exact absurd rfl hne
+  -- Winning the race changes no count.
+  | pollWin => exact absurd rfl hne
+  -- A request h loses below the bound.
+  | pollLose h _ _ _ _ hlose =>
+    -- Is x that request?
+    by_cases e : x = h
+    -- Yes: but then its new count is still below B, not B.
+    · subst e; simp [upd] at hb; omega
+    -- No: x's count is untouched, against "the count changed".
+    · simp [upd, e] at hne
+  -- A request h loses for the B-th time.
+  | pollOwe h _ _ _ _ _ =>
+    -- Is x that request?
+    by_cases e : x = h
+    -- Yes: that step sets the owed flag to x.
+    · subst e; rfl
+    -- No: x's count is untouched, against "the count changed".
+    · simp [upd, e] at hne
+  -- A waiter leaving changes no count.
+  | cancelWaiting r _ => rw [wakeIfFree_bypass] at hne; exact absurd rfl hne
+  -- A handed request giving the lock back changes no count.
+  | cancelHanded r _ => rw [relFrom_bypass] at hne; exact absurd rfl hne
+
+/-- **Once a waiter is owed, the next release hands it the lock.** If a
+handoff is owed to `w` and the owner releases, `w` is handed the lock: it
+holds it, it is woken, the lock is not free, and the flag stays up until
+`w` takes it. -/
+theorem release_hands_off_at_bound {B : Nat}
+    -- The bound is at least 1.
+    (hB : 0 < B) {s : M}
+    -- `s` is reachable from the start.
+    (h : Steps B init s) {w r : Nat}
+    -- A handoff is owed to `w`.
+    (hw : s.owed = some w)
+    -- `r` holds the lock.
+    (hr : r ∈ s.owners) :
+    -- Name the state after the release u.
+    let u := relFrom { s with owners := s.owners.erase r }
+    -- The statement: in u, w was handed the lock and woken, the lock is not free, and the handoff
+    -- is still owed to w.
+    w ∈ u.handed ∧ w ∈ u.woken ∧ u.free = false ∧ u.owed = some w := by
+  -- The invariant holds before the release.
+  have hs := reachable_inv hB h
+  -- r holds the lock, so the lock is not free and there is exactly one holder.
+  obtain ⟨hf, hlen⟩ := hs.holder (List.mem_append.2 (Or.inl hr))
+  -- There is at least one owner, r.
+  have hpos : 0 < s.owners.length := List.length_pos_of_mem hr
+  -- So nobody was handed the lock.
+  have hhand : s.handed = [] := List.length_eq_zero_iff.1 (by omega)
+  -- The owed waiter was handed the lock, or is the head.
+  rcases hs.owed_ok w hw with h' | ⟨t, hq, -⟩
+  -- Handed: nobody was.
+  · rw [hhand] at h'; simp at h'
+  -- The head. Name the state after the release.
+  · intro u
+    -- The release rule hands the lock to the head, w.
+    have hu : u = _ := relFrom_handoff (s := { s with owners := s.owners.erase r }) hq hw
+    -- Use that.
+    rw [hu]
+    -- The four claims read off the new state.
+    simp [hf, hw]
 
 /-- **Handoff-owed exclusivity, state.** While a handoff is owed to `w`,
-`w` alone holds the lock, by handoff, and the lock is not free.
-TLA+: `HandoffExclusive`. -/
+the lock is not free, nobody but `w` was handed it, and nobody but `w` is
+woken: nobody competes. TLA+: `HandoffExclusive`. -/
 theorem owed_exclusive {B : Nat}
     -- The bound is at least 1.
     (hB : 0 < B) {s : M}
@@ -1224,8 +1460,20 @@ theorem owed_exclusive {B : Nat}
     (h : Steps B init s) {w : Nat}
     -- A handoff is owed to `w`.
     (hw : s.owed = some w) :
-    s.handed = [w] ∧ s.owners = [] ∧ s.free = false :=
-  (reachable_inv hB h).owed_alone hw
+    -- The statement: the lock is not free, and every handed or woken request is w.
+    s.free = false ∧ (∀ x ∈ s.handed, x = w) ∧ (∀ x ∈ s.woken, x = w) := by
+  -- The invariant holds.
+  have hs := reachable_inv hB h
+  -- A request handed the lock is w:
+  have hh : ∀ x ∈ s.handed, x = w := fun x hx => by
+    -- the handoff is owed to it,
+    have := hs.handed_owed x hx
+    -- and it is owed to w.
+    rw [hw] at this
+    -- So it is w.
+    exact (Option.some.inj this).symm
+  -- The lock is held; a handed request is w; a woken request was handed the lock, so it is w.
+  exact ⟨hs.owed_held w hw, hh, fun x hx => hh x (hs.owed_quiet w hw x hx)⟩
 
 /-- **Handoff-owed exclusivity, steps.** While a handoff is owed to `w`,
 no step makes anyone but `w` an owner: barging is shut, and the lock goes
@@ -1239,37 +1487,50 @@ theorem owed_blocks_barging {B : Nat}
     (hw : s.owed = some w)
     -- One step.
     (hstep : Step B s t) :
+    -- The statement: every owner after the step was an owner before, or is w.
     ∀ x ∈ t.owners, x ∈ s.owners ∨ x = w := by
+  -- The invariant holds before the step.
   have hs := reachable_inv hB h
-  obtain ⟨hhand, hown, hfree⟩ := hs.owed_alone hw
+  -- Take an owner x after the step.
   intro x hx
+  -- Split on the kind of step.
   cases hstep with
-  | fast _ _ _ ho => rw [hw] at ho; simp at ho
+  -- The fast path needs "nothing owed": but a handoff is owed. Impossible.
+  | fast _ _ _ ho => rw [hw] at ho; cases ho
+  -- Joining the queue changes no owner.
   | enqueue => exact Or.inl hx
-  | release r hr => rw [hown] at hr; simp at hr
+  -- A release makes nobody an owner:
+  | release r _ =>
+    -- the owners afterwards are the old ones without r,
+    rw [relFrom_owners] at hx
+    -- so x was an owner before.
+    exact Or.inl (List.mem_of_mem_erase hx)
+  -- A request h' takes a handoff.
   | pollHanded h' _ hh =>
-    -- The new owner is the one handed the lock: `w`.
-    rw [hhand] at hh
-    simp only [List.mem_singleton] at hh
-    subst hh
+    -- The handoff is owed to the request handed the lock,
+    have := hs.handed_owed h' hh
+    -- and it is owed to w.
+    rw [hw] at this
+    -- So h' is w.
+    cases this
+    -- The owners are now w and the old ones.
     simp only [List.mem_cons] at hx
+    -- x is w, or an old owner.
     rcases hx with rfl | hx
+    -- w: the second alternative.
     · exact Or.inr rfl
+    -- An old owner: the first alternative.
     · exact Or.inl hx
-  | pollWin _ _ _ hf => rw [hfree] at hf; simp at hf
-  | pollLose => exact Or.inl hx
-  | cancelWaiting r _ =>
-    -- The lock is held: no wake, no owner change.
-    have : (wakeIfFree { s with queue := s.queue.erase r, woken := s.woken.erase r }).owners =
-        s.owners := by
-      unfold wakeIfFree; simp only [hfree, Bool.false_eq_true, false_and, ite_false]
-    rw [this] at hx; exact Or.inl hx
-  | cancelHanded r _ =>
-    -- A passed-on handoff makes nobody an owner yet.
-    have : (passOn { s with handed := s.handed.erase r, woken := s.woken.erase r,
-                            owed := none }).owners = s.owners := by
-      unfold passOn; split <;> rfl
-    rw [this] at hx; exact Or.inl hx
+  -- Winning the race needs "nothing owed". Impossible.
+  | pollWin _ _ _ _ ho => rw [hw] at ho; cases ho
+  -- Losing a race needs "nothing owed". Impossible.
+  | pollLose _ _ _ _ ho => rw [hw] at ho; cases ho
+  -- The loss that reaches the bound needs "nothing owed yet". Impossible.
+  | pollOwe _ _ _ _ ho => rw [hw] at ho; cases ho
+  -- A waiter leaving makes nobody an owner.
+  | cancelWaiting r _ => rw [wakeIfFree_owners] at hx; exact Or.inl hx
+  -- A handed request giving the lock back makes nobody an owner.
+  | cancelHanded r _ => rw [relFrom_owners] at hx; exact Or.inl hx
 
 /-- **No stranded head.** While the lock is free, the head waiter has been
 woken: no waiter sleeps beside a free lock. TLA+: `NoLostWakeup`. -/
@@ -1282,11 +1543,13 @@ theorem no_stranded_head {B : Nat}
     (hq : s.queue = x :: t)
     -- The lock is free.
     (hf : s.free = true) :
+    -- The statement: x has been woken.
     x ∈ s.woken :=
+  -- That is one fact of the invariant, which every reachable state has.
   (reachable_inv hB h).stranded x t hq hf
 
 /-- **A handoff is woken.** A request handed the lock has been woken.
-TLA+: `NoLostWakeup` (GrantedWoken). -/
+TLA+: `NoLostWakeup` (a marked sleeper is woken). -/
 theorem handed_woken {B : Nat}
     -- The bound is at least 1.
     (hB : 0 < B) {s : M}
@@ -1294,35 +1557,46 @@ theorem handed_woken {B : Nat}
     (h : Steps B init s) {x : Nat}
     -- `x` was handed the lock.
     (hx : x ∈ s.handed) :
+    -- The statement: x has been woken.
     x ∈ s.woken :=
+  -- That is one fact of the invariant, which every reachable state has.
   (reachable_inv hB h).handed_woken x hx
 
 /-! ## The RED cases -/
 
-/-- The unbounded-barging design: a release always frees the lock and
-wakes the head; it never hands off. -/
+/-- The unbounded-barging design: a waiter never makes the try that raises
+the owed flag. Every retry is a plain try, and a loss just counts. With the
+flag never up, no release ever hands the lock over: a lock that never hands
+off. TLA+: the mutant `UnboundedBarging`. (`Regolith/LockTable.lean` names
+this relation for its own RED case.) -/
 inductive StepNoHand : M → M → Prop
   /-- As `Step.fast`. -/
   | fast (s : M) (r : Nat)
       -- `r` is fresh, the lock free, nothing owed.
       (hr : r ∉ s.enq) (hf : s.free = true) (ho : s.owed = none) :
+      -- After the step: the lock is held, r is an owner, and r has entered.
       StepNoHand s { s with free := false, owners := r :: s.owners, enq := s.enq ++ [r] }
   /-- As `Step.enqueue`. -/
   | enqueue (s : M) (r : Nat)
       -- `r` is fresh, and the fast path is shut.
       (hr : r ∉ s.enq) (hc : s.free = false ∨ s.owed ≠ none) :
+      -- After the step: r is at the tail of the queue, has entered,
       StepNoHand s { s with queue := s.queue ++ [r], enq := s.enq ++ [r],
+                            -- and has a count of 0.
                             bypass := upd s.bypass r 0 }
-  /-- The defect: free and wake the head, whatever its count. -/
+  /-- As `Step.release`. -/
   | release (s : M) (r : Nat)
       -- `r` holds the lock.
       (hr : r ∈ s.owners) :
-      StepNoHand s (wakeHead { s with owners := s.owners.erase r, free := true })
-  /-- As `Step.pollLose`. -/
+      -- After the step: r is no longer an owner, and the release rule ran.
+      StepNoHand s (relFrom { s with owners := s.owners.erase r })
+  /-- The defect: a loss counts, whatever the count, and never raises the
+  owed flag. -/
   | pollLose (s : M) (h : Nat)
-      -- `h` was woken, not handed, and the fast path is shut.
-      (hw : h ∈ s.woken) (hh : h ∉ s.handed) (hc : s.free = false ∨ s.owed ≠ none) :
-      StepNoHand s { s with bypass := upd s.bypass h (s.bypass h + 1), woken := s.woken.erase h }
+      -- `h` was woken, not handed, the lock is taken, and nothing is owed.
+      (hw : h ∈ s.woken) (hh : h ∉ s.handed) (hf : s.free = false) (ho : s.owed = none) :
+      -- After the step: h's count is one more, and h is no longer "woken".
+      StepNoHand s { s with bypass := upd s.bypass h (s.bypass h + 1), woken := without s.woken h }
 
 /-- Any number of `StepNoHand` steps. -/
 inductive StepsNoHand : M → M → Prop
@@ -1331,13 +1605,16 @@ inductive StepsNoHand : M → M → Prop
   /-- Some steps, then one more. -/
   | tail {s t u : M} : StepsNoHand s t → StepNoHand t u → StepsNoHand s u
 
-/-- **`unbounded_barging_breaks_bound`.** With bound 1 and no handoff,
-request 2 waits, is woken, and loses to barging request 3; at release it
-is woken again (the design would hand it the lock here) and loses to
-barging request 4. It has lost 2 races, more than the bound: the law of
-`bounded_bypass` fails. -/
-theorem unbounded_barging_breaks_bound :
-    ∃ s, StepsNoHand init s ∧ 2 ∈ s.queue ∧ s.bypass 2 = 2 := by
+/-- The run both RED theorems below use: with bound 1 and no owed flag,
+request 2 waits, is woken, and loses to barging request 3 (the design would
+raise the flag here); at release it is woken again and loses to barging
+request 4. -/
+theorem barging_run :
+    -- The statement: some state the defective steps reach has request 2 still waiting with a count
+    -- of 2 and nothing owed.
+    ∃ s, StepsNoHand init s ∧ 2 ∈ s.queue ∧ s.bypass 2 = 2 ∧ s.owed = none := by
+  -- The run, written from the inside out: eight steps from the start, then the three facts about
+  -- the final state, each computed.
   refine ⟨_, .tail (.tail (.tail (.tail (.tail (.tail (.tail (.tail (.refl init)
     -- Request 1 takes the lock; request 2 waits.
     (.fast _ 1 (by decide) rfl rfl))
@@ -1346,31 +1623,58 @@ theorem unbounded_barging_breaks_bound :
     (.release _ 1 (by decide)))
     -- Request 3 barges in; request 2 is polled and loses.
     (.fast _ 3 (by decide) rfl rfl))
-    (.pollLose _ 2 (by decide) (by decide) (Or.inl rfl)))
+    (.pollLose _ 2 (by decide) (by decide) rfl rfl))
     -- Request 3 releases: no handoff, request 2 woken again.
     (.release _ 3 (by decide)))
     -- Request 4 barges in; request 2 loses again.
     (.fast _ 4 (by decide) rfl rfl))
-    (.pollLose _ 2 (by decide) (by decide) (Or.inl rfl)), by decide, by decide⟩
+    (.pollLose _ 2 (by decide) (by decide) rfl rfl), by decide, by decide, by decide⟩
+
+/-- **`unbounded_barging_breaks_bound`.** With bound 1 and a lock that
+never hands off, request 2 has lost 2 races, more than the bound: the law
+of `bounded_bypass` fails. -/
+theorem unbounded_barging_breaks_bound :
+    -- The statement: some state the defective steps reach has request 2 still waiting with a count
+    -- of 2.
+    ∃ s, StepsNoHand init s ∧ 2 ∈ s.queue ∧ s.bypass 2 = 2 := by
+  -- The run above ends in such a state.
+  obtain ⟨s, hs, hq, hb, -⟩ := barging_run
+  -- Its first three facts are the claim.
+  exact ⟨s, hs, hq, hb⟩
+
+/-- **`unbounded_barging_leaves_barging_open`.** In that same state nothing
+is owed, so the next caller may barge again: the law of `at_bound_owed`
+fails too. -/
+theorem unbounded_barging_leaves_barging_open :
+    -- The statement: request 2 waits with a count of 2, past the bound of 1, and nothing is owed.
+    ∃ s, StepsNoHand init s ∧ 2 ∈ s.queue ∧ 1 < s.bypass 2 ∧ s.owed = none := by
+  -- The run above ends in such a state.
+  obtain ⟨s, hs, hq, hb, ho⟩ := barging_run
+  -- A count of 2 is past 1.
+  exact ⟨s, hs, hq, by omega, ho⟩
 
 /-- The release-without-wake design: a release with waiters frees the lock
-and wakes nobody. -/
+and wakes nobody. TLA+: the mutant `ReleaseNoWake`. -/
 inductive StepNoWake : M → M → Prop
   /-- As `Step.fast`. -/
   | fast (s : M) (r : Nat)
       -- `r` is fresh, the lock free, nothing owed.
       (hr : r ∉ s.enq) (hf : s.free = true) (ho : s.owed = none) :
+      -- After the step: the lock is held, r is an owner, and r has entered.
       StepNoWake s { s with free := false, owners := r :: s.owners, enq := s.enq ++ [r] }
   /-- As `Step.enqueue`. -/
   | enqueue (s : M) (r : Nat)
       -- `r` is fresh, and the fast path is shut.
       (hr : r ∉ s.enq) (hc : s.free = false ∨ s.owed ≠ none) :
+      -- After the step: r is at the tail of the queue, has entered,
       StepNoWake s { s with queue := s.queue ++ [r], enq := s.enq ++ [r],
+                            -- and has a count of 0.
                             bypass := upd s.bypass r 0 }
   /-- The defect: free the lock, wake nobody. -/
   | release (s : M) (r : Nat)
       -- `r` holds the lock.
       (hr : r ∈ s.owners) :
+      -- After the step: r is no longer an owner and the lock is free. Nobody is woken.
       StepNoWake s { s with owners := s.owners.erase r, free := true }
 
 /-- Any number of `StepNoWake` steps. -/
@@ -1384,7 +1688,11 @@ inductive StepsNoWake : M → M → Prop
 request 1 releases without waking anyone: the lock is free and its head,
 request 2, is not woken. The law of `no_stranded_head` fails. -/
 theorem release_without_wake_strands :
+    -- The statement: some state the defective steps reach has request 2 at the head of the queue,
+    -- the lock free, and request 2 not woken.
     ∃ s, StepsNoWake init s ∧ s.queue = [2] ∧ s.free = true ∧ 2 ∉ s.woken := by
+  -- The run, written from the inside out: three steps from the start, then the facts about the
+  -- final state, each computed.
   refine ⟨_, .tail (.tail (.tail (.refl init)
     -- Request 1 takes the lock; request 2 waits.
     (.fast _ 1 (by decide) rfl rfl))
@@ -1392,4 +1700,266 @@ theorem release_without_wake_strands :
     -- Request 1 releases and wakes nobody.
     (.release _ 1 (by decide)), by decide, rfl, by decide⟩
 
+/-! ## E48: the waiter's node while its future spins
+
+The machine above takes a waiter's look at its node whole: "woken" there
+means the waiter will look at its node again, whether a release called its
+waker or the waiter was awake anyway. E48 adds a waiter that is awake on
+purpose: after it loses a retry it spins on its own node for a while
+(`Wait::spin_park` in src/sync/waiter.rs) instead of going to sleep. To make
+that cheap, the spin starts by taking the node's ARMED bit down
+(`Waiter::begin_spin`): while it spins, a release that nudges or grants the
+node finds no waker to claim, so it only sets the mark and calls nobody.
+
+Tiny example of what could go wrong: waiter W spins. Holder H lets go and its
+release nudges W's node: W is spinning, so no waker is called. W's spin then
+runs out of rounds and W goes to sleep. If W went to sleep without reading its
+node, the nudge would sit on the node for ever and nobody would ever call W's
+waker again: a lost wakeup. The code prevents it by ending every spin in the
+same look as before (`Wait::park` with the waker), whose last compare-and-swap
+arms the waker and reads the marks together, so a mark that came during the
+spin sends W back to retry instead of to sleep.
+
+This section is that node, alone: one waiter's future, its node's ARMED bit
+and its marks, with every order in which releases and the future's own steps
+can happen. It proves that a sleeping future is always armed and never has an
+unread mark (`no_lost_wakeup_spinning`), that a spinning future is never armed,
+so a release that finds it spinning calls no waker (`mark_spinning_wakes_nobody`),
+and, as the RED case, that a spin which gave up without the look would leave
+the waiter asleep beside a mark (`spin_without_look_strands`). TLA+:
+`NoLostWakeup` in `Sync.tla`, with `MC_Sync_Red_SpinNoRecheck`.
+
+What it does not cover: it is not joined to the queue machine above. That
+machine's `woken` stands for "this waiter will look at its node again"; this
+one shows that the node-level handshake (a release's mark against the
+future's look and spin) never breaks that promise, for one node and any
+interleaving of its own steps. Which waiter a release marks, and that the
+head of a free lock is marked at all, is `no_stranded_head` above; that a
+handed waiter is marked is `handed_woken`. TLA+ checks the two together,
+instruction by instruction, for two and three tasks.
+
+The spin before queueing needs nothing new here: each of its rounds either
+takes the free lock with no handoff owed, which is the `fast` step above (its
+compare-and-swap refuses an owed handoff exactly as `fast` requires), or
+changes nothing at all.
+-/
+
+/-- Where a waiter's future is, as its node sees it. -/
+inductive Where where
+  /-- It returned `Pending` and sleeps until its waker is called. -/
+  | asleep
+  /-- It is inside its poll, spinning on its node. -/
+  | spinning
+  /-- It is inside its poll doing anything else: looking, retrying, registering. -/
+  | running
+  /-- Its waker was called while it slept; the executor will poll it. -/
+  | woken
+  -- Lean writes the comparison of two places for us.
+  deriving DecidableEq
+
+/-- One waiter's node and future. -/
+structure Node where
+  /-- Where the future is. -/
+  place : Where
+  /-- The node's ARMED bit: a waker sits in the node that a release may claim
+  and call. -/
+  armed : Bool
+  /-- A nudge or grant sits on the node that the future has not read yet. -/
+  marked : Bool
+  -- Lean writes the comparison of two nodes for us.
+  deriving DecidableEq
+
+/-- A future that has just queued: inside its poll, its waker not armed yet
+(it is still registering), nothing marked. -/
+def Node.start : Node := ⟨.running, false, false⟩
+
+/-- The steps that can happen to one node, in any order. `lookAfterSpin` says
+whether a spin ends with the look, as the code does (`true`), or, as the RED
+case, may also go to sleep without it (`false`). -/
+inductive NodeStep (lookAfterSpin : Bool) : Node → Node → Prop
+  /-- A release nudges or grants an armed node (`Waiter::touch` claims the
+  waker): the waker is taken and called, and the mark is set. A sleeping
+  future is woken; a running one simply has a wake on its way. -/
+  | markArmed (n : Node)
+      -- The node is armed.
+      (h : n.armed = true) :
+      -- After the step: not armed, marked, and woken if it slept.
+      NodeStep lookAfterSpin n
+        -- (a sleeper is woken; any other future stays where it is)
+        ⟨if n.place = .asleep then .woken else n.place, false, true⟩
+  /-- A release nudges or grants a node that is not armed: only the mark is set,
+  and no waker is called. -/
+  | markUnarmed (n : Node)
+      -- The node is not armed.
+      (h : n.armed = false) :
+      -- After the step: marked where it is.
+      NodeStep lookAfterSpin n { n with marked := true }
+  /-- The future looks at its node and nothing is marked (`Waiter::park` with
+  the waker): its last swap arms the waker and reads the marks together, and
+  the future sleeps. -/
+  | lookSleep (n : Node)
+      -- The future is inside its poll,
+      (h : n.place = .running)
+      -- and nothing is marked.
+      (hm : n.marked = false) :
+      -- After the step: asleep and armed.
+      NodeStep lookAfterSpin n ⟨.asleep, true, false⟩
+  /-- The future looks at its node and finds a mark: it takes the mark and goes
+  on retrying, awake. It may come out armed (the mark landed while it was
+  registering, and the arming swap read it) or not (it saw the mark before it
+  registered); `a` is which. -/
+  | lookMarked (n : Node) (a : Bool)
+      -- The future is inside its poll,
+      (h : n.place = .running)
+      -- and a mark is there.
+      (hm : n.marked = true) :
+      -- After the step: running, the mark read, armed or not.
+      NodeStep lookAfterSpin n ⟨.running, a || n.armed, false⟩
+  /-- After a lost retry, the future starts to spin (`Waiter::begin_spin`): with
+  nothing marked, it takes ARMED down and spins. -/
+  | spinStart (n : Node)
+      -- The future is inside its poll,
+      (h : n.place = .running)
+      -- and nothing is marked.
+      (hm : n.marked = false) :
+      -- After the step: spinning, not armed.
+      NodeStep lookAfterSpin n ⟨.spinning, false, n.marked⟩
+  /-- The spin ends, because it saw the mark or its rounds ran out; the future
+  goes on to its look. -/
+  | spinEnd (n : Node)
+      -- The future spins.
+      (h : n.place = .spinning) :
+      -- After the step: inside its poll, about to look.
+      NodeStep lookAfterSpin n { n with place := .running }
+  /-- The RED case only: a spin that runs out arms the waker and sleeps without
+  reading the mark. -/
+  | spinSleep (n : Node)
+      -- Only when the spin may skip its look,
+      (hb : lookAfterSpin = false)
+      -- and the future spins.
+      (h : n.place = .spinning) :
+      -- After the step: asleep and armed, whatever is marked.
+      NodeStep lookAfterSpin n { n with place := .asleep, armed := true }
+  /-- The executor polls a woken future: it is inside its poll again. -/
+  | poll (n : Node)
+      -- The waker was called.
+      (h : n.place = .woken) :
+      -- After the step: inside its poll.
+      NodeStep lookAfterSpin n { n with place := .running }
+
+/-- Any number of node steps, one after another. -/
+inductive NodeSteps (lookAfterSpin : Bool) : Node → Node → Prop
+  /-- No step at all. -/
+  | refl (n : Node) : NodeSteps lookAfterSpin n n
+  /-- Some steps, then one more. -/
+  | tail {a b c : Node} :
+      -- Steps from a to b, then one step from b to c, make steps from a to c.
+      NodeSteps lookAfterSpin a b → NodeStep lookAfterSpin b c → NodeSteps lookAfterSpin a c
+
+/-- The promise: a sleeping future is armed and has no unread mark on its node
+(so a release that marks it calls its waker), and a spinning future is not
+armed (so a release that marks it calls none, and the spin reads the mark). -/
+def NodeInv (n : Node) : Prop :=
+  -- A sleeper is armed and unmarked,
+  (n.place = .asleep → n.armed = true ∧ n.marked = false) ∧
+  -- and a spinner is not armed.
+  (n.place = .spinning → n.armed = false)
+
+/-- One step of the code keeps the promise. -/
+theorem nodeStep_inv {n m : Node}
+    -- The promise holds before the step,
+    (hi : NodeInv n)
+    -- and the step is one of the code's, with the look after every spin.
+    (hs : NodeStep true n m) :
+    -- The statement: it holds after.
+    NodeInv m := by
+  -- Unfold the promise on both sides.
+  unfold NodeInv at *
+  -- Name the two halves of the promise before the step.
+  obtain ⟨hsleep, hspin⟩ := hi
+  -- Look at which step it was.
+  cases hs with
+  -- An armed node marked: a sleeper wakes; a spinner cannot be armed.
+  | markArmed h =>
+    -- Split on whether the future slept, and settle each place.
+    split <;> rename_i hp <;> cases hpl : n.place <;> simp_all
+  -- An unarmed node marked: it stays where it is; a sleeper cannot be unarmed.
+  | markUnarmed h =>
+    -- Each place in turn; the promise before rules out an unarmed sleeper.
+    cases hpl : n.place <;> simp_all
+  -- The look that sleeps: asleep, armed, nothing marked.
+  | lookSleep h hm =>
+    -- Both halves hold outright.
+    simp
+  -- The look that finds a mark: the future runs on.
+  | lookMarked a h hm =>
+    -- It is neither asleep nor spinning.
+    simp
+  -- Starting to spin: spinning, not armed.
+  | spinStart h hm =>
+    -- Both halves hold outright.
+    simp
+  -- Ending the spin: the future runs again.
+  | spinEnd h =>
+    -- It is neither asleep nor spinning.
+    simp
+  -- The bad way out of a spin is not a step of the code.
+  | spinSleep hb h =>
+    -- `true = false` is impossible.
+    exact absurd hb (by decide)
+  -- A woken future polled runs again.
+  | poll h =>
+    -- It is neither asleep nor spinning.
+    simp
+
+/-- **`no_lost_wakeup_spinning`.** From a fresh node, after any steps of the
+code, spins included, a sleeping future is armed with no unread mark, and a
+spinning one is not armed. Rules out: a release nudges a spinning waiter
+(calling no waker), the waiter stops spinning and sleeps, and nothing ever
+wakes it. -/
+theorem no_lost_wakeup_spinning {n : Node}
+    -- Any node reached from a fresh one by the code's steps.
+    (hr : NodeSteps true Node.start n) :
+    -- The statement: the promise holds there.
+    NodeInv n := by
+  -- By induction over the steps taken.
+  induction hr with
+  -- At the start the future runs: neither half has anything to check.
+  | refl => unfold NodeInv Node.start; simp
+  -- Each further step keeps the promise.
+  | tail _ hs ih => exact nodeStep_inv ih hs
+
+/-- **`mark_spinning_wakes_nobody`.** In any node the code reaches, a release
+that marks a spinning future finds it unarmed, so it only sets the mark: the
+future stays spinning, no waker is called, and the spin reads the mark. This is
+the wake E48 saves. -/
+theorem mark_spinning_wakes_nobody {n : Node}
+    -- A node the code reaches,
+    (hr : NodeSteps true Node.start n)
+    -- whose future spins.
+    (h : n.place = .spinning) :
+    -- The statement: the node is unarmed, and the release's step leaves it spinning, marked.
+    n.armed = false ∧ NodeStep true n { n with marked := true } := by
+  -- The promise says a spinner is unarmed.
+  have hu : n.armed = false := (no_lost_wakeup_spinning hr).2 h
+  -- So the release takes the "mark only" step.
+  exact ⟨hu, .markUnarmed n hu⟩
+
+/-- **`spin_without_look_strands`** (the RED case). If a spin that runs out may
+sleep without its look, a fresh node can end asleep beside an unread mark: it
+spins, a release marks it (calling no waker, since it spins), and it sleeps.
+The promise of `no_lost_wakeup_spinning` fails. -/
+theorem spin_without_look_strands :
+    -- The statement: some node the defective steps reach is asleep and marked.
+    ∃ n, NodeSteps false Node.start n ∧ n.place = .asleep ∧ n.marked = true := by
+  -- The run: start spinning, get marked, sleep without looking.
+  refine ⟨⟨.asleep, true, true⟩, .tail (.tail (.tail (.refl _)
+    -- The fresh future starts to spin.
+    (.spinStart Node.start rfl rfl))
+    -- A release marks it; it was spinning and unarmed, so only the mark is set.
+    (.markUnarmed _ rfl))
+    -- Its spin runs out and it sleeps without reading the mark.
+    (.spinSleep _ rfl rfl), rfl, rfl⟩
+
+-- The end of this file's names.
 end Regolith.Sync

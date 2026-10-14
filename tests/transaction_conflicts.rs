@@ -118,13 +118,13 @@ fn optimistic_plain_read_then_write_never_loses_an_update() {
 fn a_write_batch_around_the_lock_manager_is_detected() {
     let dir = TempDir::new().unwrap();
     let db = pes_db(&dir);
-    db.db().put(b"k", b"v0").unwrap();
+    regolith::through_stalls(|| db.db().put(b"k", b"v0")).unwrap();
 
     let tx = db.begin(&TxnOptions::new());
     assert_eq!(tx.get_for_update(b"k").unwrap(), Some(b"v0".to_vec()));
     let mut batch = regolith::WriteBatch::new();
     batch.put(b"k", b"racer");
-    db.db().write(batch).unwrap();
+    regolith::through_stalls(|| db.db().write(batch.clone())).unwrap();
     tx.put(b"k", b"mine").unwrap();
     assert!(matches!(
         tx.commit(),
@@ -140,7 +140,7 @@ fn a_write_batch_around_the_lock_manager_is_detected() {
 fn a_raw_put_between_read_and_commit_is_detected() {
     let dir = TempDir::new().unwrap();
     let db = pes_db(&dir);
-    db.db().put(b"k", &0u64.to_le_bytes()).unwrap();
+    regolith::through_stalls(|| db.db().put(b"k", &0u64.to_le_bytes())).unwrap();
 
     let tx = db.begin(&TxnOptions::new());
     let current = decode(tx.get_for_update(b"k").unwrap());
@@ -148,7 +148,7 @@ fn a_raw_put_between_read_and_commit_is_detected() {
 
     // The bypassing writer, placed exactly in the window rather than
     // left to a scheduler to hit by chance.
-    db.db().put(b"k", &1_000_000u64.to_le_bytes()).unwrap();
+    regolith::through_stalls(|| db.db().put(b"k", &1_000_000u64.to_le_bytes())).unwrap();
 
     tx.put(b"k", &(current + 1).to_le_bytes()).unwrap();
     assert!(
@@ -167,20 +167,20 @@ fn a_range_delete_around_the_lock_manager_is_detected() {
         let dir = TempDir::new().unwrap();
         let outcome = if pessimistic {
             let db = pes_db(&dir);
-            db.db().put(b"k", b"v0").unwrap();
+            regolith::through_stalls(|| db.db().put(b"k", b"v0")).unwrap();
             let tx = db.begin(&TxnOptions::new());
             assert_eq!(tx.get_for_update(b"k").unwrap(), Some(b"v0".to_vec()));
-            db.db().delete_range(b"a", b"z").unwrap();
+            regolith::through_stalls(|| db.db().delete_range(b"a", b"z")).unwrap();
             tx.put(b"k", b"resurrected").unwrap();
             let r = tx.commit();
             assert_eq!(db.db().get(b"k").unwrap(), None);
             r
         } else {
             let db = OptimisticTransactionDb::open(dir.path(), Options::default()).unwrap();
-            db.db().put(b"k", b"v0").unwrap();
+            regolith::through_stalls(|| db.db().put(b"k", b"v0")).unwrap();
             let tx = db.begin(&TxnOptions::new());
             assert_eq!(tx.get_for_update(b"k").unwrap(), Some(b"v0".to_vec()));
-            db.db().delete_range(b"a", b"z").unwrap();
+            regolith::through_stalls(|| db.db().delete_range(b"a", b"z")).unwrap();
             tx.put(b"k", b"resurrected").unwrap();
             let r = tx.commit();
             assert_eq!(db.db().get(b"k").unwrap(), None);
@@ -223,11 +223,11 @@ fn an_external_merge_on_a_tracked_key_is_detected() {
         Options::default().merge_operator(Some(Arc::new(Concat))),
     )
     .unwrap();
-    db.db().put(b"k", b"a").unwrap();
+    regolith::through_stalls(|| db.db().put(b"k", b"a")).unwrap();
 
     let tx = db.begin(&TxnOptions::new());
     assert_eq!(tx.get_for_update(b"k").unwrap(), Some(b"a".to_vec()));
-    db.db().merge(b"k", b"b").unwrap();
+    regolith::through_stalls(|| db.db().merge(b"k", b"b")).unwrap();
     tx.put(b"k", b"mine").unwrap();
     assert!(matches!(
         tx.commit(),
@@ -241,14 +241,14 @@ fn an_external_merge_on_a_tracked_key_is_detected() {
 fn savepoint_rollback_does_not_launder_a_bypassing_write() {
     let dir = TempDir::new().unwrap();
     let db = pes_db(&dir);
-    db.db().put(b"k", b"v0").unwrap();
+    regolith::through_stalls(|| db.db().put(b"k", b"v0")).unwrap();
 
     let mut tx = db.begin(&TxnOptions::new());
     assert_eq!(tx.get_for_update(b"k").unwrap(), Some(b"v0".to_vec()));
     tx.set_savepoint();
     tx.put(b"k", b"staged").unwrap();
     tx.rollback_to_savepoint().unwrap();
-    db.db().put(b"k", b"racer").unwrap();
+    regolith::through_stalls(|| db.db().put(b"k", b"racer")).unwrap();
     tx.put(b"k", b"mine").unwrap();
     assert!(matches!(
         tx.commit(),
@@ -261,10 +261,10 @@ fn savepoint_rollback_does_not_launder_a_bypassing_write() {
 fn reads_inside_one_transaction_never_travel_backwards() {
     let dir = TempDir::new().unwrap();
     let db = pes_db(&dir);
-    db.db().put(b"k", b"v0").unwrap();
+    regolith::through_stalls(|| db.db().put(b"k", b"v0")).unwrap();
 
     let mut tx = db.begin(&TxnOptions::new());
-    db.db().put(b"k", b"v1").unwrap();
+    regolith::through_stalls(|| db.db().put(b"k", b"v1")).unwrap();
     let first = tx.get_for_update(b"k").unwrap();
     assert_eq!(first, Some(b"v1".to_vec()));
     tx.set_savepoint();
@@ -280,14 +280,14 @@ fn a_blind_write_never_conflicts_with_a_non_transactional_writer() {
     for external_first in [true, false] {
         let dir = TempDir::new().unwrap();
         let db = pes_db(&dir);
-        db.db().put(b"k", b"v0").unwrap();
+        regolith::through_stalls(|| db.db().put(b"k", b"v0")).unwrap();
         let tx = db.begin(&TxnOptions::new());
         if external_first {
-            db.db().put(b"k", b"external").unwrap();
+            regolith::through_stalls(|| db.db().put(b"k", b"external")).unwrap();
             tx.put(b"k", b"mine").unwrap();
         } else {
             tx.put(b"k", b"mine").unwrap();
-            db.db().put(b"k", b"external").unwrap();
+            regolith::through_stalls(|| db.db().put(b"k", b"external")).unwrap();
         }
         tx.commit()
             .unwrap_or_else(|e| panic!("external_first={external_first}: {e}"));
@@ -355,7 +355,7 @@ fn read_modify_writes_interleaved_with_blind_puts_keep_their_reads() {
     const ROUNDS: u64 = 300;
     let dir = TempDir::new().unwrap();
     let db = Arc::new(pes_db(&dir));
-    db.db().put(b"k", &0u64.to_le_bytes()).unwrap();
+    regolith::through_stalls(|| db.db().put(b"k", &0u64.to_le_bytes())).unwrap();
 
     let committed = Arc::new(AtomicU64::new(0));
     std::thread::scope(|scope| {
@@ -397,8 +397,8 @@ fn reverse_order_two_key_locking_does_not_deadlock() {
     let db = TransactionDb::open(dir.path(), Options::default())
         .unwrap()
         .with_lock_timeout(Duration::from_millis(50));
-    db.db().put(b"a", &0u64.to_le_bytes()).unwrap();
-    db.db().put(b"b", &0u64.to_le_bytes()).unwrap();
+    regolith::through_stalls(|| db.db().put(b"a", &0u64.to_le_bytes())).unwrap();
+    regolith::through_stalls(|| db.db().put(b"b", &0u64.to_le_bytes())).unwrap();
 
     let bump = |db: &TransactionDb, first: &[u8], second: &[u8]| {
         commit_with_retry("two-key bump", || {
@@ -448,7 +448,7 @@ fn a_non_transactional_writer_racing_transactions_never_hides_a_lost_update() {
     let db: Db = Db::open(dir.path(), Options::default()).unwrap();
     drop(db);
     let db = Arc::new(pes_db(&dir));
-    db.db().put(b"k", &0u64.to_le_bytes()).unwrap();
+    regolith::through_stalls(|| db.db().put(b"k", &0u64.to_le_bytes())).unwrap();
 
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let noise = {
@@ -456,7 +456,7 @@ fn a_non_transactional_writer_racing_transactions_never_hides_a_lost_update() {
         let stop = Arc::clone(&stop);
         std::thread::spawn(move || {
             while !stop.load(Ordering::Relaxed) {
-                db.db().put(b"unrelated", b"v").unwrap();
+                regolith::through_stalls(|| db.db().put(b"unrelated", b"v")).unwrap();
             }
         })
     };
@@ -489,7 +489,7 @@ fn a_blind_write_conflicts_with_a_range_delete_that_landed_after_begin() {
         let dir = TempDir::new().unwrap();
         let db = OptimisticTransactionDb::open(dir.path(), Options::default()).unwrap();
         let tx = db.begin(&TxnOptions::new().isolation(level));
-        db.db().delete_range(b"a", b"z").unwrap();
+        regolith::through_stalls(|| db.db().delete_range(b"a", b"z")).unwrap();
         tx.put(b"k", b"v").unwrap();
         assert!(
             matches!(
@@ -501,7 +501,7 @@ fn a_blind_write_conflicts_with_a_range_delete_that_landed_after_begin() {
 
         let dir = TempDir::new().unwrap();
         let db = OptimisticTransactionDb::open(dir.path(), Options::default()).unwrap();
-        db.db().delete_range(b"a", b"z").unwrap();
+        regolith::through_stalls(|| db.db().delete_range(b"a", b"z")).unwrap();
         let tx = db.begin(&TxnOptions::new().isolation(level));
         tx.put(b"k", b"v").unwrap();
         tx.commit()

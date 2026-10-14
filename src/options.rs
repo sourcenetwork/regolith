@@ -73,6 +73,31 @@ pub enum CompactionDecision {
 /// They must not read from the database (would deadlock) and should
 /// avoid blocking.
 ///
+/// # What the filter is shown
+///
+/// The filter is handed the key, and the bounds of a range delete, as
+/// the caller wrote them: the bytes passed to `put` or `delete_range`,
+/// with nothing in front of them. The column family is not part of the
+/// key, so one key in two column families reaches the filter as the same
+/// bytes.
+///
+/// It is shown the caller's entries and nothing else. The database keeps
+/// entries of its own beside them (the list of column families) and
+/// writes range deletes of its own (dropping a column family deletes its
+/// whole range): the filter is never asked about either, so a filter
+/// that removes everything it is shown removes the caller's data only.
+///
+/// # How often it runs
+///
+/// The filter is asked about an entry once for each compaction pass that
+/// rewrites it. That is no fixed number: an entry no pass has rewritten
+/// yet has not been shown at all, a manual [`crate::Db::compact_range`]
+/// carries its tables down one level at a time and asks once a level,
+/// and every later pass over the entry asks again. So a decision must
+/// stand however often it is taken: asked again about a value it left,
+/// the filter must leave that value as it is. Count on being asked
+/// eventually, never on being asked once.
+///
 /// # Snapshot isolation
 ///
 /// Filters run whether or not a [`crate::Snapshot`] is live, so a filter
@@ -81,15 +106,62 @@ pub enum CompactionDecision {
 /// readers already treat as absent is unaffected:
 /// [`crate::TtlCompactionFilter`] removes only expired values, and an
 /// expired value already reads as absent.
+///
+/// # Example
+///
+/// A filter that drops rows marked as drafts. It decides from the value
+/// alone, so the same entry gets the same answer at every level.
+///
+/// ```
+/// use std::sync::Arc;
+///
+/// use regolith::{CompactionDecision, CompactionFilter, Db, Options};
+///
+/// struct DropDrafts;
+///
+/// impl CompactionFilter for DropDrafts {
+///     fn name(&self) -> &'static str {
+///         "drop-drafts"
+///     }
+///
+///     fn filter(&self, _level: usize, _key: &[u8], value: &[u8]) -> CompactionDecision {
+///         if value.starts_with(b"draft:") {
+///             CompactionDecision::Remove
+///         } else {
+///             CompactionDecision::Keep
+///         }
+///     }
+/// }
+///
+/// let options = Options::memory().compaction_filter(Some(Arc::new(DropDrafts)));
+/// let db = Db::open("rows", options)?;
+/// db.put(b"row/1", b"draft:one")?;
+/// db.put(b"row/2", b"final:two")?;
+///
+/// // The filter runs when compaction rewrites an entry, not when it is
+/// // written: until then a read still finds the draft.
+/// assert!(db.get(b"row/1")?.is_some());
+/// let before = db.snapshot();
+///
+/// db.compact_range(None, None).wait()?;
+/// assert_eq!(db.get(b"row/1")?, None);
+/// assert_eq!(db.get(b"row/2")?.as_deref(), Some(&b"final:two"[..]));
+/// // A snapshot taken before does not shield the draft from the filter.
+/// assert_eq!(before.get(b"row/1")?, None);
+/// # Ok::<(), regolith::Error>(())
+/// ```
 pub trait CompactionFilter: Send + Sync + 'static {
-    /// Inspect a point entry. Called once per surviving
-    /// `(user_key, value)` pair during compaction; versions no reader
-    /// can see are dropped first and never reach the filter.
+    /// Inspect the value of one of the caller's entries: `key` is the key
+    /// as the caller wrote it. Called for each value a compaction pass
+    /// keeps; versions no reader can see are dropped first and never
+    /// reach the filter. `level` is the level the pass writes.
     fn filter(&self, level: usize, key: &[u8], value: &[u8]) -> CompactionDecision;
 
-    /// Inspect a range tombstone. Default implementation keeps every
-    /// range tombstone. `CompactionDecision::Change` is treated as
-    /// `Keep` for range tombstones (there's no "value" to rewrite).
+    /// Inspect a range delete the caller made, by the bounds the caller
+    /// passed. Default implementation keeps every range delete.
+    /// `CompactionDecision::Change` is treated as `Keep` for range
+    /// deletes (there's no "value" to rewrite). Removing one brings back
+    /// every value it covered that compaction has not dropped yet.
     fn filter_range_delete(&self, level: usize, start: &[u8], end: &[u8]) -> CompactionDecision {
         let _ = (level, start, end);
         CompactionDecision::Keep
@@ -124,10 +196,85 @@ pub trait CompactionFilter: Send + Sync + 'static {
 /// first: `operands[0]` was written before `operands[1]`, which was
 /// written before `operands[2]`, etc. The base value (if any) was
 /// written before every operand.
+///
+/// # The key
+///
+/// Every method is handed the key as the caller wrote it: the bytes
+/// passed to `merge`, with nothing in front of them. That holds for
+/// every call the database makes: a point read, a scan, a transaction's
+/// read of its own merges, a commit's checks, and compaction. It is the
+/// key [`crate::KeyClassifier`] and [`crate::Conflict::key`] see.
+///
+/// A database has one operator, so a caller whose values have several
+/// shapes dispatches on the key inside it, by a prefix of its own. The
+/// column family is not part of the key: one key in two column families
+/// reaches the operator as the same bytes, so the shape of a value must
+/// follow from the key alone.
+///
+/// # Example
+///
+/// A counter: the value is a big-endian `u64`, and an operand is an amount
+/// to add. [`MergeOperator::partial_merge`] has an append-only list, and
+/// [`MergeOperator::touches`] a value with parts.
+///
+/// ```
+/// use std::sync::Arc;
+///
+/// use regolith::{Db, Error, MergeOperator, Options};
+///
+/// struct SumCounter;
+///
+/// fn number(bytes: &[u8]) -> Option<u64> {
+///     Some(u64::from_be_bytes(bytes.try_into().ok()?))
+/// }
+///
+/// impl MergeOperator for SumCounter {
+///     fn name(&self) -> &'static str {
+///         "sum-counter"
+///     }
+///
+///     // An absent key counts from zero. Bytes that are no number are
+///     // declined, never guessed at.
+///     fn full_merge(&self, _key: &[u8], base: Option<&[u8]>, operands: &[&[u8]]) -> Option<Vec<u8>> {
+///         let mut total = base.map_or(Some(0), number)?;
+///         for operand in operands {
+///             total = total.wrapping_add(number(operand)?);
+///         }
+///         Some(total.to_be_bytes().to_vec())
+///     }
+///
+///     // Wrapping addition is exactly associative, so two amounts fold into
+///     // one before any base is known.
+///     fn partial_merge(&self, _key: &[u8], left: &[u8], right: &[u8]) -> Option<Vec<u8>> {
+///         Some(number(left)?.wrapping_add(number(right)?).to_be_bytes().to_vec())
+///     }
+/// }
+///
+/// let options = Options::memory().merge_operator(Some(Arc::new(SumCounter)));
+/// let db = Db::open("counters", options)?;
+///
+/// // Each write is one operand: no read, no read-modify-write.
+/// db.merge(b"visits", &2u64.to_be_bytes())?;
+/// db.merge(b"visits", &3u64.to_be_bytes())?;
+/// assert_eq!(db.get(b"visits")?, Some(5u64.to_be_bytes().to_vec()));
+///
+/// // Compaction folds the operands away; a reader sees the same value.
+/// db.compact_range(None, None).wait()?;
+/// assert_eq!(db.get(b"visits")?, Some(5u64.to_be_bytes().to_vec()));
+///
+/// // A value the operator declines fails the read that needs it.
+/// db.put(b"visits", b"not a number")?;
+/// db.merge(b"visits", &1u64.to_be_bytes())?;
+/// assert!(matches!(db.get(b"visits"), Err(Error::MergeFailed { .. })));
+/// # Ok::<(), regolith::Error>(())
+/// ```
 pub trait MergeOperator: Send + Sync + 'static {
     /// Combine a `base` value (possibly `None` if the key didn't
     /// exist) with the ordered list of merge `operands`, returning
     /// the final value. Returning `None` signals merge failure.
+    ///
+    /// `key` is the key as the caller wrote it (see the trait's notes on
+    /// the key).
     fn full_merge(&self, key: &[u8], base: Option<&[u8]>, operands: &[&[u8]]) -> Option<Vec<u8>>;
 
     /// Optionally fold two adjacent operands `left` (older) and
@@ -142,6 +289,69 @@ pub trait MergeOperator: Send + Sync + 'static {
     /// addition, for one) should not implement this; `full_merge` onto a
     /// base value still folds. The default implementation returns
     /// `None`, which leaves such runs as written.
+    ///
+    /// A [`crate::DbWithTtl`] never calls it: it keeps a merged key's
+    /// writes apart until a read, so that each expires by its own time,
+    /// and folds them then with [`MergeOperator::full_merge`].
+    ///
+    /// # Example
+    ///
+    /// An append-only list: an operand is one item behind a one-byte length,
+    /// and a value is items end to end, so two operands fold by joining them.
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    ///
+    /// use regolith::{Db, MergeOperator, Options};
+    ///
+    /// struct Append;
+    ///
+    /// fn item(bytes: &[u8]) -> Vec<u8> {
+    ///     let len = u8::try_from(bytes.len()).expect("an item of at most 255 bytes");
+    ///     [&[len][..], bytes].concat()
+    /// }
+    ///
+    /// impl MergeOperator for Append {
+    ///     fn name(&self) -> &'static str {
+    ///         "append"
+    ///     }
+    ///
+    ///     fn full_merge(&self, _key: &[u8], base: Option<&[u8]>, operands: &[&[u8]]) -> Option<Vec<u8>> {
+    ///         let mut list = base.unwrap_or_default().to_vec();
+    ///         for operand in operands {
+    ///             list.extend_from_slice(operand);
+    ///         }
+    ///         Some(list)
+    ///     }
+    ///
+    ///     fn partial_merge(&self, _key: &[u8], left: &[u8], right: &[u8]) -> Option<Vec<u8>> {
+    ///         Some([left, right].concat())
+    ///     }
+    /// }
+    ///
+    /// // The law: however a run is grouped, it reads as the unfolded run does.
+    /// let (a, b, c) = (item(b"a"), item(b"b"), item(b"c"));
+    /// let unfolded = Append.full_merge(b"list", None, &[&a, &b, &c]);
+    /// assert_eq!(unfolded.as_deref(), Some(&b"\x01a\x01b\x01c"[..]));
+    /// let ab = Append.partial_merge(b"list", &a, &b).unwrap();
+    /// let bc = Append.partial_merge(b"list", &b, &c).unwrap();
+    /// assert_eq!(Append.full_merge(b"list", None, &[&ab, &c]), unfolded);
+    /// assert_eq!(Append.full_merge(b"list", None, &[&a, &bc]), unfolded);
+    ///
+    /// let options = Options::memory().merge_operator(Some(Arc::new(Append)));
+    /// let db = Db::open("lists", options)?;
+    /// db.merge(b"list", &a)?;
+    /// // The snapshot stands between the first item and the two after it, so
+    /// // compaction cannot fold those onto it and joins the two instead.
+    /// let pinned = db.snapshot();
+    /// db.merge(b"list", &b)?;
+    /// db.merge(b"list", &c)?;
+    /// db.compact_range(None, None).wait()?;
+    ///
+    /// assert_eq!(db.get(b"list")?, unfolded);
+    /// assert_eq!(pinned.get(b"list")?, Some(a));
+    /// # Ok::<(), regolith::Error>(())
+    /// ```
     fn partial_merge(&self, key: &[u8], left: &[u8], right: &[u8]) -> Option<Vec<u8>> {
         let _ = (key, left, right);
         None
@@ -155,8 +365,8 @@ pub trait MergeOperator: Send + Sync + 'static {
     ///
     /// `key` is the key exactly as [`MergeOperator::full_merge`] receives
     /// it. Return `true` when unsure: the default, `true`, makes every
-    /// operand change every part, which is the behaviour of a read that
-    /// names no parts at all.
+    /// operand change every part, so a read by parts is validated as a read
+    /// of the whole value is.
     ///
     /// Contract: a part this says an operand leaves alone is left alone by
     /// the value [`MergeOperator::full_merge`] produces, and the answer
@@ -165,10 +375,91 @@ pub trait MergeOperator: Send + Sync + 'static {
     /// commit on a part that changed. `regolith::testing::check_touches`, behind
     /// the `testing` feature, checks the second half.
     ///
-    /// Pure and fast: a commit calls it for every operand committed to the
-    /// key since the transaction began, while it holds the write pipeline.
+    /// Pure and fast. It runs when the commit of a transaction that read the
+    /// key by parts is decided, once for each operand committed to the key
+    /// since that transaction began, newest first, down to the first that
+    /// touches a named part or to a put or delete. The thread that decides
+    /// the commit runs it, which can be another committing thread, and the
+    /// commits behind it in the pipeline are decided only after it returns.
     /// A panic here fails that commit with [`crate::Error::CallbackPanicked`]
     /// and latches the database read-only until it is reopened.
+    ///
+    /// # Example
+    ///
+    /// A value with two parts, each one byte: a stock level and a price. An
+    /// operand names one part and adds to it, and so touches that part only.
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    ///
+    /// use regolith::{
+    ///     Access, IsolationLevel, MergeOperator, OptimisticTransactionDb, Options, TransactionError,
+    ///     TxnOptions, WriteKind,
+    /// };
+    ///
+    /// const STOCK: u8 = 0;
+    /// const PRICE: u8 = 1;
+    ///
+    /// struct Fields;
+    ///
+    /// impl MergeOperator for Fields {
+    ///     fn name(&self) -> &'static str {
+    ///         "fields"
+    ///     }
+    ///
+    ///     fn full_merge(&self, _key: &[u8], base: Option<&[u8]>, operands: &[&[u8]]) -> Option<Vec<u8>> {
+    ///         let mut fields: [u8; 2] = base.map_or(Some([0; 2]), |base| base.try_into().ok())?;
+    ///         for &operand in operands {
+    ///             let &[part, delta] = operand else { return None };
+    ///             let field = fields.get_mut(usize::from(part))?;
+    ///             *field = field.wrapping_add(delta);
+    ///         }
+    ///         Some(fields.to_vec())
+    ///     }
+    ///
+    ///     // Only two operands on one part fold, into one on that part, so the
+    ///     // fold touches exactly what the two touched.
+    ///     fn partial_merge(&self, _key: &[u8], left: &[u8], right: &[u8]) -> Option<Vec<u8>> {
+    ///         let (&[part, a], &[other, b]) = (left, right) else { return None };
+    ///         (part == other).then(|| vec![part, a.wrapping_add(b)])
+    ///     }
+    ///
+    ///     // An operand touches the part it names. An empty one names none:
+    ///     // unsure, so `true`.
+    ///     fn touches(&self, _key: &[u8], operand: &[u8], parts: &[u32]) -> bool {
+    ///         operand.first().is_none_or(|part| parts.contains(&u32::from(*part)))
+    ///     }
+    /// }
+    ///
+    /// // The law, for one pair that folds.
+    /// let folded = Fields.partial_merge(b"item", &[STOCK, 1], &[STOCK, 2]).unwrap();
+    /// assert!(Fields.touches(b"item", &folded, &[u32::from(STOCK)]));
+    /// assert!(!Fields.touches(b"item", &folded, &[u32::from(PRICE)]));
+    ///
+    /// let options = Options::memory().merge_operator(Some(Arc::new(Fields)));
+    /// let db = OptimisticTransactionDb::open("items", options)?
+    ///     .with_isolation(IsolationLevel::DefraLevel);
+    /// db.db().put(b"item", &[10, 50])?;
+    ///
+    /// // A quote decides on the price alone. Stock arriving meanwhile is an
+    /// // operand on the other part, so the quote commits.
+    /// let quote = db.begin(&TxnOptions::new());
+    /// let seen = quote.get_parts(b"item", &[u32::from(PRICE)])?.expect("the item exists");
+    /// db.db().merge(b"item", &[STOCK, 5])?;
+    /// quote.put(b"quote", &seen[1..])?;
+    /// quote.commit()?;
+    ///
+    /// // A price change touches the part the next quote named: it loses.
+    /// let quote = db.begin(&TxnOptions::new());
+    /// let seen = quote.get_parts(b"item", &[u32::from(PRICE)])?.expect("the item exists");
+    /// db.db().merge(b"item", &[PRICE, 5])?;
+    /// quote.put(b"quote", &seen[1..])?;
+    /// let Err(TransactionError::Conflict(lost)) = quote.commit() else {
+    ///     panic!("the price changed under the quote");
+    /// };
+    /// assert_eq!((lost.mine(), lost.theirs()), (Access::ReadParts, WriteKind::Merge));
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     fn touches(&self, key: &[u8], operand: &[u8], parts: &[u32]) -> bool {
         let _ = (key, operand, parts);
         true
@@ -199,13 +490,15 @@ pub struct WriteOptions {
     /// Reserved for future use by a cooperative write-lock priority
     /// queue. Currently accepted but ignored.
     pub low_pri: bool,
-    /// Fail the write instead of waiting when the engine is stalling.
+    /// Fail the write under any write stall, a slowdown included.
     ///
-    /// A write that would otherwise block on L0 or memtable pressure
-    /// returns [`crate::Error::Busy`] straight away, carrying the reason
-    /// it would have waited for. When the engine is not stalling this has
-    /// no effect. A transactional commit takes no write options and
-    /// always waits.
+    /// No write waits on a stall: without this flag a write under a stop
+    /// returns [`crate::Error::WouldBlock`] with a [`crate::StallWait`], and a
+    /// write under a slowdown goes ahead. With it, a write under either
+    /// returns [`crate::Error::Busy`] straight away, carrying the reason,
+    /// and leaves no wait behind. When the engine is not stalling this has
+    /// no effect. A transactional commit takes no write options and is
+    /// admitted as a write without this flag.
     pub no_slowdown: bool,
 }
 
@@ -245,6 +538,20 @@ impl WriteOptions {
 /// Point lookups are unaffected - they always consult the user-key
 /// bloom filter and do not call the extractor.
 ///
+/// # The key
+///
+/// `extract` is handed the key as the caller wrote it, and
+/// `extract_query` the prefix as the caller passed it to `seek_prefix`,
+/// with nothing in front of them, in every column family. The entries the
+/// database keeps for itself are not shown to the extractor. The filter
+/// still answers for one column family at a time: a prefix one family
+/// holds does not make a table look as if another family held it.
+///
+/// Changing the extractor is allowed: each table records the name of the
+/// extractor that built it, and a prefix seek reads a table built under
+/// another name, or before names were recorded, without its prefix filter
+/// until a compaction rewrites it.
+///
 /// A panic in this trait's code while a commit's memtable rotation runs it
 /// fails that commit with [`crate::Error::CallbackPanicked`] and latches the
 /// database read-only until it is reopened.
@@ -252,27 +559,32 @@ pub trait PrefixExtractor: Send + Sync + 'static {
     /// Return the portion of `key` that the prefix bloom should index,
     /// or `None` if `key` cannot produce a prefix (e.g., it's shorter
     /// than a fixed-length extractor's width). Keys that return `None`
-    /// are simply absent from the prefix bloom.
+    /// are simply absent from the prefix bloom. `key` is the key as the
+    /// caller wrote it.
     fn extract<'a>(&self, key: &'a [u8]) -> Option<&'a [u8]>;
 
     /// Return the bloom key that is safe to probe for a caller's
-    /// prefix-bounded scan. The default implementation only permits
-    /// exact extracted-prefix queries, preserving correctness for
-    /// custom extractors whose output may depend on more than a fixed
-    /// byte width. Extractors with stronger prefix-stability guarantees
-    /// can override this to enable broader SSTable skipping.
+    /// prefix-bounded scan, or `None` to rule no table out. `prefix` is
+    /// the prefix as the caller passed it. The default implementation
+    /// only permits exact extracted-prefix queries, preserving
+    /// correctness for custom extractors whose output may depend on more
+    /// than a fixed byte width. Extractors with stronger prefix-stability
+    /// guarantees can override this to enable broader SSTable skipping.
     fn extract_query<'a>(&self, prefix: &'a [u8]) -> Option<&'a [u8]> {
         let extracted = self.extract(prefix)?;
         (extracted == prefix).then_some(extracted)
     }
 
-    /// A stable, human-readable identifier for this extractor. Used
-    /// by tracing and diagnostics.
+    /// A stable, human-readable identifier for this extractor, recorded in
+    /// every table it builds. Two extractors that carve out different
+    /// prefixes must have different names: a table's prefix filter is used
+    /// only under the name it records. Also used by tracing and
+    /// diagnostics.
     fn name(&self) -> &'static str;
 }
 
-/// A [`PrefixExtractor`] that takes the first `N` bytes of every key.
-/// Keys shorter than `N` contribute no prefix.
+/// A [`PrefixExtractor`] that takes the first `N` bytes of every key, as
+/// the caller wrote it. Keys shorter than `N` contribute no prefix.
 #[derive(Debug, Clone, Copy)]
 pub struct FixedLengthPrefix(pub usize);
 
@@ -289,16 +601,68 @@ impl PrefixExtractor for FixedLengthPrefix {
         self.extract(prefix)
     }
 
+    /// `FixedLengthPrefix(N)`: the width is part of what it extracts, so it
+    /// is part of its name.
     fn name(&self) -> &'static str {
-        "FixedLengthPrefix"
+        fixed_length_name(self.0)
     }
+}
+
+/// The name of [`FixedLengthPrefix`] of `width`, made once per width and
+/// kept for the life of the process. Asking for it takes no lock: a width up
+/// to 64 has a cell of its own, and a wider one is kept in a lock-free map.
+fn fixed_length_name(width: usize) -> &'static str {
+    use std::sync::OnceLock;
+
+    use kovan_map::HopscotchMap;
+
+    static SMALL: [OnceLock<&'static str>; 65] = [const { OnceLock::new() }; 65];
+    static LARGE: OnceLock<HopscotchMap<usize, &'static str>> = OnceLock::new();
+    let make = || &*Box::leak(format!("FixedLengthPrefix({width})").into_boxed_str());
+    if let Some(name) = SMALL.get(width) {
+        return name.get_or_init(make);
+    }
+    let large = LARGE.get_or_init(HopscotchMap::new);
+    // Threads that miss the same width at once each make a name and the map
+    // keeps one: the others stay allocated, one per racing thread at most.
+    large
+        .get(&width)
+        .unwrap_or_else(|| large.get_or_insert(width, make()))
 }
 
 /// Compaction strategy used by the background compaction thread.
 ///
-/// Regolith currently ships two styles. More can be added in follow-up
-/// work (universal / size-tiered is the obvious next one) without
-/// breaking callers, since the field is consumed by name.
+/// # Deleted ranges
+///
+/// Under [`Level`](Self::Level) and [`Universal`](Self::Universal) a key
+/// range that was written and then deleted is compacted without a call
+/// from you. Besides the size triggers, a compaction runs when more than
+/// half of the entries it would read are deletions and the entries they
+/// delete, so that it discards more than it copies. It is an ordinary
+/// compaction, counted in
+/// [`Ticker::CompactionDeletionTriggered`](crate::Ticker::CompactionDeletionTriggered).
+/// Size-triggered work goes first, but passes such a compaction over at
+/// most [`sync::MAX_BYPASS`](crate::sync::MAX_BYPASS) times, unless L0 is
+/// within one table of a threshold that slows or stops writes.
+///
+/// Three things limit it:
+///
+/// - A live [`Snapshot`](crate::Snapshot), or an open transaction, older
+///   than the newest deletion in a table defers the compaction of that
+///   table for its deletions until the snapshot is dropped or the
+///   transaction ends: a deletion a snapshot still needs cannot be
+///   discarded. Size-triggered compaction goes on meanwhile.
+/// - A table written by an earlier version of regolith, or restored from a
+///   backup, carries no count of its deletions. Each such table is read
+///   once in the background, a bounded step at a time, and only then
+///   weighed. The property `regolith.num-uncounted-tables`
+///   ([`Db::get_int_property`](crate::Db::get_int_property)) says how many
+///   are left.
+/// - A deleted range that is a small part of the tables it lives in is not
+///   compacted for its deletions, since rewriting those tables would copy
+///   more than it discards. It goes when a size-triggered compaction
+///   reaches it, or when [`Db::compact_range`](crate::Db::compact_range)
+///   is called on it.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum CompactionStyle {
     /// Standard leveled compaction: L0 collects flushes, then files
@@ -322,6 +686,9 @@ pub enum CompactionStyle {
     /// [`Options::level0_stop_writes_trigger`]) cannot be relieved by
     /// compaction under this style. Set them to `0` unless the byte
     /// cap is guaranteed to bite first.
+    ///
+    /// For the same reason a deleted key and its deletion both stay until
+    /// their table is dropped: no compaction runs for deletions here.
     Fifo,
     /// Universal (size-tiered): all files live at L0 and are
     /// merged into progressively larger runs based on size ratios
@@ -352,7 +719,7 @@ pub struct FifoCompactionOptions {
     /// Soft cap on the total bytes held by SSTables. After every
     /// flush, if the sum of file sizes exceeds this number, the
     /// background compaction thread unlinks the oldest SSTables
-    /// (smallest `file_id` first) until the cap is satisfied or
+    /// (oldest first, as L0 lists them) until the cap is satisfied or
     /// only one file remains. Must be greater than zero when FIFO
     /// compaction is selected. Default: 1 GiB.
     pub max_table_files_size: u64,
@@ -496,6 +863,10 @@ pub struct Options {
     pub(crate) fifo_compaction_options: FifoCompactionOptions,
     pub(crate) universal_compaction_options: UniversalCompactionOptions,
     pub(crate) max_background_compactions: usize,
+    pub(crate) log_writeback: bool,
+    /// `None` until [`Options::inline_compaction`] is called: resolved by
+    /// [`Options::inline_compaction_resolved`].
+    pub(crate) inline_compaction: Option<bool>,
     pub(crate) max_subcompactions: usize,
     pub(crate) evict_compaction_data_from_page_cache: bool,
     pub(crate) partitioned_index: bool,
@@ -545,6 +916,8 @@ impl Default for Options {
             universal_compaction_options: UniversalCompactionOptions::default(),
             evict_compaction_data_from_page_cache: false,
             max_background_compactions: DEFAULT_MAX_BACKGROUND_COMPACTIONS,
+            log_writeback: false,
+            inline_compaction: None,
             max_subcompactions: 1,
             partitioned_index: false,
             cache_index_and_filter_blocks: false,
@@ -628,6 +1001,8 @@ impl std::fmt::Debug for Options {
                 "max_background_compactions",
                 &self.max_background_compactions,
             )
+            .field("log_writeback", &self.log_writeback)
+            .field("inline_compaction", &self.inline_compaction_resolved())
             .field("max_subcompactions", &self.max_subcompactions)
             .field("partitioned_index", &self.partitioned_index)
             .field(
@@ -644,6 +1019,14 @@ impl std::fmt::Debug for Options {
 }
 
 impl Options {
+    /// [`Options::inline_compaction`] as the engine takes it: what was set,
+    /// or, when nothing was, on for a database with no compaction worker and
+    /// off for one that has a worker.
+    pub(crate) fn inline_compaction_resolved(&self) -> bool {
+        self.inline_compaction
+            .unwrap_or(self.max_background_compactions == 0)
+    }
+
     /// Tuning for a device or module whose whole working set has to
     /// fit in roughly 1-4 MiB: a Linux-class embedded board (Cortex-A,
     /// or an ESP32-S3 under esp-idf), or a wasm module, where every
@@ -721,6 +1104,10 @@ impl Options {
     /// - [`Options::max_background_compactions`] `0`: compaction runs
     ///   on the calling thread. Required on a single-threaded host;
     ///   on a board with a spare core, set this to `1`.
+    /// - [`Options::inline_compaction`] `true`: with no worker, a write
+    ///   a stall stops leaves the step that relieves it on its thread's
+    ///   queue, or runs it inline with no queue, so a stall clears without
+    ///   a caller compacting by hand.
     /// - [`Options::evict_compaction_data_from_page_cache`] `true`: on
     ///   a device whose page cache is a few MiB, compaction streaming
     ///   through it would evict every hot foreground page. The hint is
@@ -795,6 +1182,7 @@ impl Options {
             hard_pending_compaction_bytes_limit: 16 * 1024 * 1024,
             max_write_buffer_number: 2,
             max_background_compactions: 0,
+            inline_compaction: Some(true),
             evict_compaction_data_from_page_cache: true,
             metadata_block_size: 1024,
             max_key_size: 16 * 1024,
@@ -931,6 +1319,7 @@ impl Options {
             hard_pending_compaction_bytes_limit: 128 * 1024 * 1024,
             max_write_buffer_number: 2,
             max_background_compactions: 0,
+            inline_compaction: Some(true),
             evict_compaction_data_from_page_cache: false,
             metadata_block_size: 1024,
             max_key_size: 16 * 1024,
@@ -1152,6 +1541,8 @@ impl Options {
             universal_compaction_options: self.universal_compaction_options,
             evict_compaction_data_from_page_cache: self.evict_compaction_data_from_page_cache,
             max_background_compactions: self.max_background_compactions,
+            log_writeback: self.log_writeback,
+            inline_compaction: self.inline_compaction_resolved(),
             partitioned_index: self.partitioned_index,
             cache_index_and_filter_blocks: self.cache_index_and_filter_blocks,
             metadata_block_size: self.metadata_block_size,
@@ -1223,7 +1614,12 @@ mod tests {
         assert_eq!(ex.extract(b"abcd"), Some(&b"abcd"[..]));
         assert_eq!(ex.extract(b"abc"), None);
         assert_eq!(ex.extract(b""), None);
-        assert_eq!(ex.name(), "FixedLengthPrefix");
+        assert_eq!(ex.name(), "FixedLengthPrefix(4)");
+        // Each width its own name, the same every time it is asked.
+        assert_eq!(FixedLengthPrefix(4).name(), ex.name());
+        assert_eq!(FixedLengthPrefix(65).name(), "FixedLengthPrefix(65)");
+        assert_eq!(FixedLengthPrefix(65).name(), FixedLengthPrefix(65).name());
+        assert_ne!(FixedLengthPrefix(3).name(), ex.name());
     }
 
     #[test]
@@ -1306,10 +1702,12 @@ mod tests {
         )
         .unwrap();
         for i in 0..500u32 {
-            db.put(
-                format!("key{i:04}").as_bytes(),
-                format!("value{i}").as_bytes(),
-            )
+            crate::through_stalls(|| {
+                db.put(
+                    format!("key{i:04}").as_bytes(),
+                    format!("value{i}").as_bytes(),
+                )
+            })
             .unwrap();
         }
         // Small write buffer forces flushes, so most of these reads
@@ -1670,6 +2068,16 @@ mod tests {
         assert_eq!(
             eo.cache_index_and_filter_blocks,
             opts.cache_index_and_filter_blocks
+        );
+        assert!(
+            !opts.log_writeback,
+            "the log writeback lane is off by default"
+        );
+        assert!(
+            Options::default()
+                .log_writeback(true)
+                .to_engine_options()
+                .log_writeback
         );
     }
 

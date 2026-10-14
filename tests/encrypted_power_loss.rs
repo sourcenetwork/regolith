@@ -104,7 +104,7 @@ fn immediate_writes_survive_every_cut_and_tear_and_a_wrong_key_never_opens() {
             );
             let context = format!("WAL write {nth}, {tear:?}");
             let r = recover_both_ways(&db, &out, &context);
-            if let Err(e) = r.covers_acked(&out.acked) {
+            if let Err(e) = r.covers_acked(&out.acked()) {
                 panic!("{context}: {e}\n{}", report.summary());
             }
         }
@@ -123,7 +123,7 @@ fn a_cut_inside_a_flush_keeps_every_acknowledged_write() {
         assert!(out.acked_count() > 0);
         let context = format!("third flush, {tear:?}");
         let r = recover_both_ways(&db, &out, &context);
-        if let Err(e) = r.covers_acked(&out.acked) {
+        if let Err(e) = r.covers_acked(&out.acked()) {
             panic!("{context}: {e}\n{}", report.summary());
         }
     }

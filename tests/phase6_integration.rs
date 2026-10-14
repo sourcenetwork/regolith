@@ -19,6 +19,11 @@
 //!   wait on, then flushes and joins the worker, while reads already under
 //!   way and the worker's flushes go on: every wait completes, no unit is
 //!   left, and a close that fails leaves queue reads working.
+//! - **Log retirement under a hard open-file bound** (#268 x Phase 7c1). The
+//!   open-file table renames a removed table aside while a reader holds it,
+//!   and passes every other file through, so a log's removal, its failure
+//!   and its retry behave on every flush path exactly as without the bound.
+#![cfg(not(target_arch = "wasm32"))]
 
 mod common;
 
@@ -49,8 +54,9 @@ enum FlushPath {
     /// The writer whose commit sealed it, once that commit returned, on a
     /// database with no worker.
     AfterCommit,
-    /// A writer stopped by a stall, inside the bounded step it runs before
-    /// its own write, on a database with no worker.
+    /// A writer slowed by a stall, in the bounded step its slowed write owes
+    /// on a database with no worker and inline compaction on, run once its
+    /// commit returned.
     StallStep,
 }
 
@@ -60,6 +66,8 @@ struct Fixture {
     stats: Arc<Statistics>,
     path: FlushPath,
     filler: usize,
+    /// `Options::max_open_files`; 0 for no bound.
+    open_files: usize,
 }
 
 impl Fixture {
@@ -70,24 +78,34 @@ impl Fixture {
             stats: Arc::new(Statistics::new()),
             path,
             filler: 0,
+            open_files: 0,
         }
+    }
+
+    /// The same fixture under a hard bound of `n` open tables.
+    fn open_files(mut self, n: usize) -> Self {
+        self.open_files = n;
+        self
     }
 
     fn options(&self) -> Options {
         let options = Options::default()
             .env(Arc::clone(&self.env) as Arc<dyn Env>)
             .statistics(Some(Arc::clone(&self.stats)))
-            .write_buffer_size(WRITE_BUFFER);
+            .write_buffer_size(WRITE_BUFFER)
+            .max_open_files(self.open_files);
         match self.path {
             FlushPath::Worker => options.max_background_compactions(1),
             FlushPath::AfterCommit => options.max_background_compactions(0),
             // With one table at L0 every write is slowed down, and a slowed
-            // write with no worker first runs one bounded step: the flush of
-            // the oldest frozen memtable when there is one. The compaction
-            // trigger is out of reach, so the steps between flushes find
-            // nothing to compact.
+            // write with no worker and inline compaction on owes one bounded
+            // step, run once its commit returned: the flush of the oldest
+            // frozen memtable when there is one. The compaction trigger is
+            // out of reach, so the steps between flushes find nothing to
+            // compact.
             FlushPath::StallStep => options
                 .max_background_compactions(0)
+                .inline_compaction(true)
                 .level0_slowdown_writes_trigger(1)
                 .l0_compaction_trigger(64),
         }
@@ -109,14 +127,14 @@ impl Fixture {
     fn fill(&mut self, db: &Db) {
         let key = format!("filler/{:06}", self.filler);
         self.filler += 1;
-        db.put(key.as_bytes(), &[b'f'; FILLER]).unwrap();
+        regolith::through_stalls(|| db.put(key.as_bytes(), &[b'f'; FILLER])).unwrap();
     }
 
     /// Put `key = value`, then have this fixture's path flush the memtable
     /// holding it. Returns once that flush has run.
     fn put_and_flush(&mut self, db: &Db, key: &[u8], value: &[u8]) {
         let flushes = self.ticker(Ticker::FlushCount);
-        db.put(key, value).unwrap();
+        regolith::through_stalls(|| db.put(key, value)).unwrap();
         match self.path {
             FlushPath::Worker => {
                 // Write until the memtable seals, then stop: a second seal
@@ -182,12 +200,16 @@ fn active_log(db: &Path) -> PathBuf {
 /// `k = new` retries that removal and fails again, and the reopen reads
 /// `new`. Each failure is counted, and the reopen removes the leftover.
 fn a_log_left_behind_is_counted_and_never_replayed(path: FlushPath) {
-    let mut f = Fixture::new(path);
+    a_log_left_behind_is_counted_and_never_replayed_in(Fixture::new(path));
+}
+
+fn a_log_left_behind_is_counted_and_never_replayed_in(mut f: Fixture) {
+    let path = f.path;
     let leftover = {
         let db = f.open();
         if let FlushPath::StallStep = path {
             // The table that turns the slowdown on.
-            db.put(b"seed", b"v").unwrap();
+            regolith::through_stalls(|| db.put(b"seed", b"v")).unwrap();
             db.flush().unwrap();
         }
         let leftover = active_log(f.dir.path());
@@ -244,17 +266,38 @@ fn the_stall_step_flush_retires_its_log_and_records_it_flushed() {
 }
 
 #[test]
+fn under_a_hard_open_file_bound_the_worker_flush_retires_its_log() {
+    a_log_left_behind_is_counted_and_never_replayed_in(
+        Fixture::new(FlushPath::Worker).open_files(2),
+    );
+}
+
+#[test]
+fn under_a_hard_open_file_bound_the_flush_after_a_commit_retires_its_log() {
+    a_log_left_behind_is_counted_and_never_replayed_in(
+        Fixture::new(FlushPath::AfterCommit).open_files(2),
+    );
+}
+
+#[test]
+fn under_a_hard_open_file_bound_the_stall_step_flush_retires_its_log() {
+    a_log_left_behind_is_counted_and_never_replayed_in(
+        Fixture::new(FlushPath::StallStep).open_files(2),
+    );
+}
+
+#[test]
 fn a_restored_database_replays_no_log_its_target_held() {
     let source = TempDir::new().unwrap();
     let db = Db::open(source.path(), Options::default()).unwrap();
-    db.put(b"k", b"backed-up").unwrap();
+    regolith::through_stalls(|| db.put(b"k", b"backed-up")).unwrap();
     let backups = TempDir::new().unwrap();
     let mut engine = BackupEngine::open(backups.path()).unwrap();
     let id = engine.create_backup(&db).unwrap();
     // Writes after the backup, held only by the log the backup's flush
     // started, whose number is below the backup's next file id.
-    db.put(b"k", b"after").unwrap();
-    db.put(b"only-in-a-log", b"v").unwrap();
+    regolith::through_stalls(|| db.put(b"k", b"after")).unwrap();
+    regolith::through_stalls(|| db.put(b"only-in-a-log", b"v")).unwrap();
     let log = logs(source.path()).pop().expect("the source's active log");
     drop(db);
 
@@ -322,7 +365,7 @@ fn a_damaged_sealed_block_read_through_a_queue_is_reported_once_naming_the_table
     {
         let db = Db::open(dir.path(), sealed_options()).unwrap();
         for i in 0..400 {
-            db.put(&numbered(i), format!("value {i}").as_bytes())
+            regolith::through_stalls(|| db.put(&numbered(i), format!("value {i}").as_bytes()))
                 .unwrap();
         }
         db.flush().unwrap();
@@ -387,7 +430,7 @@ fn an_ingested_table_read_through_a_queue_on_an_encrypted_database_reads_at_its_
     {
         let db = Db::open(dir.path(), sealed_options()).unwrap();
         for i in 0..200 {
-            db.put(&numbered(i), b"old").unwrap();
+            regolith::through_stalls(|| db.put(&numbered(i), b"old")).unwrap();
         }
         db.flush().unwrap();
         let mut writer = SstFileWriter::create(&source, &Options::default()).unwrap();
@@ -396,6 +439,7 @@ fn an_ingested_table_read_through_a_queue_on_an_encrypted_database_reads_at_its_
         }
         writer.finish().unwrap();
         db.ingest_external_files(std::slice::from_ref(&source), IngestOptions::default())
+            .wait()
             .unwrap();
         db.close().unwrap();
     }
@@ -450,7 +494,7 @@ fn close_while_the_worker_flushes_completes_every_queued_read() {
     {
         let db = Db::open(dir.path(), options()).unwrap();
         for i in 0..2000 {
-            db.put(&numbered(i), b"in a table").unwrap();
+            regolith::through_stalls(|| db.put(&numbered(i), b"in a table")).unwrap();
         }
         db.flush().unwrap();
         db.close().unwrap();
@@ -471,7 +515,9 @@ fn close_while_the_worker_flushes_completes_every_queued_read() {
         std::thread::spawn(move || {
             let mut landed = 0usize;
             loop {
-                match db.put(format!("late/{landed:06}").as_bytes(), &[b'w'; 512]) {
+                match regolith::through_stalls(|| {
+                    db.put(format!("late/{landed:06}").as_bytes(), &[b'w'; 512])
+                }) {
                     Ok(()) => landed += 1,
                     Err(Error::Closed) => return landed,
                     Err(other) => panic!("a write failed with {other:?}"),
@@ -521,7 +567,7 @@ fn a_close_that_fails_leaves_reads_through_queues_working() {
     )
     .unwrap();
     for i in 0..400 {
-        db.put(&numbered(i), b"in a table").unwrap();
+        regolith::through_stalls(|| db.put(&numbered(i), b"in a table")).unwrap();
     }
     db.flush().unwrap();
     let mut queue = db.io_queue();
@@ -533,8 +579,10 @@ fn a_close_that_fails_leaves_reads_through_queues_working() {
         .unwrap()
         == 0
     {
-        db.put(format!("filler/{filler:06}").as_bytes(), &[b'f'; 1024])
-            .unwrap();
+        regolith::through_stalls(|| {
+            db.put(format!("filler/{filler:06}").as_bytes(), &[b'f'; 1024])
+        })
+        .unwrap();
         filler += 1;
     }
     assert!(db.close().is_err(), "the close's flush fails");

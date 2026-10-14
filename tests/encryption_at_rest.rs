@@ -100,7 +100,7 @@ fn files_holding(dir: &Path, needle: &[u8]) -> Vec<PathBuf> {
 
 fn fill(db: &Db, from: usize, to: usize) {
     for i in from..to {
-        db.put(&key(i), &value(i)).unwrap();
+        regolith::through_stalls(|| db.put(&key(i), &value(i))).unwrap();
     }
 }
 
@@ -117,10 +117,10 @@ fn an_encrypted_database_round_trips_and_holds_no_plaintext_on_disk() {
     {
         let db = Db::open(dir.path(), options(&keys)).unwrap();
         fill(&db, 0, 600);
-        db.delete(&key(5)).unwrap();
-        db.delete_range(&key(10), &key(20)).unwrap();
+        regolith::through_stalls(|| db.delete(&key(5))).unwrap();
+        regolith::through_stalls(|| db.delete_range(&key(10), &key(20))).unwrap();
         db.flush().unwrap();
-        db.compact_range(None, None).unwrap();
+        db.compact_range(None, None).wait().unwrap();
         fill(&db, 600, 700);
         db.close().unwrap();
     }
@@ -154,14 +154,13 @@ fn merges_fold_plaintext_operands_across_flushes_and_compactions() {
     let keys = Keys::new(&[1]);
     let db = Db::open(dir.path(), options(&keys)).unwrap();
     for round in 0..300i64 {
-        db.merge(b"counter", &round.to_be_bytes()).unwrap();
-        db.put(&key(round as usize), &value(round as usize))
-            .unwrap();
+        regolith::through_stalls(|| db.merge(b"counter", &round.to_be_bytes())).unwrap();
+        regolith::through_stalls(|| db.put(&key(round as usize), &value(round as usize))).unwrap();
         if round % 100 == 99 {
             db.flush().unwrap();
         }
     }
-    db.compact_range(None, None).unwrap();
+    db.compact_range(None, None).wait().unwrap();
     let total: i64 = (0..300).sum();
     assert_eq!(
         db.get(b"counter").unwrap(),
@@ -184,7 +183,7 @@ fn identical_writes_and_value_validated_reads_compare_plaintext_bytes() {
     let dir = TempDir::new().unwrap();
     let keys = Keys::new(&[1]);
     let db = txn_db(dir.path(), &keys);
-    db.db().put(b"version", b"v1").unwrap();
+    regolith::through_stalls(|| db.db().put(b"version", b"v1")).unwrap();
     db.db().flush().unwrap();
 
     // Byte equality: two blind writes of the same bytes, the first flushed
@@ -204,9 +203,9 @@ fn identical_writes_and_value_validated_reads_compare_plaintext_bytes() {
     let reader = db.begin(&TxnOptions::new().isolation(IsolationLevel::DefraLevel));
     assert_eq!(reader.get(b"version").unwrap().as_deref(), Some(&b"v1"[..]));
     reader.put(b"reader-wrote", b"x").unwrap();
-    db.db().put(b"version", b"v2").unwrap();
+    regolith::through_stalls(|| db.db().put(b"version", b"v2")).unwrap();
     db.db().flush().unwrap();
-    db.db().put(b"version", b"v1").unwrap();
+    regolith::through_stalls(|| db.db().put(b"version", b"v1")).unwrap();
     db.db().flush().unwrap();
     reader
         .commit()
@@ -216,7 +215,7 @@ fn identical_writes_and_value_validated_reads_compare_plaintext_bytes() {
     let reader = db.begin(&TxnOptions::new().isolation(IsolationLevel::DefraLevel));
     reader.get(b"version").unwrap();
     reader.put(b"reader-wrote", b"y").unwrap();
-    db.db().put(b"version", b"v3").unwrap();
+    regolith::through_stalls(|| db.db().put(b"version", b"v3")).unwrap();
     db.db().flush().unwrap();
     assert!(matches!(
         reader.commit(),
@@ -246,14 +245,14 @@ fn content_addressed_keys_compare_plaintext_bytes() {
 
     let tx = defra();
     tx.put(b"b/shared", MARKER).unwrap();
-    db.db().put(b"b/shared", MARKER).unwrap();
+    regolith::through_stalls(|| db.db().put(b"b/shared", MARKER)).unwrap();
     db.db().flush().unwrap();
     tx.commit()
         .expect("the same bytes under a content-addressed key");
 
     let tx = defra();
     tx.put(b"b/shared", b"other bytes").unwrap();
-    db.db().put(b"b/shared", MARKER).unwrap();
+    regolith::through_stalls(|| db.db().put(b"b/shared", MARKER)).unwrap();
     db.db().flush().unwrap();
     assert!(matches!(
         tx.commit(),
@@ -541,7 +540,7 @@ fn a_rotated_key_reads_old_data_and_a_full_compaction_retires_it() {
         let db = Db::open(dir.path(), options(&keys)).unwrap();
         fill(&db, 0, 300);
         db.flush().unwrap();
-        db.compact_range(None, None).unwrap();
+        db.compact_range(None, None).wait().unwrap();
         fill(&db, 300, 350);
         db.flush().unwrap();
         keys.set_current(2);
@@ -561,7 +560,7 @@ fn a_rotated_key_reads_old_data_and_a_full_compaction_retires_it() {
 
     {
         let db = Db::open(dir.path(), options(&keys)).unwrap();
-        db.compact_range(None, None).unwrap();
+        db.compact_range(None, None).wait().unwrap();
         db.close().unwrap();
     }
     let db = Db::open(dir.path(), options(&only_two)).unwrap();
@@ -579,7 +578,7 @@ fn an_unencrypted_database_opens_with_a_provider_and_a_full_compaction_seals_it(
         let db = Db::open(dir.path(), plain.clone()).unwrap();
         fill(&db, 0, 400);
         db.flush().unwrap();
-        db.compact_range(None, None).unwrap();
+        db.compact_range(None, None).wait().unwrap();
         fill(&db, 400, 420);
     }
     assert!(!files_holding(dir.path(), MARKER).is_empty());
@@ -589,7 +588,7 @@ fn an_unencrypted_database_opens_with_a_provider_and_a_full_compaction_seals_it(
         let db = Db::open(dir.path(), options(&keys)).unwrap();
         check(&db, 0, 420);
         fill(&db, 420, 500);
-        db.compact_range(None, None).unwrap();
+        db.compact_range(None, None).wait().unwrap();
         db.close().unwrap();
     }
     assert!(
@@ -625,6 +624,7 @@ fn external_tables_ingest_into_an_encrypted_database_sealed_or_not() {
     }
     assert!(files_holding(staging.path(), MARKER) == vec![plain_path.clone()]);
     db.ingest_external_files(&[sealed_path, plain_path], IngestOptions::default())
+        .wait()
         .unwrap();
     check(&db, 0, 50);
     check(&db, 1000, 1050);
@@ -664,6 +664,7 @@ fn an_ingested_sealed_table_is_installed_as_is_and_reads_at_its_sequence() {
         ..IngestOptions::default()
     };
     db.ingest_external_files(std::slice::from_ref(&source), ingest)
+        .wait()
         .unwrap();
 
     let ingested = |i: usize| {
@@ -715,6 +716,7 @@ fn a_backup_holding_an_ingested_table_restores_under_the_keys() {
     let source = staging.path().join("ingest.sst");
     external(&source, &Options::default(), 100..140, b"/ingested");
     db.ingest_external_files(&[source], IngestOptions::default())
+        .wait()
         .unwrap();
 
     let backups = TempDir::new().unwrap();
@@ -755,6 +757,7 @@ fn checkpoints_and_backups_of_an_encrypted_database_open_under_its_keys() {
     Checkpoint::new(&db)
         .unwrap()
         .create(&checkpoint_dir)
+        .wait()
         .unwrap();
     let backups = TempDir::new().unwrap();
     let mut engine = BackupEngine::open(backups.path()).unwrap();

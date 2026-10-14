@@ -12,7 +12,7 @@ Early-stage. The public API (`Db`, `Snapshot`, `WriteBatch`, `Options`) is small
 - **LSM-tree**: write-optimized with level-based background compaction
 - **MVCC**: point-in-time consistent reads via global sequence numbers
 - **Crash recovery**: WAL whose records carry the offset the last sync made durable, so replay tells a crash from damage
-- **Concurrent reads**: an arena-backed skip list memtable (`src/engine/skiplist/`) that readers walk without a lock until a range delete lands in it; a block-cache hit is lock-free
+- **Concurrent reads**: no read takes a lock. A read loads the published view wait-free (`src/engine/read_view.rs`, a kovan `Atom`), walks the arena-backed skip list memtable (`src/engine/skiplist/`) and its append-only range-tombstone log, and uses a lock-free CLOCK block cache
 - **No async runtime required**: compaction runs on background worker threads (`Options::max_background_compactions`), or inline on a target that has none
 
 ---
@@ -67,47 +67,71 @@ src/
 ├── backup.rs           # BackupEngine: backups, metadata sealed through the KeyProvider (D57), restore
 ├── backup/             # format.rs: the .backup metadata, plain (version 3) and sealed (version 4)
 ├── checkpoint.rs       # Hardlinked checkpoint creation
-├── column_family.rs    # Column-family handles and descriptors
+├── column_family.rs    # Column-family handles, descriptors, and the lock-free registry
 ├── conflict.rs         # Conflict reasons: Conflict, Access, WriteKind
 ├── encryption.rs       # Encryption at rest: KeyProvider, KeyId, KeyMaterial
 ├── error.rs            # Error enum, Result alias
 ├── event_listener.rs   # Flush/compaction event callbacks
-├── io_queue.rs         # Non-blocking reads: ReadMode, QueueId, IoBudget, IoProgress
-├── io_queue/           # queue.rs (IoQueue: poll, idle_waker), wait.rs (IoWait, WouldBlock)
+├── io_queue.rs         # Non-blocking calls: ReadMode, QueueId, IoBudget, IoProgress
+├── io_queue/           # queue.rs (IoQueue: poll, idle_waker, block_on), wait.rs (IoWait, StallWait,
+│                       # LockWait, WouldBlock), ticket.rs (CommitTicket, JobTicket), completion.rs (deliver once)
 ├── iter.rs             # Public iterator wrappers
 ├── log_layout.rs       # LogLayout: the key layout of a commit-ordered log
 ├── options.rs          # Options, tuning enums, MergeOperator, CompactionFilter
 ├── options/            # Options builder methods (builder.rs) and getters (getters.rs)
+├── per_thread.rs       # A small number per thread (bounded pool, given back on exit) for per-core shards
 ├── perf_context.rs     # Per-operation performance counters
 ├── portability.rs      # Atomics shim and the portability tier map
 ├── rate_limiter.rs     # Token-bucket rate limiter
 ├── slice.rs            # DbSlice: zero-copy value handle
 ├── sst_file_writer.rs  # External SSTable writer API
-├── statistics.rs       # Tickers, histograms, and properties
+├── statistics.rs       # Tickers and histograms, sharded per thread, summed when read
 ├── stream_writer.rs    # StreamingWriter: bounded-memory write stream
 ├── tailing.rs          # Tailing iterator API
 ├── testing.rs          # `testing` feature: property checks a caller runs against its own trait implementations
 ├── transaction.rs      # Optimistic and pessimistic transactions, isolation levels
 ├── transaction/        # policy.rs (KeyClassifier, key classes), txn_options.rs (TxnOptions),
-│                       # scan_range.rs (scan stretches), write_buffer.rs (buffered puts, deletes, merges)
+│                       # scan_range.rs (scan stretches), write_buffer.rs (buffered puts, deletes, merges),
+│                       # nowait.rs (commit_nowait), retry.rs (transact, transact_async, ready),
+│                       # lock_table.rs (the lock-free pessimistic lock table, a wait kept across calls),
+│                       # locking.rs (a transaction's lock calls: try, blocking with the timeout, release)
 ├── ttl.rs              # TTL database wrapper
 ├── sync/               # Public regolith::sync: async locks, semaphore, notify, event, latch, barrier, once cell
 │   ├── queue.rs        # Wait queue and drain role every primitive builds on
 │   ├── contend.rs      # The acquire every lock-like primitive shares: barging with bounded bypass (D49)
+│   ├── owned_lock.rs   # A lock whose holder is named in its state word: the pessimistic key lock
 │   ├── waiter.rs       # Waiter nodes, their free list, the wake list
-│   └── internal.rs     # The engine's private std/loom atomics, Mutex, RwLock, Condvar and Gate
+│   └── internal.rs     # The engine's private std/loom atomics and Mutex, and how its threads wait on a
+│                       # regolith::sync primitive (block_on, wait_here), releasing held-back views first
 ├── txn_buffer.rs       # Concurrent write and read-set buffer of one transaction
-├── env/                # Env trait and backends: StdEnv, MemEnv, WASI, OPFS; db_lock.rs, open_file_limit.rs
+├── env/                # Env trait and backends: StdEnv (positional reads and log writes), MemEnv, WASI, OPFS;
+│                       # LogFile, a log written at offsets (serial_log.rs over an append-only file); db_lock.rs
+│   ├── mem_file.rs     # Lock-free in-memory file behind MemEnv and the OPFS mirror
+│   ├── open_file_limit/ # max_open_files: lock-free slot table (slots.rs), rename-aside removal
+│   ├── opfs/           # Browser OPFS backend: lock-free pool and mirror over sync access handles
+│   └── persist_order.rs # The order OPFS mirror mode writes files back: tables, manifest, deletions (E20)
 └── engine/
     ├── mod.rs          # RegolithEngine orchestration, read paths, rotation, recovery
-    ├── commit/         # Group commit pipeline: ring, bounded leader, transaction members decided in
-    │                   # group order (group.rs, txn.rs), the check up to a horizon (early.rs), stall signal
+    ├── commit/         # The lock-free commit pipeline: the ring of slots (ring.rs), what a slot holds
+    │                   # (descriptor.rs), the stages any thread runs: decide, apply, write, publish
+    │                   # (pipeline.rs), the round that syncs or rolls back the log (round.rs), ordered
+    │                   # units, rotation and rollback (ordered.rs), whose reads a decision may make
+    │                   # (read_mode.rs), commit_nowait after its call returned (resume.rs), transactions
+    │                   # as slots (txn.rs), the check up to a horizon (early.rs), the stall as a unit
+    │                   # writers wait on (stall.rs), the column-family fence (families.rs), stage hooks
+    │                   # for tests (hook.rs)
     ├── flush.rs        # Writing a frozen memtable to L0, shared with the compaction workers
-    ├── background_step.rs # Flushes off the commit path; the bounded step a write owes with no worker
+    ├── background_step.rs # Flushes off the commit path; owed work run as a job on the writer's queue
+    ├── foreground.rs   # compact_range, ingest, checkpoint run as jobs behind a JobTicket; a job on a
+    │                   # queue parks instead of waiting for the compaction gate
+    ├── compaction_gate.rs # The compaction gate: passes share it, jobs hold it alone, fair both ways (E28)
     ├── stall_state.rs  # Write-stall thresholds and the level writers cache
     ├── compaction.rs   # Level/FIFO/universal compaction planning and worker loop
-    ├── compaction/     # Per-snapshot-stripe folding of versions and merge chains
+    ├── compaction/     # Per-snapshot-stripe folding of versions and merge chains; claims.rs (the tables
+    │                   # passes are working on, claimed with atomics)
     ├── manifest.rs     # VersionSet, VersionEdit log, level tracking
+    ├── version_store.rs # The version set behind its step; the current version is one load of the view
+    ├── step.rs         # A step: sections run one at a time by whichever thread holds it, no mutex
     ├── manifest/       # Sealed manifests (sealed.rs), the judge of a torn tail (tail.rs, E29), tests
     ├── log_retirement.rs # Retiring flushed logs: min_wal_id in the table's batch, failed removals
     │                   # reported and retried (E30)
@@ -115,40 +139,49 @@ src/
     ├── open_transactions.rs # The open transactions close aborts
     ├── read_rule.rs    # How a commit judges one read against later commits
     ├── memtable.rs     # Arena-backed skip list memtable plus its range tombstones
-    ├── skiplist/       # Insert-only concurrent skip list over the arena
+    ├── memtable/       # Key walks, probe tests, and tombstones.rs: the append-only, lock-free range-tombstone log
+    ├── skiplist/       # Insert-only skip list over the arena: any thread inserts, idempotent per entry
     ├── sstable.rs      # SSTable reader/writer, footer, index block
     ├── sstable/        # SSTable key walks, size limits, sealed tables (V7, V8)
-    ├── wal.rs          # Write-ahead log writer (format 2), CLOSE, format 1 reading rules
-    ├── wal_frame.rs    # WAL format 2: stamp, group record frame, the scan past damage
+    ├── wal.rs          # Appending write-ahead log (format 2) for recovery's rewrite, CLOSE, format 1 rules
+    ├── wal_log.rs      # The log the pipeline writes: format 2 records written by position by any thread
+    ├── take.rs         # A value put by one thread and taken by another, with no lock
+    ├── wal_frame.rs    # WAL format 2: stamp, record frame, the scan past damage
     ├── wal_replay.rs   # Streaming reader over one WAL file: the O < P rule
     ├── wal_v1.rs       # Format 1 of the WAL, as 0.1.x wrote it, for replay
     ├── wal_seal.rs     # Sealed WAL: the stamp sealed and durable at creation, sealed records
     ├── seal.rs         # AES-256-GCM-SIV frames and the keyring over a KeyProvider
     ├── recovery.rs     # Replaying the WALs at open, the dropped-tail report, the rewrite
-    ├── arena.rs        # Bump allocator for one memtable
+    ├── arena.rs        # Lock-free bump allocator for one memtable
     ├── block.rs        # Data blocks: prefix compression, restart points, varint
-    ├── block_cache.rs  # Sharded CLOCK cache for decompressed SSTable blocks
+    ├── block/          # stamp.rs: an ingested table's blocks read at its one sequence (D48)
+    ├── block_cache.rs  # Sharded lock-free CLOCK cache for decompressed SSTable blocks: pins, byte bound
+    ├── block_cache/    # ring.rs: the lock-free CLOCK ring of slot words; tests.rs
     ├── callback.rs     # Catching a panic in caller code inside a commit or a background step
     ├── bloom.rs        # Bloom filter (double-hashed xxh3)
     ├── checksum.rs     # Checksum helpers
     ├── filter_block.rs # SSTable filter region: user-key and prefix bloom filters
     ├── index_block.rs  # Decoded SSTable index blocks
     ├── internal_key.rs # MVCC internal key encoding
-    ├── io/             # CacheOnly misses: unit table, the close gate (mod.rs), single-flight units
-    │                   # (unit.rs), per-queue inbox and landings (shared.rs), the mode scope (scope.rs),
-    │                   # stack.rs, atomic_waker.rs
+    ├── io/             # Per-thread queues: unit and job tables, the close gate (mod.rs), single-flight
+    │                   # read units (unit.rs) and jobs (job.rs, with parking) over one claim (flight.rs), per-queue
+    │                   # inbox and landings (shared.rs), thread binding (bind.rs), the mode scope
+    │                   # (scope.rs), stack.rs, atomic_waker.rs
     ├── loom_model/     # Loom models of the engine's lock-free protocols (--cfg loom)
     ├── lookup_key.rs   # Inline-first internal key used by every read path
     ├── iterator.rs     # Engine iterator merge logic
     ├── range_tombstone.rs # Range-delete tombstone encoding
-    ├── read_view.rs    # The published set of memtables and version a reader loads
+    ├── read_view.rs    # The published set of memtables and version a reader loads, wait-free (kovan Atom)
+    ├── reclaim.rs      # Prompt kovan reclamation for retired views and tombstone indexes
     ├── read_horizon.rs # Newest sequence whose data is durable and applied
-    ├── snapshot_registry.rs # Active snapshot sequence tracking
+    ├── snapshot_registry.rs # Live snapshot sequences on per-thread slots: announce, sample, confirm
+    ├── snapshot_registry/   # chain.rs: a slot's chunks of counted entries; unit, model and property tests
     ├── source_walk.rs  # Newest-first walk over a view's sources for one key
     ├── background_health.rs # Whether flush or compaction is failing, and why
     ├── compaction_backoff.rs # Retry pacing for a failing compaction worker
-    ├── disk_check.rs   # Open-time warning when the filesystem is nearly full
-    ├── orphan_sweep.rs # Removal of SSTables the manifest does not reference
+    ├── disk_check.rs   # Warning when the filesystem is nearly full, run once after open
+    ├── orphan_sweep.rs # Removal at a writable open of SSTables the manifest does not reference and
+    │                   # of tables renamed aside on removal that a crash left
     └── pending_outputs.rs # Compaction outputs not yet offered to the manifest
 ```
 
@@ -195,13 +228,13 @@ touching a cohesive area with tests, and keep new modules small.
 
 ## 7. Architecture at a Glance
 
-**Write path:** `put`/`delete`/`write` → append to WAL → insert into active memtable → when memtable is full, swap to immutable and flush to an L0 SSTable → background compaction merges L0→L1 and promotes levels (each 10× larger than the last).
+**Write path:** `put`/`delete`/`write` → take a slot of the commit ring → the slot is decided in ring order (sequences, log position, conflict check), applied to the active memtable and its record written to the WAL at its offset, by whichever thread reaches it → published once written (and synced, at `Immediate`) → when the memtable is full, an ordered step swaps it to immutable and it is flushed to an L0 SSTable → background compaction merges L0→L1 and promotes levels (each 10× larger than the last).
 
 **Read path:** active memtable → frozen memtables → L0 SSTables (bloom filter pre-check, overlap possible) → L1..L6 (sorted, non-overlapping, binary search). The first hit wins.
 
 **MVCC:** every write increments a global sequence number. `snapshot()` captures the current seq; reads through a `Snapshot` ignore any key whose seq is greater. This is how point-in-time isolation works without locks on the read path.
 
-**Durability:** `DurabilityMode::Immediate` fsyncs the WAL per write; `Eventual` (default) leaves it to the OS.
+**Durability:** at `DurabilityMode::Immediate` a write returns once an fsync of the WAL covers it, one fsync shared by every commit written by then; `Eventual` (default) leaves it to the OS.
 
 ## 8. Git Worktree Workflow
 

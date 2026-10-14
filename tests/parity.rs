@@ -25,9 +25,9 @@ use common::{open, small_opts as opts};
 fn put_get_delete_cycle() {
     let dir = TempDir::new().unwrap();
     let db = open(&dir);
-    db.put(b"k1", b"v1").unwrap();
+    regolith::through_stalls(|| db.put(b"k1", b"v1")).unwrap();
     assert_eq!(db.get(b"k1").unwrap(), Some(b"v1".to_vec()));
-    db.delete(b"k1").unwrap();
+    regolith::through_stalls(|| db.delete(b"k1")).unwrap();
     assert_eq!(db.get(b"k1").unwrap(), None);
 }
 
@@ -35,9 +35,9 @@ fn put_get_delete_cycle() {
 fn overwrite_returns_latest_value() {
     let dir = TempDir::new().unwrap();
     let db = open(&dir);
-    db.put(b"k", b"v1").unwrap();
-    db.put(b"k", b"v2").unwrap();
-    db.put(b"k", b"v3").unwrap();
+    regolith::through_stalls(|| db.put(b"k", b"v1")).unwrap();
+    regolith::through_stalls(|| db.put(b"k", b"v2")).unwrap();
+    regolith::through_stalls(|| db.put(b"k", b"v3")).unwrap();
     assert_eq!(db.get(b"k").unwrap(), Some(b"v3".to_vec()));
 }
 
@@ -45,7 +45,7 @@ fn overwrite_returns_latest_value() {
 fn empty_value_is_distinct_from_missing() {
     let dir = TempDir::new().unwrap();
     let db = open(&dir);
-    db.put(b"k", b"").unwrap();
+    regolith::through_stalls(|| db.put(b"k", b"")).unwrap();
     assert_eq!(db.get(b"k").unwrap(), Some(vec![]));
     assert_eq!(db.get(b"missing").unwrap(), None);
 }
@@ -59,7 +59,7 @@ fn write_batch_atomic_visibility() {
     batch.put(b"b", b"2");
     batch.put(b"c", b"3");
     batch.delete(b"b");
-    db.write(batch).unwrap();
+    regolith::through_stalls(|| db.write(batch.clone())).unwrap();
     assert_eq!(db.get(b"a").unwrap(), Some(b"1".to_vec()));
     assert_eq!(db.get(b"b").unwrap(), None);
     assert_eq!(db.get(b"c").unwrap(), Some(b"3".to_vec()));
@@ -73,8 +73,10 @@ fn reopen_preserves_all_data() {
     {
         let db = open(&dir);
         for i in 0..200 {
-            db.put(format!("k{i:04}").as_bytes(), format!("v{i}").as_bytes())
-                .unwrap();
+            regolith::through_stalls(|| {
+                db.put(format!("k{i:04}").as_bytes(), format!("v{i}").as_bytes())
+            })
+            .unwrap();
         }
     }
     let db = open(&dir);
@@ -91,9 +93,9 @@ fn reopen_after_delete_still_hides_key() {
     let dir = TempDir::new().unwrap();
     {
         let db = open(&dir);
-        db.put(b"keep", b"yes").unwrap();
-        db.put(b"drop", b"no").unwrap();
-        db.delete(b"drop").unwrap();
+        regolith::through_stalls(|| db.put(b"keep", b"yes")).unwrap();
+        regolith::through_stalls(|| db.put(b"drop", b"no")).unwrap();
+        regolith::through_stalls(|| db.delete(b"drop")).unwrap();
     }
     let db = open(&dir);
     assert_eq!(db.get(b"keep").unwrap(), Some(b"yes".to_vec()));
@@ -106,9 +108,9 @@ fn reopen_after_compact_range() {
     {
         let db = open(&dir);
         for i in 0..500 {
-            db.put(format!("k{i:04}").as_bytes(), b"v").unwrap();
+            regolith::through_stalls(|| db.put(format!("k{i:04}").as_bytes(), b"v")).unwrap();
         }
-        db.compact_range(None, None).unwrap();
+        db.compact_range(None, None).wait().unwrap();
     }
     let db = open(&dir);
     for i in 0..500 {
@@ -125,10 +127,10 @@ fn reopen_after_compact_range() {
 fn snapshot_sees_pre_snapshot_writes_only() {
     let dir = TempDir::new().unwrap();
     let db = open(&dir);
-    db.put(b"a", b"before").unwrap();
+    regolith::through_stalls(|| db.put(b"a", b"before")).unwrap();
     let snap = db.snapshot();
-    db.put(b"a", b"after").unwrap();
-    db.put(b"b", b"new").unwrap();
+    regolith::through_stalls(|| db.put(b"a", b"after")).unwrap();
+    regolith::through_stalls(|| db.put(b"b", b"new")).unwrap();
     assert_eq!(snap.get(b"a").unwrap(), Some(b"before".to_vec()));
     assert_eq!(snap.get(b"b").unwrap(), None);
     assert_eq!(db.get(b"a").unwrap(), Some(b"after".to_vec()));
@@ -139,13 +141,13 @@ fn snapshot_survives_compaction() {
     let dir = TempDir::new().unwrap();
     let db = open(&dir);
     for i in 0..200 {
-        db.put(format!("k{i:04}").as_bytes(), b"old").unwrap();
+        regolith::through_stalls(|| db.put(format!("k{i:04}").as_bytes(), b"old")).unwrap();
     }
     let snap = db.snapshot();
     for i in 0..200 {
-        db.put(format!("k{i:04}").as_bytes(), b"new").unwrap();
+        regolith::through_stalls(|| db.put(format!("k{i:04}").as_bytes(), b"new")).unwrap();
     }
-    db.compact_range(None, None).unwrap();
+    db.compact_range(None, None).wait().unwrap();
     // Snapshot still sees old values.
     for i in 0..200 {
         assert_eq!(
@@ -177,8 +179,8 @@ fn iter_seek_to_first_on_empty_db() {
 fn iter_seek_past_all_keys() {
     let dir = TempDir::new().unwrap();
     let db = open(&dir);
-    db.put(b"a", b"1").unwrap();
-    db.put(b"b", b"2").unwrap();
+    regolith::through_stalls(|| db.put(b"a", b"1")).unwrap();
+    regolith::through_stalls(|| db.put(b"b", b"2")).unwrap();
     let mut it = db.iter();
     it.seek(b"z");
     assert!(!it.valid());
@@ -189,10 +191,12 @@ fn iter_full_forward_scan_matches_scan() {
     let dir = TempDir::new().unwrap();
     let db = open(&dir);
     for i in 0..100 {
-        db.put(format!("k{i:04}").as_bytes(), format!("v{i}").as_bytes())
-            .unwrap();
+        regolith::through_stalls(|| {
+            db.put(format!("k{i:04}").as_bytes(), format!("v{i}").as_bytes())
+        })
+        .unwrap();
     }
-    db.compact_range(None, None).unwrap();
+    db.compact_range(None, None).wait().unwrap();
 
     let scan_result = db.scan(None, None).unwrap();
     let mut iter_result = Vec::new();
@@ -210,9 +214,9 @@ fn iter_reverse_scan_after_compact() {
     let dir = TempDir::new().unwrap();
     let db = open(&dir);
     for i in 0..50 {
-        db.put(format!("k{i:02}").as_bytes(), b"v").unwrap();
+        regolith::through_stalls(|| db.put(format!("k{i:02}").as_bytes(), b"v")).unwrap();
     }
-    db.compact_range(None, None).unwrap();
+    db.compact_range(None, None).wait().unwrap();
 
     let mut it = db.iter();
     it.seek_to_last();
@@ -236,12 +240,12 @@ fn compact_range_merges_l0_to_l1() {
     let db = Db::open(dir.path(), opts().max_background_compactions(0)).unwrap();
     // Write enough to produce multiple L0 files.
     for i in 0..500 {
-        db.put(format!("k{i:04}").as_bytes(), b"v").unwrap();
+        regolith::through_stalls(|| db.put(format!("k{i:04}").as_bytes(), b"v")).unwrap();
     }
     db.flush().unwrap();
     let l0_before = db.get_int_property("regolith.num-files-at-level0").unwrap();
     assert!(l0_before > 0);
-    db.compact_range(None, None).unwrap();
+    db.compact_range(None, None).wait().unwrap();
     let l0_after = db.get_int_property("regolith.num-files-at-level0").unwrap();
     assert_eq!(l0_after, 0, "compact_range should drain L0");
     // Data still readable.
@@ -258,12 +262,12 @@ fn compaction_drops_shadowed_deletions() {
     let dir = TempDir::new().unwrap();
     let db = open(&dir);
     for i in 0..100 {
-        db.put(format!("k{i:02}").as_bytes(), b"v").unwrap();
+        regolith::through_stalls(|| db.put(format!("k{i:02}").as_bytes(), b"v")).unwrap();
     }
     for i in 0..100 {
-        db.delete(format!("k{i:02}").as_bytes()).unwrap();
+        regolith::through_stalls(|| db.delete(format!("k{i:02}").as_bytes())).unwrap();
     }
-    db.compact_range(None, None).unwrap();
+    db.compact_range(None, None).wait().unwrap();
     let total = db
         .get_int_property("regolith.total-sst-files-size")
         .unwrap();
@@ -289,9 +293,9 @@ fn compression_none_produces_larger_files_than_lz4() {
         let db = Db::open(dir.path(), opts).unwrap();
         let payload = vec![0xABu8; 256];
         for i in 0..500 {
-            db.put(format!("k{i:04}").as_bytes(), &payload).unwrap();
+            regolith::through_stalls(|| db.put(format!("k{i:04}").as_bytes(), &payload)).unwrap();
         }
-        db.compact_range(None, None).unwrap();
+        db.compact_range(None, None).wait().unwrap();
         db.get_int_property("regolith.total-sst-files-size")
             .unwrap()
     };
@@ -318,10 +322,10 @@ fn fifo_drops_oldest_file_when_over_cap() {
     let db = Db::open(dir.path(), opts).unwrap();
     let payload = vec![0xEEu8; 256];
     for i in 0..256 {
-        db.put(format!("k{i:04}").as_bytes(), &payload).unwrap();
+        regolith::through_stalls(|| db.put(format!("k{i:04}").as_bytes(), &payload)).unwrap();
     }
     std::thread::sleep(std::time::Duration::from_millis(200));
-    db.compact_range(None, None).unwrap();
+    db.compact_range(None, None).wait().unwrap();
     let total = db
         .get_int_property("regolith.total-sst-files-size")
         .unwrap();
@@ -338,9 +342,9 @@ fn range_delete_hides_keys_in_range() {
     let dir = TempDir::new().unwrap();
     let db = open(&dir);
     for i in 0..10 {
-        db.put(format!("k{i}").as_bytes(), b"v").unwrap();
+        regolith::through_stalls(|| db.put(format!("k{i}").as_bytes(), b"v")).unwrap();
     }
-    db.delete_range(b"k3", b"k7").unwrap();
+    regolith::through_stalls(|| db.delete_range(b"k3", b"k7")).unwrap();
     // k0..k2 and k7..k9 survive; k3..k6 are gone.
     for i in 0..10 {
         let k = format!("k{i}");
@@ -358,10 +362,10 @@ fn range_delete_survives_compaction() {
     let dir = TempDir::new().unwrap();
     let db = open(&dir);
     for i in 0..100 {
-        db.put(format!("k{i:02}").as_bytes(), b"v").unwrap();
+        regolith::through_stalls(|| db.put(format!("k{i:02}").as_bytes(), b"v")).unwrap();
     }
-    db.delete_range(b"k20", b"k80").unwrap();
-    db.compact_range(None, None).unwrap();
+    regolith::through_stalls(|| db.delete_range(b"k20", b"k80")).unwrap();
+    db.compact_range(None, None).wait().unwrap();
     assert_eq!(db.get(b"k19").unwrap(), Some(b"v".to_vec()));
     assert_eq!(db.get(b"k20").unwrap(), None);
     assert_eq!(db.get(b"k79").unwrap(), None);
@@ -376,8 +380,8 @@ fn column_families_are_isolated() {
     let db = open(&dir);
     let cf1 = db.create_column_family("cf1").unwrap();
     let cf2 = db.create_column_family("cf2").unwrap();
-    db.put_cf(&cf1, b"shared_key", b"from_cf1").unwrap();
-    db.put_cf(&cf2, b"shared_key", b"from_cf2").unwrap();
+    regolith::through_stalls(|| db.put_cf(&cf1, b"shared_key", b"from_cf1")).unwrap();
+    regolith::through_stalls(|| db.put_cf(&cf2, b"shared_key", b"from_cf2")).unwrap();
     assert_eq!(
         db.get_cf(&cf1, b"shared_key").unwrap(),
         Some(b"from_cf1".to_vec())

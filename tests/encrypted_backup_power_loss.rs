@@ -109,8 +109,8 @@ fn db_options(spec: &ChildSpec) -> Options {
 
 fn apply(db: &Db, op: &WriteOp) {
     match &op.value {
-        OpValue::Put(v) => db.put(&op.key, v).expect("child: put"),
-        OpValue::Delete => db.delete(&op.key).expect("child: delete"),
+        OpValue::Put(v) => regolith::through_stalls(|| db.put(&op.key, v)).expect("child: put"),
+        OpValue::Delete => regolith::through_stalls(|| db.delete(&op.key)).expect("child: delete"),
     }
 }
 
@@ -129,7 +129,7 @@ fn workload(spec: &ChildSpec, then: &str) {
     if then == PURGE {
         // Every table rewritten, so the purge has tables of backup 1 to
         // remove.
-        db.compact_range(None, None).expect("child: compact");
+        db.compact_range(None, None).wait().expect("child: compact");
     }
     engine.create_backup(&db).expect("child: second backup");
     mark(root, "backup2");
@@ -305,10 +305,9 @@ fn check_backups(root: &Path, history: &History, listed: &[u64], context: &str) 
     let engine = BackupEngine::open(backup_dir(root)).unwrap();
     let found: Vec<u64> = engine
         .list_backups()
-        .unwrap()
-        .into_iter()
         .map(|entry| {
             entry
+                .unwrap()
                 .unwrap_or_else(|bad| panic!("{context}: a cut left a backup unreadable: {bad}"))
                 .id
                 .0
@@ -377,9 +376,11 @@ fn check_purge(root: &Path, history: &History, context: &str) {
         .unwrap_or_else(|e| panic!("{context}: the purge does not run again: {e}"));
     let kept: Vec<_> = engine
         .list_backups()
-        .unwrap()
-        .into_iter()
-        .map(|entry| entry.unwrap_or_else(|bad| panic!("{context}: {bad}")))
+        .map(|entry| {
+            entry
+                .unwrap()
+                .unwrap_or_else(|bad| panic!("{context}: {bad}"))
+        })
         .collect();
     assert_eq!(
         kept.iter().map(|info| info.id).collect::<Vec<_>>(),

@@ -12,10 +12,9 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::time::Duration;
 
 use regolith::env::{
-    Capabilities, DirEntry, Env, FileLock, FileMeta, JoinHandle, ReadFile, StdEnv, WriteFile,
+    Capabilities, Env, FileLock, FileMeta, JoinHandle, ReadDir, ReadFile, StdEnv, WriteFile,
     WriteMode,
 };
 
@@ -83,11 +82,18 @@ impl Env for FaultyEnv {
     fn create_dir_all(&self, path: &Path) -> io::Result<()> {
         self.inner.create_dir_all(path)
     }
-    fn read_dir(&self, path: &Path) -> io::Result<Vec<DirEntry>> {
+    fn read_dir(&self, path: &Path) -> io::Result<ReadDir<'_>> {
         self.inner.read_dir(path)
     }
     fn open_read(&self, path: &Path) -> io::Result<Box<dyn ReadFile>> {
         self.inner.open_read(path)
+    }
+    fn open_log(
+        &self,
+        path: &Path,
+        mode: WriteMode,
+    ) -> io::Result<Box<dyn regolith::env::LogFile>> {
+        self.inner.open_log(path, mode)
     }
     fn open_write(&self, path: &Path, mode: WriteMode) -> io::Result<Box<dyn WriteFile>> {
         if self.fail_tables.load(Ordering::SeqCst) && path.extension().is_some_and(|e| e == "sst") {
@@ -139,8 +145,5 @@ impl Env for FaultyEnv {
         body: Box<dyn FnOnce() + Send + 'static>,
     ) -> io::Result<Box<dyn JoinHandle>> {
         self.inner.spawn(name, body)
-    }
-    fn sleep(&self, dur: Duration) {
-        self.inner.sleep(dur)
     }
 }
