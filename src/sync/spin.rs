@@ -21,10 +21,19 @@
 
 use super::internal::{AtomicU8, Ordering};
 
-/// The most rounds one spin makes. One round is a pause hint and one load;
-/// a pause is about 40 ns on the Intel cores this was measured on, so the
-/// cap is about 5 microseconds, close to what a futex-based lock spins
-/// before it sleeps.
+/// The most rounds one spin makes, counted in pause hints
+/// (`core::hint::spin_loop`). On the Intel Cascade Lake cores this was
+/// measured on, a pause is about 140 cycles (about 37 ns), so the cap is
+/// about 5 microseconds, close to what a futex-based lock spins before it
+/// sleeps. The pause is shorter on many other cores (Intel cores before
+/// Skylake, AMD cores, and ARM's `isb` or `yield`; not measured here). There
+/// the same 128 rounds last several times less: the
+/// budget still doubles and halves with what spins see, but its ceiling in
+/// time is lower, so a holder that keeps the lock a few microseconds sees
+/// its waiters queue sooner than on the Intel host. Calibrating the count
+/// at start-up would need a clock read, which this module does not make.
+// vertexia: the cap counts pauses, not time; a per-target cap measured once
+// at build or start-up if spins on short-pause cores prove too short.
 #[cfg(not(loom))]
 pub(super) const MAX: u8 = 128;
 /// Under loom one round, so the models explore a spin that runs out and
