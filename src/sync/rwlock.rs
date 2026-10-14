@@ -58,9 +58,27 @@ impl<T> RwLock<T> {
         }
     }
 
+    loom_const_fn! {
+        /// An unlocked lock holding `value` whose contended acquires never
+        /// spin: they queue at once. For a lock its holders keep across long
+        /// waits of their own (a compaction pass, a job, I/O), where a spin
+        /// could only burn the caller's time.
+        pub(crate) fn new_without_spin(value: T) -> Self {
+            Self { raw: RawRwLock::without_spin(), value: core::cell::UnsafeCell::new(value) }
+        }
+    }
+
     /// Consumes the lock and returns its value.
     pub fn into_inner(self) -> T {
         self.value.into_inner()
+    }
+}
+
+#[cfg(all(test, not(loom)))]
+impl<T: ?Sized> RwLock<T> {
+    /// The rounds a contended acquire of this lock would spin now.
+    pub(crate) fn spin_rounds(&self) -> u32 {
+        self.raw.spin_rounds()
     }
 }
 
@@ -528,6 +546,24 @@ mod tests {
     use crate::sync::test_support::{Polled, block_on};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicIsize, Ordering as StdOrdering};
+
+    /// A lock built without spin queues its contended readers and writers at
+    /// once: its budget is zero from the start and stays zero through a
+    /// contended write, its wake and its retry, where a spinning lock's
+    /// starts above zero.
+    #[test]
+    fn a_rwlock_built_without_spin_never_spins() {
+        assert!(RwLock::new(()).spin_rounds() > 0, "a plain lock spins");
+        let lock = RwLock::new_without_spin(0u8);
+        assert_eq!(lock.spin_rounds(), 0);
+        let read = lock.try_read().expect("free");
+        let mut writer = Polled::new(lock.write());
+        writer.pending();
+        drop(read);
+        assert_eq!(writer.wakes(), 1);
+        *writer.ready() += 1;
+        assert_eq!(lock.spin_rounds(), 0, "the lock never spins");
+    }
 
     const ITERATIONS: usize = if cfg!(miri) { 20 } else { 2_000 };
 
