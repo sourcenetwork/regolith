@@ -18,9 +18,15 @@
 //!   last, about 5 microseconds at most on the cores it was tuned on):
 //!   before it queues, and again after a retry it lost. The spin makes no
 //!   system call, reads no clock, and ends in the same queueing or the same
-//!   `Pending` as before. The transaction lock table, the once-cell's
-//!   initializer turn and the bounded channel's send slots, whose holders
-//!   keep them across long waits of their own, do not spin.
+//!   `Pending` as before. Locks whose holders keep them across long waits
+//!   of their own do not spin, and their contended callers queue at once:
+//!   the transaction lock table, the once-cell's initializer turn, the
+//!   bounded channel's send slots, and, in the engine, the compaction gate
+//!   (held for a pass, a job or a checkpoint copy), the flush exclusion
+//!   (held for a memtable flush), the close lock (held for a whole close)
+//!   and the serial log's lock (held across an append's device calls). The
+//!   engine's census and a late commit's snapshot pin are only ever tried,
+//!   never waited for, so they never spin either.
 //! - **Fast under contention.** The locks and the semaphore let a caller
 //!   take what is free even while others wait, so a release never waits
 //!   for a suspended task to run: the thread that released takes the lock
