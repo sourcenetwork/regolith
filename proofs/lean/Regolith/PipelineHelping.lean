@@ -740,12 +740,14 @@ and stay the same otherwise, and it stays well formed. -/
 theorem write_one_counts (c : Cell)
     -- The slot's stage is one its kind passes through.
     (hwf : WellFormed c) :
-    -- The claim itself; its proof follows.
+    -- In symbols: the steps the slot needs after the run's write, plus the
+    -- writes the run made of it, are the steps it needed before; and it
+    -- is still well formed.
     todo (writeOne c) + writes c = todo c ∧ WellFormed (writeOne c) := by
   -- Name the slot's kind and stage.
   obtain ⟨k, s0⟩ := c
-  -- Every kind and stage, read off the tables (well formed, where it
-  -- matters, by the definition).
+  -- Try every kind of slot and every stage it can stand at; for each one
+  -- the definitions' tables decide the claim by plain arithmetic.
   cases k <;> cases s0 <;> simp_all [writeOne, writes, next, todo, WellFormed]
 
 /-- **A run counts every record it writes, once.** After one run the slots
@@ -757,7 +759,9 @@ needing the write still, or that undoes a slot it passed over. -/
 theorem run_step_counts (l : List Cell)
     -- Every slot's stage is one its kind passes through.
     (hwf : ∀ c ∈ l, WellFormed c) :
-    -- The claim itself; its proof follows.
+    -- In symbols: the steps all slots need after the run, plus the records
+    -- it wrote, are the steps they needed before; and every slot is still
+    -- well formed.
     total (runStep l) + writable l = total l ∧ ∀ c ∈ runStep l, WellFormed c := by
   -- By induction on the slots.
   induction l with
@@ -783,7 +787,7 @@ theorem run_step_counts (l : List Cell)
       simp only [runStep, List.mem_cons] at hx
       -- Look at which.
       cases hx with
-      -- The first: by `write_one_counts`.
+      -- The first slot: `write_one_counts` showed it well formed.
       | inl h => exact h ▸ hw1
       -- One of the rest: by induction.
       | inr h => exact hw2 x h
@@ -794,7 +798,8 @@ holds the write unit. -/
 theorem run_never_goes_back (c : Cell) : rank c.stage ≤ rank (writeOne c).stage := by
   -- Name the slot's kind and stage.
   obtain ⟨k, s0⟩ := c
-  -- Every kind and stage, read off the tables.
+  -- Try every kind of slot and every stage it can stand at; for each one
+  -- the tables show its stage's rank does not fall.
   cases k <;> cases s0 <;> simp [writeOne, next, rank]
 
 /-! ## The write unit: a park is bounded
@@ -841,9 +846,19 @@ def own (patience : Nat) : Waiting → Waiting
   -- A written record stays written.
   | .written => .written
 
-/-- What another thread can do to the waiting thread: write its record (a
-run of the holder's, or another's copy), which wakes it with its record in
-the log. Another thread can also do nothing at all, as one that stopped. -/
+/-- What another thread can do to the waiting thread, as this machine
+counts it: write its record (a run of the holder's, or another's copy),
+which wakes it with its record in the log. Another thread can also do
+nothing at all, as one that stopped.
+
+What this leaves out: in the code a wake does not always mean the record
+is written. A thread woken because the holder let the unit go looks again
+and may park again; its patience then runs from its first wait, not from
+the new park (`out_of_patience`: `PATIENCE` since the first wait, and at
+most `MAX_PARKS` parks). So the code's bound is that patience in all, plus
+`MAX_PARKS` parks, plus the copy; this machine shows the shape of that
+bound for one park, and `wakes_only_shorten` promises only that, in this
+machine, another thread's step never adds to what the waiter needs. -/
 def woken (_ : Waiting) : Waiting := .written
 
 /-- The steps the waiting thread still needs on its own. -/
@@ -862,7 +877,7 @@ fewer. -/
 theorem own_counts (p : Nat) (w : Waiting)
     -- The record is not in the log yet.
     (hw : w ≠ .written) :
-    -- The claim itself; its proof follows.
+    -- In symbols: one own step later, it needs exactly one step fewer.
     stepsLeft p (own p w) + 1 = stepsLeft p w := by
   -- Look at where the thread stands.
   cases w with
@@ -881,8 +896,11 @@ theorem own_counts (p : Nat) (w : Waiting)
   -- Written: ruled out by the hypothesis.
   | written => exact absurd rfl hw
 
-/-- **Wakes only shorten the wait.** Whatever another thread does to the
-waiting thread, it never needs more of its own steps afterwards. -/
+/-- **Wakes only shorten the wait, in this machine.** Whatever another
+thread does to the waiting thread here, it never needs more of its own
+steps afterwards. In the code a woken thread may park again; its bound is
+then the patience since its first wait and `MAX_PARKS` parks (see
+`woken`). -/
 theorem wakes_only_shorten (p : Nat) (w : Waiting) : stepsLeft p (woken w) ≤ stepsLeft p w := by
   -- A woken thread needs no step at all.
   simp [woken, stepsLeft]
@@ -916,9 +934,11 @@ theorem written_stays (p : Nat) (s : List Bool) : exec p s .written = .written :
   | cons b rest ih =>
     -- Whose step it is.
     cases b with
-    -- Another's: woken stays written, then the rest by induction.
+    -- Another thread's step: a written record stays written; the rest of
+    -- the schedule keeps it so, by the induction.
     | false => simpa [exec, woken] using ih
-    -- Its own: written stays written, then the rest by induction.
+    -- Its own step: a written record stays written; the rest of the
+    -- schedule keeps it so, by the induction.
     | true => simpa [exec, own] using ih
 
 /-- Needing no own step means the record is written. -/
@@ -1002,7 +1022,8 @@ theorem own_never_adds (p : Nat) (w : Waiting) : stepsLeft p (own p w) ≤ steps
 /-- No schedule adds to what the thread needs: every step, its own or
 another thread's, leaves it needing as many own steps or fewer. -/
 theorem exec_never_adds (p : Nat) (s : List Bool) (w : Waiting) :
-    -- The claim itself; its proof follows.
+    -- In symbols: after any schedule it needs no more own steps than
+    -- before it.
     stepsLeft p (exec p s w) ≤ stepsLeft p w := by
   -- By induction on the schedule, for every place the thread may stand.
   induction s generalizing w with
@@ -1041,7 +1062,8 @@ steps, whatever has happened since: spin, the slices, the run out, the
 copy. With `a_park_is_bounded`: within that many of its own steps its
 record is in the log. -/
 theorem patience_bounds_the_wait (p : Nat) (s : List Bool) :
-    -- The claim itself; its proof follows.
+    -- In symbols: whatever the schedule, a thread that began by spinning
+    -- needs at most its patience and three more own steps.
     stepsLeft p (exec p s .spinning) ≤ p + 3 := by
   -- No schedule adds to what it needed when it began...
   have := exec_never_adds p s .spinning
@@ -1075,7 +1097,8 @@ many it takes: only another thread's wake gets its record written. That is
 why the code has the patience (WU5), and why a lost wake would be a stuck
 commit (the TLA+ RED `LostWake`, checked with the time out taken away). -/
 theorem without_patience_waits_for_a_wake (n k : Nat) :
-    -- The claim itself; its proof follows.
+    -- In symbols: however many own steps it takes, it is still parked,
+    -- with the same slices left.
     execNoPatience (List.replicate k true) (.parked n) = .parked n := by
   -- By induction on the number of own steps.
   induction k with
@@ -1083,7 +1106,8 @@ theorem without_patience_waits_for_a_wake (n k : Nat) :
   | zero => rfl
   -- Case: one more, the claim known for the fewer (ih).
   | succ k ih =>
-    -- One own step leaves it parked, then the rest by induction.
+    -- An own step with no patience leaves it parked as it was; the rest
+    -- of the steps do the same, by the induction.
     simpa [List.replicate, execNoPatience, ownNoPatience] using ih
 
 /-! ## Shortcuts that keep the bound
@@ -1095,9 +1119,11 @@ A record nobody is encoding: its owner has not begun, or stopped before it
 began. The thread that needs it claims the encoding and encodes it itself
 instead of parking (`write_unit.rs`, `RegolithEngine::fill`; the TLA+
 `EncodeStart`): its spin ends straight in a write of its own. The fast
-path of a lone owner (`write_unit.rs`, `write_alone`, WU8; the TLA+
-`DirectStart`) is the same step taken before any wait: it encodes and
-writes its own record at once, so it needs no step this machine counts.
+path (`write_unit.rs`, `write_alone`, WU8; the TLA+ `DirectStart`), taken
+by an owner that finds the write unit free, is the same step taken before
+any wait: it encodes and writes its own record at once, so it needs no
+step this machine counts. Several owners may take it at once, since the
+unit does not see their writes; each writes its own record.
 A commit that waits for a sync and finds its own record in another
 thread's hands copies it at once rather than park (the TLA+ `CopyOwn`):
 its spin ends in `copying`, never in `parked`, which only shortens the
@@ -1105,10 +1131,11 @@ count `a_park_is_bounded` uses.
 
 A thread far from its turn (`pipeline.rs`, P6) parks on its own slot until
 its turn nears: a finished commit tells it (NEAR), its slot lands or fails,
-or `TURN_PATIENCE` runs out. That is this same machine, with `written` read
-as "awake and helping again": a wake is `woken`, a slice of
-`TURN_PATIENCE` is a slice of patience, and running out wakes it, which is
-one step more than it needs. -/
+or `TURN_PATIENCE` runs out. That is this same machine with one change of
+name: where it says the record is written, read that the thread is awake
+and helping again. A wake from another thread is `woken`; a slice of
+`TURN_PATIENCE` is a slice of patience; and the patience running out wakes
+the thread, which is one step more than this count allows for. -/
 
 /-- The waiting thread's own step when it may encode the record itself:
 from the spin straight to writing it, otherwise as before. -/
@@ -1122,7 +1149,8 @@ def ownEncoding (patience : Nat) : Waiting → Waiting
 record nobody is encoding needs no more of its own steps than one that
 parks: the bound of `a_park_is_bounded` still holds. -/
 theorem encoding_never_adds (p : Nat) (w : Waiting) :
-    -- The claim itself; its proof follows.
+    -- In symbols: encoding the record itself leaves it needing no more
+    -- own steps than the step it would have taken otherwise.
     stepsLeft p (ownEncoding p w) ≤ stepsLeft p w := by
   -- Look at where the thread stands.
   cases w with
