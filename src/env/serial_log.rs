@@ -86,7 +86,9 @@ impl SerialLog {
     /// A log over `file`, which holds `end` bytes and writes next at `end`.
     fn over(file: Box<dyn WriteFile>, end: u64) -> Self {
         Self {
-            inner: Mutex::new(Inner {
+            // Built without spin (E48): it is held across the device calls of
+            // an append and the caller's own sync, so a waiter queues at once.
+            inner: Mutex::new_without_spin(Inner {
                 file,
                 end,
                 held: BTreeMap::new(),
