@@ -89,6 +89,15 @@ impl Keyring {
     }
 }
 
+/// Twelve bytes from the operating system's random source: one frame's
+/// nonce.
+pub(crate) fn fresh_nonce() -> io::Result<[u8; NONCE_LEN]> {
+    let mut nonce = [0u8; NONCE_LEN];
+    getrandom::fill(&mut nonce)
+        .map_err(|e| io::Error::other(format!("the operating system gave no random nonce: {e}")))?;
+    Ok(nonce)
+}
+
 /// One key, ready to seal and open frames.
 #[derive(Clone)]
 pub(crate) struct Sealer {
@@ -109,15 +118,25 @@ impl Sealer {
         aad: &[u8],
         buf: &mut [u8],
     ) -> io::Result<([u8; NONCE_LEN], [u8; TAG_LEN])> {
-        let mut nonce = [0u8; NONCE_LEN];
-        getrandom::fill(&mut nonce).map_err(|e| {
-            io::Error::other(format!("the operating system gave no random nonce: {e}"))
-        })?;
+        let nonce = fresh_nonce()?;
+        Ok((nonce, self.seal_with(&nonce, aad, buf)?))
+    }
+
+    /// Encrypt `buf` in place under `nonce`, binding `aad`, and hand back the
+    /// tag. `nonce` must come from [`fresh_nonce`] and be used for this one
+    /// frame: the commit pipeline draws it when it decides a commit, so every
+    /// thread that writes that commit's record seals the same bytes.
+    pub(crate) fn seal_with(
+        &self,
+        nonce: &[u8; NONCE_LEN],
+        aad: &[u8],
+        buf: &mut [u8],
+    ) -> io::Result<[u8; TAG_LEN]> {
         let tag = self
             .cipher
-            .encrypt_inout_detached(&Nonce::from(nonce), aad, buf.into())
+            .encrypt_inout_detached(&Nonce::from(*nonce), aad, buf.into())
             .map_err(|_| io::Error::other("a frame is too large to seal"))?;
-        Ok((nonce, tag.into()))
+        Ok(tag.into())
     }
 
     /// Decrypt `buf` in place. `false` when the tag does not verify under

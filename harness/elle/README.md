@@ -120,12 +120,35 @@ against the Elle model it claims:
 | --- | --- | --- |
 | `read-committed` | `TransactionDb` (pessimistic locks) at `ReadCommitted` | `read-committed`. A read-only `get_for_update` is the one read this level leaves unvalidated and `snapshot-isolation` validates, so the plans hold it. It reads when its lock is taken, later than the begin snapshot plain reads use, so a transaction can see two states of a key, which `read-committed` allows and `snapshot-isolation` does not. |
 | `snapshot-isolation` | `OptimisticTransactionDb` at `SnapshotIsolation` | `snapshot-isolation`. Write skew (`G2-item`) is legal here. |
-| `repeatable-read` | `OptimisticTransactionDb` at `RepeatableRead` | `repeatable-read`, Adya's PL-2.99: every point read is validated, so a `G2-item` verdict is a defect. A scan is recorded per stretch, so a predicate anomaly would be legal; the workloads here have no predicate reads. |
+| `repeatable-read` | `OptimisticTransactionDb` at `RepeatableRead` | `repeatable-read`, Adya's PL-2.99: every point read is validated, so a `G2-item` verdict is a defect. A plain scan is recorded per stretch, so a predicate anomaly would be legal; the `point` workloads have no predicate reads, and the `scan` shape reads through validated scans. |
 | `serializable` | `OptimisticTransactionDb` at `Serializable` | `strict-serializable`. |
-| `defra-level` | `OptimisticTransactionDb` at `DefraLevel`, with a list-append merge operator | `strict-serializable`. No key classifier is installed, so point reads are validated exactly as `RepeatableRead` does and the one relaxation left is that blind merges to a key commute. They are applied in commit order, so a point workload is serializable in commit order; the TLA+ model (`proofs/tla`, `MC_DefraLevel_*`) proves the relaxations. |
+| `defra-level` | `OptimisticTransactionDb` at `DefraLevel`, with a list-append merge operator | `strict-serializable`. In the `point` shape no key classifier is installed, so point reads are validated exactly as `RepeatableRead` does and the one relaxation left is that blind merges to a key commute. They are applied in commit order, so a point workload is serializable in commit order; the TLA+ model (`proofs/tla`, `MC_DefraLevel_*`) proves the relaxations. The other shapes install a classifier (below). |
 
 There is no `snapshot-isolation` row for `defra-level`, because two blind
 merges to one key both commit, which snapshot isolation forbids.
+
+## Shapes
+
+`--shape point|classified|appends|parts|scan` selects what the transactions
+do. `point` is the workload described above, and the default. The others
+put a `DefraLevel` mechanism under the same checker, each recorded so that
+the history must still hold the strongest model. At `defra-level` every
+shape but `point` installs a key classifier: keys under `b/` are
+content-addressed, keys under `h/` a commutative prefix, and the logs and
+their once keys are log keys.
+
+| Shape | Model | What a transaction does | Why the history must be serializable |
+| --- | --- | --- | --- |
+| `classified` | either, `defra-level` only | The point workload, and beside it: read whether a shared block is stored and store it when it is not; scan the heads, add a head of its own and rewrite a marker every transaction writes alike; read a journal's head and append an entry. | The side keys are of the three classes, used as each class's contract allows, so none of those writes conflicts and nothing is decided on the exempt reads. The point operations beside them are validated as before. |
+| `appends` | `list-append` | A key is a commit-ordered log. An append is `Transaction::append`, every other one under a once key of its own; a read is the log's head and every entry up to it, in one transaction. A transaction appends or reads, never both. | Positions follow commit order and a snapshot holds a dense prefix, so an append-only transaction sits at its commit and a read-only one at its snapshot. A transaction that read a log and then appended would not be: a read of a log is never validated, which is why no plan mixes the two. This holds at every level and on the pessimistic flavour. |
+| `parts` | `list-append` | A key is one part of a document, and two keys share a document. An append is a merge operand on the part; a read is `get_parts` naming the part, and a locking read (`read-committed`) is `get_for_update` of the document, recorded as the part it holds. | A read by parts is refused by a write that touches the part and by no other, and operands on one part are applied in commit order. |
+| `scan` | either | Every read is one validated scan (`ScanCheck::Range`) of the whole key prefix, recorded as a read of every key of the workload, the ones it did not return as reads of nothing. Most transactions scan and then write one or two keys. | Any write that lands in the range before the commit refuses it, a key that appears included, so scan-then-write cannot skew. With `--keys` well above the number of writers most writes create a key, which makes the run a phantom workload. |
+
+`elle-gen` checks two things the Elle models cannot record, and fails the
+run on either. In the `appends` shape a log that has no entry at a position
+below its head, read in one transaction, stops the run. In the `classified`
+shape the heads are counted against the journal's entries after every
+phase: a transaction commits one of each or neither.
 
 A history can be checked against any model elle-cli offers, whatever level
 generated it; a weaker model than the one claimed is a sound check, a
@@ -189,7 +212,9 @@ claims is green:
 | `list-append`, `--keys 1` (one hot key) | `TransactionDb` | `read-committed` | `true` |
 
 The `repeatable-read`, `serializable` and `defra-level` rows of
-`just elle-matrix` are not recorded here; CI runs them on every push.
+`just elle-matrix`, the rows of every shape but `point` among them, and the
+`rw-register` row at `read-committed` are not recorded here; CI runs them
+on every push.
 
 The last two rows were `false` when PR 1 landed: `get_for_update` took
 the key lock and then read at the sequence the transaction began with,
@@ -224,6 +249,8 @@ dependency graph has no cycles, so it checks out while proving nothing.
 ```text
 --model <list-append|rw-register>   Workload model (default: list-append)
 --isolation <read-committed|snapshot-isolation|repeatable-read|serializable|defra-level>
+--shape <point|classified|appends|parts|scan>
+                                    What the transactions do (default: point)
 --faults <kill,torn-write,truncate-wal|all>
 --dir <path>                        Database directory (default: db)
 --out <path>                        History output (default: history.json)

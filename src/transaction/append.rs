@@ -88,6 +88,56 @@ impl Transaction {
     /// a log must be appended to through one layout, and no two logs may
     /// share a key.
     ///
+    /// # Example
+    ///
+    /// `Journal` is the layout of the [`LogLayout`] example: the head at
+    /// `journal-head`, and entries at `journal/` followed by the position.
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    ///
+    /// use regolith::{LogLayout, OptimisticTransactionDb, Options, TxnOptions};
+    /// # struct Journal;
+    /// # impl LogLayout for Journal {
+    /// #     fn head_key(&self) -> &[u8] {
+    /// #         b"journal-head"
+    /// #     }
+    /// #     fn entry_key(&self, position: u64, out: &mut Vec<u8>) {
+    /// #         out.extend_from_slice(b"journal/");
+    /// #         out.extend_from_slice(&position.to_be_bytes());
+    /// #     }
+    /// #     fn max_entry_key_len(&self) -> usize {
+    /// #         b"journal/".len() + 8
+    /// #     }
+    /// # }
+    ///
+    /// let db = OptimisticTransactionDb::open("journal", Options::memory())?;
+    /// let journal: Arc<dyn LogLayout> = Arc::new(Journal);
+    /// let position = |key: &[u8]| -> Result<Option<u64>, Box<dyn std::error::Error>> {
+    ///     let held = db.db().get(key)?;
+    ///     Ok(held.map(|bytes| u64::from_be_bytes(bytes.try_into().expect("eight bytes"))))
+    /// };
+    ///
+    /// // Two transactions append at once and touch nothing else in common:
+    /// // neither conflicts, and each entry gets its own position.
+    /// let (one, two) = (db.begin(&TxnOptions::new()), db.begin(&TxnOptions::new()));
+    /// one.append(&journal, b"order 7 placed", Some(b"placed/7"))?;
+    /// two.append(&journal, b"order 8 placed", Some(b"placed/8"))?;
+    /// // The second to append commits first, and so takes position 1.
+    /// two.commit()?;
+    /// one.commit()?;
+    /// assert_eq!(position(b"placed/8")?, Some(1));
+    /// assert_eq!(position(b"placed/7")?, Some(2));
+    ///
+    /// // A retry that appends under a once key already used adds nothing.
+    /// let retry = db.begin(&TxnOptions::new());
+    /// retry.append(&journal, b"order 7 placed", Some(b"placed/7"))?;
+    /// retry.commit()?;
+    /// assert_eq!(position(b"placed/7")?, Some(2));
+    /// assert_eq!(position(Journal.head_key())?, Some(2));
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    ///
     /// [`IsolationLevel::DefraLevel`]: crate::IsolationLevel::DefraLevel
     pub fn append(
         &self,
@@ -100,16 +150,14 @@ impl Transaction {
             once_key,
             classifier_for(&self.policy, self.isolation),
         )?;
-        self.appends
-            .get_or_init(|| Box::new(TxnBuffer::new(0)))
-            .insert(
-                (),
-                PendingAppend {
-                    log: Arc::clone(log),
-                    entry: entry.to_vec(),
-                    once_key: once_key.map(<[u8]>::to_vec),
-                },
-            );
+        self.appends_buffer().insert(
+            (),
+            PendingAppend {
+                log: Arc::clone(log),
+                entry: entry.to_vec(),
+                once_key: once_key.map(<[u8]>::to_vec),
+            },
+        );
         Ok(())
     }
 
@@ -123,6 +171,11 @@ impl Transaction {
             }
             _ => Ok(()),
         }
+    }
+
+    /// The buffer the appends are queued in, made by the first one.
+    pub(super) fn appends_buffer(&self) -> &TxnBuffer<(), PendingAppend> {
+        self.appends.get_or_init(|| Box::new(TxnBuffer::new(0)))
     }
 
     /// How many appends the transaction has made: the mark a savepoint keeps.

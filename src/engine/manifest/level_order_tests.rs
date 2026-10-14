@@ -44,6 +44,7 @@ fn table(
             file_size: 1,
             num_entries,
             global_seq: None,
+            deletions: None,
         },
         Arc::clone(reader),
     )
@@ -303,7 +304,7 @@ fn write_manifest(dir: &Path, records: &[ManifestRecord]) {
 }
 
 #[test]
-fn a_manifest_listing_overlapping_tables_below_l0_is_refused_not_trusted() {
+fn legacy_overlap_is_repaired_but_duplicate_deep_table_references_are_refused() {
     let dir = TempDir::new().unwrap();
     let sst_dir = dir.path().join("sst");
     std::fs::create_dir_all(&sst_dir).unwrap();
@@ -314,23 +315,22 @@ fn a_manifest_listing_overlapping_tables_below_l0_is_refused_not_trusted() {
         meta: file.meta.clone(),
     };
 
-    // Two tables whose ranges overlap, and the same table named twice.
-    for (level, records) in [
-        (1, [add(1, &wide), add(1, &inside)]),
-        (2, [add(2, &wide), add(2, &wide)]),
-    ] {
-        write_manifest(dir.path(), &records);
-        let error = match VersionSet::open(dir.path(), &sst_dir) {
-            Err(e) => e,
-            Ok(_) => panic!("a manifest with overlapping tables below L0 must not open"),
-        };
-        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-        let message = error.to_string();
-        assert!(
-            message.contains(&format!("at level {level} with overlapping key ranges")),
-            "{message}"
-        );
-    }
+    write_manifest(dir.path(), &[add(1, &wide), add(1, &inside)]);
+    let mut vs = VersionSet::open(dir.path(), &sst_dir).unwrap();
+    assert_eq!(ids(&vs.current().levels[0]), [1, 2]);
+    assert!(vs.current().levels[1].is_empty());
+    let moved = vs.take_demotion().expect("the open moved the level");
+    assert_eq!((moved.tables, moved.deepest_level), (2, 1));
+    drop(vs);
+
+    // A duplicate reference is not a legacy range-widening defect.
+    write_manifest(dir.path(), &[add(2, &wide), add(2, &wide)]);
+    let error = match VersionSet::open(dir.path(), &sst_dir) {
+        Err(e) => e,
+        Ok(_) => panic!("duplicate references must not be repaired into L0"),
+    };
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    assert!(error.to_string().contains("more than once"));
 
     // The same records at L0 are fine: its tables overlap by design.
     write_manifest(dir.path(), &[add(0, &wide), add(0, &inside), add(0, &wide)]);
@@ -434,24 +434,24 @@ proptest! {
             match *step {
                 Step::Put(n) => {
                     let value = format!("value-{n}-{index}-{}", "x".repeat(40)).into_bytes();
-                    db.put(&key(n), &value).unwrap();
+                    crate::through_stalls(|| db.put(&key(n), &value)).unwrap();
                     model.insert(key(n), value);
                 }
                 Step::Delete(n) => {
-                    db.delete(&key(n)).unwrap();
+                    crate::through_stalls(|| db.delete(&key(n))).unwrap();
                     model.remove(&key(n));
                 }
                 Step::DeleteRange(lo, hi) => {
-                    db.delete_range(&key(lo), &key(hi)).unwrap();
+                    crate::through_stalls(|| db.delete_range(&key(lo), &key(hi))).unwrap();
                     model.retain(|k, _| !(key(lo)..key(hi)).contains(k));
                 }
                 Step::Flush => db.flush().unwrap(),
                 Step::Pick => {
                     db.compact_step().unwrap();
                 }
-                Step::Settle => db.compact_range(None, None).unwrap(),
+                Step::Settle => db.compact_range(None, None).wait().unwrap(),
                 Step::Bounded(lo, hi) => {
-                    db.compact_range(Some(&key(lo)), Some(&key(hi))).unwrap();
+                    db.compact_range(Some(&key(lo)), Some(&key(hi))).wait().unwrap();
                 }
             }
             prop_assert!(

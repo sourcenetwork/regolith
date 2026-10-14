@@ -38,13 +38,13 @@ fn empty_key_round_trips() {
     let dir = TempDir::new().unwrap();
     {
         let db = open(&dir);
-        db.put(b"", b"root").unwrap();
+        regolith::through_stalls(|| db.put(b"", b"root")).unwrap();
         assert_eq!(db.get(b"").unwrap(), Some(b"root".to_vec()));
     }
     {
         let db = open(&dir);
         assert_eq!(db.get(b"").unwrap(), Some(b"root".to_vec()));
-        db.delete(b"").unwrap();
+        regolith::through_stalls(|| db.delete(b"")).unwrap();
         assert_eq!(db.get(b"").unwrap(), None);
     }
 }
@@ -57,8 +57,8 @@ fn empty_value_is_distinct_from_missing_after_reopen() {
     let dir = TempDir::new().unwrap();
     {
         let db = open(&dir);
-        db.put(b"exists", b"").unwrap();
-        db.put(b"also", b"v").unwrap();
+        regolith::through_stalls(|| db.put(b"exists", b"")).unwrap();
+        regolith::through_stalls(|| db.put(b"also", b"v")).unwrap();
     }
     let db = open(&dir);
     assert_eq!(db.get(b"exists").unwrap(), Some(vec![]));
@@ -75,12 +75,12 @@ fn get_from_immutable_memtable_still_visible() {
     // that freezes it, until the flush actually lands it in an SST.
     let dir = TempDir::new().unwrap();
     let db = open(&dir);
-    db.put(b"pinned", b"v").unwrap();
+    regolith::through_stalls(|| db.put(b"pinned", b"v")).unwrap();
     // Force enough writes to likely rotate (or at minimum to force
     // a flush + compaction); the pinned key must still be visible.
     for i in 0..200 {
         let k = format!("filler_{:04}", i);
-        db.put(k.as_bytes(), &[0u8; 64]).unwrap();
+        regolith::through_stalls(|| db.put(k.as_bytes(), &[0u8; 64])).unwrap();
     }
     assert_eq!(db.get(b"pinned").unwrap(), Some(b"v".to_vec()));
 }
@@ -91,9 +91,9 @@ fn get_level0_newer_file_shadows_older() {
     // engine must prefer the newer file's value.
     let dir = TempDir::new().unwrap();
     let db = open(&dir);
-    db.put(b"k", b"old").unwrap();
+    regolith::through_stalls(|| db.put(b"k", b"old")).unwrap();
     force_compaction(&db);
-    db.put(b"k", b"new").unwrap();
+    regolith::through_stalls(|| db.put(b"k", b"new")).unwrap();
     assert_eq!(db.get(b"k").unwrap(), Some(b"new".to_vec()));
     // And the shadowing survives another compaction.
     force_compaction(&db);
@@ -127,7 +127,7 @@ fn get_encounters_empty_level_between_populated_ones() {
     let db = open(&dir);
     for i in 0..1000 {
         let k = format!("k_{:06}", i);
-        db.put(k.as_bytes(), b"v").unwrap();
+        regolith::through_stalls(|| db.put(k.as_bytes(), b"v")).unwrap();
     }
     force_compaction(&db);
     assert_eq!(db.get(b"k_000500").unwrap(), Some(b"v".to_vec()));
@@ -142,9 +142,9 @@ fn snapshot_hides_later_writes() {
     // across flushes and compactions.
     let dir = TempDir::new().unwrap();
     let db = open(&dir);
-    db.put(b"k", b"v1").unwrap();
+    regolith::through_stalls(|| db.put(b"k", b"v1")).unwrap();
     let snap = db.snapshot();
-    db.put(b"k", b"v2").unwrap();
+    regolith::through_stalls(|| db.put(b"k", b"v2")).unwrap();
     force_compaction(&db);
     assert_eq!(snap.get(b"k").unwrap(), Some(b"v1".to_vec()));
     assert_eq!(db.get(b"k").unwrap(), Some(b"v2".to_vec()));
@@ -156,10 +156,10 @@ fn identical_snapshots_see_same_state() {
     // the same seq observe the same values.
     let dir = TempDir::new().unwrap();
     let db = open(&dir);
-    db.put(b"k", b"v1").unwrap();
+    regolith::through_stalls(|| db.put(b"k", b"v1")).unwrap();
     let s1 = db.snapshot();
     let s2 = db.snapshot();
-    db.put(b"k", b"v2").unwrap();
+    regolith::through_stalls(|| db.put(b"k", b"v2")).unwrap();
     assert_eq!(s1.get(b"k").unwrap(), s2.get(b"k").unwrap());
 }
 
@@ -184,7 +184,7 @@ fn iter_single_entry_is_valid_exactly_once() {
     // the entry; a subsequent `next` invalidates the iterator.
     let dir = TempDir::new().unwrap();
     let db = open(&dir);
-    db.put(b"only", b"one").unwrap();
+    regolith::through_stalls(|| db.put(b"only", b"one")).unwrap();
     let mut it = db.iter();
     it.seek_to_first();
     assert!(it.valid());
@@ -200,9 +200,9 @@ fn iter_small_and_large_values_mixed() {
     // sizes must round-trip through the iterator unchanged.
     let dir = TempDir::new().unwrap();
     let db = open(&dir);
-    db.put(b"k_small", b"s").unwrap();
-    db.put(b"k_large", &vec![0xAB; 100_000]).unwrap();
-    db.put(b"k_medium", &vec![0x42; 1024]).unwrap();
+    regolith::through_stalls(|| db.put(b"k_small", b"s")).unwrap();
+    regolith::through_stalls(|| db.put(b"k_large", &vec![0xAB; 100_000])).unwrap();
+    regolith::through_stalls(|| db.put(b"k_medium", &vec![0x42; 1024])).unwrap();
 
     let mut it = db.iter();
     it.seek_to_first();
@@ -228,10 +228,10 @@ fn iter_skips_deleted_keys_after_compaction() {
     // physically merged the tombstone with the original value.
     let dir = TempDir::new().unwrap();
     let db = open(&dir);
-    db.put(b"alive", b"1").unwrap();
-    db.put(b"dead", b"2").unwrap();
+    regolith::through_stalls(|| db.put(b"alive", b"1")).unwrap();
+    regolith::through_stalls(|| db.put(b"dead", b"2")).unwrap();
     force_compaction(&db);
-    db.delete(b"dead").unwrap();
+    regolith::through_stalls(|| db.delete(b"dead")).unwrap();
     force_compaction(&db);
 
     let mut it = db.iter();
@@ -251,7 +251,7 @@ fn iter_reverse_walks_backward() {
     let dir = TempDir::new().unwrap();
     let db = open(&dir);
     for c in b'a'..=b'e' {
-        db.put(&[c], &[c]).unwrap();
+        regolith::through_stalls(|| db.put(&[c], &[c])).unwrap();
     }
     let mut it = db.iter();
     it.seek_to_last();
@@ -297,7 +297,7 @@ fn recover_with_large_wal_replays_every_entry() {
         for i in 0..5_000 {
             let k = format!("k_{:06}", i);
             let v = format!("v_{}", i);
-            db.put(k.as_bytes(), v.as_bytes()).unwrap();
+            regolith::through_stalls(|| db.put(k.as_bytes(), v.as_bytes())).unwrap();
         }
     }
     let db = open(&dir);
@@ -329,11 +329,11 @@ fn seq_number_preserved_across_reopen() {
     let dir = TempDir::new().unwrap();
     {
         let db = open(&dir);
-        db.put(b"k", b"before").unwrap();
+        regolith::through_stalls(|| db.put(b"k", b"before")).unwrap();
     }
     let db = open(&dir);
     let snap = db.snapshot();
-    db.put(b"k", b"after").unwrap();
+    regolith::through_stalls(|| db.put(b"k", b"after")).unwrap();
     // Snapshot was taken *after* reopen but *before* the "after"
     // put, so it should observe "before".
     assert_eq!(snap.get(b"k").unwrap(), Some(b"before".to_vec()));
@@ -350,7 +350,7 @@ fn approximate_sizes_grows_with_range_width() {
     let db = open(&dir);
     for i in 0..1_000 {
         let k = format!("k_{:06}", i);
-        db.put(k.as_bytes(), &[0u8; 128]).unwrap();
+        regolith::through_stalls(|| db.put(k.as_bytes(), &[0u8; 128])).unwrap();
     }
     force_compaction(&db);
     let narrow = db.get_approximate_sizes(&[Range::new(b"k_000000", b"k_000001")]);
@@ -411,8 +411,8 @@ fn write_batch_put_delete_on_same_key_keeps_last_op() {
     // Applying the batch and reading should yield the final op.
     let dir = TempDir::new().unwrap();
     let db = open(&dir);
-    db.put(b"k", b"prior").unwrap();
-    db.write(b).unwrap();
+    regolith::through_stalls(|| db.put(b"k", b"prior")).unwrap();
+    regolith::through_stalls(|| db.write(b.clone())).unwrap();
     assert_eq!(db.get(b"k").unwrap(), None);
 }
 
@@ -428,7 +428,7 @@ fn write_batch_apply_is_atomic_under_reopen() {
         b.put(b"a", b"1");
         b.put(b"b", b"2");
         b.put(b"c", b"3");
-        db.write(b).unwrap();
+        regolith::through_stalls(|| db.write(b.clone())).unwrap();
     }
     let db = open(&dir);
     // Either all three are present or none are; partial visibility
@@ -447,14 +447,14 @@ fn write_batch_range_delete_hides_every_key_in_range() {
     let dir = TempDir::new().unwrap();
     let db = open(&dir);
     for k in [b"b".as_ref(), b"c", b"d", b"e"] {
-        db.put(k, b"v").unwrap();
+        regolith::through_stalls(|| db.put(k, b"v")).unwrap();
     }
-    db.put(b"a", b"keep_before").unwrap();
-    db.put(b"z", b"keep_after").unwrap();
+    regolith::through_stalls(|| db.put(b"a", b"keep_before")).unwrap();
+    regolith::through_stalls(|| db.put(b"z", b"keep_after")).unwrap();
 
     let mut batch = WriteBatch::new();
     batch.delete_range(b"b", b"f");
-    db.write(batch).unwrap();
+    regolith::through_stalls(|| db.write(batch.clone())).unwrap();
 
     assert_eq!(db.get(b"a").unwrap(), Some(b"keep_before".to_vec()));
     assert_eq!(db.get(b"b").unwrap(), None);
@@ -479,7 +479,7 @@ fn sequences_order_snapshots_against_commits() {
     let mut batch = WriteBatch::new();
     batch.put(b"a", b"1");
     batch.put(b"b", b"2");
-    let commit = db.write_sequenced(batch).unwrap();
+    let commit = regolith::through_stalls(|| db.write_sequenced(batch.clone())).unwrap();
     assert!(commit > before, "a commit must advance the horizon");
 
     // The snapshot taken before the commit must not see it, and must still
@@ -493,7 +493,7 @@ fn sequences_order_snapshots_against_commits() {
     assert_eq!(snap_after.get(b"a").unwrap(), Some(b"1".to_vec()));
 
     // An empty batch commits nothing and reports the current horizon.
-    let idle = db.write_sequenced(WriteBatch::new()).unwrap();
+    let idle = regolith::through_stalls(|| db.write_sequenced(WriteBatch::new())).unwrap();
     assert_eq!(idle, db.latest_sequence());
 }
 
@@ -515,7 +515,7 @@ fn concurrent_commits_report_distinct_sequences() {
             for i in 0..50u32 {
                 let mut batch = WriteBatch::new();
                 batch.put(format!("k{t}_{i}").as_bytes(), b"v");
-                seqs.push(db.write_sequenced(batch).unwrap());
+                seqs.push(regolith::through_stalls(|| db.write_sequenced(batch.clone())).unwrap());
             }
             seqs
         }));

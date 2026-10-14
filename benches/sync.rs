@@ -22,14 +22,35 @@
 //!     `std::sync::Mutex` has no equivalent: held across a suspension on
 //!     one thread it deadlocks.
 //!
-//! The locks barge: a caller takes a free lock even while others wait,
-//! and queues at once when it is held, and a release only wakes a waiter
-//! to compete again, so the releasing thread takes the lock straight back,
-//! as with `std::sync::Mutex`. A waiter passed over `MAX_BYPASS` times is
-//! handed the lock directly, which costs a context switch for that one
-//! acquisition.
+//! The uncontended rows run twice: with the lock in the benchmark's stack
+//! frame, as before, and in a `Box`, where a lock behind an `Arc` or in a
+//! heap-allocated structure lives. On the Intel host these were measured on,
+//! the same lock-and-unlock loop ran at one of two speeds about 7 cycles
+//! apart, for this crate's locks and for `std::sync::Mutex` alike, depending
+//! on where the code and the lock landed (perf counters put the slower speed
+//! on loops decoded entirely from the micro-op cache, with both locked
+//! instructions microcoded). Two placements of each lock make one lucky or
+//! unlucky layout less likely to decide the comparison.
+//!
+//! The locks barge: a caller takes a free lock even while others wait. A
+//! caller that finds the lock held while nobody is queued spins a little
+//! first, and a waiter that loses its retry spins on its own node before it
+//! sleeps (see `regolith::sync`), so the releasing thread takes the lock
+//! straight back, as with `std::sync::Mutex`. A waiter passed over
+//! `MAX_BYPASS` times is handed the lock directly, which costs a context
+//! switch for that one acquisition.
+//!
+//! **Fairness.** Unfairness can buy throughput: a lock that lets one thread
+//! keep it while the others wait moves the line less. Each contended row
+//! gives every task a fixed share of the work, which hides that. Run the
+//! binary with `SYNC_FAIRNESS=<seconds>` instead of the criterion arguments
+//! to count, in a window of that length, how many acquisitions each task
+//! made in every contended shape: it prints the throughput beside the
+//! fewest and the most acquisitions of one task.
 //!
 //! No async runtime is involved: the executors are the functions below.
+
+mod common;
 
 use std::future::Future;
 use std::hint::black_box;
@@ -39,7 +60,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll, Wake, Waker};
 use std::time::{Duration, Instant};
 
-use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group};
 use regolith::sync::{Mutex, RwLock, Semaphore};
 
 struct Unpark(std::thread::Thread);
@@ -75,6 +96,13 @@ enum Executor {
 
 /// Drives `future` on this thread, waiting the `executor` way while it
 /// is pending.
+///
+/// Always inlined: an executor polls a task's future where the task keeps
+/// it. Left to the compiler, this function was kept out of line once the
+/// lock future's first poll got an inline fast path, and every fresh future
+/// was then copied into its frame through the stack, a store-forwarding
+/// stall that `perf annotate` put at a third of the function's cycles.
+#[inline(always)]
 fn block_on<F: Future>(future: F, waker: &Waker, flag: &Flag, executor: Executor) -> F::Output {
     let mut future = pin!(future);
     let mut cx = Context::from_waker(waker);
@@ -130,22 +158,40 @@ fn uncontended(c: &mut Criterion) {
     group.bench_function("std_mutex_lock", |b| {
         b.iter(|| *black_box(&std_mutex).lock().expect("unpoisoned") += 1)
     });
+    let boxed = Box::new(Mutex::new(0u64));
+    group.bench_function("regolith_mutex_try_lock_boxed", |b| {
+        b.iter(|| *black_box(&*boxed).try_lock().expect("free") += 1)
+    });
+    group.bench_function("regolith_mutex_lock_future_boxed", |b| {
+        b.iter(|| {
+            let mut lock = pin!(black_box(&*boxed).lock());
+            match lock.as_mut().poll(&mut Context::from_waker(waker)) {
+                Poll::Ready(mut guard) => *guard += 1,
+                Poll::Pending => unreachable!("uncontended"),
+            }
+        })
+    });
+    let std_boxed = Box::new(std::sync::Mutex::new(0u64));
+    group.bench_function("std_mutex_lock_boxed", |b| {
+        b.iter(|| *black_box(&*std_boxed).lock().expect("unpoisoned") += 1)
+    });
     group.finish();
 }
 
-/// Runs `per_task` ops on each of `tasks` threads and returns the wall
-/// time from a common start.
+/// Runs `total` ops spread over `tasks` threads (`common::start::share`)
+/// and returns the wall time from a common start.
 fn on_threads(
     tasks: usize,
-    per_task: u64,
+    total: u64,
     op: impl Fn(&Waker, &Flag) + Send + Sync + 'static,
     park: bool,
 ) -> Duration {
     let op = Arc::new(op);
-    let start = Arc::new(std::sync::Barrier::new(tasks + 1));
+    let line = Arc::new(common::start::StartLine::new(tasks));
     let threads: Vec<_> = (0..tasks)
-        .map(|_| {
-            let (op, start) = (Arc::clone(&op), Arc::clone(&start));
+        .map(|t| {
+            let (op, line) = (Arc::clone(&op), Arc::clone(&line));
+            let per_task = common::start::share(total, tasks, t);
             std::thread::spawn(move || {
                 let flag = Arc::new(Flag(AtomicBool::new(false)));
                 let waker = if park {
@@ -153,15 +199,14 @@ fn on_threads(
                 } else {
                     Waker::from(Arc::clone(&flag))
                 };
-                start.wait();
+                line.wait();
                 for _ in 0..per_task {
                     op(&waker, &flag);
                 }
             })
         })
         .collect();
-    start.wait();
-    let began = Instant::now();
+    let began = line.start();
     for thread in threads {
         thread.join().expect("worker");
     }
@@ -185,15 +230,16 @@ impl Future for YieldOnce {
     }
 }
 
-/// Runs `tasks` tasks of `per_task` locks each on this thread, polling
-/// only the tasks whose waker fired.
-fn on_one_thread(mutex: &Mutex<u64>, tasks: usize, per_task: u64) -> Duration {
+/// Runs `total` locks spread over `tasks` tasks (`common::start::share`) on
+/// this thread, polling only the tasks whose waker fired.
+fn on_one_thread(mutex: &Mutex<u64>, tasks: usize, total: u64) -> Duration {
     let flags: Vec<_> = (0..tasks)
         .map(|_| Arc::new(Flag(AtomicBool::new(true))))
         .collect();
     let wakers: Vec<_> = flags.iter().map(|f| Waker::from(Arc::clone(f))).collect();
     let mut futures: Vec<Pin<Box<dyn Future<Output = ()> + '_>>> = (0..tasks)
-        .map(|_| {
+        .map(|t| {
+            let per_task = common::start::share(total, tasks, t);
             Box::pin(async move {
                 for _ in 0..per_task {
                     let mut guard = mutex.lock().await;
@@ -235,11 +281,10 @@ fn contended(c: &mut Criterion) {
             group.bench_with_input(BenchmarkId::new(name, tasks), &tasks, |b, &tasks| {
                 b.iter_custom(|iters| {
                     let mutex = Arc::new(Mutex::new(0u64));
-                    let per_task = (iters / tasks as u64).max(1);
                     let park = matches!(executor, Executor::Park);
                     on_threads(
                         tasks,
-                        per_task,
+                        iters,
                         move |waker, flag| {
                             *block_on(mutex.lock(), waker, flag, executor) += 1;
                         },
@@ -254,17 +299,16 @@ fn contended(c: &mut Criterion) {
             |b, &tasks| {
                 b.iter_custom(|iters| {
                     let mutex = Mutex::new(0u64);
-                    on_one_thread(&mutex, tasks, (iters / tasks as u64).max(1))
+                    on_one_thread(&mutex, tasks, iters)
                 })
             },
         );
         group.bench_with_input(BenchmarkId::new("std_mutex", tasks), &tasks, |b, &tasks| {
             b.iter_custom(|iters| {
                 let mutex = Arc::new(std::sync::Mutex::new(0u64));
-                let per_task = (iters / tasks as u64).max(1);
                 on_threads(
                     tasks,
-                    per_task,
+                    iters,
                     move |_, _| {
                         *mutex.lock().expect("unpoisoned") += 1;
                     },
@@ -276,5 +320,162 @@ fn contended(c: &mut Criterion) {
     group.finish();
 }
 
+/// One contended shape of the fairness window: what each task does once.
+#[derive(Clone, Copy)]
+enum Shape {
+    Park,
+    Spin,
+    Std,
+}
+
+/// Every task of a fairness run on its own thread takes the lock as often
+/// as it can until `stop` is raised; returns each task's acquisitions.
+fn window_on_threads(tasks: usize, window: Duration, shape: Shape) -> Vec<u64> {
+    let regolith = Arc::new(Mutex::new(0u64));
+    let std_mutex = Arc::new(std::sync::Mutex::new(0u64));
+    let stop = Arc::new(AtomicBool::new(false));
+    let line = Arc::new(common::start::StartLine::new(tasks));
+    let threads: Vec<_> = (0..tasks)
+        .map(|_| {
+            let (regolith, std_mutex) = (Arc::clone(&regolith), Arc::clone(&std_mutex));
+            let (stop, line) = (Arc::clone(&stop), Arc::clone(&line));
+            std::thread::spawn(move || {
+                let flag = Arc::new(Flag(AtomicBool::new(false)));
+                let waker = match shape {
+                    Shape::Park | Shape::Std => {
+                        Waker::from(Arc::new(Unpark(std::thread::current())))
+                    }
+                    Shape::Spin => Waker::from(Arc::clone(&flag)),
+                };
+                line.wait();
+                let mut taken = 0u64;
+                while !stop.load(Ordering::Relaxed) {
+                    match shape {
+                        Shape::Park => {
+                            *block_on(regolith.lock(), &waker, &flag, Executor::Park) += 1;
+                        }
+                        Shape::Spin => {
+                            *block_on(regolith.lock(), &waker, &flag, Executor::Spin) += 1;
+                        }
+                        Shape::Std => *std_mutex.lock().expect("unpoisoned") += 1,
+                    }
+                    taken += 1;
+                }
+                taken
+            })
+        })
+        .collect();
+    line.start();
+    std::thread::sleep(window);
+    stop.store(true, Ordering::Relaxed);
+    threads
+        .into_iter()
+        .map(|thread| thread.join().expect("worker"))
+        .collect()
+}
+
+/// The one-thread shape of the fairness run: `tasks` tasks on this thread,
+/// each holding the lock across one suspension, until the window closes.
+fn window_on_one_thread(tasks: usize, window: Duration) -> Vec<u64> {
+    let mutex = Mutex::new(0u64);
+    let stop = core::cell::Cell::new(false);
+    let counts: Vec<_> = (0..tasks).map(|_| core::cell::Cell::new(0u64)).collect();
+    let flags: Vec<_> = (0..tasks)
+        .map(|_| Arc::new(Flag(AtomicBool::new(true))))
+        .collect();
+    let wakers: Vec<_> = flags.iter().map(|f| Waker::from(Arc::clone(f))).collect();
+    let mut futures: Vec<Pin<Box<dyn Future<Output = ()> + '_>>> = counts
+        .iter()
+        .map(|count| {
+            let (mutex, stop) = (&mutex, &stop);
+            Box::pin(async move {
+                while !stop.get() {
+                    let mut guard = mutex.lock().await;
+                    YieldOnce(false).await;
+                    *guard += 1;
+                    count.set(count.get() + 1);
+                }
+            }) as Pin<Box<dyn Future<Output = ()> + '_>>
+        })
+        .collect();
+    let began = Instant::now();
+    let mut live = tasks;
+    let mut done = vec![false; tasks];
+    let mut polls = 0u32;
+    while live > 0 {
+        for i in 0..tasks {
+            if done[i] || !flags[i].0.swap(false, Ordering::Acquire) {
+                continue;
+            }
+            polls = polls.wrapping_add(1);
+            if polls.is_multiple_of(1024) && began.elapsed() >= window {
+                stop.set(true);
+            }
+            if futures[i]
+                .as_mut()
+                .poll(&mut Context::from_waker(&wakers[i]))
+                .is_ready()
+            {
+                done[i] = true;
+                live -= 1;
+            }
+        }
+    }
+    drop(futures);
+    counts.iter().map(core::cell::Cell::get).collect()
+}
+
+/// `SYNC_FAIRNESS=<seconds>`: every contended shape for a fixed window,
+/// printing the throughput beside each task's acquisitions.
+/// `SYNC_FAIRNESS_ONLY=<name>/<tasks>` runs that one shape alone, for a
+/// profiler to attach to.
+fn fairness(window: Duration) {
+    let only = std::env::var("SYNC_FAIRNESS_ONLY").ok();
+    for tasks in [2usize, 8, 32] {
+        for name in [
+            "regolith_mutex_park",
+            "regolith_mutex_spin",
+            "regolith_mutex_one_thread",
+            "std_mutex",
+        ] {
+            if only
+                .as_deref()
+                .is_some_and(|only| only != format!("{name}/{tasks}"))
+            {
+                continue;
+            }
+            let counts = match name {
+                "regolith_mutex_park" => window_on_threads(tasks, window, Shape::Park),
+                "regolith_mutex_spin" => window_on_threads(tasks, window, Shape::Spin),
+                "regolith_mutex_one_thread" => window_on_one_thread(tasks, window),
+                _ => window_on_threads(tasks, window, Shape::Std),
+            };
+            let total: u64 = counts.iter().sum();
+            let (fewest, most) = (
+                counts.iter().copied().min().unwrap_or(0),
+                counts.iter().copied().max().unwrap_or(0),
+            );
+            println!(
+                "fairness {name}/{tasks}: {:.2} M locks/s, per task min {fewest} max {most} \
+                 (max/min {:.2})",
+                total as f64 / window.as_secs_f64() / 1e6,
+                most as f64 / fewest.max(1) as f64,
+            );
+        }
+    }
+}
+
 criterion_group!(benches, uncontended, contended);
-criterion_main!(benches);
+
+fn main() {
+    if let Some(seconds) = std::env::var_os("SYNC_FAIRNESS") {
+        let seconds: f64 = seconds
+            .to_str()
+            .and_then(|s| s.parse().ok())
+            .expect("SYNC_FAIRNESS is a number of seconds");
+        fairness(Duration::from_secs_f64(seconds));
+        return;
+    }
+    benches();
+    Criterion::default().configure_from_args().final_summary();
+}

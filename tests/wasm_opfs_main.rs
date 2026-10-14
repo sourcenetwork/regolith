@@ -110,6 +110,12 @@ async fn a_database_larger_than_the_mirror_bound_is_refused_at_mount() {
         env.persist().await.expect("persist");
     }
 
+    // What the stored database occupies once loaded whole.
+    let stored = OpfsEnv::mount(name, OpfsOptions::default())
+        .await
+        .expect("mount within the bound")
+        .resident_bytes();
+
     let tiny = OpfsOptions {
         max_resident_bytes: 1024,
         ..OpfsOptions::default()
@@ -117,9 +123,11 @@ async fn a_database_larger_than_the_mirror_bound_is_refused_at_mount() {
     let error = OpfsEnv::mount(name, tiny)
         .await
         .expect_err("a database over the bound must be refused, not silently loaded");
+    // The mount stops reading once past the bound and only sums the sizes of
+    // the rest, so it reports the whole size without holding it.
     assert!(
-        matches!(error, OpfsError::ResidencyExceeded { .. }),
-        "expected ResidencyExceeded, got {error:?}"
+        matches!(error, OpfsError::ResidencyExceeded { resident, limit: 1024 } if resident == stored),
+        "expected ResidencyExceeded of {stored} bytes, got {error:?}"
     );
     assert!(
         error.to_string().contains("worker"),
@@ -147,9 +155,9 @@ async fn mirror_mode_refuses_immediate_durability() {
         .env(std::sync::Arc::new(env.clone()))
         .durability(regolith::DurabilityMode::Immediate)
         .max_background_compactions(0);
-    let error = Db::open("/regolith-test-main-durability", options)
-        .err()
-        .expect("Immediate durability must be refused on a non-durable env");
+    let Err(error) = Db::open("/regolith-test-main-durability", options) else {
+        panic!("Immediate durability must be refused on a non-durable env");
+    };
     let text = error.to_string();
     assert!(
         text.contains("durable_sync"),
@@ -181,7 +189,7 @@ async fn a_batch_of_new_tables_a_manifest_and_deletions_reopens() {
             db.flush().expect("flush");
         }
         env.persist().await.expect("persist the flushed tables");
-        db.compact_range(None, None).expect("compact");
+        db.compact_range(None, None).wait().expect("compact");
         db.put(b"after", b"compaction").expect("put");
         db.flush().expect("flush");
         db.close().expect("close");

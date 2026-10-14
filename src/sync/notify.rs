@@ -10,7 +10,7 @@ use core::task::{Context, Poll};
 use super::internal::{AtomicUsize, Ordering, UnsafeCell};
 use super::list::List;
 use super::queue::{Arrivals, FIRST_BIT, Policy, QUEUED, Step, WaitQueue};
-use super::waiter::{Cancel, Wait, WakeList};
+use super::waiter::{Cancel, Wait, WakeList, release_queued};
 
 /// A `notify_one` found nobody waiting and left this for the next waiter.
 const PERMIT: usize = 1 << FIRST_BIT;
@@ -140,14 +140,16 @@ impl Policy for Notify {
 
     fn pass(&self, arrivals: Arrivals, woken: &mut WakeList<'_>, _wake_front: bool) -> usize {
         let pool = &self.queue;
+        // Read after the arrivals were taken, so each arrival carries this
+        // generation or an older one.
+        let generation = self.generation();
         // SAFETY: only the drain role's holder runs a pass.
         self.waiting.with_mut(|waiting| unsafe {
             let waiting = &mut *waiting;
-            waiting.absorb(arrivals, pool);
-            waiting.tidy(&self.queue);
-            // Waiters register in generation order, so everyone a
-            // `notify_waiters` released is at the front.
-            let generation = self.generation();
+            // Every node a pass leaves queued carries the generation that
+            // pass read, so the queued nodes are all of one generation:
+            // a `notify_waiters` since then expired every one of them, and
+            // granting from the front reaches them all.
             while let Some(node) = waiting.front(pool) {
                 if node.as_ref().payload() == generation {
                     break;
@@ -155,6 +157,20 @@ impl Policy for Notify {
                 waiting.pop_front();
                 woken.grant(node);
             }
+            // Generation order is not queue order: a waiter can pass its
+            // check, stop before it queues, and queue after a newer one.
+            // So each arrival is checked on its own, and only the current
+            // generation is queued, which keeps the rule above.
+            for node in arrivals {
+                if node.as_ref().is_cancelled() {
+                    release_queued(node, pool);
+                } else if node.as_ref().payload() != generation {
+                    woken.grant(node);
+                } else {
+                    waiting.push_back(node);
+                }
+            }
+            waiting.tidy(&self.queue);
             let mut owed = self.pending.swap(0, Ordering::AcqRel);
             if waiting.front(pool).is_some()
                 && self.queue.state.fetch_and(!PERMIT, Ordering::AcqRel) & PERMIT != 0
@@ -261,6 +277,7 @@ impl fmt::Debug for Notified<'_> {
 mod tests {
     use super::*;
     use crate::sync::test_support::{Polled, block_on};
+    use core::task::Waker;
     use std::sync::Arc;
 
     #[test]
@@ -297,6 +314,26 @@ mod tests {
         waiting.ready();
         created.ready();
         Polled::new(notify.notified()).pending();
+    }
+
+    #[test]
+    fn an_older_waiter_queued_behind_a_newer_one_still_gets_the_broadcast() {
+        let notify = Notify::new();
+        // Created before the broadcast, so the broadcast is owed to it.
+        let mut older = notify.notified();
+        notify.notify_waiters();
+        let mut newer = Polled::new(notify.notified());
+        newer.pending();
+        // The older future's first poll passed its generation check before
+        // the broadcast and queues only now, behind the newer waiter: the
+        // rest of that poll, step by step.
+        notify.enqueue(&mut older.wait, older.generation, Waker::noop());
+        assert!(
+            older.wait.poll(&notify.queue, None).is_ready(),
+            "the broadcast after its creation reached it"
+        );
+        newer.pending();
+        assert_eq!(newer.wakes(), 0, "an earlier broadcast is not its");
     }
 
     #[test]

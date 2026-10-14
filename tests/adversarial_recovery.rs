@@ -4,6 +4,7 @@
 //! became an iterator: a corrupt log fails the open loud, an intact log
 //! recovers every acknowledged write, and no corruption is ever silently
 //! skipped. "Opened with the wrong data" is the failure these tests hunt.
+#![cfg(not(target_arch = "wasm32"))]
 
 use std::fs;
 use std::fs::OpenOptions;
@@ -80,7 +81,7 @@ fn a_zero_length_wal_opens_clean() {
         for i in 0..200 {
             db.put(format!("s{i:04}").as_bytes(), b"v").unwrap();
         }
-        db.compact_range(None, None).unwrap();
+        db.compact_range(None, None).wait().unwrap();
         db.close().unwrap();
     }
     for path in wal_files(dir.path()) {
@@ -312,11 +313,15 @@ fn corruption_in_an_earlier_wal_is_not_skipped() {
 
     // The control: the split alone serves every write.
     fs::write(&target, &earlier).unwrap();
+    let manifest = dir.path().join("MANIFEST");
+    let before_control = fs::read(&manifest).unwrap();
     {
         let db = Db::open(dir.path(), opts()).expect("the split alone opens");
         assert_eq!(db.scan(None, None).unwrap(), expected(COUNT));
     }
-    // That open rewrote the logs, so lay the pair down again, damaged.
+    // That open rewrote the logs and recorded the pair as retired, so lay
+    // the pair and the manifest down again, the pair damaged.
+    fs::write(&manifest, &before_control).unwrap();
     for path in wal_files(dir.path()) {
         fs::remove_file(path).unwrap();
     }

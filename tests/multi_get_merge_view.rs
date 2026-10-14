@@ -37,7 +37,7 @@ impl MergeOperator for Interfering {
         {
             db.put(b"b", b"new").unwrap();
             db.flush().unwrap();
-            db.compact_range(None, None).unwrap();
+            db.compact_range(None, None).wait().unwrap();
         }
         let mut out = base.map(<[u8]>::to_vec).unwrap_or_default();
         operands.iter().for_each(|op| out.extend_from_slice(op));

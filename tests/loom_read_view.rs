@@ -43,7 +43,7 @@ use std::sync::Arc as StdArc;
 use std::sync::atomic::{AtomicUsize as StdAtomicUsize, Ordering as StdOrdering};
 
 use loom::sync::Arc;
-use loom::sync::atomic::{AtomicU64, Ordering};
+use loom::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use loom::thread;
 
 /// Memtable ids. Small enough to pack into a nibble, distinct enough
@@ -611,6 +611,245 @@ fn sampling_the_horizon_first_is_caught_by_the_read_path_model() {
     });
 }
 
+/// Preemptions the write-free models explore. At this bound the search is
+/// saturated: raising it to 12 explores no new interleaving (525 for
+/// `horizon_then_view` and 114 for `apply_then_frontier`, the same at 8 and
+/// at 12, measured). loom's search with no bound at all reports fewer, 336 and
+/// 114, because without a bound it prunes more orders as equivalent, not
+/// because it reaches more states. Each model has two threads of a few steps.
+const WRITE_FREE_PREEMPTIONS: usize = 8;
+
+/// [`run_model`] with [`WRITE_FREE_PREEMPTIONS`] as an explicit bound.
+fn run_bounded_model(name: &str, floor: usize, body: impl Fn() + Send + Sync + 'static) -> usize {
+    let executions = StdArc::new(StdAtomicUsize::new(0));
+    let counter = StdArc::clone(&executions);
+    let mut builder = loom::model::Builder::new();
+    builder.preemption_bound = Some(WRITE_FREE_PREEMPTIONS);
+    builder.check(move || {
+        counter.fetch_add(1, StdOrdering::Relaxed);
+        body();
+    });
+    let explored = executions.load(StdOrdering::Relaxed);
+    println!("loom model `{name}`: {explored} interleavings explored");
+    assert!(
+        explored >= floor,
+        "`{name}` explored only {explored} interleavings (floor {floor}): the \
+         state space collapsed and this model proves nothing",
+    );
+    explored
+}
+
+/// [`expect_violation`] with [`WRITE_FREE_PREEMPTIONS`] as an explicit bound.
+fn expect_bounded_violation(name: &str, body: impl Fn() + Send + Sync + 'static) {
+    println!("negative control `{name}`: loom must report a violation below");
+    let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        let mut builder = loom::model::Builder::new();
+        builder.preemption_bound = Some(WRITE_FREE_PREEMPTIONS);
+        builder.check(body);
+    }));
+    assert!(
+        outcome.is_err(),
+        "negative control `{name}` passed: the model cannot tell the mutated \
+         protocol from the real one",
+    );
+    println!("negative control `{name}`: violation reported, as required");
+}
+
+/// Whether `view` can reach the fresh memtable: `reachable_ids` is a bit set
+/// with bit `n` standing for memtable `n`, so the bit for [`FRESH`] says
+/// whether the view still holds it (active, frozen, or flushed into the
+/// version).
+fn reaches_fresh(view: &View) -> bool {
+    view.reachable_ids() & (1u16 << FRESH) != 0
+}
+
+/// The load order the write-free commit depends on (E50): its points (the
+/// published horizon and the decided frontier) first, the view second
+/// (`RegolithEngine::commit_write_free`, src/engine/commit/write_free.rs:118
+/// and 129). It is the reverse of the read path's, and for a different
+/// reason: a plain read is placed where it loaded its view, while a commit
+/// that writes nothing is placed at its points, so every commit at or below
+/// them must be reachable through the view it checks in.
+///
+/// The committer seals the active memtable and only then publishes its
+/// sequence, the order the pipeline keeps: its write goes into the fresh
+/// memtable before it is published. The model has no write of its own: that
+/// the view reaches the fresh memtable stands for the view holding the write
+/// in it. A checker whose horizon covers the commit must load a view that
+/// reaches the fresh memtable.
+#[test]
+fn the_write_free_check_samples_the_horizon_before_it_loads_the_view() {
+    run_bounded_model("horizon_then_view", 262, || {
+        let cell = Arc::new(Cell::new(View::initial()));
+        let horizon = Arc::new(AtomicU64::new(1));
+
+        let committer = {
+            let cell = Arc::clone(&cell);
+            let horizon = Arc::clone(&horizon);
+            thread::spawn(move || {
+                cell.rcu(|view| rotate(view, FRESH));
+                horizon.store(2, Ordering::Release);
+            })
+        };
+
+        let checker = {
+            let cell = Arc::clone(&cell);
+            let horizon = Arc::clone(&horizon);
+            thread::spawn(move || {
+                let sampled = horizon.load(Ordering::Acquire);
+                let view = cell.load();
+                if sampled >= 2 {
+                    assert!(
+                        reaches_fresh(&view),
+                        "the check's horizon covers the commit but its view \
+                         misses the memtable the commit wrote to: {view:?}",
+                    );
+                }
+            })
+        };
+
+        committer.join().unwrap();
+        checker.join().unwrap();
+    });
+}
+
+/// The negative control of the model above: the broken order, view first
+/// and horizon second. The checker can load the old view, then see the
+/// horizon cover the commit, and miss the write; loom must find it.
+#[test]
+fn loading_the_view_first_is_caught_by_the_write_free_model() {
+    expect_bounded_violation("horizon_then_view/view_first", || {
+        let cell = Arc::new(Cell::new(View::initial()));
+        let horizon = Arc::new(AtomicU64::new(1));
+
+        let committer = {
+            let cell = Arc::clone(&cell);
+            let horizon = Arc::clone(&horizon);
+            thread::spawn(move || {
+                cell.rcu(|view| rotate(view, FRESH));
+                horizon.store(2, Ordering::Release);
+            })
+        };
+
+        let checker = {
+            let cell = Arc::clone(&cell);
+            let horizon = Arc::clone(&horizon);
+            thread::spawn(move || {
+                let view = cell.load();
+                let sampled = horizon.load(Ordering::Acquire);
+                if sampled >= 2 {
+                    assert!(reaches_fresh(&view));
+                }
+            })
+        };
+
+        committer.join().unwrap();
+        checker.join().unwrap();
+    });
+}
+
+/// One slot of the commit pipeline as the write-free check meets it: a
+/// decision installed, its operation applied to the memtable, then the tip
+/// (the decided frontier) moved past it (`settle`,
+/// src/engine/commit/pipeline.rs:671).
+struct Slot {
+    /// The slot holds a decision.
+    decided: AtomicBool,
+    /// Its operation is in the memtable.
+    in_memtable: AtomicBool,
+    /// The decided frontier: 1 before the slot, 2 once it is settled.
+    tip: AtomicU64,
+}
+
+impl Slot {
+    fn new() -> Self {
+        Self {
+            decided: AtomicBool::new(false),
+            in_memtable: AtomicBool::new(false),
+            tip: AtomicU64::new(1),
+        }
+    }
+
+    /// Apply the slot and move the tip past it: what the deciding thread
+    /// does, and what any helper does for it. Two threads may both do it,
+    /// which is harmless (the apply is idempotent and only one moves the
+    /// tip).
+    fn settle(&self) {
+        self.in_memtable.store(true, Ordering::Relaxed);
+        let _ = self
+            .tip
+            .compare_exchange(1, 2, Ordering::AcqRel, Ordering::Acquire);
+    }
+
+    /// The pipeline's thread: install the decision, then settle the slot.
+    fn decide_and_settle(&self) {
+        self.decided.store(true, Ordering::Release);
+        self.settle();
+    }
+
+    /// The write-free check: when the slot holds a decision, settle it
+    /// (`apply_decided`, write_free.rs:203-216), then read the decided
+    /// frontier, then look at the memtable. Returns whether a decision was
+    /// there when the check began, the frontier it read, and whether the
+    /// memtable held the write. `help` off is the calibration's broken check.
+    fn check(&self, help: bool) -> (bool, u64, bool) {
+        let decided = self.decided.load(Ordering::Acquire);
+        if help && decided {
+            self.settle();
+        }
+        let frontier = self.tip.load(Ordering::Acquire);
+        let seen = self.in_memtable.load(Ordering::Relaxed);
+        (decided, frontier, seen)
+    }
+}
+
+/// E50 F2: a write-free check that begins after a commit is decided counts
+/// it, applied or not. The check settles a decided slot itself before it
+/// reads the decided frontier, so the frontier it reads is past that slot,
+/// and a frontier past a slot means its write is in the memtable.
+#[test]
+fn the_write_free_check_counts_a_commit_decided_before_it() {
+    run_bounded_model("apply_then_frontier", 57, || {
+        let slot = Arc::new(Slot::new());
+        let pipeline = {
+            let slot = Arc::clone(&slot);
+            thread::spawn(move || slot.decide_and_settle())
+        };
+        let (decided, frontier, seen) = slot.check(true);
+        if decided {
+            assert_eq!(frontier, 2, "the check missed a commit decided before it");
+        }
+        if frontier >= 2 {
+            assert!(
+                seen,
+                "the frontier counts a write the memtable does not hold"
+            );
+        }
+        pipeline.join().unwrap();
+    });
+}
+
+/// The negative control of the model above: a check that reads the decided
+/// frontier without settling a decided slot first. It can begin after the
+/// decision and before the apply, read the old frontier and miss the commit,
+/// which a commit through the pipeline would be checked against; loom must
+/// find it.
+#[test]
+fn reading_the_frontier_without_helping_is_caught() {
+    expect_bounded_violation("apply_then_frontier/no_help", || {
+        let slot = Arc::new(Slot::new());
+        let pipeline = {
+            let slot = Arc::clone(&slot);
+            thread::spawn(move || slot.decide_and_settle())
+        };
+        let (decided, frontier, _) = slot.check(false);
+        if decided {
+            assert_eq!(frontier, 2);
+        }
+        pipeline.join().unwrap();
+    });
+}
+
 #[test]
 fn the_packing_round_trips_every_field() {
     let view = View {
@@ -623,4 +862,165 @@ fn the_packing_round_trips_every_field() {
     };
     assert_eq!(View::unpack(view.pack()), view);
     assert_eq!(View::unpack(View::initial().pack()), View::initial());
+}
+
+// ---------------------------------------------------------------------------
+// Reclamation and freshness: what `ReadViewCell` relies on kovan for.
+//
+// kovan's epoch protocol is not loom-instrumented (see the module docs), so
+// these two models transcribe the guarantee regolith builds on rather than
+// kovan's code: a reader announces itself before it loads the published
+// view, and a publisher frees the view it replaced only once no reader that
+// could have loaded it is still announced. That is the shape of
+// `ViewGuard` (pin, then load) against `Atom::compare_and_swap` (swap, then
+// retire), with one reader standing in for every reservation slot.
+
+/// The two views of the reclamation models and the cells around them.
+struct Reclaim {
+    /// Index of the published view.
+    published: AtomicU64,
+    /// Whether each view's memory has been given back.
+    freed: [AtomicBool; 2],
+    /// The reader's reservation: set before its load, cleared after its
+    /// last use of the view.
+    reading: AtomicBool,
+}
+
+impl Reclaim {
+    fn new() -> Self {
+        Self {
+            published: AtomicU64::new(0),
+            freed: [AtomicBool::new(false), AtomicBool::new(false)],
+            reading: AtomicBool::new(false),
+        }
+    }
+}
+
+/// One reader against one publication. `wait_for_readers` is the real
+/// rule; without it the publisher frees the view it replaced at once.
+///
+/// The announcement and the two cross-checks are read-modify-writes. kovan
+/// orders a reservation against a retirement with sequentially consistent
+/// fences, which loom models only as acquire/release; a read-modify-write
+/// always reads the newest value of its word and synchronizes with the one
+/// it reads, which gives the model the same "one side sees the other"
+/// guarantee the fences give kovan.
+fn reclaim_model(wait_for_readers: bool, deferred: &StdArc<StdAtomicUsize>) {
+    let cell = Arc::new(Reclaim::new());
+
+    let reader = {
+        let cell = Arc::clone(&cell);
+        thread::spawn(move || {
+            cell.reading.swap(true, Ordering::AcqRel);
+            let index = cell.published.fetch_add(0, Ordering::AcqRel) as usize;
+            assert!(
+                !cell.freed[index].load(Ordering::Acquire),
+                "a reader read a view that was already freed"
+            );
+            cell.reading.swap(false, Ordering::AcqRel);
+        })
+    };
+
+    let publisher = {
+        let cell = Arc::clone(&cell);
+        let deferred = StdArc::clone(deferred);
+        thread::spawn(move || {
+            let replaced = cell.published.swap(1, Ordering::AcqRel) as usize;
+            if wait_for_readers && cell.reading.fetch_or(false, Ordering::AcqRel) {
+                // A reader may hold it: the free waits for that reader.
+                deferred.fetch_add(1, StdOrdering::Relaxed);
+            } else {
+                cell.freed[replaced].store(true, Ordering::Release);
+            }
+        })
+    };
+
+    reader.join().unwrap();
+    publisher.join().unwrap();
+}
+
+/// A replaced view is freed only when no reader holds it.
+#[test]
+fn a_reader_never_reads_a_freed_view() {
+    let deferred = StdArc::new(StdAtomicUsize::new(0));
+    let seen = StdArc::clone(&deferred);
+    run_model("reclaim_waits_for_readers", 8, move || {
+        reclaim_model(true, &seen)
+    });
+    assert!(
+        deferred.load(StdOrdering::Relaxed) > 0,
+        "no schedule ever had a reader pinned across the publication"
+    );
+}
+
+/// RED: freeing the replaced view without waiting for readers.
+#[test]
+fn freeing_without_waiting_for_readers_is_caught() {
+    let deferred = StdArc::new(StdAtomicUsize::new(0));
+    expect_violation("reclaim_waits_for_readers/free_at_once", move || {
+        reclaim_model(false, &deferred)
+    });
+}
+
+/// One publication that happened before a reader's load began, made known
+/// to the reader by a release/acquire pair the way a commit's horizon is.
+/// `cached_load` is the defect: a reader answering from a view it loaded
+/// before it learned of the publication.
+fn freshness_model(cached_load: bool, witnessed: &StdArc<StdAtomicUsize>) {
+    let cell = Arc::new(Cell::new(View::initial()));
+    let announced = Arc::new(AtomicBool::new(false));
+
+    let publisher = {
+        let cell = Arc::clone(&cell);
+        let announced = Arc::clone(&announced);
+        thread::spawn(move || {
+            cell.rcu(|view| rotate(view, FRESH));
+            announced.store(true, Ordering::Release);
+        })
+    };
+
+    let reader = {
+        let cell = Arc::clone(&cell);
+        let announced = Arc::clone(&announced);
+        let witnessed = StdArc::clone(witnessed);
+        thread::spawn(move || {
+            let early = cell.load();
+            if announced.load(Ordering::Acquire) {
+                let view = if cached_load { early } else { cell.load() };
+                witnessed.fetch_add(1, StdOrdering::Relaxed);
+                assert!(
+                    view.generation >= 1,
+                    "a load that began after a publication returned an older view"
+                );
+            }
+        })
+    };
+
+    publisher.join().unwrap();
+    reader.join().unwrap();
+}
+
+/// A load never returns a view older than one published before the load
+/// began.
+#[test]
+fn a_load_after_a_publication_sees_it_or_newer() {
+    let witnessed = StdArc::new(StdAtomicUsize::new(0));
+    let seen = StdArc::clone(&witnessed);
+    run_model("load_after_publication", 8, move || {
+        freshness_model(false, &seen)
+    });
+    assert!(
+        witnessed.load(StdOrdering::Relaxed) > 0,
+        "no schedule ever had the reader learn of the publication"
+    );
+}
+
+/// RED: answering from a view loaded before the reader learned of the
+/// publication.
+#[test]
+fn a_reader_answering_from_an_earlier_load_is_caught() {
+    let witnessed = StdArc::new(StdAtomicUsize::new(0));
+    expect_violation("load_after_publication/cached_load", move || {
+        freshness_model(true, &witnessed)
+    });
 }

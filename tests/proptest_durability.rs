@@ -73,7 +73,6 @@
 //!
 //! ```sh
 //! cargo test --test proptest_durability
-//! cargo test --test proptest_durability -- --ignored --skip crash_child
 //! PROPTEST_CASES=512 cargo test --test proptest_durability
 //! ```
 
@@ -262,7 +261,7 @@ proptest! {
         let db = Db::open(dir.path(), opts(WRITE_BUFFER, DurabilityMode::Eventual))
             .map_err(|e| TestCaseError::fail(format!("reopen after drop failed: {e}")))?;
         compare(&db, &model).map_err(|e| TestCaseError::fail(format!("after reopen: {e}")))?;
-        db.compact_range(None, None).unwrap();
+        db.compact_range(None, None).wait().unwrap();
         compare(&db, &model)
             .map_err(|e| TestCaseError::fail(format!("after reopen and compaction: {e}")))?;
     }
@@ -297,7 +296,7 @@ proptest! {
                 pinned.push((db.snapshot(), model.clone(), i));
             }
         }
-        db.compact_range(None, None).unwrap();
+        db.compact_range(None, None).wait().unwrap();
 
         for (snap, want, i) in &pinned {
             let got = snap
@@ -349,7 +348,7 @@ proptest! {
         {
             let db = Db::open(dir.path(), opts(WRITE_BUFFER, DurabilityMode::Eventual)).unwrap();
             for (k, v) in &entries {
-                db.put(k, v).map_err(|e| TestCaseError::fail(e.to_string()))?;
+                regolith::through_stalls(|| db.put(k, v)).map_err(|e| TestCaseError::fail(e.to_string()))?;
                 model.insert(k.clone(), v.clone());
                 let got = db.get(k).map_err(|e| TestCaseError::fail(e.to_string()))?;
                 prop_assert_eq!(
@@ -364,7 +363,7 @@ proptest! {
         let db = Db::open(dir.path(), opts(WRITE_BUFFER, DurabilityMode::Eventual))
             .map_err(|e| TestCaseError::fail(format!("reopen failed: {e}")))?;
         compare_scan_only(&db, &model, "after reopen")?;
-        db.compact_range(None, None).unwrap();
+        db.compact_range(None, None).wait().unwrap();
         compare_scan_only(&db, &model, "after compaction")?;
     }
 
@@ -403,7 +402,7 @@ proptest! {
         sorted.sort();
         sorted.dedup();
         for k in &sorted {
-            db.put(k, b"v").map_err(|e| TestCaseError::fail(e.to_string()))?;
+            regolith::through_stalls(|| db.put(k, b"v")).map_err(|e| TestCaseError::fail(e.to_string()))?;
         }
 
         // A probe per key would make the case quadratic in iterator
@@ -422,7 +421,7 @@ proptest! {
         }
 
         check_order(&db, &sorted, &probes, "in the memtable")?;
-        db.compact_range(None, None).unwrap();
+        db.compact_range(None, None).wait().unwrap();
         check_order(&db, &sorted, &probes, "after compaction")?;
     }
 }
@@ -561,7 +560,7 @@ fn reverse_iteration_reaches_a_key_above_the_seek_to_last_probe() {
     let dir = TempDir::new().unwrap();
     let db = Db::open(dir.path(), opts(WRITE_BUFFER, DurabilityMode::Eventual)).unwrap();
     let key = [0xffu8, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01];
-    db.put(&key, b"v").unwrap();
+    regolith::through_stalls(|| db.put(&key, b"v")).unwrap();
 
     assert_eq!(db.get(&key).unwrap(), Some(b"v".to_vec()));
     assert_eq!(
@@ -595,8 +594,8 @@ fn reverse_iteration_over_the_probe_boundary_mirrors_the_forward_walk() {
     let db = Db::open(dir.path(), opts(WRITE_BUFFER, DurabilityMode::Eventual)).unwrap();
     let low = [0xffu8, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00];
     let high = [0xffu8, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01];
-    db.put(&low, b"l").unwrap();
-    db.put(&high, b"h").unwrap();
+    regolith::through_stalls(|| db.put(&low, b"l")).unwrap();
+    regolith::through_stalls(|| db.put(&high, b"h")).unwrap();
 
     let mut forward = Vec::new();
     let mut it = db.iter();

@@ -38,9 +38,13 @@ pub struct SstFileWriter {
 pub struct SstFileMeta {
     /// Path the file was written to.
     pub path: PathBuf,
-    /// Smallest user key in the file.
+    /// Lower bound of the file in storage order. A file can hold entries of
+    /// several column families ([`SstFileWriter::put_cf`]), so this is not
+    /// a key as the caller wrote it: it is the 4-byte big-endian id of a
+    /// column family, then the caller's key in that family.
     pub smallest_user_key: Vec<u8>,
-    /// Largest user key in the file.
+    /// Upper bound of the file in storage order, in the form of
+    /// [`SstFileMeta::smallest_user_key`].
     pub largest_user_key: Vec<u8>,
     /// Number of point entries written (puts + deletes).
     pub num_entries: u64,
@@ -306,6 +310,7 @@ mod tests {
         );
 
         db.ingest_external_files(&[sst_path], IngestOptions::default())
+            .wait()
             .unwrap();
 
         assert_eq!(db.get(b"apple").unwrap(), Some(b"red".to_vec()));
@@ -320,7 +325,7 @@ mod tests {
     fn test_ingest_overlap_lands_above_the_level_it_overlaps() {
         let (db, dir) = open_tmp();
         db.put(b"banana", b"old").unwrap();
-        db.compact_range(None, None).unwrap();
+        db.compact_range(None, None).wait().unwrap();
         let bottom = crate::engine::manifest::MAX_LEVELS - 1;
         assert_eq!(db.level_file_count(bottom), 1);
 
@@ -331,6 +336,7 @@ mod tests {
         );
 
         db.ingest_external_files(&[sst_path], IngestOptions::default())
+            .wait()
             .unwrap();
 
         assert_eq!(db.get(b"apple").unwrap(), Some(b"a".to_vec()));
@@ -346,13 +352,14 @@ mod tests {
         let (db, dir) = open_tmp();
         db.put(b"aaa", b"x").unwrap();
         db.put(b"bbb", b"y").unwrap();
-        db.compact_range(None, None).unwrap();
+        db.compact_range(None, None).wait().unwrap();
         let before_l0 = db.level_file_count(0);
 
         let sst_path = dir.path().join("external-disjoint.sst");
         build_sst(&sst_path, &[(b"mmm", Some(b"m")), (b"nnn", Some(b"n"))]);
 
         db.ingest_external_files(&[sst_path], IngestOptions::default())
+            .wait()
             .unwrap();
 
         assert_eq!(db.get(b"mmm").unwrap(), Some(b"m".to_vec()));
@@ -374,14 +381,14 @@ mod tests {
             ingest_behind: true,
             ..Default::default()
         };
-        assert!(db.ingest_external_files(&[sst_path], opts).is_err());
+        assert!(db.ingest_external_files(&[sst_path], opts).wait().is_err());
     }
 
     #[test]
     fn test_ingest_behind_forces_bottommost() {
         let (db, dir) = open_tmp();
         db.put(b"aaa", b"x").unwrap();
-        db.compact_range(None, None).unwrap();
+        db.compact_range(None, None).wait().unwrap();
 
         let sst_path = dir.path().join("external-behind-ok.sst");
         build_sst(&sst_path, &[(b"zzz", Some(b"z"))]);
@@ -390,7 +397,7 @@ mod tests {
             ingest_behind: true,
             ..Default::default()
         };
-        db.ingest_external_files(&[sst_path], opts).unwrap();
+        db.ingest_external_files(&[sst_path], opts).wait().unwrap();
 
         assert_eq!(db.get(b"zzz").unwrap(), Some(b"z".to_vec()));
         // Placed at the bottommost level - not L0.
@@ -418,6 +425,7 @@ mod tests {
         }
 
         db.ingest_external_files(&[sst_path], IngestOptions::default())
+            .wait()
             .unwrap();
 
         for (k, v) in &entries {
@@ -442,6 +450,7 @@ mod tests {
 
         let err = db
             .ingest_external_files(&[sst_path], IngestOptions::default())
+            .wait()
             .unwrap_err();
         drop(snap);
         let msg = format!("{err}");
@@ -461,7 +470,7 @@ mod tests {
             snapshot_consistency: false,
             ..Default::default()
         };
-        db.ingest_external_files(&[sst_path], opts).unwrap();
+        db.ingest_external_files(&[sst_path], opts).wait().unwrap();
 
         // Live db sees both.
         assert_eq!(db.get(b"a").unwrap(), Some(b"1".to_vec()));
@@ -476,14 +485,15 @@ mod tests {
     fn test_ingest_then_compact_range_merges() {
         let (db, dir) = open_tmp();
         db.put(b"aaa", b"old").unwrap();
-        db.compact_range(None, None).unwrap();
+        db.compact_range(None, None).wait().unwrap();
 
         let sst_path = dir.path().join("external-merge.sst");
         build_sst(&sst_path, &[(b"bbb", Some(b"b")), (b"ccc", Some(b"c"))]);
         db.ingest_external_files(&[sst_path], IngestOptions::default())
+            .wait()
             .unwrap();
 
-        db.compact_range(None, None).unwrap();
+        db.compact_range(None, None).wait().unwrap();
 
         assert_eq!(db.get(b"aaa").unwrap(), Some(b"old".to_vec()));
         assert_eq!(db.get(b"bbb").unwrap(), Some(b"b".to_vec()));

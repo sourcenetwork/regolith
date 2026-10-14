@@ -70,6 +70,8 @@ use super::internal_key::{
 use super::lookup_key::LookupKey;
 use super::manifest::Version;
 use super::memtable::MemTable;
+use super::merge_call::apply_merge;
+use super::prefix_call::PrefixProbe;
 use super::range_tombstone::{RangeTombstone, RangeTombstoneSet};
 use super::sstable::{LiveSst, SsTableBlockCursor, SsTableReader};
 use crate::DbSlice;
@@ -135,24 +137,26 @@ impl LevelIter {
         }
     }
 
-    /// Like [`seek`], but additionally consults the underlying
-    /// SSTable's prefix bloom filter (when present) and leaves the
-    /// level iterator empty if the file cannot contain any key with
-    /// the given prefix. Memtable levels always perform a normal seek.
-    fn seek_with_prefix_skip(&mut self, target: &[u8], prefix: &[u8]) -> io::Result<()> {
+    /// Like [`seek`], but additionally consults the prefix bloom filter
+    /// (when present) of each SSTable the seek would read, and leaves the
+    /// level iterator empty if no table of it can contain a key with the
+    /// prefix `probe` is for. A table ruled out this way is counted as a
+    /// useful bloom check. Memtable levels always perform a normal seek.
+    fn seek_with_prefix_skip(&mut self, target: &[u8], probe: &PrefixProbe) -> io::Result<()> {
         match self {
             Self::Memtable(it) => {
                 it.seek(target);
                 Ok(())
             }
             Self::SsTable(it) => {
-                if !it.reader.may_have_prefix(prefix, &it.cache)? {
+                if !it.reader.may_have_prefix(probe, &it.cache)? {
+                    it.cache.record_bloom_useful();
                     it.valid = false;
                     return Ok(());
                 }
                 it.seek(target)
             }
-            Self::LevelConcat(it) => it.seek(target),
+            Self::LevelConcat(it) => it.seek_with_prefix_skip(target, probe),
         }
     }
 
@@ -382,6 +386,11 @@ impl SsTableLevelIter {
         if let Some(block) = self.cache.get(self.reader.file_id, handle.offset) {
             return Ok(block);
         }
+        if super::io::scope::current().is_some() {
+            // A `CacheOnly` walk reads no span: the block alone goes to the
+            // walk's queue.
+            return self.reader.fetch_block(handle, &self.cache, None);
+        }
 
         // A handle comes out of the index, and an index read off a damaged
         // file can say anything: an offset near u64::MAX, a size that runs
@@ -403,7 +412,7 @@ impl SsTableLevelIter {
                 .clamp(handle.size, self.span_cap.max(handle.size));
             // Widen the next one: a walk earns its readahead by continuing.
             self.span_blocks = (self.span_blocks * 2).min(SCAN_SPAN_BLOCKS);
-            self.span = self.reader.read_span(handle.offset, want)?;
+            self.span = self.reader.read_span(handle, want, &self.cache)?;
             self.span_start = handle.offset;
             if (self.span.len() as u64) < handle.size {
                 // Ran into the end of the data area; the block is not
@@ -863,14 +872,44 @@ impl LevelConcatIter {
     }
 
     fn seek(&mut self, target: &[u8]) -> io::Result<()> {
-        if self.files.is_empty() {
-            self.current = None;
-            return Ok(());
-        }
         let uk = user_key_of(target);
         let idx = self
             .files
             .partition_point(|f| f.meta.largest_key.as_slice() < uk);
+        self.seek_from(idx, target)
+    }
+
+    /// [`seek`](Self::seek) for a prefix seek, whose `target` is the
+    /// smallest key of the prefix: a table whose prefix bloom rules the
+    /// prefix out is passed over unread, and counted as a useful bloom
+    /// check.
+    ///
+    /// The walk is bounded by the tables the prefix can be in. A level's
+    /// tables are in key order, so it ends at the first one that can hold
+    /// the prefix, and at the first one that starts past it, after which no
+    /// table holds it and the level is left empty.
+    fn seek_with_prefix_skip(&mut self, target: &[u8], probe: &PrefixProbe) -> io::Result<()> {
+        let prefix = user_key_of(target);
+        let mut idx = self
+            .files
+            .partition_point(|f| f.meta.largest_key.as_slice() < prefix);
+        while let Some(file) = self.files.get(idx) {
+            let smallest = file.meta.smallest_key.as_slice();
+            if smallest > prefix && !smallest.starts_with(prefix) {
+                idx = self.files.len();
+            } else if file.reader.may_have_prefix(probe, &self.cache)? {
+                break;
+            } else {
+                self.cache.record_bloom_useful();
+                idx += 1;
+            }
+        }
+        self.seek_from(idx, target)
+    }
+
+    /// Position at the first entry at or after `target` in the tables from
+    /// `idx` on.
+    fn seek_from(&mut self, idx: usize, target: &[u8]) -> io::Result<()> {
         if idx >= self.files.len() {
             self.current = None;
             return Ok(());
@@ -1027,9 +1066,9 @@ impl MergingIter {
         Ok(())
     }
 
-    fn seek_with_prefix_skip(&mut self, target: &[u8], prefix: &[u8]) -> io::Result<()> {
+    fn seek_with_prefix_skip(&mut self, target: &[u8], probe: &PrefixProbe) -> io::Result<()> {
         for lvl in &mut self.levels {
-            lvl.seek_with_prefix_skip(target, prefix)?;
+            lvl.seek_with_prefix_skip(target, probe)?;
         }
         self.pick_smallest();
         Ok(())
@@ -1179,8 +1218,8 @@ pub(crate) struct RegolithIterator {
     /// Prefix extractor captured at construction. Used by
     /// [`RegolithIterator::seek_prefix`] to derive the bloom probe for
     /// the caller's query prefix. If the extractor cannot produce a
-    /// prefix from the query itself, the iterator falls back to a
-    /// plain upper-bound scan without bloom skipping.
+    /// prefix from the query itself, the scan is a plain upper-bound
+    /// scan that rules no table out.
     prefix_extractor: Option<Arc<dyn PrefixExtractor>>,
     /// Optional merge operator. When `Some`, the iterator collapses
     /// merge chains encountered during materialization into a
@@ -1201,6 +1240,42 @@ pub(crate) struct RegolithIterator {
     /// already visited would otherwise stream duplicate keys forever,
     /// so a violation is reported as corruption instead of scanned.
     last_forward_user_key: Option<Vec<u8>>,
+    /// Keep what [`RegolithIterator::resume`] needs: set for a walk whose
+    /// reads can return `WouldBlock` (a `CacheOnly` one), so a `Blocking`
+    /// walk pays nothing for it.
+    track: bool,
+    /// The key the cursor sat on when the step in flight began, kept only
+    /// while `track` is set and reused across steps.
+    step_from: Vec<u8>,
+    /// The operation a `WouldBlock` interrupted, to run again on `resume`.
+    resume: Option<Resume>,
+}
+
+/// What [`RegolithIterator::resume`] runs again. A seek is run as it was
+/// called. A step is run as the seek that lands where the step would have:
+/// past the key the cursor sat on, keeping the forward bound the step kept.
+/// The view is pinned, so either lands exactly where the interrupted call
+/// would have, and nothing is skipped or seen twice.
+enum Resume {
+    First,
+    Last,
+    Seek {
+        target: Vec<u8>,
+        upper: Option<Vec<u8>>,
+    },
+    ForPrev(Vec<u8>),
+    LastBefore(Vec<u8>),
+    Prefix(Vec<u8>),
+    /// `next()` from the key held: the first visible key above it.
+    After {
+        key: Vec<u8>,
+        upper: Option<Vec<u8>>,
+    },
+    /// `prev()` from the key held: the last visible key below it.
+    Before {
+        key: Vec<u8>,
+        upper: Option<Vec<u8>>,
+    },
 }
 
 /// Compute the exclusive upper bound of all keys that start with
@@ -1321,7 +1396,94 @@ impl RegolithIterator {
             merge_operator,
             pending_consume: false,
             last_forward_user_key: None,
+            track: false,
+            step_from: Vec::new(),
+            resume: None,
         }
+    }
+
+    /// Keep what a resume needs from now on, for a walk whose reads can
+    /// return `WouldBlock`.
+    pub(crate) fn track_resume(&mut self, on: bool) {
+        self.track = on;
+    }
+
+    /// The last operation stopped on a `WouldBlock`.
+    fn blocked(&self) -> bool {
+        self.error
+            .as_ref()
+            .is_some_and(crate::io_queue::wait::is_would_block)
+    }
+
+    /// When the operation that just ran stopped on a `WouldBlock`, keep what
+    /// runs it again.
+    fn note(&mut self, resume: impl FnOnce(&Self) -> Resume) {
+        self.resume = self.blocked().then(|| resume(self));
+    }
+
+    /// Hold the key the cursor sits on before a step, for a walk that
+    /// tracks resumes.
+    fn mark_step(&mut self) {
+        if !self.track {
+            return;
+        }
+        let mut from = std::mem::take(&mut self.step_from);
+        from.clear();
+        if let Some(key) = self.key() {
+            from.extend_from_slice(key);
+        }
+        self.step_from = from;
+    }
+
+    /// Run again the operation a `WouldBlock` interrupted, after its queue
+    /// was polled. The walk continues exactly where the interrupted call
+    /// would have left it. Does nothing when the last operation did not stop
+    /// on a `WouldBlock`.
+    pub(crate) fn resume(&mut self) {
+        if !self.blocked() {
+            return;
+        }
+        let Some(resume) = self.resume.take() else {
+            return;
+        };
+        match resume {
+            Resume::First => self.seek_to_first(),
+            Resume::Last => self.seek_to_last(),
+            Resume::Seek { target, upper } => self.seek_below(&target, upper),
+            Resume::ForPrev(target) => self.seek_for_prev(&target),
+            Resume::LastBefore(bound) => self.seek_to_last_before(&bound),
+            Resume::Prefix(prefix) => self.seek_prefix(&prefix),
+            Resume::After { key, upper } => self.resume_after(key, upper),
+            Resume::Before { key, upper } => {
+                self.seek_to_last_before(&key);
+                // A step keeps the bound a seek clears.
+                self.upper_bound = upper.clone();
+                self.note(|_| Resume::Before { key, upper });
+            }
+        }
+    }
+
+    /// Land on the first visible key above `key`, as a `next()` from `key`
+    /// does, keeping the forward bound `upper`.
+    fn resume_after(&mut self, key: Vec<u8>, upper: Option<Vec<u8>>) {
+        self.error = None;
+        self.valid_entry = false;
+        self.merge_result = None;
+        self.reverse_curr = None;
+        self.pending_consume = false;
+        self.upper_bound = upper;
+        self.direction = Direction::Forward;
+        if let Err(e) = self.inner.seek(&above_all_versions(&key)) {
+            self.error = Some(e);
+        } else {
+            // Armed with the last key handed out, as after a step.
+            self.last_forward_user_key = Some(key.clone());
+            self.materialize_next_visible();
+        }
+        self.note(|it| Resume::After {
+            key,
+            upper: it.upper_bound.clone(),
+        });
     }
 
     /// Largest seq of any range tombstone covering `user_key` that is
@@ -1354,9 +1516,10 @@ impl RegolithIterator {
         self.direction = Direction::Forward;
         if let Err(e) = self.inner.seek_to_first() {
             self.error = Some(e);
-            return;
+        } else {
+            self.materialize_next_visible();
         }
-        self.materialize_next_visible();
+        self.note(|_| Resume::First);
     }
 
     pub(crate) fn seek_to_last(&mut self) {
@@ -1374,9 +1537,10 @@ impl RegolithIterator {
         self.direction = Direction::Reverse;
         if let Err(e) = self.inner.seek_to_last() {
             self.error = Some(e);
-            return;
+        } else {
+            self.materialize_prev_visible();
         }
-        self.materialize_prev_visible();
+        self.note(|_| Resume::Last);
     }
 
     pub(crate) fn seek(&mut self, target: &[u8]) {
@@ -1410,9 +1574,13 @@ impl RegolithIterator {
         let search_key = LookupKey::from_prefixed(target, u64::MAX);
         if let Err(e) = self.inner.seek(search_key.internal()) {
             self.error = Some(e);
-            return;
+        } else {
+            self.materialize_next_visible();
         }
-        self.materialize_next_visible();
+        self.note(|it| Resume::Seek {
+            target: target.to_vec(),
+            upper: it.upper_bound.clone(),
+        });
     }
 
     pub(crate) fn seek_for_prev(&mut self, target: &[u8]) {
@@ -1437,9 +1605,10 @@ impl RegolithIterator {
         let probe = above_all_versions(target);
         if let Err(e) = self.inner.seek_for_prev(&probe) {
             self.error = Some(e);
-            return;
+        } else {
+            self.materialize_prev_visible();
         }
-        self.materialize_prev_visible();
+        self.note(|_| Resume::ForPrev(target.to_vec()));
     }
 
     /// Position the iterator at the first user key `>= prefix` and
@@ -1474,6 +1643,11 @@ impl RegolithIterator {
         // 00`, the smallest internal key any entry for user key `bound`
         // could carry. Every internal key strictly below it belongs to
         // a user key strictly below `bound`, whatever its length.
+        self.seek_last_below(exclusive_upper);
+        self.note(|_| Resume::LastBefore(exclusive_upper.to_vec()));
+    }
+
+    fn seek_last_below(&mut self, exclusive_upper: &[u8]) {
         let probe = encode_internal_key(exclusive_upper, u64::MAX, VALUE_TYPE_DELETION);
         if let Err(e) = self.inner.seek_for_prev(&probe) {
             self.error = Some(e);
@@ -1514,52 +1688,96 @@ impl RegolithIterator {
         // derive the same kind of bloom key from the query prefix that
         // was indexed for table keys. This lets a fixed-length
         // extractor skip whole files for longer prefixes that share
-        // the indexed stem.
-        let bloom_probe = self
-            .prefix_extractor
-            .as_ref()
-            .and_then(|ex| ex.extract_query(prefix).map(|p| p.to_vec()));
-
+        // the indexed stem. Each table is asked in the form its own
+        // prefix bloom was built in.
         let search_key = LookupKey::from_prefixed(prefix, u64::MAX);
-        let res = if let Some(probe) = bloom_probe.as_deref() {
-            self.inner
-                .seek_with_prefix_skip(search_key.internal(), probe)
-        } else {
-            self.inner.seek(search_key.internal())
+        let res = match self.prefix_extractor.as_deref() {
+            Some(extractor) => self
+                .inner
+                .seek_with_prefix_skip(search_key.internal(), &PrefixProbe::new(extractor, prefix)),
+            None => self.inner.seek(search_key.internal()),
         };
         if let Err(e) = res {
             self.error = Some(e);
-            return;
+        } else {
+            self.materialize_next_visible();
         }
-        self.materialize_next_visible();
+        self.note(|_| Resume::Prefix(prefix.to_vec()));
     }
 
     pub(crate) fn next(&mut self) {
         if !self.valid() {
             return;
         }
+        self.mark_step();
+        self.step_forward();
+        self.note(|it| Resume::After {
+            key: it.step_from.clone(),
+            upper: it.upper_bound.clone(),
+        });
+    }
+
+    /// The body of `next`. Each part stops at the first failed read: the
+    /// merge is then half moved, and walking on would report the wreck (a
+    /// key seen twice reads as corruption) instead of the failure.
+    fn step_forward(&mut self) {
         if self.direction == Direction::Reverse {
             self.flip_to_forward();
+            if self.stopped() {
+                return;
+            }
         }
         self.merge_result = None;
         if self.pending_consume {
             self.consume_curr_user_key_forward();
             self.pending_consume = false;
+            if self.stopped() {
+                return;
+            }
         }
         self.materialize_next_visible();
+    }
+
+    /// Whether the last read failed. If so the cursor leaves its entry, so
+    /// nothing reads the half-moved merge as a position.
+    fn stopped(&mut self) -> bool {
+        if self.error.is_none() {
+            return false;
+        }
+        self.valid_entry = false;
+        self.merge_result = None;
+        self.reverse_curr = None;
+        true
     }
 
     pub(crate) fn prev(&mut self) {
         if !self.valid() {
             return;
         }
+        self.mark_step();
+        self.step_backward();
+        self.note(|it| Resume::Before {
+            key: it.step_from.clone(),
+            upper: it.upper_bound.clone(),
+        });
+    }
+
+    /// The body of `prev`, stopping at the first failed read as
+    /// `step_forward` does.
+    fn step_backward(&mut self) {
         if self.pending_consume {
             self.consume_curr_user_key_forward();
             self.pending_consume = false;
+            if self.stopped() {
+                return;
+            }
         }
         self.merge_result = None;
         if self.direction == Direction::Forward {
             self.flip_to_reverse();
+            if self.stopped() {
+                return;
+            }
         }
         self.reverse_curr = None;
         self.materialize_prev_visible();
@@ -1727,6 +1945,9 @@ impl RegolithIterator {
                 self.curr_user_key.clear();
                 self.curr_user_key.extend_from_slice(uk);
                 self.consume_curr_user_key_forward();
+                if self.error.is_some() {
+                    return;
+                }
                 continue;
             }
             match vt {
@@ -1734,11 +1955,16 @@ impl RegolithIterator {
                     self.curr_user_key.clear();
                     self.curr_user_key.extend_from_slice(uk);
                     self.consume_curr_user_key_forward();
+                    if self.error.is_some() {
+                        return;
+                    }
                     continue;
                 }
                 VALUE_TYPE_MERGE => {
                     let uk_owned = uk.to_vec();
                     match self.collapse_merge_chain_forward(&uk_owned, rt_seq) {
+                        // A read under the chain failed part way.
+                        Ok(_) if self.error.is_some() => return,
                         Ok(Some(v)) => {
                             self.curr_user_key.clear();
                             self.curr_user_key.extend_from_slice(&uk_owned);
@@ -1872,13 +2098,7 @@ impl RegolithIterator {
             .rev()
             .map(|v| v.as_slice())
             .collect();
-        match merge_op.full_merge(user_key, base.as_deref(), &operand_refs) {
-            Some(v) => Ok(Some(v)),
-            None => Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("merge operator {} failed", merge_op.name()),
-            )),
-        }
+        apply_merge(merge_op.as_ref(), user_key, base.as_deref(), &operand_refs).map(Some)
     }
 
     /// Walk the merging iterator **backward** until we find a user key
@@ -1955,16 +2175,13 @@ impl RegolithIterator {
             };
             let operand_refs: Vec<&[u8]> = operand_slice.iter().map(|e| e.2.as_slice()).collect();
             let base_bytes = base.as_ref().map(DbSlice::as_slice);
-            match merge_op.full_merge(&group, base_bytes, &operand_refs) {
-                Some(v) => {
+            match apply_merge(merge_op.as_ref(), &group, base_bytes, &operand_refs) {
+                Ok(v) => {
                     self.reverse_curr = Some((group, DbSlice::from_vec(v)));
                     return;
                 }
-                None => {
-                    self.error = Some(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("merge operator {} failed", merge_op.name()),
-                    ));
+                Err(declined) => {
+                    self.error = Some(declined);
                     self.reverse_curr = None;
                     return;
                 }

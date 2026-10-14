@@ -1,10 +1,12 @@
-//! Models of `engine::skiplist`: one writer publishing nodes
-//! against concurrent readers, and the two-step seek that must not be.
+//! Models of `engine::skiplist`: writers publishing nodes against
+//! concurrent readers and against each other, and the two-step seek that
+//! must not be.
 
 use loom::sync::Arc;
+use loom::sync::atomic::{AtomicUsize, Ordering};
 
 use super::super::internal_key::{VALUE_TYPE_VALUE, decode_internal_key, user_key_of};
-use super::{explore, memtable, probe};
+use super::{explore, explore_bounded, memtable, probe};
 
 /// Invariants S1, S3 and S7: an insert publishes a whole node and never
 /// hides one that is already published.
@@ -252,30 +254,32 @@ pub fn the_two_step_seek_loses_a_key_that_is_present() {
     );
 }
 
-/// Invariants S2 and S5 under the engine's own serialization: two
-/// writers taking a lock in turn, as the commit pipeline makes them, put
-/// two versions of one key while a reader walks it.
+/// Invariants S2 and S5 with nothing serializing the writers: two threads
+/// put two versions of one key at once, as two helpers of the commit
+/// pipeline apply two slots, while a reader walks it.
 ///
 /// The reader may legally see nothing, the older version or the newer
 /// one; what it must never see is a value belonging to the other
 /// sequence, or a key that decodes to something else. After the join
-/// both versions are present, newest sequence first.
-pub fn two_serialized_writers_and_a_reader_share_one_key() {
-    explore(
-        "two_serialized_writers_and_a_reader_share_one_key",
-        1_000,
+/// both versions are present, newest sequence first: neither insert lost
+/// its link to the other's compare-and-swap.
+///
+/// Bound: 2 preemptions (three threads). Unbounded, three threads each
+/// walking a twelve-level tower do not finish.
+pub fn two_writers_and_a_reader_share_one_key() {
+    explore_bounded(
+        "two_writers_and_a_reader_share_one_key",
+        Some(2),
         100,
+        1,
         |witness| {
             let mt = Arc::new(memtable());
-            let pipeline = Arc::new(loom::sync::Mutex::new(()));
 
             let writers: Vec<_> = [(1u64, &b"v1"[..]), (2, b"v2")]
                 .into_iter()
                 .map(|(seq, value)| {
                     let mt = Arc::clone(&mt);
-                    let pipeline = Arc::clone(&pipeline);
                     loom::thread::spawn(move || {
-                        let _lock = pipeline.lock().expect("pipeline");
                         mt.put(probe(b"k").prefixed_user_key(), value, seq);
                     })
                 })
@@ -305,7 +309,7 @@ pub fn two_serialized_writers_and_a_reader_share_one_key() {
             reader.join().expect("reader");
 
             let entries = mt.iter_internal();
-            assert_eq!(entries.len(), 2, "S2: one entry per serialized insert");
+            assert_eq!(entries.len(), 2, "S2: an insert was lost, or held twice");
             let decoded: Vec<_> = entries
                 .iter()
                 .map(|(key, value)| {
@@ -325,54 +329,86 @@ pub fn two_serialized_writers_and_a_reader_share_one_key() {
     );
 }
 
-/// Calibration for invariant S2: the guard that enforces "exactly one
-/// thread inside `insert`" really fires when the contract is broken.
+/// Invariant S2, insert if absent: two threads insert the same key at the
+/// same sequence at once, as two helpers applying one slot of the commit
+/// pipeline do. The list holds the entry once, whichever insert linked it,
+/// and the other insert reports it held. One of the two goes through a
+/// hint, the batch path, so both entry points keep the rule.
 ///
-/// S2 is a contract the engine has to keep, not something the skip list
-/// can enforce for free, so what is checkable is the detector. Two
-/// writers insert with nothing serializing them; loom finds the schedule
-/// where the second enters `insert` before the first has left, and the
-/// guard's `debug_assert` must trip. Nothing races past it: the guard is
-/// the first thing `insert` does, so the losing thread never touches a
-/// node.
-///
-/// Only a debug build has the guard, so only a debug build has this
-/// model. `tests/loom_memtable.rs` gates the test the same way.
-///
-/// The second writer goes through a hint (`insert_hint` + `put_hinted`)
-/// rather than plain `put`, so the calibration proves the hinted entry
-/// point is guarded by the same S2 check as the plain one: the guard is
-/// the first thing `insert_inner` does regardless of which caller reached
-/// it.
-#[cfg(debug_assertions)]
-pub fn an_unserialized_insert_trips_the_single_writer_guard() {
-    explore(
-        "an_unserialized_insert_trips_the_single_writer_guard",
-        2,
+/// Bound: 3 preemptions.
+pub fn two_writers_of_one_entry_hold_it_once() {
+    explore_bounded(
+        "two_writers_of_one_entry_hold_it_once",
+        Some(3),
+        16,
         1,
         |witness| {
             let mt = Arc::new(memtable());
-            witness.record();
-
             let first = {
                 let mt = Arc::clone(&mt);
                 loom::thread::spawn(move || {
-                    mt.put(probe(b"k").prefixed_user_key(), b"v1", 1);
+                    mt.put(probe(b"k").prefixed_user_key(), b"v", 1);
                 })
             };
             let second = {
                 let mt = Arc::clone(&mt);
                 loom::thread::spawn(move || {
                     let mut hint = mt.insert_hint();
-                    mt.put_hinted(&mut hint, probe(b"k").prefixed_user_key(), b"v2", 2);
+                    mt.put_hinted(&mut hint, probe(b"k").prefixed_user_key(), b"v", 1);
                 })
             };
+            first.join().expect("first");
+            second.join().expect("second");
+            witness.record();
 
-            for writer in [first, second] {
-                if let Err(payload) = writer.join() {
-                    std::panic::resume_unwind(payload);
-                }
+            let entries = mt.iter_internal();
+            assert_eq!(entries.len(), 1, "S2: one entry was linked twice");
+            let (seq, value) = mt.get(&probe(b"k")).expect("the entry is present");
+            assert_eq!(seq, 1);
+            assert_eq!(value.expect("a live value").as_slice(), b"v");
+        },
+    );
+}
+
+/// Calibration for [`two_writers_and_a_reader_share_one_key`]: a list whose
+/// head is linked by a load and a store. Two inserts read the same head,
+/// each points its node at it, and the second store unlinks the first
+/// insert's node.
+pub fn a_link_stored_without_a_compare_and_swap_loses_an_insert() {
+    explore_bounded(
+        "a_link_stored_without_a_compare_and_swap_loses_an_insert",
+        Some(3),
+        2,
+        1,
+        |witness| {
+            // Node ids 1 and 2; 0 is the end of the list.
+            let head = Arc::new(AtomicUsize::new(0));
+            let next = Arc::new([
+                AtomicUsize::new(0),
+                AtomicUsize::new(0),
+                AtomicUsize::new(0),
+            ]);
+            let writers: Vec<_> = (1..=2usize)
+                .map(|node| {
+                    let (head, next) = (Arc::clone(&head), Arc::clone(&next));
+                    loom::thread::spawn(move || {
+                        let first = head.load(Ordering::Acquire);
+                        next[node].store(first, Ordering::Release);
+                        head.store(node, Ordering::Release);
+                    })
+                })
+                .collect();
+            for writer in writers {
+                writer.join().expect("writer");
             }
+            witness.record();
+            let mut linked = 0;
+            let mut at = head.load(Ordering::Acquire);
+            while at != 0 {
+                linked += 1;
+                at = next[at].load(Ordering::Acquire);
+            }
+            assert_eq!(linked, 2, "an insert was lost");
         },
     );
 }

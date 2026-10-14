@@ -105,7 +105,7 @@ fn immediate_every_tear_at_every_cut_keeps_every_acknowledged_write() {
             let on_disk = std::fs::read(&wal).unwrap();
             let (opts, reports, stats) = reporting(out.spec.options());
             match fault::recover_and_validate(&db, opts, &out.history) {
-                Recovery::Recovered(r) => fault::assert_acked_survived(&r, &out.acked),
+                Recovery::Recovered(r) => fault::assert_acked_survived(&r, &out.acked()),
                 Recovery::RefusedToOpen(e) => {
                     failures.push(format!("{tear:?} at write {nth}: refused: {e}"));
                     continue;
@@ -246,7 +246,7 @@ fn a_whole_final_record_with_garbage_after_it_opens_as_a_tail() {
 
         let (opts, reports, _) = reporting(out.spec.options());
         match fault::recover_and_validate(&db, opts, &out.history) {
-            Recovery::Recovered(r) => fault::assert_acked_survived(&r, &out.acked),
+            Recovery::Recovered(r) => fault::assert_acked_survived(&r, &out.acked()),
             Recovery::RefusedToOpen(e) => panic!("at write {nth}: refused: {e}"),
         }
         let taken = reports.taken();
@@ -277,6 +277,8 @@ fn residual_damage_in_the_last_synced_group_is_reported_never_silent() {
         let out = crash(spec, Trigger::wal_write(nth), TearMode::Truncate);
         let wal = fault::newest_wal(&db);
         let pristine = std::fs::read(&wal).unwrap();
+        let manifest = db.join("MANIFEST");
+        let pristine_manifest = std::fs::read(&manifest).unwrap();
         let bounds = wal_format::record_bounds(&pristine);
         assert!(bounds.len() >= 3, "write {nth}: needs two whole groups");
         let last = bounds[bounds.len() - 2];
@@ -300,11 +302,13 @@ fn residual_damage_in_the_last_synced_group_is_reported_never_silent() {
         assert_eq!(taken[0].offset, last as u64);
         assert_eq!(stats.get_ticker(Ticker::WalTailDiscarded), 1);
 
-        // Reopening dropped and truncated it; plant the rot one group
-        // earlier in the pristine log instead.
+        // Reopening dropped and truncated it, and recorded the log as
+        // retired in the manifest; plant the rot one group earlier in the
+        // pristine log, beside the pristine manifest, instead.
         let mut rotted = pristine.clone();
         rotted[before + wal_format::HEADER_LEN + 2] ^= 0x10;
         std::fs::write(&wal, &rotted).unwrap();
+        std::fs::write(&manifest, &pristine_manifest).unwrap();
         for extra in fault::find_wals(&db) {
             if extra != wal {
                 std::fs::remove_file(extra).unwrap();
@@ -398,7 +402,7 @@ fn red_no_truncate_the_dropped_tail_is_truncated_durably_before_the_next_log() {
         "both logs survive the cut"
     );
     match fault::recover_and_validate(&db, first.spec.options(), &first.history) {
-        Recovery::Recovered(r) => fault::assert_acked_survived(&r, &first.acked),
+        Recovery::Recovered(r) => fault::assert_acked_survived(&r, &first.acked()),
         Recovery::RefusedToOpen(e) => {
             panic!("the truncated log must replay as an earlier log: {e}")
         }

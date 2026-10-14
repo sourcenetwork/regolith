@@ -202,9 +202,22 @@ impl Options {
     /// is synchronous on the firing thread - listeners **must not
     /// block or re-enter the database**. See
     /// [`crate::EventListener`] for the full contract.
+    ///
+    /// Replaces every listener set before. To keep them, use
+    /// [`Options::add_listener`].
     #[must_use]
     pub fn listeners(mut self, listeners: Vec<Arc<dyn crate::EventListener>>) -> Self {
         self.listeners = listeners;
+        self
+    }
+
+    /// Add one event listener after the ones already set, keeping them:
+    /// for a caller handed an [`Options`] that may carry listeners of its
+    /// own. Listeners are told of an event in the order they were set and
+    /// added. [`Options::listeners`] replaces the list instead.
+    #[must_use]
+    pub fn add_listener(mut self, listener: Arc<dyn crate::EventListener>) -> Self {
+        self.listeners.push(listener);
         self
     }
 
@@ -266,18 +279,20 @@ impl Options {
         self
     }
 
-    /// Start slowing foreground writes when the number of L0
-    /// SSTables reaches this threshold. Each affected write
-    /// incurs a small fixed delay, back-pressuring callers so
-    /// background compaction can catch up. `0` disables this
+    /// The number of L0 SSTables from which writes are slowed. No write is
+    /// ever delayed. At or past this count two things change: a write
+    /// that set [`crate::WriteOptions::no_slowdown`] is refused with
+    /// [`crate::Error::Busy`], and on a database with no compaction worker
+    /// and [`Options::inline_compaction`] on, each write runs one step of
+    /// the flush or compaction that is due. `0` disables this
     /// trigger. If both L0 triggers are enabled, this must be <=
     /// [`Options::level0_stop_writes_trigger`]. Default: 20.
     ///
     /// Level-style, with the same caveat as
     /// [`Options::level0_stop_writes_trigger`]: under FIFO and
     /// universal compaction the L0 file count is not what the picker
-    /// reduces, so this delay can become permanent rather than
-    /// transient.
+    /// reduces, so the count can stay at or past this threshold for
+    /// good.
     #[must_use]
     pub fn level0_slowdown_writes_trigger(mut self, level0_slowdown_writes_trigger: usize) -> Self {
         self.level0_slowdown_writes_trigger = level0_slowdown_writes_trigger;
@@ -285,9 +300,10 @@ impl Options {
     }
 
     /// Stop foreground writes entirely when the number of L0
-    /// SSTables reaches this threshold. Writers block on a
-    /// condvar that compaction notifies once it reduces the
-    /// count below the slowdown trigger. Plain writes, column-family
+    /// SSTables reaches this threshold. A stopped write applies nothing
+    /// and returns [`crate::Error::WouldBlock`] with a
+    /// [`crate::StallWait`], which completes once compaction has brought
+    /// the count back under the threshold. Plain writes, column-family
     /// writes (including creating and dropping a column family) and
     /// transactional commits that carry writes are stopped alike.
     /// `0` disables this trigger. Default: 36.
@@ -314,9 +330,12 @@ impl Options {
         self
     }
 
-    /// Start slowing writes when total bytes in L0 (regolith's
-    /// approximation of "pending compaction bytes") reach this
-    /// limit. `0` disables this trigger. If both pending-byte
+    /// The total bytes in L0 (regolith's approximation of "pending
+    /// compaction bytes") from which writes are slowed, exactly as
+    /// [`Options::level0_slowdown_writes_trigger`] slows them: no write
+    /// is delayed, a [`crate::WriteOptions::no_slowdown`] write is
+    /// refused, and with no worker and inline compaction on each write
+    /// runs one step. `0` disables this trigger. If both pending-byte
     /// triggers are enabled, this must be <=
     /// [`Options::hard_pending_compaction_bytes_limit`].
     /// Default: 64 GB.
@@ -329,7 +348,8 @@ impl Options {
         self
     }
 
-    /// Stop writes when total bytes in L0 reach this limit. `0`
+    /// Stop writes when total bytes in L0 reach this limit, as
+    /// [`Options::level0_stop_writes_trigger`] stops them. `0`
     /// disables this trigger. Default: 256 GB.
     #[must_use]
     pub fn hard_pending_compaction_bytes_limit(
@@ -340,10 +360,19 @@ impl Options {
         self
     }
 
-    /// Soft cap on the number of in-memory memtables (active +
-    /// frozen). Reaching this count slows writes; reaching
-    /// `2 * max_write_buffer_number` stops them. `0` disables
-    /// this trigger. Default: 2.
+    /// Cap on the number of in-memory memtables (active + frozen).
+    ///
+    /// A write that fills the active memtable seals it, and the
+    /// background writes it out to a table: the compaction worker, or,
+    /// with none, the write that sealed it once it has committed. When
+    /// the flushes before it have not finished and one more sealed
+    /// memtable would pass this count, the write that fills the active
+    /// memtable writes the oldest out first, so a rotation never leaves
+    /// more than this many. `1` writes every sealed memtable out in the
+    /// write that sealed it. Memtables that cannot be written out (a
+    /// failing flush) still count: past this count writes slow down, and
+    /// at `2 * max_write_buffer_number` they stop. `0` disables the cap
+    /// and both triggers. Default: 2.
     #[must_use]
     pub fn max_write_buffer_number(mut self, max_write_buffer_number: usize) -> Self {
         self.max_write_buffer_number = max_write_buffer_number;
@@ -383,13 +412,13 @@ impl Options {
     /// Number of background threads available for compaction.
     ///
     /// `0` starts no background worker at all. Compaction then runs
-    /// on whichever thread asks for it: a writer that reaches a
-    /// write-stall threshold performs a compaction job itself before
-    /// retrying instead of parking on a condvar nobody would ever
-    /// signal. This is the only mode that works on a single-threaded
-    /// host such as `wasm32-wasip1`, where `std::thread::spawn`
-    /// reports [`std::io::ErrorKind::Unsupported`], and it is what
-    /// [`Options::embedded`] selects.
+    /// on whichever thread asks for it: unless
+    /// [`Options::inline_compaction`] was turned off, a writer that
+    /// reaches a write-stall threshold runs the compaction that relieves
+    /// it itself, since nothing else would. This is the only mode that
+    /// works on a single-threaded host such as `wasm32-wasip1`, where
+    /// `std::thread::spawn` reports [`std::io::ErrorKind::Unsupported`],
+    /// and it is what [`Options::embedded`] selects.
     ///
     /// When `> 1`, multiple non-overlapping compaction jobs can
     /// run concurrently (e.g. L1→L2 at key range `[a,m)` on one
@@ -406,6 +435,68 @@ impl Options {
     #[must_use]
     pub fn max_background_compactions(mut self, max_background_compactions: usize) -> Self {
         self.max_background_compactions = max_background_compactions;
+        self
+    }
+
+    /// Hand the active write-ahead log to the host's writeback as it fills,
+    /// on a thread of its own, so that the rotation that seals it has little
+    /// left to sync. Off by default.
+    ///
+    /// A rotation makes the log it seals durable before the next log exists,
+    /// inside the step every writer of the database waits on, so syncing a
+    /// whole write buffer's worth of log stalls every writer. With this on,
+    /// each time the log grows by an eighth of [`Options::write_buffer_size`]
+    /// (at least 1 MiB) the thread starts the writeback of what was written,
+    /// and the rotation syncs about that eighth. On Linux the writeback is
+    /// started with `sync_file_range`. On Apple, where the rotation's sync is
+    /// `F_FULLFSYNC` (the pages and the drive's cache), it is a plain `fsync`,
+    /// which writes the pages without the cache flush; an error it gets is
+    /// reported by the log's next sync. Measured on one Linux machine (NVMe,
+    /// btrfs with compression, 32 MiB write buffer): the rotation's stall
+    /// went from about 14 to 24 ms to about 2.5 ms. Not measured on Apple.
+    /// Durability is unchanged: the writeback makes nothing durable, the
+    /// sync at the rotation still does.
+    ///
+    /// It starts one extra thread, named `regolith-log-writeback`, through
+    /// [`Options::env`], only on Linux and Apple targets, and only when a
+    /// compaction worker runs ([`Options::max_background_compactions`] above
+    /// `0`). The database's thread budget then grows by one. Elsewhere it is
+    /// accepted and does nothing.
+    #[must_use]
+    pub fn log_writeback(mut self, log_writeback: bool) -> Self {
+        self.log_writeback = log_writeback;
+        self
+    }
+
+    /// With no compaction worker ([`Options::max_background_compactions`]
+    /// `0`), whether a write a stall stopped runs the step that relieves it.
+    /// Left unset, it is on for a database with no worker, which could not
+    /// relieve its own stalls otherwise, and off for one that has a worker.
+    ///
+    /// A write stopped by a stall threshold never waits: it applies nothing
+    /// and returns [`crate::Error::WouldBlock`] with a
+    /// [`crate::StallWait`]. With a worker, the worker's flushes and
+    /// compactions clear the stall. With none, nothing clears it unless a
+    /// caller compacts, and this option says who:
+    ///
+    /// - **On.** The stopped write leaves the step (one flush or one
+    ///   compaction pass) on its thread's [`crate::IoQueue`], run at that
+    ///   queue's polls, one per poll, until the stall clears; a thread with
+    ///   no queue runs the steps inline instead, bounded, and its write goes
+    ///   on once they cleared the stall. A slowed write, under a slowdown
+    ///   threshold, owes one step the same way.
+    /// - **Off**, said explicitly: you drive compaction. A stopped write
+    ///   returns its wait, which completes once you cleared the stall with
+    ///   [`crate::Db::compact_step`] or [`crate::Db::flush`]. A transaction's
+    ///   blocking commit is the one writer that still relieves a stop
+    ///   itself, with as many steps as the stop needs and no more, because
+    ///   it cannot be made again and has nobody to wait for; commit with
+    ///   [`crate::Transaction::commit_nowait`] to keep the thread free.
+    ///
+    /// Ignored when a worker runs.
+    #[must_use]
+    pub fn inline_compaction(mut self, inline_compaction: bool) -> Self {
+        self.inline_compaction = Some(inline_compaction);
         self
     }
 
@@ -580,8 +671,31 @@ impl Options {
     /// fails with EMFILE. With a limit, the least recently read tables
     /// have their descriptor closed and reopened on the next read; a
     /// read that misses the block cache on such a table pays an `open`.
-    /// The limit is soft: tables a compaction has just deleted stay open
-    /// until no snapshot or iterator can read them.
+    ///
+    /// The limit is hard: SSTable descriptors never number more than
+    /// `max_open_files`, and none is closed while a read uses it. A table
+    /// a compaction deletes while a snapshot or iterator still reads it is
+    /// renamed aside rather than unlinked, so its descriptor stays closable
+    /// and reopens under the new name; the last reader unlinks it, and a
+    /// crash leaves it for the next writable open to remove.
+    ///
+    /// When more threads read distinct tables at once than there are
+    /// descriptors, what a read does depends on its
+    /// [`ReadMode`](crate::ReadMode):
+    ///
+    /// - A `Blocking` read, which chose to block, may wait for the reads
+    ///   running on one descriptor to finish, and then reopens its table
+    ///   there.
+    /// - A `CacheOnly` read never waits. It never reopens a table itself:
+    ///   its miss goes to its I/O queue like any other device read. When the
+    ///   queue's [`poll`](crate::IoQueue::poll) runs that read and finds
+    ///   every descriptor in use by reads running on other threads, the read
+    ///   stays pending on the queue and the poll returns. The first of those
+    ///   reads to finish tells the queue, waking its owner if it registered
+    ///   [`idle_waker`](crate::IoQueue::idle_waker), and the next poll runs
+    ///   the read again. A pending read is retried each time a descriptor
+    ///   frees, but `Blocking` reads that claim the freed descriptor first
+    ///   can keep it pending for as long as they do.
     #[must_use]
     pub fn max_open_files(mut self, max_open_files: usize) -> Self {
         self.max_open_files = max_open_files;
@@ -593,7 +707,6 @@ impl Options {
 mod tests {
     use super::*;
     use crate::rate_limiter::TokenBucketRateLimiter;
-    use std::time::Duration;
 
     struct KeepAll;
 
@@ -702,13 +815,12 @@ mod tests {
             .statistics(Some(Arc::new(crate::Statistics::new())))
             .rate_limiter(Some(Arc::new(TokenBucketRateLimiter::new(
                 1 << 20,
-                Duration::from_millis(10),
                 1 << 20,
             ))));
         assert_eq!(options.compaction_filter.unwrap().name(), "keep-all");
         assert_eq!(
             options.prefix_extractor.unwrap().name(),
-            "FixedLengthPrefix"
+            "FixedLengthPrefix(2)"
         );
         assert_eq!(options.merge_operator.unwrap().name(), "concat");
         assert_eq!(options.listeners.len(), 1);

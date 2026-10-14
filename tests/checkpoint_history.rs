@@ -49,6 +49,7 @@ fn a_checkpoint_holds_every_write_acknowledged_before_its_capture() {
     Checkpoint::new(&db)
         .expect("checkpoint")
         .create(tgt.path())
+        .wait()
         .expect("create");
 
     // Writes after the capture. None of these may appear.
@@ -129,6 +130,7 @@ fn a_checkpoint_under_concurrent_writers_holds_its_acknowledged_prefix() {
     Checkpoint::new(&db)
         .expect("checkpoint")
         .create(tgt.path())
+        .wait()
         .expect("create");
     let boundary = {
         let restored = Db::open(tgt.path(), Options::default()).expect("reopen");
