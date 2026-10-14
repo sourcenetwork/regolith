@@ -71,8 +71,8 @@
 //!   of a new epoch: a decision a thread was computing from the old state
 //!   carries the old epoch, and its slot is failed when it is settled.
 //! - **P6, a call far from its turn sleeps until its turn nears.** A
-//!   blocking call whose slot is more than [`turn_wait::LEAD`] slots past the decided
-//!   frontier, and that finds the next slot being decided by another thread,
+//!   blocking call whose slot is more than [`turn_wait::LEAD`] slots past the next
+//!   slot to decide, and that finds that slot being decided by another thread,
 //!   parks on its own slot instead of yielding to that thread over and over.
 //!   The thread that passes the decided frontier over slot `i` names slot
 //!   `i + LEAD` (a rollback's jump names the slots past it the same way),
@@ -211,6 +211,15 @@ const COURTESY_YIELDS: usize = 32;
 /// never in time, so a thread that did stop costs each helper a fixed number
 /// of yields and nothing more. A target with one thread has nobody to yield
 /// to.
+///
+/// Its two callers, a decision under way and an apply under way, stay
+/// yields where the write path's waits became parks (`write_unit.rs`). A
+/// wait there is about one decision or one apply long, and the thread that
+/// ends it is on the serial decide path: a park needs a host call to wake
+/// it on that path, which measured slower (E45: parks until the slot was
+/// published lost about 30% at 64 writers, wakes from the deciding thread
+/// about 18%). The long waits, for a turn many slots away, park instead
+/// (P6, `turn_wait.rs`).
 fn courtesy(size: usize, done: impl Fn() -> bool) {
     if !crate::env::PLATFORM_THREADS {
         return;

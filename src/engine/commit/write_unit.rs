@@ -94,7 +94,8 @@
 //!   ([`RegolithEngine::write_alone`]): what a writer did before the unit,
 //!   with no claim, gather or wake. The guard is one load and only about
 //!   speed; the copy's look again once counted in is what keeps it safe
-//!   (WG4).
+//!   (WG4). The unit does not see such writes, so several owners may take
+//!   the fast path at once, each writing its own record.
 
 use std::io::{self, IoSlice};
 use std::sync::Arc;

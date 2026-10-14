@@ -3,7 +3,7 @@
 //! told (`pipeline.rs`, `RegolithEngine::park_far` and `wake_near`).
 //!
 //! A blocking call whose slot is more than [`Turns::lead`] slots past the
-//! decided frontier, and that finds the next slot being decided by another
+//! next slot to decide, and that finds that slot being decided by another
 //! thread, parks on its own slot instead of yielding to that thread over
 //! and over. It counts itself in [`Turns::far`] first. A thread that passes
 //! the frontier over slot `i` while anybody is counted names every slot up
