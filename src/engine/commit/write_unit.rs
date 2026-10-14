@@ -84,6 +84,16 @@
 //!   frontier read when it began (or past the record the caller needs), so a
 //!   call writes at most a ring's worth of records before its own and one
 //!   run (P5 in `pipeline.rs`).
+//! - **WU7, a woken owner finds its commit published.** The holder
+//!   publishes what its run made publishable before it wakes the run's
+//!   owners ([`RegolithEngine::publish_ready`]).
+//! - **WU8, an uncontended write skips the unit.** An owner whose record
+//!   nobody has in hand, finding the unit free with no note on it and no
+//!   write in flight, encodes its record and writes it by itself, through
+//!   the gate as a copy is ([`RegolithEngine::write_alone`]): what a lone
+//!   writer did before the unit, with no claim, gather or wake. The guard is
+//!   two loads and only about speed; the copy's look again once counted in
+//!   is what keeps it safe (WG4).
 
 use std::io::{self, IoSlice};
 use std::sync::Arc;
@@ -194,6 +204,12 @@ impl WriteUnit {
             line: ArcSlot::new(Line::fresh()),
             spinners: Padded(AtomicUsize::new(0)),
         }
+    }
+
+    /// Whether the unit is free with no note on it: one load, a hint for
+    /// the fast path (WU8) that may be stale by the time it is acted on.
+    pub(super) fn quiet(&self) -> bool {
+        self.word.load(Ordering::Acquire) & (CLAIMED | WANTED | QUEUED) == 0
     }
 
     /// Claim the unit (WU1): `Ok` with the word as claimed, or `Err` with
@@ -682,6 +698,29 @@ impl RegolithEngine {
                 flags & FILLED != 0
             }
         });
+    }
+
+    /// The uncontended fast path (WU8): slot `desc`'s owner encodes its
+    /// record and writes it by itself, through the gate as a copy is, when
+    /// the unit is free with no note on it, no write is in flight, and nobody
+    /// has the record in hand. Two loads decide it; a commit that finds
+    /// either busy goes through the unit, whose runs pay off only when writes
+    /// meet. `true` when it wrote, or found the record written or discarded
+    /// meanwhile.
+    pub(super) fn write_alone(&self, pipe: &Pipeline, desc: &Descriptor) -> bool {
+        let Some(decision) = desc.decision() else {
+            return false;
+        };
+        if decision.place.is_none()
+            || !pipe.writes.quiet()
+            || !decision.after.log.writes_idle()
+            || desc.flags() & (FILLING | FILLED | WRITTEN | FAILED) != 0
+        {
+            return false;
+        }
+        self.fill(desc);
+        self.copy_record(desc);
+        true
     }
 
     /// Write slot `desc`'s record by itself, as a copy, through the gate: its

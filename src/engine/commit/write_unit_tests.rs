@@ -16,7 +16,7 @@ use super::descriptor::{Descriptor, FILLED, WRITTEN};
 use super::hook::{self, Stage};
 use super::pipeline::Turn;
 use super::pipeline_tests::{eventual_put, install, key, seq_of, stopped_at};
-use super::write_unit::{Await, Brought, CLAIMED, WANTED, WriteUnit};
+use super::write_unit::{Await, Brought, CLAIMED, QUEUED, WANTED, WriteUnit};
 use super::*;
 use crate::engine::EngineOptions;
 use crate::engine::recovery_tests::RecordingEnv;
@@ -300,27 +300,26 @@ fn a_nowait_commit_leaves_a_claimed_unit_on_its_queue() {
     let db = crate::OptimisticTransactionDb::open(dir.path(), crate::Options::default()).unwrap();
     let mut queue = db.db().io_queue();
     let options = crate::TxnOptions::new().io_queue(queue.id());
-    let mut ticket = None;
-    let writer = db.db();
-    stopped_at(
-        Stage::Write,
-        move || writer.put(b"held", b"v").unwrap(),
-        || {
-            let tx = db.begin(&options);
-            tx.put(b"nowait", b"v").unwrap();
-            let left = tx.commit_nowait();
-            assert!(
-                !left.is_ready(),
-                "the commit was written beside the holder instead of left on its queue"
-            );
-            ticket = Some(left);
-        },
+    // The unit claimed, as by a holder in the middle of its run: a lone
+    // writer takes the fast path (WU8) and never holds it.
+    let writes = &db.db().engine.pipe().unwrap().writes;
+    let claimed = writes.try_claim().expect("a free unit is claimed");
+    let tx = db.begin(&options);
+    tx.put(b"nowait", b"v").unwrap();
+    let left = tx.commit_nowait();
+    assert!(
+        !left.is_ready(),
+        "the commit was written beside the holder instead of left on its queue"
     );
+    // The holder lets go and tells the queues left on it, as Claim's drop
+    // does.
+    if writes.release(claimed) & QUEUED != 0 {
+        writes.tell_line();
+    }
     queue
-        .block_on(ticket.take().unwrap())
+        .block_on(left)
         .expect("the commit lands once the holder lets the unit go");
     assert_eq!(db.db().get(b"nowait").unwrap(), Some(b"v".to_vec()));
-    assert_eq!(db.db().get(b"held").unwrap(), Some(b"v".to_vec()));
 }
 
 /// The unit's word: one claim at a time; a note goes only on the claim it

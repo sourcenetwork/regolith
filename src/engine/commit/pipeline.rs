@@ -1008,7 +1008,9 @@ impl RegolithEngine {
             if let Turn::Blocked(job) = self.help_decide(pipe, index, Help::Leave, Some(desc)) {
                 return Err(job);
             }
-            self.fill(desc);
+            if !self.write_alone(pipe, desc) {
+                self.fill(desc);
+            }
             if let Brought::Waits(job) = self.bring_written(pipe, desc, Await::Leave) {
                 return Err(job);
             }
@@ -1033,7 +1035,9 @@ impl RegolithEngine {
                 self.run_or_wait(&job);
                 continue;
             }
-            self.fill(desc);
+            if !self.write_alone(pipe, desc) {
+                self.fill(desc);
+            }
             // A blocking call is never left waiting on a queue.
             let _ = self.bring_written(pipe, desc, Await::Park);
             match self.publish_upto(pipe, index, Some(desc), Await::Park) {

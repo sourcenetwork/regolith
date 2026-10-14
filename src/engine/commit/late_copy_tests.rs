@@ -235,7 +235,7 @@ fn journal_of(scenario: Scenario) -> Journal {
 }
 
 /// A range of a log, `(log, offset, length)`, and how many writes wrote it.
-type Copies = Vec<((PathBuf, u64, u64), usize)>;
+type Copies = Vec<((PathBuf, u64), usize)>;
 
 /// What a journal shows of one log so far.
 #[derive(Default)]
@@ -267,9 +267,9 @@ fn late_writes(journal: &Journal) -> (Vec<String>, Copies) {
         match r.kind {
             OpKind::Write if r.a >= 0 => {
                 let (offset, len) = (r.a as u64, r.written());
-                *copies
-                    .entry((r.path.clone(), offset, len))
-                    .or_insert(0usize) += 1;
+                // Keyed by where a write starts: a run that begins with a
+                // record writes that record again, whatever follows it.
+                *copies.entry((r.path.clone(), offset)).or_insert(0usize) += 1;
                 if let Some(sync_seq) = log.last_sync
                     && overlaps(&log.synced, offset, len)
                 {
